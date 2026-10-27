@@ -868,12 +868,14 @@ export interface TeardownTestDeps {
  * aborts, while best-effort disposal warns and retains. There is no path-based
  * fallback, including on non-Linux hosts.
  */
-export async function rmTeardownTree(target: string, testDeps: TeardownTestDeps = {}): Promise<void> {
+export async function rmTeardownTree(target: string, testDeps: TeardownTestDeps = {}, beforeDestroy?: () => void): Promise<void> {
   if (!path.isAbsolute(target)) throw new Error(`rmTeardownTree: refusing non-absolute path ${target}`);
   const name = path.basename(target);
+  beforeDestroy?.();
   await (testDeps.removeTreePinned ?? rmTreePinned)(path.dirname(target), name, {
     deadline: (testDeps.now ?? Date.now)() + 120_000,
     ...(isSkillsPluginTreeName(name) ? { allowSkillsPluginName: true } : {}),
+    ...(beforeDestroy ? { beforeDestroy } : {}),
   });
 }
 
@@ -898,6 +900,8 @@ export async function rmRunnerTeardownTree(
 
 /** Test seams and the caller's deadline for {@link rmTreePinned}. */
 export interface PinnedTreeRemovalOptions {
+  /** Synchronous veto immediately before each destructive dispatch. */
+  beforeDestroy?: () => void;
   /** Internal teardown opt-in for the fixed .uzi-skills- prefix only.
    * Disk reclaim keeps its ordinary-name contract unless explicitly opted in. */
   allowSkillsPluginName?: boolean;
@@ -954,7 +958,7 @@ export async function rmTreePinned(
   name: string,
   opts: PinnedTreeRemovalOptions = {},
 ): Promise<"removed" | "absent"> {
-  return removePinnedTree(parent, name, opts);
+  return removePinnedTree(parent, name, opts, { beforeDestroy: opts.beforeDestroy });
 }
 
 /** Owner policy is private: callers cannot select an arbitrary production uid. */
@@ -1004,7 +1008,10 @@ async function removePinnedTree(
         });
       }
       // chmod follows the magic link to the pinned inode, never a path.
-      if (split && !policy.runnerOwned) await fs.chmod(SELF_FD + leafPin.fd, (st.mode & 0o7777) | 0o770);
+      if (split && !policy.runnerOwned) {
+        policy.beforeDestroy?.();
+        await fs.chmod(SELF_FD + leafPin.fd, (st.mode & 0o7777) | 0o770);
+      }
       const expect = await identityOf(leafPin.fd);
       const wrappers =
         opts.wrappers ?? (split ? [runnerCommand, commandRootCommand, runnerCommand, asWorker] : [asWorker]);

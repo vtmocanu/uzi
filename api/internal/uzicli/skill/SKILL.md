@@ -79,6 +79,31 @@ board, `uzi run get --json` for one run's state, and `uzi run logs <id> --follow
 follow a transcript. Mentioned here only so you recognise it and do not try to drive
 it.
 
+### Vault
+
+- `uzi vault` — show vault command help.
+- `uzi vault status` — report `locked` or `unlocked` for the active user;
+  `--json` returns only `{"unlocked":false}` or `{"unlocked":true}`.
+  Status output remains visible with `--quiet`.
+- `uzi vault unlock` — ask the owner to run this when their vault is locked.
+  It prompts on stderr without echo for their login password or OIDC vault
+  passphrase. Never solicit, read, or handle the owner's password or passphrase
+  yourself. Unlock opens an existing vault; OIDC passphrase creation stays in
+  the web app.
+  Owners scripting unlock can explicitly use `--password-stdin` with non-terminal
+  stdin; the flag is rejected on a terminal, and non-terminal input requires it.
+  It reads one line, strips LF/CRLF, preserves spaces, and accepts a final line
+  without a newline. Empty input or input over 1 MiB is rejected. There is no
+  password-valued flag, argument, environment setting, or persisted re-unlock key.
+  Success prints `Vault unlocked.` unless `--quiet`; `--json` returns
+  `{"unlocked":true}` even with `--quiet`. The terminal prompt remains on stderr.
+  Wrong password and no vault both report `incorrect password` (exit 3);
+  rate limiting returns exit 6 with a safe hint from a valid positive
+  `Retry-After`. Unlock submits once without automatic retries. Generic input
+  failures or cancellation exit 1, usage errors exit 2, authentication failures
+  exit 3, and unreachable/server failures exit 6. Terminal cleanup failure
+  prevents submission.
+
 ### Exit codes
 
 | Code | Meaning | What to do |
@@ -230,6 +255,8 @@ uzi findings resolve <finding-id>
 uzi findings stats [--repo <repo-id>]
 uzi findings undo <disposition-id>
 uzi worker list
+uzi worker cordon <id> [-m <reason>] [--json]
+uzi worker uncordon <id> [--json]
 uzi worker rm <worker-id>
 uzi worker set-token <worker-id> <label>
 uzi worker set-token <worker-id> --default
@@ -276,6 +303,7 @@ uzi admin products connections <product>
 uzi admin guardrail-impact
 uzi admin blocked-repos
 uzi admin review-bots
+uzi admin maintenance status   # read-only: maintenance state + drain readout (CLEAR / NOT CLEAR); exit 0 either way
 uzi admin agent-source get
 uzi admin agent-source status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category <label,label>]
@@ -394,11 +422,18 @@ uzi version
   to the pool and it resumes), `recovery_wait` (parked after an empty model turn, or
   because automatic worker-death recovery exhausted — cause
   `worker_requeue_exhausted`, owner Resume/Cancel only, no timer — or
+  retained-source budget exhaustion, `retained_recovery_exhausted`, with three
+  timed retries by default followed by an owner hold (NULL retry) — or
   because the forge was unreachable at clone — cause `forge_unreachable`, capped by
   `RUN_FORGE_UNREACHABLE_MAX_PARKS`; the sweep retries it on a capped backoff; cause
   `codex_account_unavailable` is held on its Codex account until that account is usable
-  again; cause `vault_locked` means a Codex credential refresh or release found the run
-  owner's vault locked: an explicit vault unlock queues existing parks promptly;
+  again: **reconciling** means automatic recovery is pending; unlock the vault or
+  enable the credential if needed, and follow a re-login request on the same
+  credential if recovery cannot finish. A verified replacement can restore the
+  account while recovery is still pending. Cause `vault_locked` means a Codex
+  credential refresh or release found the run owner's vault locked: ask the owner to
+  check `uzi vault status` and run `uzi vault unlock` or use the web app; never solicit
+  or read their password or passphrase. An explicit unlock best-effort queues existing parks promptly;
   `recovery_retry_not_before` remains the fallback and a worker still claims the run), and `paused`
   (an ordinary owner-requested pause via `uzi run pause` or `/park`, or a
   lead-requested pause via `park_run`, resumed on demand with `uzi run resume <id>`;
@@ -445,7 +480,8 @@ uzi version
   bare wait stops there too), `completed`, `failed`, `cancelled` — and keeps
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
   `recovery_wait`/`paused`, except a default wait stops on recovery cause
-  `worker_requeue_exhausted` or a paused credential-switch hold (`credential_switch_settling` /
+  `worker_requeue_exhausted`, `worker_memory_pressure`, owner-held
+  `retained_recovery_exhausted` (NULL retry), or a paused credential-switch hold (`credential_switch_settling` /
   `credential_switch_unsettled`; it prints the next step on stderr): timed limit and recovery waits retry on a timer, pool waits
   need an available pooled token, and ordinary owner or lead pauses need `uzi run resume`. A
   `vault_locked` recovery park still waits: a bare wait keeps waiting through it
@@ -773,6 +809,26 @@ uzi version
   `landing_state` is `needs_landing` carries human-landable work: recover it with
   `uzi run export` when an archive is available, or from the preserved diff
   (`uzi run get <run-id> --field preserved_patch`) when it isn't.
+  Retained-source exhaustion is `recovery_wait` / `retained_recovery_exhausted`.
+  A finite retry, including due, means timed retry; NULL means owner-held without
+  a countdown; omitted timing is unknown. Default wait/log follow stop on the
+  held form; explicit `--until` keeps its status set. Follow reports finite-to-NULL
+  changes within the same cause/status. Default `RUN_RETAINED_RECOVERY_MAX_PARKS=3`
+  allows three parks at roughly 1m/2m/4m plus jitter; 0 holds immediately.
+  `retained_park_count` is separate from worker-death charges and lifetime waits.
+  Owner Resume/Cancel work on either form; Resume clears retry, preserves count
+  and cap, increments stored worker episode and resets its requeue baseline.
+  A fresh generation plus higher derived claim episode (stored episode plus
+  retained park count) renews one three-reservation/five-minute recovery window,
+  charging one reservation and requiring quiescence again. Same generation or
+  episode cannot renew; a two-step episode jump still grants one renewal.
+  Timer promotion grants a fresh run wall; manual Resume preserves remaining
+  wall and may need owner extension. Token/credential changes do not promote it.
+  Both forms keep source custody and can block image rolls. Execution release
+  never authorizes source deletion. Earlier archives may omit latest local work;
+  after worker death or affinity expiry, a peer may resume from a published
+  checkpoint without the original local journal.
+  See [retained recovery guidance](../../../../docs/run-recovery-wait.md#retained-recovery-exhausted).
   Worker-death exhaustion is `recovery_wait` / `worker_requeue_exhausted`:
   owner `uzi run resume <id>` (or `resume-now`) releases the exact run hold
   and queues one explicit attempt with the current `RUN_MAX_REQUEUES`
@@ -790,7 +846,8 @@ uzi version
   only and its lifetime marker is never renewed. Timers, credentials, vault,
   account and ordinary inputs do not release or renew the hold.
   `run get` shows `WORKER_RECOVERY` and `RECOVERY_EVIDENCE`; JSON
-  `worker_recovery` has `episode`, `automatic_requeue_limit`, `episode_used`,
+  `worker_recovery` reports the stored worker-death episode, not the derived
+  retained-retry episode, and has `episode`, `automatic_requeue_limit`, `episode_used`,
   `episode_remaining`, and historical `evidence` (`checkpoint_tip`,
   `available_capture`, `publication_uncertain`, `capture_uncertain`,
   `custody_uncertain`, `unknown`, `recorded_at`). This does not certify current
@@ -1609,6 +1666,24 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   these requeues: its runs are re-adopted to their exact phase on its next
   heartbeat instead. `uzi worker list` / `uzi admin workers` show the runs
   each worker reports executing and in which phase.
+- `uzi worker cordon <id> [-m <reason>]` pauses new intake on your persistent
+  hosted or external worker; held work continues subject to other fences.
+  `uzi worker uncordon <id>` clears only manual intent; automatic drains,
+  maintenance and custody remain independent. Both return the updated worker
+  with `--json`. Reasons are limited to 500 Unicode code points before
+  trimming/sanitization; blank becomes null. A repeat preserves the first
+  timestamp, actor and reason. Run-bound/ephemeral workers return HTTP 409:
+  `manual cordon is only supported for persistent workers`. Ownership is strict
+  even for admins; no admin write or worker-create command is added. Manual
+  intent survives registration, roll, restart, deadlines and ForceRoll until
+  explicit uncordon or deletion; offline status is independent. It does not
+  cancel runs, end chats or create continuation affinity. An idle worker may
+  roll and return cordoned, but supplies no serving coverage; an all-manual
+  multi-worker pool may remain held. Health/admin views are diagnosis only.
+  Older serving APIs can admit after cordon until every replica is compatible
+  (a stalled rollout extends this window); older controllers may miscount
+  coverage, and earlier poll decisions may finish. Compatible controllers are
+  required for ordinary coverage guarantees; no worker-image upgrade is needed.
 - `uzi worker set-token <worker-id> <label>|--default|--auto` — choose which
   Anthropic credential a worker's runs spend. A **label** pins it to that token;
   **`--default`** uses your default one; **`--auto`** lets uzi pick per claim from

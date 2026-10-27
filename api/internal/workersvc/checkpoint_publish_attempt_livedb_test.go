@@ -50,7 +50,7 @@ func gatePublish(svc *Service, forge *memForge, tip string, late bool) *publishG
 			first := false
 			g.once.Do(func() { first = true })
 			if first {
-				g.fetched, _ = forge.ref(checkpointRefPrefix + o.Branch)
+				g.fetched, _ = forge.ref(checkpointRefPrefix + o.CheckpointKey)
 				close(g.entered)
 				<-g.release
 				if g.late {

@@ -87,6 +87,22 @@ prevents fresh admission. See [ADR-1597's safe points and residuals](1597-midtur
 Source and local test evidence do not establish hosted acceptance or resolution
 of the reported production timings.
 
+## Amendment 2026-10-26 — #3304: code-head reads settle at the snapshot boundary
+
+A Codex code cross-check snapshot attempt (60 s soft / 90 s hard) failed the run
+after 600 s in `checkpoint-code-head`: a supervised git read inside the boundary
+scope never settled, and only the read's independent 600 s timer ended it with a
+plain error. Supervised git output in a boundary scope now settles on the scope's
+hard signal and, where cooperation is not masked, its soft signal. The gate path's
+clean soft stop or ordinary failure still gives `snapshot_failed` ("code snapshot
+unavailable") with SHA-free incomplete evidence; the done body's soft stop still
+ends the attempt `soft_stop`. Hard errors, unsafe cleanup and authority revocation
+stay terminal, and the one advisory check and one repair policy is unchanged. The
+code-head phase is reported as five named sub-steps (`checkpoint-code-head-runner-tip`,
+`-tracking`, `-default-tip`, `-pin`, `-changed-files`). Mechanism, accepted races and
+residuals: [ADR-1597's code-head amendment](1597-midturn-checkpoint-durability.md#amendment-2026-10-26--3304-code-head-reads-settle-at-the-snapshot-boundary).
+Source and local test evidence do not establish hosted acceptance.
+
 ## Planning-diff capture: symlinks, gitlinks and budgets (2026-10-07, #2410)
 
 #3338 replaces the object-store snapshot copy and its budget with direct reads from the explicit worker-held bare repository. `capturePlanningDiff` receives that authority from the worker; the command-identity helper reads base objects only from its pinned object directory, never from the clone's object store or configuration. Git runs in neutral private scratch, excluding clone configuration and replacement refs, with hooks and transports disabled and neutral attributes suppressing filters and text conversion. Bare `alternates` and `http-alternates` are rejected, including before each object query. Required objects are checked for type, size and content hash; missing or detectably corrupt required objects yield `base_unavailable`. Other Git failures, including a concurrent repack race, may yield diagnostic `git_refused` (`diff_failed`). Capture takes no long-lived bare lock.
@@ -230,7 +246,7 @@ and acceptance limits above remain historical records.
 
 ## #1230 coverage-park and semantic digest amendment (2026-10-20)
 
-This amendment records the dormant [PRD #1230](../prds/done/1230-semantic-completion-contract.md) M4 additions to the plan gate. Everything in it is reachable only through a run with a `semantic_planning` enrollment; production enrollment is off until #1231, no production code writes one, and only tests inject the path. The structural and legacy meanings of the sections above are unchanged. Nothing here is hosted-acceptance proof.
+This amendment records the dormant [PRD #1230](../prds/done/1230-semantic-completion-contract.md) M4 additions to the plan gate. Everything in it is reachable only through a run with a `semantic_planning` enrollment; production enrollment is off and not planned (#1231 was closed not planned), no production code writes one, and only tests inject the path. The structural and legacy meanings of the sections above are unchanged. Nothing here is hosted-acceptance proof.
 
 ### The `semantic_v1` candidate digest
 
@@ -250,11 +266,11 @@ Consistent with D16, a human revision of the plan triggers no new cross-family c
 
 ### Enrollment boundary for #1231
 
-#1231 must enroll inside the run-creation transaction, before the first claim, so the digest scheme and capability clauses above are non-vacuous from the first planning claim.
+#1231 was closed not planned (2026-10-23), so nothing enrolls today. The boundary binds any future enrollment: it must happen inside the run-creation transaction, before the first claim, so the digest scheme and capability clauses above are non-vacuous from the first planning claim.
 
 ### Coverage transport limitation
 
-Production coverage review reaches no model today: see the [coverage transport limitation](1225-structural-completion-interlock-invariants.md#coverage-transport-limitation) in ADR-1225. Until #1231 establishes enforceable bounds, a production call would settle as coverage-unavailable (`semantic_park: coverage_unavailable`) rather than reach a model.
+Production coverage review reaches no model today: see the [coverage transport limitation](1225-structural-completion-interlock-invariants.md#coverage-transport-limitation) in ADR-1225. Because no enforceable bounds exist (#1231 is not planned), a production call would settle as coverage-unavailable (`semantic_park: coverage_unavailable`) rather than reach a model.
 
 ## Advisory plan coverage amendment (2026-10-23, #3334 / #3168 M1)
 

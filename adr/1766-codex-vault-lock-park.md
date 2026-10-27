@@ -185,6 +185,37 @@ credential is in hand, whatever additionally caused the block.
 
 ## D3: settle before capture, and no completion authority while locked
 
+**Slice B amendment, Refs #2852 (AI-synced 2026-10-23):** wall, completion-hold
+and ordinary Codex recovery now hold process proof across the whole capture region.
+Before accepted local verification, a poisoned/refused/expired healthy phase can
+use A only after owned primary work joins and A establishes `observed_empty`.
+The same episode allows 180 s total, at most 120 s healthy, reserving fallback time;
+no retry or deferral renews it. Independent A credential-deferral episodes retain
+their existing bounds. Fallback performs no second refresh/release, credential
+overlay or PAT-bearing launch; wall/hold stay local-only and recovery keeps its
+existing join-token publication. Optional publication failure preserves verified
+local work without recapture. Cancellation, fencing and revoked shutdown authority
+never allow fallback; the typed #3109 graceful-shutdown path is unchanged.
+[ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
+records the held-finalize continuation and subsequent C's remaining writer limits.
+
+**Subsequent C amendment, Refs #2852 (AI-synced 2026-10-24):** release-capable
+Codex settlement within A/B defers coverage until exact executor/facade disposal;
+it does not reacquire a normal or free safety queue. Disposal synchronously closes
+admission irrevocably through `tablesCleared` and joins one stored attempt.
+Open/closing entry, pending launches/callbacks, unmatched poison, late admission
+or unclean cleanup is incomplete. Exact revocable disposal evidence gates inert
+hardened source reads and retirement. Skipped/incomplete/swapped proof retains
+clone, journal, inventory and paired skills with a distinct disposal diagnostic.
+Current-process completion sources bind the executor/facade in memory before
+durable bind; knownCodex without exact disposed proof retains before inventory
+and cannot use legacy fallback. KnownClaude is unchanged. Owner decision
+2026-10-24 narrows R1857-02(e): persisted/unknown-provenance sources keep today's
+behavior for both harnesses, with no prior-process topology proof or durable format
+change. C proves no Docker accepted-invisible-create (#1860) or unregistered/sibling
+writer exclusion and leaves Claude terminal residuals, #1858 no reclaim and
+#2746 SETTLE/CLEANUP separation intact.
+
 The worker's park sequence, in order: confirm the run is still `running` (a stale or already-parked
 run does not re-park); stop Codex execution without any credential operation, then
 hold safety serialization, the epoch fence and closed admission through source reads,
@@ -290,7 +321,8 @@ HEAD/pin and guarded inventory; refused proof leaves the exact parked source,
 session, existing journal and custody intact without another capture or pause attempt.
 The approval path still skips persistence from the old, drained HOME. This does not make an open `awaiting_approval` gate parkable or
 change fresh-path retained recovery. See [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
-for A's scope and the unshipped B/C gaps.
+for A's scope, B's whole-region capture and subsequent C's registered-process
+terminal strengthening and residual boundaries (AI-synced 2026-10-24).
 
 ### Amendment #3101: actual graceful-shutdown durability
 

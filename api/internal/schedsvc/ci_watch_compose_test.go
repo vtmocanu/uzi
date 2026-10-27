@@ -1,8 +1,11 @@
 package schedsvc
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -153,5 +156,195 @@ func TestCIRepairTitle(t *testing.T) {
 	long := ciRepairTitle("a\nb\x00c"+strings.Repeat("x", 300), 1)
 	if strings.ContainsAny(long, "\n\x00") || len([]rune(long)) > 120 {
 		t.Fatalf("title not sanitised/capped: %q", long)
+	}
+}
+
+// JSON fixtures let this file compile on the pre-history baseline: unknown fields
+// are ignored there, so the positive history assertions fail at runtime.
+func ciHistoryFixture(t *testing.T, rows []map[string]any, jobs []workersvc.SnapshotJob) ciEvidence {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"Workflow": "w", "URL": "u", "SHA": "s", "Jobs": jobs, "Recent": rows,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ev ciEvidence
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}
+
+func ciHistoryRows(n int) []map[string]any {
+	rows := make([]map[string]any, 0, n)
+	for i := 0; i < n; i++ {
+		rows = append(rows, map[string]any{
+			"Number": 20 - i, "SHA": fmt.Sprintf("sha-%d", 20-i),
+			"Conclusion": "success", "Status": "completed",
+			"CreatedAt": "2026-10-01T14:00:00+02:00",
+		})
+	}
+	return rows
+}
+
+func ciHistoryText(t *testing.T, desc string) string {
+	t.Helper()
+	_, content := fencedBlock(t, desc)
+	i := strings.Index(content, "\nRecent executions\n")
+	if i < 0 {
+		t.Fatal("missing Recent executions inside evidence fence")
+	}
+	return content[i:]
+}
+
+func TestComposeCIRepairRecentFieldsAndSourceNotice(t *testing.T) {
+	for _, n := range []int{0, 2, 10, 12} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			rows := ciHistoryRows(n)
+			if n == 2 {
+				rows[1]["Conclusion"], rows[1]["Status"] = "", "cancelled"
+				delete(rows[1], "CreatedAt")
+			}
+			desc, large := composeCIRepairDescription("Base.", "Guidance.", ciHistoryFixture(t, rows, nil), 10)
+			if large {
+				t.Fatal("unexpected tooLarge")
+			}
+			history := ciHistoryText(t, desc)
+			notice := "History from a bounded listing; older executions may be absent.\n"
+			if n < 10 {
+				notice = "partial history: this listing could omit older executions.\n"
+			}
+			want := "\nRecent executions\n" + notice
+			for i := 0; i < min(n, 10); i++ {
+				outcome, created := "success", "2026-10-01T12:00:00Z"
+				if n == 2 && i == 1 {
+					outcome, created = "cancelled", "unknown"
+				}
+				want += fmt.Sprintf("#%d | SHA: sha-%d | conclusion: %s | created: %s\n", 20-i, 20-i, outcome, created)
+			}
+			if n > 10 {
+				want += "[… 2 recent executions omitted from presentation]\n"
+			}
+			if history != want {
+				t.Fatalf("history = %q, want %q", history, want)
+			}
+			if len(history) > 4096 {
+				t.Fatal("history exceeds 4096 bytes")
+			}
+			delim, _ := fencedBlock(t, desc)
+			if !strings.Contains(desc[:strings.Index(desc, "\n"+delim)], "recent execution metadata") {
+				t.Fatal("trusted heading does not identify recent metadata as untrusted")
+			}
+		})
+	}
+}
+
+func TestComposeCIRepairRecentHostileFields(t *testing.T) {
+	token := "glpat-" + strings.Repeat("a", 20)
+	rows := ciHistoryRows(10)
+	rows[0]["SHA"] = "a\u202eb\u202cc\x00\n\t" + token
+	rows[0]["Conclusion"] = "x\u202ey\u202cz\r" + token
+	rows[1]["SHA"], rows[1]["Conclusion"] = strings.Repeat("界", 100), strings.Repeat("😀", 100)
+	rows[2]["SHA"], rows[2]["Conclusion"] = strings.Repeat("`", 200), strings.Repeat("`", 300)
+	for i := 3; i < 10; i++ {
+		rows[i]["SHA"], rows[i]["Conclusion"] = strings.Repeat("界", 10000), strings.Repeat("😀", 10000)
+	}
+	desc, large := composeCIRepairDescription("Base.", "", ciHistoryFixture(t, rows, nil), 10)
+	if large {
+		t.Fatal("unexpected tooLarge")
+	}
+	delim, _ := fencedBlock(t, desc)
+	history := ciHistoryText(t, desc)
+	for _, want := range []string{
+		"#20 | SHA: a b c   [REDACTED] | conclusion: x y z [REDACTED] | created: 2026-10-01T12:00:00Z\n",
+		"#19 | SHA: " + strings.Repeat("界", 21) + "[… 237 bytes omitted] | conclusion: " + strings.Repeat("😀", 16) + "[… 336 bytes omitted]",
+		"#18 | SHA: " + strings.Repeat("`", 64) + "[… 136 bytes omitted] | conclusion: " + strings.Repeat("`", 64) + "[… 236 bytes omitted]",
+	} {
+		if !strings.Contains(history, want) {
+			t.Fatalf("missing literal %q in %q", want, history)
+		}
+	}
+	if strings.ContainsAny(history, "\u202e\u202c\x00\r\t") || strings.Contains(history, token) || !utf8.ValidString(history) {
+		t.Fatal("unsafe or invalid history fields survived")
+	}
+	if len(delim) <= 64 || len(history) > 4096 || strings.Count(history, " | SHA: ") != 10 {
+		t.Fatalf("fence/history bounds: delimiter=%d bytes=%d", len(delim), len(history))
+	}
+}
+
+func TestComposeCIRepairRecentReductionLadder(t *testing.T) {
+	rows := ciHistoryRows(10)
+	jobs := ciJobs(2, "")
+	jobs[0].Name, jobs[1].Name = strings.Repeat("A", 100), strings.Repeat("B", 100)
+	ev := ciHistoryFixture(t, rows, jobs)
+	full, large := composeCIRepairDescription("Base.", "Guidance.", ev, 10)
+	if large {
+		t.Fatal("unexpected tooLarge")
+	}
+	original := ciHistoryText(t, full)
+	lines := strings.SplitAfter(original, "\n")
+	if len(lines) != 14 {
+		t.Fatalf("unexpected history layout: %q", original)
+	}
+	for _, kept := range []int{7, 1, 0} {
+		t.Run(fmt.Sprintf("keep-%d", kept), func(t *testing.T) {
+			wantHistory := strings.Join(lines[:3+kept], "") + fmt.Sprintf("[… %d recent executions omitted from presentation]\n", 10-kept)
+			target := len(full) - len(original) + len(wantHistory)
+			reserve := workersvc.MaxIssueDescriptionBytes - target
+			desc, tooLarge := composeCIRepairDescription("Base.", "Guidance.", ev, 10, reserve)
+			if tooLarge || len(desc)+reserve > workersvc.MaxIssueDescriptionBytes {
+				t.Fatal("history reduction did not fit artifact reserve")
+			}
+			if got := ciHistoryText(t, desc); got != wantHistory {
+				t.Fatalf("history = %q, want %q", got, wantHistory)
+			}
+			if !strings.Contains(desc, "--- job: "+strings.Repeat("B", 100)) || strings.Contains(desc, "more failed jobs omitted") {
+				t.Fatal("jobs reduced before history")
+			}
+			if !strings.HasPrefix(desc, "Base.") || !strings.Contains(desc, "Guidance.") {
+				t.Fatal("trusted prefix changed")
+			}
+			if kept == 0 {
+				desc, tooLarge = composeCIRepairDescription("Base.", "Guidance.", ev, 10, reserve+1)
+				if tooLarge || !strings.Contains(desc, "[… 1 more failed jobs omitted]") ||
+					!strings.Contains(desc, "--- job: "+strings.Repeat("A", 100)) || ciHistoryText(t, desc) != wantHistory {
+					t.Fatalf("wrong job reduction after all history dropped: %q", desc)
+				}
+			}
+		})
+	}
+	tailEv := ciHistoryFixture(t, rows, ciJobs(2, strings.Repeat("tail-line\n", 20000)))
+	desc, tooLarge := composeCIRepairDescription("Base.", "", tailEv, 10)
+	if tooLarge || ciHistoryText(t, desc) != original || strings.Count(desc, "--- job: job") != 2 ||
+		!strings.Contains(desc, "bytes omitted]") || !strings.Contains(desc, "tail-line\n") {
+		t.Fatal("tail shrinking did not preserve history and jobs")
+	}
+}
+
+func TestComposeCIRepairRecentMinimalFitAndSignature(t *testing.T) {
+	rows := ciHistoryRows(2)
+	snap := workersvc.FailureSnapshot{PipelineID: 42, FailedJobs: ciJobs(1, "boom")}
+	signature := workersvc.FailureSignature(snap)
+	base, _ := composeCIRepairDescription("Base.", "", ciHistoryFixture(t, rows, nil), 10)
+	history := ciHistoryText(t, base)
+	minHistory := "\nRecent executions\npartial history: this listing could omit older executions.\n[… 2 recent executions omitted from presentation]\n"
+	target := len(base) - len(history) + len(minHistory) + len("\n[… 1 more failed jobs omitted]\n")
+	// Failed jobs: 0 and Failed jobs: 1 have equal byte width.
+	reserve := workersvc.MaxIssueDescriptionBytes - target
+	for _, sha := range []string{"old-sha", "different-older-sha"} {
+		rows[1]["SHA"] = sha
+		desc, large := composeCIRepairDescription("Base.", "", ciHistoryFixture(t, rows, snap.FailedJobs), 10, reserve)
+		if large || len(desc) != target || ciHistoryText(t, desc) != minHistory || !strings.Contains(desc, "[… 1 more failed jobs omitted]") {
+			t.Fatalf("minimal omission-only evidence must fit exactly: large=%v desc=%q", large, desc)
+		}
+		if workersvc.FailureSignature(snap) != signature || snap.FailedJobs[0].LogTail != "boom" {
+			t.Fatal("presentation changed snapshot/signature")
+		}
+	}
+	target = len(base) - len(history) + len(minHistory)
+	desc, large := composeCIRepairDescription("Base.", "", ciHistoryFixture(t, rows, nil), 10, workersvc.MaxIssueDescriptionBytes-target)
+	if large || len(desc) != target || ciHistoryText(t, desc) != minHistory {
+		t.Fatal("zero-job minimal fit rejected")
 	}
 }

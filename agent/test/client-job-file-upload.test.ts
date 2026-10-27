@@ -135,6 +135,18 @@ describe("WorkerClient.uploadJobFile", () => {
     }
   });
 
+  it("refuses an acknowledgment body past 64 KiB even when it is valid JSON", async () => {
+    const client = await serve(async (req, res) => {
+      await readAll(req);
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(DTO) + " ".repeat(64 * 1024));
+    });
+    await assert.rejects(
+      () => client.uploadJobFile("r", META, Buffer.from("hello")),
+      (err: unknown) => err instanceof Error && err.name === "ResponseBodyOverflowError" && /exceeds/.test(err.message),
+    );
+  });
+
   it("a timeout aborts the request", async () => {
     const client = await serve(() => {
       /* never answers */

@@ -49,6 +49,8 @@ SELECT w.id,
        -- the timestamp also supports drain diagnostics and idempotent cordons.
        -- Busy drift and associated recycle wait indefinitely for idle, even on a plain drain.
        w.draining_since,
+       w.manual_cordoned_at,
+       (NOT fn_worker_accepts_new_intake(w))::boolean AS effective_cordoned,
        -- disk_pressure (PRD #837 M4): the ONE lifecycle reader of the display-only disk
        -- telemetry, allow-listed exactly like ReapEphemeralWorkers is for the uptime anchor. It
        -- is a DEBOUNCED, FRESHNESS-GATED derivation, never the raw sample:

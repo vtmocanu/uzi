@@ -377,7 +377,7 @@ func TestPresetMemoryLimitsFitTheChartsLimitRangeMax(t *testing.T) {
 	}
 }
 
-// chartMaxMemory reads both tiers' limitRange.max.memory out of deploy/chart/values.yaml,
+// chartMaxMemory reads all three tiers' limitRange.max.memory out of deploy/chart/values.yaml,
 // keyed by the values path so a failure names the key to edit. Same parse-and-Fatal
 // contract as chartMaxPVCStorage above: PARSED not grepped (`memory` appears under two
 // blocks a regex cannot tell apart), and FATAL on anything unexpected — unreadable file,
@@ -405,6 +405,13 @@ func chartMaxMemory(t *testing.T) map[string]resource.Quantity {
 					} `json:"max"`
 				} `json:"limitRange"`
 			} `json:"docker"`
+			IsolatedLane struct {
+				LimitRange struct {
+					Max struct {
+						Memory string `json:"memory"`
+					} `json:"max"`
+				} `json:"limitRange"`
+			} `json:"isolatedLane"`
 		} `json:"workers"`
 	}
 	if err := yaml.Unmarshal(raw, &v); err != nil {
@@ -412,8 +419,9 @@ func chartMaxMemory(t *testing.T) map[string]resource.Quantity {
 	}
 	out := map[string]resource.Quantity{}
 	for key, val := range map[string]string{
-		"workers.limitRange.max.memory":        v.Workers.LimitRange.Max.Memory,
-		"workers.docker.limitRange.max.memory": v.Workers.Docker.LimitRange.Max.Memory,
+		"workers.limitRange.max.memory":              v.Workers.LimitRange.Max.Memory,
+		"workers.docker.limitRange.max.memory":       v.Workers.Docker.LimitRange.Max.Memory,
+		"workers.isolatedLane.limitRange.max.memory": v.Workers.IsolatedLane.LimitRange.Max.Memory,
 	} {
 		if val == "" {
 			t.Fatalf("%s is empty in %s; there is no ceiling to check the preset memory limits against", key, path)
@@ -481,6 +489,8 @@ func TestEveryPresetRequestSitsAboveItsSizesMeasuredPeak(t *testing.T) {
 		"s": {request: "2Gi", peak: "676Mi"},   // the measured single-agent SDK peak
 		"m": {request: "8Gi", peak: "2764Mi"},  // peak ~2.7 GiB, a non-web-ux run's (#1341); request 8Gi per #2127 (deadcode reached 7.3-7.5 GiB)
 		"l": {request: "14Gi", peak: "7451Mi"}, // peak ≈7.1 GiB, the #1341 captured eviction figure; request 14Gi per #2127 (two overlapping ~7.5 GiB Go analyzers)
+		// l-highmem (#3383) is an operator-selectable capacity choice, not a measured guarantee; it reuses `l`'s measured peak.
+		"l-highmem": {request: "24Gi", peak: "7451Mi"},
 	}
 	if len(sizes) == 0 {
 		t.Fatal("the preset size table is empty; the request assertions below would pass vacuously")

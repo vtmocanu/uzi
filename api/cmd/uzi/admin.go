@@ -160,6 +160,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			for _, w := range ws {
+				printWorkerManualDetail(p, w.WorkerDTO)
 				printWorkerDrainDetail(p, w.WorkerDTO)
 			}
 			return nil
@@ -454,7 +455,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(users, runs, workers, health, usage, rateLimits, cliTokens, products, guardrailImpact, blockedRepos, newAdminAgentSourceCmd(env, gf), newAdminReviewCmd(env, gf), newAdminReviewBotsCmd(env, gf), newAdminEgressProfileCmd(env, gf))
+	cmd.AddCommand(users, runs, workers, health, usage, rateLimits, cliTokens, products, guardrailImpact, blockedRepos, newAdminAgentSourceCmd(env, gf), newAdminReviewCmd(env, gf), newAdminReviewBotsCmd(env, gf), newAdminEgressProfileCmd(env, gf), newAdminMaintenanceCmd(env, gf))
 	return cmd
 }
 

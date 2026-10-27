@@ -71,6 +71,40 @@ secret scan runs via `agent/src/git.ts`'s `secretScanRange`, with `agent/src/sec
 holding its pure, I/O-free helpers; `CHECKPOINT_TICK_INTERVAL` parsing is in
 `agent/src/config.ts`.
 
+## Generic checkpoint error diagnostics (issue #296)
+
+Generic exceptions retain the feed anchor “checkpoint publish failed: error” and append
+fixed phase and cause labels. Phase is `packing` until a packed tip exists, then
+`publish_request`. At most four nodes, including the root, in a linear cause chain
+are inspected with cycle detection and defensive code/message/cause reads. The first
+recognized exact code wins: ENOTFOUND/EAI_AGAIN → `dns`, ECONNREFUSED →
+`connection_refused`, ECONNRESET → `connection_reset`, and ETIMEDOUT or
+UND_ERR_CONNECT_TIMEOUT/UND_ERR_HEADERS_TIMEOUT/UND_ERR_BODY_TIMEOUT → `timeout`.
+Everything else is `unknown`; messages and aggregate collections do not classify errors.
+Boundary failures, typed refusals and aborts retain their earlier precedence, including
+fail-closed propagation from hostile boundary/name getters.
+
+The feed and its `error:<phase>:<cause>` dedupe key contain only this fixed vocabulary.
+Dedupe counts diagnostic events, not publish attempts: every generic failure is logged,
+distinct phase/cause pairs surface separately, and confirmed publication clears the
+ledger and reports recovery. These labels add no retries. HTTP status diagnostics and
+the bounded HTTP retry policy below remain distinct.
+
+Operators correlate the fixed feed label with the run ID and phase in the operator log.
+Only that log receives untrusted free text: a root `error` message and a `cause` field
+for the remaining at most three nodes. Each message is known-secret-redacted before
+sanitization and limited to 200 UTF-16 units; joined causes, including separators and
+ellipsis, are limited to 600. Raw messages over the existing 4096-character redaction
+input bound are omitted whole, and U+2028/U+2029 normalize before redaction. Missing,
+malformed or throwing redactors omit free text; stacks and arbitrary objects are never
+serialized. This is known-secret redaction, not universal removal of remote text:
+parser/ACK errors may retain a bounded, redacted remote excerpt in operator logs.
+
+An ambiguous ACK error does not prove refusal. Attempted tips still support later
+reconciliation; only a confirmed ACK and successful producer settle the confirmed tip.
+A checkpoint failure says nothing definitive about final delivery: the later work
+branch push and merge request publication remain separate and can succeed.
+
 ## Bounded HTTP retries (issue #296)
 
 [Issue #296](https://github.com/vtmocanu/uzi/issues/296) adds retries for explicit numeric
@@ -402,6 +436,59 @@ finalize were not reproduced or diagnosed: the issue supplied combined sink
 timings. The local source/tests establish the implemented boundaries, not
 production incident resolution or hosted acceptance. See the
 [existing advisory snapshot retry](2149-cross-check.md#amendment-2026-10-19--3123-existing-advisory-code-snapshot-retry).
+
+### Amendment 2026-10-26 — #3304: code-head reads settle at the snapshot boundary
+
+A done-checkpoint code snapshot failed the run after 600 s in `checkpoint-code-head`
+(allowance 60 s soft / 90 s hard). A supervised git read inside the boundary scope
+never settled. Local reproduction showed two seams consistent with the incident
+(which one fired in production is not distinguished): the child's output had
+finished before the exit-gated stream attached, or a cleanly exited child's stdout
+never ended. Only `readBare`'s
+independent 600 s timer (`GIT_TIMEOUT_MS`) ended it, with a plain error.
+
+- **Attach classification.** In a boundary scope, `spawnGit`'s exit-gated stdout
+  classifies a source already terminal at attach, as the `execScoped` collector
+  already did: ended with nothing read is a genuine empty EOF only on a clean exit;
+  data already read, destroyed without end, or errored is refused.
+- **Settlement rule.** Both supervised output consumers (the gated stream and the
+  `execScoped` collector) settle on the scope's hard signal in every boundary scope
+  (including the mid-turn tick and other TickSpawner scopes) and, where the scope
+  carries one and is not masked (Codex checkpoints), its soft signal. A soft stop's cancellation is requested by the child
+  handle's own listener; a hard stop relies on the scope's spawner stopping the
+  child on its own signal. The verdict is joined with the child's completion at the
+  `spawnGit` or `execScoped` level, and a completion rejection wins; otherwise hard
+  gives `GitBoundaryAbortError` and soft gives `CheckpointSoftDeadlineError`. The
+  collector's hard path itself is unchanged. `maskCheckpointCooperation` keeps in-import
+  mutation hard-only; that invariant is unchanged.
+- **Timer retirement.** Inside a boundary scope, `readBare`'s and
+  `streamBundleWithCap`'s independent 600 s timers are cleared when the scope stops,
+  never re-armed, and never armed if the scope already stopped, so a generic timer
+  cannot pre-empt owned cleanup with a plain error. Settlement is left to the owner.
+  Before any stop they behave as before; ordinary failures are not reclassified.
+- **Step split.** The code-head reads report as
+  `checkpoint-code-head-runner-tip`, `-tracking`, `-default-tip`, `-pin` and
+  `-changed-files` in both the gate snapshot and the done body. In the done body,
+  `checkpoint-code-head` remains as the entry marker before the post-import reads;
+  the gate snapshot no longer reports it. The gate's ownership
+  readback, previously under the last import step, now reports as
+  `checkpoint-code-head-tracking`, and its fresh pin as `checkpoint-code-head-pin`.
+
+Outcomes are unchanged: the gate path's clean soft stop or ordinary failure gives
+`snapshot_failed`; the done body's soft stop ends the attempt `soft_stop`; hard
+errors, unsafe cleanup and authority revocation stay terminal; preservation refusal
+keeps its outcome. The #3123 invariants (including
+[ADR-1766](1766-codex-vault-lock-park.md)) are unchanged.
+
+Accepted residuals: after a clean child exit, a soft stop that lands before the
+pipe's EOF turns an unmasked read's success into a soft stop (a cooperative "not
+done"; a one-event-loop-turn grace lets an already-queued EOF win). With the timers
+retired, the child's completion, bounded by the scope's spawner, is the only bound
+on a stopped read. Awaited filesystem writes and fsync stay uninterruptible. A
+`snapshot_failed` attempt leaves SHA-free incomplete evidence for the cross-check,
+as before. A started bridge adoption and in-import mutation stay hard-only (#3123,
+#3315). Source and local test evidence do not establish hosted acceptance. See the
+[cross-check amendment](2149-cross-check.md#amendment-2026-10-26--3304-code-head-reads-settle-at-the-snapshot-boundary).
 
 ### Git-busy probe
 

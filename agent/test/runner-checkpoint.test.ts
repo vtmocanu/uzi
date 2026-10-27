@@ -9,6 +9,7 @@ import type { Logger } from "../src/log.js";
 import type { OwedCandidateContext } from "../src/git.js";
 import { ScratchPublicationError, type ScratchPublicationKind, type ScratchPublicationStep } from "../src/git.js";
 import type { PublishResult } from "../src/protocol.js";
+import { followSuccessfulPush } from "./publication-fixture.js";
 import {
   api,
   client,
@@ -477,7 +478,8 @@ describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
   });
 
   it("a thrown publish error is swallowed — the run still completes and reports state (best-effort)", async () => {
-    const { gitlab } = fakeGitlab();
+    const forge = fakeGitlab();
+    followSuccessfulPush(git, forge.pr);
     const claim = gitlabClaim(66);
     const events: string[] = [];
     const restoreFetch = spyFetch(events);
@@ -492,7 +494,7 @@ describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
     };
     try {
       // Must NOT reject even though publishCheckpoint throws.
-      await runner(exec, gitlab).execute(claim);
+      await runner(exec, forge.gitlab).execute(claim);
     } finally {
       restorePublish();
       restoreFetch();
@@ -502,6 +504,13 @@ describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
       (s) => s.runId === claim.run_id && s.body.status === "completed",
     );
     assert.ok(completed, "the run completed despite the publish failure");
+    assert.equal(events.filter(e => e === "publish").length, 1, "a transport throw adds no checkpoint retry");
+    assert.equal(execFileSync("git", ["-C", fx.originPath, "rev-parse", "--verify", "refs/heads/agent/issue-66"],
+      { encoding: "utf8" }).trim().length, 40, "final publication pushes the work branch after checkpoint failure");
+    assert.equal(forge.calls.filter(c => c.method === "POST").length, 1, "final publication opens one MR");
+    const texts = api.messages(claim.run_id).map(m => String(m.payload.text ?? ""));
+    assert.ok(texts.some(t => t === "checkpoint publish failed: error (phase=publish_request, cause=unknown)"),
+      "checkpoint failure remains a distinct diagnostic after successful final delivery");
   });
 });
 
@@ -1091,9 +1100,16 @@ describe("RunRunner — report_only checkpoint orphan guard (issues #299 / #2967
     assert.equal(calls.length, 0, "no MR is opened");
   });
 
-  it("fails a report_only completion after this worker published a checkpoint", async () => {
-    const { gitlab, calls } = fakeGitlab();
-    const claim = gitlabClaim(67);
+  // #3360: an issue run that declares report_only after publishing a checkpoint is delivered
+  // as a NON-CLOSING merge request instead of failing (the #299 failure remains for an empty
+  // candidate, a non-issue kind and a refused attempt; see runner-push-mr / runner-report-only-fallback).
+  it("delivers a report_only completion non-closing after this worker published a checkpoint (#3360)", async () => {
+    api.setRegisterProtocolFeatures(["refresh_publication_context_v1"]);
+    await client.register("checkpoint");
+    const forge = fakeGitlab();
+    const { calls } = forge;
+    followSuccessfulPush(git, forge.pr);
+    const claim = gitlabClaim(67, { claim_generation: 7 });
     const events: string[] = [];
     const restoreFetch = spyFetch(events);
     const restorePublish = spyPublish(events);
@@ -1106,24 +1122,27 @@ describe("RunRunner — report_only checkpoint orphan guard (issues #299 / #2967
       killAgentTree: () => events.push("kill"),
     };
     try {
-      await runner(exec, gitlab).execute(claim);
+      await runner(exec, forge.gitlab).execute(claim);
     } finally {
       restorePublish();
       restoreFetch();
     }
     assert.ok(events.includes("publish"), "the mid-run checkpoint published (sanity)");
-    const failure = api.states.find(
-      (s) => s.runId === claim.run_id && s.body.status === "failed",
-    );
-    assert.ok(failure, "exact confirmed publication with substantive work must fail report-only");
-    const failed = failure.body;
-    assert.match(failed.failure_reason ?? "", /report_only/);
-    assert.match(failed.failure_reason ?? "", /checkpoint/);
+    assert.equal(api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"), false,
+      "report_only after substantive published work no longer fails");
     const completed = api.states.find(
       (s) => s.runId === claim.run_id && s.body.status === "completed",
     );
-    assert.strictEqual(completed, undefined, "the run FAILED, it did not complete report-only");
-    assert.strictEqual(calls.length, 0, "no MR opened after the guarded report-only run");
+    assert.ok(completed, "the run completes through delivery");
+    assert.notEqual(completed.body.report_only, true, "delivered as an MR, not a report-only completion");
+    assert.equal(execFileSync("git", ["-C", fx.originPath, "rev-parse", "--verify", "refs/heads/agent/issue-67"],
+      { encoding: "utf8" }).trim().length, 40, "the branch was pushed");
+    const posts = calls.filter((c) => c.method === "POST");
+    assert.equal(posts.length, 1, "exactly one MR opened");
+    const description = String((JSON.parse(posts[0]!.body ?? "{}") as { description?: unknown }).description);
+    assert.doesNotMatch(description, /Closes #67/);
+    assert.match(description, /Issue remains open/);
+    assert.deepEqual(completed.body.source_publication?.non_closing, true, "terminal proof records non-closing delivery");
   });
 });
 

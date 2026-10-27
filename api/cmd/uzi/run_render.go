@@ -159,6 +159,11 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) err
 	if r.HealthReason != nil && *r.HealthReason != "" {
 		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(*r.HealthReason)})
 	}
+	// QUEUE_REASON (PRD #3454): why a queued run has not started, derived server-side at read
+	// time. Emit-only-when-set; "maintenance" is spelled out, anything else is shown sanitized.
+	if r.QueueReason != nil && *r.QueueReason != "" {
+		rows = append(rows, []string{"QUEUE_REASON", queueReasonCell(*r.QueueReason)})
+	}
 	if r.FailureReason != nil && *r.FailureReason != "" {
 		rows = append(rows, []string{"FAILURE_REASON", sanitizeTTY(*r.FailureReason)})
 	}
@@ -1874,9 +1879,9 @@ func compactPayload(raw json.RawMessage) string {
 // renderRunInputs prints the steer queue (follow-ups and scope directives,
 // newest-first) as a kind/body/state/age table (PRD #95 M4, #634). The body is the
 // user's own text, sanitized like any free text bound for a TTY. State is derived per
-// kind — from the receipt timestamps and runStatus for a follow_up, from disposition for a scope
+// kind — from the receipt timestamps and run.Status for a follow_up, from disposition for a scope
 // directive; age is relative to created_at.
-func renderRunInputs(p *uzicli.Printer, inputs []apitypes.SteerInputDTO, runStatus string, recoveryCause ...string) error {
+func renderRunInputs(p *uzicli.Printer, inputs []apitypes.SteerInputDTO, run apitypes.RunDTO) error {
 	rows := make([][]string, 0, len(inputs))
 	for _, in := range inputs {
 		body := "-"
@@ -1886,7 +1891,7 @@ func renderRunInputs(p *uzicli.Printer, inputs []apitypes.SteerInputDTO, runStat
 		rows = append(rows, []string{
 			steerKindLabel(in.Kind),
 			body,
-			steerState(in, runStatus, recoveryCause...),
+			steerStateForRun(in, run),
 			relAge(in.CreatedAt),
 		})
 	}
@@ -1942,6 +1947,15 @@ func steerKindLabel(kind string) string {
 // "vault_locked" (issue #1766) names the vault unlock the run is waiting for, and
 // "data_volume_full" (PRD #1809) names the disk space it is waiting for.
 func steerState(in apitypes.SteerInputDTO, runStatus string, recoveryCause ...string) string {
+	return steerStateWithRun(in, runStatus, recoveryCause, nil)
+}
+
+// steerStateForRun preserves explicit NULL versus finite timing from a full read.
+func steerStateForRun(in apitypes.SteerInputDTO, run apitypes.RunDTO) string {
+	return steerStateWithRun(in, run.Status, []string{strOr(run.RecoveryWaitCause, "")}, &run)
+}
+
+func steerStateWithRun(in apitypes.SteerInputDTO, runStatus string, recoveryCause []string, run *apitypes.RunDTO) string {
 	kind, consumedAt, disposition := in.Kind, in.ConsumedAt, in.Disposition
 	// PRD #634: a scope directive's state IS its disposition — it is never consumed, so
 	// consumed_at/runStatus carry no delivery signal for it. A nil disposition means the
@@ -1975,6 +1989,15 @@ func steerState(in apitypes.SteerInputDTO, runStatus string, recoveryCause ...st
 	// it lives on the fuller run-get notice and the web panel). issue #1088 widened the
 	// non-forge cause to any transient interruption (a transient empty turn or provider outage).
 	recoveringSuffix := " (run recovering from a transient interruption)"
+	if len(recoveryCause) > 0 && recoveryCause[0] == retainedRecoveryExhaustedCause {
+		recoveringSuffix = " (retained recovery; retry timing unknown)"
+		if run != nil && isRetainedRecovery(*run) {
+			recoveringSuffix = " (timed retry)"
+			if isRetainedRecoveryHold(*run) {
+				recoveringSuffix = " (owner Resume/Cancel)"
+			}
+		}
+	}
 	if len(recoveryCause) > 0 && (recoveryCause[0] == workerRequeueExhaustedCause || recoveryCause[0] == workerMemoryPressureCause) {
 		recoveringSuffix = " (owner Resume/Cancel)"
 	}
@@ -2159,7 +2182,7 @@ var parkedStatuses = map[string]bool{statusLimitWait: true, statusRecoveryWait: 
 // reported it; it is shown only while the run is parked. "" when the run is not parked or the
 // worker did not report it.
 func checkpointDurabilityLine(r apitypes.RunDTO) string {
-	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] || isOwnerRequiredWorkerHold(r) {
+	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] || isOwnerRequiredWorkerHold(r) || isRetainedRecovery(r) {
 		return ""
 	}
 	if *r.CheckpointContainsLatest {
@@ -2320,7 +2343,7 @@ func codexAccountActionShort(r apitypes.RunDTO) string {
 // A run held on credential_disabled (PRD #1732 D14) gets "(credential disabled)" likewise.
 func runStatusCell(r apitypes.RunListItemDTO) string {
 	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.FailOrigin, ""))
-	if isOwnerRequiredWorkerHold(r.RunDTO) {
+	if isOwnerRequiredWorkerHold(r.RunDTO) || isRetainedRecovery(r.RunDTO) {
 		return workerExhaustionLine(r.RunDTO)
 	}
 	if short := codexAccountActionShort(r.RunDTO); short != "" {
@@ -2617,4 +2640,13 @@ func pauseOriginLabel(r apitypes.RunDTO, personal bool, origin ...string) string
 		value = origin[0]
 	}
 	return runpresentation.PauseLabel(value, personal)
+}
+
+// queueReasonCell renders a run's queue_reason. The only reason today is "maintenance", which
+// is spelled out; an unknown future value still renders, sanitized.
+func queueReasonCell(reason string) string {
+	if reason == "maintenance" {
+		return "maintenance (uzi is in maintenance mode)"
+	}
+	return sanitizeTTY(reason)
 }

@@ -213,7 +213,9 @@ locally in step 4. The advisory still prints until the window expires.
    `ELAPSED` / `RESULT=elapsed` (exit 3) stopped counting, not the run: re-snapshot
    and re-launch under the existing grant, or record the coverage blocker. A stop-set
    state exits 0 with `RESULT=stop:STATE`, not a generic success verdict. Re-arm after every
-   `uzi run extend` or `uzi run resume`, which leave no poller running.
+   `uzi run extend`, `resume`, `answer` or `decide`, which leave no poller running; after an
+   answer or decide pass the answered question's seq as the 6th arg, or the lingering
+   `awaiting_input` stops the new poller at once and the run's next question goes unseen.
    `STOP=needs_attention` (exit 4) means a non-terminal run shows persistent non-ok health or
    a stale worker heartbeat: investigate (`uzi run get RUN --json`, `uzi worker list`, the
    trace tail); do not assume dead or lost, change nothing until you know, then launch its
@@ -225,7 +227,7 @@ locally in step 4. The advisory still prints until the window expires.
    a plain answer cannot exempt it, then open the PR); `awaiting_approval` past `SEQ` → the run re-planned
    (usually a lost worker resumed from the default branch): before steering the new gate with
    `uzi-watcher`, check `uzi run recovery RUN` for committed work worth landing instead; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
-   keep polling (`limit_wait` and `pool_wait` resume on their own; a `recovery_wait` may need an owner action, so read its cause), except `recovery_wait` with cause
+   keep polling (`limit_wait` and `pool_wait` resume on their own; a `recovery_wait` may need an owner action, so read its cause; a `data_volume_full` park is counted and exits the poller 4), except `recovery_wait` with cause
    `worker_requeue_exhausted`: the poller stops on it (exit 0) because only the owner can
    Resume or Cancel; back up first (`uzi-watcher` recovery). `paused` stops the poller because it never
    resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`

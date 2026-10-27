@@ -96,11 +96,11 @@ var errPushRefused = errors.New("checkpoint push refused before the forge call")
 type checkpointPush struct {
 	s *Service
 	// runID is the run Publish was asked about (owned.ID for a real ownership read).
-	runID  uuid.UUID
-	run    store.Run
-	branch string
-	ref    string
-	opts   pushbroker.Options
+	runID         uuid.UUID
+	run           store.Run
+	checkpointKey string // checkpoint slot; independent of the work branch.
+	ref           string
+	opts          pushbroker.Options
 	// live: routed on a LIVE status read, without the run's retention lock; every push is then
 	// refused once livePublishPrePushBudget has passed since routedAt.
 	live     bool
@@ -181,13 +181,13 @@ func (p *checkpointPush) pushOnce(ctx context.Context) error {
 	id, err := p.recordAttempt(ctx)
 	if err != nil {
 		p.clearPreparedAttempt(ctx)
-		slog.Warn("checkpoint: record publish attempt; push not sent", "run", p.runID, "branch", p.branch, "error", err)
+		slog.Warn("checkpoint: record publish attempt; push not sent", "run", p.runID, "branch", p.checkpointKey, "error", err)
 		return errPushRefused
 	}
 	if err := p.observePublishBase(ctx); err != nil {
 		p.preparedID = uuid.Nil
 		s.clearPublishAttempt(ctx, id)
-		slog.Warn("checkpoint: read the publish's compare-and-set base; push not sent", "run", p.runID, "branch", p.branch,
+		slog.Warn("checkpoint: read the publish's compare-and-set base; push not sent", "run", p.runID, "branch", p.checkpointKey,
 			"error", secretscrub.Scrub(err.Error()))
 		return errPushRefused
 	}
@@ -196,7 +196,7 @@ func (p *checkpointPush) pushOnce(ctx context.Context) error {
 			p.preparedID = uuid.Nil
 			s.clearPublishAttempt(ctx, id)
 			slog.Warn("checkpoint: live-routed publish exceeded its pre-push budget; push not sent",
-				"run", p.runID, "branch", p.branch, "elapsed", elapsed, "budget", s.livePublishPrePushBudget)
+				"run", p.runID, "branch", p.checkpointKey, "elapsed", elapsed, "budget", s.livePublishPrePushBudget)
 			return errPushRefused
 		}
 	}
@@ -238,11 +238,11 @@ func pushDefinitelyRefused(err error) bool {
 // p.run is the authorization snapshot and is never refreshed to a newer claim.
 func (p *checkpointPush) recordAttempt(ctx context.Context) (uuid.UUID, error) {
 	if terminalStatuses[p.run.Status] {
-		return p.s.recordPublishAttempt(ctx, p.runID, p.branch, p.ref, p.opts.DeclaredTip, p.attestedSource)
+		return p.s.recordPublishAttempt(ctx, p.runID, p.checkpointKey, p.ref, p.opts.DeclaredTip, p.attestedSource)
 	}
 	return p.s.q.RecordLiveCheckpointPublishAttempt(ctx, store.RecordLiveCheckpointPublishAttemptParams{
 		RecordCheckpointPublishAttemptParams: store.RecordCheckpointPublishAttemptParams{
-			RunID: p.runID, Branch: p.branch, Ref: p.ref, Tip: p.opts.DeclaredTip, AttestedSource: p.attestedSource,
+			RunID: p.runID, Branch: p.checkpointKey, Ref: p.ref, Tip: p.opts.DeclaredTip, AttestedSource: p.attestedSource,
 		},
 		ExpectedWorkerID: p.run.WorkerID, ExpectedClaimGeneration: p.run.ClaimGeneration,
 		AttemptID: p.preparedID,
@@ -429,6 +429,12 @@ func (s *Service) reconcilePublishAttemptLocked(ctx context.Context, id uuid.UUI
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return false, false, fmt.Errorf("read run: %w", err)
 	}
+	if err == nil && run.Kind == "task" {
+		coordinates, coordinateErr := publicationCoordinates(run)
+		if coordinateErr != nil || coordinates == nil || a.Branch != coordinates.CheckpointKey || a.Ref != checkpointRefPrefix+coordinates.CheckpointKey {
+			return s.deferPublishAttempt(ctx, a, "checkpoint coordinates unavailable or changed")
+		}
+	}
 	live := err == nil && !terminalStatuses[run.Status]
 	if live && !a.ReconcileReadyAt.Valid {
 		return false, false, nil
@@ -519,7 +525,7 @@ func (s *Service) reconcilePublishAttemptLocked(ctx context.Context, id uuid.UUI
 		return false, false, err
 	}
 	if derr := s.deleteCheckpointFn(ctx, pushbroker.DeleteOptions{
-		CloneURL: f.cloneURL, Branch: a.Branch, Ref: a.Ref, Username: f.username, PAT: f.pat, ExpectedOldTip: a.Tip,
+		CloneURL: f.cloneURL, CheckpointKey: a.Branch, Ref: a.Ref, Username: f.username, PAT: f.pat, ExpectedOldTip: a.Tip,
 	}); derr != nil {
 		return s.deferPublishAttempt(ctx, a, "delete untracked branch ref: "+scrubForgeError(derr.Error(), f.pat))
 	}

@@ -1,0 +1,23 @@
+{
+  "id": "c-3063",
+  "kind": "control",
+  "input_provenance": "reconstructed",
+  "plan_source": "synthetic",
+  "source": {
+    "pr": 3063,
+    "issue": 2991
+  },
+  "squash_sha": "391b2478e092e40f2790202437d9e3c38cb48453",
+  "base_sha": "976724a58221d50da40569a439288a49fac0db0e",
+  "prefix_tree": "c239f396d4c76a4d1602bf07aa8beb7f6e814320",
+  "prefix_commit": "52a4ccadcf5733331ebde2386fdec4091769e81d",
+  "reversal": "none",
+  "artifacts": {
+    "issue.md": "6907b03b1cbf9cf0fa20c63a4880e1101e15ba336dbc0b4230e0495e850df992",
+    "plan.md": "1de2341ca402f4140a4778c9bc98b067c998f31126cb1182b42c738c2bace359",
+    "prefix.patch": "cc3ecd520d7cbfa77503a0b53712a19cd16b8f779e4bc380a50f15bb82db286c",
+    "removed.patch": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "witnesses": [],
+  "expected": []
+}

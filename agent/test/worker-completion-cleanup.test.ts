@@ -812,6 +812,42 @@ for (const layout of ["scratch", "attempt-parent"] as const) for (const count of
   });
 }
 
+for (const phase of ["queued", "protection"] as const) {
+  it(`M3 already-retired journal: revoked process proof at ${phase} keeps exact journal`, async t => {
+    const f = await fixture(false, true);
+    let release!: () => void, entered!: () => void;
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    let live = true;
+    let lock: Promise<void> | undefined;
+    try {
+      const attemptId = f.completingRecord.completionSource!.attemptId!;
+      f.cmd(f.bare, ["config", "--add", `uzi-attempts.${f.branch}.entry`,
+        JSON.stringify({ runId: f.runId, clonePath: f.clone, attemptId, state: "retired" })]);
+      await fs.rm(f.clone, { recursive: true });
+      const before = f.cmd(f.bare, ["config", "--get", `uzi-recovery.${f.branch}.clone`]);
+      if (phase === "queued") {
+        lock = f.git.withBareLock(f.bare, async () => { entered(); await barrier; });
+        await paused;
+      } else {
+        const protection = f.git.hasPhysicalTerminalProtection.bind(f.git);
+        t.mock.method(f.git, "hasPhysicalTerminalProtection", async (runId: string) => {
+          const result = await protection(runId);
+          entered(); await barrier;
+          return result;
+        });
+      }
+      const check = f.git.completionSourceAlreadyRetired(f.bare, f.branch, f.runId, f.clone, attemptId,
+        { processProof: () => live });
+      await paused;
+      live = false; release();
+      await lock;
+      assert.equal(await check, false, "historical retired ledger cannot substitute for current process proof");
+      assert.equal(f.cmd(f.bare, ["config", "--get", `uzi-recovery.${f.branch}.clone`]), before);
+    } finally { release?.(); await lock; await f.close(); }
+  });
+}
+
 it("predecessor-free already-retired helper clears only its matching journal", async () => {
   const f = await fixture(false, true);
   try {

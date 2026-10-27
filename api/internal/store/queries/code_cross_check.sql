@@ -83,7 +83,7 @@ FOR UPDATE OF lead, cc;
 
 -- name: DecideCodeCrossCheck :one
 UPDATE cross_checks cc SET outcome = @outcome::text, reason_class = sqlc.narg('reason_class')::text,
- findings = @findings::jsonb, decided_at = now()
+ findings = @findings::jsonb, coverage = sqlc.narg('coverage')::jsonb, decided_at = now()
 FROM runs child, runs lead
 WHERE child.id = cc.checker_run_id AND lead.id = cc.lead_run_id
  AND child.id = @child_id AND child.worker_id = @worker_id

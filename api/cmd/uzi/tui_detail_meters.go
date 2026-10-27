@@ -130,7 +130,7 @@ func (m tuiModel) railRateMeters(now time.Time, usedRows int) string {
 	accumulated := 0
 	if codexSnapshot {
 		const deleted = " (deleted)"
-		width := laneRailWidth
+		width := m.railWidth()
 		suffix := ""
 		if m.detail.run.CodexSecretID == nil {
 			width -= len(deleted)
@@ -151,9 +151,9 @@ func (m tuiModel) railRateMeters(now time.Time, usedRows int) string {
 		// lines actually built, so the always-present run label is already in the budget.
 		isRun := runID != nil && t.SecretID == *runID
 		if isRun {
-			lines = append(lines, lipgloss.NewStyle().Foreground(m.pal.tungsten).Render(m.renderer.Plain(t.Label, laneRailWidth)))
+			lines = append(lines, lipgloss.NewStyle().Foreground(m.pal.tungsten).Render(m.renderer.Plain(t.Label, m.railWidth())))
 		} else if showLabel {
-			lines = append(lines, m.pal.faint.Render(m.renderer.Plain(t.Label, laneRailWidth)))
+			lines = append(lines, m.pal.faint.Render(m.renderer.Plain(t.Label, m.railWidth())))
 		}
 		lines = append(lines,
 			m.rateWindowCell("5h", t.Limits.FiveHour, railRateBarWidth, 4, now),
@@ -181,12 +181,12 @@ func (m tuiModel) railRateMeters(now time.Time, usedRows int) string {
 // the run inherits the worker binding with no pending switch (credential_override null AND
 // credential_switch null), so the common case adds no line (and no stray blank row).
 //
-// Two lines, not one: joinColumns clamps every rail line to laneRailWidth (26), and the packed
+// Two lines, not one: joinColumns clamps every rail line to railWidth() (26 at the minimum), and the packed
 // one-line form ("token: <label> (run-pinned) · switch requested") is always wider than that, so the
 // clamp TRUNCATED the pending-switch marker — the transient, attention-worthy signal the line exists
 // to surface — off the tail. Rendering the switch on its OWN line (mirroring renderMilestones'
 // eyebrow→continuation-line precedent) keeps it inside the rail, fully rendered. Each line is
-// self-capped to laneRailWidth by renderer.Plain (token line) or is a short server enum (switch
+// self-capped to railWidth() by renderer.Plain (token line) or is a short server enum (switch
 // line), so neither depends on the joinColumns clamp to fit.
 //
 // usedRows budgets each line whole-line-or-nothing against the remaining rail height, the same
@@ -222,7 +222,7 @@ func (m tuiModel) railCredentialLine(usedRows int) string {
 }
 
 // railCredentialTokenLine builds the faint "token: <choice>" rail line, or "" when the run carries no
-// credential override. The WHOLE line rides renderer.Plain at laneRailWidth so the USER-AUTHORED
+// credential override. The WHOLE line rides renderer.Plain at railWidth() so the USER-AUTHORED
 // override label (D7) is sanitized and the line is capped to the rail width in one place; a long
 // label may push "(run-pinned)" past the cap and lose it, which is acceptable — the label is the
 // priority on the token line. The mode words are server enums (auto/default) rendered honestly (an
@@ -232,11 +232,11 @@ func (m tuiModel) railCredentialTokenLine() string {
 	if co == nil {
 		return ""
 	}
-	return m.pal.faint.Render(m.renderer.Plain("token: "+m.railOverrideMode(co), laneRailWidth))
+	return m.pal.faint.Render(m.renderer.Plain("token: "+m.railOverrideMode(co), m.railWidth()))
 }
 
 // railCredentialSwitchLine builds the faint pending-switch rail line ("switch requested" / "switch
-// released") on its OWN line, so the marker fully renders inside laneRailWidth rather than being
+// released") on its OWN line, so the marker fully renders inside railWidth() rather than being
 // truncated off the token line. "" when no switch is in flight. The switch word is a server enum
 // rendered honestly; an unrecognised value rides renderer.Plain rather than reaching the frame raw.
 func (m tuiModel) railCredentialSwitchLine() string {
@@ -250,7 +250,7 @@ func (m tuiModel) railCredentialSwitchLine() string {
 	case "released":
 		return m.pal.faint.Render("switch released")
 	default:
-		return m.pal.faint.Render("switch " + m.renderer.Plain(*sw, laneRailWidth))
+		return m.pal.faint.Render("switch " + m.renderer.Plain(*sw, m.railWidth()))
 	}
 }
 
@@ -263,7 +263,7 @@ func (m tuiModel) railOverrideMode(co *apitypes.CredentialOverrideDTO) string {
 	switch co.Mode {
 	case "pinned":
 		if co.Label != nil && *co.Label != "" {
-			return m.renderer.Plain(*co.Label, laneRailWidth) + " (run-pinned)"
+			return m.renderer.Plain(*co.Label, m.railWidth()) + " (run-pinned)"
 		}
 		return "run-pinned"
 	case "auto":
@@ -271,6 +271,6 @@ func (m tuiModel) railOverrideMode(co *apitypes.CredentialOverrideDTO) string {
 	case "default":
 		return "default"
 	default:
-		return m.renderer.Plain(co.Mode, laneRailWidth)
+		return m.renderer.Plain(co.Mode, m.railWidth())
 	}
 }

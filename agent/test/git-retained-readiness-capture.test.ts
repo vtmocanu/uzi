@@ -120,7 +120,14 @@ for (const mode of ["outside-positive", "awaited-capture", "ignored-capture"] as
       hold.resolve();
       try {
         await Promise.allSettled([...(attempt ? [attempt] : []), ...(operation ? [operation] : [])]);
-        assert.deepEqual(await safety.dispose({ boundary: "checkpoint", deadlineMs: 10000 }), { kind: "disposed" });
+        // The direct readiness child is independent of this registry. Close and
+        // settle the epoch through its real boundary before requesting disposal.
+        if (mode === "outside-positive")
+          await safety.withBoundary({ boundary: "checkpoint", deadlineMs: 10000 }, async () => {});
+        const disposal = await safety.dispose({ boundary: "terminal", deadlineMs: 10000 });
+        assert.deepEqual(disposal, { kind: "disposed" });
+        assert.equal(safety.acceptsTerminalDisposal(disposal), true);
+        assert.equal(safety.acceptsTerminalDisposal({ ...disposal }), false);
       } finally { f.cleanup(); }
     }
     t.diagnostic(JSON.stringify({ mode, inside, afterCapture, launches, waits, disposals,

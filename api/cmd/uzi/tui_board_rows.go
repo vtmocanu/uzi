@@ -145,7 +145,7 @@ func (m tuiModel) rateWindowCell(label string, w *apitypes.RateLimitWindow, barW
 	}
 	// Inline reset countdown after the percent, when Anthropic reported a reset time for this
 	// window (issue #588). shortDuration clamps a past reset to "0s". The strip is width-clamped
-	// downstream and the rail row is width-locked to laneRailWidth (26), which is why the two
+	// downstream and the rail meter row keeps the fixed laneRailWidth (26) budget, which is why the two
 	// surfaces space the countdown differently: the board appends a single space + bare duration,
 	// the rail a 2-col gap + a 6-col right-aligned field (max real value "23h59m" = 6 cols).
 	if w.ResetsAt != nil {
@@ -363,7 +363,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	}
 	if workerWidth > 0 {
 		row = padSeg(clampVisual(row, contentWidth), contentWidth, bg) + gap +
-			paintSeg(m.pal.faintC, bg, false, padCell(m.renderer.Plain(text.runWorkerName, 16), 16))
+			paintSeg(m.pal.faintC, bg, false, padVisual(m.renderer.WorkerName(text.runWorkerName, 16), 16))
 	}
 	return clampVisual(row, m.width)
 }
@@ -581,7 +581,7 @@ func providerBoardLine(r apitypes.RunDTO) string {
 func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
 	return (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
 		codexAccountActionLine(r.RunDTO) != "" || vaultParkLine(r.RunDTO) != "" ||
-		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != "" || credentialSwitchHoldLine(r.RunDTO) != "" || isOwnerRequiredWorkerHold(r.RunDTO) ||
+		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != "" || credentialSwitchHoldLine(r.RunDTO) != "" || isOwnerRequiredWorkerHold(r.RunDTO) || isRetainedRecovery(r.RunDTO) ||
 		isProviderUnavailableHold(r.RunDTO) || providerParkLine(r.RunDTO) != ""
 }
 
@@ -609,6 +609,14 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 			ink = m.pal.amber
 		}
 		out := prefix + paintSeg(ink, bg, false, m.renderer.Plain(line, 240))
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
+	if isRetainedRecovery(r.RunDTO) {
+		line := "Timed retry · Resume now/Cancel · detail: enter"
+		if isRetainedRecoveryHold(r.RunDTO) {
+			line = "Owner-held · Resume now/Cancel · detail: enter"
+		}
+		out := prefix + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 240))
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}
 	if isMemoryHold(r.RunDTO) {

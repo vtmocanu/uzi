@@ -3,20 +3,21 @@
 // link gate. Kept out of Board.tsx so the mapping is unit-tested in isolation
 // (see runBadge.test.ts), the same split the run stream uses (runStream.ts).
 
-import {
-  isTerminalRun,
-  type LatestRun,
-  type Run,
-  type Milestone,
-  type MilestoneAgent,
-  type RunHealth,
-  type RunPriority,
-  type StopKind,
-} from "./api";
+import type {
+  LatestRun,
+  Run,
+  Milestone,
+  MilestoneAgent,
+  QueueReason,
+  RunHealth,
+  RunPriority,
+  StopKind,
+} from "./apiTypes";
+import { isTerminalRun } from "./runStatus";
 import { credentialSwitchHold } from "./credentialSwitchHold";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
 import { formatCountdown } from "./limitWait";
-import { stripUnsafeChars } from "./safeText";
+import { stripDisplayCell, stripUnsafeChars } from "./safeText";
 
 // Tones mirror StatusPill's RUN_STATUS_TONES (ui.tsx) so one status renders one
 // color everywhere: queue (queued), neutral (stopped/idle), info
@@ -37,6 +38,9 @@ export type RunBadge =
       tone: BadgeTone;
       pulse: boolean;
       title?: string;
+      // wrap lets a sentence-length label (the maintenance wait) wrap instead of
+      // overflowing a narrow card; absent keeps the usual one-line pill.
+      wrap?: boolean;
     };
 
 // MrChipState is the MR chip's display variant (PRD #33 Decision 2, a
@@ -154,6 +158,9 @@ const PARK_LABELS = {
   limit_wait: "limit wait",
   pool_wait: "waiting for pool",
   recovery_wait: "recovery wait",
+  retained_recovery_retrying: "retained recovery retrying",
+  retained_recovery_held: "retained recovery needs decision",
+  retained_recovery_unknown: "retained recovery timing unknown",
   worker_requeue_exhausted: "recovery needs decision",
   worker_memory_pressure: "memory pressure: owner hold",
   paused: "paused",
@@ -190,6 +197,7 @@ export function effectiveRunStatus(
     completion_phase?: "checking" | "reworking" | "blocked" | "";
     hold_reason?: string | null;
     recovery_wait_cause?: string | null;
+    recovery_retry_not_before?: string | null;
   },
 ): string {
   if (run.status === "paused" && run.hold_reason === "provider_unavailable") return "provider_unavailable";
@@ -226,6 +234,14 @@ export function effectiveRunStatus(
   // and the board card's LatestRun (the server's board projection sends hold_reason on every
   // card, so runBadge meets this key too).
   if (run.status === "paused" && run.hold_reason === "credential_disabled") return "credential_disabled";
+  if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_exhausted") {
+    // Only explicit null means owner-held. Omitted or invalid timing stays unknown.
+    if (run.recovery_retry_not_before === null) return "retained_recovery_held";
+    if (typeof run.recovery_retry_not_before === "string" && Number.isFinite(Date.parse(run.recovery_retry_not_before))) {
+      return "retained_recovery_retrying";
+    }
+    return "retained_recovery_unknown";
+  }
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "worker_requeue_exhausted") return "worker_requeue_exhausted";
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure") return "worker_memory_pressure";
   return run.status;
@@ -361,7 +377,7 @@ export function runStatusTone(
   if (status === "pool_wait") return "warning";
   // Recovery holds use warning: transient recovery and worker exhaustion are
   // non-terminal, though exhaustion requires an owner decision.
-  if (status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure") return "warning";
+  if (status === "retained_recovery_retrying" || status === "retained_recovery_held" || status === "retained_recovery_unknown" || status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure") return "warning";
   // PRD #1190: an ordinary paused run. INFO, not the warn the involuntary holds carry
   // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
   // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
@@ -448,7 +464,27 @@ export type HealthFlaggable = {
   // near-timeout flag ("slow") counts DOWN to it; optional for api/web rollout skew —
   // an older api pod omits it and the badge falls back to the since-flagged suffix.
   deadline_at?: string | null;
+  // PRD #3454: "maintenance" while instance maintenance mode holds this queued run back.
+  // Optional for api/web rollout skew; absent reads as no instance hold.
+  queue_reason?: QueueReason | null;
 };
+
+// isMaintenanceQueued reports whether instance maintenance mode, not a missing worker, is
+// why this run waits. The server derives queue_reason from the same SQL function the claim
+// uses, so it never lags; the status check is belt-and-braces for a stale frame.
+export function isMaintenanceQueued(run: { status: string; queue_reason?: QueueReason | null }): boolean {
+  return run.status === "queued" && run.queue_reason === "maintenance";
+}
+
+// maintenanceQueueText is the one sentence every surface uses for a maintenance-held run,
+// with the admin's reason appended when the shared maintenance state carries one. The reason
+// is admin-authored free text: reduced to one display cell here.
+export function maintenanceQueueText(reason?: string | null): string {
+  const clean = stripDisplayCell(reason).trim();
+  return clean === ""
+    ? "waiting: uzi is in maintenance mode"
+    : `waiting: uzi is in maintenance mode (${clean})`;
+}
 
 // healthSuffix is the trailing clause on a flagged run's pill. For the NEAR-TIMEOUT flag
 // ("slow", PRD #1170) it counts DOWN to the run's server-computed deadline — `· 1h 5m
@@ -477,7 +513,24 @@ function healthSuffix(run: HealthFlaggable, nowMs: number): string {
 export function healthBadge(
   run: HealthFlaggable,
   nowMs: number,
+  maintenanceReason?: string | null,
 ): RunBadge | null {
+  // PRD #3454: a maintenance-held run is waiting ON PURPOSE. This takes precedence over
+  // every health flag (the server's detector may still say waiting_worker): a calm INFO
+  // pill, no pulse, no elapsed "stuck for" clock, since the wait is the admin's drain.
+  // The visible label is the full PRD sentence (reason included), wrapping on a narrow
+  // card; the title repeats it for a truncating surface.
+  if (isMaintenanceQueued(run)) {
+    const text = maintenanceQueueText(maintenanceReason);
+    return {
+      kind: "badge",
+      label: text,
+      tone: "info",
+      pulse: false,
+      title: text,
+      wrap: true,
+    };
+  }
   if (!shouldShowHealthFlag(run.health, run.status)) return null;
   const label = healthFlagLabel(run.health);
   return {
@@ -485,48 +538,13 @@ export function healthBadge(
     label: `⚠ ${label}${healthSuffix(run, nowMs)}`,
     tone: "warning",
     pulse: true,
-    title: badgeTitle(run.health_reason),
+    title: stripDisplayCell(run.health_reason) || undefined,
   };
 }
 
-/**
- * Issue #124 for the badge TOOLTIP, which is an ATTRIBUTE — and a whole-subtree
- * `container.textContent` assertion cannot see attribute values. That is why this class keeps
- * recurring: text is covered INCIDENTALLY by any subtree assertion, attributes only where
- * someone wrote an explicit check (`Judge.test.tsx` via getByLabelText,
- * `WorkerUpgradeBadge.test.tsx` via `span[title]` — so coverage exists, it is just never free).
- *
- * TWO renderers consume this descriptor, not five. The five `title={…}` badge sites share a
- * `{label, tone, title}` SHAPE, not a constructor:
- *
- *   Board.tsx          <- runBadge()        here            covered
- *   RunHealthBadge.tsx <- healthBadge()     here            covered
- *   JudgeRunBadge.tsx  <- judgeBadge()      judgeBadge.ts   not reached by this fix
- *   WorkerRunBadge.tsx <- workerRunBadge()  workerRuns.ts   not reached by this fix
- *   CIFixRunHeader.tsx <- fixVerdictChip()  fixVerdict.ts   not reached by this fix
- *
- * The three others need nothing TODAY, checked rather than assumed: `judgeBadge` is a closed
- * verdict lookup plus a count; `workerRunBadge` has TWO arms, a template over two numbers and
- * the literal "Holds an active run"; `fixVerdictChip` is four literals. But they are
- * where the next untrusted interpolation would land without a strip, and composing here
- * cannot reach them — so this placement prevents drift between the two constructors it owns,
- * NOT across all five. (An earlier version of this comment claimed the opposite; the drift it
- * said it was preventing is the drift that already exists.)
- *
- * Stripped at the descriptor rather than at the two renderers because this function's output
- * is display-only by construction — never posted back, never a key — so it is still a display
- * transform and not a boundary one.
- *
- * Covers BOTH title sources, which is why the fix does not depend on settling their
- * provenance separately:
- *   - `failure_reason` is worker-supplied and ingest does not strip it
- *     (workersvc `sanitizeFailureReason` is stripNUL + truncate). `service.go` writes
- *     `err.Error()` straight in, and a hostile repo can shape the error an agent fails
- *     with — attacker-influenceable, owner-only audience.
- *   - `health_reason` is server-composed as far as was traced, and NOT exhaustively so.
- *     The CLI already routes it through `sanitizeTTY` (cmd/uzi/run.go), so the web was the
- *     inconsistent side of a decision the CLI had already made.
- */
+// Failure tooltips keep the multiline stripUnsafeChars boundary. Health reasons
+// use stripDisplayCell in healthBadge, including manual cordon attribution. Both
+// descriptors are display-only; raw DTO values remain unchanged.
 function badgeTitle(reason: string | null | undefined): string | undefined {
   const clean = reason ? stripUnsafeChars(reason) : "";
   return clean === "" ? undefined : clean;
@@ -534,7 +552,7 @@ function badgeTitle(reason: string | null | undefined): string | undefined {
 
 // runBadge maps a card's latest_run to its primary status pill. nowMs is passed in
 // (not read from Date.now) so the running elapsed is deterministic under test.
-export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause" | "worker_recovery" | "requeue_count" | "memory_hold">>, nowMs: number): RunBadge {
+export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause" | "recovery_retry_not_before" | "worker_recovery" | "requeue_count" | "memory_hold">>, nowMs: number, maintenanceReason?: string | null): RunBadge {
   // The stopped signal wins over the raw status so a cancel-shaped `failed`
   // never renders as breakage.
   if (isStoppedRun(run.status, run.stop_kind)) {
@@ -557,7 +575,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
   // calm "revising" info badge is the more informative live-state, matching the strip/
   // ring/favicon dropping the run entirely. Non-revising runs are byte-identical (the
   // `eff !== "revising"` guard is a no-op unless the run is revising).
-  const flagged = healthBadge(run, nowMs);
+  const flagged = healthBadge(run, nowMs, maintenanceReason);
   if (flagged && eff !== "revising") return flagged;
   switch (eff) {
     case "queued":
@@ -697,6 +715,17 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
         pulse: false,
         title:
           "Waiting for a pooled Anthropic token. It resumes automatically once one is added to the pool.",
+      };
+    case "retained_recovery_retrying":
+    case "retained_recovery_held":
+    case "retained_recovery_unknown":
+      return {
+        kind: "badge", label: PARK_LABELS[eff], tone: "warning", pulse: false,
+        title: eff === "retained_recovery_held"
+          ? "Retained recovery needs an owner decision. Only the run owner can resume or cancel; there is no scheduled retry."
+          : eff === "retained_recovery_retrying"
+            ? "Retained recovery retries automatically after the scheduled time, including when that time is already due. Only the run owner can resume now or cancel."
+            : "Retained recovery timing is unavailable. Open the run page for details; an owner hold cannot be inferred.",
       };
     // Exhaustion is an owner decision, with no timer or automatic resumption.
     case "worker_requeue_exhausted":
@@ -974,6 +1003,7 @@ export function needsHumanAttention(status: string): boolean {
     isAwaitingApproval(status) ||
     isAwaitingInput(status) ||
     isAwaitingFollowup(status) ||
+    status === "retained_recovery_held" ||
     status === "worker_requeue_exhausted" ||
     status === "worker_memory_pressure" ||
     status === "provider_unavailable" ||

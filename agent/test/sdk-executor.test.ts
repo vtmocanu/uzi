@@ -14,6 +14,7 @@ import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWal
 const HAS_PROCFS = process.platform === "linux";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError, ProviderTransientError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
+import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { LimitReachedError } from "../src/limit.js";
 import { EnvProbeCleanupError } from "../src/env-probe.js";
@@ -2374,27 +2375,40 @@ describe("SdkExecutor guardrail options", () => {
     assert.strictEqual(out.hookSpecificOutput?.permissionDecision, "deny");
   });
 
-  it("hands the SDK a sparse env with no worker secrets (every turn)", async () => {
-    const { queryFn, turns } = fakeTurns([
-      [submitPlan("plan"), resultSuccess()],
-      [signalDone(), resultSuccess()],
-    ]);
-    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx().ctx);
+  for (const sqlcDir of [undefined, "/synthetic/uzi-sqlc-cache"]) {
+    it(`hands the SDK a sparse env with no worker secrets (every turn) (UZI_SQLC_DIR ${sqlcDir === undefined ? "absent" : "present"})`, async () => {
+      const savedSqlcDir = process.env.UZI_SQLC_DIR;
+      try {
+        if (sqlcDir === undefined) delete process.env.UZI_SQLC_DIR;
+        else process.env.UZI_SQLC_DIR = sqlcDir;
+        const { queryFn, turns } = fakeTurns([
+          [submitPlan("plan"), resultSuccess()],
+          [signalDone(), resultSuccess()],
+        ]);
+        await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx().ctx);
 
-    for (const t of turns) {
-      const env = t.options.env!;
-      // Core keys + TMPDIR (5-bis per-uid scratch, when the ambient env has one) — never a
-      // worker secret. TMPDIR is not a secret. AGENT_BROWSER_ARGS is a non-secret browser launch
-      // FLAG (buildSdkEnv, issue #709): it guarantees --no-sandbox survives a shim bypass, not a
-      // credential — the no-PAT / no-join-token assertions below still hold.
-      const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
-      if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
-      assert.deepStrictEqual(new Set(Object.keys(env)), expected);
-      const serialized = JSON.stringify(env);
-      assert.ok(!serialized.includes(FAKE_PAT), "PAT must not reach the SDK env");
-      assert.ok(!serialized.includes(FAKE_JOIN_TOKEN), "join token must not reach the SDK env");
-    }
-  });
+        for (const t of turns) {
+          const env = t.options.env!;
+          // Core keys + TMPDIR (5-bis per-uid scratch, when the ambient env has one) — never a
+          // worker secret. TMPDIR is not a secret. AGENT_BROWSER_ARGS is a non-secret browser launch
+          // FLAG (buildSdkEnv, issue #709): it guarantees --no-sandbox survives a shim bypass, not a
+          // credential — the no-PAT / no-join-token assertions below still hold.
+          const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
+          if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
+          if (sqlcDir !== undefined) expected.add("UZI_SQLC_DIR");
+          assert.deepStrictEqual(new Set(Object.keys(env)), expected);
+          assert.strictEqual(Object.hasOwn(env, "UZI_SQLC_DIR"), sqlcDir !== undefined);
+          assert.strictEqual(env.UZI_SQLC_DIR, sqlcDir);
+          const serialized = JSON.stringify(env);
+          assert.ok(!serialized.includes(FAKE_PAT), "PAT must not reach the SDK env");
+          assert.ok(!serialized.includes(FAKE_JOIN_TOKEN), "join token must not reach the SDK env");
+        }
+      } finally {
+        if (savedSqlcDir === undefined) delete process.env.UZI_SQLC_DIR;
+        else process.env.UZI_SQLC_DIR = savedSqlcDir;
+      }
+    });
+  }
 
   it("resumes the session across turns, seeding from the claim's session id", async () => {
     const { queryFn, turns } = fakeTurns([
@@ -3624,6 +3638,37 @@ describe("SdkExecutor tool provisioning (PRD #18 M3)", () => {
     assert.strictEqual(env.NIX_SSL_CERT_FILE, "/etc/ssl/cert.pem");
     // The credential is still there and untouched by provisioning.
     assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, OAUTH);
+  });
+
+  it("issue #3382: the configured Go concurrency reaches the SDK env on every turn, absent when unset", async () => {
+    const provision: SdkExecutorOptions["provision"] = async () => ({
+      toolEnv: { PATH: "/nix/go/bin:/usr/bin", GOFLAGS: "-toolexec=evil" },
+    });
+    try {
+      for (const settings of [{ buildParallelism: 2, maxProcs: 3 }, {}]) {
+        configureGoConcurrency(settings);
+        const { queryFn, turns } = fakeTurns([
+          [submitPlan("# plan"), resultSuccess()],
+          [signalDone(), resultSuccess()],
+        ]);
+        const probe = makeCtx({ runId: "66666666-6666-6666-6666-666666666666", config: { tool_packages: ["go"] } });
+        await new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(probe.ctx);
+        assert.ok(turns.length >= 2);
+        for (const t of turns) {
+          const env = t.options.env as Record<string, string | undefined>;
+          assert.strictEqual(env.PATH, "/nix/go/bin:/usr/bin");
+          if (settings.buildParallelism === undefined) {
+            // The unset case still carries the provisioned value; the worker adds nothing.
+            assert.strictEqual(Object.hasOwn(env, "GOMAXPROCS"), false);
+          } else {
+            assert.strictEqual(env.GOFLAGS, "-p=2");
+            assert.strictEqual(env.GOMAXPROCS, "3");
+          }
+        }
+      }
+    } finally {
+      configureGoConcurrency({});
+    }
   });
 
   it("provisions under the SHARED HOME while the SDK $HOME is per-run (PRD #42 Decision 5)", async () => {
@@ -6249,6 +6294,208 @@ describe("SdkExecutor empty-turn recovery (issue #1197 D-RC2b)", () => {
       probe.emits.some((m) => m.kind === "status" && RETRY_NOTICE.test(String(m.payload["text"]))),
       "the implement empty turn emitted a retry notice",
     );
+  });
+});
+
+// Issue #3179: a Claude turn whose SDK stream ends with NO events and no terminal used to fold into a
+// finished iteration (numTurns undefined is not positively empty), losing the plan, safety steer and
+// held owner batch the attempt carried. It now retries in place through the same bounded retry.
+describe("SdkExecutor event-free stream recovery (issue #3179)", () => {
+  const EVENT_FREE_NOTICE = /stream ended without any events; retrying/;
+  const fastRecovery = (queryFn: SdkQueryFn, maxRetries = 2, backoff = 0): SdkExecutorOptions => ({
+    queryFn,
+    emptyTurnBackoffBaseMs: backoff,
+    emptyTurnMaxRetries: maxRetries,
+  });
+  /** A script that records the moment its attempt starts streaming, then yields `msgs`. */
+  const attempt = (log: string[], name: string, msgs: SDKMessage[]): Script =>
+    () => { log.push(name); return msgs as unknown as AsyncIterable<unknown>; };
+  const statusTexts = (emits: EmittedMessage[]): string[] =>
+    emits.filter((m) => m.kind === "status").map((m) => String(m.payload["text"]));
+  const occurrences = (haystack: string, needle: string): number => haystack.split(needle).length - 1;
+
+  const variants: Array<[string, Partial<RunContext>]> = [
+    ["seeded", { seeded: true, reviewedPlanResume: false }],
+    ["reviewed-plan resume", { seeded: false, reviewedPlanResume: true }],
+  ];
+  for (const [name, variant] of variants) {
+    it(`${name}: an event-free first implement attempt is retried with the plan, steer and held owner batch intact`, async () => {
+      const log: string[] = [];
+      let steerPulls = 0;
+      let ownerGiven = false;
+      const { queryFn, turns } = fakeTurns([
+        attempt(log, "attempt 1", []),
+        attempt(log, "attempt 2", [assistantText("working", "s-retry"), resultSuccess("s-retry")]),
+        attempt(log, "attempt 3", [signalDone("s-retry"), resultSuccess("s-retry")]),
+      ]);
+      const probe = makeCtx({
+        planApproved: true, approvedPlan: "# Approved PLAN-MARK", sessionId: null,
+        config: { max_iterations: 5 },
+        ...variant,
+        pullSafetySteer: () => (steerPulls++ === 0 ? "STEER-MARK" : undefined),
+        pullFollowUps: () => {
+          if (ownerGiven) return [];
+          ownerGiven = true;
+          return [{ id: 77, body: "OWNER-BODY-MARK" }];
+        },
+        followUpIncluded: (id) => { log.push(`included ${id}`); },
+      });
+      await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx);
+
+      assert.equal(turns.length, 3, "event-free attempt + retry + the follow-on iteration");
+      const retried = turns[1]!.promptText ?? "";
+      for (const mark of ["PLAN-MARK", "STEER-MARK", "OWNER-BODY-MARK"]) {
+        assert.equal(occurrences(retried, mark), 1, `${mark} appears exactly once in the retried prompt`);
+      }
+      assert.deepEqual(log.filter((l) => l.startsWith("included")), ["included 77"], "one inclusion receipt");
+      assert.ok(log.indexOf("included 77") > log.indexOf("attempt 2"), "the receipt waits for model-processing evidence");
+      const iterations = statusTexts(probe.emits).filter((t) => t.startsWith("implement/review iteration"));
+      assert.deepEqual(iterations, ["implement/review iteration 1", "implement/review iteration 2"],
+        "the event-free attempt did not consume an iteration");
+      assert.equal(turns[2]!.options.resume, "s-retry", "the next turn resumes the retried attempt's session");
+      assert.ok(statusTexts(probe.emits).some((t) => EVENT_FREE_NOTICE.test(t)), "a truthful retry notice is emitted");
+    });
+  }
+
+  const interruptedCtx = (extra: Partial<RunContext>) => {
+    const snapshot = { base: "interrupted", interruptedEdits: false, commits: 0 } as const;
+    let gets = 0;
+    const probe = makeCtx({
+      seeded: true, planApproved: true, approvedPlan: "approved", interruptedSnapshot: snapshot,
+      config: { max_iterations: 5 },
+      getInterruptedCalls: () => { gets++; return m3Calls(); },
+      ...extra,
+    });
+    return { probe, gets: () => gets };
+  };
+
+  it("consecutive event-free attempts each re-send the interrupted-calls note, fetched once", async () => {
+    const { queryFn, turns } = fakeTurns([[], [], [signalDone(), resultSuccess()]]);
+    const { probe, gets } = interruptedCtx({});
+    await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx);
+    assert.equal(turns.length, 3);
+    for (const t of turns) assert.match(t.promptText ?? "", /interrupted_calls_/);
+    assert.equal(gets(), 1);
+  });
+
+  it("a note delivered to an attempt that processed it is not re-sent after a later event-free attempt", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [assistantText("started", "s1"), resultApiError(529, "API Error: 529 Overloaded", "s1")],
+      [],
+      [signalDone("s1"), resultSuccess("s1")],
+    ]);
+    const { probe, gets } = interruptedCtx({});
+    await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx);
+    assert.equal(turns.length, 3);
+    assert.match(turns[0]!.promptText ?? "", /interrupted_calls_/);
+    assert.doesNotMatch(turns[1]!.promptText ?? "", /interrupted_calls_/);
+    assert.doesNotMatch(turns[2]!.promptText ?? "", /interrupted_calls_/);
+    assert.equal(gets(), 1);
+  });
+
+  it("exhausted event-free planning retries park with an event-free message, not a zero-turn claim", async () => {
+    const { queryFn, turns } = fakeTurns([[]]);
+    const probe = makeCtx();
+    const err = await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn, 2)).run(probe.ctx).then(
+      () => undefined, (e: unknown) => e);
+    assert.ok(err instanceof TransientRecoveryError);
+    assert.match(err.message, /without any events/);
+    assert.equal(err.providerOrigin, false);
+    assert.equal(turns.length, 3, "1 + maxRetries drives");
+    const notices = statusTexts(probe.emits).filter((t) => /retrying/.test(t));
+    assert.equal(notices.length, 2);
+    for (const n of notices) {
+      assert.match(n, EVENT_FREE_NOTICE);
+      assert.doesNotMatch(n, /0 turns/);
+    }
+    assert.deepEqual(probe.gated, []);
+  });
+
+  it("exhausted event-free implement retries park with an event-free message", async () => {
+    const { queryFn, turns } = fakeTurns([[]]);
+    const probe = makeCtx({ seeded: true, planApproved: true, approvedPlan: "approved" });
+    const err = await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn, 1)).run(probe.ctx).then(
+      () => undefined, (e: unknown) => e);
+    assert.ok(err instanceof TransientRecoveryError);
+    assert.match(err.message, /without any events/);
+    assert.equal(err.providerOrigin, false);
+    assert.equal(turns.length, 2);
+  });
+
+  it("cancellation during the event-free backoff throws REASON_CANCELLED, not recovery", async () => {
+    const { queryFn, turns } = fakeTurns([[]]);
+    const ac = new AbortController();
+    const probe = makeCtx({ signal: ac.signal });
+    const slices: number[] = [];
+    // Cancel exactly at entry into the backoff that follows the event-free attempt: no timers.
+    const emptyTurnSleep = async (ms: number): Promise<void> => { slices.push(ms); ac.abort(); };
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { ...fastRecovery(queryFn, 2, 1000), emptyTurnSleep }).run(probe.ctx),
+      (err: unknown) => err instanceof Error && /run cancelled/.test(err.message) && !(err instanceof TransientRecoveryError),
+    );
+    assert.equal(turns.length, 1, "the event-free attempt ran once and nothing was re-dispatched");
+    assert.equal(slices.length, 1, "the cancel landed in the first backoff slice");
+  });
+
+  it("a spent wall trips the wall outcome, not recovery, after an event-free attempt", async (t) => {
+    const { queryFn, turns } = fakeTurns([[]]);
+    let now = Date.now();
+    t.mock.method(Date, "now", () => now);
+    const probe = makeCtx({ config: { run_timeout_seconds: 60 } });
+    let slices = 0;
+    // Each backoff slice advances the mocked clock past the whole wall: no real waits.
+    const emptyTurnSleep = async (): Promise<void> => { slices++; now += 61_000; };
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { ...fastRecovery(queryFn, 2, 1000), emptyTurnSleep }).run(probe.ctx),
+      (err: unknown) => err instanceof Error && /wall-clock timeout/.test(err.message) && !(err instanceof TransientRecoveryError),
+    );
+    assert.equal(slices, 1, "the event-free attempt completed and entered the backoff");
+    assert.equal(turns.length, 1, "the wall-tripped re-drive made no SDK dispatch");
+  });
+
+  it("a terminal-fenced run makes no further dispatch after an event-free attempt", async () => {
+    let fenced = false;
+    let queries = 0;
+    const { queryFn } = fakeTurns([() => { queries++; fenced = true; return [] as unknown as AsyncIterable<unknown>; }]);
+    const probe = makeCtx({
+      seeded: true, planApproved: true, approvedPlan: "approved", claimFenced: () => fenced,
+    });
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx),
+      (err: unknown) => err instanceof Error && /run cancelled/.test(err.message) && !(err instanceof TransientRecoveryError),
+    );
+    assert.equal(queries, 1);
+    // The event-free retry path was entered (base folds the attempt into a finished iteration instead).
+    assert.match(statusTexts(probe.emits).join("\n"), EVENT_FREE_NOTICE);
+  });
+
+  it("plan phase: an event-free planning turn is retried and its plan reaches the gate", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [],
+      [submitPlan("# P"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx);
+    assert.deepEqual(probe.gated, ["# P"]);
+    assert.equal(turns.length, 3);
+  });
+
+  it("guard: a planning turn with a terminal but no plan still fails REASON_NO_PLAN without retry", async () => {
+    const { queryFn, turns } = fakeTurns([[resultNoTurns()]]);
+    const probe = makeCtx();
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx),
+      (err: unknown) => err instanceof Error && /without submitting a plan/.test(err.message) && !(err instanceof TransientRecoveryError),
+    );
+    assert.equal(turns.length, 1);
+  });
+
+  it("guard: a stream that yielded an event but no terminal is not treated as event-free", async () => {
+    const { queryFn } = fakeTurns([[assistantText("partial")]]);
+    const probe = makeCtx({ seeded: true, planApproved: true, approvedPlan: "approved", config: { max_iterations: 1 } });
+    await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx).catch(() => undefined);
+    assert.ok(!statusTexts(probe.emits).some((t) => EVENT_FREE_NOTICE.test(t)), "no event-free retry notice");
   });
 });
 

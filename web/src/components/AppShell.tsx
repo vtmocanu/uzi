@@ -20,6 +20,8 @@ import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { HealthDangerBanner } from "./HealthDangerBanner";
 import { healthPipLabel } from "../lib/healthView";
 import { HealthStatusProvider, useHealthStatus } from "../lib/useAdminHealth";
+import { MaintenanceProvider } from "../lib/useMaintenance";
+import { MaintenanceBanner } from "./MaintenanceBanner";
 import { RateLimitAnnouncer } from "./RateLimitMeters";
 import { SidebarUsageLimits } from "./SidebarUsageLimits";
 import { useFavicon } from "../lib/useFavicon";
@@ -1309,6 +1311,9 @@ export function AppShell({ children }: { children: ReactNode }) {
     // Health page), so every consumer reads one provider and the isAdmin gate lives in one
     // place. A non-admin session never fetches the admin endpoint.
     <HealthStatusProvider>
+      {/* The ONE GET /api/maintenance poll (PRD #3454), for every signed-in user: feeds the
+          maintenance banner, the queue-reason labels and the admin card's reload. */}
+      <MaintenanceProvider>
       {/* Width/padding are literal class strings in the ternary so Tailwind's JIT
           emits both — an interpolated `lg:pl-${n}` would never be scanned. */}
       <div className={cx("min-h-screen", collapsed ? "lg:pl-14" : "lg:pl-60")}>
@@ -1392,6 +1397,9 @@ export function AppShell({ children }: { children: ReactNode }) {
           {/* Vault locked banner (PRD #32): app-wide so the user can unlock from
               any page. Self-gates — renders nothing while unlocked. */}
           <VaultLockedBanner />
+          {/* Maintenance mode (PRD #3454): app-wide, every signed-in user, info tone, self-gating
+              — renders nothing unless an admin has paused intake. */}
+          <MaintenanceBanner />
           {/* Update escalation banner (PRD #836 M6): app-wide, admin-only, self-gating —
               renders nothing unless the server says the instance is far behind and the
               banner is enabled and not snoozed for the current release. */}
@@ -1425,6 +1433,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         />
       )}
       </div>
+      </MaintenanceProvider>
     </HealthStatusProvider>
   );
 }

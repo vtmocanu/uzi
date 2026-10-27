@@ -15,7 +15,7 @@ import {
   type Run,
   type Worker,
 } from "../lib/api";
-import { useAuth } from "../auth/AuthContext";
+import { useAuth, useOptionalAuth } from "../auth/AuthContext";
 import { mergeRequestUrl } from "../lib/forgeUrls";
 import { errorMessage } from "../lib/apiError";
 import { changedMilestones } from "../lib/milestoneReset";
@@ -31,15 +31,18 @@ import {
 import { ExtendTimePopover } from "../components/ExtendTimePopover";
 import { canReworkNow, canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
 import { repoAgentFolder } from "../lib/repoAgentFolder";
-import { stripUnsafeChars } from "../lib/safeText";
+import { stripDisplayCell, stripUnsafeChars } from "../lib/safeText";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useNow } from "../lib/useNow";
+import { useMaintenance } from "../lib/useMaintenance";
 import { credentialSwitchHold } from "../lib/credentialSwitchHold";
 import {
   effectiveRunStatus,
   parkLabel,
   formatElapsed,
   healthFlagLabel,
+  isMaintenanceQueued,
+  maintenanceQueueText,
   isStoppedRun,
   isRejectedRun,
   milestoneBadge,
@@ -306,7 +309,7 @@ function checkpointSentence(run: Run, nowMs: number): string | null {
 
 // HealthFlag renders the run-health warn chip in the header (PRD #47
 // Decision 10): `⚠ <label> · stuck for Xm — <reason>`. The run view is owner/admin
-// only, so health_reason is always present here (no gating needed). It ticks the
+// only; optional health_reason is shown when available. It ticks the
 // "stuck for Xm" coarsely (30s) since a stalled run emits no messages to force a
 // re-render. The near-timeout flag ("slow", PRD #1170) instead counts DOWN to the run's
 // deadline_at (`· 1h 5m left`, or `· stopping` past it), falling back to "stuck for Xm"
@@ -320,7 +323,12 @@ function checkpointSentence(run: Run, nowMs: number): string | null {
  */
 export function HealthFlag({ run }: { run: Run }) {
   const now = useNow(30_000);
-  const show = shouldShowHealthFlag(run.health, run.status);
+  const maintenanceReason = useMaintenance().status?.reason;
+  // PRD #3454: maintenance mode holding this queued run back takes precedence over every
+  // health flag (the detector may still say waiting_worker). A calm info line, no "stuck
+  // for" clock: the wait is the admin's drain, not a fault.
+  const maintenance = isMaintenanceQueued(run);
+  const show = !maintenance && shouldShowHealthFlag(run.health, run.status);
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
   // Near timeout ("slow", PRD #1170) counts DOWN to run.deadline_at instead of the
   // since-flagged "stuck for Xm" every other flag keeps: `· 1h 5m left`, or `· stopping`
@@ -341,9 +349,21 @@ export function HealthFlag({ run }: { run: Run }) {
   // the region re-announce on every tick, the same countdown-in-a-live-region hostility
   // the park panel's role="status" note warns about. The stuck time and reason stay in
   // the visible pill, which no screen reader is listening to.
-  const announce = show ? (healthFlagLabel(run.health) ?? "") : "";
+  const announce = maintenance
+    ? maintenanceQueueText(maintenanceReason)
+    : show
+      ? (healthFlagLabel(run.health) ?? "")
+      : "";
   return (
     <>
+      {maintenance && (
+        <span
+          data-queue-reason="maintenance"
+          className="inline-flex items-center gap-1 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info"
+        >
+          {maintenanceQueueText(maintenanceReason)}
+        </span>
+      )}
       {show && (
         // A PLAIN (non-live) span: the sr-only region below owns the announcement.
         // role="status" used to sit HERE, and that was the bug the comment denied — a
@@ -354,17 +374,8 @@ export function HealthFlag({ run }: { run: Run }) {
         <span className="inline-flex items-center gap-1 rounded-full border border-warn/40 bg-warn/10 px-2 py-0.5 text-[11px] font-medium text-warn">
           ⚠ {healthFlagLabel(run.health)}
           {stuck}
-          {/* Issue #124, TEXT channel. 96ed275a stripped this field where it reaches a `title`
-              attribute (runBadge's descriptor) and missed it here, where it renders as body
-              text — the mirror of f399ab26, which stripped upgrade_detail's TEXT and left its
-              attribute for 4a739bff. Same field, opposite channel, one commit apart.
-              (This sentence named 4a739bff until D1: that is the commit which fixed the
-              ATTRIBUTE, so the mirror read backwards in the clause whose whole point is the
-              mirror. Second time those two were transposed — see the note in
-              WorkerUpgradeBadge.test.tsx — because they are one apart, both about
-              upgrade_detail, and differ only in channel, which is the distinction being
-              taught.) */}
-          {run.health_reason && <span className="font-normal"> — {stripUnsafeChars(run.health_reason)}</span>}
+          {/* A single display cell, including server-composed manual attribution. */}
+          {run.health_reason && <span className="font-normal"> — {stripDisplayCell(run.health_reason)}</span>}
         </span>
       )}
       {/* ALWAYS MOUNTED, empty until a flag arrives — mirrors RunView's parkAnnounce
@@ -1378,32 +1389,44 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   onResume: () => void;
   onCancel: () => void;
 }) {
+  const retained = run.recovery_wait_cause === "retained_recovery_exhausted";
+  const retainedStatus = effectiveRunStatus(run);
+  const retryMs = typeof run.recovery_retry_not_before === "string" ? Date.parse(run.recovery_retry_not_before) : NaN;
   const memoryHeld = run.recovery_wait_cause === "worker_memory_pressure";
   const memory = run.memory_hold;
   const recovery = run.worker_recovery;
   const evidence = recovery?.evidence;
   return (
     <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
-      <p className="text-sm font-semibold text-warn">{memoryHeld ? "Worker memory pressure — waiting for owner" : "Worker recovery needs your decision"}</p>
+      <p className="text-sm font-semibold text-warn">{retained ? retainedStatus === "retained_recovery_held" ? "Retained recovery needs your decision"
+        : retainedStatus === "retained_recovery_retrying" ? "Retained recovery retrying" : "Retained recovery timing unknown"
+        : memoryHeld ? "Worker memory pressure — waiting for owner" : "Worker recovery needs your decision"}</p>
       <p className="mt-0.5 text-xs text-muted">
-        {memoryHeld
+        {retained ? <>
+          {retainedStatus === "retained_recovery_held"
+            ? "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
+            : retainedStatus === "retained_recovery_retrying"
+              ? retryMs <= Date.now() ? "Automatic retry is due; the run will retry automatically. Only the run owner can Resume now or Cancel."
+                : `The run will retry automatically after ${new Date(retryMs).toLocaleString()}. Only the run owner can Resume now or Cancel.`
+              : "Retry timing is unavailable. This does not establish an owner hold or an automatic retry date."}
+        </> : <>{memoryHeld
           ? "Memory interventions have stopped. Resume starts a fresh memory episode. Cancel ends this run."
           : "Automatic worker recovery has stopped. Only the run owner can resume or cancel this run. Resume requests one explicit attempt, even when the automatic recovery limit is zero."}
         {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
-        This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.
+        This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.</>}
       </p>
-      <p className="mt-1.5 text-xs text-muted">
+      {!retained && <p className="mt-1.5 text-xs text-muted">
         {memoryHeld
           ? `Memory interventions: used ${memory?.used ?? "unknown"}. Maximum: ${memory?.max ?? "unknown"}. Remaining: ${memory?.remaining ?? "unknown"}.`
           : recovery
             ? `Automatic recovery limit: ${recovery.automatic_requeue_limit}. Used: ${recovery.episode_used}. Remaining: ${recovery.episode_remaining}.`
             : "Automatic recovery limit, used and remaining: unknown."}
-      </p>
-      {memoryHeld
+      </p>}
+      {!retained && (memoryHeld
         ? memory && <p className="mt-1.5 text-xs text-muted">Memory episode: {memory.episode}.</p>
         : <>{recovery && <p className="mt-1.5 text-xs text-muted">Recovery episode: {recovery.episode}.</p>}
-          <p className="mt-1.5 text-xs text-muted">Lifetime automatic requeues: {run.requeue_count}.</p></>}
-      {memoryHeld && <p className="mt-1.5 text-xs text-muted">
+          <p className="mt-1.5 text-xs text-muted">Lifetime automatic requeues: {run.requeue_count}.</p></>)}
+      {(memoryHeld || retained) && <p className="mt-1.5 text-xs text-muted">
         Retained source may remain on the assigned worker. Historical checkpoint or capture reports do not verify current availability or the latest local edits.
         Only a verified available recovery archive can restore captured work on another worker; uncaptured work is not guaranteed.
       </p>}
@@ -1491,7 +1514,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
   // sibling parks) renders nothing — PoolWaitPanel owns pool_wait, LimitWaitPanel owns
   // limit_wait, and this self-hides on both so mounting all three side by side is safe.
   if (run.status !== "recovery_wait") return null;
-  if (run.recovery_wait_cause === "worker_requeue_exhausted" || run.recovery_wait_cause === "worker_memory_pressure") {
+  if (run.recovery_wait_cause === "worker_requeue_exhausted" || run.recovery_wait_cause === "worker_memory_pressure" || run.recovery_wait_cause === "retained_recovery_exhausted") {
     return <WorkerDecisionPanel run={run} ownerProof={ownerProof} busy={busy} onResume={onResume} onCancel={onCancel} />;
   }
 
@@ -1747,7 +1770,8 @@ export function RunView() {
   const memoryHeld = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
   // Issue #3181: the token-switch holds are owner decisions too (Resume / Cancel).
   const switchHeld = run != null && credentialSwitchHold(run) !== null;
-  const ownerDecisionHold = workerExhausted || memoryHeld || providerHeld || switchHeld;
+  const retainedRecovery = run?.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_exhausted";
+  const ownerDecisionHold = retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
   const canSteer = optimisticCanSteer && (!ownerDecisionHold || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
   const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
@@ -1816,6 +1840,7 @@ export function RunView() {
     return () => { requestRef.current++; };
   }, [refreshIncidentalSummary]);
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
+  const [repo, setRepo] = useState<Repo | null>(null);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [actionErr, setActionErr] = useState("");
   // Issue #3181: the server's refusal of a Resume on a settling token-switch hold, bound to the
@@ -1850,7 +1875,7 @@ export function RunView() {
     setBusy(false);
   };
   const resumeWorkerHold = async () => {
-    if (!canSteer || !(workerExhausted || memoryHeld) || run?.id !== id) return;
+    if (!canSteer || !(workerExhausted || memoryHeld || retainedRecovery) || run?.id !== id) return;
     const requestRunId = id;
     const isCurrent = startAction();
     try {
@@ -1870,17 +1895,36 @@ export function RunView() {
 
   // Resolve the repo's web URL (for the MR link); the run itself does not carry
   // it. Best-effort — the MR iid is shown as text if the repo is not resolvable.
+  // Issue #3391: the same fetch keeps the run's repo for the plan gate's capability hint and
+  // Docker-allowlist line. Keyed on the repo id (not the run object) and cancelled on change, so a
+  // late list for a previous run's repo can never land on the run now shown.
+  const runRepoId = run?.repo_id;
+  const repoIdRef = useRef(runRepoId);
+  repoIdRef.current = runRepoId;
   useEffect(() => {
+    setRepo(null);
+    setRepoWebUrl(null);
     // A repo-less run (a job, PRD #1908) has no repo and no MR to link.
-    if (!run?.repo_id) return;
+    if (!runRepoId) return;
+    let cancelled = false;
     api
       .listRepos()
       .then(({ repos }: { repos: Repo[] }) => {
-        const repo = repos.find((r) => r.id === run.repo_id);
-        setRepoWebUrl(repo?.web_url ?? null);
+        if (cancelled) return;
+        const match = repos.find((r) => r.id === runRepoId) ?? null;
+        setRepo(match);
+        setRepoWebUrl(match?.web_url ?? null);
       })
-      .catch(() => setRepoWebUrl(null));
-  }, [run]);
+      .catch(() => { if (!cancelled) setRepoWebUrl(null); });
+    return () => { cancelled = true; };
+  }, [runRepoId]);
+  // The PATCH response omits the computed allowlist fields, so only the capability list is
+  // merged into the held repo. Ignored when the viewer has moved to another repo meanwhile.
+  const onRepoRequiredCapabilities = useCallback((repoId: string, caps: string[]) => {
+    if (repoIdRef.current !== repoId) return;
+    setRepo((prev) => (prev && prev.id === repoId ? { ...prev, required_capabilities: caps } : prev));
+  }, []);
+  const isAdmin = useOptionalAuth()?.user?.is_admin === true;
 
   // PRD #84 M4 4d: the workers list backs the plan-gate readiness summary — a required
   // capability is "met" when the run's ASSIGNED worker (run.worker_id) advertises it. Only
@@ -2149,6 +2193,8 @@ export function RunView() {
                   ? "data_volume_full"
                   : run.recovery_wait_cause === "provider_outage"
                     ? "provider_outage"
+                  : run.recovery_wait_cause === "retained_recovery_exhausted"
+                    ? effectiveRunStatus(run)
                   : run.recovery_wait_cause === "worker_requeue_exhausted"
                     ? "worker_requeue_exhausted"
                   : run.recovery_wait_cause === "worker_memory_pressure"
@@ -2178,6 +2224,12 @@ export function RunView() {
         ? "The run is waiting for your next follow-up."
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
+          : parkKey === "retained_recovery_held"
+            ? "Retained recovery needs your decision. Only the run owner can Resume or Cancel. There is no scheduled retry."
+          : parkKey === "retained_recovery_retrying"
+            ? "Retained recovery will retry automatically after its scheduled time, including when already due. Only the run owner can Resume now or Cancel."
+          : parkKey === "retained_recovery_unknown"
+            ? "Retained recovery timing is unavailable. An owner hold or automatic retry date cannot be inferred."
           : parkKey === "worker_requeue_exhausted"
             ? "Worker recovery needs your decision. Only the run owner can resume or cancel this hold. There is no scheduled retry."
           : parkKey === "worker_memory_pressure"
@@ -2612,6 +2664,9 @@ export function RunView() {
           workers={workers}
           busy={busy}
           canSteer={canSteer}
+          repo={repo && repo.id === run.repo_id ? repo : undefined}
+          isAdmin={isAdmin}
+          onRepoRequiredCapabilities={onRepoRequiredCapabilities}
           revisionMismatch={revisionMismatch}
           onApprove={(selection, overrideCapabilities, expectedGateRevision, semanticApproval) =>
             void gateAct(expectedGateRevision, () =>
@@ -2990,7 +3045,7 @@ export function RunView() {
           nothing for every other kind. */}
       <JobResultPanel run={run} />
 
-      {(!(workerExhausted || memoryHeld) || canSteer) && <RecoveryArchivesPanel run={run} />}
+      {(!(workerExhausted || memoryHeld || retainedRecovery) || canSteer) && <RecoveryArchivesPanel run={run} />}
 
       {/* Checkpoint salvage (PRD #1867): the bounded archive copy of a failed run's last
           published checkpoint at refs/uzi-salvage/<run-id>. Renders only for a failed run

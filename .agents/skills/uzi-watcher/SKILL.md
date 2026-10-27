@@ -168,7 +168,9 @@ Preserve the log in a private owner-chosen path, not only the harness's shell-ou
 
 It also exits 4 with `STOP=needs_attention` and final `RESULT=attention` plus evidence when a non-terminal run keeps a
 non-ok health (not `slow`) or a stale worker heartbeat for `WATCH_ATTENTION_POLLS` (default 3)
-consecutive polls; `0` disables. It means investigate, not dead. Exit 4 ends coverage: in the
+consecutive polls, or sits in `recovery_wait` with cause `data_volume_full` (a counted disk park;
+each park is its own episode, `data_volume_full@park<N>`, so the next park alerts again; act
+before the run reaches its park cap by freeing the worker's `/data`); `0` disables. It means investigate, not dead. Exit 4 ends coverage: in the
 same turn, investigate, then launch the printed `REARM=` line in the background. It acks that
 health episode, so a run that stays stalled in it (a long test suite) stops only on a park,
 a terminal state, a new episode or a stale heartbeat. A missed re-arm is how a question parks unseen.
@@ -178,7 +180,8 @@ The thirteen run statuses and which are terminal are in the `uzi-cli` skill. A r
 message) and answer with `uzi run answer`. A completion-interlock question is different: a
 plain answer cannot exempt a frozen milestone. Record the decision with `uzi run decide RUN`
 (`--continue`, `--partial <kept ids> --reason '...'` or `--accept <ids> --reason '...'`), on the
-live question or on a run already parked in the completion hold. **Never answer with "keep waiting"**
+live question or on a run already parked in the completion hold. Then re-arm the poller with
+the answered question's seq as its 6th arg (`min-question-seq`, script header). **Never answer with "keep waiting"**
 (e.g. for a dependency PR to merge): an answer resumes the run, and a run with nothing to do spends
 its iteration budget on no-op turns and fails (#2657). Leave the question unanswered, or answer and
 immediately `uzi run pause RUN --now`. A run at `limit_wait` is parked on an Anthropic

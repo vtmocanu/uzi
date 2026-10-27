@@ -78,7 +78,7 @@ normally park for a human decision even with auto-approve on. A Codex lead on
 a worker without `cross_check_codex_lead_v1` parks for a human too.
 Irrecoverable delivery losses fail the run; see
 [Cross-check](./cross-check.md#terminal-delivery-failures). A semantic run
-(dormant until #1231; production runs are not enrolled) also needs complete
+(dormant, with no production enrollment and none planned) also needs complete
 source coverage and no maintainer criteria, or an auto-approved schedule run
 parks for a human instead; see
 [Autopilot](./autopilot.md#semantic-runs-park-instead-of-auto-approving-dormant).
@@ -241,7 +241,7 @@ guidance stays catalog-owned (shown read-only and auto-tracking catalog updates)
 and your overlay is composed onto it at fire time, under a single guidance header.
 
 Guidance affects one dormant detector. On a semantic run (not enrolled in
-production until #1231), source-drift observations compare the current forge
+production, and no enrollment is planned), source-drift observations compare the current forge
 issue with the frozen issue text; a scheduled run whose frozen text was composed
 with guidance is compared with the raw issue body saved at creation instead, so
 it shows **unchanged** until the issue is edited. Drift only displays and never holds the
@@ -1184,6 +1184,11 @@ The api downloads and extracts selected archives, admitting **UTF-8 text
 only**, up to **50 files / 16 MiB per repair run / 4 MiB per file**.
 Administrators can lower the run limits in
 [Configuration](./configuration.md#job-files-and-product-skill-sets-prd-1909).
+Terminal colour codes (complete ANSI CSI sequences) are stripped, and any
+other control or format character except tab, newline and carriage return
+becomes a visible `\u{XXXX}` escape; NUL bytes or invalid UTF-8 still skip
+the file as `binary`. The per-file limit applies both before normalisation and
+after normalisation and scrubbing; retention limits apply to the resulting text.
 Archive paths, links, inflated bytes and download work are bounded before
 worker delivery. Content is scrubbed **before hashing and storage**.
 The bounded, untrusted manifest identifies kept files and refusal reasons;

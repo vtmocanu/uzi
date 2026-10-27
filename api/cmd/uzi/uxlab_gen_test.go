@@ -101,6 +101,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-accounts-one-each":           func(d bool) string { return boardAccountScene(d, now, 1, 140) },
 		"board-accounts-two-plus-one":       func(d bool) string { return boardAccountScene(d, now, 2, 140) },
 		"board-populated":                   func(d bool) string { return boardPopulated(d, now) },
+		"board-worker-name-tail":            func(d bool) string { return boardWorkerNameTailScene(d, now) },
 		"board-rejected":                    func(d bool) string { return rejectedScene(d, "board", 0, false) },
 		"board-rejected-selected":           func(d bool) string { return rejectedScene(d, "board", 0, true) },
 		"detail-rejected":                   func(d bool) string { return rejectedScene(d, "detail", 0, false) },
@@ -133,6 +134,9 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"detail-codex":                  func(d bool) string { return detailCodex(d, now) },
 		"detail-blocked-by":             func(d bool) string { return detailBlockedBy(d, now) },
 		"detail-milestones-attributed":  func(d bool) string { return detailMilestonesAttributed(d, now) },
+		"detail-rail-wide":              func(d bool) string { return detailRailScene(d, now, 200, false) },
+		"detail-rail-numbered":          func(d bool) string { return detailRailScene(d, now, frameWidth, true) },
+		"detail-rail-numbered-wide":     func(d bool) string { return detailRailScene(d, now, 200, true) },
 		"detail-crew-autofold":          func(d bool) string { return detailCrewAutofold(d, now) },
 		"detail-planning":               func(d bool) string { return detailPlanning(d, now) },
 		"detail-focus-transcript":       func(d bool) string { return detailFocusTranscript(d, now) },
@@ -379,12 +383,16 @@ func crossCheckFleetScene(dark bool, split bool, width, active int) tuiModel {
 	return m
 }
 
-var workerSceneNames = []string{"workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet", "workers-stale-stats"}
+var workerSceneNames = []string{"workers-manual-160", "workers-manual-120", "workers-manual-80", "workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet", "workers-stale-stats"}
 
-var workerDetailSceneNames = []string{"worker-upgrade-failed", "worker-outcome-outbox", "worker-holding", "worker-capacity-blocked", "worker-provisioning", "worker-provisioning-failed"}
+var workerDetailSceneNames = []string{"worker-manual-80", "worker-manual-combined-80", "worker-manual", "worker-manual-combined", "worker-upgrade-failed", "worker-outcome-outbox", "worker-holding", "worker-capacity-blocked", "worker-provisioning", "worker-provisioning-failed"}
 
 // workersScene uses the shipped model and the interactive demo's client.
 func workersScene(dark bool, name string) tuiModel {
+	narrowDetail := name == "worker-manual-80" || name == "worker-manual-combined-80"
+	if narrowDetail {
+		name = strings.TrimSuffix(name, "-80")
+	}
 	fake := newDemoClient()
 	if name == "workers-stale-stats" {
 		for i := range fake.Workers {
@@ -398,7 +406,7 @@ func workersScene(dark bool, name string) tuiModel {
 			}
 		}
 	}
-	target := map[string]string{"worker-capacity-blocked": "forge-small", "worker-provisioning": "forge-small", "worker-provisioning-failed": "forge-small", "worker-upgrade-failed": "forge-small", "worker-outcome-outbox": "forge-docker", "worker-holding": "recovery"}[name]
+	target := map[string]string{"worker-manual": "forge-m-2", "worker-manual-combined": "forge-small", "worker-capacity-blocked": "forge-small", "worker-provisioning": "forge-small", "worker-provisioning-failed": "forge-small", "worker-upgrade-failed": "forge-small", "worker-outcome-outbox": "forge-docker", "worker-holding": "recovery"}[name]
 	if target != "" {
 		// Scene-local samples keep the demo fleet's state and attention counts intact.
 		for i := range fake.Workers {
@@ -407,6 +415,10 @@ func workersScene(dark bool, name string) tuiModel {
 				continue
 			}
 			switch name {
+			case "worker-manual-combined":
+				holds := 1
+				w.CustodyDecisionsNeeded = &holds
+				w.RetainingUnpublishedWork = true
 			case "worker-capacity-blocked":
 				w.UpgradeStatus = "capacity_blocked"
 				w.UpgradeBlockingKind = strPtrT("scheduler_capacity")
@@ -444,10 +456,13 @@ func workersScene(dark bool, name string) tuiModel {
 	}
 	m := uxModel(fake, "", dark)
 	width, height := 120, 34
-	if target != "" {
+	if target != "" && !narrowDetail {
 		height = 52
 	}
-	if name == "workers-list-80" {
+	if name == "workers-manual-160" {
+		width = 160
+	}
+	if narrowDetail || name == "workers-list-80" || name == "workers-manual-80" {
 		width = 80
 	}
 	if name == "split-workers-top" {
@@ -463,6 +478,13 @@ func workersScene(dark bool, name string) tuiModel {
 	}
 	msg := m.fetchWorkersCmd(m.board.admin, m.workers.waitID)()
 	m = step(m, msg)
+	if strings.HasPrefix(name, "workers-manual-") {
+		for i, r := range m.workers.visible(time.Now()) {
+			if r.w.Name == "recovery" {
+				m.workers.cursor, m.workers.selectedID = i, r.w.ID
+			}
+		}
+	}
 	if name == "workers-cordoned" {
 		for i, r := range m.workers.visible(time.Now()) {
 			if r.w.Name == "b-runner" {
@@ -1629,6 +1651,18 @@ func boardAccountScene(dark bool, now time.Time, claudeCount, width int) string 
 	return m.View().Content
 }
 
+// Long hosted names retain distinct suffixes in the reserved worker column.
+func boardWorkerNameTailScene(dark bool, now time.Time) string {
+	runs := boardRuns(now)[:4]
+	for i, name := range []string{"base.l-highmem-a32f", "base.l-highmem-b917", "界界界界界界界界-a32f", "short-a32f"} {
+		runs[i].WorkerName = sp(name)
+	}
+	m := uxModel(&uzicli.FakeClient{Runs: runs}, "", dark)
+	m.width = 160
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
+	return m.View().Content
+}
+
 // Wide titles consume the space before the reserved judge and worker columns.
 func boardWideTitleScene(dark bool, now time.Time, width int) string {
 	runs := boardRuns(now)[:4]
@@ -1704,5 +1738,30 @@ func boardDoneFailures(dark, selected bool) string {
 	if selected {
 		m.board.cursor = 1
 	}
+	return m.View().Content
+}
+
+// detailRailScene is a running milestone run whose titles mix model-written M<n> prefixes with
+// bare titles (issue #3406), rendered at the given terminal width with [tui] milestone_numbers
+// on or off, to show the responsive rail width and the positional numbering.
+func detailRailScene(dark bool, now time.Time, width int, numbers bool) string {
+	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
+		IssueTitle:  "Add rate-limit headroom to the scheduler poll",
+		IssueIID:    ip(452),
+		IssueWebURL: sp("https://github.com/vtmocanu/uzi/issues/452"),
+		StartedAt:   tp(now.Add(-4 * time.Minute)),
+		Milestones: []apitypes.Milestone{
+			{ID: "m1", Title: "Merge base a86d6146 and rebase onto main"},
+			{ID: "m2", Title: "M2 range review of the scheduler change"},
+			{ID: "m3", Title: "M3 isolated mutation testing"},
+			{ID: "m4", Title: "m4 - records, single-commit history"},
+		},
+		MilestonesCompleted:  []string{"m1"},
+		MilestonesInProgress: []string{"m2"}}
+	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
+	m := detailBase(dark, run, now, true)
+	m.milestoneNumbers = numbers
+	m = step(m, tea.WindowSizeMsg{Width: width, Height: frameHeight})
+	m = withLiveStream(m)
 	return m.View().Content
 }

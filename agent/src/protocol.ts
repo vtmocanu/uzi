@@ -1358,6 +1358,9 @@ export interface ClaimPlanCrossCheck {
 }
 
 export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" | "planning_diff"> {
+  coverage_supported?: boolean;
+  /** Computed locally from Git, never trusted from a server claim. */
+  code_inventory?: import("./code-cross-check-coverage.js").CodeInventory;
   stage: "code";
   head_commit: string;
   /** Fresh default tip bound independently of repository-instructions consent; absent on legacy claims. */
@@ -1492,8 +1495,12 @@ export interface ClaimResponse extends ClaimMemoryState {
   /** SDK session to resume (M3); null/absent for a fresh run. */
   session_id?: string | null;
   /** Resume: the tip THIS run last published to its checkpoint ref (owner-anchor).
-   *  Adoption of refs/uzi-checkpoints/<branch> requires the remote tip to equal this. */
+   *  Adoption of refs/uzi-checkpoints/<checkpoint-key> requires the remote tip to equal this. */
   checkpoint_tip?: string | null;
+  /** Server-authorized immutable v1 coordinates; validated before any checkpoint use. */
+  checkpoint_coordinates?: unknown;
+  /** Explicit false proves no outstanding task write; omitted or malformed is unknown. */
+  checkpoint_write_unresolved?: boolean;
   /** issue #3194: the source a flight of THIS run published after its `--require-base` guard
    *  accepted (set-only server-side). A continuation may adopt exactly this content. */
   checkpoint_attested_source?: string | null;
@@ -1504,6 +1511,8 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  reserve/release name it so a capture/release binds to the exact hold this claim opened.
    *  Optional so a pre-#1296 payload without it still decodes. */
   claim_generation?: number;
+  /** Server recovery allowance; malformed values are ignored at the claim boundary. */
+  worker_recovery_episode?: number;
   /** Structured PRD #3 templates — the lead plus any subagents — consumed
    *  programmatically by M3 (mapped to SDK AgentDefinitions). M2 ignores them. */
   agents: AgentTemplate[];
@@ -1920,6 +1929,7 @@ export interface TaskReviewRequest {
 export interface ChatClaimResponse extends ClaimMemoryState {
   run_id: string;
   claim_generation?: number;
+  worker_recovery_episode?: number;
   kind: "chat";
   /** Conversation display title (server-derived; may be empty). */
   title: string;
@@ -2540,7 +2550,7 @@ export function seedAgentSelection(persisted?: AgentSelection | null): AgentSele
  * publish of a checkpoint pack. The REQUEST has no JSON type: the packfile is the raw
  * `application/octet-stream` body and the checkpoint tip OID travels in the
  * `X-Uzi-Checkpoint-Tip: <40-hex-lowercase-sha>` header. On success `published` is true
- * and `ref` names the landed `refs/uzi-checkpoints/<branch>`; a best-effort skip sets
+ * and `ref` names the landed `refs/uzi-checkpoints/<checkpoint-key>`; a best-effort skip sets
  * `published` false and carries `skipped`. Any non-2xx is ignored by the worker — a
  * publish failure never fails the run.
  */
@@ -3430,7 +3440,7 @@ export interface RecoverySettleRequest {
  *  resumed run is still LIVE (issue #1751 M2, mirrors api/internal/apitypes/recovery.go):
  *  POST /runs/{id}/recovery-holds/{holdID}/settle-live. published_sha is the successor
  *  generation's PUBLISHED tip (a confirmed checkpoint publish, or the finalize branch push);
- *  target names what the api proves it against: `checkpoint` (refs/uzi-checkpoints/<branch>) or
+ *  target names what the api proves it against: `checkpoint` (refs/uzi-checkpoints/<checkpoint-key>) or
  *  `branch` (runs.branch). Candidate SHAs only (40-char lowercase hex); no worker verdict field.
  *  The answer is the same {@link RecoverySettleResponse}. */
 export interface RecoveryLiveSettleRequest {

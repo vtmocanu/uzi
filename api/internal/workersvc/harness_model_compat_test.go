@@ -24,6 +24,7 @@ func TestHarnessModelCompatible(t *testing.T) {
 		{"claude accepts a claude alias", HarnessClaude, "sonnet", true},
 		{"claude accepts an arbitrary custom id", HarnessClaude, "claude-opus-4-8", true},
 		{"codex rejects an unknown/custom id", HarnessCodex, "some-unknown-model", false},
+		{"codex keeps luna outside the curated frozen set", HarnessCodex, "gpt-6-luna", false},
 		{"empty model is inherit, compatible with codex", HarnessCodex, "", true},
 		{"empty model is inherit, compatible with claude", HarnessClaude, "", true},
 		{"whitespace-only model is inherit", HarnessCodex, "   ", true},
@@ -34,5 +35,14 @@ func TestHarnessModelCompatible(t *testing.T) {
 				t.Fatalf("harnessModelCompatible(%q, %q) = %v, want %v", c.h, c.model, got, c.want)
 			}
 		})
+	}
+	for _, model := range codexRoleFixture(t) {
+		for _, stored := range []string{model, " \t" + model + " \n"} {
+			t.Run("claude rejects role/"+stored, func(t *testing.T) {
+				if harnessModelCompatible(HarnessClaude, stored) {
+					t.Fatalf("Claude frozen model accepted Codex role id %q", stored)
+				}
+			})
+		}
 	}
 }

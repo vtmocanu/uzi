@@ -58,9 +58,9 @@ function WorkerOfflineBanner() {
 
 // ChatStatusBadge reads a chat conversation's run status as chat semantics: a
 // terminal run is an "ended" conversation, not a "completed"/"failed" job.
-function ChatStatusBadge({ status }: { status: string }) {
+function ChatStatusBadge({ status, run }: { status: string; run?: Run | null }) {
   if (isTerminalRun(status)) return <Badge tone="neutral">ended</Badge>;
-  return <StatusPill status={status} />;
+  return <StatusPill status={status} recovery_wait_cause={run?.recovery_wait_cause} recovery_retry_not_before={run?.recovery_retry_not_before} />;
 }
 
 // ── Conversation list (/chat) ────────────────────────────────────────────────
@@ -316,7 +316,7 @@ export function ChatConversation() {
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-x-2">
               <h1 className="truncate text-xl font-semibold tracking-tight">{title}</h1>
-              <ChatStatusBadge status={status} />
+              <ChatStatusBadge status={status} run={run} />
               {!ended && (
                 <span
                   title={connected ? "Live" : "Reconnecting…"}

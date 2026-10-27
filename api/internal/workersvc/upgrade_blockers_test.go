@@ -66,6 +66,23 @@ func TestUpgradeBlockerRecoveryRetryActions(t *testing.T) {
 	}
 }
 
+func TestUpgradeBlockerRetainedRecoveryTiming(t *testing.T) {
+	for _, timed := range []bool{false, true} {
+		retry := pgtype.Timestamptz{}
+		if timed {
+			retry = pgtype.Timestamptz{Valid: true, Time: time.Now().Add(time.Hour)}
+		}
+		action := blockerAction(store.ListWorkerUpgradeBlockersRow{Status: blockerText("recovery_wait"),
+			RecoveryWaitCause: blockerText("retained_recovery_exhausted"), RecoveryRetryNotBefore: retry})
+		if !strings.Contains(action, "Resume") || !strings.Contains(action, "retained_recovery_exhausted") {
+			t.Fatalf("missing retained recovery action: %s", action)
+		}
+		if timed != strings.Contains(action, "automatic retry") || timed == strings.Contains(action, "no timer") {
+			t.Fatalf("timed=%v misstates retry policy: %s", timed, action)
+		}
+	}
+}
+
 func TestUpgradeBlockerRecoveryHoldsHaveNoTimer(t *testing.T) {
 	for _, cause := range []string{"codex_account_unavailable", "worker_requeue_exhausted"} {
 		for _, retry := range []pgtype.Timestamptz{{}, {Valid: true, Time: time.Now().Add(time.Hour)}} {

@@ -9,6 +9,8 @@ import { PassThrough } from "node:stream";
 import { after, afterEach, describe, it } from "node:test";
 
 import { guardedCommandEnv } from "../src/claude-command/env.js";
+import { configureGoConcurrency } from "../src/go-concurrency.js";
+import { buildSdkEnv } from "../src/sdk-env.js";
 import { memoryLauncherPreflight } from "../src/claude-command/preflight.js";
 import { WRAPPER, wrapperArgv } from "../src/claude-command/wrapper.js";
 import {
@@ -421,6 +423,22 @@ describe("guardedCommandEnv", () => {
     }
     assert.deepEqual(out, { PATH: "/usr/bin", HOME: "/home/runner", [RUN_ATTEMPT_ENV]: "run:attempt",
       [RUN_CLONE_ENV]: "/clone", [RUN_CLONE_KEY_ENV]: "repo/key" });
+  });
+
+  it("issue #3382: a cliEnv built by buildSdkEnv carries the configured Go concurrency into the guarded command env", () => {
+    try {
+      configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
+      const out = guardedCommandEnv(buildSdkEnv("oauth", "/home/runner"));
+      assert.equal(out.GOFLAGS, "-p=2");
+      assert.equal(out.GOMAXPROCS, "3");
+      assert.ok(!("CLAUDE_CODE_OAUTH_TOKEN" in out));
+      configureGoConcurrency({});
+      const bare = guardedCommandEnv(buildSdkEnv("oauth", "/home/runner"));
+      assert.equal(Object.hasOwn(bare, "GOFLAGS"), false);
+      assert.equal(Object.hasOwn(bare, "GOMAXPROCS"), false);
+    } finally {
+      configureGoConcurrency({});
+    }
   });
 
   it("covers every variable the SDK spawn treats as a provider credential", () => {

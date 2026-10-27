@@ -15,6 +15,18 @@ func (f *FakeClient) ListWorkers(context.Context) ([]apitypes.WorkerDTO, error) 
 	return f.Workers, nil
 }
 
+func (f *FakeClient) CordonWorker(_ context.Context, id, reason string) (apitypes.WorkerDTO, error) {
+	f.CordonWorkerCalls++
+	f.LastCordonWorkerID, f.LastCordonReason = id, reason
+	return f.CordonWorkerResult, f.Err
+}
+
+func (f *FakeClient) UncordonWorker(_ context.Context, id string) (apitypes.WorkerDTO, error) {
+	f.UncordonWorkerCalls++
+	f.LastUncordonWorkerID = id
+	return f.UncordonWorkerResult, f.Err
+}
+
 func (f *FakeClient) DeleteWorker(_ context.Context, id string) error {
 	f.DeleteWorkerCalls++
 	f.LastDeletedWorkerID = id
@@ -119,14 +131,14 @@ func (f *FakeClient) GetCIRun(_ context.Context, repoID string, runID int64) (ap
 	return f.CIRunDetailResult, nil
 }
 
-func (f *FakeClient) CreateCIFixRun(_ context.Context, repoID, ref string) (apitypes.RunDTO, error) {
+func (f *FakeClient) CreateCIFixRun(_ context.Context, repoID, ref string) (CreatedRunResult, error) {
 	f.LastCIFixRepoID = repoID
 	f.LastCIFixRef = ref
 	if f.CreateCIFixRunErr != nil {
-		return apitypes.RunDTO{}, f.CreateCIFixRunErr
+		return CreatedRunResult{}, f.CreateCIFixRunErr
 	}
 	if f.Err != nil {
-		return apitypes.RunDTO{}, f.Err
+		return CreatedRunResult{}, f.Err
 	}
-	return f.CIFixRunResult, nil
+	return CreatedRunResult{RunDTO: f.CIFixRunResult, Notice: f.CreatedNotice}, nil
 }

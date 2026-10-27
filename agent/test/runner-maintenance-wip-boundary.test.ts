@@ -2,6 +2,7 @@ import test, { describe } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { MaintenanceResources, RecoveryMaintenance } from "../src/recovery-maintenance.js";
@@ -28,7 +29,7 @@ const refused = /maintenance_wip_boundary_refused/;
 const callbacks: Callbacks = { beforeStep: async () => {}, afterRunnerGit: async () => {} };
 
 async function fixture(t: test.TestContext, extra: Partial<RunnerOptions> = {}) {
-  const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/runner-wip-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "runner-wip-"));
   const root = path.join(dir, "source");
   await fs.mkdir(root);
   const gitIn = (...args: string[]) => execFileSync("/usr/bin/git", ["-C", root, ...args],
@@ -69,7 +70,9 @@ async function fixture(t: test.TestContext, extra: Partial<RunnerOptions> = {}) 
     checkpointTestHooks: { tickKillGraceMs: 0, ...extra.checkpointTestHooks,
       tickSpawn: { ...extra.checkpointTestHooks?.tickSpawn, onSpawn: (pid, argv) => {
         pids.push(pid);
-        commands.push(argv.find(a => ["status", "add", "commit"].includes(a)) ?? "preparation");
+        // W0-H: the commit group (write-tree, commit-tree, update-ref) is the "commit" command.
+        const found = argv.find(a => ["status", "add", "write-tree", "commit-tree", "update-ref"].includes(a));
+        commands.push(found === undefined ? "preparation" : ["write-tree", "commit-tree", "update-ref"].includes(found) ? "commit" : found);
         extra.checkpointTestHooks?.tickSpawn?.onSpawn?.(pid, argv);
       } },
     },
@@ -114,7 +117,9 @@ for (const dirty of [false, true]) test("real owned boundary captures " + (dirty
   assert.equal(value.kind, dirty ? "committed" : "clean");
   assert.equal(value.parent, dirty ? f.old : null);
   assert.deepEqual(after, dirty ? ["status", "add", "commit"] : ["status"]);
-  assert.deepEqual(phases, after.flatMap(step => [step + ":prepare", step + ":dispatch"]));
+  // W0-H: (commit, dispatch) precedes each of write-tree, commit-tree and update-ref.
+  assert.deepEqual(phases, after.flatMap(step => step === "commit"
+    ? ["commit:prepare", "commit:dispatch", "commit:dispatch", "commit:dispatch"] : [step + ":prepare", step + ":dispatch"]));
   assert.equal(f.families.length, dirty ? 4 : 2, "one family pass initially and after each attempted Git");
   assert.ok(f.families.every(paths => paths.length === 1 && paths[0] === f.root));
   assert.equal(f.runner.isExecuting("run"), false);

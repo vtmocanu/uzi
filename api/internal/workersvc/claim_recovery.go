@@ -91,7 +91,7 @@ func (t pgxClaimFinishTx) Rollback(ctx context.Context) error { return t.tx.Roll
 // nor a transactional store there is no fenced writer, so it refuses rather than falling back.
 func (s *Service) beginClaimFinish(ctx context.Context) (claimFinishTx, error) {
 	if s.txBeginner != nil {
-		tx, err := s.txBeginner.Begin(ctx)
+		tx, err := s.beginReadCommitted(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -235,6 +235,18 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		return nil, "", err
 	}
 	defer func() { _ = q.Rollback(ctx) }()
+	if len(run.CheckpointCoordinates) > 0 {
+		live, ok := q.(pgxClaimFinishTx)
+		if !ok {
+			return nil, "", errClaimRecoveryNoTx
+		}
+		if _, err := live.GetWorkerForUpdate(ctx, identity.workerID); err != nil {
+			return nil, "", err
+		}
+		if err := live.OptInCheckpointCoordinates(ctx); err != nil {
+			return nil, "", err
+		}
+	}
 	// Intrinsic pin failures and every Claude checker claim enter lead-first: the
 	// locked credential re-check may decide the check. The persisted stage selects
 	// the verdict lock and settlement before the child row is locked.
@@ -380,10 +392,37 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		}
 	}
 	if decision == nil {
-		if err := q.Commit(ctx); err != nil {
-			return nil, "", err
+		if locked.Kind == runkind.Task && len(locked.CheckpointCoordinates) > 0 && payload != nil {
+			live, ok := q.(pgxClaimFinishTx)
+			if !ok {
+				return nil, "", errClaimRecoveryNoTx
+			}
+			// A fresh READ COMMITTED statement after the run lock observes confirmation
+			// and attempt admission together. False is evidence only at this admission.
+			projection, err := live.GetClaimCheckpointRecovery(ctx, locked.ID)
+			if err != nil {
+				return nil, "", err
+			}
+			payload.CheckpointTip = textPtr(projection.CheckpointTip)
+			payload.CheckpointAttestedSource = textPtr(projection.CheckpointAttestedSource)
+			payload.CheckpointWriteUnresolved = &projection.CheckpointWriteUnresolved
 		}
-		return payload, "", nil
+		// Issue #3396: measure the final payload, after every projection above, so a claim
+		// that would exceed the worker's read cap fails here with a clear reason instead of
+		// being delivered and refused. The exact-claim identity checks above already ran
+		// against this payload, so the terminal path below settles this exact mint.
+		if serr := s.refuseOversizeRunClaim(payload); serr != nil {
+			if !errors.Is(serr, errClaimTooLarge) {
+				return nil, "", serr // a marshal error is not this classification: roll back
+			}
+			decision, origin = serr, "provisioning_failed"
+			holdClass, transient = false, false
+		} else {
+			if err := q.Commit(ctx); err != nil {
+				return nil, "", err
+			}
+			return payload, "", nil
+		}
 	}
 
 	expected := 0
@@ -569,7 +608,7 @@ func claimAssemblyOrigin(err error) string {
 		return "guardrail_blocked"
 	case errors.Is(err, errCredentialUnavailable):
 		return "credential_unavailable"
-	case errors.Is(err, errToolPackagesRejected):
+	case errors.Is(err, errToolPackagesRejected), errors.Is(err, errClaimTooLarge):
 		return "provisioning_failed"
 	// ErrCrossCheckRefused is a separate sentinel grouped under the same origin; the legacy
 	// mr_rework refusal arrives via errGuardrailBlockedClaim (legacyReviewClaimError).

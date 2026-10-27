@@ -353,10 +353,12 @@ model); this section is the map. User-facing usage is
   `.agents`), since `lstat` follows a symlinked parent (issue #1205 follow-up). Repo
   skills carry no allocation, so a surviving one attaches to **every** template;
   they rank lowest (a name collision with any delivered skill drops the repo skill)
-  and are first evicted if the set exceeds `skills_max_per_run`. These two roots are
-  the **only** clone-borne configuration the worker reads (no hooks, settings,
-  commands, or `CLAUDE.md`), and it reads them through its OWN enumeration, not the
-  SDK: `settingSources: []` keeps the SDK from auto-loading the clone's `.claude/`
+  and are first evicted if the set exceeds `skills_max_per_run`. The repo-skills
+  channel reads only these two roots (no hooks, settings, commands, or `CLAUDE.md`)
+  through its OWN enumeration. A separate owner opt-in supplies root `CLAUDE.md`
+  as advisory context to Claude and Codex leads ([ADR-246](adr/0246-trusted-repo-instructions.md)).
+  Neither channel uses native project loading; for Claude, `settingSources: []`
+  keeps the SDK from auto-loading the clone's `.claude/`
   config class (settings, hooks, commands, subagents, `CLAUDE.md`), and `.agents/`
   is not an SDK setting source at all. The opt-in deliberately re-opens one narrow,
   skills-only slice of that otherwise-closed clone-config class, which is why the
@@ -461,6 +463,17 @@ the TUI render it everywhere the Claude meters already appear. See
 durable design decisions and
 [docs/rate-limits.md](docs/rate-limits.md#codex-account-limits) for
 user-facing behavior.
+
+A separate survivor path can retry an original non-rejection refresh error once
+when its durable receipt authorizes reuse. Admission consumes the retry under
+user secret mutation/account/intent locks with a fresh database clock and an
+enabled linked alias; local vault/login failures defer without consumption.
+Recovered material stays quarantined until identity-verified promotion. The
+survivor and account-action display share a 52.14-second in-flight policy bound;
+owner restore advances the generation and fences stale installs. Mixed API
+versions are unsupported for receipt-aware resolution/display. See
+[ADR-3523](adr/3523-codex-refresh-provider-error-reuse.md) for the fixed 30-minute
+eligibility window, terminal fences, provider-overlap risk and evidence limits.
 
 ## Agent runtime: workers, runs, live view
 
@@ -1224,7 +1237,9 @@ chain in the diagram above, with no intervening `running`.
   provider-context durability is honestly `same_worker_only`. An admin can turn
   the switch off from Admin → Instance → **Completion check**; a run created
   before the default changed is unaffected, since the switch is read once, at
-  create. See
+  create. Semantic completion auditing did not ship (#1231 was closed not
+  planned); #1230's semantic contract is merged but dormant, with no production
+  enrollment. See
   [docs/run-completion-hold.md](docs/run-completion-hold.md) and
   [adr/1225-structural-completion-interlock-invariants.md](adr/1225-structural-completion-interlock-invariants.md)
   for the negative-space invariants a future edit could break silently.
@@ -1569,13 +1584,19 @@ chain in the diagram above, with no intervening `running`.
   and blocks the worker's teardown. Admission counts open holds except at most
   one per run backing a healthy current claim without an owner decision;
   total custody remains protected. After discarded/released precedence, an OPEN
-  hold at `recovery_wait` for `worker_requeue_exhausted` or
-  `worker_memory_pressure` reports `needs_action` after failed latest capture,
+  hold at `recovery_wait` for `worker_requeue_exhausted`,
+  `worker_memory_pressure`, or `retained_recovery_exhausted` reports
+  `needs_action` after failed latest capture,
   otherwise `source_only`, before available unguarded archives or capture
-  progress. Archive availability remains independent of attention and does not
-  release owner-held custody; other classifier decisions remain unchanged.
-  See [ADR-2445](adr/2445-custody-admission-accounting.md) and
-  [ADR-2396](adr/2396-worker-memory-guard.md).
+  progress. Retained-recovery exhaustion keeps this conservative protection
+  for both timed retries and NULL-stamp owner holds throughout `recovery_wait`.
+  After timer promotion or owner Resume, existing proof-based release rules
+  apply again; execution-claim release alone never permits source deletion.
+  Archive availability remains independent of attention and does not release
+  these causes' custody; other classifier decisions remain unchanged.
+  See [ADR-2445](adr/2445-custody-admission-accounting.md),
+  [ADR-2396](adr/2396-worker-memory-guard.md), and the #3495 amendment in
+  [ADR-1197](adr/1197-transient-recovery-park.md).
   The **archive capture** (`recovery_captures`) is the later,
   immutable, encrypted artifact bound to that hold. PRD #1349 hardens the
   lifecycle: reserve/release now key on the **exact `runs.claim_generation`**
@@ -2094,7 +2115,12 @@ token's server-enforced scope. See
   else (`POST /api/workers`, `/api/me/cli-tokens`, `/api/vault/*`, `/api/forge/*`,
   `/api/me/secrets/*`, every admin write) stayed cookie-only, since swapping whole
   groups would have widened what a stolen CLI token could do. See the PRD's
-  route-disposition table.
+  route-disposition table. Issue #3504 later adds `GET /api/vault/status` and
+  `POST /api/vault/unlock` to `RequireUser` for `uzi vault status` and
+  `uzi vault unlock`; lock and passphrase creation remain cookie-only. Unlock
+  retains the authenticated per-user limiter shared by cookies and CLI tokens.
+  See [the vault threat model](docs/vault-threat-model.md#cli-unlock-authenticated-guessing-and-key-custody)
+  for the accepted guessing surface.
 - **`scope` is a ceiling, enforced in the middleware, not just at `/api/admin/*`.**
   `RequireAdminRO` is a plain `user.IsAdmin` check; the real control is upstream in
   `RequireUser`, which gives a CLI token whose `scope != 'admin_ro'` a **copy** of
@@ -2159,8 +2185,8 @@ rationale.
   broken relative link (doc→doc or doc→img), reference-style links, or an
   oversized `docs/img/*` file; it warns (without failing) on a `user` page over
   the 60-line house-style budget.
-  It runs both locally (ahead of `npm run build`) and in CI (`validate:web`
-  runs `npm run check-docs` too, PRD #52), so a broken doc fails the pipeline as
+  It runs both locally (ahead of `npm run build`) and in CI (`validate-web`
+  runs `task check-docs:web` too, PRD #52), so a broken doc fails the pipeline as
   well as the local build.
 
 ## Deployment: compose (laptop) and k8s
@@ -2548,6 +2574,52 @@ Admitted image turns and eligible custody-held layout migrations receive an
 `image_roll` cordon over the authenticated
 `POST /api/controller/workers/{id}/drain` control-write channel. The API's
 `draining_since` and reason remain separate from heartbeat-derived status.
+
+Owner manual cordon is an independent persistent-worker intake boundary
+(scope amendment 2026-10-22, implementation recorded 2026-10-24).
+`POST`/`DELETE /api/workers/{id}/cordon` use existing `RequireUser` session
+plus CSRF or user CLI-token authentication and strict ownership even for admins.
+Persistent hosted/external workers (`ephemeral=false`) support it; ownership
+is checked before the ephemeral HTTP 409 refusal. The web Workers controls and
+`uzi worker cordon <id> [-m <reason>]` / `uzi worker uncordon <id>`
+(both `--json`) share this owner API. Health/admin surfaces remain read-only.
+
+Manual timestamp, actor UUID/label snapshot and optional reason are separate
+from automatic drains and maintenance. Transition plus audit event commits in
+one READ COMMITTED transaction under the owner-qualified worker lock;
+compatible claims re-read combined intake state after the same worker lock.
+Idempotent repeats preserve original metadata without another event.
+Registration, roll, restart, deadlines, ForceRoll and reason-owned automatic
+release preserve manual intent; explicit owner uncordon or deletion ends it.
+Held continuations/checkers/chat remain subject to existing fences; cordon
+cancels no run, ends no chat and adds no continuation affinity.
+
+Manual workers supply no serving/replacement coverage. Incarnation proof and
+reservation completion remain distinct from serving eligibility, so an idle
+manual worker can roll and return cordoned; busy drift still waits under #3103.
+An all-manual multi-worker pool may remain held, without a zero-coverage bypass.
+Custody/migration (#3153/#3307) and DinD/pressure/maintenance guards remain
+independent. Earlier poll decisions may finish. After migration 00355, older
+ClaimRun SQL with the previous explicit worker projection fails with SQLSTATE
+42846, including ordinary candidates; rollback can prolong this claim outage.
+Older chat claims can still admit work and ignore manual intent. Deploy every
+compatible serving API before relying on enforcement. Older controllers may
+miscount manual coverage,
+so ordinary coverage guarantees require compatible controllers. No worker-image
+protocol requirement or activation flag is added. Contract and rationale:
+[ADR-422 D5a](adr/0422-decouple-worker-version.md#d5a--owner-manual-cordon-is-persistent-intent-scope-amendment-2026-10-22);
+user lifecycle: [manual cordon](docs/hosted-workers.md#pause-new-work-with-a-manual-cordon).
+
+Instance maintenance mode ([PRD #3454](prds/done/3454-instance-maintenance-mode.md))
+is a separate instance-wide intake pause: a singleton `instance_intake_pause` row
+read by SQL function `fn_instance_intake_paused()`. Its conjunct sits in exactly
+the two claim statements, `ClaimRun` and `ClaimChatRun`, and admits only runs with
+`claim_generation > 0` or `cross_check` children; it is deliberately not folded
+into `fn_worker_accepts_new_intake`, so capacity, capability and roll projections
+stay truthful. The ephemeral provisioner rechecks it in SQL per candidate and
+inside all three demand queries. The controller is unchanged. Web-only writer;
+operator guide: [instance maintenance](docs/instance-maintenance.md).
+
 Under #3103, actual spec-hash/generation drift (image pin, template or size) and
 associated recycle wait indefinitely for genuine idle, including run-bound
 workers outside pacing and calls with no pacing entry or a plain drain reason.
@@ -2601,7 +2673,7 @@ holds its tier's ResourceQuota indefinitely (issue #360). The requeue-then-manua
 interrupted — by independent nondrifted maintenance expiry, global force-roll,
 or an uncontrolled pod loss)
 is unchanged by this PRD. Full rationale, the Decision Log, and what remains
-open (a CLI drain verb, live-cluster validation) are in
+open (live-cluster validation; the owner CLI manual-cordon deferral is superseded) are in
 [adr/0422-decouple-worker-version.md](adr/0422-decouple-worker-version.md).
 
 ### Worker disk: observed on the heartbeat, self-healed by the controller (PRD #837)
@@ -2790,3 +2862,7 @@ deliberately deferred — see [plan.md](prds/done/initial-plan.md), the PRDs' Ri
 `prds/done/4-agent-runtime-workers.md`'s "Out of scope". This document will grow
 new sections (additional services, data flows, trust boundaries) as those
 land.
+
+## Release authorization
+
+The dispatch-only release workflow isolates App credentials from repository code: preparation uses the shared cutter and coverage policy, then a separate job validates a bundle and atomically pushes permitted refs. RC and stable use separate principals; stable requires an Environment reviewer. The local fallback remains. [ADR-3512](adr/3512-release-automation.md) records the accepted main-write trust boundary, staged rollout and deferred recovery work.

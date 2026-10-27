@@ -536,7 +536,8 @@ if [ -n "$added_paths" ]; then
     # references it will not touch. Commit only when the dirty set is confined to the
     # migrations directory; anything else needs a hand fix first.
     outside=$(git status --porcelain | awk '{print $NF}' | grep -v '^api/internal/store/migrations/' || true)
-    if [ -n "$outside" ] || printf '%s' "$out" | grep -qiE 'other reference|fix by hand|manual'; then
+    # Match the helper's report lines only: its success line also says "no other references".
+    if [ -n "$outside" ] || printf '%s' "$out" | grep -qE 'POSTFLIGHT --|postflight found unresolved|NOT scanned'; then
       echo "RESULT=renumber_needs_hand_fix WORKTREE=$WT"
       exit 6
     fi

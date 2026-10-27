@@ -9,6 +9,7 @@ import {
   api,
   type AgentSelectionInput,
   type MilestoneResetOptions,
+  type Repo,
   type Run,
   type RunMessage,
   type Worker,
@@ -18,6 +19,7 @@ import { setTokenBody } from "../../lib/credentialOverride";
 import { useSeededCredential } from "../../lib/useSeededCredential";
 import { stripUnsafeChars } from "../../lib/safeText";
 import { effectiveWorkerCaps } from "../../lib/workerCaps";
+import { CAPABILITY_VOCABULARY } from "../../lib/capabilityVocabulary";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../../components/AgentPicker";
 import { PlanCrossCheck } from "../../components/PlanCrossCheck";
 import { Markdown } from "../../components/Markdown";
@@ -27,6 +29,14 @@ import { Alert, Badge, Button, Field, Spinner, Textarea, cx } from "../../compon
 // The server enforces the real revision cap; 3 is only the display default for the
 // "revision N of MAX" counter (PRD #41 Decision 9).
 const MAX_REVISION_ROUNDS = 3;
+
+// Issue #3391: the Docker-allowlist gap, worded for the viewer. Verbatim copies of
+// reasonRepoNotDockerAllowedAdmin / reasonRepoNotDockerAllowedMember in
+// api/internal/workersvc/health.go, so the gate and the queued-run health text agree.
+const DOCKER_ALLOWLIST_ADMIN =
+  "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; add it under Admin → Instance → Docker worker repo allowlist";
+const DOCKER_ALLOWLIST_MEMBER =
+  "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; ask an admin to add it under Admin → Instance → Docker worker repo allowlist";
 
 // PlanRevision is the panel's derived view of the revision history (PRD #41 Decision
 // 9): all of it comes from the run's feed messages, never a separate fetch.
@@ -226,8 +236,20 @@ export function PlanPanel({
   onRequestChanges,
   onCancel,
   revisionMismatch = null,
+  repo,
+  isAdmin = false,
+  onRepoRequiredCapabilities,
 }: {
   run: Run;
+  // Issue #3391: the run's repo (list-endpoint DTO), so the readiness block can offer to
+  // require an inferred capability on the repo and name a Docker-allowlist gap. Absent =
+  // render exactly as before (repo not loaded yet, or a repo-less run).
+  repo?: Repo;
+  // The viewer's admin flag; picks the allowlist wording (an admin can fix it, a member asks one).
+  isAdmin?: boolean;
+  // Called after the repo's capability hint was saved, with the saved list, so the caller
+  // can keep its copy of the repo current.
+  onRepoRequiredCapabilities?: (repoId: string, caps: string[]) => void;
   // The run's feed, used to derive the version chip / round counter / revising state
   // (PRD #41 Decision 9). Optional so a caller/test that only exercises the base gate
   // can omit it — the derivation degrades to v1 / revision 0 of 3.
@@ -555,6 +577,34 @@ export function PlanPanel({
     return effectiveWorkerCaps(w?.capabilities, w?.docker === true);
   }, [run.worker_id, workers]);
   const unmetCaps = useMemo(() => requiredCaps.filter((c) => !workerCaps.has(c)), [requiredCaps, workerCaps]);
+  // Issue #3391: capabilities the plan needs that the repo's static hint lacks. Only the
+  // vocabulary is offered (the server filters anything else out). capsOverride holds the saved
+  // list for the repo it was saved on, because the caller's repo copy may not refresh.
+  const [capsOverride, setCapsOverride] = useState<{ repoId: string; caps: string[] } | null>(null);
+  const [requiring, setRequiring] = useState(false);
+  const [requireError, setRequireError] = useState<{ repoId: string; message: string } | null>(null);
+  const repoCaps = repo ? (capsOverride?.repoId === repo.id ? capsOverride.caps : repo.required_capabilities ?? []) : [];
+  const missingRepoCaps = repo
+    ? requiredCaps.filter((c) => (CAPABILITY_VOCABULARY as readonly string[]).includes(c) && !repoCaps.includes(c))
+    : [];
+  // Adds to the repo hint only; never touches the run or the approval.
+  const requireOnRepo = async () => {
+    if (!repo) return;
+    const id = repo.id;
+    const next = [...repoCaps, ...missingRepoCaps];
+    setRequiring(true);
+    setRequireError(null);
+    try {
+      const { repo: updated } = await api.setRepoRequiredCapabilities(id, next);
+      const caps = updated?.required_capabilities ?? next;
+      setCapsOverride({ repoId: id, caps });
+      onRepoRequiredCapabilities?.(id, caps);
+    } catch (err) {
+      setRequireError({ repoId: id, message: errorMessage(err, "Update failed") });
+    } finally {
+      setRequiring(false);
+    }
+  };
   // Whether to render the readiness panel at all. size_class is DELIBERATELY excluded: the
   // agent's detectToolchain always emits a non-empty size_class (s/m/l), so including it here
   // made the panel render for EVERY plan gate. size is advisory-only, so it never justifies the
@@ -789,6 +839,24 @@ export function PlanPanel({
                     <span className="font-medium">{unmetCaps.map((c) => stripUnsafeChars(c)).join(", ")}</span>, or run
                     without it.
                   </p>
+                )}
+                {repo && missingRepoCaps.length > 0 && canSteer && (
+                  <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                    <p className="text-xs text-muted">
+                      This repo doesn't require{" "}
+                      <span className="font-medium">{missingRepoCaps.map((c) => stripUnsafeChars(c)).join(", ")}</span>, so
+                      later runs on it may land on a worker without it.
+                    </p>
+                    <Button variant="secondary" size="sm" disabled={requiring} onClick={() => void requireOnRepo()}>
+                      Require on repo
+                    </Button>
+                  </div>
+                )}
+                {repo && requireError?.repoId === repo.id && (
+                  <p role="alert" className="mt-1.5 text-xs text-danger">{requireError.message}</p>
+                )}
+                {repo && requiredCaps.includes("docker") && repo.docker_allowlisted === false && (
+                  <p className="mt-1.5 text-xs text-warn">{isAdmin ? DOCKER_ALLOWLIST_ADMIN : DOCKER_ALLOWLIST_MEMBER}</p>
                 )}
               </div>
             )}

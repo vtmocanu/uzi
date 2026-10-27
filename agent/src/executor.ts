@@ -111,6 +111,12 @@ export type SecretRemediationDecision =
   | { action: "remediate"; followUp: string }
   | { action: "fail" };
 
+/** Marks only the exhausted revision's owner-event wait, excluding recovery work. */
+export type PlanRevisionOwnerWaitObserver = (waiting: boolean) => void;
+
+/** Silent recovery spent its wall before owner waiting; the executor owns wall routing. */
+export type PlanRevisionRetryOutcome = "wall" | void;
+
 /**
  * Everything an executor needs to work one run.
  *
@@ -428,13 +434,14 @@ export interface RunContext {
    * a fenced claim ends quietly. Absent on the stub/test executors ⇒ today's behaviour.
    */
   takeResumedGateEvent?(signal?: AbortSignal): Promise<PlanVerdict | undefined>;
-  /** Only human revision drivers call this after typed provider retry exhaustion.
+  /** Only human revision drivers call this after typed provider exhaustion or measured Codex silence.
    * Resolves to redrive, or throws controls / PlanRevisionReplacedError to exit this driver.
    * The runner must prove ownership before resolving; unknown ownership permits no provider start.
+   * remainingWallMs caps silent-recovery work before an owner-event wait; the wait itself is free.
    */
-  retryPlanRevisionTurn?(cause: unknown): Promise<void>;
-  /** Check the captured source before each human revision provider turn, including continuations. */
-  beforePlanRevisionTurn?(): Promise<void>;
+  retryPlanRevisionTurn?(cause: unknown, observer?: PlanRevisionOwnerWaitObserver, remainingWallMs?: () => number): Promise<PlanRevisionRetryOutcome>;
+  /** Check the captured source before human revision turns and fresh epoch credential/root admission. */
+  beforePlanRevisionTurn?(observer?: PlanRevisionOwnerWaitObserver, remainingWallMs?: () => number): Promise<PlanRevisionRetryOutcome>;
   /** An associated cross-check human gate continues its established wait after switch give-up. */
   continueExistingPlanGate?(otherwise: () => Promise<PlanVerdict>): Promise<PlanVerdict>;
   /**

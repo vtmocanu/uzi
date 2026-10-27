@@ -30,11 +30,11 @@ function commit(dir: string, name: string): string {
 }
 
 for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
-  for (const variant of kind === "self_improve" ? ["receipt", "excluded", "lost-ack"] : kind === "issue" ? ["receipt", "codex", "lost-ack", "capacity", "capacity-codex"] : ["receipt", "lost-ack"]) {
+  for (const variant of kind === "self_improve" ? ["receipt", "excluded", "lost-ack"] : kind === "issue" ? ["receipt", "codex", "lost-ack", "lost-ack-codex", "capacity", "capacity-codex"] : ["receipt", "lost-ack"]) {
     for (const host of process.platform === "linux" && (variant === "lost-ack" || variant === "excluded" || variant === "capacity" || variant === "capacity-codex") ? (variant.startsWith("capacity") ? ["native", "darwin", "darwin-retained"] : ["native", "darwin"]) : ["native"]) {
       const capacity = variant === "capacity" || variant === "capacity-codex";
       const excluded = variant === "excluded" || capacity;
-      const lostAck = variant === "lost-ack";
+      const lostAck = variant === "lost-ack" || variant === "lost-ack-codex";
       it(`${capacity ? "MR2598 regression 3: " : ""}${kind}/${variant}/${host}: full execute ${lostAck ? "preserves lost-ACK completion through closed fallback, exact replay and platform cleanup policy" : excluded ? "falls back when advertised API omits receipt" : "accepts authenticated completion receipt without archive or heartbeat"}`, { concurrency: false }, async t => {
         const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
         try {
@@ -127,7 +127,7 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
             return { ok: true, body: { published: true, ref: `refs/uzi-checkpoints/${branch}` } };
           };
           // Reuse the real registry/process-spawner fixture rather than copying the sink rig.
-          const codex = (variant === "codex" || variant === "capacity-codex") ? codexReapFixture([], () => false) : undefined;
+          const codex = (variant === "codex" || variant === "capacity-codex" || variant === "lost-ack-codex") ? codexReapFixture([], () => false) : undefined;
           if (codex) t.after(() => fs.rmSync(codex.root, { recursive: true, force: true }));
           let insideFinalize = false;
           if (codex) {
@@ -177,6 +177,24 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
           } }, forge.gitlab, "completion-full-execute-key", {
             outbox, checkpointIntervalMs: 1, checkpointTickIntervalMs: 0,
           });
+          // M3 fullchain: delegate the real builder and retain its exact flight, executor
+          // and terminal witness; never fabricate a successful disposal result.
+          const m3 = r as unknown as {
+            buildFlight(...args: unknown[]): {
+              executor: { safety?: unknown }; terminalDisposal?: unknown; branch?: string;
+            };
+            classifyCompletionSource(source: unknown): { kind: string; binding?: unknown };
+            completionSourceProof(source: unknown, binding: unknown): boolean;
+            withCompletionSourceBoundary(source: unknown, action: () => Promise<void>): Promise<string>;
+          };
+          let m3Flight: ReturnType<typeof m3.buildFlight> | undefined;
+          if (variant === "lost-ack-codex") {
+            const build = m3.buildFlight.bind(r);
+            t.mock.method(m3, "buildFlight", (...args: unknown[]) => {
+              m3Flight = build(...args);
+              return m3Flight;
+            });
+          }
           const recovery = (r as unknown as { recovery: RecoveryCoordinator }).recovery;
           const boundaryRunner = r as unknown as {
             withInventorySourceBoundary(context: { runId: string }, action: (prove: () => Promise<boolean>) => Promise<void>): Promise<"passed" | "retained">;
@@ -346,6 +364,85 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
                 "all existing same-attempt records bind the same authenticated source snapshot");
               assert.equal(record.completionSource?.expectedHead, command(clone, ["rev-parse", "HEAD"]));
             }
+            if (variant === "lost-ack-codex") {
+              assert.ok(m3Flight);
+              const classification = m3.classifyCompletionSource(boundSource);
+              assert.equal(classification.kind, "knownCodex");
+              assert.ok(classification.binding);
+              assert.equal(m3.completionSourceProof(boundSource, classification.binding), true,
+                "actual disposed executor/facade authenticates the advanced fallback HEAD and roots");
+              const serialized = JSON.parse(JSON.stringify(boundSource));
+              assert.equal(m3.completionSourceProof(serialized, classification.binding), true,
+                "durable serialization leaves exact current-process binding recognizable");
+              const readInventory = git.readInventoryCloneHeads.bind(git);
+              const inventory = t.mock.method(git, "readInventoryCloneHeads");
+              const executor = m3Flight.executor;
+              const safety = executor.safety;
+              const disposal = m3Flight.terminalDisposal;
+              const branch = m3Flight.branch;
+              const deny = async () => {
+                const reads = inventory.mock.callCount();
+                assert.equal(await m3.withCompletionSourceBoundary(serialized,
+                  async () => assert.fail("revoked disposal authorized deletion")), "retained");
+                assert.equal(inventory.mock.callCount(), reads, "revocation precedes first inventory");
+              };
+              try {
+                m3Flight.terminalDisposal = undefined;
+                await deny();
+                m3Flight.terminalDisposal = { result: { kind: "incomplete", errors: [] } };
+                await deny();
+                m3Flight.terminalDisposal = disposal;
+                m3Flight.executor = { safety };
+                await deny();
+                m3Flight.executor = executor;
+                executor.safety = {};
+                await deny();
+                executor.safety = safety;
+                m3Flight.branch = branch + "-changed";
+                await deny();
+              } finally {
+                m3Flight.executor = executor;
+                executor.safety = safety;
+                m3Flight.terminalDisposal = disposal;
+                m3Flight.branch = branch;
+              }
+              assert.equal(m3.completionSourceProof(boundSource, classification.binding), true,
+                "restoring the exact live witness permits the real cleanup below");
+              for (const changed of [
+                { ...serialized, expectedHead: "f".repeat(40) },
+                { ...serialized, roots: [{ sha: serialized.expectedHead, contexts: [serialized.context] }] },
+                { ...serialized, context: { ...serialized.context,
+                  defaultIdentity: { ...serialized.context.defaultIdentity, sha: "e".repeat(40) } } },
+                { ...serialized, clonePath: serialized.clonePath + "-changed" },
+                { ...serialized, attemptId: mintAttemptId(claim.claim_generation!) },
+              ]) {
+                const reads = inventory.mock.callCount();
+                assert.equal(await m3.withCompletionSourceBoundary(changed,
+                  async () => assert.fail("unbound provenance deleted source")), "retained");
+                assert.equal(inventory.mock.callCount(), reads, "unbound provenance refuses before inventory");
+              }
+              let revoked = false;
+              const accepts = codex!.safety.acceptsTerminalDisposal.bind(codex!.safety);
+              const acceptance = t.mock.method(codex!.safety, "acceptsTerminalDisposal",
+                (outcome: Parameters<typeof accepts>[0]) => !revoked && accepts(outcome));
+              const heads = t.mock.method(git, "worktreeHead");
+              const retires = t.mock.method(git, "retireRunnerClone");
+              inventory.mock.mockImplementationOnce(async (...args: Parameters<typeof readInventory>) => {
+                const value = await readInventory(...args);
+                revoked = true;
+                return value;
+              });
+              try {
+                assert.equal(await m3.withCompletionSourceBoundary(serialized,
+                  async () => assert.fail("invalidated disposal deleted source")), "retained");
+                assert.equal(heads.mock.callCount(), 0, "proof revocation during inventory stops the next source read");
+                assert.equal(retires.mock.callCount(), 0);
+                assert.equal(m3.classifyCompletionSource(serialized).kind, "knownCodex", "refusal retains provenance");
+              } finally {
+                acceptance.mock.restore(); heads.mock.restore(); retires.mock.restore();
+              }
+              assert.equal(m3.completionSourceProof(serialized, classification.binding), true);
+            }
             const cleanup = git.cleanupRecoveryGeneration.bind(git);
             const cleanupResults: string[] = [];
             t.mock.method(git, "cleanupRecoveryGeneration", async (...args: Parameters<typeof cleanup>) => {
@@ -360,6 +457,12 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
               records: persisted.map(record => ({ sourceSha: record.sourceSha, expectedHead: record.completionSource?.expectedHead,
                 hasReceipt: !!record.completionReceipt, roots: record.completionSource?.roots })),
             }));
+            if (variant === "lost-ack-codex" && linux) {
+              assert.deepEqual(await recovery.inspect(claim.run_id), [],
+                "fullchain unlinks the entire completing cohort");
+              assert.equal(m3.classifyCompletionSource(boundSource).kind, "noReliableBinding",
+                "coordinator notifies runner to forget only after actual cohort cleanup");
+            }
             if (!linux) {
               const retained = await recovery.inspect(claim.run_id);
               assert.equal(retained.length, persisted.length, "non-Linux retains all completing-generation recovery records");

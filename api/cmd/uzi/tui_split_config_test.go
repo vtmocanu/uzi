@@ -24,7 +24,8 @@ func TestTUISplitConfigModeAndUsageError(t *testing.T) {
 			if err := store.SaveConfig(&uzicli.Config{TUI: uzicli.TUIConfig{Split: tc.value}}); err != nil {
 				t.Fatal(err)
 			}
-			got, err := tuiSplitConfigMode(store)
+			prefs, err := tuiConfigPrefs(store)
+			got := prefs.split
 			if !tc.invalid {
 				if err != nil || got != tc.want {
 					t.Fatalf("mode=%q err=%v, want %q", got, err, tc.want)
@@ -40,8 +41,8 @@ func TestTUISplitConfigModeAndUsageError(t *testing.T) {
 			}
 		})
 	}
-	if mode, err := tuiSplitConfigMode(nil); err != nil || mode != "auto" {
-		t.Fatalf("nil store mode=%q err=%v", mode, err)
+	if prefs, err := tuiConfigPrefs(nil); err != nil || prefs.split != "auto" || prefs.railMinWidth != laneRailWidth || prefs.milestoneNumbers {
+		t.Fatalf("nil store prefs=%+v err=%v", prefs, err)
 	}
 	for _, value := range []string{"true", "42", "[\"auto\"]"} {
 		t.Run("invalid TOML type "+value, func(t *testing.T) {
@@ -62,7 +63,7 @@ func TestTUISplitConfigModeAndUsageError(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(store.Dir(), "config.toml"), []byte(body), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			_, err := tuiSplitConfigMode(store)
+			_, err := tuiConfigPrefs(store)
 			if err == nil || uzicli.ExitCodeFor(err) == uzicli.ExitUsage || strings.Contains(err.Error(), "accepted values") {
 				t.Fatalf("unrelated config decode error misreported as split: %v", err)
 			}

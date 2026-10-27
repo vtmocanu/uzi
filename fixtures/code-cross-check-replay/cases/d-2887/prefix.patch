@@ -1,0 +1,619 @@
+diff --git a/agent/test/fixture-repo.test.ts b/agent/test/fixture-repo.test.ts
+index 4f81d592..804bd282 100644
+--- a/agent/test/fixture-repo.test.ts
++++ b/agent/test/fixture-repo.test.ts
+@@ -5,7 +5,7 @@ import fs from "node:fs";
+ import os from "node:os";
+ import path from "node:path";
+ import { fileURLToPath } from "node:url";
+-import { makeFixture, type Fixture } from "./fixture-repo.js";
++import { makeFixture, makeScratchRoot, type Fixture } from "./fixture-repo.js";
+ import { GitCache } from "../src/git.js";
+ import { createLogger } from "../src/log.js";
+ 
+@@ -206,7 +206,113 @@ function normalizationFailureChild(): void {
+   assert.deepEqual(fs.readdirSync(process.env.TMPDIR!), ["ledger"]);
+ }
+ 
+-if (process.env.UZI_FIXTURE_PERMISSIONS_CHILD) {
++type Meta = { path: string; mode: number; uid: number; gid: number };
++
++function collectMetadata(base: string): Meta[] {
++  const metadata: Meta[] = [];
++  function collect(target: string): void {
++    const stat = fs.lstatSync(target);
++    metadata.push({ path: path.relative(base, target), mode: stat.mode & 0o7777, uid: stat.uid, gid: stat.gid });
++    if (stat.isDirectory()) for (const entry of fs.readdirSync(target)) collect(path.join(target, entry));
++  }
++  collect(base);
++  return metadata;
++}
++
++// Child of the makeScratchRoot permission matrix. TMPDIR is the parent under test.
++//   portable: a plain parent at the default umask; no POSIX identity needed.
++//   scratch:  makeScratchRoot, then the production GitCache guards over a real clone.
++//   raw:      a RAW mkdtemp root in the same parent (acceptance control / refusal calibration).
++async function scratchPermissionsChild(): Promise<void> {
++  const mode = process.env.UZI_SCRATCH_PERMISSIONS_CHILD as "portable" | "scratch" | "raw";
++  const kind = process.env.UZI_SCRATCH_PARENT_KIND;
++  const outer = process.env.TMPDIR!;
++  if (process.env.UZI_SCRATCH_UMASK !== undefined) process.umask(Number(process.env.UZI_SCRATCH_UMASK));
++  if (mode === "portable") {
++    const root = makeScratchRoot("scratch-portable-");
++    try {
++      assert.equal(path.dirname(fs.realpathSync(root)), fs.realpathSync(outer), "the root is a new directory inside the parent");
++      const nested = path.join(root, "data", "repos", "x");
++      fs.mkdirSync(nested, { recursive: true });
++      fs.writeFileSync(path.join(nested, "f.txt"), "hello\n");
++      assert.equal(fs.readFileSync(path.join(nested, "f.txt"), "utf8"), "hello\n");
++    } finally { fs.rmSync(root, { recursive: true, force: true }); }
++    assert.deepEqual(fs.readdirSync(outer), [], "removing the root leaves the parent as before");
++    return;
++  }
++  const origin = makeFixture();
++  let root: string | undefined;
++  try {
++    root = mode === "scratch" ? makeScratchRoot("scratch-matrix-") : fs.mkdtempSync(path.join(outer, "raw-matrix-"));
++    const rootStat = fs.lstatSync(root);
++    if (mode === "scratch") {
++      assert.equal(rootStat.uid, process.getuid!(), "root uid");
++      assert.equal(rootStat.gid, process.getgid!(), "root gid");
++      assert.equal(rootStat.mode & 0o7777, 0o700, "root mode");
++    }
++    const dataDir = path.join(root, "data");
++    fs.mkdirSync(dataDir);
++    const cache = new GitCache(dataDir, createLogger("error"));
++    const bare = await cache.ensureClone(origin.originPath);
++    const meta = collectMetadata(root);
++    console.log(JSON.stringify({ mode, kind, meta }));
++    const repos = meta.find(m => m.path === path.join("data", "repos"))!;
++    const discover = (): Promise<unknown> =>
++      cache.discoverRetainedRecovery(origin.originPath, "agent/issue-1", "issue-1", "run-1");
++    if (mode === "raw" && kind === "foreign") {
++      // Calibration: a raw root under a foreign-group setgid parent at umask 002 hands `repos`
++      // a foreign group with group-write, which the production guard refuses.
++      assert.notEqual(repos.gid, process.getgid!(), "repos inherited the foreign gid");
++      assert.ok((repos.mode & 0o2000) !== 0, "repos is setgid");
++      assert.ok((repos.mode & 0o020) !== 0, "repos is group-writable");
++      await assert.rejects(cache.codeSnapshotCandidate(bare, "lead"), /unsafe worker bare directory/);
++      await assert.rejects(discover(), /unsafe (worker bare directory|recovery bare config)/);
++    } else {
++      if (mode === "scratch") {
++        for (const entry of meta) {
++          assert.equal(entry.uid, process.getuid!(), entry.path + " uid");
++          assert.equal(entry.gid, process.getgid!(), entry.path + " gid");
++          assert.equal(entry.mode & 0o002, 0, entry.path + " world write");
++        }
++      }
++      assert.equal(await cache.codeSnapshotCandidate(bare, "lead"), undefined);
++      if (mode === "scratch") assert.equal(await discover(), undefined, "recovery discovery raises no guard error");
++    }
++  } finally {
++    try { if (root) fs.rmSync(root, { recursive: true, force: true }); } finally { origin.cleanup(); }
++  }
++  assert.deepEqual(fs.readdirSync(outer), [], "child teardown leaves the parent empty");
++}
++
++function scratchNormalizationFailureChild(): void {
++  const operation = process.env.UZI_SCRATCH_NORMALIZATION_FAILURE as "chownSync" | "chmodSync";
++  const originals = { chownSync: fs.chownSync, chmodSync: fs.chmodSync };
++  const failure = new Error("injected scratch normalization failure");
++  let target: fs.PathLike | undefined;
++  let caught: unknown;
++  try {
++    const fail = (root: fs.PathLike): never => { target = root; throw failure; };
++    if (operation === "chownSync") fs.chownSync = fail;
++    else fs.chmodSync = fail;
++    try { makeScratchRoot("scratch-fail-"); } catch (error) { caught = error; }
++  } finally {
++    if (operation === "chownSync") fs.chownSync = originals.chownSync;
++    else fs.chmodSync = originals.chmodSync;
++  }
++  assert.equal(fs[operation], originals[operation]);
++  assert.equal(caught, failure, "preserves the exact normalization error");
++  assert.ok(target);
++  assert.equal(fs.existsSync(target), false);
++  const lines = readLedger(process.env.UZI_TMPDIR_GUARD_LEDGER!);
++  assert.deepEqual(lines.map(line => [line.event, line.path]), [["created", target], ["removed", target]]);
++  assert.deepEqual(fs.readdirSync(process.env.TMPDIR!), ["ledger"]);
++}
++
++if (process.env.UZI_SCRATCH_PERMISSIONS_CHILD) {
++  await scratchPermissionsChild();
++} else if (process.env.UZI_SCRATCH_NORMALIZATION_FAILURE) {
++  scratchNormalizationFailureChild();
++} else if (process.env.UZI_FIXTURE_PERMISSIONS_CHILD) {
+   await permissionsChild();
+ } else if (process.env.UZI_FIXTURE_NORMALIZATION_FAILURE) {
+   normalizationFailureChild();
+@@ -242,7 +348,7 @@ if (process.env.UZI_FIXTURE_PERMISSIONS_CHILD) {
+             for (const key of Object.keys(childEnv)) {
+               if (key.startsWith("GIT_") || key === "UZI_TMPDIR_GUARD_LEDGER" ||
+                   key === "UZI_FIXTURE_REPO_CHILD" || key === "UZI_FIXTURE_REPO_POISON_CHILD" ||
+-                  key === "UZI_FIXTURE_NORMALIZATION_FAILURE") delete childEnv[key];
++                  key === "UZI_FIXTURE_NORMALIZATION_FAILURE" || key.startsWith("UZI_SCRATCH_")) delete childEnv[key];
+             }
+             const r = spawnSync(process.execPath, ["--import", "tsx", SELF], {
+               cwd: AGENT_DIR, env: childEnv, encoding: "utf8", timeout: 60_000,
+@@ -262,7 +368,8 @@ if (process.env.UZI_FIXTURE_PERMISSIONS_CHILD) {
+             UZI_FIXTURE_NORMALIZATION_FAILURE: operation, UZI_TMPDIR_GUARD_LEDGER: path.join(outer, "ledger") };
+           for (const key of Object.keys(childEnv)) {
+             if (key.startsWith("GIT_") || key === "UZI_FIXTURE_PERMISSIONS_CHILD" ||
+-                key === "UZI_FIXTURE_REPO_CHILD" || key === "UZI_FIXTURE_REPO_POISON_CHILD") delete childEnv[key];
++                key === "UZI_FIXTURE_REPO_CHILD" || key === "UZI_FIXTURE_REPO_POISON_CHILD" ||
++                key.startsWith("UZI_SCRATCH_")) delete childEnv[key];
+           }
+           const r = spawnSync(process.execPath, ["--import", "tsx", SELF], {
+             cwd: AGENT_DIR, env: childEnv, encoding: "utf8", timeout: 60_000,
+@@ -274,6 +381,97 @@ if (process.env.UZI_FIXTURE_PERMISSIONS_CHILD) {
+     }
+   });
+ 
++  describe("makeScratchRoot root permissions", () => {
++    const supported = process.platform !== "win32" && !!process.getgid && !!process.getuid && !!process.getgroups;
++    const foreignGid = supported ? process.getgroups!().find(gid => gid !== process.getgid!()) : undefined;
++
++    // Runs one child with TMPDIR=<parent>. Child flags are stripped from the inherited environment.
++    function runChild(parent: string, extra: Record<string, string>, ledger?: string): void {
++      const childEnv: NodeJS.ProcessEnv = { ...process.env, TMPDIR: parent, TEMP: parent, TMP: parent,
++        TSX_DISABLE_CACHE: "1", ...extra };
++      for (const key of Object.keys(childEnv)) {
++        if (key.startsWith("GIT_") || key === "UZI_TMPDIR_GUARD_LEDGER" || key === "UZI_FIXTURE_PERMISSIONS_CHILD" ||
++            key === "UZI_FIXTURE_REPO_CHILD" || key === "UZI_FIXTURE_REPO_POISON_CHILD" ||
++            key === "UZI_FIXTURE_NORMALIZATION_FAILURE" ||
++            (key.startsWith("UZI_SCRATCH_") && !(key in extra))) delete childEnv[key];
++      }
++      if (ledger) childEnv.UZI_TMPDIR_GUARD_LEDGER = ledger;
++      const r = spawnSync(process.execPath, ["--import", "tsx", SELF], {
++        cwd: AGENT_DIR, env: childEnv, encoding: "utf8", timeout: 90_000,
++      });
++      assert.ifError(r.error);
++      assert.equal(r.status, 0, r.stdout + r.stderr);
++    }
++
++    it("returns a private root inside a plain parent that nested directories can use and that removes cleanly", () => {
++      const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-scratch-plain-"));
++      try {
++        runChild(outer, { UZI_SCRATCH_PERMISSIONS_CHILD: "portable", UZI_SCRATCH_PARENT_KIND: "plain" });
++        assert.deepEqual(fs.readdirSync(outer), []);
++      } finally { fs.rmSync(outer, { recursive: true, force: true }); }
++    });
++
++    it("gives an owned 0700 root whose bare clones pass the production guards (plain parent, default umask)",
++      { skip: !supported ? "POSIX identity unavailable" : false }, () => {
++        const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-scratch-posix-"));
++        try {
++          runChild(outer, { UZI_SCRATCH_PERMISSIONS_CHILD: "scratch", UZI_SCRATCH_PARENT_KIND: "plain" });
++          assert.deepEqual(fs.readdirSync(outer), []);
++        } finally { fs.rmSync(outer, { recursive: true, force: true }); }
++      });
++
++    const parents = [
++      { kind: "plain", name: "plain", gid: supported ? process.getgid!() : 0, mode: 0o770, raw: false },
++      { kind: "own", name: "own-group setgid", gid: supported ? process.getgid!() : 0, mode: 0o2770, raw: true },
++      { kind: "foreign", name: "foreign-group setgid", gid: foreignGid, mode: 0o2770, raw: true },
++    ];
++    // Sets up an owned outer parent with the given group and mode, runs `children`, then checks
++    // the parent is unchanged and empty.
++    function withParent(parent: (typeof parents)[number], mask: number, children: string[]): void {
++      const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-scratch-"));
++      try {
++        fs.chownSync(outer, process.getuid!(), parent.gid!);
++        fs.chmodSync(outer, parent.mode);
++        const before = fs.statSync(outer);
++        assert.equal(before.gid, parent.gid);
++        assert.equal(before.mode & 0o7777, parent.mode);
++        const env = { UZI_SCRATCH_PARENT_KIND: parent.kind, UZI_SCRATCH_UMASK: String(mask) };
++        for (const child of children) runChild(outer, { ...env, UZI_SCRATCH_PERMISSIONS_CHILD: child });
++        const after = fs.statSync(outer);
++        assert.deepEqual([after.uid, after.gid, after.mode], [before.uid, before.gid, before.mode],
++          "parent ownership and mode remain unchanged");
++        assert.deepEqual(fs.readdirSync(outer), []);
++      } finally { fs.rmSync(outer, { recursive: true, force: true }); }
++    }
++    const identitySkip = (parent: (typeof parents)[number]) =>
++      !supported ? "POSIX identity unavailable" : parent.gid === undefined ? "foreign supplementary group unavailable" : false;
++    for (const parent of parents) {
++      for (const mask of [0o002, 0o022]) {
++        // The own-group raw root is accepted on every POSIX platform; the foreign-group raw refusal
++        // is a Linux setgid-inheritance calibration and runs in its own Linux-only test below.
++        const rawCase = parent.raw && parent.kind !== "foreign";
++        it(`${parent.name} parent with umask ${mask.toString(8)}: the scratch root is accepted${rawCase ? "; a raw root is accepted" : ""}`, {
++          skip: identitySkip(parent),
++        }, () => withParent(parent, mask, rawCase ? ["scratch", "raw"] : ["scratch"]));
++      }
++    }
++    {
++      const foreign = parents.find(p => p.kind === "foreign")!;
++      it("foreign-group setgid parent with umask 2: a raw root inherits the foreign group and is refused (Linux setgid calibration)", {
++        skip: process.platform !== "linux" ? "Linux setgid directory inheritance required" : identitySkip(foreign),
++      }, () => withParent(foreign, 0o002, ["raw"]));
++    }
++
++    for (const operation of ["chownSync", "chmodSync"]) {
++      it(`cleans up and records a failed scratch root ${operation}`, { skip: !supported ? "POSIX identity unavailable" : false }, () => {
++        const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-scratch-failure-"));
++        try {
++          runChild(outer, { UZI_SCRATCH_NORMALIZATION_FAILURE: operation }, path.join(outer, "ledger"));
++        } finally { fs.rmSync(outer, { recursive: true, force: true }); }
++      });
++    }
++  });
++
+   describe("makeFixture inherited Git environment isolation", () => {
+     for (const scenario of POISON_SCENARIOS) {
+       it(`isolates ${scenario} without mutating the child environment or poison repo`, () => {
+@@ -288,7 +486,7 @@ if (process.env.UZI_FIXTURE_PERMISSIONS_CHILD) {
+             UZI_FIXTURE_REPO_POISON_CHILD: scenario,
+           };
+           for (const key of Object.keys(childEnv)) {
+-            if (key.startsWith("GIT_")) delete childEnv[key];
++            if (key.startsWith("GIT_") || key.startsWith("UZI_SCRATCH_")) delete childEnv[key];
+           }
+           delete childEnv.UZI_FIXTURE_REPO_CHILD;
+           delete childEnv.UZI_TMPDIR_GUARD_LEDGER;
+@@ -354,6 +552,7 @@ if (process.env.UZI_FIXTURE_PERMISSIONS_CHILD) {
+       try {
+         const childEnv: NodeJS.ProcessEnv = { ...process.env, TMPDIR: outer, UZI_FIXTURE_REPO_CHILD: "1" };
+         delete childEnv.UZI_TMPDIR_GUARD_LEDGER; // the guard sets its own
++        for (const key of Object.keys(childEnv)) if (key.startsWith("UZI_SCRATCH_")) delete childEnv[key];
+         const r = spawnSync(GUARD, [process.execPath, "--import", "tsx", SELF], {
+           cwd: AGENT_DIR,
+           env: childEnv,
+diff --git a/agent/test/fixture-repo.ts b/agent/test/fixture-repo.ts
+index 6e69a93e..cfba59cc 100644
+--- a/agent/test/fixture-repo.ts
++++ b/agent/test/fixture-repo.ts
+@@ -93,18 +93,14 @@ function callerSites(): string[] {
+ }
+ 
+ /**
+- * Build a throwaway git "origin" on disk. A bare clone of a local path needs no
+- * network and no auth, so the whole worktree lifecycle is exercisable offline.
+- *
+- * `files` (repo-relative path → contents) are committed alongside the README, so
+- * a test can ship a repo that carries e.g. its own `.claude/agents/`.
++ * Normalize a freshly created scratch root. A setgid TMPDIR can lend the root a
++ * foreign group and special bits; normalize only this root before any descendants
++ * inherit its metadata. On failure the root is removed (ledgered) and the ORIGINAL
++ * error is rethrown.
+  */
+-export function makeFixture(files: Record<string, string> = {}, opts: { testName?: string } = {}): Fixture {
+-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-agent-test-"));
+-  // Recorded before the git work so a later throw in makeFixture still leaves a created line.
+-  ledger("created", base, { file: process.argv[1] ?? null, test: opts.testName ?? null, site: callerSites() });
++function normalizeRoot(base: string): void {
+   try {
+-    // A setgid TMPDIR can lend makeFixture a foreign group and special bits.
++    // A setgid TMPDIR can lend a fixture or scratch root a foreign group and special bits.
+     // Normalize only this root before any descendants inherit its metadata.
+     if (process.platform !== "win32" && process.getuid && process.getgid) {
+       fs.chownSync(base, process.getuid(), process.getgid());
+@@ -119,6 +115,32 @@ export function makeFixture(files: Record<string, string> = {}, opts: { testName
+     }
+     throw error;
+   }
++}
++
++/**
++ * Create a private (uid/gid-owned, 0700) scratch root under os.tmpdir() whose
++ * descendants cannot inherit a setgid TMPDIR's foreign group or setgid bit.
++ * The parent directory is never touched. The caller removes the root.
++ */
++export function makeScratchRoot(prefix: string): string {
++  const base = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
++  ledger("created", base, { file: process.argv[1] ?? null, test: null, site: callerSites() });
++  normalizeRoot(base);
++  return base;
++}
++
++/**
++ * Build a throwaway git "origin" on disk. A bare clone of a local path needs no
++ * network and no auth, so the whole worktree lifecycle is exercisable offline.
++ *
++ * `files` (repo-relative path → contents) are committed alongside the README, so
++ * a test can ship a repo that carries e.g. its own `.claude/agents/`.
++ */
++export function makeFixture(files: Record<string, string> = {}, opts: { testName?: string } = {}): Fixture {
++  const base = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-agent-test-"));
++  // Recorded before the git work so a later throw in makeFixture still leaves a created line.
++  ledger("created", base, { file: process.argv[1] ?? null, test: opts.testName ?? null, site: callerSites() });
++  normalizeRoot(base);
+   const originPath = path.join(base, "origin");
+   const dataDir = path.join(base, "data");
+   fs.mkdirSync(originPath);
+diff --git a/agent/test/runner-midturn-checkpoint.test.ts b/agent/test/runner-midturn-checkpoint.test.ts
+index 2d1a5100..2e89a257 100644
+--- a/agent/test/runner-midturn-checkpoint.test.ts
++++ b/agent/test/runner-midturn-checkpoint.test.ts
+@@ -6,7 +6,6 @@ import { execFile, execFileSync, spawn } from "node:child_process";
+ import { promisify } from "node:util";
+ import { randomBytes } from "node:crypto";
+ import fs from "node:fs";
+-import os from "node:os";
+ import path from "node:path";
+ import { PassThrough, type Readable } from "node:stream";
+ import type { ExecutorFactory, RunnerOptions } from "../src/runner.js";
+@@ -18,6 +17,7 @@ import { GitCache } from "../src/git.js";
+ import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
+ import { defaultGitleaksShim, shimCalls, writeGitleaksShim as writeShim } from "./gitleaks-shim.js";
+ import { realProcfsSkip } from "./real-procfs.js";
++import { makeScratchRoot } from "./fixture-repo.js";
+ import type { Logger } from "../src/log.js";
+ import {
+   api,
+@@ -462,13 +462,13 @@ async function waitFor(pred: () => boolean, ms = 5_000): Promise<void> {
+ /** How long teardown waits for each phase: execute() resolving, tick settlement, child death. */
+ const TEARDOWN_MS = 20_000;
+ 
+-async function bounded<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
++async function bounded<T>(p: Promise<T>, ms: number, what: string, phase = "teardown"): Promise<T> {
+   let t: ReturnType<typeof setTimeout> | undefined;
+   try {
+     return await Promise.race([
+       p,
+       new Promise<never>((_, reject) => {
+-        t = setTimeout(() => reject(new Error(`teardown: ${what} did not happen within ${ms}ms`)), ms);
++        t = setTimeout(() => reject(new Error(`${phase}: ${what} did not happen within ${ms}ms`)), ms);
+       }),
+     ]);
+   } finally {
+@@ -551,7 +551,57 @@ async function settleAndClean(spec: {
+ }
+ 
+ function scratchDir(tag: string): string {
+-  return fs.mkdtempSync(path.join(os.tmpdir(), `uzi-1597-m2-${tag}-`));
++  return makeScratchRoot(`uzi-1597-m2-${tag}-`);
++}
++
++/** How long a recovery scenario waits for runner A's executor to signal that it has committed. */
++const STARTUP_MS = 60_000;
++
++/**
++ * Wait for the executor's readiness signal, but fail fast and with a named startup error when the
++ * runner finishes or rejects before ever signalling (otherwise the test would hang to the per-test
++ * timeout). `running` is the runner's own execute() promise; its late settlement after `ready` wins
++ * is swallowed here, and the caller still awaits it in teardown.
++ */
++async function awaitReady(ready: Promise<void>, running: Promise<unknown>, label: string): Promise<void> {
++  const outcome = running.then(
++    () => {
++      throw new Error(`startup: ${label} finished before the executor signalled readiness`);
++    },
++    (e: unknown) => {
++      throw new Error(`startup: ${label} rejected before the executor signalled readiness`, { cause: e });
++    },
++  );
++  outcome.catch(() => undefined);
++  await bounded(Promise.race([ready, outcome]), STARTUP_MS, `${label} executor readiness`, "startup");
++}
++
++/** "complete": runner A's executor returns without signalling. "reject": additionally A's execute()
++ *  call rejects with a sentinel, as if the runner itself threw. */
++type StartupFault = "complete" | "reject";
++
++/** What a startup regression observes of a scenario that threw before returning. */
++interface StartupProbe {
++  pA?: Promise<unknown>;
++  tmp?: string;
++  sentinel?: Error;
++}
++
++/** Runner A's executor: the normal committing blockingTurn, or a turn that never signals. */
++function runnerAFactory(fault: StartupFault | undefined, body: (ctx: RunContext) => Promise<void>): ExecutorFactory {
++  return fault === undefined ? blockingTurn(body) : turn(async () => {});
++}
++
++/** For "reject", make the call site's own `runnerA.execute(claim)` settle as a rejection. */
++function injectRejection(runnerA: RunRunner, fault: StartupFault | undefined, probe: StartupProbe): void {
++  if (fault !== "reject") return;
++  const sentinel = new Error("injected runner rejection");
++  probe.sentinel = sentinel;
++  const realExecute = runnerA.execute.bind(runnerA);
++  runnerA.execute = (c) =>
++    realExecute(c).then(() => {
++      throw sentinel;
++    });
+ }
+ 
+ // ── (a) cross-worker recovery ────────────────────────────────────────────────────────────────
+@@ -560,8 +610,14 @@ function scratchDir(tag: string): string {
+  *  refs/uzi-checkpoints/<branch>; A is then "SIGKILLed" (no shutdown, timers stopped, data dir
+  *  deleted). Worker B, on a FRESH data dir, re-claims the run as a resume carrying the recorded
+  *  checkpoint tip. Returns whether B's runner clone contains A's commit. */
+-async function crossWorker(iid: number, tickEnabled: boolean): Promise<{ recovered: boolean; publishes: number }> {
++async function crossWorker(
++  iid: number,
++  tickEnabled: boolean,
++  fault?: StartupFault,
++  probe: StartupProbe = {},
++): Promise<{ recovered: boolean; publishes: number }> {
+   const tmp = scratchDir("xw");
++  probe.tmp = tmp;
+   const shim = writeShim(tmp, "detect");
+   const ctl = control();
+   const branch = `agent/issue-${iid}`;
+@@ -580,16 +636,18 @@ async function crossWorker(iid: number, tickEnabled: boolean): Promise<{ recover
+   const claim = gitlabClaim(iid);
+   const runnerA = mkRunner(
+     mkGit(dataA, shim),
+-    blockingTurn(async (ctx) => {
++    runnerAFactory(fault, async (ctx) => {
+       commitIn(ctx.worktreePath, "A1.txt", "worker A's committed work\n");
+       started.resolve();
+     }),
+     ctl,
+     { checkpointTickIntervalMs: tickEnabled ? TICK_MS : 0 },
+   );
++  injectRejection(runnerA, fault, probe);
+   const pA = runnerA.execute(claim);
++  probe.pA = pA;
+   try {
+-    await started.promise;
++    await awaitReady(started.promise, pA, "cross-worker runner A");
+     if (tickEnabled) {
+       ctl.advance(INTERVAL_MS + 1);
+       assert.equal(await ctl.fire(), "published");
+@@ -619,11 +677,114 @@ async function crossWorker(iid: number, tickEnabled: boolean): Promise<{ recover
+   } finally {
+     pub.restore();
+     runnerA.shutdown();
+-    await pA.catch(() => undefined);
++    await bounded(pA.catch(() => undefined), TEARDOWN_MS, "the runner's execute()").catch((e: unknown) =>
++      teardownErrors.push(e),
++    );
+     fs.rmSync(tmp, { recursive: true, force: true });
+   }
+ }
+ 
++/** Runner A of test (b): a same-worker run whose tick publish is rejected (HTTP 503), started and
++ *  awaited until its executor has committed. Shared by (b) and its startup regressions so both run
++ *  the same startup code. A startup failure tears the scenario down before it rethrows. */
++async function startSameWorkerA(iid: number, fault?: StartupFault, probe: StartupProbe = {}) {
++  const tmp = scratchDir("same");
++  probe.tmp = tmp;
++  const shim = writeShim(tmp, "detect");
++  const ctl = control();
++  const pub = stubPublish(async (_n, _tip, pack) => {
++    await drain(pack);
++    return { ok: false, httpStatus: 503 };
++  });
++  const branch = `agent/issue-${iid}`;
++  const dataDir = path.join(tmp, "data");
++  const g = mkGit(dataDir, shim);
++  const claim = gitlabClaim(iid);
++  let sha = "";
++  const started = deferred();
++  const runnerA = mkRunner(
++    g,
++    runnerAFactory(fault, async (ctx) => {
++      sha = commitIn(ctx.worktreePath, "SAME.txt", "same-worker work\n");
++      started.resolve();
++    }),
++    ctl,
++  );
++  injectRejection(runnerA, fault, probe);
++  const pA = runnerA.execute(claim);
++  probe.pA = pA;
++  const teardown = async (): Promise<void> => {
++    pub.restore();
++    runnerA.shutdown();
++    await bounded(pA.catch(() => undefined), TEARDOWN_MS, "the runner's execute()").catch((e: unknown) =>
++      teardownErrors.push(e),
++    );
++    fs.rmSync(tmp, { recursive: true, force: true });
++  };
++  try {
++    await awaitReady(started.promise, pA, "same-worker runner A");
++  } catch (e) {
++    await teardown();
++    throw e;
++  }
++  return { tmp, shim, ctl, iid, branch, dataDir, g, claim, runnerA, sha: () => sha, teardown };
++}
++
++describe("recovery startup readiness (#2887)", () => {
++  const scenarios: Array<{ name: string; start: (iid: number, fault: StartupFault, probe: StartupProbe) => Promise<unknown>; iid: number }> = [
++    { name: "cross-worker runner A", start: (iid, fault, probe) => crossWorker(iid, false, fault, probe), iid: 1597_291 },
++    { name: "same-worker runner A", start: (iid, fault, probe) => startSameWorkerA(iid, fault, probe), iid: 1597_293 },
++  ];
++  for (const sc of scenarios) {
++    (["complete", "reject"] as const).forEach((fault, i) => {
++      it(`${sc.name}: an executor that ${fault === "complete" ? "finishes" : "finishes and whose execute() rejects"} before signalling fails fast and tears down`, async () => {
++        const probe: StartupProbe = {};
++        const t0 = Date.now();
++        await assert.rejects(sc.start(sc.iid + i, fault, probe), (err: Error) => {
++          if (fault === "complete") {
++            assert.match(err.message, /startup: .* finished before/);
++          } else {
++            assert.match(err.message, /startup: .* rejected before/);
++            assert.ok(probe.sentinel);
++            assert.equal(err.cause, probe.sentinel);
++          }
++          return true;
++        });
++        assert.ok(Date.now() - t0 < STARTUP_MS, "failed before the startup bound");
++        assert.ok(probe.pA, "the call site's execute() promise was captured");
++        const outcome = await bounded(probe.pA.then(() => "resolved" as const, (e: unknown) => e), 5_000, "runner A settled");
++        if (fault === "reject") assert.equal(outcome, probe.sentinel, "the call site's own execute() rejected with the sentinel");
++        assert.equal(fs.existsSync(probe.tmp!), false, "the scratch root was removed");
++        assert.deepEqual(teardownErrors, [], "teardown completed cleanly");
++      });
++    });
++  }
++
++  for (const variant of ["resolves", "rejects"] as const) {
++    it(`awaitReady resolves when ready wins and the runner later ${variant}, with no unhandled rejection`, async () => {
++      const events: unknown[] = [];
++      const listener = (reason: unknown): void => {
++        events.push(reason);
++      };
++      process.on("unhandledRejection", listener);
++      try {
++        let markReady!: () => void;
++        const ready = new Promise<void>((r) => (markReady = r));
++        let settle!: (fail: boolean) => void;
++        const running = new Promise<void>((res, rej) => (settle = (fail) => (fail ? rej(new Error("late runner failure")) : res())));
++        const waited = awaitReady(ready, running, "unit runner");
++        markReady();
++        await waited;
++        settle(variant === "rejects");
++        await new Promise<void>((resolve) => setImmediate(resolve));
++        assert.deepEqual(events, []);
++      } finally {
++        process.off("unhandledRejection", listener);
++      }
++    });
++  }
++});
++
+ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
+   it("(a) cross-worker recovery: a tick-published checkpoint lets a fresh worker resume A's commits; with the tick disabled it cannot", async () => {
+     const on = await crossWorker(1597_201, true);
+@@ -636,31 +797,10 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
+   });
+ 
+   it("(b) same-worker missing source: a failed publish retains fetch-back but a re-claim cannot seed without its known source", async () => {
+-    const tmp = scratchDir("same");
+-    const shim = writeShim(tmp, "detect");
+-    const ctl = control();
+-    const pub = stubPublish(async (_n, _tip, pack) => {
+-      await drain(pack);
+-      return { ok: false, httpStatus: 503 };
+-    });
+-    const iid = 1597_203;
+-    const branch = `agent/issue-${iid}`;
+-    const dataDir = path.join(tmp, "data");
+-    const g = mkGit(dataDir, shim);
+-    const claim = gitlabClaim(iid);
+-    let sha = "";
+-    const started = deferred();
+-    const runnerA = mkRunner(
+-      g,
+-      blockingTurn(async (ctx) => {
+-        sha = commitIn(ctx.worktreePath, "SAME.txt", "same-worker work\n");
+-        started.resolve();
+-      }),
+-      ctl,
+-    );
+-    const pA = runnerA.execute(claim);
++    const A = await startSameWorkerA(1597_203);
++    const { shim, ctl, iid, branch, dataDir, g, claim } = A;
++    const sha = A.sha();
+     try {
+-      await started.promise;
+       ctl.advance(INTERVAL_MS + 1);
+       assert.equal(await ctl.fire(), "publish_failed:rejected");
+       const bare = g.barePathFor(fx.originPath);
+@@ -708,10 +848,7 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
+         line.msg === "run failed" && line.error === "Retained recovery blocked: required source is missing; local work and custody retained"),
+       "the exact missing-source failure is visible");
+     } finally {
+-      pub.restore();
+-      runnerA.shutdown();
+-      await pA.catch(() => undefined);
+-      fs.rmSync(tmp, { recursive: true, force: true });
++      await A.teardown();
+     }
+   });
+ 

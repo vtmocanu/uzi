@@ -1044,6 +1044,52 @@ awk '
 ' "$CHART_DIR/Chart.yaml" > "$STRIPPED/Chart.yaml"
 
 
+# Pod-epoch runtime: exact enum even with Docker disabled. Each render is one
+# attempt; failure stops the matrix. Docker alone gains pod watch/patch.
+for epoch_runtime in '' containerd-runc crio-crun; do
+  helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true \
+    --set-string "workers.docker.podEpochReclaim.runtime=$epoch_runtime" > "$WORK/epoch.yaml"
+  awk -v expected="\"$epoch_runtime\"" '
+    /- name: UZI_WORKER_POD_EPOCH_RUNTIME/ { pending=1; count++; next }
+    pending && /^[[:space:]]*value:/ { if ($2 != expected) exit 1; pending=0 }
+    END { if (count != 1 || pending) exit 1 }
+  ' "$WORK/epoch.yaml"
+done
+for epoch_runtime in invalid CONTAINERD-RUNC true 7; do
+  if helm template uzi "$STRIPPED" \
+    --set "workers.docker.podEpochReclaim.runtime=$epoch_runtime" > "$WORK/epoch-invalid.log" 2>&1; then
+    echo "FAIL: invalid pod-epoch runtime accepted: $epoch_runtime" >&2
+    exit 1
+  fi
+  grep -F 'workers.docker.podEpochReclaim.runtime must be' "$WORK/epoch-invalid.log" >/dev/null
+done
+helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true \
+  --set workers.docker.enabled=true --set workers.docker.networkPolicy.acknowledgeUnfenced=true \
+  --set workers.isolatedLane.enabled=true --set workers.fqdnEgress.enabled=true \
+  --set 'forge.allowedBaseURLs[0]=https://gitlab.example.com' \
+  --set 'workers.isolatedLane.clusterCIDRs.pod[0]=10.244.0.0/16' \
+  --set 'workers.isolatedLane.clusterCIDRs.service[0]=10.96.0.0/12' \
+  --set 'workers.isolatedLane.clusterCIDRs.node[0]=192.0.2.0/24' > "$WORK/epoch-rbac.yaml"
+awk '
+  /^---$/ { role=0; name=""; resource=""; next }
+  /^kind: Role$/ { role=1 }
+  role && /^  name:/ { name=$2 }
+  role && /^    resources:/ { resource=$0; next }
+  role && /^    verbs:/ {
+    if (index(resource, "\"pods\"")) {
+      want="    verbs: [\"list\"]"
+      if (name ~ /-controller-docker$/) want="    verbs: [\"list\", \"watch\", \"patch\"]"
+      if ($0 != want) { print "FAIL: pod verbs in " name ": " $0; bad=1 }
+      seen[name]=1
+    }
+    if (index(resource, "\"secrets\"") && $0 != "    verbs: [\"create\", \"delete\"]") bad=1
+    if (index(resource, "\"replicasets\"") && $0 != "    verbs: [\"list\"]") bad=1
+    if (index(resource, "\"pods/log\"") || index($0, "\"get\"")) bad=1
+  }
+  END { for (name in seen) count++; if (count != 3 || bad) exit 1 }
+' "$WORK/epoch-rbac.yaml"
+echo "OK: pod-epoch runtime enum and Docker-only pod watch/patch"
+
 # Memory guard configuration: a finite case matrix, no retries. Any failure stops
 # sibling cases. These renders use explicit synthetic values, not sizing advice.
 memory_guard_render() {
@@ -1155,6 +1201,99 @@ awk '
   }
 ' "$SCRIPT_DIR/../docker-compose.yml"
 echo "OK: memory guard defaults, aliases, explicit env values, numeric bounds, controller-off invariants and compose inventory"
+
+# Go concurrency defaults (#3382): optional, rendered only when set. A finite case
+# matrix, no retries. Values given as a string (--set-string), an int (--set) and an
+# unquoted number in a values file (float64 in Helm) must all render the canonical
+# decimal, and invalid values must fail through worker-invariants with the controller
+# and hosting off.
+go_conc_render() {
+  helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true "$@"
+}
+# go_conc_env FILE NAME: the quoted value of one env entry, "<absent>" when missing,
+# "<duplicate>" when rendered more than once.
+go_conc_env() {
+  awk -v want="$2" '
+    $0 ~ "- name: " want "$" { n++; pending=1; next }
+    pending && /^[[:space:]]*value:/ { v=$2; pending=0 }
+    END { if (n == 0) print "<absent>"; else if (n > 1) print "<duplicate>"; else print v }
+  ' "$1"
+}
+go_conc_expect() { # FILE WANT_BUILD WANT_PROCS (empty = absent)
+  _gb=$(go_conc_env "$1" UZI_WORKER_GO_BUILD_PARALLELISM)
+  _gm=$(go_conc_env "$1" UZI_WORKER_GO_MAXPROCS)
+  [ -n "$2" ] && _wb="\"$2\"" || _wb="<absent>"
+  [ -n "$3" ] && _wm="\"$3\"" || _wm="<absent>"
+  if [ "$_gb" != "$_wb" ] || [ "$_gm" != "$_wm" ]; then
+    echo "FAIL: go concurrency env build=$_gb procs=$_gm, expected build=$_wb procs=$_wm ($4)" >&2
+    exit 1
+  fi
+}
+go_conc_render > "$WORK/go-default.yaml"
+go_conc_expect "$WORK/go-default.yaml" "" "" default
+printf 'workers:\n  goBuildParallelism: 2147483647\n  goMaxProcs: 2147483647\n' > "$WORK/go-values.yaml"
+go_conc_render -f "$WORK/go-values.yaml" > "$WORK/go-case.yaml"
+go_conc_expect "$WORK/go-case.yaml" 2147483647 2147483647 "values file, unquoted max"
+printf 'workers:\n  goBuildParallelism: 4\n' > "$WORK/go-values.yaml"
+go_conc_render -f "$WORK/go-values.yaml" > "$WORK/go-case.yaml"
+go_conc_expect "$WORK/go-case.yaml" 4 "" "values file, build only"
+printf 'workers:\n  goMaxProcs: "8"\n' > "$WORK/go-values.yaml"
+go_conc_render -f "$WORK/go-values.yaml" > "$WORK/go-case.yaml"
+go_conc_expect "$WORK/go-case.yaml" "" 8 "values file, quoted procs only"
+for pair in "string:--set-string" "int:--set"; do
+  kind=${pair%%:*}; flagname=${pair#*:}
+  go_conc_render "$flagname" workers.goBuildParallelism=3 > "$WORK/go-case.yaml"
+  go_conc_expect "$WORK/go-case.yaml" 3 "" "$kind build only"
+  go_conc_render "$flagname" workers.goMaxProcs=5 > "$WORK/go-case.yaml"
+  go_conc_expect "$WORK/go-case.yaml" "" 5 "$kind procs only"
+  go_conc_render "$flagname" workers.goBuildParallelism=2147483647 \
+    "$flagname" workers.goMaxProcs=2147483647 > "$WORK/go-case.yaml"
+  go_conc_expect "$WORK/go-case.yaml" 2147483647 2147483647 "$kind both at ceiling"
+done
+go_conc_render --set-string workers.goBuildParallelism=007 --set-string 'workers.goMaxProcs= 0010 ' \
+  > "$WORK/go-case.yaml"
+go_conc_expect "$WORK/go-case.yaml" 7 10 "leading zeros and whitespace"
+# Helm decodes typed values before the template sees them, so --set +1 arrives as the
+# number 1 and is accepted (the canonical decimal is relayed); only --set-string keeps
+# the spelling and rejects it (see the invalid loop below).
+go_conc_render --set workers.goBuildParallelism=+1 --set workers.goMaxProcs=+1 \
+  > "$WORK/go-case.yaml"
+go_conc_expect "$WORK/go-case.yaml" 1 1 "typed +1 decoded by helm"
+# Blank is unset, not an error.
+go_conc_render --set-string workers.goBuildParallelism='  ' --set-string workers.goMaxProcs= \
+  > "$WORK/go-case.yaml"
+go_conc_expect "$WORK/go-case.yaml" "" "" "blank"
+for hosting in true false; do
+  for setting in goBuildParallelism goMaxProcs; do
+    for bad in 0 -1 +1 1.5 2147483648 abc '2 -toolexec=x' 00; do
+      if go_conc_render --set "workers.enabled=$hosting" --set workers.controller.enabled=false \
+        --set-string "workers.$setting=$bad" > "$WORK/go-invalid.yaml" 2> "$WORK/err"; then
+        echo "FAIL: invalid workers.$setting=$bad accepted (hosting=$hosting)" >&2; exit 1
+      fi
+      grep -F "workers.$setting must be a positive decimal integer <= 2147483647" "$WORK/err" >/dev/null || {
+        cat "$WORK/err" >&2; exit 1;
+      }
+    done
+    # Unquoted numbers that are not positive integers fail too.
+    for bad in 0 -1 1.5 2147483648; do
+      if go_conc_render --set "workers.enabled=$hosting" --set workers.controller.enabled=false \
+        --set "workers.$setting=$bad" > "$WORK/go-invalid.yaml" 2> "$WORK/err"; then
+        echo "FAIL: invalid numeric workers.$setting=$bad accepted (hosting=$hosting)" >&2; exit 1
+      fi
+      grep -F "workers.$setting must be a positive decimal integer <= 2147483647" "$WORK/err" >/dev/null || {
+        cat "$WORK/err" >&2; exit 1;
+      }
+    done
+    printf 'workers:\n  %s: 1.5\n' "$setting" > "$WORK/go-values.yaml"
+    if go_conc_render --set "workers.enabled=$hosting" --set workers.controller.enabled=false \
+      -f "$WORK/go-values.yaml" > "$WORK/go-invalid.yaml" 2> "$WORK/err"; then
+      echo "FAIL: values-file workers.$setting=1.5 accepted (hosting=$hosting)" >&2; exit 1
+    fi
+    grep -F "workers.$setting must be a positive decimal integer <= 2147483647" "$WORK/err" >/dev/null || {
+      cat "$WORK/err" >&2; exit 1;
+    }
+  done
+done
 # --- simple postgres: TCP readiness, socket liveness ---------------------------
 # Parse the focused render and Compose source, rather than accepting tokens from
 # another object/container or from an echo command.
@@ -1175,6 +1314,15 @@ case "$YQ_VERSION_RAW" in
     exit 2
     ;;
 esac
+
+# Compose must pass exactly these two names through the agent service, empty by default.
+# After the yq guard above, so a missing yq reports BROKEN rather than FAIL.
+if [ "$(yq -r '.services.agent.environment.WORKER_GO_BUILD_PARALLELISM' "$REPO_DIR/docker-compose.yml")" != "\${WORKER_GO_BUILD_PARALLELISM:-}" ] ||
+  [ "$(yq -r '.services.agent.environment.WORKER_GO_MAXPROCS' "$REPO_DIR/docker-compose.yml")" != "\${WORKER_GO_MAXPROCS:-}" ] ||
+  [ "$(grep -cE '^[[:space:]]*WORKER_GO_[A-Z_]+:' "$REPO_DIR/docker-compose.yml")" != 2 ]; then
+  echo "FAIL: compose go concurrency env inventory" >&2; exit 1
+fi
+echo "OK: go concurrency defaults, canonical values, numeric bounds, controller-off invariants and compose inventory"
 
 PG_RENDER="$WORK/postgres-simple.yaml"
 if ! helm template uzi "$STRIPPED" --set database.mode=simple \

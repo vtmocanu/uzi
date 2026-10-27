@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { decodeCodeCoverage, type CodeCoverage } from "./code-cross-check-coverage.js";
 import { decodePublicationContext, validatePublicationContextRequest } from "./publication-context.js";
 import type { PublicationContextRequest, PublicationContextResponse } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
@@ -66,7 +67,7 @@ import {
   type OutgoingMessage,
   type RegisterRequest,
   type RegisterResponse,
-  type StateAck,
+  type StateAck as ProtocolStateAck,
   type CompletedPublicationReceipt,
   type CompletedPublicationReason,
   type PlanCrossCheckReconciliation,
@@ -161,6 +162,9 @@ export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model
   | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
   | "approved_not_stored" | "revisions_exhausted";
 import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions } from "./code-cross-check-contract.js";
+
+// Same-row classification decoded by readRunAck; status alone cannot confirm a typed park.
+type StateAck = ProtocolStateAck & { recoveryCause?: string };
 
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -444,7 +448,7 @@ function hasRevisionSourceFields(body: StateRequest): boolean {
 
 // Internal per-attempt evidence, minted only after reading the authenticated response through EOF.
 class StateDecodeRefusalError extends RequestError {}
-interface StateAttemptEvidence { ambiguous: boolean; refusals: number }
+interface StateAttemptEvidence { ambiguous: boolean; refusals: number; refusedAfterAmbiguity?: boolean }
 
 /** Match a small, complete 404 JSON object against exactly the expected keys and values. */
 export function isStrict404Body(err: unknown, expected: Readonly<Record<string, string>>): boolean {
@@ -1830,11 +1834,13 @@ export class WorkerClient {
         throw new Error("unknown dedicated claim marker");
       }
       // Dedicated requests are bounded even without a marker; unmarked ordinary
-      // claims keep their existing decoder.
+      // claims are read under CLAIM_RESPONSE_MAX_BYTES.
       const claim = (dedicated || marker === "cross_check" || res.headers.has("X-Uzi-Candidate-Identity-Version")
         ? JSON.parse(await readCrossCheckText(res, 2 * 1024 * 1024, deadline,
           dedicated || marker === "cross_check" ? "claim" : undefined))
-        : await res.json()) as ClaimResponse;
+        : JSON.parse(await readBoundedText(res, CLAIM_RESPONSE_MAX_BYTES, true, deadline))) as ClaimResponse;
+      if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_episode) ||
+          (claim.worker_recovery_episode as number) < 0)) delete claim.worker_recovery_episode;
       if (isRecord(claim) && claim.semantic_planning !== undefined) claim.semantic_planning = parseSemanticEnrollment(claim.semantic_planning);
       // PRD #1230 M4: a present-but-malformed maintainer-pending projection fails the claim closed.
       if (isRecord(claim) && isRecord(claim.config) && Object.hasOwn(claim.config, "completion_pending")) {
@@ -1924,7 +1930,9 @@ export class WorkerClient {
     const res = await this.fetchRaw("POST", path, {});
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", path, res);
-    const claim = (await res.json()) as ChatClaimResponse;
+    const claim = JSON.parse(await readBoundedText(res, CLAIM_RESPONSE_MAX_BYTES, true)) as ChatClaimResponse;
+    if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_episode) ||
+        (claim.worker_recovery_episode as number) < 0)) delete claim.worker_recovery_episode;
     validateClaimMemory(claim);
     return claim;
   }
@@ -2056,8 +2064,9 @@ export class WorkerClient {
   }
 
   async reportCodeCrossCheckVerdict(runId: string, generation: number,
-    result: { outcome: "completed" | "failed"; reason_class?: string; findings: CodeFinding[] }, signal?: AbortSignal): Promise<void> {
+    result: { outcome: "completed" | "failed"; reason_class?: string; findings: CodeFinding[]; coverage?: CodeCoverage }, signal?: AbortSignal): Promise<void> {
     decodeCodeFindings(result.findings);
+    if (result.coverage !== undefined) decodeCodeCoverage(result.coverage);
     await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-check-verdict`,
       { claim_generation: generation, ...result }, this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
   }
@@ -2229,6 +2238,20 @@ export class WorkerClient {
         if (!evidence.ambiguous && evidence.refusals > 0 && err instanceof StateDecodeRefusalError)
           throw new StateReportUnappliedError(runId, err);
         throw err;
+      }
+    }
+    if (body.recovery_cause === "retained_recovery_exhausted") {
+      if (!this.hasFeature("recovery_cause_retained_recovery_exhausted") ||
+          body.status !== "recovery_wait" || !Number.isSafeInteger(body.claim_generation) ||
+          (body.claim_generation ?? 0) < 1) throw new Error("retained recovery park requires support and a positive generation");
+      // This contract cannot degrade to an unfenced or untyped recovery park on rollback.
+      const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+      try {
+        return await this.reportStateOnce(runId, path, Object.freeze({ ...body }), signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
+      } catch (error) {
+        // A later validation refusal says nothing about an earlier possibly applied send.
+        if (evidence.refusedAfterAmbiguity) throw new Error("retained recovery park outcome uncertain", { cause: error });
+        throw error;
       }
     }
     if (body.recovery_cause === "worker_memory_pressure") {
@@ -2447,6 +2470,7 @@ export class WorkerClient {
           const ack: StateAck = {
             applied: res.status === 200,
             status: fields.status,
+            ...(fields.recoveryCause !== undefined ? { recoveryCause: fields.recoveryCause } : {}),
           };
           // parkWorkerMemoryPressure returns 409 only for exact replay when these DTO fields
           // match and no decline/switch disposition is present. Generation/nonce stay in the
@@ -2581,6 +2605,8 @@ export class WorkerClient {
       } catch (err) {
         MaintenanceBudget.current()?.check();
         if (evidence) {
+          if (evidence.ambiguous && err instanceof RequestError && err.status === 400)
+            evidence.refusedAfterAmbiguity = true;
           if (err instanceof StateDecodeRefusalError) evidence.refusals++;
           else evidence.ambiguous = true;
         }
@@ -3630,7 +3656,7 @@ export class WorkerClient {
     }
     const res = await fetch(this.baseUrl + path, init);
     if (res.status !== 200 && res.status !== 201) throw await this.toError("POST", path, res);
-    const text = await res.text();
+    const text = await readBoundedText(res, JOB_FILE_UPLOAD_RESPONSE_MAX_BYTES, true, signal);
     return { status: res.status, file: JSON.parse(text) as JobFileUploadResponse };
   }
 
@@ -3905,6 +3931,7 @@ export class WorkerClient {
   async reportWallPark(
     runId: string,
     args: { head: string; published: boolean; claimGeneration?: number; checkpointContainsLatest?: boolean },
+    signal?: AbortSignal,
   ): Promise<{ applied: boolean; status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number; completionAttempts?: number }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/wall-park`;
     // Stamp the claim-lane generation through the shared send-gate + skew-safe fallback, exactly as
@@ -3917,7 +3944,7 @@ export class WorkerClient {
       if (includeField) body.claim_generation = args.claimGeneration;
       // PRD #1809 D8: the caller passes it only when the api advertised run_checkpoint_durability.
       if (args.checkpointContainsLatest !== undefined) body.checkpoint_contains_latest = args.checkpointContainsLatest;
-      const res = await this.fetchRaw("POST", path, body);
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
       if (res.status === 200 || res.status === 409) {
         const fields = await readRunAck(res);
         // Issue #1600: a refused park's 409 carries the run's fresh budget; pass it through so the
@@ -4760,6 +4787,15 @@ function retryAfterMsOf(h: string | null): number | undefined {
  * reserving another 64 KiB for keys/metadata stays below 6 MiB. Count actual streamed bytes,
  * never Content-Length; cross-check methods, strict gate and terminal RunDTO ACKs opt in. */
 const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
+/** Run and chat claim response cap. One figure shared with the api: fixtures/claims/claim-response-limit.json
+ * pins it from both sides, and the api's workersvc claimResponseMaxBytes carries the budget derivation
+ * (ADR-3396). The api refuses an over-limit run-lane claim before delivery and fails the run with
+ * `claim too large` (provisioning_failed); chat claims carry no templates, skills or issue content and
+ * are bounded by construction. A claim past the cap from an older api is still refused here, never
+ * truncated. Count actual streamed bytes, never Content-Length. */
+export const CLAIM_RESPONSE_MAX_BYTES = 168 * 1024 * 1024;
+/** Operational cap on the job-file upload acknowledgment; counts streamed bytes, not Content-Length. */
+const JOB_FILE_UPLOAD_RESPONSE_MAX_BYTES = 64 * 1024;
 /** PRD #1230 M4: a maximally escaped completion_pending projection stays below 20 MiB
  * (api TestSemanticCompletionPendingWireBound). The server's header grants that bounded
  * allowance on top of a state ACK's own cap; the projection must still decode strictly,

@@ -263,6 +263,8 @@ type CodexRefreshIntent struct {
 	State             string             `json:"state"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	ProviderErrorAt   pgtype.Timestamptz `json:"provider_error_at"`
+	ReuseAttemptedAt  pgtype.Timestamptz `json:"reuse_attempted_at"`
 }
 
 type ControllerReportStatus struct {
@@ -315,6 +317,7 @@ type CrossCheck struct {
 	RevisionDisposition             pgtype.Text        `json:"revision_disposition"`
 	RevisionSettledAt               pgtype.Timestamptz `json:"revision_settled_at"`
 	RevisionSupersededByStopInputID pgtype.Int8        `json:"revision_superseded_by_stop_input_id"`
+	Coverage                        []byte             `json:"coverage"`
 }
 
 type CustodyEpisodeNotice struct {
@@ -460,6 +463,24 @@ type IncidentalFinding struct {
 	Labels        []byte             `json:"labels"`
 	Confidence    string             `json:"confidence"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+type InstanceIntakePause struct {
+	ID       bool               `json:"id"`
+	Active   bool               `json:"active"`
+	Since    pgtype.Timestamptz `json:"since"`
+	ByUserID pgtype.UUID        `json:"by_user_id"`
+	ByLabel  pgtype.Text        `json:"by_label"`
+	Reason   pgtype.Text        `json:"reason"`
+}
+
+type InstanceIntakePauseEvent struct {
+	ID       uuid.UUID          `json:"id"`
+	At       pgtype.Timestamptz `json:"at"`
+	ByUserID pgtype.UUID        `json:"by_user_id"`
+	ByLabel  pgtype.Text        `json:"by_label"`
+	Action   string             `json:"action"`
+	Reason   pgtype.Text        `json:"reason"`
 }
 
 type Issue struct {
@@ -1100,9 +1121,11 @@ type Run struct {
 	PolicyLastOutcomeID         pgtype.UUID        `json:"policy_last_outcome_id"`
 	PolicyLastSourceGeneration  pgtype.Int8        `json:"policy_last_source_generation"`
 	PolicyFreshClaimGeneration  pgtype.Int8        `json:"policy_fresh_claim_generation"`
+	CheckpointCoordinates       []byte             `json:"checkpoint_coordinates"`
 	PolicyStopResolution        []byte             `json:"policy_stop_resolution"`
 	PolicyRevisionSource        []byte             `json:"policy_revision_source"`
 	PolicyCandidateCrossCheckID pgtype.UUID        `json:"policy_candidate_cross_check_id"`
+	RetainedParkCount           int32              `json:"retained_park_count"`
 }
 
 type RunCompletionAttempt struct {
@@ -1667,6 +1690,10 @@ type Worker struct {
 	RegisteredPodUid         pgtype.UUID        `json:"registered_pod_uid"`
 	RollHeartbeatAt          pgtype.Timestamptz `json:"roll_heartbeat_at"`
 	DrainingReason           pgtype.Text        `json:"draining_reason"`
+	ManualCordonedAt         pgtype.Timestamptz `json:"manual_cordoned_at"`
+	ManualCordonedBy         pgtype.UUID        `json:"manual_cordoned_by"`
+	ManualCordonedByLabel    pgtype.Text        `json:"manual_cordoned_by_label"`
+	ManualCordonReason       pgtype.Text        `json:"manual_cordon_reason"`
 }
 
 type WorkerActiveRun struct {
@@ -1679,6 +1706,17 @@ type WorkerActiveRun struct {
 	SnapshotEpoch        int64              `json:"snapshot_epoch"`
 	ReportedAt           pgtype.Timestamptz `json:"reported_at"`
 	TerminalPendingSince pgtype.Timestamptz `json:"terminal_pending_since"`
+}
+
+type WorkerCordonEvent struct {
+	ID         uuid.UUID          `json:"id"`
+	OwnerID    uuid.UUID          `json:"owner_id"`
+	WorkerID   uuid.UUID          `json:"worker_id"`
+	ActorID    uuid.UUID          `json:"actor_id"`
+	ActorLabel string             `json:"actor_label"`
+	Action     string             `json:"action"`
+	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
+	Reason     pgtype.Text        `json:"reason"`
 }
 
 type WorkerPendingOutcomeIdentity struct {

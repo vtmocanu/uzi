@@ -24,10 +24,6 @@
 #   - A non-merge commit on the branch carries `Changelog: none` (the oracle's regex). The
 #     repo squashes with COMMIT_MESSAGES, so the line reaches the squash body and exempts
 #     the merge at release time too; it is therefore PR-wide by design. Add a reason.
-#   - Every non-merge commit touching a shipping path has a `docs(...)`/`docs:` subject and
-#     no shipping change is uncommitted. The oracle reads the SQUASH subject, so a docs-only
-#     branch squashed under a non-docs PR title still fails there: a stricter later check,
-#     never a bypass.
 #   - Every shipping path is a dependency manifest (basename go.mod, go.sum, Dockerfile,
 #     devbox.lock, package.json or package-lock.json; not the Codex runtime lock) AND every
 #     shipping commit is `chore(deps):`/`fix(deps):`/`build(deps):`
@@ -37,6 +33,9 @@
 #     time; this only spares the bot branch a per-PR commit.
 # Merge commits (a pull_request checkout's synthetic merge, a merged-in main) are skipped
 # for messages, so their "Merge ..." subject neither breaks nor satisfies a rule.
+# Docs-typed subjects alone supply no PR-time exemption: a non-docs squash title loses
+# that implicit declaration. Docs-only shipping branches use an entry or the explicit
+# `Changelog: none` declaration above, which survives in the squash body.
 #
 # BASE AND FAILING CLOSED. When refs/remotes/origin/main does not resolve it is fetched
 # (CI's lint-repo job checks out with fetch-depth 0, so this is the offline-laptop path). No
@@ -159,8 +158,6 @@ all_shipping_commits() {
   return 0
 }
 
-all_shipping_commits '^docs(\([^)]*\))?:' && pass "every shipping commit is docs-typed"
-
 # Dependency exemption: manifest paths only AND every shipping commit dependency-typed
 # (Renovate's `chore(deps):` / `fix(deps):`), so a behavior edit to a Dockerfile under a
 # fix title is not spared.
@@ -175,8 +172,8 @@ Add a new UUID-v4 fragment under changelog.d/ (see changelog.d/README.md), or a
 legacy line under `## [Unreleased]` in CHANGELOG.md. When there is genuinely
 nothing to announce, put
 
-    Changelog: none    # and why
+    Changelog: none (reason for no announcement)
 
-in a commit message on this branch.
+in a non-merge branch commit. Retain that declaration in the squash commit body.
 MSG
 exit 1

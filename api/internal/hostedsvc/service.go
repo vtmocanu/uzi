@@ -276,6 +276,11 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			v := row.DrainingReason.String
 			dw.DrainingReason = &v
 		}
+		dw.EffectiveCordoned = row.EffectiveCordoned
+		if row.ManualCordonedAt.Valid {
+			t := row.ManualCordonedAt.Time
+			dw.ManualCordonedAt = &t
+		}
 		if row.DrainingSince.Valid {
 			t := row.DrainingSince.Time
 			dw.DrainingSince = &t

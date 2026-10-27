@@ -454,6 +454,7 @@ These are bounded observations, not a globally ordered snapshot:
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
 | `schedules.paused` | A user with a [pause-all](scheduling.md#pausing-everything-at-once) in force while still owning enabled schedules — their labelled issues look queued but will not fire | any such user | — | — |
+| `maintenance.active` | [Instance maintenance mode](instance-maintenance.md) is on: new runs wait in the queue. Carries the start time, reason and readout counts (active, held, custody). Liveness and readiness are unaffected | while on | — | `unknown` when the state cannot be read. A missing state row reads as paused, so the check warns |
 | `board.drift` | A board column move given up (stuck pending past the give-up boundary) on a run that has an issue, in the last 24 hours | any given-up move | — | — |
 | `custody.holds` | An owner at the [recovery custody admission limit](run-recovery.md) | any owner at the limit | — | `unknown` when the `custody_hold_limit` setting cannot be read; `na` only when the health service has no settings wired |
 | `recovery.storage` | Current persisted quota-refused recovery captures; [diagnosis](./recovery-storage-diagnosis.md) | any matching capture | — | `unknown` when the read fails or exceeds four seconds |

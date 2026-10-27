@@ -70,7 +70,9 @@ metadata:
   daemon's image/build cache, which since issue #224 M-a is a THIRD PVC per worker
   rather than an emptyDir — so this tier is budgeted separately from the restricted
   default's. Sized for the 10 workers `count/deployments.apps` advertises:
-  10 x (50Gi data + 20Gi nix + 20Gi dind) = 900Gi across 30 claims.
+  10 x (50Gi data + 20Gi nix + 20Gi dind) = 900Gi across 30 claims. CPU and memory
+  are budgeted on `l`; `l-highmem` is not fleet-budgeted and consumes more of the
+  shared budget.
 
   Same load-bearing side effect: a quota on requests.CPU or requests.MEMORY makes
   admission REJECT any pod with a container declaring no requests — initContainers
@@ -112,7 +114,7 @@ spec:
 {{- /*
   The backstop, never the source: every docker worker pod arrives from the controller
   with explicit requests + limits on every container. `max` must stay >= the largest
-  worker preset's limits (l = 4 CPU / 20Gi) or that preset stops being admissible here.
+  worker preset's limits (l-highmem = 4 CPU / 32Gi) or that preset stops being admissible here.
 */}}
 ---
 apiVersion: v1

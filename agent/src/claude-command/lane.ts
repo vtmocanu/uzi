@@ -88,7 +88,6 @@ export function worstCaseAbortJoinMs(cleanupMs = DEFAULT_CLEANUP_MS): number {
  */
 export const GUARDED_LANE_JOIN_MS = 60_000;
 const MAX_ATTRIBUTION_RECORDS = 4096;
-const MEMORY_MESSAGE = "Shell admission is held or its captured flight has retired.";
 
 /** A guarded command's whole-tree disposal could not be confirmed. The lane is poisoned. */
 export class GuardedCommandUnconfirmedError extends Error {
@@ -112,7 +111,7 @@ export interface ClaudeCommandLaneOptions {
   readonly capturedMemory: () => CapturedMemoryContext;
   /** Abort the current turn with this exact error (the executor's typed carrier; M3 wires it). */
   readonly tripTurn: (error: Error) => void;
-  readonly launch?: (spec: RunnerCommandLaunchSpec) => Promise<RunnerCommandRoot>;
+  readonly launch?: (spec: RunnerCommandLaunchSpec, startedDeadlineMs?: number) => Promise<RunnerCommandRoot>;
   readonly kill?: (child: RunnerCommandChild) => boolean;
   readonly now?: () => number;
   /** Bounded wait for transport EOF after the wrapper exits (default 5000). */
@@ -183,7 +182,7 @@ function sizeLabel(bytes: number): string {
 
 export class ClaudeCommandLane {
   private readonly opts: ClaudeCommandLaneOptions;
-  private readonly launch: (spec: RunnerCommandLaunchSpec) => Promise<RunnerCommandRoot>;
+  private readonly launch: NonNullable<ClaudeCommandLaneOptions["launch"]>;
   private readonly kill: (child: RunnerCommandChild) => boolean;
   private readonly now: () => number;
   private readonly graceMs: number;
@@ -207,7 +206,8 @@ export class ClaudeCommandLane {
 
   constructor(opts: ClaudeCommandLaneOptions) {
     this.opts = opts;
-    this.launch = opts.launch ?? ((spec) => launchRunnerCommandRoot(spec, { deadlines: { started: LAUNCH_STARTED_MS } }));
+    this.launch = opts.launch ?? ((spec, startedDeadlineMs) => launchRunnerCommandRoot(spec,
+      { deadlines: { started: startedDeadlineMs ?? LAUNCH_STARTED_MS } }));
     this.kill = opts.kill ?? ((child) => killUnreapedSupervisor(child));
     this.now = opts.now ?? (() => Date.now());
     this.graceMs = opts.graceMs ?? DEFAULT_GRACE_MS;
@@ -361,10 +361,12 @@ export class ClaudeCommandLane {
     // (4) Admission on the turn's captured context.
     const captured = this.captured;
     if (!this.turnOpen || captured === undefined) return this.refuse("Command refused: no active memory context for this turn.");
-    if (this.authorityLost || !captured.commands.isCurrent(captured.context, captured.flight, captured.lifecycleRevision)
-      || !captured.commands.admitsCommands(captured.context)) {
-      return this.refuse(`Command refused (worker_memory_pressure): ${MEMORY_MESSAGE}`);
+    if (this.authorityLost || !captured.commands.isCurrent(captured.context, captured.flight, captured.lifecycleRevision)) {
+      return this.refuse(`Command refused (worker_memory_pressure): ${captured.commands.admissionMessage(captured.context, "retired")}`);
     }
+    const admission = captured.commands.admissionReason(captured.context);
+    if (admission !== undefined && admission !== "pressure-held")
+      return this.refuse(`Command refused (worker_memory_pressure): ${captured.commands.admissionMessage(captured.context, admission)}`);
     // A turn that is already aborted launches nothing.
     const callSignal = ex.signal instanceof AbortSignal ? ex.signal : undefined;
     if (callSignal?.aborted || this.turnSignal?.aborted) {
@@ -393,6 +395,26 @@ export class ClaudeCommandLane {
     const spillRel = `.uzi/scratch/uzi-cmd/${commandId}.log`;
     const timeoutMs = args.timeout ?? this.defaultTimeoutMs;
     const startedAt = this.now();
+    let deadlineAt: number | undefined;
+    const { commands, context } = captured;
+    const phaseRevision = commands.phaseRevision(context);
+    if (commands.admissionReason(context, phaseRevision) === "pressure-held") {
+      deadlineAt = startedAt + timeoutMs;
+      const signal = AbortSignal.any([live.ac.signal, callSignal, this.turnSignal].filter((s): s is AbortSignal => s !== undefined));
+      const outcome = await commands.waitForPressure(context, { deadlineAt, phaseRevision, signal, now: this.now });
+      if (outcome === "cancelled" || signal.aborted) return this.refuse("Command cancelled while waiting for memory recovery; nothing was launched.");
+      if (outcome === "deadline" || this.now() >= deadlineAt) return this.refuse(
+        `Command deadline expired before launch (worker_memory_pressure): ${commands.admissionMessage(context, "pressure-held")} Nothing was launched.`);
+      if (outcome !== "admitted") return this.refuse(`Command refused (worker_memory_pressure): ${commands.admissionMessage(context, outcome)}`);
+      if (this.poisonError || !this.turnOpen || this.captured !== captured || this.authorityLost ||
+          !commands.isCurrent(context, captured.flight, captured.lifecycleRevision)) {
+        return this.refuse(`Command refused (worker_memory_pressure): ${commands.admissionMessage(context, "retired")}`);
+      }
+      const afterWait = commands.admissionReason(context, phaseRevision);
+      if (afterWait !== undefined) return this.refuse(`Command refused (worker_memory_pressure): ${commands.admissionMessage(context, afterWait)}`);
+      const screened = screenBashCommand(args.command, this.opts.secretPaths, this.opts.dockerWired);
+      if (screened.denied) return this.refuse(screened.reason ?? "denied by guardrail");
+    }
     // (6) Mint the enrollment metadata for this call.
     const metadata = mintClaudeCommandMetadata(captured, {
       toolId: toolUseId, attemptId: randomUUID(), commandId, command: args.command,
@@ -414,7 +436,7 @@ export class ClaudeCommandLane {
           live.child = child;
           if (root.startTime !== undefined) this.roots.set(live.id, { pid: root.pid, startTime: root.startTime });
         },
-      });
+      }, deadlineAt === undefined ? undefined : Math.max(1, Math.min(LAUNCH_STARTED_MS, deadlineAt - this.now())));
     } catch (error) {
       if (error instanceof RunnerCommandNotStartedError || live.child === undefined) {
         return this.refuse(`Command could not be started: ${sanitizeForLog(this.redact(errMessage(error)), 300)}`);
@@ -427,7 +449,7 @@ export class ClaudeCommandLane {
     }
     live.child = launched.child;
     try {
-      return await this.supervise(live, captured, metadata, launched, timeoutMs, spillRel, callSignal, startedAt);
+      return await this.supervise(live, captured, metadata, launched, timeoutMs, spillRel, callSignal, startedAt, deadlineAt);
     } catch (error) {
       // Unexpected: the root may still be alive. Fail closed.
       this.opts.log.warn("guarded command lane error", { error: sanitizeForLog(this.redact(errMessage(error)), 300) });
@@ -444,6 +466,7 @@ export class ClaudeCommandLane {
     spillRel: string,
     callSignal: AbortSignal | undefined,
     startedAt: number,
+    deadlineAt?: number,
   ): Promise<ToolTextResult> {
     const { handle } = launched;
     // (9) Drain the transport from the moment it exists, so the command never blocks on it.
@@ -467,7 +490,8 @@ export class ClaudeCommandLane {
     // instead of letting the command run on for the rest of the observe budget.
     const deadlineAc = new AbortController();
     const deadline = new Promise<FirstEvent>((resolve) => {
-      timer = setTimeout(() => { deadlineAc.abort(); resolve({ kind: "deadline" }); }, timeoutMs);
+      timer = setTimeout(() => { deadlineAc.abort(); resolve({ kind: "deadline" }); },
+        deadlineAt === undefined ? timeoutMs : Math.max(0, deadlineAt - this.now()));
     });
     const sources = [live.ac.signal, callSignal, this.turnSignal].filter((s): s is AbortSignal => s !== undefined);
     const removers: Array<() => void> = [];
@@ -479,7 +503,8 @@ export class ClaudeCommandLane {
         removers.push(() => signal.removeEventListener("abort", onAbort));
       }
     });
-    const exit = handle.waitChild(timeoutMs + this.cleanupMs + this.graceMs).then(
+    const remainingMs = deadlineAt === undefined ? timeoutMs : Math.max(0, deadlineAt - this.now());
+    const exit = handle.waitChild(remainingMs + this.cleanupMs + this.graceMs).then(
       (result): FirstEvent => ({ kind: "exit", code: result.code }),
       (error: unknown): FirstEvent => (error instanceof SupervisedChildExitTimeoutError ? { kind: "deadline" } : { kind: "failed", error }),
     );
@@ -626,7 +651,7 @@ export class ClaudeCommandLane {
       case "aborted":
         return err("Command was cancelled; it and all its descendants were stopped.");
       case "admission_closed":
-        return err(`Command was started, then stopped because memory-guard admission closed (worker_memory_pressure): ${MEMORY_MESSAGE} It and all its descendants were stopped.`);
+        return err("Command was started, then stopped because memory-guard admission closed (worker_memory_pressure). It and all its descendants were stopped.");
       case "enroll_failed":
         return err(`Command was started, then stopped because it could not be placed under memory supervision (${sanitizeForLog(this.redact(errMessage(first.error)), 200)}); it and all its descendants were stopped.`);
       case "guard_unread":

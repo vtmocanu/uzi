@@ -69,7 +69,7 @@ WHERE id = $1 RETURNING plan_cross_check_enabled, code_cross_check_enabled`, use
 COALESCE(bool_or('codex_harness_v1' = ANY(protocol_capabilities)), false),
 COALESCE(bool_or('cross_check_codex_lead_v1' = ANY(protocol_capabilities)), false)
 FROM workers WHERE user_id = $1 AND status = 'online'
-AND draining_since IS NULL AND NOT ephemeral AND NOT isolated_lane
+AND fn_worker_accepts_new_intake(workers) AND NOT ephemeral AND NOT isolated_lane
 AND 'cross_check_v1' = ANY(protocol_capabilities)`, user.ID).Scan(&codexCheckerAvailable, &claudeCheckerAvailable)
 		if err != nil {
 			slog.Error("check cross-check workers", "error", err)
@@ -87,7 +87,7 @@ AND 'cross_check_v1' = ANY(protocol_capabilities)`, user.ID).Scan(&codexCheckerA
 		var available bool
 		err = h.pool.QueryRow(r.Context(), `SELECT EXISTS (
 SELECT 1 FROM workers WHERE user_id=$1 AND status='online'
-AND draining_since IS NULL AND NOT isolated_lane AND NOT maintenance_fenced
+AND fn_worker_accepts_new_intake(workers) AND NOT isolated_lane
 AND max_cross_check_slots > 0
 AND 'cross_check_code_v1'=ANY(protocol_capabilities)
 AND 'cross_check_lane_v1'=ANY(protocol_capabilities)

@@ -1,4 +1,9 @@
 {
+  "manual_cordoned_at": "2020-01-02T03:04:05Z",
+  "manual_cordoned_by": "x",
+  "manual_cordoned_by_label": "x",
+  "manual_cordon_reason": "x",
+  "effective_cordoned": true,
   "roll_pacing": {},
   "id": "x",
   "name": "x",

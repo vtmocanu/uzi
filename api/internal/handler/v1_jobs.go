@@ -153,6 +153,7 @@ func v1JobDTO(v workersvc.JobView) apitypes.V1JobDTO {
 		CreatedAt:        v.CreatedAt,
 		StartedAt:        v.StartedAt,
 		FinishedAt:       v.FinishedAt,
+		QueueReason:      v.QueueReason,
 	}
 }
 
@@ -288,7 +289,11 @@ func (h *Handler) V1JobCreate(w http.ResponseWriter, r *http.Request) {
 		writeV1JobError(w, "create", err)
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, v1JobDTO(view))
+	dto := v1JobDTO(view)
+	if n := h.maintenanceNotice(r.Context()); n != "" {
+		dto.Notice = &n
+	}
+	httpx.JSON(w, http.StatusCreated, dto)
 }
 
 // V1JobGet serves GET /api/v1/jobs/{id}.

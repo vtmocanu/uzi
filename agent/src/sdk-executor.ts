@@ -221,8 +221,9 @@ const PROGRESS_MISS_LIMIT = 2;
 const REASON_NO_PROGRESS =
   "the lead declined the task and made no progress: it repeated the same response with no new commits, no working-tree changes, and no subagent activity across consecutive iterations. Stopped early rather than exhausting the iteration budget; see the lead's response on the run feed.";
 // issue #1197 (D-RC2b): bounded, budget-safe in-process retries on a POSITIVELY-EMPTY
-// SDK turn (0 turns, no model activity, no plan/questions/done). ONLY a positively-empty
-// RETURN is retried — a genuine wall/idle/cancel trip (state.tripReason) wins first, and
+// SDK turn (0 turns, no model activity, no plan/questions/done); issue #3179 adds the
+// event-free stream (no events, no terminal) to the same bound. Apart from that, ONLY a
+// positively-empty RETURN is retried — a genuine wall/idle/cancel trip (state.tripReason) wins first, and
 // a turn with MISSING metrics (numTurns undefined) is never treated as empty.
 const EMPTY_TURN_MAX_RETRIES = 2;
 // Base in-process backoff between empty-turn retries, MULTIPLIED by the attempt number
@@ -241,13 +242,16 @@ const EMPTY_TURN_BACKOFF_SLICE_MS = 250;
  * local restore point BEFORE reporting a promotable, resumable park, never a work-destroying
  * terminal `failed`. Two producers:
  *  - the Claude lane, {@link SdkExecutor.driveTurnWithEmptyRecovery} (issue #1197 D-RC2b): a
- *    POSITIVELY-EMPTY SDK turn (0 turns, no model activity, no plan/questions/done) or a
- *    transient provider error that persisted;
+ *    POSITIVELY-EMPTY SDK turn (0 turns, no model activity, no plan/questions/done), a
+ *    transient provider error that persisted, or (issue #3179) a stream that ended with no
+ *    events and no terminal at all;
  *  - the Codex lane, `CodexExecutor.driveTurnWithWallPark` (issue #2099): a turn that kept
- *    failing with a transient provider classification after its bounded same-thread retries.
+ *    failing with a transient provider classification after its bounded same-thread retries,
+ *    or an eligible turn that idled with zero model-processing evidence (#3462, #3466).
+ *    Human revision silence is consumed by its in-flight driver, never the ordinary recovery park.
  *
- * This is NEVER thrown for a genuine wall/idle/cancel/pause interruption (those keep their
- * existing terminal/cancelled/paused outcome) nor, on the Claude lane, for a turn that RAN but
+ * Except for that Codex zero-evidence idle, wall/idle/cancel/pause interruptions keep their
+ * existing terminal/cancelled/paused outcome. It is never thrown on the Claude lane for a turn that RAN but
  * did not submit a plan (that stays REASON_NO_PLAN). A distinct typed error is what lets the
  * runner catch route it to the non-terminal park instead of the generic failure path.
  */
@@ -256,15 +260,21 @@ export class TransientRecoveryError extends Error {
    *  error. The runner types the recovery_wait park `provider_outage` from this alone; the
    *  empty-turn and gate-recovery throws stay unmarked. */
   public readonly providerOrigin: boolean;
+  /** Measured Codex human-revision silence, never provider-outage evidence. */
+  public readonly zeroEvidenceIdle: boolean;
+  /** Original idle trip retained by identity for unsupported revision recovery. */
+  public readonly originalIdle?: Error;
   /** Session resolved by the final failed attempt; undefined means resume no session. */
   public readonly sessionId?: string;
   constructor(
     message = "the model returned a positively-empty result (0 turns, no activity) after bounded in-process retries",
-    opts: { providerOrigin?: boolean; sessionId?: string } = {},
+    opts: { providerOrigin?: boolean; sessionId?: string; zeroEvidenceIdle?: boolean; originalIdle?: Error } = {},
   ) {
     super(message);
     this.name = "TransientRecoveryError";
     this.providerOrigin = opts.providerOrigin === true;
+    this.zeroEvidenceIdle = opts.zeroEvidenceIdle === true;
+    this.originalIdle = opts.originalIdle;
     this.sessionId = opts.sessionId;
   }
 }
@@ -330,6 +340,23 @@ class CliSignalDeathError extends Error {
     this.death = death;
     this.sessionId = sessionId;
     this.pid = pid;
+  }
+}
+
+/**
+ * issue #3179: a Claude turn whose harness stream ended cleanly with NO events at all and no
+ * terminal (an empty iterator, e.g. the CLI exiting before emitting anything). Thrown from
+ * driveTurn after its trip checks so the turn is never mistaken for a finished iteration, and
+ * caught by {@link SdkExecutor.driveTurnWithEmptyRecovery}, which re-drives the same prompt
+ * through its bounded retry. `sessionId` is the session to resume (what resumableSessionId()
+ * resolved: with no events seen, the requested one); undefined starts fresh.
+ */
+class EventFreeStreamError extends Error {
+  public readonly sessionId?: string;
+  constructor(sessionId?: string) {
+    super("the model stream ended without any events");
+    this.name = "EventFreeStreamError";
+    this.sessionId = sessionId;
   }
 }
 
@@ -553,6 +580,9 @@ export interface SdkExecutorOptions {
    *  {@link EMPTY_TURN_MAX_RETRIES}; finite nonnegative overrides are floored,
    *  with zero disabling in-process retries. Invalid values use the default. */
   emptyTurnMaxRetries?: number;
+  /** issue #3179: the sleep each between-retry backoff slice awaits (default `sleep`). Tests
+   *  inject one to observe entry into the backoff and control time without real waits. */
+  emptyTurnSleep?: (ms: number) => Promise<void>;
   /** PRD #1809 D4: how long the quiet-point probe waits for the previous turn's processes to
    *  exit before it calls the run busy (default {@link QUIET_SETTLE_MS}). Injected in tests. */
   quietSettleMs?: number;
@@ -939,6 +969,7 @@ export class SdkExecutor implements Executor {
   /** issue #1197 (D-RC2b): base in-process backoff between positively-empty turn
    *  retries (× the attempt number). Injectable so tests run the retry paths fast. */
   private readonly emptyTurnBackoffBaseMs: number;
+  private readonly emptyTurnSleep: (ms: number) => Promise<void>;
   /** issue #1197 (D-RC2b): bounded in-process re-drive count for a positively-empty
    *  turn before escalating to {@link TransientRecoveryError}. Injectable for tests. */
   private readonly emptyTurnMaxRetries: number;
@@ -1034,6 +1065,7 @@ export class SdkExecutor implements Executor {
     // #1197: accept finite nonnegative overrides. Zero deliberately disables the
     // delay/retries; invalid values fall back. The test backoff knob can lower
     // the production delay, never extend it into an effectively unbounded wait.
+    this.emptyTurnSleep = opts.emptyTurnSleep ?? sleep;
     this.emptyTurnBackoffBaseMs =
       typeof opts.emptyTurnBackoffBaseMs === "number"
         && Number.isFinite(opts.emptyTurnBackoffBaseMs)
@@ -4844,6 +4876,8 @@ export class SdkExecutor implements Executor {
     let sawTerminal = false;
     let terminal: HarnessTerminal | undefined;
     let processedEvents = 0;
+    // Issue #3179: every event the stream yielded; zero with no terminal is an event-free stream.
+    let eventsSeen = 0;
     // Issue #3174: hoisted so the finally can record per-session model evidence.
     let sawModelEvidence = false;
     let result: TurnResult;
@@ -4914,6 +4948,7 @@ export class SdkExecutor implements Executor {
       };
       const turn = this.harness.startTurn(request);
       for await (const event of turn.events) {
+        eventsSeen++;
         if (evidencesModelProcessing(event)) processedEvents++;
         if (!sawModelEvidence && evidencesModelProcessing(event)) {
           sawModelEvidence = true;
@@ -5061,6 +5096,9 @@ export class SdkExecutor implements Executor {
     // has debited the wall and cleared the turn's watchdog/abort state. The run's trip
     // owns interruption precedence; ctx.signal may still carry a handled PauseNowSignal.
     if (state.tripReason) throw this.tripError(state);
+    // Issue #3179: a stream that ended with no events and no terminal is not a completed turn.
+    // With no events seen, resumableSessionId() is the requested resume id.
+    if (!sawTerminal && eventsSeen === 0) throw new EventFreeStreamError(resumableSessionId());
     if (sawTerminal && terminal?.outcome === "success" && processedEvents > 0 &&
         !ctx.cancelRequested?.() && !ctx.terminalLifecycleSignal?.aborted && state.wallRemainingMs > 0) {
       await ctx.onModelTurnSettled?.(processedEvents);
@@ -5071,8 +5109,11 @@ export class SdkExecutor implements Executor {
   /**
    * issue #1197 (D-RC2b) + issue #1088: drive one turn, then bounded/budget-safe/
    * cancel-safe in-process retries when — and ONLY when — that turn either returned
-   * POSITIVELY empty (0 turns, no model activity, no plan/questions/done) OR threw a
-   * {@link ProviderTransientError} (a 429/5xx/529 or status-less transport api error).
+   * POSITIVELY empty (0 turns, no model activity, no plan/questions/done), threw a
+   * {@link ProviderTransientError} (a 429/5xx/529 or status-less transport api error), OR
+   * threw an {@link EventFreeStreamError} (issue #3179: the stream ended with no events and
+   * no terminal; the same prompt is re-driven, and the interrupted-calls note the preceding
+   * dispatch appended, if any, is re-sent only after such an attempt).
    * Every OTHER return or throw is unchanged: a turn that ran but did not submit a plan
    * stays REASON_NO_PLAN in the caller, a turn with MISSING metrics returns unchanged,
    * and a genuine (non-transient) failure re-throws to fail the run.
@@ -5126,6 +5167,23 @@ export class SdkExecutor implements Executor {
     // issue #1656: resumes spent on foreign CLI signal deaths in THIS turn. Declared outside
     // runOnce so the provider/empty-turn retries below can neither reset nor extend it.
     let signalDeathRetries = 0;
+    // issue #3179: the latest attempt ended with an event-free stream (cleared by every other
+    // outcome), so the exhaustion throw and the retry notice describe the FINAL attempt.
+    let lastEventFree: EventFreeStreamError | undefined;
+    // issue #3179: the interrupted-calls note must reach the model once, but an event-free attempt
+    // never processed its prompt. `lastSuffix` is what the immediately preceding dispatch appended;
+    // `replayAfterEventFree` makes the next dispatch re-send exactly that, without consulting the
+    // original hook (whose once-only latch already fired).
+    let lastSuffix = "";
+    let replayAfterEventFree = false;
+    const dispatchHook = beforeDispatch
+      ? (input: string): string => {
+          if (replayAfterEventFree) return input + lastSuffix;
+          const out = beforeDispatch(input);
+          lastSuffix = out.startsWith(input) ? out.slice(input.length) : "";
+          return out;
+        }
+      : undefined;
     const runOnce = async (): Promise<void> => {
       for (;;) {
         try {
@@ -5139,15 +5197,27 @@ export class SdkExecutor implements Executor {
             idleMs,
             onProgress,
             onFirstEvent,
-            beforeDispatch,
+            dispatchHook,
           );
           lastProviderErr = undefined;
+          lastEventFree = undefined;
+          replayAfterEventFree = false;
           return;
         } catch (err) {
           // A real cancel/idle/wall trip WINS and keeps its existing outcome.
           if (state.tripReason) throw this.tripError(state);
           // A usage-limit death routes to the usage-limit wait path, unchanged.
           if (err instanceof LimitReachedError) throw err;
+          if (err instanceof EventFreeStreamError) {
+            // issue #3179: retry like an empty turn, resuming the session driveTurn resolved.
+            lastEventFree = err;
+            lastProviderErr = undefined;
+            turn = undefined;
+            resumeId = err.sessionId;
+            replayAfterEventFree = true;
+            return;
+          }
+          replayAfterEventFree = false;
           if (err instanceof CliSignalDeathError) {
             // The CLI is dead: from here on its pid is reaped group-only, whatever happens next.
             if (err.pid !== undefined) this.deadCliPids.add(err.pid);
@@ -5211,6 +5281,7 @@ export class SdkExecutor implements Executor {
           // one when it saw none; undefined therefore means no session seen and none requested (or a
           // fresh init with no id): start fresh.
           lastProviderErr = err;
+          lastEventFree = undefined;
           turn = undefined;
           resumeId = err.sessionId;
           return;
@@ -5243,7 +5314,9 @@ export class SdkExecutor implements Executor {
         payload: {
           text: lastProviderErr
             ? `the provider returned a transient error (${lastProviderErr.status ?? "API error"}); retrying…`
-            : "the model returned an empty result (0 turns, no activity); retrying…",
+            : lastEventFree
+              ? "the model stream ended without any events; retrying…"
+              : "the model returned an empty result (0 turns, no activity); retrying…",
         },
       });
       // An empty fresh turn can still initialize a session. Resume it on retry:
@@ -5277,7 +5350,9 @@ export class SdkExecutor implements Executor {
     throw new TransientRecoveryError(
       lastProviderErr
         ? `provider transient error persisted after bounded in-process retries: ${lastProviderErr.message}`
-        : undefined,
+        : lastEventFree
+          ? "the model stream ended without any events after bounded in-process retries"
+          : undefined,
       // lastProviderErr is cleared by any attempt that returned (even positively empty), so it
       // is set here only when the FINAL attempt threw the provider error.
       { providerOrigin: lastProviderErr !== undefined, sessionId: resumeId },
@@ -5373,7 +5448,7 @@ export class SdkExecutor implements Executor {
       if (state.wallRemainingMs <= 0) return;
       const slice = Math.min(EMPTY_TURN_BACKOFF_SLICE_MS, remaining);
       const before = Date.now();
-      await sleep(slice);
+      await this.emptyTurnSleep(slice);
       // Catch a cancel that landed mid-sleep promptly, before debiting/looping.
       if (state.tripReason) throw this.tripError(state);
       // Debit the ACTUAL elapsed time (mirrors disarmWall) so the subsequent turn's

@@ -1,4 +1,9 @@
+{{- $runtime := .Values.workers.docker.podEpochReclaim.runtime -}}
+{{- if not (and (kindIs "string" $runtime) (has $runtime (list "" "containerd-runc" "crio-crun"))) -}}
+{{- fail "workers.docker.podEpochReclaim.runtime must be empty, containerd-runc or crio-crun" -}}
+{{- end -}}
 {{- $_ := include "uzi.workerMemoryGuardEnabled" . -}}
+{{- $_ := include "uzi.workerGoConcurrencyValidate" . -}}
 {{- if .Values.workers.enabled }}
 {{- /*
   THIS TEMPLATE RENDERS NOTHING, ON PURPOSE. It exists to evaluate the hosted-worker

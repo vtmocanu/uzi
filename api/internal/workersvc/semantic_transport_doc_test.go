@@ -17,7 +17,7 @@ func TestSemanticTransportLimitsDocumented(t *testing.T) {
 		"Claude's output cap alone does not prove a conservative full-call bound.",
 		"Complete large sources can exceed the 40,000-token allowance.",
 		"Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call.",
-		"#1231 must establish enforceable bounds before activation.",
+		"Any future semantic activation must establish enforceable bounds before activation.",
 	}
 	read := func(rel string) string {
 		t.Helper()
@@ -42,7 +42,7 @@ func TestSemanticTransportLimitsDocumented(t *testing.T) {
 	for _, rel := range []string{"adr/1225-structural-completion-interlock-invariants.md", "prds/done/1230-semantic-completion-contract.md"} {
 		for _, sentence := range []string{
 			"Maximum-size owner semantic transport is not production-readiness proof.",
-			"#1231 must verify maximum-size owner reads and decisions against production transport deadlines before activation.",
+			"Any future semantic activation must verify maximum-size owner reads and decisions against production transport deadlines before activation.",
 		} {
 			if !strings.Contains(read(rel), sentence) {
 				t.Errorf("%s lacks the sentence %q", rel, sentence)

@@ -985,6 +985,7 @@ describe("Worker — job dispatch and capability (PRD #1908 M4)", () => {
     for (let i = 0; i < 300 && caps === undefined; i++) await tick();
     controller.abort();
     await done;
+    assert.ok(caps?.includes("task_checkpoint_coordinates_v1"), "task checkpoint consumer capability is on the register wire");
     assert.ok(caps?.includes("job_runner_v1"), "job_runner_v1 is on the register wire");
     assert.ok(caps?.includes("job_files_v1"), "job_files_v1 (PRD #1909 M1 rollout gate) is on the register wire next to job_runner_v1");
     assert.ok(caps?.includes("cross_check_v1"), "cross_check_v1 is advertised even when Codex is unavailable on this worker");
@@ -1011,6 +1012,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
   // expectation readable and off gitleaks' generic-api-key heuristic, which flagged the
   // single-line form.
   const ALWAYS_PRESENT_PROTOCOL_CAPS = [
+    "task_checkpoint_coordinates_v1",
     "completion_interlock_v1",
     "recovery_archive_v1",
     "recovery_archive_v2",

@@ -264,21 +264,32 @@ nothing while it waits; an idle round-trip in a local session (a question to
 the user, a wait for a teammate) still sits inside the one session whose
 context keeps growing underneath it.
 
-### 2. Every SDK session starts lean
+### 2. Native project context stays disabled
 
-Every SDK session uzi spawns — lead and subagent alike — runs with
-`settingSources: []` (run options in `agent/src/claude-harness.ts`), so it never loads the
-cloned repo's own `CLAUDE.md`, `.claude/rules/*`, `.claude/agents/*`, or
-skills; the comment beside the option calls this out explicitly as
-prompt-injection defense, not a cost optimization, but it has the cost effect
-too. A subagent's role context is the body of its template (for a builtin,
-the file under `api/internal/agenttmpl/builtins/`, roughly 2–14 KB per role:
+Claude sessions use `settingSources: []`
+(`agent/src/claude-harness.ts`), disabling the SDK's project-settings loader.
+Codex uses `project_doc_max_bytes = 0`, an explicitly `untrusted` project and
+disabled native extensions/hooks (`agent/src/codex/config.ts`). These are
+prompt-injection defenses with a cost effect too: repo configuration is not
+automatically loaded through either harness's native project loader.
+
+A subagent's role context is the body of its template (for a builtin, the file under `api/internal/agenttmpl/builtins/`, roughly 2–14 KB per role:
 `researcher.md` is the smallest at 2.0 KB, `tester.md` the largest at 13.8 KB,
 measured 2026-09-28) plus the runtime block uzi appends to every subagent
-(scratch directory, safety and findings rules, `agent/src/prompt.ts`). The cloned repo's *own* `CLAUDE.md` still reaches the run, but
-only the **lead** sees it, and only as a nonce-fenced `UNTRUSTED, ADVISORY`
-block appended last, after every guardrail instruction (`agent/src/prompt.ts`,
-PRD #246) — never as loaded instructions a model treats as authoritative.
+(scratch directory, safety and findings rules, `agent/src/prompt.ts`).
+
+The cloned repo's root `CLAUDE.md` reaches a **Claude or Codex lead** through
+uzi's worker-read channel **only when the owner or admin enables Repo
+instructions** for that repo (default off). It is appended last as a
+nonce-fenced `UNTRUSTED, ADVISORY` block, after uzi's guardrail text, with no
+change to native loader isolation. One snapshot is read and framed per
+execution before the same-run dependency installer and agent turns can write;
+Codex also captures before repo-tool provisioning. Root phases, retries and
+replacement provider epochs reuse that text and nonce. A fresh execution,
+including a newly claimed resume, snapshots afresh. Subagent definitions
+receive no advisory block, and their static advice is unchanged. The code
+checker's independent consent and frozen-commit contract remain separate.
+See [Repo instructions](./skills.md#repo-instructions-opt-in-default-off).
 
 A local Claude Code session auto-loads the project's root `CLAUDE.md` at
 session start, by design — this repo's own is 49,756 bytes today — plus

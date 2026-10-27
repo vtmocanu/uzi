@@ -1,0 +1,2297 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7b958d35..491c9e1b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -22,6 +22,11 @@ through `[0.52.0]`.)
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- **Filed incidental findings can request automatic work from uzi ([#2991](https://github.com/vtmocanu/uzi/issues/2991)).**
++  Single and grouped finding drafts offer an unchecked Send to uzi checkbox, and `uzi findings file --send-to-uzi` adds the same configured run-eligibility and autopilot labels after explicit labels; omitting the option keeps filing unchanged. The next normal sync still requires existing owner opt-in and matching forge identity plus the usual run checks: filing requests labels, does not enable autopilot, and does not guarantee a run. Uncertain group filings without a confirmed issue show no queued confirmation and retain the existing recovery guidance.
++
+ ### Fixed
+ 
+ - **Require complete bounded ownership-loss responses ([#2985](https://github.com/vtmocanu/uzi/issues/2985)).**
+diff --git a/api/cmd/uzi/findings.go b/api/cmd/uzi/findings.go
+index 4739c2cd..76a099fe 100644
+--- a/api/cmd/uzi/findings.go
++++ b/api/cmd/uzi/findings.go
+@@ -74,6 +74,8 @@ func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
+ 		},
+ 	}
+ 
++	file.Flags().Bool("send-to-uzi", false, "label the issue for uzi; automatic starts require autopilot to be enabled and a matching forge identity")
++
+ 	draft := &cobra.Command{
+ 		Use:   "draft <finding-id> [<finding-id>...]",
+ 		Short: "Preview the issue draft for one or more findings (read-only)",
+@@ -394,7 +396,8 @@ func runFindingsResolve(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Co
+ // created-with-warning note. A 409 (already filed/filing) and a 404 (unknown/foreign id) arrive
+ // as *ExitError with exit 5 / 4 from statusError, propagated unchanged.
+ func runFindingsFile(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, id string) error {
+-	res, err := c.FileFinding(cmd.Context(), id)
++	sendToUzi, _ := cmd.Flags().GetBool("send-to-uzi")
++	res, err := c.FileFinding(cmd.Context(), id, sendToUzi)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -409,6 +412,10 @@ func runFindingsFile(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Comma
+ 		if res.Issue.WebURL != "" {
+ 			p.Printf("  %s\n", res.Issue.WebURL)
+ 		}
++		if sendToUzi {
++			p.Printf("Queued for uzi: starts on the next sync if autopilot is on\n")
++			p.Printf("Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi.\n")
++		}
+ 		// A warning is created-with-warning: the forge issue is REAL, so this is a note on a
+ 		// success (exit 0), never a retry signal.
+ 		if res.Warning != "" {
+@@ -549,7 +556,8 @@ func runFindingsFileGroup(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.
+ 	if len(dispIDs) == 1 {
+ 		return runFindingsFile(env, gf, c, cmd, distinct[0])
+ 	}
+-	res, accepted, err := c.FileFindingGroup(cmd.Context(), dispIDs)
++	sendToUzi, _ := cmd.Flags().GetBool("send-to-uzi")
++	res, accepted, err := c.FileFindingGroup(cmd.Context(), dispIDs, sendToUzi)
+ 	if err != nil {
+ 		var ee *uzicli.ExitError
+ 		if errors.As(err, &ee) && ee.Code == uzicli.ExitConflict {
+@@ -569,6 +577,10 @@ func runFindingsFileGroup(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.
+ 				p.Printf("  %s\n", res.Issue.WebURL)
+ 			}
+ 			p.Printf("linked findings: %s\n", strings.Join(res.DispositionIDs, ", "))
++			if sendToUzi {
++				p.Printf("Queued for uzi: starts on the next sync if autopilot is on\n")
++				p.Printf("Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi.\n")
++			}
+ 		}
+ 		// An unsettled operation (202, or a 201 not yet settled) and any warning are always
+ 		// printed, --quiet included: the operation id is what the user later inspects, and must
+diff --git a/api/cmd/uzi/findings_send_test.go b/api/cmd/uzi/findings_send_test.go
+new file mode 100644
+index 00000000..fc6ad88a
+--- /dev/null
++++ b/api/cmd/uzi/findings_send_test.go
+@@ -0,0 +1,163 @@
++package main
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++
++	"github.com/vtmocanu/uzi/api/internal/apitypes"
++	"github.com/vtmocanu/uzi/api/internal/uzicli"
++)
++
++const queuedExplanation = "Queued for uzi: starts on the next sync if autopilot is on\nStarts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi.\n"
++
++func TestFindingsFileSendToUziForwarding(t *testing.T) {
++	for _, shape := range []struct {
++		name  string
++		ids   []string
++		group bool
++	}{
++		{"single", []string{"e-1"}, false},
++		{"group", []string{"e-1", "e-2"}, true},
++		{"same-coordinate", []string{"e-1", "e-1-old"}, false},
++	} {
++		for _, flag := range []struct {
++			name string
++			args []string
++			want bool
++		}{
++			{"default", nil, false},
++			{"false", []string{"--send-to-uzi=false"}, false},
++			{"true", []string{"--send-to-uzi"}, true},
++		} {
++			t.Run(shape.name+"/"+flag.name, func(t *testing.T) {
++				fc := groupFake()
++				fc.FileFindingResult.Issue = apitypes.IncidentalFindingFiledIssueDTO{IID: 3, Title: "single"}
++				// Seed both captures oppositely so forwarding false must overwrite its own capture.
++				fc.LastFileFindingSendToUzi = !flag.want
++				fc.LastFileFindingGroupSendToUzi = !flag.want
++				args := append([]string{"findings", "file"}, shape.ids...)
++				args = append(args, flag.args...)
++				out, errb, code := runCLI(t, fakeEnv(fc), args...)
++				if code != uzicli.ExitOK {
++					t.Fatalf("exit=%d stderr=%s", code, errb)
++				}
++				if shape.group {
++					if fc.LastFileFindingGroupSendToUzi != flag.want || fc.LastFileFindingSendToUzi != !flag.want || fc.LastFileFindingID != "" {
++						t.Fatalf("wrong group forwarding: %+v", fc)
++					}
++				} else if fc.LastFileFindingSendToUzi != flag.want || fc.LastFileFindingGroupSendToUzi != !flag.want || fc.LastFileFindingID != "e-1" || fc.LastFileFindingGroupIDs != nil {
++					t.Fatalf("wrong single forwarding")
++				}
++				if strings.Contains(out, queuedExplanation) != flag.want {
++					t.Errorf("queue explanation: %q", out)
++				}
++			})
++		}
++	}
++}
++
++func TestFindingsFileSendToUziOutput(t *testing.T) {
++	for _, tc := range []struct {
++		name                                                            string
++		group, quiet, json, uncertain, accepted, noIssue, warning, fail bool
++	}{
++		{name: "single-warning", warning: true},
++		{name: "single-quiet", quiet: true, warning: true},
++		{name: "single-json", json: true, warning: true},
++		{name: "single-json-quiet", json: true, quiet: true},
++		{name: "single-error", fail: true},
++		{name: "group-warning", group: true, warning: true},
++		{name: "group-quiet-warning", group: true, quiet: true, warning: true},
++		{name: "group-json", group: true, json: true, warning: true},
++		{name: "group-json-quiet", group: true, json: true, quiet: true},
++		{name: "group-unlinked", group: true, warning: true, uncertain: true},
++		{name: "group-unlinked-quiet", group: true, quiet: true, warning: true, uncertain: true},
++		{name: "group-uncertain", group: true, uncertain: true, accepted: true, warning: true},
++		{name: "group-uncertain-quiet", group: true, quiet: true, uncertain: true, accepted: true, warning: true},
++		{name: "group-uncertain-json", group: true, json: true, uncertain: true, accepted: true},
++		{name: "group-no-issue-201", group: true, uncertain: true, noIssue: true},
++		{name: "group-error", group: true, fail: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			fc := groupFake()
++			fc.FileFindingResult.Issue = apitypes.IncidentalFindingFiledIssueDTO{IID: 3, Title: "single"}
++			if tc.warning {
++				fc.FileFindingResult.Warning = "settle warning"
++				fc.FileFindingGroupResult.Warning = "settle warning"
++			}
++			if tc.uncertain {
++				fc.FileFindingGroupResult.Phase = "returned_uncertain"
++			}
++			if tc.accepted || tc.noIssue {
++				fc.FileFindingGroupResult.Issue = nil
++			}
++			fc.FileFindingGroupAccepted = tc.accepted
++			if tc.fail {
++				fc.FileFindingErr = uzicli.Exitf(uzicli.ExitNotFound, "missing")
++				fc.FileFindingGroupErr = uzicli.Exitf(uzicli.ExitNotFound, "missing")
++			}
++			args := []string{"findings", "file", "e-1", "--send-to-uzi"}
++			if tc.group {
++				args = append(args, "e-2")
++			}
++			if tc.quiet {
++				args = append(args, "--quiet")
++			}
++			if tc.json {
++				args = append(args, "--json")
++			}
++			out, errb, code := runCLI(t, fakeEnv(fc), args...)
++			wantCode := uzicli.ExitOK
++			if tc.accepted || tc.noIssue {
++				wantCode = uzicli.ExitConflict
++			}
++			if tc.fail {
++				wantCode = uzicli.ExitNotFound
++			}
++			if code != wantCode {
++				t.Fatalf("exit=%d want=%d stderr=%s", code, wantCode, errb)
++			}
++			wantQueued := !tc.quiet && !tc.json && !tc.accepted && !tc.noIssue && !tc.fail
++			if strings.Contains(out, queuedExplanation) != wantQueued || (!wantQueued && strings.Contains(out, "Queued for uzi")) {
++				t.Errorf("queue output: %q", out)
++			}
++			if tc.json {
++				var want []byte
++				if tc.group {
++					want, _ = json.MarshalIndent(fc.FileFindingGroupResult, "", "  ")
++				} else {
++					want, _ = json.MarshalIndent(fc.FileFindingResult, "", "  ")
++				}
++				if out != string(want)+"\n" {
++					t.Errorf("JSON changed: %q want %s", out, want)
++				}
++			} else {
++				if tc.quiet && !tc.uncertain && out != "" {
++					t.Errorf("quiet: %q", out)
++				}
++				if tc.warning && (!tc.quiet || tc.uncertain) && !strings.Contains(out, "warning: settle warning") {
++					t.Errorf("warning lost: %q", out)
++				}
++				if tc.uncertain && !strings.Contains(out, "operation op-1 (returned_uncertain)") {
++					t.Errorf("operation lost: %q", out)
++				}
++				if (tc.accepted || tc.noIssue) && !strings.Contains(out, "uzi findings release op-1 --confirm-no-issue") {
++					t.Errorf("guidance lost: %q", out)
++				}
++			}
++		})
++	}
++}
++
++func TestFindingsFileSendToUziFlagScope(t *testing.T) {
++	for _, args := range [][]string{
++		{"review", "file", "f-1", "--send-to-uzi"},
++		{"findings", "draft", "e-1", "--send-to-uzi"},
++	} {
++		_, errb, code := runCLI(t, fakeEnv(groupFake()), args...)
++		if code != uzicli.ExitUsage || !strings.Contains(errb, "unknown flag: --send-to-uzi") {
++			t.Errorf("%v: exit=%d stderr=%s", args, code, errb)
++		}
++	}
++}
+diff --git a/api/internal/apitypes/contract_test.go b/api/internal/apitypes/contract_test.go
+index 438da756..5a7aac6f 100644
+--- a/api/internal/apitypes/contract_test.go
++++ b/api/internal/apitypes/contract_test.go
+@@ -108,6 +108,8 @@ func contractCases() []contractCase {
+ 		// shape as AgentMemoryDTO. The zero-fixture check stays non-vacuous by pinning the
+ 		// always-present key set.
+ 		newContractCase[IncidentalFindingDTO]("finding"),
++		newContractCase[FileFindingRequest]("file_finding_request"),
++		newContractCase[FindingGroupFileRequest]("finding_group_file_request"),
+ 		// PRD #1255 M2a: the forge-view read DTOs (pulls list + drill-in, CI runs list +
+ 		// drill-in). PullDetailDTO embeds PullDTO and CIRunDetailDTO embeds CIRunDTO, so
+ 		// their full fixtures carry the embedded scalars inline (like RunListItemDTO).
+@@ -288,3 +290,31 @@ func TestContractFullFixtureDecodesStrict(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// Explicit false is omitted even when the request edits are populated.
++func TestFindingRequestsFalseOmitsSendToUzi(t *testing.T) {
++	var single FileFindingRequest
++	var group FindingGroupFileRequest
++	apitypestest.Populate(&single)
++	apitypestest.Populate(&group)
++	single.SendToUzi = false
++	group.SendToUzi = false
++	for _, c := range []struct {
++		name  string
++		value any
++	}{
++		{"single", single},
++		{"group", group},
++	} {
++		t.Run(c.name, func(t *testing.T) {
++			raw := mustMarshalIndent(t, c.value)
++			var fields map[string]json.RawMessage
++			if err := json.Unmarshal(raw, &fields); err != nil {
++				t.Fatal(err)
++			}
++			if _, present := fields["send_to_uzi"]; present {
++				t.Fatal("false send_to_uzi must be omitted")
++			}
++		})
++	}
++}
+diff --git a/api/internal/apitypes/finding.go b/api/internal/apitypes/finding.go
+index 1ef09632..dfde7daa 100644
+--- a/api/internal/apitypes/finding.go
++++ b/api/internal/apitypes/finding.go
+@@ -78,12 +78,13 @@ type FindingOccurrenceDTO struct {
+ 
+ // FileFindingRequest is the (all-optional) body of POST /api/findings/{id}/issue (PRD #333 M5,
+ // exported in PRD #1183 M3 so the wire lives in apitypes beside the response). Every field is a
+-// user EDIT of the server-rendered draft, so none is trusted: the handler re-runs title/description
+-// through the field-level sanitisers and UNIONs labels with the server marker.
++// user edit or explicit send-to-uzi opt-in. The handler re-runs title/description through the
++// field-level sanitisers and unions labels with the server marker and any opted-in run labels.
+ type FileFindingRequest struct {
+ 	Title       *string  `json:"title"`
+ 	Description *string  `json:"description"`
+ 	Labels      []string `json:"labels"`
++	SendToUzi   bool     `json:"send_to_uzi,omitempty"`
+ }
+ 
+ // DismissFindingRequest is the body of POST /api/findings/{id}/dismiss: a required reason from the
+@@ -217,6 +218,7 @@ type FindingGroupFileRequest struct {
+ 	Title       *string  `json:"title,omitempty"`
+ 	Description *string  `json:"description,omitempty"`
+ 	Labels      []string `json:"labels,omitempty"`
++	SendToUzi   bool     `json:"send_to_uzi,omitempty"`
+ }
+ 
+ type FindingGroupFileResultDTO struct {
+diff --git a/api/internal/handler/findings_file.go b/api/internal/handler/findings_file.go
+index 194637d5..4b0ed84b 100644
+--- a/api/internal/handler/findings_file.go
++++ b/api/internal/handler/findings_file.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/vtmocanu/uzi/api/internal/httpx"
+ 	"github.com/vtmocanu/uzi/api/internal/issuedraft"
+ 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
++	"github.com/vtmocanu/uzi/api/internal/settings"
+ 	"github.com/vtmocanu/uzi/api/internal/store"
+ 	"github.com/vtmocanu/uzi/api/internal/termsafe"
+ 	"github.com/vtmocanu/uzi/api/internal/workersvc"
+@@ -32,11 +33,11 @@ import (
+ // body's title/description are accepted only as edits and are re-run through the same
+ // write-boundary sanitisers, never trusted to have preserved their inertness. Labels are
+ // assembled server-side (D5): the config-overridable marker (settings.FindingLabel) is unioned
+-// with the user's sanitised, capped selection, marker always present.
++// with the user's sanitised, capped selection and explicit send_to_uzi opt-in, marker always present.
+ //
+ // Ordering is claim-first (D4): ClaimFindingForFiling (open→filing, a guarded UPDATE) so of two
+ // concurrent POSTs on one coordinate exactly one reaches the forge and the loser is a 409; then
+-// EnsureLabels the marker BEFORE CreateIssue (D5/R5 — Forgejo resolves label ids and errors on
++// EnsureLabels the marker and opted-in run labels BEFORE CreateIssue (D5/R5 — Forgejo resolves label ids and errors on
+ // an unknown name); then CreateIssue on the caller's own connection; then SettleFindingFiled.
+ // Any post-claim, pre-CreateIssue failure REVERTS the claim (filing→open, re-fileable). A settle
+ // failure AFTER a successful CreateIssue is created-with-warning: the forge issue is real, so we
+@@ -118,17 +119,17 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	// (4) Labels are assembled server-side (D5): the config-overridable marker unioned with the
+-	// user's sanitised, capped selection, marker ALWAYS first and present. The API gives the
++	// user's sanitised, capped selection and explicit send-to-uzi opt-in, marker ALWAYS first and present. The API gives the
+ 	// client no way to attach a trigger label that skips the marker.
+ 	//
+-	// LABEL POSTURE (auditor question, confirmed): the ONLY inputs are the server marker and the
+-	// human's req.Labels. The agent-authored suggestions stored on finding.Labels are NOT read
++	// LABEL POSTURE: inputs are the server marker, the human's req.Labels, and the explicit
++	// req.SendToUzi boolean. The agent-authored suggestions stored on finding.Labels are NOT read
+ 	// here, so they never auto-attach — they are surfaced only as an editable seed in the M4
+ 	// draft (GetFindingIssueDraft), and attach solely when the repo owner explicitly keeps them
+ 	// in the body. A user-chosen run-eligible label is therefore the owner's own deliberate
+ 	// action, not an agent-injected one.
+ 	marker, _ := h.settings.FindingLabel(ctx)
+-	filedLabels := assembleFindingLabels(marker, req.Labels)
++	filedLabels, requiredLabels := h.findingFilingLabels(ctx, marker, req.Labels, req.SendToUzi)
+ 
+ 	// (5) Claim-first (D4): a guarded open→filing UPDATE. 0 rows affected means the coordinate
+ 	// is already filed or being filed (the single row is not `open`), so exactly one of two
+@@ -156,10 +157,10 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	// EnsureLabels the marker BEFORE CreateIssue (D5/R5): Forgejo resolves label names to ids
+-	// and errors on an unknown one, so the marker must pre-exist. A failure here reverts the
++	// EnsureLabels the marker and opted-in run labels BEFORE CreateIssue (D5/R5): Forgejo
++	// resolves label names to ids and errors on an unknown one, so required labels must pre-exist. A failure here reverts the
+ 	// claim and is a 502 (an upstream forge problem), not a duplicate issue.
+-	if err := f.EnsureLabels(ctx, repo.ForgeProjectID, []forge.Label{{Name: marker}}); err != nil {
++	if err := f.EnsureLabels(ctx, repo.ForgeProjectID, requiredLabels); err != nil {
+ 		h.revertFindingClaim(ctx, finding)
+ 		httpx.Error(w, http.StatusBadGateway, "could not ensure the finding label on the forge: "+err.Error())
+ 		return
+@@ -294,6 +295,41 @@ func assembleFindingLabels(marker string, userLabels []string) []string {
+ 	return out
+ }
+ 
++// findingFilingLabels preserves assembleFindingLabels' explicit-label budget, then appends
++// the requested run labels without displacing accepted user labels. Required forge labels
++// are built independently so an explicit-label collision never skips ensuring a run label.
++func (h *Handler) findingFilingLabels(ctx context.Context, marker string, userLabels []string, sendToUzi bool) ([]string, []forge.Label) {
++	filed := assembleFindingLabels(marker, userLabels)
++	required := []forge.Label{{Name: marker}}
++	if !sendToUzi {
++		return filed, required
++	}
++	eligibility, _ := h.settings.UziLabel(ctx)
++	if eligibility == "" {
++		eligibility = settings.DefaultUziLabel
++	}
++	autopilot, _ := h.settings.AutopilotLabel(ctx)
++	if autopilot == "" {
++		autopilot = settings.DefaultAutopilotLabel
++	}
++	filedSeen := make(map[string]bool, len(filed)+2)
++	for _, name := range filed {
++		filedSeen[name] = true
++	}
++	requiredSeen := map[string]bool{marker: true}
++	for _, name := range []string{eligibility, autopilot} {
++		if !filedSeen[name] {
++			filed = append(filed, name)
++			filedSeen[name] = true
++		}
++		if !requiredSeen[name] {
++			required = append(required, forge.Label{Name: name})
++			requiredSeen[name] = true
++		}
++	}
++	return filed, required
++}
++
+ func containsComma(s string) bool {
+ 	for i := 0; i < len(s); i++ {
+ 		if s[i] == ',' {
+diff --git a/api/internal/handler/findings_file_livedb_test.go b/api/internal/handler/findings_file_livedb_test.go
+index 7576e796..05004388 100644
+--- a/api/internal/handler/findings_file_livedb_test.go
++++ b/api/internal/handler/findings_file_livedb_test.go
+@@ -49,6 +49,9 @@ type findingForgeStub struct {
+ 	creates      []forgeCreate
+ 	seq          int
+ 	markerSeq    int // sequence number of the CreateLabel that created the marker
++	ensured      []string
++	ensureSeqs   []int
++	ensureFail   bool
+ 	firstIssueAt int // sequence number of the first CreateIssue
+ 	nextIID      int64
+ }
+@@ -69,10 +72,18 @@ func newFindingForgeStub(t *testing.T, marker string) *findingForgeStub {
+ 			name, _ := m["name"].(string)
+ 			fs.mu.Lock()
+ 			fs.seq++
++			fs.ensured = append(fs.ensured, name)
++			fs.ensureSeqs = append(fs.ensureSeqs, fs.seq)
++			ensureFail := fs.ensureFail
+ 			if name == marker {
+ 				fs.markerSeq = fs.seq
+ 			}
+ 			fs.mu.Unlock()
++			if ensureFail {
++				w.WriteHeader(http.StatusForbidden)
++				_, _ = w.Write([]byte(`{"message":"label creation refused"}`))
++				return
++			}
+ 			w.Header().Set("Content-Type", "application/json")
+ 			w.WriteHeader(http.StatusCreated)
+ 			_, _ = fmt.Fprintf(w, `{"id":7,"name":%q,"color":"#888888"}`, name)
+diff --git a/api/internal/handler/findings_group_file.go b/api/internal/handler/findings_group_file.go
+index d0952d79..72caed33 100644
+--- a/api/internal/handler/findings_group_file.go
++++ b/api/internal/handler/findings_group_file.go
+@@ -199,7 +199,8 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
+ 		writeStoppedFindingGroup(w, op.ID, dispositionIDs, "pre_call")
+ 		return
+ 	}
+-	if err := f.EnsureLabels(callCtx, repo.ForgeProjectID, []forge.Label{{Name: marker}}); err != nil {
++	filedLabels, requiredLabels := h.findingFilingLabels(callCtx, marker, req.Labels, req.SendToUzi)
++	if err := f.EnsureLabels(callCtx, repo.ForgeProjectID, requiredLabels); err != nil {
+ 		if callCtx.Err() != nil {
+ 			writeStoppedFindingGroup(w, op.ID, dispositionIDs, "pre_call")
+ 			return
+@@ -223,7 +224,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
+ 		writeStoppedFindingGroup(w, op.ID, dispositionIDs, "in_flight")
+ 		return
+ 	}
+-	created, err := f.CreateIssue(callCtx, repo.ForgeProjectID, title, description, assembleFindingLabels(marker, req.Labels))
++	created, err := f.CreateIssue(callCtx, repo.ForgeProjectID, title, description, filedLabels)
+ 	if err != nil {
+ 		if forge.IsCreateIssueDefinitiveRejection(err) {
+ 			if !h.releaseDefinitiveFindingGroup(user.ID, op.ID) {
+diff --git a/api/internal/handler/findings_group_livedb_test.go b/api/internal/handler/findings_group_livedb_test.go
+index a0a7336d..b3adaaf3 100644
+--- a/api/internal/handler/findings_group_livedb_test.go
++++ b/api/internal/handler/findings_group_livedb_test.go
+@@ -58,6 +58,7 @@ type fgFake struct {
+ 	mu      sync.Mutex
+ 	seq     int
+ 	ensureN int
++	ensured []string
+ 	ensureS int // seq of the first EnsureLabels
+ 	createS int // seq of the first CreateIssue
+ 	creates []fgCreate
+@@ -73,10 +74,13 @@ type fgFake struct {
+ 	ensureGate    chan struct{} // when non-nil EnsureLabels blocks until it is closed
+ }
+ 
+-func (f *fgFake) EnsureLabels(_ context.Context, _ int64, _ []forge.Label) error {
++func (f *fgFake) EnsureLabels(_ context.Context, _ int64, labels []forge.Label) error {
+ 	f.mu.Lock()
+ 	f.seq++
+ 	f.ensureN++
++	for _, label := range labels {
++		f.ensured = append(f.ensured, label.Name)
++	}
+ 	if f.ensureS == 0 {
+ 		f.ensureS = f.seq
+ 	}
+diff --git a/api/internal/handler/findings_send_to_uzi_livedb_test.go b/api/internal/handler/findings_send_to_uzi_livedb_test.go
+new file mode 100644
+index 00000000..01afc8db
+--- /dev/null
++++ b/api/internal/handler/findings_send_to_uzi_livedb_test.go
+@@ -0,0 +1,196 @@
++package handler
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"slices"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/vtmocanu/uzi/api/internal/settings"
++	"github.com/vtmocanu/uzi/api/internal/store"
++	"github.com/vtmocanu/uzi/api/internal/workersvc"
++)
++
++// Bodies deliberately use raw JSON rather than the new DTO fields, so this file and the
++// fake capture changes can also exercise request acceptance against the pinned baseline.
++type findingSendCase struct {
++	name           string
++	body           string
++	rows           []store.AppSetting
++	storeErr       error
++	ensureFail     bool
++	wantStatus     int
++	groupStatus    int
++	filed, ensured []string
++}
++
++func findingSendCases() []findingSendCase {
++	marker := findingTestMarker
++	defaults := []string{marker, "uzi", "autopilot"}
++	custom := []store.AppSetting{
++		{Key: settings.KeyFindingLabel, Value: "reported"},
++		{Key: settings.KeyUziLabel, Value: "eligible"},
++		{Key: settings.KeyAutopilotLabel, Value: "hands-off"},
++	}
++	capped := []string{marker, "clean", strings.Repeat("a", 64)}
++	raw := []string{"", "bad,separator", "clean\u0001", "clean", strings.Repeat("a", 80)}
++	for i := 0; i < workersvc.MaxProposalLabels; i++ {
++		name := fmt.Sprintf("explicit-%02d", i)
++		raw = append(raw, name)
++		if len(capped) < workersvc.MaxProposalLabels {
++			capped = append(capped, name)
++		}
++	}
++	labels, _ := json.Marshal(raw)
++	return []findingSendCase{
++		{name: "absent", body: "{}", filed: []string{marker}, ensured: []string{marker}},
++		{name: "false", body: `{"send_to_uzi":false}`, filed: []string{marker}, ensured: []string{marker}},
++		{name: "false explicit run labels", body: `{"send_to_uzi":false,"labels":["uzi","autopilot","chosen"]}`, filed: []string{marker, "uzi", "autopilot", "chosen"}, ensured: []string{marker}},
++		{name: "true missing rows", body: `{"send_to_uzi":true}`, filed: defaults, ensured: defaults},
++		{name: "custom settings", body: `{"send_to_uzi":true,"labels":["chosen"]}`, rows: custom,
++			filed: []string{"reported", "chosen", "eligible", "hands-off"}, ensured: []string{"reported", "eligible", "hands-off"}},
++		{name: "explicit defaults", body: `{"send_to_uzi":true}`, rows: []store.AppSetting{
++			{Key: settings.KeyUziLabel, Value: "uzi"}, {Key: settings.KeyAutopilotLabel, Value: "autopilot"}},
++			filed: defaults, ensured: defaults},
++		{name: "exact explicit collisions", body: `{"send_to_uzi":true,"labels":["autopilot","uzi","agent-found","Uzi","uzi"]}`,
++			filed: []string{marker, "autopilot", "uzi", "Uzi"}, ensured: defaults},
++		// These rows bypass admin validation intentionally: legacy coincident settings must
++		// deduplicate even though ValidateMerged rejects new eligibility collisions.
++		{name: "legacy all coincident", body: `{"send_to_uzi":true}`, rows: []store.AppSetting{
++			{Key: settings.KeyUziLabel, Value: marker}, {Key: settings.KeyAutopilotLabel, Value: marker}},
++			filed: []string{marker}, ensured: []string{marker}},
++		{name: "legacy run labels coincident", body: `{"send_to_uzi":true}`, rows: []store.AppSetting{
++			{Key: settings.KeyUziLabel, Value: "run"}, {Key: settings.KeyAutopilotLabel, Value: "run"}},
++			filed: []string{marker, "run"}, ensured: []string{marker, "run"}},
++		{name: "sanitization and cap", body: `{"send_to_uzi":true,"labels":` + string(labels) + "}",
++			filed: append(slices.Clone(capped), "uzi", "autopilot"), ensured: defaults},
++		{name: "ensure failure", body: `{"send_to_uzi":true}`, ensureFail: true, wantStatus: http.StatusBadGateway, ensured: []string{marker}},
++		{name: "cold settings error", body: `{"send_to_uzi":true}`, storeErr: errors.New("settings unavailable"),
++			groupStatus: http.StatusInternalServerError, filed: defaults, ensured: defaults},
++		{name: "false cold settings error", body: `{"send_to_uzi":false}`, storeErr: errors.New("settings unavailable"),
++			groupStatus: http.StatusInternalServerError, filed: []string{marker}, ensured: []string{marker}},
++	}
++}
++
++func TestFileFindingSendToUziLiveDB(t *testing.T) {
++	for _, tc := range findingSendCases() {
++		t.Run(tc.name, func(t *testing.T) {
++			h, pool, q, box, fs := fileFindingLiveDB(t)
++			h.settings = settings.New(&settingsStore{rows: tc.rows, err: tc.storeErr}, time.Minute)
++			f := seedFindingFileFixture(context.Background(), t, pool, q, box, fs.server.URL)
++			fs.ensureFail = tc.ensureFail
++			req := fileFindingReq(f.owner, f.finding.ID, nil)
++			req.Body = io.NopCloser(strings.NewReader(tc.body))
++			rr := httptest.NewRecorder()
++			h.FileFinding(rr, req)
++			want := tc.wantStatus
++			if want == 0 {
++				want = http.StatusCreated
++			}
++			if rr.Code != want {
++				t.Fatalf("status=%d want=%d body=%s", rr.Code, want, rr.Body.String())
++			}
++			fs.mu.Lock()
++			ensured := slices.Clone(fs.ensured)
++			seqs := slices.Clone(fs.ensureSeqs)
++			issueSeq := fs.firstIssueAt
++			creates := slices.Clone(fs.creates)
++			fs.mu.Unlock()
++			if !slices.Equal(ensured, tc.ensured) {
++				t.Errorf("ensured=%v want=%v", ensured, tc.ensured)
++			}
++			if tc.ensureFail {
++				if len(creates) != 0 {
++					t.Fatal("ensure failure reached CreateIssue")
++				}
++				if status, _ := dispositionStatus(context.Background(), t, pool, f.owner.ID, f.repoID, f.location); status != "open" {
++					t.Fatalf("claim not reverted: %s", status)
++				}
++				return
++			}
++			if len(creates) != 1 {
++				t.Fatalf("creates=%d want=1", len(creates))
++			}
++			if !slices.Equal(creates[0].Labels, tc.filed) {
++				t.Errorf("filed=%v want=%v", creates[0].Labels, tc.filed)
++			}
++			for _, seq := range seqs {
++				if seq <= 0 || seq >= issueSeq {
++					t.Errorf("ensure sequence=%d create=%d", seq, issueSeq)
++				}
++			}
++		})
++	}
++}
++
++func TestFileFindingGroupSendToUziLiveDB(t *testing.T) {
++	for _, tc := range findingSendCases() {
++		t.Run(tc.name, func(t *testing.T) {
++			e := newFGEnv(t, nil)
++			e.h.settings = settings.New(&settingsStore{rows: tc.rows, err: tc.storeErr}, time.Minute)
++			members := e.members(2)
++			// Add ids to a raw JSON body without relying on FindingGroupFileRequest.
++			ids, _ := json.Marshal(fgIDs(members...))
++			body := `{"ids":` + string(ids) + "}"
++			if tc.body != "{}" {
++				body = `{"ids":` + string(ids) + "," + strings.TrimPrefix(tc.body, "{")
++			}
++			e.fake.ensureErr = nil
++			if tc.ensureFail {
++				e.fake.ensureErr = errors.New("ensure refused")
++			}
++			rr := httptest.NewRecorder()
++			e.h.FileFindingGroup(rr, fgRequest(e.owner, http.MethodPost, "/x", json.RawMessage(body), nil))
++			want := tc.wantStatus
++			if want == 0 {
++				want = http.StatusCreated
++			}
++			if tc.groupStatus != 0 {
++				want = tc.groupStatus
++			}
++			if rr.Code != want {
++				t.Fatalf("status=%d want=%d body=%s", rr.Code, want, rr.Body.String())
++			}
++			e.fake.mu.Lock()
++			ensured := slices.Clone(e.fake.ensured)
++			ensureSeq, createSeq := e.fake.ensureS, e.fake.createS
++			e.fake.mu.Unlock()
++			wantEnsured := tc.ensured
++			if tc.ensureFail {
++				wantEnsured = []string{findingTestMarker, "uzi", "autopilot"}
++			}
++			if tc.groupStatus != 0 {
++				wantEnsured = nil
++			}
++			if !slices.Equal(ensured, wantEnsured) {
++				t.Errorf("ensured=%v want=%v", ensured, wantEnsured)
++			}
++			if want != http.StatusCreated {
++				if e.fake.createCount() != 0 {
++					t.Fatal("failed request reached CreateIssue")
++				}
++				e.requireOpen(members...)
++				if n, _, err := store.FindingGroupPendingStats(e.ctx, e.pool, e.owner.ID); err != nil || n != 0 {
++					t.Fatalf("operation not released: pending=%d err=%v", n, err)
++				}
++				return
++			}
++			if e.fake.createCount() != 1 {
++				t.Fatalf("creates=%d want=1", e.fake.createCount())
++			}
++			if got := e.fake.create(0).Labels; !slices.Equal(got, tc.filed) {
++				t.Errorf("filed=%v want=%v", got, tc.filed)
++			}
++			if ensureSeq <= 0 || ensureSeq >= createSeq {
++				t.Errorf("ensure sequence=%d create=%d", ensureSeq, createSeq)
++			}
++		})
++	}
++}
+diff --git a/api/internal/poller/autopilot_filed_test.go b/api/internal/poller/autopilot_filed_test.go
+new file mode 100644
+index 00000000..a3fd6f34
+--- /dev/null
++++ b/api/internal/poller/autopilot_filed_test.go
+@@ -0,0 +1,187 @@
++package poller
++
++import (
++	"context"
++	"errors"
++	"slices"
++	"strings"
++	"testing"
++
++	"github.com/vtmocanu/uzi/api/internal/forge"
++	"github.com/vtmocanu/uzi/api/internal/store"
++)
++
++// The candidate is already cached: these tests do not prove filing -> forge sync
++// -> cache creation. Handler writes use the repo-owner PAT, so event adder and
++// issue author can be that PAT's identity, not the user who clicked in the UI.
++type apFiledForge struct {
++	*apForge
++	labelWrites int
++}
++
++func (f *apFiledForge) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
++	f.labelWrites++
++	return errors.New("unexpected issue label write")
++}
++
++func filedCandidate(author string) (*apStore, *apRuns, *apFiledForge) {
++	return &apStore{
++		candidates: []store.ListAutopilotCandidateIssuesRow{candIssue(7, author)},
++		cc:         ccOwner("alice", true, true),
++	}, &apRuns{}, &apFiledForge{apForge: &apForge{
++		issue: forge.Issue{
++			Description: "Fix the filed issue, preserving this description.",
++			Labels:      []string{"agent-found", "uzi", apLabel},
++		},
++	}}
++}
++
++func detectFiled(st *apStore, runs *apRuns, f *apFiledForge) {
++	NewAutopilot(st, runs, apLabeler{label: apLabel}).detect(context.Background(), repoRow(), f)
++}
++
++func assertFiledLabelsRetained(t *testing.T, f *apFiledForge) {
++	t.Helper()
++	if f.labelWrites != 0 || !slices.Equal(f.issue.Labels, []string{"agent-found", "uzi", apLabel}) {
++		t.Fatalf("filed eligibility changed: label writes=%d labels=%v", f.labelWrites, f.issue.Labels)
++	}
++}
++
++func assertFiledStart(t *testing.T, runs *apRuns, f *apFiledForge) {
++	t.Helper()
++	if len(runs.calls) != 1 {
++		t.Fatalf("CreateAutopilotRun calls = %+v, want one", runs.calls)
++	}
++	c := runs.calls[0]
++	if c.userID != apUserID || c.repoID != apRepoID || c.iid != 7 || c.desc != f.issue.Description {
++		t.Fatalf("run call = %+v, want owner/repo/issue and fresh description", c)
++	}
++}
++
++func TestAutopilotFiledLabelCandidates(t *testing.T) {
++	cases := []struct {
++		name, human, adder, author string
++		enabled                    bool
++		events                     []forge.LabelEvent
++		wantRun, wantComment       bool
++	}{
++		{name: "enabled owner adder", human: "alice", adder: "alice", author: "filing-bot", enabled: true, wantRun: true},
++		{name: "cached author fallback", human: "alice", adder: "repo-pat", author: "alice", enabled: true, wantRun: true},
++		{name: "disabled owner", human: "alice", adder: "alice", author: "alice", wantComment: true},
++		{name: "bot PAT is neither human adder nor author", human: "alice", adder: "repo-bot", author: "repo-bot", enabled: true, wantComment: true},
++		{name: "other actor and author", human: "alice", adder: "bob", author: "carol", enabled: true, wantComment: true},
++		{name: "empty declared human mapping", adder: "alice", author: "alice", enabled: true, wantComment: true},
++		{name: "no add event", human: "alice", author: "alice", enabled: true},
++		{name: "latest event removed", human: "alice", author: "alice", enabled: true, events: []forge.LabelEvent{addEvt(100, "alice"), remEvt(105, "alice")}},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			st, runs, f := filedCandidate(tc.author)
++			st.cc = ccOwner(tc.human, tc.enabled, true)
++			if tc.human == "" {
++				// The existing no-mapping test covers NULL; exercise a declared empty value here.
++				st.cc.HumanUsername.Valid = true
++			}
++			events := tc.events
++			if tc.adder != "" {
++				events = []forge.LabelEvent{addEvt(100, tc.adder)}
++			}
++			f.events = map[int64][]forge.LabelEvent{7: events}
++			// A fresh forge author must not replace the cached attribution input.
++			f.issue.Author = "fresh-unrelated-actor"
++			detectFiled(st, runs, f)
++			detectFiled(st, runs, f) // Same application is handled only once.
++
++			if tc.wantRun {
++				assertFiledStart(t, runs, f)
++			} else if len(runs.calls) != 0 {
++				t.Fatalf("unexpected run calls: %+v", runs.calls)
++			}
++			wantNotes := 0
++			if tc.wantComment {
++				wantNotes = 1
++			}
++			if len(f.noteAttempts) != wantNotes || len(f.notes) != wantNotes {
++				t.Fatalf("comment attempts=%+v successful=%+v, want %d", f.noteAttempts, f.notes, wantNotes)
++			}
++			if tc.wantComment {
++				note := f.noteAttempts[0]
++				if note.iid != 7 || !strings.Contains(note.body, "autopilot enabled is mapped") || !strings.Contains(note.body, "remove and re-add") {
++					t.Fatalf("missing consent explanation/retry instruction: %+v", note)
++				}
++			}
++			wantRecords := 0
++			if tc.wantRun || tc.wantComment {
++				wantRecords = 1
++			}
++			if len(st.upserts) != wantRecords {
++				t.Fatalf("trigger records=%+v, want %d", st.upserts, wantRecords)
++			}
++			if wantRecords != 0 {
++				got := lastUpsert(t, st)
++				if got.RepoID != apRepoID || got.IssueIid != 7 || got.LastEventID != 100 {
++					t.Fatalf("recorded transition = %+v", got)
++				}
++			}
++			assertFiledLabelsRetained(t, f)
++		})
++	}
++}
++
++func TestAutopilotFiledRefusalEnableReplayThenReAdd(t *testing.T) {
++	for _, failedPost := range []bool{false, true} {
++		name := "comment succeeds"
++		if failedPost {
++			name = "comment POST fails"
++		}
++		t.Run(name, func(t *testing.T) {
++			st, runs, f := filedCandidate("repo-bot")
++			st.cc.AutopilotEnabled = false
++			f.events = map[int64][]forge.LabelEvent{7: {addEvt(100, "alice")}}
++			var ops []string
++			st.ops, runs.ops, f.ops = &ops, &ops, &ops
++			if failedPost {
++				f.noteErr = errors.New("comment POST unavailable")
++			}
++
++			detectFiled(st, runs, f)
++			if len(runs.calls) != 0 || len(st.upserts) != 1 || lastUpsert(t, st).LastEventID != 100 ||
++				len(f.noteAttempts) != 1 || strings.Join(ops, ",") != "record,comment" {
++				t.Fatalf("refusal must record then attempt one comment: runs=%+v records=%+v attempts=%+v ops=%v", runs.calls, st.upserts, f.noteAttempts, ops)
++			}
++			if f.noteAttempts[0].iid != 7 || !strings.Contains(f.noteAttempts[0].body, "autopilot enabled is mapped") {
++				t.Fatalf("unexpected refusal: %+v", f.noteAttempts)
++			}
++			wantNotes := 1
++			if failedPost {
++				wantNotes = 0
++			}
++			if len(f.notes) != wantNotes {
++				t.Fatalf("successful comments=%+v, want %d", f.notes, wantNotes)
++			}
++			assertFiledLabelsRetained(t, f)
++
++			st.cc.AutopilotEnabled = true
++			f.noteErr = nil // A recovered POST must still never be retried.
++			detectFiled(st, runs, f)
++			if len(runs.calls) != 0 || len(st.upserts) != 1 || len(f.noteAttempts) != 1 || len(f.notes) != wantNotes {
++				t.Fatalf("enabling must not replay the refused application: runs=%+v records=%+v attempts=%+v notes=%+v", runs.calls, st.upserts, f.noteAttempts, f.notes)
++			}
++
++			f.events[7] = append(f.events[7], remEvt(105, "alice"))
++			detectFiled(st, runs, f)
++			if len(runs.calls) != 0 || len(st.upserts) != 1 || len(f.noteAttempts) != 1 {
++				t.Fatal("removal must not start, record or comment")
++			}
++			f.events[7] = append(f.events[7], addEvt(110, "alice"))
++			detectFiled(st, runs, f)
++			detectFiled(st, runs, f)
++			assertFiledStart(t, runs, f)
++			if len(st.upserts) != 2 || lastUpsert(t, st).LastEventID != 110 || len(f.noteAttempts) != 1 || len(f.notes) != wantNotes ||
++				strings.Join(ops, ",") != "record,comment,create,record" {
++				t.Fatalf("re-add must start exactly once: records=%+v attempts=%+v notes=%+v ops=%v", st.upserts, f.noteAttempts, f.notes, ops)
++			}
++			assertFiledLabelsRetained(t, f)
++		})
++	}
++}
+diff --git a/api/internal/poller/autopilot_test.go b/api/internal/poller/autopilot_test.go
+index df8a89b1..a5e1c367 100644
+--- a/api/internal/poller/autopilot_test.go
++++ b/api/internal/poller/autopilot_test.go
+@@ -142,14 +142,15 @@ type apNote struct {
+ 
+ type apForge struct {
+ 	forgetest.BaseFake
+-	fetches   int
+-	events    map[int64][]forge.LabelEvent
+-	eventsErr error
+-	issue     forge.Issue
+-	issueErr  error
+-	notes     []apNote
+-	noteErr   error
+-	ops       *[]string
++	fetches      int
++	events       map[int64][]forge.LabelEvent
++	eventsErr    error
++	issue        forge.Issue
++	issueErr     error
++	notes        []apNote
++	noteAttempts []apNote
++	noteErr      error
++	ops          *[]string
+ }
+ 
+ func (f *apForge) ListIssueLabelEvents(_ context.Context, _, iid int64) ([]forge.LabelEvent, error) {
+@@ -165,13 +166,14 @@ func (f *apForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Issue,
+ 	return issue, f.issueErr
+ }
+ func (f *apForge) CreateIssueNote(_ context.Context, _, iid int64, body string) (forge.IssueNote, error) {
++	f.noteAttempts = append(f.noteAttempts, apNote{iid, body})
++	if f.ops != nil {
++		*f.ops = append(*f.ops, "comment")
++	}
+ 	if f.noteErr != nil {
+ 		return forge.IssueNote{}, f.noteErr
+ 	}
+ 	f.notes = append(f.notes, apNote{iid, body})
+-	if f.ops != nil {
+-		*f.ops = append(*f.ops, "comment")
+-	}
+ 	return forge.IssueNote{ID: 1, Body: body}, nil
+ }
+ 
+diff --git a/api/internal/uzicli/client.go b/api/internal/uzicli/client.go
+index 9247ec1e..4c75da2a 100644
+--- a/api/internal/uzicli/client.go
++++ b/api/internal/uzicli/client.go
+@@ -574,12 +574,12 @@ type Client interface {
+ 	// is an EMPTY list (no existence oracle), never a 404.
+ 	ListFindings(ctx context.Context, bucket, repo, run string) (apitypes.IncidentalFindingBacklogDTO, error)
+ 	// FileFinding files a forge issue from one finding coordinate (PRD #333 M6): POST
+-	// /api/findings/{id}/issue with an empty body, so the server files with the STORED,
++	// /api/findings/{id}/issue with {} unless sendToUzi adds send_to_uzi:true. The server uses the STORED,
+ 	// already-sanitised template and the server-mandated marker label (the CLI is not the rich
+ 	// editor — the web is, D4/D5). Returns the created forge issue (iid/web_url) and any
+ 	// created-with-warning note. An unknown/foreign id is a 404 (exit 4); an already-filed or
+ 	// mid-filing coordinate is a 409 (exit 5) — both come straight from statusError.
+-	FileFinding(ctx context.Context, id string) (apitypes.IncidentalFindingFileResultDTO, error)
++	FileFinding(ctx context.Context, id string, sendToUzi bool) (apitypes.IncidentalFindingFileResultDTO, error)
+ 	// FindingIssueDraft reads the issue draft for one finding (GET /api/findings/{id}/issue-draft,
+ 	// keyed on the EVIDENCE id). The CLI uses it only for DispositionID, which resolves any
+ 	// (possibly older) evidence id to its coordinate's disposition so a group file can dedupe.
+@@ -588,11 +588,12 @@ type Client interface {
+ 	// GetFindingGroupIssueDraft previews one issue for multiple disposition IDs.
+ 	GetFindingGroupIssueDraft(ctx context.Context, dispositionIDs []string) (apitypes.FindingGroupDraftDTO, error)
+ 	// FileFindingGroup files ONE forge issue from several coordinates (issue #1724): POST
+-	// /api/findings/issue {ids} keyed on DISPOSITION ids, with the server's default text. The bool
++	// /api/findings/issue {ids} keyed on DISPOSITION ids, optionally adding send_to_uzi:true,
++	// with the server's default text. The returned bool
+ 	// is true on a 202 (the filing has not settled: pre_call/in_flight/returned_uncertain, no
+ 	// Issue), false on a 201. A 409 (a coordinate is not fileable) is exit 5, 400 exit 2, 404
+ 	// exit 4, all straight from statusError.
+-	FileFindingGroup(ctx context.Context, dispositionIDs []string) (res apitypes.FindingGroupFileResultDTO, accepted bool, err error)
++	FileFindingGroup(ctx context.Context, dispositionIDs []string, sendToUzi bool) (res apitypes.FindingGroupFileResultDTO, accepted bool, err error)
+ 	// ReleaseFindingGroup releases a stuck group filing operation after the owner confirmed no
+ 	// issue exists (POST /api/findings/filing-operations/{op}/release {confirmed_absent:true}).
+ 	// A 409 (cannot be released) is exit 5, an unknown operation exit 4.
+@@ -646,7 +647,7 @@ type Client interface {
+ 	GetReviewIssueDraft(ctx context.Context, runID, recID string) (apitypes.IssueDraftDTO, error)
+ 	// FileReviewIssue files a forge issue from one judge recommendation (PRD #365 M2): POST
+ 	// /api/runs/{runID}/review/recommendations/{recID}/issue with {repo_id,title,description}
+-	// (all three required — unlike FileFinding's empty body, the CLI sends the draft defaults
++	// (all three required — unlike FileFinding's default empty body, the CLI sends the draft defaults
+ 	// it just fetched). Owner-or-admin to READ the recommendation, caller-owns-repo to WRITE.
+ 	// Returns the created forge issue (iid/web_url/title) and any created-with-warning note.
+ 	// A foreign/unknown run or rec is a 404 (exit 4); an already-filed or mid-filing
+diff --git a/api/internal/uzicli/client_review.go b/api/internal/uzicli/client_review.go
+index f1dfb222..295a19be 100644
+--- a/api/internal/uzicli/client_review.go
++++ b/api/internal/uzicli/client_review.go
+@@ -117,13 +117,16 @@ func (c *HTTPClient) ListFindings(ctx context.Context, bucket, repo, run string)
+ 	return out, nil
+ }
+ 
+-func (c *HTTPClient) FileFinding(ctx context.Context, id string) (apitypes.IncidentalFindingFileResultDTO, error) {
+-	// An empty JSON object body: the file endpoint resolves title/description from the STORED,
++func (c *HTTPClient) FileFinding(ctx context.Context, id string, sendToUzi bool) (apitypes.IncidentalFindingFileResultDTO, error) {
++	// An empty JSON object unless sendToUzi is true: the endpoint resolves text from the STORED,
+ 	// already-sanitised finding row (D4) and assembles labels server-side (D5), so the CLI sends
+ 	// no edits — the web is the rich editor, the CLI files defaults. postJSON routes a non-2xx
+ 	// through statusError, so 404→ExitNotFound and 409→ExitConflict come for free.
+ 	var out apitypes.IncidentalFindingFileResultDTO
+-	if err := c.postJSON(ctx, "/api/findings/"+url.PathEscape(id)+"/issue", struct{}{}, &out); err != nil {
++	req := struct {
++		SendToUzi bool `json:"send_to_uzi,omitempty"`
++	}{SendToUzi: sendToUzi}
++	if err := c.postJSON(ctx, "/api/findings/"+url.PathEscape(id)+"/issue", req, &out); err != nil {
+ 		return apitypes.IncidentalFindingFileResultDTO{}, err
+ 	}
+ 	return out, nil
+@@ -146,11 +149,12 @@ func (c *HTTPClient) GetFindingGroupIssueDraft(ctx context.Context, dispositionI
+ 	return out, nil
+ }
+ 
+-func (c *HTTPClient) FileFindingGroup(ctx context.Context, dispositionIDs []string) (apitypes.FindingGroupFileResultDTO, bool, error) {
+-	// Only ids are sent: the server renders the default group text. doJSONRead (not postJSON) so
++func (c *HTTPClient) FileFindingGroup(ctx context.Context, dispositionIDs []string, sendToUzi bool) (apitypes.FindingGroupFileResultDTO, bool, error) {
++	// Send ids and the optional sendToUzi opt-in; the server renders the default group text.
++	// Use doJSONRead (not postJSON) so
+ 	// the 201/202 split stays visible; decode2xx already accepts any 2xx and maps the rest.
+ 	const path = "/api/findings/issue"
+-	resp, body, err := c.doJSONRead(ctx, http.MethodPost, path, apitypes.FindingGroupFileRequest{IDs: dispositionIDs})
++	resp, body, err := c.doJSONRead(ctx, http.MethodPost, path, apitypes.FindingGroupFileRequest{IDs: dispositionIDs, SendToUzi: sendToUzi})
+ 	if err != nil {
+ 		return apitypes.FindingGroupFileResultDTO{}, false, err
+ 	}
+@@ -270,7 +274,7 @@ func (c *HTTPClient) GetReviewIssueDraft(ctx context.Context, runID, recID strin
+ }
+ 
+ func (c *HTTPClient) FileReviewIssue(ctx context.Context, runID, recID, repoID, title, description string) (ReviewIssueFileResult, error) {
+-	// Unlike FileFinding's empty body, the review file endpoint decodes fileIssueRequest
++	// Unlike FileFinding's default empty body, the review file endpoint decodes fileIssueRequest
+ 	// {repo_id,title,description} — all three required — so the CLI sends the draft defaults it
+ 	// just fetched (the web is the rich editor). postJSON routes a non-2xx through statusError,
+ 	// so 404→ExitNotFound and 409→ExitConflict come for free.
+diff --git a/api/internal/uzicli/client_review_test.go b/api/internal/uzicli/client_review_test.go
+index 507e16c4..e0988eb7 100644
+--- a/api/internal/uzicli/client_review_test.go
++++ b/api/internal/uzicli/client_review_test.go
+@@ -3,6 +3,7 @@ package uzicli
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -247,6 +248,48 @@ func TestGetFindingGroupIssueDraftStatusMapping(t *testing.T) {
+ 	}
+ }
+ 
++func TestFileFindingSendToUziWire(t *testing.T) {
++	for _, group := range []bool{false, true} {
++		for _, send := range []bool{false, true} {
++			t.Run(fmt.Sprintf("group=%v/send=%v", group, send), func(t *testing.T) {
++				var method, path, body string
++				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++					method, path = r.Method, r.URL.EscapedPath()
++					b, _ := io.ReadAll(r.Body)
++					body = string(b)
++					w.WriteHeader(http.StatusCreated)
++					_, _ = w.Write([]byte(`{"issue":{"iid":7,"title":"filed"}}`))
++				}))
++				defer srv.Close()
++				c := newTestClient(srv)
++				wantBody, wantPath := "{}", "/api/findings/f%2F1/issue"
++				if group {
++					wantPath = "/api/findings/issue"
++					wantBody = `{"ids":["a","b"]}`
++					if send {
++						wantBody = `{"ids":["a","b"],"send_to_uzi":true}`
++					}
++					res, accepted, err := c.FileFindingGroup(context.Background(), []string{"a", "b"}, send)
++					if err != nil || accepted || res.Issue == nil || res.Issue.IID != 7 {
++						t.Fatalf("res=%+v accepted=%v err=%v", res, accepted, err)
++					}
++				} else {
++					if send {
++						wantBody = `{"send_to_uzi":true}`
++					}
++					res, err := c.FileFinding(context.Background(), "f/1", send)
++					if err != nil || res.Issue.IID != 7 {
++						t.Fatalf("res=%+v err=%v", res, err)
++					}
++				}
++				if method != http.MethodPost || path != wantPath || body != wantBody {
++					t.Errorf("method=%q path=%q body=%q want POST %s %s", method, path, body, wantPath, wantBody)
++				}
++			})
++		}
++	}
++}
++
+ func TestFileFindingGroupWire(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		status   int
+@@ -264,7 +307,7 @@ func TestFileFindingGroupWire(t *testing.T) {
+ 			w.WriteHeader(tc.status)
+ 			_, _ = w.Write([]byte(tc.body))
+ 		}))
+-		res, accepted, err := newTestClient(srv).FileFindingGroup(context.Background(), []string{"a", "b"})
++		res, accepted, err := newTestClient(srv).FileFindingGroup(context.Background(), []string{"a", "b"}, false)
+ 		srv.Close()
+ 		if err != nil {
+ 			t.Fatalf("%d: %v", tc.status, err)
+@@ -284,7 +327,7 @@ func TestFileFindingGroupStatusMapping(t *testing.T) {
+ 			w.WriteHeader(status)
+ 			_, _ = w.Write([]byte(`{"error":"x"}`))
+ 		}))
+-		_, _, err := newTestClient(srv).FileFindingGroup(context.Background(), []string{"a"})
++		_, _, err := newTestClient(srv).FileFindingGroup(context.Background(), []string{"a"}, false)
+ 		srv.Close()
+ 		var ee *ExitError
+ 		if !errors.As(err, &ee) || ee.Code != want {
+diff --git a/api/internal/uzicli/fake.go b/api/internal/uzicli/fake.go
+index 8941658f..19d0d2de 100644
+--- a/api/internal/uzicli/fake.go
++++ b/api/internal/uzicli/fake.go
+@@ -495,27 +495,29 @@ type FakeClient struct {
+ 	LastFindingsRepo   string
+ 	LastFindingsRun    string
+ 
+-	FileFindingResult apitypes.IncidentalFindingFileResultDTO
+-	LastFileFindingID string
+-	FileFindingErr    error
++	FileFindingResult        apitypes.IncidentalFindingFileResultDTO
++	LastFileFindingID        string
++	LastFileFindingSendToUzi bool
++	FileFindingErr           error
+ 
+ 	// Grouped filing (issue #1724). FindingDrafts maps an evidence id to its canned issue draft
+ 	// (an id with no entry is a 404); FileFindingGroup captures the disposition ids and returns
+ 	// FileFindingGroupResult with FileFindingGroupAccepted as the 201/202 flag;
+ 	// ReleaseFindingGroup captures the operation id. *Err fields win over Err.
+-	FindingDrafts             map[string]apitypes.IncidentalFindingIssueDraftDTO
+-	LastFindingDraftIDs       []string
+-	FindingIssueDraftErr      error
+-	FindingGroupDraftResult   apitypes.FindingGroupDraftDTO
+-	LastFindingGroupDraftIDs  []string
+-	FindingGroupDraftErr      error
+-	FileFindingGroupResult    apitypes.FindingGroupFileResultDTO
+-	FileFindingGroupAccepted  bool
+-	LastFileFindingGroupIDs   []string
+-	FileFindingGroupErr       error
+-	ReleaseFindingGroupResult apitypes.FindingGroupReleaseResultDTO
+-	LastReleaseFindingGroupOp string
+-	ReleaseFindingGroupErr    error
++	FindingDrafts                 map[string]apitypes.IncidentalFindingIssueDraftDTO
++	LastFindingDraftIDs           []string
++	FindingIssueDraftErr          error
++	FindingGroupDraftResult       apitypes.FindingGroupDraftDTO
++	LastFindingGroupDraftIDs      []string
++	FindingGroupDraftErr          error
++	FileFindingGroupResult        apitypes.FindingGroupFileResultDTO
++	FileFindingGroupAccepted      bool
++	LastFileFindingGroupIDs       []string
++	LastFileFindingGroupSendToUzi bool
++	FileFindingGroupErr           error
++	ReleaseFindingGroupResult     apitypes.FindingGroupReleaseResultDTO
++	LastReleaseFindingGroupOp     string
++	ReleaseFindingGroupErr        error
+ 
+ 	LastDismissFindingID     string
+ 	LastDismissFindingReason string
+@@ -721,8 +723,9 @@ func (f *FakeClient) FindingIssueDraft(_ context.Context, evidenceID string) (ap
+ }
+ 
+ // FileFindingGroup records the disposition ids and returns the canned result and accepted flag.
+-func (f *FakeClient) FileFindingGroup(_ context.Context, dispositionIDs []string) (apitypes.FindingGroupFileResultDTO, bool, error) {
++func (f *FakeClient) FileFindingGroup(_ context.Context, dispositionIDs []string, sendToUzi bool) (apitypes.FindingGroupFileResultDTO, bool, error) {
+ 	f.LastFileFindingGroupIDs = append([]string(nil), dispositionIDs...)
++	f.LastFileFindingGroupSendToUzi = sendToUzi
+ 	if f.FileFindingGroupErr != nil {
+ 		return apitypes.FindingGroupFileResultDTO{}, false, f.FileFindingGroupErr
+ 	}
+diff --git a/api/internal/uzicli/fake_review.go b/api/internal/uzicli/fake_review.go
+index 3f17e623..d979fa4c 100644
+--- a/api/internal/uzicli/fake_review.go
++++ b/api/internal/uzicli/fake_review.go
+@@ -75,8 +75,9 @@ func (f *FakeClient) ListFindings(_ context.Context, bucket, repo, run string) (
+ // FileFinding records the id it was asked to file and returns the canned result. FileFindingErr
+ // wins over the blanket Err so a test can model a 409/404 on the WRITE precisely, while the id
+ // capture still proves the write was reached.
+-func (f *FakeClient) FileFinding(_ context.Context, id string) (apitypes.IncidentalFindingFileResultDTO, error) {
++func (f *FakeClient) FileFinding(_ context.Context, id string, sendToUzi bool) (apitypes.IncidentalFindingFileResultDTO, error) {
+ 	f.LastFileFindingID = id
++	f.LastFileFindingSendToUzi = sendToUzi
+ 	if f.FileFindingErr != nil {
+ 		return apitypes.IncidentalFindingFileResultDTO{}, f.FileFindingErr
+ 	}
+diff --git a/api/internal/uzidocs/embed/cli.md b/api/internal/uzidocs/embed/cli.md
+index 20e17feb..1f3583c4 100644
+--- a/api/internal/uzidocs/embed/cli.md
++++ b/api/internal/uzidocs/embed/cli.md
+@@ -147,7 +147,7 @@ uzi review undo <id> <rec> | stats [--json]
+ uzi review file <id> <rec> [--repo <repo-id>]
+ uzi findings list [--repo <id>] [--bucket to_file|filed|done|dismissed|all] [--run <id>]
+ uzi findings draft <finding-id> [<finding-id>...] [--json]
+-uzi findings file <finding-id> [<finding-id>...]
++uzi findings file <finding-id> [<finding-id>...] [--send-to-uzi]
+ uzi findings release <operation-id> --confirm-no-issue
+ uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
+ uzi findings resolve <finding-id>
+@@ -2223,6 +2223,8 @@ uzi findings draft <finding-id>                               # preview one issu
+ uzi findings draft <finding-id> <finding-id> ...              # preview one grouped issue
+ uzi findings file <finding-id>                               # file a forge issue from a coordinate
+ uzi findings file <finding-id> <finding-id> ...              # file ONE issue for several coordinates
++uzi findings file <finding-id> --send-to-uzi                 # file and request run labels
++uzi findings file <finding-id> <finding-id> ... --send-to-uzi # same for a group
+ uzi findings release <operation-id> --confirm-no-issue       # free a group filing that never confirmed
+ uzi findings dismiss <finding-id> --reason wont-do           # valid, not worth doing
+ uzi findings dismiss <finding-id> --reason not-an-issue      # false positive
+@@ -2258,6 +2260,34 @@ group draft includes assembled labels, including the mandatory marker label,
+ but unedited CLI filing sends only the explicit ids and the server applies its
+ mandatory marker label. Use explicit ids with `file`; there is no `--run` shortcut.
+ 
++`file --send-to-uzi` requests the configured run-eligibility label
++(`UziLabel`, default `uzi`) and autopilot label (`AutopilotLabel`, default
++`autopilot`) for either a single or grouped filing. The server appends them,
++deduplicated, after the mandatory finding marker and sanitized, capped explicit
++labels, without displacing accepted explicit labels. Omitting the flag keeps
++filing unchanged. Stored agent suggestions do not automatically attach; manual
++label selection in the web draft remains available.
++
++In human output, a confirmed issue filed with the flag also prints
++"Queued for uzi: starts on the next sync if autopilot is on", followed by
++"Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi."
++An uncertain group result without a confirmed issue prints no queued confirmation;
++the pending-operation and release guidance below still applies. JSON output keeps
++the existing result DTO.
++
++This is a label request evaluated on the next normal repo sync, not a guaranteed
++run or an autopilot opt-in. The repo owner's connection PAT supplies the forge
++issue author and label-event actor, which need not match the browser user.
++The owner must already have autopilot enabled and a nonempty `human_username`
++matching the event adder or, as fallback, the issue author; repo ownership and
++opt-in alone do not suffice if both mismatch. A consent refusal records the
++event and attempts one explanatory comment, leaving manual **Start run**
++available. Enabling autopilot after a handled refusal requires removing and
++re-adding its label. A missing current label-add event waits without a run or
++comment. Existing credential, harness, active-run, open-PR and description-size
++checks remain in force. See [sending a finding to uzi](./findings.md#sending-the-filed-issue-to-uzi)
++and [Autopilot](./autopilot.md).
++
+ `file` turns one coordinate into a real forge issue on **your own** connection. The
+ title, description and labels are assembled server-side from the stored, sanitised
+ finding plus a mandatory marker label, so the CLI files the defaults — editing the
+diff --git a/api/internal/uzidocs/embed/findings.md b/api/internal/uzidocs/embed/findings.md
+index f1ae48b2..a23f5fed 100644
+--- a/api/internal/uzidocs/embed/findings.md
++++ b/api/internal/uzidocs/embed/findings.md
+@@ -52,6 +52,42 @@ labels you pick. Click **Edit & file** first if you want to change the title,
+ description, or labels before it's created. Either way, a filed finding links
+ back to the issue it became.
+ 
++### Sending the filed issue to uzi
++
++In the single-finding **Edit & file** draft or the **File as one issue**
++draft, check **Send to uzi** to request automatic work on the filed issue.
++It starts unchecked. Leaving it unchecked keeps filing unchanged, including
++any labels you deliberately select; stored agent label suggestions do not
++automatically attach.
++
++With the checkbox checked, the server keeps the mandatory finding marker and
++your sanitized, capped explicit label selection, then appends the configured
++run-eligibility label (`UziLabel`, default `uzi`) and autopilot label
++(`AutopilotLabel`, default `autopilot`), deduplicated without displacing
++accepted explicit labels. You can still select run labels manually.
++
++The help text reads: "Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi."
++
++After a confirmed filing with this option, the result reads:
++"Queued for uzi: starts on the next sync if autopilot is on".
++This confirms a label request, not a run: the next normal repo sync evaluates
++[Autopilot](./autopilot.md). Filing does not directly start a run or enable
++autopilot.
++
++The issue is filed through the repo owner's forge connection PAT. The forge
++issue author and autopilot-label event actor therefore need not be the person
++using the browser. The connection's owner must already have autopilot enabled
++and a nonempty `human_username` matching the label-event adder, or the issue
++author as fallback. Owning the repo with autopilot enabled is insufficient
++when both forge identities mismatch.
++
++A consent refusal records the handled label-add event and attempts one
++explanatory comment; the issue stays eligible for a manual **Start run**.
++Enabling autopilot after that handled refusal requires removing and re-adding
++the autopilot label to retry. If no current label-add event is available, the
++poller waits without starting a run or commenting. Existing credential,
++harness, active-run, open-PR and description-size checks still apply.
++
+ ### Filing several findings as one issue
+ 
+ When several findings share a root cause, tick their rows and click **File as
+@@ -68,7 +104,9 @@ the whole group instead of leaving it half filed. The issue carries a hidden
+ marker that lets uzi recognize it later.
+ 
+ If uzi cannot confirm whether the forge created the issue, the page shows the
+-operation id and tells you to check the forge. uzi's repo sync settles the group
++operation id and tells you to check the forge. An uncertain result with no
++confirmed issue does not show the queued confirmation, even if **Send to uzi**
++was checked. uzi's repo sync settles the group
+ by itself once it finds the marked issue. If you find no issue on the forge
+ after the operation's deadline, release the findings with
+ [`uzi findings release`](./cli.md#incidental-findings-uzi-findings) and file
+@@ -170,6 +208,8 @@ uzi findings draft <finding-id>                          # preview without filin
+ uzi findings draft <finding-id> <finding-id> ...         # preview a grouped issue
+ uzi findings file <finding-id>                           # file it
+ uzi findings file <finding-id> <finding-id> ...          # file several as one issue
++uzi findings file <finding-id> --send-to-uzi             # file and request run labels
++uzi findings file <finding-id> <finding-id> ... --send-to-uzi  # same for a group
+ uzi findings release <operation-id> --confirm-no-issue   # free a group filing that never confirmed
+ uzi findings dismiss <finding-id> --reason wont-do       # or not-an-issue
+ uzi findings resolve <finding-id>                        # mark it done yourself
+@@ -190,7 +230,10 @@ a blank line and body; `--json` returns the exact server draft DTO. A group
+ preview omits the filing-time operation marker; filing may trim evidence at a
+ UTF-8-safe boundary to make room for it. Draft labels are suggestions: the
+ group includes assembled labels with the mandatory marker label, while unedited
+-CLI filing sends only explicit ids and the server applies that label. Preview
++CLI filing sends only explicit ids and the server applies that label.
++Adding `--send-to-uzi` to single or grouped `file` requests the two configured
++run labels described [above](#sending-the-filed-issue-to-uzi); omitting the flag
++keeps the default filing behavior. It does not copy stored suggestions. Preview
+ is read-only; pass explicit ids to `file` too, with no `--run` shortcut.
+ 
+ Give `file` several ids of one repo to file one issue for all of them (see
+diff --git a/docs/cli.md b/docs/cli.md
+index 20e17feb..1f3583c4 100644
+--- a/docs/cli.md
++++ b/docs/cli.md
+@@ -147,7 +147,7 @@ uzi review undo <id> <rec> | stats [--json]
+ uzi review file <id> <rec> [--repo <repo-id>]
+ uzi findings list [--repo <id>] [--bucket to_file|filed|done|dismissed|all] [--run <id>]
+ uzi findings draft <finding-id> [<finding-id>...] [--json]
+-uzi findings file <finding-id> [<finding-id>...]
++uzi findings file <finding-id> [<finding-id>...] [--send-to-uzi]
+ uzi findings release <operation-id> --confirm-no-issue
+ uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
+ uzi findings resolve <finding-id>
+@@ -2223,6 +2223,8 @@ uzi findings draft <finding-id>                               # preview one issu
+ uzi findings draft <finding-id> <finding-id> ...              # preview one grouped issue
+ uzi findings file <finding-id>                               # file a forge issue from a coordinate
+ uzi findings file <finding-id> <finding-id> ...              # file ONE issue for several coordinates
++uzi findings file <finding-id> --send-to-uzi                 # file and request run labels
++uzi findings file <finding-id> <finding-id> ... --send-to-uzi # same for a group
+ uzi findings release <operation-id> --confirm-no-issue       # free a group filing that never confirmed
+ uzi findings dismiss <finding-id> --reason wont-do           # valid, not worth doing
+ uzi findings dismiss <finding-id> --reason not-an-issue      # false positive
+@@ -2258,6 +2260,34 @@ group draft includes assembled labels, including the mandatory marker label,
+ but unedited CLI filing sends only the explicit ids and the server applies its
+ mandatory marker label. Use explicit ids with `file`; there is no `--run` shortcut.
+ 
++`file --send-to-uzi` requests the configured run-eligibility label
++(`UziLabel`, default `uzi`) and autopilot label (`AutopilotLabel`, default
++`autopilot`) for either a single or grouped filing. The server appends them,
++deduplicated, after the mandatory finding marker and sanitized, capped explicit
++labels, without displacing accepted explicit labels. Omitting the flag keeps
++filing unchanged. Stored agent suggestions do not automatically attach; manual
++label selection in the web draft remains available.
++
++In human output, a confirmed issue filed with the flag also prints
++"Queued for uzi: starts on the next sync if autopilot is on", followed by
++"Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi."
++An uncertain group result without a confirmed issue prints no queued confirmation;
++the pending-operation and release guidance below still applies. JSON output keeps
++the existing result DTO.
++
++This is a label request evaluated on the next normal repo sync, not a guaranteed
++run or an autopilot opt-in. The repo owner's connection PAT supplies the forge
++issue author and label-event actor, which need not match the browser user.
++The owner must already have autopilot enabled and a nonempty `human_username`
++matching the event adder or, as fallback, the issue author; repo ownership and
++opt-in alone do not suffice if both mismatch. A consent refusal records the
++event and attempts one explanatory comment, leaving manual **Start run**
++available. Enabling autopilot after a handled refusal requires removing and
++re-adding its label. A missing current label-add event waits without a run or
++comment. Existing credential, harness, active-run, open-PR and description-size
++checks remain in force. See [sending a finding to uzi](./findings.md#sending-the-filed-issue-to-uzi)
++and [Autopilot](./autopilot.md).
++
+ `file` turns one coordinate into a real forge issue on **your own** connection. The
+ title, description and labels are assembled server-side from the stored, sanitised
+ finding plus a mandatory marker label, so the CLI files the defaults — editing the
+diff --git a/docs/findings.md b/docs/findings.md
+index f1ae48b2..a23f5fed 100644
+--- a/docs/findings.md
++++ b/docs/findings.md
+@@ -52,6 +52,42 @@ labels you pick. Click **Edit & file** first if you want to change the title,
+ description, or labels before it's created. Either way, a filed finding links
+ back to the issue it became.
+ 
++### Sending the filed issue to uzi
++
++In the single-finding **Edit & file** draft or the **File as one issue**
++draft, check **Send to uzi** to request automatic work on the filed issue.
++It starts unchecked. Leaving it unchecked keeps filing unchanged, including
++any labels you deliberately select; stored agent label suggestions do not
++automatically attach.
++
++With the checkbox checked, the server keeps the mandatory finding marker and
++your sanitized, capped explicit label selection, then appends the configured
++run-eligibility label (`UziLabel`, default `uzi`) and autopilot label
++(`AutopilotLabel`, default `autopilot`), deduplicated without displacing
++accepted explicit labels. You can still select run labels manually.
++
++The help text reads: "Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi."
++
++After a confirmed filing with this option, the result reads:
++"Queued for uzi: starts on the next sync if autopilot is on".
++This confirms a label request, not a run: the next normal repo sync evaluates
++[Autopilot](./autopilot.md). Filing does not directly start a run or enable
++autopilot.
++
++The issue is filed through the repo owner's forge connection PAT. The forge
++issue author and autopilot-label event actor therefore need not be the person
++using the browser. The connection's owner must already have autopilot enabled
++and a nonempty `human_username` matching the label-event adder, or the issue
++author as fallback. Owning the repo with autopilot enabled is insufficient
++when both forge identities mismatch.
++
++A consent refusal records the handled label-add event and attempts one
++explanatory comment; the issue stays eligible for a manual **Start run**.
++Enabling autopilot after that handled refusal requires removing and re-adding
++the autopilot label to retry. If no current label-add event is available, the
++poller waits without starting a run or commenting. Existing credential,
++harness, active-run, open-PR and description-size checks still apply.
++
+ ### Filing several findings as one issue
+ 
+ When several findings share a root cause, tick their rows and click **File as
+@@ -68,7 +104,9 @@ the whole group instead of leaving it half filed. The issue carries a hidden
+ marker that lets uzi recognize it later.
+ 
+ If uzi cannot confirm whether the forge created the issue, the page shows the
+-operation id and tells you to check the forge. uzi's repo sync settles the group
++operation id and tells you to check the forge. An uncertain result with no
++confirmed issue does not show the queued confirmation, even if **Send to uzi**
++was checked. uzi's repo sync settles the group
+ by itself once it finds the marked issue. If you find no issue on the forge
+ after the operation's deadline, release the findings with
+ [`uzi findings release`](./cli.md#incidental-findings-uzi-findings) and file
+@@ -170,6 +208,8 @@ uzi findings draft <finding-id>                          # preview without filin
+ uzi findings draft <finding-id> <finding-id> ...         # preview a grouped issue
+ uzi findings file <finding-id>                           # file it
+ uzi findings file <finding-id> <finding-id> ...          # file several as one issue
++uzi findings file <finding-id> --send-to-uzi             # file and request run labels
++uzi findings file <finding-id> <finding-id> ... --send-to-uzi  # same for a group
+ uzi findings release <operation-id> --confirm-no-issue   # free a group filing that never confirmed
+ uzi findings dismiss <finding-id> --reason wont-do       # or not-an-issue
+ uzi findings resolve <finding-id>                        # mark it done yourself
+@@ -190,7 +230,10 @@ a blank line and body; `--json` returns the exact server draft DTO. A group
+ preview omits the filing-time operation marker; filing may trim evidence at a
+ UTF-8-safe boundary to make room for it. Draft labels are suggestions: the
+ group includes assembled labels with the mandatory marker label, while unedited
+-CLI filing sends only explicit ids and the server applies that label. Preview
++CLI filing sends only explicit ids and the server applies that label.
++Adding `--send-to-uzi` to single or grouped `file` requests the two configured
++run labels described [above](#sending-the-filed-issue-to-uzi); omitting the flag
++keeps the default filing behavior. It does not copy stored suggestions. Preview
+ is read-only; pass explicit ids to `file` too, with no `--run` shortcut.
+ 
+ Give `file` several ids of one repo to file one issue for all of them (see
+diff --git a/fixtures/api-contract/file_finding_request.full.json b/fixtures/api-contract/file_finding_request.full.json
+new file mode 100644
+index 00000000..0a9cd8fb
+--- /dev/null
++++ b/fixtures/api-contract/file_finding_request.full.json
+@@ -0,0 +1,8 @@
++{
++  "title": "x",
++  "description": "x",
++  "labels": [
++    "x"
++  ],
++  "send_to_uzi": true
++}
+diff --git a/fixtures/api-contract/file_finding_request.zero.json b/fixtures/api-contract/file_finding_request.zero.json
+new file mode 100644
+index 00000000..7ed8d78d
+--- /dev/null
++++ b/fixtures/api-contract/file_finding_request.zero.json
+@@ -0,0 +1,5 @@
++{
++  "title": null,
++  "description": null,
++  "labels": null
++}
+diff --git a/fixtures/api-contract/finding_group_file_request.full.json b/fixtures/api-contract/finding_group_file_request.full.json
+new file mode 100644
+index 00000000..9affc032
+--- /dev/null
++++ b/fixtures/api-contract/finding_group_file_request.full.json
+@@ -0,0 +1,11 @@
++{
++  "ids": [
++    "x"
++  ],
++  "title": "x",
++  "description": "x",
++  "labels": [
++    "x"
++  ],
++  "send_to_uzi": true
++}
+diff --git a/fixtures/api-contract/finding_group_file_request.zero.json b/fixtures/api-contract/finding_group_file_request.zero.json
+new file mode 100644
+index 00000000..5969de01
+--- /dev/null
++++ b/fixtures/api-contract/finding_group_file_request.zero.json
+@@ -0,0 +1,3 @@
++{
++  "ids": null
++}
+diff --git a/web/src/components/FindingCard.test.tsx b/web/src/components/FindingCard.test.tsx
+index c211044c..ef86bcb5 100644
+--- a/web/src/components/FindingCard.test.tsx
++++ b/web/src/components/FindingCard.test.tsx
+@@ -145,6 +145,7 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
+     const link = await screen.findByRole("link", { name: /Filed #512/ });
+     expect(link.getAttribute("href")).toBe("https://gitlab.example.com/vtmocanu/uzi/-/issues/512");
+     expect(screen.queryByText("Issue filed.")).toBeNull();
++    expect(screen.queryByText(/Queued for uzi/)).toBeNull();
+     // Draft card unmounted on success.
+     expect(screen.queryByText("Draft issue")).toBeNull();
+   });
+@@ -175,11 +176,15 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
+     render(<FindingCard id="find-1" title="Leaked ticker" location="a.go#loop" labels={[]} />);
+ 
+     await openDraft();
++    fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
+     fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
+ 
+     // A warning is a success (the issue exists): the filed chip AND the note both show.
+     await screen.findByRole("link", { name: /Filed #512/ });
+     expect(screen.getByText(/recording it in uzi failed/)).toBeTruthy();
++    expect(mockApi.fileFinding).toHaveBeenCalledWith("find-1", expect.objectContaining({ send_to_uzi: true }));
++    expect(screen.getByText("Queued for uzi: starts on the next sync if autopilot is on")).toBeTruthy();
++    expect(screen.getByText("Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi.")).toBeTruthy();
+   });
+ 
+   it("Dismiss posts the chosen reason and shows the reasoned Dismissed chip", async () => {
+@@ -203,6 +208,7 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
+     const { container } = render(<FindingCard id="find-1" title="Leaked ticker" location="a.go#loop" labels={[]} />);
+ 
+     await openDraft();
++    fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
+     fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
+ 
+     await waitFor(() => expect(screen.getByText(/Already filed or resolved/)).toBeTruthy());
+@@ -210,6 +216,7 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
+     expect(screen.queryByText("Draft issue")).toBeNull();
+     expect(container.textContent).not.toContain("already filed or being filed");
+     expect(screen.getByText("resolved")).toBeTruthy();
++    expect(screen.queryByText(/Queued for uzi/)).toBeNull();
+   });
+ 
+   it("a stale Dismiss that 409s shows the resolved advisory, never a crash", async () => {
+@@ -287,6 +294,7 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
+ 
+     const link = await screen.findByRole("link", { name: /Filed #77/ });
+     expect(link.getAttribute("href")).toBe("https://gitlab.example.com/vtmocanu/uzi/-/issues/77");
++    expect(screen.queryByText(/Queued for uzi/)).toBeNull();
+     // A filed coordinate does not re-offer File issue.
+     expect(screen.queryByRole("button", { name: "File issue" })).toBeNull();
+     // No button replaces the Undo that just unmounted, so focus lands on the Filed #N link rather
+@@ -343,3 +351,17 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
+     expect(container.textContent).toContain("unrenderable finding event");
+   });
+ });
++
++it("keeps the checked choice and edited draft after a forge failure", async () => {
++  mockApi.findingIssueDraft.mockResolvedValue(draftFixture());
++  mockApi.fileFinding.mockRejectedValue(new ApiError(502, "forge unavailable"));
++  render(<FindingCard id="find-1" title="Leaked ticker" location="a.go#loop" labels={[]} />);
++  await openDraft();
++  fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
++  fireEvent.change(screen.getByDisplayValue(draftFixture().title), { target: { value: "keep this title" } });
++  fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
++  await screen.findByText("forge unavailable");
++  expect((screen.getByRole("checkbox", { name: "Send to uzi" }) as HTMLInputElement).checked).toBe(true);
++  expect(screen.getByDisplayValue("keep this title")).toBeTruthy();
++  expect(screen.queryByText(/Queued for uzi/)).toBeNull();
++});
+diff --git a/web/src/components/FindingCard.tsx b/web/src/components/FindingCard.tsx
+index 9662763f..00b8cf88 100644
+--- a/web/src/components/FindingCard.tsx
++++ b/web/src/components/FindingCard.tsx
+@@ -5,7 +5,13 @@ import { Badge } from "./ui";
+ import { BugIcon } from "./icons";
+ import { stripUnsafeChars } from "../lib/safeText";
+ import { TriageActions } from "./triage/TriageActions";
+-import { IssueDraftCard, type IssueDraftSeed, type IssueDraftValues } from "./triage/IssueDraftCard";
++import {
++  IssueDraftCard,
++  SEND_TO_UZI_HELP,
++  SEND_TO_UZI_CONFIRMED,
++  type IssueDraftSeed,
++  type IssueDraftValues,
++} from "./triage/IssueDraftCard";
+ import { TriageStateChip } from "./triage/TriageStateChip";
+ import { TriageDisposedRow } from "./triage/TriageDisposedRow";
+ import { findingState } from "./triage/triageCopy";
+@@ -49,7 +55,7 @@ import { findingState } from "./triage/triageCopy";
+ type FindingCardState =
+   | { kind: "open" }
+   | { kind: "drafting" }
+-  | { kind: "filed"; issue: IncidentalFindingFiledIssue; warning: string }
++  | { kind: "filed"; issue: IncidentalFindingFiledIssue; warning: string; queued?: boolean }
+   | { kind: "dismissed"; reason: "wont_do" | "not_an_issue" }
+   // A human Mark done: the disposition id is what Undo keys on; resolvedAt feeds "resolved Xh ago".
+   | { kind: "done"; dispositionId: string; resolvedAt: string }
+@@ -123,8 +129,14 @@ export function FindingCard({
+         title: values.title,
+         description: values.description,
+         labels: values.labels,
++        ...(values.send_to_uzi ? { send_to_uzi: true } : {}),
++      });
++      setState({
++        kind: "filed",
++        issue: res.issue,
++        warning: res.warning ?? "",
++        queued: values.send_to_uzi === true,
+       });
+-      setState({ kind: "filed", issue: res.issue, warning: res.warning ?? "" });
+       onMutation?.();
+     } catch (e) {
+       if (e instanceof ApiError && e.status === 409) {
+@@ -294,11 +306,17 @@ export function FindingCard({
+         </div>
+ 
+         {state.kind === "drafting" && (
+-          <IssueDraftCard loadDraft={loadDraft} onCreate={onCreate} onCancel={() => setState({ kind: "open" })} />
++          <IssueDraftCard allowSendToUzi loadDraft={loadDraft} onCreate={onCreate} onCancel={() => setState({ kind: "open" })} />
+         )}
+ 
+         {/* Filed shows only the "Filed #N ↗" chip in the state slot; a created-with-warning line
+             (the issue WAS created but its local disposition could not settle) stays under it. */}
++        {state.kind === "filed" && state.queued && (
++          <div className="text-xs text-muted">
++            <p>{SEND_TO_UZI_CONFIRMED}</p>
++            <p>{SEND_TO_UZI_HELP}</p>
++          </div>
++        )}
+         {state.kind === "filed" && state.warning && <p className="text-xs text-muted">{state.warning}</p>}
+ 
+         {state.kind === "dismissed" && (
+diff --git a/web/src/components/triage/IssueDraftCard.test.tsx b/web/src/components/triage/IssueDraftCard.test.tsx
+index 918ffc4f..752e1aea 100644
+--- a/web/src/components/triage/IssueDraftCard.test.tsx
++++ b/web/src/components/triage/IssueDraftCard.test.tsx
+@@ -65,6 +65,7 @@ describe("IssueDraftCard — repo Select mode (judge/run page)", () => {
+     expect(select.value).toBe("repo1");
+     expect(screen.getByText(/Source:/)).toBeTruthy();
+     expect(screen.getByText(/from vlad's worker/)).toBeTruthy();
++    expect(screen.queryByRole("checkbox", { name: "Send to uzi" })).toBeNull();
+     // Labels render.
+     expect(screen.getByText("uzi")).toBeTruthy();
+     expect(screen.getByText("judge")).toBeTruthy();
+@@ -202,3 +203,47 @@ describe("IssueDraftCard — recovery paths", () => {
+     expect(await screen.findByText(/Filed for an earlier version/)).toBeTruthy();
+   });
+ });
++
++describe("IssueDraftCard send to uzi opt-in", () => {
++  it("defaults off, omits unchecked, preserves checked edits after failure and resets on a fresh draft", async () => {
++    const loadDraft = vi.fn().mockResolvedValue(seedFixture());
++    const onCreate = vi.fn().mockRejectedValue(new ApiError(502, "forge unavailable"));
++    const props = { loadDraft, onCreate, onCancel: vi.fn(), allowSendToUzi: true };
++    const view = render(<IssueDraftCard {...props} key="first" />);
++    const check = await screen.findByRole("checkbox", { name: "Send to uzi" }) as HTMLInputElement;
++    expect(check.checked).toBe(false);
++    fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
++    await screen.findByText("forge unavailable");
++    expect(onCreate.mock.calls[0][0]).not.toHaveProperty("send_to_uzi");
++    fireEvent.click(check);
++    expect(screen.queryByText(/No autopilot label/)).toBeNull();
++    fireEvent.change(screen.getByDisplayValue(seedFixture().title), { target: { value: "My edit" } });
++    fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
++    await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(2));
++    await waitFor(() => expect((screen.getByRole("button", { name: "Create issue" }) as HTMLButtonElement).disabled).toBe(false));
++    expect(onCreate.mock.calls[1][0]).toMatchObject({ title: "My edit", send_to_uzi: true });
++    expect(check.checked).toBe(true);
++    expect(screen.getByDisplayValue("My edit")).toBeTruthy();
++    fireEvent.click(check);
++    fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
++    await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(3));
++    await waitFor(() => expect((screen.getByRole("button", { name: "Create issue" }) as HTMLButtonElement).disabled).toBe(false));
++    expect(onCreate.mock.calls[2][0]).not.toHaveProperty("send_to_uzi");
++    fireEvent.click(check);
++    view.rerender(<IssueDraftCard {...props} key="fresh" />);
++    expect((await screen.findByRole("checkbox", { name: "Send to uzi" }) as HTMLInputElement).checked).toBe(false);
++  });
++
++  it("omits a previously checked choice when the opt-in becomes unavailable", async () => {
++    const onCreate = vi.fn().mockResolvedValue(undefined);
++    const props = { loadDraft: async () => seedFixture(), onCreate, onCancel: vi.fn() };
++    const view = render(<IssueDraftCard {...props} allowSendToUzi />);
++    fireEvent.click(await screen.findByRole("checkbox", { name: "Send to uzi" }));
++    view.rerender(<IssueDraftCard {...props} />);
++    expect(screen.queryByRole("checkbox", { name: "Send to uzi" })).toBeNull();
++    expect(screen.getByText(/No autopilot label/)).toBeTruthy();
++    fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
++    await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
++    expect(onCreate.mock.calls[0][0]).not.toHaveProperty("send_to_uzi");
++  });
++});
+diff --git a/web/src/components/triage/IssueDraftCard.tsx b/web/src/components/triage/IssueDraftCard.tsx
+index da663580..0ee122c2 100644
+--- a/web/src/components/triage/IssueDraftCard.tsx
++++ b/web/src/components/triage/IssueDraftCard.tsx
+@@ -1,4 +1,4 @@
+-import { useCallback, useEffect, useRef, useState } from "react";
++import { useCallback, useEffect, useId, useRef, useState } from "react";
+ import { type Repo } from "../../lib/api";
+ import { errorMessage } from "../../lib/apiError";
+ import { stripUnsafeChars } from "../../lib/safeText";
+@@ -33,8 +33,13 @@ export interface IssueDraftValues {
+   title: string;
+   description: string;
+   labels: string[];
++  send_to_uzi?: boolean;
+ }
+ 
++export const SEND_TO_UZI_HELP =
++  "Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi.";
++export const SEND_TO_UZI_CONFIRMED = "Queued for uzi: starts on the next sync if autopilot is on";
++
+ // IssueDraftCard is the single "Draft issue" card for filing a forge issue, serving BOTH
+ // surfaces the PRD folds together: the judge/run page (a repo `Select`, seeded to the draft's
+ // default, with default_note as an info box while none is picked) and the Findings page (a
+@@ -55,6 +60,7 @@ export function IssueDraftCard({
+   repos,
+   fixedRepoLabel,
+   staleWarning,
++  allowSendToUzi = false,
+ }: {
+   loadDraft: () => Promise<IssueDraftSeed>;
+   onCreate: (values: IssueDraftValues) => Promise<void>;
+@@ -65,8 +71,10 @@ export function IssueDraftCard({
+   fixedRepoLabel?: string;
+   // Optional "filed for an earlier version of this recommendation" line under the header.
+   staleWarning?: string;
++  allowSendToUzi?: boolean;
+ }) {
+   const demo = useDemoMode();
++  const sendHelpId = useId();
+   const needsRepo = repos !== undefined;
+ 
+   const [seed, setSeed] = useState<IssueDraftSeed | null>(null);
+@@ -75,6 +83,7 @@ export function IssueDraftCard({
+   const [repoId, setRepoId] = useState("");
+   const [title, setTitle] = useState("");
+   const [description, setDescription] = useState("");
++  const [sendToUzi, setSendToUzi] = useState(false);
+   const [busy, setBusy] = useState(false);
+   const [createErr, setCreateErr] = useState("");
+ 
+@@ -90,6 +99,7 @@ export function IssueDraftCard({
+     try {
+       const s = await loadRef.current();
+       setSeed(s);
++      setSendToUzi(false);
+       setRepoId(s.defaultRepoId ?? "");
+       // Issue #124 / LOW-1: strip Cf/control chars from what UZI supplies, leave what the USER
+       // types alone. These are controlled inputs, so the state IS what gets POSTed — filtering
+@@ -112,7 +122,13 @@ export function IssueDraftCard({
+     setCreateErr("");
+     setBusy(true);
+     try {
+-      await onCreate({ repoId, title, description, labels: seed?.labels ?? [] });
++      await onCreate({
++        repoId,
++        title,
++        description,
++        labels: seed?.labels ?? [],
++        ...(allowSendToUzi && sendToUzi ? { send_to_uzi: true } : {}),
++      });
+       // Success: the surface refetches and stops rendering this card. Nothing more to do here.
+     } catch (e) {
+       // The forge rejected the write: keep the card open with the edits intact.
+@@ -227,12 +243,32 @@ export function IssueDraftCard({
+                   </Badge>
+                 ))}
+               </div>
+-              <p className="text-xs text-faint">
+-                Lands on the board and is startable without a PRD file. No autopilot label — nothing runs until you click
+-                Start.
+-              </p>
++              {!(allowSendToUzi && sendToUzi) && (
++                <p className="text-xs text-faint">
++                  Lands on the board and is startable without a PRD file. No autopilot label — nothing runs until you click
++                  Start.
++                </p>
++              )}
+             </div>
+ 
++            {allowSendToUzi && (
++              <div className="space-y-1">
++                <label className="flex items-center gap-2 text-sm">
++                  <input
++                    type="checkbox"
++                    aria-describedby={sendHelpId}
++                    checked={sendToUzi}
++                    disabled={busy}
++                    onChange={(e) => setSendToUzi(e.target.checked)}
++                  />
++                  Send to uzi
++                </label>
++                <p id={sendHelpId} className="text-xs text-faint">
++                  {SEND_TO_UZI_HELP}
++                </p>
++              </div>
++            )}
++
+             <div className="flex flex-wrap gap-2 pt-0.5">
+               <Button size="sm" disabled={busy || title.trim() === "" || (needsRepo && !repoId)} onClick={create}>
+                 Create issue
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index 69e1e953..6a39906a 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -66,6 +66,8 @@ import type {
+   ProductTokenScope,
+   CreatedIssue,
+   FindingGroupDraft,
++  FileFindingRequest,
++  FindingGroupFileRequest,
+   FindingGroupFileResult,
+   EgressProfile,
+   EgressProfileProblem,
+@@ -1747,7 +1749,7 @@ const realApi = {
+   // user EDITS re-run through the write-boundary sanitisers. A stale card acting on an
+   // already-filed coordinate gets a 409 (the guarded claim), which the caller renders as a
+   // friendly "already filed" state — the backlog is the source of truth.
+-  fileFinding: (id: string, body?: { title?: string; description?: string; labels?: string[] }) =>
++  fileFinding: (id: string, body?: FileFindingRequest) =>
+     request<IncidentalFindingFileResult>("POST", `/findings/${id}/issue`, body ?? {}),
+   // findingGroupIssueDraft reads the deterministic, human-editable draft for filing several
+   // findings as ONE issue (issue #1724). Keyed on DISPOSITION ids, sent as one comma-separated
+@@ -1760,7 +1762,7 @@ const realApi = {
+   // created issue; 202 returns the same shape WITHOUT `issue` (uncertain or stopped: `warning` says
+   // to inspect the forge), which request() decodes like any 2xx. 409 = a member was already filed
+   // or is being filed; 502 = the forge rejected the create.
+-  fileFindingGroup: (body: { ids: string[]; title?: string; description?: string; labels?: string[] }) =>
++  fileFindingGroup: (body: FindingGroupFileRequest) =>
+     request<FindingGroupFileResult>("POST", "/findings/issue", body),
+   // dismissFinding triages one coordinate to `dismissed` with a required reason from the
+   // closed enum (M5). A LOCAL write — no forge call, no token spend. Keys on the evidence
+diff --git a/web/src/lib/apiContract.test.ts b/web/src/lib/apiContract.test.ts
+index 0ac9ab09..c6628b7b 100644
+--- a/web/src/lib/apiContract.test.ts
++++ b/web/src/lib/apiContract.test.ts
+@@ -1,3 +1,8 @@
++import type { FileFindingRequest, FindingGroupFileRequest } from "./apiTypes";
++import fileFindingRequestZero from "../../../fixtures/api-contract/file_finding_request.zero.json";
++import fileFindingRequestFull from "../../../fixtures/api-contract/file_finding_request.full.json";
++import findingGroupFileRequestZero from "../../../fixtures/api-contract/finding_group_file_request.zero.json";
++import findingGroupFileRequestFull from "../../../fixtures/api-contract/finding_group_file_request.full.json";
+ import { describe, expect, it } from "vitest";
+ import type { PlanCrossCheckSummary } from "./apiTypes";
+ import { readFileSync } from "node:fs";
+@@ -1603,6 +1608,8 @@ const dtos: { stem: string; nullable: boolean }[] = [
+   // resolved_at) are ALL omitempty, so its zero.json carries no null — the same shape as
+   // AgentMemoryDTO, declared nullable:false rather than manufacturing a null by dropping an
+   // existing field's omitempty (which would change the live findings wire).
++  { stem: "file_finding_request", nullable: true },
++  { stem: "finding_group_file_request", nullable: true },
+   { stem: "finding", nullable: false },
+   // PRD #1255 M2a — the forge-view read DTOs.
+   // pull: conflicts + run_id are nullable, so zero.json carries a null.
+@@ -1775,3 +1782,31 @@ it("release-check partial is omitted at zero and true when populated", () => {
+   expect(releaseCheckStatusZero).not.toHaveProperty("partial");
+   expect(releaseCheckStatusFull.partial).toBe(true);
+ });
++
++
++{
++  const missing: never = null as unknown as Exclude<keyof FileFindingRequest, keyof typeof fileFindingRequestFull>;
++  const extra: never = null as unknown as Exclude<keyof typeof fileFindingRequestFull, keyof FileFindingRequest>;
++  const zero: ZeroOf<FileFindingRequest> = fileFindingRequestZero;
++  const full: Widen<FileFindingRequest> = fileFindingRequestFull;
++  void missing; void extra; void zero; void full;
++}
++
++
++{
++  const missing: never = null as unknown as Exclude<keyof FindingGroupFileRequest, keyof typeof findingGroupFileRequestFull>;
++  const extra: never = null as unknown as Exclude<keyof typeof findingGroupFileRequestFull, keyof FindingGroupFileRequest>;
++  const zero: ZeroOf<FindingGroupFileRequest> = findingGroupFileRequestZero;
++  const full: Widen<FindingGroupFileRequest> = findingGroupFileRequestFull;
++  void missing; void extra; void zero; void full;
++}
++
++it("finding requests record true and omit the default send_to_uzi field", () => {
++  for (const [zero, full] of [
++    [fileFindingRequestZero, fileFindingRequestFull],
++    [findingGroupFileRequestZero, findingGroupFileRequestFull],
++  ] as const) {
++    expect(zero).not.toHaveProperty("send_to_uzi");
++    expect(full.send_to_uzi).toBe(true);
++  }
++});
+diff --git a/web/src/lib/apiTypes.ts b/web/src/lib/apiTypes.ts
+index f9c64801..bb94b182 100644
+--- a/web/src/lib/apiTypes.ts
++++ b/web/src/lib/apiTypes.ts
+@@ -4520,6 +4520,22 @@ export interface IncidentalFindingFiledIssue {
+   title: string;
+ }
+ 
++// Optional properties allow client omission; null also mirrors the Go request wire.
++export interface FileFindingRequest {
++  title?: string | null;
++  description?: string | null;
++  labels?: string[] | null;
++  send_to_uzi?: boolean;
++}
++
++export interface FindingGroupFileRequest {
++  ids: string[] | null;
++  title?: string | null;
++  description?: string | null;
++  labels?: string[] | null;
++  send_to_uzi?: boolean;
++}
++
+ // IncidentalFindingFileResult is the POST /api/findings/{id}/issue response (M5): the created
+ // forge issue plus a non-empty `warning` when the issue WAS created but its local disposition
+ // could not settle (created-with-warning — a success, never a retry signal).
+diff --git a/web/src/mocks/mockApi.findings.test.ts b/web/src/mocks/mockApi.findings.test.ts
+index 726a67df..ade9d873 100644
+--- a/web/src/mocks/mockApi.findings.test.ts
++++ b/web/src/mocks/mockApi.findings.test.ts
+@@ -335,3 +335,36 @@ describe("mockApi grouped filing (issue #1724)", () => {
+     await expect(api.findingGroupIssueDraft(many)).rejects.toMatchObject({ status: 400 });
+   });
+ });
++
++describe("mock finding send_to_uzi requests", () => {
++  it("accepts nullable single edits and send_to_uzi without inventing a run", async () => {
++    const api = await freshApi();
++    const before = (await api.listRuns()).runs.map(r => r.id);
++    const row = (await api.listFindings()).findings.find(f => f.finding_id)!;
++    const result = await api.fileFinding(row.finding_id!, {
++      title: null, description: null, labels: null, send_to_uzi: true,
++    });
++    expect(result.issue.title).toBe(row.last_title);
++    expect(result.issue.iid).toBeGreaterThan(0);
++    expect(result).not.toHaveProperty("run");
++    expect((await api.listRuns()).runs.map(r => r.id)).toEqual(before);
++  });
++
++  it("rejects null or missing group ids, accepts null edits, and never starts a run", async () => {
++    const api = await freshApi();
++    const before = (await api.listRuns()).runs.map(r => r.id);
++    await expect(api.fileFindingGroup({ ids: null, send_to_uzi: true })).rejects.toMatchObject({ status: 400 });
++    // @ts-expect-error IDs are required; deliberately exercise malformed runtime input.
++    await expect(api.fileFindingGroup({ send_to_uzi: true })).rejects.toMatchObject({ status: 400 });
++    const rows = (await api.listFindings()).findings.filter(f => f.finding_id && f.repo_id === "repo-uzi").slice(0, 2);
++    expect(rows).toHaveLength(2);
++    const result = await api.fileFindingGroup({
++      ids: rows.map(f => f.disposition_id!),
++      title: null, description: null, labels: null, send_to_uzi: true,
++    });
++    expect(result.issue?.title).toBe(rows[0].last_title);
++    expect(result.phase).toBe("settled");
++    expect(result).not.toHaveProperty("run");
++    expect((await api.listRuns()).runs.map(r => r.id)).toEqual(before);
++  });
++});
+diff --git a/web/src/mocks/mockApi/findings.ts b/web/src/mocks/mockApi/findings.ts
+index be47bee5..35d671ac 100644
+--- a/web/src/mocks/mockApi/findings.ts
++++ b/web/src/mocks/mockApi/findings.ts
+@@ -1,6 +1,8 @@
+ import {
+   type CreatedIssue,
+   type FindingGroupDraft,
++  type FileFindingRequest,
++  type FindingGroupFileRequest,
+   type FindingGroupFileResult,
+   type IssueDraft,
+   type IncidentalFinding,
+@@ -196,7 +198,7 @@ export const findingsApi = {
+     };
+     return delay(draft, 80);
+   },
+-  fileFinding: async (id: string, body?: { title?: string; description?: string; labels?: string[] }) => {
++  fileFinding: async (id: string, body?: FileFindingRequest) => {
+     const me = requireSession();
+     const f = findings.find((x) => x.finding_id === id && x.user_id === me.id);
+     if (!f) throw new ApiError(404, "finding not found");
+@@ -234,11 +236,11 @@ export const findingsApi = {
+   },
+   // fileFindingGroup files every member as ONE issue (issue #1724): all members flip to `filed`
+   // sharing one new iid and web_url. Same validation as the draft; returns the 201 shape.
+-  fileFindingGroup: async (body: { ids: string[]; title?: string; description?: string; labels?: string[] }) => {
+-    const members = resolveGroup(body.ids);
++  fileFindingGroup: async (body: FindingGroupFileRequest) => {
++    const members = resolveGroup(body.ids ?? []);
+     // Like the server, an explicitly empty title is rejected; an omitted one falls back to the first
+     // member's title (demo convenience).
+-    if (body.title !== undefined && body.title.trim() === "") throw new ApiError(400, "title must be non-empty");
++    if (body.title != null && body.title.trim() === "") throw new ApiError(400, "title must be non-empty");
+     const iid = nextFiledIssueIid++;
+     const webURL = `https://gitlab.example.com/${members[0].repo_path}/-/issues/${iid}`;
+     const now = new Date().toISOString();
+diff --git a/web/src/pages/Findings.test.tsx b/web/src/pages/Findings.test.tsx
+index 27978420..4da95698 100644
+--- a/web/src/pages/Findings.test.tsx
++++ b/web/src/pages/Findings.test.tsx
+@@ -264,7 +264,7 @@ describe("Findings page — state chips (PRD #1183 vocabulary)", () => {
+ });
+ 
+ describe("Findings page — File issue via the shared draft card", () => {
+-  it("opens the fixed-repo draft and posts the edits to fileFinding(finding_id)", async () => {
++  it.each([false, true])("posts the row draft with send_to_uzi=%s", async (sendToUzi) => {
+     mockApi.findingIssueDraft.mockResolvedValue({
+       title: "File race in sweepLoop",
+       description: "The ticker leaks on early return.",
+@@ -290,6 +290,7 @@ describe("Findings page — File issue via the shared draft card", () => {
+     expect(within(draft).getByText("vtmocanu/uzi")).toBeTruthy();
+ 
+     fireEvent.change(screen.getByDisplayValue(/File race in sweepLoop/), { target: { value: "edited title" } });
++    if (sendToUzi) fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
+     fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
+ 
+     await waitFor(() =>
+@@ -297,11 +298,14 @@ describe("Findings page — File issue via the shared draft card", () => {
+         title: "edited title",
+         description: "The ticker leaks on early return.",
+         labels: ["bug"],
++        ...(sendToUzi ? { send_to_uzi: true } : {}),
+       }),
+     );
+     // Filed state is the shared "Filed #N" link chip.
+     const link = await screen.findByRole("link", { name: /Filed #512/ });
+     expect(link.getAttribute("href")).toBe("https://gitlab.example.com/vtmocanu/uzi/-/issues/512");
++    expect(!!screen.queryByText("Queued for uzi: starts on the next sync if autopilot is on")).toBe(sendToUzi);
++    if (sendToUzi) expect(screen.getByText("Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi.")).toBeTruthy();
+   });
+ });
+ 
+@@ -917,6 +921,7 @@ describe("Findings page - File as one issue (issue #1724)", () => {
+ 
+     fireEvent.change(screen.getByDisplayValue("Findings (2): Alpha bug"), { target: { value: "edited" } });
+     const listCalls = mockApi.listFindings.mock.calls.length;
++    fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
+     fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
+ 
+     await waitFor(() =>
+@@ -925,11 +930,15 @@ describe("Findings page - File as one issue (issue #1724)", () => {
+         title: "edited",
+         description: "1. Alpha\n2. Beta",
+         labels: ["uzi"],
++        send_to_uzi: true,
+       }),
+     );
+     await screen.findByText(/Filed 2 findings as issue #77\. Issue created but two rows failed to settle\./);
+     await waitFor(() => expect(mockApi.listFindings.mock.calls.length).toBeGreaterThan(listCalls));
+     expect(screen.queryByRole("button", { name: "Create issue" })).toBeNull();
++    expect(screen.getByText("Queued for uzi: starts on the next sync if autopilot is on")).toBeTruthy();
++    expect(screen.getByText("Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi.")).toBeTruthy();
++    expect(screen.getByRole("link", { name: /Filed #77/ }).getAttribute("href")).toBe("https://gitlab.example.com/vtmocanu/uzi/-/issues/77");
+     // Selection cleared, so the bar is gone.
+     expect(screen.queryByRole("button", { name: "File as one issue" })).toBeNull();
+   });
+@@ -946,12 +955,15 @@ describe("Findings page - File as one issue (issue #1724)", () => {
+     tick("Alpha bug");
+     tick("Beta bug");
+     fireEvent.click(groupButton());
+-    fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
++    await screen.findByRole("button", { name: "Create issue" });
++    fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
++    fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
+     await screen.findByText(/Outcome unknown, inspect the forge before retrying\. Operation op-202 \(returned_uncertain\)\./);
+     expect(screen.getByText(/uzi findings release op-202 --confirm-no-issue/)).toBeTruthy();
+     expect(screen.getByText(/deadline has passed/)).toBeTruthy();
+     expect(screen.getByText(/Check the forge/)).toBeTruthy();
+     expect(screen.queryByRole("button", { name: "Create issue" })).toBeNull();
++    expect(screen.queryByText(/Queued for uzi/)).toBeNull();
+   });
+ 
+   it("409 closes the card, reloads and explains the rows were already filed", async () => {
+@@ -962,12 +974,15 @@ describe("Findings page - File as one issue (issue #1724)", () => {
+     tick("Beta bug");
+     fireEvent.click(groupButton());
+     const listCalls = mockApi.listFindings.mock.calls.length;
+-    fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
++    await screen.findByRole("button", { name: "Create issue" });
++    fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
++    fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
+     await screen.findByText(/already filed or are being filed/);
+     // The selection clears on a 409, so the bar is gone.
+     expect(screen.queryByRole("button", { name: "File as one issue" })).toBeNull();
+     await waitFor(() => expect(mockApi.listFindings.mock.calls.length).toBeGreaterThan(listCalls));
+     expect(screen.queryByRole("button", { name: "Create issue" })).toBeNull();
++    expect(screen.queryByText(/Queued for uzi/)).toBeNull();
+   });
+ 
+   it("201 with a warning keeps the operation id and phase and shows NO release hint (issue_recorded)", async () => {
+@@ -1131,8 +1146,11 @@ describe("Findings page - File as one issue (issue #1724)", () => {
+     fireEvent.click(groupButton());
+     await screen.findByRole("button", { name: "Create issue" });
+     fireEvent.change(screen.getByDisplayValue("Findings (2): Alpha bug"), { target: { value: "kept edit" } });
++    fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
+     fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
+     await screen.findByText(/forge rejected the request/);
+     expect(screen.getByDisplayValue("kept edit")).toBeTruthy();
++    expect((screen.getByRole("checkbox", { name: "Send to uzi" }) as HTMLInputElement).checked).toBe(true);
++    expect(screen.queryByText(/Queued for uzi/)).toBeNull();
+   });
+ });
+diff --git a/web/src/pages/Findings.tsx b/web/src/pages/Findings.tsx
+index c0bdc8cc..9dd527b1 100644
+--- a/web/src/pages/Findings.tsx
++++ b/web/src/pages/Findings.tsx
+@@ -48,7 +48,7 @@ import { TriageSummary } from "./RunView";
+ import { useSetFindingsOpen } from "../components/FindingsOpenContext";
+ import { TriageActions } from "../components/triage/TriageActions";
+ import { TriageStateChip } from "../components/triage/TriageStateChip";
+-import { IssueDraftCard } from "../components/triage/IssueDraftCard";
++import { IssueDraftCard, SEND_TO_UZI_HELP, SEND_TO_UZI_CONFIRMED } from "../components/triage/IssueDraftCard";
+ import { findingState } from "../components/triage/triageCopy";
+ import { SelectAllCheckbox } from "../components/triage/SelectAllCheckbox";
+ import { MultiSelectBar } from "./findings/MultiSelectBar";
+@@ -163,7 +163,13 @@ export function Findings() {
+   // File as one issue is disabled while the card is open, so a changed selection cannot be posted
+   // under an old draft (and the user's edits are never silently discarded by a reload).
+   const [groupTarget, setGroupTarget] = useState<{ ids: string[]; repoLabel: string } | null>(null);
+-  const [notice, setNotice] = useState("");
++  const [notice, setNoticeText] = useState("");
++  const [groupConfirmation, setGroupConfirmation] = useState<{ url: string; iid: number; queued: boolean } | null>(null);
++  const setNotice = useCallback((text: string) => {
++    setNoticeText(text);
++    setGroupConfirmation(null);
++  }, []);
++  const [queuedFindings, setQueuedFindings] = useState<Set<string>>(new Set());
+   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+ 
+   // Publishes the canonical open count to the nav badge (PRD #1183 M4, the BLK-BADGE pattern). A
+@@ -214,7 +220,7 @@ export function Findings() {
+     setSelected(new Set());
+     setGroupTarget(null);
+     setNotice("");
+-  }, [bucket, repoFilter, runAnchor]);
++  }, [bucket, repoFilter, runAnchor, setNotice]);
+ 
+   // The repo scope selector's options. Best-effort (a failure leaves All-repos as the only option,
+   // and the backlog still renders); the selector defaults to All-repos-grouped.
+@@ -288,7 +294,7 @@ export function Findings() {
+   }, []);
+ 
+   const fileFinding = useCallback(
+-    async (findingID: string, body: { title: string; description: string; labels: string[] }) => {
++    async (findingID: string, body: { title: string; description: string; labels: string[]; send_to_uzi?: boolean }) => {
+       setActionErr("");
+       try {
+         const res = await api.fileFinding(findingID, body);
+@@ -299,6 +305,13 @@ export function Findings() {
+           filed_issue_iid: res.issue.iid,
+           filed_issue_url: res.issue.web_url,
+         });
++        // Only this local, confirmed submission can show the queued caveat.
++        setQueuedFindings((s) => {
++          const next = new Set(s);
++          if (body.send_to_uzi === true) next.add(findingID);
++          else next.delete(findingID);
++          return next;
++        });
+         setFiledWarnings((m) => ({ ...m, [findingID]: res.warning ?? "" }));
+         // Filing moves a coordinate to_file → filed, so the tabs and the nav badge change.
+         reloadStats();
+@@ -323,7 +336,7 @@ export function Findings() {
+   // rethrows so the card keeps the user's edits and shows the error. The web has no release action,
+   // so a 202 (no issue) points at the CLI release after the user inspects the forge.
+   const fileGroup = useCallback(
+-    async (ids: string[], body: { title: string; description: string; labels: string[] }) => {
++    async (ids: string[], body: { title: string; description: string; labels: string[]; send_to_uzi?: boolean }) => {
+       setActionErr("");
+       setNotice("");
+       try {
+@@ -339,6 +352,7 @@ export function Findings() {
+               ? `${filed} ${res.warning ?? ""} Operation ${res.operation_id} (${res.phase}).`.replace(/ {2,}/g, " ")
+               : filed,
+           );
++          setGroupConfirmation({ url: res.issue.web_url, iid: res.issue.iid, queued: body.send_to_uzi === true });
+         } else {
+           const detail = res.warning ? `${res.warning} ` : "";
+           setNotice(
+@@ -359,7 +373,7 @@ export function Findings() {
+         throw e;
+       }
+     },
+-    [load, reloadStats],
++    [load, reloadStats, setNotice],
+   );
+ 
+   // settle patches every row a bulk verdict response re-read (exactly the rows that moved, never the
+@@ -541,9 +555,10 @@ export function Findings() {
+     selected: canSelect(f) && f.disposition_id ? selected.has(f.disposition_id) : false,
+     onToggleSelect: () => f.disposition_id && toggleSelect(f.disposition_id),
+     repoLabel: stripUnsafeChars(maskRepoPath(f.repo_path, demo)),
++    queued: !!f.finding_id && queuedFindings.has(f.finding_id),
+     warning: f.finding_id ? filedWarnings[f.finding_id] : undefined,
+     resolved: f.finding_id ? resolvedIds.has(f.finding_id) : false,
+-    onFile: (body: { title: string; description: string; labels: string[] }) =>
++    onFile: (body: { title: string; description: string; labels: string[]; send_to_uzi?: boolean }) =>
+       f.finding_id ? fileFinding(f.finding_id, body) : Promise.resolve(),
+     onDismiss: (reason: "wont_do" | "not_an_issue") => {
+       if (f.disposition_id) dismiss([f.disposition_id], reason);
+@@ -572,6 +587,23 @@ export function Findings() {
+       {notice && (
+         <div role="status" className="rounded-lg border border-info/30 bg-info/[0.06] px-3 py-2 text-sm text-muted">
+           {notice}
++          {groupConfirmation && (
++            <>
++              <TriageStateChip
++                {...findingState({
++                  status: "filed",
++                  filed_issue_iid: groupConfirmation.iid,
++                  filed_issue_url: groupConfirmation.url,
++                })}
++              />
++              {groupConfirmation.queued && (
++                <>
++                  <p>{SEND_TO_UZI_CONFIRMED}</p>
++                  <p>{SEND_TO_UZI_HELP}</p>
++                </>
++              )}
++            </>
++          )}
+         </div>
+       )}
+ 
+@@ -648,6 +680,7 @@ export function Findings() {
+             File {groupTarget.ids.length} findings as one issue
+           </p>
+           <IssueDraftCard
++            allowSendToUzi
+             key={groupTarget.ids.join(",")}
+             fixedRepoLabel={groupTarget.repoLabel}
+             loadDraft={async () => {
+@@ -664,6 +697,7 @@ export function Findings() {
+                 title: values.title,
+                 description: values.description,
+                 labels: values.labels,
++                ...(values.send_to_uzi ? { send_to_uzi: true } : {}),
+               })
+             }
+             onCancel={() => setGroupTarget(null)}
+@@ -786,6 +820,7 @@ export function FindingRow({
+   onToggleSelect,
+   repoLabel,
+   warning,
++  queued,
+   resolved,
+   onFile,
+   onDismiss,
+@@ -797,8 +832,9 @@ export function FindingRow({
+   onToggleSelect: () => void;
+   repoLabel: string;
+   warning?: string;
++  queued?: boolean;
+   resolved: boolean;
+-  onFile: (body: { title: string; description: string; labels: string[] }) => Promise<void>;
++  onFile: (body: { title: string; description: string; labels: string[]; send_to_uzi?: boolean }) => Promise<void>;
+   onDismiss: (reason: "wont_do" | "not_an_issue") => void;
+   onMarkDone: () => void;
+ }) {
+@@ -857,6 +893,12 @@ export function FindingRow({
+               <TriageStateChip {...state} />
+             )}
+           </div>
++          {finding.status === "filed" && queued && (
++            <div className="mt-1 text-xs text-muted">
++              <p>{SEND_TO_UZI_CONFIRMED}</p>
++              <p>{SEND_TO_UZI_HELP}</p>
++            </div>
++          )}
+           {finding.status === "filed" && warning && (
+             // warning is a server-authored constant (created-with-warning), not model text.
+             <p className="mt-1 text-xs text-muted">· {warning}</p>
+@@ -892,6 +934,7 @@ export function FindingRow({
+       {actionable && filing && finding.finding_id && (
+         <div className="border-t border-edge px-3 py-2.5">
+           <IssueDraftCard
++            allowSendToUzi
+             fixedRepoLabel={repoLabel}
+             loadDraft={async () => {
+               const draft = await api.findingIssueDraft(finding.finding_id!);
+@@ -907,6 +950,7 @@ export function FindingRow({
+                 title: values.title,
+                 description: values.description,
+                 labels: values.labels,
++                ...(values.send_to_uzi ? { send_to_uzi: true } : {}),
+               });
+               setFiling(false);
+             }}

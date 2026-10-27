@@ -118,7 +118,7 @@ There is no new issue comment for these refusals; the existing
 
 ## Semantic runs park instead of auto-approving (dormant)
 
-**Dormant.** Production enrollment is off until [PRD #1231](https://github.com/vtmocanu/uzi/issues/1231): no production code creates a semantic run today, so every real autopilot run keeps the behavior described above (the *structural* profile, which makes zero coverage calls). This section describes the built-but-unreachable path that only tests exercise. Nothing here is live behavior.
+**Dormant.** Production enrollment is off and not planned (the semantic completion auditor, #1231, was closed not planned; any future activation needs a new approved design): no production code creates a semantic run today, so every real autopilot run keeps the behavior described above (the *structural* profile, which makes zero coverage calls). This section describes the built-but-unreachable path that only tests exercise. Nothing here is live behavior.
 
 A *semantic* run (see [Cross-check](./cross-check.md#semantic-contract-profile-dormant)) compares the issue and linked PRD against the proposed plan before it proceeds. On such a run autopilot auto-approves only when all of these hold:
 
@@ -147,7 +147,7 @@ Three further rules:
 
 ### Coverage transport limitation
 
-Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. #1231 must establish enforceable bounds before activation.
+Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. Any future semantic activation must establish enforceable bounds before activation.
 
 The shipped workers supply no coverage transport at all, so even an enrolled run would park as `coverage_unavailable`. See [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#coverage-transport-limitation).
 

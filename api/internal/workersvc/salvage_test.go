@@ -45,6 +45,7 @@ type salvageStore struct {
 
 	mu sync.Mutex
 
+	runs          map[uuid.UUID]store.Run
 	candidates    []store.ListSalvageCandidatesRow
 	candidatesErr error
 	candParams    []store.ListSalvageCandidatesParams
@@ -68,6 +69,16 @@ type salvageStore struct {
 	claimCtx   store.GetRunClaimContextRow
 	claimErr   error
 	claimCalls int
+}
+
+func (f *salvageStore) GetRunByID(_ context.Context, id uuid.UUID) (store.Run, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	run, ok := f.runs[id]
+	if !ok {
+		return store.Run{}, pgx.ErrNoRows
+	}
+	return run, nil
 }
 
 func (f *salvageStore) ListSalvageCandidates(_ context.Context, arg store.ListSalvageCandidatesParams) ([]store.ListSalvageCandidatesRow, error) {
@@ -411,11 +422,12 @@ func promotedSalvageRow(forge string) store.RunSalvage {
 func TestSweepSalvageEnqueuePassesParamsAndRecordsStates(t *testing.T) {
 	issueRun, selfRun, secretRun, taskRun, goneRun := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	fs := &salvageStore{
+		runs: map[uuid.UUID]store.Run{taskRun: {ID: taskRun, Kind: "task"}},
 		candidates: []store.ListSalvageCandidatesRow{
 			{ID: issueRun, Kind: runkind.Issue, IssueIid: pgtype.Int8{Int64: 7, Valid: true}, CheckpointTip: salvageTip, FailOrigin: pgtype.Text{String: "agent_failure", Valid: true}, ForgeType: "github"},
 			{ID: selfRun, Kind: runkind.SelfImprove, IssueIid: pgtype.Int8{Int64: 3, Valid: true}, CheckpointTip: salvageTip, ForgeType: "gitlab"},
 			{ID: secretRun, Kind: runkind.Issue, IssueIid: pgtype.Int8{Int64: 8, Valid: true}, CheckpointTip: salvageTip, FailOrigin: pgtype.Text{String: "push_secret_blocked", Valid: true}, ForgeType: "github"},
-			{ID: taskRun, Kind: "task", CheckpointTip: salvageTip, ForgeType: "github"}, // not checkpoint-eligible
+			{ID: taskRun, Kind: "task", CheckpointTip: salvageTip, ForgeType: "github"}, // legacy task, not enrolled
 			{ID: goneRun, Kind: runkind.Issue, IssueIid: pgtype.Int8{Int64: 9, Valid: true}, CheckpointTip: salvageTip, ForgeType: "github"},
 		},
 		insertErr: map[uuid.UUID]error{goneRun: &pgconn.PgError{Code: "23503", ConstraintName: "run_salvage_live_run_id_fkey"}},
@@ -452,7 +464,7 @@ func TestSweepSalvageEnqueuePassesParamsAndRecordsStates(t *testing.T) {
 		t.Errorf("secret-blocked insert = %+v, want skipped_secret with no live pointer", in)
 	}
 	if _, ok := byRun[taskRun]; ok {
-		t.Errorf("a non-checkpoint-eligible run was enqueued")
+		t.Errorf("an unenrolled task was enqueued")
 	}
 	if len(b.creates)+len(b.deletes) != 0 {
 		t.Errorf("enqueue made broker calls: creates=%d deletes=%d", len(b.creates), len(b.deletes))

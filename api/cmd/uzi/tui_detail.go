@@ -16,11 +16,34 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
-// laneRailWidth is the left rail's fixed column budget.
+// laneRailWidth is the left rail's minimum width and the fixed budget of its account-meter rows.
+// Text rows use railWidth(), which grows on wide terminals.
 const laneRailWidth = 26
 
-// railRateBarWidth is the full-rail account meter's bar. The rail row is width-locked to
-// laneRailWidth (26); its budget is: "5h " label+space (3) + bar + " NN%" percent field (5) +
+const (
+	// railAutoMaxWidth caps the automatic growth; a configured rail_min_width may exceed it.
+	railAutoMaxWidth = 44
+	// railAutoPercent is the share of the terminal width the rail grows toward.
+	railAutoPercent = 20
+	// railTranscriptMinCols is the transcript width the rail never squeezes below once the
+	// terminal is wide enough to hold both (92 columns); narrower terminals keep a 26-col rail.
+	railTranscriptMinCols = 60
+	// railChromeCols is the columns transcriptWidth reserves beside the rail (divider and slack).
+	railChromeCols = 6
+)
+
+// railWidth is the detail rail's column budget for the current terminal width: about a fifth of
+// it, between the configured floor (rail_min_width, default laneRailWidth) and railAutoMaxWidth,
+// reduced so the transcript keeps railTranscriptMinCols, and never below laneRailWidth.
+func (m tuiModel) railWidth() int {
+	floor := max(m.railMinWidth, laneRailWidth)
+	desired := max(floor, min((m.width*railAutoPercent+50)/100, railAutoMaxWidth))
+	available := m.width - railTranscriptMinCols - railChromeCols
+	return max(laneRailWidth, min(desired, available))
+}
+
+// railRateBarWidth is the full-rail account meter's bar. The meter row keeps the fixed
+// laneRailWidth (26) budget at any rail width: "5h " label+space (3) + bar + " NN%" percent field (5) +
 // 2-col gap (2) + 6-col right-aligned reset countdown (6). The bar takes what is left (issue #588
 // shrank it from 18 to 10 to make room for the inline reset). A window with no reset time renders
 // no countdown and the row is simply shorter (still <= 26).
@@ -1018,7 +1041,7 @@ func (m tuiModel) renderDetail() string {
 	}
 	rail := m.renderLaneRail()
 	body := m.renderTranscript()
-	sb.WriteString(m.joinColumns(rail, body, laneRailWidth))
+	sb.WriteString(m.joinColumns(rail, body, m.railWidth()))
 	// The attention band (PRD #325 M3 redesigned) shows regardless of ownership — it is
 	// informational. At a plan gate the OWNER's action keys ride inline at the band's right
 	// edge, and detailFooter drops them so they are not duplicated.

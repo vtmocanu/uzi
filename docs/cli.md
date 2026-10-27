@@ -78,11 +78,57 @@ secret), never a plain variable.**
 can target a *named context* instead of overwriting the one you already have —
 see [Named contexts](#named-contexts) below.
 
+## Vault: check status and unlock
+
+After authenticating, run `uzi vault status` to print `locked` or `unlocked`
+for the active user. `--json` returns only `{"unlocked":false}` or
+`{"unlocked":true}`. Status output remains visible with `--quiet`.
+
+Run `uzi vault unlock` in a terminal to enter your login password or, for
+an OIDC-only account, your dedicated vault passphrase. The prompt goes to
+stderr and input is hidden. Unlock opens an existing vault; it does not
+create one. Set an OIDC vault passphrase in the web app first.
+
+For an owner-controlled script, explicitly pass `--password-stdin` with
+non-terminal stdin, for example using a password manager's stdout:
+
+```sh
+pass show uzi/vault | uzi vault unlock --password-stdin
+```
+
+The command reads one line, strips its trailing LF or CRLF, and preserves
+leading and trailing spaces. A final line without a newline is accepted.
+Empty input or input over 1 MiB is rejected. Non-terminal stdin without
+`--password-stdin`, or a terminal with that flag, is a usage error.
+There is no password-valued flag, positional argument, environment setting,
+or persisted re-unlock key. Agents must ask the owner to unlock, never
+solicit or read the owner's password or passphrase.
+
+On success, unlock prints `Vault unlocked.` unless `--quiet` is set.
+`--json` returns `{"unlocked":true}`, including with `--quiet`; the terminal
+prompt still goes to stderr. Unlock submits once and never retries
+automatically. Terminal input fails closed if cleanup fails: no password
+is submitted.
+
+| Exit | Vault result |
+|------|--------------|
+| 0 | Success |
+| 1 | Generic input/read/cleanup failure or cancellation |
+| 2 | Usage error, including invalid flags/arguments, empty or oversized input, or stdin/flag mismatch |
+| 3 | Authentication failure; wrong password and no existing vault both report `incorrect password` |
+| 6 | Unreachable server, server error, or HTTP 429 rate limit |
+
+A 429 reports a safe retry hint when the server supplies a valid positive
+`Retry-After`; wait before making another attempt. Arbitrary unlock error
+response bodies are not printed.
+
 ## Commands
 
 ```
 uzi login | logout | auth token [--with-token] | auth status [--all] | whoami
 uzi context list | current | use <name> | set <name> --url <url> | rm <name>
+uzi vault status
+uzi vault unlock [--password-stdin]
 uzi run list | get <id> [--field <name> ...] [--reconciliation-before-gate-revision <n>]
 uzi run logs <id> [--follow] [--after <seq>]
 uzi run plan <run-id> [--version N] [--diff] [--json]
@@ -159,6 +205,8 @@ uzi handoff rm <run-id> | review <run-id>
 uzi token list
 uzi rate-limits [--provider claude|codex]
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
+uzi worker cordon <id> [-m <reason>] [--json]
+uzi worker uncordon <id> [--json]
 uzi repo list | remove <id> [--force]
 uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
@@ -169,6 +217,7 @@ uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
 uzi admin egress-profile list | show <name>
+uzi admin maintenance status [--json]
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -244,7 +293,7 @@ A few worth knowing:
 - **No `worker create` and no `admin` writes.** Minting a worker join token
   returns a credential that reads decrypted secrets, and every admin write
   stays cookie-only — both are web UI actions by design.
-- **`token` is list-only, and `worker set-token` is the one write near it.**
+- **`token` is list-only; `worker set-token` writes the worker's credential binding.**
   See [Anthropic tokens](#anthropic-tokens) below for why the split falls
   exactly there.
 - **`uzi rate-limits [--provider claude|codex]`** — your own rate-limit
@@ -1135,6 +1184,23 @@ A few worth knowing:
   sanitizing cell path as every other untrusted field; `show` prints a host or
   description whole, up to its 253- or 500-character maximum. Read-only, `uza_`-token, same ceiling as every other `admin`
   verb: creating, editing and deleting a profile are cookie-only admin writes.
+- **`admin maintenance status` reads [instance maintenance
+  mode](instance-maintenance.md)** (PRD #3454): whether it is on, since when and
+  why, then the counts and a `CLEAR: …` or `NOT CLEAR: …` line with its `as_of`
+  time. It lists `active`, `held` and `custody` items (owner and age; only held
+  and custody items carry a `progressing` or `needs_owner` tag, active items
+  carry none). The informational queued runs and idle bound ephemeral workers
+  are counts only here; the web card lists them. "Clear" means no blockers visible in that snapshot; refresh it
+  right before evicting nodes. The reason and owner labels go through the same
+  sanitizing path as every other untrusted field. Read-only, `uza_`-token (or
+  session), same ceiling as every other `admin` verb: turning maintenance on or
+  off is a cookie-only web action (**Admin → Instance → Maintenance mode**), so
+  the CLI has no on/off.
+- **While maintenance is on, creating a run still succeeds and prints a warning
+  on stderr** (the server's `notice`; `uzi run create`, `uzi run rework`,
+  `uzi ci fix` and the other create paths), and `uzi run get` shows a `QUEUE_REASON`
+  row for a queued run that maintenance is holding back. `--json` stdout is
+  unchanged apart from the additive `queue_reason` and `notice` fields.
 - **`uzi repo remove <id>` deletes a single stale repo** — the surgical
   counterpart to deleting a whole forge connection. It only works on a
   **disabled** repo, so disable it first (`enabled` shows in `uzi repo list`);
@@ -1296,9 +1362,11 @@ uzi run recovery <run-id> [--json]
   protection, a capture in flight, or a ready archive. Legacy holds can release
   automatically on archive readiness; guarded holds await final inventory acknowledgment.
   The narrow exhaustion exception is an OPEN hold for `recovery_wait` /
-  `worker_requeue_exhausted`: it remains `source_only`, or `needs_action` after a failed
-  latest capture, even with an available archive or capture in flight. Owner Resume/Cancel
-  remains required; archive readiness does not implicitly release this custody.
+  `worker_requeue_exhausted`, `worker_memory_pressure`, or
+  `retained_recovery_exhausted` (timed or held): it remains `source_only`, or `needs_action` after a failed
+  latest capture, even with an available archive or capture in flight. Timed retained
+  recovery can retry automatically; NULL retry requires owner Resume/Cancel. Archive
+  readiness does not implicitly release this custody.
   The latest capture state and available archive are independent: an older download may
   omit latest work while a newer capture prepares/uploads. The same source, coverage,
   export and discard guidance as above follows. `--json` prints
@@ -1308,11 +1376,13 @@ uzi run recovery <run-id> [--json]
   its run) or the server predates capture-hold linking. Owner-only.
 - While the server retains the run's last published checkpoint on origin (PRD #1810), the
   human-readable output adds a line per hold naming where it lives: `hold <id> checkpoint:
-  <ref> @ <12-char tip> (<state>)`, where `<ref>` is `refs/uzi-checkpoints/<branch>` or, once
-  a newer run on the same branch superseded it, `refs/uzi-recovery/<run-id>`. `--json` carries
+  <ref> @ <12-char tip> (<state>)`, where `<ref>` is `refs/uzi-checkpoints/<checkpoint-key>` or, once
+  a newer run using that key superseded it, `refs/uzi-recovery/<run-id>`. `--json` carries
   the same information as `checkpoint_ref`, `checkpoint_tip`, and `checkpoint_state` on each
   hold. A hold with no retained checkpoint ref omits the line (and the `--json` fields are
-  absent).
+  absent). The key keeps the exact legacy issue/self-improvement spelling; an enrolled
+  task uses `uzi/task/<its-own-run-id>`, even when its work branch belongs to a root
+  task. See [task checkpoint recovery](./run-recovery.md#task-checkpoint-recovery).
 
 - A hold with `terminal_record_rejection: "mac_failure"` also shows the fixed diagnostic:
   “terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody”.
@@ -1341,7 +1411,7 @@ uzi run discard <run-id> --hold <hold-id> --yes
   destroy the last copy of that work — export anything you might need first.
 - **Discarding a run's last open hold also deletes its retained checkpoint ref on the
   forge.** Once no hold of the run is left open, the server settles (CAS-deletes) whatever
-  ref still carries the run's tip (`refs/uzi-checkpoints/<branch>`, or `refs/uzi-recovery/<run-id>`
+  ref still carries the run's tip (`refs/uzi-checkpoints/<checkpoint-key>`, or `refs/uzi-recovery/<run-id>`
   once a newer run superseded it) — see the `run recovery` checkpoint line above. Both the
   `run discard` help and its confirmation prompt name this; fetch the ref first if you
   might still need it.
@@ -1438,7 +1508,7 @@ uzi copies a failed run's last **published** checkpoint to a run-scoped ref,
 (if the removal keeps failing, uzi stops trying and `SALVAGE_ERROR` names the ref that may
 remain).
 The copy is only what the run had checkpointed to the forge, so it may be behind the
-run's final local work. Salvage never moves or deletes the branch's own checkpoint ref.
+run's final local work. Salvage never moves or deletes the run's checkpoint ref.
 
 `uzi run get` on a failed run with a salvage record prints a `SALVAGE` block: the state
 with a one-line explanation, then `SALVAGE_REF`, `SALVAGE_TIP` (short), `SALVAGE_EXPIRES`
@@ -1763,7 +1833,7 @@ A newer release is available.
   in-progress milestone's cell blinks** `▰`/`▱` in the tungsten colour (the
   same warm accent as the done fill) on a half-second tick — a static `▱`
   frame renders instead when the terminal isn't interactive (a piped or
-  offline render) or with `UZI_TUI_NO_BLINK=1` set (a reduced-motion opt-out,
+  offline render) or with `UZI_TUI_NO_BLINK=1` or `[tui] blink = false` set (a reduced-motion opt-out,
   read once at startup). The **selected row**
   additionally gains a second line naming the active lane's role, task
   label and age — the run's current activity, the same information [the run
@@ -1814,12 +1884,12 @@ A newer release is available.
   `🔒 vault locked` hint (`[locked] vault locked` under NO_COLOR or a
   non-color terminal). When one or more of **your own** runs are actually
   parked on the lock, the hint escalates to a steady amber needs-you band
-  instead: `▌ VAULT LOCKED · N runs parked — unlock in the web app to
-  resume`. On the admin/factory board the count is scoped to your own
+  instead: `▌ VAULT LOCKED · N runs parked — uzi vault unlock or the web app to resume`.
+  On the admin/factory board the count is scoped to your own
   runs only — it never counts or names another user's locked vault. Either
   form is steady, never blinking, and clears on its own within about a
   minute of the vault unlocking; there's no dismiss. Unlocking itself is done
-  off-TUI, in the web app.
+  outside the TUI, with `uzi vault unlock` or in the web app.
 - **Run detail** (`[enter]` from the board, or `uzi tui <run-id>` directly).
   A left rail of agent lanes — the lead plus each live subagent, one lane per
   invocation, each with a status dot — beside the selected lane's transcript,
@@ -1843,7 +1913,7 @@ A newer release is available.
   for a milestone in progress — a `◕` that blinks `◕`/`○` in the faint grey
   colour (the same colour as a not-started `○`; the row is told apart by the
   `◕` shape, its motion and a brighter title, never by colour), a static `◕`
-  under `UZI_TUI_NO_BLINK=1` or a non-tty render. The rail's eyebrow also
+  under `UZI_TUI_NO_BLINK=1`, `[tui] blink = false` or a non-tty render. The rail's eyebrow also
   carries a compact `▰`/`▱` micro-bar that blinks one cell per milestone in
   progress in tungsten, the twin of the board's, and names the in-progress
   milestone(s) after the count (e.g. `· m1, m2`, capped at two then `+N`).
@@ -2042,6 +2112,41 @@ split = "off"
 `split = "auto"` is the default; `auto` and `off` are the supported values.
 The `off` setting also disables `s`. `uzi tui --demo` and
 `uzi tui --sketch` use `auto` regardless of this setting.
+
+The run detail's left rail grows with the terminal: about a fifth of its
+width, at least 26 columns and at most 44, so milestone titles, crew labels
+and the now line truncate less on a wide terminal. Once the terminal is
+92 columns or wider the transcript always keeps at least 60 columns; below
+that the rail stays at 26 columns. Three more `[tui]` keys tune the detail view:
+
+```toml
+[tui]
+milestone_numbers = true   # default false
+rail_min_width = 36        # default 26
+blink = false              # default true
+```
+
+- `milestone_numbers = true` prefixes each rail milestone title with its
+  position in the approved list (`M1`, `M2`, …, right-aligned once there are
+  ten or more), and the `MILESTONES` header names the in-progress milestones
+  by the same positions (`· M2`) instead of their ids. When the run already
+  wrote the same number at the start of the title (`M3 `, `m3 - `, `M3:` on
+  the third row), it is dropped so the row is not doubled. A different
+  number stays, so a plan numbered from zero reads `M1 M0 investigation`
+  and the run's own numbering is never hidden. A word that merely starts
+  with a number, like `M3Migration`, is left alone. The board row is
+  unchanged.
+- `rail_min_width` raises the rail's floor, and may exceed the automatic
+  44-column cap. The 60-column transcript minimum still wins on a terminal
+  too narrow for both. Values below 26 are rejected.
+- `blink = false` pins the static frame instead of the half-second blink of
+  in-progress milestones, the same reduced-motion opt-out as
+  `UZI_TUI_NO_BLINK=1`. Either one turns the blink off; `blink = true` does
+  not override the environment variable.
+
+An invalid value for any `[tui]` key stops `uzi tui` with a usage error
+naming the key. Like `split`, these keys are ignored by `--demo` and
+`--sketch`.
 
 ### Keybindings
 
@@ -2550,6 +2655,46 @@ is healthy. Confirmed first-provision and capacity failures have their own label
 These diagnostics also appear in `uzi admin workers` and worker TUI details;
 capacity remains in the attention set without claiming that storage is healthy.
 
+### Manual worker cordon
+
+```sh
+uzi worker cordon <id> [-m <reason>]
+uzi worker uncordon <id>
+```
+
+Both commands accept `--json` and act on your persistent hosted or external
+workers. Admin status does not grant access to another owner's worker.
+Run-bound/ephemeral workers return HTTP 409 with
+`manual cordon is only supported for persistent workers`.
+
+Cordon pauses new intake; assigned work can continue subject to existing
+restrictions. It does not cancel runs, end chats or create continuation affinity.
+Uncordon removes the manual hold; automatic drains, maintenance and other fences
+can remain. The manual hold survives registration, roll, restart, deadlines and
+ForceRoll until you explicitly uncordon or delete the worker. Offline status is
+independent.
+
+`-m` (also `--reason`) accepts an optional reason of at most 500 Unicode code
+points before trimming/sanitization; blank reasons become null. Repeating a
+cordon preserves its first actor, time and reason. Repeating uncordon is a
+no-op. These owner writes do not add `worker create` or admin writes.
+
+Both commands return the updated worker DTO under `--json`. Manual metadata is
+`manual_cordoned_at`, `manual_cordoned_by` (actor UUID),
+`manual_cordoned_by_label` (snapshot) and `manual_cordon_reason`.
+`effective_cordoned` reflects the combined intake fences; automatic
+`draining_since`/reason remain separate. The human output shows manual metadata
+and remaining fences. Worker lists and details keep liveness separate from the
+manual annotation.
+
+The Workers page has the same owner controls. Health and admin views remain
+read-only. An idle manually cordoned hosted worker may roll and return cordoned;
+it supplies no serving coverage, and a multi-worker pool without an uncordoned
+provider can remain held. See [manual cordon lifecycle and deployment caveats](./hosted-workers.md#pause-new-work-with-a-manual-cordon),
+including older ClaimRun SQL failing after the worker-schema extension (rollback
+can prolong that outage), older chat claims ignoring manual intent, and older
+controllers miscounting coverage.
+
 ### Worker lane capacity
 
 `uzi worker list` and `uzi admin workers` show `RUN SLOTS` and
@@ -2815,6 +2960,8 @@ the displayed gate revision, not historical findings. See
 
 ### Code cross-check evidence
 
+The coverage rows show every stored path, its assessment, reason and recorded-read flag, plus omitted-path, judgment and activity metadata. Legacy checks say "coverage not reported". This is an advisory account; see [Review coverage](./cross-check.md#review-coverage).
+
 The [Code cross-check](./cross-check.md#code-cross-check) consent is set in
 **Settings → Run defaults → Cross-check**; there is no CLI write verb for it.
 
@@ -2999,7 +3146,9 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `paused` / `provider_unavailable` — see [Recovering
   from a transient interruption](run-recovery-wait.md). An exhausted worker-death episode also parks here with cause
   `worker_requeue_exhausted`, requiring explicit owner Resume or Cancel
-  without an automatic timer. A Codex credential
+  without an automatic timer. Retained-source budget exhaustion can use cause
+  `retained_recovery_exhausted`: three timed retries by default, then an owner
+  hold with no countdown. See [Retained recovery exhausted](#retained-recovery-exhausted). A Codex credential
   refresh or release that found the owner's vault locked also parks here
   (cause `vault_locked`); it takes the same capped backoff and no lifetime
   cap. The owner's explicit successful vault unlock best-effort queues an
@@ -3089,7 +3238,9 @@ hold presentation and remedies are unchanged. See
 
 `limit_wait` and timed `recovery_wait` causes auto-resume on a timer.
 `worker_requeue_exhausted` instead requires owner Resume or Cancel; the Codex
-account hold waits for its account. `pool_wait` instead clears only when a token is
+account hold waits for its account. `retained_recovery_exhausted` retries when
+its timestamp is finite (even if due); NULL instead needs owner Resume/Cancel,
+and omitted timing is unknown. `pool_wait` instead clears only when a token is
 opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
 does not resume it.
 
@@ -3292,6 +3443,30 @@ set written explicitly. Ordinary recovery waits continue as before.
 status stays `recovery_wait`. The TUI puts this hold in NEEDS YOU with
 owner actions, counts and historical evidence, without a self-retry countdown.
 
+### Retained recovery exhausted
+
+`recovery_wait` / `retained_recovery_exhausted` means a durably confirmed
+retained-source recovery budget was exhausted. The default cap allows three
+timed parks (roughly 1m, 2m, 4m plus jitter), then holds for the owner.
+`retained_park_count` counts these retries, not worker-death requeues.
+`worker_recovery` remains stored-episode and historical evidence; neither it
+nor an earlier available archive proves latest-work coverage.
+
+A finite `recovery_retry_not_before`, including a due timestamp, shows a timed
+retry; NULL shows an owner hold with no countdown, and omitted timing is unknown.
+Owner `uzi run resume <id>` or `resume-now` queues either form early and clears
+its retry; `uzi run cancel <id>` ends either form. Resume preserves the count
+and cap. Timer promotion grants a fresh run wall window, while manual Resume
+preserves remaining wall budget and may require `uzi run extend` first.
+Token/credential changes do not promote this cause.
+
+Default wait and log follow stop at the owner-held form and continue through
+timed retries; explicit `--until` keeps its status set. Follow reports a
+finite-to-NULL transition even within the same cause/status. Both forms keep
+source custody; execution release does not authorize deleting source. See
+[Retained recovery exhausted](run-recovery-wait.md#retained-recovery-exhausted)
+for renewal bounds, storage risks and rollout requirements.
+
 ### Waiting for a state: `uzi run wait`
 
 `uzi run wait <id>` blocks until the run reaches a state you can act on — the
@@ -3301,7 +3476,8 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 `awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
 rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`),
 except a default wait also stops at `recovery_wait` with cause
-`worker_requeue_exhausted`, and at a `paused` run held on
+`worker_requeue_exhausted`, `worker_memory_pressure`, or owner-held
+`retained_recovery_exhausted` (NULL retry), and at a `paused` run held on
 `base_attestation_missing`, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means

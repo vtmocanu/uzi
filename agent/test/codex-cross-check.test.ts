@@ -2,7 +2,7 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough, Writable } from "node:stream";
 import { createHash } from "node:crypto";
-import { CodexCrossCheck, OWNER_GUIDANCE_LABEL, REPO_INSTRUCTIONS_DIFF_NOTE, codeCrossCheckBrief, crossCheckBrief, crossCheckPrompt, type CrossCheckModelDeps } from "../src/codex/cross-check.js";
+import { CodexCrossCheck, CrossCheckMalformedError, validateVerdict, validateCodeFindings, OWNER_GUIDANCE_LABEL, REPO_INSTRUCTIONS_DIFF_NOTE, codeCrossCheckBrief, crossCheckBrief, crossCheckPrompt, type CrossCheckModelDeps } from "../src/codex/cross-check.js";
 import type { CodexRootHandle, CodexLaunchSpec, CodexEffectLaunchSpec } from "../src/codex/launcher.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
@@ -12,6 +12,31 @@ import { CheckActivityRecorder } from "../src/cross-check-activity.js";
 import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
 
 const verdict = JSON.stringify({ verdict: "approve", summary: "Anchors checked", items: [] });
+
+const diagnosticFinding = { file: "anchor.ts", severity: "warning", summary: "Finding", rationale: "Read anchor" };
+for (const [name, text, subreason] of [
+ ["invalid_json", "{broken", "invalid_json"],
+ ["verdict_schema", JSON.stringify({ verdict: "maybe", summary: "x", items: [] }), "verdict_schema"],
+ ["finding_schema", JSON.stringify({ verdict: "revise", summary: "x", items: [{ ...diagnosticFinding, severity: "bad" }] }), "finding_schema"],
+ ["findings_cap per-item", JSON.stringify({ verdict: "revise", summary: "x", items: [{ ...diagnosticFinding, rationale: "é".repeat(1025) }] }), "findings_cap"],
+ ["findings_cap aggregate", JSON.stringify({ verdict: "revise", summary: "x", items: Array.from({ length: 20 }, () => ({ ...diagnosticFinding, rationale: "é".repeat(850) })) }), "findings_cap"],
+] as const) {
+ it("malformed diagnostic validateVerdict " + name, () => {
+  assert.throws(() => validateVerdict(text), (err: unknown) => {
+   assert.ok(err instanceof CrossCheckMalformedError);
+   assert.equal(err.subreason, subreason);
+   return true;
+  });
+ });
+}
+
+it("malformed diagnostic validateCodeFindings code_findings", () => {
+ assert.throws(() => validateCodeFindings("{broken"), (err: unknown) => {
+  assert.ok(err instanceof CrossCheckMalformedError);
+  assert.equal(err.subreason, "code_findings");
+  return true;
+ });
+});
 const claim = (subscription = false): ClaimResponse => ({
  kind: "cross_check", run_id: "check", issue_iid: null, issue_title: "Issue",
  repo: { id: "repo", full_name: "owner/repo", url: "https://example.test/owner/repo", clone_url: "https://example.test/owner/repo.git", default_branch: "main" },
@@ -187,12 +212,12 @@ it("code checker uses the confined provider and file broker and returns only fin
  assert.match(input, /<code_context_[a-f0-9]{32}>/);
 });
 
-// PRD #2170. The goldens are the sha256 of the pre-change brief and nonce-stripped DATA prompt for
-// codeClaim() (computed from the tree before owner guidance and repository instructions existed).
+// PRD #3167 M2: coverage brief and nonce-stripped DATA prompt goldens.
+// These are separate from the byte-frozen pre-M2 replay corpus pins.
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 const stripNonces = (text: string) => text.replace(/_[a-f0-9]{32}>/g, "_NONCE>");
-const GOLDEN_CODE_PROMPT = "40aa10669f27861a6f35882e8c95b82b67979a37b738cb53c01506ff1eda0f03";
-const GOLDEN_CODEX_CODE_BRIEF = "29e410c44476fb6e2560fd03c2d990de24cee2193e6df6c250085cb1b39252a5";
+const GOLDEN_CODE_PROMPT = "f95c12b182d1a8b0b4426cfb0d52558d982a7da3965c860456e935d3ba201581";
+const GOLDEN_CODEX_CODE_BRIEF = "d8dd1257d920c6aa5f467d54f7a7b169ef445facf05932d45790d7f500fc5841";
 
 async function codeRequests(c: ClaimResponse) {
  const r = rig({ claim: c, notes: (emit) => r.terminal(emit, '{"findings":[]}') });

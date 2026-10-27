@@ -1,6 +1,8 @@
 package workersvc
 
 import (
+	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -31,6 +33,21 @@ func TestDeriveCodexAccountAction(t *testing.T) {
 		mutate func(in *codexAccountActionInputs)
 		want   string
 	}{
+		// SQL projects receipt/consumption timing into retryPending. The distinct
+		// eligibility, expiry and failure cases live in TestCodexAccountActionRetryPendingLiveDB.
+		{"quarantined, retry pending", func(in *codexAccountActionInputs) {
+			quarantine(in)
+			in.retryPending = true
+		}, CodexAccountActionReconciling},
+		{"quarantined, retry pending but reauth required", func(in *codexAccountActionInputs) {
+			quarantine(in)
+			in.retryPending, in.reauthRequired = true, true
+		}, CodexAccountActionReloginRequired},
+		{"identity change outranks retry pending", func(in *codexAccountActionInputs) {
+			quarantine(in)
+			in.retryPending = true
+			in.release.currentProviderUserID = "changed"
+		}, CodexAccountActionReloginRequired},
 		// D6 table rows.
 		{"account not quarantined, predicate passes", func(*codexAccountActionInputs) {}, CodexAccountActionResuming},
 		{"account committed, predicate passes", func(in *codexAccountActionInputs) { in.release.coordState = codexCoordCommitted },
@@ -132,10 +149,15 @@ func TestCodexAccountActionInputsFromRow(t *testing.T) {
 		AccountID:              acct,
 		LeaseDeadline:          pgtype.Timestamptz{Time: now.Add(time.Second), Valid: true},
 		ReauthRequired:         pgtype.Bool{Bool: true, Valid: true},
+		RetryPending:           true,
 	}
 	in := codexAccountActionInputsFromRow(row, now)
-	if in.aliasDeleted || !in.aliasPresent || !in.accountLinked || !in.leaseLive || in.leaseExpired || !in.reauthRequired {
+	if in.aliasDeleted || !in.aliasPresent || !in.accountLinked || !in.leaseLive || in.leaseExpired || !in.reauthRequired || !in.retryPending {
 		t.Fatalf("linked row projected as %+v", in)
+	}
+	row.RetryPending = false
+	if in := codexAccountActionInputsFromRow(row, now); in.retryPending {
+		t.Fatal("false retry projection became pending")
 	}
 	row.LeaseDeadline.Time = now
 	if in := codexAccountActionInputsFromRow(row, now); in.leaseLive || !in.leaseExpired {
@@ -149,6 +171,34 @@ func TestCodexAccountActionInputsFromRow(t *testing.T) {
 	in = codexAccountActionInputsFromRow(row, now)
 	if !in.aliasDeleted || in.aliasPresent || in.accountLinked {
 		t.Fatalf("deleted-alias row projected as %+v", in)
+	}
+}
+
+type actionQueryStore struct {
+	Store
+	arg   store.ListCodexAccountActionInputsParams
+	rows  []store.ListCodexAccountActionInputsRow
+	calls int
+}
+
+func (s *actionQueryStore) ListCodexAccountActionInputs(_ context.Context, arg store.ListCodexAccountActionInputsParams) ([]store.ListCodexAccountActionInputsRow, error) {
+	s.arg = arg
+	s.calls++
+	return s.rows, nil
+}
+
+func TestCodexAccountActionsRetryQueryParams(t *testing.T) {
+	ids := []uuid.UUID{uuid.New(), uuid.New()}
+	st := &actionQueryStore{}
+	svc := New(st, nil, testParams())
+	if _, err := svc.CodexAccountActionsForRuns(context.Background(), ids); err != nil {
+		t.Fatal(err)
+	}
+	if st.calls != 1 || !slices.Equal(st.arg.RunIds, ids) || st.arg.ReuseInFlightMicroseconds != codexRefreshReuseInFlightBound.Microseconds() || st.arg.ReuseInFlightMicroseconds != 52140000 {
+		t.Fatalf("query params: calls=%d arg=%+v", st.calls, st.arg)
+	}
+	if _, err := svc.CodexAccountActionsForRuns(context.Background(), nil); err != nil || st.calls != 1 {
+		t.Fatalf("empty batch: calls=%d err=%v", st.calls, err)
 	}
 }
 

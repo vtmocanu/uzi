@@ -11,7 +11,7 @@
 #
 # uzi's benign "CLI is behind server" line goes to stderr and is discarded here.
 #
-# Usage: watch-run.sh <run-id> [stop-csv] [interval-secs] [max-polls] [min-plan-seq]
+# Usage: watch-run.sh <run-id> [stop-csv] [interval-secs] [max-polls] [min-plan-seq] [min-question-seq]
 #   stop-csv (default) covers a plan gate, a question park, and every terminal
 #   state: completed,failed,cancelled,awaiting_approval,awaiting_input
 #   (`paused` and recovery_wait/worker_requeue_exhausted always stop; see below)
@@ -29,12 +29,26 @@
 #     uzi run revise <id> -m "…"
 #     watch-run.sh <id> "" "" "" "$SEQ"
 #
+#   min-question-seq (optional 6th arg) — use it when re-arming right after
+#   `uzi run answer` or `uzi run decide`: the status can still read the answered
+#   `awaiting_input` for a poll or two, and a plain re-arm stops on it at once,
+#   leaving the run unwatched. When set, `awaiting_input` only stops the watch once
+#   the newest question message is no longer the answered one: only a newest
+#   question seq exactly equal to min-question-seq keeps polling (attention checks
+#   still run); a newer, missing, unreadable or lower seq stops, never masking a
+#   park. Capture it before answering:
+#     QSEQ=$(uzi run logs <id> --json | jq -rs '[.[]|select(.kind=="question")|.seq]|max // 0')
+#
 # Attention stop (read-only; never changes run state). A dead run can read `running`
 # forever, so status-only polling cannot see it. When the run is non-terminal and NOT yet in
 # the stop set, each poll also reads `uzi run get --json` and counts a poll as "attention"
-# when either holds:
+# when any of these holds:
 #   - health is set, not `ok`, and not in WATCH_ATTENTION_IGNORE_HEALTH (default `slow`,
 #     the near-timeout hint): stalled, looping, waiting_worker, approval_idle, ...
+#   - status is recovery_wait with recovery_wait_cause `data_volume_full` (a counted disk park: the
+#     worker's data volume is nearly full; the run fails once its counted parks reach the cap, so
+#     an unattended loop of parks must not pass silently). Its episode is
+#     `data_volume_full@park<disk_park_count>`, so acking one park still alerts on the next.
 #   - status is running/claimed, the run has a worker_id, and `uzi worker list --json`
 #     shows that worker's last_heartbeat_at older than WATCH_HEARTBEAT_STALE_SECS
 #     (default 180; the api default WORKER_HEARTBEAT_STALE is 45s, configurable). An unreadable worker list
@@ -53,15 +67,15 @@
 # Owner-decision park: `recovery_wait` with recovery_wait_cause `worker_requeue_exhausted` never
 # resumes on its own (the owner must Resume or Cancel), so it always stops the watch, whatever the
 # stop set (also when the stop set names recovery_wait): STOP=recovery_wait:worker_requeue_exhausted,
-# RESULT=stop:recovery_wait, exit 0. Other recovery_wait causes keep their existing behaviour: they
-# keep polling unless the stop set names recovery_wait.
+# RESULT=stop:recovery_wait, exit 0. Other recovery_wait causes keep polling unless the stop set names
+# recovery_wait, except a `data_volume_full` park, which is an attention signal (above).
 # `paused` never resumes on its own either (an owner pause, or hold_reason budget_exhausted /
 # completion hold that needs extend, resume or decide), so it always stops the watch, whatever the
 # stop set: STOP=paused, a NOTE with hold_reason, RESULT=stop:paused, exit 0.
 # Exit codes: 0 stop-set state (not necessarily success), 3 coverage elapsed,
 # 4 needs_attention. The final RESULT line distinguishes these outcomes.
 set -u
-RID="${1:?usage: watch-run.sh <run-id> [stop-csv] [interval] [max] [min-plan-seq]}"
+RID="${1:?usage: watch-run.sh <run-id> [stop-csv] [interval] [max] [min-plan-seq] [min-question-seq]}"
 STOP="${2:-completed,failed,cancelled,awaiting_approval,awaiting_input}"
 # 30s default balances gate-detection latency against poll volume; MAX 240 keeps
 # total coverage at ~2h (30*240=7200s) so a long implementation phase still fits.
@@ -70,6 +84,7 @@ STOP="${2:-completed,failed,cancelled,awaiting_approval,awaiting_input}"
 INT="${3:-30}"
 MAX="${4:-240}"
 MIN_PLAN_SEQ="${5:-}"
+MIN_QUESTION_SEQ="${6:-}"
 ATTN_POLLS="${WATCH_ATTENTION_POLLS:-3}"
 HB_STALE="${WATCH_HEARTBEAT_STALE_SECS:-180}"
 ATTN_IGNORE="${WATCH_ATTENTION_IGNORE_HEALTH:-slow}"
@@ -80,10 +95,19 @@ max_plan_seq() {
     | jq -rs '[.[] | select(.kind=="plan") | .seq] | max // 0'
 }
 
+# Prints the newest question seq, or nothing when the logs are unreadable or hold none.
+max_question_seq() {
+  local logs
+  logs="$(uzi run logs "$RID" --json 2>/dev/null)" || return 0
+  # Any question without a positive integer seq makes the evidence uncertain: print nothing.
+  printf '%s' "$logs" | jq -rs '[.[] | select(.kind=="question") | .seq]
+    | if length > 0 and all(type=="number" and . > 0 and . == floor) then max else empty end' 2>/dev/null || true
+}
+
 # attention_check returns 0 (and sets ATTN_EVIDENCE) when this poll shows attention, 1 when
 # it does not or nothing is readable. Never writes to uzi.
 attention_check() {
-  local status="$1" rj="$2" health reason since wid hb_age="" wstatus="" hb dat=0 wl w
+  local status="$1" rj="$2" health reason since wid hb_age="" wstatus="" hb dat=0 wl w parks ep disk=""
   printf '%s' "$rj" | jq -e 'type=="object"' >/dev/null 2>&1 || return 1
   health="$(printf '%s' "$rj" | jq -r '.health // ""')"
   reason="$(printf '%s' "$rj" | jq -r '(.health_reason // "")|gsub("\n";" ")|.[0:200]')"
@@ -100,6 +124,15 @@ attention_check() {
             esac ;;
        esac ;;
   esac
+  if [ "$status" = recovery_wait ] && [ "$(printf '%s' "$rj" | jq -r '.recovery_wait_cause // ""')" = data_volume_full ]; then
+    parks="$(printf '%s' "$rj" | jq -r '.disk_park_count // "unknown"')"
+    ep="data_volume_full@park$parks"
+    disk=" recovery_wait_cause=data_volume_full disk_park_count=$parks"
+    case ",$ATTN_ACK," in
+      *",$ep,"*) ;;
+      *) dat=1; ATTN_EPISODE="${ATTN_EPISODE:+$ATTN_EPISODE,}$ep" ;;
+    esac
+  fi
   if [ -n "$wid" ] && { [ "$status" = running ] || [ "$status" = claimed ]; }; then
     wl="$(uzi worker list --json 2>/dev/null)" || wl=""
     w="$(printf '%s' "$wl" | jq -c --arg id "$wid" '[.[]?|select(.id==$id)]|first // empty' 2>/dev/null)" || w=""
@@ -114,7 +147,7 @@ attention_check() {
     fi
   fi
   [ "$dat" -eq 1 ] || return 1
-  ATTN_EVIDENCE="status=$status health=${health:-none} health_reason='${reason}' health_since=${since:-none} worker=${wid:-none} worker_status=${wstatus:-unknown} heartbeat_age_secs=${hb_age:-unknown} (stale after ${HB_STALE}s)"
+  ATTN_EVIDENCE="status=$status health=${health:-none} health_reason='${reason}' health_since=${since:-none} worker=${wid:-none} worker_status=${wstatus:-unknown} heartbeat_age_secs=${hb_age:-unknown} (stale after ${HB_STALE}s)$disk"
   return 0
 }
 
@@ -161,9 +194,24 @@ while [ "$i" -lt "$MAX" ]; do
         printf 'RESULT=stop:%s\n' "$s"
         exit 0
       fi
-      printf 'STOP=%s\n' "$s"
-      printf 'RESULT=stop:%s\n' "$s"
-      exit 0
+      # An answered question can still read awaiting_input briefly: keep polling (with the
+      # attention checks below) only while the newest question is positively the answered one.
+      answered=0
+      if [ "$s" = "awaiting_input" ] && [ -n "$MIN_QUESTION_SEQ" ]; then
+        cur="$(max_question_seq)"
+        if [ "$cur" = "$MIN_QUESTION_SEQ" ]; then
+          answered=1
+        else
+          printf 'STOP=%s (newest question seq=%s, answered=%s)\n' "$s" "${cur:-none}" "$MIN_QUESTION_SEQ"
+          printf 'RESULT=stop:%s\n' "$s"
+          exit 0
+        fi
+      fi
+      if [ "$answered" -eq 0 ]; then
+        printf 'STOP=%s\n' "$s"
+        printf 'RESULT=stop:%s\n' "$s"
+        exit 0
+      fi
       ;;
   esac
   case "$s" in
@@ -180,8 +228,8 @@ while [ "$i" -lt "$MAX" ]; do
           printf 'NOTE investigate only: stalled health does not prove the run is dead and a stale heartbeat does not prove work was lost; this poller changed nothing\n'
           ack="$ATTN_ACK"
           if [ -n "$ATTN_EPISODE" ]; then ack="${ack:+$ack,}$ATTN_EPISODE"; fi
-          printf 'REARM=WATCH_ATTENTION_ACK=%q WATCH_ATTENTION_POLLS=%q WATCH_HEARTBEAT_STALE_SECS=%q WATCH_ATTENTION_IGNORE_HEALTH=%q %q %q %q %q %q %q\n' \
-            "$ack" "$ATTN_POLLS" "$HB_STALE" "$ATTN_IGNORE" "$0" "$RID" "$STOP" "$INT" "$MAX" "$MIN_PLAN_SEQ"
+          printf 'REARM=WATCH_ATTENTION_ACK=%q WATCH_ATTENTION_POLLS=%q WATCH_HEARTBEAT_STALE_SECS=%q WATCH_ATTENTION_IGNORE_HEALTH=%q %q %q %q %q %q %q %q\n' \
+            "$ack" "$ATTN_POLLS" "$HB_STALE" "$ATTN_IGNORE" "$0" "$RID" "$STOP" "$INT" "$MAX" "$MIN_PLAN_SEQ" "$MIN_QUESTION_SEQ"
           printf 'NOTE coverage ended: after investigating, run the REARM line in the background (a stale heartbeat is never acked and stops again)\n'
           printf 'RESULT=attention\n'
           exit 4

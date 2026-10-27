@@ -1,4 +1,9 @@
 {
+  "manual_cordoned_at": null,
+  "manual_cordoned_by": null,
+  "manual_cordoned_by_label": null,
+  "manual_cordon_reason": null,
+  "effective_cordoned": false,
   "id": "",
   "name": "",
   "status": "",

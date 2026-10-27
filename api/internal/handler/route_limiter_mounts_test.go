@@ -386,6 +386,7 @@ var wantRouteMounts = []routeMount{
 	// call → noLimiter, like the agent-source GET beside it.
 	{"GET", "/api/admin/release-check", noLimiter},
 	{"GET", "/api/admin/settings", noLimiter},
+	{"GET", "/api/admin/maintenance", noLimiter},
 	{"GET", "/api/admin/docker-allowlist-repos", noLimiter},
 	{"GET", "/api/admin/slack/status", noLimiter},
 	{"GET", "/api/admin/usage", noLimiter},
@@ -472,6 +473,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/me/runs/in-progress-count", noLimiter},
 	// Schedule list/get (PRD #241 M4): owner-scoped reads, no forge → noLimiter.
 	{"GET", "/api/me/schedules/", noLimiter},
+	{"GET", "/api/maintenance/", noLimiter},
 	{"GET", "/api/schedules/{id}", noLimiter},
 	{"GET", "/api/schedules/{id}/ci-episodes", noLimiter},
 	// Pause-all singleton (PRD #1093 M2, D7): the user-level kill switch. All three are
@@ -621,6 +623,8 @@ var wantRouteMounts = []routeMount{
 	// Schedule edit (PRD #241 M4): owner-scoped DB update, no forge → noLimiter.
 	{"PATCH", "/api/schedules/{id}", noLimiter},
 	{"PATCH", "/api/workers/{id}", noLimiter},
+	{"POST", "/api/workers/{id}/cordon", noLimiter},
+	{"DELETE", "/api/workers/{id}/cordon", noLimiter},
 	// PRD #66 M8 (D8): admin per-repo guardrail override set — an admin-only,
 	// unscoped-by-id DB write, no forge call → noLimiter.
 	{"POST", "/api/admin/repos/{id}/guardrail-override", noLimiter},
@@ -960,6 +964,7 @@ var wantRouteMounts = []routeMount{
 	// (set_via='admin', ON CONFLICT DO NOTHING), no forge call and no token spend → noLimiter.
 	{"PUT", "/api/admin/judge/recommendations/disposition", noLimiter},
 	{"PUT", "/api/admin/settings", noLimiter},
+	{"PUT", "/api/admin/maintenance", noLimiter},
 	{"PUT", "/api/admin/users/{id}/ci-autofix", noLimiter},
 	// PRD #1976 M1: allow one site list for a product — a cookie-only admin DB write → noLimiter.
 	{"PUT", "/api/admin/products/{id}/egress-profiles/{name}", noLimiter},

@@ -51,6 +51,7 @@ type fakeChatActionSubmitter struct {
 	continueErr  error
 	liveChatOK   bool // M6: LiveChatForUser (default false = no live chat)
 	liveChatErr  error
+	maintenance  string // PRD #3454: MaintenanceNotice text ("" = not paused)
 }
 
 type endCall struct {
@@ -92,6 +93,8 @@ func (f *fakeChatActionSubmitter) ContinueChat(_ context.Context, userID, runID 
 func (f *fakeChatActionSubmitter) LiveChatForUser(context.Context, uuid.UUID) (store.Run, bool, error) {
 	return store.Run{}, f.liveChatOK, f.liveChatErr
 }
+
+func (f *fakeChatActionSubmitter) MaintenanceNotice(context.Context) string { return f.maintenance }
 
 func runCardPress(actionID, repoPath string, issueIID int64) BlockAction {
 	return BlockAction{
@@ -798,4 +801,88 @@ func TestChatActionIgnoresForeignNamespace(t *testing.T) {
 	if len(sub.confirms) != 0 || len(sub.dismisses) != 0 || len(fp.ephemerals) != 0 {
 		t.Errorf("a slack_gate_* action must be ignored by ChatActions")
 	}
+}
+
+// The admin-written reason inside the notice must never reach Slack as live mrkdwn: every
+// sink (status block, card, and the plain-text ephemeral fallback) escapes it exactly once.
+func TestChatActionMaintenanceNoticeEscapesReason(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	const hostile = "drain <!channel> <https://x.example|y>"
+	notice := "uzi is in maintenance mode: new work is queued and starts when maintenance ends. Reason: " + hostile
+	check := func(t *testing.T, label, got string) {
+		t.Helper()
+		if !strings.Contains(got, "&lt;") || strings.Contains(got, "<!channel>") || strings.Contains(got, "<https://x.example|y>") {
+			t.Errorf("%s not escaped: %q", label, got)
+		}
+		if strings.Contains(got, "&amp;lt;") {
+			t.Errorf("%s double escaped: %q", label, got)
+		}
+	}
+
+	t.Run("continue blocks", func(t *testing.T) {
+		sub := &fakeChatActionSubmitter{continuedRun: uuid.New(), maintenance: notice}
+		fp := &fakePoster{}
+		NewChatActions(&fakeChatActionStore{user: user}, sub, fp, fixedBase, nil).
+			HandleBlockAction(context.Background(), lifecyclePress(ActionChatContinue, uuid.New()))
+		if len(fp.blocks) != 1 {
+			t.Fatalf("blocks = %+v", fp.blocks)
+		}
+		check(t, "status block", fp.blocks[0].sectionText)
+	})
+	t.Run("continue ephemeral fallback", func(t *testing.T) {
+		sub := &fakeChatActionSubmitter{continuedRun: uuid.New(), maintenance: notice}
+		fp := &fakePoster{postErr: errors.New("slack down")}
+		NewChatActions(&fakeChatActionStore{user: user}, sub, fp, fixedBase, nil).
+			HandleBlockAction(context.Background(), lifecyclePress(ActionChatContinue, uuid.New()))
+		if len(fp.ephemerals) != 1 {
+			t.Fatalf("ephemerals = %+v", fp.ephemerals)
+		}
+		check(t, "ephemeral", fp.ephemerals[0].text)
+	})
+	t.Run("start run card", func(t *testing.T) {
+		sub := &fakeChatActionSubmitter{startedRun: uuid.New(), maintenance: notice}
+		fp := &fakePoster{}
+		NewChatActions(&fakeChatActionStore{user: user}, sub, fp, fixedBase, nil).
+			HandleBlockAction(context.Background(), runCardPress(ActionChatRunStart, "grp/repo", 42))
+		if len(fp.updateBlocks) != 1 {
+			t.Fatalf("updateBlocks = %+v", fp.updateBlocks)
+		}
+		check(t, "card", fp.updateBlocks[0].sectionText)
+	})
+}
+
+// PRD #3454: the resumed chat's status message and a Start-run card both carry the maintenance
+// notice while the pause is active.
+func TestChatActionMaintenanceNotice(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	const notice = "uzi is in maintenance mode: new work is queued and starts when maintenance ends."
+
+	t.Run("continue", func(t *testing.T) {
+		sub := &fakeChatActionSubmitter{continuedRun: uuid.New(), maintenance: notice}
+		fp := &fakePoster{}
+		c := NewChatActions(&fakeChatActionStore{user: user}, sub, fp, fixedBase, nil)
+		c.HandleBlockAction(context.Background(), lifecyclePress(ActionChatContinue, uuid.New()))
+		if len(fp.blocks) != 1 || !strings.Contains(fp.blocks[0].sectionText, notice) {
+			t.Fatalf("continued status must carry the notice, got %+v", fp.blocks)
+		}
+	})
+	t.Run("continue not paused", func(t *testing.T) {
+		sub := &fakeChatActionSubmitter{continuedRun: uuid.New()}
+		fp := &fakePoster{}
+		c := NewChatActions(&fakeChatActionStore{user: user}, sub, fp, fixedBase, nil)
+		c.HandleBlockAction(context.Background(), lifecyclePress(ActionChatContinue, uuid.New()))
+		if len(fp.blocks) != 1 || strings.Contains(fp.blocks[0].sectionText, "maintenance") {
+			t.Fatalf("no notice expected, got %+v", fp.blocks)
+		}
+	})
+	t.Run("start run", func(t *testing.T) {
+		sub := &fakeChatActionSubmitter{startedRun: uuid.New(), maintenance: notice}
+		fp := &fakePoster{}
+		c := NewChatActions(&fakeChatActionStore{user: user}, sub, fp, fixedBase, nil)
+		c.HandleBlockAction(context.Background(), runCardPress(ActionChatRunStart, "grp/repo", 42))
+		if len(fp.updateBlocks) != 1 || !strings.Contains(fp.updateBlocks[0].sectionText, notice) ||
+			!strings.Contains(strings.ToLower(fp.updateBlocks[0].sectionText), "run started") {
+			t.Fatalf("started card must say started and carry the notice, got %+v", fp.updateBlocks)
+		}
+	})
 }

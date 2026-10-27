@@ -249,6 +249,11 @@ refresh operations and durable latest-state reconciliation remain production
 requirements; no prior-token reuse or concurrent-refresh guarantee follows from
 these unchanged M0 measurements.
 
+[ADR-3523](3523-codex-refresh-provider-error-reuse.md) adds one survivor retry
+for a durable receipt of an original non-rejection refresh error, outside the
+callback. It supersedes the no-reuse policy only for that case; these historical
+measurements still provide no live proof of prior-token reuse.
+
 ## Model and effort decision
 
 The refreshed server catalog visible to 0.153.2 contained:
@@ -480,7 +485,39 @@ it admits no provider turn or normal callback, admission reopen, credential
 reconciliation, refresh or release, PAT, credential-bearing environment or overlay.
 Lost supervision or incomplete settlement grants no capture authority. This context
 mints neither a credentialed nor a completion permit. See the
-[remaining sink gaps](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+[sink contracts and remaining terminal gap](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+
+**Slice B contract, Refs #2852 (AI-synced 2026-10-23):** healthy Codex wall
+park, completion hold and ordinary recovery hold the existing process permit from
+before source inspection through capture and source-dependent settlement. The
+private authenticated capability is bound to its exact flight/executor and callback
+lifetime; Git children use the existing supervisor and await full cleanup. A's
+credential-free fallback starts only after the primary scope joins, within the
+same deadline. Unexpected Codex credential-switch entries retain without capture.
+B left Claude behavior and terminal disposal unchanged; subsequent C strengthens
+terminal disposal as described below. The linked
+[sink contract](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
+records the budget, held-finalize continuation, publication and remaining writer limits.
+
+**Subsequent slice C contract, Refs #2852 (AI-synced 2026-10-24):**
+`tablesCleared` synchronously and irrevocably closes admission at disposal entry.
+`disposeTools` is single-flight; open/closing entry, pending launches/callbacks,
+unmatched poison, late roots/admission faults or unclean cleanup stays incomplete.
+The exact disposal result is revocable, bound to registry facts and successful
+facade cleanup; cleared tables or an optional killAgentTree call are not proof.
+Release-dependent coverage waits for disposal of the exact executor/facade.
+Skipped/incomplete/swapped proof retains clone, journal, inventory and paired skills
+with a distinct terminal-disposal diagnostic. A/B handler settlement defers this
+request without reacquiring either safety queue. Post-disposal source reads are
+inert and hardened; witness checks continue through destructive dispatches.
+Current-process completion bindings record exact executor/facade in memory before
+durable bind; knownCodex missing/non-disposed/swapped proof retains before inventory,
+with no legacy fallback. KnownClaude is unchanged. Owner decision 2026-10-24
+narrows R1857-02(e): persisted/unknown-provenance sources keep today's behavior for
+both harnesses, without prior-process topology proof or durable format changes.
+This is registered-process strengthening; Docker accepted invisible creates (#1860),
+unregistered/sibling writers and Claude terminal residuals remain. The canonical
+sink contract records the unchanged retention and ownership boundaries.
 
 Pre-start capture uses the existing capture-only facade. A later owned capture can
 also select a fresh production capture-only facade for the exact retired public
@@ -568,8 +605,12 @@ Trusted-worker bare Git keeps its worker identity;
 `worker_pat` is the historical identity name, not evidence of credential presence.
 Credential presence is checked separately; free capture does not downgrade bare
 Git to the isolated clone identity. Blanket refusal of free capture was rejected:
-it leaves uncaptured work in an ephemeral clone instead of moving capturable work
-into the persistent worker bare and regresses verified park/pause preservation.
+it strands capturable work, including work awaiting verified capture, in the source
+clone instead of moving verified bytes into the persistent worker bare and regresses
+verified park/pause preservation. Older Docker emptyDir layouts could lose that source
+on pod replacement; [ADR-3153](3153-runner-shared-pvc-subpath.md) migrated workers
+keep it on the data PVC. Neither layout nor successful capture grants deletion authority
+(AI-synced 2026-10-23).
 Local capture alone proves neither origin publication nor permission to dispose
 of the source. Worker-provided global Git
 config may configure drivers; ordinary seeding trust is unchanged. These

@@ -176,6 +176,12 @@ type Config struct {
 	WorkerMemoryGuardResponseBudgetMs int64
 	WorkerMemoryGuardMaxInterventions int64
 
+	// WorkerGoBuildParallelism / WorkerGoMaxProcs are optional caps relayed as
+	// WORKER_GO_BUILD_PARALLELISM / WORKER_GO_MAXPROCS. 0 means unset (the env is
+	// not rendered).
+	WorkerGoBuildParallelism int
+	WorkerGoMaxProcs         int
+
 	// --- Codex uid-split profile (PRD #1493 M1) -------------------------------
 	// WorkerUIDSplit opts the fleet into the Codex uid-split worker profile
 	// (UZI_WORKER_UID_SPLIT, default false). When on, the controller renders the
@@ -246,6 +252,7 @@ type Config struct {
 	// renders no docker workers; a docker worker in the poll is then skipped with a
 	// loud error rather than rendered into the wrong (restricted) namespace.
 	WorkerDockerNamespace string
+	WorkerPodEpochRuntime string
 	// WorkerDinDImage is the fully-pinned DinD sidecar image
 	// (docker:<tag>-dind-rootless@sha256:... or, non-rootless, docker:<tag>-dind@...).
 	// It is operator config, not wire data — the api never names an image — and shared
@@ -422,6 +429,12 @@ func Load() (Config, error) {
 // an unknown release, and a guessed namespace means listing somewhere this
 // controller has no RBAC.
 func loadWorkerSettings(cfg *Config) error {
+	cfg.WorkerPodEpochRuntime = os.Getenv("UZI_WORKER_POD_EPOCH_RUNTIME")
+	switch cfg.WorkerPodEpochRuntime {
+	case "", "containerd-runc", "crio-crun":
+	default:
+		return fmt.Errorf("UZI_WORKER_POD_EPOCH_RUNTIME must be unset, containerd-runc or crio-crun")
+	}
 	required := []struct {
 		key  string
 		dst  *string
@@ -462,6 +475,9 @@ func loadWorkerSettings(cfg *Config) error {
 	// pod. Raising it opts into the intra-user concurrency residuals documented in
 	// docs/worker-setup.md (PRD #58 Decision 7).
 	if err := loadWorkerMemoryGuard(cfg); err != nil {
+		return err
+	}
+	if err := loadWorkerGoConcurrency(cfg); err != nil {
 		return err
 	}
 

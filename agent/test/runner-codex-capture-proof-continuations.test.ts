@@ -35,10 +35,17 @@ it("non-Codex accepted owner pause retains the public legacy continuation", asyn
 
 // Drive only public executor callbacks. Wrappers below delay real journal/settlement
 // operations; none supplies authority, implements exclusion, or changes their result.
+// The test owns the clock: once the continuation starts, Date.now jumps forward by a known
+// amount, so deadline assertions compare runner-enforced values, not clock-read jitter.
 for (const route of ["uncertain-ACK", "guarded-question", "outer-owner-question"] as const) {
-  for (const refusal of [false, true]) it(`owner pause continuation ${route} fresh-proof-${refusal ? "refused" : "accepted"}`, async t => {
+  const modes = route === "uncertain-ACK" ? ["accepted", "refused", "expired"] as const : ["accepted", "refused"] as const;
+  for (const mode of modes) it(`owner pause continuation ${route} ${mode === "expired" ? "deadline-expired" : `fresh-proof-${mode}`}`, async t => {
+    const refusal = mode === "refused", expired = mode === "expired";
     const o = observe();
     t.after(() => o.restore());
+    const realNow = Date.now.bind(Date);
+    let skew = 0;
+    t.mock.method(Date, "now", () => realNow() + skew);
     const claim = { ...gitlabClaim(2858), claim_generation: 1, park_run_supported: true, auto_approve: false };
     api.parkRunGeneration = 1;
     api.parkRunOwnership = { status: route === "uncertain-ACK" ? "paused" : "running",
@@ -49,15 +56,29 @@ for (const route of ["uncertain-ACK", "guarded-question", "outer-owner-question"
     let beforeAuth = { refresh: 0, release: 0 };
     const sources: string[] = [], pins: unknown[] = [], inventories: unknown[] = [];
     const questionIds: string[] = [];
-    const budgets: { at: number; ms: number; continuation: boolean; deadline?: number }[] = [];
+    const budgets: { at: number; ms: number; continuation: boolean }[] = [];
+    // Absolute deadlines the runner hands to runFreeCapture and git.withRecoveryOperation.
+    const captureDeadlines: { continuation: boolean; deadlineAt: number }[] = [];
+    const recoveryDeadlines: number[] = [];
     let beforeJournal: unknown, cloneInode = 0;
     const mark = async () => {
       if (continuing) return;
+      // Accepted: 1 s later, still inside the original deadline. Expired: 1 s past it.
+      const original = captureDeadlines[0]?.deadlineAt;
+      if (route === "uncertain-ACK") {
+        assert.ok(original !== undefined, "initial park capture fixed the original deadline");
+        skew = expired ? original - realNow() + 1000 : 1000;
+      }
       continuing = true; o.arm();
       beforeAuth = { refresh: o.rig.refreshCalls(), release: o.rig.releaseCalls() };
       cloneInode = fs.statSync(clone).ino;
       beforeJournal = await recovery.inspect(claim.run_id);
     };
+    const recoveryOperation = git.withRecoveryOperation.bind(git);
+    t.mock.method(git, "withRecoveryOperation", (async (...args: Parameters<typeof recoveryOperation>) => {
+      if (continuing) recoveryDeadlines.push(args[1]);
+      return recoveryOperation(...args);
+    }) as typeof recoveryOperation);
     const branchTip = git.branchTip.bind(git);
     t.mock.method(git, "branchTip", async (...args: Parameters<typeof branchTip>) => {
       if (continuing && args[0] === clone) {
@@ -103,11 +124,11 @@ for (const route of ["uncertain-ACK", "guarded-question", "outer-owner-question"
     });
     const capture: typeof o.capture = async (ms, action, purpose, signal) => {
       captures++;
-      const row = { at: Date.now(), ms, continuation: continuing, deadline: undefined as number | undefined };
+      const row = { at: Date.now(), ms, continuation: continuing };
       budgets.push(row);
       if (continuing) continuationCaptures++;
       if ((continuing && refusal) || (!continuing && route === "guarded-question")) return { kind: "incomplete", errors: [{ category: "tool", message: "test initial continuation proof refused" }] };
-      return o.capture(ms, async held => { row.deadline = held.deadlineAt; return action(held); }, purpose, signal);
+      return o.capture(ms, action, purpose, signal);
     };
     const behavior: Executor["run"] = async ctx => {
       turns++; clone = ctx.worktreePath;
@@ -128,6 +149,11 @@ for (const route of ["uncertain-ACK", "guarded-question", "outer-owner-question"
       undefined, { checkpointIntervalMs: 0 });
     const internal = runner as any;
     const recovery = internal.recovery;
+    const freeCapture = internal.runFreeCapture.bind(runner);
+    t.mock.method(internal, "runFreeCapture", (...args: any[]) => {
+      captureDeadlines.push({ continuation: continuing, deadlineAt: args[2] });
+      return freeCapture(...args);
+    });
     const pin = recovery.pin.bind(recovery);
     t.mock.method(recovery, "pin", async (...args: any[]) => {
       if (!continuing) return pin(...args);
@@ -149,7 +175,8 @@ for (const route of ["uncertain-ACK", "guarded-question", "outer-owner-question"
     });
     await o.execute(runner.execute(claim));
     console.log("CONTINUATION", JSON.stringify({ route, refusal, captures, continuationCaptures, attempts,
-      turns, pausedAcks, questions, questionIds, sourceReads: sources.length, pins, inventories, budgets }));
+      turns, pausedAcks, questions, questionIds, sourceReads: sources.length, pins, inventories, budgets,
+      captureDeadlines, recoveryDeadlines, skew }));
     assert.equal(continuing, true, "the public continuation was reached");
     assert.equal(turns, 1, "no new provider turn");
     assert.equal(pausedAcks, route === "uncertain-ACK" ? 1 : 0, "continuation fabricates no new pause ACK");
@@ -163,8 +190,9 @@ for (const route of ["uncertain-ACK", "guarded-question", "outer-owner-question"
     assert.equal(fs.readFileSync(path.join(clone, "CONTINUATION.txt"), "utf8"), "exact owner pause content\n");
     assert.equal(fs.readFileSync(path.join(homeDir, "owner-session"), "utf8"), "original session");
     assert.equal(await branchTip(clone, "agent/issue-2858"), head, "no new WIP or fabricated capture");
-    assert.equal(continuationCaptures, 1, "a fresh proof is required even after an earlier capture");
-    if (refusal) {
+    assert.equal(continuationCaptures, expired ? 0 : 1,
+      expired ? "an expired deadline admits no fresh capture" : "a fresh proof is required even after an earlier capture");
+    if (refusal || expired) {
       assert.deepEqual(sources, [], "initial refusal performs no source read");
       assert.deepEqual(pins, [], "initial refusal performs no journal pin");
       assert.deepEqual(inventories, [], "initial refusal performs no guarded inventory settlement");
@@ -181,9 +209,18 @@ for (const route of ["uncertain-ACK", "guarded-question", "outer-owner-question"
       o.assertProof(false);
     }
     assert.ok(Array.isArray(beforeJournal));
-    if (route === "uncertain-ACK" && !refusal) {
-      assert.ok(budgets[1]!.deadline! <= budgets[0]!.deadline!,
+    if (route === "uncertain-ACK") {
+      const original = captureDeadlines[0]!;
+      const continuation = captureDeadlines.filter(row => row.continuation);
+      assert.equal(original.continuation, false);
+      assert.equal(continuation.length, 1, "one continuation capture attempt");
+      assert.ok(continuation[0]!.deadlineAt <= original.deadlineAt,
         "uncertain ACK continuation must preserve the original absolute capture deadline");
+      if (mode === "accepted") {
+        assert.ok(recoveryDeadlines.length > 0, "continuation work ran under a recovery deadline");
+        assert.ok(recoveryDeadlines.every(deadline => deadline <= original.deadlineAt),
+          "enforced recovery deadline never extends past the original capture deadline");
+      } else assert.deepEqual(recoveryDeadlines, [], "no continuation recovery operation without a fresh proof");
     }
   });
 }

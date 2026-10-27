@@ -72,6 +72,11 @@ func (forgeLookupFailsDB) QueryRow(context.Context, string, ...interface{}) pgx.
 	return blockedByErrRow{}
 }
 
+// Query fails like QueryRow: a queued run's GetRun also reads its derived queue_reason (PRD #3454).
+func (forgeLookupFailsDB) Query(context.Context, string, ...interface{}) (pgx.Rows, error) {
+	return nil, errors.New("no database in this test")
+}
+
 func (s *blockedByStore) totalCalls() int { return s.questionN + s.answerN + s.blockN }
 
 // questionPayloadJSON builds a `question` message payload with the given question id and

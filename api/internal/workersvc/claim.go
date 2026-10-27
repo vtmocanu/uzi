@@ -24,14 +24,18 @@ import (
 // structured templates (PRD #3 provides several subagents that map to
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
-	PolicyHoldResume        bool                         `json:"policy_hold_resume,omitempty"`
-	PolicyHoldFreshSession  bool                         `json:"policy_hold_fresh_session,omitempty"`
-	SemanticPlanning        *apitypes.SemanticEnrollment `json:"semantic_planning,omitempty"`
-	MemoryEpisode           int64                        `json:"memory_episode"`
-	MemoryInterventionCount int32                        `json:"memory_intervention_count"`
-	MemoryPolicy            *MemoryPolicy                `json:"memory_policy"`
-	CrossCheck              *ClaimPlanCrossCheck         `json:"cross_check,omitempty"`
-	RunID                   string                       `json:"run_id"`
+	PolicyHoldResume       bool `json:"policy_hold_resume,omitempty"`
+	PolicyHoldFreshSession bool `json:"policy_hold_fresh_session,omitempty"`
+	// CheckpointWriteUnresolved is admission-time evidence for validated enrolled tasks;
+	// nil leaves recovery status unknown for legacy claims.
+	CheckpointWriteUnresolved *bool                        `json:"checkpoint_write_unresolved,omitempty"`
+	CheckpointCoordinates     *CheckpointCoordinates       `json:"checkpoint_coordinates,omitempty"`
+	SemanticPlanning          *apitypes.SemanticEnrollment `json:"semantic_planning,omitempty"`
+	MemoryEpisode             int64                        `json:"memory_episode"`
+	MemoryInterventionCount   int32                        `json:"memory_intervention_count"`
+	MemoryPolicy              *MemoryPolicy                `json:"memory_policy"`
+	CrossCheck                *ClaimPlanCrossCheck         `json:"cross_check,omitempty"`
+	RunID                     string                       `json:"run_id"`
 	// Kind is the run kind (one of the runkind values; PRD #6). The worker branches on it: an
 	// issue run works IssueIID's card; a ci_fix run diagnoses + fixes Pipeline.
 	Kind string `json:"kind"`
@@ -64,6 +68,13 @@ type ClaimPayload struct {
 	LastSeq                  int32   `json:"last_seq"` // resume: continue message numbering
 	IterationCount           int32   `json:"iteration_count"`
 	RequeueCount             int32   `json:"requeue_count"`
+	// WorkerRecoveryEpisode combines the stored owner-authorized episode and retained parks.
+	// ResumeWorkerRecoveryEpisode increments the stored episode; retained parks advance
+	// this projection. Automatic requeues and claims
+	// preserve it. Always present, including zero; older workers ignore the key.
+	// Run-backed cross-check claims use the child run's episode, never the lead's.
+	// Non-run cross-check records have no recovery episode to project.
+	WorkerRecoveryEpisode int64 `json:"worker_recovery_episode"`
 	// ClaimGeneration is the general claim-lane counter (PRD #1296 M1, D2), incremented
 	// atomically in the ClaimRun transaction that produced this payload and read straight
 	// off the returned run row. The worker binds its durable source-journal identity to

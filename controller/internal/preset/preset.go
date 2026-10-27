@@ -59,7 +59,7 @@ import (
 // 2026-10-03 a single run's `deadcode` reached 7.3-7.5 GiB anon RSS at the old 8Gi limit
 // and was OOMKilled twice.
 //
-// Owner decision (settled 2026-09-14) keeps all three Burstable. Guaranteed
+// Owner decision (settled 2026-09-14) keeps every preset Burstable. Guaranteed
 // (request==limit) was considered and dropped: it would strand a full memory limit per
 // IDLE worker (~150Mi idle), and a Guaranteed `l` (12Gi limit at the time, now 20Gi)
 // could not fit beside the system pods on a ~13.58Gi node.
@@ -147,6 +147,15 @@ var sizes = map[string]Size{
 		MemoryRequest: resource.MustParse("14Gi"),
 		MemoryLimit:   resource.MustParse("20Gi"),
 		DataSize:      resource.MustParse("50Gi"), // issue #2013: headroom for long runs and concurrent build caches
+	},
+	// l-highmem (issue #3383) is an operator-selectable capacity choice for memory-heavy
+	// gates, not an OOM guarantee: same CPU and data size as `l`, 24Gi request / 32Gi limit.
+	"l-highmem": {
+		CPURequest:    resource.MustParse("1"),
+		CPULimit:      resource.MustParse("4"),
+		MemoryRequest: resource.MustParse("24Gi"),
+		MemoryLimit:   resource.MustParse("32Gi"),
+		DataSize:      resource.MustParse("50Gi"),
 	},
 }
 

@@ -334,7 +334,34 @@ try {
   assert.notEqual(executors[1], executors[2]);
   assert.notEqual(registries[0], registries[1]);
   assert.notEqual(homes[0], homes[1]);
-  assert.equal(registries[0]!.state(), "disposed");
+  const oldRegistry = registries[0]!;
+  assert.equal(oldRegistry.registryTablesCleared, true, "disposal already entered before observation");
+  assert.equal(oldRegistry.state(), "poisoned");
+  assert.equal(oldRegistry.isPoisoned(), true);
+  assert.equal(safety!.completedCaptureForTeardown(), undefined);
+  const poisonRevision = oldRegistry.cleanupPoisonRevision;
+  const firstDisposal = oldRegistry.disposeTools(1000);
+  const secondDisposal = oldRegistry.disposeTools(1000);
+  assert.equal(firstDisposal, secondDisposal);
+  const disposalOutcome = await firstDisposal;
+  assert.equal(disposalOutcome.kind, "incomplete");
+  if (disposalOutcome.kind !== "incomplete") throw new Error("expired capture must retain incomplete disposal");
+  assert.ok(disposalOutcome.errors.length > 0);
+  assert.equal(await secondDisposal, disposalOutcome);
+  assert.equal(oldRegistry.acceptsTerminalDisposal(disposalOutcome), false);
+  assert.equal(await oldRegistry.disposeTools(1000), disposalOutcome);
+  assert.equal(oldRegistry.cleanupPoisonRevision, poisonRevision);
+  assert.equal(oldRegistry.state(), "poisoned");
+  assert.equal(oldRegistry.isPoisoned(), true);
+  assert.equal(oldRegistry.registryTablesCleared, true);
+  assert.equal(safety!.completedCaptureForTeardown(), undefined);
+  // Admission refusal intentionally re-poisons, after the stable observations above.
+  assert.deepEqual(oldRegistry.reserveLaunch("provider"), { kind: "denied", reason: "admission_closed" });
+  assert.equal(oldRegistry.acceptsTerminalDisposal(disposalOutcome), false);
+  const refusedDisposal = oldRegistry.disposeTools(1000);
+  assert.equal(refusedDisposal, firstDisposal);
+  assert.equal(await refusedDisposal, disposalOutcome);
+  assert.equal(oldRegistry.acceptsTerminalDisposal(disposalOutcome), false);
   assert.equal(transports[0]!.turnStartCount, 1);
   assert.equal(transports[1]!.turnStartCount, 1);
   assert.deepEqual(transports[1]!.requests

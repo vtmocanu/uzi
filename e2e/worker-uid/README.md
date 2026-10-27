@@ -1,7 +1,7 @@
 # Worker UID test lane
 
 `task test:agent:worker-uid` builds the base worker image and runs the ownership and cleanup
-leaves from nine test files through its root entrypoint, which drops to the worker UID with runner
+leaves from ten test files through its root entrypoint, which drops to the worker UID with runner
 group membership and the production ambient capabilities. It runs offline, with
 disposable data and Nix mounts, and removes only its own containers and their
 anonymous volumes and its two named tool volumes after checking exact resource
@@ -97,7 +97,9 @@ A ninth file, `agent/test/codex-capture-reaper-real.test.ts`, adds four required
 
 An eighth file, `e2e/worker-uid/claude-command-real.test.mts`, contributes twelve required literal `it` leaves under the single `INIT_SKIP`-gated suite `real Claude guarded command lane` (issue #2471, M4). It runs in the same root-start worker-proof container (worker UID 10001, `UZI_UID_SPLIT=1`, runner UID 10002) and drives the real `ClaudeCommandLane` with the real launcher, image supervisor and `WorkerMemoryCommands`, entering each call through `lane.hook` then `lane.handle` as the SDK does. It proves: guard-style cancel and short-deadline expiry drain a detached command and its descendants; cancelling one run's command leaves a sibling run's command alive; another attempt's capture scan skips a live command's recorded root while the owner's reap still kills it; a candidate whose root start time differs from the enrolled one (simulating PID reuse by altering the observed start time, not by reusing a kernel PID) cancels nothing; a larger unattributed tree is never selected; the exact `worker_memory_pressure` result becomes the selected command's tool error; registrations from other sources, and unminted, cloned or foreign-context metadata, are never enrolled yet the command still runs; a command declaring its own worker marks gets no protection; a stopped supervisor, with a non-dumpable runner-UID descendant under it, cannot confirm disposal, so the lane is poisoned, exactly that supervisor is killed, and the owner's own reap reports `unverified` (never `quiescent`) while the descendant lives; and native Bash is kept when the guard is off. The non-dumpable descendant needs no prctl helper: the kernel marks a process non-dumpable when it execs a file it cannot read, so the case runs a worker-owned mode 0711 copy of the image's busybox (executable, not readable, by the runner UID) by its applet name. The inventory requires exactly one UID gate and all twelve literals under that suite; a missing, renamed, nonliteral, nested, duplicate or ungated leaf fails closed.
 
-The default inventory retains the five old files and adds the retained recovery file, the claude-command-launcher file (its three literal leaves above) and the claude-command-real file (its twelve); `node e2e/worker-uid/inventory.mjs command` emits the separate command
+A tenth file, `agent/test/code-cross-check-replay-uid-split.test.ts`, contributes one `INIT_SKIP`-gated leaf for the offline code cross-check replay (issue #3357): the real Codex fileop helper, launched as the command uid, stats and reads a file of the replay snapshot, while uid 10003 and the runner uid are denied (DAC) on the records file (created through the CLI's own helper), on listing the replay run directory, and on the replay-work repository. It calls no provider or model.
+
+The default inventory retains the five old files and adds the retained recovery file, the claude-command-launcher file (its three literal leaves above), the claude-command-real file (its twelve), the ninth file `codex-capture-reaper-real` and the tenth file `code-cross-check-replay-uid-split`; `node e2e/worker-uid/inventory.mjs command` emits the separate command
 inventory and `node e2e/worker-uid/inventory.mjs single` the single-uid inventory. `expected.json` / `results.xml`, `command-expected.json` /
 `command-results.xml` and `single-expected.json` / `single-<n>-results.xml` are checked separately. The JUnit
 checker requires each leaf exactly once and
@@ -261,7 +263,12 @@ Each class has two producers, 1 MiB chunks, at most 16/32 rounds per producer,
 and a combined logical budget of 32/64 MiB; the four budgets sum to
 `plan.allocationBytes`. These are planned worst-case logical budgets, not measured
 per-class charges or extra headroom from shared cache. They remain null before
-a validated plan is available.
+a validated plan is available. `dirty_disk` and `fsynced_read_file_cache` are measured
+charge classes that need not cross the hard threshold: H applies to the working set
+(`memory.current` minus `inactive_file`), and clean or written-back page cache is
+reclaimable. The hard-crossing proof therefore rests at least on the anonymous and
+tmpfs shmem growth, which the working set always counts; re-read active file pages may
+add to it. The safety budget and ceiling stay on raw `memory.current`.
 
 `oomEvents` names the first/last raw sample IDs and their before/after
 `oom`, `oom_kill`, and `oom_group_kill` counters, plus literal after-minus-before
@@ -272,10 +279,26 @@ No raw records are discarded. Host-aborted unknown metadata is null.
 The positive checker independently verifies these fields from raw evidence and
 still requires stable OOM counters across every raw record.
 
+Guard-facing PSI is controlled on these hard-path legs; memory charges and crossing
+evidence remain measured. The monitor hands the production guard a copy of each
+measured sample whose `memory.pressure` totals and averages are pinned to the first
+load sample's, so the guard's early-PSI branch cannot drain the load before a sample's
+working set reaches the hard threshold. On a host without PSI the pin is the reader's
+absence marker (`{unavailable: "absent"|"unsupported"}`), which the guard never treats
+as early evidence either. `guardPressure` records the pin (mode
+`pinned_to_first_load_sample`, the source `sampleId` and its PSI); the checker requires
+it and binds it to the first load sample's raw-verified PSI. `samples` and `rawSamples`
+keep the unmodified reads, and the sampled hard crossing stays mandatory. Early-PSI
+coverage lives in `agent/test/worker-memory-guard.test.ts`.
+
 The version-1 derivation attributes every adjacent periodic sample pair by real
-sample IDs, signed raw byte delta, completion interval, positive byte/ms rate and
-read gap. Peak rate and maximum gap select the earliest pair on ties; baseline
-jitter names the earliest minimum/maximum baseline samples and their byte values.
+sample IDs, signed byte delta of the working set (`memory.current` minus
+`inactive_file`; the field keeps its `rawDeltaBytes` name as the unclamped delta),
+completion interval, positive byte/ms rate and read gap. Peak rate and maximum gap select the earliest pair on ties; baseline
+jitter names the earliest minimum/maximum baseline samples and their working-set byte
+values. The plan keeps `baselineBytes` (raw maximum, for the safety budget and ceiling)
+and adds `workingSetBaselineBytes`, from which `H = workingSetBaselineBytes + 32 MiB`.
+Crossing brackets, growth, jitter and the fresh quiet dwell all use the working set.
 `samplingSchedule` separately records the 250 ms requested anchor/ordinal/deadline,
 actual dispatch, reader start/completion and signed lateness (early ticks are valid),
 plus maximum positive lateness and maximum absolute jitter in milliseconds.
@@ -296,9 +319,13 @@ unknown evidence set to null. No next size starts after incomplete cleanup or
 an active-leg failure. A demonstrated unavailable reader before any command
 launch permits collecting the other size's failed prerequisite evidence.
 
-Earlier local prerequisite probes lacked `memory.pressure` at both sizes.
-On any such host this fixture fails before load; it has no PSI substitute (only the Node diagnostic guarded leg below does) or
-privileged fallback. CI acceptance requires both complete successful bound
+Earlier local prerequisite probes lacked `memory.pressure` at both sizes. PSI is now
+optional on this lane: the fixture runs the production reader unchanged, so such a host
+yields the reader's absence marker in `pressure` (no synthesized PSI, no privileged
+fallback). The raw evidence keeps `raw["/sys/fs/cgroup/memory.pressure"] = null` and
+records the read's errno in `rawErrors` (`ENOENT` for `absent`, `ENOTSUP` for
+`unsupported`); the checker accepts a null PSI file only with that binding and still
+requires the other raw files to be strings. CI acceptance requires both complete successful bound
 reports; local prerequisite failures and synthetic regressions provide no
 measurement acceptance. Docker-free regression data lives in
 `calibration_synthetic.py`. Focused regressions are:
@@ -326,7 +353,7 @@ a real `WorkerMemoryCommands` context, the real `WorkerMemoryReader` and the rea
 `UZI_NODE_DIAGNOSTIC_BEGIN/END` markers and is kept in `node-diagnostic.json`.
 
 The guarded measurement reports the node version; the sampled series
-(`[sampleId, ms, currentBytes]`, bounded to 200) and peak growth; the threshold-crossing
+(`[sampleId, ms, currentBytes, workingSetBytes]`, bounded to 200) and peak growth; the threshold-crossing
 sample, reservation request/grant, cancel and confirmed-drain times with the derived
 crossing-to-reserve, cancel-to-drain and crossing-to-drain latencies; the exact
 `worker_memory_pressure` tool result the lane returned for the attributed tool use (or the
@@ -345,11 +372,14 @@ plain workloads keep 30 s), above the leg's ~59 s in-container worst case, so a 
 outcome is recorded rather than cut by the host.
 
 A host kernel without PSI (no `memory.pressure`) makes the production reader report
-`absent`. Only in this guarded leg's harness the reader gets a `readBytes` that is the real
-bounded read except that an absent `memory.pressure` is replaced by an all-zero PSI
-document; every other file (current, max, stat, events) stays real. Any such run sets
-`psiSynthesized: true` in the measurement, so a report never claims real PSI. The two
-Codex fixtures above have no such substitute and still fail on that host.
+`absent`, and the guarded leg runs the production reader and monitor unchanged: no
+`memory.pressure` document is substituted. `psiAvailable` in the measurement is true only
+when every available sample carried real PSI rows, so a report never claims PSI it did
+not read. The guarded leg's hard crossing, baseline and growth use the working set
+(`crossingWorkingSetBytes`, `baselineWorkingSetBytes`); `baselineBytes` and the raw
+`currentBytes` series column stay raw. Likewise `peakSeriesBytes` stays the raw
+`memory.current` peak, while `peakGrowthBytesPerSecond` is computed from the working-set
+column (the fourth series entry).
 
 [Issue #2397: partial investigation](issue-2397-investigation.md) records the
 available evidence and remaining diagnosis work.

@@ -431,6 +431,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool, pendin
 		// the cause and counts the park toward UZI_RUN_DISK_PARK_MAX. Advertised UNCONDITIONALLY
 		// (no config gates the park; 0 only lifts the cap): a worker must see it before sending
 		// the cause or the flag, because an older api 400s both.
+		{"recovery_cause_retained_recovery_exhausted"},
 		{"recovery_cause_data_volume_full"},
 		// PRD #1733: this api accepts {status:"recovery_wait", recovery_cause:"provider_outage"}
 		// with the optional productive_turns count, stores and counts the typed park, bounds an
@@ -2342,7 +2343,7 @@ func (h *Handler) WorkerListMemory(w http.ResponseWriter, r *http.Request) {
 // #122): the worker POSTs a raw delta PACKFILE (octet-stream body) plus the tip OID
 // it claims (header X-Uzi-Checkpoint-Tip), naming ONLY the run id in the path. The
 // api derives the repo/branch/PAT entirely from the run row and pushes the pack
-// NON-FORCED to refs/uzi-checkpoints/<branch> — the worker can never name the
+// NON-FORCED to refs/uzi-checkpoints/<checkpoint-key> — the worker can never name the
 // repo/ref/credential.
 //
 // This is a best-effort durability path: a 500 is ignored by the worker, and the

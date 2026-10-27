@@ -24,6 +24,7 @@ import { mergeRequestUrl } from "../../lib/forgeUrls";
 import { ExternalLinkIcon } from "../../components/icons";
 import { stripUnsafeChars } from "../../lib/safeText";
 import { useDemoMode } from "../../lib/demoMode";
+import { useMaintenance } from "../../lib/useMaintenance";
 import { maskName, maskUsername } from "../../lib/demoMask";
 
 // Highlighted renders `text`, wrapping every case-insensitive occurrence of `query` in
@@ -220,7 +221,9 @@ export function IssueCard({
   // on the card root. Inert on every other theme (only Shadow styles the attributes);
   // computed once here so both attributes read one derivation.
   const shadow = shadowSignal(run);
-  const badge = run ? runBadge(run, Date.now()) : null;
+  // PRD #3454: a maintenance-held card's tooltip carries the admin's reason.
+  const maintenanceReason = useMaintenance().status?.reason;
+  const badge = run ? runBadge(run, Date.now(), maintenanceReason) : null;
   // Uniform per-card duration token (issue #256 M4, Decision 4): a faint mono span
   // beside the badge carrying `running 1h 30m` / `queued 4m` / `ran 42m`. A terminal card
   // shows `ran …` from first start to finish (issue #2004); "" only for an older api whose
@@ -431,7 +434,7 @@ export function IssueCard({
             <MrChip mrIid={badge.mrIid} mrState={badge.mrState} href={mrHref} forgeType={card.forge_type} />
           ) : (
             <span className={badge.pulse ? "animate-pulse" : ""}>
-              <Badge tone={badge.tone} title={badge.title}>
+              <Badge tone={badge.tone} title={badge.title} wrap={badge.wrap}>
                 {badge.label}
               </Badge>
             </span>

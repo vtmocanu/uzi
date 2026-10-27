@@ -11,7 +11,7 @@ const files = () => ({
   "/fake/memory.stat": "anon 600\nshmem 10\nslab_unreclaimable 20\nunevictable 30\ninactive_file 900\n",
   "/fake/memory.pressure": "some avg10=1.25 avg60=0.00 avg300=0.00 total=100\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=20\n",
 });
-function fixture(overrides: Record<string, string | undefined> = {}) {
+function fixture(overrides: Record<string, string | undefined> = {}, codes: Record<string, string> = {}) {
   const data: Record<string, string | undefined> = { ...files(), ...overrides };
   const reads: { file: string; budget: number }[] = [];
   let clock = 10;
@@ -19,6 +19,8 @@ function fixture(overrides: Record<string, string | undefined> = {}) {
     procCgroupPath: "/fake/proc", cgroupRoot: "/fake", now: () => clock++,
     readBytes: (file, budget) => {
       reads.push({ file, budget });
+      const code = codes[file];
+      if (code !== undefined) throw Object.assign(new Error("coded " + code), { code });
       if (data[file] === undefined) throw new Error("missing");
       return Buffer.from(data[file]).subarray(0, budget + 1);
     },
@@ -38,7 +40,8 @@ test("total accounting, complete PSI, identity and monotonic age metadata", () =
   if (!result.available) return;
   assert.equal(result.currentBytes, 1000);
   assert.equal(result.limitBytes, 2000);
-  assert.deepEqual(result.stat, { anon: 600, shmem: 10, slab_unreclaimable: 20, unevictable: 30 });
+  assert.deepEqual(result.stat, { anon: 600, shmem: 10, slab_unreclaimable: 20, unevictable: 30, inactive_file: 900 });
+  assert.ok("some" in result.pressure && "full" in result.pressure);
   assert.deepEqual(result.pressure.some, { avg10: 1.25, avg60: 0, avg300: 0, total: 100 });
   assert.equal(result.pressure.full.total, 20);
   assert.equal(result.sampleId, 1);
@@ -58,6 +61,7 @@ test("root must be exactly one unified 0::/ entry, with no fallback reads", () =
   assert.equal(fixture({ "/fake/proc": "1:cpu:/\n0::/\n" }).reader.sample().available, true);
 });
 test("absent files, unlimited and invalid numeric scalar fields", () => {
+  // A missing file without an ENOENT/ENOTSUP errno code (including memory.pressure) is still unavailable.
   for (const file of Object.keys(files())) unavailable({ [file]: undefined }, "absent");
   unavailable({ "/fake/memory.max": "max\n" }, "unlimited");
   unavailable({ "/fake/memory.max": "0" }, "malformed");
@@ -70,7 +74,7 @@ test("absent files, unlimited and invalid numeric scalar fields", () => {
   assert.equal(fixture({ "/fake/memory.current": "0" }).reader.sample().available, true);
 });
 test("each stat field is required, unique and a nonnegative safe integer", () => {
-  for (const key of ["anon", "shmem", "slab_unreclaimable", "unevictable"]) {
+  for (const key of ["anon", "shmem", "slab_unreclaimable", "unevictable", "inactive_file"]) {
     const original = files()["/fake/memory.stat"];
     unavailable({ "/fake/memory.stat": original.replace(new RegExp(key + " [0-9]+\\n"), "") }, "malformed");
     unavailable({ "/fake/memory.stat": original + key + " 0\n" }, "malformed");
@@ -78,6 +82,39 @@ test("each stat field is required, unique and a nonnegative safe integer", () =>
       unavailable({ "/fake/memory.stat": original.replace(new RegExp(key + " [0-9]+"), key + " " + value) }, "malformed");
     }
   }
+});
+test("memory.pressure ENOENT and ENOTSUP yield an explicit marker with otherwise valid core accounting", () => {
+  for (const [code, reason] of [["ENOENT", "absent"], ["ENOTSUP", "unsupported"]] as const) {
+    const { reader, reads } = fixture({}, { "/fake/memory.pressure": code });
+    const result = reader.sample();
+    assert.equal(result.available, true, code);
+    if (!result.available) return;
+    assert.deepEqual(result.pressure, { unavailable: reason });
+    assert.equal(result.currentBytes, 1000);
+    assert.equal(result.limitBytes, 2000);
+    assert.deepEqual(result.stat, { anon: 600, shmem: 10, slab_unreclaimable: 20, unevictable: 30, inactive_file: 900 });
+    assert.equal(reads.at(-1)!.file, "/fake/memory.pressure", "pressure is still read last");
+  }
+});
+test("other memory.pressure read errors, and core read errors with PSI codes, keep the sample unavailable", () => {
+  for (const code of ["EACCES", "EIO", "EPERM", "EOPNOTSUPP", "enoent"]) {
+    const result = fixture({}, { "/fake/memory.pressure": code }).reader.sample();
+    assert.equal(result.available, false, code);
+    if (!result.available) assert.equal(result.reason, "absent");
+  }
+  // The optional path applies to memory.pressure alone.
+  for (const file of ["/fake/proc", "/fake/memory.current", "/fake/memory.max", "/fake/memory.stat"]) {
+    for (const code of ["ENOENT", "ENOTSUP"]) {
+      assert.equal(fixture({}, { [file]: code }).reader.sample().available, false, file + " " + code);
+    }
+  }
+  // Oversized or non-UTF-8 pressure input is not an absence marker.
+  unavailable({ "/fake/memory.pressure": "x".repeat(65537) }, "oversized");
+  const reader = new WorkerMemoryReader({
+    cgroupRoot: "/fake", procCgroupPath: "/fake/proc",
+    readBytes: (file) => file.endsWith("memory.pressure") ? Uint8Array.from([0xc3, 0x28]) : Buffer.from(files()[file as keyof ReturnType<typeof files>]),
+  });
+  assert.equal(reader.sample().available, false);
 });
 test("invalid, incomplete or duplicated PSI invalidates the entire sample", () => {
   const original = files()["/fake/memory.pressure"];
@@ -113,6 +150,22 @@ test("production bounded read seam works on fake proc/cgroup files only", () => 
     const result = reader.sample();
     assert.equal(result.available, false);
     if (!result.available) assert.equal(result.reason, "oversized");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("real bounded read maps a missing memory.pressure file to the absent marker", () => {
+  const dir = fs.mkdtempSync(path.resolve("../.uzi/scratch/memory-nopsi-"));
+  try {
+    for (const [file, raw] of Object.entries(files())) {
+      if (path.basename(file) !== "memory.pressure") fs.writeFileSync(path.join(dir, path.basename(file)), raw);
+    }
+    const result = new WorkerMemoryReader({ cgroupRoot: dir, procCgroupPath: path.join(dir, "proc") }).sample();
+    assert.equal(result.available, true);
+    if (result.available) assert.deepEqual(result.pressure, { unavailable: "absent" });
+    fs.rmSync(path.join(dir, "memory.stat"));
+    assert.equal(new WorkerMemoryReader({ cgroupRoot: dir, procCgroupPath: path.join(dir, "proc") }).sample().available, false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

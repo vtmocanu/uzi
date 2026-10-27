@@ -366,7 +366,8 @@ including when none advertises `cross_check_codex_lead_v1`.
 
 ## Semantic contract profile (dormant)
 
-**Dormant.** Production enrollment is off until #1231, no production code creates a
+**Dormant.** Production enrollment is off and not planned (#1231 was closed not planned;
+any future activation needs a new approved design), no production code creates a
 semantic run and only tests inject the path. A real run uses the *structural*
 profile described everywhere else on this page.
 
@@ -397,7 +398,7 @@ Design record: [ADR-2149 amendment](../adr/2149-cross-check.md#1230-coverage-par
 
 ### Coverage transport limitation
 
-Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. #1231 must establish enforceable bounds before activation.
+Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. Any future semantic activation must establish enforceable bounds before activation.
 
 See [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#coverage-transport-limitation).
 
@@ -571,6 +572,37 @@ cross-checked." An incomplete check renders as prose instead, for example
 
 The run page has a **Code cross-check** panel with the same evidence, and
 `uzi run get <id>` prints it (see [CLI](./cli.md#code-cross-check-evidence)).
+
+### Review coverage
+
+New code checks separately account for the changed paths in the checked Git
+range, including deleted paths and both names of a rename. Each retained path is
+examined, excluded with a reason, or unassessed. A missing judgment is
+unassessed. The worker supplies the inventory; model-invented paths are dropped
+and counted.
+
+The merge request shows counts such as "Coverage: 9 examined, 0 excluded,
+3 unassessed", plus at most ten unassessed paths within its existing section
+budget. The run page and `uzi run get <id>` show the full stored account,
+including reasons, omitted judgments, and recorded-read flags. These are
+advisory review accounts, not correctness certifications. A recorded-read flag
+comes only from successful recorded file reads; reading a diff or searching a
+directory does not produce that flag. Partial or unavailable activity is shown.
+
+Inventories retain at most 128 unique paths of at most 512 UTF-8 bytes each.
+Processing is bounded at 1 MiB of Git output and 16,384 NUL records. When the
+retained-path cap is exceeded but enumeration finishes, the omitted count is
+exact. If enumeration stops early, the display reports a lower bound or an
+unknown omitted count and never claims complete inventory coverage.
+Judgments have separate bounds (128 entries, 256 UTF-8 bytes per reason and
+32 KiB model coverage); the stored account is bounded at 128 KiB. Invalid or
+oversized coverage does not discard valid findings.
+
+Older workers and historical rows show "coverage not reported". The API
+advertises coverage support on code claims, so newer workers keep the legacy
+findings-only request when talking to an older API. Coverage is stored once
+with the verdict and preserved as earlier evidence after interruption; it is
+not rechecked after the lead's repair pass.
 
 ### Owner guidance and repository instructions
 

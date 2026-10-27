@@ -72,6 +72,19 @@ storage_diagnostic_snapshot() {
   return 0
 }
 
+# Retain complete build output; show only a bounded failure tail in the terminal.
+compose_build_logged() {
+  local status
+  mkdir -p "$RUNROOT/artifacts/build" || return $?
+  if "${COMPOSE[@]}" --progress=plain build > "$RUNROOT/artifacts/build/compose-build.log" 2>&1; then
+    return 0
+  else
+    status=$?
+    tail -n80 "$RUNROOT/artifacts/build/compose-build.log" >&2 || true
+    return "$status"
+  fi
+}
+
 # Failure-only metadata for a retained FINAL or an unstable custody baseline.
 # Local records are inspected, not independently MAC-verified by this diagnostic.
 _inventory_diagnostic_rows() {

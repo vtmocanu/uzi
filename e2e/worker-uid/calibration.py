@@ -110,7 +110,7 @@ def parse_guarded(raw, workload):
                   and value.get("leg") == "guarded", "node diagnostic identity")
     tool, cleanup, growth, timeline, budget = (value.get(key) for key in ("tool", "cleanup", "growth", "timeline", "budget"))
     check.require(all(isinstance(item, dict) for item in (tool, cleanup, growth, timeline, budget)) and
-                  isinstance(value.get("nodeVersion"), str) and type(value.get("psiSynthesized")) is bool and
+                  isinstance(value.get("nodeVersion"), str) and type(value.get("psiAvailable")) is bool and
                   isinstance(growth.get("series"), list), "node diagnostic shape")
     check.require(tool.get("outcome") in GUARDED_OUTCOMES, "node diagnostic guarded outcome")
     if tool["outcome"] == "guard_acted":
@@ -130,7 +130,7 @@ def parse_guarded(raw, workload):
 def killed_guarded_result(workload, rc):
     """The guarded container's main process was killed before it could report: a recorded outcome."""
     return {"schemaVersion": 1, "workload": workload, "leg": "guarded", "nodeVersion": "unknown",
-            "psiSynthesized": None, "noReport": True, "tool": {"outcome": "container_killed_no_report"},
+            "psiAvailable": None, "noReport": True, "tool": {"outcome": "container_killed_no_report"},
             "killedExit": rc}
 
 
@@ -141,7 +141,7 @@ def guarded_summary(result):
     tool, timeline, budget, cleanup = result["tool"], result["timeline"], result["budget"], result["cleanup"]
     pressure = tool.get("pressure") or {}
     return (f"node diagnostic {result['workload']} {result['limitBytes'] >> 20}MiB: {tool['outcome']} "
-            f"node={result['nodeVersion']} psi_synthesized={result['psiSynthesized']} baseline={result['baselineBytes']} "
+            f"node={result['nodeVersion']} psi_available={result['psiAvailable']} baseline={result['baselineBytes']} "
             f"peak_series={result['growth']['peakSeriesBytes']} samples={result['growth']['sampleCount']} "
             f"crossing_ms={timeline['crossingSampleCompletedMs']} crossing_to_reserve_ms={budget['crossingToReserveRequestMs']} "
             f"cancel_to_drain_ms={budget['cancelToConfirmedDrainMs']} crossing_to_drain_ms={budget['crossingToConfirmedDrainMs']} "

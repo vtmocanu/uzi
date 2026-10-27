@@ -13,7 +13,8 @@ func (g *gitLab) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 	if projectID <= 0 || authorID <= 0 {
 		return AuthorUnknown, ErrAuthorUnknown
 	}
-	state := newResponseLimitState(objectResponseBytes)
+	ledger := &responseLedger{remaining: collaboratorListResponseBytes}
+	state := ledger.state(objectResponseBytes)
 	u, userResp, err := g.client.Users.GetUser(authorID, nil, gitlab.WithContext(withResponseLimit(ctx, state)))
 	if state.overflow.Load() {
 		return AuthorUnknown, g.wrapErr("resolve repository author", state.err())
@@ -27,7 +28,7 @@ func (g *gitLab) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 	// Same effective members/all route as GetInheritedProjectMember. The SDK
 	// ProjectMember omits membership_state; decode it here to reject inactive
 	// memberships while retaining the existing SDK client, timeout and retries.
-	state = newResponseLimitState(objectResponseBytes)
+	state = ledger.state(objectResponseBytes)
 	req, err := g.client.NewRequest(http.MethodGet,
 		fmt.Sprintf("projects/%d/members/all/%d", projectID, authorID), nil, []gitlab.RequestOptionFunc{gitlab.WithContext(withResponseLimit(ctx, state))})
 	if err != nil {
@@ -50,7 +51,7 @@ func (g *gitLab) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 		// means absence of effective membership for that extant user.
 		if resp != nil && resp.Response != nil && resp.StatusCode == http.StatusNotFound && len(resp.Header.Values("Content-Range")) == 0 {
 			// Exclude a concealed or deleted project before treating this as absence.
-			state := newResponseLimitState(objectResponseBytes)
+			state := ledger.state(objectResponseBytes)
 			repo, repoResp, readErr := g.client.Projects.GetProject(projectID, nil, gitlab.WithContext(withResponseLimit(ctx, state)))
 			if state.overflow.Load() {
 				return AuthorUnknown, g.wrapErr("author repository", state.err())

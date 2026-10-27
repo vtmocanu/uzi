@@ -478,17 +478,13 @@ func newRunInputsCmd(env Env, gf *globalFlags) *cobra.Command {
 			// the run's live status for the gate/terminal nuance. One cheap GetRun; if
 			// it fails, status stays "" and the state degrades to the receipt-derived
 			// floor (Decision 10). Skipped entirely for an empty queue.
-			status := ""
-			recoveryCause := ""
+			var presentationRun apitypes.RunDTO
 			if len(list) > 0 {
 				if run, err := c.GetRun(cmd.Context(), args[0]); err == nil {
-					status = run.Status
+					presentationRun = run
 					if line := workerExhaustionLine(run); line != "" {
 						_, _ = fmt.Fprintln(env.Stderr, line)
 					}
-					// PRD #1392 M5: carry the recovery cause so a forge-unreachable park's
-					// queue row names the forge rather than a transient empty turn.
-					recoveryCause = strOr(run.RecoveryWaitCause, "")
 					if run.Kind == runkind.Chat {
 						// N3: a chat run's queue is every chat turn. Note it only when it
 						// actually applies, so an issue run's output stays clean.
@@ -496,7 +492,7 @@ func newRunInputsCmd(env Env, gf *globalFlags) *cobra.Command {
 					}
 				}
 			}
-			return renderRunInputs(p, list, status, recoveryCause)
+			return renderRunInputs(p, list, presentationRun)
 		},
 	}
 	return inputs

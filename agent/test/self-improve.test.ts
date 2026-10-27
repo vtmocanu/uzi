@@ -1,3 +1,4 @@
+import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -400,6 +401,21 @@ describe("buildCheckEnv scrubs worker-impersonation vars (M9)", () => {
     ANTHROPIC_API_KEY: "sk-should-not-be-here-either",
   };
 
+  it("issue #3382: the configured Go concurrency reaches the check env; none when unset", () => {
+    try {
+      configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
+      const env = buildCheckEnv(source, "/home/checks", { PATH: "/tools/bin" });
+      assert.equal(env.GOFLAGS, "-p=2");
+      assert.equal(env.GOMAXPROCS, "3");
+      configureGoConcurrency({});
+      const bare = buildCheckEnv(source, "/home/checks", { PATH: "/tools/bin" });
+      assert.equal(Object.hasOwn(bare, "GOFLAGS"), false);
+      assert.equal(Object.hasOwn(bare, "GOMAXPROCS"), false);
+    } finally {
+      configureGoConcurrency({});
+    }
+  });
+
   it("the built env contains NONE of the worker/API/token vars, by construction", () => {
     const env = buildCheckEnv(source, "/home/checks", { PATH: "/tools/bin:/base/bin", NIX_SSL_CERT_FILE: "/etc/ssl/cert.pem" });
     for (const k of ["UZI_WORKER_TOKEN", "UZI_WORKER_TOKEN_FILE", "UZI_API_URL", "ANTHROPIC_API_KEY"]) {
@@ -438,6 +454,29 @@ describe("buildCheckEnv scrubs worker-impersonation vars (M9)", () => {
     const env = buildCheckEnv({ ...source, PATH: process.env.PATH }, wt);
     const r = await defaultCheckRunner(env, 5000)(probe, wt);
     assert.equal(r.status, "passed", "the check subprocess must NOT inherit the worker/API/token vars");
+  });
+
+  // Issue #3382: a real check subprocess spawned by defaultCheckRunner under the built env. The
+  // probe exits 0 only when its own environment carries exactly the expected Go values.
+  it("issue #3382: a check spawned under the built env sees the configured Go concurrency (end to end)", async () => {
+    const wt = mkdtempSync(join(scratchRoot, "si-go-"));
+    mkdirSync(join(wt, "api"), { recursive: true });
+    const probeFor = (script: string): SelfImproveCheck => ({ name: "go env probe", cwd: "api", command: "sh", args: ["-c", script] });
+    const toolEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", GOFLAGS: "-toolexec=evil" };
+    try {
+      configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
+      const set = buildCheckEnv(source, wt, toolEnv);
+      const setRun = await defaultCheckRunner(set, 5000)(
+        probeFor('[ "$GOFLAGS" = "-p=2" ] && [ "$GOMAXPROCS" = "3" ]'), wt);
+      assert.equal(setRun.status, "passed", "the spawned check carries GOFLAGS=-p=2 and GOMAXPROCS=3");
+      configureGoConcurrency({});
+      const unset = buildCheckEnv(source, wt, toolEnv);
+      const unsetRun = await defaultCheckRunner(unset, 5000)(
+        probeFor('[ -z "${GOMAXPROCS+x}" ] && [ "$GOFLAGS" != "-p=2" ]'), wt);
+      assert.equal(unsetRun.status, "passed", "an unset setting adds no GOMAXPROCS and no -p flag");
+    } finally {
+      configureGoConcurrency({});
+    }
   });
 });
 

@@ -11,6 +11,7 @@ import { capBody, renderBody, renderRegion, type RegionInput } from "./pr-descri
 import type { DeliveryContext } from "./pr-description-context.js";
 import type { PrSummaryClaim } from "./signals.js";
 import type { Logger } from "./log.js";
+import { goConcurrencyEnv, type GoConcurrency } from "./go-concurrency.js";
 
 export const evalLog: Logger = {
   debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {},
@@ -108,11 +109,12 @@ async function goCacheDirs(): Promise<Record<string, string>> {
 /** One bounded helper process, no retries. Failure blocks this fixture, not sibling fixtures.
  * Replacement environment contains tool/cache coordinates only, never model or worker auth.
  */
-export async function sanitizeEditorFields(checkout: string, fields: RawPrDescriptionFields) {
+export async function sanitizeEditorFields(checkout: string, fields: RawPrDescriptionFields, go?: GoConcurrency) {
   const input = JSON.stringify({ fields });
   if (Buffer.byteLength(input) > 4 * 1024 * 1024) throw new Error("helper_failed");
   const scratch = path.join(checkout, ".uzi/scratch");
-  const env: NodeJS.ProcessEnv = { HOME: scratch, GOFLAGS: "-buildvcs=false", ...(await goCacheDirs()) };
+  // Issue #3382: GOFLAGS is "-buildvcs=false" plus the optional "-p=N" parsed by the CLI.
+  const env: NodeJS.ProcessEnv = { HOME: scratch, ...goConcurrencyEnv(go ?? {}, "-buildvcs=false"), ...(await goCacheDirs()) };
   for (const key of ["PATH", "GOROOT", "GOPATH", "GOCACHE", "GOMODCACHE"] as const) {
     if (process.env[key]) env[key] = process.env[key];
   }
@@ -155,7 +157,9 @@ export function editorStageTransport(fields: unknown): NonNullable<ClientOptions
     } }), { status: 200 });
   };
 }
-export async function evaluateEditorResponse(checkout: string, fixture: EditorFixture, response: string): Promise<PipelineResult> {
+export async function evaluateEditorResponse(
+  checkout: string, fixture: EditorFixture, response: string, go?: GoConcurrency,
+): Promise<PipelineResult> {
   let emitted = false;
   let summary;
   try { summary = parseDeliverySummary(response, (_raw, present) => { emitted = present; }); }
@@ -165,7 +169,7 @@ export async function evaluateEditorResponse(checkout: string, fixture: EditorFi
   const zeroCode = !fixture.code.unavailable && fixture.code.added + fixture.code.deleted === 0;
   const fields = assembleGeneratedFields(summary, fixture.lead, zeroCode);
   try {
-    const sanitized = await sanitizeEditorFields(checkout, fields);
+    const sanitized = await sanitizeEditorFields(checkout, fields, go);
     const client = new WorkerClient(origin, marker, "offline-eval", evalLog, { fetch: editorStageTransport(sanitized.fields) });
     const { version } = await client.stagePrDescription(runId, {
       claim_generation: 1, source: "generated", fields, size: null,

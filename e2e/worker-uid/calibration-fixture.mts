@@ -11,7 +11,7 @@ import { launchCodexEffectRoot, type CodexRootHandle, type SpawnSupervisor } fro
 import { boundedCommandWait } from "../../agent/src/codex/memory-command.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../../agent/src/codex/registry.js";
 import { WorkerMemoryCommands } from "../../agent/src/worker-memory-commands.js";
-import { WorkerMemoryMonitor } from "../../agent/src/worker-memory-guard.js";
+import { WorkerMemoryMonitor, workingSetBytes } from "../../agent/src/worker-memory-guard.js";
 import { WorkerMemoryReader } from "../../agent/src/worker-memory-reader.js";
 import type { MemoryReservation, MemoryReservationRequest, WorkerMemoryPressureResult } from "../../agent/src/protocol.js";
 import { calibrationPlan, calibrationReport, calibrationSchedulingReport, type CalibrationSchedulingObservation, type CalibrationBinding, type CalibrationLegResponse } from "../../agent/test/helpers/worker-memory-calibration.js";
@@ -160,6 +160,30 @@ export function projectFailedEvidence(facts: {
     cleanup: { confirmed: null, startMs: facts.cleanupStart ?? null, endMs: facts.cleanupEnd ?? null },
   };
 }
+// The guard's early branch (growing full PSI projecting a crossing) can drain the load
+// before any sample reaches H, which leaves no hard crossing to measure (#3363). Hard-path
+// legs therefore hand the guard each measured sample with PSI pinned to the first load
+// sample's values; memory charges and every recorded sample stay measured.
+export type GuardPressurePin = { mode: "pinned_to_first_load_sample"; sampleId: number; pressure: Available["pressure"] };
+// Copies the absence marker when PSI is absent, the two rows otherwise.
+function copyPressure(pressure: Available["pressure"]): Available["pressure"] {
+  return "unavailable" in pressure ? { unavailable: pressure.unavailable }
+    : { some: { ...pressure.some }, full: { ...pressure.full } };
+}
+export function pinGuardPressure(first: Available): GuardPressurePin {
+  return { mode: "pinned_to_first_load_sample", sampleId: first.sampleId, pressure: copyPressure(first.pressure) };
+}
+export function guardFacingSample(value: Available, pin: GuardPressurePin): Available {
+  return { ...value, stat: { ...value.stat }, pressure: copyPressure(pin.pressure) };
+}
+// The hard threshold H applies to the working set (memory.current minus inactive file cache),
+// exactly as the production guard compares it; raw current stays the safety-budget basis.
+export function hardCrossing<T extends { currentBytes: number; stat: { inactive_file: number } }>(samples: readonly T[], high: number): { low: T; above: T } {
+  const index = samples.findIndex((s) => workingSetBytes(s) >= high);
+  const low = samples[index - 1], above = samples[index];
+  assert.ok(index > 0 && low && above, "real hard crossing required; early PSI cannot replace it");
+  return { low, above };
+}
 // Bounded by MAX_SAMPLES at the caller. Invalid evidence refuses completion;
 // a high sample resets dwell, while a gap rejects the remaining contiguous run.
 export function freshPostCleanupDwell(samples: Sample[], cleanupEnd: number, atMs: number, guard: {
@@ -180,7 +204,7 @@ export function freshPostCleanupDwell(samples: Sample[], cleanupEnd: number, atM
       || value.completedAtMs < value.startedAtMs || value.completedAtMs > atMs
       || value.completedAtMs - value.startedAtMs > maximumGap
       || (previous && (value.sampleId <= previous.sampleId || value.startedAtMs < previous.completedAtMs))) return false;
-    if (value.currentBytes >= quiet) { first = undefined; count = 0; contiguous = true; }
+    if (workingSetBytes(value) >= quiet) { first = undefined; count = 0; contiguous = true; }
     else {
       if (previous && first && value.startedAtMs - previous.completedAtMs > maximumGap) contiguous = false;
       first ??= value;
@@ -199,7 +223,7 @@ export async function fixture(manifestFile: string, fixtureId: string) {
   const report: Record<string, unknown> = {
     schemaVersion: 1, ...manifest.identity, ...expected, provenance: "measured",
     status: "FAILED", reasons: [], observed: null, guard: null, plan: null,
-    units: calibrationUnits, plannedChargeClasses: null, oomEvents: null, rawSamples: [], finalCleanup: null,
+    units: calibrationUnits, plannedChargeClasses: null, oomEvents: null, rawSamples: [], guardPressure: null, finalCleanup: null,
     samplingSchedule: { periodMs: 250, anchorMs: null, rows: [], maxPositiveLatenessMs: null, maxAbsoluteJitterMs: null },
     baseline: [], samples: [], response: null, derivation: null, trees: [],
     settlement: null, cleanup: null, outcome: { status: "failed", reasons: ["not settled"] },
@@ -209,13 +233,18 @@ export async function fixture(manifestFile: string, fixtureId: string) {
     signalMeaning: "application supervisor disposal control write", ackService: "LOCALFIXTURE",
   };
   const reasons: string[] = [];
-  const rawSamples: { sample: Sample; raw: Record<string, string | null>; events: Record<string, number> | null }[] = [];
+  // rawErrors records the errno code of a failed memory.pressure read (ENOENT or ENOTSUP), so
+  // the checker can bind the reader's absence marker to the real error; other paths are never listed.
+  const PSI_FILE = "/sys/fs/cgroup/memory.pressure";
+  const rawSamples: { sample: Sample; raw: Record<string, string | null>; rawErrors: Record<string, string>;
+    events: Record<string, number> | null }[] = [];
   const baseline: Available[] = [], samples: Available[] = [];
+  let guardPressure: GuardPressurePin | undefined;
   const schedulingObservations: CalibrationSchedulingObservation[] = [];
   let schedulingAnchor: number | null = null;
   let samplingSchedule: ReturnType<typeof calibrationSchedulingReport> | undefined;
   let requested: Omit<CalibrationSchedulingObservation, "sampleId"> | undefined;
-  let raw: Record<string, string | null> = {}, rawBytes = 0;
+  let raw: Record<string, string | null> = {}, rawErrors: Record<string, string> = {}, rawBytes = 0;
   const reader = new WorkerMemoryReader({ readBytes: (file, max) => {
     try {
       const bytes = readBounded(file, max);
@@ -223,11 +252,16 @@ export async function fixture(manifestFile: string, fixtureId: string) {
       if (rawBytes > RAW_SAMPLE_BYTES) throw new Error("raw sample byte bound exceeded");
       raw[file] = new TextDecoder("utf8", { fatal: true }).decode(bytes);
       return bytes; // Identical default paths, budget, bytes and production parsing.
-    } catch (error) { raw[file] = null; throw error; }
+    } catch (error) {
+      raw[file] = null;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (file === PSI_FILE && typeof code === "string") rawErrors[file] = code;
+      throw error;
+    }
   } });
   function sample() {
     if (rawSamples.length >= MAX_SAMPLES) throw new Error("sample bound exceeded");
-    raw = {}; rawBytes = 0;
+    raw = {}; rawErrors = {}; rawBytes = 0;
     const value = reader.sample();
     // Capture real reader identity/times even if availability or event checks fail.
     if (requested) schedulingObservations.push({ ...requested, sampleId: value.sampleId });
@@ -240,7 +274,7 @@ export async function fixture(manifestFile: string, fixtureId: string) {
       ({ events, failure: eventFailure } = captureEventCounters(bytes.toString("utf8")));
     } catch (error) { eventFailure = String(error); }
     if (eventFailure) reasons.push("events unavailable: " + eventFailure);
-    rawSamples.push({ sample: value, raw, events });
+    rawSamples.push({ sample: value, raw, rawErrors, events });
     if (!value.available || !events || eventFailure) throw new Error("actual default reader unavailable: " + JSON.stringify(value));
     assert.equal(value.limitBytes, expected.limitBytes);
     return value;
@@ -289,7 +323,7 @@ export async function fixture(manifestFile: string, fixtureId: string) {
     let plan = calibrationPlan({ dedicated: true, baseline, windowMs: 30000 });
     report.plan = plan;
     report.plannedChargeClasses = plannedChargeClasses(plan);
-    let high = plan.baselineBytes + 32 * 1024 ** 2;
+    let high = plan.workingSetBaselineBytes + 32 * 1024 ** 2;
     const guard = { enabled: true as const, reserveBytes: plan.limitBytes - high, hysteresisBytes: 8 * 1024 ** 2,
       sampleMs: 250, responseBudgetMs: 5000, rearmMs: 500, maxInterventions: 2 };
     assert.ok(0 < high - guard.hysteresisBytes && high < plan.limitBytes / 2);
@@ -417,7 +451,7 @@ export async function fixture(manifestFile: string, fixtureId: string) {
     baseline.length = 0;
     for (let i = 0; i < 3; i++) { baseline.push(sample()); await new Promise((resolve) => setTimeout(resolve, 250)); }
     plan = calibrationPlan({ dedicated: true, baseline, windowMs: 30000 });
-    high = plan.baselineBytes + 32 * 1024 ** 2;
+    high = plan.workingSetBaselineBytes + 32 * 1024 ** 2;
     guard.reserveBytes = plan.limitBytes - high;
     assert.ok(0 < high - guard.hysteresisBytes && high < plan.ceilingBytes);
     report.plan = plan; report.guard = guard;
@@ -507,7 +541,8 @@ export async function fixture(manifestFile: string, fixtureId: string) {
       sample: () => {
         const value = sample(); samples.push(value);
         if (value.currentBytes + plan.overheadBytes > plan.ceilingBytes) throw new Error("safety ceiling reached");
-        return value;
+        guardPressure ??= pinGuardPressure(value);
+        return guardFacingSample(value, guardPressure);
       },
       reserve: async (input, signal) => {
         const index = entries.findIndex((entry) => commands.outcome(entry) !== undefined);
@@ -550,9 +585,7 @@ export async function fixture(manifestFile: string, fixtureId: string) {
     const outcomes = acknowledgements.filter((item) => item.path === "/outcome");
     assert.equal(ack.length, 1); assert.equal(outcomes.length, 1);
     assert.equal(outcomes[0]!.ack.outcome, "confirmed_drained");
-    const highIndex = samples.findIndex((s) => s.currentBytes >= high);
-    const low = samples[highIndex - 1], above = samples[highIndex];
-    assert.ok(low && above, "real hard crossing required; early PSI cannot replace it");
+    const { low, above } = hardCrossing(samples, high);
     const observe = observations.find((o) => o.index === selected && o.startMs >= above.completedAtMs);
     const signal = signalWrites.filter((s) => s.index === selected);
     const disposal = disposals.find((d) => d.index === selected);
@@ -615,6 +648,7 @@ export async function fixture(manifestFile: string, fixtureId: string) {
       clean: cleaned.map((r) => r.status === "fulfilled" ? r.value : { unknown: true, failure: String(r.reason) }),
       joined: joined.map((r) => r.status), driverCompleted };
     report.baseline = baseline; report.samples = samples; report.rawSamples = rawSamples;
+    report.guardPressure = guardPressure ?? null;
     const oomEvents = oomEventEvidence(rawSamples);
     report.oomEvents = oomEvents;
     if (oomEvents && Object.values(oomEvents.delta).some((v) => v !== null && v < 0)) {

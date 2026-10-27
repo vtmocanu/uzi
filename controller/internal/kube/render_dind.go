@@ -533,15 +533,25 @@ var dindMeterResources = corev1.ResourceRequirements{
 // the worker's freshness bound turns a stale sample into "no sample". A failed stat
 // prints one fixed line to the container's stderr (stat's own output stays discarded) so
 // a meter that can never sample is visible in `kubectl logs`, not silent.
+//
+// It exits 0 promptly on SIGTERM (issue #3421). Native sidecars stop in reverse order
+// after the worker, so the meter is signalled before dind; the shell is PID 1 of the
+// container's PID namespace, where the kernel drops a signal that has no handler, so
+// without the trap it would hold the pod stop until grace expiry and exit 137. The
+// trap alone is not enough: a trap waits for a FOREGROUND child to finish, so the sleep
+// runs in the background under an interruptible `wait`. The orphaned sleep dies when
+// the meter container's private PID namespace is torn down after its PID 1 exits.
+// TestDindMeterScriptExitsZeroPromptlyOnSIGTERM guards this.
 func dindMeterScript() string {
 	return fmt.Sprintf(`set -u
+trap 'exit 0' TERM
 while :; do
   if s=$(stat -f -c '%%S %%b %%f %%c %%d' %[1]s 2>/dev/null); then
     t=$(date +%%s) && printf 'v1 %%s %%s\n' "$t" "$s" > %[2]s.tmp && mv -f %[2]s.tmp %[2]s
   else
     echo "dind-meter: statfs sample failed" >&2
   fi
-  sleep %[3]d
+  sleep %[3]d & wait $!
 done
 `, dindMeterDataDir, dindMeterFile, dindMeterIntervalSeconds)
 }

@@ -607,6 +607,7 @@ describe("RunRunner — credentialed settle reaps the Codex provider FIRST (PRD 
       const boundaries: string[] = [];
       const safety: CodexExecutionSafety = {
         kind: "codex",
+        acceptsTerminalDisposal: () => false,
         withBoundary: async <T>(
           req: BoundaryRequest,
           action: (permit: BoundaryPermit) => Promise<T>,

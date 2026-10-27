@@ -71,7 +71,7 @@ func (m *memForge) publish(_ context.Context, o pushbroker.Options) (pushbroker.
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.publishCalls++
-	ref := checkpointRefPrefix + o.Branch
+	ref := checkpointRefPrefix + o.CheckpointKey
 	if cur, ok := m.refs[ref]; ok && cur == o.DeclaredTip {
 		// pushbroker's already-current short-circuit: nothing is written.
 		return pushbroker.Result{Ref: ref, AlreadyCurrent: true}, nil
@@ -133,7 +133,7 @@ func (m *memForge) createRef(_ context.Context, o pushbroker.CreateRefOptions) e
 func (m *memForge) deleteRef(_ context.Context, o pushbroker.DeleteOptions) error {
 	ref := o.Ref
 	if ref == "" {
-		ref = checkpointRefPrefix + o.Branch
+		ref = checkpointRefPrefix + o.CheckpointKey
 	}
 	if m.beforeDelete != nil {
 		m.beforeDelete(ref)

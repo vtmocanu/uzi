@@ -317,3 +317,54 @@ test("startup failure also removes all handlers and prints no raw path/error", a
   assert.deepEqual(rows, ['{"error":"startup_failed"}']);
   for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) assert.equal(signals.listenerCount(name), 0);
 });
+
+// Issue #3382: the Go helper child env carries the optional -p flag next to the trusted
+// -buildvcs=false base. A fake `go` on PATH dumps the GOFLAGS/GOMAXPROCS it was handed.
+async function withFakeGo(run: (dump: string) => Promise<void>) {
+  await fs.mkdir(path.join(checkout, ".uzi/scratch"), { recursive: true });
+  const dir = await fs.mkdtemp(path.join(checkout, ".uzi/scratch/fake-go-"));
+  const dump = path.join(dir, "dump.txt");
+  const script = [
+    "#!/bin/sh",
+    'if [ "$1" = "run" ]; then',
+    "  cat > /dev/null",
+    `  printf '%s|%s|%s' "\${GOFLAGS-<unset>}" "\${GOMAXPROCS-<unset>}" "\${GOFLAGS+set}" > '${dump}'`,
+    `  printf '{"fields":{},"diagram_rejected":false}'`,
+    "  exit 0",
+    "fi",
+    "exit 1",
+    "",
+  ].join("\n");
+  await fs.writeFile(path.join(dir, "go"), script, { mode: 0o755 });
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${dir}:${savedPath ?? ""}`;
+  try { await run(dump); } finally {
+    process.env.PATH = savedPath;
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+const noFields = { summary: "x", changes: [], scope_notes: [], review_pointers: [], verification: [] };
+test("helper child env: -buildvcs=false alone, with -p, and GOMAXPROCS only when configured", async () => {
+  await withFakeGo(async (dump) => {
+    await sanitizeEditorFields(checkout, noFields);
+    assert.equal(await fs.readFile(dump, "utf8"), "-buildvcs=false|<unset>|set");
+    await sanitizeEditorFields(checkout, noFields, { buildParallelism: 2 });
+    assert.equal(await fs.readFile(dump, "utf8"), "-buildvcs=false -p=2|<unset>|set");
+    await sanitizeEditorFields(checkout, noFields, { buildParallelism: 2, maxProcs: 3 });
+    assert.equal(await fs.readFile(dump, "utf8"), "-buildvcs=false -p=2|3|set");
+  });
+});
+test("runEvalCli threads parsed Go settings to the helper and fails startup on an invalid value", async () => {
+  const rows: string[] = [];
+  const deps = (e: NodeJS.ProcessEnv) => ({
+    checkout, env: e, signals: process, write: (r: string) => { rows.push(r); },
+    pass: async () => response(),
+  });
+  assert.equal(await runEvalCli(args(), deps({ ...env, WORKER_GO_BUILD_PARALLELISM: "0" })), 1);
+  assert.deepEqual(rows.map((r) => JSON.parse(r)), [{ error: "startup_failed" }]);
+  rows.length = 0;
+  await withFakeGo(async (dump) => {
+    await runEvalCli(args(), deps({ ...env, WORKER_GO_BUILD_PARALLELISM: " 2 ", WORKER_GO_MAXPROCS: "007" }));
+    assert.equal(await fs.readFile(dump, "utf8"), "-buildvcs=false -p=2|7|set");
+  });
+});

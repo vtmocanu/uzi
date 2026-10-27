@@ -59,7 +59,7 @@ k8s-only: nothing here applies to compose. Configure these variables through the
 | `WORKER_HOSTING_ENABLED` | `false` | The feature gate. `true` requires `WORKER_HOSTING_CONTROLLER_TOKEN_SHA256` to also be set, or the api refuses to boot — enabling hosting with no way to authenticate a controller would be a silent no-op, and this is a security control rather than a tuning knob, so a malformed value also refuses to start. |
 | `WORKER_HOSTING_CONTROLLER_TOKEN_SHA256` | — | The sha256 (hex) of the controller's bearer credential, generated once with `openssl rand -base64 32` and hashed. Setting this while `WORKER_HOSTING_ENABLED` is `false` also refuses to boot — a hash with nothing to gate it is a stray credential the api would silently ignore. |
 | `WORKER_HOSTING_PENDING_TOKEN_TTL` | `1h` | How long a hosted worker's join token may sit sealed in Postgres, undelivered, before the expiry sweep destroys it. Read regardless of `WORKER_HOSTING_ENABLED`, so a stack that provisioned workers and then turned hosting off doesn't strand ciphertext. `0` disables the sweep — an undelivered token then stays sealed under `UZI_SECRET_KEY` indefinitely; see [vault-threat-model.md](vault-threat-model.md#hosted-worker-join-tokens-prd-58). |
-| `UZI_EPHEMERAL_DEFAULT_SIZE` | `m` | Size preset for new ephemeral hosted workers (`s`, `m`, or `l`). Invalid values fall back to `m` with a boot warning outside the chart. Set `workers.ephemeralDefaultSize` in the chart: invalid values fail rendering, and setting this key in `api.config` or `api.secretEnv` also fails rendering (move it to `workers.ephemeralDefaultSize`). Existing workers keep their stored size. The persistent provision form still preselects `l`, while its API requires an explicit size. |
+| `UZI_EPHEMERAL_DEFAULT_SIZE` | `m` | Size preset for new ephemeral hosted workers (`s`, `m`, `l`, or `l-highmem`). Invalid values fall back to `m` with a boot warning outside the chart. Set `workers.ephemeralDefaultSize` in the chart: invalid values fail rendering, and setting this key in `api.config` or `api.secretEnv` also fails rendering (move it to `workers.ephemeralDefaultSize`). Existing workers keep their stored size. The persistent provision form still preselects `l`, while its API requires an explicit size. |
 
 ### `controller`
 
@@ -305,8 +305,9 @@ The run view in the web UI shows a terse, one-line-per-event feed (tool calls wi
 | `RUN_MAX_REQUEUES` | `3` | Maximum automatic worker-death requeues per recovery episode (issue #2394). Requeue after one stale window and over-cap disposition after a second consecutive stale window (`WORKER_HEARTBEAT_STALE`, issue #1390) retain the existing readoption protection and `SWEEPER_BOOT_GRACE`. At exhaustion, recorded checkpoint/capture evidence, pending publication/capture, unresolved source custody or unknown server evidence parks the run at owner-only `recovery_wait` / `worker_requeue_exhausted`; no recorded recovery evidence or unresolved custody keeps `worker_lost`, without proving absence of unrecorded worker work. Each explicit owner Resume starts an episode with the current maximum, preserving lifetime charged `requeue_count` and generation-proven readoption refunds. `0` grants no **automatic** requeues; owner Resume still queues one explicit attempt. **Initial-episode exception, once per run (issue #1742):** a worker-authenticated durable finalize-pending record at the exact current generation, still running under that worker with no live terminal lease, permits one extra requeue only in episode 0, with a positive maximum, exhausted episode allowance and unused `runs.finalize_resume_generation`. The lifetime marker is never renewed; ordinary under-budget requeues do not stamp or overwrite it, and charged automatic worker-death retries in owner-started episodes cannot exceed the configured cap. Completion uses the normal claim-generation fences and completion permit where interlocked; the record is not an outcome. No durable record or no timely attested proof uses ordinary disposition: under-budget requeue, otherwise evidence-based hold or `worker_lost`. See [Worker recovery exhausted](run-recovery-wait.md#worker-recovery-exhausted) and [ADR-1742](../adr/1742-finalize-resume-allowance.md). |
 | `RUN_LIMIT_MAX_WAITS` | `5` | How many times one run may park at `limit_wait` on a recognized Claude or Codex subscription usage window (PRDs #35/#2360, `runs.limit_wait_count`) before the next limit failure fails it instead ("usage-limit retry budget exhausted") rather than parking again. `0` is legal and means "never park" — the off switch for an operator who wants today's fail-immediately behaviour, matching how `RUN_MAX_REQUEUES=0` means "no automatic requeues". |
 | `RUN_LIMIT_MAX_PARK` | `192h` (8 days) | Ceiling on how far out a single park's `retry_not_before` may reach; a run whose computed wait exceeds this fails instead of parking, so a compromised or buggy worker can't hold a run parked for years. Longer than a weekly usage window (`seven_day`) to leave headroom for jitter and clock skew. This is a per-park bound, not a lifetime wait budget; without a usable reset, the 15m-doubling fallback (capped at 4h) can exhaust `RUN_LIMIT_MAX_WAITS` before a weekly window reopens. A park holds the issue lock and worker disk, and can hold a run-bound hosted worker and PVC. **Cannot be disabled**: unlike a set-but-unparseable `UZI_AUTOSTOP_ENABLED`, an invalid or non-positive value here is not a boot guard — it silently falls back to the default, so a mistyped `RUN_LIMIT_MAX_PARK=0` does not remove the clamp. |
-| `RUN_RECOVERY_PARK_BASE` | `1m` | Wait for the **first** `recovery_wait` park a run enters when a resumed SDK turn keeps coming back empty or the provider is transiently failing, after bounded in-process retries (issue #1197; see [Recovering from a transient interruption](run-recovery-wait.md)). Each subsequent park on the same run doubles the previous wait, clamped at `RUN_RECOVERY_MAX_PARK` below. There is no `RUN_RECOVERY_MAX_WAITS`: empty-turn and resumed-gate recovery keep auto-resuming without a lifetime cap. Provider-origin parks use the separate elapsed streak bound below. This knob and `RUN_RECOVERY_MAX_PARK` shape retry *cadence*. |
+| `RUN_RECOVERY_PARK_BASE` | `1m` | Wait for the **first** `recovery_wait` park a run enters when a resumed SDK turn keeps coming back empty or the provider is transiently failing, after bounded in-process retries (issue #1197; see [Recovering from a transient interruption](run-recovery-wait.md)). Subsequent ordinary parks use the lifetime recovery-wait count to double the wait, clamped at `RUN_RECOVERY_MAX_PARK` below. Retained-recovery exhaustion instead uses its separate `retained_park_count` for this cadence (1m, 2m, 4m plus jitter at defaults). There is no `RUN_RECOVERY_MAX_WAITS`: empty-turn and resumed-gate recovery keep auto-resuming without a lifetime cap. Provider-origin parks use the separate elapsed streak bound below. This knob and `RUN_RECOVERY_MAX_PARK` shape retry *cadence*. |
 | `RUN_PROVIDER_PARK_MAX_DURATION` | `24h` | Go duration bounding a feature-negotiated `provider_outage` streak from its first park. At the next qualifying provider park at or past the bound, the run waits for its owner as `paused` / `provider_unavailable`, without failing. `0` disables the hold while typing and counting remain enabled; negative or malformed values fall back to `24h`. Positive `productive_turns` on a provider park starts a new streak, and positive `provider_progress_turns` on an ordinary or disk recovery park clears one; owner Resume, early credential-driven promotion and credential switching clear it, while automatic and vault-unlock promotion preserve it. Evaluation is at park time, so backoff, jitter, queue/claim delay and the next attempt can delay detection; no maximum overshoot is promised. See [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks). |
+| `RUN_RETAINED_RECOVERY_MAX_PARKS` | `3` | Nonnegative cap on automatic `retained_recovery_exhausted` parks; `0` holds immediately. Below the cap, increment the cause-specific count and schedule a timed retry. At the cap, hold for owner Resume/Cancel without incrementing that count or setting a retry time; lifetime recovery-wait count still increments. The fourth exhaustion is held by default. Resume preserves the count and cap. Timer promotion grants a fresh run wall window; manual Resume preserves remaining wall and may require extension. Both forms retain source custody and can block image rolls. See [Retained recovery exhausted](run-recovery-wait.md#retained-recovery-exhausted). |
 | `RUN_RECOVERY_MAX_PARK` | `30m` | Ceiling on a single timed `recovery_wait` park's backoff wait — the same role `RUN_LIMIT_MAX_PARK` plays for `limit_wait`, just clamped far shorter by default (30m vs. 8 days), because a transient interruption is expected to be short-lived rather than a multi-day usage-limit window. |
 | `RUN_FORGE_UNREACHABLE_MAX_PARKS` | `6` | Cap on how many times one run may park at `recovery_wait` with cause `forge_unreachable` (a transient DNS/connect/5xx failure at clone or fetch, issue #1392; see [Forge unreachable at clone](run-recovery-wait.md#forge-unreachable-at-clone)) before the next such failure fails it instead, with `fail_origin=forge_unreachable` and no judge run, rather than parking again. Unlike the empty-turn park above, this cause has a lifetime cap by design — a dead forge should not hold a run open forever. `0` means unlimited, the same "off switch" convention as `RUN_LIMIT_MAX_WAITS=0`. |
 | `RUN_GATE_REFUSAL_MAX` | `3` | Cap on how many times one run may have a plan-gate re-presentation refused (issue #1795: a worker retrying, or reclaiming, a gate it cannot present exactly as it was last shown) before the next refusal fails the run instead, with `fail_origin=gate_presentation_refused`, rather than parking it at `recovery_wait` again. Counted once per claim generation, so a single claim's own retries never exhaust the budget on their own. `0` means unlimited, the same "off switch" convention as `RUN_LIMIT_MAX_WAITS=0`. |
@@ -413,20 +414,41 @@ against runner cleanup and the recovery lifecycle on 2026-09-08.
 
 `config.Load` also parses `WORKER_HEARTBEAT_INTERVAL` and `WORKER_POLL_INTERVAL` into the server's `Config` struct. The api reads its copy of `WORKER_HEARTBEAT_INTERVAL` for the active-run snapshot freshness fences (`WORKER_HEARTBEAT_STALE` plus one interval) and the [run health](run-health.md#what-the-flags-mean) undelivered-outcome threshold (4 intervals); the stale-worker sweeper itself acts on `WORKER_HEARTBEAT_STALE`. `WORKER_POLL_INTERVAL` now has one API-side use: its parsed value is the multiplier `WORKER_SPREAD_GRACE` defaults from (`3×`, see the row above) — otherwise it, too, is not a server knob despite being parsed here. The values that actually matter for pacing the worker's own poll loop are the **worker's own copy** of these same-named variables, consumed by the `agent` binary and wired to the `agent` compose service; see the Worker container table below.
 
+### Task checkpoint rollout and rollback
+
+Upgrade the API before enrolling tasks with workers advertising
+`task_checkpoint_coordinates_v1`. Enrollment is a fresh compatible claim's
+immutable server snapshot; existing active legacy tasks are not converted.
+Old workers receive no task coordinate descriptor and cannot claim or readopt
+enrolled tasks. Invalid lineage remains unsupported.
+
+**Rolling back to an old API can reduce availability.** Database guards can
+stall queue-head claims or reject a whole readoption batch containing an
+enrolled task, including otherwise compatible peers in that batch. Roll forward
+to a compatible API to restore progress. Capability overrides cannot bypass
+coordinate compatibility or these database guards.
+
+Migration 00352's schema Down refuses while enrolled rows exist, including
+terminal rows, and requires READ COMMITTED isolation. Do not clear frozen
+descriptors to force a downgrade. Keep the compatible schema/API and preserve
+custody while resolving the incident. See [ADR-3343](../adr/3343-task-checkpoint-coordinates.md)
+for the rollout boundary and [task checkpoint recovery](./run-recovery.md#task-checkpoint-recovery)
+for publication evidence.
+
 ### Checkpoints: two tiers (PRD #122 M8, PRD #267)
 
-A run's committed work is published to origin (`refs/uzi-checkpoints/<branch>`, credential-free — the worker never `git push`es; a pack is brokered through the api) on two independent triggers, so a different worker that later re-claims the run can recover it (`seededFrom: "checkpoint"`) instead of redoing it:
+A run's committed work is published to origin (`refs/uzi-checkpoints/<checkpoint-key>`, credential-free — the worker never `git push`es; a pack is brokered through the api) on two independent triggers, so a different worker that later re-claims the run can recover it (`seededFrom: "checkpoint"`) instead of redoing it:
 
-1. **Milestone-cooperative.** When the lead signals a completed milestone, the worker reaps the agent tree, fetches the committed work back, and publishes it to origin. This is the original mechanism (PRD #122 M6/M8) and still fires on every milestone boundary.
+1. **Milestone-cooperative.** When the lead signals a completed milestone, the worker reaps the agent tree, fetches the committed work back, and publishes it to origin. This is the original mechanism (PRD #122 M6/M8) and applies to the existing issue-only milestone policy; task checkpoint enrollment does not make task runs milestone-eligible.
 2. **Time-gated iteration boundary** (PRD #267). Every iteration boundary the lead does *not* cooperatively checkpoint already fetches committed work back locally without reaping (so a backgrounded process the lead is using, e.g. a dev server, survives). That fallback now *also* publishes to origin — without reaping — once `CHECKPOINT_INTERVAL` has elapsed since the last logical origin publish attempt, provided the branch tip has moved. This bounds worst-case data loss from a worker-disk loss to roughly one `CHECKPOINT_INTERVAL` of committed work, instead of a whole milestone's worth on a long first milestone where nothing has reached origin yet.
 
-Only **committed** work is captured either way — a checkpoint fetches back commits, not the dirty working tree, so uncommitted changes are not protected by either tier. Cross-worker recovery is identical for both: both write the same `refs/uzi-checkpoints/<branch>` mirror.
+Only **committed** work is captured either way — a checkpoint fetches back commits, not the dirty working tree, so uncommitted changes are not protected by either tier. Cross-worker recovery uses the same `refs/uzi-checkpoints/<checkpoint-key>` mirror for both. Dirty work requires the separate verified recovery-capture overlay path. Keys remain exactly `agent/issue-<iid>` and `uzi/self-improve/<run-id>` for existing issue and self-improvement runs; an enrolled task uses `uzi/task/<its-own-run-id>`, independently of its validated root's work branch. See [task checkpoint recovery](./run-recovery.md#task-checkpoint-recovery).
 
 **Checkpoint HTTP retries (issue #296).** Each logical checkpoint publish makes at most three HTTP requests total, retrying only explicit numeric HTTP 500–599 after 250ms and 1000ms. Any supplied caller deadline or abort signal is shared across attempts; each HTTP request retains its own client timeout. Some callers supply no outer signal, so the first request's timeout does not bound the total operation. Each retry opens a fresh producer stream for the fixed original source, candidate and floor after rechecking ownership, scratch/floor safety and the remediation hold; the abandoned producer is explicitly cancelled and settled before replay. HTTP 4xx, nonconfirming 2xx, skips, local errors, transport exceptions and aborts are not retried. The `CHECKPOINT_INTERVAL` gate (default `20m`) measures logical operations, not these internal requests. A confirming ACK also requires producer exit zero; ambiguous attempts remain available for later overlay chaining. Intermediate 5xx responses appear in numeric operator retry logs; a continuing 5xx failure reaches the deduped feed only after the third request. A successful retry emits one positive “checkpoint publishing recovered — published to origin” feed line even when no earlier failure was recorded there. These retries do not guarantee durability for divergent heads or resolve the cause of production HTTP 500 responses.
 
 **Mid-turn tick (issue #1597).** Both tiers above fire only at a turn boundary, so a single very long turn — the case this closes — could previously commit real work and reach no checkpoint at all until the turn ended. A repeating mid-turn tick, `CHECKPOINT_TICK_INTERVAL` (default `5m`; `0` disables it), fetches the runner clone's committed work back into the worker's bare repository at most once per tick, when the branch tip has moved and the clone is not busy, and publishes it to origin through the same credential-free broker once the branch tip differs from the last confirmed published tip and `CHECKPOINT_INTERVAL` has elapsed since the last publish attempt, not the last success — the same publish cadence as the iteration-boundary tier, just triggered without waiting for the turn to end. Worst-case loss is therefore roughly `CHECKPOINT_INTERVAL` plus one tick interval, as a best-effort bound rather than a guarantee: it holds only while the tick actually runs (the clone is not git-busy and no retained bare lock remains), the scan is trusted and finding-free, and the broker accepts the publish, so sink reachability alone does not provide it — a lingering git-busy marker defers the tick indefinitely, a finding or untrusted scan keeps that tick's work on worker-local storage (#1964 also holds remembered findings at the upload seam within the current flight; its memory does not survive reclaim), and the tick starts a failed publish's next logical operation at most once per `CHECKPOINT_INTERVAL` (each operation may make up to three HTTP requests); there is no durability claim while every sink is down, and a fetch-back with no successful remote publish is never reported as durable. A per-flight sink gate serializes the tick against every other path that moves the run's durable state (checkpoint closure, pause/wall/completion-hold parks, credential switch). A metadata-only git-busy probe (one non-blocking open of `.git`, then `lstat` of each marker; no git child) skips the tick whenever one of a fixed set of git lock files or merge/rebase/cherry-pick/revert markers is present in the runner clone, or its gitdir is unreadable, regardless of age. Scanning covers every checkpoint publish that goes through the checkpoint body without an overlay context — the mid-turn tick, the time-gated iteration-boundary tier, and milestone publishes on non-GitHub forges — over the pinned commit range being packed, minus content already public, before that range ever reaches origin; a finding or an untrusted scan skips the remote publish and keeps only the local fetch-back. On a Codex run such an overlay-less (non-GitHub) milestone publish is instead deferred (`scan_deferred`) rather than scanned inside the boundary permit. The park/shutdown/pause/capture checkpoint publishes and every GitHub milestone (`reap:true`) publish remain unscanned, unchanged from before this issue — a GitHub milestone, Codex or otherwise, always carries an overlay context and, when the #1964 hold permits publication, publishes unscanned, whether or not an overlay commit is actually built.
 
-**Done checkpoint budgets (issue #3123).** Explicit reaped Codex `done_checkpoint` calls with `executor.safety` use an absolute 60 s cooperative soft allowance and 90 s hard allowance, starting before sink-gate admission, preliminary reads, queue admission, reconciliation, quiescence and action. Commands share the remaining time. The initial checkpoint and the existing fresh advisory snapshot request each get one allowance, so together they may approach 180 s. A soft stop skips optional publication after owned work settles; local import alone does not establish origin durability. Milestones retain 10 s soft / 30 s hard budgets (#3304): the pre-import bare-lock wait can be cancelled; started import, preservation and in-import stage cleanup stay hard-only. After the import settles and retained-head notices are emitted, ownership readback, steering and bridge reads can stop cooperatively, even without new work to publish. A started bridge adoption stays hard-only through the tracking update, ownership readback and checkpoint-floor advancement. A clean stop reports `soft_deadline` and milestone progress without claiming publication or origin durability; the next checkpoint, park or finalize re-evaluates the skipped work. Successful-import cleanup checks the tracking ref before scanning owed inventory, but its checked ref read and stage deletion can still exhaust the hard boundary. Repeated skips leave work local and unpublished; Docker pod replacement can still lose it (#3153). Shared Claude and non-reaped paths are unchanged; finalize independently imports work under its existing guards and separate 50-minute boundary.
+**Done checkpoint budgets (issue #3123).** Explicit reaped Codex `done_checkpoint` calls with `executor.safety` use an absolute 60 s cooperative soft allowance and 90 s hard allowance, starting before sink-gate admission, preliminary reads, queue admission, reconciliation, quiescence and action. Commands share the remaining time. The initial checkpoint and the existing fresh advisory snapshot request each get one allowance, so together they may approach 180 s. A soft stop skips optional publication after owned work settles; local import alone does not establish origin durability. Milestones retain 10 s soft / 30 s hard budgets (#3304): the pre-import bare-lock wait can be cancelled; started import, preservation and in-import stage cleanup stay hard-only. After the import settles and retained-head notices are emitted, ownership readback, steering and bridge reads can stop cooperatively, even without new work to publish. A started bridge adoption stays hard-only through the tracking update, ownership readback and checkpoint-floor advancement. A clean stop reports `soft_deadline` and milestone progress without claiming publication or origin durability; the next checkpoint, park or finalize re-evaluates the skipped work. Successful-import cleanup checks the tracking ref before scanning owed inventory, but its checked ref read and stage deletion can still exhaust the hard boundary. Repeated skips leave work local and unpublished; Docker pod replacement can still lose it (#3153). Code-head reads for the advisory code snapshot (#3304) settle at the soft or hard stop instead of waiting on the code-head path's generic 600 s read timer (the prompt-run changed-files read), which is retired once the boundary stops; a clean soft stop or ordinary failure still gives `snapshot_failed`, and the done body's soft stop still ends the attempt `soft_stop`. The phase reports `checkpoint-code-head-runner-tip`, `-tracking`, `-default-tip`, `-pin` and `-changed-files`. The hard-stop settlement and timer retirement also apply in other boundary scopes such as the mid-turn tick. Shared Claude and non-reaped paths otherwise keep these budgets unchanged; finalize independently imports work under its existing guards and separate 50-minute boundary.
 
 An unavailable advisory snapshot gets the [existing single fresh request](./cross-check.md#owner-guidance-and-repository-instructions) for the retained exact candidate, or the successfully settled normal completion-record callback's head if the initial head was unreadable. A null or moved candidate is `snapshot_failed`, with no fresh-head substitution. Ordinary failure and a clean soft stop disclose SHA-free incomplete evidence. This adds no model turn, completion attempt, checker invocation or repair rerun; finalize is not the snapshot retry.
 
@@ -478,6 +500,55 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 
 Duration values accept the same Go-style strings used server-side (`15s`, `3s`, `500ms`, `2h`) or a bare integer read as milliseconds.
 
+### Worker Go concurrency defaults
+
+Two optional settings (issue #3382) cap the Go build and runtime parallelism of
+commands the worker launches. Both are **unset by default**: nothing is rendered
+and no `GOFLAGS` or `GOMAXPROCS` is injected.
+
+| Worker environment variable | Helm `workers` key | Default | Meaning |
+|---|---|---|---|
+| `WORKER_GO_BUILD_PARALLELISM` | `goBuildParallelism` | empty | Sets `GOFLAGS=-p=N`: how many packages `go build` and `go test` build or run in parallel. |
+| `WORKER_GO_MAXPROCS` | `goMaxProcs` | empty | Sets `GOMAXPROCS=N`: the Go runtime's CPU parallelism. The `go` command's `-p` defaults to `GOMAXPROCS`, so this also bounds package parallelism when no `-p` is set. |
+
+String values (quoted YAML, `--set-string`, and the controller and worker
+environment) must be positive decimal digits up to `2147483647`; surrounding
+whitespace is trimmed, empty means unset, and leading zeros are accepted
+(`007` is `7`). Zero, signs, fractions, non-digits and larger values are
+rejected: the chart render fails, the controller refuses to start, or the worker
+refuses to start, depending on where the value is set. Helm decodes typed
+numbers (unquoted YAML, `--set`) before the template sees them, so those are
+checked by numeric value: a whole number from `1` to `2147483647`, relayed as its
+canonical decimal (`+1` arrives as `1`; in a values file `0x10` and `1e3` also
+arrive as `16` and `1000`, while `--set` decodes only decimal integers). Quote the
+value in YAML or use `--set-string` to have the spelling checked. There is no general `GOFLAGS` passthrough.
+
+The values apply to the scrubbed environment of Claude commands (native and
+guarded), Codex commands, worker-run checks and JavaScript dependency installs.
+Compose relays both variables from `.env`; hosted workers use the chart keys,
+and the controller receives them as `UZI_WORKER_GO_BUILD_PARALLELISM` and
+`UZI_WORKER_GO_MAXPROCS` and relays them into worker pods. Setting or changing
+either hosted value rolls every hosted worker pod once it holds no non-terminal
+run; compose and self-run workers
+pick it up on restart. Both the controller and the worker image must come from a
+release containing this change; older ones ignore the settings.
+
+Limits:
+
+- This is not a worker-wide process or memory limit. Each concurrent command gets
+  the same value on its own.
+- An explicit `-p` flag, or a command or Taskfile that sets its own `GOFLAGS`,
+  replaces `-p=N`. `GOMAXPROCS` still applies, so `goMaxProcs` is the more
+  robust knob.
+- It does not cap per-test internal concurrency, child processes or memory, and
+  command code can replace its own environment.
+- On Codex, the worker's own Go helper processes (supervisor, sandbox and
+  file-operation helper) launched with the command environment also inherit
+  `GOMAXPROCS`.
+
+See [Worker setup](./worker-setup.md#3-run-the-worker) for supplying the values
+to a self-run worker.
+
 ### Worker memory guard
 
 The proactive worker memory guard is **off by default** (issue #2396).
@@ -514,8 +585,28 @@ These `_MS` settings take decimal milliseconds, not Go-style durations.
 For a finite cgroup limit `L = memory.max`, the guard computes
 `H = L - reserveBytes` and `Q = H - hysteresisBytes`, requiring
 `0 < Q < H < L`. Unavailable, stale or incompatible cgroup evidence inhibits
-intervention; an unlimited cgroup does not supply a usable limit. Total
-`memory.current` is authoritative, with no file-memory subtraction.
+intervention; an unlimited cgroup does not supply a usable limit. Pressure
+is the working set, `max(0, memory.current - inactive_file)`; it is compared with `H`
+and drives the early projection and the below-`Q` quiet dwell (the early
+projection runs only with PSI).
+`memory.stat` must contain `inactive_file`, else the sample is unavailable.
+The working set is an estimate, not guaranteed non-reclaimable memory and not
+an OOM predictor: inactive file pages can be dirty, under writeback or slow to
+reclaim, so the subtraction can underestimate pressure (dirty/writeback
+validation is deferred). Feedback's `observed_total_bytes` stays the raw
+`memory.current` and can exceed the working set that triggered.
+
+Cgroup memory PSI (`memory.pressure`) is optional. A read failing with exactly
+`ENOENT` or `ENOTSUP` marks PSI absent; any other error, or malformed or
+oversized PSI, makes the whole sample unavailable. Early intervention needs real
+PSI in two consecutive samples, an increasing full-PSI total, growth in
+`anon`, `shmem`, `slab_unreclaimable` or `unevictable`, and a working-set
+projection reaching `H` within the response budget. Without PSI only the hard
+path (working set at or above `H`) can fire. The worker logs one `warn`
+("worker memory guard: cgroup memory PSI unavailable; early intervention
+disabled, hard intervention continues on valid core accounting", field `reason`) on initial absence or
+loss, and one `info` ("worker memory guard: cgroup memory PSI restored; early
+intervention resumes after consecutive PSI samples") on restoration; repeats are silent.
 Approximate command-tree RSS ranks eligible targets; it does not measure
 cgroup usage or prove that memory was freed.
 
