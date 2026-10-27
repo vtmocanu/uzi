@@ -500,7 +500,9 @@ export function formatRetainedRecoveryDiagnostic(
 ): { diagnostic_stage: string; diagnostic_code: string; cause: string; context?: string } {
   let stage = "recovery";
   try {
-    const successor = error instanceof Error ? retainedSuccessorDiagnostics.get(error) : undefined;
+    // WeakMap lookup inspects no properties and returns undefined for primitive keys too.
+    // Avoid adding an observable instanceof/prototype read to untagged formatting.
+    const successor = retainedSuccessorDiagnostics.get(error as Error);
     if (successor !== undefined && RETAINED_SUCCESSOR_REASONS.has(successor)) {
       return { diagnostic_stage: "successor", diagnostic_code: "retained_successor_" + successor, cause: "" };
     }

@@ -83,6 +83,17 @@ it("generic errors are redacted and bounded; helper and formatter failures use f
   assert.ok(!JSON.stringify(failed).includes(secret));
 });
 
+it("M1 untagged formatting preserves prototype observations", () => {
+  let prototypeReads = 0;
+  const error = new Proxy(new Error("plain untagged failure"), {
+    getPrototypeOf() { return ++prototypeReads <= 2 ? Error.prototype : null; },
+  });
+  assert.deepEqual(formatRetainedRecoveryDiagnostic(error, s => s), {
+    diagnostic_stage: "recovery", diagnostic_code: "recovery_failed", cause: "plain untagged failure",
+  });
+  assert.equal(prototypeReads, 2, "only the original formatter checks the untagged value");
+});
+
 // Candidate-only annotation API tables; portable lifecycle assertions live in the fixture tests.
 const successorReasons = [
   "wrapper_tip_subject", "wrapper_source_subject", "wrapper_leaf_subject", "wrapper_commit_read",
