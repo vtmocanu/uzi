@@ -34,6 +34,11 @@ function timestamp(value: unknown): value is string {
   return month! >= 1 && month! <= 12 && day! >= 1 &&
     day! <= new Date(Date.UTC(year!, month!, 0)).getUTCDate() && Number.isFinite(Date.parse(value));
 }
+// Date.parse truncates fractional milliseconds; PostgreSQL timestamps retain them.
+function timestampNanos(value: string): bigint {
+  const fraction = /\.(\d+)/.exec(value)?.[1] ?? "";
+  return BigInt(Date.parse(value)) * 1_000_000n + BigInt(fraction.padEnd(9, "0").slice(3));
+}
 export function decodeCodexOperationDecision(value: unknown, request: CodexOperationRequest): CodexOperationDecision {
   const fail = (): never => { throw new Error("invalid Codex operation admission response"); };
   if (!record(value) || value.operation_id !== request.operation_id || !uuid(value.operation_id) ||
@@ -43,6 +48,6 @@ export function decodeCodexOperationDecision(value: unknown, request: CodexOpera
   if (value.decision !== "wait" || !closed(value, [...common, "class", "episode_id", "server_now", "eligible_at"]) ||
       !["rate_limit", "overload"].includes(value.class as string) || !uuid(value.episode_id) ||
       !timestamp(value.server_now) || !timestamp(value.eligible_at) ||
-      Date.parse(value.eligible_at) <= Date.parse(value.server_now)) return fail();
+      timestampNanos(value.eligible_at) <= timestampNanos(value.server_now)) return fail();
   return value as CodexOperationDecision;
 }

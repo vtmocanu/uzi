@@ -27,6 +27,12 @@ func (h *Handler) WorkerCodexOperationAdmission(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
+	// Context expiry alone cannot interrupt a transport body read. Use the same
+	// deadline for the connection, and close a contract-compliant Body on cancel.
+	deadline, _ := ctx.Deadline()
+	_ = http.NewResponseController(w).SetReadDeadline(deadline)
+	stopBodyClose := context.AfterFunc(ctx, func() { _ = r.Body.Close() })
+	defer stopBodyClose()
 	var req workersvc.CodexOperationRequest
 	if httpx.DecodeJSONStrictBounded(r, &req, 4096) != nil || req.Validate() != nil {
 		httpx.Error(w, http.StatusBadRequest, codexErrInvalid)

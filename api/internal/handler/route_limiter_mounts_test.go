@@ -844,6 +844,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/memory/outcome", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/refresh", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/admission-signal", noLimiter},
+	{"POST", "/api/worker/runs/{id}/codex/operation-admission", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/release", noLimiter},
 	// PRD #1226 M2: the completion-interlock permit-issue and same-lead attempt endpoints.
 	// Worker-authenticated, scoped to the worker's own run, no forge call → noLimiter, matching
