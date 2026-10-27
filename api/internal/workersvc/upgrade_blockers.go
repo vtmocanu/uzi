@@ -95,6 +95,11 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 	case "awaiting_followup":
 		return "owner follows up or ends the run"
 	case "paused":
+		// PRD #3522: a run parked by the weekly usage reserve leaves by itself once usage drops
+		// below the threshold, or when the owner resumes it (overriding the reserve).
+		if r.HoldReason.Valid && r.HoldReason.String == holdWeeklyReserve {
+			return "held by the weekly usage reserve; resumes when usage drops below the threshold, or the owner resumes the run (overriding the reserve)"
+		}
 		return "owner resumes the run"
 	case "claimed", "running":
 		return "run must finish"

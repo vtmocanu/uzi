@@ -120,7 +120,12 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 				return p.JSON(run)
 			}
 			if !gf.quiet {
-				p.Printf("Resumed %s: queued.\n", args[0])
+				if run.ReserveExemptUntil != nil {
+					// PRD #3522: the server records the override only when it resumed a weekly_reserve hold.
+					p.Printf("Resumed %s: queued (overrides the weekly usage reserve until the next weekly reset).\n", args[0])
+				} else {
+					p.Printf("Resumed %s: queued.\n", args[0])
+				}
 				if w := run.WorkerRecovery; w != nil && w.Episode > 0 {
 					p.Printf("Worker recovery episode %d; only owner Resume from exhaustion starts a fresh worker recovery episode; automatic requeue allowance %d; %d used, %d remaining; lifetime charged count %d.\n", w.Episode, w.AutomaticRequeueLimit, w.EpisodeUsed, w.EpisodeRemaining, run.RequeueCount)
 					if w.AutomaticRequeueLimit == 0 {

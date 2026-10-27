@@ -19,7 +19,8 @@ import (
 // RequestWorkerPause reuses the ordinary pause request under the claim's run-row
 // lock. It leaves SetRunPaused and owner resume responsible for the transitions.
 // A pending ordinary pause is accepted without creating another audit input;
-// its mode is retained. All pending ordinary pause inputs are delivered by this
+// its mode is retained, except a pending system 'reserve' request, which becomes the lead's ordinary
+// 'now' pause (PRD #3522). All pending ordinary pause inputs are delivered by this
 // response and consumed/applied in this transaction, never by later steering.
 func (s *Service) RequestWorkerPause(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64) (store.Run, bool, error) {
 	if generation <= 0 {
@@ -79,7 +80,18 @@ func (s *Service) RequestWorkerPause(ctx context.Context, wkr store.Worker, runI
 	if !run.AutoApprove && !rc.HumanPlanApproved && run.PlanSource != planSourceSeeded {
 		return run, false, nil
 	}
-	if !run.PauseRequestedAt.Valid {
+	if run.PauseRequestedAt.Valid && run.PauseMode.String == "reserve" {
+		// PRD #3522: the lead's /park overlapping a pending weekly-reserve request. Replace it with the
+		// lead's ordinary now-pause in this same transaction, so the run parks with a NULL hold, needs an
+		// owner decision, and the reserve sweeper neither releases it nor re-requests a pause.
+		n, err := q.ConvertReservePauseToNow(ctx, store.ConvertReservePauseToNowParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID), ClaimGeneration: generation})
+		if err != nil {
+			return store.Run{}, false, err
+		}
+		if n == 0 {
+			return run, false, nil
+		}
+	} else if !run.PauseRequestedAt.Valid {
 		if _, err := q.CreateWorkerPauseInput(ctx, store.CreateWorkerPauseInputParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID), ClaimGeneration: generation}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return run, false, nil

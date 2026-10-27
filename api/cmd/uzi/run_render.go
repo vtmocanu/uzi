@@ -535,6 +535,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, credentialSwitchAction(r))
 	case holdBaseAttestation:
 		clauses = append(clauses, baseAttestationAction(r))
+	case holdWeeklyReserve:
+		clauses = append(clauses, weeklyReserveAction(r))
 	}
 	return []string{"HOLD", strings.Join(clauses, " · ")}
 }
@@ -557,9 +559,18 @@ func holdReasonLabel(reason string) string {
 		return "credential switch unsettled"
 	case holdBaseAttestation:
 		return "base not attested"
+	case holdWeeklyReserve:
+		return "weekly usage reserve"
 	default:
 		return cellText(reason)
 	}
+}
+
+// weeklyReserveAction is the owner's next step for a weekly_reserve hold (PRD #3522): the run resumes
+// by itself when usage falls below the threshold, and `uzi run resume` overrides the reserve until the
+// next weekly reset.
+func weeklyReserveAction(r apitypes.RunDTO) string {
+	return "resumes when usage drops below the threshold; override: uzi run resume " + cellText(r.ID)
 }
 
 // isBaseAttestationHold reports whether r is held because its kept work carries no
@@ -634,6 +645,8 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "held, credential switch unsettled; " + credentialSwitchAction(r)
 	case holdBaseAttestation:
 		return "held, its kept work is not attested against the planned base (--require-base); " + baseAttestationAction(r)
+	case holdWeeklyReserve:
+		return "held by the weekly usage reserve; " + weeklyReserveAction(r)
 	default:
 		return "paused (" + holdReasonLabel(reason) + ")"
 	}
@@ -795,14 +808,20 @@ func pauseBoundaryClause(r apitypes.RunDTO) string {
 	if r.PauseMode != nil && *r.PauseMode == "now" {
 		return "now"
 	}
+	// PRD #3522: the weekly usage reserve files the same milestone-boundary request; name the cause so
+	// the owner does not read it as their own pause.
+	suffix := ""
+	if r.PauseMode != nil && *r.PauseMode == "reserve" {
+		suffix = " (weekly usage reserve)"
+	}
 	if len(r.Milestones) == 0 {
-		return "after the current step"
+		return "after the current step" + suffix
 	}
 	n := 1
 	if r.PauseAfterCount != nil {
 		n = *r.PauseAfterCount + 1
 	}
-	return fmt.Sprintf("after M%d", n)
+	return fmt.Sprintf("after M%d", n) + suffix
 }
 
 // joinSheddingClauses joins clauses with " · ", DROPPING trailing clauses (from the right)

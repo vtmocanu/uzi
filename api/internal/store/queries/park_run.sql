@@ -22,6 +22,32 @@ INSERT INTO run_user_inputs (run_id, kind, body)
 SELECT paused_req.id, 'pause', 'now' FROM paused_req
 RETURNING *;
 
+-- name: ConvertReservePauseToNow :execrows
+-- PRD #3522: the lead's own /park overlapping a PENDING system 'reserve' pause request. The reserve
+-- request is replaced by the lead's ordinary now-pause (same fence as CreateWorkerPauseInput, plus
+-- pause_mode = 'reserve'), so the run parks with a NULL hold and waits for an owner decision rather
+-- than being auto-released as a weekly_reserve park. The audit kind='pause' body='now' input is
+-- written in the same statement; the caller consumes it with ConsumeWorkerPauseInputs. 0 rows when
+-- the request is gone or the fence no longer holds.
+WITH converted AS (
+    UPDATE runs SET
+        pause_mode = 'now',
+        pause_requested_at = now(),
+        pause_after_count = COALESCE(jsonb_array_length(runs.milestones_completed), 0),
+        updated_at = now()
+    WHERE runs.id = @id AND runs.worker_id = @worker_id
+      AND runs.claim_generation = @claim_generation
+      AND runs.claim_released_at IS NULL AND runs.status = 'running'
+      AND runs.kind = 'issue' AND runs.interactive = false
+      AND runs.pause_requested_at IS NOT NULL AND runs.pause_mode = 'reserve'
+      AND runs.stop_kind IS NULL AND runs.budget_finalize_seconds = 0
+      AND NOT EXISTS (SELECT 1 FROM run_user_inputs
+          WHERE run_id = runs.id AND kind IN ('stop', 'cancel'))
+    RETURNING runs.id
+)
+INSERT INTO run_user_inputs (run_id, kind, body)
+SELECT converted.id, 'pause', 'now' FROM converted;
+
 -- name: ConsumeWorkerPauseInputs :exec
 -- The direct pause response delivers the control. Settle ordinary pause inputs
 -- in the same run-row transaction so neither steering nor replay re-triggers it.

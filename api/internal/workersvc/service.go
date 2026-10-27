@@ -6344,7 +6344,7 @@ func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid
 	// hold or released claim after a lost ACK. All fields come from this same read.
 	if run.HoldReason.Valid {
 		reason := run.HoldReason.String
-		holdReason = &reason
+		holdReason = WorkerVisibleHoldReason(&reason)
 	}
 	return run.Status, retry, run.ClaimGeneration, holdReason, run.ClaimReleasedAt.Valid, run.GateRevision, nil
 }

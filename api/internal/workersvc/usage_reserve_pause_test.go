@@ -198,3 +198,18 @@ func TestReserveSpentVerdictAndRequestWanted(t *testing.T) {
 		t.Error("a cleared threshold must withdraw the request")
 	}
 }
+
+func TestWorkerVisibleHoldReason(t *testing.T) {
+	s := func(v string) *string { return &v }
+	if got := WorkerVisibleHoldReason(s("weekly_reserve")); got != nil {
+		t.Errorf("weekly_reserve = %q, want nil", *got)
+	}
+	if got := WorkerVisibleHoldReason(nil); got != nil {
+		t.Errorf("nil = %q, want nil", *got)
+	}
+	for _, hold := range []string{"budget_exhausted", "completion_blocked", "provider_unavailable", "credential_disabled", "owner"} {
+		if got := WorkerVisibleHoldReason(s(hold)); got == nil || *got != hold {
+			t.Errorf("%s = %v, want unchanged", hold, got)
+		}
+	}
+}

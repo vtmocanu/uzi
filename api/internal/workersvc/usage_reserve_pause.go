@@ -387,3 +387,25 @@ func ComputeReserveOverride(ctx context.Context, q *store.Queries, run store.Run
 	}
 	return g, nil
 }
+
+// WorkerVisibleHoldReason is the ONE mapping of a run's hold_reason to what a worker is told (every
+// worker-facing emission goes through it: the ownership probe, the state/pause ACK run bodies and the
+// other worker run responses). The agent treats a paused run with a null hold as an ordinary pause
+// (retain it, wait for the owner) and any other hold as a recovery or refusal path, so the reserve's
+// weekly_reserve hold reads as null to a worker. Owner-facing DTOs keep the real value.
+func WorkerVisibleHoldReason(reason *string) *string {
+	if reason != nil && *reason == holdWeeklyReserve {
+		return nil
+	}
+	return reason
+}
+
+// WorkerVisiblePauseMode is servedPauseMode for a worker-facing run body's pending pause mode: the
+// reserve's 'reserve' request reads as an ordinary 'milestone' request to a worker.
+func WorkerVisiblePauseMode(mode *string) *string {
+	if mode == nil {
+		return nil
+	}
+	served := servedPauseMode(*mode)
+	return &served
+}
