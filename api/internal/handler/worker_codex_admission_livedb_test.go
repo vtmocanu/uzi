@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -128,6 +129,50 @@ func TestWorkerCodexAdmissionPersistedLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertAdmissionSpreadBound(t, eligible, state.EffectiveExpiry.Time, state.SpreadWidthMs)
+	t.Run("service reconstruction preserves admission and duplicate receipt", func(t *testing.T) {
+		// Ordinary service reconstruction, with its own pool and query context; the original
+		// fixture stays open for the deterministic-spread and post-park checks below.
+		restartedCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		restartedPool, err := store.OpenPool(restartedCtx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer restartedPool.Close()
+		restartedQ := store.New(restartedPool)
+		restartedSvc := workersvc.New(restartedQ, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
+		restartedSvc.SetTxBeginner(restartedPool)
+		restartedHandler := &Handler{q: restartedQ, wsvc: restartedSvc}
+		restartedRouter := restartedHandler.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))
+		assertPersisted := func() {
+			t.Helper()
+			got, err := restartedQ.GetCodexAdmissionState(restartedCtx, store.GetCodexAdmissionStateParams{UserID: owner, ProviderAccountID: account.ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Compare the entire persisted row: steps, expiries, episode, width, clocks,
+			// votes and receipts must survive, and the duplicate must change none of them.
+			if !reflect.DeepEqual(got, state) {
+				t.Fatalf("service reconstruction/duplicate changed persisted admission: got %+v want %+v", got, state)
+			}
+			gotEligibility, err := restartedQ.GetCodexAdmissionRunEligibility(restartedCtx, run)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !gotEligibility.Valid || !gotEligibility.Time.Equal(eligible.Time) {
+				t.Fatalf("reconstructed eligibility=%v, want %v", gotEligibility, eligible)
+			}
+		}
+		assertPersisted()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		restartedRec := httptest.NewRecorder()
+		restartedRouter.ServeHTTP(restartedRec, req)
+		if restartedRec.Code != http.StatusNoContent {
+			t.Fatalf("reconstructed duplicate = %d %s", restartedRec.Code, restartedRec.Body.String())
+		}
+		assertPersisted()
+	})
 	t.Run("deterministic spread vectors", func(t *testing.T) {
 		tx, err := pool.Begin(ctx)
 		if err != nil {

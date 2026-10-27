@@ -151,7 +151,7 @@ Each stored Codex credential shows one of four statuses:
 | Status | Meaning |
 |---|---|
 | `staging` | Saved and encrypted; the provider identity has not been verified yet. While Codex usage polling is on (the default), uzi verifies it automatically in the background on a read-only, non-rotating identity check, moving it to `linked` once that succeeds, or `failed` once it proves bad; a transient failure (a timeout, a 5xx) leaves it `staging` to retry. With polling turned off (`UZI_CODEX_USAGE_POLL_INTERVAL=0`, see [Codex account limits](rate-limits.md#codex-account-limits)) nothing verifies it, and it stays `staging`. |
-| `linked` | The provider identity has been verified. |
+| `linked` | The provider identity has been verified. Saved aliases of the same account share its temporary [account admission wait](rate-limits.md#temporary-account-admission-waits), including after refresh or re-import; linking does not promise immediate admission. |
 | `failed` | Verification failed. Use **Replace value** with a *new* [login dedicated to uzi](#1-sign-in-with-a-login-dedicated-to-uzi), never a re-paste of the old one. |
 | `static` | An OpenAI API key, not a Codex login; provider-account linking doesn't apply to a key. |
 

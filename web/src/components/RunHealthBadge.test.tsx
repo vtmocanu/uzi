@@ -58,3 +58,18 @@ describe("RunHealthBadge (PRD #47 dashboard/runs-list surface)", () => {
     expect(badge.getAttribute("title")).toBeNull();
   });
 });
+
+
+describe("Codex admission list/dashboard badge", () => {
+  it.each([["rate_limit", "a rate limit"], ["overload", "overload"]] as const)("shows %s and clears without a new API frame", (cls, words) => {
+    const at = "2026-07-04T12:06:37Z";
+    const r = flaggable({ status: "queued", health: "waiting_worker", codex_admission_class: cls,
+      codex_admission_eligible_at: at,
+      health_reason: `waiting: provider reported ${words}; account admission eligible after ${at}` });
+    const { container, rerender } = render(<RunHealthBadge run={r} nowMs={NOW} />);
+    expect(screen.getByText(`waiting: provider reported ${words}; account admission eligible after ${at}`)).toBeTruthy();
+    rerender(<RunHealthBadge run={r} nowMs={Date.parse(at)} />);
+    expect(container.textContent).toBe("⚠ waiting for worker");
+    expect(container.querySelector("[title]")).toBeNull();
+  });
+});

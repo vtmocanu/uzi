@@ -82,6 +82,10 @@ func inputOutcome(kind string, serverSide bool) string {
 // prints HEALTH_REASON and FAILURE_REASON generically, switching on no vocabulary,
 // so PRD #108's new reason strings flow through untouched.
 func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) error {
+	return renderRunDetailAt(p, r, time.Now(), origin...)
+}
+
+func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, origin ...string) error {
 	rows := [][]string{
 		{"ID", r.ID},
 		{"KIND", r.Kind},
@@ -156,13 +160,14 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) err
 	if line := checkpointDurabilityLine(r); line != "" {
 		rows = append(rows, []string{"CHECKPOINT", line})
 	}
-	if r.HealthReason != nil && *r.HealthReason != "" {
-		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(*r.HealthReason)})
+	if reason := runHealthReasonAt(r, now); reason != "" {
+		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(reason)})
 	}
-	// QUEUE_REASON (PRD #3454): why a queued run has not started, derived server-side at read
-	// time. Emit-only-when-set; "maintenance" is spelled out, anything else is shown sanitized.
-	if r.QueueReason != nil && *r.QueueReason != "" {
-		rows = append(rows, []string{"QUEUE_REASON", queueReasonCell(*r.QueueReason)})
+	if reason := runQueueReason(r); reason != "" {
+		rows = append(rows, []string{"QUEUE_REASON", reason})
+	}
+	if reason := codexAdmissionLineAt(r, now); reason != "" {
+		rows = append(rows, []string{"CODEX_ADMISSION", reason})
 	}
 	if r.FailureReason != nil && *r.FailureReason != "" {
 		rows = append(rows, []string{"FAILURE_REASON", sanitizeTTY(*r.FailureReason)})
@@ -2318,6 +2323,10 @@ func codexAccountActionShort(r apitypes.RunDTO) string {
 // (PRD #1809) a data_volume_full park adds "(waiting for disk space)".
 // A run held on credential_disabled (PRD #1732 D14) gets "(credential disabled)" likewise.
 func runStatusCell(r apitypes.RunListItemDTO) string {
+	return runStatusCellAt(r, time.Now())
+}
+
+func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.FailOrigin, ""))
 	if isOwnerRequiredWorkerHold(r.RunDTO) {
 		return workerExhaustionLine(r.RunDTO)
@@ -2339,7 +2348,44 @@ func runStatusCell(r apitypes.RunListItemDTO) string {
 	case isCredentialSwitchUnsettledHold(r.RunDTO):
 		s += " (credential switch unsettled)"
 	}
+	if reason := runQueueReason(r.RunDTO); reason != "" {
+		s += " (" + reason + ")"
+	}
+	if reason := codexAdmissionLineAt(r.RunDTO, now); reason != "" {
+		s += " (" + reason + ")"
+	}
 	return s
+}
+
+// codexAdmissionLineAt uses only owner-authorized typed fields, never persisted health text.
+func codexAdmissionLineAt(r apitypes.RunDTO, now time.Time) string {
+	if r.Status != "queued" || r.CodexAdmissionClass == nil || r.CodexAdmissionEligibleAt == nil || !r.CodexAdmissionEligibleAt.After(now) {
+		return ""
+	}
+	return apitypes.CodexAdmissionReason(*r.CodexAdmissionClass, *r.CodexAdmissionEligibleAt)
+}
+
+// runHealthReasonAt discards stale persisted provider reasons, retaining other blockers.
+func runHealthReasonAt(r apitypes.RunDTO, now time.Time) string {
+	reason := strOr(r.HealthReason, "")
+	if apitypes.IsCodexAdmissionReason(reason) {
+		return codexAdmissionLineAt(r, now)
+	}
+	return reason
+}
+
+func runQueueReason(r apitypes.RunDTO) string {
+	reason := strOr(r.QueueReason, "")
+	switch reason {
+	case "codex_rate_limit", "codex_overload":
+		// CODEX_ADMISSION carries the independently active class and eligibility.
+		return ""
+	default:
+		if r.Status != "queued" {
+			return ""
+		}
+		return queueReasonCell(reason)
+	}
 }
 
 // providerParkLine is CLI retry wording; shared TUI glyphs remain unchanged.
@@ -2596,8 +2642,7 @@ func pauseOriginLabel(r apitypes.RunDTO, personal bool, origin ...string) string
 	return runpresentation.PauseLabel(value, personal)
 }
 
-// queueReasonCell renders a run's queue_reason. The only reason today is "maintenance", which
-// is spelled out; an unknown future value still renders, sanitized.
+// queueReasonCell spells out maintenance; unknown future values render sanitized.
 func queueReasonCell(reason string) string {
 	if reason == "maintenance" {
 		return "maintenance (uzi is in maintenance mode)"

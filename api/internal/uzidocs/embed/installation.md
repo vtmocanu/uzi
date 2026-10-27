@@ -53,6 +53,55 @@ This builds and starts three services (`db`, `api`, `web`) in dependency order: 
 
 Register the first account — it becomes admin automatically. Subsequent registrations are regular users.
 
+## Codex account admission upgrades
+
+Deploy the **API first, then workers**. The API applies the additive
+`00360_codex_account_admission_throttle.sql` and
+`00361_codex_admission_projection.sql` schema before serving. The supported
+Helm API deployment remains a singleton with `Recreate`
+([deployment template](../deploy/chart/templates/api-deployment.yaml));
+mixed old/new API replicas outside that topology have no enforcement promise.
+
+Workers negotiate `codex_account_admission_signal_v1` before reporting
+provider evidence. Older workers still obey the server's claim gate but
+supply less evidence. Missing or refused reporting drops telemetry without
+changing run lifecycle behavior. See the
+[user contract](rate-limits.md#temporary-account-admission-waits).
+
+Reporting is bounded best effort and does not block the provider or lifecycle
+path. Each observation gets at most two HTTP attempts, at most three seconds
+each, within a ten-second monotonic budget. The current implementation starts
+that budget at observation, including queue time, stricter than starting at
+first send. The pending queue holds 32 observations including the active
+send; overflow drops signals rather than inventing evidence.
+
+A worker client retains closed/generation markers for up to **1,024 distinct
+run IDs over that client's lifetime**. At that limit it conservatively refuses
+telemetry for new run IDs; existing tracked IDs remain eligible to report.
+This can reduce pressure evidence on a long-lived worker. It does **not**
+limit claims or runs. State, release and park paths seal pending reporting
+and abort unsent retries; preservation does not wait for a reporting ACK.
+The signal retains typed evidence rather than raw provider text and does not
+use Retry-After.
+
+An ordinary API restart reconstructs admission from persisted database state.
+Application rollback leaves the additive tables and view in place: an old
+API does not read this state and admits without this account gate.
+Roll-forward reapplies still-live finite state; expired rows follow the
+quiet-reset policy when qualifying evidence next arrives. Do not run the
+schema Down migrations as an application rollback.
+
+The M4 reconstruction test creates a separate database pool and service
+instance; it does not exercise a binary or Kubernetes restart. An optional
+operator rollout smoke check can observe a queued run across an API restart
+and confirm admission after eligibility; it is separate from required gates.
+Before merge, the maintainer/CI must complete **full agent suite: exact-head PR CI**:
+successful required `validate-agent`, both `test-agent-shard` legs and the
+worker-UID lane on the exact published head. The worker cannot trigger hosted
+jobs before publication; these checks remain external and unverified here.
+See [ADR-1106](../adr/1106-codex-harness.md#amendment-temporary-account-admission-3530-2026-10-27)
+for the statement-snapshot boundary and critical invariants.
+
 ## Smoke test
 
 `scripts/smoke.sh` drives the full journey against a running stack (registration race, login, admin list, deactivation/revocation, CSRF enforcement) and expects a **fresh, empty** `users` table:
