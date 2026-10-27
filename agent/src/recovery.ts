@@ -1158,12 +1158,25 @@ export class RecoveryCoordinator {
     return undefined;
   }
 
-  /** Run `fn` inside the authority transaction (borrowed when one is already active). */
+  /**
+   * Run `fn` inside the authority transaction (borrowed when one is already active). Use it ONLY for a
+   * capture cycle that can reach a mutating authority hook (cleanupArchivedRecoveryPin,
+   * cleanupRecoveryGeneration, deleteRecoveryPin via forgetGeneration): A must be outermost there (A -> C).
+   * A cycle whose only hook is assertBareClear (freezeInventory's buildRecoveryCoverage) takes no A.
+   *
+   * The wait for A ends with the maintenance budget the caller runs under, if any: its signal ends the wait
+   * and its remaining time is the explicit deadline. A cycle that uploads (captureCycle / uploadCycle) holds
+   * A for the upload because A must precede the capture-cycle lock C that serializes uploads of one record
+   * (see captureCycleTails): A cannot be released and retaken beneath C.
+   */
   private inAuthority<T>(fn: () => Promise<T>): Promise<T> {
     if (!this.authority) return fn();
-    // The wait for A ends with the maintenance budget the caller runs under, if any.
     const signal = maintenanceSignal();
-    return this.authority.withTransaction(() => fn(), signal ? { signal } : {});
+    const remaining = MaintenanceBudget.current()?.remainingMs();
+    return this.authority.withTransaction(() => fn(), {
+      ...(signal ? { signal } : {}),
+      ...(remaining === undefined ? {} : { timeoutMs: Math.max(1, remaining) }),
+    });
   }
 
   constructor(opts: RecoveryCoordinatorOptions) {
@@ -1309,7 +1322,8 @@ export class RecoveryCoordinator {
   }): Promise<RecoveryRecord | undefined> {
     if (!this.enabled) return undefined;
     const { context } = input;
-    return this.withCancellationAttempt({ runId: context.runId, generation: context.generation, inventoryGuarded: true } as RecoveryRecord, () => this.inAuthority(async () =>
+    // No A: the only authority hook this cycle reaches is assertBareClear (buildRecoveryCoverage), a read.
+    return this.withCancellationAttempt({ runId: context.runId, generation: context.generation, inventoryGuarded: true } as RecoveryRecord, async () =>
       runCaptureCycle(await this.cycleKey({ runId: context.runId, generation: context.generation, captureId: "", inventoryGuarded: true }), "wait", async () => {
       if (!await this.newReconstructionRecords(context.runId, context.generation)) return undefined;
       if (!this.git.enumerateOwedCandidates || !this.git.buildRecoveryCoverage) throw new Error("inventory Git support unavailable");
@@ -1403,7 +1417,7 @@ export class RecoveryCoordinator {
         });
       };
       return freezeRemaining();
-    })), undefined, input.onCancellationObserved);
+    }), undefined, input.onCancellationObserved);
   }
 
   /**
@@ -2674,15 +2688,15 @@ export class RecoveryCoordinator {
         // freezeInventory alone compares the complete source/tree/context fingerprint.
         // Equal pin lists cannot justify reusing an archive of an earlier disposition source.
         const diagnostics = this.inventorySourceDiagnostics({ ...ctx, generation: ctx.generation }, original?.captureId);
-        // A before the source reservation S: freezeInventory below borrows this transaction.
-        const boundary = await this.inAuthority(() => this.inventorySourceBoundary(diagnostics.context, async prove => {
+        // No A around the source boundary: freezeInventory below reaches only assertBareClear, a read.
+        const boundary = await this.inventorySourceBoundary(diagnostics.context, async prove => {
           if (!await this.inactiveInventory(probe) || !await prove()) return;
           const record = await this.freezeInventory({
             context: ctx as PositiveOwedCandidateContext, currentSha, originalSourceSha,
             defaultBranch: ctx.defaultIdentity!.ref.replace(/^refs\/remotes\/origin\//, ""),
           });
           if (record) records.push(record);
-        }));
+        });
         if (boundary === "retained") diagnostics.retained();
         if (boundary === "retained" && original) {
           await this.writeExistingRecord(original, cur => ({ ...cur, state: "needs_action", reason: diagnostics.reason() }));

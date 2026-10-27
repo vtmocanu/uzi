@@ -6,6 +6,7 @@ import { describe, it, type TestContext } from "node:test";
 import { acquireWorkerLifetime, AuthorityRefusal, withAuthorityTransaction, type WorkerLifetime } from "../src/authority-lock.js";
 import { AuthorityRuntime, type AuthorityScope } from "../src/authority-runtime.js";
 import { leaseEpoch, leaseHarness, openAuthorityStore, type SlotSnapshot } from "../src/completion-authority.js";
+import { buildClaudeSourceCore } from "../src/completion-source.js";
 import { loadConfig } from "../src/config.js";
 import type { WorkerClient } from "../src/client.js";
 import type { Executor } from "../src/executor.js";
@@ -47,6 +48,12 @@ async function rig(t: TestContext): Promise<Rig> {
   return { root, lifetime, rt: new AuthorityRuntime({ lifetime, workerToken: TOKEN, timeoutMs: 5000 }), bare, clone, skills };
 }
 
+/** The parts of a RunFlight the authority wait reads (its cancel and lifecycle signals). */
+function fakeFlight(executor: Executor): { executor: Executor; sourceLease?: unknown; cancel: AbortController; steering: { lifecycleSignal(): AbortSignal } } {
+  const lifecycle = new AbortController();
+  return { executor, cancel: new AbortController(), steering: { lifecycleSignal: () => lifecycle.signal } };
+}
+
 async function slotOf(rt: AuthorityRuntime, p: string): Promise<SlotSnapshot | null> {
   return rt.withTransaction(async (tx) => {
     const store = await openAuthorityStore(tx, { workerToken: TOKEN });
@@ -60,7 +67,6 @@ describe("hooks require the outer transaction", () => {
     const calls: Array<() => Promise<unknown>> = [
       () => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"),
       () => r.rt.hooks.beginBareMutation(r.bare, "recovery-cleanup-delete-ref", ["refs/x"]),
-      () => r.rt.hooks.assertBareClear(r.bare, "owed-pin"),
       () => r.rt.hooks.beginDestructive([r.clone], "runner-uid-delete"),
     ];
     for (const call of calls) {
@@ -385,13 +391,13 @@ describe("the runner's clone path", () => {
     const runner = new RunRunner({} as unknown as WorkerClient, git, () => ({ executor: {} as never }), nullLogger(), 20, undefined, { authority: rt });
     const internals = runner as unknown as {
       runnerCloneForClaim(bare: string, claim: unknown, reseed: unknown, executor: Executor): Promise<{ path: string }>;
-      bindFlightSource(flight: { executor: Executor; sourceLease?: unknown }, clonePath: string): Promise<void>;
+      bindFlightSource(flight: ReturnType<typeof fakeFlight>, clonePath: string): Promise<void>;
     };
 
     const codexExecutor = { executorIncarnation: "exec-inc-77" } as unknown as Executor;
     const claim = { run_id: "run-77", kind: "issue", issue_iid: 77, session_id: null, secrets: {}, repo: { id: "repo-1" } };
     const clone = await internals.runnerCloneForClaim(bare, claim, noProofReseed, codexExecutor);
-    const flight: { executor: Executor; sourceLease?: unknown } = { executor: codexExecutor };
+    const flight = fakeFlight(codexExecutor);
     await internals.bindFlightSource(flight, clone.path);
     const slot = await slotOf(rt, clone.path);
     assert.equal(slot?.state, "active");
@@ -399,10 +405,280 @@ describe("the runner's clone path", () => {
     assert.equal(flight.sourceLease, rt.leaseFor(clone.path), "the flight keeps the final lease");
     assert.equal(leaseHarness(flight.sourceLease as never), "codex");
 
-    const claudeFlight: { executor: Executor; sourceLease?: unknown } = { executor: {} as Executor };
+    const claudeFlight = fakeFlight({} as Executor);
     const claudeClone = await internals.runnerCloneForClaim(bare, { ...claim, run_id: "run-78", issue_iid: 78 }, noProofReseed, claudeFlight.executor);
     await internals.bindFlightSource(claudeFlight, claudeClone.path);
     assert.equal(leaseHarness(claudeFlight.sourceLease as never), "claude");
     assert.equal((await slotOf(rt, claudeClone.path))?.owner.executor, null);
+  });
+});
+
+describe("assertBareClear needs no transaction", () => {
+  it("passes on a data root with no authority state and creates none", async (t) => {
+    const r = await rig(t);
+    await r.rt.hooks.assertBareClear(r.bare, "owed-pin");
+    for (const name of ["enrollment.json", "slots", "heads"]) {
+      assert.equal(fs.existsSync(path.join(r.root, ".uzi-authority", name)), false, `a read creates no ${name}`);
+    }
+    // Also when A is held by someone else: the read does not queue behind it.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let acquired!: () => void;
+    const holding = new Promise<void>((resolve) => { acquired = resolve; });
+    const holder = withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async () => { acquired(); await held; });
+    await holding;
+    const outcome = await Promise.race([
+      r.rt.hooks.assertBareClear(r.bare, "owed-pin").then(() => "returned"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("waited-for-A"), 1500)),
+    ]);
+    release();
+    await holder;
+    assert.equal(outcome, "returned");
+  });
+
+  it("refuses an unresolved record from any incarnation with no transaction open, and passes once it is settled", async (t) => {
+    const r = await rig(t);
+    const successor = successorOf(r);
+    const settlement = await r.rt.withTransaction(() => r.rt.hooks.beginBareMutation(r.bare, "recovery-cleanup-delete-ref", ["refs/x"]));
+    assert.equal(r.rt.active(), undefined);
+    await assert.rejects(r.rt.hooks.assertBareClear(r.bare, "owed-pin"), /unresolved bare_mutation/);
+    await assert.rejects(successor.hooks.assertBareClear(r.bare, "owed-pin"), /unresolved bare_mutation/);
+    const other = path.join(r.root, "repos", "other.git");
+    fs.mkdirSync(other, { recursive: true });
+    await successor.hooks.assertBareClear(other, "owed-pin");
+    await r.rt.withTransaction(() => settlement.settle({ ok: true }));
+    await r.rt.hooks.assertBareClear(r.bare, "owed-pin");
+    await successor.hooks.assertBareClear(r.bare, "owed-pin");
+  });
+
+  it("a slot caught in the head crash window is refused and nothing is completed by the read", async (t) => {
+    const r = await rig(t);
+    const flags = { head: false };
+    const rt = new AuthorityRuntime({
+      lifetime: r.lifetime, workerToken: TOKEN, timeoutMs: 5000,
+      ops: {
+        syncFile: (h) => h.sync(), syncDir: (h) => h.sync(),
+        rename: async (a, b) => {
+          if (flags.head && path.basename(path.dirname(b)) === "heads") throw new Error("injected head failure");
+          fs.renameSync(a, b);
+        },
+      },
+    });
+    const settlement = await rt.withTransaction(() => rt.hooks.beginBareMutation(r.bare, "recovery-cleanup-delete-ref", ["refs/x"]));
+    flags.head = true;
+    await assert.rejects(rt.withTransaction(() => settlement.settle({ ok: true })), /injected head failure/);
+    flags.head = false;
+    const heads = path.join(r.root, ".uzi-authority", "heads");
+    const snapshot = (): string => fs.readdirSync(heads).sort().map((n) => `${n}:${fs.readFileSync(path.join(heads, n), "utf8")}`).join("\n");
+    const before = snapshot();
+    await assert.rejects(rt.hooks.assertBareClear(r.bare, "owed-pin"), /crash window/);
+    assert.equal(snapshot(), before, "a read-only load completes nothing");
+    // The next transaction finishes the window, after which the read passes (the record was settled).
+    assert.equal((await slotOf(rt, r.bare))?.pending, null);
+    assert.notEqual(snapshot(), before);
+    await rt.hooks.assertBareClear(r.bare, "owed-pin");
+  });
+
+  it("refuses a slot that cannot be decoded", async (t) => {
+    const r = await rig(t);
+    await r.rt.withTransaction(() => r.rt.hooks.beginBareMutation(r.bare, "recovery-cleanup-delete-ref", ["refs/x"]));
+    const slots = path.join(r.root, ".uzi-authority", "slots");
+    const [file] = fs.readdirSync(slots).filter((n) => n.endsWith(".json"));
+    fs.writeFileSync(path.join(slots, file!), "{}\n", { mode: 0o600 });
+    await assert.rejects(r.rt.hooks.assertBareClear(r.bare, "owed-pin"), AuthorityRefusal);
+  });
+});
+
+describe("ending a source use", () => {
+  it("moves the slots this worker admitted to ineligible, so another incarnation can use the path", async (t) => {
+    const r = await rig(t);
+    const successor = successorOf(r);
+    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    const settlement = await r.rt.withTransaction(() => r.rt.hooks.beginDestructive([r.skills], "runner-uid-delete"));
+    await r.rt.withTransaction(() => settlement.settle({ ok: true }));
+    await assert.rejects(successor.withTransaction(() => successor.hooks.admitSourceUse(r.clone, "seed-canonical")),
+      /active under another worker incarnation/);
+
+    const outcome = await r.rt.endSourceUse([r.clone, r.clone]);
+    assert.deepEqual(outcome, { ended: [r.clone], kept: [] });
+    assert.equal((await slotOf(r.rt, r.clone))?.state, "ineligible");
+    assert.equal(r.rt.leaseFor(r.clone), undefined, "the lease is dropped");
+    await successor.withTransaction(() => successor.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    assert.equal((await slotOf(r.rt, r.clone))?.state, "active");
+    assert.deepEqual(await r.rt.endSourceUse([r.clone]), { ended: [], kept: [r.clone] }, "nothing is held here any more: nothing to end");
+    assert.equal((await slotOf(r.rt, r.clone))?.state, "active", "the successor's epoch is untouched");
+  });
+
+  it("keeps a slot active while an operation on it is unresolved, and says so", async (t) => {
+    const warnings: string[] = [];
+    const r = await rig(t);
+    const rt = new AuthorityRuntime({
+      lifetime: r.lifetime, workerToken: TOKEN, timeoutMs: 5000,
+      log: { warn: (message) => { warnings.push(message); } },
+    });
+    await rt.withTransaction(() => rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    await rt.withTransaction(() => rt.hooks.beginDestructive([r.clone], "runner-uid-delete"));
+    assert.deepEqual(await rt.endSourceUse([r.clone]), { ended: [], kept: [r.clone] });
+    assert.equal((await slotOf(rt, r.clone))?.state, "active");
+    assert.match(warnings.join("\n"), /unresolved/);
+  });
+
+  it("an unavailable A keeps everything active and never throws", async (t) => {
+    const r = await rig(t);
+    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let acquired!: () => void;
+    const holding = new Promise<void>((resolve) => { acquired = resolve; });
+    const holder = withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async () => { acquired(); await held; });
+    await holding;
+    const outcome = await r.rt.endSourceUse([r.clone], { timeoutMs: 200 });
+    release();
+    await holder;
+    assert.deepEqual(outcome, { ended: [], kept: [r.clone] });
+    assert.equal((await slotOf(r.rt, r.clone))?.state, "active");
+  });
+
+  it("recordAdmissions names every path an admission touched, including one that was refused", async (t) => {
+    const r = await rig(t);
+    const sink = new Set<string>();
+    await r.rt.recordAdmissions(sink, () => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical")));
+    assert.deepEqual([...sink], [r.clone]);
+    const successor = successorOf(r);
+    const refused = new Set<string>();
+    await assert.rejects(successor.recordAdmissions(refused, () => successor.withTransaction(() => successor.hooks.admitSourceUse(r.clone, "seed-canonical"))),
+      /active under another worker incarnation/);
+    assert.deepEqual([...refused], [r.clone]);
+    const outside = new Set<string>();
+    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    assert.equal(outside.size, 0, "nothing is recorded outside a recordAdmissions scope");
+  });
+
+  it("a predecessor admission carries the capturing executor and a foreign active epoch refuses it", async (t) => {
+    const r = await rig(t);
+    const successor = successorOf(r);
+    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-attempt"));
+    await assert.rejects(successor.bindSource(r.clone, "exec-pred"), /active under another worker incarnation/);
+    assert.equal((await slotOf(r.rt, r.clone))?.owner.executor, null, "the refused admission wrote nothing");
+    await r.rt.endSourceUse([r.clone]);
+    const lease = await successor.bindSource(r.clone, "exec-pred");
+    assert.equal(leaseHarness(lease), "codex");
+    assert.equal((await slotOf(r.rt, r.clone))?.owner.executor, "exec-pred");
+    // The retained normalize that follows keeps this very epoch.
+    await successor.withTransaction(() => successor.hooks.admitSourceUse(r.clone, "normalize"));
+    assert.equal((await slotOf(r.rt, r.clone))?.epoch, leaseEpoch(lease));
+  });
+});
+
+describe("the executor-launch gate", () => {
+  it("accepts only the current lease of the clone, carrying this executor's incarnation", async (t) => {
+    const r = await rig(t);
+    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    const claude = await r.rt.bindSource(r.clone);
+    await r.rt.assertLaunchable(r.clone, claude, undefined);
+    await assert.rejects(r.rt.assertLaunchable(r.clone, claude, "exec-1"), /launch refused/, "a claude epoch does not carry an executor");
+    await assert.rejects(r.rt.assertLaunchable(r.clone, undefined, undefined), /launch refused/, "no lease");
+
+    const codex = await r.rt.bindSource(r.clone, "exec-1");
+    await r.rt.assertLaunchable(r.clone, codex, "exec-1");
+    await assert.rejects(r.rt.assertLaunchable(r.clone, codex, "exec-2"), /launch refused/, "another executor's incarnation");
+    await assert.rejects(r.rt.assertLaunchable(r.clone, codex, undefined), /launch refused/);
+    await assert.rejects(r.rt.assertLaunchable(r.clone, claude, undefined), /launch refused/, "a replaced lease is stale");
+
+    await r.rt.endSourceUse([r.clone]);
+    await assert.rejects(r.rt.assertLaunchable(r.clone, codex, "exec-1"), /launch refused/, "an ended use cannot launch");
+  });
+});
+
+/** Publish `p` as claude_ready through an independent store of the same worker incarnation (the runtime holds no lease for it). */
+async function publishOutOfBand(r: Rig, p: string): Promise<void> {
+  await r.rt.withTransaction(async (tx) => {
+    const store = await openAuthorityStore(tx, { workerToken: TOKEN });
+    const lease = await store.admitSourceUse(tx, p);
+    const sha = "a".repeat(40);
+    const context = { runId: "run-1", branch: "agent/issue-1", kind: "issue" as const, barePath: r.bare, generation: 2, defaultIdentity: { ref: "refs/heads/main", sha } };
+    const base = { context, clonePath: p, expectedHead: sha, roots: [{ sha: "b".repeat(40), contexts: [context] }] };
+    const certified = await store.certifySource(tx, lease, buildClaudeSourceCore({ store, base, lease }));
+    await store.transition(tx, lease, "claude_ready", {
+      source: certified, captureIds: ["11111111-1111-4111-8111-111111111111"],
+    });
+  });
+}
+
+describe("a destructive operation over a published source", () => {
+  it("is refused without that slot's retiring lease, and the publication survives", async (t) => {
+    const r = await rig(t);
+    await publishOutOfBand(r, r.clone);
+    const before = await slotOf(r.rt, r.clone);
+    assert.equal(before?.state, "claude_ready");
+    assert.ok(before?.publication);
+    await assert.rejects(r.rt.withTransaction(() => r.rt.hooks.beginDestructive([r.clone], "runner-uid-delete")),
+      /published source needs its retiring lease/);
+    await assert.rejects(r.rt.withTransaction(() => r.rt.hooks.beginDestructive([r.skills], "runner-uid-delete")),
+      /published source needs its retiring lease/, "the paired skills dir maps to the same slot");
+    const after = await slotOf(r.rt, r.clone);
+    assert.equal(after?.state, "claude_ready", "no new epoch was minted");
+    assert.equal(after?.epoch, before?.epoch);
+    assert.deepEqual(after?.publication, before?.publication);
+    assert.equal(after?.seq, before?.seq, "nothing was written");
+  });
+
+  it("an unpublished slot is still admitted and recorded by a destructive operation", async (t) => {
+    const r = await rig(t);
+    const settlement = await r.rt.withTransaction(() => r.rt.hooks.beginDestructive([r.clone], "runner-uid-delete"));
+    assert.equal((await slotOf(r.rt, r.clone))?.pending?.kind, "destructive");
+    await r.rt.withTransaction(() => settlement.settle({ ok: true }));
+  });
+});
+
+describe("a reseed over a published canonical source", () => {
+  it("is stopped by the journal guards before any admission or deletion: the published slot and the clone survive", async (t) => {
+    const fx2 = makeFixture();
+    t.after(() => fx2.cleanup());
+    const dataDir = fs.realpathSync(fx2.dataDir);
+    const lifetime = await acquireWorkerLifetime(dataDir, testLockOptions());
+    const rt = new AuthorityRuntime({ lifetime, workerToken: TOKEN, timeoutMs: 5000 });
+    const config = loadConfig({ UZI_API_URL: "http://api:8080", UZI_WORKER_TOKEN: TOKEN, UZI_DATA_DIR: dataDir });
+    const cache = buildWorkerGitCache(config, nullLogger(), async () => false, rt);
+    const bare = await cache.ensureClone(fx2.originPath);
+    fs.chmodSync(path.dirname(bare), 0o700);
+    fs.chmodSync(bare, 0o700);
+    const clone = await rt.withTransaction(() => cache.createOrAttachRunnerClone(bare, 3405, noProofReseed, "run-3405"));
+    // A published source keeps the journal that names it (the completion-source fence lives in that journal).
+    await cache.markRecoveryCapture(bare, clone.path, "agent/issue-3405", "run-3405");
+    await publishOutOfBand({ rt, bare } as Rig, clone.path);
+    const published = await slotOf(rt, clone.path);
+    assert.equal(published?.state, "claude_ready");
+
+    for (const runId of ["run-3405", "run-other"]) {
+      await assert.rejects(rt.withTransaction(() => cache.createOrAttachRunnerClone(bare, 3405, noProofReseed, runId)),
+        (e: unknown) => /PendingRecoveryCaptureError|ForeignCaptureBlockedError/.test((e as Error).name) && !(e instanceof AuthorityRefusal));
+    }
+    assert.equal(fs.existsSync(path.join(clone.path, ".git")), true, "the published clone was not freed");
+    const after = await slotOf(rt, clone.path);
+    assert.equal(after?.seq, published?.seq, "no epoch was minted and nothing was written");
+    assert.deepEqual(after?.publication, published?.publication);
+  });
+});
+
+describe("the production GitCache builder", () => {
+  it("is authorityRequired: a completion retirement without its expected fence refuses before any effect", async (t) => {
+    const fx2 = makeFixture();
+    t.after(() => fx2.cleanup());
+    const dataDir = fs.realpathSync(fx2.dataDir);
+    const lifetime = await acquireWorkerLifetime(dataDir, testLockOptions());
+    const rt = new AuthorityRuntime({ lifetime, workerToken: TOKEN, timeoutMs: 5000 });
+    const config = loadConfig({ UZI_API_URL: "http://api:8080", UZI_WORKER_TOKEN: TOKEN, UZI_DATA_DIR: dataDir });
+    const cache = buildWorkerGitCache(config, nullLogger(), async () => false, rt);
+    const bare = await cache.ensureClone(fx2.originPath);
+    fs.chmodSync(path.dirname(bare), 0o700);
+    fs.chmodSync(bare, 0o700);
+    const clone = await rt.withTransaction(() => cache.createOrAttachRunnerClone(bare, 3404, noProofReseed, "run-3404"));
+    await cache.markRecoveryCapture(bare, clone.path, "agent/issue-3404", "run-3404");
+    const head = (await cache.worktreeHead(clone.path)) as string;
+    await assert.rejects(rt.withTransaction(() => cache.retireRunnerClone(bare, clone.path, "agent/issue-3404", "run-3404", {
+      discard: true, completionSource: { expectedHead: head, canDelete: () => true },
+    })), /fence missing or changed/);
+    assert.equal(fs.existsSync(path.join(clone.path, ".git")), true, "the clone is untouched");
   });
 });

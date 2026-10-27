@@ -3,8 +3,11 @@
  * changes anything the slot epoch state does not already cover.
  *
  * Contract for every implementer (the runner, over the authority store):
- *  - Every method is called from INSIDE an outer authority transaction the runner established. The
- *    hooks borrow that transaction; GitCache never acquires the authority lock itself.
+ *  - admitSourceUse, beginBareMutation and beginDestructive are called from INSIDE an outer authority
+ *    transaction the runner established. The hooks borrow that transaction; GitCache never acquires the
+ *    authority lock itself. assertBareClear is the exception: it is a read-only load of a durable record
+ *    that needs no transaction (see its entry below), so a call site whose only hook is assertBareClear
+ *    runs without A.
  *  - A rejected promise is a refusal. GitCache aborts BEFORE the effect it was about to perform.
  *  - Settlement (`settle`) is called only once the effect's child process or in-process await has
  *    been positively joined. When joining is unknown (a spawn error after a possible start, a
@@ -78,7 +81,13 @@
  *
  * assertBareClear(barePath, op) — refuses while a beginBareMutation record on that bare is unresolved,
  *  so a pin or coverage ref cannot be re-created over a pending (ABA) deletion, and a seed cannot start
- *  on a repository whose bare has an unresolved mutation.
+ *  on a repository whose bare has an unresolved mutation. It needs NO transaction: it reads the bare's
+ *  slot with a read-only load that never writes (a record written by an owner that is dead, since W
+ *  excludes another compatible worker, or serialized in this process by the bare lock B the caller
+ *  holds), and refuses fail-closed on a slot one ahead of its head shard instead of completing that
+ *  crash window. Runner sites that therefore lost their A wrapper (their only hook is this one):
+ *  fetchAgentBranch, updateTrackingRef, retainCurrentOwedCandidate (two sites) and anchorRecoveryHead;
+ *  in recovery.ts freezeInventory (buildRecoveryCoverage) and the inventory source boundary around it.
  *  - "seed-canonical", "seed-attempt", "replace": GitCache.runnerCloneForBranch, attemptCloneForBranch
  *    and prepareRecoverySuccessor, immediately before their admitSourceUse.
  *  - "owed-pin": GitCache.pinOwedUnderLock (re-creates refs/uzi-owed/<run>/<sha>, which the cleanup

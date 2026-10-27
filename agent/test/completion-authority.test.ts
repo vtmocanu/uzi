@@ -11,7 +11,7 @@ import {
 } from "../src/authority-lock.js";
 import {
   type AuthorityFsOps, AuthorityStore, installWorkerLifetime, leaseEpoch, leaseHarness, leaseSlotKey, openAuthorityStore,
-  requireWorkerLifetime, SourceUseLease,
+  peekAuthoritySlot, requireWorkerLifetime, SourceUseLease, type SlotSnapshot,
 } from "../src/completion-authority.js";
 import { buildClaudeSourceCore, buildCodexSourceCore, type CompletionSourceV2, sourceCoreDigest } from "../src/completion-source.js";
 import { ExecutorLifetime } from "../src/codex/executor-lifetime.js";
@@ -1453,4 +1453,60 @@ test("admitBareMutation writes the epoch and the running record in one slot writ
   const l2 = await tx(f, (t2) => a.admitSourceUse(t2, retiringSrc));
   await retire(f, a, l2, ["m"]);
   await assert.rejects(tx(f, (t2) => b.admitBareMutation(t2, retiringSrc, { footprint: "op: z" })), /being retired/);
+});
+
+test("a destructive admission never drops a live publication; any other admission still mints a new epoch", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  // An unpublished slot of this worker accepts a destructive admission (it starts a fresh epoch like any other).
+  const own = await tx(f, (t2) => s.admitSourceUse(t2, src, { destructive: true }));
+  assert.notEqual(leaseEpoch(own), leaseEpoch(lease));
+
+  await tx(f, (t2) => publish(f, s, t2, own, "claude_ready"));
+  const published = await tx(f, (t2) => s.readSlot(t2, key));
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src, { destructive: true })), /published; a destructive operation needs its retiring lease/);
+  assert.deepEqual(await tx(f, (t2) => s.readSlot(t2, key)), published, "a refused admission writes nothing");
+
+  // The publication is kept through ineligible, so the destructive admission still refuses.
+  await tx(f, (t2) => s.transition(t2, own, "ineligible"));
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src, { destructive: true })), /published; a destructive operation needs its retiring lease/);
+
+  // A plain admission (a seed, a discard the operator authorized) is a new use of the path: new epoch, no publication.
+  const reused = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const slot = await tx(f, (t2) => s.readSlot(t2, key));
+  assert.equal(slot?.epoch, leaseEpoch(reused));
+  assert.equal(slot?.publication, null);
+});
+
+test("peekAuthoritySlot reads a slot with no transaction and writes nothing", async (t) => {
+  const f = await fixture(t);
+  const src = source(f);
+  const peek = (): Promise<SlotSnapshot | null> => peekAuthoritySlot({ dataDir: f.root, workerToken: f.token }, src);
+  // Nothing enrolled yet: a read reports nothing recorded and creates no store.
+  assert.equal(await peek(), null);
+  assert.equal(fs.existsSync(enrollmentFile(f)), false);
+  assert.equal(fs.existsSync(path.join(authorityDir(f), "heads")), false);
+
+  const s = await store(f);
+  assert.equal(await peek(), null, "enrolled, never admitted");
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  const files = (): string => [...fs.readdirSync(slotsDir(f)).sort(), ...fs.readdirSync(path.join(authorityDir(f), "heads")).sort()]
+    .map((n) => (n.endsWith(".json") ? n : "")).join(",");
+  const stamp = (): string => `${files()}|${fs.readFileSync(shardFile(f, key), "utf8")}|${fs.readFileSync(path.join(slotsDir(f), `${key}.json`), "utf8")}`;
+  const before = stamp();
+  const seen = await peek();
+  assert.equal(seen?.state, "active");
+  assert.equal(seen?.epoch, leaseEpoch(lease));
+  assert.deepEqual(seen, await tx(f, (t2) => s.readSlot(t2, key)), "the same record a transaction reads");
+  assert.equal(stamp(), before, "a peek writes nothing");
+
+  // A wrong token cannot authenticate the enrollment.
+  await assert.rejects(peekAuthoritySlot({ dataDir: f.root, workerToken: f.token + "x" }, src), /authenticat/);
+  // Slots without an enrollment are a reset, never an empty store.
+  fs.rmSync(enrollmentFile(f));
+  await assert.rejects(peek(), /reset|without an enrollment/);
 });

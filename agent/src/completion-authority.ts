@@ -87,6 +87,8 @@ const MAX_SLOT_BYTES = 1 << 20;
 const MAX_FOOTPRINT = 1024;
 const MAX_ITEM = 512;
 const MAX_ITEMS = 1024;
+/** A slot exactly one ahead of its head shard: the crash window only a transaction may complete. */
+const SLOT_AHEAD_OF_HEAD = "authority slot is one ahead of its head (crash window); a transaction must complete it";
 const HEX64 = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** recovery.ts capture ids: randomUUID(), or "maintenance-v1-" + randomUUID() for a maintenance capture. */
@@ -633,6 +635,53 @@ export async function openAuthorityStore(tx: AuthorityTransaction, options: Auth
   });
 }
 
+/**
+ * Read one slot with NO authority transaction and no write (see {@link AuthorityStore.peekSlot}). An
+ * unenrolled store reads as "nothing recorded" (null) only when it has no slots and no heads either; a
+ * store this process already opened that has since lost its enrollment, an unauthenticated or other-layout
+ * enrollment, missing heads and a half-created enrollment all refuse (the next transaction adopts or
+ * rejects them). The storage-type probe is skipped: W acquisition already required a supported filesystem.
+ */
+export async function peekAuthoritySlot(
+  options: { dataDir: string; workerToken: string; uid?: number }, sourcePath: string,
+): Promise<SlotSnapshot | null> {
+  if (options.workerToken === "") throw new AuthorityRefusal("worker token required to authenticate authority state");
+  const dataDir = options.dataDir;
+  const uid = options.uid ?? process.getuid?.() ?? -1;
+  const key = createHmac("sha256", options.workerToken).update(KEY_LABEL).digest();
+  if (path.resolve(dataDir) !== dataDir || await fsp.realpath(dataDir) !== dataDir) {
+    throw new AuthorityRefusal("authority data root is not the canonical spelling");
+  }
+  const authorityDir = path.join(dataDir, AUTHORITY_DIR_NAME);
+  const existing = await readRegular(path.join(authorityDir, ENROLLMENT_FILE), uid, MAX_ENROLLMENT_BYTES);
+  const latched = enrolledStorage.get(dataDir);
+  if (existing === null) {
+    if (latched !== undefined) throw new AuthorityRefusal("authority store was reset after this process enrolled it");
+    for (const name of [SLOTS_DIR, HEADS_DIR]) {
+      try { await fsp.lstat(path.join(authorityDir, name)); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      throw new AuthorityRefusal("authority state exists without an enrollment");
+    }
+    return null;
+  }
+  const enrollment = unseal(key, "enrollment", existing, normalizeEnrollment);
+  if (enrollment.layout !== AUTHORITY_LAYOUT) throw new AuthorityRefusal("unsupported authority layout");
+  if (enrollment.dataDir !== dataDir) throw new AuthorityRefusal("authority enrolled under a different data root spelling");
+  await requireCompleteHeads({ dir: authorityDir, uid });
+  if (latched !== undefined && latched !== enrollment.storageId) {
+    throw new AuthorityRefusal("authority store was replaced after this process enrolled it");
+  }
+  enrolledStorage.set(dataDir, enrollment.storageId);
+  const store = new AuthorityStore(storeBrand, {
+    key, storageId: enrollment.storageId, ctxDir: authorityDir, dataDir, uid,
+    incarnation: PROCESS_INCARNATION, ops: realOps, maxHeadBytes: MAX_SLOT_BYTES,
+  });
+  return store.peekSlot(sourcePath);
+}
+
 interface StoreInit {
   key: Buffer; storageId: string; ctxDir: string; dataDir: string; uid: number; incarnation: string; ops: AuthorityFsOps;
   maxHeadBytes: number;
@@ -811,8 +860,32 @@ export class AuthorityStore {
 
   async slotKey(tx: AuthorityTransaction, sourcePath: string): Promise<string> {
     this.#check(tx);
+    return this.#slotKeyOf(sourcePath);
+  }
+
+  async #slotKeyOf(sourcePath: string): Promise<string> {
     const rel = await this.#relative(sourcePath);
     return createHmac("sha256", this.#init.key).update(`slot\0${this.#init.storageId}\0${rel}`).digest("hex");
+  }
+
+  /**
+   * Read a slot WITHOUT an authority transaction and without writing anything. Meant for a reader whose
+   * record is written either by an owner that is necessarily dead (W excludes another compatible worker)
+   * or serialized in this process by the caller's own lock. It never creates a directory, never completes
+   * the crash window between a slot rename and its head update (a slot exactly one ahead of its head is
+   * refused, after a short bounded re-read in case a writer in this process is between the two renames), and
+   * never moves the in-process high-water mark. Not for any decision that must be atomic with a write.
+   */
+  async peekSlot(sourcePath: string): Promise<SlotSnapshot | null> {
+    const key = await this.#slotKeyOf(sourcePath);
+    const dir = path.join(this.#init.ctxDir, SLOTS_DIR);
+    for (let attempt = 0; ; attempt++) {
+      try { return await this.#load(dir, key, true); }
+      catch (error) {
+        if (!(error instanceof AuthorityRefusal) || error.message !== SLOT_AHEAD_OF_HEAD || attempt >= 3) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
   }
 
   #identityOf(): StoreIdentity {
@@ -822,7 +895,7 @@ export class AuthorityStore {
     };
   }
 
-  async #load(dir: string, key: string): Promise<SlotSnapshot | null> {
+  async #load(dir: string, key: string, readOnly = false): Promise<SlotSnapshot | null> {
     const head = await readHead(this.#identityOf(), shardOf(key));
     const source = await readRegular(path.join(dir, `${key}.json`), this.#init.uid, MAX_SLOT_BYTES);
     const headSeq = head.get(key) ?? 0;
@@ -837,10 +910,12 @@ export class AuthorityStore {
     if (body.seq > headSeq) {
       // Exactly one ahead is a crash between the slot rename and the head update: finish it.
       if (body.seq !== headSeq + 1) throw new AuthorityRefusal("authority slot is ahead of the recorded head");
+      // A read-only load never completes the window: it refuses, and the next transaction finishes it.
+      if (readOnly) throw new AuthorityRefusal(SLOT_AHEAD_OF_HEAD);
       head.set(key, body.seq);
       await writeHead(this.#init.ops, this.#identityOf(), shardOf(key), head);
     }
-    this.#highWater.set(key, body.seq);
+    if (!readOnly) this.#highWater.set(key, body.seq);
     return body;
   }
 
@@ -879,7 +954,7 @@ export class AuthorityStore {
    * REFUSED, never silently replaced by a new epoch: call without a lease to mint one.
    */
   async admitSourceUse(
-    tx: AuthorityTransaction, sourcePath: string, options: { executor?: string; lease?: SourceUseLease } = {},
+    tx: AuthorityTransaction, sourcePath: string, options: { executor?: string; lease?: SourceUseLease; destructive?: boolean } = {},
   ): Promise<SourceUseLease> {
     this.#check(tx);
     if (options.executor !== undefined &&
@@ -895,6 +970,12 @@ export class AuthorityStore {
       if (old.state === "retiring") throw new AuthorityRefusal("source is being retired");
       if (old.state === "active" && old.owner.worker !== this.#init.incarnation) {
         throw new AuthorityRefusal("source is active under another worker incarnation");
+      }
+      // A destructive purpose must not mint a fresh epoch over a live publication: that write would drop the
+      // published proof (publication: null) with no retiring record. Retirement (beginRetirement) is the
+      // way to destroy a published source.
+      if (options.destructive === true && old.publication !== null) {
+        throw new AuthorityRefusal("source is published; a destructive operation needs its retiring lease");
       }
     }
     if (options.lease) {

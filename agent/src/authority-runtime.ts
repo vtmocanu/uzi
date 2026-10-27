@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import path from "node:path";
@@ -6,7 +7,7 @@ import {
   type AuthorityTransaction, type WorkerLifetime,
 } from "./authority-lock.js";
 import {
-  leaseEpoch, openAuthorityStore,
+  leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot,
   type AuthorityFsOps, type AuthorityStore, type SlotSnapshot, type SourceUseLease,
 } from "./completion-authority.js";
 import type { AuthoritySettlement, GitAuthorityHooks } from "./git-authority-hooks.js";
@@ -20,12 +21,25 @@ import type { AuthoritySettlement, GitAuthorityHooks } from "./git-authority-hoo
 // A settlement that runs with no active transaction (a child's late close, or GitCache's abandoned
 // cleanupArchivedRecoveryPin continuation, which may still hold B) never acquires A either: it is queued
 // in-process and applied at the start of the next outermost A acquisition (see {@link AuthorityRuntime.withTransaction}).
+//
+// assertBareClear is the one hook that needs no A: it reads a durable record that is written either by an
+// owner that is necessarily dead (W excludes another compatible worker) or, in this process, under the same
+// bare lock B the reader holds, and it uses a read-only load that never writes (peekAuthoritySlot).
+//
+// Ending a source use. A slot a flight's source use left `active` blocks every later worker incarnation (a
+// successor cannot advance an active foreign epoch). {@link AuthorityRuntime.endSourceUse} is the live
+// owner's one step that moves the slots it admitted for a flight to `ineligible` once the flight's source use
+// ended and its worker-owned source-capable tails were positively joined. It is the seam where U4 will
+// publish sealed/claude_ready instead when that is proven. A crash never reaches it, so the slot stays active.
+
+/** How long, and until what signal, an outermost entry may wait for A. */
+export interface AuthorityWait { signal?: AbortSignal; timeoutMs?: number }
 
 /** What an entry point needs to open (or borrow) A. Tests substitute an instrumented one. */
 export interface AuthorityScope {
   withTransaction<T>(
     fn: (tx: AuthorityTransaction) => Promise<T>,
-    options?: { signal?: AbortSignal; timeoutMs?: number },
+    options?: AuthorityWait,
   ): Promise<T>;
 }
 
@@ -90,6 +104,8 @@ export class AuthorityRuntime implements AuthorityScope {
   readonly #leases = new Map<string, SourceUseLease>();
   /** Settlements that arrived with no active transaction; applied under the next outermost A. */
   readonly #late: Array<(tx: AuthorityTransaction) => Promise<void>> = [];
+  /** Collects the normalized slot paths this runtime admits inside {@link recordAdmissions}. */
+  readonly #collector = new AsyncLocalStorage<Set<string>>();
   readonly hooks: GitAuthorityHooks;
 
   constructor(options: AuthorityRuntimeOptions) {
@@ -116,7 +132,7 @@ export class AuthorityRuntime implements AuthorityScope {
    */
   withTransaction<T>(
     fn: (tx: AuthorityTransaction) => Promise<T>,
-    options: { signal?: AbortSignal; timeoutMs?: number } = {},
+    options: AuthorityWait = {},
   ): Promise<T> {
     const tx = this.active();
     if (tx) return fn(tx);
@@ -161,15 +177,106 @@ export class AuthorityRuntime implements AuthorityScope {
   }
 
   /**
+   * Run `fn` and add the normalized path of every source slot this runtime admits inside it (whether
+   * `fn` then succeeds or not) to `sink`. A flight passes its own set, so {@link endSourceUse} later names
+   * exactly what the flight admitted, including a path whose clone creation failed after admission.
+   */
+  recordAdmissions<T>(sink: Set<string>, fn: () => Promise<T>): Promise<T> {
+    return this.#collector.run(sink, fn);
+  }
+
+  #note(key: string): void {
+    this.#collector.getStore()?.add(key);
+  }
+
+  /**
+   * End this process's source use of `paths`: each slot this worker still holds `active` under the lease it
+   * minted moves to `ineligible`, so a later worker incarnation may use the path again. The CALLER must have
+   * ended the source use and positively joined every worker-owned source-capable tail first; this method
+   * only performs the durable step. A slot with a running pending record, one this process no longer holds,
+   * a transition that fails, or a wait for A that times out stays `active` (fail closed) and is reported in
+   * `kept`. Never throws. Runs under its own short A and releases it before returning.
+   */
+  async endSourceUse(
+    paths: Iterable<string>, options: AuthorityWait = {},
+  ): Promise<{ ended: string[]; kept: string[] }> {
+    const keys = [...new Set([...paths].map((p) => path.resolve(p)))];
+    const ended: string[] = [];
+    const kept: string[] = [];
+    if (keys.length === 0) return { ended, kept };
+    const warn = (message: string, fields: Record<string, unknown>): void => this.#options.log?.warn(message, fields);
+    try {
+      await this.withTransaction(async (tx) => {
+        const store = await this.#storeFor(tx);
+        for (const key of keys) {
+          const lease = this.#leases.get(key);
+          if (!lease) { kept.push(key); continue; }
+          try {
+            const slot = await this.#slotOf(tx, store, key);
+            if (!slot || slot.epoch !== leaseEpoch(lease) || slot.owner.worker !== store.workerIncarnation) {
+              // Someone else's epoch now: this process holds nothing here to end.
+              this.#leases.delete(key);
+              continue;
+            }
+            if (slot.state !== "active") { this.#leases.delete(key); continue; }
+            if (slot.pending?.status === "running") {
+              kept.push(key);
+              warn("source use left active: an operation on it is unresolved", { source: key, operation: slot.pending.operation });
+              continue;
+            }
+            await store.transition(tx, lease, "ineligible");
+            this.#leases.delete(key);
+            ended.push(key);
+          } catch (error) {
+            kept.push(key);
+            warn("source use left active: it could not be ended", { source: key, error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+      }, options);
+    } catch (error) {
+      warn("source use left active: the authority transaction was unavailable", { error: error instanceof Error ? error.message : String(error) });
+      return { ended, kept: keys.filter((key) => !ended.includes(key)) };
+    }
+    return { ended, kept };
+  }
+
+  /**
+   * The executor-launch gate: refuse unless `lease` is this process's CURRENT lease for `clonePath`, the slot
+   * is still this worker's active epoch under it, and the slot's owner carries exactly the launching
+   * executor's incarnation (none for a claude flight). Runs under its own short A.
+   */
+  async assertLaunchable(
+    clonePath: string, lease: SourceUseLease | undefined, executorIncarnation: string | undefined,
+    options: AuthorityWait = {},
+  ): Promise<void> {
+    await this.withTransaction(async (tx) => {
+      const store = await this.#storeFor(tx);
+      const key = path.resolve(clonePath);
+      if (!lease || this.#leases.get(key) !== lease) {
+        throw new AuthorityRefusal("executor launch refused: the flight's source lease is not the current lease for its clone");
+      }
+      const slot = await this.#slotOf(tx, store, key);
+      if (!slot || !this.#ownedActive(store, slot, lease)) {
+        throw new AuthorityRefusal("executor launch refused: the clone's source-use epoch is no longer this worker's active epoch");
+      }
+      if (slot.owner.executor !== (executorIncarnation ?? null) ||
+          leaseHarness(lease) !== (executorIncarnation === undefined ? "claude" : "codex")) {
+        throw new AuthorityRefusal("executor launch refused: the source-use epoch does not carry this executor's incarnation");
+      }
+    }, options);
+  }
+
+  /**
    * Bind a flight's source to its executor BEFORE the executor launches anything against the clone.
    * A Codex executor presents its incarnation, which mints a fresh epoch that carries it (or keeps the
    * current one when it already does); a Claude flight keeps the claude lease clone admission minted
    * (admitting the clone when none exists).
    */
-  async bindSource(clonePath: string, executorIncarnation?: string): Promise<SourceUseLease> {
+  async bindSource(clonePath: string, executorIncarnation?: string, wait: AuthorityWait = {}): Promise<SourceUseLease> {
     return this.withTransaction(async (tx) => {
       const store = await this.#storeFor(tx);
       const key = path.resolve(clonePath);
+      this.#note(key);
       const held = this.#leases.get(key);
       const slot = held ? await this.#slotOf(tx, store, key) : null;
       if (held && slot && this.#ownedActive(store, slot, held) &&
@@ -178,7 +285,7 @@ export class AuthorityRuntime implements AuthorityScope {
       const lease = await store.admitSourceUse(tx, key, { executor: executorIncarnation });
       this.#leases.set(key, lease);
       return lease;
-    });
+    }, wait);
   }
 
   // ---- hooks ----------------------------------------------------------------------------
@@ -214,8 +321,10 @@ export class AuthorityRuntime implements AuthorityScope {
     return slot.state === "active" && slot.owner.worker === store.workerIncarnation && slot.epoch === leaseEpoch(lease);
   }
 
-  async #mint(tx: AuthorityTransaction, store: AuthorityStore, key: string): Promise<SourceUseLease> {
-    const lease = await store.admitSourceUse(tx, key);
+  async #mint(tx: AuthorityTransaction, store: AuthorityStore, key: string, destructive = false): Promise<SourceUseLease> {
+    // Recorded before the admission so a path whose admission wrote the slot and then failed is still named.
+    this.#note(key);
+    const lease = await store.admitSourceUse(tx, key, destructive ? { destructive: true } : {});
     this.#leases.set(key, lease);
     return lease;
   }
@@ -233,6 +342,7 @@ export class AuthorityRuntime implements AuthorityScope {
       const held = this.#leases.get(key);
       const slot = held ? await this.#slotOf(tx, store, key) : null;
       if (held && slot && this.#ownedActive(store, slot, held)) {
+        this.#note(key);
         await store.admitSourceUse(tx, key, { lease: held });
         return;
       }
@@ -250,7 +360,14 @@ export class AuthorityRuntime implements AuthorityScope {
         return held;
       }
     }
-    return this.#mint(tx, store, key);
+    // No live lease of this worker carries the record. A destructive operation must not become the way a
+    // published source loses its proof: over a sealed/claude_ready slot it needs that slot's retiring lease
+    // (U5 registers it), and the store refuses a destructive admission over any live publication.
+    const slot = await this.#slotOf(tx, store, key);
+    if (slot && (slot.state === "sealed" || slot.state === "claude_ready")) {
+      throw new AuthorityRefusal("a destructive operation over a published source needs its retiring lease");
+    }
+    return this.#mint(tx, store, key, true);
   }
 
   async #beginBare(bare: string, op: string, footprint: readonly string[]): Promise<AuthoritySettlement> {
@@ -273,10 +390,10 @@ export class AuthorityRuntime implements AuthorityScope {
   }
 
   async #assertBareClear(bare: string, op: string): Promise<void> {
-    const tx = this.#requireActive(op);
-    const store = await this.#storeFor(tx);
-    // A slot that cannot be decoded or authenticated throws here: it blocks the bare, it is not skipped.
-    const slot = await this.#slotOf(tx, store, path.resolve(bare));
+    // No transaction: see the header comment. A slot that cannot be decoded or authenticated, or one caught in
+    // the head crash window, throws here: it blocks the bare, it is not skipped or completed.
+    const slot = await peekAuthoritySlot(
+      { dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken }, path.resolve(bare));
     if (slot?.pending?.status === "running") {
       throw new AuthorityRefusal(`${op}: an unresolved ${slot.pending.kind} (${slot.pending.operation}) covers this bare`);
     }
