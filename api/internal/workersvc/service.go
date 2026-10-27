@@ -1612,9 +1612,9 @@ type Params struct {
 	// Transient-recovery park (issue #1197), mirrored from config. RunRecoveryParkBase is
 	// the FIRST recovery park's wait (the exponential backoff's base); each subsequent
 	// park doubles it, clamped at RunRecoveryMaxPark. UNLIKE the usage-limit knobs above,
-	// NEITHER can fail a run: there is no per-run park cap, so a 'recovery_wait' run always
-	// becomes promotable again after its capped backoff (until it recovers or the owner
-	// cancels). recovery_wait_count shapes the curve only. The defaults live in config.go.
+	// NEITHER can fail a run: recovery_wait_count shapes the curve only. Untyped
+	// recovery has no per-run cap; typed idle stalls have a separate count bound
+	// and may hold for the owner. The defaults live in config.go.
 	RunRecoveryParkBase time.Duration
 	RunRecoveryMaxPark  time.Duration
 	// RunCodexIdleStallMaxParks bounds automatic idle-stall retries; zero holds immediately.
@@ -5337,8 +5337,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// backoff and the sweeper auto-promotes it. This is the reusable transient-recovery
 		// park primitive (any transient cause reports it and reuses the park->promote
 		// lifecycle); it is NOT a usage limit — see setRecoveryWait / recoverywait.go. Issue
-		// #1766 M2: a vault_locked report parks here too and is the one cause this park stores;
-		// the timer promoter re-queues it and Claim holds it idle while the vault stays locked.
+		// #1766 M2: vault_locked is stored here too; Claim keeps it idle while the
+		// vault stays locked. Codex idle stalls also use this writer, preserving their
+		// typed cause and count with a finite retry or an owner-held NULL deadline.
 		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseCodexAccountUnavailable {
 			var crun store.Run
 			crun, rows, err = s.parkRunningCodexAccountUnavailable(ctx, wkr, owned, req, sessionID)

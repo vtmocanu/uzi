@@ -365,8 +365,8 @@ func run() error {
 		RunLimitMaxWaits: cfg.RunLimitMaxWaits,
 		RunLimitMaxPark:  cfg.RunLimitMaxPark,
 		// Transient-recovery park (issue #1197): the base/ceiling of the server-owned
-		// exponential backoff the sweeper auto-promotes a 'recovery_wait' run on. No
-		// per-run cap — a park always becomes promotable again.
+		// exponential backoff used by timed recovery parks. Codex idle stalls have
+		// their own count bound and wait for owner Resume above that bound.
 		RunCodexIdleStallMaxParks: cfg.RunCodexIdleStallMaxParks,
 		RunRecoveryParkBase:       cfg.RunRecoveryParkBase,
 		RunRecoveryMaxPark:        cfg.RunRecoveryMaxPark,

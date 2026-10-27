@@ -3399,8 +3399,8 @@ WHERE id = @id AND user_id = @user_id AND status = @status::text;
 --
 -- Unlike limit_wait there is NO lifetime cap: recovery_wait_count is left in place (it
 -- keeps shaping the next park's backoff) and this promotion always fires once the stamp
--- passes, so the run auto-resumes repeatedly at the capped cadence until it recovers or the
--- owner cancels (CancelRunServerSide's negative admit-set covers a recovery_wait run).
+-- passes. A finite stamp permits automatic retry at the capped cadence; a NULL stamp
+-- instead keeps a typed owner hold, including a bounded Codex idle-stall park.
 --
 -- started_at = NULL so the resumed run gets a FRESH RUN_TIMEOUT wall, and
 -- budget_paused_seconds = 0 so the pause banked against the OLD baseline is not

@@ -26,17 +26,22 @@ func (b idleStallTxBarrier) Begin(ctx context.Context) (pgx.Tx, error) {
 	if err != nil {
 		return nil, err
 	}
+	rollback := func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = tx.Rollback(cleanup)
+	}
 	select {
 	case b.ready <- struct{}{}:
 	case <-ctx.Done():
-		_ = tx.Rollback(context.Background())
+		rollback()
 		return nil, ctx.Err()
 	}
 	select {
 	case <-b.release:
 		return tx, nil
 	case <-ctx.Done():
-		_ = tx.Rollback(context.Background())
+		rollback()
 		return nil, ctx.Err()
 	}
 }
@@ -65,6 +70,8 @@ func TestIdleStallReportPromotionResumeRaceLiveDB(t *testing.T) {
 			}()
 			select {
 			case <-ready:
+			case r := <-done:
+				t.Fatalf("report returned before transaction barrier: %v", r.err)
 			case <-ctx.Done():
 				t.Fatal(ctx.Err())
 			}
@@ -92,7 +99,12 @@ func TestIdleStallReportPromotionResumeRaceLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			close(release)
-			r := <-done
+			var r result
+			select {
+			case r = <-done:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
 			if r.err != nil || r.applied {
 				t.Fatalf("superseded report applied=%v err=%v", r.applied, r.err)
 			}

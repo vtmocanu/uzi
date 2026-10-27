@@ -222,15 +222,27 @@ func TestIdleStallConcurrentDuplicateLiveDB(t *testing.T) {
 			results <- result{n, err}
 		}()
 	}
-	<-ready
-	<-ready
+	for range 2 {
+		select {
+		case <-ready:
+		case r := <-results:
+			t.Fatalf("report returned before transaction barrier: %v", r.err)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
 	close(release)
 	if err = tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	total := int64(0)
 	for range 2 {
-		r := <-results
+		var r result
+		select {
+		case r = <-results:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
 		if r.err != nil {
 			t.Fatal(r.err)
 		}

@@ -496,9 +496,9 @@ type Config struct {
 
 	// Transient-recovery park (issue #1197). A run that reports a positively-empty SDK
 	// turn (after bounded in-process retries) parks in 'recovery_wait' and the sweeper
-	// auto-promotes it on a capped exponential backoff. UNLIKE the usage-limit park there
-	// is NO per-run park cap (no RUN_RECOVERY_MAX_WAITS): a park always becomes promotable
-	// again, so the run recovers repeatedly until it succeeds or the owner cancels.
+	// auto-promotes timed parks on a capped exponential backoff. Untyped recovery has
+	// no per-run park cap; typed causes such as Codex idle stalls apply their own
+	// retry bound and may instead wait for the owner.
 	//
 	// RunRecoveryParkBase is the FIRST park's wait (the backoff's base); each subsequent
 	// park doubles it, clamped at RunRecoveryMaxPark. Both shape only the retry cadence —
