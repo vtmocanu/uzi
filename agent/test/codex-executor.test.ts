@@ -18021,6 +18021,107 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     assert.ok(predicate(), "event barrier was not reached");
   }
 
+  for (const phase of ["initial", "automatic", "implement", "human"] as const) {
+    for (const negotiated of [false, true]) it(`M2 productive idle ${phase}, negotiated=${negotiated}`, async t => {
+      const revision = phase === "automatic" || phase === "human";
+      const target = revision ? 2 : 1;
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          c.transport.push(threadStarted());
+          if (revision && c.turnStartCount === 1)
+            c.transport.push(toolCall(1, "submit_plan", { plan_md: "initial" }, "th-1", "tn-1", "plan"))
+              .push(turnCompleted("completed"));
+          else c.transport.push(agentMessage("partial model output"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      } });
+      rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+      let settled = 0, retries = 0;
+      const { ctx, emitted } = makeCtx({
+        codexIdleStallRecovery: negotiated,
+        planApproved: phase === "implement", approvedPlan: phase === "implement" ? "approved" : undefined,
+        gatePlan: async () => phase === "automatic"
+          ? { kind: "revise", feedback: "revise", automatic: true, round: 1 }
+          : { kind: "revise", feedback: "revise", inputId: 1 },
+        onModelTurnSettled: async () => { settled++; },
+        retryPlanRevisionTurn: async cause => { retries++; throw cause; },
+      });
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      void running.catch(() => undefined);
+      try {
+        await until(() => rig.transport.turnStartCount === target && emitted.some(m => m.kind === "text"));
+        await tick(); t.mock.timers.tick(100);
+        await assert.rejects(running, (error: unknown) => {
+          assert.ok(error instanceof Error);
+          if (negotiated && phase !== "human") {
+            assert.ok(error instanceof TransientRecoveryError);
+            assert.equal(error.idleStallKind, "productive");
+            assert.equal(error.providerOrigin, false);
+            assert.equal(error.message, "model output stalled within the idle timeout");
+            assert.equal(error.originalIdle?.message, "codex run idle timeout");
+            assert.equal(rig.sessionOps.persist, 1);
+          } else {
+            assert.ok(!(error instanceof TransientRecoveryError));
+            assert.equal(error.message, "codex run idle timeout");
+          }
+          return true;
+        });
+        assert.equal(retries, 0);
+        assert.equal(settled, revision ? 1 : 0, "stalled output is never a settled turn");
+      } finally { rig.transport.end(); t.mock.timers.reset(); }
+    });
+  }
+
+  it("M2 turn_finished with callbacks settled but iterator tail idle remains recoverable without progress", async t => {
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+    rig.transport.push(threadStarted()).push(agentMessage("partial output"))
+      .push(toolCall(91, "signal_done", {}, "th-1", "tn-1", "settled"))
+      .push(turnCompleted("completed"));
+    let tail = false, release!: () => void, settled = 0;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const original = CodexHarness.prototype.startTurn;
+    const mocked = mock.method(CodexHarness.prototype, "startTurn", function(this: CodexHarness, ...args: Parameters<typeof original>) {
+      const turn = original.apply(this, args);
+      args[0].signal?.addEventListener("abort", () => release(), { once: true });
+      return { ...turn, events: (async function* () { yield* turn.events; tail = true; await barrier; })() };
+    });
+    const { ctx } = makeCtx({ codexIdleStallRecovery: true, onModelTurnSettled: async () => { settled++; } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => tail && rig.transport.responses.some(r => r.requestId === 91));
+      t.mock.timers.tick(100);
+      await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError && error.idleStallKind === "productive");
+        return true;
+      });
+      assert.equal(settled, 0);
+      assert.equal(rig.sessionOps.persist, 1);
+      mocked.mock.restore();
+      t.mock.timers.reset();
+      const resumed = makeRig({ responder: c => {
+        if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          c.transport.push(signalDone("th-1", "tn-2")).push(turnCompleted("completed", "th-1", "tn-2"));
+          return { turn: { id: "tn-2" } };
+        }
+        return {};
+      } });
+      resumed.deps = { ...resumed.deps, sessionStore: { ...resumed.deps.sessionStore!, inspect: async () => "present" } };
+      const { ctx: resumeCtx } = makeCtx({ sessionId: "th-1", codexIdleStallRecovery: true,
+        onModelTurnSettled: async () => { settled++; } });
+      await makeExecutor(resumed, bindingOf(SUBSCRIPTION)).run(resumeCtx);
+      assert.equal(resumed.transport.requests.filter(r => r.method === "thread/resume").length, 1);
+      assert.equal(resumed.transport.turnStartCount, 1, "resume reasks the model despite the prior signal_done");
+      assert.equal(settled, 1, "only the resumed completed iterator settles");
+    } finally { release(); rig.transport.end(); mocked.mock.restore(); t.mock.timers.reset(); }
+  });
+
   for (const retry of [false, true]) it(`3462 ${retry ? "serverOverloaded then silent retry" : "first-turn silence"} parks without another start`, async t => {
     const rig = makeRig({ responder: c => {
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
@@ -18254,7 +18355,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       },
       askUser: async () => { questions++; return { kind: "answer", answers: ["server"] }; },
       retryPlanRevisionTurn: async cause => {
-        assert.ok(cause instanceof TransientRecoveryError && cause.zeroEvidenceIdle);
+        assert.ok(cause instanceof TransientRecoveryError && cause.idleStallKind === "zero_evidence");
         assert.equal(cause.providerOrigin, false);
         assert.equal(cause.originalIdle?.message, "codex run idle timeout");
         assert.ok(rig.epochs[0]!.disposed() > 0);
@@ -18359,7 +18460,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       }
       const ctx = revisionContext(fallback === "absent hook" ? {} : {
         retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
-          assert.ok(cause instanceof TransientRecoveryError && cause.zeroEvidenceIdle);
+          assert.ok(cause instanceof TransientRecoveryError && cause.idleStallKind === "zero_evidence");
           original = cause.originalIdle;
           if (fallback === "unnegotiated") throw cause;
           await recovery.retry(cause, observer, remainingWallMs);
@@ -18972,7 +19073,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         finally { sourceHeld = false; }
       },
       retryPlanRevisionTurn: async cause => {
-        assert.ok(cause instanceof TransientRecoveryError && cause.zeroEvidenceIdle);
+        assert.ok(cause instanceof TransientRecoveryError && cause.idleStallKind === "zero_evidence");
         if (++retries > 1) {
           terminalRoots = rig.providerLaunches();
           terminalCredentials = rig.client.releaseCalls.length;
@@ -19095,7 +19196,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         return verdict;
       };
       ctx.retryPlanRevisionTurn = async (cause, observer, remainingWallMs) => {
-        assert.ok(cause instanceof TransientRecoveryError && cause.zeroEvidenceIdle && !cause.providerOrigin);
+        assert.ok(cause instanceof TransientRecoveryError && cause.idleStallKind === "zero_evidence" && !cause.providerOrigin);
         retries++; await retry(cause, observer, remainingWallMs);
       };
       return run(ctx);
@@ -19407,7 +19508,11 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(retryNotices(emitted).length, 2);
   });
 
-  for (const silence of [false, true]) it(`real runner ${silence ? "3462 silence parks and resumes the persisted session" : "rateLimitExceeded exhaustion reaches typed provider_outage"}`, async () => {
+  for (const mode of ["provider", "legacy zero", "typed zero", "initial", "automatic", "implement"] as const) it(`real runner M2 ${mode} captures and resumes the persisted session`, async t => {
+    const silence = mode !== "provider";
+    const typed = silence && mode !== "legacy zero";
+    const productive = typed && mode !== "typed zero";
+    const planning = mode === "initial" || mode === "automatic";
     const parkedId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     const api = new FakeApi("rate-limit-worker");
     const url = await api.listen();
@@ -19417,11 +19522,15 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
       if (c.method === "thread/start") return { thread: { id: parkedId } };
       if (c.method === "turn/start") {
         c.transport.push(threadStarted(parkedId));
+        if (mode === "automatic" && c.turnStartCount === 1)
+          c.transport.push(toolCall(1, "submit_plan", { plan_md: "initial" }, parkedId, "tn-1", "plan"))
+            .push(turnCompleted("completed", parkedId));
+        else if (productive) c.transport.push(agentMessage("partial output", parkedId));
         return { turn: { id: "tn-1" } };
       }
       return {};
     } : failingThenDone(Number.MAX_SAFE_INTEGER, "rateLimitExceeded") });
-    tinyBackoff(rig, { deferRegistryTeardown: true, ...(silence ? { idleMs: 30 } : {}) });
+    tinyBackoff(rig, { deferRegistryTeardown: true, ...(silence ? { idleMs: typed ? 100 : 30 } : {}) });
     const launchCapture = rig.deps.launchEffectRoot!;
     const captureGitLaunches: CodexEffectLaunchSpec[] = [];
     rig.deps = { ...rig.deps, launchEffectRoot: async (spec, deadline) => {
@@ -19435,17 +19544,23 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     });
     client.protocolFeatures = ["claim_generation_fence", "recovery_cause_provider_outage"];
     if (silence) {
-      client.protocolFeatures.push("run_checkpoint_durability");
+      client.protocolFeatures = [...client.protocolFeatures, "run_checkpoint_durability"];
       client.publishCheckpoint = async (_runId, _tip, pack) => {
         for await (const _chunk of pack) { /* Drain the supervised capture's real pack. */ }
         return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/test" } };
       };
     }
+    if (typed) {
+      client.protocolFeatures = [...client.protocolFeatures, "recovery_cause_codex_idle_stall_v1"];
+      api.stateAckWire = (body, run) => body.recovery_cause === "codex_idle_stall"
+        ? { status: 200, body: { run: { ...run, recovery_wait_cause: "codex_idle_stall", recovery_retry_not_before: "2026-10-28T00:00:00Z" } } }
+        : undefined;
+    }
     api.recoveryWaitRequiresRunning = true;
     const claim = makeClaim({
       repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
       claim_generation: 3,
-      plan_approved: true, plan_source: "agent", plan_md: "approved plan",
+      plan_approved: !planning, plan_source: "agent", plan_md: planning ? undefined : "approved plan",
       secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
     });
     const git = new GitCache(fx.dataDir, diagnostics.log, undefined, testGitCacheOptions());
@@ -19488,6 +19603,8 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
       const cloneHead = await readFixtureHead(path.join(ctx.worktreePath, ".git"));
       assert.match(cloneHead, /^[0-9a-f]{40}$/);
       assert.equal(await readFixtureHead(barePath), cloneHead, "worker bare and runner clone start at the same real HEAD");
+      if (mode === "automatic") ctx.gatePlan = async () => ({ kind: "revise", automatic: true, round: 1, feedback: "revise" });
+      if (productive) await fs.writeFile(path.join(ctx.worktreePath, "PARTIAL.txt"), "partial edit before stall\n");
       try { return await run(ctx); } catch (error) {
         produced = error;
         assert.equal(rig.client.refreshCalls.length, 0, "provider retries do not refresh credentials");
@@ -19495,7 +19612,8 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
       }
     };
     try {
-      await new RunRunner(client, git,
+      if (typed) t.mock.timers.enable({ apis: ["setTimeout"] });
+      const executing = new RunRunner(client, git,
         () => ({ executor, homeDir }), diagnostics.log, 20, undefined, {
           pollMs: 5, recoveryRetryMs: 5, codexBoundaryDeadlineMs: 200,
           quiesceRun: async () => ({
@@ -19503,20 +19621,40 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
             docker: { state: "not_wired", removed: [], detail: "not wired" },
           }),
         }).execute(claim);
+      let executionError: unknown;
+      void executing.catch(error => { executionError = error; });
+      if (typed) {
+        const deadline = performance.now() + 10000;
+        const target = mode === "automatic" ? 2 : 1;
+        while (rig.transport.turnStartCount < target && executionError === undefined && performance.now() < deadline) await tick();
+        assert.ifError(executionError);
+        assert.equal(rig.transport.turnStartCount, target, diagnostics.lines.join("\n"));
+        for (let i = 0; i < 5; i++) await tick();
+        t.mock.timers.tick(100);
+        t.mock.timers.reset();
+      }
+      await executing;
       assert.ok(produced instanceof TransientRecoveryError, diagnostics.lines.join("\n"));
+      assert.equal(produced.idleStallKind, typed ? productive ? "productive" : "zero_evidence" : undefined);
       assert.equal(produced.providerOrigin, !silence);
       assert.ok(captureGitLaunches.some(spec => spec.identity === "worker_pat" && spec.cwd === barePath),
         "capture uses real supervised Git in the trusted worker bare");
       assert.ok(captureGitLaunches.some(spec => spec.identity === "command" && spec.cwd === clonePath),
         "capture uses real supervised Git in the runner clone");
-      assert.equal(rig.transport.turnStartCount, silence ? 1 : 3, "silence parks directly; classified errors spend two retries");
+      assert.equal(rig.transport.turnStartCount, silence ? mode === "automatic" ? 2 : 1 : 3, "idle parks directly; classified errors spend two retries");
       const reports = api.states.filter(s => s.runId === claim.run_id && s.body.status === "recovery_wait");
       assert.equal(reports.length, 1, diagnostics.lines.join("\n"));
-      assert.equal(reports[0]!.body.recovery_cause, silence ? undefined : "provider_outage");
+      assert.equal(reports[0]!.body.recovery_cause, typed ? "codex_idle_stall" : silence ? undefined : "provider_outage");
+      assert.equal(reports[0]!.body.provider_progress_turns, typed ? mode === "automatic" ? 1 : 0 : undefined);
       assert.equal(reports[0]!.body.productive_turns, silence ? undefined : 0);
       assert.equal(reports[0]!.body.claim_generation, 3);
       assert.equal(rig.client.refreshCalls.length, 1, "only the held recovery boundary reconciles credentials");
       assert.ok(!api.states.some(s => s.body.status === "failed" || s.body.status === "limit_wait"));
+      if (productive) {
+        assert.equal(await fs.readFile(path.join(clonePath!, "PARTIAL.txt"), "utf8"), "partial edit before stall\n");
+        assert.ok(captureGitLaunches.some(spec => spec.identity === "command" && spec.args?.includes("commit")),
+          "partial edit is committed by verified WIP capture");
+      }
       if (silence) {
         assert.equal(reports[0]!.body.session_id, parkedId);
         assert.equal(await CodexSessionStore.inspect(path.join(homeDir, "codex-session-store")), "present");
@@ -19548,22 +19686,41 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
         git.discoverRetainedRecovery = async () => undefined;
         git.recoveryAttemptMode = async () => false;
         git.createOrAttachRunnerClone = async () => parkedClone!;
-        api.setOwnershipStatus(claim.run_id, "running", 3);
-        api.setInputClaimGeneration(claim.run_id, 3);
+        const resumeGeneration = 3;
+        if (typed) {
+          api.registerNonce = "m2-idle-registration";
+          api.setRegisterProtocolFeatures(client.protocolFeatures);
+          await client.register("m2-idle-fixture");
+          const identity = client.interruptedCallsRegistration!;
+          const observation = m3Calls();
+          api.interruptedCallsResponse = { status: 200, body: { ...observation,
+            run_id: claim.run_id, worker_id: identity.workerId, register_nonce: identity.nonce,
+            claim_generation: resumeGeneration, source_generation: mode === "initial" ? 2 : null,
+            inspected_count: mode === "initial" ? 1 : 0,
+            entries: mode === "initial" ? observation.entries : [],
+          } };
+        }
+        api.setOwnershipStatus(claim.run_id, "running", resumeGeneration);
+        api.setInputClaimGeneration(claim.run_id, resumeGeneration);
         await new RunRunner(client, git, () => ({ executor: resumeExecutor, homeDir }), diagnostics.log, 20, undefined, {
           gitlab: fakeGitlab().gitlab, pollMs: 5,
           quiesceRun: async () => ({
             process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
             docker: { state: "not_wired", removed: [], detail: "not wired" },
           }),
-        }).execute({ ...claim, session_id: parkedId, claim_generation: 3, last_seq: 1000 });
+        }).execute({ ...claim, plan_approved: true, plan_md: "approved plan", session_id: parkedId, claim_generation: resumeGeneration, last_seq: 1000 });
         assert.equal(resumed.transport.requests.filter(r => r.method === "thread/resume").length, 1, diagnostics.lines.join("\n"));
         assert.equal(rec(resumed.transport.requests.find(r => r.method === "thread/resume")!.params).threadId, parkedId);
         assert.equal(resumed.transport.requests.filter(r => r.method === "thread/start").length, 0);
+        const prompt = JSON.stringify(resumed.transport.requests.find(r => r.method === "turn/start")!.params);
+        if (mode === "initial") {
+          assert.match(prompt, /interrupted_calls_/);
+          assert.match(prompt, /printf interrupted-observation/);
+        } else if (typed) assert.doesNotMatch(prompt, /interrupted_calls_/);
         assert.equal(api.states.at(-1)?.body.status, "completed", diagnostics.lines.join("\n"));
         assert.equal(api.states.filter(s => s.body.status === "recovery_wait").length, 1);
       }
-    } finally { await api.close(); fx.cleanup(); }
+    } finally { if (typed) t.mock.timers.reset(); await api.close(); fx.cleanup(); }
   });
 
   for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(b1) the exhausted transient park is marked providerOrigin (PRD #1733) [${info}]`, async () => {

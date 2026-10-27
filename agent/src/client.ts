@@ -65,7 +65,7 @@ import {
   type OutgoingMessage,
   type RegisterRequest,
   type RegisterResponse,
-  type StateAck as ProtocolStateAck,
+  type StateAck,
   type CompletedPublicationReceipt,
   type CompletedPublicationReason,
   type PlanCrossCheckReconciliation,
@@ -123,9 +123,6 @@ export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model
   | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
   | "approved_not_stored" | "revisions_exhausted";
 import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions } from "./code-cross-check-contract.js";
-
-// Same-row classification decoded by readRunAck; status alone cannot confirm a typed park.
-type StateAck = ProtocolStateAck & { recoveryCause?: string };
 
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -2196,6 +2193,17 @@ export class WorkerClient {
         throw err;
       }
     }
+    if (body.recovery_cause === "codex_idle_stall") {
+      // Freeze the negotiated obligation before generic generation/progress fallbacks.
+      const outbound: PlanCrossCheckStateRequest = Object.freeze(structuredClone(body));
+      const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+      try {
+        return await this.reportStateOnce(runId, path, outbound, signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
+      } catch (error) {
+        if (evidence.refusedAfterAmbiguity) throw new Error("Codex idle park outcome uncertain", { cause: error });
+        throw error;
+      }
+    }
     if (body.recovery_cause === "retained_recovery_exhausted") {
       if (!this.hasFeature("recovery_cause_retained_recovery_exhausted") ||
           body.status !== "recovery_wait" || !Number.isSafeInteger(body.claim_generation) ||
@@ -2397,6 +2405,13 @@ export class WorkerClient {
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
       // Revalidate on every actual attempt: registration may shrink while retry sleep yields.
+      if (body.recovery_cause === "codex_idle_stall" &&
+          (!this.hasFeature("recovery_cause_codex_idle_stall_v1") ||
+           !this.includeClaimGeneration(body.claim_generation) ||
+           !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+           body.status !== "recovery_wait" || !Number.isInteger(body.provider_progress_turns) ||
+           (body.provider_progress_turns ?? -1) < 0 || (body.provider_progress_turns ?? 0) > 2147483647))
+        throw new Error("Codex idle park requires support, a positive generation and provider progress");
       if (body.source_publication !== undefined) {
         const proof = body.source_publication;
         if (!this.hasFeature("refresh_publication_context_v1") ||
