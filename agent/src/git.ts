@@ -3510,6 +3510,8 @@ export class GitCache {
       }
       const warningScope: RecoveryPhysicalWarningScope = { emitted: false };
       if ((await this.journaledClonePaths(barePath, warningScope)).has(clonePath)) throw new Error("retained predecessor blocks canonical reuse");
+      // issue #3404: a fresh seed on this repo waits for any unresolved shared-bare mutation, before any effect.
+      await this.assertBareClear(barePath, "seed-canonical");
       await this.admitSource(clonePath, "seed-canonical");
       await this.freeCanonicalClonePath(clonePath, key, reseed);
       await this.diagnoseRetainedArtifacts(barePath, clonePath, undefined, reseed, warningScope).catch((err: unknown) => {
@@ -3736,6 +3738,8 @@ export class GitCache {
       if (await this.pathPresent(clonePath)) {
         throw new Error(`${REASON_WORKER_RESIDUE_BLOCKED}: the fresh attempt clone path already exists (${sanitizeForLog(path.basename(clonePath), 160)}); nothing seeded`);
       }
+      // issue #3404: a fresh seed on this repo waits for any unresolved shared-bare mutation, before any effect.
+      await this.assertBareClear(barePath, "seed-attempt");
       await this.admitSource(clonePath, "seed-attempt");
       // Bound the ledger before reading it: the last value per attemptId, gone paths dropped (see compactAttemptLedger).
       await this.compactAttemptLedger(barePath, branch);
@@ -4164,7 +4168,15 @@ export class GitCache {
     // An 'error' event after a real start or an unsettled timeout leaves `joined` undefined: the record stays open.
     // A timed-out child that closed within the wait is joined "failed"; an unsettled one settles late above.
     if (joined !== undefined && !(failure instanceof RunnerDeleteUnsettledError)) {
-      await settlement?.settle(joined === "ok" ? { ok: true } : { ok: false, residue: [target] });
+      if (joined === "ok") {
+        // The rm exited 0: a rejected settlement leaves the record open; it is an authority error, never
+        // a failed delete (the caller would otherwise quarantine a path that is already gone).
+        try { await settlement?.settle({ ok: true }); }
+        catch (err) { throw new AuthorityRefusedError("runner-uid-delete settlement", err); }
+      } else {
+        // The original delete failure is what the caller must see; a failed residue settlement leaves the record open.
+        await settlement?.settle({ ok: false, residue: [target] }).catch(() => undefined);
+      }
     }
     if (failed) throw failure;
   }
@@ -5976,8 +5988,10 @@ export class GitCache {
   /**
    * issue #1507 — best-effort remove a pin ref planted by {@link anchorRecoveryHead}, once a durable
    * replacement exists (the bundle was archived, or the head is already forge-published). A failed
-   * cleanup only leaves a harmless ref on the long-lived bare (the same never-deleted posture
-   * `refs/uzi-runner` already carries, PRD #218); only a Git boundary abort propagates.
+   * cleanup only leaves a ref on the long-lived bare (the same never-deleted posture
+   * `refs/uzi-runner` already carries, PRD #218). With authority hooks installed that ref stays fenced:
+   * a refused registration (a hook refusal), a rejected settlement (AuthorityRefusedError) and a Git
+   * boundary abort propagate; an unjoined child leaves its record open and does not throw.
    */
   async deleteRecoveryPin(barePath: string, runId: string, generation: number, expectedSha?: string): Promise<void> {
     if (expectedSha === undefined) {
@@ -5999,13 +6013,20 @@ export class GitCache {
       // including boundary-abort propagation, and returns null when the child never produced a real
       // exit status (spawn failure, timeout, signal): that join is unknown and the record stays open.
       const settlement = await this.beginBare(barePath, "recovery-pin-delete-ref", [pinRef]);
-      const exit = await this.tryGitExit(barePath, ["update-ref", "-d", pinRef]);
-      if (settlement && exit !== null) {
+      const notStarted = { value: false };
+      const exit = await this.tryGitExit(barePath, ["update-ref", "-d", pinRef], undefined, notStarted);
+      if (settlement && exit === null && notStarted.value) {
+        // The spawn itself failed: no child ever existed, nothing was deleted. Close the record as a
+        // joined failure so assertBareClear does not block this bare for an effect that never started.
+        try { await settlement.settle({ ok: false, residue: [pinRef] }); }
+        catch (err) { throw new AuthorityRefusedError("recovery-pin-delete-ref settlement", err); }
+      } else if (settlement && exit !== null) {
         let remains = true;
         let readError: unknown;
         try { remains = await this.checkedRefSha(barePath, pinRef) !== undefined; }
         catch (err) { readError = err; }
-        await settlement.settle(remains ? { ok: false, residue: [pinRef] } : { ok: true });
+        try { await settlement.settle(remains ? { ok: false, residue: [pinRef] } : { ok: true }); }
+        catch (err) { throw new AuthorityRefusedError("recovery-pin-delete-ref settlement", err); }
         const abort = readError === undefined ? undefined : this.boundaryAbortError(readError);
         if (abort) throw abort;
       }
@@ -6314,7 +6335,15 @@ export class GitCache {
               keepStdinOpen: true, timeoutMs: Math.max(1, deadline - Date.now()) + PREPARED_ABORT_GRACE_MS,
               stderrMaxBytes: 65536, cancelOnAbandon: true,
               env: { GIT_CONFIG_GLOBAL: "/dev/null", GIT_COMMON_DIR: chosen.bare },
-            }).catch(() => refuse("git_failure"));
+            }).catch(async (): Promise<never> => {
+              // spawnGit rejected before any child object existed: the effect provably never started, so close
+              // the record (a joined failure) rather than leave this bare fenced for good.
+              if (settlement) {
+                try { await settlement.settle({ ok: false, residue: [ref] }); }
+                catch (err) { throw new AuthorityRefusedError("recovery-pin-archive-delete-ref settlement", err); }
+              }
+              return refuse("git_failure");
+            });
           activeChildren.add(child.exited);
           // SIGTERM between Git's O_EXCL create of the ref lock and arming its tempfile cleanup would
           // leave a stale `<ref>.lock` that this code did not remove and must never delete. So an
@@ -6324,6 +6353,7 @@ export class GitCache {
           // kill the child; that path is left unchanged.
           let committed = false;
           let abortSent = false;
+          let settleError: unknown;
           const sendAbort = (): void => {
             if (committed || abortSent) return;
             abortSent = true;
@@ -6421,15 +6451,20 @@ export class GitCache {
                   .then(() => true, (e: NodeJS.ErrnoException) => e.code !== "ENOENT");
                 if (!lockLeft && (!committed || !remains)) outcome = { ok: true };
               } catch { /* unconfirmed: residue */ }
-              await settlement.settle(outcome);
+              // A rejected settlement is an authority error, not a retained pin: it is thrown after this block
+              // (a throw inside `finally` is unsafe) and the outer catch rethrows it rather than map it to a reason.
+              try { await settlement.settle(outcome); }
+              catch (err) { settleError = err; }
             }
           }
+          if (settleError !== undefined) throw new AuthorityRefusedError("recovery-pin-archive-delete-ref settlement", settleError);
           return { state: "deleted" };
         }, stop.signal);
       }, stop.signal);
     };
     try { return await bounded(attempt()); }
     catch (error) {
+      if (error instanceof AuthorityRefusedError) throw error;
       const message = error instanceof Error ? error.message : "";
       const reasons: Reason[] = ["invalid_identity", "unsafe_metadata", "ambiguous", "scan_limit",
         "target_changed", "ineligible", "cancelled", "deadline", "git_failure"];
@@ -7728,6 +7763,8 @@ export class GitCache {
         runId: s.runId, clonePath: s.clonePath, ...(s.attemptId ? { attemptId: s.attemptId } : {}),
         ...(s.restoreTip ? { restoreTip: s.restoreTip } : {}),
       }));
+      // issue #3404: a fresh seed on this repo waits for any unresolved shared-bare mutation, before any effect.
+      await this.assertBareClear(barePath, "replace");
       await this.admitSource(clonePath, "replace");
       await this.appendAttemptLedger(barePath, branch, { attemptId, runId: successor.runId, clonePath, state: "live" });
       await this.writeRecovery(barePath, branch, { ...journal, retainedSources,
@@ -17529,7 +17566,9 @@ try {
    *  string, e.g. "ENOENT"), a timeout/SIGTERM kill, or any signal death (code is `null`). tryGit
    *  keeps its historical coerce-to-1 for callers that only care whether the op succeeded; this
    *  sibling exists for callers (ancestry) that MUST NOT treat a broken read as a data answer. */
-  private async tryGitExit(cwd: string | undefined, args: string[], pat?: string): Promise<number | null> {
+  private async tryGitExit(
+    cwd: string | undefined, args: string[], pat?: string, notStarted?: { value: boolean },
+  ): Promise<number | null> {
     if (this.boundaryProcesses.getStore()?.capture && pat !== undefined) throw new Error("capture credentials refused");
     const env = gitEnv(pat);
     try {
@@ -17540,6 +17579,11 @@ try {
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
       const code = (err as { code?: unknown }).code;
+      // Only Node's own spawn failure (a string errno with syscall "spawn ...", no kill) proves no child
+      // ever ran; a timeout or signal death may have started one, so the caller must keep its record open.
+      const syscall = (err as { syscall?: unknown }).syscall;
+      if (notStarted && typeof code === "string" && typeof syscall === "string" && syscall.startsWith("spawn") &&
+          (err as { killed?: unknown }).killed !== true) notStarted.value = true;
       return typeof code === "number" ? code : null;
     }
   }

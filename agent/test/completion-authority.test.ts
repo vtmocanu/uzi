@@ -1331,3 +1331,126 @@ test("a transient open failure on the heads directory is named, not reported as 
   assert.ok(refusal instanceof AuthorityRefusal, String(refusal));
   assert.match((refusal as Error).message, /authority directory unavailable: EMFILE/);
 });
+
+test("residue retry: a retiring slot's settled_failed destructive record is replaceable only inside the retiring manifest", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const inside = path.join(src, "inside");
+  const other = path.join(src, "outside");
+  await retire(f, s, lease, [inside, `${inside}-2`]);
+
+  const first = await tx(f, (t2) => s.beginPending(t2, lease, { kind: "destructive", footprint: inside }));
+  // A running record never admits a second one.
+  await assert.rejects(tx(f, (t2) => s.beginPending(t2, lease, { kind: "destructive", footprint: inside })), /already recorded/);
+  await tx(f, (t2) => s.settlePending(t2, lease, first, { ok: false, residue: [inside] }));
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.pending?.status, "settled_failed");
+
+  // Outside the manifest, the wrong kind and a partly-outside footprint all refuse and write nothing.
+  for (const bad of [{ kind: "destructive" as const, footprint: other }, { kind: "bare_mutation" as const, footprint: inside },
+    { kind: "destructive" as const, footprint: `${inside}\n${other}` }]) {
+    await assert.rejects(tx(f, (t2) => s.beginPending(t2, lease, bad)), /already recorded/);
+  }
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.pending?.operation, first, "the failed record is untouched");
+  // settled_failed still blocks a new source use.
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /unresolved pending footprint/);
+
+  const retry = await tx(f, (t2) => s.beginPending(t2, lease, { kind: "destructive", footprint: `${inside}\n${inside}-2` }));
+  const slot = await tx(f, (t2) => s.readSlot(t2, key));
+  assert.equal(slot?.state, "retiring");
+  assert.equal(slot?.pending?.operation, retry);
+  assert.equal(slot?.pending?.status, "running");
+  assert.deepEqual(slot?.pending?.residue, []);
+  await tx(f, (t2) => s.settlePending(t2, lease, retry, { ok: true }));
+  await tx(f, (t2) => s.advanceRetiring(t2, lease, 2));
+  await tx(f, (t2) => s.markRetired(t2, lease));
+});
+
+test("a settled_failed destructive record outside retiring is not replaceable by beginPending", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const op = await tx(f, (t2) => s.beginPending(t2, lease, { kind: "destructive", footprint: src }));
+  await tx(f, (t2) => s.settlePending(t2, lease, op, { ok: false, residue: [src] }));
+  await assert.rejects(tx(f, (t2) => s.beginPending(t2, lease, { kind: "destructive", footprint: src })), /already recorded/);
+});
+
+test("retirement resume: a successor takes over a retiring slot whose owner died, keeping the retiring record", async (t) => {
+  const f = await fixture(t);
+  const dead = await store(f, { workerIncarnation: randomUUID() });
+  const successor = await store(f, { workerIncarnation: randomUUID() });
+  const src = source(f);
+  const key = await tx(f, (t2) => successor.slotKey(t2, src));
+  const lease = await tx(f, (t2) => dead.admitSourceUse(t2, src));
+  const published = await tx(f, (t2) => publish(f, dead, t2, lease, "claude_ready"));
+  const digest = sourceCoreDigest(published);
+  const epoch = leaseEpoch(lease);
+  const manifest = [path.join(src, "a"), path.join(src, "b")];
+  await tx(f, (t2) => dead.markRetiring(t2, lease, { manifest }));
+  await tx(f, (t2) => dead.advanceRetiring(t2, lease, 1));
+  const before = await tx(f, (t2) => successor.readSlot(t2, key));
+  const resume = (over: Partial<{ expectedEpoch: string; expectedDigest: string }> = {}): Promise<SourceUseLease> =>
+    tx(f, (t2) => successor.beginRetirement(t2, src, { expectedEpoch: epoch, expectedDigest: digest, manifest: ["ignored"], ...over }));
+
+  // Running pending: never. Wrong epoch or digest: never.
+  const op = await tx(f, (t2) => dead.beginPending(t2, lease, { kind: "destructive", footprint: manifest[1]! }));
+  await assert.rejects(resume(), /unresolved pending footprint/);
+  await tx(f, (t2) => dead.settlePending(t2, lease, op, { ok: false, residue: [manifest[1]!] }));
+  await assert.rejects(resume({ expectedEpoch: randomUUID() }), /another source-use epoch/);
+  await assert.rejects(resume({ expectedDigest: "b".repeat(64) }), /expected digest/);
+
+  const resumed = await resume();
+  const slot = await tx(f, (t2) => successor.readSlot(t2, key));
+  assert.equal(slot?.state, "retiring");
+  assert.equal(slot?.epoch, epoch);
+  assert.equal(slot?.owner.worker, successor.workerIncarnation);
+  assert.deepEqual(slot?.retiring, before?.retiring, "prior, manifest, progress and operation are kept");
+  assert.equal(slot?.retiring?.deleted, 1);
+  assert.equal(slot?.pending?.status, "settled_failed");
+  await assert.rejects(resume(), /already retiring/, "an owned retiring slot is not taken over again");
+  await assert.rejects(tx(f, (t2) => dead.advanceRetiring(t2, lease, 2)), /stale/);
+
+  // The new lease drives the residue retry and completes the retirement.
+  const retry = await tx(f, (t2) => successor.beginPending(t2, resumed, { kind: "destructive", footprint: manifest[1]! }));
+  await tx(f, (t2) => successor.settlePending(t2, resumed, retry, { ok: true }));
+  await tx(f, (t2) => successor.advanceRetiring(t2, resumed, 2));
+  await tx(f, (t2) => successor.markRetired(t2, resumed));
+  assert.equal((await tx(f, (t2) => successor.readSlot(t2, key)))?.state, "retired");
+});
+
+test("admitBareMutation writes the epoch and the running record in one slot write and refuses where admit+beginPending would", async (t) => {
+  const f = await fixture(t);
+  const a = await store(f, { workerIncarnation: randomUUID() });
+  const b = await store(f, { workerIncarnation: randomUUID() });
+  const bare = source(f, "repos/x.git");
+  const key = await tx(f, (t2) => a.slotKey(t2, bare));
+
+  const { lease, operation } = await tx(f, (t2) => a.admitBareMutation(t2, bare, { footprint: "op: refs/x" }));
+  const slot = await tx(f, (t2) => a.readSlot(t2, key));
+  assert.equal(slot?.seq, 1, "one durable write");
+  assert.equal(slot?.state, "active");
+  assert.equal(slot?.epoch, leaseEpoch(lease));
+  assert.equal(slot?.pending?.operation, operation);
+  assert.equal(slot?.pending?.status, "running");
+  assert.equal(slot?.pending?.kind, "bare_mutation");
+
+  // A foreign incarnation refuses while it is running, and while the owner is still active.
+  await assert.rejects(tx(f, (t2) => b.admitBareMutation(t2, bare, { footprint: "op: refs/y" })), /unresolved pending footprint/);
+  await tx(f, (t2) => a.settlePending(t2, lease, operation, { ok: true }));
+  await assert.rejects(tx(f, (t2) => b.admitBareMutation(t2, bare, { footprint: "op: refs/y" })), /active under another worker/,
+    "an active foreign bare slot with nothing pending (an older build's) keeps refusing");
+  // Once the owner left active, the successor admits.
+  await tx(f, (t2) => a.transition(t2, lease, "ineligible"));
+  const next = await tx(f, (t2) => b.admitBareMutation(t2, bare, { footprint: "op: refs/y" }));
+  assert.notEqual(leaseEpoch(next.lease), leaseEpoch(lease));
+  assert.equal((await tx(f, (t2) => b.readSlot(t2, key)))?.pending?.status, "running");
+
+  // A retiring slot refuses.
+  const retiringSrc = source(f, "repos/y.git");
+  const l2 = await tx(f, (t2) => a.admitSourceUse(t2, retiringSrc));
+  await retire(f, a, l2, ["m"]);
+  await assert.rejects(tx(f, (t2) => b.admitBareMutation(t2, retiringSrc, { footprint: "op: z" })), /being retired/);
+});

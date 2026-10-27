@@ -15,11 +15,12 @@
  * and passed by buildWorkerGitCache. Each hook REQUIRES the transaction the outermost entry point opened in
  * the current async context and refuses (AuthorityRefusal) when there is none; it never acquires A beneath
  * B. Every `settle` call is awaited inside the caller's own B section and borrows its transaction, except
- * two that can run after it ended: the runner-uid delete's late `close` (a child that outlived its
- * caller; it holds no lower lock) and the continuation GitCache.cleanupArchivedRecoveryPin abandons when
- * its caller's deadline passes (it still holds B). Both acquire A themselves, for a bounded wait; a wait
- * that expires fails the settlement and leaves the record open, so the abandoned continuation can
- * delay but never deadlock a holder of A.
+ * two that can run with none active: the runner-uid delete's late `close` (a child that outlived its
+ * caller) and the continuation GitCache.cleanupArchivedRecoveryPin abandons when its caller's deadline
+ * passes (it still holds B). `settle` NEVER acquires A: with no active transaction the settlement is
+ * queued in-process and applied at the start of the next outermost A acquisition (or by a microtask
+ * the exit of an outermost transaction schedules). Until applied the durable record stays `running`
+ * (fail-closed); if the process dies first, a successor sees it unresolved.
  *
  * Wiring: `new GitCache(dataDir, log, retry, { authority, authorityRequired })`. With no hooks and
  * `authorityRequired` false (every test default) behaviour is exactly the legacy one. With
@@ -28,7 +29,10 @@
  * Dispatch inventory (file git.ts; symbol; mutable footprint; existing owner/join; why the slot epoch
  * state does not already cover it):
  *
- * admitSourceUse(clonePath, op) — source bytes under a runner clone path.
+ * admitSourceUse(clonePath, op) — source bytes under a runner clone path. The three seeding ops
+ *  ("seed-canonical", "seed-attempt", "replace") first call assertBareClear(barePath, op) on the
+ *  repository's bare, so a fresh successor is admitted only when its bare footprint has no unresolved
+ *  mutation; a refusal there aborts the seed before any effect.
  *  - "seed-canonical": GitCache.runnerCloneForBranch, before freeCanonicalClonePath. Footprint: the
  *    canonical clone dir (deleted then reseeded). Owner: the bare lock. The slot epoch binds a
  *    completion source's identity; a canonical reseed is a new use of the same path.
@@ -55,12 +59,14 @@
  *    Same footprint, join and reasoning.
  *  - "recovery-pin-delete-ref": GitCache.deleteRecoveryPin (`update-ref -d` of refs/uzi-recovery-pin/
  *    <run>/<gen>, the ref anchorRecoveryHead re-creates). Join: tryGitExit returning a real exit status
- *    (0 or not), then a read-back; null (spawn failure, timeout, signal) leaves it unsettled.
+ *    (0 or not), then a read-back; null leaves it unsettled (timeout, signal) unless Node's own spawn
+ *    failure proves no child ran, which settles as residue.
  *  - "recovery-pin-archive-delete-ref": GitCache.cleanupArchivedRecoveryPin's prepared
  *    `update-ref --stdin` child (same pin ref). Registered after the last eligibility check and before
  *    the child is spawned (a refusal retains the pin). Join: the child's exit status is >= 0 (-1 is
  *    unknown), then a read-back: a committed delete must have removed the ref, an uncommitted abort
- *    must have left no `<ref>.lock`; anything else settles as residue.
+ *    must have left no `<ref>.lock`; anything else settles as residue. A spawnGit rejection (no child
+ *    object ever existed) settles as residue; a rejected settlement surfaces as AuthorityRefusedError.
  *  Other `update-ref -d` sites swept in git.ts, none in a namespace assertBareClear guards, so none is
  *  hooked: refs/uzi-checkpoints/<key>, refs/uzi-publication-floor/, refs/uzi-incoming/ (the fetch
  *  stage), the tracking-ancestor `candidate` in the archive step (refs/uzi-runner/..., after its
@@ -71,7 +77,10 @@
  *  four sites above.
  *
  * assertBareClear(barePath, op) — refuses while a beginBareMutation record on that bare is unresolved,
- *  so a pin or coverage ref cannot be re-created over a pending (ABA) deletion.
+ *  so a pin or coverage ref cannot be re-created over a pending (ABA) deletion, and a seed cannot start
+ *  on a repository whose bare has an unresolved mutation.
+ *  - "seed-canonical", "seed-attempt", "replace": GitCache.runnerCloneForBranch, attemptCloneForBranch
+ *    and prepareRecoverySuccessor, immediately before their admitSourceUse.
  *  - "owed-pin": GitCache.pinOwedUnderLock (re-creates refs/uzi-owed/<run>/<sha>, which the cleanup
  *    deletes).
  *  - "recovery-coverage-ref": GitCache.buildRecoveryCoverage (re-creates refs/uzi-coverage/...).
@@ -87,8 +96,8 @@
  *    ok; any other joined exit settles with the target as residue). A spawn that failed before any
  *    process existed (a synchronous throw, or an `error` event with no pid) settles with the target as
  *    residue. An `error` event after a real start, or an unsettled timeout, leaves the record open, and
- *    a late `close` of an unsettled child settles it as residue. A rejected ok-settlement of an
- *    in-process delete surfaces as an authority error, never as a failed delete.
+ *    a late `close` of an unsettled child settles it as residue. A rejected ok-settlement of a
+ *    delete (in-process, or the spawned rm that exited 0) surfaces as an authority error, never as a failed delete.
  */
 export interface AuthoritySettlement {
   settle(outcome: { ok: true } | { ok: false; residue: string[] }): Promise<void>;

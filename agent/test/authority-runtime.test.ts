@@ -184,26 +184,69 @@ describe("shared-bare mutation", () => {
 });
 
 describe("settlement outside a transaction", () => {
-  it("a settlement after its transaction ended acquires A (it waits for a holder)", async (t) => {
+  it("settle outside a transaction never takes A: it returns while A is held, the record stays running, the next transaction applies it", async (t) => {
     const r = await rig(t);
     const settlement = await r.rt.withTransaction(() => r.rt.hooks.beginBareMutation(r.bare, "recovery-cleanup-delete-ref", ["refs/x"]));
-    const events: string[] = [];
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     let acquired!: () => void;
     const holding = new Promise<void>((resolve) => { acquired = resolve; });
-    const holder = withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async () => {
-      acquired();
-      await held;
-      events.push("holder-released");
-    });
+    // Another holder owns A (not through the runtime, so no drain can run under it).
+    const holder = withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async () => { acquired(); await held; });
     await holding;
-    const late = settlement.settle({ ok: true }).then(() => events.push("settled"));
+    // Were settle to wait for A it would not return before the holder released; it returns at once.
+    const outcome = await Promise.race([
+      settlement.settle({ ok: true }).then(() => "returned"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("waited-for-A"), 1500)),
+    ]);
+    assert.equal(outcome, "returned");
     release();
     await holder;
-    await late;
-    assert.deepEqual(events, ["holder-released", "settled"], "the settlement queued behind A");
-    assert.equal((await slotOf(r.rt, r.bare))?.pending, null);
+    // Nothing has been applied: the durable record is still running (fail-closed). Read it without a runtime transaction.
+    const raw = await withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async (tx) => {
+      const store = await openAuthorityStore(tx, { workerToken: TOKEN });
+      return store.readSlot(tx, await store.slotKey(tx, r.bare));
+    });
+    assert.equal(raw?.pending?.status, "running");
+    // The next outermost transaction through the runtime applies it before its own body runs.
+    const seen = await r.rt.withTransaction(async (tx) => {
+      const store = await openAuthorityStore(tx, { workerToken: TOKEN });
+      return store.readSlot(tx, await store.slotKey(tx, r.bare));
+    });
+    assert.equal(seen?.pending, null, "applied at the start of the next outer acquisition");
+  });
+
+  it("a queued settlement is also applied right after the outer transaction that was running releases", async (t) => {
+    const r = await rig(t);
+    const settlement = await r.rt.withTransaction(() => r.rt.hooks.beginBareMutation(r.bare, "recovery-cleanup-delete-ref", ["refs/x"]));
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    // Registered outside any transaction, so it runs with none active even while one is open.
+    const late = gate.then(() => settlement.settle({ ok: true }));
+    await r.rt.withTransaction(async () => { open(); await late; });
+    // That transaction's exit scheduled the drain (a microtask that acquires A once more); wait for it.
+    for (let i = 0; i < 100; i++) {
+      const raw = await withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async (tx) => {
+        const store = await openAuthorityStore(tx, { workerToken: TOKEN });
+        return store.readSlot(tx, await store.slotKey(tx, r.bare));
+      });
+      if (raw?.pending === null) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const raw = await withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async (tx) => {
+      const store = await openAuthorityStore(tx, { workerToken: TOKEN });
+      return store.readSlot(tx, await store.slotKey(tx, r.bare));
+    });
+    assert.equal(raw?.pending, null);
+  });
+
+  it("a bare mutation admits its epoch and records the running footprint in one slot write", async (t) => {
+    const r = await rig(t);
+    await r.rt.withTransaction(() => r.rt.hooks.beginBareMutation(r.bare, "recovery-cleanup-delete-ref", ["refs/x"]));
+    const slot = await slotOf(r.rt, r.bare);
+    assert.equal(slot?.seq, 1);
+    assert.equal(slot?.state, "active");
+    assert.equal(slot?.pending?.status, "running");
   });
 
   it("a callback that inherited a finished transaction's async context still settles", async (t) => {

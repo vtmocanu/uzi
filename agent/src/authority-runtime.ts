@@ -17,8 +17,9 @@ import type { AuthoritySettlement, GitAuthorityHooks } from "./git-authority-hoo
 // Lock order is P -> W -> A -> C -> S -> J -> B -> O. The hooks run INSIDE the bare lock B (and
 // usually inside C, S and J), so they never acquire A: they require the transaction the outermost
 // entry point opened in this async context and refuse with AuthorityRefusal when there is none.
-// The one deliberate exception is a settlement that runs after its transaction ended (see
-// {@link AuthorityRuntime.withTransaction}).
+// A settlement that runs with no active transaction (a child's late close, or GitCache's abandoned
+// cleanupArchivedRecoveryPin continuation, which may still hold B) never acquires A either: it is queued
+// in-process and applied at the start of the next outermost A acquisition (see {@link AuthorityRuntime.withTransaction}).
 
 /** What an entry point needs to open (or borrow) A. Tests substitute an instrumented one. */
 export interface AuthorityScope {
@@ -45,9 +46,8 @@ export interface AuthorityRuntimeOptions {
 
 /** Bounded wait for A at an outermost entry: a recovery pass or a discard may hold it for a while. */
 const DEFAULT_WAIT_MS = 600_000;
-/** A settlement with no active transaction waits at most LATE_ATTEMPTS x LATE_WAIT_MS for A (see #settlement). */
+/** The idle drain of queued late settlements waits at most this long for A (it holds no lower lock). */
 const LATE_WAIT_MS = 20_000;
-const LATE_ATTEMPTS = 3;
 const SKILLS_PREFIX = ".uzi-skills-";
 /** The ops that create the path they admit: GitCache creates its parent directory right after admission. */
 const SEED_OPS: ReadonlySet<string> = new Set(["seed-canonical", "seed-attempt", "replace"]);
@@ -88,6 +88,8 @@ export class AuthorityRuntime implements AuthorityScope {
   #store: AuthorityStore | undefined;
   /** The flight-visible lease per normalized slot path, minted by this process. */
   readonly #leases = new Map<string, SourceUseLease>();
+  /** Settlements that arrived with no active transaction; applied under the next outermost A. */
+  readonly #late: Array<(tx: AuthorityTransaction) => Promise<void>> = [];
   readonly hooks: GitAuthorityHooks;
 
   constructor(options: AuthorityRuntimeOptions) {
@@ -107,8 +109,10 @@ export class AuthorityRuntime implements AuthorityScope {
 
   /**
    * Run `fn` inside A: borrow the transaction already active in this async context, otherwise
-   * acquire A. Outermost entry points call this BEFORE any C, S, J or B they take. A settlement that
-   * ran after its transaction ended has no outer lock above it and acquires A here.
+   * acquire A. Outermost entry points call this BEFORE any C, S, J or B they take. Acquiring A applies
+   * the settlements queued by {@link #settlement} first, and after an outermost transaction released
+   * with any still queued, a microtask (started from this exit, never from a settle call) acquires A
+   * once more to apply them.
    */
   withTransaction<T>(
     fn: (tx: AuthorityTransaction) => Promise<T>,
@@ -119,7 +123,36 @@ export class AuthorityRuntime implements AuthorityScope {
     return withAuthorityTransaction(this.#options.lifetime, {
       ...(options.signal ? { signal: options.signal } : {}),
       timeoutMs: options.timeoutMs ?? this.#options.timeoutMs ?? DEFAULT_WAIT_MS,
-    }, fn);
+    }, async (outer) => {
+      await this.#applyLate(outer);
+      return fn(outer);
+    }).then((result) => {
+      this.#scheduleDrain();
+      return result;
+    });
+  }
+
+  async #applyLate(tx: AuthorityTransaction): Promise<void> {
+    // Taken only once A is held, so a failed acquisition leaves every queued settlement in place.
+    for (const apply of this.#late.splice(0)) {
+      try { await apply(tx); }
+      catch (error) {
+        // The durable record stays `running` (fail-closed); it is not retried forever.
+        this.#options.log?.warn("late authority settlement could not be applied; its record stays open", {
+          error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+  }
+
+  /** Called from an outermost transaction's own exit, which holds no lower lock. */
+  #scheduleDrain(): void {
+    if (this.#late.length === 0 || this.active()) return;
+    queueMicrotask(() => {
+      this.withTransaction(async () => undefined, { timeoutMs: LATE_WAIT_MS }).catch((error: unknown) => {
+        this.#options.log?.warn("late authority settlements stay queued until the next transaction", {
+          error: error instanceof Error ? error.message : String(error) });
+      });
+    });
   }
 
   /** The lease this process minted for `clonePath` (what a flight keeps for publication). */
@@ -224,12 +257,19 @@ export class AuthorityRuntime implements AuthorityScope {
     const tx = this.#requireActive(op);
     const store = await this.#storeFor(tx);
     const key = path.resolve(bare);
-    const lease = await this.#leaseForPending(tx, store, key, ["active"]);
     const covers = [...footprint];
-    const operation = await store.beginPending(tx, lease, {
-      kind: "bare_mutation", footprint: boundedText(`${op}: ${covers.join(", ")}`, MAX_FOOTPRINT),
-    });
-    return this.#settlement(store, [{ lease, operation, covers, bareSlot: true, settled: false }]);
+    const text = boundedText(`${op}: ${covers.join(", ")}`, MAX_FOOTPRINT);
+    // This worker's own live epoch carries the record; otherwise the epoch and the running record are one write,
+    // so a crash cannot leave an active bare slot with nothing pending.
+    const held = this.#leases.get(key);
+    const slot = held ? await this.#slotOf(tx, store, key) : null;
+    if (held && slot && slot.owner.worker === store.workerIncarnation && slot.epoch === leaseEpoch(held) && slot.state === "active") {
+      const operation = await store.beginPending(tx, held, { kind: "bare_mutation", footprint: text });
+      return this.#settlement(store, [{ lease: held, operation, covers, bareSlot: true, settled: false }]);
+    }
+    const admitted = await store.admitBareMutation(tx, key, { footprint: text });
+    this.#leases.set(key, admitted.lease);
+    return this.#settlement(store, [{ lease: admitted.lease, operation: admitted.operation, covers, bareSlot: true, settled: false }]);
   }
 
   async #assertBareClear(bare: string, op: string): Promise<void> {
@@ -270,41 +310,34 @@ export class AuthorityRuntime implements AuthorityScope {
   }
 
   #settlement(store: AuthorityStore, parts: PendingPart[]): AuthoritySettlement {
+    const apply = async (tx: AuthorityTransaction, outcome: { ok: true } | { ok: false; residue: string[] }): Promise<void> => {
+      for (const part of parts) {
+        if (part.settled) continue;
+        if (outcome.ok) {
+          await store.settlePending(tx, part.lease, part.operation, { ok: true });
+          part.settled = true;
+          if (part.bareSlot) {
+            // Leave `active` so a successor worker is not refused by a slot with nothing pending.
+            await store.transition(tx, part.lease, "ineligible").catch((error: unknown) => {
+              this.#options.log?.warn("bare-mutator slot could not leave active", { error: error instanceof Error ? error.message : String(error) });
+            });
+          }
+        } else {
+          await store.settlePending(tx, part.lease, part.operation, { ok: false, residue: residueFor(part, outcome.residue) });
+          part.settled = true;
+        }
+      }
+    };
     return {
       settle: async (outcome) => {
-        // Settlement runs under the caller's transaction when there is one (every site inside B), and
-        // acquires A only when none is active: a child's late close, which holds no lower lock.
-        //
-        // One more path ends here with no transaction: GitCache.cleanupArchivedRecoveryPin's abandoned
-        // continuation (its caller returned on the deadline, its bare lock is still held) settling after the
-        // caller's transaction ended. That acquires A beneath B, so the wait is bounded and, on expiry, the
-        // settlement fails and the record stays open (a fence, never a clearance) instead of deadlocking.
-        const attempt = (timeoutMs: number): Promise<void> => this.withTransaction(async (tx) => {
-          for (const part of parts) {
-            if (part.settled) continue;
-            if (outcome.ok) {
-              await store.settlePending(tx, part.lease, part.operation, { ok: true });
-              part.settled = true;
-              if (part.bareSlot) {
-                // Leave `active` so a successor worker is not refused by a slot with nothing pending.
-                await store.transition(tx, part.lease, "ineligible").catch((error: unknown) => {
-                  this.#options.log?.warn("bare-mutator slot could not leave active", { error: error instanceof Error ? error.message : String(error) });
-                });
-              }
-            } else {
-              await store.settlePending(tx, part.lease, part.operation, { ok: false, residue: residueFor(part, outcome.residue) });
-              part.settled = true;
-            }
-          }
-        }, { timeoutMs });
-        if (this.active()) { await attempt(LATE_WAIT_MS); return; }
-        // At most LATE_ATTEMPTS waits of LATE_WAIT_MS each, and only a timed-out wait is retried.
-        for (let n = 1; ; n++) {
-          try { await attempt(LATE_WAIT_MS); return; }
-          catch (error) {
-            if (n >= LATE_ATTEMPTS || !(error instanceof AuthorityRefusal) || error.message !== "authority lock timeout") throw error;
-          }
-        }
+        // Under the caller's transaction (every site inside B) it is applied now. With none active (a child's
+        // late close, or the continuation GitCache.cleanupArchivedRecoveryPin abandons on its caller's deadline
+        // while still holding B) it must NOT acquire A, which would invert the lock order beneath B: it is queued
+        // and the next outermost acquisition applies it. Until then the durable record stays running, fail-closed;
+        // if the process dies first a successor finds it unresolved, which is correct.
+        const tx = this.active();
+        if (tx) { await apply(tx, outcome); return; }
+        this.#late.push((outer) => apply(outer, outcome));
       },
     };
   }

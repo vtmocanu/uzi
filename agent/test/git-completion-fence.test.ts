@@ -272,11 +272,35 @@ describe("authority hooks", () => {
     }));
     const target = fs.readdirSync(path.dirname(clonePath));
     await assert.rejects(refusing.createOrAttachRunnerClone(bare, 2700, noProofReseed, "run-27"), /refused issue-2700/);
-    assert.deepEqual(events, ["admit:seed-canonical"]);
+    assert.deepEqual(events, ["clear:seed-canonical", "admit:seed-canonical"]);
     assert.deepEqual(fs.readdirSync(path.dirname(clonePath)), target);
     const admitting = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ authority: recorder(events = []) }));
     await admitting.createOrAttachRunnerClone(bare, 2700, noProofReseed, "run-27");
-    assert.deepEqual(events, ["admit:seed-canonical:issue-2700"]);
+    assert.deepEqual(events, ["clear:seed-canonical", "admit:seed-canonical:issue-2700"]);
+  });
+
+  it("an unresolved bare mutation refuses a seed before admission: canonical, attempt and replace", async () => {
+    const events: string[] = [];
+    const blocked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+      authority: recorder(events, { assertBareClear: async (_b, op) => { events.push(`clear:${op}`); throw new Error("bare not clear"); } }),
+    }));
+    const before = fs.readdirSync(path.dirname(clonePath));
+    await assert.rejects(blocked.createOrAttachRunnerClone(bare, 2800, noProofReseed, "run-28"), /bare not clear/);
+    await assert.rejects(blocked.createOrAttachRunnerClone(bare, 2801, noProofReseed, "run-2801", false, undefined,
+      { attemptId: aid(4), beforeSeed: async () => {}, isLive: () => false }), /bare not clear/);
+    assert.deepEqual(fs.readdirSync(path.dirname(clonePath)), before, "no clone, ledger entry or directory was created");
+
+    // replace: a reserved, captured source with a successor prepared against it.
+    const source = reconstructionSource();
+    const r = await cache.reserveRecoveryIteration(bare, BRANCH, KEY, source);
+    const head = gitIn(clonePath, ["rev-parse", "HEAD"]);
+    await cache.recordRecoveryCapture(bare, BRANCH, KEY, source, r.attempts, head);
+    const journalBefore = rawJournal();
+    await assert.rejects(blocked.prepareRecoverySuccessor(bare, BRANCH, KEY, source, r.attempts, aid(2)), /bare not clear/);
+    assert.equal(rawJournal(), journalBefore, "the journal was not rewritten");
+    assert.equal(fs.readdirSync(path.dirname(clonePath)).some(n => n.includes(aid(2))), false);
+
+    assert.deepEqual(events, ["clear:seed-canonical", "clear:seed-attempt", "clear:replace"], "refused before any admitSourceUse");
   });
 
   describe("shared-bare mutation", () => {
@@ -478,6 +502,59 @@ describe("authority hooks", () => {
       assert.deepEqual(events, [`bare:recovery-pin-archive-delete-ref:${PIN}:pin=true`]);
     });
 
+    it("deleteRecoveryPin settles a Node spawn failure (no child ever ran) as residue, but not a timeout", async () => {
+      const events: string[] = [];
+      const hooked = hookedWith(events);
+      watchGit(hooked, isDelete, events, Object.assign(new Error("spawn git ENOENT"), { code: "ENOENT", syscall: "spawn git", stdout: "", stderr: "" }));
+      await hooked.deleteRecoveryPin(bare, OWED_RUN, 1);
+      assert.deepEqual(events, [
+        `bare:recovery-pin-delete-ref:${PIN}:pin=true`, "git:update-ref-d",
+        `settle:recovery-pin-delete-ref:pin=true:{"ok":false,"residue":["${PIN}"]}`,
+      ]);
+      const killed: string[] = [];
+      const timedOut = hookedWith(killed);
+      watchGit(timedOut, isDelete, killed, Object.assign(new Error("timed out"), { code: "ENOENT", syscall: "spawn git", killed: true, stdout: "", stderr: "" }));
+      await timedOut.deleteRecoveryPin(bare, OWED_RUN, 1);
+      assert.deepEqual(killed, [`bare:recovery-pin-delete-ref:${PIN}:pin=true`, "git:update-ref-d"], "a killed child may have started: left open");
+    });
+
+    it("deleteRecoveryPin surfaces a rejected settlement as an authority error", async () => {
+      const events: string[] = [];
+      const hooked = hookedWith(events, {
+        beginBareMutation: async () => ({ settle: async () => { throw new Error("cannot write slot"); } }),
+      });
+      await assert.rejects(hooked.deleteRecoveryPin(bare, OWED_RUN, 1), /completion authority refused recovery-pin-delete-ref settlement: cannot write slot/);
+    });
+
+    it("cleanupArchivedRecoveryPin settles as residue when spawnGit rejects before any child exists", async () => {
+      const events: string[] = [];
+      const hooked = hookedWith(events);
+      const internals = hooked as unknown as { spawnGit(...a: unknown[]): Promise<unknown> };
+      const real = internals.spawnGit.bind(hooked);
+      internals.spawnGit = async (...a) => {
+        if ((a[1] as string[]).includes("--stdin")) throw new Error("spawn EAGAIN");
+        return real(...a);
+      };
+      const result = await hooked.cleanupArchivedRecoveryPin({
+        runId: OWED_RUN, generation: 1, sourceSha: sha, recoveryPinBareDir: path.basename(bare), isEligible: () => true,
+      });
+      assert.deepEqual(result, { state: "retained", reason: "git_failure" });
+      assert.deepEqual(events, [
+        `bare:recovery-pin-archive-delete-ref:${PIN}:pin=true`, `settle:recovery-pin-archive-delete-ref:pin=true:{"ok":false,"residue":["${PIN}"]}`,
+      ]);
+      assert.equal(pinExists(), true);
+    });
+
+    it("cleanupArchivedRecoveryPin surfaces a rejected settlement as an authority error, not a retained pin", async () => {
+      const events: string[] = [];
+      const hooked = hookedWith(events, {
+        beginBareMutation: async () => ({ settle: async () => { throw new Error("cannot write slot"); } }),
+      });
+      await assert.rejects(hooked.cleanupArchivedRecoveryPin({
+        runId: OWED_RUN, generation: 1, sourceSha: sha, recoveryPinBareDir: path.basename(bare), isEligible: () => true,
+      }), /completion authority refused recovery-pin-archive-delete-ref settlement: cannot write slot/);
+    });
+
     it("cleanupArchivedRecoveryPin retains the pin without spawning when registration is refused", async () => {
       const events: string[] = [];
       const hooked = hookedWith(events, { beginBareMutation: async () => { throw new Error("authority refused"); } });
@@ -580,6 +657,22 @@ describe("authority hooks", () => {
           } }),
         }),
         retentionDelete: { split: true, run: async (_command: string, args: string[]) => { fs.rmSync(args.at(-1)!, { recursive: true, force: true }); } },
+      }));
+      await assert.rejects(reseed(hooked), /completion authority refused runner-uid-delete settlement: cannot write issue-2512/);
+      assert.deepEqual(events.filter(e => e.startsWith("settle:")), ['settle:{"ok":true}']);
+      assert.equal(fs.readdirSync(path.dirname(clonePath)).some(n => /residue/i.test(n)), false, "nothing was quarantined as a failed delete");
+    });
+
+    it("a rejected ok-settlement after the spawned rm exited 0 is an authority error, not a failed delete", async () => {
+      const events: string[] = [];
+      await free();
+      const hooked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+        authority: recorder(events, {
+          beginDestructive: async (paths) => ({ settle: async (outcome) => {
+            events.push(`settle:${JSON.stringify(outcome)}`); throw new Error(`cannot write ${path.basename(paths[0]!)}`);
+          } }),
+        }),
+        retentionDelete: { split: true, spawn: fakeSpawn(events, c => c.emit("close", 0, null)) },
       }));
       await assert.rejects(reseed(hooked), /completion authority refused runner-uid-delete settlement: cannot write issue-2512/);
       assert.deepEqual(events.filter(e => e.startsWith("settle:")), ['settle:{"ok":true}']);
