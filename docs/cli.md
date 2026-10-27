@@ -3151,7 +3151,9 @@ A run's raw `status` (in `run get --json`, `run list --json` and
 - `recovery_wait` — parked to recover from a resumed turn that came back empty
   (no model activity) or hit a transient provider error; the sweep auto-resumes
   it on a capped backoff. Empty-turn and resumed-gate recovery have no lifetime cap;
-  typed `provider_outage` parks use the elapsed streak bound and can become
+  negotiated `codex_idle_stall` parks instead have three timed retries by default,
+  then require owner Resume/Cancel. See [Codex idle stalls](#codex-idle-stalls).
+  Typed `provider_outage` parks use the elapsed streak bound and can become
   `paused` / `provider_unavailable` — see [Recovering
   from a transient interruption](run-recovery-wait.md). An exhausted worker-death episode also parks here with cause
   `worker_requeue_exhausted`, requiring explicit owner Resume or Cancel
@@ -3247,8 +3249,9 @@ hold presentation and remedies are unchanged. See
 
 `limit_wait` and timed `recovery_wait` causes auto-resume on a timer.
 `worker_requeue_exhausted` instead requires owner Resume or Cancel; the Codex
-account hold waits for its account. `retained_recovery_exhausted` retries when
-its timestamp is finite (even if due); NULL instead needs owner Resume/Cancel,
+account hold waits for its account. `codex_idle_stall` and
+`retained_recovery_exhausted` retry when
+their timestamp is finite (even if due); NULL instead needs owner Resume/Cancel,
 and omitted timing is unknown. `pool_wait` instead clears only when a token is
 opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
 does not resume it.
@@ -3308,8 +3311,9 @@ belongs to the current streak, separately from the recovery backoff count.
 The default elapsed bound is 24h from the first park; operators can change
 `RUN_PROVIDER_PARK_MAX_DURATION` or use `0` to disable the hold while
 typing/counting remain enabled. Positive completed `productive_turns` on
-a provider park starts a new streak; the same evidence on an ordinary or
-disk recovery park (`provider_progress_turns`) clears an open streak. Owner Resume, early credential-driven
+a provider park starts a new streak; the same evidence on an ordinary,
+typed idle-stall or disk recovery park (`provider_progress_turns`) clears an
+open streak. Provider-outage owner Resume, early credential-driven
 promotion and credential switching clear it; automatic and vault-unlock
 promotion preserve it. Detection is at the next qualifying park, with no
 maximum overshoot promised.
@@ -3369,6 +3373,33 @@ set written explicitly. Ordinary recovery waits continue as before.
 status stays `recovery_wait`. The TUI puts this hold in NEEDS YOU with
 owner actions, counts and historical evidence, without a self-retry countdown.
 
+### Codex idle stalls
+
+`recovery_wait` / `codex_idle_stall` covers measured no-output and productive
+Codex stalls. The default allows three automatic parks, then holds for the owner.
+A finite `recovery_retry_not_before`, including a due timestamp, means timed
+recovery; NULL means held with no countdown, and omitted timing means unknown.
+The full worker ACK lacking a retry time is held; an omitted public DTO field
+does not establish that fact.
+
+Use `uzi run resume <id>` (or `resume-now`) to queue either form early, or
+`uzi run cancel <id>` to end it. Resume clears the retry, resets the internal
+idle count to 0, grants a fresh wall window and revokes the Codex capability.
+It preserves lifetime recovery backoff, provider streak, session, affinity,
+worker recovery episode and requeue baseline, with ordinary claim-release and
+custody semantics. Timer promotion preserves the count and grants a fresh wall
+window too; the default can therefore buy three extra full wall windows.
+`set-token` can promote a timed park; a held park returns a named 409 requiring
+Resume first.
+
+Default wait and log follow stop for a NULL-retry hold, continue through finite
+or unknown timing, and report finite-to-held changes within the same cause/status.
+Explicit `--until` is unchanged. Same-session recovery requires a resolvable
+ordinary unwired non-Docker path; retained-source and Docker recovery use fresh
+paths/threads. Read `resume_lineage_break` warnings: recovery does not guarantee
+exactly-once effects. See [Codex idle stalls](run-recovery-wait.md#codex-idle-stalls)
+for progress accounting, source custody and deployment limits.
+
 ### Retained recovery exhausted
 
 `recovery_wait` / `retained_recovery_exhausted` means a durably confirmed
@@ -3403,7 +3434,7 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`),
 except a default wait also stops at `recovery_wait` with cause
 `worker_requeue_exhausted`, `worker_memory_pressure`, or owner-held
-`retained_recovery_exhausted` (NULL retry), and at a `paused` run held on
+`retained_recovery_exhausted` or `codex_idle_stall` (NULL retry), and at a `paused` run held on
 `base_attestation_missing`, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means

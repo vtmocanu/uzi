@@ -219,7 +219,8 @@ func reconcilerDecision(status string, origin pgtype.Text) decision {
 	// hold moves no card, so there is nothing to notify about.
 	// recovery_wait (issue #1197) is the transient-recovery park and belongs here for the
 	// very same reasons as limit_wait/pool_wait: a recovery-parked run keeps its issue and
-	// worker affinity, auto-resumes on the server-owned capped backoff, and routinely
+	// worker affinity, retries timed causes on capped backoff or awaits owner action for
+	// held causes (including Codex idle stalls, #3509), and routinely
 	// outlasts 30 minutes — so leaving it in the default arm would trip the give-up warn on
 	// every park. It is In Progress (a recovering run is still working), and Notify's partial
 	// map is deliberately NOT extended: a park moves no card, so there is nothing to notify.

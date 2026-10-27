@@ -6,7 +6,7 @@ audience: user
 
 # Recovering from a transient interruption
 
-`recovery_wait` also includes owner-only [worker recovery exhaustion](#worker-recovery-exhausted), which has no timer or automatic resume. The transient-interruption retries below do not describe that hold.
+`recovery_wait` also includes owner-only [worker recovery exhaustion](#worker-recovery-exhausted), which has no timer or automatic resume. [Codex idle stalls](#codex-idle-stalls) and retained-source exhaustion can also become owner-held. The transient-interruption retries below do not describe those holds.
 
 Uzi retries in place and, if the trouble persists, parks the run in
 `recovery_wait` on these transient interruptions:
@@ -34,7 +34,8 @@ recovery checkpoint before parking the run in `recovery_wait`.
 
 This recovery is automatic and requires no per-run setting. A missing plan
 after a turn that actually did work, missing turn-count metadata, a real
-timeout, and cancellation are not classified as a transient recovery.
+wall timeout, and cancellation are not classified as a transient recovery.
+Measured Codex idle timeouts have the separate [idle-stall policy](#codex-idle-stalls) below.
 
 A **permanent** provider error — for example 401, 403, or 400 (bad
 credentials or a bad request) — is not a transient interruption. The run
@@ -69,13 +70,14 @@ an unverified capture attempt.
 
 For these empty-turn and provider recoveries, after verified capture, the server parks the run on a capped exponential
 backoff and returns it to `queued` when that delay passes. Empty-turn and
-resumed-gate recovery have no lifetime cap or manual resume step. Typed provider
-parks use the elapsed streak bound below.
+resumed-gate recovery have no lifetime cap or manual resume step. Negotiated
+Codex idle stalls use the separate park cap below; typed provider parks use the
+elapsed streak bound below.
 
 An ordinary unwired resume can recover from the verified local checkpoint
-with same-path session continuity, provided its key has never entered
-retained-source recovery. Docker-wired resumes and retained-source recovery
-use a fresh attempt path and model session. Publishing a checkpoint to the
+with same-path session continuity when the saved session is resolvable and its
+key has never entered retained-source recovery. Docker-wired resumes and
+retained-source recovery use a fresh attempt path and model session. Publishing a checkpoint to the
 forge is best-effort:
 a different worker can recover only what was successfully published.
 Losing the original worker's storage before publication can therefore
@@ -96,6 +98,67 @@ its work entirely, the existing plan-review safeguard still applies.
 This fix does not reconstruct plan text missing from older runs. A legacy
 auto-approved run whose stored plan is empty can still need a new planning
 turn; an approval flag alone is not an implementation-ready plan.
+
+## Codex idle stalls
+
+A compatible worker reports measured Codex idle timeouts as `recovery_wait` /
+`codex_idle_stall`, for both no model output (`zero_evidence`) and output that
+stalled (`productive`). This covers lead initial planning, automatic plan
+revisions and implementation. Human plan-revision productive idle still fails;
+zero-evidence revision silence uses its existing in-flight revision driver.
+Child turns, Claude and `idleOperation` keep their existing behavior. Cancel,
+pause, spent wall, vault-lock, completion-hold and first-trip precedence remain.
+
+By default, **three automatic parks** get finite retry times; the fourth stays
+**held for the owner** with a NULL retry. `RUN_CODEX_IDLE_STALL_MAX_PARKS=0`
+holds on the first park. The delay still uses lifetime recovery backoff plus
+jitter. Positive completed `provider_progress_turns` on an idle park restarts
+the idle count at 1; otherwise it increments with saturation. Current stalled
+output is not a completed turn. This is a park-observed streak, not an exact
+count of unsuccessful turns: progress in another flight that ends without an
+idle park may be unseen, so the hold can arrive earlier. Reclaim, checkpointing
+and credential parks leave the idle count unchanged.
+
+1. With a finite retry, including one already due, wait for automatic recovery,
+   choose **Resume** (`uzi run resume <id>`) to queue it early, or **Cancel**.
+2. With a NULL retry, choose **Resume** when ready or **Cancel** to end it.
+   Omitted timing means unknown, not held. Default CLI wait and log follow stop
+   for the held form and continue through finite or unknown retries; explicit
+   `--until` keeps its chosen status set.
+3. Resume of either form clears the retry and idle count, queues a fresh wall
+   window and revokes the Codex capability. It preserves lifetime backoff,
+   provider streak, session, affinity, worker recovery episode and requeue
+   baseline. Automatic promotion also resets the wall, so the default allowance
+   can buy three extra full wall windows. A timed park can be promoted by
+   set-token; a held one returns a named 409 requiring Resume first.
+
+Accepted parks still require persistence, executor cleanup, a successful WIP
+commit when dirty, fetch-back and verified ref coverage. Typing requires
+`recovery_cause_codex_idle_stall_v1` and a positive, stampable generation before
+capture; acceptance requires the exact returned status and cause. A full worker
+ACK without a retry timestamp confirms held, whereas an omitted public DTO
+field means unknown timing. These errors have `providerOrigin: false` and do
+not charge provider-outage accounting.
+Without feature support, zero-evidence idle keeps legacy untyped recovery and
+productive idle keeps terminal failure. After negotiation, HTTP 400 or feature
+loss does not trigger an untyped downgrade; the worker keeps the source.
+
+Same-session recovery requires a resolvable ordinary unwired non-Docker path.
+Retained-source recovery and Docker attempts use a fresh path/thread; rejected
+thread resume keeps the `resume_lineage_break` warning and fresh-thread fallback.
+Interrupted-turn notes, reconciliation and snapshots do not guarantee
+exactly-once effects or prevent duplicate work.
+
+An execution hold adds no custody retention rule. Ordinary settlement and
+exact-generation ACK guards still apply; uncaptured, guarded, unresolved and
+507-refused sources remain protected, and open holds still count toward admission.
+The cap limits further generation minting for one run; it does not relieve storage
+quota or admission pressure (#2969/#2544). Held runs block worker image rollout.
+Deploy the API to all replicas before workers; mixed API versions and application
+rollback while holds exist are unsupported because an old token promoter can
+bypass the hold. See [configuration and destructive schema Down risks](configuration.md#codex-idle-stall-deployment-and-schema-rollback)
+and the [#3509 decision](../adr/1197-transient-recovery-park.md#amendment-2026-10-27-3509-bounded-codex-idle-stall-parks).
+No live rollout is claimed.
 
 ## Provider outage streaks
 
@@ -118,14 +181,15 @@ at that park with count 1. These are completed, error-free model turns in
 the current flight, including planning, implementation and review; claiming
 the run or becoming `running` does not count as progress. Progress is not
 limited to provider parks: a flight that completed turns and then parks for
-another reason, an ordinary (untyped or `empty_turn`) or a disk
+another reason, an ordinary (untyped or `empty_turn`), typed idle-stall or disk
 (`data_volume_full`) recovery park, reports them as `provider_progress_turns`,
 and the API clears an open streak in the same statement that applies that
 park. Missing or zero evidence leaves the streak untouched, and the report
 must carry a positive `claim_generation`; the generation, status and release
 fences reject stale or replayed evidence, so it cannot reset a streak twice.
-Owner Resume,
+Provider-outage owner Resume,
 early credential-driven promotion and credential switching clear the streak.
+Idle-stall owner Resume instead preserves the provider streak.
 Automatic and vault-unlock promotion preserve it.
 
 For a **provider unavailable** hold:
@@ -155,10 +219,11 @@ refusal triggers one untyped resend and disables the cached feature;
 ordinary validation errors do not. Recognizing `paused` alone does not
 make rollback safe: older APIs lack the provider hold's late-failure guards.
 
-`provider_progress_turns` is gated separately by the negotiated
-`provider_progress_on_recovery_park_v1` feature. A worker sends it only after
-seeing that feature, only with a positive claim generation, and only on an
-ordinary or disk recovery park. If the API refuses it as an unknown field
+On ordinary and disk parks, `provider_progress_turns` is gated separately by
+`provider_progress_on_recovery_park_v1` and a positive claim generation.
+Typed idle-stall parks instead require this field, including zero, under
+`recovery_cause_codex_idle_stall_v1` alone and do not downgrade. The fallback
+below applies to ordinary and disk parks. If the API refuses it as an unknown field
 (a positively identified strict-decoder refusal after a rollback), the worker
 drops the cached feature and re-sends the same park once without the field,
 keeping the fence; a refusal of that retry propagates, and there is no third
