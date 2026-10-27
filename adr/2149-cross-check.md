@@ -233,8 +233,8 @@ These are prompt requirements, not parser-enforced submission conditions.
 Dispositions remain untrusted plan content within the exact candidate digest
 and grant no authorization. No new fields, parser, transport,
 history or authority are introduced; server-provided prior-findings history is
-accepted as out of scope. Code cross-check's existing inline-environment wording
-is unchanged; code-stage prompt changes are deferred.
+accepted as out of scope. At this amendment, code cross-check's existing inline-environment wording
+was unchanged and code-stage prompt changes were deferred; the 2026-10-27 amendment below supersedes that deferral.
 
 Compared with the old default, the worst case adds two checker waits, each up
 to `PLAN_CROSS_CHECK_TIMEOUT` (normally 30 minutes), holding the lead slot but
@@ -331,3 +331,42 @@ pin unchanged code-stage revision prompts. Required validation and its observed
 results are tracked in PRD #3168's M1 progress section. Child #3334 requires no
 maintainer replay; parent #3168 remains open for M2. No live model convergence,
 cost or latency measurement is claimed.
+
+### Advisory code criteria and environment effects amendment (2026-10-27, #3167 M3a)
+
+This amendment supersedes the code-stage environment deferral above. Both checker
+families share the code brief: correctness against the issue and approved plan,
+contracts and safety invariants, tests unable to fail on unfixed code, scope,
+docs and changelog. Criteria come from the issue, approved plan and frozen
+milestones. The code prompt serializes milestones once as whole JSON in a
+nonce-fenced approved_milestones untrusted DATA block. Absent/null lists become
+[]; nonarrays, more than 64 entries or more than 256 KiB UTF-8 JSON are refused,
+with the exact byte boundary accepted. No API, claim or digest changes.
+
+Criterion titles must start with Requirement gap: for missing/partial delivery
+or Coverage uncertainty: for verification unavailable here, including informational
+notes; defect titles use neither prefix. Use the relevant code or PRD/plan path,
+and line 0 when none applies. Hosted/live/maintainer-only verification is minor;
+missing worker implementation/tests are graded by impact. An issue-stated safety,
+security or data-integrity requirement that is missing is a critical/major defect
+without either prefix. Defects come first within 20 findings, 2 KiB per finding
+and 32 KiB total. Criteria use spare room only; at most one minor omission note
+counts unreported criteria if room remains. Never evict a defect. A full defect
+report may omit criterion notes; criterion-only findings are valid. Empty findings
+mean no reportable defect, criterion or omission note.
+
+Judge overrides by actual effects, inherited children and the effects relied on.
+Temporary scratch/TMPDIR relocation, including inherited Go build/test temporary
+files, alone is not bypass. Neither name nor destination proves harmlessness;
+configuration, credentials and test behavior require inspectable evidence. Flag
+skipping, selecting, narrowing or weakening required validation and explicit
+restriction violations. This introduces no plan dispositions or scratch-location
+instruction into the code brief.
+
+M2 changed-path coverage instructions and locked-brief precedence over owner
+guidance remain intact. This is advisory instruction policy, with one check and
+one fix pass, no recheck or publication block, no new schema field or programmatic
+finding rewrite. Instruction fixtures pin text, not model behavior. Frozen replay
+inputs and baseline hashes are unchanged; only revised brief hashes are repinned.
+M1 baseline and M3b replay/hosted verification remain maintainer follow-ups; this
+amendment claims neither detection improvement nor hosted acceptance.

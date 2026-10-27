@@ -5,6 +5,32 @@
 
 Resolved facts below were read at `main` `c1543616`.
 
+## Follow-up note (2026-10-27, #3167 M3a)
+
+The shared code brief now checks contracts/safety invariants and delivery of issue,
+approved-plan and frozen-milestone criteria, alongside correctness, test validity,
+scope, docs and changelog. Missing/partial criteria use Requirement gap:; unverifiable
+criteria use Coverage uncertainty: (hosted/live/maintainer-only is minor). Missing
+worker implementation/tests are graded by impact; missing issue-stated safety,
+security or data-integrity requirements are critical/major defects without either
+prefix. Defects retain priority within the existing caps; criteria and at most one
+minor counted omission note use spare room only. Criterion-only findings are valid.
+
+The code prompt adds whole nonce-fenced approved_milestones JSON DATA, absent/null
+as [], rejecting nonarrays, more than 64 entries or more than 256 KiB serialized
+UTF-8 bytes without truncation. Environment guidance now evaluates actual and
+inherited effects rather than blanket inline-variable objections: temporary
+scratch/TMPDIR relocation alone is not bypass, and configuration/credential/test
+effects need inspectable evidence. Weakening required validation or violating
+explicit restrictions is reportable. See the dated amendment in
+[ADR-2149](../../adr/2149-cross-check.md).
+
+The original delivery and validation records below remain historical. M2 coverage
+and owner-guidance precedence are preserved. This follow-up remains advisory, one
+check and one fix pass, without recheck, block, schema or digest changes, or
+programmatic finding rewrites. M1 measurement and M3b replay/hosted acceptance are
+separate maintainer follow-ups; no model-behavior or detection claim is made here.
+
 ## Problem
 
 A run's code is checked in-run only by validators on the lead's own model family (the reviewer, tester and auditor roles the lead delegates to, `api/internal/agenttmpl/builtins/`), and by external bots only after the merge request is open. The cross-family reviews that catch most plan defects (PRD #2149) never see the code. A human who approved the plan never sees the code before the MR either.
@@ -69,7 +95,7 @@ Acceptance examples:
 - `CrossCheckRunner`'s code stage, on the lead's worker: checks out `head_commit` from the local bare ref into a clone keyed by its own run id, refusing if the ref's tip is not `head_commit`. It never fetches from origin for the snapshot.
 - **Snapshot lifetime.** The lead's worker deletes `refs/uzi-cross-check/<lead-run-id>` (exact ref, never a glob) once the child has settled or been cancelled, never while the child can still read it. A worker boot sweeps refs whose lead is terminal or no longer owned by this worker. A new attempt on another worker never sees the ref, which is why an interrupted attempt does not check again.
 - Read-only tools only, per family: the Codex broker grant set of PRD #2149 D3, the Claude path-guarded `Read`/`Grep`/`Glob` set of PRD #2460 D1. Usage frames as in PRD #2149.
-- Inputs: the issue or prompt text, the approved plan if any, `git diff base_commit...head_commit` read through the hardened `runGit` (`--no-ext-diff --no-textconv`), and a fixed base brief: correctness against the plan and the issue, regression tests that cannot fail, security and data-integrity claims stronger than their evidence, gate commands with inlined environment variables, missing changelog or docs, scope beyond the issue. Untrusted content is nonce-fenced. Output is one JSON object of findings; anything else is `failed`, reason `malformed`.
+- Historical inputs and brief at #2170 delivery (see the 2026-10-27 note above): the issue or prompt text, the approved plan if any, `git diff base_commit...head_commit` read through the hardened `runGit` (`--no-ext-diff --no-textconv`), and a fixed base brief: correctness against the plan and the issue, regression tests that cannot fail, security and data-integrity claims stronger than their evidence, gate commands with inlined environment variables, missing changelog or docs, scope beyond the issue. Untrusted content is nonce-fenced. Output is one JSON object of findings; anything else is `failed`, reason `malformed`.
 
 ### Owner guidance (M3)
 
