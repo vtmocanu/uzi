@@ -1291,6 +1291,8 @@ export class WorkerClient {
    */
   private serverFeatures = new Set<string>();
   private readonly codexAdmission = new Map<string, { generation: number; reporter: CodexAdmissionReporter }>();
+  private readonly codexAdmissionClosed = new Map<string, number>();
+  private codexAdmissionEpoch = {};
 
   /** Only an owned subscription claim grants observation authority to advice producers. */
   codexAdmissionReporter(runId: string, generation?: number): CodexAdmissionReporter | undefined {
@@ -1298,23 +1300,47 @@ export class WorkerClient {
     return owned && owned.generation === generation ? owned.reporter : undefined;
   }
 
-  private bindCodexAdmission(claim: ClaimResponse): void {
-    if (!this.hasFeature("codex_account_admission_signal_v1") || !claim || !terminalUUID(claim.run_id) || !Number.isSafeInteger(claim.claim_generation) ||
+  private markCodexAdmissionClosed(runId: string, generation: number): void {
+    this.codexAdmissionClosed.set(runId, Math.max(this.codexAdmissionClosed.get(runId) ?? 0, generation));
+    if (this.codexAdmissionClosed.size > 1024) {
+      this.codexAdmissionClosed.delete(this.codexAdmissionClosed.keys().next().value!);
+      // Claims issued before forgetting a generation cannot restore its authority.
+      this.codexAdmissionEpoch = {};
+    }
+  }
+
+  private retireCodexAdmission(runId: string, expected: { generation: number; reporter: CodexAdmissionReporter } | undefined): void {
+    if (!expected || this.codexAdmission.get(runId) !== expected) return;
+    expected.reporter.seal(true);
+    this.codexAdmission.delete(runId);
+    this.markCodexAdmissionClosed(runId, expected.generation);
+  }
+
+  private bindCodexAdmission(claim: ClaimResponse, epoch: object): void {
+    if (epoch !== this.codexAdmissionEpoch || !this.hasFeature("codex_account_admission_signal_v1") || !claim || !terminalUUID(claim.run_id) || !Number.isSafeInteger(claim.claim_generation) ||
         (claim.claim_generation ?? 0) <= 0) return;
-    const prior = this.codexAdmission.get(claim.run_id);
-    // Retain a monotonic high-water mark per run. Closed identities are never evicted:
-    // at the fixed lifetime cap, refuse new telemetry rather than forget a tombstone.
-    if (prior && prior.generation > claim.claim_generation!) return;
-    if (!prior && this.codexAdmission.size >= 1024) return;
-    if (claim.kind === "job" || claim.kind === "chat") { prior?.reporter.seal(true); return; }
+    const runId = claim.run_id;
+    const generation = claim.claim_generation!;
+    const prior = this.codexAdmission.get(runId);
+    if ((this.codexAdmissionClosed.get(runId) ?? 0) >= generation || (prior && prior.generation > generation)) return;
+    let eligible = claim.kind !== "job" && claim.kind !== "chat";
     try {
       const selected = selectCodexBinding(claim.secrets);
-      if (selected.kind !== "codex" || selected.binding.authMode !== "subscription") { prior?.reporter.seal(true); return; }
-    } catch { prior?.reporter.seal(true); return; }
-    if (prior?.generation === claim.claim_generation) return;
-    prior?.reporter.seal(true);
-    const runId = claim.run_id;
-    const reporter = new CodexAdmissionReporter(claim.claim_generation!,
+      eligible &&= selected.kind === "codex" && selected.binding.authMode === "subscription";
+    } catch { eligible = false; }
+    if (!eligible) {
+      this.retireCodexAdmission(runId, prior);
+      this.markCodexAdmissionClosed(runId, generation);
+      return;
+    }
+    if (prior?.generation === generation) return;
+    if (!prior && this.codexAdmission.size >= 1024) {
+      // Refusals also fence older requests still in flight when capacity opens.
+      this.markCodexAdmissionClosed(runId, generation);
+      return;
+    }
+    this.retireCodexAdmission(runId, prior);
+    const reporter = new CodexAdmissionReporter(generation,
       () => this.hasFeature("codex_account_admission_signal_v1"),
       async (body, signal) => {
         // Dedicated transport; no state retries, error bodies or Retry-After parsing.
@@ -1323,10 +1349,12 @@ export class WorkerClient {
           { method: "POST", headers: { Authorization: "Bearer " + this.token,
             "Content-Type": "application/json", "X-Client-Version": this.version },
             body: JSON.stringify(body), signal });
+        if ([401, 403, 404].includes(response.status)) this.retireCodexAdmission(runId, owned);
         void response.body?.cancel().catch(() => {});
         return response.status;
       });
-    this.codexAdmission.set(runId, { generation: claim.claim_generation!, reporter });
+    const owned = { generation, reporter };
+    this.codexAdmission.set(runId, owned);
   }
 
   private sealCodexAdmission(path: string, body: unknown): void {
@@ -1340,8 +1368,8 @@ export class WorkerClient {
       ? !["running", "awaiting_approval"].includes(String(body.status))
       : endpoint === "completion/attempt" ? false
       : endpoint === "pause" ? false : true;
-    owned.reporter.seal(close);
-    // Retain the closed generation so an identical claim response cannot reopen it.
+    if (close) this.retireCodexAdmission(runId, owned);
+    else owned.reporter.seal();
   }
   private memoryRegistrationRevision = 0;
   private memoryIncarnationValue: MemoryIncarnation | undefined;
@@ -1475,7 +1503,8 @@ export class WorkerClient {
   private replaceServerFeatures(features: readonly string[]): void {
     this.serverFeatures = new Set(features);
     if (!this.hasFeature("codex_account_admission_signal_v1")) {
-      for (const owned of this.codexAdmission.values()) owned.reporter.seal(true);
+      this.codexAdmissionEpoch = {};
+      for (const owned of this.codexAdmission.values()) owned.reporter.seal();
     }
     if (!this.serverFeatures.has("worker_memory_pressure_v1")) this.revokeMemoryOnlyAuthority();
   }
@@ -1506,7 +1535,8 @@ export class WorkerClient {
     initialSnapshot?: ActiveSnapshot,
     maxCrossCheckSlots?: number,
   ): Promise<RegisterResponse> {
-    for (const owned of this.codexAdmission.values()) owned.reporter.seal(true);
+    this.codexAdmissionEpoch = {};
+    for (const owned of this.codexAdmission.values()) owned.reporter.seal();
     this.revokeInterruptedCallsAuthority();
     const interruptedEpoch = this.interruptedEpoch;
     const memoryRevision = ++this.memoryRegistrationRevision;
@@ -1626,7 +1656,8 @@ export class WorkerClient {
    *  rollback fallback succeeds, later ordinary heartbeat adverts can repopulate it. */
   clearFeatures(): void {
     this.serverFeatures.clear();
-    for (const owned of this.codexAdmission.values()) owned.reporter.seal(true);
+    this.codexAdmissionEpoch = {};
+    for (const owned of this.codexAdmission.values()) owned.reporter.seal();
     this.revokeMemoryAuthority();
     this.latestDindMaintenanceValue = undefined;
   }
@@ -1637,7 +1668,8 @@ export class WorkerClient {
   dropFeature(f: string): void {
     this.serverFeatures.delete(f);
     if (f === "codex_account_admission_signal_v1") {
-      for (const owned of this.codexAdmission.values()) owned.reporter.seal(true);
+      this.codexAdmissionEpoch = {};
+      for (const owned of this.codexAdmission.values()) owned.reporter.seal();
     }
     if (f === "worker_memory_pressure_v1") this.revokeMemoryOnlyAuthority();
   }
@@ -1820,6 +1852,7 @@ export class WorkerClient {
   }
 
   private async claimRunLane(path: string, activeSnapshot: ActiveSnapshot | undefined, signal: AbortSignal | undefined, timeoutMs: number, dedicated = false): Promise<ClaimResponse | null> {
+    const admissionEpoch = this.codexAdmissionEpoch;
     const incarnation = this.completionIncarnation;
     const ticket = this.beginCompletionObservation();
     try {
@@ -1933,7 +1966,7 @@ export class WorkerClient {
             (prior !== undefined && JSON.stringify(prior) !== JSON.stringify(next)) ? null : next);
         }
       }
-      this.bindCodexAdmission(claim);
+      this.bindCodexAdmission(claim, admissionEpoch);
       return claim;
     } finally { this.endCompletionObservation(ticket); }
   }
@@ -2440,6 +2473,8 @@ export class WorkerClient {
         !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
         !this.includeClaimGeneration(body.claim_generation)))
       throw new RevisionSourceFenceUnavailableError();
+    const admissionOwned = this.codexAdmission.get(runId);
+    const admissionRecord = admissionOwned?.generation === (admissionGeneration ?? body.claim_generation) ? admissionOwned : undefined;
     const incarnation = this.completionIncarnation;
     if (MaintenanceBudget.current()) signal = AbortSignal.any([MaintenanceBudget.current()!.signal, ...(signal ? [signal] : [])]);
     for (let attempt = 0; ; attempt++) {
@@ -2473,7 +2508,7 @@ export class WorkerClient {
           const fields = await readRunAck(res, maxAckBytes);
           if (fields.staleClaim === true ||
               (fields.status && !["claimed", "running", "awaiting_approval"].includes(fields.status)))
-            this.codexAdmissionReporter(runId, admissionGeneration ?? body.claim_generation)?.seal(true);
+            this.retireCodexAdmission(runId, admissionRecord);
           MaintenanceBudget.current()?.check();
           const ack: StateAck = {
             applied: res.status === 200,
@@ -3981,6 +4016,8 @@ export class WorkerClient {
     if (!Number.isSafeInteger(claimGeneration) || claimGeneration <= 0)
       throw new Error("worker pause requires positive claim_generation");
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/pause`;
+    const admissionOwned = this.codexAdmission.get(runId);
+    const admissionRecord = admissionOwned?.generation === claimGeneration ? admissionOwned : undefined;
     try {
       const res = await this.fetchRaw("POST", path, { claim_generation: claimGeneration }, this.httpTimeoutMs, signal);
       if (res.status !== 200 && res.status !== 409) throw await this.toError("POST", path, res);
@@ -3989,7 +4026,7 @@ export class WorkerClient {
         throw new RequestError("POST", path, res.status, "invalid worker pause acknowledgement");
       const ack: StateAck = { status: fields.status, applied: fields.applied };
       if (fields.staleClaim === true || !["claimed", "running", "awaiting_approval"].includes(fields.status))
-        this.codexAdmissionReporter(runId, claimGeneration)?.seal(true);
+        this.retireCodexAdmission(runId, admissionRecord);
       if (fields.holdReason !== undefined) ack.holdReason = fields.holdReason;
       if (fields.reason !== undefined) ack.reason = fields.reason;
       if (fields.staleClaim !== undefined) ack.staleClaim = fields.staleClaim;

@@ -1080,15 +1080,32 @@ network from provider/lifecycle handlers. It permits two HTTP attempts capped
 at three seconds each within ten seconds monotonic total. The implementation
 starts the budget at observation, including queue time, stricter than the
 first-send contract. The 32-entry bound includes the active send; overflow
-drops evidence. State/release/park seal pending work and abort retries before
-preservation; a reporting ACK is not a prerequisite. This signal path does
-not retain raw provider text.
+drops evidence. Nonclosing `running`/`awaiting_approval` state sends, pause
+intent and completion attempts seal queued work and unsent retries, leaving
+active HTTP to finish within its existing three-second attempt and ten-second
+observation bounds under the server's live-state fence. Ending authority
+permanently closes reporting and aborts active HTTP, allowing loss of the last
+attempt. Lifecycle and preservation do not wait for a reporting ACK. This
+signal path does not retain raw provider text.
 
-[The client](../agent/src/client.ts) retains generation/closed markers for
-1,024 distinct run IDs per client lifetime, then conservatively refuses new
-telemetry IDs while existing entries remain usable. This limits reporting,
-not claims or execution. Missing/refused feature support loses signals without
-a lifecycle effect; old workers still obey server admission.
+Correction to the reported lifetime cutoff (AI-synced 2026-10-27):
+[the client](../agent/src/client.ts) bounds `codexAdmission` at 1,024 live
+reporters and `codexAdmissionClosed` at 1,024 recent closed/refused run-generation
+high-water marks in FIFO order. Closing retires the live reporter and frees
+capacity for future bindings; there is no permanent lifetime run cutoff.
+Concurrent live overflow drops the telemetry binding but records its generation
+to fence older pending claim responses. Closed-cache eviction rotates
+`codexAdmissionEpoch`, so pre-eviction responses cannot rebind forgotten old
+authority; this may also drop unrelated pending telemetry bindings. It does
+not drop claims or execution. A fresh server `ClaimRun` increments
+`claim_generation`; retained closed handles stay inert.
+
+Registration and temporarily missing feature support seal pending work and
+suspend new reporting while support is absent; fresh attempts on live reporters
+resume when support is advertised. Claims started before registration or feature
+invalidation are ignored for telemetry binding through the observation epoch,
+without changing execution. Permanently closed, refused or stale-generation
+reporters remain closed; old workers still obey server admission.
 
 The supported API deployment remains singleton Recreate. Deploy the additive
 schema/API before workers. Application rollback leaves the schema in place;

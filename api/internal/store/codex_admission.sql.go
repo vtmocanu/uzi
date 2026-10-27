@@ -125,7 +125,10 @@ WITH inputs AS MATERIALIZED (
       AND s.disabled_at IS NULL AND s.kind = 'codex_auth' AND c.status = 'linked'
       AND c.material_revision = r.codex_material_revision
       AND a.credential_revision = r.codex_account_revision
-      AND r.codex_account_key::jsonb = jsonb_build_array(a.provider_user_id, a.workspace_account_id)
+      AND CASE WHEN pg_input_is_valid(r.codex_account_key, 'jsonb')
+               THEN r.codex_account_key::jsonb
+                    = jsonb_build_array(a.provider_user_id, a.workspace_account_id)
+               ELSE false END
 ), initial AS MATERIALIZED (
     SELECT codex_admission_transition(NULL::codex_account_admission_throttle,
         source.user_id, source.provider_account_id, $1::uuid, $4::bigint,

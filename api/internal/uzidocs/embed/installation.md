@@ -75,14 +75,31 @@ that budget at observation, including queue time, stricter than starting at
 first send. The pending queue holds 32 observations including the active
 send; overflow drops signals rather than inventing evidence.
 
-A worker client retains closed/generation markers for up to **1,024 distinct
-run IDs over that client's lifetime**. At that limit it conservatively refuses
-telemetry for new run IDs; existing tracked IDs remain eligible to report.
-This can reduce pressure evidence on a long-lived worker. It does **not**
-limit claims or runs. State, release and park paths seal pending reporting
-and abort unsent retries; preservation does not wait for a reporting ACK.
-The signal retains typed evidence rather than raw provider text and does not
-use Retry-After.
+The worker client has separate bounds of **1,024 live reporters** and
+**1,024 recent closed/refused generation markers**, correcting the previously
+reported lifetime cutoff. Closing removes the live reporter and frees capacity
+for future bindings. Concurrent live overflow drops the telemetry binding but
+records its generation to fence older pending responses. Closed markers retain
+recent generation high-water marks in FIFO order. Eviction rotates the claim
+observation epoch to prevent pre-eviction responses from rebinding forgotten
+old authority; unrelated pending telemetry bindings may also be dropped.
+Claims and execution continue. A fresh server claim increments the generation;
+retained closed handles stay inert.
+
+Nonclosing running/awaiting-approval state sends, pause intent and completion
+attempts seal queued work and unsent retries. Active HTTP may finish within
+its existing three-second attempt and ten-second observation bounds under the
+server's live-state fence. Ending authority permanently closes reporting and
+aborts active HTTP, allowing loss of the last attempt. Lifecycle and preservation
+do not wait for a reporting ACK.
+
+Registration and temporarily missing feature support discard pending work and
+suspend new reporting while support is absent. Fresh attempts on live reporters
+resume when support is advertised; closed, refused or stale-generation reporters
+stay closed. Claims started before registration or feature invalidation are
+ignored for telemetry binding through the observation epoch, without changing
+execution. The signal retains typed evidence rather than raw provider text and
+does not use Retry-After.
 
 An ordinary API restart reconstructs admission from persisted database state.
 Application rollback leaves the additive tables and view in place: an old

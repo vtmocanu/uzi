@@ -49,15 +49,16 @@ export class CodexAdmissionReporter {
   seal(close = false): void {
     this.epoch++;
     this.queue = [];
-    this.active?.abort();
+    if (close) this.active?.abort();
     this.closed ||= close;
   }
 
   /** Called synchronously immediately before the actual model dispatch. */
   begin(threadId: string): AdmissionAttempt {
-    if (!this.enabled()) this.seal(true);
+    const enabledAtDispatch = this.enabled();
+    if (!enabledAtDispatch) this.seal();
     return new AdmissionAttempt(randomUUID(), threadId, (id, turnId, kind) => {
-      if (this.closed || !this.enabled() || !Number.isSafeInteger(this.generation) || this.generation <= 0) return;
+      if (!enabledAtDispatch || this.closed || !this.enabled() || !Number.isSafeInteger(this.generation) || this.generation <= 0) return;
       if (this.queue.length + Number(this.active !== undefined) >= 32) return;
       const body: AdmissionSignal = { claim_generation: this.generation, attempt_id: id, class: kind,
         provider_thread_id: threadId, provider_turn_id: turnId };
@@ -88,7 +89,9 @@ export class CodexAdmissionReporter {
           let status: number;
           try {
             status = await Promise.race([
-              Promise.resolve().then(() => controller.signal.aborted ? 0 : this.send(entry.body, controller.signal)).catch(() => 0),
+              Promise.resolve().then(() =>
+                controller.signal.aborted || entry.epoch !== this.epoch || this.closed || !this.enabled()
+                  ? 0 : this.send(entry.body, controller.signal)).catch(() => 0),
               cancelled,
             ]);
           } finally {

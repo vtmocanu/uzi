@@ -101,6 +101,55 @@ func TestWorkerCodexAdmissionPersistedLiveDB(t *testing.T) {
 		router.ServeHTTP(rec, req)
 		return rec
 	}
+	t.Run("malformed frozen binding is refused without mutation", func(t *testing.T) {
+		var validKey string
+		if err := pool.QueryRow(ctx, "SELECT codex_account_key FROM runs WHERE id=$1", run).Scan(&validKey); err != nil {
+			t.Fatal(err)
+		}
+		snapshot := func(t *testing.T) string {
+			t.Helper()
+			var state string
+			// Include the full run (status, claim generation and release included) and
+			// every owner throttle row, including receipts; absence must stay absence.
+			if err := pool.QueryRow(ctx, `SELECT jsonb_build_object(
+				'run', (SELECT to_jsonb(r) FROM runs r WHERE r.id=$1),
+				'throttles', (SELECT coalesce(jsonb_agg(to_jsonb(s) ORDER BY s.provider_account_id), '[]'::jsonb)
+					FROM codex_account_admission_throttle s WHERE s.user_id=$2))::text`,
+				run, owner).Scan(&state); err != nil {
+				t.Fatal(err)
+			}
+			return state
+		}
+		for _, tc := range []struct {
+			name string
+			key  string
+		}{
+			{"empty", ""},
+			{"invalid token", "not-json"},
+			{"truncated array", `["principal"`},
+			{"JSON null", "null"},
+			{"JSON object", "{}"},
+			{"JSON scalar", `"principal"`},
+			{"nonmatching tuple", `["other-principal","other-workspace"]`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				mustExecT(ctx, t, pool, "UPDATE runs SET codex_account_key=$2 WHERE id=$1", run, tc.key)
+				t.Cleanup(func() {
+					mustExecT(ctx, t, pool, "UPDATE runs SET codex_account_key=$2 WHERE id=$1", run, validKey)
+				})
+				before := snapshot(t)
+				rec := post()
+				if rec.Code != http.StatusNotFound {
+					t.Errorf("malformed binding POST = %d %s, want 404", rec.Code, rec.Body.String())
+				}
+				if after := snapshot(t); after != before {
+					t.Fatalf("refused admission mutated run or throttle state: before=%s after=%s", before, after)
+				}
+			})
+		}
+	})
+	// Reuse the exact Bearer, run, generation and attempt after restoring the
+	// valid frozen tuple: refusals must not consume this observation's identity.
 	rec := post()
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("POST = %d %s", rec.Code, rec.Body.String())
