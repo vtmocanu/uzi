@@ -627,8 +627,13 @@ describe("M2 Codex idle typed ACK and custody", () => {
     });
   });
 
-  for (const ack of ["held", "missing cause", "wrong cause", "statusless", "strict refusal", "validation refusal"] as const) {
-    it(`M2 ${ack} keeps source with no false automatic-resume promise`, async t => {
+  for (const { ack, kind } of [
+    ...(["held", "missing cause", "wrong cause", "statusless", "strict refusal", "validation refusal"] as const)
+      .map(ack => ({ ack, kind: "productive" as const })),
+    ...(["strict refusal", "validation refusal"] as const)
+      .map(ack => ({ ack, kind: "zero_evidence" as const })),
+  ]) {
+    it(`M2 ${kind} ${ack} keeps source with no false automatic-resume promise`, async t => {
       await withHome(async home => {
         client.protocolFeatures = ["claim_generation_fence", feature];
         api.stateAckWire = (body, run) => {
@@ -638,16 +643,24 @@ describe("M2 Codex idle typed ACK and custody", () => {
             recovery_wait_cause: ack === "held" ? "codex_idle_stall" : ack === "wrong cause" ? "provider_outage" : undefined,
           } } };
         };
-        const rig = rigFor("codex", { error: () => new TransientRecoveryError("idle", { idleStallKind: "productive" }) }, home);
-        const claim = gitlabClaim(3510, { claim_generation: 3 });
         const refusal = ack.endsWith("refusal");
-        if (refusal) api.failStateWhen(claim.run_id, b => b.recovery_cause === "codex_idle_stall",
-          { httpStatus: 400, error: ack === "strict refusal" ? "invalid request body" : "invalid progress" });
+        const rig = rigFor("codex", { turns: refusal ? 2 : 0,
+          error: () => new TransientRecoveryError("idle", { idleStallKind: kind }) }, home);
+        const claim = gitlabClaim(3510, { claim_generation: 3 });
+        const refusedBodies: Parameters<typeof client.reportState>[1][] = [];
+        const refuseNext = () => api.failStateWhen(claim.run_id, body => {
+          if (body.status !== "recovery_wait") return false;
+          refusedBodies.push({ ...body });
+          return true;
+        }, { httpStatus: 400, error: ack === "strict refusal" ? "invalid request body" : "invalid progress" });
+        if (refusal) refuseNext();
         let reports = 0;
+        const reportBodies: Parameters<typeof client.reportState>[1][] = [];
         const report = client.reportState.bind(client);
         t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
           if (args[1].status === "recovery_wait") {
             reports++;
+            reportBodies.push({ ...args[1] });
             assert.equal(args[1].recovery_cause, "codex_idle_stall", "no untyped resend");
           }
           return report(...args);
@@ -655,9 +668,14 @@ describe("M2 Codex idle typed ACK and custody", () => {
         const wait = rig.runner["waitRecoveryRetry"].bind(rig.runner);
         let waits = 0;
         t.mock.method(rig.runner as unknown as { waitRecoveryRetry: typeof wait }, "waitRecoveryRetry", async (...args: Parameters<typeof wait>) => {
-          // The first unconfirmed report must reach retry, then shutdown bounds this fixture.
-          assert.equal(reports, 1);
           waits++;
+          assert.equal(reports, waits);
+          if (refusal && waits === 1) {
+            assert.equal(refusedBodies.length, 1, "first actual HTTP request refused");
+            refuseNext();
+            return;
+          }
+          // Refusals get two actual requests without backoff; shutdown bounds all other retries at one.
           rig.runner.shutdown();
           return wait(...args);
         });
@@ -666,11 +684,22 @@ describe("M2 Codex idle typed ACK and custody", () => {
           if (ack === "held") await executing;
           else await assert.rejects(executing, { name: "AbortError" });
         } finally { rig.runner.shutdown(); t.mock.restoreAll(); }
-        assert.equal(reports, 1);
-        assert.equal(waits, ack === "held" ? 0 : 1);
+        assert.equal(reports, refusal ? 2 : 1);
+        assert.equal(waits, ack === "held" ? 0 : refusal ? 2 : 1);
+        if (refusal) {
+          assert.equal(refusedBodies.length, 2, "both retries reached the actual HTTP refusal hook");
+          for (const body of [...reportBodies, ...refusedBodies]) {
+            assert.equal(body.recovery_cause, "codex_idle_stall", "no untyped fallback, including internal client resends");
+            assert.equal(body.claim_generation, 3);
+            assert.equal(body.provider_progress_turns, 2, "settled progress is independent of idle kind");
+            assert.equal(body.productive_turns, undefined);
+            assert.deepEqual(body, refusedBodies[0], "the complete typed request stays frozen across retry");
+          }
+        }
         assert.equal(parks(claim.run_id).length, refusal ? 0 : 1, "refusal never persists");
         assert.equal(rig.custody(), ack === "held" ? 1 : 0, "only exact typed ACK authorizes settlement");
         assert.ok(fs.existsSync(worktreeDirFor(3510)), "source retained");
+        assert.ok(fs.existsSync(rig.homePath()), "HOME retained");
         assert.ok(!feedTexts(claim.run_id).some(t => /resumes automatically/.test(t)));
         if (ack === "held") assert.ok(feedTexts(claim.run_id).some(t => /waits for its owner/.test(t)));
       });
