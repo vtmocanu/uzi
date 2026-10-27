@@ -117,6 +117,8 @@ func TestRetainedParkOwnerCancelLiveDB(t *testing.T) {
 				svc := e.diskParkService(t, 3)
 				svc.p.RunRetainedRecoveryMaxParks = cap
 				w := e.seedWorker(t, nil)
+				// The retained worker stays live for its other runs after this flight parks.
+				e.exec(t, "UPDATE workers SET last_heartbeat_at=now() WHERE id=$1", w)
 				id := e.fpSeedRunning(t, w, 1)
 				hold := mhOpenHold(t, e, id, 1, w)
 				capture := uuid.New()
@@ -164,6 +166,9 @@ func TestRetainedParkOwnerCancelLiveDB(t *testing.T) {
 					}
 				}
 				sourceBefore := custodySnapshot()
+				if live, err := svc.hasLivePoller(e.ctx, readRun()); err != nil || !live {
+					t.Fatalf("fixture must have a live poller before parking: live=%v err=%v", live, err)
+				}
 				if _, ok, err := svc.SetState(e.ctx, store.Worker{ID: w}, id, retainedReportCause(1, cause)); err != nil || !ok {
 					t.Fatalf("park=%v %v", ok, err)
 				}
