@@ -168,7 +168,15 @@ export async function mkdirPrivate(dir: string, uid: number): Promise<boolean> {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
     throw error;
   }
-  const handle = await fsp.open(dir, fsc.O_RDONLY | fsc.O_DIRECTORY | fsc.O_NOFOLLOW);
+  let handle: fsp.FileHandle;
+  try { handle = await fsp.open(dir, fsc.O_RDONLY | fsc.O_DIRECTORY | fsc.O_NOFOLLOW); }
+  catch (error) {
+    // The name was swapped or removed between mkdir and open: a refusal, not a raw errno.
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") throw new AuthorityRefusal("authority directory vanished after it was created");
+    if (code === "ELOOP" || code === "ENOTDIR") throw new AuthorityRefusal("unsafe authority directory");
+    throw new AuthorityRefusal(`authority directory unavailable: ${code ?? errorText(error)}`);
+  }
   try {
     const stat = await handle.stat({ bigint: true });
     if (!stat.isDirectory() || stat.uid !== BigInt(uid)) throw new AuthorityRefusal("unsafe authority directory");
@@ -215,22 +223,22 @@ async function openLockFile(ctx: Context, name: string): Promise<{ handle: fsp.F
     const base = fsc.O_RDWR | fsc.O_NOFOLLOW | fsc.O_NONBLOCK;
     let handle: fsp.FileHandle;
     let created = false;
-    try {
-      try {
-        handle = await fsp.open(viaDir, base | fsc.O_CREAT | fsc.O_EXCL, 0o600);
-        created = true;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        handle = await fsp.open(viaDir, base);
-      }
-    } catch (error) {
-      // Every failure of the via-directory open is a refusal with context, not a raw errno. ENOENT
-      // here means the descriptor path itself is unavailable (no procfs), since the directory is held.
-      if (error instanceof AuthorityRefusal) throw error;
+    // Every failure of the via-directory open is a refusal with context, not a raw errno.
+    const refuseOpen = (error: unknown, enoent: string): never => {
       const code = (error as NodeJS.ErrnoException).code;
-      throw new AuthorityRefusal(code === "ENOENT"
-        ? "authority lock requires /proc/self/fd"
-        : `authority lock open failed: ${code ?? errorText(error)}`);
+      throw new AuthorityRefusal(code === "ENOENT" ? enoent : `authority lock open failed: ${code ?? errorText(error)}`);
+    };
+    try {
+      handle = await fsp.open(viaDir, base | fsc.O_CREAT | fsc.O_EXCL, 0o600);
+      created = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        // ENOENT on the O_CREAT open means the descriptor path itself is unavailable (no procfs),
+        // since the directory is held and creation needs no existing file.
+        return refuseOpen(error, "authority lock requires /proc/self/fd");
+      }
+      try { handle = await fsp.open(viaDir, base); }
+      catch (reopen) { return refuseOpen(reopen, "authority lock file vanished after it was found to exist"); }
     }
     try {
       if (created) {

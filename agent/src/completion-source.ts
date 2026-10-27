@@ -254,16 +254,6 @@ export function sourceFenceOf(source: CompletionSourceV2): CompletionSourceFence
 // ---- certificates -----------------------------------------------------------------------
 
 /**
- * Mint the certificate for a core. Only the exact live lease of the source's slot can obtain
- * one (same epoch and slot, slot active and owned by this worker); see AuthorityStore.certifySource.
- */
-export function certifySourceCore(
-  tx: AuthorityTransaction, store: AuthorityStore, lease: SourceUseLease, source: CompletionSourceV2,
-): Promise<CompletionSourceV2> {
-  return store.certifySource(tx, lease, source);
-}
-
-/**
  * Decode a stored source and require a certificate valid under this store's key. This is a pure
  * MAC check: it proves the core was certified, not that it is still the published source. Use
  * `verifyPublishedSource` for freshness.
@@ -324,17 +314,32 @@ function core(input: CoreInput, extra: Partial<CompletionSourceV2> & Pick<Comple
  * `accepts` (for example `(seal, use) => executor.acceptsLifetimeSeal(seal, use)`) must still
  * accept it. There is no plain-material input.
  */
-export function buildCodexSourceCore(input: CoreInput & {
+export function buildCodexSourceCore(input: CoreInput & CodexSealInput): CompletionSourceV2 {
+  const { executorIncarnation, registryFacadePairs } = codexSealFields(input.lease, input);
+  return core(input, { harness: "codex", executorIncarnation, registryFacadePairs });
+}
+
+/** The terminal seal a codex source is derived from, and the executor's current acceptance of it. */
+export interface CodexSealInput {
   seal: unknown;
   accepts: (seal: unknown, sourceUse: object) => boolean;
-}): CompletionSourceV2 {
+}
+
+/**
+ * The codex-only source fields, derived from an opaque terminal seal. The material comes only
+ * from `terminalSealMaterial(seal)`; the seal must have been sealed for exactly this lease and
+ * `accepts` must still accept it. The store re-derives them with this same function to certify.
+ */
+export function codexSealFields(
+  lease: SourceUseLease, input: CodexSealInput,
+): { executorIncarnation: string; registryFacadePairs: [string, string][] } {
   const material = terminalSealMaterial(input.seal);
   if (!material) throw new AuthorityRefusal("not a terminal seal");
-  if (material.sourceUse !== input.lease) throw new AuthorityRefusal("terminal seal belongs to another source use");
-  if (input.accepts(input.seal, input.lease) !== true) throw new AuthorityRefusal("terminal seal is not accepted");
-  const pairs = material.incarnations.map((i): [string, string] => [i.registry, i.facade])
+  if (material.sourceUse !== lease) throw new AuthorityRefusal("terminal seal belongs to another source use");
+  if (input.accepts(input.seal, lease) !== true) throw new AuthorityRefusal("terminal seal is not accepted");
+  const registryFacadePairs = material.incarnations.map((i): [string, string] => [i.registry, i.facade])
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-  return core(input, { harness: "codex", executorIncarnation: material.executorIncarnation, registryFacadePairs: pairs });
+  return { executorIncarnation: material.executorIncarnation, registryFacadePairs };
 }
 
 /** Uncertified claude core: no executor, registry or facade incarnations. */

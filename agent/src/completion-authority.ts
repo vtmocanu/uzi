@@ -6,7 +6,9 @@ import {
   AuthorityRefusal, isPrivateDirMode, mkdirPrivate, requireSupportedStorage, transactionContext, type AuthorityTransaction,
   type WorkerLifetime,
 } from "./authority-lock.js";
-import { type CompletionSourceV2, parseCompletionSourceV2, sourceCoreDigest } from "./completion-source.js";
+import {
+  type CodexSealInput, codexSealFields, type CompletionSourceV2, parseCompletionSourceV2, sourceCoreDigest,
+} from "./completion-source.js";
 
 // Completion-authority enrollment and durable source-use slots (issue #3404 M1a).
 // DORMANT: nothing in production calls the slot API yet; it changes no release
@@ -16,11 +18,12 @@ import { type CompletionSourceV2, parseCompletionSourceV2, sourceCoreDigest } fr
 // Harness and the sticky codex marker: the harness is bound when a lease is minted (an executor
 // present means codex, absent means claude) and recorded on the lease. A slot admitted with an
 // executor, at any time, carries `codexMarked` in its MAC'd body; it survives re-admission,
-// ineligible, retiring and the retired tombstone, so a reused path can never publish claude_ready.
+// ineligible, retiring and the retired tombstone, so within this process (see Rollback) a reused
+// path cannot publish claude_ready.
 // Publication takes the CERTIFIED source itself (see transition) and derives the digest and the
 // run/generation of the cohort from it.
 //
-// Files (all 0600 under the 0700 `<dataDir>/.uzi-authority/`, never persisting st_dev/st_ino):
+// Files (all 0600 under the 0700 (S_ISGID tolerated, see Directory modes) `<dataDir>/.uzi-authority/`, never persisting st_dev/st_ino):
 //   enrollment.json        authenticated storage UUID + layout version + canonical data root
 //   heads/<xx>.json       256 MAC'd head shards (xx = first two hex digits of the slot key):
 //                         latest slot seq per slot key in that shard (freshness)
@@ -56,12 +59,15 @@ import { type CompletionSourceV2, parseCompletionSourceV2, sourceCoreDigest } fr
 // setgid parent such as a Kubernetes fsGroup volume would pass down); an existing one is accepted
 // with or without S_ISGID. No check compares a gid.
 //
-// Rollback: the in-process high-water mark (module level, keyed by storage id, so reopening the
-// store per transaction keeps it) catches any restore within this process. Across a restart,
-// the undetected rollback is restoring a head shard together with the slot(s) of the keys being
-// read, up to and including the whole store (for example a volume snapshot restore); detection
-// of that case is in-process only. A deleted shard refuses, as does an older shard with a
-// newer slot (more than one ahead) or an older slot under a newer shard.
+// Rollback. Within one process, any restore or reset is detected: the high-water mark (module
+// level, keyed by storage id, so reopening the store per transaction keeps it) catches a restored
+// slot or shard, and a module-level latch per canonical data root records the storage id this
+// process opened, so a later open that finds no enrollment (a full reset of enrollment.json,
+// heads/ and slots/) or another storage id refuses instead of re-enrolling. Across a restart
+// nothing remembers the high-water mark or the latch: restoring a head shard together with the
+// slot(s) of the keys being read, up to and including the whole store (a volume snapshot restore
+// or a full reset), is NOT detected and is out of scope. A deleted shard refuses, as does an
+// older shard with a newer slot (more than one ahead) or an older slot under a newer shard.
 
 /** Authority layout identity; exposed as `AuthorityStore.layout` for completion-source.ts. */
 const AUTHORITY_LAYOUT = "uzi-authority-layout/1";
@@ -448,6 +454,14 @@ async function ensurePrivateDir(dir: string, parent: string, uid: number, ops: A
   }
 }
 
+/**
+ * Storage id this process opened (or created) per canonical data root, for the life of the
+ * process. The high-water marks and the codex marker are keyed by storage id, so a reset that
+ * mints a fresh id would otherwise start them over; a later open that finds no enrollment, or
+ * another id, refuses instead.
+ */
+const enrolledStorage = new Map<string, string>();
+
 const SHARD_NAMES: readonly string[] = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
 const STALE_HEADS_TMP = /^\.heads\.[0-9a-f-]{36}\.tmp$/;
 
@@ -578,7 +592,11 @@ export async function openAuthorityStore(tx: AuthorityTransaction, options: Auth
   try { await fsp.lstat(headsDir); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; headsExist = false; }
   let enrollment: Enrollment;
+  const latched = enrolledStorage.get(ctx.dataDir);
   if (existing === null) {
+    // This process already opened an enrolled store here: a store without an enrollment now was
+    // reset (enrollment, heads and slots removed), and re-enrolling would drop every high-water mark.
+    if (latched !== undefined) throw new AuthorityRefusal("authority store was reset after this process enrolled it");
     let entries: string[] = [];
     try { entries = await fsp.readdir(slotsDir); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -603,7 +621,11 @@ export async function openAuthorityStore(tx: AuthorityTransaction, options: Auth
     // An enrolled store always has its heads: absent means deleted, never "not created yet".
     if (!headsExist) throw new AuthorityRefusal("enrolled authority store has no heads");
     await requireCompleteHeads({ dir: ctx.authorityDir, uid: ctx.uid });
+    if (latched !== undefined && latched !== enrollment.storageId) {
+      throw new AuthorityRefusal("authority store was replaced after this process enrolled it");
+    }
   }
+  enrolledStorage.set(ctx.dataDir, enrollment.storageId);
   return new AuthorityStore(storeBrand, {
     key, storageId: enrollment.storageId, ctxDir: ctx.authorityDir, dataDir: ctx.dataDir, uid: ctx.uid,
     incarnation: options.workerIncarnation ?? PROCESS_INCARNATION, ops,
@@ -652,11 +674,25 @@ export class AuthorityStore {
    * the slot can obtain a certificate: the slot must be active and owned by this worker under
    * the lease's epoch, and the source must carry that epoch, name this slot, this worker, the
    * lease's harness and (codex) the slot's executor. A claude source is refused for a slot that
-   * was ever admitted as codex.
+   * was ever admitted as codex. A codex source additionally needs the actual terminal seal: the
+   * store derives the executor incarnation and registry/facade pairs from `terminalSealMaterial`
+   * itself (the seal must be for this lease and still accepted) and requires the source to carry
+   * exactly those, so a hand-built codex core cannot be certified. A claude lease takes no seal.
    */
-  async certifySource(tx: AuthorityTransaction, lease: SourceUseLease, value: unknown): Promise<CompletionSourceV2> {
+  async certifySource(
+    tx: AuthorityTransaction, lease: SourceUseLease, value: unknown, codex?: CodexSealInput,
+  ): Promise<CompletionSourceV2> {
     const { body, held } = await this.#owned(tx, lease);
     const source = await this.#bindSource(tx, held, body, value);
+    if (held.harness === "codex") {
+      if (codex === undefined) throw new AuthorityRefusal("codex source needs its terminal seal");
+      const derived = codexSealFields(lease, codex);
+      if (derived.executorIncarnation !== body.owner.executor ||
+          source.executorIncarnation !== derived.executorIncarnation ||
+          JSON.stringify(source.registryFacadePairs) !== JSON.stringify(derived.registryFacadePairs)) {
+        throw new AuthorityRefusal("source does not match the terminal seal");
+      }
+    } else if (codex !== undefined) throw new AuthorityRefusal("a claude source takes no terminal seal");
     const { certificate: _old, ...bare } = source;
     return { ...bare, certificate: this.#certificate(sourceCoreDigest(bare)) };
   }

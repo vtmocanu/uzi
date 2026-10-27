@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import fs, { constants as fsConstants } from "node:fs";
 import fsp from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
@@ -84,7 +84,7 @@ async function certifiedFor(f: Fixture, s: AuthorityStore, t2: AuthorityTransact
   const core = leaseHarness(lease) === "codex" && seals
     ? buildCodexSourceCore({ store: s, base, lease, seal: seals.seal, accepts: (seal, use) => seals.lifetime.accepts(seal, use) })
     : buildClaudeSourceCore({ store: s, base, lease });
-  const certified = await s.certifySource(t2, lease, core);
+  const certified = await s.certifySource(t2, lease, core, seals ? { seal: seals.seal, accepts: (seal, use) => seals.lifetime.accepts(seal, use) } : undefined);
   leaseSources.set(lease, certified);
   return certified;
 }
@@ -151,13 +151,45 @@ test("enrollment authentication: tamper, missing MAC, wrong token and replacemen
   await assert.rejects(store(f), /unreadable authority file/);
 });
 
-test("slot files without an enrollment refuse rather than re-enroll", async (t) => {
-  const f = await fixture(t);
-  const s = await store(f);
-  await tx(f, (t2) => s.admitSourceUse(t2, source(f)));
+test("slot files without an enrollment refuse rather than re-enroll (across a restart)", async (t) => {
+  const root = makeTmp(t);
+  const src = path.join(root, "runner", "repo-a");
+  fs.mkdirSync(src, { recursive: true });
+  setupInChild(root, src, makeTmp(t, "authority-backup-"), "admit");
+  const f = await restarted(root);
   fs.rmSync(enrollmentFile(f));
   await assert.rejects(store(f), /without an enrollment/);
   assert.equal(fs.existsSync(enrollmentFile(f)), false);
+});
+
+test("a full mid-process reset of enrollment, heads and slots refuses instead of minting a fresh storage id", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const lease = await tx(f, (t2) => admitCodex(s, t2, src));
+  await tx(f, (t2) => publish(f, s, t2, lease, "sealed"));
+  // Lock files stay; everything that carries the storage id goes.
+  fs.rmSync(enrollmentFile(f));
+  fs.rmSync(path.join(authorityDir(f), "heads"), { recursive: true });
+  fs.rmSync(slotsDir(f), { recursive: true });
+  await assert.rejects(store(f), /reset after this process enrolled it/);
+  assert.equal(fs.existsSync(enrollmentFile(f)), false, "nothing was re-enrolled");
+  assert.equal(fs.existsSync(path.join(authorityDir(f), "heads")), false, "no fresh heads were created");
+  // The store handle opened before the reset cannot be used to re-admit the path either.
+  const reused = await tx(f, (t2) => s.admitSourceUse(t2, src)).then(() => undefined, (error: unknown) => error);
+  assert.ok(reused instanceof AuthorityRefusal, String(reused));
+});
+
+test("an authentic enrollment of another storage id replaced mid-process refuses", async (t) => {
+  const f = await fixture(t);
+  await store(f);
+  const original = JSON.parse(fs.readFileSync(enrollmentFile(f), "utf8")) as Record<string, string>;
+  const { mac: _mac, ...body } = original;
+  body.storageId = randomUUID();
+  const hmacKey = createHmac("sha256", TOKEN).update("uzi completion authority v1").digest();
+  const mac = createHmac("sha256", hmacKey).update(`uzi-authority-record\0enrollment\0${JSON.stringify(body)}`).digest("hex");
+  fs.writeFileSync(enrollmentFile(f), JSON.stringify({ ...body, mac }) + "\n", { mode: 0o600 });
+  await assert.rejects(store(f), /replaced after this process enrolled it/);
 });
 
 test("an alternate logical root spelling refuses; a copied enrollment at another root refuses", async (t) => {
@@ -809,7 +841,9 @@ test("publication takes the certified source: any foreign epoch, slot, worker, e
   const xSrc = source(f, "runner/px");
   const xLease = await tx(f, (t2) => admitCodex(s, t2, xSrc));
   const xSource = await tx(f, (t2) => certifiedFor(f, s, t2, xLease));
-  const wrongExecutor = await tx(f, (t2) => s.certifySource(t2, xLease, { ...xSource, executorIncarnation: "exec-forged" }).catch((e: unknown) => e));
+  const xSeal = leaseSeals.get(xLease)!;
+  const wrongExecutor = await tx(f, (t2) => s.certifySource(t2, xLease, { ...xSource, executorIncarnation: "exec-forged" },
+    { seal: xSeal.seal, accepts: (seal, use) => xSeal.lifetime.accepts(seal, use) }).catch((e: unknown) => e));
   assert.match(String((wrongExecutor as Error).message), /executor does not match/);
   await tx(f, (t2) => s.transition(t2, xLease, "sealed", { source: xSource, captureIds: CAPS }));
 });
@@ -1091,24 +1125,57 @@ test("an enrolled store whose heads and slots were both deleted refuses instead 
   await assert.rejects(store(bare), /enrolled authority store has no heads/);
 });
 
+/** A crash between the heads rename and the enrollment write: the enrollment rename fails, the heads stay. */
+async function crashBeforeEnrollment(f: Fixture): Promise<void> {
+  const ops: AuthorityFsOps = {
+    syncFile: (h) => h.sync(), syncDir: (h) => h.sync(),
+    rename: async (a, b) => {
+      if (path.basename(b) === "enrollment.json") throw new Error("injected enrollment rename failure");
+      fs.renameSync(a, b);
+    },
+  };
+  await assert.rejects(store(f, { ops }), /injected enrollment rename failure/);
+  assert.equal(fs.existsSync(enrollmentFile(f)), false);
+  assert.equal(fs.readdirSync(path.join(authorityDir(f), "heads")).length, 256);
+}
+const headStorageId = (f: Fixture, shard = "00"): string =>
+  (JSON.parse(fs.readFileSync(path.join(authorityDir(f), "heads", `${shard}.json`), "utf8")) as { storageId: string }).storageId;
+
 test("heads written but enrollment missing (crash window) is adopted when empty and refused otherwise", async (t) => {
   const f = await fixture(t);
-  await store(f);
-  const headOf = (): { storageId: string } =>
-    JSON.parse(fs.readFileSync(path.join(authorityDir(f), "heads", "00.json"), "utf8")) as { storageId: string };
-  const before = headOf().storageId;
-  fs.rmSync(enrollmentFile(f));
+  await crashBeforeEnrollment(f);
+  const before = headStorageId(f);
   const reopened = await store(f);
+  assert.equal(reopened.storageId, before);
   assert.equal((JSON.parse(fs.readFileSync(enrollmentFile(f), "utf8")) as { storageId: string }).storageId, before);
   const src = source(f);
   const key = await tx(f, (t2) => reopened.slotKey(t2, src));
   await tx(f, (t2) => reopened.admitSourceUse(t2, src));
   assert.equal((await tx(f, (t2) => reopened.readSlot(t2, key)))?.seq, 1);
 
-  // A non-empty head set without an enrollment is a reset attempt, not a crash window.
-  fs.rmSync(enrollmentFile(f));
-  fs.rmSync(slotsDir(f), { recursive: true });
+  // A non-empty head set without an enrollment is a reset attempt, not a crash window (a restarted process).
+  const root = makeTmp(t);
+  const src2 = path.join(root, "runner", "repo-a");
+  fs.mkdirSync(src2, { recursive: true });
+  setupInChild(root, src2, makeTmp(t, "authority-backup-"), "admit");
+  const g = await restarted(root);
+  fs.rmSync(enrollmentFile(g));
+  fs.rmSync(slotsDir(g), { recursive: true });
+  await assert.rejects(store(g), /authority heads exist without an enrollment/);
+});
+
+test("adoption refuses heads whose shards carry more than one storage id", async (t) => {
+  const f = await fixture(t);
+  await crashBeforeEnrollment(f);
+  const other = await fixture(t);
+  await store(other);
+  assert.notEqual(headStorageId(other, "05"), headStorageId(f, "05"));
+  // An authentic shard (same key) of another store: every shard alone is valid, the set is not one storage.
+  const target = path.join(authorityDir(f), "heads", "05.json");
+  fs.copyFileSync(path.join(authorityDir(other), "heads", "05.json"), target);
+  fs.chmodSync(target, 0o600);
   await assert.rejects(store(f), /authority heads exist without an enrollment/);
+  assert.equal(fs.existsSync(enrollmentFile(f)), false, "nothing was enrolled over mixed heads");
 });
 
 test("a leftover heads staging directory is removed when the heads are created", async (t) => {

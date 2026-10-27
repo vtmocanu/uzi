@@ -7,7 +7,7 @@ import path from "node:path";
 import { mock, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import {
-  acquireWorkerLifetime, AuthorityRefusal, AuthorityTransaction, WorkerLifetime, withAuthorityTransaction,
+  acquireWorkerLifetime, AuthorityRefusal, AuthorityTransaction, mkdirPrivate, WorkerLifetime, withAuthorityTransaction,
 } from "../src/authority-lock.js";
 import { makeTmp, spawnWorkerLockHolder, testLockOptions, utilLinux } from "./authority-test-support.js";
 
@@ -412,4 +412,44 @@ test("W: lock-open failures are authority refusals with context, not raw errnos"
   const noProc = await acquireWorkerLifetime(root, testLockOptions()).then(() => undefined, (error: unknown) => error);
   assert.ok(noProc instanceof AuthorityRefusal, String(noProc));
   assert.match((noProc as Error).message, /authority lock requires \/proc\/self\/fd/);
+});
+
+test("W: only the creating open's ENOENT blames procfs; a lock file that vanishes after EEXIST says so", async (t) => {
+  const root = makeTmp(t);
+  const realOpen = fsp.open;
+  const patched = mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+    if (typeof args[0] === "string" && args[0].startsWith("/proc/self/fd/")) {
+      const flags = typeof args[1] === "number" ? args[1] : 0;
+      const code = (flags & fsConstants.O_EXCL) !== 0 ? "EEXIST" : "ENOENT";
+      throw Object.assign(new Error(`${code}: injected`), { code });
+    }
+    return realOpen(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { patched.mock.restore(); syncBuiltinESMExports(); });
+  const vanished = await acquireWorkerLifetime(root, testLockOptions()).then(() => undefined, (error: unknown) => error);
+  assert.ok(vanished instanceof AuthorityRefusal, String(vanished));
+  assert.match((vanished as Error).message, /lock file vanished/);
+  assert.doesNotMatch((vanished as Error).message, /requires/);
+});
+
+test("mkdirPrivate turns a name swapped or removed right after mkdir into an authority refusal", async (t) => {
+  const realOpen = fsp.open;
+  let code = "ELOOP";
+  const patched = mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+    const flags = typeof args[1] === "number" ? args[1] : 0;
+    if (typeof args[0] === "string" && args[0].endsWith("/swapped") && (flags & fsConstants.O_DIRECTORY) !== 0) {
+      throw Object.assign(new Error(`${code}: injected`), { code });
+    }
+    return realOpen(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { patched.mock.restore(); syncBuiltinESMExports(); });
+  for (const [errno, message] of [["ELOOP", /unsafe authority directory/], ["ENOENT", /vanished/], ["EMFILE", /unavailable: EMFILE/]] as const) {
+    code = errno;
+    const root = makeTmp(t);
+    const refusal = await mkdirPrivate(path.join(root, "swapped"), process.getuid?.() ?? -1).then(() => undefined, (error: unknown) => error);
+    assert.ok(refusal instanceof AuthorityRefusal, `${errno}: ${String(refusal)}`);
+    assert.match((refusal as Error).message, message);
+  }
 });

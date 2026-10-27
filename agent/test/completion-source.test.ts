@@ -6,7 +6,7 @@ import { test, type TestContext } from "node:test";
 import { acquireWorkerLifetime, type AuthorityTransaction, withAuthorityTransaction } from "../src/authority-lock.js";
 import { type AuthorityStore, leaseEpoch, openAuthorityStore, type SourceUseLease } from "../src/completion-authority.js";
 import {
-  buildClaudeSourceCore, buildCodexSourceCore, certifySourceCore, type CompletionSourceV2, parseCompletionSourceV2,
+  buildClaudeSourceCore, buildCodexSourceCore, type CompletionSourceV2, parseCompletionSourceV2,
   parseSourceFence, parseSourceFenceJson, serializeSourceFence, sourceCoreDigest, sourceFenceOf, verifyCertifiedSource,
   verifyPublishedSource,
 } from "../src/completion-source.js";
@@ -36,7 +36,7 @@ async function fixture(t: TestContext, token = TOKEN): Promise<Fixture> {
   fs.mkdirSync(codexClone, { recursive: true });
   const lease = await run((t2) => store.admitSourceUse(t2, clone));
   const executor = new ExecutorLifetime();
-  const executorId = (executor as unknown as { executorIncarnation: string }).executorIncarnation;
+  const executorId = executor.executorIncarnation;
   const codexLease = await run((t2) => store.admitSourceUse(t2, codexClone, { executor: executorId }));
   const identity = {};
   executor.inventory(identity, () => true);
@@ -62,6 +62,8 @@ const expectation = (f: Fixture): { dataDir: string; storageId: string; layout: 
 const codex = (f: Fixture): CompletionSourceV2 => buildCodexSourceCore({
   store: f.store, base: f.codexBase, lease: f.codexLease, seal: f.seal, accepts: accepts(f.lifetime),
 });
+const codexSeal = (f: Fixture): { seal: unknown; accepts: (seal: unknown, use: object) => boolean } =>
+  ({ seal: f.seal, accepts: accepts(f.lifetime) });
 const claude = (f: Fixture): CompletionSourceV2 => buildClaudeSourceCore({ store: f.store, base: f.base, lease: f.lease });
 const clone = <T>(v: T): T => structuredClone(v);
 
@@ -244,7 +246,7 @@ test("the digest and the fence refuse what JSON would drop or conflate", async (
 
 test("only the exact live lease can certify, and a certificate verifies only under the store key", async (t) => {
   const f = await fixture(t);
-  const certified = await f.tx(async (t2) => certifySourceCore(t2, f.store, f.codexLease, codex(f)));
+  const certified = await f.tx(async (t2) => f.store.certifySource(t2, f.codexLease, codex(f), codexSeal(f)));
   assert.match(certified.certificate ?? "", /^[0-9a-f]{64}$/);
   const verified = await f.tx(async (t2) => verifyCertifiedSource(t2, f.store, JSON.parse(JSON.stringify(certified))));
   assert.deepEqual(verified, certified);
@@ -267,7 +269,7 @@ test("only the exact live lease can certify, and a certificate verifies only und
 
   // Another store key never verifies, even for the same digest.
   const other = await fixture(t, TOKEN + "-other");
-  const foreign = await other.tx(async (t2) => certifySourceCore(t2, other.store, other.codexLease, codex(other)));
+  const foreign = await other.tx(async (t2) => other.store.certifySource(t2, other.codexLease, codex(other), codexSeal(other)));
   assert.equal(
     await f.tx(async (t2) => f.store.verifySourceCertificate(t2, sourceCoreDigest(certified), foreign.certificate)), false,
   );
@@ -278,7 +280,7 @@ test("only the exact live lease can certify, and a certificate verifies only und
 test("certification refuses a source that is not the live lease's: slot, harness, epoch, worker, executor, state", async (t) => {
   const f = await fixture(t);
   const certify = (lease: SourceUseLease, source: unknown): Promise<CompletionSourceV2> =>
-    f.tx(async (t2) => certifySourceCore(t2, f.store, lease, source as CompletionSourceV2));
+    f.tx(async (t2) => f.store.certifySource(t2, lease, source as CompletionSourceV2, lease === f.codexLease ? codexSeal(f) : undefined));
   await assert.rejects(certify(f.lease, codex(f)), /another source-use epoch/);
   await assert.rejects(certify(f.codexLease, claude(f)), /another source-use epoch/);
   // Right epoch, right slot, right worker, wrong harness: only the harness check can refuse it.
@@ -302,11 +304,33 @@ test("certification refuses a source that is not the live lease's: slot, harness
   await assert.rejects(certify(f.lease, fresh), /not active/);
 });
 
+test("a codex source is certified only against the actual terminal seal, never a hand-built core", async (t) => {
+  const f = await fixture(t);
+  const certify = (source: unknown, seal?: { seal: unknown; accepts: (seal: unknown, use: object) => boolean }, lease = f.codexLease): Promise<CompletionSourceV2> =>
+    f.tx((t2) => f.store.certifySource(t2, lease, source as CompletionSourceV2, seal));
+  const genuine = codex(f);
+  // The slot owner's executor id with invented registry/facade incarnations: parses, binds, and used to certify.
+  const handBuilt = { ...genuine, registryFacadePairs: [["reg-invented", "fac-invented"]] };
+  await assert.rejects(certify(genuine), /needs its terminal seal/, "no seal at all");
+  await assert.rejects(certify(handBuilt), /needs its terminal seal/);
+  await assert.rejects(certify(handBuilt, codexSeal(f)), /does not match the terminal seal/, "invented pairs");
+  await assert.rejects(certify({ ...genuine, registryFacadePairs: [] }, codexSeal(f)), /does not match the terminal seal/, "dropped pairs");
+
+  const other = await fixture(t);
+  await assert.rejects(certify(genuine, codexSeal(other)), /another source use/, "a seal of another lease");
+  await assert.rejects(certify(genuine, { seal: {}, accepts: () => true }), /not a terminal seal/, "a look-alike seal");
+  await assert.rejects(certify(genuine, { seal: f.seal, accepts: () => false }), /not accepted/, "an executor that no longer accepts it");
+  await assert.rejects(certify(claude(f), codexSeal(f), f.lease), /takes no terminal seal/, "a claude lease takes no seal");
+
+  const certified = await certify(genuine, codexSeal(f));
+  assert.match(certified.certificate ?? "", /^[0-9a-f]{64}$/);
+});
+
 test("verifyPublishedSource needs the certificate AND the slot's current publication for the same epoch and digest", async (t) => {
   const f = await fixture(t);
-  const certified = await f.tx((t2) => certifySourceCore(t2, f.store, f.lease, claude(f)));
+  const certified = await f.tx((t2) => f.store.certifySource(t2, f.lease, claude(f)));
   await assert.rejects(f.tx((t2) => verifyPublishedSource(t2, f.store, certified)), /not the published source/, "active slot publishes nothing");
-  const rival = await f.tx((t2) => certifySourceCore(t2, f.store, f.lease, { ...claude(f), expectedHead: "c".repeat(40) }));
+  const rival = await f.tx((t2) => f.store.certifySource(t2, f.lease, { ...claude(f), expectedHead: "c".repeat(40) }));
   await f.tx((t2) => f.store.transition(t2, f.lease, "claude_ready", { source: certified, captureIds: CAP }));
   const published = await f.tx((t2) => verifyPublishedSource(t2, f.store, JSON.parse(JSON.stringify(certified))));
   assert.deepEqual(published.source, certified);
@@ -320,7 +344,7 @@ test("verifyPublishedSource needs the certificate AND the slot's current publica
   await f.tx((t2) => f.store.admitSourceUse(t2, f.clone));
   await assert.rejects(f.tx((t2) => verifyPublishedSource(t2, f.store, certified)), /not the published source/, "a new epoch supersedes it");
 
-  const sealedCodex = await f.tx((t2) => certifySourceCore(t2, f.store, f.codexLease, codex(f)));
+  const sealedCodex = await f.tx((t2) => f.store.certifySource(t2, f.codexLease, codex(f), codexSeal(f)));
   await f.tx((t2) => f.store.transition(t2, f.codexLease, "sealed", { source: sealedCodex, captureIds: CAP }));
   assert.equal((await f.tx((t2) => verifyPublishedSource(t2, f.store, sealedCodex))).publication.state, "sealed");
 });
