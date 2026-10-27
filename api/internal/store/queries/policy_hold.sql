@@ -135,6 +135,8 @@ WHERE run.id = @run_id
        OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
       AND ((run.status NOT IN ('completed', 'failed', 'cancelled') AND run.policy_refusal_count > 0 OR run.hold_reason = 'provider_policy_refusal') IS NOT TRUE
            OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
+  AND (run.checkpoint_coordinates IS NULL
+       OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -151,6 +153,10 @@ WHERE run.id = @run_id
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
            OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = run.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
+           OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+      AND (run.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = run.id)
+           OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (run.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = run.id

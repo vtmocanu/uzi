@@ -314,10 +314,10 @@ type CrossCheck struct {
 	Dispositions                    []byte             `json:"dispositions"`
 	FinalizedAt                     pgtype.Timestamptz `json:"finalized_at"`
 	RepoInstructionsCommit          pgtype.Text        `json:"repo_instructions_commit"`
+	Coverage                        []byte             `json:"coverage"`
 	RevisionDisposition             pgtype.Text        `json:"revision_disposition"`
 	RevisionSettledAt               pgtype.Timestamptz `json:"revision_settled_at"`
 	RevisionSupersededByStopInputID pgtype.Int8        `json:"revision_superseded_by_stop_input_id"`
-	Coverage                        []byte             `json:"coverage"`
 }
 
 type CustodyEpisodeNotice struct {
@@ -1110,6 +1110,8 @@ type Run struct {
 	CheckpointAttestedSource    pgtype.Text        `json:"checkpoint_attested_source"`
 	SourcePublicationIntent     []byte             `json:"source_publication_intent"`
 	ContinuedIssueIid           pgtype.Int8        `json:"continued_issue_iid"`
+	CheckpointCoordinates       []byte             `json:"checkpoint_coordinates"`
+	RetainedParkCount           int32              `json:"retained_park_count"`
 	PolicyRefusalCount          int32              `json:"policy_refusal_count"`
 	PolicyLastTag               pgtype.Text        `json:"policy_last_tag"`
 	PolicyLastPhase             pgtype.Text        `json:"policy_last_phase"`
@@ -1121,11 +1123,9 @@ type Run struct {
 	PolicyLastOutcomeID         pgtype.UUID        `json:"policy_last_outcome_id"`
 	PolicyLastSourceGeneration  pgtype.Int8        `json:"policy_last_source_generation"`
 	PolicyFreshClaimGeneration  pgtype.Int8        `json:"policy_fresh_claim_generation"`
-	CheckpointCoordinates       []byte             `json:"checkpoint_coordinates"`
 	PolicyStopResolution        []byte             `json:"policy_stop_resolution"`
 	PolicyRevisionSource        []byte             `json:"policy_revision_source"`
 	PolicyCandidateCrossCheckID pgtype.UUID        `json:"policy_candidate_cross_check_id"`
-	RetainedParkCount           int32              `json:"retained_park_count"`
 }
 
 type RunCompletionAttempt struct {
