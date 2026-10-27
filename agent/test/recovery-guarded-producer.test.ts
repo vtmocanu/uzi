@@ -243,7 +243,11 @@ it("force-push before and after capture leaves stale dependencies declared and f
     const publicTree = git(f.bare, "rev-parse", f.tip + "^{tree}");
     const forced = commit(f, publicTree, [], "new unrelated public history");
     git(f.bare, "push", "--force", f.forge, forced + ":refs/heads/main");
-    // Deliberately do not fetch: the direct worker cache remains stale.
+    // Git 2.56 can update the matching origin tracking ref even for a URL push.
+    // Establish the deliberately stale cache explicitly, independently of that behavior.
+    git(f.bare, "update-ref", "refs/remotes/origin/main", f.tip);
+    assert.equal(git(f.forge, "rev-parse", "refs/heads/main"), forced);
+    assert.equal(git(f.bare, "rev-parse", "refs/remotes/origin/main"), f.tip);
     const after = await produce(f, f.head, "after", 32 * 1024);
     assert.deepEqual(before.prerequisiteShas, [f.tip]);
     assert.deepEqual(after.prerequisiteShas, [f.tip]);
