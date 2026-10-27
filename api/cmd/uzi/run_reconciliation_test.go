@@ -199,7 +199,8 @@ func TestReconciliationReviewChangedGate(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := apitypes.RunDTO{ID: "r1", Status: tc.status, ResetStateDigest: strings.Repeat("b", 64),
-				GateRevision: 7, Milestones: tc.frozen, MilestonesCandidate: tc.candidate}
+				GateRevision: 7, Milestones: tc.frozen, MilestonesCandidate: tc.candidate,
+				RecoveryRetryNotBeforePresent: true} // Full JSON includes recovery_retry_not_before:null.
 			fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": r}}
 			out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
 			if code != 0 {
