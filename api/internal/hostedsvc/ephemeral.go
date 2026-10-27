@@ -367,6 +367,22 @@ func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID u
 		return false, err
 	}
 
+	// PRD #3454: re-check intake admission under the lock, before any count/evict/token/create.
+	// The demand queries filter at selection time, but the pause can be enabled between selection
+	// and here. Plain snapshot read (no row lock). A vanished run is skipped; any other error
+	// fails closed (the next pass retries).
+	admittable, err := qtx.RunAdmittableForEphemeralProvision(ctx, runID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !admittable {
+		slog.Debug("ephemeral provisioner: instance intake is paused and the run is not admitted; skipping", "run_id", runID)
+		return false, nil
+	}
+
 	n, err := qtx.CountEphemeralHostedWorkersForUser(ctx, userID)
 	if err != nil {
 		return false, err

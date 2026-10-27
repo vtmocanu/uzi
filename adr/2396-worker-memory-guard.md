@@ -46,6 +46,11 @@ Command admission feedback (#3436) distinguishes retirement, exhaustion, phase h
 
 Failed or uncertain capture retains local source, possibly its only copy, without an archive or latest-work guarantee. Available historical archives remain exportable independently of attention and do not authorize custody release. Migration [00342](../api/internal/store/migrations/00342_worker_memory_interventions.sql) retains discarded/released precedence, then classifies an OPEN hold at `recovery_wait` for either `worker_requeue_exhausted` or `worker_memory_pressure` as `needs_action` after failed latest capture, otherwise `source_only`, before available unguarded archives or capture progress. Other decisions remain unchanged. This approved extension amends [ADR-2445](2445-custody-admission-accounting.md) and [ADR-1742's 2026-10-08 amendment](1742-finalize-resume-allowance.md#amendment-2026-10-08--2445-exhaustion-attention).
 
+The later #3495 amendment in [ADR-1197](1197-transient-recovery-park.md) adds
+`retained_recovery_exhausted` to that conservative custody protection for its
+whole wait, including timed parks. This changes neither memory holds' owner-only
+Resume policy nor the proof required to release custody after a park ends.
+
 ### D7: Rollout, disable and command deadlines
 
 Supported API-first rollout: deploy the API advertising `worker_memory_pressure_v1`, then enable workers. [Worker startup](../agent/src/worker.ts) refuses an enabled guard against an older API or invalid register incarnation with `UnsupportedMemoryAPI`. Supported worker-first rollout: deploy with the guard disabled until the API is ready, then enable through fresh registration/restart. A heartbeat advertisement alone cannot upgrade a disabled or revoked registration into memory authority.

@@ -217,22 +217,28 @@ describe("issue #1856: terminal Codex disposal gates clone retirement", () => {
   for (const [name, outcome] of [
     ["incomplete", { kind: "incomplete", errors: [{ category: "timeout", message: "writer survived disposal" }] }],
     ["disposed", { kind: "disposed" }],
+    ["unaccepted-disposed", { kind: "disposed" }],
+    ["copied-disposed", { kind: "disposed" }],
     ["legacy_in_process", { kind: "legacy_in_process" }],
     ["rejected", undefined],
   ] as const) {
     it(`${name}: retains only when terminal disposal is unproven`, async () => {
       const { gitlab } = fakeGitlab();
-      const iid = 18560 + ["incomplete", "disposed", "legacy_in_process", "rejected"].indexOf(name);
+      const iid = 18560 + ["incomplete", "disposed", "legacy_in_process", "rejected", "unaccepted-disposed", "copied-disposed"].indexOf(name);
       const { logger, lines } = recordingLogger();
       const { calls, quiesceRun } = scriptedQuiescer(["quiescent"]);
       let clone = "";
+      let issued: ToolDisposal | undefined;
       const safety: CodexExecutionSafety = {
         kind: "codex",
+        // Model the facade contract: only its own exact successful result is proof.
+        acceptsTerminalDisposal: result => name !== "unaccepted-disposed" && result === issued && result.kind === "disposed",
         withBoundary: async () => { throw new Error("unexpected boundary"); },
         spawnBoundaryProcess: async () => { throw new Error("unexpected spawn"); },
         dispose: async () => {
           if (outcome === undefined) throw new Error("disposal rejected");
-          return outcome as ToolDisposal;
+          issued = outcome as ToolDisposal;
+          return name === "copied-disposed" ? { ...issued } : issued;
         },
       };
       const factory: ExecutorFactory = (runId) => ({
@@ -247,14 +253,19 @@ describe("issue #1856: terminal Codex disposal gates clone retirement", () => {
         },
       });
       await runnerWith(factory, gitlab, undefined, logger, { quiesceRun }).execute(gitlabClaim(iid));
-      const retained = name === "incomplete" || name === "rejected";
+      const retained = name !== "disposed";
       assert.ok(api.states.some((s) => s.body.status === "failed"), "the original failure is reported");
       assert.equal(fs.existsSync(clone), retained, "clone follows disposal proof");
       assert.equal(journal(iid) !== undefined, retained, "recovery journal follows clone");
       assert.equal(fs.existsSync(skillsPluginDir(clone)), retained, "paired skills directory follows clone");
       if (retained) {
-        const reason = name === "incomplete" ? "writer survived disposal" : "disposal rejected";
-        assert.ok(lines.some((line) => JSON.stringify(line).includes(reason)), "the disposal reason is logged");
+        const diagnostic = lines.find((line): line is { msg: string; disposition?: unknown } =>
+          typeof line === "object" && line !== null && "msg" in line &&
+          line.msg === "codex terminal disposal unproven; retaining runner clone");
+        assert.equal(diagnostic?.disposition, name === "incomplete" ? "incomplete" : name === "rejected" ? "rejected" : "invalid");
+        assert.equal(lines.some(line => /writer survived disposal|disposal rejected/.test(JSON.stringify(line))), false,
+          "raw disposal errors stay out of diagnostics");
+        assert.equal(calls.length, 0, "unproven Codex disposal cannot reach the legacy terminal scanner");
       } else {
         assert.equal(calls.length, 1, "proved disposal reaches the terminal scanner");
       }

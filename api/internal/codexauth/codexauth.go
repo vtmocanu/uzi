@@ -194,7 +194,7 @@ type Client struct {
 	usageBase string
 	oauthBase string
 	clientID  string
-	// perRequestTimeout bounds ONE provider HTTP call (identity read OR token refresh)
+	// perRequestTimeout bounds ONE provider HTTP call (identity, usage or token refresh)
 	// with a context deadline (PRD #1171 M1). Zero (the default) means "no per-request
 	// deadline beyond whatever the doer enforces" — the pre-#1171 dark-M1 behaviour, so
 	// existing callers/tests are unchanged. Production sets it (WithPerRequestTimeout) so
@@ -202,6 +202,8 @@ type Client struct {
 	// pinned app-server 10-second external-auth callback deadline; see the nested budget
 	// documented at the NewClient call site in cmd/server/main.go.
 	perRequestTimeout time.Duration
+	// refreshTimeout overrides perRequestTimeout for Refresh only when positive.
+	refreshTimeout time.Duration
 }
 
 // Option configures a Client at construction.
@@ -217,9 +219,9 @@ func WithHTTPDoer(d httpDoer) Option {
 	}
 }
 
-// WithPerRequestTimeout bounds each provider HTTP call (DiscoverIdentity, Refresh) with
-// a per-request context deadline (PRD #1171 M1). The coordinated callback uses it for its
-// single oauth exchange; import and recovery use it for their nonrotating identity reads.
+// WithPerRequestTimeout bounds each provider HTTP call (DiscoverIdentity, ReadUsage,
+// Refresh) with a per-request context deadline (PRD #1171 M1). WithRefreshTimeout can
+// override this bound for the coordinated callback's single OAuth exchange.
 // A non-positive value is ignored (keeps the default: no per-request deadline), so an
 // accidental zero never disables the doer's own timeout.
 func WithPerRequestTimeout(d time.Duration) Option {
@@ -230,15 +232,27 @@ func WithPerRequestTimeout(d time.Duration) Option {
 	}
 }
 
+// WithRefreshTimeout overrides the per-request timeout for Refresh only. A positive
+// value replaces that bound rather than nesting beneath it; the parent context's
+// deadline still wins when earlier. Non-positive values are ignored.
+func WithRefreshTimeout(d time.Duration) Option {
+	return func(c *Client) {
+		if d > 0 {
+			c.refreshTimeout = d
+		}
+	}
+}
+
 // NewClient builds a Client with the provider defaults, then applies opts. The base
 // URLs, provider name and client id are the FIXED provider defaults — production never
 // takes an endpoint from a claim, model, repo, saved label or callback (PRD #1171 M1);
 // a localhost/fake provider is injected in tests ONLY through WithHTTPDoer, whose fake
 // doer intercepts the request regardless of the (still-default) URL, so no endpoint
 // override option is needed or offered. Production additionally passes
-// WithPerRequestTimeout to bound each provider call under the app-server callback
-// deadline. A later unit that must point at a non-default endpoint can add the override
-// option then, with a caller — an unused exported option would redden the deadcode gate.
+// WithPerRequestTimeout and WithRefreshTimeout to bound provider calls under the
+// app-server callback deadline. A later unit that must point at a non-default endpoint
+// can add the override option then, with a caller — an unused exported option would
+// redden the deadcode gate.
 func NewClient(opts ...Option) *Client {
 	c := &Client{
 		// CheckRedirect refuses EVERY redirect (mirrors forge/github.go's second-hop log
@@ -443,7 +457,12 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (RefreshResul
 	if err != nil {
 		return RefreshResult{}, fmt.Errorf("codexauth: encode refresh request: %w", err)
 	}
-	ctx, cancel := c.requestContext(ctx)
+	var cancel context.CancelFunc
+	if c.refreshTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, c.refreshTimeout)
+	} else {
+		ctx, cancel = c.requestContext(ctx)
+	}
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.oauthBase+"/oauth/token", bytes.NewReader(payload))
 	if err != nil {

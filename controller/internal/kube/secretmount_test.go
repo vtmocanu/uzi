@@ -107,8 +107,59 @@ func TestSecretMountPathOverrideMovesMountAndBothEnvs(t *testing.T) {
 	}
 }
 
+func TestSecretMountPathRunUziCompatibility(t *testing.T) {
+	for _, p := range append([]dindPosture{{"plain", testConfig(), false}}, dindPostures()...) {
+		for _, isolated := range []bool{false, true} {
+			t.Run(p.name+map[bool]string{false: "", true: "/isolated"}[isolated], func(t *testing.T) {
+				cfg := p.cfg
+				cfg.SecretMountPath = "/run/uzi"
+				cfg.APICAPEM = []byte("ca")
+				cfg.IsolatedNamespace = "isolated"
+				cfg.PodEpochRuntime = "containerd-runc"
+				if err := ValidateSecretMountPath(cfg); err != nil {
+					t.Fatalf("previously valid /run/uzi rejected: %v", err)
+				}
+				w := desired("abc")
+				if p.name != "plain" {
+					w = desiredDocker("abc")
+				}
+				w.Isolated = isolated
+				pod := RenderDeployment(cfg, w, testSpec(t, "base", "m")).Spec.Template.Spec
+				worker := workerContainer(t, pod)
+				if got := mountPath(worker, "token"); got != "/run/uzi" {
+					t.Errorf("token mount = %q, want /run/uzi", got)
+				}
+				env := workerEnv(pod)
+				if env["UZI_WORKER_TOKEN_FILE"] != "/run/uzi/worker_token" || env["NODE_EXTRA_CA_CERTS"] != "/run/uzi/ca.crt" {
+					t.Errorf("token/CA env changed: %v", env)
+				}
+				projection := false
+				for _, c := range append(pod.InitContainers, pod.Containers...) {
+					for _, m := range c.VolumeMounts {
+						if m.Name == "token" && c.Name == "worker" {
+							continue
+						}
+						if pathsOverlap(m.MountPath, "/run/uzi") {
+							t.Errorf("container %q mount %q at %q overlaps token", c.Name, m.Name, m.MountPath)
+						}
+						if m.Name == "pod-epoch" {
+							projection = true
+							if c.Name != "worker" || m.MountPath != "/etc/uzi/pod-epoch" || !m.ReadOnly || m.SubPath != "" {
+								t.Errorf("unexpected projection on %q: %+v", c.Name, m)
+							}
+						}
+					}
+				}
+				if projection != (p.name != "plain" && !isolated) {
+					t.Errorf("projection present = %v, isolated = %v", projection, isolated)
+				}
+			})
+		}
+	}
+}
+
 func TestValidateSecretMountPath(t *testing.T) {
-	valid := []string{"", "/run/secrets", "/run/uzi-secrets", "/run/uzi.secrets_1"}
+	valid := []string{"", "/run/secrets", "/run/uzi", "/run/uzi-secrets", "/run/uzi.secrets_1"}
 	for _, p := range valid {
 		if err := ValidateSecretMountPath(RenderConfig{SecretMountPath: p}); err != nil {
 			t.Errorf("%q rejected: %v", p, err)

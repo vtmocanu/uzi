@@ -131,14 +131,14 @@ func (f *FakeClient) GetCIRun(_ context.Context, repoID string, runID int64) (ap
 	return f.CIRunDetailResult, nil
 }
 
-func (f *FakeClient) CreateCIFixRun(_ context.Context, repoID, ref string) (apitypes.RunDTO, error) {
+func (f *FakeClient) CreateCIFixRun(_ context.Context, repoID, ref string) (CreatedRunResult, error) {
 	f.LastCIFixRepoID = repoID
 	f.LastCIFixRef = ref
 	if f.CreateCIFixRunErr != nil {
-		return apitypes.RunDTO{}, f.CreateCIFixRunErr
+		return CreatedRunResult{}, f.CreateCIFixRunErr
 	}
 	if f.Err != nil {
-		return apitypes.RunDTO{}, f.Err
+		return CreatedRunResult{}, f.Err
 	}
-	return f.CIFixRunResult, nil
+	return CreatedRunResult{RunDTO: f.CIFixRunResult, Notice: f.CreatedNotice}, nil
 }

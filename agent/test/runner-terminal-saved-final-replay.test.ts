@@ -8,7 +8,7 @@ import { performance } from "node:perf_hooks";
 import { RecoveryCoordinator } from "../src/recovery.js";
 import { RequestError } from "../src/client.js";
 import { SteeringChannel } from "../src/steering.js";
-import type { CodexExecutionSafety, BoundaryPermit } from "../src/harness.js";
+import type { CodexExecutionSafety, BoundaryPermit, ToolDisposal } from "../src/harness.js";
 import type { Executor } from "../src/executor.js";
 import type { RecoveryExactHold, RecoveryFinalDisposition } from "../src/protocol.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
@@ -152,11 +152,11 @@ function deferred() {
 }
 
 type ReplayMode = "ordinary" | "upload-rejected" | "upload-failed" | "commands-unconfirmed" | "commands-rejected" |
-  "disposed" | "incomplete" | "legacy_in_process" | "dispose-rejected" | "steering-rejected" | "executor-replaced" | "shutdown" |
+  "disposed" | "unaccepted-disposed" | "copied-disposed" | "incomplete" | "legacy_in_process" | "dispose-rejected" | "steering-rejected" | "executor-replaced" | "shutdown" |
   "memory-enrolled" | "memory-operation-pending" | "memory-executor-pending" | "memory-closing-pending" | "memory-sink-receipt";
 
 for (const mode of ["ordinary", "upload-rejected", "upload-failed", "commands-unconfirmed", "commands-rejected",
-  "disposed", "incomplete", "legacy_in_process", "dispose-rejected", "steering-rejected", "executor-replaced", "shutdown",
+  "disposed", "unaccepted-disposed", "copied-disposed", "incomplete", "legacy_in_process", "dispose-rejected", "steering-rejected", "executor-replaced", "shutdown",
   "memory-enrolled", "memory-operation-pending", "memory-executor-pending", "memory-closing-pending",
   "memory-sink-receipt"] as ReplayMode[]) {
   it("N current accepted archive replay: " + mode, {
@@ -263,9 +263,13 @@ for (const mode of ["ordinary", "upload-rejected", "upload-failed", "commands-un
       if (mode === "steering-rejected") throw new Error("fixture steering join rejected");
     });
     let disposals = 0, replacementDisposals = 0;
-    const codex = ["disposed", "incomplete", "legacy_in_process", "dispose-rejected", "executor-replaced"].includes(mode);
+    const codex = ["disposed", "unaccepted-disposed", "copied-disposed", "incomplete", "legacy_in_process", "dispose-rejected", "executor-replaced"].includes(mode);
+    let issuedDisposal: ToolDisposal | undefined;
     const safety: CodexExecutionSafety | undefined = codex ? {
       kind: "codex",
+      // An exact-result witness, scoped to this executor/facade. A label or copy
+      // alone cannot confirm the terminal source for accepted-archive replay.
+      acceptsTerminalDisposal: result => mode !== "unaccepted-disposed" && result === issuedDisposal && result.kind === "disposed",
       withBoundary: async (request, action) => action({ epoch: 1, boundary: request.boundary,
         signal: new AbortController().signal } as BoundaryPermit),
       spawnBoundaryProcess: async () => { throw new Error("no subprocess admission in fixture"); },
@@ -273,7 +277,9 @@ for (const mode of ["ordinary", "upload-rejected", "upload-failed", "commands-un
         disposals++;
         if (mode === "dispose-rejected") throw new Error("fixture disposal rejection");
         if (mode === "incomplete") return { kind: "incomplete", errors: [] };
-        return { kind: mode === "legacy_in_process" ? "legacy_in_process" : "disposed" };
+        const result: ToolDisposal = { kind: mode === "legacy_in_process" ? "legacy_in_process" : "disposed" };
+        issuedDisposal = result;
+        return mode === "copied-disposed" ? { ...result } : result;
       },
     } : undefined;
     let commandFailures = 0;

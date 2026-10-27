@@ -48,6 +48,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 	lastStatus := ""
 	lastHold := ""
 	lastRecoveryCause := ""
+	lastWorkerHoldKey := ""
 	defaultUntil := len(nonEmpty(until)) == 0 && !cmd.Flags().Changed("until")
 	sawStatus := false
 	warnedUnknown := map[string]bool{}
@@ -76,13 +77,15 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 		}
 		consecutiveUnreachable = 0
 		cause := strOr(run.RecoveryWaitCause, "")
-		if isOwnerRequiredWorkerHold(run) && (run.Status != lastStatus || cause != lastRecoveryCause) {
+		workerKey := workerHoldNoticeKey(run)
+		if (isOwnerRequiredWorkerHold(run) || isRetainedRecovery(run)) && workerKey != lastWorkerHoldKey {
 			_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", runID, workerExhaustionLine(run))
 		}
 		if line := providerParkLine(run); line != "" && (run.Status != lastStatus || cause != lastRecoveryCause) {
 			_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), line)
 		}
 		lastRecoveryCause = cause
+		lastWorkerHoldKey = workerKey
 
 		// A transition line on every status change, including the first observation, so a
 		// human watching stderr sees the run move. cellText folds a newline a rotted
@@ -240,7 +243,7 @@ func newRunWaitCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Block until a run reaches a chosen state",
 		Long: "Poll a run until its status enters the `--until` set, then exit 0 (PRD #264).\n\n" +
 			"With no `--until`, it stops on any state that needs you or ends the run: " +
-			strings.Join(defaultWaitStates, ", ") + ", or worker recovery exhausted / worker memory pressure (recovery_wait; owner Resume or Cancel), " +
+			strings.Join(defaultWaitStates, ", ") + ", or worker recovery exhausted / worker memory pressure / owner-held retained recovery exhausted (recovery_wait; owner Resume or Cancel), " +
 			"or a --require-base run held because its kept work is not attested against the planned base (paused, " +
 			"base_attestation_missing; recover its kept work with the run recovery or run export commands). " +
 			"Explicit --until uses only the named statuses. Ordinary transient recovery_wait keeps polling. It does NOT stop " +

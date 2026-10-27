@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -91,6 +92,7 @@ func main() {
 		RollTargetVersion: cfg.RollTargetVersion,
 		Namespace:         cfg.WorkerNamespace,
 		DockerNamespace:   cfg.WorkerDockerNamespace,
+		PodEpochRuntime:   cfg.WorkerPodEpochRuntime,
 		DinDImage:         cfg.WorkerDinDImage,
 		// Config carries the POSITIVE `rootless` bool (matching the chart value); the
 		// render side carries the NEGATIVE `non-rootless` so its zero value is the safe
@@ -225,6 +227,17 @@ func main() {
 		// poll are skipped, never rendered into the worker namespace.
 		"isolated_lane", cfg.WorkerIsolatedNamespace != "",
 		"isolated_namespace", cfg.WorkerIsolatedNamespace)
+	if cfg.WorkerDockerNamespace != "" {
+		session := kube.NewPodEpochSession(kubeClient, kube.PodEpochKubeResolver{Client: kubeClient}, nil)
+		materializer.SetPodEpochSession(session)
+		owner := kube.NewPodEpochWatch(kubeClient.CoreV1().RESTClient(), cfg.WorkerDockerNamespace, cfg.WorkerPodEpochRuntime, session)
+		owner.Start(ctx)
+		defer owner.Stop()
+		timer := time.NewTimer(60 * time.Second)
+		synced := owner.WaitForSync(ctx, timer.C)
+		timer.Stop()
+		log.Info("pod epoch initial subscription", "synced", synced)
+	}
 	loop.Run(ctx)
 	log.Info("controller stopped")
 }

@@ -469,6 +469,7 @@ function fakeSafety(script: {
     ({ epoch: 1, boundary, signal }) as unknown as BoundaryPermit;
   return {
     kind: "codex",
+    acceptsTerminalDisposal: () => false,
     withBoundary: async (req, action) => {
       const ac = new AbortController();
       if (req.boundary !== "shutdown") return action(permitFor(req.boundary, ac.signal));

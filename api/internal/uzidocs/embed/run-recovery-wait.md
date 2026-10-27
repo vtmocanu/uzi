@@ -175,15 +175,60 @@ deadline from the first reservation**. Reservation happens before work and
 survives crash, reclaim and successor handoff. Retry delays use the existing
 exponential backoff capped at 16 times its base. Capture, publication,
 adoption or reclaim does not reset the budget; a trusted, successfully
-settled real model turn does, and so does an owner Resume of a
-`worker_requeue_exhausted` hold (see
-[Worker recovery exhausted](#worker-recovery-exhausted)). Nothing else renews it.
+settled real model turn does. An owner Resume of a
+`worker_requeue_exhausted` hold or the retained-recovery retry described below
+can renew it on a fresh claim with a higher recovery episode.
 
-A permanent blocker or exhausted budget ends the run **failed**, keeping
-local work and custody. It does not park for automatic reclaim or offer
-Resume on the failed run. Only an exhausted-budget (`budget_exhausted`) blocker
-is ever renewable, and only by the owner Resume above; every other permanent
-blocker stays permanent. Actual quiescence failure uses `worker_residue_blocked`; a missing
+### Retained recovery exhausted
+
+A durably confirmed `budget_exhausted` retained source can park at
+`recovery_wait` with cause `retained_recovery_exhausted`, keeping local source
+and custody while releasing its execution slot. It does not require a new
+capture when the exhausted budget prevents one.
+
+By default, **three automatic parks** retry after roughly **1m, 2m and 4m**,
+plus jitter. This cause has its own `retained_park_count`, separate from the
+lifetime recovery-wait count and worker-death requeue allowance.
+`RUN_RETAINED_RECOVERY_MAX_PARKS` sets the cap; **0 holds immediately**.
+The fourth exhaustion at defaults stays held for the owner, without a timer
+or another counted park. Resume does not reset that cap.
+
+A fresh claim with a higher derived recovery episode charges one of three
+reservations in a new five-minute window and must prove quiescence again.
+A new claim alone, the same generation or the same episode cannot renew it.
+Timer promotion gives a fresh run wall window, up to three at the default cap.
+Manual Resume preserves the remaining wall budget instead; it can require an
+owner extension first.
+
+1. For a timed retry, wait, choose **Resume** to queue it early, or **Cancel**
+   to end the run.
+2. For an owner-held retry, choose **Resume** (`uzi run resume <id>`) when ready,
+   or **Cancel** (`uzi run cancel <id>`). Both actions use existing owner checks.
+3. Read `uzi run recovery <id>` before relying on an archive. Both timed and
+   held parks keep source custody; an available earlier archive may omit latest
+   local work. Losing the original storage can still lose that work. Another
+   worker may resume from a published checkpoint after worker loss or affinity
+   expiry without the original local recovery journal.
+
+Finite retry timestamps, including due ones, mean timed recovery. A NULL retry
+means an owner hold with no countdown; omitted timing means unknown. Default
+CLI wait and log follow stop for the owner-held form, and follow reports a
+transition from timed to held even within the same status and cause. Explicit
+`--until` keeps its chosen status set. Token or credential changes do not
+promote this cause. Both forms can keep storage occupied and block worker
+image rolls. See [Configuration](configuration.md) and the
+[ADR-1197 #3495 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-26-3495-bounded-retained-recovery-parks).
+
+The worker needs API feature support and exact durable journal confirmation.
+Without that support or proof, exhaustion keeps the terminal fallback with
+custody retained. Uncertain park responses instead stop nonterminal while
+bounded reconciliation checks the outcome. Deploy the API fully before
+upgrading workers; mixed API replicas and API rollback are unsupported.
+
+Other permanent blockers end the run **failed**, keeping local work and
+custody, without automatic reclaim or failed-run Resume. Only
+`budget_exhausted` is renewable; other permanent blockers stay permanent.
+Actual quiescence failure uses `worker_residue_blocked`; a missing
 source, invalid recovery clock, preservation or adoption failure, missing
 needed prerequisites, or an oversized fallback is not a quiescence failure.
 Transient capture, forge or disk failures consume the same reserved budget.
@@ -294,8 +339,10 @@ board each name one of four states (a state this client does not recognise
 reads **Codex account unavailable**):
 
 - **Codex account is reconciling** — the account is repairing its login on
-  its own. No action is needed; the run resumes automatically once it
-  clears.
+  its own after an uncertain renewal or while verifying protected login
+  material. Let recovery finish; unlock your vault or enable the login if
+  needed. The run resumes automatically if recovery succeeds, or asks you
+  to log in again if it cannot recover.
 - **Re-log in Codex credential \<label\> to continue** — the account has no way back on
   its own. Log in again in Settings, on the **same** credential — the same
   alias, the same ChatGPT account. Logging in with a different account does
@@ -308,8 +355,10 @@ reads **Codex account unavailable**):
   worker that holds its source, including when the hold began at a running
   checkpoint; normal worker-affinity limits still apply.
 
-A successful same-credential re-login re-admits the run: the activity feed
-records the re-admission, naming the credential and what changed.
+Automatic account recovery or a successful same-credential re-login re-admits
+the run: the activity feed records the re-admission, naming the credential
+and what changed. You can replace the login on that same credential while
+recovery is still in progress; uzi verifies it before using it.
 
 ### No expiry, no timer
 
@@ -394,8 +443,10 @@ the source and retry visibly with bounded backoff instead of failing after
 the ordinary blocked-capture limit. Verified capture is still required to
 park. Cancellation, shutdown and loss of the claim retain precedence; other
 recovery causes keep their existing limit. After unlock, the recovery sweep
-promotes the protected login before the run can resume. The original refresh
-token is never exchanged again.
+promotes the protected login before the run can resume. Recovering this
+protected login does not exchange the original refresh token again. After a
+separate uncertain renewal failure, uzi may make one automatic recovery attempt;
+if that cannot recover the account, follow the request to log in again.
 
 Deploy the API before upgrading the affected workers. Older workers keep
 their existing first-request vault-lock reply, including pending retention,
@@ -576,10 +627,11 @@ survives on the worker.
 
 Each owner Resume also renews an exhausted or partly used retained-source
 recovery budget (up to 3 more iterations, at most once per Resume), on the
-run's next fresh claim; nothing else does. A server requeue, the
+run's next fresh claim. The retained-recovery parks above also grant bounded
+renewals; ordinary server requeue, the
 `data_volume_full` park retry, the memory-pressure Resume and a new claim alone
 never renew it. See [Bounded retained-source recovery](#bounded-retained-source-recovery)
-and the [ADR-1197 #3330 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-25-3330-an-owner-resume-renews-the-retained-source-budget).
+and the [ADR-1197 #3495 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-26-3495-bounded-retained-recovery-parks).
 
 Historical evidence persists until owner Resume or Cancel. Capture expiry
 neither fails nor promotes the hold; there is no automatic reclassification
@@ -630,6 +682,8 @@ historical-evidence rules above remain in force.
   hold has no timer and resumes when the account does.
   `worker_requeue_exhausted` is an owner-only exhaustion hold: explicit
   Resume starts a new episode; Cancel ends the run. It has no automatic retry.
+  `retained_recovery_exhausted` has bounded timed retries followed by an owner
+  hold; see [Retained recovery exhausted](#retained-recovery-exhausted).
 - `limit_wait`: a usage-limit window must reset. See
   [Paused on a usage limit](run-limit-wait.md).
 - `pool_wait`: no token is available in the selected pool. It needs an

@@ -445,6 +445,11 @@ export type BoundaryStep =
   | "checkpoint_import_mutation"
   | "checkpoint_import_readback"
   | "checkpoint_code_head"
+  | "checkpoint_code_head_runner_tip"
+  | "checkpoint_code_head_tracking"
+  | "checkpoint_code_head_default_tip"
+  | "checkpoint_code_head_pin"
+  | "checkpoint_code_head_changed_files"
   | "checkpoint_bridge"
   | "checkpoint_post_import"
   | "checkpoint_steer"
@@ -601,6 +606,8 @@ export interface CodexExecutionSafety {
   // `finally`, after every sink has settled, to drop the roots/handlers. Idempotent
   // (disposeTools is), so a backstop dispose in the executor never double-disposes.
   dispose(request: BoundaryRequest): Promise<ToolDisposal>;
+  /** Exact successful terminal outcome, still backed by all cleanup evidence. */
+  acceptsTerminalDisposal(outcome: ToolDisposal): boolean;
 }
 
 // M3 addition required on the existing outer Executor contract in executor.ts:

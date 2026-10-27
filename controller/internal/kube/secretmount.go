@@ -31,6 +31,7 @@ var knownWorkerMountPaths = []string{
 	dindDataDirRoot,
 	dindMeterDir,
 	dindMeterDataDir,
+	podEpochMountPath,
 }
 
 // ValidateSecretMountPath refuses a SecretMountPath override that is malformed or

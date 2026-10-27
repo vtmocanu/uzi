@@ -137,6 +137,8 @@ func TestPlanCrossCheckRequestExactKeys(t *testing.T) {
 func TestCrossCheckVerdictRequestExactKeys(t *testing.T) {
 	for _, b := range []string{
 		`{"claim_generation":1,"outcome":"clean","findings":[]}`,
+		`{"claim_generation":1,"outcome":"completed","findings":[],"coverage":null}`,
+		`{"claim_generation":1,"outcome":"completed","findings":[],"coverage":{"partial":true}}`,
 		`{"claim_generation":1,"verdict":"approve","summary":"ok","items":[]}`,
 	} {
 		var req crossCheckVerdictRequest
@@ -146,6 +148,8 @@ func TestCrossCheckVerdictRequestExactKeys(t *testing.T) {
 	}
 	for _, b := range []string{
 		`{"claim_generation":1,"OUTCOME":"clean"}`,
+		`{"claim_generation":1,"Coverage":null}`,
+		`{"claim_generation":1,"coverage":null,"coverage":{}}`,
 		`{"claim_generation":1,"Findings":[]}`,
 		`{"claim_generation":1,"VERDICT":"approve"}`,
 		`{"claim_generation":1,"Summary":"x"}`,

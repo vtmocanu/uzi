@@ -116,7 +116,7 @@ Constraints, so nobody simplifies that block back into something broken:
 ## CI
 
 CI is GitHub Actions; there is no `.gitlab-ci.yml`. The workflows are
-`.github/workflows/{ci,e2e,kind-smoke,release,codex-packaged-proof}.yml` plus `brew.yml`,
+`.github/workflows/{ci,e2e,kind-smoke,release,release-auto,codex-packaged-proof}.yml` plus `brew.yml`,
 `main-guard.yml` and the weekly `devbox-update.yml`, `pricing-freshness.yml` and
 `roles-manifest-refresh.yml`.
 

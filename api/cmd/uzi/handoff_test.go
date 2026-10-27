@@ -39,7 +39,7 @@ type handoffClient struct {
 	rec *handoffRecorder
 }
 
-func (c *handoffClient) CreateTaskRun(ctx context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool, continuedIssueIID *int64) (apitypes.RunDTO, error) {
+func (c *handoffClient) CreateTaskRun(ctx context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool, continuedIssueIID *int64) (uzicli.CreatedRunResult, error) {
 	c.rec.seq = append(c.rec.seq, "create")
 	return c.FakeClient.CreateTaskRun(ctx, repoID, taskContext, baseBranch, openMR, reviewRequested, thenFixRequested, interactive, continuedIssueIID)
 }

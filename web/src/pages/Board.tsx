@@ -30,6 +30,7 @@ import {
   isAwaitingApproval,
   isAwaitingFollowup,
   isAwaitingInput,
+  isMaintenanceQueued,
 } from "../lib/runBadge";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { lanePaging, visibleColumns } from "../lib/boardColumns";
@@ -578,6 +579,9 @@ export function Board() {
             // status should not exist — but if one ever did, "looks stuck" would be
             // the wrong words for it.
             r.health !== "approval_idle" &&
+            // PRD #3454: a run held back by instance maintenance mode waits on purpose (the
+            // detector may still flag waiting_worker); it is not stuck.
+            !isMaintenanceQueued(r) &&
             r.issue_iid != null,
         ),
       );

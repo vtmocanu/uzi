@@ -15,6 +15,7 @@ import {
   type RetainedHoldsSnapshot,
   type RetainedLifecycleSnapshot,
   type RetainedSourceSelector,
+  runnerGitCarriesWorkerMark,
 } from "../src/git.js";
 import { RetainedStoppedSourceError, RunResidueBlockedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
@@ -609,6 +610,44 @@ describe("verifyStoppedSourceCovered", () => {
     const calls: Array<[string[], string]> = [];
     assert.equal(await verify(a, head, async (p, phase) => { calls.push([p, phase]); return true; }), "covered");
     assert.deepEqual(calls, [[[a.path], "before"], [[a.path], "after"]]);
+  });
+
+  it("coverage clone reads deny every transport per call and retain command identity and marking", { skip: LINUX_ONLY }, async (t) => {
+    const { a, head } = await captured();
+    type Read = (cwd: string | undefined, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => Promise<string>;
+    const readers = git as unknown as { runGitAsRunner: Read };
+    const read = readers.runGitAsRunner.bind(git);
+    const calls: string[][] = [];
+    t.mock.method(readers, "runGitAsRunner", async (cwd: string | undefined, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => {
+      if (cwd === a.path && !args.includes("rev-parse")) {
+        calls.push(args);
+        assert.equal(opts?.env?.GIT_ALLOW_PROTOCOL, "none", "explicit per-call transport denial");
+        assert.equal(opts?.env?.GIT_NO_REPLACE_OBJECTS, "1");
+        if (args.includes("status")) assert.equal(opts?.env?.GIT_OPTIONAL_LOCKS, "0");
+      }
+      return read(cwd, args, opts);
+    });
+    type Exec = (command: string, args: string[], opts: { env: NodeJS.ProcessEnv }, identity?: string) => Promise<unknown>;
+    const processes = git as unknown as { execScoped: Exec };
+    const exec = processes.execScoped.bind(git);
+    const dispatched: string[] = [];
+    t.mock.method(processes, "execScoped", async (command: string, args: string[], opts: { env: NodeJS.ProcessEnv }, identity?: string) => {
+      if (args.includes(a.path)) {
+        assert.equal(identity, "command", "clone reads keep their OS identity");
+        assert.equal(opts.env.GIT_ALLOW_PROTOCOL, "none");
+        assert.equal(opts.env.GIT_NO_LAZY_FETCH, "1");
+        for (const sub of ["status", "for-each-ref"]) if (args.includes(sub)) {
+          dispatched.push(sub);
+          assert.equal(runnerGitCarriesWorkerMark([sub]), false);
+          assert.equal(opts.env.UZI_WORKER_SPAWN, undefined, "unmarked reads remain reapable");
+        }
+      }
+      return exec(command, args, opts, identity);
+    });
+    assert.equal(await verify(a, head), "covered");
+    assert.deepEqual(calls.map(args => args.includes("config") ? "config" : args.includes("status") ? "status" : args.includes("for-each-ref") ? "for-each-ref" : args.includes("--stage") ? "stage" : "flags"),
+      ["config", "stage", "status", "flags", "for-each-ref"]);
+    assert.deepEqual(dispatched, ["status", "for-each-ref"]);
   });
 
   it("leaves the clone's .git/index bytes unchanged when a tracked file's mtime moved", { skip: LINUX_ONLY }, async () => {

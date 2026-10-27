@@ -90,8 +90,9 @@ follow-up and pause do not release a held memory episode. Extending a timed
 run can supply budget for a subsequent owner Resume, but does not itself
 queue the run. An available archive does not automatically release this
 hold's retained custody. After discarded/released precedence, an OPEN hold at
-`recovery_wait` for either `worker_memory_pressure` or
-`worker_requeue_exhausted` reports `needs_action` when its latest capture failed,
+`recovery_wait` for `worker_memory_pressure`,
+`worker_requeue_exhausted`, or `retained_recovery_exhausted` (timed or held),
+reports `needs_action` when its latest capture failed,
 otherwise `source_only`, before available unguarded archives or capture progress.
 Other custody attention decisions retain their existing ordering.
 
@@ -165,8 +166,19 @@ See [the canonical A/B contract](../adr/1783-run-quiescence-and-attempt-clone-pa
 for scope and deadline internals. This adds no fresh park secret scan; remembered
 findings and the pack guard keep their existing rules.
 
-Strengthened terminal proof (C) remains unshipped; existing terminal executor disposal
-still applies, with snapshot coverage still preceding strengthened writer-exclusion proof.
+**Subsequent C (Refs #2852) (AI-synced 2026-10-24)** defers Codex
+release-dependent coverage until disposal of the exact executor/facade.
+Skipped, incomplete or swapped proof retains clone, journal, inventory and paired
+skills, logging `codex terminal disposal unproven; retaining runner clone`.
+The revocable witness is checked through retirement; a cleared registry is not proof.
+Settlement inside A/B defers the request without reacquiring either safety queue;
+post-disposal source reads are inert and hardened.
+Current-process completion sources bind exact executor/facade in memory before
+durable bind. KnownCodex missing/non-disposed/swapped proof retains before inventory
+and never uses legacy fallback; knownClaude stays unchanged. Owner decision
+2026-10-24 narrows R1857-02(e): **persisted completion sources without reliable provenance**
+keep today's behavior for both harnesses. No prior-process topology proof or
+durable format change is supplied.
 Registered-root capture exclusion does not exclude daemon or sibling writers,
 accepted-but-invisible creates (#1860), or Claude terminal residuals; per-attempt
 cgroup proof (#1862) remains unshipped. Automatic reclaim remains disabled (#1858),
@@ -430,18 +442,22 @@ and exponential retry cap of 16 times the base delay. A legacy episode without a
 claim fence binds once to a positively verified claim; its old claim identity is
 never inferred. Already-blocked episodes retain their original reason; only a
 `budget_exhausted` blocker can renew, and only as described below. A trusted, successfully settled real model turn resets the
-reservation count. So does an explicit owner Resume of a run held at
-`recovery_wait` with cause `worker_requeue_exhausted`: the next fresh claim
-(episode above the journal's stored one) charges 1 of 3, opens a new window and
-clears a `budget_exhausted` blocker, at most once per Resume and still capped at
-3 iterations. No server requeue, `data_volume_full` retry, memory-pressure
-Resume or new claim alone renews, and no other blocker is ever renewed (see the
-[ADR-1197 #3330 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-25-3330-an-owner-resume-renews-the-retained-source-budget)).
+reservation count. Owner Resume of `worker_requeue_exhausted` and bounded
+`retained_recovery_exhausted` retries can also renew: a fresh generation and
+higher derived episode charge one of three reservations in a new five-minute
+window and clear only `budget_exhausted`. The default three timed parks are
+followed by an owner hold; Resume preserves that count. Timer promotion resets
+the run wall, while manual Resume preserves remaining wall budget and may need
+an owner extension. Other requeues, disk retries, memory-pressure Resume or a
+new claim alone do not renew. See
+[Retained recovery exhausted](./run-recovery-wait.md#retained-recovery-exhausted)
+and the [ADR-1197 #3495 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-26-3495-bounded-retained-recovery-parks).
 Recovery adopts work on a fresh attempt path and model
 session even on an unwired worker; ordinary unwired keys that never entered
 retained recovery keep same-path continuity.
 
-Permanent blockers or exhaustion end the run **failed** with custody kept,
+Other permanent blockers, or exhaustion without both durable journal confirmation
+and API support, end the run **failed** with custody kept,
 without automatic reclaim or failed-run Resume. The reason names the
 blocker: missing source, invalid clock, preservation/adoption failure,
 missing or unverifiable needed prerequisites, or a fallback still oversized.
@@ -715,7 +731,8 @@ still gates release (terminal exits, below); on parks it is diagnostic:
   byte checks do not cover what it wrote. The residual is a writer that writes and
   exits between the status read and that proof. Stopped and park exits keep the
   clone regardless of coverage. Completed, failed and cancelled terminal exits
-  retain their existing covered release; that residual remains open under
+  require C's exact post-disposal witness for Codex release-dependent checks.
+  Claude terminal behavior and unregistered/Docker-writer residuals remain under
   [#2852](https://github.com/vtmocanu/uzi/issues/2852).
 - **Docker teardown failed.** The proof scans processes only, so it is skipped
   unless the Docker half was `not_wired` or `docker_unconfirmed`.
@@ -786,12 +803,13 @@ leaves, and whether coverage can release it, depends on the exit:
   journal even when covered, with no `uzi-stopped` marker or `reclaimed` entry.
   Coverage is diagnostic when checked; shutdown still skips the check. Codex
   recovery parks skip the post-scope clone diagnostic at the original cleanup
-  site, preserving `sourceExitDenied` and retention latches. Claude and terminal/stale
-  paths keep their existing checks. A successful direct Claude credential switch
-  also keeps the clone for recapture.
-- **Terminal exits** (`completed`, `failed`, `cancelled`) retain their existing
-  covered release at the handler's exit. Otherwise the clone and plain journal
-  stay; a kept terminal clone still follows existing terminal-orphan handling.
+  site, preserving `sourceExitDenied` and retention latches. Claude and stale
+  paths keep their existing checks; C defers release-capable Codex terminal checks.
+  A successful direct Claude credential switch also keeps the clone for recapture.
+- **Terminal exits** (`completed`, `failed`, `cancelled`) retain covered release,
+  with Codex release-dependent coverage deferred until exact executor/facade
+  disposal under C. Missing or revoked proof keeps clone, journal, inventory and
+  paired skills; retained terminal clones follow existing terminal-orphan handling.
 - An owner-authorized cancel of a non-credential run keeps its normal cleanup; a credential-deferred captured cancel is revalidated at cleanup, and a retained result keeps the clone.
 
 On the same worker, the next claim follows retained-source recovery
@@ -808,7 +826,8 @@ Keeping the old parked source costs storage, including after resume. On an
 unwired worker retained recovery also starts a fresh path and model session,
 instead of ordinary same-path continuity; Docker-wired resumes already start
 fresh sessions. Capacity pressure does not authorize deletion. This is a partial
-fix for #2852: terminal/Docker writer exclusion and safe reclaim remain open.
+fix for #2852: unregistered/Docker writers, Claude terminal residuals, unknown
+completion provenance and safe reclaim remain open.
 After recapture, parked predecessors can become abandoned attempts; repeated
 disk parks can compound retained storage (#2013/#225). The retention-only,
 non-closing #1858 change disables unsafe automatic retention reclaim on every
@@ -835,8 +854,8 @@ checked before credentials or another model turn; a locked vault can defer recre
 into credential recovery. This does not make an open approval gate parkable.
 Slice B now covers Codex wall/hold/ordinary recovery through source-dependent
 settlement; see [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
-Strengthened terminal proof (C) remains unshipped; existing terminal disposal does not remove the
-snapshot/late-writer limitation. (AI-synced 2026-10-23)
+C adds the exact revocable post-disposal prerequisite described above, without
+broadening park or stopped-source deletion authority. (AI-synced 2026-10-24)
 After terminal settlement, verified capture evidence can attest that the disposed
 Codex registry drained for command-cache release. Later poison, changed registry
 facts, unclean cache roots or open roots retain that cache. This avoids retaining
@@ -846,7 +865,7 @@ kill behavior; no-kill observation requires a genuine report budget. Existing
 absolute deadlines expire without detaching owned cleanup or renewing authority.
 The detailed boundary is in [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
 Refs #2852 (AI-synced 2026-10-18).
-A plus B does not complete #2852. Independent #3031 work is not a prerequisite and gains no
+A/B/C do not complete #2852. Independent #3031 work is not a prerequisite and gains no
 model-free capture coverage or changes to producers, ledger, custody or settlement.
 
 Retained bytes, identity metadata and the safety inventory have no retention
@@ -1332,7 +1351,8 @@ trusted unsent outcome protected against a second execution.
 
 The open hold for that originating worker and exact claim generation G
 stays in custody. An OPEN hold for `recovery_wait` /
-`worker_requeue_exhausted` reports `source_only`, or `needs_action` if its latest
+`worker_requeue_exhausted` or `retained_recovery_exhausted` (timed or held)
+reports `source_only`, or `needs_action` if its latest
 capture failed, before archive readiness or capture progress is considered.
 The same narrow OPEN-hold exception applies to `worker_memory_pressure` at
 `recovery_wait`; this worker-loss example does not make a rejected record
@@ -1490,9 +1510,9 @@ count or disk pressure authorizes retention deletion. Existing canonical
 `beforeFree` / `freeCanonicalClonePath` and quarantine are unchanged and retain
 the **process-proof / daemon pending-create residual**: a create already accepted
 by the daemon can complete after process proof and clean listings. #1860 is the
-separate daemon-mediation follow-up; #2852's terminal/Docker writer-exclusion
-remainder is not fixed. Current unwired status is not durable proof that a path
-was never exposed to a daemon. No new proxy, marker, ledger, API, schema,
+separate daemon-mediation follow-up; C's registered-process strengthening does
+not fix #2852's Docker/unregistered-writer remainder. Current unwired status is
+not durable proof that a path was never exposed to a daemon. No new proxy, marker, ledger, API, schema,
 configuration flag or infrastructure is added.
 
 - **Socket.** The worker listens on `<dataDir>/ops/retained-source.sock` (a
@@ -1870,6 +1890,8 @@ cancelled source or pins through hosted GC, controller teardown or recycling.
 A reviewing peer preferred durable post-release retention across that lifecycle;
 that alternative was rejected because of its size and because it would recreate
 custody after release. See [ADR-2545](../adr/2545-failed-run-held-publication.md).
+Subsequent #2852 C adds exact post-disposal registered-process proof for positively bound Codex
+sources; the accepted limit still applies to writers outside that boundary.
 
 This extension adds no model-free blocked/orphan producer (#3031),
 live-predecessor widening (#2969), writer design (#2852), plan-rejection

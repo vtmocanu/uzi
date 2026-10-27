@@ -133,6 +133,7 @@ describe("recovery capture retry and restart safety (#1197)", () => {
         // Broken wrapper identity must fail before source work even if it invokes action.
         made.executor.safety = boundary === "throw-after-action" ? {
           kind: "codex", withBoundary: (request, action) => rig.safety.withBoundary(request, action),
+          acceptsTerminalDisposal: outcome => rig.safety.acceptsTerminalDisposal(outcome),
           spawnBoundaryProcess: (permit, request) => rig.safety.spawnBoundaryProcess(permit, request),
           dispose: request => rig.safety.dispose(request),
         } : rig.safety;

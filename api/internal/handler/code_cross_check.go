@@ -46,7 +46,7 @@ func codeCrossCheckResponse(cc store.CrossCheck) apitypes.CodeCrossCheck {
 	return apitypes.CodeCrossCheck{CustomGuidanceApplied: cc.GuidanceText.String != "", GuidanceDigest: hex.EncodeToString(cc.GuidanceDigest), RepoInstructionsCommit: text(cc.RepoInstructionsCommit), RepoInstructionsEnabled: cc.RepoInstructionsEnabled, RepoInstructionsDigest: hex.EncodeToString(cc.RepoInstructionsDigest), Stage: "code", Round: cc.Round, CandidateGeneration: cc.LeadClaimGeneration,
 		BaseCommit: text(cc.BaseCommit), HeadCommit: text(cc.HeadCommit), CandidateDigest: hex.EncodeToString(cc.CandidateDigest),
 		CheckerRunID: child, CheckerHarness: text(cc.CheckerHarness), CheckerModel: text(cc.CheckerModel), CheckerEffort: text(cc.CheckerEffort),
-		Outcome: cc.Outcome.String, ReasonClass: text(cc.ReasonClass), Findings: findings, Dispositions: cc.Dispositions, InterruptedAt: timestamp(cc.InterruptedAt),
+		Outcome: cc.Outcome.String, ReasonClass: text(cc.ReasonClass), Findings: findings, Coverage: cc.Coverage, Dispositions: cc.Dispositions, InterruptedAt: timestamp(cc.InterruptedAt),
 		FinalizedAt: timestamp(cc.FinalizedAt), DeadlineAt: cc.DeadlineAt.Time}
 }
 

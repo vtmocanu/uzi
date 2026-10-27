@@ -258,12 +258,25 @@ export interface CodeSnapshotRetirementProof {
  *  a late reader sees only EOF. A caller may await something before it reads (the finalize
  *  import starts its `index-pack` consumer first, which under the real supervisor can take
  *  longer than a small `pack-objects` takes to exit and reap); the bytes wait in `out`, with
- *  backpressure pausing the source, instead of being lost. */
+ *  backpressure pausing the source, instead of being lost.
+ *
+ *  `classifyAtAttach` (issue #3304, supervised boundary children only): the handle can reach this
+ *  function after its source already ended, closed or failed (the Codex supervisor closes its stdio
+ *  copies at launch, so a fast, silent child's pipe can be over before the handle is returned), and
+ *  a terminal event emitted before the listeners attach is never delivered again. With the flag the
+ *  source's terminal STATE is recorded as flags only and the exit verdict decides, through
+ *  {@link settle}'s precedence: data already read is lost output (refused at exit), an errored source
+ *  is refused with its error, an ended source with nothing ever read is a genuine empty EOF (valid
+ *  only on a clean exit), a source destroyed without ending is a premature close deferred to exit.
+ *  Nothing is destroyed eagerly. `fail(err)` settles the output with a typed error from the owner
+ *  when the supervised child's scope stops while the source can no longer finish by itself.
+ *  Callers that deliberately hand over a consumed source (`attachStdout`) keep the flag off. */
 function exitGatedStream(
   source: Readable,
   onAbandon?: () => void,
   deferPrematureCloseUntilExit = false,
-): { out: Readable; exited: (err?: Error) => void } {
+  classifyAtAttach = false,
+): { out: Readable; exited: (err?: Error) => void; fail: (err: Error) => void; done: () => boolean } {
   const out = new PassThrough();
   // A caller may drop the stream unread (tests do; a skipped publish could): an exit error
   // with no listener would be an uncaught exception that kills the worker. Consumers that
@@ -271,6 +284,7 @@ function exitGatedStream(
   out.on("error", () => undefined);
   let sourceEnded = false;
   let sourceClosedPrematurely = false;
+  let attachFailure: Error | undefined;
   let finished = false;
   let exit: { err?: Error } | undefined;
   const settle = (): void => {
@@ -278,6 +292,9 @@ function exitGatedStream(
     if (exit.err) {
       finished = true;
       out.destroy(exit.err);
+    } else if (attachFailure) {
+      finished = true;
+      out.destroy(attachFailure);
     } else if (sourceEnded) {
       finished = true;
       out.end();
@@ -312,6 +329,12 @@ function exitGatedStream(
     sourceEnded = true;
     settle();
   });
+  if (classifyAtAttach) {
+    if (source.errored) attachFailure = source.errored;
+    else if (source.readableDidRead) attachFailure = new Error("git stdout was read before it was attached (output lost)");
+    else if (source.readableEnded) sourceEnded = true;
+    else if (source.destroyed) sourceClosedPrematurely = true;
+  }
   source.pipe(out, { end: false });
   return {
     out,
@@ -319,6 +342,13 @@ function exitGatedStream(
       exit ??= { err };
       settle();
     },
+    fail: (err) => {
+      if (finished || out.destroyed) return;
+      finished = true;
+      source.unpipe(out);
+      out.destroy(err);
+    },
+    done: () => finished || out.destroyed,
   };
 }
 
@@ -756,7 +786,8 @@ interface BoundaryProcessScope {
   spawn: BoundaryProcessSpawner;
   signal: AbortSignal;
   /** Checkpoint-only budget. The soft signal may forfeit a queued lock or abort
-   * broker I/O; it must never abort an active child output collector. */
+   * broker I/O; it never settles a child output collector before that child's
+   * cancellation and completion have settled through its handle (issue #3304). */
   softSignal?: AbortSignal;
   softDeadlineAt?: number;
   now?: () => number;
@@ -1685,7 +1716,44 @@ export type RetainedLifecycleSnapshot =
   | { state: "not_terminal"; status: string }
   | { state: "unknown" };
 
+export interface EpochRetainedLimits {
+  /** Test seams may lower, but never raise, the production limits. */
+  maxDirectoryEntries?: number;
+  maxBares?: number;
+  maxMetadataBytes?: number;
+  maxMetadataRecords?: number;
+  maxSeenPaths?: number;
+}
+
+export interface EpochRetainedDiscoveryOptions {
+  signal?: AbortSignal;
+  /** Absolute wall-clock deadline. */
+  deadline?: number;
+  maxPhysicalPaths?: number;
+  limits?: EpochRetainedLimits;
+}
+
+export interface EpochRetainedDiscoveryResult {
+  groups: Array<{ barePath: string; selector: RetainedSourceSelector; paths: string[] }>;
+  inventoryComplete: boolean;
+  /** Unique physical paths observed, including omitted groups; a lower bound if incomplete. */
+  physicalPaths: number;
+  overflow: number;
+  overflowExact: boolean;
+  unreadable: number;
+}
+
 export interface RetainedInspectOptions {
+  signal?: AbortSignal;
+  /** Absolute wall-clock deadline, also covering measurement and queued locks. */
+  deadline?: number;
+  /** Opt in to bounded epoch reads; ordinary operator defaults are unchanged. */
+  epoch?: boolean;
+  maxDescriptors?: number;
+  maxPhysicalPaths?: number;
+  epochLimits?: EpochRetainedLimits;
+  /** Caller-owned read-only binding check immediately before each physical tree walk. */
+  beforeTree?: (clonePath: string) => void;
   /** Restrict to one source. Absent ⇒ an aggregate view (no disposition: holds are per run). */
   selector?: RetainedSourceSelector;
   /** Restrict to one bare (tests; the operator channel scans every bare). */
@@ -2287,6 +2355,130 @@ export class GitCache {
     closureCache: { identities: Map<string, Map<string, ClosureObject>>; entries: number };
   }>();
 
+  private readonly epochRetained = new AsyncLocalStorage<Required<EpochRetainedLimits>>();
+
+  private epochLimits(limits: EpochRetainedLimits = {}): Required<EpochRetainedLimits> {
+    const cap = (value: number | undefined, maximum: number): number => {
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 1 || value > maximum))
+        throw new Error("invalid epoch retained limit");
+      return value ?? maximum;
+    };
+    return {
+      maxDirectoryEntries: cap(limits.maxDirectoryEntries, 4096),
+      maxBares: cap(limits.maxBares, 1024),
+      maxMetadataBytes: cap(limits.maxMetadataBytes, 8 * 1024 * 1024),
+      maxMetadataRecords: cap(limits.maxMetadataRecords, 4096),
+      maxSeenPaths: cap(limits.maxSeenPaths, 4096),
+    };
+  }
+
+  private retainedCap(value: number | undefined, fallback: number): number {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 1 || value > 200))
+      throw new Error("invalid retained source cap");
+    return value ?? fallback;
+  }
+
+  /** Await uncancellable filesystem work to settlement, then observe interruption. */
+  private async retainedIO<T>(action: () => Promise<T>): Promise<T> {
+    this.checkRecoveryInterruption();
+    try { return await action(); }
+    finally { this.checkRecoveryInterruption(); }
+  }
+
+  /** Epoch reads stream and refuse the whole listing on overflow before any sort. */
+  private async retainedNames(dir: string): Promise<string[]> {
+    const limits = this.epochRetained.getStore();
+    if (!limits) return this.retainedIO(() => fs.readdir(dir));
+    this.checkRecoveryInterruption();
+    const handle = await fs.opendir(dir, { bufferSize: 1 });
+    try {
+      this.checkRecoveryInterruption();
+      const names: string[] = [];
+      for (;;) {
+        const entry = await this.retainedIO(() => handle.read());
+        if (!entry) return names;
+        if (names.length >= limits.maxDirectoryEntries) throw new Error("epoch directory entry limit");
+        names.push(entry.name);
+      }
+    } finally { await handle.close(); }
+  }
+
+  /** Discovery is only a census. Selected groups must be inspected again with fresh authority.
+   * One streaming pass, no retries: a failed bare or exhausted cap stops sibling discovery and
+   * makes every reported count a lower bound. All started filesystem work is awaited. */
+  async discoverEpochRetainedSources(opts: EpochRetainedDiscoveryOptions = {}): Promise<EpochRetainedDiscoveryResult> {
+    const limits = this.epochLimits(opts.limits);
+    const maximum = this.retainedCap(opts.maxPhysicalPaths, 200);
+    const result: EpochRetainedDiscoveryResult = {
+      groups: [], inventoryComplete: true, physicalPaths: 0, overflow: 0, overflowExact: false, unreadable: 0,
+    };
+    const seen = new Set<string>();
+    const selectedPaths = new Set<string>();
+    try {
+      await this.epochRetained.run(limits, () => this.withRecoveryOperation(
+        opts.signal ?? new AbortController().signal, opts.deadline ?? Date.now() + RETAINED_INSPECT_BUDGET_MS,
+        async () => {
+          this.checkRecoveryInterruption();
+          let handle: Awaited<ReturnType<typeof fs.opendir>>;
+          try { handle = await fs.opendir(this.reposRoot, { bufferSize: 1 }); }
+          catch (error) {
+            // A fresh volume has no repos root yet: an empty, complete census.
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+            throw error;
+          }
+          try {
+            this.checkRecoveryInterruption();
+            let entries = 0;
+            let bares = 0;
+            for (;;) {
+              const ent = await this.retainedIO(() => handle.read());
+              if (!ent) break;
+              if (++entries > limits.maxDirectoryEntries) { result.inventoryComplete = false; break; }
+              if (!ent.name.endsWith(".git") || !ent.isDirectory() || ent.isSymbolicLink()) continue;
+              if (++bares > limits.maxBares) { result.inventoryComplete = false; break; }
+              const bare = path.join(this.reposRoot, ent.name);
+              try {
+                await this.withLock(bare, async () => {
+                  const g = await this.gatherRetainedUnderLock(bare);
+                  for (const rec of g.records) {
+                    this.checkRecoveryInterruption();
+                    const paths = [...new Set(rec.parts.map(p => p.clonePath))];
+                    const fresh = paths.filter(p => !seen.has(p));
+                    if (seen.size + fresh.length > limits.maxSeenPaths) {
+                      result.inventoryComplete = false;
+                      return;
+                    }
+                    for (const p of fresh) seen.add(p);
+                    result.physicalPaths = seen.size;
+                    const unselected = paths.filter(p => !selectedPaths.has(p));
+                    if (!unselected.length) continue;
+                    // Keep whole groups; shared paths are charged once globally.
+                    if (selectedPaths.size + unselected.length > maximum) continue;
+                    const head = rec.parts[0]!;
+                    result.groups.push({ barePath: bare,
+                      selector: { runId: rec.runId, generation: head.generation ?? "none", attempt: head.attemptId ?? "canonical" },
+                      paths });
+                    for (const p of unselected) selectedPaths.add(p);
+                  }
+                });
+              } catch {
+                this.checkRecoveryInterruption();
+                result.unreadable++;
+                result.inventoryComplete = false;
+              }
+              if (!result.inventoryComplete) break;
+            }
+          } finally { await handle.close(); }
+        }));
+    } catch (error) {
+      result.inventoryComplete = false;
+      if (!opts.signal?.aborted && (error as NodeJS.ErrnoException).code !== "ENOENT") result.unreadable++;
+    }
+    result.overflow = result.physicalPaths - selectedPaths.size;
+    result.overflowExact = result.inventoryComplete;
+    return result;
+  }
+
   /** Local recovery clocks, including queued locks and actual child settlement. */
   async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>, budget?: MaintenanceBudget): Promise<T> {
     const parent = this.recoveryOperations.getStore();
@@ -2634,14 +2826,20 @@ export class GitCache {
     const barePath = path.join(this.reposRoot, bareDir);
     if (path.dirname(barePath) !== this.reposRoot) return undefined;
     try {
-      const st = await fs.lstat(barePath);
+      const st = await this.retainedIO(() => fs.lstat(barePath));
       if (st.isSymbolicLink() || !st.isDirectory()) return undefined;
-      const [realBare, realRoot] = await Promise.all([fs.realpath(barePath), fs.realpath(this.reposRoot)]);
+      const [realBare, realRoot] = await this.retainedIO(async () => {
+        const results = await Promise.allSettled([fs.realpath(barePath), fs.realpath(this.reposRoot)]);
+        return results.map(result => {
+          if (result.status === "rejected") throw result.reason;
+          return result.value;
+        }) as [string, string];
+      });
       if (path.dirname(realBare) !== realRoot) return undefined;
     } catch {
       return undefined;
     }
-    if (this.reportProofs.getStore()) {
+    if (this.epochRetained.getStore() || this.reportProofs.getStore()) {
       try { if ((await this.runGit(barePath, ["rev-parse", "--is-bare-repository"])).trim() !== "true") return undefined; }
       catch { return undefined; }
     } else if (!(await isBareRepo(barePath))) return undefined;
@@ -6208,8 +6406,9 @@ export class GitCache {
   ): Promise<{ sources: Array<{ runId: string; clonePath: string; attemptId: string; identity: string }>;
     metadata: string } | undefined> {
     try {
-      const scan = () => this.withMaintenanceFamilyLock(barePath, branch, key, runId, known, options,
-        readLockedFamily => readLockedFamily());
+      // The producer adapter is a private binding, never an ordinary option.
+      const scan = () => this.withMaintenanceFamilyLock(barePath, branch, key, runId, known,
+        { signal: options.signal, maxSources: options.maxSources }, readLockedFamily => readLockedFamily());
       // Discovery cannot mint a producer token; a paid recheck shares its slot.
       return await (MaintenanceResources.active() && !MaintenanceResources.discoveryActive()
         ? scan() : MaintenanceResources.runDiscovery(scan, { signal: options.signal }));
@@ -6222,7 +6421,7 @@ export class GitCache {
   private withMaintenanceFamilyLock<T>(
     barePath: string, branch: string, key: string, runId: string,
     known: ReadonlyArray<{ runId: string; clonePath: string; attemptId: string; identity?: string }>,
-    options: { signal?: AbortSignal; maxSources?: number },
+    options: { signal?: AbortSignal; maxSources?: number; configRead?: () => Promise<string> },
     action: (readLockedFamily: () => Promise<{ sources: Array<{ runId: string; clonePath: string;
       attemptId: string; identity: string }>; metadata: string }>) => Promise<T>,
   ): Promise<T> {
@@ -6245,8 +6444,10 @@ export class GitCache {
             throw new Error("invalid known source");
           recoverySource({ runId: source.runId, clonePath: source.clonePath, attemptId: source.attemptId });
         }
-        await this.assertRecoveryBare(barePath);
-        const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
+        // Producer supplies its guarded canonical reader; ordinary callers retain validation.
+        if (!options.configRead) await this.assertRecoveryBare(barePath);
+        const config = options.configRead ? await options.configRead() :
+          await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
         // runGit charges every raw null-list entry before delivering this snapshot.
         const canonical = this.runnerClonePath(barePath, key);
         for (const source of known) {
@@ -6338,15 +6539,22 @@ export class GitCache {
         if (!selected.length || selected.length !== known.length ||
             new Set(known.map(s => s.clonePath)).size !== known.length) throw new Error("incomplete known family");
         const sources: Array<{ runId: string; clonePath: string; attemptId: string; identity: string }> = [];
+        const chargeSource = (p: string) => {
+          if (!options.configRead) return;
+          MaintenanceResources.consume("sourceEntries", 1);
+          MaintenanceResources.consume("metadataBytes", 2048 + Buffer.byteLength(p));
+        };
         // Stream actual siblings; unknown entries and unsafe artifacts protect.
         for (const ancestor of [path.resolve(this.runnerRoot), path.dirname(canonical)]) {
+          chargeSource(ancestor);
           const stat = await fs.lstat(ancestor);
           if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe source ancestor");
         }
+        chargeSource(path.dirname(canonical));
         const directory = await fs.opendir(path.dirname(canonical), { bufferSize: 1 });
         try {
           for (;;) {
-            MaintenanceResources.consumeIfActive("adminEntries", 1);
+            MaintenanceResources.consumeIfActive(options.configRead ? "sourceEntries" : "adminEntries", 1);
             const entry = await directory.read();
             if (!entry) break;
             MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(entry.name));
@@ -6364,6 +6572,7 @@ export class GitCache {
           if (!original || entry.branch !== branch || entry.state === "retired" ||
               this.clonePathShape(entry.clonePath, canonical)?.attemptId !== entry.attemptId)
             throw new Error("unknown source family");
+          chargeSource(entry.clonePath);
           const stat = await fs.lstat(entry.clonePath);
           if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe source path");
           const identity = stat.dev + ":" + stat.ino;
@@ -6381,6 +6590,11 @@ export class GitCache {
   /** Pure existing-origin identity. Forge coordinates are not independent repo binding. */
   async maintenanceOriginDigest(barePath: string, originalUrl: string): Promise<string | undefined> {
     await this.assertRecoveryBare(barePath);
+    const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
+    return this.maintenanceOriginFromConfig(barePath, originalUrl, config);
+  }
+
+  private maintenanceOriginFromConfig(barePath: string, originalUrl: string, config: string): string | undefined {
     if (this.barePathFor(originalUrl) !== barePath) return undefined;
     const canonical = (raw: string): string | undefined => {
       const [host, repo] = splitHostAndPath(raw);
@@ -6392,7 +6606,6 @@ export class GitCache {
     };
     const expected = canonical(originalUrl);
     if (!expected) return undefined;
-    const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
     const values = (key: string) => config.split("\0").filter(s => s === key || s.startsWith(key + "\n"));
     const origins = values("remote.origin.url"), cached = values(BARE_CACHE_ORIGIN_KEY);
     if (origins.length !== 1 || !origins[0]!.includes("\n") ||
@@ -6489,7 +6702,7 @@ export class GitCache {
   }
 
   private async assertRecoveryBare(barePath: string): Promise<void> {
-    const st = await fs.lstat(path.join(barePath, "config"));
+    const st = await this.retainedIO(() => fs.lstat(path.join(barePath, "config")));
     if (!st.isFile() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o002) !== 0 ||
         ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() || (uidSplitActive() && st.gid === RUNNER_UID)))) {
       throw new Error("unsafe recovery bare config");
@@ -7504,10 +7717,11 @@ export class GitCache {
    *  `present` with its dev:ino identity, ENOENT is `missing`, anything else is `unsafe`. */
   private async clonePresence(p: string): Promise<{ presence: "present" | "missing" | "unsafe"; devIno: string }> {
     try {
-      const st = await fs.lstat(p);
+      const st = await this.retainedIO(() => fs.lstat(p));
       if (st.isSymbolicLink() || !st.isDirectory()) return { presence: "unsafe", devIno: "unsafe" };
       return { presence: "present", devIno: `${st.dev}:${st.ino}` };
     } catch (err) {
+      this.checkRecoveryInterruption();
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return { presence: "missing", devIno: "missing" };
       return { presence: "unsafe", devIno: "unsafe" };
     }
@@ -7561,6 +7775,7 @@ export class GitCache {
         try {
           out.valid.push({ marker: await this.parseStoppedMarker(barePath, runId, raw), raw });
         } catch {
+          this.checkRecoveryInterruption();
           out.malformed.push({ runId, raw });
         }
       }
@@ -7909,7 +8124,7 @@ export class GitCache {
         throw err;
       });
       if (wt.length > 0) return false;
-      const out = await this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], { env: NO_REPLACE_ENV });
+      const out = await this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
       const shas = new Set<string>();
       for (const line of out.split("\n")) {
         if (line === "") continue;
@@ -7964,7 +8179,7 @@ export class GitCache {
       if (attributes) return false;
       // Scope-less read (global/system are pinned to /dev/null): it follows include/includeIf and
       // config.worktree exactly as `status` does, which `--local` would not.
-      const config = await this.runGitAsRunner(cwd, ["config", "--null", "--list"], NO_REPLACE);
+      const config = await this.runGitAsRunner(cwd, ["config", "--null", "--list"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
       const entries = config.split("\0");
       if (entries.some((e) => /^(filter\.|include\.|includeif\.|extensions\.worktreeconfig|core\.attributesfile)/i.test(e))) return false;
       // A case-folding clone could hide a tracked `readme` behind an untracked `README`. The
@@ -7990,7 +8205,7 @@ export class GitCache {
         throw err;
       });
       if (modules) return false;
-      const staged = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"], NO_REPLACE);
+      const staged = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
       for (const entry of staged.split("\0")) {
         const m = /^160000 [0-9a-f]+ [0-3]\t([\s\S]+)$/.exec(entry);
         if (!m) continue;
@@ -8003,9 +8218,9 @@ export class GitCache {
         if (!st.isDirectory() || st.isSymbolicLink()) return false;
         if ((await fs.readdir(gitlink)).length > 0) return false;
       }
-      const status = await this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], READ_ONLY_STATUS);
+      const status = await this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], { env: { ...READ_ONLY_STATUS.env, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
       if (status.split("\n").some((l) => l.length > 0)) return false;
-      const flags = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], NO_REPLACE);
+      const flags = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
       for (const entry of flags.split("\0")) {
         if (entry.length === 0) continue;
         // `H` is a normal entry; a lowercase tag is assume-unchanged and `S`/`s` is skip-worktree.
@@ -8024,7 +8239,7 @@ export class GitCache {
     if (only !== undefined) return [only];
     let names: string[];
     try {
-      names = await fs.readdir(this.reposRoot);
+      names = await this.retainedNames(this.reposRoot);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw err;
@@ -8033,8 +8248,14 @@ export class GitCache {
     for (const name of names.sort()) {
       if (!name.endsWith(".git")) continue;
       const p = path.join(this.reposRoot, name);
-      const st = await fs.lstat(p).catch(() => undefined);
-      if (st?.isDirectory() && !st.isSymbolicLink()) out.push(p);
+      const st = await this.retainedIO(() => fs.lstat(p)).catch(() => {
+        this.checkRecoveryInterruption();
+        return undefined;
+      });
+      if (st?.isDirectory() && !st.isSymbolicLink()) {
+        if (out.length >= (this.epochRetained.getStore()?.maxBares ?? Infinity)) throw new Error("epoch bare limit");
+        out.push(p);
+      }
     }
     return out;
   }
@@ -8066,6 +8287,7 @@ export class GitCache {
       let m = /^uzi-attempts\.(.+)\.entry$/.exec(k);
       if (m) {
         const e = parseAttemptLedgerEntry(v);
+        if (!e && this.epochRetained.getStore()) throw new Error("unreadable epoch attempt ledger");
         if (e) {
           ledger.set(e.attemptId, { ...e, branch: m[1]! });
           ledgerRaw.set(e.attemptId, v);
@@ -8086,6 +8308,7 @@ export class GitCache {
           journal = parseRecoveryJournal(v);
         } catch {
           this.checkRecoveryInterruption();
+          if (this.epochRetained.getStore()) throw new Error("unreadable epoch journal");
           bareProblems.push(`unreadable_journal:${sanitizeForLog(m[1]!, 64)}`);
         }
         active.set(m[1]!, { raw: v, journal });
@@ -8099,9 +8322,12 @@ export class GitCache {
       descriptors = await this.protectedRecoveries(barePath);
     } catch {
       this.checkRecoveryInterruption();
+      if (this.epochRetained.getStore()) throw new Error("unreadable epoch protected descriptors");
       bareProblems.push("protected_descriptors_unreadable");
     }
     const markers = await this.readStoppedMarkers(barePath, list);
+    if (this.epochRetained.getStore() && (markers.malformed.length || markers.overflow.size))
+      throw new Error("unreadable epoch stopped markers");
 
     // path → the journals, descriptors and markers that name it.
     const namers = new Map<string, string[]>();
@@ -8278,7 +8504,7 @@ export class GitCache {
     for (const { root, kind, field, resolution } of roots) {
       let names: string[];
       try {
-        names = (await fs.readdir(path.join(root, runId))).sort();
+        names = (await this.retainedNames(path.join(root, runId))).sort();
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw err;
@@ -8296,17 +8522,19 @@ export class GitCache {
   /** Best-effort, informational generation of a local record (a bounded no-follow read). */
   private async readRecordGeneration(file: string, field: string): Promise<number | null> {
     if (!file.endsWith(".json")) return null;
+    this.checkRecoveryInterruption();
     try {
       const fh = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
       try {
         const buf = Buffer.alloc(65536);
-        const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+        const { bytesRead } = await this.retainedIO(() => fh.read(buf, 0, buf.length, 0));
         const g = (JSON.parse(buf.subarray(0, bytesRead).toString("utf8")) as Record<string, unknown>)[field];
         return Number.isSafeInteger(g) ? (g as number) : null;
       } finally {
         await fh.close();
       }
     } catch {
+      this.checkRecoveryInterruption();
       return null;
     }
   }
@@ -8466,8 +8694,9 @@ export class GitCache {
     let bytes = 0;
     let visited = 0;
     try {
-      bytes += (await fs.lstat(root)).blocks * 512;
+      bytes += (await this.retainedIO(() => fs.lstat(root))).blocks * 512;
     } catch {
+      this.checkRecoveryInterruption();
       return { bytes: 0, complete: false };
     }
     const stack: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
@@ -8475,21 +8704,25 @@ export class GitCache {
       const { dir, depth } = stack.pop()!;
       let handle;
       try {
+        this.checkRecoveryInterruption();
         handle = await fs.opendir(dir);
       } catch {
+        this.checkRecoveryInterruption();
         return { bytes, complete: false };
       }
       try {
+        this.checkRecoveryInterruption();
         for (;;) {
           if (now() >= deadline) return { bytes, complete: false };
-          const ent = await handle.read();
+          const ent = await this.retainedIO(() => handle.read());
           if (!ent) break;
           if (++visited > maxEntries) return { bytes, complete: false };
           const p = path.join(dir, ent.name);
           let st: Stats;
           try {
-            st = await fs.lstat(p);
+            st = await this.retainedIO(() => fs.lstat(p));
           } catch (err) {
+            this.checkRecoveryInterruption();
             if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
             return { bytes, complete: false };
           }
@@ -8500,7 +8733,7 @@ export class GitCache {
           }
         }
       } finally {
-        await handle.close().catch(() => undefined);
+        await handle.close();
       }
     }
     return { bytes, complete: true };
@@ -8514,15 +8747,25 @@ export class GitCache {
    * to get a disposition.
    */
   async inspectRetainedSources(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
+    const run = () => this.inspectRetainedSourcesScoped(opts);
+    return opts.epoch ? this.epochRetained.run(this.epochLimits(opts.epochLimits), run) : run();
+  }
+
+  private async inspectRetainedSourcesScoped(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
+    const maxDescriptors = opts.epoch ? this.retainedCap(opts.maxDescriptors, 200) : RETAINED_MAX_DESCRIPTORS;
+    const maxPhysicalPaths = opts.epoch ? this.retainedCap(opts.maxPhysicalPaths, 200) : Infinity;
+    const physicalPaths = new Set<string>();
     const now = opts.now ?? Date.now;
     const budgetMs = opts.budgetMs ?? RETAINED_INSPECT_BUDGET_MS;
     const deadline = now() + budgetMs;
+    const operationDeadline = Math.min(opts.deadline ?? Infinity, Date.now() +
+      (opts.now === undefined ? budgetMs : Math.max(budgetMs, RETAINED_INSPECT_BUDGET_MS)));
     let partial = false;
     let unreadable = 0;
     type Evaluated = Awaited<ReturnType<GitCache["evaluateRetained"]>>;
     const found: Array<{ g: GatheredBare; rec: GatheredRecord; ev: Evaluated }> = [];
     const exhausted = (err: unknown): boolean =>
-      now() >= deadline || (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError" || /deadline exhausted/.test(err.message)));
+      opts.signal?.aborted === true || now() >= deadline || Date.now() >= (opts.deadline ?? Infinity) || (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError" || /deadline exhausted/.test(err.message)));
     const byIdentity = (x: { rec: GatheredRecord }, y: { rec: GatheredRecord }): number =>
       (x.rec.runId < y.rec.runId ? -1 : x.rec.runId > y.rec.runId ? 1 : 0) ||
       (x.rec.parts[0]!.clonePath < y.rec.parts[0]!.clonePath ? -1 : x.rec.parts[0]!.clonePath > y.rec.parts[0]!.clonePath ? 1 : 0);
@@ -8530,8 +8773,7 @@ export class GitCache {
       // One recovery clock covers the bare locks (queued waits included), the gather and the
       // evaluation; exhausting it is `partial`, never a silently shorter list.
       // (An injected clock governs the budget in tests; the real-time guard then stays at the default.)
-      const realBudgetMs = opts.now === undefined ? budgetMs : Math.max(budgetMs, RETAINED_INSPECT_BUDGET_MS);
-      await this.withRecoveryOperation(new AbortController().signal, Date.now() + realBudgetMs, async () => {
+      await this.withRecoveryOperation(opts.signal ?? new AbortController().signal, operationDeadline, async () => {
         for (const bare of await this.retainedBares(opts.barePath)) {
           if (now() >= deadline) {
             partial = true;
@@ -8549,8 +8791,17 @@ export class GitCache {
                   : this.matchesRetainedSelector(rec, opts.selector))
                 .map((rec) => ({ g, rec }))
                 .sort(byIdentity)
-                .slice(0, RETAINED_MAX_DESCRIPTORS + 1);
+                .slice(0, maxDescriptors + 1);
               for (const { rec } of matching) {
+                this.checkRecoveryInterruption();
+                if (opts.epoch) {
+                  const fresh = [...new Set(rec.parts.map(p => p.clonePath))].filter(p => !physicalPaths.has(p));
+                  if (found.length >= maxDescriptors || physicalPaths.size + fresh.length > maxPhysicalPaths) {
+                    partial = true;
+                    continue;
+                  }
+                  for (const p of fresh) physicalPaths.add(p);
+                }
                 const ev = await this.evaluateRetained(g, rec, {
                   holds: opts.selector === undefined ? undefined : opts.holds,
                   ...(opts.selector === undefined || opts.lifecycle === undefined ? {} : { lifecycle: opts.lifecycle }),
@@ -8577,11 +8828,13 @@ export class GitCache {
       }
     }
     found.sort(byIdentity);
-    if (found.length > RETAINED_MAX_DESCRIPTORS) {
+    if (found.length > maxDescriptors) {
       partial = true;
-      found.length = RETAINED_MAX_DESCRIPTORS;
+      found.length = maxDescriptors;
     }
     const sources: RetainedSourceEvidence[] = [];
+    const measurements = new Map<string, { bytes: number; complete: boolean }>();
+    let bindingFailed = false;
     for (const { g, rec, ev } of found) {
       const parts: RetainedSourcePart[] = [];
       let measured = 0;
@@ -8591,7 +8844,22 @@ export class GitCache {
         let bytes: number | null = null;
         if (p.presence === "missing") bytes = 0;
         else if (p.presence === "present") {
-          const m = await this.measureAllocated(p.clonePath, now, deadline, opts.measureCaps);
+          let m = { bytes: 0, complete: false };
+          try {
+            if (bindingFailed) throw new Error("retained tree binding check failed");
+            m = (opts.epoch ? measurements.get(p.clonePath) : undefined) ??
+              await this.withRecoveryOperation(opts.signal ?? new AbortController().signal, operationDeadline,
+                async () => {
+                  this.checkRecoveryInterruption();
+                  try { opts.beforeTree?.(p.clonePath); }
+                  catch (error) { bindingFailed = true; throw error; }
+                  this.checkRecoveryInterruption();
+                  return this.measureAllocated(p.clonePath, now, deadline, opts.measureCaps);
+                });
+            if (opts.epoch) measurements.set(p.clonePath, m);
+          } catch (error) {
+            if (!exhausted(error)) unreadable++;
+          }
           bytes = m.complete ? m.bytes : null;
           if (!m.complete) partial = true;
         }
@@ -8617,6 +8885,10 @@ export class GitCache {
         sources: parts, consumers: [...ev.consumers, ...ev.blockers.map((b) => `blocker:${b}`)], localRecords: ev.localRecords,
         holds: ev.holdsView, disposition: ev.disposition,
       });
+    }
+    if (bindingFailed) {
+      partial = true;
+      for (const source of sources) source.disposition = undefined;
     }
     return { sources, partial, unreadable, sampledAt: new Date(now()).toISOString() };
   }
@@ -9366,8 +9638,9 @@ export class GitCache {
   /** Callback errors retain custody; no identity is inferred from terminal body fields. */
   async hasPhysicalTerminalProtection(runId: string): Promise<boolean> {
     try {
-      return await this.terminalRecordProtection?.(runId) ?? false;
+      return await this.retainedIO(async () => await this.terminalRecordProtection?.(runId) ?? false);
     } catch {
+      this.checkRecoveryInterruption();
       return true;
     }
   }
@@ -9381,7 +9654,7 @@ export class GitCache {
     if (await this.hasPhysicalTerminalProtection(runId)) return true;
     for (const root of [this.recoveryRoot, this.recoverySettlementRoot]) {
       try {
-        if ((await fs.readdir(path.join(root, runId))).length > 0) return true;
+        if ((await this.retainedNames(path.join(root, runId))).length > 0) return true;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") return true;
       }
@@ -10764,11 +11037,13 @@ export class GitCache {
 
   /** Remove the run's runner clone (a standalone clone, not a linked worktree — no
    *  bare interaction). The warm bare and the fetched refs/objects are kept. */
-  async removeRunnerClone(clonePath: string, ownerRunId?: string): Promise<void> {
+  async removeRunnerClone(clonePath: string, ownerRunId?: string, opts: { processProof?: () => boolean } = {}): Promise<void> {
     const refuseUnderQuarantine = (): void => {
+      if (opts.processProof && opts.processProof() !== true) throw new Error("runner clone process proof revoked");
       this.checkRecoveryInterruption();
       if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
     };
+    if (opts.processProof) refuseUnderQuarantine();
     if (ownerRunId !== undefined) {
       if (await this.hasPhysicalTerminalProtection(ownerRunId)) {
         throw new Error("terminal record custody retains runner clone");
@@ -10781,15 +11056,19 @@ export class GitCache {
       if (path.dirname(parent) === path.resolve(this.runnerRoot)) {
         const bare = path.join(this.reposRoot, `${path.basename(parent)}.git`);
         if (await this.pathPresent(bare)) {
-          await this.withLock(bare, () => this.refuseMarkedPaths(bare, [path.resolve(clonePath)], ownerRunId));
+          await this.withLock(bare, () => {
+            refuseUnderQuarantine();
+            return this.refuseMarkedPaths(bare, [path.resolve(clonePath)], ownerRunId);
+          });
         }
       }
     }
+    if (opts.processProof) refuseUnderQuarantine();
     // The pinned teardown awaits several opens and stats before it deletes anything, so a
     // latch landing in that window is rechecked synchronously at each destructive dispatch.
     await rmRunnerTeardownTree(clonePath, {
       allowCloneName: true,
-      ...(ownerRunId !== undefined ? { beforeDestroy: refuseUnderQuarantine } : {}),
+      ...((ownerRunId !== undefined || opts.processProof) ? { beforeDestroy: refuseUnderQuarantine } : {}),
     });
   }
 
@@ -10821,24 +11100,30 @@ export class GitCache {
    */
   /** Credential-free exact prior retirement proof. Absence alone is never attribution. */
   async completionSourceAlreadyRetired(barePath: string, branch: string, runId: string,
-    clonePath: string, attemptId: string | undefined): Promise<boolean> {
-    if (!attemptId) return false;
+    clonePath: string, attemptId: string | undefined, opts: { processProof?: () => boolean } = {}): Promise<boolean> {
+    const processOpen = (): boolean => opts.processProof === undefined || opts.processProof() === true;
+    if (!attemptId || !processOpen()) return false;
     return this.withLock(barePath, async () => {
+      if (!processOpen()) return false;
       const entry = (await this.readAttemptLedger(barePath, branch)).get(attemptId);
-      if (entry?.runId !== runId || entry.clonePath !== clonePath || entry.state !== "retired") return false;
+      if (!processOpen() || entry?.runId !== runId || entry.clonePath !== clonePath || entry.state !== "retired") return false;
       const open = async (): Promise<boolean> =>
-        !await this.hasPhysicalTerminalProtection(runId) && residueQuarantine() === undefined;
+        processOpen() && !await this.hasPhysicalTerminalProtection(runId) && processOpen() && residueQuarantine() === undefined;
       if (!await open()) return false;
       const pending = await this.readRecoveryCapture(barePath, branch);
+      if (!processOpen()) return false;
       if (pending && (pending.runId !== runId || pending.clonePath !== clonePath || pending.attemptId !== attemptId))
         return false; // A successor/adoption owns this branch now.
       if (pending?.recovery || pending?.retainedSources?.length) return false;
       try { await fs.lstat(clonePath); return false; }
       catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
       if (!await open()) return false;
-      // Durable retirement already proves disposal; only finish this exact old journal.
-      if (pending) await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
-      return true;
+      // The retired ledger proves attribution only. The caller may independently require live process exclusion.
+      if (pending) {
+        if (!processOpen()) return false;
+        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+      }
+      return processOpen();
     });
   }
 
@@ -10848,11 +11133,14 @@ export class GitCache {
     branch: string,
     ownerRunId: string,
     opts: { discard: boolean; attemptId?: string; orphanDiagnostics?: OrphanDiagnostics;
+      /** Synchronous deny-only proof; never grants retirement authority. */
+      processProof?: () => boolean;
       onRetirementUnproven?: () => void;
       verifiedSuccessor?: { key: string; generation: number; expected: RecoveryJournalEntry;
         acknowledged: () => Promise<boolean> };
       completionSource?: { expectedHead: string; canDelete: () => boolean } },
   ): Promise<RunnerCloneRetireResult> {
+    if (opts.processProof && opts.processProof() !== true) throw new Error("runner clone process proof revoked");
     if (opts.completionSource && opts.verifiedSuccessor) throw new Error("retirement authorities are mutually exclusive");
     // Completion retains adoption exclusion through holding/scratch disposal as well.
     if (opts.completionSource) return this.withLock(barePath,
@@ -10866,6 +11154,8 @@ export class GitCache {
     branch: string,
     ownerRunId: string,
     opts: { discard: boolean; attemptId?: string; orphanDiagnostics?: OrphanDiagnostics;
+      /** Synchronous deny-only proof; never grants retirement authority. */
+      processProof?: () => boolean;
       onRetirementUnproven?: () => void;
       verifiedSuccessor?: { key: string; generation: number; expected: RecoveryJournalEntry;
         acknowledged: () => Promise<boolean> };
@@ -10876,17 +11166,32 @@ export class GitCache {
     const unproven = (): void => {
       try { opts.onRetirementUnproven?.(); } catch { /* preserve retirement behavior */ }
     };
+    let processRevokedHere = false;
+    const checkProcessProof = (): void => {
+      if (opts.processProof) {
+        let valid: boolean;
+        try { valid = opts.processProof(); }
+        catch (error) { processRevokedHere = true; throw error; }
+        if (valid === true) return;
+        processRevokedHere = true;
+        throw new Error("runner clone process proof revoked");
+      }
+    };
+    checkProcessProof();
     let stage: OrphanRetireStage = "journal_read";
+    let dispatched: Promise<void> | undefined;
     const retire = async (): Promise<{ holding?: string; scratch?: string; renamed: boolean; disposition: RunnerCloneRetireResult }> => {
       // 1. Pre-rename pair validation. Require the EXACT (ownerRunId, clonePath) pair
       //    to STILL be journaled before moving anything. A missing/malformed journal, or
       //    a lock-gap rewrite to a different runId/path, moves NOTHING and fails closed.
+      checkProcessProof();
       const pending = await this.readRecoveryCapture(barePath, branch);
       stage = "journal_validation";
       if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, ownerRunId);
       }
       // issue #1786: a marked stopped canonical source is retired only by the operator discard.
+      checkProcessProof();
       await this.refuseMarkedPaths(barePath, [clonePath], ownerRunId);
       const verified = opts.verifiedSuccessor;
       let anchored: RecoveryJournalEntry | undefined;
@@ -10898,6 +11203,7 @@ export class GitCache {
             !pending.retainedSources?.length || JSON.stringify(pending) !== JSON.stringify(verified.expected)) {
           throw new Error("completed successor identity or predecessor set changed");
         }
+        checkProcessProof();
         await this.checkedRecovery(barePath, branch, verified.key, pending);
         const predecessors = pending.retainedSources.filter(s => !sameRecoverySource(s, pending));
         if (!predecessors.length || predecessors.length !== pending.retainedSources.length) {
@@ -10910,6 +11216,7 @@ export class GitCache {
       // Each check reads authority once through the trusted runner callback, no retries.
       // A failed check blocks this retirement alone and never releases predecessor evidence.
       const checkSuccessor = async (expected: RecoveryJournalEntry) => {
+        checkProcessProof();
         if (!verified) return;
         if (await this.hasPhysicalTerminalProtection(ownerRunId)) {
           throw new Error("verified successor FINAL authority unavailable");
@@ -10918,31 +11225,39 @@ export class GitCache {
         if (ledger?.runId !== ownerRunId || ledger.clonePath !== clonePath || ledger.state !== "live") {
           throw new Error("successor ledger identity changed");
         }
+        checkProcessProof();
         const current = await this.checkedRecovery(barePath, branch, verified.key, expected);
         if (JSON.stringify(current) !== JSON.stringify(expected)) throw new Error("successor predecessor set changed");
         if (await verified.acknowledged() !== true) throw new Error("verified successor FINAL authority unavailable");
+        checkProcessProof();
         // The authority callback awaits physical journals; revalidate mutable identity after it.
         const afterLedger = (await this.readAttemptLedger(barePath, branch)).get(opts.attemptId!);
         if (afterLedger?.runId !== ownerRunId || afterLedger.clonePath !== clonePath || afterLedger.state !== "live")
           throw new Error("successor ledger identity changed");
+        checkProcessProof();
         const afterJournal = await this.checkedRecovery(barePath, branch, verified.key, expected);
         if (JSON.stringify(afterJournal) !== JSON.stringify(expected)) throw new Error("successor predecessor set changed");
         if (await this.hasPhysicalTerminalProtection(ownerRunId)) throw new Error("verified successor FINAL authority unavailable");
+        checkProcessProof();
         if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
       };
+      checkProcessProof();
       if (opts.completionSource) {
         // Exact ownership and expected HEAD are checked while adoption shares this bare lock.
         const parsed = parseAttemptPath(clonePath, path.resolve(this.runnerRoot));
         const key = parsed?.key ?? path.basename(clonePath);
         if (pending.attemptId !== opts.attemptId ||
-            !await this.classifyOwnerClonePath(barePath, branch, key, ownerRunId, clonePath) ||
-            await this.worktreeHead(clonePath) !== opts.completionSource.expectedHead ||
+            !await this.classifyOwnerClonePath(barePath, branch, key, ownerRunId, clonePath))
+          throw new Error("completion source attribution changed");
+        checkProcessProof();
+        if (await this.worktreeHead(clonePath) !== opts.completionSource.expectedHead ||
             !opts.completionSource.canDelete()) throw new Error("completion source attribution changed");
       }
       // 2. Containment. Only ever move a path strictly UNDER runnerRoot. Resolve both
       //    sides and require a path-separator boundary so a sibling like
       //    `<runnerRoot>-evil` cannot satisfy a bare prefix test. A path outside
       //    runnerRoot (whatever the journal claims) fails closed and moves nothing.
+      checkProcessProof();
       stage = "containment";
       const resolvedClone = path.resolve(clonePath);
       const resolvedRoot = path.resolve(this.runnerRoot);
@@ -10965,6 +11280,7 @@ export class GitCache {
         this.runnerHoldingRoot,
         `${ownerRunId.replace(/[^A-Za-z0-9_-]/g, "_")}-${randomUUID()}`,
       );
+      checkProcessProof();
       stage = "holding_parent";
       await fs.mkdir(path.dirname(holdingDest), { recursive: true, mode: 0o700 });
       // 4. Atomic move + ENOENT disambiguation, with an EXDEV fallback (issue #1354).
@@ -10974,6 +11290,7 @@ export class GitCache {
       let exdev = false;
       stage = "rename";
       // issue #2213: a latch that landed during the awaits above keeps the clone; nothing moved.
+      checkProcessProof();
       if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
       if (opts.completionSource && !opts.completionSource.canDelete()) throw new Error("completion cleanup exclusion changed");
       if (anchored) {
@@ -10987,173 +11304,324 @@ export class GitCache {
         }
         await checkSuccessor(anchored);
       }
-      this.checkRecoveryInterruption();
+      // Snapshot the predecessor anchor, not the initial successor journal. Rollback
+      // touches only this invocation's metadata, while adoption still shares this lock.
+      const journalBeforeMove = opts.completionSource ? undefined : await this.readRecoveryCaptureWithRaw(barePath, branch);
+      const ledgerBeforeMove = (opts.completionSource ? [] : await this.readAllAttemptLedgerRaw(barePath))
+        .filter(([b]) => b === branch).map(([, raw]) => raw);
+      let cleared = false, appended = false;
+      let movedTo: string | undefined;
+      const retiredValue = opts.attemptId === undefined ? undefined : attemptLedgerValue({
+        attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired",
+      });
       try {
-        await fs.rename(clonePath, holdingDest);
-      } catch (err) {
-        const e = err as NodeJS.ErrnoException;
-        if (e.code === "EXDEV") {
-          // issue #1354 — runnerRoot and the quarantine share a dataDir PATH but are on
-          // DIFFERENT mounts on a docker-lane worker (the runner-shared subPath bind mount vs the
-          // PVC root; formerly an emptyDir), so the rename to holdingDest is a cross-mount move that
-          // cannot happen even when both sit on one filesystem. Free the canonical with
-          // an intra-device atomic rename into a scratch parent under runnerRoot (SAME
-          // device — never EXDEV, and it survives a daemon file-hold where a recursive rm
-          // races). The #1315 invariant is preserved: the journaled canonical is freed ONLY
-          // by an atomic rename, never a direct recursive rm of partial residue.
-          exdev = true;
-          if (opts.discard) {
-            // Hot path (G1 rename-first): the owner's own terminal trash. Free the
-            // canonical and copy NOTHING — an fs.cp here would throw on a git fsmonitor
-            // socket / FIFO the clone may carry. No holdingDest is used on this path.
-            stage = "intra_device_rename";
-            const scratchParent = await this.createRetireScratchParent();
-            if (opts.completionSource && !opts.completionSource.canDelete()) throw new Error("completion cleanup exclusion changed");
-            renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent, undefined,
-              anchored ? () => checkSuccessor(anchored!) : undefined);
-            scratch = scratchParent;
-          } else {
-            // Rare foreign-orphan reclaim: the quarantine is RETAINED FOREVER, so
-            // cross-crash retention is a hard requirement → copy-before-free. COMPLETE the
-            // symlink-safe copy into holdingDest FIRST, while the canonical AND the journal
-            // still protect a retry.
-            stage = "retained_copy";
-            try {
-              await fs.cp(clonePath, holdingDest, {
-                recursive: true,
-                dereference: false,
-                verbatimSymlinks: true,
-                // dereference:false + verbatimSymlinks:true copy symlinks AS links. The
-                // filter skips sockets/FIFOs: fs.cp throws ERR_FS_CP_SOCKET /
-                // ERR_FS_CP_FIFO_PIPE on them, and the git fsmonitor daemon plants a UNIX
-                // socket in .git/.
-                filter: async (src) => {
-                  const s = await fs.lstat(src);
-                  return !s.isSocket() && !s.isFIFO();
-                },
-              });
-            } catch (copyErr) {
-              // Remove ONLY the incomplete copy; the canonical + journal stay intact so a
-              // retry can re-copy. No scratch parent exists yet (created below), so this
-              // cleanup is scoped strictly to the copy.
-              await this.removeBestEffort(holdingDest, "retire-incomplete-copy");
-              throw copyErr;
+        this.checkRecoveryInterruption();
+        try {
+          checkProcessProof();
+          await fs.rename(clonePath, holdingDest);
+          movedTo = holdingDest;
+        } catch (err) {
+          const e = err as NodeJS.ErrnoException;
+          if (e.code === "EXDEV") {
+            // issue #1354 — runnerRoot and the quarantine share a dataDir PATH but are on
+            // DIFFERENT mounts on a docker-lane worker (the runner-shared subPath bind mount vs the
+            // PVC root; formerly an emptyDir), so the rename to holdingDest is a cross-mount move that
+            // cannot happen even when both sit on one filesystem. Free the canonical with
+            // an intra-device atomic rename into a scratch parent under runnerRoot (SAME
+            // device — never EXDEV, and it survives a daemon file-hold where a recursive rm
+            // races). The #1315 invariant is preserved: the journaled canonical is freed ONLY
+            // by an atomic rename, never a direct recursive rm of partial residue.
+            exdev = true;
+            if (opts.discard) {
+              // Hot path (G1 rename-first): the owner's own terminal trash. Free the
+              // canonical and copy NOTHING — an fs.cp here would throw on a git fsmonitor
+              // socket / FIFO the clone may carry. No holdingDest is used on this path.
+              stage = "intra_device_rename";
+              checkProcessProof();
+              const scratchParent = await this.createRetireScratchParent();
+              if (opts.completionSource && !opts.completionSource.canDelete()) throw new Error("completion cleanup exclusion changed");
+              renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent, undefined,
+                anchored ? () => checkSuccessor(anchored!) : undefined, checkProcessProof);
+              scratch = scratchParent;
+              if (renamed) movedTo = path.join(scratchParent, "clone");
+            } else {
+              // Rare foreign-orphan reclaim: the quarantine is RETAINED FOREVER, so
+              // cross-crash retention is a hard requirement → copy-before-free. COMPLETE the
+              // symlink-safe copy into holdingDest FIRST, while the canonical AND the journal
+              // still protect a retry.
+              stage = "retained_copy";
+              try {
+                checkProcessProof();
+                await fs.cp(clonePath, holdingDest, {
+                  recursive: true,
+                  dereference: false,
+                  verbatimSymlinks: true,
+                  // dereference:false + verbatimSymlinks:true copy symlinks AS links. The
+                  // filter skips sockets/FIFOs: fs.cp throws ERR_FS_CP_SOCKET /
+                  // ERR_FS_CP_FIFO_PIPE on them, and the git fsmonitor daemon plants a UNIX
+                  // socket in .git/.
+                  filter: async (src) => {
+                    checkProcessProof();
+                    const s = await fs.lstat(src);
+                    checkProcessProof();
+                    return !s.isSocket() && !s.isFIFO();
+                  },
+                });
+              } catch (copyErr) {
+                // Remove ONLY the incomplete copy; the canonical + journal stay intact so a
+                // retry can re-copy. No scratch parent exists yet (created below), so this
+                // cleanup is scoped strictly to the copy.
+                await this.removeBestEffort(holdingDest, "retire-incomplete-copy", "tree", checkProcessProof);
+                throw copyErr;
+              }
+              // The completed off-tree copy is recorded. NOW free the canonical with the
+              // intra-device atomic rename. A REAL rename failure here must RETAIN the
+              // completed holdingDest AND leave the canonical + journal intact — so this
+              // rename is deliberately OUTSIDE the copy's cleanup catch above.
+              stage = "intra_device_rename";
+              checkProcessProof();
+              const scratchParent = await this.createRetireScratchParent();
+              renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent, holdingDest, undefined, checkProcessProof);
+              holding = holdingDest; // retained; step 6 no-ops since discard === false
+              scratch = scratchParent;
+              if (renamed) movedTo = path.join(scratchParent, "clone");
             }
-            // The completed off-tree copy is recorded. NOW free the canonical with the
-            // intra-device atomic rename. A REAL rename failure here must RETAIN the
-            // completed holdingDest AND leave the canonical + journal intact — so this
-            // rename is deliberately OUTSIDE the copy's cleanup catch above.
-            stage = "intra_device_rename";
-            const scratchParent = await this.createRetireScratchParent();
-            renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent, holdingDest);
-            holding = holdingDest; // retained; step 6 no-ops since discard === false
-            scratch = scratchParent;
+          } else if (e.code === "ENOENT") {
+            // The destination parent was asserted in step 3, so a rename ENOENT is about the
+            // SOURCE. Confirm: if the source is gone, the canonical is already free — proceed
+            // to clear the journal. If the source STILL exists, the ENOENT is a real,
+            // unexpected failure (e.g. a destination parent that vanished under us) and must
+            // surface with the journal left intact.
+            checkProcessProof();
+            const sourceGone = await fs.lstat(clonePath).then(
+              () => false,
+              (le: NodeJS.ErrnoException) => {
+                if (le.code === "ENOENT") return true;
+                throw le;
+              },
+            );
+            if (!sourceGone) throw err;
+            renamed = false;
+          } else {
+            throw err;
           }
-        } else if (e.code === "ENOENT") {
-          // The destination parent was asserted in step 3, so a rename ENOENT is about the
-          // SOURCE. Confirm: if the source is gone, the canonical is already free — proceed
-          // to clear the journal. If the source STILL exists, the ENOENT is a real,
-          // unexpected failure (e.g. a destination parent that vanished under us) and must
-          // surface with the journal left intact.
-          const sourceGone = await fs.lstat(clonePath).then(
-            () => false,
-            (le: NodeJS.ErrnoException) => {
-              if (le.code === "ENOENT") return true;
-              throw le;
-            },
-          );
-          if (!sourceGone) throw err;
-          renamed = false;
-        } else {
-          throw err;
         }
-      }
-      if (!exdev) {
-        // Non-EXDEV path (rename success OR a confirmed source-already-free): unchanged
-        // behavior — holdingDest is the retired residue iff we renamed it, no scratch.
-        holding = renamed ? holdingDest : undefined;
-      }
-      // 5. Journal clear — ONLY after a confirmed rename or a confirmed source-already-
-      //    free. Re-read and clear only if it STILL matches (ownerRunId, clonePath); a
-      //    concurrent successor must never have its journal cleared by us.
-      stage = "journal_clear";
-      const still = await this.readRecoveryCapture(barePath, branch);
-      if (residueQuarantine() !== undefined || (opts.completionSource && !opts.completionSource.canDelete())) {
-        // issue #2213: a latch landed after the move. Undo it (best-effort), keep the journal and
-        // dispose of nothing; the latched worker keeps the clone at its journaled path.
-        const movedTo = renamed ? (exdev ? (scratch ? path.join(scratch, "clone") : undefined) : holdingDest) : undefined;
-        if (movedTo !== undefined) {
-          await fs.rename(movedTo, clonePath).then(
-            async () => {
-              if (scratch) await this.removeBestEffort(scratch, "retire-rollback-scratch");
-            },
-            (renameErr: unknown) =>
-              this.log.warn("retireRunnerClone: worker residue quarantine latched mid-retire and the clone could not be moved back; it is retained at the holding path", {
+        if (!exdev) {
+          // Non-EXDEV path (rename success OR a confirmed source-already-free): unchanged
+          // behavior — holdingDest is the retired residue iff we renamed it, no scratch.
+          holding = renamed ? holdingDest : undefined;
+        }
+        // 5. Journal clear — ONLY after a confirmed rename or a confirmed source-already-
+        //    free. Re-read and clear only if it STILL matches (ownerRunId, clonePath); a
+        //    concurrent successor must never have its journal cleared by us.
+        stage = "journal_clear";
+        const still = await this.readRecoveryCapture(barePath, branch);
+        // Normal observations must latch exceptions as well as false returns, so
+        // a one-shot callback failure cannot disappear on the rollback recheck.
+        if (!opts.completionSource) checkProcessProof();
+        // Completion: a throwing proof callback is a revocation too, routed through the same
+        // rollback (canonical restored, journal kept, nothing disposed) before it is rethrown.
+        let processRevoked = false;
+        let completionProofError: unknown;
+        if (opts.completionSource !== undefined && opts.processProof !== undefined) {
+          try { processRevoked = opts.processProof() !== true; }
+          catch (err) { processRevoked = true; completionProofError = err; }
+        }
+        if (processRevoked || residueQuarantine() !== undefined || (opts.completionSource && !opts.completionSource.canDelete())) {
+          // issue #2213: a latch landed after the move. Undo it (best-effort), keep the journal and
+          // dispose of nothing; the latched worker keeps the clone at its journaled path.
+          const rollbackSource = renamed ? (exdev ? (scratch ? path.join(scratch, "clone") : undefined) : holdingDest) : undefined;
+          if (rollbackSource !== undefined) {
+            await fs.rename(rollbackSource, clonePath).then(
+              async () => {
+                // Restored: the outer revocation rollback must not treat the vacated
+                // holding path as residue and re-point the journal at it.
+                movedTo = undefined;
+                if (scratch) await this.removeBestEffort(scratch, "retire-rollback-scratch", "emptyDir");
+              },
+              (renameErr: unknown) =>
+                this.log.warn("retireRunnerClone: worker residue quarantine latched mid-retire and the clone could not be moved back; it is retained at the holding path", {
+                  clone: clonePath,
+                  retained_at: rollbackSource,
+                  error: gitErrorMessage(renameErr),
+                }),
+            );
+          }
+          if (completionProofError !== undefined) throw completionProofError;
+          if (processRevoked) throw new Error("runner clone process proof revoked");
+          throw new CloneRetainedByQuarantineError();
+        }
+        if (anchored) await checkSuccessor(anchored);
+        if (!opts.completionSource) checkProcessProof();
+        if (!verified && !opts.completionSource && still?.runId === ownerRunId && still.clonePath === clonePath) {
+          cleared = true;
+          await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+        }
+        // Completion keeps its existing journal until physical disposal succeeds, so a caught
+        // disposal failure can restore the exact canonical source under the held bare lock.
+        // issue #1783 M2: an attempt clone the owner's terminal retire disposed of is `retired` in
+        // the ledger (its id is never reused). Contained: by here the clone is moved and the journal
+        // cleared, so a failed append must neither fail the completed retire nor skip step 6's
+        // disposal of the holding copy.
+        if (opts.attemptId !== undefined && !opts.completionSource) {
+          checkProcessProof();
+          appended = true;
+          await this.appendAttemptLedger(barePath, branch, { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" }).catch(
+            (err: unknown) => {
+              unproven();
+              this.log.warn("retireRunnerClone: could not record the attempt as retired; the gone path is compacted later", {
                 clone: clonePath,
-                retained_at: movedTo,
-                error: gitErrorMessage(renameErr),
-              }),
+                attempt_id: opts.attemptId,
+                error: gitErrorMessage(err),
+              });
+            },
           );
         }
-        throw new CloneRetainedByQuarantineError();
-      }
-      if (anchored) await checkSuccessor(anchored);
-      if (!verified && !opts.completionSource && still?.runId === ownerRunId && still.clonePath === clonePath) {
-        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
-      }
-      // Completion keeps its existing journal until physical disposal succeeds, so a caught
-      // disposal failure can restore the exact canonical source under the held bare lock.
-      // issue #1783 M2: an attempt clone the owner's terminal retire disposed of is `retired` in
-      // the ledger (its id is never reused). Contained: by here the clone is moved and the journal
-      // cleared, so a failed append must neither fail the completed retire nor skip step 6's
-      // disposal of the holding copy.
-      if (opts.attemptId !== undefined && !opts.completionSource) {
-        await this.appendAttemptLedger(barePath, branch, { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" }).catch(
-          (err: unknown) => {
+        const result = { holding, scratch, renamed,
+          disposition: holding ? "quarantined" as const : "source-already-absent" as const };
+        if (!opts.completionSource) {
+          checkProcessProof();
+          const protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId);
+          checkProcessProof();
+          // Preserve quarantine-only late-latch policy: retain moved residue as-is.
+          if (residueQuarantine() !== undefined) {
             unproven();
-            this.log.warn("retireRunnerClone: could not record the attempt as retired; the gone path is compacted later", {
-              clone: clonePath,
-              attempt_id: opts.attemptId,
-              error: gitErrorMessage(err),
+            if (holding || scratch) this.log.warn("retireRunnerClone: worker residue quarantine latched after the journal clear; the holding/scratch dirs are retained, not disposed", {
+              run_id: ownerRunId, clone: clonePath, holding, scratch,
             });
-          },
-        );
+            return result;
+          }
+          if (!renamed || (holding && !opts.discard) || ((holding || scratch) && protectedNow)) unproven();
+          const target = scratch ?? (opts.discard ? holding : undefined);
+          if (target && !protectedNow) {
+            if (verified && await verified.acknowledged() !== true)
+              throw new Error("verified successor FINAL authority unavailable");
+            if (verified && await this.hasPhysicalTerminalProtection(ownerRunId))
+              throw new Error("verified successor FINAL authority unavailable");
+            const beforeDestroy = () => {
+              checkProcessProof();
+              if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
+              this.checkRecoveryInterruption();
+            };
+            // The guard and fs.rm dispatch run synchronously before this callback returns.
+            // Own the promise outside withLock, whose post-callback interruption may reject.
+            beforeDestroy();
+            dispatched = this.removeBestEffort(target, scratch ? "retire-scratch" : "retire-holding-dispose",
+              "tree").then(ok => {
+                if (!ok) {
+                  unproven();
+                  if (holding && !scratch) this.log.warn("retireRunnerClone: holding dispose failed", { path: holding });
+                }
+              });
+          }
+        }
+        return result;
+      } catch (error) {
+        if (!opts.completionSource && !dispatched && opts.processProof) {
+          // Preserve an already observed denial even if a later callback returns true.
+          try { checkProcessProof(); } catch { /* rollback below */ }
+        }
+        if (!opts.completionSource && !dispatched && processRevokedHere) {
+          // One restoration attempt, without asking the revoked proof for permission.
+          // Conflicting metadata or an occupied canonical fails closed; no recursive rm.
+          try {
+            const currentJournal = await this.readRecoveryCaptureRaw(barePath, branch);
+            if (currentJournal !== journalBeforeMove?.raw && !(cleared && currentJournal === undefined))
+              throw new Error("retirement rollback journal changed");
+            let ledgerRepairFailed = false;
+            try {
+              const currentLedger = (await this.readAllAttemptLedgerRaw(barePath))
+                .filter(([b]) => b === branch).map(([, raw]) => raw);
+              const baseline = JSON.stringify(ledgerBeforeMove);
+              if (JSON.stringify(currentLedger) !== baseline) {
+                if (!appended || JSON.stringify(currentLedger) !== JSON.stringify([...ledgerBeforeMove, retiredValue]))
+                  throw new Error("retirement rollback ledger changed");
+                await this.rewriteLedgerAtomically(barePath, attemptLedgerKey(branch), ledgerBeforeMove);
+              }
+            } catch (ledgerError) {
+              ledgerRepairFailed = true;
+              unproven();
+              this.log.warn("retireRunnerClone: process revocation rollback ledger repair failed", {
+                clone: clonePath, error: gitErrorMessage(ledgerError),
+              });
+            }
+            // One journal repair and one return rename, independently of ledger repair.
+            // A possibly retired attempt needs the existing protected-source form so
+            // gatherRetainedUnderLock still enumerates its live bytes conservatively.
+            if (journalBeforeMove && (ledgerRepairFailed || (cleared && currentJournal === undefined))) {
+              const before = journalBeforeMove.journal;
+              const raw = ledgerRepairFailed
+                ? JSON.stringify({ ...before, retainedSources: [...(before.retainedSources ?? []),
+                  { runId: ownerRunId, clonePath, ...(opts.attemptId ? { attemptId: opts.attemptId } : {}) }] })
+                : journalBeforeMove.raw;
+              try {
+                await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), raw]);
+              } catch (journalError) {
+                unproven();
+                this.log.warn("retireRunnerClone: process revocation rollback journal repair failed", {
+                  clone: clonePath, error: gitErrorMessage(journalError),
+                });
+              }
+            }
+            if (movedTo) {
+              const occupied = await fs.lstat(clonePath).then(() => true, (err: NodeJS.ErrnoException) => {
+                if (err.code === "ENOENT") return false;
+                throw err;
+              });
+              try {
+                if (occupied) throw new Error("retirement rollback canonical occupied");
+                await fs.rename(movedTo, clonePath);
+              } catch (renameError) {
+                if (journalBeforeMove) {
+                  // Keep the actual residue discoverable through retained-source inspect.
+                  // Its noncanonical path deliberately grants no adoption/discard authority.
+                  // Holding paths are not attempt-shaped; keep the old attempt identity
+                  // in the unchanged ledger, without claiming it for this residue path.
+                  const source = { runId: ownerRunId, clonePath: movedTo };
+                  const before = journalBeforeMove.journal;
+                  const retained = before.clonePath === clonePath
+                    ? { ...before, clonePath: movedTo, attemptId: undefined, retainedSources: [source] }
+                    : { ...before, retainedSources: [...(before.retainedSources ?? []), source] };
+                  await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), JSON.stringify(retained)]);
+                }
+                throw renameError;
+              }
+              if (scratch) await this.removeBestEffort(scratch, "retire-rollback-scratch", "emptyDir");
+            }
+          } catch (rollbackError) {
+            this.log.warn("retireRunnerClone: process revocation rollback retained residue", {
+              clone: clonePath, retained_at: movedTo, error: gitErrorMessage(rollbackError),
+            });
+          }
+        }
+        throw error;
       }
-      return { holding, scratch, renamed, disposition: holding ? "quarantined" : "source-already-absent" };
     };
-    const result = await (bareLockHeld ? retire() : this.withLock(barePath, retire)).catch((error: unknown) => {
+    let result: Awaited<ReturnType<typeof retire>>;
+    try {
+      result = await (bareLockHeld ? retire() : this.withLock(barePath, retire));
+    } catch (error) {
+      if (dispatched) await dispatched;
       if (opts.orphanDiagnostics) emitOrphanDiagnostic(opts.orphanDiagnostics, clonePath, "orphan_retirement_failed", stage, "canonical_retirement_failure", error);
       throw error;
-    });
-    // 6. Normal retirement disposes outside its lock; completion keeps the outer bare lock.
-    //    Terminal trash (discard) — best-effort delete the
-    //    holding dir. Foreign quarantine (!discard) — RETAIN it forever (never delete).
-    //    Always best-effort delete the intra-device scratch parent (issue #1354): by here
-    //    the canonical is already free and the journal already cleared, so a partial
-    //    scratch rm is harmless residue.
-    const { holding, scratch } = result;
-    const protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId) ||
-      (opts.completionSource !== undefined && !opts.completionSource.canDelete());
-    // issue #2213: a latch that landed during the protection read keeps the holding and scratch dirs.
-    if (!opts.completionSource && residueQuarantine() !== undefined) {
-      unproven();
-      if (holding || scratch) {
-        this.log.warn("retireRunnerClone: worker residue quarantine latched after the journal clear; the holding/scratch dirs are retained, not disposed", {
-          run_id: ownerRunId,
-          clone: clonePath,
-          holding,
-          scratch,
-        });
-      }
+    }
+    if (!opts.completionSource) {
+      if (dispatched) await dispatched;
       return result.disposition;
     }
+    // Completion keeps the existing outer bare lock through disposal.
+    const { holding, scratch } = result;
+    let protectedNow = false;
     if (opts.completionSource) {
       const open = (): void => {
+        checkProcessProof();
         this.checkRecoveryInterruption();
         if (protectedNow || residueQuarantine() !== undefined || !opts.completionSource!.canDelete())
           throw new Error("completion disposal protection changed");
       };
       try {
+        checkProcessProof();
+        protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId) || !opts.completionSource.canDelete();
         if (!result.renamed || !opts.discard) throw new Error("completion disposal was not established");
         open();
         if (holding && opts.discard) await fs.rm(holding, { recursive: true, force: true });
@@ -11227,31 +11695,6 @@ export class GitCache {
         throw error;
       }
       return result.disposition;
-    }
-    // Recheck trusted FINAL proof separately for each disposal; no retries. A refusal
-    // retains the moved successor and does not affect predecessor paths or episode pins.
-    const checkDisposal = async () => {
-      if (opts.verifiedSuccessor && await opts.verifiedSuccessor.acknowledged() !== true) {
-        throw new Error("verified successor FINAL authority unavailable");
-      }
-      if (await this.hasPhysicalTerminalProtection(ownerRunId)) {
-        throw new Error("verified successor FINAL authority unavailable");
-      }
-      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
-    };
-    if (!result.renamed || (holding && !opts.discard) || ((holding || scratch) && protectedNow)) unproven();
-    if (holding && opts.discard && !protectedNow) {
-      if (opts.verifiedSuccessor) await checkDisposal();
-      this.checkRecoveryInterruption();
-      if (!(await this.removeBestEffort(holding, "retire-holding-dispose"))) {
-        unproven();
-        this.log.warn("retireRunnerClone: holding dispose failed", { path: holding });
-      }
-    }
-    if (scratch && !protectedNow) {
-      if (opts.verifiedSuccessor) await checkDisposal();
-      this.checkRecoveryInterruption();
-      if (!(await this.removeBestEffort(scratch, "retire-scratch"))) unproven();
     }
     return result.disposition;
   }
@@ -11340,7 +11783,8 @@ export class GitCache {
    *  `retainedUndeletable` (failed-removal attempts) and logged with the path and errno so a
    *  persistent-volume leak is visible.
    *  Returns true when the target is gone. `emptyDir` is a non-recursive rmdir. */
-  private async removeBestEffort(target: string, site: string, kind: "tree" | "file" | "emptyDir" = "tree"): Promise<boolean> {
+  private async removeBestEffort(target: string, site: string, kind: "tree" | "file" | "emptyDir" = "tree", beforeDestroy?: () => void): Promise<boolean> {
+    beforeDestroy?.();
     try {
       if (kind === "emptyDir") await fs.rmdir(target);
       else await fs.rm(target, kind === "tree" ? { recursive: true, force: true } : { force: true });
@@ -11377,16 +11821,18 @@ export class GitCache {
    *  scratch parent (and the completed off-tree copy at `copy`, if any) are removed best-effort and
    *  the canonical clone stays. */
   private async renameIntoScratchUnlessLatched(clonePath: string, scratchParent: string, copy?: string,
-    guard?: () => Promise<void>): Promise<boolean> {
+    guard?: () => Promise<void>, processProof?: () => void): Promise<boolean> {
+    processProof?.();
     if (residueQuarantine() !== undefined) {
-      await this.removeBestEffort(scratchParent, "retire-latched-scratch-parent");
-      if (copy) await this.removeBestEffort(copy, "retire-latched-copy");
+      await this.removeBestEffort(scratchParent, "retire-latched-scratch-parent", "tree", processProof);
+      if (copy) await this.removeBestEffort(copy, "retire-latched-copy", "tree", processProof);
       throw new CloneRetainedByQuarantineError();
     }
     if (guard) await guard();
+    processProof?.();
     if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
     this.checkRecoveryInterruption();
-    return this.renameCanonicalOrConfirmFree(clonePath, path.join(scratchParent, "clone"));
+    return this.renameCanonicalOrConfirmFree(clonePath, path.join(scratchParent, "clone"), processProof);
   }
 
   /** issue #1354 — atomically rename the canonical clone to `dest`, applying the same
@@ -11396,13 +11842,15 @@ export class GitCache {
    *  that is still present makes the ENOENT a real, unexpected failure that must surface.
    *  Any non-ENOENT error is rethrown. Returns true when the rename actually moved the
    *  canonical. */
-  private async renameCanonicalOrConfirmFree(clonePath: string, dest: string): Promise<boolean> {
+  private async renameCanonicalOrConfirmFree(clonePath: string, dest: string, processProof?: () => void): Promise<boolean> {
+    processProof?.();
     try {
       await fs.rename(clonePath, dest);
       return true;
     } catch (err) {
       const e = err as NodeJS.ErrnoException;
       if (e.code !== "ENOENT") throw err;
+      processProof?.();
       const sourceGone = await fs.lstat(clonePath).then(
         () => false,
         (le: NodeJS.ErrnoException) => {
@@ -12795,6 +13243,8 @@ try {
     if (!Number.isFinite(timeoutMs)) throw new Error(`${what}: timeoutMs must be finite`);
     const deadlineError = new Error(`${what} exceeded ${timeoutMs}ms`);
     const budgeted = !!this.recoveryOperation()?.budget || MaintenanceResources.active();
+    // issue #3304: the scope's stop signals, read at spawn time. A masked scope carries no soft signal.
+    const stopSignals = this.boundaryStopSignals();
     const { stdout, exited, cancel } = await this.spawnGit(barePath, [...args], undefined, {
       timeoutMs,
       cancelOnAbandon: budgeted,
@@ -12806,10 +13256,20 @@ try {
       let bytes = 0;
       let settled = false;
       let timer: NodeJS.Timeout | undefined;
+      // Once the boundary scope stops, this plain deadline must not race the owner's typed verdict: the
+      // stopped scope settles the gated stdout itself (spawnGit), so the timer only retires. It never
+      // settles, abandons or kills anything, and it is never armed again.
+      let retired = false;
+      const retire = (): void => {
+        retired = true;
+        if (timer !== undefined) clearTimeout(timer);
+        timer = undefined;
+      };
       const finish = (result: BoundedRead | undefined, error?: Error): void => {
         if (settled) return;
         settled = true;
         if (timer !== undefined) clearTimeout(timer);
+        for (const signal of stopSignals) signal.removeEventListener("abort", retire);
         opts.signal?.removeEventListener("abort", onAbort);
         stdout.removeListener("data", onData);
         stdout.removeListener("end", onEnd);
@@ -12845,7 +13305,11 @@ try {
       stdout.on("data", onData);
       stdout.once("end", onEnd);
       stdout.once("error", onError);
-      timer = setTimeout(() => finish(undefined, deadlineError), timeoutMs);
+      if (stopSignals.some(signal => signal.aborted)) retired = true;
+      else {
+        for (const signal of stopSignals) signal.addEventListener("abort", retire, { once: true });
+        timer = setTimeout(() => { if (!retired) finish(undefined, deadlineError); }, timeoutMs);
+      }
       if (opts.signal?.aborted) onAbort();
       else opts.signal?.addEventListener("abort", onAbort, { once: true });
     });
@@ -13457,128 +13921,259 @@ try {
     });
   }
 
+  /** Test observation only; production retains the original charged continuation. */
+  protected async observeMaintenanceTransferPhase<T>(
+    _phase: "walk" | "selection" | "pack" | "proof" | "import", action: () => Promise<T>,
+  ): Promise<T> { return action(); }
+
   /**
-   * Private callback lifetime only. Caller still owes the held bare lock, quiescence,
-   * fresh exact custody, non-stopped family and original charged output history.
-   * This seam grants neither publication nor preservation/release authority.
+   * Internal objects-only transfer. Metadata must come from worker records. Callbacks
+   * are owner-scoped: prepare is deny-only local work; validateFamily checks the
+   * locked snapshot and ledger continuity locally. Supervised reads refresh that
+   * snapshot without remote pairs. Only canonical import calls beforeSemantic for
+   * a fresh custody pair, followed solely by local checks before dispatch.
+   * Return grants no ref, FINAL, release, cleanup or accepted-ledger authority.
    */
-  // Dormant until the producer transfer binding lands (#3031); protected so no unused-private
-  // diagnostic needs suppressing under every tsconfig that compiles this file.
-  protected async withVerifiedMaintenancePack(
-    source: { clonePath: string; identity: string },
-    tip: string,
-    outDir: string,
-    beforeEffect: () => Promise<void>,
-    consume: (result: { pack: { path: string; byteSize: number; objectCount: number };
-      index: { path: string; byteSize: number; objectCount: number }; sourceSha: string }) => Promise<void>,
-    knownBase?: { barePath: string; identity: string },
-  ): Promise<void> {
+  async importMaintenanceTip(request: {
+    source: { clonePath: string; identity: string; runId: string; attemptId: string };
+    original: { barePath: string; baseCommit?: string; cloneUrl: string };
+    record?: { bareDir: string; sourceSha?: string };
+    tip: string; defaultBranch: string; branch: string; key: string;
+    family: ReadonlyArray<{ runId: string; clonePath: string; attemptId: string; identity?: string }>;
+    outDir: string;
+    prepare: () => Promise<void>;
+    beforeSemantic: () => Promise<void>;
+    validateFamily: (snapshot: { sources: Array<{ runId: string; clonePath: string;
+      attemptId: string; identity: string }>; metadata: string; origin: string | undefined }) => Promise<void>;
+  }): Promise<{ kind: "imported" | "already_present"; sourceSha: string }> {
+    // Must precede even request getters, token checks and filesystem reads.
     if (this.boundaryProcesses.getStore()?.capture) throw new Error("capture private verification refused");
     MaintenanceResources.check();
-    if (!this.boundaryProcesses.getStore() || !this.recoveryOperations.getStore() ||
-        !SHA40_RE.test(tip) || typeof beforeEffect !== "function" || typeof consume !== "function") {
+    if (!this.boundaryProcesses.getStore() || !this.recoveryOperations.getStore() || !MaintenanceBudget.current())
       throw new Error("maintenance_private_verification_refused");
-    }
-    type Stat = import("node:fs").BigIntStats;
-    const root = path.resolve(this.recoveryRoot);
-    const refused = () => new Error("maintenance_private_verification_refused");
+    const { source, original, record, tip, defaultBranch, branch, key, family, outDir,
+      prepare, beforeSemantic, validateFamily } = request;
+    const refused = () => new Error("maintenance_source_layout_unsupported");
     const check = () => { MaintenanceResources.check(); this.checkRecoveryInterruption(); };
-    const same = (a: Stat, b: Stat) => a.dev === b.dev && a.ino === b.ino && a.mode === b.mode;
-    const safe = (p: string, s: Stat) => s.isDirectory() && !s.isSymbolicLink() &&
-      (s.uid === BigInt(process.getuid!()) || (s.uid === 0n && p !== root && isWithinPath(root, p))) &&
-      (s.mode & 2n) === 0n && ((s.mode & 16n) === 0n ||
-        (p !== root && isWithinPath(root, p) && uidSplitActive() &&
-          process.getuid!() === WORKER_UID && process.getgid!() === WORKER_UID && s.gid === BigInt(WORKER_UID)));
+    const literalBranch = (value: unknown) => {
+      if (typeof value !== "string" || value.length === 0) return false;
+      // Reserve literal validation and the closed anchor strings, not a new name cap.
+      MaintenanceResources.consume("metadataBytes", Buffer.byteLength(value) * 10 + 1024);
+      for (const character of value) {
+        const point = character.codePointAt(0)!;
+        // Ref arguments reach spawnGit debug logs: refuse display controls before any effects.
+        if (point <= 0x20 || (point >= 0x7f && point <= 0x9f) ||
+            point === 0x061c || point === 0x200e || point === 0x200f ||
+            (point >= 0x2028 && point <= 0x202e) || (point >= 0x2066 && point <= 0x2069) ||
+            (point >= 0xd800 && point <= 0xdfff) ||
+            "~^:?*[\\".includes(character)) return false;
+      }
+      return !value.includes("..") && !value.includes("@{") && !value.startsWith("/") && !value.endsWith("/") &&
+        !value.includes("//") && !value.startsWith(".") && !value.includes("/.") &&
+        !value.endsWith(".") && !/\.lock(?:\/|$)/.test(value);
+    };
+    check();
+    if (process.platform !== "linux" || !SHA40_RE.test(tip) ||
+        defaultBranch === "recovered-source" ||
+        ![defaultBranch, branch].every(literalBranch) ||
+        !CODE_ID.test(key) || !CODE_ID.test(source.runId) || !ATTEMPT_ID_RE.test(source.attemptId) ||
+        !/^[0-9]+:[0-9]+$/.test(source.identity) ||
+        ![prepare, beforeSemantic, validateFamily].every(f => typeof f === "function")) throw refused();
+    const root = path.resolve(this.recoveryRoot), runner = path.resolve(this.runnerRoot);
     const valid = (p: string) => {
+      MaintenanceResources.consume("metadataBytes", 8448);
       if (typeof p !== "string" || !path.isAbsolute(p) || path.resolve(p) !== p ||
-          Buffer.byteLength(p) > 4096 || p === root || !isWithinPath(p, root)) throw refused();
-      MaintenanceResources.consume("metadataBytes", 32768);
-      const parts = p.split("/").filter(Boolean);
-      if (parts.length > 128 || parts.some(part => Buffer.byteLength(part) > 255 ||
-          [...part].some(character => { const code = character.charCodeAt(0); return code < 32 || code === 127 || code === 92; }))) throw refused();
+          Buffer.byteLength(p) > 4096 || p.split("/").length > 128 ||
+          p.split("/").some(s => Buffer.byteLength(s) > 255 || [...s].some(c =>
+            c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127 || c.charCodeAt(0) === 92))) throw refused();
     };
-    valid(outDir);
-    const ancestors: Array<{ path: string; stat: Stat }> = [];
+    const barePath = original.barePath;
+    for (const p of [barePath, source.clonePath, outDir]) valid(p);
+    if (path.dirname(barePath) !== path.resolve(this.reposRoot) || !barePath.endsWith(".git") ||
+        (record && record.bareDir !== path.basename(barePath)) ||
+        source.clonePath === runner || !isWithinPath(source.clonePath, runner) ||
+        outDir === root || !isWithinPath(outDir, root) ||
+        [barePath, source.clonePath].some(p => isWithinPath(outDir, p) || isWithinPath(p, outDir)) ||
+        !family.some(s => s.clonePath === source.clonePath && s.identity === source.identity &&
+          s.runId === source.runId && s.attemptId === source.attemptId)) throw refused();
+    type Stat = import("node:fs").BigIntStats;
+    type Handle = Awaited<ReturnType<typeof fs.open>>;
+    type Pin = { absolute: string; named: string; file: Handle; stat: Stat; source: boolean; frozen?: Stat };
+    const pins: Pin[] = [], handles = new Set<Handle>();
+    let ioClosed = true;
+    const closeIO = async (file: { close(): Promise<void> }) => {
+      try { await file.close(); }
+      catch (error) { ioClosed = false; throw error; }
+    };
+    const leaves: Array<{ named: string; stat: Stat }> = [];
+    const controls = new Map<string, Stat | null>();
     const owned = new Map<string, { stat: Stat; directory: boolean }>();
-    const stat = async (p: string) => {
-      check(); MaintenanceResources.consume("adminEntries", 1);
+    const same = (a: Stat, b: Stat) => a.dev === b.dev && a.ino === b.ino && a.mode === b.mode;
+    const unchanged = (a: Stat, b: Stat) => same(a, b) && a.size === b.size &&
+      a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs && a.nlink === b.nlink;
+    const charge = (p: string, category: "sourceEntries" | "adminEntries" = "sourceEntries") => {
+      check(); MaintenanceResources.consume(category, 1);
       MaintenanceResources.consume("metadataBytes", 2048 + Buffer.byteLength(p));
-      const s = await fs.lstat(p, { bigint: true }); check(); return s;
     };
-    const validate = async (target = outDir) => {
-      for (const a of ancestors) {
-        const now = await stat(a.path);
-        if (!same(a.stat, now) || !safe(a.path, now)) throw refused();
+    const stat = async (p: string, category: "sourceEntries" | "adminEntries" = "sourceEntries") => {
+      charge(p, category); const s = await fs.lstat(p, { bigint: true }); check(); return s;
+    };
+    const fstat = async (f: Handle) => {
+      charge("descriptor"); const s = await f.stat({ bigint: true }); check(); return s;
+    };
+    const safeDir = (p: string, s: Stat, sourceTree: boolean) => {
+      const ancestor = p !== root && p !== runner &&
+        (isWithinPath(root, p) || isWithinPath(runner, p));
+      const runnerOwned = sourceTree && uidSplitActive() && s.uid === BigInt(RUNNER_UID);
+      return s.isDirectory() && !s.isSymbolicLink() &&
+        (s.uid === BigInt(process.getuid!()) || runnerOwned || (ancestor && s.uid === 0n)) &&
+        (s.mode & 0o7000n & ~0o2000n) === 0n && (s.mode & 2n) === 0n &&
+        ((s.mode & 16n) === 0n || runnerOwned || (ancestor && uidSplitActive() &&
+          process.getuid!() === WORKER_UID && s.gid === BigInt(WORKER_UID)));
+    };
+    const childPath = (p: Pin, name: string) => {
+      valid(path.join(p.absolute, name));
+      return "/proc/self/fd/" + p.file.fd + "/" + name;
+    };
+    const pin = async (named: string, absolute: string, sourceTree: boolean): Promise<Pin> => {
+      const existing = pins.find(p => p.absolute === absolute);
+      if (existing) return existing;
+      valid(absolute);
+      const before = await stat(named);
+      if (!safeDir(absolute, before, sourceTree)) throw refused();
+      charge(named);
+      const file = await fs.open(named, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY |
+        fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+      handles.add(file);
+      const after = await fstat(file);
+      if (!same(before, after) || !safeDir(absolute, after, sourceTree)) throw refused();
+      MaintenanceResources.consume("metadataBytes", 1024);
+      const p = { absolute, named, file, stat: after, source: sourceTree };
+      pins.push(p); return p;
+    };
+    const absolutePin = async (absolute: string, sourceTree: boolean) => {
+      let p = await pin("/", "/", false), full = "";
+      for (const part of absolute.split("/").filter(Boolean)) {
+        full += "/" + part;
+        p = await pin(childPath(p, part), full, sourceTree);
       }
-      for (const [p, entry] of owned) {
-        if (!entry.directory || !isWithinPath(target, p)) continue;
-        const now = await stat(p);
-        if (!same(entry.stat, now) || !safe(p, now)) throw refused();
+      return p;
+    };
+    const validate = async (includeLeaves = true, includeOwned = true) => {
+      for (const p of pins) {
+        const named = await stat(p.named), fd = await fstat(p.file);
+        if (!same(p.stat, named) || !same(named, fd) ||
+            (p.frozen && (!unchanged(p.frozen, named) || !unchanged(p.frozen, fd))) ||
+            !safeDir(p.absolute, fd, p.source)) throw refused();
+      }
+      if (includeLeaves) for (const leaf of leaves) {
+        const now = await stat(leaf.named);
+        if (now.nlink > 1n) throw new Error("maintenance_source_alias_refused");
+        if (!unchanged(leaf.stat, now)) throw refused();
+      }
+      if (includeOwned) for (const [name, entry] of owned) {
+        const now = await stat(name, "sourceEntries");
+        if (!same(entry.stat, now) || (!entry.directory && (!unchanged(entry.stat, now) || now.nlink !== 1n))) throw refused();
+      }
+      for (const [name, initial] of controls) {
+        let now: Stat | null = null;
+        try { now = await stat(name); }
+        catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+        if ((initial === null) !== (now === null) || (initial && now && !unchanged(initial, now))) throw refused();
       }
     };
-    const admit = async () => { check(); await beforeEffect(); check(); };
-    const effect = async (target = outDir) => { await admit(); await validate(target); check(); };
-    // Reserve every later cleanup lookup/removal before admitting its creation.
-    // One attempt per recorded name; an uncertain parent/name is retained, siblings continue.
-    const own = (p: string, directory: boolean) => {
+    // Per-I/O preparation retains all source/control pins. Private operations
+    // check their active target and parents; Git boundaries check the full registry.
+    const local = async () => { check(); await prepare(); check(); await validate(true, false); check(); };
+    const control = async (name: string, mustBeAbsent: boolean) => {
+      let s: Stat | null = null;
+      try { s = await stat(name); }
+      catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+      if (mustBeAbsent && s) throw refused();
+      controls.set(name, s);
+      return s;
+    };
+    const own = (p: string, directory: boolean, administrative = directory) => {
       valid(p);
       const depth = p.split("/").length;
-      MaintenanceResources.consume("adminEntries", depth + 2);
-      MaintenanceResources.consume("metadataBytes", (depth + 2) * (4096 + 2048));
+      // Reserve parent checks separately from operations on a regular artifact.
+      MaintenanceResources.consume("sourceEntries", depth + (administrative ? 3 : 0));
+      if (!administrative) MaintenanceResources.consume("sourceEntries", 3);
+      MaintenanceResources.consume("metadataBytes", (depth + 3) * 6144);
       return (s: Stat) => { owned.set(p, { stat: s, directory }); };
     };
+    const scratchParents = new Map<string, Stat>();
+    const scratchCheck = async (target: string) => {
+      for (let p = path.dirname(target);; p = path.dirname(p)) {
+        const expected = owned.get(p)?.stat ?? scratchParents.get(p);
+        if (!expected) throw refused();
+        const now = await stat(p, "sourceEntries");
+        if (!same(expected, now) || !safeDir(p, now, false)) throw refused();
+        if (path.dirname(p) === p) break;
+      }
+    };
     const mkdir = async (p: string) => {
-      const record = own(p, true);
-      await effect(p); MaintenanceResources.consume("adminEntries", 1);
-      await fs.mkdir(p, { mode: 0o700 });
-      const created = await fs.lstat(p, { bigint: true }); record(created);
-      if (!safe(p, created) || created.uid !== BigInt(process.getuid!()) ||
+      const recordOwn = own(p, true);
+      await local(); await scratchCheck(p);
+      charge(p, "adminEntries"); await fs.mkdir(p, { mode: 0o700 });
+      // Identity collection is pre-reserved even if the owner was just revoked.
+      const created = await fs.lstat(p, { bigint: true }); recordOwn(created);
+      if (!safeDir(p, created, false) || created.uid !== BigInt(process.getuid!()) ||
           (created.mode & 0o5777n) !== 0o700n) throw refused();
       check();
     };
     const write = async (p: string, value: string) => {
-      const record = own(p, false);
-      MaintenanceResources.consume("adminEntries", 3);
-      MaintenanceResources.consume("artifactBytes", Buffer.byteLength(value));
-      await effect(p);
+      const recordOwn = own(p, false, true);
+      await local(); await scratchCheck(p);
+      const bytes = Buffer.from(value);
+      MaintenanceResources.consume("artifactBytes", bytes.length);
+      charge(p, "adminEntries");
       const file = await fs.open(p, fsConstants.O_CREAT | fsConstants.O_EXCL |
         fsConstants.O_NOFOLLOW | fsConstants.O_WRONLY, 0o600);
       try {
-        record(await file.stat({ bigint: true }));
-        const bytes = Buffer.from(value);
+        charge(p, "sourceEntries"); const created = await file.stat({ bigint: true }); recordOwn(created);
+        if (!created.isFile() || created.nlink !== 1n || created.uid !== BigInt(process.getuid!()) ||
+            (created.mode & 0o7777n) !== 0o600n) throw refused();
         for (let offset = 0; offset < bytes.length;) {
-          await effect(p);
-          const result = await file.write(bytes, offset, bytes.length - offset);
-          if (result.bytesWritten <= 0) throw refused();
+          await local(); await scratchCheck(p);
+          const named = await stat(p, "sourceEntries");
+          charge(p, "sourceEntries"); const fd = await file.stat({ bigint: true });
+          if (!same(created, named) || !same(named, fd) || named.nlink !== 1n || fd.nlink !== 1n) throw refused();
+          const result = await file.write(bytes, offset, bytes.length - offset, offset);
+          if (result.bytesWritten <= 0 || result.bytesWritten > bytes.length - offset) throw refused();
           offset += result.bytesWritten;
+          charge(p, "sourceEntries"); recordOwn(await file.stat({ bigint: true }));
         }
-      } finally { await file.close(); }
+      } finally { await closeIO(file); }
     };
     const view = async (p: string) => {
       await mkdir(p); await mkdir(path.join(p, "objects")); await mkdir(path.join(p, "refs"));
       await write(path.join(p, "HEAD"), "ref: refs/heads/private\n");
       await write(path.join(p, "config"), "[core]\nrepositoryformatversion = 0\nbare = true\n");
     };
-    const environment = (repo: string, objects: string, base?: string): NodeJS.ProcessEnv => ({
+    const environment = (repo: string, objects: string, alternate: string): NodeJS.ProcessEnv => ({
       PATH: "/usr/bin:/bin", HOME: outDir, TMPDIR: outDir, LANG: "C", LC_ALL: "C",
       GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_TERMINAL_PROMPT: "0", GIT_DIR: repo, GIT_OBJECT_DIRECTORY: objects,
-      GIT_ALTERNATE_OBJECT_DIRECTORIES: base ? JSON.stringify(base) : "",
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: alternate ? JSON.stringify(alternate) : "",
       GIT_NO_REPLACE_OBJECTS: "1", GIT_REPLACE_REF_BASE: "refs/disabled/",
       GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null", GIT_NO_LAZY_FETCH: "1",
       GIT_ALLOW_PROTOCOL: "none",
     });
+    const hardArgs = ["--no-replace-objects", "-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false",
+      "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "maintenance.auto=false",
+      "-c", "gc.auto=0"];
+    let supervised: (importing?: boolean) => Promise<void> = async () => { throw refused(); };
     const launch = async (repo: string, env: NodeJS.ProcessEnv, args: string[], input?: string,
-      category: SpawnGitOptions["stdoutCategory"] = "metadataBytes") => {
-      // Logical helper input and retained control capacity, before stdin delivery.
+      category: SpawnGitOptions["stdoutCategory"] = "metadataBytes", keepStdinOpen = false,
+      importing = false) => {
       MaintenanceResources.consume("metadataBytes", Buffer.byteLength(input ?? "") * 2 + 4096);
-      return this.spawnGit(repo, ["--no-replace-objects", ...args], input, { env,
-        trustedExecutable: true, beforeSpawn: async () => { await effect(repo); await validate(env.GIT_OBJECT_DIRECTORY); },
-        joinStderr: true, cancelOnAbandon: true,
+      return this.spawnGit(repo, [...hardArgs, ...args], input, { env, trustedExecutable: true,
+        beforeSpawn: async () => { await supervised(importing); await scratchCheck(path.join(repo, "sentinel")); },
+        joinStderr: true, cancelOnAbandon: true, keepStdinOpen,
         stderrMaxBytes: 4096, timeoutMs: GIT_TIMEOUT_MS, stdoutCategory: category });
     };
-    const read = async (repo: string, env: NodeJS.ProcessEnv, args: string[], input?: string) => {
-      const child = await launch(repo, env, args, input);
+    const collect = async (child: Awaited<ReturnType<GitCache["spawnGit"]>>, allowNegative = false) => {
       try {
         const chunks: Buffer[] = []; let size = 0;
         for await (const raw of child.stdout) {
@@ -13587,528 +14182,414 @@ try {
           MaintenanceResources.consume("metadataBytes", bytes.length * 2);
           chunks.push(bytes); size += bytes.length;
         }
-        if (await child.exited !== 0) throw refused();
-        return Buffer.concat(chunks).toString("utf8");
-      } catch (error) {
-        child.cancel(); child.stdout.destroy(); await child.exited; throw error;
+        const code = await child.exited;
+        check();
+        // A candidate absent from the bare produces 128, not ancestry's 1.
+        // Only positive ancestry admits a boundary; failed candidates are dropped.
+        if (code !== 0 && !(allowNegative && (code === 1 || code === 128))) throw refused();
+        return { text: Buffer.concat(chunks).toString("utf8"), code };
+      } catch (e) {
+        child.cancel(); child.stdout.destroy();
+        const code = await child.exited;
+        check();
+        if (allowNegative && (code === 1 || code === 128)) return { text: "", code };
+        child.cancel(); child.stdout.destroy(); await child.exited; throw e;
       }
     };
+    const read = async (repo: string, env: NodeJS.ProcessEnv, args: string[], input?: string) =>
+      (await collect(await launch(repo, env, args, input))).text;
     const cleanup = async () => {
-      // All admitted child and serial I/O work above has joined. Unknown entries
-      // (including partial helper outputs without an observed identity) are retained.
+      if (!ioClosed) return;
+      // Pre-reserved, one attempt per owned entry after all children and serial I/O
+      // settle. Uncertainty retains that entry; failure does not block siblings.
       for (const [p, entry] of [...owned].reverse()) {
         try {
-          await beforeEffect();
           for (let parent = path.dirname(p);; parent = path.dirname(parent)) {
-            const expected = owned.get(parent)?.stat ?? ancestors.find(a => a.path === parent)?.stat;
-            if (!expected) throw refused();
+            const expected = owned.get(parent)?.stat ?? scratchParents.get(parent);
             const now = await fs.lstat(parent, { bigint: true });
-            if (!same(expected, now) || !safe(parent, now)) throw refused();
+            if (!expected || !same(expected, now) || !safeDir(parent, now, false)) throw refused();
             if (path.dirname(parent) === parent) break;
           }
           const now = await fs.lstat(p, { bigint: true });
-          if (!same(entry.stat, now)) continue;
+          if (!same(entry.stat, now) || (!entry.directory && now.nlink !== 1n)) continue;
           if (entry.directory) await fs.rmdir(p); else await fs.unlink(p);
-        } catch { /* One bounded attempt; preserve uncertainty and continue siblings. */ }
+        } catch { /* Preserve ambiguous names; continue the finite registry. */ }
       }
     };
-    try {
-      const hierarchy: string[] = [];
-      for (let p = path.dirname(outDir);; p = path.dirname(p)) {
-        if (hierarchy.length >= 128) throw refused();
-        hierarchy.push(p); if (path.dirname(p) === p) break;
-      }
-      for (const p of hierarchy.reverse()) {
-        const s = await stat(p); if (!safe(p, s)) throw refused();
-        ancestors.push({ path: p, stat: s });
-      }
-      await mkdir(outDir);
-      const snapshot = await this.snapshotMaintenanceObjects(source, path.join(outDir, "source"),
-        admit, knownBase, own);
-      const first = path.join(outDir, "read"), second = path.join(outDir, "proof");
-      await view(first); await view(second);
-      const env = environment(first, snapshot.path, snapshot.base?.path);
-      const listing = await read(first, env, ["rev-list", "--objects", "--no-object-names", "--missing=error", tip]);
-      let count = 0;
-      for (const character of listing) if (character === "\n") count++;
-      MaintenanceResources.consume("closureEntries", count);
-      MaintenanceResources.consume("metadataBytes", listing.length * 4 + count * 128);
-      if (!listing.endsWith("\n") || count === 0 || count > 65536) throw refused();
-      const oids = listing.slice(0, -1).split("\n");
-      if (oids.some(oid => !SHA40_RE.test(oid)) || new Set(oids).size !== count || !oids.includes(tip)) throw refused();
-      const packDir = path.join(second, "objects", "pack");
-      await mkdir(packDir);
-      const packPath = path.join(packDir, "stage.pack"), indexPath = path.join(packDir, "stage.idx");
-      const packRecord = own(packPath, false), indexRecord = own(indexPath, false);
-      const producer = await launch(first, env, ["pack-objects", "--stdout", "--no-reuse-object",
-        "--no-reuse-delta", "--window=0", "--depth=0", "--threads=1"], listing, "artifactBytes");
-      // No stdout reads/listeners between spawn and the existing staging consumer.
-      const pack = await this.stageMaintenancePack({ stdout: producer.stdout,
-        exited: producer.exited.then(code => ({ code, stderr: "" })), abort: producer.cancel },
-      packPath, 256 * 1024 ** 2, admit, beforeEffect);
-      packRecord(await stat(packPath));
-      const index = await this.indexMaintenancePack(pack, indexPath, oids, admit, beforeEffect);
-      indexRecord(await stat(indexPath));
-      MaintenanceResources.consume("adminEntries", 3);
-      MaintenanceResources.consume("sourceBytes", 20);
-      const file = await fs.open(packPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
-      let checksum: string;
-      try {
-        const bytes = Buffer.alloc(20);
-        if ((await file.read(bytes, 0, 20, pack.byteSize - 20)).bytesRead !== 20) throw refused();
-        checksum = bytes.toString("hex");
-      } finally { await file.close(); }
-      const rename = async (from: string, to: string) => {
-        const record = own(to, false);
-        await effect(to); MaintenanceResources.consume("adminEntries", 1);
-        await fs.rename(from, to);
-        record(owned.get(from)!.stat); owned.delete(from);
-      };
-      pack.path = path.join(packDir, "pack-" + checksum + ".pack");
-      index.path = path.join(packDir, "pack-" + checksum + ".idx");
-      await rename(packPath, pack.path); await rename(indexPath, index.path);
-      const proofEnv = environment(second, path.join(second, "objects"));
-      if (!await this.verifyRecoveryClosureBound(second, tip, {
-        read: (args, input) => read(second, proofEnv, args, input),
-        spawn: (args, input) => launch(second, proofEnv, args, input, "closure"),
-        identity: async () => {
-          await validate(path.join(second, "objects"));
-          const bare = await stat(second), objects = await stat(path.join(second, "objects"));
-          return JSON.stringify([second, String(bare.dev) + ":" + bare.ino, String(objects.dev) + ":" + objects.ino]);
-        },
-      })) throw refused();
-      await effect();
-      await consume({ pack, index, sourceSha: tip });
-      check();
-    } finally { await cleanup(); }
-  }
-
-  /**
-   * Dormant detached encoded bytes, NOT authentication or a durable journal.
-   * Caller owes positive non-stopped family/custody/origin/output-index proof,
-   * quiescence, held bare lock, live execution reservation and worker-exclusive
-   * private parents throughout. The supplied dev:ino is only a consistency check.
-   * A caller-selected canonical base supplies encoded prerequisites, never repository
-   * authentication. Both complete private copies still owe the later C verification.
-   * Optional own reserves cleanup before each creation and registers every observed
-   * output identity. Supplying it delegates ALL removal to the caller, including on
-   * refusal; this helper joins I/O and closes handles before returning or throwing.
-   * Unknown identities must be retained. Without own, local cleanup stays reserved.
-   */
-  private async snapshotMaintenanceObjects(
-    source: { clonePath: string; identity: string },
-    outDir: string,
-    beforeEffect: () => Promise<void>,
-    knownBase?: { barePath: string; identity: string },
-    own?: (absolute: string, directory: boolean) => (stat: import("node:fs").BigIntStats) => void,
-  ): Promise<{ path: string; byteSize: number; fileCount: number;
-    base?: { path: string; byteSize: number; fileCount: number } }> {
-    type Stat = import("node:fs").BigIntStats;
-    type Handle = Awaited<ReturnType<typeof fs.open>>;
-    type Pin = { file: Handle; named: string; stat: Stat; output: boolean; absolute: string; immutable: boolean };
-    type Record = { parent: Pin; name: string; stat: Stat; directory: boolean; size: number };
-    const refused = () => new Error("maintenance_object_snapshot_refused");
-    const signal = MaintenanceResources.signalIfActive();
-    const check = () => {
-      MaintenanceResources.check();
-      this.checkRecoveryInterruption();
-      if (signal?.aborted) throw refused();
+    let closingPins: Promise<void> | undefined;
+    const closePins = (activeIOClosed = true) => {
+      ioClosed &&= activeIOClosed;
+      return closingPins ??= (async () => {
+        // One attempt per pin; join all attempts even when a sibling close fails.
+        // A rejected join prevents both helper unlink and the outer owned cleanup.
+        const closed = await Promise.allSettled([...handles].map(async file => file.close()));
+        const failure = closed.find(result => result.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
+      })();
     };
-    const meta = (n: number) => { check(); MaintenanceResources.consume("metadataBytes", n); };
-    const visit = (admin: boolean) => {
-      check(); MaintenanceResources.consume(admin ? "adminEntries" : "sourceEntries", 1);
-    };
-    const pins: Pin[] = [], handles = new Set<Handle>();
-    const pinIndex = new Map<string, Pin>();
-    const workerInputs = new Set<Pin>();
-    // Match assertOwedBare's worker-exclusive directory policy without running Git.
-    const workerDirectory = (s: Stat) => s.isDirectory() && !s.isSymbolicLink() &&
-      s.uid === BigInt(process.getuid!()) && (s.mode & 2n) === 0n &&
-      ((s.mode & 16n) === 0n || (s.gid === BigInt(process.getgid!()) &&
-        !(uidSplitActive() && s.gid === BigInt(RUNNER_UID))));
-    const inputs: Record[] = [], outputs: Record[] = [];
-    const root = path.resolve(this.recoveryRoot), runner = path.resolve(this.runnerRoot);
-    const same = (a: Stat, b: Stat) => a.dev === b.dev && a.ino === b.ino && a.mode === b.mode;
-    const unchanged = (a: Stat, b: Stat) => same(a, b) && a.size === b.size &&
-      a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs && a.nlink === b.nlink;
-    const strictAncestor = (p: string) => p !== root && isWithinPath(root, p);
-    const safeDirectory = (p: string, s: Stat) => s.isDirectory() && !s.isSymbolicLink() &&
-      (s.uid === BigInt(process.getuid!()) || (s.uid === 0n && strictAncestor(p))) &&
-      (s.mode & 2n) === 0n && ((s.mode & 16n) === 0n ||
-        (strictAncestor(p) && uidSplitActive() && process.getuid!() === WORKER_UID &&
-          process.getgid!() === WORKER_UID && s.gid === BigInt(WORKER_UID)));
-    const validPath = (p: string) => {
-      if (typeof p !== "string" || Buffer.byteLength(p) > 4096 ||
-          !path.isAbsolute(p) || path.resolve(p) !== p) throw refused();
-      meta(32768); // Split/components/retained ancestor capacity before allocation.
-      const parts = p.split("/").filter(Boolean);
-      if (parts.length > 128) throw refused();
-      for (const part of parts) validName(part);
-      return parts;
-    };
-    const validName = (s: string) => {
-      if (!s || s === "." || s === ".." || Buffer.byteLength(s) > 255) throw refused();
-      for (const character of s) {
-        const point = character.codePointAt(0)!;
-        if (character === "/" || character === "\\" || point < 32 || point === 127 ||
-            (point >= 0xd800 && point <= 0xdfff)) throw refused();
-      }
-    };
-    const child = (parent: Pin, name: string) => {
-      meta(8448);
-      const p = "/proc/self/fd/" + parent.file.fd + "/" + name;
-      if (Buffer.byteLength(p) > 4096) throw refused();
-      return p;
-    };
-    const absoluteChild = (parent: Pin, name: string) => {
-      meta(8448); // UTF-16 path and bookkeeping capacity before concatenation.
-      if (Buffer.byteLength(parent.absolute) + 1 + Buffer.byteLength(name) > 4096) throw refused();
-      return parent.absolute + "/" + name;
-    };
-    const stat = async (p: string, admin: boolean) => {
-      visit(admin); meta(2048);
-      const s = await fs.lstat(p, { bigint: true }); check(); return s;
-    };
-    const fstat = async (f: Handle, admin: boolean) => {
-      visit(admin); meta(2048);
-      const s = await f.stat({ bigint: true }); check(); return s;
-    };
-    const open = async (p: string, flags: number, admin: boolean, mode?: number, creating = false) => {
-      visit(admin); meta(512);
-      const f = await fs.open(p, flags, mode);
-      handles.add(f); if (!creating) check(); return f;
-    };
-    const close = async (f: Handle) => { await f.close(); handles.delete(f); };
-    const validatePins = async (...active: Pin[]) => {
-      // Each selected pin and its named ancestor chain is visited once per call.
-      // Earlier siblings remain covered by the complete final validations.
-      for (const p of pins) {
-        if (active.length && !active.some(target => target.output === p.output &&
-            isWithinPath(target.absolute, p.absolute))) continue;
-        const named = await stat(p.named, p.output), fd = await fstat(p.file, p.output);
-        if (!(p.immutable ? unchanged(p.stat, named) && unchanged(named, fd) :
-          same(p.stat, named) && same(named, fd)) || !fd.isDirectory() ||
-            (p.output && (!safeDirectory(p.absolute, named) || !safeDirectory(p.absolute, fd))) ||
-            (workerInputs.has(p) && (!workerDirectory(named) || !workerDirectory(fd)))) throw refused();
-      }
-    };
-    const effect = async (...active: Pin[]) => {
-      check(); await beforeEffect(); check(); await validatePins(...active); check();
-    };
-    // Cleanup reads/removals are admitted before creation, then remain available
-    // after revocation. One serial attempt per recorded entry, no recursive rm.
-    // An ambiguous parent/entry is preserved; sibling cleanup may still proceed.
-    const reserveCleanup = (admin: boolean, parent?: Pin) => {
-      if (own) return; // Composition reserves and performs the sole removal traversal.
-      visit(admin); meta(12288); MaintenanceResources.consume("adminEntries", 2);
-      if (parent) for (const p of pins) {
-        if (p.output && isWithinPath(parent.absolute, p.absolute)) {
-          MaintenanceResources.consume("adminEntries", 2); meta(4096);
-        }
-      }
-    };
-    const pin = async (named: string, absolute: string, output: boolean, readable: boolean, immutable = false) => {
-      meta(8448); // Bounded lookup key and retained map entry before allocation.
-      const key = (output ? "+" : "-") + absolute;
-      const before = await stat(named, output), existing = pinIndex.get(key);
-      if (existing) {
-        const fd = await fstat(existing.file, output);
-        if (existing.immutable !== immutable || !fd.isDirectory() ||
-            !(immutable ? unchanged(existing.stat, before) && unchanged(before, fd) :
-              same(existing.stat, before) && same(before, fd)) ||
-            (output && (!safeDirectory(absolute, before) || !safeDirectory(absolute, fd)))) throw refused();
-        // Reuse the original pin: repeated control probes cannot grow the set
-        // of cleanup ancestors after an artifact's cleanup work was reserved.
-        return existing;
-      }
-      const f = await open(named, (readable ? fsConstants.O_RDONLY | fsConstants.O_DIRECTORY |
-        fsConstants.O_NONBLOCK : 0x200000) | fsConstants.O_NOFOLLOW, output);
-      const after = await fstat(f, output);
-      if (!after.isDirectory() || !same(before, after) || (output && !safeDirectory(absolute, after))) throw refused();
-      meta(1024); reserveCleanup(output);
-      const p = { file: f, named, stat: after, output, absolute, immutable };
-      pins.push(p); pinIndex.set(key, p); return p;
-    };
-    const absoluteDirectory = async (absolute: string, output: boolean) => {
-      const parts = validPath(absolute);
-      let current = await pin("/", "/", output, parts.length === 0);
-      let full = "";
-      for (let i = 0; i < parts.length; i++) {
-        meta(8448); full += "/" + parts[i];
-        current = await pin(child(current, parts[i]!), full, output, i === parts.length - 1);
-      }
-      return current;
-    };
-    const absent = async (p: string, admin: boolean) => {
-      try { await stat(p, admin); }
-      catch (error) {
-        check();
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-        throw error;
-      }
-      throw refused();
-    };
-    // Omitted (tolerated) source controls are pinned at their first observation. Every later
-    // probe must see the same state, so a change is refused whether the walk lists objects/info
-    // before or after it: directory order is filesystem-defined (ext4 hashes names per filesystem).
-    const omittedControls = new Map<string, Stat | null>();
-    const sameOmitted = (key: string, now: Stat | null) => {
-      if (!omittedControls.has(key)) { omittedControls.set(key, now); return; }
-      const first = omittedControls.get(key)!;
-      if ((first === null) !== (now === null) || (first && now && !unchanged(first, now))) throw refused();
-    };
-    const controlsAbsent = async (objects: Pin, omit = false) => {
-      const p = child(objects, "info");
-      let info: Stat;
-      try { info = await stat(p, objects.output); }
-      catch (error) {
-        check();
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        if (omit) for (const name of ["alternates", "http-alternates"]) sameOmitted(objects.absolute + "\0" + name, null);
-        return;
-      }
-      if (!info.isDirectory() || info.isSymbolicLink()) throw refused();
-      // Pin even this preliminary control lookup: no symlink-following probe.
-      const d = await pin(p, absoluteChild(objects, "info"), objects.output, true, !objects.output);
-      for (const name of ["alternates", "http-alternates"]) {
-        const control = child(d, name);
-        if (!omit) { await absent(control, objects.output); continue; }
-        // Non-authoritative metadata only: never open, readlink, read or follow it.
-        let s: Stat | null = null;
+    let readCanonicalConfig: () => Promise<string> = async () => { throw refused(); };
+    return this.withMaintenanceFamilyLock(barePath, branch, key, source.runId, family,
+      { signal: this.recoveryOperations.getStore()!.signal, configRead: () => readCanonicalConfig() },
+      async readLockedFamily => {
         try {
-          s = await stat(control, false);
-          if (!s.isFile() && !s.isSymbolicLink() && !s.isFIFO()) throw refused();
-        } catch (error) {
-          check();
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        }
-        sameOmitted(objects.absolute + "\0" + name, s);
-      }
-    };
-    const createDirectory = async (parent: Pin, name: string, absolute: string, source: Pin) => {
-      const p = child(parent, name);
-      await absent(p, true); reserveCleanup(true, parent); visit(true); meta(2048);
-      const record = own?.(absolute, true);
-      await effect(source, parent); visit(true);
-      await fs.mkdir(p, { mode: 0o700 });
-      // Recover identity without dispatching other effects, even if now revoked.
-      const created = await fs.lstat(p, { bigint: true });
-      outputs.push({ parent, name, stat: created, directory: true, size: 0 });
-      record?.(created);
-      check(); await validatePins(source, parent);
-      // mkdir(0700) can inherit SGID. It grants no group access; never heal
-      // an existing directory or permit setuid/sticky/group/other permission bits.
-      if (!created.isDirectory() || created.uid !== BigInt(process.getuid!()) ||
-          (created.mode & 0o5777n) !== 0o700n) throw refused();
-      return pin(p, absolute, true, true);
-    };
-    let byteSize = 0, fileCount = 0;
-    try {
-      check();
-      if (process.platform !== "linux" || typeof beforeEffect !== "function" ||
-          typeof source?.identity !== "string" || source.identity.length > 128 ||
-          !/^[0-9]+:[0-9]+(?![\s\S])/.test(source.identity)) throw refused();
-      validPath(source.clonePath); validPath(outDir);
-      if (source.clonePath === runner || !isWithinPath(source.clonePath, runner) ||
-          outDir === root || !isWithinPath(outDir, root)) throw refused();
-      // sources counts logical inventory, never OS descriptors.
-      MaintenanceResources.consume("sources", 1);
-      const clone = await absoluteDirectory(source.clonePath, false);
-      if (String(clone.stat.dev) + ":" + String(clone.stat.ino) !== source.identity) throw refused();
-      const gd = await pin(child(clone, ".git"), absoluteChild(clone, ".git"), false, true);
-      const objects = await pin(child(gd, "objects"), absoluteChild(gd, "objects"), false, true, true);
-      await controlsAbsent(objects, knownBase !== undefined);
-      let baseObjects: Pin | undefined, baseOut: string | undefined;
-      if (knownBase !== undefined) {
-        validPath(knownBase.barePath);
-        if (typeof knownBase.identity !== "string" || knownBase.identity.length > 128 ||
-            !/^[0-9]+:[0-9]+(?![\s\S])/.test(knownBase.identity) ||
-            path.dirname(knownBase.barePath) !== path.resolve(this.reposRoot) ||
-            !path.basename(knownBase.barePath).endsWith(".git")) throw refused();
-        // Reserve the fixed sibling's capacity BEFORE concatenation; never accept
-        // a caller path for the second output or discover a base via alternates.
-        meta(8448);
-        if (Buffer.byteLength(outDir) + Buffer.byteLength("-base") > 4096) throw refused();
-        baseOut = outDir + "-base";
-        validPath(baseOut);
-        for (const output of [outDir, baseOut]) {
-          for (const input of [source.clonePath, knownBase.barePath]) {
-            if (isWithinPath(output, input) || isWithinPath(input, output)) throw refused();
+          await prepare(); check();
+          MaintenanceResources.consume("sources", 2);
+          const clone = await absolutePin(source.clonePath, true);
+          if (clone.stat.dev + ":" + clone.stat.ino !== source.identity) throw refused();
+          const git = await pin(childPath(clone, ".git"), path.join(source.clonePath, ".git"), true);
+          const objects = await pin(childPath(git, "objects"), path.join(git.absolute, "objects"), true);
+          if (git.stat.dev !== clone.stat.dev || objects.stat.dev !== git.stat.dev) throw refused();
+          await pin(childPath(objects, "pack"), path.join(objects.absolute, "pack"), true);
+          const bare = await absolutePin(barePath, false);
+          for (const name of [".git", "commondir", "gitdir"])
+            await control(childPath(bare, name), true);
+          for (const name of ["commondir", "gitdir"])
+            await control(childPath(git, name), true);
+          const bareConfigName = childPath(bare, "config"), bareConfig = await stat(bareConfigName);
+          if (!bareConfig.isFile() || bareConfig.nlink !== 1n || bareConfig.uid !== BigInt(process.getuid!()) ||
+              (bareConfig.mode & 0o002n) !== 0n || ((bareConfig.mode & 16n) !== 0n &&
+                (bareConfig.gid !== BigInt(process.getgid!()) || (uidSplitActive() && bareConfig.gid === BigInt(RUNNER_UID))))) throw refused();
+          leaves.push({ named: bareConfigName, stat: bareConfig });
+          const base = await pin(childPath(bare, "objects"), path.join(barePath, "objects"), false);
+          await pin(childPath(base, "pack"), path.join(base.absolute, "pack"), false);
+          for (const p of [bare, base, ...pins.filter(p => p.absolute === path.join(base.absolute, "pack"))]) {
+            if (p.stat.uid !== BigInt(process.getuid!()) ||
+                ((p.stat.mode & 16n) !== 0n && (p.stat.gid !== BigInt(process.getgid!()) ||
+                  (uidSplitActive() && p.stat.gid === BigInt(RUNNER_UID))))) throw refused();
           }
-        }
-        MaintenanceResources.consume("sources", 1);
-        const repos = await absoluteDirectory(path.resolve(this.reposRoot), false);
-        const bare = await pin(child(repos, path.basename(knownBase.barePath)), knownBase.barePath, false, true, true);
-        if (String(bare.stat.dev) + ":" + String(bare.stat.ino) !== knownBase.identity) throw refused();
-        baseObjects = await pin(child(bare, "objects"), absoluteChild(bare, "objects"), false, true, true);
-        for (const p of [repos, bare, baseObjects]) {
-          if (!workerDirectory(p.stat)) throw refused();
-          workerInputs.add(p);
-        }
-        await controlsAbsent(baseObjects);
-      }
-      const parent = await absoluteDirectory(path.dirname(outDir), true);
-      if (baseOut) await absent(child(parent, path.basename(baseOut)), true);
-      const destination = await createDirectory(parent, path.basename(outDir), outDir, objects);
-      const copyFile = async (src: Pin, dst: Pin, name: string, observed: Stat) => {
-        const from = child(src, name), to = child(dst, name);
-        if (!observed.isFile() || observed.nlink !== 1n || observed.size < 0n ||
-            observed.size > BigInt(Number.MAX_SAFE_INTEGER)) throw refused();
-        const input = await open(from, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK, false);
-        let output: Handle | undefined;
-        try {
-          const before = await fstat(input, false);
-          if (!unchanged(observed, before) || !before.isFile() || before.nlink !== 1n) throw refused();
-          await absent(to, true); reserveCleanup(true, dst); visit(true); meta(2048);
-          const record = own?.(absoluteChild(dst, name), false);
-          await effect(src, dst);
-          output = await open(to, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW |
-            fsConstants.O_RDWR, true, 0o600, true);
-          const created = await output.stat({ bigint: true });
-          outputs.push({ parent: dst, name, stat: created, directory: false, size: Number(before.size) });
-          record?.(created);
-          check(); await validatePins(src, dst);
-          let n = 0;
-          while (true) {
-            check();
-            const request = Math.min(65536, Number(before.size) + 1 - n);
-            MaintenanceResources.consume("sourceBytes", request);
-            const buf = Buffer.alloc(request);
-            const { bytesRead } = await input.read(buf, 0, request, n);
-            check();
-            if (bytesRead < 0 || bytesRead > request || n + bytesRead > Number(before.size)) throw refused();
-            if (!bytesRead) break;
-            MaintenanceResources.consume("artifactBytes", bytesRead);
-            for (let offset = 0; offset < bytesRead;) {
-              await effect(src, dst);
-              const { bytesWritten } = await output.write(buf, offset, bytesRead - offset, n + offset);
-              check(); await validatePins(src, dst);
-              if (bytesWritten <= 0 || bytesWritten > bytesRead - offset) throw refused();
-              offset += bytesWritten;
-            }
-            n += bytesRead;
+          const infoControl = async (parent: Pin, name: string, absent: boolean) => {
+            const infoName = childPath(parent, "info");
+            const infoStat = await control(infoName, false);
+            if (!infoStat) return;
+            const info = await pin(infoName, path.join(parent.absolute, "info"), parent.source);
+            await control(childPath(info, name), absent);
+          };
+          await infoControl(base, "alternates", true); await infoControl(base, "http-alternates", true);
+          await infoControl(bare, "alternates", true);
+          for (let p = path.dirname(outDir);; p = path.dirname(p)) {
+            const s = await stat(p, "sourceEntries");
+            if (!safeDir(p, s, false)) throw refused();
+            scratchParents.set(p, s); if (path.dirname(p) === p) break;
           }
-          if (n !== Number(before.size) || !unchanged(before, await fstat(input, false)) ||
-              !unchanged(before, await stat(from, false))) throw refused();
-          byteSize += n; fileCount++;
-        } finally {
-          if (output) await close(output);
-          await close(input);
-        }
-      };
-      const walk = async (src: Pin, dst: Pin, relative: string, depth: number, omit = false, workerTree = false): Promise<void> => {
-        check(); if (depth > 64) throw refused();
-        const before = await fstat(src.file, false);
-        visit(false); meta(4096);
-        const stream = await fs.opendir("/proc/self/fd/" + src.file.fd, { encoding: "buffer" as BufferEncoding, bufferSize: 1 });
-        try {
-          check();
-          while (true) {
-            visit(false); MaintenanceResources.consume("sourceBytes", 255); meta(1536);
-            const ent = await stream.read(); check();
-            if (!ent) break;
-            const raw = ent.name as unknown as Buffer;
-            if (!Buffer.isBuffer(raw) || raw.length > 255 || !isUtf8(raw)) throw refused();
-            meta(1024); const name = raw.toString("utf8"); validName(name);
-            meta(16384); const rel = relative ? relative + "/" + name : name;
-            if (Buffer.byteLength(rel) > 4096 || depth + 1 > 64) throw refused();
-            const control = relative === "info" && (name === "alternates" || name === "http-alternates");
-            if (control && !omit) throw refused();
-            const sourceAbsolute = absoluteChild(src, name), targetAbsolute = absoluteChild(dst, name);
-            const observed = await stat(child(src, name), false);
-            visit(false); meta(2048);
-            inputs.push({ parent: src, name, stat: observed, directory: observed.isDirectory(), size: 0 });
-            if (control) {
-              if (!observed.isFile() && !observed.isSymbolicLink() && !observed.isFIFO()) throw refused();
-              continue;
+          // No Git, RPC, journal or source mutation occurs inside this descriptor walk.
+          await this.observeMaintenanceTransferPhase("walk", async () => {
+            const walk = async (dir: Pin, relative: string): Promise<void> => {
+              const before = await fstat(dir.file);
+              charge(dir.absolute);
+              const stream = await fs.opendir("/proc/self/fd/" + dir.file.fd,
+                { encoding: "buffer" as BufferEncoding, bufferSize: 1 });
+              try {
+                for (;;) {
+                  await prepare(); check();
+                  charge(dir.absolute); MaintenanceResources.consume("sourceBytes", 255);
+                  const entry = await stream.read(); check(); if (!entry) break;
+                  const raw = entry.name as unknown as Buffer;
+                  if (!Buffer.isBuffer(raw) || !isUtf8(raw) || raw.length > 255) throw refused();
+                  const name = raw.toString("utf8"), rel = relative ? relative + "/" + name : name;
+                  const named = childPath(dir, name), s = await stat(named);
+                  if (s.dev !== objects.stat.dev || s.isSymbolicLink()) throw refused();
+                  if (s.isDirectory()) {
+                    if (!(relative === "" && (/^[0-9a-f]{2}$/.test(name) || name === "pack" || name === "info")) &&
+                        !(relative === "info" && name === "commit-graphs")) throw refused();
+                    await walk(await pin(named, path.join(dir.absolute, name), true), rel);
+                  } else {
+                    if (s.nlink > 1n) throw new Error("maintenance_source_alias_refused");
+                    const allowed = /^[0-9a-f]{2}\/[0-9a-f]{38}$/.test(rel) ||
+                      /^pack\/pack-[0-9a-f]{40}\.(pack|idx|rev|mtimes|bitmap|keep)$/.test(rel) ||
+                      /^info\/(alternates|packs|commit-graph|multi-pack-index)$/.test(rel) ||
+                      /^info\/commit-graphs\/(commit-graph-chain|graph-[0-9a-f]{40}\.graph)$/.test(rel) ||
+                      /^(pack\/)?(tmp_[A-Za-z0-9._-]+|incoming-[A-Za-z0-9._-]+)$/.test(rel);
+                    if (!allowed || !s.isFile() || s.nlink !== 1n || s.size < 0n ||
+                        s.size > BigInt(Number.MAX_SAFE_INTEGER) ||
+                        (s.uid !== BigInt(process.getuid!()) && !(uidSplitActive() && s.uid === BigInt(RUNNER_UID))) ||
+                        (s.mode & 0o7002n) !== 0n ||
+                        ((s.mode & 16n) !== 0n && !(uidSplitActive() && s.uid === BigInt(RUNNER_UID)))) throw refused();
+                    MaintenanceResources.consume("sourceBytes", Number(s.size));
+                    leaves.push({ named, stat: s });
+                    const sourceUnchanged = (now: Stat) => {
+                      if (now.isFile() && now.nlink > 1n) throw new Error("maintenance_source_alias_refused");
+                      return unchanged(s, now);
+                    };
+                    charge(named);
+                    const file = await fs.open(named, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+                    try {
+                      if (!sourceUnchanged(await fstat(file))) throw refused();
+                      if (rel === "info/alternates") {
+                        const expected = Buffer.from(base.absolute + "\n");
+                        if (s.size !== BigInt(expected.length)) throw refused();
+                        const bytes = Buffer.alloc(expected.length + 1);
+                        let offset = 0;
+                        while (offset < bytes.length) {
+                          check();
+                          const capacity = bytes.length - offset;
+                          MaintenanceResources.consume("sourceBytes", capacity);
+                          const result = await file.read(bytes, offset, capacity, offset);
+                          if (!Number.isSafeInteger(result.bytesRead) || result.bytesRead < 0 || result.bytesRead > capacity)
+                            throw refused();
+                          if (result.bytesRead === 0) break;
+                          offset += result.bytesRead;
+                        }
+                        if (offset !== expected.length || !bytes.subarray(0, offset).equals(expected) ||
+                            !sourceUnchanged(await fstat(file)) || !sourceUnchanged(await stat(named))) throw refused();
+                      }
+                      if (!sourceUnchanged(await fstat(file)) || !sourceUnchanged(await stat(named))) throw refused();
+                    } finally { await closeIO(file); }
+                  }
+                }
+              } finally { await closeIO(stream); }
+              if (!unchanged(before, await fstat(dir.file))) throw refused();
+              dir.frozen = before;
+            };
+            await walk(objects, "");
+            await infoControl(objects, "http-alternates", true);
+            await infoControl(objects, "alternates", false);
+            await validate();
+          });
+          await mkdir(outDir);
+          const first = path.join(outDir, "read"), second = path.join(outDir, "proof");
+          await view(first); await view(second);
+          const env = environment(first, objects.absolute, base.absolute);
+          const bareEnv = environment(first, base.absolute, "");
+          const proofEnv = environment(second, path.join(second, "objects"), base.absolute);
+          readCanonicalConfig = async () => {
+            // Metadata acquisition is supervised local work, never a remote pair
+            // or a recursive family read. The caller holds the canonical lock.
+            await local(); await validate(); check();
+            // Canonical metadata only, never clone config; no recursive family reader.
+            const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"],
+              undefined, undefined, undefined, "sourceEntries");
+            check(); await validate();
+            const rows = config.split("\0");
+            if (rows.some(row => /^(include\.|includeif\.|core\.(worktree|hookspath|sshcommand)\n|extensions\.(partialclone|worktreeconfig|refstorage)\n)/i.test(row)) ||
+                rows.filter(row => row.startsWith("core.bare\n")).join("") !== "core.bare\ntrue" ||
+                rows.some(row => row.startsWith("extensions.objectformat\n") && row !== "extensions.objectformat\nsha1"))
+              throw refused();
+            return config;
+          };
+          supervised = async (importing = false) => {
+            await local();
+            const snapshot = await readLockedFamily();
+            await validateFamily({ ...snapshot,
+              origin: this.maintenanceOriginFromConfig(barePath, original.cloneUrl, snapshot.metadata) });
+            await local();
+            if (importing) {
+              // All Git metadata and ledger continuity checks precede this pair.
+              // Only deny-only local checks may follow it before shared import.
+              await beforeSemantic();
+              await local();
             }
-            if (observed.isDirectory()) {
-              const sub = await pin(child(src, name), sourceAbsolute, false, true, true);
-              if (!unchanged(observed, sub.stat)) throw refused();
-              if (workerTree) {
-                if (!workerDirectory(sub.stat)) throw refused();
-                workerInputs.add(sub);
+            // Last yielded owner callback precedes every artifact check, including
+            // readLockedFamily's independent canonical-config acquisition.
+            await validate(); check();
+          };
+          const shallow = async () => {
+            try {
+              // Existing entries are never opened. Both absence and query must prove non-shallow.
+              await control(childPath(bare, "shallow"), true);
+              await supervised();
+              if ((await this.runGit(barePath, ["rev-parse", "--is-shallow-repository"])).trim() !== "false") throw refused();
+              check(); await validate();
+            } catch { throw refused(); }
+          };
+          await shallow();
+          // Private controls are SHA-1. The admitted SHA-1 object layout, exact
+          // index OIDs and decoded hashes prove supplied bytes without clone config.
+          const anchors: string[] = [], boundary: string[] = [];
+          const ancestor = async (candidate: string, anchor: string) =>
+            (await collect(await launch(first, bareEnv, ["merge-base", "--is-ancestor", candidate, anchor]), true)).code === 0;
+          const listing = await this.observeMaintenanceTransferPhase("selection", async () => {
+            const eligible = new Set(["refs/remotes/origin/" + defaultBranch,
+              "refs/heads/" + defaultBranch, "refs/uzi-runner/" + branch]);
+            // Missing exact refs produce no rows; command errors still refuse.
+            // Git patterns can include descendants: only exact eligible names
+            // contribute anchors, never any other namespace or descendant.
+            const refs = await read(first, { ...bareEnv, GIT_DIR: barePath },
+              ["for-each-ref", "--format=%(objectname) %(refname)", "--", ...eligible]);
+            if (refs && !refs.endsWith("\n")) throw refused();
+            for (const row of refs ? refs.slice(0, -1).split("\n") : []) {
+              // Git permits Unicode whitespace in literal refs. Only exact names
+              // built from the validated worker fields below can become anchors.
+              const match = /^([a-f0-9]{40}) (refs\/[\s\S]+)$/.exec(row);
+              if (!match) throw refused();
+              if (eligible.has(match[2]!) && !anchors.includes(match[1]!)) anchors.push(match[1]!);
+            }
+            const candidates = [...new Set([original.baseCommit, record?.sourceSha, ...anchors].filter((s): s is string => s !== undefined))];
+            for (const candidate of candidates) {
+              if (!SHA40_RE.test(candidate)) throw refused();
+              for (const anchor of anchors) if (await ancestor(candidate, anchor)) { boundary.push(candidate); break; }
+            }
+            if (!boundary.length) throw new Error("maintenance_transfer_boundary_missing");
+            return read(first, env, ["rev-list", "--objects", "--no-object-names", "--missing=error", tip, "--not", ...boundary]);
+          });
+          const parseOids = (text: string) => {
+            let count = 0; for (const c of text) if (c === "\n") count++;
+            MaintenanceResources.consume("closureEntries", count);
+            MaintenanceResources.consume("metadataBytes", text.length * 4 + count * 128);
+            if (text && !text.endsWith("\n")) throw refused();
+            const rows = text ? text.slice(0, -1).split("\n") : [];
+            if (rows.length > 65536 || rows.some(s => !SHA40_RE.test(s)) || new Set(rows).size !== rows.length) throw refused();
+            return rows;
+          };
+          const oids = parseOids(listing);
+          if (!oids.length) {
+            let reachable = false;
+            for (const anchor of anchors) if (await ancestor(tip, anchor)) { reachable = true; break; }
+            if (!reachable) throw refused();
+            await shallow(); await validate(); await supervised(); await validate(); check();
+            return { kind: "already_present", sourceSha: tip };
+          }
+          if (!oids.includes(tip)) throw refused();
+          const operation = this.recoveryOperations.getStore()!;
+          const metadata = async (repo: string, environment: NodeJS.ProcessEnv,
+            verified?: Map<string, ClosureObject>): Promise<ClosureObject[]> => {
+            const rows = (await read(repo, environment, ["cat-file", "--batch-check"], listing)).split("\n");
+            if (rows.pop() !== "" || rows.length !== oids.length) throw refused();
+            let declared = 0;
+            return rows.map((row, i) => {
+              MaintenanceResources.consume("closureEntries", 1);
+              const match = /^([0-9a-f]{40}) (blob|tree|commit|tag) (0|[1-9][0-9]*)$/.exec(row);
+              if (!match || match[1] !== oids[i]) throw refused();
+              const size = Number(match[3]), hit = verified?.get(match[1]!);
+              if (!Number.isSafeInteger(size)) throw refused();
+              if (hit && (hit.size !== size || hit.type !== match[2])) throw refused();
+              if (!hit) {
+                if (size > operation.closureBudget.limit - operation.closureBudget.delivered - declared)
+                  throw new RecoveryClosureLimitError(operation.closureBudget.limit);
+                declared += size;
               }
-              const target = await createDirectory(dst, name, targetAbsolute, sub);
-              await walk(sub, target, rel, depth + 1, omit, workerTree);
-            } else await copyFile(src, dst, name, observed);
-          }
-        } finally { await stream.close(); }
-        if (!unchanged(before, await fstat(src.file, false))) throw refused();
-      };
-      await walk(objects, destination, "", 0, knownBase !== undefined);
-      const sourceResult = { path: outDir, byteSize, fileCount };
-      let baseResult: { path: string; byteSize: number; fileCount: number } | undefined;
-      let baseDestination: Pin | undefined;
-      if (baseObjects && baseOut) {
-        baseDestination = await createDirectory(parent, path.basename(baseOut), baseOut, baseObjects);
-        const sourceBytes = byteSize, sourceFiles = fileCount;
-        await walk(baseObjects, baseDestination, "", 0, false, true);
-        baseResult = { path: baseOut, byteSize: byteSize - sourceBytes, fileCount: fileCount - sourceFiles };
-      }
-      const validateRecords = async () => {
-        await validatePins();
-        if (!unchanged(objects.stat, await fstat(objects.file, false))) throw refused();
-        // Revisit every earlier leaf after the entire walk, including files in
-        // earlier directories. Quiescence is a caller prerequisite, not an atomic claim.
-        for (const r of inputs) {
-          if (!unchanged(r.stat, await stat(child(r.parent, r.name), false))) throw refused();
-        }
-        for (const r of outputs) {
-          const named = child(r.parent, r.name), now = await stat(named, true);
-          if (!same(r.stat, now) || now.uid !== BigInt(process.getuid!()) ||
-              (now.mode & (r.directory ? 0o5777n : 0o7777n)) !== (r.directory ? 0o700n : 0o600n) ||
-              (!r.directory && (now.nlink !== 1n || now.size !== BigInt(r.size)))) throw refused();
-          const f = await open(named, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW |
-            fsConstants.O_NONBLOCK | (r.directory ? fsConstants.O_DIRECTORY : 0), true);
+              return { oid: match[1]!, type: match[2]!, size };
+            });
+          };
+          await metadata(first, env);
+          const packDir = path.join(second, "objects", "pack"); await mkdir(packDir);
+          const packPath = path.join(packDir, "stage.pack"), indexPath = path.join(packDir, "stage.idx");
+          const recordPack = own(packPath, false), recordIndex = own(indexPath, false);
+          const { pack, index } = await this.observeMaintenanceTransferPhase("pack", async () => {
+            const producer = await launch(first, env, ["pack-objects", "--stdout", "--no-reuse-object",
+              "--no-reuse-delta", "--window=0", "--depth=0", "--threads=1"], listing, "artifactBytes");
+            const pack = await this.stageMaintenancePack({ stdout: producer.stdout,
+              exited: producer.exited.then(code => ({ code, stderr: "" })), abort: producer.cancel },
+              packPath, 256 * 1024 ** 2, local, closePins, { disposable: true });
+            recordPack(await stat(packPath));
+            const index = await this.indexMaintenancePack(pack, indexPath, oids, local, closePins,
+              { repo: second, objects: path.join(second, "objects"), alternate: base.absolute,
+                beforeSpawn: () => supervised() });
+            recordIndex(await stat(indexPath));
+            return { pack, index };
+          });
+          // Fixed standard pack names; read checksum through a pinned no-follow descriptor.
+          charge(packPath);
+          const file = await fs.open(packPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+          let checksum: string;
           try {
-            const fd = await fstat(f, true);
-            if (!unchanged(now, fd)) throw refused();
-          } finally { await close(f); }
+            const initial = await fstat(file);
+            if (!unchanged(owned.get(packPath)!.stat, initial) || initial.nlink !== 1n) throw refused();
+            MaintenanceResources.consume("sourceBytes", 20);
+            const bytes = Buffer.alloc(20);
+            if ((await file.read(bytes, 0, 20, pack.byteSize - 20)).bytesRead !== 20 ||
+                !unchanged(initial, await fstat(file)) || !unchanged(initial, await stat(packPath))) throw refused();
+            checksum = bytes.toString("hex");
+          } finally { await closeIO(file); }
+          const rename = async (from: string, to: string) => {
+            const recordOwn = own(to, false);
+            await local(); await scratchCheck(to);
+            const expected = owned.get(from)!.stat, now = await stat(from);
+            if (!unchanged(expected, now) || now.nlink !== 1n) throw refused();
+            try { await stat(to); throw refused(); }
+            catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+            await scratchCheck(to);
+            charge(to); await fs.rename(from, to);
+            recordOwn(expected); owned.delete(from);
+            recordOwn(await stat(to));
+          };
+          pack.path = path.join(packDir, "pack-" + checksum + ".pack");
+          index.path = path.join(packDir, "pack-" + checksum + ".idx");
+          await rename(packPath, pack.path); await rename(indexPath, index.path);
+          const range = async (repo: string, environment: NodeJS.ProcessEnv) => {
+            const rows = parseOids(await read(repo, environment,
+              ["rev-list", "--objects", "--no-object-names", "--missing=error", tip, "--not", ...boundary]));
+            const selected = new Set(oids);
+            if (rows.length !== oids.length || rows.some(oid => !selected.has(oid))) throw refused();
+          };
+          await this.observeMaintenanceTransferPhase("proof", async () => {
+            // Only this operation's unchanged staged provenance can reuse hashes.
+            // Canonical entries never authenticate newly supplied runner bytes.
+            await local();
+            const provenance = (p: string) => {
+              const s = owned.get(p)!.stat;
+              return [p, String(s.dev), String(s.ino), String(s.size), String(s.mtimeNs), String(s.ctimeNs)];
+            };
+            const identity = JSON.stringify([barePath, `${bare.stat.dev}:${bare.stat.ino}`,
+              `${base.stat.dev}:${base.stat.ino}`, provenance(pack.path), provenance(index.path)]);
+            const verified = operation.closureCache.identities.get(identity);
+            const objects = await metadata(second, proofEnv, verified);
+            const missing = objects.filter(object => !verified?.has(object.oid));
+            if (missing.length) {
+              const child = await launch(second, proofEnv, ["cat-file", "--batch"],
+                missing.map(object => object.oid).join("\n") + "\n", "closure");
+              try {
+                await verifyClosureFrames(child.stdout, missing, operation.closureBudget, operation.signal);
+                if (await child.exited !== 0) throw refused();
+              } catch (e) { child.cancel(); child.stdout.destroy(); await child.exited; throw e; }
+            }
+            await range(second, proofEnv);
+            await local(); await validate();
+            // Publish only after all frames, joined children and pinned identity rechecks.
+            let entries = verified;
+            for (const object of missing) {
+              if (operation.closureCache.entries >= Math.floor(GIT_MAX_BUFFER / 41)) break;
+              if (!entries) {
+                entries = new Map(); operation.closureCache.identities.set(identity, entries);
+              }
+              entries.set(object.oid, object); operation.closureCache.entries++;
+            }
+          });
+          await shallow(); await validate();
+          await this.observeMaintenanceTransferPhase("import", async () => {
+            await local(); await scratchCheck(pack.path);
+            const initial = await stat(pack.path);
+            if (!unchanged(owned.get(pack.path)!.stat, initial) || initial.nlink !== 1n) throw refused();
+            charge(pack.path);
+            const input = await fs.open(pack.path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+            let child: Awaited<ReturnType<GitCache["spawnGit"]>> | undefined;
+            try {
+              if (!unchanged(initial, await fstat(input))) throw refused();
+              // Import uses private controls, canonical objects, and no refs/config from the clone.
+              child = await launch(first, bareEnv, ["index-pack", "--strict", "--stdin"], undefined, "metadataBytes", true, true);
+              if (!child.stdin) throw refused();
+              const output = collect(child);
+              // Observe rejection while streaming, then join both paths below.
+              void output.catch(() => undefined);
+              try {
+                const bytes = Buffer.alloc(65536);
+                for (let offset = 0; offset < pack.byteSize;) {
+                  await local(); await scratchCheck(pack.path);
+                  if (!unchanged(initial, await stat(pack.path)) || !unchanged(initial, await fstat(input))) throw refused();
+                  const length = Math.min(bytes.length, pack.byteSize - offset);
+                  MaintenanceResources.consume("sourceBytes", length);
+                  const result = await input.read(bytes, 0, length, offset);
+                  if (result.bytesRead <= 0 || result.bytesRead > length) throw refused();
+                  await new Promise<void>((resolve, reject) => child!.stdin!.write(bytes.subarray(0, result.bytesRead),
+                    e => e ? reject(e) : resolve()));
+                  offset += result.bytesRead;
+                }
+                if (!unchanged(initial, await fstat(input)) || !unchanged(initial, await stat(pack.path))) throw refused();
+                child.stdin.end(); await output;
+              } catch (e) { child.cancel(); child.stdout.destroy(); await output.catch(() => undefined); throw e; }
+            } catch (e) {
+              if (child) { child.cancel(); child.stdout.destroy(); await child.exited; }
+              throw e;
+            } finally { await closeIO(input); }
+            await range(first, bareEnv); await validate();
+          });
+          await supervised(); await validate(); check();
+          return { kind: "imported", sourceSha: tip };
+        } finally {
+          await closePins();
+          await cleanup();
+          check();
         }
-        await controlsAbsent(objects, knownBase !== undefined); await controlsAbsent(destination);
-        if (baseObjects && baseDestination) {
-          await controlsAbsent(baseObjects); await controlsAbsent(baseDestination);
-        }
-        await validatePins();
-      };
-      await validateRecords();
-      await effect();
-      await validateRecords(); // Callback may itself yield to an insertion/replacement.
-      for (const f of handles) { await close(f); check(); }
-      check();
-      if (handles.size !== 0) throw refused();
-      return baseResult ? { ...sourceResult, base: baseResult } : sourceResult;
-    } catch (error) {
-      // All I/O above is serial and settled before cleanup. No abort races,
-      // permission repairs, retries, source writes, child launches or refunds.
-      for (let i = own ? -1 : outputs.length - 1; i >= 0; i--) {
-        const r = outputs[i]!;
-        try {
-          for (const p of pins) {
-            if (!p.output || !isWithinPath(r.parent.absolute, p.absolute)) continue;
-            const named = await fs.lstat(p.named, { bigint: true });
-            const fd = await p.file.stat({ bigint: true });
-            if (!same(p.stat, named) || !same(named, fd) ||
-                (p.output && !safeDirectory(p.absolute, named))) throw refused();
-          }
-          const p = "/proc/self/fd/" + r.parent.file.fd + "/" + r.name;
-          const now = await fs.lstat(p, { bigint: true });
-          if (!same(r.stat, now)) continue;
-          if (r.directory) await fs.rmdir(p); else await fs.unlink(p);
-        } catch { /* Preserve foreign or ambiguous names; continue bounded siblings. */ }
-      }
-      const reason = error instanceof Error && [
-        "maintenance_resource_exhausted", "maintenance_token_invalid", "maintenance_clock_invalid",
-      ].includes(error.message) ? error.message : "maintenance_object_snapshot_refused";
-      throw new Error(reason);
-    } finally {
-      // Success already joined every retained close. On refusal, settle the
-      // remaining admitted handles without masking the fixed refusal or granting work.
-      for (const f of handles) {
-        try { await close(f); } catch { /* Retain uncertainty; no successful handoff. */ }
-      }
-    }
+      });
   }
 
   /**
@@ -14125,7 +14606,8 @@ try {
     outPath: string,
     maxBytes: number,
     beforeEffect: () => Promise<void>,
-    beforeCleanup?: () => Promise<void>,
+    beforeCleanup?: (activeIOClosed?: boolean) => Promise<void>,
+    options?: { disposable: boolean },
   ): Promise<{ path: string; byteSize: number; objectCount: number }> {
     const refused = () => new Error("maintenance_pack_staging_refused");
     const scope = AsyncLocalStorage.snapshot();
@@ -14144,6 +14626,14 @@ try {
     const signal = MaintenanceResources.signalIfActive();
     signal?.addEventListener("abort", cancel, { once: true });
     let file: Awaited<ReturnType<typeof fs.open>> | undefined;
+    let closeFailed = false;
+    const closeFile = async () => {
+      const active = file;
+      if (!active) return;
+      if (options?.disposable) file = undefined;
+      try { await active.close(); file = undefined; }
+      catch (error) { closeFailed = true; throw error; }
+    };
     let created: Stats | undefined;
     const parents: Array<{ path: string; stat: Stats }> = [];
     const check = () => {
@@ -14156,7 +14646,7 @@ try {
       check();
     };
     const chargeStat = (p: string) => {
-      MaintenanceResources.consume("adminEntries", 1);
+      MaintenanceResources.consume(options?.disposable ? "sourceEntries" : "adminEntries", 1);
       MaintenanceResources.consume("metadataBytes", 1024 + Buffer.byteLength(p));
     };
     const same = (a: Stats, b: Stats) => a.dev === b.dev && a.ino === b.ino;
@@ -14173,7 +14663,8 @@ try {
         chargeStat(parent.path);
         const now = await fs.lstat(parent.path);
         check();
-        if (!safeDirectory(parent.path, now) || !same(now, parent.stat)) throw refused();
+        if (!safeDirectory(parent.path, now) || !same(now, parent.stat) ||
+            (options?.disposable && parent.stat.mode !== now.mode)) throw refused();
       }
     };
     const effect = async () => { await admit(); await parentCheck(); check(); };
@@ -14197,7 +14688,7 @@ try {
       // Reserve cleanup metadata before creation: refusal must never block safe
       // cleanup after revocation. Each reserved read is bounded like a normal stat.
       for (const p of [...hierarchy, outPath, outPath]) chargeStat(p);
-      MaintenanceResources.consume("adminEntries", 1); // Potential cleanup unlink.
+      MaintenanceResources.consume(options?.disposable ? "sourceEntries" : "adminEntries", 1); // Potential cleanup unlink.
       for (const p of hierarchy.reverse()) {
         check();
         chargeStat(p);
@@ -14207,7 +14698,7 @@ try {
         parents.push({ path: p, stat });
       }
       await effect();
-      MaintenanceResources.consume("adminEntries", 1);
+      MaintenanceResources.consume(options?.disposable ? "sourceEntries" : "adminEntries", 1);
       file = await fs.open(outPath, fsConstants.O_EXCL | fsConstants.O_NOFOLLOW |
         fsConstants.O_RDWR | fsConstants.O_CREAT, 0o600);
       // On refusal after open, cleanup recovers identity from this owned fd.
@@ -14221,6 +14712,17 @@ try {
         MaintenanceResources.consume("artifactBytes", bytes.length);
         for (let offset = 0; offset < bytes.length;) {
           await effect();
+          if (options?.disposable) {
+            // The importer registers this pack only after staging returns. Until
+            // then authenticate the active fd and name on every short-write retry.
+            chargeStat(outPath); const fd = await file!.stat();
+            chargeStat(outPath); const named = await fs.lstat(outPath);
+            check();
+            if (!same(created!, fd) || !same(fd, named) ||
+                [fd, named].some(s => !s.isFile() || s.nlink !== 1 ||
+                  s.uid !== process.getuid!() || (s.mode & 0o7777) !== 0o600 ||
+                  s.size !== byteSize + offset)) throw refused();
+          }
           const { bytesWritten } = await file!.write(bytes, offset, bytes.length - offset, byteSize + offset);
           check();
           if (bytesWritten <= 0 || bytesWritten > bytes.length - offset) throw refused();
@@ -14258,7 +14760,7 @@ try {
       check();
       if (prefixSize !== 12 || byteSize < 32) throw refused();
       await effect();
-      await file.sync();
+      if (!options?.disposable) await file.sync();
       await parentCheck();
       chargeStat(outPath);
       const fdStat = await file.stat();
@@ -14283,8 +14785,7 @@ try {
       if (!same(fdStat, finalPath) || finalPath.size !== byteSize || finalPath.nlink !== 1 ||
           (finalPath.mode & 0o7777) !== 0o600 || finalPath.uid !== process.getuid!()) throw refused();
       await effect();
-      await file.close();
-      file = undefined;
+      await closeFile();
       check();
       return { path: outPath, byteSize, objectCount };
     } catch (error) {
@@ -14292,15 +14793,17 @@ try {
       await exited;
       if (file) {
         // If the first fstat failed, recover identity from our still-owned fd.
-        if (!created) { try { created = await file.stat(); } catch { /* No unlink without identity. */ } }
-        try { await file.close(); } catch { /* Cleanup still checks identity. */ }
-        file = undefined;
+        if (!created) { try { created = await file.stat(); } catch { /* Pre-reserved; no unlink without identity. */ } }
+        try { await closeFile(); } catch { /* Retain output when closure is uncertain. */ }
       }
       // Bounded best effort, no retries; one failed check prevents unlink.
       // Check-then-unlink relies on the caller's worker-exclusive hierarchy.
       if (created) {
         try {
-          await beforeCleanup?.();
+          if (options?.disposable) {
+            await beforeCleanup?.(!closeFailed);
+            if (closeFailed) throw refused();
+          } else await beforeCleanup?.();
           for (const parent of parents) {
             const now = await fs.lstat(parent.path);
             if (!safeDirectory(parent.path, now) || !same(now, parent.stat)) throw refused();
@@ -14334,7 +14837,8 @@ try {
     outPath: string,
     expectedOids: readonly string[],
     beforeEffect: () => Promise<void>,
-    beforeCleanup?: () => Promise<void>,
+    beforeCleanup?: (activeIOClosed?: boolean) => Promise<void>,
+    proof?: { repo: string; objects: string; alternate: string; beforeSpawn: () => Promise<void> },
   ): Promise<{ path: string; byteSize: number; objectCount: number }> {
     const refused = () => new Error("maintenance_pack_index_refused");
     const check = () => { MaintenanceResources.check(); this.checkRecoveryInterruption(); };
@@ -14350,7 +14854,7 @@ try {
         (strictAncestor(p) && uidSplitActive() && process.getuid!() === WORKER_UID &&
           process.getgid!() === WORKER_UID && s.gid === WORKER_UID));
     const chargeStat = (p: string) => {
-      MaintenanceResources.consume("adminEntries", 1);
+      MaintenanceResources.consume(proof ? "sourceEntries" : "adminEntries", 1);
       MaintenanceResources.consume("metadataBytes", 1024 + Buffer.byteLength(p));
     };
     const parents: Array<{ path: string; stat: Stats }> = [];
@@ -14374,6 +14878,21 @@ try {
     };
     let input: Awaited<ReturnType<typeof fs.open>> | undefined;
     let output: Awaited<ReturnType<typeof fs.open>> | undefined;
+    let closeFailed = false;
+    const closeInput = async () => {
+      const active = input;
+      if (!active) return;
+      if (proof) input = undefined;
+      try { await active.close(); input = undefined; }
+      catch (error) { closeFailed = true; throw error; }
+    };
+    const closeOutput = async () => {
+      const active = output;
+      if (!active) return;
+      if (proof) output = undefined;
+      try { await active.close(); output = undefined; }
+      catch (error) { closeFailed = true; throw error; }
+    };
     let inputStat: Stats | undefined, outputStat: Stats | undefined;
     let child: Awaited<ReturnType<GitCache["spawnGit"]>> | undefined;
     let launched = false, byteSize = 0;
@@ -14404,7 +14923,7 @@ try {
       }
       // Pre-reserve bounded cleanup stats + unlink, independent of later revocation.
       for (const p of [...hierarchy, outPath, outPath]) chargeStat(p);
-      MaintenanceResources.consume("adminEntries", 1);
+      MaintenanceResources.consume(proof ? "sourceEntries" : "adminEntries", 1);
       for (const p of hierarchy.reverse()) {
         check(); chargeStat(p);
         const stat = await fs.lstat(p);
@@ -14414,7 +14933,7 @@ try {
       }
       await absent();
       await parentCheck();
-      MaintenanceResources.consume("adminEntries", 1);
+      MaintenanceResources.consume(proof ? "sourceEntries" : "adminEntries", 1);
       input = await fs.open(staged.path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
       chargeStat(staged.path);
       inputStat = await input.stat();
@@ -14484,15 +15003,23 @@ try {
         GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null",
         GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "none",
       };
+      if (proof) {
+        // Private importer binding only. No public arbitrary environment surface.
+        env.GIT_DIR = proof.repo; env.GIT_OBJECT_DIRECTORY = proof.objects;
+        env.GIT_ALTERNATE_OBJECT_DIRECTORIES = JSON.stringify(proof.alternate);
+      }
       child = await this.spawnGit(path.dirname(outPath),
-        ["--no-replace-objects", "index-pack", "--strict", "--no-rev-index", "--index-version=2",
+        ["--no-replace-objects", ...(proof ? ["-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false",
+          "-c", "core.fsmonitor=false"] : []), "index-pack", "--strict", "--no-rev-index", "--index-version=2",
           "-o", outPath, staged.path], undefined,
         { env, trustedExecutable: true, timeoutMs: GIT_TIMEOUT_MS, stderrMaxBytes: 4096,
           cancelOnAbandon: true, joinStderr: true, beforeSpawn: async () => {
-            await effect(); await inputCheck(); await absent(); check();
+            await effect(); await inputCheck(); await absent();
+            if (proof) { await proof.beforeSpawn(); await inputCheck(); }
+            check();
             // Git unlinks -o first. Only an absent name in this pinned exclusive
             // hierarchy is admitted. No placeholder or pre-existing file is safe.
-            MaintenanceResources.consume("adminEntries", 2); // Git unlink + create.
+            MaintenanceResources.consume(proof ? "sourceEntries" : "adminEntries", 2); // Git unlink + create.
             launched = true;
           } });
       const status: Buffer[] = [];
@@ -14513,7 +15040,7 @@ try {
       if (!candidate.isFile() || candidate.isSymbolicLink() || candidate.uid !== process.getuid!() ||
           candidate.nlink !== 1 || (candidate.mode & 0o022) !== 0 ||
           candidate.size < 1072 || candidate.size > envelope) throw refused();
-      MaintenanceResources.consume("adminEntries", 1);
+      MaintenanceResources.consume(proof ? "sourceEntries" : "adminEntries", 1);
       output = await fs.open(outPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
       chargeStat(outPath);
       if (!unchanged(candidate, await output.stat())) throw refused();
@@ -14586,9 +15113,9 @@ try {
       await effect();
       await inputCheck(); await parentCheck(); chargeStat(outPath);
       if (!unchanged(outputStat, await fs.lstat(outPath))) throw refused();
-      await output.close(); output = undefined;
+      await closeOutput();
       check();
-      await input.close(); input = undefined;
+      await closeInput();
       await parentCheck(); chargeStat(outPath);
       if (!unchanged(outputStat, await fs.lstat(outPath))) throw refused();
       chargeStat(staged.path);
@@ -14601,13 +15128,16 @@ try {
         child.stdout.destroy();
         await Promise.allSettled([child.exited]);
       }
-      if (input) { try { await input.close(); } catch { /* Single bounded cleanup attempt. */ } }
-      if (output) { try { await output.close(); } catch { /* Still check named identity. */ } }
+      try { await closeInput(); } catch { /* Retain output when closure is uncertain. */ }
+      try { await closeOutput(); } catch { /* Retain output when closure is uncertain. */ }
       // Single bounded attempt, after owned process/drain/I/O settlement. Failed
       // checks preserve foreign names. Parent exclusion is a caller prerequisite.
       if (launched) {
         try {
-          await beforeCleanup?.();
+          if (proof) {
+            await beforeCleanup?.(!closeFailed);
+            if (closeFailed) throw refused();
+          } else await beforeCleanup?.();
           for (const parent of parents) {
             const now = await fs.lstat(parent.path);
             if (!safeDirectory(parent.path, now) || !same(now, parent.stat)) throw refused();
@@ -14633,6 +15163,7 @@ try {
    * as {@link runGit} (via {@link spawnGit}), no shell, and the same GIT_TIMEOUT_MS bound.
    */
   private async streamBundleWithCap(barePath: string, args: string[], outPath: string, maxBytes: number): Promise<void> {
+    const stopSignals = this.boundaryStopSignals();
     const { child, stdout, exited, cancel } = await this.spawnGit(barePath, args, undefined, { timeoutMs: GIT_TIMEOUT_MS, stdoutCategory: "artifactBytes" });
     let seen = 0;
     const counter = new Transform({
@@ -14646,10 +15177,24 @@ try {
       cancel();
       if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     };
-    const timer = setTimeout(() => {
-      killChild();
-      counter.destroy(new Error(`git ${args.join(" ")} exceeded ${GIT_TIMEOUT_MS}ms`));
-    }, GIT_TIMEOUT_MS);
+    // issue #3304: after the boundary scope stops, this plain deadline only retires (see readBare); the
+    // gated stdout settles with the owner's typed error and the catch below still kills and removes.
+    let retired = false;
+    let timer: NodeJS.Timeout | undefined;
+    const retire = (): void => {
+      retired = true;
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    };
+    if (stopSignals.some(signal => signal.aborted)) retired = true;
+    else {
+      for (const signal of stopSignals) signal.addEventListener("abort", retire, { once: true });
+      timer = setTimeout(() => {
+        if (retired) return;
+        killChild();
+        counter.destroy(new Error(`git ${args.join(" ")} exceeded ${GIT_TIMEOUT_MS}ms`));
+      }, GIT_TIMEOUT_MS);
+    }
     try {
       await pipeline(stdout, counter, createWriteStream(outPath, { mode: 0o600 }));
       await exited;
@@ -14661,7 +15206,8 @@ try {
       await fs.rm(outPath, { force: true });
       throw err;
     } finally {
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
+      for (const signal of stopSignals) signal.removeEventListener("abort", retire);
     }
   }
 
@@ -15656,6 +16202,13 @@ try {
     }
   }
 
+  /** issue #3304: the active boundary scope's stop signals (hard permit signal, and the soft signal unless
+   *  the scope is masked), read once when a read starts. Empty outside a boundary scope. */
+  private boundaryStopSignals(): AbortSignal[] {
+    const scope = this.boundaryProcesses.getStore();
+    return scope ? [scope.signal, scope.softSignal].filter((signal): signal is AbortSignal => signal !== undefined) : [];
+  }
+
   /** Called under the existing lock, after observation. Only cooperative checkpoint
    * cancellation is masked; the spawner, hard signal and release hook are identical. */
   private maskCheckpointCooperation<T>(action: () => Promise<T>): Promise<T> {
@@ -15896,6 +16449,43 @@ try {
     return output;
   }
 
+  private checkEpochMetadata(args: string[], stdout: string): void {
+    const limits = this.epochRetained.getStore();
+    if (!limits) return;
+    this.checkRecoveryInterruption();
+    if (Buffer.byteLength(stdout) > limits.maxMetadataBytes) throw new Error("epoch metadata byte limit");
+    const config = args.includes("config") && (args.includes("--list") || args.includes("--get-regexp"));
+    const refs = args.includes("for-each-ref") || args.includes("show-ref");
+    if (!config && !refs) return;
+    const separator = config && (args.includes("--null") || args.includes("-z")) ? "\0" : "\n";
+    let count = 0;
+    for (let i = 0; i < stdout.length; i++) {
+      if (stdout[i] === separator && ++count > limits.maxMetadataRecords) throw new Error("epoch metadata record limit");
+    }
+    if (stdout.length && !stdout.endsWith(separator) && ++count > limits.maxMetadataRecords)
+      throw new Error("epoch metadata record limit");
+    if (config && separator === "\0" && args.includes("--list")) {
+      let start = 0;
+      let sources = 0;
+      for (let i = 0; i <= stdout.length; i++) {
+        if (i < stdout.length && stdout[i] !== "\0") continue;
+        const item = stdout.slice(start, i);
+        start = i + 1;
+        const nl = item.indexOf("\n");
+        const key = item.slice(0, nl);
+        if (!/^(uzi-recovery\.|uzi-retained\.|uzi-attempts\.|uzi-stopped\.)/.test(key)) continue;
+        sources++;
+        try {
+          const parsed = JSON.parse(item.slice(nl + 1));
+          const journal = key.startsWith("uzi-retained.") ? parsed?.journal : parsed;
+          if (Array.isArray(journal?.retainedSources)) sources += journal.retainedSources.length;
+          if (journal?.recovery) sources += 2;
+        } catch { /* The authority parser reports malformed values; never accept them here. */ }
+        if (sources > limits.maxMetadataRecords) throw new Error("epoch source record limit");
+      }
+    }
+  }
+
   private async execScoped(
     command: string,
     args: string[],
@@ -15903,6 +16493,8 @@ try {
     identity: BoundaryProcessRequest["identity"] = "worker_pat",
   ): Promise<{ stdout: string; stderr: string }> {
     const boundary = this.boundaryProcesses.getStore();
+    const epoch = this.epochRetained.getStore();
+    if (epoch) options = { ...options, maxBuffer: Math.min(options.maxBuffer ?? Infinity, epoch.maxMetadataBytes) };
     this.checkReportProof();
     const report = this.reportProofs.getStore();
     if (report) options = { ...options, timeout: Math.max(1, Math.min(options.timeout ?? Infinity, report.deadline - Date.now())) };
@@ -15916,7 +16508,11 @@ try {
       // issue #2213: the second quarantine check, keyed on the credential itself, synchronously
       // before the child is created (nothing awaits between this and execFileAsync).
       assertNoCredentialedGitWhileQuarantined(options.env);
-      if (MaintenanceResources.active()) return this.execMeteredNative(command, args, options, operationSignal);
+      if (MaintenanceResources.active()) {
+        const result = await this.execMeteredNative(command, args, options, operationSignal);
+        this.checkEpochMetadata(args, result.stdout);
+        return result;
+      }
       // issue #1597 M2: optional stdin (the checkpoint scan's cat-file / gitleaks stdin). An EPIPE on
       // an early-exiting child is swallowed here; the exit status carries the failure.
       const pending = execFileAsync(command, args, { ...execOptions,
@@ -15934,7 +16530,9 @@ try {
       try {
         const result = await pending;
         this.checkRecoveryInterruption();
-        return { stdout: String(result.stdout), stderr: String(result.stderr) };
+        const stdout = String(result.stdout);
+        this.checkEpochMetadata(args, stdout);
+        return { stdout, stderr: String(result.stderr) };
       } finally {
         await closed;
         if (killTimer) clearTimeout(killTimer);
@@ -15976,6 +16574,16 @@ try {
     process.stdin?.on("error", () => undefined);
     if (!recovery?.signal.aborted) process.stdin?.end(input);
     const cap = options.maxBuffer ?? GIT_MAX_BUFFER;
+    // issue #3304: the soft signal of an UNMASKED scope settles a collector only after the child's own
+    // cancellation and completion have settled through its handle, and only if the stream still has not ended.
+    let softJoin: Promise<void> | undefined;
+    const joinSoftStop = (): Promise<void> => softJoin ??= (async () => {
+      // The handle's own soft listener (spawnCheckpointProcess) requests the cancellation while the handle
+      // still admits it; once completion has settled nothing is needed.
+      await Promise.allSettled([process.completed]);
+      // An EOF already queued on the stream (delivered on a later tick) must land before the verdict.
+      await new Promise<void>(resolve => setImmediate(resolve));
+    })();
     const collect = (source: Readable | null): Promise<{ chunks: Buffer[]; oversized: boolean }> =>
       new Promise((resolve, reject) => {
         if (!source) { resolve({ chunks: [], oversized: false }); return; }
@@ -15986,6 +16594,7 @@ try {
         let settled = false;
         const cleanup = (): void => {
           boundary.signal.removeEventListener("abort", onAbort);
+          boundary.softSignal?.removeEventListener("abort", onSoft);
           stream.removeListener("data", onData);
           stream.removeListener("end", onEnd);
           stream.removeListener("close", onClose);
@@ -16021,6 +16630,10 @@ try {
           stream.destroy();
           settle(undefined, new Error(GIT_OUTPUT_ABORT_MESSAGE));
         };
+        const onSoft = (): void => {
+          if (settled) return;
+          void joinSoftStop().then(() => settle(undefined, new CheckpointSoftDeadlineError()));
+        };
         stream.on("data", onData);
         stream.once("end", onEnd);
         stream.once("close", onClose);
@@ -16033,7 +16646,11 @@ try {
         else if (stream.readableEnded) onEnd();
         else if (stream.destroyed) onClose();
         if (boundary.signal.aborted) onAbort();
-        else boundary.signal.addEventListener("abort", onAbort, { once: true });
+        else {
+          boundary.signal.addEventListener("abort", onAbort, { once: true });
+          if (boundary.softSignal?.aborted) onSoft();
+          else boundary.softSignal?.addEventListener("abort", onSoft, { once: true });
+        }
       });
     let stdout: { chunks: Buffer[]; oversized: boolean };
     let stderr: { chunks: Buffer[]; oversized: boolean };
@@ -16083,10 +16700,12 @@ try {
       failure.stderr = err;
       throw failure;
     }
+    this.checkEpochMetadata(args, out);
     return { stdout: out, stderr: err };
   }
 
-  private async runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string): Promise<string> {
+  private async runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string,
+    metadataCategory: "adminEntries" | "sourceEntries" = "adminEntries"): Promise<string> {
     if (this.boundaryProcesses.getStore()?.capture && (pat !== undefined || scope !== undefined || username !== undefined)) {
       throw new Error("capture credentials refused");
     }
@@ -16103,7 +16722,7 @@ try {
       // journals, ledgers, origins or stopped markers. Raw output bytes are metered
       // by execScoped; unscoped boot/live calls retain their existing behavior.
       if (MaintenanceResources.active() && args[0] === "config" && args.includes("--null") && args.includes("--list")) {
-        MaintenanceResources.consumeMetadataEntriesIfActive(stdout, "\0");
+        MaintenanceResources.consumeMetadataEntriesIfActive(stdout, "\0", metadataCategory);
       }
       return stdout;
     } catch (err) {
@@ -16283,7 +16902,48 @@ try {
         stderrBytes += kept.length;
       });
       const gated = exitGatedStream(this.meteredGitOutput(process.stdout, opts.stdoutCategory, abortRecovery),
-        opts.cancelOnAbandon || MaintenanceResources.active() ? abortRecovery : undefined, true);
+        opts.cancelOnAbandon || MaintenanceResources.active() ? abortRecovery : undefined, true, true);
+      // issue #3304: the child's clean exit does not end the gated output by itself (its source may never
+      // deliver an EOF), and the handle stops cancelling once its completion has settled. When the scope's
+      // hard signal, or its soft signal where the scope carries one (a masked scope has none), fires while
+      // the output is still unfinished, the child is joined (its spawner's handle stops it on the hard
+      // signal; on soft, the handle's soft listener requests cancellation while it still admits it), then
+      // the output settles with the typed verdict. The `exited` calls below are first-wins, so a rejection or soft timeout of
+      // the completion itself still reaches the output through them (tests: v2 control in
+      // runner-m2-done-checkpoint, git-startup-timeout).
+      const stopSignals = [boundary.signal, boundary.softSignal].filter((signal): signal is AbortSignal => signal !== undefined);
+      const unwatchStops = (): void => {
+        for (const signal of stopSignals) signal.removeEventListener("abort", stopOutput);
+      };
+      let stopSettling: Promise<void> | undefined;
+      const stopOutput = (): void => {
+        if (stopSettling || gated.done()) return;
+        stopSettling = (async () => {
+          // No cancellation is requested here. On a soft stop the handle's own soft listener
+          // (spawnCheckpointProcess) requests it while the handle still admits cancellation (once completion
+          // has settled nothing is needed). On a hard stop the scope's spawner (the Codex safety handle or TickSpawner) stops the child on its own signal,
+          // and a cancel() request would mirror its typed completion rejection into an unsafe-cleanup error.
+          const cleanup = await Promise.allSettled([process.completed]);
+          for (const result of cleanup) {
+            if (result.status !== "rejected") continue;
+            const reason = result.reason;
+            gated.fail(reason instanceof CheckpointUnsafeCleanupError || reason instanceof TrustedExecutionRefusal ||
+              reason instanceof GitBoundaryAbortError || reason instanceof CheckpointSoftDeadlineError
+              ? reason : new CheckpointUnsafeCleanupError("checkpoint metadata child settlement unverified", reason));
+            return;
+          }
+          // An EOF already queued on the source (delivered on a later tick) must land before this verdict.
+          await new Promise<void>(resolve => setImmediate(resolve));
+          gated.fail(boundary.signal.aborted
+            ? new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE, undefined, boundary.capture?.signal)
+            : new CheckpointSoftDeadlineError());
+        })();
+        void stopSettling.finally(unwatchStops);
+      };
+      for (const signal of stopSignals) signal.addEventListener("abort", stopOutput, { once: true });
+      gated.out.once("finish", unwatchStops);
+      gated.out.once("close", unwatchStops);
+      if (stopSignals.some(signal => signal.aborted)) stopOutput();
       stderr?.on("error", error => { abortRecovery(); gated.exited(error); });
       process.completed.then(({ code, softTimedOut }) => {
         const expired = completionError();
@@ -16293,6 +16953,10 @@ try {
           return;
         }
         if (code !== 0) {
+          // A stopped scope owns cancellation. Its verified nonzero completion (TickSpawner
+          // resolves with 128 on a signal) must not beat stopOutput's typed verdict while
+          // that handler gives an already-queued EOF one turn to arrive.
+          if (stopSignals.some(signal => signal.aborted)) return;
           const detail = Buffer.concat(stderrChunks).subarray(0, stderrCap).toString().trim();
           gated.exited(new Error(`git ${args.join(" ")} exited ${code}${detail ? `: ${detail}` : ""}`));
         } else gated.exited();
@@ -16817,7 +17481,7 @@ try {
       throw new Error("owed candidates require a known worker bare path");
     }
     for (const dir of [root, barePath]) {
-      const st = await fs.lstat(dir);
+      const st = await this.retainedIO(() => fs.lstat(dir));
       if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() ||
           (st.mode & 0o002) !== 0 ||
           ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() ||
@@ -17338,13 +18002,14 @@ try {
         throw new Error("unsafe owed discovery directory");
       }
       const names: string[] = [];
-      if (this.reportProofs.getStore() || MaintenanceResources.active()) {
+      if (this.epochRetained.getStore() || this.reportProofs.getStore() || MaintenanceResources.active()) {
         const directory = await fs.opendir(dir);
         try {
           for (;;) {
             this.checkReportProof();
+            this.checkRecoveryInterruption();
             MaintenanceResources.checkIfActive();
-            const entry = await directory.read();
+            const entry = await this.retainedIO(() => directory.read());
             if (!entry) break;
             MaintenanceResources.consumeIfActive("adminEntries", 1);
             MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(entry.name));

@@ -79,10 +79,10 @@ const statusPoolWait = "pool_wait"
 // statusLimitWait/statusPoolWait: the follow loop, the steer-queue delivery label and
 // `uzi run get`'s detail block compare against one literal.
 //
-// NON-TERMINAL, like limit_wait/pool_wait, and with NO lifetime cap: a park always
-// becomes promotable again after its capped backoff, so the run auto-resumes repeatedly
-// until it recovers or the owner cancels. Treating it as terminal would make `--follow`
-// exit on a run that is about to produce more messages.
+// NON-TERMINAL, like limit_wait/pool_wait. The cause and retry stamp distinguish
+// timed recovery from an owner-required hold. Retained recovery with a finite stamp
+// stays timed even after it is due; NULL requires owner Resume or Cancel. Default
+// wait and follow stop on owner-required worker holds; timed recovery keeps polling.
 const statusRecoveryWait = "recovery_wait"
 
 // statusPaused is the status a run carries while parked by an OWNER pause (PRD #1190):
@@ -196,8 +196,8 @@ var allRunStatuses = func() map[string]bool {
 // follow-up park, or a terminal — the common "wait for the gate OR the end" case. It also
 // OMITS recovery_wait (issue #1197: a transient-recovery park auto-resumes on a capped
 // backoff, so it is legitimate to wait through, exactly like limit_wait/pool_wait).
-// runWait separately stops a default wait on worker_requeue_exhausted for owner
-// intervention; an explicit --until retains the exact status-set semantics.
+// runWait separately stops a default wait on owner-required worker holds, including
+// retained recovery exhausted only when its retry stamp is NULL; an explicit --until retains the exact status-set semantics.
 var defaultWaitStates = []string{"awaiting_approval", "awaiting_input", "awaiting_followup", "completed", "failed", "cancelled"}
 
 // run wait poll cadence and transient-blip resilience knobs (PRD #264 D1/D9). Vars,
@@ -573,18 +573,32 @@ func openQuestion(ctx context.Context, c uzicli.Client, runID string) (questionP
 // already carries a health reason (e.g. a locked vault parks it queued). The reliable
 // surface remains `uzi run get`/`run list`, which poll the same reason; this warns at
 // create time so an agent that queues then polls is not left blind on the first read.
-func renderCreatedRun(env Env, gf *globalFlags, run apitypes.RunDTO) error {
+func renderCreatedRun(env Env, gf *globalFlags, run apitypes.RunDTO, notice string) error {
 	if run.HealthReason != nil && strings.TrimSpace(*run.HealthReason) != "" {
 		_, _ = fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(strings.TrimSpace(*run.HealthReason)))
 	}
+	printNotice(env, notice)
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
-		return p.JSON(map[string]any{"run": run})
+		out := map[string]any{"run": run}
+		if strings.TrimSpace(notice) != "" {
+			out["notice"] = notice
+		}
+		return p.JSON(out)
 	}
 	if !gf.quiet {
 		return renderRunDetail(p, run)
 	}
 	return nil
+}
+
+// printNotice writes the server's create-time notice (PRD #3454: instance maintenance holds the
+// new run in the queue) to stderr as a warning, so stdout stays machine-readable. The text is
+// server-authored, so it passes through sanitizeTTY.
+func printNotice(env Env, notice string) {
+	if n := strings.TrimSpace(notice); n != "" {
+		_, _ = fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(n))
+	}
 }
 
 // nonEmpty drops blank entries from a StringSlice flag (e.g. --exclude-agents "" or

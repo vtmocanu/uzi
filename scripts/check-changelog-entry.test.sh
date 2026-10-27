@@ -9,7 +9,7 @@ ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 mkdir -p "$ROOT/.uzi/scratch"
 TMP="$(mktemp -d "$ROOT/.uzi/scratch/changelog-entry-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
-FLOOR=80
+FLOOR=99
 cases=0
 passed=0
 
@@ -20,7 +20,7 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 fresh() {
   local d="$TMP/$1"
   mkdir -p "$d/seed/scripts/lib" "$d/seed/api" "$d/seed/deploy/chart"
-  cp "$ROOT/scripts/check-changelog-entry.sh" "$d/seed/scripts/"
+  cp "$ROOT/scripts/check-changelog-entry.sh" "$ROOT/scripts/assert-changelog-covers-release.sh" "$d/seed/scripts/"
   cp "$ROOT/scripts/lib/shipping-paths.sh" "$d/seed/scripts/lib/"
   cp "$ROOT/scripts/lib/dependency-bump.sh" "$d/seed/scripts/lib/"
   cp "$ROOT/scripts/lib/changelog-fragments.sh" "$ROOT/scripts/lib/changelog-fragments.awk" "$d/seed/scripts/lib/"
@@ -64,6 +64,37 @@ expect() {
     echo "FAIL: $2: want exit $1, got $rc" >&2
     sed 's/^/    /' "$TMP/out" >&2
   fi
+}
+
+expect_output() {
+  cases=$((cases + 1))
+  if grep -qF -- "$1" "$TMP/out"; then
+    passed=$((passed + 1))
+  else
+    echo "FAIL: check output does not name $1" >&2
+  fi
+}
+
+# The real release oracle is kept offline; no PR lookup may supply missing coverage.
+mkdir -p "$TMP/oracle-offline"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/oracle-offline/gh"
+chmod +x "$TMP/oracle-offline/gh"
+expect_oracle() {
+  cases=$((cases + 1))
+  local rc=0
+  (cd "$W" && PATH="$TMP/oracle-offline:$PATH" bash scripts/assert-changelog-covers-release.sh HEAD origin/main 0.1.0) > "$TMP/oracle-out" 2>&1 || rc=$?
+  if [ "$rc" = "$1" ]; then
+    passed=$((passed + 1))
+  else
+    echo "FAIL: $2: want oracle exit $1, got $rc" >&2
+    sed 's/^/    /' "$TMP/oracle-out" >&2
+  fi
+}
+
+squash_for_oracle() {
+  git -C "$W" checkout -qb squash origin/main
+  git -C "$W" merge -q --squash feature > /dev/null
+  git -C "$W" commit -qm "$1"
 }
 
 fresh on-main; git -C "$W" checkout -q main
@@ -138,7 +169,43 @@ fresh changelog-none; echo '// y' >> "$W/api/x.go"; commit "$(printf 'refactor(a
 expect 0 "Changelog: none in a branch commit"
 
 fresh docs-only; echo '// comment' >> "$W/api/x.go"; commit "docs(api): comment"
-expect 0 "every shipping commit docs-typed"
+expect 1 "docs-typed shipping commits need an entry or explicit declaration"
+
+# docs-branch-squash-exemption-gap (#3511): docs commits plus excluded tests can
+# squash under a non-docs title. The explicit declaration must survive that squash.
+fresh docs-branch-squash-exemption-gap
+mkdir -p "$W/docs" "$W/api/internal/uzidocs/embed"
+echo 'Updated guidance.' > "$W/docs/autopilot.md"
+echo 'Updated guidance.' > "$W/api/internal/uzidocs/embed/autopilot.md"
+commit 'docs: update guidance'
+echo 'package api' > "$W/api/x_test.go"
+commit 'test: document coverage'
+expect 1 'docs-branch-squash-exemption-gap rejects missing declaration'
+expect_output 'new UUID-v4 fragment'
+expect_output 'Changelog: none'
+expect_output 'reason'
+expect_output 'non-merge branch commit'
+squash_for_oracle '[partial] Guidance verification (#3424)'
+expect_oracle 1 'a non-docs squash without the declaration stays blocked'
+git -C "$W" checkout -q feature
+git -C "$W" commit --allow-empty -qm $'docs: declare no announcement\n\nChangelog: none (documentation only)'
+expect 0 'explicit docs declaration satisfies the PR check'
+squash_body="$(git -C "$W" log --reverse --format=%B origin/main..feature)"
+git -C "$W" branch -D squash > /dev/null
+squash_for_oracle "$(printf '[partial] Guidance verification (#3424)\n\n%s' "$squash_body")"
+expect_oracle 0 'the non-docs squash retains the explicit declaration'
+
+fresh docs-with-fragment
+echo '// comment' >> "$W/api/x.go"
+printf '### Fixed\n\n- **Updated guidance (#3511).**\n  Clarify the existing behavior.\n' > "$W/changelog.d/11111111-1111-4111-8111-111111111111.md"
+commit 'docs: update guidance with a fragment'
+expect 0 'a docs branch can supply a new fragment instead'
+
+fresh docs-with-legacy-entry
+echo '// comment' >> "$W/api/x.go"
+unrel '- Clarify existing behavior (#3511).'
+commit 'docs: update guidance with a legacy entry'
+expect 0 'a docs branch can supply a legacy entry instead'
 
 fresh docs-then-fix; echo '// c' >> "$W/api/x.go"; commit "docs(api): c"; echo '// d' >> "$W/api/x.go"; commit "fix(api): d"
 expect 1 "docs commit plus a code commit is not exempt"
@@ -183,8 +250,8 @@ fresh chart; echo 'a: 2' > "$W/deploy/chart/values.yaml"; commit "chore(deps): c
 expect 1 "deploy/chart change is never exempt"
 
 # A pull_request checkout: HEAD is a merge of the PR head into main, whose subject must
-# not break the docs exemption.
-fresh synthetic-merge; echo '// c' >> "$W/api/x.go"; commit "docs(api): c"
+# not override an explicit declaration in a non-merge branch commit.
+fresh synthetic-merge; echo '// c' >> "$W/api/x.go"; commit $'docs(api): c\n\nChangelog: none (comment only)'
 git -C "$W" checkout -q -B pr-merge origin/main
 git -C "$W" merge -q --no-ff -m "Merge abc into def" feature
 expect 0 "synthetic merge commit ignored for messages"
@@ -241,7 +308,7 @@ for exemption in none docs deps legacy nonshipping valid; do
   fresh "malformed-$exemption"
   case "$exemption" in
     none) echo '// y' >> "$W/api/x.go"; commit $'fix: y\n\nChangelog: none' ;;
-    docs) echo '// y' >> "$W/api/x.go"; commit "docs: y" ;;
+    docs) echo '// y' >> "$W/api/x.go"; commit $'docs: y\n\nChangelog: none (comment only)' ;;
     deps) echo 'require y v1' >> "$W/api/go.mod"; commit "chore(deps): y" ;;
     legacy) echo '// y' >> "$W/api/x.go"; unrel '- legacy' ;;
     valid) echo '// y' >> "$W/api/x.go"; write_fragment ;;
@@ -338,7 +405,7 @@ for exemption in none docs deps; do
   fresh "safety-limit-$exemption"
   case "$exemption" in
     none) echo '// change' >> "$W/api/x.go"; commit $'fix: change\n\nChangelog: none' ;;
-    docs) echo '// docs' >> "$W/api/x.go"; commit 'docs: change' ;;
+    docs) echo '// docs' >> "$W/api/x.go"; commit $'docs: change\n\nChangelog: none (comment only)' ;;
     deps) echo 'require y v1' >> "$W/api/go.mod"; commit 'chore(deps): change' ;;
   esac
   python3 - "$W/$fragment" <<'PYFIX'

@@ -22,8 +22,9 @@ unfetched or uncommitted bytes, so that convention deleted the last copy.
 A stopped generation's exact local source is kept until an operator explicitly disposes of it. For
 stopped-source exits the coverage check is diagnostic only and never authorizes release. Park
 release paths also keep the exact clone and existing journal even when covered. Terminal exits
-retain the existing snapshot-based covered release, subject to the remaining writer-exclusion
-limitation tracked in [#2852](https://github.com/vtmocanu/uzi/issues/2852) (AI-synced 2026-10-18).
+retain covered release subject, for Codex, to subsequent C's exact post-disposal
+proof below. Unregistered/Docker writers and Claude terminal residuals remain
+under [#2852](https://github.com/vtmocanu/uzi/issues/2852) (AI-synced 2026-10-24).
 
 **Slice A contract, Refs #2852 (AI-synced 2026-10-18):** A holds
 credential-free GitCache capture and its supervised children, including retained-source
@@ -62,12 +63,29 @@ Codex switch entries retain without capture; Claude switching is unchanged.
 The [capture contract](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
 records budgets, capability lifetime and held-finalize continuation.
 
-Existing terminal executor disposal and disposeTools are unchanged. B does not
-close the gap between terminal snapshot coverage and writer-exclusion proof;
-strengthened terminal proof (C) remains unshipped. Neither A nor B establishes
-Docker writer exclusion: accepted-but-invisible creates (#1860), daemon/sibling
-writers and Claude terminal residuals remain. Per-attempt cgroups (#1862) are not
-supplied. #1858 grants no automatic reclaim, and #2746 custody SETTLE remains
+**Subsequent C amendment, Refs #2852 (AI-synced 2026-10-24):** Codex
+release-dependent coverage follows disposal of the exact executor/facade.
+Disposal closes admission synchronously and irrevocably through `tablesCleared`;
+one stored attempt remains incomplete on open/closing entry, pending launches or
+callbacks, unmatched poison, late roots/admission faults or unclean cleanup.
+Its exact result is a revocable witness, rechecked through retirement and paired
+skills deletion. Skipped, incomplete or swapped proof retains clone, journal,
+inventory and paired skills with the distinct
+`codex terminal disposal unproven; retaining runner clone` diagnostic.
+Settlement inside A/B defers a request without coverage reads or safety-queue
+reacquisition; inert hardened reads follow disposal. Independent preserve latches,
+custody, receipts, memory settlement, fencing and cancellation still veto release;
+`sourceExitDenied` remains sticky.
+
+Current-process completion sources record exact executor/facade in memory before
+durable bind. KnownCodex missing/non-disposed/swapped proof retains before inventory
+and never falls back to legacy inspection. KnownClaude is unchanged. Owner decision
+2026-10-24 narrows R1857-02(e): persisted/unknown-provenance sources keep today's
+behavior for both harnesses, with no prior-process topology proof or durable format
+change. See the [canonical C contract](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+C strengthens registered processes; Docker accepted-but-invisible creates (#1860),
+unregistered/daemon/sibling writers and Claude terminal residuals remain.
+Per-attempt cgroups (#1862) are not supplied. #1858 grants no automatic reclaim, and #2746 custody SETTLE remains
 separate from physical CLEANUP. Refusal/capacity rates are unknown, retained bytes
 can grow, and capacity pressure grants no deletion authority.
 
@@ -116,9 +134,10 @@ The artifact is the existing clone; nothing is copied.
 ### Coverage: a diagnostic on stopped and park exits, the release gate on terminal exits
 
 `GitCache.verifyStoppedSourceCovered` runs under the bare lock, with the flight's execution
-tail excluding same-run successors, and is evaluated at the exit's cleanup, not when a
-capture was taken (the recovery handler evaluates it once, at its own exit; see
-Recovery-handler exits below). It returns `covered` only if all of these hold:
+tail excluding same-run successors, and is evaluated at cleanup rather than when
+a capture was taken. Claude evaluates it at handler exit; subsequent C defers
+release-capable Codex checks until exact disposal (see Recovery-handler exits
+below). It returns `covered` only if these checks pass (AI-synced 2026-10-24):
 
 - the journal (and, for a canonical clone, the digest-bound marker) still names exactly this
   source, and the path is a real directory with a real `.git` directory;
@@ -129,14 +148,15 @@ Recovery-handler exits below). It returns `covered` only if all of these hold:
   its seed base);
 - every local ref of the clone, in any namespace, points at a commit reachable from `HEAD` or
   from a ref of the bare; there is no stash entry; and no linked worktree exists;
-- a capture-mode proof was quiescent before and after the reads;
+- the before/after callbacks pass: release-capable Codex checks consume C's exact
+  live disposal witness; other stopped-source checks keep their existing process scan;
 - there is no populated submodule: `status` runs with `--ignore-submodules=none`, and a
   `.git/modules` store or an index gitlink whose path holds anything but nothing or an empty
   directory is `not_covered`, including under `ignore=all` (set in `.gitmodules` or config),
   since the parent proof says nothing about a submodule's own files, commits or refs;
-- the final process proof reaped no writer: a writer reaped by the "after" scan existed after
-  the byte checks ran, so they do not cover what it wrote. The residual is a writer that
-  writes and exits between the status read and that proof;
+- where the final process scan runs, it reaped no writer: a writer reaped after
+  the byte checks invalidates them. A writer that writes and exits between reads
+  and that scan remains invisible; Codex release instead requires C's live witness;
 - the stopped-source proof's Docker half was `not_wired` or `docker_unconfirmed`. A failed
   Docker teardown (`docker_error`) skips the coverage check and keeps the clone, because the
   proof scans processes only.
@@ -144,7 +164,8 @@ Recovery-handler exits below). It returns `covered` only if all of these hold:
 The verdict is a snapshot, and its final process scan cannot see a writer that writes and
 exits between the status read and the scan; the cleanup's retire (`discard: true`) would then
 delete that writer's bytes. Park exits therefore keep the source regardless of this verdict;
-the remaining snapshot-based terminal release is an open limitation under #2852:
+subsequent C moves Codex release-dependent checks after exact disposal, while
+unregistered/Docker writers and Claude terminal residuals remain under #2852:
 
 - **Stopped-source exits** (no handler: the generic `stale_claim`, `claim_fence`,
   `running_ack_terminal` arms and a `terminal_disk_precheck` where the generation moved; or a
@@ -159,11 +180,13 @@ the remaining snapshot-based terminal release is an open limitation under #2852:
   Coverage is diagnostic when checked; shutdown still skips the check. Codex
   recovery_park_keep skips the post-scope clone diagnostic at the original cleanup
   site after its original guards, preserving sourceExitDenied and retention latches;
-  Claude and terminal reasons are unchanged (AI-synced 2026-10-23). No stopped-source
+  Claude and stale reasons keep their prior paths; subsequent C defers release-capable
+  Codex terminal checks until exact disposal (AI-synced 2026-10-24). No stopped-source
   marker or `reclaimed` entry is added by the park.
 - **Terminal exits** (`completed`, `failed`, `cancelled`, with `record: "none"`) retain the
-  existing covered release at the handler's exit. The late-writer snapshot residual remains
-  open under #2852; retaining parks is a partial fix, not closure of that issue.
+  covered release, with Codex checks deferred from handler exit until exact executor/facade
+  disposal under C. Missing or revoked proof retains before coverage. Claude's prior
+  behavior and the unregistered/Docker-writer residual remain; #2852 is not complete.
 
 Status reads on a kept clone run with `GIT_OPTIONAL_LOCKS=0`, so they never rewrite its
 index stat cache.
@@ -280,11 +303,13 @@ keep (`markParkKeep`, reason `recovery_park_keep`), or keeps the clone outright 
 The handler's `finally` runs `settleCloneRelease` once after the return-path work.
 After the original guards, Codex recovery_park_keep retains and sets sourceExitDenied
 without a post-scope clone diagnostic; the pending slot is consumed at that original
-cleanup site (AI-synced 2026-10-23). Other reasons and Claude retain the existing
-`retainStoppedSource` call with the capture's `capturedHead`; this orders their snapshot
-after return-path work but does not exclude an independent late writer. A terminal exit can
-release the clone when `verifyStoppedSourceCovered` returns `covered`; on a park or an exit
-that stops the generation the verdict is diagnostic and the clone stays (see Coverage above).
+cleanup site (AI-synced 2026-10-23). Subsequently C makes release-capable Codex
+`retainStoppedSource` calls defer a request until outer disposal, without source
+reads or queue reacquisition inside A/B. The exact disposed executor/facade and
+live witness must still match when coverage runs and retirement dispatches.
+Claude keeps the existing snapshot after return-path work; it does not exclude
+an independent late writer. A terminal exit can release when coverage and its
+applicable proof pass; park/stopped verdicts remain diagnostic (AI-synced 2026-10-24).
 A remembered capture result, a memo without a `capturedHead` (including the degraded `{ verified: false }` stub) and a
 check that throws are all `not_covered`: the clone is kept.
 
@@ -300,7 +325,8 @@ The exit decides the representation of a kept source:
   when covered. The exact clone and existing journal stay, with no marker or `reclaimed`
   entry. A successful direct credential switch also preserves the clone flag.
 - **Terminal exits** (a terminal status or a terminal-disk recheck showing one): covered
-  release is unchanged; otherwise the clone and plain journal stay, and a later run's
+  release for Codex additionally requires C's exact post-disposal proof; otherwise
+  the clone and plain journal stay, and a later run's
   existing terminal-orphan handling applies.
 
 On the same worker, the next claim follows `recoverRetainedClaim` to recapture the kept
@@ -315,7 +341,8 @@ The cost is storage for the old parked source, including after resume and comple
 unwired worker this also replaces ordinary same-path/session continuity with a fresh attempt
 and model session; Docker-wired resumes already use fresh attempts and sessions. Capacity
 pressure is not deletion authority. No new rename, state, TTL, exclusion or disposal
-mechanism is introduced.
+mechanism was introduced by the historical park-only delivery. Subsequent C adds
+the terminal disposal prerequisite above (AI-synced 2026-10-24).
 
 Two exits keep their earlier shape. An owner-authorized cancel (a non-credential cancel
 ACK) keeps its normal cleanup, since the owner chose to discard; only the
@@ -326,9 +353,11 @@ handling is unchanged. A predecessor-capture park instead latches keep and retai
 
 Park and terminal exits that keep the clone outright (`credentialHeld`, an unverified
 credential terminal, `receipt_failed`, `ServerWallParkedError`, a confirm `gone` without
-a capture) run no own-mode proof beyond the existing entry kill, as before; only exits
-that become terminal release-eligible or mark a park keep run the `stopped_source` proof,
-once, at the handler's cleanup (an existing retained-custody flight skips coverage).
+a capture) request no handler coverage. The historical handler cleanup invokes
+`stopped_source` for release-eligible or park-keep exits; existing retained custody
+skips coverage. Subsequent C defers release-capable Codex requests until exact
+outer disposal; outright retention does not bypass that terminal disposal
+(AI-synced 2026-10-24).
 An interruption propagating out of the handler (shutdown, pause, limit, a codex deferral,
 any throw) skips that cleanup check; the preserve flag stays as the
 interrupting arm set it (shutdown, pause and limit keep the clone; an owner cancel takes
@@ -459,11 +488,11 @@ Every case keeps the source. What a later run sees depends on where the failure 
   its seed base, persists the key's attempt mode, so later claims of that issue use fresh
   attempt paths and fresh model sessions. Stopped markers count toward the per-run cap of 64;
   past it the record is `unknown` and the clone stays under its plain journal.
-- **Deferred (not shipped):** writer exclusion spanning the final byte checks through retirement
-  disposal, which would let a covered stopped clone be released again. Park retention avoids
-  snapshot-authorized park deletion, but the residual remains on completed, failed and
-  cancelled terminal release (#2852), pending real writer exclusion and safe reclaim in the
-  Docker lane. Persisting the coverage verdict into inspect
+- **Deferred beyond C:** general writer exclusion that would let a covered stopped
+  clone be released again. C adds registered-process terminal proof without
+  broadening stopped/park deletion authority. Docker and unregistered/sibling
+  writers, Claude terminal residuals and unknown-provenance completion sources
+  remain outside that strengthening (#2852); safe Docker reclaim is not supplied. Persisting the coverage verdict into inspect
   output is also not done; today it is in the worker log only. Decision: PRD
   `prds/done/1786-preserve-worker-only-work.md`, Decision 6 (lander and reviewer).
 - **Not shipped:** teardown of attributed containers is not proven by tests or hosted

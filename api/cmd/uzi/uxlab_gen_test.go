@@ -101,6 +101,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-accounts-one-each":           func(d bool) string { return boardAccountScene(d, now, 1, 140) },
 		"board-accounts-two-plus-one":       func(d bool) string { return boardAccountScene(d, now, 2, 140) },
 		"board-populated":                   func(d bool) string { return boardPopulated(d, now) },
+		"board-worker-name-tail":            func(d bool) string { return boardWorkerNameTailScene(d, now) },
 		"board-rejected":                    func(d bool) string { return rejectedScene(d, "board", 0, false) },
 		"board-rejected-selected":           func(d bool) string { return rejectedScene(d, "board", 0, true) },
 		"detail-rejected":                   func(d bool) string { return rejectedScene(d, "detail", 0, false) },
@@ -1647,6 +1648,18 @@ func boardAccountScene(dark bool, now time.Time, claudeCount, width int) string 
 	m.width = width
 	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
 	m = step(m, secretsMsg{count: claudeCount, codexCount: 1})
+	return m.View().Content
+}
+
+// Long hosted names retain distinct suffixes in the reserved worker column.
+func boardWorkerNameTailScene(dark bool, now time.Time) string {
+	runs := boardRuns(now)[:4]
+	for i, name := range []string{"base.l-highmem-a32f", "base.l-highmem-b917", "界界界界界界界界-a32f", "short-a32f"} {
+		runs[i].WorkerName = sp(name)
+	}
+	m := uxModel(&uzicli.FakeClient{Runs: runs}, "", dark)
+	m.width = 160
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
 	return m.View().Content
 }
 

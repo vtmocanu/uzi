@@ -1220,7 +1220,7 @@ describe("CodexExecutionSafety.withBoundary: per-sink reconcile (m4)", () => {
     assert.equal(JSON.stringify(first).includes("private cleanup detail"), false);
     const second = await safety.dispose(req("terminal"));
     assert.equal(second.kind, "incomplete", "cleared tables cannot erase hook failure");
-    assert.equal(calls, 2, "independent cleanup is still attempted");
+    assert.equal(calls, 1, "the facade joins the original hook failure");
     assert.equal(reg.isPoisoned(), true);
   });
 
@@ -1929,7 +1929,11 @@ describe("A normal boundaries refuse unusable registries before credentials", ()
         return { kind: "ready" };
       });
       if (state === "poisoned") registry.poison({ category: "protocol", message: "prior proof refused" });
-      else assert.equal((await safety.dispose(req("terminal"))).kind, "disposed");
+      else {
+        await registry.quiesceChildren(1000);
+        await registry.reapProcesses(1000, registry.epoch());
+        assert.equal((await safety.dispose(req("terminal"))).kind, "disposed");
+      }
       const priorErrors = registry.poisonErrors();
       const priorQuiesces = quiesces, priorReaps = reaps;
       await assert.rejects(safety.withBoundary(req("finalize"), async () => { actions++; }), CodexBoundaryError);
@@ -2692,4 +2696,61 @@ it("held cleanup joins a later completion batch and refuses its failed reap", as
     assert.equal(await settled, false);
   }));
   assert.equal(acceptsJoinedCaptureCleanup(safety, saved), false);
+});
+
+describe("#2852 facade terminal disposal witness", () => {
+  for (const change of ["poison", "root"] as const) {
+    it(`refuses disposal evidence invalidated by a nonthrowing hook (${change})`, async () => {
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+      await registry.quiesceChildren(1000);
+      await registry.reapProcesses(1000, registry.epoch());
+      const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, () => {
+        if (change === "poison") registry.poison([]);
+        else registry.registerRoot({ id: "late", kind: "command" }, new FakeRoot("command"));
+      });
+      const outcome = await safety.dispose(req("terminal"));
+      assert.equal(outcome.kind, "incomplete", "registry success cannot outlive hook invalidation");
+      assert.equal(safety.acceptsTerminalDisposal(outcome), false);
+      assert.equal(registry.rootCount(), change === "root" ? 1 : 0);
+    });
+  }
+
+  for (const change of ["none", "poison", "root", "throw"] as const) {
+    it(`joins hooks and attests only unchanged success (${change})`, async () => {
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+      await registry.quiesceChildren(1000);
+      await registry.reapProcesses(1000, registry.epoch());
+      const entered = defer<void>(), release = defer<void>();
+      let hooks = 0;
+      const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, async () => {
+        hooks++;
+        entered.resolve();
+        await release.promise;
+        if (change === "poison") registry.poison([]);
+        if (change === "root") registry.registerRoot({ id: "late", kind: "command" }, new FakeRoot("command"));
+        if (change === "throw") throw new Error("private hook failure");
+      });
+      const first = safety.dispose(req("terminal"));
+      const second = safety.dispose(req("terminal"));
+      assert.equal(first, second);
+      await entered.promise;
+      assert.equal(safety.acceptsTerminalDisposal({ kind: "disposed" }), false);
+      let settled = false;
+      void second.then(() => { settled = true; });
+      await Promise.resolve();
+      assert.equal(settled, false);
+      release.resolve();
+      const outcome = await first;
+      assert.equal(outcome.kind, change === "none" ? "disposed" : "incomplete");
+      assert.equal(await second, outcome);
+      assert.equal(await safety.dispose(req("terminal")), outcome);
+      assert.equal(hooks, 1);
+      assert.equal(safety.acceptsTerminalDisposal(outcome), change === "none");
+      if (change === "none") {
+        registry.poison([]);
+        assert.equal(safety.acceptsTerminalDisposal(outcome), false);
+        assert.equal(await safety.dispose(req("terminal")), outcome);
+      }
+    });
+  }
 });

@@ -56,6 +56,7 @@ function realCodexExecutor(): CodexExecutor {
 function fakeSafety(): CodexExecutionSafety {
   return {
     kind: "codex",
+    acceptsTerminalDisposal: () => false,
     withBoundary: async () => { throw new Error("no boundary in this test"); },
     spawnBoundaryProcess: async () => { throw new Error("no boundary process in this test"); },
     dispose: async () => ({}) as Awaited<ReturnType<CodexExecutionSafety["dispose"]>>,

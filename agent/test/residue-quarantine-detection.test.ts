@@ -57,6 +57,7 @@ function neverStarts(counter: { started: number }, safety?: CodexExecutionSafety
 
 const CODEX_SAFETY: CodexExecutionSafety = {
   kind: "codex",
+  acceptsTerminalDisposal: () => false,
   withBoundary: async () => {
     throw new Error("unexpected boundary");
   },

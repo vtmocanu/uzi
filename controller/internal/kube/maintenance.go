@@ -175,9 +175,16 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 				return true, nil
 			}
 			uid := types.UID(op.PVCUID)
+			var generation PodEpochGeneration
+			if m.epoch != nil {
+				generation = m.epoch.CurrentGeneration()
+			}
 			err := m.client.CoreV1().PersistentVolumeClaims(ns).Delete(ctx, dindDataPVCName(w.ID), metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
 			if err != nil && !apierrors.IsNotFound(err) {
 				return true, err
+			}
+			if err == nil {
+				m.recordEpochDelete(generation, w.ID, *op)
 			}
 			return true, nil
 		}
@@ -223,6 +230,9 @@ func (m *Materializer) reconcileReplacement(ctx context.Context, w protocol.Desi
 		return nil // Cleanup may progress; a replacement still needs its image turn.
 	}
 	// Disable only the legacy triggers in this local copy during fenced rebuilding.
+	if w.DindMaintenance != nil {
+		ctx = context.WithValue(ctx, podEpochMaintenanceKey{}, *w.DindMaintenance)
+	}
 	w.DindMaintenance = nil
 	w.DiskPressure = false
 	return m.reconcileWorkerWithLegacy(ctx, w, o, false)

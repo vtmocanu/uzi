@@ -1,4 +1,5 @@
 import test, { mock } from "node:test";
+import type { GitCache } from "../src/git.js";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -69,6 +70,13 @@ async function fixture(t: test.TestContext) {
     releaseRecoveryCustody: async () => { throw new Error("FINAL forbidden"); },
   };
   const git = {
+    // Coordinator-only fixture: no object proof is claimed by this clean no-op.
+    // Real transfer/proof and owner settlement run in the composed runner tests.
+    importMaintenanceTip: async (request: Parameters<GitCache["importMaintenanceTip"]>[0]) => {
+      await request.prepare();
+      await request.validateFamily({ sources: [...observation.family!.originals], metadata, origin });
+      return { kind: "already_present" as const, sourceSha: request.tip };
+    },
     matchMaintenanceSourceFamily: async () => {
       if (!MaintenanceResources.discoveryActive()) {
         events.push("paid-scan");
@@ -150,6 +158,84 @@ async function fixture(t: test.TestContext) {
     holdJoin: (join: () => Promise<void>) => { boundaryJoin = join; },
     duringCapture: (hook: () => Promise<void>) => { onCapture = hook; } };
 }
+
+test("terminal origin: registration changes during the semantic pair refuse before import despite a current fresh token", async t => {
+  for (const invalidateDuringPair of [false, true]) {
+    const f = await fixture(t);
+    const observe = f.client.observeTerminalMaintenanceHold!;
+    const epochs = new WeakMap<object, number>();
+    const tokens: Readonly<object>[] = [];
+    let epoch = 0, semanticPair = false, imported = 0, pairCalls = 0;
+    let chargedCurrentBeforePair = false, chargedCurrentAfterPair = true, freshCurrentAfterPair = false;
+    const current = (candidate: Readonly<object>) => epochs.get(candidate) === epoch;
+    f.client.isCurrentTerminalMaintenanceHold = current;
+    f.client.observeTerminalMaintenanceHold = async (...args: Parameters<typeof observe>) => {
+      if (semanticPair) {
+        pairCalls++;
+        // WorkerClient invalidates every prior token on registration. A pair
+        // started after that change may still return a current new token.
+        if (invalidateDuringPair) epoch++;
+      }
+      const result = await observe(...args);
+      if (!result.ok) return result;
+      const token = Object.freeze({});
+      epochs.set(token, epoch);
+      tokens.push(token);
+      if (semanticPair) {
+        chargedCurrentAfterPair = current(tokens[1]!);
+        freshCurrentAfterPair = current(token);
+      }
+      return { ...result, token };
+    };
+    f.git.importMaintenanceTip = async request => {
+      await request.prepare();
+      await request.validateFamily({ sources: [...f.observation.family!.originals],
+        metadata: f.observation.family!.metadata, origin });
+      chargedCurrentBeforePair = current(tokens[1]!);
+      semanticPair = true;
+      try { await request.beforeSemantic(); }
+      finally { semanticPair = false; }
+      imported++;
+      return { kind: "already_present" as const, sourceSha: request.tip };
+    };
+    await f.run();
+    assert.equal(pairCalls, 1, "the semantic pair was reached");
+    assert.equal(chargedCurrentBeforePair, true, "the charged token was live before the pair");
+    assert.equal(chargedCurrentAfterPair, !invalidateDuringPair, "currency changes during the pair only");
+    assert.equal(freshCurrentAfterPair, true, "the newly observed token is current");
+    assert.equal(imported, invalidateDuringPair ? 0 : 1, "stale source lifetime refuses before shared import");
+    assert.equal(await f.chargeCount(), 1, "the same paid slot is retained");
+    await f.unchanged();
+  }
+});
+
+test("terminal origin: a semantic pair naming a different original worker than the custodian refuses before import", async t => {
+  const f = await fixture(t);
+  const observe = f.client.observeTerminalMaintenanceHold!;
+  let semanticPair = false, imported = 0, pairCalls = 0;
+  f.client.observeTerminalMaintenanceHold = async (...args: Parameters<typeof observe>) => {
+    const result = await observe(...args);
+    if (!semanticPair || !result.ok) return result;
+    pairCalls++;
+    // Only the owner's semantic pair is altered; the charged and fresh observations name the custodian.
+    return { ...result, hold: { ...result.hold, original_worker_id: "another-" + workerId } };
+  };
+  f.git.importMaintenanceTip = async request => {
+    await request.prepare();
+    await request.validateFamily({ sources: [...f.observation.family!.originals],
+      metadata: f.observation.family!.metadata, origin });
+    semanticPair = true;
+    try { await request.beforeSemantic(); }
+    finally { semanticPair = false; }
+    imported++;
+    return { kind: "already_present" as const, sourceSha: request.tip };
+  };
+  await f.run();
+  assert.equal(pairCalls, 1, "the semantic pair was reached with a foreign original worker");
+  assert.equal(imported, 0, "a hold whose original worker is not the custodian refuses before shared import");
+  assert.equal(await f.chargeCount(), 1, "the same paid slot is retained");
+  await f.unchanged();
+});
 
 test("terminal origin: real ledger indexes a MAC standard prefix before publication; source and UUID unchanged", async t => {
   const f = await fixture(t);

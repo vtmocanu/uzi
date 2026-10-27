@@ -121,9 +121,10 @@ func newCICmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			printNotice(env, run.Notice)
 			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
-				return p.JSON(run)
+				return p.JSON(run.RunDTO)
 			}
 			p.Printf("Queued CI-fix run %s (%s) for %s\n", run.ID, run.Status, ref)
 			return nil

@@ -14,6 +14,8 @@ os=$(uname -s 2>/dev/null) || os=unknown
 note "module=$module os=$os"
 note "runner_image_os=${ImageOS:-unavailable (ImageOS unset)}"
 note "runner_image_version=${ImageVersion:-unavailable (ImageVersion unset)}"
+note "go_memory_limit=${GOMEMLIMIT:-unset}"
+note "go_gc_percent=${GOGC:-unset}"
 
 case "$os" in
   Linux)

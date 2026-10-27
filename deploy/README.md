@@ -85,6 +85,72 @@ atomically, it does not ship a half-version.
 
 ## Release procedure
 
+Standard releases use `.github/workflows/release-auto.yml` on main. This first stage
+is **dispatch-only**; a schedule follows a proven live RC. The shared scripts below
+remain the local fallback. [ADR-3512](../adr/3512-release-automation.md) records the
+accepted authorization boundary and staged recovery work.
+
+Before the first live dispatch, the maintainer configures and verifies:
+
+| Control | Required configuration |
+|---|---|
+| RC App | Repository-only installation, contents write, no workflows permission |
+| Stable App | Separate repository-only installation, contents write, no main bypass |
+| `release-rc` | Main-only Environment; `RELEASE_APP_ID` variable, `RELEASE_APP_KEY` secret |
+| `release-stable` | Main-only; same variable/secret names, required maintainer reviewer, prevent self-review off for the solo-maintainer case |
+| `RELEASE_DISPATCHERS` | Repository variable, comma/space-separated exact GitHub logins |
+| Main review rules | Pull requests/checks; admin and RC App bypass |
+| Main integrity rules | Deletion/non-fast-forward; admin bypass only |
+| Stable-tag creation | `v*` excluding `v*-rc.*`; admin and stable App bypass |
+| RC-tag creation | `v*-rc.*`; admin and RC App bypass |
+| Tag integrity | All `v*` updates/deletion/non-fast-forward; admin bypass only |
+
+The existing `release` publisher Environment is unchanged. The workflow never
+creates or modifies these settings. Verify that the RC App cannot create stable
+tags, either App cannot update/delete tags or force/delete main, the stable App
+cannot write main, and rejecting one ref rejects the whole atomic push. A dry-run
+or source review alone is not evidence that server rules are active.
+
+For an explicitly authorized RC, dispatch `release-auto.yml` with `kind=rc`.
+Optional `version` chooses a base; `abandon_train=true` needs a higher version.
+`supersede` must name the latest failed/missing-publication candidate. It waives
+only that publication refusal, never pin, coverage, oracle, metadata or adoption
+checks. Manual RC dispatch preserves empty-delta respins; the cutter still decides
+releasability. Review the run summary and its exact parent/release/tag identifiers.
+
+Only the human dispatches `kind=stable`, supplying the newest `rc_tag` and its full
+peeled `rc_sha`, then approves `release-stable`. Agents never perform either act.
+The request expires 24 hours after the original run creation, including approval
+wait. Promotion uses the candidate and ignores current-main CI and
+advancement. The summary links first-parent main changes observed during preparation.
+
+Codex lock changes in the planned range require the adoption read and a local cut.
+On abandon the range starts at the highest stable, so a previously adopted change
+can still block automated abandon until a local cut. There is no CI attestation
+parser or model access. Before any local fallback, finish/stop CI release work,
+inspect remote main/tags and resolve interrupted publication on the same tag.
+
+The prepared bundle is validated in a separate job without repository checkout
+before the App token is minted. RC metadata and tag push atomically, without force.
+A lost push receipt is investigated against the prepared tag/SHA, never by cutting
+a replacement. Prepare and push refuse when the run attempt is greater than one: re-dispatch
+instead, after inspecting remote refs when a push receipt is uncertain. Never
+rerun prepare or push in the same run. Watch and report may rerun against the
+exact existing tag/SHA. The inspection bundle is retained for one day; watch
+and report recovery use the existing tag and stored outputs, not a new bundle
+or a second push. The local watch/verify scripts remain available for
+manual same-tag recovery. Only a confirmed publication and `release-verify.sh` success mean
+done; deployment health is a separate check. Problems use one `Release automation
+failures` tracking issue; expected no-ops remain in the summary.
+
+Manual tip selection is bounded at 120 minutes plus 10 minutes for cutting.
+Publication watching retains its 60-minute bound within the 120-minute recovery
+allowance. **D10 is partial until 3e-3:** only the single eligible pre-cut main-CI
+infrastructure rerun and existing non-gate publication retries are automated.
+Tagged-KinD, release-commit CI and targeted assertion recovery remain fail-closed
+follow-up work. Scheduling, local morning cutoff and first-week contention
+measurements are separate rollout steps. The procedures below are the local path.
+
 **Releases are cut RC-first** (ADR-1265, PRD #1265). `release-cut X.Y.Z`
 (`.agents/skills/uzi-release/`) cuts a release **candidate** `vX.Y.Z-rc.1` by default: it
 publishes the five images and the chart at that version, opens a GitHub Release flagged
@@ -194,10 +260,10 @@ registry layers are reused when their inputs match; release image identity check
    the OCI chart (`oci://ghcr.io/vtmocanu/uzi/uzi:<tag>`, published LAST). Homebrew is a separate
    `v*`-triggered run (`brew.yml`).
 
-   > **The tag publishes everything UNATTENDED — there is no approval gate.** The old
-   > `release`-environment required-reviewer was removed 2026-08-20; access control is now the
-   > `protect-release-tags` tag ruleset, so only a repo admin can create a `v*` tag and the tag
-   > push itself is the authorization. (`publish-*` jobs keep `environment: release` only for
+   > **Tag publication remains unattended after authorization.** The release-auto
+   > stable review happens before its App creates the tag. Configured tag rulesets
+   > admit the corresponding App and admin local fallback; the existing `release`
+   > publisher Environment has no required reviewer. (`publish-*` jobs keep `environment: release` only for
    > deployment tracking; `brew.yml` keeps it to scope the `HOMEBREW_TAP_TOKEN` secret. Neither
    > carries a reviewer.) After `git push origin v0.1.0`, the run builds the images, then the
    > chart, then the GitHub Release, with no pause:
@@ -267,17 +333,15 @@ before the first deploy. Each mirrors an existing example-app step.
    GitLab↔Harbor integration, and no `HARBOR_USERNAME`/`HARBOR_PASSWORD` to provision.
    The credential-isolation property Decision 2 wanted still holds: PR builds run
    `--no-push` and never touch the registry, and the push-capable token exists only on
-   the `v*`-tag run, which the tag ruleset below restricts to admins. So an
+   the `v*`-tag run, whose creation is restricted by the split rulesets above. So an
    agent-authored PR that edits a workflow file cannot reach a push credential.
 
-2. **Protected `v*` tags — admin-create-only (`protect-release-tags` ruleset).** The
-   agent/worker PAT lacks the `workflow` scope and cannot create a `v*` tag, and the
-   ruleset restricts `v*` tag creation to a repo admin (admin `bypass_actors`, same
-   shape as `protect-main`). Cutting a release tag — the thing that triggers the
-   unattended publish — is therefore an admin-only action; the tag push itself is the
-   authorization, and there is no approval gate anywhere. Combined with `main` being
-   protected, this closes the agent-MR loop. (Replaces the old GitLab "Maintainer-only
-   protected tags" step and the since-removed `release`-environment reviewer.)
+2. **Protected release refs.** Apply the split rulesets above before live CI use.
+   RC and stable Apps have distinct creation authority, while only admin retains
+   tag update/deletion and force/delete-main bypass. The stable App has no main
+   bypass. The worker PAT still lacks workflow scope and release authority. The
+   existing publisher Environment has no second approval gate; stable review is
+   before the separate stable App creates its tag.
 
 3. **GHCR packages are anonymous-pullable, so the cluster needs no image pull secret.**
    The `ghcr.io/vtmocanu/uzi/*` images and chart are public. The only pull secret still
@@ -805,6 +869,128 @@ is itself a kubelet eviction trigger (see [ADR-1598](../adr/1598-codex-command-s
 and `specs/ai.md` §480). It is not a trust boundary: every command root for a
 run shares one uid, so treat its contents as untrusted, never reused across
 runs. See [adr/1598-codex-command-storage.md](../adr/1598-codex-command-storage.md).
+
+### Pod-epoch shadow reclaim (PRD #3430)
+
+Hosted Docker workers now participate in epoch ownership and can report a
+read-only `pod_epoch_reclaim` verdict before run admission. **The shadow pass
+does not delete attempt trees, release holds or remove stopped containers.**
+Existing startup reapers and DinD maintenance are separate. Compose and
+non-Docker lanes are unchanged. See the [worker overview](../docs/worker-docker.md#pod-epoch-shadow-reclaim)
+and [design and implementation evidence](../prds/3430-pod-epoch-lock-shadow.md).
+
+**Runtime declaration is an operator attestation, not autodetection.**
+`workers.docker.podEpochReclaim.runtime` defaults to `""` (unset). The chart
+accepts exactly `containerd-runc` or `crio-crun` when set. The declaration
+attests that the nodes eligible for these workers meet the audited stack and
+storage prerequisites below; it does not verify versions or storage itself.
+
+| Declaration | Audited stack |
+|---|---|
+| `containerd-runc` | containerd **2.3.4**, runc **1.5.1**, kubelet **1.37.1** |
+| `crio-crun` | CRI-O **1.36.2**, classic conmon with `runtime_type: oci` (unset resolves to `oci`), default crun **1.30.1**, conmon **2.1.10–2.2.1**, kubelet **1.35.3**; no namespace-adjusting NRI plugin |
+
+Leave the value unset for unaudited versions, other runtime handlers or any
+`runtimeClassName`. CRI-O conmon-rs, runtimeVM and runc handlers are unsupported.
+The [CRI-O source audit](../prds/3430-pod-epoch-crio-audit.md) distinguishes
+read evidence from inference and unverified node facts; its function-level
+comparisons do not widen the declaration's crun version.
+
+| Prerequisite | Operator responsibility |
+|---|---|
+| Storage exclusion | Use node-local or attach-enforced data storage so overlapping pods share one kernel's lock view. Shared storage without attach enforcement, including NFS/CephFS, is unsupported. |
+| Kubelet/CSI ownership | Verify the actual driver honors matching-root skip semantics. A driver that recursively walks ownership despite a matching root is unsupported; application flock cannot fence kubelet/CSI. |
+| Mounted data-root posture | Prepare a trusted root/worker-owned directory with gid **10001**, owner and group permissions covering **0770**, setgid, and no world write. Participating initializers preserve this posture; a root mismatch fails startup rather than being repaired. |
+| Node/runtime evidence | Verify installed packages, `/proc` options, NRI configuration and the audit's conmon PID-namespace inference before declaring. Verify the image's util-linux flock as part of the image proof. |
+
+See the [pinned storage audit](../prds/3430-pod-epoch-storage-audit.md) for the
+matching-root predicate and CSI delegation boundary. Rendering
+`OnRootMismatch` alone does not establish the driver's behavior.
+
+**Default-off still participates.** On ext4/xfs, a Docker worker holds shared
+epoch ownership for its process lifetime even with runtime unset, no evidence
+projection, an already-consumed pod UUID or a full consumption ledger. A fresh
+default-off pod logs `deferred` / `runtime_not_declared` immediately after the
+existing startup reapers, without an evidence wait. An absent projection likewise
+defers without waiting. Process restart of a consumed pod does not evaluate again.
+
+Protected pre-Node initializers take temporary shared ownership before their
+writes; Node acquires epoch ownership before its data-volume writers, startup
+reapers and Docker requests. The bounded read-only maintenance `/proc` snapshot
+is the explicit pre-lock exception. An ext4/xfs candidate tries exclusive
+ownership first and holds it through reaping and shadow evaluation, then settles
+its work and reacquires shared ownership before admission.
+
+The filesystem gate permits ext4/xfs. Unsupported filesystems uniformly skip
+**epoch-file** flock and defer evaluation; their bounded ledger metadata still
+uses its serialization mutex, which supplies no epoch-exclusion authority.
+Other participation failures fail closed: missing/unsafe state, flock errors
+and uncertain ledger durability refuse startup without admission.
+
+| Bound | Behavior |
+|---|---|
+| Epoch shared acquisition | **120 s**, including protected initialization; busy tentative EX defers and falls back to bounded SH. |
+| Ledger metadata mutex | **5 s**; validation and durable consumption precede evaluation/admission. |
+| Controller startup synchronization | **60 s**; incomplete synchronization supplies no positive handoff. |
+| Worker evidence wait | **115 s soft / 120 s hard**, including a **5 s** settlement reserve. Negative or invalid evidence defers. |
+| Whole shadow pass | **595 s soft / 600 s hard**, including evidence waiting and settlement; cleanup is joined under EX. Uncertain settlement is fatal, retaining EX until process exit. OS filesystem latency is not cancellable. |
+| Shared reacquisition after EX | Separate **120 s** wait after cleanup, before admission. |
+| Daemon inventory | **10 s** per request; **500 containers**, **500 volumes**, **50 plugins**; inspect concurrency **4**. |
+| Input bytes | Finite daemon bodies and finite subprocess output capped at **8 MiB**; cumulative event stream capped at **64 KiB**; projected evidence **8 KiB**. |
+| Retained-source discovery | **200 physical tree paths**, **4,096 directory entries**, **1,024 bare repositories**; metadata per bare **8 MiB / 4,096 records**. The operator inspector retains its independent **64-descriptor** default. |
+| Consumption history | **4,096 distinct pod UUIDs / 151,560 logical bytes**, on one immutable ledger inode, plus filesystem allocation overhead. No eviction, compaction or automatic reset. |
+
+**Reading verdicts.** `pod_epoch_reclaim` reports `eligible`, `deferred` or
+`partial`, a stable `reason`, `examined`, `would_delete`, `kept`,
+and `list` (up to **32** entries with sanitized run/path identifiers and sizes).
+`list_overflow` counts omitted selected entries. Discovery overflow is exact
+only when bounded discovery completed; consult `inventory_overflow_exact`
+and `inventory_complete` rather than assuming a complete census.
+`bytes_state` is `measured`, `partial` or `unknown`; measured entries do not
+make a partial inventory complete. Evidence-wait and pass durations accompany
+the verdict. Only a fresh durable consumer under EX evaluates; a new pod at
+ledger saturation reports `consumption_full` without evaluation while preserving
+SH startup.
+A would-delete entry requires terminal ownership, fresh empty holds and an
+eligible retained-source disposition; a verdict grants no deletion authority.
+
+**The daemon check is a veto, not an event-subscription proof.** Read-only GET
+inventory requires stopped/created containers, no running/restarting/paused
+containers, restart policy `no`, inactive Swarm, live-restore off, no enabled
+plugins and local volumes with empty options. The unfiltered `since` event
+stream aborts on events, malformed data, EOF or transport failure. HTTP headers
+or a silent stream prove neither subscription liveness nor writer exclusion.
+The exclusion argument rests on the no-client interval, restore/restart-policy
+predicate and stopped-state proof described in the PRD.
+
+**Rollout and repair.** Runtime changes use the existing **Recreate** rollout.
+Plan for initialization lock waits, evidence latency, the bounded pass and
+shared reacquisition before the replacement admits work. A wedged EX holder can
+make a successor reach its bounded SH wait and exit nonzero for restart/retry.
+Do not unlink or replace `/data/.uzi-epoch.lock` or
+`/data/.uzi-epoch-consumed` to fix contention. The ledger records historical
+one-shot consumption: do not automatically delete, truncate or reset it,
+including when full. Torn/corrupt state, uncertain fsync and unsafe metadata
+require operator-owned repair. Positively stop the writers that can reach the
+volume before considering repair; stopping them alone does not establish that
+resetting historical consumption is safe. This guide provides no automatic
+reset or generic safe repair procedure.
+
+**Acceptance remains pending.** The accepted residual is an older pod's writer
+surviving its own termination and continuing after a later evidenced epoch;
+the immediate predecessor/overlap proof does not exclude every historical
+writer. Both base and JVM final-head image proofs remain with the lander on
+the storage host: follow the [exact-head image-proof handoff](../prds/3430-pod-epoch-image-proof.md).
+Live acceptance remains operator-owned: attest the node/storage prerequisites,
+then observe several graceful rolls and record handoff capture, projection
+latency, pass times and verdict/list agreement with actual trees and holds, as
+specified in the [acceptance boundary](../prds/3430-pod-epoch-lock-shadow.md#delivery-acceptance-and-closure).
+The local full-agent gate also remains red, with inconclusive bounded
+base/candidate controls; exact-head PR CI is still pending. Before delivery,
+a formal owner partial decision must name the actual milestone IDs and the
+outstanding M1/M2c image/full-gate criteria and M3 live acceptance. Continuation
+guidance does not waive these checks. These pending proofs are not production
+verification; deletion remains later work under #3431.
 
 ### M4/M5 runbook: known items before go-live
 

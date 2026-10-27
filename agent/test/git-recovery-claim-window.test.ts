@@ -510,3 +510,230 @@ for (const outcome of ["typed 404", "terminal", "foreign generation"] as const) 
     assert.equal(proofs, 0);
   });
 }
+
+// Only persistent IO and external effects are replaced: reservation, blocker persistence,
+// deadline reclassification and typed park reconciliation use production implementations.
+function exhaustionRunner(f: ReturnType<typeof fixture>, options: {
+  feature?: boolean; persistence?: "write" | "read" | "identity" | "other" | "post-read";
+  ack?: () => Promise<Record<string, unknown>>;
+  ownership?: () => Promise<{ status: string; claim_generation: number }>;
+  postDeadline?: boolean;
+} = {}) {
+  const cache = f.recreate();
+  let reports = 0, terminal = 0, reads = 0;
+  cache.terminalRetainedSnapshot = async () => {
+    if (options.persistence === "read") throw new Error("readback unavailable");
+    const journal = f.read();
+    if (options.persistence === "identity") journal.clonePath = "/tmp/other-source";
+    if (options.persistence === "other") journal.recovery = { ...journal.recovery!, blocker: "capture_failed" };
+    return { journal, paths: [journal.clonePath] };
+  };
+  if (options.persistence === "post-read") {
+    const operation = cache.withRecoveryOperation.bind(cache);
+    cache.withRecoveryOperation = async (...args) => {
+      await operation(...args);
+      throw new Error("operation boundary expired after readback");
+    };
+  }
+  if (options.persistence === "write") cache.blockRecoveryEpisode = async () => { throw new Error("write unavailable"); };
+  const flight = {
+    barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 4,
+    runLog: nullLogger(), parked: false, batcher: { emit: () => {} },
+    reportState: async (body: unknown) => {
+      reports++;
+      assert.deepEqual(body, { status: "recovery_wait", recovery_cause: "retained_recovery_exhausted", claim_generation: 4 });
+      return options.ack ? options.ack() : { status: "recovery_wait", recoveryCause: "retained_recovery_exhausted" };
+    },
+  };
+  const runner = Object.assign(Object.create(RunRunner.prototype), {
+    git: cache, recoveryRetryMs: 1, codexBoundaryDeadlineMs: 1000,
+    shutdownSignal: new AbortController(),
+    client: { protocolFeatures: options.feature === false ? [] : ["recovery_cause_retained_recovery_exhausted"],
+      getRunOwnership: async () => {
+        reads++;
+        if (options.ownership) return options.ownership();
+        if (options.postDeadline) f.advance(300_001);
+        throw new TypeError("ownership unavailable");
+      } },
+    cloneCoordinates: () => ({ branch: "branch" }),
+    retainedLifecycleGuard: () => {},
+    retainedLifecycleSignal: () => new AbortController().signal,
+    waitRecoveryRetry: async () => {},
+    reportGenericFailure: async (_claim: unknown, _flight: unknown, _error: unknown, opts: unknown) => {
+      assert.deepEqual(opts, { keepCustody: true }); terminal++;
+    },
+  });
+  return { flight, runner, counts: () => ({ reports, terminal, reads }),
+    run: () => runner.recoverRetainedClaim({ run_id: f.source.runId, worker_recovery_episode: 7 }, flight, "key", f.read()) };
+}
+
+for (const trigger of ["deadline", "three reservations", "post-deadline reclassification"] as const) {
+  test(`retained ${trigger} parks only after persisted budget exhaustion`, async t => {
+    const f = fixture(t);
+    if (trigger === "deadline") { await f.reserve(4, f.recreate(), 7); f.advance(300_001); }
+    const h = exhaustionRunner(f, { postDeadline: trigger === "post-deadline reclassification" });
+    await assert.rejects(h.run());
+    assert.equal(f.read().recovery?.blocker, "budget_exhausted");
+    assert.equal(f.read().recovery?.attempts, trigger === "three reservations" ? 3 : 1);
+    assert.equal(h.flight.parked, true);
+    assert.equal(h.counts().reports, 1);
+    assert.equal(h.counts().terminal, 0);
+    for (const latch of ["retainedEpisodeCustody", "retainedLocalCustody", "preserveRecoveryClone", "preserveSession", "keepGuardedInventoryOpen"])
+      assert.equal(Reflect.get(h.flight, latch), true, latch);
+  });
+}
+
+for (const control of ["write", "read", "identity", "other", "post-read", "absent feature", "400"] as const) {
+  test(`retained exhaustion ${control} keeps terminal fallback and custody`, async t => {
+    const f = fixture(t);
+    await f.reserve(4, f.recreate(), 7); f.advance(300_001);
+    const h = exhaustionRunner(f, {
+      ...(control === "absent feature" ? { feature: false } : {}),
+      ...(["write", "read", "identity", "other", "post-read"].includes(control) ? { persistence: control as "write" | "read" | "identity" | "other" | "post-read" } : {}),
+      ...(control === "400" ? { ack: async () => { throw new RequestError("POST", "/state", 400, "invalid request body"); } } : {}),
+    });
+    await assert.rejects(h.run());
+    assert.equal(h.flight.parked, false);
+    assert.equal(h.counts().terminal, 1);
+    assert.equal(h.counts().reports, control === "400" ? 1 : 0);
+    assert.equal(Reflect.get(h.flight, "retainedEpisodeCustody"), true);
+  });
+}
+
+for (const outcome of ["stale", "cancelled", "newer", "mismatch", "statusless", "transport", "duplicate", "lost ACK"] as const) {
+  test(`retained park ${outcome} reconciles without terminal fallback`, async t => {
+    const f = fixture(t);
+    await f.reserve(4, f.recreate(), 7); f.advance(300_001);
+    const before = f.read();
+    let sends = 0;
+    const h = exhaustionRunner(f, {
+      ack: async () => {
+        sends++;
+        if (outcome === "transport" || (outcome === "lost ACK" && sends === 1)) throw new TypeError("fetch failed");
+        if (outcome === "stale") return { status: "recovery_wait", recoveryCause: "retained_recovery_exhausted", staleClaim: true };
+        if (outcome === "cancelled") return { status: "cancelled" };
+        if (outcome === "newer") return {};
+        if (outcome === "mismatch") return { status: "recovery_wait", recoveryCause: "data_volume_full" };
+        if (outcome === "statusless") return {};
+        // Decoded handler 409: the released claim is stale even when the row is parked.
+        return { status: "recovery_wait", recoveryCause: "retained_recovery_exhausted", applied: false, staleClaim: true };
+      },
+      ownership: async () => ({ status: "recovery_wait", claim_generation: outcome === "newer" ? 5 : 4 }),
+    });
+    await assert.rejects(h.run(), (error: Error) => error.constructor.name === "RetainedRecoveryStop");
+    assert.equal(h.flight.parked, false);
+    assert.equal(h.counts().terminal, 0);
+    assert.ok(sends <= 2);
+    assert.ok(h.counts().reads <= 2);
+    if (outcome === "duplicate" || outcome === "lost ACK") {
+      assert.equal(sends, outcome === "duplicate" ? 1 : 2);
+      assert.equal(h.counts().reads, outcome === "duplicate" ? 0 : 1);
+      for (const latch of ["retainedEpisodeCustody", "retainedLocalCustody", "preserveRecoveryClone", "preserveSession", "keepGuardedInventoryOpen"])
+        assert.equal(Reflect.get(h.flight, latch), true, latch);
+      assert.deepEqual(f.read(), { ...before, recovery: {
+        ...before.recovery!, stage: "blocked", blocker: "budget_exhausted",
+      } });
+    }
+    assert.equal(Reflect.get(h.flight, "keepGuardedInventoryOpen"), true);
+    assert.equal(f.read().recovery?.blocker, "budget_exhausted");
+  });
+}
+
+test("retained reconciliation converts lifecycle cancellation to the nonterminal stop", async t => {
+  const f = fixture(t);
+  await f.reserve(4, f.recreate(), 7); f.advance(300_001);
+  let cancelled = false;
+  const h = exhaustionRunner(f, { ack: async () => { cancelled = true; return { status: "cancelled" }; } });
+  const controller = new AbortController();
+  Object.assign(h.flight, { steering: {
+    claimFence: () => undefined, isCancelled: () => cancelled,
+    terminalLifecycleSignal: () => controller.signal, lifecycleSignal: () => controller.signal,
+  }, cancel: controller });
+  h.runner.retainedLifecycleGuard = RunRunner.prototype["retainedLifecycleGuard"];
+  await assert.rejects(h.run(), (error: Error) => error.constructor.name === "RetainedRecoveryStop");
+  assert.equal(h.counts().terminal, 0);
+  assert.equal(h.flight.parked, false);
+});
+
+for (const episodeJump of [1, 2]) test(`owner-derived episode jump ${episodeJump} renews exactly one charged window`, async t => {
+  const f = fixture(t);
+  for (let i = 0; i < 3; i++) await f.reserve(4, f.recreate(), 7);
+  await assert.rejects(f.reserve(4, f.recreate(), 7), /budget/);
+  const before = f.read();
+  await assert.rejects(f.reserve(4, f.recreate(), 7 + episodeJump), /fence/);
+  assert.deepEqual(f.read(), before);
+  f.advance(400_000);
+  const first = await f.reserve(5, f.recreate(), 7 + episodeJump);
+  assert.equal(first.attempts, 1);
+  assert.equal(first.deadline, 1_700_000);
+  assert.equal((await f.reserve(5, f.recreate(), 7 + episodeJump)).attempts, 2);
+  assert.equal((await f.reserve(6, f.recreate(), 7 + episodeJump)).attempts, 3);
+  await assert.rejects(f.reserve(7, f.recreate(), 7 + episodeJump), /budget/);
+});
+
+for (const blocker of Object.keys(permanentBlockers) as Exclude<RecoveryBlocker, "budget_exhausted">[]) {
+  test(`advertised retained park leaves actual already-blocked ${blocker} terminal`, async t => {
+    const f = fixture(t);
+    await f.reserve(4, f.recreate(), 7);
+    const before = f.read();
+    before.recovery = { ...before.recovery!, stage: "blocked", blocker };
+    f.write(before); f.advance(300_001);
+    const h = exhaustionRunner(f);
+    await assert.rejects(h.run());
+    assert.equal(h.counts().reports, 0);
+    assert.equal(h.counts().terminal, 1);
+    assert.deepEqual(f.read(), before);
+  });
+}
+
+test("silent already-blocked nonbudget write cannot authorize a budget park", async t => {
+  const f = fixture(t);
+  await f.reserve(4, f.recreate(), 7); f.advance(300_001);
+  const h = exhaustionRunner(f);
+  const block = h.runner.git.blockRecoveryEpisode.bind(h.runner.git);
+  h.runner.git.blockRecoveryEpisode = async (...args: Parameters<GitCache["blockRecoveryEpisode"]>) => {
+    const saved = f.read();
+    saved.recovery = { ...saved.recovery!, stage: "blocked", blocker: "capture_failed" };
+    f.write(saved);
+    return block(...args);
+  };
+  await assert.rejects(h.run());
+  assert.equal(f.read().recovery?.blocker, "capture_failed");
+  assert.deepEqual(h.counts(), { reports: 0, terminal: 1, reads: 0 });
+  assert.equal(h.flight.parked, false);
+});
+
+for (const jump of [1, 2]) test(`derived episode jump ${jump} passes runner ownership and renewed quiescence`, async t => {
+  const f = fixture(t);
+  for (let i = 0; i < 3; i++) await f.reserve(4, f.recreate(), 7);
+  await assert.rejects(f.reserve(4, f.recreate(), 7), /budget/);
+  f.advance(400_000);
+  const h = runnerFixture(f, async () => ({ status: "running", claim_generation: 5 }));
+  await assert.rejects(h.run(5, 7 + jump));
+  assert.ok(h.ownershipReads() > 0);
+  assert.equal(h.quiescenceCalls(), 1);
+  assert.equal(f.read().recovery?.attempts, 1);
+  assert.equal(f.read().recovery?.episode, 7 + jump);
+  assert.equal(f.read().recovery?.blocker, "quiescence_failed");
+});
+
+for (const first of ["unconfirmed ACK", "transport"] as const) test(`retained park ${first} then 400 remains nonterminal`, async t => {
+  const f = fixture(t);
+  await f.reserve(4, f.recreate(), 7); f.advance(300_001);
+  let sends = 0;
+  const h = exhaustionRunner(f, {
+    ack: async () => {
+      if (++sends === 1) {
+        if (first === "transport") throw new TypeError("fetch failed after send");
+        return {};
+      }
+      throw new RequestError("POST", "/state", 400, "invalid request body");
+    },
+    ownership: async () => ({ status: "running", claim_generation: 4 }),
+  });
+  await assert.rejects(h.run(), (error: Error) => error.constructor.name === "RetainedRecoveryStop");
+  assert.equal(h.counts().terminal, 0, "a later refusal cannot disprove an earlier possibly applied report");
+  assert.equal(h.counts().reports, 2);
+  assert.equal(h.flight.parked, false);
+  assert.equal(Reflect.get(h.flight, "retainedEpisodeCustody"), true);
+});

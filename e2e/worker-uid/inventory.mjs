@@ -10,7 +10,16 @@ const { SyntaxKind } = await import(pathToFileURL(require.resolve('typescript/un
 const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff', 'codex-capture-reaper-real', 'git-retained-permissions', 'code-cross-check-replay-uid-split', 'claude-command-launcher', 'claude-command-real'];
 const singleFile = 'single-uid-preflight';
 const sharedFile = 'runner-shared-real';
-const e2eFiles = new Set(['memory-command-real', 'claude-command-real', singleFile, sharedFile]);
+const epochFile = 'pod-epoch-real';
+const epochLeaves = [
+  'pod epoch rendered seed and runner-init wait under EX in both real UID modes',
+  'pod epoch real Node fd survives flock helper exit, excludes peers and releases only with its owner',
+  'pod epoch real concurrent consumers preserve S to T to S history and the full immutable ledger bound',
+  'pod epoch real entrypoint fences protected initialization under EX and confines both UID bootstrap launches',
+  'pod epoch private API CA survives both real UID launch chains without relaxing preload refusal',
+  'pod epoch restores observable persistent worker and runner scratch in both UID modes and refuses invalid saved paths',
+];
+const e2eFiles = new Set(['memory-command-real', 'claude-command-real', singleFile, sharedFile, epochFile]);
 const captureSuite = 'Unit2 runner source capture';
 const captureLeaves = new Set([
   'cancels during worktree comparisons and leaves no temp tree',
@@ -73,7 +82,7 @@ const retainedLeaves = new Set([
 // The source AST seam lets regressions share one small parser project.
 export function inventoryForSource(source, file) {
   const planning = file === 'git-planning-diff';
-  const command = file === 'memory-command-real' || file === singleFile || file === sharedFile;
+  const command = file === 'memory-command-real' || file === singleFile || file === sharedFile || file === epochFile;
   const claudeReal = file === 'claude-command-real';
   const retained = file === 'git-retained-permissions';
   const expected = [];
@@ -136,6 +145,12 @@ export function inventoryForSource(source, file) {
     if (!expected.some(test => test.names.length === 1 && test.names[0] === singleLeaf)) {
       throw new Error(`${file}: missing required literal single-uid proof: ${singleLeaf}`);
     }
+  } else if (file === epochFile) {
+    for (const leaf of epochLeaves) {
+      if (!expected.some(test => test.names.length === 1 && test.names[0] === leaf)) {
+        throw new Error(`${file}: missing required literal pod-epoch proof: ${leaf}`);
+      }
+    }
   } else if (file === sharedFile) {
     for (const leaf of sharedLeaves) {
       if (!expected.some(test => test.names.length === 1 && test.names[0] === leaf)) {
@@ -176,7 +191,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const program = snapshot.getProjects()[0].program;
     const lane = process.argv[2] ?? 'worker';
     if (!['worker', 'command', 'single', 'shared'].includes(lane)) throw new Error(`unknown lane: ${lane}`);
-    const selected = lane === 'command' ? ['memory-command-real'] : lane === 'single' ? [singleFile] : lane === 'shared' ? [sharedFile] : files;
+    const selected = lane === 'command' ? ['memory-command-real'] : lane === 'single' ? [singleFile] : lane === 'shared' ? [sharedFile, epochFile] : files;
     const expected = selected.flatMap(file => {
       const filename = path.join(repo, e2eFiles.has(file)
         ? `e2e/worker-uid/${file}.test.mts` : `agent/test/${file}.test.ts`);

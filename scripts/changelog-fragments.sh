@@ -4,6 +4,7 @@
 #   list                               validates all; emits incorporated paths.
 #   render-body <legacy-body-file>     emits grouped pending body to stdout.
 #   render-unreleased <CHANGELOG-file> extracts only [Unreleased], then renders.
+# Release-only render suffix: --cite-introducers <base-oid> <head-oid> <shipping-file>.
 # list's newline output is safe because all filenames have passed the UUID grammar.
 # Release cuts capture list/render output ephemerally and own consumption; this CLI
 # never edits CHANGELOG, fragments, or a tracked manifest. Full-file mode does not
@@ -15,7 +16,11 @@ CHANGELOG_FRAGMENT_PARSER="$SCRIPT_ROOT/scripts/lib/changelog-fragments.awk"
 # shellcheck source=scripts/lib/changelog-fragments.sh
 . "$SCRIPT_ROOT/scripts/lib/changelog-fragments.sh"
 
-usage() { echo 'usage: changelog-fragments.sh validate [paths...] | list | render-body file | render-unreleased file' >&2; exit 2; }
+usage() {
+  echo 'usage: changelog-fragments.sh validate [paths...] | list | render-body file | render-unreleased file' >&2
+  echo 'render suffix: --cite-introducers base-oid head-oid shipping-file' >&2
+  exit 2
+}
 [ "$#" -gt 0 ] || usage
 mode=$1
 shift
@@ -35,7 +40,9 @@ case "$mode" in
     for path in "${CHANGELOG_FRAGMENTS[@]}"; do printf '%s\n' "$path"; done
     ;;
   render-body|render-unreleased)
-    [ "$#" -eq 1 ] || usage
+    if [ "$#" -ne 1 ]; then
+      [ "$#" -eq 5 ] && [ "$2" = --cite-introducers ] || usage
+    fi
     [ ! -L "$1" ] && [ -f "$1" ] || { changelog_fragment_error 'legacy input must be a regular file'; exit 1; }
     mkdir -p .uzi/scratch
     work="$(mktemp -d .uzi/scratch/changelog-render.XXXXXX)"
@@ -54,6 +61,21 @@ case "$mode" in
       ' < "$work/source" > "$work/legacy" || { changelog_fragment_error 'expected exactly one [Unreleased] section'; exit 1; }
     else
       cp -- "$work/source" "$work/legacy"
+    fi
+    if [ "$#" -eq 5 ]; then
+      python3 -I "$SCRIPT_ROOT/scripts/changelog-fragment-citations.py" "$3" "$4" "$work" "$5" > "$work/citations"
+      while IFS=$'\t' read -r number identity; do
+        input="$work/fragment-$((number - 1))"
+        awk -v identity="$identity" '
+          FNR == 3 {
+            if ($0 ~ /\(#[0-9]+(, #[0-9]+)*\)\.\*\*$/) sub(/\)\.\*\*$/, ", " identity ").**")
+            else sub(/\.\*\*$/, " (" identity ").**")
+          }
+          { print }
+        ' "$input" > "$input.cited"
+        changelog_fragment_snapshot "$input.cited" "$input" 65536
+        awk -v mode=validate -f "$CHANGELOG_FRAGMENT_PARSER" "$input"
+      done < "$work/citations"
     fi
     # Prefix operands so awk cannot interpret a filename as an assignment.
     total=$(wc -c < "$work/legacy")

@@ -3,7 +3,7 @@ import { minsAgo } from "./time";
 
 // Admin-health fixtures (PRD #1484 M4). These stand in for GET /api/admin/health in mock
 // mode and back the Health-tab component tests. They mirror the real registry
-// (api/internal/healthsvc): all 22 of its check ids, in the SAME stable order the
+// (api/internal/healthsvc): all 23 of its check ids, in the SAME stable order the
 // server emits (service.go Evaluate), so the demo and the tests exercise a well-formed document.
 //
 // Summaries here are illustrative demo copy, not byte-for-byte the server's templates — the
@@ -28,6 +28,7 @@ const CHECK_META: { id: string; scope: string; group: string; title: string; doc
   { id: "forge.sync", scope: "owner", group: "integrations", title: "Forge issue sync", doc: null },
   { id: "slack.socket", scope: "owner", group: "integrations", title: "Slack socket", doc: null },
   { id: "schedules.paused", scope: "owner", group: "housekeeping", title: "Paused schedules", doc: null },
+  { id: "maintenance.active", scope: "instance", group: "housekeeping", title: "Maintenance mode", doc: "instance-maintenance" },
   { id: "board.drift", scope: "owner", group: "housekeeping", title: "Board drift", doc: null },
   { id: "custody.holds", scope: "owner", group: "housekeeping", title: "Recovery custody holds", doc: null },
   { id: "recovery.storage", scope: "owner", group: "housekeeping", title: "Recovery storage", doc: null },
@@ -54,6 +55,7 @@ const OK_SUMMARY: Record<string, string> = {
   "forge.sync": "0 of 3 failing; 0 pending.",
   "slack.socket": "Slack socket is connected.",
   "schedules.paused": "No user has paused schedules while owning enabled ones.",
+  "maintenance.active": "uzi is not in maintenance mode.",
   "board.drift": "No column move has been given up in the last 24 hours.",
   "custody.holds": "No owner is at the custody-hold admission limit.",
   "recovery.storage": "0 captures currently marked quota-refused.",
@@ -121,6 +123,28 @@ function doc(checks: HealthCheck[], over: Partial<HealthDoc> = {}): HealthDoc {
 // health-silent (and the default): every check passing.
 export function healthySilentDoc(): HealthDoc {
   return doc(build({}));
+}
+
+// maintenance (PRD #3454): an admin has paused intake. Warning while active, instance scope,
+// with the since/reason/readout counts the server's maintenance.active check carries.
+export function maintenanceDoc(): HealthDoc {
+  return doc(
+    build({
+      "maintenance.active": {
+        severity: "warn",
+        summary: "Maintenance mode is on: new runs wait in the queue. Reason: Node pool upgrade, back by 15:00",
+        since: minsAgo(25),
+        evidence: [
+          { label: "Running", value: "2" },
+          { label: "Held", value: "3" },
+          { label: "Custody holds", value: "1" },
+          { label: "Queued", value: "3" },
+          { label: "Clear", value: "no" },
+        ],
+        action: "Switch maintenance mode off in Admin Settings when the work is done; queued runs then start.",
+      },
+    }),
+  );
 }
 
 // health-degraded: two checks need attention.

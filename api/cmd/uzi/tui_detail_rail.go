@@ -98,7 +98,7 @@ func (m tuiModel) railWorkerLine() string {
 		return ""
 	}
 	text := struct{ runWorkerName string }{runWorkerName: *m.detail.run.WorkerName}
-	return m.pal.faint.Render("worker "+m.renderer.Plain(text.runWorkerName, 19)) + "\n"
+	return m.pal.faint.Render("worker "+m.renderer.WorkerName(text.runWorkerName, 19)) + "\n"
 }
 
 // railWaitingMaxRows bounds the waiting explanation's height on the rail. Five rows keep the

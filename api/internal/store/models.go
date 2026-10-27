@@ -263,6 +263,8 @@ type CodexRefreshIntent struct {
 	State             string             `json:"state"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	ProviderErrorAt   pgtype.Timestamptz `json:"provider_error_at"`
+	ReuseAttemptedAt  pgtype.Timestamptz `json:"reuse_attempted_at"`
 }
 
 type ControllerReportStatus struct {
@@ -312,6 +314,7 @@ type CrossCheck struct {
 	Dispositions            []byte             `json:"dispositions"`
 	FinalizedAt             pgtype.Timestamptz `json:"finalized_at"`
 	RepoInstructionsCommit  pgtype.Text        `json:"repo_instructions_commit"`
+	Coverage                []byte             `json:"coverage"`
 }
 
 type CustodyEpisodeNotice struct {
@@ -457,6 +460,24 @@ type IncidentalFinding struct {
 	Labels        []byte             `json:"labels"`
 	Confidence    string             `json:"confidence"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+type InstanceIntakePause struct {
+	ID       bool               `json:"id"`
+	Active   bool               `json:"active"`
+	Since    pgtype.Timestamptz `json:"since"`
+	ByUserID pgtype.UUID        `json:"by_user_id"`
+	ByLabel  pgtype.Text        `json:"by_label"`
+	Reason   pgtype.Text        `json:"reason"`
+}
+
+type InstanceIntakePauseEvent struct {
+	ID       uuid.UUID          `json:"id"`
+	At       pgtype.Timestamptz `json:"at"`
+	ByUserID pgtype.UUID        `json:"by_user_id"`
+	ByLabel  pgtype.Text        `json:"by_label"`
+	Action   string             `json:"action"`
+	Reason   pgtype.Text        `json:"reason"`
 }
 
 type Issue struct {
@@ -1087,6 +1108,7 @@ type Run struct {
 	SourcePublicationIntent     []byte             `json:"source_publication_intent"`
 	ContinuedIssueIid           pgtype.Int8        `json:"continued_issue_iid"`
 	CheckpointCoordinates       []byte             `json:"checkpoint_coordinates"`
+	RetainedParkCount           int32              `json:"retained_park_count"`
 }
 
 type RunCompletionAttempt struct {

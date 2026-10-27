@@ -106,6 +106,9 @@ const (
 	// worker would find no token and crash-loop (see ValidateSecretMountPath).
 	defaultSecretMountPath = "/run/secrets"
 
+	// podEpochMountPath stays outside the configurable /run/<singlecomponent> secret namespace.
+	podEpochMountPath = "/etc/uzi/pod-epoch"
+
 	dataMountPath = "/data"
 	nixMountPath  = "/nix"
 	// nixSeedMountPath is where the INIT container mounts the nix PVC — deliberately
@@ -428,6 +431,7 @@ var seedResources = corev1.ResourceRequirements{
 // Every field here is operator config — the api sends names, this side owns every
 // mapping to a concrete pod-spec value.
 type RenderConfig struct {
+	PodEpochRuntime   string
 	RollConcurrency   int
 	RollTargetVersion string
 	// Namespace is the dedicated worker namespace: it contains nothing but hosted
@@ -875,6 +879,35 @@ echo "uzi-seed-nix: seeded"
 `, src, dst, markerFile, nixSentinel, nixToolchainMarker, dataClear)
 }
 
+// podEpochSharedInit protects synchronous initialization on the shell's FD9.
+// The image helper bounds SH acquisition to 120 seconds and validates the inode.
+func podEpochSharedInit() string {
+	return `if [ "${UZI_EPOCH_LOCK:-}" = 1 ]; then
+  identity="$(/usr/local/bin/node /usr/local/lib/uzi/pod-epoch-init.cjs prepare /data-seed)"
+  if [ "$identity" != unsupported ]; then
+    exec 9</data-seed/.uzi-epoch.lock
+    /usr/local/bin/node /usr/local/lib/uzi/pod-epoch-init.cjs hold /data-seed "$identity" 9
+    trap 'exec 9>&-' EXIT
+  fi
+fi
+`
+}
+
+// dockerNixSeedScript validates mount preparation without changing the root,
+// records this pod before any warm-seed exit, then protects the entire seed body.
+func dockerNixSeedScript() string {
+	return `set -eu
+/usr/local/bin/node -e '
+const fs = require("node:fs");
+const s = fs.lstatSync("/data-seed");
+if (!s.isDirectory() || s.isSymbolicLink() || s.gid !== 10001 ||
+    (s.mode & 0o2770) !== 0o2770 || (s.mode & 0o002) ||
+    ![0, 10001].includes(s.uid)) throw new Error("unsafe data root posture");
+'
+/usr/local/bin/node /usr/local/lib/uzi/pod-epoch-init.cjs seed /data-seed "$UZI_POD_UID"
+` + podEpochSharedInit() + nixSeedScript(nixMountPath, nixSeedMountPath, toolchainProfileMarker, dataSeedMountPath)
+}
+
 // runnerInitScript is the runner-init init container's program (issue #3153).
 //
 // It is golden-pinned byte for byte (testdata/runner-shared-init.sh). The single-uid
@@ -909,7 +942,7 @@ if [ -L "$M" ] || [ ! -f "$M" ] || [ "$(cat "$M")" != "%[2]s" ]; then
   echo "uzi-runner-init: worker image lacks runner-shared layout support (want %[2]s); refusing; upgrade the worker image or roll back the controller" >&2
   exit 1
 fi
-R=%[3]s
+%[5]sR=%[3]s
 T=%[4]s
 fail() { echo "uzi-runner-init: $1" >&2; exit 1; }
 # check_dir refuses a symlink or a non-directory at the path. A missing path is fine.
@@ -954,7 +987,8 @@ check_dir "$R"
 check_dir "$T"
 [ -d "$R" ] && [ -d "$T" ] || fail "$R or $T is not a directory"
 echo "uzi-runner-init: runner-shared ready ($R, $T)"
-`, runnerLayoutMarkerFile, runnerLayoutMarkerValue, runnerInitRoot, runnerInitTmp)
+if [ "${UZI_EPOCH_LOCK:-}" = 1 ]; then exec 9>&-; fi
+`, runnerLayoutMarkerFile, runnerLayoutMarkerValue, runnerInitRoot, runnerInitTmp, podEpochSharedInit())
 }
 
 // RenderDeployment builds a worker's Deployment, with the spec hash stamped in.
@@ -1267,6 +1301,18 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		},
 	}
 	if withDinD(w) {
+		env = append(env, corev1.EnvVar{Name: "UZI_EPOCH_LOCK", Value: "1"},
+			corev1.EnvVar{Name: "UZI_POD_EPOCH_EVIDENCE_FILE", Value: podEpochMountPath + "/evidence"})
+		if cfg.PodEpochRuntime != "" {
+			env = append(env, corev1.EnvVar{Name: PodEpochRuntimeEnv, Value: cfg.PodEpochRuntime})
+		}
+		workerMounts = append(workerMounts, corev1.VolumeMount{Name: "pod-epoch", MountPath: podEpochMountPath, ReadOnly: true})
+		volumes = append(volumes, corev1.Volume{Name: "pod-epoch", VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{Items: []corev1.DownwardAPIVolumeFile{{Path: "evidence", FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['uzi.dev/pod-epoch-evidence']"}}}}}})
+		initContainers[0].Command[2] = dockerNixSeedScript()
+		initContainers[0].Env = []corev1.EnvVar{
+			{Name: "UZI_EPOCH_LOCK", Value: "1"},
+			{Name: "UZI_POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
+		}
 		// Native-sidecar ordering (reviewer race, k8s half): the DinD daemon is an
 		// initContainer with restartPolicy: Always, so k8s starts it BEFORE the worker
 		// and — via the dind startupProbe — holds the worker until dockerd is actually
@@ -1282,6 +1328,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// context as seed-nix in both uid modes.
 		initContainers = append(initContainers, corev1.Container{
 			Name:            runnerInitContainerName,
+			Env:             []corev1.EnvVar{{Name: "UZI_EPOCH_LOCK", Value: "1"}},
 			Image:           spec.Image,
 			Command:         []string{"/bin/sh", "-c", runnerInitScript()},
 			Resources:       seedResources,

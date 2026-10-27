@@ -1,0 +1,455 @@
+# Dispatch-only first stage of #3512. Scheduling follows a proven live RC.
+# App/environment/ruleset setup and the first live dispatch belong to the maintainer.
+# D10 is partial: one eligible pre-cut CI rerun and existing non-gate publication
+# retries. Tagged smoke, post-cut CI and targeted assertion recovery follow in 3e-3.
+name: Release automation
+
+"on":
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: Release operation
+        type: choice
+        options: [rc, stable]
+        required: true
+      version:
+        description: Optional RC base X.Y.Z
+        type: string
+      abandon_train:
+        description: Abandon the open train (requires a higher version)
+        type: boolean
+        default: false
+      supersede:
+        description: Exact latest failed or missing-publication RC to replace
+        type: string
+      rc_tag:
+        description: Stable only, exact candidate tag
+        type: string
+      rc_sha:
+        description: Stable only, full peeled candidate commit
+        type: string
+
+permissions: {}
+concurrency:
+  group: release-auto
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      outcome: ${{ steps.authorize.outputs.outcome }}
+      reason: ${{ steps.authorize.outputs.reason }}
+      created_at: ${{ steps.authorize.outputs.created_at }}
+    env:
+      RELEASE_KIND: ${{ inputs.kind }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_ABANDON: ${{ inputs.abandon_train }}
+      RELEASE_SUPERSEDE: ${{ inputs.supersede }}
+      RELEASE_RC_TAG: ${{ inputs.rc_tag }}
+      RELEASE_RC_SHA: ${{ inputs.rc_sha }}
+      RELEASE_REF: ${{ github.ref }}
+      RELEASE_ACTOR: ${{ github.triggering_actor }}
+      RELEASE_DISPATCHERS: ${{ vars.RELEASE_DISPATCHERS }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate dispatch and original run metadata
+        id: authorize
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I scripts/release-auto.py authorize
+
+  prepare:
+    needs: authorize
+    if: needs.authorize.outputs.outcome == 'authorized'
+    runs-on: ubuntu-latest
+    timeout-minutes: 135
+    permissions:
+      contents: read
+      actions: write
+    outputs:
+      outcome: ${{ steps.prepare.outputs.outcome }}
+      reason: ${{ steps.prepare.outputs.reason }}
+      parent: ${{ steps.prepare.outputs.parent }}
+      release: ${{ steps.prepare.outputs.release }}
+      tag: ${{ steps.prepare.outputs.tag }}
+      tag_oid: ${{ steps.prepare.outputs.tag_oid }}
+      digest: ${{ steps.prepare.outputs.digest }}
+      refs_digest: ${{ steps.prepare.outputs.refs_digest }}
+      previous_rc: ${{ steps.prepare.outputs.previous_rc }}
+      previous_rc_sha: ${{ steps.prepare.outputs.previous_rc_sha }}
+      previous_stable: ${{ steps.prepare.outputs.previous_stable }}
+      previous_stable_sha: ${{ steps.prepare.outputs.previous_stable_sha }}
+      changes: ${{ steps.prepare.outputs.changes }}
+      audit_head: ${{ steps.prepare.outputs.audit_head }}
+      retry_log: ${{ steps.prepare.outputs.retry_log }}
+      artifact_name: release-auto-${{ github.run_id }}-${{ github.run_attempt }}
+    env:
+      RELEASE_KIND: ${{ inputs.kind }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_ABANDON: ${{ inputs.abandon_train }}
+      RELEASE_SUPERSEDE: ${{ inputs.supersede }}
+      RELEASE_RC_TAG: ${{ inputs.rc_tag }}
+      RELEASE_RC_SHA: ${{ inputs.rc_sha }}
+      RELEASE_REF: ${{ github.ref }}
+      RELEASE_ACTOR: ${{ github.triggering_actor }}
+      RELEASE_DISPATCHERS: ${{ vars.RELEASE_DISPATCHERS }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Configure release bot identity
+        run: |
+          git config user.name 'uzi release bot'
+          git config user.email 'uzi-release@users.noreply.github.com'
+      - name: Prepare exact release without an App key
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I scripts/release-auto.py prepare
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: release-auto-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-auto/release.bundle
+          if-no-files-found: error
+          retention-days: 1
+
+  push:
+    needs: [authorize, prepare]
+    if: needs.authorize.outputs.outcome == 'authorized' && needs.prepare.outputs.outcome == 'prepared'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: {}
+    environment:
+      name: ${{ inputs.kind == 'stable' && 'release-stable' || 'release-rc' }}
+    outputs:
+      outcome: ${{ steps.push.outputs.outcome }}
+      attempted: ${{ steps.push.outputs.attempted }}
+      reason: ${{ steps.bundle.outputs.reason || steps.push.outputs.reason }}
+    env:
+      RELEASE_KIND: ${{ inputs.kind }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_ABANDON: ${{ inputs.abandon_train }}
+      RELEASE_SUPERSEDE: ${{ inputs.supersede }}
+      RELEASE_RC_TAG: ${{ inputs.rc_tag }}
+      RELEASE_RC_SHA: ${{ inputs.rc_sha }}
+      RELEASE_REF: ${{ github.ref }}
+      RELEASE_ACTOR: ${{ github.triggering_actor }}
+      RELEASE_DISPATCHERS: ${{ vars.RELEASE_DISPATCHERS }}
+      RUN_CREATED_AT: ${{ needs.authorize.outputs.created_at }}
+      PARENT: ${{ needs.prepare.outputs.parent }}
+      RELEASE_SHA: ${{ needs.prepare.outputs.release }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      TAG_OID: ${{ needs.prepare.outputs.tag_oid }}
+      BUNDLE_DIGEST: ${{ needs.prepare.outputs.digest }}
+      REFS_DIGEST: ${{ needs.prepare.outputs.refs_digest }}
+      PREVIOUS_RC: ${{ needs.prepare.outputs.previous_rc }}
+      PREVIOUS_RC_SHA: ${{ needs.prepare.outputs.previous_rc_sha }}
+      PREVIOUS_STABLE: ${{ needs.prepare.outputs.previous_stable }}
+      PREVIOUS_STABLE_SHA: ${{ needs.prepare.outputs.previous_stable_sha }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: ${{ needs.prepare.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-bundle
+      - name: Validate request and bundle before minting
+        id: bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          reason='authorization-failed'
+          fail() { printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"; exit 1; }
+          trap fail ERR
+          if [ "${GITHUB_RUN_ATTEMPT:-}" != 1 ]; then
+            reason='re-dispatch-required'
+            echo '::error::Re-dispatch instead of rerunning prepare or push.'
+            fail
+          fi
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0
+          if ! { [ "$GITHUB_REPOSITORY" = vtmocanu/uzi ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; }; then fail; fi
+          [ "$RELEASE_REF" = refs/heads/main ]
+          read -r -a dispatchers <<< "$(printf '%s' "$RELEASE_DISPATCHERS" | tr ',\t\r\n' '    ')"
+          allowed=false
+          for dispatcher in "${dispatchers[@]}"; do
+            if [ -n "$RELEASE_ACTOR" ] && [ "$dispatcher" = "$RELEASE_ACTOR" ]; then allowed=true; fi
+          done
+          [ "$allowed" = true ]
+          reason='input-validation'
+          base='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          rc="^v${base}-rc\.[1-9][0-9]*$"
+          [[ "$RELEASE_ABANDON" = true || "$RELEASE_ABANDON" = false ]]
+          [[ -z "$RELEASE_VERSION" || ( ${#RELEASE_VERSION} -le 100 && "$RELEASE_VERSION" =~ ^${base}$ ) ]]
+          [[ -z "$RELEASE_SUPERSEDE" || ( ${#RELEASE_SUPERSEDE} -le 128 && "$RELEASE_SUPERSEDE" =~ $rc ) ]]
+          case "$RELEASE_KIND" in
+            rc)
+              [ -z "$RELEASE_RC_TAG$RELEASE_RC_SHA" ]
+              [[ "$RELEASE_TAG" =~ $rc ]]
+              if ! { [ "$RELEASE_ABANDON" = false ] || [ -n "$RELEASE_VERSION" ]; }; then fail; fi
+              if [ -n "$RELEASE_VERSION" ]; then [ "${RELEASE_TAG#v}" = "${RELEASE_VERSION}-rc.${RELEASE_TAG##*-rc.}" ]; fi
+              ;;
+            stable)
+              if ! { [ -z "$RELEASE_VERSION$RELEASE_SUPERSEDE" ] && [ "$RELEASE_ABANDON" = false ]; }; then fail; fi
+              [[ ${#RELEASE_RC_TAG} -le 128 && "$RELEASE_RC_TAG" =~ $rc && "$RELEASE_RC_SHA" =~ ^[0-9a-f]{40}$ ]]
+              if ! { [ "$RELEASE_TAG" = "${RELEASE_RC_TAG%-rc.*}" ] && [ "$PARENT" = "$RELEASE_RC_SHA" ]; }; then fail; fi
+              reason='stale-request'
+              [[ "$RUN_CREATED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+              requested="$(date -u -d "$RUN_CREATED_AT" +%s)"; now="$(date -u +%s)"
+              if ! { [ "$requested" -le "$now" ] && [ "$((now-requested))" -le 86400 ]; }; then fail; fi
+              ;;
+            *) exit 1 ;;
+          esac
+          reason='bundle-digest-mismatch'
+          for sha in "$PARENT" "$RELEASE_SHA" "$TAG_OID"; do [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; done
+          for digest in "$BUNDLE_DIGEST" "$REFS_DIGEST"; do [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; done
+          bundle="$RUNNER_TEMP/release-bundle/release.bundle"
+          [ "$(sha256sum "$bundle" | cut -d' ' -f1)" = "$BUNDLE_DIGEST" ]
+          reason='invalid-prepared-bundle'
+          bare="$RUNNER_TEMP/release-auto-push.git"
+          [ ! -e "$bare" ]
+          git init --bare --template= "$bare"
+          g() { git --git-dir="$bare" -c core.hooksPath=/dev/null "$@"; }
+          g remote add origin https://github.com/vtmocanu/uzi.git
+          g fetch --no-tags origin "$PARENT"
+          g bundle verify "$bundle"
+          heads="$(g bundle list-heads "$bundle")"
+          [ "$(printf '%s\n' "$heads" | wc -l | tr -d ' ')" = 2 ]
+          printf '%s\n' "$heads" | awk -v r="$RELEASE_SHA" -v t="$RELEASE_TAG" -v o="$TAG_OID" '
+            $1==r && $2=="refs/heads/release-auto-prepared" { a++ }
+            $1==o && $2=="refs/tags/"t { b++ }
+            END { exit !(a==1 && b==1 && NR==2) }'
+          g fetch "$bundle" refs/heads/release-auto-prepared:refs/heads/release-auto-prepared "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          [ "$(g rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$RELEASE_SHA" ]
+          [ "$(g cat-file -t "refs/tags/$RELEASE_TAG")" = tag ]
+          [ "$(g rev-list --parents -n 1 "$RELEASE_SHA")" = "$RELEASE_SHA $PARENT" ]
+          reason='non-metadata-bundle'
+          changes="$RUNNER_TEMP/release-changes"
+          g diff-tree --no-commit-id --no-renames --no-ext-diff --no-textconv --name-status -r -z "$PARENT" "$RELEASE_SHA" > "$changes"
+          uuid='[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+          status=''; path=''
+          while IFS= read -r -d '' status; do
+            IFS= read -r -d '' path || fail
+            old_mode="$(g ls-tree "$PARENT" -- "$path" | awk '{print $1}')"
+            case "$status:$path" in
+              M:CHANGELOG.md|M:deploy/chart/Chart.yaml|M:deploy/chart/values.yaml|M:scripts/assert-worker-tag-decoupled.sh)
+                new_mode="$(g ls-tree "$RELEASE_SHA" -- "$path" | awk '{print $1}')"
+                if ! { [ "$old_mode" = "$new_mode" ] && [[ "$old_mode" = 100644 || "$old_mode" = 100755 ]]; }; then fail; fi ;;
+              D:*)
+                if ! { [[ "$path" =~ ^changelog\.d/${uuid}\.md$ ]] && [ "$old_mode" = 100644 ]; }; then fail; fi ;;
+              *) fail ;;
+            esac
+            status=''; path=''
+          done < "$changes"
+          [ -z "$status$path" ]
+
+      - name: Mint repository-scoped installation token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510  # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: vtmocanu
+          repositories: uzi
+          permission-contents: write
+
+      - name: Revalidate remote state and atomically push
+        id: push
+        shell: bash
+        env:
+          GH_APP_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          reason='remote-state-unreadable'
+          fail() { printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"; exit 1; }
+          trap fail ERR
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0
+          unset GIT_TRACE GIT_TRACE_CURL GIT_CURL_VERBOSE GIT_TRACE_PACKET GIT_TRACE_SETUP GIT_TRACE_PERFORMANCE GIT_TRACE2 GIT_TRACE2_EVENT GIT_TRACE2_PERF
+          bare="$RUNNER_TEMP/release-auto-push.git"
+          g() { git --git-dir="$bare" -c core.hooksPath=/dev/null "$@"; }
+          auth="$(printf 'x-access-token:%s' "$GH_APP_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$auth"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+          refs="$(g ls-remote origin refs/heads/main 'refs/tags/v*')"
+          reason='release-ref-race'
+          actual_digest="$(printf '%s\n' "$refs" | awk '$2 ~ /^refs\/tags\/v/ {print}' | LC_ALL=C sort | sha256sum | cut -d' ' -f1)"
+          [ "$actual_digest" = "$REFS_DIGEST" ]
+          inventory="$(printf '%s\n' "$refs" | awk -F '\t' '
+            BEGIN { base="(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)" }
+            function gt(a,b, x,y,i) {
+              sub(/^v/,"",a); sub(/^v/,"",b); gsub(/-rc\./,".",a); gsub(/-rc\./,".",b)
+              split(a,x,"."); split(b,y,".")
+              for(i=1;i<=4;i++) {if(x[i]+0>y[i]+0)return 1;if(x[i]+0<y[i]+0)return 0} return 0
+            }
+            { oid[$2]=$1; t=$2; sub(/^refs\/tags\//,"",t)
+              if(t ~ ("^v"base"-rc[.][1-9][0-9]*$") && (rc=="" || gt(t,rc))) rc=t
+              if(t ~ ("^v"base"$") && (st=="" || gt(t,st))) st=t
+            }
+            END { r=oid["refs/tags/"rc"^{}"];if(r=="")r=oid["refs/tags/"rc]
+              s=oid["refs/tags/"st"^{}"];if(s=="")s=oid["refs/tags/"st]
+              printf "%s|%s|%s|%s|%s",oid["refs/heads/main"],rc,r,st,s }')"
+          IFS='|' read -r main rc rc_sha stable stable_sha <<< "$inventory"
+          if ! { [ "$rc" = "$PREVIOUS_RC" ] && [ "$rc_sha" = "$PREVIOUS_RC_SHA" ]; }; then fail; fi
+          if ! { [ "$stable" = "$PREVIOUS_STABLE" ] && [ "$stable_sha" = "$PREVIOUS_STABLE_SHA" ]; }; then fail; fi
+          if printf '%s\n' "$refs" | awk -v tag="refs/tags/$RELEASE_TAG" '$2==tag {found=1} END {exit !found}'; then reason='target-tag-exists'; fail; fi
+          case "$RELEASE_KIND" in
+            rc) reason='main-race'; [ "$main" = "$PARENT" ]; refspecs=("$RELEASE_SHA:refs/heads/main" "refs/tags/$RELEASE_TAG") ;;
+            stable)
+              if ! { [ "$rc" = "$RELEASE_RC_TAG" ] && [ "$rc_sha" = "$RELEASE_RC_SHA" ]; }; then fail; fi
+              reason='stale-request'
+              requested="$(date -u -d "$RUN_CREATED_AT" +%s)"; now="$(date -u +%s)"
+              if ! { [ "$requested" -le "$now" ] && [ "$((now-requested))" -le 86400 ]; }; then fail; fi
+              refspecs=("refs/tags/$RELEASE_TAG") ;;
+            *) exit 1 ;;
+          esac
+          # A lost transport receipt may follow a successful atomic server update.
+          # Recover/verify this exact tag only; never prepare or push a replacement.
+          echo 'attempted=true' >> "$GITHUB_OUTPUT"
+          receipt="$RUNNER_TEMP/push-receipt"
+          errors="$RUNNER_TEMP/push-errors"
+          if g push --porcelain --atomic origin "${refspecs[@]}" > "$receipt" 2> "$errors"; then
+            cat "$receipt" "$errors"
+            echo 'outcome=pushed' >> "$GITHUB_OUTPUT"
+          else
+            cat "$receipt" "$errors"
+            if awk -F '\t' '
+              NF>=3 && $1=="!" { rejected++ }
+              NF>=3 && $1 ~ /^[ *+\-]$/ { changed++ }
+              END { exit !(rejected>0 && changed==0) }' "$receipt"; then
+              echo 'attempted=false' >> "$GITHUB_OUTPUT"
+              echo 'outcome=push-rejected' >> "$GITHUB_OUTPUT"
+              reason='push-rejected'
+              fail
+            else
+              echo 'outcome=receipt-unknown' >> "$GITHUB_OUTPUT"
+              echo 'reason=push-receipt-unknown' >> "$GITHUB_OUTPUT"
+              echo '::warning::Push receipt unconfirmed; inspect and verify only the prepared tag.'
+            fi
+          fi
+
+  watch:
+    needs: [authorize, prepare, push]
+    if: ${{ !cancelled() && needs.push.outputs.attempted == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 125
+    permissions:
+      contents: read
+      actions: write
+    outputs:
+      outcome: ${{ steps.watch.outputs.outcome }}
+      receipt: ${{ steps.watch.outputs.receipt }}
+      published_at: ${{ steps.watch.outputs.published_at }}
+      verified_at: ${{ steps.watch.outputs.verified_at }}
+      reason: ${{ steps.admit.outputs.reason }}
+    env:
+      RELEASE_KIND: ${{ inputs.kind }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_ABANDON: ${{ inputs.abandon_train }}
+      RELEASE_SUPERSEDE: ${{ inputs.supersede }}
+      RELEASE_RC_TAG: ${{ inputs.rc_tag }}
+      RELEASE_RC_SHA: ${{ inputs.rc_sha }}
+      RELEASE_REF: ${{ github.ref }}
+      RELEASE_ACTOR: ${{ github.triggering_actor }}
+      RELEASE_DISPATCHERS: ${{ vars.RELEASE_DISPATCHERS }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_SHA: ${{ needs.prepare.outputs.release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          ref: ${{ needs.prepare.outputs.release }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Recheck dispatcher and exact recovery tag
+        id: admit
+        run: python3 -I scripts/release-auto.py watch-check
+      - name: Recover and verify only the prepared tag
+        id: watch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$RELEASE_SHA" ]
+          receipt=confirmed
+          if [ "$RELEASE_KIND" = rc ]; then
+            git fetch origin refs/heads/main
+            if ! git merge-base --is-ancestor "$RELEASE_SHA" FETCH_HEAD; then receipt=unconfirmed; fi
+          fi
+          echo "receipt=$receipt" >> "$GITHUB_OUTPUT"
+          watch_status=0
+          .agents/skills/uzi-release/scripts/release-watch.sh "${RELEASE_TAG#v}" --max-reruns 2 --interval 60 --max-ticks 60 2>&1 | tee "$RUNNER_TEMP/release-watch.log" || watch_status=$?
+          python3 -I scripts/release-auto.py watch-log
+          [ "$watch_status" -eq 0 ]
+          echo "published_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          .agents/skills/uzi-release/scripts/release-verify.sh "$RELEASE_TAG"
+          echo "verified_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo 'outcome=published-and-verified' >> "$GITHUB_OUTPUT"
+
+  report:
+    needs: [authorize, prepare, push, watch]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Summarize and track failures without repository code
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          needs = json.loads(os.environ['NEEDS_JSON'])
+          prepared = needs['prepare'].get('outputs', {})
+          pushed = needs['push'].get('outputs', {})
+          push_outcome = pushed.get('outcome') or ('receipt-unknown' if pushed.get('attempted') == 'true' else '')
+          watched = needs['watch'].get('outputs', {})
+          result = {'run': os.environ['RUN_URL'], 'tag': prepared.get('tag', ''),
+                    'parent': prepared.get('parent', ''), 'release': prepared.get('release', ''),
+                    'audit_head': prepared.get('audit_head', ''),
+                    'push_outcome': push_outcome,
+                    'published_at': watched.get('published_at', ''), 'verified_at': watched.get('verified_at', ''),
+                    'changes': json.loads(prepared.get('changes') or '[]'),
+                    'retries': json.loads(prepared.get('retry_log') or '[]')}
+          failed = [name for name, job in needs.items() if job['result'] in ('failure', 'cancelled')]
+          problem = bool(failed) or watched.get('receipt') == 'unconfirmed'
+          result['outcome'] = 'blocked' if problem else (watched.get('outcome') or prepared.get('outcome') or 'no-op')
+          result['reason'] = next((needs[name].get('outputs', {}).get('reason') or name + '-failed' for name in failed),
+                                  'partial-publication' if problem else prepared.get('reason', 'complete'))
+          if problem and push_outcome == 'receipt-unknown':
+              result['outcome'], result['reason'] = 'partial-publication', 'push-receipt-unknown'
+          body = '```json\n' + json.dumps(result, indent=2, sort_keys=True) + '\n```\n'
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+              stream.write(body)
+          if problem:
+              if os.environ['REPOSITORY'] != 'vtmocanu/uzi':
+                  raise SystemExit(1)
+              def api(*args, data=None):
+                  command = ['gh', 'api', *args]
+                  if data is not None: command += ['--input', '-']
+                  return json.loads(subprocess.check_output(command, input=json.dumps(data).encode() if data is not None else None))
+              repo = os.environ['REPOSITORY']
+              title = 'Release automation failures'
+              pages = api('--paginate', '--slurp', f'repos/{repo}/issues?state=all&labels=area%3A%3Arelease&per_page=100')
+              matches = [issue for page in pages for issue in page if issue.get('title') == title and 'pull_request' not in issue]
+              if matches:
+                  issue = min(matches, key=lambda item: item['number'])
+                  if issue['state'] == 'closed': api('--method', 'PATCH', f'repos/{repo}/issues/{issue["number"]}', data={'state': 'open'})
+                  api('--method', 'POST', f'repos/{repo}/issues/{issue["number"]}/comments', data={'body': body})
+              else:
+                  api('--method', 'POST', f'repos/{repo}/issues', data={'title': title, 'body': body, 'labels': ['area::release', 'priority::normal']})
+              raise SystemExit(1)
+          PY

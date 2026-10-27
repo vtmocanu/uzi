@@ -82,6 +82,105 @@ fi
 mkdir -p "$ROOT/.uzi/scratch"
 SEQ_DIR="$(mktemp -d "$ROOT/.uzi/scratch/e2e-lib.XXXXXX")"
 trap 'rm -rf "$SEQ_DIR"' EXIT
+
+# compose_build_logged (#3468): extract the shipped multiline helper without
+# sourcing lib.sh's stack setup. A missing helper counts as a failure, then lets
+# the other regression groups continue producing useful diagnostics.
+eval "$(awk '/^compose_build_logged\(\) \{/,/^\}/' "$LIB")"
+cases=$((cases + 1))
+if type compose_build_logged >/dev/null 2>&1; then
+  passed=$((passed + 1))
+  echo "PASS: compose_build_logged extracted from lib.sh"
+else
+  echo "FAIL: compose_build_logged not defined — extraction failed or build logging fix is absent"
+fi
+build_check() {
+  cases=$((cases + 1))
+  local name="$1"; shift
+  if "$@"; then
+    passed=$((passed + 1))
+    echo "PASS: $name"
+  else
+    echo "FAIL: $name"
+  fi
+}
+if type compose_build_logged >/dev/null 2>&1; then
+  # Each invocation is synchronous; the only loop emits exactly 105 fixture lines.
+  fake_build_compose() {
+    printf '%s\n' "$@" > "$BUILD_FIXTURE/argv"
+    if [ "${BUILD_LINES:-0}" -eq 1 ]; then
+      local i
+      for ((i = 1; i <= 105; i++)); do
+        printf 'build-line-%03d\n' "$i"
+      done
+    else
+      printf 'build stdout sentinel\n'
+      printf 'build stderr sentinel\n' >&2
+    fi
+    return "$BUILD_EXIT"
+  }
+  (
+    BUILD_FIXTURE="$SEQ_DIR/compose-build"
+    mkdir -p "$BUILD_FIXTURE"
+    RUNROOT="$BUILD_FIXTURE/failure run"
+    COMPOSE=(fake_build_compose --project-name "fixture project" --file "fixture compose.yml")
+    printf '%s\n' --project-name "fixture project" --file "fixture compose.yml" --progress=plain build > "$BUILD_FIXTURE/expected-argv"
+    printf 'build stdout sentinel\nbuild stderr sentinel\n' > "$BUILD_FIXTURE/expected-log"
+    BUILD_EXIT=3
+    build_rc=0
+    compose_build_logged > "$BUILD_FIXTURE/stdout" 2> "$BUILD_FIXTURE/stderr" || build_rc=$?
+    build_check "failed build preserves exit 3" test "$build_rc" -eq 3
+    build_check "failed build creates artifact directory automatically" test -d "$RUNROOT/artifacts/build"
+    build_check "failed build retains both output streams" cmp -s "$BUILD_FIXTURE/expected-log" "$RUNROOT/artifacts/build/compose-build.log"
+    build_check "failed build leaves terminal stdout empty" test ! -s "$BUILD_FIXTURE/stdout"
+    build_check "failed build prints log only to terminal stderr" cmp -s "$BUILD_FIXTURE/expected-log" "$BUILD_FIXTURE/stderr"
+    build_check "compose globals precede plain progress and build in exact argv order" cmp -s "$BUILD_FIXTURE/expected-argv" "$BUILD_FIXTURE/argv"
+
+    RUNROOT="$BUILD_FIXTURE/success run"
+    BUILD_EXIT=0
+    build_rc=0
+    compose_build_logged > "$BUILD_FIXTURE/stdout" 2> "$BUILD_FIXTURE/stderr" || build_rc=$?
+    build_check "successful build returns zero" test "$build_rc" -eq 0
+    build_check "successful build retains both output streams" cmp -s "$BUILD_FIXTURE/expected-log" "$RUNROOT/artifacts/build/compose-build.log"
+    build_check "successful build leaves terminal stdout empty" test ! -s "$BUILD_FIXTURE/stdout"
+    build_check "successful build leaves terminal stderr empty" test ! -s "$BUILD_FIXTURE/stderr"
+
+    RUNROOT="$BUILD_FIXTURE/long run"
+    BUILD_EXIT=3 BUILD_LINES=1
+    # Independently specify the expected last 80 of 105 deterministic lines.
+    for ((i = 26; i <= 105; i++)); do
+      printf 'build-line-%03d\n' "$i"
+    done > "$BUILD_FIXTURE/expected-tail"
+    compose_build_logged > "$BUILD_FIXTURE/stdout" 2> "$BUILD_FIXTURE/stderr" || :
+    build_check "failed build prints exactly the last 80 lines" cmp -s "$BUILD_FIXTURE/expected-tail" "$BUILD_FIXTURE/stderr"
+
+    # The helper is standalone in a fresh Bash with errexit, not inside an
+    # if/OR-list that would disable errexit throughout a called function.
+    declare -f compose_build_logged fake_build_compose > "$BUILD_FIXTURE/definitions.sh"
+    build_rc=0
+    bash -c '
+      set -e
+      source "$1"
+      RUNROOT="$2"
+      BUILD_FIXTURE="$3"
+      BUILD_EXIT=3
+      COMPOSE=(fake_build_compose --project-name "fixture project")
+      compose_build_logged
+      printf "post-helper marker\n" > "$BUILD_FIXTURE/post-helper"
+    ' _ "$BUILD_FIXTURE/definitions.sh" "$BUILD_FIXTURE/errexit run" "$BUILD_FIXTURE" > "$BUILD_FIXTURE/child-stdout" 2> "$BUILD_FIXTURE/child-stderr" || build_rc=$?
+    build_check "standalone helper under child Bash errexit exits 3" test "$build_rc" -eq 3
+    build_check "child Bash errexit prevents post-helper marker" test ! -e "$BUILD_FIXTURE/post-helper"
+
+    BUILD_LINES=0
+    tail() { return 7; }
+    build_rc=0
+    compose_build_logged > "$BUILD_FIXTURE/stdout" 2> "$BUILD_FIXTURE/stderr" || build_rc=$?
+    build_check "tail failure does not replace build exit 3" test "$build_rc" -eq 3
+    # Preserve the parent tally while keeping all fixture globals in this subshell.
+    printf '%s %s\n' "$cases" "$passed" > "$BUILD_FIXTURE/tally"
+  )
+  read -r cases passed < "$SEQ_DIR/compose-build/tally"
+fi
 record_margin() { :; }
 fail() { echo "$*" >&2; exit 1; }
 apiget() {
@@ -1622,6 +1721,6 @@ done
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 node --test "$ROOT/e2e/recovery-record-projection.test.mjs"
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has at least 188 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has at least 203 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 188 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 203 ] && [ "$cases" -eq "$passed" ]

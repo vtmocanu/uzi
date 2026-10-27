@@ -521,6 +521,8 @@ describe("ExecutionRegistry: disposal and poison stickiness", () => {
     const b = new FakeRoot("command");
     registerRoot(reg, a);
     registerRoot(reg, b);
+    await reg.quiesceChildren(DEADLINE);
+    await reg.reapProcesses(DEADLINE, reg.epoch());
     const first = await reg.disposeTools(DEADLINE);
     assert.equal(first.kind, "disposed");
     assert.equal(reg.state(), "disposed");
@@ -560,11 +562,14 @@ describe("ExecutionRegistry: disposal and poison stickiness", () => {
         throw new TypeError("dispose boom");
       }),
     );
+    await reg.quiesceChildren(DEADLINE);
+    await reg.reapProcesses(DEADLINE, reg.epoch());
     const res = await reg.disposeTools(DEADLINE);
     assert.equal(res.kind, "incomplete");
     assert.deepEqual(
       res.kind === "incomplete" ? res.errors.map((e) => e.message) : [],
-      ["disposeTools: root dispose failed (Error)", "disposeTools: root dispose failed (TypeError)"],
+      ["disposeTools: root dispose failed (Error)", "disposeTools: root dispose failed (TypeError)",
+        "disposeTools: cleanup evidence changed or unconfirmed"],
     );
   });
 
@@ -577,7 +582,7 @@ describe("ExecutionRegistry: disposal and poison stickiness", () => {
     assert.equal(safeErrorName("boom"), "unknown");
   });
 
-  it("retries one failed root disposal without clearing poison evidence", async () => {
+  it("joins the original failed root disposal without retrying or clearing poison evidence", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
     let calls = 0;
     registerRoot(
@@ -592,23 +597,21 @@ describe("ExecutionRegistry: disposal and poison stickiness", () => {
     assert.equal(first.kind, "incomplete");
     assert.equal(reg.isPoisoned(), true);
     const second = await reg.disposeTools(DEADLINE);
-    assert.equal(second.kind, "disposed");
-    assert.equal(calls, 2, "only the previously failed root is retried once");
-    assert.equal(reg.isPoisoned(), true, "successful retry does not erase prior poison evidence");
+    assert.equal(second, first);
+    assert.equal(calls, 1, "a completed incomplete disposal is never retried");
+    assert.equal(reg.isPoisoned(), true, "joining does not erase prior poison evidence");
   });
 
-  it("isPoisoned() is sticky and survives disposal masking state() as 'disposed'", async () => {
+  it("unproven poison stays incomplete through disposal", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
     assert.equal(reg.isPoisoned(), false);
     reg.poison({ category: "unknown", message: "poison before disposal" });
     assert.equal(reg.isPoisoned(), true);
     assert.equal(reg.state(), "poisoned");
     const res = await reg.disposeTools(DEADLINE);
-    assert.equal(res.kind, "disposed");
-    // Disposal masks the enum: state() no longer reports "poisoned"...
-    assert.equal(reg.state(), "disposed");
-    // ...but the sticky witness stays true so a poisoned-then-disposed epoch can
-    // never be mistaken for clean.
+    assert.equal(res.kind, "incomplete");
+    assert.equal(reg.state(), "poisoned");
+    // Unproven poison remains a sticky refusal after cleanup.
     assert.equal(reg.isPoisoned(), true);
   });
 
@@ -708,7 +711,7 @@ describe("ExecutionRegistry: settleForCapture (issue #1766)", () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
     assert.equal(reg.reserveCallback(cb("x")).kind, "admitted");
     assert.equal(reg.reserveLaunch("provider").kind, "reserved");
-    assert.deepEqual(await reg.disposeTools(DEADLINE), { kind: "disposed" });
+    assert.equal((await reg.disposeTools(DEADLINE)).kind, "incomplete");
     assert.equal(reg.pendingLaunchCount(), 0);
     assert.equal(reg.inFlightCallbackCount(), 0);
     const result = await reg.settleForCapture(500, POLL);
@@ -801,5 +804,260 @@ describe("ExecutionRegistry: settleForCapture (issue #1766)", () => {
     if (result.kind === "incomplete") {
       assert.ok(result.errors.some((e) => e.message === "settleForCapture: registry disposed during settle"));
     }
+  });
+});
+
+describe("#2852 terminal disposal evidence", () => {
+  const cb = (callId: string) => ({ threadId: "thread", turnId: "turn", callId, fingerprint: "payload" });
+  function deferred() {
+    let resolve!: () => void;
+    const promise = new Promise<void>(yes => { resolve = yes; });
+    return { promise, resolve };
+  }
+
+  async function closed(root?: FakeRoot) {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+    if (root) registerRoot(reg, root);
+    await reg.quiesceChildren(DEADLINE);
+    await reg.reapProcesses(DEADLINE, reg.epoch());
+    return reg;
+  }
+
+  for (const failure of [false, true]) {
+    it(`joins concurrent, reentrant and repeated cleanup (failure=${failure})`, async () => {
+      const entered = deferred(), release = deferred();
+      let reg!: ExecutionRegistry;
+      let reentrant: Promise<unknown> | undefined;
+      let reentered = false;
+      const root = new FakeRoot("provider", undefined, async () => {
+        if (!reentered) {
+          reentered = true;
+          reentrant = reg.disposeTools(DEADLINE);
+        }
+        entered.resolve();
+        await release.promise;
+        if (failure) throw new Error("cleanup failed");
+      });
+      reg = await closed(root);
+      const revision = reg.cleanupPoisonRevision;
+      const first = reg.disposeTools(DEADLINE);
+      const second = reg.disposeTools(0);
+      assert.equal(first, second);
+      await entered.promise;
+      assert.equal(reentrant, first);
+      let settled = false;
+      void second.then(() => { settled = true; });
+      await Promise.resolve();
+      assert.equal(settled, false);
+      release.resolve();
+      const outcome = await first;
+      assert.equal(outcome.kind, failure ? "incomplete" : "disposed");
+      assert.equal(await second, outcome);
+      assert.equal(await reg.disposeTools(DEADLINE), outcome);
+      assert.equal(root.disposeCalls, 1);
+      assert.equal(reg.acceptsTerminalDisposal(outcome), !failure);
+      assert.equal(reg.acceptsTerminalDisposal({ kind: "disposed" }), false);
+      if (!failure) assert.equal(reg.cleanupPoisonRevision, revision);
+    });
+  }
+
+  for (const admission of ["provider", "command", "boundary_action", "callback", "replay", "duplicate"] as const) {
+    it(`closes ${admission} admission at disposal entry`, async () => {
+      const release = deferred(), entered = deferred();
+      const reg = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+      const request = cb("entry");
+      const callback = reg.reserveCallback(request);
+      assert.equal(callback.kind, "admitted");
+      if (callback.kind !== "admitted") throw new Error("missing callback");
+      if (admission !== "duplicate") reg.settleCallback(callback.token, "ok");
+      registerRoot(reg, new FakeRoot("provider", undefined, async () => { entered.resolve(); await release.promise; }));
+      if (admission !== "duplicate") {
+        await reg.quiesceChildren(DEADLINE);
+        await reg.reapProcesses(DEADLINE, reg.epoch());
+      }
+      const first = reg.disposeTools(DEADLINE);
+      const revision = reg.cleanupPoisonRevision;
+      const denied = admission === "provider" || admission === "command" || admission === "boundary_action"
+        ? reg.reserveLaunch(admission)
+        : reg.reserveCallback(admission === "callback" ? cb("new") : request);
+      assert.deepEqual(denied, { kind: "denied", reason: "admission_closed" });
+      assert.notEqual(reg.cleanupPoisonRevision, revision);
+      await entered.promise;
+      release.resolve();
+      assert.equal((await first).kind, "incomplete");
+      assert.equal(await reg.disposeTools(DEADLINE), await first);
+    });
+  }
+
+  for (const pending of ["launch", "callback", "open", "unreaped", "uncertainty", "poison"] as const) {
+    it(`never launders ${pending} entry evidence through cleared tables`, async () => {
+      const reg = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+      if (pending === "launch") reg.reserveLaunch("provider");
+      if (pending === "callback") reg.reserveCallback(cb("pending"));
+      if (pending === "unreaped") registerRoot(reg, new FakeRoot("command"));
+      if (pending === "uncertainty") reg.markLaunchCleanupUnconfirmed();
+      if (pending === "poison") reg.poison([]);
+      const first = await reg.disposeTools(DEADLINE);
+      assert.equal(first.kind, "incomplete");
+      assert.equal(reg.pendingLaunchCount(), 0);
+      assert.equal(reg.inFlightCallbackCount(), 0);
+      assert.equal(await reg.disposeTools(DEADLINE), first);
+      assert.equal(reg.acceptsTerminalDisposal(first), false);
+    });
+  }
+
+  it("uses the entry deadline before scheduled cleanup begins", async (t) => {
+    let now = 0;
+    t.mock.method(Date, "now", () => now);
+    let cleanupBudget = -1;
+    const reg = await closed(new FakeRoot("provider", undefined, async (budget) => {
+      cleanupBudget = budget;
+    }));
+    const disposal = reg.disposeTools(50);
+    now = 100;
+    assert.equal((await disposal).kind, "disposed");
+    assert.equal(cleanupBudget, 0, "scheduling cannot renew cleanup time");
+  });
+
+  it("refuses a new capture lane after disposal enters", async () => {
+    const entered = deferred(), release = deferred();
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+    registerRoot(reg, new FakeRoot("provider", undefined, async () => {
+      entered.resolve();
+      await release.promise;
+    }));
+    const observation = await reg.settleForCapture(DEADLINE);
+    const disposal = reg.disposeTools(DEADLINE);
+    assert.throws(() => reg.beginCapture(observation), /capture lane/);
+    await entered.promise;
+    release.resolve();
+    assert.equal((await disposal).kind, "incomplete");
+    assert.equal((await reg.settleForCapture(DEADLINE)).kind, "incomplete");
+  });
+
+  it("retains an entry reservation even when it cancels during cleanup", async () => {
+    const entered = deferred(), release = deferred();
+    const reg = await closed(new FakeRoot("provider", undefined, async () => {
+      entered.resolve();
+      await release.promise;
+    }));
+    const pending = reg.reserveLaunch("boundary_action");
+    assert.equal(pending.kind, "reserved");
+    if (pending.kind !== "reserved") throw new Error("missing reservation");
+    const disposal = reg.disposeTools(DEADLINE);
+    reg.cancelReservation(pending.reservation);
+    await entered.promise;
+    release.resolve();
+    assert.equal((await disposal).kind, "incomplete");
+  });
+
+  it("retains poison recorded while root disposal is suspended", async () => {
+    const entered = deferred(), release = deferred();
+    const reg = await closed(new FakeRoot("provider", undefined, async () => {
+      entered.resolve();
+      await release.promise;
+    }));
+    const disposal = reg.disposeTools(DEADLINE);
+    await entered.promise;
+    reg.poison({ category: "tool", message: "independent cleanup fault" });
+    release.resolve();
+    assert.equal((await disposal).kind, "incomplete");
+  });
+
+  it("retains and cleans a rejected late root even without caller cleanup", async () => {
+    const entered = deferred(), release = deferred();
+    const reg = await closed(new FakeRoot("provider", undefined, async () => { entered.resolve(); await release.promise; }));
+    const first = reg.disposeTools(DEADLINE);
+    await entered.promise;
+    const late = new FakeRoot("command");
+    const reservation = { id: "late", kind: "command" } as const;
+    assert.equal(reg.registerRoot(reservation, late).ok, false);
+    reg.retainRejectedRoot(reservation, late);
+    assert.equal(reg.rootCount(), 2, "retention is idempotent");
+    release.resolve();
+    assert.equal((await first).kind, "incomplete");
+    assert.equal(late.disposeCalls, 1);
+  });
+
+  it("retains a rejected late root whose cleanup fails", async () => {
+    const entered = deferred(), release = deferred();
+    const reg = await closed(new FakeRoot("provider", undefined, async () => {
+      entered.resolve();
+      await release.promise;
+    }));
+    const disposal = reg.disposeTools(DEADLINE);
+    await entered.promise;
+    const late = new FakeRoot("command", undefined, async () => { throw new TypeError("cleanup refused"); });
+    const admitted = reg.registerRoot({ id: "late", kind: "command" }, late);
+    release.resolve();
+    const outcome = await disposal;
+    assert.equal(admitted.ok, false);
+    assert.equal(reg.rootCount(), 2, "registry keeps custody without caller assistance");
+    assert.equal(outcome.kind, "incomplete");
+    assert.equal(late.disposeCalls, 1);
+    assert.equal(await reg.disposeTools(DEADLINE), outcome);
+    assert.equal(late.disposeCalls, 1, "joining cannot retry failed cleanup");
+  });
+
+  for (const change of ["poison", "uncertainty", "root", "admission"] as const) {
+    it(`revokes successful witness after ${change} without changing the historical result`, async () => {
+      const reg = await closed();
+      const outcome = await reg.disposeTools(DEADLINE);
+      assert.equal(reg.acceptsTerminalDisposal(outcome), true);
+      if (change === "poison") reg.poison([]);
+      if (change === "uncertainty") reg.markLaunchCleanupUnconfirmed();
+      if (change === "admission") reg.reserveCallback(cb("late"));
+      if (change === "root") reg.registerRoot({ id: "late", kind: "command" }, new FakeRoot("command"));
+      assert.equal(reg.acceptsTerminalDisposal(outcome), false);
+      assert.equal(await reg.disposeTools(DEADLINE), outcome);
+    });
+  }
+
+  for (const faultAfterCapture of [false, true]) {
+    it(`completed capture after prior poison attests only terminal cleanup; later fault=${faultAfterCapture}`, async () => {
+      const reg = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+      registerRoot(reg, new FakeRoot("provider"));
+      reg.poison({ category: "authorization", message: "credential unavailable" });
+      const lane = reg.beginCapture(await reg.settleForCapture(DEADLINE));
+      const capture = lane.complete();
+      assert.ok(capture);
+      lane.close();
+      assert.equal(reg.acceptsCompletedCapture(capture), false, "prior poison still refuses in-run continuation");
+      if (faultAfterCapture) reg.poison({ category: "protocol", message: "new uncertainty" });
+      const before = [reg.cleanupPoisonRevision, reg.rootCount(), reg.launchAdmissionCursor(), reg.callbackAdmissionCursor()];
+      const disposal = await reg.disposeTools(DEADLINE);
+      assert.equal(disposal.kind, faultAfterCapture ? "incomplete" : "disposed");
+      assert.equal(reg.acceptsTerminalDisposal(disposal), !faultAfterCapture);
+      assert.equal(reg.acceptsCompletedCapture(capture), false, "terminal disposal never grants continuation");
+      if (!faultAfterCapture)
+        assert.deepEqual([reg.cleanupPoisonRevision, reg.rootCount(), reg.launchAdmissionCursor(), reg.callbackAdmissionCursor()], before);
+    });
+  }
+
+  it("clean capture evidence survives disposal without changing revision or cursors", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+    registerRoot(reg, new FakeRoot("provider"));
+    const observation = await reg.settleForCapture(DEADLINE);
+    const lane = reg.beginCapture(observation);
+    const proof = lane.complete();
+    assert.ok(proof);
+    lane.close();
+    const before = [reg.cleanupPoisonRevision, reg.rootCount(), reg.launchAdmissionCursor(), reg.callbackAdmissionCursor()];
+    const outcome = await reg.disposeTools(DEADLINE);
+    assert.equal(outcome.kind, "disposed");
+    assert.equal(reg.acceptsCompletedCapture(proof), true);
+    assert.equal(reg.acceptsTerminalDisposal(outcome), true);
+    assert.deepEqual([reg.cleanupPoisonRevision, reg.rootCount(), reg.launchAdmissionCursor(), reg.callbackAdmissionCursor()], before);
+  });
+
+  it("active capture and its late launch cannot attest disposal", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+    const lane = reg.beginCapture(await reg.settleForCapture(DEADLINE));
+    const disposal = reg.disposeTools(DEADLINE);
+    const revision = reg.cleanupPoisonRevision;
+    assert.deepEqual(lane.reserve(), { kind: "denied", reason: "admission_closed" });
+    assert.notEqual(reg.cleanupPoisonRevision, revision);
+    lane.close();
+    assert.equal((await disposal).kind, "incomplete");
   });
 });

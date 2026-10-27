@@ -14,9 +14,10 @@
 # TRUST BOUNDARY: read-only default token. Writes are per-job and of two kinds:
 # `packages: write` (GHCR, via the built-in GITHUB_TOKEN) on every image + chart job,
 # and `contents: write` on the lone `publish-release` job, which creates the GitHub
-# Release. ACCESS CONTROL for a release is the `protect-release-tags` tag ruleset:
-# only a repo admin can create/delete/move a `v*` tag, so the tag push itself IS the
-# authorization -- whoever is allowed to cut the tag is the only one who could publish.
+# Release. Authorization is upstream of this publisher: release-auto.yml uses separate
+# RC/stable Apps, with human review in release-stable before stable tag creation.
+# Maintainer-configured rulesets restrict each principal's tag creation and retain
+# admin local fallback; tag updates/deletion remain admin-only. See ADR-3512.
 # The IMAGE/CHART publish jobs still declare `environment: release`, but that
 # environment carries NO required reviewer (removed 2026-08-20): it is kept only for
 # deployment TRACKING, not as a gate, so a `v*` tag publishes IMMEDIATELY with no

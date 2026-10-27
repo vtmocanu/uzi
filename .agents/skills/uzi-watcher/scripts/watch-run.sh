@@ -11,7 +11,7 @@
 #
 # uzi's benign "CLI is behind server" line goes to stderr and is discarded here.
 #
-# Usage: watch-run.sh <run-id> [stop-csv] [interval-secs] [max-polls] [min-plan-seq]
+# Usage: watch-run.sh <run-id> [stop-csv] [interval-secs] [max-polls] [min-plan-seq] [min-question-seq]
 #   stop-csv (default) covers a plan gate, a question park, and every terminal
 #   state: completed,failed,cancelled,awaiting_approval,awaiting_input
 #   (`paused` and recovery_wait/worker_requeue_exhausted always stop; see below)
@@ -28,6 +28,16 @@
 #     SEQ=$(uzi run logs <id> --json | jq -rs '[.[]|select(.kind=="plan")|.seq]|max // 0')
 #     uzi run revise <id> -m "…"
 #     watch-run.sh <id> "" "" "" "$SEQ"
+#
+#   min-question-seq (optional 6th arg) — use it when re-arming right after
+#   `uzi run answer` or `uzi run decide`: the status can still read the answered
+#   `awaiting_input` for a poll or two, and a plain re-arm stops on it at once,
+#   leaving the run unwatched. When set, `awaiting_input` only stops the watch once
+#   the newest question message is no longer the answered one: only a newest
+#   question seq exactly equal to min-question-seq keeps polling (attention checks
+#   still run); a newer, missing, unreadable or lower seq stops, never masking a
+#   park. Capture it before answering:
+#     QSEQ=$(uzi run logs <id> --json | jq -rs '[.[]|select(.kind=="question")|.seq]|max // 0')
 #
 # Attention stop (read-only; never changes run state). A dead run can read `running`
 # forever, so status-only polling cannot see it. When the run is non-terminal and NOT yet in
@@ -65,7 +75,7 @@
 # Exit codes: 0 stop-set state (not necessarily success), 3 coverage elapsed,
 # 4 needs_attention. The final RESULT line distinguishes these outcomes.
 set -u
-RID="${1:?usage: watch-run.sh <run-id> [stop-csv] [interval] [max] [min-plan-seq]}"
+RID="${1:?usage: watch-run.sh <run-id> [stop-csv] [interval] [max] [min-plan-seq] [min-question-seq]}"
 STOP="${2:-completed,failed,cancelled,awaiting_approval,awaiting_input}"
 # 30s default balances gate-detection latency against poll volume; MAX 240 keeps
 # total coverage at ~2h (30*240=7200s) so a long implementation phase still fits.
@@ -74,6 +84,7 @@ STOP="${2:-completed,failed,cancelled,awaiting_approval,awaiting_input}"
 INT="${3:-30}"
 MAX="${4:-240}"
 MIN_PLAN_SEQ="${5:-}"
+MIN_QUESTION_SEQ="${6:-}"
 ATTN_POLLS="${WATCH_ATTENTION_POLLS:-3}"
 HB_STALE="${WATCH_HEARTBEAT_STALE_SECS:-180}"
 ATTN_IGNORE="${WATCH_ATTENTION_IGNORE_HEALTH:-slow}"
@@ -82,6 +93,15 @@ ATTN_ACK="${WATCH_ATTENTION_ACK:-}"
 max_plan_seq() {
   uzi run logs "$RID" --json 2>/dev/null \
     | jq -rs '[.[] | select(.kind=="plan") | .seq] | max // 0'
+}
+
+# Prints the newest question seq, or nothing when the logs are unreadable or hold none.
+max_question_seq() {
+  local logs
+  logs="$(uzi run logs "$RID" --json 2>/dev/null)" || return 0
+  # Any question without a positive integer seq makes the evidence uncertain: print nothing.
+  printf '%s' "$logs" | jq -rs '[.[] | select(.kind=="question") | .seq]
+    | if length > 0 and all(type=="number" and . > 0 and . == floor) then max else empty end' 2>/dev/null || true
 }
 
 # attention_check returns 0 (and sets ATTN_EVIDENCE) when this poll shows attention, 1 when
@@ -174,9 +194,24 @@ while [ "$i" -lt "$MAX" ]; do
         printf 'RESULT=stop:%s\n' "$s"
         exit 0
       fi
-      printf 'STOP=%s\n' "$s"
-      printf 'RESULT=stop:%s\n' "$s"
-      exit 0
+      # An answered question can still read awaiting_input briefly: keep polling (with the
+      # attention checks below) only while the newest question is positively the answered one.
+      answered=0
+      if [ "$s" = "awaiting_input" ] && [ -n "$MIN_QUESTION_SEQ" ]; then
+        cur="$(max_question_seq)"
+        if [ "$cur" = "$MIN_QUESTION_SEQ" ]; then
+          answered=1
+        else
+          printf 'STOP=%s (newest question seq=%s, answered=%s)\n' "$s" "${cur:-none}" "$MIN_QUESTION_SEQ"
+          printf 'RESULT=stop:%s\n' "$s"
+          exit 0
+        fi
+      fi
+      if [ "$answered" -eq 0 ]; then
+        printf 'STOP=%s\n' "$s"
+        printf 'RESULT=stop:%s\n' "$s"
+        exit 0
+      fi
       ;;
   esac
   case "$s" in
@@ -193,8 +228,8 @@ while [ "$i" -lt "$MAX" ]; do
           printf 'NOTE investigate only: stalled health does not prove the run is dead and a stale heartbeat does not prove work was lost; this poller changed nothing\n'
           ack="$ATTN_ACK"
           if [ -n "$ATTN_EPISODE" ]; then ack="${ack:+$ack,}$ATTN_EPISODE"; fi
-          printf 'REARM=WATCH_ATTENTION_ACK=%q WATCH_ATTENTION_POLLS=%q WATCH_HEARTBEAT_STALE_SECS=%q WATCH_ATTENTION_IGNORE_HEALTH=%q %q %q %q %q %q %q\n' \
-            "$ack" "$ATTN_POLLS" "$HB_STALE" "$ATTN_IGNORE" "$0" "$RID" "$STOP" "$INT" "$MAX" "$MIN_PLAN_SEQ"
+          printf 'REARM=WATCH_ATTENTION_ACK=%q WATCH_ATTENTION_POLLS=%q WATCH_HEARTBEAT_STALE_SECS=%q WATCH_ATTENTION_IGNORE_HEALTH=%q %q %q %q %q %q %q %q\n' \
+            "$ack" "$ATTN_POLLS" "$HB_STALE" "$ATTN_IGNORE" "$0" "$RID" "$STOP" "$INT" "$MAX" "$MIN_PLAN_SEQ" "$MIN_QUESTION_SEQ"
           printf 'NOTE coverage ended: after investigating, run the REARM line in the background (a stale heartbeat is never acked and stops again)\n'
           printf 'RESULT=attention\n'
           exit 4
