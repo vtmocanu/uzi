@@ -162,6 +162,9 @@ func TestMaintenanceReadoutPartitionLiveDB(t *testing.T) {
 	add(seedRun{status: "pool_wait"}, "held", "progressing")
 	add(seedRun{status: "recovery_wait", cause: "worker_requeue_exhausted"}, "held", "needs_owner")
 	add(seedRun{status: "recovery_wait", cause: "worker_memory_pressure"}, "held", "needs_owner")
+	for _, retry := range []string{"", "1 minute", "-1 minute"} {
+		add(seedRun{status: "recovery_wait", cause: "retained_recovery_adoption_failed", retryIn: retry}, "held", "needs_owner")
+	}
 	add(seedRun{status: "recovery_wait", cause: "forge_unreachable"}, "held", "progressing")
 	add(seedRun{status: "recovery_wait", cause: "retained_recovery_exhausted"}, "held", "needs_owner")
 	add(seedRun{status: "recovery_wait", cause: "retained_recovery_exhausted", retryIn: "1 minute"}, "held", "progressing")

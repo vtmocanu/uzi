@@ -78,14 +78,39 @@ func TestWorkerRecoveryClaimConstructorsJSON(t *testing.T) {
 						t.Fatalf("ClaimChat returned payload=%v err=%v", payload != nil, err)
 					}
 					assertClaimRecoveryEpisode(t, payload, episode+int64(value.parks))
+					assertClaimRecoveryOwnerEpisode(t, payload, episode)
 				} else {
 					payload, err := svc.Claim(context.Background(), worker, nil)
 					if err != nil || payload == nil {
 						t.Fatalf("Claim returned payload=%v err=%v", payload != nil, err)
 					}
 					assertClaimRecoveryEpisode(t, payload, episode+int64(value.parks))
+					assertClaimRecoveryOwnerEpisode(t, payload, episode)
 				}
 			}
 		})
+	}
+}
+
+func assertClaimRecoveryOwnerEpisode(t *testing.T, payload any, want int64) {
+	t.Helper()
+	wire, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(wire, &fields); err != nil {
+		t.Fatal(err)
+	}
+	raw, present := fields["worker_recovery_owner_episode"]
+	if !present {
+		t.Fatal("claim wire lacks worker_recovery_owner_episode")
+	}
+	var got int64
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("claim worker_recovery_owner_episode=%d want=%d", got, want)
 	}
 }

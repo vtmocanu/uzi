@@ -45,6 +45,10 @@ func TestWorkerExhaustionCustodyListingsLiveDB(t *testing.T) {
 		{"worker_memory_pressure", "available", "source_only"},
 		{"worker_memory_pressure", "preparing", "source_only"},
 		{"worker_memory_pressure", "needs_action", "needs_action"},
+		{"retained_recovery_adoption_failed", "", "source_only"},
+		{"retained_recovery_adoption_failed", "available", "source_only"},
+		{"retained_recovery_adoption_failed", "preparing", "source_only"},
+		{"retained_recovery_adoption_failed", "needs_action", "needs_action"},
 		{"provider_outage", "", "active"},
 	} {
 		run, hold := uuid.New(), uuid.New()
@@ -74,7 +78,7 @@ func TestWorkerExhaustionCustodyListingsLiveDB(t *testing.T) {
 	if len(workers) != len(wants) {
 		t.Fatalf("worker listing rows=%d want=%d", len(workers), len(wants))
 	}
-	remaining := map[string]int{"source_only": 6, "needs_action": 2, "active": 1}
+	remaining := map[string]int{"source_only": 9, "needs_action": 3, "active": 1}
 	for _, row := range workers {
 		got := row.Attention
 		if row.WorkerID != worker || remaining[got] == 0 || row.DecisionNeeded != (got != "active") {
@@ -91,7 +95,7 @@ func TestWorkerExhaustionCustodyListingsLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if counts[worker] != 8 {
-		t.Fatalf("decision count=%d want=8 (six source_only + two needs_action)", counts[worker])
+	if counts[worker] != 12 {
+		t.Fatalf("decision count=%d want=12 (nine source_only + three needs_action)", counts[worker])
 	}
 }

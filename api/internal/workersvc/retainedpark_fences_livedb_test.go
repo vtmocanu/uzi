@@ -12,9 +12,17 @@ import (
 )
 
 func TestRetainedParkLateExecutionFencesLiveDB(t *testing.T) {
+	for _, cause := range []string{"retained_recovery_exhausted", "retained_recovery_adoption_failed"} {
+		t.Run(cause, func(t *testing.T) {
+			testRetainedParkLateExecutionFencesLiveDB(t, cause)
+		})
+	}
+}
+
+func testRetainedParkLateExecutionFencesLiveDB(t *testing.T, cause string) {
 	for _, timed := range []bool{false, true} {
 		for _, endPark := range []string{"parked", "timer", "owner"} {
-			if !timed && endPark == "timer" {
+			if endPark == "timer" && (!timed || cause == recoveryCauseRetainedRecoveryAdoptionFailed) {
 				continue
 			}
 			t.Run(fmt.Sprintf("timed=%v/%s", timed, endPark), func(t *testing.T) {
@@ -26,7 +34,7 @@ func TestRetainedParkLateExecutionFencesLiveDB(t *testing.T) {
 				}
 				w := e.seedWorker(t, nil)
 				id := e.fpSeedRunning(t, w, 1)
-				if _, ok, err := svc.SetState(e.ctx, store.Worker{ID: w}, id, retainedReport(1)); err != nil || !ok {
+				if _, ok, err := svc.SetState(e.ctx, store.Worker{ID: w}, id, retainedReportCause(1, cause)); err != nil || !ok {
 					t.Fatalf("park: %v %v", ok, err)
 				}
 				if endPark == "timer" {

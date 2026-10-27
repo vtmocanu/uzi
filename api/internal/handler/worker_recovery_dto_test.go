@@ -96,3 +96,12 @@ func TestWorkerRecoveryHistoricEvidenceDTO(t *testing.T) {
 		})
 	}
 }
+
+func TestAdoptionFailureRecoveryDTO(t *testing.T) {
+	dto := runToDTO(store.Run{Status: "recovery_wait",
+		RecoveryWaitCause: pgtype.Text{String: "retained_recovery_adoption_failed", Valid: true}},
+		"normal", 0, 0, 0, dtoTestNow, 3)
+	if dto.WorkerRecovery == nil || dto.WorkerRecovery.Episode != 0 {
+		t.Fatal("adoption hold omitted stored owner episode")
+	}
+}

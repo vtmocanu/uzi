@@ -30,14 +30,15 @@ import (
 // volume filled; SetState routes it to its own park transaction (parkDataVolumeFull), which stores
 // the cause and counts it toward the disk-only lifetime cap (UZI_RUN_DISK_PARK_MAX).
 var recoveryWaitCauses = map[string]bool{
-	recoveryCauseRetainedRecoveryExhausted: true,
-	recoveryCauseWorkerMemoryPressure:      true,
-	"forge_unreachable":                    true,
-	"empty_turn":                           true,
-	recoveryCauseProviderOutage:            true,
-	recoveryCauseVaultLocked:               true,
-	recoveryCauseDataVolumeFull:            true,
-	recoveryCauseCodexAccountUnavailable:   true,
+	recoveryCauseRetainedRecoveryExhausted:      true,
+	recoveryCauseRetainedRecoveryAdoptionFailed: true,
+	recoveryCauseWorkerMemoryPressure:           true,
+	"forge_unreachable":                         true,
+	"empty_turn":                                true,
+	recoveryCauseProviderOutage:                 true,
+	recoveryCauseVaultLocked:                    true,
+	recoveryCauseDataVolumeFull:                 true,
+	recoveryCauseCodexAccountUnavailable:        true,
 }
 
 // recoveryCauseVaultLocked is the issue #1766 cause for a run parked because its owner's vault
