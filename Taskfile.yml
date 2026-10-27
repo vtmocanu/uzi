@@ -138,21 +138,22 @@
 # THE npm TARGETS DELEGATE TO THE EXISTING SCRIPT AND MUST KEEP DOING SO. A target
 # written `npm test` inherits whatever flags `package.json` already encodes; a
 # target that reimplements the command drops them SILENTLY. The live instance is
-# `test:agent`: `agent/package.json`'s test script carries `--test-timeout=120000`
-# and node's own default is NO timeout. A target that reimplements the command
+# `test:agent`: `agent/package.json`'s test script invokes
+# `agent/test/run-unit-tests.ts`, which passes `--test-timeout=120000`;
+# node's own default is NO timeout. A target that reimplements the command
 # drops the flag silently. See `test:agent` below for why the cap is 120000 and
 # not the 30000 it shipped with -- and for why what that number GOVERNS is
 # different on the CI node major than on the dev laptop's. This is the same "a future simplify-the-gate edit"
 # hazard as `-race`/`-count=1`, arriving through `package.json` instead of
-# .github/workflows/ci.yml. Before wrapping any npm script, read it for flags first; if you
+# .github/workflows/ci.yml. Before wrapping any npm script, read it and its launcher for flags; if you
 # must spell out the underlying command, re-add every flag the script carried and
 # say in the comment that you are re-adding it because the target bypassed the
 # script, not that the script never had it.
 #
 # NOT SILENT, DELIBERATELY. Task echoes each command before running it, so the
-# gate's own output shows `-race`, `-count=1` and `--test-timeout=120000` actually
-# being passed. That echo is how a teammate notices a load-bearing flag going
-# missing, which is the failure mode this milestone is most exposed to.
+# gate's own output shows `-race` and `-count=1` actually being passed.
+# The agent unit command echoes only `npm test`; inspect
+# `agent/test/run-unit-tests.ts` for its load-bearing timeout flag.
 #
 # NO `-buildvcs=false` HERE. It is a local-only workaround for VCS stamping in a
 # linked git worktree and must not be committed. If you hit it, export
@@ -2943,7 +2944,8 @@ tasks:
         msg: 'UZI_AGENT_TEST_STALL_MS / UZI_AGENT_TEST_STALL_TESTONLY are for the launcher tests only; unset them'
     cmds:
       # `npm test` and NOT a bare `node --test`: agent/package.json's test script
-      # carries `--test-timeout=120000`, and node's own default is NO timeout at
+      # invokes test/run-unit-tests.ts, which passes `--test-timeout=120000`.
+      # Node's own default is NO timeout at
       # all. Rewriting this line as a direct node call drops the flag silently,
       # which is the reason to delegate regardless.
       #
