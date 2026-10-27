@@ -2350,6 +2350,10 @@ func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 	}
 	if reason := runQueueReason(r.RunDTO); reason != "" {
 		s += " (" + reason + ")"
+	} else if reason := strOr(r.HealthReason, ""); r.Status == "queued" && reason == "your Codex account is unavailable (quarantined or being re-linked), so this run can't start" {
+		// Before the recovery_wait transition, retain account unavailability after
+		// maintenance precedence and ahead of the independent admission details.
+		s += " (" + reason + ")"
 	}
 	if reason := codexAdmissionLineAt(r.RunDTO, now); reason != "" {
 		s += " (" + reason + ")"

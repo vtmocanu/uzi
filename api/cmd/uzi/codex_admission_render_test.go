@@ -49,6 +49,64 @@ func TestCodexAdmissionCLIConsumers(t *testing.T) {
 	}
 }
 
+func TestCodexAdmissionQueuedBlockerPriority(t *testing.T) {
+	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	unavailable := "your Codex account is unavailable (quarantined or being re-linked), so this run can't start"
+	for _, class := range []string{"rate_limit", "overload"} {
+		for _, tc := range []struct {
+			name, status, queue, health, want string
+		}{
+			{"queued account unavailable", "queued", "codex_" + class, unavailable, "queued (" + unavailable + ")"},
+			{"maintenance coexistence", "queued", "maintenance", unavailable, "queued (maintenance (uzi is in maintenance mode))"},
+			{"recovery wait", "recovery_wait", "codex_" + class, unavailable, "recovery_wait (Codex reconciling)"},
+			{"untyped provider text", "queued", "codex_" + class, "provider reported overload", "queued"},
+		} {
+			for _, delta := range []time.Duration{time.Minute, 0, -time.Nanosecond} {
+				t.Run(class+"/"+tc.name+"/"+delta.String(), func(t *testing.T) {
+					at := now.Add(delta)
+					run := apitypes.RunDTO{Status: tc.status, QueueReason: sp(tc.queue), HealthReason: sp(tc.health)}
+					if tc.name != "untyped provider text" {
+						run.CodexAdmissionClass, run.CodexAdmissionEligibleAt = &class, &at
+					}
+					if tc.status == "recovery_wait" {
+						run.RecoveryWaitCause = sp(codexAccountUnavailableCause)
+						run.CodexAccountAction = sp(codexActionReconciling)
+					}
+					want := tc.want
+					if tc.status == "queued" && delta > 0 && tc.name != "untyped provider text" {
+						copy := "waiting: provider reported overload; account admission eligible after 2026-10-27T12:01:00Z"
+						if class == "rate_limit" {
+							copy = "waiting: provider reported a rate limit; account admission eligible after 2026-10-27T12:01:00Z"
+						}
+						want += " (" + copy + ")"
+					}
+					if got := runStatusCellAt(apitypes.RunListItemDTO{RunDTO: run}, now); got != want {
+						t.Fatalf("status = %q, want %q", got, want)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestCodexAdmissionQueuedAccountCLIConsumers(t *testing.T) {
+	at := time.Date(2099, 1, 2, 3, 4, 5, 0, time.UTC)
+	unavailable := "your Codex account is unavailable (quarantined or being re-linked), so this run can't start"
+	for _, class := range []string{"rate_limit", "overload"} {
+		t.Run(class, func(t *testing.T) {
+			run := apitypes.RunDTO{ID: "admission", Kind: "issue", Status: "queued", HealthReason: &unavailable, QueueReason: sp("codex_" + class), CodexAdmissionClass: &class, CodexAdmissionEligibleAt: &at}
+			srv := newListViewServer(t, []apitypes.RunListItemDTO{{RunDTO: run}})
+			for _, args := range [][]string{{"run", "list"}, {"admin", "runs"}} {
+				out, errs, code := runCLI(t, httpEnv(srv.Server), args...)
+				blocker, admission := strings.Index(out, unavailable), strings.Index(out, "waiting: provider reported")
+				if code != 0 || blocker < 0 || admission <= blocker || !strings.Contains(out, "2099-01-02T03:04:05Z") {
+					t.Fatalf("%v exit=%d stderr=%s output=%s", args, code, errs, out)
+				}
+			}
+		})
+	}
+}
+
 func TestCodexAdmissionReadTimeRendering(t *testing.T) {
 	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
 	future, past := now.Add(time.Minute), now.Add(-time.Nanosecond)
