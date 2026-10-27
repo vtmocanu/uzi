@@ -82,9 +82,9 @@ async function certifiedFor(f: Fixture, s: AuthorityStore, t2: AuthorityTransact
   const base = { context, clonePath, expectedHead: sha, roots: [{ sha: "b".repeat(40), contexts: [context] }] };
   const seals = leaseSeals.get(lease);
   const core = leaseHarness(lease) === "codex" && seals
-    ? buildCodexSourceCore({ store: s, base, lease, seal: seals.seal, accepts: (seal, use) => seals.lifetime.accepts(seal, use) })
+    ? buildCodexSourceCore({ store: s, base, lease, seal: seals.seal })
     : buildClaudeSourceCore({ store: s, base, lease });
-  const certified = await s.certifySource(t2, lease, core, seals ? { seal: seals.seal, accepts: (seal, use) => seals.lifetime.accepts(seal, use) } : undefined);
+  const certified = await s.certifySource(t2, lease, core, seals ? { seal: seals.seal } : undefined);
   leaseSources.set(lease, certified);
   return certified;
 }
@@ -95,6 +95,11 @@ async function publish(
   const source = await certifiedFor(f, s, t2, lease);
   await s.transition(t2, lease, to, { source, captureIds });
   return source;
+}
+/** Publish the lease's own harness (a retirement starts from a published slot), then mark it retiring. */
+async function retire(f: Fixture, s: AuthorityStore, lease: SourceUseLease, manifest: string[]): Promise<void> {
+  await tx(f, (t2) => publish(f, s, t2, lease, leaseHarness(lease) === "codex" ? "sealed" : "claude_ready"));
+  await tx(f, (t2) => s.markRetiring(t2, lease, { manifest }));
 }
 function slotFiles(f: Fixture): string[] {
   return fs.existsSync(slotsDir(f)) ? fs.readdirSync(slotsDir(f)) : [];
@@ -335,7 +340,7 @@ test("pending footprints: running blocks admission, settle clears, a failed sett
   await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /pending/);
   await assert.rejects(tx(f, (t2) => s.beginPending(t2, lease, { kind: "bare_mutation", footprint: "x" })), /already recorded/);
   await assert.rejects(tx(f, (t2) => publish(f, s, t2, lease, "claude_ready")), /pending/);
-  await assert.rejects(tx(f, (t2) => s.markRetiring(t2, lease, { prior: "a".repeat(64), manifest: [] })), /pending/);
+  await assert.rejects(tx(f, (t2) => s.markRetiring(t2, lease, { manifest: [] })), /pending/);
   await tx(f, (t2) => s.settlePending(t2, lease, op, { ok: true }));
   assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.pending, null);
   const again = await tx(f, (t2) => s.admitSourceUse(t2, src));
@@ -355,7 +360,7 @@ test("retiring blocks admission until retired; a retired tombstone mints a new e
   const src = source(f);
   const key = await tx(f, (t2) => s.slotKey(t2, src));
   const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
-  await tx(f, (t2) => s.markRetiring(t2, lease, { prior: "b".repeat(64), manifest: ["x", "y"] }));
+  await retire(f, s, lease, ["x", "y"]);
   await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /retired|retiring/);
   await assert.rejects(tx(f, (t2) => s.markRetired(t2, lease)), /incomplete/);
   await assert.rejects(tx(f, (t2) => s.advanceRetiring(t2, lease, 3)), /invalid retire progress/);
@@ -421,7 +426,7 @@ test("input the decoder would refuse is rejected before anything is written, so 
   assert.deepEqual(slotFiles(f), []);
   const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
 
-  await tx(f, (t2) => s.markRetiring(t2, lease, { prior: "a".repeat(64), manifest: ["x", "y"] }));
+  await retire(f, s, lease, ["x", "y"]);
   await assert.rejects(tx(f, (t2) => s.advanceRetiring(t2, lease, 0.5)), /invalid retire progress/);
   await assert.rejects(tx(f, (t2) => s.advanceRetiring(t2, lease, Number.NaN)), /invalid retire progress/);
   const retiring = await tx(f, (t2) => s.readSlot(t2, key));
@@ -432,9 +437,9 @@ test("input the decoder would refuse is rejected before anything is written, so 
   const other = await tx(f, (t2) => s.admitSourceUse(t2, source(f, "runner/repo-b")));
   const otherKey = await tx(f, (t2) => s.slotKey(t2, source(f, "runner/repo-b")));
   const big = Array.from({ length: 1024 }, (_, i) => String(i).padStart(4, "0") + "€".repeat(508));
-  await assert.rejects(tx(f, (t2) => s.markRetiring(t2, other, { prior: "c".repeat(64), manifest: big })), /exceeds bound/);
-  assert.equal((await tx(f, (t2) => s.readSlot(t2, otherKey)))?.state, "active", "slot still readable and unchanged");
   await tx(f, (t2) => publish(f, s, t2, other, "claude_ready"));
+  await assert.rejects(tx(f, (t2) => s.markRetiring(t2, other, { manifest: big })), /exceeds bound/);
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, otherKey)))?.state, "claude_ready", "slot still readable and unchanged");
 });
 
 test("replaying an older authentic slot file refuses and keeps refusing", async (t) => {
@@ -631,7 +636,7 @@ test("a head shard stays far below the file bound with many retired tombstones k
   for (let i = 0; i < 40; i++) {
     const src = source(f, `runner/many-${i}`);
     const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
-    await tx(f, (t2) => s.markRetiring(t2, lease, { prior: "e".repeat(64), manifest: [] }));
+    await retire(f, s, lease, []);
     await tx(f, (t2) => s.markRetired(t2, lease));
   }
   const heads = fs.readdirSync(path.join(authorityDir(f), "heads"));
@@ -661,17 +666,97 @@ test("a stale or foreign lease passed to admit refuses instead of minting a new 
 test("a failed footprint's residue cannot be discarded by a retire that does not cover it", async (t) => {
   const f = await fixture(t);
   const s = await store(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, source(f)));
+  const attempt = async (src: string, manifest: string[]): Promise<{ lease: SourceUseLease }> => {
+    const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+    await retire(f, s, lease, manifest);
+    const op = await tx(f, (t2) => s.beginPending(t2, lease, { kind: "destructive", footprint: "rm -r build" }));
+    await assert.rejects(tx(f, (t2) => s.markRetired(t2, lease)), /incomplete|pending/);
+    await tx(f, (t2) => s.settlePending(t2, lease, op, { ok: false, residue: ["a/b", "c"] }));
+    await tx(f, (t2) => s.advanceRetiring(t2, lease, manifest.length));
+    return { lease };
+  };
+  const bad = await attempt(source(f), ["a/b"]);
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.state, "retiring", "a failed footprint keeps the slot retiring");
+  await assert.rejects(tx(f, (t2) => s.markRetired(t2, bad.lease)), /residue/);
+  const good = await attempt(source(f, "runner/repo-b"), ["c", "a/b"]);
+  await tx(f, (t2) => s.markRetired(t2, good.lease));
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.state, "retiring");
+  const goodKey = await tx(f, (t2) => s.slotKey(t2, source(f, "runner/repo-b")));
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, goodKey)))?.state, "retired");
+});
+
+test("retirement derives its prior from the slot's own publication and only starts from a published slot", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
   const src = source(f);
   const key = await tx(f, (t2) => s.slotKey(t2, src));
   const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
-  const op = await tx(f, (t2) => s.beginPending(t2, lease, { kind: "destructive", footprint: "rm -r build" }));
-  await tx(f, (t2) => s.settlePending(t2, lease, op, { ok: false, residue: ["a/b", "c"] }));
-  await assert.rejects(tx(f, (t2) => s.markRetiring(t2, lease, { prior: "d".repeat(64), manifest: ["a/b"] })), /residue/);
-  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.state, "ineligible");
-  await tx(f, (t2) => s.markRetiring(t2, lease, { prior: "d".repeat(64), manifest: ["c", "a/b"] }));
-  await tx(f, (t2) => s.advanceRetiring(t2, lease, 2));
-  await tx(f, (t2) => s.markRetired(t2, lease));
-  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.state, "retired");
+  // Never published: an active slot cannot be marked retiring, and the old caller-supplied prior is gone.
+  await assert.rejects(tx(f, (t2) => s.markRetiring(t2, lease, { manifest: [] })), /published/);
+  await assert.rejects(tx(f, (t2) => s.markRetiring(t2, lease, { prior: "a".repeat(64), manifest: [] } as never)), /published/);
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.state, "active");
+
+  const published = await tx(f, (t2) => publish(f, s, t2, lease, "claude_ready"));
+  const digest = sourceCoreDigest(published);
+  await assert.rejects(tx(f, (t2) => s.markRetiring(t2, lease, { expectedDigest: "a".repeat(64), manifest: [] })), /expected digest/);
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.state, "claude_ready", "a refused retire writes nothing");
+  await tx(f, (t2) => s.markRetiring(t2, lease, { expectedDigest: digest, manifest: ["x"] }));
+  const slot = await tx(f, (t2) => s.readSlot(t2, key));
+  assert.equal(slot?.state, "retiring");
+  assert.equal(slot?.retiring?.prior, digest);
+  await assert.rejects(tx(f, (t2) => s.markRetiring(t2, lease, { manifest: [] })), /already retiring/);
+});
+
+test("restart retirement: a successor retires a slot a dead incarnation published, but never an active foreign epoch", async (t) => {
+  const f = await fixture(t);
+  const dead = await store(f, { workerIncarnation: randomUUID() });
+  const successor = await store(f, { workerIncarnation: randomUUID() });
+  const src = source(f);
+  const key = await tx(f, (t2) => successor.slotKey(t2, src));
+  const lease = await tx(f, (t2) => dead.admitSourceUse(t2, src));
+
+  // Active under the dead incarnation: the successor cannot advance it, by lease or by beginRetirement.
+  const epoch = leaseEpoch(lease);
+  await assert.rejects(tx(f, (t2) => successor.beginRetirement(t2, src, { expectedEpoch: epoch, expectedDigest: "a".repeat(64), manifest: [] })), /published/);
+  await assert.rejects(tx(f, (t2) => successor.markRetiring(t2, lease, { manifest: [] })), /not belong/);
+
+  const published = await tx(f, (t2) => publish(f, dead, t2, lease, "claude_ready"));
+  const digest = sourceCoreDigest(published);
+  // Even this incarnation's own lease is no authority for the successor: it must verify epoch and digest itself.
+  const attempt = (over: Partial<{ expectedEpoch: string; expectedDigest: string }>): Promise<SourceUseLease> =>
+    tx(f, (t2) => successor.beginRetirement(t2, src, { expectedEpoch: epoch, expectedDigest: digest, manifest: ["x", "y"], ...over }));
+  await assert.rejects(attempt({ expectedEpoch: randomUUID() }), /another source-use epoch/);
+  await assert.rejects(attempt({ expectedDigest: "b".repeat(64) }), /expected digest/);
+  await assert.rejects(tx(f, (t2) => successor.beginRetirement(t2, source(f, "runner/never"), { expectedEpoch: epoch, expectedDigest: digest, manifest: [] })), /missing/);
+  assert.equal((await tx(f, (t2) => successor.readSlot(t2, key)))?.state, "claude_ready", "refusals write nothing");
+
+  const resumed = await attempt({});
+  const slot = await tx(f, (t2) => successor.readSlot(t2, key));
+  assert.equal(slot?.state, "retiring");
+  assert.equal(slot?.epoch, epoch, "same epoch");
+  assert.equal(slot?.owner.worker, successor.workerIncarnation);
+  assert.equal(slot?.retiring?.prior, digest);
+  assert.equal(slot?.publication?.sourceCoreDigest, digest, "publication kept");
+  await assert.rejects(attempt({}), /already retiring/);
+  await assert.rejects(tx(f, (t2) => dead.advanceRetiring(t2, lease, 0)), /stale/, "the dead incarnation's lease no longer drives it");
+
+  // The returned lease drives the whole retirement, including a pending footprint.
+  const op = await tx(f, (t2) => successor.beginPending(t2, resumed, { kind: "destructive", footprint: "rm x y" }));
+  await tx(f, (t2) => successor.advanceRetiring(t2, resumed, 2));
+  await assert.rejects(tx(f, (t2) => successor.markRetired(t2, resumed)), /pending/, "a running footprint blocks the tombstone");
+  await tx(f, (t2) => successor.settlePending(t2, resumed, op, { ok: true }));
+  await tx(f, (t2) => successor.markRetired(t2, resumed));
+  assert.equal((await tx(f, (t2) => successor.readSlot(t2, key)))?.state, "retired");
+
+  // A slot with a pending record, or an ineligible one, does not begin retirement.
+  const src2 = source(f, "runner/repo-b");
+  const lease2 = await tx(f, (t2) => dead.admitSourceUse(t2, src2));
+  const pub2 = await tx(f, (t2) => publish(f, dead, t2, lease2, "claude_ready"));
+  await tx(f, (t2) => dead.transition(t2, lease2, "ineligible"));
+  await assert.rejects(tx(f, (t2) => successor.beginRetirement(t2, src2, {
+    expectedEpoch: leaseEpoch(lease2), expectedDigest: sourceCoreDigest(pub2), manifest: [],
+  })), /published/);
 });
 
 test("authority operations require an active transaction of the same root", async (t) => {
@@ -754,9 +839,11 @@ test("a codex slot can never become claude_ready: the harness is bound at admiss
   // The marker survives ineligible, retiring and the tombstone, so a reused path is still codex.
   await tx(f, (t2) => s.transition(t2, successor, "ineligible"));
   assert.equal((await tx(f, (t2) => s.readSlot(t2, bKey)))?.codexMarked, true);
-  await tx(f, (t2) => s.markRetiring(t2, successor, { prior: "a".repeat(64), manifest: [] }));
+  await assert.rejects(tx(f, (t2) => s.markRetiring(t2, successor, { manifest: [] })), /published/, "an ineligible slot cannot retire");
+  const codexAgain = await tx(f, (t2) => admitCodex(s, t2, bSrc));
+  await retire(f, s, codexAgain, []);
   assert.equal((await tx(f, (t2) => s.readSlot(t2, bKey)))?.codexMarked, true);
-  await tx(f, (t2) => s.markRetired(t2, successor));
+  await tx(f, (t2) => s.markRetired(t2, codexAgain));
   const tomb = await tx(f, (t2) => s.readSlot(t2, bKey));
   assert.equal(tomb?.state, "retired");
   assert.equal(tomb?.codexMarked, true, "even the tombstone keeps it");
@@ -843,7 +930,7 @@ test("publication takes the certified source: any foreign epoch, slot, worker, e
   const xSource = await tx(f, (t2) => certifiedFor(f, s, t2, xLease));
   const xSeal = leaseSeals.get(xLease)!;
   const wrongExecutor = await tx(f, (t2) => s.certifySource(t2, xLease, { ...xSource, executorIncarnation: "exec-forged" },
-    { seal: xSeal.seal, accepts: (seal, use) => xSeal.lifetime.accepts(seal, use) }).catch((e: unknown) => e));
+    { seal: xSeal.seal }).catch((e: unknown) => e));
   assert.match(String((wrongExecutor as Error).message), /executor does not match/);
   await tx(f, (t2) => s.transition(t2, xLease, "sealed", { source: xSource, captureIds: CAPS }));
 });
@@ -934,9 +1021,13 @@ test("publication survives ineligible and retiring, is cleared by retire, and is
 
   await tx(f, (t2) => s.transition(t2, lease, "ineligible"));
   assert.equal((await tx(f, (t2) => s.readPublication(t2, src)))?.state, "ineligible");
-  await tx(f, (t2) => s.markRetiring(t2, lease, { prior: "a".repeat(64), manifest: [] }));
-  assert.equal((await tx(f, (t2) => s.readPublication(t2, src)))?.state, "retiring");
-  await tx(f, (t2) => s.markRetired(t2, lease));
+  await assert.rejects(tx(f, (t2) => s.markRetiring(t2, lease, { manifest: [] })), /published/, "ineligible does not retire");
+  const next = await tx(f, (t2) => admitCodex(s, t2, src));
+  await retire(f, s, next, []);
+  const retiring = await tx(f, (t2) => s.readPublication(t2, src));
+  assert.equal(retiring?.state, "retiring");
+  assert.equal(retiring?.epoch, leaseEpoch(next));
+  await tx(f, (t2) => s.markRetired(t2, next));
   assert.equal(await tx(f, (t2) => s.readPublication(t2, src)), null);
 });
 

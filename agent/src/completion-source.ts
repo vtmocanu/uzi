@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { AuthorityRefusal, type AuthorityTransaction } from "./authority-lock.js";
 import { leaseEpoch, type AuthorityStore, type SlotPublicationRead, type SourceUseLease } from "./completion-authority.js";
-import { terminalSealMaterial } from "./codex/executor-lifetime.js";
+import { terminalSealMaterial, terminalSealStillAccepted } from "./codex/executor-lifetime.js";
 import { type CompletionSource, validCompletionSource } from "./recovery.js";
 
 // Version 2 completion sources and the source fence (issue #3404 M2 U1). Pure primitives:
@@ -310,25 +310,24 @@ function core(input: CoreInput, extra: Partial<CompletionSourceV2> & Pick<Comple
 
 /**
  * Uncertified codex core from an opaque terminal seal. The material comes only from
- * `terminalSealMaterial(seal)`; it must have been sealed for exactly this lease and the caller's
- * `accepts` (for example `(seal, use) => executor.acceptsLifetimeSeal(seal, use)`) must still
- * accept it. There is no plain-material input.
+ * `terminalSealMaterial(seal)`; it must have been sealed for exactly this lease and the issuing
+ * lifetime must still accept it (answered from the seal's own recorded state, never a caller
+ * callback). There is no plain-material input.
  */
 export function buildCodexSourceCore(input: CoreInput & CodexSealInput): CompletionSourceV2 {
   const { executorIncarnation, registryFacadePairs } = codexSealFields(input.lease, input);
   return core(input, { harness: "codex", executorIncarnation, registryFacadePairs });
 }
 
-/** The terminal seal a codex source is derived from, and the executor's current acceptance of it. */
+/** The terminal seal a codex source is derived from. */
 export interface CodexSealInput {
   seal: unknown;
-  accepts: (seal: unknown, sourceUse: object) => boolean;
 }
 
 /**
  * The codex-only source fields, derived from an opaque terminal seal. The material comes only
  * from `terminalSealMaterial(seal)`; the seal must have been sealed for exactly this lease and
- * `accepts` must still accept it. The store re-derives them with this same function to certify.
+ * its issuing lifetime must still accept it. The store re-derives them with this same function to certify.
  */
 export function codexSealFields(
   lease: SourceUseLease, input: CodexSealInput,
@@ -336,7 +335,7 @@ export function codexSealFields(
   const material = terminalSealMaterial(input.seal);
   if (!material) throw new AuthorityRefusal("not a terminal seal");
   if (material.sourceUse !== lease) throw new AuthorityRefusal("terminal seal belongs to another source use");
-  if (input.accepts(input.seal, lease) !== true) throw new AuthorityRefusal("terminal seal is not accepted");
+  if (!terminalSealStillAccepted(input.seal, lease)) throw new AuthorityRefusal("terminal seal is not accepted");
   const registryFacadePairs = material.incarnations.map((i): [string, string] => [i.registry, i.facade])
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   return { executorIncarnation: material.executorIncarnation, registryFacadePairs };

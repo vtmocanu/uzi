@@ -28,6 +28,17 @@ export function terminalSealMaterial(seal: unknown): ExecutorSealMaterial | unde
   return typeof seal === "object" && seal !== null ? sealStates.get(seal)?.material : undefined;
 }
 
+/**
+ * Whether the lifetime that issued `seal` still accepts it for `sourceUse`, answered from the
+ * seal's own recorded state. A caller cannot substitute its own answer, so a seal revoked after
+ * issue (distrust, a failing facade or registry check, a late tail) is never accepted.
+ */
+export function terminalSealStillAccepted(seal: unknown, sourceUse: object): boolean {
+  if (typeof seal !== "object" || seal === null) return false;
+  const state = sealStates.get(seal);
+  return state !== undefined && state.lifetime.accepts(seal, sourceUse);
+}
+
 interface Incarnation {
   readonly id: string;
   facade?: { readonly id: string; readonly identity: object; readonly check: () => boolean };

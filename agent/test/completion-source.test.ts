@@ -23,8 +23,9 @@ interface Fixture {
   clone: string; base: CompletionSource;
   /** A codex-admitted slot: its lease, the lifetime that sealed it and the terminal seal. */
   codexLease: SourceUseLease; codexBase: CompletionSource; lifetime: ExecutorLifetime; seal: unknown;
+  /** Make the sealed facade's own check fail from now on: the seal is revoked after it was issued. */
+  revoke(): void;
 }
-const accepts = (lifetime: ExecutorLifetime) => (seal: unknown, use: object): boolean => lifetime.accepts(seal, use);
 async function fixture(t: TestContext, token = TOKEN): Promise<Fixture> {
   const root = makeTmp(t);
   const lifetime = await acquireWorkerLifetime(root, testLockOptions());
@@ -40,7 +41,8 @@ async function fixture(t: TestContext, token = TOKEN): Promise<Fixture> {
   const codexLease = await run((t2) => store.admitSourceUse(t2, codexClone, { executor: executorId }));
   const identity = {};
   executor.inventory(identity, () => true);
-  executor.bindFacade(identity, {}, () => true);
+  let facadeOk = true;
+  executor.bindFacade(identity, {}, () => facadeOk);
   const sealed = await executor.seal(codexLease, async () => undefined, () => true);
   assert.equal(sealed.kind, "sealed");
   const context = {
@@ -53,17 +55,16 @@ async function fixture(t: TestContext, token = TOKEN): Promise<Fixture> {
   };
   return {
     root, store, lease, tx: run, clone, base, codexLease, codexBase: { ...base, clonePath: codexClone }, lifetime: executor,
-    seal: sealed.kind === "sealed" ? sealed.seal : undefined,
+    seal: sealed.kind === "sealed" ? sealed.seal : undefined, revoke: () => { facadeOk = false; },
   };
 }
 
 const expectation = (f: Fixture): { dataDir: string; storageId: string; layout: string } =>
   ({ dataDir: f.root, storageId: f.store.storageId, layout: f.store.layout });
 const codex = (f: Fixture): CompletionSourceV2 => buildCodexSourceCore({
-  store: f.store, base: f.codexBase, lease: f.codexLease, seal: f.seal, accepts: accepts(f.lifetime),
+  store: f.store, base: f.codexBase, lease: f.codexLease, seal: f.seal,
 });
-const codexSeal = (f: Fixture): { seal: unknown; accepts: (seal: unknown, use: object) => boolean } =>
-  ({ seal: f.seal, accepts: accepts(f.lifetime) });
+const codexSeal = (f: Fixture): { seal: unknown } => ({ seal: f.seal });
 const claude = (f: Fixture): CompletionSourceV2 => buildClaudeSourceCore({ store: f.store, base: f.base, lease: f.lease });
 const clone = <T>(v: T): T => structuredClone(v);
 
@@ -85,7 +86,7 @@ test("builders produce valid sorted cores that round-trip through the strict par
 test("the codex builder takes only an opaque seal bound to this lease that the executor still accepts", async (t) => {
   const f = await fixture(t);
   const build = (over: Record<string, unknown>): CompletionSourceV2 => buildCodexSourceCore({
-    store: f.store, base: f.codexBase, lease: f.codexLease, seal: f.seal, accepts: accepts(f.lifetime), ...over,
+    store: f.store, base: f.codexBase, lease: f.codexLease, seal: f.seal, ...over,
   });
   const refused = (over: Record<string, unknown>, re: RegExp): void => assert.throws(() => build(over), re);
   const material = { sourceUse: f.codexLease, executorIncarnation: "exec-x", incarnations: [{ registry: "r", facade: "f" }] };
@@ -93,8 +94,8 @@ test("the codex builder takes only an opaque seal bound to this lease that the e
   refused({ seal: Object.freeze({}) }, /not a terminal seal/);
   refused({ seal: undefined }, /not a terminal seal/);
   refused({ lease: f.lease }, /another source use/);
-  refused({ accepts: () => false }, /not accepted/);
-  refused({ accepts: (_seal: unknown, use: object) => use !== f.codexLease }, /not accepted/);
+  // A caller-supplied acceptance callback is ignored: only the seal's own lifetime answers.
+  refused({ accepts: () => true, seal: Object.freeze({}) }, /not a terminal seal/);
   assert.equal(build({}).harness, "codex");
 });
 
@@ -306,7 +307,7 @@ test("certification refuses a source that is not the live lease's: slot, harness
 
 test("a codex source is certified only against the actual terminal seal, never a hand-built core", async (t) => {
   const f = await fixture(t);
-  const certify = (source: unknown, seal?: { seal: unknown; accepts: (seal: unknown, use: object) => boolean }, lease = f.codexLease): Promise<CompletionSourceV2> =>
+  const certify = (source: unknown, seal?: { seal: unknown }, lease = f.codexLease): Promise<CompletionSourceV2> =>
     f.tx((t2) => f.store.certifySource(t2, lease, source as CompletionSourceV2, seal));
   const genuine = codex(f);
   // The slot owner's executor id with invented registry/facade incarnations: parses, binds, and used to certify.
@@ -318,12 +319,23 @@ test("a codex source is certified only against the actual terminal seal, never a
 
   const other = await fixture(t);
   await assert.rejects(certify(genuine, codexSeal(other)), /another source use/, "a seal of another lease");
-  await assert.rejects(certify(genuine, { seal: {}, accepts: () => true }), /not a terminal seal/, "a look-alike seal");
-  await assert.rejects(certify(genuine, { seal: f.seal, accepts: () => false }), /not accepted/, "an executor that no longer accepts it");
+  await assert.rejects(certify(genuine, { seal: {} }), /not a terminal seal/, "a look-alike seal");
   await assert.rejects(certify(claude(f), codexSeal(f), f.lease), /takes no terminal seal/, "a claude lease takes no seal");
 
   const certified = await certify(genuine, codexSeal(f));
   assert.match(certified.certificate ?? "", /^[0-9a-f]{64}$/);
+});
+
+test("a seal revoked after it was issued is never accepted, whatever acceptance callback the caller supplies", async (t) => {
+  const f = await fixture(t);
+  const genuine = codex(f);
+  f.revoke();
+  assert.equal(f.lifetime.accepts(f.seal, f.codexLease), false, "precondition: the lifetime itself no longer accepts the seal");
+  assert.throws(() => codex(f), /not accepted/, "the builder");
+  // The old API let a caller pass accepts: () => true; the extra field is now simply ignored.
+  const callerOverride = { seal: f.seal, accepts: () => true } as { seal: unknown };
+  assert.throws(() => buildCodexSourceCore({ store: f.store, base: f.codexBase, lease: f.codexLease, ...callerOverride }), /not accepted/);
+  await assert.rejects(f.tx((t2) => f.store.certifySource(t2, f.codexLease, genuine, callerOverride)), /not accepted/, "certification");
 });
 
 test("verifyPublishedSource needs the certificate AND the slot's current publication for the same epoch and digest", async (t) => {

@@ -43,6 +43,22 @@
  *    runs' cleanup and pinning also touch.
  *  - "owed-reconcile-delete-ref": GitCache.reconcileOwedCandidates (`update-ref -d` of the owed pin).
  *    Same footprint, join and reasoning.
+ *  - "recovery-pin-delete-ref": GitCache.deleteRecoveryPin (`update-ref -d` of refs/uzi-recovery-pin/
+ *    <run>/<gen>, the ref anchorRecoveryHead re-creates). Join: tryGitExit returning a real exit status
+ *    (0 or not), then a read-back; null (spawn failure, timeout, signal) leaves it unsettled.
+ *  - "recovery-pin-archive-delete-ref": GitCache.cleanupArchivedRecoveryPin's prepared
+ *    `update-ref --stdin` child (same pin ref). Registered after the last eligibility check and before
+ *    the child is spawned (a refusal retains the pin). Join: the child's exit status is >= 0 (-1 is
+ *    unknown), then a read-back: a committed delete must have removed the ref, an uncommitted abort
+ *    must have left no `<ref>.lock`; anything else settles as residue.
+ *  Other `update-ref -d` sites swept in git.ts, none in a namespace assertBareClear guards, so none is
+ *  hooked: refs/uzi-checkpoints/<key>, refs/uzi-publication-floor/, refs/uzi-incoming/ (the fetch
+ *  stage), the tracking-ancestor `candidate` in the archive step (refs/uzi-runner/..., after its
+ *  refs/uzi-archive/ copy exists), refs/uzi-cross-check/<run>, refs/uzi-settle/, refs/uzi-recovery-
+ *  episode/ (the discard path), refs/uzi-workflow-target/, refs/uzi-secret-scan-floor/, the
+ *  RECOVERY_BUNDLE_REF, and clone-local refs (runGitAsRunner / the clone `git` helper). The guarded
+ *  namespaces refs/uzi-owed/, refs/uzi-coverage/ and refs/uzi-recovery-pin/ are deleted only by the
+ *  four sites above.
  *
  * assertBareClear(barePath, op) — refuses while a beginBareMutation record on that bare is unresolved,
  *  so a pin or coverage ref cannot be re-created over a pending (ABA) deletion.
@@ -58,8 +74,11 @@
  *    freeCanonicalClonePath). Under the uid split this is a detached, setpriv-wrapped `rm -rf` that
  *    can outlive its caller (RunnerDeleteUnsettledError); in the single-uid layout it is an
  *    in-process fs.rm. Footprint: the target tree. Join: the child's `close` event (exit 0 settles
- *    ok; any other joined exit settles with the target as residue); an `error` event or an unsettled
- *    timeout leaves the record open, and a late `close` of an unsettled child settles it as residue.
+ *    ok; any other joined exit settles with the target as residue). A spawn that failed before any
+ *    process existed (a synchronous throw, or an `error` event with no pid) settles with the target as
+ *    residue. An `error` event after a real start, or an unsettled timeout, leaves the record open, and
+ *    a late `close` of an unsettled child settles it as residue. A rejected ok-settlement of an
+ *    in-process delete surfaces as an authority error, never as a failed delete.
  */
 export interface AuthoritySettlement {
   settle(outcome: { ok: true } | { ok: false; residue: string[] }): Promise<void>;

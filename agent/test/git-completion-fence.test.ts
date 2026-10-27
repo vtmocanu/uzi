@@ -34,7 +34,7 @@ function gitIn(dir: string, args: string[]): string {
 }
 const rawJournal = (): string => gitIn(bare, ["config", "--get", `uzi-recovery.${BRANCH}.clone`]);
 const journal = (): Record<string, unknown> => JSON.parse(rawJournal()) as Record<string, unknown>;
-const expected = () => ({ clonePath });
+const expected = () => ({ runId: RUN, clonePath });
 const reconstructionSource = () => ({ runId: RUN, clonePath });
 
 /** Recording hooks. `events` is shared with the git wrapper so cross-component order is observable. */
@@ -125,8 +125,9 @@ describe("installCompletionSourceFence", () => {
   });
 
   it("refuses a missing journal, a different path and a different attempt without writing", async () => {
-    await assert.rejects(cache.installCompletionSourceFence(bare, BRANCH, { clonePath: clonePath + "-x" }, FENCE), /does not name this source/);
-    await assert.rejects(cache.installCompletionSourceFence(bare, BRANCH, { clonePath, attemptId: aid(2) }, FENCE), /does not name this source/);
+    await assert.rejects(cache.installCompletionSourceFence(bare, BRANCH, { runId: RUN, clonePath: clonePath + "-x" }, FENCE), /does not name this source/);
+    await assert.rejects(cache.installCompletionSourceFence(bare, BRANCH, { runId: RUN, clonePath, attemptId: aid(2) }, FENCE), /does not name this source/);
+    await assert.rejects(cache.installCompletionSourceFence(bare, BRANCH, { runId: "run-other", clonePath }, FENCE), /does not name this source/);
     gitIn(bare, ["config", `uzi-recovery.${BRANCH}.clone`, ""]);
     await assert.rejects(cache.installCompletionSourceFence(bare, BRANCH, expected(), FENCE), /does not name this source/);
     assert.equal(gitIn(bare, ["config", "--get", `uzi-recovery.${BRANCH}.clone`]), "");
@@ -166,8 +167,8 @@ describe("installCompletionSourceFence", () => {
   }
 });
 
-describe("fence preserved by every journal reconstruction", () => {
-  it("survives reserve, capture, prepareRecoverySuccessor and the successor replacement", async () => {
+describe("fence preserved by every reconstruction of the SAME source, never inherited by another", () => {
+  it("survives reserve and capture of the same source", async () => {
     await cache.installCompletionSourceFence(bare, BRANCH, expected(), FENCE);
     const source = reconstructionSource();
     const r = await cache.reserveRecoveryIteration(bare, BRANCH, KEY, source);
@@ -175,16 +176,33 @@ describe("fence preserved by every journal reconstruction", () => {
     const head = gitIn(clonePath, ["rev-parse", "HEAD"]);
     await cache.recordRecoveryCapture(bare, BRANCH, KEY, source, r.attempts, head);
     assert.equal(JSON.stringify(journal().completionSourceFence), serializeSourceFence(FENCE));
+    assert.equal(Object.keys(journal()).at(-1), "completionSourceFence");
+  });
+
+  it("a successor journal carries no stale fence and can install its own once the predecessor is gone", async () => {
+    await cache.installCompletionSourceFence(bare, BRANCH, expected(), FENCE);
+    const source = reconstructionSource();
+    const r = await cache.reserveRecoveryIteration(bare, BRANCH, KEY, source);
+    const head = gitIn(clonePath, ["rev-parse", "HEAD"]);
+    await cache.recordRecoveryCapture(bare, BRANCH, KEY, source, r.attempts, head);
     const successor = await cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source, r.attempts, aid(2));
     const after = journal() as unknown as RecoveryJournalEntry;
     assert.equal(after.clonePath, successor.path, "the journal was replaced by the successor's");
     assert.equal(after.recovery?.stage, "ready-for-model");
-    assert.equal(JSON.stringify(after.completionSourceFence), serializeSourceFence(FENCE));
-    assert.equal(Object.keys(after).at(-1), "completionSourceFence");
+    assert.equal(after.completionSourceFence, undefined, "the predecessor's fence is not the successor's");
     await cache.completeRecoveryEpisode(bare, BRANCH, KEY, { runId: RUN, clonePath: successor.path, attemptId: aid(2) },
       { settled: true, processedEvents: 1, attemptId: aid(2) });
-    assert.equal(JSON.stringify(journal().completionSourceFence), serializeSourceFence(FENCE));
+    assert.equal(journal().completionSourceFence, undefined);
     assert.ok(Array.isArray(journal().retainedSources), "retained source rebuild still names the predecessor");
+
+    // Predecessor disposed (the installer refuses a journal that still names one): the successor installs its own fence.
+    const { retainedSources: _gone, ...plain } = journal();
+    gitIn(bare, ["config", `uzi-recovery.${BRANCH}.clone`, JSON.stringify(plain)]);
+    const mine = { runId: RUN, clonePath: successor.path, attemptId: aid(2) };
+    await assert.rejects(cache.installCompletionSourceFence(bare, BRANCH, { ...mine, runId: "run-other" }, OTHER), /does not name this source/);
+    const installed = await cache.installCompletionSourceFence(bare, BRANCH, mine, OTHER);
+    assert.equal(serializeSourceFence(installed), serializeSourceFence(OTHER));
+    assert.equal(JSON.stringify(journal().completionSourceFence), serializeSourceFence(OTHER));
   });
 });
 
@@ -354,12 +372,130 @@ describe("authority hooks", () => {
     });
   });
 
+  describe("recovery pin deletion (N1)", () => {
+    const OWED_RUN = "19241924-1111-2222-3333-444444444444";
+    const PIN = `refs/uzi-recovery-pin/${OWED_RUN}/1`;
+    let sha: string;
+    const pinExists = (): boolean => gitIn(bare, ["for-each-ref", PIN]) !== "";
+    beforeEach(async () => {
+      sha = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+      assert.equal(await cache.anchorRecoveryHead(bare, OWED_RUN, 1, sha), true);
+      assert.equal(pinExists(), true);
+    });
+    const isDelete = (args: string[]) => args.includes("update-ref") && args.includes("-d") ? "update-ref-d" : undefined;
+    const hookedWith = (events: string[], over: Partial<GitAuthorityHooks> = {}): GitCache =>
+      new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+        authority: recorder(events, {
+          // The registration must precede the effect: record whether the pin still exists when it happens.
+          beginBareMutation: async (_b, op, footprint) => {
+            events.push(`bare:${op}:${footprint.join(",")}:pin=${pinExists()}`);
+            return { settle: async (outcome) => { events.push(`settle:${op}:pin=${pinExists()}:${JSON.stringify(outcome)}`); } };
+          },
+          ...over,
+        }),
+      }));
+
+    it("deleteRecoveryPin registers before the child and settles ok only after it is joined and the ref is gone", async () => {
+      const events: string[] = [];
+      const hooked = hookedWith(events);
+      watchGit(hooked, isDelete, events);
+      await hooked.deleteRecoveryPin(bare, OWED_RUN, 1);
+      assert.deepEqual(events, [
+        `bare:recovery-pin-delete-ref:${PIN}:pin=true`, "git:update-ref-d", 'settle:recovery-pin-delete-ref:pin=false:{"ok":true}',
+      ]);
+      assert.equal(pinExists(), false);
+    });
+
+    it("deleteRecoveryPin leaves the record unsettled when the child has no real exit status", async () => {
+      const events: string[] = [];
+      const hooked = hookedWith(events);
+      watchGit(hooked, isDelete, events, Object.assign(new Error("timed out"), { code: "ETIMEDOUT", stdout: "", stderr: "" }));
+      await hooked.deleteRecoveryPin(bare, OWED_RUN, 1);
+      assert.deepEqual(events, [`bare:recovery-pin-delete-ref:${PIN}:pin=true`, "git:update-ref-d"]);
+      assert.equal(pinExists(), true);
+    });
+
+    it("deleteRecoveryPin settles a joined nonzero exit that left the ref as residue", async () => {
+      const events: string[] = [];
+      const hooked = hookedWith(events);
+      watchGit(hooked, isDelete, events, Object.assign(new Error("exit 1"), { code: 1, stdout: "", stderr: "" }));
+      await hooked.deleteRecoveryPin(bare, OWED_RUN, 1);
+      assert.deepEqual(events, [
+        `bare:recovery-pin-delete-ref:${PIN}:pin=true`, "git:update-ref-d",
+        `settle:recovery-pin-delete-ref:pin=true:{"ok":false,"residue":["${PIN}"]}`,
+      ]);
+    });
+
+    it("a refused registration deletes nothing", async () => {
+      const events: string[] = [];
+      const hooked = hookedWith(events, { beginBareMutation: async () => { throw new Error("authority refused"); } });
+      watchGit(hooked, isDelete, events);
+      await assert.rejects(hooked.deleteRecoveryPin(bare, OWED_RUN, 1), /authority refused/);
+      assert.deepEqual(events, []);
+      assert.equal(pinExists(), true);
+    });
+
+    it("cleanupArchivedRecoveryPin registers before the prepared child and settles ok after a joined commit", async () => {
+      const events: string[] = [];
+      const hooked = hookedWith(events);
+      const result = await hooked.cleanupArchivedRecoveryPin({
+        runId: OWED_RUN, generation: 1, sourceSha: sha, recoveryPinBareDir: path.basename(bare), isEligible: () => true,
+      });
+      assert.deepEqual(result, { state: "deleted" });
+      assert.deepEqual(events, [
+        `bare:recovery-pin-archive-delete-ref:${PIN}:pin=true`, 'settle:recovery-pin-archive-delete-ref:pin=false:{"ok":true}',
+      ]);
+    });
+
+    it("cleanupArchivedRecoveryPin settles an aborted (uncommitted) child as ok only when the pin and lock are untouched", async () => {
+      const events: string[] = [];
+      const hooked = hookedWith(events);
+      let calls = 0;
+      // The first eligibility check precedes the registration; the second runs while the child holds the prepared lock.
+      const result = await hooked.cleanupArchivedRecoveryPin({
+        runId: OWED_RUN, generation: 1, sourceSha: sha, recoveryPinBareDir: path.basename(bare), isEligible: () => ++calls < 2,
+      });
+      assert.deepEqual(result, { state: "retained", reason: "ineligible" });
+      assert.deepEqual(events, [
+        `bare:recovery-pin-archive-delete-ref:${PIN}:pin=true`, 'settle:recovery-pin-archive-delete-ref:pin=true:{"ok":true}',
+      ]);
+      assert.equal(fs.existsSync(path.join(bare, `${PIN}.lock`)), false);
+    });
+
+    it("cleanupArchivedRecoveryPin does not settle when the child's exit is unverified (-1)", async () => {
+      const events: string[] = [];
+      const hooked = hookedWith(events);
+      const internals = hooked as unknown as { spawnGit(...a: unknown[]): Promise<{ exited: Promise<number> }> };
+      const real = internals.spawnGit.bind(hooked);
+      internals.spawnGit = async (...a) => {
+        const child = await real(...a);
+        // Only the prepared delete child: the metadata probes must keep their real status.
+        return (a[1] as string[]).includes("--stdin") ? Object.assign(child, { exited: child.exited.then(() => -1) }) : child;
+      };
+      await hooked.cleanupArchivedRecoveryPin({
+        runId: OWED_RUN, generation: 1, sourceSha: sha, recoveryPinBareDir: path.basename(bare), isEligible: () => true,
+      });
+      assert.deepEqual(events, [`bare:recovery-pin-archive-delete-ref:${PIN}:pin=true`]);
+    });
+
+    it("cleanupArchivedRecoveryPin retains the pin without spawning when registration is refused", async () => {
+      const events: string[] = [];
+      const hooked = hookedWith(events, { beginBareMutation: async () => { throw new Error("authority refused"); } });
+      const result = await hooked.cleanupArchivedRecoveryPin({
+        runId: OWED_RUN, generation: 1, sourceSha: sha, recoveryPinBareDir: path.basename(bare), isEligible: () => true,
+      });
+      assert.deepEqual(result, { state: "retained", reason: "ineligible" });
+      assert.equal(pinExists(), true);
+      assert.deepEqual(events, []);
+    });
+  });
+
   describe("destructive runner-tree delete", () => {
     /** A fake detached child: the rm runs when `run` is called, then the fake reports `finish`. */
-    function fakeSpawn(events: string[], finish: (child: EventEmitter) => void, remove = true) {
+    function fakeSpawn(events: string[], finish: (child: EventEmitter) => void, remove = true, pid: number | null = 4242) {
       return (_command: string, args: string[]) => {
         events.push("spawn");
-        const child = Object.assign(new EventEmitter(), { stderr: new EventEmitter(), pid: 4242 });
+        const child = Object.assign(new EventEmitter(), { stderr: new EventEmitter(), pid: pid ?? undefined });
         setImmediate(() => {
           if (remove) fs.rmSync(args.at(-1)!, { recursive: true, force: true });
           finish(child);
@@ -406,6 +542,48 @@ describe("authority hooks", () => {
       }));
       await reseed(hooked);
       assert.deepEqual(events.filter(e => /^(destructive|spawn|settle)/.test(e)), ["destructive:runner-uid-delete:issue-2512", "spawn"]);
+    });
+
+    it("a spawn 'error' with no pid (the child never started) settles as a joined failure with the target as residue", async () => {
+      const events: string[] = [];
+      await free();
+      const hooked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+        authority: recorder(events),
+        retentionDelete: { split: true, spawn: fakeSpawn(events, c => c.emit("error", new Error("spawn EAGAIN")), false, null) },
+      }));
+      await reseed(hooked);
+      const ours = events.filter(e => /^(destructive|spawn|settle)/.test(e));
+      assert.equal(ours.length, 3, ours.join("\n"));
+      assert.match(ours[2]!, /^settle:runner-uid-delete:\{"ok":false,"residue":\["[^"]*issue-2512"\]\}$/);
+    });
+
+    it("a spawn seam that throws synchronously settles {ok:false} with the target as residue, never ok", async () => {
+      const events: string[] = [];
+      await free();
+      const hooked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+        authority: recorder(events),
+        retentionDelete: { split: true, spawn: () => { events.push("spawn"); throw new Error("spawn threw synchronously"); } },
+      }));
+      await reseed(hooked);
+      const settles = events.filter(e => e.startsWith("settle:"));
+      assert.equal(settles.length, 1, settles.join("\n"));
+      assert.match(settles[0]!, /^settle:runner-uid-delete:\{"ok":false,"residue":\["[^"]*issue-2512"\]\}$/);
+    });
+
+    it("a rejected settlement after a successful in-process delete is an authority error, not a failed delete", async () => {
+      const events: string[] = [];
+      await free();
+      const hooked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+        authority: recorder(events, {
+          beginDestructive: async (paths) => ({ settle: async (outcome) => {
+            events.push(`settle:${JSON.stringify(outcome)}`); throw new Error(`cannot write ${path.basename(paths[0]!)}`);
+          } }),
+        }),
+        retentionDelete: { split: true, run: async (_command: string, args: string[]) => { fs.rmSync(args.at(-1)!, { recursive: true, force: true }); } },
+      }));
+      await assert.rejects(reseed(hooked), /completion authority refused runner-uid-delete settlement: cannot write issue-2512/);
+      assert.deepEqual(events.filter(e => e.startsWith("settle:")), ['settle:{"ok":true}']);
+      assert.equal(fs.readdirSync(path.dirname(clonePath)).some(n => /residue/i.test(n)), false, "nothing was quarantined as a failed delete");
     });
 
     it("a refused beginDestructive deletes nothing and never spawns", async () => {

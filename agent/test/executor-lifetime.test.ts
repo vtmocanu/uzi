@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { ExecutorLifetime, terminalSealMaterial, type ExecutorTerminalSeal } from "../src/codex/executor-lifetime.js";
+import { ExecutorLifetime, terminalSealMaterial, terminalSealStillAccepted, type ExecutorTerminalSeal } from "../src/codex/executor-lifetime.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import { createCodexExecutionSafety, type CodexExecutionSafetyImpl } from "../src/codex/safety.js";
 import { CodexCallbackBroker, type FileopRequest, type FileopResponse, type RunGrants } from "../src/codex/broker.js";
@@ -172,6 +172,28 @@ describe("ExecutorLifetime (#3404 M1b)", () => {
     const o = origin(lifetime);
     await disposeOrigin(o);
     assert.equal((await lifetime.seal("run-1" as never, settled, () => true)).kind, "unproven");
+  });
+
+  it("terminalSealStillAccepted answers from the seal's own lifetime and follows a later revocation", async () => {
+    const lifetime = new ExecutorLifetime();
+    let facadeOk = true;
+    const identity = {};
+    lifetime.inventory(identity, () => true);
+    lifetime.bindFacade(identity, {}, () => facadeOk);
+    const source = Object.freeze({ lease: "opaque" });
+    const result = await lifetime.seal(source, settled, () => true);
+    assert.equal(result.kind, "sealed");
+    if (result.kind !== "sealed") return;
+    assert.equal(terminalSealStillAccepted(result.seal, source), true);
+    assert.equal(terminalSealStillAccepted(result.seal, { lease: "opaque" }), false, "another source use");
+    assert.equal(terminalSealStillAccepted({}, source), false);
+    assert.equal(terminalSealStillAccepted(null, source), false);
+    assert.equal(terminalSealStillAccepted(JSON.parse(JSON.stringify(result.seal)), source), false);
+    facadeOk = false;
+    assert.equal(terminalSealStillAccepted(result.seal, source), false, "revoked after issue");
+    facadeOk = true;
+    lifetime.distrust();
+    assert.equal(terminalSealStillAccepted(result.seal, source), false, "distrusted after issue");
   });
 
   it("forged, copied, foreign and mismatched seals are rejected; material is readable only from the real seal", async () => {

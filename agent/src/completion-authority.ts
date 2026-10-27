@@ -653,6 +653,21 @@ function requireResidueCovered(pending: PendingFootprint | null, manifest: reado
   }
 }
 
+/** The published digest a slot may retire from: sealed or claude_ready, nothing pending, and the expected digest if given. */
+function retirablePrior(body: SlotSnapshot, expectedDigest: string | undefined): string {
+  if (body.state === "retiring" || body.state === "retired") throw new AuthorityRefusal("source already retiring");
+  if (body.pending !== null) throw new AuthorityRefusal("unresolved pending footprint");
+  if (body.state !== "sealed" && body.state !== "claude_ready") throw new AuthorityRefusal("only a published source can retire");
+  if (body.publication === null) throw new AuthorityRefusal("only a published source can retire");
+  if (expectedDigest !== undefined && expectedDigest !== body.publication.sourceCoreDigest) {
+    throw new AuthorityRefusal("expected digest does not match the published source");
+  }
+  return body.publication.sourceCoreDigest;
+}
+function retiringRecord(prior: string, manifest: readonly string[]): RetiringRecord {
+  return { prior, operation: randomUUID(), manifest: strings(manifest, MAX_ITEMS), deleted: 0 };
+}
+
 export class AuthorityStore {
   readonly #init: StoreInit;
   /** Highest seq loaded or written per slot key; shared by every store of this storage id. */
@@ -948,7 +963,7 @@ export class AuthorityStore {
     tx: AuthorityTransaction, lease: SourceUseLease, input: { kind: "bare_mutation" | "destructive"; footprint: string },
   ): Promise<string> {
     const { dir, body } = await this.#owned(tx, lease);
-    if (body.state === "retiring" || body.state === "retired") throw new AuthorityRefusal("source is retiring");
+    if (body.state === "retired") throw new AuthorityRefusal("source is retiring");
     // Post-publication, any source operation needs a fresh admitSourceUse epoch first.
     if (body.state === "sealed" || body.state === "claude_ready") throw new AuthorityRefusal("source is published; admit a new epoch first");
     if (body.pending !== null) throw new AuthorityRefusal("a pending footprint is already recorded");
@@ -977,15 +992,43 @@ export class AuthorityStore {
     await this.#save(dir, { ...body, state, pending, seq: body.seq + 1 });
   }
 
-  async markRetiring(tx: AuthorityTransaction, lease: SourceUseLease, input: { prior: string; manifest: string[] }): Promise<void> {
+  /**
+   * Retire the source this incarnation published. Only a sealed or claude_ready slot with no
+   * pending record can retire, and `prior` is never caller-supplied: it is the slot's own
+   * published source-core digest, so retiring persists exactly what was proven. `expectedDigest`
+   * is an optional guard that must equal it.
+   */
+  async markRetiring(tx: AuthorityTransaction, lease: SourceUseLease, input: { expectedDigest?: string; manifest: string[] }): Promise<void> {
     const { dir, body } = await this.#owned(tx, lease);
-    if (body.state === "retiring" || body.state === "retired") throw new AuthorityRefusal("source already retiring");
-    if (body.pending?.status === "running") throw new AuthorityRefusal("unresolved pending footprint");
-    const retiring: RetiringRecord = {
-      prior: hex64(input.prior), operation: randomUUID(), manifest: strings(input.manifest, MAX_ITEMS), deleted: 0,
-    };
-    requireResidueCovered(body.pending, retiring.manifest);
-    await this.#save(dir, { ...body, state: "retiring", retiring, seq: body.seq + 1 });
+    const prior = retirablePrior(body, input.expectedDigest);
+    await this.#save(dir, {
+      ...body, state: "retiring", retiring: retiringRecord(prior, input.manifest), seq: body.seq + 1,
+    });
+  }
+
+  /**
+   * Begin retirement of a slot published by ANY worker incarnation, including a dead earlier one
+   * (restart retirement). The caller names the exact epoch and published digest it verified; both
+   * must equal the slot's. The slot must be sealed or claude_ready with no pending record, so an
+   * active foreign epoch (an unfinished source use) still refuses. The slot moves to retiring under
+   * this worker, same epoch, publication kept, and the returned lease drives
+   * advanceRetiring / markRetired / beginPending / settlePending.
+   */
+  async beginRetirement(
+    tx: AuthorityTransaction, sourcePath: string, input: { expectedEpoch: string; expectedDigest: string; manifest: string[] },
+  ): Promise<SourceUseLease> {
+    this.#check(tx);
+    const key = await this.slotKey(tx, sourcePath);
+    const dir = await this.#slotsDir();
+    const body = await this.#load(dir, key);
+    if (!body) throw new AuthorityRefusal("authority slot missing");
+    if (body.epoch !== uuid(input.expectedEpoch)) throw new AuthorityRefusal("source belongs to another source-use epoch");
+    const prior = retirablePrior(body, hex64(input.expectedDigest));
+    const retiring = retiringRecord(prior, input.manifest);
+    await this.#save(dir, {
+      ...body, state: "retiring", owner: { worker: this.#init.incarnation, executor: body.owner.executor }, retiring, seq: body.seq + 1,
+    });
+    return new SourceUseLease(leaseBrand, this, key, body.epoch, (body.publication as SlotPublication).harness);
   }
 
   /** Durable deletion progress; monotonic and bounded by the manifest. */
@@ -1004,6 +1047,7 @@ export class AuthorityStore {
     if (body.state !== "retiring" || !body.retiring || body.retiring.deleted !== body.retiring.manifest.length) {
       throw new AuthorityRefusal("retire is incomplete");
     }
+    if (body.pending?.status === "running") throw new AuthorityRefusal("unresolved pending footprint");
     requireResidueCovered(body.pending, body.retiring.manifest);
     await this.#save(dir, { ...body, state: "retired", retiring: null, pending: null, publication: null, seq: body.seq + 1 });
   }
