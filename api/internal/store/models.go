@@ -1111,6 +1111,7 @@ type Run struct {
 	CheckpointCoordinates       []byte             `json:"checkpoint_coordinates"`
 	RetainedParkCount           int32              `json:"retained_park_count"`
 	IgnoredInferredCapabilities []string           `json:"ignored_inferred_capabilities"`
+	IdleStallParkCount          int32              `json:"idle_stall_park_count"`
 }
 
 type RunCompletionAttempt struct {

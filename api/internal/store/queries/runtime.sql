@@ -3146,64 +3146,15 @@ UPDATE runs SET retry_not_before = now(), updated_at = now()
 WHERE id = @id AND user_id = @user_id AND status = 'limit_wait';
 
 -- name: SetRunRecoveryWait :execrows
--- Park a run in the TRANSIENT-RECOVERY hold (issue #1197). running -> recovery_wait,
--- non-terminal: the run keeps its issue, its session, its worker affinity, its message
--- history and its plan_md, and the sweeper (PromoteRecoveryWaitRuns) promotes it back to
--- queued once recovery_retry_not_before passes. It is modelled CLOSELY on SetRunLimitWait
--- but is a DISTINCT park with a distinct purpose:
---
--- 🔴 recovery_wait IS NOT A USAGE LIMIT. A worker enters it after a positively-empty SDK
--- turn survived bounded in-process retries — a transient recovery, not credential
--- exhaustion. So this query MUST NOT touch any limit/credential gauge: limit_wait_count,
--- limit_resets_at, retry_not_before, rate_limit_type and limit_dead_secret_id are ALL left
--- untouched. Its own recovery_wait_count/recovery_retry_not_before are the only park
--- bookkeeping, and recovery_wait_count is a backoff SHAPER, never a cap (there is no
--- lifetime-park cap and no terminal branch — a park always becomes promotable again).
---
--- 🔴 THE SOURCE GUARD IS POSITIVE (status = 'running'), exactly as SetRunLimitWait's, and
--- for the same reasons: a negative guard would admit queued/claimed -> recovery_wait (a
--- stale report parking a run no worker holds), awaiting_approval -> recovery_wait
--- (swallowing a pending human approval), and recovery_wait -> recovery_wait (a re-delivered
--- report bumping the backoff count a second time on one event). With the positive guard
--- each is a 0-row no-op, surfaced to the worker as 409 / applied=false, so re-delivery is
--- idempotent and the worker's cleanup carve-out keys off the RETURNED STATUS.
---
--- kind <> 'judge' mirrors SetRunLimitWait (Decision 14): a judge run is executed by a
--- different runner with its own error path and is never re-enqueued.
---
--- recovery_retry_not_before is computed in GO and passed in (now + capped exponential
--- backoff + jitter; see workersvc/recoverywait.go), never derived here.
---
--- recovery_wait_count bumps HERE, in the same statement as the transition, so a run cannot
--- end up parked without its backoff shaper advancing. It is distinct from limit_wait_count
--- and requeue_count on purpose — a shared counter would let one park's budget leak into
--- another's curve.
---
--- The health reset is MANDATORY for the same reason SetRunLimitWait's is: a parked run is
--- absent from ListActiveRunsForHealth (a POSITIVE allowlist), so whatever flag was live at
--- park time would FREEZE for the whole park with nothing able to clear it. Do NOT "fix" it
--- by adding recovery_wait to that allowlist: stalled/looping/slow describe a RUNNING agent.
--- plan_md and worker_id are PRESERVED (worker_id is in the WHERE, never the SET). This is a
--- NON-TERMINAL transition, so the run's checkpoint is NOT deleted (that fires only on
--- terminal transitions).
---
--- PRD #1392 M1 (D9): this is the UNTYPED park (empty turn, and #1088's provider park once
--- it adopts recovery_wait). It REPLACES recovery_wait_cause with @recovery_cause, never
--- coalescing it — a later untyped park on a run that forge-parked earlier must drop the typed
--- cause, so its surface reads the generic wording and its forge cap counter is not consulted.
--- Issue #1766 M2: the Go caller (setRecoveryWait) passes a non-NULL recovery_cause ONLY for
--- 'vault_locked' (the worker's codex refresh/release answered 409 vault_locked: the owner's
--- vault is locked, so the run waits for an unlock) and NULL for every other reported cause,
--- so empty_turn/provider_outage still store NULL (D9). The column CHECK is the backstop. It does NOT
--- touch forge_park_count: that lifetime counter belongs to the forge park alone (fact 7 /
--- D2), so an empty-turn park neither increments nor resets it (a run keeps its forge-park
--- lifetime count through a later empty-turn park). The forge park has its own writer,
--- ParkRunForgeUnreachable, which sets the cause and bumps forge_park_count.
+-- Park a running claim without releasing custody or its execution claim. The caller
+-- computes the retry and optional idle count under the run lock. Untyped parks
+-- preserve the idle counter; typed idle parks can hold with a NULL deadline.
 UPDATE runs SET
     status                    = 'recovery_wait',
     status_since              = now(),
     recovery_wait_count       = recovery_wait_count + 1,
     recovery_wait_cause       = sqlc.narg('recovery_cause')::text,
+    idle_stall_park_count = COALESCE(sqlc.narg('idle_stall_park_count')::integer, idle_stall_park_count),
     provider_park_count = CASE WHEN sqlc.arg('reset_provider_streak')::boolean
         AND sqlc.narg('claim_generation')::bigint > 0
         AND claim_generation = sqlc.narg('claim_generation')::bigint
@@ -3569,6 +3520,7 @@ RETURNING id, user_id, status;
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
+  AND (runs.recovery_wait_cause IS DISTINCT FROM 'codex_idle_stall' OR runs.recovery_retry_not_before IS NOT NULL)
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
@@ -3623,6 +3575,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
+  AND (runs.recovery_wait_cause IS DISTINCT FROM 'codex_idle_stall' OR runs.recovery_retry_not_before IS NOT NULL)
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
@@ -11835,4 +11788,15 @@ WHERE id = @id AND worker_id = @worker_id AND status='running'
  AND claim_generation = @claim_generation::bigint AND @claim_generation::bigint > 0
  AND claim_released_at IS NULL AND COALESCE(stop_kind, '')=''
  AND kind IN ('issue','ci_fix','self_improve','prompt','task','mr_rework')
+RETURNING *;
+
+-- name: ResumeCodexIdleStall :one
+UPDATE runs SET
+    status = 'queued', recovery_retry_not_before = NULL, idle_stall_park_count = 0,
+    started_at = NULL, budget_paused_seconds = 0,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    status_since = now(), health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
+  AND recovery_wait_cause = 'codex_idle_stall'
 RETURNING *;

@@ -285,7 +285,7 @@ FOR UPDATE;
 -- Owner-scoped. Comparing status_since as well as status is what catches a run that left and
 -- re-entered the same status in between.
 -- name: LockRunForCredentialSwitch :one
-SELECT id, status, status_since, claim_generation
+SELECT id, status, status_since, claim_generation, recovery_wait_cause, recovery_retry_not_before
 FROM runs
 WHERE id = @id AND user_id = @user_id
 FOR UPDATE;

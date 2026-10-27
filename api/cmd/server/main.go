@@ -367,8 +367,9 @@ func run() error {
 		// Transient-recovery park (issue #1197): the base/ceiling of the server-owned
 		// exponential backoff the sweeper auto-promotes a 'recovery_wait' run on. No
 		// per-run cap — a park always becomes promotable again.
-		RunRecoveryParkBase: cfg.RunRecoveryParkBase,
-		RunRecoveryMaxPark:  cfg.RunRecoveryMaxPark,
+		RunCodexIdleStallMaxParks: cfg.RunCodexIdleStallMaxParks,
+		RunRecoveryParkBase:       cfg.RunRecoveryParkBase,
+		RunRecoveryMaxPark:        cfg.RunRecoveryMaxPark,
 		// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2): past this many forge parks
 		// the run fails with fail_origin='forge_unreachable' instead of parking again. 0 =
 		// unlimited. Counted separately from the recovery-park backoff (recovery_wait_count).

@@ -1617,6 +1617,8 @@ type Params struct {
 	// cancels). recovery_wait_count shapes the curve only. The defaults live in config.go.
 	RunRecoveryParkBase time.Duration
 	RunRecoveryMaxPark  time.Duration
+	// RunCodexIdleStallMaxParks bounds automatic idle-stall retries; zero holds immediately.
+	RunCodexIdleStallMaxParks int
 
 	// RunForgeUnreachableMaxParks (PRD #1392 M1, D2), mirrored from config. The FORGE-park
 	// lifetime cap: past it, SetState's forge-park transaction fails the run with
