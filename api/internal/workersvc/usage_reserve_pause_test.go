@@ -61,6 +61,10 @@ func TestOverrideActiveReadingAware(t *testing.T) {
 	afterGrant := ovGrant.Add(time.Hour)
 	beforeGrant := ovGrant.Add(-time.Hour)
 	moved := anchor.Add(7 * 24 * time.Hour) // a week later: the boundary moved
+	withThr := func(snap *reserveSnap, thr int16) *reserveSnap {
+		snap.threshold = &thr
+		return snap
+	}
 	cases := []struct {
 		name   string
 		harn   string
@@ -84,6 +88,11 @@ func TestOverrideActiveReadingAware(t *testing.T) {
 		{"codex early reset", "codex", ovRun("codex", anchor, &anchor), ovSnap(freshV(usagereserve.Held, 55, moved), afterGrant), now, false},
 		{"codex unmoved boundary", "codex", ovRun("codex", anchor, &anchor), ovSnap(freshV(usagereserve.Held, 55, anchor), afterGrant), now, true},
 		{"codex no anchor, fresh below the line", "codex", ovRun("codex", ovGrant.Add(ReserveOverrideWindow), nil), ovSnap(freshV(usagereserve.OK, 5, anchor), afterGrant), now, false},
+		{"threshold 1, claude: the same fresh 1% under the unchanged boundary is not a reset", "claude", ovRun("claude", anchor, &anchor), withThr(ovSnap(freshV(usagereserve.Held, 1, anchor), afterGrant), 1), now, true},
+		{"threshold 1, codex: the same fresh 1.0 under the unchanged boundary is not a reset", "codex", ovRun("codex", anchor, &anchor), withThr(ovSnap(freshV(usagereserve.Held, 1, anchor), afterGrant), 1), now, true},
+		{"threshold 1: a moved boundary still ends it", "claude", ovRun("claude", anchor, &anchor), withThr(ovSnap(freshV(usagereserve.Held, 1, moved), afterGrant), 1), now, false},
+		{"threshold 70, fresh 1% under the unchanged boundary is a reset", "claude", ovRun("claude", anchor, &anchor), withThr(ovSnap(freshV(usagereserve.OK, 1, anchor), afterGrant), 70), now, false},
+		{"threshold 70, codex fresh 1.0 under the unchanged boundary is a reset", "codex", ovRun("codex", anchor, &anchor), withThr(ovSnap(freshV(usagereserve.OK, 1, anchor), afterGrant), 70), now, false},
 		{"no exemption", "claude", store.Run{Kind: runkind.Issue}, ovSnap(freshV(usagereserve.OK, 5, anchor), afterGrant), now, false},
 	}
 	for _, c := range cases {
@@ -211,5 +220,35 @@ func TestWorkerVisibleHoldReason(t *testing.T) {
 		if got := WorkerVisibleHoldReason(s(hold)); got == nil || *got != hold {
 			t.Errorf("%s = %v, want unchanged", hold, got)
 		}
+	}
+}
+
+// TestReserveReleaseHasCapacity: with no lane that could claim the run, the lane loop proves nothing,
+// so an enforced reserve releases only on a fresh OK reading of the credential the run spent.
+func TestReserveReleaseHasCapacity(t *testing.T) {
+	now := reserveT0
+	anchor := ovAnchor
+	run := store.Run{
+		Kind: runkind.Issue, Harness: "claude", Status: "paused",
+		AnthropicSecretID: pgconv.UUID(tokDefault),
+	}
+	svc := &Service{}
+	// ephemeral=false and no workers: no lane.
+	if got := svc.reserveReleaseHasCapacity(run, ovSnap(freshV(usagereserve.Held, 60, anchor), now), nil, false, false, now); got {
+		t.Error("no lane and a held reading must not release")
+	}
+	if got := svc.reserveReleaseHasCapacity(run, ovSnap(usagereserve.Verdict{State: usagereserve.Unknown}, now), nil, false, false, now); got {
+		t.Error("no lane and an unknown reading must not release")
+	}
+	if got := svc.reserveReleaseHasCapacity(run, ovSnap(freshV(usagereserve.OK, 10, anchor), now), nil, false, false, now); !got {
+		t.Error("no lane and a fresh OK reading must release")
+	}
+	off := &reserveSnap{userID: uuid.New()}
+	if got := svc.reserveReleaseHasCapacity(run, off, nil, false, false, now); !got {
+		t.Error("a reserve that is not enforced must release")
+	}
+	// With a lane (ephemeral on) the helper defers to the lanes.
+	if got := svc.reserveReleaseHasCapacity(run, ovSnap(freshV(usagereserve.Held, 60, anchor), now), nil, false, true, now); !got {
+		t.Error("with a lane the helper defers to the lane decision")
 	}
 }

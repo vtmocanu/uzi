@@ -453,11 +453,14 @@ func overrideEndedByReading(run store.Run, snap *reserveSnap) bool {
 		return false
 	}
 	anchor := run.ReserveExemptWindowReset.Time
-	// The utilization at the grant is not persisted; the run was held, so it read at or above the
-	// threshold. Utilization is monotonic within a week, so a fresh reading at or below
-	// usagereserve.PctResetCeil under an unmoved boundary is a reset whatever the exact prior was,
-	// and the floor keeps a tiny threshold from reading below the detectors' own floor.
-	prior := max(float64(*snap.threshold), usagereserve.PctResetFloor)
+	// The utilization at the grant is not persisted. The anchor is recorded only when the run read at
+	// or above the threshold at the grant (ComputeReserveOverride), so the threshold is the one
+	// established lower bound on the prior. Utilization is monotonic within a week, so a fresh reading
+	// at or below usagereserve.PctResetCeil under an unmoved boundary is a reset whatever the exact
+	// prior was, provided the prior reached the detectors' own floor; for a threshold below
+	// usagereserve.PctResetFloor the drop arm cannot fire (the moved-boundary arm and the clock arm
+	// still end the exemption).
+	prior := float64(*snap.threshold)
 	if codex {
 		fresh := float64(v.Pct)
 		return usagereserve.CodexResetObserved(anchor.Unix(), v.ResetsAt.Unix(), &prior, &fresh)

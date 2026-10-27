@@ -357,6 +357,34 @@ func TestReserveAutoReleaseOnlyOnFreshOKLiveDB(t *testing.T) {
 	}
 }
 
+// TestReserveReleaseWithNoLaneNeedsFreshOKLiveDB: an owner whose last worker is gone (ephemeral off)
+// has no lane that could claim a resumed run, so the lane loop proves nothing: a weekly_reserve pause
+// stays while the reading is held or unknown and is released only by a fresh OK reading.
+func TestReserveReleaseWithNoLaneNeedsFreshOKLiveDB(t *testing.T) {
+	fx := newReserveFix(t, 70, true)
+	tok := fx.token("only", true, false, 90)
+	fx.svc.ephemeralSettings = fakeEphemeralSettings{on: false} // no burst lane either
+	run := fx.pauseRun(pauseRun{cred: &tok, status: "paused", hold: "weekly_reserve"})
+	fx.env.exec(`UPDATE runs SET worker_id = NULL WHERE id = $1`, run)
+	fx.env.exec(`DELETE FROM workers WHERE user_id = $1`, fx.userID)
+	for name, set := range map[string]func(){
+		"held":    func() { fx.reading(tok, 90, 10, "1 minute") },
+		"stale":   func() { fx.reading(tok, 5, 10, "3 hours") },
+		"missing": func() { fx.env.exec(`DELETE FROM anthropic_rate_limits WHERE user_secret_id = $1`, tok) },
+	} {
+		set()
+		fx.pass()
+		if mustRun(t, fx.env, run).Status != "paused" {
+			t.Fatalf("%s reading with no lane released the reserve pause", name)
+		}
+	}
+	fx.reading(tok, 10, 10, "1 minute")
+	fx.pass()
+	if mustRun(t, fx.env, run).Status != "queued" {
+		t.Fatal("a fresh OK reading with no lane did not release the reserve pause")
+	}
+}
+
 // TestReserveClearingThresholdOrToggleReleasesRegardlessOfFreshnessLiveDB: during a poller outage
 // (stale reading), clearing the threshold releases the parks and withdraws pending requests; so does
 // the toggle; the released run is then claimed above the threshold when the toggle is off.
@@ -677,6 +705,17 @@ func TestReserveOverrideGrantComputationLiveDB(t *testing.T) {
 	fx.env.exec(`UPDATE anthropic_rate_limits SET seven_day_resets_at = $2 WHERE user_secret_id = $1`, tok, far)
 	if g, _ = ComputeReserveOverride(fx.env.ctx, fx.env.q, run, iv, now); !g.Until.Equal(now.Add(ReserveOverrideWindow)) {
 		t.Fatalf("until = %v, want the %v cap", g.Until, ReserveOverrideWindow)
+	}
+	// A fresh reading BELOW the threshold at the grant does not establish "read at or above the
+	// threshold", so no anchor is recorded either: seven days, the first-fresh-OK arm.
+	fx.reading(tok, 10, 10, "1 minute")
+	if g, _ = ComputeReserveOverride(fx.env.ctx, fx.env.q, run, iv, now); g.WindowReset != nil || !g.Until.Equal(now.Add(ReserveOverrideWindow)) {
+		t.Fatalf("fresh-OK grant = %+v, want no anchor and the seven-day cap", g)
+	}
+	// A stale reading above the threshold is no better.
+	fx.reading(tok, 90, 10, "3 hours")
+	if g, _ = ComputeReserveOverride(fx.env.ctx, fx.env.q, run, iv, now); g.WindowReset != nil {
+		t.Fatalf("stale-held grant = %+v, want no anchor", g)
 	}
 	// No reading: no anchor, seven days.
 	fx.env.exec(`DELETE FROM anthropic_rate_limits WHERE user_secret_id = $1`, tok)

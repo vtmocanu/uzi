@@ -272,6 +272,16 @@ func reserveRequestStillWanted(run store.Run, snap *reserveSnap) bool {
 	return true
 }
 
+// reserveReleaseHasCapacity: with no lane that could claim the run, the lane loop proves nothing, so an
+// enforced reserve releases only on a fresh OK reading of the credential the run spent.
+func (s *Service) reserveReleaseHasCapacity(run store.Run, snap *reserveSnap, workers []store.ListReserveWorkersRow, hasPool, ephemeral bool, now time.Time) bool {
+	if !reserveEnforced(run, snap, now) || len(s.reserveCandidateLanes(run, workers, hasPool, ephemeral, now)) > 0 {
+		return true
+	}
+	v, ok := snap.spentVerdict(run)
+	return ok && v.Fresh && v.State == usagereserve.OK
+}
+
 // releaseReservePauses resumes the owner's weekly_reserve pauses the reserve no longer holds. A
 // cleared threshold or a toggle turned off releases regardless of freshness; otherwise a run is
 // released only when reserveRunDecision (affinity-aware, like the marker) admits it, which for an
@@ -297,7 +307,8 @@ func (s *Service) releaseReservePauses(ctx context.Context, q reservePauseQuerie
 			queued := run
 			queued.UpdatedAt = pgconv.Time(now)
 			ephemeral := ownerEphemeral || run.EgressProfileID.Valid
-			if s.reserveRunDecision(queued, snap, workers, hasPool, ephemeral, now).held {
+			if s.reserveRunDecision(queued, snap, workers, hasPool, ephemeral, now).held ||
+				!s.reserveReleaseHasCapacity(queued, snap, workers, hasPool, ephemeral, now) {
 				continue
 			}
 		}
@@ -378,7 +389,9 @@ func ComputeReserveOverride(ctx context.Context, q *store.Queries, run store.Run
 		id := uuid.UUID(run.AnthropicSecretID.Bytes)
 		g.CredentialID = &id
 	}
-	if v, ok := snap.spentVerdict(run); ok && v.ResetsAt != nil && v.ResetsAt.After(now) {
+	// The anchor says "the run read at or above the threshold at the grant", which overrideEndedByReading
+	// relies on, so it is recorded only from a fresh held verdict; anything else keeps the seven-day cap.
+	if v, ok := snap.spentVerdict(run); ok && v.Fresh && v.State == usagereserve.Held && v.ResetsAt != nil && v.ResetsAt.After(now) {
 		anchor := v.ResetsAt.UTC()
 		g.WindowReset = &anchor
 		if anchor.Before(g.Until) {
