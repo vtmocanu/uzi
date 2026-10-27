@@ -4758,7 +4758,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		if fenceTx == nil || req.ClaimGeneration == nil {
 			return owned, false, stopReviewConflict("policy_stop_execution_unverifiable")
 		}
-		if _, err := s.policyStopProjectionLocked(ctx, q, wkr, owned, *req.ClaimGeneration, s.policyRevisionProjectionNegotiated(wkr)); err != nil {
+		if _, err := s.policyStopEvidenceLocked(ctx, q, wkr, owned, *req.ClaimGeneration, s.policyRevisionProjectionNegotiated(wkr)); err != nil {
 			return owned, false, err
 		}
 	}

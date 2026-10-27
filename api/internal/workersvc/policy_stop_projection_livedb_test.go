@@ -17,7 +17,7 @@ import (
 // Immutable receipt corruption is exercised by unit input seams; database tests
 // retain the trigger that prevents overwriting an accepted receipt.
 func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
-	for _, mode := range []string{"gated", "no_gate", "switch_off", "claim_commit_failure", "ack_commit_failure", "ack_switch_off", "terminal"} {
+	for _, mode := range []string{"gated", "no_gate", "ordinary_question", "completion_question", "switch_off", "claim_commit_failure", "ack_commit_failure", "ack_switch_off", "terminal"} {
 		t.Run(mode, func(t *testing.T) {
 			e := setupCodexLiveDB(t)
 			f := newCodexClaimFix(t, e, false)
@@ -57,6 +57,7 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 				t.Fatalf("progress: %v", err)
 			}
 			gated := mode == "gated"
+			var revisionID int64
 			if gated {
 				e.exec("UPDATE runs SET auto_approve=false WHERE id=$1", created.ID)
 				req := acceptanceGateRequest()
@@ -64,6 +65,23 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 				req.PlanMd = strPtr("# Unapproved candidate B")
 				req.Milestones = &[]Milestone{{ID: "b1", Title: "candidate"}}
 				g.mustPublish(created.ID, req, 1)
+				gate := mustRun(t, e, created.ID).GateRevision
+				revision, err := f.svc.SubmitInputWithOptions(e.ctx, f.userID, created.ID, "revise_plan", "revise candidate B", nil, SubmitInputOptions{ExpectedGateRevision: &gate})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if receipt, err := f.svc.AckInputs(e.ctx, w, created.ID, generation, []int64{revision.ID}); err != nil || !receipt.Active {
+					t.Fatalf("revision ACK: %+v %v", receipt, err)
+				}
+				revisionID = revision.ID
+				source := acceptanceSource(t, e, created.ID)
+				// This Go frame exercises the service writer, not the Node worker.
+				if err := f.svc.AppendMessagesForClaim(e.ctx, w, created.ID, []IncomingMessage{{
+					Seq: mustRun(t, e, created.ID).LastSeq + 1, Kind: "plan_revising",
+					Payload: revisionWriterPayload(t, source, revisionWriterHumanRef(revision.ID)),
+				}}, &generation); err != nil {
+					t.Fatal(err)
+				}
 			}
 			before := mustRun(t, e, created.ID)
 			hold := policyRequest()
@@ -81,6 +99,14 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			record := stopExecutionConfirm(t, e, g, created.ID, review)
+			if gated {
+				revision, err := e.q.GetPolicyStopRevisionInput(e.ctx, store.GetPolicyStopRevisionInputParams{RunID: created.ID, InputID: revisionID})
+				if err != nil || !revision.Disposition.Valid || revision.Disposition.String != "superseded_by_stop" ||
+					!revision.SettledAt.Valid || !revision.SettledAt.Time.Equal(record.AcceptedAt) ||
+					!revision.SupersededByStopInputID.Valid || revision.SupersededByStopInputID.Int64 != record.ScopeInputID || revision.AppliedAt.Valid {
+					t.Fatalf("owner Stop did not supersede pending revision: %+v %v", revision, err)
+				}
+			}
 			assembled := false
 			f.svc.claimHooks = &claimTestHooks{afterAssembly: func(_ context.Context, r store.Run, payload *ClaimPayload, err error) {
 				if err != nil || payload == nil || r.ID != created.ID {
@@ -121,6 +147,81 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 			if gated && (claim.PlanApproved || claim.ResumePhase != "awaiting_approval" || claim.PlanMd == nil ||
 				*claim.PlanMd != "# Unapproved candidate B" || len(claim.Milestones) != 1 || claim.Milestones[0].ID != "b1") {
 				t.Fatal("gated candidate replaced or approved")
+			}
+			if mode == "ordinary_question" || mode == "completion_question" {
+				// Compare the receipt, audit row, source, execution and completed
+				// work through every park/answer/resume operation.
+				snapshot := func() []byte {
+					r := mustRun(t, e, created.ID)
+					scope, err := e.q.GetPolicyStopScopeInput(e.ctx, store.GetPolicyStopScopeInputParams{RunID: created.ID, InputID: record.ScopeInputID})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if scope.Disposition.Valid || scope.SettledAt.Valid || scope.ConsumedAt.Valid ||
+						scope.ConsumedWorkerID.Valid || scope.ConsumedClaimGeneration.Valid || scope.AppliedAt.Valid ||
+						scope.IncludedAt.Valid || scope.InclusionReported {
+						t.Fatal("scope audit no longer pending and undelivered")
+					}
+					return mustStopJSON(t, []any{r.PolicyStopResolution, scope, r.PolicyRevisionSource,
+						r.ScopeCeiling, r.MilestonesFrozen, r.MilestonesCompleted, r.GateRevision, r.GatePresentedPayload})
+				}
+				saved := snapshot()
+				assertPreserved := func() {
+					t.Helper()
+					if !bytes.Equal(saved, snapshot()) {
+						t.Fatal("question flow changed accepted scope or evidence")
+					}
+				}
+				qid := "stop-resume-question"
+				park, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{
+					State: "awaiting_input", ClaimGeneration: &generation, OpenQuestionID: &qid,
+					CompletionQuestion: mode == "completion_question",
+				})
+				if err != nil || !park.Applied || park.PolicyStopExecution != nil {
+					t.Fatalf("question park: %+v %v", park, err)
+				}
+				parked := mustRun(t, e, created.ID)
+				if parked.Status != "awaiting_input" || !parked.OpenQuestionID.Valid || parked.OpenQuestionID.String != qid ||
+					parked.CompletionQuestionAt.Valid != (mode == "completion_question") {
+					t.Fatal("question park identity or completion marker lost")
+				}
+				assertPreserved()
+				refuseRunning := func(stage string) {
+					t.Helper()
+					ack, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{State: "running", ClaimGeneration: &generation})
+					// Baseline may reject preflight; either refusal must omit authority.
+					if ack.Applied || ack.PolicyStopExecution != nil {
+						t.Fatalf("%s running bypassed answer guard: %+v %v", stage, ack, err)
+					}
+					if mustRun(t, e, created.ID).Status != "awaiting_input" {
+						t.Fatalf("%s refusal changed park", stage)
+					}
+					assertPreserved()
+				}
+				refuseRunning("before_answer")
+				answer, err := f.svc.SubmitInput(e.ctx, f.userID, created.ID, "answer", answerBody(t, qid, "continue"), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				refuseRunning("before_ack")
+				if receipt, err := f.svc.AckInputs(e.ctx, w, created.ID, generation, []int64{answer.ID}); err != nil || !receipt.Active {
+					t.Fatalf("answer ACK: %+v %v", receipt, err)
+				}
+				refuseRunning("before_applied")
+				if receipt, err := f.svc.ApplyInputs(e.ctx, w, created.ID, generation, []int64{answer.ID}); err != nil || !receipt.Active {
+					t.Fatalf("answer APPLIED: %+v %v", receipt, err)
+				}
+				assertPreserved()
+				resume, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{State: "running", ClaimGeneration: &generation})
+				if err != nil || !resume.Applied || resume.PolicyStopExecution == nil || *resume.PolicyStopExecution != *claim.PolicyStopExecution {
+					t.Fatalf("answered resume refused or lost current-generation authority: %+v %v", resume, err)
+				}
+				resumed := mustRun(t, e, created.ID)
+				if resumed.Status != "running" || resumed.OpenQuestionID.Valid || resumed.CompletionQuestionAt.Valid {
+					t.Fatal("answered resume retained question park")
+				}
+				assertPreserved()
+				return
 			}
 			if mode == "ack_commit_failure" {
 				f.svc.SetTxBeginner(&revisionGateBeginner{TxBeginner: e.pool, point: "commit"})

@@ -107,6 +107,55 @@ func TestPolicyStopProjectionEvidenceAndNegotiation(t *testing.T) {
 	}
 }
 
+func TestPolicyStopQuestionEvidenceDoesNotIssueAuthority(t *testing.T) {
+	for _, noGate := range []bool{false, true} {
+		name := "gated"
+		if noGate {
+			name = "no_gate"
+		}
+		t.Run(name, func(t *testing.T) {
+			for _, mode := range []string{"current", "wrong_generation", "wrong_worker", "wrong_source", "unnegotiated"} {
+				t.Run(mode, func(t *testing.T) {
+					f := stopExecutionFixtureFor(t, "legacy", noGate)
+					f.run.Status = "awaiting_input"
+					f.worker.ProtocolCapabilities = []string{capability.ProviderPolicyHoldV1, capability.CredentialSwitchV1}
+					s := stopProjectionService()
+					generation := f.run.ClaimGeneration
+					switch mode {
+					case "wrong_generation":
+						generation--
+					case "wrong_worker":
+						f.worker.ID = uuid.New()
+					case "wrong_source":
+						f.run.PolicyLastSourceGeneration.Int64--
+					case "unnegotiated":
+						s.p.PolicyStopNegotiated = false
+					}
+					snapshot := func() []byte {
+						return mustStopJSON(t, []any{f.run, f.reader.scope, f.reader.inputs, f.reader.checks, f.reader.pending})
+					}
+					before := snapshot()
+					evidence, err := s.policyStopEvidenceLocked(context.Background(), f.reader, f.worker, f.run, generation, s.policyRevisionProjectionNegotiated(f.worker))
+					if mode == "current" {
+						if err != nil || evidence == nil || evidence.record.ResolutionID != f.record.ResolutionID {
+							t.Fatalf("parked evidence=%+v err=%v", evidence, err)
+						}
+					} else if err == nil || evidence != nil {
+						t.Fatalf("invalid parked evidence=%+v err=%v", evidence, err)
+					}
+					projection, err := s.policyStopProjectionLocked(context.Background(), f.reader, f.worker, f.run, generation, s.policyRevisionProjectionNegotiated(f.worker))
+					if err == nil || projection != nil {
+						t.Fatalf("parked projection=%+v err=%v", projection, err)
+					}
+					if !bytes.Equal(before, snapshot()) {
+						t.Fatal("evidence or projection mutated persisted data")
+					}
+				})
+			}
+		})
+	}
+}
+
 // The fake transaction supplies accepted validator evidence and valid API-key
 // credential authority. It models lock custody; SQL locking needs LiveDB coverage.
 type stopProjectionClaimTx struct {

@@ -51,7 +51,7 @@ func policyStopExecutionLocked(ctx context.Context, q policyStopExecutionReader,
 	}
 	if q == nil || (reflect.ValueOf(q).Kind() == reflect.Ptr && reflect.ValueOf(q).IsNil()) ||
 		r.ID == uuid.Nil || !policyEligible(r) || r.TargetRunID.Valid || r.ReviewTargetRunID.Valid || r.ThenFixOfRunID.Valid ||
-		r.PolicyRefusalCount <= 0 || !slices.Contains([]string{"claimed", "running", "awaiting_approval"}, r.Status) ||
+		r.PolicyRefusalCount <= 0 || !slices.Contains([]string{"claimed", "running", "awaiting_approval", "awaiting_input"}, r.Status) ||
 		generation <= 0 || r.ClaimGeneration != generation || r.ClaimReleasedAt.Valid ||
 		w.ID == uuid.Nil || w.UserID != r.UserID || !r.WorkerID.Valid || uuid.UUID(r.WorkerID.Bytes) != w.ID {
 		return bad()
