@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -296,8 +297,14 @@ func TestRetainedRecoveryOwnerActions(t *testing.T) {
 		for _, verb := range []string{"resume", "cancel"} {
 			for _, status := range []int{http.StatusOK, http.StatusNotFound, http.StatusConflict} {
 				t.Run(fmt.Sprintf("%s/%s/%d", timing, verb, status), func(t *testing.T) {
-					posts := 0
+					gets, posts := 0, 0
 					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+						if req.Method == http.MethodGet && req.URL.Path == "/api/runs/r1" {
+							gets++
+							w.Header().Set("Content-Type", "application/json")
+							_ = json.NewEncoder(w).Encode(map[string]any{"run": retainedRecoveryRun(timing)})
+							return
+						}
 						want := "/api/runs/r1/resume-now"
 						if verb == "cancel" {
 							want = "/api/runs/r1/inputs"
@@ -312,6 +319,12 @@ func TestRetainedRecoveryOwnerActions(t *testing.T) {
 							var body map[string]any
 							if err := json.NewDecoder(req.Body).Decode(&body); err != nil || body["kind"] != "cancel" {
 								t.Errorf("cancel body %+v: %v", body, err)
+							}
+						} else {
+							// Ordinary recovery grants no fresh session, policy action, or guidance.
+							body, err := io.ReadAll(req.Body)
+							if err != nil || len(body) != 0 || req.Header.Get("If-Match") != "" {
+								t.Errorf("ordinary resume body %q If-Match %q: %v", body, req.Header.Get("If-Match"), err)
 							}
 						}
 						w.Header().Set("Content-Type", "application/json")
@@ -331,8 +344,12 @@ func TestRetainedRecoveryOwnerActions(t *testing.T) {
 					defer srv.Close()
 					_, errout, code := runCLI(t, httpEnv(srv), "run", verb, "r1")
 					wantCode := map[int]int{http.StatusOK: 0, http.StatusNotFound: uzicli.ExitNotFound, http.StatusConflict: uzicli.ExitConflict}[status]
-					if code != wantCode || posts != 1 {
-						t.Fatalf("exit %d want %d posts %d: %s", code, wantCode, posts, errout)
+					wantGets := 0
+					if verb == "resume" {
+						wantGets = 1
+					}
+					if code != wantCode || gets != wantGets || posts != 1 {
+						t.Fatalf("exit %d want %d gets %d want %d posts %d: %s", code, wantCode, gets, wantGets, posts, errout)
 					}
 					fc := &uzicli.FakeClient{}
 					m := tuiTestModel(t, fc, "r1")
