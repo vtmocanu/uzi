@@ -3,6 +3,7 @@ package workersvc
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // Public creation supplies source coverage. Claim and reports use the same
@@ -92,6 +94,53 @@ func TestPolicyClaimAckHumanApprovalLiveDB(t *testing.T) {
 	approved, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{State: "running", ClaimGeneration: &gen})
 	if err != nil || !approved.Applied || approved.PlanApproved == nil || !*approved.PlanApproved || mustRun(t, e, created.ID).PolicyRefusalCount != 1 {
 		t.Fatalf("current human approval: %+v %v", approved, err)
+	}
+
+	// An applied G1 approval remains true in GetRunClaimContext for this
+	// no-cross-check run, but must not approve a newly published G2 candidate.
+	req = gateReq(&gen, uid())
+	plan := "A newer plan requiring its own human approval"
+	req.PlanMd, req.RequiredCapabilities = &plan, &[]string{}
+	newer, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, req)
+	if err != nil || !newer.Applied || newer.GateRevision != candidate.GateRevision+1 {
+		t.Fatalf("newer candidate: %+v %v", newer, err)
+	}
+	current = mustRun(t, e, created.ID)
+	if current.Status != "awaiting_approval" || !current.PlanMd.Valid || current.PlanMd.String != plan ||
+		current.PolicyRefusalCount != 1 || current.AutoApprove || current.PlanCrossCheckRequired || current.PlanSource != "agent" ||
+		!current.GatePresentationID.Valid || current.GatePresentationID.Bytes != *req.PresentationID {
+		t.Fatal("G2 did not persist the new human-only candidate with refusal count 1")
+	}
+	source = assertRevisionGateBound(t, e, created.ID, newer.GateRevision)
+	var ackGate apitypes.PolicyStopGateContext
+	if source.Gate == nil || source.PrimaryRevision != nil || len(source.AssociatedCrossChecks) != 0 ||
+		json.Unmarshal(newer.PolicyRevisionGate, &ackGate) != nil || ackGate != *source.Gate {
+		t.Fatalf("G2 ACK/source mismatch: gate=%s source=%s", newer.PolicyRevisionGate, current.PolicyRevisionSource)
+	}
+	inputs, err := e.q.ListRunInputsForRun(e.ctx, store.ListRunInputsForRunParams{RunID: created.ID, Lim: 2})
+	if err != nil || len(inputs) != 1 {
+		t.Fatalf("approval inventory: count=%d err=%v", len(inputs), err)
+	}
+	receipt := inputs[0]
+	if receipt.ID != approval.ID || receipt.Kind != "approve_plan" || !receipt.AppliedAt.Valid ||
+		!receipt.ConsumedAt.Valid || !receipt.ConsumedWorkerID.Valid || receipt.ConsumedWorkerID.Bytes != w.ID ||
+		!receipt.ConsumedClaimGeneration.Valid || receipt.ConsumedClaimGeneration.Int64 != gen ||
+		!receipt.GateBinding.Valid || receipt.GateBinding.String != "bound" ||
+		!receipt.GateRevision.Valid || receipt.GateRevision.Int64 != candidate.GateRevision {
+		t.Fatal("the sole persisted approval must be the applied G1 receipt")
+	}
+	currentApproved, err := e.q.HasPolicyCurrentGateApproval(e.ctx, store.HasPolicyCurrentGateApprovalParams{
+		RunID: created.ID, GateRevision: newer.GateRevision,
+	})
+	if err != nil || currentApproved {
+		t.Fatalf("G2 unexpectedly has an applied approval: approved=%v err=%v", currentApproved, err)
+	}
+	legacy, err := e.q.GetRunClaimContext(e.ctx, created.ID)
+	if err != nil || !legacy.HumanPlanApproved {
+		t.Fatalf("old applied approval must keep legacy human approval true: approved=%v err=%v", legacy.HumanPlanApproved, err)
+	}
+	if newer.PlanApproved == nil || *newer.PlanApproved {
+		t.Fatalf("G1 approval must not approve G2 in the state ACK: %+v", newer)
 	}
 }
 
