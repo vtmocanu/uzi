@@ -199,6 +199,7 @@ func TestSetRunCredentialDisabledHoldReassignmentLiveDB(t *testing.T) {
 func TestSetRunCredentialLimitWaitAutoClaimExcludesDeadTokenLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, autoParams())
+	svc.SetVault(env.vlt)
 	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
 	svc.SetTxBeginner(env.pool)
 	now := time.Now().UTC()

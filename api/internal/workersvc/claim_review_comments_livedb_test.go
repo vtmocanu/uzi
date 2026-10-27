@@ -38,6 +38,7 @@ func TestAssembleClaimReplaysOnlyAssessedReviewSnapshotLiveDB(t *testing.T) {
 	userID, workerID, repoID := seedResumeClaimInfra(t, env)
 	runID, _ := seedClaimedMRRework(t, env, userID, workerID, repoID)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	wkr := store.Worker{ID: workerID, UserID: userID}
 
 	assemble := func(stored string) *ReviewCommentsSnapshot {
@@ -106,6 +107,7 @@ func TestLegacyReviewSnapshotWithReusableContextFailsClaimLiveDB(t *testing.T) {
 			userID, workerID, repoID := seedResumeClaimInfra(t, env)
 			runID, sourceID := seedClaimedMRRework(t, env, userID, workerID, repoID)
 			svc := New(env.q, env.box, testParams())
+			svc.SetVault(env.vlt)
 			svc.SetTxBeginner(env.pool)
 			env.exec(`UPDATE runs SET review_comments = $2::jsonb, auto_approve = true, plan_source = 'agent', `+
 				tc.set+` WHERE id = $1`, runID, legacy)

@@ -22,6 +22,7 @@ func TestM2IssueCreateClaimPersistedDowngradeLiveDB(t *testing.T) {
 	env.exec(`INSERT INTO issues(id,repo_id,forge_issue_iid,title,state,labels,web_url,has_prd_link,forge_updated_at,synced_at)
  VALUES($1,$2,4,'cached stale title','opened','["uzi"]','https://forge.e2e/i',false,now(),now())`, uuid.New(), repo)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
 	svc.SetForges(m2Builder{&m2Forge{disposition: forge.AuthorNotEligible, comments: []forge.IssueComment{{AuthorForgeUserID: 3, Body: "WITHHELD_RAW_CREATE"}, {AuthorForgeUserID: 4, Body: "UNKNOWN_RAW_CREATE"}}}})
 	run, err := svc.CreateScheduledAutopilotRun(env.ctx, user, repo, 4, "raw argument", nil, nil, nil, false, nil, nil)

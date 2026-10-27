@@ -13,6 +13,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // TestRecoveryWaitLiveDB exercises the transient-recovery park (issue #1197) end to end
@@ -62,6 +63,8 @@ func TestRecoveryWaitLiveDB(t *testing.T) {
 	box := newBox(t)
 	q := store.New(pool)
 	svc := New(q, box, testParams())
+	svc.SetVault(vault.NewPostgres(box, pool))
+	svc.SetTxBeginner(pool)
 
 	exec := func(sql string, args ...any) {
 		t.Helper()
@@ -79,7 +82,7 @@ func TestRecoveryWaitLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seal anthropic token: %v", err)
 	}
-	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userID, fmt.Sprintf("rw-%s@e2e", userID))
+	exec(`INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`, userID, fmt.Sprintf("rw-%s@e2e", userID))
 	exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 	      VALUES ($1, $2, 'github', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, sealedPAT)
 	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)

@@ -38,6 +38,7 @@ func setupJobLiveDB(t *testing.T, cap int) jobEnv {
 	params := testParams()
 	params.ProductSkillsEnabled = true // the product-skills allowlist is non-empty on this instance
 	svc := New(env.q, env.box, params)
+	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
 	if cap > 0 {
 		svc.SetHealthSettings(jobCapFake{cap: cap})

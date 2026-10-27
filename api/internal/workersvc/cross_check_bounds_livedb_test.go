@@ -92,6 +92,7 @@ func TestCheckerAssemblyRefusalFinishesExactClaimLiveDB(t *testing.T) {
 			}
 			worker := checkerBoundsWorker(f)
 			svc := New(env.q, env.box, testParams())
+			svc.SetVault(env.vlt)
 			svc.SetTxBeginner(env.pool)
 			// Missing candidates and oversized stored context are refused before
 			// minting; encoded-envelope bounds still exercise post-mint recovery.
@@ -130,6 +131,7 @@ func TestCheckerStoredAssemblyContextBoundsLiveDB(t *testing.T) {
 	env.exec("UPDATE user_secrets SET is_default=true WHERE id=$1", f.aliasID)
 	original := mustRun(t, env, f.runID)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
 	worker := checkerBoundsWorker(f)
 	// Ordinary oversized issue context still passes the real assembly seam.

@@ -97,6 +97,7 @@ func TestAssembleClaimResumePhaseAwaitingApprovalLiveDB(t *testing.T) {
 	}
 
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	wkr := store.Worker{ID: workerID, UserID: userID}
 	payload, err := svc.assembleClaim(env.ctx, wkr, run)
 	if err != nil {
@@ -177,6 +178,7 @@ func TestAssembleClaimResumePhaseImplementingLiveDB(t *testing.T) {
 	}
 
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	wkr := store.Worker{ID: workerID, UserID: userID}
 	payload, err := svc.assembleClaim(env.ctx, wkr, run)
 	if err != nil {

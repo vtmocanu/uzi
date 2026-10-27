@@ -44,6 +44,7 @@ func TestClaimRecordsCredentialEpochLiveDB(t *testing.T) {
 	          VALUES ($1, $2, $3, 'issue', 101, 't', 'd', 'queued')`, runID, userID, repoID)
 
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
 	svc.SetTxBeginner(env.pool)
 	wkr := store.Worker{ID: workerID, UserID: userID, Name: "worker-alpha", Status: "online"}

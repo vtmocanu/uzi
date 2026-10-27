@@ -37,6 +37,7 @@ func setupPrDescLive(t *testing.T) prDescLive {
 	runID := env.seedCodexRun(t, userID, workerID, repoID)
 	env.exec(`UPDATE runs SET claim_generation = 1 WHERE id = $1`, runID)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
 	return prDescLive{env: env, svc: svc, wkr: store.Worker{ID: workerID, UserID: userID}, runID: runID, repo: repoID}
 }

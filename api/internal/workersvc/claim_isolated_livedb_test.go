@@ -56,6 +56,7 @@ func newIsoFix(t *testing.T) *isoFix {
 		_, _ = env.pool.Exec(env.ctx, `DELETE FROM egress_profiles WHERE id = $1`, f.profile)
 	})
 	f.svc = New(env.q, env.box, testParams())
+	f.svc.SetVault(env.vlt)
 	f.svc.SetTxBeginner(env.pool)
 	f.wkr = store.Worker{ID: f.workerID, UserID: f.userID, Name: "worker-iso", Status: "online"}
 	return f

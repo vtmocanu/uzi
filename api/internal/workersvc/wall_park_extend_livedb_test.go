@@ -59,6 +59,7 @@ func newWallParkExtendFixture(t *testing.T, capSeconds int) *wallParkExtendFixtu
 	env := setupCodexLiveDB(t)
 	userID, workerID, repoID := env.seedCodexInfra(t)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	svc.SetHealthSettings(fakeHealthSettings{enabled: true, runExtensionCap: capSeconds})
 	obs := &recordingWallParkObserver{}
 	svc.SetBroadcaster(obs)

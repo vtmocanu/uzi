@@ -36,7 +36,7 @@ type reevalOwner struct {
 func seedReevalOwner(t *testing.T, env codexTestEnv, bindMode string, altEligible bool) reevalOwner {
 	t.Helper()
 	userID := uuid.New()
-	env.exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+	env.exec(`INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`,
 		userID, fmt.Sprintf("reeval-%s@e2e", userID))
 	connID, repoID := uuid.New(), uuid.New()
 	env.exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)

@@ -165,6 +165,7 @@ func TestCompletionNonClosingClaimRestorationLiveDB(t *testing.T) {
 	id := seedUnassignedRun(t, env, userID, repoID, 0)
 	env.exec(`UPDATE runs SET completion_contract_version=1,contract_revision=1,completion_contract=$2,milestones_frozen=$3 WHERE id=$1`, id, contractJSON(t, "m1"), frozenJSON(t, "m1"))
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
 	svc.SetBackground(func(func()) {})
 	w := wkrRow(t, env, workerID)
