@@ -56,8 +56,8 @@ Register the first account — it becomes admin automatically. Subsequent regist
 ## Codex account admission upgrades
 
 Deploy the **API first, then workers**. The API applies the additive
-`00360_codex_account_admission_throttle.sql` and
-`00361_codex_admission_projection.sql` schema before serving. The supported
+`00364_codex_account_admission_throttle.sql` and
+`00365_codex_admission_projection.sql` schema before serving. The supported
 Helm API deployment remains a singleton with `Recreate`
 ([deployment template](../deploy/chart/templates/api-deployment.yaml));
 mixed old/new API replicas outside that topology have no enforcement promise.

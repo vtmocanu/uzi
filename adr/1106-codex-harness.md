@@ -1042,8 +1042,8 @@ controls, with rate winning a tie.
 A common recovery episode gives each run a stable spread in 0..W, where W
 is the smaller of the opening duration and 60 seconds. Recovery floors prevent
 a new episode from shortening prior eligibility. Admission is unlimited after
-the finite recovery window. Migration 00360 persists transitions/eligibility;
-00361 projects active queued admission. Receipt and overload-vote ledgers
+the finite recovery window. Migration 00364 persists transitions/eligibility;
+00365 projects active queued admission. Receipt and overload-vote ledgers
 are each bounded at 256; receipts retain at least the 60-second retry horizon.
 Capacity overflow refuses the observation rather than manufacturing evidence.
 
