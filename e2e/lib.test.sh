@@ -1718,6 +1718,7 @@ for mode in lost-response empty-response not-committed preexisting lookup-error 
   else echo "FAIL: manual registration cleanup $mode result=$got sql=[$calls] http=[$http] output=[$output]"; fi
 done
 
+bash "$ROOT/e2e/vault-modes.test.sh"
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 node --test "$ROOT/e2e/recovery-record-projection.test.mjs"
 echo "cases=$cases passed=$passed"

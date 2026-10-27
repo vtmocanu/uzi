@@ -22,6 +22,43 @@ First run builds the `api`/`web`/`agent` images plus the tiny `forge-fake` image
 (a few minutes); later runs reuse the layer cache. On success it prints
 `All E2E checks passed.` and tears everything down.
 
+Fresh startup first verifies the default optional policy: the seed admin is Off
+(`mode=unprotected`, `unlocked=false`, `exists=false`) and its token uses
+`master_aad`. Login does not enroll it. The harness then writes
+`settings.vault_policy=required` through the authenticated admin API, checks that
+the existing admin stays Off, and explicitly enables it with the seed password.
+Enable converts its secrets to DEK sealing and unlocks it; no extra unlock is needed.
+There is no policy environment or Compose override.
+
+Focused vault acceptance (lead runs this after committing; not a hermetic check):
+
+```sh
+root="$(git rev-parse --show-toplevel)"
+mkdir -p "$root/.uzi/scratch/tmp"
+TMPDIR="$root/.uzi/scratch/tmp" \
+UZI_E2E_COMPOSE_PROJECT="vlt3507-$(date +%s)-$$" \
+E2E_RUN_DIR="$root/.uzi/scratch/vlt3507-$(date +%s)-$$" \
+UZI_E2E_NO_RECLAIM=1 KEEP_RUNDIR=1 E2E_STRICT_LEAKS=1 \
+E2E_ONLY='steer-queue-delivery,mr-close-watcher,autopilot-lifecycle,autopilot-carry-item,vault' \
+./e2e/run-e2e.sh
+```
+
+Use a fresh run directory/project per attempt and the Docker/tool prerequisites
+above; this command builds images and executes the stack. Critical phases 00, 13
+and 15 run automatically. Phase34 needs `JAR2` from phase30; phase30's collision
+check needs phase29's retained `owner-alice` mapping; phase29 needs phase27's fast
+poll/reconcile cadence. Phase27 consumes `IID RUN MR_IID` from critical phase15.
+The driver does not select these noncritical prerequisites automatically.
+
+Phase34 retains protected lock → queued → unlock → claim, protected seed boot
+unlock, normal-user restart lock, and legacy master → DEK lazy rewrap. It also
+disables the admin under optional policy, restores required policy, restarts with
+seed env retained, and proves Off stays wrapper-free, `master_aad`-sealed and
+runnable without login/unlock. Both admin rate-limit DTO families must report Off,
+not locked. Its Off run reaches the plan gate and completes. Success restores
+required policy and both users protected/unlocked; failure attempts independent
+bounded restoration and cancellation without hiding failures or strict-lane leaks.
+
 Knobs (env vars):
 
 - `KEEP_RUNDIR=1` — keep the per-run scratch dir (certs, env-file, the local git
@@ -216,7 +253,7 @@ headers, not the rows.
 | 31 | ci-status-fix | gitlab | no | PRD #6: CI status sync + Fix CI + the verification stamp |
 | 32 | agent-mr-fix-crosskind | gitlab | no | PRD #6: agent-MR same-branch fix + cross-kind race |
 | 33 | uzi-eligibility-gate | gitlab | no | PRD #764: uzi run-eligibility gate (no PRD link required + Promote) |
-| 34 | vault | gitlab | no | PRD #32: per-user vault (dek sealing, claim gating, restart lock, lazy rewrap) |
+| 34 | vault | gitlab | no | Vault modes: protected/Off restart claims, DEK sealing and legacy rewrap |
 | 35 | judge-funnel | gitlab | no | PRD #46: run judge (stub) — funnel enqueue -> claim -> review -> durable review via the judge API |
 | 36 | file-forge-issue | gitlab | no | PRD #68: file a forge issue from a judge recommendation |
 | 37 | printed-instructions-menu | gitlab | no | PRD #98 M8c: printed instructions EXECUTED verbatim from the emitting command's own output |

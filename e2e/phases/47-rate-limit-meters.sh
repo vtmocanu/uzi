@@ -18,7 +18,8 @@
 # handlers over httptest against a fake DBTX: the FULL status union on /me
 # (no_token / unavailable / ok, incl. the "no key leaks" checks), stale both ways
 # (3x-interval and the poller-disabled always-stale rule), the admin list shape (every
-# user appears, ok + no_token + unavailable, vault_locked), the member-403 through the
+# user appears, ok + no_token + unavailable, vault_mode plus mode-aware vault_locked),
+# the member-403 through the
 # real RequireAdmin gate, and the D3b token-delete cascade. What no lower layer can show
 # is that a row written to the REAL schema by the REAL poller shape reaches the REAL
 # endpoint, so one seeded gauge row → /me remains.

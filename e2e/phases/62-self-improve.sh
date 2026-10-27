@@ -22,10 +22,11 @@
 # On the run-now path the vault does NOT gate: the run-now HTTP handler builds its
 # scheduler with a NIL vault (api/internal/handler/handler.go NewHandler: schedsvc.New(…,
 # nil, nil, 0, …), "treated as always unlocked"), so fireSelfImprove's
-# `if e.vault != nil && !e.vault.Unlocked(...)` vault_locked branch is UNREACHABLE via
+# `if e.vault != nil && e.vault.RequiresUnlock(...)` vault_locked branch is UNREACHABLE via
 # run-now. So this phase does NOT unlock the vault — that would be a vacuous control. The
-# vault_locked skip is only reachable through the BACKGROUND (non-nil-vault) scheduler and
-# belongs to a unit test, not this wire phase. This phase asserts a Started, not a Skip;
+# vault_locked skip belongs to protected owners in the BACKGROUND (non-nil-vault)
+# scheduler; Off owners remain runnable even under required policy. This phase
+# asserts a Started, not a Skip;
 # a skip reason (e.g. self_improve_mr_cap_reached) would be the recordable blocker.
 #
 # NOTE (SC9 / stretch): live behaviour is validated in CI; the full suite cannot run in

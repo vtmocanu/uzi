@@ -251,6 +251,22 @@ wait_http
 pass "control plane up; boot seed provisioned admin + forge + repo"
 
 login
+# Fresh optional policy seeds an Off account; login must not enroll it.
+apiget /api/vault/status | jq -e '.mode == "unprotected" and .policy == "optional" and .unlocked == false and .exists == false' >/dev/null \
+  || fail "fresh seed admin must remain Off after login under optional policy"
+[ "$(db_psql "SELECT s.sealed_with FROM user_secrets s JOIN users u ON u.id=s.user_id WHERE u.email='$ADMIN_EMAIL' AND s.kind='anthropic_token' AND s.is_default")" = master_aad ] \
+  || fail "fresh Off seed token must use master_aad"
+apiput /api/admin/settings '{"settings":{"vault_policy":"required"}}' >/dev/null
+apiget /api/vault/status | jq -e '.mode == "unprotected" and .policy == "required" and .unlocked == false and .exists == false' >/dev/null \
+  || fail "required policy must leave the existing Off admin unchanged"
+apipost /api/vault/enable "{\"password\":\"$ADMIN_PASS\"}" | jq -e '.mode == "protected" and (.rotation_advice | length > 0)' >/dev/null \
+  || fail "explicit seed enrollment failed"
+# Enable already unlocks: do not repeat the password derivation.
+apiget /api/vault/status | jq -e '.mode == "protected" and .policy == "required" and .unlocked == true and .exists == true' >/dev/null \
+  || fail "explicitly enabled seed admin must be protected and unlocked with a wrapper"
+[ "$(db_psql "SELECT s.sealed_with FROM user_secrets s JOIN users u ON u.id=s.user_id WHERE u.email='$ADMIN_EMAIL' AND s.kind='anthropic_token' AND s.is_default")" = dek ] \
+  || fail "seed enrollment must convert the token to DEK sealing"
+pass "fresh optional/Off seed verified; authenticated required policy + explicit enrollment ready"
 REPO_ID="$(apiget /api/repos | jq -r '.repos[0].id // empty')"
 [ -n "$REPO_ID" ] || fail "no enabled repo after seed (expected group/repo)"
 pass "admin logged in; repo $REPO_ID enabled"
