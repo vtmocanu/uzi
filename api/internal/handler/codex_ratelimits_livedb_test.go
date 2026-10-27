@@ -86,7 +86,7 @@ func TestCodexRateLimitsReadSurfaceLiveDB(t *testing.T) {
 		t.Helper()
 		id := uuid.New()
 		email := "codexrl-" + uuid.NewString() + "@example.test"
-		mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, id, email)
+		mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`, id, email)
 		return id, email
 	}
 
@@ -176,7 +176,7 @@ func TestCodexRateLimitsReadSurfaceLiveDB(t *testing.T) {
 	acctB := seedAccount(t, userB, []string{"userb-sub"}, true)
 	seedRL(t, userB, acctB, buckets(5), now, now)
 
-	h := &Handler{pool: pool, q: q, box: box, cfg: config.Config{CodexUsagePollInterval: 5 * time.Minute}}
+	h := &Handler{pool: pool, q: q, box: box, vault: vault.NewPostgres(box, pool), cfg: config.Config{CodexUsagePollInterval: 5 * time.Minute}}
 
 	decodeAccounts := func(t *testing.T, rec *httptest.ResponseRecorder) []codexAccountJSON {
 		t.Helper()
@@ -341,11 +341,28 @@ func TestCodexRateLimitsReadSurfaceLiveDB(t *testing.T) {
 			t.Fatalf("admin: %s has %d accounts, want 1", emailB, byEmail[emailB])
 		}
 		if locked[emailA] {
-			t.Errorf("%s vault_locked = true with no vault wired", emailA)
+			t.Errorf("%s vault_locked = true for an explicitly unprotected user", emailA)
+		}
+	})
+
+	t.Run("missing core fails closed", func(t *testing.T) {
+		hMissing := &Handler{pool: pool, q: q, box: box, cfg: config.Config{CodexUsagePollInterval: 5 * time.Minute}}
+		rec := httptest.NewRecorder()
+		hMissing.SelfCodexRateLimits(rec, codexRLReq(userA, false))
+		accounts := decodeAccounts(t, rec)
+		if len(accounts) != 6 {
+			t.Fatalf("missing core accounts=%d", len(accounts))
+		}
+		for _, a := range accounts {
+			if a.Status != codexRateLimitStatusVaultLocked {
+				t.Fatalf("missing core account %v status=%s", a.Aliases, a.Status)
+			}
 		}
 	})
 
 	t.Run("vault locked overrides all", func(t *testing.T) {
+		mustExecT(ctx, t, pool, "UPDATE users SET vault_mode='protected' WHERE id=$1", userA)
+		defer mustExecT(ctx, t, pool, "UPDATE users SET vault_mode='unprotected' WHERE id=$1", userA)
 		hLocked := &Handler{pool: pool, q: q, box: box, cfg: config.Config{CodexUsagePollInterval: 5 * time.Minute}}
 		hLocked.vault = vault.NewPostgres(box, pool) // protected durable state, empty cache
 		rec := httptest.NewRecorder()

@@ -245,7 +245,7 @@ func TestVaultPassphraseCreateOnly(t *testing.T) {
 	h := &Handler{vault: testVault(t)}
 	uid := uuid.New()
 
-	if h.vaultExists(context.Background(), uid) {
+	if h.vaultStatus(context.Background(), store.User{ID: uid}).Exists {
 		t.Fatal("vault should not exist before create")
 	}
 	rec := postPassphrase(h, uid, "a-strong-vault-passphrase")
@@ -255,8 +255,8 @@ func TestVaultPassphraseCreateOnly(t *testing.T) {
 	if !statusUnlocked(t, h, uid) {
 		t.Error("vault should be unlocked immediately after passphrase create")
 	}
-	if !h.vaultExists(context.Background(), uid) {
-		t.Error("vaultExists should be true after create")
+	if !h.vaultStatus(context.Background(), store.User{ID: uid}).Exists {
+		t.Error("vault status should report exists after create")
 	}
 
 	// Create-only: a second attempt (even with a different passphrase) is a 409.
@@ -276,7 +276,7 @@ func TestVaultPassphraseMinLength(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("code = %d, want 400", rec.Code)
 	}
-	if h.vaultExists(context.Background(), uid) {
+	if h.vaultStatus(context.Background(), store.User{ID: uid}).Exists {
 		t.Error("a rejected short passphrase must not create a vault")
 	}
 }
@@ -343,7 +343,7 @@ func TestVaultPassphraseRejectsPasswordUser(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("code = %d, want 409 for a password account; body=%s", rec.Code, rec.Body.String())
 	}
-	if h.vaultExists(context.Background(), uid) {
+	if h.vaultStatus(context.Background(), store.User{ID: uid}).Exists {
 		t.Error("a password user's passphrase attempt must not create a vault")
 	}
 }

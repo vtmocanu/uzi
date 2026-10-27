@@ -71,7 +71,7 @@ func (h *Handler) SelfCodexRateLimits(w http.ResponseWriter, r *http.Request) {
 	// The caller's live vault-lock state, looked up ONCE (not per account): a locked vault
 	// means the poller cannot read the login, so every one of this user's accounts is
 	// vault_locked.
-	vaultLocked := !h.vaultUnlocked(user.ID)
+	vaultLocked := h.vault.RequiresUnlock(r.Context(), user.ID)
 	accounts := make([]apitypes.CodexAccountRateLimitDTO, 0, len(rows))
 	for _, row := range rows {
 		accounts = append(accounts, h.codexAccountDTO(
@@ -113,7 +113,7 @@ func (h *Handler) AdminCodexRateLimits(w http.ResponseWriter, r *http.Request) {
 				ID:          row.UserID.String(),
 				Email:       row.Email,
 				Name:        row.DisplayName.String, // "" when the user has no display name
-				VaultLocked: !h.vaultUnlocked(row.UserID),
+				VaultLocked: h.vault.RequiresUnlock(r.Context(), row.UserID),
 				Accounts:    []apitypes.CodexAccountRateLimitDTO{},
 			})
 		}

@@ -47,6 +47,8 @@ func vaultRecoveryHandler(t *testing.T, e *recoveryEnv, createVault bool) (*Hand
 	h := e.handler()
 	h.vault = vault.NewPostgres(e.box, e.pool)
 	h.wsvc.SetVault(h.vault)
+	// Execute requested credential work deterministically before fixture cleanup.
+	h.wsvc.SetBackground(func(fn func()) { fn() })
 	poker := &fakeCodexPoker{}
 	h.SetCodexUsagePoker(poker)
 	events := &vaultRecoveryEvents{states: map[uuid.UUID]string{}, notes: map[uuid.UUID]string{}}
@@ -132,8 +134,45 @@ func assertVaultRecoveryPromoted(t *testing.T, before, after map[string]any, low
 
 // Removing the successful VaultUnlock trigger must fail this named endpoint test.
 func TestVaultUnlockPromotesRecoveryWaitRunsLiveDB(t *testing.T) {
+	testVaultReadyPromotesRecoveryWaitRuns(t, false)
+}
+
+func TestVaultDisablePromotesRecoveryWaitRunsLiveDB(t *testing.T) {
+	testVaultReadyPromotesRecoveryWaitRuns(t, true)
+}
+
+func testVaultReadyPromotesRecoveryWaitRuns(t *testing.T, disable bool) {
 	e := newRecoveryEnv(t)
 	h, poker, events := vaultRecoveryHandler(t, e, true)
+	credentialPasses := 0
+	h.wsvc.SetBackground(func(fn func()) {
+		credentialPasses++
+		fn()
+	})
+	wantCode := http.StatusNoContent
+	action := func() *httptest.ResponseRecorder {
+		return vaultRecoveryUnlock(h, e.ctx, e.user, recoveryUnlockPassword)
+	}
+	if disable {
+		var previous string
+		err := e.pool.QueryRow(e.ctx, "SELECT value FROM app_settings WHERE key='vault_policy'").Scan(&previous)
+		if err != nil && err != pgx.ErrNoRows {
+			t.Fatal(err)
+		}
+		existed := err == nil
+		t.Cleanup(func() {
+			if existed {
+				mustExecT(e.ctx, t, e.pool, "INSERT INTO app_settings (key,value) VALUES ('vault_policy',$1) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", previous)
+			} else {
+				mustExecT(e.ctx, t, e.pool, "DELETE FROM app_settings WHERE key='vault_policy'")
+			}
+		})
+		mustExecT(e.ctx, t, e.pool, "INSERT INTO app_settings (key,value) VALUES ('vault_policy','optional') ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value")
+		wantCode = http.StatusOK
+		action = func() *httptest.ResponseRecorder {
+			return toggleRequest(h, e.user, "disable", "")
+		}
+	}
 	foreign := uuid.New()
 	mustExecT(e.ctx, t, e.pool, "INSERT INTO users (id,email,password_hash) VALUES ($1,$2,'x')", foreign, foreign.String()+"@vault-recovery.test")
 	future := time.Now().Add(24 * time.Hour)
@@ -152,12 +191,22 @@ func TestVaultUnlockPromotesRecoveryWaitRunsLiveDB(t *testing.T) {
 	for _, id := range append(eligible, untouched...) {
 		before[id] = vaultRecoveryRow(t, e, id)
 	}
+	if disable {
+		// The runs were parked while protected and locked. Model a successful core
+		// unlock whose handler promotion was interrupted, then disable protection.
+		if err := h.vault.UnlockExisting(e.ctx, e.user, recoveryUnlockPassword); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var lower time.Time
 	if err := e.pool.QueryRow(e.ctx, "SELECT clock_timestamp()").Scan(&lower); err != nil {
 		t.Fatal(err)
 	}
-	rec := vaultRecoveryUnlock(h, e.ctx, e.user, recoveryUnlockPassword)
-	if rec.Code != http.StatusNoContent || poker.count(e.user) != 1 {
+	rec := action()
+	if credentialPasses != 1 {
+		t.Fatalf("credential wake requests=%d want=1", credentialPasses)
+	}
+	if rec.Code != wantCode || poker.count(e.user) != 1 {
 		t.Fatalf("unlock=%d body=%s poker=%d", rec.Code, rec.Body.String(), poker.count(e.user))
 	}
 	var upper time.Time
@@ -183,8 +232,11 @@ func TestVaultUnlockPromotesRecoveryWaitRunsLiveDB(t *testing.T) {
 	for _, id := range eligible {
 		afterFirst[id] = vaultRecoveryRow(t, e, id)
 	}
-	if rec := vaultRecoveryUnlock(h, e.ctx, e.user, recoveryUnlockPassword); rec.Code != http.StatusNoContent || poker.count(e.user) != 2 {
+	if rec := action(); rec.Code != wantCode || poker.count(e.user) != 2 {
 		t.Fatalf("repeat unlock=%d poker=%d", rec.Code, poker.count(e.user))
+	}
+	if credentialPasses != 2 {
+		t.Fatalf("repeat credential wake requests=%d want=2", credentialPasses)
 	}
 	for _, id := range eligible {
 		if !reflect.DeepEqual(afterFirst[id], vaultRecoveryRow(t, e, id)) {

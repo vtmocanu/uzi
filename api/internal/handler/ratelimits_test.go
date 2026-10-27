@@ -18,6 +18,7 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // fakeRLDB is a store.DBTX answering the rate-limit read queries from fixed
@@ -338,8 +339,8 @@ func TestAdminRateLimitsGroupsByUserThenToken(t *testing.T) {
 	byEmail := map[string]int{}
 	for _, u := range body.Users {
 		byEmail[u.Email] = len(u.Tokens)
-		if u.VaultLocked {
-			t.Errorf("%s vault_locked = true with no vault wired", u.Email)
+		if !u.VaultLocked {
+			t.Errorf("%s vault_locked = false with no vault wired; must fail closed", u.Email)
 		}
 	}
 	if byEmail["a@x"] != 2 {
@@ -401,3 +402,63 @@ func TestAdminRateLimitsVaultLocked(t *testing.T) {
 // TestRateLimitsPerTokenLiveDB (real Postgres); there is nothing left to assert with
 // a fake DBTX here, and the former TestDeleteTokenDeletesRateLimits was removed
 // rather than left asserting a call the code no longer makes.
+
+// A failed durable lookup must not trust even a still-present cached DEK.
+type rateLimitFailedVaultState struct{ *memVaultQ }
+
+func (m *rateLimitFailedVaultState) GetUserVaultState(context.Context, uuid.UUID) (store.GetUserVaultStateRow, error) {
+	return store.GetUserVaultStateRow{}, context.DeadlineExceeded
+}
+
+func TestAdminRateLimitsModeAwareGate(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode                          string
+		unlock, failed, missing, wantLocked bool
+	}{
+		{name: "off", mode: store.VaultModeUnprotected},
+		{name: "protected-locked", mode: store.VaultModeProtected, wantLocked: true},
+		{name: "protected-unlocked", mode: store.VaultModeProtected, unlock: true},
+		{name: "lookup-failed-with-cached-key", mode: store.VaultModeProtected, unlock: true, failed: true, wantLocked: true},
+		{name: "missing-core", missing: true, wantLocked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := uuid.New()
+			h := rlHandler(&fakeRLDB{listRows: []store.ListRateLimitsRow{{UserID: id, Email: "mode@example.com"}}}, time.Minute)
+			if !tc.missing {
+				m := newMemVaultQ()
+				m.states[id] = store.LockVaultAuthStateRow{VaultMode: tc.mode}
+				box := newHandlerTestBox(t)
+				h.vault = newHandlerMemoryVault(box, m)
+				if tc.unlock {
+					if err := h.vault.Enable(context.Background(), id, "mode-aware-passphrase"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if tc.failed {
+					// Populate the failing reader core's cache through the transaction seam.
+					failed := &rateLimitFailedVaultState{memVaultQ: m}
+					h.vault = vault.New(box, failed, m.transaction)
+					if err := h.vault.UnlockExisting(context.Background(), id, "mode-aware-passphrase"); err != nil {
+						t.Fatal(err)
+					}
+					if !h.vault.Unlocked(id) {
+						t.Fatal("fixture needs a cached key")
+					}
+				}
+			}
+			rec := httptest.NewRecorder()
+			h.AdminRateLimits(rec, rlReq(uuid.New(), true))
+			var body struct {
+				Users []struct {
+					VaultLocked bool `json:"vault_locked"`
+				} `json:"users"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || rec.Code != http.StatusOK || len(body.Users) != 1 {
+				t.Fatalf("status=%d err=%v body=%s", rec.Code, err, rec.Body.String())
+			}
+			if body.Users[0].VaultLocked != tc.wantLocked {
+				t.Fatalf("vault_locked=%v want=%v", body.Users[0].VaultLocked, tc.wantLocked)
+			}
+		})
+	}
+}

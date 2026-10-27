@@ -1,21 +1,25 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 
+	"github.com/google/uuid"
+
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // VaultUnlock re-derives and caches the current user's DEK from their login
 // password (PRD #32), so agents resume after a pod restart without a full
 // re-login (the JWT cookie survives; the in-memory DEK does not). It NEVER
-// creates a vault — that happens only on login/register, which hold a freshly
-// verified password — so a wrong password here cannot mint a fresh vault and lock
+// creates a vault; explicit enable and required enrollment own creation. A
+// wrong password here cannot mint a fresh vault and lock
 // the user out of their real secrets (ErrNoVault is answered like a wrong
 // password). Sits behind RequireAuth (CSRF applies) and the per-user rate limiter
 // so a stolen JWT is not an unthrottled online password oracle.
@@ -41,23 +45,16 @@ func (h *Handler) VaultUnlock(w http.ResponseWriter, r *http.Request) {
 	err := h.vault.UnlockExisting(r.Context(), user.ID, req.Password)
 	switch {
 	case err == nil:
-		if h.wsvc != nil {
-			if err := h.wsvc.PromoteVaultLockedRecoveryWaitRuns(r.Context(), user.ID); err != nil {
-				slog.Error("vault unlock: promote recovery waits", "user", user.ID, "error", err)
-			}
-		}
-		// A successful unlock lets the Codex poller read this user's linked accounts;
-		// poke so their account meters refresh within seconds (PRD #1209). Best-effort.
-		if h.codexUsagePoker != nil {
-			h.codexUsagePoker.Poke(user.ID)
-		}
+		h.vaultReady(r.Context(), user.ID)
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, vault.ErrWrongPassword), errors.Is(err, vault.ErrNoVault):
 		// One response for both: whether a vault row exists is not something the
 		// unlock form should disclose, and it matches login's generic failure.
 		httpx.Error(w, http.StatusForbidden, "incorrect password")
+	case errors.Is(err, vault.ErrUncertainOutcome):
+		h.vaultToggleError(w, user.ID, err)
 	default:
-		slog.Error("vault unlock", "user", user.ID, "error", err)
+		slog.Error("vault unlock failed", "user", user.ID)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	}
 }
@@ -108,28 +105,8 @@ func (h *Handler) VaultPassphrase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create-only: refuse if a vault already exists (a linked user's password-derived
-	// vault, or a passphrase set earlier). The unlock banner + /api/vault/unlock cover
-	// an existing vault; this endpoint only mints the first one.
-	exists, err := h.vault.Exists(r.Context(), user.ID)
-	if err != nil {
-		slog.Error("vault passphrase exists check", "user", user.ID, "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	if exists {
-		httpx.Error(w, http.StatusConflict, "a vault already exists")
-		return
-	}
-
-	// Enable is create-only and verifies the current durable authentication state.
 	if err := h.vault.Enable(r.Context(), user.ID, req.Passphrase); err != nil {
-		if errors.Is(err, vault.ErrAlreadyProtected) {
-			httpx.Error(w, http.StatusConflict, "a vault already exists")
-			return
-		}
-		slog.Error("vault passphrase create", "user", user.ID, "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		h.vaultToggleError(w, user.ID, err)
 		return
 	}
 	// A successful create+unlock lets the Codex poller read this user's linked accounts;
@@ -168,5 +145,124 @@ func (h *Handler) VaultStatus(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"unlocked": h.vaultUnlocked(user.ID)})
+	httpx.JSON(w, http.StatusOK, h.vaultStatus(r.Context(), user))
+}
+
+// vaultStatus shares the core snapshot between auth/session and the dedicated
+// endpoint. If core reads fail, retain only a valid durable user-mode snapshot;
+// never advertise a cached key or invite overwriting an unknown protected wrapper.
+func (h *Handler) vaultStatus(ctx context.Context, user store.User) vault.Status {
+	if h.vault != nil {
+		status, err := h.vault.Status(ctx, user.ID)
+		if err == nil {
+			return status
+		}
+		slog.Error("vault status unavailable", "user", user.ID)
+	}
+	mode := user.VaultMode
+	if mode != store.VaultModeUnprotected && mode != store.VaultModeProtected {
+		mode = store.VaultModeProtected
+	}
+	policy := "required"
+	if h.settings != nil {
+		if cached, err := h.settings.VaultPolicy(ctx); err == nil {
+			policy = cached
+		}
+	}
+	return vault.Status{Mode: mode, Policy: policy, Exists: mode == store.VaultModeProtected}
+}
+
+// vaultToggleResponse reports the committed target without a fallible post-commit
+// status read. Clients refresh the session after the action.
+type vaultToggleResponse struct {
+	Mode           string `json:"mode"`
+	RotationAdvice string `json:"rotation_advice,omitempty"`
+}
+
+// VaultEnable accepts {"password": "..."} for both the verified login password
+// and an OIDC-only user's chosen vault passphrase. Core enforces durable auth,
+// passphrase bounds, and create-only wrapper semantics.
+func (h *Handler) VaultEnable(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := h.vault.Enable(r.Context(), user.ID, req.Password); err != nil {
+		h.vaultToggleError(w, user.ID, err)
+		return
+	}
+	h.vaultReady(r.Context(), user.ID)
+	httpx.JSON(w, http.StatusOK, vaultToggleResponse{
+		Mode:           store.VaultModeProtected,
+		RotationAdvice: "Credentials previously stored without the vault may already exist in backups. Rotate them to be safe.",
+	})
+}
+
+// VaultDisable is owner-scoped and takes no target or credentials in its body.
+func (h *Handler) VaultDisable(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if err := h.vault.Disable(r.Context(), user.ID); err != nil {
+		h.vaultToggleError(w, user.ID, err)
+		return
+	}
+	h.vaultReady(r.Context(), user.ID)
+	httpx.JSON(w, http.StatusOK, vaultToggleResponse{Mode: store.VaultModeUnprotected})
+}
+
+// vaultReady runs only after the core lifecycle call has released its locks.
+// Promotion is best effort, as on unlock: a failure cannot undo committed mode.
+func (h *Handler) vaultReady(ctx context.Context, userID uuid.UUID) {
+	if h.wsvc != nil {
+		if err := h.wsvc.PromoteVaultLockedRecoveryWaitRuns(ctx, userID); err != nil {
+			slog.Error("vault ready: promote recovery waits", "user", userID, "error", err)
+		}
+	}
+	h.requestCredentialPromotion(userID)
+	if h.usagePoker != nil {
+		h.usagePoker.Poke(userID)
+	}
+	if h.codexUsagePoker != nil {
+		h.codexUsagePoker.Poke(userID)
+	}
+}
+
+func (h *Handler) vaultToggleError(w http.ResponseWriter, userID uuid.UUID, err error) {
+	var limit *vault.ConversionLimitError
+	var uncertain *vault.UncertainOutcomeError
+	switch {
+	case errors.As(err, &uncertain):
+		httpx.Error(w, http.StatusServiceUnavailable, "vault change outcome is uncertain; refresh vault status before retrying, and unlock if protection is enabled")
+	case errors.As(err, &limit):
+		// Core supplies measured totals, limits, rollback confirmation and existing
+		// management UI guidance; it contains no credential material.
+		httpx.Error(w, http.StatusRequestEntityTooLarge, limit.Error())
+	case errors.Is(err, vault.ErrWrongPassword):
+		httpx.Error(w, http.StatusForbidden, "incorrect password")
+	case errors.Is(err, vault.ErrRequiredPolicy):
+		httpx.Error(w, http.StatusForbidden, "instance policy requires credential protection")
+	case errors.Is(err, vault.ErrNoVault):
+		httpx.Error(w, http.StatusConflict, "vault is not set up; enable it before disabling protection")
+	case errors.Is(err, vault.ErrLocked):
+		httpx.Error(w, http.StatusConflict, "vault is locked; unlock before disabling protection")
+	case errors.Is(err, vault.ErrAlreadyProtected):
+		httpx.Error(w, http.StatusConflict, "a vault already exists")
+	case errors.Is(err, vault.ErrPassphraseLength):
+		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("passphrase must be between %d and %d characters", minPasswordLen, maxPasswordLen))
+	default:
+		// Store errors can contain material. Log only the phase and owner.
+		slog.Error("vault change failed", "user", userID)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	}
 }

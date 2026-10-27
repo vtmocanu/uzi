@@ -8,7 +8,6 @@ import (
 	"net/mail"
 	"strings"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -459,10 +458,7 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 		// `exists` (PRD #45, review N1) lets a passwordless user's SPA pick the
 		// create-passphrase dialog (exists=false) vs the unlock banner (exists=true)
 		// deterministically, without probing for a 409.
-		"vault": map[string]any{
-			"unlocked": h.vaultUnlocked(user.ID),
-			"exists":   h.vaultExists(ctx, user.ID),
-		},
+		"vault": h.vaultStatus(ctx, user),
 		// has_password is false for OIDC-only users (NULL password_hash); the SPA uses
 		// it with vault.exists to choose passphrase-create vs unlock wording (PRD #45).
 		"has_password": user.PasswordHash.Valid,
@@ -494,31 +490,6 @@ func paintedTheme(a theme.Appearance) string {
 		return a.Light
 	}
 	return a.Dark
-}
-
-// vaultUnlocked reports whether the user's vault DEK is cached. A nil vault (only
-// in tests; main always wires one) means "no gate", reported as unlocked so the
-// SPA shows no banner and legacy behavior is preserved.
-func (h *Handler) vaultUnlocked(userID uuid.UUID) bool {
-	return h.vault == nil || h.vault.Unlocked(userID)
-}
-
-// vaultExists reports whether the user has a vault row, for the session payload's
-// `exists` bit (PRD #45). A nil vault (tests) reports true ("no gate", consistent
-// with vaultUnlocked) so the SPA offers no create dialog. A DB error is treated as
-// "exists" (conservative: never invite a passphrase-create over a vault we could
-// not confirm is absent — the user can retry, and /api/vault/passphrase is itself
-// create-only as the real backstop).
-func (h *Handler) vaultExists(ctx context.Context, userID uuid.UUID) bool {
-	if h.vault == nil {
-		return true
-	}
-	exists, err := h.vault.Exists(ctx, userID)
-	if err != nil {
-		slog.Error("vault exists for session payload", "user", userID, "error", err)
-		return true
-	}
-	return exists
 }
 
 // AuthConfig returns the operator-set registration policy the register page

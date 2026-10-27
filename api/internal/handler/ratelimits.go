@@ -110,14 +110,14 @@ func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 	}
 	users := make([]apitypes.AdminRateLimitRowDTO, 0)
 	for _, u := range rows {
-		// A new user starts a new group. vaultUnlocked is looked up once per user, on
+		// A new user starts a new group. RequiresUnlock is looked up once per user, on
 		// the first row, not once per token.
 		if len(users) == 0 || users[len(users)-1].ID != u.UserID.String() {
 			users = append(users, apitypes.AdminRateLimitRowDTO{
 				ID:          u.UserID.String(),
 				Email:       u.Email,
 				Name:        u.DisplayName.String, // "" when the user has no display name
-				VaultLocked: !h.vaultUnlocked(u.UserID),
+				VaultLocked: h.vault.RequiresUnlock(r.Context(), u.UserID),
 				Tokens:      []apitypes.TokenRateLimitDTO{},
 			})
 		}
