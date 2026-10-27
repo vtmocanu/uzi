@@ -342,8 +342,10 @@ run DTO carries it as `reserve_hold_reason`, with `queue_reason` set to
 `weekly_reserve` (`maintenance` wins when both apply). `uzi run get` prints a
 `RESERVE` row and a `QUEUE_REASON` row. The reason is written by the periodic
 sweeper, so it can appear a short while after the run is queued. It is dropped
-on the next pass once you clear the threshold or turn the toggle off,
-whatever the freshness of any reading.
+on the next pass once you clear the threshold, whatever the freshness of any
+reading. Turning the toggle off drops it only for a run that has already
+started; never-started work stays held. On `/api/v1/jobs` the job carries the
+reason as `reserve_hold_reason` and leaves `queue_reason` to maintenance.
 
 Running runs pause after their current milestone and resume on a fresh reading
 below the threshold; see [Pausing and resuming a run](run-pause.md#paused-by-the-weekly-usage-reserve).
