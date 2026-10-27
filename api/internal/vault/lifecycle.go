@@ -118,9 +118,8 @@ func (v *Vault) unlock(ctx context.Context, id uuid.UUID, password string, creat
 	}
 	ctx, cancel := context.WithTimeout(ctx, LifecycleTimeout)
 	defer cancel()
-	m := v.lifecycleMutex(id)
-	m.Lock()
-	defer m.Unlock()
+	release := v.acquireLifecycle(id)
+	defer release()
 	var dek []byte
 	defer func() { wipe(dek) }()
 	var epoch int64
@@ -323,9 +322,8 @@ func (v *Vault) Disable(ctx context.Context, id uuid.UUID) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, LifecycleTimeout)
 	defer cancel()
-	m := v.lifecycleMutex(id)
-	m.Lock()
-	defer m.Unlock()
+	release := v.acquireLifecycle(id)
+	defer release()
 	err := v.transact(ctx, func(ctx context.Context, q Store) error {
 		state, _, exists, policy, err := lockLifecycleState(ctx, q, id, true)
 		if err != nil {
@@ -377,9 +375,8 @@ func (v *Vault) Lock(id uuid.UUID) {
 	if v == nil {
 		return
 	}
-	m := v.lifecycleMutex(id)
-	m.Lock()
-	defer m.Unlock()
+	release := v.acquireLifecycle(id)
+	defer release()
 	v.evict(id)
 }
 
@@ -394,9 +391,8 @@ func (v *Vault) LockAndAcknowledge(ctx context.Context, id uuid.UUID) error {
 	// indefinitely. Preserve a shorter request deadline and evict even on failure.
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	m := v.lifecycleMutex(id)
-	m.Lock()
-	defer m.Unlock()
+	release := v.acquireLifecycle(id)
+	defer release()
 	defer v.evict(id)
 	if _, err := v.q.ClaimVaultLockNotice(ctx, id); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		slog.Error("vault lock: pre-ack lock-notice", "user", id, "error", err)

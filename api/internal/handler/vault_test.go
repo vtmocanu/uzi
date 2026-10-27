@@ -68,8 +68,8 @@ func (m *memVaultQ) transaction(ctx context.Context, fn func(context.Context, va
 	return fn(vault.WithStateReader(ctx, m), m)
 }
 
-func newHandlerMemoryVault(box *secretbox.Box, m *memVaultQ) *vault.Vault {
-	return vault.New(box, m, m.transaction)
+func newHandlerMemoryVault(box *secretbox.Box, m *memVaultQ, opts ...vault.Option) *vault.Vault {
+	return vault.New(box, m, m.transaction, opts...)
 }
 
 func (m *memVaultQ) state(id uuid.UUID) store.LockVaultAuthStateRow {

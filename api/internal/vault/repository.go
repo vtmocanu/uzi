@@ -43,11 +43,27 @@ type Store interface {
 // the acknowledgment was uncertain and requires fresh locked reconciliation.
 type Transact func(ctx context.Context, fn func(context.Context, Store) error) error
 
+// Option configures a Vault at construction time.
+type Option struct {
+	onLifecycleWaitObserver func(uuid.UUID)
+}
+
+// WithLifecycleWaitObserverForTest reports a failed lifecycle TryLock. The
+// observer must return promptly, be concurrency-safe, and never reenter Vault.
+// It receives only the owner ID; it does not report mutex queue insertion.
+func WithLifecycleWaitObserverForTest(observer func(uuid.UUID)) Option {
+	return Option{onLifecycleWaitObserver: observer}
+}
+
 // New requires an explicit transaction implementation. Production uses
 // NewPostgres; a nil callback is a programming error, never a fallback to fn(q).
-func New(master *secretbox.Box, q Store, transact Transact) *Vault {
+func New(master *secretbox.Box, q Store, transact Transact, opts ...Option) *Vault {
 	if transact == nil {
 		panic("vault: transaction callback required")
 	}
-	return &Vault{master: master, q: q, transact: transact, cache: make(map[uuid.UUID]cachedKey)}
+	v := &Vault{master: master, q: q, transact: transact, cache: make(map[uuid.UUID]cachedKey)}
+	for _, opt := range opts {
+		v.onLifecycleWaitObserver = opt.onLifecycleWaitObserver
+	}
+	return v
 }

@@ -206,9 +206,8 @@ func (v *Vault) Status(ctx context.Context, userID uuid.UUID) (Status, error) {
 	// cannot indefinitely prevent an explicit lock or conversion from entering.
 	ctx, cancel := context.WithTimeout(ctx, LifecycleTimeout)
 	defer cancel()
-	m := v.lifecycleMutex(userID)
-	m.Lock()
-	defer m.Unlock()
+	release := v.acquireLifecycle(userID)
+	defer release()
 	state, err := v.State(ctx, userID)
 	if err != nil {
 		return Status{}, err

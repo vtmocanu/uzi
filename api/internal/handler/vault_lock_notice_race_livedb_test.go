@@ -22,6 +22,7 @@ import (
 type vaultNoticeListBarrier struct {
 	*store.Queries
 	entered, release chan struct{}
+	onClaim          func(time.Time)
 }
 
 func (s *vaultNoticeListBarrier) HasMasterVaultMaterial(ctx context.Context, uid uuid.UUID) (bool, error) {
@@ -37,6 +38,18 @@ func (s *vaultNoticeListBarrier) HasMasterVaultMaterial(ctx context.Context, uid
 	}
 }
 
+func (s *vaultNoticeListBarrier) ClaimVaultLockNotice(ctx context.Context, uid uuid.UUID) (uuid.UUID, error) {
+	id, err := s.Queries.ClaimVaultLockNotice(ctx, uid)
+	if err == nil && s.onClaim != nil {
+		row, readErr := s.GetUserVault(ctx, uid)
+		if readErr != nil {
+			return uuid.Nil, readErr
+		}
+		s.onClaim(row.LockNotifiedAt.Time)
+	}
+	return id, err
+}
+
 type vaultNoticeRaceSettings struct{}
 
 func (vaultNoticeRaceSettings) UziLabel(context.Context) (string, error) {
@@ -47,16 +60,27 @@ func (vaultNoticeRaceSettings) PublicBaseURL(context.Context) (string, error) {
 	return "", nil
 }
 
-// PRD #890 D6 / success criterion 4: an older unlock finishing after a deliberate
-// lock must preserve the pre-ack and suppress the real reconciler's inbox notice.
+// PRD #890 D6 / success criterion 4: the lazy-material barrier is AFTER
+// unlock clears its notice. A contending deliberate lock must run after the
+// older unlock, preserve its actual pre-ack, and suppress the reconciler notice.
 // The handler package is enumerated by e2e/run-store-it.sh's LiveDB sweep.
 func TestVaultLockOlderUnlockPreservesNoticeLiveDB(t *testing.T) {
 	e := newRecoveryEnv(t)
 	h := e.handler()
-	barrier := &vaultNoticeListBarrier{Queries: h.q}
+	contended := make(chan struct{}, 1)
+	observer := vault.WithLifecycleWaitObserverForTest(func(id uuid.UUID) {
+		if id == e.user {
+			select {
+			case contended <- struct{}{}:
+			default:
+			}
+		}
+	})
+	acknowledged := make(chan time.Time, 1)
+	barrier := &vaultNoticeListBarrier{Queries: h.q, onClaim: func(at time.Time) { acknowledged <- at }}
 	h.vault = newWrappedPostgresVault(e.box, e.pool, barrier, func(q *store.Queries) vault.Store {
 		return &vaultNoticeListBarrier{Queries: q, entered: barrier.entered, release: barrier.release}
-	})
+	}, observer)
 	setVaultFixturePassword(t, e.pool, e.user, recoveryUnlockPassword)
 	if err := h.vault.Unlock(e.ctx, e.user, recoveryUnlockPassword); err != nil {
 		t.Fatal(err)
@@ -144,6 +168,14 @@ func TestVaultLockOlderUnlockPreservesNoticeLiveDB(t *testing.T) {
 		h.VaultLock(rec, req)
 		lockDone <- rec
 	}()
+	select {
+	case <-contended:
+	case <-lockDone:
+		lockJoined = true
+		t.Fatal("manual lock completed before observed lifecycle contention")
+	case <-ctx.Done():
+		t.Fatal("manual lock did not contend on older unlock")
+	}
 	release()
 	unlockResponse := <-done
 	joined = true
@@ -155,15 +187,20 @@ func TestVaultLockOlderUnlockPreservesNoticeLiveDB(t *testing.T) {
 	if lockResponse.Code != http.StatusNoContent {
 		t.Fatalf("manual lock=%d body=%s", lockResponse.Code, lockResponse.Body.String())
 	}
-	preack := marker().LockNotifiedAt
-	if !preack.Valid {
+	var preack time.Time
+	select {
+	case preack = <-acknowledged:
+	case <-ctx.Done():
+		t.Fatal("manual lock did not capture its actual persisted acknowledgment")
+	}
+	if preack.IsZero() {
 		t.Fatal("manual lock must persist pre-ack")
 	}
 	if h.vault.Unlocked(e.user) {
 		t.Error("older unlock must leave the manually locked vault locked")
 	}
 	after := marker().LockNotifiedAt
-	if !after.Valid || !after.Time.Equal(preack.Time) {
+	if !after.Valid || !after.Time.Equal(preack) {
 		t.Errorf("older unlock erased manual lock pre-ack: before=%v after=%v", preack, after)
 	}
 	reconciler.Reconcile(e.ctx)

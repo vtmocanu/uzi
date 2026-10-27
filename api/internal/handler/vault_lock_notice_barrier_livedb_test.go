@@ -42,10 +42,19 @@ func (s *vaultNoticeClearBarrier) ClearVaultLockNotice(ctx context.Context, id u
 func TestVaultManualLockWaitingOnNoticeClearSendsNoNoticeLiveDB(t *testing.T) {
 	e := newRecoveryEnv(t)
 	h := e.handler()
+	contended := make(chan struct{}, 1)
+	observer := vault.WithLifecycleWaitObserverForTest(func(id uuid.UUID) {
+		if id == e.user {
+			select {
+			case contended <- struct{}{}:
+			default:
+			}
+		}
+	})
 	barrier := &vaultNoticeClearBarrier{Queries: h.q}
 	h.vault = newWrappedPostgresVault(e.box, e.pool, barrier, func(q *store.Queries) vault.Store {
 		return &vaultNoticeClearBarrier{Queries: q, entered: barrier.entered, release: barrier.release}
-	})
+	}, observer)
 	setVaultFixturePassword(t, e.pool, e.user, recoveryUnlockPassword)
 	if err := h.vault.Unlock(e.ctx, e.user, recoveryUnlockPassword); err != nil {
 		t.Fatal(err)
@@ -101,6 +110,14 @@ func TestVaultManualLockWaitingOnNoticeClearSendsNoNoticeLiveDB(t *testing.T) {
 		h.VaultLock(rec, req)
 		lockDone <- rec.Code
 	}()
+	select {
+	case <-contended:
+	case <-lockDone:
+		lockJoined = true
+		t.Fatal("manual lock completed before observed lifecycle contention")
+	case <-ctx.Done():
+		t.Fatal("manual lock did not contend on older unlock")
+	}
 	// Reconcile while unlock holds its notice-clear barrier.
 	reconciler.Reconcile(e.ctx)
 	if n := inbox(); n != 0 {

@@ -49,9 +49,10 @@ type cachedKey struct {
 // spans database or network I/O. Normal ciphertext writers use epoch fences and
 // never acquire a lifecycle mutex from an already-open transaction.
 type Vault struct {
-	master   *secretbox.Box
-	q        Store
-	transact Transact
+	master                  *secretbox.Box
+	q                       Store
+	transact                Transact
+	onLifecycleWaitObserver func(uuid.UUID)
 
 	mu        sync.RWMutex
 	cache     map[uuid.UUID]cachedKey
@@ -61,6 +62,19 @@ type Vault struct {
 func (v *Vault) lifecycleMutex(userID uuid.UUID) *sync.Mutex {
 	m, _ := v.lifecycle.LoadOrStore(userID, &sync.Mutex{})
 	return m.(*sync.Mutex)
+}
+
+// acquireLifecycle returns a release function only after obtaining ownership.
+// The nil observer path preserves ordinary mutex admission in production.
+func (v *Vault) acquireLifecycle(userID uuid.UUID) func() {
+	m := v.lifecycleMutex(userID)
+	if v.onLifecycleWaitObserver == nil {
+		m.Lock()
+	} else if !m.TryLock() {
+		v.onLifecycleWaitObserver(userID)
+		m.Lock()
+	}
+	return m.Unlock
 }
 
 // Unlocked means exactly that a DEK is cached. RequiresUnlock is the mode-aware

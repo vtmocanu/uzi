@@ -23,7 +23,7 @@ func (e *CommitError) Unwrap() error { return e.Err }
 
 // NewPostgres installs the real transaction adapter. Admission reads require
 // READ COMMITTED regardless of the pool's default transaction configuration.
-func NewPostgres(master *secretbox.Box, pool *pgxpool.Pool) *Vault {
+func NewPostgres(master *secretbox.Box, pool *pgxpool.Pool, opts ...Option) *Vault {
 	if pool == nil {
 		panic("vault: database pool required")
 	}
@@ -46,5 +46,5 @@ func NewPostgres(master *secretbox.Box, pool *pgxpool.Pool) *Vault {
 			return &CommitError{Err: err}
 		}
 		return nil
-	})
+	}, opts...)
 }

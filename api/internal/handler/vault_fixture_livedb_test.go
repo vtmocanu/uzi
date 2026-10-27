@@ -24,7 +24,7 @@ func setVaultFixturePassword(t *testing.T, pool *pgxpool.Pool, id uuid.UUID, pas
 
 // Every lifecycle callback receives the interception wrapper over its own real
 // transaction. Out-of-transaction notice calls use the supplied root wrapper.
-func newWrappedPostgresVault(box *secretbox.Box, pool *pgxpool.Pool, root vault.Store, wrap func(*store.Queries) vault.Store) *vault.Vault {
+func newWrappedPostgresVault(box *secretbox.Box, pool *pgxpool.Pool, root vault.Store, wrap func(*store.Queries) vault.Store, opts ...vault.Option) *vault.Vault {
 	return vault.New(box, root, func(ctx context.Context, fn func(context.Context, vault.Store) error) error {
 		tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 		if err != nil {
@@ -43,5 +43,5 @@ func newWrappedPostgresVault(box *secretbox.Box, pool *pgxpool.Pool, root vault.
 			return &vault.CommitError{Err: err}
 		}
 		return nil
-	})
+	}, opts...)
 }

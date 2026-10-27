@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 func TestHTTPSecretMaterialPolicy(t *testing.T) {
@@ -116,8 +117,16 @@ func TestHTTPSecretMaterialPolicy(t *testing.T) {
 // acknowledgment. Channel barriers keep both requests in flight without sleeps.
 func TestVaultManualLockSerializesPreAckWithUnlock(t *testing.T) {
 	m := newMemVaultQ()
-	h := &Handler{vault: newHandlerMemoryVault(newHandlerTestBox(t), m)}
 	uid := uuid.New()
+	contended := make(chan struct{}, 1)
+	h := &Handler{vault: newHandlerMemoryVault(newHandlerTestBox(t), m, vault.WithLifecycleWaitObserverForTest(func(id uuid.UUID) {
+		if id == uid {
+			select {
+			case contended <- struct{}{}:
+			default:
+			}
+		}
+	}))}
 	const password = "serialization-passphrase"
 	if err := h.vault.Enable(context.Background(), uid, password); err != nil {
 		t.Fatal(err)
@@ -179,6 +188,14 @@ func TestVaultManualLockSerializesPreAckWithUnlock(t *testing.T) {
 		h.VaultUnlock(rec, req)
 		unlockDone <- rec.Code
 	}()
+	select {
+	case <-contended:
+	case code := <-unlockDone:
+		unlockJoined = true
+		t.Fatalf("unlock completed before observed lifecycle contention: %d", code)
+	case <-ctx.Done():
+		t.Fatal("unlock did not contend on manual pre-ack")
+	}
 	unblock()
 	if code := <-lockDone; code != http.StatusNoContent {
 		lockJoined = true

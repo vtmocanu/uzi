@@ -224,6 +224,19 @@ func TestHTTPSecretWritersRejectLifecycleRacesLiveDB(t *testing.T) {
 					t.Fatalf("fresh save=%d %s", fresh.Code, fresh.Body.String())
 				}
 				assertPolicyMaterialOpens(t, h, raceCtx, uid, marker)
+				savedID := id
+				if writer.method == http.MethodPost {
+					savedID = decodeSecret(t, fresh).Secret.ID
+				}
+				var savedCipher []byte
+				var savedMarker string
+				if err := pool.QueryRow(raceCtx, "SELECT ciphertext,sealed_with FROM user_secrets WHERE user_id=$1 AND id=$2 AND kind=$3", uid, savedID, writer.kind).Scan(&savedCipher, &savedMarker); err != nil {
+					t.Fatal(err)
+				}
+				opened, err := h.vault.Open(uid, writer.kind, savedMarker, savedCipher)
+				if err != nil || !bytes.Equal(opened, []byte(policyValue(writer.kind, "fresh"))) {
+					t.Fatalf("addressed fresh credential differs from requested fixture: kind=%s id=%s open_error=%v", writer.kind, savedID, err)
+				}
 			})
 		}
 	}
