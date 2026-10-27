@@ -19,6 +19,7 @@ func (s *Service) policyRevisionProjectionNegotiated(w store.Worker) bool {
 // policyRevisionStateProjection is captured under one owned lock and published
 // only after the state transaction commits. A false approval remains present.
 type policyRevisionStateProjection struct {
+	Execution    *PolicyStopExecution
 	Gate         json.RawMessage
 	PlanApproved *bool
 }

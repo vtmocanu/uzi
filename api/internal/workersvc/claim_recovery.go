@@ -45,6 +45,7 @@ func (e *codexMintedClaimError) Unwrap() error { return e.cause }
 
 type claimRecoveryIdentity struct {
 	workerID                 uuid.UUID
+	userID                   uuid.UUID
 	recoveryCapable          bool
 	policyRevisionProjection bool
 }
@@ -199,7 +200,7 @@ func (s *Service) assembleAndFinishRunClaim(ctx context.Context, wkr store.Worke
 		h.afterAssembly(ctx, run, payload, err)
 	}
 	return s.finishRunClaim(ctx, run, payload, err,
-		claimRecoveryIdentity{workerID: wkr.ID, recoveryCapable: recoveryCapable,
+		claimRecoveryIdentity{workerID: wkr.ID, userID: wkr.UserID, recoveryCapable: recoveryCapable,
 			policyRevisionProjection: s.policyRevisionProjectionNegotiated(wkr)})
 }
 
@@ -207,6 +208,10 @@ func (s *Service) assembleAndFinishRunClaim(ctx context.Context, wkr store.Worke
 // authority. A failed assembly and a late authority refusal share one transaction, and
 // no run-lane outcome reaches an unfenced writer: without a transaction it refuses.
 func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *ClaimPayload, assemblyErr error, identity claimRecoveryIdentity) (*ClaimPayload, error) {
+	// Assembly cannot issue authority, including on a failed final transaction.
+	if payload != nil {
+		payload.PolicyStopExecution = nil
+	}
 	if errors.Is(assemblyErr, errCodexMintAmbiguous) || isTransientClaimDBError(assemblyErr) {
 		return nil, assemblyErr // the write may have landed; no mutation is safe
 	}
@@ -445,7 +450,13 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		}
 	}
 	if decision == nil {
+		execution, err := s.policyStopProjectionLocked(ctx, q,
+			store.Worker{ID: identity.workerID, UserID: identity.userID}, locked, run.ClaimGeneration, identity.policyRevisionProjection)
+		if err != nil {
+			return nil, "", err
+		}
 		if payload != nil {
+			payload.PolicyStopExecution = execution
 			if locked.Kind != runkind.Judge && locked.Kind != runkind.Job {
 				rc, err := q.GetRunClaimContext(ctx, locked.ID)
 				if err != nil {

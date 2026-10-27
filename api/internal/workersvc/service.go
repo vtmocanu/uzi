@@ -4751,6 +4751,17 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		owned = locked
 		q = qtx
 	}
+	// A live execution report cannot reinterpret an accepted Stop as ordinary
+	// approval. This statement follows the parent lock and uses its transaction.
+	// Terminal transitions retain historical evidence without issuing authority.
+	if len(owned.PolicyStopResolution) > 0 && (req.State == "running" || req.State == "awaiting_approval" || req.State == "awaiting_input") {
+		if fenceTx == nil || req.ClaimGeneration == nil {
+			return owned, false, stopReviewConflict("policy_stop_execution_unverifiable")
+		}
+		if _, err := s.policyStopProjectionLocked(ctx, q, wkr, owned, *req.ClaimGeneration, s.policyRevisionProjectionNegotiated(wkr)); err != nil {
+			return owned, false, err
+		}
+	}
 	var rows int64
 	// PRD #1795 M1: a refused awaiting_approval report (historical id, changed payload on the
 	// current id, stale adoption). It wrote no report; it is returned AFTER the commit (its
@@ -5569,22 +5580,33 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// every early return omit this projection; only our successful commit
 		// may expose it through policyRevisionOut.
 		if policyRevisionOut != nil && parentTx == nil && rows > 0 && gateRefusal == nil &&
-			req.ClaimGeneration != nil && policyEligible(owned) && !owned.TargetRunID.Valid && s.policyRevisionProjectionNegotiated(wkr) {
+			req.ClaimGeneration != nil && policyEligible(owned) && !owned.TargetRunID.Valid &&
+			(s.policyRevisionProjectionNegotiated(wkr) || len(owned.PolicyStopResolution) > 0) {
 			current, readErr := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 			if readErr != nil {
 				return store.Run{}, false, readErr
 			}
 			if current.UserID == wkr.UserID && current.ClaimGeneration == *req.ClaimGeneration && !current.ClaimReleasedAt.Valid &&
 				policyEligible(current) && !current.TargetRunID.Valid {
-				rc, readErr := q.GetRunClaimContext(ctx, current.ID)
-				if readErr != nil {
-					return store.Run{}, false, readErr
+				// Only live execution states can carry Stop authority. Terminal and
+				// parked rows retain their receipt solely as historical evidence.
+				if current.Status == "claimed" || current.Status == "running" || current.Status == "awaiting_approval" {
+					policyRevision.Execution, err = s.policyStopProjectionLocked(ctx, q, wkr, current, *req.ClaimGeneration, s.policyRevisionProjectionNegotiated(wkr))
+					if err != nil {
+						return store.Run{}, false, err
+					}
 				}
-				approved := policyRevisionPlanApproved(ctx, q, current, current.AutoApprove || rc.HumanPlanApproved || current.PlanSource == planSourceSeeded)
-				policyRevision.PlanApproved = &approved
-				policyRevision.Gate, err = policyRevisionGateProjection(ctx, q, current)
-				if err != nil {
-					return store.Run{}, false, err
+				if s.policyRevisionProjectionNegotiated(wkr) {
+					rc, readErr := q.GetRunClaimContext(ctx, current.ID)
+					if readErr != nil {
+						return store.Run{}, false, readErr
+					}
+					approved := policyRevisionPlanApproved(ctx, q, current, current.AutoApprove || rc.HumanPlanApproved || current.PlanSource == planSourceSeeded)
+					policyRevision.PlanApproved = &approved
+					policyRevision.Gate, err = policyRevisionGateProjection(ctx, q, current)
+					if err != nil {
+						return store.Run{}, false, err
+					}
 				}
 			}
 		}

@@ -26,6 +26,7 @@ type LeadReconciliation struct {
 }
 
 type StateReportResult struct {
+	PolicyStopExecution         *PolicyStopExecution                  `json:"-"`
 	PlanApproved                *bool                                 `json:"-"`
 	PolicyRevisionGate          json.RawMessage                       `json:"-"`
 	RevisionInputID             *int64                                `json:"-"`
@@ -114,6 +115,7 @@ func (s *Service) SetStateReportWithReconciliation(ctx context.Context, worker s
 	}
 	result.Run, result.Applied = run, applied
 	if applied {
+		result.PolicyStopExecution = projection.Execution
 		result.PolicyRevisionGate, result.PlanApproved = projection.Gate, projection.PlanApproved
 	}
 	if applied && result.GateRevision > 0 && req.RevisionInputID != nil {

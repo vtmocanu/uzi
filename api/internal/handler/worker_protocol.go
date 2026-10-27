@@ -1570,6 +1570,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 
 // workerStateReportAck encodes projections returned by the committed report.
 func workerStateReportAck(ack map[string]any, result workersvc.StateReportResult) any {
+	delete(ack, "policy_stop_execution")
+	if result.PolicyStopExecution != nil {
+		ack["policy_stop_execution"] = result.PolicyStopExecution
+	}
 	if result.PlanApproved != nil {
 		ack["plan_approved"] = *result.PlanApproved
 	}
@@ -1583,9 +1587,10 @@ func workerStateReportAck(ack map[string]any, result workersvc.StateReportResult
 			supersededIDs = &ids
 		}
 		return workerReconciledStateAck{
-			PlanApproved:       result.PlanApproved,
-			PolicyRevisionGate: result.PolicyRevisionGate,
-			RevisionInputID:    result.RevisionInputID, SupersededRevisionInputIDs: supersededIDs,
+			PolicyStopExecution: result.PolicyStopExecution,
+			PlanApproved:        result.PlanApproved,
+			PolicyRevisionGate:  result.PolicyRevisionGate,
+			RevisionInputID:     result.RevisionInputID, SupersededRevisionInputIDs: supersededIDs,
 			Run: ack["run"], CredentialSwitch: ack["credential_switch"], Disposition: ack["disposition"],
 			leadReconciliationResponse: reconciliationResponse(0, result.Reconciliation),
 		}

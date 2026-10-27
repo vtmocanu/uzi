@@ -285,6 +285,9 @@ type ClaimPayload struct {
 	// Absent is unknown; null is verified no-gate; an object binds the verified gate.
 	PolicyRevisionGate json.RawMessage `json:"policy_revision_gate,omitempty"`
 
+	// Issued from validated Stop evidence under the final owned claim lock.
+	PolicyStopExecution *PolicyStopExecution `json:"policy_stop_execution,omitempty"`
+
 	// TargetRunID is the run a JUDGE run reviews (PRD #46 Decision 1). Present only
 	// for kind=judge (omitted otherwise). The judge fetches that run's trace through
 	// the Bearer worker trace endpoint (M3); the claim itself stays small and carries
