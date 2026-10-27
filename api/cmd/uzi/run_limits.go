@@ -111,17 +111,27 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			p := env.printer(gf)
+			human := p.Format != uzicli.FormatJSON && !gf.quiet
+			// PRD #3522: the override line names THIS resume's effect, so it needs the hold the run had
+			// before the resume (an exemption recorded by an earlier resume survives an ordinary one). A
+			// failed read only costs the wording: the resume itself is still attempted below.
+			reserveHold := false
+			if human {
+				if prior, gerr := c.GetRun(cmd.Context(), args[0]); gerr == nil && prior.HoldReason != nil {
+					reserveHold = *prior.HoldReason == holdWeeklyReserve
+				}
+			}
 			run, err := c.ResumeRunNow(cmd.Context(), args[0])
 			if err != nil {
 				return err
 			}
-			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(run)
 			}
 			if !gf.quiet {
-				if run.ReserveExemptUntil != nil {
-					// PRD #3522: the server records the override only when it resumed a weekly_reserve hold.
+				if reserveHold && run.ReserveExemptUntil != nil {
+					// The server records the override only when it resumed a weekly_reserve hold.
 					p.Printf("Resumed %s: queued (overrides the weekly usage reserve until the next weekly reset).\n", args[0])
 				} else {
 					p.Printf("Resumed %s: queued.\n", args[0])

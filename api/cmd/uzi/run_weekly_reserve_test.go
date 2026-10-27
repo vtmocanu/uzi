@@ -80,7 +80,11 @@ func TestPauseDetailRowsWeeklyReservePending(t *testing.T) {
 // recorded exemption, and the confirmation says so; an ordinary resume prints the plain line.
 func TestRunResumeNamesTheReserveOverride(t *testing.T) {
 	until := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
-	fc := &uzicli.FakeClient{ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued", ReserveExemptUntil: &until}}
+	hold := "weekly_reserve"
+	fc := &uzicli.FakeClient{
+		RunByID:    map[string]apitypes.RunDTO{"r1": {ID: "r1", Status: "paused", HoldReason: &hold}},
+		ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued", ReserveExemptUntil: &until},
+	}
 	stdout, stderr, code := runCLI(t, fakeEnv(fc), "run", "resume", "r1")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
@@ -94,5 +98,16 @@ func TestRunResumeNamesTheReserveOverride(t *testing.T) {
 	stdout, _, code = runCLI(t, fakeEnv(plain), "run", "resume", "r1")
 	if code != uzicli.ExitOK || strings.Contains(stdout, "weekly usage reserve") || !strings.Contains(stdout, "Resumed r1: queued.\n") {
 		t.Errorf("an ordinary resume printed %q (exit %d), want the plain queued line", stdout, code)
+	}
+
+	// An ordinary (NULL-hold) pause resumed while an exemption recorded by an EARLIER reserve resume is
+	// still in force: this resume overrode nothing, so the plain line prints.
+	carried := &uzicli.FakeClient{
+		RunByID:    map[string]apitypes.RunDTO{"r1": {ID: "r1", Status: "paused"}},
+		ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued", ReserveExemptUntil: &until},
+	}
+	stdout, _, code = runCLI(t, fakeEnv(carried), "run", "resume", "r1")
+	if code != uzicli.ExitOK || strings.Contains(stdout, "weekly usage reserve") || !strings.Contains(stdout, "Resumed r1: queued.\n") {
+		t.Errorf("resuming an ordinary pause with a carried exemption printed %q (exit %d), want the plain queued line", stdout, code)
 	}
 }

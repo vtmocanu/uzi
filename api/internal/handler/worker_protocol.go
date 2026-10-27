@@ -2443,8 +2443,10 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 }
 
 // workerRunDTO is the run body every worker-facing response carries. It is runToDTO with the hold
-// reason passed through workersvc.WorkerVisibleHoldReason, so the weekly usage reserve's park reads
-// as an ordinary pause (null hold) to the agent; owner-facing DTOs keep using runToDTO directly.
+// reason passed through workersvc.WorkerVisibleHoldReason and the pending pause mode through
+// workersvc.WorkerVisiblePauseMode, so the weekly usage reserve's request reads as an ordinary
+// 'milestone' request and its park as an ordinary pause (null hold) to the agent; owner-facing DTOs
+// keep using runToDTO directly.
 func (h *Handler) workerRunDTO(ctx context.Context, run store.Run) apitypes.RunDTO {
 	dto := runToDTO(run, h.runPriorityClass(ctx, run), h.cfg.RunTimeout, h.runExtensionCapSeconds(ctx), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
 	dto.HoldReason = workersvc.WorkerVisibleHoldReason(dto.HoldReason)
