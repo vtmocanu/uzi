@@ -244,7 +244,7 @@ func TestVaultToggleRoutesOIDCAndLimiterLiveDB(t *testing.T) {
 	assertVaultRouteSnapshot(t, router, h, user, vault.Status{Mode: store.VaultModeProtected, Policy: "optional", Exists: true, Unlocked: true})
 
 	for _, action := range []string{"enable", "disable"} {
-		// Each endpoint case owns a fresh limiter; both endpoints share its per-user bucket.
+		// Each case owns a fresh router; buckets are keyed by route pattern and owner.
 		limited := vaultToggleRouter(h, 1)
 		path := "/api/vault/" + action
 		first := vaultRouteRequest(t, limited, h, user, http.MethodPost, path, `{"password":"oidc-route-passphrase"}`, true, true)

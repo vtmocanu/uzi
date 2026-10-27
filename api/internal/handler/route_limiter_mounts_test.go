@@ -261,12 +261,13 @@ type routeMount struct {
 // drift; the durable claim is that the list is COMPLETE, which is what
 // TestEveryRouteCarriesItsExpectedPerUserLimiter enforces in both directions.
 //
-// The two rows worth naming, because they are brute-force controls on a passphrase
-// endpoint: POST /api/vault/unlock and POST /api/vault/passphrase.
+// The vault's password/passphrase surfaces use authLimiter: POST /api/vault/unlock,
+// POST /api/vault/enable and POST /api/vault/passphrase. Disabling protection also
+// uses that limiter class to bound conversion requests.
 //
 // NOTE on authLimiter: it is mounted BOTH ways. Its per-IP Middleware sits on
-// /register, /login, /config, the OIDC pair and /cli/start; EIGHT routes take its
-// PerUserMiddleware — /cli/approve, /vault/unlock, /vault/passphrase,
+// /register, /login, /config, the OIDC pair and /cli/start. Its PerUserMiddleware
+// protects /cli/approve, /vault/unlock, /vault/enable, /vault/disable, /vault/passphrase,
 // /admin/cli-tokens, /admin/products, /admin/product-tokens, the product-token mint
 // POST /me/product-tokens/ and POST /v1/jobs (a per-route mount inside the /api/v1
 // subtree, whose own r.Use is v1Limiter since PRD #1908 D-B, so every /api/v1 route
@@ -828,6 +829,8 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/skills/", noLimiter},
 	{"POST", "/api/skills/{id}/reset", noLimiter},
 	{"POST", "/api/tool-allowlist/", noLimiter},
+	{"POST", "/api/vault/disable", limAuth},
+	{"POST", "/api/vault/enable", limAuth},
 	{"POST", "/api/vault/lock", noLimiter},
 	{"POST", "/api/vault/passphrase", limAuth},
 	{"POST", "/api/vault/unlock", limAuth},
