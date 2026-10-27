@@ -1508,7 +1508,7 @@ Tracked as issue vtmocanu/uzi#2865; PRD at `prds/done/2865-default-branch-ci-rep
 
 ## Feature #3522 — Weekly usage reserve
 
-PRD at `prds/3522-weekly-usage-reserve.md`.
+PRD at `prds/done/3522-weekly-usage-reserve.md`.
 
 - Each user may set a weekly reserve threshold (off by default, otherwise an integer 1..100) and a pause-running toggle (default on once set), through web settings, `uzi settings reserve` and `PUT /api/me/usage-reserve`. Only the 7-day window counts; the 5-hour window is ignored. [user 2026-10-26] (AI-synced 2026-10-27)
 - While the credential a run would spend reads at or above the threshold, new work stays `queued` with a visible reason (`weekly usage reserve: N% >= T%`, `queue_reason` `weekly_reserve`) for every worker run kind except chat; judge and cross-check are gated on their own credential, and the auto pool skips held tokens. A missing, stale, pre-reset or partial reading reads as unknown and holds new work (so console API keys and a disabled usage poller hold), but never pauses a running run; Codex API-key aliases and OpenAI API keys are never gated. [user 2026-10-26] (AI-synced 2026-10-27)
