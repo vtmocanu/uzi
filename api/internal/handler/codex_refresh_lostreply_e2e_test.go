@@ -21,6 +21,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
@@ -33,33 +36,100 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// The only store override delays retention; all authority and transactions remain SQL-backed.
+// Only the recovery-slot Exec is intercepted; successful writes use the service's
+// actual transaction and the service receives unwrapped *store.Queries.
 type lostReplyStore struct {
 	*store.Queries
+	workersvc.TxBeginner
+	t          *testing.T
+	owner      uuid.UUID
+	account    uuid.UUID
 	mu         sync.Mutex
 	delay      bool
+	delayed    int
+	retained   int
 	background []func()
 }
 
-func (q *lostReplyStore) SetCodexRecoverySlot(ctx context.Context, p store.SetCodexRecoverySlotParams) (int64, error) {
+func (q *lostReplyStore) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := q.TxBeginner.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &lostReplyTx{Tx: tx, fixture: q}, nil
+}
+
+type lostReplyTx struct {
+	pgx.Tx
+	fixture *lostReplyStore
+}
+
+func (tx *lostReplyTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if !strings.HasPrefix(sql, "-- name: SetCodexRecoverySlot :execrows\n") {
+		return tx.Tx.Exec(ctx, sql, args...)
+	}
+	q := tx.fixture
+	// Pin the generated query's argument order and the protected locked recovery
+	// exception. A changed SQL seam must fail visibly, not silently disable the fault.
+	valid := len(args) == 7
+	var gen int64
+	var id, owner, op uuid.UUID
+	if valid {
+		sealed, sealedOK := args[0].([]byte)
+		var genOK, idOK, ownerOK, opOK bool
+		gen, genOK = args[1].(int64)
+		mode, modeOK := args[2].(pgtype.Text)
+		cause, causeOK := args[3].(pgtype.Text)
+		id, idOK = args[4].(uuid.UUID)
+		owner, ownerOK = args[5].(uuid.UUID)
+		op, opOK = args[6].(uuid.UUID)
+		valid = sealedOK && len(sealed) > 0 && genOK && gen == 0 &&
+			modeOK && mode.Valid && mode.String == store.SealedWithMasterAAD &&
+			causeOK && cause.Valid && cause.String == "vault_locked" &&
+			idOK && id == q.account && ownerOK && owner == q.owner && opOK && op != uuid.Nil
+	}
+	if !valid {
+		q.t.Error("recovery-slot SQL seam or protected recovery parameters changed")
+		return pgconn.CommandTag{}, errors.New("fixture recovery parameters invalid")
+	}
 	q.mu.Lock()
 	delay := q.delay
 	q.mu.Unlock()
 	if delay {
-		// Check the generation and operation before quarantining the leased account.
-		account, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{ID: p.ID, UserID: p.UserID})
+		// withCodexVaultWrite holds secret advisory -> users here. Release those
+		// locks before the original durable metadata fault; quarantine must survive
+		// the failed material transaction, which has not executed its UPDATE.
+		if err := tx.Rollback(ctx); err != nil {
+			return pgconn.CommandTag{}, err
+		}
+		account, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{ID: id, UserID: owner})
 		if err != nil {
-			return 0, err
+			return pgconn.CommandTag{}, err
 		}
-		if account.Generation != p.Gen || !account.CoordOperationID.Valid || account.CoordOperationID.Bytes != p.Op {
-			return 0, errors.New("fixture retention fence lost")
+		if account.Generation != gen || !account.CoordOperationID.Valid || account.CoordOperationID.Bytes != op {
+			q.t.Error("fixture retention generation/operation fence lost")
+			return pgconn.CommandTag{}, errors.New("fixture retention fence lost")
 		}
-		if _, err := q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{ID: p.ID, UserID: p.UserID, Op: p.Op}); err != nil {
-			return 0, err
+		n, err := q.QuarantineCodexAccount(ctx, store.QuarantineCodexAccountParams{ID: id, UserID: owner, Op: op})
+		if err != nil {
+			return pgconn.CommandTag{}, err
 		}
-		return 0, errors.New("fixture retention not released")
+		if n != 1 && (n != 0 || account.CoordState != "quarantined") {
+			q.t.Error("fixture retention quarantine fence lost")
+			return pgconn.CommandTag{}, errors.New("fixture quarantine fence lost")
+		}
+		q.mu.Lock()
+		q.delayed++
+		q.mu.Unlock()
+		return pgconn.CommandTag{}, errors.New("fixture retention not released")
 	}
-	return q.Queries.SetCodexRecoverySlot(ctx, p)
+	tag, err := tx.Tx.Exec(ctx, sql, args...)
+	if err == nil && tag.RowsAffected() == 1 {
+		q.mu.Lock()
+		q.retained++
+		q.mu.Unlock()
+	}
+	return tag, err
 }
 
 func (q *lostReplyStore) dispatch(fn func()) {
@@ -248,11 +318,11 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 			}()
 			origin := filepath.Join(dir, "origin.git")
 			q := store.New(pool)
-			delayed := &lostReplyStore{Queries: q, delay: variant == "pending-retention"}
+			delayed := &lostReplyStore{Queries: q, TxBeginner: pool, t: t, delay: variant == "pending-retention"}
 			box := newHandlerTestBox(t)
 			vlt := vault.NewPostgres(box, pool)
-			svc := workersvc.New(delayed, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), RunRecoveryParkBase: time.Second, RunRecoveryMaxPark: time.Second})
-			svc.SetTxBeginner(pool)
+			svc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), RunRecoveryParkBase: time.Second, RunRecoveryMaxPark: time.Second})
+			svc.SetTxBeginner(delayed)
 			svc.SetVault(vlt)
 			svc.SetForges(settleForgeBuilder{f: &lostReplyForge{origin: origin}})
 			svc.SetBackground(delayed.dispatch)
@@ -378,6 +448,7 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			delayed.owner, delayed.account = owner, account.ID
 			if _, err := q.InsertCodexCredentialState(ctx, store.InsertCodexCredentialStateParams{UserSecretID: secret.ID, UserID: owner, Status: "staging"}); err != nil {
 				t.Fatal(err)
 			}
@@ -550,6 +621,12 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 					if before["slot"] != false || before["coord"] != "quarantined" {
 						return nil, errors.New("pending retention was already durable")
 					}
+					delayed.mu.Lock()
+					faultFired := delayed.delayed > 0 && delayed.retained == 0 && len(delayed.background) > 0
+					delayed.mu.Unlock()
+					if !faultFired {
+						return nil, errors.New("pending retention fault or controlled background retry did not fire")
+					}
 					delayed.release()
 				}
 				durable, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{ID: account.ID, UserID: owner})
@@ -680,6 +757,16 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 			}
 			if state["status"] != "completed" || state["consumed"] != 1 || state["holds"] != 0 {
 				t.Fatalf("completion/custody result: %v", state)
+			}
+			delayed.mu.Lock()
+			retained, faults := delayed.retained, delayed.delayed
+			delayed.mu.Unlock()
+			if variant == "account-unavailable" {
+				if retained != 0 || faults != 0 {
+					t.Error("provider rejection unexpectedly reached recovery-slot write")
+				}
+			} else if retained != 1 || (faults > 0) != (variant == "pending-retention") {
+				t.Errorf("recovery-slot hook: retained=%d delayed=%d", retained, faults)
 			}
 			mu.Lock()
 			seen := map[string]bool{attempts[0].Operation: true}
