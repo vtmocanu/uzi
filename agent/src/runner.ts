@@ -19,7 +19,7 @@ import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
-import { BASE_ATTESTATION_HOLD_REASON } from "./protocol.js";
+import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE } from "./protocol.js";
 import { PublicationContextLatch } from "./publication-context.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CREDENTIAL_SWITCH_HOLD_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
@@ -22501,7 +22501,7 @@ export class RunRunner {
       // PRD #84 M4: the FROZEN requirement set rides this same self-contained running
       // report (an autopilot run never reports awaiting_approval), each field only when
       // non-empty — same conditional-spread discipline as milestones/repo_agents above.
-      Object.assign(autopilotState, toolchainReportFields(toolchainDetection));
+      Object.assign(autopilotState, toolchainReportFields(toolchainDetection, this.client.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)));
       // RC1 (#1197): the approved autopilot plan rides this running report so the
       // server persists it durably via the guarded SetRunAutopilotPlan write — an
       // autopilot run never reports awaiting_approval, the channel the human-gated
@@ -22623,7 +22623,7 @@ export class RunRunner {
       // the server can gate plan-approval on worker eligibility. Each field only when
       // non-empty (additive-optional), matching the milestones conditional above.
       // PRD #1795: a re-presentation sends the requirements the human was shown instead.
-      ...(reuse ? presentedReportFields(reuse.presented) : toolchainReportFields(toolchainDetection)),
+      ...(reuse ? presentedReportFields(reuse.presented) : toolchainReportFields(toolchainDetection, this.client.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE))),
       // PRD #212 (Decision 3): ALWAYS send (empty [] when clean), NOT conditionally
       // spread — so each gate round REPLACES the server's list (M1's COALESCE clears on
       // empty), keeping a revision gate from showing a stale earlier round's writes.
@@ -23296,15 +23296,16 @@ function presentedReportFields(presented: GatePresentedRequirements | undefined)
   return fields;
 }
 
-/** Plan-time requirements omit empty arrays; a completed scan always includes its
- *  observation map ({} means known empty). Failed scans emit nothing. WorkerClient
- *  independently negotiates advisory metadata; size_class may floor server budgets. */
+/** Negotiate observations before freezing the plan report so the full captured
+ *  request matches its wire body and retries retain identical JSON. WorkerClient
+ *  still defends against feature shrink. Failed scans emit nothing; {} is known empty. */
 function toolchainReportFields(
   detection: ToolchainDetection | undefined,
+  evidenceSupported: boolean,
 ): Partial<StateRequest> {
   if (!detection) return {};
   const fields: Partial<StateRequest> = { size_class: detection.size_class };
-  fields.capability_inference_evidence = detection.evidence;
+  if (evidenceSupported) fields.capability_inference_evidence = detection.evidence;
   if (detection.required_capabilities.length)
     fields.required_capabilities = detection.required_capabilities;
   if (detection.required_tools.length)

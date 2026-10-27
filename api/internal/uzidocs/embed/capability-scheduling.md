@@ -99,8 +99,10 @@ alongside the plan, between the proposed milestones and the plan body:
 
 ### Why a capability is required
 
-The run's **Run requirements** panel shows each capability's known sources:
-the repo hint, inference, or both. Expand a source to see sampled repo-relative
+The run detail's read-only **Capability sources** section remains available while
+the run is running and after it finishes, including autopilot runs. At approval,
+the same information appears in **Run requirements**. Sources can be the repo hint,
+inference, or both. Expand a source to see sampled repo-relative
 trigger paths and the detector rule they matched. Ignored inferences appear as
 non-blocking observations; an explicit hint can still keep that capability required.
 Demo mode hides trigger paths.

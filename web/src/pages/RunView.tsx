@@ -103,6 +103,7 @@ import { Modal } from "../components/Modal";
 import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon } from "../components/icons";
 import { gateMismatchMessage, PlanPanel, SeededPlanPanel, type GateMismatch } from "./runView/PlanPanel";
+import { CapabilitySources } from "./runView/CapabilitySources";
 import { FullPlanPanel } from "./runView/FullPlanPanel";
 import { CompletionPending } from "./runView/CompletionPending";
 import { SemanticDrift } from "./runView/SemanticDrift";
@@ -2720,6 +2721,12 @@ export function RunView() {
       {actionErr && <Alert message={actionErr} />}
       <CompletionPending run={run} />
       <SemanticDrift run={run} />
+      {run.status !== "awaiting_approval" && (run.capability_provenance?.capabilities.length ?? 0) > 0 && (
+        <section aria-label="Run capability sources" className="rounded-xl border border-edge bg-surface p-4">
+          <h2 className="mb-2 text-sm font-semibold text-fg">Capability sources</h2>
+          <CapabilitySources provenance={run.capability_provenance} />
+        </section>
+      )}
       {/* PRD #1795 D5: a refused plan verdict whose refetch shows the run has left the gate.
           The panel that would word it has unmounted, so the page says it instead. */}
       {revisionMismatch && run.status !== "awaiting_approval" && (

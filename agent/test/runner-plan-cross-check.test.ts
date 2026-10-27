@@ -13,6 +13,7 @@ import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import { RecoveryCoordinator, type RecoveryArchiveClient } from "../src/recovery.js";
 import type { OutgoingMessage } from "../src/protocol.js";
+import { CAPABILITY_INFERENCE_EVIDENCE_FEATURE } from "../src/protocol.js";
 import { createHash } from "node:crypto";
 import { PlanRejectedError, type Executor, type RunContext } from "../src/executor.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
@@ -1368,9 +1369,10 @@ describe("U2 real runner checked gate", () => {
     });
   }
 
-  for (const droppedRound of [0, 1]) {
+  for (const [droppedRound, evidenceNegotiated] of [[0, false], [1, false], [0, true], [1, true]] as const) {
     for (const final of ["approve_plan", "reject_plan"] as const) {
-      it(`SDK dropped ${droppedRound === 0 ? "initial" : "revised"} ACK routes next revise before retry ACK then current ${final}`, { skip: LINUX_CAPTURE }, async () => {
+      it(`SDK dropped ${droppedRound === 0 ? "initial" : "revised"} ACK routes next revise before retry ACK then current ${final}${evidenceNegotiated ? " (evidence negotiated)" : ""}`, { skip: LINUX_CAPTURE }, async () => {
+        if (evidenceNegotiated) client.protocolFeatures = [...client.protocolFeatures, CAPABILITY_INFERENCE_EVIDENCE_FEATURE];
         const c = claim();
         const plans = [PLAN, "# PLAN SDK revision B", "# PLAN SDK revision C"].slice(0, droppedRound + 2);
         const milestones = [
@@ -1460,6 +1462,7 @@ describe("U2 real runner checked gate", () => {
           const retryIndex = droppedRound;
           assert.deepEqual(gates(c.run_id)[retryIndex + 1], gates(c.run_id)[retryIndex], "transport retry keeps full request identity");
           assert.equal(JSON.stringify(gates(c.run_id)[retryIndex + 1]), snapshots[retryIndex], "identical full JSON, id, generation and session");
+          assert.equal("capability_inference_evidence" in requests[retryIndex]!, evidenceNegotiated, "preserve negotiated evidence without adding unsupported fields");
           assert.equal(requests[retryIndex]!.claim_generation, c.claim_generation);
           assert.equal(requests[retryIndex]!.session_id, "sess-e2e");
           if (droppedRound === 0)
