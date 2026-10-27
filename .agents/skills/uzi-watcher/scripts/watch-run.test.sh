@@ -30,7 +30,7 @@ case "$*" in
       --arg rn "$(cat "$WORK/retry" 2>/dev/null || true)" \
       --arg hr "$(cat "$WORK/hold" 2>/dev/null || true)" \
       --arg dp "$(pollfile parks 2>/dev/null || true)" \
-      '{status:"running",hold_reason:(if $hr=="" then null else $hr end),recovery_wait_cause:(if $c=="" then null else $c end),recovery_retry_not_before:(if $rn=="" then null else $rn end),disk_park_count:(if $dp=="" then null else ($dp|tonumber) end),health:$h,health_reason:(if $h=="stalled" then "no progress 20m" else null end),health_since:(if $h=="ok" then null else ($since|if .=="" then null else . end) end),worker_id:(if $w=="" then null else $w end)}'
+      '{status:"running",hold_reason:(if $hr=="" then null else $hr end),recovery_wait_cause:(if $c=="" then null else $c end),recovery_retry_not_before:(if $rn=="" then null elif $rn=="EMPTY" then "" elif $rn=="FALSE" then false else $rn end),disk_park_count:(if $dp=="" then null else ($dp|tonumber) end),health:$h,health_reason:(if $h=="stalled" then "no progress 20m" else null end),health_since:(if $h=="ok" then null else ($since|if .=="" then null else . end) end),worker_id:(if $w=="" then null else $w end)} | if $rn=="OMIT" then del(.recovery_retry_not_before) else . end'
     mv "$WORK/poll.next" "$WORK/poll" ;;
   "worker list --json") cat "$WORK/workers" ;;
   "run logs "*" --json") [ -f "$WORK/logs" ] || exit 1; cat "$WORK/logs" ;;
@@ -176,6 +176,16 @@ echo 2026-10-27T03:00:00Z > "$WORK/retry"
 rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
 [ "$rc" -eq 3 ] || fail "timed retained park should expire: $rc: $out"
 case "$out" in *STOP=*) fail "timed retained park stopped: $out";; esac
+
+# 12f. only an explicit null stamp is a hold: an omitted, empty or false stamp keeps polling
+for v in OMIT EMPTY FALSE; do
+  reset recovery_wait ok "" '[]'
+  echo retained_recovery_exhausted > "$WORK/cause"
+  echo "$v" > "$WORK/retry"
+  rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
+  [ "$rc" -eq 3 ] || fail "retained park with $v stamp should expire: $rc: $out"
+  case "$out" in *STOP=*) fail "retained park with $v stamp stopped: $out";; esac
+done
 
 # 13. any other recovery_wait cause keeps its existing behaviour: keep polling to ELAPSED
 reset recovery_wait ok "" '[]'

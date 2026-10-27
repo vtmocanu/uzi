@@ -68,8 +68,8 @@
 # resumes on its own (the owner must Resume or Cancel), so it always stops the watch, whatever the
 # stop set (also when the stop set names recovery_wait): STOP=recovery_wait:worker_requeue_exhausted,
 # RESULT=stop:recovery_wait, exit 0. So does an owner-held `retained_recovery_exhausted` park (#3495:
-# NULL recovery_retry_not_before = retries capped): STOP=recovery_wait:retained_recovery_exhausted.
-# A stamped one is an automatic retry and keeps polling. Other recovery_wait causes keep polling unless the stop set names
+# recovery_retry_not_before present and explicitly null = retries capped):
+# STOP=recovery_wait:retained_recovery_exhausted. A stamped, omitted or malformed one keeps polling. Other recovery_wait causes keep polling unless the stop set names
 # recovery_wait, except a `data_volume_full` park, which is an attention signal (above).
 # `paused` never resumes on its own either (an owner pause, or hold_reason budget_exhausted /
 # completion hold that needs extend, resume or decide), so it always stops the watch, whatever the
@@ -174,7 +174,7 @@ while [ "$i" -lt "$MAX" ]; do
       exit 0
     fi
     if [ "$rc_cause" = retained_recovery_exhausted ] &&
-       [ "$(printf '%s' "$rj" | jq -r '.recovery_retry_not_before // ""' 2>/dev/null)" = "" ]; then
+       printf '%s' "$rj" | jq -e 'has("recovery_retry_not_before") and .recovery_retry_not_before == null' >/dev/null 2>&1; then
       printf 'STOP=recovery_wait:retained_recovery_exhausted\n'
       printf 'NOTE owner decision: automatic retained-recovery retries are capped (no retry stamp); local work and custody are retained; uzi run resume or cancel\n'
       printf 'RESULT=stop:recovery_wait\n'
