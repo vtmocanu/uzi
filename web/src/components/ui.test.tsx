@@ -405,6 +405,12 @@ it.each([
   expect(container.textContent).toBe(label);
   expect(container.querySelector(".text-warn")).toBeTruthy();
 });
+it.each([null, undefined, "invalid", "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z"])("StatusPill renders adoption integrity hold regardless of timing %s", (stamp) => {
+  const { container } = render(<StatusPill status="recovery_wait" recovery_wait_cause="retained_recovery_adoption_failed" recovery_retry_not_before={stamp} />);
+  expect(container.textContent).toBe("retained recovery integrity hold");
+  expect(container.querySelector(".text-warn")).toBeTruthy();
+  expect(container.querySelector(".animate-pulse")).toBeNull();
+});
 it("StatusPill keeps a narrow projection's recovery cause unknown", () => {
   const { container } = render(<StatusPill status="recovery_wait" />);
   expect(container.textContent).toBe("recovery wait");

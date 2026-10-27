@@ -3494,6 +3494,10 @@ export interface Run {
    *  while it stays locked), and "data_volume_full" (PRD #1809 M5: the worker's data volume
    *  was full or about to fill; the run resumes at its next retry, see disk_park_count);
    *  "provider_outage" is a counted provider interruption with a scheduled retry;
+   *  "retained_recovery_exhausted" can be timed or owner-held (see recovery_retry_not_before);
+   *  "retained_recovery_adoption_failed" means integrity checks refused adoption of retained
+   *  work: always owner-held with local work and custody preserved, no automatic retry.
+   *  Only the owner can Resume or Cancel, through the existing owner authorization.
    *  "empty_turn" remains reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
@@ -3518,7 +3522,11 @@ export interface Run {
    *  the next retry a `vault_locked` park resumes at once the vault is unlocked. The
    *  recovery-park analog of retry_not_before (the usage-limit park's stamp) and a SEPARATE
    *  field: a run parks on at most one of the two at a time. Null for a run that has never
-   *  recovery-parked. ISO-8601 string, like every other timestamp on this type. */
+   *  recovery-parked. For retained_recovery_exhausted, explicit null means owner-held;
+   *  a valid timestamp means timed retry (including when already due). Missing or invalid
+   *  timing is unknown. For retained_recovery_adoption_failed this is always null and must
+   *  never produce a retry countdown, even if a malformed response supplies a timestamp.
+   *  ISO-8601 string, like every other timestamp on this type. */
   recovery_retry_not_before: string | null;
   /** PRD #1392 M1: how many times this run has forge-parked in its lifetime — the
    *  FORGE-ONLY counter the cap decides on. 0 for a run that has never forge-parked

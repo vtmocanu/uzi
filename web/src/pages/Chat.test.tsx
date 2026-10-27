@@ -241,6 +241,19 @@ it.each([
   expect(screen.getByText(label)).toBeTruthy();
   await waitFor(() => expect(mockApi.listChats).toHaveBeenCalled());
 });
+it.each([null, "2099-01-01T00:00:00Z"])("chat detail renders adoption integrity hold regardless of timing %s", async (stamp) => {
+  mockApi.listChats.mockResolvedValue(chatList([]));
+  vi.mocked(useRunStream).mockReturnValue({
+    run: { ...mockRuns[0], id: "c1", status: "recovery_wait", recovery_wait_cause: "retained_recovery_adoption_failed", recovery_retry_not_before: stamp },
+    messages: [], connected: true, error: "", refreshRun: vi.fn(),
+  } as unknown as ReturnType<typeof useRunStream>);
+  render(<MemoryRouter initialEntries={["/chat/c1"]}><Routes>
+    <Route path="/chat/:id" element={<ChatConversation />} />
+  </Routes></MemoryRouter>);
+  expect(screen.getByText("retained recovery integrity hold")).toBeTruthy();
+  expect(screen.queryByText("retained recovery retrying")).toBeNull();
+  await waitFor(() => expect(mockApi.listChats).toHaveBeenCalled());
+});
 it("chat list keeps omitted recovery metadata generic", async () => {
   mockApi.listChats.mockResolvedValue(chatList([aChat({ status: "recovery_wait" })]));
   render(<MemoryRouter><ChatList /></MemoryRouter>);

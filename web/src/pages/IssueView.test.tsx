@@ -1544,6 +1544,16 @@ describe("IssueView history rejection presentation", () => {
 });
 
 
+it.each([null, "2099-01-01T00:00:00Z"])("adoption refusal history uses integrity hold label with timestamp %s", async (stamp) => {
+  setAuth();
+  mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+  mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status: "recovery_wait", recovery_wait_cause: "retained_recovery_adoption_failed", recovery_retry_not_before: stamp } as Partial<RunListItem>)] });
+  renderIssueView();
+  const badge = await screen.findByText("retained recovery integrity hold");
+  expect(badge.classList.contains("text-warn")).toBe(true);
+  expect(screen.queryByText("retained recovery retrying")).toBeNull();
+});
+
 it.each([
   ["2099-01-01T00:00:00Z", "retained recovery retrying"],
   ["2020-01-01T00:00:00Z", "retained recovery retrying"],

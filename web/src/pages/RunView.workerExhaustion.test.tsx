@@ -237,6 +237,40 @@ it("badge and shared pill describe the owner decision without automatic retry", 
 });
 
 
+function adoptionFailed(stamp: string | null = null): Run {
+  return { ...held(), recovery_wait_cause: "retained_recovery_adoption_failed", recovery_retry_not_before: stamp };
+}
+it.each([null, "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "invalid"])("adoption integrity refusal ignores retry timestamp %s and uses owner actions", async (stamp) => {
+  const { container } = render(view(adoptionFailed(stamp), true));
+  expect(screen.getByText("Retained recovery integrity check failed")).toBeTruthy();
+  expect(screen.getByText(/Integrity checks refused to adopt the retained work/, { selector: "p" })).toBeTruthy();
+  expect(screen.getByText(/Local work and its custody are preserved/, { selector: "p" })).toBeTruthy();
+  expect(screen.getByText(/This hold has no scheduled retry. Only the run owner can Resume or Cancel/)).toBeTruthy();
+  expect(container.textContent).not.toMatch(/retry automatically|retrying in|retry in|Automatic retry is due|Retry timing is unavailable/i);
+  const notice = container.querySelector('div.sr-only[role="status"]')!;
+  await waitFor(() => expect(notice.textContent).toMatch(/Integrity checks refused/));
+  expect(notice.textContent).toMatch(/no scheduled retry/);
+  expect(api.getRunArchives).toHaveBeenCalledWith("held");
+  fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));
+  await waitFor(() => expect(api.resumeRun).toHaveBeenCalledWith("held"));
+  await waitFor(() => expect(refreshRun).toHaveBeenCalledOnce());
+  fireEvent.click(screen.getByRole("button", { name: /^Cancel$/ }));
+  await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+});
+it.each([undefined, false])("adoption refusal requires confirmed owner proof %s", (proof) => {
+  render(view(adoptionFailed("2099-01-01T00:00:00Z"), proof));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+  expect(api.getRunArchives).not.toHaveBeenCalled();
+});
+it("adoption refusal requires steer permission and reacts to owner proof changes", () => {
+  const { rerender } = render(view(adoptionFailed(), true, false));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+  rerender(view(adoptionFailed(), true));
+  expect((screen.getByRole("button", { name: /^Resume$/ }) as HTMLButtonElement).disabled).toBe(false);
+  rerender(view(adoptionFailed(), false));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+});
+
 function retained(stamp: string | null): Run {
   return { ...held(), recovery_wait_cause: "retained_recovery_exhausted", recovery_retry_not_before: stamp };
 }
