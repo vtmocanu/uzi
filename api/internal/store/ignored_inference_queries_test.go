@@ -19,7 +19,9 @@ func TestRepoHintCreatorsSnapshotIgnoredInference(t *testing.T) {
 	columnsRE := regexp.MustCompile(`(?s)INSERT INTO runs\s*\((.*?)\)\s*(?:VALUES|SELECT)`)
 	repoHintRE := regexp.MustCompile(`(?i)SELECT\s+(?:\w+\.)?required_capabilities\s+FROM\s+repos\b`)
 	repoPolicyRE := regexp.MustCompile(`(?i)SELECT\s+(?:\w+\.)?ignored_inferred_capabilities\s+FROM\s+repos\b`)
+	aliasedReadRE := regexp.MustCompile(`(?i)\b(?:FROM|JOIN)\s+(repos|runs)\s+(?:AS\s+)?(\w+)`)
 	seenCreateRun := false
+	seenPlanChild := false
 	for _, path := range files {
 		raw, err := os.ReadFile(path) //nolint:gosec // Paths come only from the fixed queries directory.
 		if err != nil {
@@ -32,18 +34,32 @@ func TestRepoHintCreatorsSnapshotIgnoredInference(t *testing.T) {
 				end = matches[i+1][0]
 			}
 			query := string(raw[match[0]:end])
-			if !strings.Contains(query, "INSERT INTO runs") || !repoHintRE.MatchString(query) {
+			copiesRepoHint := repoHintRE.MatchString(query)
+			copiesPolicy := repoPolicyRE.MatchString(query)
+			for _, source := range aliasedReadRE.FindAllStringSubmatch(query, -1) {
+				if strings.EqualFold(source[1], "repos") && strings.Contains(query, source[2]+".required_capabilities") {
+					copiesRepoHint = true
+				}
+				if strings.Contains(query, source[2]+".ignored_inferred_capabilities") {
+					copiesPolicy = true
+				}
+			}
+			if !strings.Contains(query, "INSERT INTO runs") || !copiesRepoHint {
 				continue
 			}
 			name := string(raw[match[2]:match[3]])
 			seenCreateRun = seenCreateRun || name == "CreateRun"
+			seenPlanChild = seenPlanChild || name == "CreatePlanCrossCheckChild"
 			columns := columnsRE.FindStringSubmatch(query)
-			if len(columns) != 2 || !strings.Contains(columns[1], "ignored_inferred_capabilities") || !repoPolicyRE.MatchString(query) {
+			if len(columns) != 2 || !strings.Contains(columns[1], "ignored_inferred_capabilities") || !copiesPolicy {
 				t.Errorf("%s in %s copies the repo hint without its ignored-inference snapshot", name, path)
 			}
 		}
 	}
 	if !seenCreateRun {
 		t.Fatal("CreateRun was not inspected; query discovery is broken")
+	}
+	if !seenPlanChild {
+		t.Fatal("CreatePlanCrossCheckChild was not inspected; JOIN discovery is broken")
 	}
 }

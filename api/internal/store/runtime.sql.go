@@ -3480,10 +3480,10 @@ func (q *Queries) CreatePauseInput(ctx context.Context, arg CreatePauseInputPara
 const createPlanCrossCheckChild = `-- name: CreatePlanCrossCheckChild :one
 INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
                   report_only, budget_wall_seconds, dispatched_at, auto_approve,
-                  issue_title, issue_description, required_capabilities, trigger_source, worker_id)
+                  issue_title, issue_description, required_capabilities, ignored_inferred_capabilities, trigger_source, worker_id)
 SELECT $1, lead.user_id, lead.repo_id, 'cross_check', lead.id, $2::text, 2,
        true, $3::int, now(), true, lead.issue_title, lead.issue_description,
-       COALESCE(repo.required_capabilities, '{}'), 'cross_check', lead.worker_id
+       COALESCE(repo.required_capabilities, '{}'), lead.ignored_inferred_capabilities, 'cross_check', lead.worker_id
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id
 WHERE lead.id = $4 AND lead.user_id = $5
   AND lead.worker_id = $6 AND lead.claim_generation = $7
@@ -3506,6 +3506,7 @@ type CreatePlanCrossCheckChildParams struct {
 	ClaimGeneration   int64       `json:"claim_generation"`
 }
 
+// Preserve the lead's frozen inference policy; declared requirements keep their repo-hint source.
 func (q *Queries) CreatePlanCrossCheckChild(ctx context.Context, arg CreatePlanCrossCheckChildParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createPlanCrossCheckChild,
 		arg.ChildID,
