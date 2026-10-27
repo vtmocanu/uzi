@@ -214,7 +214,7 @@ func TestCodexRefreshInstrumentationNoSecretLeakLiveDB(t *testing.T) {
 
 	res, aerr := svc.advanceCodexRefresh(
 		env.ctx, env.q, f.userID, f.accountID, uuid.New(),
-		acct, time.Now().Add(time.Hour), time.Now().Add(time.Hour),
+		env.mustAccountSnapshot(t, f.userID, f.accountID), time.Now().Add(time.Hour), time.Now().Add(time.Hour),
 	)
 	if aerr != nil {
 		t.Fatalf("advanceCodexRefresh: %v", aerr)
@@ -272,7 +272,7 @@ func TestCodexRefreshInstrumentationProviderErrorLiveDB(t *testing.T) {
 	acct = env.mustAccount(t, f.userID, f.accountID)
 	_, aerr := f.svc.advanceCodexRefresh(
 		env.ctx, env.q, f.userID, f.accountID, uuid.New(),
-		acct, time.Now().Add(time.Hour), time.Now().Add(time.Hour),
+		env.mustAccountSnapshot(t, f.userID, f.accountID), time.Now().Add(time.Hour), time.Now().Add(time.Hour),
 	)
 	if aerr == nil {
 		t.Fatalf("advanceCodexRefresh: expected a non-nil error on provider failure")

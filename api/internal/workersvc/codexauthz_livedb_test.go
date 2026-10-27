@@ -110,7 +110,7 @@ func newSubscriptionFixture(t *testing.T, env codexTestEnv) codexRunFixture {
 	refresh := codexToken("refresh")
 	aliasID := env.seedLinkedSubscription(t, userID, "codex-sub-"+uuid.NewString(), access, refresh)
 	runID := env.seedCodexRun(t, userID, workerID, repoID)
-	svc := &Service{q: env.q, box: env.box}
+	svc := &Service{q: env.q, box: env.box, vlt: env.vlt}
 	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeSubscription); err != nil {
 		t.Fatalf("FreezeCodexBinding: %v", err)
 	}
@@ -373,7 +373,7 @@ func TestAuthorizeCodexScopeNotApplicableAPIKeyLiveDB(t *testing.T) {
 	staticKey := codexToken("sk")
 	aliasID := env.seedStaticAPIKey(t, userID, "codex-key-"+uuid.NewString(), staticKey)
 	runID := env.seedCodexRun(t, userID, workerID, repoID)
-	svc := &Service{q: env.q, box: env.box}
+	svc := &Service{q: env.q, box: env.box, vlt: env.vlt}
 	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeAPIKey); err != nil {
 		t.Fatalf("FreezeCodexBinding: %v", err)
 	}
@@ -678,7 +678,7 @@ func (d *midMintStore) SetRunCodexClaimCapability(ctx context.Context, arg store
 	return epoch, nil
 }
 
-// midOpenStore decorates the Codex claim store: its GetCodexProviderAccountByID runs the
+// midOpenStore decorates the Codex claim store: its GetCodexProviderAccountSnapshot runs the
 // REAL read and then, before returning, fires an injected callback that mutates DB state.
 // It reproduces the window BETWEEN Barrier A and Barrier B — a state change that lands
 // AFTER the post-mint re-check (Barrier A) but during the subscription decrypt, so only
@@ -690,8 +690,8 @@ type midOpenStore struct {
 	afterRead func()
 }
 
-func (d *midOpenStore) GetCodexProviderAccountByID(ctx context.Context, arg store.GetCodexProviderAccountByIDParams) (store.CodexProviderAccount, error) {
-	acct, err := d.Queries.GetCodexProviderAccountByID(ctx, arg)
+func (d *midOpenStore) GetCodexProviderAccountSnapshot(ctx context.Context, arg store.GetCodexProviderAccountSnapshotParams) (store.GetCodexProviderAccountSnapshotRow, error) {
+	acct, err := d.Queries.GetCodexProviderAccountSnapshot(ctx, arg)
 	if err != nil {
 		return acct, err
 	}
@@ -709,7 +709,7 @@ func newAPIKeyFixture(t *testing.T, env codexTestEnv) codexRunFixture {
 	staticKey := codexToken("sk")
 	aliasID := env.seedStaticAPIKey(t, userID, "codex-key-"+uuid.NewString(), staticKey)
 	runID := env.seedCodexRun(t, userID, workerID, repoID)
-	svc := &Service{q: env.q, box: env.box}
+	svc := &Service{q: env.q, box: env.box, vlt: env.vlt}
 	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeAPIKey); err != nil {
 		t.Fatalf("FreezeCodexBinding (api_key): %v", err)
 	}
@@ -804,7 +804,7 @@ func TestCodexClaimSecretsReauthorizesAfterMintLiveDB(t *testing.T) {
 // re-check catches a state change that lands in the window BETWEEN Barrier A and Barrier B —
 // specifically DURING the subscription account read/decrypt, after the post-mint re-check
 // (Barrier A) has already passed on a clean snapshot. A midOpenStore fires each mutation from
-// inside the real GetCodexProviderAccountByID, so it lands after Barrier A but before Barrier
+// inside the real GetCodexProviderAccountSnapshot, so it lands after Barrier A but before Barrier
 // B's fresh read; each case asserts the claim returns its specific sentinel and releases NO
 // access token. The mutations here leave codex_claim_epoch and codex_cap_hash untouched, so
 // Barrier B's epoch/hash guard is NOT what rejects them — its FRESH release-predicate and

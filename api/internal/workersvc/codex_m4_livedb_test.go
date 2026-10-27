@@ -572,6 +572,7 @@ func TestCodexDarkNoCodexOnNormalClaimPathLiveDB(t *testing.T) {
 	          VALUES ($1, $2, 'anthropic_token', $3, true, $4, 'master')`,
 		uuid.New(), userID, "anthropic-"+uuid.NewString(), anthropicSealed)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	wkr := store.Worker{ID: workerID, UserID: userID}
 
 	// The normal run has NO codex binding frozen and stays harness='claude' (the assembly branch

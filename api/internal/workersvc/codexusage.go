@@ -163,6 +163,7 @@ func (s *Service) codexUsageReader() (CodexUsageReader, bool) {
 // Store interface for the same reason codexAuthzStore is. *store.Queries satisfies it.
 type codexUsageStore interface {
 	GetCodexProviderAccountByID(ctx context.Context, arg store.GetCodexProviderAccountByIDParams) (store.CodexProviderAccount, error)
+	codexAccountSnapshotStore
 	CountEnabledLinkedAliasesForCodexAccount(ctx context.Context, arg store.CountEnabledLinkedAliasesForCodexAccountParams) (int64, error)
 	MarkCodexReauthRequired(ctx context.Context, arg store.MarkCodexReauthRequiredParams) (int64, error)
 }
@@ -207,7 +208,7 @@ func (s *Service) CollectCodexAccountUsage(ctx context.Context, userID, accountI
 	}
 
 	// (1) Re-read the account owner-scoped.
-	acct, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: userID, ID: accountID})
+	acct, err := readCodexAccountSnapshot(ctx, q, store.GetCodexProviderAccountSnapshotParams{UserID: userID, ID: accountID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return CodexUsageReading{}, codexUsageFail(CodexUsageFailNotLinked)
@@ -221,10 +222,10 @@ func (s *Service) CollectCodexAccountUsage(ctx context.Context, userID, accountI
 	}
 
 	// (3) Refuse a non-pollable state, then capture the principal.
-	if f := codexInitialPollableState(acct); f != nil {
+	if f := codexInitialPollableState(acct.CodexProviderAccount); f != nil {
 		return CodexUsageReading{}, f
 	}
-	principal := s.newCodexPollPrincipal(acct)
+	principal := s.newCodexPollPrincipal(acct.CodexProviderAccount)
 
 	// (4)-(7) Read the usage, with at most one bounded refresh/retry.
 	reading, captured, f := s.readCodexUsage(ctx, q, reader, principal, acct)
@@ -251,14 +252,14 @@ func (s *Service) TestCodexLinkedAccount(ctx context.Context, userID, accountID 
 	if !ok || reader == nil {
 		return "inconclusive", "generic"
 	}
-	acct, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: userID, ID: accountID})
-	if err != nil || codexRotatableState(acct) != nil {
+	acct, err := readCodexAccountSnapshot(ctx, q, store.GetCodexProviderAccountSnapshotParams{UserID: userID, ID: accountID})
+	if err != nil || codexRotatableState(acct.CodexProviderAccount) != nil {
 		return "inconclusive", "generic"
 	}
 	if !s.codexVaultUnlocked(ctx, userID) {
 		return "inconclusive", "vault_locked"
 	}
-	blob, err := s.openCodexAccountLogin(userID, acct)
+	blob, err := s.openCodexAccountLogin(ctx, userID, acct)
 	if errors.Is(err, errVaultLocked) {
 		return "inconclusive", "vault_locked"
 	}
@@ -267,7 +268,7 @@ func (s *Service) TestCodexLinkedAccount(ctx context.Context, userID, accountID 
 	}
 	reading, callErr := reader.ReadUsage(ctx, blob.AccessToken, acct.WorkspaceAccountID)
 	status := "inconclusive"
-	if callErr == nil && codexUsageIdentityMatches(acct, reading) {
+	if callErr == nil && codexUsageIdentityMatches(acct.CodexProviderAccount, reading) {
 		status = "ok"
 	} else {
 		var authErr *codexauth.AuthError
@@ -289,10 +290,10 @@ func (s *Service) TestCodexLinkedAccount(ctx context.Context, userID, accountID 
 // 401 only — one bounded retry, either against a newer committed generation or after a single
 // coordinated rotation. It returns the reading and the account row it was CAPTURED UNDER (so
 // step 8 fences on the right generation), or a typed failure.
-func (s *Service) readCodexUsage(ctx context.Context, q codexUsageStore, reader CodexUsageReader, principal codexPollPrincipal, acct store.CodexProviderAccount) (codexauth.UsageReading, store.CodexProviderAccount, *CodexUsageFailure) {
+func (s *Service) readCodexUsage(ctx context.Context, q codexUsageStore, reader CodexUsageReader, principal codexPollPrincipal, acct codexAccountSnapshot) (codexauth.UsageReading, store.CodexProviderAccount, *CodexUsageFailure) {
 	reading, f, unauthorized := s.readCodexUsageAttempt(ctx, reader, acct)
 	if !unauthorized {
-		return reading, acct, f
+		return reading, acct.CodexProviderAccount, f
 	}
 	return s.handleCodexUsageUnauthorized(ctx, q, reader, principal)
 }
@@ -301,8 +302,8 @@ func (s *Service) readCodexUsage(ctx context.Context, q codexUsageStore, reader 
 // It returns (reading, failure, unauthorized): unauthorized is true ONLY for a 401, which the
 // caller handles specially (the refresh loop); every other outcome is a terminal reading or a
 // typed failure. The token is opened and discarded here — it never leaves this function.
-func (s *Service) readCodexUsageAttempt(ctx context.Context, reader CodexUsageReader, acct store.CodexProviderAccount) (codexauth.UsageReading, *CodexUsageFailure, bool) {
-	blob, err := s.openCodexAccountLogin(acct.UserID, acct)
+func (s *Service) readCodexUsageAttempt(ctx context.Context, reader CodexUsageReader, acct codexAccountSnapshot) (codexauth.UsageReading, *CodexUsageFailure, bool) {
+	blob, err := s.openCodexAccountLogin(ctx, acct.UserID, acct)
 	if err != nil {
 		if errors.Is(err, errVaultLocked) {
 			return codexauth.UsageReading{}, codexUsageFail(CodexUsageFailVaultLocked), false
@@ -322,7 +323,7 @@ func (s *Service) readCodexUsageAttempt(ctx context.Context, reader CodexUsageRe
 
 	// (6) Identity-mismatch check BEFORE returning any reading. Never persist/log/return the
 	// raw provider ids — only the boolean verdict leaves here.
-	if !codexUsageIdentityMatches(acct, reading) {
+	if !codexUsageIdentityMatches(acct.CodexProviderAccount, reading) {
 		return codexauth.UsageReading{}, codexUsageFail(CodexUsageFailProviderMismatch), false
 	}
 	return reading, nil, false
@@ -338,7 +339,7 @@ func (s *Service) readCodexUsageAttempt(ctx context.Context, reader CodexUsageRe
 // failure (contended, quarantined, a 5xx, a transport error, a 400/401 without a
 // material-rejection code) is transient, never reauth.
 func (s *Service) handleCodexUsageUnauthorized(ctx context.Context, q codexUsageStore, reader CodexUsageReader, principal codexPollPrincipal) (codexauth.UsageReading, store.CodexProviderAccount, *CodexUsageFailure) {
-	fresh, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: principal.userID, ID: principal.accountID})
+	fresh, err := readCodexAccountSnapshot(ctx, q, store.GetCodexProviderAccountSnapshotParams{UserID: principal.userID, ID: principal.accountID})
 	if err != nil {
 		return codexauth.UsageReading{}, store.CodexProviderAccount{}, codexUsageFail(CodexUsageFailTransient)
 	}
@@ -352,11 +353,11 @@ func (s *Service) handleCodexUsageUnauthorized(ctx context.Context, q codexUsage
 			// expiry, so retry next tick rather than refresh again or flag reauth.
 			return codexauth.UsageReading{}, store.CodexProviderAccount{}, codexUsageFail(CodexUsageFailTransient)
 		}
-		return reading, fresh, f
+		return reading, fresh.CodexProviderAccount, f
 	}
 
 	// No newer generation. Rotate only if the account state permits it.
-	if f := codexRotatableState(fresh); f != nil {
+	if f := codexRotatableState(fresh.CodexProviderAccount); f != nil {
 		return codexauth.UsageReading{}, store.CodexProviderAccount{}, f
 	}
 	// A rotation is a background refresh: re-prove the account is still live right before
@@ -406,7 +407,7 @@ func (s *Service) handleCodexUsageUnauthorized(ctx context.Context, q codexUsage
 
 	// Rotation advanced (or reconciled to a committed generation). Re-read the account and
 	// retry ReadUsage once against the now-committed token.
-	advanced, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: principal.userID, ID: principal.accountID})
+	advanced, err := readCodexAccountSnapshot(ctx, q, store.GetCodexProviderAccountSnapshotParams{UserID: principal.userID, ID: principal.accountID})
 	if err != nil {
 		return codexauth.UsageReading{}, store.CodexProviderAccount{}, codexUsageFail(CodexUsageFailTransient)
 	}
@@ -416,7 +417,7 @@ func (s *Service) handleCodexUsageUnauthorized(ctx context.Context, q codexUsage
 		// next tick rather than loop the refresh or flag reauth.
 		return codexauth.UsageReading{}, store.CodexProviderAccount{}, codexUsageFail(CodexUsageFailTransient)
 	}
-	return reading, advanced, f
+	return reading, advanced.CodexProviderAccount, f
 }
 
 // finalizeCodexUsage re-reads the account after the provider call and refuses a stale reading

@@ -147,8 +147,8 @@ type releaseHookStore struct {
 	onAccountRead func()
 }
 
-func (h releaseHookStore) GetCodexProviderAccountByID(ctx context.Context, arg store.GetCodexProviderAccountByIDParams) (store.CodexProviderAccount, error) {
-	acct, err := h.Queries.GetCodexProviderAccountByID(ctx, arg)
+func (h releaseHookStore) GetCodexProviderAccountSnapshot(ctx context.Context, arg store.GetCodexProviderAccountSnapshotParams) (store.GetCodexProviderAccountSnapshotRow, error) {
+	acct, err := h.Queries.GetCodexProviderAccountSnapshot(ctx, arg)
 	if h.onAccountRead != nil {
 		h.onAccountRead()
 	}
@@ -1236,7 +1236,7 @@ func TestReleaseCodexCredentialAPIKeyLiveDB(t *testing.T) {
 	key := codexToken("sk")
 	aliasID := env.seedStaticAPIKey(t, userID, "codex-key-"+uuid.NewString(), key)
 	runID := env.seedCodexRun(t, userID, workerID, repoID)
-	svc := &Service{q: env.q, box: env.box}
+	svc := &Service{q: env.q, box: env.box, vlt: env.vlt}
 	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeAPIKey); err != nil {
 		t.Fatalf("FreezeCodexBinding: %v", err)
 	}
@@ -1460,7 +1460,7 @@ func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 	if acct.SealedWith != store.SealedWithDEK {
 		t.Fatalf("promoted sealed_with = %q, want %q", acct.SealedWith, store.SealedWithDEK)
 	}
-	blob, oerr := f.svc.openCodexAccountLogin(f.userID, acct)
+	blob, oerr := f.svc.openCodexAccountLogin(env.ctx, f.userID, env.mustAccountSnapshot(t, f.userID, f.accountID))
 	if oerr != nil {
 		t.Fatalf("open promoted login: %v", oerr)
 	}
@@ -1708,4 +1708,14 @@ func (h *recoverySlotZeroStore) bindCodexRefreshTx(q *store.Queries) codexRefres
 
 func (h boundRecoverySlotZeroStore) SetCodexRecoverySlot(ctx context.Context, arg store.SetCodexRecoverySlotParams) (int64, error) {
 	return h.hook.SetCodexRecoverySlot(ctx, arg)
+}
+
+// mustAccountSnapshot reads material and epoch in the same executed query.
+func (e codexTestEnv) mustAccountSnapshot(t *testing.T, userID, accountID uuid.UUID) codexAccountSnapshot {
+	t.Helper()
+	row, err := readCodexAccountSnapshot(e.ctx, e.q, store.GetCodexProviderAccountSnapshotParams{UserID: userID, ID: accountID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return row
 }

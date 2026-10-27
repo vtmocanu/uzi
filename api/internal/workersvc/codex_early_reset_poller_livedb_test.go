@@ -20,6 +20,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -115,7 +116,7 @@ func TestCodexEarlyResetAuxiliaryProvenanceLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	exec(`INSERT INTO users (id,email,password_hash,notify_early_limit_reset) VALUES ($1,$2,'x',true)`, user, "early-reset-"+uuid.NewString()+"@example.test")
+	exec(`INSERT INTO users (id,email,password_hash,notify_early_limit_reset,vault_mode) VALUES ($1,$2,'x',true,'unprotected')`, user, "early-reset-"+uuid.NewString()+"@example.test")
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
@@ -131,6 +132,7 @@ func TestCodexEarlyResetAuxiliaryProvenanceLiveDB(t *testing.T) {
 		exec(`INSERT INTO codex_credential_state (user_secret_id,user_id,status,provider_account_id) VALUES ($1,$2,'linked',$3)`, alias, user, account)
 	}
 	svc := workersvc.New(q, box, workersvc.Params{})
+	svc.SetVault(vault.NewPostgres(box, pool))
 	doer := &earlyResetUsageHTTP{workspace: workspace}
 	svc.SetCodexRefresh(codexauth.NewClient(codexauth.WithHTTPDoer(doer)))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

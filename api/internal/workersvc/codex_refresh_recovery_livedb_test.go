@@ -353,7 +353,7 @@ func TestCodexRefreshRecoveryPromotedBeforeFirstResponseLiveDB(t *testing.T) {
 						if err := v.Unlock(e.ctx, f.userID, "first-response-password"); err != nil {
 							t.Fatal(err)
 						}
-						if changed, err := f.svc.promoteCodexRecovery(e.ctx, e.q, f.userID, acct); err != nil || !changed {
+						if changed, err := f.svc.promoteCodexRecovery(e.ctx, e.q, f.userID, e.mustAccountSnapshot(t, f.userID, f.accountID)); err != nil || !changed {
 							t.Fatalf("promotion=(%v,%v)", changed, err)
 						}
 						acct = e.mustAccount(t, f.userID, f.accountID)

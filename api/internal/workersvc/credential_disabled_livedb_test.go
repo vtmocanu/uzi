@@ -46,6 +46,7 @@ func newCDFix(t *testing.T) *cdFix {
 		o.workerID, fx.pinTok, "nonce-"+uuid.NewString(),
 		[]string{capability.RecoveryArchiveV1, capability.CredentialSwitchV1})
 	fx.svc = New(env.q, env.box, testParams())
+	fx.svc.SetVault(env.vlt)
 	fx.svc.SetTxBeginner(env.pool)
 	fx.svc.SetBackground(func(fn func()) { fx.requests++; fn() })
 	return fx

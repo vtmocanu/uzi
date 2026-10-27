@@ -197,7 +197,7 @@ func TestCodexRefreshResolution(t *testing.T) {
 func TestCodexReturnCommittedRefusesQuarantined(t *testing.T) {
 	s := &Service{}
 	acct := store.CodexProviderAccount{CoordState: codexCoordQuarantined, Generation: 2}
-	res, err := s.codexReturnCommitted(uuid.New(), acct, CodexRefreshReplayed)
+	res, err := s.codexReturnCommitted(context.Background(), uuid.New(), codexAccountSnapshot{CodexProviderAccount: acct}, CodexRefreshReplayed)
 	if !errors.Is(err, ErrCodexRefreshQuarantined) {
 		t.Fatalf("err = %v, want ErrCodexRefreshQuarantined", err)
 	}

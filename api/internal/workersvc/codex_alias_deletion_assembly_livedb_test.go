@@ -45,6 +45,7 @@ func TestClaimAssemblyCodexAliasDeletionFailsClosedLiveDB(t *testing.T) {
 		uuid.New(), f.userID, "anthropic-"+uuid.NewString(), anthropicSealed)
 
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	wkr := store.Worker{ID: f.workerID, UserID: f.userID}
 
 	// Baseline: the fully-bound Codex run assembles WITH a Codex block, so the fixture is a genuinely

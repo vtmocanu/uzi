@@ -20,6 +20,7 @@ func TestOversizeRunClaimFinishesMintedCodexRunLiveDB(t *testing.T) {
 	f := newSubscriptionFixture(t, env)
 	resealBotPAT(t, env, f.userID)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
 	svc.claimSizeLimit = 1024
 

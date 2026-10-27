@@ -208,6 +208,7 @@ type codexAuthzStore interface {
 	GetRunCodexAuthContext(ctx context.Context, id uuid.UUID) (store.GetRunCodexAuthContextRow, error)
 	GetCodexCredentialState(ctx context.Context, arg store.GetCodexCredentialStateParams) (store.CodexCredentialState, error)
 	GetCodexProviderAccountByID(ctx context.Context, arg store.GetCodexProviderAccountByIDParams) (store.CodexProviderAccount, error)
+	codexAccountSnapshotStore
 	SetRunCodexClaimCapability(ctx context.Context, arg store.SetRunCodexClaimCapabilityParams) (int64, error)
 	FreezeRunCodexBinding(ctx context.Context, arg store.FreezeRunCodexBindingParams) (int64, error)
 	SetRunCodexFrozenIdentity(ctx context.Context, arg store.SetRunCodexFrozenIdentityParams) (int64, error)
@@ -959,7 +960,7 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 		if !st.ProviderAccountID.Valid {
 			return nil, fmt.Errorf("%w: subscription alias not linked", errCredentialUnavailable)
 		}
-		acct, aerr := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{
+		acct, aerr := readCodexAccountSnapshot(ctx, q, store.GetCodexProviderAccountSnapshotParams{
 			UserID: run.UserID,
 			ID:     uuid.UUID(st.ProviderAccountID.Bytes),
 		})
@@ -976,19 +977,9 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 		g := acct.Generation
 		generation = &g
 		chatgptAccountID = acct.WorkspaceAccountID
-		plain, oerr := secretopen.OpenSealed(s.vlt, s.box, run.UserID, store.KindCodexAuth, acct.SealedWith, acct.SealedLogin)
+		blob, oerr := s.openCodexAccountLogin(ctx, run.UserID, acct)
 		if oerr != nil {
-			if errors.Is(oerr, secretopen.ErrVaultLocked) {
-				return nil, errVaultLocked
-			}
-			return nil, fmt.Errorf("%w: codex login could not be decrypted", errCredentialUnavailable)
-		}
-		var blob codexLoginBlob
-		if jerr := json.Unmarshal(plain, &blob); jerr != nil {
-			return nil, fmt.Errorf("%w: %v", ErrCodexLoginBlob, jerr)
-		}
-		if blob.AccessToken == "" {
-			return nil, fmt.Errorf("%w: missing access token", ErrCodexLoginBlob)
+			return nil, oerr
 		}
 		accessToken = blob.AccessToken
 	case codexAuthModeAPIKey:

@@ -43,7 +43,7 @@ func TestAssembleJudgeClaimCodexOnlyFullAssemblySucceedsLiveDB(t *testing.T) {
 	targetRunID := env.seedCodexRun(t, userID, workerID, repoID) // an ordinary reviewed run; its own harness is irrelevant here
 	judgeRunID := env.seedCodexJudgeRun(t, userID, workerID, targetRunID)
 
-	svc := &Service{q: env.q, box: env.box}
+	svc := &Service{q: env.q, box: env.box, vlt: env.vlt}
 	if err := svc.FreezeCodexBinding(env.ctx, userID, judgeRunID, aliasID, codexAuthModeSubscription); err != nil {
 		t.Fatalf("FreezeCodexBinding on the judge run: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestAssembleJudgeClaimCodexBothCredentialsNoAnthropicEpochLiveDB(t *testing
 	targetRunID := env.seedCodexRun(t, userID, workerID, repoID)
 	judgeRunID := env.seedCodexJudgeRun(t, userID, workerID, targetRunID)
 
-	svc := &Service{q: env.q, box: env.box}
+	svc := &Service{q: env.q, box: env.box, vlt: env.vlt}
 	if err := svc.FreezeCodexBinding(env.ctx, userID, judgeRunID, aliasID, codexAuthModeSubscription); err != nil {
 		t.Fatalf("FreezeCodexBinding on the judge run: %v", err)
 	}
@@ -125,6 +125,7 @@ func TestAssembleJudgeClaimClaudeRunUnchangedLiveDB(t *testing.T) {
 	// defaults to 'auto') and so calls autoChoice, which reads s.now() — nil on a bare
 	// struct literal, so this MUST go through the full constructor.
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	run := mustRun(t, env, judgeRunID)
 	if run.Harness != harnessClaude {
 		t.Fatalf("fixture judge run harness = %q, want claude", run.Harness)

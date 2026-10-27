@@ -609,7 +609,7 @@ func TestCollectCodexAccountUsageVaultLockedAtOpenLiveDB(t *testing.T) {
 	fx.svc.SetVault(vlt)
 	enrollCodexProtectedVault(t, env, vlt, fx.userID, "codex-usage-open-vault-pw")
 	// Re-seal the committed login under the DEK, then lock: openCodexAccountLogin now fails.
-	blob, err := fx.svc.openCodexAccountLogin(fx.userID, env.mustAccount(t, fx.userID, fx.accountID))
+	blob, err := fx.svc.openCodexAccountLogin(env.ctx, fx.userID, env.mustAccountSnapshot(t, fx.userID, fx.accountID))
 	if err != nil {
 		t.Fatal(err)
 	}

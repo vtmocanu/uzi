@@ -11,9 +11,11 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 type linkedProbeStore struct {
+	epoch int64
 	Store
 	account store.CodexProviderAccount
 	reads   int
@@ -23,6 +25,11 @@ func (f *linkedProbeStore) GetCodexProviderAccountByID(_ context.Context, _ stor
 	f.reads++
 	return f.account, nil
 }
+func (f *linkedProbeStore) GetCodexProviderAccountSnapshot(ctx context.Context, arg store.GetCodexProviderAccountSnapshotParams) (store.GetCodexProviderAccountSnapshotRow, error) {
+	acct, err := f.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams(arg))
+	return store.GetCodexProviderAccountSnapshotRow{CodexProviderAccount: acct, VaultEpoch: f.epoch}, err
+}
+
 func (*linkedProbeStore) CountEnabledLinkedAliasesForCodexAccount(context.Context, store.CountEnabledLinkedAliasesForCodexAccountParams) (int64, error) {
 	return 1, nil
 }
@@ -66,7 +73,7 @@ func TestCodexLinkedProbeUnit(t *testing.T) {
 				SealedLogin: sealed, SealedWith: store.SealedWithMaster,
 				ProviderUserID: "user", WorkspaceAccountID: "workspace",
 			}}
-			svc := &Service{q: q, box: box}
+			svc := newOffModeService(q, box, Params{})
 			calls := 0
 			reader := linkedProbeReader(func(_ context.Context, token, workspace string) (codexauth.UsageReading, error) {
 				calls++
@@ -109,8 +116,7 @@ func TestCodexLinkedProbeVaultMode(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			// Legacy input remains readable under either mode. This test writes no
-			// replacement credential and makes no provider refresh call.
+			// Capture the epoch when sealing protected material, after Unlock.
 			raw, err := json.Marshal(codexLoginBlob{AccessToken: "access", RefreshToken: "renewal"}) //nolint:gosec // G117: synthetic credential fixture
 			if err != nil {
 				t.Fatal(err)
@@ -119,9 +125,17 @@ func TestCodexLinkedProbeVaultMode(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			q := &linkedProbeStore{account: store.CodexProviderAccount{
+			marker, epoch := store.SealedWithMaster, int64(0)
+			if tc.unlocked {
+				material, serr := v.Seal(ctx, uid, store.KindCodexAuth, raw, vault.SealForUse)
+				if serr != nil {
+					t.Fatal(serr)
+				}
+				sealed, marker, epoch = material.Ciphertext, material.SealedWith, material.Epoch
+			}
+			q := &linkedProbeStore{epoch: epoch, account: store.CodexProviderAccount{
 				UserID: uid, ID: aid, CoordState: tc.coord,
-				SealedLogin: sealed, SealedWith: store.SealedWithMaster,
+				SealedLogin: sealed, SealedWith: marker,
 				ProviderUserID: "user", WorkspaceAccountID: "workspace",
 			}}
 			svc := &Service{q: q, box: box, vlt: v}

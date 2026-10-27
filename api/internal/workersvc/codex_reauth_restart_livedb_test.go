@@ -82,7 +82,7 @@ func TestCodexReauthSurvivesRestartThenReplacementClearsLiveDB(t *testing.T) {
 	// A collect on the restarted Service, while still flagged, is disabled (not a poll target)
 	// — the flag stops collection until a verified replacement lands.
 	fake2 := &fakeUsageClient{}
-	freshSvc := &Service{q: freshQ, box: freshBox, codexRefresh: fake2}
+	freshSvc := &Service{q: freshQ, box: freshBox, vlt: vault.NewPostgres(freshBox, freshPool), codexRefresh: fake2}
 	if _, cerr := freshSvc.CollectCodexAccountUsage(env.ctx, fx.userID, fx.accountID); mustUsageFailure(t, cerr).Kind != CodexUsageFailDisabled {
 		t.Fatalf("a reauth-flagged account must be disabled for polling, got %v", cerr)
 	}
