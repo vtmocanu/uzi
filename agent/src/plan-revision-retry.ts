@@ -119,7 +119,7 @@ export class PlanRevisionRecovery {
   }
 
   /** The runner admits typed provider exhaustion and measured Codex revision silence only. */
-  async retry(cause: unknown, observer?: PlanRevisionOwnerWaitObserver): Promise<void> {
+  async retry(cause: unknown, observer?: PlanRevisionOwnerWaitObserver, remainingWallMs?: () => number): Promise<void> {
     const a = this.active;
     if (!a) throw cause; // missing source/older API keeps existing compatibility behavior
     await this.confirmSource(a);
@@ -131,7 +131,7 @@ export class PlanRevisionRecovery {
       const random = this.deps.policy?.random?.() ?? Math.random();
       const jitter = Number.isFinite(random) ? Math.max(0, Math.min(1, random)) : 0;
       const backoff = Math.min(30_000, [5_000, 10_000, 20_000][a.used]! * (1 + jitter * 0.2));
-      await this.wait(backoff);
+      await this.wait(backoff, remainingWallMs);
       await this.confirmSource(a);
       a.redriveReady = true;
       return;
@@ -261,10 +261,11 @@ export class PlanRevisionRecovery {
     if (control?.kind === "reject") throw new PlanRejectedError(control.reason, a.source.revision);
   }
 
-  private async wait(ms: number): Promise<void> {
+  private async wait(ms: number, remainingWallMs?: () => number): Promise<void> {
     while (ms > 0) {
       if (this.active) this.control(this.active);
-      const slice = Math.min(250, ms);
+      const slice = Math.min(250, ms, remainingWallMs?.() ?? Infinity);
+      if (slice <= 0) break;
       try { await this.sleep(slice, this.deps.signal()); }
       catch (err) { if (this.active) this.control(this.active); throw err; }
       ms -= slice;

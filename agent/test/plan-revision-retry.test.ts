@@ -147,6 +147,17 @@ describe("live-flight plan revision recovery", () => {
     assert.deepEqual(reclaimed.recovery.fields(111).superseded_revision_input_ids, [101]);
   });
 
+  for (const budget of [0, 125, 625]) it(`3466 silent backoff stops at remaining wall=${budget}`, async () => {
+    const f = fixture(3);
+    let remaining = budget;
+    f.onSleep(ms => { remaining -= ms; });
+    await f.recovery.retry(new Error("silent recovery"), undefined, () => remaining);
+    assert.deepEqual(f.sleeps, budget === 0 ? [] : budget === 125 ? [125] : [250, 250, 125]);
+    assert.equal(remaining, 0);
+    assert.deepEqual(f.writes, []);
+    assert.deepEqual(f.waits, []);
+  });
+
   it("allows three re-drives across continuation stages, then expires without another start", async () => {
     const f = fixture(3);
     await f.recovery.beforeTurn();

@@ -3829,7 +3829,11 @@ export class CodexExecutor implements Executor {
                 (!cause.providerOrigin && !cause.zeroEvidenceIdle)) throw error;
             if (!ctx.retryPlanRevisionTurn) throw cause.zeroEvidenceIdle ? cause.originalIdle ?? cause : cause;
             try {
-              await ctx.retryPlanRevisionTurn(cause, silentRevision?.needsRebuild ? observeOwnerWait : undefined);
+              await ctx.retryPlanRevisionTurn(cause, silentRevision?.needsRebuild ? observeOwnerWait : undefined,
+                silentRevision?.needsRebuild ? () => {
+                  chargeSilentRecovery();
+                  return Math.max(0, wall.remainingMs);
+                } : undefined);
             } catch (rejected) {
               // Only identity rejection denotes unsupported recovery. Controls and
               // replacement-revise exceptions must retain their own routing.

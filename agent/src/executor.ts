@@ -430,8 +430,9 @@ export interface RunContext {
   /** Only human revision drivers call this after typed provider exhaustion or measured Codex silence.
    * Resolves to redrive, or throws controls / PlanRevisionReplacedError to exit this driver.
    * The runner must prove ownership before resolving; unknown ownership permits no provider start.
+   * remainingWallMs caps only silent-recovery backoff, never exhausted owner waiting.
    */
-  retryPlanRevisionTurn?(cause: unknown, observer?: PlanRevisionOwnerWaitObserver): Promise<void>;
+  retryPlanRevisionTurn?(cause: unknown, observer?: PlanRevisionOwnerWaitObserver, remainingWallMs?: () => number): Promise<void>;
   /** Check the captured source before human revision turns and fresh epoch credential/root admission. */
   beforePlanRevisionTurn?(observer?: PlanRevisionOwnerWaitObserver): Promise<void>;
   /** An associated cross-check human gate continues its established wait after switch give-up. */

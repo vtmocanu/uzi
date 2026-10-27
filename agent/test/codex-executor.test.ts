@@ -18258,11 +18258,11 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         recovery.accept({ kind: "revise", feedback: "change", inputId: 11, sourceGateRevision: 1 });
       }
       const ctx = revisionContext(fallback === "absent hook" ? {} : {
-        retryPlanRevisionTurn: async (cause, observer) => {
+        retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
           assert.ok(cause instanceof TransientRecoveryError && cause.zeroEvidenceIdle);
           original = cause.originalIdle;
           if (fallback === "unnegotiated") throw cause;
-          await recovery.retry(cause, observer);
+          await recovery.retry(cause, observer, remainingWallMs);
         },
       });
       t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
@@ -18399,7 +18399,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         async () => ({ applied: true, status: "awaiting_approval", gateRevision: 1 }));
       recovery.accept({ kind: "revise", feedback: "change", inputId: 11, sourceGateRevision: 1 });
       const ctx = revisionContext({ beforePlanRevisionTurn: observer => recovery.beforeTurn(observer),
-        retryPlanRevisionTurn: async (cause, observer) => { retries++; await recovery.retry(cause, observer); } });
+        retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => { retries++; await recovery.retry(cause, observer, remainingWallMs); } });
       t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
       const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
       void running.catch(() => undefined);
@@ -18512,7 +18512,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     const extra = makeMultiEpochRig([silent, silent, silent]);
     rig.epochs.splice(1, 0, ...extra.epochs);
     rig.deps = { ...rig.deps, wallMs };
-    let waits = 0, retries = 0, parks = 0, suspended = false, backoff = 0;
+    let waits = 0, retries = 0, parks = 0, suspended = false, backoff = 0, ownerWait = 0, lastBackoff = 0;
     const recovery = new PlanRevisionRecovery({ generation: 1,
       ownership: async () => {
         assert.equal(suspended, false, "source work must be charged");
@@ -18520,8 +18520,8 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         return { status: "running", claim_generation: 1, gate_revision: 1, claim_released: false };
       }, signal: () => new AbortController().signal, checkControl: () => {}, notice: async () => {},
       policy: { random: () => 0, sleep: async (ms, signal) => {
-        if (ms !== 30000) { backoff += ms; t.mock.timers.tick(ms); return; }
-        if (++waits <= 4) { t.mock.timers.tick(ms); return; }
+        if (ms !== 30000) { backoff += ms; lastBackoff = ms; t.mock.timers.tick(ms); return; }
+        if (++waits <= 4) { ownerWait += ms; t.mock.timers.tick(ms); return; }
         return new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
       } },
       steering: { takeRevisionRecoveryControl: () => undefined,
@@ -18535,9 +18535,9 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         return { applied: true, status: "awaiting_approval", gateRevision: 1 }; });
     recovery.accept({ kind: "revise", inputId: 11, sourceGateRevision: 1, feedback: "I" });
     const ctx = revisionContext({ beforePlanRevisionTurn: observer => recovery.beforeTurn(observer),
-      retryPlanRevisionTurn: async (cause, observer) => {
+      retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
         retries++;
-        await recovery.retry(cause, waiting => { observer?.(waiting); suspended = waiting; });
+        await recovery.retry(cause, waiting => { observer?.(waiting); suspended = waiting; }, remainingWallMs);
       }, parkForWall: async () => { parks++; return "parked"; } });
     t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
     const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
@@ -18557,8 +18557,11 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         assert.equal(parks, 1);
         assert.equal(waits, 0);
         assert.equal(rig.providerLaunches(), 3);
+        assert.equal(rig.client.releaseCalls.length, 3, "no credentials for another root after wall exhaustion");
+        assert.equal(lastBackoff, 10, "final sleep is capped below the 250 ms slice");
       }
-      assert.equal(backoff, 35000);
+      assert.equal(ownerWait, wallMs === 100000 ? 120000 : 0);
+      assert.equal(backoff, wallMs === 100000 ? 35000 : 33510);
       assert.equal(retries, wallMs === 100000 ? 4 : 3);
       assert.equal(suspended, false);
     } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
@@ -18762,9 +18765,9 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         }
         return verdict;
       };
-      ctx.retryPlanRevisionTurn = async (cause, observer) => {
+      ctx.retryPlanRevisionTurn = async (cause, observer, remainingWallMs) => {
         assert.ok(cause instanceof TransientRecoveryError && cause.zeroEvidenceIdle && !cause.providerOrigin);
-        retries++; await retry(cause, observer);
+        retries++; await retry(cause, observer, remainingWallMs);
       };
       return run(ctx);
     };

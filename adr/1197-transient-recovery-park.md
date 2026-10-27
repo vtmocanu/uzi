@@ -1263,7 +1263,9 @@ before fresh construction, including an owner replacement after exhaustion.
 Locked-vault and unavailable-credential construction failures remain inside
 that bounded driver, including an owner replacement revision after exhaustion;
 they do not escape into the runner credential hold. Teardown, backoff and
-admission consume the unchanged wall budget. Time awaiting an owner event at
+admission consume the unchanged wall budget. Silent-revision backoff slices are
+clamped to the remaining wall budget before sleeping; a spent wall returns to
+the executor's existing interruption routing. Time awaiting an owner event at
 the restored gate remains excluded; ownership checks and gate restoration
 between wait ticks remain charged. Cancel, pause, spent wall and completion
 holds retain their existing precedence. Provider-origin revision

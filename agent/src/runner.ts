@@ -13054,9 +13054,9 @@ export class RunRunner {
         } }
         : {}),
       beforePlanRevisionTurn: observer => revisionRecovery?.beforeTurn(observer) ?? Promise.resolve(),
-      retryPlanRevisionTurn: async (cause, observer) => {
+      retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
         if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && !cause.zeroEvidenceIdle) || !revisionRecovery) throw cause;
-        await revisionRecovery.retry(cause, observer);
+        await revisionRecovery.retry(cause, observer, remainingWallMs);
       },
       gatePlan: async (planMd, milestones, onPlanPersisted, settles, semanticSubmission) => {
         if (flight.workerMemory) flight.workerMemory.revisionContext = undefined;
