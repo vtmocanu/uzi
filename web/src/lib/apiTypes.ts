@@ -538,6 +538,7 @@ export interface PipelineStatus {
 }
 
 export interface Repo {
+  ignored_inferred_capabilities?: string[];
   /** Separate checker consent; absent on older APIs means off. */
   cross_check_repo_instructions_enabled?: boolean;
   code_cross_check_guidance?: string | null;
@@ -3029,6 +3030,10 @@ export interface SemanticDriftDTO {
 }
 
 export interface Run {
+  /** Repo display path on detail reads; absent on older servers, empty when unavailable. */
+  repo_path?: string;
+  /** Frozen repo inference policy; explicit requirements take precedence. */
+  ignored_inferred_capabilities?: string[];
   completion_pending?: CompletionPendingDTO;
   semantic_gate?: import("./semanticGate").SemanticGateDTO;
   semantic_drift?: SemanticDriftDTO;
@@ -3832,7 +3837,22 @@ export interface PlanCrossCheckFinding {
   rationale: string;
 }
 
+export interface CodeCrossCheckCoverage {
+  version: 1;
+  entries: { path: string; status: "examined" | "excluded" | "unassessed"; reason: string; recorded_read: boolean }[];
+  inventory_incomplete: boolean;
+  omitted_paths: number;
+  omitted_count_exact: boolean;
+  unknown_judgments: number;
+  invalid_judgments: number;
+  omitted_judgments: number;
+  activity_complete: boolean;
+  reasons: string[];
+}
+
 export interface CodeCrossCheckSummary {
+  /** Raw JSON from the API; the card validates it before rendering. */
+  coverage?: unknown;
   custom_guidance_applied?: boolean;
   guidance_digest?: string;
   repo_instructions_enabled?: boolean;

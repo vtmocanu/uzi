@@ -33,6 +33,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 ### Changed
 
+- **Routine dependency updates ([#3517](https://github.com/vtmocanu/uzi/pull/3517)).**
+  Dependency manifest and image bumps that carry no entry of their own.
+
 - **Routine dependency updates ([#3369](https://github.com/vtmocanu/uzi/pull/3369), [#3368](https://github.com/vtmocanu/uzi/pull/3368), [#3370](https://github.com/vtmocanu/uzi/pull/3370), [#3367](https://github.com/vtmocanu/uzi/pull/3367)).**
   Dependency manifest and image bumps that carry no entry of their own.
 
@@ -319,6 +322,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Busy source replay test failures include observed exit details ([#3464](https://github.com/vtmocanu/uzi/pull/3464)).**
   The affected recovery test records bounded discovery, retry, exhaustion, abort and retained-attempt observations to diagnose future failures; a bounded Linux contention investigation did not reproduce the flake, and recovery behavior is unchanged.
 
+- **Verify captured WIP tips with bounded delta transfers ([#3441](https://github.com/vtmocanu/uzi/pull/3441), [#3031](https://github.com/vtmocanu/uzi/pull/3031), [#3503](https://github.com/vtmocanu/uzi/pull/3503)).**
+  The guarded producer verifies and imports selected Git objects, or confirms an anchored tip is already present, retaining source and custody on refusal; automatic terminal admission remains disabled.
+
+- **Built-in Anthropic token and developer convention docs corrected ([#3486](https://github.com/vtmocanu/uzi/pull/3486)).**
+  The in-app and CLI docs now carry fixed broken links, current CI job names, the launcher flag location and an accurate release coverage claim.
+
 ### Added
 
 - **Healthy busy workers no longer show custody attention.**
@@ -449,6 +458,24 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Deadcode gates report optional runner and memory diagnostics (Refs #3433).**
   Logs include runner image, starting memory, elapsed time and scoped peak RSS when available; unavailable measurements preserve the gate verdict.
+
+- **Unlock an existing vault from the CLI ([#3504](https://github.com/vtmocanu/uzi/pull/3504), [#3528](https://github.com/vtmocanu/uzi/pull/3528)).**
+  Check vault status and unlock with a hidden password prompt or explicit stdin input, with shared per-user rate limiting and no persisted re-unlock key.
+
+- **Instance maintenance mode ([#3454](https://github.com/vtmocanu/uzi/pull/3454), [#3505](https://github.com/vtmocanu/uzi/pull/3505)).**
+  Admins can pause intake instance-wide: new runs of every kind stay queued and no ephemeral pod starts for them, while already-admitted work finishes; every user sees a banner and held runs say why, and an admin readout reports when no running, held or custody work remains.
+
+- **Retained-source budget exhaustion retries before an owner hold ([#3495](https://github.com/vtmocanu/uzi/pull/3495), [#3538](https://github.com/vtmocanu/uzi/pull/3538)).**
+  Three timed retries are allowed by default, then the run holds without a countdown; owners can Resume or Cancel either form while local work and custody remain protected.
+
+- **Code cross-check shows which changed paths were reviewed ([#3167](https://github.com/vtmocanu/uzi/pull/3167), [#3532](https://github.com/vtmocanu/uzi/pull/3532)).**
+  Code checks report examined, excluded and unassessed paths from a bounded Git inventory; the merge request, run page and CLI display gaps, and explicit offline replay profiles preserve the frozen baseline pins.
+
+- **Hosted Docker workers on supported ext4/xfs data volumes hold lifetime epoch ownership and report shadow cleanup verdicts ([#3430](https://github.com/vtmocanu/uzi/pull/3430), [#3501](https://github.com/vtmocanu/uzi/pull/3501)).**
+  Workers log kept and would-delete trees when evaluation is available; runtime declaration defaults off, and the shadow pass performs no automatic deletion. Custom token Secret mounts such as `/run/uzi` remain supported. Final image and live acceptance remain pending.
+
+- **Recovery logs explain inventory reconstruction decisions ([#3544](https://github.com/vtmocanu/uzi/pull/3544), [#3548](https://github.com/vtmocanu/uzi/pull/3548)).**
+  The `recovery: inventory reconstruction` event distinguishes coverage failures, reconstruction refusals and invalidated snapshot reuse; custody behavior is unchanged.
 
 ### Fixed
 
@@ -1185,6 +1212,30 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **An owner Resume of an exhausted worker-recovery hold now renews the retained-source recovery budget ([#3330](https://github.com/vtmocanu/uzi/pull/3330)).**
   Only that Resume renews it, once per Resume and still capped at 3 iterations; requeues, new claims and other blockers never do, and an older api or worker simply does not renew.
+
+- **A Codex code cross-check snapshot no longer hangs 600 s in `checkpoint-code-head` ([#3304](https://github.com/vtmocanu/uzi/pull/3304), [#3534](https://github.com/vtmocanu/uzi/pull/3534)).**
+  Supervised git reads in a boundary scope now settle on its hard stop (and, in a Codex checkpoint, its soft stop) and classify an already-ended output at attach, and the generic 600 s read timers are retired once the scope stops; the phase reports five `checkpoint-code-head-*` sub-steps, and a soft stop after a clean child exit but before EOF can turn an unmasked read into a soft stop.
+
+- **CI repair investigates issue history before local reproduction ([#3470](https://github.com/vtmocanu/uzi/pull/3470), [#3496](https://github.com/vtmocanu/uzi/pull/3496)).**
+  Investigations disclose evidence gaps and recurrence uncertainty, separate reproduction blockers from the original failure, and report a discriminating next diagnostic when no fix is made through the completion summary.
+
+- **Declared prompt summaries and Codex proposals survive completion ([#3469](https://github.com/vtmocanu/uzi/pull/3469), [#3541](https://github.com/vtmocanu/uzi/pull/3541)).**
+  Report-only prompt runs now populate `report_md` from a declared `signal_done` summary: SDK prompt runs forward that summary, and Codex forwards summaries on issue and prompt runs and proposals on every run kind.
+
+- **The API dead-code gate caps its Go heap target to reduce runner memory kills ([#3433](https://github.com/vtmocanu/uzi/pull/3433)).**
+  `deadcode:api` runs the analyzer with GOMEMLIMIT=12GiB; the gate's verdict and package pattern are unchanged.
+
+- **Codex subscriptions can recover from a failed token exchange without re-login ([#3523](https://github.com/vtmocanu/uzi/pull/3523), [#3533](https://github.com/vtmocanu/uzi/pull/3533)).**
+  Refresh exchanges have a longer timeout, and one bounded background retry can recover a recorded provider error while runs wait safely for verified credentials.
+
+- **Silent Codex plan revisions can recover without losing feedback ([#3466](https://github.com/vtmocanu/uzi/pull/3466), [#3539](https://github.com/vtmocanu/uzi/pull/3539)).**
+  Human plan revisions retry idle turns with zero measured model-processing evidence within the existing bounded allowance, keeping feedback pending until a revised plan is saved.
+
+- **TUI worker names retain their identifying suffix ([#3513](https://github.com/vtmocanu/uzi/pull/3513)).**
+  Long worker names use a middle ellipsis within existing column widths so hosted workers with the same template and size remain distinguishable, including names with wide Unicode characters.
+
+- **The worker bare cache refuses a shallow repository ([#3450](https://github.com/vtmocanu/uzi/pull/3450), [#3491](https://github.com/vtmocanu/uzi/pull/3491)).**
+  Cloning from a shallow source or reusing a shallow bare now fails with a non-retryable error instead of caching refs with incomplete history.
 
 ### Security
 

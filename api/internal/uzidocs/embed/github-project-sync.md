@@ -40,7 +40,7 @@ Two switches, held by two different people. An admin flips the
 Instance** (see [Admin settings](./admin-settings.md)), off by
 default and a strict no-op while off — nothing below works until this is
 on. Then, **per repo**, the repo's connection owner (or an admin) links it
-to a Projects v2 board from the **Boards** page: the repo row's "Project
+to a Projects v2 board from the **Repos** page: the repo row's "Project
 sync" cell opens a Manage panel with **Adopt** (link an existing board) or
 **Provision** (have uzi create one) — the link itself is the per-repo
 enabled state, no separate flag.
@@ -64,7 +64,7 @@ repo (it never creates or removes a link) — see the
 
 ## Sync health at a glance
 
-The repo list on the **Boards** page carries a "Sync" pill next to each
+The repo list on the **Repos** page carries a "Sync" pill next to each
 repo, and it reflects real state instead of sitting there as a static
 label: **green** when the repo is linked and its last sync ran clean, a
 **warning/error** tone when the last sync recorded an error, and
@@ -120,7 +120,7 @@ type, it falls back to showing both options rather than guessing.)
    comes back skipped (see [Skipped columns and fixing
    them](#skipped-columns-and-fixing-them)) until you add the option or use
    auto-create.
-4. **Adopt.** On the **Boards** page, open the repo's Manage panel, pick
+4. **Adopt.** On the **Repos** page, open the repo's Manage panel, pick
    Adopt, and enter the Project's number (the `N` in the project's URL).
    Adopt persists the link and returns right away; seeding every current
    issue's Status runs in the background, so a large board doesn't leave
@@ -244,7 +244,7 @@ doesn't let you see the board uzi just made; you'd otherwise have to leave
 uzi and fix that in GitHub's own project settings. **Board access** puts
 those same controls inside uzi instead.
 
-You'll find it in the linked board's Manage panel on the **Boards** page,
+You'll find it in the linked board's Manage panel on the **Repos** page,
 right below the sync status readout — same reach as the rest of the panel:
 the repo's connection owner (or an admin), GitHub only, and only once an
 admin has turned on the `github_project_sync_enabled` instance switch above.

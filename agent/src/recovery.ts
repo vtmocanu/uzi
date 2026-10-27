@@ -1111,29 +1111,41 @@ export class RecoveryCoordinator {
   private readonly redundancySettled = new Set<string>();
   /** Last logged re-drive exit per run/generation/capture (bounded; pruned with the live journal snapshot). */
   private readonly redriveExitLogged = new Map<string, { captureId: string; value: string }>();
+  // Separate lifetime: a reconstruction context may have no capture to prune yet.
+  // Share the bounded logger, without changing exit-channel progress clearing.
+  private readonly inventoryDiagnosticLogged = new Map<string, { captureId: string; value: string }>();
+  // Diagnostic context only: neither the journal nor recovery authority depends on it.
+  private readonly inventoryDiagnosticPath = new AsyncLocalStorage<"boot" | "live">();
 
-  private redriveExitKey(record: RecoveryRecord): string {
+  private redriveExitKey(record: Pick<RecoveryRecord, "runId" | "generation" | "captureId">): string {
     return canonicalJson([record.runId, record.generation ?? null, record.captureId]);
   }
 
-  /** One info line per change of a guarded record's re-drive exit; diagnostics only, never throws. */
-  private noteRedriveExit(path: RedrivePath, record: RecoveryRecord, reason: string, field?: string): void {
+  /** One info line per transition and diagnostic channel; diagnostics only, never throws. */
+  private noteRedriveExit(path: RedrivePath, record: Pick<RecoveryRecord, "runId" | "generation" | "captureId">, reason: string, field?: string, inventory = false): void {
     try {
       const key = this.redriveExitKey(record);
+      const logged = inventory ? this.inventoryDiagnosticLogged : this.redriveExitLogged;
       const value = field ? `${reason}:${field}` : reason;
-      if (this.redriveExitLogged.get(key)?.value === value) return;
-      this.redriveExitLogged.delete(key);
-      this.redriveExitLogged.set(key, { captureId: record.captureId, value });
-      while (this.redriveExitLogged.size > REDRIVE_EXIT_LOG_MAX) {
-        const oldest = this.redriveExitLogged.keys().next();
+      if (logged.get(key)?.value === value) return;
+      logged.delete(key);
+      logged.set(key, { captureId: record.captureId, value });
+      while (logged.size > REDRIVE_EXIT_LOG_MAX) {
+        const oldest = logged.keys().next();
         if (oldest.done) break;
-        this.redriveExitLogged.delete(oldest.value);
+        logged.delete(oldest.value);
       }
-      this.log.info("recovery: re-drive exit", {
+      this.log.info(inventory ? "recovery: inventory reconstruction" : "recovery: re-drive exit", {
         path, reason, ...(field ? { field } : {}),
-        run_id: record.runId, generation: record.generation, capture_id: record.captureId,
+        run_id: record.runId, generation: record.generation,
+        ...(!inventory || record.captureId ? { capture_id: record.captureId } : {}),
       });
     } catch { /* diagnostics must not change control flow */ }
+  }
+
+  private noteInventoryDiagnostic(record: Pick<RecoveryRecord, "runId" | "generation" | "captureId">,
+    reason: string, path = this.inventoryDiagnosticPath.getStore()): void {
+    if (path) this.noteRedriveExit(path, record, reason, undefined, true);
   }
 
   private clearRedriveExit(record: RecoveryRecord): void {
@@ -1353,6 +1365,8 @@ export class RecoveryCoordinator {
             canonicalJson(r.coverageContext) === canonicalJson(context) &&
             canonicalJson(r.originalRoots) === canonicalJson(roots));
           if (matching) {
+            this.noteInventoryDiagnostic(matching, matching.reason === "inventory_snapshot_changed" || matching.reason === "inventory_quiescence_breach"
+              ? "invalidated_snapshot_reused" : "matching_snapshot_reused");
             if (exactHoldBinding && !matching.exactHoldBinding) {
               const bound = { ...matching, exactHoldBinding };
               await this.writeRecordUnlocked(bound);
@@ -1363,6 +1377,7 @@ export class RecoveryCoordinator {
           const pending = records.find(r => r.generation === context.generation && r.inventoryGuarded &&
             r.finalRequest && !r.finalAcknowledged);
           if (pending) {
+            this.noteInventoryDiagnostic(pending, "pending_final");
             this.log.warn("recovery: inventory_quiescence_breach; pending identity retained", {
               run_id: context.runId, generation: context.generation,
             });
@@ -1383,6 +1398,7 @@ export class RecoveryCoordinator {
             } : {}),
           };
           await this.writeRecordUnlocked(record);
+          this.noteInventoryDiagnostic(record, "snapshot_created");
           return record;
         });
       };
@@ -1929,6 +1945,7 @@ export class RecoveryCoordinator {
     const heads = [...new Set([...sourceHeads, ...clones.heads.filter(h => !laterHead(h))])];
     for (const head of heads) {
       if (await ownedRecoveryIO(() => this.git.ancestry!(record.coverageContext!.barePath, head, record.sourceSha)) !== "ancestor") {
+        this.noteInventoryDiagnostic(record, "source_ancestry_unproven");
         await this.writeExistingRecord(record, cur => ({ ...cur, reason: cur.finalRequest
           ? "inventory_quiescence_breach" : "inventory_snapshot_changed" }));
         return false;
@@ -1940,6 +1957,7 @@ export class RecoveryCoordinator {
       .filter(root => root.contexts.length > 0)).some(root => !frozenRoots.some(frozen =>
       root.sha === frozen.sha && root.contexts.every(context =>
         frozen.contexts.some(producer => canonicalJson(producer) === canonicalJson(context)))))) {
+      this.noteInventoryDiagnostic(record, "root_context_uncovered");
       await this.writeExistingRecord(record, cur => ({ ...cur, reason: cur.finalRequest
         ? "inventory_quiescence_breach" : "inventory_snapshot_changed" }));
       return false;
@@ -2616,6 +2634,12 @@ export class RecoveryCoordinator {
   }
 
   async materializeBootInventory(signal?: AbortSignal, isExecuting = this.isExecuting, attempts?: Map<string, MaintenanceBudget>): Promise<RecoveryRecord[]> {
+    return this.inventoryDiagnosticPath.run(this.inventoryDiagnosticPath.getStore() ?? "boot",
+      () => this.materializeInventory(signal, isExecuting, attempts));
+  }
+
+  private async materializeInventory(signal: AbortSignal | undefined, isExecuting: (runId: string) => boolean,
+    attempts?: Map<string, MaintenanceBudget>): Promise<RecoveryRecord[]> {
     const records: RecoveryRecord[] = [];
     // Each discovered context is visited once; a failure keeps its pins and allows siblings.
     const batch = this.bootOwed.splice(0, this.liveMaxPerPass);
@@ -2623,23 +2647,30 @@ export class RecoveryCoordinator {
     for (const entry of batch) {
       if (signal?.aborted) break;
       const ctx = entry.context;
-      if (ctx.generation === null || !("kind" in ctx) || ctx.kind === null ||
-          (this.isExecuting(ctx.runId) || isExecuting(ctx.runId)) || !this.client.hasFeature?.("recovery_inventory_v1")) continue;
+      const identity = { runId: ctx.runId, generation: ctx.generation ?? undefined, captureId: "" };
+      const note = (reason: string): void => this.noteInventoryDiagnostic(identity, reason);
+      if (ctx.generation === null) { note("generation"); continue; }
+      if (!("kind" in ctx) || ctx.kind === null) { note("kind"); continue; }
+      if (this.isExecuting(ctx.runId) || isExecuting(ctx.runId)) { note("executing"); continue; }
+      if (!this.client.hasFeature?.("recovery_inventory_v1")) { note("inventory_feature"); continue; }
       try {
         const hold = (await this.recoveryRPC(() => this.client.listRecoveryHolds(ctx.runId, ...this.passSignalArgs()))).holds.find(h =>
           h.generation === ctx.generation && h.inventory_guarded === true);
-        if (!hold || !this.client.getRunOwnership) continue; // closed/discarded never reopened
+        if (!hold) { note("hold_unavailable"); continue; } // closed/discarded never reopened
+        if (!this.client.getRunOwnership) { note("ownership_unsupported"); continue; }
         const existing = await this.newReconstructionRecords(ctx.runId, ctx.generation);
-        if (!existing) continue;
+        if (!existing) { note("provenance_unavailable"); continue; }
+        identity.captureId = existing.find(r => r.generation === ctx.generation && r.coverageDigest)?.captureId ??
+          existing.find(r => r.generation === ctx.generation)?.captureId ?? "";
         const probe = existing.find(r => r.generation === ctx.generation && r.exactHoldBinding) ??
           { runId: ctx.runId, generation: ctx.generation, inventoryGuarded: true } as RecoveryRecord;
         const materialize = async (): Promise<void> => {
-        if (!(await this.inactiveInventory(probe))) return;
+        if (!(await this.inactiveInventory(probe))) { note("inventory_not_inactive"); return; }
         // Issue #2545: a generation with a journaled held_publication FINAL has its identity fixed by
         // that request. A second snapshot (it would differ in its original source) would only mint a
         // redundant archive beside the held release, so the pending request is replayed instead.
         if (existing.some(r => r.generation === ctx.generation && r.inventoryGuarded && !r.finalAcknowledged &&
-            r.finalRequest?.disposition.kind === "held_publication")) return;
+            r.finalRequest?.disposition.kind === "held_publication")) { note("pending_held_final"); return; }
         const original = existing.find(r => r.generation === ctx.generation && !r.coverageDigest);
         const frozenContext = existing.find(r => r.generation === ctx.generation && r.coverageContext)?.coverageContext;
         // A generation has one stable snapshot authority even when its original roots
@@ -2649,24 +2680,25 @@ export class RecoveryCoordinator {
           .map(e => e.context)
           .sort((a, b) => Number(b.branch === original?.branch) - Number(a.branch === original?.branch) ||
             canonicalJson(a).localeCompare(canonicalJson(b)))[0];
-        if (!preferred || canonicalJson(preferred) !== canonicalJson(ctx)) return;
+        if (!preferred || canonicalJson(preferred) !== canonicalJson(ctx)) { note("nonpreferred_context"); return; }
         const originalSourceSha = original?.sourceSha;
         let currentSha = originalSourceSha ?? entry.candidates[0]?.sha;
         const owned = await ownedRecoveryIO(() => this.git.committedTrackingOwnership?.(ctx.barePath, ctx.branch, ctx.runId, undefined, ctx.generation));
         if (owned?.kind === "owned" && canonicalJson(owned.context) === canonicalJson(ctx)) currentSha = owned.sha;
-        if (!currentSha) return; // No adopted source or positive tracking proof is not an empty snapshot.
+        if (!currentSha) { note("current_source_missing"); return; } // No positive source is not an empty snapshot.
         // freezeInventory alone compares the complete source/tree/context fingerprint.
         // Equal pin lists cannot justify reusing an archive of an earlier disposition source.
         const diagnostics = this.inventorySourceDiagnostics({ ...ctx, generation: ctx.generation }, original?.captureId);
         const boundary = await this.inventorySourceBoundary(diagnostics.context, async prove => {
-          if (!await this.inactiveInventory(probe) || !await prove()) return;
+          if (!await this.inactiveInventory(probe)) { note("inventory_not_inactive"); return; }
+          if (!await prove()) { note("source_proof_unavailable"); return; }
           const record = await this.freezeInventory({
             context: ctx as PositiveOwedCandidateContext, currentSha, originalSourceSha,
             defaultBranch: ctx.defaultIdentity!.ref.replace(/^refs\/remotes\/origin\//, ""),
           });
           if (record) records.push(record);
         });
-        if (boundary === "retained") diagnostics.retained();
+        if (boundary === "retained") { note("source_boundary_retained"); diagnostics.retained(); }
         if (boundary === "retained" && original) {
           await this.writeExistingRecord(original, cur => ({ ...cur, state: "needs_action", reason: diagnostics.reason() }));
         }
@@ -3340,7 +3372,7 @@ export class RecoveryCoordinator {
     signal = signal ? AbortSignal.any([signal, this.passShutdown.signal]) : this.passShutdown.signal;
     // issue #1995: installed SYNCHRONOUSLY (before the first await) so a heartbeat-driven
     // resumeLive can never overlap the boot sweep: it returns at once while any pass is in flight.
-    return this.trackPass(signal, () => this.resumePendingPass(signal, snapshot, discover));
+    return this.trackPass(signal, () => this.inventoryDiagnosticPath.run("boot", () => this.resumePendingPass(signal, snapshot, discover)));
   }
 
   /** Register before the runner releases its exact local tail. The observation selects
@@ -4164,7 +4196,7 @@ export class RecoveryCoordinator {
       return;
     }
     if (this.now() < this.nextPassAt) return;
-    await this.trackPass(opts.signal, () => this.livePass(opts));
+    await this.trackPass(opts.signal, () => this.inventoryDiagnosticPath.run("live", () => this.livePass(opts)));
   }
 
   private async livePass(opts: ResumeLiveOptions): Promise<void> {
@@ -4192,6 +4224,7 @@ export class RecoveryCoordinator {
       for (const id of this.pinCleanupBackoff.keys()) if (!seen.has(id)) this.pinCleanupBackoff.delete(id);
       for (const id of this.pendingReportLogged) if (!seen.has(id)) this.pendingReportLogged.delete(id);
       for (const [key, entry] of this.redriveExitLogged) if (!seen.has(entry.captureId)) this.redriveExitLogged.delete(key);
+      for (const [key, entry] of this.inventoryDiagnosticLogged) if (entry.captureId && !seen.has(entry.captureId)) this.inventoryDiagnosticLogged.delete(key);
       // Executing runs and ACKs whose reports still need them are filtered BEFORE
       // the cap. Deferred local cleanup must not displace a fresh upload or FINAL.
       const eligible = all

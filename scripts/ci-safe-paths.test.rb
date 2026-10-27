@@ -6,6 +6,10 @@ require 'yaml'
 require 'open3'
 require 'tempfile'
 require 'tmpdir'
+require 'fileutils'
+require 'digest'
+require 'time'
+require 'json'
 
 class Expression
   def initialize(source, context)
@@ -220,5 +224,412 @@ Dir.mktmpdir('brew-watch-proof') do |dir|
   assert.call(status.exitstatus, 1, 'failed Brew proof remains a gate failure')
   assert.call(stdout.include?('manual recovery required'), true, 'watcher refuses automatic gate rerun')
   assert.call(stderr.include?("After the same tag's release.yml succeeds: gh run rerun 202 --failed"), true, 'watcher names guarded recovery command')
+end
+release_auto = YAML.safe_load(File.read(File.join(root, '.github/workflows/release-auto.yml')), aliases: true)
+assert.call(release_auto.fetch('on').keys, ['workflow_dispatch'], 'automation remains dispatch-only until live RC proof')
+assert.call(release_auto.fetch('permissions'), {}, 'automation token defaults to no permissions')
+assert.call(release_auto.fetch('concurrency'), {'group' => 'release-auto', 'cancel-in-progress' => false, 'queue' => 'max'}, 'all release routes queue without cancellation')
+auto_jobs = release_auto.fetch('jobs')
+assert.call(release_auto.fetch('on').fetch('workflow_dispatch').fetch('inputs').fetch('kind').fetch('options'), %w[rc stable], 'dispatch operation choices')
+assert.call(auto_jobs.keys, %w[authorize prepare push watch report], 'release automation job graph')
+permissions = {'authorize' => {'contents' => 'read'}, 'prepare' => {'contents' => 'read', 'actions' => 'write'},
+               'push' => {}, 'watch' => {'contents' => 'read', 'actions' => 'write'}, 'report' => {'issues' => 'write'}}
+needs = {'authorize' => [], 'prepare' => ['authorize'], 'push' => %w[authorize prepare],
+         'watch' => %w[authorize prepare push], 'report' => %w[authorize prepare push watch]}
+auto_jobs.each do |name, job|
+  assert.call(job.fetch('permissions'), permissions.fetch(name), "#{name} least privilege")
+  assert.call(Array(job['needs']), needs.fetch(name), "#{name} retains authority prerequisites")
+  assert.call(job['continue-on-error'], nil, "#{name} cannot suppress job failure")
+  job.fetch('steps').each do |step|
+    assert.call(step['continue-on-error'], nil, "#{name} cannot suppress a step failure")
+    assert.call(step.fetch('run', '').include?('${{'), false, "#{name} run inputs arrive as data")
+    if step['uses'] && !step['uses'].start_with?('./')
+      assert.call(step['uses'].match?(/@[0-9a-f]{40}$/), true, "#{name} action is immutable")
+    end
+  end
+  unless name == 'push'
+    assert.call(job['environment'], nil, "#{name} has no credential environment")
+    assert.call(job.to_s.include?('RELEASE_APP_KEY'), false, "#{name} has no App private key")
+    assert.call(job.to_s.include?('RELEASE_APP_ID'), false, "#{name} has no App identity")
+  end
+end
+assert.call(auto_jobs.fetch('report').fetch('if'), 'always()', 'failure reporting runs after skipped jobs')
+auto_prepare = auto_jobs.fetch('prepare')
+assert.call(auto_prepare.fetch('if'), "needs.authorize.outputs.outcome == 'authorized'", 'prepare requires current authorization')
+assert.call(auto_jobs.fetch('authorize').fetch('steps').find { |step| step['id'] == 'authorize' }.fetch('run'),
+            'python3 -I scripts/release-auto.py authorize', 'dispatch schema and context validator actually runs')
+assert.call(auto_prepare.fetch('steps').find { |step| step['id'] == 'prepare' }.fetch('run'),
+            'python3 -I scripts/release-auto.py prepare', 'shared release orchestrator actually runs')
+auto_push = auto_jobs.fetch('push')
+assert.call(auto_push.fetch('if'), "needs.authorize.outputs.outcome == 'authorized' && needs.prepare.outputs.outcome == 'prepared'", 'App key requires authorized successful preparation')
+assert.call(auto_push.fetch('environment').fetch('name'), "${{ inputs.kind == 'stable' && 'release-stable' || 'release-rc' }}", 'separate principal per operation')
+assert.call(auto_jobs.fetch('watch').fetch('if'), "${{ !cancelled() && needs.push.outputs.attempted == 'true' }}", 'known push attempt remains watched after job failure or timeout')
+assert.call(auto_jobs.fetch('watch').fetch('steps').find { |step| step['id'] == 'admit' }.fetch('run'),
+            'python3 -I scripts/release-auto.py watch-check', 'recovery checks actor and tag before actions writes')
+mint = auto_push.fetch('steps').find { |step| step['id'] == 'app' }
+assert.call(mint.fetch('uses'), 'actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510', 'reviewed token action')
+assert.call(mint['if'], nil, 'mint keeps default success gating after validation')
+assert.call(mint.fetch('with'), {'client-id' => '${{ vars.RELEASE_APP_ID }}', 'private-key' => '${{ secrets.RELEASE_APP_KEY }}',
+                               'owner' => 'vtmocanu', 'repositories' => 'uzi', 'permission-contents' => 'write'}, 'installation token scope')
+bundle_step = auto_push.fetch('steps').find { |step| step['id'] == 'bundle' }
+publish_step = auto_push.fetch('steps').find { |step| step['id'] == 'push' }
+# Execute the classifier from the actual step, including its defensive mixed
+# receipt branch. A reported ref update must never be called "nothing changed".
+receipt_parts = publish_step.fetch('run').split("if awk -F '\\t' ", 2)
+assert.call(receipt_parts.length, 2, 'actual porcelain classifier is present')
+receipt_classifier = "awk -F '\\t' " + receipt_parts.last.split(' "$receipt"; then', 2).first
+{"!\trefs/tags/v0.2.0:refs/tags/v0.2.0\t[rejected]\n" => true,
+ "*\trefs/heads/main:refs/heads/main\t[new branch]\n!\trefs/tags/v0.2.0:refs/tags/v0.2.0\t[rejected]\n" => false,
+ "fatal: transport interrupted\n" => false}.each do |receipt, rejected|
+  Tempfile.create('push-porcelain') do |file|
+    file.write(receipt)
+    file.flush
+    _, _, status = Open3.capture3('bash', '-e', '-c', receipt_classifier + ' "$1"', 'porcelain', file.path)
+    assert.call(status.success?, rejected, 'only rejection without a changed ref is definitive')
+  end
+end
+assert.call(auto_push.fetch('steps').index(bundle_step) < auto_push.fetch('steps').index(mint), true, 'bundle validated before minting')
+assert.call(auto_push.fetch('steps').index(mint) < auto_push.fetch('steps').index(publish_step), true, 'only final publisher receives installation token')
+assert.call(auto_push.fetch('steps').map { |step| step['uses'] }.compact, [
+  'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333',
+  'actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510'
+], 'credential job runs only reviewed infrastructure actions')
+push_runs = auto_push.fetch('steps').map { |step| step.fetch('run', '') }.join("\n")
+assert.call(push_runs.match?(/\b(?:python3?|node|npm|npx|pip|curl|wget|eval|source|bash)\b|(?:^|[;|&]|\$\()\s*sh(?:\s|$)/), false, 'credential job does not execute repository runtimes or installers')
+assert.call(push_runs.match?(%r{(?:^|[;|&])\s*(?:\./)?(?:\.agents/|scripts/)\S*|\b(?:git|g)\s+(?:checkout|switch|worktree)}), false, 'credential job never checks out or runs repository code')
+assert.call(push_runs.include?('--force'), false, 'release push cannot force refs')
+
+# Execute the real guarded steps against an owned local bare remote. All network
+# protocols are denied; an insteadOf mapping redirects the hard-coded public URL.
+real_git = ENV.fetch('PATH').split(File::PATH_SEPARATOR).map { |dir| File.join(dir, 'git') }.find { |path| File.executable?(path) }
+Dir.mktmpdir('release-auto-contract') do |dir|
+  remote = File.join(dir, 'remote.git')
+  repo = File.join(dir, 'source')
+  bin = File.join(dir, 'bin')
+  FileUtils.mkdir_p(bin)
+  hermetic = {'GIT_CONFIG_GLOBAL' => '/dev/null', 'GIT_CONFIG_SYSTEM' => '/dev/null', 'GIT_ALLOW_PROTOCOL' => 'file'}
+  git = lambda do |*args|
+    out, err, status = Open3.capture3(hermetic, real_git, '-c', 'core.fsmonitor=false', *args)
+    raise "fixture git failed: #{err}" unless status.success?
+    out.strip
+  end
+  git.call('init', '--bare', remote)
+  git.call('init', '-b', 'main', repo)
+  git.call('-C', repo, 'config', 'user.name', 'fixture')
+  git.call('-C', repo, 'config', 'user.email', 't@example.com')
+  File.write(File.join(repo, 'CHANGELOG.md'), "stable\n")
+  git.call('-C', repo, 'add', 'CHANGELOG.md')
+  git.call('-C', repo, 'commit', '-m', 'stable')
+  stable_sha = git.call('-C', repo, 'rev-parse', 'HEAD')
+  git.call('-C', repo, 'tag', '-a', 'v0.1.0', '-m', 'v0.1.0')
+  File.write(File.join(repo, 'CHANGELOG.md'), "candidate\n")
+  git.call('-C', repo, 'commit', '-am', 'candidate')
+  parent = git.call('-C', repo, 'rev-parse', 'HEAD')
+  git.call('-C', repo, 'tag', '-a', 'v0.2.0-rc.10', '-m', 'candidate')
+  git.call('-C', repo, 'remote', 'add', 'origin', remote)
+  git.call('-C', repo, 'push', 'origin', 'main', '--tags')
+  advertised = git.call('-C', repo, 'ls-remote', 'origin', 'refs/heads/main', 'refs/tags/v*')
+  refs_digest = Digest::SHA256.hexdigest(advertised.lines.map(&:chomp).select { |line| line.split("\t")[1].start_with?('refs/tags/v') }.sort.join("\n") + "\n")
+  File.write(File.join(repo, 'CHANGELOG.md'), "new candidate\n")
+  git.call('-C', repo, 'commit', '-am', 'prepared')
+  release_sha = git.call('-C', repo, 'rev-parse', 'HEAD')
+  git.call('-C', repo, 'tag', '-a', 'v0.2.0-rc.11', '-m', 'new candidate')
+  tag_oid = git.call('-C', repo, 'rev-parse', 'v0.2.0-rc.11')
+  git.call('-C', repo, 'update-ref', 'refs/heads/release-auto-prepared', release_sha)
+  bundle = File.join(dir, 'release.bundle')
+  git.call('-C', repo, 'bundle', 'create', bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v0.2.0-rc.11', '^' + parent)
+  File.write(File.join(bin, 'git'), <<~'SH')
+    #!/usr/bin/env bash
+    set -e
+    args=(); pushing=false
+    for arg in "$@"; do
+      args+=("$arg")
+      if [ "$arg" = push ]; then
+        pushing=true
+        if [ -n "${TEST_RECEIVE_PACK:-}" ]; then args+=("--receive-pack=$TEST_RECEIVE_PACK"); fi
+      fi
+    done
+    if [ "$pushing" = true ] && [ "${TEST_FAIL_AFTER_PUSH:-0}" = 1 ]; then
+      "$TEST_REAL_GIT" -c core.fsmonitor=false -c "url.${TEST_REMOTE}.insteadOf=https://github.com/vtmocanu/uzi.git" "${args[@]}"
+      exit 77
+    fi
+    exec "$TEST_REAL_GIT" -c core.fsmonitor=false -c "url.${TEST_REMOTE}.insteadOf=https://github.com/vtmocanu/uzi.git" "${args[@]}"
+  SH
+  File.write(File.join(bin, 'receive-pack'), <<~'SH')
+    #!/usr/bin/env bash
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+    unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+    exec "$TEST_REAL_GIT" -c core.fsmonitor=false -c "core.hooksPath=$TEST_REMOTE/hooks" receive-pack "$@"
+  SH
+  File.write(File.join(bin, 'sha256sum'), <<~'RUBY')
+    #!/usr/bin/env ruby
+    require 'digest'
+    data = ARGV.empty? ? STDIN.read : File.binread(ARGV[0])
+    puts "#{Digest::SHA256.hexdigest(data)}  #{ARGV.empty? ? '-' : ARGV[0]}"
+  RUBY
+  File.write(File.join(bin, 'date'), <<~'RUBY')
+    #!/usr/bin/env ruby
+    require 'time'
+    puts(ARGV.include?('-d') ? Time.iso8601(ARGV[ARGV.index('-d') + 1]).to_i : ENV.fetch('TEST_NOW'))
+  RUBY
+  %w[git receive-pack sha256sum date].each { |name| File.chmod(0o700, File.join(bin, name)) }
+  env = hermetic.merge('PATH' => "#{bin}:#{ENV.fetch('PATH')}", 'TEST_REAL_GIT' => real_git, 'TEST_REMOTE' => remote,
+                      'TEST_NOW' => Time.utc(2026, 10, 26, 10).to_i.to_s,
+                      'GITHUB_REPOSITORY' => 'vtmocanu/uzi', 'GITHUB_EVENT_NAME' => 'workflow_dispatch', 'GITHUB_RUN_ATTEMPT' => '1',
+                      'RELEASE_KIND' => 'rc', 'RELEASE_VERSION' => '', 'RELEASE_ABANDON' => 'false',
+                      'RELEASE_SUPERSEDE' => '', 'RELEASE_RC_TAG' => '', 'RELEASE_RC_SHA' => '',
+                      'RELEASE_REF' => 'refs/heads/main', 'RELEASE_ACTOR' => 'maintainer', 'RELEASE_DISPATCHERS' => 'maintainer',
+                      'RUN_CREATED_AT' => '2026-10-26T09:00:00Z', 'PARENT' => parent, 'RELEASE_SHA' => release_sha,
+                      'RELEASE_TAG' => 'v0.2.0-rc.11', 'TAG_OID' => tag_oid, 'BUNDLE_DIGEST' => Digest::SHA256.file(bundle).hexdigest,
+                      'REFS_DIGEST' => refs_digest, 'PREVIOUS_RC' => 'v0.2.0-rc.10', 'PREVIOUS_RC_SHA' => parent,
+                      'PREVIOUS_STABLE' => 'v0.1.0', 'PREVIOUS_STABLE_SHA' => stable_sha, 'GH_APP_TOKEN' => 'credential-sentinel')
+  exercise = lambda do |changes, expected, publish_expected = nil, source_bundle = bundle, after_validation = {}, expected_outcome = nil|
+    Dir.mktmpdir('push-step', dir) do |work|
+      FileUtils.mkdir_p(File.join(work, 'release-bundle'))
+      FileUtils.cp(source_bundle, File.join(work, 'release-bundle/release.bundle'))
+      invocation = env.merge('RUNNER_TEMP' => work, 'GITHUB_OUTPUT' => File.join(work, 'output')).merge(changes)
+      guard_out, err, status = Open3.capture3(invocation, 'bash', '-e', '-c', bundle_step.fetch('run'), chdir: work)
+      assert.call(status.success?, expected, "actual pre-key guard #{changes.keys}: #{err[-300..]}")
+      if changes['GITHUB_RUN_ATTEMPT'] == '2'
+        assert.call(status.success?, false, 'rerun never reaches the default-success token step')
+        assert.call((guard_out + err).include?('Re-dispatch instead'), true, 'push rerun gives a clear recovery instruction')
+      end
+      if expected && !publish_expected.nil?
+        active_remote = invocation.fetch('TEST_REMOTE')
+        main_before = git.call('--git-dir=' + active_remote, 'rev-parse', 'refs/heads/main')
+        tags_before = git.call('--git-dir=' + active_remote, 'show-ref', '--tags')
+        _, push_err, pushed = Open3.capture3(invocation.merge(after_validation), 'bash', '-e', '-c', publish_step.fetch('run'), chdir: work)
+        expected_main = publish_expected && invocation['RELEASE_KIND'] == 'rc' ? invocation['RELEASE_SHA'] : main_before
+        assert.call(git.call('--git-dir=' + active_remote, 'rev-parse', 'refs/heads/main'), expected_main,
+                    expected_outcome == 'push-rejected' ? 'atomic rejection leaves main unchanged' : 'publisher preserves the correct main boundary')
+        assert.call(pushed.success?, publish_expected, "actual atomic publish: #{push_err}")
+        if expected_outcome
+          receipt = File.read(invocation.fetch('GITHUB_OUTPUT')).lines.map { |line| line.strip.split('=', 2) }.to_h
+          assert.call(receipt['outcome'], expected_outcome, 'push result classification')
+          assert.call(receipt['attempted'], expected_outcome == 'push-rejected' ? 'false' : 'true', 'rejected push never enters watch')
+        end
+        if publish_expected
+          assert.call(git.call('--git-dir=' + active_remote, 'rev-parse', 'refs/tags/' + invocation['RELEASE_TAG'] + '^{}'), invocation['RELEASE_SHA'], 'atomic publish creates exact tag')
+        else
+          assert.call(git.call('--git-dir=' + active_remote, 'show-ref', '--tags'), tags_before, 'failed final guard preserves all tags')
+        end
+      end
+    end
+  end
+  exercise.call({'RELEASE_ACTOR' => 'outside'}, false)
+  exercise.call({'GITHUB_RUN_ATTEMPT' => '2'}, false)
+  exercise.call({'RELEASE_REF' => 'refs/heads/feature'}, false)
+  exercise.call({'GITHUB_REPOSITORY' => 'other/uzi'}, false)
+  exercise.call({'GITHUB_EVENT_NAME' => 'push'}, false)
+  exercise.call({'RELEASE_VERSION' => '0.3.0'}, false)
+  exercise.call({'RELEASE_RC_TAG' => 'v0.2.0-rc.10'}, false)
+  exercise.call({'RELEASE_TAG' => 'v00.2.0-rc.11'}, false)
+  exercise.call({'BUNDLE_DIGEST' => '0' * 64}, false)
+  exercise.call({'RELEASE_SHA' => '0' * 40}, false)
+  exercise.call({'REFS_DIGEST' => '0' * 64}, true, false)
+  exercise.call({'PREVIOUS_RC' => 'v0.2.0-rc.9'}, true, false)
+  exercise.call({'PREVIOUS_STABLE' => 'v0.0.9'}, true, false)
+  exercise.call({'RELEASE_KIND' => 'stable', 'RELEASE_RC_TAG' => 'v0.2.0-rc.10', 'RELEASE_RC_SHA' => parent,
+                 'RELEASE_TAG' => 'v0.2.0', 'RUN_CREATED_AT' => '2026-10-24T09:00:00Z'}, false)
+  # Matching digests and advertised heads cannot replace annotation and target
+  # checks. Both malformed bundles otherwise have the expected two heads.
+  git.call('-C', repo, 'update-ref', 'refs/tags/v0.2.0-rc.11', release_sha)
+  lightweight_bundle = File.join(dir, 'lightweight.bundle')
+  git.call('-C', repo, 'bundle', 'create', lightweight_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v0.2.0-rc.11', '^' + parent)
+  exercise.call({'TAG_OID' => release_sha, 'BUNDLE_DIGEST' => Digest::SHA256.file(lightweight_bundle).hexdigest}, false, nil, lightweight_bundle)
+  git.call('-C', repo, 'tag', '-f', '-a', 'v0.2.0-rc.11', '-m', 'wrong target', parent)
+  wrong_target_oid = git.call('-C', repo, 'rev-parse', 'v0.2.0-rc.11')
+  wrong_target_bundle = File.join(dir, 'wrong-target.bundle')
+  git.call('-C', repo, 'bundle', 'create', wrong_target_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v0.2.0-rc.11', '^' + parent)
+  exercise.call({'TAG_OID' => wrong_target_oid, 'BUNDLE_DIGEST' => Digest::SHA256.file(wrong_target_bundle).hexdigest}, false, nil, wrong_target_bundle)
+  git.call('-C', repo, 'update-ref', 'refs/tags/v0.2.0-rc.11', tag_oid)
+  invalid_rc_bundle = File.join(dir, 'invalid-rc.bundle')
+  git.call('-C', repo, 'tag', '-a', 'v0.2.0-rc.0', '-m', 'invalid zero candidate', release_sha)
+  invalid_rc_oid = git.call('-C', repo, 'rev-parse', 'v0.2.0-rc.0')
+  git.call('-C', repo, 'bundle', 'create', invalid_rc_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v0.2.0-rc.0', '^' + parent)
+  exercise.call({'RELEASE_TAG' => 'v0.2.0-rc.0', 'TAG_OID' => invalid_rc_oid,
+                 'BUNDLE_DIGEST' => Digest::SHA256.file(invalid_rc_bundle).hexdigest}, false, nil, invalid_rc_bundle)
+  valid_extra_bundle = File.join(dir, 'valid-extra-head.bundle')
+  git.call('-C', repo, 'update-ref', 'refs/heads/unexpected', release_sha)
+  git.call('-C', repo, 'bundle', 'create', valid_extra_bundle, 'refs/heads/release-auto-prepared',
+           'refs/tags/v0.2.0-rc.11', 'refs/heads/unexpected', '^' + parent)
+  exercise.call({'BUNDLE_DIGEST' => Digest::SHA256.file(valid_extra_bundle).hexdigest}, false, nil, valid_extra_bundle)
+  # Each malformed commit otherwise has matching parent, tag and digest. Pin
+  # both the fragment-only deletion rule and unchanged regular-file modes.
+  %w[deletion mode].each_with_index do |shape, index|
+    git.call('-C', repo, 'checkout', '--detach', parent)
+    if shape == 'deletion'
+      FileUtils.rm(File.join(repo, 'CHANGELOG.md'))
+    else
+      File.chmod(0o755, File.join(repo, 'CHANGELOG.md'))
+    end
+    git.call('-C', repo, 'add', '--', 'CHANGELOG.md')
+    git.call('-C', repo, 'commit', '-m', shape + ' fence fixture')
+    malformed = git.call('-C', repo, 'rev-parse', 'HEAD')
+    malformed_tag = "v0.2.0-rc.#{96 + index}"
+    git.call('-C', repo, 'tag', '-a', malformed_tag, '-m', shape)
+    malformed_oid = git.call('-C', repo, 'rev-parse', malformed_tag)
+    git.call('-C', repo, 'update-ref', 'refs/heads/release-auto-prepared', malformed)
+    malformed_bundle = File.join(dir, shape + '.bundle')
+    git.call('-C', repo, 'bundle', 'create', malformed_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/' + malformed_tag, '^' + parent)
+    exercise.call({'RELEASE_SHA' => malformed, 'RELEASE_TAG' => malformed_tag, 'TAG_OID' => malformed_oid,
+                   'BUNDLE_DIGEST' => Digest::SHA256.file(malformed_bundle).hexdigest}, false, nil, malformed_bundle)
+  end
+  # A self-consistent child with source changes must fail the fixed metadata fence.
+  git.call('-C', repo, 'checkout', '--detach', parent)
+  FileUtils.mkdir_p(File.join(repo, 'api'))
+  File.write(File.join(repo, 'api/injected.go'), "package main\n")
+  git.call('-C', repo, 'add', 'api/injected.go')
+  git.call('-C', repo, 'commit', '-m', 'extra source')
+  injected = git.call('-C', repo, 'rev-parse', 'HEAD')
+  git.call('-C', repo, 'tag', '-a', 'v0.2.0-rc.99', '-m', 'extra source')
+  injected_tag = git.call('-C', repo, 'rev-parse', 'v0.2.0-rc.99')
+  git.call('-C', repo, 'update-ref', 'refs/heads/release-auto-prepared', injected)
+  injected_bundle = File.join(dir, 'injected.bundle')
+  git.call('-C', repo, 'bundle', 'create', injected_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v0.2.0-rc.99', '^' + parent)
+  exercise.call({'RELEASE_SHA' => injected, 'RELEASE_TAG' => 'v0.2.0-rc.99', 'TAG_OID' => injected_tag,
+                 'BUNDLE_DIGEST' => Digest::SHA256.file(injected_bundle).hexdigest}, false, nil, injected_bundle)
+  # Stable pushes ignore current main, and age is checked again after bundle fetch.
+  stable_remote = File.join(dir, 'stable-remote.git')
+  git.call('clone', '--bare', remote, stable_remote)
+  git.call('-C', repo, 'push', stable_remote, release_sha + ':refs/heads/main')
+  git.call('-C', repo, 'checkout', '--detach', parent)
+  File.write(File.join(repo, 'CHANGELOG.md'), "promoted\n")
+  git.call('-C', repo, 'commit', '-am', 'promote')
+  promoted = git.call('-C', repo, 'rev-parse', 'HEAD')
+  git.call('-C', repo, 'tag', '-a', 'v0.2.0', '-m', 'stable')
+  promoted_tag = git.call('-C', repo, 'rev-parse', 'v0.2.0')
+  git.call('-C', repo, 'update-ref', 'refs/heads/release-auto-prepared', promoted)
+  stable_bundle = File.join(dir, 'stable.bundle')
+  git.call('-C', repo, 'bundle', 'create', stable_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v0.2.0', '^' + parent)
+  stable_env = {'TEST_REMOTE' => stable_remote, 'RELEASE_KIND' => 'stable', 'RELEASE_RC_TAG' => 'v0.2.0-rc.10',
+                'RELEASE_RC_SHA' => parent, 'RELEASE_TAG' => 'v0.2.0', 'RELEASE_SHA' => promoted,
+                'TAG_OID' => promoted_tag, 'BUNDLE_DIGEST' => Digest::SHA256.file(stable_bundle).hexdigest,
+                'RUN_CREATED_AT' => '2026-10-25T10:00:00Z'}
+  prefix = bundle_step.fetch('run').split("reason='bundle-digest-mismatch'", 2)
+  assert.call(prefix.length, 2, 'schema boundary remains identifiable before artifact access')
+  _, _, parent_status = Open3.capture3(env.merge(stable_env).merge('PARENT' => stable_sha, 'GITHUB_OUTPUT' => File.join(dir, 'prefix-output')),
+                                      'bash', '-e', '-c', prefix.first)
+  assert.call(parent_status.success?, false, 'actual pre-key schema independently binds approved parent')
+  exercise.call(stable_env.merge('RELEASE_VERSION' => '0.2.0'), false, nil, stable_bundle)
+  exercise.call(stable_env.merge('RELEASE_SUPERSEDE' => 'v0.2.0-rc.9'), false, nil, stable_bundle)
+  exercise.call(stable_env.merge('RUN_CREATED_AT' => '2026-10-27T10:00:00Z'), false, nil, stable_bundle)
+  # Recompute discovery outputs so only the approved-candidate identity guard
+  # rejects a newer remote RC. The raw inventory digest alone is insufficient.
+  newer_remote = File.join(dir, 'newer-candidate.git')
+  git.call('clone', '--bare', remote, newer_remote)
+  git.call('-C', repo, 'tag', '-a', 'v0.2.0-rc.12', '-m', 'new candidate', parent)
+  git.call('-C', repo, 'push', newer_remote, 'refs/tags/v0.2.0-rc.12')
+  newer_refs = git.call('ls-remote', newer_remote, 'refs/tags/v*')
+  newer_digest = Digest::SHA256.hexdigest(newer_refs.lines.map(&:chomp).sort.join("\n") + "\n")
+  exercise.call(stable_env.merge('TEST_REMOTE' => newer_remote, 'REFS_DIGEST' => newer_digest,
+                               'PREVIOUS_RC' => 'v0.2.0-rc.12'), true, false, stable_bundle)
+  git.call('-C', repo, 'tag', '-d', 'v0.2.0-rc.12')
+  exercise.call(stable_env, true, false, stable_bundle, {'TEST_NOW' => (Time.utc(2026, 10, 26, 10).to_i + 1).to_s})
+  exercise.call(stable_env, true, true, stable_bundle)
+  # An existing target is independently refused even with a matching fresh
+  # inventory and matching discovery names. No existing ref may be rewritten.
+  existing_remote = File.join(dir, 'existing-target.git')
+  git.call('clone', '--bare', remote, existing_remote)
+  git.call('-C', repo, 'push', existing_remote, 'refs/tags/v0.2.0-rc.11')
+  existing_refs = git.call('ls-remote', existing_remote, 'refs/tags/v*')
+  existing_digest = Digest::SHA256.hexdigest(existing_refs.lines.map(&:chomp).sort.join("\n") + "\n")
+  exercise.call({'TEST_REMOTE' => existing_remote, 'REFS_DIGEST' => existing_digest,
+                 'PREVIOUS_RC' => 'v0.2.0-rc.11', 'PREVIOUS_RC_SHA' => release_sha}, true, false)
+  # A self-contained bundle can hide a wrong parent from prerequisite checking;
+  # the independent single-parent binding must still reject it before minting.
+  File.write(File.join(repo, 'CHANGELOG.md'), "wrong parent\n")
+  git.call('-C', repo, 'commit', '-am', 'another child')
+  wrong_child = git.call('-C', repo, 'rev-parse', 'HEAD')
+  git.call('-C', repo, 'tag', '-a', 'v0.2.0-rc.12', '-m', 'wrong parent fixture')
+  wrong_tag = git.call('-C', repo, 'rev-parse', 'v0.2.0-rc.12')
+  git.call('-C', repo, 'update-ref', 'refs/heads/release-auto-prepared', wrong_child)
+  wrong_bundle = File.join(dir, 'wrong-parent.bundle')
+  git.call('-C', repo, 'bundle', 'create', wrong_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v0.2.0-rc.12')
+  exercise.call({'RELEASE_SHA' => wrong_child, 'RELEASE_TAG' => 'v0.2.0-rc.12', 'TAG_OID' => wrong_tag,
+                 'BUNDLE_DIGEST' => Digest::SHA256.file(wrong_bundle).hexdigest}, false, nil, wrong_bundle)
+  extra_bundle = File.join(dir, 'extra-ref.bundle')
+  git.call('-C', repo, 'update-ref', 'refs/heads/extra', wrong_child)
+  git.call('-C', repo, 'bundle', 'create', extra_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v0.2.0-rc.12', 'refs/heads/extra')
+  exercise.call({'RELEASE_SHA' => wrong_child, 'RELEASE_TAG' => 'v0.2.0-rc.12', 'TAG_OID' => wrong_tag,
+                 'BUNDLE_DIGEST' => Digest::SHA256.file(extra_bundle).hexdigest}, false, nil, extra_bundle)
+  # Self-consistency does not establish the human-approved stable version.
+  mismatched_remote = File.join(dir, 'mismatched-stable.git')
+  git.call('clone', '--bare', remote, mismatched_remote)
+  git.call('-C', repo, 'tag', '-a', 'v9.9.9', '-m', 'wrong stable target', release_sha)
+  mismatched_oid = git.call('-C', repo, 'rev-parse', 'v9.9.9')
+  git.call('-C', repo, 'update-ref', 'refs/heads/release-auto-prepared', release_sha)
+  mismatched_bundle = File.join(dir, 'mismatched-stable.bundle')
+  git.call('-C', repo, 'bundle', 'create', mismatched_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v9.9.9', '^' + parent)
+  exercise.call({'TEST_REMOTE' => mismatched_remote, 'RELEASE_KIND' => 'stable',
+                 'RELEASE_RC_TAG' => 'v0.2.0-rc.10', 'RELEASE_RC_SHA' => parent,
+                 'RELEASE_TAG' => 'v9.9.9', 'TAG_OID' => mismatched_oid,
+                 'BUNDLE_DIGEST' => Digest::SHA256.file(mismatched_bundle).hexdigest}, false, nil, mismatched_bundle)
+  # A main advance after preparation must stop the RC route before any push.
+  raced_remote = File.join(dir, 'raced-remote.git')
+  git.call('clone', '--bare', remote, raced_remote)
+  git.call('-C', repo, 'push', raced_remote, release_sha + ':refs/heads/main')
+  exercise.call({'TEST_REMOTE' => raced_remote}, true, false)
+  rejected_remote = File.join(dir, 'rejected-remote.git')
+  git.call('clone', '--bare', remote, rejected_remote)
+  File.write(File.join(rejected_remote, 'hooks/update'), "#!/bin/sh\n[ \"$1\" != refs/tags/v0.2.0-rc.11 ]\n")
+  File.chmod(0o700, File.join(rejected_remote, 'hooks/update'))
+  exercise.call({'TEST_REMOTE' => rejected_remote, 'TEST_RECEIVE_PACK' => File.join(bin, 'receive-pack')}, true, false, bundle, {}, 'push-rejected')
+  lost_remote = File.join(dir, 'lost-receipt.git')
+  git.call('clone', '--bare', remote, lost_remote)
+  exercise.call({'TEST_REMOTE' => lost_remote, 'TEST_FAIL_AFTER_PUSH' => '1'}, true, true, bundle, {}, 'receipt-unknown')
+  exercise.call({}, true, true)
+end
+# Reporting has no checkout/contents grant. Execute its exact inline program with
+# a fake API; healthy publication is summary-only, and failures reuse one issue.
+report_script = auto_jobs.fetch('report').fetch('steps').first.fetch('run')
+Dir.mktmpdir('release-report') do |dir|
+  bin = File.join(dir, 'bin')
+  FileUtils.mkdir_p(bin)
+  File.write(File.join(bin, 'gh'), <<~'RUBY')
+    #!/usr/bin/env ruby
+    require 'json'
+    File.open(ENV.fetch('REPORT_CALLS'), 'a') { |file| file.puts(ARGV.join(' ')) }
+    input = ARGV.include?('--input') ? JSON.parse(STDIN.read) : nil
+    if ARGV.include?('--slurp')
+      puts [[{'number' => 42, 'state' => 'closed', 'title' => 'Release automation failures'}]].to_json
+    elsif ARGV.include?('PATCH')
+      abort 'wrong reopen' unless input == {'state' => 'open'}
+      puts({'number' => 42, 'state' => 'open'}.to_json)
+    elsif ARGV.any? { |arg| arg.end_with?('/comments') }
+      abort 'unsafe issue body' if input.fetch('body').include?('credential-sentinel')
+      puts({'id' => 1}.to_json)
+    else
+      abort 'unexpected issue creation or API request'
+    end
+  RUBY
+  File.chmod(0o700, File.join(bin, 'gh'))
+  normal = {'authorize' => {'result' => 'success', 'outputs' => {'outcome' => 'authorized'}},
+            'prepare' => {'result' => 'success', 'outputs' => {'outcome' => 'prepared', 'reason' => 'ready'}},
+            'push' => {'result' => 'success', 'outputs' => {'outcome' => 'pushed', 'attempted' => 'true'}},
+            'watch' => {'result' => 'success', 'outputs' => {'outcome' => 'published-and-verified', 'receipt' => 'confirmed'}}}
+  environment = {'PATH' => "#{bin}:#{ENV.fetch('PATH')}", 'REPORT_CALLS' => File.join(dir, 'calls'),
+                 'GH_TOKEN' => 'credential-sentinel', 'REPOSITORY' => 'vtmocanu/uzi', 'RUN_ID' => '123',
+                 'RUN_URL' => 'https://github.com/vtmocanu/uzi/actions/runs/123', 'GITHUB_STEP_SUMMARY' => File.join(dir, 'summary')}
+  _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => normal.to_json), 'bash', '-e', '-c', report_script)
+  assert.call(status.success?, true, "healthy publication reporting: #{err}")
+  assert.call(File.exist?(File.join(dir, 'calls')), false, 'healthy publication never opens or comments on an issue')
+  failed = Marshal.load(Marshal.dump(normal))
+  failed['prepare'] = {'result' => 'failure', 'outputs' => {'outcome' => 'blocked', 'reason' => 'codex-runtime-needs-local-cut'}}
+  _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => failed.to_json), 'bash', '-e', '-c', report_script)
+  assert.call(status.exitstatus, 1, "blocked report remains visibly failed: #{err}")
+  calls = File.read(File.join(dir, 'calls'))
+  assert.call(calls.include?('PATCH repos/vtmocanu/uzi/issues/42'), true, 'closed tracking issue is reopened')
+  assert.call(calls.include?('POST repos/vtmocanu/uzi/issues/42/comments'), true, 'existing tracking issue receives incident')
+  %w[failure cancelled].each do |result|
+    interrupted = Marshal.load(Marshal.dump(normal))
+    interrupted['push'] = {'result' => result, 'outputs' => {'attempted' => 'true'}}
+    interrupted['watch'] = {'result' => 'failure', 'outputs' => {}}
+    _, _, status = Open3.capture3(environment.merge('NEEDS_JSON' => interrupted.to_json), 'bash', '-e', '-c', report_script)
+    assert.call(status.exitstatus, 1, "#{result} after send remains an incident")
+    text = File.read(environment.fetch('GITHUB_STEP_SUMMARY'))
+    assert.call(text.include?('"push_outcome": "receipt-unknown"'), true, "#{result} with missing receipt is unknown")
+    assert.call(text.include?('"outcome": "partial-publication"'), true, "#{result} reports same-tag manual inspection")
+  end
 end
 puts "ci-safe-paths: #{checks} assertions passed"

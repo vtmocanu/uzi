@@ -58,13 +58,13 @@ jobs and a wrapper would run the tests twice.
 
 Four things about it that are decisions rather than accidents:
 
-- **The load-bearing flags live in the targets, with their reason beside them.**
-  `-race` and `-count=1` on `test:api` and (since PRD #103 M6) on `test:controller`,
-  `--test-timeout=120000` inside `agent/test/run-unit-tests.ts` (the launcher
-  for `agent/package.json`'s `test` script). None is
-  optional and each one's absence is invisible in a passing run, which is why
-  the Taskfile is not `silent:` — Task echoes every command, so you can read the
-  flags in the output instead of trusting a file.
+- **Keep the load-bearing flags and inspect where they are set.**
+  `-race` and `-count=1` live in `test:api` and (since PRD #103 M6) in
+  `test:controller`; Task's command echo shows both. The agent unit timeout,
+  `--test-timeout=120000`, lives inside `agent/test/run-unit-tests.ts` (the launcher
+  for `agent/package.json`'s `test` script). Task echoes only `npm test` for that
+  stage, so inspect the launcher for the timeout. None of these flags is optional;
+  a passing run does not prove they were present.
 - **No `sources:`, `generates:` or `status:` on any target.** A fingerprinted
   target prints `Task "x" is up to date`, exits 0 and runs nothing, which is
   indistinguishable from a pass. uzi's gates deliberately read fixtures from
@@ -97,10 +97,11 @@ which is expected, not a hang.
 
 **🔴 BEFORE YOUR FIRST `task gate:web` OR `task gate:agent` AFTER PULLING M3 OR
 M4, YOU MUST INSTALL IN BOTH npm PACKAGES.** M3 added oxlint and M4 added knip,
-both as devDependencies in both packages, and the lint and dead-code steps fail
-closed with `oxlint: command not found` / `knip: command not found` until they are
-present — in a package you may not have touched. Run it in **both** `web/` and
-`agent/`:
+both as devDependencies in both packages. Missing oxlint fails lint. Missing knip
+makes `scripts/deadcode-knip.sh` print a loud skip and exit 0 locally; it fails
+with exit 2 when `CI` or `UZI_DEADCODE_<COMPONENT>_REQUIRED` is truthy. A local
+skip is not dead-code validation. To run both npm gates fully, install in **both**
+`web/` and `agent/`:
 
 ```sh
 npm install --ignore-scripts
@@ -184,9 +185,7 @@ new regression.
 There **is** a dead-code check, as of PRD #103 M4: `task deadcode` runs all four
 components, and each `task gate:<component>` runs its own. Go (`api`,
 `controller`) is `golang.org/x/tools/cmd/deadcode -test ./...`, invoked through
-`scripts/deadcode-gate.sh`; `web` and `agent` are knip. *(This paragraph read
-"There is still no dead-code check and no coverage signal" until M4 landed. The
-coverage half is still true and is M6's.)*
+`scripts/deadcode-gate.sh`; `web` and `agent` are knip.
 
 **The two halves gate differently, and that is the thing to know before you read
 a green.** The Go half holds both modules at **zero**: the baselines
@@ -198,21 +197,21 @@ baseline is a deliberate suppression and owes a reason in a comment beside it;
 the script treats an entry that is no longer reported as a failure, so a
 suppression cannot outlive the finding it covered.
 
-The npm half is **staged by severity** instead. Unused files, dependencies,
-unlisted imports, binaries, unresolved imports and duplicate exports are `error`
-and gate at zero. The **unused-export family is `warn`: printed in full on every
-run and setting no exit code** — 22 findings on `web` and 53 on `agent` as of
-2026-08-02. So a green `task deadcode:web` means no *gating* tier fired, not
-"no unused exports". Burning that tier down and promoting it to `error` is
-tracked as issue #206; `--max-issues` is not a stopgap for it, because it counts
-error-severity issues only.
+The npm half gates at **zero** too. `web/knip.jsonc` and `agent/knip.jsonc` set
+unused files, dependencies, unlisted imports, binaries, unresolved imports,
+duplicate exports and the unused-export/type family (`exports`, `types`,
+`nsExports`, `nsTypes`, `enumMembers`, `namespaceMembers`) to `error`. A green
+`task deadcode:web` or `task deadcode:agent`, when knip actually ran, means no
+unused exports were reported. Keep in-file DTO/contract types exported via
+`ignoreExportsUsedInFile`, not a blanket suppression.
 
 **Neither tool sees a dead *branch*.** `deadcode` finds unreachable functions and
 knip finds unused exports, files and dependencies; a `case` arm that nothing
-reaches inside a live function is invisible to both. The known instance is the
-legacy `"Task"` switch case in `web/src/components/RunEvent.tsx`. Dead branches
-stay a review question, which is why the reviewer role keeps a deletion lens
-rather than deferring to the slot.
+reaches inside a live function is invisible to both. The legacy `"Task"` cases
+in `web/src/components/RunEvent.tsx` are retained for historical run frames,
+alongside the live `"Agent"` name; they are not evidence of a dead branch.
+Dead branches stay a review question, which is why the reviewer role keeps a
+deletion lens rather than deferring to the slot.
 
 Two companion targets, `task deadcode:api:all` and `task deadcode:controller:all`,
 drop `-test` and print what the gating invocation cannot see: a function whose
@@ -221,8 +220,9 @@ only remaining caller is a test (43 and 4 respectively, re-derived 2026-08-03 at
 `task lint:api:all`, **they always exit 0** — deadcode has no failure status of
 its own, so read their output rather than their exit code.
 
-There is still no coverage signal. That is PRD #103's M6, and a target for it
-arrives with the check itself rather than as an empty stub.
+Coverage is emitted by `test:api` and `test:controller` through
+`-covermode=atomic -coverprofile=coverage.out` and `scripts/coverage-total.sh`.
+The web `test` script runs `vitest run --coverage`.
 
 There are also four repo-wide checks with no component, as of PRD #103 M5:
 `task lint:shell` (shellcheck), `task lint:yaml` (yamllint `--strict`),

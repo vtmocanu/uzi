@@ -85,7 +85,7 @@ it("WorkerClient serializes the instruction pin separately from the diff base", 
   const client = new WorkerClient("http://example.com", "worker-token", "test", nullLogger());
   assert.deepEqual(await client.submitCodeCrossCheck("lead", 1,
     { head_commit: HEAD, base_commit: BASE, repo_instructions_commit: TIP },
-    undefined, { repo_instructions_enabled: true, repo_instructions_text: "tip rules" }), { ...row, dispositions: null });
+    undefined, { repo_instructions_enabled: true, repo_instructions_text: "tip rules" }), { ...row, dispositions: null, coverage: null });
   assert.deepEqual(calls, [{
     url: "http://example.com/api/worker/runs/lead/cross-checks",
     body: { stage: "code", claim_generation: 1, head_commit: HEAD, base_commit: BASE,

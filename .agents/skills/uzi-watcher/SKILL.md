@@ -188,8 +188,10 @@ immediately `uzi run pause RUN --now`. A run at `limit_wait` is parked on an Ant
 usage limit and resumes itself — keep waiting. `recovery_wait` with cause
 `worker_requeue_exhausted` never resumes itself: the poller always stops on it
 (`STOP=recovery_wait:worker_requeue_exhausted`, exit 0, whatever the stop set, even one naming `recovery_wait`). Back up the
-work (*Recovering a failed run's work*), then `uzi run resume` or cancel; other
-`recovery_wait` causes keep their existing polling behaviour. `uzi-lander` uses this same poller for its
+work (*Recovering a failed run's work*), then `uzi run resume` or cancel. It stops the same way on
+an owner-held `retained_recovery_exhausted` park (retry stamp explicitly null; retries capped):
+`STOP=recovery_wait:retained_recovery_exhausted`; custody is kept, so Resume or cancel. A stamped
+park of that cause retries itself and keeps polling, as do other `recovery_wait` causes. `uzi-lander` uses this same poller for its
 blind watch to terminal.
 
 **Watching for a REVISED plan (after `uzi run revise`) uses the plan-seq form.** The

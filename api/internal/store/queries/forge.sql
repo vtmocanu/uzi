@@ -314,6 +314,24 @@ RETURNING *;
 -- Filter-ed against the vocabulary in the handler before it reaches here.
 UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING *;
 
+-- name: SetRepoIgnoredInferredCapabilitiesForUser :one
+UPDATE repos SET ignored_inferred_capabilities = $2
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
+RETURNING *;
+
+-- name: SetRepoIgnoredInferredCapabilities :one
+UPDATE repos SET ignored_inferred_capabilities = $2 WHERE repos.id = $1 RETURNING *;
+
+-- name: SetRepoCapabilityPolicyForUser :one
+UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $4)
+RETURNING *;
+
+-- name: SetRepoCapabilityPolicy :one
+UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3 WHERE repos.id = $1 RETURNING *;
+
 -- name: SetRepoTrustFlags :one
 -- Atomic Trusted-repo (PRD #246) toggle: sets repo_skills_enabled and/or
 -- repo_claudemd_enabled in ONE round-trip. A nil arg leaves that column unchanged

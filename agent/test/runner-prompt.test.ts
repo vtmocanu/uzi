@@ -1,4 +1,8 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { Outbox } from "../src/outbox.js";
 import assert from "node:assert/strict";
 import { makeClaim, nullLogger } from "./helpers.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
@@ -93,6 +97,110 @@ describe("RunRunner — ad-hoc prompt kind (PRD #241 M8)", () => {
 // commit so the agent branch fetches back; overriding changedFiles to [] drives the
 // confirmed-empty (report-only) leg deterministically.
 describe("RunRunner — prompt run proposal delivery (PRD #929 M2)", () => {
+  const tmpRoots: string[] = [];
+  afterEach(async () => {
+    for (const root of tmpRoots.splice(0)) await fs.rm(root, { recursive: true, force: true });
+  });
+
+  async function mkOutbox(): Promise<Outbox> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "runner-prompt-journal-"));
+    tmpRoots.push(dir);
+    const outbox = new Outbox({
+      root: path.join(dir, "outbox"),
+      log: nullLogger(),
+      runMaxBytes: 64 * 1024 * 1024,
+      maxBytes: 512 * 1024 * 1024,
+      retentionMs: 7 * 86_400_000,
+    });
+    await outbox.init();
+    return outbox;
+  }
+
+  it("#3469 control runner journals exact executor summary on confirmed-empty prompt completion after 409 running", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const outbox = await mkOutbox();
+    const claim = promptClaim({ claim_generation: 8 });
+    const summary = "Prompt findings\n\nNo repair needed.";
+    const stub = new StubExecutor(nullLogger());
+    const executor: Executor = {
+      run: async (ctx) => ({ ...await stub.run(ctx), summary }),
+    };
+    git.changedFiles = (async () => []) as typeof git.changedFiles;
+    api.failStateWhen(claim.run_id, (body) => body.status === "completed", { httpStatus: 409, runStatus: "running" });
+
+    await runner(executor, gitlab, undefined, {
+      outbox,
+      outboxTerminalMaxBytes: 1 << 20,
+      gapFillMax: 100,
+    }).execute(claim);
+
+    assert.equal(outbox.hasPendingTerminal(claim.run_id, 8), true);
+    const journal = await outbox.readTerminalJournal(claim.run_id, 8);
+    assert.ok(journal);
+    assert.equal(outbox.hasPendingTerminal(claim.run_id, 7), false, "journal belongs to this claim generation");
+    assert.equal(journal.body.status, "completed");
+    assert.equal(journal.body.report_only, true);
+    assert.equal(journal.body.report_md, summary);
+    assert.ok(!("mr_iid" in journal.body));
+    assert.equal(calls.length, 0, "no MR opened on confirmed-empty prompt completion");
+  });
+
+  it("#3469 control runner journals exact summary from a genuine no-commit prompt after 409 running", async () => {
+    const { gitlab, all } = fakeGitlab();
+    const scratch = path.resolve(import.meta.dirname, "../../.uzi/scratch");
+    await fs.mkdir(scratch, { recursive: true });
+    const dir = await fs.mkdtemp(path.join(scratch, "runner-prompt-no-commit-journal-"));
+    tmpRoots.push(dir);
+    const outbox = new Outbox({
+      root: path.join(dir, "outbox"),
+      log: nullLogger(),
+      runMaxBytes: 64 * 1024 * 1024,
+      maxBytes: 512 * 1024 * 1024,
+      retentionMs: 7 * 86_400_000,
+    });
+    await outbox.init();
+    const claim = promptClaim({ claim_generation: 9 });
+    const summary = "Prompt findings\n\nNo commits or repairs needed.";
+    let invocations = 0;
+    let headBefore: string | null = null;
+    let headAfter: string | null = null;
+    const executor: Executor = {
+      run: async (ctx) => {
+        invocations++;
+        headBefore = await git.worktreeHead(ctx.worktreePath);
+        assert.ok(headBefore, "executor starts at a real commit");
+        assert.equal(headBefore, ctx.baseCommit, "fresh prompt starts at its base commit");
+        headAfter = await git.worktreeHead(ctx.worktreePath);
+        assert.equal(headAfter, headBefore, "summary-only work leaves HEAD unchanged");
+        return { branch: ctx.branch, summary };
+      },
+    };
+    api.failStateWhen(claim.run_id, (body) => body.status === "completed", { httpStatus: 409, runStatus: "running" });
+
+    await runner(executor, gitlab, undefined, {
+      outbox,
+      outboxTerminalMaxBytes: 1 << 20,
+      gapFillMax: 100,
+    }).execute(claim);
+
+    assert.equal(invocations, 1, "summary executor was invoked");
+    assert.ok(headBefore);
+    assert.equal(headAfter, headBefore);
+    const barePath = git.barePathFor(fx.originPath);
+    const branch = `uzi/prompt-${claim.run_id}`;
+    assert.equal(await git.trackingTip(barePath, branch), headBefore, "fetch-back contains no new commits");
+    assert.deepEqual(await git.changedFiles(barePath, headBefore), [], "real Git diff confirms no changed files");
+    assert.equal(outbox.hasPendingTerminal(claim.run_id, 9), true);
+    assert.equal(outbox.hasPendingTerminal(claim.run_id, 8), false, "journal belongs to this claim generation");
+    const journal = await outbox.readTerminalJournal(claim.run_id, 9);
+    assert.ok(journal);
+    assert.equal(journal.body.status, "completed");
+    assert.equal(journal.body.report_only, true);
+    assert.equal(journal.body.report_md, summary);
+    assert.ok(!("mr_iid" in journal.body));
+    assert.deepEqual(all, [], "no forge MR reads or writes on no-commit prompt completion");
+  });
+
   /** Wrap StubExecutor so the branch is really created (fetchAgentBranch succeeds) while the
    *  ExecutorResult also carries a proposal, exactly as the SDK executor forwards one. */
   function proposalExecutor(

@@ -49,7 +49,11 @@ func (s *recoveryClaimJobStore) ListJobInputFilesForClaim(context.Context, pgtyp
 func TestWorkerRecoveryClaimConstructorsJSON(t *testing.T) {
 	for _, kind := range []string{"issue", "judge", "job", "chat"} {
 		t.Run(kind, func(t *testing.T) {
-			for _, episode := range []int64{0, 7} {
+			for _, value := range []struct {
+				episode int64
+				parks   int32
+			}{{0, 0}, {0, 3}, {7, 0}, {7, 1}, {7, 3}} {
+				episode := value.episode
 				box := newBox(t)
 				pat, err := box.Seal([]byte("fixture-pat"))
 				if err != nil {
@@ -61,7 +65,7 @@ func TestWorkerRecoveryClaimConstructorsJSON(t *testing.T) {
 				}
 				uid := uuid.New()
 				run := store.Run{ID: uuid.New(), UserID: uid, Kind: kind, Harness: "claude", Status: "claimed",
-					WorkerRecoveryEpisode: episode, ClaimGeneration: 13, RequeueCount: 4, MemoryEpisode: 2,
+					WorkerRecoveryEpisode: episode, RetainedParkCount: value.parks, ClaimGeneration: 13, RequeueCount: 4, MemoryEpisode: 2,
 					TargetRunID: pgconv.UUID(uuid.New()), JobType: pgconv.Text("research")}
 				fs := &fakeStore{claimRun: run, chatClaimRun: run, anthropic: token,
 					claimCtx: store.GetRunClaimContextRow{RepoWebUrl: "https://forge.example/g/r",
@@ -73,13 +77,13 @@ func TestWorkerRecoveryClaimConstructorsJSON(t *testing.T) {
 					if err != nil || payload == nil {
 						t.Fatalf("ClaimChat returned payload=%v err=%v", payload != nil, err)
 					}
-					assertClaimRecoveryEpisode(t, payload, episode)
+					assertClaimRecoveryEpisode(t, payload, episode+int64(value.parks))
 				} else {
 					payload, err := svc.Claim(context.Background(), worker, nil)
 					if err != nil || payload == nil {
 						t.Fatalf("Claim returned payload=%v err=%v", payload != nil, err)
 					}
-					assertClaimRecoveryEpisode(t, payload, episode)
+					assertClaimRecoveryEpisode(t, payload, episode+int64(value.parks))
 				}
 			}
 		})

@@ -49,8 +49,8 @@ var codexRejectionAfterAccountLock func(ctx context.Context)
 // The account row is locked first, then the intent. No lock cycle forms with the other
 // statements that touch both tables: ClearMismatchedCodexRecoveryAndMarkIntents (one
 // statement) updates only intents already 'reconciled', never a 'rotating' intent this
-// primitive locks, and SetCodexRefreshIntentStateFenced only reads the account in an EXISTS
-// subquery (no row lock on it) while it updates the intent. (InsertCodexRefreshIntent's
+// primitive locks. SetCodexRefreshIntentStateFenced and retry admission also lock the
+// account before updating a rotating intent, preserving this order. (InsertCodexRefreshIntent's
 // foreign-key check takes a KEY SHARE lock on the account, but its only intent row is the
 // one it is inserting, which no other transaction can hold.) Each lock re-checks its fence
 // (see the query comments); a fence that does not hold rolls back and returns

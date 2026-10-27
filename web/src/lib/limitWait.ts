@@ -29,7 +29,7 @@
 // resolved through a closed lookup and anything else renders as nothing at all,
 // leaving the surrounding sentence still true.
 
-import { isTerminalRun } from "./api";
+import { isTerminalRun } from "./runStatus";
 import { stripUnsafeChars } from "./safeText";
 
 // Only these stored harness values name a provider; missing or unknown context

@@ -1293,3 +1293,33 @@ func TestLoadWorkerStaleRequeueGrace(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadRunRetainedRecoveryMaxParks(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+
+	for _, tc := range []struct {
+		env  string
+		want int
+	}{
+		{"", 3},
+		{"5", 5},
+		{"0", 0},
+		{"-1", 3},
+		{"nonsense", 3},
+	} {
+		t.Setenv("RUN_RETAINED_RECOVERY_MAX_PARKS", tc.env)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() with RUN_RETAINED_RECOVERY_MAX_PARKS=%q: %v", tc.env, err)
+		}
+		if cfg.RunRetainedRecoveryMaxParks != tc.want {
+			t.Errorf("RunRetainedRecoveryMaxParks for RUN_RETAINED_RECOVERY_MAX_PARKS=%q = %d, want %d", tc.env, cfg.RunRetainedRecoveryMaxParks, tc.want)
+		}
+	}
+}

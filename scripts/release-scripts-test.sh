@@ -30,6 +30,7 @@
 # --ghcr-only [baseline-verifier] runs #1464 M1 publication fixtures only.
 # --frozen-rc-only runs the #1389 block-guard regressions without the full fixture suite.
 # --fold-order-only runs canonical pending/open-RC ordering fixtures.
+# --promote-main-race-only [cutter-path] pins promotion while remote main advances.
 # --plan-only [cutter-path] runs read-only decision and publication fixtures.
 # --fragments-only [cutter-path] runs fragment regressions, optionally against a frozen cutter.
 #
@@ -524,7 +525,7 @@ if [ "${1:-}" = "--identity-only" ]; then
   exit $?
 fi
 
-if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ] && [ "${1:-}" != "--plan-only" ]; then
+if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ] && [ "${1:-}" != "--plan-only" ] && [ "${1:-}" != "--promote-main-race-only" ]; then
 identity_regressions
 echo "=== building fixture in $REPO ==="
 build_fixture
@@ -632,7 +633,9 @@ fi
 # =============================================================================
 REPO_ROOT="$(cd "$SCRIPTS_DIR/.." && pwd)"
 RC="$REPO_ROOT/.agents/skills/uzi-release/scripts/release-cut.sh"
-[ "${1:-}" != --fragments-only ] && [ "${1:-}" != --plan-only ] || RC="${2:-$RC}"
+case "${1:-}" in
+  --fragments-only|--plan-only|--promote-main-race-only) RC="${2:-$RC}" ;;
+esac
 [ -f "$RC" ] || { echo "release-scripts-test: $RC not found" >&2; exit 2; }
 
 D2N=0
@@ -733,6 +736,41 @@ published_rc() {
   git -C "$1" tag v0.2.0-rc.1
   push_tag_to_origin "$1" v0.2.0-rc.1
 }
+# A promotion is pinned to the candidate; only main-writing cuts need a fresh main.
+promotion_main_race_regressions() (
+  local d candidate selected advanced
+  d="$(mktemp -d)"
+  trap 'rm -rf "$d" "$d.origin.git" "$d.writer"' EXIT
+  published_rc "$d"
+  git -C "$d" push -q origin main
+  candidate="$(git -C "$d" rev-parse 'v0.2.0-rc.1^{commit}')"
+  selected="$(git -C "$d" rev-parse HEAD)"
+  git clone -q --branch main "$d.origin.git" "$d.writer"
+  git -C "$d.writer" config user.email t@example.com
+  git -C "$d.writer" config user.name test
+  echo 'package main // work after the candidate' > "$d.writer/api/after_candidate.go"
+  git -C "$d.writer" add api/after_candidate.go
+  gcommit "$d.writer" 'Feature after candidate (#208)'
+  git -C "$d.writer" push -q origin main
+  advanced="$(git -C "$d.writer" rev-parse HEAD)"
+  assert_eq 'selected main tracking ref has not moved yet' "$selected" "$(git -C "$d" rev-parse origin/main)"
+  run_rc "$d" 0.2.0
+  assert_eq 'main-writing cut still refuses advancing main' 3 "$RC_RC"
+  assert_contains 'main-writing cut explains the race' 'behind origin/main' "$RC_OUT"
+  assert_eq 'refused main cut preserves HEAD' "$selected" "$(git -C "$d" rev-parse HEAD)"
+  assert_eq 'cutter fetch observed the new main' "$advanced" "$(git -C "$d" rev-parse origin/main)"
+  run_rc "$d" 0.2.0 --promote-only --ci
+  assert_eq 'promote-only permits advancing main' 0 "$RC_RC"
+  assert_eq 'stable parent remains the pinned candidate' "$candidate" "$(git -C "$d" rev-parse -q --verify 'v0.2.0^{commit}^' 2>/dev/null)"
+  assert_eq 'promotion preserves local main HEAD' "$selected" "$(git -C "$d" rev-parse HEAD)"
+  assert_eq 'promotion leaves remote main advanced' "$advanced" "$(git --git-dir="$d.origin.git" rev-parse refs/heads/main)"
+  assert_eq 'promotion leaves clean tracked inputs' '' "$(git -C "$d" status --porcelain --untracked-files=no)"
+  echo "promotion main race: $PASSES passed, $FAILS failed"
+  [ "$FAILS" -eq 0 ]
+)
+if [ "${1:-}" = --promote-main-race-only ]; then promotion_main_race_regressions; exit $?; fi
+if [ "$#" -eq 0 ]; then promotion_main_race_regressions || fail 'promotion main-race regressions'; fi
+
 # The planner shares the cutter's discovery and note rules, but owns no Git writes.
 plan_regressions() (
   local d before_head before_refs before_status output rc

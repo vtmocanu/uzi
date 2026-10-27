@@ -71,7 +71,7 @@ for older instances.
 
 ## 7. Enable the repo
 
-Open **Boards**, pick the connection, and enable each project you added the bot
+Open **Repos**, pick the connection, and enable each project you added the bot
 to. This makes its board appear in the sidebar and starts syncing its
 `uzi`-labeled issues (see [Board](./board.md)).
 

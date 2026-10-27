@@ -10,6 +10,7 @@ import { RunView } from "./RunView";
 import { useRunStream } from "../lib/useRunStream";
 import { api, ApiError, type Run } from "../lib/api";
 import { mockJobRuns, mockRuns } from "../mocks/data";
+import { setDemoMode } from "../lib/demoMode";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -41,6 +42,7 @@ const mockApi = vi.mocked(api);
 
 afterEach(() => {
   cleanup();
+  setDemoMode(false);
   vi.clearAllMocks();
   submit.mockReset().mockResolvedValue(undefined);
 });
@@ -56,6 +58,7 @@ const runningIssue: Run = {
   worker_id: "w-laptop",
   mr_iid: null,
   mr_state: null,
+  repo_path: "vtmocanu/uzi",
 };
 
 const submit = vi.fn().mockResolvedValue(undefined);
@@ -87,13 +90,39 @@ const REWORK_LABEL = /Auto-rework this MR.s review comments/;
 const breadcrumb = (container: HTMLElement) => container.querySelector("nav")!;
 
 describe("RunView job gates (PRD #1908)", () => {
-  it("control: a running issue run has the toggle row, a Board crumb, no job panel, and looks up its repo", async () => {
+  it("control: a running issue run names its repo in the breadcrumb and has the toggle row", async () => {
     const { container } = await renderPage(runningIssue);
     expect(screen.getByLabelText(WAIT_LABEL)).toBeTruthy();
     expect(screen.getByLabelText(REWORK_LABEL)).toBeTruthy();
-    expect(within(breadcrumb(container)).getByRole("link", { name: "Board" })).toBeTruthy();
+    const repo = within(breadcrumb(container)).getByRole("link", { name: "uzi" });
+    expect(repo.getAttribute("href")).toBe(`/repos/${runningIssue.repo_id}/board`);
+    expect(repo.getAttribute("title")).toBe("vtmocanu/uzi");
     expect(screen.queryByRole("region", { name: /job$/ })).toBeNull();
     expect(mockApi.listRepos).toHaveBeenCalled();
+  });
+
+  it.each([undefined, ""])("falls back to Board for an unavailable repo path (%s)", async (repo_path) => {
+    const { container } = await renderPage({ ...runningIssue, repo_path });
+    expect(within(breadcrumb(container)).getByRole("link", { name: "Board" }).getAttribute("href"))
+      .toBe(`/repos/${runningIssue.repo_id}/board`);
+  });
+
+  it("masks the repo breadcrumb tooltip in demo mode", async () => {
+    setDemoMode(true);
+    const { container } = await renderPage(runningIssue);
+    const repo = within(breadcrumb(container)).getByRole("link", { name: "uzi" });
+    expect(repo.getAttribute("title")).toBe("demo/uzi");
+  });
+
+  it("strips unsafe characters from the repo label and tooltip", async () => {
+    const { container } = await renderPage({ ...runningIssue, repo_path: "team\u202e/uz\u001bi" });
+    const repo = within(breadcrumb(container)).getByRole("link", { name: "uzi" });
+    expect(repo.getAttribute("title")).toBe("team/uzi");
+  });
+
+  it("keeps No repository for a repo-less non-job run", async () => {
+    const { container } = await renderPage({ ...runningJob, kind: "chat" });
+    expect(within(breadcrumb(container)).getByText("No repository")).toBeTruthy();
   });
 
   it("a running job mounts the result panel and has no wait-on-limit / MR-rework row", async () => {

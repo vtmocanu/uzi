@@ -27,8 +27,8 @@ func semanticSnapshotBlobs(planMd string, captures []apitypes.SemanticSourceCapt
 	return blobs
 }
 
-// SubmitSemanticCandidate is the dormant trusted-worker compiler seam. Transport
-// must use existing worker authentication; no production route enrolls a run.
+// SubmitSemanticCandidate compiles a claim-owned proposal against frozen issue
+// bytes. The worker route authenticates the caller; compilation requires enrollment.
 func (s *Service) SubmitSemanticCandidate(ctx context.Context, workerID, runID uuid.UUID, generation int64, structural PlanCrossCheckCandidate, proposal []byte, captures []apitypes.SemanticSourceCapture) (apitypes.SemanticCandidate, error) {
 	return s.submitSemanticCandidate(ctx, workerID, runID, generation, structural, proposal, captures, true)
 }
@@ -112,6 +112,11 @@ func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID u
 	// The compiler validates and canonicalizes a copy for checker identity.
 	// Keep the raw plan here for its fingerprint, exact snapshot and byte budget.
 	structural.CandidateIdentityVersion, structural.SemanticCandidate = "", nil
+	// Keep the raw candidate bound before suppression can shrink the reported set.
+	if len(structural.RequiredCapabilities) > 64 {
+		return empty, ErrCrossCheckRefused
+	}
+	structural.RequiredCapabilities = applyInferredCapabilityPolicy(run, structural.RequiredCapabilities)
 	candidate, fp, err := compileSemanticProposal(structural, proposal, captures)
 	if err != nil {
 		return empty, err

@@ -166,9 +166,12 @@ replacement or disablement may be superseded by the newer credential state.
 
 For a Codex login in `staging` or `failed`, Test runs identity reconciliation;
 that check can move the link state to `linked` or `failed`. If the verified
-account is quarantined or needs re-login, reconciliation installs this stored
-login on it, as the background check does for a new login. For a `linked`
-login, Test reads the account's usage once and does not refresh or rotate the
+account is quarantined or needs re-login, reconciliation can install a newly
+verified replacement on it, as the background check does for a new login.
+You can replace the value while automatic recovery is still in progress.
+To resume held runs, supply the same ChatGPT account and workspace: uzi verifies
+the replacement's identity, but a replacement for a different account cannot
+resume those runs. For a `linked` login, Test reads the account's usage once and does not refresh or rotate the
 login. It is a current check, not a promise that a later run can start.
 
 For an OpenAI API key, Test requests `GET /v1/models`. An `ok` result means
@@ -190,6 +193,13 @@ choosing which additional accounts show in the sidebar and TUI.
 **An OpenAI API key never gets a meter.** It has no subscription lifecycle
 behind it, so Codex limits shows a short "subscription windows do not
 apply" note next to it instead.
+
+uzi tries automatic recovery after an uncertain renewal failure. A waiting run
+may show **Codex account is reconciling** while that happens; let it recover,
+and unlock your vault or enable the login if needed. If recovery cannot finish,
+follow the re-login request on the run or credential card. The run's action is
+separate from its usage meter: an uncertain exchange can leave the meter stale.
+See [Codex account unavailable](run-recovery-wait.md#codex-account-unavailable).
 
 A linked account's meter can land in a state that needs your attention:
 

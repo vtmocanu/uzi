@@ -83,7 +83,7 @@ func seedRepo(ctx context.Context, t *testing.T, pool *pgxpool.Pool, connID uuid
 
 // assertPathsInherit creates a run through each of the six non-issue paths against repo
 // repoID and asserts every created run's required_capabilities equals want.
-func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, pool *pgxpool.Pool, userID, repoID uuid.UUID, want []string) {
+func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, pool *pgxpool.Pool, userID, repoID uuid.UUID, want []string, ignored ...[]string) {
 	t.Helper()
 
 	// CreateTaskRun — supplies id + branch; the review/then-fix runs reference it as their
@@ -103,6 +103,9 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 		t.Fatalf("CreateTaskRun: %v", err)
 	}
 	assertCaps(t, "CreateTaskRun", taskRun.RequiredCapabilities, want)
+	if len(ignored) > 0 {
+		assertCaps(t, "CreateTaskRun ignored inference", taskRun.IgnoredInferredCapabilities, ignored[0])
+	}
 
 	// CreateTaskReviewRun — a review of the task run above (non-null target FK).
 	reviewID := uuid.New()
@@ -119,6 +122,9 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 		t.Fatalf("CreateTaskReviewRun: %v", err)
 	}
 	assertCaps(t, "CreateTaskReviewRun", reviewRun.RequiredCapabilities, want)
+	if len(ignored) > 0 {
+		assertCaps(t, "CreateTaskReviewRun ignored inference", reviewRun.IgnoredInferredCapabilities, ignored[0])
+	}
 
 	// CreateThenFixRun — a fix derived from the task run above (non-null then_fix FK).
 	fixID := uuid.New()
@@ -136,6 +142,9 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 		t.Fatalf("CreateThenFixRun: %v", err)
 	}
 	assertCaps(t, "CreateThenFixRun", fixRun.RequiredCapabilities, want)
+	if len(ignored) > 0 {
+		assertCaps(t, "CreateThenFixRun ignored inference", fixRun.IgnoredInferredCapabilities, ignored[0])
+	}
 
 	// CreateCIFixRun — pipeline_ref is unique per repo so the one-active-ci_fix index
 	// never collides across the two repos.
@@ -156,6 +165,9 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 		t.Fatalf("CreateCIFixRun: %v", err)
 	}
 	assertCaps(t, "CreateCIFixRun", ciFixRun.RequiredCapabilities, want)
+	if len(ignored) > 0 {
+		assertCaps(t, "CreateCIFixRun ignored inference", ciFixRun.IgnoredInferredCapabilities, ignored[0])
+	}
 
 	// CreatePromptRun — needs a real run_schedules row (schedule_id FK, one-active-per-
 	// schedule dedup). A minimal prompt schedule satisfies both shape CHECKs.
@@ -178,6 +190,9 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 		t.Fatalf("CreatePromptRun: %v", err)
 	}
 	assertCaps(t, "CreatePromptRun", promptRun.RequiredCapabilities, want)
+	if len(ignored) > 0 {
+		assertCaps(t, "CreatePromptRun ignored inference", promptRun.IgnoredInferredCapabilities, ignored[0])
+	}
 
 	// CreateSelfImproveRun — repo-bearing (targets uzi's own repo), so it inherits the hint
 	// like the others (issue #512 review finding: it was the one repo-bearing path M1 missed).
@@ -198,6 +213,9 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 		t.Fatalf("CreateSelfImproveRun: %v", err)
 	}
 	assertCaps(t, "CreateSelfImproveRun", selfRun.RequiredCapabilities, want)
+	if len(ignored) > 0 {
+		assertCaps(t, "CreateSelfImproveRun ignored inference", selfRun.IgnoredInferredCapabilities, ignored[0])
+	}
 	mustExec(ctx, t, pool, `UPDATE runs SET status = 'completed' WHERE id = $1`, selfRun.ID)
 }
 

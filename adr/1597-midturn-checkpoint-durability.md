@@ -437,6 +437,59 @@ timings. The local source/tests establish the implemented boundaries, not
 production incident resolution or hosted acceptance. See the
 [existing advisory snapshot retry](2149-cross-check.md#amendment-2026-10-19--3123-existing-advisory-code-snapshot-retry).
 
+### Amendment 2026-10-26 — #3304: code-head reads settle at the snapshot boundary
+
+A done-checkpoint code snapshot failed the run after 600 s in `checkpoint-code-head`
+(allowance 60 s soft / 90 s hard). A supervised git read inside the boundary scope
+never settled. Local reproduction showed two seams consistent with the incident
+(which one fired in production is not distinguished): the child's output had
+finished before the exit-gated stream attached, or a cleanly exited child's stdout
+never ended. Only `readBare`'s
+independent 600 s timer (`GIT_TIMEOUT_MS`) ended it, with a plain error.
+
+- **Attach classification.** In a boundary scope, `spawnGit`'s exit-gated stdout
+  classifies a source already terminal at attach, as the `execScoped` collector
+  already did: ended with nothing read is a genuine empty EOF only on a clean exit;
+  data already read, destroyed without end, or errored is refused.
+- **Settlement rule.** Both supervised output consumers (the gated stream and the
+  `execScoped` collector) settle on the scope's hard signal in every boundary scope
+  (including the mid-turn tick and other TickSpawner scopes) and, where the scope
+  carries one and is not masked (Codex checkpoints), its soft signal. A soft stop's cancellation is requested by the child
+  handle's own listener; a hard stop relies on the scope's spawner stopping the
+  child on its own signal. The verdict is joined with the child's completion at the
+  `spawnGit` or `execScoped` level, and a completion rejection wins; otherwise hard
+  gives `GitBoundaryAbortError` and soft gives `CheckpointSoftDeadlineError`. The
+  collector's hard path itself is unchanged. `maskCheckpointCooperation` keeps in-import
+  mutation hard-only; that invariant is unchanged.
+- **Timer retirement.** Inside a boundary scope, `readBare`'s and
+  `streamBundleWithCap`'s independent 600 s timers are cleared when the scope stops,
+  never re-armed, and never armed if the scope already stopped, so a generic timer
+  cannot pre-empt owned cleanup with a plain error. Settlement is left to the owner.
+  Before any stop they behave as before; ordinary failures are not reclassified.
+- **Step split.** The code-head reads report as
+  `checkpoint-code-head-runner-tip`, `-tracking`, `-default-tip`, `-pin` and
+  `-changed-files` in both the gate snapshot and the done body. In the done body,
+  `checkpoint-code-head` remains as the entry marker before the post-import reads;
+  the gate snapshot no longer reports it. The gate's ownership
+  readback, previously under the last import step, now reports as
+  `checkpoint-code-head-tracking`, and its fresh pin as `checkpoint-code-head-pin`.
+
+Outcomes are unchanged: the gate path's clean soft stop or ordinary failure gives
+`snapshot_failed`; the done body's soft stop ends the attempt `soft_stop`; hard
+errors, unsafe cleanup and authority revocation stay terminal; preservation refusal
+keeps its outcome. The #3123 invariants (including
+[ADR-1766](1766-codex-vault-lock-park.md)) are unchanged.
+
+Accepted residuals: after a clean child exit, a soft stop that lands before the
+pipe's EOF turns an unmasked read's success into a soft stop (a cooperative "not
+done"; a one-event-loop-turn grace lets an already-queued EOF win). With the timers
+retired, the child's completion, bounded by the scope's spawner, is the only bound
+on a stopped read. Awaited filesystem writes and fsync stay uninterruptible. A
+`snapshot_failed` attempt leaves SHA-free incomplete evidence for the cross-check,
+as before. A started bridge adoption and in-import mutation stay hard-only (#3123,
+#3315). Source and local test evidence do not establish hosted acceptance. See the
+[cross-check amendment](2149-cross-check.md#amendment-2026-10-26--3304-code-head-reads-settle-at-the-snapshot-boundary).
+
 ### Git-busy probe
 
 Before touching the runner clone, the tick opens `.git` exactly **once**, with

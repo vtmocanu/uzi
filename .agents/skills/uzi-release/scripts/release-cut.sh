@@ -487,12 +487,13 @@ OWNED_PATHS=(CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scrip
 # Best-effort tag refresh so discovery sees pushed tags; harmless (and skipped) with no
 # reachable origin, e.g. an offline fixture repo.
 git fetch --tags --quiet origin >/dev/null 2>&1 || true
-# The cut reads the LOCAL HEAD. A main that is BEHIND origin/main miscounts what shipped since
+# Main-writing cuts read LOCAL HEAD. A main that is BEHIND origin/main miscounts what shipped since
 # the RC (so --promote can take promote-only wrongly) and produces a release commit that can
 # never fast-forward onto origin. Refuse here rather than at the push. Ahead is normal (an
 # unpushed release commit); no origin/main ref (offline fixture, unreachable origin) skips it.
+# Promote-only writes no main state and validates its pinned candidate instead.
 BEHIND="$(git rev-list --count HEAD..refs/remotes/origin/main 2>/dev/null || echo 0)"
-if [ "${BEHIND:-0}" -gt 0 ]; then
+if [ "$VERB" != "--promote-only" ] && [ "${BEHIND:-0}" -gt 0 ]; then
   echo "release-cut: local main is $BEHIND commit(s) behind origin/main. Fast-forward first: git merge --ff-only origin/main" >&2; exit 3
 fi
 

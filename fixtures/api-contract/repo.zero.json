@@ -13,6 +13,7 @@
   "repo_devbox_opt_in": false,
   "repo_fold_improve_uzi_backlog": false,
   "required_capabilities": null,
+  "ignored_inferred_capabilities": null,
   "pipeline": null,
   "guardrail_override": null,
   "guardrail_blocked": false,

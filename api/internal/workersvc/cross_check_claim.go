@@ -21,6 +21,7 @@ import (
 // ClaimPlanCrossCheck carries the stored candidate only. Credentials stay in the
 // existing child claim's worker-owned secret envelope, never in this model input.
 type ClaimPlanCrossCheck struct {
+	CoverageSupported       bool            `json:"coverage_supported,omitempty"`
 	RepoInstructionsCommit  *string         `json:"repo_instructions_commit,omitempty"`
 	GuidanceDigest          string          `json:"guidance_digest,omitempty"`
 	RepoInstructionsEnabled *bool           `json:"repo_instructions_enabled,omitempty"`
@@ -72,7 +73,7 @@ func crossCheckCandidateInput(cc store.CrossCheck, semantic ...*apitypes.Semanti
 		if err != nil || !bytes.Equal(digest, cc.CandidateDigest) {
 			return nil, ErrCrossCheckRefused
 		}
-		return &ClaimPlanCrossCheck{Stage: "code", LeadRunID: cc.LeadRunID.String(), Round: 1,
+		return &ClaimPlanCrossCheck{CoverageSupported: true, Stage: "code", LeadRunID: cc.LeadRunID.String(), Round: 1,
 			CandidateDigest: hex.EncodeToString(cc.CandidateDigest), DeadlineAt: cc.DeadlineAt.Time,
 			RepoInstructionsCommit: textPtr(cc.RepoInstructionsCommit), GuidanceDigest: hex.EncodeToString(guidanceHash[:]), RepoInstructionsEnabled: &cc.RepoInstructionsEnabled,
 			RepoInstructionsText: cc.RepoInstructionsText.String, RepoInstructionsDigest: hex.EncodeToString(instructionsHash[:]), CustomGuidanceApplied: &custom,

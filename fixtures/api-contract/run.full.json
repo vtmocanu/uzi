@@ -250,6 +250,7 @@
   },
   "id": "x",
   "repo_id": "x",
+  "repo_path": "x",
   "forge_type": "x",
   "kind": "x",
   "issue_iid": 1,
@@ -318,6 +319,7 @@
     "historical": true
   },
   "code_cross_check_summary": {
+    "coverage": {},
     "custom_guidance_applied": true,
     "guidance_digest": "x",
     "repo_instructions_commit": "x",
@@ -671,6 +673,9 @@
   "override_subagent_model": true,
   "priority": "x",
   "required_capabilities": [
+    "x"
+  ],
+  "ignored_inferred_capabilities": [
     "x"
   ],
   "required_tools": [

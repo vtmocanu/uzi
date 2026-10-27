@@ -5199,3 +5199,268 @@ for (const key of [undefined, "uzi/task/11111111-1111-4111-8111-111111111111"]) 
     } finally { await f.close(); }
   });
 }
+
+// #3544: diagnostics describe existing refusals without changing custody decisions.
+function issue3544Lines(f: Awaited<ReturnType<typeof fixture>>) {
+  const lines: Array<Record<string, unknown>> = [];
+  f.log.info = (message, fields) => {
+    if (message === "recovery: inventory reconstruction") lines.push(structuredClone(fields!));
+  };
+  return lines;
+}
+
+for (const branch of ["source_ancestry_unproven", "root_context_uncovered"] as const) {
+  it(`#3544 coverage refusal identifies ${branch}`, async () => {
+    const f = await fixture(true);
+    try {
+      const lines = issue3544Lines(f);
+      f.state.sourceRefused = true;
+      const old = await f.freeze(); assert.ok(old);
+      await f.capture(old);
+      f.state.sourceRefused = false;
+      if (branch === "source_ancestry_unproven") f.state.cloneHeads = [H2];
+      else {
+        f.state.candidates.push({ sha: H2, pinRef: "refs/owed/PRIVATE-CONTEXT", contexts: [f.context] });
+        f.state.ancestors.add(H2);
+      }
+      await f.coordinator.resumePending(undefined, [(await f.coordinator.inspect("run-1"))[0]!]);
+      assert.equal((await f.coordinator.inspect("run-1"))[0]?.reason, "inventory_snapshot_changed");
+      assert.deepEqual(lines, [{ path: "boot", reason: branch, run_id: "run-1", generation: 7, capture_id: old.captureId }]);
+      assert.equal(f.finals.length, 0);
+      assert.equal(JSON.stringify(lines).includes("PRIVATE-CONTEXT"), false);
+    } finally { await f.close(); }
+  });
+}
+
+it("#3544 reconstruction distinguishes fresh, eligible and invalidated matching records", async () => {
+  const f = await fixture(true);
+  try {
+    const lines = issue3544Lines(f);
+    await f.coordinator.snapshotOwedInventory();
+    const [old] = await f.coordinator.materializeBootInventory(); assert.ok(old);
+    assert.equal(lines.at(-1)?.reason, "snapshot_created");
+    await f.coordinator.materializeBootInventory();
+    assert.equal(lines.at(-1)?.reason, "matching_snapshot_reused");
+    const count = lines.length;
+    await f.coordinator.materializeBootInventory();
+    assert.equal(lines.length, count, "unchanged matching outcome is not logged every pass");
+    f.state.sourceRefused = true;
+    await f.capture(old);
+    f.state.sourceRefused = false;
+    f.state.candidates.push({ sha: H2, pinRef: "refs/owed/temporary", contexts: [f.context] });
+    f.state.ancestors.add(H2);
+    await f.coordinator.resumePending(undefined, [(await f.coordinator.inspect("run-1"))[0]!]);
+    f.state.candidates.pop(); // synthetic characterization only; real-source test below accounts for pins
+    const [same] = await f.coordinator.materializeBootInventory();
+    assert.equal(same?.captureId, old.captureId);
+    assert.equal(lines.at(-1)?.reason, "invalidated_snapshot_reused");
+    assert.equal(same?.reason, "inventory_snapshot_changed");
+    assert.equal(f.finals.length, 0, "diagnostics must not repair or release the invalidated snapshot");
+    assert.equal(f.state.pinDeletes, 0);
+  } finally { await f.close(); }
+});
+
+for (const mode of ["generation", "kind", "executing", "inventory_feature", "hold_unavailable", "ownership_unsupported", "provenance_unavailable", "inventory_not_inactive", "nonpreferred_context", "current_source_missing", "source_boundary_retained", "source_proof_unavailable"] as const) {
+  it(`#3544 reconstruction refusal identifies ${mode}`, async () => {
+    const f = await fixture(true);
+    try {
+      const lines = issue3544Lines(f);
+      let context = f.context;
+      if (mode === "generation") context = { ...context, generation: null } as unknown as PositiveOwedCandidateContext;
+      if (mode === "kind") context = { ...context, kind: null } as unknown as PositiveOwedCandidateContext;
+      if (mode === "executing") (f.coordinator as any).isExecuting = () => true;
+      if (mode === "inventory_feature") f.state.feature = false;
+      if (mode === "hold_unavailable") f.state.open = false;
+      if (mode === "ownership_unsupported") delete (f.client as any).getRunOwnership;
+      if (mode === "provenance_unavailable") {
+        await fs.mkdir(path.join(f.root, "journal", "run-1"), { recursive: true });
+        await fs.writeFile(path.join(f.root, "journal", "run-1", "untrusted.json"), '{"private":"PRIVATE-PROVENANCE"}');
+      }
+      if (mode === "inventory_not_inactive") f.state.status = "running";
+      if (mode === "nonpreferred_context") { await f.freeze(); context = { ...context, branch: "other" }; }
+      if (mode === "current_source_missing") f.state.candidates = [];
+      if (mode === "source_boundary_retained") f.state.sourceRefused = true;
+      if (mode === "source_proof_unavailable") f.state.sourceProofRefused = true;
+      f.git.discoverOwedCandidates = async () => [{ context, candidates: structuredClone(f.state.candidates) }];
+      await f.coordinator.snapshotOwedInventory();
+      assert.deepEqual(await f.coordinator.materializeBootInventory(), []);
+      assert.equal(lines.at(-1)?.reason, mode);
+      const count = lines.length;
+      await f.coordinator.materializeBootInventory();
+      assert.equal(lines.length, count);
+      assert.equal(f.finals.length, 0); assert.equal(f.state.pinDeletes, 0);
+      assert.equal(JSON.stringify(lines).includes("PRIVATE-PROVENANCE"), false);
+      for (const line of lines) assert.ok(Object.keys(line).every(k => ["path", "reason", "run_id", "generation", "capture_id"].includes(k)));
+    } finally { await f.close(); }
+  });
+}
+
+it("#3544 reconstruction diagnostics remain bounded and throwing logs do not alter snapshots", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3544Lines(f);
+    const c = f.coordinator as any;
+    for (let n = 0; n < 300; n++) c.noteRedriveExit("boot", { runId: `run-${n}`, generation: 7, captureId: "" }, "current_source_missing", undefined, true);
+    assert.equal((c.inventoryDiagnosticLogged ?? c.redriveExitLogged).size, 256);
+    assert.equal(lines.length, 300);
+    c.noteRedriveExit("boot", { runId: "run-299", generation: 7, captureId: "" }, "current_source_missing", undefined, true);
+    assert.equal(lines.length, 300);
+    f.log.info = () => { throw new Error("PRIVATE-LOGGER"); };
+    await f.coordinator.snapshotOwedInventory();
+    const [record] = await f.coordinator.materializeBootInventory();
+    assert.ok(record);
+    assert.equal(record.reason, undefined);
+    assert.equal(f.finals.length, 0);
+  } finally { await f.close(); }
+});
+
+for (const publish of [false, true]) {
+  it(`#3544 real GitCache heartbeat reconstruction after ${publish ? "confirmed publication restores the fingerprint" : "changed inventory stays owed"}`, async () => {
+    const f = await fixture(true);
+    const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+    const git = (cwd: string, args: string[], input?: string) => execFileSync("git", ["-C", cwd, ...args],
+      { env, input, encoding: "utf8", timeout: 10000 }).trim();
+    try {
+      const data = path.join(f.root, "real-data"), bare = path.join(data, "repos", "repo.git"), remote = path.join(f.root, "published.git");
+      await fs.mkdir(path.dirname(bare), { recursive: true });
+      for (const dir of [bare, remote]) execFileSync("git", ["init", "--bare", dir], { env, stdio: "pipe", timeout: 10000 });
+      const tree = git(bare, ["mktree"], "");
+      const commit = (message: string, parent?: string) => git(bare, ["hash-object", "-t", "commit", "-w", "--stdin"],
+        `tree ${tree}\n${parent ? `parent ${parent}\n` : ""}author Fixture <fixture@example.com> 946684800 +0000\ncommitter Fixture <fixture@example.com> 946684800 +0000\n\n${message}\n`);
+      const base = commit("base"), h = commit("original", base), h2 = commit("transient head", h);
+      git(bare, ["update-ref", "refs/remotes/origin/main", base]);
+      Object.assign(f.context, { barePath: bare, defaultIdentity: { ref: "refs/remotes/origin/main", sha: base } });
+      const bind = (cache: GitCache) => Object.assign(f.git, {
+        enumerateOwedCandidates: cache.enumerateOwedCandidates.bind(cache),
+        discoverOwedCandidates: cache.discoverOwedCandidates.bind(cache),
+        buildRecoveryCoverage: cache.buildRecoveryCoverage.bind(cache),
+        readInventoryCloneHeads: cache.readInventoryCloneHeads.bind(cache),
+        committedTrackingOwnership: cache.committedTrackingOwnership.bind(cache),
+        ancestry: cache.ancestry.bind(cache),
+        produceRecoveryBundle: cache.produceRecoveryBundle.bind(cache),
+      });
+      let cache = new GitCache(data, f.log, undefined, testGitCacheOptions());
+      bind(cache);
+      const earlier = { ...f.context, runId: "earlier-context", generation: 6, branch: "earlier" };
+      assert.equal((await cache.updateTrackingRef(bare, earlier.branch, h, { context: earlier })).kind, "updated");
+      assert.deepEqual((await cache.enumerateOwedCandidates(bare, earlier.runId)).map(r => r.sha), [h]);
+      git(bare, ["push", remote, `${h}:refs/heads/published`]);
+      const confirmed = git(bare, ["ls-remote", remote, "refs/heads/published"]).split(/\s+/)[0]!;
+      assert.equal(confirmed, h);
+      assert.equal((await cache.updateTrackingRef(bare, f.context.branch, h, { context: f.context, remotelyConfirmedSha: confirmed })).kind, "updated");
+      assert.deepEqual(await cache.enumerateOwedCandidates(bare, "run-1"), []);
+      f.state.status = "running";
+      const old = await f.coordinator.freezeInventory({ context: f.context, currentSha: h, defaultBranch: "main", locallyQuiescent: true });
+      assert.ok(old);
+      f.state.sourceRefused = true;
+      await f.capture(old);
+      assert.equal(f.state.uploads, 1);
+      // A running claim may rewrite and then restore H. GitCache must retain the displaced H2.
+      assert.equal((await cache.updateTrackingRef(bare, f.context.branch, h2, { context: f.context, remotelyConfirmedSha: h })).kind, "updated");
+      assert.equal((await cache.updateTrackingRef(bare, f.context.branch, h, { context: f.context, remotelyConfirmedSha: h })).kind, "updated");
+      const owed = await cache.enumerateOwedCandidates(bare, "run-1");
+      assert.deepEqual(owed.map(r => r.sha), [h2]);
+      f.state.status = "cancelled"; f.state.sourceRefused = false;
+      await f.coordinator.resumePending(undefined, [(await f.coordinator.inspect("run-1"))[0]!]);
+      assert.equal((await f.coordinator.inspect("run-1"))[0]?.reason, "inventory_snapshot_changed");
+      if (publish) {
+        // Real independent publication and the existing positive-confirmation reconciler,
+        // never a raw pin deletion or a fake enumeration omitting H2.
+        git(bare, ["push", remote, `${h2}:refs/heads/published`]);
+        const tip = git(bare, ["ls-remote", remote, "refs/heads/published"]).split(/\s+/)[0]!;
+        assert.equal(tip, h2);
+        await cache.reconcileOwedCandidates(bare, "run-1", tip);
+        assert.deepEqual(await cache.enumerateOwedCandidates(bare, "run-1"), []);
+        assert.equal(git(remote, ["cat-file", "-t", h2]), "commit", "the displaced source survives independent publication");
+      }
+      // A new cache and coordinator read the persisted Git metadata and authenticated journals.
+      cache = new GitCache(data, f.log, undefined, testGitCacheOptions()); bind(cache);
+      const restarted = f.make(true);
+      const runner = new RunRunner(f.client as never, f.git as never,
+        () => { throw new Error("unreached executor"); }, f.log, 20, "local-worker-fixture", { recovery: restarted });
+      const lines = issue3544Lines(f);
+      // The earlier context comes from real persisted owed metadata, not an injected listing.
+      assert.deepEqual((await cache.enumerateOwedCandidates(bare, earlier.runId)).map(r => r.sha), [h]);
+      const list = f.client.listRecoveryHolds.bind(f.client);
+      (f.client as any).listRecoveryHolds = async (id: string) => id === "earlier-context" ? { run_id: id, holds: [] } : list(id);
+      (restarted as any).liveMaxPerPass = 1;
+      f.state.closeOnRelease = true;
+      const visits: Array<{ pass: number; reason: unknown }> = [];
+      for (let pass = 0; pass < 4; pass++) {
+        const from = lines.length;
+        f.state.now += 3_600_000;
+        await runner.resumeLiveRecoveries(f.state.now);
+        visits.push(...lines.slice(from).map(l => ({ pass, reason: l.reason })));
+      }
+      assert.deepEqual(visits.slice(0, 2), [
+        { pass: 0, reason: "hold_unavailable" },
+        { pass: 1, reason: publish ? "invalidated_snapshot_reused" : "snapshot_created" },
+      ], "the earlier context rotates before the target, rather than starving it");
+      const records = await restarted.inspect("run-1");
+      assert.ok(records.some(r => r.captureId === old.captureId && r.reason === "inventory_snapshot_changed"));
+      if (publish) {
+        assert.equal(records.length, 1);
+        assert.equal(f.state.open, true);
+        assert.equal(f.finals.length, 0, "characterize the unresolved matching-record liveness gap, do not repair it here");
+        assert.ok(lines.some(l => l.path === "live" && l.reason === "invalidated_snapshot_reused" && l.capture_id === old.captureId));
+      } else {
+        const fresh = records.find(r => r.captureId !== old.captureId);
+        assert.ok(fresh?.finalAcknowledged, "changed inventory control reaches a genuine FINAL ACK");
+        assert.equal(f.finals.length, 1);
+        assert.equal(f.state.open, false);
+        assert.ok(lines.some(l => l.path === "live" && l.reason === "snapshot_created" && l.capture_id === fresh.captureId));
+      }
+      assert.equal(f.state.pinDeletes, 0, "diagnostics never retire source records");
+      assert.deepEqual((await cache.enumerateOwedCandidates(bare, earlier.runId)).map(r => r.sha), [h], "the sibling source remains protected");
+    } finally { await f.close(); }
+  });
+}
+
+it("#3544 reconstruction keeps the pending immutable FINAL identity instead of replacing it", async () => {
+  const f = await fixture();
+  try {
+    const old = await f.freeze(); assert.ok(old);
+    f.state.finalError = new Error("API unavailable");
+    await f.capture(old);
+    const saved = (await f.coordinator.inspect("run-1"))[0]!;
+    assert.ok(saved.finalRequest);
+    f.state.candidates.push({ sha: H2, pinRef: "refs/owed/new", contexts: [f.context] });
+    f.state.ancestors.add(H2);
+    const lines = issue3544Lines(f);
+    await f.coordinator.snapshotOwedInventory();
+    assert.deepEqual(await f.coordinator.materializeBootInventory(), []);
+    assert.equal(lines.at(-1)?.reason, "pending_final");
+    assert.equal(lines.at(-1)?.capture_id, old.captureId);
+    assert.deepEqual((await f.coordinator.inspect("run-1"))[0]!.finalRequest, saved.finalRequest);
+    assert.equal(f.state.uploads, 1);
+    assert.equal(f.finals.length, 1);
+  } finally { await f.close(); }
+});
+
+it("#3544 reconstruction retains a pending held-publication identity before freezing", async () => {
+  const f = await v2FrozenFixture();
+  try {
+    f.state.finalError = new Error("FINAL unavailable");
+    await f.operate();
+    const saved = (await f.coordinator.inspect(f.context.runId))[0]!;
+    assert.equal(saved.finalRequest?.disposition.kind, "held_publication");
+    const lines = issue3544Lines(f);
+    await f.coordinator.snapshotOwedInventory();
+    assert.deepEqual(await f.coordinator.materializeBootInventory(), []);
+    assert.equal(lines.at(-1)?.reason, "pending_held_final");
+    assert.deepEqual((await f.coordinator.inspect(f.context.runId))[0]!.finalRequest, saved.finalRequest);
+    assert.equal(f.state.produced, 0);
+  } finally { await f.close(); }
+});
+
+it("#3544 unchanged reconstruction refusals stay deduplicated across live passes without a capture", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3544Lines(f);
+    f.state.status = "running";
+    await issue3152LivePasses(f, f.coordinator, 3);
+    assert.deepEqual(lines, [{ path: "live", reason: "inventory_not_inactive", run_id: "run-1", generation: 7 }]);
+    assert.equal(f.state.uploads, 0);
+    assert.equal(f.finals.length, 0);
+  } finally { await f.close(); }
+});

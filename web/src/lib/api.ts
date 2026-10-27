@@ -960,6 +960,10 @@ const realApi = {
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
       required_capabilities: caps,
     }),
+  setRepoIgnoredInferredCapabilities: (id: string, caps: string[]) =>
+    request<{ repo: Repo; warning?: string }>("PATCH", `/repos/${id}`, {
+      ignored_inferred_capabilities: caps,
+    }),
   // Admin per-repo guardrail override (PRD #66 D8). ADMIN-ONLY, no member path — a
   // dedicated route, not PatchRepo. Requires a non-empty reason; returns the repo.
   setRepoGuardrailOverride: (id: string, reason: string) =>

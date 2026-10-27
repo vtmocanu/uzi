@@ -97,6 +97,9 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			"keeps the worker pin, and banks the parked time so the remaining budget is what it was — the " +
 			"clock stopped while paused. The claim then continues the SDK session on the same worker if it " +
 			"is still alive, or recovers the branch from the checkpoint on another worker if it is gone.\n\n" +
+			"For retained recovery exhausted (recovery_wait), Resume now requests another attempt; success is not assured. " +
+			"A finite retry stamp means timed retry, even after it is due; NULL means owner-held with no automatic resume. " +
+			"Cancel is terminal. Resume does not reset the retained recovery cap or promise a fresh archive or latest edits.\n\n" +
 			"For worker memory pressure (recovery_wait), only owner Resume starts a fresh memory episode; " +
 			"Cancel is terminal. There is no automatic resume. Source/archive availability and latest edits remain unverified.\n\n" +
 			"For worker recovery exhausted (recovery_wait), only owner Resume starts a fresh recovery episode " +

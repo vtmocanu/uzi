@@ -941,8 +941,14 @@ settled real model turn, or an explicit owner Resume of a
 [ADR-1197 #3330 amendment](1197-transient-recovery-park.md#amendment-2026-10-25-3330-an-owner-resume-renews-the-retained-source-budget)). External restarts require a genuinely fenced
 successor, not reuse of a discovered ready successor as execution authority.
 
-A permanent blocker or exhaustion ends `failed` with `keepCustody`, no
-automatic reclaim and no failed-run Resume. In this retained-recovery path,
+This original terminal policy is narrowed by the #3495 amendment in
+[ADR-1197](1197-transient-recovery-park.md): a confirmed persisted
+`budget_exhausted` blocker can enter bounded timed retries, then an owner-held
+park, when the API advertises support. Owner Resume of either retained park
+can also renew the budget on a fresh claim; automatic grants contribute to
+the derived claim episode. Other blockers and the documented compatibility
+fallback still end `failed` with `keepCustody`, with no failed-run Resume.
+In this retained-recovery path,
 `worker_residue_blocked` denotes actual quiescence failure; archive size,
 prerequisite, source, clock, preservation and adoption blockers have their
 own accurate reasons. Healthy provider/empty-turn parks and the owner

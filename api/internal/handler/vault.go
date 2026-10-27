@@ -14,13 +14,12 @@ import (
 )
 
 // VaultUnlock re-derives and caches the current user's DEK from their login
-// password (PRD #32), so agents resume after a pod restart without a full
-// re-login (the JWT cookie survives; the in-memory DEK does not). It NEVER
-// creates a vault — that happens only on login/register, which hold a freshly
-// verified password — so a wrong password here cannot mint a fresh vault and lock
-// the user out of their real secrets (ErrNoVault is answered like a wrong
-// password). Sits behind RequireAuth (CSRF applies) and the per-user rate limiter
-// so a stolen JWT is not an unthrottled online password oracle.
+// password or dedicated OIDC vault passphrase, so agents resume after a pod
+// restart without a full re-login. It NEVER creates a vault: creation belongs to
+// login/register or the cookie-only passphrase endpoint. ErrNoVault is answered
+// like a wrong password. Sits behind RequireUser (CSRF applies to cookies) and
+// the per-user rate limiter shared by sessions and CLI tokens, so a stolen
+// credential is not an unthrottled online password oracle.
 func (h *Handler) VaultUnlock(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {

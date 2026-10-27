@@ -335,9 +335,10 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// web/CLI (4d) readiness/mismatch display. Capability/tool slices are normalized to
 		// a non-nil empty slice ([] over null), mirroring the repo DTO; size_class is the
 		// NOT NULL DEFAULT '' string (empty for a run whose inference never set it).
-		RequiredCapabilities: capsOrEmpty(r.RequiredCapabilities),
-		RequiredTools:        capsOrEmpty(r.RequiredTools),
-		SizeClass:            r.SizeClass,
+		RequiredCapabilities:        capsOrEmpty(r.RequiredCapabilities),
+		IgnoredInferredCapabilities: capsOrEmpty(r.IgnoredInferredCapabilities),
+		RequiredTools:               capsOrEmpty(r.RequiredTools),
+		SizeClass:                   r.SizeClass,
 		// PRD #212: the plan-turn git-status list, non-nil ([] over null) via capsOrEmpty
 		// like required_tools. runToDTO is the single chokepoint for every run-detail
 		// response, so this one line covers every consumer.
@@ -809,7 +810,7 @@ func runJobDTO(d *workersvc.JobRunDetail) *apitypes.RunJobDTO {
 // Evidence is historical; it never asserts latest work or current forge availability.
 func workerRecoveryDTO(r store.Run, limit int) *apitypes.WorkerRecoveryDTO {
 	if r.WorkerRecoveryEpisode == 0 && len(r.WorkerRecoveryEvidence) == 0 &&
-		(!r.RecoveryWaitCause.Valid || r.RecoveryWaitCause.String != "worker_requeue_exhausted") {
+		(!r.RecoveryWaitCause.Valid || (r.RecoveryWaitCause.String != "worker_requeue_exhausted" && r.RecoveryWaitCause.String != "retained_recovery_exhausted")) {
 		return nil
 	}
 	used := r.RequeueCount - r.RequeueEpisodeBaseline
