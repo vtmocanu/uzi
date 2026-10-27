@@ -88,6 +88,9 @@ const LINUX_CAPTURE = process.platform !== "linux" && "Linux /proc capture requi
 describe("U2 real runner checked gate", () => {
   it("four automatic revisions select explicit rounds and store only round-five canonical approval", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
+    // Distinct persisted rows alternate with legacy absence without adding capture rounds.
+    const crossCheckIds = ["22222222-2222-4222-8222-222222222222", undefined,
+      "33333333-3333-4333-8333-333333333333", undefined] as const;
     const seen: PlanVerdict[] = [];
     const events: string[] = [];
     const reserve = MessageBatcher.prototype.reserveCandidateTransport;
@@ -115,6 +118,7 @@ describe("U2 real runner checked gate", () => {
       assert.equal(gates(runId).length, 0);
       assert.equal(api.states.filter((s) => s.runId === runId && s.body.plan_md).length, 0);
       return { status: 200, body: answer(runId, body, round < 5 ? "revise" : "approve", round < 5 ? "revise" : "approve", {
+        ...(crossCheckIds[round - 1] === undefined ? {} : { cross_check_id: crossCheckIds[round - 1] }),
         automatic_revision_limit: 4, automatic_rounds_enabled: true,
         findings: round < 5 ? { summary: `fix round ${round}`, items: [{ file: "plan.md", severity: "warning", summary: `finding ${round}`, rationale: `evidence ${round}` }] } : null,
         candidate: { plan_md: NORMALIZED, milestones: [{ title: "canonical", done: false }],
@@ -131,6 +135,7 @@ describe("U2 real runner checked gate", () => {
         assert.equal(gates(c.run_id).length, 0);
         if (round < 5) {
           assert.deepEqual(verdict, { kind: "revise", automatic: true, round,
+            ...(crossCheckIds[round - 1] === undefined ? {} : { crossCheckId: crossCheckIds[round - 1] }),
             feedback: `fix round ${round}`, items: [{ file: "plan.md", severity: "warning", summary: `finding ${round}`, rationale: `evidence ${round}` }] });
           assert.ok(!("inputId" in verdict));
           assert.equal(ctx.cancelRequested!(), false);
