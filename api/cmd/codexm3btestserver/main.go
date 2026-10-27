@@ -71,6 +71,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -223,6 +224,9 @@ func main() {
 	q := store.New(pool)
 	box := newTestBox()
 	wsvc := workersvc.New(q, box, workersvc.Params{RunWallCeiling: 8 * time.Hour})
+	vlt := vault.NewPostgres(box, pool)
+	wsvc.SetVault(vlt)
+	wsvc.SetTxBeginner(pool)
 
 	seed, err := seedFixtures(ctx, pool, q, box, wsvc, live)
 	if err != nil {
@@ -234,6 +238,7 @@ func main() {
 	// config (WorkerHostingEnabled false), so the forge/privcheck/hub/settings collaborators
 	// are safely nil for this credential-only surface.
 	h := handler.New(pool, q, config.Config{}, box, nil, wsvc, nil, nil, nil)
+	h.SetVault(vlt)
 	router := h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))
 
 	ln, err := net.Listen("tcp", *listenAddr)
@@ -325,7 +330,7 @@ func newTestBox() *secretbox.Box {
 func seedFixtures(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, box *secretbox.Box, wsvc *workersvc.Service, live *liveSubscription) (seedResult, error) {
 	ownerID, connectionID, repoID, workerID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 
-	if err := exec(ctx, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+	if err := exec(ctx, pool, `INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`,
 		ownerID, fmt.Sprintf("codex-m3b-%s@example.test", uuid.NewString())); err != nil {
 		return seedResult{}, fmt.Errorf("insert user: %w", err)
 	}
