@@ -31,6 +31,7 @@ import {
   isAwaitingFollowup,
   isAwaitingInput,
   isMaintenanceQueued,
+  isReserveQueued,
 } from "../lib/runBadge";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { lanePaging, visibleColumns } from "../lib/boardColumns";
@@ -582,6 +583,7 @@ export function Board() {
             // PRD #3454: a run held back by instance maintenance mode waits on purpose (the
             // detector may still flag waiting_worker); it is not stuck.
             !isMaintenanceQueued(r) &&
+            !isReserveQueued(r) &&
             r.issue_iid != null,
         ),
       );

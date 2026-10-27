@@ -168,6 +168,18 @@ function seed(): MockState {
   if (maintenance) {
     for (const r of runs.values()) if (r.status === "queued") r.queue_reason = "maintenance";
   }
+  // ?mock=weekly-reserve (PRD #3522): queued fixtures are held by the weekly usage reserve and
+  // owner-paused fixtures read as parked by it (resuming one records the override).
+  if (mockScenario() === "weekly-reserve") {
+    for (const r of runs.values()) {
+      if (r.status === "queued") {
+        r.queue_reason = "weekly_reserve";
+        r.reserve_hold_reason = "weekly usage reserve: 85% >= 80%";
+      } else if (r.status === "paused" && !r.hold_reason) {
+        r.hold_reason = "weekly_reserve";
+      }
+    }
+  }
   const proposals = new Map<string, IssueProposal>();
   for (const p of mockProposals) proposals.set(p.id, { ...p });
   const boards = new Map<string, Board>();

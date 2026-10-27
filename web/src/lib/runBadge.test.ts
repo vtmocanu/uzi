@@ -12,6 +12,9 @@ import {
   isAwaitingInput,
   isHealthFlaggableStatus,
   isMaintenanceQueued,
+  isReserveQueued,
+  reserveQueueText,
+  parkLabel,
   maintenanceQueueText,
   isPlanningRun,
   isRevisingRun,
@@ -1468,5 +1471,41 @@ describe("maintenance queue reason", () => {
     expect(isMaintenanceQueued(run({ status: "running", queue_reason: "maintenance" }))).toBe(false);
     const plain = runBadge(run({ status: "queued", health: "waiting_worker", health_since: "2026-07-04T12:00:00Z" }), NOW);
     expect(plain.kind === "badge" && plain.label).toBe("⚠ waiting for worker · 4m");
+  });
+});
+
+describe("weekly usage reserve (PRD #3522)", () => {
+  it("a reserve-held queued run reads as a calm waiting pill carrying the reason as text", () => {
+    // The board's LatestRun does not carry reserve_hold_reason; the run view's Run does.
+    const held = { ...run({ status: "queued", queue_reason: "weekly_reserve", health: "waiting_worker" }), reserve_hold_reason: "weekly usage reserve: 85% >= 80%" };
+    expect(isReserveQueued(held)).toBe(true);
+    expect(isMaintenanceQueued(held)).toBe(false);
+    expect(runBadge(held, 0)).toMatchObject({
+      kind: "badge",
+      label: "waiting: weekly usage reserve: 85% >= 80%",
+      tone: "info",
+      pulse: false,
+    });
+  });
+  it("falls back to the plain hold name, and a non-queued run is never reserve-queued", () => {
+    expect(reserveQueueText(null)).toBe("waiting: weekly usage reserve");
+    expect(reserveQueueText("\u202e")).toBe("waiting: weekly usage reserve");
+    expect(isReserveQueued(run({ status: "running", queue_reason: "weekly_reserve" }))).toBe(false);
+  });
+  it("maintenance takes precedence over the reserve", () => {
+    const both = { ...run({ status: "queued", queue_reason: "maintenance" }), reserve_hold_reason: "weekly usage reserve: 85% >= 80%" };
+    const b = runBadge(both, 0);
+    expect(b.kind === "badge" && b.label).toBe("waiting: uzi is in maintenance mode");
+  });
+  it("a run paused by the reserve gets its own pause chip and park label", () => {
+    const r = run({ status: "paused", hold_reason: "weekly_reserve" });
+    const b = runBadge(r, 0);
+    expect(b).toMatchObject({ kind: "badge", label: "\u2016 paused: weekly usage reserve", tone: "info", pulse: false });
+    expect(b.kind === "badge" && b.title).toMatch(/resumes automatically when usage drops below the threshold/);
+    expect(b.kind === "badge" && b.title).toMatch(/overrides the reserve until the next weekly reset/);
+    expect(parkLabel(r)).toBe("paused: weekly usage reserve");
+    // positive control: an owner pause keeps the plain wording
+    expect(runBadge(run({ status: "paused", hold_reason: null }), 0)).toMatchObject({ label: "\u2016 paused" });
+    expect(parkLabel(run({ status: "paused", hold_reason: null }))).toBe("paused");
   });
 });

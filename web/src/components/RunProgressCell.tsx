@@ -21,7 +21,7 @@
 // (a newer server's enum member) renders nothing, so the row reads exactly as before.
 import type { Run, RunProgress } from "../lib/apiTypes";
 import { formatLocalTime } from "../lib/budget";
-import { formatElapsed, isMaintenanceQueued, parkLabel } from "../lib/runBadge";
+import { formatElapsed, isMaintenanceQueued, isReserveQueued, parkLabel } from "../lib/runBadge";
 import { stripUnsafeChars } from "../lib/safeText";
 import { Badge } from "./ui";
 
@@ -144,7 +144,19 @@ export function RunProgressCell({ run, now }: { run: ProgressRun; now?: number }
     case "queued":
       // PRD #3454: the adjacent RunHealthBadge draws the visible maintenance pill; the
       // screen-reader word names why the run waits.
-      return <Quiet state="queued" word={isMaintenanceQueued(run) ? "queued: uzi is in maintenance mode" : "queued"} />;
+      // PRD #3522: the same for the weekly usage reserve (maintenance wins).
+      return (
+        <Quiet
+          state="queued"
+          word={
+            isMaintenanceQueued(run)
+              ? "queued: uzi is in maintenance mode"
+              : isReserveQueued(run)
+                ? "queued: weekly usage reserve"
+                : "queued"
+          }
+        />
+      );
     case "planning":
       return <Quiet state="planning" word="planning" />;
     case "none":

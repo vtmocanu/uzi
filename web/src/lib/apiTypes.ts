@@ -3197,6 +3197,9 @@ export interface Run {
   /** PRD #3522: why the weekly usage reserve holds this queued run (e.g. "weekly usage reserve:
    *  72% >= 70%"); absent when not held or not queued. */
   reserve_hold_reason?: string | null;
+  /** PRD #3522: RFC3339 end of the owner's manual-resume override of the weekly usage reserve
+   *  (the next weekly reset); absent/null when no override is active. */
+  reserve_exempt_until?: string | null;
   /** PRD #320 D8: the run's queue-priority CLASS, computed server-side (see RunPriority).
    *  Only a QUEUED run is ever non-"normal"; a running/terminal run renders no pill. It
    *  rides the shared run embed (RunListItemDTO embeds RunDTO), so it is present on BOTH
@@ -3605,7 +3608,9 @@ export interface Run {
   pause_requested_at?: string | null;
   /** PRD #1497 M1 widens pause_mode with "wall": the system-authored wall-park request mode the
    *  timeout sweep stamps at the deadline (alongside the owner's "milestone"/"now"). */
-  pause_mode?: "milestone" | "now" | "wall" | null;
+  pause_mode?: "milestone" | "now" | "wall" | "reserve" | null;
+  // PRD #3522: "reserve" is the system pause request the weekly usage reserve files; it parks
+  // after the current milestone and cannot be withdrawn by the owner (cancel 409s).
   pause_after_count?: number | null;
   checkpoint_tip_at?: string | null;
   /** PRD #1226 M5 (D8): the honest-state completion fields — the wire contract the web + CLI
