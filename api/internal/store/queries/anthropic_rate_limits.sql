@@ -26,7 +26,7 @@
 -- fenced on the revision it started at (D13, see UpsertRateLimits). The success
 -- generation is captured before the provider call to fence a later refusal.
 SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
-       s.enablement_rev, s.anthropic_success_generation
+       s.enablement_rev, s.anthropic_success_generation, u.vault_epoch
 FROM user_secrets s
 JOIN users u ON s.user_id = u.id
 WHERE s.kind = 'anthropic_token' AND s.disabled_at IS NULL
@@ -40,7 +40,7 @@ ORDER BY s.user_id, s.id;
 -- enablement_rev fence and success generation. A disabled token resolves to no row, so a poke never polls
 -- it (D1).
 SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
-       s.enablement_rev, s.anthropic_success_generation
+       s.enablement_rev, s.anthropic_success_generation, u.vault_epoch
 FROM user_secrets s
 JOIN users u ON s.user_id = u.id
 WHERE s.user_id = @user_id AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL

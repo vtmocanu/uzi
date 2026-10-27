@@ -56,7 +56,8 @@ const pokeBuffer = 64
 // Store is the query surface the engine needs. *store.Queries satisfies it.
 // ListAnthropicTokensToPoll returns each ENABLED TOKEN's id, owner, ciphertext +
 // sealed_with, owner opt-in, enablement revision and success generation so the tick opens them in one
-// pass (no per-row re-fetch); GetAnthropicTokenToPoll is its single-token sibling
+// pass; only an exact stale crypto epoch permits one same-ID refetch.
+// GetAnthropicTokenToPoll is its single-token sibling
 // for the poke path, which polls the token a save or re-enable just touched.
 type Store interface {
 	ListAnthropicTokensToPoll(ctx context.Context) ([]store.ListAnthropicTokensToPollRow, error)
@@ -90,7 +91,7 @@ type EarlyResetNotifier interface {
 // secretopen.ErrVaultLocked for a locked dek-sealed vault (skip, keep the last
 // reading) and ErrUndecryptable when the token is undecryptable.
 type TokenOpener interface {
-	OpenSealed(userID uuid.UUID, kind, sealedWith string, ciphertext []byte) ([]byte, error)
+	OpenSealedAtEpoch(ctx context.Context, userID uuid.UUID, kind, sealedWith string, ciphertext []byte, epoch int64) ([]byte, error)
 }
 
 // Client reads rate-limit state from Anthropic. *anthropic.Client satisfies it.
@@ -238,7 +239,7 @@ func (e *Engine) tickAll(ctx context.Context) {
 			// The listing holds enabled tokens only (PRD #1732 D1) and carries the
 			// enablement revision this poll is fenced on (D13).
 			e.pollToken(tickCtx, row.UserID, row.ID, row.EnablementRev, row.AnthropicSuccessGeneration, false, row.NotifyEarlyLimitReset, func() ([]byte, error) {
-				return e.opener.OpenSealed(row.UserID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext)
+				return e.openToken(tickCtx, store.GetAnthropicTokenToPollRow(row))
 			})
 		}(row)
 	}
@@ -275,13 +276,37 @@ func (e *Engine) pokeUser(ctx context.Context, userID, secretID uuid.UUID) {
 		return
 	}
 	e.pollToken(ctx, row.UserID, row.ID, row.EnablementRev, row.AnthropicSuccessGeneration, true, row.NotifyEarlyLimitReset, func() ([]byte, error) {
-		return e.opener.OpenSealed(row.UserID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext)
+		return e.openToken(ctx, row)
 	})
+}
+
+// openToken permits one same-ID refetch only on exact crypto epoch mismatch.
+// Its caller keeps the original row for write and notification fences.
+func (e *Engine) openToken(ctx context.Context, row store.GetAnthropicTokenToPollRow) ([]byte, error) {
+	plain, err := e.opener.OpenSealedAtEpoch(ctx, row.UserID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext, row.VaultEpoch)
+	if err != store.ErrVaultSealStale {
+		return plain, err
+	}
+	fresh, err := e.store.GetAnthropicTokenToPoll(ctx, store.GetAnthropicTokenToPollParams{
+		UserID: row.UserID, SecretID: pgtype.UUID{Bytes: row.ID, Valid: true},
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrVaultSealStale
+	}
+	if err != nil {
+		return nil, err
+	}
+	if fresh.ID != row.ID || fresh.UserID != row.UserID ||
+		fresh.EnablementRev != row.EnablementRev ||
+		fresh.AnthropicSuccessGeneration != row.AnthropicSuccessGeneration {
+		return nil, store.ErrVaultSealStale
+	}
+	return e.opener.OpenSealedAtEpoch(ctx, fresh.UserID, store.KindAnthropicToken, fresh.SealedWith, fresh.Ciphertext, fresh.VaultEpoch)
 }
 
 // pollToken polls ONE token, applying the D2 (usage-first, probe fallback) and D5
 // (fail-closed / backoff) rules. open decrypts that token's already-fetched row via
-// the vault path (OpenSealed on both the tick's listing row and the poke's resolved
+// the vault path (OpenSealedAtEpoch on both the tick's listing row and the poke's resolved
 // row); ignoreBackoff is set on the poke path so a just-saved credential is polled even if the one it replaced was
 // backed off. rev is the token's enablement revision captured when the poll
 // started; the write is fenced on it (PRD #1732 D13). successGeneration is

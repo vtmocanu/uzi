@@ -108,6 +108,9 @@ func newAutoFixture(t *testing.T) autoFixture {
 		candRow(emptyID, "spare-key", true, 90, time.Minute, 0),
 	}
 	svc := New(fs, box, autoParams())
+	m := newMemVaultStore()
+	m.states[owner] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected}
+	svc.SetVault(newMemoryVault(box, m))
 	svc.now = func() time.Time { return autoNow }
 	return autoFixture{
 		fs: fs, svc: svc, owner: owner, runID: runID, emptyID: emptyID, fullID: fullID,
@@ -638,6 +641,7 @@ func TestAutoDoesNotRetryOnALockedVault(t *testing.T) {
 			pickID: {
 				UserID: owner, Kind: store.KindAnthropicToken,
 				Ciphertext: []byte("dek-sealed-never-decrypted"), SealedWith: store.SealedWithDEK,
+				VaultEpoch: 1, // unlockedVault enrolls the owner's first protected epoch.
 			},
 		},
 		byIDLabels: map[uuid.UUID]string{pickID: "spare-key"},

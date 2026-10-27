@@ -181,7 +181,7 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 	// codex_credential_state already ties this alias to a codex_auth secret, so a wrong kind
 	// is unreachable here; collapsing it into the not-found sentinel is acceptable (no test
 	// asserts the distinct ErrCodexSecretKind diagnostic).
-	plain, err := secretopen.OpenByIDOfKind(ctx, r.q, r.vlt, r.box, userID, userSecretID, store.KindCodexAuth)
+	plain, err := secretopen.OpenByIDOfKindAtRevision(ctx, r.q, r.vlt, r.box, userID, userSecretID, store.KindCodexAuth, st.MaterialRevision)
 	if err != nil {
 		switch {
 		case errors.Is(err, secretopen.ErrNoSecret):
@@ -196,8 +196,8 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 			r.markFailed(ctx, userID, userSecretID, "stored codex login could not be decrypted", st.MaterialRevision)
 			return fmt.Errorf("codex reconcile: open login: %w", err)
 		default:
-			// A transient store/lookup error (OpenByIDOfKind wraps a non-ErrNoRows lookup
-			// failure as "secretopen: lookup by id") is NOT the credential's fault: leave the
+			// A transient reader failure from OpenByIDOfKindAtRevision is NOT the
+			// credential's fault: leave the
 			// alias 'staging' so the next poller sweep retries it, exactly as the discovery
 			// path does. Marking it 'failed' on a DB blip would drop it from the staging list
 			// permanently (issue #1209 review).

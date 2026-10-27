@@ -33,6 +33,14 @@ WHERE user_id = @user_id
 SELECT * FROM codex_provider_account
 WHERE user_id = @user_id AND id = @id;
 
+-- name: GetCodexProviderAccountSnapshot :one
+-- Owner-scoped material and epoch for decrypting a selected account slot.
+-- GetCodexProviderAccountByID remains the metadata-only read.
+SELECT sqlc.embed(a), u.vault_epoch
+FROM codex_provider_account a
+JOIN users u ON u.id = a.user_id
+WHERE a.user_id = @user_id AND a.id = @id;
+
 -- name: InsertCodexCredentialState :one
 -- Create the per-alias state row for a codex-kind secret (PRD #1147 M1). Owner-scoped
 -- by the composite FK (00200) to a secret the same user owns. status is 'staging'

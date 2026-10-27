@@ -164,6 +164,9 @@ func (v *Vault) sealState(userID uuid.UUID, kind string, plaintext []byte, mode 
 // current. An owner-scoped caller can refetch once on ErrVaultSealStale; it must
 // never reinterpret a discriminator or fall back to master after a DEK failure.
 func (v *Vault) OpenAtEpoch(ctx context.Context, userID uuid.UUID, kind, sealedWith string, ciphertext []byte, epoch int64) ([]byte, error) {
+	if sealedWith != store.SealedWithDEK && sealedWith != store.SealedWithMaster && sealedWith != store.SealedWithMasterAAD {
+		return nil, ErrInvalidMaterial
+	}
 	if v == nil {
 		return nil, ErrNotConfigured
 	}
@@ -183,11 +186,36 @@ func (v *Vault) OpenAtEpoch(ctx context.Context, userID uuid.UUID, kind, sealedW
 			return nil, err
 		}
 		if !ok {
+			// Cache retirement can follow the first State read. Only an observed
+			// epoch change authorizes the caller to refetch its ciphertext.
+			fresh, err := v.State(ctx, userID)
+			if err != nil {
+				return nil, err
+			}
+			if fresh.VaultEpoch != epoch {
+				return nil, store.ErrVaultSealStale
+			}
 			return nil, ErrLocked
 		}
-		return box.OpenWithAAD(ciphertext, secretAAD(userID, kind))
+		plain, err := box.OpenWithAAD(ciphertext, secretAAD(userID, kind))
+		return openedMaterial(plain, err)
 	}
-	return OpenMasterMaterial(v.master, userID, kind, sealedWith, ciphertext)
+	plain, err := OpenMasterMaterial(v.master, userID, kind, sealedWith, ciphertext)
+	if errors.Is(err, ErrNotConfigured) || errors.Is(err, ErrLocked) {
+		return nil, err
+	}
+	return openedMaterial(plain, err)
+}
+
+// ErrInvalidMaterial identifies a discriminator or authentication failure.
+// State and cache infrastructure errors remain distinct.
+var ErrInvalidMaterial = errors.New("vault: invalid sealed material")
+
+func openedMaterial(plain []byte, err error) ([]byte, error) {
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidMaterial, err)
+	}
+	return plain, nil
 }
 
 type Status struct {

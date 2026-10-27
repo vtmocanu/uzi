@@ -16,7 +16,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
-const credVaultPassword = "codex-vault-fixture-password"
+const credVaultPassword = "codex-vault-fixture-password" //nolint:gosec // G101: public passphrase for isolated test users, never a provider credential.
 
 // Begin is the deterministic barrier after outside preparation and before any
 // install transaction locks. The lifecycle transition completes before Begin

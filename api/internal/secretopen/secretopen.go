@@ -5,8 +5,9 @@
 // lock surfaces as ErrVaultLocked — transient, retry), a legacy 'master'-sealed
 // row opens under the process master box regardless of lock state, and a
 // 'master_aad' row authenticates its owner and kind under that box. Without a
-// vault, only the master formats can open; DEK rows remain locked and unknown
-// discriminators are refused. Callers map these sentinels to their own domain
+// vault, only the legacy OpenSealed helper can open master formats. Snapshot
+// readers require a vault to validate the durable epoch. Unknown discriminators
+// are refused. Callers map these sentinels to their own domain
 // errors (workersvc) or skip semantics (the poller).
 package secretopen
 
@@ -36,6 +37,10 @@ var (
 	// this process. Transient — the caller retries after the next unlock, never
 	// fails terminally on it.
 	ErrVaultLocked = errors.New("secretopen: vault locked")
+	// ErrReaderFailure marks lookup, configuration, or policy infrastructure
+	// failures so callers preserve them instead of blaming the credential.
+	// The underlying error remains available through errors.Is/errors.As.
+	ErrReaderFailure = errors.New("secretopen: reader failure")
 )
 
 // Store is the narrow query surface OpenByID and OpenByIDOfKind need.
@@ -59,63 +64,80 @@ type Store interface {
 // The row's OWN kind feeds the vault dispatch: the DEK AAD is user_id||kind, so a
 // caller-supplied kind could only ever be a guess that fails GCM authentication.
 func OpenByID(ctx context.Context, q Store, vlt *vault.Vault, box *secretbox.Box, userID, secretID uuid.UUID) ([]byte, error) {
-	row, err := q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
-		ID:     secretID,
-		UserID: userID,
-	})
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNoSecret
-		}
-		return nil, fmt.Errorf("secretopen: lookup by id: %w", err)
-	}
-	if row.UserID != userID {
-		return nil, ErrNoSecret
-	}
-	return OpenSealed(vlt, box, userID, row.Kind, row.SealedWith, row.Ciphertext)
+	return openByID(ctx, q, vlt, box, userID, secretID, "", nil)
 }
 
-// OpenByIDOfKind is OpenByID with an additional KIND GUARD: it opens ONE specific
-// secret of the user's only when the row's own user_secrets.kind equals expectedKind,
-// and otherwise returns the SAME not-found sentinel (ErrNoSecret) a missing or foreign
-// secret returns — never the plaintext, and never a distinct error that would confirm
-// the row exists under a different kind.
-//
-// This is defense-in-depth for the bound credential paths (PRD #1147 audit #6): an
-// api_key open path must never decrypt and return a codex_auth login blob (which carries
-// a refresh_token), even if an upstream kind check were ever bypassed or a binding were
-// somehow mis-kinded. The caller states the kind it EXPECTS to open; a row of any other
-// kind is treated as if it did not exist. The kind check is non-disclosing on purpose —
-// it collapses to ErrNoSecret rather than a "wrong kind" error so it leaks nothing about
-// the row's real kind.
-//
-// The row's OWN kind still feeds the vault dispatch (the DEK AAD is user_id||kind); the
-// expectedKind argument only gates access, it never changes how the ciphertext is opened.
+// OpenByIDOfKind additionally refuses a row of any other kind without disclosing it.
 func OpenByIDOfKind(ctx context.Context, q Store, vlt *vault.Vault, box *secretbox.Box, userID, secretID uuid.UUID, expectedKind string) ([]byte, error) {
-	row, err := q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
-		ID:     secretID,
-		UserID: userID,
-	})
+	return openByID(ctx, q, vlt, box, userID, secretID, expectedKind, nil)
+}
+
+// OpenByIDOfKindAtRevision fences an alias revision captured before this lookup.
+// It checks that revision before the first crypto operation as well as the retry.
+func OpenByIDOfKindAtRevision(ctx context.Context, q Store, vlt *vault.Vault, box *secretbox.Box, userID, secretID uuid.UUID, expectedKind string, revision int64) ([]byte, error) {
+	return openByID(ctx, q, vlt, box, userID, secretID, expectedKind, &revision)
+}
+
+func openByID(ctx context.Context, q Store, vlt *vault.Vault, box *secretbox.Box, userID, secretID uuid.UUID, expectedKind string, revision *int64) ([]byte, error) {
+	arg := store.GetUserSecretCiphertextByIDParams{ID: secretID, UserID: userID}
+	row, err := q.GetUserSecretCiphertextByID(ctx, arg)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNoSecret
 		}
-		return nil, fmt.Errorf("secretopen: lookup by id: %w", err)
+		return nil, fmt.Errorf("%w: lookup by id: %w", ErrReaderFailure, err)
 	}
-	if row.UserID != userID {
+	if row.ID != secretID || row.UserID != userID || (expectedKind != "" && row.Kind != expectedKind) {
 		return nil, ErrNoSecret
 	}
-	if row.Kind != expectedKind {
-		// Non-disclosing: a row of the wrong kind is the not-found sentinel, so this path
-		// can never decrypt+return a credential of a kind the caller did not ask for.
-		return nil, ErrNoSecret
+	if revision != nil && (!row.MaterialRevision.Valid || row.MaterialRevision.Int64 != *revision) {
+		return nil, store.ErrVaultSealStale
 	}
-	return OpenSealed(vlt, box, userID, row.Kind, row.SealedWith, row.Ciphertext)
+	plain, err := OpenSealedAtEpoch(ctx, vlt, box, userID, row.Kind, row.SealedWith, row.Ciphertext, row.VaultEpoch)
+	if err != store.ErrVaultSealStale {
+		return plain, err
+	}
+	// Exactly one same-ID refetch, only after the crypto layer observed an epoch
+	// mismatch. Disabled rows are permitted here for already-started refreshes;
+	// callers retain their admission/finalization checks.
+	fresh, err := q.GetUserSecretCiphertextByID(ctx, arg)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrVaultSealStale
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: refetch by id: %w", ErrReaderFailure, err)
+	}
+	if fresh.ID != row.ID || fresh.UserID != row.UserID || fresh.Kind != row.Kind ||
+		fresh.Disabled != row.Disabled || fresh.EnablementRev != row.EnablementRev ||
+		fresh.MaterialRevision != row.MaterialRevision {
+		return nil, store.ErrVaultSealStale
+	}
+	return OpenSealedAtEpoch(ctx, vlt, box, userID, fresh.Kind, fresh.SealedWith, fresh.Ciphertext, fresh.VaultEpoch)
 }
 
-// OpenSealed decrypts an already-fetched sealed row, without a DB lookup — the
-// path the rate-limit poller takes when it lists every token in one query (D1).
-// It is the crypto half of OpenByID and shares the exact vault dispatch: a 'dek' row
+// OpenSealedAtEpoch opens only a material/epoch pair captured in one SQL snapshot.
+// It preserves policy and infrastructure failures; only invalid material is
+// classified as an unusable credential. A Vault is required even in off mode.
+func OpenSealedAtEpoch(ctx context.Context, vlt *vault.Vault, _ *secretbox.Box, userID uuid.UUID, kind, sealedWith string, ciphertext []byte, epoch int64) ([]byte, error) {
+	plain, err := vlt.OpenAtEpoch(ctx, userID, kind, sealedWith, ciphertext, epoch)
+	if err == store.ErrVaultSealStale {
+		return nil, store.ErrVaultSealStale
+	}
+	if errors.Is(err, vault.ErrLocked) {
+		return nil, ErrVaultLocked
+	}
+	if errors.Is(err, vault.ErrInvalidMaterial) {
+		return nil, ErrUndecryptable
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrReaderFailure, err)
+	}
+	return plain, nil
+}
+
+// OpenSealed is the compatibility opener for material without a captured epoch.
+// Production snapshot readers use OpenSealedAtEpoch and retain their read fences.
+// It shares the same discriminator dispatch: a 'dek' row
 // needs the owner unlocked (ErrVaultLocked otherwise), a legacy 'master' row opens
 // under the master box regardless of lock state, and master_aad authenticates
 // the owner and kind with that box. Without a vault, DEK rows remain locked and
@@ -139,7 +161,7 @@ func OpenSealed(vlt *vault.Vault, box *secretbox.Box, userID uuid.UUID, kind, se
 	return plain, nil
 }
 
-// Opener binds OpenSealed's collaborators so it satisfies a caller's one-method
+// Opener binds OpenSealedAtEpoch's collaborators so it satisfies a caller's one-method
 // seam (the usage poller's TokenOpener). One instance is shared across polls.
 type Opener struct {
 	vlt *vault.Vault
@@ -152,9 +174,7 @@ func NewOpener(vlt *vault.Vault, box *secretbox.Box) *Opener {
 	return &Opener{vlt: vlt, box: box}
 }
 
-// OpenSealed opens an already-fetched sealed row without a lookup. Both of the
-// usage poller's paths take it: the tick opens the rows of its bulk listing, and
-// the poke opens the one row it resolved.
-func (o *Opener) OpenSealed(userID uuid.UUID, kind, sealedWith string, ciphertext []byte) ([]byte, error) {
-	return OpenSealed(o.vlt, o.box, userID, kind, sealedWith, ciphertext)
+// OpenSealedAtEpoch opens an atomic SQL material/epoch snapshot.
+func (o *Opener) OpenSealedAtEpoch(ctx context.Context, userID uuid.UUID, kind, sealedWith string, ciphertext []byte, epoch int64) ([]byte, error) {
+	return OpenSealedAtEpoch(ctx, o.vlt, o.box, userID, kind, sealedWith, ciphertext, epoch)
 }

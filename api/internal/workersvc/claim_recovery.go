@@ -161,7 +161,7 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 		return nil, nil
 	}
 	assemblyErr = claudeCheckerClaimError(run, assemblyErr)
-	transient := errors.Is(assemblyErr, errVaultLocked) || errors.Is(assemblyErr, errAutoPoolEmpty) ||
+	transient := errors.Is(assemblyErr, store.ErrVaultSealStale) || errors.Is(assemblyErr, errVaultLocked) || errors.Is(assemblyErr, errAutoPoolEmpty) ||
 		errors.Is(assemblyErr, errCustomModelCapabilityMissing) || errors.Is(assemblyErr, errCrossCheckPinsCapabilityMissing)
 	// errCredentialDisabled is its own non-terminal classification (PRD #1732 D14): neither
 	// transient nor terminal, so it must pass this early return to reach the fenced park.
@@ -216,7 +216,7 @@ func isClaudeCheckerChild(run store.Run) bool {
 // carries no credential detail. The finalizer selects the stage-specific failure
 // reason; the sentinel retains its legacy plan text. Other run shapes return err unchanged.
 func claudeCheckerClaimError(run store.Run, err error) error {
-	if err == nil || !isClaudeCheckerChild(run) || errors.Is(err, errVaultLocked) {
+	if err == nil || !isClaudeCheckerChild(run) || errors.Is(err, errVaultLocked) || errors.Is(err, store.ErrVaultSealStale) {
 		return err
 	}
 	if errors.Is(err, errCredentialUnavailable) || errors.Is(err, errCredentialDisabled) || errors.Is(err, errAutoPoolEmpty) {

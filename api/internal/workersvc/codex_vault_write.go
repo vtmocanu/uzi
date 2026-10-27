@@ -73,7 +73,7 @@ func (s *Service) quarantineCodexMaterialLoss(ctx context.Context, userID, accou
 	if err != nil {
 		return false, err
 	}
-	if n != 1 && !(n == 0 && account.CoordState == codexCoordQuarantined) {
+	if n != 1 && (n != 0 || account.CoordState != codexCoordQuarantined) {
 		return false, nil
 	}
 	n, err = q.MarkCodexRejectionIntentUnrecoverable(ctx, store.MarkCodexRejectionIntentUnrecoverableParams{

@@ -871,6 +871,11 @@ func (f *fakeStore) GetUserJudgeAnthropicBinding(context.Context, uuid.UUID) (st
 func (f *fakeStore) GetUserSecretCiphertextByID(_ context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error) {
 	f.byIDLookups = append(f.byIDLookups, arg)
 	if row, ok := f.byIDSecrets[arg.ID]; ok {
+		// Legacy fixtures key rows by their stored ID. Preserve explicit IDs so
+		// malformed-row tests can still exercise the reader's identity guard.
+		if row.ID == uuid.Nil {
+			row.ID = arg.ID
+		}
 		return row, nil
 	}
 	// Since PRD #111 D8 the DEFAULT credential is opened by id too, so this lookup
@@ -885,7 +890,7 @@ func (f *fakeStore) GetUserSecretCiphertextByID(_ context.Context, arg store.Get
 			sealedWith = store.SealedWithMaster
 		}
 		return store.GetUserSecretCiphertextByIDRow{
-			UserID: arg.UserID, Kind: store.KindAnthropicToken,
+			ID: arg.ID, UserID: arg.UserID, Kind: store.KindAnthropicToken,
 			Ciphertext: f.anthropic, SealedWith: sealedWith,
 		}, f.defaultCiphertextErr
 	}
@@ -1988,7 +1993,12 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 	defer slog.SetDefault(prev)
 
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker(), nil)
+	wkr := worker()
+	fs.claimRun.UserID = wkr.UserID
+	m := newMemVaultStore()
+	m.states[wkr.UserID] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected}
+	svc.SetVault(newMemoryVault(box, m))
+	payload, err := svc.Claim(context.Background(), wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

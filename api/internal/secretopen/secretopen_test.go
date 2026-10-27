@@ -15,12 +15,28 @@ import (
 )
 
 type fakeStore struct {
+	*store.Queries
 	// byID is the row GetUserSecretCiphertextByID returns, and byIDArg records what
 	// it was asked for — the owner scoping is a property of the query, so the test
 	// asserts on the arguments rather than re-implementing the predicate.
 	byID    store.GetUserSecretCiphertextByIDRow
 	byIDErr error
 	byIDArg store.GetUserSecretCiphertextByIDParams
+}
+
+func (f *fakeStore) GetUserVaultState(_ context.Context, id uuid.UUID) (store.GetUserVaultStateRow, error) {
+	if id != f.byID.UserID {
+		return store.GetUserVaultStateRow{}, pgx.ErrNoRows
+	}
+	return store.GetUserVaultStateRow{VaultMode: store.VaultModeProtected, VaultEpoch: f.byID.VaultEpoch}, nil
+}
+
+// This read-only fixture refuses lifecycle transactions; its state is the
+// explicit owner/epoch represented by the staged ciphertext row.
+func readerTestVault(box *secretbox.Box, q vault.Store) *vault.Vault {
+	return vault.New(box, q, func(context.Context, func(context.Context, vault.Store) error) error {
+		return errors.New("read-only fixture transaction")
+	})
 }
 
 func (f *fakeStore) GetUserSecretCiphertextByID(_ context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error) {
@@ -69,7 +85,7 @@ func TestOpenSealedMasterAAD(t *testing.T) {
 		name := "no_vault"
 		var vlt *vault.Vault
 		if useVault {
-			name, vlt = "locked_vault", vault.New(box, nil)
+			name, vlt = "locked_vault", readerTestVault(box, nil)
 		}
 		t.Run(name, func(t *testing.T) {
 			for i, kind := range kinds {
@@ -128,7 +144,7 @@ func TestOpenSealedMasterAAD(t *testing.T) {
 // either path, so a nil store is sufficient.
 func TestOpenSealedRealVaultLocked(t *testing.T) {
 	box, _ := secretbox.New(key)
-	vlt := vault.New(box, nil) // empty DEK cache ⇒ every user is locked
+	vlt := readerTestVault(box, nil) // empty DEK cache ⇒ every user is locked
 	userID := uuid.New()
 	if vlt.Unlocked(userID) {
 		t.Fatal("a fresh vault must report the user as locked")
@@ -166,10 +182,10 @@ func TestOpenByIDRoundTrip(t *testing.T) {
 	}
 	userID, secretID := uuid.New(), uuid.New()
 	st := &fakeStore{byID: store.GetUserSecretCiphertextByIDRow{
-		UserID: userID, Kind: "anthropic_token", Ciphertext: sealed, SealedWith: store.SealedWithMaster,
+		ID: secretID, VaultEpoch: 7, UserID: userID, Kind: "anthropic_token", Ciphertext: sealed, SealedWith: store.SealedWithMaster,
 	}}
 
-	plain, err := OpenByID(context.Background(), st, nil, box, userID, secretID)
+	plain, err := OpenByID(context.Background(), st, readerTestVault(box, st), box, userID, secretID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,13 +204,13 @@ func TestOpenByIDRoundTrip(t *testing.T) {
 func TestOpenByIDForeignRowIsNoSecret(t *testing.T) {
 	box, _ := secretbox.New(key)
 	sealed, _ := box.Seal([]byte("someone-elses-token"))
-	caller := uuid.New()
+	caller, secretID := uuid.New(), uuid.New()
 	st := &fakeStore{byID: store.GetUserSecretCiphertextByIDRow{
-		UserID: uuid.New(), // a DIFFERENT owner than the caller
-		Kind:   "anthropic_token", Ciphertext: sealed, SealedWith: store.SealedWithMaster,
+		ID: secretID, UserID: uuid.New(), // a DIFFERENT owner than the caller
+		Kind: "anthropic_token", Ciphertext: sealed, SealedWith: store.SealedWithMaster,
 	}}
 
-	plain, err := OpenByID(context.Background(), st, nil, box, caller, uuid.New())
+	plain, err := OpenByID(context.Background(), st, nil, box, caller, secretID)
 	if !errors.Is(err, ErrNoSecret) {
 		t.Fatalf("want ErrNoSecret for a row owned by another user, got %v", err)
 	}
@@ -207,7 +223,7 @@ func TestOpenByIDForeignRowIsNoSecret(t *testing.T) {
 // as OpenSealed and OpenByIDOfKind, so callers need one error-handling shape for all.
 func TestOpenByIDSentinels(t *testing.T) {
 	box, _ := secretbox.New(key)
-	uid := uuid.New()
+	uid, sid := uuid.New(), uuid.New()
 
 	if _, err := OpenByID(context.Background(), &fakeStore{byIDErr: pgx.ErrNoRows}, nil, box, uid, uuid.New()); !errors.Is(err, ErrNoSecret) {
 		t.Fatalf("unknown id: want ErrNoSecret, got %v", err)
@@ -223,10 +239,10 @@ func TestOpenByIDSentinels(t *testing.T) {
 	}
 
 	st := &fakeStore{byID: store.GetUserSecretCiphertextByIDRow{
-		UserID: uid, Kind: "anthropic_token",
+		ID: sid, VaultEpoch: 7, UserID: uid, Kind: "anthropic_token",
 		Ciphertext: []byte("not a valid sealed blob"), SealedWith: store.SealedWithMaster,
 	}}
-	if _, err := OpenByID(context.Background(), st, nil, box, uid, uuid.New()); !errors.Is(err, ErrUndecryptable) {
+	if _, err := OpenByID(context.Background(), st, readerTestVault(box, st), box, uid, sid); !errors.Is(err, ErrUndecryptable) {
 		t.Fatalf("undecryptable: want ErrUndecryptable, got %v", err)
 	}
 }
@@ -236,12 +252,11 @@ func TestOpenByIDSentinels(t *testing.T) {
 // terminal credential failure.
 func TestOpenByIDVaultLocked(t *testing.T) {
 	box, _ := secretbox.New(key)
-	vlt := vault.New(box, nil) // empty DEK cache ⇒ locked
-	uid := uuid.New()
+	uid, sid := uuid.New(), uuid.New()
 	st := &fakeStore{byID: store.GetUserSecretCiphertextByIDRow{
-		UserID: uid, Kind: "anthropic_token", Ciphertext: []byte("irrelevant"), SealedWith: store.SealedWithDEK,
+		ID: sid, VaultEpoch: 7, UserID: uid, Kind: "anthropic_token", Ciphertext: []byte("irrelevant"), SealedWith: store.SealedWithDEK,
 	}}
-	if _, err := OpenByID(context.Background(), st, vlt, box, uid, uuid.New()); !errors.Is(err, ErrVaultLocked) {
+	if _, err := OpenByID(context.Background(), st, readerTestVault(box, st), box, uid, sid); !errors.Is(err, ErrVaultLocked) {
 		t.Fatalf("dek-sealed while locked must return ErrVaultLocked, got %v", err)
 	}
 }
@@ -256,9 +271,9 @@ func TestOpenByIDOfKindMatchingKind(t *testing.T) {
 	}
 	userID, secretID := uuid.New(), uuid.New()
 	st := &fakeStore{byID: store.GetUserSecretCiphertextByIDRow{
-		UserID: userID, Kind: store.KindOpenAIAPIKey, Ciphertext: sealed, SealedWith: store.SealedWithMaster,
+		ID: secretID, VaultEpoch: 7, UserID: userID, Kind: store.KindOpenAIAPIKey, Ciphertext: sealed, SealedWith: store.SealedWithMaster,
 	}}
-	plain, err := OpenByIDOfKind(context.Background(), st, nil, box, userID, secretID, store.KindOpenAIAPIKey)
+	plain, err := OpenByIDOfKind(context.Background(), st, readerTestVault(box, st), box, userID, secretID, store.KindOpenAIAPIKey)
 	if err != nil {
 		t.Fatalf("matching kind must open: %v", err)
 	}
@@ -289,10 +304,10 @@ func TestOpenByIDOfKindMismatchIsNotFound(t *testing.T) {
 	}
 	userID, secretID := uuid.New(), uuid.New()
 	st := &fakeStore{byID: store.GetUserSecretCiphertextByIDRow{
-		UserID: userID, Kind: store.KindCodexAuth, Ciphertext: loginBlob, SealedWith: store.SealedWithMaster,
+		ID: secretID, VaultEpoch: 7, UserID: userID, Kind: store.KindCodexAuth, Ciphertext: loginBlob, SealedWith: store.SealedWithMaster,
 	}}
 
-	plain, err := OpenByIDOfKind(context.Background(), st, nil, box, userID, secretID, store.KindOpenAIAPIKey)
+	plain, err := OpenByIDOfKind(context.Background(), st, readerTestVault(box, st), box, userID, secretID, store.KindOpenAIAPIKey)
 	if !errors.Is(err, ErrNoSecret) {
 		t.Fatalf("kind mismatch: want ErrNoSecret, got %v", err)
 	}
@@ -305,7 +320,7 @@ func TestOpenByIDOfKindMismatchIsNotFound(t *testing.T) {
 
 	// Sanity: the SAME row DOES open when the expected kind matches — proving the guard,
 	// not a broken fixture, is what refused above.
-	plain, err = OpenByIDOfKind(context.Background(), st, nil, box, userID, secretID, store.KindCodexAuth)
+	plain, err = OpenByIDOfKind(context.Background(), st, readerTestVault(box, st), box, userID, secretID, store.KindCodexAuth)
 	if err != nil {
 		t.Fatalf("matching kind must open the same row: %v", err)
 	}

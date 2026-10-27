@@ -24,6 +24,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
 	"github.com/vtmocanu/uzi/api/internal/toolseed"
@@ -946,15 +947,16 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// transaction and matches these by IDENTITY, so pass them through untouched:
 			// errVaultLocked (transient requeue), errRunVanished (drop) and
 			// errCodexMintAmbiguous (no payload, no mutation: the mint write may have landed).
-			// Every other Codex error is wrapped as errCredentialUnavailable with %w, so the
+			// Snapshot reader infrastructure errors pass through with their underlying cause.
+			// Other Codex errors are wrapped as errCredentialUnavailable with %w, so the
 			// sentinel and any minted epoch/hash survive for that classifier: a quarantine or a
 			// same-alias re-login in flight parks the run in recovery_wait, and the other
 			// credential failures (kind/mode mismatch, login blob, revoked revision, identity
-			// change, a store defect) stay terminal.
+			// change) stay terminal.
 			// errCredentialDisabled (the frozen alias is disabled, refused before any mint) passes
 			// through too: finishRunClaim parks it on credential_disabled (PRD #1732 D14).
 			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) || errors.Is(err, errCodexMintAmbiguous) ||
-				errors.Is(err, errCredentialDisabled) {
+				errors.Is(err, errCredentialDisabled) || errors.Is(err, store.ErrVaultSealStale) || errors.Is(err, secretopen.ErrReaderFailure) {
 				return nil, err
 			}
 			return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)

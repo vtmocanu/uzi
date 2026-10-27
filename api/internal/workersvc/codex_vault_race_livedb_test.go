@@ -18,7 +18,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
-const codexRacePassword = "refresh-conversion-fixture-password"
+const codexRacePassword = "refresh-conversion-fixture-password" //nolint:gosec // G101: public passphrase for isolated test users, never a provider credential.
 
 // The base exchange completes exactly once before the lifecycle callback. No
 // lifecycle call runs under the material writer's advisory/users/account locks.

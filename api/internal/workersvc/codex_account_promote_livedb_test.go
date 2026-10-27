@@ -577,8 +577,8 @@ func TestCodexAccountPromoteRelinkWaitsOnAliasLockLiveDB(t *testing.T) {
 		}()
 		waitForLockWait(t, env, pid) // the relink now waits on the promoter's alias lock
 		select {
-		case <-linkDone:
-			t.Error("the relink completed while the promoter held the alias")
+		case linkErr := <-linkDone:
+			t.Errorf("the relink completed while the promoter held the alias: %v", linkErr)
 		default:
 			blocked = true
 		}

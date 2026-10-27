@@ -34,7 +34,7 @@ func (q *Queries) DeleteRateLimits(ctx context.Context, userID uuid.UUID) (int64
 
 const getAnthropicTokenToPoll = `-- name: GetAnthropicTokenToPoll :one
 SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
-       s.enablement_rev, s.anthropic_success_generation
+       s.enablement_rev, s.anthropic_success_generation, u.vault_epoch
 FROM user_secrets s
 JOIN users u ON s.user_id = u.id
 WHERE s.user_id = $1 AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
@@ -55,6 +55,7 @@ type GetAnthropicTokenToPollRow struct {
 	NotifyEarlyLimitReset      bool      `json:"notify_early_limit_reset"`
 	EnablementRev              int64     `json:"enablement_rev"`
 	AnthropicSuccessGeneration int64     `json:"anthropic_success_generation"`
+	VaultEpoch                 int64     `json:"vault_epoch"`
 }
 
 // The single-token sibling of ListAnthropicTokensToPoll for the out-of-band poke
@@ -74,6 +75,7 @@ func (q *Queries) GetAnthropicTokenToPoll(ctx context.Context, arg GetAnthropicT
 		&i.NotifyEarlyLimitReset,
 		&i.EnablementRev,
 		&i.AnthropicSuccessGeneration,
+		&i.VaultEpoch,
 	)
 	return i, err
 }
@@ -114,7 +116,7 @@ func (q *Queries) GetRateLimitsForToken(ctx context.Context, arg GetRateLimitsFo
 
 const listAnthropicTokensToPoll = `-- name: ListAnthropicTokensToPoll :many
 SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
-       s.enablement_rev, s.anthropic_success_generation
+       s.enablement_rev, s.anthropic_success_generation, u.vault_epoch
 FROM user_secrets s
 JOIN users u ON s.user_id = u.id
 WHERE s.kind = 'anthropic_token' AND s.disabled_at IS NULL
@@ -129,6 +131,7 @@ type ListAnthropicTokensToPollRow struct {
 	NotifyEarlyLimitReset      bool      `json:"notify_early_limit_reset"`
 	EnablementRev              int64     `json:"enablement_rev"`
 	AnthropicSuccessGeneration int64     `json:"anthropic_success_generation"`
+	VaultEpoch                 int64     `json:"vault_epoch"`
 }
 
 // Every anthropic_token secret to poll each tick (PRD #104 M5): the token's id and
@@ -174,6 +177,7 @@ func (q *Queries) ListAnthropicTokensToPoll(ctx context.Context) ([]ListAnthropi
 			&i.NotifyEarlyLimitReset,
 			&i.EnablementRev,
 			&i.AnthropicSuccessGeneration,
+			&i.VaultEpoch,
 		); err != nil {
 			return nil, err
 		}
