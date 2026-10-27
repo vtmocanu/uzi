@@ -806,17 +806,22 @@ components:
             - "null"
           enum:
             - maintenance
-            - weekly_reserve
             - null
           description: >-
             Optional. "maintenance" while the instance is in maintenance mode and holds
             this queued job back; the job starts once maintenance ends and a worker claims it;
             its wall-clock limit counts from that claim, not from queueing (and not necessarily
-            from the moment maintenance ends). "weekly_reserve" while the job owner's weekly
-            usage reserve holds it because the credential it would spend reads at or above the
-            owner's threshold; it starts once a fresh reading is below that line. Maintenance
-            wins when both apply. Absent or null otherwise.
+            from the moment maintenance ends). Absent or null otherwise.
             status stays queued.
+        reserve_hold_reason:
+          type:
+            - string
+            - "null"
+          description: >-
+            Optional. A human-readable reason (for example "weekly usage reserve: 85% >= 80%")
+            while the job owner's weekly usage reserve holds this queued job and maintenance does
+            not; it starts once a fresh reading is below the owner's threshold. Absent or null
+            otherwise. status stays queued.
         notice:
           type:
             - string
