@@ -187,6 +187,17 @@ for v in OMIT EMPTY FALSE; do
   case "$out" in *STOP=*) fail "retained park with $v stamp stopped: $out";; esac
 done
 
+# Adoption refusal always stops once, including inconsistent or absent retry timing.
+for v in NULL 2099-01-02T03:04:05Z OMIT FALSE; do
+  reset recovery_wait stalled "" '[]'
+  echo retained_recovery_adoption_failed > "$WORK/cause"
+  [ "$v" = NULL ] || echo "$v" > "$WORK/retry"
+  rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
+  [ "$rc" -eq 0 ] || fail "adoption $v: want exit 0, got $rc: $out"
+  case "$out" in *"STOP=recovery_wait:retained_recovery_adoption_failed"*"owner decision"*"integrity check refused adoption"*"local work and custody preserved"*"no automatic retry"*"RESULT=stop:recovery_wait") ;; *) fail "adoption guidance missing: $out";; esac
+  [ "$(cat "$WORK/poll")" -eq 1 ] || fail "adoption hold polled again"
+done
+
 # 13. any other recovery_wait cause keeps its existing behaviour: keep polling to ELAPSED
 reset recovery_wait ok "" '[]'
 echo provider_outage > "$WORK/cause"

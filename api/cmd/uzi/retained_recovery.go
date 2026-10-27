@@ -6,16 +6,20 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
-const retainedRecoveryExhaustedCause = "retained_recovery_exhausted"
+const (
+	retainedRecoveryExhaustedCause      = "retained_recovery_exhausted"
+	retainedRecoveryAdoptionFailedCause = "retained_recovery_adoption_failed"
+)
 
 // Full RunDTO reads carry an explicit nullable retry stamp. Cause-only
-// projections must use their neutral presentation instead of this predicate.
+// projections cannot infer exhaustion timing; adoption refusal always holds.
 func isRetainedRecovery(r apitypes.RunDTO) bool {
-	return r.Status == statusRecoveryWait && strOr(r.RecoveryWaitCause, "") == retainedRecoveryExhaustedCause
+	cause := strOr(r.RecoveryWaitCause, "")
+	return r.Status == statusRecoveryWait && (cause == retainedRecoveryExhaustedCause || cause == retainedRecoveryAdoptionFailedCause)
 }
 
 func isRetainedRecoveryHold(r apitypes.RunDTO) bool {
-	return isRetainedRecovery(r) && r.RecoveryRetryNotBefore == nil
+	return isRetainedRecovery(r) && (strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause || r.RecoveryRetryNotBefore == nil)
 }
 
 func retainedRecoveryWord(r apitypes.RunDTO) string {
@@ -27,7 +31,10 @@ func retainedRecoveryWord(r apitypes.RunDTO) string {
 
 func retainedRecoveryLine(r apitypes.RunDTO) string {
 	state := "retained recovery exhausted · owner-held; no automatic resume"
-	if r.RecoveryRetryNotBefore != nil {
+	if strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause {
+		state = "retained recovery adoption failed · integrity check refused adoption · local work and custody preserved · owner-held; no automatic resume"
+	}
+	if !isRetainedRecoveryHold(r) && r.RecoveryRetryNotBefore != nil {
 		state = "retained recovery exhausted · timed retry not before " + r.RecoveryRetryNotBefore.UTC().Format(time.RFC3339) + "; retry may still be pending"
 	}
 	return state + " · owner Resume now: uzi run resume " + cellText(r.ID) +
@@ -36,8 +43,21 @@ func retainedRecoveryLine(r apitypes.RunDTO) string {
 }
 
 func retainedRecoveryTUILines(r apitypes.RunDTO) []string {
+	if strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause {
+		return append([]string{
+			"Retained recovery adoption failed.",
+			"Integrity check refused adoption.",
+			"Local work and custody preserved.",
+			"Owner-held · no automatic resume.",
+			"Owner Resume or Cancel:",
+			"Resume: uzi run resume " + cellText(r.ID),
+			"Cancel: uzi run cancel " + cellText(r.ID) + " (terminal)",
+			"Resume requests an attempt; success is not assured.",
+			"Source/archive availability and latest edits unverified.",
+		}, workerExhaustionEvidence(r)...)
+	}
 	state := "Owner-held · no automatic resume."
-	if r.RecoveryRetryNotBefore != nil {
+	if !isRetainedRecoveryHold(r) && r.RecoveryRetryNotBefore != nil {
 		state = "Timed retry not before " + r.RecoveryRetryNotBefore.UTC().Format(time.RFC3339)
 	}
 	lines := []string{
@@ -56,7 +76,7 @@ func retainedRecoveryTUILines(r apitypes.RunDTO) []string {
 func workerHoldNoticeKey(r apitypes.RunDTO) string {
 	key := r.Status + "/" + strOr(r.HoldReason, "") + "/" + strOr(r.RecoveryWaitCause, "")
 	if isRetainedRecovery(r) {
-		if r.RecoveryRetryNotBefore == nil {
+		if isRetainedRecoveryHold(r) {
 			return key + "/held"
 		}
 		return key + "/" + r.RecoveryRetryNotBefore.UTC().Format(time.RFC3339Nano)
