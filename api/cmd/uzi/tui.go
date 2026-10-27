@@ -426,7 +426,8 @@ type tuiModel struct {
 	sidebarCodexAccountIds []string
 
 	// vaultLocked is the viewer's vault-lock state (PRD #1251 M2), decoded off GET
-	// /api/auth/me's sibling `vault.unlocked` via WhoamiVault. Fetched at Init, on the 60s
+	// /api/auth/me's sibling vault object via WhoamiVault (off is never locked).
+	// Fetched at Init, on the 60s
 	// strip ticker and on manual refresh (r) — the same cadence as the rate-limit strip — so
 	// the tier-1 vault-locked hint auto-clears within ~a minute of an unlock (D3). A fetch
 	// failure is swallowed (last-known state kept), so a transient error never flashes a

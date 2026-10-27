@@ -27,7 +27,8 @@ type Client interface {
 	Whoami(ctx context.Context) (apitypes.UserDTO, error)
 	// WhoamiVault reads GET /api/auth/me like Whoami, but decodes the sibling top-level
 	// `vault` object the same response carries and returns the viewer's vault-LOCK state
-	// (PRD #1251 M2). It returns the viewer identity AND `locked` (= !vault.unlocked), so
+	// (PRD #1251 M2). It returns the viewer identity AND `locked` (false for an
+	// unprotected vault, otherwise !vault.unlocked when present), so
 	// the TUI can show the tier-1 vault-locked hint without a new endpoint or DTO (D9). An
 	// absent `vault` (a pre-vault server) decodes as unlocked, so an older server never
 	// shows a spurious lock — mirroring the web client's absent-⇒-unlocked convention. It
