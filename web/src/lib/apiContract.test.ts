@@ -41,6 +41,10 @@ import type {
   BoardColumn,
   Skill,
   SettingsResponse,
+  SessionResponse,
+  VaultStatus,
+  VaultToggleResponse,
+  AdminRateLimitUser,
   Branding,
   Chat,
   AgentTemplate,
@@ -194,6 +198,14 @@ import guardrailOverrideRequestZero from "../../../fixtures/api-contract/guardra
 import guardrailOverrideRequestFull from "../../../fixtures/api-contract/guardrail_override_request.full.json";
 import codexAccountRateLimitZero from "../../../fixtures/api-contract/codex_account_rate_limit.zero.json";
 import codexAccountRateLimitFull from "../../../fixtures/api-contract/codex_account_rate_limit.full.json";
+import authSessionZero from "../../../fixtures/api-contract/auth_session.zero.json";
+import authSessionFull from "../../../fixtures/api-contract/auth_session.full.json";
+import vaultStatusZero from "../../../fixtures/api-contract/vault_status.zero.json";
+import vaultStatusFull from "../../../fixtures/api-contract/vault_status.full.json";
+import vaultToggleZero from "../../../fixtures/api-contract/vault_toggle.zero.json";
+import vaultToggleFull from "../../../fixtures/api-contract/vault_toggle.full.json";
+import anthropicAdminRateLimitRowZero from "../../../fixtures/api-contract/anthropic_admin_rate_limit_row.zero.json";
+import anthropicAdminRateLimitRowFull from "../../../fixtures/api-contract/anthropic_admin_rate_limit_row.full.json";
 import codexAdminRateLimitRowZero from "../../../fixtures/api-contract/codex_admin_rate_limit_row.zero.json";
 import codexAdminRateLimitRowFull from "../../../fixtures/api-contract/codex_admin_rate_limit_row.full.json";
 import healthDocZero from "../../../fixtures/api-contract/health_doc.zero.json";
@@ -884,6 +896,67 @@ it("recorded nested checker metadata always has the nullable member", () => {
   void _codexAdminExtra;
   void _codexAdminZero;
   void _codexAdminFull;
+}
+
+// Vault/session lifecycle contracts: Go's generic populator widens enum values.
+{
+  const missing: never = null as unknown as Exclude<keyof SessionResponse, keyof typeof authSessionFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof authSessionFull, keyof SessionResponse>;
+  const zero: ZeroOf<SessionResponse> = authSessionZero;
+  const full: Widen<SessionResponse> = authSessionFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof VaultStatus, keyof typeof vaultStatusFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof vaultStatusFull, keyof VaultStatus>;
+  const zero: ZeroOf<VaultStatus> = vaultStatusZero;
+  const full: Widen<VaultStatus> = vaultStatusFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof VaultToggleResponse, keyof typeof vaultToggleFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof vaultToggleFull, keyof VaultToggleResponse>;
+  const zero: ZeroOf<VaultToggleResponse> = vaultToggleZero;
+  const full: Widen<VaultToggleResponse> = vaultToggleFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof AdminRateLimitUser, keyof typeof anthropicAdminRateLimitRowFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof anthropicAdminRateLimitRowFull, keyof AdminRateLimitUser>;
+  // ratelimits.go initializes each row's Tokens to [], unlike the nil-slice Go zero marshal.
+  const zero: ZeroOf<AdminRateLimitUser, "tokens"> = anthropicAdminRateLimitRowZero;
+  const full: Widen<AdminRateLimitUser> = anthropicAdminRateLimitRowFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof SessionResponse["user"], keyof typeof authSessionFull.user>;
+  const extra: never = null as unknown as Exclude<keyof typeof authSessionFull.user, keyof SessionResponse["user"]>;
+  void missing; void extra;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof SessionResponse["appearance"], keyof typeof authSessionFull.appearance>;
+  const extra: never = null as unknown as Exclude<keyof typeof authSessionFull.appearance, keyof SessionResponse["appearance"]>;
+  void missing; void extra;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof SessionResponse["appearance"]["overrides"], keyof typeof authSessionFull.appearance.overrides>;
+  const extra: never = null as unknown as Exclude<keyof typeof authSessionFull.appearance.overrides, keyof SessionResponse["appearance"]["overrides"]>;
+  void missing; void extra;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof SessionResponse["appearance"]["defaults"], keyof typeof authSessionFull.appearance.defaults>;
+  const extra: never = null as unknown as Exclude<keyof typeof authSessionFull.appearance.defaults, keyof SessionResponse["appearance"]["defaults"]>;
+  void missing; void extra;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof NonNullable<SessionResponse["vault"]>, keyof typeof authSessionFull.vault>;
+  const extra: never = null as unknown as Exclude<keyof typeof authSessionFull.vault, keyof NonNullable<SessionResponse["vault"]>>;
+  void missing; void extra;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof AdminRateLimitUser["tokens"][number], keyof (typeof anthropicAdminRateLimitRowFull.tokens)[number]>;
+  const extra: never = null as unknown as Exclude<keyof (typeof anthropicAdminRateLimitRowFull.tokens)[number], keyof AdminRateLimitUser["tokens"][number]>;
+  void missing; void extra;
 }
 
 // ── CatalogEntry (M2 drift, RECONCILED M4) ──────────────────────────────────
@@ -1655,6 +1728,11 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // row), normalized to [] by the M3 mapper — so nullable:true.
   { stem: "codex_account_rate_limit", nullable: true },
   { stem: "codex_admin_rate_limit_row", nullable: true },
+  // Auth has nullable user metadata/appearance overrides; Anthropic's zero tokens is nil.
+  { stem: "auth_session", nullable: true },
+  { stem: "vault_status", nullable: false },
+  { stem: "vault_toggle", nullable: false },
+  { stem: "anthropic_admin_rate_limit_row", nullable: true },
   // PRD #1484 M1: the admin-health document. snoozed_until/episode_id are present-as-null
   // pointers and checks is a non-omitempty slice (a null nil-slice marshal the registry
   // normalizes to []), so its zero.json carries nulls.
@@ -1679,6 +1757,59 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // nil-slice null in zero.json.
   { stem: "product_skills", nullable: true },
 ];
+
+describe("vault lifecycle contract fixtures", () => {
+  it("pins the session envelope and nested public metadata keys", () => {
+    expect(Object.keys(authSessionFull).sort()).toEqual([
+      "user", "autopilot_label", "uzi_label", "appearance", "theme", "theme_override",
+      "default_theme", "vault", "has_password", "judge_enforced_by_admin", "effective_judge_model",
+    ].sort());
+    expect(Object.keys(authSessionFull.user).sort()).toEqual(Object.keys(userFull).sort());
+    expect(Object.keys(authSessionFull.appearance).sort()).toEqual([
+      "mode", "light_theme", "dark_theme", "typeface", "overrides", "defaults",
+    ].sort());
+    for (const values of [authSessionFull.appearance.overrides, authSessionFull.appearance.defaults]) {
+      expect(Object.keys(values).sort()).toEqual(["mode", "light_theme", "dark_theme", "typeface"].sort());
+    }
+    expect(authSessionFull.vault).toEqual(vaultStatusFull);
+    expect(authSessionZero.vault).toEqual(vaultStatusZero);
+  });
+
+  it("preserves session zero booleans and nullable metadata and appearance overrides", () => {
+    expect(authSessionZero.has_password).toBe(false);
+    expect(authSessionZero.judge_enforced_by_admin).toBe(false);
+    expect(authSessionZero.user).toEqual(userZero);
+    expect(authSessionZero.theme_override).toBeNull();
+    expect(authSessionZero.appearance.overrides).toEqual({
+      mode: null, light_theme: null, dark_theme: null, typeface: null,
+    });
+    expect(authSessionFull.has_password).toBe(true);
+    expect(authSessionFull.judge_enforced_by_admin).toBe(true);
+    expect(authSessionFull.effective_judge_model).toBe("x");
+  });
+
+  it("pins status and toggle key sets without interpreting Go zero strings as modes", () => {
+    expect(Object.keys(vaultStatusFull).sort()).toEqual(["mode", "policy", "unlocked", "exists"].sort());
+    expect(Object.keys(vaultStatusZero).sort()).toEqual(Object.keys(vaultStatusFull).sort());
+    expect(vaultStatusZero).toEqual({ mode: "", policy: "", unlocked: false, exists: false });
+    expect(Object.keys(vaultToggleZero)).toEqual(["mode"]);
+    expect(Object.keys(vaultToggleFull).sort()).toEqual(["mode", "rotation_advice"]);
+    expect(vaultToggleFull.rotation_advice).toBe("x");
+  });
+
+  it("pins both admin meter row key sets and the GET/PUT settings count", () => {
+    expect(Object.keys(anthropicAdminRateLimitRowFull).sort()).toEqual([
+      "id", "email", "name", "vault_mode", "vault_locked", "tokens",
+    ].sort());
+    expect(Object.keys(codexAdminRateLimitRowFull).sort()).toEqual([
+      "id", "email", "name", "vault_mode", "vault_locked", "accounts",
+    ].sort());
+    expect(anthropicAdminRateLimitRowZero.tokens).toBeNull();
+    expect(codexAdminRateLimitRowZero.accounts).toBeNull();
+    expect(settingsZero.unprotected_users).toBe(0);
+    expect(settingsFull.unprotected_users).toBe(1);
+  });
+});
 
 describe("admin worker cleanup contract", () => {
   it("keeps required cleanup state admin-only and pressure volumes non-null at zero", () => {

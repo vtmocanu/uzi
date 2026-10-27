@@ -4,7 +4,7 @@
 // socket is therefore a live cache over this store, exactly like /api/ws is
 // over Postgres, so useRunStream's replay/merge logic runs unmodified.
 
-import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
+import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, VaultMode, WsEvent } from "../lib/api";
 import { seedUnifiedProgress } from "./data/unifiedProgress";
 import { deriveMockProgress } from "./runProgress";
 import {
@@ -52,6 +52,9 @@ export interface MockState {
   // the Lock vault action flips it so the badge, banner, and "waiting for vault
   // unlock" run state are all browsable.
   vaultUnlocked: boolean;
+  vaultMode: VaultMode;
+  // Undefined uses the scenario's initial wrapper presence.
+  vaultExists?: boolean;
 }
 
 // seedRun copies a fixture into the store with status_since defaulted to the fixture's own
@@ -188,10 +191,23 @@ function seed(): MockState {
     boardPrefs: new Map<string, BoardPrefs>(),
     proposals,
     vaultUnlocked: true,
+    vaultMode: "protected",
   };
 }
 
 export const state: MockState = seed();
+
+// Material-only projection: policy remains owned by mockApi/settings.ts.
+// Read on demand so store initialization never depends on a scenario or domain.
+export function mockVaultMaterial(passwordless: boolean) {
+  const mode = state.vaultMode;
+  const exists = state.vaultExists ?? !passwordless;
+  return {
+    mode,
+    exists,
+    unlocked: mode === "protected" && exists && state.vaultUnlocked,
+  };
+}
 
 // ── Event bus (one channel per run, like the WS hub) ─────────────────────────
 

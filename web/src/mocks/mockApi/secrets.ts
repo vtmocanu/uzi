@@ -4,13 +4,14 @@ import type {
   SecretDependents,
   SecretMeta,
   TokenRateLimits,
+  VaultEnableResponse,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { isTerminalRun } from "../../lib/runStatus";
 import { mockCodexAliasAccounts, mockMyTokenRateLimits, mockSecrets } from "../data";
-import { patchRun, state } from "../store";
+import { mockVaultMaterial, patchRun, state } from "../store";
 import { schedulesPinnedTo } from "./schedules";
-import { delay, mockScenario, users } from "./shared";
+import { delay, mockScenario, oidcDemo, users } from "./shared";
 // secrets ↔ workers is the one accepted import cycle (PRD #991 D4): deleteAnthropicTokenById
 // unbinds workers pinned to the deleted token, and workers' setWorkerBindMode resolves a
 // token label against this roster. Both reads are inside function bodies and no module-level
@@ -86,20 +87,39 @@ function promoteCredentialDisabledRuns(): void {
   }
 }
 
-export function visibleCodexAccounts(accounts: CodexAccountRateLimit[]): CodexAccountRateLimit[] {
+export function visibleCodexAccounts(
+  accounts: CodexAccountRateLimit[],
+  ownerId = state.session?.id,
+): CodexAccountRateLimit[] {
   const disabledLabels = new Set(
     secrets.filter((s) => s.kind === "codex_auth" && s.enabled === false).map((s) => s.label),
   );
-  if (disabledLabels.size === 0) return accounts;
+  const vault = mockVaultMaterial(oidcDemo().passwordless);
   return accounts
-    .map((a) => ({ ...a, aliases: a.aliases.filter((l) => !disabledLabels.has(l)) }))
+    .map((a): CodexAccountRateLimit => {
+      const row = { ...a, aliases: a.aliases.filter((l) => !disabledLabels.has(l)) };
+      if (ownerId !== state.session?.id || row.status === "polling_disabled") return row;
+      if (vault.mode === "protected" && !vault.unlocked) {
+        const locked: CodexAccountRateLimit = { ...row, status: "vault_locked" };
+        delete locked.reason;
+        return locked;
+      }
+      if (row.status === "vault_locked") {
+        return {
+          ...row,
+          status: row.last_success_at ? (row.stale ? "stale" : "fresh") : "pending",
+        };
+      }
+      return row;
+    })
     .filter((a) => a.aliases.length > 0);
 }
-// requireUnlockedVault mirrors the real API: sealing a token needs the vault
-// unlocked (PRD #32), so every create/rotate path throws the same 409 the SPA
-// turns into an unlock prompt.
+// requireUnlockedVault mirrors the mode-aware API gate: protected saves need
+// an unlocked vault and otherwise return the 409 that prompts an unlock.
+// Unprotected saves do not need a cached key.
 function requireUnlockedVault(): void {
-  if (!state.vaultUnlocked) {
+  const vault = mockVaultMaterial(oidcDemo().passwordless);
+  if (vault.mode === "protected" && !vault.unlocked) {
     throw new ApiError(409, "vault is locked; unlock it with your password, then save again", {
       code: "vault_locked",
     });
@@ -571,13 +591,25 @@ export const secretsApi = {
   // password is treated as the "wrong password" 403 so the banner's error path is
   // browsable.
   vaultUnlock: async (password: string) => {
+    const vault = mockVaultMaterial(oidcDemo().passwordless);
+    if (vault.mode === "unprotected") return delay(null, 150);
+    if (!vault.exists) throw new ApiError(409, "vault is not set up");
     if (password.trim() === "") throw new ApiError(403, "incorrect password");
     state.vaultUnlocked = true;
     return delay(null, 150);
   },
-  // Passphrase-create (PRD #45): min length 12, then the demo vault is unlocked.
+  // VaultPassphrase delegates to Enable: passwordless, create-only, including from Off.
   vaultCreatePassphrase: async (passphrase: string) => {
-    if (passphrase.length < 12) throw new ApiError(400, "passphrase must be at least 12 characters");
+    const vault = mockVaultMaterial(oidcDemo().passwordless);
+    if (!oidcDemo().passwordless) {
+      throw new ApiError(409, "account has a password; its vault derives from the login password");
+    }
+    if (vault.exists) throw new ApiError(409, "a vault already exists");
+    if (passphrase.length < 12 || passphrase.length > 1024) {
+      throw new ApiError(400, "passphrase must be between 12 and 1024 characters");
+    }
+    state.vaultMode = "protected";
+    state.vaultExists = true;
     state.vaultUnlocked = true;
     return delay(null, 150);
   },
@@ -585,7 +617,24 @@ export const secretsApi = {
     state.vaultUnlocked = false;
     return delay(null, 100);
   },
-  vaultStatus: async () => delay({ unlocked: state.vaultUnlocked }, 40),
+  vaultEnable: async (password: string): Promise<VaultEnableResponse> => {
+    const vault = mockVaultMaterial(oidcDemo().passwordless);
+    if (vault.mode === "protected" && vault.exists) throw new ApiError(409, "a vault already exists");
+    if (oidcDemo().passwordless) {
+      if (password.length < 12 || password.length > 1024) {
+        throw new ApiError(400, "passphrase must be between 12 and 1024 characters");
+      }
+    } else if (password.trim() === "") {
+      throw new ApiError(403, "incorrect password");
+    }
+    state.vaultMode = "protected";
+    state.vaultExists = true;
+    state.vaultUnlocked = true;
+    return delay({
+      mode: "protected",
+      rotation_advice: "Credentials previously stored without the vault may already exist in backups. Rotate them to be safe.",
+    }, 150);
+  },
   deleteAnthropicToken: async () => {
     // D14: the kind-path alias 409s for a multi-token user — they delete by id.
     const anthropic = secrets.filter((s) => s.kind === "anthropic_token");

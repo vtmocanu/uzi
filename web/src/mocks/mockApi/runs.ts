@@ -36,7 +36,7 @@ import { ensureLive, handleInput, startNewRun } from "../engine";
 import { getRun, nextRunId, patchRun, state } from "../store";
 import { delay, mockScenario, requireSession } from "./shared";
 import { LEAD_NAME_RE, templates } from "./agents";
-import { appSettings } from "./settings";
+import { appSettings, mockVaultRateFields } from "./settings";
 import { visibleCodexAccounts, visibleTokenMeters } from "./secrets";
 
 // Fixed at module load so refreshing usage does not reset the demo's elapsed clock.
@@ -652,7 +652,11 @@ export const runsApi = {
   },
   // PRD #1732 D9: the admin view shows no row and no count for a disabled credential.
   getAdminRateLimits: async () =>
-    delay({ users: mockAdminRateLimits.map((u) => ({ ...u, tokens: visibleTokenMeters(u.tokens) })) }, 60),
+    delay({ users: mockAdminRateLimits.map((u) => ({
+      ...u,
+      ...mockVaultRateFields(u.id),
+      tokens: visibleTokenMeters(u.tokens),
+    })) }, 60),
   // ── Codex per-account rate limits (PRD #1209 M3) ────────────────────────────
   // The caller's own Codex meters follow the persona (a demo login as a seeded
   // non-admin reaches pending / vault-locked / polling-off / no-subscription); the
@@ -666,7 +670,11 @@ export const runsApi = {
     delay(
       {
         users: mockAdminCodexRateLimits
-          .map((u) => ({ ...u, accounts: visibleCodexAccounts(u.accounts) }))
+          .map((u) => ({
+            ...u,
+            ...mockVaultRateFields(u.id),
+            accounts: visibleCodexAccounts(u.accounts, u.id),
+          }))
           .filter((u) => u.accounts.length > 0),
       },
       60,

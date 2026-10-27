@@ -125,6 +125,9 @@ import type {
   TestSecretResult,
   SelfUsage,
   SessionResponse,
+  VaultStatus,
+  VaultEnableResponse,
+  VaultDisableResponse,
   SettingsResponse,
   Skill,
   SkillCreateInput,
@@ -756,7 +759,11 @@ const realApi = {
   vaultCreatePassphrase: (passphrase: string) =>
     request<null>("POST", "/vault/passphrase", { passphrase }),
   vaultLock: () => request<null>("POST", "/vault/lock"),
-  vaultStatus: () => request<{ unlocked: boolean }>("GET", "/vault/status"),
+  vaultStatus: () => request<VaultStatus>("GET", "/vault/status"),
+  // Both login-password verification and OIDC passphrase enrollment use password.
+  vaultEnable: (password: string) =>
+    request<VaultEnableResponse>("POST", "/vault/enable", { password }),
+  vaultDisable: () => request<VaultDisableResponse>("POST", "/vault/disable"),
   getMySettings: () =>
     request<{ settings: UserSettings }>("GET", "/me/settings"),
   putMySettings: (patch: UserSettingsPatch) =>

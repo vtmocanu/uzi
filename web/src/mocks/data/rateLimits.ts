@@ -164,14 +164,14 @@ export const mockMyRateLimitsByUser: Record<string, TokenRateLimits[]> = {
 // stale+vault-locked, unavailable, no_token.
 export const mockAdminRateLimits: AdminRateLimitUser[] = [
   // vlad holds TWO tokens, so the admin table's per-user grouping is demonstrable.
-  { id: "u-admin", email: "vlad@example.com", name: "vlad", vault_locked: false, tokens: mockMyTokenRateLimits },
-  { id: "u-radu", email: "radu@example.com", name: "radu", vault_locked: false, tokens: tokenised(okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3)) },
-  { id: "u-ana", email: "ana@example.com", name: "ana", vault_locked: false, tokens: tokenised(okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1)) },
+  { id: "u-admin", email: "vlad@example.com", name: "vlad", vault_mode: "protected", vault_locked: false, tokens: mockMyTokenRateLimits },
+  { id: "u-radu", email: "radu@example.com", name: "radu", vault_mode: "protected", vault_locked: false, tokens: tokenised(okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3)) },
+  { id: "u-ana", email: "ana@example.com", name: "ana", vault_mode: "protected", vault_locked: false, tokens: tokenised(okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1)) },
   // sorin demonstrates the new PRD #115 85–94 danger band: 5h at 88% paints a red
   // bar (danger tone ≥85) but the status pill stays a green "Live" because no
   // window has crossed 95 (the badge stays decoupled at ≥95).
-  { id: "u-sorin", email: "sorin@example.com", name: "sorin", vault_locked: false, tokens: tokenised(okReading(88, 3 * H + 5 * MIN, 76, 3 * D + 6 * H, 4)) },
-  { id: "u-mihai", email: "mihai@example.com", name: "mihai", vault_locked: true, tokens: tokenised(okReading(31, 0, 12, 0, 180, "header_probe", true)) },
-  { id: "u-dana", email: "dana@example.com", name: "dana", vault_locked: false, tokens: tokenised({ status: "unavailable" }) },
-  { id: "u-irina", email: "irina@example.com", name: "irina", vault_locked: false, tokens: [] },
+  { id: "u-sorin", email: "sorin@example.com", name: "sorin", vault_mode: "protected", vault_locked: false, tokens: tokenised(okReading(88, 3 * H + 5 * MIN, 76, 3 * D + 6 * H, 4)) },
+  { id: "u-mihai", email: "mihai@example.com", name: "mihai", vault_mode: "protected", vault_locked: true, tokens: tokenised(okReading(31, 0, 12, 0, 180, "header_probe", true)) },
+  { id: "u-dana", email: "dana@example.com", name: "dana", vault_mode: "protected", vault_locked: false, tokens: tokenised({ status: "unavailable" }) },
+  { id: "u-irina", email: "irina@example.com", name: "irina", vault_mode: "protected", vault_locked: false, tokens: [] },
 ];

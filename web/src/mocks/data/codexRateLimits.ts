@@ -202,6 +202,7 @@ export const mockAdminCodexRateLimits: CodexAdminRateLimitRow[] = [
     id: "u-admin",
     email: "vlad@example.com",
     name: "vlad",
+    vault_mode: "protected",
     vault_locked: false,
     accounts: [acctDefault, acctTeam],
   },
@@ -209,6 +210,7 @@ export const mockAdminCodexRateLimits: CodexAdminRateLimitRow[] = [
     id: "u-mira",
     email: "mira@example.com",
     name: "mira",
+    vault_mode: "protected",
     vault_locked: false,
     accounts: mockMyCodexRateLimitsByUser["u-mira"],
   },
@@ -216,6 +218,7 @@ export const mockAdminCodexRateLimits: CodexAdminRateLimitRow[] = [
     id: "u-sorin",
     email: "sorin@example.com",
     name: "sorin",
+    vault_mode: "protected",
     vault_locked: false,
     accounts: [
       acct(
@@ -232,6 +235,7 @@ export const mockAdminCodexRateLimits: CodexAdminRateLimitRow[] = [
     id: "u-andrei",
     email: "andrei@example.com",
     name: "andrei",
+    vault_mode: "protected",
     vault_locked: false,
     accounts: mockMyCodexRateLimitsByUser["u-andrei"],
   },
@@ -239,6 +243,7 @@ export const mockAdminCodexRateLimits: CodexAdminRateLimitRow[] = [
     id: "u-carmen",
     email: "carmen@example.com",
     name: "carmen",
+    vault_mode: "protected",
     vault_locked: false,
     // The provider REJECTED carmen's saved login (issue #1594): the same action-required
     // badge, but the hint tells her to add a login used only by uzi.
@@ -252,6 +257,7 @@ export const mockAdminCodexRateLimits: CodexAdminRateLimitRow[] = [
     id: "u-radu",
     email: "radu@example.com",
     name: "radu",
+    vault_mode: "protected",
     vault_locked: true,
     accounts: mockMyCodexRateLimitsByUser["u-radu"],
   },
@@ -259,6 +265,7 @@ export const mockAdminCodexRateLimits: CodexAdminRateLimitRow[] = [
     id: "u-mihai",
     email: "mihai@example.com",
     name: "mihai",
+    vault_mode: "protected",
     vault_locked: false,
     accounts: mockMyCodexRateLimitsByUser["u-mihai"],
   },

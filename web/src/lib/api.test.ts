@@ -25,6 +25,96 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("vault lifecycle HTTP request contract", () => {
+  it.each(["login password", "chosen OIDC passphrase"])(
+    "enables protection with the password field, cookies and CSRF: %s",
+    async (password) => {
+      expect(MOCK_MODE).toBe(false);
+      const response = {
+        mode: "protected",
+        rotation_advice: "Credentials previously stored without the vault may already exist in backups. Rotate them to be safe.",
+      };
+      const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, response));
+      vi.stubGlobal("fetch", fetchMock);
+      vi.stubGlobal("document", { cookie: "uzi_csrf=csrf-value" });
+      const result = await api.vaultEnable(password);
+      const mode: "protected" = result.mode;
+      const advice: string = result.rotation_advice;
+      expect({ mode, rotation_advice: advice }).toEqual(response);
+      expect(fetchMock.mock.calls).toEqual([["/api/vault/enable", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": "csrf-value" },
+        body: JSON.stringify({ password }),
+      }]]);
+    },
+  );
+
+  it("disables protection without a target or body, with cookies and CSRF", async () => {
+    expect(MOCK_MODE).toBe(false);
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, { mode: "unprotected" }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "uzi_csrf=csrf-value" });
+    const result = await api.vaultDisable();
+    const mode: "unprotected" = result.mode;
+    expect({ mode }).toEqual({ mode: "unprotected" });
+    expect(fetchMock.mock.calls).toEqual([["/api/vault/disable", {
+      method: "POST", credentials: "same-origin",
+      headers: { "X-CSRF-Token": "csrf-value" }, body: undefined,
+    }]]);
+  });
+
+  it.each([
+    { mode: "protected", policy: "required", unlocked: false, exists: false },
+    { mode: "unprotected", policy: "optional", unlocked: false, exists: false },
+    { mode: "protected", policy: "optional", unlocked: true, exists: true },
+  ])("returns all status fields independently: %j", async (status) => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, status));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await api.vaultStatus()).toEqual(status);
+    expect(fetchMock.mock.calls).toEqual([["/api/vault/status", {
+      method: "GET", credentials: "same-origin", headers: {}, body: undefined,
+    }]]);
+  });
+
+  it.each([
+    [403, "instance policy requires credential protection"],
+    [409, "vault is locked; unlock before disabling protection"],
+  ] as const)("propagates disable refusal %s", async (status, error) => {
+    vi.stubGlobal("document", { cookie: "uzi_csrf=csrf-value" });
+    vi.stubGlobal("fetch", vi.fn(async () => fakeResponse(status, { error })));
+    await expect(api.vaultDisable()).rejects.toMatchObject({ status, message: error });
+  });
+
+  it("propagates the protected-wrapper enable conflict", async () => {
+    vi.stubGlobal("document", { cookie: "uzi_csrf=csrf-value" });
+    vi.stubGlobal("fetch", vi.fn(async () => fakeResponse(409, { error: "a vault already exists" })));
+    await expect(api.vaultEnable("login password")).rejects.toMatchObject({
+      status: 409, message: "a vault already exists",
+    });
+  });
+
+  it("preserves the legacy passphrase field and the 204 unlock/lock responses", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(204, null));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "uzi_csrf=csrf-value" });
+    expect(await api.vaultCreatePassphrase("chosen passphrase")).toBeNull();
+    expect(await api.vaultUnlock("login password")).toBeNull();
+    expect(await api.vaultLock()).toBeNull();
+    const post = {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": "csrf-value" },
+    };
+    expect(fetchMock.mock.calls).toEqual([
+      ["/api/vault/passphrase", { ...post, body: JSON.stringify({ passphrase: "chosen passphrase" }) }],
+      ["/api/vault/unlock", { ...post, body: JSON.stringify({ password: "login password" }) }],
+      ["/api/vault/lock", {
+        method: "POST", credentials: "same-origin",
+        headers: { "X-CSRF-Token": "csrf-value" }, body: undefined,
+      }],
+    ]);
+  });
+});
+
 describe("manual worker cordon request contract", () => {
   it.each([undefined, "", " raw\n\u202ereason 🚀 "])("posts the raw optional reason %j with cookies and CSRF", async (reason) => {
     expect(MOCK_MODE).toBe(false);

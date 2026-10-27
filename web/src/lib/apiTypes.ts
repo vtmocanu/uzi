@@ -1000,6 +1000,9 @@ export interface ForgeConfig {
 // every field is always present. default_theme is the instance-default UI theme
 // (PRD #21).
 export interface AppSettings {
+  // Settings are a string map; callers accept only optional, otherwise required.
+  // Missing on older APIs must also be treated as required.
+  vault_policy?: string;
   autopilot_label: string;
   // PRD #764: the single run-eligibility label (default "uzi"). An issue is runnable
   // iff it carries this label; served as a raw string like every other setting.
@@ -1168,6 +1171,8 @@ export type SettingSource = "env" | "db" | "default";
 // non-secret effective values; `secrets` reports, per secret key, whether a value
 // is configured (never the value itself); `sources` reports every key's source.
 export interface SettingsResponse {
+  // Always reported by current GET/PUT handlers; absent on older APIs is unknown.
+  unprotected_users?: number;
   settings: AppSettings;
   secrets: Record<string, boolean>;
   sources: Record<string, SettingSource>;
@@ -1353,6 +1358,26 @@ export interface AppearanceState {
   };
 }
 
+export type VaultMode = "protected" | "unprotected";
+export type VaultPolicy = "optional" | "required";
+
+// Mode is independent of wrapper presence: protected users may still need enrollment.
+export interface VaultStatus {
+  mode: VaultMode;
+  policy: VaultPolicy;
+  unlocked: boolean;
+  exists: boolean;
+}
+
+// The shared Go toggle DTO omits rotation_advice for disable.
+export interface VaultToggleResponse {
+  mode: VaultMode;
+  rotation_advice?: string;
+}
+
+export type VaultEnableResponse = Required<VaultToggleResponse> & { mode: "protected" };
+export type VaultDisableResponse = Pick<VaultToggleResponse, "mode"> & { mode: "unprotected" };
+
 // SessionResponse is the auth/session bootstrap body (login, register, me). It
 // carries the user, the instance forge labels the board and issue-creation UI
 // need before their first call (PRD #19 M2, PRD #764: the single `uzi`
@@ -1378,12 +1403,10 @@ export interface SessionResponse {
   /** @deprecated PRD #1167: use `appearance.defaults.dark_theme` instead. The instance
    *  dark-polarity default (the legacy single-theme instance default). */
   default_theme: string;
-  // Vault status (PRD #32): whether the user's per-user secret vault is unlocked
-  // in the server process. Optional so a server that predates the field reads as
-  // unlocked (no banner, legacy behavior) rather than falsely locked. `exists`
-  // (PRD #45) is whether a vault row exists at all; with has_password it lets a
-  // passwordless user's SPA pick the passphrase-create dialog vs the unlock banner.
-  vault?: { unlocked: boolean; exists?: boolean };
+  // Older sessions may omit vault or its newer metadata. Missing mode/policy
+  // must be treated as protected/required, never inferred from exists. Preserve
+  // the pre-vault unlocked fallback when the entire object is absent.
+  vault?: Pick<VaultStatus, "unlocked"> & Partial<Omit<VaultStatus, "unlocked">>;
   // has_password is false for OIDC-only users (NULL password_hash; PRD #45). Absent
   // (older server, or a password user) reads as true — no passphrase-create dialog.
   has_password?: boolean;
@@ -4094,6 +4117,8 @@ export interface AdminRateLimitUser {
   id: string;
   email: string;
   name: string;
+  // Older rows omit mode; absence means protected, independently of lock state.
+  vault_mode?: VaultMode;
   vault_locked: boolean;
   tokens: TokenRateLimits[];
 }
@@ -4169,6 +4194,8 @@ export interface CodexAdminRateLimitRow {
   id: string;
   email: string;
   name: string;
+  // Older rows omit mode; absence means protected, independently of lock state.
+  vault_mode?: VaultMode;
   vault_locked: boolean;
   accounts: CodexAccountRateLimit[];
 }
