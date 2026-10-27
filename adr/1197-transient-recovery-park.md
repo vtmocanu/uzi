@@ -1235,6 +1235,7 @@ for each wrapped variant. M2/M3, complete mutation mapping, integration/full gat
 and new candidate reviewer/tester/auditor sign-offs remain incomplete and mandatory.
 The timed-out full gate is not green. Guard remains false; C2–C8, compose70/72/73
 and hosted timing retain their separate unproven boundaries.
+
 ## Issue #3466 amendment — silent human revisions
 
 A real Codex idle trip with exactly zero measured model-processing events can
@@ -1255,7 +1256,8 @@ Unproven cleanup, including cleanup of a partially built replacement, and
 residue quarantine refuse continuation. Token redaction survives replacement
 until existing terminal cleanup.
 
-Each admitted reconstruction spends the existing three-redrive allowance.
+Each admitted reconstruction spends the existing three-redrive allowance
+before fresh construction, including an owner replacement after exhaustion.
 Locked-vault and unavailable-credential construction failures remain inside
 that bounded driver, including an owner replacement revision after exhaustion;
 they do not escape into the runner credential hold. Teardown, backoff and

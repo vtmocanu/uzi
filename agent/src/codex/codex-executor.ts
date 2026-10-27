@@ -3585,7 +3585,7 @@ export class CodexExecutor implements Executor {
       let lastSessionId = ctx.sessionId ?? undefined;
       const wallMs = this.deps.wallMs ?? (ctx.config?.run_timeout_seconds ? ctx.config.run_timeout_seconds * 1000 : DEFAULT_WALL_MS);
       const wall: RunWall = { remainingMs: wallMs, maxServedMs: wallMs, claimMs: wallMs };
-      let silentRevision: { cause: TransientRecoveryError; needsRebuild: boolean; retryReady: boolean; checkedAt: number } | undefined;
+      let silentRevision: { cause: TransientRecoveryError; needsRebuild: boolean; checkedAt: number } | undefined;
       const chargeSilentRecovery = (): void => {
         if (!silentRevision?.needsRebuild) return;
         const now = Date.now();
@@ -3781,20 +3781,10 @@ export class CodexExecutor implements Executor {
           try {
             const stopped = await routeSilentInterruption();
             if (stopped) return stopped;
-            // An owner replacement inherits the rebuild requirement, not the old allowance.
-            if (humanRevision && silentRevision?.needsRebuild && !silentRevision.retryReady) {
-              const cause = silentRevision.cause;
-              try { await ctx.retryPlanRevisionTurn!(cause); }
-              catch (rejected) {
-                if (rejected === cause) throw cause.originalIdle ?? cause;
-                throw rejected;
-              } finally { chargeSilentRecovery(); }
-              silentRevision.retryReady = true;
-            }
-            // Debit the allowance before reconstruction, including credential failures.
+            // Recovery carries measured-silence readiness into an owner replacement.
+            // Debit its allowance before every reconstruction, including credential failures.
             if (humanRevision) await ctx.beforePlanRevisionTurn?.();
             if (humanRevision && silentRevision?.needsRebuild) {
-              silentRevision.retryReady = false;
               await recreateEpochAfterReap();
               chargeSilentRecovery();
               silentRevision.needsRebuild = false;
@@ -3808,7 +3798,7 @@ export class CodexExecutor implements Executor {
             }
             let cause = error;
             if (humanRevision && error instanceof TransientRecoveryError && error.zeroEvidenceIdle) {
-              silentRevision = { cause: error, needsRebuild: true, retryReady: false, checkedAt: Date.now() };
+              silentRevision = { cause: error, needsRebuild: true, checkedAt: Date.now() };
               // Persist already happened in the measured-idle branch. Dispose before
               // the hook, even when it will restore the exhausted owner gate.
               await this.withCaptureOwnership(async () => {
@@ -3823,6 +3813,10 @@ export class CodexExecutor implements Executor {
                 (error instanceof CodexCredentialDeferredError || error instanceof CodexInitialCredentialUnavailableError)) {
               // Includes half-built replacement registries, not just the predecessor.
               if (this.unverifiedEpochRegistries.size) throw new EpochCleanupUnprovenError(epoch!.safety);
+              // Failed construction cleanup can itself spend the wall. Route it
+              // before another backoff or an exhausted owner wait.
+              const stopped = await routeSilentInterruption();
+              if (stopped) return stopped;
               cause = silentRevision.cause;
             }
             if (!humanRevision || !(cause instanceof TransientRecoveryError) ||
@@ -3830,7 +3824,6 @@ export class CodexExecutor implements Executor {
             if (!ctx.retryPlanRevisionTurn) throw cause.zeroEvidenceIdle ? cause.originalIdle ?? cause : cause;
             try {
               await ctx.retryPlanRevisionTurn(cause);
-              if (silentRevision?.needsRebuild) silentRevision.retryReady = true;
             } catch (rejected) {
               // Only identity rejection denotes unsupported recovery. Controls and
               // replacement-revise exceptions must retain their own routing.
@@ -4962,6 +4955,9 @@ export class CodexExecutor implements Executor {
       const fileopRoot = await launchRegisteredEffectRoot(
         registry,
         async (spec, deadlineMs) => {
+          await this.epochSourceAdmission?.();
+          this.assertCaptureAdmission(revision);
+          this.epochAdmission?.();
           const handle = await launchEffectRoot(spec, deadlineMs);
           return {
             get started() { return handle.started; },

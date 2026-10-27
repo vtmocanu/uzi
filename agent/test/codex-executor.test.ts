@@ -66,6 +66,7 @@ import { makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from ".
 import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
+import { PlanRevisionRecovery } from "../src/plan-revision-retry.js";
 import { WORKER_UID, RUNNER_UID, runnerCommand, commandRootCommand } from "../src/runner-uid.js";
 import { gitEnv } from "../src/git.js";
 import { forgeToolNames } from "../src/forge-tools.js";
@@ -18216,8 +18217,356 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } finally { rig.transport.end(); t.mock.timers.reset(); }
   });
 
-  for (const mode of ["redrive", "replacement", "cancel", "reject"] as const)
-    it(`3466 real runner revision silence ${mode} preserves the negotiated source and receipts`, async () => {
+  // The first turn publishes a plan; the human revision produces no model event.
+  function silentRevisionRig() {
+    const rig = makeMultiEpochRig([c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) c.transport.push(threadStarted())
+          .push(toolCall(1, "submit_plan", { plan_md: "initial" }, "th-1", "tn-1", "plan"))
+          .push(turnCompleted("completed"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    }, epochResponder("th-1", "tn-1", transport => transport
+      .push(toolCall(2, "submit_plan", { plan_md: "revised" }, "th-1", "tn-1", "revised"))
+      .push(turnCompleted("completed")))]);
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 100000, initialCredentialAttempts: 1 };
+    return rig;
+  }
+
+  function revisionContext(overrides: Partial<RunContext> = {}) {
+    let gates = 0;
+    return makeCtx({ planApproved: false, approvedPlan: undefined, config: { plan_max_revisions: 1 },
+      gatePlan: async () => ++gates === 1 ? { kind: "revise", feedback: "change", inputId: 11 }
+        : { kind: "reject", reason: "test complete" }, ...overrides }).ctx;
+  }
+
+  for (const fallback of ["absent hook", "unnegotiated", "inactive", "idless"] as const)
+    it(`3466 ${fallback} preserves the original idle failure`, async t => {
+      const rig = silentRevisionRig();
+      let original: Error | undefined;
+      const recovery = new PlanRevisionRecovery({ generation: 1,
+        ownership: async () => ({ status: "running", claim_generation: 1, gate_revision: 1, claim_released: false }),
+        signal: () => new AbortController().signal, checkControl: () => {}, notice: async () => {},
+        steering: { takeRevisionRecoveryControl: () => undefined,
+          awaitRevisionRecoveryEvent: async () => { throw new Error("unsupported recovery waited"); },
+          retirePersistedRevision: () => {}, setGateRevision: () => {} },
+      });
+      if (fallback === "idless") {
+        recovery.seed({ status: "awaiting_approval", plan_md: "initial" }, 1, async () => ({ applied: true }));
+        recovery.accept({ kind: "revise", feedback: "change", inputId: 11, sourceGateRevision: 1 });
+      }
+      const ctx = revisionContext(fallback === "absent hook" ? {} : {
+        retryPlanRevisionTurn: async cause => {
+          assert.ok(cause instanceof TransientRecoveryError && cause.zeroEvidenceIdle);
+          original = cause.originalIdle;
+          if (fallback === "unnegotiated") throw cause;
+          await recovery.retry(cause);
+        },
+      });
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const trip = executor["tripError"].bind(executor);
+      executor["tripError"] = (...args) => {
+        const error = trip(...args);
+        if (error.message === "codex run idle timeout") original = error;
+        return error;
+      };
+      const dispose = rig.epochs[0]!.root.dispose!;
+      rig.epochs[0]!.root.dispose = async (...args) => {
+        assert.ok(rig.sessionOps.persist > 0, "session persisted before idle disposal");
+        return dispose(...args);
+      };
+      const running = executor.run(ctx);
+      void running.catch(() => undefined);
+      try {
+        await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+        await tick(); t.mock.timers.tick(100);
+        await assert.rejects(running, (error: unknown) => {
+          assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
+          assert.equal(error.message, "codex run idle timeout");
+          assert.equal(error, original);
+          return true;
+        });
+        assert.equal(rig.providerLaunches(), 1);
+        assert.equal(rig.client.releaseCalls.length, 1);
+        assert.ok(rig.epochs[0]!.disposed() > 0);
+      } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+    });
+
+  for (const control of ["source", "claim", "cancel", "pause", "wall"] as const)
+    for (const boundary of ["teardown", "backoff", "credential", "effect"] as const)
+    it(`3466 ${control} at ${boundary} prevents replacement admission`, async t => {
+      const rig = silentRevisionRig();
+      let cancelled = false, paused = false, stopped = false, retries = 0, parks = 0;
+      let released = 0, effects = 0;
+      const sourceError = new Error("source gate lost");
+      const controller = new AbortController();
+      const stop = () => {
+        stopped = true;
+        if (control === "cancel") cancelled = true;
+        if (control === "pause") { paused = true; controller.abort(new PauseNowSignal()); }
+        if (control === "wall") t.mock.timers.tick(100000);
+      };
+      const dispose = rig.epochs[0]!.root.dispose!;
+      rig.epochs[0]!.root.dispose = async (...args) => {
+        await dispose(...args);
+        if (boundary === "teardown") stop();
+      };
+      const release = rig.client.releaseCodex.bind(rig.client);
+      rig.client.releaseCodex = async (...args) => {
+        released++;
+        if (released === 2 && boundary === "credential") stop();
+        return release(...args);
+      };
+      const effect = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, launchEffectRoot: async (...args) => { effects++; return effect(...args); } };
+      const ctx = revisionContext({
+        signal: controller.signal, cancelRequested: () => cancelled, pauseModeRequested: () => paused ? "now" : null,
+        claimFenced: () => control === "claim" && stopped,
+        beforePlanRevisionTurn: async () => {
+          if (rig.epochs[0]!.disposed() === 0) return;
+          // A probe after credential release is the final effect-root admission fence.
+          if (boundary === "effect" && released === 2) stop();
+          if (stopped && control === "source") throw sourceError;
+        },
+        retryPlanRevisionTurn: async () => {
+          retries++;
+          assert.ok(rig.epochs[0]!.disposed() > 0, "disposal precedes backoff");
+          if (boundary === "backoff") stop();
+        },
+        parkForWall: async () => { parks++; return "parked"; },
+      });
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      void running.catch(() => undefined);
+      try {
+        await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+        await tick(); t.mock.timers.tick(100);
+        if (control === "wall") {
+          const result = await running;
+          assert.equal(result.walled?.reason, "codex run wall-clock timeout");
+          assert.equal(parks, 1);
+        } else await assert.rejects(running, (error: unknown) => {
+          if (control === "source") assert.equal(error, sourceError);
+          else if (control === "claim") assert.ok(error instanceof CodexRequestFailure && error.kind === "parent_abort");
+          else if (control === "pause") assert.ok(error instanceof PauseNowSignal);
+          else assert.equal((error as Error).message, "run cancelled");
+          return true;
+        });
+        assert.equal(rig.providerLaunches(), 1);
+        assert.equal(released, boundary === "credential" || boundary === "effect" ? 2 : 1);
+        assert.equal(effects, 1, "no replacement effect root after lost authority");
+        assert.equal(retries, boundary === "teardown" && control !== "source" && control !== "claim" ? 0 : 1);
+      } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+    });
+
+  for (const failure of ["vault", "unavailable"] as const)
+    for (const replacement of [false, true])
+    it(`3466 replacement ${failure} consumes three allowances before construction; owner replacement=${replacement}`, async t => {
+      const rig = silentRevisionRig();
+      let attempts = 0, retries = 0, probes = 0, expirations = 0;
+      const waits: number[] = [], notices: string[] = [];
+      const release = rig.client.releaseCodex.bind(rig.client);
+      rig.client.releaseCodex = async (...args) => {
+        attempts++;
+        if (attempts > 1) {
+          assert.equal(notices.filter(text => text.includes("re-driving the failed turn")).length,
+            attempts - 1, "allowance spent before every credential construction attempt");
+          throw new RequestError("POST", "/release", failure === "vault" ? 409 : 503,
+            failure === "vault" ? JSON.stringify({ reason: "vault_locked" }) : "unavailable");
+        }
+        return release(...args);
+      };
+      const recovery = new PlanRevisionRecovery({ generation: 1,
+        ownership: async () => { probes++; return { status: "running", claim_generation: 1, gate_revision: 1, claim_released: false }; },
+        signal: () => new AbortController().signal, checkControl: () => {}, notice: async text => { notices.push(text); },
+        policy: { random: () => 0, sleep: async (ms, signal) => {
+          waits.push(ms);
+          if (ms === 30000) return new Promise<void>((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+          t.mock.timers.tick(ms);
+        } },
+        steering: { takeRevisionRecoveryControl: () => undefined,
+          awaitRevisionRecoveryEvent: async () => replacement && ++expirations === 1
+            ? { kind: "revise", feedback: "replacement J", inputId: 12, sourceGateRevision: 1 }
+            : { kind: "reject", reason: "exhausted", sourceGateRevision: 1 },
+          retirePersistedRevision: () => assert.fail("pending revision retired"), setGateRevision: () => {} },
+      });
+      recovery.seed({ status: "awaiting_approval", plan_md: "initial", presentation_id: "source" }, 1,
+        async () => ({ applied: true, status: "awaiting_approval", gateRevision: 1 }));
+      recovery.accept({ kind: "revise", feedback: "change", inputId: 11, sourceGateRevision: 1 });
+      const ctx = revisionContext({ beforePlanRevisionTurn: () => recovery.beforeTurn(),
+        retryPlanRevisionTurn: async cause => { retries++; await recovery.retry(cause); } });
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      void running.catch(() => undefined);
+      try {
+        await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+        await tick(); t.mock.timers.tick(100);
+        await assert.rejects(running, PlanRejectedError);
+        assert.equal(attempts, replacement ? 7 : 4, "initial credential plus three charged constructions per revision");
+        assert.equal(retries, replacement ? 7 : 4, "each exhausted allowance expires without construction");
+        assert.equal(rig.providerLaunches(), 1);
+        assert.equal(waits.filter(ms => ms !== 30000).reduce((a, b) => a + b, 0), replacement ? 65000 : 35000);
+        if (replacement) assert.deepEqual(recovery.fields(12).superseded_revision_input_ids, [11]);
+        assert.ok(probes > 3, "admission revalidates repeatedly without spending twice");
+        assert.match(notices.at(-1)!, /retry allowance exhausted/);
+      } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+    });
+
+  it("3466 source is proved after the last disposal even without a capture revision", async t => {
+    const rig = silentRevisionRig();
+    let disposals = 0, proofsAfterLastDisposal = 0, retries = 0;
+    const lost = new Error("source changed during final disposal");
+    const wire = rig.deps.wireFileop!;
+    rig.deps = { ...rig.deps, wireFileop: (...args) => {
+      const handle = wire(...args);
+      return { ...handle, dispose: async () => { await handle.dispose(); disposals++; } };
+    } };
+    const ctx = revisionContext({ beforePlanRevisionTurn: async () => {
+      if (disposals >= 2) { proofsAfterLastDisposal++; throw lost; }
+    }, retryPlanRevisionTurn: async () => { retries++; } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+      await tick(); t.mock.timers.tick(100);
+      await assert.rejects(running, error => error === lost);
+      assert.equal(proofsAfterLastDisposal, 1);
+      assert.equal(retries, 1);
+      assert.equal(rig.client.releaseCalls.length, 1);
+      assert.equal(rig.providerLaunches(), 1);
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  it("3466 teardown, backoff and admission consume the same remaining wall", async t => {
+    const rig = silentRevisionRig();
+    rig.deps = { ...rig.deps, wallMs: 1000 };
+    const dispose = rig.epochs[0]!.root.dispose!;
+    rig.epochs[0]!.root.dispose = async (...args) => { await dispose(...args); t.mock.timers.tick(300); };
+    let probed = false, retries = 0, parks = 0;
+    const ctx = revisionContext({ beforePlanRevisionTurn: async () => {
+      if (rig.epochs[0]!.disposed() && !probed) { probed = true; t.mock.timers.tick(300); }
+    }, retryPlanRevisionTurn: async () => { retries++; t.mock.timers.tick(300); },
+    parkForWall: async () => { parks++; return "parked"; } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+      await tick(); t.mock.timers.tick(100);
+      const result = await running;
+      assert.equal(result.walled?.reason, "codex run wall-clock timeout");
+      assert.equal(retries, 1);
+      assert.equal(parks, 1);
+      assert.equal(rig.client.releaseCalls.length, 1);
+      assert.equal(rig.providerLaunches(), 1);
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  it("3466 spent wall during failed replacement cleanup precedes retry and owner wait", async t => {
+    const rig = silentRevisionRig();
+    const wire = rig.deps.wireFileop!;
+    const effect = rig.deps.launchEffectRoot!;
+    let wires = 0, effects = 0, retries = 0, parks = 0;
+    rig.deps = { ...rig.deps, wireFileop: (...args) => {
+      if (++wires === 2) throw new CodexCredentialDeferredError();
+      return wire(...args);
+    }, launchEffectRoot: async (...args) => {
+      const handle = await effect(...args);
+      if (++effects === 1) return handle;
+      return { ...handle, dispose: async (...disposeArgs) => {
+        const result = await handle.dispose(...disposeArgs);
+        t.mock.timers.tick(100000);
+        return result;
+      } };
+    } };
+    const ctx = revisionContext({ retryPlanRevisionTurn: async () => { retries++; },
+      parkForWall: async () => { parks++; return "parked"; } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+      await tick(); t.mock.timers.tick(100);
+      assert.equal((await running).walled?.reason, "codex run wall-clock timeout");
+      assert.equal(retries, 1, "spent cleanup cannot enter another backoff or owner wait");
+      assert.equal(parks, 1);
+      assert.equal(rig.providerLaunches(), 1);
+      assert.equal(rig.client.releaseCalls.length, 2);
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const failure of ["predecessor", "half-built"] as const)
+    it(`3466 unverified ${failure} cleanup is terminal and evicts released credentials`, async t => {
+      const rig = silentRevisionRig();
+      let retries = 0, wires = 0;
+      const diagnostics = recordingLog();
+      if (failure === "predecessor") rig.epochs[0]!.root.dispose = async () => { throw new Error("disposal unverified"); };
+      else {
+        const wire = rig.deps.wireFileop!;
+        const effect = rig.deps.launchEffectRoot!;
+        let effects = 0;
+        rig.deps = { ...rig.deps,
+          launchEffectRoot: async (...args) => {
+            const handle = await effect(...args);
+            if (++effects === 1) return handle;
+            return { ...handle, dispose: async () => ({ clean: false, reason: "fixture cleanup unverified" }) };
+          },
+          wireFileop: (...args) => {
+            if (++wires === 2) throw new CodexCredentialDeferredError();
+            return wire(...args);
+          },
+        };
+      }
+      const ctx = revisionContext({ retryPlanRevisionTurn: async () => { retries++; } });
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION), diagnostics.log).run(ctx);
+      void running.catch(() => undefined);
+      try {
+        await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+        await tick(); t.mock.timers.tick(100);
+        await assert.rejects(running, (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.ok(error instanceof EpochCleanupUnprovenError);
+          return true;
+        });
+        assert.equal(retries, failure === "predecessor" ? 0 : 1);
+        assert.equal(rig.client.releaseCalls.length, failure === "predecessor" ? 1 : 2);
+        assert.equal(rig.providerLaunches(), 1);
+        assert.ok(diagnostics.added.includes(FRESH_TOKEN));
+        assert.equal(diagnostics.added.filter(token => token === FRESH_TOKEN).length,
+          diagnostics.removed.filter(token => token === FRESH_TOKEN).length, "every released credential is evicted");
+      } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+    });
+
+  it("3466 a human revision with model evidence keeps the terminal idle contract", async t => {
+    const rig = silentRevisionRig();
+    let retries = 0;
+    const ctx = revisionContext({ retryPlanRevisionTurn: async () => { retries++; } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+      rig.epochs[0]!.transport.push(agentMessage("Working on your revision"));
+      await tick(); t.mock.timers.tick(100);
+      await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
+        assert.equal(error.message, "codex run idle timeout");
+        return true;
+      });
+      assert.equal(retries, 0);
+      assert.equal(rig.providerLaunches(), 1);
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const mode of ["redrive", "replacement", "cancel", "reject", "unnegotiated"] as const)
+    it(`3466 real runner revision silence ${mode} preserves the negotiated source and receipts`, async t => {
     const api = new FakeApi("revision-idle-worker");
     api.planRevisionRetries = true;
     api.gateRevisions = true;
@@ -18236,14 +18585,16 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         return { turn: { id: "tn-1" } };
       }
       return {};
-    }, epochResponder("th-1", "tn-1", transport => transport
+    }, ...(mode === "redrive" ? [] : Array.from({ length: 3 }, () => epochResponder("th-1", "tn-1", () => {}))),
+    epochResponder("th-1", "tn-1", transport => transport
       .push(toolCall(2, "submit_plan", { plan_md: "# Revised plan" }, "th-1", "tn-1", "revised"))
       .push(turnCompleted("completed")))]);
     rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000, deferRegistryTeardown: true };
     const client = new WorkerClient(url, "revision-idle-worker", "test", diagnostics.log, {
       sleep: async () => {}, terminalRetrySchedule: [1, 1],
     });
-    client.protocolFeatures = ["claim_generation_fence", "gate_revision_v1", "plan_revision_retry_v1"];
+    client.protocolFeatures = ["claim_generation_fence", "gate_revision_v1",
+      ...(mode === "unnegotiated" ? [] : ["plan_revision_retry_v1"])];
     const claim = makeClaim({
       repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
       claim_generation: 1, auto_approve: false, plan_approved: false, config: { plan_max_revisions: 1 },
@@ -18259,22 +18610,28 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     });
     let revisions = 0, retries = 0, expired = 0;
     const waits: number[] = [];
+    const feedback: unknown[] = [], notices: string[] = [];
     const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
     const run = executor.run.bind(executor);
     executor.run = async ctx => {
       const gate = ctx.gatePlan!;
       const retry = ctx.retryPlanRevisionTurn!;
-      const emit = ctx.emit;
-      ctx.emit = message => {
-        emit(message);
-        if (message.kind !== "status" || !String(rec(message.payload).text).includes("retry allowance exhausted")) return;
-        expired++;
-        assert.equal(api.isApplied(claim.run_id, 1), false);
-        assert.ok(rig.epochs[0]!.disposed() > 0, "exhausted gate is offered only after disposal");
-        assert.equal(rig.providerLaunches(), 1);
-        api.setInputs(claim.run_id, [{ id: 2,
-          kind: mode === "replacement" ? "revise_plan" : mode === "reject" ? "reject_plan" : "cancel",
-          body: mode === "replacement" ? "replacement J" : "stop" }]);
+      const postMessages = client.postMessages.bind(client);
+      client.postMessages = async (...args) => {
+        await postMessages(...args);
+        for (const message of args[1]) {
+          if (message.kind === "plan_feedback") feedback.push(rec(message.payload).feedback);
+          if (message.kind === "status") notices.push(String(rec(message.payload).text));
+          if (message.kind !== "status" || !String(rec(message.payload).text).includes("retry allowance exhausted")) continue;
+          expired++;
+          assert.equal(api.isApplied(claim.run_id, 1), false);
+          assert.ok(rig.epochs[0]!.disposed() > 0, "exhausted gate is offered only after disposal");
+          assert.equal(rig.providerLaunches(), 4);
+          assert.ok(rig.epochs.slice(0, 4).every(epoch => epoch.disposed() > 0), "all silent epochs disposed");
+          api.setInputs(claim.run_id, [{ id: 2,
+            kind: mode === "replacement" ? "revise_plan" : mode === "reject" ? "reject_plan" : "cancel",
+            body: mode === "replacement" ? "replacement J" : "stop" }]);
+        }
       };
       ctx.gatePlan = async (...args) => {
         const verdict = await gate(...args);
@@ -18292,9 +18649,9 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     };
     try {
       const git = new GitCache(fx.dataDir, diagnostics.log, undefined, testGitCacheOptions());
-      await new RunRunner(client, git, () => ({ executor }), diagnostics.log, 20, undefined, {
+      const runner = new RunRunner(client, git, () => ({ executor }), diagnostics.log, 20, undefined, {
         pollMs: 5,
-        planRevisionRetryPolicy: { redrives: mode === "redrive" ? 3 : 0, random: () => 0,
+        planRevisionRetryPolicy: { redrives: 3, random: () => 0,
           sleep: async (ms, signal) => {
             signal.throwIfAborted(); waits.push(ms);
             if (ms === 30000) await new Promise<void>((resolve, reject) => {
@@ -18306,25 +18663,67 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
           process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
           docker: { state: "not_wired", removed: [], detail: "not wired" },
         }),
-      }).execute(claim);
+      });
+      const stop = () => runner.shutdown();
+      t.signal.addEventListener("abort", stop, { once: true });
+      const running = runner.execute(claim);
+      try {
+        await withTimeout(running, 8000, `revision silence ${mode}`);
+      } catch (error) {
+        t.diagnostic(diagnostics.lines.join("\n"));
+        throw error;
+      } finally {
+        stop();
+        t.signal.removeEventListener("abort", stop);
+        for (const epoch of rig.epochs) epoch.transport.end();
+        await withTimeout(running, 3000, "revision runner teardown");
+      }
       const states = api.states.filter(s => s.runId === claim.run_id).map(s => s.body);
       const revised = states.find(s => s.plan_md === "# Revised plan");
       const publishes = mode === "redrive" || mode === "replacement";
+      if (mode === "unnegotiated") {
+        assert.equal(retries, 1);
+        assert.equal(expired, 0);
+        assert.equal(rig.providerLaunches(), 1);
+        assert.equal(rig.client.releaseCalls.length, 1);
+        assert.ok(rig.sessionOps.persist > 0);
+        assert.ok(rig.epochs[0]!.disposed() > 0);
+        assert.equal(api.isApplied(claim.run_id, 1), false);
+        assert.equal(states.filter(state => state.status === "awaiting_approval").length, 1);
+        assert.equal(states.filter(state => state.status === "failed").length, 1);
+        assert.equal(states.at(-1)?.status, "failed", "terminal report closes the source gate");
+        assert.equal(states.at(-1)?.failure_reason, "codex run idle timeout");
+        assert.ok(!states.some(state => state.status === "recovery_wait"));
+        return;
+      }
+      const failed = rig.epochs[0]!.transport.requests.filter(r => r.method === "turn/start").at(-1)!;
+      if (mode !== "redrive") {
+        for (const epoch of rig.epochs.slice(1, 4)) {
+          const turns = epoch.transport.requests.filter(r => r.method === "turn/start");
+          assert.equal(turns.length, 1);
+          assert.deepEqual(turns[0]!.params, failed.params, "each silent redrive retains the exact prompt");
+        }
+        assert.equal(waits.filter(ms => ms !== 30000).reduce((sum, ms) => sum + ms, 0), 35000);
+      }
+      assert.deepEqual(feedback, mode === "replacement" ? ["tighten the scope", "replacement J"] : ["tighten the scope"]);
+      assert.equal(notices.filter(text => text.includes("re-driving the failed turn")).length,
+        mode === "redrive" ? 1 : mode === "replacement" ? 4 : 3);
       assert.equal(revisions, 1);
-      assert.equal(retries, 1, diagnostics.lines.join("\n"));
+      assert.equal(retries, mode === "redrive" ? 1 : 4, diagnostics.lines.join("\n"));
       assert.equal(expired, mode === "redrive" ? 0 : 1, diagnostics.lines.join("\n"));
-      assert.equal(rig.providerLaunches(), publishes ? 2 : 1, diagnostics.lines.join("\n"));
+      assert.equal(rig.providerLaunches(), mode === "redrive" ? 2 : mode === "replacement" ? 5 : 4,
+        diagnostics.lines.join("\n"));
       assert.equal(rig.epochs[0]!.transport.turnStartCount, 2);
       assert.equal(states.filter(s => s.status === "awaiting_approval").length, publishes ? 2 : 1);
       assert.equal(Boolean(revised), publishes, diagnostics.lines.join("\n"));
       assert.equal(api.isApplied(claim.run_id, 1), publishes);
+      if (!publishes) assert.equal(api.isInputSuperseded(claim.run_id, 1), false);
       if (revised) {
         assert.equal(revised.revision_input_id, mode === "replacement" ? 2 : 1);
         assert.equal(revised.expected_gate_revision, 1);
         assert.deepEqual(revised.superseded_revision_input_ids, mode === "replacement" ? [1] : []);
         assert.equal(api.isInputSuperseded(claim.run_id, 1), mode === "replacement");
-        const failed = rig.epochs[0]!.transport.requests.filter(r => r.method === "turn/start").at(-1)!;
-        const retried = rig.epochs[1]!.transport.requests.find(r => r.method === "turn/start")!;
+        const retried = rig.epochs[mode === "redrive" ? 1 : 4]!.transport.requests.find(r => r.method === "turn/start")!;
         if (mode === "redrive") {
           assert.deepEqual(retried.params, failed.params);
           assert.equal(waits.reduce((sum, ms) => sum + ms, 0), 5000);

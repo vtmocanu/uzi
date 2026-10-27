@@ -176,6 +176,12 @@ export class PlanRevisionRecovery {
       await this.confirmSource(a); // a taken J remains pending if this check cannot complete
       this.predecessors.push(a.id);
       this.accept(verdict);
+      if (this.active && a.cause instanceof TransientRecoveryError && a.cause.zeroEvidenceIdle) {
+        // The replacement still needs a fresh epoch. Charge its first construction
+        // at beforeTurn(), without retrying or restoring the exhausted predecessor.
+        this.active.cause = a.cause;
+        this.active.redriveReady = true;
+      }
       throw new PlanRevisionReplacedError(verdict);
     }
   }

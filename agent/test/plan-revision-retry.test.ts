@@ -184,6 +184,35 @@ describe("live-flight plan revision recovery", () => {
     assert.deepEqual(f.retired, []);
   });
 
+  for (const silence of [false, true]) it(`3466 owner replacement charges first rebuild only for measured silence=${silence}`, async () => {
+    const f = fixture(3);
+    const cause = new TransientRecoveryError("exhausted revision", silence
+      ? { zeroEvidenceIdle: true, originalIdle: new Error("codex run idle timeout") }
+      : { providerOrigin: true });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await f.recovery.retry(cause);
+      await f.recovery.beforeTurn();
+    }
+    f.setEvent({ kind: "revise", inputId: 102, sourceGateRevision: 11, feedback: "J" });
+    await assert.rejects(f.recovery.retry(cause), PlanRevisionReplacedError);
+    const before = f.notices.length;
+    const slept = [...f.sleeps];
+    await f.recovery.beforeTurn();
+    await f.recovery.beforeTurn();
+    assert.equal(f.notices.length, before + Number(silence), "repeated admission probes charge once");
+    if (silence) assert.match(f.notices.at(-1)!, /revision 102; re-driving the failed turn \(1\/3\)/);
+    assert.equal(f.sleeps.filter(ms => ms !== 30000).reduce((sum, ms) => sum + ms, 0), 35000);
+    assert.deepEqual(f.sleeps, slept, "replacement admission does not invoke retry backoff");
+    for (let attempt = Number(silence); attempt < 3; attempt++) {
+      await f.recovery.retry(cause);
+      await f.recovery.beforeTurn();
+    }
+    f.setEvent({ kind: "reject", reason: "stop", sourceGateRevision: 11 });
+    await assert.rejects(f.recovery.retry(cause), PlanRejectedError);
+    assert.deepEqual(f.recovery.fields(102).superseded_revision_input_ids, [101]);
+    assert.deepEqual(f.retired, []);
+  });
+
   it("restores the original presentation after clarification and defers I supersession until J persistence", async () => {
     const f = fixture();
     f.setOwner({ status: "running", claim_generation: 7, gate_revision: 11, claim_released: false });
