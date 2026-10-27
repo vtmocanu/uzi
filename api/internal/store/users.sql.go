@@ -190,6 +190,165 @@ func (q *Queries) CreateUserOIDC(ctx context.Context, arg CreateUserOIDCParams) 
 	return i, err
 }
 
+const enrollUser = `-- name: EnrollUser :one
+INSERT INTO users (email, password_hash, display_name, is_admin, vault_mode)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, vault_mode, vault_epoch
+`
+
+type EnrollUserParams struct {
+	Email        string      `json:"email"`
+	PasswordHash pgtype.Text `json:"password_hash"`
+	DisplayName  pgtype.Text `json:"display_name"`
+	IsAdmin      bool        `json:"is_admin"`
+	VaultMode    string      `json:"vault_mode"`
+}
+
+// Production enrollment supplies the mode read under settings admission.
+// CreateUser retains the protected schema default for fixture callers.
+func (q *Queries) EnrollUser(ctx context.Context, arg EnrollUserParams) (User, error) {
+	row := q.db.QueryRow(ctx, enrollUser,
+		arg.Email,
+		arg.PasswordHash,
+		arg.DisplayName,
+		arg.IsAdmin,
+		arg.VaultMode,
+	)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.PasswordHash,
+		&i.DisplayName,
+		&i.IsAdmin,
+		&i.IsActive,
+		&i.TokenVersion,
+		&i.CreatedAt,
+		&i.LastLogin,
+		&i.DefaultModel,
+		&i.AutopilotEnabled,
+		&i.Theme,
+		&i.SlackMemberID,
+		&i.SlackNotify,
+		&i.SlackResolvedID,
+		&i.SlackLinkConfirmedAt,
+		&i.OidcIssuer,
+		&i.OidcSubject,
+		&i.JudgeEnabled,
+		&i.JudgeAnthropicSecretID,
+		&i.WaitOnLimit,
+		&i.CiAutofixEnabled,
+		&i.SidebarTokenIds,
+		&i.JudgeModel,
+		&i.SummaryModel,
+		&i.EphemeralWorkersEnabled,
+		&i.DefaultEffort,
+		&i.MrReworkEnabled,
+		&i.AttributionEnabled,
+		&i.NotifyEarlyLimitReset,
+		&i.SchedulesPaused,
+		&i.SchedulesPausedUntil,
+		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
+		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
+		&i.DefaultClaudeModel,
+		&i.DefaultCodexModel,
+		&i.DefaultCodexEffort,
+		&i.EphemeralDockerEnabled,
+		&i.PlanCrossCheckEnabled,
+		&i.NowSummaryEnabled,
+		&i.CodeCrossCheckEnabled,
+		&i.CodexJudgeModel,
+		&i.VaultMode,
+		&i.VaultEpoch,
+	)
+	return i, err
+}
+
+const enrollUserOIDC = `-- name: EnrollUserOIDC :one
+INSERT INTO users (email, password_hash, display_name, is_admin, oidc_issuer, oidc_subject, vault_mode)
+VALUES ($1, NULL, $2, $3, $4, $5, $6)
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, vault_mode, vault_epoch
+`
+
+type EnrollUserOIDCParams struct {
+	Email       string      `json:"email"`
+	DisplayName pgtype.Text `json:"display_name"`
+	IsAdmin     bool        `json:"is_admin"`
+	OidcIssuer  pgtype.Text `json:"oidc_issuer"`
+	OidcSubject pgtype.Text `json:"oidc_subject"`
+	VaultMode   string      `json:"vault_mode"`
+}
+
+// Passwordless production enrollment; CreateUserOIDC retains its safe default.
+func (q *Queries) EnrollUserOIDC(ctx context.Context, arg EnrollUserOIDCParams) (User, error) {
+	row := q.db.QueryRow(ctx, enrollUserOIDC,
+		arg.Email,
+		arg.DisplayName,
+		arg.IsAdmin,
+		arg.OidcIssuer,
+		arg.OidcSubject,
+		arg.VaultMode,
+	)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.PasswordHash,
+		&i.DisplayName,
+		&i.IsAdmin,
+		&i.IsActive,
+		&i.TokenVersion,
+		&i.CreatedAt,
+		&i.LastLogin,
+		&i.DefaultModel,
+		&i.AutopilotEnabled,
+		&i.Theme,
+		&i.SlackMemberID,
+		&i.SlackNotify,
+		&i.SlackResolvedID,
+		&i.SlackLinkConfirmedAt,
+		&i.OidcIssuer,
+		&i.OidcSubject,
+		&i.JudgeEnabled,
+		&i.JudgeAnthropicSecretID,
+		&i.WaitOnLimit,
+		&i.CiAutofixEnabled,
+		&i.SidebarTokenIds,
+		&i.JudgeModel,
+		&i.SummaryModel,
+		&i.EphemeralWorkersEnabled,
+		&i.DefaultEffort,
+		&i.MrReworkEnabled,
+		&i.AttributionEnabled,
+		&i.NotifyEarlyLimitReset,
+		&i.SchedulesPaused,
+		&i.SchedulesPausedUntil,
+		&i.JudgeAnthropicBindMode,
+		&i.AppearanceMode,
+		&i.LightTheme,
+		&i.DarkTheme,
+		&i.Typeface,
+		&i.DefaultHarness,
+		&i.SidebarCodexAccountIds,
+		&i.DefaultClaudeModel,
+		&i.DefaultCodexModel,
+		&i.DefaultCodexEffort,
+		&i.EphemeralDockerEnabled,
+		&i.PlanCrossCheckEnabled,
+		&i.NowSummaryEnabled,
+		&i.CodeCrossCheckEnabled,
+		&i.CodexJudgeModel,
+		&i.VaultMode,
+		&i.VaultEpoch,
+	)
+	return i, err
+}
+
 const getUserAttributionEnabled = `-- name: GetUserAttributionEnabled :one
 SELECT attribution_enabled FROM users WHERE id = $1
 `

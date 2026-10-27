@@ -377,7 +377,7 @@ func (h *Handler) oidcSyncAdmin(ctx context.Context, user store.User, identity o
 }
 
 // createOIDCUserFirstAdmin is the passwordless sibling of createUserFirstAdmin
-// (review B2): the same advisory-locked check-and-insert, but via CreateUserOIDC
+// (review B2): the same advisory-locked check-and-insert, but via EnrollUserOIDC
 // (NULL password_hash) with the IdP identity attached. The admin decision (PRD #55
 // Decision 4): when useGroupAdmin is true (UZI_OIDC_ADMIN_GROUPS configured) the row
 // is created with IsAdmin=groupAdmin and the count==0 first-admin rule is disabled;
@@ -385,13 +385,26 @@ func (h *Handler) oidcSyncAdmin(ctx context.Context, user store.User, identity o
 // held in both branches, preserving the concurrent-JIT race handling.
 func (h *Handler) createOIDCUserFirstAdmin(r *http.Request, email string, displayName pgtype.Text, issuer, subject string, useGroupAdmin, groupAdmin bool) (store.User, error) {
 	ctx := r.Context()
-	tx, err := h.pool.Begin(ctx)
+	tx, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return store.User{}, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit
 
 	qtx := h.q.WithTx(tx)
+	// Admission precedes the registration guard and stays held through commit.
+	if err := qtx.LockSettingsAdmission(ctx); err != nil {
+		return store.User{}, err
+	}
+	// Read the authoritative policy in its own statement after admission.
+	policy, err := qtx.GetVaultPolicy(ctx)
+	if err != nil {
+		return store.User{}, err
+	}
+	mode := store.VaultModeProtected
+	if policy == "optional" {
+		mode = store.VaultModeUnprotected
+	}
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", store.RegistrationLockKey); err != nil {
 		return store.User{}, err
 	}
@@ -405,7 +418,8 @@ func (h *Handler) createOIDCUserFirstAdmin(r *http.Request, email string, displa
 		}
 		isAdmin = count == 0
 	}
-	user, err := qtx.CreateUserOIDC(ctx, store.CreateUserOIDCParams{
+	user, err := qtx.EnrollUserOIDC(ctx, store.EnrollUserOIDCParams{
+		VaultMode:   mode,
 		Email:       email,
 		DisplayName: displayName,
 		IsAdmin:     isAdmin,
@@ -487,7 +501,7 @@ func (h *Handler) setOIDCStateCookie(w http.ResponseWriter, data oidcStateData) 
 	if err != nil {
 		return err
 	}
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // G124: Secure follows the configured frontend origin; HTTP development is supported.
 		Name:     oidcStateCookieName,
 		Value:    base64.RawURLEncoding.EncodeToString(sealed),
 		Path:     oidcStateCookiePath,
@@ -501,7 +515,7 @@ func (h *Handler) setOIDCStateCookie(w http.ResponseWriter, data oidcStateData) 
 }
 
 func (h *Handler) clearOIDCStateCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // G124: deletion must retain the same origin-derived Secure attribute as creation.
 		Name:     oidcStateCookieName,
 		Value:    "",
 		Path:     oidcStateCookiePath,

@@ -6,6 +6,19 @@ INSERT INTO users (email, password_hash, display_name, is_admin)
 VALUES ($1, $2, $3, $4)
 RETURNING *;
 
+-- name: EnrollUser :one
+-- Production enrollment supplies the mode read under settings admission.
+-- CreateUser retains the protected schema default for fixture callers.
+INSERT INTO users (email, password_hash, display_name, is_admin, vault_mode)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING *;
+
+-- name: EnrollUserOIDC :one
+-- Passwordless production enrollment; CreateUserOIDC retains its safe default.
+INSERT INTO users (email, password_hash, display_name, is_admin, oidc_issuer, oidc_subject, vault_mode)
+VALUES ($1, NULL, $2, $3, $4, $5, $6)
+RETURNING *;
+
 -- name: GetUserByEmail :one
 SELECT * FROM users WHERE email = $1;
 

@@ -162,14 +162,15 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create + unlock the user's vault with the registration password (PRD #32).
+	// Create + unlock a protected user's vault with the registration password.
+	// Optional-policy enrollment starts off and creates no wrapped DEK.
 	// Deliberately AFTER the transaction commits: registration holds a
 	// pg_advisory_xact_lock, and the vault's Argon2 KEK derivation inside that lock
 	// would serialize all registrations. The vault row is created in its own
 	// statement here; a crash between user-create and vault-create is self-healing
 	// (the next login's first-unlock creates it). A failure is non-fatal, same as
 	// login — the account exists and the SPA will show the unlock banner.
-	if h.vault != nil {
+	if h.vault != nil && user.VaultMode == store.VaultModeProtected {
 		if err := h.vault.Unlock(r.Context(), user.ID, req.Password); err != nil {
 			slog.Error("vault unlock at register", "user", user.ID, "error", err)
 		} else if h.codexUsagePoker != nil {
@@ -189,13 +190,26 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 // check-and-insert in a single transaction.
 func (h *Handler) createUserFirstAdmin(r *http.Request, email, hash string, displayName pgtype.Text) (store.User, error) {
 	ctx := r.Context()
-	tx, err := h.pool.Begin(ctx)
+	tx, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return store.User{}, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit
 
 	qtx := h.q.WithTx(tx)
+	// Admission precedes the registration guard and stays held through commit.
+	if err := qtx.LockSettingsAdmission(ctx); err != nil {
+		return store.User{}, err
+	}
+	// Read the authoritative policy in its own statement after admission.
+	policy, err := qtx.GetVaultPolicy(ctx)
+	if err != nil {
+		return store.User{}, err
+	}
+	mode := store.VaultModeProtected
+	if policy == "optional" {
+		mode = store.VaultModeUnprotected
+	}
 
 	// Serialize registrations: the lock is held until the transaction ends,
 	// so the count-then-insert below is atomic across concurrent callers.
@@ -208,7 +222,8 @@ func (h *Handler) createUserFirstAdmin(r *http.Request, email, hash string, disp
 		return store.User{}, err
 	}
 
-	user, err := qtx.CreateUser(ctx, store.CreateUserParams{
+	user, err := qtx.EnrollUser(ctx, store.EnrollUserParams{
+		VaultMode:    mode,
 		Email:        email,
 		PasswordHash: pgtype.Text{String: hash, Valid: true},
 		DisplayName:  displayName,
@@ -304,7 +319,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	// must NOT block login (the session is valid); it can only be a corrupted row,
 	// so log loudly and return the session with the vault left locked (the SPA then
 	// shows the unlock banner). The error never carries the password or a secret.
-	if h.vault != nil {
+	if h.vault != nil && user.VaultMode == store.VaultModeProtected {
 		if err := h.vault.Unlock(r.Context(), user.ID, req.Password); err != nil {
 			slog.Error("vault unlock at login", "user", user.ID, "error", err)
 		} else if h.codexUsagePoker != nil {

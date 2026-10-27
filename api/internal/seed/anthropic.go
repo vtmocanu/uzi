@@ -9,9 +9,12 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // maxAnthropicTokenBytes bounds a seeded credential, mirroring
@@ -19,24 +22,47 @@ import (
 // tokens and console API keys.
 const maxAnthropicTokenBytes = 4096
 
-// SecretStore is the subset of *store.Queries the Anthropic-token seed needs.
-// Narrowing to an interface lets the seed be unit-tested against a fake store
-// without a live database, mirroring the forge seed's Store. ListUserSecretsMeta
-// (metadata only) is used for the create-only existence check so the seed never
-// fetches ciphertext it does not need.
+// SecretStore provides boot lookups and an atomic create-only token write.
 type SecretStore interface {
-	GetUserByEmail(ctx context.Context, email string) (store.User, error)
-	ListUserSecretsMeta(ctx context.Context, userID uuid.UUID) ([]store.ListUserSecretsMetaRow, error)
-	InsertUserSecret(ctx context.Context, arg store.InsertUserSecretParams) (store.InsertUserSecretRow, error)
+	GetUserByEmail(context.Context, string) (store.User, error)
+	ListUserSecretsMeta(context.Context, uuid.UUID) ([]store.ListUserSecretsMetaRow, error)
+	WithSecretTx(context.Context, func(SecretTx) error) error
 }
 
-// VaultSealer is the subset of *vault.Vault the seed needs: it seals the seeded
-// token under the seed admin's per-user DEK (PRD #32), the same primitive the
-// secrets handler uses. main boot-unlocks the seed admin's vault before this runs,
-// so Seal succeeds; if it did not, Seal returns vault.ErrLocked and the seed fails
-// loud (consistent with the other boot-fatal seed faults).
+// SecretTx holds the advisory guard and vault fence until the insert commits.
+type SecretTx interface {
+	LockSecretMutation(context.Context, uuid.UUID) error
+	FenceVaultWrite(context.Context, uuid.UUID, string, int64) (store.LockUserVaultStateRow, error)
+	ListUserSecretsMeta(context.Context, uuid.UUID) ([]store.ListUserSecretsMetaRow, error)
+	InsertUserSecret(context.Context, store.InsertUserSecretParams) (store.InsertUserSecretRow, error)
+}
+
+type postgresSecretStore struct {
+	*store.Queries
+	pool *pgxpool.Pool
+}
+
+// NewPostgresSecretStore supplies actual transaction-bound queries to the seed.
+func NewPostgresSecretStore(pool *pgxpool.Pool) SecretStore {
+	return &postgresSecretStore{Queries: store.New(pool), pool: pool}
+}
+
+func (s *postgresSecretStore) WithSecretTx(ctx context.Context, fn func(SecretTx) error) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
+	if err := fn(s.WithTx(tx)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// VaultSealer returns ciphertext and its durable mode/epoch snapshot.
+// The writer must fence that snapshot in the same transaction as persistence.
 type VaultSealer interface {
-	Seal(userID uuid.UUID, kind string, plaintext []byte) ([]byte, error)
+	Seal(context.Context, uuid.UUID, string, []byte, vault.SealPurpose) (vault.SealedMaterial, error)
 }
 
 // AnthropicToken seeds the seed admin's Anthropic token from
@@ -54,7 +80,7 @@ type VaultSealer interface {
 // the DB won't clobber it; only a fresh `down -v` re-seeds from the env.
 //
 // Failure stance: every failure here is either a DB fault (user lookup, list,
-// upsert) or a static operator misconfiguration (a malformed configured token),
+// insert) or a static operator misconfiguration (a malformed configured token),
 // both of which the codebase treats as boot-fatal (see loadSeedAdmin /
 // loadSeedForge). There is no network/outage condition to defer, so — unlike the
 // forge seed — nothing is swallowed.
@@ -89,28 +115,51 @@ func AnthropicToken(ctx context.Context, q SecretStore, sealer VaultSealer, cfg 
 		return fmt.Errorf("seed anthropic token: %w", err)
 	}
 
-	// DEK-seal under the seed admin's vault (unlocked at boot by main). The error
-	// carries no plaintext; vault.ErrLocked here means the boot-unlock did not run,
-	// which is a boot-fatal misconfiguration.
-	sealed, err := sealer.Seal(user.ID, store.KindAnthropicToken, []byte(token))
+	// Seal before opening the write transaction; a lifecycle change in between
+	// is refused by the mode/epoch fence, never retried with old material.
+	if sealer == nil {
+		return fmt.Errorf("seed anthropic token: seal: %w", vault.ErrNotConfigured)
+	}
+	sealed, err := sealer.Seal(ctx, user.ID, store.KindAnthropicToken, []byte(token), vault.SealForUse)
 	if err != nil {
 		return fmt.Errorf("seed anthropic token: seal: %w", err)
 	}
-
-	// A plain insert, not an upsert: the create-only check above already returned
-	// for a user who has any token of this kind, so there is nothing to conflict
-	// with. It seeds the operator's token as the DEFAULT, labelled 'default' — the
-	// same shape 00077 backfills onto pre-existing rows, so a seeded deployment and
-	// an upgraded one are indistinguishable from here on (PRD #104 M1).
-	if _, err := q.InsertUserSecret(ctx, store.InsertUserSecretParams{
-		UserID:      user.ID,
-		Kind:        store.KindAnthropicToken,
-		Label:       store.LabelDefaultSecret,
-		WantDefault: true,
-		Ciphertext:  sealed,
-		SealedWith:  store.SealedWithDEK,
+	inserted := false
+	if err := q.WithSecretTx(ctx, func(tx SecretTx) error {
+		if err := tx.LockSecretMutation(ctx, user.ID); err != nil {
+			return err
+		}
+		if _, err := tx.FenceVaultWrite(ctx, user.ID, sealed.Mode, sealed.Epoch); err != nil {
+			return err
+		}
+		// Recheck after serialization: a concurrent creator may have won since
+		// the cheap boot lookup. Any token of this kind makes seeding a no-op.
+		current, err := tx.ListUserSecretsMeta(ctx, user.ID)
+		if err != nil {
+			return err
+		}
+		for _, s := range current {
+			if s.Kind == store.KindAnthropicToken {
+				return nil
+			}
+		}
+		if _, err := tx.InsertUserSecret(ctx, store.InsertUserSecretParams{
+			UserID:      user.ID,
+			Kind:        store.KindAnthropicToken,
+			Label:       store.LabelDefaultSecret,
+			WantDefault: true,
+			Ciphertext:  sealed.Ciphertext,
+			SealedWith:  sealed.SealedWith,
+		}); err != nil {
+			return err
+		}
+		inserted = true
+		return nil
 	}); err != nil {
 		return fmt.Errorf("seed anthropic token: store: %w", err)
+	}
+	if !inserted {
+		return nil
 	}
 
 	slog.Info("seeded anthropic token", "email", cfg.SeedEmail)

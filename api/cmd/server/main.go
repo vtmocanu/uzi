@@ -19,13 +19,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/agentsource"
 	"github.com/vtmocanu/uzi/api/internal/anthropic"
-	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/codexusagepoller"
 	"github.com/vtmocanu/uzi/api/internal/config"
@@ -496,7 +494,7 @@ func run() error {
 	// Optional startup admin seed. Runs after migrations, before serving. A
 	// failure here (e.g. DB error) aborts boot; an already-present seed user is
 	// left untouched.
-	if err := seedAdmin(ctx, q, cfg); err != nil {
+	if err := seedAdmin(ctx, pool, cfg); err != nil {
 		return err
 	}
 	// Optional startup forge-connection seed for the seed admin. Runs after the
@@ -507,37 +505,28 @@ func run() error {
 	if err := seed.ForgeConnection(ctx, q, svc, cfg); err != nil {
 		return err
 	}
-	// Per-user vault (PRD #32): password-wrapped DEKs sealing each user's personal
-	// secrets. One instance, shared by the HTTP handlers (unlock at login, secret
-	// save) and — from M3 — the worker service (claim-time open), so a login on the
-	// API and a claim by the worker see one DEK cache. Built on the master box
-	// (which now seals only connection PATs + legacy master-sealed rows) and the store.
-	vlt := vault.New(box, q)
+	// Shared policy-aware credential vault: protected users use password-wrapped
+	// DEKs; unprotected users use the master box with owner/kind AAD. HTTP handlers
+	// and workers share this instance and its per-user DEK cache.
+	vlt := vault.NewPostgres(box, pool)
 	// Boot-unlock the seed admin so a headless deployment runs overnight autopilot
 	// from the first boot: the DEK cache is empty after every restart, and without
-	// this the seed admin would sit locked until an interactive login (defeating the
-	// bootstrap case). Fatal when seeding is configured — a seed admin whose vault
-	// cannot be unlocked at boot is a broken bootstrap, matching the other seed
+	// this a protected seed admin would sit locked until an interactive login.
+	// Off accounts skip unlock. A protected seed admin whose vault cannot be
+	// unlocked at boot is a broken bootstrap, matching the other seed
 	// steps' loud-on-misconfig stance. First boot creates the vault here; a later
 	// boot re-derives it and lazily rewraps any legacy master-sealed secret to the DEK.
-	if cfg.SeedEmail != "" {
-		seedUser, err := q.GetUserByEmail(ctx, cfg.SeedEmail)
-		if err != nil {
-			return fmt.Errorf("boot-unlock seed admin: look up %q: %w", cfg.SeedEmail, err)
-		}
-		if err := vlt.Unlock(ctx, seedUser.ID, cfg.SeedPassword); err != nil {
-			return fmt.Errorf("boot-unlock seed admin vault: %w", err)
-		}
-		slog.Info("boot-unlocked seed admin vault", "email", cfg.SeedEmail)
+	if err := seed.UnlockAdminVault(ctx, q, vlt, cfg); err != nil {
+		return err
 	}
 	// Optional startup Anthropic-token seed for the seed admin (dev convenience:
 	// survives `docker compose down -v` so the token need not be re-pasted). Runs
 	// after the admin seed (whose user it belongs to) and the boot-unlock (so it can
-	// DEK-seal). Create-only and format-checked only — it seeds the operator's
-	// EXISTING token, never mints a credential, never does a live/network check, and
-	// never logs the value. A DB error or a malformed configured token aborts boot;
+	// seal for its current mode). Create-only and format-checked only — it seeds
+	// the operator's EXISTING token, never mints a credential, never does a live
+	// network check, and never logs the value. A DB error or malformed token aborts boot;
 	// an already-present token is left untouched.
-	if err := seed.AnthropicToken(ctx, q, vlt, cfg); err != nil {
+	if err := seed.AnthropicToken(ctx, seed.NewPostgresSecretStore(pool), vlt, cfg); err != nil {
 		return err
 	}
 	// Optional startup Slack-settings seed (UZI_SEED_SLACK_*): create-only
@@ -1975,43 +1964,9 @@ func startRunCardMessage(err error) string {
 	}
 }
 
-// seedAdmin provisions the configured admin user if seeding is enabled and no
-// user with that email exists yet. It uses the exact same argon2id hashing as
-// registration and never touches an existing user's password. A concurrent
-// create (unique violation) is treated as "already exists".
-func seedAdmin(ctx context.Context, q *store.Queries, cfg config.Config) error {
-	if cfg.SeedEmail == "" {
-		return nil
-	}
-	if _, err := q.GetUserByEmail(ctx, cfg.SeedEmail); err == nil {
-		slog.Info("seed admin already present, leaving untouched", "email", cfg.SeedEmail)
-		return nil
-	} else if !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("seed admin lookup: %w", err)
-	}
-
-	hash, err := auth.HashPassword(cfg.SeedPassword)
-	if err != nil {
-		return fmt.Errorf("seed admin hash: %w", err)
-	}
-	name := pgtype.Text{}
-	if cfg.SeedName != "" {
-		name = pgtype.Text{String: cfg.SeedName, Valid: true}
-	}
-	if _, err := q.CreateUser(ctx, store.CreateUserParams{
-		Email:        cfg.SeedEmail,
-		PasswordHash: pgtype.Text{String: hash, Valid: true},
-		DisplayName:  name,
-		IsAdmin:      true,
-	}); err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			return nil // raced with another creator; the user now exists
-		}
-		return fmt.Errorf("seed admin create: %w", err)
-	}
-	slog.Info("seeded admin user", "email", cfg.SeedEmail)
-	return nil
+// seedAdmin retains the server's boot entry point for the shared production helper.
+func seedAdmin(ctx context.Context, pool *pgxpool.Pool, cfg config.Config) error {
+	return seed.Admin(ctx, pool, cfg)
 }
 
 // stripXFF removes the forwarding headers from every request on the TLS listener
