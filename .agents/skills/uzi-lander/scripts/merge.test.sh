@@ -172,6 +172,7 @@ seed_state() {  # a live claim + a pre-merge trail for #42, so the terminal side
 # 1. Already MERGED out of band → --confirm-only emits the owed terminal evidence (MERGED, the
 #    true MERGE_SHA, the trail's admin-merged line) THEN releases the claim but preserves the
 #    trail until the post-merge result is appended, printed and explicitly purged.
+if [ "${UZI_MERGE_POLICY_ONLY:-0}" != 1 ]; then
 MERGE_STATE=MERGED; export MERGE_STATE
 seed_state
 set +e
@@ -636,5 +637,131 @@ set +e; bash "$SCRIPT" test/repo 42 --confirm-only > "$WORK/confirm-runs.out" 2>
 bash "$HERE/claims.sh" release '#42' --purge > /dev/null
 MERGE_STATE=OPEN; export MERGE_STATE
 unset RUNS_FAIL CHECKS_JSON CHECKS_RC
+fi
+
+# Real local history plus the existing fake forge: all CI is green, but only the
+# policy delta since this branch's own merge-base decides freshness (#3550).
+REAL_GIT=$(command -v git)
+export REAL_GIT POLICY_ROOT="$WORK/policy" POLICY_REMOTE="$WORK/policy-origin.git"
+export POLICY_SCRIPT_DIR="$HERE" POLICY_BASE_GH="$WORK/bin/gh" POLICY_GIT_LOG="$WORK/policy-git.log"
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_ALLOW_PROTOCOL=file
+export SESSION_PEERS_NAME=policy-fixture SESSION_PEERS_UUID=policy-fixture SESSION_PEERS_KIND=codex
+mkdir -p "$WORK/policy-bin" "$POLICY_ROOT"
+"$REAL_GIT" -c core.fsmonitor=false init -q -b main "$POLICY_ROOT"
+"$REAL_GIT" -C "$POLICY_ROOT" config user.name fixture
+"$REAL_GIT" -C "$POLICY_ROOT" config user.email fixture@example.invalid
+mkdir -p "$POLICY_ROOT/scripts/lib" "$POLICY_ROOT/api"
+printf 'base\n' > "$POLICY_ROOT/README.md"
+printf 'base\n' > "$POLICY_ROOT/api/doc.md"
+POLICIES=(scripts/check-changelog-entry.sh scripts/lib/shipping-paths.sh scripts/lib/dependency-bump.sh
+  scripts/lib/changelog-fragments.sh scripts/lib/changelog-fragments.awk scripts/assert-changelog-covers-release.sh)
+for path in "${POLICIES[@]}"; do printf 'old policy\n' > "$POLICY_ROOT/$path"; done
+"$REAL_GIT" -C "$POLICY_ROOT" add .
+"$REAL_GIT" -C "$POLICY_ROOT" commit -qm base
+"$REAL_GIT" clone -q --bare "$POLICY_ROOT" "$POLICY_REMOTE"
+"$REAL_GIT" -C "$POLICY_ROOT" remote add origin https://github.com/vtmocanu/uzi.git
+cat > "$WORK/policy-bin/git" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+if [ "${1:-}" = -C ] && [ "${2:-}" = "$POLICY_SCRIPT_DIR" ]; then
+  shift 2; set -- -C "$POLICY_ROOT" "$@"
+fi
+case " $* " in
+  *' config --get remote.origin.url '*)
+    if [ "${POLICY_ORIGIN_MISMATCH:-0}" = 1 ]; then echo https://github.com/other/repo.git; exit 0; fi ;;
+  *' fetch '*)
+    [ -f "$UZI_LANDER_STATE_DIR/locks/merge/uuid" ] || { echo 'fetch outside merge lock' >&2; exit 99; }
+    printf '%s\n' "$*" >> "$POLICY_GIT_LOG"
+    [ "${POLICY_FETCH_FAIL:-0}" != 1 ] || exit 88 ;;
+  *' diff '*) [ "${POLICY_DIFF_FAIL:-0}" != 1 ] || exit 89 ;;
+esac
+exec "$REAL_GIT" -c core.fsmonitor=false -c "url.${POLICY_REMOTE}.insteadOf=https://github.com/vtmocanu/uzi.git" "$@"
+STUB
+cat > "$WORK/policy-bin/gh" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+if [ "${1:-}" = pr ] && [ "${2:-}" = view ] && [[ "$*" == *headRefOid* ]]; then
+  "$POLICY_BASE_GH" "$@" | jq --arg h "$POLICY_HEAD" '.headRefOid=$h'
+else
+  exec "$POLICY_BASE_GH" "$@"
+fi
+STUB
+chmod +x "$WORK/policy-bin/git" "$WORK/policy-bin/gh"
+export PATH="$WORK/policy-bin:$PATH" CONFIRM_AFTER_MERGE=1 MERGE_STATE=OPEN
+export CHECKS_JSON='[{"name":"ci","bucket":"pass"}]' CHECKS_RC=0
+export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"}]}}]'
+policy_run() {
+  local repo=${1:-vtmocanu/uzi}
+  if [ "$#" -gt 0 ]; then shift; fi
+  rm -f "$WORK/merge.log"
+  set +e
+  bash "$SCRIPT" "$repo" 42 --expect-head "$POLICY_HEAD" --no-rework-check "$@" > "$WORK/policy.out" 2>&1
+  rc=$?
+  set -e
+}
+for path in "${POLICIES[@]}"; do
+  git -C "$POLICY_ROOT" checkout -q -B topic main
+  printf '%s\n' "$path" > "$POLICY_ROOT/api/doc.md"
+  git -C "$POLICY_ROOT" commit -qam 'docs: shipping mirror without a fragment'
+  POLICY_HEAD=$(git -C "$POLICY_ROOT" rev-parse HEAD); export POLICY_HEAD
+  git -C "$POLICY_ROOT" checkout -q main
+  printf 'new policy\n' > "$POLICY_ROOT/$path"
+  git -C "$POLICY_ROOT" commit -qam 'tighten policy'
+  git -C "$POLICY_ROOT" push -q origin main
+  policy_run
+  [ "$rc" -eq 12 ] || fail "policy-stale '$path': want 12, got $rc: $(cat "$WORK/policy.out")"
+  [ ! -e "$WORK/merge.log" ] || fail "stale-policy merge reached the forge"
+  grep -qF "$path" "$WORK/policy.out" || fail "stale-policy refusal omitted $path"
+  grep -qF 'fresh exact-head CI' "$WORK/policy.out" || fail "stale-policy refusal omitted recovery"
+done
+policy_run Vtmocanu/Uzi
+[ "$rc" -eq 12 ] || fail "policy repository casing bypassed the guard: $(cat "$WORK/policy.out")"
+policy_run vtmocanu/uzi --no-admin
+[ "$rc" -eq 12 ] || fail "policy-no-admin bypassed the guard: $(cat "$WORK/policy.out")"
+[ ! -e "$WORK/merge.log" ] || fail 'stale policy reached a non-admin merge'
+POLICY_STALE_HEAD=$POLICY_HEAD
+git -C "$POLICY_ROOT" checkout -q topic
+git -C "$POLICY_ROOT" rebase -q origin/main
+POLICY_HEAD=$(git -C "$POLICY_ROOT" rev-parse HEAD); export POLICY_HEAD
+policy_run
+[ "$rc" -eq 0 ] || fail "policy-rebased: $(cat "$WORK/policy.out")"
+[ -s "$WORK/merge.log" ] || fail "rebased policy did not reach merge"
+grep -qF -- "--match-head-commit $POLICY_HEAD" "$WORK/merge.log" || fail 'policy check lost exact-head merge binding'
+git -C "$POLICY_ROOT" checkout -q main
+printf 'unrelated\n' >> "$POLICY_ROOT/README.md"
+git -C "$POLICY_ROOT" commit -qam 'unrelated main change'
+git -C "$POLICY_ROOT" push -q origin main
+policy_run
+[ "$rc" -eq 0 ] || fail "policy-unrelated-main: $(cat "$WORK/policy.out")"
+[ -s "$WORK/merge.log" ] || fail 'unrelated main change prevented merging'
+export POLICY_FETCH_FAIL=1
+policy_run
+[ "$rc" -eq 2 ] || fail "policy-fetch-error: expected instrument refusal, got $rc"
+[ ! -e "$WORK/merge.log" ] || fail 'merged after policy fetch failed'
+unset POLICY_FETCH_FAIL
+export POLICY_DIFF_FAIL=1
+policy_run
+[ "$rc" -eq 2 ] || fail "policy-diff-error: expected instrument refusal, got $rc"
+[ ! -e "$WORK/merge.log" ] || fail 'merged after policy diff failed'
+unset POLICY_DIFF_FAIL
+export POLICY_ORIGIN_MISMATCH=1
+policy_run
+[ "$rc" -eq 2 ] || fail "policy-origin-mismatch: expected refusal, got $rc"
+[ ! -e "$WORK/merge.log" ] || fail 'merged using policy from another repository'
+unset POLICY_ORIGIN_MISMATCH
+fetches_before=$(wc -l < "$POLICY_GIT_LOG")
+export MERGE_STATE=MERGED POLICY_FETCH_FAIL=1 POLICY_HEAD=$POLICY_STALE_HEAD
+rm -f "$WORK/merge.log"
+set +e
+bash "$SCRIPT" vtmocanu/uzi 42 --confirm-only > "$WORK/policy-confirm.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "policy-confirm-only: $(cat "$WORK/policy-confirm.out")"
+[ ! -e "$WORK/merge.log" ] || fail 'confirm-only attempted another merge'
+[ "$(wc -l < "$POLICY_GIT_LOG")" = "$fetches_before" ] || fail 'confirm-only fetched policy after an out-of-band merge'
+unset POLICY_FETCH_FAIL
+[ -s "$POLICY_GIT_LOG" ] || fail 'policy freshness never fetched under the merge lock'
+echo 'PASS merge-policy: six policy changes/admin/no-admin/case refuse; rebase/unrelated-main accept; fetch/diff/origin errors refuse; confirm-only skips policy'
+if [ "${UZI_MERGE_POLICY_ONLY:-0}" = 1 ]; then exit 0; fi
 
 echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses unless its tag is on origin and coverage holds without it; --expect-closes refuses a closing-reference mismatch"

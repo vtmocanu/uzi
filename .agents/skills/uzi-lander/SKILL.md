@@ -458,6 +458,7 @@ locally in step 4. The advisory still prints until the window expires.
    S/merge.sh OWNER/REPO PR --expect-head <sha you watched> --expect-closes <N,...|none>   # squash + delete-branch + admin
    ```
 
+   For `vtmocanu/uzi` main, exit 12: rebase or merge main, wait for fresh exact-head CI, re-run `merge.sh`; merges outside it bypass this policy guard.
    It refuses on a moved head, an active rework, red, pending or no passing required checks, a
    git conflict, or (exit 5) any unresolved thread, open code-scanning alert or
    unacknowledged comment, or (exit 10) a `chore(release):` commit's CI still running on
