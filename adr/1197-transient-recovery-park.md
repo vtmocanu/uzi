@@ -1498,15 +1498,15 @@ token promoter can bypass the held NULL-retry shape. Held runs block worker
 image rollout under #3103's existing upgrade-blocker policy. No live rollout
 has been executed as evidence for this documentation unit.
 
-[00364_codex_idle_stall.sql](../api/internal/store/migrations/00364_codex_idle_stall.sql)
+[00370_codex_idle_stall.sql](../api/internal/store/migrations/00370_codex_idle_stall.sql)
 adds a constant-default counter and `NOT VALID` checks in a short schema
-transaction; [00365_validate_codex_idle_stall.sql](../api/internal/store/migrations/00365_validate_codex_idle_stall.sql)
+transaction; [00371_validate_codex_idle_stall.sql](../api/internal/store/migrations/00371_validate_codex_idle_stall.sql)
 validates in a separately committed migration. The brief ACCESS EXCLUSIVE DDL
 lock can wait; separate validation avoids holding that lock through the scan.
 Production table size, lock duration and row-update/WAL/replica costs are unmeasured.
 
 Down changes active idle parks (timed or held) to `failed` / `worker_lost`
-with the 00364 schema-rollback reason and finish/status/update timestamps, then
+with the 00370 schema-rollback reason and finish/status/update timestamps, then
 clears historical idle cause/retry fields before restoring the old check and
 dropping the counter. It does not mutate custody. Counter history and idle-cause
 evidence are lost; assess backup/PITR needs first. This destructive downgrade

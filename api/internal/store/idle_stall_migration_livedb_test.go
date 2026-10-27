@@ -138,7 +138,7 @@ func TestIdleStallMigrationLifecycleLiveDB(t *testing.T) {
 		if !clean {
 			t.Fatal("Down retained new cause/retry")
 		}
-		if i < 2 && (status != "failed" || origin != "worker_lost" || reason != "codex idle stall hold ended by schema rollback (00364)" || !finished) {
+		if i < 2 && (status != "failed" || origin != "worker_lost" || reason != "codex idle stall hold ended by schema rollback (00370)" || !finished) {
 			t.Fatalf("active Down %s %s %s %v", status, origin, reason, finished)
 		}
 		if i == 2 && (status != "queued" || !finished) {

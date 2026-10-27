@@ -11,7 +11,7 @@ ALTER TABLE runs ADD CONSTRAINT runs_recovery_wait_cause_check CHECK (
 
 -- +goose Down
 UPDATE runs SET status='failed', fail_origin='worker_lost',
- failure_reason='codex idle stall hold ended by schema rollback (00364)',
+ failure_reason='codex idle stall hold ended by schema rollback (00370)',
  finished_at=now(), status_since=now(), updated_at=now(),
  recovery_wait_cause=NULL, recovery_retry_not_before=NULL
 WHERE status='recovery_wait' AND recovery_wait_cause='codex_idle_stall';

@@ -298,10 +298,10 @@ rollout under the existing upgrade-blocker policy (#3103); resolve them with own
 Resume or Cancel before rolling that worker. This is rollout guidance, not evidence
 of a live deployment.
 
-[00364_codex_idle_stall.sql](../api/internal/store/migrations/00364_codex_idle_stall.sql)
+[00370_codex_idle_stall.sql](../api/internal/store/migrations/00370_codex_idle_stall.sql)
 adds the constant-default counter and `NOT VALID` checks in a short schema
 transaction.
-[00365_validate_codex_idle_stall.sql](../api/internal/store/migrations/00365_validate_codex_idle_stall.sql)
+[00371_validate_codex_idle_stall.sql](../api/internal/store/migrations/00371_validate_codex_idle_stall.sql)
 validates them in a separately committed migration, avoiding retention of the
 DDL's ACCESS EXCLUSIVE lock through the validation scan. The brief DDL lock can
 still wait behind other transactions. Production table size, lock duration,
@@ -309,7 +309,7 @@ row-update/WAL volume and replica costs have not been measured.
 
 **Schema Down is destructive recovery, not supported application rollback.**
 It changes active `codex_idle_stall` parks (timed or held) to `failed` /
-`worker_lost`, records the 00364 schema-rollback reason and finish/status/update
+`worker_lost`, records the 00370 schema-rollback reason and finish/status/update
 timestamps, and clears cause/retry. Historical idle cause/retry fields are cleared
 before restoring the old cause check and dropping the counter. It does not mutate
 custody. This loses counter history and idle-cause evidence; assess backups/PITR
