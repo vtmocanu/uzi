@@ -41,6 +41,8 @@
 # and a gate with no way to say "genuinely nothing to announce" gets satisfied with
 # a junk entry, which is worse than silence.
 set -euo pipefail
+# Exit codes: 0 covered, 1 coverage refused, 2 unreadable first-parent history.
+# Other Git instrument errors also remain nonzero.
 
 REF="${1:-HEAD}"
 PREV="${2:-}"
@@ -190,6 +192,11 @@ fi
 # shellcheck source=scripts/lib/shipping-paths.sh
 . "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/lib/shipping-paths.sh"
 
+HISTORY_FILE="$WORK/history"
+if ! git log --first-parent --format=%H "$PREV..$REF" > "$HISTORY_FILE"; then
+  echo 'assert-changelog-covers-release: changelog-coverage-error: could not read first-parent history' >&2
+  exit 2
+fi
 missing=0
 while read -r sha; do
   [ -n "$sha" ] || continue
@@ -367,9 +374,7 @@ while read -r sha; do
       "$shipping_example" "$(printf '%s' "$refs" | tr '\n' ',' | sed 's/,$//; s/,/, #/g')" "$short"
     missing=$((missing + 1))
   fi
-done <<EOF
-$(git log --first-parent --format=%H "$PREV..$REF")
-EOF
+done < "$HISTORY_FILE"
 
 if [ "$missing" -gt 0 ]; then
   cat <<MSG

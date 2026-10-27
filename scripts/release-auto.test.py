@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+import subprocess
 from unittest.mock import Mock, patch
 
 spec = importlib.util.spec_from_file_location('release_auto', Path(__file__).with_name('release-auto.py'))
@@ -15,6 +16,43 @@ auto = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(auto)
 H, NEW, CANDIDATE, RELEASE, TAG_OID = (char * 40 for char in '12345')
 TAG = 'v0.2.0-rc.10'
+
+
+class OracleDiagnostics(unittest.TestCase):
+    def fixture(self, directory):
+        repo = Path(directory) / 'repo'
+        repo.mkdir()
+        env = {**os.environ, 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_SYSTEM': '/dev/null'}
+        def git(*args):
+            return subprocess.check_output(['git', '-c', 'core.fsmonitor=false', *args], cwd=repo, env=env, text=True).strip()
+        git('init', '-q', '-b', 'main')
+        git('config', 'user.name', 'fixture')
+        git('config', 'user.email', 'fixture@example.invalid')
+        (repo / 'CHANGELOG.md').write_text('## [Unreleased]\n\n## [0.2.0] - 2026-10-27\n### Changed\n- Existing note (#999).\n')
+        (repo / 'api').mkdir()
+        (repo / 'api/a.go').write_text('package fixture\n')
+        git('add', '.')
+        git('commit', '-qm', 'base')
+        git('tag', 'v0.1.0')
+        (repo / 'api/a.go').write_text('package fixture\n// changed\n')
+        git('commit', '-qam', 'fix: uncited shipping change (#3486)')
+        sha = git('rev-parse', 'HEAD')
+        bin_dir = Path(directory) / 'bin'
+        bin_dir.mkdir()
+        gh = bin_dir / 'gh'
+        gh.write_text('#!/bin/sh\nexit 1\n')
+        gh.chmod(0o700)
+        env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
+        return repo, env, sha
+
+    def test_unreadable_history_is_not_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, env, _ = self.fixture(directory)
+            result = subprocess.run(['bash', str(Path(__file__).with_name('assert-changelog-covers-release.sh')),
+                                     'HEAD', 'missing-baseline', '0.2.0'], cwd=repo, env=env,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn('changelog-coverage-error', result.stderr)
 
 
 def context(**changes):
