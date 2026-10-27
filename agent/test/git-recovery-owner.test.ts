@@ -48,7 +48,8 @@ for (const control of ["missing", "malformed", "duplicate", "baseline", "bare", 
 }
 
 for (const point of ["pending-write-before", "pending-write-after", "pending-read", "journal-write-before",
-  "journal-write-after", "journal-read", "commit-write-before", "commit-write-after", "commit-read"] as const) {
+  "journal-write-after", "journal-read", "commit-write-before", "commit-write-after", "commit-read",
+  "pending-read-after", "journal-read-after", "commit-read-after"] as const) {
   test(`owner charge interruption at ${point} never returns work or replays the grant`, async () => {
     const f = ownerFixture();
     await f.reserve();
@@ -59,7 +60,8 @@ for (const point of ["pending-write-before", "pending-write-after", "pending-rea
       const journalWrite = args.at(-2) === f.journalKey;
       const state = ownerWrite ? JSON.parse(args.at(-1)!).state : undefined;
       const label = ownerWrite ? (state === "pending" ? "pending" : "commit") : journalWrite ? "journal" : "";
-      if (phase === "before" && args.includes("--list") && point === lastWrite + "-read") throw new Error("injected " + point);
+      if (args.includes("--list") && ((phase === "before" && point === lastWrite + "-read") ||
+          (phase === "after" && point === lastWrite + "-read-after"))) throw new Error("injected " + point);
       if (label && point === label + "-write-" + phase) throw new Error("injected " + point);
       if (label && phase === "after") lastWrite = label;
     });
@@ -69,12 +71,29 @@ for (const point of ["pending-write-before", "pending-write-after", "pending-rea
     const record = JSON.parse(raw);
     if (point === "pending-write-before") {
       assert.equal(record.consumed, 0, "nothing landed; the original grant remains available");
+      const fresh = await f.reserve(3, 1, 9);
+      assert.equal(fresh.claimGeneration, 3);
+      assert.equal(fresh.attempts, 1);
+      assert.equal(JSON.parse(f.values.get(f.ownerKey)![0]!).after.claimGeneration, 3);
       return;
     }
     assert.equal(record.consumed, 1);
     if (record.state === "pending") await assert.rejects(f.reserve(2, 1, 8), /pending/);
     else await f.block();
     await assert.rejects(f.reserve(3, 1, 9));
+    if (["pending-write-after", "pending-read", "pending-read-after", "journal-write-before"].includes(point)) {
+      await assert.rejects(f.reserve(3, 2, 9), /pending/);
+      assert.equal(f.read().recovery?.claimGeneration, 1);
+    } else {
+      const renewed = await f.reserve(3, 2, 9);
+      assert.equal(renewed.claimGeneration, 3);
+      assert.equal(renewed.attempts, 1);
+      const landed = JSON.parse(f.values.get(f.ownerKey)![0]!);
+      assert.equal(landed.state, "committed");
+      assert.equal(landed.consumed, 2);
+      assert.equal(landed.after.claimGeneration, 3);
+      assert.equal(landed.after.attempts, 1);
+    }
   });
 }
 
@@ -122,5 +141,26 @@ test("external record rejects duplicate JSON keys and bounded record overflow", 
   for (const value of ['{"version":1,' + raw.slice(1), raw + " ".repeat(32_768)]) {
     f.values.set(f.ownerKey, [value]);
     await assert.rejects(f.reserve(2, 1, 8));
+  }
+});
+
+test("a journal missing its charged claim fence cannot renew through a zero-generation record", async () => {
+  const f = ownerFixture();
+  await f.reserve(); await f.block();
+  const record = JSON.parse(f.values.get(f.ownerKey)![0]!);
+  record.after.claimGeneration = 0;
+  f.values.set(f.ownerKey, [JSON.stringify(record)]);
+  const journal = f.read(); delete journal.recovery!.claimGeneration; f.write(journal);
+  await assert.rejects(f.reserve(2, 1, 8));
+  assert.equal(await f.recreate().canRenewRecoveryAdoption(f.bare, f.branch, f.key, journal, 2, 1).catch(() => false), false);
+});
+
+test("owner fixture works without a TMPDIR override", () => {
+  const previous = process.env.TMPDIR;
+  delete process.env.TMPDIR;
+  try { assert.doesNotThrow(() => ownerFixture()); }
+  finally {
+    if (previous === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previous;
   }
 });

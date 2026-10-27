@@ -54,7 +54,7 @@ export function parseRecoveryOwner(raw: string): RecoveryOwnerRecord {
   for (const [index, r] of [o.before, o.after].entries()) {
     if (r === null && index === 0) continue;
     if (!r || Object.keys(r).sort().join(",") !== "attempts,claimGeneration,deadline,episode,startedAt" ||
-        !ownerGrant(r.episode) || !ownerGrant(r.claimGeneration) ||
+        !ownerGrant(r.episode) || !ownerGrant(r.claimGeneration) || (index === 1 && r.claimGeneration < 1) ||
         !ownerGrant(r.startedAt) || r.deadline !== r.startedAt + 300_000 ||
         !Number.isSafeInteger(r.deadline) || !Number.isSafeInteger(r.attempts) ||
         r.attempts < 1 || r.attempts > 3) invalid();

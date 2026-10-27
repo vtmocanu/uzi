@@ -21804,7 +21804,8 @@ export class RunRunner {
           if (ack.staleClaim || ack.reason === "stale_claim" || ack.credentialSwitch ||
               (ack.status !== undefined && ack.status !== "running" && ack.status !== "recovery_wait"))
             throw new RetainedRecoveryStop();
-          if (ack.status === "recovery_wait" && ack.recoveryCause !== undefined && ack.recoveryCause !== cause)
+          if (cause === "retained_recovery_adoption_failed" && ack.status === "recovery_wait" &&
+              ack.recoveryCause !== undefined && ack.recoveryCause !== cause)
             throw new RetainedRecoveryStop();
           if (ack.status === "recovery_wait" && ack.recoveryCause === cause) {
             flight.parked = true;

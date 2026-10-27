@@ -1,12 +1,13 @@
 import path from "node:path";
+import os from "node:os";
 import { GitCache, type RecoveryJournalEntry } from "../src/git.js";
 import { recoveryProgress, sameRecoverySource, type RecoverySource } from "../src/recovery-progress.js";
 import { nullLogger } from "./helpers.js";
 
 // Persistent config IO seam; reservation, strict parsers, charging and blocking are production.
 export function ownerFixture() {
-  const bare = path.join(process.env.TMPDIR!, "owner-bare");
-  const source = { runId: "owner-run", clonePath: path.join(process.env.TMPDIR!, "owner-source") };
+  const bare = path.join(os.tmpdir(), "owner-bare");
+  const source = { runId: "owner-run", clonePath: path.join(os.tmpdir(), "owner-source") };
   const branch = "agent/issue-3527", key = "issue-3527";
   const journalKey = `uzi-recovery.${branch}.clone`;
   const ownerKey = `uzi-recoveryowner.${source.runId}.record`;
@@ -14,7 +15,7 @@ export function ownerFixture() {
   let fault: ((args: string[], phase: "before" | "after") => void) | undefined;
   const read = (): RecoveryJournalEntry => JSON.parse(values.get(journalKey)![0]!);
   function recreate() {
-    const cache = new GitCache(path.join(process.env.TMPDIR!, "owner-cache"), nullLogger());
+    const cache = new GitCache(path.join(os.tmpdir(), "owner-cache"), nullLogger());
     Object.assign(cache, {
       withLock: async (_bare: string, action: () => Promise<unknown>) => action(),
       assertRecoveryBare: async () => {},

@@ -33,7 +33,9 @@ async function setup(t: TestContext) {
   return { fx, cache, bare, branch, source, key, read, charged };
 }
 
-for (const phase of ["before-successor", "ledger-landed", "partial-clone", "handoff-write-landed", "ready-for-model"] as const) {
+for (const phase of ["before-successor", "ledger-landed", "partial-clone", "handoff-write-landed", "ready-for-model",
+  "owner-successor-before", "owner-successor-after", "owner-successor-read", "owner-successor-read-after",
+  "handoff-write-before", "handoff-read", "handoff-read-after"] as const) {
   test(`real Git exact reservation survives adoption failure at ${phase}`, async t => {
     const f = await setup(t);
     const { cache, bare, branch, source, key, charged } = f;
@@ -47,23 +49,38 @@ for (const phase of ["before-successor", "ledger-landed", "partial-clone", "hand
       const seed = seam.seedRunnerClone.bind(cache);
       t.mock.method(seam, "seedRunnerClone", async (...args: any[]) => { await seed(...args); throw new Error("injected"); });
     }
-    if (phase === "handoff-write-landed") {
+    let injected = false;
+    if (phase === "handoff-write-landed" || phase.startsWith("owner-successor-") || phase.startsWith("handoff-")) {
       const run = seam.runGit.bind(cache);
+      let armed = false;
       t.mock.method(seam, "runGit", async (cwd: string, args: string[], ...rest: any[]) => {
+        const ownerWrite = args.at(-2) === `uzi-recoveryowner.${source.runId}.record` &&
+          !!JSON.parse(args.at(-1)!).successor;
+        const readyWrite = args.at(-2) === `uzi-recovery.${branch}.clone` &&
+          JSON.parse(args.at(-1)!).recovery?.stage === "ready-for-model";
+        if ((ownerWrite && phase === "owner-successor-before") || (readyWrite && phase === "handoff-write-before") ||
+            (armed && args.includes("--list") && !phase.endsWith("-read-after"))) {
+          injected = true; throw new Error("injected " + phase);
+        }
         const result = await run(cwd, args, ...rest);
-        if (args.at(-2) === `uzi-recovery.${branch}.clone` &&
-            JSON.parse(args.at(-1)!).recovery?.stage === "ready-for-model") throw new Error("injected");
+        if ((readyWrite && phase === "handoff-write-landed") || (ownerWrite && phase === "owner-successor-after") ||
+            (armed && args.includes("--list") && phase.endsWith("-read-after"))) {
+          injected = true; throw new Error("injected " + phase);
+        }
+        if ((ownerWrite && phase.startsWith("owner-successor-read")) || (readyWrite && phase.startsWith("handoff-read"))) armed = true;
         return result;
       });
     }
     if (phase === "ready-for-model") await cache.prepareRecoverySuccessor(bare, branch, key, source, charged.attempts, attemptId);
     else await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, source, charged.attempts, attemptId), /injected/);
+    if (phase.startsWith("owner-successor-") || phase.startsWith("handoff-")) assert.equal(injected, true);
     t.mock.restoreAll();
     const current = await cache.recoveryReservationSnapshot(bare, branch, key, source, charged);
     await cache.blockRecoveryEpisode(bare, branch, key, current, "adoption_failed", charged);
     assert.equal(f.read().recovery?.blocker, "adoption_failed");
     assert.ok(fs.existsSync(source.clonePath));
-    if (phase === "handoff-write-landed" || phase === "ready-for-model") assert.notEqual(current.clonePath, source.clonePath);
+    if (phase === "handoff-write-landed" || phase === "ready-for-model" || phase.startsWith("handoff-read"))
+      assert.notEqual(current.clonePath, source.clonePath);
     assert.equal(await cache.canRenewRecoveryAdoption(bare, branch, key, current, 3, 1), false);
     assert.equal(await cache.canRenewRecoveryAdoption(bare, branch, key, current, 3, 2), true);
   });

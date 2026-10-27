@@ -86,3 +86,72 @@ for (const phase of ["before-successor", "partial-clone", "handoff-write-landed"
     assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "local retained work\n");
   });
 }
+
+test("owner Resume verifies the successor before model admission and preserves its consumed grant after settlement", async t => {
+  const claim = gitlabClaim(3527, { claim_generation: 2, worker_recovery_episode: 7, worker_recovery_owner_episode: 0 });
+  const bare = await git.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700); fs.chmodSync(bare, 0o700);
+  const clone = await git.createOrAttachRunnerClone(bare, 3527, noProofReseed, claim.run_id);
+  await git.markRecoveryCapture(bare, clone.path, clone.branch, claim.run_id);
+  fs.writeFileSync(path.join(clone.path, "retained.txt"), "owner retained work\n");
+  client.protocolFeatures = ["recovery_cause_retained_recovery_adoption_failed"];
+  let failAdoption = true, parks = 0, models = 0, settlements = 0, verified = false;
+  const modelErrors: unknown[] = [];
+  const seam = git as any;
+  const resolve = seam.resolveMarkerWrapperAdoption.bind(git);
+  t.mock.method(seam, "resolveMarkerWrapperAdoption", async (...args: any[]) => {
+    if (failAdoption) throw new Error("initial integrity refusal");
+    return resolve(...args);
+  });
+  const prepare = git.prepareRecoverySuccessor.bind(git);
+  t.mock.method(git, "prepareRecoverySuccessor", async (...args: Parameters<typeof prepare>) => {
+    const successor = await prepare(...args);
+    verified = true;
+    return successor;
+  });
+  const report = client.reportState.bind(client);
+  t.mock.method(client, "reportState", async (runId: Parameters<typeof report>[0], body: Parameters<typeof report>[1], signal?: AbortSignal) => {
+    if (body.status === "recovery_wait" && body.recovery_cause === "retained_recovery_adoption_failed") {
+      parks++;
+      return { status: body.status, recoveryCause: body.recovery_cause };
+    }
+    return report(runId, body, signal);
+  });
+  const read = () => JSON.parse(command(bare, "config", `uzi-recovery.${clone.branch}.clone`));
+  const owner = () => JSON.parse(command(bare, "config", `uzi-recoveryowner.${claim.run_id}.record`));
+  const execute = async () => {
+    api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation);
+    const runner = runnerWith(runId => ({ homeDir: path.join(homeDir, runId), executor: {
+      run: async (ctx: import("../src/executor.js").RunContext) => {
+        models++;
+        try {
+          assert.equal(verified, true);
+          const journal = read();
+          assert.equal(journal.recovery.stage, "ready-for-model");
+          assert.equal(journal.recovery.claimGeneration, 3);
+          assert.equal(journal.recovery.attempts, 1);
+          assert.equal(journal.clonePath, ctx.worktreePath);
+          assert.notEqual(ctx.worktreePath, clone.path);
+          assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "retained.txt"), "utf8"), "owner retained work\n");
+          assert.equal(owner().consumed, 1);
+          await ctx.onModelTurnSettled!(1);
+          settlements++;
+          assert.equal(read().recovery, undefined);
+          assert.equal(owner().consumed, 1);
+        } catch (error) { modelErrors.push(error); throw error; }
+        throw new Error("stop after the settled model turn");
+      },
+    } }), fakeGitlab().gitlab, undefined, undefined, { recoveryRetryMs: 1 });
+    await runner.execute(claim);
+  };
+  await execute();
+  assert.equal(parks, 1); assert.equal(models, 0); assert.equal(owner().baseline, 0);
+  failAdoption = false;
+  claim.claim_generation = 3;
+  claim.worker_recovery_episode = 8;
+  claim.worker_recovery_owner_episode = 1;
+  await execute();
+  assert.equal(parks, 1); assert.equal(models, 1); assert.equal(settlements, 1);
+  assert.deepEqual(modelErrors, []);
+  assert.equal(owner().consumed, 1);
+});
