@@ -83,7 +83,7 @@ func TestRetainedParkRollbackLiveDB(t *testing.T) {
 	for _, id := range ids {
 		before[id] = snapshot(preserved, id)
 	}
-	for _, stmt := range migrationDownStatements(t, "00358_retained_recovery_parks.sql") {
+	for _, stmt := range migrationDownStatements(t, "00362_retained_recovery_parks.sql") {
 		exec(stmt)
 	}
 	assertSQL("column removed", `SELECT NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='runs' AND column_name='retained_park_count')`)
@@ -96,7 +96,7 @@ func TestRetainedParkRollbackLiveDB(t *testing.T) {
 			t.Fatal("rollback changed affinity, execution fence or unrelated data")
 		}
 	}
-	for _, stmt := range migrationUpStatements(t, "00358_retained_recovery_parks.sql") {
+	for _, stmt := range migrationUpStatements(t, "00362_retained_recovery_parks.sql") {
 		exec(stmt)
 	}
 	for _, id := range ids {
