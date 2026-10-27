@@ -243,6 +243,29 @@ describe("durable publication at the end of source use", () => {
     assert.deepEqual(snapshotFiles(r), before);
   });
 
+  it("a publication that cannot get A in time never publishes late: the end is queued and lands ineligible", async t => {
+    const r = await rig(t, { codex: false });
+    (r.p as unknown as { sourceUseEndWaitMs: number }).sourceUseEndWaitMs = 150;
+    const before = snapshotFiles(r);
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let acquired!: () => void;
+    const holding = new Promise<void>(resolve => { acquired = resolve; });
+    // A long recovery pass owns A through the whole bounded wait of both the publication and the end.
+    const holder = r.rt.withTransaction(async () => { acquired(); await held; });
+    await holding;
+    await r.end();
+    release();
+    await holder;
+    let slot = await slotOf(r);
+    for (let i = 0; i < 200 && slot?.state === "active"; i++) { await new Promise(resolve => setTimeout(resolve, 20)); slot = await slotOf(r); }
+    assert.equal(slot?.state, "ineligible", "the queued end landed, with no further caller");
+    assert.equal(slot?.publication ?? null, null, "nothing was published late");
+    assert.equal(fenceOf(r), undefined);
+    assert.deepEqual(snapshotFiles(r), before);
+    assert.equal(await eligibleRecords(r), 0);
+  });
+
   it("a flight that never durably bound a source is only ended, as before", async t => {
     const r = await rig(t, { codex: false });
     r.flight.completionSourceBound = undefined;
@@ -423,8 +446,14 @@ describe("a failure at each publication step leaves nothing eligible", () => {
     r.fail.always = true;
     arm(r, kind => kind === "syncFile");
     await r.end();
-    r.fail.authority = undefined;
+    // While the failure persists the slot stays active (every retry of the queued end fails too)...
     await expectNothingEligible(r, "active", N, true);
+    // ...and once it stops, the queued end lands: it is retried, not forgotten, and still never published.
+    r.fail.authority = undefined;
+    let slot = await slotOf(r);
+    for (let i = 0; i < 200 && slot?.state === "active"; i++) { await new Promise(resolve => setTimeout(resolve, 20)); slot = await slotOf(r); }
+    assert.equal(slot?.state, "ineligible");
+    assert.equal(slot?.publication ?? null, null);
   });
 
   /** Fail the authority store only once the record directory is durable, i.e. at the slot transition. */

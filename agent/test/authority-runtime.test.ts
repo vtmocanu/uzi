@@ -206,20 +206,78 @@ describe("settlement outside a transaction", () => {
       new Promise<string>((resolve) => setTimeout(() => resolve("waited-for-A"), 1500)),
     ]);
     assert.equal(outcome, "returned");
+    // While another holder owns A the durable record stays running (fail-closed): the settle only queued it.
+    const during = await withAuthorityTransaction(r.lifetime, { timeoutMs: 100 }, async () => undefined).then(() => "got-A", () => "A-held");
+    assert.equal(during, "A-held");
     release();
     await holder;
-    // Nothing has been applied: the durable record is still running (fail-closed). Read it without a runtime transaction.
-    const raw = await withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async (tx) => {
+    // The idle drain the settle itself scheduled applies it once A is free: no further runtime transaction is needed.
+    const read = () => withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async (tx) => {
       const store = await openAuthorityStore(tx, { workerToken: TOKEN });
       return store.readSlot(tx, await store.slotKey(tx, r.bare));
     });
-    assert.equal(raw?.pending?.status, "running");
-    // The next outermost transaction through the runtime applies it before its own body runs.
-    const seen = await r.rt.withTransaction(async (tx) => {
-      const store = await openAuthorityStore(tx, { workerToken: TOKEN });
-      return store.readSlot(tx, await store.slotKey(tx, r.bare));
+    let raw = await read();
+    for (let i = 0; i < 100 && raw?.pending !== null; i++) { await new Promise((resolve) => setTimeout(resolve, 20)); raw = await read(); }
+    assert.equal(raw?.pending, null, "applied by the drain scheduled from settle");
+  });
+
+  it("a settle outside a transaction is applied with no other runtime transaction ever opened", async (t) => {
+    const r = await rig(t);
+    const settlement = await r.rt.withTransaction(() => r.rt.hooks.beginBareMutation(r.bare, "recovery-cleanup-delete-ref", ["refs/x"]));
+    // The transaction above has fully exited (and its own exit drain found nothing). Settle with none active.
+    await settlement.settle({ ok: true });
+    let slot = await slotOf(new AuthorityRuntime({ lifetime: r.lifetime, workerToken: TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000 }), r.bare);
+    for (let i = 0; i < 100 && slot?.pending !== null; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      slot = await slotOf(new AuthorityRuntime({ lifetime: r.lifetime, workerToken: TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000 }), r.bare);
+    }
+    assert.equal(slot?.pending, null);
+  });
+
+  it("a failed apply is re-queued a bounded number of times, then logged and left running", async (t) => {
+    const r = await rig(t);
+    const warnings: string[] = [];
+    const fail = { on: false, syncs: 0 };
+    const rt = new AuthorityRuntime({
+      lifetime: r.lifetime, workerToken: TOKEN, timeoutMs: 5000, retryMs: 30,
+      log: { warn: (message) => { warnings.push(message); } },
+      ops: {
+        syncFile: async (h) => { if (fail.on) { fail.syncs++; throw new Error("injected ENOSPC"); } await h.sync(); },
+        syncDir: (h) => h.sync(),
+        rename: async (a, b) => { fs.renameSync(a, b); },
+      },
     });
-    assert.equal(seen?.pending, null, "applied at the start of the next outer acquisition");
+    const settlement = await rt.withTransaction(() => rt.hooks.beginBareMutation(r.bare, "recovery-cleanup-delete-ref", ["refs/x"]));
+    fail.on = true;
+    await settlement.settle({ ok: true });
+    for (let i = 0; i < 200 && !warnings.some((w) => /stays open/.test(w)); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(warnings.filter((w) => /queued again/.test(w)).length, 2, "re-queued after the first two failures");
+    assert.equal(warnings.filter((w) => /its record stays open/.test(w)).length, 1, "then given up on, loudly");
+    const attempts = fail.syncs;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(fail.syncs, attempts, "no further attempt after the bound");
+    fail.on = false;
+    const slot = await slotOf(successorOf(r), r.bare);
+    assert.equal(slot?.pending?.status, "running", "fail closed: the record is still open");
+  });
+
+  it("a failed apply that succeeds on a re-queue settles the record", async (t) => {
+    const r = await rig(t);
+    const fail = { on: false };
+    const rt = new AuthorityRuntime({
+      lifetime: r.lifetime, workerToken: TOKEN, timeoutMs: 5000, retryMs: 30,
+      ops: {
+        syncFile: async (h) => { if (fail.on) { fail.on = false; throw new Error("injected once"); } await h.sync(); },
+        syncDir: (h) => h.sync(),
+        rename: async (a, b) => { fs.renameSync(a, b); },
+      },
+    });
+    const settlement = await rt.withTransaction(() => rt.hooks.beginBareMutation(r.bare, "recovery-cleanup-delete-ref", ["refs/x"]));
+    fail.on = true;
+    await settlement.settle({ ok: true });
+    let slot = await slotOf(successorOf(r), r.bare);
+    for (let i = 0; i < 200 && slot?.pending !== null; i++) { await new Promise((resolve) => setTimeout(resolve, 20)); slot = await slotOf(successorOf(r), r.bare); }
+    assert.equal(slot?.pending, null);
   });
 
   it("a queued settlement is also applied right after the outer transaction that was running releases", async (t) => {
@@ -536,7 +594,11 @@ describe("ending a source use", () => {
     release();
     await holder;
     assert.deepEqual(outcome, { ended: [], kept: [r.clone] });
-    assert.equal((await slotOf(r.rt, r.clone))?.state, "active");
+    // Kept, not forgotten: the end is queued and the drain applies it once A is free (see "an end that could not
+    // be applied is retried by the drain"), so the slot is never left active forever by a slow A.
+    let slot = await slotOf(successorOf(r), r.clone);
+    for (let i = 0; i < 200 && slot?.state !== "ineligible"; i++) { await new Promise((resolve) => setTimeout(resolve, 20)); slot = await slotOf(successorOf(r), r.clone); }
+    assert.equal(slot?.state, "ineligible");
   });
 
   it("recordAdmissions names every path an admission touched, including one that was refused", async (t) => {
@@ -680,5 +742,186 @@ describe("the production GitCache builder", () => {
       discard: true, completionSource: { expectedHead: head, canDelete: () => true },
     })), /fence missing or changed/);
     assert.equal(fs.existsSync(path.join(clone.path, ".git")), true, "the clone is untouched");
+  });
+});
+
+describe("seed after a failed head write", () => {
+  it("assertBareClear inside A completes the crash window, so a seed is not blocked, across a fresh incarnation too", async (t) => {
+    const r = await rig(t);
+    const flags = { head: false };
+    const rt = new AuthorityRuntime({
+      lifetime: r.lifetime, workerToken: TOKEN, timeoutMs: 5000,
+      ops: {
+        syncFile: (h) => h.sync(), syncDir: (h) => h.sync(),
+        rename: async (a, b) => {
+          if (flags.head && path.basename(path.dirname(b)) === "heads") throw new Error("injected ENOSPC on the head write");
+          fs.renameSync(a, b);
+        },
+      },
+    });
+    // A bare settle whose slot write lands but whose head write fails: the slot is one ahead of its head.
+    const settlement = await rt.withTransaction(() => rt.hooks.beginBareMutation(r.bare, "recovery-cleanup-delete-ref", ["refs/x"]));
+    flags.head = true;
+    await assert.rejects(rt.withTransaction(() => settlement.settle({ ok: true })), /injected ENOSPC/);
+    flags.head = false;
+    // No-transaction readers still refuse (they never complete the window)...
+    await assert.rejects(rt.hooks.assertBareClear(r.bare, "owed-pin"), /crash window/);
+    // ...but a seed holds A, and its assertBareClear completes the window instead of blocking the repository.
+    const fresh = successorOf(r);
+    await fresh.withTransaction(async () => {
+      await fresh.hooks.assertBareClear(r.bare, "seed-canonical");
+      await fresh.hooks.admitSourceUse(r.clone, "seed-canonical");
+    });
+    assert.equal((await slotOf(fresh, r.clone))?.state, "active");
+    assert.equal((await slotOf(fresh, r.bare))?.pending, null);
+    // And the repair is durable: a later incarnation's plain read passes too.
+    await successorOf(r).hooks.assertBareClear(r.bare, "owed-pin");
+  });
+
+  it("inside A an unresolved record still refuses the seed", async (t) => {
+    const r = await rig(t);
+    await r.rt.withTransaction(() => r.rt.hooks.beginBareMutation(r.bare, "recovery-cleanup-delete-ref", ["refs/x"]));
+    const next = successorOf(r);
+    await assert.rejects(next.withTransaction(() => next.hooks.assertBareClear(r.bare, "seed-canonical")), /unresolved bare_mutation/);
+  });
+});
+
+describe("a published source is never re-admitted without an explicit consuming purpose", () => {
+  async function published(t: TestContext): Promise<{ r: Rig; before: SlotSnapshot | null }> {
+    const r = await rig(t);
+    await publishOutOfBand(r, r.clone);
+    const before = await slotOf(r.rt, r.clone);
+    assert.equal(before?.state, "claude_ready");
+    return { r, before };
+  }
+  const untouched = async (r: Rig, before: SlotSnapshot | null): Promise<void> => {
+    const after = await slotOf(r.rt, r.clone);
+    assert.equal(after?.seq, before?.seq, "nothing was written");
+    assert.equal(after?.state, "claude_ready");
+    assert.deepEqual(after?.publication, before?.publication);
+  };
+
+  it("bindSource (claude and codex) refuses", async (t) => {
+    const { r, before } = await published(t);
+    await assert.rejects(r.rt.bindSource(r.clone), /published/);
+    await assert.rejects(r.rt.bindSource(r.clone, "exec-1"), /published/);
+    await untouched(r, before);
+  });
+
+  it("a predecessor admission (bindSource with the capturing executor) refuses", async (t) => {
+    const { r, before } = await published(t);
+    await assert.rejects(successorOf(r).bindSource(r.clone, "exec-pred"), /published/);
+    await untouched(r, before);
+  });
+
+  it("normalize, replace and discard admissions refuse", async (t) => {
+    const { r, before } = await published(t);
+    for (const op of ["normalize", "replace", "discard"]) {
+      await assert.rejects(r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, op)), /published/, op);
+    }
+    await untouched(r, before);
+  });
+
+  it("a destructive operation refuses (it needs the retiring lease)", async (t) => {
+    const { r, before } = await published(t);
+    await assert.rejects(r.rt.withTransaction(() => r.rt.hooks.beginDestructive([r.clone], "runner-uid-delete")), /published/);
+    await untouched(r, before);
+  });
+
+  it("the canonical and attempt seeds, which run after git.ts's journal guards, may consume it", async (t) => {
+    for (const op of ["seed-canonical", "seed-attempt"]) {
+      const { r, before } = await published(t);
+      await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, op));
+      const after = await slotOf(r.rt, r.clone);
+      assert.equal(after?.state, "active", op);
+      assert.equal(after?.publication, null, op);
+      assert.notEqual(after?.epoch, before?.epoch, `${op} minted a fresh epoch`);
+    }
+  });
+
+  it("an unpublished slot is admitted by every caller as before", async (t) => {
+    const r = await rig(t);
+    for (const op of ["seed-canonical", "replace", "discard"]) {
+      await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, op));
+      assert.equal((await slotOf(r.rt, r.clone))?.state, "active", op);
+    }
+    await r.rt.bindSource(r.clone);
+  });
+});
+
+describe("a claude flight never keeps a codex lease", () => {
+  it("bindSource mints a fresh claude epoch that assertLaunchable accepts", async (t) => {
+    const r = await rig(t);
+    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    const codex = await r.rt.bindSource(r.clone, "exec-1");
+    assert.equal(leaseHarness(codex), "codex");
+    const claude = await r.rt.bindSource(r.clone);
+    assert.notEqual(claude, codex);
+    assert.equal(leaseHarness(claude), "claude");
+    assert.equal((await slotOf(r.rt, r.clone))?.owner.executor, null);
+    await r.rt.assertLaunchable(r.clone, claude, undefined);
+    assert.equal(await r.rt.bindSource(r.clone), claude, "a claude lease is then kept");
+  });
+});
+
+describe("the launch gate needs no A for a normal launch", () => {
+  it("passes while another holder owns A, and a refusal still waits for the transactional check", async (t) => {
+    const r = await rig(t);
+    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    const claude = await r.rt.bindSource(r.clone);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let acquired!: () => void;
+    const holding = new Promise<void>((resolve) => { acquired = resolve; });
+    const holder = withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async () => { acquired(); await held; });
+    await holding;
+    try {
+      const started = Date.now();
+      await r.rt.assertLaunchable(r.clone, claude, undefined, { timeoutMs: 300 });
+      assert.ok(Date.now() - started < 250, "did not wait for A");
+      // A mismatch is not decided without A: it falls back to the transactional check, which times out here.
+      const refused = await r.rt.assertLaunchable(r.clone, claude, "exec-1", { timeoutMs: 300 }).then(() => "passed", (e: unknown) => String(e));
+      assert.notEqual(refused, "passed");
+    } finally {
+      release();
+      await holder;
+    }
+    await assert.rejects(r.rt.assertLaunchable(r.clone, claude, "exec-1"), /launch refused/);
+  });
+});
+
+describe("an end that could not be applied is retried by the drain", () => {
+  it("a wait for A that times out queues the end; once A frees, the slot ends and the lease is dropped", async (t) => {
+    const r = await rig(t);
+    const rt = new AuthorityRuntime({ lifetime: r.lifetime, workerToken: TOKEN, timeoutMs: 5000, retryMs: 30 });
+    await rt.withTransaction(() => rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let acquired!: () => void;
+    const holding = new Promise<void>((resolve) => { acquired = resolve; });
+    const holder = withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async () => { acquired(); await held; });
+    await holding;
+    const outcome = await rt.endSourceUse([r.clone], { timeoutMs: 100 });
+    assert.deepEqual(outcome, { ended: [], kept: [r.clone] });
+    release();
+    await holder;
+    let slot = await slotOf(successorOf(r), r.clone);
+    for (let i = 0; i < 200 && slot?.state !== "ineligible"; i++) { await new Promise((resolve) => setTimeout(resolve, 20)); slot = await slotOf(successorOf(r), r.clone); }
+    assert.equal(slot?.state, "ineligible", "the queued end was applied with no further caller");
+    assert.equal(rt.leaseFor(r.clone), undefined);
+  });
+
+  it("a running pending record defers the queued end until it is settled, and not before", async (t) => {
+    const r = await rig(t);
+    const rt = new AuthorityRuntime({ lifetime: r.lifetime, workerToken: TOKEN, timeoutMs: 5000, retryMs: 30 });
+    await rt.withTransaction(() => rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    const settlement = await rt.withTransaction(() => rt.hooks.beginDestructive([r.clone], "runner-uid-delete"));
+    assert.deepEqual(await rt.endSourceUse([r.clone]), { ended: [], kept: [r.clone] });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal((await slotOf(successorOf(r), r.clone))?.state, "active", "several drains ran; the running record held the end back");
+    await rt.withTransaction(() => settlement.settle({ ok: true }));
+    let slot = await slotOf(successorOf(r), r.clone);
+    for (let i = 0; i < 200 && slot?.state !== "ineligible"; i++) { await new Promise((resolve) => setTimeout(resolve, 20)); slot = await slotOf(successorOf(r), r.clone); }
+    assert.equal(slot?.state, "ineligible");
   });
 });

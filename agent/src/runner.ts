@@ -3390,6 +3390,9 @@ export class RunRunner {
       this.authority!.bindSource(clonePath, flight.executor.executorIncarnation, wait));
   }
 
+  /** Bounds the wait for A when a flight ends or publishes its source use (a field so a test can shorten it). */
+  private sourceUseEndWaitMs = SOURCE_USE_END_WAIT_MS;
+
   /**
    * The executor-launch gate: with an authority runtime, the executor is not started on a clone unless the
    * flight's lease is the current lease for that clone and (Codex) carries this executor's incarnation.
@@ -3406,8 +3409,11 @@ export class RunRunner {
    * source-capable tail the flight owns was joined. Today every slot moves to `ineligible`, so a later
    * worker incarnation (a pod roll, a restart) can use the path again. A flight whose completing source the
    * journal bound publishes it through this seam instead (see publishFlightSource), when it can prove the
-   * source. If the tails were NOT positively joined the
-   * slots stay `active` (fail closed) and that is logged: nothing here is retried or forced. Never throws.
+   * source; a publication that cannot get A in time never publishes late, it only ends the path ineligible.
+   * An end that cannot be applied (A unavailable within SOURCE_USE_END_WAIT_MS, a failed write, a running
+   * pending record) is queued by the authority runtime and retried by its drain while the lease is current.
+   * If the tails were NOT positively joined the slots stay `active` (fail closed) and that is logged:
+   * nothing here is forced and no end is queued. Never throws.
    *
    * "Positively joined" is `sourceTailsJoined`, set in the teardown finally: this executor's process half
    * quiescent (or its Codex terminal disposal proven), its worker commands confirmed, steering stopped, the
@@ -3416,6 +3422,11 @@ export class RunRunner {
    * ref, a failed skills/HOME removal), which say a source is kept, not that something can still write it: a
    * failed run's retained clone must remain usable by a successor incarnation's retained recovery. A crash
    * never reaches this method, so a crashed worker's slots legitimately stay active.
+   *
+   * Residual (explicit, per the plan): Docker and other unregistered writers are not part of
+   * `sourceTailsJoined`. quiesceRun logs a docker_error but sets no join flag, so a Docker container (or any
+   * writer the worker does not register) that outlives the flight is not accounted here. That stays a
+   * documented residual of #3404, not a claim of this method.
    */
   private async endFlightSourceUse(flight: RunFlight, runLog: Logger): Promise<void> {
     const authority = this.authority;
@@ -3437,7 +3448,7 @@ export class RunRunner {
       if (await this.publishFlightSource(flight, bound, runLog) !== "unpublished") paths.delete(resolvePath(bound.clonePath));
     }
     if (paths.size === 0) return;
-    const outcome = await authority.endSourceUse(paths, { timeoutMs: SOURCE_USE_END_WAIT_MS });
+    const outcome = await authority.endSourceUse(paths, { timeoutMs: this.sourceUseEndWaitMs });
     if (outcome.kept.length > 0) runLog.warn("source use left active for some paths", { kept: outcome.kept.length });
   }
 
@@ -3475,7 +3486,7 @@ export class RunRunner {
       }
       const rootsKey = (roots: CompletionSource["roots"]): string => canonicalJson(
         roots.map(r => ({ sha: r.sha, contexts: r.contexts.map(c => canonicalJson(c)).sort() })).sort((a, b) => a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0));
-      const outcome = await authority.publishSource(bound.clonePath, lease, { timeoutMs: SOURCE_USE_END_WAIT_MS }, async ({ tx, store }) => {
+      const outcome = await authority.publishSource(bound.clonePath, lease, { timeoutMs: this.sourceUseEndWaitMs }, async ({ tx, store }) => {
         const { barePath, branch, runId, generation } = bound.context;
         if (await this.git.worktreeHead(bound.clonePath) !== bound.expectedHead) throw new Error("the source HEAD changed since it was bound");
         if (rootsKey(await this.completionRoots(barePath, runId, generation)) !== rootsKey(bound.roots)) {

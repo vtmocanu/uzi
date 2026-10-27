@@ -432,13 +432,13 @@ test("a failed durable write never returns a lease or leaves an eligible state",
   await tx(f, (t2) => publish(f, s, t2, lease, "sealed"));
 
   flags.rename = true;
-  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /injected rename/);
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src, { consumePublication: true })), /injected rename/);
   assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.state, "sealed", "old state intact when nothing was replaced");
   assert.deepEqual(slotFiles(f), [`${key}.json`]);
   flags.rename = false;
 
   flags.dir = true;
-  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /injected dir sync/);
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src, { consumePublication: true })), /injected dir sync/);
   flags.dir = false;
   // The rename may or may not be durable; either way the state is never one that releases.
   // (Reading finishes the head update for a slot renamed just before the failure.)
@@ -858,7 +858,7 @@ test("a codex slot can never become claude_ready: the harness is bound at admiss
   const bKey = await tx(f, (t2) => s.slotKey(t2, bSrc));
   const bLease = await tx(f, (t2) => admitCodex(s, t2, bSrc));
   await tx(f, (t2) => publish(f, s, t2, bLease, "sealed"));
-  const successor = await tx(f, (t2) => s.admitSourceUse(t2, bSrc));
+  const successor = await tx(f, (t2) => s.admitSourceUse(t2, bSrc, { consumePublication: true }));
   const reslot = await tx(f, (t2) => s.readSlot(t2, bKey));
   assert.equal(reslot?.publication, null, "re-admission wipes the publication");
   assert.equal(reslot?.owner.executor, null);
@@ -1010,7 +1010,7 @@ test("a published slot refuses bare mutation until a fresh epoch is admitted", a
     assert.equal(slot?.pending, null, "nothing was recorded");
     assert.equal(slot?.state, to);
   }
-  const fresh = await tx(f, (t2) => s.admitSourceUse(t2, cSrc));
+  const fresh = await tx(f, (t2) => s.admitSourceUse(t2, cSrc, { consumePublication: true }));
   await tx(f, (t2) => s.beginPending(t2, fresh, { kind: "bare_mutation", footprint: "x" }));
 });
 
@@ -1509,4 +1509,30 @@ test("peekAuthoritySlot reads a slot with no transaction and writes nothing", as
   // Slots without an enrollment are a reset, never an empty store.
   fs.rmSync(enrollmentFile(f));
   await assert.rejects(peek(), /reset|without an enrollment/);
+});
+
+test("a fresh epoch over a live publication needs the explicit consuming purpose; nothing else mints one", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const cSrc = source(f, "runner/qa");
+  const xSrc = source(f, "runner/qb");
+  const cLease = await tx(f, (t2) => s.admitSourceUse(t2, cSrc));
+  const xLease = await tx(f, (t2) => admitCodex(s, t2, xSrc));
+  for (const [lease, to, src] of [[cLease, "claude_ready", cSrc], [xLease, "sealed", xSrc]] as const) {
+    await tx(f, (t2) => publish(f, s, t2, lease, to));
+    const key = await tx(f, (t2) => s.slotKey(t2, src));
+    const before = await tx(f, (t2) => s.readSlot(t2, key));
+    for (const options of [{}, { executor: "exec-9" }, { destructive: true }, { lease }, { consumePublication: false }] as const) {
+      await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src, options)), /published/, JSON.stringify(options));
+    }
+    assert.deepEqual(await tx(f, (t2) => s.readSlot(t2, key)), before, "every refusal wrote nothing");
+    // A destructive purpose never consumes, even with the consuming flag.
+    await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src, { destructive: true, consumePublication: true })), /retiring lease/);
+    const fresh = await tx(f, (t2) => s.admitSourceUse(t2, src, { consumePublication: true }));
+    const after = await tx(f, (t2) => s.readSlot(t2, key));
+    assert.equal(after?.state, "active");
+    assert.equal(after?.publication, null);
+    assert.notEqual(after?.epoch, before?.epoch);
+    assert.ok(fresh);
+  }
 });

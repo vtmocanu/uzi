@@ -954,7 +954,8 @@ export class AuthorityStore {
    * REFUSED, never silently replaced by a new epoch: call without a lease to mint one.
    */
   async admitSourceUse(
-    tx: AuthorityTransaction, sourcePath: string, options: { executor?: string; lease?: SourceUseLease; destructive?: boolean } = {},
+    tx: AuthorityTransaction, sourcePath: string,
+    options: { executor?: string; lease?: SourceUseLease; destructive?: boolean; consumePublication?: boolean } = {},
   ): Promise<SourceUseLease> {
     this.#check(tx);
     if (options.executor !== undefined &&
@@ -971,11 +972,17 @@ export class AuthorityStore {
       if (old.state === "active" && old.owner.worker !== this.#init.incarnation) {
         throw new AuthorityRefusal("source is active under another worker incarnation");
       }
-      // A destructive purpose must not mint a fresh epoch over a live publication: that write would drop the
-      // published proof (publication: null) with no retiring record. Retirement (beginRetirement) is the
-      // way to destroy a published source.
+      // A fresh epoch writes `publication: null`, so minting one over a live publication (sealed/claude_ready)
+      // would erase the published proof with no retiring record. Only a caller that passes the explicit
+      // `consumePublication` purpose may do that: the canonical/attempt seeds in git.ts, which run after the
+      // journal guards found no journal naming the path. A destructive purpose never consumes (retirement via
+      // beginRetirement is the way to destroy a published source), and bind, predecessor, normalize and
+      // discard admissions pass no purpose, so they refuse.
       if (options.destructive === true && old.publication !== null) {
         throw new AuthorityRefusal("source is published; a destructive operation needs its retiring lease");
+      }
+      if ((old.state === "sealed" || old.state === "claude_ready") && old.publication !== null && options.consumePublication !== true) {
+        throw new AuthorityRefusal("source is published; a new epoch needs an explicit purpose that consumes the publication");
       }
     }
     if (options.lease) {

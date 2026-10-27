@@ -116,6 +116,34 @@ describe("end of a flight's source use", () => {
       /active under another worker incarnation/);
   });
 
+  it("a teardown through execute() whose process half was never positively joined keeps the slot active and warns", async () => {
+    // evidenceProcessJoined unset with NO evidenceJoinFailed: the quiescence result is real and clean, but the
+    // flight's join record is withheld, so "no failure was seen" must not be read as "joined".
+    const r = await rig();
+    const claim = gitlabClaim(340409);
+    const warnings: string[] = [];
+    const runner = runnerWith(stopAfterSeed(), rawFakeGitlab({}).gitlab, undefined, undefined, { authority: r.rt });
+    const internals = runner as unknown as {
+      quiesceRun(flight: { evidenceProcessJoined?: unknown; evidenceJoinFailed?: boolean; runLog: { warn: (m: string) => void } }, ...rest: unknown[]): Promise<unknown>;
+    };
+    const quiesce = internals.quiesceRun.bind(runner);
+    let sawUnset = false;
+    internals.quiesceRun = async (flight, ...rest) => {
+      const result = await quiesce(flight, ...rest);
+      flight.evidenceProcessJoined = undefined;
+      sawUnset = flight.evidenceJoinFailed !== true;
+      const warn = flight.runLog.warn.bind(flight.runLog);
+      flight.runLog.warn = (message: string, ...more: unknown[]) => { warnings.push(message); (warn as (m: string, ...m2: unknown[]) => void)(message, ...more); };
+      return result;
+    };
+    await runner.execute(claim);
+    assert.equal(failed(claim.run_id), true);
+    assert.equal(sawUnset, true, "the join record was withheld without any recorded failure");
+    const canonical = git.runnerClonePath(git.barePathFor(fx.originPath), "issue-340409");
+    assert.equal((await slotOf(r.rt, canonical))?.state, "active", "an unset join is not a join");
+    assert.match(warnings.join("\n"), /not positively joined/);
+  });
+
   it("a worker that dies mid-flight (no end) leaves the slot active, and a successor incarnation refuses the path", async () => {
     const r = await rig();
     const bare = await git.ensureClone(fx.originPath);

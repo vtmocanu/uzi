@@ -21,9 +21,10 @@
  * two that can run with none active: the runner-uid delete's late `close` (a child that outlived its
  * caller) and the continuation GitCache.cleanupArchivedRecoveryPin abandons when its caller's deadline
  * passes (it still holds B). `settle` NEVER acquires A: with no active transaction the settlement is
- * queued in-process and applied at the start of the next outermost A acquisition (or by a microtask
- * the exit of an outermost transaction schedules). Until applied the durable record stays `running`
- * (fail-closed); if the process dies first, a successor sees it unresolved.
+ * queued in-process and applied by the idle drain `settle` itself schedules (a microtask that acquires
+ * A with no lock held and is not awaited), or at the start of the next outermost A acquisition. A failed
+ * apply is re-queued a bounded number of times, then logged and left `running`. Until applied the durable
+ * record stays `running` (fail-closed); if the process dies first, a successor sees it unresolved.
  *
  * Wiring: `new GitCache(dataDir, log, retry, { authority, authorityRequired })`. With no hooks and
  * `authorityRequired` false (every test default) behaviour is exactly the legacy one. With
@@ -47,6 +48,10 @@
  *    clone. Footprint: the successor path and the journal that names the retained predecessors.
  *  - "discard": GitCache.discardRetainedSource, after the disposition check and before the first
  *    delete. Footprint: every path of the retained record.
+ *  A published source (sealed/claude_ready) is never re-admitted by accident: the runtime passes the
+ *  store's explicit consume-the-publication purpose only for "seed-canonical" and "seed-attempt" (they run
+ *  after git.ts's journal guards found no journal naming the path). "replace", "normalize", "discard" and
+ *  every destructive operation never consume a publication; retirement does.
  *  Not hooked: retainStoppedAttempt and markStoppedCanonical change bare ledger/marker/journal
  *  metadata only and never touch clone bytes; retireRunnerClone is fenced by the journal's
  *  completion-source fence (expectedFence), not by this hook.
@@ -81,11 +86,14 @@
  *
  * assertBareClear(barePath, op) — refuses while a beginBareMutation record on that bare is unresolved,
  *  so a pin or coverage ref cannot be re-created over a pending (ABA) deletion, and a seed cannot start
- *  on a repository whose bare has an unresolved mutation. It needs NO transaction: it reads the bare's
- *  slot with a read-only load that never writes (a record written by an owner that is dead, since W
- *  excludes another compatible worker, or serialized in this process by the bare lock B the caller
- *  holds), and refuses fail-closed on a slot one ahead of its head shard instead of completing that
- *  crash window. Runner sites that therefore lost their A wrapper (their only hook is this one):
+ *  on a repository whose bare has an unresolved mutation. It needs NO transaction: with none active it
+ *  reads the bare's slot with a read-only load that never writes (a record written by an owner that is
+ *  dead, since W excludes another compatible worker, or by this process's own transactions; the bare lock
+ *  B the caller holds does not serialize those, a queued late settlement only relaxes the record), and
+ *  refuses fail-closed on a slot one ahead of its head shard instead of completing that crash window.
+ *  With a transaction active (the seed and replace sites all hold A) it reads through the transactional
+ *  load, which completes that window, so one failed head write cannot block a repository's seeds
+ *  permanently. Runner sites that therefore lost their A wrapper (their only hook is this one):
  *  fetchAgentBranch, updateTrackingRef, retainCurrentOwedCandidate (two sites) and anchorRecoveryHead;
  *  in recovery.ts freezeInventory (buildRecoveryCoverage) and the inventory source boundary around it.
  *  - "seed-canonical", "seed-attempt", "replace": GitCache.runnerCloneForBranch, attemptCloneForBranch
