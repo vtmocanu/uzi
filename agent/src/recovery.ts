@@ -1359,11 +1359,20 @@ export class RecoveryCoordinator {
         return this.withJournalLock(context.runId, async () => {
           const records = await this.newReconstructionRecords(context.runId, context.generation);
           if (!records) return undefined;
-          const matching = records.find(r => r.generation === context.generation && r.inventoryGuarded &&
+          const matches = records.filter(r => r.generation === context.generation && r.inventoryGuarded &&
             r.coverageDigest === digest && r.sourceSha === sourceSha &&
             r.inventoryCurrentSha === input.currentSha && r.originalSourceSha === originalSourceSha &&
             canonicalJson(r.coverageContext) === canonicalJson(context) &&
             canonicalJson(r.originalRoots) === canonicalJson(roots));
+          const replaceable = (r: RecoveryRecord): boolean => classifyRecoveryOrigin(r.captureId) === "ordinary" &&
+            r.reason === "inventory_snapshot_changed" && !r.finalRequest && !r.finalAcknowledged && !r.completionReceipt;
+          let matching = matches.find(r => !replaceable(r));
+          if (!matching) {
+            const invalidated = matches.find(replaceable);
+            // Clone/journal heads are not part of the fingerprint. A persistent
+            // uncovered head must retain this identity, not create one upload per pass.
+            if (invalidated && await this.frozenSourceAncestry(invalidated, candidates) !== "verified") matching = invalidated;
+          }
           if (matching) {
             this.noteInventoryDiagnostic(matching, matching.reason === "inventory_snapshot_changed" || matching.reason === "inventory_quiescence_breach"
               ? "invalidated_snapshot_reused" : "matching_snapshot_reused");
@@ -1916,41 +1925,52 @@ export class RecoveryCoordinator {
       }, budget.signal)));
   }
 
-  private async frozenCoverageProven(record: RecoveryRecord): Promise<boolean> {
-    // Every still-unresolved root must be covered; an earlier archive cannot close a later inventory.
-    if (!record.coverageContext || !this.git.enumerateOwedCandidates) return false;
-    const unresolved = await ownedRecoveryIO(() => this.git.enumerateOwedCandidates!(record.coverageContext!.barePath, record.runId));
-    const frozenRoots = record.originalRoots ?? [];
-    // Authenticate every physical source record: listRecords deliberately skips unreadable
-    // files for inspection, which cannot prove that FINAL covers the run's sources.
-    if (!this.git.readInventoryCloneHeads || !this.git.ancestry) return false;
+  /** Read-only ancestry evidence shared by reconstruction and FINAL. "unavailable"
+   * preserves the old unstamped refusal; an actual non-positive ancestry result
+   * is "unproven". Cancellation/budget errors retain their existing propagation. */
+  private async frozenSourceAncestry(record: RecoveryRecord,
+    unresolved: readonly OwedCandidate[]): Promise<"verified" | "unavailable" | "unproven"> {
+    if (!record.coverageContext || !this.git.readInventoryCloneHeads || !this.git.ancestry) return "unavailable";
+    // Inspection skips unreadable files; authority requires every physical source MAC.
     let sources: RecoveryRecord[];
-    try { sources = await this.checkedRecords(record.runId); } catch { MaintenanceBudget.current()?.check(); return false; }
+    try { sources = await this.checkedRecords(record.runId); } catch { MaintenanceBudget.current()?.check(); return "unavailable"; }
     const clones = await ownedRecoveryIO(() => this.git.readInventoryCloneHeads!(record.coverageContext!.barePath, record.runId));
-    if (clones.kind !== "verified") return false;
-    const laterContext = (c: OwedCandidate["contexts"][number]): boolean =>
-      typeof c.generation === "number" && c.generation > record.generation!;
+    if (clones.kind !== "verified") return "unavailable";
     const laterHead = (sha: string): boolean => {
       const journals = sources.filter(r => !r.coverageDigest && r.sourceSha === sha);
       const producers = unresolved.filter(c => c.sha === sha).flatMap(c => c.contexts);
       return (journals.length + producers.length > 0) &&
         journals.every(r => typeof r.generation === "number" && r.generation > record.generation!) &&
-        producers.every(laterContext);
+        producers.every(c => typeof c.generation === "number" && c.generation > record.generation!);
     };
     const settledEarlier = await this.settledEarlierGenerations(sources, record.generation!);
     const sourceHeads = sources.filter(r => !r.coverageDigest &&
       !(typeof r.generation === "number" && (r.generation > record.generation! || settledEarlier.has(r.generation)))).map(r => r.sourceSha);
-    // Later claims have their own holds. Only positive later-generation evidence can
-    // exclude a retained head; unknown attribution still needs positive ancestry.
+    // Unknown attribution still requires positive ancestry; only proven later
+    // generations and independently settled earlier sources can be excluded.
     const heads = [...new Set([...sourceHeads, ...clones.heads.filter(h => !laterHead(h))])];
     for (const head of heads) {
-      if (await ownedRecoveryIO(() => this.git.ancestry!(record.coverageContext!.barePath, head, record.sourceSha)) !== "ancestor") {
+      if (await ownedRecoveryIO(() => this.git.ancestry!(record.coverageContext!.barePath, head, record.sourceSha)) !== "ancestor") return "unproven";
+    }
+    return "verified";
+  }
+
+  private async frozenCoverageProven(record: RecoveryRecord): Promise<boolean> {
+    // Every still-unresolved root must be covered; an earlier archive cannot close a later inventory.
+    if (!record.coverageContext || !this.git.enumerateOwedCandidates) return false;
+    const unresolved = await ownedRecoveryIO(() => this.git.enumerateOwedCandidates!(record.coverageContext!.barePath, record.runId));
+    const frozenRoots = record.originalRoots ?? [];
+    const ancestry = await this.frozenSourceAncestry(record, unresolved);
+    if (ancestry !== "verified") {
+      if (ancestry === "unproven") {
         this.noteInventoryDiagnostic(record, "source_ancestry_unproven");
         await this.writeExistingRecord(record, cur => ({ ...cur, reason: cur.finalRequest
           ? "inventory_quiescence_breach" : "inventory_snapshot_changed" }));
-        return false;
       }
+      return false;
     }
+    const laterContext = (c: OwedCandidate["contexts"][number]): boolean =>
+      typeof c.generation === "number" && c.generation > record.generation!;
     // Confirmed checkpoints may have removed pins since upload. The immutable archive
     // still covers those roots; only a new or differently attributed root invalidates it.
     if (snapshotRoots(unresolved.map(root => ({ ...root, contexts: root.contexts.filter(c => !laterContext(c)) }))
@@ -2014,10 +2034,14 @@ export class RecoveryCoordinator {
       const hold = await this.heldOperationState(record);
       if (hold !== "open") return this.heldStopped(record, hold);
       if (!(await this.openInventoryHold(record)) || !await prove() || residueQuarantine() !== undefined) return;
-      record = await this.writeExistingRecord(record, cur => ({
-        ...cur, finalRequest: { disposition: { kind: "archive", capture_id: cur.serverCaptureId!,
-          source_sha: cur.sourceSha, coverage_digest: cur.coverageDigest! } },
-      }));
+      record = await this.writeExistingRecord(record, cur => {
+        // Refuse only a new archive mint. Saved requests retain their exact replay
+        // identity, and held-publication mint sites keep their separate policy.
+        if (cur.finalRequest || cur.finalAcknowledged || cur.reason === "inventory_snapshot_changed") return undefined;
+        return { ...cur, finalRequest: { disposition: { kind: "archive", capture_id: cur.serverCaptureId!,
+          source_sha: cur.sourceSha, coverage_digest: cur.coverageDigest! } } };
+      });
+      if (!record.finalRequest) return;
     }
     const request = record.finalRequest!;
     if (request.disposition.kind === "held_publication") return this.releaseHeldFinal(record, request, prove);
