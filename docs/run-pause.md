@@ -201,8 +201,9 @@ not one you or the run's lead asked for: the pending request has
   immediately and records an override for the credential it spent, so it is not
   held again at admission and does not re-pause at once. The override ends at
   the first of: the observed 7-day reset time (read from your current meter when
-  you resume); a later reading that shows the week reset early; or, when the
-  meter carried no reset time, the first fresh reading below the threshold. It
+  you resume, if that reading is fresh and at or above the threshold); a later
+  reading that shows the week reset early; or, when no such reset time was
+  recorded, the first fresh reading below the threshold. It
   never lasts longer than seven days. Its end time is the run's
   `reserve_exempt_until`. If you have already cleared the threshold there is
   nothing to override, and a plain resume applies. A resume that is not of a
