@@ -2097,6 +2097,32 @@ describe("Run defaults — weekly usage reserve (PRD #3522)", () => {
     expect(pctInput().value).toBe("40");
   });
 
+  it("a change made while the session refresh is pending is still sent", async () => {
+    const calls = deferred();
+    let release: () => void = () => {};
+    refresh.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    fireEvent.click(pauseBox());
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]).toMatchObject({ pct: 70, pause: false });
+    calls[0].done();
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    // The write landed and the refresh is in flight: type a new threshold and blur.
+    fireEvent.change(pctInput(), { target: { value: "40" } });
+    fireEvent.blur(pctInput());
+    release();
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1]).toMatchObject({ pct: 40, pause: false });
+    calls[1].done();
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+  });
+
   it("follows a session user change made elsewhere, and a bare focus and blur sends nothing", () => {
     mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
     const view = renderPage();

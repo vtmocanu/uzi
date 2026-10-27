@@ -94,23 +94,29 @@ export function UsageReserveSetting() {
     running.current = true;
     setBusy(true);
     let confirmed = previous;
+    let wrote = false;
     try {
-      while (pending.current) {
-        const sending = pending.current;
-        pending.current = null;
-        const { user: updated } = await api.setUsageReserve(sending.pct, sending.pause);
-        // Adopt what the server stored; an older response without the fields keeps ours.
-        confirmed = {
-          pct: updated.weekly_reserve_pct === undefined ? sending.pct : updated.weekly_reserve_pct,
-          pause: updated.weekly_reserve_pause_running ?? sending.pause,
-        };
-        if (!pending.current) setLocal({ value: confirmed, base: savedRef.current });
-      }
-      await refresh();
+      // A change made while the refresh is pending is queued, so look again after it.
+      do {
+        while (pending.current) {
+          const sending = pending.current;
+          pending.current = null;
+          const { user: updated } = await api.setUsageReserve(sending.pct, sending.pause);
+          wrote = true;
+          // Adopt what the server stored; an older response without the fields keeps ours.
+          confirmed = {
+            pct: updated.weekly_reserve_pct === undefined ? sending.pct : updated.weekly_reserve_pct,
+            pause: updated.weekly_reserve_pause_running ?? sending.pause,
+          };
+          if (!pending.current) setLocal({ value: confirmed, base: savedRef.current });
+        }
+        await refresh();
+      } while (pending.current);
     } catch (err) {
       // The failed write and anything queued behind it are dropped; roll back to the
-      // last pair the server confirmed.
+      // last pair the server confirmed, and refresh if an earlier write did land.
       pending.current = null;
+      if (wrote) void Promise.resolve(refresh()).catch(() => {});
       setLocal({ value: confirmed, base: savedRef.current });
       if (confirmed.pct !== null) setDraft(String(confirmed.pct));
       setSaveError(errorMessage(err, "Failed to update the weekly usage reserve"));
