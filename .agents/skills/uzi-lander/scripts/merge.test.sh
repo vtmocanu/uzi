@@ -643,7 +643,7 @@ fi
 # policy delta since this branch's own merge-base decides freshness (#3550).
 REAL_GIT=$(command -v git)
 export REAL_GIT POLICY_ROOT="$WORK/policy" POLICY_REMOTE="$WORK/policy-origin.git"
-export POLICY_SCRIPT_DIR="$HERE" POLICY_BASE_GH="$WORK/bin/gh" POLICY_GIT_LOG="$WORK/policy-git.log"
+export POLICY_SCRIPT_DIR="$HERE" POLICY_BASE_GH="$WORK/bin/gh" POLICY_GIT_LOG="$WORK/policy-git.log" POLICY_GH_LOG="$WORK/policy-gh.log"
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_ALLOW_PROTOCOL=file
 export SESSION_PEERS_NAME=policy-fixture SESSION_PEERS_UUID=policy-fixture SESSION_PEERS_KIND=codex
 mkdir -p "$WORK/policy-bin" "$POLICY_ROOT"
@@ -653,6 +653,7 @@ mkdir -p "$WORK/policy-bin" "$POLICY_ROOT"
 mkdir -p "$POLICY_ROOT/scripts/lib" "$POLICY_ROOT/api"
 printf 'base\n' > "$POLICY_ROOT/README.md"
 printf 'base\n' > "$POLICY_ROOT/api/doc.md"
+# Intentionally independent of merge.sh's array: deleting a production path must fail.
 POLICIES=(scripts/check-changelog-entry.sh scripts/lib/shipping-paths.sh scripts/lib/dependency-bump.sh
   scripts/lib/changelog-fragments.sh scripts/lib/changelog-fragments.awk scripts/assert-changelog-covers-release.sh)
 for path in "${POLICIES[@]}"; do printf 'old policy\n' > "$POLICY_ROOT/$path"; done
@@ -670,7 +671,11 @@ case " $* " in
   *' config --get remote.origin.url '*)
     if [ "${POLICY_ORIGIN_MISMATCH:-0}" = 1 ]; then echo https://github.com/other/repo.git; exit 0; fi ;;
   *' fetch '*)
-    [ -f "$UZI_LANDER_STATE_DIR/locks/merge/uuid" ] || { echo 'fetch outside merge lock' >&2; exit 99; }
+    if [ "${POLICY_LOCK_STATE_FAIL:-0}" = 1 ]; then
+      [ ! -f "$UZI_LANDER_STATE_DIR/locks/merge/uuid" ] || { echo 'expected unavailable lock state' >&2; exit 99; }
+    else
+      [ -f "$UZI_LANDER_STATE_DIR/locks/merge/uuid" ] || { echo 'fetch outside merge lock' >&2; exit 99; }
+    fi
     printf '%s\n' "$*" >> "$POLICY_GIT_LOG"
     [ "${POLICY_FETCH_FAIL:-0}" != 1 ] || exit 88 ;;
   *' diff '*) [ "${POLICY_DIFF_FAIL:-0}" != 1 ] || exit 89 ;;
@@ -680,6 +685,7 @@ STUB
 cat > "$WORK/policy-bin/gh" <<'STUB'
 #!/usr/bin/env bash
 set -eu
+printf '%s\n' "$*" >> "$POLICY_GH_LOG"
 if [ "${1:-}" = pr ] && [ "${2:-}" = view ] && [[ "$*" == *headRefOid* ]]; then
   "$POLICY_BASE_GH" "$@" | jq --arg h "$POLICY_HEAD" '.headRefOid=$h'
 else
@@ -714,8 +720,16 @@ for path in "${POLICIES[@]}"; do
   grep -qF "$path" "$WORK/policy.out" || fail "stale-policy refusal omitted $path"
   grep -qF 'fresh exact-head CI' "$WORK/policy.out" || fail "stale-policy refusal omitted recovery"
 done
-policy_run Vtmocanu/Uzi
-[ "$rc" -eq 12 ] || fail "policy repository casing bypassed the guard: $(cat "$WORK/policy.out")"
+for repo in Vtmocanu/Uzi github.com/vtmocanu/uzi https://github.com/vtmocanu/uzi; do
+  policy_run "$repo"
+  [ "$rc" -eq 12 ] || fail "policy repository spelling '$repo' bypassed the guard: $(cat "$WORK/policy.out")"
+done
+for repo in otherhost/vtmocanu/uzi git@github.com:vtmocanu/uzi vtmocanu/uzi/ vtmocanu/uzi.git vtmocanu/..; do
+  rm -f "$POLICY_GH_LOG"
+  policy_run "$repo"
+  [ "$rc" -eq 2 ] || fail "malformed repository '$repo' did not refuse before forge reads"
+  [ ! -s "$POLICY_GH_LOG" ] || fail 'malformed repository reached the forge'
+done
 policy_run vtmocanu/uzi --no-admin
 [ "$rc" -eq 12 ] || fail "policy-no-admin bypassed the guard: $(cat "$WORK/policy.out")"
 [ ! -e "$WORK/merge.log" ] || fail 'stale policy reached a non-admin merge'
@@ -749,6 +763,57 @@ policy_run
 [ "$rc" -eq 2 ] || fail "policy-origin-mismatch: expected refusal, got $rc"
 [ ! -e "$WORK/merge.log" ] || fail 'merged using policy from another repository'
 unset POLICY_ORIGIN_MISMATCH
+# A PR may propose a policy edit itself: compare main's delta, not head..main.
+git -C "$POLICY_ROOT" checkout -q -B policy-edit main
+printf 'branch policy improvement\n' >> "$POLICY_ROOT/scripts/check-changelog-entry.sh"
+git -C "$POLICY_ROOT" commit -qam 'propose a policy edit'
+POLICY_HEAD=$(git -C "$POLICY_ROOT" rev-parse HEAD); export POLICY_HEAD
+policy_run
+[ "$rc" -eq 0 ] || fail "policy-own-edit: $(cat "$WORK/policy.out")"
+[ -s "$WORK/merge.log" ] || fail 'branch-owned policy edit was refused'
+
+# The actual head exists only on the bare origin, under its pull ref. This proves
+# a real missing-object fetch, not a mocked cat-file failure in the same clone.
+git clone -q --no-hardlinks "$POLICY_REMOTE" "$WORK/pr-only"
+git -C "$WORK/pr-only" config user.name fixture
+git -C "$WORK/pr-only" config user.email fixture@example.invalid
+printf 'remote-only PR\n' > "$WORK/pr-only/api/doc.md"
+git -C "$WORK/pr-only" commit -qam 'remote-only PR head'
+POLICY_HEAD=$(git -C "$WORK/pr-only" rev-parse HEAD); export POLICY_HEAD
+git -C "$WORK/pr-only" push -q origin HEAD:refs/pull/42/head
+if git -C "$POLICY_ROOT" cat-file -e "$POLICY_HEAD^{commit}" 2>/dev/null; then fail 'remote-only head was already local'; fi
+policy_run
+[ "$rc" -eq 0 ] || fail "policy-remote-head: $(cat "$WORK/policy.out")"
+grep -qF "origin $POLICY_HEAD" "$POLICY_GIT_LOG" || fail 'remote-only head did not exercise by-SHA fetch'
+git -C "$POLICY_ROOT" cat-file -e "$POLICY_HEAD^{commit}" || fail 'exact remote head was not imported'
+
+# A persistent state-dir failure already blocks acknowledgement reads. Model a
+# failure only at lock acquisition (second state_dir call), preserving that path.
+REAL_MKDIR=$(command -v mkdir); export REAL_MKDIR POLICY_STATE_CALLS="$WORK/policy-state-calls"
+cat > "$WORK/policy-bin/mkdir" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+if [ "${POLICY_LOCK_STATE_FAIL:-0}" = 1 ] && [ "${1:-}" = -p ] && [ "${2:-}" = "$UZI_LANDER_STATE_DIR/trail" ]; then
+  count=0; if [ -f "$POLICY_STATE_CALLS" ]; then count=$(cat "$POLICY_STATE_CALLS"); fi
+  count=$((count+1)); printf '%s\n' "$count" > "$POLICY_STATE_CALLS"
+  [ "$count" -ne 2 ] || exit 1
+fi
+exec "$REAL_MKDIR" "$@"
+STUB
+chmod +x "$WORK/policy-bin/mkdir"
+POLICY_FRESH_HEAD=$POLICY_HEAD
+export POLICY_LOCK_STATE_FAIL=1
+rm -f "$POLICY_STATE_CALLS"
+policy_run
+[ "$rc" -eq 0 ] || fail "policy-no-lock-fresh: $(cat "$WORK/policy.out")"
+[ -s "$WORK/merge.log" ] || fail 'fresh policy was refused when the lock state directory was unavailable'
+POLICY_HEAD=$POLICY_STALE_HEAD; export POLICY_HEAD
+rm -f "$POLICY_STATE_CALLS"
+policy_run
+[ "$rc" -eq 12 ] || fail "policy-no-lock-stale: $(cat "$WORK/policy.out")"
+[ ! -e "$WORK/merge.log" ] || fail 'missing lock skipped stale-policy protection'
+unset POLICY_LOCK_STATE_FAIL
+POLICY_HEAD=$POLICY_FRESH_HEAD; export POLICY_HEAD
 fetches_before=$(wc -l < "$POLICY_GIT_LOG")
 export MERGE_STATE=MERGED POLICY_FETCH_FAIL=1 POLICY_HEAD=$POLICY_STALE_HEAD
 rm -f "$WORK/merge.log"
@@ -761,7 +826,7 @@ set -e
 [ "$(wc -l < "$POLICY_GIT_LOG")" = "$fetches_before" ] || fail 'confirm-only fetched policy after an out-of-band merge'
 unset POLICY_FETCH_FAIL
 [ -s "$POLICY_GIT_LOG" ] || fail 'policy freshness never fetched under the merge lock'
-echo 'PASS merge-policy: six policy changes/admin/no-admin/case refuse; rebase/unrelated-main accept; fetch/diff/origin errors refuse; confirm-only skips policy'
+echo 'PASS merge-policy: six changes/admin modes/repo spellings refuse stale policy; rebase/unrelated-main/own-policy-edit/remote-head accept; Git errors refuse; optional lock still checks; confirm-only skips'
 if [ "${UZI_MERGE_POLICY_ONLY:-0}" = 1 ]; then exit 0; fi
 
 echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses unless its tag is on origin and coverage holds without it; --expect-closes refuses a closing-reference mismatch"
