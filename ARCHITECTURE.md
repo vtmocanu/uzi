@@ -464,6 +464,17 @@ durable design decisions and
 [docs/rate-limits.md](docs/rate-limits.md#codex-account-limits) for
 user-facing behavior.
 
+A separate survivor path can retry an original non-rejection refresh error once
+when its durable receipt authorizes reuse. Admission consumes the retry under
+user secret mutation/account/intent locks with a fresh database clock and an
+enabled linked alias; local vault/login failures defer without consumption.
+Recovered material stays quarantined until identity-verified promotion. The
+survivor and account-action display share a 52.14-second in-flight policy bound;
+owner restore advances the generation and fences stale installs. Mixed API
+versions are unsupported for receipt-aware resolution/display. See
+[ADR-3523](adr/3523-codex-refresh-provider-error-reuse.md) for the fixed 30-minute
+eligibility window, terminal fences, provider-overlap risk and evidence limits.
+
 ## Agent runtime: workers, runs, live view
 
 uzi's third surface is the one that acts: a per-user worker container claims
@@ -2051,7 +2062,12 @@ token's server-enforced scope. See
   else (`POST /api/workers`, `/api/me/cli-tokens`, `/api/vault/*`, `/api/forge/*`,
   `/api/me/secrets/*`, every admin write) stayed cookie-only, since swapping whole
   groups would have widened what a stolen CLI token could do. See the PRD's
-  route-disposition table.
+  route-disposition table. Issue #3504 later adds `GET /api/vault/status` and
+  `POST /api/vault/unlock` to `RequireUser` for `uzi vault status` and
+  `uzi vault unlock`; lock and passphrase creation remain cookie-only. Unlock
+  retains the authenticated per-user limiter shared by cookies and CLI tokens.
+  See [the vault threat model](docs/vault-threat-model.md#cli-unlock-authenticated-guessing-and-key-custody)
+  for the accepted guessing surface.
 - **`scope` is a ceiling, enforced in the middleware, not just at `/api/admin/*`.**
   `RequireAdminRO` is a plain `user.IsAdmin` check; the real control is upstream in
   `RequireUser`, which gives a CLI token whose `scope != 'admin_ro'` a **copy** of
@@ -2116,8 +2132,8 @@ rationale.
   broken relative link (doc→doc or doc→img), reference-style links, or an
   oversized `docs/img/*` file; it warns (without failing) on a `user` page over
   the 60-line house-style budget.
-  It runs both locally (ahead of `npm run build`) and in CI (`validate:web`
-  runs `npm run check-docs` too, PRD #52), so a broken doc fails the pipeline as
+  It runs both locally (ahead of `npm run build`) and in CI (`validate-web`
+  runs `task check-docs:web` too, PRD #52), so a broken doc fails the pipeline as
   well as the local build.
 
 ## Deployment: compose (laptop) and k8s

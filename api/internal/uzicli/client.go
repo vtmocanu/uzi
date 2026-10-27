@@ -24,6 +24,8 @@ import (
 // handlers serialize, without importing internal/handler (which would drag pgx +
 // chi into the binary — the go list -deps layering assertion).
 type Client interface {
+	VaultStatus(ctx context.Context) (VaultStatusResult, error)
+	VaultUnlock(ctx context.Context, password string) error
 	Whoami(ctx context.Context) (apitypes.UserDTO, error)
 	// WhoamiVault reads GET /api/auth/me like Whoami, but decodes the sibling top-level
 	// `vault` object the same response carries and returns the viewer's vault-LOCK state

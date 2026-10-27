@@ -88,6 +88,7 @@
     "historical": true
   },
   "code_cross_check_summary": {
+    "coverage": {},
     "custom_guidance_applied": true,
     "guidance_digest": "x",
     "repo_instructions_commit": "x",

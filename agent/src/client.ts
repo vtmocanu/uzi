@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { decodeCodeCoverage, type CodeCoverage } from "./code-cross-check-coverage.js";
 import { decodePublicationContext, validatePublicationContextRequest } from "./publication-context.js";
 import type { PublicationContextRequest, PublicationContextResponse } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
@@ -2016,8 +2017,9 @@ export class WorkerClient {
   }
 
   async reportCodeCrossCheckVerdict(runId: string, generation: number,
-    result: { outcome: "completed" | "failed"; reason_class?: string; findings: CodeFinding[] }, signal?: AbortSignal): Promise<void> {
+    result: { outcome: "completed" | "failed"; reason_class?: string; findings: CodeFinding[]; coverage?: CodeCoverage }, signal?: AbortSignal): Promise<void> {
     decodeCodeFindings(result.findings);
+    if (result.coverage !== undefined) decodeCodeCoverage(result.coverage);
     await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-check-verdict`,
       { claim_generation: generation, ...result }, this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
   }

@@ -249,6 +249,11 @@ refresh operations and durable latest-state reconciliation remain production
 requirements; no prior-token reuse or concurrent-refresh guarantee follows from
 these unchanged M0 measurements.
 
+[ADR-3523](3523-codex-refresh-provider-error-reuse.md) adds one survivor retry
+for a durable receipt of an original non-rejection refresh error, outside the
+callback. It supersedes the no-reuse policy only for that case; these historical
+measurements still provide no live proof of prior-token reuse.
+
 ## Model and effort decision
 
 The refreshed server catalog visible to 0.153.2 contained:

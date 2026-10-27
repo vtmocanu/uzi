@@ -33,9 +33,15 @@ import (
 // review still needs the nil Reviews entry — otherwise it is asking about a 404.
 type FakeClient struct {
 	User apitypes.UserDTO
-	// VaultLocked drives WhoamiVault's `locked` return (PRD #1251 M2), so a test can drive
-	// the TUI's tier-1 vault-locked hint on/off. Whoami ignores it (it stays {user}-only).
+	// VaultLocked drives WhoamiVault and VaultStatus, so fixtures share one vault state.
+	// Whoami ignores it (it stays {user}-only).
 	VaultLocked bool
+
+	VaultStatusErr       error
+	VaultUnlockErr       error
+	VaultStatusCalls     int
+	VaultUnlockCalls     int
+	VaultUnlockPasswords []string
 
 	Runs                 []apitypes.RunListItemDTO
 	RunByID              map[string]apitypes.RunDTO

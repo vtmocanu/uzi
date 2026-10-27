@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { decodeCodeCoverage, type CodeCoverage } from "./code-cross-check-coverage.js";
 import { parseSemanticCandidate, SEMANTIC_ENVELOPE_MAX_BYTES } from "./semantic-plan.js";
 import type { ClaimPlanCrossCheck, ClaimCodeCrossCheck } from "./protocol.js";
 
@@ -25,6 +26,7 @@ export type CodeCrossCheckDispositionBatch = Array<Omit<CodeCrossCheckDispositio
   disposition: "addressed" | "declined";
 }>;
 export interface CodeCrossCheckRecord {
+  coverage?: CodeCoverage | null;
   stage: "code";
   round: 1;
   candidate_generation: number;
@@ -134,6 +136,7 @@ export function decodeCrossCheckClaim(v: unknown): ClaimPlanCrossCheck | ClaimCo
     } catch { return invalid(); }
   }
   if (v.stage === "code") {
+    if (v.coverage_supported !== undefined && typeof v.coverage_supported !== "boolean") return invalid();
     if (v.repo_instructions_commit !== undefined && (typeof v.repo_instructions_commit !== "string"
       || v.repo_instructions_commit.length !== 40 || !/^[a-f0-9]{40}$/.test(v.repo_instructions_commit))) return invalid();
     if (!/^[A-Za-z0-9_-]+(?![\s\S])/.test(v.lead_run_id as string) || v.base_commit.length !== 40 || (v.candidate_digest as string).length !== 64 || v.round !== 1 || !/^[a-f0-9]{64}$/.test(v.candidate_digest as string) || typeof v.head_commit !== "string" || v.head_commit.length !== 40 || !/^[a-f0-9]{40}$/.test(v.head_commit)
@@ -154,7 +157,7 @@ export function decodeCrossCheckClaim(v: unknown): ClaimPlanCrossCheck | ClaimCo
       || (v.custom_guidance_applied !== undefined && v.custom_guidance_applied !== (guidance !== ""))) return invalid();
     return { ...v, guidance_snapshot: guidance } as unknown as ClaimCodeCrossCheck;
   }
-  if ("repo_instructions_commit" in v) return invalid();
+  if ("repo_instructions_commit" in v || "coverage_supported" in v) return invalid();
   if (!Number.isInteger(v.round) || (v.round as number) < 1 || (v.round as number) > 5
     || !v.plan_md || !bounded(v.planning_diff, 512 * 1024)
     || !Array.isArray(v.milestones) || v.milestones.length > 64
@@ -240,5 +243,5 @@ export function decodeCodeCrossCheckStatus(v: unknown): CodeCrossCheckStatus {
   } else if (v.dispositions === null && finalized_at !== null && v.interrupted_at === null) return invalid();
   // WorkerCodeCrossCheckStatus hides superseded findings and dispositions.
   if (v.interrupted_at !== null && findings.length !== 0) return invalid();
-  return { ...v, findings, dispositions, finalized_at } as unknown as CodeCrossCheckRecord;
+  return { ...v, findings, dispositions, finalized_at, coverage: decodeCodeCoverage(v.coverage) } as unknown as CodeCrossCheckRecord;
 }

@@ -379,6 +379,11 @@ const CODEX_BOUNDARY_STEPS: ReadonlySet<BoundaryStep> = new Set<BoundaryStep>([
   "checkpoint_import_mutation",
   "checkpoint_import_readback",
   "checkpoint_code_head",
+  "checkpoint_code_head_runner_tip",
+  "checkpoint_code_head_tracking",
+  "checkpoint_code_head_default_tip",
+  "checkpoint_code_head_pin",
+  "checkpoint_code_head_changed_files",
   "checkpoint_bridge",
   "checkpoint_post_import", "checkpoint_steer", "checkpoint_post_bridge",
 ]);
@@ -12058,17 +12063,23 @@ export class RunRunner {
       }
     };
 
-    const captureImportedCodeHead = async (head: string | null): Promise<void> => {
+    const captureImportedCodeHead = async (head: string | null, step?: (s: BoundaryStep) => void): Promise<void> => {
       clearCodeSnapshot();
-      if (!barePath || !head || await this.git.branchTip(runnerClone.path, runnerClone.branch) !== head) return;
+      if (!barePath || !head) return;
+      step?.("checkpoint_code_head_runner_tip");
+      if (await this.git.branchTip(runnerClone.path, runnerClone.branch) !== head) return;
+      step?.("checkpoint_code_head_tracking");
       await this.requireTrackingOwned(flight, barePath, runnerClone.branch, head);
+      step?.("checkpoint_code_head_default_tip");
       const defaultBranch = claim.repo.default_branch?.trim() || await this.git.defaultBranchName(barePath);
       const defaultCommit = defaultBranch ? await this.git.originBranchTip(barePath, defaultBranch) : null;
       if (!defaultCommit) return;
       codeDefaultCommit = defaultCommit;
+      step?.("checkpoint_code_head_pin");
       codeSnapshot = await this.git.pinCodeSnapshot(barePath, runId, head, defaultCommit, false);
       codeEmptyPrompt = false;
       if (claim.kind === "prompt") {
+        step?.("checkpoint_code_head_changed_files");
         const changed = await this.git.readBare(barePath,
           ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--name-only", `${codeSnapshot.base_commit}...${head}`],
           { maxBytes: 1024, signal: steering.lifecycleSignal() });
@@ -12088,12 +12099,13 @@ export class RunRunner {
       // reaches the executor, but narrow it so the closure is honest rather than `!`.
       if (!barePath) return "no_new_work";
       const checkpointSteps = opts.doneAttempt?.steps ?? (opts.reap ? new BoundaryStepTracker(runLog, this.now, "checkpoint step", opts.sink) : undefined);
-      if (opts.doneAttempt) checkpointSteps?.enter("checkpoint_code_head");
+      if (opts.doneAttempt) checkpointSteps?.enter("checkpoint_code_head_runner_tip");
       // Decision 6 tip-movement check: has the runner clone's branch tip moved since the
       // last checkpoint wrote the tracking ref? A null trackTip (never checkpointed) or a
       // null cloneTip (unresolvable) is NOT a match, so it falls through to a real fetch.
       const cloneTip = await this.git.branchTip(runnerClone.path, runnerClone.branch);
       if (opts.doneAttempt && claim.code_cross_check_required === true) doneCandidate = cloneTip;
+      if (opts.doneAttempt) checkpointSteps?.enter("checkpoint_code_head_tracking");
       const trackTip = await this.git.trackingTip(barePath, runnerClone.branch);
       const tipUnmovedSinceFetch =
         trackTip !== null && cloneTip !== null && trackTip === cloneTip &&
@@ -12209,7 +12221,7 @@ export class RunRunner {
         if (codeDoneSnapshot && fetchedBack.kind === "updated") {
           try {
             checkpointSteps?.enter("checkpoint_code_head");
-            await captureImportedCodeHead(originalCodeHead);
+            await captureImportedCodeHead(originalCodeHead, step => checkpointSteps?.enter(step));
           }
           catch (err) {
             codeSnapshot = undefined; codeFreshReceipt = undefined; codeEmptyPrompt = false;
@@ -13646,7 +13658,7 @@ export class RunRunner {
               let snapshot: { head_commit: string; base_commit: string; repo_instructions_commit: string } | undefined;
               try {
                 const snapshotAction = async (_permit?: BoundaryPermit, attempt?: NonNullable<CheckpointBodyOpts["doneAttempt"]>) => {
-                  attempt?.steps.enter("checkpoint_code_head");
+                  attempt?.steps.enter("checkpoint_code_head_runner_tip");
                   if (!completion.interlocked || (executor.safety && !codeSnapshot)) {
                     if (!completion.interlocked && doneCandidate === undefined) doneCandidate = await this.git.branchTip(runnerClone.path, runnerClone.branch);
                     const original = doneCandidate;
@@ -13657,11 +13669,12 @@ export class RunRunner {
                       { expectedCandidateSha: original, ...(executor.safety ? { checkpointImportMode: "done" as const } : {}),
                         checkpointStep: step => attempt?.steps.enter(step) });
                     if (imported.kind !== "updated") { clearCodeSnapshot(); return; }
+                    attempt?.steps.enter("checkpoint_code_head_tracking");
                     await this.requireTrackingOwned(flight, barePath!, runnerClone.branch, original);
-                    attempt?.steps.enter("checkpoint_code_head");
-                    await captureImportedCodeHead(original);
+                    await captureImportedCodeHead(original, step => attempt?.steps.enter(step));
                   }
                   if (codeEmptyPrompt || !codeSnapshot || !codeDefaultCommit) return;
+                  attempt?.steps.enter("checkpoint_code_head_default_tip");
                   const defaultBranch = claim.repo.default_branch?.trim() || await this.git.defaultBranchName(barePath!);
                   if (!defaultBranch) throw new Error("code instructions default branch unavailable");
                   attempt?.steps.enter("default_fetch");
@@ -13669,6 +13682,7 @@ export class RunRunner {
                     barePath!, defaultBranch, claim.secrets.forge_pat,
                     claim.repo.clone_url, claim.secrets.forge_username,
                   );
+                  attempt?.steps.enter("checkpoint_code_head_pin");
                   const pinned = await this.git.pinCodeSnapshot(barePath!, runId, codeSnapshot.head_commit, codeDefaultCommit, true, flight.claimGeneration);
                   codeFreshReceipt = pinned.freshReceipt;
                   snapshot = { head_commit: pinned.head_commit, base_commit: pinned.base_commit,

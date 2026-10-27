@@ -112,12 +112,14 @@ var (
 // collector is the workersvc Service, so this keeps a signature drift a build error.
 var _ codexusagepoller.Recoverer = (*workersvc.Service)(nil)
 
-// codexProviderRequestTimeout bounds one Codex provider HTTP call in the production
-// codexauth.Client (PRD #1171 M1). The refresh callback spends it only on the oauth exchange;
-// import and recovery spend it on their nonrotating identity reads. Request-entry anchoring
-// leaves commit/recheck and response-delivery margin inside the 7.5s route budget, while the
-// worker HTTP client remains capped at 8s.
+// codexProviderRequestTimeout bounds nonrotating identity and usage reads in the
+// production codexauth.Client (PRD #1171 M1).
 const codexProviderRequestTimeout = 2500 * time.Millisecond
+
+// codexRefreshTimeout bounds the refresh callback's single OAuth exchange. Request-entry
+// anchoring leaves commit/recheck and response-delivery margin inside the unchanged 7.5s
+// route budget, while the worker HTTP client remains capped at 8s.
+const codexRefreshTimeout = 5 * time.Second
 
 // bindWorkerListeners binds the worker-facing listener(s) and, ONLY after every enabled bind
 // succeeds, calls setReady — so the boot-grace anchor (Service.SetReadyAt) fires after the api
@@ -624,7 +626,7 @@ func run() error {
 	// (codexauth.NewClient) — NEVER from a claim, model, repo, saved label or callback. Tests
 	// inject a fake through WithHTTPDoer; production takes the fixed defaults.
 	//
-	// The per-provider-request deadline (codexProviderRequestTimeout) is the innermost of a
+	// The refresh-only deadline (codexRefreshTimeout) is the innermost of a
 	// nested budget that keeps the WHOLE worker → API → provider → durable-commit → callback
 	// round trip UNDER the pinned app-server 10-second external-auth callback deadline
 	// (PRD #1147 M2 B6):
@@ -635,7 +637,7 @@ func run() error {
 	//	worker → API HTTP timeout ............................. 8s   (agent WorkerClient)
 	//	API route handling timeout .......................... 7.5s   (worker_codex.go)
 	//	coordinated-refresh lease ............................. 7s   (codexrefresh.go)
-	//	oauth exchange (codexProviderRequestTimeout) ........ 2.5s   (the callback's only
+	//	oauth exchange (codexRefreshTimeout) .................. 5s   (the callback's only
 	//	                                                           provider network call)
 	//
 	// Each outer layer therefore has actual response/cancellation margin. A timeout keeps
@@ -643,6 +645,7 @@ func run() error {
 	// the same operation instead of blindly starting another exchange.
 	wsvc.SetCodexRefresh(codexauth.NewClient(
 		codexauth.WithPerRequestTimeout(codexProviderRequestTimeout),
+		codexauth.WithRefreshTimeout(codexRefreshTimeout),
 	))
 
 	// Browser live-event hub (M5): workersvc broadcasts persisted run events to

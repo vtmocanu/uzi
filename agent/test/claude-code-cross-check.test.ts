@@ -98,12 +98,12 @@ it("Claude code stub returns exact empty findings and confirms cleanup despite p
   assert.equal(confirmed, 1);
 });
 
-// PRD #2170. Goldens: sha256 of the pre-change Claude code brief and nonce-stripped DATA prompt for
-// this file's claim(), computed from the tree before owner guidance and repository instructions existed.
+// PRD #3167 M2: coverage brief and nonce-stripped DATA prompt goldens.
+// These are separate from the byte-frozen pre-M2 replay corpus pins.
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 const stripNonces = (text: string) => text.replace(/_[a-f0-9]{32}>/g, "_NONCE>");
-const GOLDEN_CLAUDE_CODE_PROMPT = "030823da82006dae7ab936b3092ae4acd6b9ea957d5e70b929a2563f4ec54836";
-const GOLDEN_CLAUDE_CODE_BRIEF = "27f677678fbf3ffb78c08ec6d5549ca4ceaf722b6997e8599a5fe03092413192";
+const GOLDEN_CLAUDE_CODE_PROMPT = "655e293835b439076e65db2c628bb14d14abcf5ce353b0288db36463308dec96";
+const GOLDEN_CLAUDE_CODE_BRIEF = "60dbc88ffad1ff0f7cef763ca71d6263541ffe9573be2082435406db32822321";
 
 async function claudeRequest(c: ClaimResponse): Promise<{ brief: string; prompt: string }> {
   let brief = "";
@@ -193,7 +193,7 @@ for (const [label, text] of [
   ["21 findings", output(Array.from({ length: 21 }, (_, i) => ({ ...finding, id: "F" + i })))],
   ["2 KiB finding", output([{ ...finding, detail: "é".repeat(1024) }])],
   ["32 KiB array", output(Array.from({ length: 20 }, (_, i) => ({ ...finding, id: "F" + i, detail: "a".repeat(1800) })))],
-  ["oversized wire", " ".repeat(32785) + output()],
+  ["oversized wire", " ".repeat(256 * 1024 + 1) + output()],
 ] as const) it("Claude code rejects malformed output: " + label, async () => {
   await assert.rejects(runFrames([init, result(text)]), CrossCheckMalformedError);
 });
