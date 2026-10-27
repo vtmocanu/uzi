@@ -41,6 +41,8 @@ import {
   parseRetainedArtifactName,
 } from "./attempt-path.js";
 import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
+import { parseSourceFence, serializeSourceFence, type CompletionSourceFence } from "./completion-source.js";
+import type { GitAuthorityHooks, AuthoritySettlement } from "./git-authority-hooks.js";
 import { sanitizeForLog } from "./run-quiescence.js";
 import { RECOVERY_DECODED_LIMIT, validateRecoveryDecodedLimitBytes, RecoveryClosureLimitError, verifyClosureFrames, type ClosureBudget, type ClosureObject } from "./recovery-closure.js";
 import { REASON_WORKER_RESIDUE_BLOCKED, RetainedStoppedSourceError, RunResidueBlockedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen, residueQuarantine } from "./residue-quarantine.js";
@@ -798,6 +800,12 @@ export interface CheckpointRange {
 
 /** issue #1597 M2: optional GitCache construction knobs. */
 export interface GitCacheOptions {
+  /** issue #3404 M2: the completion-authority hooks (see git-authority-hooks.ts). Called from
+   *  inside an outer authority transaction the runner establishes; GitCache never acquires it. */
+  authority?: GitAuthorityHooks;
+  /** Production sets true: an effect the hooks guard is refused when no hooks are installed.
+   *  Default false, so tests and any caller without hooks keep the legacy behaviour. */
+  authorityRequired?: boolean;
   /** Test-only tightening of selective checkpoint preparation limits. */
   checkpointPackBounds?: { records?: number; bytes?: number; lineBytes?: number; durationMs?: number };
   /** Test-only supervised readiness root. Production always uses the immutable launcher. */
@@ -1406,6 +1414,20 @@ export class RunnerCloneImportError extends Error {
   }
 }
 
+/** A completion-authority hook refused the effect; no part of it ran. Never reinterpreted as a failed
+ *  delete (which would quarantine-rename the source): it propagates. */
+class AuthorityRefusedError extends Error {
+  constructor(op: string, cause: unknown) {
+    super(`completion authority refused ${op}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = "AuthorityRefusedError";
+  }
+}
+
+/** The retained journal does not carry the exact fence an install or retirement expected. */
+class CompletionSourceFenceError extends Error {
+  constructor(message: string) { super(message); this.name = "CompletionSourceFenceError"; }
+}
+
 function recoveryCaptureKey(branch: string): string {
   return `uzi-recovery.${branch}.clone`;
 }
@@ -1451,6 +1473,13 @@ export interface RecoveryJournalEntry extends RecoverySource {
    *  a coverage wrapper may leave such a superseded marker as a leaf. Lost lineage can only cause a
    *  refusal, never an acceptance. */
   peeledMarkers?: string[];
+  /** issue #3404 M2: the authenticated completion-source fence {version, sourceUseEpoch,
+   *  sourceCoreDigest}, installed on the plain completing journal by
+   *  {@link GitCache.installCompletionSourceFence} and consumed by completion retirement. Always
+   *  the LAST key of a written journal (see writeRecovery), so JSON equality of two journals is
+   *  fence equality. Workers built before this field existed reject the unknown key (their strict
+   *  allowlist), which is the accepted rollback fence: they refuse to attach, recover or discard it. */
+  completionSourceFence?: CompletionSourceFence;
 }
 
 /** issue #3239: at most this many peeled markers are journaled (SHA-40, unique). */
@@ -1507,7 +1536,7 @@ function parseRecoveryJournal(value: string): RecoveryJournalEntry {
     throw new Error("invalid retained recovery clone journal");
   }
   const o = parsed as Record<string, unknown>;
-  if (Object.keys(o).some(k => !["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources", "peeledMarkers"].includes(k))) {
+  if (Object.keys(o).some(k => !["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources", "peeledMarkers", "completionSourceFence"].includes(k))) {
     throw new Error("invalid retained recovery clone journal");
   }
   // Legacy callers classify a mismatched attempt id as CapturePathMismatchError.
@@ -1541,8 +1570,23 @@ function parseRecoveryJournal(value: string): RecoveryJournalEntry {
         new Set(o.peeledMarkers).size !== o.peeledMarkers.length) throw new Error("invalid peeled markers");
     peeledMarkers = [...o.peeledMarkers];
   }
+  let completionSourceFence: CompletionSourceFence | undefined;
+  if (o.completionSourceFence !== undefined) {
+    try { completionSourceFence = parseSourceFence(o.completionSourceFence); }
+    catch { throw new Error("invalid completion source fence"); }
+  }
   return { ...source, ...(recovery ? { recovery } : {}), ...(retainedSources ? { retainedSources } : {}),
-    ...(peeledMarkers?.length ? { peeledMarkers } : {}) };
+    ...(peeledMarkers?.length ? { peeledMarkers } : {}),
+    ...(completionSourceFence ? { completionSourceFence } : {}) };
+}
+
+/** The journal's persisted spelling: identical to JSON.stringify except that a completion-source
+ *  fence, when present, is re-parsed and always emitted as the LAST key in its fixed field order,
+ *  wherever the spread that built the object happened to put it. */
+function recoveryJournalJson(journal: RecoveryJournalEntry): string {
+  const { completionSourceFence, ...rest } = journal;
+  if (completionSourceFence === undefined) return JSON.stringify(rest);
+  return JSON.stringify({ ...rest, completionSourceFence: parseSourceFence(completionSourceFence) });
 }
 
 function parseAttemptLedgerEntry(value: string): AttemptLedgerEntry | undefined {
@@ -2539,6 +2583,8 @@ export class GitCache {
    *  under it ({@link deleteRetainedArtifact}), for as long as that rm may still be running. An
    *  entry is logged (warn) when it is recorded and (info) when its 'close' removes it. */
   private readonly unsettledDeletes = new Map<string, number>();
+  private readonly authority: GitAuthorityHooks | undefined;
+  private readonly authorityRequired: boolean;
   /** issue #1597 M2: memoised `--remerge-diff` support probe. */
   private remergeProbe: Promise<boolean> | undefined;
 
@@ -2553,6 +2599,8 @@ export class GitCache {
     this.recoveryDecodedLimitBytes = validateRecoveryDecodedLimitBytes(opts.recoveryDecodedLimitBytes === undefined ? RECOVERY_DECODED_LIMIT : opts.recoveryDecodedLimitBytes);
     this.retainedReadinessLaunch = opts.retainedReadinessLaunchForTest ?? launchCodexEffectRoot;
     this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
+    this.authority = opts.authority;
+    this.authorityRequired = opts.authorityRequired === true;
     this.checkpointPackBounds = opts.checkpointPackBounds ?? {};
     this.maxOwedCandidates = opts.maxOwedCandidates ?? MAX_OWED_CANDIDATES_PER_RUN;
     this.chainMaxWrappers = opts.checkpointChainBounds?.maxWrappers ?? CHECKPOINT_CHAIN_MAX_WRAPPERS;
@@ -2569,6 +2617,38 @@ export class GitCache {
     this.recoveryMaintenanceRoot = path.join(dataDir, "recovery-maintenance");
     this.recoverySettlementRoot = path.join(dataDir, "recovery-settlement");
     this.recoveryArchiveRoot = path.join(dataDir, "recovery-archive");
+  }
+
+  private authorityRefusal(op: string): Error {
+    return new AuthorityRefusedError(op, new Error("authority hooks required"));
+  }
+
+  /** issue #3404 M2: ask before a real source effect. Refusal (or required-but-absent) throws. */
+  private async admitSource(clonePath: string, op: string): Promise<void> {
+    if (this.authority) { await this.authority.admitSourceUse(clonePath, op); return; }
+    if (this.authorityRequired) throw this.authorityRefusal(op);
+  }
+
+  /** Register a shared-bare mutation child before it starts. Undefined = legacy (no hooks). */
+  private async beginBare(barePath: string, op: string, footprint: readonly string[]): Promise<AuthoritySettlement | undefined> {
+    if (this.authority) return this.authority.beginBareMutation(barePath, op, footprint);
+    if (this.authorityRequired) throw this.authorityRefusal(op);
+    return undefined;
+  }
+
+  /** Refuse a ref renewal while a pending shared-bare deletion could be ABA'd. */
+  private async assertBareClear(barePath: string, op: string): Promise<void> {
+    if (this.authority) { await this.authority.assertBareClear(barePath, op); return; }
+    if (this.authorityRequired) throw this.authorityRefusal(op);
+  }
+
+  private async beginDestructive(paths: readonly string[], op: string): Promise<AuthoritySettlement | undefined> {
+    if (this.authority) {
+      try { return await this.authority.beginDestructive(paths, op); }
+      catch (err) { throw new AuthorityRefusedError(op, err); }
+    }
+    if (this.authorityRequired) throw this.authorityRefusal(op);
+    return undefined;
   }
 
   /** Scope every subprocess and bare-lock acquisition created by `action` to the
@@ -3428,6 +3508,7 @@ export class GitCache {
       }
       const warningScope: RecoveryPhysicalWarningScope = { emitted: false };
       if ((await this.journaledClonePaths(barePath, warningScope)).has(clonePath)) throw new Error("retained predecessor blocks canonical reuse");
+      await this.admitSource(clonePath, "seed-canonical");
       await this.freeCanonicalClonePath(clonePath, key, reseed);
       await this.diagnoseRetainedArtifacts(barePath, clonePath, undefined, reseed, warningScope).catch((err: unknown) => {
         if (reseed.isInterruption?.(err)) throw err;
@@ -3494,6 +3575,7 @@ export class GitCache {
     try {
       await this.runRunnerUidDelete(canonical);
     } catch (err) {
+      if (err instanceof AuthorityRefusedError) throw err;
       deleteErr = err;
     }
     // An rm that may still be alive walks the canonical path by name: a quarantine rename would
@@ -3652,6 +3734,7 @@ export class GitCache {
       if (await this.pathPresent(clonePath)) {
         throw new Error(`${REASON_WORKER_RESIDUE_BLOCKED}: the fresh attempt clone path already exists (${sanitizeForLog(path.basename(clonePath), 160)}); nothing seeded`);
       }
+      await this.admitSource(clonePath, "seed-attempt");
       // Bound the ledger before reading it: the last value per attemptId, gone paths dropped (see compactAttemptLedger).
       await this.compactAttemptLedger(barePath, branch);
       // The seed-time recovery sweep over every NON-LIVE path of this key. It throws to block.
@@ -3952,30 +4035,52 @@ export class GitCache {
   private async runRunnerUidDelete(target: string): Promise<void> {
     if (this.boundaryProcesses.getStore()?.capture) throw new Error("capture cannot run an unsupervised delete");
     const split = this.retentionDeleteSeam?.split ?? uidSplitActive();
+    // issue #3404 M2: registered BEFORE the first byte can go; a refusal deletes nothing.
+    const settlement = await this.beginDestructive([target], "runner-uid-delete");
+    // In-process deletes are joined by their own await: success settles ok, failure leaves residue.
+    const inProcess = async (run: () => Promise<void>): Promise<void> => {
+      try { await run(); }
+      catch (err) {
+        await settlement?.settle({ ok: false, residue: [target] }).catch(() => undefined);
+        throw err;
+      }
+      await settlement?.settle({ ok: true });
+    };
     if (!split) {
-      await fs.rm(target, { recursive: true, force: true });
+      await inProcess(() => fs.rm(target, { recursive: true, force: true }));
       return;
     }
     const wrapped = runnerCommand(RETENTION_RM_BIN, ["-rf", "--", target], true);
     if (this.retentionDeleteSeam?.run) {
-      await this.retentionDeleteSeam.run(wrapped.command, wrapped.args);
+      const run = this.retentionDeleteSeam.run;
+      await inProcess(() => run(wrapped.command, wrapped.args));
       return;
     }
+    // "ok" / "failed": the child was positively joined (its 'close'). Undefined: unknown, never settled.
+    let joined: "ok" | "failed" | undefined;
     const seam = this.retentionDeleteSeam;
     const timeoutMs = seam?.timeoutMs ?? RETENTION_RM_TIMEOUT_MS;
     const closeWaitMs = seam?.closeWaitMs ?? RETENTION_RM_CLOSE_WAIT_MS;
     const kill = seam?.kill ?? killRunnerGroup;
+    let failure: unknown;
+    let failed = false;
     await new Promise<void>((resolve, reject) => {
       // cwd "/" and a fixed root-owned PATH: nothing resolves from a runner-writable dir. Detached,
       // so the setpriv'd rm leads its own group and a timeout can kill it as the runner uid.
-      const child = seam?.spawn
-        ? seam.spawn(wrapped.command, wrapped.args)
-        : spawn(wrapped.command, wrapped.args, {
-            cwd: "/",
-            env: workerSpawnEnv({ PATH: "/usr/bin:/bin" }),
-            detached: true,
-            stdio: ["ignore", "ignore", "pipe"],
-          });
+      let child: ChildProcess;
+      try {
+        child = seam?.spawn
+          ? seam.spawn(wrapped.command, wrapped.args)
+          : spawn(wrapped.command, wrapped.args, {
+              cwd: "/",
+              env: workerSpawnEnv({ PATH: "/usr/bin:/bin" }),
+              detached: true,
+              stdio: ["ignore", "ignore", "pipe"],
+            });
+      } catch (err) {
+        joined = "ok"; // no child object exists: nothing was started, nothing to join
+        throw err;
+      }
       let stderr = "";
       child.stderr?.on("data", (c: Buffer) => {
         if (stderr.length < 4096) stderr += c.toString("utf8");
@@ -4010,6 +4115,10 @@ export class GitCache {
               exit: code ?? signal ?? "abnormal",
               pending: n,
             });
+            // The late 'close' is the positive join the timeout lacked; the killed rm may have left residue.
+            void settlement?.settle({ ok: false, residue: [target] }).catch((err: unknown) =>
+              this.log.warn("runner-uid delete late settlement failed; the authority record stays open", {
+                path: key, error: sanitizeForLog(gitErrorMessage(err), 157) }));
           });
         }
         if (err) reject(err);
@@ -4034,11 +4143,18 @@ export class GitCache {
       });
       child.once("close", (code, signal) => {
         closed = true;
+        joined = !timedOut && code === 0 ? "ok" : "failed";
         if (timedOut) settle(new Error(`runner-uid delete timed out after ${timeoutMs}ms (killed; exited ${code ?? signal ?? "abnormally"})`));
         else if (code === 0) settle();
         else settle(new Error(`runner-uid delete exited ${code ?? signal ?? "abnormally"}: ${stripAnsiSgr(stderr).slice(0, 512)}`));
       });
-    });
+    }).catch((err: unknown) => { failed = true; failure = err; });
+    // An 'error' event or an unsettled timeout leaves `joined` undefined: the record stays open.
+    // A timed-out child that closed within the wait is joined "failed"; an unsettled one settles late above.
+    if (joined !== undefined && !(failure instanceof RunnerDeleteUnsettledError)) {
+      await settlement?.settle(joined === "ok" ? { ok: true } : { ok: false, residue: [target] });
+    }
+    if (failed) throw failure;
   }
 
   /** The seed itself (base resolution, the local `clone --shared`, checkout, WIP recovery, the
@@ -5627,6 +5743,7 @@ export class GitCache {
             await this.runGit(barePath, ["rev-parse", "--verify", `${sha}^{commit}`]).catch(() => "")
           ).trim();
           if (present !== sha) return false;
+          await this.assertBareClear(barePath, "recovery-pin-anchor");
           await this.runGit(barePath, ["update-ref", pinRef, sha]);
           return true;
         }),
@@ -6359,8 +6476,61 @@ export class GitCache {
       // history; journal it as lineage for a later coverage wrapper over this attempt's successor marker.
       const peeled = peeledMarker === undefined ? pending?.peeledMarkers : unionPeeledMarkers(pending?.peeledMarkers, [peeledMarker]);
       const value: RecoveryJournalEntry = { ...pending, ...source, ...(peeled?.length ? { peeledMarkers: peeled } : {}) };
-      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), JSON.stringify(value)]);
+      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), recoveryJournalJson(value)]);
     });
+  }
+
+  /**
+   * issue #3404 M2 — install the authenticated completion-source fence on the PLAIN completing
+   * journal of exactly `expected.clonePath` (and `expected.attemptId`, absent for a canonical source).
+   * One bare-lock section (or the caller's, with `opts.bareLockHeld`): read the journal, refuse every
+   * other attribution (no journal, a different path or attempt, an episode, retained sources, a
+   * protected descriptor, a stopped marker, a different fence), write it through writeRecovery (so the
+   * fence is the last key), then make it durable (fsync of the bare's `config` file and of the bare
+   * directory) and read it back. The fence is returned only from that read-back; any failure to
+   * settle or an inexact read-back throws and returns nothing. Idempotent for an identical fence.
+   * `opts.sync` is a test seam replacing the per-handle fsync.
+   */
+  async installCompletionSourceFence(
+    barePath: string, branch: string, expected: { clonePath: string; attemptId?: string },
+    fence: CompletionSourceFence,
+    opts: { bareLockHeld?: boolean; sync?: (handle: { sync(): Promise<void> }, what: "config" | "directory") => Promise<void> } = {},
+  ): Promise<CompletionSourceFence> {
+    const want = parseSourceFence(fence);
+    const section = async (): Promise<CompletionSourceFence> => {
+      await this.assertRecoveryBare(barePath);
+      const journal = await this.readRecoveryCapture(barePath, branch);
+      if (!journal || journal.clonePath !== expected.clonePath || journal.attemptId !== expected.attemptId) {
+        throw new CompletionSourceFenceError("completion source journal does not name this source");
+      }
+      if (journal.recovery || journal.retainedSources?.length) {
+        throw new CompletionSourceFenceError("completion source journal is a recovery episode");
+      }
+      if ((await this.protectedRecoveries(barePath, journal.runId)).length) {
+        throw new CompletionSourceFenceError("completion source has a protected descriptor");
+      }
+      await this.assertNoStoppedMarker(barePath, journal.clonePath, journal);
+      if (journal.completionSourceFence !== undefined &&
+          serializeSourceFence(journal.completionSourceFence) !== serializeSourceFence(want)) {
+        throw new CompletionSourceFenceError("completion source already carries a different fence");
+      }
+      if (journal.completionSourceFence === undefined) {
+        await this.writeRecovery(barePath, branch, { ...journal, completionSourceFence: want });
+      }
+      const sync = opts.sync ?? (async (h: { sync(): Promise<void> }) => { await h.sync(); });
+      const config = await fs.open(path.join(barePath, "config"), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      try { await sync(config, "config"); } finally { await config.close(); }
+      const dir = await fs.open(barePath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      try { await sync(dir, "directory"); } finally { await dir.close(); }
+      const after = await this.readRecoveryCapture(barePath, branch);
+      if (!after || after.clonePath !== journal.clonePath || after.attemptId !== journal.attemptId ||
+          after.runId !== journal.runId || after.completionSourceFence === undefined ||
+          serializeSourceFence(after.completionSourceFence) !== serializeSourceFence(want)) {
+        throw new CompletionSourceFenceError("completion source fence read-back differs");
+      }
+      return after.completionSourceFence;
+    };
+    return opts.bareLockHeld ? section() : this.withLock(barePath, section);
   }
 
   /**
@@ -6757,6 +6927,7 @@ export class GitCache {
           return JSON.stringify(journal);
         };
         const journalBefore = await attribution();
+        await this.admitSource(expectedSource.clonePath, "normalize");
         const roots = [expectedSource.clonePath, path.join(expectedSource.clonePath, ".git"),
           path.join(expectedSource.clonePath, ".git", "objects"), barePath, path.join(barePath, "objects")];
         const identities = async () => {
@@ -6983,7 +7154,7 @@ export class GitCache {
   }
 
   private async writeRecovery(barePath: string, branch: string, journal: RecoveryJournalEntry, guard?: () => void | Promise<void>): Promise<void> {
-    const value = JSON.stringify(journal);
+    const value = recoveryJournalJson(journal);
     parseRecoveryJournal(value);
     await this.assertRecoveryBare(barePath);
     if (guard) await guard();
@@ -7515,6 +7686,7 @@ export class GitCache {
         runId: s.runId, clonePath: s.clonePath, ...(s.attemptId ? { attemptId: s.attemptId } : {}),
         ...(s.restoreTip ? { restoreTip: s.restoreTip } : {}),
       }));
+      await this.admitSource(clonePath, "replace");
       await this.appendAttemptLedger(barePath, branch, { attemptId, runId: successor.runId, clonePath, state: "live" });
       await this.writeRecovery(barePath, branch, { ...journal, retainedSources,
         recovery: { ...recovery, successor, stage: "adopting" } });
@@ -7535,6 +7707,8 @@ export class GitCache {
         // itself when the tip is the marker the seed's `reset --soft` removed from history.
         ...(wrapped ? (wrapped.peeledMarkers.length ? { peeledMarkers: wrapped.peeledMarkers } : {})
           : marker ? { peeledMarkers: [tip] } : {}),
+        // issue #3404 M2: this fresh object does not spread `journal`, so carry the fence explicitly.
+        ...(journal.completionSourceFence ? { completionSourceFence: journal.completionSourceFence } : {}),
         recovery: { ...recovery, successor, stage: "ready-for-model" } });
       // issue #3194: hand the guard the content source this wrapper verifiably stands for.
       return { ...seeded, attemptId, ...(recovery.restoreSource ? { adoptedContentSource: recovery.restoreSource } : {}) };
@@ -8949,6 +9123,8 @@ export class GitCache {
               return refused(ev.disposition?.kind ?? "refused",
                 ev.disposition?.kind === "refused" ? ev.disposition.consumers : ev.blockers, ev.disposition);
             }
+            try { for (const p of rec.parts) await this.admitSource(p.clonePath, "discard"); }
+            catch { return refused("source_use_refused", ["authority"]); }
             // The existing protected-source checks, then the exclusivity ones (evaluateRetained).
             let snapshot: { descriptor: string | undefined; active: string | undefined } | undefined;
             if (rec.kind === "protected") {
@@ -11107,7 +11283,10 @@ export class GitCache {
       onRetirementUnproven?: () => void;
       verifiedSuccessor?: { key: string; generation: number; expected: RecoveryJournalEntry;
         acknowledged: () => Promise<boolean> };
-      completionSource?: { expectedHead: string; canDelete: () => boolean } },
+      completionSource?: { expectedHead: string; canDelete: () => boolean;
+        /** issue #3404 M2: the journal fence the caller certified. Required whenever authority is
+         *  required (production); optional only so legacy no-authority callers still compile. */
+        expectedFence?: CompletionSourceFence } },
   ): Promise<RunnerCloneRetireResult> {
     if (opts.processProof && opts.processProof() !== true) throw new Error("runner clone process proof revoked");
     if (opts.completionSource && opts.verifiedSuccessor) throw new Error("retirement authorities are mutually exclusive");
@@ -11128,7 +11307,10 @@ export class GitCache {
       onRetirementUnproven?: () => void;
       verifiedSuccessor?: { key: string; generation: number; expected: RecoveryJournalEntry;
         acknowledged: () => Promise<boolean> };
-      completionSource?: { expectedHead: string; canDelete: () => boolean } },
+      completionSource?: { expectedHead: string; canDelete: () => boolean;
+        /** issue #3404 M2: the journal fence the caller certified. Required whenever authority is
+         *  required (production); optional only so legacy no-authority callers still compile. */
+        expectedFence?: CompletionSourceFence } },
     bareLockHeld = false,
   ): Promise<RunnerCloneRetireResult> {
     // Deny-only observation: no cleanup authority, and observer errors cannot change retirement.
@@ -11221,6 +11403,17 @@ export class GitCache {
         checkProcessProof();
         if (await this.worktreeHead(clonePath) !== opts.completionSource.expectedHead ||
             !opts.completionSource.canDelete()) throw new Error("completion source attribution changed");
+        // issue #3404 M2: the held-lock journal must carry exactly the certified fence, before ANY
+        // destructive effect below. Missing, different or unexpected-absent all refuse (retained).
+        const want = opts.completionSource.expectedFence;
+        if (want !== undefined || this.authorityRequired) {
+          let ok = false;
+          try {
+            ok = want !== undefined && pending.completionSourceFence !== undefined &&
+              serializeSourceFence(pending.completionSourceFence) === serializeSourceFence(want);
+          } catch { ok = false; }
+          if (!ok) throw new CompletionSourceFenceError("completion source fence missing or changed");
+        }
       }
       // 2. Containment. Only ever move a path strictly UNDER runnerRoot. Resolve both
       //    sides and require a path-separator boundary so a sibling like
@@ -11520,7 +11713,7 @@ export class GitCache {
             if (journalBeforeMove && (ledgerRepairFailed || (cleared && currentJournal === undefined))) {
               const before = journalBeforeMove.journal;
               const raw = ledgerRepairFailed
-                ? JSON.stringify({ ...before, retainedSources: [...(before.retainedSources ?? []),
+                ? recoveryJournalJson({ ...before, retainedSources: [...(before.retainedSources ?? []),
                   { runId: ownerRunId, clonePath, ...(opts.attemptId ? { attemptId: opts.attemptId } : {}) }] })
                 : journalBeforeMove.raw;
               try {
@@ -11551,7 +11744,7 @@ export class GitCache {
                   const retained = before.clonePath === clonePath
                     ? { ...before, clonePath: movedTo, attemptId: undefined, retainedSources: [source] }
                     : { ...before, retainedSources: [...(before.retainedSources ?? []), source] };
-                  await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), JSON.stringify(retained)]);
+                  await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), recoveryJournalJson(retained)]);
                 }
                 throw renameError;
               }
@@ -17575,6 +17768,7 @@ try {
    *  retainCurrentOwedCandidate) funnels through here. The check precedes every write, so a refusal
    *  leaves the existing pins, metadata and refs untouched. */
   private async pinOwedUnderLock(c: StoredOwedContext, sha: string): Promise<void> {
+    await this.assertBareClear(c.barePath, "owed-pin");
     await this.requireOwedCommit(c.barePath, sha);
     const ref = `refs/uzi-owed/${c.runId}/${sha}`;
     const held = (await this.runGit(c.barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${c.runId}/`]))
@@ -18232,8 +18426,16 @@ try {
       };
       const deleteRef = async (ref: string, sha: string): Promise<void> => {
         open();
+        const settlement = await this.beginBare(barePath, "recovery-cleanup-delete-ref", [ref]);
+        // A rejected child is left unsettled: nothing here proves it exited or never started.
         await this.runGit(barePath, ["update-ref", "-d", ref, sha]);
-        if (await this.checkedRefSha(barePath, ref) !== undefined) throw new Error("recovery cleanup ref deletion mismatch");
+        let remains = true;
+        let readError: unknown;
+        try { remains = await this.checkedRefSha(barePath, ref) !== undefined; }
+        catch (err) { readError = err; }
+        await settlement?.settle(remains ? { ok: false, residue: [ref] } : { ok: true });
+        if (readError !== undefined) throw readError;
+        if (remains) throw new Error("recovery cleanup ref deletion mismatch");
       };
       if (authority === "completion-check") { open(); return "verified"; }
       for (const pin of ownedPins) await deleteRef(pin.ref, pin.sha);
@@ -18280,8 +18482,16 @@ try {
       const removedShas: string[] = [], retainedShas: string[] = [];
       for (const candidate of candidates) {
         if (await this.remotelyCovers(barePath, candidate.sha, remotelyConfirmedSha)) {
+          const settlement = await this.beginBare(barePath, "owed-reconcile-delete-ref", [candidate.pinRef]);
+          // A rejected child is left unsettled: nothing here proves it exited or never started.
           await this.runGit(barePath, ["update-ref", "-d", candidate.pinRef, candidate.sha]);
-          if (await this.checkedRefSha(barePath, candidate.pinRef) !== undefined) throw new Error("owed pin deletion mismatch");
+          let remains = true;
+          let readError: unknown;
+          try { remains = await this.checkedRefSha(barePath, candidate.pinRef) !== undefined; }
+          catch (err) { readError = err; }
+          await settlement?.settle(remains ? { ok: false, residue: [candidate.pinRef] } : { ok: true });
+          if (readError !== undefined) throw readError;
+          if (remains) throw new Error("owed pin deletion mismatch");
           // Ref first, metadata second: a crash between them leaves harmless metadata, never a
           // pin without discovery metadata. Without this, candidate-*.json would outlive every
           // released pin and enumerateOwedUnderLock would read them all forever.
@@ -18341,6 +18551,7 @@ try {
       if ((await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${sha}^{tree}`])).trim() !== tree) {
         throw new Error("recovery coverage tree mismatch");
       }
+      await this.assertBareClear(barePath, "recovery-coverage-ref");
       await this.persistOwedContext(context);
       const coverageRef = `refs/uzi-coverage/${context.runId}/${context.generation}/${fingerprint}`;
       await this.runGit(barePath, ["update-ref", coverageRef, sha]);
