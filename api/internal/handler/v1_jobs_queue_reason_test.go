@@ -2,10 +2,12 @@ package handler
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -22,7 +24,8 @@ func TestV1JobDTOQueueReasonStaysAdditive(t *testing.T) {
 		wantQueueN bool
 		wantHoldN  bool
 	}{
-		{"reserve hold", workersvc.JobView{QueueReason: strp("weekly_reserve"), ReserveHoldReason: strp("weekly usage reserve: 85% >= 80%")}, "", "weekly usage reserve: 85% >= 80%", true, false},
+		{"reserve hold", workersvc.JobView{QueueReason: strp("weekly_reserve"), ReserveHoldReason: strp("weekly usage reserve: 85% >= 80%")}, "", apitypes.V1ReserveHoldText, true, false},
+		{"reserve hold, unknown reading", workersvc.JobView{QueueReason: strp("weekly_reserve"), ReserveHoldReason: strp("weekly usage reserve: weekly usage unknown")}, "", apitypes.V1ReserveHoldText, true, false},
 		{"maintenance wins", workersvc.JobView{QueueReason: strp("maintenance"), ReserveHoldReason: nil}, "maintenance", "", false, true},
 		{"none", workersvc.JobView{}, "", "", true, true},
 	}
@@ -41,6 +44,10 @@ func TestV1JobDTOQueueReasonStaysAdditive(t *testing.T) {
 			_ = json.Unmarshal(b, &m)
 			if v, ok := m["queue_reason"]; ok && v == "weekly_reserve" {
 				t.Fatalf("v1 JSON leaks weekly_reserve: %s", b)
+			}
+			// The owner's usage figures stay off /api/v1: a product token is scoped to its jobs.
+			if strings.Contains(string(b), "%") {
+				t.Fatalf("v1 JSON leaks usage figures: %s", b)
 			}
 		})
 	}

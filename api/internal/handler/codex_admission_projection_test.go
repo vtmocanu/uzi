@@ -29,6 +29,9 @@ func TestCodexAdmissionBoardProjection(t *testing.T) {
 		{"owner vault", true, "codex_overload", "overload", "your vault is locked, so this run can't start", "your vault is locked, so this run can't start", true},
 		{"owner custody", true, "codex_overload", "overload", "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs", "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs", true},
 		{"owner custody unavailable", true, "codex_overload", "overload", "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings", "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings", true},
+		// PRD #3522: the weekly reserve outranks an open cooldown for the owner and, like it, is owner-only.
+		{"owner reserve over cooldown", true, "weekly_reserve", "rate_limit", "weekly usage reserve: 72% >= 70%", "weekly usage reserve: 72% >= 70%", true},
+		{"shared reserve", false, "weekly_reserve", "", "weekly usage reserve: 72% >= 70%", "", false},
 		{"shared cooldown", false, "codex_rate_limit", "rate_limit", "private", "", false},
 		{"shared maintenance", false, "maintenance", "overload", "private", "", false},
 		{"expired", true, "", "", "waiting: provider reported overload; account admission eligible after 2026-10-26T12:00:00Z", "", false},
@@ -65,7 +68,7 @@ func TestCodexAdmissionBoardProjection(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if strings.Contains(string(data), "codex_admission_") || strings.Contains(string(data), "private") || strings.Contains(string(data), "codex_rate_limit") {
+				if strings.Contains(string(data), "codex_admission_") || strings.Contains(string(data), "private") || strings.Contains(string(data), "codex_rate_limit") || strings.Contains(string(data), "weekly") {
 					t.Fatalf("private details leaked: %s", data)
 				}
 			}

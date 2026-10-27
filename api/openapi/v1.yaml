@@ -818,10 +818,11 @@ components:
             - string
             - "null"
           description: >-
-            Optional. A human-readable reason (for example "weekly usage reserve: 85% >= 80%")
+            Optional. The fixed display text "Waiting for the owner's weekly usage reserve."
             while the job owner's weekly usage reserve holds this queued job and maintenance does
-            not; it starts once a fresh reading is below the owner's threshold. Absent or null
-            otherwise. status stays queued.
+            not; it starts once a fresh reading is below the owner's threshold. It never carries
+            the owner's usage figures. Display it as is; do not parse it. Absent or null otherwise.
+            status stays queued.
         notice:
           type:
             - string

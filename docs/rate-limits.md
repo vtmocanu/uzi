@@ -399,7 +399,9 @@ sweeper, so it can appear a short while after the run is queued. It is dropped
 on the next pass once you clear the threshold, whatever the freshness of any
 reading. Turning the toggle off drops it only for a run that has already
 started; never-started work stays held. On `/api/v1/jobs` the job carries the
-reason as `reserve_hold_reason` and leaves `queue_reason` to maintenance.
+reason as `reserve_hold_reason`, the fixed text `Waiting for the owner's weekly
+usage reserve.` without your usage figures, and leaves `queue_reason` to
+maintenance.
 
 Running runs pause after their current milestone and resume on a fresh reading
 below the threshold; see [Pausing and resuming a run](run-pause.md#paused-by-the-weekly-usage-reserve).

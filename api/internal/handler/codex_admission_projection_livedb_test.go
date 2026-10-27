@@ -182,6 +182,30 @@ func TestCodexAdmissionReadProjectionsLiveDB(t *testing.T) {
 		t.Fatal("public maintenance leaked private admission")
 	}
 	fx.setIntakePause(false)
+	// PRD #3522: a weekly reserve hold outranks the still-open cooldown in every SQL projection,
+	// while the owner keeps the independent admission details.
+	reserve := "weekly usage reserve: 72% >= 70%"
+	if _, err := fx.pool.Exec(fx.ctx, "UPDATE runs SET reserve_hold_reason=$2,health='waiting_worker',health_reason=$2 WHERE id=$1", run, reserve); err != nil {
+		t.Fatal(err)
+	}
+	r, err = fx.q.GetRunByID(fx.ctx, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dto = runToDTO(r, "", 0, 0, 0, now, 0)
+	h.overlayQueueReasons(ownerCtx, &dto)
+	if dto.QueueReason == nil || *dto.QueueReason != "weekly_reserve" || dto.CodexAdmissionClass == nil || dto.HealthReason == nil || *dto.HealthReason != reserve {
+		t.Fatalf("weekly reserve lost precedence over the cooldown: queue=%v class=%v health=%v", dto.QueueReason, dto.CodexAdmissionClass, dto.HealthReason)
+	}
+	if latest, err := fx.q.ListLatestRunsForRepo(fx.ctx, fx.repoID); err != nil || len(latest) != 1 || latest[0].QueueReason != "weekly_reserve" {
+		t.Fatalf("board SQL precedence disagrees: %v %v", latest, err)
+	}
+	if single, err := fx.q.GetLatestRunForIssue(fx.ctx, store.GetLatestRunForIssueParams{RepoID: fx.repoID, IssueIid: r.IssueIid}); err != nil || single.QueueReason != "weekly_reserve" {
+		t.Fatalf("card SQL precedence disagrees: %v", err)
+	}
+	if _, err := fx.pool.Exec(fx.ctx, "UPDATE runs SET reserve_hold_reason=NULL,health='ok',health_reason=NULL WHERE id=$1", run); err != nil {
+		t.Fatal(err)
+	}
 	stale := apitypes.CodexAdmissionReason("rate_limit", now.Add(-time.Minute))
 	if _, err := fx.pool.Exec(fx.ctx, "UPDATE runs SET health='waiting_worker',health_reason=$2 WHERE id=$1", run, stale); err != nil {
 		t.Fatal(err)

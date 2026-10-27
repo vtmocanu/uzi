@@ -143,14 +143,16 @@ func writeV1JobError(w http.ResponseWriter, op string, err error) {
 
 func v1JobDTO(v workersvc.JobView) apitypes.V1JobDTO {
 	// /api/v1 is additive only: queue_reason keeps its original maintenance-only enum, and the
-	// weekly usage reserve hold (PRD #3522) is carried by the new reserve_hold_reason field.
+	// weekly usage reserve hold (PRD #3522) is carried by the new reserve_hold_reason field, as fixed
+	// text without the owner's usage figures (see apitypes.V1ReserveHoldText).
 	var queueReason *string
 	if v.QueueReason != nil && *v.QueueReason == "maintenance" {
 		queueReason = v.QueueReason
 	}
 	var reserveHold *string
 	if v.QueueReason != nil && *v.QueueReason == "weekly_reserve" {
-		reserveHold = v.ReserveHoldReason
+		text := apitypes.V1ReserveHoldText
+		reserveHold = &text
 	}
 	return apitypes.V1JobDTO{
 		ID:                v.ID.String(),
