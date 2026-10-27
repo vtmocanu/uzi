@@ -419,7 +419,7 @@ func TestAdminRateLimitsModeAwareGate(t *testing.T) {
 		{name: "off", mode: store.VaultModeUnprotected},
 		{name: "protected-locked", mode: store.VaultModeProtected, wantLocked: true},
 		{name: "protected-unlocked", mode: store.VaultModeProtected, unlock: true},
-		{name: "lookup-failed-with-cached-key", mode: store.VaultModeProtected, unlock: true, failed: true, wantLocked: true},
+		{name: "lookup-failed-with-cached-key", mode: store.VaultModeProtected, unlock: true, failed: true},
 		{name: "missing-core", missing: true, wantLocked: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -449,6 +449,12 @@ func TestAdminRateLimitsModeAwareGate(t *testing.T) {
 			}
 			rec := httptest.NewRecorder()
 			h.AdminRateLimits(rec, rlReq(uuid.New(), true))
+			if tc.failed {
+				if rec.Code != http.StatusInternalServerError || strings.TrimSpace(rec.Body.String()) != `{"error":"internal error"}` {
+					t.Fatalf("status=%d body=%s, want private generic 500", rec.Code, rec.Body.String())
+				}
+				return
+			}
 			var body struct {
 				Users []struct {
 					VaultLocked bool   `json:"vault_locked"`
@@ -458,8 +464,12 @@ func TestAdminRateLimitsModeAwareGate(t *testing.T) {
 			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || rec.Code != http.StatusOK || len(body.Users) != 1 {
 				t.Fatalf("status=%d err=%v body=%s", rec.Code, err, rec.Body.String())
 			}
-			if body.Users[0].VaultMode != tc.mode {
-				t.Fatalf("vault_mode=%q want=%q", body.Users[0].VaultMode, tc.mode)
+			wantMode := tc.mode
+			if tc.missing {
+				wantMode = store.VaultModeProtected
+			}
+			if body.Users[0].VaultMode != wantMode {
+				t.Fatalf("vault_mode=%q want=%q", body.Users[0].VaultMode, wantMode)
 			}
 			if body.Users[0].VaultLocked != tc.wantLocked {
 				t.Fatalf("vault_locked=%v want=%v", body.Users[0].VaultLocked, tc.wantLocked)

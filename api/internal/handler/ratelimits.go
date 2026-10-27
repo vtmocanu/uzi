@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // rateLimitWindow (apitypes.RateLimitWindow), rateLimitDTO (apitypes.RateLimitDTO)
@@ -110,15 +112,21 @@ func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 	}
 	users := make([]apitypes.AdminRateLimitRowDTO, 0)
 	for _, u := range rows {
-		// A new user starts a new group. RequiresUnlock is looked up once per user, on
-		// the first row, not once per token.
+		// Resolve one coordinated mode/lock snapshot on the first row per user.
 		if len(users) == 0 || users[len(users)-1].ID != u.UserID.String() {
+			mode, locked, err := h.adminRateVaultSnapshot(r.Context(), u.UserID, u.VaultMode)
+			if err != nil {
+				slog.Error("rate limits: vault status unavailable", "user", u.UserID)
+				w.Header().Set("Cache-Control", "private, no-store")
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+				return
+			}
 			users = append(users, apitypes.AdminRateLimitRowDTO{
 				ID:          u.UserID.String(),
 				Email:       u.Email,
 				Name:        u.DisplayName.String, // "" when the user has no display name
-				VaultMode:   u.VaultMode,
-				VaultLocked: h.vault.RequiresUnlock(r.Context(), u.UserID),
+				VaultMode:   mode,
+				VaultLocked: locked,
 				Tokens:      []apitypes.TokenRateLimitDTO{},
 			})
 		}
@@ -161,6 +169,20 @@ func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"users": users})
+}
+
+// adminRateVaultSnapshot keeps metadata mode and lock state in the same lifecycle
+// observation. Only fixtures without a core use the conservative session fallback.
+func (h *Handler) adminRateVaultSnapshot(ctx context.Context, ownerID uuid.UUID, fallbackMode string) (string, bool, error) {
+	if h.vault == nil {
+		status := h.vaultStatus(ctx, store.User{ID: ownerID, VaultMode: fallbackMode})
+		return status.Mode, status.Mode == store.VaultModeProtected && !status.Unlocked, nil
+	}
+	status, err := h.vault.Status(ctx, ownerID)
+	if err != nil {
+		return "", false, err
+	}
+	return status.Mode, status.Mode == store.VaultModeProtected && !status.Unlocked, nil
 }
 
 // okRateLimitDTO builds the "ok" union branch from the stored gauge columns. stale
