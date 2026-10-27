@@ -440,7 +440,7 @@ func TestClaimServesFrozenMilestones(t *testing.T) {
 				IssueIid: pgtype.Int8{Int64: 5, Valid: true}, MilestonesFrozen: frozen},
 			claimCtx: claimCtx, anthropic: sealedTok,
 		}
-		payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
+		payload, err := newOffModeService(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 		if err != nil {
 			t.Fatalf("Claim: %v", err)
 		}
@@ -459,7 +459,7 @@ func TestClaimServesFrozenMilestones(t *testing.T) {
 				IssueIid: pgtype.Int8{Int64: 6, Valid: true}},
 			claimCtx: claimCtx, anthropic: sealedTok,
 		}
-		payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
+		payload, err := newOffModeService(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 		if err != nil {
 			t.Fatalf("Claim: %v", err)
 		}
@@ -481,7 +481,7 @@ func TestClaimServesFrozenMilestones(t *testing.T) {
 				BudgetWallSeconds:   pgtype.Int4{Int32: 28800, Valid: true}},
 			claimCtx: claimCtx, anthropic: sealedTok,
 		}
-		payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
+		payload, err := newOffModeService(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 		if err != nil {
 			t.Fatalf("Claim: %v", err)
 		}
@@ -498,7 +498,7 @@ func TestClaimServesFrozenMilestones(t *testing.T) {
 				IssueIid: pgtype.Int8{Int64: 8, Valid: true}},
 			claimCtx: claimCtx, anthropic: sealedTok,
 		}
-		payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
+		payload, err := newOffModeService(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 		if err != nil {
 			t.Fatalf("Claim: %v", err)
 		}

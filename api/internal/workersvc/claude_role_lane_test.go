@@ -82,7 +82,7 @@ func TestClaimClaudeRoleLane(t *testing.T) {
 				old := slog.Default()
 				slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
 				t.Cleanup(func() { slog.SetDefault(old) })
-				svc := New(&roleLaneStore{fs}, newBox(t), testParams())
+				svc := newOffModeService(&roleLaneStore{fs}, newBox(t), testParams())
 				var model *string
 				var lastSeq int32
 				var err error
@@ -180,7 +180,7 @@ func TestClaimClaudeFrozenCodexRoleModel(t *testing.T) {
 					if path == "job" {
 						fs.claimRun.Kind = runkind.Job
 					}
-					pl, err := New(&roleLaneStore{fs}, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
+					pl, err := newOffModeService(&roleLaneStore{fs}, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -233,7 +233,7 @@ func TestClaimClaudeRoleLaneFallbackSequence(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("gpt-6-astra"), pgconv.TextOrNull("gpt-6-luna"))
 	fs.claimRun.Harness = harnessClaude
 	fs.claimRun.LastSeq = 17
-	pl, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
+	pl, err := newOffModeService(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -44,7 +44,7 @@ func TestClaimJudgeSkipsRepoJoinAndPAT(t *testing.T) {
 		// No claimCtx set: if assembly touched GetRunClaimContext it would still
 		// return a zero row, so claimCtxCalled is the real assertion below.
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 
 	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil {
@@ -91,7 +91,7 @@ func TestClaimJudgeCarriesKnownImproveUziTargets(t *testing.T) {
 		anthropic:    sealedTok,
 		knownTargets: menu,
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 
 	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil || payload == nil {
@@ -122,7 +122,7 @@ func TestClaimJudgeCarriesKnownImproveUziTargets(t *testing.T) {
 
 	// ── empty menu is omitted from the wire ──
 	fsEmpty := &fakeStore{claimRun: judgeRun(uid, uuid.New()), anthropic: sealedTok}
-	svcEmpty := New(fsEmpty, box, testParams())
+	svcEmpty := newOffModeService(fsEmpty, box, testParams())
 	empty, err := svcEmpty.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil || empty == nil {
 		t.Fatalf("Claim (empty): payload=%v err=%v", empty, err)
@@ -148,7 +148,7 @@ func TestClaimJudgeSurvivesKnownTargetsLookupError(t *testing.T) {
 		anthropic:       sealedTok,
 		knownTargetsErr: errors.New("db down"),
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 
 	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil {
@@ -171,7 +171,7 @@ func TestClaimJudgeWireCarriesNoPATValue(t *testing.T) {
 	sealedTok, _ := box.Seal([]byte("anthropic-judge-nopat-abcdef1234567890"))
 	uid := uuid.New()
 	fs := &fakeStore{claimRun: judgeRun(uid, uuid.New()), anthropic: sealedTok}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 
 	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
 	if err != nil || payload == nil {

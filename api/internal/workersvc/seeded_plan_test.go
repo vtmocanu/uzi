@@ -376,7 +376,7 @@ func claimForPlanSource(t *testing.T, planSource string, autoApprove, humanAppro
 		},
 		anthropic: sealedTok,
 	}
-	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
+	payload, err := newOffModeService(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}

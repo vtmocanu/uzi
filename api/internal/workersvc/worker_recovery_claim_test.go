@@ -66,7 +66,7 @@ func TestWorkerRecoveryClaimConstructorsJSON(t *testing.T) {
 				fs := &fakeStore{claimRun: run, chatClaimRun: run, anthropic: token,
 					claimCtx: store.GetRunClaimContextRow{RepoWebUrl: "https://forge.example/g/r",
 						RepoPath: "g/r", ForgeType: "github", BaseUrl: "https://forge.example", TokenCiphertext: pat}}
-				svc := New(&recoveryClaimJobStore{fs}, box, testParams())
+				svc := newOffModeService(&recoveryClaimJobStore{fs}, box, testParams())
 				worker := store.Worker{ID: uuid.New(), UserID: uid}
 				if kind == "chat" {
 					payload, err := svc.ClaimChat(context.Background(), worker)

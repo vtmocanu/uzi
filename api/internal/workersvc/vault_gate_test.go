@@ -18,10 +18,13 @@ import (
 // memVaultStore is an in-memory vault.Store so the claim gate + lock-race paths
 // can run against a real *vault.Vault without a database.
 type memVaultStore struct {
-	mu     sync.Mutex
-	txMu   sync.Mutex
-	vaults map[uuid.UUID]store.UserVault
-	states map[uuid.UUID]store.LockVaultAuthStateRow
+	// defaultMode is opt-in for populations of legacy master-sealed fixtures.
+	// The zero value keeps protected admission for vault gate tests.
+	defaultMode string
+	mu          sync.Mutex
+	txMu        sync.Mutex
+	vaults      map[uuid.UUID]store.UserVault
+	states      map[uuid.UUID]store.LockVaultAuthStateRow
 }
 
 func newMemVaultStore() *memVaultStore {
@@ -64,10 +67,23 @@ func newMemoryVault(box *secretbox.Box, m *memVaultStore) *vault.Vault {
 	return vault.New(box, m, m.transaction)
 }
 
+// newOffModeService gives master-sealed claim fixtures a configured real vault
+// with explicit off-mode state at epoch zero for every fixture owner.
+func newOffModeService(q Store, box *secretbox.Box, p Params) *Service {
+	m := newMemVaultStore()
+	m.defaultMode = store.VaultModeUnprotected
+	s := New(q, box, p)
+	s.SetVault(newMemoryVault(box, m))
+	return s
+}
+
 func (m *memVaultStore) state(id uuid.UUID) store.LockVaultAuthStateRow {
 	s, ok := m.states[id]
 	if !ok {
-		s.VaultMode = store.VaultModeProtected
+		s.VaultMode = m.defaultMode
+		if s.VaultMode == "" {
+			s.VaultMode = store.VaultModeProtected
+		}
 	}
 	return s
 }
@@ -193,6 +209,7 @@ func TestClaimUnlockedOwnerOpensDEKToken(t *testing.T) {
 		},
 		anthropic:           dekTok.Ciphertext,
 		anthropicSealedWith: dekTok.SealedWith,
+		anthropicVaultEpoch: dekTok.Epoch,
 		templates:           []store.AgentTemplate{{Name: "coder", PromptBody: "code"}},
 	}
 	svc := New(fs, box, testParams())
@@ -221,6 +238,10 @@ func TestClaimLockRaceRequeuesNeverFails(t *testing.T) {
 	box := newBox(t)
 	uid := uuid.New()
 	v := unlockedVault(t, uid, box) // passes the gate...
+	sealed, err := v.Seal(context.Background(), uid, store.KindAnthropicToken, []byte("lock-race-token"), vault.SealForUse)
+	if err != nil {
+		t.Fatalf("vault Seal: %v", err)
+	}
 
 	sealedPAT, _ := box.Seal([]byte("bot-pat-LOCKRACE-abcdef1234567890"))
 	runID := uuid.New()
@@ -231,8 +252,9 @@ func TestClaimLockRaceRequeuesNeverFails(t *testing.T) {
 			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
-		anthropic:           []byte("locked-so-never-decrypted"),
-		anthropicSealedWith: store.SealedWithDEK,
+		anthropic:           sealed.Ciphertext,
+		anthropicSealedWith: sealed.SealedWith,
+		anthropicVaultEpoch: sealed.Epoch,
 		// ...then the owner locks after ClaimRun, before the token open.
 		onClaimRun: func() { v.Lock(uid) },
 	}

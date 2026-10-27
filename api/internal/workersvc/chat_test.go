@@ -33,7 +33,7 @@ func TestClaimChatSucceedsWithoutForgeConnection(t *testing.T) {
 		},
 		anthropic: sealedTok,
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 
 	payload, err := svc.ClaimChat(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
 	if err != nil {
@@ -69,7 +69,7 @@ func TestClaimChatDefaultsEffortToMediumWhenOwnerHasNone(t *testing.T) {
 		anthropic:    sealedTok,
 		// defaultEffort left zero ⇒ NULL ⇒ the owner has no per-user default.
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	payload, err := svc.ClaimChat(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
 	if err != nil || payload == nil {
 		t.Fatalf("ClaimChat: payload=%v err=%v", payload, err)
@@ -97,7 +97,7 @@ func TestClaimChatCarriesDefaultEffort(t *testing.T) {
 		anthropic:     sealedTok,
 		defaultEffort: pgconv.TextOrNull("max"),
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	payload, err := svc.ClaimChat(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
 	if err != nil || payload == nil {
 		t.Fatalf("ClaimChat: payload=%v err=%v", payload, err)
@@ -119,7 +119,7 @@ func TestClaimChatWireOmitsForgePAT(t *testing.T) {
 		chatClaimRun: store.Run{ID: uuid.New(), UserID: uid, Kind: runkind.Chat, Status: "claimed", Title: pgtype.Text{String: "t", Valid: true}},
 		anthropic:    sealedTok,
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	payload, err := svc.ClaimChat(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
 	if err != nil || payload == nil {
 		t.Fatalf("ClaimChat: payload=%v err=%v", payload, err)
@@ -148,7 +148,7 @@ func TestClaimChatUsesChatLane(t *testing.T) {
 		chatClaimRun: store.Run{ID: uuid.New(), UserID: uid, Kind: runkind.Chat, Status: "claimed", Title: pgtype.Text{String: "t", Valid: true}},
 		anthropic:    sealedTok,
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	if _, err := svc.ClaimChat(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}); err != nil {
 		t.Fatalf("ClaimChat: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestAssembleChatClaimAllowsClaudeRun(t *testing.T) {
 	box := newBox(t)
 	sealedTok, _ := box.Seal([]byte("anthropic-claude-chat-allow-abcdef1234567890"))
 	fs := &fakeStore{anthropic: sealedTok}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 
 	run := store.Run{ID: uuid.New(), UserID: uuid.New(), Kind: runkind.Chat, Harness: harnessClaude, Status: "claimed", Title: pgtype.Text{String: "hi", Valid: true}}
 	payload, err := svc.assembleChatClaim(context.Background(), run)

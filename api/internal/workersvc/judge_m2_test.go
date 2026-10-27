@@ -30,7 +30,7 @@ func TestJudgeClaimUserModelOverridesInstance(t *testing.T) {
 		anthropic:  sealedTok,
 		judgeModel: pgtype.Text{String: "opus", Valid: true},
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
 	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
@@ -53,7 +53,7 @@ func TestJudgeClaimNullUserModelInheritsInstance(t *testing.T) {
 		anthropic: sealedTok,
 		// judgeModel left zero (NULL/inherit).
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
 	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
@@ -76,7 +76,7 @@ func TestJudgeClaimBlankUserModelInheritsInstance(t *testing.T) {
 		anthropic:  sealedTok,
 		judgeModel: pgtype.Text{String: "   ", Valid: true},
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
 	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
@@ -100,7 +100,7 @@ func TestJudgeClaimUserModelReadErrorFallsBackToInstance(t *testing.T) {
 		anthropic:     sealedTok,
 		judgeModelErr: errors.New("user row read failed"),
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
 	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
@@ -131,7 +131,7 @@ func TestJudgeClaimNullDefaultEffortUsesUziDefault(t *testing.T) {
 		anthropic: sealedTok,
 		// defaultEffort left zero (NULL) ⇒ the uzi default medium.
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
 	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
@@ -161,7 +161,7 @@ func TestJudgeClaimExplicitDefaultEffortIsCarried(t *testing.T) {
 		anthropic:     sealedTok,
 		defaultEffort: pgconv.TextOrNull("high"),
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
 	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
@@ -185,7 +185,7 @@ func TestJudgeClaimDefaultEffortReadErrorFallsBackToMedium(t *testing.T) {
 		anthropic:        sealedTok,
 		defaultEffortErr: errors.New("db down"),
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
 	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
