@@ -2205,6 +2205,21 @@ describe("RunView — weekly usage reserve (PRD #3522)", () => {
     expect(past.container.firstChild).toBeNull();
   });
 
+  it("shows the override line for a live run but not a finished one that still carries a future stamp", () => {
+    // The server never clears reserve_exempt_until on completed/failed/cancelled runs.
+    const future = new Date(Date.now() + 3 * 24 * 3600 * 1000).toISOString();
+    for (const status of ["paused", "queued"] as const) {
+      const live = render(<ReserveExemptLine run={run({ status, reserve_exempt_until: future })} />);
+      expect(document.querySelector("[data-reserve-exempt]")).not.toBeNull();
+      live.unmount();
+    }
+    for (const status of ["completed", "failed", "cancelled"] as const) {
+      const done = render(<ReserveExemptLine run={run({ status, reserve_exempt_until: future })} />);
+      expect(done.container.firstChild).toBeNull();
+      done.unmount();
+    }
+  });
+
   it("the page header carries the override line for a run with an active override", async () => {
     renderPage({ status: "running", reserve_exempt_until: new Date(Date.now() + 86_400_000).toISOString() });
     await screen.findByText("Add rate limiting");

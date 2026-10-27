@@ -836,7 +836,8 @@ function confirmReserveResume(run: Run): boolean {
 // ReserveExemptLine states the owner's override of the weekly usage reserve while it lasts.
 export function ReserveExemptLine({ run }: { run: Run }) {
   const until = run.reserve_exempt_until ? Date.parse(run.reserve_exempt_until) : NaN;
-  if (!Number.isFinite(until) || until <= Date.now()) return null;
+  // The server never clears the stamp on a finished run, so the line is for live runs only.
+  if (isTerminalRun(run.status) || !Number.isFinite(until) || until <= Date.now()) return null;
   return (
     <span className="text-xs text-muted" data-reserve-exempt="true">
       Weekly usage reserve overridden until{" "}
