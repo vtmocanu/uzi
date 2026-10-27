@@ -1,12 +1,14 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 )
 
@@ -26,12 +28,28 @@ func TestPolicyClaimAckHumanApprovalLiveDB(t *testing.T) {
 	e.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", w.ID, w.ProtocolCapabilities)
 	e.exec("UPDATE runs SET status='cancelled' WHERE id=$1", f.runID)
 	setDefaultHarness(t, e, f.userID, "codex")
+	makeCodexDefault(t, e, f.aliasID)
 	created, err := f.svc.CreateTaskRun(e.ctx, f.userID, f.repoID, "ACK approval", "", false, false, false, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.svc.FreezeCodexBinding(e.ctx, f.userID, created.ID, f.aliasID, codexAuthModeSubscription); err != nil {
-		t.Fatal(err)
+	if created.Harness != string(HarnessCodex) {
+		t.Fatalf("created harness=%s, want codex", created.Harness)
+	}
+	// CreateTaskRun returns the row before the atomic credential freeze; read
+	// the committed binding rather than supplying it after creation.
+	born := mustRun(t, e, created.ID)
+	if born.Harness != string(HarnessCodex) || !born.CodexSecretID.Valid || born.CodexSecretID.Bytes != f.aliasID ||
+		!born.CodexAuthMode.Valid || born.CodexAuthMode.String != codexAuthModeSubscription {
+		t.Fatal("creation did not freeze the selected Codex subscription")
+	}
+	source, err := apitypes.ParsePolicyRevisionSourceV1(created.PolicyRevisionSource)
+	if err != nil || source.Version != 1 || source.Gate != nil || source.PrimaryRevision != nil ||
+		source.AssociatedCrossChecks == nil || len(source.AssociatedCrossChecks) != 0 {
+		t.Fatalf("initial source=%s err=%v", created.PolicyRevisionSource, err)
+	}
+	if !bytes.Equal(created.PolicyRevisionSource, born.PolicyRevisionSource) {
+		t.Fatal("creation did not persist the initial source")
 	}
 	e.exec("UPDATE runs SET plan_cross_check_required=false,auto_approve=false,policy_refusal_count=1 WHERE id=$1", created.ID)
 	// Dispatch is a fixture precondition; no forge branch seeding is exercised.
@@ -50,6 +68,9 @@ func TestPolicyClaimAckHumanApprovalLiveDB(t *testing.T) {
 	if !current.WorkerID.Valid || current.WorkerID.Bytes != w.ID || claim.PlanApproved {
 		t.Fatal("Claim did not hand off the unapproved candidate")
 	}
+	if current.PolicyRefusalCount != 1 || !bytes.Equal(born.PolicyRevisionSource, current.PolicyRevisionSource) {
+		t.Fatal("Claim changed the initial source or refusal count")
+	}
 	gen := current.ClaimGeneration
 	req := gateReq(&gen, uid())
 	req.RequiredCapabilities = &[]string{}
@@ -57,6 +78,7 @@ func TestPolicyClaimAckHumanApprovalLiveDB(t *testing.T) {
 	if err != nil || !candidate.Applied || candidate.PlanApproved == nil || *candidate.PlanApproved || mustRun(t, e, created.ID).PolicyRefusalCount != 1 {
 		t.Fatalf("candidate: %+v %v", candidate, err)
 	}
+	assertRevisionGateBound(t, e, created.ID, candidate.GateRevision)
 	approval, err := f.svc.SubmitInputWithOptions(e.ctx, f.userID, created.ID, "approve_plan", "", nil, SubmitInputOptions{ExpectedGateRevision: &candidate.GateRevision})
 	if err != nil {
 		t.Fatal(err)
