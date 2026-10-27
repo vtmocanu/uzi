@@ -27,6 +27,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 import { ATTEMPT_ID_RE } from "../attempt-path.js";
+import type { AuthorityScope } from "../authority-runtime.js";
 import type { DindPruneGate } from "../dind-prune.js";
 import type {
   GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedInspectResult, RetainedLifecycleSnapshot, RetainedSourceSelector,
@@ -82,6 +83,9 @@ export interface RetainedSourceServerDeps {
   isIdle: () => boolean;
   runner: RetainedSourceRunnerPort;
   log: Logger;
+  /** issue #3404 M2: when set, the discard runs inside an authority transaction opened BEFORE the run
+   *  reservation (lock order A -> S), so the Git discard hooks borrow it. Absent: legacy behaviour. */
+  authority?: AuthorityScope;
   /** Test seams: the drain clock/poll and the timeouts. */
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -483,7 +487,10 @@ export class RetainedSourceServer {
       // A client that left before anything destructive began must not get a deletion it never saw.
       if (clientGone()) return this.refusal("client_disconnected");
       // 5. Reserve the run through the disposal.
-      const boundary = await this.deps.runner.withRetainedSourceBoundary(sel.runId, clonePaths, async (ctx) => {
+      // The authority transaction (A) is taken before the reservation (S) and spans the discard.
+      const inAuthority = <T>(fn: () => Promise<T>): Promise<T> =>
+        this.deps.authority ? this.deps.authority.withTransaction(fn, { signal: this.shutdown.signal }) : fn();
+      const boundary = await inAuthority(() => this.deps.runner.withRetainedSourceBoundary(sel.runId, clonePaths, async (ctx) => {
         // 6. The holds read, inside the reservation and before GitCache takes the bare lock.
         const [holds, lifecycle] = await Promise.all([this.readHolds(sel.runId), this.readLifecycle(sel.runId)]);
         if (holds.state === "unknown") return this.refusal("holds_unknown");
@@ -504,7 +511,7 @@ export class RetainedSourceServer {
           result = { kind: "unknown", sources: [], metadata: "kept" };
         }
         return { ok: result.kind === "done", op: "discard" as const, result };
-      });
+      }));
       if (!boundary.entered) return this.refusal("run_reserved");
       return boundary.value;
     } finally {

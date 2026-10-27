@@ -664,6 +664,16 @@ function retirablePrior(body: SlotSnapshot, expectedDigest: string | undefined):
   }
   return body.publication.sourceCoreDigest;
 }
+/**
+ * Whether a pending record refuses a new use or a new pending operation of its slot. A running
+ * record always does, and so does a settled_failed destructive record (its residue is the only
+ * authority for the bounded retry). A settled_failed bare_mutation record was positively joined:
+ * it releases only the mutator-running exclusion, so it must not wedge every later mutation of
+ * that bare for the live owner. A new use or operation replaces it.
+ */
+function blocksNewOperation(pending: PendingFootprint | null): boolean {
+  return pending !== null && !(pending.kind === "bare_mutation" && pending.status === "settled_failed");
+}
 function retiringRecord(prior: string, manifest: readonly string[]): RetiringRecord {
   return { prior, operation: randomUUID(), manifest: strings(manifest, MAX_ITEMS), deleted: 0 };
 }
@@ -867,7 +877,7 @@ export class AuthorityStore {
     const old = await this.#load(dir, key);
     const harness: LeaseHarness = options.executor !== undefined ? "codex" : "claude";
     if (old) {
-      if (old.pending !== null) throw new AuthorityRefusal("source has an unresolved pending footprint");
+      if (blocksNewOperation(old.pending)) throw new AuthorityRefusal("source has an unresolved pending footprint");
       if (old.state === "retiring") throw new AuthorityRefusal("source is being retired");
       if (old.state === "active" && old.owner.worker !== this.#init.incarnation) {
         throw new AuthorityRefusal("source is active under another worker incarnation");
@@ -966,7 +976,7 @@ export class AuthorityStore {
     if (body.state === "retired") throw new AuthorityRefusal("source is retiring");
     // Post-publication, any source operation needs a fresh admitSourceUse epoch first.
     if (body.state === "sealed" || body.state === "claude_ready") throw new AuthorityRefusal("source is published; admit a new epoch first");
-    if (body.pending !== null) throw new AuthorityRefusal("a pending footprint is already recorded");
+    if (blocksNewOperation(body.pending)) throw new AuthorityRefusal("a pending footprint is already recorded");
     const operation = randomUUID();
     const pending: PendingFootprint = {
       operation, kind: input.kind, footprint: text(input.footprint, MAX_FOOTPRINT), status: "running", residue: [],

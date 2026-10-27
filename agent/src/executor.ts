@@ -1010,6 +1010,10 @@ export interface Executor {
    * inside `run()`), this is readable before the runner clone is seeded, so the seed can make
    * the clone self-contained. Every other executor leaves it unset. */
   readonly sandboxesCommands?: boolean;
+  /** issue #3404 M2: this executor's lifetime incarnation, the value a source-use admission binds
+   * (`admitSourceUse(tx, clonePath, { executor })`) before the executor launches anything against the
+   * flight's clone. Only the Codex executor has one; every other executor leaves it unset. */
+  readonly executorIncarnation?: string;
   /** Issue #1604: true when run() awaits a resumed claim's pending gate inputs
    * (ctx.takeResumedGateEvent) and may RE-PRESENT its persisted unapproved plan at the gate
    * (resume_phase "awaiting_approval"). The runner then lets the re-presented gate keep epoch 0.

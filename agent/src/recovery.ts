@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { ProcessQuiescence } from "./run-quiescence.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
+import type { AuthorityScope } from "./authority-runtime.js";
 import type { ExclusionRefusal, MaintenanceExclusion, MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { MaintenanceResources as M1MaintenanceResources, RecoveryMaintenance, type MaintenanceAdmission } from "./recovery-maintenance.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
@@ -510,6 +511,11 @@ function inventorySourceReason(diagnostic?: InventorySourceDiagnostic): string {
 }
 
 export interface RecoveryCoordinatorOptions {
+  /** issue #3404 M2: opens (or borrows) the authority transaction A. Every capture cycle that can
+   *  reach a hooked Git effect is entered inside it, so A is taken BEFORE the cycle lock C, the
+   *  source reservation S, the journal lock J and the bare lock B (order A -> C -> S -> J -> B).
+   *  Absent: legacy behaviour (unit tests). */
+  authority?: AuthorityScope;
   /** Issue #3031: the claim-gate writer exclusion every new terminal production runs inside. */
   writerExclusion?: Pick<MaintenanceWriterExclusion, "run">;
   /** After a terminal boundary returns: whether its children actually joined. False keeps claims gated. */
@@ -982,6 +988,7 @@ const recoveryJournalLocks = new RunDiskLocks();
  * upload can safely happen after (or across a restart from) the terminal report.
  */
 export class RecoveryCoordinator {
+  private readonly authority: AuthorityScope | undefined;
   private readonly withInventorySourceBoundary: RecoveryCoordinatorOptions["withInventorySourceBoundary"];
   private readonly withCompletionSourceBoundary: RecoveryCoordinatorOptions["withCompletionSourceBoundary"];
   private readonly onCompletionSourceForgotten: RecoveryCoordinatorOptions["onCompletionSourceForgotten"];
@@ -1151,7 +1158,16 @@ export class RecoveryCoordinator {
     return undefined;
   }
 
+  /** Run `fn` inside the authority transaction (borrowed when one is already active). */
+  private inAuthority<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this.authority) return fn();
+    // The wait for A ends with the maintenance budget the caller runs under, if any.
+    const signal = maintenanceSignal();
+    return this.authority.withTransaction(() => fn(), signal ? { signal } : {});
+  }
+
   constructor(opts: RecoveryCoordinatorOptions) {
+    this.authority = opts.authority;
     this.withTerminalSourceBoundary = opts.withTerminalSourceBoundary;
     this.writerExclusion = opts.writerExclusion;
     this.terminalSettlementConfirmed = opts.terminalSettlementConfirmed;
@@ -1293,7 +1309,7 @@ export class RecoveryCoordinator {
   }): Promise<RecoveryRecord | undefined> {
     if (!this.enabled) return undefined;
     const { context } = input;
-    return this.withCancellationAttempt({ runId: context.runId, generation: context.generation, inventoryGuarded: true } as RecoveryRecord, async () =>
+    return this.withCancellationAttempt({ runId: context.runId, generation: context.generation, inventoryGuarded: true } as RecoveryRecord, () => this.inAuthority(async () =>
       runCaptureCycle(await this.cycleKey({ runId: context.runId, generation: context.generation, captureId: "", inventoryGuarded: true }), "wait", async () => {
       if (!await this.newReconstructionRecords(context.runId, context.generation)) return undefined;
       if (!this.git.enumerateOwedCandidates || !this.git.buildRecoveryCoverage) throw new Error("inventory Git support unavailable");
@@ -1387,7 +1403,7 @@ export class RecoveryCoordinator {
         });
       };
       return freezeRemaining();
-    }), undefined, input.onCancellationObserved);
+    })), undefined, input.onCancellationObserved);
   }
 
   /**
@@ -2159,8 +2175,8 @@ export class RecoveryCoordinator {
     if (!this.enabled || !HELD_PUBLICATION_ID_RE.test(publicationId)) return "fallback";
     if (residueQuarantine() !== undefined) return "kept";
     try {
-      return await this.withCancellationAttempt(record, async () =>
-        runCaptureCycle(await this.cycleKey(record), "wait", () => this.releaseHeldWithinCycle(record, publicationId)));
+      return await this.withCancellationAttempt(record, () => this.inAuthority(async () =>
+        runCaptureCycle(await this.cycleKey(record), "wait", () => this.releaseHeldWithinCycle(record, publicationId))));
     } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: held publication final not completed; custody retained", {
         run_id: record.runId, generation: record.generation, error: errText(err) });
@@ -2356,9 +2372,9 @@ export class RecoveryCoordinator {
   /** Shared foreground/boot/live ordering, serialized once per frozen generation. */
   async operateFrozenInventory(input: CaptureInput, options: FrozenOperationOptions = {}): Promise<RecoveryOutcome> {
     if (!this.enabled || residueQuarantine() !== undefined) return quarantinedOutcome(input.record.captureId);
-    return this.withCancellationAttempt(input.record, async () =>
+    return this.withCancellationAttempt(input.record, () => this.inAuthority(async () =>
       runCaptureCycle(await this.cycleKey(input.record), "wait",
-        () => this.frozenOperationCycle(input, options)), undefined, input.onCancellationObserved);
+        () => this.frozenOperationCycle(input, options))), undefined, input.onCancellationObserved);
   }
 
   private async frozenOperationCycle(input: CaptureInput, options: FrozenOperationOptions = {}): Promise<RecoveryOutcome> {
@@ -2658,14 +2674,15 @@ export class RecoveryCoordinator {
         // freezeInventory alone compares the complete source/tree/context fingerprint.
         // Equal pin lists cannot justify reusing an archive of an earlier disposition source.
         const diagnostics = this.inventorySourceDiagnostics({ ...ctx, generation: ctx.generation }, original?.captureId);
-        const boundary = await this.inventorySourceBoundary(diagnostics.context, async prove => {
+        // A before the source reservation S: freezeInventory below borrows this transaction.
+        const boundary = await this.inAuthority(() => this.inventorySourceBoundary(diagnostics.context, async prove => {
           if (!await this.inactiveInventory(probe) || !await prove()) return;
           const record = await this.freezeInventory({
             context: ctx as PositiveOwedCandidateContext, currentSha, originalSourceSha,
             defaultBranch: ctx.defaultIdentity!.ref.replace(/^refs\/remotes\/origin\//, ""),
           });
           if (record) records.push(record);
-        });
+        }));
         if (boundary === "retained") diagnostics.retained();
         if (boundary === "retained" && original) {
           await this.writeExistingRecord(original, cur => ({ ...cur, state: "needs_action", reason: diagnostics.reason() }));
@@ -2710,8 +2727,8 @@ export class RecoveryCoordinator {
     if (!this.enabled) return { state: "pinned", captureId: input.record.captureId };
     // issue #2213: a latched worker captures and uploads nothing; the record and pin stay as they are.
     if (residueQuarantine() !== undefined) return quarantinedOutcome(input.record.captureId);
-    return this.withCancellationAttempt(input.record, async () =>
-      runCaptureCycle(await this.cycleKey(input.record), "wait", () => this.captureCycle(input)), undefined, input.onCancellationObserved);
+    return this.withCancellationAttempt(input.record, () => this.inAuthority(async () =>
+      runCaptureCycle(await this.cycleKey(input.record), "wait", () => this.captureCycle(input))), undefined, input.onCancellationObserved);
   }
 
   /** The capture cycle; the caller holds the record's capture-cycle lock. */
@@ -3404,13 +3421,13 @@ export class RecoveryCoordinator {
               residueQuarantine() !== undefined || this.isExecuting(runId)) break;
           if (!this.finalRetryReady(snap)) continue;
           try {
-            await this.withCancellationAttempt(snap, async () =>
+            await this.withCancellationAttempt(snap, () => this.inAuthority(async () =>
               runCaptureCycle(await this.cycleKey(snap), "wait", async () => {
                 if (passSignal.aborted || residueQuarantine() !== undefined || this.isExecuting(runId)) return;
                 const current = await this.readRecord(this.recordPath(snap));
                 if (!current || !this.savedSourceCandidate(current) || !this.finalRetryReady(current)) return;
                 await this.pendingStep(current, passSignal, "terminal_source");
-              }), attempts);
+              })), attempts);
           } catch {
             this.log.warn("recovery: terminal saved evidence retained");
           }
@@ -3909,8 +3926,8 @@ export class RecoveryCoordinator {
         }
         if (snap.state === "uploaded" && !snap.inventoryGuarded) { if (archiveProvesPin(snap)) cleanups.push(snap); continue; }
         try {
-          await this.withCancellationAttempt(snap, async () =>
-            runCaptureCycle(await this.cycleKey(snap), "wait", () => this.pendingStep(snap, signal)), attempts);
+          await this.withCancellationAttempt(snap, () => this.inAuthority(async () =>
+            runCaptureCycle(await this.cycleKey(snap), "wait", () => this.pendingStep(snap, signal))), attempts);
         } catch (err) { MaintenanceBudget.current()?.check(); failure ??= err; }
       }
       await this.bootPinCleanups(cleanups, signal);
@@ -3933,7 +3950,7 @@ export class RecoveryCoordinator {
       handled++;
       this.lastAttemptAt.set(snap.captureId, this.now());
       try {
-        await runCaptureCycle(await this.cycleKey(snap), "wait", async () => {
+        await this.inAuthority(async () => runCaptureCycle(await this.cycleKey(snap), "wait", async () => {
           const record = await this.readRecord(this.recordPath(snap));
           if (!record || record.state !== "uploaded" || record.inventoryGuarded) return;
           const res = await this.cleanupUploadedRecoveryPin(record, { mode: "boot", signal, deadline });
@@ -3943,7 +3960,7 @@ export class RecoveryCoordinator {
             outcome: "pin_cleanup",
             reason: res.state === "retained" ? res.reason : res.state,
           });
-        });
+        }));
       } catch (err) { MaintenanceBudget.current()?.check();
         this.log.warn("recovery: uploaded pin cleanup step failed; continuing", { run_id: snap.runId, error: errText(err).slice(0, 512) });
       }
@@ -4222,8 +4239,8 @@ export class RecoveryCoordinator {
         if (opts.signal?.aborted) break;
         let res;
         try {
-          res = await this.withCancellationAttempt(snap, async () =>
-            runCaptureCycle(await this.cycleKey(snap), "skip", () => this.liveStep(snap, opts)), attempts);
+          res = await this.withCancellationAttempt(snap, () => this.inAuthority(async () =>
+            runCaptureCycle(await this.cycleKey(snap), "skip", () => this.liveStep(snap, opts))), attempts);
         } catch (err) {
           MaintenanceBudget.current()?.check();
           transient = true;
@@ -4244,7 +4261,8 @@ export class RecoveryCoordinator {
       }
       for (const snap of cleanupCandidates) {
         if (opts.signal?.aborted) break;
-        const res = await runCaptureCycle(await this.cycleKey(snap), "skip", () => this.livePinCleanupStep(snap, opts));
+        const res = await this.inAuthority(async () =>
+          runCaptureCycle(await this.cycleKey(snap), "skip", () => this.livePinCleanupStep(snap, opts)));
         if (!res.ran) this.lastAttemptAt.set(snap.captureId, this.now());
       }
     } catch (err) { MaintenanceBudget.current()?.check();
@@ -4352,8 +4370,8 @@ export class RecoveryCoordinator {
    */
   async forgetGeneration(runId: string, generation: number): Promise<void> {
     if (!this.enabled) return;
-    await runCaptureCycle(await this.cycleKey({ runId, captureId: "", generation, inventoryGuarded: true }), "wait",
-      () => this.forgetGenerationWithinCycle(runId, generation));
+    await this.inAuthority(async () => runCaptureCycle(await this.cycleKey({ runId, captureId: "", generation, inventoryGuarded: true }), "wait",
+      () => this.forgetGenerationWithinCycle(runId, generation)));
   }
 
   /** Receipt cleanup visits only this authenticated generation. No archive ancestry or capture RPC

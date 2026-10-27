@@ -395,6 +395,18 @@ export function transactionContext(tx: unknown): AuthorityTransactionContext {
 }
 
 /**
+ * The transaction still running in THIS async context for `lifetime`, if any. A transaction whose
+ * callback has settled is not returned, so a late event handler that merely inherited the context
+ * of a finished transaction sees none. Read-only: it never acquires A.
+ */
+export function activeAuthorityTransaction(lifetime: WorkerLifetime): AuthorityTransaction | undefined {
+  const ctx = lifetimeContext(lifetime);
+  const held = current.getStore();
+  const state = held ? transactionStates.get(held) : undefined;
+  return held && state?.active && state.ctx === ctx ? held : undefined;
+}
+
+/**
  * Run `fn` holding A. Pass an existing transaction instead of a lifetime to BORROW it
  * (no reacquisition). Calling with a lifetime from inside a callback that already holds
  * A in this async context is refused rather than left to deadlock. A is released only

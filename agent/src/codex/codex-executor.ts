@@ -2122,6 +2122,9 @@ function childInterruptDeadlineMs(boundaryDeadlineMs: number): number {
 export class CodexExecutor implements Executor {
   private readonly lifetime = new ExecutorLifetime();
 
+  /** The lifetime's incarnation; a source-use admission binds it (see Executor.executorIncarnation). */
+  get executorIncarnation(): string { return this.lifetime.executorIncarnation; }
+
   /**
    * Irreversibly close this executor's admission and, only when every owned producer, observer and
    * cleanup tail has actually settled with its original successful disposal facts, issue an opaque

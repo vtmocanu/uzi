@@ -11,6 +11,16 @@
  *    timeout the child has not yet closed after) GitCache does NOT settle, so the authority
  *    record stays unresolved and the footprint stays fenced.
  *
+ * Implementation: `AuthorityRuntime.hooks` (authority-runtime.ts), built in main.ts over the worker lifetime
+ * and passed by buildWorkerGitCache. Each hook REQUIRES the transaction the outermost entry point opened in
+ * the current async context and refuses (AuthorityRefusal) when there is none; it never acquires A beneath
+ * B. Every `settle` call is awaited inside the caller's own B section and borrows its transaction, except
+ * two that can run after it ended: the runner-uid delete's late `close` (a child that outlived its
+ * caller; it holds no lower lock) and the continuation GitCache.cleanupArchivedRecoveryPin abandons when
+ * its caller's deadline passes (it still holds B). Both acquire A themselves, for a bounded wait; a wait
+ * that expires fails the settlement and leaves the record open, so the abandoned continuation can
+ * delay but never deadlock a holder of A.
+ *
  * Wiring: `new GitCache(dataDir, log, retry, { authority, authorityRequired })`. With no hooks and
  * `authorityRequired` false (every test default) behaviour is exactly the legacy one. With
  * `authorityRequired` true and no hooks, every call site below refuses before its effect.

@@ -345,13 +345,44 @@ test("pending footprints: running blocks admission, settle clears, a failed sett
   assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.pending, null);
   const again = await tx(f, (t2) => s.admitSourceUse(t2, src));
 
-  const op2 = await tx(f, (t2) => s.beginPending(t2, again, { kind: "bare_mutation", footprint: "chmod" }));
+  const op2 = await tx(f, (t2) => s.beginPending(t2, again, { kind: "destructive", footprint: "chmod" }));
   await assert.rejects(tx(f, (t2) => s.settlePending(t2, again, randomUUID(), { ok: true })), /no matching/);
   await tx(f, (t2) => s.settlePending(t2, again, op2, { ok: false, residue: ["a/b"] }));
   const failed = await tx(f, (t2) => s.readSlot(t2, key));
   assert.equal(failed?.state, "ineligible");
   assert.deepEqual(failed?.pending?.residue, ["a/b"]);
+  // A joined failed DESTRUCTIVE record keeps its residue authority: it blocks admission and a new operation.
   await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /pending/);
+  await assert.rejects(tx(f, (t2) => s.beginPending(t2, again, { kind: "bare_mutation", footprint: "x" })), /already recorded/);
+});
+
+test("a joined failed bare_mutation record releases only the running exclusion: admission and a new operation replace it", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const op = await tx(f, (t2) => s.beginPending(t2, lease, { kind: "bare_mutation", footprint: "update-ref -d" }));
+  await tx(f, (t2) => s.settlePending(t2, lease, op, { ok: false, residue: ["refs/x"] }));
+  const failed = await tx(f, (t2) => s.readSlot(t2, key));
+  assert.equal(failed?.state, "ineligible");
+  assert.equal(failed?.pending?.status, "settled_failed");
+  assert.deepEqual(failed?.pending?.residue, ["refs/x"]);
+  // The live owner can run another bare mutation: the failed record is replaced by the new running one.
+  const op2 = await tx(f, (t2) => s.beginPending(t2, lease, { kind: "bare_mutation", footprint: "update-ref -d again" }));
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.pending?.status, "running");
+  await tx(f, (t2) => s.settlePending(t2, lease, op2, { ok: false, residue: ["refs/x"] }));
+  // A new use of the source mints a fresh epoch and drops the failed bare record.
+  const fresh = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const slot = await tx(f, (t2) => s.readSlot(t2, key));
+  assert.equal(slot?.pending, null);
+  assert.equal(slot?.state, "active");
+  assert.equal(leaseEpoch(fresh), slot?.epoch);
+  // A running record, by contrast, still refuses both.
+  const op3 = await tx(f, (t2) => s.beginPending(t2, fresh, { kind: "bare_mutation", footprint: "running" }));
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /pending/);
+  await assert.rejects(tx(f, (t2) => s.beginPending(t2, fresh, { kind: "bare_mutation", footprint: "x" })), /already recorded/);
+  await tx(f, (t2) => s.settlePending(t2, fresh, op3, { ok: true }));
 });
 
 test("retiring blocks admission until retired; a retired tombstone mints a new epoch", async (t) => {

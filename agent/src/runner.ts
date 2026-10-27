@@ -25,6 +25,8 @@ import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransien
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
 import { MaintenanceResources } from "./recovery-maintenance.js";
+import type { AuthorityRuntime } from "./authority-runtime.js";
+import type { SourceUseLease } from "./completion-authority.js";
 import type { WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
@@ -2133,6 +2135,9 @@ interface RunFlight {
   terminalDisposal?: Readonly<{ source: TerminalSource; result: Awaited<ReturnType<CodexExecutionSafety["dispose"]>> }>;
   deferredTerminalRelease?: DeferredTerminalRelease;
   terminalReleaseOwner?: { veto: boolean; provisional: (value: boolean) => void };
+  /** issue #3404 M2 U3: the flight's final source-use lease for its clone (the executor-bound one
+   *  for Codex). Undefined without an authority runtime. Publication (U4) consumes it. */
+  sourceLease?: SourceUseLease;
 
   /** Local observer only; preservation keeps its own operation and authority. */
   memoryHoldObserver?: () => void;
@@ -2595,6 +2600,10 @@ export interface CheckpointTestHooks {
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
+  /** issue #3404 M2 U3: the completion-authority runtime. Every runner path that reaches a hooked
+   *  GitCache effect opens its transaction through it, BEFORE any C/S/J/B it takes; the flight's
+   *  executor is bound to its clone through it. Absent (unit tests): legacy behaviour. */
+  authority?: AuthorityRuntime;
   memoryRuntime?: WorkerMemoryRuntime;
   /** Issue #3031: the claim-gate writer exclusion new terminal production runs inside. */
   maintenanceExclusion?: RecoveryCoordinatorOptions["writerExclusion"];
@@ -2810,6 +2819,7 @@ export class RunRunner {
   /** PRD #1296 M3 — durable-recovery capture/journal/upload coordinator (D1/D3/D5).
    *  Disabled when the worker has no join token (a token-less test harness). */
   private readonly recovery: RecoveryCoordinator;
+  private readonly authority: AuthorityRuntime | undefined;
   /** issue #1582 M2 — the authenticated ancestry-settlement journal (adopted predecessor holds)
    *  and the settler that drives the api settle for them. Disabled without a worker token. */
   private readonly settlement: SettlementJournal;
@@ -2985,6 +2995,7 @@ export class RunRunner {
     private readonly joinToken?: string,
     opts: RunnerOptions = {},
   ) {
+    this.authority = opts.authority;
     this.memoryRuntime = opts.memoryRuntime;
     this.cancellationBudgetFactory = opts.cancellationBudgetFactory ?? (() => new MaintenanceBudget());
     this.pollMs = opts.pollMs ?? 3_000;
@@ -3005,6 +3016,7 @@ export class RunRunner {
     this.recovery =
       opts.recovery ??
       new RecoveryCoordinator({
+        ...(opts.authority ? { authority: opts.authority } : {}),
         client: this.client,
         git: this.git,
         log: this.log,
@@ -3065,7 +3077,7 @@ export class RunRunner {
       client: opts.settleClient ?? this.client,
       cleanup: {
         deleteSettlementRefs: (bare, runId, holdId) => gitCache.deleteSettlementRefs(bare, runId, holdId),
-        deleteRecoveryPin: (bare, runId, gen) => gitCache.deleteRecoveryPin(bare, runId, gen),
+        deleteRecoveryPin: (bare, runId, gen) => this.inAuthority(() => gitCache.deleteRecoveryPin(bare, runId, gen)),
         forgetGeneration: (runId, gen) => recovery.forgetGeneration(runId, gen),
         onAuthoritativeGenerationReleased: opts.queueTerminalRejectionReconciliation,
       },
@@ -3295,6 +3307,26 @@ export class RunRunner {
    */
   isExecuting(runId: string): boolean {
     return this.executionTails.has(runId);
+  }
+
+  /**
+   * issue #3404 M2 U3: run `fn` inside the authority transaction A (borrowed when this async
+   * context already holds it). Wraps ONE hooked GitCache effect, or one recovery entry, at the call
+   * site: A is held for that effect and its admission only, never across model work, and no C, S, J
+   * or B lock is held by any caller of these sites (lock order A -> C -> S -> J -> B).
+   */
+  private inAuthority<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return this.authority ? this.authority.withTransaction(() => fn(), signal ? { signal } : {}) : fn();
+  }
+
+  /**
+   * Bind the flight's executor to its clone's source-use epoch BEFORE the executor launches anything
+   * against the clone: a Codex executor's admission carries its executor incarnation; a Claude flight
+   * keeps the lease clone admission minted. The flight keeps the final lease (publication, U4).
+   */
+  private async bindFlightSource(flight: RunFlight, clonePath: string): Promise<void> {
+    if (!this.authority) return;
+    flight.sourceLease = await this.authority.bindSource(clonePath, flight.executor.executorIncarnation);
   }
 
   private async withInventorySourceBoundary(
@@ -5391,7 +5423,8 @@ export class RunRunner {
           !this.completionReceipts.has(this.completionKey(runId, flight.claimGeneration)) &&
           typeof this.git.retainCurrentOwedCandidate === "function") {
         try {
-          const retain = async () => this.git.retainCurrentOwedCandidate(flight.barePath!, await this.owedOptions(flight, flight.barePath!, flight.branch!));
+          const retain = async () => this.inAuthority(async () =>
+            this.git.retainCurrentOwedCandidate(flight.barePath!, await this.owedOptions(flight, flight.barePath!, flight.branch!)));
           // Retained-flight cleanup must not requeue behind a lock its lifecycle just cancelled.
           const retained = await this.runCancellationMaintenance(flight, () => flight.retainedLocalCustody
             ? this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
@@ -11351,6 +11384,7 @@ export class RunRunner {
         const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
+        await this.bindFlightSource(flight, runnerClone.path);
       } catch (err) {
         if (!freshRetry && !flight.effectiveAttemptPaths &&
             (err instanceof RetainedStoppedSourceError || (err instanceof Error && err.message === "recovered key requires a fresh attempt path"))) {
@@ -11387,6 +11421,7 @@ export class RunRunner {
           const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence));
           flight.worktreePath = runnerClone.path;
           flight.branch = runnerClone.branch;
+          await this.bindFlightSource(flight, runnerClone.path);
         } else if (err instanceof CapturePathMismatchError) {
           // issue #1319 Case A: a claimant-relative clone-path mismatch (the cross-kind slug
           // divergence, e.g. an issue owner's `issue-N` vs this mr_rework's `agent-issue-N`).
@@ -11396,6 +11431,7 @@ export class RunRunner {
           const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence));
           flight.worktreePath = runnerClone.path;
           flight.branch = runnerClone.branch;
+          await this.bindFlightSource(flight, runnerClone.path);
         } else {
           throw err;
         }
@@ -14600,7 +14636,7 @@ export class RunRunner {
   private async reconcileConfirmedOwed(flight: RunFlight, barePath: string, confirmedSha: string,
     onStep?: (step: BoundaryStep) => void): Promise<void> {
     try {
-      const result = await this.git.reconcileOwedCandidates(barePath, flight.runId, confirmedSha, onStep);
+      const result = await this.inAuthority(() => this.git.reconcileOwedCandidates(barePath, flight.runId, confirmedSha, onStep));
       // Only reconcileOwedCandidates supplies positive checkpoint coverage proof.
       // Snapshot previously announced removals before forgetting all released heads.
       const resolved = [...new Set(result.removedShas)].filter(sha => /^[0-9a-f]{40}$/.test(sha) &&
@@ -14671,7 +14707,7 @@ export class RunRunner {
       if (options.context.generation === null) return;
       const context = options.context;
       // Before any clone/anchor retirement, retain the current positively owned head.
-      const retained = await this.git.retainCurrentOwedCandidate(barePath, options);
+      const retained = await this.inAuthority(() => this.git.retainCurrentOwedCandidate(barePath, options));
       if (retained.kind === "updated") this.announceOwedHeads(flight, retained.retainedShas);
       else flight.preserveRecoveryClone = true;
       let own: RunOwnershipResponse | undefined;
@@ -14954,9 +14990,9 @@ export class RunRunner {
     options.checkpointStep?.("checkpoint_import_context");
     const owed = await this.owedOptions(flight, barePath, branch);
     return importScope(async () => {
-      const result = await this.git.fetchAgentBranch(
+      const result = await this.inAuthority(() => this.git.fetchAgentBranch(
         barePath, worktreePath, branch, flight.runId, { ...owed, ...options },
-      );
+      ));
       if (result.kind === "not_updated") throw this.preservationRefused(flight, result.reason);
       if (result.divergence === "divergent") {
         const heads = result.displacedSha && result.retainedShas.includes(result.displacedSha) ? [result.displacedSha] : [];
@@ -15217,7 +15253,7 @@ export class RunRunner {
     return adopt(async () => {
       try {
         const context = await this.owedOptions(flight, barePath, branch);
-        const update = await this.git.updateTrackingRef(barePath, branch, bridge, { ...context, checkpointStep: step });
+        const update = await this.inAuthority(() => this.git.updateTrackingRef(barePath, branch, bridge, { ...context, checkpointStep: step }));
         if (update.kind === "not_updated") {
           this.preservationRefused(flight, update.reason);
           return { kind: "preservation_refused" };
@@ -17370,7 +17406,7 @@ export class RunRunner {
     // tracking ref afterward. A false anchor (the object is absent in the bare, or the update
     // failed) means no durable replacement exists yet ⇒ retain the source clone and keep the hold
     // open, never a clone-only SHA fed to bundle production.
-    const anchored = await this.git.anchorRecoveryHead(barePath, runId, generation, head);
+    const anchored = await this.inAuthority(() => this.git.anchorRecoveryHead(barePath, runId, generation, head));
     check();
     if (!anchored) {
       runLog.warn("recovery: settle transfer — could not durably anchor the verified head in the trusted bare");
@@ -17481,7 +17517,7 @@ export class RunRunner {
         MaintenanceBudget.current()?.check();
         this.assertHeldFreeCapture(flight, held);
         if (residueQuarantine() !== undefined) return "retained" as const;
-        await this.git.deleteRecoveryPin(flight.barePath!, flight.runId, gen);
+        await this.inAuthority(() => this.git.deleteRecoveryPin(flight.barePath!, flight.runId, gen));
         MaintenanceBudget.current()?.check();
         this.assertHeldFreeCapture(flight, held);
         if (residueQuarantine() !== undefined) return "retained" as const;
@@ -17626,7 +17662,7 @@ export class RunRunner {
       // with the pinned head as the expected SHA so a moved ref is retained. On any retain
       // (needs_action) LEAVE it as the durable anchor that keeps the retained source reachable.
       if (outcome.state === "uploaded" && outcome.reason === "already_published") {
-        await this.git.deleteRecoveryPin(barePath, claim.run_id, generation, record.sourceSha);
+        await this.inAuthority(() => this.git.deleteRecoveryPin(barePath, claim.run_id, generation, record.sourceSha));
       }
       runLog.info("recovery: park/early-terminal disposition outcome", {
         run_id: claim.run_id,
@@ -21910,7 +21946,7 @@ export class RunRunner {
           // omit the declaration when no Codex credential is present; unknown values refuse.
           if (flight.executor.sandboxesCommands === true) {
             await check();
-            await this.git.normalizeRetainedSourceObjects(bare, branch, key, source);
+            await this.inAuthority(() => this.git.normalizeRetainedSourceObjects(bare, branch, key, source));
             this.retainedLifecycleGuard(flight);
             await check();
           } else if (claim.secrets.codex || (flight.executor.sandboxesCommands !== undefined &&
@@ -22002,9 +22038,9 @@ export class RunRunner {
           await check();
           blocker = "adoption_failed";
           const attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
-          const successor = await this.git.prepareRecoverySuccessor(bare, branch, key, source,
+          const successor = await this.inAuthority(() => this.git.prepareRecoverySuccessor(bare, branch, key, source,
             iteration.attempts, attemptId, { checkpointWriteUnresolved: flight.checkpointClaimEvidence.writeUnresolved, checkpointKey: flight.checkpointCoordinates?.checkpoint_key ??
-              (flight.runKind === "task" ? null : undefined), selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true });
+              (flight.runKind === "task" ? null : undefined), selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true }));
           expectedSource = { ...source, clonePath: successor.path, attemptId: successor.attemptId };
           flight.runnerClone = successor;
           flight.worktreePath = successor.path;
@@ -22030,6 +22066,8 @@ export class RunRunner {
             flight.executor = this.makeExecutor(claim.run_id, claim.secrets.codex).executor;
             this.registerEvidenceExecutor(flight);
           }
+          // The (possibly new) executor is bound to the successor's epoch before it runs anything there.
+          await this.bindFlightSource(flight, successor.path);
           flight.batcher.emit({ kind: "status", agent: "worker", payload: {
             text: "retained work verified on a fresh local attempt; predecessor sources and custody retained",
           } });
@@ -22121,10 +22159,10 @@ export class RunRunner {
     // that have no cloneBranch — falls through to the issue path below, byte-identically.
     const coordinates = this.cloneCoordinates(claim);
     if (coordinates.issueIid !== undefined) {
-      return this.git.createOrAttachRunnerClone(barePath, coordinates.issueIid, reseed, runId, resume, expectedCheckpointTip, attempt, cloneOpts);
+      return this.inAuthority(() => this.git.createOrAttachRunnerClone(barePath, coordinates.issueIid!, reseed, runId, resume, expectedCheckpointTip, attempt, cloneOpts));
     }
     const cloneBranch = { branch: coordinates.branch, slug: coordinates.key };
-    return this.git.runnerCloneForBranch(
+    return this.inAuthority(() => this.git.runnerCloneForBranch(
         barePath,
         cloneBranch.branch,
         cloneBranch.slug,
@@ -22134,7 +22172,7 @@ export class RunRunner {
         expectedCheckpointTip,
         attempt,
         cloneOpts,
-      );
+      ));
 
   }
 
