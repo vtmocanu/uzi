@@ -189,6 +189,51 @@ describe("mock vault mode API", () => {
     expect((await mockApi.me()).vault).toMatchObject({ exists: true, unlocked: true });
   });
 
+  it.each(["vaultEnable", "vaultCreatePassphrase"] as const)(
+    "%s bounds OIDC passphrases by UTF-8 bytes",
+    async (method) => {
+      window.localStorage.setItem("uzi_mock_scenario", "oidc");
+      state.vaultMode = "unprotected";
+      state.vaultExists = false;
+      state.vaultUnlocked = false;
+      const before = await mockApi.vaultStatus();
+      for (const length of [5, 513]) {
+        await expect(mockApi[method]("é".repeat(length))).rejects.toMatchObject({ status: 400 });
+        expect(await mockApi.vaultStatus()).toEqual(before);
+        expect(state.vaultMode).toBe("unprotected");
+        expect(state.vaultExists).toBe(false);
+        expect(state.vaultUnlocked).toBe(false);
+      }
+      for (const length of [6, 512]) {
+        state.vaultMode = "unprotected";
+        state.vaultExists = false;
+        state.vaultUnlocked = false;
+        await mockApi[method]("é".repeat(length));
+        expect(await mockApi.vaultStatus()).toEqual({
+          mode: "protected", policy: "required", exists: true, unlocked: true,
+        });
+        expect(state.vaultMode).toBe("protected");
+        expect(state.vaultExists).toBe(true);
+        expect(state.vaultUnlocked).toBe(true);
+      }
+    },
+  );
+
+  it("protected OIDC unlock without a wrapper returns the generic password error without changes", async () => {
+    window.localStorage.setItem("uzi_mock_scenario", "oidc");
+    state.vaultMode = "protected";
+    state.vaultExists = false;
+    state.vaultUnlocked = false;
+    const before = await mockApi.vaultStatus();
+    await expect(mockApi.vaultUnlock("demo password")).rejects.toMatchObject({
+      status: 403, message: "incorrect password",
+    });
+    expect(await mockApi.vaultStatus()).toEqual(before);
+    expect(state.vaultMode).toBe("protected");
+    expect(state.vaultExists).toBe(false);
+    expect(state.vaultUnlocked).toBe(false);
+  });
+
   it("legacy passphrase enrollment rejects password accounts even without a wrapper", async () => {
     state.vaultExists = false;
     const before = await mockApi.vaultStatus();

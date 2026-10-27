@@ -8,6 +8,7 @@ import type {
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { isTerminalRun } from "../../lib/runStatus";
+import { byteLength } from "../../lib/skills";
 import { mockCodexAliasAccounts, mockMyTokenRateLimits, mockSecrets } from "../data";
 import { mockVaultMaterial, patchRun, state } from "../store";
 import { schedulesPinnedTo } from "./schedules";
@@ -593,7 +594,7 @@ export const secretsApi = {
   vaultUnlock: async (password: string) => {
     const vault = mockVaultMaterial(oidcDemo().passwordless);
     if (vault.mode === "unprotected") return delay(null, 150);
-    if (!vault.exists) throw new ApiError(409, "vault is not set up");
+    if (!vault.exists) throw new ApiError(403, "incorrect password");
     if (password.trim() === "") throw new ApiError(403, "incorrect password");
     state.vaultUnlocked = true;
     return delay(null, 150);
@@ -605,7 +606,8 @@ export const secretsApi = {
       throw new ApiError(409, "account has a password; its vault derives from the login password");
     }
     if (vault.exists) throw new ApiError(409, "a vault already exists");
-    if (passphrase.length < 12 || passphrase.length > 1024) {
+    const passphraseBytes = byteLength(passphrase);
+    if (passphraseBytes < 12 || passphraseBytes > 1024) {
       throw new ApiError(400, "passphrase must be between 12 and 1024 characters");
     }
     state.vaultMode = "protected";
@@ -621,7 +623,8 @@ export const secretsApi = {
     const vault = mockVaultMaterial(oidcDemo().passwordless);
     if (vault.mode === "protected" && vault.exists) throw new ApiError(409, "a vault already exists");
     if (oidcDemo().passwordless) {
-      if (password.length < 12 || password.length > 1024) {
+      const passphraseBytes = byteLength(password);
+      if (passphraseBytes < 12 || passphraseBytes > 1024) {
         throw new ApiError(400, "passphrase must be between 12 and 1024 characters");
       }
     } else if (password.trim() === "") {
