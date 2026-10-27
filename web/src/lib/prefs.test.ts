@@ -120,7 +120,7 @@ describe("summaryCollapse (PRD #362 Decision 9)", () => {
   });
 });
 
-// Issue #578: the last-selected Boards forge connection. A single scalar with a 7-day TTL,
+// Issue #578: the last-selected Repos forge connection. A single scalar with a 7-day TTL,
 // so an expired entry simply reads as null (no GC loop). The expiry is exercised via the
 // injected `now` param rather than the system clock.
 describe("selectedForge (issue #578)", () => {

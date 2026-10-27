@@ -1,5 +1,5 @@
 // A leaf module (no imports): the mock API imports it, and lib/api imports the mock API, so
-// it must not reach lib/api (runBadge does) or the mock surface sees a half-initialized cycle.
+// it must not reach lib/api or the mock surface sees a half-initialized cycle.
 //
 // credentialSwitchHold names the issue #3181 token-switch hold a run is parked in, or null.
 // "settling": the owner switched a retained-recovery run's token, the run's processes could

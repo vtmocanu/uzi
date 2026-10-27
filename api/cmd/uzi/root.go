@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -91,6 +92,9 @@ type Env struct {
 	// credential is never taken from argv (PRD #64).
 	StdinTTY bool
 
+	// ReadVaultPassword reads terminal input without echo; tests inject a reader.
+	ReadVaultPassword func(context.Context, io.Reader) ([]byte, error)
+
 	// NewClient builds the API client from resolved settings. M3 wires the
 	// real-client stub; tests inject a fake; M7 replaces the default with the
 	// live HTTP client.
@@ -174,6 +178,7 @@ func DefaultEnv() Env {
 		Stdin:              os.Stdin,
 		StdoutTTY:          uzicli.IsTerminal(os.Stdout),
 		StdinTTY:           uzicli.IsTerminal(os.Stdin),
+		ReadVaultPassword:  readVaultTerminalPassword,
 		NewClient:          func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) },
 		Git:                realGit,
 		Brew:               realBrew,
@@ -296,6 +301,7 @@ func newRootCmd(env Env) *cobra.Command {
 		newAuthCmd(env, gf),
 		newContextCmd(env, gf),
 		newWhoamiCmd(env, gf),
+		newVaultCmd(env, gf),
 		newSettingsCmd(env, gf),
 		newRunCmd(env, gf),
 		newPRCmd(env, gf),

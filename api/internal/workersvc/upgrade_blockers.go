@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -112,6 +113,11 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 		switch r.RecoveryWaitCause.String {
 		case recoveryCauseCodexAccountUnavailable:
 			return fmt.Sprintf("recorded cause %s; wait for the same Codex account to become available; inspect account recovery; no timer", cause)
+		case recoveryCauseRetainedRecoveryExhausted:
+			if r.RecoveryRetryNotBefore.Valid {
+				return fmt.Sprintf("automatic retry not before %s; recorded cause %s; owner may inspect or Resume", blockerTime(r.RecoveryRetryNotBefore), cause)
+			}
+			return fmt.Sprintf("recorded cause %s; owner reviews retained recovery and chooses Resume; no timer", cause)
 		case "worker_requeue_exhausted":
 			return fmt.Sprintf("recorded cause %s; owner reviews recovery evidence and chooses Resume; no timer", cause)
 		}
@@ -124,6 +130,9 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 		}
 		return fmt.Sprintf("automatic retry not before %s; recorded cause %s; %s", blockerTime(r.RecoveryRetryNotBefore), cause, action)
 	case "queued":
+		if r.HealthReason.Valid && apitypes.IsCodexAdmissionReason(r.HealthReason.String) {
+			r.HealthReason.String = "waiting: admission held"
+		}
 		return fmt.Sprintf("own continuation must become claimable; recorded reason %s; hold %s; exact fence unavailable, inspect run", blockerFact(r.HealthReason), blockerFact(r.HoldReason))
 	default:
 		return "releasing action unavailable; inspect run"

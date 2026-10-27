@@ -403,6 +403,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []string {
 	groups := [][]string{
 		{"heartbeat_protocol_refresh_v1"},
+		{"codex_account_admission_signal_v1"},
 		{"completion_non_closing_v1"},
 		{"refresh_publication_context_v1"},
 		{"completion_semantic_publication_v1"}, // PRD #1230 D4: independent of completion_non_closing_v1; advertises the semantic coverage park report
@@ -431,6 +432,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		// the cause and counts the park toward UZI_RUN_DISK_PARK_MAX. Advertised UNCONDITIONALLY
 		// (no config gates the park; 0 only lifts the cap): a worker must see it before sending
 		// the cause or the flag, because an older api 400s both.
+		{"recovery_cause_retained_recovery_exhausted"},
 		{"recovery_cause_data_volume_full"},
 		// PRD #1733: this api accepts {status:"recovery_wait", recovery_cause:"provider_outage"}
 		// with the optional productive_turns count, stores and counts the typed park, bounds an

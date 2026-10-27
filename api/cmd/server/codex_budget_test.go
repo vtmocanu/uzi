@@ -8,10 +8,13 @@ import (
 	"time"
 )
 
-// The production refresh callback performs one OAuth exchange. Its 2.5-second cap leaves
-// ample request-entry-anchored margin for the local claim comparison, commit/recheck and
-// response delivery; import and recovery identity reads use the same per-call cap elsewhere.
+// The production refresh callback performs one OAuth exchange capped at 5s, leaving
+// request-entry-anchored margin for commit/recheck and response delivery. Nonrotating
+// identity and usage reads retain their separate 2.5s cap.
 func TestCodexProviderRequestTimeoutLeavesCommitMargin(t *testing.T) {
+	if codexRefreshTimeout != 5*time.Second {
+		t.Fatalf("refresh timeout = %s, want 5s", codexRefreshTimeout)
+	}
 	if codexProviderRequestTimeout != 2500*time.Millisecond {
 		t.Fatalf("provider request timeout = %s, want 2.5s", codexProviderRequestTimeout)
 	}
@@ -48,23 +51,48 @@ func TestProductionWiresCodexRefreshClient(t *testing.T) {
 			return true
 		}
 		pkg, pkgOK := selector.X.(*ast.Ident)
-		if !pkgOK || pkg.Name != "codexauth" || selector.Sel.Name != "NewClient" || len(constructor.Args) != 1 {
+		if !pkgOK || pkg.Name != "codexauth" || selector.Sel.Name != "NewClient" {
 			return true
 		}
-		timeoutCall, ok := constructor.Args[0].(*ast.CallExpr)
-		if !ok || len(timeoutCall.Args) != 1 {
-			return true
+		want := map[string]string{
+			"WithPerRequestTimeout": "codexProviderRequestTimeout",
+			"WithRefreshTimeout":    "codexRefreshTimeout",
 		}
-		timeoutSelector, ok := timeoutCall.Fun.(*ast.SelectorExpr)
-		if !ok || timeoutSelector.Sel.Name != "WithPerRequestTimeout" {
-			return true
+		seen := make(map[string]bool)
+		for _, arg := range constructor.Args {
+			timeoutCall, ok := arg.(*ast.CallExpr)
+			if !ok {
+				continue
+			}
+			timeoutSelector, ok := timeoutCall.Fun.(*ast.SelectorExpr)
+			if !ok {
+				continue
+			}
+			timeoutPkg, ok := timeoutSelector.X.(*ast.Ident)
+			if !ok || timeoutPkg.Name != "codexauth" {
+				continue
+			}
+			name := timeoutSelector.Sel.Name
+			wantArg, required := want[name]
+			if !required {
+				continue
+			}
+			if seen[name] || len(timeoutCall.Args) != 1 {
+				t.Fatalf("production refresh client has duplicate or malformed %s", name)
+			}
+			timeoutArg, ok := timeoutCall.Args[0].(*ast.Ident)
+			if !ok || timeoutArg.Name != wantArg {
+				t.Fatalf("production refresh client %s must use %s", name, wantArg)
+			}
+			seen[name] = true
 		}
-		timeoutPkg, pkgOK := timeoutSelector.X.(*ast.Ident)
-		timeoutArg, argOK := timeoutCall.Args[0].(*ast.Ident)
-		found = pkgOK && argOK && timeoutPkg.Name == "codexauth" && timeoutArg.Name == "codexProviderRequestTimeout"
-		return !found
+		if !seen["WithPerRequestTimeout"] || !seen["WithRefreshTimeout"] {
+			t.Fatal("production refresh client must set both distinct timeout options")
+		}
+		found = true
+		return true
 	})
 	if !found {
-		t.Fatal("production worker service does not inject codexauth.NewClient with the pinned per-request timeout")
+		t.Fatal("production worker service does not inject codexauth.NewClient with the pinned timeout options")
 	}
 }

@@ -227,7 +227,7 @@ describe("AppShell navigation", () => {
     for (const retired of ["Configure", "Help"]) {
       expect(screen.queryByText(retired)).toBeNull();
     }
-    for (const item of ["Overview", "Boards", "Runs", "Agents", "Workers", "Settings", "Docs"]) {
+    for (const item of ["Overview", "Repos", "Runs", "Agents", "Workers", "Settings", "Docs"]) {
       expect(screen.getByRole("link", { name: item })).toBeTruthy();
     }
     // Admin is a single tabbed destination and only for admins; this user is not one.
@@ -336,7 +336,7 @@ describe("AppShell sidebar collapse", () => {
     expect(screen.queryByText("Factory")).toBeNull();
 
     // Every primary destination is still reachable (label survives as a title).
-    for (const item of ["Overview", "Boards", "Runs", "Agents", "Workers", "Settings", "Docs"]) {
+    for (const item of ["Overview", "Repos", "Runs", "Agents", "Workers", "Settings", "Docs"]) {
       expect(screen.getByRole("link", { name: item })).toBeTruthy();
     }
   });

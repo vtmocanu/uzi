@@ -25,6 +25,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
@@ -468,6 +469,8 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// clears to ok and flags again; only that later ok->flagged episode nudges.
 		leftMaintenance := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			r.HealthReason.String == reasonMaintenance && reason != reasonMaintenance
+		leftAdmission := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
+			apitypes.IsCodexAdmissionReason(r.HealthReason.String) && !apitypes.IsCodexAdmissionReason(reason)
 		nudge := target != healthOK && (r.Health == healthOK || leftPin) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
@@ -503,7 +506,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			nudge = false
 		}
 		// PRD #3454: maintenance is an expected, operator-announced wait; a worker-pickup nudge is noise.
-		if reason == reasonMaintenance {
+		if reason == reasonMaintenance || apitypes.IsCodexAdmissionReason(reason) || leftAdmission {
 			nudge = false
 		}
 		// PRD #3522 M3: the weekly usage reserve is the owner's own deliberate limit, not a stuck
@@ -529,7 +532,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		leftReserve := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			isReserveHoldReason(r.HealthReason.String) && !isReserveHoldReason(reason)
 		since := healthSince(now, target, r)
-		if leftPin || leftMaintenance || leftReserve {
+		if leftPin || leftMaintenance || leftReserve || leftAdmission {
 			since = pgconv.Time(now)
 		}
 		notifiedAt := pgtype.Timestamptz{}
@@ -1188,6 +1191,20 @@ type healthEligibilityResult struct {
 	err    error
 }
 
+// QueuedReasonPrecedesCodexAdmission identifies the owner/setup blockers that
+// queuedReasonWithEligibility resolves before temporary provider admission.
+// Maintenance is projected separately at read time, so stale maintenance text
+// must not keep outranking an active cooldown after maintenance ends.
+func QueuedReasonPrecedesCodexAdmission(reason string) bool {
+	switch reason {
+	case reasonHandoffSetup, reasonVaultLocked, reasonCustodyLimit,
+		reasonCustodyLimitUnavailable, reasonCodexAccountUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, early bool, projection *healthEligibilityResult) string {
 	// PRD #3454: the instance intake pause outranks every rung, the handoff one included, since the
 	// pause is the reason ClaimRun matches nothing.
@@ -1253,6 +1270,13 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 	// limit it is owner-account state no worker can clear, so it precedes every worker reason.
 	if r.CodexAccountGated {
 		return reasonCodexAccountUnavailable
+	}
+	// Temporary provider admission is separate from account availability. The
+	// owner-scoped projection already includes this run\'s stable recovery offset.
+	if r.CodexAdmissionClass.Valid && r.CodexAdmissionEligibleAt.Valid && now.Before(r.CodexAdmissionEligibleAt.Time) {
+		if reason := apitypes.CodexAdmissionReason(r.CodexAdmissionClass.String, r.CodexAdmissionEligibleAt.Time); reason != "" {
+			return reason
+		}
 	}
 	// PRD #1906 M5: a profile-bound run is claimable ONLY by an api-provisioned lane worker, so
 	// the ordinary fleet rungs below (online, capable, busy workers) cannot describe it; every one

@@ -23,6 +23,9 @@ func workerRecoveryAllowance(r apitypes.RunDTO) string {
 }
 
 func workerExhaustionLine(r apitypes.RunDTO) string {
+	if isRetainedRecovery(r) {
+		return retainedRecoveryLine(r)
+	}
 	if isMemoryHold(r) {
 		return memoryHoldLine(r)
 	}
@@ -41,16 +44,26 @@ func workerExhaustionEvidence(r apitypes.RunDTO) []string {
 	if isMemoryHold(r) {
 		return []string{"Source/archive availability and latest local edits are unverified. Historical checkpoints and captures do not verify current availability or latest edits."}
 	}
-	if !isWorkerRecoveryExhausted(r) {
+	if !isWorkerRecoveryExhausted(r) && !isRetainedRecovery(r) {
 		return nil
 	}
 	if r.WorkerRecovery == nil || r.WorkerRecovery.Evidence == nil {
+		if isRetainedRecovery(r) {
+			return []string{"Recovery evidence unavailable or unknown. Source/archive availability and latest local edits are unverified."}
+		}
 		return []string{"Recovery evidence unavailable or unknown."}
 	}
 	e := r.WorkerRecovery.Evidence
 	var lines []string
+	if isRetainedRecovery(r) {
+		lines = append(lines, "Historical evidence: source/archive availability and latest local edits are unverified.")
+	}
 	if e.CheckpointTip != nil && *e.CheckpointTip != "" {
-		lines = append(lines, "The server recorded checkpoint "+cellText(*e.CheckpointTip)+" before this hold. Current availability and the latest local edits are not verified.")
+		when := " before this hold"
+		if isRetainedRecovery(r) {
+			when = ""
+		}
+		lines = append(lines, "The server recorded checkpoint "+cellText(*e.CheckpointTip)+when+". Current availability and the latest local edits are not verified.")
 	}
 	if e.AvailableCapture {
 		stamp := "an unknown time"
@@ -81,6 +94,9 @@ func workerExhaustionEvidence(r apitypes.RunDTO) []string {
 // workerExhaustionTUILines puts owner actions and historical caveats before
 // values that a narrow terminal may clip. Each entry occupies one physical row.
 func workerExhaustionTUILines(r apitypes.RunDTO) []string {
+	if isRetainedRecovery(r) {
+		return retainedRecoveryTUILines(r)
+	}
 	if isMemoryHold(r) {
 		return memoryHoldTUILines(r)
 	}
@@ -127,10 +143,13 @@ func workerExhaustionTUILines(r apitypes.RunDTO) []string {
 }
 
 func workerExhaustionRows(r apitypes.RunDTO) [][]string {
-	if !isOwnerRequiredWorkerHold(r) {
+	if !isOwnerRequiredWorkerHold(r) && !isRetainedRecovery(r) {
 		return nil
 	}
 	label := "WORKER_RECOVERY"
+	if isRetainedRecovery(r) {
+		label = "RETAINED_RECOVERY"
+	}
 	if isMemoryHold(r) {
 		label = "MEMORY_HOLD"
 	}

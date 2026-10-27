@@ -762,6 +762,7 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
   it("labels the implicit column Backlog and no lane reads Open", async () => {
     const { container } = renderBoard();
     await screen.findByText("Backlog");
+    expect(screen.getByRole("link", { name: /Repos/ }).getAttribute("href")).toBe("/repos");
     expect(within(container).queryByText("Open")).toBeNull();
   });
 
@@ -2307,7 +2308,9 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     health: string;
     issue_iid: number;
     is_revising?: boolean;
-    queue_reason?: "maintenance" | "weekly_reserve";
+    queue_reason?: import("../lib/api").QueueReason;
+    codex_admission_class?: "rate_limit" | "overload";
+    codex_admission_eligible_at?: string;
   }) =>
     // Issue #485 review FIX 2: the strip's overlay <Link> is now named by the run title
     // as well, so the fixture must carry an issue_title the way the real RunListItem does
@@ -2394,6 +2397,18 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     });
     renderBoard();
     await screen.findByText("1 run looks stuck");
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
+  });
+
+  it.each(["rate_limit", "overload"] as const)("Codex admission %s is not stuck", async (cls) => {
+    mockApi.listRuns.mockResolvedValue({ runs: [
+      aRun({ id: "held", status: "queued", health: "waiting_worker", issue_iid: 8,
+        codex_admission_class: cls, codex_admission_eligible_at: new Date(Date.now() + 60_037).toISOString() }),
+      aRun({ id: "stuck", status: "running", health: "stalled", issue_iid: 7 }),
+    ] });
+    renderBoard();
+    await screen.findByText("1 run looks stuck");
+    expect(strip().textContent).toBe("1 run looks stuck");
     expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
   });
 

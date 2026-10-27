@@ -63,6 +63,7 @@ func TestCodeCrossCheckWorkerInterruptedProjection(t *testing.T) {
 			tx := &codeStatusTx{lead: store.Run{ID: uuid.New(), UserID: worker.UserID, Status: "running", ClaimGeneration: 2},
 				check: store.CrossCheck{Stage: "code", Round: 1, LeadClaimGeneration: 1, Outcome: pgtype.Text{String: "failed", Valid: true},
 					ReasonClass: pgtype.Text{String: reason, Valid: true}, InterruptedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+					Coverage: []byte(`{"version":1,"entries":[],"inventory_incomplete":true,"omitted_paths":0,"omitted_count_exact":false,"unknown_judgments":0,"invalid_judgments":0,"omitted_judgments":0,"activity_complete":false,"reasons":["coverage_invalid"]}`),
 					Findings: []byte(`[{"id":"F-1"}]`), Dispositions: []byte(`[{"finding_id":"F-1","disposition":"declined","reason":"verified"}]`)}}
 			if reason == "superseded" {
 				tx.check.HeadCommit = pgtype.Text{String: strings.Repeat("a", 40), Valid: true}
@@ -83,6 +84,9 @@ func TestCodeCrossCheckWorkerInterruptedProjection(t *testing.T) {
 			var got apitypes.CodeCrossCheck
 			if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &got) != nil || got.ReasonClass == nil || *got.ReasonClass != reason || got.InterruptedAt == nil || string(got.Findings) != "[]" || string(got.Dispositions) != "null" {
 				t.Fatalf("worker projection: %d %s", rec.Code, rec.Body.String())
+			}
+			if string(got.Coverage) != string(tx.check.Coverage) {
+				t.Fatal("worker projection lost coverage")
 			}
 			if reason != "superseded" && (got.HeadCommit != nil || got.BaseCommit != nil) {
 				t.Fatal("invented snapshot")

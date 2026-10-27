@@ -1,5 +1,7 @@
 # PRD 1265: RC-first release train (prerelease channel, lockstep promote)
 
+The exclusively in-session/admin-tag authorization described here is superseded by [ADR-3512](../../adr/3512-release-automation.md), 2026-10-26. The local fallback and RC-first content rules remain.
+
 - **Issue**: #1265
 - **Status**: Done (archived 2026-10-23). Implementation shipped and the issue is closed; the RC train is in use, and the unrecorded M7 success-criteria observations are tracked in #3346.
 - **Earlier status**: In review — M1-M6 implemented (this PR); M7 (first live RC cut + GitOps `0.*-0` flip) is the maintainer's, out of band
@@ -107,7 +109,7 @@ Given `vB-rc.N` at commit `X'`:
 1. Refuse if a `release/B` branch or worktree already exists (a previous aborted promotion; the lead removes it deliberately). `git worktree add <tmp> -b release/B vB-rc.N`. On it: `Chart.yaml` version and appVersion to `B`; `## [B]` heading date to today; `worker-tag-autobump.sh B` unchanged (the pin stays at the RC's tag when the surface is unchanged, D11); `changelog-links.sh`; commit `chore(release): vB (promotes vB-rc.N)`. Assert `git diff --name-only vB-rc.N..HEAD` is a subset of `{CHANGELOG.md, deploy/chart/Chart.yaml, deploy/chart/values.yaml, scripts/assert-worker-tag-decoupled.sh}`; anything else removes the worktree and branch and aborts **before** any tag exists. Only then the annotated tag `vB`, created locally by the script.
 2. The worktree and the `release/B` branch are removed after tagging (and on any abort). The tag carries the commit; `git push origin vB` pushes it. The branch is never pushed and stable tags are **not** ancestors of main (D4 handles it). This is the Kubernetes shape (release branches derive from main, main never merges them back), not git-flow's merge-back; a `-s ours` merge-back was considered and dropped as an extra commit that buys nothing once D4 stops using ancestry. Repair: a pushed `v*` tag is immutable under the ruleset, so a botched pushed RC is followed by `rc.(N+1)` and a botched pushed stable by a patch release (the hotfix procedure in D1); a local-only mistake is `git tag -d` plus a rerun.
 3. The promote commit gets no `ci.yml` run (`ci.yml` runs on PRs and `main`). Accepted because `X'` was green on main, the diff allowlist proves no source changed, `release.yml` re-runs `assert-version` and `assert-changelog` on the tag, and `kind-smoke.yml` runs on every `v*` tag.
-4. Then on main: fold `[Unreleased]` into `## [X.Y.Z]` (D3), refresh the `## [B]` date, `Chart.yaml` to `X.Y.Z-rc.1`, autobump, links, commit `chore(release): vX.Y.Z-rc.1`, verify with the oracle (`PREV` is the local `vB`, so it must be created first) and `changelog-links --check`. As today the RC tag on main is applied by the lead only after `ci.yml` is green on the release commit.
+4. Then on main: fold `[Unreleased]` into `## [X.Y.Z]` (D3), refresh the `## [B]` date, `Chart.yaml` to `X.Y.Z-rc.1`, autobump, links, commit `chore(release): vX.Y.Z-rc.1`, verify with the oracle (`PREV` is the local `vB`, so it must be created first) and `changelog-links --check`. As today the RC tag on main is applied by the lead only after `ci.yml` is green on the release commit. *(Superseded 2026-10-26: PR #2718 permits bounded strict metadata inheritance from exact green pre-cut CI/smoke; the release commit's own full CI need not finish before tagging. [ADR-3512](../../adr/3512-release-automation.md) adds protected CI preparation/push while retaining the local path.)*
 5. **Push order is stable tag, then main, then the RC tag.** The RC tag's `assert-changelog` job computes `PREV` from the tags it can see; `vB` must already be on the remote. The script prints the three push lines in that order; the skill repeats it. The wrong order fails loudly in CI (an uncited-merges FAIL), not silently.
 
 ### D6: Promotion rebuilds; artifact retagging is deferred
@@ -116,7 +118,7 @@ Retagging the RC images as stable (`crane tag`, same digest, cosign referrers ri
 
 ### D7: Non-interactive scripts, verbs over prompts
 
-`release-cut.sh` is driven by the lead in-session; a blocking `read` is the wrong shape for an agent and a trap for a human on a slow terminal. State is derived from tags at every run (no state file). Refusals exit 3 with the facts; the skill owns the conversation.
+*(The exclusively in-session driver is superseded by [ADR-3512](../../adr/3512-release-automation.md), 2026-10-26; shared script behavior remains.)* `release-cut.sh` is driven by the lead in-session; a blocking `read` is the wrong shape for an agent and a trap for a human on a slow terminal. State is derived from tags at every run (no state file). Refusals exit 3 with the facts; the skill owns the conversation.
 
 ### D8: The deployment opts in with `0.*-0`, described generically
 

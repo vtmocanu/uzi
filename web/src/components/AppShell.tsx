@@ -783,8 +783,8 @@ function SidebarContent({
         </div>
 
         <NavGroup label="Work" collapsed={collapsed}>
-          <NavItem to="/repos" icon={<BoardIcon />} label="Boards" exactOnly onNavigate={onNavigate} collapsed={collapsed} />
-          {/* Board children collapse into the "Boards" parent: on the rail every
+          <NavItem to="/repos" icon={<BoardIcon />} label="Repos" exactOnly onNavigate={onNavigate} collapsed={collapsed} />
+          {/* Board children collapse into the "Repos" parent: on the rail every
               repo would render as an identical forge glyph, so hide them and let
               /repos stand in (Decision: reviewer #7). */}
           {!collapsed &&

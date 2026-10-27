@@ -34,6 +34,11 @@ const rec = (over: Partial<ReplayRecord> & { case_id: string }): ReplayRecord =>
   outcome: "completed", latency_ms: 100, cost_usd: 1, findings: [], ...over,
 });
 const only = (records: ReplayRecord[], adj?: Adjudication[]): GroupAggregate => scoreReplays(corpus, records, adj).groups[0]!;
+
+test("score rejects a foreign explicit replay profile even with matching brief hashes", () => {
+  assert.throws(() => scoreReplays({ ...corpus, profile: "revised" }, [rec({ case_id: "d-a", profile: "baseline" })]),
+    { message: "records_invalid" });
+});
 const defectScore = (g: GroupAggregate, case_id: string, id: string) => g.defects.find((d) => d.case_id === case_id && d.id === id)!;
 
 test("a finding matches by path plus line, or path plus keyword, and not otherwise", () => {

@@ -1718,6 +1718,136 @@ for mode in lost-response empty-response not-committed preexisting lookup-error 
   else echo "FAIL: manual registration cleanup $mode result=$got sql=[$calls] http=[$http] output=[$output]"; fi
 done
 
+
+# Phase 50's API-created ephemeral peer may legitimately be reaped while unbound.
+eval "$(awk '/^fixture_worker_absent\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^remove_fixture_ephemeral_worker\(\) \{/,/^\}/' "$LIB")"
+ephemeral_cleanup_case() (
+  local mode="$1" id=11111111-1111-4111-8111-111111111111 owner=22222222-2222-4222-8222-222222222222
+  db_psql() {
+    case "$1" in
+      DELETE*)
+        [[ "$1" == *"id='$id' AND user_id='$owner' AND ephemeral RETURNING id"* ]] || return 90
+        case "$mode" in deleted) printf '%s' "$id";; wrong-id) printf '%s' "$owner";; delete-error) return 1;; esac ;;
+      SELECT*)
+        [[ "$1" == "SELECT count(*) FROM workers WHERE id='$id'" ]] || return 91
+        case "$mode" in present) printf 1;; count-error) return 1;; malformed) printf unknown;; *) printf 0;; esac ;;
+      *) return 92 ;;
+    esac
+  }
+  remove_fixture_ephemeral_worker "$id" "$owner"
+)
+for mode in deleted reaped present delete-error count-error malformed wrong-id; do
+  cases=$((cases + 1))
+  case "$mode" in deleted|reaped) want=pass;; *) want=fail;; esac
+  if output="$(ephemeral_cleanup_case "$mode" 2>&1)"; then got=pass; else got=fail; fi
+  if [ "$got" = "$want" ]; then
+    passed=$((passed + 1)); echo "PASS: phase50 ephemeral cleanup $mode"
+  else echo "FAIL: phase50 ephemeral cleanup $mode result=$got expected=$want: $output"; fi
+done
+
+# Extract and drive the shipped whole window, including both 409 checks and tuple/audit
+# snapshots. This same extraction also executes the old inline block for red proof.
+phase50_ephemeral_case() {
+  bash -euo pipefail -s -- "$ROOT" "$SEQ_DIR" "$1" <<'BASH'
+ROOT="$1" SEQ_DIR="$2" MODE="$3"
+BASE=http://fixture.invalid JAR=unused
+M5_OWNER=22222222-2222-4222-8222-222222222222 M5_FIXTURE=33333333-3333-4333-8333-333333333333 M5_EPHEMERAL=""
+printf 0 > "$SEQ_DIR/phase50-seeds"
+printf 0 > "$SEQ_DIR/phase50-present"
+: > "$SEQ_DIR/phase50-methods"
+fail() { echo "$*" >&2; exit 1; }
+m5_uuid() { [[ "$1" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]]; }
+csrf() { printf dummy-csrf; }
+apipost() {
+  local n
+  n=$(( $(cat "$SEQ_DIR/phase50-seeds") + 1 ))
+  printf '%s' "$n" > "$SEQ_DIR/phase50-seeds"
+  printf 1 > "$SEQ_DIR/phase50-present"
+  printf 0 > "$SEQ_DIR/phase50-snapshots"
+  printf '{"worker":{"id":"11111111-1111-4111-8111-%012d"}}' "$n"
+}
+db_psql() {
+  local n snapshots
+  n="$(cat "$SEQ_DIR/phase50-seeds")"
+  case "$1" in
+    UPDATE*)
+      [[ "$1" == *"id='$M5_EPHEMERAL' AND user_id='$M5_OWNER'"* && "$1" == *'AND NOT ephemeral RETURNING id'* ]] || return 90
+      if [ "$MODE" = seed-reaped ] && [ "$n" = 1 ]; then printf 0 > "$SEQ_DIR/phase50-present"; return; fi
+      printf '%s' "$M5_EPHEMERAL" ;;
+    'SELECT jsonb_build_object('* )
+      snapshots=$(( $(cat "$SEQ_DIR/phase50-snapshots") + 1 ))
+      printf '%s' "$snapshots" > "$SEQ_DIR/phase50-snapshots"
+      if [ "$MODE" = snapshot-error ]; then return 1; fi
+      if [ "$MODE" = snapshot-present ] && [ "$snapshots" = 1 ]; then return; fi
+      if [ "$MODE" = all-reaped ] || { [ "$n" = 1 ] && {
+          { [ "$MODE" = before-reaped ] && [ "$snapshots" = 1 ]; } ||
+          { [ "$MODE" = after-post-reaped ] && [ "$snapshots" = 2 ]; } ||
+          { [ "$MODE" = after-delete-reaped ] && [ "$snapshots" = 3 ]; }; }; }; then
+        printf 0 > "$SEQ_DIR/phase50-present"; return
+      fi
+      if [ "$MODE" = tuple-change ] && [ "$snapshots" = 2 ]; then printf '{"tuple":["changed"],"events":[]}'; return; fi
+      printf '{"tuple":[null,null,null,null],"events":[]}' ;;
+    DELETE*)
+      [[ "$1" == *"id='$M5_EPHEMERAL' AND user_id='$M5_OWNER' AND ephemeral RETURNING id"* ]] || return 91
+      case "$MODE" in
+        cleanup-reaped) printf 0 > "$SEQ_DIR/phase50-present";;
+        cleanup-present) ;;
+        *) printf 0 > "$SEQ_DIR/phase50-present"; printf '%s' "$M5_EPHEMERAL" ;;
+      esac ;;
+    'SELECT count(*) FROM workers WHERE id='*)
+      [[ "$1" != *user_id* ]] || return 92
+      cat "$SEQ_DIR/phase50-present" ;;
+    'SELECT count(*) FROM workers WHERE user_id='*) printf 1 ;;
+    *) return 93 ;;
+  esac
+}
+curl() {
+  local method="" n code=409 message='manual cordon is only supported for persistent workers'
+  while [ "$#" -gt 0 ]; do
+    case "$1" in -X) method="$2"; shift 2;; *) shift;; esac
+  done
+  n="$(cat "$SEQ_DIR/phase50-seeds")"
+  printf '%s:%s\n' "$n" "$method" >> "$SEQ_DIR/phase50-methods"
+  if [ "$MODE" = transport-error ]; then return 7; fi
+  if [ "$MODE" = wrong-reason ]; then message=wrong; fi
+  if [ "$MODE" = missing-present ]; then code=404; fi
+  if [ "$MODE" = error-absent ]; then code=500; printf 0 > "$SEQ_DIR/phase50-present"; fi
+  if [ "$n" = 1 ] && { { [ "$MODE" = post-reaped ] && [ "$method" = POST ]; } ||
+      { [ "$MODE" = delete-reaped ] && [ "$method" = DELETE ]; }; }; then
+    code=404; printf 0 > "$SEQ_DIR/phase50-present"
+  fi
+  printf '{"error":"%s"}\n%s' "$message" "$code"
+}
+eval "$(awk '/^fixture_worker_absent\(\) \{/,/^\}/' "$ROOT/e2e/lib.sh")"
+eval "$(awk '/^remove_fixture_ephemeral_worker\(\) \{/,/^\}/' "$ROOT/e2e/lib.sh")"
+# shellcheck disable=SC1090  # execute only the real ephemeral fixture block, with mocked transports
+source <(awk '/^  # Public CreateWorker has no ephemeral flag/ {emit=1} /^  M5_HELD=/ {exit} emit {print}' "$ROOT/e2e/phases/50-worker-token-binding.sh")
+BASH
+}
+for mode in success cleanup-reaped before-reaped post-reaped delete-reaped after-post-reaped after-delete-reaped seed-reaped \
+    all-reaped missing-present error-absent wrong-reason tuple-change snapshot-present snapshot-error transport-error cleanup-present; do
+  cases=$((cases + 1))
+  case "$mode" in
+    success|cleanup-reaped) want=pass; seeds=1;;
+    before-reaped|post-reaped|delete-reaped|after-post-reaped|after-delete-reaped|seed-reaped) want=pass; seeds=2;;
+    all-reaped) want=fail; seeds=3;;
+    *) want=fail; seeds=1;;
+  esac
+  if output="$(phase50_ephemeral_case "$mode" 2>&1)"; then got=pass; else got=fail; fi
+  actual_seeds="$(cat "$SEQ_DIR/phase50-seeds")"
+  valid=true
+  [ "$got" = "$want" ] && [ "$actual_seeds" = "$seeds" ] || valid=false
+  if [ "$got" = pass ]; then
+    methods="$(tail -2 "$SEQ_DIR/phase50-methods")"
+    [ "$methods" = "${seeds}:POST"$'\n'"${seeds}:DELETE" ] || valid=false
+  fi
+  if [ "$mode" = all-reaped ]; then [[ "$output" == *'ephemeral fixture reaped on every attempt'* ]] || valid=false; fi
+  if [ "$valid" = true ]; then
+    passed=$((passed + 1)); echo "PASS: phase50 ephemeral window $mode"
+  else echo "FAIL: phase50 ephemeral window $mode result=$got seeds=$actual_seeds expected=$want/$seeds: $output"; fi
+done
+
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 node --test "$ROOT/e2e/recovery-record-projection.test.mjs"
 echo "cases=$cases passed=$passed"

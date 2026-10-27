@@ -546,6 +546,7 @@ export interface PipelineStatus {
 }
 
 export interface Repo {
+  ignored_inferred_capabilities?: string[];
   /** Separate checker consent; absent on older APIs means off. */
   cross_check_repo_instructions_enabled?: boolean;
   code_cross_check_guidance?: string | null;
@@ -869,10 +870,12 @@ export interface LatestRun {
   // null for a non-running/chat/judge/interactive run. Optional for the same api/web
   // rollout skew as is_planning: a pre-feature api pod omits the key.
   deadline_at?: string | null;
-  // queue_reason (PRD #3454): "maintenance" while instance maintenance mode holds this queued,
-  // not-yet-admitted run back; null/absent otherwise. Computed in SQL at read time, so it never
-  // lags the pause. Optional for api/web rollout skew.
+  // Read-time reason holding this queued run back; optional for api/web rollout skew.
   queue_reason?: QueueReason | null;
+  // Read-time owner projection; foreign/admin shared reads redact account details.
+  // Eligibility includes the per-run spread and is not a promised start time.
+  codex_admission_class?: CodexAdmissionClass | null;
+  codex_admission_eligible_at?: string | null;
   // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
@@ -1546,10 +1549,11 @@ export interface ReleaseCheckStatus {
 
 // ── Instance maintenance mode (PRD #3454) ───────────────────────────────────
 
-// QueueReason is why a queued run is held back by the instance, beyond waiting for a
-// worker: "maintenance" (instance maintenance mode) or "weekly_reserve" (below).
-/** "weekly_reserve" (PRD #3522): the owner's weekly usage reserve holds this queued run. */
-export type QueueReason = "maintenance" | "weekly_reserve";
+// QueueReason is why a queued run is held back, beyond waiting for a worker: instance
+// maintenance, the owner's weekly usage reserve ("weekly_reserve", PRD #3522), or a temporary
+// provider admission hold. Precedence is in that order.
+export type QueueReason = "maintenance" | "weekly_reserve" | "codex_rate_limit" | "codex_overload";
+export type CodexAdmissionClass = "rate_limit" | "overload";
 
 // MaintenanceState is `GET /api/maintenance` (any signed-in user): whether intake is paused,
 // since when, and the admin's plain-text reason. Render the reason via stripDisplayCell.
@@ -3035,6 +3039,10 @@ export interface SemanticDriftDTO {
 }
 
 export interface Run {
+  /** Repo display path on detail reads; absent on older servers, empty when unavailable. */
+  repo_path?: string;
+  /** Frozen repo inference policy; explicit requirements take precedence. */
+  ignored_inferred_capabilities?: string[];
   completion_pending?: CompletionPendingDTO;
   semantic_gate?: import("./semanticGate").SemanticGateDTO;
   semantic_drift?: SemanticDriftDTO;
@@ -3191,8 +3199,7 @@ export interface Run {
   // null for a non-running/chat/judge/interactive run. Optional for the same api/web
   // rollout skew as is_planning: a pre-feature api pod omits the key.
   deadline_at?: string | null;
-  /** PRD #3454: "maintenance" while instance maintenance mode holds this queued run back
-   *  (see LatestRun.queue_reason). Optional for api/web rollout skew. */
+  /** Read-time queue hold (see LatestRun.queue_reason). Optional for rollout skew. */
   queue_reason?: QueueReason | null;
   /** PRD #3522: why the weekly usage reserve holds this queued run (e.g. "weekly usage reserve:
    *  72% >= 70%"); absent when not held or not queued. */
@@ -3200,6 +3207,10 @@ export interface Run {
   /** PRD #3522: RFC3339 end of the owner's manual-resume override of the weekly usage reserve
    *  (the next weekly reset); absent/null when no override is active. */
   reserve_exempt_until?: string | null;
+  // Read-time owner projection; foreign/admin shared reads redact account details.
+  // Eligibility includes the per-run spread and is not a promised start time.
+  codex_admission_class?: CodexAdmissionClass | null;
+  codex_admission_eligible_at?: string | null;
   /** PRD #320 D8: the run's queue-priority CLASS, computed server-side (see RunPriority).
    *  Only a QUEUED run is ever non-"normal"; a running/terminal run renders no pill. It
    *  rides the shared run embed (RunListItemDTO embeds RunDTO), so it is present on BOTH
@@ -3843,7 +3854,22 @@ export interface PlanCrossCheckFinding {
   rationale: string;
 }
 
+export interface CodeCrossCheckCoverage {
+  version: 1;
+  entries: { path: string; status: "examined" | "excluded" | "unassessed"; reason: string; recorded_read: boolean }[];
+  inventory_incomplete: boolean;
+  omitted_paths: number;
+  omitted_count_exact: boolean;
+  unknown_judgments: number;
+  invalid_judgments: number;
+  omitted_judgments: number;
+  activity_complete: boolean;
+  reasons: string[];
+}
+
 export interface CodeCrossCheckSummary {
+  /** Raw JSON from the API; the card validates it before rendering. */
+  coverage?: unknown;
   custom_guidance_applied?: boolean;
   guidance_digest?: string;
   repo_instructions_enabled?: boolean;

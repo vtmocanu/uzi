@@ -103,6 +103,9 @@ func (e *waitEvidence) append(id, owner uuid.UUID, reason pgtype.Text, since pgt
 	stored := "unavailable"
 	if reason.Valid {
 		stored = safe(reason.String)
+		if apitypes.IsCodexAdmissionReason(reason.String) {
+			stored = "waiting: admission held"
+		}
 	}
 	e.rows = append(e.rows, apitypes.HealthEvidenceDTO{Label: "Waiting run", Value: fmt.Sprintf("run %s; owner %s; waited %s; stored reason %s", safe(id.String()), safe(owner.String()), age, stored)})
 }

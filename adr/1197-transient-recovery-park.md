@@ -41,6 +41,9 @@ historical timeout precedence.
 
 ### Verified capture before a promotable park
 
+The [#3495 amendment](#amendment-2026-10-26-3495-bounded-retained-recovery-parks)
+below adds a narrow exception for durably confirmed retained-source budget exhaustion.
+
 After retries exhaust, reap the agent tree before inspecting its clone.
 Read the dirty/clean state as the runner identity, require a successful WIP
 commit for dirty work, fetch into the worker-owned bare repository, and
@@ -370,8 +373,10 @@ equal to the index size. The caller's fresh observation pairs cost about 8
 `rpcAttempts` per capture (4 mutating dispatches), against the cap of 32.
 Representative measurement: see the delivery report.
 
-**Boundary.** The composed W0, U4b and archive capacity remains an unverified
-projection. The terminal producer guard stays off. U4b, U4c, U4d, U5, F, M3
+**Boundary.** The composed gate (C2) is UNRUN: no qualifying measurement exists, and
+the diagnostic run shows `sourceEntries` refusals at 65,536 on representative
+fixtures, with no archive outcome reached (see the MEASURE section of the delivery
+report). No contract change follows. The terminal producer guard stays off. U4b, U4c, U4d, U5, F, M3
 and M4 remain undelivered, and MO is unperformed.
 
 ### Server-owned backoff
@@ -460,6 +465,9 @@ existing exponential delay capped at 16 times the base. Capture, publication and
 successor handoff preserve the reservation count. Reset of that count requires
 a trusted, successfully settled real model turn. (The #3330 amendment below
 supersedes that sentence: an explicit owner Resume also renews the count.)
+
+The [#3495 amendment](#amendment-2026-10-26-3495-bounded-retained-recovery-parks)
+supersedes terminal exhaustion below only for durably confirmed `budget_exhausted` retained source.
 
 A permanent blocker or exhaustion reports terminal `failed` with
 `keepCustody`; it neither auto-reclaims nor exposes failed-run Resume.
@@ -756,6 +764,9 @@ been observed. The ADR-1416 steering bridge is unchanged.
 
 ## Amendment 2026-10-25, #3330: an owner Resume renews the retained-source budget
 
+Historical decision, narrowed by the [#3495 amendment](#amendment-2026-10-26-3495-bounded-retained-recovery-parks)
+below, including its claim episode projection and stricter rollout boundary.
+
 Maintainer decision: **only** an explicit owner Resume of a run in
 `recovery_wait` with cause `worker_requeue_exhausted` renews the retained-source
 recovery budget. This supersedes three earlier statements: the #2512 amendment's
@@ -846,10 +857,11 @@ provider error nor that the model processed the prompt.
 
 Eligibility covers initial planning, automatic plan revisions and implementation
 model turns.
-`drivePlan` excludes human plan-revision turns throughout the invocation,
-including their clarification and prose-only followups. Those idle outcomes
-retain the existing failure contract. Productive idle, callback-based idle
-suppression, `idleOperation`, child turns and the Claude lane are unchanged.
+Human plan-revision turns use the separate, negotiated in-flight recovery
+path described in the #3466 amendment below, including clarification and
+prose-only followups. Without that recovery, they retain the idle failure
+contract. Productive idle, callback-based idle suppression, `idleOperation`,
+child turns and the Claude lane are unchanged.
 The [SDK recovery-error comment](../agent/src/sdk-executor.ts) records the
 same Codex exception.
 
@@ -862,8 +874,9 @@ pause or spent wall therefore takes its existing route instead of becoming
 ordinary recovery. A latched vault lock prevents this conversion; a lock
 latched after the idle trip preserves the earlier idle outcome.
 
-There is no in-process retry or transient-retry debit for this idle outcome,
-including silence after a #2099 retry. The existing #2099 classified-provider
+Outside negotiated human revision recovery (#3466 below), there is no
+in-process retry or transient-retry debit for this idle outcome, including
+silence after a #2099 retry. The existing #2099 classified-provider
 retry count and same-thread retries remain unchanged; that in-process
 backoff stays clamped to the remaining wall budget. A fresh
 harness is required after the recovery park: `turn/interrupt` is a
@@ -1233,3 +1246,146 @@ for each wrapped variant. M2/M3, complete mutation mapping, integration/full gat
 and new candidate reviewer/tester/auditor sign-offs remain incomplete and mandatory.
 The timed-out full gate is not green. Guard remains false; C2–C8, compose70/72/73
 and hosted timing retain their separate unproven boundaries.
+
+## Issue #3466 amendment — silent human revisions
+
+A real Codex idle trip with exactly zero measured model-processing events can
+use `plan_revision_retry_v1` during an accepted human revision, including its
+clarification and prose followups. A typed `zeroEvidenceIdle` discriminator
+retains the original idle trip; `providerOrigin` stays false. Silence does not
+establish a provider error. This path uses `PlanRevisionRecovery`, without an
+ordinary recovery park or provider-outage accounting. Missing negotiation,
+hook, active revision or presentation identity retains the original terminal
+idle outcome. Control and ownership exceptions retain their own routes.
+
+The pre-reaping sink persists the session before verified epoch disposal,
+including when the retry allowance is exhausted. A silent retry reconstructs
+inside the revision driver, after allowance consumption and the last awaited
+disposal. Exact source, claim and owner controls are checked again before
+construction and at credential/root admission, including before any capture.
+Unproven cleanup, including cleanup of a partially built replacement or a
+failed repeated disposal, and residue quarantine refuse continuation. A failed
+repeated disposal revokes the earlier capture-only proof for that exact facade.
+Token redaction survives replacement
+until existing terminal cleanup.
+
+Each admitted reconstruction spends the existing three-redrive allowance
+before fresh construction, including an owner replacement after exhaustion.
+Locked-vault and unavailable-credential construction failures remain inside
+that bounded driver, including an owner replacement revision after exhaustion;
+they do not escape into the runner credential hold. Teardown, backoff and
+admission consume the unchanged wall budget. Silent-revision backoff slices are
+clamped to the remaining wall budget before sleeping; a spent wall returns to
+the executor's existing interruption routing. Time awaiting an owner event at
+the restored gate remains excluded; ownership checks and gate restoration
+between wait ticks remain charged. Both revision-retry entry paths check the
+remaining wall after source checks and gate restoration, before each owner-event
+wait. A spent wall returns to the executor's wall routing; an extension retains
+the exhausted retry state instead of admitting an uncharged reconstruction.
+Retry waits for unknown ownership and gate-restoration evidence use that same
+remaining budget. A replacement revise already taken from the owner queue stays
+pending across a wall unwind until its source proof can complete.
+Cancel, pause, spent wall and completion
+holds retain their existing precedence. Provider-origin revision
+retries continue on their existing epoch.
+
+The same failed prompt and clarification/prose budgets survive a silent retry.
+Feedback remains pending until source-fenced revised publication succeeds.
+Exhaustion restores the original presentation and an operable busy owner wait;
+source-bound reject and cancel remain available. An ordinary replacement revise
+spends the normal revision cap and receives a fresh allowance, while predecessor
+feedback settles only with the successor publication receipt. Retry notices
+describe silence as no model output, without attributing it to a provider outage.
+
+Validation uses scripted executor and runner fixtures. No live-provider or
+compose-stack proof is claimed for this amendment.
+
+## Amendment 2026-10-26, #3495: bounded retained-recovery parks
+
+Decision record (AI-synced 2026-10-26). This amendment qualifies #2512's
+terminal-exhaustion policy, #3330's owner-only renewal and server-requeue
+exclusion, and the verified-capture-before-promotable-park prerequisite.
+It applies only to an authoritative exact-source journal durably confirmed as
+`budget_exhausted`. Other permanent blockers keep the existing terminal fallback
+with custody retained. #3462's Codex zero-evidence idle still enters ordinary
+verified-capture recovery; this is not a broader retry for deterministic blockers.
+#3181 remains out of scope. There is no linked PRD.
+
+### Retry allowance and renewal
+
+- `RUN_RETAINED_RECOVERY_MAX_PARKS` is nonnegative, default **3**; **0** holds
+  immediately. If the prior `retained_park_count` is below the cap, the park
+  increments it and schedules a retry using that cause's count: base backoff
+  of 1m, 2m, 4m at defaults, clamped by `RUN_RECOVERY_MAX_PARK`, plus jitter.
+  `RUN_RECOVERY_PARK_BASE` sets the base. At the cap the count stays unchanged
+  and `recovery_retry_not_before` is NULL: the fourth exhaustion is owner-held
+  by default. Both forms increment lifetime `recovery_wait_count`, which does
+  not set this cause's cadence. Owner Resume preserves the count and cap.
+- Automatic parks do not change stored `worker_recovery_episode` or
+  `requeue_episode_baseline`. All four claim builders (ordinary, chat, job,
+  judge) project `worker_recovery_episode = stored worker_recovery_episode +
+  retained_park_count` through `claimRecoveryEpisode` in
+  [retainedpark.go](../api/internal/workersvc/retainedpark.go).
+  The worker-death allowance and historical `WorkerRecoveryDTO` use stored
+  episode evidence; retained retries are not worker-death requeues.
+- Renewal requires both a fresh generation and a higher derived episode than
+  the journal. It charges exactly one reservation of three in a new five-minute
+  window, clears only `budget_exhausted`, and requires quiescence again before
+  recovery work. Same generation or same episode cannot renew. Resume of a
+  pending timed retry before its fresh claim can advance the derived episode
+  by two but still grants one renewal, not two windows.
+- Default timer promotion permits up to three new full run wall windows:
+  `PromoteRecoveryWaitRuns` sets `started_at = NULL`. Manual Resume instead
+  preserves existing wall-remaining semantics and banks held time; the owner
+  may need `uzi run extend` first. It does not grant that timer wall reset.
+- Existing owner-authorized Resume and Cancel work on timed and held forms.
+  Resume clears the retry, increments stored `worker_recovery_episode` by one,
+  resets the worker-death baseline, and preserves `retained_park_count`.
+  Timer promotion excludes NULL retries. Token/credential immediate promotion
+  excludes this cause entirely. See the park, Resume and promotion queries in
+  [runtime.sql](../api/internal/store/queries/runtime.sql).
+
+### Worker confirmation and execution fencing
+
+The worker requires a positive claim generation, negotiated
+`recovery_cause_retained_recovery_exhausted`, and authoritative exact-source
+journal readback confirming durable `budget_exhausted`. Feature absence,
+readback or persistence failure, another blocker, or explicit HTTP 400 before
+any uncertain request keeps the existing terminal fallback with custody kept.
+Transport/server errors and unconfirmed 2xx responses enter bounded
+reconciliation and preserve a nonterminal retained stop. Only returned status
+and cause confirm the park; stale, cancelled or newer outcomes stop without a
+terminal report. Budget exhaustion does not require a new capture it prevents.
+
+An applied park atomically releases the **execution claim** and fences late
+same-generation state, completion and snapshot reports. It retains `worker_id`,
+session and open custody holds, and does not set a released-worker-incarnation
+marker. `ClaimRun` clears execution release with a fresh generation. Execution
+release is never a custody release or source-deletion receipt.
+
+Both timed and held forms conservatively protect custody throughout
+`recovery_wait`, before archive readiness or capture progress, after existing
+discarded/released precedence. After timer promotion or Resume leaves the park,
+existing archive/final-disposition proof rules apply again; source-only,
+unknown or unproven holds stay. There is no new custody lifetime marker.
+Export availability remains independent and an earlier archive may omit latest
+work. Same-worker affinity remains; after worker death or the affinity ceiling,
+a peer may recover a published checkpoint without the local journal, with
+source custody still held and no latest-work guarantee.
+
+### Presentation, risks and rollout
+
+Finite retries, including due timestamps, display as timed retries. NULL means
+owner-held with no countdown; omitted timing is unknown. Default CLI wait and
+log follow stop for the owner-held form; explicit `--until` is unchanged.
+Follow notices include a finite-to-NULL change within the same cause/status.
+
+Retained sources increase storage and custody-quota pressure and can block image
+rolls in both forms. Post-deadline failure reclassification as
+`budget_exhausted` can include another failure; renewed quiescence remains
+required. Deploy the API fully before workers consume the feature. Mixed API
+replicas and API rollback are unsupported; an old API omitting the feature uses
+the terminal fallback. The existing worker-journal downgrade caution remains:
+older workers may reject or drop durable recovery fields. This amendment adds
+no operator watcher or lander policy, source-deletion authority or guarantee
+that the latest edits have an archive.

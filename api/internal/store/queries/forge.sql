@@ -314,6 +314,24 @@ RETURNING *;
 -- Filter-ed against the vocabulary in the handler before it reaches here.
 UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING *;
 
+-- name: SetRepoIgnoredInferredCapabilitiesForUser :one
+UPDATE repos SET ignored_inferred_capabilities = $2
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
+RETURNING *;
+
+-- name: SetRepoIgnoredInferredCapabilities :one
+UPDATE repos SET ignored_inferred_capabilities = $2 WHERE repos.id = $1 RETURNING *;
+
+-- name: SetRepoCapabilityPolicyForUser :one
+UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $4)
+RETURNING *;
+
+-- name: SetRepoCapabilityPolicy :one
+UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3 WHERE repos.id = $1 RETURNING *;
+
 -- name: SetRepoTrustFlags :one
 -- Atomic Trusted-repo (PRD #246) toggle: sets repo_skills_enabled and/or
 -- repo_claudemd_enabled in ONE round-trip. A nil arg leaves that column unchanged
@@ -610,11 +628,19 @@ SELECT DISTINCT ON (r.issue_iid)
        r.budget_finalize_seconds, r.hold_reason,
        r.auto_approve_blocked_reasons,
        r.created_at, r.updated_at,
-       -- PRD #3454: "maintenance" while intake is paused and this queued run is not admitted; PRD #3522: "weekly_reserve" while a queued run carries a reserve hold marker (maintenance wins when both apply); else '' (sqlc types a CASE column non-null; the handler maps '' to absent).
-       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' WHEN r.status = 'queued' AND r.reserve_hold_reason IS NOT NULL THEN 'weekly_reserve' ELSE '' END)::text AS queue_reason,
+       -- Maintenance outranks the PRD #3522 weekly reserve, which outranks account admission; the
+       -- handler hides account details from nonowners. Empty means unrestricted and maps to an
+       -- absent queue_reason.
+       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance'
+             WHEN r.status = 'queued' AND r.reserve_hold_reason IS NOT NULL THEN 'weekly_reserve'
+             WHEN admission.codex_admission_class = 'rate_limit' THEN 'codex_rate_limit'
+             WHEN admission.codex_admission_class = 'overload' THEN 'codex_overload'
+             ELSE '' END)::text AS queue_reason,
+       admission.codex_admission_class, admission.codex_admission_eligible_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
 FROM runs r
+LEFT JOIN codex_queued_run_admission admission ON admission.run_id = r.id AND admission.user_id = r.user_id
 LEFT JOIN users ru ON ru.id = r.user_id
 LEFT JOIN workers rw ON rw.id = r.worker_id
 WHERE r.repo_id = @repo_id::uuid AND r.issue_iid IS NOT NULL   -- issue runs only; ci_fix runs (PRD #6) have no card; ::uuid keeps the param non-null after PRD #39
@@ -645,11 +671,19 @@ SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_
        r.budget_finalize_seconds, r.hold_reason,
        r.auto_approve_blocked_reasons,
        r.created_at, r.updated_at,
-       -- PRD #3454: "maintenance" while intake is paused and this queued run is not admitted; PRD #3522: "weekly_reserve" while a queued run carries a reserve hold marker (maintenance wins when both apply); else '' (sqlc types a CASE column non-null; the handler maps '' to absent).
-       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' WHEN r.status = 'queued' AND r.reserve_hold_reason IS NOT NULL THEN 'weekly_reserve' ELSE '' END)::text AS queue_reason,
+       -- Maintenance outranks the PRD #3522 weekly reserve, which outranks account admission; the
+       -- handler hides account details from nonowners. Empty means unrestricted and maps to an
+       -- absent queue_reason.
+       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance'
+             WHEN r.status = 'queued' AND r.reserve_hold_reason IS NOT NULL THEN 'weekly_reserve'
+             WHEN admission.codex_admission_class = 'rate_limit' THEN 'codex_rate_limit'
+             WHEN admission.codex_admission_class = 'overload' THEN 'codex_overload'
+             ELSE '' END)::text AS queue_reason,
+       admission.codex_admission_class, admission.codex_admission_eligible_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count
 FROM runs r
+LEFT JOIN codex_queued_run_admission admission ON admission.run_id = r.id AND admission.user_id = r.user_id
 LEFT JOIN users ru ON ru.id = r.user_id
 LEFT JOIN workers rw ON rw.id = r.worker_id
 WHERE r.repo_id = @repo_id::uuid AND r.issue_iid = @issue_iid

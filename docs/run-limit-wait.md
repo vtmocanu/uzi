@@ -158,7 +158,9 @@ opt a token into the pool, or on demand with `uzi run resume-now`. See
 [Letting uzi pick the token (auto-selection)](anthropic-token.md#letting-uzi-pick-the-token-auto-selection)
 for the pooled-token wait. `recovery_wait` covers transient interruptions and
 other recovery causes; `worker_requeue_exhausted` requires explicit owner
-Resume or Cancel and has no automatic retry — see
+Resume or Cancel and has no automatic retry. `retained_recovery_exhausted`
+instead has bounded timed retries followed by an owner hold with a NULL retry
+and no countdown — see
 [Recovering from a transient interruption](run-recovery-wait.md).
 
 ## Not the same as pausing

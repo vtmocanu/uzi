@@ -136,6 +136,7 @@ export type LaunchAdviceRootSeam = (spec: CodexAdviceLaunchSpec) => Promise<Code
  *  app-server authentication is a PRIVATE, narrow transport seam for the selected
  *  credential, not a general callback registry. */
 export interface CodexAdviceHarnessOptions {
+  readonly admissionReporter?: import("./admission-signal.js").CodexAdmissionReporter;
   readonly launchRoot: LaunchAdviceRootSeam;
   readonly provider: CodexProviderConfig;
   /** Pinned auth owner for this isolated app-server. It has no run callback registry. */
@@ -221,6 +222,8 @@ async function awaitSettled(work: Promise<unknown>, graceMs: number): Promise<vo
 export class CodexAdviceHarness implements AdviceHarness {
   readonly kind = "codex" as const;
 
+  private readonly admissionReporter?: import("./admission-signal.js").CodexAdmissionReporter;
+  private admissionAttempt?: import("./admission-signal.js").AdmissionAttempt;
   private readonly launchRoot: LaunchAdviceRootSeam;
   private readonly provider: CodexProviderConfig;
   private readonly appServerAuth?: CodexAppServerAuthSession;
@@ -231,6 +234,7 @@ export class CodexAdviceHarness implements AdviceHarness {
   private readonly log: Logger;
 
   constructor(opts: CodexAdviceHarnessOptions) {
+    this.admissionReporter = opts.admissionReporter;
     this.authMode = opts.authMode;
     this.now = opts.now ?? (() => new Date());
     this.launchRoot = opts.launchRoot;
@@ -453,6 +457,7 @@ export class CodexAdviceHarness implements AdviceHarness {
           });
         }
         const note = step.value;
+        this.admissionAttempt?.observe(note);
 
         // A server→client request: the narrow provider-auth owner is the only admitted
         // seam. It has no workspace or run callback registry; everything else is refused.
@@ -630,11 +635,13 @@ export class CodexAdviceHarness implements AdviceHarness {
     if (rendered.modelReasoningEffort !== undefined) params.effort = rendered.modelReasoningEffort;
     // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
     assertResidueQuarantineOpen("provider_turn");
+    this.admissionAttempt = this.admissionReporter?.begin(threadId);
     const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
     const id = res?.turn?.id;
     if (typeof id !== "string" || id.length === 0) {
       throw new CodexAdviceError({ category: "protocol", message: "codex advice turn/start returned no turn id" });
     }
+    this.admissionAttempt?.bind(id);
     return id;
   }
 

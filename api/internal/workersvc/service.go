@@ -1644,7 +1644,8 @@ type Params struct {
 	// DATA-VOLUME-FULL park's lifetime cap: parkDataVolumeFull fails the run with the
 	// server-derived fail_origin='data_volume_full' instead of parking when a COUNTED park would
 	// take disk_park_count past it. A preventive park is neither counted nor capped. 0 = unlimited.
-	RunDiskParkMax int
+	RunDiskParkMax              int
+	RunRetainedRecoveryMaxParks int
 	// RunProviderParkMaxDuration (PRD #1733), mirrored from config RUN_PROVIDER_PARK_MAX_DURATION.
 	// The elapsed-time bound on an unbroken streak of typed provider_outage parks: the first
 	// such park at or past it becomes a paused 'provider_unavailable' owner hold instead of a
@@ -4776,6 +4777,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		owned = locked
 		q = qtx
 	}
+	if req.RequiredCapabilities != nil {
+		caps := applyInferredCapabilityPolicy(owned, *req.RequiredCapabilities)
+		req.RequiredCapabilities = &caps
+	}
 	var rows int64
 	// PRD #1795 M1: a refused awaiting_approval report (historical id, changed payload on the
 	// current id, stale adoption). It wrote no report; it is returned AFTER the commit (its
@@ -5337,6 +5342,17 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			}
 			break
 		}
+		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseRetainedRecoveryExhausted {
+			var retained store.Run
+			retained, rows, err = s.parkRetainedRecovery(ctx, wkr, owned, req, sessionID)
+			if err != nil {
+				return retained, false, err
+			}
+			if rows == 0 {
+				return retained, false, nil
+			}
+			break
+		}
 		// PRD #1809 M5 (D6): the DATA-VOLUME-FULL park is its own locked transaction too — the
 		// forge park's claim-generation fencing, a disk-only lifetime counter (bumped unless the
 		// park is preventive) and a cap past which the run fails with fail_origin
@@ -5565,7 +5581,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// The bounded provider park left the run 'paused', not 'recovery_wait': store the
 			// durability report against the status the run actually holds.
 			s.setCheckpointDurability(ctx, wkr, owned, "paused", req.CheckpointContainsLatest)
-		} else {
+		} else if req.State != "recovery_wait" || req.RecoveryCause == nil || *req.RecoveryCause != recoveryCauseRetainedRecoveryExhausted {
+			// Retained recovery records this value atomically before releasing
+			// execution; a post-park mutation is stale on reconciled runs.
 			s.recordCheckpointDurability(ctx, wkr, owned, req)
 		}
 	}

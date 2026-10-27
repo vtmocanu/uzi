@@ -3,13 +3,15 @@
 # a local bare origin, no network. Each case builds a branch off origin/main and asserts the
 # gate's status, so every exemption and the fail-closed paths are proven to fire. Prints a
 # `cases=N passed=N` tally and fails below its case floor, so a gutted run cannot read green.
+# Pass --producer-failures-only to isolate commit/path inventory failures.
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 mkdir -p "$ROOT/.uzi/scratch"
 TMP="$(mktemp -d "$ROOT/.uzi/scratch/changelog-entry-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
-FLOOR=99
+FLOOR=135
+[ "${1:-}" != --producer-failures-only ] || FLOOR=36
 cases=0
 passed=0
 
@@ -97,6 +99,7 @@ squash_for_oracle() {
   git -C "$W" commit -qm "$1"
 }
 
+if [ "${1:-}" != --producer-failures-only ]; then
 fresh on-main; git -C "$W" checkout -q main
 expect 0 "HEAD at origin/main: empty diff"
 
@@ -443,6 +446,106 @@ import sys
 Path(sys.argv[1]).write_bytes(b'## [Unreleased]\n### Fixed\n- ' + b'x' * 4194280 + b'\n')
 PYFIX
 expect 1 'PR check rejects combined body and fragments'
+
+fi
+# Instrument failures cannot omit a commit or hide an uncommitted manifest.
+producer_status_regressions() {
+  local site form good bad base marker before after real_git count_file
+  real_git=$(command -v git)
+  mkdir -p "$TMP/producer-bin"
+  cat > "$TMP/producer-bin/git" <<'SH'
+#!/usr/bin/env bash
+match=0
+case "$READ_FAIL_SITE/$*" in
+  "commit-paths/diff-tree --no-commit-id --name-only -z -r $READ_BAD_SHA") match=1 ;;
+  "commits/rev-list --no-merges $READ_BASE..HEAD") match=1 ;;
+  'uncommitted/diff --name-only -z HEAD --') match=1 ;;
+  'untracked/ls-files -z --others --exclude-standard')
+    count=0
+    [ ! -f "$READ_COUNT_FILE" ] || read -r count < "$READ_COUNT_FILE"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$READ_COUNT_FILE"
+    # The first read supplies the whole-branch diff. Fail the later exemption read.
+    [ "$count" -ne 2 ] || match=1 ;;
+esac
+if [ "$match" -eq 1 ]; then
+  printf '%s\n' "$READ_FAIL_SITE/$READ_FAIL_FORM" > "$READ_FAIL_MARKER"
+  if [ "$READ_FAIL_FORM" = partial ]; then
+    if [ "$READ_FAIL_SITE" = commits ]; then printf '%s\n' "$READ_GOOD_SHA"
+    elif [ "$READ_FAIL_SITE" = untracked ]; then printf 'UNTRACKED.md\0'
+    else printf 'README.md\0'
+    fi
+  fi
+  exit 71
+fi
+exec "$READ_REAL_GIT" "$@"
+SH
+  chmod +x "$TMP/producer-bin/git"
+  for site in commit-paths commits uncommitted untracked; do
+    for form in empty partial; do
+      fresh "producer-$site-$form"
+      echo '// dependency update' >> "$W/api/go.mod"
+      echo 'manifest documentation' > "$W/README.md"
+      commit 'chore(deps): update manifest'
+      good=$(git -C "$W" rev-parse HEAD)
+      case "$site" in
+        commit-paths|commits)
+          echo 'RUN changed behavior' >> "$W/api/Dockerfile"
+          echo 'behavior documentation' >> "$W/README.md"
+          commit 'fix(api): change Dockerfile behavior' ;;
+        uncommitted)
+          echo '// pending manifest edit' >> "$W/api/go.mod"
+          echo 'pending documentation' >> "$W/README.md" ;;
+        untracked)
+          echo 'pending lockfile' > "$W/api/go.sum"
+          echo 'pending documentation' > "$W/UNTRACKED.md" ;;
+      esac
+      bad=$(git -C "$W" rev-parse HEAD)
+      base=$(git -C "$W" rev-parse origin/main)
+      marker="$TMP/$site-$form.marker"; count_file="$TMP/$site-$form.count"
+      before=$(git -C "$W" rev-parse HEAD; git -C "$W" for-each-ref --format='%(refname) %(objectname)'; git -C "$W" status --porcelain=v1 --untracked-files=all)
+      READ_REAL_GIT="$real_git" READ_FAIL_SITE="$site" READ_FAIL_FORM="$form" READ_BAD_SHA="$bad" READ_GOOD_SHA="$good" \
+        READ_BASE="$base" READ_FAIL_MARKER="$marker" READ_COUNT_FILE="$count_file" PATH="$TMP/producer-bin:$PATH" \
+        expect 2 "$site $form failure is an instrument error, never an exemption"
+      case "$site" in
+        commits) expect_output 'could not read branch commits' ;;
+        commit-paths) expect_output 'could not read commit paths' ;;
+        uncommitted) expect_output 'could not read uncommitted tracked paths' ;;
+        untracked) expect_output 'could not read untracked paths' ;;
+      esac
+      cases=$((cases + 1))
+      if [ "$(cat "$marker" 2>/dev/null)" = "$site/$form" ]; then passed=$((passed + 1))
+      else echo "FAIL: $site $form did not inject the exact producer" >&2
+      fi
+      after=$(git -C "$W" rev-parse HEAD; git -C "$W" for-each-ref --format='%(refname) %(objectname)'; git -C "$W" status --porcelain=v1 --untracked-files=all)
+      cases=$((cases + 1))
+      if [ "$before" = "$after" ]; then passed=$((passed + 1))
+      else echo "FAIL: $site $form changed HEAD, refs, index or worktree" >&2
+      fi
+    done
+  done
+  fresh producer-early-shipping-control
+  echo '// dependency update' >> "$W/api/go.mod"
+  mkdir -p "$W/tools"; echo 'documentation' > "$W/tools/z.md"
+  commit 'chore(deps): update manifest and documentation'
+  expect 0 'dependency exemption accepts a shipping path before the last diff record'
+
+  fresh producer-mixed-control
+  echo '// dependency update' >> "$W/api/go.mod"; commit 'chore(deps): update manifest'
+  echo 'RUN changed behavior' >> "$W/api/Dockerfile"; commit 'fix(api): change Dockerfile behavior'
+  expect 1 'complete history refuses the nondependency manifest commit'
+
+  fresh producer-uncommitted-control
+  echo '// dependency update' >> "$W/api/go.mod"; commit 'chore(deps): update manifest'
+  echo '// pending manifest edit' >> "$W/api/go.mod"
+  expect 1 'a visible uncommitted manifest prevents the exemption'
+
+  fresh producer-untracked-control
+  echo '// dependency update' >> "$W/api/go.mod"; commit 'chore(deps): update manifest'
+  echo 'pending lockfile' > "$W/api/go.sum"
+  expect 1 'a visible untracked manifest prevents the exemption'
+}
+producer_status_regressions
 
 echo "check-changelog-entry.test.sh: cases=$cases passed=$passed"
 [ "$cases" = "$passed" ] || exit 1

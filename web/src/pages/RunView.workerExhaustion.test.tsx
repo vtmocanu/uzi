@@ -235,3 +235,66 @@ it("badge and shared pill describe the owner decision without automatic retry", 
   render(<StatusPill status={effectiveRunStatus(run)} />);
   expect(screen.getByText("recovery needs decision")).toBeTruthy();
 });
+
+
+function retained(stamp: string | null): Run {
+  return { ...held(), recovery_wait_cause: "retained_recovery_exhausted", recovery_retry_not_before: stamp };
+}
+it.each(["2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z", null])("retained recovery %s uses the actual Resume and Cancel handlers", async (stamp) => {
+  render(view(retained(stamp), true));
+  expect(screen.getByText(stamp === null ? "Retained recovery needs your decision" : "Retained recovery retrying")).toBeTruthy();
+  if (stamp === null) {
+    expect(screen.getByText(/This hold has no scheduled retry/)).toBeTruthy();
+    expect(screen.queryByText(/The run will retry automatically|Automatic retry is due/)).toBeNull();
+  } else {
+    expect(screen.getByText(stamp.startsWith("2099") ? /The run will retry automatically after/ : /Automatic retry is due/)).toBeTruthy();
+    expect(screen.queryByText(/This hold has no scheduled retry/)).toBeNull();
+  }
+  expect(screen.queryByText(/Automatic recovery limit:|Lifetime automatic requeues:|Recovery episode:/)).toBeNull();
+  expect(screen.getByText(/Historical checkpoint or capture reports do not verify current availability/)).toBeTruthy();
+  expect(screen.getByText(/A recovery capture was recorded as available/)).toBeTruthy();
+  expect(screen.queryByText("The published checkpoint contains the latest work.")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));
+  await waitFor(() => expect(api.resumeRun).toHaveBeenCalledWith("held"));
+  await waitFor(() => expect(refreshRun).toHaveBeenCalledOnce());
+  fireEvent.click(screen.getByRole("button", { name: /^Cancel$/ }));
+  await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+});
+it.each([
+  [null, undefined, true], [null, false, true], [null, true, false],
+  ["2099-01-01T00:00:00Z", undefined, true], ["2099-01-01T00:00:00Z", false, true], ["2099-01-01T00:00:00Z", true, false],
+] as const)("retained recovery %s requires owner proof %s and canSteer %s", (stamp, proof, canSteer) => {
+  render(view(retained(stamp), proof, canSteer));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+  expect(api.getRunArchives).not.toHaveBeenCalled();
+  expect(api.resumeRun).not.toHaveBeenCalled();
+  expect(submit).not.toHaveBeenCalled();
+});
+it("announces retained recovery timing changing to explicit owner hold", async () => {
+  const { container, rerender } = render(view(retained("2020-01-01T00:00:00Z"), true));
+  const notice = container.querySelector('div.sr-only[role="status"]')!;
+  await waitFor(() => expect(notice.textContent).toMatch(/retry automatically/));
+  expect(screen.getByText(/Automatic retry is due/)).toBeTruthy();
+  expect(screen.queryByText(/This hold has no scheduled retry/)).toBeNull();
+  rerender(view(retained(null), true));
+  await waitFor(() => expect(notice.textContent).toMatch(/There is no scheduled retry/));
+  expect(notice.textContent).not.toMatch(/automatically/);
+  expect(screen.getByText(/This hold has no scheduled retry/)).toBeTruthy();
+});
+it.each([undefined, "invalid"])("retained recovery unknown timing %s promises no retry or owner hold", (stamp) => {
+  const run = { ...retained(null), recovery_retry_not_before: stamp } as Run;
+  render(view(run, true));
+  expect(screen.getByText("Retained recovery timing unknown")).toBeTruthy();
+  expect(screen.getByText(/Retry timing is unavailable/)).toBeTruthy();
+  expect(screen.queryByText(/This hold has no scheduled retry|The run will retry automatically/)).toBeNull();
+});
+it.each([null, "2099-01-01T00:00:00Z"])("retained recovery %s shares busy and error handling", async (stamp) => {
+  let reject!: (error: Error) => void;
+  vi.mocked(api.resumeRun).mockImplementationOnce(() => new Promise((_, fail) => { reject = fail; }));
+  render(view(retained(stamp), true));
+  fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));
+  expect((screen.getByRole("button", { name: /^Cancel$/ }) as HTMLButtonElement).disabled).toBe(true);
+  await act(async () => reject(new ApiError(409, "Retained recovery refused")));
+  expect(screen.getByText("Retained recovery refused")).toBeTruthy();
+  expect((screen.getByRole("button", { name: /^Resume$/ }) as HTMLButtonElement).disabled).toBe(false);
+});

@@ -111,6 +111,12 @@ export type SecretRemediationDecision =
   | { action: "remediate"; followUp: string }
   | { action: "fail" };
 
+/** Marks only the exhausted revision's owner-event wait, excluding recovery work. */
+export type PlanRevisionOwnerWaitObserver = (waiting: boolean) => void;
+
+/** Silent recovery spent its wall before owner waiting; the executor owns wall routing. */
+export type PlanRevisionRetryOutcome = "wall" | void;
+
 /**
  * Everything an executor needs to work one run.
  *
@@ -424,13 +430,14 @@ export interface RunContext {
    * a fenced claim ends quietly. Absent on the stub/test executors ⇒ today's behaviour.
    */
   takeResumedGateEvent?(signal?: AbortSignal): Promise<PlanVerdict | undefined>;
-  /** Only human revision drivers call this after typed provider retry exhaustion.
+  /** Only human revision drivers call this after typed provider exhaustion or measured Codex silence.
    * Resolves to redrive, or throws controls / PlanRevisionReplacedError to exit this driver.
    * The runner must prove ownership before resolving; unknown ownership permits no provider start.
+   * remainingWallMs caps silent-recovery work before an owner-event wait; the wait itself is free.
    */
-  retryPlanRevisionTurn?(cause: unknown): Promise<void>;
-  /** Check the captured source before each human revision provider turn, including continuations. */
-  beforePlanRevisionTurn?(): Promise<void>;
+  retryPlanRevisionTurn?(cause: unknown, observer?: PlanRevisionOwnerWaitObserver, remainingWallMs?: () => number): Promise<PlanRevisionRetryOutcome>;
+  /** Check the captured source before human revision turns and fresh epoch credential/root admission. */
+  beforePlanRevisionTurn?(observer?: PlanRevisionOwnerWaitObserver, remainingWallMs?: () => number): Promise<PlanRevisionRetryOutcome>;
   /** An associated cross-check human gate continues its established wait after switch give-up. */
   continueExistingPlanGate?(otherwise: () => Promise<PlanVerdict>): Promise<PlanVerdict>;
   /**
@@ -831,7 +838,7 @@ export interface ExecutorResult {
    *  runner completes it with NO push/MR. Issue runs only. Absent ⇒ normal push+MR path. */
   reportOnly?: boolean;
   /** issue #279: the one-line/short findings summary from signal_done, persisted as
-   *  report_md on a report-only completion. Issue runs only. */
+   *  report_md on a report-only issue completion or a prompt completion. Issue and prompt runs only. */
   summary?: string;
   /** PRD #929 M2: a scheduled `prompt` run's structured proposal (title + body) from
    *  signal_done, forwarded verbatim on the prompt-run completion report so the server can

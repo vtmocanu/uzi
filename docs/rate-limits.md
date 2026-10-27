@@ -201,6 +201,60 @@ or switch accounts.
 linked Codex subscription login produces a meter; an API-key-only default
 shows nothing here, and Settings says so next to the credential itself.
 
+### Temporary account admission waits
+
+Linked Codex subscription accounts normally have unlimited account admission.
+A model-reported rate limit temporarily delays new claims on that account.
+Overload needs reports from **two distinct runs within five minutes**; three
+retries in one run are insufficient. Idle time, silence, generic transport
+errors or 5xx responses, usage-quota exhaustion, authentication failures and
+a usage-meter GET returning 429 do not trigger this wait.
+
+The wait is shared by your saved aliases of the same verified account,
+including after refresh or re-import. Another authorized account remains
+independent; uzi does not rotate accounts automatically.
+
+| Evidence | Initial wait | Exponential cap before jitter | Quiet reset |
+|---|---|---|---|
+| Model rate limit | 30 seconds | 15 minutes | 30 minutes |
+| Repeated overload | 15 seconds | 5 minutes | 15 minutes |
+
+Each opening adds persisted positive jitter of 0–20%. The classes keep
+independent schedules; the later expiry controls, with rate limit winning a
+tie. Qualifying evidence during a class's active wait does not extend its
+expiry or advance its step. Quiet-reset clocks follow qualifying unique
+observations; a repeated overload vote does not extend its five-minute life.
+Recovery adds a stable spread per run, up to the opening wait's duration or
+60 seconds, whichever is smaller. A new episode cannot bring eligibility
+forward; after the finite recovery window, account admission is unlimited again.
+
+Runs stay **queued**, and admitted runs continue with their existing retries
+and preservation rules. There is no standing account seat limit, per-request
+limiter, mid-turn pause or force-park. Claim and provisioning decisions use a
+database statement snapshot: an already in-flight statement may admit a run
+after new evidence commits.
+
+Your run detail, list, board and CLI show the current class and eligibility
+time, including recovery spread:
+
+- `waiting: provider reported a rate limit; account admission eligible after <time>`
+- `waiting: provider reported overload; account admission eligible after <time>`
+
+Eligibility is **not a promised start time**. The copy clears on a read after
+expiry; maintenance and account-unavailability reasons take precedence, with
+admission details available independently. Shared views and admin summaries
+for another owner omit these fields. There is no per-run Slack burst,
+account settings panel or Resume now override for this wait.
+
+Cancel still works. Resume, restart, schedules, another alias of the same
+account and provisioning pass through the new-claim gate; a live admitted
+approval continues under existing rules. Checker deadlines include queued
+time without an exemption or extension. Usage-window and account-unavailability
+parking policies, OpenAI API keys, Claude, chat, versioned jobs and the
+isolated lane are unchanged. Running-turn limiting remains a separate
+[follow-up (#3531)](https://github.com/vtmocanu/uzi/issues/3531).
+Operators: see [upgrade and reporting limits](installation.md#codex-account-admission-upgrades).
+
 ### Where to look
 
 | Surface | What you see |

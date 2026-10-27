@@ -80,7 +80,7 @@ for img in api web controller agent-base agent-jvm; do
   img_has_tag "$img"; r=$?
   case $r in
     0) pass "image ${REPO}/${img}:${VERSION} on GHCR" ;;
-    2) fail "image ${REPO}/${img}: could not query GHCR (gh/network error) — re-run verify" ;;
+    2) fail "image ${REPO}/${img}: could not query GHCR (registry/network error); re-run verify" ;;
     *) fail "image ${REPO}/${img}:${VERSION} NOT found on GHCR" ;;
   esac
 done
@@ -90,7 +90,7 @@ done
 img_has_tag "$REPO"; r=$?
 case $r in
   0) pass "chart ${REPO}/${REPO}:${VERSION} on GHCR" ;;
-  2) fail "chart ${REPO}/${REPO}: could not query GHCR (gh/network error) — re-run verify" ;;
+  2) fail "chart ${REPO}/${REPO}: could not query GHCR (registry/network error); re-run verify" ;;
   *) fail "chart ${REPO}/${REPO}:${VERSION} NOT found on GHCR" ;;
 esac
 
@@ -170,7 +170,7 @@ else
     img_has_tag "$img" "$PIN"; r=$?
     case $r in
       0) pass "worker pin ${REPO}/${img}:${PIN} on GHCR" ;;
-      2) fail "worker image ${REPO}/${img}: could not query GHCR (gh/network error) -- re-run verify" ;;
+      2) fail "worker image ${REPO}/${img}: could not query GHCR (registry/network error); re-run verify" ;;
       *) fail "chart pins workers.image.tag=${PIN} but ${REPO}/${img}:${PIN} NOT on GHCR (unpublished worker image -- new hosted workers would ImagePullBackOff)" ;;
     esac
   done

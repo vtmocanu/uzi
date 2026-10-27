@@ -204,6 +204,24 @@ type CliToken struct {
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
 }
 
+type CodexAccountAdmissionThrottle struct {
+	UserID                 uuid.UUID          `json:"user_id"`
+	ProviderAccountID      uuid.UUID          `json:"provider_account_id"`
+	RateStep               int32              `json:"rate_step"`
+	RateExpiry             pgtype.Timestamptz `json:"rate_expiry"`
+	RateLastQualifying     pgtype.Timestamptz `json:"rate_last_qualifying"`
+	OverloadStep           int32              `json:"overload_step"`
+	OverloadExpiry         pgtype.Timestamptz `json:"overload_expiry"`
+	OverloadLastQualifying pgtype.Timestamptz `json:"overload_last_qualifying"`
+	ObservationClock       pgtype.Timestamptz `json:"observation_clock"`
+	Receipts               []byte             `json:"receipts"`
+	OverloadVotes          []byte             `json:"overload_votes"`
+	EpisodeID              pgtype.UUID        `json:"episode_id"`
+	SpreadWidthMs          int32              `json:"spread_width_ms"`
+	EffectiveExpiry        pgtype.Timestamptz `json:"effective_expiry"`
+	RecoveryFloor          pgtype.Timestamptz `json:"recovery_floor"`
+}
+
 type CodexAccountRateLimit struct {
 	UserID                     uuid.UUID          `json:"user_id"`
 	ProviderAccountID          uuid.UUID          `json:"provider_account_id"`
@@ -255,6 +273,13 @@ type CodexProviderAccount struct {
 	RecoveryCause            pgtype.Text        `json:"recovery_cause"`
 }
 
+type CodexQueuedRunAdmission struct {
+	RunID                    uuid.UUID          `json:"run_id"`
+	UserID                   uuid.UUID          `json:"user_id"`
+	CodexAdmissionClass      string             `json:"codex_admission_class"`
+	CodexAdmissionEligibleAt pgtype.Timestamptz `json:"codex_admission_eligible_at"`
+}
+
 type CodexRefreshIntent struct {
 	OperationID       uuid.UUID          `json:"operation_id"`
 	UserID            uuid.UUID          `json:"user_id"`
@@ -263,6 +288,8 @@ type CodexRefreshIntent struct {
 	State             string             `json:"state"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	ProviderErrorAt   pgtype.Timestamptz `json:"provider_error_at"`
+	ReuseAttemptedAt  pgtype.Timestamptz `json:"reuse_attempted_at"`
 }
 
 type ControllerReportStatus struct {
@@ -312,6 +339,7 @@ type CrossCheck struct {
 	Dispositions            []byte             `json:"dispositions"`
 	FinalizedAt             pgtype.Timestamptz `json:"finalized_at"`
 	RepoInstructionsCommit  pgtype.Text        `json:"repo_instructions_commit"`
+	Coverage                []byte             `json:"coverage"`
 }
 
 type CustodyEpisodeNotice struct {
@@ -896,6 +924,7 @@ type Repo struct {
 	FoldImproveUziBacklog             bool               `json:"fold_improve_uzi_backlog"`
 	CodeCrossCheckGuidance            pgtype.Text        `json:"code_cross_check_guidance"`
 	CrossCheckRepoInstructionsEnabled bool               `json:"cross_check_repo_instructions_enabled"`
+	IgnoredInferredCapabilities       []string           `json:"ignored_inferred_capabilities"`
 }
 
 type RepoToolProfile struct {
@@ -1110,6 +1139,8 @@ type Run struct {
 	ReserveExemptGrantedAt      pgtype.Timestamptz `json:"reserve_exempt_granted_at"`
 	ReserveExemptCredentialID   pgtype.UUID        `json:"reserve_exempt_credential_id"`
 	ReserveExemptWindowReset    pgtype.Timestamptz `json:"reserve_exempt_window_reset"`
+	RetainedParkCount           int32              `json:"retained_park_count"`
+	IgnoredInferredCapabilities []string           `json:"ignored_inferred_capabilities"`
 }
 
 type RunCompletionAttempt struct {

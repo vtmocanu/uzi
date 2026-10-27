@@ -218,6 +218,8 @@ type RunDTO struct {
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
 	// issue/ci_fix runs.
 	RepoID *string `json:"repo_id"`
+	// RepoPath is display context on the detail read, empty when the repo is unavailable.
+	RepoPath string `json:"repo_path"`
 	// ForgeType is the run's forge ("gitlab"|"forgejo"|"github"), so the web picks the
 	// per-run MR/PR noun and reference sigil (PRD #65 D2). "" on the worker/create
 	// DTO paths, which never render the MR affordance in a browser; set on the
@@ -563,11 +565,10 @@ type RunDTO struct {
 	// chat/judge/interactive run, or no started_at). The near-timeout badge counts down
 	// to it; the reason string stays static, so nothing stored ever ages (D4).
 	DeadlineAt *time.Time `json:"deadline_at"`
-	// QueueReason (PRD #3454) is "maintenance" while instance maintenance mode holds this
-	// queued run back (queued, intake paused, run not admitted), or "weekly_reserve" (PRD #3522)
-	// while the owner's weekly usage reserve holds it (maintenance wins when both apply); absent
-	// otherwise. Derived in SQL at read time (store ListRunQueueReasons) so it never lags the
-	// pause; runToDTO leaves it nil.
+	// QueueReason is maintenance, weekly_reserve (PRD #3522), codex_rate_limit, or
+	// codex_overload while a queued run is held; absent otherwise. Precedence is in that
+	// order. The handler overlays this at read time from ListRunAdmissionQueueReasons on
+	// owner-authorized reads.
 	QueueReason *string `json:"queue_reason,omitempty"`
 	// ReserveHoldReason (PRD #3522) is the visible weekly-usage-reserve reason ("weekly usage
 	// reserve: 72% >= 70%" or "weekly usage reserve: weekly usage unknown") while this QUEUED run is
@@ -579,7 +580,10 @@ type RunDTO struct {
 	// the resume when no reset time was known). Absent when no exemption is in force; it clears early
 	// when the reset is observed sooner.
 	ReserveExemptUntil *time.Time `json:"reserve_exempt_until,omitempty"`
-	PlanMd             *string    `json:"plan_md"`
+	// Read-time account admission details; absent when unrestricted.
+	CodexAdmissionClass      *string    `json:"codex_admission_class,omitempty"`
+	CodexAdmissionEligibleAt *time.Time `json:"codex_admission_eligible_at,omitempty"`
+	PlanMd                   *string    `json:"plan_md"`
 	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
 	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
 	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB
@@ -981,8 +985,10 @@ type RunDTO struct {
 	// are non-nil ([] over null) via capsOrEmpty; SizeClass is "" for a run whose plan-time
 	// inference never set it (the column is NOT NULL DEFAULT '').
 	RequiredCapabilities []string `json:"required_capabilities"`
-	RequiredTools        []string `json:"required_tools"`
-	SizeClass            string   `json:"size_class"`
+	// Frozen repo inference policy; declared requirements still win on overlap.
+	IgnoredInferredCapabilities []string `json:"ignored_inferred_capabilities"`
+	RequiredTools               []string `json:"required_tools"`
+	SizeClass                   string   `json:"size_class"`
 	// PlanChangedFiles is the git-status list surfaced at the approval gate (PRD #212).
 	// [] (never omitempty) like required_tools: a pre-#212 run's NULL column and a clean
 	// plan turn both map to []; renderers show the section only when non-empty.
@@ -1423,11 +1429,10 @@ type RunSummaryItemDTO struct {
 	// chat/judge/interactive run, or no started_at). The near-timeout badge counts down
 	// to it; the reason string stays static, so nothing stored ever ages (D4).
 	DeadlineAt *time.Time `json:"deadline_at"`
-	// QueueReason (PRD #3454) is "maintenance" while instance maintenance mode holds this
-	// queued run back (queued, intake paused, run not admitted), or "weekly_reserve" (PRD #3522)
-	// while the owner's weekly usage reserve holds it (maintenance wins when both apply); absent
-	// otherwise. Derived in SQL at read time (store ListRunQueueReasons) so it never lags the
-	// pause; runToDTO leaves it nil.
+	// QueueReason is maintenance, weekly_reserve (PRD #3522), codex_rate_limit, or
+	// codex_overload while a queued run is held; absent otherwise. Precedence is in that
+	// order. The handler overlays this at read time from ListRunAdmissionQueueReasons on
+	// owner-authorized reads.
 	QueueReason *string `json:"queue_reason,omitempty"`
 	// ReserveHoldReason (PRD #3522) is the visible weekly-usage-reserve reason ("weekly usage
 	// reserve: 72% >= 70%" or "weekly usage reserve: weekly usage unknown") while this QUEUED run is
@@ -1439,6 +1444,9 @@ type RunSummaryItemDTO struct {
 	// the resume when no reset time was known). Absent when no exemption is in force; it clears early
 	// when the reset is observed sooner.
 	ReserveExemptUntil *time.Time `json:"reserve_exempt_until,omitempty"`
+	// Read-time account admission details; absent when unrestricted.
+	CodexAdmissionClass      *string    `json:"codex_admission_class,omitempty"`
+	CodexAdmissionEligibleAt *time.Time `json:"codex_admission_eligible_at,omitempty"`
 	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
 	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
 	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB
@@ -1820,9 +1828,10 @@ type RunSummaryItemDTO struct {
 	// authoritative enforcement is the 409 the approval gate returns. Capability/tool slices
 	// are non-nil ([] over null) via capsOrEmpty; SizeClass is "" for a run whose plan-time
 	// inference never set it (the column is NOT NULL DEFAULT '').
-	RequiredCapabilities []string `json:"required_capabilities"`
-	RequiredTools        []string `json:"required_tools"`
-	SizeClass            string   `json:"size_class"`
+	RequiredCapabilities        []string `json:"required_capabilities"`
+	IgnoredInferredCapabilities []string `json:"ignored_inferred_capabilities"`
+	RequiredTools               []string `json:"required_tools"`
+	SizeClass                   string   `json:"size_class"`
 	// PlanChangedFiles is the git-status list surfaced at the approval gate (PRD #212).
 	// [] (never omitempty) like required_tools: a pre-#212 run's NULL column and a clean
 	// plan turn both map to []; renderers show the section only when non-empty.
@@ -1961,6 +1970,8 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		QueueReason:                 item.QueueReason,
 		ReserveHoldReason:           item.ReserveHoldReason,
 		ReserveExemptUntil:          item.ReserveExemptUntil,
+		CodexAdmissionClass:         item.CodexAdmissionClass,
+		CodexAdmissionEligibleAt:    item.CodexAdmissionEligibleAt,
 		PlanSource:                  item.PlanSource,
 		GateRevision:                item.GateRevision,
 		SummaryIntent:               item.SummaryIntent,
@@ -2026,6 +2037,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		OverrideSubagentModel:       item.OverrideSubagentModel,
 		Priority:                    item.Priority,
 		RequiredCapabilities:        item.RequiredCapabilities,
+		IgnoredInferredCapabilities: item.IgnoredInferredCapabilities,
 		RequiredTools:               item.RequiredTools,
 		SizeClass:                   item.SizeClass,
 		PlanChangedFiles:            item.PlanChangedFiles,
@@ -2130,6 +2142,8 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			QueueReason:                 s.QueueReason,
 			ReserveHoldReason:           s.ReserveHoldReason,
 			ReserveExemptUntil:          s.ReserveExemptUntil,
+			CodexAdmissionClass:         s.CodexAdmissionClass,
+			CodexAdmissionEligibleAt:    s.CodexAdmissionEligibleAt,
 			PlanSource:                  s.PlanSource,
 			GateRevision:                s.GateRevision,
 			SummaryIntent:               s.SummaryIntent,
@@ -2195,6 +2209,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			OverrideSubagentModel:       s.OverrideSubagentModel,
 			Priority:                    s.Priority,
 			RequiredCapabilities:        s.RequiredCapabilities,
+			IgnoredInferredCapabilities: s.IgnoredInferredCapabilities,
 			RequiredTools:               s.RequiredTools,
 			SizeClass:                   s.SizeClass,
 			PlanChangedFiles:            s.PlanChangedFiles,
@@ -2220,6 +2235,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 // admin view, the owning user's email.
 type RunListItemDTO struct {
 	RunDTO
+	// RepoPath shadows the detail field: list queries already join this display context.
 	RepoPath string `json:"repo_path"`
 	// WorkerName SHADOWS the embedded RunDTO.WorkerName (PRD #1497 M1 added that): the list query
 	// populates this depth-0 field, which json marshals in preference to the (null-in-the-list-path)

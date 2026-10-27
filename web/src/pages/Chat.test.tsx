@@ -2,6 +2,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { useRunStream } from "../lib/useRunStream";
+import { mockRuns } from "../mocks/data/runs";
 import { ChatConversation, ChatList } from "./Chat";
 import { api, type Chat, type Worker } from "../lib/api";
 
@@ -220,4 +222,27 @@ describe("ChatConversation — optimistic seed after create/continue", () => {
     await waitFor(() => expect(mockApi.listChats).toHaveBeenCalled());
     expect(screen.getByText("My brand new chat")).toBeTruthy();
   });
+});
+
+
+it.each([
+  ["2099-01-01T00:00:00Z", "retained recovery retrying"],
+  ["2020-01-01T00:00:00Z", "retained recovery retrying"],
+  [null, "retained recovery needs decision"],
+] as const)("chat detail forwards full run recovery timing %s", async (stamp, label) => {
+  mockApi.listChats.mockResolvedValue(chatList([]));
+  vi.mocked(useRunStream).mockReturnValue({
+    run: { ...mockRuns[0], id: "c1", status: "recovery_wait", recovery_wait_cause: "retained_recovery_exhausted", recovery_retry_not_before: stamp },
+    messages: [], connected: true, error: "", refreshRun: vi.fn(),
+  } as unknown as ReturnType<typeof useRunStream>);
+  render(<MemoryRouter initialEntries={["/chat/c1"]}><Routes>
+    <Route path="/chat/:id" element={<ChatConversation />} />
+  </Routes></MemoryRouter>);
+  expect(screen.getByText(label)).toBeTruthy();
+  await waitFor(() => expect(mockApi.listChats).toHaveBeenCalled());
+});
+it("chat list keeps omitted recovery metadata generic", async () => {
+  mockApi.listChats.mockResolvedValue(chatList([aChat({ status: "recovery_wait" })]));
+  render(<MemoryRouter><ChatList /></MemoryRouter>);
+  expect(await screen.findByText("recovery wait")).toBeTruthy();
 });

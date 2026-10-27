@@ -34,7 +34,8 @@ type RepoDTO struct {
 	// require. Copied onto each new issue run at enqueue and matched at claim time.
 	// Server-owned vocabulary — an unknown name is Filter-ed out before it is stored.
 	// Empty (the default) means no requirement, so runs claim anywhere.
-	RequiredCapabilities []string `json:"required_capabilities"`
+	RequiredCapabilities        []string `json:"required_capabilities"`
+	IgnoredInferredCapabilities []string `json:"ignored_inferred_capabilities"`
 	// Pipeline is the repo's default-branch CI status (PRD #6), null when there is
 	// no cached default-branch pipeline (no CI configured, MR-only pipelines, or not
 	// yet synced). Set by the list handlers, which enrich from the pipeline cache.

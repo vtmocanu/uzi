@@ -64,6 +64,7 @@ func TestRunSummaryItemRoundTrip(t *testing.T) {
 	want.IssueDescription = ""
 	want.PreservedPatch = nil
 	want.RunDTO.WorkerName = nil
+	want.RunDTO.RepoPath = "" // detail-only; the list carries its own shadowing RepoPath
 
 	got := RunSummaryOf(full).ListItem()
 	if !reflect.DeepEqual(got, want) {
