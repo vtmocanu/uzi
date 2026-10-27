@@ -13,7 +13,7 @@ import (
 
 func TestIdleStallMigrationLifecycleLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "idle_stall_migration_")
-	if err := store.MigrateTo(ctx, dsn, 363); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 369); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -30,7 +30,7 @@ func TestIdleStallMigrationLifecycleLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, "INSERT INTO workers(id,user_id,name,token_hash,status) VALUES($1,$2,'idle migration',$3,'online')", w, user, w[:])
 	old := uuid.New()
 	mustExec(ctx, t, pool, "INSERT INTO runs(id,user_id,repo_id,worker_id,issue_iid,issue_title,issue_description,status,recovery_wait_cause) VALUES($1,$2,$3,$4,1,'idle migration','fixture','recovery_wait','provider_outage')", old, user, repo, w)
-	if err = store.MigrateTo(ctx, dsn, 364); err != nil {
+	if err = store.MigrateTo(ctx, dsn, 370); err != nil {
 		t.Fatal(err)
 	}
 	var valid bool
@@ -46,7 +46,7 @@ func TestIdleStallMigrationLifecycleLiveDB(t *testing.T) {
 	if _, err = pool.Exec(ctx, "UPDATE runs SET idle_stall_park_count=-1 WHERE id=$1", old); err == nil {
 		t.Fatal("negative accepted")
 	}
-	if err = store.MigrateTo(ctx, dsn, 365); err != nil {
+	if err = store.MigrateTo(ctx, dsn, 371); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"runs_idle_stall_park_count_nonnegative", "runs_recovery_wait_cause_check"} {
@@ -90,7 +90,7 @@ func TestIdleStallMigrationLifecycleLiveDB(t *testing.T) {
 	if err = pool.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&downStart); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.MigrateDownTo(ctx, dsn, 363); err != nil {
+	if err = store.MigrateDownTo(ctx, dsn, 369); err != nil {
 		t.Fatal(err)
 	}
 	if err = pool.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&downEnd); err != nil {
@@ -159,7 +159,7 @@ func TestIdleStallMigrationLifecycleLiveDB(t *testing.T) {
 	if _, err = pool.Exec(ctx, "UPDATE runs SET recovery_wait_cause='codex_idle_stall' WHERE id=$1", old); err == nil {
 		t.Fatal("Down failed to restore old cause check")
 	}
-	if err = store.MigrateTo(ctx, dsn, 365); err != nil {
+	if err = store.MigrateTo(ctx, dsn, 371); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range append(ids, old) {
