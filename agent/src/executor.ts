@@ -125,6 +125,9 @@ export type PlanRevisionRetryOutcome = "wall" | void;
  * compatible. The runner populates them from the claim.
  */
 export interface RunContext {
+  /** undefined: unknown; null: verified absence; object: verified current presentation.
+   * Read at each accepted revision; later claim/ACK wiring may supply a getter. */
+  readonly policyRevisionGate?: import("./protocol.js").PolicyStopGateContext | null;
   semanticPlanning?: import("./semantic-plan.js").SemanticPlanning;
   /** Called after harness-specific home preparation, before any model invocation. */
   prepareCIEvidence?: () => Promise<import("./ci-evidence.js").PreparedCIEvidence>;

@@ -62,6 +62,7 @@ import { PolicyResumeRejected, ProviderPolicyRefusal } from "../provider-policy-
 import { CI_EVIDENCE_READ, readCIEvidence, ciEvidencePrompt } from "../ci-evidence-tools.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "../checked-plan.js";
+import { buildPolicyRevision, safeRevisionInputId } from "../policy-revision.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
 import { ATTEMPT_ID_RE, cloneKeyOf } from "../attempt-path.js";
@@ -4045,7 +4046,7 @@ export class CodexExecutor implements Executor {
           const feedback = verdict.feedback;
           // Issue #1604: the re-gate below settles a human revise once the revised plan is persisted.
           // An automatic round has no input row to settle.
-          const settles = automatic ? undefined : verdict.inputId;
+          const settles = automatic ? undefined : safeRevisionInputId(verdict.inputId);
           ctx.emit({ kind: "plan_feedback", agent: "worker",
             payload: automatic ? { feedback, automatic: true, cross_check_round: automaticRound } : { feedback } });
           if (!automatic) {
@@ -4057,8 +4058,10 @@ export class CodexExecutor implements Executor {
           // Accepted revise: the plan being summarised is superseded; the revised plan's summary
           // starts from the next gatePlan's onPlanPersisted.
           supersedePlanSummary();
+          const policyRevision = buildPolicyRevision(ctx.policyRevisionGate, verdict);
           ctx.emit({ kind: "plan_revising", agent: "worker",
-            payload: automatic ? { automatic: true, cross_check_round: automaticRound } : { round: revisions } });
+            payload: { ...(automatic ? { automatic: true, cross_check_round: automaticRound } : { round: revisions }),
+              ...(policyRevision === undefined ? {} : { policy_revision: policyRevision }) } });
           // The revise turn resumes the plan thread, which holds the plan being revised.
           let reviseTurn: Awaited<ReturnType<typeof drivePlan>>;
           try {

@@ -13370,6 +13370,7 @@ export class RunRunner {
                   crossCheckRound = decision.response.round + 1;
                   crossCheckSelected = false;
                   return { kind: "revise", automatic: true, round: decision.response.round,
+                    ...(decision.response.cross_check_id !== undefined ? { crossCheckId: decision.response.cross_check_id } : {}),
                     feedback: decision.response.findings?.summary ?? "Plan cross-check requested changes.",
                     ...(decision.response.findings ? { items: decision.response.findings.items } : {}) };
                 } else {

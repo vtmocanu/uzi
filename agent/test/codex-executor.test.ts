@@ -26682,3 +26682,153 @@ describe("issue3472 M1 Codex repository instruction snapshot", () => {
     });
   });
 });
+
+describe("M2 bounded policy revision producer", () => {
+  const rowId = "12345678-1234-5678-9abc-123456789abc";
+  const presentationId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const exactGate = { revision: "7", presentation_id: presentationId, payload_digest: "a".repeat(64) };
+  // These tests use ordinary fixture properties so raw emission oracles can overlay preunit code.
+  function revisionRig() {
+    return makeRig({ responder: c => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        const n = c.turnStartCount;
+        if (n === 1) c.transport.push(threadStarted());
+        c.transport.push(toolCall(n, "submit_plan", { plan_md: `plan-${n}` }, "th-1", "tn-1", `plan-${n}`))
+          .push(turnCompleted("completed"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+  }
+
+  for (const origin of ["live", "replayed"] as const) {
+    it(`M2 producer ${origin} revisions preserve taken IDs for identical feedback`, async () => {
+      const rig = revisionRig();
+      const settled: (number | undefined)[] = [];
+      let gates = 0;
+      let replayed = 0;
+      const { ctx, emitted } = makeCtx({
+        planApproved: false, approvedPlan: origin === "replayed" ? "retained plan" : undefined,
+        config: { plan_max_revisions: 2 },
+        ...(origin === "replayed" ? {
+          policyHoldResume: true, sessionId: "th-1", resumePhase: "awaiting_approval" as const,
+          takeResumedGateEvent: async () => {
+            replayed++;
+            return { kind: "revise" as const, feedback: "same feedback", inputId: 13 };
+          },
+        } : {}),
+        gatePlan: async (_plan, _milestones, _summary, settles) => {
+          gates++;
+          settled.push(settles);
+          if (origin === "live" && gates === 1) return { kind: "revise", feedback: "same feedback", inputId: 13 };
+          if (gates === (origin === "live" ? 2 : 1)) return { kind: "revise", feedback: "same feedback", inputId: 14 };
+          return { kind: "reject", reason: "producer test complete" };
+        },
+      });
+      Object.assign(ctx, { policyRevisionGate: exactGate });
+      await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), PlanRejectedError);
+      assert.equal(replayed, origin === "replayed" ? 1 : 0);
+      assert.deepEqual(emitted.filter(m => m.kind === "plan_revising").map(m => m.payload), [
+        { round: 1, policy_revision: { gate: exactGate, revision: { source: "run_user_input", input_id: "13" } } },
+        { round: 2, policy_revision: { gate: exactGate, revision: { source: "run_user_input", input_id: "14" } } },
+      ]);
+      assert.deepEqual(settled, origin === "live" ? [undefined, 13, 14] : [13, 14]);
+      assert.equal(rig.transport.turnStartCount, origin === "live" ? 3 : 2);
+    });
+  }
+
+  it("M2 producer replacement rereads the current gate and settles only the completed taken identity", async () => {
+    const rig = revisionRig();
+    const settled: (number | undefined)[] = [];
+    let gates = 0, before = 0, reads = 0;
+    let currentGate = { ...exactGate };
+    const { ctx, emitted } = makeCtx({
+      planApproved: false, approvedPlan: undefined, config: { plan_max_revisions: 1 },
+      gatePlan: async (_plan, _milestones, _summary, settles) => {
+        settled.push(settles);
+        return ++gates === 1 ? { kind: "revise", feedback: "same feedback", inputId: 13 }
+          : { kind: "reject", reason: "producer test complete" };
+      },
+      beforePlanRevisionTurn: async () => {
+        if (++before === 1) {
+          assert.deepEqual(settled, [undefined], "emission is not a persistence receipt");
+          currentGate.revision = "8";
+          currentGate = { ...exactGate, revision: "9", presentation_id: rowId };
+          throw new PlanRevisionReplacedError({ kind: "revise", feedback: "same feedback", inputId: 22 });
+        }
+      },
+    });
+    Object.defineProperty(ctx, "policyRevisionGate", { get: () => { reads++; return currentGate; } });
+    await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), PlanRejectedError);
+    assert.equal(reads, 2);
+    assert.equal(before, 2);
+    assert.deepEqual(emitted.filter(m => m.kind === "plan_revising").map(m => m.payload), [
+      { round: 1, policy_revision: { gate: exactGate, revision: { source: "run_user_input", input_id: "13" } } },
+      { round: 2, policy_revision: { gate: { ...exactGate, revision: "9", presentation_id: rowId },
+        revision: { source: "run_user_input", input_id: "22" } } },
+    ]);
+    assert.deepEqual(settled, [undefined, 22]);
+    assert.equal(rig.transport.turnStartCount, 2, "replacement did not submit the abandoned revision");
+  });
+
+  for (const identity of ["exact", "legacy"] as const) {
+    it(`M2 producer automatic ${identity} identity uses the cross-check row only`, async () => {
+      const rig = revisionRig();
+      const settled: (number | undefined)[] = [];
+      let gates = 0, humanAdmissions = 0;
+      const automatic = Object.assign({ kind: "revise" as const, automatic: true as const,
+        feedback: "same feedback", round: 4 }, {
+        ...(identity === "exact" ? { crossCheckId: rowId } : {}),
+        checker_run_id: presentationId,
+      });
+      const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined,
+        beforePlanRevisionTurn: async () => { humanAdmissions++; },
+        gatePlan: async (_plan, _milestones, _summary, settles) => {
+          settled.push(settles);
+          return ++gates === 1 ? automatic : { kind: "reject", reason: "producer test complete" };
+        },
+      });
+      Object.assign(ctx, { policyRevisionGate: null });
+      await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), PlanRejectedError);
+      assert.deepEqual(emitted.filter(m => m.kind === "plan_revising").map(m => m.payload), [
+        { automatic: true, cross_check_round: 4, ...(identity === "exact" ? {
+          policy_revision: { gate: null, revision: { source: "plan_cross_check", cross_check_id: rowId } },
+        } : {}) },
+      ]);
+      assert.deepEqual(settled, [undefined, undefined]);
+      assert.equal(humanAdmissions, 0);
+      assert.equal(rig.transport.turnStartCount, 2);
+    });
+  }
+
+  for (const coverage of ["unknown", "malformed", "absent-id", "fractional-id", "zero-id", "negative-id", "unsafe-id", "safe-max"] as const) {
+    it(`M2 producer ${coverage} preserves revision behavior and safe receipt identity`, async () => {
+      const rig = revisionRig();
+      const settled: (number | undefined)[] = [];
+      let gates = 0;
+      const inputId = coverage === "absent-id" ? undefined : coverage === "fractional-id" ? 1.5
+        : coverage === "zero-id" ? 0 : coverage === "negative-id" ? -1
+          : coverage === "unsafe-id" ? Number.MAX_SAFE_INTEGER + 1 : coverage === "safe-max" ? Number.MAX_SAFE_INTEGER : 13;
+      const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined,
+        gatePlan: async (_plan, _milestones, _summary, settles) => {
+          settled.push(settles);
+          return ++gates === 1 ? { kind: "revise", feedback: "same feedback", inputId }
+            : { kind: "reject", reason: "producer test complete" };
+        },
+      });
+      if (coverage !== "unknown") Object.assign(ctx, {
+        policyRevisionGate: coverage === "malformed" ? { ...exactGate, extra: true } : null,
+      });
+      await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), PlanRejectedError);
+      assert.deepEqual(emitted.filter(m => m.kind === "plan_revising").map(m => m.payload), [
+        { round: 1, ...(coverage === "safe-max" ? {
+          policy_revision: { gate: null, revision: { source: "run_user_input", input_id: "9007199254740991" } },
+        } : {}) },
+      ]);
+      assert.deepEqual(settled, [undefined, coverage === "unknown" || coverage === "malformed" ? 13
+        : coverage === "safe-max" ? Number.MAX_SAFE_INTEGER : undefined]);
+      assert.equal(rig.transport.turnStartCount, 2);
+    });
+  }
+});

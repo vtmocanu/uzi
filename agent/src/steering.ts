@@ -77,9 +77,9 @@ export type PlanVerdict =
     }
   | { kind: "reject"; reason: string; sourceGateRevision?: number }
   | { kind: "cancel" }
-  | { kind: "revise"; automatic?: false; feedback: string; inputId?: number; sourceGateRevision?: number }
+  | { kind: "revise"; automatic?: false; feedback: string; inputId?: number; sourceGateRevision?: number; crossCheckId?: never }
   | { kind: "revise"; automatic: true; feedback: string; round: number;
-      items?: PlanCrossCheckFindings["items"]; inputId?: never };
+      items?: PlanCrossCheckFindings["items"]; inputId?: never; crossCheckId?: string };
 
 /** The resolution of an ask_user park (PRD #88 M1). `cancel` is the same abort the
  *  plan gate sees; it is question-identity-exempt and always wins. */

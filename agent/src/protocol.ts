@@ -29,6 +29,22 @@ export interface PolicyHoldRequest {
   expected_gate_revision?: number;
 }
 
+/** Closed policy revision wire values; they carry provenance, not execution authority. */
+export type PolicyRevisionRef =
+  | { source: "run_user_input"; input_id: string; cross_check_id?: never }
+  | { source: "plan_cross_check"; cross_check_id: string; input_id?: never };
+
+export interface PolicyStopGateContext {
+  revision: string;
+  presentation_id: string;
+  payload_digest: string;
+}
+
+export interface PolicyRevisionCarrier {
+  gate: PolicyStopGateContext | null;
+  revision: PolicyRevisionRef;
+}
+
 export type ImmutablePolicyOutcome = Readonly<Omit<PolicyHoldRequest, "claim_generation">>;
 
 export interface PolicyHoldAck {
