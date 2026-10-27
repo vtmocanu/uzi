@@ -887,11 +887,11 @@ class Nightly(unittest.TestCase):
         self.assertEqual(fixture.now, 30)
 
     def test_window_uses_bucharest_date_and_dst_offsets(self):
-        cases = [('2026-01-15T02:47:00Z', '2026-01-15T04:00:00Z', '2026-01-15T05:00:00Z'),
-                 ('2026-07-15T01:47:00Z', '2026-07-15T03:00:00Z', '2026-07-15T04:00:00Z'),
-                 ('2026-03-29T01:47:00Z', '2026-03-29T03:00:00Z', '2026-03-29T04:00:00Z'),
-                 ('2026-10-25T02:47:00Z', '2026-10-25T04:00:00Z', '2026-10-25T05:00:00Z'),
-                 ('2026-10-26T22:30:00Z', '2026-10-27T04:00:00Z', '2026-10-27T05:00:00Z')]
+        cases = [('2026-01-15T02:47:00Z', '2026-01-15T06:00:00Z', '2026-01-15T07:00:00Z'),
+                 ('2026-07-15T01:47:00Z', '2026-07-15T05:00:00Z', '2026-07-15T06:00:00Z'),
+                 ('2026-03-29T01:47:00Z', '2026-03-29T05:00:00Z', '2026-03-29T06:00:00Z'),
+                 ('2026-10-25T02:47:00Z', '2026-10-25T06:00:00Z', '2026-10-25T07:00:00Z'),
+                 ('2026-10-26T22:30:00Z', '2026-10-27T06:00:00Z', '2026-10-27T07:00:00Z')]
         for created, cutoff, target in cases:
             with self.subTest(created=created):
                 self.assertEqual(auto.nightly_window(created), (self.epoch(cutoff), self.epoch(target)))
@@ -900,8 +900,19 @@ class Nightly(unittest.TestCase):
             with self.subTest(created=created), self.assertRaises(auto.Stop):
                 auto.nightly_window(created)
 
+    def test_schedule_uses_full_window_while_manual_keeps_two_hours(self):
+        for scheduled, expected in ((True, 10980), (False, 7200)):
+            with self.subTest(scheduled=scheduled):
+                release, fixture, api = self.release(now=self.created)
+                release.config['scheduled'] = scheduled
+                api.run.return_value = run('queued', None)
+                reason = 'tip-not-green-by-cutoff' if scheduled else 'tip-not-green-by-deadline'
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(auto.Stop, reason):
+                    release.tip(interval=60)
+                self.assertEqual(fixture.now, expected)
+
     def test_tip_deadline_reserves_cut_time_and_does_not_reset_on_main_move(self):
-        release, fixture, api = self.release(heads=[H, NEW], now='2026-10-27T03:49:50Z')
+        release, fixture, api = self.release(heads=[H, NEW], now='2026-10-27T05:49:50Z')
         api.run.return_value = run('queued', None)
         with self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-cutoff'):
             release.tip(seconds=7200, interval=5)
@@ -909,7 +920,7 @@ class Nightly(unittest.TestCase):
         self.assertGreaterEqual(fixture.index, 1)
 
     def test_green_response_after_cut_start_deadline_does_not_cut(self):
-        release, fixture, api = self.release(now='2026-10-27T03:49:50Z')
+        release, fixture, api = self.release(now='2026-10-27T05:49:50Z')
         def slow_run(*args):
             fixture.now += 20
             return run()
@@ -918,7 +929,7 @@ class Nightly(unittest.TestCase):
             release.tip()
 
     def test_final_plan_cannot_extend_the_cut_start_deadline(self):
-        release, fixture, _ = self.release(now='2026-10-27T03:49:50Z')
+        release, fixture, _ = self.release(now='2026-10-27T05:49:50Z')
         original, reads = release.run, 0
         def slow_plan(*args, **kwargs):
             nonlocal reads
@@ -941,14 +952,14 @@ class Nightly(unittest.TestCase):
         self.assertEqual(sum(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls), 1)
 
     def test_cut_is_refused_if_window_expires_after_tip_returns(self):
-        release, fixture, _ = self.release(now='2026-10-27T04:01:00Z')
+        release, fixture, _ = self.release(now='2026-10-27T06:01:00Z')
         release.tip = lambda: (H, plan())
         with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(auto.Stop, 'missed-target'):
             release.prepare(Path(directory))
         self.assertEqual(fixture.calls, [])
 
     def test_expired_or_next_day_preparation_does_not_acquire_a_new_window(self):
-        for now in ('2026-10-27T03:50:01Z', '2026-10-27T04:00:00Z', '2026-10-28T02:00:00Z'):
+        for now in ('2026-10-27T05:50:01Z', '2026-10-27T06:00:00Z', '2026-10-28T02:00:00Z'):
             release, fixture, api = self.release(now=now)
             with self.subTest(now=now), tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(auto.Stop, 'missed-target'):
                 release.prepare(Path(directory))
