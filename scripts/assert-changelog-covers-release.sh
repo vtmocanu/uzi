@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Assert the CHANGELOG section being released actually accounts for every merge
 # since the previous tag.
+# Optional --result-file FILE writes bounded public diagnostic identities as JSON.
 #
 # WHY THIS EXISTS. Twice the CHANGELOG has shipped a release that did not describe
 # what the release contained:
@@ -41,10 +42,45 @@
 # and a gate with no way to say "genuinely nothing to announce" gets satisfied with
 # a junk entry, which is worse than silence.
 set -euo pipefail
+# Exit codes: 0 covered, 1 coverage refused, 2 unreadable first-parent history.
+# Other Git instrument errors also remain nonzero.
 
-REF="${1:-HEAD}"
-PREV="${2:-}"
-VERSION="${3:-}"
+# Optional structured result is separate from the human-readable stdout contract.
+RESULT_FILE=""; POSITIONAL=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --result-file)
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" = -* ]] || [ -n "$RESULT_FILE" ]; then
+        echo 'usage: assert-changelog-covers-release.sh [ref [prev [version]]] [--result-file FILE]' >&2; exit 2
+      fi
+      RESULT_FILE=$2; shift 2 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+REF="${POSITIONAL[0]:-HEAD}"
+PREV="${POSITIONAL[1]:-}"
+VERSION="${POSITIONAL[2]:-}"
+RESULT_REASON=changelog-coverage-error
+RESULT_MISSING=""; WORK=""
+ORACLE_SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+DIAGNOSTICS="$ORACLE_SCRIPT_DIR/lib/release-diagnostics.py"
+oracle_exit() {
+  local status=$? args
+  if [ -n "$RESULT_FILE" ]; then
+    args=(--kind oracle --stage changelog-coverage --reason "$RESULT_REASON" --status "$status")
+    [ -z "$VERSION" ] || args+=(--tag "v${VERSION#v}")
+    if [ "$status" -eq 0 ] || [ "$RESULT_REASON" = changelog-coverage-refused ]; then
+      [ -z "$RESULT_MISSING" ] || args+=(--missing "$RESULT_MISSING")
+    fi
+    if ! python3 -I "$DIAGNOSTICS" "${args[@]}" -- "$RESULT_FILE"; then
+      if [ "$status" -eq 0 ]; then status=1; fi
+    fi
+  fi
+  if [ -n "$WORK" ]; then rm -rf "$WORK"; fi
+  trap - EXIT
+  exit "$status"
+}
+trap oracle_exit EXIT
 
 # THE COVERAGE WINDOW IS "SINCE THE HIGHEST LOWER STABLE TAG BY VERSION" (PRD 1265 D4),
 # not `git describe` ancestry. Two reasons the old ancestry lookup is wrong under the
@@ -151,7 +187,6 @@ echo "Checking CHANGELOG coverage for $PREV..$REF (version $VERSION)"
 # just bitten by one).
 # =============================================================================
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
 CHANGELOG_FILE="$WORK/changelog.md"
 SECTION_FILE="$WORK/section.md"
 SUBJECT_FILE="$WORK/subject.txt"
@@ -179,6 +214,7 @@ awk -v v="$BASE" '
 # on a command substitution, which strips trailing newlines, so a section of
 # nothing but blank lines counted as empty. `-s` would quietly start passing it.
 if [ -z "$(cat "$SECTION_FILE")" ]; then
+  RESULT_REASON=changelog-coverage-refused
   echo "FAIL: CHANGELOG.md at $REF has no '## [$BASE]' section, or it is empty."
   echo "      A release must describe itself before it is tagged."
   exit 1
@@ -188,9 +224,22 @@ fi
 # definition (scripts/lib/shipping-paths.sh). Resolve the lib next to this script, CDPATH
 # cleared so `cd` cannot echo an unexpected dir.
 # shellcheck source=scripts/lib/shipping-paths.sh
-. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/lib/shipping-paths.sh"
+. "$ORACLE_SCRIPT_DIR/lib/shipping-paths.sh"
 
+HISTORY_FILE="$WORK/history"
+if ! git log --first-parent --format=%H "$PREV..$REF" > "$HISTORY_FILE"; then
+  echo 'assert-changelog-covers-release: changelog-coverage-error: could not read first-parent history' >&2
+  exit 2
+fi
 missing=0
+if [ -n "$RESULT_FILE" ]; then RESULT_MISSING="$WORK/uncited.tsv"; : > "$RESULT_MISSING"; fi
+record_missing() {
+  [ -n "$RESULT_MISSING" ] || return 0
+  local pr
+  pr=$(sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p' "$SUBJECT_FILE")
+  if [ -z "$pr" ]; then pr=$(sed -nE 's/^Merge pull request #([0-9]+) .*/\1/p' "$SUBJECT_FILE"); fi
+  printf '%s\t%s\n' "$sha" "$pr" >> "$RESULT_MISSING"
+}
 while read -r sha; do
   [ -n "$sha" ] || continue
 
@@ -322,6 +371,7 @@ while read -r sha; do
     printf '        changed %s but cites no issue number; cite #<issue> or the short SHA %s in the section\n' \
       "$shipping_example" "$short"
     missing=$((missing + 1))
+    record_missing
     continue
   fi
 
@@ -366,12 +416,12 @@ while read -r sha; do
     printf '        changed %s; neither #%s nor the short SHA %s appears in the section\n' \
       "$shipping_example" "$(printf '%s' "$refs" | tr '\n' ',' | sed 's/,$//; s/,/, #/g')" "$short"
     missing=$((missing + 1))
+    record_missing
   fi
-done <<EOF
-$(git log --first-parent --format=%H "$PREV..$REF")
-EOF
+done < "$HISTORY_FILE"
 
 if [ "$missing" -gt 0 ]; then
+  RESULT_REASON=changelog-coverage-refused
   cat <<MSG
 
 Add these to the [$BASE] section, then re-tag, citing either the issue number

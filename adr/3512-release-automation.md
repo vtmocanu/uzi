@@ -76,6 +76,16 @@ flowchart LR
   may rerun against the same existing tag/SHA; they cannot create a new tag.
   Recovery refuses an older stable when a newer stable tag exists, preventing
   a stale publication rerun from changing the latest channel.
+- Preparation failure metadata uses optional, bounded cutter/oracle result files;
+  raw command prose stays in logs. Watch owns receipt/publication validation.
+  Report succeeds after delivering the incident and fails on reporting errors;
+  it does not turn a failed upstream job green (#3551).
+  An unconfirmed push receipt stops watch before publication recovery and
+  verification, including automatic publication retries. Inspect remote refs,
+  then use local watch/verify against the same existing tag/SHA.
+  A successful promotion followed by a diagnostics-write failure exits nonzero
+  and retains its local stable tag. CI does not push; inspect local and remote
+  refs before recovery.
 
 ## Stages and limits
 
@@ -84,7 +94,7 @@ cutting; publication watching retains its 60-minute bound, within a 120-minute
 post-push recovery allowance and enclosing job timeouts. No morning cutoff
 applies to dispatch. A single allowlisted infrastructure rerun of pre-cut main
 CI cannot replenish when main moves. Unknown steps and test/assertion failures
-stop. Existing non-gate publication retries retain their two-rerun budget.
+stop. Existing non-gate publication retries retain their two-rerun budget when watch runs.
 
 **D10 is partial until 3e-3.** Post-cut main CI recovery, infrastructure-only
 tagged KinD retries and targeted `assert-tag-smoke` recovery are deferred to that

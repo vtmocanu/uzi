@@ -90,6 +90,11 @@ jobs:
       changes: ${{ steps.prepare.outputs.changes }}
       audit_head: ${{ steps.prepare.outputs.audit_head }}
       retry_log: ${{ steps.prepare.outputs.retry_log }}
+      stage: ${{ steps.prepare.outputs.stage }}
+      planned_tag: ${{ steps.prepare.outputs.planned_tag }}
+      uncited: ${{ steps.prepare.outputs.uncited }}
+      uncited_count: ${{ steps.prepare.outputs.uncited_count }}
+      uncited_truncated: ${{ steps.prepare.outputs.uncited_truncated }}
       artifact_name: release-auto-${{ github.run_id }}-${{ github.run_attempt }}
     env:
       RELEASE_KIND: ${{ inputs.kind }}
@@ -349,7 +354,7 @@ jobs:
       receipt: ${{ steps.watch.outputs.receipt }}
       published_at: ${{ steps.watch.outputs.published_at }}
       verified_at: ${{ steps.watch.outputs.verified_at }}
-      reason: ${{ steps.admit.outputs.reason }}
+      reason: ${{ steps.admit.outputs.reason || steps.watch.outputs.reason }}
     env:
       RELEASE_KIND: ${{ inputs.kind }}
       RELEASE_VERSION: ${{ inputs.version }}
@@ -378,6 +383,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          reason='publication-unconfirmed'
+          fail() { printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"; exit 1; }
+          trap fail ERR
           [ "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$RELEASE_SHA" ]
           receipt=confirmed
           if [ "$RELEASE_KIND" = rc ]; then
@@ -385,6 +393,7 @@ jobs:
             if ! git merge-base --is-ancestor "$RELEASE_SHA" FETCH_HEAD; then receipt=unconfirmed; fi
           fi
           echo "receipt=$receipt" >> "$GITHUB_OUTPUT"
+          if [ "$receipt" != confirmed ]; then reason='push-receipt-unconfirmed'; fail; fi
           watch_status=0
           .agents/skills/uzi-release/scripts/release-watch.sh "${RELEASE_TAG#v}" --max-reruns 2 --interval 60 --max-ticks 60 2>&1 | tee "$RUNNER_TEMP/release-watch.log" || watch_status=$?
           python3 -I scripts/release-auto.py watch-log
@@ -411,27 +420,68 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 - <<'PY'
-          import json, os, subprocess
+          import json, os, re, subprocess
           needs = json.loads(os.environ['NEEDS_JSON'])
           prepared = needs['prepare'].get('outputs', {})
           pushed = needs['push'].get('outputs', {})
           push_outcome = pushed.get('outcome') or ('receipt-unknown' if pushed.get('attempted') == 'true' else '')
           watched = needs['watch'].get('outputs', {})
-          result = {'run': os.environ['RUN_URL'], 'tag': prepared.get('tag', ''),
-                    'parent': prepared.get('parent', ''), 'release': prepared.get('release', ''),
-                    'audit_head': prepared.get('audit_head', ''),
-                    'push_outcome': push_outcome,
-                    'published_at': watched.get('published_at', ''), 'verified_at': watched.get('verified_at', ''),
-                    'changes': json.loads(prepared.get('changes') or '[]'),
+          # Mirror the public identity wire contract in release-diagnostics.py:
+          # this job has no checkout and must not execute repository code.
+          uncited = json.loads(prepared.get('uncited') or 'null')
+          if uncited is not None:
+              if not isinstance(uncited, list) or len(uncited) > 50:
+                  raise ValueError('invalid public identity list')
+              for row in uncited:
+                  if (not isinstance(row, dict) or row.keys() != {'sha', 'pr'}
+                          or not isinstance(row['sha'], str) or not re.fullmatch('[0-9a-f]{40}', row['sha'])
+                          or (row['pr'] is not None and (type(row['pr']) is not int or not 0 < row['pr'] < 2**53))):
+                      raise ValueError('invalid public identity')
+          uncited_count = json.loads(prepared.get('uncited_count') or 'null')
+          uncited_truncated = json.loads(prepared.get('uncited_truncated') or 'null')
+          if uncited is None:
+              if uncited_count is not None or (uncited_truncated is not None and uncited_truncated is not False):
+                  raise ValueError('invalid uncollected identities')
+              uncited_truncated = None
+          elif (type(uncited_count) is not int or not len(uncited) <= uncited_count < 2**53
+                or type(uncited_truncated) is not bool or uncited_truncated != (uncited_count > len(uncited))):
+              raise ValueError('invalid public identity count')
+          attempted = {'true': True, 'false': False}.get(pushed.get('attempted'))
+          # The recovery marker is false after a definitive rejection, despite
+          # Git having attempted that push. Keep the public statement literal.
+          if push_outcome == 'push-rejected': attempted = True
+          if needs['push']['result'] == 'skipped': attempted = False
+          failed = [name for name in ('authorize', 'prepare', 'push', 'watch') if needs[name]['result'] in ('failure', 'cancelled')]
+          phase = failed[0] if failed else 'watch'
+          result = {'run': os.environ['RUN_URL'], 'tag': prepared.get('tag') or None,
+                    'planned_tag': prepared.get('planned_tag') or None, 'phase': phase,
+                    'stage': (prepared.get('stage') or None) if phase == 'prepare' else None,
+                    'parent': prepared.get('parent') or None, 'release': prepared.get('release') or None,
+                    'audit_head': prepared.get('audit_head') or None, 'push_attempted': attempted,
+                    'push_outcome': push_outcome or None,
+                    'published_at': watched.get('published_at') or None, 'verified_at': watched.get('verified_at') or None,
+                    'changes': json.loads(prepared.get('changes') or 'null'), 'uncited': uncited,
+                    'uncited_count': uncited_count, 'uncited_truncated': uncited_truncated,
                     'retries': json.loads(prepared.get('retry_log') or '[]')}
-          failed = [name for name, job in needs.items() if job['result'] in ('failure', 'cancelled')]
           problem = bool(failed) or watched.get('receipt') == 'unconfirmed'
           result['outcome'] = 'blocked' if problem else (watched.get('outcome') or prepared.get('outcome') or 'no-op')
           result['reason'] = next((needs[name].get('outputs', {}).get('reason') or name + '-failed' for name in failed),
                                   'partial-publication' if problem else prepared.get('reason', 'complete'))
           if problem and push_outcome == 'receipt-unknown':
               result['outcome'], result['reason'] = 'partial-publication', 'push-receipt-unknown'
-          body = '```json\n' + json.dumps(result, indent=2, sort_keys=True) + '\n```\n'
+          explanation = {'changelog-coverage-refused': 'Release preparation refused: the assembled changelog failed its coverage check.',
+                         'changelog-coverage-error': 'Release preparation could not establish changelog coverage.',
+                         'push-rejected': 'Release push was rejected without updating refs.',
+                         'push-receipt-unconfirmed': 'Release recovery could not confirm that main contains the RC.'}.get(
+                             result['reason'], 'Release automation stopped during ' + phase + '.' if problem else 'Release automation summary.')
+          if problem and attempted is False: explanation += ' No push was attempted.'
+          elif problem and attempted is None: explanation += ' Push attempt status is unavailable; inspect remote refs.'
+          body = explanation + '\n\n```json\n' + json.dumps(result, indent=2, sort_keys=True) + '\n```\n'
+          for row in uncited or []:
+              label = 'PR #' + str(row['pr']) if row['pr'] is not None else row['sha'][:10]
+              body += '- Uncited ' + label + ': https://github.com/vtmocanu/uzi/commit/' + row['sha'] + '\n'
+          if uncited_truncated:
+              body += '\nShowing ' + str(len(uncited)) + ' of ' + str(uncited_count) + ' uncited commits.\n'
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
               stream.write(body)
           if problem:
@@ -451,5 +501,5 @@ jobs:
                   api('--method', 'POST', f'repos/{repo}/issues/{issue["number"]}/comments', data={'body': body})
               else:
                   api('--method', 'POST', f'repos/{repo}/issues', data={'title': title, 'body': body, 'labels': ['area::release', 'priority::normal']})
-              raise SystemExit(1)
+              print('Release incident delivered successfully.')
           PY

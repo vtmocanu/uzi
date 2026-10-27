@@ -32,6 +32,7 @@
 # --fold-order-only runs canonical pending/open-RC ordering fixtures.
 # --promote-main-race-only [cutter-path] pins promotion while remote main advances.
 # --plan-only [cutter-path] runs read-only decision and publication fixtures.
+# --diagnostics-only runs real cutter/oracle structured-refusal fixtures.
 # --fragments-only [cutter-path] runs fragment regressions, optionally against a frozen cutter.
 #
 # Wired as `task test:release-scripts` (its own gate member, not gate:repo's
@@ -525,7 +526,7 @@ if [ "${1:-}" = "--identity-only" ]; then
   exit $?
 fi
 
-if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ] && [ "${1:-}" != "--plan-only" ] && [ "${1:-}" != "--promote-main-race-only" ]; then
+if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ] && [ "${1:-}" != "--plan-only" ] && [ "${1:-}" != "--promote-main-race-only" ] && [ "${1:-}" != "--diagnostics-only" ] && [ "${1:-}" != "--promotion-diagnostics-only" ]; then
 identity_regressions
 echo "=== building fixture in $REPO ==="
 build_fixture
@@ -663,6 +664,7 @@ seed_repo() {
   cp "$SCRIPTS_DIR/changelog-fragment-citations.py" "$d/scripts/changelog-fragment-citations.py"
   cp "$SCRIPTS_DIR/lib/release-mode.sh" "$d/scripts/lib/release-mode.sh"
   cp "$SCRIPTS_DIR/lib/changelog-bullets.awk" "$d/scripts/lib/changelog-bullets.awk"
+  [ ! -f "$SCRIPTS_DIR/lib/release-diagnostics.py" ] || cp "$SCRIPTS_DIR/lib/release-diagnostics.py" "$d/scripts/lib/release-diagnostics.py"
   [ ! -f "$SCRIPTS_DIR/lib/ghcr.sh" ] || cp "$SCRIPTS_DIR/lib/ghcr.sh" "$d/scripts/lib/ghcr.sh"
   cat > "$d/deploy/chart/Chart.yaml" <<'YAML'
 apiVersion: v2
@@ -728,6 +730,33 @@ push_tag_to_origin() { git -C "$1" push -q origin "refs/tags/$2"; }
 
 feature_201_changelog() { printf '# Changelog\n\n## [Unreleased]\n### Added\n- **Feature 201** (#201)\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' | put_changelog "$1"; }
 
+diagnostic_regressions() (
+  PASSES=0; FAILS=0
+  local d result before missing_sha
+  d=$(mktemp -d); result="$d.result.json"
+  trap 'rm -rf "$d"; rm -f "$result"' EXIT
+  seed_repo "$d"
+  add_feature "$d" 201
+  feature_201_changelog "$d"
+  run_rc "$d" 0.2.0 --result-file "$result"
+  assert_eq 'diagnostic cut succeeds' 0 "$RC_RC"
+  assert_eq 'diagnostic cut ready' ready "$(jq -r .reason "$result" 2>/dev/null)"
+  assert_eq 'diagnostic cut target' v0.2.0-rc.1 "$(jq -r .planned_tag "$result" 2>/dev/null)"
+  git -C "$d" tag v0.2.0-rc.1
+  add_feature "$d" 202
+  before=$(git -C "$d" rev-parse HEAD); missing_sha=$before
+  run_rc "$d" 0.2.0 --result-file "$result"
+  assert_eq 'diagnostic oracle refusal preserves cut exit' 1 "$RC_RC"
+  assert_eq 'diagnostic oracle reason survives rollback' changelog-coverage-refused "$(jq -r .reason "$result" 2>/dev/null)"
+  assert_eq 'diagnostic refusal target' v0.2.0-rc.2 "$(jq -r .planned_tag "$result" 2>/dev/null)"
+  assert_eq 'diagnostic refusal stage' changelog-coverage "$(jq -r .stage "$result" 2>/dev/null)"
+  assert_eq 'diagnostic uncited commit' "$missing_sha" "$(jq -r '.uncited[0].sha' "$result" 2>/dev/null)"
+  assert_eq 'diagnostic uncited PR' 202 "$(jq -r '.uncited[0].pr' "$result" 2>/dev/null)"
+  assert_eq 'diagnostic refusal still undoes the commit' "$before" "$(git -C "$d" rev-parse HEAD)"
+  echo "diagnostics: $PASSES passed, $FAILS failed"
+  [ "$FAILS" -eq 0 ]
+)
+
 published_rc() {
   seed_repo "$1"; add_origin "$1"; add_feature "$1" 201
   feature_201_changelog "$1"
@@ -736,6 +765,127 @@ published_rc() {
   git -C "$1" tag v0.2.0-rc.1
   push_tag_to_origin "$1" v0.2.0-rc.1
 }
+promotion_diagnostic_regressions() (
+  PASSES=0; FAILS=0
+  local root d result mode before dep copy_result=${1:-}
+  root=$(mktemp -d)
+  trap 'rm -rf "$root"' EXIT
+  for mode in stable implicit failed refused after-promotion; do
+    d="$root/$mode"; result="$root/$mode.json"
+    published_rc "$d"
+    before=$(git -C "$d" rev-parse HEAD)
+    case "$mode" in
+      stable) run_rc "$d" 0.2.0 --promote-only --ci --result-file "$result" ;;
+      implicit) run_rc "$d" 0.3.0 --promote --result-file "$result" ;;
+      refused)
+        git -C "$d" branch release/0.2.0 v0.2.0-rc.1
+        run_rc "$d" 0.2.0 --promote-only --result-file "$result" ;;
+      after-promotion)
+        printf 'module example/diagnostic\n' > "$d/api/go.mod"
+        git -C "$d" add api/go.mod; gcommit "$d" 'chore(deps): update dependency (#204)'
+        dep=$(git -C "$d" rev-parse HEAD)
+        add_feature "$d" 202
+        awk '/^## \[Unreleased\]$/ {print;print "### Added\n- **Feature 202** (#202)\n";next} {print}' "$d/CHANGELOG.md" > "$root/notes"
+        put_changelog "$d" < "$root/notes"
+        before=$(git -C "$d" rev-parse HEAD)
+        mkdir "$root/bin"
+        cat > "$root/bin/git" <<'STUB'
+#!/usr/bin/env bash
+if "$DIAGNOSTIC_GIT" -C "$DIAGNOSTIC_ROOT" show-ref --verify --quiet refs/tags/v0.2.0; then
+  case "$*" in
+    "diff --name-only -z ${DIAGNOSTIC_DEP}^1 ${DIAGNOSTIC_DEP}"|"show --name-only --format= -z ${DIAGNOSTIC_DEP}") exit 71 ;;
+  esac
+fi
+exec "$DIAGNOSTIC_GIT" "$@"
+STUB
+        chmod +x "$root/bin/git"
+        DIAGNOSTIC_GIT=$(command -v git) DIAGNOSTIC_ROOT="$d" DIAGNOSTIC_DEP="$dep" PATH="$root/bin:$PATH" \
+          run_rc "$d" 0.3.0 --promote --result-file "$result" ;;
+      failed)
+        add_feature "$d" 202
+        awk '/^## \[Unreleased\]$/ {print;print "### Added\n- **Feature 202** (#202)\n";next} {print}' "$d/CHANGELOG.md" > "$root/notes"
+        put_changelog "$d" < "$root/notes"
+        add_feature "$d" 203
+        before=$(git -C "$d" rev-parse HEAD)
+        run_rc "$d" 0.3.0 --promote --result-file "$result" ;;
+    esac
+    if [ "$mode" = failed ]; then
+      assert_eq 'failed promote preserves failure status' 1 "$RC_RC"
+      assert_eq 'failed promote emits non-ready reason' changelog-coverage-refused "$(jq -r .reason "$result" 2>/dev/null)"
+      if git -C "$d" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail 'failed promote leaked provisional stable tag'; else pass 'failed promote removes provisional stable tag'; fi
+      assert_eq 'failed promote preserves starting HEAD' "$before" "$(git -C "$d" rev-parse HEAD)"
+    elif [ "$mode" = after-promotion ]; then
+      assert_eq 'post-promotion precondition preserves refusal status' 3 "$RC_RC"
+      assert_eq 'post-promotion refusal leaves promotion stage' preconditions "$(jq -r .stage "$result" 2>/dev/null)"
+      assert_eq 'post-promotion refusal is not promotion-failed' release-precondition-refused "$(jq -r .reason "$result" 2>/dev/null)"
+      if git -C "$d" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail 'post-promotion refusal leaked stable tag'; else pass 'post-promotion refusal removes stable tag'; fi
+      assert_eq 'post-promotion refusal preserves HEAD' "$before" "$(git -C "$d" rev-parse HEAD)"
+    elif [ "$mode" = refused ]; then
+      assert_eq 'early promotion refusal stays nonzero' 3 "$RC_RC"
+      assert_eq 'early promotion refusal is not ready' promotion-failed "$(jq -r .reason "$result" 2>/dev/null)"
+    else
+      assert_eq "$mode promotion succeeds" 0 "$RC_RC"
+      assert_eq "$mode promotion emits ready" ready "$(jq -r .reason "$result" 2>/dev/null)"
+      assert_eq "$mode promotion reports actual stable target" v0.2.0 "$(jq -r .planned_tag "$result" 2>/dev/null)"
+      assert_eq "$mode promotion preserves main chart" 0.2.0-rc.1 "$(chart_ver "$d")"
+      git -C "$d" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null || fail "$mode promotion stable tag missing"
+      if [ "$mode" = stable ] && [ -n "$copy_result" ] && [ -f "$result" ]; then cp "$result" "$copy_result"; fi
+    fi
+  done
+  echo "promotion diagnostics: $PASSES passed, $FAILS failed"
+  [ "$FAILS" -eq 0 ]
+)
+diagnostic_option_regressions() (
+  PASSES=0; FAILS=0
+  local root d result before mode
+  root=$(mktemp -d)
+  trap 'rm -rf "$root"' EXIT
+  for mode in plan duplicate no-commit writer-failure relative inflight; do
+    d="$root/$mode"; result="$root/$mode.json"
+    seed_repo "$d"; add_feature "$d" 201; feature_201_changelog "$d"
+    before=$(git -C "$d" rev-parse HEAD)
+    case "$mode" in
+      plan) run_rc "$d" --plan --result-file "$result" ;;
+      duplicate) run_rc "$d" 0.2.0 --result-file "$result" --result-file "$result" ;;
+      no-commit) run_rc "$d" 0.2.0 --no-commit --result-file "$result" ;;
+      writer-failure) mkdir "$result"; run_rc "$d" 0.2.0 --result-file "$result" ;;
+      relative)
+        mkdir "$d/subdir"
+        RC_OUT=$(cd "$d/subdir" && UZI_RELEASE_OFFLINE_FIXTURE=1 UZI_CHANGELOG_REPO_URL=https://github.com/vtmocanu/uzi bash "$RC" 0.2.0 --result-file result.json 2>&1); RC_RC=$?
+        assert_eq 'relative diagnostics retain caller cwd' ready "$(jq -r .reason "$d/subdir/result.json" 2>/dev/null)" ;;
+      inflight)
+        run_rc "$d" 0.2.0
+        git -C "$d" tag v0.2.0-rc.1
+        before=$(git -C "$d" rev-parse HEAD)
+        run_rc "$d" 0.3.0 --result-file "$result" ;;
+    esac
+    case "$mode" in
+      writer-failure) assert_eq 'successful cut fails if diagnostics cannot be delivered' 1 "$RC_RC" ;;
+      relative) assert_eq 'relative diagnostics cut succeeds' 0 "$RC_RC" ;;
+      *)
+        assert_eq "$mode diagnostic usage/refusal stays nonzero" 3 "$RC_RC"
+        assert_eq "$mode refusal preserves HEAD" "$before" "$(git -C "$d" rev-parse HEAD)"
+        if [ "$mode" != duplicate ]; then
+          assert_eq "$mode refusal is typed" release-precondition-refused "$(jq -r .reason "$result" 2>/dev/null)"
+        fi ;;
+    esac
+  done
+  echo "diagnostic options: $PASSES passed, $FAILS failed"
+  [ "$FAILS" -eq 0 ]
+)
+if [ "${1:-}" = --promotion-diagnostics-only ]; then promotion_diagnostic_regressions "${2:-}"; exit $?; fi
+if [ "${1:-}" = --diagnostics-only ]; then
+  diagnostic_status=0
+  diagnostic_regressions || diagnostic_status=1
+  promotion_diagnostic_regressions || diagnostic_status=1
+  diagnostic_option_regressions || diagnostic_status=1
+  exit "$diagnostic_status"
+fi
+if [ "$#" -eq 0 ]; then
+  diagnostic_regressions || fail 'structured diagnostic regressions'
+  promotion_diagnostic_regressions || fail 'promotion diagnostic regressions'
+  diagnostic_option_regressions || fail 'diagnostic option regressions'
+fi
 # A promotion is pinned to the candidate; only main-writing cuts need a fresh main.
 promotion_main_race_regressions() (
   local d candidate selected advanced

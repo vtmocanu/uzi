@@ -13,11 +13,15 @@ import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location('release_coverage', ROOT / 'scripts/release-ci-coverage.py')
 policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
+diag_spec = importlib.util.spec_from_file_location('release_diagnostics', ROOT / 'scripts/lib/release-diagnostics.py')
+diagnostics = importlib.util.module_from_spec(diag_spec)
+diag_spec.loader.exec_module(diagnostics)
 BASE = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
 RC = rf'v{BASE}-rc\.[1-9][0-9]*'
 SHA = r'[0-9a-f]{40}'
@@ -118,12 +122,15 @@ def eligible_jobs(jobs):
     return True
 
 
-def command(*args, timeout=60, raw=False):
-    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+def command(*args, timeout=60, raw=False, live=False):
+    result = subprocess.run(args, capture_output=not live, text=True, timeout=timeout, check=False)
     if result.returncode:
         # Diagnostics stay in job logs; incident reports contain typed reasons.
-        print((result.stdout + result.stderr)[-8192:], file=sys.stderr)
+        if not live:
+            print((result.stdout + result.stderr)[-8192:], file=sys.stderr)
         raise Stop('command-failed')
+    if live:
+        return ''
     return result.stdout if raw else result.stdout.strip()
 
 
@@ -141,7 +148,10 @@ def summary(values):
     target = os.environ.get('GITHUB_STEP_SUMMARY')
     if target:
         with open(target, 'a') as stream:
-            stream.write('```json\n' + json.dumps(values, sort_keys=True, indent=2) + '\n```\n')
+            public = dict(values)
+            for key in ('changes', 'uncited', 'uncited_count', 'uncited_truncated'):
+                public[key] = json.loads(values.get(key, 'null'))
+            stream.write('```json\n' + json.dumps(public, sort_keys=True, indent=2) + '\n```\n')
             for change in json.loads(values.get('changes', '[]')):
                 sha = change['sha']
                 pr = f'PR #{change["pr"]}' if change['pr'] else 'no PR number in subject'
@@ -207,6 +217,36 @@ class Release:
     def remote(self):
         return inventory(self.git('ls-remote', 'origin', 'refs/heads/main', 'refs/tags/v*'))
 
+    def cut(self, args, directory, tag):
+        self.evidence.update(phase='prepare', stage='preconditions', planned_tag=tag)
+        directory.mkdir(parents=True, exist_ok=True)
+        result_file = directory / 'cut-result.json'
+        result_file.unlink(missing_ok=True)
+        failed = None
+        command_token = uuid.uuid4().hex
+        print('::stop-commands::' + command_token, flush=True)
+        try:
+            self.run(*args, '--result-file', str(result_file), timeout=600, live=True)
+        except Stop as error:
+            failed = error
+        except subprocess.TimeoutExpired:
+            raise Stop('release-cut-timed-out') from None
+        finally:
+            print('::' + command_token + '::', flush=True)
+        try:
+            data = diagnostics.read(result_file)
+        except (OSError, ValueError, TypeError):
+            raise Stop('release-diagnostics-unavailable') from None
+        require(data['planned_tag'] == tag or (failed is not None and data['planned_tag'] is None),
+                'release-diagnostics-tag-mismatch')
+        require((data['reason'] == 'ready') if failed is None else
+                data['reason'] not in ('ready', 'changelog-coverage-ok'), 'release-diagnostics-status-mismatch')
+        self.evidence.update(stage=data['stage'], uncited=json.dumps(data['uncited']),
+                             uncited_count=json.dumps(data['uncited_count']),
+                             uncited_truncated=json.dumps(data['uncited_truncated']))
+        if failed is not None:
+            raise Stop(data['reason']) from failed
+
     def watch_admission(self, tag, sha):
         require(re.fullmatch(SHA, sha) and re.fullmatch(rf'v{BASE}(?:-rc\.[1-9][0-9]*)?', tag), 'invalid-recovery-tag')
         current = self.remote()
@@ -233,7 +273,10 @@ class Release:
         require(re.fullmatch(BASE, plan['BASE']) and re.fullmatch(RC, plan['TAG']), 'invalid-plan')
 
     def tip(self, seconds=7200, interval=15):
-        deadline, retried, pending_retry = self.clock() + seconds, False, None
+        started = self.clock()
+        deadline, retried, pending_retry = started + seconds, False, None
+        deadline_utc = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)).isoformat(timespec='seconds')
+        last_progress = None
         selected, plan = None, None
         while True:
             if self.clock() > deadline:
@@ -241,11 +284,14 @@ class Release:
             self.git('fetch', '--prune', '--tags', 'origin')
             sha = self.git('rev-parse', 'refs/remotes/origin/main')
             self.evidence['parent'] = sha
+            self.evidence.update(phase='prepare', stage='plan')
             tags = self.git('show-ref', '--tags', '-d')
             if selected != (sha, tags):
                 self.git('checkout', '-B', 'main', sha)
                 plan = self.plan()
                 require(plan['HEAD_SHA'] == sha, 'plan-head-mismatch')
+                if re.fullmatch(RC, plan['TAG']):
+                    self.evidence['planned_tag'] = plan['TAG']
                 self.accept_rc(plan)
                 selected = sha, tags
             ci = self.api.run('ci.yml', sha, 'main')
@@ -254,6 +300,21 @@ class Release:
             if pending_retry and ci and ci['id'] == pending_retry[0] and ci['run_attempt'] <= pending_retry[1]:
                 require(self.clock() < pending_retry[2], 'tip-ci-retry-not-started')
                 ci_state = 'pending'
+            self.evidence['stage'] = 'tip-wait'
+            progress = (sha, plan['TAG'], ci_state, (ci or {}).get('id'), (ci or {}).get('run_attempt'),
+                        (ci or {}).get('status'), (ci or {}).get('conclusion'),
+                        smoke_state, (smoke or {}).get('id'), (smoke or {}).get('run_attempt'),
+                        (smoke or {}).get('status'), (smoke or {}).get('conclusion'))
+            if progress != last_progress:
+                print('release-auto: ' + json.dumps(dict(phase='prepare', stage='tip-wait', parent=sha,
+                      planned_tag=plan['TAG'], ci_state=ci_state, ci_run=(ci or {}).get('id'),
+                      ci_attempt=(ci or {}).get('run_attempt'), smoke_state=smoke_state,
+                      ci_status=(ci or {}).get('status'), ci_conclusion=(ci or {}).get('conclusion'),
+                      smoke_run=(smoke or {}).get('id'), smoke_attempt=(smoke or {}).get('run_attempt'),
+                      smoke_status=(smoke or {}).get('status'), smoke_conclusion=(smoke or {}).get('conclusion'),
+                      elapsed_seconds=round(self.clock() - started, 1), deadline_utc=deadline_utc,
+                      remaining_seconds=round(max(0, deadline - self.clock()), 1)), sort_keys=True), flush=True)
+                last_progress = progress
             if smoke_state == 'failed':
                 raise Stop('tip-smoke-failed')
             if ci_state == 'failed':
@@ -328,10 +389,11 @@ class Release:
             if cfg['abandon']:
                 args.append('--skip-promote')
             try:
-                self.run(*args, timeout=600)
+                self.cut(args, directory, tag)
             except Stop:
                 require(self.remote()['main'] == parent, 'main-race')
                 raise
+            self.evidence['stage'] = 'metadata-verification'
             release = self.git('rev-parse', 'HEAD')
             require(self.git('rev-list', '--parents', '-n', '1', release).split() == [release, parent], 'prepared-parent-mismatch')
             self.run('python3', '-I', 'scripts/release-ci-coverage.py', 'metadata', parent, release)
@@ -339,6 +401,8 @@ class Release:
             require(tag not in before['tags'], 'target-tag-exists')
             self.git('tag', '-a', tag, '-m', tag, release)
         else:
+            self.evidence.update(phase='prepare', stage='candidate-validation',
+                                 planned_tag=cfg['rc_tag'].split('-rc.')[0])
             self.git('fetch', '--prune', '--tags', 'origin')
             # Read discovery fields only: RC no-op/main-note/runtime guards do not
             # govern promotion of an already published, pinned candidate.
@@ -353,7 +417,8 @@ class Release:
             base = cfg['rc_tag'][1:].split('-rc.')[0]
             tag = 'v' + base
             require(tag not in before['tags'] and (not before['previous_stable'] or version(before['previous_stable']) < version(tag)), 'stable-superseded')
-            self.run('bash', CUTTER, base, '--promote-only', '--ci', timeout=600)
+            self.cut(['bash', CUTTER, base, '--promote-only', '--ci'], directory, tag)
+            self.evidence['stage'] = 'metadata-verification'
             release = self.git('rev-parse', '--verify', f'refs/tags/{tag}^{{commit}}')
             require(self.git('rev-list', '--parents', '-n', '1', release).split() == [release, parent], 'promotion-parent-mismatch')
             self.run('python3', '-I', 'scripts/release-ci-coverage.py', 'metadata', parent, release)
@@ -361,11 +426,13 @@ class Release:
         after = self.remote()
         # Stable publication is pinned to the candidate and never depends on main.
         require((after == before) if cfg['kind'] == 'rc' else (after['tags_digest'] == before['tags_digest']), 'release-ref-race')
+        self.evidence['stage'] = 'bundle'
         self.git('update-ref', 'refs/heads/release-auto-prepared', release)
         directory.mkdir(parents=True, exist_ok=True)
         bundle = directory / 'release.bundle'
         self.git('bundle', 'create', str(bundle), 'refs/heads/release-auto-prepared', f'refs/tags/{tag}', '^' + parent)
         result = dict(outcome='prepared', reason='ready', parent=parent, release=release, tag=tag,
+                      phase='prepare', stage='complete', planned_tag=tag,
                       digest=hashlib.sha256(bundle.read_bytes()).hexdigest(),
                       tag_oid=self.git('rev-parse', f'refs/tags/{tag}'))
         result.update({key: before[key] for key in ('previous_rc', 'previous_rc_sha', 'previous_stable', 'previous_stable_sha')})
@@ -378,6 +445,9 @@ class Release:
         result['audit_head'] = audit_head
         result['changes'] = json.dumps(self.changes(boundary, audit_head)) if boundary else '[]'
         result['retry_log'] = json.dumps(self.retries)
+        for key in ('uncited', 'uncited_count', 'uncited_truncated'):
+            if key in self.evidence:
+                result[key] = self.evidence[key]
         (directory / 'retries.json').write_text(json.dumps(self.retries, indent=2))
         return result
 
