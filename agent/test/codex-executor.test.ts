@@ -18493,6 +18493,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         else assert.equal(error, ownerExit, "cleanup must preserve the owner control outcome");
         return true;
       });
+      assert.ok(teardownCalls >= 2, "the repeated teardown ran");
       assert.equal(retries, 1);
       assert.equal(rig.client.releaseCalls.length, 1);
       assert.equal(rig.providerLaunches(), 1);
@@ -18568,13 +18569,14 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
   });
 
   for (const entry of ["retry", "beforeTurn", "owner tick"] as const)
-    for (const work of ["source", "restoration"] as const)
+    for (const work of ["source", "restoration", "unavailable", "uncertain", "restore unavailable"] as const)
     for (const extended of [false, true])
     it(`3466 exhausted ${entry} ${work} work spends wall before owner wait; extended=${extended}`, async t => {
       const rig = silentRevisionRig();
       rig.deps = { ...rig.deps, wallMs: 1000 };
       let waits = 0, parks = 0, spent = false, replacement = false, afterTick = false, replacementProbes = 0;
       let restoring = false;
+      let proofUnavailable = false, failedProbes = 0;
       let status: "running" | "awaiting_approval" = "awaiting_approval";
       const recovery = new PlanRevisionRecovery({ generation: 1,
         ownership: async () => {
@@ -18582,11 +18584,22 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
               (entry === "retry" || (entry === "beforeTurn" && replacement && ++replacementProbes === 2) ||
                 (entry === "owner tick" && afterTick))) {
             if (work === "source") { spent = true; t.mock.timers.tick(1000); }
-            else { restoring = true; status = "running"; }
+            else if (work === "restoration" || work === "restore unavailable") { restoring = true; status = "running"; }
+            else { spent = true; proofUnavailable = true; }
+          }
+          if (proofUnavailable) {
+            failedProbes++;
+            t.mock.timers.tick(100);
+            if (work === "unavailable") throw new RequestError("GET", "/ownership", 503, "unavailable");
+            return { status }; // Missing generation/release evidence is not ownership.
           }
           return { status, claim_generation: 1, gate_revision: 1, claim_released: false };
-        }, signal: () => new AbortController().signal, checkControl: () => {}, notice: async () => {},
+        }, signal: () => new AbortController().signal,
+        checkControl: () => {
+          if (failedProbes >= 4) throw new Error("ownership retries exceeded the wall budget");
+        }, notice: async () => {},
         policy: { redrives: 0, sleep: async (ms, signal) => {
+          if (proofUnavailable || (restoring && work === "restore unavailable")) { t.mock.timers.tick(ms); return; }
           if (entry === "owner tick" && !afterTick) {
             assert.equal(ms, 30000);
             t.mock.timers.tick(ms);
@@ -18608,6 +18621,12 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       });
       recovery.seed({ status: "awaiting_approval", plan_md: "initial", presentation_id: "source" }, 1,
         async () => {
+          if (restoring && work === "restore unavailable") {
+            spent = true;
+            failedProbes++;
+            t.mock.timers.tick(100);
+            throw new RequestError("POST", "/state", 503, "unavailable");
+          }
           if (restoring && !spent) { spent = true; t.mock.timers.tick(1000); }
           status = "awaiting_approval";
           return { applied: true, status, gateRevision: 1 };
@@ -18625,7 +18644,10 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
             throw error;
           }
         },
-        parkForWall: async () => { parks++; return extended ? "refused" : "parked"; },
+        parkForWall: async () => {
+          parks++; proofUnavailable = false; restoring = false; status = "awaiting_approval";
+          return extended ? "refused" : "parked";
+        },
         takeWallParkRefresh: () => ({ totalSeconds: 2, usedSeconds: 1 }),
       });
       t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });

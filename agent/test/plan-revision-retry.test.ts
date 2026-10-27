@@ -1,5 +1,5 @@
 import { describe, it } from "node:test";
-import { RevisionSourceFenceUnavailableError } from "../src/client.js";
+import { RequestError, RevisionSourceFenceUnavailableError } from "../src/client.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import assert from "node:assert/strict";
 import { PlanRevisionRecovery, PlanRevisionRecoveryStoppedError, type PlanRevisionRetryPolicy } from "../src/plan-revision-retry.js";
@@ -363,6 +363,46 @@ describe("live-flight plan revision recovery", () => {
     assert.equal(reads, 3);
     assert.equal(f.writes.length, 0);
     assert.equal(f.notices.length, 0, "no charged re-drive");
+  });
+
+  for (const control of ["404", "cancel"] as const)
+    it(`3466 ownership ${control} keeps precedence over a spent wall`, async () => {
+      const f = fixture();
+      f.onOwner(() => {
+        if (control === "cancel") f.cancel();
+        throw new RequestError("GET", "/ownership", 404, "not found");
+      });
+      await assert.rejects(f.recovery.beforeTurn(undefined, () => 0),
+        control === "404" ? PlanRevisionRecoveryStoppedError : /run cancelled/);
+      assert.deepEqual(f.sleeps, []);
+      assert.deepEqual(f.waits, []);
+      assert.deepEqual(f.writes, []);
+    });
+
+  it("3466 replacement feedback survives wall exhaustion during ownership retries", async () => {
+    const f = fixture();
+    let taken = false, reads = 0, remaining = 250;
+    f.onEvent(async () => {
+      taken = true;
+      return { kind: "revise", inputId: 102, feedback: "J", sourceGateRevision: 11 };
+    });
+    f.onOwner(() => {
+      if (!taken) return;
+      if (++reads >= 4) f.cancel(); // Bound the unfixed implementation's red direction.
+      throw new RequestError("GET", "/ownership", 503, "unavailable");
+    });
+    f.onSleep(ms => { if (ms <= 250) remaining -= ms; });
+    const cause = new TransientRecoveryError("silence", { zeroEvidenceIdle: true });
+    assert.equal(await f.recovery.retry(cause, undefined, () => remaining), "wall");
+    assert.equal(remaining, 0);
+    assert.deepEqual(f.waits, [101]);
+    assert.deepEqual(f.retired, []);
+    remaining = 1000; // An owner extension refused the wall park.
+    f.onOwner(() => {});
+    await assert.rejects(f.recovery.beforeTurn(undefined, () => remaining), PlanRevisionReplacedError);
+    assert.deepEqual(f.waits, [101], "do not take the pending replacement a second time");
+    assert.deepEqual(f.recovery.fields(102).superseded_revision_input_ids, [101]);
+    assert.deepEqual(f.retired, []);
   });
 
   it("a cancel during backoff stops before a re-drive is charged", async () => {

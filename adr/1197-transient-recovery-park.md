@@ -1280,6 +1280,9 @@ between wait ticks remain charged. Both revision-retry entry paths check the
 remaining wall after source checks and gate restoration, before each owner-event
 wait. A spent wall returns to the executor's wall routing; an extension retains
 the exhausted retry state instead of admitting an uncharged reconstruction.
+Retry waits for unknown ownership and gate-restoration evidence use that same
+remaining budget. A replacement revise already taken from the owner queue stays
+pending across a wall unwind until its source proof can complete.
 Cancel, pause, spent wall and completion
 holds retain their existing precedence. Provider-origin revision
 retries continue on their existing epoch.

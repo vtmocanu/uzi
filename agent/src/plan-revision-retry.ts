@@ -23,7 +23,13 @@ export class PlanRevisionRecoveryStoppedError extends Error {
 
 type Report = (request: StateRequest) => Promise<StateAck>;
 interface Source { revision: number; request: StateRequest; report: Report }
-interface Active { id: number; source: Source; used: number; redriveReady: boolean; cause?: unknown }
+interface Active {
+  id: number; source: Source; used: number; redriveReady: boolean; cause?: unknown;
+  replacement?: Extract<PlanVerdict, { kind: "revise" }>;
+}
+
+/** Internal unwind, caught only at the silent-recovery entry points below. */
+class PlanRevisionWallSpentError extends Error {}
 
 interface Dependencies {
   generation: number;
@@ -103,17 +109,22 @@ export class PlanRevisionRecovery {
   async beforeTurn(observer?: PlanRevisionOwnerWaitObserver, remainingWallMs?: () => number): Promise<PlanRevisionRetryOutcome> {
     const a = this.active;
     if (!a) return;
-    await this.confirmSource(a);
-    if (a.redriveReady) {
-      if (a.used >= this.limit) {
-        return this.retry(a.cause, observer, remainingWallMs);
+    try {
+      await this.confirmSource(a, false, remainingWallMs);
+      if (a.redriveReady) {
+        if (a.used >= this.limit) {
+          return this.retry(a.cause, observer, remainingWallMs);
+        }
+        const reason = a.cause instanceof TransientRecoveryError && a.cause.zeroEvidenceIdle
+          ? "No model output within the idle timeout" : "Provider transient exhaustion";
+        await this.deps.notice(`${reason} during plan revision ${a.id}; re-driving the failed turn (${a.used + 1}/${this.limit}).`);
+        await this.confirmSource(a, false, remainingWallMs);
+        a.used++;
+        a.redriveReady = false;
       }
-      const reason = a.cause instanceof TransientRecoveryError && a.cause.zeroEvidenceIdle
-        ? "No model output within the idle timeout" : "Provider transient exhaustion";
-      await this.deps.notice(`${reason} during plan revision ${a.id}; re-driving the failed turn (${a.used + 1}/${this.limit}).`);
-      await this.confirmSource(a);
-      a.used++;
-      a.redriveReady = false;
+    } catch (error) {
+      if (error instanceof PlanRevisionWallSpentError) return "wall";
+      throw error;
     }
   }
 
@@ -121,17 +132,28 @@ export class PlanRevisionRecovery {
   async retry(cause: unknown, observer?: PlanRevisionOwnerWaitObserver, remainingWallMs?: () => number): Promise<PlanRevisionRetryOutcome> {
     const a = this.active;
     if (!a) throw cause; // missing source/older API keeps existing compatibility behavior
-    await this.confirmSource(a);
+    a.cause = cause;
+    try { return await this.retryOwned(a, cause, observer, remainingWallMs); }
+    catch (error) {
+      if (!(error instanceof PlanRevisionWallSpentError)) throw error;
+      // An extension still needs a charged retry, or the exhausted owner wait.
+      a.redriveReady = true;
+      return "wall";
+    }
+  }
+
+  private async retryOwned(a: Active, cause: unknown, observer?: PlanRevisionOwnerWaitObserver,
+    remainingWallMs?: () => number): Promise<PlanRevisionRetryOutcome> {
+    await this.confirmSource(a, false, remainingWallMs);
     // An id-less legacy presentation still has a source ownership fence, but
     // cannot use the exact-presentation expiry restore. Keep its existing recovery path.
     if (!a.source.request.presentation_id) throw cause;
-    a.cause = cause;
     if (a.used < this.limit) {
       const random = this.deps.policy?.random?.() ?? Math.random();
       const jitter = Number.isFinite(random) ? Math.max(0, Math.min(1, random)) : 0;
       const backoff = Math.min(30_000, [5_000, 10_000, 20_000][a.used]! * (1 + jitter * 0.2));
       await this.wait(backoff, remainingWallMs);
-      await this.confirmSource(a);
+      await this.confirmSource(a, false, remainingWallMs);
       a.redriveReady = true;
       return;
     }
@@ -144,10 +166,10 @@ export class PlanRevisionRecovery {
       delete restore.adopt_gate_revision;
       delete restore.revision_input_id;
       delete restore.superseded_revision_input_ids;
-      await this.publish(restore, a.source.report);
+      await this.publish(restore, a.source.report, remainingWallMs);
     }
     };
-    await restoreSourceGate(await this.confirmSource(a));
+    await restoreSourceGate(await this.confirmSource(a, false, remainingWallMs));
     this.deps.steering.setGateRevision(a.source.revision);
     await this.deps.notice(
       `${a.cause instanceof TransientRecoveryError && a.cause.zeroEvidenceIdle ? "No model output within the idle timeout. " : ""}Plan revision retry allowance exhausted (generation ${this.deps.generation}, source gate ${a.source.revision}, pending revision ${a.id}, ${this.limit} automatic re-drives in this flight). Feedback remains pending; no revised plan answering it has persisted. ` +
@@ -157,38 +179,41 @@ export class PlanRevisionRecovery {
     for (;;) {
       // Same-flight readoption or a delayed running report must not hide the
       // expired gate again. Retain only the captured source under the same fence.
-      await restoreSourceGate(await this.confirmSource(a));
+      await restoreSourceGate(await this.confirmSource(a, false, remainingWallMs));
       // Source probes, restoration and notices are recovery work, not owner waiting.
       // Keep the exhausted readiness if an owner extension refuses the wall park:
       // beforeTurn must re-enter this wait, never admit an uncharged reconstruction.
-      if (remainingWallMs !== undefined && remainingWallMs() <= 0) {
-        a.redriveReady = true;
-        return "wall";
-      }
-      const abort = new AbortController();
-      const signal = AbortSignal.any([this.deps.signal(), abort.signal]);
-      let verdict: PlanVerdict | undefined;
-      try {
+      this.requireRemainingWall(remainingWallMs);
+      let verdict: PlanVerdict | undefined = a.replacement;
+      if (!verdict) {
+        const abort = new AbortController();
+        const signal = AbortSignal.any([this.deps.signal(), abort.signal]);
         try {
-          observer?.(true);
-          verdict = await Promise.race([
-            this.deps.steering.awaitRevisionRecoveryEvent(a.source.revision, a.id, signal),
-            this.sleep(30_000, signal).then(() => undefined),
-          ]);
-        } finally { observer?.(false); }
-      } catch (err) {
-        this.control(a);
-        throw err;
-      } finally {
-        abort.abort(new Error("revision recovery wait tick ended"));
+          try {
+            observer?.(true);
+            verdict = await Promise.race([
+              this.deps.steering.awaitRevisionRecoveryEvent(a.source.revision, a.id, signal),
+              this.sleep(30_000, signal).then(() => undefined),
+            ]);
+          } finally { observer?.(false); }
+        } catch (err) {
+          this.control(a);
+          throw err;
+        } finally {
+          abort.abort(new Error("revision recovery wait tick ended"));
+        }
       }
       if (!verdict) continue;
       if (verdict.kind === "cancel") { this.deps.checkControl(); throw new Error("run cancelled"); }
       if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason, a.source.revision);
       if (verdict.kind !== "revise" || verdict.automatic) continue;
-      await this.confirmSource(a); // a taken J remains pending if this check cannot complete
+      // A spent wall can unwind the source probe. Keep a taken replacement so an
+      // extension resumes its proof, without taking feedback twice or losing it.
+      a.replacement = verdict;
+      await this.confirmSource(a, false, remainingWallMs);
       this.predecessors.push(a.id);
       this.accept(verdict);
+      delete a.replacement;
       if (this.active && a.cause instanceof TransientRecoveryError && a.cause.zeroEvidenceIdle) {
         // The replacement still needs a fresh epoch. Charge its first construction
         // at beforeTurn(), without retrying or restoring the exhausted predecessor.
@@ -202,12 +227,12 @@ export class PlanRevisionRecovery {
   /** Source-fenced sends retain one frozen body after unknown ACKs. A replay can
    * encounter the advanced revision it published, but cannot start provider work.
    */
-  async publish(request: StateRequest, report: Report): Promise<StateAck> {
+  async publish(request: StateRequest, report: Report, remainingWallMs?: () => number): Promise<StateAck> {
     const a = this.active;
     if (!a || request.expected_gate_revision === undefined) return report(request);
     let attempted = false;
     for (;;) {
-      await this.confirmSource(a, attempted);
+      await this.confirmSource(a, attempted, remainingWallMs);
       let ack: StateAck;
       try { attempted = true; ack = await report(request); }
       catch (err) {
@@ -217,7 +242,7 @@ export class PlanRevisionRecovery {
           throw new PlanRevisionRecoveryStoppedError("plan revision source-fence support is unavailable");
         if (err instanceof RequestError && err.status >= 400 && err.status < 500 && err.status !== 429)
           throw new PlanRevisionRecoveryStoppedError("source-fenced plan revision publication was refused");
-        await this.wait(250);
+        await this.waitForProof(remainingWallMs);
         continue;
       }
       if (ack.staleClaim || ack.staleRevisionSource)
@@ -226,7 +251,7 @@ export class PlanRevisionRecovery {
         if (request.revision_input_id !== undefined) {
           if (ack.revisionInputId !== request.revision_input_id ||
               !sameIDs(ack.supersededRevisionInputIds, request.superseded_revision_input_ids ?? [])) {
-            await this.wait(250); // receipt evidence unknown: replay only, never infer success
+            await this.waitForProof(remainingWallMs); // receipt unknown: replay only, never infer success
             continue;
           }
         } else if (ack.gateRevision !== a.source.revision) {
@@ -236,7 +261,7 @@ export class PlanRevisionRecovery {
       }
       if (ack.status !== undefined && !["running", "awaiting_approval"].includes(ack.status))
         throw new PlanRevisionRecoveryStoppedError("plan revision publication stopped at " + ack.status, ack.status);
-      await this.wait(250);
+      await this.waitForProof(remainingWallMs);
     }
   }
 
@@ -279,7 +304,18 @@ export class PlanRevisionRecovery {
     if (this.active) this.control(this.active);
   }
 
-  private async confirmSource(a: Active, replay = false): Promise<RunOwnershipResponse> {
+  private requireRemainingWall(remainingWallMs?: () => number): void {
+    if (remainingWallMs !== undefined && remainingWallMs() <= 0) throw new PlanRevisionWallSpentError();
+  }
+
+  private async waitForProof(remainingWallMs?: () => number): Promise<void> {
+    if (this.active) this.control(this.active);
+    this.requireRemainingWall(remainingWallMs);
+    await this.wait(250, remainingWallMs);
+    this.requireRemainingWall(remainingWallMs);
+  }
+
+  private async confirmSource(a: Active, replay = false, remainingWallMs?: () => number): Promise<RunOwnershipResponse> {
     for (;;) {
       this.control(a);
       let owned: RunOwnershipResponse;
@@ -288,7 +324,7 @@ export class PlanRevisionRecovery {
         this.control(a);
         if (err instanceof RequestError && err.status === 404)
           throw new PlanRevisionRecoveryStoppedError("plan revision claim is no longer owned");
-        await this.wait(250);
+        await this.waitForProof(remainingWallMs);
         continue;
       }
       this.control(a);
@@ -298,9 +334,10 @@ export class PlanRevisionRecovery {
         throw new PlanRevisionRecoveryStoppedError("plan revision recovery stopped at " + owned.status, owned.status);
       if (positive(owned.gate_revision) && owned.gate_revision !== a.source.revision && !replay)
         throw new PlanRevisionRecoveryStoppedError("plan revision source gate changed", owned.status);
+      this.requireRemainingWall(remainingWallMs);
       if (positive(owned.claim_generation) && positive(owned.gate_revision) &&
           owned.claim_released === false && ["running", "awaiting_approval"].includes(owned.status)) return owned;
-      await this.wait(250); // uncertainty grants neither a provider start nor a write
+      await this.waitForProof(remainingWallMs); // uncertainty grants neither a provider start nor a write
     }
   }
 }
