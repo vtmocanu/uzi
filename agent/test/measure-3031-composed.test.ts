@@ -408,8 +408,8 @@ function ancestryProblem(parents: ReadonlyMap<number, number>, self: number): st
   if (self === 1 || parent === 1 || (parents.get(parent) ?? 0) === 1) return undefined;
   return "the measurement is not PID 1, nor a child of PID 1, nor a child of PID 1's test runner";
 }
-function soleExecutionProblem(runner?: unknown, runId?: string): string | undefined {
-  const tree = readParents();
+function soleExecutionProblem(runner?: unknown, runId?: string, readTree: () => Map<number, number> = readParents): string | undefined {
+  const tree = readTree();
   const ancestry = ancestryProblem(tree, process.pid);
   if (ancestry) return ancestry;
   const foreign = foreignPids(tree, process.pid);
@@ -418,8 +418,8 @@ function soleExecutionProblem(runner?: unknown, runId?: string): string | undefi
 }
 
 /** The real writer exclusion; its idleness is the harness's sole-execution check, evaluated at entry. */
-function realExclusion(runner: () => unknown, runId: string, dockerHost: string): MaintenanceWriterExclusion {
-  return new MaintenanceWriterExclusion({ gate: new DindPruneGate(), isIdle: () => soleExecutionProblem(runner(), runId) === undefined,
+function realExclusion(runner: () => unknown, runId: string, dockerHost: string, readTree?: () => Map<number, number>): MaintenanceWriterExclusion {
+  return new MaintenanceWriterExclusion({ gate: new DindPruneGate(), isIdle: () => soleExecutionProblem(runner(), runId, readTree) === undefined,
     proof: scans => terminalMaintenanceProof(scans, dockerHost), log: nullLogger() });
 }
 
@@ -958,9 +958,16 @@ describe("#3031 composed measurement verdict controls", () => {
     const { evaluation, record } = await runPipeline(t, { label: "control-sole", layout: "shared", shape: "A", origin: "tiny", real: true });
     assert.equal(evaluation.verdict, "UNRUN");
     assert.match(String(record.reason), /sole execution is unverified/);
-    // The real exclusion refuses at entry on a foreign runner tail: isIdle is the harness check, not a constant.
-    const exclusion = realExclusion(() => ({ executionTails: new Map([["other-run", 1]]) }), "this-run", "http://unused.invalid");
-    assert.deepEqual(await exclusion.run(async () => "ran", () => true), { entered: false, reason: "worker_not_idle" });
+  });
+
+  it("control: with a clean process tree the real exclusion's idleness follows the runner's execution tails", async () => {
+    const clean = () => new Map([[1, 0], [process.pid, 1]]); // only this process: ancestry and foreign checks pass
+    const own = realExclusion(() => ({ executionTails: new Map([["this-run", 1]]) }), "this-run", "http://unused.invalid", clean);
+    const allowed = await own.run(async () => "ran", () => true);
+    assert.notDeepEqual(allowed, { entered: false, reason: "worker_not_idle" }, "the run's own tail is idle: the exclusion goes on to its proof");
+    const foreign = realExclusion(() => ({ executionTails: new Map([["other-run", 1]]) }), "this-run", "http://unused.invalid", clean);
+    assert.deepEqual(await foreign.run(async () => "ran", () => true), { entered: false, reason: "worker_not_idle" });
+    assert.equal(soleExecutionProblem({ executionTails: new Map() }, "this-run", clean), undefined);
   });
 
   it("control: the measurement must be PID 1 or a child of PID 1 through at most the test runner", () => {
