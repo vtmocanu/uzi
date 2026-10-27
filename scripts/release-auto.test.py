@@ -30,9 +30,9 @@ class OracleDiagnostics(unittest.TestCase):
     def fixture(self, directory):
         repo = Path(directory) / 'repo'
         repo.mkdir()
-        env = {**os.environ, 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_SYSTEM': '/dev/null'}
+        env = dict(os.environ, GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_SYSTEM='/dev/null')
         def git(*args):
-            return subprocess.check_output(['git', '-c', 'core.fsmonitor=false', *args], cwd=repo, env=env, text=True).strip()
+            return subprocess.check_output(['git', '-c', 'core.fsmonitor=false', *args], cwd=repo, env=env, text=True, timeout=120).strip()
         git('init', '-q', '-b', 'main')
         git('config', 'user.name', 'fixture')
         git('config', 'user.email', 'fixture@example.invalid')
@@ -58,7 +58,7 @@ class OracleDiagnostics(unittest.TestCase):
             repo, env, _ = self.fixture(directory)
             result = subprocess.run(['bash', str(Path(__file__).with_name('assert-changelog-covers-release.sh')),
                                      'HEAD', 'missing-baseline', '0.2.0'], cwd=repo, env=env,
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn('changelog-coverage-error', result.stderr)
 
@@ -68,7 +68,7 @@ class OracleDiagnostics(unittest.TestCase):
             result_file = Path(directory) / 'result.json'
             result = subprocess.run(['bash', str(Path(__file__).with_name('assert-changelog-covers-release.sh')),
                                      'HEAD', 'v0.1.0', '0.2.0-rc.1', '--result-file', str(result_file)],
-                                    cwd=repo, env=env, capture_output=True, text=True)
+                                    cwd=repo, env=env, capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertTrue(result_file.exists(), 'oracle did not emit its structured refusal')
             data = json.loads(result_file.read_text())
@@ -82,7 +82,7 @@ class OracleDiagnostics(unittest.TestCase):
             result_file = Path(directory) / 'result.json'
             result = subprocess.run(['bash', str(Path(__file__).with_name('assert-changelog-covers-release.sh')),
                                      'HEAD', 'missing-baseline', '0.2.0', '--result-file', str(result_file)],
-                                    cwd=repo, env=env, capture_output=True, text=True)
+                                    cwd=repo, env=env, capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 2)
             data = json.loads(result_file.read_text())
             self.assertEqual(data['reason'], 'changelog-coverage-error')
@@ -93,15 +93,15 @@ class OracleDiagnostics(unittest.TestCase):
             repo, env, _ = self.fixture(directory)
             changelog = repo / 'CHANGELOG.md'
             changelog.write_text(changelog.read_text().replace('#999', '#3486'))
-            subprocess.run(['git', '-C', str(repo), 'commit', '-qam', 'docs: cite the shipping commit'], env=env, check=True)
+            subprocess.run(['git', '-C', str(repo), 'commit', '-qam', 'docs: cite the shipping commit'], env=env, check=True, timeout=120)
             oracle = ['bash', str(Path(__file__).with_name('assert-changelog-covers-release.sh')), 'HEAD', 'v0.1.0', '0.2.0']
-            self.assertEqual(subprocess.run(oracle, cwd=repo, env=env, capture_output=True).returncode, 0)
+            self.assertEqual(subprocess.run(oracle, cwd=repo, env=env, capture_output=True, timeout=120).returncode, 0)
             target = Path(directory) / 'output-directory'
             target.mkdir()
             self.assertEqual(subprocess.run(oracle + ['--result-file', str(target)], cwd=repo, env=env,
-                                            capture_output=True).returncode, 1)
+                                            capture_output=True, timeout=120).returncode, 1)
             self.assertEqual(subprocess.run(oracle + ['--result-file', 'one', '--result-file', 'two'],
-                                            cwd=repo, env=env, capture_output=True).returncode, 2)
+                                            cwd=repo, env=env, capture_output=True, timeout=120).returncode, 2)
 
 
 def context(**changes):
@@ -380,7 +380,7 @@ class Stable(unittest.TestCase):
                 if '--result-file' in args:
                     proof = subprocess.run(['bash', str(Path(__file__).with_name('release-scripts-test.sh')),
                                             '--promotion-diagnostics-only', args[args.index('--result-file') + 1]],
-                                           capture_output=True, text=True)
+                                           capture_output=True, text=True, timeout=300)
                     self.assertEqual(proof.returncode, 0, proof.stdout + proof.stderr)
                 return rendered(plan(OP='blocked', REASON='codex-runtime-needs-local-cut')) if '--plan' in args else ''
             if args[0] != 'git':

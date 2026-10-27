@@ -711,24 +711,67 @@ Dir.mktmpdir('release-report') do |dir|
   _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => failed.to_json, 'REPORT_FAIL' => '1'), 'bash', '-e', '-c', report_script)
   assert.call(status.success?, false, 'a reporting API failure keeps the report job red')
   assert.call(err.include?('fixture reporting failure'), true, 'the failure actually came from the reporting API')
-  [[{'sha' => 'credential-sentinel', 'pr' => 3486}], [{'sha' => '1' * 40, 'pr' => true}],
-   Array.new(51) { {'sha' => '1' * 40, 'pr' => 3486} }].each do |bad_rows|
-    malformed = Marshal.load(Marshal.dump(failed))
-    malformed['prepare']['outputs']['uncited'] = bad_rows.to_json
-    malformed['prepare']['outputs']['uncited_count'] = bad_rows.length.to_json
+  # Reporting deliberately has no checkout. Pin its duplicate wire validator to
+  # the codec with the same fixtures, including valid boundary values.
+  codec_program = <<~'PY'
+    import importlib.util, json, sys
+    spec = importlib.util.spec_from_file_location('diagnostics', sys.argv[1])
+    codec = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(codec)
+    try:
+        codec.validate(json.loads(sys.argv[2]))
+    except (TypeError, ValueError):
+        print('false')
+    else:
+        print('true')
+  PY
+  row = {'sha' => '1' * 40, 'pr' => 3486}
+  rows50 = Array.new(50) { row }
+  identity_cases = [
+    ['one identity', [row], 1, false, true],
+    ['SHA alone', [row.merge('pr' => nil)], 1, false, true],
+    ['largest PR', [row.merge('pr' => 2**53 - 1)], 1, false, true],
+    ['50 identities', rows50, 50, false, true],
+    ['truncated identities', rows50, 51, true, true],
+    ['empty collection', [], 0, false, true],
+    ['uncollected', nil, nil, false, true],
+    ['private SHA', [row.merge('sha' => 'credential-sentinel')], 1, false, false],
+    ['uppercase SHA', [row.merge('sha' => 'A' * 40)], 1, false, false],
+    ['short SHA', [row.merge('sha' => '1' * 39)], 1, false, false],
+    ['boolean PR', [row.merge('pr' => true)], 1, false, false],
+    ['zero PR', [row.merge('pr' => 0)], 1, false, false],
+    ['negative PR', [row.merge('pr' => -1)], 1, false, false],
+    ['oversized PR', [row.merge('pr' => 2**53)], 1, false, false],
+    ['string PR', [row.merge('pr' => '3486')], 1, false, false],
+    ['extra identity field', [row.merge('prose' => 'unexpected')], 1, false, false],
+    ['51 identities', Array.new(51) { row }, 51, false, false],
+    ['boolean count', [row], true, false, false],
+    ['count below collection', [row], 0, false, false],
+    ['oversized count', [row], 2**53, true, false],
+    ['missing truncation flag', [row], 2, false, false],
+    ['false truncation claim', [row], 1, true, false],
+    ['uncollected count', nil, 1, false, false],
+    ['uncollected truncation', nil, nil, true, false]
+  ]
+  identity_cases.each do |label, rows, count, truncated, expected|
+    diagnostic = {'schema' => 1, 'stage' => 'changelog-coverage', 'reason' => 'changelog-coverage-refused',
+                  'planned_tag' => 'v0.2.0-rc.11', 'uncited' => rows,
+                  'uncited_count' => count, 'uncited_truncated' => truncated}
+    stdout, err, codec_status = Open3.capture3('python3', '-I', '-',
+                                             File.join(root, 'scripts/lib/release-diagnostics.py'),
+                                             diagnostic.to_json, stdin_data: codec_program)
+    assert.call(codec_status.success?, true, "#{label}: codec instrument succeeds: #{err}")
+    codec_accepts = JSON.parse(stdout)
+    incident = Marshal.load(Marshal.dump(failed))
+    %w[uncited uncited_count uncited_truncated].each do |field|
+      incident['prepare']['outputs'][field] = diagnostic.fetch(field).to_json
+    end
     FileUtils.rm_f(environment.fetch('REPORT_CALLS'))
-    _, _, status = Open3.capture3(environment.merge('NEEDS_JSON' => malformed.to_json), 'bash', '-e', '-c', report_script)
-    assert.call(status.success?, false, 'invalid diagnostic identities are refused')
-    assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, 'invalid identities never reach the issue API')
-  end
-  [{'uncited_count' => 'true'}, {'uncited_count' => '0'}, {'uncited_truncated' => 'true'},
-   {'uncited' => 'null', 'uncited_count' => '1'}].each do |changes|
-    malformed = Marshal.load(Marshal.dump(failed))
-    malformed['prepare']['outputs'].merge!(changes)
-    FileUtils.rm_f(environment.fetch('REPORT_CALLS'))
-    _, _, status = Open3.capture3(environment.merge('NEEDS_JSON' => malformed.to_json), 'bash', '-e', '-c', report_script)
-    assert.call(status.success?, false, 'inconsistent diagnostic collection status is refused')
-    assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, 'inconsistent counts never reach the issue API')
+    _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => incident.to_json), 'bash', '-e', '-c', report_script)
+    assert.call(status.success?, codec_accepts, "#{label}: report/codec identity parity")
+    assert.call(codec_accepts, expected, "#{label}: codec identity verdict")
+    assert.call(status.success?, expected, "#{label}: report identity verdict: #{err}")
+    assert.call(File.exist?(environment.fetch('REPORT_CALLS')), expected, "#{label}: only valid identities reach the issue API")
   end
 end
 puts "ci-safe-paths: #{checks} assertions passed"
