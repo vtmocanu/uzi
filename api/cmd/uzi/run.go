@@ -479,14 +479,14 @@ func gateRevisionMismatchError(runID string, expected *int64, current int64) err
 // action took effect immediately rather than being queued. expectedGateRevision binds a
 // plan-gate verdict to a gate revision (PRD #1795 D5; nil for every other kind).
 func submitInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64) error {
-	return submitBoundInput(env, gf, c, cmd, runID, kind, body, sel, discardPendingOutcome, expectedGateRevision, nil)
+	return submitBoundInput(env, gf, c, cmd, runID, kind, body, sel, discardPendingOutcome, false, expectedGateRevision, nil)
 }
 
-func submitBoundInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64, approval *apitypes.SemanticGateApproval) error {
+func submitBoundInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome, overrideCapabilities bool, expectedGateRevision *int64, approval *apitypes.SemanticGateApproval) error {
 	var res apitypes.RunInputResponse
 	var err error
-	if approval != nil {
-		res, err = c.SubmitRunInputWithOptions(cmd.Context(), runID, apitypes.RunInputRequest{Kind: kind, Body: body, Selection: sel, ExpectedGateRevision: expectedGateRevision, SemanticApproval: approval})
+	if approval != nil || overrideCapabilities {
+		res, err = c.SubmitRunInputWithOptions(cmd.Context(), runID, apitypes.RunInputRequest{Kind: kind, Body: body, Selection: sel, DiscardPendingOutcome: discardPendingOutcome, OverrideCapabilities: overrideCapabilities, ExpectedGateRevision: expectedGateRevision, SemanticApproval: approval})
 	} else {
 		res, err = c.SubmitRunInput(cmd.Context(), runID, kind, body, sel, discardPendingOutcome, expectedGateRevision)
 	}

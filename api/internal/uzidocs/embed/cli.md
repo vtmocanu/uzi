@@ -138,6 +138,7 @@ uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--planned-commit <sha>] [--require-base] [--force]
                 [--harness claude|codex]
 uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
+                [--override-capabilities]
                 [--expected-gate-revision <n>]
                 [--reset-milestones --reason <text> --expected-reset-state-digest <digest>
                  --expected-completion-revision <N|null>]
@@ -334,6 +335,11 @@ A few worth knowing:
   empty or invalid. See [Repo agents](repo-agents.md#which-folder-is-read).
   `run create --plan-file` takes the same two flags, for the seeded run's
   roster.
+- **`run approve <id> --override-capabilities`** clears this run's required
+  capabilities and approves even when its assigned worker cannot satisfy them.
+  Use it only when the plan can proceed without those capabilities. It does not
+  change the repo's capability hints or grant the worker new capabilities;
+  runtime guardrails still apply. Without the flag, capability checks stay active.
 - **`run revise <id> -m "<feedback>"`** steers a plan at the approval gate
   without stopping the run: the agent re-plans from your feedback and returns
   to `awaiting_approval` for another decision, where `run reject` instead ends
