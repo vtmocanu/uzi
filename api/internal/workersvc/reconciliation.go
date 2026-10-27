@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -25,6 +26,7 @@ type LeadReconciliation struct {
 }
 
 type StateReportResult struct {
+	PolicyRevisionGate          json.RawMessage                       `json:"-"`
 	RevisionInputID             *int64                                `json:"-"`
 	SupersededRevisionInputIDs  []int64                               `json:"-"`
 	CompletedPublicationReceipt *apitypes.CompletedPublicationReceipt `json:"-"`
@@ -104,7 +106,7 @@ func (s *Service) SetStateReportWithReconciliation(ctx context.Context, worker s
 		}
 		return result, err
 	}
-	run, applied, err := s.setState(ctx, worker, runID, req, &result.GateRevision, &result.Reconciliation)
+	run, applied, err := s.setState(ctx, worker, runID, req, &result.GateRevision, &result.Reconciliation, &result.PolicyRevisionGate)
 	if err != nil {
 		return StateReportResult{Run: run}, err
 	}

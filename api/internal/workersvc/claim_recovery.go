@@ -44,8 +44,9 @@ func (e *codexMintedClaimError) Error() string { return e.cause.Error() }
 func (e *codexMintedClaimError) Unwrap() error { return e.cause }
 
 type claimRecoveryIdentity struct {
-	workerID        uuid.UUID
-	recoveryCapable bool
+	workerID                 uuid.UUID
+	recoveryCapable          bool
+	policyRevisionProjection bool
 }
 
 // claimFinishQueries is the statement surface of finishRunClaim's exact-claim transaction.
@@ -147,7 +148,8 @@ func (s *Service) assembleAndFinishRunClaim(ctx context.Context, wkr store.Worke
 		h.afterAssembly(ctx, run, payload, err)
 	}
 	return s.finishRunClaim(ctx, run, payload, err,
-		claimRecoveryIdentity{workerID: wkr.ID, recoveryCapable: recoveryCapable})
+		claimRecoveryIdentity{workerID: wkr.ID, recoveryCapable: recoveryCapable,
+			policyRevisionProjection: s.policyRevisionProjectionNegotiated(wkr)})
 }
 
 // finishRunClaim checks even successful payloads against the exact mint and current
@@ -392,6 +394,16 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		}
 	}
 	if decision == nil {
+		if payload != nil {
+			// Replace any assembly value only under the final owned claim lock.
+			payload.PolicyRevisionGate = nil
+			if identity.policyRevisionProjection {
+				payload.PolicyRevisionGate, err = policyRevisionGateProjection(ctx, q, locked)
+				if err != nil {
+					return nil, "", err
+				}
+			}
+		}
 		if locked.Kind == runkind.Task && len(locked.CheckpointCoordinates) > 0 && payload != nil {
 			live, ok := q.(pgxClaimFinishTx)
 			if !ok {

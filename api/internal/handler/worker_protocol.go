@@ -1565,20 +1565,28 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			ack["semantic_approval"] = approval
 		}
 	}
+	httpx.JSON(w, http.StatusOK, workerStateReportAck(ack, result))
+}
+
+// workerStateReportAck encodes projections returned by the committed report.
+func workerStateReportAck(ack map[string]any, result workersvc.StateReportResult) any {
+	if len(result.PolicyRevisionGate) > 0 {
+		ack["policy_revision_gate"] = result.PolicyRevisionGate
+	}
 	if result.Reconciliation != nil {
 		var supersededIDs *[]int64
 		if result.RevisionInputID != nil {
 			ids := append([]int64{}, result.SupersededRevisionInputIDs...)
 			supersededIDs = &ids
 		}
-		httpx.JSON(w, http.StatusOK, workerReconciledStateAck{
-			RevisionInputID: result.RevisionInputID, SupersededRevisionInputIDs: supersededIDs,
+		return workerReconciledStateAck{
+			PolicyRevisionGate: result.PolicyRevisionGate,
+			RevisionInputID:    result.RevisionInputID, SupersededRevisionInputIDs: supersededIDs,
 			Run: ack["run"], CredentialSwitch: ack["credential_switch"], Disposition: ack["disposition"],
 			leadReconciliationResponse: reconciliationResponse(0, result.Reconciliation),
-		})
-		return
+		}
 	}
-	httpx.JSON(w, http.StatusOK, ack)
+	return ack
 }
 
 // workerStateAck builds the state-report ack body: the run DTO plus, when a held-state switch is

@@ -282,6 +282,9 @@ type ClaimPayload struct {
 	// gate candidate. A pointer preserves an explicitly frozen empty list.
 	ExecutionMilestones *[]Milestone `json:"execution_milestones,omitempty"`
 
+	// Absent is unknown; null is verified no-gate; an object binds the verified gate.
+	PolicyRevisionGate json.RawMessage `json:"policy_revision_gate,omitempty"`
+
 	// TargetRunID is the run a JUDGE run reviews (PRD #46 Decision 1). Present only
 	// for kind=judge (omitted otherwise). The judge fetches that run's trace through
 	// the Bearer worker trace endpoint (M3); the claim itself stays small and carries
