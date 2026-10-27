@@ -179,17 +179,21 @@ reasoning.
 
 For the seed admin, after first boot:
 
-1. Change the seed admin's password (this rewraps the DEK). Until a
-   change-password endpoint exists, re-register or rotate out of the seeded
-   account. **Note:** once a change-password flow lands, a stale `UZI_SEED_PASSWORD`
-   left in the environment would make the next boot-unlock fail — and boot-unlock
-   is fatal when seeding is configured. Remove `UZI_SEED_*` after the account is
-   self-sufficient.
-2. Rotate `UZI_SEED_ANTHROPIC_TOKEN` (it was readable from the env) and re-save it
-   through the UI so it is DEK-sealed under the changed password. See
-   [anthropic-token.md](anthropic-token.md).
-3. Remove `UZI_SEED_PASSWORD` and `UZI_SEED_ANTHROPIC_TOKEN` from the deployed
-   environment.
+1. Confirm **Protect my credentials with my password (vault)** is On in
+   Settings; enable it if the account is Off, then confirm the protected vault
+   is unlocked. Fresh seed accounts start Off, so re-saving a token alone does
+   not add password protection. Use a strong account password: this feature
+   adds no change-password endpoint, and re-registering does not rewrap an
+   existing account's DEK. Protected accounts unlock with their current password.
+2. Rotate `UZI_SEED_ANTHROPIC_TOKEN` (it was readable from the env) and save the
+   replacement only after confirming protected/unlocked status. That save is
+   DEK-sealed under the protected vault. If the account remains Off, the
+   replacement remains server-key-sealed and does not meet this hardening
+   objective. See [Vault choice](anthropic-token.md#vault-choice).
+3. Once the account and credentials are self-sufficient, remove `UZI_SEED_*`
+   (including `UZI_SEED_PASSWORD` and `UZI_SEED_ANTHROPIC_TOKEN`) from the
+   deployed environment. This stops seed boot-unlock; a protected account
+   then needs an interactive unlock after a restart.
 
 ## Rollout note
 

@@ -558,9 +558,11 @@ enabling: rotate them to address that exposure.
   token is a bearer credential, and if it could mint or replace Anthropic
   credentials, a stolen one could swap out your account's credentials rather
   than merely read their names. See [the CLI guide](./cli.md#anthropic-tokens).
-- **Key rotation resets everything.** If an operator rotates the server's
-  master key, every stored token (yours included) must be re-pasted; see
-  [configuration.md](./configuration.md).
+- **Master-key rotation affects server-key-sealed material.** Off tokens,
+  legacy master-sealed rows and server-key-sealed Codex recovery copies become
+  unreadable when that key is replaced. Protected tokens already sealed under
+  a DEK remain decryptable with their password-wrapped key; replacing the
+  server key alone does not invalidate them. See [Vault choice](#vault-choice).
 - **Which model runs against it?** See [Worker model](./worker-model.md),
   further down the Settings page, to pick or override the Claude model your
   runs use.
