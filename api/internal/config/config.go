@@ -506,6 +506,10 @@ type Config struct {
 	RunRecoveryParkBase time.Duration // first recovery park's wait; doubles per prior park
 	RunRecoveryMaxPark  time.Duration // ceiling on one recovery park's backoff
 
+	// RunRetainedRecoveryMaxParks bounds automatic budget-exhaustion renewals only.
+	// RUN_RETAINED_RECOVERY_MAX_PARKS defaults to 3; zero holds for the owner immediately.
+	RunRetainedRecoveryMaxParks int
+
 	// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2). A transient forge failure at
 	// clone parks the run in 'recovery_wait' with recovery_wait_cause='forge_unreachable';
 	// forge_park_count is its FORGE-ONLY lifetime counter (distinct from the backoff-shaping
@@ -1242,6 +1246,7 @@ func Load() (Config, error) {
 	// value silently falls back to the default (like RUN_LIMIT_MAX_PARK): these shape the
 	// auto-promote cadence and have no off switch — there is no "never recover" mode.
 	cfg.RunRecoveryParkBase = parseDuration("RUN_RECOVERY_PARK_BASE", time.Minute)
+	cfg.RunRetainedRecoveryMaxParks = parseNonNegInt("RUN_RETAINED_RECOVERY_MAX_PARKS", 3)
 	cfg.RunRecoveryMaxPark = parseDuration("RUN_RECOVERY_MAX_PARK", 30*time.Minute)
 
 	// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2). parseNonNegInt, so

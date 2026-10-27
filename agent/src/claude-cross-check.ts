@@ -17,6 +17,7 @@
 // kill on abort) with a full-replacement env.
 
 import path from "node:path";
+import { CODE_COVERAGE_LIMITS } from "./code-cross-check-coverage.js";
 import type { ActivitySettle, CheckActivityRecorder } from "./cross-check-activity.js";
 import type { EffortLevel, HookInput, HookJSONOutput, Options as SdkOptions, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 
@@ -486,7 +487,7 @@ export class ClaudeCrossCheck {
       }
       if (isErrorResult(resultFrame)) throw new Error("cross-check model error");
       const text = resultFrame["result"];
-      if (typeof text !== "string" || Buffer.byteLength(text) > MAX_VERDICT_BYTES) {
+      if (typeof text !== "string" || Buffer.byteLength(text) > (code ? CODE_COVERAGE_LIMITS.verdictBytes : MAX_VERDICT_BYTES)) {
         throw new CrossCheckMalformedError("cross-check requires one bounded complete verdict", "result_cap");
       }
       if (code) validateCodeFindings(text);

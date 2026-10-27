@@ -136,3 +136,16 @@ describe("IssueCard — CI auto-fix halted marker (#1650 D3a)", () => {
     expect(screen.queryByRole("img", { name: /^Autofix stopped/ })).toBeNull();
   });
 });
+
+
+it.each([["rate_limit", "a rate limit"], ["overload", "overload"]] as const)("Codex admission board card shows %s spread", (cls, words) => {
+  const at = new Date(Date.now() + 60_037).toISOString();
+  renderCard({ latest_run: {
+    id: "held", status: "queued", health: "waiting_worker", health_since: null,
+    health_reason: null, codex_admission_class: cls, codex_admission_eligible_at: at,
+    created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    mr_iid: null, mr_web_url: null, mr_state: null, failure_reason: null,
+    stop_kind: null, stop_reason: null, fail_origin: null, owner_name: "Demo", worker_name: null, is_mine: true, run_count: 1,
+  } });
+  expect(screen.getByText(`waiting: provider reported ${words}; account admission eligible after ${at}`)).toBeTruthy();
+});

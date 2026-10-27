@@ -56,6 +56,7 @@ type seedRun struct {
 	gen                 int
 	autoApprove         bool
 	target              uuid.UUID // lead run of a cross_check child
+	retryIn             string    // recovery_retry_not_before offset from now(), e.g. "1 minute"; "" = NULL
 }
 
 func (f *readoutFixture) run(s seedRun) uuid.UUID {
@@ -79,6 +80,9 @@ func (f *readoutFixture) run(s seedRun) uuid.UUID {
 		 auto_approve,recovery_wait_cause,status_since)
 		VALUES ($1,$2,$3,$4,$5,'t','d',$6,$7,$8,$9,$10, now() - interval '1 year' + $11 * interval '1 second')`,
 		id, f.userID, f.repoID, insertKind, f.nextIID(), s.status, worker, s.gen, s.autoApprove, cause, f.n)
+	if s.retryIn != "" {
+		mustExec(f.ctx, f.t, f.pool, `UPDATE runs SET recovery_retry_not_before=now() + $2::interval WHERE id=$1`, id, s.retryIn)
+	}
 	switch s.kind {
 	case "cross_check":
 		mustExec(f.ctx, f.t, f.pool, `UPDATE runs SET kind='cross_check',issue_iid=NULL,target_run_id=$2,harness='claude',
@@ -159,6 +163,9 @@ func TestMaintenanceReadoutPartitionLiveDB(t *testing.T) {
 	add(seedRun{status: "recovery_wait", cause: "worker_requeue_exhausted"}, "held", "needs_owner")
 	add(seedRun{status: "recovery_wait", cause: "worker_memory_pressure"}, "held", "needs_owner")
 	add(seedRun{status: "recovery_wait", cause: "forge_unreachable"}, "held", "progressing")
+	add(seedRun{status: "recovery_wait", cause: "retained_recovery_exhausted"}, "held", "needs_owner")
+	add(seedRun{status: "recovery_wait", cause: "retained_recovery_exhausted", retryIn: "1 minute"}, "held", "progressing")
+	add(seedRun{status: "recovery_wait", cause: "retained_recovery_exhausted", retryIn: "-1 minute"}, "held", "progressing")
 	add(seedRun{status: "recovery_wait"}, "held", "progressing")
 	for _, terminal := range []string{"completed", "failed", "cancelled"} {
 		f.run(seedRun{status: terminal, gen: 1}) // in no section

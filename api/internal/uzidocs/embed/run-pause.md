@@ -11,7 +11,8 @@ because it's an inconvenient time to keep spending — and pick it back up
 later from its preserved session or published checkpoint. No model turns run
 while it is paused. The run's lead can also request an ordinary pause while
 waiting on a dependency during approved issue implementation. Both wait for
-owner resume. System holds also use `paused`, with their own next steps.
+owner resume. System holds also use `paused`, with their own next steps, such
+as the [weekly usage reserve](#paused-by-the-weekly-usage-reserve).
 
 ## Reading the pause label
 
@@ -164,6 +165,71 @@ hold. Losing the worker's storage can lose unpublished work; another worker
 needs published work or an available verified recovery copy. See
 [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)
 for progress resets, detection timing and compatibility.
+
+## Paused by the weekly usage reserve
+
+If you set a [weekly usage reserve](rate-limits.md#weekly-usage-reserve) with
+**Also pause running runs** on (the default once a threshold is set), uzi can
+pause a running run for you when the credential it spends reads at or above
+your threshold on the 7-day window. This is a system pause with its own cause,
+not one you or the run's lead asked for: the pending request has
+`pause_mode: reserve` and the parked run has `status: paused` with
+`hold_reason: weekly_reserve`. To the worker it is an ordinary milestone pause.
+
+- **Which runs pause.** Running, non-interactive issue, task, prompt and
+  self-improve runs, the same kinds you can pause by hand. Other kinds (CI-fix,
+  MR-rework, job, judge, cross-check, interactive tasks) are held at admission
+  only, and one already running finishes.
+- **When.** Only a fresh reading at or above the threshold on the credential the
+  run recorded as spending requests a pause. A missing, stale or partial
+  reading holds *new* work but never pauses a running one, and a run with no
+  recorded credential is left alone. The run finishes its current milestone
+  (or the current step, with no frozen milestones), checkpoints, then parks.
+  `uzi run get` shows the pending request as `PAUSE_REQUESTED  after M3 (weekly
+  usage reserve)`. A pending pause you or the wall clock
+  requested is never overwritten by the reserve. If the checkpoint fails, the
+  run keeps going and the reserve asks again at the next boundary.
+- **It releases itself.** The sweeper resumes a `weekly_reserve` pause when a
+  fresh reading is below the threshold, and on its next pass whenever you clear
+  the threshold or turn **Also pause running runs** off, whatever the freshness
+  of any reading. Resuming this way keeps the run's remaining budget exactly as
+  an owner resume does. The same three conditions withdraw a request that has
+  not parked yet. The sweeper never releases an owner pause, a wall park, a
+  usage-limit wait or any other hold.
+- **Resuming by hand overrides the reserve.** `uzi run resume <id>` (or
+  **Resume** on the run page) on a `weekly_reserve` pause queues the run
+  immediately and records an override for the credential it spent, so it is not
+  held again at admission and does not re-pause at once. The override ends at
+  the first of: the observed 7-day reset time (read from your current meter when
+  you resume, if that reading is fresh and at or above the threshold); a later
+  reading that shows the week reset early; or, when no such reset time was
+  recorded, the first fresh reading below the threshold. It
+  never lasts longer than seven days. Its end time is the run's
+  `reserve_exempt_until`. If you have already cleared the threshold there is
+  nothing to override, and a plain resume applies. A resume that is not of a
+  reserve pause records no override. A run that spans a reset is protected
+  again in the following week.
+- **You cannot cancel a reserve request.** `uzi run pause <id> --cancel`
+  on a request the reserve filed is refused with a 409:
+  raise or clear the threshold in your usage settings to withdraw it, or resume
+  the run once it pauses.
+- **Your own pause wins.** Requesting a pause yourself (after the milestone, or
+  **Pause now**) while a reserve request is pending replaces it with yours.
+  The run then parks as an ordinary owner pause and waits for you. The run's
+  lead parking over a pending reserve request does the same: it becomes an
+  ordinary pause that needs an owner decision, and the reserve does not release
+  it or ask again.
+- **With the toggle off, started runs continue.** Turning **Also pause running
+  runs** off releases reserve pauses and lets previously started runs continue
+  above the threshold; new work stays held.
+- **Rolling back.** Reserve-paused runs are released only by this version's
+  sweeper. After a downgrade, resume them by hand; nothing releases them
+  automatically. The schema rollback also refuses to run while any run still
+  holds a pending `reserve` pause request, so resume or drain those first.
+
+The reserve is best effort, not a cap; see [what it does not
+guarantee](rate-limits.md#it-is-best-effort). Slack pause notices for a reserve
+pause name the weekly usage reserve rather than an owner pause.
 
 ## Not the same as a completion hold
 

@@ -260,6 +260,9 @@ describe("Dashboard — the recent-run title carries no format characters (#124)
       await new Promise((r) => setTimeout(r, 0));
     });
     expect(screen.getByText("Active runs")).toBeTruthy();
+    const repoTile = screen.getByText("enabled repos").closest("a")!;
+    expect(within(repoTile).getByText("Repos")).toBeTruthy();
+    expect(repoTile.getAttribute("href")).toBe("/repos");
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
     expect(screen.getByText("Fix the parser bug")).toBeTruthy();
   });

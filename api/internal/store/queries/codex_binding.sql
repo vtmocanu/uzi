@@ -690,9 +690,9 @@ WHERE id = @id AND user_id = @user_id
 FOR UPDATE;
 
 -- name: LockRotatingCodexRefreshIntent :one
--- Step 2 of the provider-rejection primitive (issue #1594): row-lock the rejecting operation's
--- intent, ONLY IF it is still 'rotating' from the same generation on the same account. Taken
--- AFTER LockCodexAccountForRejection (account row first, then the intent). pgx.ErrNoRows means the
+-- Step 2 of provider rejection and the final row lock for refresh-reuse admission:
+-- lock the operation's intent ONLY IF it is still 'rotating' from the same generation
+-- on the same account. Taken AFTER the account lock in both paths. pgx.ErrNoRows means the
 -- intent already moved (committed/reconciled/unrecoverable) and the caller applies nothing.
 -- Owner-scoped.
 SELECT operation_id FROM codex_refresh_intent
@@ -789,20 +789,120 @@ WHERE operation_id = @operation_id AND user_id = @user_id;
 -- still 'rotating' AND the account is still at the generation the verdict was computed from AND
 -- the account is NOT a live in-progress lease-holder of THIS intent's op — so a concurrently
 -- committed intent, a generation that advanced under us, or a genuinely live in-flight op is
--- never overwritten. Owner-scoped; the owning-op writes stay on the unconditional
--- SetCodexRefreshIntentState. 0 rows means the guard rejected the stale write.
+-- never overwritten. Owner-scoped; original owning-op writes use
+-- SetCodexRefreshIntentState, while admitted reuse has its own terminal fence.
+-- 0 rows means the guard rejected the stale write.
+-- Lock the account before the intent, serializing restore/lease changes with resolution.
+WITH locked_account AS MATERIALIZED (
+    SELECT a.* FROM codex_provider_account a
+    WHERE a.user_id = sqlc.arg('user_id') AND a.id = (
+        SELECT i.provider_account_id FROM codex_refresh_intent i
+        WHERE i.operation_id = sqlc.arg('operation_id') AND i.user_id = sqlc.arg('user_id')
+    )
+    FOR UPDATE
+)
 UPDATE codex_refresh_intent cri
-SET state = @state, updated_at = now()
-WHERE cri.operation_id = @operation_id AND cri.user_id = @user_id
+SET state = sqlc.arg('state')::text, updated_at = now()
+WHERE cri.operation_id = sqlc.arg('operation_id') AND cri.user_id = sqlc.arg('user_id')
   AND cri.state = 'rotating'
   AND EXISTS (
-      SELECT 1 FROM codex_provider_account cpa
+      SELECT 1 FROM locked_account cpa
       WHERE cpa.id = cri.provider_account_id AND cpa.user_id = cri.user_id
-        AND cpa.generation = @expected_generation::bigint
+        AND cpa.generation = sqlc.arg('expected_generation')::bigint
+        AND (
+            cri.provider_error_at IS NULL
+            OR (
+                sqlc.arg('state')::text = 'reconciled'
+                AND (cpa.generation > cri.from_generation
+                     OR (cpa.recovery_sealed IS NOT NULL
+                         AND cpa.recovery_generation = cpa.generation
+                         AND cpa.generation = cri.from_generation))
+            )
+            OR (
+                sqlc.arg('state')::text = 'unrecoverable'
+                AND cpa.generation = cri.from_generation
+                AND NOT (cpa.recovery_sealed IS NOT NULL
+                         AND cpa.recovery_generation = cpa.generation)
+                AND NOT (
+                    (cri.reuse_attempted_at IS NULL
+                     AND cri.created_at > now() - interval '30 minutes')
+                    OR (cri.reuse_attempted_at IS NOT NULL
+                        AND cri.reuse_attempted_at > now() - (sqlc.arg('reuse_in_flight_microseconds')::bigint * interval '1 microsecond'))
+                )
+            )
+        )
         AND NOT (cpa.coord_state = 'in_progress'
                  AND cpa.coord_operation_id = cri.operation_id
                  AND cpa.lease_deadline IS NOT NULL
-                 AND cpa.lease_deadline > @now::timestamptz)
+                 AND cpa.lease_deadline > now())
+  );
+
+-- name: SetCodexRefreshReuseUnrecoverable :execrows
+-- Only the admitted survivor may terminate its still-current rotating retry.
+-- Lock account before intent, as admission, rejection and resolution do. An owner
+-- restore, a reconciled intent or surviving recovery material wins over a late error.
+WITH locked_account AS MATERIALIZED (
+    SELECT a.* FROM codex_provider_account a
+    WHERE a.id = sqlc.arg('account_id') AND a.user_id = sqlc.arg('user_id')
+    FOR UPDATE
+)
+UPDATE codex_refresh_intent i
+SET state = 'unrecoverable', updated_at = now()
+WHERE i.operation_id = sqlc.arg('operation_id') AND i.user_id = sqlc.arg('user_id')
+  AND i.provider_account_id = sqlc.arg('account_id')
+  AND i.from_generation = sqlc.arg('from_generation')::bigint
+  AND i.state = 'rotating' AND i.provider_error_at IS NOT NULL
+  AND i.reuse_attempted_at IS NOT NULL
+  AND EXISTS (
+      SELECT 1 FROM locked_account a
+      WHERE a.id = i.provider_account_id AND a.user_id = i.user_id
+        AND a.coord_state = 'quarantined' AND a.coord_operation_id = i.operation_id
+        AND a.generation = i.from_generation AND a.recovery_sealed IS NULL
+        AND NOT a.reauth_required
+  );
+
+-- name: RecordCodexRefreshProviderError :execrows
+-- Last write of an ambiguous provider exchange. No retry is consumed here.
+UPDATE codex_refresh_intent i
+SET provider_error_at = now(), updated_at = now()
+WHERE i.operation_id = @operation_id AND i.user_id = @user_id
+  AND i.provider_account_id = @account_id AND i.from_generation = @from_generation::bigint
+  AND i.state = 'rotating' AND i.provider_error_at IS NULL AND i.reuse_attempted_at IS NULL
+  AND EXISTS (
+      SELECT 1 FROM codex_provider_account a
+      WHERE a.id = i.provider_account_id AND a.user_id = i.user_id
+        AND a.generation = i.from_generation AND a.coord_operation_id = i.operation_id
+  );
+
+-- name: LockCodexRefreshReuseAccount :one
+-- Called only after LockSecretMutation, before locking/updating an intent.
+SELECT * FROM codex_provider_account
+WHERE id = @account_id AND user_id = @user_id
+FOR UPDATE;
+
+-- name: ConsumeCodexRefreshReuse :execrows
+-- User mutation, account and intent locks are held by AdmitCodexRefreshReuse.
+-- admitted_at is LeaseClockNow's fresh DB instant sampled AFTER all those locks,
+-- not transaction-start now(): lock waits must not extend eligibility or backdate reuse.
+UPDATE codex_refresh_intent i
+SET reuse_attempted_at = sqlc.arg('admitted_at')::timestamptz,
+    updated_at = sqlc.arg('admitted_at')::timestamptz
+WHERE i.operation_id = @operation_id AND i.user_id = @user_id
+  AND i.provider_account_id = @account_id AND i.from_generation = @from_generation::bigint
+  AND i.state = 'rotating' AND i.provider_error_at IS NOT NULL
+  AND i.reuse_attempted_at IS NULL AND i.created_at > sqlc.arg('admitted_at')::timestamptz - interval '30 minutes'
+  AND EXISTS (
+      SELECT 1 FROM codex_provider_account a
+      WHERE a.id = i.provider_account_id AND a.user_id = i.user_id
+        AND a.coord_state = 'quarantined' AND a.coord_operation_id = i.operation_id
+        AND a.generation = i.from_generation AND a.recovery_sealed IS NULL
+        AND NOT a.reauth_required
+        AND EXISTS (
+            SELECT 1 FROM codex_credential_state s
+            JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+            WHERE s.user_id = a.user_id AND s.provider_account_id = a.id
+              AND s.status = 'linked' AND us.disabled_at IS NULL
+        )
   );
 
 -- name: ListUnresolvedCodexRefreshIntents :many
@@ -944,7 +1044,29 @@ SELECT
     COALESCE(length(cpa.recovery_sealed) > 0
              AND cpa.recovery_generation = cpa.generation, false)::boolean AS recovery_at_generation,
     cpa.lease_deadline,
-    cpa.reauth_required
+    cpa.reauth_required,
+    EXISTS (
+        SELECT 1 FROM codex_refresh_intent cri
+        WHERE cri.user_id = cpa.user_id AND cri.provider_account_id = cpa.id
+          AND cri.state = 'rotating' AND cri.provider_error_at IS NOT NULL
+          AND cri.operation_id = cpa.coord_operation_id
+          AND cri.from_generation = cpa.generation
+          AND cpa.coord_state = 'quarantined' AND cpa.recovery_sealed IS NULL
+          AND NOT cpa.reauth_required
+          AND (
+              (cri.reuse_attempted_at IS NULL
+               AND cri.created_at > now() - interval '30 minutes'
+               AND EXISTS (
+                   SELECT 1 FROM codex_credential_state s
+                   JOIN user_secrets enabled_alias
+                     ON enabled_alias.id = s.user_secret_id AND enabled_alias.user_id = s.user_id
+                   WHERE s.user_id = cpa.user_id AND s.provider_account_id = cpa.id
+                     AND s.status = 'linked' AND enabled_alias.disabled_at IS NULL
+               ))
+              OR (cri.reuse_attempted_at IS NOT NULL
+                  AND cri.reuse_attempted_at > now() - (sqlc.arg('reuse_in_flight_microseconds')::bigint * interval '1 microsecond'))
+          )
+    )::boolean AS retry_pending
 FROM runs r
 LEFT JOIN user_secrets us
     ON us.id = r.codex_secret_id AND us.user_id = r.user_id

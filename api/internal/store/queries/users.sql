@@ -67,6 +67,20 @@ RETURNING *;
 UPDATE users SET notify_early_limit_reset = $2 WHERE id = $1
 RETURNING *;
 
+-- name: GetUserUsageReserve :one
+-- The user's weekly usage reserve (PRD #3522): weekly_reserve_pct is the 7-day utilization
+-- percent at which uzi stops spending the user's subscription (NULL = off), and
+-- weekly_reserve_pause_running says whether a running run is also paused. The narrow read the
+-- claim path and the sweeper use, so they need not load the whole users row.
+SELECT weekly_reserve_pct, weekly_reserve_pause_running FROM users WHERE id = $1;
+
+-- name: SetUserUsageReserve :one
+-- Set both reserve fields together (PRD #3522); the API requires both, so a write is never a
+-- partial update. A NULL threshold turns the reserve off. Returns the whole row, like the
+-- other per-user toggles, so the handler answers with the updated user envelope.
+UPDATE users SET weekly_reserve_pct = $2, weekly_reserve_pause_running = $3 WHERE id = $1
+RETURNING *;
+
 -- name: SetUserJudgeEnabled :one
 -- Flip a user's run-retrospective opt-in (PRD #46 Decision 7). Per-user consent to
 -- spend the user's own Anthropic tokens judging every finished run; default false.
@@ -273,7 +287,9 @@ RETURNING summary_model;
 -- default_claude_model and default_codex_model (PRD #1551 M1 / D2) ride it too — the retained
 -- per-harness worker-model lanes; each NULL means "inherit". The settings surface exposes both
 -- lanes, and projects the deprecated default_model from the effective harness's lane.
-SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled FROM users WHERE id = $1;
+-- weekly_reserve_pct and weekly_reserve_pause_running (PRD #3522) ride it too: the weekly
+-- usage reserve, NULL threshold = off.
+SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running FROM users WHERE id = $1;
 
 -- name: GetUserSchedulePause :one
 -- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch

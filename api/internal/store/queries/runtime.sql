@@ -668,8 +668,8 @@ WHERE status = 'online'
 -- query's own "name every column" convention so an unstamped path is visible in a diff
 -- of THIS file, and guarded by a per-path test rather than the compiler (the narg trap
 -- above applies identically).
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, issue_saved_body, issue_raw_digest, issue_input_reason, auto_approve_blocked_reasons, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required, code_cross_check_required)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('issue_saved_body'), sqlc.narg('issue_raw_digest'), sqlc.narg('issue_input_reason'), COALESCE(sqlc.narg('auto_approve_blocked_reasons')::text[], '{}'), sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'),
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, issue_saved_body, issue_raw_digest, issue_input_reason, auto_approve_blocked_reasons, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required, code_cross_check_required)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('issue_saved_body'), sqlc.narg('issue_raw_digest'), sqlc.narg('issue_input_reason'), COALESCE(sqlc.narg('auto_approve_blocked_reasons')::text[], '{}'), sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.ignored_inferred_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'),
     (@auto_approve AND @plan_source <> 'seeded' AND (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id)), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id))
 RETURNING *;
 
@@ -1014,6 +1014,9 @@ WITH claimant AS MATERIALIZED (
 ), target AS (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id FROM runs r
     WHERE r.user_id = @user_id
+      -- Admission is a snapshot read, before generation advances or custody opens.
+      -- NULL is unrestricted; the deadline includes the account's recovery spread.
+      AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
       AND EXISTS (SELECT 1 FROM claimant c WHERE NOT c.maintenance_fenced
         AND (fn_worker_accepts_new_intake(c)
              OR r.worker_id = c.id))
@@ -1143,6 +1146,58 @@ WITH claimant AS MATERIALIZED (
                AND (SELECT count(*) FROM recovery_custody_holds oh2
                       WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int)
            OR (SELECT fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)) < @custody_hold_limit::int)
+      -- PRD #3522 M3: the weekly usage reserve admission gate. @reserve_on is true only when the run
+      -- owner has a threshold set (users.weekly_reserve_pct); every other @reserve_* param is then
+      -- precomputed in Go (workersvc/usage_reserve.go, reserveSnapshot) from the owner's fresh
+      -- readings. A held run matches no row and stays queued. The exemption arms mirror Go's
+      -- reserveEnforced (chat is already excluded above): an active manual-resume override
+      -- (@reserve_override_ended lists run ids whose override ended early; empty until the reset
+      -- observation lands) and a previously started run while the pause toggle is off
+      -- (@reserve_pause_on). The credential arm mirrors Go's reserveHeld, in claimSecretID order:
+      --   Codex run        -> its frozen alias is blocked (api_key aliases are never in the list);
+      --   judge/self_improve -> the owner's judge-lane binding;
+      --   per-run override -> pinned id / default / auto pool (a pinned override with a NULL id
+      --                       falls through to the worker lane);
+      --   otherwise        -> the CLAIMING worker's lane (@reserve_worker_mode, static verdict
+      --                       @reserve_worker_static_blocked for pinned/default).
+      -- The auto arms hold only when something pooled WAS spendable but every such token is
+      -- blocked: an empty pool (or only the run's active dead-credential exclusion) keeps its
+      -- existing pool_wait behaviour. A pooled id is skippable-by-exclusion when the run's
+      -- limit_dead_secret_id names it while retry_not_before is still in the future (claimExcludeFor).
+      -- A reserve-marked queued run sorts after the owner's unmarked ones in the ORDER BY below.
+      AND (NOT @reserve_on::boolean
+           OR (COALESCE(r.reserve_exempt_until > @reserve_now::timestamptz, false) AND NOT (r.id = ANY(@reserve_override_ended::uuid[])))
+           OR (r.first_started_at IS NOT NULL AND NOT @reserve_pause_on::boolean)
+           OR NOT (
+               CASE
+                   WHEN r.harness = 'codex'
+                       THEN COALESCE(r.codex_secret_id = ANY(@reserve_blocked_codex::uuid[]), false)
+                   WHEN r.kind IN ('judge', 'self_improve')
+                       THEN CASE @reserve_judge_mode::text
+                           WHEN 'auto' THEN
+                               CASE
+                                   WHEN EXISTS (SELECT 1 FROM unnest(@reserve_permitted::uuid[]) pp
+                                                WHERE NOT COALESCE(r.retry_not_before > @reserve_now::timestamptz AND pp = r.limit_dead_secret_id, false))
+                                       THEN false
+                                   WHEN EXISTS (SELECT 1 FROM unnest(@reserve_pooled::uuid[]) pp
+                                                WHERE NOT COALESCE(r.retry_not_before > @reserve_now::timestamptz AND pp = r.limit_dead_secret_id, false))
+                                       THEN true
+                                   ELSE @reserve_owner_default_blocked::boolean
+                               END
+                           ELSE @reserve_judge_static_blocked::boolean
+                       END
+                   WHEN r.credential_override_mode = 'pinned' AND r.credential_override_secret_id IS NOT NULL
+                       THEN COALESCE(r.credential_override_secret_id = ANY(@reserve_blocked_claude::uuid[]), false)
+                   WHEN r.credential_override_mode = 'default'
+                       THEN @reserve_owner_default_blocked::boolean
+                   WHEN r.credential_override_mode = 'auto' OR @reserve_worker_mode::text = 'auto'
+                       THEN (EXISTS (SELECT 1 FROM unnest(@reserve_pooled::uuid[]) pp
+                                     WHERE NOT COALESCE(r.retry_not_before > @reserve_now::timestamptz AND pp = r.limit_dead_secret_id, false))
+                             AND NOT EXISTS (SELECT 1 FROM unnest(@reserve_permitted::uuid[]) pp
+                                             WHERE NOT COALESCE(r.retry_not_before > @reserve_now::timestamptz AND pp = r.limit_dead_secret_id, false)))
+                   ELSE @reserve_worker_static_blocked::boolean
+               END
+           ))
       -- PRD #1226 M1 (D2): the NON-BYPASSABLE completion-protocol claim clause. An
       -- INTERLOCKED run (completion_contract_version IS NOT NULL) may be claimed ONLY by a
       -- worker whose SELF-REPORTED protocol_capabilities contain 'completion_interlock_v1';
@@ -1495,6 +1550,7 @@ WITH claimant AS MATERIALIZED (
                          AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(p.protocol_capabilities))
                          -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
                          AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(p.protocol_capabilities))))
+                AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
                 -- PRD #1590 M2 (D2, A1): mirror the claimant's account gate so a
                 -- busy worker never defers this run to a peer that cannot claim it.
                 AND NOT (
@@ -1531,6 +1587,26 @@ WITH claimant AS MATERIALIZED (
                 AND ((r.egress_profile_id IS NOT NULL) = p.isolated_lane)
                 AND (r.egress_profile_id IS NULL OR 'isolated_fetch_v1' = ANY(p.protocol_capabilities))
                 AND (r.egress_profile_id IS NULL OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL))
+                -- PRD #3522 M3: never DEFER a worker-lane run to a peer whose own Anthropic lane the
+                -- weekly reserve blocks (@reserve_blocked_worker_ids, the owner's workers whose bind
+                -- mode resolves to a blocked token or an all-blocked auto pool): that peer's
+                -- ClaimRun would hold the run, and deferring to it would leave the run unclaimed
+                -- until @spread_cutoff. Only a run whose credential is chosen by the claiming
+                -- WORKER is affected: Codex, judge/self_improve and per-run override runs resolve
+                -- their credential independently of the peer, and an exempt run is not gated. The
+                -- list is computed without the run's dead-credential exclusion; the spread is advisory
+                -- and fails open at @spread_cutoff, so that approximation can delay a deferral but
+                -- never strand a run.
+                AND NOT (
+                    @reserve_on::boolean
+                    AND NOT (COALESCE(r.reserve_exempt_until > @reserve_now::timestamptz, false) AND NOT (r.id = ANY(@reserve_override_ended::uuid[])))
+                    AND NOT (r.first_started_at IS NOT NULL AND NOT @reserve_pause_on::boolean)
+                    AND r.harness IS DISTINCT FROM 'codex'
+                    AND r.kind NOT IN ('judge', 'self_improve')
+                    AND NOT (r.credential_override_mode = 'pinned' AND r.credential_override_secret_id IS NOT NULL)
+                    AND COALESCE(r.credential_override_mode, '') NOT IN ('default', 'auto')
+                    AND p.id = ANY(@reserve_blocked_worker_ids::uuid[])
+                )
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = @worker_id)
                     < (SELECT count(*) FROM runs mr
@@ -1614,7 +1690,14 @@ WITH claimant AS MATERIALIZED (
     -- level. @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4
     -- fail-open: a demoted run created before it reads as stale, so
     -- fn_run_priority returns normal and background work never starves.
+    --
+    -- PRD #3522 M3: a queued run carrying a weekly-reserve hold marker (reserve_hold_reason, written by
+    -- the sweeper's markReserveHolds pass) sorts AFTER the owner's unmarked runs, right after the
+    -- affinity key. Held runs are filtered out of `target` above, so the marker only matters where a
+    -- stale marker outlives the reading that set it: the run is still claimable, it just does not
+    -- starve unmarked siblings while the sweeper catches up.
     ORDER BY COALESCE(r.worker_id = @worker_id, false) DESC,
+             (r.reserve_hold_reason IS NOT NULL) ASC,
              fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC,
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
@@ -1684,6 +1767,9 @@ UPDATE runs SET
     -- credential_disabled park of this claimed run, a sweeper wall park, a completion hold) shows
     -- "not reported" instead of an older park's value. Display-only.
     checkpoint_contains_latest = NULL,
+    -- PRD #3522 M3: leaving 'queued' drops the weekly-reserve hold marker; the visible reason only
+    -- describes a queued run.
+    reserve_hold_reason = NULL,
     -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
     -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
     health = 'ok', health_reason = NULL, health_since = NULL
@@ -2068,6 +2154,7 @@ UPDATE runs SET
     -- authoritative inferred toolchain list), an absent (NULL) param COALESCEs back to the
     -- existing column. The service only passes a non-empty filtered set, so a garbled/empty
     -- report leaves the param nil rather than wiping the column.
+    capability_inference_evidence = COALESCE(sqlc.narg('capability_inference_evidence')::jsonb, runs.capability_inference_evidence),
     required_tools = CASE WHEN plan_cross_check_required AND (auto_approve OR plan_md IS NOT NULL) THEN required_tools
         ELSE COALESCE(sqlc.narg('inferred_tools')::text[], required_tools) END,
     -- size_class is SET, absent-safe like required_tools: a present (clamped s/m/l) value
@@ -2534,6 +2621,7 @@ UPDATE runs SET
     -- required_tools is SET, absent-safe: a present set REPLACES (it is the run's single
     -- authoritative inferred toolchain list, not merged with a prior source), and an
     -- absent (NULL) param COALESCEs back to the existing column, leaving it untouched.
+    capability_inference_evidence = COALESCE(sqlc.narg('capability_inference_evidence')::jsonb, runs.capability_inference_evidence),
     required_tools = COALESCE(sqlc.narg('inferred_tools')::text[], runs.required_tools),
     -- PRD #212: the changed-file list the plan turn produced (git status --porcelain,
     -- run as the RUNNER uid). Absent-safe COALESCE like required_tools, but note the
@@ -3572,6 +3660,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted'
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -3625,6 +3714,7 @@ WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted'
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
       SELECT 1 FROM locked_checks cc
@@ -3669,6 +3759,10 @@ UPDATE runs SET
     status             = 'paused',
     status_since       = now(),
     session_id         = COALESCE(sqlc.narg('session_id'), session_id),
+    -- PRD #3522 M4a: a SYSTEM reserve request parks with the weekly_reserve hold, the cause the
+    -- sweeper's release pass keys on (an owner milestone/now park leaves hold_reason as it was). The
+    -- CASE reads the OLD pause_mode, which this same statement clears.
+    hold_reason        = CASE WHEN pause_mode = 'reserve' THEN 'weekly_reserve' ELSE hold_reason END,
     pause_requested_at = NULL,
     pause_mode         = NULL,
     pause_after_count  = NULL,
@@ -3680,8 +3774,8 @@ WHERE id = @id AND worker_id = @worker_id
   -- PRD #1497 M1 (D14/D15): an owner-pause park can never consume a system 'wall' request. The
   -- wall park is its own fenced transition (SetRunWallPark); this owner-pause report parks only a
   -- 'milestone'/'now' request, so a delayed owner-pause report cannot settle a wall request that
-  -- overwrote it.
-  AND pause_mode IN ('milestone', 'now');
+  -- overwrote it. PRD #3522 M4a: the system 'reserve' request parks here too, as the weekly_reserve hold.
+  AND pause_mode IN ('milestone', 'now', 'reserve');
 
 -- name: SetRunCompletionHold :one
 -- Park an OWNED, INTERLOCKED run on the completion interlock's dedicated HOLD transition
@@ -3838,6 +3932,7 @@ WITH candidates AS MATERIALIZED (
   AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
+  AND (sqlc.narg('required_hold_reason')::text IS NULL OR runs.hold_reason = sqlc.narg('required_hold_reason')::text)
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -3884,8 +3979,22 @@ UPDATE runs SET
     worker_id = CASE WHEN runs.claim_released_at IS NOT NULL THEN NULL ELSE runs.worker_id END,
     -- D7: a resumed budget_exhausted row leaves the wall hold behind.
     -- Issue #3181: a resumed credential-switch hold (settling once its fence lifted, or unsettled) is cleared too.
-    hold_reason = CASE WHEN runs.hold_reason IN ('budget_exhausted', 'credential_switch_settling', 'credential_switch_unsettled') THEN NULL ELSE runs.hold_reason END,
+    hold_reason = CASE WHEN runs.hold_reason IN ('budget_exhausted', 'credential_switch_settling', 'credential_switch_unsettled', 'weekly_reserve') THEN NULL ELSE runs.hold_reason END,
     hold_captured_head = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_captured_head END,
+    -- PRD #3522 M4a: the owner's manual resume of a weekly_reserve pause is a recorded OVERRIDE until the
+    -- next observed 7-day reset. The five exemption columns are written ONLY on a weekly_reserve hold and
+    -- only when the caller supplies a grant time (the owner resume does; set-token, the completion
+    -- decision and the sweeper release pass NULL, leaving the columns as they were).
+    reserve_exempt_granted_at    = CASE WHEN runs.hold_reason = 'weekly_reserve' AND sqlc.narg('reserve_exempt_granted_at')::timestamptz IS NOT NULL
+                                        THEN sqlc.narg('reserve_exempt_granted_at')::timestamptz ELSE runs.reserve_exempt_granted_at END,
+    reserve_exempt_credential_id = CASE WHEN runs.hold_reason = 'weekly_reserve' AND sqlc.narg('reserve_exempt_granted_at')::timestamptz IS NOT NULL
+                                        THEN sqlc.narg('reserve_exempt_credential_id')::uuid ELSE runs.reserve_exempt_credential_id END,
+    reserve_exempt_window_reset  = CASE WHEN runs.hold_reason = 'weekly_reserve' AND sqlc.narg('reserve_exempt_granted_at')::timestamptz IS NOT NULL
+                                        THEN sqlc.narg('reserve_exempt_window_reset')::timestamptz ELSE runs.reserve_exempt_window_reset END,
+    reserve_exempt_prior_pct     = CASE WHEN runs.hold_reason = 'weekly_reserve' AND sqlc.narg('reserve_exempt_granted_at')::timestamptz IS NOT NULL
+                                        THEN sqlc.narg('reserve_exempt_prior_pct')::smallint ELSE runs.reserve_exempt_prior_pct END,
+    reserve_exempt_until         = CASE WHEN runs.hold_reason = 'weekly_reserve' AND sqlc.narg('reserve_exempt_granted_at')::timestamptz IS NOT NULL
+                                        THEN sqlc.narg('reserve_exempt_until')::timestamptz ELSE runs.reserve_exempt_until END,
     -- PRD #1733: the owner's resume of a provider hold is the decision to try again, so the open
     -- provider-park streak is cleared in this same statement (a refused resume changes nothing).
     -- The provider_unavailable marker survives queued and claimed until SetRunRunning clears it.
@@ -3918,6 +4027,10 @@ WHERE runs.id = @id AND runs.user_id = @user_id
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  -- PRD #3522 M4a: the caller's hold guard (repeated here beside the others): the sweeper release and the
+  -- owner resume of a reserve pause pass 'weekly_reserve', so a hold that changed between the caller's
+  -- read and this write is never resumed (or granted an override) under the wrong cause.
+  AND (sqlc.narg('required_hold_reason')::text IS NULL OR runs.hold_reason = sqlc.narg('required_hold_reason')::text)
   AND (runs.kind <> 'cross_check' OR EXISTS (
       SELECT 1 FROM locked_checks cc
       JOIN locked_parents lead ON lead.id = cc.lead_run_id
@@ -5759,6 +5872,12 @@ UPDATE runs SET
     budget_paused_seconds = CASE WHEN @pool_wait::boolean THEN 0 ELSE runs.budget_paused_seconds END,
     health = 'ok', health_reason = NULL, health_since = NULL,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
+    -- PRD #3522 M3: a claim that resolved onto a credential the weekly reserve blocks at assembly
+    -- (assembly reuses the claim's own snapshot, so this arises from a Go/SQL divergence or the
+    -- open-failure floor, not from a reading that moved after admission) persists the visible
+    -- reason here; only set when supplied, and the
+    -- sweeper's markReserveHolds pass keeps it current afterwards. No other counter or stamp moves.
+    reserve_hold_reason = COALESCE(sqlc.narg('reserve_hold_reason')::text, runs.reserve_hold_reason),
     updated_at = now()
 WHERE runs.id = @id AND runs.worker_id = @worker_id AND runs.claim_generation = @claim_generation
   AND runs.status = 'claimed'
@@ -9157,6 +9276,10 @@ WITH cancelled AS (
       -- PRD #1497 M1 (D18): an owner cannot withdraw the system's 'wall' request (IS DISTINCT FROM
       -- because pause_mode is NULL on a no-pending-pause row). A 0-row result surfaces as the 409.
       AND runs.pause_mode IS DISTINCT FROM 'wall'
+      -- PRD #3522 M4a: the owner cannot withdraw the system's 'reserve' request either; it is withdrawn
+      -- only by the reserve's own passes (threshold cleared, toggle off, a fresh OK reading). The
+      -- 0-row result surfaces as the 409 pointing at resume and the threshold.
+      AND runs.pause_mode IS DISTINCT FROM 'reserve'
     RETURNING runs.id
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
@@ -9793,7 +9916,8 @@ WHERE id = @id;
 -- owner row is gone (COALESCE keeps the scan target a plain string).
 -- #3000: owner_hold_pinnable projects ClaimRun's independent draining/maintenance
 -- hold; Go applies the inclusive updated_at + affinity ceiling and reuses the owner name.
-SELECT id, user_id, status, auto_approve,
+SELECT id, runs.user_id, status, auto_approve,
+       admission.codex_admission_class, admission.codex_admission_eligible_at,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
@@ -9863,8 +9987,13 @@ SELECT id, user_id, status, auto_approve,
        -- PRD #3454: a queued run the instance intake pause holds (paused AND not admitted); queuedReason
        -- reports it as reasonMaintenance, ahead of every worker-side rung.
        ((SELECT fn_instance_intake_paused()) AND status = 'queued'
-        AND NOT fn_run_admitted_during_intake_pause(runs))::boolean AS intake_pause_held
+        AND NOT fn_run_admitted_during_intake_pause(runs))::boolean AS intake_pause_held,
+       -- PRD #3522 M3: the weekly-reserve hold marker of a queued run ('' otherwise; sqlc types a
+       -- COALESCE column non-null); healthTargetFor reports it right after maintenance.
+       COALESCE(CASE WHEN status = 'queued' THEN reserve_hold_reason END, '')::text AS reserve_hold_reason
 FROM runs
+LEFT JOIN codex_queued_run_admission admission
+  ON admission.run_id = runs.id AND admission.user_id = runs.user_id
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';
 
@@ -9993,8 +10122,15 @@ WHERE w.user_id = @user_id
 -- claim would allow. That only softens a "restart worker" hint and never grants a claim.
 -- Issue #2184: preserve the advisory availability projection separately from strict health
 -- eligibility. Static requirements compose on ONE candidate; strict counts ignore slots.
+--
+-- PRD #3522 M3: deliberately LANE-AGNOSTIC for the weekly usage reserve. This counts which workers
+-- could claim the run structurally; a reserve hold is a property of the run's credential, not of
+-- any worker's availability, and the health resolver reports it through its own queued-run reason
+-- (ListActiveRunsForHealth.reserve_hold_reason, read by healthTargetFor), so folding it in here
+-- would turn "weekly reserve" into a bogus "no worker can claim" reading.
 WITH candidates AS (
 SELECT w.id,
+       COALESCE(codex_admission_run_eligible_at(run.id) <= now(), true)::boolean AS admission_eligible,
        (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))::boolean AS strict_candidate,
        fn_worker_accepts_new_intake(w)::boolean AS accepts_intake,
        w.maintenance_fenced AS hard_fenced,
@@ -10146,14 +10282,14 @@ WHERE run.id = @run_id
        OR run.released_worker_nonce IS DISTINCT FROM w.snapshot_register_nonce)
 )
 SELECT COALESCE(bool_or(own_worker AND automatic_hold), false)::boolean AS automatic_owner_hold,
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND affinity AND strict_binding)::bigint AS strict_eligible,
+       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND affinity AND strict_binding)::bigint AS strict_eligible,
        -- Legacy advisory availability deliberately ignores status and affinity.
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND NOT hard_fenced AND (accepts_intake OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND NOT hard_fenced AND own_worker AND affinity AND free_slot AND advisory_binding)::bigint AS assigned_claimable,
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
-       max(draining_since) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
+       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND NOT hard_fenced AND (accepts_intake OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
+       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND NOT hard_fenced AND own_worker AND affinity AND free_slot AND advisory_binding)::bigint AS assigned_claimable,
+       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
+       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
+       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
+       max(draining_since) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
        , count(*) FILTER (WHERE strict_candidate AND diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding)::bigint AS diagnostic_suitable
        , count(*) FILTER (WHERE strict_candidate AND diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll)::bigint AS diagnostic_rolling
        , count(*) FILTER (WHERE strict_candidate AND diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll
@@ -10472,6 +10608,8 @@ SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
+  -- Filter admission before LIMIT so held accounts cannot crowd out demand.
+  AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
   AND r.kind <> 'chat'
   AND NOT EXISTS (SELECT 1 FROM cross_checks code_check
                   WHERE code_check.checker_run_id = r.id AND code_check.stage = 'code')
@@ -10628,6 +10766,10 @@ WHERE r.status = 'queued'
   -- PRD #3454: while intake is paused only admitted runs (replacements) may drive provisioning, so
   -- blocked roots cannot fill the bounded batch; provisionOne re-checks under the advisory lock.
   AND (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
+  -- PRD #3522 M3: a run the weekly usage reserve holds (reserve_hold_reason, set by the sweeper's
+  -- markReserveHolds only when every claimant lane, the ephemeral lane included, is blocked) would
+  -- be claimed by no worker, so it must not drive provisioning; provisionOne re-checks live.
+  AND r.reserve_hold_reason IS NULL
 ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC, r.created_at ASC
 LIMIT @max_rows;
 
@@ -10694,6 +10836,8 @@ SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
+  -- Filter admission before LIMIT so held accounts cannot crowd out demand.
+  AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
   AND r.kind <> 'chat'
   AND NOT EXISTS (SELECT 1 FROM cross_checks code_check
                   WHERE code_check.checker_run_id = r.id AND code_check.stage = 'code')
@@ -10906,6 +11050,10 @@ WHERE r.status = 'queued'
   -- PRD #3454: while intake is paused only admitted runs (replacements) may drive provisioning, so
   -- blocked roots cannot fill the bounded batch; provisionOne re-checks under the advisory lock.
   AND (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
+  -- PRD #3522 M3: a run the weekly usage reserve holds (reserve_hold_reason, set by the sweeper's
+  -- markReserveHolds only when every claimant lane, the ephemeral lane included, is blocked) would
+  -- be claimed by no worker, so it must not drive provisioning; provisionOne re-checks live.
+  AND r.reserve_hold_reason IS NULL
 ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC, r.status_since ASC
 LIMIT @max_rows;
 
@@ -10961,6 +11109,10 @@ WHERE r.status = 'queued'
   -- PRD #3454: while intake is paused only admitted runs (replacements) may drive provisioning, so
   -- blocked roots cannot fill the bounded batch; provisionOne re-checks under the advisory lock.
   AND (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
+  -- PRD #3522 M3: a run the weekly usage reserve holds (reserve_hold_reason, set by the sweeper's
+  -- markReserveHolds only when every claimant lane, the ephemeral lane included, is blocked) would
+  -- be claimed by no worker, so it must not drive provisioning; provisionOne re-checks live.
+  AND r.reserve_hold_reason IS NULL
 ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC, r.created_at ASC
 LIMIT @max_rows;
 
@@ -11508,12 +11660,13 @@ FROM runs r WHERE r.id = @lead_run_id AND r.claim_generation = @claim_generation
 SELECT * FROM cross_checks WHERE lead_run_id = @lead_run_id AND stage = 'plan' ORDER BY round DESC LIMIT 1 FOR UPDATE;
 
 -- name: CreatePlanCrossCheckChild :one
+-- Preserve the lead's frozen inference policy; declared requirements keep their repo-hint source.
 INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
                   report_only, budget_wall_seconds, dispatched_at, auto_approve,
-                  issue_title, issue_description, required_capabilities, trigger_source, worker_id)
+                  issue_title, issue_description, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, worker_id)
 SELECT @child_id, lead.user_id, lead.repo_id, 'cross_check', lead.id, @child_harness::text, 2,
        true, @budget_wall_seconds::int, now(), true, lead.issue_title, lead.issue_description,
-       COALESCE(repo.required_capabilities, '{}'), 'cross_check', lead.worker_id
+       COALESCE(repo.required_capabilities, '{}'), COALESCE(repo.required_capabilities, '{}'), lead.ignored_inferred_capabilities, 'cross_check', lead.worker_id
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id
 WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
   AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation
@@ -11687,7 +11840,7 @@ WHERE lead.id = @lead_run_id AND cc.stage = 'plan'
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id
-  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'worker_requeue_exhausted'
+  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted')
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
@@ -11735,8 +11888,8 @@ UPDATE runs SET
         + CASE WHEN runs.started_at IS NOT NULL
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
                ELSE 0 END,
-    -- Drop obsolete affinity while preserving the incarnation captured by the park.
-    worker_id = CASE WHEN runs.claim_released_at IS NOT NULL THEN NULL ELSE runs.worker_id END,
+    -- Retained recovery preserves affinity even though its execution claim is released.
+    worker_id = CASE WHEN runs.claim_released_at IS NOT NULL AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted' THEN NULL ELSE runs.worker_id END,
     hold_reason = NULL,
     hold_captured_head = NULL,
     worker_recovery_episode = runs.worker_recovery_episode + 1,
@@ -11747,7 +11900,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at            = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
-  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause = 'worker_requeue_exhausted'
+  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted')
   -- Honor the wall sweep's chat/judge/interactive exemptions; timed runs still need remaining budget.
   -- Extending does not itself release this hold; checker parent/deadline guards below still apply.
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
@@ -11815,4 +11968,21 @@ SELECT
 -- name: SaveCIArtifactAdmission :one
 UPDATE runs SET ci_artifact_manifest = @manifest::jsonb, issue_description = @description
  WHERE id = @id AND kind = 'prompt' AND ci_config_guard
+RETURNING *;
+
+-- name: ParkRunRetainedRecovery :one
+-- Called under GetRunOwnedByWorkerForUpdate. Execution release is not custody release.
+UPDATE runs SET status='recovery_wait', status_since=now(), updated_at=now(),
+ recovery_wait_cause='retained_recovery_exhausted',
+ recovery_wait_count=recovery_wait_count+1,
+ retained_park_count=retained_park_count+CASE WHEN @counted::boolean THEN 1 ELSE 0 END,
+ recovery_retry_not_before=sqlc.narg('retry_not_before')::timestamptz,
+ session_id=COALESCE(sqlc.narg('session_id')::text, session_id),
+ checkpoint_contains_latest=sqlc.narg('checkpoint_contains_latest')::boolean,
+ claim_released_at=now(),
+ health='ok', health_reason=NULL, health_since=NULL
+WHERE id = @id AND worker_id = @worker_id AND status='running'
+ AND claim_generation = @claim_generation::bigint AND @claim_generation::bigint > 0
+ AND claim_released_at IS NULL AND COALESCE(stop_kind, '')=''
+ AND kind IN ('issue','ci_fix','self_improve','prompt','task','mr_rework')
 RETURNING *;

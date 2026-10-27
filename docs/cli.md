@@ -78,11 +78,57 @@ secret), never a plain variable.**
 can target a *named context* instead of overwriting the one you already have —
 see [Named contexts](#named-contexts) below.
 
+## Vault: check status and unlock
+
+After authenticating, run `uzi vault status` to print `locked` or `unlocked`
+for the active user. `--json` returns only `{"unlocked":false}` or
+`{"unlocked":true}`. Status output remains visible with `--quiet`.
+
+Run `uzi vault unlock` in a terminal to enter your login password or, for
+an OIDC-only account, your dedicated vault passphrase. The prompt goes to
+stderr and input is hidden. Unlock opens an existing vault; it does not
+create one. Set an OIDC vault passphrase in the web app first.
+
+For an owner-controlled script, explicitly pass `--password-stdin` with
+non-terminal stdin, for example using a password manager's stdout:
+
+```sh
+pass show uzi/vault | uzi vault unlock --password-stdin
+```
+
+The command reads one line, strips its trailing LF or CRLF, and preserves
+leading and trailing spaces. A final line without a newline is accepted.
+Empty input or input over 1 MiB is rejected. Non-terminal stdin without
+`--password-stdin`, or a terminal with that flag, is a usage error.
+There is no password-valued flag, positional argument, environment setting,
+or persisted re-unlock key. Agents must ask the owner to unlock, never
+solicit or read the owner's password or passphrase.
+
+On success, unlock prints `Vault unlocked.` unless `--quiet` is set.
+`--json` returns `{"unlocked":true}`, including with `--quiet`; the terminal
+prompt still goes to stderr. Unlock submits once and never retries
+automatically. Terminal input fails closed if cleanup fails: no password
+is submitted.
+
+| Exit | Vault result |
+|------|--------------|
+| 0 | Success |
+| 1 | Generic input/read/cleanup failure or cancellation |
+| 2 | Usage error, including invalid flags/arguments, empty or oversized input, or stdin/flag mismatch |
+| 3 | Authentication failure; wrong password and no existing vault both report `incorrect password` |
+| 6 | Unreachable server, server error, or HTTP 429 rate limit |
+
+A 429 reports a safe retry hint when the server supplies a valid positive
+`Retry-After`; wait before making another attempt. Arbitrary unlock error
+response bodies are not printed.
+
 ## Commands
 
 ```
 uzi login | logout | auth token [--with-token] | auth status [--all] | whoami
 uzi context list | current | use <name> | set <name> --url <url> | rm <name>
+uzi vault status
+uzi vault unlock [--password-stdin]
 uzi run list | get <id> [--field <name> ...] [--reconciliation-before-gate-revision <n>]
 uzi run logs <id> [--follow] [--after <seq>]
 uzi run plan <run-id> [--version N] [--diff] [--json]
@@ -92,6 +138,7 @@ uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--planned-commit <sha>] [--require-base] [--force]
                 [--harness claude|codex]
 uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
+                [--override-capabilities]
                 [--expected-gate-revision <n>]
                 [--reset-milestones --reason <text> --expected-reset-state-digest <digest>
                  --expected-completion-revision <N|null>]
@@ -172,6 +219,8 @@ uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
 uzi admin egress-profile list | show <name>
 uzi admin maintenance status [--json]
+uzi settings get
+uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -278,6 +327,9 @@ A few worth knowing:
   onto a branch you have not merged yet. `--force` overrides that one refusal
   so the new run is created anyway; it bypasses only the open-MR guard, and a
   run already in progress for the issue is never bypassed.
+- **`run get` names the repository.** The `REPO` row shows its full path;
+  `--json` and `--field repo_path` expose the same value. A repo-less run or an
+  unavailable repository has an empty `repo_path` and no `REPO` row.
 - **`run approve` picks the subagent roster explicitly.** By default a run
   uses its own default roster; `--agent-source own|repo` overrides it
   (`own` = your template roster, `repo` = the agents the worker detected in
@@ -288,6 +340,11 @@ A few worth knowing:
   empty or invalid. See [Repo agents](repo-agents.md#which-folder-is-read).
   `run create --plan-file` takes the same two flags, for the seeded run's
   roster.
+- **`run approve <id> --override-capabilities`** clears this run's required
+  capabilities and approves even when its assigned worker cannot satisfy them.
+  Use it only when the plan can proceed without those capabilities. It does not
+  change the repo's capability hints or grant the worker new capabilities;
+  runtime guardrails still apply. Without the flag, capability checks stay active.
 - **`run revise <id> -m "<feedback>"`** steers a plan at the approval gate
   without stopping the run: the agent re-plans from your feedback and returns
   to `awaiting_approval` for another decision, where `run reject` instead ends
@@ -449,7 +506,13 @@ A few worth knowing:
   turn, judge/mr-rework/ci-fix runs finish on their own, and a run already
   at a gate or an involuntary park is refused too — all as a 409 (exit 5)
   naming the reason. This existing command is also the compatibility path
-  when dependency parking requires an API or worker upgrade.
+  when dependency parking requires an API or worker upgrade. A pending pause
+  that the [weekly usage reserve](./run-pause.md#paused-by-the-weekly-usage-reserve)
+  filed cannot be withdrawn with `--cancel`: that is a 409 (exit 5) pointing
+  at the threshold and `run resume`. While a `PAUSE_REQUESTED` row is
+  pending, a reserve request reads
+  `after M<n> (weekly usage reserve)` (or `after the current step (weekly
+  usage reserve)` with no frozen milestones).
 - **`run resume <id>`** resumes an ordinary pause requested by the owner or
   the run's lead: it moves the run
   from `paused` back to `queued`, keeps the worker pin, and preserves the
@@ -460,7 +523,13 @@ A few worth knowing:
   (exit 5). It posts to the same endpoint as `run resume-now` below, which
   also resumes an ordinary paused run in addition to a pool-held one.
   A `completion_blocked` hold refuses plain resume; use `run decide` or an
-  eligible `run set-token` switch.
+  eligible `run set-token` switch. Resuming a run the
+  [weekly usage reserve](./run-pause.md#paused-by-the-weekly-usage-reserve)
+  paused (`hold_reason: weekly_reserve`) is an explicit override: human output
+  prints `Resumed <id>: queued (overrides the weekly usage reserve until the
+  next weekly reset).` The line appears only when this resume lifted a reserve
+  hold and the server recorded the override (`reserve_exempt_until` in
+  `--json`); an ordinary resume prints `Resumed <id>: queued.`
 - **`run decide <id>`** (PRD #1226/#1227) records the owner's decision on a
   run the [structural completion interlock](./run-completion-hold.md) has
   blocked — either a live completion question or a run already parked in the
@@ -1149,6 +1218,17 @@ A few worth knowing:
   `uzi ci fix` and the other create paths), and `uzi run get` shows a `QUEUE_REASON`
   row for a queued run that maintenance is holding back. `--json` stdout is
   unchanged apart from the additive `queue_reason` and `notice` fields.
+- **Queued Codex subscription runs can show a temporary account admission wait.**
+  `uzi run get` prints `CODEX_ADMISSION`; run-list status cells and the TUI
+  detail rail show the same owner-only eligibility explanation. JSON exposes
+  `codex_admission_class` (`rate_limit` or `overload`) and
+  `codex_admission_eligible_at`, including recovery spread, while the wait is
+  active. Foreign shared/admin summaries omit these fields. The time is
+  eligibility, not a promised start; expired provider copy clears on a fresh
+  read. Maintenance and account-unavailability explanations retain precedence,
+  with admission shown independently. Cancel works; there is no admission
+  override. See [Temporary account admission waits](rate-limits.md#temporary-account-admission-waits)
+  for the shared-account policy and exact waiting messages.
 - **`uzi repo remove <id>` deletes a single stale repo** — the surgical
   counterpart to deleting a whole forge connection. It only works on a
   **disabled** repo, so disable it first (`enabled` shows in `uzi repo list`);
@@ -1310,9 +1390,11 @@ uzi run recovery <run-id> [--json]
   protection, a capture in flight, or a ready archive. Legacy holds can release
   automatically on archive readiness; guarded holds await final inventory acknowledgment.
   The narrow exhaustion exception is an OPEN hold for `recovery_wait` /
-  `worker_requeue_exhausted`: it remains `source_only`, or `needs_action` after a failed
-  latest capture, even with an available archive or capture in flight. Owner Resume/Cancel
-  remains required; archive readiness does not implicitly release this custody.
+  `worker_requeue_exhausted`, `worker_memory_pressure`, or
+  `retained_recovery_exhausted` (timed or held): it remains `source_only`, or `needs_action` after a failed
+  latest capture, even with an available archive or capture in flight. Timed retained
+  recovery can retry automatically; NULL retry requires owner Resume/Cancel. Archive
+  readiness does not implicitly release this custody.
   The latest capture state and available archive are independent: an older download may
   omit latest work while a newer capture prepares/uploads. The same source, coverage,
   export and discard guidance as above follows. `--json` prints
@@ -1830,12 +1912,12 @@ A newer release is available.
   `🔒 vault locked` hint (`[locked] vault locked` under NO_COLOR or a
   non-color terminal). When one or more of **your own** runs are actually
   parked on the lock, the hint escalates to a steady amber needs-you band
-  instead: `▌ VAULT LOCKED · N runs parked — unlock in the web app to
-  resume`. On the admin/factory board the count is scoped to your own
+  instead: `▌ VAULT LOCKED · N runs parked — uzi vault unlock or the web app to resume`.
+  On the admin/factory board the count is scoped to your own
   runs only — it never counts or names another user's locked vault. Either
   form is steady, never blinking, and clears on its own within about a
   minute of the vault unlocking; there's no dismiss. Unlocking itself is done
-  off-TUI, in the web app.
+  outside the TUI, with `uzi vault unlock` or in the web app.
 - **Run detail** (`[enter]` from the board, or `uzi tui <run-id>` directly).
   A left rail of agent lanes — the lead plus each live subagent, one lane per
   invocation, each with a status dot — beside the selected lane's transcript,
@@ -2871,6 +2953,43 @@ your own switch for the model-written [Now summary](./run-activity.md#now-summar
 instance). `--json` carries it as `now_summary_enabled` (`null` when unset). Change it in
 **Settings → Run defaults → Run summaries**; there is no CLI write verb for it.
 
+### Weekly usage reserve
+
+```sh
+uzi settings reserve --threshold 70
+uzi settings reserve --threshold 90 --pause-running=false
+uzi settings reserve --threshold off
+```
+
+`uzi settings reserve` sets your [weekly usage
+reserve](./rate-limits.md#weekly-usage-reserve): the 7-day utilization percent
+at which uzi stops starting runs on your subscription and, with pausing on,
+pauses running runs at their next milestone. `--threshold` is required: an
+integer from 1 to 100, or `off`; anything else is a usage error (exit 2).
+`--pause-running` / `--pause-running=false` sets whether running runs are also
+paused; when you omit it the command reads your settings first and keeps the
+current value (the default for a fresh account is on). It posts to
+`PUT /api/me/usage-reserve`, which accepts a `uzc_` Bearer token. Human output
+prints the result, for example `Weekly usage reserve: 70% (pause running runs:
+on)` or `Weekly usage reserve: off`; `--json` returns
+`weekly_reserve_pct` (`null` = off) and `weekly_reserve_pause_running`.
+
+`uzi settings get` ends with the same `Weekly usage reserve:` line (after the
+`Now summary:` line), and its `--json` carries both fields.
+
+On a run the reserve touches, `uzi run get` shows:
+
+- a queued run held at admission: a `RESERVE` row with the reason
+  (`weekly usage reserve: 72% >= 70%`, or `weekly usage reserve: weekly usage
+  unknown`) and a `QUEUE_REASON` row reading `weekly_reserve (held by your
+  weekly usage reserve)`; `--json` adds `reserve_hold_reason` and
+  `queue_reason: "weekly_reserve"`;
+- a run the reserve parked: a `HOLD` row with the label `weekly usage reserve`
+  and the next step (`resumes when usage drops below the threshold; override:
+  uzi run resume <id>`);
+- a pending reserve pause: the `PAUSE_REQUESTED` suffix described under
+  `run pause` above.
+
 ### Plan cross-check evidence
 
 `uzi whoami` shows your `PLAN CROSS-CHECK` consent value. Change it in
@@ -2905,6 +3024,8 @@ the displayed gate revision, not historical findings. See
 [Cross-check](./cross-check.md) for fallbacks and terminal delivery failures.
 
 ### Code cross-check evidence
+
+The coverage rows show every stored path, its assessment, reason and recorded-read flag, plus omitted-path, judgment and activity metadata. Legacy checks say "coverage not reported". This is an advisory account; see [Review coverage](./cross-check.md#review-coverage).
 
 The [Code cross-check](./cross-check.md#code-cross-check) consent is set in
 **Settings → Run defaults → Cross-check**; there is no CLI write verb for it.
@@ -3057,8 +3178,23 @@ row (the hard, closed-vocabulary set — today `docker`/`jvm` — a subset of
 which the run's worker must have to claim and to clear the plan-approval
 gate), a `REQUIRED_TOOLS` row (provisionable toolchains that will simply be
 installed at run time, never a blocker), and a `SIZE_CLASS` row (`s`/`m`/`l`,
-advisory only). All three are comma-joined where the value is a list, and
+coarse repo size, which can floor large-repo budgets). All three are comma-joined where the value is a list, and
 readable the same way under `--json`.
+
+`IGNORED_INFERRED_CAPABILITIES` shows the run's captured repo inference policy
+when non-empty. The JSON field is `ignored_inferred_capabilities`. This affects
+inferred scheduling requirements only; explicit repo hints still win, and
+`required_tools` is unchanged. Configure the policy in the repo's Tools panel
+or through its settings API; the CLI has no repo-settings command.
+
+`CAPABILITY_SOURCE` lists known repo-hint and inferred sources, current required
+status, and ignored inference. `CAPABILITY_TRIGGER` lists bounded detector path
+samples and reasons, with a note for omitted paths. `CAPABILITY_PROVENANCE` marks
+unavailable history. The detail JSON field
+`capability_provenance` includes `hints_known`, `inference_known` and per-capability
+source flags, triggers and truncation. Unknown legacy provenance remains unknown;
+an empty observed scan is distinct from missing evidence. Evidence stays outside
+approval identity and summary polling.
 
 ### Run status, and what `--follow` waits for
 
@@ -3090,7 +3226,9 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `paused` / `provider_unavailable` — see [Recovering
   from a transient interruption](run-recovery-wait.md). An exhausted worker-death episode also parks here with cause
   `worker_requeue_exhausted`, requiring explicit owner Resume or Cancel
-  without an automatic timer. A Codex credential
+  without an automatic timer. Retained-source budget exhaustion can use cause
+  `retained_recovery_exhausted`: three timed retries by default, then an owner
+  hold with no countdown. See [Retained recovery exhausted](#retained-recovery-exhausted). A Codex credential
   refresh or release that found the owner's vault locked also parks here
   (cause `vault_locked`); it takes the same capped backoff and no lifetime
   cap. The owner's explicit successful vault unlock best-effort queues an
@@ -3180,7 +3318,9 @@ hold presentation and remedies are unchanged. See
 
 `limit_wait` and timed `recovery_wait` causes auto-resume on a timer.
 `worker_requeue_exhausted` instead requires owner Resume or Cancel; the Codex
-account hold waits for its account. `pool_wait` instead clears only when a token is
+account hold waits for its account. `retained_recovery_exhausted` retries when
+its timestamp is finite (even if due); NULL instead needs owner Resume/Cancel,
+and omitted timing is unknown. `pool_wait` instead clears only when a token is
 opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
 does not resume it.
 
@@ -3300,6 +3440,30 @@ set written explicitly. Ordinary recovery waits continue as before.
 status stays `recovery_wait`. The TUI puts this hold in NEEDS YOU with
 owner actions, counts and historical evidence, without a self-retry countdown.
 
+### Retained recovery exhausted
+
+`recovery_wait` / `retained_recovery_exhausted` means a durably confirmed
+retained-source recovery budget was exhausted. The default cap allows three
+timed parks (roughly 1m, 2m, 4m plus jitter), then holds for the owner.
+`retained_park_count` counts these retries, not worker-death requeues.
+`worker_recovery` remains stored-episode and historical evidence; neither it
+nor an earlier available archive proves latest-work coverage.
+
+A finite `recovery_retry_not_before`, including a due timestamp, shows a timed
+retry; NULL shows an owner hold with no countdown, and omitted timing is unknown.
+Owner `uzi run resume <id>` or `resume-now` queues either form early and clears
+its retry; `uzi run cancel <id>` ends either form. Resume preserves the count
+and cap. Timer promotion grants a fresh run wall window, while manual Resume
+preserves remaining wall budget and may require `uzi run extend` first.
+Token/credential changes do not promote this cause.
+
+Default wait and log follow stop at the owner-held form and continue through
+timed retries; explicit `--until` keeps its status set. Follow reports a
+finite-to-NULL transition even within the same cause/status. Both forms keep
+source custody; execution release does not authorize deleting source. See
+[Retained recovery exhausted](run-recovery-wait.md#retained-recovery-exhausted)
+for renewal bounds, storage risks and rollout requirements.
+
 ### Waiting for a state: `uzi run wait`
 
 `uzi run wait <id>` blocks until the run reaches a state you can act on — the
@@ -3309,7 +3473,8 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 `awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
 rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`),
 except a default wait also stops at `recovery_wait` with cause
-`worker_requeue_exhausted`, and at a `paused` run held on
+`worker_requeue_exhausted`, `worker_memory_pressure`, or owner-held
+`retained_recovery_exhausted` (NULL retry), and at a `paused` run held on
 `base_attestation_missing`, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means

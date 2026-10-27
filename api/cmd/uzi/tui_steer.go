@@ -159,7 +159,7 @@ func (m tuiModel) renderSteerQueue() string {
 			body = m.renderer.Plain(*in.Body, 48)
 		}
 		sb.WriteString("  " + m.pal.faint.Render(padCell(steerKindLabel(in.Kind), 10)+" "+
-			padCell(steerState(in, m.detail.run.Status, strOr(m.detail.run.RecoveryWaitCause, "")), 30)+" "+
+			padCell(steerStateForRun(in, m.detail.run), 30)+" "+
 			padCell(relAge(in.CreatedAt), 5)) + " " + body + "\n")
 	}
 	return sb.String()

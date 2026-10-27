@@ -1542,3 +1542,19 @@ describe("IssueView history rejection presentation", () => {
     expect(badge.classList.contains(tone === "neutral" ? "text-neutral-fg" : "text-danger")).toBe(true);
   });
 });
+
+
+it.each([
+  ["2099-01-01T00:00:00Z", "retained recovery retrying"],
+  ["2020-01-01T00:00:00Z", "retained recovery retrying"],
+  [null, "retained recovery needs decision"],
+  [undefined, "retained recovery timing unknown"],
+  ["invalid", "retained recovery timing unknown"],
+] as const)("retained recovery history renders timing %s", async (stamp, label) => {
+  setAuth();
+  mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+  mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status: "recovery_wait", recovery_wait_cause: "retained_recovery_exhausted", recovery_retry_not_before: stamp } as Partial<RunListItem>)] });
+  renderIssueView();
+  const badge = await screen.findByText(label);
+  expect(badge.classList.contains("text-warn")).toBe(true);
+});

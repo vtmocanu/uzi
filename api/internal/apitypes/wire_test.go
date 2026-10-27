@@ -63,6 +63,8 @@ func TestUserDTOTags(t *testing.T) {
 		"judge_anthropic_secret_id", "judge_anthropic_secret_label",
 		// PRD #1140 M2: the EFFECTIVE three-valued judge bind mode (default/pinned/auto).
 		"judge_anthropic_bind_mode",
+		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).
+		"weekly_reserve_pct", "weekly_reserve_pause_running",
 		"created_at", "last_login")
 }
 
@@ -273,7 +275,7 @@ var runDTOKeys = []string{
 	// and required_tools (M4 4b, display-only) are non-nil slices ([] over null); size_class
 	// (M4 4b) is the NOT NULL DEFAULT '' string. All three always on the wire, and — via the
 	// RunListItemDTO embed pin — on both the list and detail reads.
-	"required_capabilities", "required_tools", "size_class",
+	"required_capabilities", "ignored_inferred_capabilities", "required_tools", "size_class",
 	// PRD #212: the git-status list surfaced at the approval gate, non-nil ([] over null)
 	// via capsOrEmpty like required_tools. On both list and detail via the RunListItemDTO embed.
 	"plan_changed_files",
@@ -290,6 +292,8 @@ var runDTOKeys = []string{
 	"auto_approve_blocked_reasons", "issue_input_reason",
 	// PRD #2602: server-derived progress estimate (object, null for a terminal run).
 	"progress",
+	// Issue #3555: repo display path, overlaid on the single-run detail read only.
+	"repo_path",
 }
 
 func TestRunDTOTags(t *testing.T) {
@@ -364,12 +368,13 @@ func TestV1JobDTOTags(t *testing.T) {
 }
 
 func TestRunListItemDTOTags(t *testing.T) {
-	// Embeds RunDTO (keys flatten in) plus repo_path; owner_email is omitempty (absent when nil).
+	// Embeds RunDTO (keys flatten in, repo_path included since #3555: the list's own repo_path
+	// shadows it); owner_email is omitempty (absent when nil).
 	// PRD #1497 M1: worker_name is now on RunDTO too, so it is in runDTOKeys — RunListItemDTO's own
 	// worker_name field shadows the embedded one (json collapses the duplicate tag to one key), so it
 	// is NOT appended here any more.
 	// is_revising moved onto RunDTO (issue #2760), so it is in runDTOKeys.
-	want := append(append([]string{}, runDTOKeys...), "repo_path", "judge_verdict", "judge_todo_count")
+	want := append(append([]string{}, runDTOKeys...), "judge_verdict", "judge_todo_count")
 	assertTags(t, "RunListItemDTO(no owner)", RunListItemDTO{}, want...)
 	// owner_email present when set.
 	email := "u@example.test"
@@ -845,7 +850,7 @@ func TestRepoDTOTags(t *testing.T) {
 		// improve_uzi backlog + selects the uzi worker directive). Default false.
 		"repo_fold_improve_uzi_backlog",
 		// PRD #84 M2: the static per-repo capability hint routed onto each run.
-		"required_capabilities", "pipeline",
+		"required_capabilities", "ignored_inferred_capabilities", "pipeline",
 		// PRD #66 M8 (D8): admin per-repo guardrail override metadata, null when no
 		// override is active. Display-only surfacing for M9's badge.
 		"guardrail_override",
@@ -1173,7 +1178,9 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		// PRD #2603: the per-user model-written "Now" summary switch (null ⇒ default ON).
 		"now_summary_enabled",
 		// PRD #3245: the Codex judge lane and the read-only resolved judge cells.
-		"codex_judge_model", "judge_models")
+		"codex_judge_model", "judge_models",
+		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).
+		"weekly_reserve_pct", "weekly_reserve_pause_running")
 }
 
 func TestModelSettingCellDTOTags(t *testing.T) {

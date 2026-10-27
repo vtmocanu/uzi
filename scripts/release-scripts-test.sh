@@ -30,6 +30,10 @@
 # --ghcr-only [baseline-verifier] runs #1464 M1 publication fixtures only.
 # --frozen-rc-only runs the #1389 block-guard regressions without the full fixture suite.
 # --fold-order-only runs canonical pending/open-RC ordering fixtures.
+# --promote-main-race-only [cutter-path] pins promotion while remote main advances.
+# --plan-only [cutter-path] runs read-only decision and publication fixtures.
+# --diagnostics-only runs real cutter/oracle structured-refusal fixtures.
+# --producer-failures-only isolates Git producer failures in real release fixtures.
 # --fragments-only [cutter-path] runs fragment regressions, optionally against a frozen cutter.
 #
 # Wired as `task test:release-scripts` (its own gate member, not gate:repo's
@@ -523,7 +527,7 @@ if [ "${1:-}" = "--identity-only" ]; then
   exit $?
 fi
 
-if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ]; then
+if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ] && [ "${1:-}" != "--plan-only" ] && [ "${1:-}" != "--promote-main-race-only" ] && [ "${1:-}" != "--diagnostics-only" ] && [ "${1:-}" != "--promotion-diagnostics-only" ] && [ "${1:-}" != "--producer-failures-only" ]; then
 identity_regressions
 echo "=== building fixture in $REPO ==="
 build_fixture
@@ -631,7 +635,9 @@ fi
 # =============================================================================
 REPO_ROOT="$(cd "$SCRIPTS_DIR/.." && pwd)"
 RC="$REPO_ROOT/.agents/skills/uzi-release/scripts/release-cut.sh"
-[ "${1:-}" != --fragments-only ] || RC="${2:-$RC}"
+case "${1:-}" in
+  --fragments-only|--plan-only|--promote-main-race-only|--producer-failures-only) RC="${2:-$RC}" ;;
+esac
 [ -f "$RC" ] || { echo "release-scripts-test: $RC not found" >&2; exit 2; }
 
 D2N=0
@@ -659,6 +665,7 @@ seed_repo() {
   cp "$SCRIPTS_DIR/changelog-fragment-citations.py" "$d/scripts/changelog-fragment-citations.py"
   cp "$SCRIPTS_DIR/lib/release-mode.sh" "$d/scripts/lib/release-mode.sh"
   cp "$SCRIPTS_DIR/lib/changelog-bullets.awk" "$d/scripts/lib/changelog-bullets.awk"
+  [ ! -f "$SCRIPTS_DIR/lib/release-diagnostics.py" ] || cp "$SCRIPTS_DIR/lib/release-diagnostics.py" "$d/scripts/lib/release-diagnostics.py"
   [ ! -f "$SCRIPTS_DIR/lib/ghcr.sh" ] || cp "$SCRIPTS_DIR/lib/ghcr.sh" "$d/scripts/lib/ghcr.sh"
   cat > "$d/deploy/chart/Chart.yaml" <<'YAML'
 apiVersion: v2
@@ -724,6 +731,33 @@ push_tag_to_origin() { git -C "$1" push -q origin "refs/tags/$2"; }
 
 feature_201_changelog() { printf '# Changelog\n\n## [Unreleased]\n### Added\n- **Feature 201** (#201)\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' | put_changelog "$1"; }
 
+diagnostic_regressions() (
+  PASSES=0; FAILS=0
+  local d result before missing_sha
+  d=$(mktemp -d); result="$d.result.json"
+  trap 'rm -rf "$d"; rm -f "$result"' EXIT
+  seed_repo "$d"
+  add_feature "$d" 201
+  feature_201_changelog "$d"
+  run_rc "$d" 0.2.0 --result-file "$result"
+  assert_eq 'diagnostic cut succeeds' 0 "$RC_RC"
+  assert_eq 'diagnostic cut ready' ready "$(jq -r .reason "$result" 2>/dev/null)"
+  assert_eq 'diagnostic cut target' v0.2.0-rc.1 "$(jq -r .planned_tag "$result" 2>/dev/null)"
+  git -C "$d" tag v0.2.0-rc.1
+  add_feature "$d" 202
+  before=$(git -C "$d" rev-parse HEAD); missing_sha=$before
+  run_rc "$d" 0.2.0 --result-file "$result"
+  assert_eq 'diagnostic oracle refusal preserves cut exit' 1 "$RC_RC"
+  assert_eq 'diagnostic oracle reason survives rollback' changelog-coverage-refused "$(jq -r .reason "$result" 2>/dev/null)"
+  assert_eq 'diagnostic refusal target' v0.2.0-rc.2 "$(jq -r .planned_tag "$result" 2>/dev/null)"
+  assert_eq 'diagnostic refusal stage' changelog-coverage "$(jq -r .stage "$result" 2>/dev/null)"
+  assert_eq 'diagnostic uncited commit' "$missing_sha" "$(jq -r '.uncited[0].sha' "$result" 2>/dev/null)"
+  assert_eq 'diagnostic uncited PR' 202 "$(jq -r '.uncited[0].pr' "$result" 2>/dev/null)"
+  assert_eq 'diagnostic refusal still undoes the commit' "$before" "$(git -C "$d" rev-parse HEAD)"
+  echo "diagnostics: $PASSES passed, $FAILS failed"
+  [ "$FAILS" -eq 0 ]
+)
+
 published_rc() {
   seed_repo "$1"; add_origin "$1"; add_feature "$1" 201
   feature_201_changelog "$1"
@@ -732,6 +766,455 @@ published_rc() {
   git -C "$1" tag v0.2.0-rc.1
   push_tag_to_origin "$1" v0.2.0-rc.1
 }
+promotion_diagnostic_regressions() (
+  PASSES=0; FAILS=0
+  local root d result mode before dep copy_result=${1:-}
+  root=$(mktemp -d)
+  trap 'rm -rf "$root"' EXIT
+  for mode in stable implicit failed refused after-promotion; do
+    d="$root/$mode"; result="$root/$mode.json"
+    published_rc "$d"
+    before=$(git -C "$d" rev-parse HEAD)
+    case "$mode" in
+      stable) run_rc "$d" 0.2.0 --promote-only --ci --result-file "$result" ;;
+      implicit) run_rc "$d" 0.3.0 --promote --result-file "$result" ;;
+      refused)
+        git -C "$d" branch release/0.2.0 v0.2.0-rc.1
+        run_rc "$d" 0.2.0 --promote-only --result-file "$result" ;;
+      after-promotion)
+        printf 'module example/diagnostic\n' > "$d/api/go.mod"
+        git -C "$d" add api/go.mod; gcommit "$d" 'chore(deps): update dependency (#204)'
+        dep=$(git -C "$d" rev-parse HEAD)
+        add_feature "$d" 202
+        awk '/^## \[Unreleased\]$/ {print;print "### Added\n- **Feature 202** (#202)\n";next} {print}' "$d/CHANGELOG.md" > "$root/notes"
+        put_changelog "$d" < "$root/notes"
+        before=$(git -C "$d" rev-parse HEAD)
+        mkdir "$root/bin"
+        cat > "$root/bin/git" <<'STUB'
+#!/usr/bin/env bash
+if "$DIAGNOSTIC_GIT" -C "$DIAGNOSTIC_ROOT" show-ref --verify --quiet refs/tags/v0.2.0; then
+  case "$*" in
+    "diff --name-only -z ${DIAGNOSTIC_DEP}^1 ${DIAGNOSTIC_DEP}"|"show --name-only --format= -z ${DIAGNOSTIC_DEP}") exit 71 ;;
+  esac
+fi
+exec "$DIAGNOSTIC_GIT" "$@"
+STUB
+        chmod +x "$root/bin/git"
+        DIAGNOSTIC_GIT=$(command -v git) DIAGNOSTIC_ROOT="$d" DIAGNOSTIC_DEP="$dep" PATH="$root/bin:$PATH" \
+          run_rc "$d" 0.3.0 --promote --result-file "$result" ;;
+      failed)
+        add_feature "$d" 202
+        awk '/^## \[Unreleased\]$/ {print;print "### Added\n- **Feature 202** (#202)\n";next} {print}' "$d/CHANGELOG.md" > "$root/notes"
+        put_changelog "$d" < "$root/notes"
+        add_feature "$d" 203
+        before=$(git -C "$d" rev-parse HEAD)
+        run_rc "$d" 0.3.0 --promote --result-file "$result" ;;
+    esac
+    if [ "$mode" = failed ]; then
+      assert_eq 'failed promote preserves failure status' 1 "$RC_RC"
+      assert_eq 'failed promote emits non-ready reason' changelog-coverage-refused "$(jq -r .reason "$result" 2>/dev/null)"
+      if git -C "$d" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail 'failed promote leaked provisional stable tag'; else pass 'failed promote removes provisional stable tag'; fi
+      assert_eq 'failed promote preserves starting HEAD' "$before" "$(git -C "$d" rev-parse HEAD)"
+    elif [ "$mode" = after-promotion ]; then
+      assert_eq 'post-promotion precondition preserves refusal status' 3 "$RC_RC"
+      assert_eq 'post-promotion refusal leaves promotion stage' preconditions "$(jq -r .stage "$result" 2>/dev/null)"
+      assert_eq 'post-promotion refusal is not promotion-failed' release-precondition-refused "$(jq -r .reason "$result" 2>/dev/null)"
+      if git -C "$d" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail 'post-promotion refusal leaked stable tag'; else pass 'post-promotion refusal removes stable tag'; fi
+      assert_eq 'post-promotion refusal preserves HEAD' "$before" "$(git -C "$d" rev-parse HEAD)"
+    elif [ "$mode" = refused ]; then
+      assert_eq 'early promotion refusal stays nonzero' 3 "$RC_RC"
+      assert_eq 'early promotion refusal is not ready' promotion-failed "$(jq -r .reason "$result" 2>/dev/null)"
+    else
+      assert_eq "$mode promotion succeeds" 0 "$RC_RC"
+      assert_eq "$mode promotion emits ready" ready "$(jq -r .reason "$result" 2>/dev/null)"
+      assert_eq "$mode promotion reports actual stable target" v0.2.0 "$(jq -r .planned_tag "$result" 2>/dev/null)"
+      assert_eq "$mode promotion preserves main chart" 0.2.0-rc.1 "$(chart_ver "$d")"
+      git -C "$d" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null || fail "$mode promotion stable tag missing"
+      if [ "$mode" = stable ] && [ -n "$copy_result" ] && [ -f "$result" ]; then cp "$result" "$copy_result"; fi
+    fi
+  done
+  echo "promotion diagnostics: $PASSES passed, $FAILS failed"
+  [ "$FAILS" -eq 0 ]
+)
+diagnostic_option_regressions() (
+  PASSES=0; FAILS=0
+  local root d result before mode
+  root=$(mktemp -d)
+  trap 'rm -rf "$root"' EXIT
+  for mode in plan duplicate no-commit writer-failure relative inflight; do
+    d="$root/$mode"; result="$root/$mode.json"
+    seed_repo "$d"; add_feature "$d" 201; feature_201_changelog "$d"
+    before=$(git -C "$d" rev-parse HEAD)
+    case "$mode" in
+      plan) run_rc "$d" --plan --result-file "$result" ;;
+      duplicate) run_rc "$d" 0.2.0 --result-file "$result" --result-file "$result" ;;
+      no-commit) run_rc "$d" 0.2.0 --no-commit --result-file "$result" ;;
+      writer-failure) mkdir "$result"; run_rc "$d" 0.2.0 --result-file "$result" ;;
+      relative)
+        mkdir "$d/subdir"
+        RC_OUT=$(cd "$d/subdir" && UZI_RELEASE_OFFLINE_FIXTURE=1 UZI_CHANGELOG_REPO_URL=https://github.com/vtmocanu/uzi bash "$RC" 0.2.0 --result-file result.json 2>&1); RC_RC=$?
+        assert_eq 'relative diagnostics retain caller cwd' ready "$(jq -r .reason "$d/subdir/result.json" 2>/dev/null)" ;;
+      inflight)
+        run_rc "$d" 0.2.0
+        git -C "$d" tag v0.2.0-rc.1
+        before=$(git -C "$d" rev-parse HEAD)
+        run_rc "$d" 0.3.0 --result-file "$result" ;;
+    esac
+    case "$mode" in
+      writer-failure) assert_eq 'successful cut fails if diagnostics cannot be delivered' 1 "$RC_RC" ;;
+      relative) assert_eq 'relative diagnostics cut succeeds' 0 "$RC_RC" ;;
+      *)
+        assert_eq "$mode diagnostic usage/refusal stays nonzero" 3 "$RC_RC"
+        assert_eq "$mode refusal preserves HEAD" "$before" "$(git -C "$d" rev-parse HEAD)"
+        if [ "$mode" != duplicate ]; then
+          assert_eq "$mode refusal is typed" release-precondition-refused "$(jq -r .reason "$result" 2>/dev/null)"
+        fi ;;
+    esac
+  done
+  echo "diagnostic options: $PASSES passed, $FAILS failed"
+  [ "$FAILS" -eq 0 ]
+)
+# Failed and partially emitted inventories never become release evidence.
+producer_failure_regressions() (
+  PASSES=0; FAILS=0
+  local root d site form before refs status worktrees marker result real_git
+  local -a args
+  root=$(mktemp -d)
+  trap 'rm -rf "$root"' EXIT
+  real_git=$(command -v git)
+  mkdir "$root/bin"
+  cat > "$root/bin/git" <<'STUB'
+#!/usr/bin/env bash
+original=("$@")
+while [ "$#" -gt 0 ]; do
+  case "$1" in -c|-C) shift 2 ;; *) break ;; esac
+done
+if [ "$READ_FAIL_FORM" != control ] && [ ! -e "$READ_FAIL_MARKER" ]; then
+  match=0
+  case "$READ_FAIL_SITE/$*" in
+    'history/log --first-parent --reverse --format=%H v0.1.0..HEAD') match=1 ;;
+    'allowlist/diff --name-only v0.2.0-rc.1..HEAD') match=1 ;;
+  esac
+  if [ "$match" -eq 1 ]; then
+    printf '%s\n' "$READ_FAIL_SITE/$READ_FAIL_FORM" > "$READ_FAIL_MARKER"
+    if [ "$READ_FAIL_FORM" = partial ]; then
+      if [ "$READ_FAIL_SITE" = history ]; then
+        history=$("$READ_REAL_GIT" "${original[@]}") || exit 92
+        printf '%s\n' "${history%%$'\n'*}"
+      else
+        printf 'CHANGELOG.md\n'
+      fi
+    fi
+    exit 71
+  fi
+fi
+exec "$READ_REAL_GIT" "${original[@]}"
+STUB
+  chmod +x "$root/bin/git"
+  for site in history allowlist; do
+    for form in empty partial control plan; do
+      if [ "$site" = allowlist ] && [ "$form" = plan ]; then continue; fi
+      d="$root/$site-$form"; marker="$root/$site-$form.marker"; result="$root/$site-$form.json"
+      if [ "$site" = history ]; then
+        seed_repo "$d"; add_feature "$d" 201
+        printf 'module example/producer\n' > "$d/api/go.mod"
+        git -C "$d" add api/go.mod; gcommit "$d" 'chore(deps): update manifest (#204)'
+        feature_201_changelog "$d"
+        awk '{gsub(/\(#201\)/, "(#201, #204)"); print}' "$d/CHANGELOG.md" > "$root/notes"
+        put_changelog "$d" < "$root/notes"
+      else
+        published_rc "$d"
+      fi
+      if [ "$form" = plan ]; then
+        cat > "$d/scripts/release-ci-coverage.py" <<'PY'
+import sys
+if sys.argv[1] == 'publication':
+    print('success')
+    sys.exit(0)
+sys.exit(1)  # metadata: these shipping fixture commits are not metadata-only
+PY
+        git -C "$d" add scripts/release-ci-coverage.py
+        gcommit "$d" 'test: offline publication evidence'
+      fi
+      before=$(git -C "$d" rev-parse HEAD)
+      refs=$(git -C "$d" for-each-ref --format='%(refname) %(objectname)')
+      status=$(git -C "$d" status --porcelain=v1 --untracked-files=all)
+      worktrees=$(git -C "$d" worktree list --porcelain)
+      args=(0.2.0 --result-file "$result")
+      [ "$site" = history ] || args+=(--promote-only)
+      [ "$form" != plan ] || args=(--plan)
+      READ_REAL_GIT="$real_git" READ_FAIL_SITE="$site" READ_FAIL_FORM="$form" READ_FAIL_MARKER="$marker" \
+        PATH="$root/bin:$PATH" run_rc "$d" "${args[@]}"
+      if [ "$form" = control ]; then
+        # The shim itself must preserve a normal cut/promotion.
+        # Control mode bypasses injection while using the same Git wrapper.
+        assert_eq "$site successful control" 0 "$RC_RC"
+        continue
+      fi
+      if [ "$site" = history ]; then
+        if [ "$form" = plan ]; then
+          assert_eq 'dependency history plan propagates instrument status' 2 "$RC_RC"
+        else
+          assert_eq "dependency history $form instrument refusal" 3 "$RC_RC"
+        fi
+        assert_contains "dependency history $form names failed read" 'could not read dependency history' "$RC_OUT"
+      else
+        assert_eq "promotion allowlist $form instrument failure" 1 "$RC_RC"
+        assert_contains "promotion allowlist $form names failed read" 'could not read promotion metadata diff' "$RC_OUT"
+      fi
+      assert_eq "$site $form injected exact producer" "$site/$form" "$(cat "$marker" 2>/dev/null)"
+      assert_eq "$site $form HEAD unchanged" "$before" "$(git -C "$d" rev-parse HEAD)"
+      assert_eq "$site $form refs unchanged" "$refs" "$(git -C "$d" for-each-ref --format='%(refname) %(objectname)')"
+      assert_eq "$site $form worktree unchanged" "$status" "$(git -C "$d" status --porcelain=v1 --untracked-files=all)"
+      assert_eq "$site $form temporary release worktree removed" "$worktrees" "$(git -C "$d" worktree list --porcelain)"
+    done
+  done
+  [ "$PASSES" -ge 40 ] || fail 'producer failure fixture assertion floor'
+  echo "git producer failures: $PASSES passed, $FAILS failed"
+  [ "$FAILS" -eq 0 ]
+)
+if [ "${1:-}" = --producer-failures-only ]; then producer_failure_regressions; exit $?; fi
+if [ "${1:-}" = --promotion-diagnostics-only ]; then promotion_diagnostic_regressions "${2:-}"; exit $?; fi
+if [ "${1:-}" = --diagnostics-only ]; then
+  diagnostic_status=0
+  diagnostic_regressions || diagnostic_status=1
+  promotion_diagnostic_regressions || diagnostic_status=1
+  diagnostic_option_regressions || diagnostic_status=1
+  exit "$diagnostic_status"
+fi
+if [ "$#" -eq 0 ]; then
+  producer_failure_regressions || fail 'git producer failure regressions'
+  diagnostic_regressions || fail 'structured diagnostic regressions'
+  promotion_diagnostic_regressions || fail 'promotion diagnostic regressions'
+  diagnostic_option_regressions || fail 'diagnostic option regressions'
+fi
+# A promotion is pinned to the candidate; only main-writing cuts need a fresh main.
+promotion_main_race_regressions() (
+  local d candidate selected advanced
+  d="$(mktemp -d)"
+  trap 'rm -rf "$d" "$d.origin.git" "$d.writer"' EXIT
+  published_rc "$d"
+  git -C "$d" push -q origin main
+  candidate="$(git -C "$d" rev-parse 'v0.2.0-rc.1^{commit}')"
+  selected="$(git -C "$d" rev-parse HEAD)"
+  git clone -q --branch main "$d.origin.git" "$d.writer"
+  git -C "$d.writer" config user.email t@example.com
+  git -C "$d.writer" config user.name test
+  echo 'package main // work after the candidate' > "$d.writer/api/after_candidate.go"
+  git -C "$d.writer" add api/after_candidate.go
+  gcommit "$d.writer" 'Feature after candidate (#208)'
+  git -C "$d.writer" push -q origin main
+  advanced="$(git -C "$d.writer" rev-parse HEAD)"
+  assert_eq 'selected main tracking ref has not moved yet' "$selected" "$(git -C "$d" rev-parse origin/main)"
+  run_rc "$d" 0.2.0
+  assert_eq 'main-writing cut still refuses advancing main' 3 "$RC_RC"
+  assert_contains 'main-writing cut explains the race' 'behind origin/main' "$RC_OUT"
+  assert_eq 'refused main cut preserves HEAD' "$selected" "$(git -C "$d" rev-parse HEAD)"
+  assert_eq 'cutter fetch observed the new main' "$advanced" "$(git -C "$d" rev-parse origin/main)"
+  run_rc "$d" 0.2.0 --promote-only --ci
+  assert_eq 'promote-only permits advancing main' 0 "$RC_RC"
+  assert_eq 'stable parent remains the pinned candidate' "$candidate" "$(git -C "$d" rev-parse -q --verify 'v0.2.0^{commit}^' 2>/dev/null)"
+  assert_eq 'promotion preserves local main HEAD' "$selected" "$(git -C "$d" rev-parse HEAD)"
+  assert_eq 'promotion leaves remote main advanced' "$advanced" "$(git --git-dir="$d.origin.git" rev-parse refs/heads/main)"
+  assert_eq 'promotion leaves clean tracked inputs' '' "$(git -C "$d" status --porcelain --untracked-files=no)"
+  echo "promotion main race: $PASSES passed, $FAILS failed"
+  [ "$FAILS" -eq 0 ]
+)
+if [ "${1:-}" = --promote-main-race-only ]; then promotion_main_race_regressions; exit $?; fi
+if [ "$#" -eq 0 ]; then promotion_main_race_regressions || fail 'promotion main-race regressions'; fi
+
+# The planner shares the cutter's discovery and note rules, but owns no Git writes.
+plan_regressions() (
+  local d before_head before_refs before_status output rc
+  d="$(mktemp -d)"
+  trap 'rm -rf "$d"' EXIT
+  seed_repo "$d"
+  cp "$SCRIPTS_DIR/release-ci-coverage.py" "$d/scripts/release-ci-coverage.py"
+  git -C "$d" add scripts/release-ci-coverage.py
+  gcommit "$d" 'test: include release evidence reader'
+  mkdir -p "$d/plan-bin"
+  cat > "$d/plan-bin/gh" <<'GH'
+#!/usr/bin/env bash
+if [ "$1 $2" = 'repo view' ]; then echo example/uzi; exit 0; fi
+[ "$1 $2" = 'api --paginate' ] || exit 91
+case "${PLAN_PUBLICATION:-success}" in
+  error) exit 1 ;;
+  transient) echo 'HTTP 502: Bad Gateway' >&2; exit 1 ;;
+esac
+for arg in "$@"; do
+  case "$arg" in *head_sha=*) sha="${arg#*head_sha=}"; sha="${sha%%&*}" ;; esac
+done
+branch=$PLAN_PREVIOUS
+if [ "$sha" = "${PLAN_FAILED_SHA:-}" ]; then
+  PLAN_PUBLICATION=failed
+  branch=$PLAN_FAILED_TAG
+fi
+case "${PLAN_PUBLICATION:-success}" in
+  missing) printf '[{"total_count":0,"workflow_runs":[]}]'; exit 0 ;;
+  pending) status=in_progress; conclusion=null ;;
+  failed) status=completed; conclusion='"failure"' ;;
+  *) status=completed; conclusion='"success"' ;;
+esac
+printf '[{"total_count":1,"workflow_runs":[{"id":1,"run_attempt":1,"status":"%s","conclusion":%s,"head_sha":"%s","head_branch":"%s","event":"push","path":".github/workflows/release.yml","repository":{"full_name":"example/uzi"},"head_repository":{"full_name":"example/uzi"}}]}]' "$status" "$conclusion" "$sha" "$branch"
+GH
+  chmod +x "$d/plan-bin/gh"
+  # Resolve before changing PATH, so the shim cannot recursively invoke itself.
+  PLAN_REAL_GIT="$(command -v git)" || return 2
+  PLAN_GIT_AUDIT="$d/forbidden-fetch"
+  export PLAN_REAL_GIT PLAN_GIT_AUDIT
+  cat > "$d/plan-bin/git" <<'GIT'
+#!/usr/bin/env bash
+if [ "${PLAN_READONLY:-0}" = 1 ]; then
+  for arg in "$@"; do
+    if [ "$arg" = fetch ]; then printf 'fetch\n' >> "$PLAN_GIT_AUDIT"; exit 73; fi
+  done
+fi
+if [ "${PLAN_HISTORY_FAILURE:-0}" = 1 ]; then
+  case " $* " in *' log --first-parent '*) exit 74 ;; esac
+fi
+exec "$PLAN_REAL_GIT" "$@"
+GIT
+  chmod +x "$d/plan-bin/git"
+  export PATH="$d/plan-bin:$PATH" PLAN_PREVIOUS=v0.1.0 PLAN_PUBLICATION=success GITHUB_REPOSITORY=example/uzi
+  output="$(
+    cd "$d" || exit 2
+    set -o pipefail
+    # Only extract the real cutter's pure function, rather than running its ceremony.
+    # shellcheck source=/dev/null
+    . <(awk '/^inflight_rc\(\)/ { active=1 } active { print } active && /^}/ { exit }' "$RC")
+    inflight_rc
+  )"; rc=$?
+  assert_eq 'no open train emits no tag' '' "$output"
+  assert_eq 'no open train is a successful discovery' 0 "$rc"
+  plan_expect() {
+    local label=$1 expected=$2 field actual; shift 2
+    before_head="$(git -C "$d" rev-parse HEAD)"
+    before_refs="$(git -C "$d" show-ref)"
+    before_status="$(git -C "$d" status --porcelain --untracked-files=all)"
+    output="$(cd "$d" && PLAN_READONLY=1 bash "$RC" --plan "$@" 2>&1)"; rc=$?
+    assert_eq "$label plan exit" 0 "$rc"
+    while IFS= read -r field; do
+      actual="$(printf '%s\n' "$output" | awk -v prefix="${field%%=*}=" 'index($0, prefix) == 1 { print }')"
+      assert_eq "$label decision ${field%%=*}" "$field" "$actual"
+    done <<< "$expected"
+    assert_eq "$label HEAD unchanged" "$before_head" "$(git -C "$d" rev-parse HEAD)"
+    assert_eq "$label refs unchanged" "$before_refs" "$(git -C "$d" show-ref)"
+    assert_eq "$label worktree unchanged" "$before_status" "$(git -C "$d" status --porcelain --untracked-files=all)"
+    assert_eq "$label no scratch files" '' "$(find "$d/.uzi/scratch" -type f 2>/dev/null)"
+    assert_eq "$label no fetch" '' "$(cat "$PLAN_GIT_AUDIT" 2>/dev/null)"
+  }
+  plan_expect 'empty range' 'OP=noop'
+  plan_expect 'version must exceed stable' $'OP=blocked\nREASON=version-not-above-stable' --version 0.1.0
+  plan_expect 'no train to abandon' $'OP=blocked\nREASON=no-train-to-abandon' --abandon-train
+  plan_expect 'CI strict planning does not query worker pins' 'OP=noop' --ci
+  add_feature "$d" 201
+  output="$(cd "$d" && PLAN_HISTORY_FAILURE=1 bash "$RC" --plan 2>&1)"; rc=$?
+  assert_eq 'broken history reader is an instrument error' 2 "$rc"
+  plan_expect 'shipping without notes' 'OP=noop'
+  feature_201_changelog "$d"
+  plan_expect 'new minor' $'OP=new-base\nTAG=v0.2.0-rc.1'
+  plan_expect 'manual patch base' $'OP=new-base\nTAG=v0.1.1-rc.1' --version 0.1.1
+  plan_expect 'invalid explicit base' $'OP=blocked\nREASON=invalid-version' --version 0.01.1
+  plan_expect 'plan never switches to promote' 'OP=blocked' --promote
+  git -C "$d" tag v0.2.0-rc.9
+  export PLAN_PREVIOUS=v0.2.0-rc.9
+  plan_expect 'open train no new shipping' 'OP=noop'
+  add_feature "$d" 202
+  plan_expect 'open train advances' $'OP=nextrc\nTAG=v0.2.0-rc.10'
+  plan_expect 'other base needs abandon' $'OP=blocked\nREASON=open-train-needs-abandon' --version 0.3.0
+  plan_expect 'abandon needs a higher base' $'OP=blocked\nREASON=abandon-needs-higher-base' --version 0.2.0 --abandon-train
+  PLAN_PREVIOUS=v0.1.0 plan_expect 'explicit abandon' $'OP=new-base\nTAG=v0.3.0-rc.1\nPREVIOUS_TAG=v0.1.0\nSHIPPING_COUNT=2' --version 0.3.0 --abandon-train
+  PLAN_PREVIOUS=v0.1.0 PLAN_FAILED_TAG=v0.2.0-rc.9 PLAN_FAILED_SHA="$(git -C "$d" rev-parse v0.2.0-rc.9)" \
+    plan_expect 'failed abandoned candidate does not block' $'OP=new-base\nTAG=v0.3.0-rc.1\nPREVIOUS_TAG=v0.1.0\nPUBLICATION_STATE=success' --version 0.3.0 --abandon-train
+  plan_expect 'abandon cannot downgrade' $'OP=blocked\nREASON=abandon-needs-higher-base' --version 0.1.1 --abandon-train
+  for PLAN_PUBLICATION in failed pending missing error transient; do
+    export PLAN_PUBLICATION
+    plan_expect "publication $PLAN_PUBLICATION" 'OP=blocked'
+  done
+  export PLAN_PUBLICATION=success
+  printf '\n// dirty\n' >> "$d/api/base.go"
+  plan_expect 'dirty tracked files' 'OP=blocked'
+  git -C "$d" checkout -- api/base.go
+  git -C "$d" tag -d v0.2.0-rc.9 >/dev/null
+  git -C "$d" tag v1.0.0
+  export PLAN_PREVIOUS=v1.0.0
+  plan_expect 'automatic 1.x held' 'OP=blocked'
+  plan_expect 'explicit 1.x patch no shipping' 'OP=noop' --version 1.0.1
+  git -C "$d" tag -d v1.0.0 >/dev/null
+  export PLAN_PREVIOUS=v0.1.0
+  # A strict metadata change is excluded regardless of its subject, even with notes.
+  git -C "$d" tag v0.2.0-rc.9
+  export PLAN_PREVIOUS=v0.2.0-rc.9
+  printf 'apiVersion: v2\nname: uzi\nversion: 0.2.0\nappVersion: "0.1.0"\n' > "$d/deploy/chart/Chart.yaml"
+  git -C "$d" add deploy/chart/Chart.yaml
+  gcommit "$d" 'repair: chart version'
+  plan_expect 'metadata excluded independent of subject' $'OP=noop\nSHIPPING_COUNT=0'
+  export PLAN_PUBLICATION=failed
+  plan_expect 'failed previous tag blocks a no-op' 'OP=blocked'
+  export PLAN_PUBLICATION=success
+  git -C "$d" tag v0.2.0-rc.10
+  export PLAN_PREVIOUS=v0.2.0-rc.10
+  printf '# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' | put_changelog "$d"
+  mkdir -p "$d/docs"
+  echo 'Editorial correction.' > "$d/docs/example.md"
+  git -C "$d" add docs/example.md
+  git -C "$d" commit -q -m 'docs: correct example' -m 'Changelog: none, editorial correction'
+  plan_expect 'explicitly exempt range has no releasable notes' $'OP=noop\nREASON=no-releasable-notes'
+  printf 'module example/test\n' > "$d/api/go.mod"
+  git -C "$d" add api/go.mod
+  gcommit "$d" 'chore(deps): update module (#204)'
+  printf '# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' | put_changelog "$d"
+  plan_expect 'dependency citations make notes releasable' $'OP=nextrc\nTAG=v0.2.0-rc.11'
+  add_feature "$d" 205
+  mkdir -p "$d/changelog.d"
+  printf '### Fixed\n\n- **Fix feature (#205).**\n  Correct the observed behavior.\n' > "$d/changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md"
+  plan_expect 'untracked fragment blocked' 'OP=blocked'
+  git -C "$d" add changelog.d
+  gcommit "$d" 'docs: add fragment'
+  plan_expect 'committed fragment accepted' $'OP=nextrc\nTAG=v0.2.0-rc.11'
+  git -C "$d" rm -q -- changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md
+  gcommit "$d" 'chore: consume previous notes'
+  git -C "$d" tag v0.2.0-rc.11
+  export PLAN_PREVIOUS=v0.2.0-rc.11
+  add_feature "$d" 206
+  mkdir -p "$d/changelog.d"
+  printf '### Fixed\n\n- **Fix isolated feature (#206).**\n  The only pending note is this fragment.\n' > "$d/changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md"
+  git -C "$d" add changelog.d
+  gcommit "$d" 'docs: isolated fragment'
+  plan_expect 'only committed fragment makes range releasable' $'OP=nextrc\nTAG=v0.2.0-rc.12\nSHIPPING_COUNT=1'
+  mkdir -p "$d/agent/codex"
+  echo 'runtime pin fixture' > "$d/agent/codex/codex-package.lock"
+  git -C "$d" add agent/codex/codex-package.lock
+  gcommit "$d" 'chore: change Codex runtime'
+  plan_expect 'Codex adoption requires a local cut' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  PLAN_PUBLICATION=failed plan_expect 'Codex block precedes liftable publication block' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  # A human's local cut establishes a new boundary after the adoption read.
+  git -C "$d" tag v0.2.0-rc.12
+  export PLAN_PREVIOUS=v0.2.0-rc.12
+  add_feature "$d" 207
+  plan_expect 'published local boundary clears adoption block' $'OP=nextrc\nTAG=v0.2.0-rc.13'
+  git -C "$d" checkout -q -b other
+  plan_expect 'non-main branch blocked' $'OP=blocked\nREASON=main-required'
+  git -C "$d" checkout -q main
+  git -C "$d" tag -d v0.1.0 v0.2.0-rc.9 v0.2.0-rc.10 v0.2.0-rc.11 v0.2.0-rc.12 >/dev/null
+  plan_expect 'first release remains local' $'OP=blocked\nREASON=initial-release-needs-local-cut'
+  plan_expect 'explicit first release remains local' $'OP=blocked\nREASON=initial-release-needs-local-cut' --version 0.1.0
+  git -C "$d" tag v0.2.0-rc.1
+  plan_expect 'abandon without stable boundary remains local' $'OP=blocked\nREASON=initial-release-needs-local-cut' --version 0.3.0 --abandon-train
+  output="$(cd "$d" && bash "$RC" --plan 0.1.0 2>&1)"; rc=$?
+  assert_eq 'plan positional base is usage error' 3 "$rc"
+  assert_contains 'plan positional base prints usage' usage: "$output"
+  output="$(cd "$d" && bash "$RC" --plan --version 2>&1)"; rc=$?
+  assert_eq 'missing version is usage error' 3 "$rc"
+  assert_contains 'missing version prints usage' usage: "$output"
+  echo "release plan: $PASSES passed, $FAILS failed"
+  [ "$FAILS" -eq 0 ]
+)
+if [ "${1:-}" = --plan-only ]; then
+  plan_regressions; exit $?
+fi
+if [ "$#" -eq 0 ]; then plan_regressions || fail "release planning regressions"; fi
+
 # Real cuts preserve published blocks while grouping newly pending categories.
 fold_order_regressions() {
   local d mode inventory version base before oldblock oldaddition section expected
@@ -790,7 +1273,7 @@ fold_order_regressions() {
     done
   done
 }
-if [ "${1:-}" != "--fragments-only" ]; then
+if [ "${1:-}" != "--fragments-only" ] && [ "${1:-}" != "--plan-only" ]; then
 if [ "$#" -eq 0 ] || [ "${1:-}" = "--fold-order-only" ]; then fold_order_regressions; fi
 if [ "${1:-}" = "--fold-order-only" ]; then
   printf '=== fold ordering: %s passed, %s failed ===\n' "$PASSES" "$FAILS"

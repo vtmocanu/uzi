@@ -464,6 +464,17 @@ durable design decisions and
 [docs/rate-limits.md](docs/rate-limits.md#codex-account-limits) for
 user-facing behavior.
 
+A separate survivor path can retry an original non-rejection refresh error once
+when its durable receipt authorizes reuse. Admission consumes the retry under
+user secret mutation/account/intent locks with a fresh database clock and an
+enabled linked alias; local vault/login failures defer without consumption.
+Recovered material stays quarantined until identity-verified promotion. The
+survivor and account-action display share a 52.14-second in-flight policy bound;
+owner restore advances the generation and fences stale installs. Mixed API
+versions are unsupported for receipt-aware resolution/display. See
+[ADR-3523](adr/3523-codex-refresh-provider-error-reuse.md) for the fixed 30-minute
+eligibility window, terminal fences, provider-overlap risk and evidence limits.
+
 ## Agent runtime: workers, runs, live view
 
 uzi's third surface is the one that acts: a per-user worker container claims
@@ -1526,13 +1537,19 @@ chain in the diagram above, with no intervening `running`.
   and blocks the worker's teardown. Admission counts open holds except at most
   one per run backing a healthy current claim without an owner decision;
   total custody remains protected. After discarded/released precedence, an OPEN
-  hold at `recovery_wait` for `worker_requeue_exhausted` or
-  `worker_memory_pressure` reports `needs_action` after failed latest capture,
+  hold at `recovery_wait` for `worker_requeue_exhausted`,
+  `worker_memory_pressure`, or `retained_recovery_exhausted` reports
+  `needs_action` after failed latest capture,
   otherwise `source_only`, before available unguarded archives or capture
-  progress. Archive availability remains independent of attention and does not
-  release owner-held custody; other classifier decisions remain unchanged.
-  See [ADR-2445](adr/2445-custody-admission-accounting.md) and
-  [ADR-2396](adr/2396-worker-memory-guard.md).
+  progress. Retained-recovery exhaustion keeps this conservative protection
+  for both timed retries and NULL-stamp owner holds throughout `recovery_wait`.
+  After timer promotion or owner Resume, existing proof-based release rules
+  apply again; execution-claim release alone never permits source deletion.
+  Archive availability remains independent of attention and does not release
+  these causes' custody; other classifier decisions remain unchanged.
+  See [ADR-2445](adr/2445-custody-admission-accounting.md),
+  [ADR-2396](adr/2396-worker-memory-guard.md), and the #3495 amendment in
+  [ADR-1197](adr/1197-transient-recovery-park.md).
   The **archive capture** (`recovery_captures`) is the later,
   immutable, encrypted artifact bound to that hold. PRD #1349 hardens the
   lifecycle: reserve/release now key on the **exact `runs.claim_generation`**
@@ -2107,7 +2124,12 @@ token's server-enforced scope. See
   else (`POST /api/workers`, `/api/me/cli-tokens`, `/api/vault/*`, `/api/forge/*`,
   `/api/me/secrets/*`, every admin write) stayed cookie-only, since swapping whole
   groups would have widened what a stolen CLI token could do. See the PRD's
-  route-disposition table.
+  route-disposition table. Issue #3504 later adds `GET /api/vault/status` and
+  `POST /api/vault/unlock` to `RequireUser` for `uzi vault status` and
+  `uzi vault unlock`; lock and passphrase creation remain cookie-only. Unlock
+  retains the authenticated per-user limiter shared by cookies and CLI tokens.
+  See [the vault threat model](docs/vault-threat-model.md#cli-unlock-authenticated-guessing-and-key-custody)
+  for the accepted guessing surface.
 - **`scope` is a ceiling, enforced in the middleware, not just at `/api/admin/*`.**
   `RequireAdminRO` is a plain `user.IsAdmin` check; the real control is upstream in
   `RequireUser`, which gives a CLI token whose `scope != 'admin_ro'` a **copy** of
@@ -2172,8 +2194,8 @@ rationale.
   broken relative link (doc→doc or doc→img), reference-style links, or an
   oversized `docs/img/*` file; it warns (without failing) on a `user` page over
   the 60-line house-style budget.
-  It runs both locally (ahead of `npm run build`) and in CI (`validate:web`
-  runs `npm run check-docs` too, PRD #52), so a broken doc fails the pipeline as
+  It runs both locally (ahead of `npm run build`) and in CI (`validate-web`
+  runs `task check-docs:web` too, PRD #52), so a broken doc fails the pipeline as
   well as the local build.
 
 ## Deployment: compose (laptop) and k8s
@@ -2849,3 +2871,7 @@ deliberately deferred — see [plan.md](prds/done/initial-plan.md), the PRDs' Ri
 `prds/done/4-agent-runtime-workers.md`'s "Out of scope". This document will grow
 new sections (additional services, data flows, trust boundaries) as those
 land.
+
+## Release authorization
+
+The release workflow (manual dispatch and opt-in nightly RCs) isolates App credentials from repository code: preparation uses the shared cutter and coverage policy, then a separate job validates a bundle and atomically pushes permitted refs. RC and stable use separate principals; stable requires an Environment reviewer. The local fallback remains. [ADR-3512](adr/3512-release-automation.md) records the accepted main-write trust boundary, staged rollout and deferred recovery work.

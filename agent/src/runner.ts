@@ -19,7 +19,7 @@ import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
-import { BASE_ATTESTATION_HOLD_REASON } from "./protocol.js";
+import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE } from "./protocol.js";
 import { PublicationContextLatch } from "./publication-context.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CREDENTIAL_SWITCH_HOLD_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
@@ -34,6 +34,7 @@ import {
   CheckpointSoftDeadlineError,
   RetainedReadinessCleanupUnconfirmedError,
   formatRetainedRecoveryDiagnostic,
+  annotateRetainedSuccessorError,
   gitBasicCredential,
   isNonFastForwardRejection,
   isPushProtectionRejection,
@@ -390,6 +391,11 @@ const CODEX_BOUNDARY_STEPS: ReadonlySet<BoundaryStep> = new Set<BoundaryStep>([
   "checkpoint_import_mutation",
   "checkpoint_import_readback",
   "checkpoint_code_head",
+  "checkpoint_code_head_runner_tip",
+  "checkpoint_code_head_tracking",
+  "checkpoint_code_head_default_tip",
+  "checkpoint_code_head_pin",
+  "checkpoint_code_head_changed_files",
   "checkpoint_bridge",
   "checkpoint_post_import", "checkpoint_steer", "checkpoint_post_bridge",
 ]);
@@ -10838,7 +10844,7 @@ export class RunRunner {
           ? MaintenanceBudget.withoutAttempt(transport) : transport();
         const senders = flight.stateSenders ??= new Set();
         senders.add(sending);
-        let ack: StateAck;
+        let ack: Awaited<ReturnType<WorkerClient["reportState"]>>;
         try { ack = await sending; }
         finally { senders.delete(sending); }
         if (diskSeq !== undefined) this.diskGovernor?.statusAcked(runId, diskSeq, ack.status);
@@ -12363,17 +12369,23 @@ export class RunRunner {
       }
     };
 
-    const captureImportedCodeHead = async (head: string | null): Promise<void> => {
+    const captureImportedCodeHead = async (head: string | null, step?: (s: BoundaryStep) => void): Promise<void> => {
       clearCodeSnapshot();
-      if (!barePath || !head || await this.git.branchTip(runnerClone.path, runnerClone.branch) !== head) return;
+      if (!barePath || !head) return;
+      step?.("checkpoint_code_head_runner_tip");
+      if (await this.git.branchTip(runnerClone.path, runnerClone.branch) !== head) return;
+      step?.("checkpoint_code_head_tracking");
       await this.requireTrackingOwned(flight, barePath, runnerClone.branch, head);
+      step?.("checkpoint_code_head_default_tip");
       const defaultBranch = claim.repo.default_branch?.trim() || await this.git.defaultBranchName(barePath);
       const defaultCommit = defaultBranch ? await this.git.originBranchTip(barePath, defaultBranch) : null;
       if (!defaultCommit) return;
       codeDefaultCommit = defaultCommit;
+      step?.("checkpoint_code_head_pin");
       codeSnapshot = await this.git.pinCodeSnapshot(barePath, runId, head, defaultCommit, false);
       codeEmptyPrompt = false;
       if (claim.kind === "prompt") {
+        step?.("checkpoint_code_head_changed_files");
         const changed = await this.git.readBare(barePath,
           ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--name-only", `${codeSnapshot.base_commit}...${head}`],
           { maxBytes: 1024, signal: steering.lifecycleSignal() });
@@ -12393,12 +12405,13 @@ export class RunRunner {
       // reaches the executor, but narrow it so the closure is honest rather than `!`.
       if (!barePath) return "no_new_work";
       const checkpointSteps = opts.doneAttempt?.steps ?? (opts.reap ? new BoundaryStepTracker(runLog, this.now, "checkpoint step", opts.sink) : undefined);
-      if (opts.doneAttempt) checkpointSteps?.enter("checkpoint_code_head");
+      if (opts.doneAttempt) checkpointSteps?.enter("checkpoint_code_head_runner_tip");
       // Decision 6 tip-movement check: has the runner clone's branch tip moved since the
       // last checkpoint wrote the tracking ref? A null trackTip (never checkpointed) or a
       // null cloneTip (unresolvable) is NOT a match, so it falls through to a real fetch.
       const cloneTip = await this.git.branchTip(runnerClone.path, runnerClone.branch);
       if (opts.doneAttempt && claim.code_cross_check_required === true) doneCandidate = cloneTip;
+      if (opts.doneAttempt) checkpointSteps?.enter("checkpoint_code_head_tracking");
       const trackTip = await this.git.trackingTip(barePath, runnerClone.branch);
       const tipUnmovedSinceFetch =
         trackTip !== null && cloneTip !== null && trackTip === cloneTip &&
@@ -12514,7 +12527,7 @@ export class RunRunner {
         if (codeDoneSnapshot && fetchedBack.kind === "updated") {
           try {
             checkpointSteps?.enter("checkpoint_code_head");
-            await captureImportedCodeHead(originalCodeHead);
+            await captureImportedCodeHead(originalCodeHead, step => checkpointSteps?.enter(step));
           }
           catch (err) {
             codeSnapshot = undefined; codeFreshReceipt = undefined; codeEmptyPrompt = false;
@@ -13035,7 +13048,7 @@ export class RunRunner {
             claim: {
               kind: resolveRunKind(claim.kind),
               claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,
-              ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory),
+              ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory, claim.claim_generation),
             },
             emit: (m) => batcher.emit(m),
             redact: flight.redactText,
@@ -13346,10 +13359,10 @@ export class RunRunner {
           return verdict;
         } }
         : {}),
-      beforePlanRevisionTurn: () => revisionRecovery?.beforeTurn() ?? Promise.resolve(),
-      retryPlanRevisionTurn: async (cause) => {
-        if (!(cause instanceof TransientRecoveryError) || !cause.providerOrigin || !revisionRecovery) throw cause;
-        await revisionRecovery.retry(cause);
+      beforePlanRevisionTurn: (observer, remainingWallMs) => revisionRecovery?.beforeTurn(observer, remainingWallMs) ?? Promise.resolve(),
+      retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
+        if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && !cause.zeroEvidenceIdle) || !revisionRecovery) throw cause;
+        return revisionRecovery.retry(cause, observer, remainingWallMs);
       },
       gatePlan: async (planMd, milestones, onPlanPersisted, settles, semanticSubmission) => {
         if (flight.workerMemory) flight.workerMemory.revisionContext = undefined;
@@ -13953,7 +13966,7 @@ export class RunRunner {
               let snapshot: { head_commit: string; base_commit: string; repo_instructions_commit: string } | undefined;
               try {
                 const snapshotAction = async (_permit?: BoundaryPermit, attempt?: NonNullable<CheckpointBodyOpts["doneAttempt"]>) => {
-                  attempt?.steps.enter("checkpoint_code_head");
+                  attempt?.steps.enter("checkpoint_code_head_runner_tip");
                   if (!completion.interlocked || (executor.safety && !codeSnapshot)) {
                     if (!completion.interlocked && doneCandidate === undefined) doneCandidate = await this.git.branchTip(runnerClone.path, runnerClone.branch);
                     const original = doneCandidate;
@@ -13964,11 +13977,12 @@ export class RunRunner {
                       { expectedCandidateSha: original, ...(executor.safety ? { checkpointImportMode: "done" as const } : {}),
                         checkpointStep: step => attempt?.steps.enter(step) });
                     if (imported.kind !== "updated") { clearCodeSnapshot(); return; }
+                    attempt?.steps.enter("checkpoint_code_head_tracking");
                     await this.requireTrackingOwned(flight, barePath!, runnerClone.branch, original);
-                    attempt?.steps.enter("checkpoint_code_head");
-                    await captureImportedCodeHead(original);
+                    await captureImportedCodeHead(original, step => attempt?.steps.enter(step));
                   }
                   if (codeEmptyPrompt || !codeSnapshot || !codeDefaultCommit) return;
+                  attempt?.steps.enter("checkpoint_code_head_default_tip");
                   const defaultBranch = claim.repo.default_branch?.trim() || await this.git.defaultBranchName(barePath!);
                   if (!defaultBranch) throw new Error("code instructions default branch unavailable");
                   attempt?.steps.enter("default_fetch");
@@ -13976,6 +13990,7 @@ export class RunRunner {
                     barePath!, defaultBranch, claim.secrets.forge_pat,
                     claim.repo.clone_url, claim.secrets.forge_username,
                   );
+                  attempt?.steps.enter("checkpoint_code_head_pin");
                   const pinned = await this.git.pinCodeSnapshot(barePath!, runId, codeSnapshot.head_commit, codeDefaultCommit, true, flight.claimGeneration);
                   codeFreshReceipt = pinned.freshReceipt;
                   snapshot = { head_commit: pinned.head_commit, base_commit: pinned.base_commit,
@@ -22080,6 +22095,59 @@ export class RunRunner {
     if (deadline !== undefined && Date.now() >= deadline) throw new Error("recovery deadline exhausted");
   }
 
+  /** Two identical reports and at most two ownership probes, under one boundary deadline.
+   * Ownership only authorizes replay: only the report ACK's exact status/cause confirms.
+   * Any unresolved outcome stops this flight without terminal reporting or releasing custody. */
+  private async parkRetainedRecoveryExhausted(flight: RunFlight): Promise<boolean> {
+    const deadline = Date.now() + this.codexBoundaryDeadlineMs;
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(new Error("retained park deadline exhausted")),
+      Math.max(1, deadline - Date.now()));
+    const signal = AbortSignal.any([this.retainedLifecycleSignal(flight), timeout.signal]);
+    const body: StateRequest = { status: "recovery_wait", recovery_cause: "retained_recovery_exhausted",
+      claim_generation: flight.claimGeneration };
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        this.retainedLifecycleGuard(flight);
+        signal.throwIfAborted();
+        try {
+          const ack = await flight.reportState(body, signal);
+          this.retainedLifecycleGuard(flight);
+          if (ack.staleClaim || ack.reason === "stale_claim" || ack.credentialSwitch ||
+              (ack.status !== undefined && ack.status !== "running" && ack.status !== "recovery_wait"))
+            throw new RetainedRecoveryStop();
+          if (ack.status === "recovery_wait" && ack.recoveryCause === "retained_recovery_exhausted") {
+            flight.parked = true;
+            return true;
+          }
+        } catch (error) {
+          this.retainedLifecycleGuard(flight);
+          if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal ||
+              error instanceof StaleClaimError || isRunOwnershipLost(error, flight.runId)) throw error;
+          if (error instanceof RequestError && error.status === 400) {
+            if (attempt === 0) return false;
+            throw new RetainedRecoveryStop();
+          }
+          flight.runLog.warn("retained exhaustion park report unconfirmed", {
+            attempt, ...formatRetainedRecoveryDiagnostic(error, flight.redactText),
+          });
+        }
+        // A lost ACK or a status-only 2xx is not proof. A same-generation ownership
+        // read permits one duplicate report, including when the park already landed.
+        const own = await this.getObservedRunOwnership(flight, { signal, deadline });
+        this.retainedLifecycleGuard(flight);
+        if (own.claim_generation !== flight.claimGeneration ||
+            (own.status !== "running" && own.status !== "recovery_wait")) throw new RetainedRecoveryStop();
+      }
+      throw new RetainedRecoveryStop();
+    } catch (error) {
+      // In this reconciliation even cancellation must not enter the legacy dispatcher's
+      // RetainedRecoveryCancelled terminal fallback. Other cancellation sites retain it.
+      if (error instanceof CredentialSwitchSignal) throw error;
+      throw new RetainedRecoveryStop({ cause: error });
+    } finally { clearTimeout(timer); }
+  }
+
   /** At most three durably precharged iterations per server recovery episode.
    * A newer episode with a fresh owned claim can renew budget exhaustion; other blockers persist.
    * Each failed capture blocks only this run; waits are bounded by the persisted episode clock. */
@@ -22110,13 +22178,13 @@ export class RunRunner {
     const finalize = new Error("retained recovery requires finalization");
     const fail = async (): Promise<never> => {
       this.retainedLifecycleGuard(flight);
-      // This is monotone episode bookkeeping followed by an exact-generation terminal
-      // report, not recovery authority. A new ownership GET could fail independently
-      // of the fenced state endpoint and leave an exhausted claim cycling again.
+      // Deadline expiry can reclassify a failed iteration, but only persisted readback
+      // below can authorize the typed exhaustion park.
       if (episode && episode.stage !== "blocked" && episode.claimGeneration === flight.claimGeneration &&
           Date.now() >= episode.deadline && blocker !== "decoded_history_limit" &&
           blocker !== "readiness_cleanup_unconfirmed") blocker = "budget_exhausted";
       let persistence = "";
+      let persisted: RecoveryJournalEntry | undefined;
       try {
         await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
           async () => {
@@ -22124,6 +22192,15 @@ export class RunRunner {
             await this.git.blockRecoveryEpisode(bare, branch, key, expectedSource, blocker, episode ?? null,
               () => this.retainedLifecycleGuard(flight));
             this.retainedLifecycleGuard(flight);
+            if (this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_exhausted") &&
+                Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0) {
+              const snapshot = await this.git.terminalRetainedSnapshot(bare, branch, key, expectedSource);
+              this.retainedLifecycleGuard(flight);
+              if (!snapshot || snapshot.journal.runId !== expectedSource.runId ||
+                  snapshot.journal.clonePath !== expectedSource.clonePath ||
+                  snapshot.journal.attemptId !== expectedSource.attemptId) throw new Error("recovery readback identity changed");
+              persisted = snapshot.journal;
+            }
           });
       }
       catch (error) {
@@ -22144,6 +22221,11 @@ export class RunRunner {
       // quiescence and persisted blocker, never the catch type or custody flags.
       flight.sourceBlockingNormal = flight.sourceFamilyMatched === true && sourceQuiescenceJoined &&
         blocker === "decoded_history_limit" && persistence === "" && !flight.sourceExitDenied && !flight.sourceDispatchDenied;
+      if (persistence === "" && persisted?.recovery?.stage === "blocked" && persisted.recovery.blocker === "budget_exhausted" &&
+          Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 &&
+          this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_exhausted")) {
+        if (await this.parkRetainedRecoveryExhausted(flight)) throw new RetainedRecoveryStop();
+      }
       await this.reportGenericFailure(claim, flight,
         blocker === "quiescence_failed" ? new RunResidueBlockedError(reason) : new Error(reason),
         { keepCustody: true });
@@ -22344,7 +22426,16 @@ export class RunRunner {
             () => flight.executor.recordedRootPids?.() ?? [], new Date(this.now()), attemptId);
           flight.attempt = attempt;
           this.liveAttempts.add(attempt);
-          await check();
+          try { await check(); }
+          catch (error) {
+            try {
+              if (!(error instanceof RetainedRecoveryStop) && !(error instanceof CredentialSwitchSignal) &&
+                  !isCheckpointBoundaryFailure(error) && !(error instanceof Error && error.name === "AbortError")) {
+                annotateRetainedSuccessorError(error, "post_adoption_check");
+              }
+            } catch { /* Diagnostics must not replace the original failure. */ }
+            throw error;
+          }
           // Capture boundaries may have closed the Codex executor. A new factory instance owns
           // model admission; the predecessor executor never runs the resumed model.
           if (claim.secrets.codex || flight.executor.safety || flight.executor.sandboxesCommands ||
@@ -22742,12 +22833,12 @@ export class RunRunner {
       // PRD #122 M1 (Decision 2): an autopilot run never reports awaiting_approval, so
       // the FROZEN milestone list rides this self-contained running report instead —
       // mirroring the repo_agents conditional above. Only when non-empty (additive-
-      // optional, never []). Reporting stays fire-and-forget via the .catch below.
+      // optional, never []). The storage report is awaited before implementation.
       if (milestones?.length) autopilotState.milestones = milestones;
       // PRD #84 M4: the FROZEN requirement set rides this same self-contained running
       // report (an autopilot run never reports awaiting_approval), each field only when
       // non-empty — same conditional-spread discipline as milestones/repo_agents above.
-      Object.assign(autopilotState, toolchainReportFields(toolchainDetection));
+      Object.assign(autopilotState, toolchainReportFields(toolchainDetection, this.client.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)));
       // RC1 (#1197): the approved autopilot plan rides this running report so the
       // server persists it durably via the guarded SetRunAutopilotPlan write — an
       // autopilot run never reports awaiting_approval, the channel the human-gated
@@ -22869,7 +22960,7 @@ export class RunRunner {
       // the server can gate plan-approval on worker eligibility. Each field only when
       // non-empty (additive-optional), matching the milestones conditional above.
       // PRD #1795: a re-presentation sends the requirements the human was shown instead.
-      ...(reuse ? presentedReportFields(reuse.presented) : toolchainReportFields(toolchainDetection)),
+      ...(reuse ? presentedReportFields(reuse.presented) : toolchainReportFields(toolchainDetection, this.client.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE))),
       // PRD #212 (Decision 3): ALWAYS send (empty [] when clean), NOT conditionally
       // spread — so each gate round REPLACES the server's list (M1's COALESCE clears on
       // empty), keeping a revision gate from showing a stale earlier round's writes.
@@ -23542,16 +23633,16 @@ function presentedReportFields(presented: GatePresentedRequirements | undefined)
   return fields;
 }
 
-/** PRD #84 M4: the additive `StateRequest` fields for a plan-time toolchain detection.
- *  Each array field is included ONLY when non-empty — mirroring the `milestones?.length ?
- *  {milestones} : {}` conditional-spread discipline, so a run that detected nothing (or
- *  whose scan failed and passed `undefined`) reports byte-for-byte as before. `size_class`
- *  is included whenever a detection was computed (it is soft/display-only). */
+/** Negotiate observations before freezing the plan report so the full captured
+ *  request matches its wire body and retries retain identical JSON. WorkerClient
+ *  still defends against feature shrink. Failed scans emit nothing; {} is known empty. */
 function toolchainReportFields(
   detection: ToolchainDetection | undefined,
+  evidenceSupported: boolean,
 ): Partial<StateRequest> {
   if (!detection) return {};
   const fields: Partial<StateRequest> = { size_class: detection.size_class };
+  if (evidenceSupported) fields.capability_inference_evidence = detection.evidence;
   if (detection.required_capabilities.length)
     fields.required_capabilities = detection.required_capabilities;
   if (detection.required_tools.length)

@@ -198,7 +198,7 @@ func (s *Service) CodeCrossCheckStatus(ctx context.Context, worker store.Worker,
 	return cc, nil
 }
 
-func (s *Service) DecideCodeCrossCheck(ctx context.Context, worker store.Worker, childID uuid.UUID, generation int64, outcome, reason string, findings []CodeCrossCheckFinding) (store.CrossCheck, error) {
+func (s *Service) DecideCodeCrossCheck(ctx context.Context, worker store.Worker, childID uuid.UUID, generation int64, outcome, reason string, findings []CodeCrossCheckFinding, coverage ...json.RawMessage) (store.CrossCheck, error) {
 	raw, err := NormalizeCodeCrossCheckFindings(outcome, reason, findings)
 	if err != nil || s.txBeginner == nil {
 		return store.CrossCheck{}, ErrCrossCheckRefused
@@ -217,7 +217,7 @@ func (s *Service) DecideCodeCrossCheck(ctx context.Context, worker store.Worker,
 	if reason != "" {
 		reasonPtr = &reason
 	}
-	cc, err := q.DecideCodeCrossCheck(ctx, store.DecideCodeCrossCheckParams{ChildID: childID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, Outcome: outcome, ReasonClass: pgconv.TextPtr(reasonPtr), Findings: raw})
+	cc, err := q.DecideCodeCrossCheck(ctx, store.DecideCodeCrossCheckParams{ChildID: childID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, Outcome: outcome, ReasonClass: pgconv.TextPtr(reasonPtr), Findings: raw, Coverage: NormalizeCodeCrossCheckCoverage(outcome, coverage...)})
 	if err != nil {
 		return cc, ErrCrossCheckRefused
 	}

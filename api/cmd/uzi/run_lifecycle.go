@@ -205,6 +205,7 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 			// This mirrors `run set-token`, which resolves/validates before its server call.
 			source, _ := cmd.Flags().GetString("agent-source")
 			exclude, _ := cmd.Flags().GetStringSlice("exclude-agents")
+			overrideCapabilities, _ := cmd.Flags().GetBool("override-capabilities")
 			sel, err := approveSelection(source, exclude)
 			if err != nil {
 				return err
@@ -214,6 +215,7 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			if reset != nil {
+				reset.OverrideCapabilities = overrideCapabilities
 				res, err := c.SubmitRunInputWithOptions(cmd.Context(), args[0], *reset)
 				if err != nil {
 					return err
@@ -256,11 +258,7 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 				}
 				tokenSwitched = true
 			}
-			if semantic != nil {
-				err = submitBoundInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false, expected, semantic)
-			} else {
-				err = submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false, expected)
-			}
+			err = submitBoundInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false, overrideCapabilities, expected, semantic)
 			// PRD #1795 D5: the revision is read BEFORE the switch (above), so a gate refused as
 			// stale can arrive after the switch already landed. The switch is not rolled back;
 			// say so, so the owner re-runs the approve without repeating it.
@@ -278,6 +276,7 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 	approve.Flags().String("semantic-approval", "", "exact semantic_gate.approval JSON reviewed from run get --json")
+	approve.Flags().Bool("override-capabilities", false, "clear this run's required capabilities and approve even if its worker cannot satisfy them")
 	approve.Flags().String("agent-source", "", "which subagent roster to run: own|repo (default: the run's own default)")
 	approve.Flags().StringSlice("exclude-agents", nil, "subagents to drop from the chosen source (requires --agent-source)")
 	// PRD #1247 M5b (D8): switch the run's Anthropic token as part of the approval. Same
@@ -315,7 +314,7 @@ func newRunRejectCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, nil, false, expected)
+			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, false, expected)
 		},
 	}
 	reject.Flags().StringP("message", "m", "", "reason to send back to the agent (or pipe it on stdin)")
@@ -342,7 +341,7 @@ func newRunCancelCmd(env Env, gf *globalFlags) *cobra.Command {
 			// discarding that outcome. This non-TTY flag is the explicit, no-prompt confirmation
 			// the owner passes to discard it and cancel.
 			discard, _ := cmd.Flags().GetBool("discard-pending-outcome")
-			return submitInput(env, gf, c, cmd, args[0], kindCancel, msg, nil, discard, nil)
+			return submitInput(env, gf, c, cmd, args[0], kindCancel, msg, discard, nil)
 		},
 	}
 	cancel.Flags().StringP("message", "m", "", "reason for cancelling (optional; or pipe it on stdin)")
@@ -381,7 +380,7 @@ func newRunStopCmd(env Env, gf *globalFlags) *cobra.Command {
 			// The stop message is OPTIONAL, like a cancel reason — no empty check.
 			msg, _ := cmd.Flags().GetString("message")
 			msg = resolveMessage(env, msg)
-			return submitInput(env, gf, c, cmd, args[0], kindStop, msg, nil, false, nil)
+			return submitInput(env, gf, c, cmd, args[0], kindStop, msg, false, nil)
 		},
 	}
 	stop.Flags().StringP("message", "m", "", "an optional message to accompany the stop (or pipe it on stdin)")

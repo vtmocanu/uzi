@@ -8,6 +8,7 @@ package main
 // COUNT — never the raw HealthReason — so it cannot inject via the count path (D7).
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -67,15 +68,10 @@ func TestVaultBandEscalatesWhenOwnRunParked(t *testing.T) {
 	})
 	line := m.vaultIndicatorLine()
 	plain := stripANSI(line)
-	for _, want := range []string{"VAULT LOCKED", "1 run parked", "unlock in the web app to resume"} {
+	for _, want := range []string{"VAULT LOCKED", "1 run parked", "uzi vault unlock", "web app"} {
 		if !strings.Contains(plain, want) {
 			t.Errorf("escalated band missing %q; got stripped %q", want, plain)
 		}
-	}
-	// Regression pin: the band must NOT name a CLI vault-unlock command — there is none, unlock is
-	// a web/API-only surface, so the copy points at the web app instead.
-	if strings.Contains(plain, "uzi vault unlock") {
-		t.Errorf("band names the non-existent `uzi vault unlock` CLI command; got %q", plain)
 	}
 	// The band and the tier-1 hint are mutually exclusive on the one line: the faint lock glyph
 	// is gone once the band shows.
@@ -281,6 +277,34 @@ func TestBoardCapacityReservesVaultBandLine(t *testing.T) {
 	}
 }
 
+func TestVaultBandAtTerminalWidths(t *testing.T) {
+	for _, width := range []int{80, 120} {
+		for _, ascii := range []bool{false, true} {
+			t.Run(fmt.Sprintf("width=%d/ascii=%t", width, ascii), func(t *testing.T) {
+				m := vaultBoardModel(t, false, "me@x.io", true, []apitypes.RunListItemDTO{vaultParkedRun("r1", serverVaultLockedReason, "")})
+				next, _ := m.Update(tea.WindowSizeMsg{Width: width, Height: 40})
+				m = next.(tuiModel)
+				if ascii {
+					next, _ = m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+					m = next.(tuiModel)
+				}
+				line := m.vaultIndicatorLine()
+				for _, output := range []string{line, m.View().Content} {
+					plain := stripANSI(output)
+					for _, want := range []string{"VAULT LOCKED", "1 run parked", "uzi vault unlock", "web app"} {
+						if !strings.Contains(plain, want) {
+							t.Errorf("missing %q at width %d: %q", want, width, plain)
+						}
+					}
+				}
+				if ascii && strings.ContainsRune(line, '\x1b') {
+					t.Error("ASCII vault band contains escape")
+				}
+			})
+		}
+	}
+}
+
 // TestVaultBandAsciiFallback — under colorprofile.Ascii the amber fill is stripped and the band's
 // WORDS carry the signal with NO colour (D4).
 func TestVaultBandAsciiFallback(t *testing.T) {
@@ -291,14 +315,10 @@ func TestVaultBandAsciiFallback(t *testing.T) {
 	m = next.(tuiModel)
 
 	line := m.vaultIndicatorLine()
-	for _, want := range []string{"VAULT LOCKED", "1 run parked", "unlock in the web app to resume"} {
+	for _, want := range []string{"VAULT LOCKED", "1 run parked", "uzi vault unlock", "web app"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("ascii band missing the signal word %q; got %q", want, line)
 		}
-	}
-	// Regression pin: the ascii band must not name a CLI vault-unlock command either (there is none).
-	if strings.Contains(line, "uzi vault unlock") {
-		t.Errorf("ascii band names the non-existent `uzi vault unlock` CLI command; got %q", line)
 	}
 	// No SGR/colour under Ascii: the words alone carry it.
 	if strings.ContainsRune(line, '\x1b') {

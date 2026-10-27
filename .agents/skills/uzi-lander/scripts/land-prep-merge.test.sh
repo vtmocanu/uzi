@@ -70,7 +70,7 @@ cat > "$WORK/bin/task" <<'STUB'
 set -eu
 printf '%s\n' "$*" >> "$TASK_LOG"
 case "${1:-}" in
-  migration:renumber) git mv "$RENUMBER_FROM" "$RENUMBER_TO"; echo "renamed $RENUMBER_FROM -> $RENUMBER_TO";;
+  migration:renumber) git mv "$RENUMBER_FROM" "$RENUMBER_TO"; echo "renamed $RENUMBER_FROM -> $RENUMBER_TO"; printf "%s\n" "${RENUMBER_OUT:-}";;
   gate:*) ;;
   *) echo "unexpected task: $*" >&2; exit 1;;
 esac
@@ -240,13 +240,24 @@ merge_branch mf
 branch_commit mf "$MIG/00002_branch.sql" '-- branch\n' 'branch migration'
 main_commit "$MIG/00002_main.sql" '-- main\n' 'main migration'
 : > "$TASK_LOG"
-RENUMBER_FROM="$MIG/00002_branch.sql" RENUMBER_TO="$MIG/00003_branch.sql" run mf 406 --no-push
+RENUMBER_OUT="migration-renumber: postflight found no other references to the old numbers." \
+  RENUMBER_FROM="$MIG/00002_branch.sql" RENUMBER_TO="$MIG/00003_branch.sql" run mf 406 --no-push
 [ "$rc" -eq 0 ] || fail "F: renumber after merge failed, rc=$rc: $(out 406)"
 grep -qx 'migration:renumber' "$TASK_LOG" || fail "F: migration:renumber was not invoked"
 WT="$WORK/wt-406"
 [ -f "$WT/$MIG/00003_branch.sql" ] && [ ! -e "$WT/$MIG/00002_branch.sql" ] || fail "F: the migration was not renamed"
 git -C "$WT" log -1 --format=%s | grep -q '^chore: renumber migrations' || fail "F: the renumber was not committed"
 [ "$(git -C "$WT" rev-parse HEAD^^2)" = "$(origin_ref main)" ] || fail "F: the renumber does not sit on the merge"
+
+# F2. a renumber that reports unresolved references stops for a hand fix, uncommitted.
+merge_branch mf2
+branch_commit mf2 "$MIG/00002_branch.sql" '-- branch\n' 'branch migration'
+main_commit "$MIG/00002_main2.sql" '-- main\n' 'main migration'
+RENUMBER_OUT="migration-renumber: POSTFLIGHT -- other files reference an OLD migration number." \
+  RENUMBER_FROM="$MIG/00002_branch.sql" RENUMBER_TO="$MIG/00004_branch.sql" run mf2 419 --no-push
+[ "$rc" -eq 6 ] || fail "F2: an unresolved-reference report returned rc=$rc, want 6: $(out 419)"
+grep -q '^RESULT=renumber_needs_hand_fix ' "$WORK/out.419" || fail "F2: no RESULT=renumber_needs_hand_fix: $(out 419)"
+git -C "$WORK/wt-419" log -1 --format=%s | grep -q '^chore: renumber migrations' && fail "F2: the renumber was committed"
 
 # G. forced modes are recorded for the landing.
 linear_branch lg

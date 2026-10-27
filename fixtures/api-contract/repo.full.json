@@ -15,6 +15,9 @@
   "required_capabilities": [
     "x"
   ],
+  "ignored_inferred_capabilities": [
+    "x"
+  ],
   "pipeline": {
     "ref": "x",
     "status": "x",

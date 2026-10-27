@@ -18,6 +18,7 @@ import { errorMessage } from "../../lib/apiError";
 import { setTokenBody } from "../../lib/credentialOverride";
 import { useSeededCredential } from "../../lib/useSeededCredential";
 import { stripUnsafeChars } from "../../lib/safeText";
+import { CapabilitySources } from "./CapabilitySources";
 import { effectiveWorkerCaps } from "../../lib/workerCaps";
 import { CAPABILITY_VOCABULARY } from "../../lib/capabilityVocabulary";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../../components/AgentPicker";
@@ -611,7 +612,7 @@ export function PlanPanel({
   // panel on its own — it is shown as a minor detail INSIDE the panel when a capability or tool
   // already opened it, and simply not shown when nothing else was inferred. A block is a subset
   // of requiredCaps, so "a capability, a tool, or a block" reduces to caps-or-tools here.
-  const hasRequirements = requiredCaps.length > 0 || requiredTools.length > 0;
+  const hasRequirements = requiredCaps.length > 0 || requiredTools.length > 0 || (run.capability_provenance?.capabilities.length ?? 0) > 0;
 
   // The rounds counter is always shown at the head; MAX is the display default (the
   // server owns the real cap).
@@ -804,13 +805,15 @@ export function PlanPanel({
         {/* PRD #84 M4 4d: the pre-run readiness summary — the run's inferred/hinted
             requirements checked against the assigned worker, shown between the candidate
             milestones and the plan body. Renders NOTHING when no CAPABILITY or TOOL was
-            inferred — size_class alone (always emitted) does not open it (see hasRequirements).
+            required or observed; ignored inference is informational. Size alone
+            does not open it (see hasRequirements).
             Capability/tool names are a server-Filter-ed vocabulary, but rendered through
             stripUnsafeChars anyway (defense-in-depth, matching the candidate milestones above) —
             this is an approval dialog. */}
         {hasRequirements && (
           <div className="rounded-lg border border-edge bg-surface/60 p-3">
             <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-faint">Run requirements</p>
+            <CapabilitySources provenance={run.capability_provenance} />
 
             {requiredCaps.length > 0 && (
               <div className="mb-2">

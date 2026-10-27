@@ -50,6 +50,56 @@ assert.ok([...complementRepresentations].every(form => !ownedRepresentations.has
   "owned forms and the complement are disjoint");
 
 describe("terminal execution disk deferral", () => {
+  for (const outcome of ["confirmed", "mismatched", "cancelled"] as const) {
+    it(`retained exhaustion ${outcome} keeps real clone bytes, HOME, journal and existing refs`, { skip: LINUX_CAPTURE }, async () => {
+      const f = fixture();
+      await f.runner.execute(f.claim);
+      const bare = git.barePathFor(fx.originPath);
+      const branch = "agent/issue-2201", key = "issue-2201";
+      const readJournal = (): RecoveryJournalEntry => JSON.parse(readGit(bare,
+        "config", "--local", "--get", `uzi-recovery.${branch}.clone`));
+      const source = readJournal();
+      for (let i = 0; i < 3; i++) await git.reserveRecoveryIteration(bare, branch, key, source, 1, 5, 7);
+      await assert.rejects(git.reserveRecoveryIteration(bare, branch, key, source, 1, 5, 7), /budget/);
+      const blocked = readJournal();
+      const refs = readGit(bare, "for-each-ref", "--format=%(refname) %(objectname)");
+      assert.ok(refs);
+      const report = client.reportState.bind(client);
+      const features = client.protocolFeatures;
+      let typed = 0;
+      client.protocolFeatures = [...features, "recovery_cause_retained_recovery_exhausted"];
+      client.reportState = async (id, body, signal) => {
+        if (body.recovery_cause !== "retained_recovery_exhausted") return report(id, body, signal);
+        typed++;
+        assert.equal(body.claim_generation, 5);
+        if (outcome === "cancelled") {
+          api.setOwnershipStatus(id, "cancelled", 5);
+          return { applied: false, status: "cancelled" };
+        }
+        api.setOwnershipStatus(id, "recovery_wait", 5);
+        return { applied: true, status: "recovery_wait", recoveryCause: outcome === "confirmed"
+          ? "retained_recovery_exhausted" : "data_volume_full" };
+      };
+      try {
+        f.setRoomy();
+        api.setOwnershipStatus(f.claim.run_id, "running", 5);
+        await f.runner.execute({ ...f.claim, claim_generation: 5, worker_recovery_episode: 7 });
+        assert.equal(typed, outcome === "mismatched" ? 2 : 1);
+        assert.equal(f.calls(), 1, "no model admission or fresh capture prerequisite for exhaustion");
+        assert.equal(api.states.filter(s => s.body.status === "failed").length, 0,
+          "uncertain or cancelled reconciliation cannot enter dispatcher's terminal fallback");
+        assert.equal(fs.readFileSync(path.join(source.clonePath, "COMMITTED.txt"), "utf8"), "committed sentinel\n");
+        assert.equal(fs.readFileSync(path.join(source.clonePath, "DIRTY.txt"), "utf8"), "dirty sentinel\n");
+        assert.equal(fs.readFileSync(path.join(f.home, "session"), "utf8"), "transcript");
+        assert.deepEqual(readJournal(), blocked);
+        assert.equal(readGit(bare, "for-each-ref", "--format=%(refname) %(objectname)"), refs);
+      } finally {
+        client.reportState = report;
+        client.protocolFeatures = features;
+      }
+    });
+  }
+
   for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) it(`policy refusal (#2321) ${tag} remains terminal on a full data volume`, async () => {
     const error = new ProviderPolicyRefusal({ ...admitPolicyTurn("implement"), event: "provider_policy_refusal",
       provider: "codex", category: "policy_refusal", origin: "root", policy_tag: tag });

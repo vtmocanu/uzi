@@ -40,8 +40,10 @@ SELECT * FROM instance_intake_pause_events ORDER BY at DESC, id DESC LIMIT @row_
 -- PRD #3454: the ephemeral provisioner's per-candidate recheck, run inside provisionOne's
 -- transaction right after the advisory lock. Plain snapshot read: NO row lock (a FOR UPDATE /
 -- FOR SHARE here could deadlock against the lease path, see the 40P01 note in workersvc/ephemeral_lease.go). false means
--- the pause is on and the run is not admitted; no row means the run is gone.
-SELECT (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))::boolean AS admittable
+-- intake is paused for this run or its Codex account admission deadline is still ahead;
+-- no row means the run is gone. The deadline includes recovery spread.
+SELECT ((NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
+        AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true))::boolean AS admittable
 FROM runs r
 WHERE r.id = @run_id;
 
@@ -76,6 +78,11 @@ SELECT r.id AS run_id, r.kind, r.status,
                   OR r.status IN ('awaiting_input', 'paused')
                   OR (r.status = 'recovery_wait'
                       AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure'))
+                  -- #3495: a capped retained-recovery park (NULL retry stamp) waits for owner
+                  -- Resume; a stamped one is an automatic retry still progressing.
+                  OR (r.status = 'recovery_wait'
+                      AND r.recovery_wait_cause = 'retained_recovery_exhausted'
+                      AND r.recovery_retry_not_before IS NULL)
              THEN 'needs_owner' ELSE 'progressing' END)::text AS tag,
        count(*) OVER ()::bigint AS total
 FROM runs r
@@ -144,10 +151,32 @@ LIMIT 50;
 
 -- name: ListRunQueueReasons :many
 -- PRD #3454: the derived queue_reason for a set of runs, evaluated at read time so it never lags
--- the pause. Only runs that are queued, not admitted, while intake is paused are returned (reason
--- "maintenance"); every other id is absent.
+-- the pause. A queued run that is not admitted while intake is paused reads "maintenance"; PRD
+-- #3522: a queued run carrying a weekly-reserve hold marker otherwise reads "weekly_reserve"
+-- (maintenance wins when both apply). Every other id is absent.
 SELECT r.id AS run_id,
-       'maintenance'::text AS queue_reason
+       (CASE WHEN (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r)
+             THEN 'maintenance' ELSE 'weekly_reserve' END)::text AS queue_reason
 FROM runs r
 WHERE r.id = ANY(@run_ids::uuid[])
-  AND r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r);
+  AND r.status = 'queued'
+  AND (((SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r))
+       OR r.reserve_hold_reason IS NOT NULL);
+
+-- name: ListRunAdmissionQueueReasons :many
+-- Read-time precedence: maintenance, then the PRD #3522 weekly reserve, then Codex account
+-- admission; owner admission details remain available independently.
+SELECT r.id AS run_id,
+       (CASE WHEN (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r)
+             THEN 'maintenance'
+             WHEN r.reserve_hold_reason IS NOT NULL THEN 'weekly_reserve'
+             WHEN admission.codex_admission_class = 'rate_limit' THEN 'codex_rate_limit'
+             WHEN admission.codex_admission_class = 'overload' THEN 'codex_overload'
+             ELSE '' END)::text AS queue_reason,
+       admission.codex_admission_class, admission.codex_admission_eligible_at
+FROM runs r
+LEFT JOIN codex_queued_run_admission admission ON admission.run_id = r.id AND admission.user_id = r.user_id AND admission.user_id = @viewer_id::uuid
+WHERE r.id = ANY(@run_ids::uuid[]) AND r.status = 'queued'
+  AND (admission.run_id IS NOT NULL
+       OR r.reserve_hold_reason IS NOT NULL
+       OR ((SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r)));

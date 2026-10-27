@@ -16,6 +16,15 @@ The register-only detail matters before you read any badge: a worker that went o
 through an upgrade still reports the version it ran *before*, so a failed upgrade is detected
 by watching the pod rather than by asking the worker.
 
+## Codex admission reporting compatibility
+
+For `codex_account_admission_signal_v1`, upgrade the API before workers.
+Older workers obey the server claim gate but provide less pressure evidence;
+missing or refused telemetry does not change run lifecycle behavior.
+Operators: see [upgrade, rollback and reporting limits](installation.md#codex-account-admission-upgrades).
+The [account admission policy](rate-limits.md#temporary-account-admission-waits)
+is shared across aliases and adds no account seat limit.
+
 ## Completion publication compatibility
 
 Coordinate API and worker upgrades for `completion_non_closing_v1`. A new

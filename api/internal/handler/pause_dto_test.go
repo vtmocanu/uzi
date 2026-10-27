@@ -25,6 +25,9 @@ func TestPauseRequestedRule(t *testing.T) {
 	}{
 		{"now parks immediately", "now", 6, 3, 3, true},
 		{"wall parks immediately (PRD #1497)", "wall", 6, 3, 3, true},
+		{"reserve parks like milestone: not yet at boundary (PRD #3522)", "reserve", 6, 3, 3, false},
+		{"reserve parks like milestone: past boundary (PRD #3522)", "reserve", 6, 4, 3, true},
+		{"reserve with no frozen list parks at next turn (PRD #3522)", "reserve", 0, 0, 0, true},
 		{"milestone not yet at boundary (completed == after)", "milestone", 6, 3, 3, false},
 		{"milestone past boundary (completed > after)", "milestone", 6, 4, 3, true},
 		{"milestone with no frozen list parks at next turn", "milestone", 0, 0, 0, true},

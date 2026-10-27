@@ -24,7 +24,7 @@ A run's tool set is resolved from three sources, highest precedence first:
 
 ## Set a repo's tools (tier 1)
 
-1. Open **Boards**, pick a repo, and open its **Tools** panel.
+1. Open **Repos**, pick a repo, and open its **Tools** panel.
 2. Add packages from the allowlist-backed picker (e.g. `kubectl@1.31`,
    `opentofu`). Pin a version with `name@version`.
 3. Save. Your next run on that repo has those tools on `PATH` inside the

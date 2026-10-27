@@ -87,3 +87,13 @@ func int32PtrValue(valid bool, v int32) *int32 {
 	}
 	return &v
 }
+
+// intPtrFromInt2 applies the JSON-null vs value convention to a nullable smallint
+// (users.weekly_reserve_pct, PRD #3522): NULL → JSON null (off), else the stored value.
+func intPtrFromInt2(v pgtype.Int2) *int {
+	if !v.Valid {
+		return nil
+	}
+	n := int(v.Int16)
+	return &n
+}

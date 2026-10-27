@@ -574,6 +574,123 @@ MEASURE elapsed=1354
   `EMFILE` under a low `RLIMIT_NOFILE` refuses safely; the ceiling is
   unmeasured.
 
+### Composed measurement harness (C2, #3442)
+
+`agent/test/measure-3031-composed.test.ts` is the harness for the composed capacity
+gate. A diagnostic run has been recorded (see "Official diagnostic run" below), but no
+qualifying C2 measurement and no PASS exist, and only a recorded PASS releases C3. The producer guard stays `false`; the harness
+changes no production code.
+
+It drives one complete pipeline per measurement through the real `RunRunner` and the
+real `RecoveryCoordinator` admission, in one charged slot with the production caps:
+W0-H capture, `importMaintenanceTip` (walk, selection, pack, proof, import), then the
+archive phase (`produceRecoveryBundle`, self-contained first, guarded thin fallback only
+on `RecoveryBundleTooLargeError`). The writer-exclusion proof and the quiescence scans are
+the real ones (three exclusion passes and the family proofs are charged inside the slot).
+The harness interventions are these, and every MEASURE line prints all of them: the guard
+method; a faked server behind the real strict client (the harness answers `hasFeature` and
+`listRecoveryHolds` directly); `isIdle`, a harness check (sole execution in the container and
+a settled runner, verified before admission, else UNRUN) passed to the real writer exclusion,
+which does not prove the production Worker-idleness integration; and a refusal of every
+`produceRecoveryBundle` call outside the archive window with a `RecoveryBundleTooLargeError`,
+which models the runner's ordinary pre-slot capture refused as oversize (without it the ordinary
+pass journals a real bundle, a saved-source candidate, and admission is refused as
+`source_protected_or_ambiguous`; measured on the shared-layout shape-B fixture, not diagnosed
+further). That suppression is not a Design-7 substitution, so
+every run is `eligible_for_gate: false` ("pre-slot production bundle path suppressed by the
+harness"), its counters are diagnostics, and the gate-level `c2_gate_summary` line is `UNRUN`
+(no qualifying measurement is possible) regardless of the counters.
+With the two-source family variant `UNRUN` at current production and the pre-slot suppression
+non-qualifying, C2 cannot record a PASS at this code: this is an R3 stop-and-report for the
+maintainers. Open reachability question, not a confirmed blocker and not something the harness
+proves: production may refuse `worker_not_idle` if the failed run's lane is still active at
+admission, which the harness's own sole-execution check does not exercise. The archive phase is
+harness-placed: it has no production caller yet. Every limit is read from the admitted slot
+reservation in the ledger, never from a table, and `decoded` follows the configured C. A
+charged dimension with no admitted limit fails.
+
+Run it as the container's main process on Linux, on the worker image's Git and Node,
+from a full (non-shallow, at least 1,000 commits) checkout of this repository:
+
+```sh
+UZI_MEASURE_3031=1 UZI_MEASURE_DOCKER_HOST=tcp://<dind>:2375 \
+  node --import tsx --test --test-timeout=120000 test/measure-3031-composed.test.ts > measure.out
+```
+
+- `UZI_MEASURE_DOCKER_HOST` is the Docker daemon the measurement is wired to. It must be a
+  throwaway dind sidecar reachable only from the measurement container: an unauthenticated,
+  TLS-off `tcp://...:2375` must never be exposed or shared, and it is never a real worker's
+  daemon. It must have zero running containers. Only the exclusion proof is read-only
+  (`GET /containers/json`, which requires zero running containers). The real quiescence
+  scans are not: they may force-remove (`DELETE /containers/<id>?force=1&v=1`) containers
+  that bind the fixture clone paths, and the `/proc` scan may SIGKILL in-scope processes.
+  Unset, the run reports UNRUN.
+- `TMPDIR` must be a case-sensitive, container-internal directory whose ancestors are not
+  group-writable, world-writable or sticky. Otherwise UNRUN with the reason. This rule rejects
+  the real Kubernetes `/data` layout (mode 2775), so the measurement runs on a scratch
+  directory, not on `/data`. It is single-UID (`UZI_UID_SPLIT` unset); split-UID is not
+  covered, and each MEASURE line records the mode.
+- The measurement must be the only process in its container: the exclusive-idle scan and the harness
+  idleness check refuse any other writer, so redirect output to a file (a `| tee` or `| grep` is a
+  foreign process) and run it as PID 1 (or a child of PID 1 through the test runner; a deeper ancestry is `UNRUN`), not through a long-lived `docker exec` shell.
+- `UZI_MEASURE_DEVIATION` states any difference from the worker image's environment. It
+  becomes `elapsed_fidelity: "unverified: <text>"`, and a would-be PASS is then reported as
+  `counters_within_limits_elapsed_unverified`. It never relaxes a limit or the slot deadline.
+
+Output is one `MEASURE {json}` line per layout (shared, dissociated) by shape (A, B, C) and
+per two-source family variant, a loose-object ladder above the shape-C count, and a ceiling
+summary. Each line carries per-phase counters for every slot dimension, the limit compared
+with, real `rpcAttempts`, elapsed time, RSS, Git and Node versions, substitutions, archive
+kind, bytes and the per-bundle cap, and `count-objects -v` per fixture clone. Shape C uses
+196 loose objects, the largest observed in a read-only sample of hosted worker attempt
+clones (not a fleet maximum). A refusal (layout, quiescence, admission, resource exhaustion)
+is recorded with its phase and the phases left unrun and is never a counter PASS. The
+two-source family variant is reported UNRUN: at this commit no production path produces a two-member
+family (the family list is `[genesis]` or the inherited list, which is built the same way), and the
+measurement injects no member. This is a reachability conflict between #3442 Design 5 and current
+production, left for maintainer disposition.
+
+The verdict controls (`measure-3031-composed.test.ts`, "verdict controls") run without the
+environment variable, on a small fixture, and are the only runs that stub exclusion and
+quiescence; their lines are marked as not eligible for the gate.
+
+#### Official diagnostic run (harness `91a8ad16`)
+
+Environment: the rc.26 worker image `agent-base@sha256:74154d5bf9f738278b65db058c3116d74b8cc7dfababd33e1f2bdff46bccbf07`, Git 2.54.0, Node v24.20.0,
+emulated linux/amd64 on an arm64 host, single-UID 10001 (split-UID not covered), candidate SHA
+`91a8ad16b50c31618b6070cfdf7a30ad8f1078ed`. The harness ran the candidate's `agent/src` with
+lockfile-installed `node_modules`, not the image's `/app` (rc.26 predates C1). Elapsed time is
+unverified (emulation). Evidence: ten JSON lines extracted from the run output, sha256
+`a03cd83f28afb82a85c1dac61aeb9898383ebda495c79db64ca54520bcbb582a`.
+
+| Run | Verdict | Refused phase | sourceEntries (W0 share) | sources | adminEntries | rpcAttempts | launches | Transfer entered | Archive |
+|---|---|---|---|---|---|---|---|---|---|
+| shared-A | FAIL | after_walk | 65,536 (62,980) | 58 | 3,371 | 25 | 162 | yes | none |
+| shared-B | FAIL | selection | 65,536 (62,745) | 70 | 3,341 | 25 | 167 | yes | none |
+| shared-C | FAIL | walk | 65,536 (63,300) | 58 | 3,366 | 25 | 162 | yes | none |
+| dissociated-A | FAIL (incomplete) | none attributed | 62,845 (partial) | 44 | 2,429 | 17 | 113 | no | none |
+| dissociated-B | FAIL | selection | 65,536 (62,745) | 66 | 3,341 | 25 | 168 | yes | none |
+| dissociated-C | FAIL | walk | 65,536 (63,300) | 58 | 3,366 | 25 | 162 | yes | none |
+| shared-family, dissociated-family | UNRUN | not reached | n/a | n/a | n/a | n/a | n/a | no | none |
+
+Results, stated exactly:
+
+- C2 remains UNRUN. The gate summary is UNRUN with 0 of 8 runs eligible: every run depends on the
+  suppressed pre-slot production bundle path.
+- The two-source family variants are UNRUN: a two-member family is unreachable through production code.
+- Five representative runs (shared A, B, C and dissociated B, C) show diagnostic `sourceEntries`
+  refusals at 65,536; W0 alone uses 62,745 to 63,300.
+- dissociated-A is incomplete and unattributed: the 120 s test timeout fired under emulation, the transfer
+  never entered, no quota was violated, and its W0 counters are partial. Its `post_archive` label is a
+  bookkeeping label, not evidence that archive execution occurred.
+- No representative run reached an archive outcome. The small controls did produce self-contained archives.
+- The loose-object ceiling is not established: 196 loose objects failed locally, which is not a proven
+  universal ceiling.
+
+These results are diagnostic only and are not C2 evidence. R3 conflicts for maintainer disposition: family
+reachability, the pre-slot bundle suppression, and `sourceEntries` capacity. No redesign, waiver or
+C3 to C8 unblock follows from them.
+
 
 ## U4b delivery (#3441), producer disabled
 

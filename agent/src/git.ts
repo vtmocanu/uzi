@@ -260,12 +260,25 @@ export interface CodeSnapshotRetirementProof {
  *  a late reader sees only EOF. A caller may await something before it reads (the finalize
  *  import starts its `index-pack` consumer first, which under the real supervisor can take
  *  longer than a small `pack-objects` takes to exit and reap); the bytes wait in `out`, with
- *  backpressure pausing the source, instead of being lost. */
+ *  backpressure pausing the source, instead of being lost.
+ *
+ *  `classifyAtAttach` (issue #3304, supervised boundary children only): the handle can reach this
+ *  function after its source already ended, closed or failed (the Codex supervisor closes its stdio
+ *  copies at launch, so a fast, silent child's pipe can be over before the handle is returned), and
+ *  a terminal event emitted before the listeners attach is never delivered again. With the flag the
+ *  source's terminal STATE is recorded as flags only and the exit verdict decides, through
+ *  {@link settle}'s precedence: data already read is lost output (refused at exit), an errored source
+ *  is refused with its error, an ended source with nothing ever read is a genuine empty EOF (valid
+ *  only on a clean exit), a source destroyed without ending is a premature close deferred to exit.
+ *  Nothing is destroyed eagerly. `fail(err)` settles the output with a typed error from the owner
+ *  when the supervised child's scope stops while the source can no longer finish by itself.
+ *  Callers that deliberately hand over a consumed source (`attachStdout`) keep the flag off. */
 function exitGatedStream(
   source: Readable,
   onAbandon?: () => void,
   deferPrematureCloseUntilExit = false,
-): { out: Readable; exited: (err?: Error) => void } {
+  classifyAtAttach = false,
+): { out: Readable; exited: (err?: Error) => void; fail: (err: Error) => void; done: () => boolean } {
   const out = new PassThrough();
   // A caller may drop the stream unread (tests do; a skipped publish could): an exit error
   // with no listener would be an uncaught exception that kills the worker. Consumers that
@@ -273,6 +286,7 @@ function exitGatedStream(
   out.on("error", () => undefined);
   let sourceEnded = false;
   let sourceClosedPrematurely = false;
+  let attachFailure: Error | undefined;
   let finished = false;
   let exit: { err?: Error } | undefined;
   const settle = (): void => {
@@ -280,6 +294,9 @@ function exitGatedStream(
     if (exit.err) {
       finished = true;
       out.destroy(exit.err);
+    } else if (attachFailure) {
+      finished = true;
+      out.destroy(attachFailure);
     } else if (sourceEnded) {
       finished = true;
       out.end();
@@ -314,6 +331,12 @@ function exitGatedStream(
     sourceEnded = true;
     settle();
   });
+  if (classifyAtAttach) {
+    if (source.errored) attachFailure = source.errored;
+    else if (source.readableDidRead) attachFailure = new Error("git stdout was read before it was attached (output lost)");
+    else if (source.readableEnded) sourceEnded = true;
+    else if (source.destroyed) sourceClosedPrematurely = true;
+  }
   source.pipe(out, { end: false });
   return {
     out,
@@ -321,6 +344,13 @@ function exitGatedStream(
       exit ??= { err };
       settle();
     },
+    fail: (err) => {
+      if (finished || out.destroyed) return;
+      finished = true;
+      source.unpipe(out);
+      out.destroy(err);
+    },
+    done: () => finished || out.destroyed,
   };
 }
 
@@ -420,6 +450,27 @@ export class ScratchPublicationError extends Error {
 // Transport text is private and ephemeral. Only the safe formatter below reads it;
 // the public Error message and abort/residue classifications remain unchanged.
 const retainedGitDiagnostics = new WeakMap<Error, { stderr: string; context: string }>();
+const RETAINED_SUCCESSOR_REASONS = new Set([
+  "wrapper_tip_subject", "wrapper_source_subject", "wrapper_leaf_subject", "wrapper_commit_read",
+  "wrapper_walk_bound", "wrapper_tip_bound", "wrapper_coverage_leaf_bound", "wrapper_lookalike_bound",
+  "wrapper_aggregate_bound", "wrapper_leaf_bound", "wrapper_lookalike", "wrapper_source_missing",
+  "wrapper_aggregate_missing", "wrapper_fingerprint_mismatch", "wrapper_source_oid", "wrapper_source_tree",
+  "wrapper_tree", "wrapper_author", "wrapper_committer", "wrapper_source_leaf", "wrapper_fingerprint",
+  "wrapper_pin_read", "wrapper_pin", "wrapper_lineage_marker", "wrapper_lineage_membership",
+  "wrapper_marker_parent", "wrapper_lineage_ancestry", "wrapper_source_parent",
+  "final_head", "final_tree", "final_marker_restoration", "final_dirty_diff", "final_ancestry",
+  "attempt_invalid", "iteration_before", "episode_pin_changed", "identity_used", "seed_failed",
+  "iteration_after", "post_adoption_check",
+]);
+const retainedSuccessorDiagnostics = new WeakMap<Error, string>();
+
+/** Attach only a fixed successor reason, without changing the thrown value's public surface.
+ * Callers retain responsibility for excluding their abort and control-flow sentinels. */
+export function annotateRetainedSuccessorError<T>(error: T, reason: string): T {
+  if (error instanceof Error && RETAINED_SUCCESSOR_REASONS.has(reason)) retainedSuccessorDiagnostics.set(error, reason);
+  return error;
+}
+
 const RETAINED_DIAGNOSTIC_INPUT_MAX = 64 * 1024;
 
 /** Redact unsplit inputs before sanitizing or cutting. Both ends survive a cut so
@@ -451,6 +502,12 @@ export function formatRetainedRecoveryDiagnostic(
 ): { diagnostic_stage: string; diagnostic_code: string; cause: string; context?: string } {
   let stage = "recovery";
   try {
+    // WeakMap lookup inspects no properties and returns undefined for primitive keys too.
+    // Avoid adding an observable instanceof/prototype read to untagged formatting.
+    const successor = retainedSuccessorDiagnostics.get(error as Error);
+    if (successor !== undefined && RETAINED_SUCCESSOR_REASONS.has(successor)) {
+      return { diagnostic_stage: "successor", diagnostic_code: "retained_successor_" + successor, cause: "" };
+    }
     const transport = error instanceof Error ? retainedGitDiagnostics.get(error) : undefined;
     const message = error instanceof Error ? error.message : String(error);
     if (!transport && message.startsWith("retained_readiness_")) {
@@ -758,7 +815,8 @@ interface BoundaryProcessScope {
   spawn: BoundaryProcessSpawner;
   signal: AbortSignal;
   /** Checkpoint-only budget. The soft signal may forfeit a queued lock or abort
-   * broker I/O; it must never abort an active child output collector. */
+   * broker I/O; it never settles a child output collector before that child's
+   * cancellation and completion have settled through its handle (issue #3304). */
   softSignal?: AbortSignal;
   softDeadlineAt?: number;
   now?: () => number;
@@ -1450,6 +1508,18 @@ export class BareCacheIdentityError extends Error {
   constructor(readonly bareName: string) {
     super(`bare cache identity check failed: ${bareName}`);
     this.name = "BareCacheIdentityError";
+  }
+}
+
+/**
+ * issue #3450: a bare cache that is shallow (a `shallow` file, refs with missing ancestry) is
+ * refused, both when freshly cloned and when reused. Refusal only: an existing bare is left as
+ * found. Non-retryable by the default classification; the message carries no path on purpose.
+ */
+export class BareCacheShallowError extends Error {
+  constructor() {
+    super("repo cache refused: shallow repository");
+    this.name = "BareCacheShallowError";
   }
 }
 
@@ -2840,6 +2910,7 @@ export class GitCache {
   private async readBareCacheOrigin(barePath: string): Promise<BareCacheOrigin> {
     let out: string;
     try {
+      await this.assertCanonicalAlternatesAbsent(barePath);
       out = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
     } catch (err) {
       if (err instanceof RunResidueBlockedError) throw err;
@@ -2860,6 +2931,13 @@ export class GitCache {
     if (!HASHED_BARE_NAME.test(name)) return;
     const stored = await this.readBareCacheOrigin(barePath);
     if (stored.kind !== "ok" || stored.value !== repoUrl) throw new BareCacheIdentityError(name);
+  }
+
+  /** issue #3450: refuse a shallow bare. Read-only probe; a probe failure propagates unchanged. */
+  private async assertBareNotShallow(barePath: string): Promise<void> {
+    const { stdout } = await this.execScoped("git", withDir(barePath, ["rev-parse", "--is-shallow-repository"]),
+      { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
+    if (stdout.trim() !== "false") throw new BareCacheShallowError();
   }
 
   /** Resolve a recovery journal basename to a real bare directly under the private repos root. */
@@ -2887,6 +2965,7 @@ export class GitCache {
         }) as [string, string];
       });
       if (path.dirname(realBare) !== realRoot) return undefined;
+      await this.assertCanonicalAlternatesAbsent(barePath);
     } catch {
       return undefined;
     }
@@ -2973,6 +3052,8 @@ export class GitCache {
       await fs.mkdir(this.reposRoot, { recursive: true });
       if (await isBareRepo(barePath)) {
         await this.assertBareOriginIdentity(barePath, repoUrl);
+        // issue #3450: before any write (maintenance config, fetch) so a refusal leaves it as found.
+        await this.assertBareNotShallow(barePath);
         this.log.info("repo cache: fetching", { bare: barePath });
         // Issue #134: reassert IDEMPOTENTLY on the warm path, BEFORE the fetch (the first
         // object-writing command, hence the first spawner). cloneBare only runs on the very
@@ -7666,21 +7747,25 @@ export class GitCache {
     // source (freezeInventory appends it to the roots) and the current source (buildRecoveryCoverage
     // adds it), and the two extras can be distinct.
     const MAX_LEAVES = MAX_OWED_CANDIDATES_PER_RUN + 2, MAX_AGGREGATES = 8, MAX_OBJECT_BYTES = 64 * 1024;
-    const fail = (): never => { throw new Error("successor recovery verification failed"); };
+    const fail = (reason?: string): never => {
+      const error = new Error("successor recovery verification failed");
+      if (reason !== undefined) annotateRetainedSuccessorError(error, reason);
+      throw error;
+    };
     // Throwing subject read (unlike isWipParkMarker/tryGitStdout, which answer "" on any non-abort
     // error): once a decision depends on the subject, an unreadable commit refuses.
-    const subjectOf = async (rev: string): Promise<string> => {
+    const subjectOf = async (rev: string, reason: string): Promise<string> => {
       try {
         return (await this.runGit(barePath, ["--no-replace-objects", "log", "-1", "--format=%s", `${rev}^{commit}`])).trim();
       } catch (err) {
         const abort = this.boundaryAbortError(err);
         if (abort) throw abort;
-        return fail();
+        return fail(err instanceof Error ? reason : undefined);
       }
     };
-    const subject = await subjectOf(tip);
+    const subject = await subjectOf(tip, "wrapper_tip_subject");
     if (subject.startsWith(WIP_PARK_COMMIT_PREFIX)) return undefined;
-    const srcMarker = src !== undefined && OWED_OID.test(src) && (await subjectOf(src)).startsWith(WIP_PARK_COMMIT_PREFIX);
+    const srcMarker = src !== undefined && OWED_OID.test(src) && (await subjectOf(src, "wrapper_source_subject")).startsWith(WIP_PARK_COMMIT_PREFIX);
     // From here the tip is a coverage commit or the source is a marker. A wrapper whose walk cannot be
     // completed cannot be shown to bury no marker, so every inability to verify below refuses; only a
     // non-tip commit that cannot be read within bounds is demoted to a leaf (it then meets the leaf rule).
@@ -7696,16 +7781,16 @@ export class GitCache {
       const sha = queue.shift()!;
       if (seen.has(sha)) continue;
       seen.add(sha);
-      if (seen.size > MAX_AGGREGATES + MAX_LEAVES) return fail();
+      if (seen.size > MAX_AGGREGATES + MAX_LEAVES) return fail("wrapper_walk_bound");
       let commit;
       try { commit = await this.readBoundedCommit(barePath, sha, MAX_OBJECT_BYTES); } catch (err) {
         const abort = this.boundaryAbortError(err);
         if (abort) throw abort;
-        return fail();
+        return fail(err instanceof Error ? "wrapper_commit_read" : undefined);
       }
       if (!commit) {
-        if (sha === tip) return fail();
-        if ((await subjectOf(sha)).startsWith("uzi recovery coverage ")) return fail();
+        if (sha === tip) return fail("wrapper_tip_bound");
+        if ((await subjectOf(sha, "wrapper_leaf_subject")).startsWith("uzi recovery coverage ")) return fail("wrapper_coverage_leaf_bound");
         leaves.add(sha);
         continue;
       }
@@ -7716,7 +7801,7 @@ export class GitCache {
         // marker involvement refuses below (defence in depth: the fingerprint/pin checks would too).
         if (commit.message.startsWith("uzi recovery coverage ")) {
           lookalike = true;
-          if (++lookalikes > MAX_AGGREGATES) return fail();
+          if (++lookalikes > MAX_AGGREGATES) return fail("wrapper_lookalike_bound");
           queue.push(...commit.parents);
           continue;
         }
@@ -7724,56 +7809,71 @@ export class GitCache {
         continue;
       }
       aggregates.push({ fp: m[1]!, tree: commit.tree, author: commit.author, committer: commit.committer });
-      if (aggregates.length > MAX_AGGREGATES) return fail();
+      if (aggregates.length > MAX_AGGREGATES) return fail("wrapper_aggregate_bound");
       queue.push(...commit.parents);
     }
-    if (leaves.size > MAX_LEAVES) return fail();
+    if (leaves.size > MAX_LEAVES) return fail("wrapper_leaf_bound");
     const markerLeaves = new Set<string>();
-    for (const leaf of leaves) if ((await subjectOf(leaf)).startsWith(WIP_PARK_COMMIT_PREFIX)) markerLeaves.add(leaf);
+    for (const leaf of leaves) if ((await subjectOf(leaf, "wrapper_leaf_subject")).startsWith(WIP_PARK_COMMIT_PREFIX)) markerLeaves.add(leaf);
     if (!srcMarker && markerLeaves.size === 0) return undefined;
-    if (lookalike) return fail();
+    if (lookalike) return fail("wrapper_lookalike");
 
     // From here the shape involves a marker: everything below is a hard requirement.
-    if (!src || !aggregates.length) return fail();
+    if (!src) return fail("wrapper_source_missing");
+    if (!aggregates.length) return fail("wrapper_aggregate_missing");
     const fp = aggregates[0]!.fp;
-    if (aggregates.some(a => a.fp !== fp)) return fail();
+    if (aggregates.some(a => a.fp !== fp)) return fail("wrapper_fingerprint_mismatch");
     // The source (and a marker leaf) is read by plumbing, not readBoundedCommit: a clean source may be
     // oversized or non-UTF-8 and must still be comparable.
-    if (!OWED_OID.test(src)) return fail();
-    const sha1Of = async (rev: string): Promise<string> => {
+    if (!OWED_OID.test(src)) return fail("wrapper_source_oid");
+    const sha1Of = async (rev: string, reason: string): Promise<string> => {
       const out = await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-parse", "--verify", rev]);
-      return OWED_OID.test(out) ? out : fail();
+      return OWED_OID.test(out) ? out : fail(reason);
     };
-    const srcTree = await sha1Of(`${src}^{tree}`);
+    const srcTree = await sha1Of(`${src}^{tree}`, "wrapper_source_tree");
     const identity = (kind: string) => `${kind} ${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
     for (const a of aggregates) {
-      if (a.tree !== srcTree || a.author !== identity("author") || a.committer !== identity("committer")) return fail();
+      if (a.tree !== srcTree) return fail("wrapper_tree");
+      if (a.author !== identity("author")) return fail("wrapper_author");
+      if (a.committer !== identity("committer")) return fail("wrapper_committer");
     }
     const sortedLeaves = [...leaves].sort();
-    if (!leaves.has(src)) return fail();
+    if (!leaves.has(src)) return fail("wrapper_source_leaf");
     // The roots are the leaves, with or without the current source (the producer passes both forms).
     const fingerprints = [sortedLeaves, sortedLeaves.filter(l => l !== src)].filter(r => r.length > 0)
       .map(roots => createHash("sha256").update(JSON.stringify({ roots, currentSha: src, tree: srcTree })).digest("hex"));
-    if (!fingerprints.includes(fp)) return fail();
+    if (!fingerprints.includes(fp)) return fail("wrapper_fingerprint");
     // Provenance: only the worker's own pin of this very wrapper, for this run, proves it is genuine.
-    const pins = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
-      `refs/uzi-coverage/${journal.runId}/`]);
+    let pins: string;
+    try {
+      pins = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
+        `refs/uzi-coverage/${journal.runId}/`]);
+    } catch (error) {
+      try {
+        if (!this.boundaryProcesses.getStore()?.signal.aborted && !isCheckpointBoundaryFailure(error) &&
+            !(error instanceof CheckpointChildStartupTimeoutError) && !isAbortLike(error)) {
+          annotateRetainedSuccessorError(error, "wrapper_pin_read");
+        }
+      } catch { /* Diagnostics must not replace the original failure. */ }
+      throw error;
+    }
     const pinned = pins.split("\n").some(line => {
       const [ref, oid] = line.split(" ");
       return oid === tip && ref !== undefined && new RegExp(`^refs/uzi-coverage/[^/]+/[^/]+/${fp}$`).test(ref);
     });
-    if (!pinned) return fail();
+    if (!pinned) return fail("wrapper_pin");
     // Leaves: the source, history of the source, or a marker this attempt's lineage proves superseded.
     const lineage = new Set(journal.peeledMarkers ?? []);
     const accepted: string[] = [];
     for (const leaf of sortedLeaves) {
       if (leaf === src || await this.isAncestor(barePath, leaf, src)) continue;
-      if (!markerLeaves.has(leaf) || !lineage.has(leaf)) return fail();
-      if (!await this.isAncestor(barePath, await sha1Of(`${leaf}^`), src)) return fail();
+      if (!markerLeaves.has(leaf)) return fail("wrapper_lineage_marker");
+      if (!lineage.has(leaf)) return fail("wrapper_lineage_membership");
+      if (!await this.isAncestor(barePath, await sha1Of(`${leaf}^`, "wrapper_marker_parent"), src)) return fail("wrapper_lineage_ancestry");
       accepted.push(leaf);
     }
     if (srcMarker) {
-      return { seedTip: src, expectedHead: await sha1Of(`${src}^`), expectedTree: srcTree,
+      return { seedTip: src, expectedHead: await sha1Of(`${src}^`, "wrapper_source_parent"), expectedTree: srcTree,
         peeledMarkers: unionPeeledMarkers(accepted, [src]) };
     }
     return { seedTip: src, expectedHead: src, expectedTree: srcTree, peeledMarkers: unionPeeledMarkers(accepted) };
@@ -7787,21 +7887,21 @@ export class GitCache {
     barePath: string, branch: string, key: string, expected: RecoverySource, iteration: number,
     attemptId: string, opts?: { selfContained?: boolean; checkpointKey?: string | null; checkpointWriteUnresolved?: boolean },
   ): Promise<RunnerClone> {
-    if (!ATTEMPT_ID_RE.test(attemptId)) throw new Error("invalid successor attempt");
+    if (!ATTEMPT_ID_RE.test(attemptId)) throw annotateRetainedSuccessorError(new Error("invalid successor attempt"), "attempt_invalid");
     return this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const recovery = journal.recovery;
       if (!recovery || recovery.stage !== "captured" || recovery.attempts !== iteration ||
-          !recovery.restoreTip || !await this.recoveryClockCurrent(barePath, branch, journal)) throw new Error("successor iteration is not current");
+          !recovery.restoreTip || !await this.recoveryClockCurrent(barePath, branch, journal)) throw annotateRetainedSuccessorError(new Error("successor iteration is not current"), "iteration_before");
       // The successor journal below is a fresh object that deliberately omits the fence.
       this.refuseFenceDrop(journal, "adopt successor");
       const tip = recovery.restoreTip;
       const pin = `refs/uzi-recovery-episode/${journal.runId}/${tip}`;
-      if ((await this.runGit(barePath, ["rev-parse", "--verify", pin])).trim() !== tip) throw new Error("recovery pin changed");
+      if ((await this.runGit(barePath, ["rev-parse", "--verify", pin])).trim() !== tip) throw annotateRetainedSuccessorError(new Error("recovery pin changed"), "episode_pin_changed");
       // issue #3239: before any write, so a refusal leaves no ledger entry, journal change or clone.
       const wrapped = await this.resolveMarkerWrapperAdoption(barePath, journal, tip, recovery.restoreSource);
       const clonePath = attemptClonePath(this.runnerClonePath(barePath, key), attemptId);
-      if (await this.pathPresent(clonePath) || (await this.readAttemptLedger(barePath, branch)).has(attemptId)) throw new Error("successor identity already used");
+      if (await this.pathPresent(clonePath) || (await this.readAttemptLedger(barePath, branch)).has(attemptId)) throw annotateRetainedSuccessorError(new Error("successor identity already used"), "identity_used");
       const successor: RecoverySource = { runId: journal.runId, clonePath, attemptId, restoreTip: tip };
       const existingSources: RecoverySource[] = [];
       for (const s of this.recoverySources(journal)) {
@@ -7817,18 +7917,32 @@ export class GitCache {
       await this.appendAttemptLedger(barePath, branch, { attemptId, runId: successor.runId, clonePath, state: "live" });
       await this.writeRecovery(barePath, branch, { ...journal, retainedSources,
         recovery: { ...recovery, successor, stage: "adopting" } });
-      const seeded = await this.seedRunnerClone(barePath, branch, clonePath, journal.runId, true, undefined,
-        { ...opts, recoveryTip: wrapped?.seedTip ?? tip });
+      let seeded: RunnerClone;
+      try {
+        seeded = await this.seedRunnerClone(barePath, branch, clonePath, journal.runId, true, undefined,
+          { ...opts, recoveryTip: wrapped?.seedTip ?? tip });
+      } catch (error) {
+        try {
+          if (!this.boundaryProcesses.getStore()?.signal.aborted && !isCheckpointBoundaryFailure(error) &&
+              !(error instanceof CheckpointChildStartupTimeoutError) && !isAbortLike(error)) {
+            annotateRetainedSuccessorError(error, "seed_failed");
+          }
+        } catch { /* Diagnostics must not replace the original failure. */ }
+        throw error;
+      }
       const head = (await this.runGitAsRunner(clonePath, ["rev-parse", "HEAD"])).trim();
       const tree = (await this.runGitAsRunner(clonePath, ["write-tree"])).trim();
       const expectedTree = wrapped?.expectedTree ?? (await this.runGit(barePath, ["rev-parse", `${tip}^{tree}`])).trim();
       const marker = wrapped ? wrapped.expectedHead !== wrapped.seedTip : await this.isWipParkMarker(barePath, tip);
       const expectedHead = wrapped?.expectedHead ?? (marker ? (await this.runGit(barePath, ["rev-parse", `${tip}^`])).trim() : tip);
-      if (head !== expectedHead || tree !== expectedTree || (wrapped && marker && seeded.wipRecovered !== true) ||
-          (await this.runGitAsRunner(clonePath, ["diff", "--name-only"])).trim() !== "" ||
-          !await this.isAncestor(barePath, expectedHead, tip)) throw new Error("successor recovery verification failed");
+      const failedProof = head !== expectedHead ? "final_head"
+        : tree !== expectedTree ? "final_tree"
+        : (wrapped && marker && seeded.wipRecovered !== true) ? "final_marker_restoration"
+        : (await this.runGitAsRunner(clonePath, ["diff", "--name-only"])).trim() !== "" ? "final_dirty_diff"
+        : !await this.isAncestor(barePath, expectedHead, tip) ? "final_ancestry" : undefined;
+      if (failedProof) throw annotateRetainedSuccessorError(new Error("successor recovery verification failed"), failedProof);
       if (!await this.recoveryClockCurrent(barePath, branch, { ...journal, retainedSources,
-        recovery: { ...recovery, successor, stage: "adopting" } })) throw new Error("successor iteration is not current");
+        recovery: { ...recovery, successor, stage: "adopting" } })) throw annotateRetainedSuccessorError(new Error("successor iteration is not current"), "iteration_after");
       await this.writeRecovery(barePath, branch, { ...successor, retainedSources,
         // issue #3239: the lineage of what this seed peeled: the wrapper's accepted markers, or the tip
         // itself when the tip is the marker the seed's `reset --soft` removed from history.
@@ -13653,6 +13767,8 @@ try {
     if (!Number.isFinite(timeoutMs)) throw new Error(`${what}: timeoutMs must be finite`);
     const deadlineError = new Error(`${what} exceeded ${timeoutMs}ms`);
     const budgeted = !!this.recoveryOperation()?.budget || MaintenanceResources.active();
+    // issue #3304: the scope's stop signals, read at spawn time. A masked scope carries no soft signal.
+    const stopSignals = this.boundaryStopSignals();
     const { stdout, exited, cancel } = await this.spawnGit(barePath, [...args], undefined, {
       timeoutMs,
       cancelOnAbandon: budgeted,
@@ -13664,10 +13780,20 @@ try {
       let bytes = 0;
       let settled = false;
       let timer: NodeJS.Timeout | undefined;
+      // Once the boundary scope stops, this plain deadline must not race the owner's typed verdict: the
+      // stopped scope settles the gated stdout itself (spawnGit), so the timer only retires. It never
+      // settles, abandons or kills anything, and it is never armed again.
+      let retired = false;
+      const retire = (): void => {
+        retired = true;
+        if (timer !== undefined) clearTimeout(timer);
+        timer = undefined;
+      };
       const finish = (result: BoundedRead | undefined, error?: Error): void => {
         if (settled) return;
         settled = true;
         if (timer !== undefined) clearTimeout(timer);
+        for (const signal of stopSignals) signal.removeEventListener("abort", retire);
         opts.signal?.removeEventListener("abort", onAbort);
         stdout.removeListener("data", onData);
         stdout.removeListener("end", onEnd);
@@ -13703,7 +13829,11 @@ try {
       stdout.on("data", onData);
       stdout.once("end", onEnd);
       stdout.once("error", onError);
-      timer = setTimeout(() => finish(undefined, deadlineError), timeoutMs);
+      if (stopSignals.some(signal => signal.aborted)) retired = true;
+      else {
+        for (const signal of stopSignals) signal.addEventListener("abort", retire, { once: true });
+        timer = setTimeout(() => { if (!retired) finish(undefined, deadlineError); }, timeoutMs);
+      }
       if (opts.signal?.aborted) onAbort();
       else opts.signal?.addEventListener("abort", onAbort, { once: true });
     });
@@ -15557,6 +15687,7 @@ try {
    * as {@link runGit} (via {@link spawnGit}), no shell, and the same GIT_TIMEOUT_MS bound.
    */
   private async streamBundleWithCap(barePath: string, args: string[], outPath: string, maxBytes: number): Promise<void> {
+    const stopSignals = this.boundaryStopSignals();
     const { child, stdout, exited, cancel } = await this.spawnGit(barePath, args, undefined, { timeoutMs: GIT_TIMEOUT_MS, stdoutCategory: "artifactBytes" });
     let seen = 0;
     const counter = new Transform({
@@ -15570,10 +15701,24 @@ try {
       cancel();
       if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     };
-    const timer = setTimeout(() => {
-      killChild();
-      counter.destroy(new Error(`git ${args.join(" ")} exceeded ${GIT_TIMEOUT_MS}ms`));
-    }, GIT_TIMEOUT_MS);
+    // issue #3304: after the boundary scope stops, this plain deadline only retires (see readBare); the
+    // gated stdout settles with the owner's typed error and the catch below still kills and removes.
+    let retired = false;
+    let timer: NodeJS.Timeout | undefined;
+    const retire = (): void => {
+      retired = true;
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    };
+    if (stopSignals.some(signal => signal.aborted)) retired = true;
+    else {
+      for (const signal of stopSignals) signal.addEventListener("abort", retire, { once: true });
+      timer = setTimeout(() => {
+        if (retired) return;
+        killChild();
+        counter.destroy(new Error(`git ${args.join(" ")} exceeded ${GIT_TIMEOUT_MS}ms`));
+      }, GIT_TIMEOUT_MS);
+    }
     try {
       await pipeline(stdout, counter, createWriteStream(outPath, { mode: 0o600 }));
       await exited;
@@ -15585,7 +15730,8 @@ try {
       await fs.rm(outPath, { force: true });
       throw err;
     } finally {
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
+      for (const signal of stopSignals) signal.removeEventListener("abort", retire);
     }
   }
 
@@ -15987,6 +16133,8 @@ try {
     // transient into a permanent one. This guarantees each retry starts from a clean bare.
     try {
       await this.runGit(undefined, ["clone", "--bare", "-c", `${BARE_CACHE_ORIGIN_KEY_CONFIG}=${repoUrl}`, "--", repoUrl, dest], pat, scope, username);
+      // issue #3450: a shallow source yields a shallow bare; refuse it (the catch removes dest).
+      await this.assertBareNotShallow(dest);
       // Convert the mirror refspec to remote-tracking so future fetches write to
       // refs/remotes/origin/*. Under (b) the bare's refs/heads/* stay the
       // stale mirror; the agent branch is resolved via refs/remotes/origin/* (resume)
@@ -16580,6 +16728,13 @@ try {
     }
   }
 
+  /** issue #3304: the active boundary scope's stop signals (hard permit signal, and the soft signal unless
+   *  the scope is masked), read once when a read starts. Empty outside a boundary scope. */
+  private boundaryStopSignals(): AbortSignal[] {
+    const scope = this.boundaryProcesses.getStore();
+    return scope ? [scope.signal, scope.softSignal].filter((signal): signal is AbortSignal => signal !== undefined) : [];
+  }
+
   /** Called under the existing lock, after observation. Only cooperative checkpoint
    * cancellation is masked; the spawner, hard signal and release hook are identical. */
   private maskCheckpointCooperation<T>(action: () => Promise<T>): Promise<T> {
@@ -16945,6 +17100,16 @@ try {
     process.stdin?.on("error", () => undefined);
     if (!recovery?.signal.aborted) process.stdin?.end(input);
     const cap = options.maxBuffer ?? GIT_MAX_BUFFER;
+    // issue #3304: the soft signal of an UNMASKED scope settles a collector only after the child's own
+    // cancellation and completion have settled through its handle, and only if the stream still has not ended.
+    let softJoin: Promise<void> | undefined;
+    const joinSoftStop = (): Promise<void> => softJoin ??= (async () => {
+      // The handle's own soft listener (spawnCheckpointProcess) requests the cancellation while the handle
+      // still admits it; once completion has settled nothing is needed.
+      await Promise.allSettled([process.completed]);
+      // An EOF already queued on the stream (delivered on a later tick) must land before the verdict.
+      await new Promise<void>(resolve => setImmediate(resolve));
+    })();
     const collect = (source: Readable | null): Promise<{ chunks: Buffer[]; oversized: boolean }> =>
       new Promise((resolve, reject) => {
         if (!source) { resolve({ chunks: [], oversized: false }); return; }
@@ -16955,6 +17120,7 @@ try {
         let settled = false;
         const cleanup = (): void => {
           boundary.signal.removeEventListener("abort", onAbort);
+          boundary.softSignal?.removeEventListener("abort", onSoft);
           stream.removeListener("data", onData);
           stream.removeListener("end", onEnd);
           stream.removeListener("close", onClose);
@@ -16990,6 +17156,10 @@ try {
           stream.destroy();
           settle(undefined, new Error(GIT_OUTPUT_ABORT_MESSAGE));
         };
+        const onSoft = (): void => {
+          if (settled) return;
+          void joinSoftStop().then(() => settle(undefined, new CheckpointSoftDeadlineError()));
+        };
         stream.on("data", onData);
         stream.once("end", onEnd);
         stream.once("close", onClose);
@@ -17002,7 +17172,11 @@ try {
         else if (stream.readableEnded) onEnd();
         else if (stream.destroyed) onClose();
         if (boundary.signal.aborted) onAbort();
-        else boundary.signal.addEventListener("abort", onAbort, { once: true });
+        else {
+          boundary.signal.addEventListener("abort", onAbort, { once: true });
+          if (boundary.softSignal?.aborted) onSoft();
+          else boundary.softSignal?.addEventListener("abort", onSoft, { once: true });
+        }
       });
     let stdout: { chunks: Buffer[]; oversized: boolean };
     let stderr: { chunks: Buffer[]; oversized: boolean };
@@ -17254,7 +17428,48 @@ try {
         stderrBytes += kept.length;
       });
       const gated = exitGatedStream(this.meteredGitOutput(process.stdout, opts.stdoutCategory, abortRecovery),
-        opts.cancelOnAbandon || MaintenanceResources.active() ? abortRecovery : undefined, true);
+        opts.cancelOnAbandon || MaintenanceResources.active() ? abortRecovery : undefined, true, true);
+      // issue #3304: the child's clean exit does not end the gated output by itself (its source may never
+      // deliver an EOF), and the handle stops cancelling once its completion has settled. When the scope's
+      // hard signal, or its soft signal where the scope carries one (a masked scope has none), fires while
+      // the output is still unfinished, the child is joined (its spawner's handle stops it on the hard
+      // signal; on soft, the handle's soft listener requests cancellation while it still admits it), then
+      // the output settles with the typed verdict. The `exited` calls below are first-wins, so a rejection or soft timeout of
+      // the completion itself still reaches the output through them (tests: v2 control in
+      // runner-m2-done-checkpoint, git-startup-timeout).
+      const stopSignals = [boundary.signal, boundary.softSignal].filter((signal): signal is AbortSignal => signal !== undefined);
+      const unwatchStops = (): void => {
+        for (const signal of stopSignals) signal.removeEventListener("abort", stopOutput);
+      };
+      let stopSettling: Promise<void> | undefined;
+      const stopOutput = (): void => {
+        if (stopSettling || gated.done()) return;
+        stopSettling = (async () => {
+          // No cancellation is requested here. On a soft stop the handle's own soft listener
+          // (spawnCheckpointProcess) requests it while the handle still admits cancellation (once completion
+          // has settled nothing is needed). On a hard stop the scope's spawner (the Codex safety handle or TickSpawner) stops the child on its own signal,
+          // and a cancel() request would mirror its typed completion rejection into an unsafe-cleanup error.
+          const cleanup = await Promise.allSettled([process.completed]);
+          for (const result of cleanup) {
+            if (result.status !== "rejected") continue;
+            const reason = result.reason;
+            gated.fail(reason instanceof CheckpointUnsafeCleanupError || reason instanceof TrustedExecutionRefusal ||
+              reason instanceof GitBoundaryAbortError || reason instanceof CheckpointSoftDeadlineError
+              ? reason : new CheckpointUnsafeCleanupError("checkpoint metadata child settlement unverified", reason));
+            return;
+          }
+          // An EOF already queued on the source (delivered on a later tick) must land before this verdict.
+          await new Promise<void>(resolve => setImmediate(resolve));
+          gated.fail(boundary.signal.aborted
+            ? new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE, undefined, boundary.capture?.signal)
+            : new CheckpointSoftDeadlineError());
+        })();
+        void stopSettling.finally(unwatchStops);
+      };
+      for (const signal of stopSignals) signal.addEventListener("abort", stopOutput, { once: true });
+      gated.out.once("finish", unwatchStops);
+      gated.out.once("close", unwatchStops);
+      if (stopSignals.some(signal => signal.aborted)) stopOutput();
       stderr?.on("error", error => { abortRecovery(); gated.exited(error); });
       process.completed.then(({ code, softTimedOut }) => {
         const expired = completionError();
@@ -17264,6 +17479,10 @@ try {
           return;
         }
         if (code !== 0) {
+          // A stopped scope owns cancellation. Its verified nonzero completion (TickSpawner
+          // resolves with 128 on a signal) must not beat stopOutput's typed verdict while
+          // that handler gives an already-queued EOF one turn to arrive.
+          if (stopSignals.some(signal => signal.aborted)) return;
           const detail = Buffer.concat(stderrChunks).subarray(0, stderrCap).toString().trim();
           gated.exited(new Error(`git ${args.join(" ")} exited ${code}${detail ? `: ${detail}` : ""}`));
         } else gated.exited();
@@ -17788,6 +18007,20 @@ try {
     return false;
   }
 
+  /** Canonical caches do not borrow object stores. Git 2.56 initializes alternates
+   * even for metadata probes, so refuse controls without opening or following them. */
+  private async assertCanonicalAlternatesAbsent(barePath: string): Promise<void> {
+    for (const name of ["alternates", "http-alternates"]) {
+      try {
+        await this.retainedIO(() => fs.lstat(path.join(barePath, "objects", "info", name)));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      throw new Error("maintenance_source_layout_unsupported");
+    }
+  }
+
   /** Worker-only directories are the ownership root; runner-provided Git config is not. */
   private async assertOwedBare(barePath: string, readOptions?: BoundedReadOptions): Promise<void> {
     const root = path.resolve(this.reposRoot);
@@ -17801,6 +18034,7 @@ try {
           ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() ||
             (uidSplitActive() && st.gid === RUNNER_UID)))) throw new Error("unsafe worker bare directory");
     }
+    await this.assertCanonicalAlternatesAbsent(barePath);
     const args = ["rev-parse", "--is-bare-repository"];
     const read = readOptions ? await this.readBare(barePath, args, readOptions) : undefined;
     if (read?.truncated || (read ? read.text : await this.runGit(barePath, args)).trim() !== "true") {

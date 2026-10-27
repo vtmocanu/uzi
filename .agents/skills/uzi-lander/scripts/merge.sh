@@ -4,6 +4,7 @@
 # post-merge watch. The decision to merge is the caller's; this is only the mechanics.
 #
 # Usage: merge.sh OWNER/REPO PR [--expect-head SHA] [--expect-closes N[,N...]|none] [--method squash|merge] [--no-admin] [--no-delete-branch] [--no-rework-check] [--confirm-only]
+# OWNER/REPO also accepts a github.com/ or https://github.com/ prefix.
 #   --expect-head   reviewed full SHA or unique hex prefix (7+); resolve prefixes on the forge
 #                   before comparing; a different current head refuses (exit 8)
 #                   so a push that landed after your last look is never merged unseen. The
@@ -41,6 +42,8 @@
 #      reported, none passed, or gh failed without a failing/pending check explaining it, or
 #      the threads / code-scanning alerts / comments / ack store behind exit 5 unreadable —
 #      not merged
+#      Also malformed repository syntax or unreadable changelog-policy checkout/origin,
+#      fetched main/PR head, merge-base or diff; no merge attempted.
 #   3  gh error, or the merge command was refused (classifier block, ruleset, conflict):
 #      the exact command is printed for the user to run via a `!` line. Also the PR
 #      conflicting with its base (mergeable=CONFLICTING), checked before the required
@@ -65,6 +68,8 @@
 #      (see release_run_unneeded); any error or unknown keeps the refusal
 #  11  closing references differ from --expect-closes: fix the PR body (drop the closing
 #      keyword, e.g. reword "does not close #N" to "Refs #N"), then re-run
+#  12  main changed changelog policy since the PR's merge-base: integrate main and
+#      require fresh exact-head CI before retrying
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -95,6 +100,15 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$REPO" ] && [ -n "$PR" ] || { echo "usage: merge.sh OWNER/REPO PR [--expect-head SHA] [--method squash|merge] [--no-admin]" >&2; exit 2; }
 case "$METHOD" in squash|merge) ;; *) echo "bad --method" >&2; exit 2;; esac
+REPO=$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')
+case "$REPO" in
+  https://github.com/*) REPO=${REPO#https://github.com/} ;;
+  github.com/*) REPO=${REPO#github.com/} ;;
+esac
+if ! [[ "$REPO" =~ ^[a-z0-9][a-z0-9-]*/[a-z0-9_.-]+$ ]]; then
+  echo 'repository must be OWNER/REPO, optionally prefixed by github.com/ or https://github.com/'; exit 2
+fi
+case "${REPO#*/}" in .|..|*.git) echo 'repository name must not be a dot path or end in .git'; exit 2 ;; esac
 
 pj=$(gh pr view "$PR" --repo "$REPO" --json state,headRefOid,mergeStateStatus,mergeable,mergeCommit,baseRefName 2>/dev/null) || { echo "gh pr view failed" >&2; exit 3; }
 state=$(printf '%s' "$pj" | jq -r .state); head=$(printf '%s' "$pj" | jq -r .headRefOid)
@@ -390,6 +404,44 @@ if [ -n "$SD" ]; then
   fi
   printf '%s' "$my_uuid" > "$LOCK/uuid"; printf '%s' "$my_name" > "$LOCK/name"
   trap 'rm -rf "$LOCK"' EXIT
+fi
+
+# Changelog policy freshness for this repository's main branch (#3550). Compare
+# main's policy delta, not the PR's own edits, and never execute the PR's gate code.
+# Pin both endpoints after fetching, inside the existing lock window when available.
+# Out-of-band base moves between this snapshot and the GitHub merge remain a bypass.
+if [ "$REPO" = vtmocanu/uzi ] && [ "$base" = main ]; then
+  [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo 'invalid PR head for changelog policy'; exit 2; }
+  policy_root=$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null) \
+    || { echo 'cannot locate the checkout for changelog policy'; exit 2; }
+  policy_origin=$(git -C "$policy_root" config --get remote.origin.url) \
+    || { echo 'cannot identify the changelog policy origin'; exit 2; }
+  case "$policy_origin" in
+    git@github.com:vtmocanu/uzi|git@github.com:vtmocanu/uzi.git|https://github.com/vtmocanu/uzi|https://github.com/vtmocanu/uzi.git|ssh://git@github.com/vtmocanu/uzi|ssh://git@github.com/vtmocanu/uzi.git) ;;
+    *) echo 'changelog policy checkout origin is not vtmocanu/uzi'; exit 2 ;;
+  esac
+  git -C "$policy_root" fetch -q --no-tags origin +refs/heads/main:refs/remotes/origin/main \
+    || { echo 'cannot fetch current main for changelog policy'; exit 2; }
+  if ! git -C "$policy_root" cat-file -e "$head^{commit}" 2>/dev/null; then
+    git -C "$policy_root" fetch -q --no-tags origin "$head" \
+      || { echo 'cannot fetch the exact PR head for changelog policy'; exit 2; }
+  fi
+  policy_main=$(git -C "$policy_root" rev-parse --verify 'refs/remotes/origin/main^{commit}') \
+    || { echo 'cannot resolve current main for changelog policy'; exit 2; }
+  policy_base=$(git -C "$policy_root" merge-base "$head" "$policy_main") \
+    || { echo 'cannot find the PR merge-base for changelog policy'; exit 2; }
+  # Keep this list aligned with the checker/oracle's repository dependencies.
+  CHANGELOG_POLICY_FILES=(scripts/check-changelog-entry.sh scripts/lib/shipping-paths.sh
+    scripts/lib/dependency-bump.sh scripts/lib/changelog-fragments.sh
+    scripts/lib/changelog-fragments.awk scripts/assert-changelog-covers-release.sh)
+  policy_changed=$(git -C "$policy_root" diff --no-ext-diff --no-textconv --no-renames --name-only \
+    "$policy_base" "$policy_main" -- "${CHANGELOG_POLICY_FILES[@]}") \
+    || { echo 'cannot compare changelog policy with current main'; exit 2; }
+  if [ -n "$policy_changed" ]; then
+    printf 'CHANGELOG_POLICY_STALE: main changed policy since this PR merge-base:\n%s\n' "$policy_changed"
+    echo 'Rebase or merge origin/main into the PR branch, then require fresh exact-head CI and review before retrying merge.sh.'
+    exit 12
+  fi
 fi
 
 # --match-head-commit makes GitHub itself refuse the merge if the head moved after the

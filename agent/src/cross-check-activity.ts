@@ -99,6 +99,12 @@ export class CheckActivityRecorder {
   private started = false;
   private modelRan = false;
   private summarized = false;
+  private readonly recordedReads = new Set<string>();
+  private captureComplete = false;
+
+  coverageEvidence(): { reads: ReadonlySet<string>; complete: boolean } {
+    return { reads: new Set(this.recordedReads), complete: this.captureComplete };
+  }
 
   constructor(private readonly emit: (payload: Record<string, unknown>) => void, opts: ActivityRecorderOptions) {
     this.attach(opts.checkout, opts.toolOutputDir);
@@ -154,6 +160,9 @@ export class CheckActivityRecorder {
     if (!payload) { this.dropped++; return; }
     try {
       this.emit(payload);
+      if (entry.op === "read" && outcome === "ok" && typeof payload["path"] === "string") {
+        this.recordedReads.add(payload["path"]);
+      }
       this.emitted++;
     } catch { this.dropped++; }
   }
@@ -164,6 +173,7 @@ export class CheckActivityRecorder {
     this.summarized = true;
     const unsettled = this.pending.size;
     const complete = this.started && this.modelRan && sessionEnded && unsettled === 0 && this.untracked === 0;
+    this.captureComplete = complete && this.dropped === 0;
     try {
       this.emit({
         event: EVENT_ACTIVITY_SUMMARY, generation: this.generation,

@@ -396,7 +396,7 @@ export class ReviewRunner {
         queryFn: this.queryFn,
         denyReason: "the reviewer is read-only and runs no tools",
         log: this.log,
-        codex: { runId: claim.run_id, binding, buildHarness: this.codexAdviceHarnessFactory },
+        codex: { runId: claim.run_id, claimGeneration: claim.claim_generation, binding, buildHarness: this.codexAdviceHarnessFactory },
         onUsage,
       });
       return parseTaskReview(text);

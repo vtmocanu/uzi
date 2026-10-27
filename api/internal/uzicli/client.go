@@ -24,6 +24,8 @@ import (
 // handlers serialize, without importing internal/handler (which would drag pgx +
 // chi into the binary — the go list -deps layering assertion).
 type Client interface {
+	VaultStatus(ctx context.Context) (VaultStatusResult, error)
+	VaultUnlock(ctx context.Context, password string) error
 	Whoami(ctx context.Context) (apitypes.UserDTO, error)
 	// WhoamiVault reads GET /api/auth/me like Whoami, but decodes the sibling top-level
 	// `vault` object the same response carries and returns the viewer's vault-LOCK state
@@ -188,6 +190,12 @@ type Client interface {
 	// sidebar_token_ids: GET /api/me/settings. RequireUser (the GET was split out
 	// from the cookie-only /me/settings group so a uzc_ can read it).
 	GetMySettings(ctx context.Context) (apitypes.UserSettingsDTO, error)
+	// SetUsageReserve sets the caller's weekly usage reserve (PRD #3522):
+	// PUT /api/me/usage-reserve. thresholdPct nil turns the reserve off, else it is the
+	// 7-day utilization percent (1..100) at which uzi stops spending the caller's
+	// subscription; pauseRunning also pauses running runs. Both are always sent (the
+	// server requires both). RequireUser, so a uzc_ token reaches it. Returns the updated user.
+	SetUsageReserve(ctx context.Context, thresholdPct *int, pauseRunning bool) (apitypes.UserDTO, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
 	// DeleteRepo removes a single repo: DELETE /api/repos/{id}, 204 on success
 	// (PRD #357 M3). The server only removes a DISABLED repo and refuses one that

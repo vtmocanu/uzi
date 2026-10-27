@@ -310,7 +310,7 @@ def published(api, sha, tag, wait, interval):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('metadata', 'coverage', 'tip', 'smoke', 'annotation', 'published'))
+    parser.add_argument('mode', choices=('metadata', 'coverage', 'tip', 'smoke', 'annotation', 'published', 'publication'))
     parser.add_argument('ref')
     parser.add_argument('other', nargs='?')
     parser.add_argument('--repo')
@@ -342,6 +342,11 @@ def main():
         raise Refusal('published needs a valid release tag')
     repo = args.repo or os.environ.get('GITHUB_REPOSITORY') or command('gh', 'repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner').strip()
     api = GitHub(repo)
+    if args.mode == 'publication':
+        if not args.tag or not re.fullmatch('v' + VERSION, args.tag):
+            raise Refusal('publication needs a valid release tag')
+        print(state(api.run('release.yml', sha, args.tag)))
+        return
     if args.mode == 'published':
         published(api, sha, args.tag, args.wait, args.interval)
     elif args.mode == 'smoke':

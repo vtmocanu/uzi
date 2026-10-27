@@ -130,6 +130,7 @@
   "override_subagent_model": false,
   "priority": "",
   "required_capabilities": null,
+  "ignored_inferred_capabilities": null,
   "required_tools": null,
   "size_class": "",
   "plan_changed_files": null,

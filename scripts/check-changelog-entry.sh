@@ -44,7 +44,8 @@
 # diff is empty.
 #
 # EXIT CODES (check-migration-numbering.sh convention; `task` itself reports 201):
-#     2 = instrument broken (not a git repo, base unresolvable, no merge-base)
+#     2 = instrument broken (not a git repo, base unresolvable, no merge-base,
+#         or an unreadable commit/path inventory)
 #     1 = malformed/unsafe fragment, or shipping change without entry/exemption
 #     0 = nothing shipping, or an entry or exemption covers it
 set -euo pipefail
@@ -137,20 +138,36 @@ grep -qiE '^Changelog:[[:space:]]*none' "$TMP/bodies" && pass "a branch commit c
 # left uncommitted (the committed subjects must describe the whole diff).
 all_shipping_commits() {
   local n=0 sha f touches
+  if ! git rev-list --no-merges "$BASE..HEAD" > "$TMP/commits"; then
+    echo 'check-changelog-entry.sh: could not read branch commits' >&2
+    exit 2
+  fi
   while read -r sha; do
     [ -n "$sha" ] || continue
     touches=0
+    # Complete the NUL inventory before a loop that may break on its first path.
+    if ! git diff-tree --no-commit-id --name-only -z -r "$sha" > "$TMP/commit-files"; then
+      echo 'check-changelog-entry.sh: could not read commit paths' >&2
+      exit 2
+    fi
     while IFS= read -r -d '' f; do
       [ -n "$f" ] || continue
       if is_shipping "$f"; then touches=1; break; fi
-    done < <(git diff-tree --no-commit-id --name-only -z -r "$sha")
+    done < "$TMP/commit-files"
     [ "$touches" = 1 ] || continue
     n=$((n + 1))
     git log -1 --format=%s "$sha" > "$TMP/subject"
     grep -qE "$1" "$TMP/subject" || return 1
-  done < <(git rev-list --no-merges "$BASE..HEAD")
+  done < "$TMP/commits"
   [ "$n" -gt 0 ] || return 1
-  { git diff --name-only -z HEAD --; git ls-files -z --others --exclude-standard; } > "$TMP/uncommitted"
+  if ! git diff --name-only -z HEAD -- > "$TMP/uncommitted"; then
+    echo 'check-changelog-entry.sh: could not read uncommitted tracked paths' >&2
+    exit 2
+  fi
+  if ! git ls-files -z --others --exclude-standard >> "$TMP/uncommitted"; then
+    echo 'check-changelog-entry.sh: could not read untracked paths' >&2
+    exit 2
+  fi
   while IFS= read -r -d '' f; do
     [ -n "$f" ] || continue
     if is_shipping "$f"; then return 1; fi

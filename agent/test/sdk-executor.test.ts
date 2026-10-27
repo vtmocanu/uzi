@@ -3564,6 +3564,47 @@ describe("SdkExecutor signal_done report_only + summary (issue #279)", () => {
     return { result, turns, probe };
   }
 
+  it("#3469 regression SDK prompt terminating signal_done forwards exact summary", async () => {
+    const summary = "Prompt findings\n\nNo repair needed.";
+    const { result } = await runDeclaring({ summary }, { kind: "prompt" });
+    assert.strictEqual(result.summary, summary);
+    assert.ok(!("reportOnly" in result));
+  });
+
+  it("#3469 control SDK issue summary and absent-kind default preserve report-only behavior", async () => {
+    for (const kind of ["issue", undefined] as const) {
+      const { result } = await runDeclaring({ report_only: true, summary: "issue findings" }, { kind });
+      assert.strictEqual(result.reportOnly, true);
+      assert.strictEqual(result.summary, "issue findings");
+    }
+  });
+
+  it("#3469 control SDK undeclared summary proposal and reportOnly keys are absent", async () => {
+    for (const kind of ["issue", "prompt"] as const) {
+      const { result } = await runDeclaring({}, { kind });
+      for (const key of ["summary", "proposal", "reportOnly"]) assert.ok(!(key in result), key);
+    }
+  });
+
+  it("#3469 control SDK plain-text completion does not synthesize declarations", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [assistantText("Finished. Summary: prose only. Proposal: prose only."), signalDone(), resultSuccess()],
+    ]);
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({ kind: "prompt" }).ctx);
+    for (const key of ["summary", "proposal", "reportOnly"]) assert.ok(!(key in result), key);
+  });
+
+  it("#3469 control SDK other kinds omit summary while every kind forwards proposal", async () => {
+    const proposal = { title: "Follow-up", body: "Investigate the scheduler." };
+    for (const kind of ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework", "job", "cross_check"] as const) {
+      const { result } = await runDeclaring({ summary: "findings", proposal, report_only: true }, { kind });
+      assert.deepStrictEqual(result.proposal, proposal, kind);
+      if (kind !== "issue" && kind !== "prompt") assert.ok(!("summary" in result), kind);
+      if (kind !== "issue") assert.ok(!("reportOnly" in result), kind);
+    }
+  });
+
   it("carries report_only + summary off the TERMINATING turn into the result (issue run)", async () => {
     const { result } = await runDeclaring({ report_only: true, summary: "verified: no code change needed" });
     assert.strictEqual(result.reportOnly, true);

@@ -95,7 +95,7 @@ func (q *Queries) CreateJobOrigin(ctx context.Context, arg CreateJobOriginParams
 const createJobRun = `-- name: CreateJobRun :one
 INSERT INTO runs (id, user_id, kind, job_type, issue_title, issue_description, auto_approve, required_capabilities, budget_wall_seconds, trigger_source, harness, job_protocol, egress_profile_id)
 VALUES ($1, $2, 'job', $3, $4, $5, true, '{}', $6, 'manual', $7, $8::smallint, $9::uuid)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates, retained_park_count, ignored_inferred_capabilities, reserve_hold_reason, reserve_exempt_until, reserve_exempt_granted_at, reserve_exempt_credential_id, reserve_exempt_window_reset, reserve_exempt_prior_pct, hinted_capabilities, capability_inference_evidence
 `
 
 type CreateJobRunParams struct {
@@ -314,6 +314,16 @@ func (q *Queries) CreateJobRun(ctx context.Context, arg CreateJobRunParams) (Run
 		&i.SourcePublicationIntent,
 		&i.ContinuedIssueIid,
 		&i.CheckpointCoordinates,
+		&i.RetainedParkCount,
+		&i.IgnoredInferredCapabilities,
+		&i.ReserveHoldReason,
+		&i.ReserveExemptUntil,
+		&i.ReserveExemptGrantedAt,
+		&i.ReserveExemptCredentialID,
+		&i.ReserveExemptWindowReset,
+		&i.ReserveExemptPriorPct,
+		&i.HintedCapabilities,
+		&i.CapabilityInferenceEvidence,
 	)
 	return i, err
 }
@@ -512,7 +522,8 @@ const getJobForCaller = `-- name: GetJobForCaller :one
 SELECT r.id, r.job_type, r.status, r.issue_title AS title, r.failure_reason, r.fail_origin,
        r.budget_wall_seconds, r.created_at, r.started_at, r.finished_at, r.updated_at,
        o.product_id, o.product_token_id, o.requested_by_label,
-       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' ELSE '' END)::text AS queue_reason
+       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' WHEN r.status = 'queued' AND r.reserve_hold_reason IS NOT NULL THEN 'weekly_reserve' ELSE '' END)::text AS queue_reason,
+       r.reserve_hold_reason
   FROM runs r
   JOIN job_origins o ON o.run_id = r.id
  WHERE r.id = $1
@@ -543,6 +554,7 @@ type GetJobForCallerRow struct {
 	ProductTokenID    pgtype.UUID        `json:"product_token_id"`
 	RequestedByLabel  pgtype.Text        `json:"requested_by_label"`
 	QueueReason       string             `json:"queue_reason"`
+	ReserveHoldReason pgtype.Text        `json:"reserve_hold_reason"`
 }
 
 func (q *Queries) GetJobForCaller(ctx context.Context, arg GetJobForCallerParams) (GetJobForCallerRow, error) {
@@ -564,6 +576,7 @@ func (q *Queries) GetJobForCaller(ctx context.Context, arg GetJobForCallerParams
 		&i.ProductTokenID,
 		&i.RequestedByLabel,
 		&i.QueueReason,
+		&i.ReserveHoldReason,
 	)
 	return i, err
 }
@@ -931,7 +944,8 @@ const listJobsForCaller = `-- name: ListJobsForCaller :many
 SELECT r.id, r.job_type, r.status, r.issue_title AS title, r.failure_reason, r.fail_origin,
        r.budget_wall_seconds, r.created_at, r.started_at, r.finished_at, r.updated_at,
        o.product_id, o.product_token_id, o.requested_by_label,
-       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' ELSE '' END)::text AS queue_reason
+       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' WHEN r.status = 'queued' AND r.reserve_hold_reason IS NOT NULL THEN 'weekly_reserve' ELSE '' END)::text AS queue_reason,
+       r.reserve_hold_reason
   FROM runs r
   JOIN job_origins o ON o.run_id = r.id
  WHERE r.kind = 'job'
@@ -967,6 +981,7 @@ type ListJobsForCallerRow struct {
 	ProductTokenID    pgtype.UUID        `json:"product_token_id"`
 	RequestedByLabel  pgtype.Text        `json:"requested_by_label"`
 	QueueReason       string             `json:"queue_reason"`
+	ReserveHoldReason pgtype.Text        `json:"reserve_hold_reason"`
 }
 
 // Newest first, keyset on (created_at, id) descending. A NULL cursor starts at the newest job.
@@ -1001,6 +1016,7 @@ func (q *Queries) ListJobsForCaller(ctx context.Context, arg ListJobsForCallerPa
 			&i.ProductTokenID,
 			&i.RequestedByLabel,
 			&i.QueueReason,
+			&i.ReserveHoldReason,
 		); err != nil {
 			return nil, err
 		}
