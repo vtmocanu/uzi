@@ -23,6 +23,7 @@ import {
   mrChipSuffix,
   mrChipTitle,
   needsHumanAttention,
+  parkLabel,
   priorityBadge,
   retryHint,
   runBadge,
@@ -1469,4 +1470,27 @@ describe("maintenance queue reason", () => {
     const plain = runBadge(run({ status: "queued", health: "waiting_worker", health_since: "2026-07-04T12:00:00Z" }), NOW);
     expect(plain.kind === "badge" && plain.label).toBe("⚠ waiting for worker · 4m");
   });
+});
+
+it.each([
+  ["2099-01-01T00:00:00Z", "retained_recovery_retrying", "retained recovery retrying", false],
+  ["2020-01-01T00:00:00Z", "retained_recovery_retrying", "retained recovery retrying", false],
+  [null, "retained_recovery_held", "retained recovery needs decision", true],
+  [undefined, "retained_recovery_unknown", "retained recovery timing unknown", false],
+  ["invalid", "retained_recovery_unknown", "retained recovery timing unknown", false],
+] as const)("retained recovery normalizes timing %s honestly", (stamp, status, label, attention) => {
+  const input = { ...run({ status: "recovery_wait" }), recovery_wait_cause: "retained_recovery_exhausted", recovery_retry_not_before: stamp };
+  expect(effectiveRunStatus(input)).toBe(status);
+  expect(parkLabel(input)).toBe(label);
+  expect(needsHumanAttention(status)).toBe(attention);
+  expect(runStatusTone(status, null)).toBe("warning");
+  const badge = runBadge(input, NOW);
+  expect(badge).toMatchObject({ label, tone: "warning", pulse: false });
+  expect(badge.kind === "badge" && badge.title).not.toMatch(/requeues|episode|Used:|Remaining:/);
+  expect(effectiveRunStatus({ ...input, status: "running" })).toBe("running");
+});
+it("omitted board cause and timing remain generic even if retry stamp is null", () => {
+  expect(runBadge(run({ status: "recovery_wait" }), NOW)).toMatchObject({ label: "recovery wait" });
+  expect(effectiveRunStatus({ status: "recovery_wait", recovery_retry_not_before: null })).toBe("recovery_wait");
+  expect(effectiveRunStatus({ status: "recovery_wait", recovery_wait_cause: "retained_recovery_exhausted" })).toBe("retained_recovery_unknown");
 });

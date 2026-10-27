@@ -107,6 +107,11 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 		switch r.RecoveryWaitCause.String {
 		case recoveryCauseCodexAccountUnavailable:
 			return fmt.Sprintf("recorded cause %s; wait for the same Codex account to become available; inspect account recovery; no timer", cause)
+		case recoveryCauseRetainedRecoveryExhausted:
+			if r.RecoveryRetryNotBefore.Valid {
+				return fmt.Sprintf("automatic retry not before %s; recorded cause %s; owner may inspect or Resume", blockerTime(r.RecoveryRetryNotBefore), cause)
+			}
+			return fmt.Sprintf("recorded cause %s; owner reviews retained recovery and chooses Resume; no timer", cause)
 		case "worker_requeue_exhausted":
 			return fmt.Sprintf("recorded cause %s; owner reviews recovery evidence and chooses Resume; no timer", cause)
 		}

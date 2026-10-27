@@ -1,25 +1,29 @@
 ---
 name: uzi-release
 disable-model-invocation: true
-description: "Cuts and ships a uzi release for this repo (hosted on GitHub), and nothing else: confirms nothing wanted in the release is still unmerged and main's CI is green, then cuts the release (RC-first version bump, CHANGELOG, tag, GHCR publish, deploy verify) INLINE as the lead with the bundled release-cut/release-watch/release-verify scripts and presents the summary while it publishes in the background. Reviewing and merging open PRs, Renovate included, is the uzi-lander skill. Use when the user runs /uzi-release, or asks to cut or ship a uzi release, promote an RC, bump the uzi version, or deploy uzi. Triggers include uzi-release, release uzi, cut a uzi version, cut an RC, promote the RC, ship uzi, deploy uzi."
+description: "Cut and verify uzi RCs or promote a pinned candidate through protected GitHub Actions, with shared scripts as a local fallback. Check release scope, applicable coverage and publication; PR review and merge belong to uzi-lander. Use when asked to release or deploy uzi, cut a version or RC, or promote a candidate."
 ---
 
 # uzi-release
 
-Cut a uzi release, watch it publish, verify it, then summarize. This repo is hosted on **GitHub**: use `gh` (which infers the repo from the checkout, so a fork under any owner works unedited; never `glab`/`tea`). CI is **GitHub Actions** (`.github/workflows/`), images and the Helm chart publish to **GHCR** on a `v*` tag.
+Cut a uzi release, watch it publish, verify it, then summarize. This repo is hosted on **GitHub**: use `gh` (which infers the checkout; never `glab`/`tea`). Protected automation is configured for the canonical repository; forks need their own setup. CI is **GitHub Actions** (`.github/workflows/`), images and the Helm chart publish to **GHCR** on a `v*` tag.
 
 **Boundary.** Reviewing and merging PRs, one or the whole open set, Renovate included, is the `uzi-lander` skill (`references/batch.md` for the set, `references/renovate.md` for dependency PRs). This skill starts once what should ship is on `main`.
 
-Do NOT bake step details that live in the repo into your head. Read the source of truth each run: `.github/workflows/release.yml` (and `ci.yml`, `kind-smoke.yml`, `brew.yml`), `.claude/agents/release.md` (the mechanics reference), the destructive-ops rules in `CLAUDE.md`, and `deploy/README.md` for deploy (still GitLab-worded in places, not the authority for publish mechanics).
+Do NOT bake step details that live in the repo into your head. Read the source of truth each run: `.github/workflows/release.yml` (and `ci.yml`, `kind-smoke.yml`, `brew.yml`), `.claude/agents/release.md` (the mechanics reference), the destructive-ops rules in `CLAUDE.md`, and `deploy/README.md` for setup, deploy and local fallback.
 
 > **Note on the deploy layer.** Cluster/deploy verification needs cluster access you may not have; if so, say so plainly rather than guessing.
 
 ## 0. Guardrails first
+- Standard CI releases use `release-auto.yml` on main after the maintainer verifies its App/ruleset setup. Dispatch an RC only under the user's release authorization. Agents NEVER dispatch `kind=stable` and NEVER approve a `release-stable` deployment; the human performs both acts.
+- CI prepare/push never rerun in the same run ID: re-dispatch instead after inspecting uncertain remote refs. Only watch/report may rerun against the existing tag/SHA; use local watch/verify for manual same-tag recovery.
+- Before local fallback, finish or stop any CI release run, inspect remote main/tags and resolve interrupted publication on the same tag. No local/CI race. A Codex lock change blocks CI planning; perform the adoption read and cut locally. On abandon the range starts at the highest stable, so an already adopted change can still require local fallback.
+- Dispatch-only stage: no nightly schedule yet. D10 post-cut CI/tagged-smoke recovery is deferred to 3e-3; assertions remain fail-closed, with existing non-gate retries only.
 - NEVER `docker compose -p uzi down -v` and never glob `uzi-` containers (see `CLAUDE.md` "Destructive operations"). This skill touches git, `gh`, and (if you have deploy access) `kubectl` only.
 - Work on `main` in the repo root worktree; `release-cut.sh` makes its own throwaway worktree for a promote. Never check the root worktree out onto another branch.
 - The release commit goes direct to `main` under the admin role's ruleset bypass (`uzi-lander` `references/merge-mechanics.md` has the ruleset). If a push is refused, read the refusal and stop rather than forcing.
 
-## 1. Preconditions: nothing wanted left unmerged, `main` green
+## 1. Preconditions: release scope and applicable coverage
 - **Nothing wanted in this release is still open.** `gh pr list --state open`, `uzi run list` for in-flight runs. Anything the user wants in the release gets landed first with `uzi-lander` (the whole set: its `references/batch.md`), then come back. Say which open PRs you are leaving out. When unsure what the user wants in, ask.
 - **Exact `main` tip green.** Fetch and fast-forward `main`. Watch all existing tip workflows to green with `.agents/skills/uzi-lander/scripts/watch-run-ci.sh --sha "$(git rev-parse origin/main)" --branch main` in the background; require successful `ci.yml` and `kind-smoke.yml` push runs on that exact SHA. Run `python3 -I scripts/release-ci-coverage.py tip HEAD --wait 0` for the shared policy. A missing, queued, running, failed or cancelled run blocks the cut. Wait for the exact tip's ci.yml + KinD success BEFORE release-cut: pushing the release commit supersedes main CI and cancels a running parent, destroying inheritance evidence. `release-cut.sh` repeats this precondition for verbs that write main. For `--promote-only`, validate candidate coverage instead; the current main tip need not be green. Candidate validation accepts at most one strictly metadata hop to green main-push CI and smoke: the stable commit is the publish gate's first hop, so it reaches only one past the candidate (#2719). Do not substitute evidence from an older commit.
 - **A Codex runtime bump in the release.** When the range since the previous tag changes `agent/codex/codex-package.lock`, confirm its PR recorded the adoption read and CI coverage that `.agents/skills/uzi-lander/references/renovate.md` (*Agent runtimes*) requires; if not, do that read before cutting.
@@ -28,7 +32,7 @@ Do NOT bake step details that live in the repo into your head. Read the source o
 
 `release-cut.sh --plan [--version X.Y.Z] [--abandon-train]` reports the scheduled RC decision without fetching or changing Git state, CHANGELOG or fragments. Shared validators remove temporary snapshots but may leave an empty `.uzi/scratch` directory. Refresh refs first. Read `OP` (`nextrc`, `new-base`, `noop`, `blocked`), `BASE`, `TAG`, `REASON`, `SHIPPING_COUNT`, `PREVIOUS_TAG`, `PUBLICATION_STATE`, and `HEAD_SHA`; exit 0 includes no-op/blocked plans and some instrument failures (API or fragment reads); exit 2 is reserved for Git/history instruments, exit 3 for usage. An open train continues, otherwise 0.x defaults to the next minor; automatic 1.x needs a policy. A Codex runtime lock change in the plan range blocks with `codex-runtime-needs-local-cut`: perform the adoption read above and cut locally. Failed, pending, missing or unreadable previous publication blocks even a no-op. Only non-metadata shipping changes count, and notes or dependency citations must make them releasable. This recommendation does not remove manual empty-delta cuts or replace exact-tip CI checks.
 
-## 2. Cut the release inline with the deterministic scripts — do NOT dispatch a subagent
+## 2. Local fallback: cut inline with the deterministic scripts — do NOT dispatch a subagent
 Once step 1 holds (nothing wanted left unmerged, `main` green on the tip), cut the release **inline as the lead**, driving three bundled scripts. Do NOT dispatch the `release` subagent for this: a background subagent spawns a watch and then idles, so every wait becomes a manual re-ping (the "agent keeps dying" ping-pong), while the steps that actually need judgment — flake-vs-defect, whether to rerun, authoring the CHANGELOG — are the lead's regardless. `.claude/agents/release.md` stays the MECHANICS reference (what each step proves, the signing traps, deploy verify), but the driver is the lead + scripts, not that agent.
 
 **What the lead decides first** (from what merged since the previous stable tag):

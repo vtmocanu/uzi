@@ -3,17 +3,17 @@
 // link gate. Kept out of Board.tsx so the mapping is unit-tested in isolation
 // (see runBadge.test.ts), the same split the run stream uses (runStream.ts).
 
-import {
-  isTerminalRun,
-  type LatestRun,
-  type Run,
-  type Milestone,
-  type MilestoneAgent,
-  type QueueReason,
-  type RunHealth,
-  type RunPriority,
-  type StopKind,
-} from "./api";
+import type {
+  LatestRun,
+  Run,
+  Milestone,
+  MilestoneAgent,
+  QueueReason,
+  RunHealth,
+  RunPriority,
+  StopKind,
+} from "./apiTypes";
+import { isTerminalRun } from "./runStatus";
 import { credentialSwitchHold } from "./credentialSwitchHold";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
 import { formatCountdown } from "./limitWait";
@@ -158,6 +158,9 @@ const PARK_LABELS = {
   limit_wait: "limit wait",
   pool_wait: "waiting for pool",
   recovery_wait: "recovery wait",
+  retained_recovery_retrying: "retained recovery retrying",
+  retained_recovery_held: "retained recovery needs decision",
+  retained_recovery_unknown: "retained recovery timing unknown",
   worker_requeue_exhausted: "recovery needs decision",
   worker_memory_pressure: "memory pressure: owner hold",
   paused: "paused",
@@ -194,6 +197,7 @@ export function effectiveRunStatus(
     completion_phase?: "checking" | "reworking" | "blocked" | "";
     hold_reason?: string | null;
     recovery_wait_cause?: string | null;
+    recovery_retry_not_before?: string | null;
   },
 ): string {
   if (run.status === "paused" && run.hold_reason === "provider_unavailable") return "provider_unavailable";
@@ -230,6 +234,14 @@ export function effectiveRunStatus(
   // and the board card's LatestRun (the server's board projection sends hold_reason on every
   // card, so runBadge meets this key too).
   if (run.status === "paused" && run.hold_reason === "credential_disabled") return "credential_disabled";
+  if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_exhausted") {
+    // Only explicit null means owner-held. Omitted or invalid timing stays unknown.
+    if (run.recovery_retry_not_before === null) return "retained_recovery_held";
+    if (typeof run.recovery_retry_not_before === "string" && Number.isFinite(Date.parse(run.recovery_retry_not_before))) {
+      return "retained_recovery_retrying";
+    }
+    return "retained_recovery_unknown";
+  }
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "worker_requeue_exhausted") return "worker_requeue_exhausted";
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure") return "worker_memory_pressure";
   return run.status;
@@ -365,7 +377,7 @@ export function runStatusTone(
   if (status === "pool_wait") return "warning";
   // Recovery holds use warning: transient recovery and worker exhaustion are
   // non-terminal, though exhaustion requires an owner decision.
-  if (status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure") return "warning";
+  if (status === "retained_recovery_retrying" || status === "retained_recovery_held" || status === "retained_recovery_unknown" || status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure") return "warning";
   // PRD #1190: an ordinary paused run. INFO, not the warn the involuntary holds carry
   // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
   // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
@@ -540,7 +552,7 @@ function badgeTitle(reason: string | null | undefined): string | undefined {
 
 // runBadge maps a card's latest_run to its primary status pill. nowMs is passed in
 // (not read from Date.now) so the running elapsed is deterministic under test.
-export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause" | "worker_recovery" | "requeue_count" | "memory_hold">>, nowMs: number, maintenanceReason?: string | null): RunBadge {
+export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause" | "recovery_retry_not_before" | "worker_recovery" | "requeue_count" | "memory_hold">>, nowMs: number, maintenanceReason?: string | null): RunBadge {
   // The stopped signal wins over the raw status so a cancel-shaped `failed`
   // never renders as breakage.
   if (isStoppedRun(run.status, run.stop_kind)) {
@@ -703,6 +715,17 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
         pulse: false,
         title:
           "Waiting for a pooled Anthropic token. It resumes automatically once one is added to the pool.",
+      };
+    case "retained_recovery_retrying":
+    case "retained_recovery_held":
+    case "retained_recovery_unknown":
+      return {
+        kind: "badge", label: PARK_LABELS[eff], tone: "warning", pulse: false,
+        title: eff === "retained_recovery_held"
+          ? "Retained recovery needs an owner decision. Only the run owner can resume or cancel; there is no scheduled retry."
+          : eff === "retained_recovery_retrying"
+            ? "Retained recovery retries automatically after the scheduled time, including when that time is already due. Only the run owner can resume now or cancel."
+            : "Retained recovery timing is unavailable. Open the run page for details; an owner hold cannot be inferred.",
       };
     // Exhaustion is an owner decision, with no timer or automatic resumption.
     case "worker_requeue_exhausted":
@@ -980,6 +1003,7 @@ export function needsHumanAttention(status: string): boolean {
     isAwaitingApproval(status) ||
     isAwaitingInput(status) ||
     isAwaitingFollowup(status) ||
+    status === "retained_recovery_held" ||
     status === "worker_requeue_exhausted" ||
     status === "worker_memory_pressure" ||
     status === "provider_unavailable" ||

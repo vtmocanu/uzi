@@ -76,6 +76,11 @@ SELECT r.id AS run_id, r.kind, r.status,
                   OR r.status IN ('awaiting_input', 'paused')
                   OR (r.status = 'recovery_wait'
                       AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure'))
+                  -- #3495: a capped retained-recovery park (NULL retry stamp) waits for owner
+                  -- Resume; a stamped one is an automatic retry still progressing.
+                  OR (r.status = 'recovery_wait'
+                      AND r.recovery_wait_cause = 'retained_recovery_exhausted'
+                      AND r.recovery_retry_not_before IS NULL)
              THEN 'needs_owner' ELSE 'progressing' END)::text AS tag,
        count(*) OVER ()::bigint AS total
 FROM runs r

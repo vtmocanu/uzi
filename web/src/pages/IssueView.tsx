@@ -16,7 +16,7 @@ import {
 } from "../lib/harnessSelection";
 import { TokenPicker } from "../components/TokenPicker";
 import { HarnessPicker } from "../components/HarnessPicker";
-import { activeRunInHistory, effectiveRunStatus, isStoppedRun, isRejectedRun, mrChipState, runStatusTone } from "../lib/runBadge";
+import { activeRunInHistory, effectiveRunStatus, parkLabel, isStoppedRun, isRejectedRun, mrChipState, runStatusTone } from "../lib/runBadge";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { chipLabels } from "../lib/labelChips";
 import { canPromote, isUziCard } from "../lib/boardCards";
@@ -554,7 +554,7 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunSummaryItem; projectWeb
       </div>
       <div className="flex items-center gap-2">
         <Badge tone={runStatusTone(effectiveRunStatus(run), run.stop_kind, run.fail_origin)}>
-          {stopped ? "stopped" : isRejectedRun(run.status, run.fail_origin) ? "rejected" : effectiveRunStatus(run).replace("_", " ")}
+          {stopped ? "stopped" : isRejectedRun(run.status, run.fail_origin) ? "rejected" : run.recovery_wait_cause === "retained_recovery_exhausted" ? parkLabel(run) : effectiveRunStatus(run).replace("_", " ")}
         </Badge>
         {/* Every run here is the viewer's own (the endpoint is owner-scoped), so
             the run view is always reachable — no is_mine gate needed. */}

@@ -12,6 +12,7 @@ import {
   type TextareaHTMLAttributes,
 } from "react";
 import { Link } from "react-router-dom";
+import { effectiveRunStatus } from "../lib/runBadge";
 import type { RunProgress } from "../lib/apiTypes";
 import { ArrowLeftIcon, EyeIcon, EyeOffIcon } from "./icons";
 
@@ -512,6 +513,9 @@ export const RUN_STATUS_TONES: Record<
    *  wait" de-underscores fine, so the default label already matches runBadge's word
    *  (the ui.test.tsx label-agreement loop over this map asserts the two surfaces agree). */
   recovery_wait: { tone: "warning" },
+  retained_recovery_retrying: { tone: "warning" },
+  retained_recovery_held: { tone: "warning" },
+  retained_recovery_unknown: { tone: "warning" },
   worker_requeue_exhausted: { tone: "warning" },
   worker_memory_pressure: { tone: "warning" },
   /** PRD #1190: a run its OWNER paused. `info` tone (D11), deliberately DISTINCT from
@@ -584,6 +588,9 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   // matching "waiting for pool" label (the ui.test.tsx label-agreement loop over
   // RUN_STATUS_TONES asserts the two surfaces print one word).
   pool_wait: "waiting for pool",
+  retained_recovery_retrying: "retained recovery retrying",
+  retained_recovery_held: "retained recovery needs decision",
+  retained_recovery_unknown: "retained recovery timing unknown",
   worker_requeue_exhausted: "recovery needs decision",
   worker_memory_pressure: "memory pressure: owner hold",
   // PRD #1190: the "‖" glyph tells a chosen pause apart from the rate-limit park's "~"
@@ -611,7 +618,12 @@ const RUN_STATUS_LABELS: Record<string, string> = {
 
 // A running or live completion row may attach its server estimate to the status pill.
 // Other callers and non-percent states retain the ordinary status presentation.
-export function StatusPill({ status, progress }: { status: string; progress?: RunProgress | null }) {
+export function StatusPill({ status: rawStatus, progress, recovery_wait_cause, recovery_retry_not_before }: {
+  status: string; progress?: RunProgress | null;
+  recovery_wait_cause?: string | null;
+  recovery_retry_not_before?: string | null;
+}) {
+  const status = effectiveRunStatus({ status: rawStatus, recovery_wait_cause, recovery_retry_not_before });
   const cfg = RUN_STATUS_TONES[status] ?? { tone: "neutral" as BadgeTone };
   const label = RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
   const showsProgress = status === "running" || status === "completion_checking" || status === "completion_reworking";

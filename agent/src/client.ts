@@ -65,7 +65,7 @@ import {
   type OutgoingMessage,
   type RegisterRequest,
   type RegisterResponse,
-  type StateAck,
+  type StateAck as ProtocolStateAck,
   type CompletedPublicationReceipt,
   type CompletedPublicationReason,
   type PlanCrossCheckReconciliation,
@@ -123,6 +123,9 @@ export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model
   | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
   | "approved_not_stored" | "revisions_exhausted";
 import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions } from "./code-cross-check-contract.js";
+
+// Same-row classification decoded by readRunAck; status alone cannot confirm a typed park.
+type StateAck = ProtocolStateAck & { recoveryCause?: string };
 
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -404,7 +407,7 @@ function hasRevisionSourceFields(body: StateRequest): boolean {
 
 // Internal per-attempt evidence, minted only after reading the authenticated response through EOF.
 class StateDecodeRefusalError extends RequestError {}
-interface StateAttemptEvidence { ambiguous: boolean; refusals: number }
+interface StateAttemptEvidence { ambiguous: boolean; refusals: number; refusedAfterAmbiguity?: boolean }
 
 /** Match a small, complete 404 JSON object against exactly the expected keys and values. */
 export function isStrict404Body(err: unknown, expected: Readonly<Record<string, string>>): boolean {
@@ -2193,6 +2196,20 @@ export class WorkerClient {
         throw err;
       }
     }
+    if (body.recovery_cause === "retained_recovery_exhausted") {
+      if (!this.hasFeature("recovery_cause_retained_recovery_exhausted") ||
+          body.status !== "recovery_wait" || !Number.isSafeInteger(body.claim_generation) ||
+          (body.claim_generation ?? 0) < 1) throw new Error("retained recovery park requires support and a positive generation");
+      // This contract cannot degrade to an unfenced or untyped recovery park on rollback.
+      const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+      try {
+        return await this.reportStateOnce(runId, path, Object.freeze({ ...body }), signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
+      } catch (error) {
+        // A later validation refusal says nothing about an earlier possibly applied send.
+        if (evidence.refusedAfterAmbiguity) throw new Error("retained recovery park outcome uncertain", { cause: error });
+        throw error;
+      }
+    }
     if (body.recovery_cause === "worker_memory_pressure") {
       // Snapshot once: caller mutation and transport retries cannot rebind this request.
       const outbound: PlanCrossCheckStateRequest = Object.freeze(JSON.parse(JSON.stringify(body)));
@@ -2409,6 +2426,7 @@ export class WorkerClient {
           const ack: StateAck = {
             applied: res.status === 200,
             status: fields.status,
+            ...(fields.recoveryCause !== undefined ? { recoveryCause: fields.recoveryCause } : {}),
           };
           // parkWorkerMemoryPressure returns 409 only for exact replay when these DTO fields
           // match and no decline/switch disposition is present. Generation/nonce stay in the
@@ -2543,6 +2561,8 @@ export class WorkerClient {
       } catch (err) {
         MaintenanceBudget.current()?.check();
         if (evidence) {
+          if (evidence.ambiguous && err instanceof RequestError && err.status === 400)
+            evidence.refusedAfterAmbiguity = true;
           if (err instanceof StateDecodeRefusalError) evidence.refusals++;
           else evidence.ambiguous = true;
         }

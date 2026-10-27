@@ -805,7 +805,7 @@ func runJobDTO(d *workersvc.JobRunDetail) *apitypes.RunJobDTO {
 // Evidence is historical; it never asserts latest work or current forge availability.
 func workerRecoveryDTO(r store.Run, limit int) *apitypes.WorkerRecoveryDTO {
 	if r.WorkerRecoveryEpisode == 0 && len(r.WorkerRecoveryEvidence) == 0 &&
-		(!r.RecoveryWaitCause.Valid || r.RecoveryWaitCause.String != "worker_requeue_exhausted") {
+		(!r.RecoveryWaitCause.Valid || (r.RecoveryWaitCause.String != "worker_requeue_exhausted" && r.RecoveryWaitCause.String != "retained_recovery_exhausted")) {
 		return nil
 	}
 	used := r.RequeueCount - r.RequeueEpisodeBaseline

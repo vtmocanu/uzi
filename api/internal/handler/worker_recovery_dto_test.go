@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -55,6 +57,18 @@ func TestWorkerRecoveryRunDTO(t *testing.T) {
 			t.Fatal("legacy recovery should be omitted")
 		}
 	})
+}
+
+func TestRetainedRecoveryDTOUsesStoredEpisode(t *testing.T) {
+	for _, count := range []int32{0, 3} {
+		r := store.Run{RetainedParkCount: count, RecoveryWaitCause: pgtype.Text{String: "retained_recovery_exhausted", Valid: true},
+			RequeueCount: 7, RequeueEpisodeBaseline: 5}
+		dto := runToDTO(r, "normal", 0, 0, 0, dtoTestNow, 3)
+		if dto.WorkerRecovery == nil || dto.WorkerRecovery.Episode != 0 ||
+			dto.WorkerRecovery.EpisodeUsed != 2 || dto.WorkerRecovery.EpisodeRemaining != 1 {
+			t.Fatalf("retained count %d must not become worker-death allowance: %+v", count, dto.WorkerRecovery)
+		}
+	}
 }
 
 func TestWorkerRecoveryHistoricEvidenceDTO(t *testing.T) {

@@ -1360,6 +1360,12 @@ tasks:
       - ./scripts/release-scripts-test.sh
       - ./scripts/worker-roll-target.test.sh
       - task: test:release-ci-coverage
+      - task: test:release-auto
+
+  test:release-auto:
+    desc: offline release automation orchestration regressions
+    cmds:
+      - python3 -I -B scripts/release-auto.test.py
 
   test:release-ci-coverage:
     desc: offline release evidence, metadata and publication polling regressions

@@ -422,6 +422,8 @@ uzi version
   to the pool and it resumes), `recovery_wait` (parked after an empty model turn, or
   because automatic worker-death recovery exhausted — cause
   `worker_requeue_exhausted`, owner Resume/Cancel only, no timer — or
+  retained-source budget exhaustion, `retained_recovery_exhausted`, with three
+  timed retries by default followed by an owner hold (NULL retry) — or
   because the forge was unreachable at clone — cause `forge_unreachable`, capped by
   `RUN_FORGE_UNREACHABLE_MAX_PARKS`; the sweep retries it on a capped backoff; cause
   `codex_account_unavailable` is held on its Codex account until that account is usable
@@ -478,7 +480,8 @@ uzi version
   bare wait stops there too), `completed`, `failed`, `cancelled` — and keeps
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
   `recovery_wait`/`paused`, except a default wait stops on recovery cause
-  `worker_requeue_exhausted` or a paused credential-switch hold (`credential_switch_settling` /
+  `worker_requeue_exhausted`, `worker_memory_pressure`, owner-held
+  `retained_recovery_exhausted` (NULL retry), or a paused credential-switch hold (`credential_switch_settling` /
   `credential_switch_unsettled`; it prints the next step on stderr): timed limit and recovery waits retry on a timer, pool waits
   need an available pooled token, and ordinary owner or lead pauses need `uzi run resume`. A
   `vault_locked` recovery park still waits: a bare wait keeps waiting through it
@@ -806,6 +809,26 @@ uzi version
   `landing_state` is `needs_landing` carries human-landable work: recover it with
   `uzi run export` when an archive is available, or from the preserved diff
   (`uzi run get <run-id> --field preserved_patch`) when it isn't.
+  Retained-source exhaustion is `recovery_wait` / `retained_recovery_exhausted`.
+  A finite retry, including due, means timed retry; NULL means owner-held without
+  a countdown; omitted timing is unknown. Default wait/log follow stop on the
+  held form; explicit `--until` keeps its status set. Follow reports finite-to-NULL
+  changes within the same cause/status. Default `RUN_RETAINED_RECOVERY_MAX_PARKS=3`
+  allows three parks at roughly 1m/2m/4m plus jitter; 0 holds immediately.
+  `retained_park_count` is separate from worker-death charges and lifetime waits.
+  Owner Resume/Cancel work on either form; Resume clears retry, preserves count
+  and cap, increments stored worker episode and resets its requeue baseline.
+  A fresh generation plus higher derived claim episode (stored episode plus
+  retained park count) renews one three-reservation/five-minute recovery window,
+  charging one reservation and requiring quiescence again. Same generation or
+  episode cannot renew; a two-step episode jump still grants one renewal.
+  Timer promotion grants a fresh run wall; manual Resume preserves remaining
+  wall and may need owner extension. Token/credential changes do not promote it.
+  Both forms keep source custody and can block image rolls. Execution release
+  never authorizes source deletion. Earlier archives may omit latest local work;
+  after worker death or affinity expiry, a peer may resume from a published
+  checkpoint without the original local journal.
+  See [retained recovery guidance](../../../../docs/run-recovery-wait.md#retained-recovery-exhausted).
   Worker-death exhaustion is `recovery_wait` / `worker_requeue_exhausted`:
   owner `uzi run resume <id>` (or `resume-now`) releases the exact run hold
   and queues one explicit attempt with the current `RUN_MAX_REQUEUES`
@@ -823,7 +846,8 @@ uzi version
   only and its lifetime marker is never renewed. Timers, credentials, vault,
   account and ordinary inputs do not release or renew the hold.
   `run get` shows `WORKER_RECOVERY` and `RECOVERY_EVIDENCE`; JSON
-  `worker_recovery` has `episode`, `automatic_requeue_limit`, `episode_used`,
+  `worker_recovery` reports the stored worker-death episode, not the derived
+  retained-retry episode, and has `episode`, `automatic_requeue_limit`, `episode_used`,
   `episode_remaining`, and historical `evidence` (`checkpoint_tip`,
   `available_capture`, `publication_uncertain`, `capture_uncertain`,
   `custody_uncertain`, `unknown`, `recorded_at`). This does not certify current

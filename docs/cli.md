@@ -1356,9 +1356,11 @@ uzi run recovery <run-id> [--json]
   protection, a capture in flight, or a ready archive. Legacy holds can release
   automatically on archive readiness; guarded holds await final inventory acknowledgment.
   The narrow exhaustion exception is an OPEN hold for `recovery_wait` /
-  `worker_requeue_exhausted`: it remains `source_only`, or `needs_action` after a failed
-  latest capture, even with an available archive or capture in flight. Owner Resume/Cancel
-  remains required; archive readiness does not implicitly release this custody.
+  `worker_requeue_exhausted`, `worker_memory_pressure`, or
+  `retained_recovery_exhausted` (timed or held): it remains `source_only`, or `needs_action` after a failed
+  latest capture, even with an available archive or capture in flight. Timed retained
+  recovery can retry automatically; NULL retry requires owner Resume/Cancel. Archive
+  readiness does not implicitly release this custody.
   The latest capture state and available archive are independent: an older download may
   omit latest work while a newer capture prepares/uploads. The same source, coverage,
   export and discard guidance as above follows. `--json` prints
@@ -3138,7 +3140,9 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `paused` / `provider_unavailable` — see [Recovering
   from a transient interruption](run-recovery-wait.md). An exhausted worker-death episode also parks here with cause
   `worker_requeue_exhausted`, requiring explicit owner Resume or Cancel
-  without an automatic timer. A Codex credential
+  without an automatic timer. Retained-source budget exhaustion can use cause
+  `retained_recovery_exhausted`: three timed retries by default, then an owner
+  hold with no countdown. See [Retained recovery exhausted](#retained-recovery-exhausted). A Codex credential
   refresh or release that found the owner's vault locked also parks here
   (cause `vault_locked`); it takes the same capped backoff and no lifetime
   cap. The owner's explicit successful vault unlock best-effort queues an
@@ -3228,7 +3232,9 @@ hold presentation and remedies are unchanged. See
 
 `limit_wait` and timed `recovery_wait` causes auto-resume on a timer.
 `worker_requeue_exhausted` instead requires owner Resume or Cancel; the Codex
-account hold waits for its account. `pool_wait` instead clears only when a token is
+account hold waits for its account. `retained_recovery_exhausted` retries when
+its timestamp is finite (even if due); NULL instead needs owner Resume/Cancel,
+and omitted timing is unknown. `pool_wait` instead clears only when a token is
 opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
 does not resume it.
 
@@ -3348,6 +3354,30 @@ set written explicitly. Ordinary recovery waits continue as before.
 status stays `recovery_wait`. The TUI puts this hold in NEEDS YOU with
 owner actions, counts and historical evidence, without a self-retry countdown.
 
+### Retained recovery exhausted
+
+`recovery_wait` / `retained_recovery_exhausted` means a durably confirmed
+retained-source recovery budget was exhausted. The default cap allows three
+timed parks (roughly 1m, 2m, 4m plus jitter), then holds for the owner.
+`retained_park_count` counts these retries, not worker-death requeues.
+`worker_recovery` remains stored-episode and historical evidence; neither it
+nor an earlier available archive proves latest-work coverage.
+
+A finite `recovery_retry_not_before`, including a due timestamp, shows a timed
+retry; NULL shows an owner hold with no countdown, and omitted timing is unknown.
+Owner `uzi run resume <id>` or `resume-now` queues either form early and clears
+its retry; `uzi run cancel <id>` ends either form. Resume preserves the count
+and cap. Timer promotion grants a fresh run wall window, while manual Resume
+preserves remaining wall budget and may require `uzi run extend` first.
+Token/credential changes do not promote this cause.
+
+Default wait and log follow stop at the owner-held form and continue through
+timed retries; explicit `--until` keeps its status set. Follow reports a
+finite-to-NULL transition even within the same cause/status. Both forms keep
+source custody; execution release does not authorize deleting source. See
+[Retained recovery exhausted](run-recovery-wait.md#retained-recovery-exhausted)
+for renewal bounds, storage risks and rollout requirements.
+
 ### Waiting for a state: `uzi run wait`
 
 `uzi run wait <id>` blocks until the run reaches a state you can act on — the
@@ -3357,7 +3387,8 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 `awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
 rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`),
 except a default wait also stops at `recovery_wait` with cause
-`worker_requeue_exhausted`, and at a `paused` run held on
+`worker_requeue_exhausted`, `worker_memory_pressure`, or owner-held
+`retained_recovery_exhausted` (NULL retry), and at a `paused` run held on
 `base_attestation_missing`, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means

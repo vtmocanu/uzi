@@ -431,6 +431,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		// the cause and counts the park toward UZI_RUN_DISK_PARK_MAX. Advertised UNCONDITIONALLY
 		// (no config gates the park; 0 only lifts the cap): a worker must see it before sending
 		// the cause or the flag, because an older api 400s both.
+		{"recovery_cause_retained_recovery_exhausted"},
 		{"recovery_cause_data_volume_full"},
 		// PRD #1733: this api accepts {status:"recovery_wait", recovery_cause:"provider_outage"}
 		// with the optional productive_turns count, stores and counts the typed park, bounds an

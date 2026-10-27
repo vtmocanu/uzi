@@ -1389,32 +1389,44 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   onResume: () => void;
   onCancel: () => void;
 }) {
+  const retained = run.recovery_wait_cause === "retained_recovery_exhausted";
+  const retainedStatus = effectiveRunStatus(run);
+  const retryMs = typeof run.recovery_retry_not_before === "string" ? Date.parse(run.recovery_retry_not_before) : NaN;
   const memoryHeld = run.recovery_wait_cause === "worker_memory_pressure";
   const memory = run.memory_hold;
   const recovery = run.worker_recovery;
   const evidence = recovery?.evidence;
   return (
     <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
-      <p className="text-sm font-semibold text-warn">{memoryHeld ? "Worker memory pressure — waiting for owner" : "Worker recovery needs your decision"}</p>
+      <p className="text-sm font-semibold text-warn">{retained ? retainedStatus === "retained_recovery_held" ? "Retained recovery needs your decision"
+        : retainedStatus === "retained_recovery_retrying" ? "Retained recovery retrying" : "Retained recovery timing unknown"
+        : memoryHeld ? "Worker memory pressure — waiting for owner" : "Worker recovery needs your decision"}</p>
       <p className="mt-0.5 text-xs text-muted">
-        {memoryHeld
+        {retained ? <>
+          {retainedStatus === "retained_recovery_held"
+            ? "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
+            : retainedStatus === "retained_recovery_retrying"
+              ? retryMs <= Date.now() ? "Automatic retry is due; the run will retry automatically. Only the run owner can Resume now or Cancel."
+                : `The run will retry automatically after ${new Date(retryMs).toLocaleString()}. Only the run owner can Resume now or Cancel.`
+              : "Retry timing is unavailable. This does not establish an owner hold or an automatic retry date."}
+        </> : <>{memoryHeld
           ? "Memory interventions have stopped. Resume starts a fresh memory episode. Cancel ends this run."
           : "Automatic worker recovery has stopped. Only the run owner can resume or cancel this run. Resume requests one explicit attempt, even when the automatic recovery limit is zero."}
         {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
-        This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.
+        This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.</>}
       </p>
-      <p className="mt-1.5 text-xs text-muted">
+      {!retained && <p className="mt-1.5 text-xs text-muted">
         {memoryHeld
           ? `Memory interventions: used ${memory?.used ?? "unknown"}. Maximum: ${memory?.max ?? "unknown"}. Remaining: ${memory?.remaining ?? "unknown"}.`
           : recovery
             ? `Automatic recovery limit: ${recovery.automatic_requeue_limit}. Used: ${recovery.episode_used}. Remaining: ${recovery.episode_remaining}.`
             : "Automatic recovery limit, used and remaining: unknown."}
-      </p>
-      {memoryHeld
+      </p>}
+      {!retained && (memoryHeld
         ? memory && <p className="mt-1.5 text-xs text-muted">Memory episode: {memory.episode}.</p>
         : <>{recovery && <p className="mt-1.5 text-xs text-muted">Recovery episode: {recovery.episode}.</p>}
-          <p className="mt-1.5 text-xs text-muted">Lifetime automatic requeues: {run.requeue_count}.</p></>}
-      {memoryHeld && <p className="mt-1.5 text-xs text-muted">
+          <p className="mt-1.5 text-xs text-muted">Lifetime automatic requeues: {run.requeue_count}.</p></>)}
+      {(memoryHeld || retained) && <p className="mt-1.5 text-xs text-muted">
         Retained source may remain on the assigned worker. Historical checkpoint or capture reports do not verify current availability or the latest local edits.
         Only a verified available recovery archive can restore captured work on another worker; uncaptured work is not guaranteed.
       </p>}
@@ -1502,7 +1514,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
   // sibling parks) renders nothing — PoolWaitPanel owns pool_wait, LimitWaitPanel owns
   // limit_wait, and this self-hides on both so mounting all three side by side is safe.
   if (run.status !== "recovery_wait") return null;
-  if (run.recovery_wait_cause === "worker_requeue_exhausted" || run.recovery_wait_cause === "worker_memory_pressure") {
+  if (run.recovery_wait_cause === "worker_requeue_exhausted" || run.recovery_wait_cause === "worker_memory_pressure" || run.recovery_wait_cause === "retained_recovery_exhausted") {
     return <WorkerDecisionPanel run={run} ownerProof={ownerProof} busy={busy} onResume={onResume} onCancel={onCancel} />;
   }
 
@@ -1758,7 +1770,8 @@ export function RunView() {
   const memoryHeld = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
   // Issue #3181: the token-switch holds are owner decisions too (Resume / Cancel).
   const switchHeld = run != null && credentialSwitchHold(run) !== null;
-  const ownerDecisionHold = workerExhausted || memoryHeld || providerHeld || switchHeld;
+  const retainedRecovery = run?.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_exhausted";
+  const ownerDecisionHold = retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
   const canSteer = optimisticCanSteer && (!ownerDecisionHold || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
   const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
@@ -1862,7 +1875,7 @@ export function RunView() {
     setBusy(false);
   };
   const resumeWorkerHold = async () => {
-    if (!canSteer || !(workerExhausted || memoryHeld) || run?.id !== id) return;
+    if (!canSteer || !(workerExhausted || memoryHeld || retainedRecovery) || run?.id !== id) return;
     const requestRunId = id;
     const isCurrent = startAction();
     try {
@@ -2180,6 +2193,8 @@ export function RunView() {
                   ? "data_volume_full"
                   : run.recovery_wait_cause === "provider_outage"
                     ? "provider_outage"
+                  : run.recovery_wait_cause === "retained_recovery_exhausted"
+                    ? effectiveRunStatus(run)
                   : run.recovery_wait_cause === "worker_requeue_exhausted"
                     ? "worker_requeue_exhausted"
                   : run.recovery_wait_cause === "worker_memory_pressure"
@@ -2209,6 +2224,12 @@ export function RunView() {
         ? "The run is waiting for your next follow-up."
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
+          : parkKey === "retained_recovery_held"
+            ? "Retained recovery needs your decision. Only the run owner can Resume or Cancel. There is no scheduled retry."
+          : parkKey === "retained_recovery_retrying"
+            ? "Retained recovery will retry automatically after its scheduled time, including when already due. Only the run owner can Resume now or Cancel."
+          : parkKey === "retained_recovery_unknown"
+            ? "Retained recovery timing is unavailable. An owner hold or automatic retry date cannot be inferred."
           : parkKey === "worker_requeue_exhausted"
             ? "Worker recovery needs your decision. Only the run owner can resume or cancel this hold. There is no scheduled retry."
           : parkKey === "worker_memory_pressure"
@@ -3024,7 +3045,7 @@ export function RunView() {
           nothing for every other kind. */}
       <JobResultPanel run={run} />
 
-      {(!(workerExhausted || memoryHeld) || canSteer) && <RecoveryArchivesPanel run={run} />}
+      {(!(workerExhausted || memoryHeld || retainedRecovery) || canSteer) && <RecoveryArchivesPanel run={run} />}
 
       {/* Checkpoint salvage (PRD #1867): the bounded archive copy of a failed run's last
           published checkpoint at refs/uzi-salvage/<run-id>. Renders only for a failed run
