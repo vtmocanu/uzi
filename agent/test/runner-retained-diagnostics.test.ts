@@ -150,3 +150,68 @@ it("an asynchronous readiness refusal stops retained recovery before successor a
   assert.equal(journal.recovery.attempts, refusals);
   assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "local work\n");
 });
+
+for (const mode of ["operational", "non-error", "abort", "ownership", "credential"] as const) {
+  it("M1 post-adoption check: " + mode, async () => {
+    const { claim, bare, clone } = await seed();
+    const log = recordingLogger();
+    const operational = new TypeError("check /private/source/" + "a".repeat(40) + " " + secret);
+    const before = Object.getOwnPropertyDescriptors(operational);
+    let adopted = false, faulted = false, models = 0, factories = 0;
+    const prepare = git.prepareRecoverySuccessor.bind(git);
+    const runner = runnerWith(() => {
+      factories++;
+      return { executor: { sandboxesCommands: false, run: async () => { models++; throw new Error("must not enter model"); } } };
+    }, fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: 1 });
+    let flight: any;
+    const ownership = (runner as any).requireRetainedOwnership.bind(runner);
+    (runner as any).requireRetainedOwnership = async (...args: any[]) => {
+      flight = args[0];
+      if (adopted && !faulted) {
+        faulted = true;
+        if (mode === "operational") throw operational;
+        if (mode === "non-error") throw "postcheck ordinary value";
+        if (mode === "abort") throw Object.assign(new Error("postcheck aborted"), { name: "AbortError" });
+      }
+      return ownership(...args);
+    };
+    let successor: Awaited<ReturnType<typeof prepare>> | undefined;
+    git.prepareRecoverySuccessor = async (...args) => {
+      successor = await prepare(...args);
+      adopted = true;
+      assert.equal(JSON.parse(command(bare, "config", `uzi-recovery.${clone.branch}.clone`)).recovery.stage, "ready-for-model");
+      if (mode === "ownership") api.setOwnershipStatus(claim.run_id, "running", 3);
+      if (mode === "credential") flight.steering.tripCredentialSwitch(2);
+      return successor;
+    };
+    await runner.execute(claim);
+    assert.equal(adopted, true);
+    assert.equal(faulted, true);
+    assert.equal(models, 0);
+    assert.equal(factories, 1, "postcheck failure never recreates the executor");
+    const diagnostics = log.lines.filter((line: any) => line.msg === warning) as Array<Record<string, any>>;
+    if (mode === "operational") {
+      assert.equal(diagnostics.length, 1);
+      const diagnostic = diagnostics[0]!;
+      assert.equal(diagnostic.diagnostic_stage, "successor");
+      assert.equal(diagnostic.diagnostic_code, "retained_successor_post_adoption_check");
+      assert.equal(diagnostic.cause, "");
+      assert.equal(diagnostic.context, undefined);
+      assert.equal(diagnostic.detail, undefined);
+      assert.doesNotMatch(JSON.stringify(diagnostic), /private|aaaaaaa|ijklmnopqrst/);
+      assert.deepEqual(Object.getOwnPropertyDescriptors(operational), before);
+    } else if (mode === "non-error" || mode === "abort") {
+      assert.equal(diagnostics.length, 1);
+      assert.equal(diagnostics[0]!.diagnostic_code, "recovery_failed");
+      assert.equal(diagnostics[0]!.cause, mode === "abort" ? "postcheck aborted" : "postcheck ordinary value");
+    } else {
+      assert.equal(diagnostics.length, 0, "runtime stop sentinels bypass operational warnings");
+      assert.equal(api.states.some(s => s.body.status === "failed" || s.body.status === "recovery_wait"), false);
+    }
+    assert.ok(successor);
+    assert.ok(fs.existsSync(successor.path), "successor custody remains");
+    assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "local work\n");
+    const journal = JSON.parse(command(bare, "config", `uzi-recovery.${clone.branch}.clone`));
+    assert.doesNotMatch(JSON.stringify(journal), /diagnostic_/);
+  });
+}
