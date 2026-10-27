@@ -9248,8 +9248,6 @@ export class GitCache {
               return refused(ev.disposition?.kind ?? "refused",
                 ev.disposition?.kind === "refused" ? ev.disposition.consumers : ev.blockers, ev.disposition);
             }
-            try { for (const p of rec.parts) await this.admitSource(p.clonePath, "discard"); }
-            catch { return refused("source_use_refused", ["authority"]); }
             // The existing protected-source checks, then the exclusivity ones (evaluateRetained).
             let snapshot: { descriptor: string | undefined; active: string | undefined } | undefined;
             if (rec.kind === "protected") {
@@ -9269,6 +9267,12 @@ export class GitCache {
             // remaining sources and every record: nothing further is deleted or retired.
             const stopped = (): RetainedDiscardResult => ({ kind: "unknown", sources: outcomes, metadata });
             if (residueQuarantine() !== undefined) return stopped();
+            // issue #3404 M2 U5: the operator-discard takeover of the authority slots comes LAST, after every refusal
+            // above (protected-source checks, quiescence, latch) and immediately before the first delete. A refused
+            // discard therefore rewrites no durable authority, and a crashed worker's foreign `active` epoch keeps
+            // guarding a source this discard never touched. A refusal here (a running pending record, ...) deletes nothing.
+            try { for (const p of rec.parts) await this.admitSource(p.clonePath, "discard"); }
+            catch { return refused("source_use_refused", ["authority"]); }
             for (const [i, p] of rec.parts.entries()) {
               this.checkRecoveryInterruption();
               if (residueQuarantine() !== undefined) return stopped();

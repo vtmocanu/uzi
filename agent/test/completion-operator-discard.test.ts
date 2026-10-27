@@ -157,14 +157,62 @@ describe("operator discard takes over exactly its footprint", () => {
     assert.ok(fs.existsSync(source.dir));
   });
 
-  it("a discard that deletes nothing (not quiescent) leaves the slot usable, not stuck retiring", async () => {
+  it("a refused discard (not quiescent) rewrites no authority state at all", async () => {
     const source = plant(8);
     const result = await discard(live, source, { quiesce: async () => false });
     assert.equal(result.kind, "refused");
-    assert.ok(fs.existsSync(source.dir));
-    const slot = await slotOf(live, source.dir);
-    assert.equal(slot?.state, "ineligible", "the retiring transaction was closed without a tombstone");
-    assert.equal(slot?.retiring ?? null, null);
+    assert.equal(result.kind === "refused" ? result.reason : "", "not_quiescent");
+    assert.ok(fs.existsSync(source.dir) && fs.existsSync(source.skills));
+    assert.equal(await slotOf(live, source.dir), null, "no slot was written: the takeover comes after every refusal");
+  });
+
+  it("a crashed worker's active slot survives a not_quiescent discard: still active under the dead incarnation, a seed is still refused", async () => {
+    const source = plant(11);
+    const crashed = runtimeOf();
+    await crashed.bindSource(source.dir);
+    const before = await slotOf(live, source.dir);
+    assert.equal(before?.state, "active");
+    const result = await discard(live, source, { quiesce: async () => false });
+    assert.equal(result.kind, "refused");
+    assert.deepEqual(await slotOf(live, source.dir), before, "the slot is byte-for-byte what the crashed worker left");
+    await assert.rejects(live.withTransaction(() => live.hooks.admitSourceUse(source.dir, "seed-attempt")), /active under another worker incarnation/);
+  });
+
+  it("a discard that took the slot over but deleted nothing restores the prior state exactly (a foreign active epoch stays guarded)", async t => {
+    const source = plant(12);
+    const crashed = runtimeOf();
+    await crashed.bindSource(source.dir);
+    const before = await slotOf(live, source.dir);
+    assert.equal(before?.state, "active");
+    // Every delete is refused by a guard after the takeover: nothing is removed.
+    t.mock.method(git as unknown as { deleteRetainedArtifact(): Promise<boolean> }, "deleteRetainedArtifact", async () => false);
+    const result = await discard(live, source);
+    assert.equal(result.kind, "incomplete");
+    assert.ok(fs.existsSync(source.dir) && fs.existsSync(source.skills));
+    const after = await slotOf(live, source.dir);
+    assert.equal(after?.state, "active");
+    assert.equal(after?.epoch, before?.epoch, "the foreign epoch is back");
+    assert.deepEqual(after?.owner, before?.owner, "under the dead incarnation");
+    assert.equal(after?.retiring ?? null, null);
+    await assert.rejects(live.withTransaction(() => live.hooks.admitSourceUse(source.dir, "seed-attempt")), /active under another worker incarnation/);
+  });
+
+  it("a discard that deleted nothing keeps a settled_failed record as evidence (never ineligible without it)", async t => {
+    const source = plant(13);
+    const failed = runtimeOf();
+    await failed.withTransaction(async () => {
+      await failed.hooks.admitSourceUse(source.dir, "seed-attempt");
+      const settlement = await failed.hooks.beginDestructive([source.skills], "runner-uid-delete");
+      await settlement.settle({ ok: false, residue: [source.skills] });
+    });
+    const before = await slotOf(live, source.dir);
+    t.mock.method(git as unknown as { deleteRetainedArtifact(): Promise<boolean> }, "deleteRetainedArtifact", async () => false);
+    const result = await discard(live, source);
+    assert.equal(result.kind, "incomplete");
+    const after = await slotOf(live, source.dir);
+    assert.deepEqual(after?.pending, before?.pending, "the residue evidence stays on record");
+    assert.equal(after?.state, before?.state);
+    assert.equal(after?.epoch, before?.epoch);
   });
 
   it("a sibling attempt of the same key is untouched", async () => {

@@ -125,6 +125,10 @@ const DEFAULT_RETRY_MS = 30_000;
 /** The seed ops that may consume a live publication: git.ts runs them after its journal guards found no journal naming the path. */
 const CONSUMING_OPS: ReadonlySet<string> = new Set(["seed-canonical", "seed-attempt"]);
 const SKILLS_PREFIX = ".uzi-skills-";
+/** Retiring-manifest item prefixes (recovery.ts retiringManifest): the journal fence, and a bundle or record file. */
+const FENCE_ITEM = "fence:";
+const BUNDLE_ITEM = "bundle:";
+const RECORD_ITEM = "record:";
 /** The ops that create the path they admit: GitCache creates its parent directory right after admission. */
 const SEED_OPS: ReadonlySet<string> = new Set(["seed-canonical", "seed-attempt", "replace"]);
 const MAX_FOOTPRINT = 1024;
@@ -174,6 +178,10 @@ export class AuthorityRuntime implements AuthorityScope {
   readonly #collector = new AsyncLocalStorage<Set<string>>();
   /** The operator-discard lease per normalized slot path: an end of that source use tombstones or releases it. */
   readonly #discards = new Map<string, SourceUseLease>();
+  /** The footprint items that existed when the operator discard took the slot over, per normalized slot path. */
+  readonly #discardPresent = new Map<string, string[]>();
+  /** Pending-binder predicates registered by the runners that share this runtime (see {@link registerBinderPending}). */
+  readonly #binderPending: Array<(clonePath: string) => boolean> = [];
   readonly hooks: GitAuthorityHooks;
   readonly retirement: RetirementScope;
 
@@ -189,6 +197,16 @@ export class AuthorityRuntime implements AuthorityScope {
       inspect: (value) => this.#inspectRetirement(value),
       enter: (view, manifest) => this.#enterRetirement(view, manifest),
     };
+  }
+
+  /**
+   * A runner registers whether a completion-source binder is still pending for a clone path in its process. The
+   * retired tombstone is never written for a path while one is: the finisher in {@link #finishRecordedRetirement}
+   * waits, like the coordinator's own retirement does, and the path stays refused as `being retired` until a
+   * later admission finishes it.
+   */
+  registerBinderPending(check: (clonePath: string) => boolean): void {
+    this.#binderPending.push(check);
   }
 
   /** The transaction of this async context, or undefined. Never acquires A. */
@@ -377,48 +395,73 @@ export class AuthorityRuntime implements AuthorityScope {
 
   /**
    * End an operator discard (U5): the slot is tombstoned only when every footprint item is confirmed absent
-   * (lstat ENOENT; any other answer counts as present), otherwise it leaves `retiring` for `ineligible` or keeps
-   * its settled_failed residue. A running pending record keeps it for a later retry.
+   * (lstat ENOENT; any other answer counts as present). When nothing the discard found was deleted the store
+   * restores the slot exactly as the takeover found it; otherwise (a partial deletion) it leaves `retiring` for
+   * `ineligible` or keeps its settled_failed residue. A running pending record keeps it for a later retry.
    */
   async #endDiscard(tx: AuthorityTransaction, store: AuthorityStore, key: string, lease: SourceUseLease, slot: SlotSnapshot): Promise<"ended" | "kept"> {
     if (slot.pending?.status === "running") {
       this.#options.log?.warn("operator discard left retiring: an operation on it is unresolved", { source: key, operation: slot.pending.operation });
       return "kept";
     }
+    const presentNow = async (item: string): Promise<boolean> =>
+      fsp.lstat(item).then(() => true, (error: NodeJS.ErrnoException) => error.code !== "ENOENT");
     let allGone = true;
     for (const item of slot.retiring?.manifest ?? []) {
-      const present = await fsp.lstat(item).then(() => true, (error: NodeJS.ErrnoException) => error.code !== "ENOENT");
-      if (present) { allGone = false; break; }
+      if (await presentNow(item)) { allGone = false; break; }
     }
-    await store.endOperatorDiscard(tx, lease, { allGone });
+    // Nothing deleted: every item that existed when the discard took the slot over still exists. The store then
+    // puts the slot back exactly as the takeover found it instead of weakening it (a foreign active epoch stays
+    // guarded, a settled_failed record stays evidence).
+    let nothingDeleted = !allGone;
+    if (nothingDeleted) {
+      for (const item of this.#discardPresent.get(key) ?? []) {
+        if (!(await presentNow(item))) { nothingDeleted = false; break; }
+      }
+    }
+    await store.endOperatorDiscard(tx, lease, { allGone, nothingDeleted });
     this.#leases.delete(key);
     this.#discards.delete(key);
+    this.#discardPresent.delete(key);
     return "ended";
   }
 
   // ---- restart retirement (U5) -------------------------------------------------------------
 
   /**
-   * A `retiring` slot whose progress record says every manifest item is confirmed deleted needs only its
-   * tombstone: write it (taking over a dead owner's retirement first) unless an operation on it is unresolved.
-   * Progress is recorded only after a deletion is confirmed, so nothing here deletes or reopens anything. Any
-   * refusal leaves the slot as it is and the admission that follows refuses as before.
+   * A `retiring` restart-retirement slot whose manifest is CONFIRMED fully deleted needs only its tombstone:
+   * write it (taking over a dead owner's retirement first) unless an operation on it is unresolved or a binder
+   * for the path is pending in this process. Recorded progress is not the only proof: a crash or failed write
+   * after the last record unlink and before the final progress write leaves no record to resume from, so every
+   * file item is lstat-confirmed absent here, and progress must already cover the journal fence (progress is
+   * recorded only from a Git read of the journal, and the record deletions that follow it come after it).
+   * Anything present or unconfirmed leaves the slot as it is and the admission that follows refuses as before.
+   * An operator-discard retiring slot (no fence item) is never finished here.
    */
   async #finishRecordedRetirement(tx: AuthorityTransaction, store: AuthorityStore, key: string): Promise<void> {
     const slot = await this.#slotOf(tx, store, key);
     const retiring = slot?.retiring;
-    if (!slot || slot.state !== "retiring" || !retiring || retiring.deleted !== retiring.manifest.length ||
-        slot.pending?.status === "running") return;
+    if (!slot || slot.state !== "retiring" || !retiring || slot.pending?.status === "running") return;
+    if (this.#binderPending.some((check) => check(key))) return;
+    const fenceIndex = retiring.manifest.findIndex((item) => item.startsWith(FENCE_ITEM));
+    if (fenceIndex < 0 || retiring.deleted <= fenceIndex) return;
+    for (const item of retiring.manifest) {
+      if (item.startsWith(FENCE_ITEM)) continue;
+      const file = item.startsWith(BUNDLE_ITEM) || item.startsWith(RECORD_ITEM) ? item.slice(item.indexOf(":") + 1) : item;
+      const present = await fsp.lstat(file).then(() => true, (error: NodeJS.ErrnoException) => error.code !== "ENOENT");
+      if (present) return;
+    }
     try {
       let lease = this.#leases.get(key);
       if (slot.owner.worker !== store.workerIncarnation || !lease || leaseEpoch(lease) !== slot.epoch) {
         lease = await store.beginRetirement(tx, key, { expectedEpoch: slot.epoch, expectedDigest: retiring.prior, manifest: [] });
       }
+      if (retiring.deleted !== retiring.manifest.length) await store.advanceRetiring(tx, lease, retiring.manifest.length);
       await store.markRetired(tx, lease);
       this.#leases.delete(key);
       this.#discards.delete(key);
     } catch (error) {
-      this.#options.log?.warn("a fully recorded retirement could not be tombstoned", { source: key, error: error instanceof Error ? error.message : String(error) });
+      this.#options.log?.warn("a fully deleted retirement could not be tombstoned", { source: key, error: error instanceof Error ? error.message : String(error) });
     }
   }
 
@@ -619,6 +662,7 @@ export class AuthorityRuntime implements AuthorityScope {
     this.#store = opened;
     this.#leases.clear();
     this.#discards.clear();
+    this.#discardPresent.clear();
     return opened;
   }
 
@@ -654,13 +698,20 @@ export class AuthorityRuntime implements AuthorityScope {
     // state the slot is in (a crashed worker's active epoch, settled_failed residue); a running pending refuses.
     if (op === "discard") {
       this.#note(key);
-      const lease = await store.admitOperatorDiscard(tx, key, [key, path.join(path.dirname(key), `${SKILLS_PREFIX}${path.basename(key)}`)]);
+      const footprint = [key, path.join(path.dirname(key), `${SKILLS_PREFIX}${path.basename(key)}`)];
+      const existing: string[] = [];
+      for (const item of footprint) {
+        if (await fsp.lstat(item).then(() => true, (error: NodeJS.ErrnoException) => error.code !== "ENOENT")) existing.push(item);
+      }
+      const lease = await store.admitOperatorDiscard(tx, key, footprint);
       this.#leases.set(key, lease);
       this.#discards.set(key, lease);
+      this.#discardPresent.set(key, existing);
       return;
     }
-    // A retirement whose whole manifest is RECORDED deleted but whose tombstone was never written (a crash, a
-    // failed write, a pending binder) is finished here, so it cannot wedge the path's next use.
+    // A restart retirement whose whole manifest is CONFIRMED deleted (lstat; see #finishRecordedRetirement) but whose
+    // tombstone was never written (a crash or failed write after the last unlink) is finished here, so it cannot wedge
+    // the path's next use. A pending binder for the path in this process defers it: the path stays refused.
     await this.#finishRecordedRetirement(tx, store, key);
     // A normalize works on the source its own epoch already covers: the same open lease keeps its
     // epoch. Every other op starts a new use of the path and mints a fresh epoch first.

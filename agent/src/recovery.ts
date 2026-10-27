@@ -93,15 +93,24 @@ const BUNDLE_ITEM = "bundle:";
 const RECORD_ITEM = "record:";
 
 /**
- * The exact artifacts a completed generation's retirement destroys, in DELETION order, so what remains at any
- * moment is a suffix: the clone, its paired skills dir (only when present), the journal fence (cleared with the
- * clone's retirement), the bundle files that exist, the cohort's records and the receipt-bearing record last.
+ * The exact artifacts a completed generation's retirement destroys, in the ORDER forgetCompletedGeneration
+ * actually deletes them, so what remains at any moment is a suffix: the clone and the journal fence (both go
+ * in GitCache.retireRunnerClone's one step: the clone is moved, then the journal entry is cleared), then the
+ * paired skills dir (only when present; removed by removeCompletionSkillsDir after that step), the bundle
+ * files that exist, the cohort's records and the receipt-bearing record last.
+ *
+ * The manifest names files and the fence, not Git refs or recovery pins. The ref and pin deletions of
+ * cleanupRecoveryGeneration are bound through the RECORDS instead: a retry derives its pins and recovery
+ * sources only from the generation's records still on disk, and residueExplained refuses any such record the
+ * manifest does not name or that does not carry the retiring source, so a retry cannot delete a ref or pin
+ * the retiring generation's own manifest-bound records do not account for.
  */
 function retiringManifest(input: { clonePath: string; skillsPath: string | undefined; fence: CompletionSourceFence;
   bundles: string[]; records: string[]; authorityRecord: string }): string[] {
   return [
-    input.clonePath, ...(input.skillsPath === undefined ? [] : [input.skillsPath]),
+    input.clonePath,
     FENCE_ITEM + serializeSourceFence(input.fence),
+    ...(input.skillsPath === undefined ? [] : [input.skillsPath]),
     ...[...input.bundles].sort().map(file => BUNDLE_ITEM + file),
     ...input.records.filter(file => file !== input.authorityRecord).sort().map(file => RECORD_ITEM + file),
     RECORD_ITEM + input.authorityRecord,
@@ -584,14 +593,18 @@ export interface RecoveryCoordinatorOptions {
   }) => Promise<T>, signal?: AbortSignal) => Promise<{ entered: false } | { entered: true; value: T }>;
   /** Notification only, after exact-source and generation cleanup actually completed. */
   onCompletionSourceForgotten?: (source: CompletionSource) => void;
-  /** issue #3404 M2 U5: whether a binder for this source's identity is still pending in the process. The retired
-   *  tombstone is written only while none is. Absent: nothing is pending. */
+  /** issue #3404 M2 U5: whether a binder for this source's identity is still pending in the process. No retired
+   *  tombstone is written while one is: not by this coordinator's retirement (forgetCompletedGeneration leaves
+   *  the slot `retiring`) and not by AuthorityRuntime's finisher, which consults the same pending-binder state
+   *  through the runner's registration (AuthorityRuntime.registerBinderPending). Absent: nothing is pending. */
   completionBinderPending?: (source: CompletionSource) => boolean;
   /** Notification only, after guarded archive/FINAL cleanup removed the full generation. */
   onCompletionGenerationForgotten?: (runId: string, generation: number) => void;
   withCompletionSourceBoundary?: (
     source: CompletionSource,
-    action: (canDelete: () => boolean) => Promise<void>,
+    /** `quiesceSkills` proves the paired skills dir's writers gone (and, on a Docker-wired worker, that no
+     *  container is known to mount it), the same proof the guarded operator discard demands before it deletes. */
+    action: (canDelete: () => boolean, quiesceSkills?: (paths: string[]) => Promise<boolean>) => Promise<void>,
     durable?: DurableCompletionRetirement,
   ) => Promise<"passed" | "retained">;
   /** Tests only: the file/directory barriers of {@link RecoveryCoordinator.publishCompletionSource}. */
@@ -4543,7 +4556,7 @@ export class RecoveryCoordinator {
         enter: async () => { handle ??= await this.authority!.retirement!.enter(plan.view, items); },
       } : undefined;
       let forgotten = false;
-      const boundary = await this.withCompletionSourceBoundary!(source, async canDelete => {
+      const boundary = await this.withCompletionSourceBoundary!(source, async (canDelete, quiesceSkills) => {
         // Idempotent: normally the clone move already entered it; a source that is already gone enters here,
         // before the first ref, bundle or record is destroyed.
         await durable?.enter();
@@ -4568,6 +4581,10 @@ export class RecoveryCoordinator {
           if (skills !== undefined) {
             const removeSkills = this.git.removeCompletionSkillsDir;
             if (!removeSkills || !canDelete()) throw new Error("completion skills directory cannot be removed");
+            // The clone's quiescence was proven before the clone moved, but the skills dir is a separate footprint and
+            // on a resume the clone is already gone: its writers (and, Docker-wired, its mounts) are proven gone here,
+            // exactly as the operator discard does. A refusal throws: the retiring record stays for a later retry.
+            if (!quiesceSkills || !await quiesceSkills([skills]) || !canDelete()) throw new Error("completion skills directory not proven quiescent");
             const gone = await ownedRecoveryIO(() => removeSkills.call(this.git, bare, plan!.v2.clonePath, canDelete));
             if (!gone) throw new Error("completion skills directory retained");
             await progress();
@@ -4643,9 +4660,12 @@ export class RecoveryCoordinator {
    * fence or a manifest member was intentionally removed by the retirement itself. It refuses additions (a record
    * or bundle of the run that the manifest does not name, a member whose source is not the retiring one, a stray
    * directory entry), changes (a journal fence other than the manifest's) and unexplained absence. Deletion
-   * order is the manifest order, so what remains must be a SUFFIX of it: the leading absent items are explained
-   * by the deletions the retirement made (confirmed or not yet recorded), but an item absent behind a present one
-   * is not, and an item the record counts as deleted must not be present. Caller holds J.
+   * order is the manifest order (see {@link retiringManifest}), so what remains must be a SUFFIX of it: the
+   * leading absent items are explained by the deletions the retirement made (confirmed or not yet recorded), but
+   * an item absent behind a present one is not, and an item the record counts as deleted must not be present.
+   * Git refs and recovery pins are not manifest items: the retry's ref/pin deletions are derived from the
+   * generation's records, and every record present must be a named manifest member carrying the retiring source
+   * (checked first below), which is what binds them. Caller holds J.
    */
   private async residueExplained(runId: string, view: RetirementView, v2: CompletionSourceV2, wanted: string,
     journalFence: CompletionSourceFence | undefined, records: RecoveryRecord[], selected: RecoveryRecord[]): Promise<boolean> {

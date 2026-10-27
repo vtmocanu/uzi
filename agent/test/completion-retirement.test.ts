@@ -7,8 +7,9 @@ import path from "node:path";
 import { latchResidueQuarantine } from "../src/residue-quarantine.js";
 import { nullLogger } from "./helpers.js";
 import { installHarness, git } from "./runner-harness.js";
+import { openAuthorityStore } from "../src/completion-authority.js";
 import {
-  BRANCH, ENV, fenceOf, isV2, journalRaw, readRecords, recordDir, recordNames, rewriteSources, rig, slotAt, slotOf, slotVia, snapshotFiles,
+  BRANCH, ENV, GENERATION, TOKEN, fenceOf, isV2, journalRaw, readRecords, recordDir, recordNames, rewriteSources, rig, slotAt, slotOf, slotVia, snapshotFiles,
   type Rig,
 } from "./completion-retirement-fixture.js";
 
@@ -487,19 +488,28 @@ describe("partial retirement keeps the authenticated retiring record as the only
   });
 });
 
-describe("a fully recorded retirement never wedges the next use of the path", () => {
-  it("a pending binder defers the tombstone; the next admission of the path finishes it and issues a new epoch", async t => {
+/** The identity the runner's pending-binder set uses for this rig's completing source (completionSourceIdentity). */
+const binderKey = (r: Rig): string => JSON.stringify([r.runId, GENERATION, r.bare, BRANCH, r.clone, r.bound.attemptId]);
+const binderSet = (p: unknown): Set<{ key: string }> => (p as { completionSourceBinds: Set<{ key: string }> }).completionSourceBinds;
+
+describe("a fully deleted retirement never wedges the next use of the path", () => {
+  it("a binder pending in the process defers every tombstone (the retirement's and the admission finisher's); once it clears, the next admission finishes it and issues a new epoch", async t => {
     const r = await rig(t, { codex: false, cohort: 2 });
     await r.end();
     await r.receipt();
     const published = await slotOf(r);
     const second = r.restart();
-    (second.p.recovery as unknown as { completionBinderPending: () => boolean }).completionBinderPending = () => true;
+    const binder = { key: binderKey(r) };
+    binderSet(second.p).add(binder);
     await second.sweep();
     assert.deepEqual(recordNames(r), [], "everything was deleted");
     const waiting = await slotVia(second.rt, r.clone);
-    assert.equal(waiting?.state, "retiring", "the tombstone waited for the binder");
+    assert.equal(waiting?.state, "retiring", "the retirement's tombstone waited for the binder");
     assert.equal(waiting?.retiring?.deleted, waiting?.retiring?.manifest.length, "the whole manifest is recorded deleted");
+    // The admission finisher consults the same pending-binder state: it does not tombstone beneath a pending binder.
+    await assert.rejects(second.rt.withTransaction(() => second.rt.hooks.admitSourceUse(r.clone, "seed-canonical")), /being retired/);
+    assert.equal((await slotVia(second.rt, r.clone))?.state, "retiring", "still retiring: no tombstone with a binder pending");
+    binderSet(second.p).delete(binder);
     await second.rt.withTransaction(() => second.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
     const next = await slotVia(second.rt, r.clone);
     assert.equal(next?.state, "active");
@@ -507,7 +517,7 @@ describe("a fully recorded retirement never wedges the next use of the path", ()
     assert.equal(next?.publication, null);
   });
 
-  it("a retiring slot with unrecorded progress is not finished by an admission: the path stays refused", async t => {
+  it("a retiring slot with undeleted artifacts is not finished by an admission: the path stays refused", async t => {
     const r = await rig(t, { codex: false, cohort: 2 });
     await r.end();
     await r.receipt();
@@ -522,6 +532,224 @@ describe("a fully recorded retirement never wedges the next use of the path", ()
     const successor = r.restart();
     await assert.rejects(successor.rt.withTransaction(() => successor.rt.hooks.admitSourceUse(r.clone, "seed-canonical")), /being retired/);
     assert.equal((await slotVia(successor.rt, r.clone))?.state, "retiring");
+  });
+
+  it("a failed run-directory sync after the last unlink leaves the slot retiring, not retired, and no record to resume from", async t => {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    await r.end();
+    await r.receipt();
+    const second = r.restart();
+    (second.p.recovery as unknown as { publicationOps: { syncDir(h: unknown): Promise<void> } }).publicationOps.syncDir = async () => { throw new Error("injected run-directory sync failure"); };
+    await second.sweep().catch(() => undefined);
+    const slot = await slotAt(r, r.clone);
+    assert.notEqual(slot?.state, "retired", "no tombstone before the record deletions are durable");
+    assert.equal(slot?.state, "retiring");
+    assert.deepEqual(recordNames(r), [], "every record is already gone: nothing receipt-bearing remains to resume from");
+    assert.ok((slot?.retiring?.deleted ?? 0) < (slot?.retiring?.manifest.length ?? 0), "the final progress write never happened");
+  });
+
+  for (const successor of [false, true]) {
+    it(`a slot left retiring after the last unlink is finished by the next admission when every manifest artifact is confirmed absent (${successor ? "successor incarnation" : "same worker"})`, async t => {
+      const r = await rig(t, { codex: false, cohort: 2 });
+      await r.end();
+      await r.receipt();
+      const published = await slotOf(r);
+      const second = r.restart();
+      (second.p.recovery as unknown as { publicationOps: { syncDir(h: unknown): Promise<void> } }).publicationOps.syncDir = async () => { throw new Error("injected run-directory sync failure"); };
+      await second.sweep().catch(() => undefined);
+      assert.equal((await slotVia(second.rt, r.clone))?.state, "retiring");
+      const user = successor ? r.restart() : second;
+      await user.rt.withTransaction(() => user.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+      const next = await slotVia(user.rt, r.clone);
+      assert.equal(next?.state, "active");
+      assert.notEqual(next?.epoch, published?.epoch, "a new epoch");
+      assert.equal(next?.owner.worker, user.incarnation);
+    });
+  }
+
+  it("an artifact reappearing before the finisher runs (a stray record) keeps the slot retiring and the path refused", async t => {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    await r.end();
+    await r.receipt();
+    const second = r.restart();
+    (second.p.recovery as unknown as { publicationOps: { syncDir(h: unknown): Promise<void> } }).publicationOps.syncDir = async () => { throw new Error("injected run-directory sync failure"); };
+    await second.sweep().catch(() => undefined);
+    // The authority record is back: a manifest member that is present is not confirmed deleted.
+    const name = `${r.captureIds[0]}.json`;
+    fs.mkdirSync(recordDir(r), { recursive: true });
+    fs.writeFileSync(path.join(recordDir(r), name), "{}");
+    await assert.rejects(second.rt.withTransaction(() => second.rt.hooks.admitSourceUse(r.clone, "seed-canonical")), /being retired/);
+    assert.equal((await slotVia(second.rt, r.clone))?.state, "retiring");
+  });
+});
+
+describe("a retirement interrupted after the clone moved and before the skills dir was deleted completes on retry", () => {
+  async function interrupted(t: Parameters<typeof rig>[0], codex = false): Promise<{ r: Rig; first: ReturnType<Rig["restart"]> }> {
+    const r = await rig(t, { codex, cohort: 2 });
+    await r.end();
+    await r.receipt();
+    const first = r.restart();
+    t.mock.method(git, "removeCompletionSkillsDir", async () => { throw new Error("injected skills failure"); });
+    await first.sweep();
+    return { r, first };
+  }
+
+  for (const codex of [false, true]) {
+    it(`${codex ? "Codex" : "Claude"}: the retiring slot keeps the skills dir and the records; the same worker's retry completes and tombstones`, async t => {
+      const { r, first } = await interrupted(t, codex);
+      assert.equal(fs.existsSync(r.clone), false, "Git moved the clone");
+      assert.equal(journalRaw(r), "", "and cleared the journal fence");
+      assert.ok(fs.existsSync(r.skills), "the skills dir is still there");
+      assert.equal((await slotOf(r))?.state, "retiring");
+      t.mock.restoreAll();
+      await first.sweep();
+      assert.equal(fs.existsSync(r.skills), false, "the retry removed the skills dir");
+      assert.deepEqual(recordNames(r), []);
+      assert.equal((await slotOf(r))?.state, "retired");
+    });
+
+    it(`${codex ? "Codex" : "Claude"}: a successor incarnation retries after the owner died between the clone move and the skills delete`, async t => {
+      const { r } = await interrupted(t, codex);
+      t.mock.restoreAll();
+      const successor = r.restart();
+      await successor.sweep();
+      assert.equal(fs.existsSync(r.skills), false);
+      assert.deepEqual(recordNames(r), []);
+      const slot = await slotVia(successor.rt, r.clone);
+      assert.equal(slot?.state, "retired");
+      assert.equal(slot?.owner.worker, successor.incarnation);
+    });
+  }
+
+  it("the manifest lists the artifacts in the order they are deleted: clone, fence, skills, bundles, records", async t => {
+    const { r } = await interrupted(t);
+    const manifest = (await slotOf(r))?.retiring?.manifest ?? [];
+    const kinds = manifest.map(item => item.startsWith("fence:") ? "fence" : item.startsWith("bundle:") ? "bundle" : item.startsWith("record:") ? "record"
+      : path.basename(item).startsWith(".uzi-skills-") ? "skills" : "clone");
+    assert.deepEqual(kinds, ["clone", "fence", "skills", "bundle", "bundle", "record", "record"]);
+  });
+});
+
+describe("the skills dir is deleted only after its own quiescence proof", () => {
+  type Quiesce = (req: { site?: string; targetPaths: string[] }) => Promise<unknown>;
+  const outcome = (process: string, docker: string): unknown => ({ process: { state: process }, docker: { state: docker } });
+
+  async function withQuiesce(t: Parameters<typeof rig>[0], decide: (req: { site?: string; targetPaths: string[] }) => unknown,
+    options: { dockerHost?: string } = {}): Promise<{ r: Rig; second: ReturnType<Rig["restart"]>; skillsRequests: Array<{ site?: string; targetPaths: string[] }> }> {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    await r.end();
+    await r.receipt();
+    const second = r.restart();
+    const skillsRequests: Array<{ site?: string; targetPaths: string[] }> = [];
+    (second.p as unknown as { quiesceImpl: Quiesce }).quiesceImpl = async req => {
+      if (req.site === "completion_source:skills") { skillsRequests.push({ site: req.site, targetPaths: [...req.targetPaths] }); return decide(req); }
+      return outcome("quiescent", "docker_unconfirmed");
+    };
+    if (options.dockerHost !== undefined) (second.p as unknown as { dockerHost: string }).dockerHost = options.dockerHost;
+    return { r, second, skillsRequests };
+  }
+
+  it("a skills dir whose writers are not proven gone is retained: the retiring record stays and nothing further is deleted", async t => {
+    let quiet = false;
+    const { r, second, skillsRequests } = await withQuiesce(t, () => outcome(quiet ? "quiescent" : "survivors", "docker_unconfirmed"));
+    const removeSkills = t.mock.method(git, "removeCompletionSkillsDir");
+    await second.sweep();
+    assert.equal(removeSkills.mock.callCount(), 0, "no delete was attempted");
+    assert.deepEqual(skillsRequests, [{ site: "completion_source:skills", targetPaths: [r.skills] }], "exactly the paired skills path was proven");
+    assert.ok(fs.existsSync(r.skills));
+    assert.equal(recordNames(r).length, 4, "records and bundles remain");
+    assert.equal((await slotOf(r))?.state, "retiring");
+    quiet = true;
+    await second.sweep();
+    assert.equal(fs.existsSync(r.skills), false, "the later retry, with the proof, completes");
+    assert.deepEqual(recordNames(r), []);
+    assert.equal((await slotOf(r))?.state, "retired");
+  });
+
+  it("Docker-wired: only docker_unconfirmed proves it; docker_error retains, docker_unconfirmed proceeds", async t => {
+    let docker = "docker_error";
+    const { r, second } = await withQuiesce(t, () => outcome("quiescent", docker), { dockerHost: "unix:///docker-test.sock" });
+    const removeSkills = t.mock.method(git, "removeCompletionSkillsDir");
+    await second.sweep();
+    assert.equal(removeSkills.mock.callCount(), 0);
+    assert.ok(fs.existsSync(r.skills));
+    assert.equal((await slotOf(r))?.state, "retiring");
+    docker = "docker_unconfirmed";
+    await second.sweep();
+    assert.equal(fs.existsSync(r.skills), false);
+    assert.equal((await slotOf(r))?.state, "retired");
+  });
+});
+
+describe("a completed source retires in the SAME process too (no restart)", () => {
+  for (const codex of [false, true]) {
+    it(`${codex ? "Codex" : "Claude"}: the publishing worker's own sweep retires the exact clone, skills, journal entry, bundles and records and tombstones`, async t => {
+      const r = await rig(t, { codex, cohort: 2 });
+      await r.end();
+      await r.receipt();
+      assert.ok(cloneAlive(r));
+      const snapshot = (await r.p.recovery.inspect(r.runId)).filter(x => x.completionReceipt);
+      await r.p.recovery.resumePending(undefined, snapshot);
+      assert.equal(fs.existsSync(r.clone), false, "the clone is retired by the publishing process");
+      assert.equal(fs.existsSync(r.skills), false);
+      assert.equal(journalRaw(r), "");
+      assert.deepEqual(recordNames(r), []);
+      assert.equal((await slotOf(r))?.state, "retired");
+    });
+  }
+});
+
+describe("the withCompletionSourceBoundary memory veto", () => {
+  it("a runner with an authority runtime and no durable retirement never releases a source on memory alone", async t => {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    await r.end();
+    await r.receipt();
+    const second = r.restart();
+    const p = second.p as unknown as {
+      classifyCompletionSource(s: unknown): { kind: string };
+      withCompletionSourceBoundary(s: unknown, action: (open: () => boolean) => Promise<void>): Promise<string>;
+    };
+    assert.equal(p.classifyCompletionSource(r.bound).kind, "noReliableBinding");
+    const inventory = t.mock.method(git, "readInventoryCloneHeads");
+    let ran = 0;
+    assert.equal(await p.withCompletionSourceBoundary(r.bound, async () => { ran++; }), "retained");
+    assert.equal(ran, 0);
+    assert.equal(inventory.mock.callCount(), 0, "refused before any inventory read");
+    assert.ok(fs.existsSync(path.join(r.clone, ".git")), "the clone stays");
+    assert.equal((await slotOf(r))?.state, "claude_ready");
+  });
+});
+
+describe("operator discard never takes over a published source or a restart retirement", () => {
+  const discardFootprint = (r: Rig): string[] => [r.clone, r.skills];
+  const attempt = (rt: Rig["rt"], r: Rig): Promise<unknown> => rt.withTransaction(async tx => {
+    const store = await openAuthorityStore(tx, { workerToken: TOKEN });
+    return store.admitOperatorDiscard(tx, r.clone, discardFootprint(r));
+  });
+
+  for (const codex of [false, true]) {
+    it(`${codex ? "sealed" : "claude_ready"}: refused, the slot and publication are unchanged`, async t => {
+      const r = await rig(t, { codex, cohort: 2 });
+      await r.end();
+      const before = await slotOf(r);
+      assert.equal(before?.state, codex ? "sealed" : "claude_ready");
+      await assert.rejects(attempt(r.restart().rt, r), /published/);
+      assert.deepEqual(await slotOf(r), before);
+    });
+  }
+
+  it("a restart retirement in progress (retiring, authenticated manifest) is refused and left intact", async t => {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    await r.end();
+    await r.receipt();
+    const first = r.restart();
+    t.mock.method(git, "removeCompletionSkillsDir", async () => { throw new Error("injected skills failure"); });
+    await first.sweep();
+    t.mock.restoreAll();
+    const before = await slotOf(r);
+    assert.equal(before?.state, "retiring");
+    await assert.rejects(attempt(r.restart().rt, r), /being retired/);
+    assert.deepEqual(await slotOf(r), before, "the authenticated retirement manifest was not replaced");
   });
 });
 

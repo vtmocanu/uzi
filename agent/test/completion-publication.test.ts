@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { acquireWorkerLifetime, type WorkerLifetime } from "../src/authority-lock.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
-import { openAuthorityStore, type AuthorityFsOps, type SlotSnapshot, type SourceUseLease } from "../src/completion-authority.js";
+import { leaseEpoch, openAuthorityStore, type AuthorityFsOps, type SlotSnapshot, type SourceUseLease } from "../src/completion-authority.js";
 import { sourceCoreDigest, sourceFenceOf, verifyCertifiedSource, verifyPublishedSource, type CompletionSourceV2 } from "../src/completion-source.js";
 import { ExecutorLifetime, type ExecutorTerminalSeal } from "../src/codex/executor-lifetime.js";
 import type { Executor } from "../src/executor.js";
@@ -629,7 +629,9 @@ describe("a stale fence never wedges a clone", () => {
       assert.deepEqual(fenceOf(r), foreign, "the stale fence is untouched");
       assert.deepEqual(snapshotFiles(r), before);
       assert.equal(readRecords(r).some(isV2), false);
-      assert.equal((await slotOf(r))?.epoch, slotBefore?.epoch, "the slot's epoch is not adopted");
+      // A discard that deleted nothing restores the exact prior slot when its use ends, so the epoch may
+      // be the disturbance's or the one it displaced; publication never mints or adopts a third.
+      assert.ok([slotBefore?.epoch, leaseEpoch(stale!)].includes((await slotOf(r))?.epoch), "the slot's epoch is not adopted");
       assert.notEqual((await slotOf(r))?.state, "claude_ready");
     });
   }

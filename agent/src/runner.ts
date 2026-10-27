@@ -3014,6 +3014,8 @@ export class RunRunner {
     opts: RunnerOptions = {},
   ) {
     this.authority = opts.authority;
+    // issue #3404 M2 U5: the runtime's retired-tombstone finisher must not run while a binder for the path is pending.
+    this.authority?.registerBinderPending(clonePath => this.completionBinderPendingAt(clonePath));
     this.memoryRuntime = opts.memoryRuntime;
     this.cancellationBudgetFactory = opts.cancellationBudgetFactory ?? (() => new MaintenanceBudget());
     this.pollMs = opts.pollMs ?? 3_000;
@@ -3592,6 +3594,17 @@ export class RunRunner {
     }
   }
 
+  /** Whether a completion-source binder (preparation or binding; keys are completionSourceIdentity tuples) is pending for `clonePath`. */
+  private completionBinderPendingAt(clonePath: string): boolean {
+    for (const binder of this.completionSourceBinds) {
+      try {
+        const tuple: unknown = JSON.parse(binder.key);
+        if (Array.isArray(tuple) && tuple[4] === clonePath) return true;
+      } catch { return true; }
+    }
+    return false;
+  }
+
   private completionSourceIdentity(source: CompletionSource): string {
     const ctx = source.context;
     return JSON.stringify([ctx.runId, ctx.generation, ctx.barePath, ctx.branch, source.clonePath, source.attemptId]);
@@ -3670,7 +3683,8 @@ export class RunRunner {
   /** Reserve execution through completion retirement's disposal under the bare lock. Successor admission
    * replaces this tail and stops any further destruction while waiting for our release. */
   private async withCompletionSourceBoundary(source: CompletionSource,
-    action: (canDelete: () => boolean) => Promise<void>, durable?: DurableCompletionRetirement): Promise<"passed" | "retained"> {
+    action: (canDelete: () => boolean, quiesceSkills?: (paths: string[]) => Promise<boolean>) => Promise<void>,
+    durable?: DurableCompletionRetirement): Promise<"passed" | "retained"> {
     const ctx = source.context;
     // issue #3404 M2 U5: with an authority runtime a release rests on durable authority the coordinator verified
     // and passes here. This process's memory (classification below) stays a VETO either way, but it is never the
@@ -3690,6 +3704,22 @@ export class RunRunner {
     this.inventoryReservations.add(ctx.runId);
     const open = (): boolean => proof() && this.executionTails.get(ctx.runId) === tail && residueQuarantine() === undefined &&
       !this.liveAttempts.isLivePath(source.clonePath);
+    // issue #3404 M2 U5: the paired skills dir is a separate footprint from the clone and, on a resume, the clone is
+    // already gone, so its own writers are proven gone the way the operator discard proves them (capture-mode scoped
+    // quiescence over exactly that path; Docker-wired, teardown must answer docker_unconfirmed). Only that path is
+    // accepted: this is never a way to quiesce, and so delete, anything else.
+    const skillsPath = join(pathDirname(source.clonePath), `.uzi-skills-${pathBasename(source.clonePath)}`);
+    const quiesceSkills = async (paths: string[]): Promise<boolean> => {
+      if (process.platform !== "linux" || !open() || paths.length === 0 || paths.some(p => p !== skillsPath)) return false;
+      const outcome = await this.quiesceImpl({
+        mode: "capture" as const, attempt: undefined, cloneKey: cloneKeyOf(source.clonePath).cloneKey, targetPaths: [skillsPath],
+        processes: true, dockerHost: this.dockerHost, registry: this.liveAttempts,
+        otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== ctx.runId),
+        site: "completion_source:skills",
+      });
+      if (outcome.process?.state !== "quiescent" || !open()) return false;
+      return !this.dockerHost || outcome.docker.state === "docker_unconfirmed";
+    };
     try {
       const inventory = await this.git.readInventoryCloneHeads(ctx.barePath, ctx.runId);
       if (inventory.kind !== "verified" || !open()) return "retained";
@@ -3702,7 +3732,7 @@ export class RunRunner {
           (durable?.resumed === true && open() &&
             await this.git.completionSourceJournalAbsent(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId));
         if (!retired || !open()) return "retained";
-        await action(open);
+        await action(open, quiesceSkills);
         return "passed";
       }
       if (clone.branch !== ctx.branch || clone.runId !== ctx.runId) return "retained";
@@ -3722,7 +3752,7 @@ export class RunRunner {
         ...(classification.kind === "knownCodex" ? { processProof: open } : {}),
       });
       if (!open()) return "retained";
-      await action(open);
+      await action(open, quiesceSkills);
       return "passed";
     } catch (err) {
       this.log.warn("recovery: completion source retained", { run_id: ctx.runId, error: errMessage(err) });

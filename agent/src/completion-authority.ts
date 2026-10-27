@@ -749,6 +749,9 @@ function operatorDiscardPrior(key: string, epoch: string): string {
   return createHash("sha256").update(`uzi operator discard\0${key}\0${epoch}`).digest("hex");
 }
 
+/** The exact slot an operator-discard takeover replaced (null: none), keyed by the lease the takeover minted. */
+const discardPriors = new WeakMap<SourceUseLease, SlotSnapshot | null>();
+
 export class AuthorityStore {
   readonly #init: StoreInit;
   /** Highest seq loaded or written per slot key; shared by every store of this storage id. */
@@ -1246,6 +1249,16 @@ export class AuthorityStore {
     const old = await this.#load(dir, key);
     const items = strings([...footprint], MAX_ITEMS);
     if (items.length === 0) throw new AuthorityRefusal("operator discard needs a footprint");
+    // A published source (sealed/claude_ready, or any slot still carrying a publication) and a restart retirement in
+    // progress belong to restart retirement: the discard authorizes neither its proof nor its manifest, and taking
+    // either over would replace the authenticated retirement with its own transaction. Only a discard's own earlier
+    // retiring record (its `prior` is derived from the slot and epoch) may be retaken.
+    if (old?.state === "retiring" && old.retiring?.prior !== operatorDiscardPrior(key, old.epoch)) {
+      throw new AuthorityRefusal("source is being retired; restart retirement owns it");
+    }
+    if (old && (old.state === "sealed" || old.state === "claude_ready" || old.publication !== null)) {
+      throw new AuthorityRefusal("source is published; restart retirement owns it");
+    }
     if (old?.pending?.status === "running") throw new AuthorityRefusal("source has an unresolved pending footprint");
     if (old?.pending && !old.pending.residue.every((item) => items.includes(item))) {
       throw new AuthorityRefusal("pending residue is not covered by the discard footprint");
@@ -1255,10 +1268,12 @@ export class AuthorityStore {
       version: SLOT_VERSION, key, state: "retiring", epoch, seq: (old?.seq ?? 0) + 1,
       owner: { worker: this.#init.incarnation, executor: null }, pending: old?.pending ?? null,
       retiring: { prior: operatorDiscardPrior(key, epoch), operation: randomUUID(), manifest: items, deleted: 0 },
-      publication: old?.publication ?? null, codexMarked: old?.codexMarked ?? false,
+      publication: null, codexMarked: old?.codexMarked ?? false,
     };
     await this.#save(dir, body);
-    return new SourceUseLease(leaseBrand, this, key, epoch, "claude");
+    const lease = new SourceUseLease(leaseBrand, this, key, epoch, "claude");
+    discardPriors.set(lease, old);
+    return lease;
   }
 
   /**
@@ -1268,8 +1283,15 @@ export class AuthorityStore {
    * pending leaves `retiring` for `ineligible` (the source stays as it was, usable by a retained recovery) and
    * a slot with a settled_failed record stays `retiring`, keeping its residue as evidence. A running pending
    * record refuses. Only a record this method's admission wrote qualifies.
+   *
+   * `nothingDeleted` is the caller's finding that every footprint item that existed at the takeover still exists.
+   * The slot is then put back EXACTLY as the takeover found it (a crashed worker's foreign `active` epoch keeps
+   * guarding the source, a settled_failed record stays evidence), provided no operation changed the pending
+   * record meanwhile; a discard that deleted nothing never weakens the prior state.
    */
-  async endOperatorDiscard(tx: AuthorityTransaction, lease: SourceUseLease, outcome: { allGone: boolean }): Promise<"retired" | "ineligible" | "retained"> {
+  async endOperatorDiscard(
+    tx: AuthorityTransaction, lease: SourceUseLease, outcome: { allGone: boolean; nothingDeleted?: boolean },
+  ): Promise<"retired" | "ineligible" | "retained" | "restored"> {
     const { dir, body } = await this.#owned(tx, lease);
     if (body.state !== "retiring" || !body.retiring || body.retiring.prior !== operatorDiscardPrior(body.key, body.epoch)) {
       throw new AuthorityRefusal("source is not an operator discard");
@@ -1279,6 +1301,11 @@ export class AuthorityStore {
       requireResidueCovered(body.pending, body.retiring.manifest);
       await this.#save(dir, { ...body, state: "retired", retiring: null, pending: null, publication: null, seq: body.seq + 1 });
       return "retired";
+    }
+    const prior = discardPriors.get(lease);
+    if (outcome.nothingDeleted === true && prior && JSON.stringify(prior.pending) === JSON.stringify(body.pending)) {
+      await this.#save(dir, { ...prior, seq: body.seq + 1 });
+      return "restored";
     }
     if (body.pending !== null) return "retained";
     await this.#save(dir, { ...body, state: "ineligible", retiring: null, seq: body.seq + 1 });
