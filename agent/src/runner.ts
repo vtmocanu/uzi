@@ -21784,13 +21784,15 @@ export class RunRunner {
   /** Two identical reports and at most two ownership probes, under one boundary deadline.
    * Ownership only authorizes replay: only the report ACK's exact status/cause confirms.
    * Any unresolved outcome stops this flight without terminal reporting or releasing custody. */
-  private async parkRetainedRecoveryExhausted(flight: RunFlight): Promise<boolean> {
+  private async parkRetainedRecoveryExhausted(flight: RunFlight,
+    cause: "retained_recovery_exhausted" | "retained_recovery_adoption_failed" = "retained_recovery_exhausted",
+  ): Promise<boolean> {
     const deadline = Date.now() + this.codexBoundaryDeadlineMs;
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(new Error("retained park deadline exhausted")),
       Math.max(1, deadline - Date.now()));
     const signal = AbortSignal.any([this.retainedLifecycleSignal(flight), timeout.signal]);
-    const body: StateRequest = { status: "recovery_wait", recovery_cause: "retained_recovery_exhausted",
+    const body: StateRequest = { status: "recovery_wait", recovery_cause: cause,
       claim_generation: flight.claimGeneration };
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -21802,7 +21804,9 @@ export class RunRunner {
           if (ack.staleClaim || ack.reason === "stale_claim" || ack.credentialSwitch ||
               (ack.status !== undefined && ack.status !== "running" && ack.status !== "recovery_wait"))
             throw new RetainedRecoveryStop();
-          if (ack.status === "recovery_wait" && ack.recoveryCause === "retained_recovery_exhausted") {
+          if (ack.status === "recovery_wait" && ack.recoveryCause !== undefined && ack.recoveryCause !== cause)
+            throw new RetainedRecoveryStop();
+          if (ack.status === "recovery_wait" && ack.recoveryCause === cause) {
             flight.parked = true;
             return true;
           }
@@ -21835,7 +21839,8 @@ export class RunRunner {
   }
 
   /** At most three durably precharged iterations per server recovery episode.
-   * A newer episode with a fresh owned claim can renew budget exhaustion; other blockers persist.
+   * A newer episode with a fresh owned claim can renew budget exhaustion. Adoption failure
+   * needs an unconsumed raw owner grant and a newer owned claim; other blockers persist.
    * Each failed capture blocks only this run; waits are bounded by the persisted episode clock. */
   private async recoverRetainedClaim(
     claim: ClaimResponse, flight: RunFlight, key: string, source: RecoveryJournalEntry,
@@ -21871,14 +21876,21 @@ export class RunRunner {
           blocker !== "readiness_cleanup_unconfirmed") blocker = "budget_exhausted";
       let persistence = "";
       let persisted: RecoveryJournalEntry | undefined;
+      let persistedPaths: string[] = [];
       try {
         await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
           async () => {
             this.retainedLifecycleGuard(flight);
+            if (episode && Number.isSafeInteger(claim.worker_recovery_owner_episode) &&
+                (claim.worker_recovery_owner_episode ?? -1) >= 0) {
+              expectedSource = await this.git.recoveryReservationSnapshot(bare, branch, key, expectedSource, episode);
+              this.retainedLifecycleGuard(flight);
+            }
             await this.git.blockRecoveryEpisode(bare, branch, key, expectedSource, blocker, episode ?? null,
               () => this.retainedLifecycleGuard(flight));
             this.retainedLifecycleGuard(flight);
-            if (this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_exhausted") &&
+            if ((this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_exhausted") ||
+                this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_adoption_failed")) &&
                 Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0) {
               const snapshot = await this.git.terminalRetainedSnapshot(bare, branch, key, expectedSource);
               this.retainedLifecycleGuard(flight);
@@ -21886,6 +21898,7 @@ export class RunRunner {
                   snapshot.journal.clonePath !== expectedSource.clonePath ||
                   snapshot.journal.attemptId !== expectedSource.attemptId) throw new Error("recovery readback identity changed");
               persisted = snapshot.journal;
+              persistedPaths = snapshot.paths;
             }
           });
       }
@@ -21907,6 +21920,48 @@ export class RunRunner {
       // quiescence and persisted blocker, never the catch type or custody flags.
       flight.sourceBlockingNormal = flight.sourceFamilyMatched === true && sourceQuiescenceJoined &&
         blocker === "decoded_history_limit" && persistence === "" && !flight.sourceExitDenied && !flight.sourceDispatchDenied;
+      if (persistence === "" && persisted?.recovery?.stage === "blocked" &&
+          persisted.recovery.blocker === "adoption_failed" &&
+          this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_adoption_failed") &&
+          Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0) {
+        const deadline = Date.now() + this.codexBoundaryDeadlineMs;
+        let quiescent = false;
+        const checkOwnership = async () => {
+          try { await this.requireRetainedOwnership(flight); }
+          catch (error) {
+            if (error instanceof CredentialSwitchSignal) throw error;
+            throw new RetainedRecoveryStop({ cause: error });
+          }
+        };
+        await checkOwnership();
+        try {
+          await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), deadline, async signal => {
+            // No capture is performed on a rehold. Every source, including a partial
+            // successor, still needs a fresh credential-free quiescence boundary.
+            const proof = await this.runFreeCapture(claim, flight, deadline, signal, async held => {
+              this.assertHeldFreeCapture(flight, held);
+              const quiescence = await this.quiesceRun(flight, flight.executor, {
+                mode: "capture", site: "predecessor_capture", targetPaths: persistedPaths, propagateControl: true,
+              });
+              this.assertHeldFreeCapture(flight, held);
+              return quiescence;
+            }, "capture", "strict");
+            quiescent = proof.kind === "observed_empty" && !proof.value.blocked;
+          });
+        } catch (error) {
+          this.retainedLifecycleGuard(flight);
+          if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal ||
+              isRunOwnershipLost(error, flight.runId)) throw error;
+          quiescent = false;
+          flight.runLog.warn("retained adoption park quiescence unproven; failing with custody retained",
+            formatRetainedRecoveryDiagnostic(error, flight.redactText));
+        }
+        // The proof can exhaust its operation clock. Use a separate bounded ownership
+        // probe before either outcome, so integrity refusal cannot overwrite a changed owner.
+        await checkOwnership();
+        if (quiescent && await this.parkRetainedRecoveryExhausted(flight, "retained_recovery_adoption_failed"))
+          throw new RetainedRecoveryStop();
+      }
       if (persistence === "" && persisted?.recovery?.stage === "blocked" && persisted.recovery.blocker === "budget_exhausted" &&
           Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 &&
           this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_exhausted")) {
@@ -21921,8 +21976,21 @@ export class RunRunner {
     };
     const recoveryEpisode = Number.isSafeInteger(claim.worker_recovery_episode) &&
       (claim.worker_recovery_episode ?? -1) >= 0 ? claim.worker_recovery_episode : undefined;
-    if (source.recovery?.stage === "blocked" &&
-        (source.recovery.blocker !== "budget_exhausted" || (recoveryEpisode ?? 0) <= (source.recovery.episode ?? 0))) await fail();
+    if (source.recovery?.stage === "blocked") {
+      let renewable = source.recovery.blocker === "budget_exhausted" &&
+        (recoveryEpisode ?? 0) > (source.recovery.episode ?? 0);
+      if (source.recovery.blocker === "adoption_failed") {
+        try {
+          renewable = await this.git.canRenewRecoveryAdoption(bare, branch, key, source,
+            flight.claimGeneration, claim.worker_recovery_owner_episode);
+        } catch (error) {
+          this.retainedLifecycleGuard(flight);
+          flight.runLog.warn("retained adoption renewal evidence unavailable",
+            formatRetainedRecoveryDiagnostic(error, flight.redactText));
+        }
+      }
+      if (!renewable) await fail();
+    }
     // Refusing an unfenced renewal must leave the predecessor journal untouched.
     if (episode && (recoveryEpisode ?? 0) > (episode.episode ?? 0) &&
         (!Number.isSafeInteger(flight.claimGeneration) || flight.claimGeneration < 1 ||
@@ -21953,7 +22021,7 @@ export class RunRunner {
               throw new RetainedRecoveryStop();
             }
           }
-          return this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs, flight.claimGeneration, recoveryEpisode);
+          return this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs, flight.claimGeneration, recoveryEpisode, claim.worker_recovery_owner_episode);
         });
       } catch (error) {
         this.retainedLifecycleGuard(flight);

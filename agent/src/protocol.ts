@@ -1482,6 +1482,8 @@ export interface ClaimResponse extends ClaimMemoryState {
   claim_generation?: number;
   /** Server recovery allowance; malformed values are ignored at the claim boundary. */
   worker_recovery_episode?: number;
+  /** Raw owner resume grant; malformed or absent grants confer no adoption renewal. */
+  worker_recovery_owner_episode?: number;
   /** Structured PRD #3 templates — the lead plus any subagents — consumed
    *  programmatically by M3 (mapped to SDK AgentDefinitions). M2 ignores them. */
   agents: AgentTemplate[];
@@ -1899,6 +1901,8 @@ export interface ChatClaimResponse extends ClaimMemoryState {
   run_id: string;
   claim_generation?: number;
   worker_recovery_episode?: number;
+  /** Raw owner resume grant; malformed or absent grants confer no adoption renewal. */
+  worker_recovery_owner_episode?: number;
   kind: "chat";
   /** Conversation display title (server-derived; may be empty). */
   title: string;
