@@ -200,6 +200,7 @@ SELECT
     u.id            AS user_id,
     u.email         AS email,
     u.display_name  AS display_name,
+    u.vault_mode,
     s.id            AS user_secret_id,
     s.label         AS label,
     s.is_default    AS is_default,

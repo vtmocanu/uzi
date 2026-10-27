@@ -117,6 +117,7 @@ func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 				ID:          u.UserID.String(),
 				Email:       u.Email,
 				Name:        u.DisplayName.String, // "" when the user has no display name
+				VaultMode:   u.VaultMode,
 				VaultLocked: h.vault.RequiresUnlock(r.Context(), u.UserID),
 				Tokens:      []apitypes.TokenRateLimitDTO{},
 			})

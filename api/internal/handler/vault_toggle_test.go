@@ -136,7 +136,7 @@ func TestVaultStatusFallbackTruth(t *testing.T) {
 				wantMode = store.VaultModeProtected
 			}
 			want := vault.Status{Mode: wantMode, Policy: "optional", Exists: wantMode == store.VaultModeProtected}
-			if got := h.sessionPayload(context.Background(), user)["vault"]; got != want {
+			if got := h.sessionPayload(context.Background(), user).Vault; got != want {
 				t.Fatalf("mode=%s broken=%v session=%+v want=%+v", mode, broken, got, want)
 			}
 			rec := httptest.NewRecorder()

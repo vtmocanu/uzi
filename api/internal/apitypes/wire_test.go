@@ -1100,7 +1100,7 @@ func TestTokenRateLimitDTOTags(t *testing.T) {
 
 func TestAdminRateLimitRowDTOTags(t *testing.T) {
 	assertTags(t, "AdminRateLimitRowDTO", AdminRateLimitRowDTO{},
-		"id", "email", "name", "vault_locked", "tokens")
+		"id", "email", "name", "vault_mode", "vault_locked", "tokens")
 }
 
 // TestCodexRateLimitWindowDTOTags pins the nested Codex window (PRD #1209). Every field
@@ -1150,7 +1150,7 @@ func TestCodexAccountRateLimitDTOTags(t *testing.T) {
 // TestCodexAdminRateLimitRowDTOTags pins the admin row, mirroring AdminRateLimitRowDTO.
 func TestCodexAdminRateLimitRowDTOTags(t *testing.T) {
 	assertTags(t, "CodexAdminRateLimitRowDTO", CodexAdminRateLimitRowDTO{},
-		"id", "email", "name", "vault_locked", "accounts")
+		"id", "email", "name", "vault_mode", "vault_locked", "accounts")
 }
 
 // TestUserSettingsDTOTags pins the CLI's decoding mirror of GET /api/me/settings

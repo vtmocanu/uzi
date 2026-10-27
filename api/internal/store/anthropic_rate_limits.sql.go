@@ -344,6 +344,7 @@ SELECT
     u.id            AS user_id,
     u.email         AS email,
     u.display_name  AS display_name,
+    u.vault_mode,
     s.id            AS user_secret_id,
     s.label         AS label,
     s.is_default    AS is_default,
@@ -367,6 +368,7 @@ type ListRateLimitsRow struct {
 	UserID           uuid.UUID          `json:"user_id"`
 	Email            string             `json:"email"`
 	DisplayName      pgtype.Text        `json:"display_name"`
+	VaultMode        string             `json:"vault_mode"`
 	UserSecretID     pgtype.UUID        `json:"user_secret_id"`
 	Label            pgtype.Text        `json:"label"`
 	IsDefault        pgtype.Bool        `json:"is_default"`
@@ -419,6 +421,7 @@ func (q *Queries) ListRateLimits(ctx context.Context) ([]ListRateLimitsRow, erro
 			&i.UserID,
 			&i.Email,
 			&i.DisplayName,
+			&i.VaultMode,
 			&i.UserSecretID,
 			&i.Label,
 			&i.IsDefault,

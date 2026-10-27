@@ -30,9 +30,10 @@ type updateSettingsRequest struct {
 // values from secrets is what makes a token leak structurally impossible — the
 // value map cannot hold a secret's bytes.
 type settingsResponse struct {
-	Settings map[string]string `json:"settings"`
-	Secrets  map[string]bool   `json:"secrets"`
-	Sources  map[string]string `json:"sources"`
+	UnprotectedUsers int64             `json:"unprotected_users"`
+	Settings         map[string]string `json:"settings"`
+	Secrets          map[string]bool   `json:"secrets"`
+	Sources          map[string]string `json:"sources"`
 	// Defaults carries the compiled-in default of every non-secret key (PRD #3245),
 	// so the web labels "Default · <built-in>" from the server rather than a copy.
 	// Secret keys are structurally absent: it is built from settings.Defaults only.
@@ -49,14 +50,14 @@ type settingsResponse struct {
 	OIDCProviderName string `json:"oidc_provider_name"`
 }
 
-func newSettingsResponse(v settings.AdminView, slackStatus string) settingsResponse {
+func newSettingsResponse(v settings.AdminView, slackStatus string, unprotectedUsers int64) settingsResponse {
 	defaults := make(map[string]string, len(settings.Defaults))
 	for k, d := range settings.Defaults {
 		if !settings.IsSecret(k) {
 			defaults[k] = d
 		}
 	}
-	return settingsResponse{Settings: v.Values, Secrets: v.Secrets, Sources: v.Sources, Defaults: defaults, SlackStatus: slackStatus}
+	return settingsResponse{UnprotectedUsers: unprotectedUsers, Settings: v.Values, Secrets: v.Secrets, Sources: v.Sources, Defaults: defaults, SlackStatus: slackStatus}
 }
 
 // GetSettings returns every known setting (admin only): non-secret effective
@@ -70,7 +71,13 @@ func (h *Handler) GetSettings(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	resp := newSettingsResponse(view, h.slackState())
+	n, err := h.q.CountUnprotectedUsers(r.Context())
+	if err != nil {
+		slog.Error("get settings: count unprotected users", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	resp := newSettingsResponse(view, h.slackState(), n)
 	resp.OIDCStatus = h.oidcStatus()
 	resp.OIDCProviderName = h.cfg.OIDCProviderName
 	httpx.JSON(w, http.StatusOK, resp)
@@ -91,12 +98,11 @@ func (h *Handler) oidcStatus() string {
 	}
 }
 
-// VaultMigration reports how many stored user secrets still use the legacy
-// master-key sealing (PRD #32): an admin-visible migration-progress signal so the
-// operator can see who has not unlocked since the vault rolled out. New saves are
-// born 'dek' and lazy rewrap flips old rows on unlock, so a healthy instance
-// trends to zero. Admin-only (mounted under the admin group). It never exposes any
-// secret value or per-user identity — only the count.
+// VaultMigration counts legacy 'master' secrets belonging to protected users.
+// This is an admin alert signal for protected material awaiting lazy rewrap on
+// unlock. Unprotected users and their master_aad saves are excluded; this is
+// neither a count of all master-key material nor a cleanup operation.
+// Only the count is exposed, never secret values or per-user identities.
 func (h *Handler) VaultMigration(w http.ResponseWriter, r *http.Request) {
 	n, err := h.q.CountMasterSealedSecrets(r.Context())
 	if err != nil {
@@ -318,5 +324,11 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, newSettingsResponse(view, h.slackState()))
+	n, err := h.q.CountUnprotectedUsers(ctx)
+	if err != nil {
+		slog.Error("update settings: count unprotected users", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, newSettingsResponse(view, h.slackState(), n))
 }

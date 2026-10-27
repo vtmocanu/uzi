@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/mail"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -16,6 +17,19 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+func sessionJSON(t *testing.T, payload sessionResponse) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
 
 // parseDomain mirrors what Register does before the allowlist check: lowercase,
 // parse to an addr-spec, then take emailDomain of addr.Address. Used to assert
@@ -40,7 +54,7 @@ func TestSessionPayloadCarriesUziLabel(t *testing.T) {
 		store.AppSetting{Key: settings.KeyUziLabel, Value: "runnable"},
 		store.AppSetting{Key: settings.KeyAutopilotLabel, Value: "hands-off"},
 	)
-	payload := h.sessionPayload(context.Background(), store.User{})
+	payload := sessionJSON(t, h.sessionPayload(context.Background(), store.User{}))
 
 	if uzi, ok := payload["uzi_label"].(string); !ok || uzi != "runnable" {
 		t.Errorf("uzi_label = %v (%T), want \"runnable\"", payload["uzi_label"], payload["uzi_label"])
@@ -73,7 +87,7 @@ func TestSessionPayloadJudgeConsentFields(t *testing.T) {
 		store.AppSetting{Key: settings.KeyJudgeEnforceAll, Value: "true"},
 		store.AppSetting{Key: settings.KeyJudgeModel, Value: "sonnet"},
 	)
-	payload := h.sessionPayload(context.Background(), store.User{})
+	payload := sessionJSON(t, h.sessionPayload(context.Background(), store.User{}))
 	if enforced, ok := payload["judge_enforced_by_admin"].(bool); !ok || !enforced {
 		t.Errorf("judge_enforced_by_admin = %v (%T), want true", payload["judge_enforced_by_admin"], payload["judge_enforced_by_admin"])
 	}
@@ -89,7 +103,7 @@ func TestSessionPayloadJudgeConsentFields(t *testing.T) {
 		store.AppSetting{Key: settings.KeyJudgeModel, Value: "sonnet"},
 	)
 	user := store.User{JudgeModel: pgtype.Text{String: "haiku", Valid: true}}
-	payload2 := h2.sessionPayload(context.Background(), user)
+	payload2 := sessionJSON(t, h2.sessionPayload(context.Background(), user))
 	if enforced, ok := payload2["judge_enforced_by_admin"].(bool); !ok || enforced {
 		t.Errorf("judge_enforced_by_admin = %v, want false when kill-switch off", payload2["judge_enforced_by_admin"])
 	}
@@ -100,7 +114,7 @@ func TestSessionPayloadJudgeConsentFields(t *testing.T) {
 	// No judge settings at all ⇒ not enforced, effective falls back to the compiled-in
 	// the built-in Claude judge model (opus) rather than an empty string.
 	h3 := newSettingsHandler()
-	payload3 := h3.sessionPayload(context.Background(), store.User{})
+	payload3 := sessionJSON(t, h3.sessionPayload(context.Background(), store.User{}))
 	if enforced, _ := payload3["judge_enforced_by_admin"].(bool); enforced {
 		t.Errorf("judge_enforced_by_admin = true, want false with no settings")
 	}
@@ -137,7 +151,7 @@ type sessionAppearance struct {
 	DefaultTheme  string  `json:"default_theme"`
 }
 
-func decodeSessionAppearance(t *testing.T, payload map[string]any) sessionAppearance {
+func decodeSessionAppearance(t *testing.T, payload sessionResponse) sessionAppearance {
 	t.Helper()
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -445,4 +459,46 @@ func TestAuthConfigShape(t *testing.T) {
 			t.Error("password_login_enabled should be false")
 		}
 	})
+}
+
+// The typed producer keeps the complete bootstrap metadata shape. The existing
+// appearance and judge tests exercise resolution; this guards keys, user
+// projection, nullable fields and password-presence metadata independently.
+func TestSessionPayloadTypedWireMetadata(t *testing.T) {
+	h := newSettingsHandler()
+	user := store.User{
+		Email:        "wire@example.com",
+		DisplayName:  pgtype.Text{String: "Wire User", Valid: true},
+		PasswordHash: pgtype.Text{String: "private-password-hash", Valid: true},
+	}
+	payload := h.sessionPayload(context.Background(), user)
+	if !reflect.DeepEqual(payload.User, toDTO(user)) || !payload.HasPassword {
+		t.Fatalf("user metadata=%+v has_password=%v", payload.User, payload.HasPassword)
+	}
+	got := sessionJSON(t, payload)
+	keys := []string{"user", "autopilot_label", "uzi_label", "appearance", "theme", "theme_override", "default_theme", "vault", "has_password", "judge_enforced_by_admin", "effective_judge_model"}
+	if len(got) != len(keys) {
+		t.Fatalf("session key count=%d want=%d", len(got), len(keys))
+	}
+	for _, key := range keys {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("missing session key %q", key)
+		}
+	}
+	if got["theme_override"] != nil || got["has_password"] != true {
+		t.Fatalf("nullable metadata=%v", got)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"private-password-hash", "password_hash", "wrapped_dek", "kek_salt", "ciphertext"} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatalf("session leaked %q", secret)
+		}
+	}
+	user.PasswordHash = pgtype.Text{}
+	if h.sessionPayload(context.Background(), user).HasPassword {
+		t.Fatal("passwordless session claims password")
+	}
 }

@@ -1,0 +1,56 @@
+{
+  "user": {
+    "id": "",
+    "email": "",
+    "display_name": null,
+    "is_admin": false,
+    "is_active": false,
+    "autopilot_enabled": false,
+    "plan_cross_check_enabled": false,
+    "code_cross_check_enabled": false,
+    "wait_on_limit": false,
+    "notify_early_limit_reset": false,
+    "judge_enabled": false,
+    "ci_autofix_enabled": null,
+    "attribution_enabled": false,
+    "ephemeral_workers_enabled": false,
+    "ephemeral_docker_enabled": false,
+    "judge_anthropic_secret_id": null,
+    "judge_anthropic_secret_label": null,
+    "judge_anthropic_bind_mode": "",
+    "created_at": "0001-01-01T00:00:00Z",
+    "last_login": null
+  },
+  "autopilot_label": "",
+  "uzi_label": "",
+  "appearance": {
+    "mode": "",
+    "light_theme": "",
+    "dark_theme": "",
+    "typeface": "",
+    "overrides": {
+      "mode": null,
+      "light_theme": null,
+      "dark_theme": null,
+      "typeface": null
+    },
+    "defaults": {
+      "mode": "",
+      "light_theme": "",
+      "dark_theme": "",
+      "typeface": ""
+    }
+  },
+  "theme": "",
+  "theme_override": null,
+  "default_theme": "",
+  "vault": {
+    "mode": "",
+    "policy": "",
+    "unlocked": false,
+    "exists": false
+  },
+  "has_password": false,
+  "judge_enforced_by_admin": false,
+  "effective_judge_model": ""
+}

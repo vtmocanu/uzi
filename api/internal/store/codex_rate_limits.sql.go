@@ -237,6 +237,7 @@ SELECT
     u.id                         AS user_id,
     u.email                      AS email,
     u.display_name               AS display_name,
+    u.vault_mode,
     a.id                         AS provider_account_id,
     COALESCE(al.labels, '{}')::text[] AS aliases,
     COALESCE(al.is_default, false)    AS is_default,
@@ -294,6 +295,7 @@ type ListCodexAccountRateLimitsRow struct {
 	UserID                     uuid.UUID          `json:"user_id"`
 	Email                      string             `json:"email"`
 	DisplayName                pgtype.Text        `json:"display_name"`
+	VaultMode                  string             `json:"vault_mode"`
 	ProviderAccountID          uuid.UUID          `json:"provider_account_id"`
 	Aliases                    []string           `json:"aliases"`
 	IsDefault                  bool               `json:"is_default"`
@@ -331,6 +333,7 @@ func (q *Queries) ListCodexAccountRateLimits(ctx context.Context) ([]ListCodexAc
 			&i.UserID,
 			&i.Email,
 			&i.DisplayName,
+			&i.VaultMode,
 			&i.ProviderAccountID,
 			&i.Aliases,
 			&i.IsDefault,

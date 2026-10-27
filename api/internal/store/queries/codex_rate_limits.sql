@@ -267,6 +267,7 @@ SELECT
     u.id                         AS user_id,
     u.email                      AS email,
     u.display_name               AS display_name,
+    u.vault_mode,
     a.id                         AS provider_account_id,
     COALESCE(al.labels, '{}')::text[] AS aliases,
     COALESCE(al.is_default, false)    AS is_default,

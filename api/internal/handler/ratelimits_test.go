@@ -83,17 +83,18 @@ func scanListRateLimit(r store.ListRateLimitsRow) func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = r.UserID
 		*dest[1].(*string) = r.Email
 		*dest[2].(*pgtype.Text) = r.DisplayName
-		*dest[3].(*pgtype.UUID) = r.UserSecretID
-		*dest[4].(*pgtype.Text) = r.Label
-		*dest[5].(*pgtype.Bool) = r.IsDefault
-		*dest[6].(*pgtype.Bool) = r.AutoEligible // PRD #111 M2; shifts the rest by one
-		*dest[7].(*bool) = r.Rejected            // issue #1988: rejected follows auto_eligible
-		*dest[8].(*pgtype.Int2) = r.FiveHourPct
-		*dest[9].(*pgtype.Timestamptz) = r.FiveHourResetsAt
-		*dest[10].(*pgtype.Int2) = r.SevenDayPct
-		*dest[11].(*pgtype.Timestamptz) = r.SevenDayResetsAt
-		*dest[12].(*pgtype.Text) = r.Source
-		*dest[13].(*pgtype.Timestamptz) = r.SyncedAt
+		*dest[3].(*string) = r.VaultMode
+		*dest[4].(*pgtype.UUID) = r.UserSecretID
+		*dest[5].(*pgtype.Text) = r.Label
+		*dest[6].(*pgtype.Bool) = r.IsDefault
+		*dest[7].(*pgtype.Bool) = r.AutoEligible // PRD #111 M2; shifts the rest by one
+		*dest[8].(*bool) = r.Rejected            // issue #1988: rejected follows auto_eligible
+		*dest[9].(*pgtype.Int2) = r.FiveHourPct
+		*dest[10].(*pgtype.Timestamptz) = r.FiveHourResetsAt
+		*dest[11].(*pgtype.Int2) = r.SevenDayPct
+		*dest[12].(*pgtype.Timestamptz) = r.SevenDayResetsAt
+		*dest[13].(*pgtype.Text) = r.Source
+		*dest[14].(*pgtype.Timestamptz) = r.SyncedAt
 		return nil
 	}
 }
@@ -423,7 +424,7 @@ func TestAdminRateLimitsModeAwareGate(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			id := uuid.New()
-			h := rlHandler(&fakeRLDB{listRows: []store.ListRateLimitsRow{{UserID: id, Email: "mode@example.com"}}}, time.Minute)
+			h := rlHandler(&fakeRLDB{listRows: []store.ListRateLimitsRow{{UserID: id, Email: "mode@example.com", VaultMode: tc.mode}}}, time.Minute)
 			if !tc.missing {
 				m := newMemVaultQ()
 				m.states[id] = store.LockVaultAuthStateRow{VaultMode: tc.mode}
@@ -450,11 +451,15 @@ func TestAdminRateLimitsModeAwareGate(t *testing.T) {
 			h.AdminRateLimits(rec, rlReq(uuid.New(), true))
 			var body struct {
 				Users []struct {
-					VaultLocked bool `json:"vault_locked"`
+					VaultLocked bool   `json:"vault_locked"`
+					VaultMode   string `json:"vault_mode"`
 				} `json:"users"`
 			}
 			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || rec.Code != http.StatusOK || len(body.Users) != 1 {
 				t.Fatalf("status=%d err=%v body=%s", rec.Code, err, rec.Body.String())
+			}
+			if body.Users[0].VaultMode != tc.mode {
+				t.Fatalf("vault_mode=%q want=%q", body.Users[0].VaultMode, tc.mode)
 			}
 			if body.Users[0].VaultLocked != tc.wantLocked {
 				t.Fatalf("vault_locked=%v want=%v", body.Users[0].VaultLocked, tc.wantLocked)

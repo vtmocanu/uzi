@@ -113,6 +113,7 @@ func (h *Handler) AdminCodexRateLimits(w http.ResponseWriter, r *http.Request) {
 				ID:          row.UserID.String(),
 				Email:       row.Email,
 				Name:        row.DisplayName.String, // "" when the user has no display name
+				VaultMode:   row.VaultMode,
 				VaultLocked: h.vault.RequiresUnlock(r.Context(), row.UserID),
 				Accounts:    []apitypes.CodexAccountRateLimitDTO{},
 			})

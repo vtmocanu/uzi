@@ -63,7 +63,7 @@ func assertVaultRouteSnapshot(t *testing.T, router http.Handler, h *Handler, use
 		t.Fatalf("status=%d snapshot=%+v want=%+v err=%v", rec.Code, status, want, err)
 	}
 	rec = vaultRouteRequest(t, router, h, user, http.MethodGet, "/api/auth/me", "", true, false)
-	var session struct{ Vault vault.Status }
+	var session sessionResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &session); err != nil || rec.Code != http.StatusOK || session.Vault != want {
 		t.Fatalf("auth/me=%d snapshot=%+v want=%+v err=%v", rec.Code, session.Vault, want, err)
 	}

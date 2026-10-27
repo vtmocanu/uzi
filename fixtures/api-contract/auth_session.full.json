@@ -1,0 +1,56 @@
+{
+  "user": {
+    "id": "x",
+    "email": "x",
+    "display_name": "x",
+    "is_admin": true,
+    "is_active": true,
+    "autopilot_enabled": true,
+    "plan_cross_check_enabled": true,
+    "code_cross_check_enabled": true,
+    "wait_on_limit": true,
+    "notify_early_limit_reset": true,
+    "judge_enabled": true,
+    "ci_autofix_enabled": true,
+    "attribution_enabled": true,
+    "ephemeral_workers_enabled": true,
+    "ephemeral_docker_enabled": true,
+    "judge_anthropic_secret_id": "x",
+    "judge_anthropic_secret_label": "x",
+    "judge_anthropic_bind_mode": "x",
+    "created_at": "2020-01-02T03:04:05Z",
+    "last_login": "2020-01-02T03:04:05Z"
+  },
+  "autopilot_label": "x",
+  "uzi_label": "x",
+  "appearance": {
+    "mode": "x",
+    "light_theme": "x",
+    "dark_theme": "x",
+    "typeface": "x",
+    "overrides": {
+      "mode": "x",
+      "light_theme": "x",
+      "dark_theme": "x",
+      "typeface": "x"
+    },
+    "defaults": {
+      "mode": "x",
+      "light_theme": "x",
+      "dark_theme": "x",
+      "typeface": "x"
+    }
+  },
+  "theme": "x",
+  "theme_override": "x",
+  "default_theme": "x",
+  "vault": {
+    "mode": "x",
+    "policy": "x",
+    "unlocked": true,
+    "exists": true
+  },
+  "has_password": true,
+  "judge_enforced_by_admin": true,
+  "effective_judge_model": "x"
+}

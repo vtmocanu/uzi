@@ -153,6 +153,7 @@ func contractCases() []contractCase {
 		// non-omitempty, so its zero.json carries the nil-slice nulls the M3 mapper
 		// normalizes to []; last_success_at/stale are omitempty and drop on the zero value.
 		newContractCase[CodexAccountRateLimitDTO]("codex_account_rate_limit"),
+		newContractCase[AdminRateLimitRowDTO]("anthropic_admin_rate_limit_row"),
 		newContractCase[CodexAdminRateLimitRowDTO]("codex_admin_rate_limit_row"),
 		// PRD #1484 M1: the admin-health document. Its Checks slice is non-omitempty (its
 		// zero.json carries a null the registry normalizes to []); snoozed_until and
