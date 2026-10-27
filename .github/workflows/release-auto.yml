@@ -146,7 +146,7 @@ jobs:
       name: ${{ inputs.kind == 'stable' && 'release-stable' || 'release-rc' }}
     outputs:
       outcome: ${{ steps.push.outputs.outcome }}
-      attempted: ${{ steps.push.outputs.attempted }}
+      attempted: ${{ steps.push.outputs.attempted || steps.bundle.outputs.attempted }}
       reason: ${{ steps.bundle.outputs.reason || steps.push.outputs.reason }}
     env:
       RELEASE_KIND: ${{ github.event_name == 'schedule' && 'rc' || inputs.kind }}
@@ -281,6 +281,24 @@ jobs:
             status=''; path=''
           done < "$changes"
           [ -z "$status$path" ]
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            echo 'attempted=false' >> "$GITHUB_OUTPUT"
+            reason='invalid-nightly-window'
+            [[ "$RUN_CREATED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+            requested="$(date -u -d "$RUN_CREATED_AT" +%s)"
+            attempt_date="$(TZ=Europe/Bucharest date -d "$RUN_CREATED_AT" +%F)"
+            cutoff="$(TZ=Europe/Bucharest date -d "$attempt_date 06:00:00" +%s)"
+            offset="$(TZ=Europe/Bucharest date -d "$attempt_date 06:00:00" +%z)"
+            now="$(date -u +%s)"
+            [[ "$now" =~ ^[0-9]+$ ]]
+            [[ "$cutoff" =~ ^[0-9]+$ ]]
+            [[ "$offset" = +0200 || "$offset" = +0300 ]]
+            [ "$requested" -le "$((now+60))" ]
+            if ! [ "$now" -lt "$cutoff" ]; then
+              reason='missed-target'
+              fail
+            fi
+          fi
 
       - name: Mint repository-scoped installation token
         id: app
@@ -357,9 +375,13 @@ jobs:
             requested="$(date -u -d "$RUN_CREATED_AT" +%s)"
             attempt_date="$(TZ=Europe/Bucharest date -d "$RUN_CREATED_AT" +%F)"
             cutoff="$(TZ=Europe/Bucharest date -d "$attempt_date 06:00:00" +%s)"
+            offset="$(TZ=Europe/Bucharest date -d "$attempt_date 06:00:00" +%z)"
             now="$(date -u +%s)"
-            [ "$requested" -le "$now" ]
-            if [ "$now" -ge "$cutoff" ]; then
+            [[ "$now" =~ ^[0-9]+$ ]]
+            [[ "$cutoff" =~ ^[0-9]+$ ]]
+            [[ "$offset" = +0200 || "$offset" = +0300 ]]
+            [ "$requested" -le "$((now+60))" ]
+            if ! [ "$now" -lt "$cutoff" ]; then
               reason='missed-target'
               fail
             fi

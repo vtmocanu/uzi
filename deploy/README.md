@@ -139,7 +139,8 @@ instead, after inspecting remote refs when a push receipt is uncertain. Never
 rerun prepare or push in the same run. Watch and report may rerun against the
 exact existing tag/SHA. The inspection bundle is retained for one day; watch
 and report recovery use the existing tag and stored outputs, not a new bundle
-or a second push. The local watch/verify scripts remain available for
+or a second push. Each watch rerun starts its own bounded recovery operation;
+retry budgets cannot replenish within one operation. The local watch/verify scripts remain available for
 manual same-tag recovery. Only a confirmed publication and `release-verify.sh` success mean
 done; deployment health is a separate check. Problems use one `Release automation
 failures` tracking issue; expected no-ops remain in the summary.
@@ -156,9 +157,11 @@ Inspect remote refs, then use local watch/verify against the same tag/SHA.
 
 Nightly attempts start at 04:47 Europe/Bucharest using GitHub's native timezone
 schedule, after the local maintenance window, aiming to cut near 05:00. They are
-off until the maintainer sets `RELEASE_NIGHTLY_ENABLED=true`. Unset it or set it
-to `false` to pause future nightly attempts; manual dispatch still works. Cancel
-any existing attempt separately if necessary. Disabling the whole workflow
+off until the user decides to activate and the maintainer sets
+`RELEASE_NIGHTLY_ENABLED=true`. Unset it or set it to `false` to pause nightly
+attempts; manual dispatch still works. Enablement is rechecked at job boundaries,
+so a not-yet-pushed attempt may stop there, possibly red with `nightly-disabled`.
+Cancel an in-flight run explicitly for an immediate stop. Disabling the whole workflow
 also disables manual dispatch. Scheduled authorization pins repository, main ref
 and event/run metadata, without treating the scheduler as an allowlisted human.
 
@@ -171,8 +174,11 @@ the cutter's existing empty-delta behavior.
 
 The provisional push cutoff is strictly before 06:00 on the original run's
 Bucharest calendar date. A queued run does not gain a fresh window tomorrow.
-Tip waiting ends by 05:50, reserving ten minutes for cutting; push independently
-checks the cutoff immediately before the atomic update. A missed window stops
+Tip waiting ends by 05:50, reserving a provisional 600 seconds from the existing
+cutter timeout, not a measured cut duration. The key job checks the window before
+minting and independently again immediately before the atomic update, validating
+numeric epochs and the Bucharest offset. Creation timestamps tolerate 60 seconds
+of clock skew; the 06:00 push cutoff has no grace period. A missed window stops
 with `missed-target` and no push; a tip not green in its budget is reported
 separately. Main races never cause automatic rebasing or an older-tip fallback.
 Expected no-ops stay in the summary; misses and failures update the tracking

@@ -964,7 +964,17 @@ class Nightly(unittest.TestCase):
         self.assertEqual(fixture.calls, [])
         api.run.assert_not_called()
         status, data, _, _ = self.cli(self.env(), now='2026-10-27T02:40:00Z')
-        self.assertEqual((status, data['reason']), (1, 'invalid-run-age'))
+        self.assertEqual((status, data.get('reason')), (1, 'invalid-run-age'))
+
+    def test_scheduled_creation_clock_skew_is_bounded(self):
+        for seconds in (0, 59, 60):
+            now = dt.datetime.fromtimestamp(self.epoch(self.created) - seconds, dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            with self.subTest(skew=seconds):
+                status, data, _, _ = self.cli(self.env(), now=now)
+                self.assertEqual((status, data['outcome']), (0, 'authorized'))
+        now = dt.datetime.fromtimestamp(self.epoch(self.created) - 61, dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        status, data, _, _ = self.cli(self.env(), now=now)
+        self.assertEqual((status, data.get('reason')), (1, 'invalid-run-age'))
 
     def test_scheduled_prepare_rerun_still_requires_redispatch(self):
         status, data, _, constructor = self.cli(self.env(GITHUB_RUN_ATTEMPT='2'), 'prepare')

@@ -92,7 +92,7 @@ def nightly_window(stamp):
 
 def nightly_cutoff(stamp, now, reserve=0):
     cutoff, _ = nightly_window(stamp)
-    require(dt.datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() <= now, 'invalid-run-age')
+    require(dt.datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() <= now + 60, 'invalid-run-age')
     if now >= cutoff - reserve:
         raise Stop('missed-target', 'defer')
     return cutoff

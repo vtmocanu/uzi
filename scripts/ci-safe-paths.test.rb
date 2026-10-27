@@ -355,6 +355,30 @@ assert.call(mint.fetch('with'), {'client-id' => '${{ vars.RELEASE_APP_ID }}', 'p
                                'owner' => 'vtmocanu', 'repositories' => 'uzi', 'permission-contents' => 'write'}, 'installation token scope')
 bundle_step = auto_push.fetch('steps').find { |step| step['id'] == 'bundle' }
 publish_step = auto_push.fetch('steps').find { |step| step['id'] == 'push' }
+assert.call(auto_push.fetch('outputs').fetch('attempted'), '${{ steps.push.outputs.attempted || steps.bundle.outputs.attempted }}',
+            'actual push status overrides the pre-mint no-push fallback')
+windows = [bundle_step, publish_step].map do |step|
+  block = step.fetch('run').match(/^if \[ "\$GITHUB_EVENT_NAME" = schedule \]; then\n.*?^fi\n/m)
+  assert.call(block.nil?, false, 'nightly window is checked before minting and before pushing')
+  block[0]
+end
+assert.call(windows[0], windows[1], 'pre-mint and pre-push inline window policies stay identical')
+# Isolate the actual comparison as a second defense, even if its numeric input
+# guards were later removed. An operand error must select refusal, never push.
+comparison = windows.last.match(/^  if (?:! )?\[ "\$now" -(?:lt|ge) "\$cutoff" \]; then\n.*?^  fi\n/m)
+assert.call(comparison.nil?, false, 'actual nightly cutoff comparison is present')
+[['5', ''], ['bad-now', '6'], ['5', 'bad-cutoff']].each do |now, cutoff|
+  Dir.mktmpdir('nightly-compare') do |dir|
+    output = File.join(dir, 'output')
+    File.write(output, '')
+    prefix = publish_step.fetch('run').split("trap fail ERR\n", 2).first + "trap fail ERR\n"
+    body = "now=$PROBE_NOW\ncutoff=$PROBE_CUTOFF\n" + comparison[0]
+    _, _, status = Open3.capture3({'GITHUB_OUTPUT' => output, 'PROBE_NOW' => now, 'PROBE_CUTOFF' => cutoff},
+                                 'bash', '-e', '-c', prefix + body, chdir: dir)
+    assert.call(status.exitstatus, 1, 'malformed cutoff comparison refuses')
+    assert.call(File.readlines(output).map(&:strip), ['reason=missed-target'], 'comparison errors have one refusal reason')
+  end
+end
 # Execute the classifier from the actual step, including its defensive mixed
 # receipt branch. A reported ref update must never be called "nothing changed".
 receipt_parts = publish_step.fetch('run').split("if awk -F '\\t' ", 2)
@@ -461,9 +485,21 @@ Dir.mktmpdir('release-auto-contract') do |dir|
     require 'time'
     if ARGV.include?('-d')
       text = ARGV[ARGV.index('-d') + 1]
+      if ARGV.include?('+%s') && !text.include?('T') && ENV['TEST_BAD_CUTOFF']
+        puts(ENV['TEST_BAD_CUTOFF'] == 'empty' ? '' : 'bad-cutoff')
+        exit
+      end
       stamp = text.include?('T') ? Time.iso8601(text) : Time.strptime(text, '%Y-%m-%d %H:%M:%S')
-      puts(ARGV.include?('+%F') ? stamp.getlocal.strftime('%F') : stamp.to_i)
+      if ARGV.include?('+%z')
+        puts ENV.fetch('TEST_OFFSET', stamp.getlocal.strftime('%z'))
+      else
+        puts(ARGV.include?('+%F') ? stamp.getlocal.strftime('%F') : stamp.to_i)
+      end
     else
+      if ARGV.include?('+%s') && ENV['TEST_BAD_NOW']
+        puts(ENV['TEST_BAD_NOW'] == 'empty' ? '' : 'bad-now')
+        exit
+      end
       now = Time.at(Integer(ENV.fetch('TEST_NOW')))
       puts(ARGV.include?('+%F') ? now.getlocal.strftime('%F') : now.to_i)
     end
@@ -488,9 +524,12 @@ Dir.mktmpdir('release-auto-contract') do |dir|
       guard_out, err, status = Open3.capture3(invocation, 'bash', '-e', '-c', bundle_step.fetch('run'), chdir: work)
       assert.call(status.success?, expected, "actual pre-key guard #{changes.keys}: #{err[-300..]}")
       if expected_reason
-        assert.call(File.read(invocation.fetch('TEST_GIT_FAILURE_MARKER')).strip, changes.fetch('TEST_GIT_FAIL'), 'exact Git failure was injected')
+        if changes.key?('TEST_GIT_FAIL')
+          assert.call(File.read(invocation.fetch('TEST_GIT_FAILURE_MARKER')).strip, changes.fetch('TEST_GIT_FAIL'), 'exact Git failure was injected')
+        end
         outputs = File.exist?(invocation.fetch('GITHUB_OUTPUT')) ? File.readlines(invocation.fetch('GITHUB_OUTPUT')).map(&:strip) : []
-        assert.call(outputs, ['reason=' + expected_reason], "#{changes.fetch('TEST_GIT_FAIL')}: one phase-correct reason before mint/push")
+        assert.call(outputs.select { |line| line.start_with?('reason=') }, ['reason=' + expected_reason], 'one phase-correct reason before mint/push')
+        assert.call(outputs.include?('attempted=true'), false, 'pre-mint refusal cannot have attempted a push')
       end
       if changes['GITHUB_RUN_ATTEMPT'] == '2'
         assert.call(status.success?, false, 'rerun never reaches the default-success token step')
@@ -530,6 +569,14 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   end
   # Validate a normal bundle first, then execute the actual final publisher as a
   # scheduled route delayed by its runner queue. Its clock guard is independent.
+  [['empty-cutoff', {'TEST_BAD_CUTOFF' => 'empty'}], ['garbage-cutoff', {'TEST_BAD_CUTOFF' => 'garbage'}],
+   ['empty-now', {'TEST_BAD_NOW' => 'empty'}], ['garbage-now', {'TEST_BAD_NOW' => 'garbage'}],
+   ['wrong-offset', {'TEST_OFFSET' => '+0000'}]].each do |label, faults|
+    faulty_remote = File.join(dir, 'faulty-date-' + label + '.git')
+    git.call('clone', '--bare', remote, faulty_remote)
+    exercise.call({'TEST_REMOTE' => faulty_remote, 'RUN_CREATED_AT' => '2026-10-27T02:47:00Z'}, true, false, bundle,
+                  {'GITHUB_EVENT_NAME' => 'schedule', 'TEST_NOW' => Time.utc(2026, 10, 27, 3).to_i.to_s}.merge(faults), 'invalid-nightly-window')
+  end
   [['winter-at', '2026-10-27T02:47:00Z', '2026-10-27T04:00:00Z', false],
    ['winter-before', '2026-10-27T02:47:00Z', '2026-10-27T03:59:59Z', true],
    ['winter-after', '2026-10-27T02:47:00Z', '2026-10-27T04:01:00Z', false],
@@ -545,12 +592,24 @@ Dir.mktmpdir('release-auto-contract') do |dir|
     exercise.call({'TEST_REMOTE' => scheduled_remote, 'RUN_CREATED_AT' => created}, true, allowed, bundle,
                   {'GITHUB_EVENT_NAME' => 'schedule', 'TEST_NOW' => Time.iso8601(now).to_i.to_s}, allowed ? nil : reason || 'missed-target')
   end
-  ['', 'false', 'TRUE', '1'].each do |disabled|
-    exercise.call({'GITHUB_EVENT_NAME' => 'schedule', 'RELEASE_NIGHTLY_ENABLED' => disabled}, false)
+  schedule_env = {'GITHUB_EVENT_NAME' => 'schedule', 'RELEASE_NIGHTLY_ENABLED' => 'true',
+                  'RUN_CREATED_AT' => '2026-10-27T02:47:00Z', 'TEST_NOW' => Time.utc(2026, 10, 27, 3).to_i.to_s}
+  exercise.call(schedule_env.merge('TEST_NOW' => Time.utc(2026, 10, 27, 4).to_i.to_s), false, nil, bundle, {}, nil, 'missed-target')
+  [{'TEST_BAD_CUTOFF' => 'empty'}, {'TEST_BAD_CUTOFF' => 'garbage'}, {'TEST_BAD_NOW' => 'empty'},
+   {'TEST_BAD_NOW' => 'garbage'}, {'TEST_OFFSET' => '+0000'}].each do |faults|
+    exercise.call(schedule_env.merge(faults), false, nil, bundle, {}, nil, 'invalid-nightly-window')
   end
-  exercise.call({'GITHUB_EVENT_NAME' => 'schedule', 'RELEASE_NIGHTLY_ENABLED' => 'true', 'RELEASE_ACTOR' => 'scheduler', 'RELEASE_DISPATCHERS' => ''}, true)
-  exercise.call({'GITHUB_EVENT_NAME' => 'schedule', 'RELEASE_NIGHTLY_ENABLED' => 'true', 'RELEASE_VERSION' => '0.2.0'}, false)
-  exercise.call({'GITHUB_EVENT_NAME' => 'schedule', 'RELEASE_NIGHTLY_ENABLED' => 'true', 'RELEASE_KIND' => 'stable', 'RELEASE_RC_TAG' => 'v0.2.0-rc.10', 'RELEASE_RC_SHA' => parent}, false)
+  [59, 60].each do |skew|
+    exercise.call(schedule_env.merge('TEST_NOW' => (Time.iso8601(schedule_env.fetch('RUN_CREATED_AT')).to_i - skew).to_s), true)
+  end
+  exercise.call(schedule_env.merge('TEST_NOW' => (Time.iso8601(schedule_env.fetch('RUN_CREATED_AT')).to_i - 61).to_s),
+                false, nil, bundle, {}, nil, 'invalid-nightly-window')
+  ['', 'false', 'TRUE', '1'].each do |disabled|
+    exercise.call(schedule_env.merge('RELEASE_NIGHTLY_ENABLED' => disabled), false)
+  end
+  exercise.call(schedule_env.merge('RELEASE_ACTOR' => 'scheduler', 'RELEASE_DISPATCHERS' => ''), true)
+  exercise.call(schedule_env.merge('RELEASE_VERSION' => '0.2.0'), false)
+  exercise.call(schedule_env.merge('RELEASE_KIND' => 'stable', 'RELEASE_RC_TAG' => 'v0.2.0-rc.10', 'RELEASE_RC_SHA' => parent), false)
   exercise.call({'RELEASE_ACTOR' => 'outside'}, false)
   exercise.call({'GITHUB_RUN_ATTEMPT' => '2'}, false)
   exercise.call({'RELEASE_REF' => 'refs/heads/feature'}, false)

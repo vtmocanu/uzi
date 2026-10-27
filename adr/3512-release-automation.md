@@ -12,13 +12,17 @@ installation or shared build cache. Installation tokens request only
 
 The RC App may bypass main review and create RC tags. The stable App may create
 stable tags only, after the `release-stable` Environment reviewer approves.
-Both Environments admit only main. A dispatcher allowlist and input checks run
-before preparation and again before minting. Prepare and push reject run attempts
-above one; watch recovery rechecks the dispatcher and exact tag. Stable age is
+Both Environments admit only main. Manual dispatch repeats its dispatcher
+allowlist before preparation and minting; schedule uses event, repository, ref
+and enablement checks. Input checks apply to both routes. Prepare and push reject
+run attempts above one. Watch recovery rechecks the exact tag for both routes
+and the dispatcher for manual runs. Stable age is
 measured from the original run's `created_at`, with a 24-hour bound checked after
 approval and immediately before the only push attempt. The bundle is retained
 for one day for inspection; watch/report recovery reads the existing tag and
-stored outputs without preparing or pushing again. Agents never dispatch stable or approve
+stored outputs without preparing or pushing again. Each watch rerun starts its
+own bounded recovery operation; retry budgets never replenish within an operation.
+Agents never dispatch stable or approve
 the stable Environment. GitHub cannot distinguish a human from an agent using
 the same credential; this behavioral boundary remains explicit.
 
@@ -39,7 +43,7 @@ The full content classifier still runs during preparation.
 
 ```mermaid
 flowchart LR
-  A[Authorize dispatch] --> B[Prepare without App key]
+  A[Authorize release route] --> B[Prepare without App key]
   B --> C[Environment and isolated atomic push]
   C --> D[Watch and verify exact tag]
   A --> E[Always report]
@@ -110,8 +114,11 @@ health. Runner-slot and critical-path impact remain unmeasured until live use.
 GitHub's native `timezone: Europe/Bucharest`, targeting a cut near 05:00 after
 the local maintenance window ([schedule syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onschedule)).
 Only exact `RELEASE_NIGHTLY_ENABLED=true` enables nightly attempts; unset/false
-is a reported no-op. Activation belongs to the maintainer. Pausing does not
-disable manual dispatch or interrupt an existing run. Schedule authorization
+is a reported no-op. Activation requires the user's decision. Enablement is
+rechecked at job boundaries; pausing may stop a not-yet-pushed attempt there,
+possibly red with `nightly-disabled`. To stop an in-flight run immediately,
+cancel it explicitly. Recovery of a pushed tag and manual dispatch are unaffected.
+Schedule authorization
 pins repository, main ref, event and original run metadata, with canonical RC
 inputs only. Manual dispatch keeps the actor allowlist and input checks.
 Stable remains manual.
@@ -121,10 +128,15 @@ shipping change plus releasable notes. A no-op stops before CI waiting, cutting
 or artifact upload. Blocked plans are not converted into no-ops; manual empty
 respins retain the cutter's rules. The provisional cutoff is strictly before
 06:00 on the original run creation's Bucharest date. Tip waiting ends by 05:50,
-reserving the existing ten-minute cut budget without resetting on tip changes.
-The isolated push job independently requires the enable flag before minting
-and recomputes the cutoff inline immediately before pushing;
-an expired window records `missed-target` and no attempted push. A queued run
+reserving a provisional fixed 600 seconds without resetting on tip changes.
+This is the existing cutter timeout, not a measured cut duration; it is an
+approved rollout deviation from D6 until timing evidence supports adjustment.
+The isolated push job independently requires the enable flag and checks the
+window before minting, then recomputes the window immediately before pushing.
+Both inline checks require numeric epochs, a +0200/+0300 Bucharest offset and
+a fail-closed comparison. Original creation time permits at most 60 seconds of
+runner clock skew; the 06:00 cutoff itself has no grace period.
+An expired window records `missed-target` and no attempted push. A queued run
 cannot acquire a new window on the following date. Manual budgets are unchanged.
 After tagging, bounded recovery ignores the cutoff and pause flag. Verification
 recorded after 07:00 is marked late without changing verified success or opening
