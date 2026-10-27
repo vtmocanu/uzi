@@ -6,7 +6,7 @@ import { terminalSealMaterial, terminalSealStillAccepted } from "./codex/executo
 import { type CompletionSource, validCompletionSource } from "./recovery.js";
 
 // Version 2 completion sources and the source fence (issue #3404 M2 U1). Pure primitives:
-// DORMANT, no production caller. A V2 source extends the V1 attempt provenance with the
+// Used by publication (runner/recovery) and restart retirement. A V2 source extends the V1 attempt provenance with the
 // storage identity, the harness and the worker/executor incarnations that produced it, bound
 // to one source-use epoch. `sourceCoreDigest` covers everything except the certificate, and the
 // certificate is an HMAC over that digest minted only by the authority store (the key never

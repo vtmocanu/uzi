@@ -11,8 +11,7 @@ import {
 } from "./completion-source.js";
 
 // Completion-authority enrollment and durable source-use slots (issue #3404 M1a).
-// DORMANT: nothing in production calls the slot API yet; it changes no release
-// eligibility. Every operation needs an active authority transaction (A) from
+// Production reaches it through authority-runtime.ts (main.ts builds the runtime). Every operation needs an active authority transaction (A) from
 // authority-lock.ts, so a stale or foreign caller cannot write.
 //
 // Harness and the sticky codex marker: the harness is bound when a lease is minted (an executor

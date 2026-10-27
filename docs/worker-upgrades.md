@@ -36,6 +36,17 @@ fall back only at exactly the claim revision (default 1). A different
 revision without scope holds closed. Upgrade both components for current
 scope rendering; see [Completion holds](run-completion-hold.md).
 
+## Completion-source authority (#3404)
+
+Cut over with the old workers quiesced. A worker publishing a completed source
+writes a fence into the bare repository's recovery journal, and an older worker
+refuses to attach, recover or discard a journal that carries it. Rolling a worker
+back therefore leaves those sources unreachable until a current worker runs
+again. Two workers cannot share one data directory (the newer one refuses to
+start), and changing the worker join token on a reused data volume leaves
+existing authority records unauthenticated, so their sources are retained. See
+[Completed sources after a worker restart](run-recovery.md#completed-sources-after-a-worker-restart).
+
 ## Refresh publication context (#3120)
 
 Roll the API and workers together for `refresh_publication_context_v1`.

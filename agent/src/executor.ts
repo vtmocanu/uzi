@@ -944,8 +944,8 @@ export interface Executor {
    * observer and cleanup tail has settled with unchanged successful disposal facts, return an opaque
    * seal bound to `sourceUse` (an opaque caller-owned identity, e.g. the source-use lease). Failure
    * is `{ kind: "unproven" }`, permanently closed, and never changes a completed run. Only the Codex
-   * executor implements it; absent means the executor has no closed lifetime to prove. Dormant until
-   * the runner consumes it: call it only after every executor-dependent terminal sink, never under a
+   * executor implements it; absent means the executor has no closed lifetime to prove. The runner
+   * calls it at publication (RunRunner.publishFlightSource): only after every executor-dependent terminal sink, never under a
    * safety, journal or bare lock.
    */
   sealLifetime?(sourceUse: object): Promise<ExecutorSealResult>;
