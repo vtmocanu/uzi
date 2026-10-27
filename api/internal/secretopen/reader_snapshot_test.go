@@ -97,7 +97,9 @@ func TestByIDSnapshotRejectsChangedAuthority(t *testing.T) {
 			fresh := row
 			fresh.VaultEpoch = 8
 			tc.change(&fresh)
-			q := &snapshotStore{fakeStore: &fakeStore{}, rows: []store.GetUserSecretCiphertextByIDRow{row, fresh}, epochs: []int64{8}}
+			// Supply the forbidden second open too: a missing guard must fail the
+			// authority assertion below, rather than panic in the test double.
+			q := &snapshotStore{fakeStore: &fakeStore{}, rows: []store.GetUserSecretCiphertextByIDRow{row, fresh}, epochs: []int64{8, 8}}
 			got, err := OpenByID(context.Background(), q, readerTestVault(box, q), box, row.UserID, row.ID)
 			if err != store.ErrVaultSealStale || got != nil || q.reads != 1 || len(q.args) != 2 {
 				t.Fatalf("replacement accepted: err=%v plaintext-present=%v reads=%d lookups=%d", err, got != nil, q.reads, len(q.args))
@@ -119,7 +121,9 @@ func TestByIDSnapshotSecondTransitionStops(t *testing.T) {
 
 func TestByIDSnapshotRevisionBeforeFirstOpen(t *testing.T) {
 	box, row := snapshotFixture(t)
-	q := &snapshotStore{fakeStore: &fakeStore{}, rows: []store.GetUserSecretCiphertextByIDRow{row}}
+	// A missing revision guard can open valid material and reach the assertion;
+	// the correct path must still perform zero state reads.
+	q := &snapshotStore{fakeStore: &fakeStore{}, rows: []store.GetUserSecretCiphertextByIDRow{row}, epochs: []int64{7}}
 	got, err := OpenByIDOfKindAtRevision(context.Background(), q, readerTestVault(box, q), box, row.UserID, row.ID, row.Kind, 3)
 	if err != store.ErrVaultSealStale || got != nil || q.reads != 0 || len(q.args) != 1 {
 		t.Fatalf("revision check happened after crypto: err=%v reads=%d", err, q.reads)
