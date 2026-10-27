@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildPolicyRevision, safeRevisionInputId } from "../src/policy-revision.js";
+import { buildPolicyRevision, decodePolicyRevisionGate, safeRevisionInputId } from "../src/policy-revision.js";
 
 const rowId = "12345678-1234-5678-9abc-123456789abc";
 const childId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -8,6 +8,16 @@ const gate = { revision: "7", presentation_id: rowId, payload_digest: "a".repeat
 const human = { kind: "revise", feedback: "same feedback", inputId: 13 } as const;
 
 describe("policy revision producer wire", () => {
+  it("shares a narrow copying decoder across transport and carrier boundaries", () => {
+    assert.equal(decodePolicyRevisionGate(undefined), undefined);
+    assert.equal(decodePolicyRevisionGate(null), null);
+    const input = { ...gate };
+    const decoded = decodePolicyRevisionGate(input)!;
+    input.revision = "8";
+    assert.deepEqual(decoded, gate);
+    for (const value of [{ ...gate, extra: true }, { ...gate, revision: 7 }, [], false])
+      assert.equal(decodePolicyRevisionGate(value), undefined);
+  });
   it("distinguishes absent coverage, explicit null and a verified gate", () => {
     assert.equal(buildPolicyRevision(undefined, human), undefined);
     assert.deepEqual(buildPolicyRevision(null, human), {

@@ -986,3 +986,154 @@ test("root refusal journals a flat hold and parks without terminal failure or MR
   assert.equal(api.policyHoldRequests[0]!.body.published, true);
   assert.equal(outbox.listPendingPolicies(claim.run_id)[0]?.server_settled, true);
 });
+
+const transportedGate = { revision: "7", presentation_id: "12345678-1234-5678-9abc-123456789abc",
+  payload_digest: "a".repeat(64) };
+function gateBarrier<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(r => { resolve = r; });
+  return { promise, resolve };
+}
+
+test("live policy gate getter follows the latest ACK, copies values and emits only the taken identity", async (t) => {
+  const { outbox, claim } = await setup();
+  const claimGate = { ...transportedGate };
+  claim.policy_revision_gate = claimGate;
+  const report = client.reportState.bind(client);
+  let gate: unknown = { ...transportedGate };
+  let entered = false;
+  t.mock.method(client, "reportState", async (...[runId, body, signal]: Parameters<typeof report>) => body.status === "running"
+    ? { applied: true, status: "running", runId, workerIdentityMatches: true,
+      sentClaimGeneration: body.claim_generation, policyRevisionGate: gate as typeof transportedGate | null | undefined }
+    : report(runId, body, signal));
+  const { buildPolicyRevision } = await import("../src/policy-revision.js");
+  const executor: Executor = { async run(ctx) {
+    assert.equal(typeof Object.getOwnPropertyDescriptor(ctx, "policyRevisionGate")?.get, "function");
+    assert.deepEqual(ctx.policyRevisionGate, transportedGate);
+    claimGate.revision = "99";
+    const copy = ctx.policyRevisionGate!;
+    copy.revision = "100";
+    assert.equal(ctx.policyRevisionGate?.revision, "7");
+    gate = { ...transportedGate, revision: "8" };
+    await ctx.reportIteration!(1);
+    assert.equal(ctx.policyRevisionGate?.revision, "8");
+    const verdict = { kind: "revise", feedback: "identical text", inputId: 13 } as const;
+    const carrier = buildPolicyRevision(ctx.policyRevisionGate, verdict);
+    ctx.emit({ kind: "plan_revising", payload: { feedback: verdict.feedback, policy_revision: carrier } });
+    gate = null;
+    await ctx.reportIteration!(2);
+    assert.equal(ctx.policyRevisionGate, null);
+    assert.deepEqual(buildPolicyRevision(ctx.policyRevisionGate, verdict)?.gate, null);
+    for (gate of [undefined, { ...transportedGate, extra: true }]) {
+      await ctx.reportIteration!(3);
+      assert.equal(ctx.policyRevisionGate, undefined);
+      assert.equal(buildPolicyRevision(ctx.policyRevisionGate, verdict), undefined);
+    }
+    assert.equal(buildPolicyRevision(null, { kind: "revise", feedback: "identical text" }), undefined);
+    assert.equal(carrier?.gate?.revision, "8", "later observations cannot mutate the emitted snapshot");
+    entered = true;
+    throw refusal();
+  } };
+  await runner(executor, fakeGitlab().gitlab, undefined, { outbox }).execute(claim);
+  assert.equal(entered, true, "executor completed every context assertion");
+  const frames = api.messages(claim.run_id).filter(m => m.kind === "plan_revising");
+  assert.equal(frames.length, 1);
+  assert.deepEqual((frames[0]!.payload as { policy_revision: unknown }).policy_revision, {
+    gate: { ...transportedGate, revision: "8" }, revision: { source: "run_user_input", input_id: "13" },
+  });
+});
+
+for (const outcome of ["changed", "null", "missing", "malformed", "declined", "error", "stale", "wrong_generation", "wrong_run", "wrong_worker"] as const) {
+  test(`latest ${outcome} policy ACK cannot be revived by an older valid response`, async (t) => {
+    const { outbox, claim } = await setup();
+    claim.policy_revision_gate = { ...transportedGate };
+    const report = client.reportState.bind(client);
+    const olderEntered = gateBarrier<void>();
+    const releaseOlder = gateBarrier<void>();
+    const olderObserved = gateBarrier<void>();
+    let checked = false;
+    const expected = outcome === "null" ? null : outcome === "changed" ? { ...transportedGate, revision: "8" } : undefined;
+    t.mock.method(client, "reportState", async (...[runId, body, signal]: Parameters<typeof report>) => {
+      if (body.status !== "running") return report(runId, body, signal);
+      const ack = { applied: true, status: "running", runId, workerIdentityMatches: true,
+        sentClaimGeneration: body.claim_generation, policyRevisionGate: { ...transportedGate } as typeof transportedGate | undefined };
+      if (body.session_id === "older-gate-request" && body.iteration_count === undefined) {
+        olderEntered.resolve();
+        await releaseOlder.promise;
+        Object.defineProperty(ack, "applied", { get() { olderObserved.resolve(); return true; } });
+        return ack;
+      }
+      if (body.iteration_count === 1) {
+        if (outcome === "changed" || outcome === "null") return { ...ack, policyRevisionGate: expected };
+        if (outcome === "error") throw new Error("latest transport uncertain");
+        if (outcome === "stale") return { ...ack, staleClaim: true };
+        if (outcome === "declined") return { ...ack, applied: false };
+        if (outcome === "wrong_generation") return { ...ack, sentClaimGeneration: 1 };
+        if (outcome === "wrong_run") return { ...ack, runId: "other" };
+        if (outcome === "wrong_worker") return { ...ack, workerIdentityMatches: false };
+        return { ...ack, policyRevisionGate: outcome === "missing" ? undefined :
+          { ...transportedGate, revision: "01" } };
+      }
+      return ack;
+    });
+    const executor: Executor = { async run(ctx) {
+      assert.deepEqual(ctx.policyRevisionGate, transportedGate);
+      ctx.onSessionId!("older-gate-request");
+      await olderEntered.promise;
+      try {
+        assert.equal(ctx.policyRevisionGate, undefined, "an in-flight send invalidates prior coverage");
+        await ctx.reportIteration!(1);
+        assert.deepEqual(ctx.policyRevisionGate, expected);
+      } finally {
+        releaseOlder.resolve();
+      }
+      await olderObserved.promise;
+      assert.deepEqual(ctx.policyRevisionGate, expected, "response order cannot restore an older observation");
+      checked = true;
+      throw refusal();
+    } };
+    await runner(executor, fakeGitlab().gitlab, undefined, { outbox }).execute(claim);
+    assert.equal(checked, true, "runner reached the assertion after both event barriers");
+  });
+}
+
+for (const initial of [undefined, null, transportedGate]) {
+  test(`first running ACK absence supersedes claim gate ${initial === null ? "null" : initial ? "object" : "unknown"}`, async (t) => {
+    const { outbox, claim } = await setup();
+    claim.policy_revision_gate = initial;
+    const report = client.reportState.bind(client);
+    let checked = false;
+    t.mock.method(client, "reportState", async (...[runId, body, signal]: Parameters<typeof report>) => body.status === "running"
+      ? { applied: true, status: "running", runId, workerIdentityMatches: true, sentClaimGeneration: body.claim_generation }
+      : report(runId, body, signal));
+    const executor: Executor = { async run(ctx) {
+      assert.equal(ctx.policyRevisionGate, undefined);
+      checked = true;
+      throw refusal();
+    } };
+    await runner(executor, fakeGitlab().gitlab, undefined, { outbox }).execute(claim);
+    assert.equal(checked, true);
+  });
+}
+
+for (const negotiated of [true, false]) test(`ineligible or unnegotiated=${!negotiated} flights never expose policy coverage`, async (t) => {
+  const { outbox, claim } = await setup();
+  if (negotiated) claim.kind = undefined;
+  else client.supportsPolicyHold = () => false;
+  claim.policy_revision_gate = null;
+  const report = client.reportState.bind(client);
+  let checked = false;
+  t.mock.method(client, "reportState", async (...[runId, body, signal]: Parameters<typeof report>) => body.status === "running"
+    ? { applied: true, status: "running", runId, workerIdentityMatches: true,
+      sentClaimGeneration: body.claim_generation, policyRevisionGate: null }
+    : report(runId, body, signal));
+  const executor: Executor = { async run(ctx) {
+    assert.equal(ctx.policyRevisionGate, undefined);
+    await ctx.reportIteration!(1);
+    assert.equal(ctx.policyRevisionGate, undefined);
+    checked = true;
+    throw refusal();
+  } };
+  await runner(executor, fakeGitlab().gitlab, undefined, { outbox }).execute(claim);
+  assert.equal(checked, true);
+});

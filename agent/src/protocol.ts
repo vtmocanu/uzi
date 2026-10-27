@@ -1461,6 +1461,8 @@ export interface ClaimResponse extends ClaimMemoryState {
   semantic_planning?: import("./semantic-plan.js").SemanticPlanning;
   /** Guarded prompt repair inputs; metadata is untrusted. */
   ci_repair?: ClaimCIRepair;
+  /** Unknown is absent; null is verified no-gate coverage. */
+  policy_revision_gate?: PolicyStopGateContext | null;
   /** Nonterminal refusal-count constraint and server-derived exact-claim fresh grant. */
   policy_hold_resume?: boolean;
   policy_hold_fresh_session?: boolean;
@@ -2984,6 +2986,8 @@ export interface StateAck {
   workerIdentityMatches?: boolean;
   /** The actual request generation, after feature and strict-decode fallback selection. */
   sentClaimGeneration?: number;
+  /** Validated current transport observation; absence is unknown, never no-gate. */
+  policyRevisionGate?: PolicyStopGateContext | null;
   /** Exact server presentation; malformed presence never becomes legacy absence. */
   semanticGate?: SemanticGateAck;
   semanticGateMalformed?: true;

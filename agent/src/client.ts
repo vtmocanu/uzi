@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { decodePolicyRevisionGate } from "./policy-revision.js";
 import { decodeCodeCoverage, type CodeCoverage } from "./code-cross-check-coverage.js";
 import { decodePublicationContext, validatePublicationContextRequest } from "./publication-context.js";
 import type { PublicationContextRequest, PublicationContextResponse } from "./protocol.js";
@@ -1823,6 +1824,7 @@ export class WorkerClient {
           this.log.warn("memory authority lost; claims report it and the api stops dispatching guard-bound runs here until the worker restarts", {});
         }
       }
+      const policyNegotiated = this.supportsPolicyHold();
       const res = await this.fetchRaw("POST", path, body, timeoutMs, deadline);
       deadline.throwIfAborted();
       if (res.status === 204) return null;
@@ -1839,6 +1841,16 @@ export class WorkerClient {
         ? JSON.parse(await readCrossCheckText(res, 2 * 1024 * 1024, deadline,
           dedicated || marker === "cross_check" ? "claim" : undefined))
         : JSON.parse(await readBoundedText(res, CLAIM_RESPONSE_MAX_BYTES, true, deadline))) as ClaimResponse;
+      if (isRecord(claim)) {
+        const gate = policyNegotiated && this.supportsPolicyHold() && incarnation === this.completionIncarnation &&
+          terminalUUID(claim.run_id) && terminalGeneration(claim.claim_generation) && claim.claim_generation > 0 &&
+          isRecord(claim.secrets) && !!claim.secrets.codex && claim.interactive !== true &&
+          (claim.target_run_id === undefined || claim.target_run_id === null) &&
+          (claim.kind === "issue" || claim.kind === "task" || claim.kind === "prompt" || claim.kind === "self_improve")
+          ? decodePolicyRevisionGate(claim.policy_revision_gate) : undefined;
+        if (gate === undefined) delete claim.policy_revision_gate;
+        else claim.policy_revision_gate = gate;
+      }
       if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_episode) ||
           (claim.worker_recovery_episode as number) < 0)) delete claim.worker_recovery_episode;
       if (isRecord(claim) && claim.semantic_planning !== undefined) claim.semantic_planning = parseSemanticEnrollment(claim.semantic_planning);
@@ -2456,6 +2468,8 @@ export class WorkerClient {
           throw new Error("source publication requires negotiated support, positive claim_generation and matching terminal proof");
       }
       try {
+        const policyNegotiated = this.supportsPolicyHold();
+        const policyWorkerId = this.registeredWorkerId;
         const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
         // 409 = the server declined the transition and is telling us the run's real
         // status. Not an error, and not a retry: the server has moved on.
@@ -2493,6 +2507,14 @@ export class WorkerClient {
           }
           if (body.claim_generation !== undefined)
             ack.sentClaimGeneration = body.claim_generation;
+          if (policyNegotiated && this.supportsPolicyHold() && !signal?.aborted && incarnation === this.completionIncarnation &&
+              policyWorkerId !== undefined && policyWorkerId === this.registeredWorkerId &&
+              ack.applied && !fields.staleClaim && fields.applied !== false &&
+              ack.runId === runId && ack.workerIdentityMatches === true && typeof ack.status === "string" &&
+              Number.isSafeInteger(ack.sentClaimGeneration) && (ack.sentClaimGeneration ?? 0) > 0 &&
+              (fields.reconciliation === undefined || fields.reconciliation.claimGeneration === ack.sentClaimGeneration) &&
+              fields.policyRevisionGate !== undefined)
+            ack.policyRevisionGate = decodePolicyRevisionGate(fields.policyRevisionGate);
           if (fields.semanticGate !== undefined) ack.semanticGate = fields.semanticGate;
           if (fields.semanticGateMalformed) ack.semanticGateMalformed = true;
           if (fields.completionPending !== undefined) ack.completionPending = fields.completionPending;
@@ -4997,6 +5019,7 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
  * applied it.
  */
 export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
+  policyRevisionGate?: StateAck["policyRevisionGate"];
   applied?: boolean;
   semanticGate?: StateAck["semanticGate"];
   semanticGateMalformed?: true;
@@ -5045,6 +5068,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     MaintenanceBudget.current()?.check();
     if (!text) return {};
     const parsed = JSON.parse(text) as {
+      policy_revision_gate?: unknown;
       applied?: unknown;
       // PRD #1392 M2 (D10): `reason` is TOP-LEVEL on the {run, reason?} ack body, NOT under run.
       reason?: unknown;
@@ -5088,6 +5112,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     };
     const run = parsed?.run;
     const out: {
+      policyRevisionGate?: StateAck["policyRevisionGate"];
       applied?: boolean;
       semanticGate?: StateAck["semanticGate"];
       semanticGateMalformed?: true;
@@ -5275,6 +5300,12 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     if (res.status === 200 && reconciliation !== undefined &&
         (out.status !== "awaiting_approval" || reconciliation.gateRevision > 0))
       out.reconciliation = reconciliation;
+    if (res.status === 200 && isRecord(parsed) && !Object.hasOwn(parsed, "disposition") &&
+        (!Object.hasOwn(parsed, "applied") || parsed.applied === true) &&
+        (!Object.hasOwn(parsed, "claim_generation") || out.reconciliation !== undefined)) {
+      const gate = decodePolicyRevisionGate(parsed.policy_revision_gate);
+      if (gate !== undefined) out.policyRevisionGate = gate;
+    }
     MaintenanceBudget.current()?.check();
     return out;
   } catch {

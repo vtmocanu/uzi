@@ -18,7 +18,7 @@ function positiveInt64(value: unknown): value is string {
 }
 
 /** Copy the closed Go gate shape. Unknown or malformed coverage never becomes null. */
-function copyGate(value: unknown): PolicyStopGateContext | null | undefined {
+export function decodePolicyRevisionGate(value: unknown): PolicyStopGateContext | null | undefined {
   if (value === null) return null;
   if (typeof value !== "object" || Array.isArray(value)) return undefined;
   const keys = Reflect.ownKeys(value);
@@ -37,7 +37,7 @@ export function buildPolicyRevision(
   gate: unknown,
   verdict: Extract<PlanVerdict, { kind: "revise" }>,
 ): PolicyRevisionCarrier | undefined {
-  const copied = copyGate(gate);
+  const copied = decodePolicyRevisionGate(gate);
   if (copied === undefined) return undefined;
   if (verdict.automatic === true) {
     if (!canonicalUUID(verdict.crossCheckId)) return undefined;

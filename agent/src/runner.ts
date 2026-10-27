@@ -7,6 +7,7 @@ import { interruptedSnapshot, prepareInterruptedCalls } from "./interrupted-call
 import { CodeCrossCheckGate, persistedCodeCrossCheckSummary } from "./code-cross-check-gate.js";
 import { readRepoInstructionsAtCommit } from "./repo-instructions-at-commit.js";
 import { resolvePendingPolicy } from "./policy-resolve.js";
+import { decodePolicyRevisionGate } from "./policy-revision.js";
 import type { ImmutablePolicyOutcome } from "./protocol.js";
 import { PolicyResumeRejected, ProviderPolicyRefusal, policyRefusalMessage } from "./provider-policy-refusal.js";
 import { isParkAnswer } from "./park-run.js";
@@ -2138,6 +2139,8 @@ interface RunFlight {
   /** A reached policy Stop needs a fresh authoritative scope ACK before execution. */
   policyStopAtResume?: boolean;
   policyHoldSupported?: boolean;
+  policyRevisionGate?: StateAck["policyRevisionGate"];
+  policyRevisionEnded?: boolean;
   policyHoldIntent?: PolicyResumeRejected | ProviderPolicyRefusal;
   policyReconciliationPending?: boolean;
   policyHoldOutcome?: ImmutablePolicyOutcome;
@@ -10519,8 +10522,13 @@ export class RunRunner {
       writeUnresolved: typeof claim.checkpoint_write_unresolved === "boolean"
         ? claim.checkpoint_write_unresolved : undefined,
     });
+    const policyHoldSupported = this.policyHoldEligible(claim) && this.client.supportsPolicyHold();
+    let policyRevisionSequence = 0;
     const flight: RunFlight = {
-      policyHoldSupported: this.policyHoldEligible(claim) && this.client.supportsPolicyHold(),
+      policyHoldSupported,
+      policyRevisionGate: policyHoldSupported && (claim.target_run_id === undefined || claim.target_run_id === null) &&
+        Number.isSafeInteger(claimGeneration) && claimGeneration > 0
+        ? decodePolicyRevisionGate(claim.policy_revision_gate) : undefined,
       lastPersistedGateRevision: Number.isSafeInteger(claim.resume_gate_revision) && (claim.resume_gate_revision ?? 0) > 0 ? claim.resume_gate_revision : undefined,
       initiallyCodex: this.requiresFreeCaptureScope(claim, { executor }),
       runId,
@@ -10688,6 +10696,10 @@ export class RunRunner {
           ? this.client.reportSemanticPlanGateState(runId, stamped, signal)
           : checked ? this.client.reportPlanCrossCheckGateState(runId, stamped, signal)
           : this.client.reportState(runId, stamped, signal);
+        // Order observations at transport entry, after every receipt/preparation barrier.
+        // A new send makes prior coverage unknown even if its response fails or is unreadable.
+        const policySequence = ++policyRevisionSequence;
+        flight.policyRevisionGate = undefined;
         // Preservation expiry cannot prevent the honest terminal report. FINAL stays budgeted.
         const sending = body.status === "failed" || body.status === "completed"
           ? MaintenanceBudget.withoutAttempt(transport) : transport();
@@ -10696,6 +10708,10 @@ export class RunRunner {
         let ack: Awaited<ReturnType<WorkerClient["reportState"]>>;
         try { ack = await sending; }
         finally { senders.delete(sending); }
+        if (ack.staleClaim || ack.status === "cancelled") {
+          flight.policyRevisionEnded = true;
+          flight.policyRevisionGate = undefined;
+        }
         if (ack.applied === true && ack.status === "awaiting_approval" && Number.isSafeInteger(ack.gateRevision) && (ack.gateRevision ?? 0) > 0)
           flight.lastPersistedGateRevision = Math.max(flight.lastPersistedGateRevision ?? 0, ack.gateRevision!);
         if (diskSeq !== undefined) this.diskGovernor?.statusAcked(runId, diskSeq, ack.status);
@@ -10733,6 +10749,14 @@ export class RunRunner {
           throw new StaleClaimError();
         }
         if (ack.status === "cancelled") this.observeCancellation(flight);
+        if (policySequence === policyRevisionSequence && !flight.policyRevisionEnded && flight.policyHoldSupported === true &&
+            this.client.supportsPolicyHold() && !signal?.aborted && ack.applied === true &&
+            (claim.target_run_id === undefined || claim.target_run_id === null) &&
+            ack.runId === runId && ack.workerIdentityMatches === true && typeof ack.status === "string" &&
+            Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 &&
+            ack.sentClaimGeneration === flight.claimGeneration &&
+            steering.claimFence() === undefined && !steering.isCancelled() && !cancel.signal.aborted)
+          flight.policyRevisionGate = decodePolicyRevisionGate(ack.policyRevisionGate);
         // Issue #3240: only an applied running ACK confirms pause_failed's continuing flight. Any other
         // answer (declined, or a non-running status) gets the ordinary non-running handling it skipped
         // above: the flight stops running and its context is retired, so no shell authority survives.
@@ -12951,7 +12975,15 @@ export class RunRunner {
     const semanticPlanning = claim.semantic_planning === undefined ? undefined : parseSemanticEnrollment(claim.semantic_planning);
     const semanticGate = semanticPlanning ? new SemanticPlanningGate(this.client, runId, flight.claimGeneration,
       steering.lifecycleSignal(), this.semanticCoverageTestTransport) : undefined;
+    const currentPolicyRevisionGate = () => {
+      if (flight.policyRevisionEnded || flight.policyHoldSupported !== true || !this.client.supportsPolicyHold() ||
+          this.activeRuns.get(runId) !== flight.active || flight.active?.shuttingDown ||
+          steering.claimFence() !== undefined || steering.isCancelled() || cancel.signal.aborted)
+        return undefined;
+      return decodePolicyRevisionGate(flight.policyRevisionGate);
+    };
     const ctx: RunContext = {
+      get policyRevisionGate() { return currentPolicyRevisionGate(); },
       policyHoldSupported: flight.policyHoldSupported === true,
       policyHoldResume: claim.policy_hold_resume === true,
       policyHoldFreshSession: claim.policy_hold_fresh_session === true,
