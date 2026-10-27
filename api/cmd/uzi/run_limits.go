@@ -88,7 +88,10 @@ func newRunResumeNowCmd(env Env, gf *globalFlags) *cobra.Command {
 // a plain RunDTO that carries neither the worker's NAME nor its liveness (draining/gone),
 // which the richer "pinned to worker <name> …" wording would need — and the PRD is explicit
 // that a round-trip must not be added just for that wording — so the plain form is what a CLI
-// resume prints today. --json emits the run object for the agent contract.
+// resume prints today. The one pre-resume read it does make is PRD #3522's: human output reads the
+// run's hold first, so the weekly-usage-reserve override line names only a resume that lifted a
+// reserve hold (an exemption from an earlier resume survives an ordinary one). --json and --quiet
+// skip that read. --json emits the run object for the agent contract.
 func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 	resume := &cobra.Command{
 		Use:   "resume <run-id>",
