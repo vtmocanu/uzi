@@ -604,6 +604,7 @@ for (const outcome of ["stale", "cancelled", "newer", "mismatch", "statusless", 
   test(`retained park ${outcome} reconciles without terminal fallback`, async t => {
     const f = fixture(t);
     await f.reserve(4, f.recreate(), 7); f.advance(300_001);
+    const before = f.read();
     let sends = 0;
     const h = exhaustionRunner(f, {
       ack: async () => {
@@ -614,15 +615,25 @@ for (const outcome of ["stale", "cancelled", "newer", "mismatch", "statusless", 
         if (outcome === "newer") return {};
         if (outcome === "mismatch") return { status: "recovery_wait", recoveryCause: "data_volume_full" };
         if (outcome === "statusless") return {};
-        return { status: "recovery_wait", recoveryCause: "retained_recovery_exhausted", applied: false };
+        // Decoded handler 409: the released claim is stale even when the row is parked.
+        return { status: "recovery_wait", recoveryCause: "retained_recovery_exhausted", applied: false, staleClaim: true };
       },
       ownership: async () => ({ status: "recovery_wait", claim_generation: outcome === "newer" ? 5 : 4 }),
     });
     await assert.rejects(h.run(), (error: Error) => error.constructor.name === "RetainedRecoveryStop");
-    assert.equal(h.flight.parked, outcome === "duplicate" || outcome === "lost ACK");
+    assert.equal(h.flight.parked, false);
     assert.equal(h.counts().terminal, 0);
     assert.ok(sends <= 2);
     assert.ok(h.counts().reads <= 2);
+    if (outcome === "duplicate" || outcome === "lost ACK") {
+      assert.equal(sends, outcome === "duplicate" ? 1 : 2);
+      assert.equal(h.counts().reads, outcome === "duplicate" ? 0 : 1);
+      for (const latch of ["retainedEpisodeCustody", "retainedLocalCustody", "preserveRecoveryClone", "preserveSession", "keepGuardedInventoryOpen"])
+        assert.equal(Reflect.get(h.flight, latch), true, latch);
+      assert.deepEqual(f.read(), { ...before, recovery: {
+        ...before.recovery!, stage: "blocked", blocker: "budget_exhausted",
+      } });
+    }
     assert.equal(Reflect.get(h.flight, "keepGuardedInventoryOpen"), true);
     assert.equal(f.read().recovery?.blocker, "budget_exhausted");
   });

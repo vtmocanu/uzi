@@ -121,6 +121,7 @@ for (const status of [200, 409, 400]) it(`retained exhaustion wire preserves cau
     sent.push(JSON.parse(String(init?.body)));
     return status === 400 ? Response.json({ error: "invalid request body" }, { status }) : Response.json({
       run: { status: "recovery_wait", recovery_wait_cause: "retained_recovery_exhausted" },
+      ...(status === 409 ? { disposition: "stale_claim" } : {}),
     }, { status });
   });
   await client.register("episode-worker");
@@ -132,8 +133,33 @@ for (const status of [200, 409, 400]) it(`retained exhaustion wire preserves cau
     assert.equal(ack.status, "recovery_wait");
     assert.equal(ack.recoveryCause, "retained_recovery_exhausted");
     assert.equal(ack.sentClaimGeneration, 5);
+    if (status === 409) {
+      assert.equal(ack.applied, false);
+      assert.equal(ack.staleClaim, true);
+    }
   }
   assert.deepEqual(sent, [body], "no untyped or generation-stripped retry, even without the generic fence feature");
+});
+
+it("retained exhaustion lost ACK retries the same fenced body and returns stale without confirmation", async () => {
+  const sent: unknown[] = [];
+  client.protocolFeatures = ["recovery_cause_retained_recovery_exhausted"];
+  mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
+    sent.push(JSON.parse(String(init?.body)));
+    return sent.length === 1 ? Response.json({ error: "response lost after write" }, { status: 500 })
+      : Response.json({
+        run: { status: "recovery_wait", recovery_wait_cause: "retained_recovery_exhausted" },
+        disposition: "stale_claim",
+      }, { status: 409 });
+  });
+  const body = { status: "recovery_wait", recovery_cause: "retained_recovery_exhausted", claim_generation: 5 } as const;
+  const ack = await client.reportState("episode-run", body);
+  assert.equal(ack.applied, false);
+  assert.equal(ack.staleClaim, true);
+  assert.equal(ack.status, "recovery_wait");
+  assert.equal(ack.recoveryCause, "retained_recovery_exhausted");
+  assert.equal(ack.sentClaimGeneration, 5);
+  assert.deepEqual(sent, [body, body], "one retry keeps the typed cause and generation");
 });
 
 it("retained exhaustion requires negotiated support and positive generation before sending", async () => {
