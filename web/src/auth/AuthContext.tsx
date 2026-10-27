@@ -149,6 +149,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // a probe started before one of those drops its result rather than undoing it.
   const probeInFlight = useRef<Promise<void> | null>(null);
   const sessionGen = useRef(0);
+  // Authentication changes retire mutation authority; ordinary probes and
+  // same-user preference saves only invalidate older session snapshots.
+  const authSessionGen = useRef(0);
   const probeToken = useRef<object | null>(null);
 
   // applySession records the user and the instance labels from a session
@@ -204,9 +207,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const beginVaultChange = useCallback(() => {
     const id = currentUserID.current;
-    const gen = sessionGen.current;
+    const gen = authSessionGen.current;
     return (mode: "protected" | "unprotected") => {
-      if (id === null || id !== currentUserID.current || gen !== sessionGen.current) return false;
+      if (id === null || id !== currentUserID.current || gen !== authSessionGen.current) return false;
       sessionGen.current += 1;
       probeInFlight.current = null;
       setVaultMode(mode);
@@ -237,6 +240,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       } catch (err) {
         if (gen !== sessionGen.current) return;
         if (err instanceof ApiError && err.status === 401) {
+          authSessionGen.current += 1;
           currentUserID.current = null;
           setUser(null);
           setServerUnreachable(false);
@@ -265,6 +269,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // Another request's 401: the session is gone. Invalidate any pending probe
       // so its later result cannot restore the user.
       sessionGen.current += 1;
+      authSessionGen.current += 1;
       currentUserID.current = null;
       setUser(null);
       setServerUnreachable(false);
@@ -325,6 +330,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     async (email: string, password: string, displayName: string) => {
       const session = await api.register(email, password, displayName);
       sessionGen.current += 1;
+      authSessionGen.current += 1;
       applySession(session);
     },
     [applySession],
@@ -334,6 +340,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     async (email: string, password: string) => {
       const session = await api.login(email, password);
       sessionGen.current += 1;
+      authSessionGen.current += 1;
       applySession(session);
     },
     [applySession],
@@ -344,6 +351,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       await api.logout();
     } finally {
       sessionGen.current += 1;
+      authSessionGen.current += 1;
       currentUserID.current = null;
       setUser(null);
       setServerUnreachable(false);

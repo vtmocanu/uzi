@@ -28,12 +28,13 @@ function deferredFetch() {
 }
 
 function Probe() {
-  const { user, loading, retry, refresh, vaultMode, vaultPolicy, vaultUnlocked, login, logout } = useAuth();
+  const { user, loading, retry, refresh, vaultMode, vaultPolicy, vaultUnlocked, login, logout, updateUser } = useAuth();
   return (
     <>
       <span data-testid="user">{user?.id ?? "none"}</span>
       <span data-testid="vault">{vaultMode}/{vaultPolicy}/{String(vaultUnlocked)}</span>
       <button onClick={() => void refresh(true)}>fresh session</button>
+      <button onClick={() => { if (user) updateUser({ ...user, display_name: "Saved preference" }); }}>save preferences</button>
       <button onClick={() => void login("a@b.c", "pw")}>login</button>
       <button onClick={() => void logout()}>logout</button>
       <span data-testid="loading">{String(loading)}</span>
@@ -252,6 +253,31 @@ it.each(["protected", "unprotected"] as const)("reconciles a successful toggle f
   await act(async () => { screen.getByText("retry").click(); });
   await act(async () => { resolves[5](response(vaultSession(nextMode))); });
   expect(screen.queryByText(/metadata are unknown/)).toBeNull();
+});
+
+it.each([
+  ["protected", "save preferences"],
+  ["unprotected", "save preferences"],
+  ["protected", "fresh session"],
+  ["unprotected", "fresh session"],
+] as const)("reconciles %s toggle after unrelated %s invalidation", async (mode, action) => {
+  const resolves = deferredFetch();
+  const reload = renderVault();
+  await act(async () => { resolves[0](response(vaultSession(mode))); });
+  await startToggle(mode);
+  await act(async () => { screen.getByText(action).click(); });
+  const nextMode = mode === "protected" ? "unprotected" : "protected";
+  await act(async () => { resolves[1](response({ mode: nextMode })); });
+  const metadataRequest = action === "fresh session" ? 3 : 2;
+  expect(resolves).toHaveLength(metadataRequest + 1);
+  await act(async () => { resolves[metadataRequest](response({ error: "unavailable" }, 503)); });
+  expect(screen.getByTestId("vault").textContent).toBe(`${nextMode}/optional/false`);
+  expect(screen.getByText(/vault\/session metadata could not be refreshed/)).toBeTruthy();
+  expect(reload).toHaveBeenCalledTimes(1);
+  if (action === "fresh session") {
+    await act(async () => { resolves[2](response(vaultSession(mode))); });
+    expect(screen.getByTestId("vault").textContent).toBe(`${nextMode}/optional/false`);
+  }
 });
 
 it.each(["u1", "u2"])("rejects an old toggle after logout/login as %s", async id => {
