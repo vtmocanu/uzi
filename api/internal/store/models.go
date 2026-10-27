@@ -273,6 +273,13 @@ type CodexProviderAccount struct {
 	RecoveryCause            pgtype.Text        `json:"recovery_cause"`
 }
 
+type CodexQueuedRunAdmission struct {
+	RunID                    uuid.UUID          `json:"run_id"`
+	UserID                   uuid.UUID          `json:"user_id"`
+	CodexAdmissionClass      string             `json:"codex_admission_class"`
+	CodexAdmissionEligibleAt pgtype.Timestamptz `json:"codex_admission_eligible_at"`
+}
+
 type CodexRefreshIntent struct {
 	OperationID       uuid.UUID          `json:"operation_id"`
 	UserID            uuid.UUID          `json:"user_id"`
