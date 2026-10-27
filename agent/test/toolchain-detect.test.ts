@@ -30,6 +30,30 @@ function mkClone(files: Record<string, string>): string {
 const GO_MOD = "module example.com/x\n\ngo 1.22\n";
 const PKG = '{"name":"x","version":"1.0.0"}';
 
+describe("detectToolchain: bounded trigger observations", () => {
+  it("retains depth-4 JVM manifests, not arbitrary Gradle fixtures or Kotlin files", async () => {
+    const root=mkClone({"app/modules/x/android/build.gradle":"plugins {}","app/__tests__/fixtures/sample.gradle":"text","app/a.kt":"text"});
+    assert.deepEqual((await detectToolchain(root)).evidence,{jvm:{triggers:[{path:"app/modules/x/android/build.gradle",reason:"jvm_manifest"}],truncated:false}});
+    assert.deepEqual((await detectToolchain(mkClone({"fixture/sample.gradle":"text","module.kt":"text"}))).evidence,{});
+  });
+  it("keeps sorted, bounded samples and reason kinds without source snippets", async () => {
+    const root=mkClone({Dockerfile:"FROM alpine","compose.yml":"services: {}","docker-compose.yml":"services: {}","docker-compose.yaml":"services: {}", "pom.xml":"<project/>"});
+    const result=await detectToolchain(root);
+    assert.deepEqual(result.evidence.docker,{triggers:[{path:"Dockerfile",reason:"docker_marker"},{path:"docker-compose.yml",reason:"docker_marker"},{path:"docker-compose.yaml",reason:"docker_marker"}],truncated:true});
+    assert.deepEqual(result.evidence, (await detectToolchain(root)).evidence);
+  });
+  it("explains manifest references and root docker command matches",async()=>{
+    const root=mkClone({"package.json":'{"testcontainers":"x"}',"Makefile":"build:\n\tdocker build ."});
+    assert.deepEqual((await detectToolchain(root)).evidence.docker?.triggers,[{path:"package.json",reason:"testcontainers_reference"},{path:"Makefile",reason:"docker_command"}]);
+  });
+  it("caps UTF-8 path bytes without dropping the inferred capability",async()=>{
+    const root=mkClone({[`${"é".repeat(120)}/${"é".repeat(120)}/${"é".repeat(120)}/pom.xml`] : "<project/>"});
+    const result=await detectToolchain(root);
+    assert.deepEqual(result.required_capabilities,["jvm"]);
+    assert.deepEqual(result.evidence.jvm,{triggers:[],truncated:true});
+  });
+});
+
 describe("detectToolchain: docker capability", () => {
   it("(a) a Dockerfile ⇒ required_capabilities includes docker", async () => {
     const root = mkClone({ Dockerfile: "FROM alpine\n" });

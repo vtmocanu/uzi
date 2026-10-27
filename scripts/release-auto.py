@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dispatch-only release orchestration; the cutter and coverage tool own policy."""
+"""Scheduled/manual release orchestration; the cutter and coverage tool own policy."""
 import argparse
 import datetime as dt
 import hashlib
@@ -13,11 +13,16 @@ import subprocess
 import sys
 import time
 import urllib.request
+import uuid
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location('release_coverage', ROOT / 'scripts/release-ci-coverage.py')
 policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
+diag_spec = importlib.util.spec_from_file_location('release_diagnostics', ROOT / 'scripts/lib/release-diagnostics.py')
+diagnostics = importlib.util.module_from_spec(diag_spec)
+diag_spec.loader.exec_module(diagnostics)
 BASE = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
 RC = rf'v{BASE}-rc\.[1-9][0-9]*'
 SHA = r'[0-9a-f]{40}'
@@ -47,13 +52,20 @@ def require(condition, reason):
 def inputs(env):
     require(env.get('GITHUB_REPOSITORY') == 'vtmocanu/uzi', 'wrong-repository')
     require(env.get('RELEASE_REF') == 'refs/heads/main', 'main-required')
-    dispatchers = re.split(r'[,\s]+', env.get('RELEASE_DISPATCHERS', '').strip())
-    require(bool(env.get('RELEASE_ACTOR')) and env['RELEASE_ACTOR'] in dispatchers, 'dispatcher-not-allowed')
+    event = env.get('GITHUB_EVENT_NAME', '')
+    require(event in ('workflow_dispatch', 'schedule'), 'invalid-event')
+    scheduled = event == 'schedule'
+    if not scheduled:
+        dispatchers = re.split(r'[,\s]+', env.get('RELEASE_DISPATCHERS', '').strip())
+        require(bool(env.get('RELEASE_ACTOR')) and env['RELEASE_ACTOR'] in dispatchers, 'dispatcher-not-allowed')
     kind = env.get('RELEASE_KIND', '')
     require(kind in ('rc', 'stable'), 'invalid-kind')
     version, supersede = env.get('RELEASE_VERSION', ''), env.get('RELEASE_SUPERSEDE', '')
     abandon = env.get('RELEASE_ABANDON', 'false')
     tag, sha = env.get('RELEASE_RC_TAG', ''), env.get('RELEASE_RC_SHA', '')
+    if scheduled:
+        require(kind == 'rc' and not version and not supersede and not tag and not sha and abandon == 'false',
+                'scheduled-input-mismatch')
     require(abandon in ('true', 'false'), 'invalid-abandon')
     require(not version or (len(version) <= 100 and re.fullmatch(BASE, version)), 'invalid-version')
     require(not supersede or (len(supersede) <= 128 and re.fullmatch(RC, supersede)), 'invalid-supersede')
@@ -63,7 +75,27 @@ def inputs(env):
     else:
         require(not tag and not sha, 'rc-input-mismatch')
         require(abandon == 'false' or bool(version), 'abandon-needs-version')
-    return dict(kind=kind, version=version, abandon=abandon == 'true', supersede=supersede, rc_tag=tag, rc_sha=sha)
+    return dict(kind=kind, version=version, abandon=abandon == 'true', supersede=supersede, rc_tag=tag, rc_sha=sha,
+                scheduled=scheduled, nightly_enabled=env.get('RELEASE_NIGHTLY_ENABLED') == 'true',
+                created_at=env.get('RUN_CREATED_AT', ''))
+
+
+def nightly_window(stamp):
+    require(isinstance(stamp, str) and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', stamp), 'invalid-run-age')
+    try:
+        zone = ZoneInfo('Europe/Bucharest')
+        day = dt.datetime.fromisoformat(stamp.replace('Z', '+00:00')).astimezone(zone).date()
+        return tuple(dt.datetime.combine(day, dt.time(hour), zone).timestamp() for hour in (8, 9))
+    except (ValueError, OverflowError, ZoneInfoNotFoundError):
+        raise Stop('invalid-nightly-window') from None
+
+
+def nightly_cutoff(stamp, now, reserve=0):
+    cutoff, _ = nightly_window(stamp)
+    require(dt.datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() <= now + 60, 'invalid-run-age')
+    if now >= cutoff - reserve:
+        raise Stop('missed-target', 'defer')
+    return cutoff
 
 
 def parse_plan(text):
@@ -118,12 +150,15 @@ def eligible_jobs(jobs):
     return True
 
 
-def command(*args, timeout=60, raw=False):
-    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+def command(*args, timeout=60, raw=False, live=False):
+    result = subprocess.run(args, capture_output=not live, text=True, timeout=timeout, check=False)
     if result.returncode:
         # Diagnostics stay in job logs; incident reports contain typed reasons.
-        print((result.stdout + result.stderr)[-8192:], file=sys.stderr)
+        if not live:
+            print((result.stdout + result.stderr)[-8192:], file=sys.stderr)
         raise Stop('command-failed')
+    if live:
+        return ''
     return result.stdout if raw else result.stdout.strip()
 
 
@@ -141,7 +176,10 @@ def summary(values):
     target = os.environ.get('GITHUB_STEP_SUMMARY')
     if target:
         with open(target, 'a') as stream:
-            stream.write('```json\n' + json.dumps(values, sort_keys=True, indent=2) + '\n```\n')
+            public = dict(values)
+            for key in ('changes', 'uncited', 'uncited_count', 'uncited_truncated'):
+                public[key] = json.loads(values.get(key, 'null'))
+            stream.write('```json\n' + json.dumps(public, sort_keys=True, indent=2) + '\n```\n')
             for change in json.loads(values.get('changes', '[]')):
                 sha = change['sha']
                 pr = f'PR #{change["pr"]}' if change['pr'] else 'no PR number in subject'
@@ -171,7 +209,8 @@ def created_at(env, fetch=None):
             with urllib.request.urlopen(request, timeout=20) as response:
                 return json.load(response)
     run = fetch(url)
-    require(run.get('id') == int(run_id) and run.get('event') == 'workflow_dispatch'
+    require(run.get('id') == int(run_id) and env.get('GITHUB_EVENT_NAME') in ('workflow_dispatch', 'schedule')
+            and run.get('event') == env.get('GITHUB_EVENT_NAME')
             and run.get('head_branch') == 'main' and run.get('head_sha') == env.get('GITHUB_SHA')
             and run.get('repository', {}).get('full_name') == 'vtmocanu/uzi'
             and run.get('path', '').split('@')[0] == '.github/workflows/release-auto.yml', 'invalid-run-metadata')
@@ -186,6 +225,7 @@ class Release:
         self.config, self.run = config, run
         self.api = api or policy.GitHub('vtmocanu/uzi')
         self.clock, self.sleep = clock, sleep
+        self.wall_time = time.time
         self.retries = []
         self.evidence = {}
 
@@ -206,6 +246,36 @@ class Release:
 
     def remote(self):
         return inventory(self.git('ls-remote', 'origin', 'refs/heads/main', 'refs/tags/v*'))
+
+    def cut(self, args, directory, tag):
+        self.evidence.update(phase='prepare', stage='preconditions', planned_tag=tag)
+        directory.mkdir(parents=True, exist_ok=True)
+        result_file = directory / 'cut-result.json'
+        result_file.unlink(missing_ok=True)
+        failed = None
+        command_token = uuid.uuid4().hex
+        print('::stop-commands::' + command_token, flush=True)
+        try:
+            self.run(*args, '--result-file', str(result_file), timeout=600, live=True)
+        except Stop as error:
+            failed = error
+        except subprocess.TimeoutExpired:
+            raise Stop('release-cut-timed-out') from None
+        finally:
+            print('::' + command_token + '::', flush=True)
+        try:
+            data = diagnostics.read(result_file)
+        except (OSError, ValueError, TypeError):
+            raise Stop('release-diagnostics-unavailable') from None
+        require(data['planned_tag'] == tag or (failed is not None and data['planned_tag'] is None),
+                'release-diagnostics-tag-mismatch')
+        require((data['reason'] == 'ready') if failed is None else
+                data['reason'] not in ('ready', 'changelog-coverage-ok'), 'release-diagnostics-status-mismatch')
+        self.evidence.update(stage=data['stage'], uncited=json.dumps(data['uncited']),
+                             uncited_count=json.dumps(data['uncited_count']),
+                             uncited_truncated=json.dumps(data['uncited_truncated']))
+        if failed is not None:
+            raise Stop(data['reason']) from failed
 
     def watch_admission(self, tag, sha):
         require(re.fullmatch(SHA, sha) and re.fullmatch(rf'v{BASE}(?:-rc\.[1-9][0-9]*)?', tag), 'invalid-recovery-tag')
@@ -228,24 +298,39 @@ class Release:
             require(cfg['supersede'] and plan['PREVIOUS_TAG'] == cfg['supersede']
                     and plan['REASON'] == 'previous-publication-not-successful'
                     and plan['PUBLICATION_STATE'] in ('failed', 'absent'), plan['REASON'])
+        if cfg['scheduled'] and plan['OP'] == 'noop':
+            raise Stop(plan['REASON'], 'no-op')
         # Dispatch explicitly preserves manual empty-delta respins. The cutter
         # still enforces notes/releasability and every mutation/publication guard.
         require(re.fullmatch(BASE, plan['BASE']) and re.fullmatch(RC, plan['TAG']), 'invalid-plan')
 
     def tip(self, seconds=7200, interval=15):
-        deadline, retried, pending_retry = self.clock() + seconds, False, None
+        if self.config['scheduled']:
+            if not self.config['nightly_enabled']:
+                raise Stop('nightly-disabled', 'no-op')
+            now = self.wall_time()
+            cutoff = nightly_cutoff(self.config['created_at'], now, reserve=600)
+            seconds = cutoff - 600 - now
+        deadline_reason = 'tip-not-green-by-cutoff' if self.config['scheduled'] else 'tip-not-green-by-deadline'
+        started = self.clock()
+        deadline, retried, pending_retry = started + seconds, False, None
+        deadline_utc = dt.datetime.fromtimestamp(self.wall_time() + seconds, dt.timezone.utc).isoformat(timespec='seconds')
+        last_progress = None
         selected, plan = None, None
         while True:
             if self.clock() > deadline:
-                raise Stop('tip-not-green-by-deadline', 'defer')
+                raise Stop(deadline_reason, 'defer')
             self.git('fetch', '--prune', '--tags', 'origin')
             sha = self.git('rev-parse', 'refs/remotes/origin/main')
             self.evidence['parent'] = sha
+            self.evidence.update(phase='prepare', stage='plan')
             tags = self.git('show-ref', '--tags', '-d')
             if selected != (sha, tags):
                 self.git('checkout', '-B', 'main', sha)
                 plan = self.plan()
                 require(plan['HEAD_SHA'] == sha, 'plan-head-mismatch')
+                if re.fullmatch(RC, plan['TAG']):
+                    self.evidence['planned_tag'] = plan['TAG']
                 self.accept_rc(plan)
                 selected = sha, tags
             ci = self.api.run('ci.yml', sha, 'main')
@@ -254,6 +339,21 @@ class Release:
             if pending_retry and ci and ci['id'] == pending_retry[0] and ci['run_attempt'] <= pending_retry[1]:
                 require(self.clock() < pending_retry[2], 'tip-ci-retry-not-started')
                 ci_state = 'pending'
+            self.evidence['stage'] = 'tip-wait'
+            progress = (sha, plan['TAG'], ci_state, (ci or {}).get('id'), (ci or {}).get('run_attempt'),
+                        (ci or {}).get('status'), (ci or {}).get('conclusion'),
+                        smoke_state, (smoke or {}).get('id'), (smoke or {}).get('run_attempt'),
+                        (smoke or {}).get('status'), (smoke or {}).get('conclusion'))
+            if progress != last_progress:
+                print('release-auto: ' + json.dumps(dict(phase='prepare', stage='tip-wait', parent=sha,
+                      planned_tag=plan['TAG'], ci_state=ci_state, ci_run=(ci or {}).get('id'),
+                      ci_attempt=(ci or {}).get('run_attempt'), smoke_state=smoke_state,
+                      ci_status=(ci or {}).get('status'), ci_conclusion=(ci or {}).get('conclusion'),
+                      smoke_run=(smoke or {}).get('id'), smoke_attempt=(smoke or {}).get('run_attempt'),
+                      smoke_status=(smoke or {}).get('status'), smoke_conclusion=(smoke or {}).get('conclusion'),
+                      elapsed_seconds=round(self.clock() - started, 1), deadline_utc=deadline_utc,
+                      remaining_seconds=round(max(0, deadline - self.clock()), 1)), sort_keys=True), flush=True)
+                last_progress = progress
             if smoke_state == 'failed':
                 raise Stop('tip-smoke-failed')
             if ci_state == 'failed':
@@ -283,7 +383,7 @@ class Release:
                     raise Stop('tip-ci-retry-failed')
             elif ci_state == 'success' and smoke_state == 'success':
                 if self.clock() > deadline:
-                    raise Stop('tip-not-green-by-deadline', 'defer')
+                    raise Stop(deadline_reason, 'defer')
                 for retry in self.retries:
                     if retry['sha'] == sha and retry['run'] == ci['id'] and ci['run_attempt'] > retry['attempt']:
                         retry['result'] = 'passed on retry'
@@ -291,9 +391,11 @@ class Release:
                 plan = self.plan()
                 require(plan['HEAD_SHA'] == sha, 'plan-head-mismatch')
                 self.accept_rc(plan)
+                if self.config['scheduled'] and self.clock() > deadline:
+                    raise Stop(deadline_reason, 'defer')
                 return sha, plan
             if self.clock() >= deadline:
-                raise Stop('tip-not-green-by-deadline', 'defer')
+                raise Stop(deadline_reason, 'defer')
             self.sleep(min(interval, max(0, deadline - self.clock())))
 
     def chart(self, ref, tag):
@@ -320,7 +422,10 @@ class Release:
     def prepare(self, directory):
         cfg = self.config
         if cfg['kind'] == 'rc':
+            self.evidence.update(phase='prepare', stage='preconditions')
             parent, plan = self.tip()
+            if cfg['scheduled']:
+                nightly_cutoff(cfg['created_at'], self.wall_time())
             before = self.remote()
             require(before['main'] == parent, 'main-race')
             tag = plan['TAG']
@@ -328,10 +433,11 @@ class Release:
             if cfg['abandon']:
                 args.append('--skip-promote')
             try:
-                self.run(*args, timeout=600)
+                self.cut(args, directory, tag)
             except Stop:
                 require(self.remote()['main'] == parent, 'main-race')
                 raise
+            self.evidence['stage'] = 'metadata-verification'
             release = self.git('rev-parse', 'HEAD')
             require(self.git('rev-list', '--parents', '-n', '1', release).split() == [release, parent], 'prepared-parent-mismatch')
             self.run('python3', '-I', 'scripts/release-ci-coverage.py', 'metadata', parent, release)
@@ -339,6 +445,8 @@ class Release:
             require(tag not in before['tags'], 'target-tag-exists')
             self.git('tag', '-a', tag, '-m', tag, release)
         else:
+            self.evidence.update(phase='prepare', stage='candidate-validation',
+                                 planned_tag=cfg['rc_tag'].split('-rc.')[0])
             self.git('fetch', '--prune', '--tags', 'origin')
             # Read discovery fields only: RC no-op/main-note/runtime guards do not
             # govern promotion of an already published, pinned candidate.
@@ -353,7 +461,8 @@ class Release:
             base = cfg['rc_tag'][1:].split('-rc.')[0]
             tag = 'v' + base
             require(tag not in before['tags'] and (not before['previous_stable'] or version(before['previous_stable']) < version(tag)), 'stable-superseded')
-            self.run('bash', CUTTER, base, '--promote-only', '--ci', timeout=600)
+            self.cut(['bash', CUTTER, base, '--promote-only', '--ci'], directory, tag)
+            self.evidence['stage'] = 'metadata-verification'
             release = self.git('rev-parse', '--verify', f'refs/tags/{tag}^{{commit}}')
             require(self.git('rev-list', '--parents', '-n', '1', release).split() == [release, parent], 'promotion-parent-mismatch')
             self.run('python3', '-I', 'scripts/release-ci-coverage.py', 'metadata', parent, release)
@@ -361,11 +470,13 @@ class Release:
         after = self.remote()
         # Stable publication is pinned to the candidate and never depends on main.
         require((after == before) if cfg['kind'] == 'rc' else (after['tags_digest'] == before['tags_digest']), 'release-ref-race')
+        self.evidence['stage'] = 'bundle'
         self.git('update-ref', 'refs/heads/release-auto-prepared', release)
         directory.mkdir(parents=True, exist_ok=True)
         bundle = directory / 'release.bundle'
         self.git('bundle', 'create', str(bundle), 'refs/heads/release-auto-prepared', f'refs/tags/{tag}', '^' + parent)
         result = dict(outcome='prepared', reason='ready', parent=parent, release=release, tag=tag,
+                      phase='prepare', stage='complete', planned_tag=tag,
                       digest=hashlib.sha256(bundle.read_bytes()).hexdigest(),
                       tag_oid=self.git('rev-parse', f'refs/tags/{tag}'))
         result.update({key: before[key] for key in ('previous_rc', 'previous_rc_sha', 'previous_stable', 'previous_stable_sha')})
@@ -378,6 +489,9 @@ class Release:
         result['audit_head'] = audit_head
         result['changes'] = json.dumps(self.changes(boundary, audit_head)) if boundary else '[]'
         result['retry_log'] = json.dumps(self.retries)
+        for key in ('uncited', 'uncited_count', 'uncited_truncated'):
+            if key in self.evidence:
+                result[key] = self.evidence[key]
         (directory / 'retries.json').write_text(json.dumps(self.retries, indent=2))
         return result
 
@@ -394,7 +508,12 @@ def main():
             append_watch_log(Path(os.environ['RUNNER_TEMP']) / 'release-watch.log', Path(os.environ['GITHUB_STEP_SUMMARY']))
             return 0
         if args.mode == 'authorize':
-            result = dict(outcome='authorized', kind=cfg['kind'], created_at=created_at(os.environ))
+            if cfg['scheduled'] and not cfg['nightly_enabled']:
+                result = dict(outcome='no-op', reason='nightly-disabled', kind='rc', phase='authorize')
+            else:
+                result = dict(outcome='authorized', kind=cfg['kind'], created_at=created_at(os.environ))
+                if cfg['scheduled']:
+                    nightly_cutoff(result['created_at'], time.time())
         elif args.mode == 'prepare':
             require(os.environ.get('GITHUB_RUN_ATTEMPT') == '1', 're-dispatch-required')
             directory = Path(os.environ['RUNNER_TEMP']) / 'release-auto'
@@ -416,7 +535,7 @@ def main():
         if result['reason'] == 're-dispatch-required':
             print('Re-dispatch instead of rerunning prepare or push.', file=sys.stderr)
         print(str(error)[-8192:], file=sys.stderr)
-        return 1
+        return 0 if result['outcome'] == 'no-op' else 1
 
 
 if __name__ == '__main__':

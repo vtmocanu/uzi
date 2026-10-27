@@ -167,4 +167,8 @@ and no countdown — see
 
 A `limit_wait` park (this page) happens *to* the run — its provider usage window was exhausted — and it is scheduled to resume on its own, with a fresh clock, after the reset or bounded fallback. An [ordinary pause](run-pause.md) can be requested by the owner or the run's lead; it waits for owner resume, handing back exactly the budget that was left rather than a fresh clock. The two can overlap: a pause requested while a run is still `running` survives a `limit_wait` park that overtakes it, and takes effect at the first boundary once the run is working again — you don't have to ask twice.
 
+## Not the same as the weekly usage reserve
+
+A `limit_wait` park reacts to a provider's *actual* limit: the window was exhausted and the provider refused. The [weekly usage reserve](rate-limits.md#weekly-usage-reserve) is your own earlier stop: an opt-in threshold on the 7-day window at which uzi holds new work and, optionally, pauses running runs before the provider refuses. A held run stays `queued` and a reserve pause is a [`weekly_reserve` pause](run-pause.md#paused-by-the-weekly-usage-reserve); neither uses the wait count, the fresh clock a `limit_wait` resume grants, or the `limit_wait` status.
+
 Related: [Claude rate limits](rate-limits.md) · [Anthropic tokens](anthropic-token.md) · [Run health](run-health.md) · [Pausing and resuming a run](run-pause.md) · [Configuration](configuration.md) · [Slack notifications](slack.md) · [Recovering from a transient interruption](run-recovery-wait.md)

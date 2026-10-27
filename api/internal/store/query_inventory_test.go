@@ -1034,6 +1034,9 @@ var queryInventory = []queryPin{
 			"(TestMaintenanceReadoutCapLiveDB asserts the row cap)"},
 	{"ListMaintenanceIdleBoundWorkers", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
 		"reached through store.ReadMaintenanceReadout; asserts the idle-bound worker section"},
+	{"ListRunAdmissionQueueReasons", "intake_pause.sql", "TestCodexAdmissionReadProjectionsLiveDB",
+		"../handler: executed indirectly through h.overlayQueueReasons; asserts owner class and " +
+			"eligibility time, foreign-admin privacy, expiry, and maintenance precedence"},
 	{"ListRunQueueReasons", "intake_pause.sql", "TestQueueReasonLiveDB",
 		"../handler: runs_dto.go batch lookup behind the run reads; asserts queue_reason for queued " +
 			"runs while paused and its absence once lifted. Also called from workersvc/jobs.go"},

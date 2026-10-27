@@ -19,6 +19,19 @@ vi.mock("../../lib/api", async (importOriginal) => {
 });
 const mockApi = vi.mocked(api);
 
+describe("PlanPanel ignored inference evidence",()=>{
+  it("shows ignored-only observations without requiring a worker capability",()=>{
+    render(<PlanPanel run={run({required_capabilities:[],required_tools:[],capability_provenance:{
+      hints_known:true,inference_known:true,capabilities:[{capability:"docker",sources:["inferred"],required:false,inference_ignored:true,
+        triggers:[{path:"Dockerfile",reason:"docker_marker"}],truncated:false}],
+    }})} busy={false} canSteer onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.getByText("Run requirements")).toBeTruthy();
+    expect(screen.getByText(/inferred; inference ignored; not currently required/)).toBeTruthy();
+    expect(screen.queryByText(/Provision or start a worker/)).toBeNull();
+    expect(screen.queryByRole("button",{name:/Run without/})).toBeNull();
+  });
+});
+
 beforeEach(() => {
   // The gate picker's seed loads the user's Anthropic tokens (self-fetch path).
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });

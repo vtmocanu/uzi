@@ -402,7 +402,9 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // worker never sends the snapshot — the same shape an old worker sees.
 func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []string {
 	groups := [][]string{
+		{workersvc.CapabilityEvidenceFeature},
 		{"heartbeat_protocol_refresh_v1"},
+		{"codex_account_admission_signal_v1"},
 		{"completion_non_closing_v1"},
 		{"refresh_publication_context_v1"},
 		{"completion_semantic_publication_v1"}, // PRD #1230 D4: independent of completion_non_closing_v1; advertises the semantic coverage park report
@@ -1384,12 +1386,12 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// recovery and the next claim re-presents. The run may already be failed when the
 		// refusal cap was reached.
 		if errors.Is(err, workersvc.ErrStaleRevisionSource) {
-			httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues), "reason": "stale_revision_source"})
+			httpx.JSON(w, http.StatusConflict, map[string]any{"run": h.workerRunDTO(r.Context(), run), "reason": "stale_revision_source"})
 			return
 		}
 		if reason, ok := workersvc.GatePresentationRefusalReason(err); ok {
 			httpx.JSON(w, http.StatusConflict, map[string]any{
-				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues),
+				"run":    h.workerRunDTO(r.Context(), run),
 				"reason": reason,
 			})
 			return
@@ -1406,7 +1408,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// bodies cannot drift or swap; a non-forge-park error returns ok=false and falls through.
 		if reason, ok := forgeParkRefusalReason(err); ok {
 			httpx.JSON(w, http.StatusConflict, map[string]any{
-				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues),
+				"run":    h.workerRunDTO(r.Context(), run),
 				"reason": reason,
 			})
 			return
@@ -1419,7 +1421,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// disposition shape) so the worker fills the missing seqs and re-reports. SetState returns
 			// the run alongside the error.
 			httpx.JSON(w, http.StatusConflict, map[string]any{
-				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues),
+				"run":    h.workerRunDTO(r.Context(), run),
 				"reason": "messages_pending",
 			})
 		case errors.Is(err, workersvc.ErrGapUnrecoverable):
@@ -1439,7 +1441,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// worker that ignores the extra field still treats it as "changed nothing"); the
 			// disposition is what distinguishes a stale claim from a benign no-op.
 			httpx.JSON(w, http.StatusConflict, map[string]any{
-				"run":         runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues),
+				"run":         h.workerRunDTO(r.Context(), run),
 				"disposition": "stale_claim",
 			})
 		case errors.Is(err, workersvc.ErrRunNotOwned):
@@ -1581,7 +1583,7 @@ func (h *Handler) workerStateAck(w http.ResponseWriter, r *http.Request, run sto
 	if pending != nil {
 		w.Header().Set(apitypes.CompletionPendingHeader, apitypes.CompletionPendingVersion)
 	}
-	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
+	dto := h.workerRunDTO(r.Context(), run)
 	dto.CompletionPending = pending
 	ack := map[string]any{"run": dto}
 	if sig := workersvc.PendingCredentialSwitchSignal(run); sig != nil {
@@ -2129,10 +2131,10 @@ func (h *Handler) WorkerRunCompletionHold(w http.ResponseWriter, r *http.Request
 		// The hold's guard refused (wrong status, not interlocked, or no recorded completion
 		// attempt): 409 with the run's REAL status, which the worker reads off the body and
 		// retains the run on (it cleans up ONLY on a `paused` ack).
-		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
+		httpx.JSON(w, http.StatusConflict, map[string]any{"run": h.workerRunDTO(r.Context(), run)})
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": h.workerRunDTO(r.Context(), run)})
 }
 
 // WorkerRunWallPark is the wall-clock PARK endpoint (PRD #1497 M1, D4/D15): the worker reports it
@@ -2187,10 +2189,10 @@ func (h *Handler) WorkerRunWallPark(w http.ResponseWriter, r *http.Request) {
 	if !applied {
 		// The park was refused (the owner extended in the window, or the run moved on): 409 with the
 		// run's REAL status, which the worker reads off the body to clear the wall mode and restart.
-		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
+		httpx.JSON(w, http.StatusConflict, map[string]any{"run": h.workerRunDTO(r.Context(), run)})
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": h.workerRunDTO(r.Context(), run)})
 }
 
 // workerMemoryToDTO maps a stored entry to the worker-facing DTO. It carries run_id
@@ -2442,4 +2444,16 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 		out["skipped"] = res.Skipped
 	}
 	httpx.JSON(w, http.StatusOK, out)
+}
+
+// workerRunDTO is the run body every worker-facing response carries. It is runToDTO with the hold
+// reason passed through workersvc.WorkerVisibleHoldReason and the pending pause mode through
+// workersvc.WorkerVisiblePauseMode, so the weekly usage reserve's request reads as an ordinary
+// 'milestone' request and its park as an ordinary pause (null hold) to the agent; owner-facing DTOs
+// keep using runToDTO directly.
+func (h *Handler) workerRunDTO(ctx context.Context, run store.Run) apitypes.RunDTO {
+	dto := runToDTO(run, h.runPriorityClass(ctx, run), h.cfg.RunTimeout, h.runExtensionCapSeconds(ctx), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
+	dto.HoldReason = workersvc.WorkerVisibleHoldReason(dto.HoldReason)
+	dto.PauseMode = workersvc.WorkerVisiblePauseMode(dto.PauseMode)
+	return dto
 }

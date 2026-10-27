@@ -97,6 +97,25 @@ alongside the plan, between the proposed milestones and the plan body:
   only, never blocking.
 - The size estimate, as a small badge.
 
+### Why a capability is required
+
+The run detail's read-only **Capability sources** section remains available while
+the run is running and after it finishes, including autopilot runs. At approval,
+the same information appears in **Run requirements**. Sources can be the repo hint,
+inference, or both. Expand a source to see sampled repo-relative
+trigger paths and the detector rule they matched. Ignored inferences appear as
+non-blocking observations; an explicit hint can still keep that capability required.
+Demo mode hides trigger paths.
+
+Evidence is bounded to three triggers per capability and 512 UTF-8 bytes per path.
+A truncation note signals omitted entries. The latest accepted plan scan replaces
+the observations; replaying a gate preserves them. Evidence is display-only and
+does not change approval identity, scheduling or runtime guardrails.
+
+Runs retain the hint captured at creation. Older runs or workers can have unknown
+provenance or unavailable paths; current repo settings do not fill in that history.
+New workers send evidence when the API advertises support. Older workers keep working.
+
 ### Overriding a false-positive inference
 
 For a recurring false positive, open the repo's **Tools** panel and select

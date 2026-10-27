@@ -134,7 +134,8 @@ type ClaimPayload struct {
 	// (no requeue writer touches them), so a worker that dies with a pause pending re-arms it
 	// on resume — the re-claim seeds the flag, and pause_after_count still compares against the
 	// monotone milestones_completed. PausePending is (pause_requested_at IS NOT NULL);
-	// PauseMode passes the mode through ('milestone'|'now'), empty/omitted when none is
+	// PauseMode passes the mode through ('milestone'|'now'|'wall'; the weekly reserve's
+	// own 'reserve' request is served as 'milestone', servedPauseMode), empty/omitted when none is
 	// pending. Additive on the wire — an old worker ignores both keys.
 	// ParkRunSupported negotiates the protocol for the entire flight; endpoint
 	// authorization independently checks its current phase and persisted plan.

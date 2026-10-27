@@ -742,6 +742,12 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
     case "pause_cancel": {
       if (run.status !== "running" || !run.pause_requested_at)
         return { status: 409, message: "no pause is pending" };
+      // PRD #3522: the weekly usage reserve's request is not the owner's to withdraw.
+      if (run.pause_mode === "reserve")
+        return {
+          status: 409,
+          message: "this pause was requested by your weekly usage reserve; resume the run once it parks, or change the threshold in Run defaults",
+        };
       // Clear ONLY the park timer — leave the execution timers running so the interrupted
       // script continues (finding [4]: clearing them left the run permanently `running` with
       // no activity, a cancelled pause that silently killed the run).

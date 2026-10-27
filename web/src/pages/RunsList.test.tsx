@@ -2107,3 +2107,15 @@ describe("RunRow rejection presentation", () => {
     expect(screen.getByText(label).classList.contains(tone === "neutral" ? "text-neutral-fg" : "text-danger")).toBe(true);
   });
 });
+
+
+it.each([["rate_limit", "a rate limit"], ["overload", "overload"]] as const)("Codex admission run list row shows %s from a summary", (cls, words) => {
+  const at = "2026-07-05T12:05:37Z";
+  const { container, rerender } = render(<MemoryRouter><ul><RunRow run={aRun({ status: "queued", health: "waiting_worker",
+    codex_admission_class: cls, codex_admission_eligible_at: at })} now={Date.parse("2026-07-05T12:04:00Z")} /></ul></MemoryRouter>);
+  expect(container.textContent).toContain(`waiting: provider reported ${words}; account admission eligible after ${at}`);
+  rerender(<MemoryRouter><ul><RunRow run={aRun({ status: "queued", health: "waiting_worker",
+    codex_admission_class: cls, codex_admission_eligible_at: at })} now={Date.parse(at)} /></ul></MemoryRouter>);
+  expect(container.textContent).toContain("waiting for worker");
+  expect(container.textContent).not.toContain("provider reported");
+});

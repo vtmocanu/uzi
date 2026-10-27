@@ -2818,4 +2818,4 @@ land.
 
 ## Release authorization
 
-The dispatch-only release workflow isolates App credentials from repository code: preparation uses the shared cutter and coverage policy, then a separate job validates a bundle and atomically pushes permitted refs. RC and stable use separate principals; stable requires an Environment reviewer. The local fallback remains. [ADR-3512](adr/3512-release-automation.md) records the accepted main-write trust boundary, staged rollout and deferred recovery work.
+The release workflow (manual dispatch and opt-in nightly RCs) isolates App credentials from repository code: preparation uses the shared cutter and coverage policy, then a separate job validates a bundle and atomically pushes permitted refs. RC and stable use separate principals; stable requires an Environment reviewer. The local fallback remains. [ADR-3512](adr/3512-release-automation.md) records the accepted main-write trust boundary, staged rollout and deferred recovery work.

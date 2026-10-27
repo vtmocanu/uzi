@@ -170,6 +170,11 @@ var (
 	// ErrNoPausePending rejects a `pause_cancel` (PRD #1190 M1) when no pause is pending on a
 	// still-running run → 409. A 0-row CancelPauseInput is the only cause.
 	ErrNoPausePending = errors.New("no pause is pending")
+	// ErrReservePausePending rejects a `pause_cancel` (PRD #3522 M4a) while the pending pause is
+	// the weekly usage reserve's own request → 409. The reserve withdraws its request itself (threshold
+	// cleared or raised past the reading, pause toggle off, a fresh reading below the threshold); the
+	// owner's levers are the threshold and, once the run parks, resume.
+	ErrReservePausePending = errors.New("the weekly usage reserve requested this pause, so it cannot be cancelled here: raise or clear the threshold in your usage settings to withdraw it, or resume the run once it pauses")
 	// ErrScopeNotMilestoneRun rejects a `scope` (PRD #634 M2) on a run that is not a
 	// milestone-structured issue run (kind='issue' with a non-empty frozen milestone
 	// list) → 409. A scope ceiling bounds how many of the frozen milestones the run may
@@ -1596,6 +1601,15 @@ type Params struct {
 	// disabled (R2) — degraded, never wrong, and never a spend against a credential
 	// nobody chose.
 	Autoselect autoselect.Policy
+
+	// UsagePollInterval and CodexUsagePollInterval are the Claude and Codex usage poll cadences
+	// (config.UsagePollInterval / CodexUsagePollInterval): the weekly usage reserve (PRD #3522)
+	// treats a reading older than three of them as stale (usagereserve.Stale), the same rule the
+	// rate-limit surfaces apply. Zero (a poller disabled, or a forgotten field) makes every reading
+	// stale, so a user WITH a threshold reads "unknown" and is held, never silently unprotected;
+	// a user without one is unaffected.
+	UsagePollInterval      time.Duration
+	CodexUsagePollInterval time.Duration
 
 	// Anthropic usage-limit park (PRD #35), mirrored from config. RunLimitMaxWaits
 	// caps parks PER RUN; RunLimitMaxPark caps how far out ONE park may reach.
@@ -3367,6 +3381,21 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		custodyLimit = n
 	}
 	claimNow := s.now()
+	// PRD #3522 M3: the weekly usage reserve, read ONCE per claim. An owner with no threshold costs
+	// exactly one settings read (the OFF snapshot); an owner with one also reads their token and
+	// Codex readings and their workers' lanes. The snapshot feeds ClaimRun's reserve clause below
+	// and rides the context into assembly, so the credential the claim finally spends is checked
+	// against the SAME reading that admitted it. A read failure fails the claim closed (the handler
+	// answers 500 and the run stays queued), like the custody limit.
+	reserve, rerr := s.reserveSnapshot(ctx, wkr.UserID, claimNow)
+	if rerr != nil {
+		return nil, rerr
+	}
+	reservePeers, rerr := s.reserveBlockedWorkers(ctx, reserve)
+	if rerr != nil {
+		return nil, rerr
+	}
+	ctx = withReserveSnapshot(ctx, reserve)
 	// Issue #3142: the memory-authority gate applies to the run/ordinary lanes only (the
 	// cross_check lane never reaches a memory runtime). claimRunInTx recomputes it from the
 	// locked re-read capabilities. A held report clears the visibility entry; an absent
@@ -3448,6 +3477,14 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		// custom (non-curated) effective root then requires codex_custom_model_v1. Sorted server-side.
 		CodexCuratedModels: codexCuratedModelsSlice(),
 	}
+	reserveClaimParams(&params, reserve, wkr, reservePeers, claimNow)
+	// PRD #3522 M4a: the queued runs whose manual-resume exemption the reading-aware rule has ended
+	// early; ClaimRun's time-only test cannot see that.
+	ended, rerr := s.reserveEndedOverrides(ctx, reserve, claimNow)
+	if rerr != nil {
+		return nil, rerr
+	}
+	params.ReserveOverrideEnded = ended
 
 	// Bodyless claims also lock and re-read the worker in a separate statement.
 	// This serializes both lane and legacy child occupancy before ClaimRun's snapshot.
@@ -4189,16 +4226,18 @@ type StateRequest struct {
 	// worker sends each array only when non-empty. UNTRUSTED on arrival — every name is
 	// Filter-ed / FilterTools-ed against the server-owned vocabulary before storage
 	// (capability package), and SizeClass is clamped to {"s","m","l"}, so a garbled
-	// report cannot smuggle arbitrary strings into the requirement panel. Ignored on
-	// every non-`awaiting_approval` report.
+	// report cannot smuggle arbitrary strings into the requirement panel. Consumed by
+	// awaiting_approval and plan-bearing autopilot running reports.
 	//
 	// required_capabilities is UNION-MERGED onto the M2 repo hint (escalation-only:
 	// inference can add, never drop); required_tools is SET. size_class is SET the same
 	// way (PRD #84 M4 4b): the clamped value REPLACES the run's size_class column, and a
 	// nil / off-vocabulary value COALESCEs to a no-op. A later unit surfaces it on the DTO.
 	RequiredCapabilities *[]string `json:"required_capabilities"`
-	RequiredTools        *[]string `json:"required_tools"`
-	SizeClass            *string   `json:"size_class"`
+	// Optional, display-only raw detector observations; never part of gate identity.
+	CapabilityInferenceEvidence json.RawMessage `json:"capability_inference_evidence,omitempty"`
+	RequiredTools               *[]string       `json:"required_tools"`
+	SizeClass                   *string         `json:"size_class"`
 	// RecoveryCause is the worker's TYPED cause for a 'recovery_wait' park (PRD #1392 M1).
 	// UNTRUSTED free text on arrival: SetState validates it against the server enum
 	// {forge_unreachable, empty_turn, provider_outage, vault_locked, data_volume_full} BEFORE any
@@ -4894,6 +4933,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// it for them). Absent on every ordinary session-id/iteration heartbeat, so those
 		// stay no-ops.
 		runningParams.InferredCapabilities, runningParams.InferredTools, runningParams.SizeClass = inferredRequirementParams(req)
+		runningParams.CapabilityInferenceEvidence = capabilityEvidenceParam(req)
 		// PRD #628 M4: a cross-worker re-claim that reseeded from the DEFAULT branch recovered
 		// no committed work, so pass-1's milestones_completed is stale — it must be cleared,
 		// NOT unioned onto. milestones_completed is a monotone union (SetRunRunning below,
@@ -4955,11 +4995,12 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// non-empty candidate to `[]` (no superseded criteria freeze), and after a REJECTED list
 			// (stored candidate NULL beside a stored plan_md) it stays NULL: nothing freezes and the
 			// run holds at finalize.
-			MilestonesCandidate:  reportPlanMilestonesParam(owned, req),
-			InferredCapabilities: inferredCaps,
-			InferredTools:        inferredTools,
-			SizeClass:            sizeClass,
-			PlanChangedFiles:     planChangedFilesParam(req.PlanChangedFiles),
+			MilestonesCandidate:         reportPlanMilestonesParam(owned, req),
+			InferredCapabilities:        inferredCaps,
+			CapabilityInferenceEvidence: capabilityEvidenceParam(req),
+			InferredTools:               inferredTools,
+			SizeClass:                   sizeClass,
+			PlanChangedFiles:            planChangedFilesParam(req.PlanChangedFiles),
 		}
 		// PRD #1795 M1: classify the report under the run-row lock BEFORE any write (see
 		// gate_revision.go). The effective presented payload is computed in Go, so a conflict
@@ -6328,7 +6369,7 @@ func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid
 	// hold or released claim after a lost ACK. All fields come from this same read.
 	if run.HoldReason.Valid {
 		reason := run.HoldReason.String
-		holdReason = &reason
+		holdReason = WorkerVisibleHoldReason(&reason)
 	}
 	return run.Status, retry, run.ClaimGeneration, holdReason, run.ClaimReleasedAt.Valid, run.GateRevision, nil
 }
@@ -8302,6 +8343,13 @@ type SweepResult struct {
 	// partial index this reads covers only parked runs, a set that is empty on a
 	// healthy instance.
 	LimitPromoted int64
+	// ReserveMarked is the number of queued runs whose weekly-reserve hold marker this pass wrote or
+	// cleared (PRD #3522 M3). Only changes count: an owner whose markers are already right adds 0.
+	ReserveMarked int64
+	// ReservePauseActed is the number of runs the weekly reserve's pause pass changed (PRD #3522
+	// M4a): a pause requested or withdrawn, a reserve pause released, an ended exemption dropped.
+	// Normally 0.
+	ReservePauseActed int64
 	// PoolResumed is the number of runs this pass reactively resumed from pool_wait to
 	// queued because their owner's token pool became non-empty (PRD #754 M5). At most
 	// ONE per distinct held-run owner per tick (the anti-stampede stagger), so on a

@@ -26,7 +26,7 @@ import (
 // SetUserDefaultEffort/SetUserJudgeModel/SetUserSummaryModel/SetUserTheme UPDATEs QueryRow a
 // single Text RETURNING column (discarded by the handler) and SetUserSidebarTokens a uuid[]
 // one; SetUserHarnessModels (PRD #1551 M1) PATCHes the harness, both lanes and the legacy
-// default_model in one conditional UPDATE; GetUserSettings QueryRows eighteen (default_model,
+// default_model in one conditional UPDATE; GetUserSettings QueryRows twenty (default_model,
 // default_effort, judge_model, summary_model, theme, sidebar_token_ids,
 // mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface — the four
 // appearance columns joined the read in PRD #1167 M1 — default_harness, which joined
@@ -44,6 +44,8 @@ type fakeSettingsDB struct {
 	theme           pgtype.Text
 	mrRework        pgtype.Bool
 	nowSummary      pgtype.Bool
+	weeklyPct       pgtype.Int2
+	weeklyPause     bool
 	sidebarIDs      []uuid.UUID
 	sidebarCodexIDs []uuid.UUID
 	apprMode        pgtype.Text
@@ -202,6 +204,8 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		theme:           f.theme,
 		mrRework:        f.mrRework,
 		nowSummary:      f.nowSummary,
+		weeklyPct:       f.weeklyPct,
+		weeklyPause:     f.weeklyPause,
 		sidebarIDs:      f.sidebarIDs,
 		sidebarCodexIDs: f.sidebarCodexIDs,
 		apprMode:        f.apprMode,
@@ -224,6 +228,8 @@ type fakeSettingsRow struct {
 	theme           pgtype.Text
 	mrRework        pgtype.Bool
 	nowSummary      pgtype.Bool
+	weeklyPct       pgtype.Int2
+	weeklyPause     bool
 	sidebarIDs      []uuid.UUID
 	sidebarCodexIDs []uuid.UUID
 	apprMode        pgtype.Text
@@ -262,7 +268,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[3].(*pgtype.Text); ok {
 			*p = r.typeface
 		}
-	case 18:
+	case 20:
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -325,6 +331,13 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		// now_summary_enabled (PRD #2603) rides the read as the 18th column.
 		if p, ok := dest[17].(*pgtype.Bool); ok {
 			*p = r.nowSummary
+		}
+		// weekly_reserve_pct and weekly_reserve_pause_running (PRD #3522) are columns 19 and 20.
+		if p, ok := dest[18].(*pgtype.Int2); ok {
+			*p = r.weeklyPct
+		}
+		if p, ok := dest[19].(*bool); ok {
+			*p = r.weeklyPause
 		}
 	}
 	return nil

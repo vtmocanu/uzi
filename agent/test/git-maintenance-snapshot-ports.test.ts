@@ -14,16 +14,28 @@ async function sourceAt(f: Fixture, clonePath: string) {
   const stat = await fs.lstat(clonePath, { bigint: true });
   return { ...f.source, clonePath, identity: stat.dev + ":" + stat.ino };
 }
-async function bytesIdentity(root: string): Promise<string> {
+async function bytesIdentity(root: string, labelRoot = root): Promise<string> {
   const hash = createHash("sha256");
   const walk = async (p: string): Promise<void> => {
     const stat = await fs.lstat(p, { bigint: true });
-    hash.update(p + ":" + stat.dev + ":" + stat.ino + ":" + stat.mode + ":" + stat.nlink);
+    hash.update(path.join(labelRoot, path.relative(root, p)) + ":" + stat.dev + ":" + stat.ino + ":" + stat.mode + ":" + stat.nlink);
     if (stat.isDirectory()) for (const name of (await fs.readdir(p)).sort()) await walk(path.join(p, name));
     else hash.update(await fs.readFile(p));
   };
   await walk(root);
   return hash.digest("hex");
+}
+
+async function refIdentity(bare: string): Promise<Array<[string, string | null]>> {
+  const result: Array<[string, string | null]> = [];
+  for (const name of ["HEAD", "refs", "packed-refs", "reftable"]) {
+    try { result.push([name, await bytesIdentity(path.join(bare, name), name)]); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      result.push([name, null]);
+    }
+  }
+  return result;
 }
 
 for (const allowed of [true, false]) {
@@ -174,7 +186,7 @@ for (const kind of ["bad identity", "relative", "unnormalized", "outside", "nest
     const objects = path.join(f.bare, "objects");
     const sourceObjects = path.join(f.clone, ".git", "objects");
     const sourceBefore = await bytesIdentity(sourceObjects);
-    const canonicalRefs = await f.refs();
+    const canonicalRefs = await refIdentity(f.bare);
     let substituted = false;
     if (kind === "bad identity") {
       // knownBase.identity is no longer an input. Substitute the real canonical
@@ -210,6 +222,7 @@ for (const kind of ["bad identity", "relative", "unnormalized", "outside", "nest
       else if (kind === "control directory") await fs.mkdir(control);
       else await fs.writeFile(control, sourceObjects + "\n");
     }
+    const controlBefore = control ? await fs.lstat(control, { bigint: true }) : undefined;
     // The importer pins the required canonical pack directory; arbitrary base
     // object contents are outside its integrity contract. Keep the special-node
     // attack in the canonical object store, at that actually consumed entry.
@@ -243,6 +256,11 @@ for (const kind of ["bad identity", "relative", "unnormalized", "outside", "nest
     assert.equal(siblingAttempted, occupiedSibling, "occupied private sibling is actually checked");
     assert.equal(substituted, kind === "bad identity");
     assert.equal(controlOpened, false, "canonical alternate controls are refused without opening");
+    if (controlBefore) {
+      const after = await fs.lstat(control!, { bigint: true });
+      assert.deepEqual([after.dev, after.ino, after.mode], [controlBefore.dev, controlBefore.ino, controlBefore.mode],
+        "refusal retains the alternate control's inode and mode");
+    }
     assert.equal(f.requests.length, 0, "no Git launched or partial source handed off");
     assert.equal(f.pairs(), 0);
     assert.equal(await bytesIdentity(sourceObjects), sourceBefore, "all source bytes and identities retained");
@@ -253,10 +271,10 @@ for (const kind of ["bad identity", "relative", "unnormalized", "outside", "nest
       assert.deepEqual(await fs.readdir(f.request.outDir), ["proof"]);
       if (kind === "sibling symlink") assert.equal(await fs.readlink(sibling), sourceObjects);
     } else await assert.rejects(fs.lstat(f.request.outDir), { code: "ENOENT" });
-    // Path substitutions intentionally invalidate f.bare; inspect the same real
-    // repository through its surviving name to verify no refs changed.
+    // Compare ref bytes and identities without asking Git to open the poisoned
+    // object store. Stable relative labels also allow the deliberate bare rename.
     const retainedBare = kind === "basename" ? original.barePath : f.bare;
-    assert.equal(await f.native(retainedBare, ["for-each-ref", "--format=%(refname) %(objectname)"]), canonicalRefs);
+    assert.deepEqual(await refIdentity(retainedBare), canonicalRefs, "refusal preserves canonical refs");
     assert.equal(f.joined(), 0);
   });
 }

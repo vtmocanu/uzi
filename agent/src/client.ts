@@ -1,3 +1,5 @@
+import { CodexAdmissionReporter } from "./codex/admission-signal.js";
+import { selectCodexBinding } from "./codex/select.js";
 import { createHash } from "node:crypto";
 import { decodeCodeCoverage, type CodeCoverage } from "./code-cross-check-coverage.js";
 import { decodePublicationContext, validatePublicationContextRequest } from "./publication-context.js";
@@ -16,6 +18,7 @@ import type { ResidueQuarantineState } from "./residue-quarantine.js";
 import type { UsageWireRequest } from "./usage-recorder.js";
 import {
   WORKER_API_PREFIX,
+  CAPABILITY_INFERENCE_EVIDENCE_FEATURE,
   type MemoryBinding,
   type MemoryPolicy,
   type MemoryOutcome,
@@ -1289,6 +1292,87 @@ export class WorkerClient {
    * A stripped rollback success clears it; later ordinary ticks can rediscover it.
    */
   private serverFeatures = new Set<string>();
+  private readonly codexAdmission = new Map<string, { generation: number; reporter: CodexAdmissionReporter }>();
+  private readonly codexAdmissionClosed = new Map<string, number>();
+  private codexAdmissionEpoch = {};
+
+  /** Only an owned subscription claim grants observation authority to advice producers. */
+  codexAdmissionReporter(runId: string, generation?: number): CodexAdmissionReporter | undefined {
+    const owned = this.codexAdmission.get(runId);
+    return owned && owned.generation === generation ? owned.reporter : undefined;
+  }
+
+  private markCodexAdmissionClosed(runId: string, generation: number): void {
+    this.codexAdmissionClosed.set(runId, Math.max(this.codexAdmissionClosed.get(runId) ?? 0, generation));
+    if (this.codexAdmissionClosed.size > 1024) {
+      this.codexAdmissionClosed.delete(this.codexAdmissionClosed.keys().next().value!);
+      // Claims issued before forgetting a generation cannot restore its authority.
+      this.codexAdmissionEpoch = {};
+    }
+  }
+
+  private retireCodexAdmission(runId: string, expected: { generation: number; reporter: CodexAdmissionReporter } | undefined): void {
+    if (!expected || this.codexAdmission.get(runId) !== expected) return;
+    expected.reporter.seal(true);
+    this.codexAdmission.delete(runId);
+    this.markCodexAdmissionClosed(runId, expected.generation);
+  }
+
+  private bindCodexAdmission(claim: ClaimResponse, epoch: object): void {
+    if (epoch !== this.codexAdmissionEpoch || !this.hasFeature("codex_account_admission_signal_v1") || !claim || !terminalUUID(claim.run_id) || !Number.isSafeInteger(claim.claim_generation) ||
+        (claim.claim_generation ?? 0) <= 0) return;
+    const runId = claim.run_id;
+    const generation = claim.claim_generation!;
+    const prior = this.codexAdmission.get(runId);
+    if ((this.codexAdmissionClosed.get(runId) ?? 0) >= generation || (prior && prior.generation > generation)) return;
+    let eligible = claim.kind !== "job" && claim.kind !== "chat";
+    try {
+      const selected = selectCodexBinding(claim.secrets);
+      eligible &&= selected.kind === "codex" && selected.binding.authMode === "subscription";
+    } catch { eligible = false; }
+    if (!eligible) {
+      this.retireCodexAdmission(runId, prior);
+      this.markCodexAdmissionClosed(runId, generation);
+      return;
+    }
+    if (prior?.generation === generation) return;
+    if (!prior && this.codexAdmission.size >= 1024) {
+      // Refusals also fence older requests still in flight when capacity opens.
+      this.markCodexAdmissionClosed(runId, generation);
+      return;
+    }
+    this.retireCodexAdmission(runId, prior);
+    const reporter = new CodexAdmissionReporter(generation,
+      () => this.hasFeature("codex_account_admission_signal_v1"),
+      async (body, signal) => {
+        // Dedicated transport; no state retries, error bodies or Retry-After parsing.
+        const response = await (this.transport ?? fetch)(
+          this.baseUrl + WORKER_API_PREFIX + "/runs/" + encodeURIComponent(runId) + "/codex/admission-signal",
+          { method: "POST", headers: { Authorization: "Bearer " + this.token,
+            "Content-Type": "application/json", "X-Client-Version": this.version },
+            body: JSON.stringify(body), signal });
+        if ([401, 403, 404].includes(response.status)) this.retireCodexAdmission(runId, owned);
+        void response.body?.cancel().catch(() => {});
+        return response.status;
+      });
+    const owned = { generation, reporter };
+    this.codexAdmission.set(runId, owned);
+  }
+
+  private sealCodexAdmission(path: string, body: unknown): void {
+    const match = /^\/api\/worker\/runs\/([^/]+)\/(state|cross-check-verdict|wall-park|pause|completion\/hold|base-attestation-hold|completion\/attempt|archives\/release)$/.exec(path);
+    if (!match || !isRecord(body)) return;
+    const runId = decodeURIComponent(match[1]!);
+    const owned = this.codexAdmission.get(runId);
+    if (!owned || (body.claim_generation ?? body.generation) !== owned.generation) return;
+    const endpoint = match[2];
+    const close = endpoint === "state"
+      ? !["running", "awaiting_approval"].includes(String(body.status))
+      : endpoint === "completion/attempt" ? false
+      : endpoint === "pause" ? false : true;
+    if (close) this.retireCodexAdmission(runId, owned);
+    else owned.reporter.seal();
+  }
   private memoryRegistrationRevision = 0;
   private memoryIncarnationValue: MemoryIncarnation | undefined;
   private memoryInvalidationListener: (() => void) | undefined;
@@ -1420,6 +1504,10 @@ export class WorkerClient {
 
   private replaceServerFeatures(features: readonly string[]): void {
     this.serverFeatures = new Set(features);
+    if (!this.hasFeature("codex_account_admission_signal_v1")) {
+      this.codexAdmissionEpoch = {};
+      for (const owned of this.codexAdmission.values()) owned.reporter.seal();
+    }
     if (!this.serverFeatures.has("worker_memory_pressure_v1")) this.revokeMemoryOnlyAuthority();
   }
 
@@ -1449,6 +1537,8 @@ export class WorkerClient {
     initialSnapshot?: ActiveSnapshot,
     maxCrossCheckSlots?: number,
   ): Promise<RegisterResponse> {
+    this.codexAdmissionEpoch = {};
+    for (const owned of this.codexAdmission.values()) owned.reporter.seal();
     this.revokeInterruptedCallsAuthority();
     const interruptedEpoch = this.interruptedEpoch;
     const memoryRevision = ++this.memoryRegistrationRevision;
@@ -1568,6 +1658,8 @@ export class WorkerClient {
    *  rollback fallback succeeds, later ordinary heartbeat adverts can repopulate it. */
   clearFeatures(): void {
     this.serverFeatures.clear();
+    this.codexAdmissionEpoch = {};
+    for (const owned of this.codexAdmission.values()) owned.reporter.seal();
     this.revokeMemoryAuthority();
     this.latestDindMaintenanceValue = undefined;
   }
@@ -1577,6 +1669,10 @@ export class WorkerClient {
    *  closes and every other negotiated extension stays on. */
   dropFeature(f: string): void {
     this.serverFeatures.delete(f);
+    if (f === "codex_account_admission_signal_v1") {
+      this.codexAdmissionEpoch = {};
+      for (const owned of this.codexAdmission.values()) owned.reporter.seal();
+    }
     if (f === "worker_memory_pressure_v1") this.revokeMemoryOnlyAuthority();
   }
 
@@ -1758,6 +1854,7 @@ export class WorkerClient {
   }
 
   private async claimRunLane(path: string, activeSnapshot: ActiveSnapshot | undefined, signal: AbortSignal | undefined, timeoutMs: number, dedicated = false): Promise<ClaimResponse | null> {
+    const admissionEpoch = this.codexAdmissionEpoch;
     const incarnation = this.completionIncarnation;
     const ticket = this.beginCompletionObservation();
     try {
@@ -1871,6 +1968,7 @@ export class WorkerClient {
             (prior !== undefined && JSON.stringify(prior) !== JSON.stringify(next)) ? null : next);
         }
       }
+      this.bindCodexAdmission(claim, admissionEpoch);
       return claim;
     } finally { this.endCompletionObservation(ticket); }
   }
@@ -2128,7 +2226,7 @@ export class WorkerClient {
     return this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
   }
 
-  /** Semantic writes require existing fences and never use compatibility stripping. */
+  /** Semantic authority fields never downgrade; advisory observations negotiate separately. */
   async reportSemanticPlanGateState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const frozen: PlanCrossCheckStateRequest = JSON.parse(JSON.stringify(body));
     if (!Number.isSafeInteger(frozen.claim_generation) || (frozen.claim_generation ?? 0) <= 0 ||
@@ -2181,6 +2279,7 @@ export class WorkerClient {
    */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    this.sealCodexAdmission(path, body);
     if (body.source_publication !== undefined) {
       // Snapshot nested proof once, before either transport retries or caller mutation.
       const outbound: PlanCrossCheckStateRequest = Object.freeze(structuredClone(body));
@@ -2255,7 +2354,8 @@ export class WorkerClient {
         throw new Error("guarded question state requires awaiting_input and positive claim_generation");
       return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
-    // PRD #1247 fix round (E): /state carries claim_generation on EVERY mutating report (M5b's
+    // PRD #1247 fix round (E): reports without the advisory-evidence path below retain
+    // the legacy generation fallback. /state carries claim_generation on EVERY mutating report (M5b's
     // reportState closure stamps it), but /state DisallowUnknownFields-decodes, so a rolled-back api
     // that predates the field 400s the report and — force-roll off — a busy newer worker wedges every
     // run. Route the report through the SAME send-gate + skew-safe fallback as postMessages and the
@@ -2296,9 +2396,15 @@ export class WorkerClient {
         // Enforce the shared response cap on actual streamed bytes.
         b.status === "running" || b.status === "failed" || b.status === "completed" ? CROSS_CHECK_RESPONSE_MAX_BYTES : undefined,
         evidence,
+        undefined,
+        b.claim_generation,
       );
     try {
-      if (outbound.provider_progress_turns !== undefined && included) {
+      if (outbound.capability_inference_evidence !== undefined && this.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)) {
+        // Advisory rollback is resolved before the legacy generation fallback.
+        // A refusal of its stripped variant must never select an unfenced third body.
+        ack = await sendWith(outbound)(included);
+      } else if (outbound.provider_progress_turns !== undefined && included) {
         // Both attempts retain the fence. A stripped retry refusal propagates without
         // invoking the older generation fallback or sending a third variant.
         try {
@@ -2386,20 +2492,47 @@ export class WorkerClient {
     return receipt;
   }
 
-  /** One /state POST WITH the given body, including the transient-retry loop, AbortSignal
-   *  handling, 200/409 single-body ACK parse, already-terminal handling and logging. Split out of
-   *  reportState (PRD #1247 fix round E) so the claim_generation send-gate + strict-decode
-   *  strip-and-retry can drive it through withGenerationFallback, exactly as postMessages. */
+  /** Own and freeze evidence-bearing state-report wire variants. Only a proven decoder
+   * refusal selects the advisory-free variant; every authority field stays intact. */
   private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number, evidence?: StateAttemptEvidence, memoryPark?: {
     incarnation: MemoryIncarnation;
     binding: NonNullable<StateAck["memoryParkAccepted"]>;
-  }): Promise<StateAck> {
+  }, admissionGeneration?: number): Promise<StateAck> {
+    const send = (variant: PlanCrossCheckStateRequest) =>
+      this.reportStateVariant(runId, path, variant, signal, maxAckBytes, evidence, memoryPark, admissionGeneration);
+    if (body.capability_inference_evidence === undefined) return send(body);
+    // Own the nested metadata and choose its wire presence once. Heartbeat refresh
+    // or caller mutation during backoff cannot change a variant's transport retries.
+    const primary = structuredClone(body);
+    if (!this.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)) delete primary.capability_inference_evidence;
+    Object.freeze(primary);
+    try { return await send(primary); }
+    catch (error) {
+      if (primary.capability_inference_evidence === undefined || !(error instanceof StateDecodeRefusalError)) throw error;
+    }
+    // The complete strict-decoder 400 proves this attempt did not reach state
+    // mutation. Freeze a compatibility variant with every authority field intact.
+    const compatible = structuredClone(primary);
+    delete compatible.capability_inference_evidence;
+    const ack = await send(Object.freeze(compatible));
+    if (ack.runId === runId && ack.status !== undefined && !ack.semanticGateMalformed)
+      this.dropFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE);
+    return ack;
+  }
+
+  /** Transient retries and ACK handling for one chosen state-report wire variant. */
+  private async reportStateVariant(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number, evidence?: StateAttemptEvidence, memoryPark?: {
+    incarnation: MemoryIncarnation;
+    binding: NonNullable<StateAck["memoryParkAccepted"]>;
+  }, admissionGeneration?: number): Promise<StateAck> {
     // Field presence carries the source-fence intent through feature shrink and
     // durable terminal replay. Absence of support cannot authorize an ordinary write.
     if (hasRevisionSourceFields(body) && (!this.hasFeature("plan_revision_retry_v1") ||
         !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
         !this.includeClaimGeneration(body.claim_generation)))
       throw new RevisionSourceFenceUnavailableError();
+    const admissionOwned = this.codexAdmission.get(runId);
+    const admissionRecord = admissionOwned?.generation === (admissionGeneration ?? body.claim_generation) ? admissionOwned : undefined;
     const incarnation = this.completionIncarnation;
     if (MaintenanceBudget.current()) signal = AbortSignal.any([MaintenanceBudget.current()!.signal, ...(signal ? [signal] : [])]);
     for (let attempt = 0; ; attempt++) {
@@ -2427,7 +2560,9 @@ export class WorkerClient {
           throw new Error("source publication requires negotiated support, positive claim_generation and matching terminal proof");
       }
       try {
-        const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
+        const outbound = { ...body };
+        this.sealCodexAdmission(path, { ...outbound, claim_generation: admissionGeneration ?? outbound.claim_generation });
+        const res = await this.fetchRaw("POST", path, outbound, this.httpTimeoutMs, signal);
         // 409 = the server declined the transition and is telling us the run's real
         // status. Not an error, and not a retry: the server has moved on.
         if (res.status === 200 || res.status === 409) {
@@ -2437,6 +2572,9 @@ export class WorkerClient {
           // already issued — learns its scaled cap here (a resume gets it on the claim
           // config instead). Absent/non-numeric ⇒ left undefined = "no budget update".
           const fields = await readRunAck(res, maxAckBytes);
+          if (fields.staleClaim === true ||
+              (fields.status && !["claimed", "running", "awaiting_approval"].includes(fields.status)))
+            this.retireCodexAdmission(runId, admissionRecord);
           MaintenanceBudget.current()?.check();
           const ack: StateAck = {
             applied: res.status === 200,
@@ -2556,7 +2694,7 @@ export class WorkerClient {
           }
           return ack;
         }
-        if (res.status === 400 && evidence) {
+        if (res.status === 400 && (evidence || body.capability_inference_evidence !== undefined)) {
           let text = "";
           let exact = false;
           try {
@@ -3672,6 +3810,7 @@ export class WorkerClient {
     signal?: AbortSignal,
   ): Promise<{ unmet: string[]; attemptCount: number }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/attempt`;
+    this.sealCodexAdmission(path, { claim_generation: args.claimGeneration });
     // PRD #1247 fix round: stamp the claim-lane generation through the shared send-gate so a
     // completion attempt racing a rollback recovers instead of hard-400ing. A
     // credential_switch_v1 capability worker stamps OPTIMISTICALLY (its runs are fenced
@@ -3689,6 +3828,7 @@ export class WorkerClient {
     // retain the intent; a server rejecting it must fail rather than silently close.
     const nonClosing = this.serverFeatures.has("completion_non_closing_v1") ? args.nonClosing : undefined;
     const res = (await this.withGenerationFallback(included, (includeField) => {
+      this.sealCodexAdmission(path, { claim_generation: args.claimGeneration });
       const body: CompletionAttemptRequest = {
         milestones_completed: args.milestonesCompleted,
         head: args.head,
@@ -3817,6 +3957,7 @@ export class WorkerClient {
     signal?: AbortSignal,
   ): Promise<{ status: string }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/hold`;
+    this.sealCodexAdmission(path, { claim_generation: args.claimGeneration });
     // PRD #1247 fix round: stamp the claim-lane generation through the shared send-gate so a
     // hold request racing a rollback recovers instead of hard-400ing. A credential_switch_v1
     // capability worker stamps OPTIMISTICALLY (its runs are fenced server-side, so a register
@@ -3833,6 +3974,7 @@ export class WorkerClient {
     // today). A genuine non-200/409 4xx/5xx that is NOT a strict-decode 400 propagates unchanged.
     const included = this.includeClaimGeneration(args.claimGeneration);
     return this.withGenerationFallback(included, async (includeField) => {
+      this.sealCodexAdmission(path, { claim_generation: args.claimGeneration });
       const body: { head: string; claim_generation?: number } = { head: args.head };
       if (includeField) body.claim_generation = args.claimGeneration;
       const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
@@ -3905,12 +4047,14 @@ export class WorkerClient {
     signal?: AbortSignal,
   ): Promise<{ applied: boolean; status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number; completionAttempts?: number }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/wall-park`;
+    this.sealCodexAdmission(path, { claim_generation: args.claimGeneration });
     // Stamp the claim-lane generation through the shared send-gate + skew-safe fallback, exactly as
     // requestCompletionHold does: a wall_park_v1 worker also advertises credential_switch_v1, so it
     // stamps OPTIMISTICALLY, and a rolled-back api answering the field with a strict-decode 400 is
     // retried stripped ONCE (the first, rejected, request parks nothing).
     const included = this.includeClaimGeneration(args.claimGeneration);
     return this.withGenerationFallback(included, async (includeField) => {
+      this.sealCodexAdmission(path, { claim_generation: args.claimGeneration });
       const body: WallParkRequest = { head: args.head, published: args.published };
       if (includeField) body.claim_generation = args.claimGeneration;
       // PRD #1809 D8: the caller passes it only when the api advertised run_checkpoint_durability.
@@ -3941,6 +4085,8 @@ export class WorkerClient {
     if (!Number.isSafeInteger(claimGeneration) || claimGeneration <= 0)
       throw new Error("worker pause requires positive claim_generation");
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/pause`;
+    const admissionOwned = this.codexAdmission.get(runId);
+    const admissionRecord = admissionOwned?.generation === claimGeneration ? admissionOwned : undefined;
     try {
       const res = await this.fetchRaw("POST", path, { claim_generation: claimGeneration }, this.httpTimeoutMs, signal);
       if (res.status !== 200 && res.status !== 409) throw await this.toError("POST", path, res);
@@ -3948,6 +4094,8 @@ export class WorkerClient {
       if (fields.status === undefined || fields.applied === undefined)
         throw new RequestError("POST", path, res.status, "invalid worker pause acknowledgement");
       const ack: StateAck = { status: fields.status, applied: fields.applied };
+      if (fields.staleClaim === true || !["claimed", "running", "awaiting_approval"].includes(fields.status))
+        this.retireCodexAdmission(runId, admissionRecord);
       if (fields.holdReason !== undefined) ack.holdReason = fields.holdReason;
       if (fields.reason !== undefined) ack.reason = fields.reason;
       if (fields.staleClaim !== undefined) ack.staleClaim = fields.staleClaim;
@@ -4527,6 +4675,7 @@ export class WorkerClient {
     callerSignal?: AbortSignal,
     requestHeaders?: Readonly<Record<string, string>>,
   ): Promise<Response> {
+    if (method === "POST") this.sealCodexAdmission(path, body);
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.token}`,
       "X-Client-Version": this.version,

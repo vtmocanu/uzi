@@ -89,6 +89,35 @@ const WAIT_LABEL = "Wait out future usage limits on this run";
 const REWORK_LABEL = /Auto-rework this MR.s review comments/;
 const breadcrumb = (container: HTMLElement) => container.querySelector("nav")!;
 
+describe("RunView read-only capability sources", () => {
+  it.each([
+    ["running", false], ["completed", false], ["running", true], ["completed", true],
+  ] as const)("shows sources for status=%s autopilot=%s outside the approval gate", async (status, auto_approve) => {
+    const { container } = await renderPage({ ...runningIssue, status, auto_approve,
+      required_capabilities: [], required_tools: [], capability_provenance: {
+        hints_known: true, inference_known: true, capabilities: [{ capability: "jvm", sources: ["inferred"],
+          required: false, inference_ignored: true,
+          triggers: [{ path: "app/modules/x/android/build.gradle", reason: "jvm_manifest" }], truncated: false }],
+      },
+    });
+    const sources = within(container).getByRole("group", { name: "Capability sources" });
+    expect(within(sources).getByText("app/modules/x/android/build.gradle")).toBeTruthy();
+    expect(within(sources).getByText(/inferred; inference ignored; not currently required/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Approve plan/ })).toBeNull();
+  });
+
+  it("hides read-only source paths in demo mode", async () => {
+    setDemoMode(true);
+    const { container } = await renderPage({ ...runningIssue, capability_provenance: {
+      hints_known: true, inference_known: true, capabilities: [{ capability: "jvm", sources: ["inferred"],
+        required: false, inference_ignored: true,
+        triggers: [{ path: "private/customer/build.gradle", reason: "jvm_manifest" }], truncated: false }],
+    } });
+    expect(within(container).getByRole("group", { name: "Capability sources" })).toBeTruthy();
+    expect(container.innerHTML).not.toContain("private/customer/build.gradle");
+  });
+});
+
 describe("RunView job gates (PRD #1908)", () => {
   it("control: a running issue run names its repo in the breadcrumb and has the toggle row", async () => {
     const { container } = await renderPage(runningIssue);

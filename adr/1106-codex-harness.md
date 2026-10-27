@@ -1007,3 +1007,122 @@ and the stable-to-stable source diff for the consumed paths:
 agreement of pins, not execution of 0.163.0. Installed receipt/probe acceptance,
 real worker-UID and M4 execution remain separate evidence required before
 accepting the upgrade.
+
+## Amendment: temporary account admission (#3530, 2026-10-27)
+
+The account admission policy is **no standing limit; temporary cooldown after rate-limit or repeated-overload evidence.**
+The retired one-run-per-seat policy above stays retired. Credential selection
+([ADR-0035](0035-run-limit-retry.md)), worker slots
+([ADR-0042](0042-worker-run-concurrency.md)) and preservation
+([ADR-0759](0759-protect-run-work-usage-limit-park.md)) keep their existing boundaries.
+The user contract is [Temporary account admission waits](../docs/rate-limits.md#temporary-account-admission-waits);
+[installation](../docs/installation.md#codex-account-admission-upgrades)
+owns rollout, rollback and reporting-loss guidance.
+
+### Evidence and persisted policy
+
+State is keyed by user and canonical linked Codex subscription account,
+independent of saved alias, credential refresh or re-import. Another
+authorized account remains independent, without automatic rotation.
+Bound thread/turn errors and terminals use the closed `codexErrorInfo` map:
+`rateLimitExceeded` or accepted structured model HTTP 429 supplies rate
+evidence; `serverOverloaded` supplies overload. Overload requires two distinct
+run IDs within five minutes. Same-run retries cannot supply the second vote;
+repeating a vote does not refresh its time. Idle/silence, generic transport
+errors or 5xx, usage quota, auth and meter GET 429 do not qualify.
+Retry-After is not consulted.
+
+The independent schedules start at 30 seconds for rate and 15 seconds for
+overload, double to caps of 15 minutes and five minutes before persisted
+positive 0–20% jitter, and reset after 30 and 15 minutes quiet respectively.
+Quiet clocks track qualifying unique class observations. In-episode evidence
+does not extend the class expiry or advance its step. Later class expiry
+controls, with rate winning a tie.
+
+A common recovery episode gives each run a stable spread in 0..W, where W
+is the smaller of the opening duration and 60 seconds. Recovery floors prevent
+a new episode from shortening prior eligibility. Admission is unlimited after
+the finite recovery window. Migration 00364 persists transitions/eligibility;
+00365 projects active queued admission. Receipt and overload-vote ledgers
+are each bounded at 256; receipts retain at least the 60-second retry horizon.
+Capacity overflow refuses the observation rather than manufacturing evidence.
+
+### Claim, lifecycle and trust boundaries
+
+Claim and provisioning use database statement snapshots. Queued runs keep
+status, claim generation and custody. An already in-flight statement may
+admit after evidence commits; there is no custody-lock guarantee. The signal
+path takes a run SHARE lock against lifecycle/generation changes, then checks
+owned active subscription claims, enabled linked credentials, material/account
+revisions and canonical identity in the following INSERT snapshot. It does
+not lock account/alias rows; credential replacement committed after that
+snapshot may race acceptance. See the enforcing
+[queries](../api/internal/store/queries/codex_admission.sql) and
+[service](../api/internal/workersvc/codex_admission.go).
+
+This adds no standing seat lock, ceiling or active-count policy, per-request
+limiter, mid-turn pause, force-park or retry change. Admitted runs continue
+existing execution and preservation. Usage and account-unavailability parked
+policies are independent. Resume, restart, schedules, same-account aliases
+and provisioning pass through the next claim gate. Live admitted approval
+uses existing rules; cancellation remains available. Checker deadlines
+include queued time without exemption or extension. API keys, Claude, chat,
+versioned jobs and the isolated lane keep their prior behavior.
+Running-turn limiting remains the separate [#3531 follow-up](https://github.com/vtmocanu/uzi/issues/3531).
+
+The owner-only read-time class and eligibility including spread appear on
+run detail/list/board and CLI; foreign shared/admin summaries redact them.
+Finite expiry clears the copy on subsequent reads. Maintenance and account
+unavailability retain precedence with independent admission details.
+Eligibility is not a promised start. There is no per-run Slack burst,
+account panel, settings control or Resume now override.
+
+### Best-effort reporter and acceptance boundary
+
+The negotiated feature is `codex_account_admission_signal_v1`.
+[The reporter](../agent/src/codex/admission-signal.ts) queues without awaiting
+network from provider/lifecycle handlers. It permits two HTTP attempts capped
+at three seconds each within ten seconds monotonic total. The implementation
+starts the budget at observation, including queue time, stricter than the
+first-send contract. The 32-entry bound includes the active send; overflow
+drops evidence. Nonclosing `running`/`awaiting_approval` state sends, pause
+intent and completion attempts seal queued work and unsent retries, leaving
+active HTTP to finish within its existing three-second attempt and ten-second
+observation bounds under the server's live-state fence. Ending authority
+permanently closes reporting and aborts active HTTP, allowing loss of the last
+attempt. Lifecycle and preservation do not wait for a reporting ACK. This
+signal path does not retain raw provider text.
+
+Correction to the reported lifetime cutoff (AI-synced 2026-10-27):
+[the client](../agent/src/client.ts) bounds `codexAdmission` at 1,024 live
+reporters and `codexAdmissionClosed` at 1,024 recent closed/refused run-generation
+high-water marks in FIFO order. Closing retires the live reporter and frees
+capacity for future bindings; there is no permanent lifetime run cutoff.
+Concurrent live overflow drops the telemetry binding but records its generation
+to fence older pending claim responses. Closed-cache eviction rotates
+`codexAdmissionEpoch`, so pre-eviction responses cannot rebind forgotten old
+authority; this may also drop unrelated pending telemetry bindings. It does
+not drop claims or execution. A fresh server `ClaimRun` increments
+`claim_generation`; retained closed handles stay inert.
+
+Registration and temporarily missing feature support seal pending work and
+suspend new reporting while support is absent; fresh attempts on live reporters
+resume when support is advertised. Claims started before registration or feature
+invalidation are ignored for telemetry binding through the observation epoch,
+without changing execution. Permanently closed, refused or stale-generation
+reporters remain closed; old workers still obey server admission.
+
+The supported API deployment remains singleton Recreate. Deploy the additive
+schema/API before workers. Application rollback leaves the schema in place;
+an old API admits without reading this state. Roll-forward uses still-live
+finite state and the normal quiet-reset policy. Mixed old/new replicas outside
+the singleton carry no enforcement promise. The M4 separate-pool/service
+reconstruction test models persisted recovery, not a binary/Kubernetes
+restart; execution evidence belongs to the integration handoff.
+
+M5 remains external: **full agent suite: exact-head PR CI** requires
+maintainer/CI success for required `validate-agent`, both
+`test-agent-shard` legs and the worker-UID lane on the exact published head
+before merge. The worker cannot trigger hosted jobs before publication;
+these checks are not verified here. An optional operator rollout smoke
+check is separate and does not substitute for required gates.

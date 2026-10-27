@@ -179,11 +179,12 @@ export function nowSummaryCodexClaim(
   runId: string,
   codexBlock: unknown,
   buildHarness: CodexAdviceHarnessFactory | undefined,
+  claimGeneration?: number,
 ): { codex?: NonNullable<ReadOnlyModelPassOpts["codex"]> } {
   if (codexBlock === undefined || buildHarness === undefined) return {};
   try {
     const selection = selectCodexBinding({ codex: codexBlock });
-    return selection.kind === "codex" ? { codex: { runId, binding: selection.binding, buildHarness } } : {};
+    return selection.kind === "codex" ? { codex: { runId, claimGeneration, binding: selection.binding, buildHarness } } : {};
   } catch {
     return {};
   }

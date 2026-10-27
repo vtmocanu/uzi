@@ -47,12 +47,13 @@ func TestIgnoredInferenceSnapshotCreatorsLiveDB(t *testing.T) {
 	}
 	for _, run := range []store.Run{issue, auto, manual} {
 		assertCaps(t, "declared hint", run.RequiredCapabilities, []string{"jvm"})
+		assertCaps(t, "hinted snapshot", run.HintedCapabilities, []string{"jvm"})
 		assertCaps(t, "ignored snapshot", run.IgnoredInferredCapabilities, []string{"jvm"})
 	}
 	assertPathsInherit(ctx, t, q, pool, user, repo, []string{"jvm"}, []string{"jvm"})
 	mustExec(ctx, t, pool, "UPDATE repos SET required_capabilities='{docker}',ignored_inferred_capabilities='{docker}' WHERE id=$1", repo)
 	var frozen int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM runs WHERE repo_id=$1 AND required_capabilities='{jvm}' AND ignored_inferred_capabilities='{jvm}'", repo).Scan(&frozen); err != nil {
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM runs WHERE repo_id=$1 AND required_capabilities='{jvm}' AND ignored_inferred_capabilities='{jvm}' AND hinted_capabilities='{jvm}'", repo).Scan(&frozen); err != nil {
 		t.Fatal(err)
 	}
 	if frozen != 9 {

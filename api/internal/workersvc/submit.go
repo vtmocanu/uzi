@@ -336,6 +336,11 @@ func (s *Service) submitInputForRun(ctx context.Context, userID, runID uuid.UUID
 	// clearing the three columns + writing the kind='pause_cancel' audit row (CancelPauseInput)
 	// in one statement. A 0-row result means nothing was pending → 409.
 	if kind == "pause_cancel" {
+		// PRD #3522 M4a: the weekly reserve's own request is not the owner's to withdraw (the SQL guard
+		// refuses it too, which covers a request that landed after this read).
+		if run.PauseMode.Valid && run.PauseMode.String == "reserve" {
+			return SubmitInputResult{}, ErrReservePausePending
+		}
 		if _, err := s.q.CancelPauseInput(ctx, runID); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return SubmitInputResult{}, ErrNoPausePending

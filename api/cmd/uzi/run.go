@@ -121,6 +121,11 @@ const (
 	holdCompletionBlocked   = "completion_blocked"
 	holdCredentialDisabled  = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
 	holdBaseAttestation     = "base_attestation_missing"
+	// holdWeeklyReserve (PRD #3522) is the park the weekly usage reserve puts a running run in when the
+	// credential it spends reaches the owner's threshold. It releases by itself when usage falls back
+	// below the threshold (or the setting is cleared); `uzi run resume` overrides it until the next
+	// weekly reset.
+	holdWeeklyReserve = "weekly_reserve"
 )
 
 // logsPollInterval is how often `uzi run logs --follow` re-polls
@@ -574,8 +579,8 @@ func openQuestion(ctx context.Context, c uzicli.Client, runID string) (questionP
 // surface remains `uzi run get`/`run list`, which poll the same reason; this warns at
 // create time so an agent that queues then polls is not left blind on the first read.
 func renderCreatedRun(env Env, gf *globalFlags, run apitypes.RunDTO, notice string) error {
-	if run.HealthReason != nil && strings.TrimSpace(*run.HealthReason) != "" {
-		_, _ = fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(strings.TrimSpace(*run.HealthReason)))
+	if reason := strings.TrimSpace(runHealthReasonAt(run, time.Now())); reason != "" {
+		_, _ = fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(reason))
 	}
 	printNotice(env, notice)
 	p := env.printer(gf)

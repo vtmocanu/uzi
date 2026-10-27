@@ -94,7 +94,7 @@ export interface PlanSummaryResult {
 export interface IntentSummaryInput {
   /** Claim shape selects Codex when present and valid; malformed Codex fails closed.
    *  With no Codex block, the legacy token/model inputs below are used unchanged. */
-  claim?: { readonly run_id: string; readonly secrets: { readonly codex?: unknown } };
+  claim?: { readonly run_id: string; readonly claim_generation?: number; readonly secrets: { readonly codex?: unknown } };
   token: string;
   model: string;
   issueTitle: string;
@@ -134,6 +134,7 @@ export interface SummaryRunnerOptions {
 /** The claim facts the editor pass selects its harness from (a ClaimResponse is assignable). */
 export interface DeliverySummaryClaimView {
   readonly run_id: string;
+  readonly claim_generation?: number;
   /** The resolved Claude summary model (PRD #362); unused on a Codex claim. */
   readonly summary_model?: string | null;
   readonly secrets: { readonly anthropic_oauth_token?: string; readonly codex?: unknown };
@@ -292,7 +293,7 @@ export class SummaryRunner {
     if (!(timeoutMs > 0)) return fail("the publication's summary deadline is spent");
     let harness: Pick<ReadOnlyModelPassOpts, "token" | "model" | "codex"> | null;
     try {
-      harness = this.deliveryHarness(input.claim, fail);
+      harness = this.deliveryHarness(input.claim, fail, input.claimGeneration);
     } catch (err) {
       return fail("the claim's codex block is invalid", err);
     }
@@ -338,13 +339,14 @@ export class SummaryRunner {
   private deliveryHarness(
     claim: DeliverySummaryClaimView,
     fail: (reason: "Codex claim but no Codex advice-harness factory is wired" | "the claim carries no Anthropic token") => null,
+    claimGeneration?: number,
   ): Pick<ReadOnlyModelPassOpts, "token" | "model" | "codex"> | null {
     const selection = selectCodexBinding({ codex: claim.secrets.codex });
     if (selection.kind === "codex") {
       if (!this.codexAdviceHarnessFactory) return fail("Codex claim but no Codex advice-harness factory is wired");
       return {
         model: CODEX_PR_DESCRIPTION_MODEL,
-        codex: { runId: claim.run_id, binding: selection.binding, buildHarness: this.codexAdviceHarnessFactory },
+        codex: { runId: claim.run_id, claimGeneration: claimGeneration ?? claim.claim_generation, binding: selection.binding, buildHarness: this.codexAdviceHarnessFactory },
       };
     }
     const token = claim.secrets.anthropic_oauth_token?.trim();
@@ -433,6 +435,7 @@ export class SummaryRunner {
           effort: CODEX_INTENT_PLAN_EFFORT,
           codex: {
             runId: input.claim!.run_id,
+            claimGeneration: input.claim!.claim_generation,
             binding: selection.binding,
             buildHarness: this.codexAdviceHarnessFactory,
             refresh: "deny",

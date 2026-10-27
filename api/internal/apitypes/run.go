@@ -205,6 +205,8 @@ type MemoryHoldDTO struct {
 
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
+	// Detail-only detector provenance; never approval authority or summary polling data.
+	CapabilityProvenance                           *CapabilityProvenance `json:"capability_provenance,omitempty"`
 	CompletionPending                              *CompletionPendingDTO `json:"completion_pending,omitempty"`
 	SemanticGate                                   *SemanticGateDTO      `json:"semantic_gate,omitempty"`
 	SemanticDrift                                  *SemanticDriftDTO     `json:"semantic_drift,omitempty"`
@@ -565,11 +567,25 @@ type RunDTO struct {
 	// chat/judge/interactive run, or no started_at). The near-timeout badge counts down
 	// to it; the reason string stays static, so nothing stored ever ages (D4).
 	DeadlineAt *time.Time `json:"deadline_at"`
-	// QueueReason (PRD #3454) is "maintenance" while instance maintenance mode holds this
-	// queued run back (queued, intake paused, run not admitted); absent otherwise. Derived in
-	// SQL at read time (store ListRunQueueReasons) so it never lags the pause; runToDTO leaves it nil.
+	// QueueReason is maintenance, weekly_reserve (PRD #3522), codex_rate_limit, or
+	// codex_overload while a queued run is held; absent otherwise. Precedence is in that
+	// order. The handler overlays this at read time from ListRunAdmissionQueueReasons on
+	// owner-authorized reads.
 	QueueReason *string `json:"queue_reason,omitempty"`
-	PlanMd      *string `json:"plan_md"`
+	// ReserveHoldReason (PRD #3522) is the visible weekly-usage-reserve reason ("weekly usage
+	// reserve: 72% >= 70%" or "weekly usage reserve: weekly usage unknown") while this QUEUED run is
+	// held because the credential it would spend reads at or above the owner's threshold, or
+	// cannot be read. Absent otherwise; runToDTO fills it only while status is "queued".
+	ReserveHoldReason *string `json:"reserve_hold_reason,omitempty"`
+	// ReserveExemptUntil (PRD #3522 M4a) is when the owner's manual resume of a weekly-reserve pause
+	// stops exempting this run from the reserve (the next observed 7-day reset, or seven days after
+	// the resume when no reset time was known). Absent when no exemption is in force; it clears early
+	// when the reset is observed sooner.
+	ReserveExemptUntil *time.Time `json:"reserve_exempt_until,omitempty"`
+	// Read-time account admission details; absent when unrestricted.
+	CodexAdmissionClass      *string    `json:"codex_admission_class,omitempty"`
+	CodexAdmissionEligibleAt *time.Time `json:"codex_admission_eligible_at,omitempty"`
+	PlanMd                   *string    `json:"plan_md"`
 	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
 	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
 	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB
@@ -1417,10 +1433,24 @@ type RunSummaryItemDTO struct {
 	// chat/judge/interactive run, or no started_at). The near-timeout badge counts down
 	// to it; the reason string stays static, so nothing stored ever ages (D4).
 	DeadlineAt *time.Time `json:"deadline_at"`
-	// QueueReason (PRD #3454) is "maintenance" while instance maintenance mode holds this
-	// queued run back (queued, intake paused, run not admitted); absent otherwise. Derived in
-	// SQL at read time (store ListRunQueueReasons) so it never lags the pause; runToDTO leaves it nil.
+	// QueueReason is maintenance, weekly_reserve (PRD #3522), codex_rate_limit, or
+	// codex_overload while a queued run is held; absent otherwise. Precedence is in that
+	// order. The handler overlays this at read time from ListRunAdmissionQueueReasons on
+	// owner-authorized reads.
 	QueueReason *string `json:"queue_reason,omitempty"`
+	// ReserveHoldReason (PRD #3522) is the visible weekly-usage-reserve reason ("weekly usage
+	// reserve: 72% >= 70%" or "weekly usage reserve: weekly usage unknown") while this QUEUED run is
+	// held because the credential it would spend reads at or above the owner's threshold, or
+	// cannot be read. Absent otherwise; runToDTO fills it only while status is "queued".
+	ReserveHoldReason *string `json:"reserve_hold_reason,omitempty"`
+	// ReserveExemptUntil (PRD #3522 M4a) is when the owner's manual resume of a weekly-reserve pause
+	// stops exempting this run from the reserve (the next observed 7-day reset, or seven days after
+	// the resume when no reset time was known). Absent when no exemption is in force; it clears early
+	// when the reset is observed sooner.
+	ReserveExemptUntil *time.Time `json:"reserve_exempt_until,omitempty"`
+	// Read-time account admission details; absent when unrestricted.
+	CodexAdmissionClass      *string    `json:"codex_admission_class,omitempty"`
+	CodexAdmissionEligibleAt *time.Time `json:"codex_admission_eligible_at,omitempty"`
 	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
 	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
 	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB
@@ -1944,6 +1974,10 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		HealthSince:                   item.HealthSince,
 		DeadlineAt:                    item.DeadlineAt,
 		QueueReason:                   item.QueueReason,
+		ReserveHoldReason:             item.ReserveHoldReason,
+		ReserveExemptUntil:            item.ReserveExemptUntil,
+		CodexAdmissionClass:           item.CodexAdmissionClass,
+		CodexAdmissionEligibleAt:      item.CodexAdmissionEligibleAt,
 		PlanSource:                    item.PlanSource,
 		GateRevision:                  item.GateRevision,
 		SummaryIntent:                 item.SummaryIntent,
@@ -2113,6 +2147,10 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			HealthSince:                   s.HealthSince,
 			DeadlineAt:                    s.DeadlineAt,
 			QueueReason:                   s.QueueReason,
+			ReserveHoldReason:             s.ReserveHoldReason,
+			ReserveExemptUntil:            s.ReserveExemptUntil,
+			CodexAdmissionClass:           s.CodexAdmissionClass,
+			CodexAdmissionEligibleAt:      s.CodexAdmissionEligibleAt,
 			PlanSource:                    s.PlanSource,
 			GateRevision:                  s.GateRevision,
 			SummaryIntent:                 s.SummaryIntent,

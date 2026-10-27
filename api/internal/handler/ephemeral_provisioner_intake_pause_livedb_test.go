@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -228,5 +229,170 @@ func TestEphemeralProvisionOneRechecksIntakePauseLiveDB(t *testing.T) {
 	}
 	if rows := fx.ephemeralRows(); len(rows) != 0 {
 		t.Fatalf("provisionOne created %d workers after the pause was enabled mid-pass, want 0", len(rows))
+	}
+}
+
+// seedEphemeralAdmissionAlias supplies the SQL binding needed by the admission
+// helper. No credential assembly is involved in the provisioning path.
+func (fx *ephemeralFixture) seedEphemeralAdmissionAlias() uuid.UUID {
+	fx.t.Helper()
+	alias, account := uuid.New(), uuid.New()
+	for _, stmt := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO user_secrets (id,user_id,kind,label,ciphertext,sealed_with)
+		 VALUES ($1,$2,'codex_auth',$3,$4,'master')`, []any{alias, fx.userID, alias.String(), []byte("fixture")}},
+		{`INSERT INTO codex_provider_account (id,user_id,provider_user_id,workspace_account_id,sealed_login,sealed_with)
+		 VALUES ($1,$2,$3,$3,$4,'master')`, []any{account, fx.userID, account.String(), []byte("fixture")}},
+		{`INSERT INTO codex_credential_state (user_secret_id,user_id,status,provider_account_id)
+		 VALUES ($1,$2,'linked',$3)`, []any{alias, fx.userID, account}},
+	} {
+		if _, err := fx.pool.Exec(fx.ctx, stmt.sql, stmt.args...); err != nil {
+			fx.t.Fatal(err)
+		}
+	}
+	return alias
+}
+
+func (fx *ephemeralFixture) bindEphemeralAdmission(run, alias uuid.UUID) {
+	fx.t.Helper()
+	if _, err := fx.pool.Exec(fx.ctx, `UPDATE runs SET harness='codex', codex_auth_mode='subscription',
+		codex_secret_id=$2, codex_material_revision=0 WHERE id=$1`, run, alias); err != nil {
+		fx.t.Fatal(err)
+	}
+}
+
+func (fx *ephemeralFixture) holdEphemeralAdmission(alias uuid.UUID) {
+	fx.t.Helper()
+	if _, err := fx.pool.Exec(fx.ctx, `INSERT INTO codex_account_admission_throttle
+		(user_id,provider_account_id,rate_expiry,effective_expiry,episode_id,spread_width_ms)
+		SELECT user_id,provider_account_id,now()+interval '1 hour',now()+interval '1 hour',gen_random_uuid(),60000
+		FROM codex_credential_state WHERE user_secret_id=$1`, alias); err != nil {
+		fx.t.Fatal(err)
+	}
+}
+
+// Both bounded demand queries must skip held accounts before LIMIT. The later
+// eligible run is the only row allowed into a one-row window.
+func TestEphemeralCodexAdmissionBeforeLimitLiveDB(t *testing.T) {
+	db := ephemeralPriorityDatabase(t)
+	for _, trigger := range []string{"gap", "saturation"} {
+		t.Run(trigger, func(t *testing.T) {
+			fx := priorityFixture(t, db)
+			priorityTrigger(fx, trigger)
+			if _, err := fx.pool.Exec(fx.ctx, "UPDATE workers SET protocol_capabilities=$2 WHERE user_id=$1", fx.userID,
+				[]string{"codex_harness_v1", "codex_runtime_v2", "codex_custom_model_v1"}); err != nil {
+				t.Fatal(err)
+			}
+			alias := fx.seedEphemeralAdmissionAlias()
+			var held []uuid.UUID
+			for i := 0; i < 3; i++ {
+				id := priorityRun(fx, trigger, uuid.Nil, "issue", nil, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour))
+				fx.bindEphemeralAdmission(id, alias)
+				held = append(held, id)
+			}
+			eligible := priorityRun(fx, trigger, uuid.Nil, "issue", nil, time.Now().Add(-30*time.Minute), time.Now().Add(-30*time.Minute))
+			fx.holdEphemeralAdmission(alias)
+			// LeaseInterval(0) is SQL NULL, so use a real debounce interval.
+			ids := priorityQuery(t, fx, fx.q, trigger, time.Now().Add(-15*time.Minute), 1, time.Second)
+			if len(ids) != 1 || ids[0] != eligible {
+				t.Fatalf("demand window = %v, want later eligible run %s", ids, eligible)
+			}
+			if _, err := fx.pool.Exec(fx.ctx, "UPDATE codex_account_admission_throttle SET effective_expiry=now()-interval '2 minutes' WHERE user_id=$1", fx.userID); err != nil {
+				t.Fatal(err)
+			}
+			ids = priorityQuery(t, fx, fx.q, trigger, time.Now().Add(-15*time.Minute), 10, time.Second)
+			got := make(map[uuid.UUID]bool)
+			for _, id := range ids {
+				got[id] = true
+			}
+			for _, id := range held {
+				if !got[id] {
+					t.Fatalf("expired admission omitted demand %s: %v", id, ids)
+				}
+			}
+		})
+	}
+}
+
+// Evidence arrives after demand selection while provisionOne waits on its
+// advisory lock. Recheck precedes quota eviction, worker creation and token sealing.
+func TestEphemeralProvisionOneRechecksCodexAdmissionLiveDB(t *testing.T) {
+	db := ephemeralPriorityDatabase(t)
+	fx := priorityFixture(t, db)
+	fx.onlineWorker("base", false)
+	alias := fx.seedEphemeralAdmissionAlias()
+	run := fx.queuedRun([]string{"jvm"})
+	fx.bindEphemeralAdmission(run, alias)
+	idle := fx.leasedWorker(time.Minute)
+	ctx, cancel := context.WithTimeout(fx.ctx, 20*time.Second)
+	defer cancel()
+	holder, err := fx.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback(context.Background()) }()
+	key := hostedProvisionLockObjID(fx.userID)
+	if _, err := holder.Exec(ctx, "SELECT pg_advisory_xact_lock($1,$2)", store.HostedProvisionLockClass, key); err != nil {
+		t.Fatal(err)
+	}
+
+	// At cap: without the recheck the real provisioner can evict this idle worker.
+	prov := fx.leaseProvisioner(1, 2*time.Hour)
+	done := make(chan error, 1)
+	finished := false
+	go func() { _, err := prov.ProvisionPass(ctx); done <- err }()
+	defer func() {
+		cancel()
+		_ = holder.Rollback(context.Background())
+		if !finished {
+			if err := <-done; err != nil {
+				t.Logf("cancelled provisioner cleanup: %v", err)
+			}
+		}
+	}()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		err := fx.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory'
+			AND NOT granted AND classid::bigint=$1 AND objid::bigint=$2)`,
+			int64(store.HostedProvisionLockClass)&0xFFFFFFFF, int64(key)&0xFFFFFFFF).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case err := <-done:
+			finished = true
+			t.Fatalf("provisioning finished before barrier: %v", err)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-ticker.C:
+		}
+	}
+	fx.holdEphemeralAdmission(alias)
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	err = <-done
+	finished = true
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := fx.ephemeralRows()
+	if len(rows) != 1 || rows[0].id != idle.id {
+		t.Fatalf("recheck evicted or created a worker: %v, want original %s", rows, idle.id)
+	}
+	var tokens int
+	if err := fx.pool.QueryRow(ctx, `SELECT count(*) FROM hosted_worker_tokens t JOIN workers w ON w.id=t.worker_id
+		WHERE w.user_id=$1 AND w.id<>$2`, fx.userID, idle.id).Scan(&tokens); err != nil {
+		t.Fatal(err)
+	}
+	if tokens != 0 {
+		t.Fatal("recheck created a hosted join token")
 	}
 }

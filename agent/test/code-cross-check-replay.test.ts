@@ -12,6 +12,7 @@ import {
 import type { ClaudeCrossCheck } from "../src/claude-cross-check.js";
 import { createReplayRecordsFile, defaultReplayCliDeps, runReplayCli } from "../src/code-cross-check-replay-cli.js";
 import { codeCrossCheckBrief, crossCheckPrompt } from "../src/codex/cross-check.js";
+import { REPLAY_PROFILES } from "../src/code-cross-check-replay-profiles.js";
 import { decodeCrossCheckClaim } from "../src/code-cross-check-contract.js";
 import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
 import {
@@ -56,7 +57,15 @@ test("baseline remains drift-checked while revised profile preserves frozen pins
   const revised = await load();
   assert.equal(revised.profile, "revised");
   assert.notDeepEqual(revised.brief_sha256, revised.pins.brief_sha256);
-  assert.equal(revised.pins.brief_sha256.codex, "29e410c44476fb6e2560fd03c2d990de24cee2193e6df6c250085cb1b39252a5");
+  assert.deepEqual(REPLAY_PROFILES.baseline, {
+    codex: "29e410c44476fb6e2560fd03c2d990de24cee2193e6df6c250085cb1b39252a5",
+    claude: "27f677678fbf3ffb78c08ec6d5549ca4ceaf722b6997e8599a5fe03092413192",
+  });
+  assert.deepEqual(revised.pins.brief_sha256, REPLAY_PROFILES.baseline);
+  for (const family of ["claude", "codex"] as const) {
+    assert.equal(REPLAY_PROFILES.revised[family], sha256(codeCrossCheckBrief(BRIEF_TOOLS[family])));
+    assert.equal(revised.brief_sha256[family], REPLAY_PROFILES.revised[family]);
+  }
 });
 
 async function replay(over: Partial<RunReplaysDeps> & { checkers?: RunReplaysDeps["checkers"] } = {}): Promise<ReplayRecord[]> {
@@ -80,6 +89,7 @@ test("the claim passes the real decoder and prompt builder with a single-family 
     const prompt = crossCheckPrompt(claim);
     for (const text of [FIXTURE_PLAN, FIXTURE_TITLE, FIXTURE_BODY, inputs.diff]) assert.ok(prompt.includes(text));
     assert.deepEqual((claim.cross_check as { milestones: unknown[] }).milestones, []);
+    assert.match(prompt, /^<approved_milestones_([a-f0-9]{32})>\n\[\]\n<\/approved_milestones_\1>$/m);
     assert.equal(claim.cross_check?.stage, "code");
   }
   assert.equal(claude.run_id, `replay-${defect.id}-claude-2`);

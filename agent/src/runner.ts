@@ -19,7 +19,7 @@ import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
-import { BASE_ATTESTATION_HOLD_REASON } from "./protocol.js";
+import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE } from "./protocol.js";
 import { PublicationContextLatch } from "./publication-context.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CREDENTIAL_SWITCH_HOLD_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
@@ -30,6 +30,7 @@ import {
   CheckpointSoftDeadlineError,
   RetainedReadinessCleanupUnconfirmedError,
   formatRetainedRecoveryDiagnostic,
+  annotateRetainedSuccessorError,
   gitBasicCredential,
   isNonFastForwardRejection,
   isPushProtectionRejection,
@@ -12742,7 +12743,7 @@ export class RunRunner {
             claim: {
               kind: resolveRunKind(claim.kind),
               claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,
-              ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory),
+              ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory, claim.claim_generation),
             },
             emit: (m) => batcher.emit(m),
             redact: flight.redactText,
@@ -22113,7 +22114,16 @@ export class RunRunner {
             () => flight.executor.recordedRootPids?.() ?? [], new Date(this.now()), attemptId);
           flight.attempt = attempt;
           this.liveAttempts.add(attempt);
-          await check();
+          try { await check(); }
+          catch (error) {
+            try {
+              if (!(error instanceof RetainedRecoveryStop) && !(error instanceof CredentialSwitchSignal) &&
+                  !isCheckpointBoundaryFailure(error) && !(error instanceof Error && error.name === "AbortError")) {
+                annotateRetainedSuccessorError(error, "post_adoption_check");
+              }
+            } catch { /* Diagnostics must not replace the original failure. */ }
+            throw error;
+          }
           // Capture boundaries may have closed the Codex executor. A new factory instance owns
           // model admission; the predecessor executor never runs the resumed model.
           if (claim.secrets.codex || flight.executor.safety || flight.executor.sandboxesCommands ||
@@ -22503,12 +22513,12 @@ export class RunRunner {
       // PRD #122 M1 (Decision 2): an autopilot run never reports awaiting_approval, so
       // the FROZEN milestone list rides this self-contained running report instead —
       // mirroring the repo_agents conditional above. Only when non-empty (additive-
-      // optional, never []). Reporting stays fire-and-forget via the .catch below.
+      // optional, never []). The storage report is awaited before implementation.
       if (milestones?.length) autopilotState.milestones = milestones;
       // PRD #84 M4: the FROZEN requirement set rides this same self-contained running
       // report (an autopilot run never reports awaiting_approval), each field only when
       // non-empty — same conditional-spread discipline as milestones/repo_agents above.
-      Object.assign(autopilotState, toolchainReportFields(toolchainDetection));
+      Object.assign(autopilotState, toolchainReportFields(toolchainDetection, this.client.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)));
       // RC1 (#1197): the approved autopilot plan rides this running report so the
       // server persists it durably via the guarded SetRunAutopilotPlan write — an
       // autopilot run never reports awaiting_approval, the channel the human-gated
@@ -22630,7 +22640,7 @@ export class RunRunner {
       // the server can gate plan-approval on worker eligibility. Each field only when
       // non-empty (additive-optional), matching the milestones conditional above.
       // PRD #1795: a re-presentation sends the requirements the human was shown instead.
-      ...(reuse ? presentedReportFields(reuse.presented) : toolchainReportFields(toolchainDetection)),
+      ...(reuse ? presentedReportFields(reuse.presented) : toolchainReportFields(toolchainDetection, this.client.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE))),
       // PRD #212 (Decision 3): ALWAYS send (empty [] when clean), NOT conditionally
       // spread — so each gate round REPLACES the server's list (M1's COALESCE clears on
       // empty), keeping a revision gate from showing a stale earlier round's writes.
@@ -23303,16 +23313,16 @@ function presentedReportFields(presented: GatePresentedRequirements | undefined)
   return fields;
 }
 
-/** PRD #84 M4: the additive `StateRequest` fields for a plan-time toolchain detection.
- *  Each array field is included ONLY when non-empty — mirroring the `milestones?.length ?
- *  {milestones} : {}` conditional-spread discipline, so a run that detected nothing (or
- *  whose scan failed and passed `undefined`) reports byte-for-byte as before. `size_class`
- *  is included whenever a detection was computed (it is soft/display-only). */
+/** Negotiate observations before freezing the plan report so the full captured
+ *  request matches its wire body and retries retain identical JSON. WorkerClient
+ *  still defends against feature shrink. Failed scans emit nothing; {} is known empty. */
 function toolchainReportFields(
   detection: ToolchainDetection | undefined,
+  evidenceSupported: boolean,
 ): Partial<StateRequest> {
   if (!detection) return {};
   const fields: Partial<StateRequest> = { size_class: detection.size_class };
+  if (evidenceSupported) fields.capability_inference_evidence = detection.evidence;
   if (detection.required_capabilities.length)
     fields.required_capabilities = detection.required_capabilities;
   if (detection.required_tools.length)
