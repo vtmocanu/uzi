@@ -259,6 +259,21 @@ func TestReserveReleaseHasCapacity(t *testing.T) {
 	if got := svc.reserveReleaseHasCapacity(run, ovSnap(freshV(usagereserve.Held, 60, anchor), now), nil, false, true, now); !got {
 		t.Error("with a lane the helper defers to the lane decision")
 	}
+	// Greptile #3568: the credential the run spent was deleted while it was paused (absent from the
+	// snapshot). Even with a lane, an enforced reserve keeps the pause for the owner rather than
+	// releasing it into a claim that can only fail.
+	gone := run
+	gone.AnthropicSecretID = pgconv.UUID(uuid.New())
+	if got := svc.reserveReleaseHasCapacity(gone, ovSnap(freshV(usagereserve.OK, 10, anchor), now), nil, false, true, now); got {
+		t.Error("a deleted spent credential must not release, even with a lane")
+	}
+	gone.AnthropicSecretID = pgtype.UUID{}
+	if got := svc.reserveReleaseHasCapacity(gone, ovSnap(freshV(usagereserve.OK, 10, anchor), now), nil, false, true, now); got {
+		t.Error("a cleared spent credential must not release, even with a lane")
+	}
+	if got := svc.reserveReleaseHasCapacity(gone, off, nil, false, true, now); !got {
+		t.Error("a reserve that is not enforced still releases a run whose credential is gone")
+	}
 }
 
 // TestOverrideResetSurvivesThresholdChange: the reset detector's prior is the utilization the grant
@@ -302,5 +317,24 @@ func TestOverrideAnchorWithoutPriorUsesBoundaryOnly(t *testing.T) {
 		if overrideActive(run, ovSnap(freshV(usagereserve.OK, 0, moved), ovGrant.Add(time.Hour)), reserveT0) {
 			t.Errorf("%s: no recorded prior, moved boundary: want the exemption ended", harness)
 		}
+	}
+}
+
+// TestCodexOverrideIgnoresWindowSwitch (Greptile #3568): granted on weekly window A at 90%, the
+// override survives window B overtaking A (the verdict's reset becomes B's), and ends when A resets.
+func TestCodexOverrideIgnoresWindowSwitch(t *testing.T) {
+	b := ovAnchor.Add(72 * time.Hour)
+	run := ovRun(harnessCodex, ovAnchor, &ovAnchor)
+	run.ReserveExemptPriorPct = pgtype.Int2{Int16: 90, Valid: true}
+	switched := freshV(usagereserve.Held, 91, b)
+	switched.Weekly = []usagereserve.WeeklyWindow{{ResetsAt: &ovAnchor, Pct: 90}, {ResetsAt: &b, Pct: 91}}
+	if !overrideActive(run, ovSnap(switched, ovGrant.Add(time.Hour)), reserveT0) {
+		t.Fatal("window B overtaking A ended the override although A did not reset")
+	}
+	rolled := ovAnchor.Add(7 * 24 * time.Hour)
+	reset := freshV(usagereserve.Held, 91, b)
+	reset.Weekly = []usagereserve.WeeklyWindow{{ResetsAt: &rolled, Pct: 2}, {ResetsAt: &b, Pct: 91}}
+	if overrideActive(run, ovSnap(reset, ovGrant.Add(time.Hour)), reserveT0) {
+		t.Fatal("window A rolling forward must end the override")
 	}
 }

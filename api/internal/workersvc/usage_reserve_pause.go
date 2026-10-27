@@ -273,14 +273,23 @@ func reserveRequestStillWanted(run store.Run, snap *reserveSnap) bool {
 	return true
 }
 
-// reserveReleaseHasCapacity: with no lane that could claim the run, the lane loop proves nothing, so an
-// enforced reserve releases only on a fresh OK reading of the credential the run spent.
+// reserveReleaseHasCapacity: an enforced reserve never releases a run whose recorded credential is gone
+// (deleted or disabled while it was paused): no reading can show it below the threshold, and a
+// release would only turn the pause into a failed claim. With no lane that could claim the run, the
+// lane loop proves nothing, so an enforced reserve releases only on a fresh OK reading of the
+// credential the run spent.
 func (s *Service) reserveReleaseHasCapacity(run store.Run, snap *reserveSnap, workers []store.ListReserveWorkersRow, hasPool, ephemeral bool, now time.Time) bool {
-	if !reserveEnforced(run, snap, now) || len(s.reserveCandidateLanes(run, workers, hasPool, ephemeral, now)) > 0 {
+	if !reserveEnforced(run, snap, now) {
 		return true
 	}
 	v, ok := snap.spentVerdict(run)
-	return ok && v.Fresh && v.State == usagereserve.OK
+	if !ok {
+		return false
+	}
+	if len(s.reserveCandidateLanes(run, workers, hasPool, ephemeral, now)) > 0 {
+		return true
+	}
+	return v.Fresh && v.State == usagereserve.OK
 }
 
 // releaseReservePauses resumes the owner's weekly_reserve pauses the reserve no longer holds. A

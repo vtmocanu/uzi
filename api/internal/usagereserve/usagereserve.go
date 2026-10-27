@@ -89,6 +89,10 @@ type Verdict struct {
 	ResetsAt  *time.Time
 	Fresh     bool
 	Reason    string
+	// Weekly is every Codex weekly window the reading reported (nil for Claude, which has one): the
+	// manual-resume override follows the window it was granted on, matched by its reset time,
+	// rather than whichever window is highest now (CodexOverrideResetObserved).
+	Weekly []WeeklyWindow
 }
 
 // Exempt is the verdict for a credential that structurally has no subscription meter (a Codex
@@ -174,6 +178,7 @@ func EvaluateCodex(threshold *int16, r CodexReading, interval time.Duration, now
 		return unknown()
 	}
 	var best *apitypes.CodexRateLimitWindowDTO
+	var weekly []WeeklyWindow
 	for i := range r.Buckets {
 		for _, w := range []*apitypes.CodexRateLimitWindowDTO{r.Buckets[i].Primary, r.Buckets[i].Secondary} {
 			if w == nil || w.LimitWindowSeconds == nil || *w.LimitWindowSeconds != WeeklyWindowSeconds {
@@ -185,6 +190,7 @@ func EvaluateCodex(threshold *int16, r CodexReading, interval time.Duration, now
 			if w.UsedPercent == nil || math.IsNaN(*w.UsedPercent) || math.IsInf(*w.UsedPercent, 0) || *w.UsedPercent < 0 {
 				return unknown()
 			}
+			weekly = append(weekly, WeeklyWindow{ResetsAt: codexWindowReset(w, *r.LastSuccessAt), Pct: clampPercent(*w.UsedPercent)})
 			if best == nil || clampPercent(*w.UsedPercent) > clampPercent(*best.UsedPercent) {
 				best = w
 			}
@@ -193,19 +199,27 @@ func EvaluateCodex(threshold *int16, r CodexReading, interval time.Duration, now
 	if best == nil {
 		return unknown()
 	}
-	var resetsAt *time.Time
-	switch {
-	case best.ResetAt != nil && validReset(*best.ResetAt):
-		t := time.Unix(*best.ResetAt, 0).UTC()
-		resetsAt = &t
-	case best.ResetAfterSeconds != nil && *best.ResetAfterSeconds >= 0:
-		t := r.LastSuccessAt.Add(time.Duration(*best.ResetAfterSeconds) * time.Second).UTC()
-		resetsAt = &t
-	}
+	resetsAt := codexWindowReset(best, *r.LastSuccessAt)
 	if preReset(resetsAt, *r.LastSuccessAt, now) {
 		return unknown()
 	}
-	return decide(*threshold, clampPercent(*best.UsedPercent), resetsAt)
+	v := decide(*threshold, clampPercent(*best.UsedPercent), resetsAt)
+	v.Weekly = weekly
+	return v
+}
+
+// codexWindowReset is a Codex window's reset: its absolute reset when valid, else the reading time
+// plus its relative reset, else nil.
+func codexWindowReset(w *apitypes.CodexRateLimitWindowDTO, readAt time.Time) *time.Time {
+	switch {
+	case w.ResetAt != nil && validReset(*w.ResetAt):
+		t := time.Unix(*w.ResetAt, 0).UTC()
+		return &t
+	case w.ResetAfterSeconds != nil && *w.ResetAfterSeconds >= 0:
+		t := readAt.Add(time.Duration(*w.ResetAfterSeconds) * time.Second).UTC()
+		return &t
+	}
+	return nil
 }
 
 func clampPercent(p float64) float64 { return math.Min(p, 100) }
@@ -244,4 +258,36 @@ func validReset(reset int64) bool { return reset > 0 && reset <= 253402300799 }
 
 func validPercent(pct *float64) bool {
 	return pct != nil && !math.IsNaN(*pct) && !math.IsInf(*pct, 0) && *pct >= 0 && *pct <= 100
+}
+
+// WeeklyWindow is one Codex weekly window of a reading: its reset (nil when the reading carried
+// none) and its clamped used percent.
+type WeeklyWindow struct {
+	ResetsAt *time.Time
+	Pct      float64
+}
+
+// CodexOverrideResetObserved reports whether a fresh Codex reading shows the week that a manual-resume
+// override was granted under has reset. An account can report several weekly windows, and the verdict
+// follows whichever is highest, so the anchor (the granted window's reset) identifies the window: a
+// window whose reset is within ResetEpochMoveMargin of the anchor is the same window, and only its own
+// usage drop can show a fixed-grid reset (CodexResetObserved on that window). When no window still
+// matches the anchor, the granted window reset and rolled forward iff some window now resets more than
+// the margin past the anchor. A nil priorPct disables the drop arm.
+func CodexOverrideResetObserved(anchor time.Time, priorPct *float64, weekly []WeeklyWindow) bool {
+	moved := false
+	for _, w := range weekly {
+		if w.ResetsAt == nil {
+			continue
+		}
+		d := w.ResetsAt.Sub(anchor)
+		if d >= -ResetEpochMoveMargin && d <= ResetEpochMoveMargin {
+			fresh := w.Pct
+			return CodexResetObserved(anchor.Unix(), w.ResetsAt.Unix(), priorPct, &fresh)
+		}
+		if d > ResetEpochMoveMargin {
+			moved = true
+		}
+	}
+	return moved
 }

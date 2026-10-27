@@ -228,3 +228,35 @@ func TestCodexResetObserved(t *testing.T) {
 }
 
 func nan() float64 { z := 0.0; return z / z }
+
+// TestCodexOverrideFollowsGrantedWindow (Greptile #3568): with two weekly windows, the override
+// follows the window it was granted on, matched by its reset, not whichever window is highest now.
+func TestCodexOverrideFollowsGrantedWindow(t *testing.T) {
+	const week = 604800
+	a := now.Add(48 * time.Hour).Truncate(time.Second)  // window A: granted on at 90%
+	b := now.Add(120 * time.Hour).Truncate(time.Second) // window B
+	prior := 90.0
+	// Evaluation: B overtakes A, so the verdict's reset is B's, and Weekly carries both windows.
+	v := EvaluateCodex(i16(70), codexAt(
+		apitypes.CodexRateLimitBucketDTO{ID: "codex", Secondary: win(90, week, a.Unix())},
+		apitypes.CodexRateLimitBucketDTO{ID: "codex_other", Primary: win(91, week, b.Unix())}), 5*time.Minute, now)
+	if v.ResetsAt == nil || !v.ResetsAt.Equal(b) || len(v.Weekly) != 2 {
+		t.Fatalf("verdict = %+v, want B's reset and both weekly windows", v)
+	}
+	if CodexOverrideResetObserved(a, &prior, v.Weekly) {
+		t.Fatal("B overtaking A is not a reset of A")
+	}
+	// A resets on time and rolls forward a week: no window still matches the anchor, one moved past it.
+	rolled := []WeeklyWindow{{ResetsAt: tp(a.Add(7 * 24 * time.Hour)), Pct: 3}, {ResetsAt: tp(b), Pct: 91}}
+	if !CodexOverrideResetObserved(a, &prior, rolled) {
+		t.Fatal("A rolling forward is a reset")
+	}
+	// Fixed-grid reset of A in place: same boundary, usage dropped, while B stays high.
+	cleared := []WeeklyWindow{{ResetsAt: tp(a), Pct: 0}, {ResetsAt: tp(b), Pct: 91}}
+	if !CodexOverrideResetObserved(a, &prior, cleared) {
+		t.Fatal("A dropping to 0 under its unchanged boundary is a reset")
+	}
+	if CodexOverrideResetObserved(a, nil, cleared) {
+		t.Fatal("with no recorded prior the drop arm cannot fire")
+	}
+}

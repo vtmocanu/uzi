@@ -460,18 +460,24 @@ func overrideEndedByReading(run store.Run, snap *reserveSnap) bool {
 	// reset when the prior reached the detectors' own floor; below usagereserve.PctResetFloor the drop
 	// arm cannot fire (the moved-boundary arm and the clock arm still end the exemption). A row with an
 	// anchor but no recorded prior cannot prove a drop, so only those two arms apply to it.
-	if !run.ReserveExemptPriorPct.Valid {
-		if codex {
-			return usagereserve.CodexResetObserved(anchor.Unix(), v.ResetsAt.Unix(), nil, nil)
+	var prior *float64
+	if run.ReserveExemptPriorPct.Valid {
+		p := float64(run.ReserveExemptPriorPct.Int16)
+		prior = &p
+	}
+	if codex {
+		// An account can report several weekly windows and the verdict follows the highest, so the
+		// override follows the window it was granted on, matched by its reset (Greptile #3568).
+		weekly := v.Weekly
+		if len(weekly) == 0 {
+			weekly = []usagereserve.WeeklyWindow{{ResetsAt: v.ResetsAt, Pct: float64(v.Pct)}}
 		}
+		return usagereserve.CodexOverrideResetObserved(anchor, prior, weekly)
+	}
+	if prior == nil {
 		return usagereserve.ClaudeResetObserved(anchor, nil, v.ResetsAt, v.Pct)
 	}
-	prior := float64(run.ReserveExemptPriorPct.Int16)
-	if codex {
-		fresh := float64(v.Pct)
-		return usagereserve.CodexResetObserved(anchor.Unix(), v.ResetsAt.Unix(), &prior, &fresh)
-	}
-	priorPct := int16(prior)
+	priorPct := int16(*prior)
 	return usagereserve.ClaudeResetObserved(anchor, &priorPct, v.ResetsAt, v.Pct)
 }
 
