@@ -76,9 +76,8 @@ first send. The pending queue holds 32 observations including the active
 send; overflow drops signals rather than inventing evidence.
 
 The worker client has separate bounds of **1,024 live reporters** and
-**1,024 recent closed/refused generation markers**, correcting the previously
-reported lifetime cutoff. Closing removes the live reporter and frees capacity
-for future bindings. Concurrent live overflow drops the telemetry binding but
+**1,024 recent closed/refused generation markers**. Closing removes the live
+reporter and frees capacity for future bindings. Concurrent live overflow drops the telemetry binding but
 records its generation to fence older pending responses. Closed markers retain
 recent generation high-water marks in FIFO order. Eviction rotates the claim
 observation epoch to prevent pre-eviction responses from rebinding forgotten
@@ -108,14 +107,10 @@ Roll-forward reapplies still-live finite state; expired rows follow the
 quiet-reset policy when qualifying evidence next arrives. Do not run the
 schema Down migrations as an application rollback.
 
-The M4 reconstruction test creates a separate database pool and service
+Automated reconstruction coverage creates a separate database pool and service
 instance; it does not exercise a binary or Kubernetes restart. An optional
 operator rollout smoke check can observe a queued run across an API restart
-and confirm admission after eligibility; it is separate from required gates.
-Before merge, the maintainer/CI must complete **full agent suite: exact-head PR CI**:
-successful required `validate-agent`, both `test-agent-shard` legs and the
-worker-UID lane on the exact published head. The worker cannot trigger hosted
-jobs before publication; these checks remain external and unverified here.
+and confirm admission after eligibility; it is separate from CI gates.
 See [ADR-1106](../adr/1106-codex-harness.md#amendment-temporary-account-admission-3530-2026-10-27)
 for the statement-snapshot boundary and critical invariants.
 

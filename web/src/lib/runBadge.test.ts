@@ -1516,6 +1516,18 @@ describe("Codex admission read-time projection", () => {
       label: "⚠ waiting for worker", title: `${reason} · ${text}`,
     });
   });
+  it.each([
+    "handoff setup has not finished",
+    "your vault is locked, so this run can't start",
+    "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs",
+    "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
+  ])("preserves the higher-priority queued blocker %s", (reason) => {
+    const text = codexAdmissionText(held, NOW);
+    const r = { ...held, health_reason: reason };
+    for (const badge of [healthBadge(r, NOW), runBadge(r, NOW)]) {
+      expect(badge).toMatchObject({ label: "⚠ waiting for worker", title: `${reason} · ${text}`, tone: "warning" });
+    }
+  });
   it("renders a redacted shared summary without inventing account detail", () => {
     expect(healthBadge(run({ status: "queued", health: "waiting_worker", health_reason: null }), NOW))
       .toMatchObject({ label: "⚠ waiting for worker", title: undefined });

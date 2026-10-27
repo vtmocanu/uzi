@@ -57,6 +57,10 @@ func TestCodexAdmissionQueuedBlockerPriority(t *testing.T) {
 			name, status, queue, health, want string
 		}{
 			{"queued account unavailable", "queued", "codex_" + class, unavailable, "queued (" + unavailable + ")"},
+			{"queued handoff", "queued", "codex_" + class, "handoff setup has not finished", "queued (handoff setup has not finished)"},
+			{"queued vault", "queued", "codex_" + class, "your vault is locked, so this run can't start", "queued (your vault is locked, so this run can't start)"},
+			{"queued custody", "queued", "codex_" + class, "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs", "queued (you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs)"},
+			{"queued custody unavailable", "queued", "codex_" + class, "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings", "queued (new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings)"},
 			{"maintenance coexistence", "queued", "maintenance", unavailable, "queued (maintenance (uzi is in maintenance mode))"},
 			{"recovery wait", "recovery_wait", "codex_" + class, unavailable, "recovery_wait (Codex reconciling)"},
 			{"untyped provider text", "queued", "codex_" + class, "provider reported overload", "queued"},
@@ -73,6 +77,10 @@ func TestCodexAdmissionQueuedBlockerPriority(t *testing.T) {
 						run.CodexAccountAction = sp(codexActionReconciling)
 					}
 					want := tc.want
+					if strings.HasPrefix(tc.name, "queued ") && tc.name != "queued account unavailable" && delta <= 0 {
+						// The existing compact list only adds these blockers alongside active admission.
+						want = "queued"
+					}
 					if tc.status == "queued" && delta > 0 && tc.name != "untyped provider text" {
 						copy := "waiting: provider reported overload; account admission eligible after 2026-10-27T12:01:00Z"
 						if class == "rate_limit" {

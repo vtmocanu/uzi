@@ -1166,6 +1166,20 @@ type healthEligibilityResult struct {
 	err    error
 }
 
+// QueuedReasonPrecedesCodexAdmission identifies the owner/setup blockers that
+// queuedReasonWithEligibility resolves before temporary provider admission.
+// Maintenance is projected separately at read time, so stale maintenance text
+// must not keep outranking an active cooldown after maintenance ends.
+func QueuedReasonPrecedesCodexAdmission(reason string) bool {
+	switch reason {
+	case reasonHandoffSetup, reasonVaultLocked, reasonCustodyLimit,
+		reasonCustodyLimitUnavailable, reasonCodexAccountUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, early bool, projection *healthEligibilityResult) string {
 	// PRD #3454: the instance intake pause outranks every rung, the handoff one included, since the
 	// pause is the reason ClaimRun matches nothing.

@@ -47,7 +47,7 @@ import {
   maintenanceQueueText,
   codexAdmissionText,
   displayHealthReason,
-  isCodexAccountUnavailable,
+  queuedBlockerPrecedesCodexAdmission,
   isStoppedRun,
   isRejectedRun,
   milestoneBadge,
@@ -334,7 +334,7 @@ export function HealthFlag({ run }: { run: Run }) {
   // for" clock: the wait is the admin's drain, not a fault.
   const maintenance = isMaintenanceQueued(run);
   const admission = codexAdmissionText(run, now);
-  const primaryAdmission = !maintenance && !isCodexAccountUnavailable(run) ? admission : null;
+  const primaryAdmission = !maintenance && !queuedBlockerPrecedesCodexAdmission(run) ? admission : null;
   const reason = displayHealthReason(run);
   const show = !maintenance && !primaryAdmission && shouldShowHealthFlag(run.health, run.status);
   const since = run.health_since ? Date.parse(run.health_since) : NaN;

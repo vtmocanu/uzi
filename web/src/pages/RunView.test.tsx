@@ -7545,10 +7545,15 @@ describe("HealthFlag Codex admission", () => {
 });
 
 
-it("HealthFlag Codex admission keeps account unavailability primary", () => {
+it.each([
+  "handoff setup has not finished",
+  "your vault is locked, so this run can't start",
+  "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs",
+  "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
+  "your Codex account is unavailable (quarantined or being re-linked), so this run can't start",
+])("HealthFlag Codex admission keeps %s primary", (reason) => {
   const now = vi.spyOn(Date, "now").mockReturnValue(0);
   try {
-    const reason = "your Codex account is unavailable (quarantined or being re-linked), so this run can't start";
     const { container } = render(<HealthFlag run={run({ status: "queued", health: "waiting_worker", health_reason: reason,
       codex_admission_class: "overload", codex_admission_eligible_at: "2026-10-27T12:01:37Z" })} />);
     expect(container.textContent).toContain(reason);

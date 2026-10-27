@@ -173,6 +173,16 @@ func TestCodexAdmissionSharedAliasesAndOtherAccountLiveDB(t *testing.T) {
 	if r := mustRun(t, e, reimportRun); r.Status != "queued" || r.ClaimGeneration != 0 {
 		t.Fatal("reimport reset admission")
 	}
+	// Expiry must reopen the shared canonical account, including the reimport.
+	e.exec("UPDATE codex_account_admission_throttle SET effective_expiry=now()-interval '2 minutes' WHERE user_id=$1", owner)
+	remaining := map[uuid.UUID]bool{runA: true, runB: true, reimportRun: true}
+	for range 3 {
+		claimed, err := e.q.ClaimRun(e.ctx, e.codexClaimParams(owner, worker, caps))
+		if err != nil || !remaining[claimed.ID] || claimed.ClaimGeneration != 1 {
+			t.Fatalf("expired shared account claim = %s gen=%d, %v", claimed.ID, claimed.ClaimGeneration, err)
+		}
+		delete(remaining, claimed.ID)
+	}
 }
 
 func TestCodexAdmissionSubscriptionOnlyLiveDB(t *testing.T) {

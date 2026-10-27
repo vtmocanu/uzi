@@ -896,7 +896,7 @@ func overlayAdmissionReason(reason *string, queueReason string, class *string, e
 	if queueReason == "maintenance" || class == nil || eligibleAt == nil {
 		return reason
 	}
-	if reason != nil && *reason == "your Codex account is unavailable (quarantined or being re-linked), so this run can't start" {
+	if reason != nil && workersvc.QueuedReasonPrecedesCodexAdmission(*reason) {
 		return reason
 	}
 	current := apitypes.CodexAdmissionReason(*class, *eligibleAt)

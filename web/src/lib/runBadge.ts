@@ -499,9 +499,15 @@ export function displayHealthReason(run: Pick<HealthFlaggable, "health_reason">)
     ? null : reason || null;
 }
 
-export function isCodexAccountUnavailable(run: Pick<HealthFlaggable, "status" | "health_reason">): boolean {
-  return run.status === "queued" && run.health_reason ===
-    "your Codex account is unavailable (quarantined or being re-linked), so this run can't start";
+export function queuedBlockerPrecedesCodexAdmission(run: Pick<HealthFlaggable, "status" | "health_reason">): boolean {
+  // Mirror the blockers before admission in queuedReasonWithEligibility (health.go).
+  return run.status === "queued" && [
+    "handoff setup has not finished",
+    "your vault is locked, so this run can't start",
+    "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs",
+    "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
+    "your Codex account is unavailable (quarantined or being re-linked), so this run can't start",
+  ].includes(run.health_reason ?? "");
 }
 
 // isMaintenanceQueued reports whether instance maintenance mode, not a missing worker, is
@@ -567,7 +573,7 @@ export function healthBadge(
       wrap: true,
     };
   }
-  if (admission && !isCodexAccountUnavailable(run)) {
+  if (admission && !queuedBlockerPrecedesCodexAdmission(run)) {
     return { kind: "badge", label: admission, title: admission, tone: "info", pulse: false, wrap: true };
   }
   if (!shouldShowHealthFlag(run.health, run.status)) return null;
