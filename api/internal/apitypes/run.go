@@ -574,7 +574,12 @@ type RunDTO struct {
 	// held because the credential it would spend reads at or above the owner's threshold, or
 	// cannot be read. Absent otherwise; runToDTO fills it only while status is "queued".
 	ReserveHoldReason *string `json:"reserve_hold_reason,omitempty"`
-	PlanMd            *string `json:"plan_md"`
+	// ReserveExemptUntil (PRD #3522 M4a) is when the owner's manual resume of a weekly-reserve pause
+	// stops exempting this run from the reserve (the next observed 7-day reset, or seven days after
+	// the resume when no reset time was known). Absent when no exemption is in force; it clears early
+	// when the reset is observed sooner.
+	ReserveExemptUntil *time.Time `json:"reserve_exempt_until,omitempty"`
+	PlanMd             *string    `json:"plan_md"`
 	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
 	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
 	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB
@@ -1429,6 +1434,11 @@ type RunSummaryItemDTO struct {
 	// held because the credential it would spend reads at or above the owner's threshold, or
 	// cannot be read. Absent otherwise; runToDTO fills it only while status is "queued".
 	ReserveHoldReason *string `json:"reserve_hold_reason,omitempty"`
+	// ReserveExemptUntil (PRD #3522 M4a) is when the owner's manual resume of a weekly-reserve pause
+	// stops exempting this run from the reserve (the next observed 7-day reset, or seven days after
+	// the resume when no reset time was known). Absent when no exemption is in force; it clears early
+	// when the reset is observed sooner.
+	ReserveExemptUntil *time.Time `json:"reserve_exempt_until,omitempty"`
 	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
 	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
 	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB
@@ -1950,6 +1960,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		DeadlineAt:                  item.DeadlineAt,
 		QueueReason:                 item.QueueReason,
 		ReserveHoldReason:           item.ReserveHoldReason,
+		ReserveExemptUntil:          item.ReserveExemptUntil,
 		PlanSource:                  item.PlanSource,
 		GateRevision:                item.GateRevision,
 		SummaryIntent:               item.SummaryIntent,
@@ -2118,6 +2129,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			DeadlineAt:                  s.DeadlineAt,
 			QueueReason:                 s.QueueReason,
 			ReserveHoldReason:           s.ReserveHoldReason,
+			ReserveExemptUntil:          s.ReserveExemptUntil,
 			PlanSource:                  s.PlanSource,
 			GateRevision:                s.GateRevision,
 			SummaryIntent:               s.SummaryIntent,

@@ -1026,6 +1026,9 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, workersvc.ErrNoPausePending):
 			// PRD #1190 M1: pause_cancel with nothing pending → 409.
 			httpx.Error(w, http.StatusConflict, "no pause is pending")
+		case errors.Is(err, workersvc.ErrReservePausePending):
+			// PRD #3522 M4a: the pending pause is the weekly reserve's own → 409 naming the levers.
+			httpx.Error(w, http.StatusConflict, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidPauseMode):
 			// PRD #1190 M1: the pause body was neither 'milestone' nor 'now' → 400 (a caller
 			// error). The service built the reason clause, so surface it verbatim.

@@ -12,6 +12,34 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const clearReserveOverride = `-- name: ClearReserveOverride :execrows
+UPDATE runs SET
+    reserve_exempt_until         = NULL,
+    reserve_exempt_granted_at    = NULL,
+    reserve_exempt_credential_id = NULL,
+    reserve_exempt_window_reset  = NULL
+WHERE id = $1
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  AND reserve_exempt_until IS NOT NULL
+  AND reserve_exempt_granted_at IS NOT DISTINCT FROM $2::timestamptz
+`
+
+type ClearReserveOverrideParams struct {
+	ID                uuid.UUID          `json:"id"`
+	ExpectedGrantedAt pgtype.Timestamptz `json:"expected_granted_at"`
+}
+
+// Drop an ended manual-resume exemption (all four columns) so the display and the claim gate agree.
+// Guarded on the grant time the caller READ, so a fresh grant that landed between the list and this
+// write is never cleared. updated_at is untouched (display state).
+func (q *Queries) ClearReserveOverride(ctx context.Context, arg ClearReserveOverrideParams) (int64, error) {
+	result, err := q.db.Exec(ctx, clearReserveOverride, arg.ID, arg.ExpectedGrantedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const listQueuedRunsForReserve = `-- name: ListQueuedRunsForReserve :many
 SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates, reserve_hold_reason, reserve_exempt_until, reserve_exempt_granted_at, reserve_exempt_credential_id, reserve_exempt_window_reset FROM runs
 WHERE user_id = $1 AND status = 'queued' AND kind <> 'chat'
@@ -265,6 +293,479 @@ func (q *Queries) ListReserveMarkOwners(ctx context.Context) ([]uuid.UUID, error
 	return items, nil
 }
 
+const listReserveOverrideRuns = `-- name: ListReserveOverrideRuns :many
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates, reserve_hold_reason, reserve_exempt_until, reserve_exempt_granted_at, reserve_exempt_credential_id, reserve_exempt_window_reset FROM runs
+WHERE user_id = $1 AND status = 'queued' AND reserve_exempt_until IS NOT NULL
+`
+
+// One owner's QUEUED runs that carry a manual-resume exemption: the set ClaimRun's
+// reserve_override_ended list is computed from (an exemption the reading-aware rule has ended
+// early, which the time-only SQL test cannot see).
+func (q *Queries) ListReserveOverrideRuns(ctx context.Context, userID uuid.UUID) ([]Run, error) {
+	rows, err := q.db.Query(ctx, listReserveOverrideRuns, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Run{}
+	for rows.Next() {
+		var i Run
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.RepoID,
+			&i.IssueIid,
+			&i.IssueTitle,
+			&i.IssueDescription,
+			&i.Status,
+			&i.RequeueCount,
+			&i.WorkerID,
+			&i.SessionID,
+			&i.LastSeq,
+			&i.Branch,
+			&i.MrIid,
+			&i.FailureReason,
+			&i.PlanMd,
+			&i.IterationCount,
+			&i.ClaimedAt,
+			&i.StartedAt,
+			&i.FinishedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.OriginColumn,
+			&i.BoardColumn,
+			&i.MovePendingSince,
+			&i.MrState,
+			&i.AutoApprove,
+			&i.AutopilotCommentedAt,
+			&i.Kind,
+			&i.PipelineID,
+			&i.PipelineRef,
+			&i.FailureSnapshot,
+			&i.FixVerdict,
+			&i.StopKind,
+			&i.AgentSource,
+			&i.AgentExclusions,
+			&i.RepoAgents,
+			&i.Title,
+			&i.ResumeOfRunID,
+			&i.LastActivityAt,
+			&i.Health,
+			&i.HealthReason,
+			&i.HealthSince,
+			&i.HealthNotifiedAt,
+			&i.TargetRunID,
+			&i.MrWebUrl,
+			&i.PrdDonePath,
+			&i.PrdPatchSettledAt,
+			&i.AnthropicSecretID,
+			&i.AnthropicSecretLabel,
+			&i.AnthropicSelectReason,
+			&i.AnthropicHeadroomPct,
+			&i.WaitOnLimit,
+			&i.LimitResetsAt,
+			&i.RetryNotBefore,
+			&i.LimitWaitCount,
+			&i.RateLimitType,
+			&i.OpenQuestionID,
+			&i.ReviseCount,
+			&i.PlanSource,
+			&i.PlannedBaseCommit,
+			&i.RequireBaseMatch,
+			&i.MilestonesCandidate,
+			&i.MilestonesFrozen,
+			&i.MilestonesCompleted,
+			&i.MilestonesInProgress,
+			&i.BudgetMaxIterations,
+			&i.BudgetWallSeconds,
+			&i.ScheduleID,
+			&i.LimitDeadSecretID,
+			&i.ReportOnly,
+			&i.ReportMd,
+			&i.CiConfigPaths,
+			&i.Model,
+			&i.OverrideSubagentModel,
+			&i.FailOrigin,
+			&i.Priority,
+			&i.SummaryIntent,
+			&i.SummaryPlan,
+			&i.SummaryDeltas,
+			&i.IssueComments,
+			&i.BaseBranch,
+			&i.OpenMr,
+			&i.DispatchedAt,
+			&i.ReviewTargetRunID,
+			&i.ReviewRequested,
+			&i.ThenFixRequested,
+			&i.ThenFixOfRunID,
+			&i.PreservedPatch,
+			&i.RequiredCapabilities,
+			&i.StopReason,
+			&i.RequiredTools,
+			&i.SizeClass,
+			&i.Interactive,
+			&i.OpenFollowupID,
+			&i.PlanChangedFiles,
+			&i.ScopeCeiling,
+			&i.StatusSince,
+			&i.ReviewComments,
+			&i.BudgetPausedSeconds,
+			&i.MrReworkEnabled,
+			&i.TriggerSource,
+			&i.CheckpointTip,
+			&i.UsageRefolded,
+			&i.CodexSecretID,
+			&i.CodexAuthMode,
+			&i.CodexSecretLabel,
+			&i.CodexAccountKey,
+			&i.CodexMaterialRevision,
+			&i.CodexAccountRevision,
+			&i.CodexClaimEpoch,
+			&i.CodexCapHash,
+			&i.PauseRequestedAt,
+			&i.PauseMode,
+			&i.PauseAfterCount,
+			&i.CheckpointTipAt,
+			&i.RecoveryWaitCount,
+			&i.RecoveryRetryNotBefore,
+			&i.CompletionContractVersion,
+			&i.ContractRevision,
+			&i.CompletionContract,
+			&i.CompletionAttempts,
+			&i.LatestCompletionAttempt,
+			&i.MilestonesAgents,
+			&i.HoldReason,
+			&i.HoldCapturedHead,
+			&i.CompletionBudgetExhaustedAt,
+			&i.CompletionQuestionAt,
+			&i.BudgetExtensionSeconds,
+			&i.ClaimGeneration,
+			&i.Harness,
+			&i.RecoveryWaitCause,
+			&i.ForgeParkCount,
+			&i.CredentialOverrideMode,
+			&i.CredentialOverrideSecretID,
+			&i.ClaimReleasedAt,
+			&i.CredentialSwitchRequestedAt,
+			&i.CredentialSwitchGeneration,
+			&i.StaleRequeueGeneration,
+			&i.BudgetFinalizeSeconds,
+			&i.ReleasedWorkerID,
+			&i.ReleasedWorkerNonce,
+			&i.GateRevision,
+			&i.GatePresentationID,
+			&i.GatePresentedPayload,
+			&i.GatePayloadDigest,
+			&i.GateRefusalCount,
+			&i.GateRefusalGeneration,
+			&i.DiskParkCount,
+			&i.CheckpointContainsLatest,
+			&i.EgressProfileID,
+			&i.EgressSnapshot,
+			&i.JobType,
+			&i.FinalizeResumeGeneration,
+			&i.JobProtocol,
+			&i.FirstStartedAt,
+			&i.PlanCrossCheckRequired,
+			&i.PlanCrossCheckGateReason,
+			&i.IssueRawDigest,
+			&i.IssueSavedBody,
+			&i.IssueInputReason,
+			&i.AutoApproveBlockedReasons,
+			&i.PlanCrossCheckDiffRefusal,
+			&i.WorkerRecoveryEpisode,
+			&i.RequeueEpisodeBaseline,
+			&i.WorkerRecoveryEvidence,
+			&i.CrossCheckLane,
+			&i.CrossCheckLaneGeneration,
+			&i.CompletionFinalHead,
+			&i.CodeCrossCheckRequired,
+			&i.ProviderParkCount,
+			&i.ProviderParkStreakStartedAt,
+			&i.CiConfigGuard,
+			&i.MemoryEpisode,
+			&i.MemoryInterventionCount,
+			&i.MemoryPolicy,
+			&i.CompletionNonClosingReason,
+			&i.CiArtifactManifest,
+			&i.CheckpointAttestedSource,
+			&i.SourcePublicationIntent,
+			&i.ContinuedIssueIid,
+			&i.CheckpointCoordinates,
+			&i.ReserveHoldReason,
+			&i.ReserveExemptUntil,
+			&i.ReserveExemptGrantedAt,
+			&i.ReserveExemptCredentialID,
+			&i.ReserveExemptWindowReset,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listReservePauseOwners = `-- name: ListReservePauseOwners :many
+
+SELECT u.id AS user_id FROM users u
+WHERE u.weekly_reserve_pct IS NOT NULL
+  AND EXISTS (SELECT 1 FROM runs r WHERE r.user_id = u.id AND r.status = 'running')
+UNION
+SELECT r.user_id FROM runs r
+WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
+  AND (r.pause_mode = 'reserve' OR r.hold_reason = 'weekly_reserve' OR r.reserve_exempt_until IS NOT NULL)
+`
+
+// PRD #3522 M4a: the weekly reserve's pause side. Go decides WHICH runs (the reserveEnforced gate and
+// the fresh verdict of each run's recorded credential); these statements apply the decision by run id
+// with the guards repeated, so a run that changed between the list and the write is left alone.
+// The owners the sweeper's reserve pause pass must visit: a user with a threshold set that has a
+// running run (a pause may be requested), and ANY user holding a non-terminal run that carries
+// reserve state (a pending reserve request, a weekly_reserve pause, or a manual-resume exemption), so
+// clearing the threshold or flipping the toggle still reaches them.
+func (q *Queries) ListReservePauseOwners(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listReservePauseOwners)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var user_id uuid.UUID
+		if err := rows.Scan(&user_id); err != nil {
+			return nil, err
+		}
+		items = append(items, user_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listReservePauseRunsForOwner = `-- name: ListReservePauseRunsForOwner :many
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates, reserve_hold_reason, reserve_exempt_until, reserve_exempt_granted_at, reserve_exempt_credential_id, reserve_exempt_window_reset FROM runs
+WHERE user_id = $1 AND kind <> 'chat'
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  AND (status = 'running' OR pause_mode = 'reserve' OR hold_reason = 'weekly_reserve'
+       OR reserve_exempt_until IS NOT NULL)
+ORDER BY created_at, id
+`
+
+// One owner's non-terminal, non-chat runs the reserve pause pass may act on: running runs (a pause
+// may be requested), runs carrying a pending reserve request, weekly_reserve pauses (release) and runs
+// carrying a manual-resume exemption (expiry). Whole rows: Go evaluates the same fields the claim
+// gate reads.
+func (q *Queries) ListReservePauseRunsForOwner(ctx context.Context, userID uuid.UUID) ([]Run, error) {
+	rows, err := q.db.Query(ctx, listReservePauseRunsForOwner, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Run{}
+	for rows.Next() {
+		var i Run
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.RepoID,
+			&i.IssueIid,
+			&i.IssueTitle,
+			&i.IssueDescription,
+			&i.Status,
+			&i.RequeueCount,
+			&i.WorkerID,
+			&i.SessionID,
+			&i.LastSeq,
+			&i.Branch,
+			&i.MrIid,
+			&i.FailureReason,
+			&i.PlanMd,
+			&i.IterationCount,
+			&i.ClaimedAt,
+			&i.StartedAt,
+			&i.FinishedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.OriginColumn,
+			&i.BoardColumn,
+			&i.MovePendingSince,
+			&i.MrState,
+			&i.AutoApprove,
+			&i.AutopilotCommentedAt,
+			&i.Kind,
+			&i.PipelineID,
+			&i.PipelineRef,
+			&i.FailureSnapshot,
+			&i.FixVerdict,
+			&i.StopKind,
+			&i.AgentSource,
+			&i.AgentExclusions,
+			&i.RepoAgents,
+			&i.Title,
+			&i.ResumeOfRunID,
+			&i.LastActivityAt,
+			&i.Health,
+			&i.HealthReason,
+			&i.HealthSince,
+			&i.HealthNotifiedAt,
+			&i.TargetRunID,
+			&i.MrWebUrl,
+			&i.PrdDonePath,
+			&i.PrdPatchSettledAt,
+			&i.AnthropicSecretID,
+			&i.AnthropicSecretLabel,
+			&i.AnthropicSelectReason,
+			&i.AnthropicHeadroomPct,
+			&i.WaitOnLimit,
+			&i.LimitResetsAt,
+			&i.RetryNotBefore,
+			&i.LimitWaitCount,
+			&i.RateLimitType,
+			&i.OpenQuestionID,
+			&i.ReviseCount,
+			&i.PlanSource,
+			&i.PlannedBaseCommit,
+			&i.RequireBaseMatch,
+			&i.MilestonesCandidate,
+			&i.MilestonesFrozen,
+			&i.MilestonesCompleted,
+			&i.MilestonesInProgress,
+			&i.BudgetMaxIterations,
+			&i.BudgetWallSeconds,
+			&i.ScheduleID,
+			&i.LimitDeadSecretID,
+			&i.ReportOnly,
+			&i.ReportMd,
+			&i.CiConfigPaths,
+			&i.Model,
+			&i.OverrideSubagentModel,
+			&i.FailOrigin,
+			&i.Priority,
+			&i.SummaryIntent,
+			&i.SummaryPlan,
+			&i.SummaryDeltas,
+			&i.IssueComments,
+			&i.BaseBranch,
+			&i.OpenMr,
+			&i.DispatchedAt,
+			&i.ReviewTargetRunID,
+			&i.ReviewRequested,
+			&i.ThenFixRequested,
+			&i.ThenFixOfRunID,
+			&i.PreservedPatch,
+			&i.RequiredCapabilities,
+			&i.StopReason,
+			&i.RequiredTools,
+			&i.SizeClass,
+			&i.Interactive,
+			&i.OpenFollowupID,
+			&i.PlanChangedFiles,
+			&i.ScopeCeiling,
+			&i.StatusSince,
+			&i.ReviewComments,
+			&i.BudgetPausedSeconds,
+			&i.MrReworkEnabled,
+			&i.TriggerSource,
+			&i.CheckpointTip,
+			&i.UsageRefolded,
+			&i.CodexSecretID,
+			&i.CodexAuthMode,
+			&i.CodexSecretLabel,
+			&i.CodexAccountKey,
+			&i.CodexMaterialRevision,
+			&i.CodexAccountRevision,
+			&i.CodexClaimEpoch,
+			&i.CodexCapHash,
+			&i.PauseRequestedAt,
+			&i.PauseMode,
+			&i.PauseAfterCount,
+			&i.CheckpointTipAt,
+			&i.RecoveryWaitCount,
+			&i.RecoveryRetryNotBefore,
+			&i.CompletionContractVersion,
+			&i.ContractRevision,
+			&i.CompletionContract,
+			&i.CompletionAttempts,
+			&i.LatestCompletionAttempt,
+			&i.MilestonesAgents,
+			&i.HoldReason,
+			&i.HoldCapturedHead,
+			&i.CompletionBudgetExhaustedAt,
+			&i.CompletionQuestionAt,
+			&i.BudgetExtensionSeconds,
+			&i.ClaimGeneration,
+			&i.Harness,
+			&i.RecoveryWaitCause,
+			&i.ForgeParkCount,
+			&i.CredentialOverrideMode,
+			&i.CredentialOverrideSecretID,
+			&i.ClaimReleasedAt,
+			&i.CredentialSwitchRequestedAt,
+			&i.CredentialSwitchGeneration,
+			&i.StaleRequeueGeneration,
+			&i.BudgetFinalizeSeconds,
+			&i.ReleasedWorkerID,
+			&i.ReleasedWorkerNonce,
+			&i.GateRevision,
+			&i.GatePresentationID,
+			&i.GatePresentedPayload,
+			&i.GatePayloadDigest,
+			&i.GateRefusalCount,
+			&i.GateRefusalGeneration,
+			&i.DiskParkCount,
+			&i.CheckpointContainsLatest,
+			&i.EgressProfileID,
+			&i.EgressSnapshot,
+			&i.JobType,
+			&i.FinalizeResumeGeneration,
+			&i.JobProtocol,
+			&i.FirstStartedAt,
+			&i.PlanCrossCheckRequired,
+			&i.PlanCrossCheckGateReason,
+			&i.IssueRawDigest,
+			&i.IssueSavedBody,
+			&i.IssueInputReason,
+			&i.AutoApproveBlockedReasons,
+			&i.PlanCrossCheckDiffRefusal,
+			&i.WorkerRecoveryEpisode,
+			&i.RequeueEpisodeBaseline,
+			&i.WorkerRecoveryEvidence,
+			&i.CrossCheckLane,
+			&i.CrossCheckLaneGeneration,
+			&i.CompletionFinalHead,
+			&i.CodeCrossCheckRequired,
+			&i.ProviderParkCount,
+			&i.ProviderParkStreakStartedAt,
+			&i.CiConfigGuard,
+			&i.MemoryEpisode,
+			&i.MemoryInterventionCount,
+			&i.MemoryPolicy,
+			&i.CompletionNonClosingReason,
+			&i.CiArtifactManifest,
+			&i.CheckpointAttestedSource,
+			&i.SourcePublicationIntent,
+			&i.ContinuedIssueIid,
+			&i.CheckpointCoordinates,
+			&i.ReserveHoldReason,
+			&i.ReserveExemptUntil,
+			&i.ReserveExemptGrantedAt,
+			&i.ReserveExemptCredentialID,
+			&i.ReserveExemptWindowReset,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listReserveWorkers = `-- name: ListReserveWorkers :many
 SELECT id, ephemeral, ephemeral_run_id, anthropic_bind_mode, anthropic_secret_id,
        last_heartbeat_at, draining_since, maintenance_fenced, maintenance_phase
@@ -316,6 +817,61 @@ func (q *Queries) ListReserveWorkers(ctx context.Context, userID uuid.UUID) ([]L
 	return items, nil
 }
 
+const requestReservePauses = `-- name: RequestReservePauses :many
+WITH requested AS (
+    UPDATE runs SET
+        pause_requested_at = now(),
+        pause_mode         = 'reserve',
+        pause_after_count  = COALESCE(jsonb_array_length(runs.milestones_completed), 0),
+        updated_at         = now()
+    WHERE runs.id = ANY($1::uuid[])
+      AND runs.status = 'running'
+      AND runs.kind IN ('issue', 'task', 'prompt', 'self_improve')
+      AND runs.interactive = false
+      AND runs.pause_requested_at IS NULL
+      AND EXISTS (SELECT 1 FROM users u WHERE u.id = runs.user_id
+                  AND u.weekly_reserve_pct IS NOT NULL AND u.weekly_reserve_pause_running)
+    RETURNING runs.id, runs.user_id, runs.status
+),
+reserve_input AS (
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    SELECT id, 'pause', 'milestone' FROM requested
+)
+SELECT id, user_id, status FROM requested
+`
+
+type RequestReservePausesRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// File a SYSTEM-authored pause request (mode 'reserve') on each listed running run, and in the SAME
+// statement the kind='pause' body='milestone' steering input the worker drains (CreatePauseInput's
+// shape; the worker is served 'milestone' for a reserve request, so both harnesses park at the
+// milestone boundary). Never overwrites a pending request of any mode (pause_requested_at IS NULL):
+// an owner or wall request stands. The owner guards (threshold set, pause toggle on) and the pause
+// allowlist (non-interactive issue/task/prompt/self_improve) are repeated here.
+func (q *Queries) RequestReservePauses(ctx context.Context, ids []uuid.UUID) ([]RequestReservePausesRow, error) {
+	rows, err := q.db.Query(ctx, requestReservePauses, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RequestReservePausesRow{}
+	for rows.Next() {
+		var i RequestReservePausesRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const setRunReserveHoldReason = `-- name: SetRunReserveHoldReason :execrows
 UPDATE runs SET reserve_hold_reason = $1::text
 WHERE id = $2 AND status = 'queued'
@@ -341,4 +897,110 @@ func (q *Queries) SetRunReserveHoldReason(ctx context.Context, arg SetRunReserve
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const withdrawReservePausesIdle = `-- name: WithdrawReservePausesIdle :many
+WITH withdrawn AS (
+    UPDATE runs SET
+        pause_requested_at = NULL,
+        pause_mode         = NULL,
+        pause_after_count  = NULL,
+        updated_at         = now()
+    WHERE runs.id = ANY($1::uuid[])
+      AND runs.pause_mode = 'reserve'
+      AND runs.status IN ('queued', 'claimed', 'limit_wait', 'pool_wait', 'recovery_wait',
+                          'awaiting_input', 'awaiting_approval', 'awaiting_followup')
+    RETURNING runs.id, runs.user_id, runs.status
+),
+settled_inputs AS (
+    UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
+    WHERE u.run_id IN (SELECT id FROM withdrawn) AND u.kind = 'pause' AND u.applied_at IS NULL
+),
+cancel_input AS (
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    SELECT id, 'pause_cancel', NULL::text FROM withdrawn
+    WHERE status IN ('claimed', 'awaiting_input', 'awaiting_approval', 'awaiting_followup')
+)
+SELECT id, user_id, status FROM withdrawn
+`
+
+type WithdrawReservePausesIdleRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// Withdraw a pending RESERVE request on each listed non-terminal run that is not running and not
+// paused (queued, claimed, limit_wait, pool_wait, recovery_wait and the awaiting_* parks, where the
+// request survives the involuntary parks and would otherwise re-arm on the first running report).
+// Clears the three pause columns and settles the run's unapplied kind='pause' inputs (the
+// settled_inputs shape of SettleCredentialDisabledPause), so a resumed flight is never handed a
+// stale pause. A claimed or awaiting_* row may have a live worker that already drained the pause, so
+// those also get a kind='pause_cancel' input. Only where pause_mode = 'reserve'.
+func (q *Queries) WithdrawReservePausesIdle(ctx context.Context, ids []uuid.UUID) ([]WithdrawReservePausesIdleRow, error) {
+	rows, err := q.db.Query(ctx, withdrawReservePausesIdle, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WithdrawReservePausesIdleRow{}
+	for rows.Next() {
+		var i WithdrawReservePausesIdleRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const withdrawReservePausesRunning = `-- name: WithdrawReservePausesRunning :many
+WITH withdrawn AS (
+    UPDATE runs SET
+        pause_requested_at = NULL,
+        pause_mode         = NULL,
+        pause_after_count  = NULL,
+        updated_at         = now()
+    WHERE runs.id = ANY($1::uuid[])
+      AND runs.status = 'running'
+      AND runs.pause_mode = 'reserve'
+    RETURNING runs.id, runs.user_id, runs.status
+),
+cancel_input AS (
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    SELECT id, 'pause_cancel', NULL::text FROM withdrawn
+)
+SELECT id, user_id, status FROM withdrawn
+`
+
+type WithdrawReservePausesRunningRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// Withdraw a pending RESERVE request on each listed running run: the CancelPauseInput shape (clear
+// the three pause columns, write the kind='pause_cancel' input the worker drains). Only where
+// pause_mode = 'reserve', so an owner or wall request that overwrote it is never touched.
+func (q *Queries) WithdrawReservePausesRunning(ctx context.Context, ids []uuid.UUID) ([]WithdrawReservePausesRunningRow, error) {
+	rows, err := q.db.Query(ctx, withdrawReservePausesRunning, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WithdrawReservePausesRunningRow{}
+	for rows.Next() {
+		var i WithdrawReservePausesRunningRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

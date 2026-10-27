@@ -640,6 +640,10 @@ WITH cancelled AS (
       -- PRD #1497 M1 (D18): an owner cannot withdraw the system's 'wall' request (IS DISTINCT FROM
       -- because pause_mode is NULL on a no-pending-pause row). A 0-row result surfaces as the 409.
       AND runs.pause_mode IS DISTINCT FROM 'wall'
+      -- PRD #3522 M4a: the owner cannot withdraw the system's 'reserve' request either; it is withdrawn
+      -- only by the reserve's own passes (threshold cleared, toggle off, a fresh OK reading). The
+      -- 0-row result surfaces as the 409 pointing at resume and the threshold.
+      AND runs.pause_mode IS DISTINCT FROM 'reserve'
     RETURNING runs.id
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
@@ -18035,19 +18039,20 @@ func (q *Queries) ResetRunGateRefusals(ctx context.Context, id uuid.UUID) error 
 const resumePausedRun = `-- name: ResumePausedRun :one
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
-    WHERE runs.id = $1 AND runs.user_id = $2
+    WHERE runs.id = $5 AND runs.user_id = $6
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
   AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
-  AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR $3::boolean)
+  AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR $7::boolean)
   AND (runs.hold_reason IS DISTINCT FROM 'credential_switch_settling'
        OR NOT EXISTS (SELECT 1 FROM workers w
-                      WHERE w.id = runs.worker_id AND ($4::timestamptz IS NULL OR w.last_heartbeat_at >= $4::timestamptz)
+                      WHERE w.id = runs.worker_id AND ($8::timestamptz IS NULL OR w.last_heartbeat_at >= $8::timestamptz)
                         AND w.dind_register_floor <= runs.status_since))
   AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
-       OR (COALESCE(runs.budget_wall_seconds, $5::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+       OR (COALESCE(runs.budget_wall_seconds, $9::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
+  AND ($10::text IS NULL OR runs.hold_reason = $10::text)
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -18094,8 +18099,20 @@ UPDATE runs SET
     worker_id = CASE WHEN runs.claim_released_at IS NOT NULL THEN NULL ELSE runs.worker_id END,
     -- D7: a resumed budget_exhausted row leaves the wall hold behind.
     -- Issue #3181: a resumed credential-switch hold (settling once its fence lifted, or unsettled) is cleared too.
-    hold_reason = CASE WHEN runs.hold_reason IN ('budget_exhausted', 'credential_switch_settling', 'credential_switch_unsettled') THEN NULL ELSE runs.hold_reason END,
+    hold_reason = CASE WHEN runs.hold_reason IN ('budget_exhausted', 'credential_switch_settling', 'credential_switch_unsettled', 'weekly_reserve') THEN NULL ELSE runs.hold_reason END,
     hold_captured_head = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_captured_head END,
+    -- PRD #3522 M4a: the owner's manual resume of a weekly_reserve pause is a recorded OVERRIDE until the
+    -- next observed 7-day reset. The four exemption columns are written ONLY on a weekly_reserve hold and
+    -- only when the caller supplies a grant time (the owner resume does; set-token, the completion
+    -- decision and the sweeper release pass NULL, leaving the columns as they were).
+    reserve_exempt_granted_at    = CASE WHEN runs.hold_reason = 'weekly_reserve' AND $1::timestamptz IS NOT NULL
+                                        THEN $1::timestamptz ELSE runs.reserve_exempt_granted_at END,
+    reserve_exempt_credential_id = CASE WHEN runs.hold_reason = 'weekly_reserve' AND $1::timestamptz IS NOT NULL
+                                        THEN $2::uuid ELSE runs.reserve_exempt_credential_id END,
+    reserve_exempt_window_reset  = CASE WHEN runs.hold_reason = 'weekly_reserve' AND $1::timestamptz IS NOT NULL
+                                        THEN $3::timestamptz ELSE runs.reserve_exempt_window_reset END,
+    reserve_exempt_until         = CASE WHEN runs.hold_reason = 'weekly_reserve' AND $1::timestamptz IS NOT NULL
+                                        THEN $4::timestamptz ELSE runs.reserve_exempt_until END,
     -- PRD #1733: the owner's resume of a provider hold is the decision to try again, so the open
     -- provider-park streak is cleared in this same statement (a refused resume changes nothing).
     -- The provider_unavailable marker survives queued and claimed until SetRunRunning clears it.
@@ -18107,27 +18124,31 @@ UPDATE runs SET
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at            = now()
-WHERE runs.id = $1 AND runs.user_id = $2
+WHERE runs.id = $5 AND runs.user_id = $6
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
   AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
-  AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR $3::boolean)
+  AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR $7::boolean)
   -- Issue #3181: refuse a credential_switch_settling hold while its worker is still finishing its own
   -- operations for the run (a fresh heartbeat from the SAME incarnation that wrote the hold). The fence
   -- lifts when the worker settles it (credential_switch_unsettled), goes stale or vanishes, or
   -- re-registers (dind_register_floor then moves past status_since).
   AND (runs.hold_reason IS DISTINCT FROM 'credential_switch_settling'
        OR NOT EXISTS (SELECT 1 FROM workers w
-                      WHERE w.id = runs.worker_id AND ($4::timestamptz IS NULL OR w.last_heartbeat_at >= $4::timestamptz)
+                      WHERE w.id = runs.worker_id AND ($8::timestamptz IS NULL OR w.last_heartbeat_at >= $8::timestamptz)
                         AND w.dind_register_floor <= runs.status_since))
   -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).
   -- Remaining = three-term total - (elapsed active run-time) = total - ((status_since - started_at) - budget_paused_seconds).
   AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
-       OR (COALESCE(runs.budget_wall_seconds, $5::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+       OR (COALESCE(runs.budget_wall_seconds, $9::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
+  -- PRD #3522 M4a: the caller's hold guard (repeated here beside the others): the sweeper release and the
+  -- owner resume of a reserve pause pass 'weekly_reserve', so a hold that changed between the caller's
+  -- read and this write is never resumed (or granted an override) under the wrong cause.
+  AND ($10::text IS NULL OR runs.hold_reason = $10::text)
   AND (runs.kind <> 'cross_check' OR EXISTS (
       SELECT 1 FROM locked_checks cc
       JOIN locked_parents lead ON lead.id = cc.lead_run_id
@@ -18139,11 +18160,16 @@ RETURNING runs.id, runs.user_id, runs.status
 `
 
 type ResumePausedRunParams struct {
+	ReserveExemptGrantedAt     pgtype.Timestamptz `json:"reserve_exempt_granted_at"`
+	ReserveExemptCredentialID  pgtype.UUID        `json:"reserve_exempt_credential_id"`
+	ReserveExemptWindowReset   pgtype.Timestamptz `json:"reserve_exempt_window_reset"`
+	ReserveExemptUntil         pgtype.Timestamptz `json:"reserve_exempt_until"`
 	ID                         uuid.UUID          `json:"id"`
 	UserID                     uuid.UUID          `json:"user_id"`
 	AllowCompletionBlockedHold bool               `json:"allow_completion_blocked_hold"`
 	StaleCutoff                pgtype.Timestamptz `json:"stale_cutoff"`
 	GlobalTimeoutSeconds       int32              `json:"global_timeout_seconds"`
+	RequiredHoldReason         pgtype.Text        `json:"required_hold_reason"`
 }
 
 type ResumePausedRunRow struct {
@@ -18199,11 +18225,16 @@ type ResumePausedRunRow struct {
 // All guards use IS DISTINCT FROM / OR so a NULL hold_reason (an owner pause) always resumes.
 func (q *Queries) ResumePausedRun(ctx context.Context, arg ResumePausedRunParams) (ResumePausedRunRow, error) {
 	row := q.db.QueryRow(ctx, resumePausedRun,
+		arg.ReserveExemptGrantedAt,
+		arg.ReserveExemptCredentialID,
+		arg.ReserveExemptWindowReset,
+		arg.ReserveExemptUntil,
 		arg.ID,
 		arg.UserID,
 		arg.AllowCompletionBlockedHold,
 		arg.StaleCutoff,
 		arg.GlobalTimeoutSeconds,
+		arg.RequiredHoldReason,
 	)
 	var i ResumePausedRunRow
 	err := row.Scan(&i.ID, &i.UserID, &i.Status)
@@ -20764,6 +20795,10 @@ UPDATE runs SET
     status             = 'paused',
     status_since       = now(),
     session_id         = COALESCE($1, session_id),
+    -- PRD #3522 M4a: a SYSTEM reserve request parks with the weekly_reserve hold, the cause the
+    -- sweeper's release pass keys on (an owner milestone/now park leaves hold_reason as it was). The
+    -- CASE reads the OLD pause_mode, which this same statement clears.
+    hold_reason        = CASE WHEN pause_mode = 'reserve' THEN 'weekly_reserve' ELSE hold_reason END,
     pause_requested_at = NULL,
     pause_mode         = NULL,
     pause_after_count  = NULL,
@@ -20775,8 +20810,8 @@ WHERE id = $2 AND worker_id = $3
   -- PRD #1497 M1 (D14/D15): an owner-pause park can never consume a system 'wall' request. The
   -- wall park is its own fenced transition (SetRunWallPark); this owner-pause report parks only a
   -- 'milestone'/'now' request, so a delayed owner-pause report cannot settle a wall request that
-  -- overwrote it.
-  AND pause_mode IN ('milestone', 'now')
+  -- overwrote it. PRD #3522 M4a: the system 'reserve' request parks here too, as the weekly_reserve hold.
+  AND pause_mode IN ('milestone', 'now', 'reserve')
 `
 
 type SetRunPausedParams struct {

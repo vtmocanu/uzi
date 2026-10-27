@@ -371,7 +371,8 @@ WITH settled_inputs AS (
                   AND r.pause_requested_at IS NOT NULL)
 )
 UPDATE runs SET
-    hold_reason = CASE WHEN runs.pause_mode = 'wall' THEN 'budget_exhausted' ELSE NULL END,
+    -- PRD #3522 M4a: a pending reserve request lands in the weekly_reserve hold the reserve park writes.
+    hold_reason = CASE WHEN runs.pause_mode = 'wall' THEN 'budget_exhausted' WHEN runs.pause_mode = 'reserve' THEN 'weekly_reserve' ELSE NULL END,
     claim_released_at = NULL,
     pause_requested_at = NULL,
     pause_mode = NULL,

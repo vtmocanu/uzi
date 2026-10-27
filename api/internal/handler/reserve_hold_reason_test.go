@@ -2,6 +2,7 @@ package handler
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -42,5 +43,33 @@ func TestRunDTOReserveHoldReasonOnlyWhileQueued(t *testing.T) {
 	}
 	if got := apitypes.RunSummaryOf(full).ListItem().ReserveHoldReason; got == nil || *got != reason {
 		t.Errorf("list item round trip dropped reserve_hold_reason: %v", got)
+	}
+}
+
+// TestRunDTOReserveExemptUntil (PRD #3522 M4a): the manual-resume override's end rides the run DTO
+// whatever the status, and the key is absent without one; the summary and list rows carry it too.
+func TestRunDTOReserveExemptUntil(t *testing.T) {
+	until := dtoTestNow.Add(36 * time.Hour)
+	for _, status := range []string{"queued", "running"} {
+		dto := runToDTO(store.Run{ID: uuid.New(), Status: status, ReserveExemptUntil: pgtype.Timestamptz{Time: until, Valid: true}}, "normal", 0, 0, 0, dtoTestNow, 0)
+		if dto.ReserveExemptUntil == nil || !dto.ReserveExemptUntil.Equal(until) {
+			t.Errorf("%s: reserve_exempt_until = %v, want %v", status, dto.ReserveExemptUntil, until)
+		}
+	}
+	if dto := runToDTO(store.Run{ID: uuid.New(), Status: "queued"}, "normal", 0, 0, 0, dtoTestNow, 0); dto.ReserveExemptUntil != nil {
+		t.Errorf("reserve_exempt_until = %v without an exemption, want absent", dto.ReserveExemptUntil)
+	}
+	// A reserve request reads as pause_mode 'reserve' and parks at the milestone boundary.
+	dto := runToDTO(store.Run{ID: uuid.New(), Status: "running",
+		PauseMode: pgtype.Text{String: "reserve", Valid: true}, PauseRequestedAt: pgtype.Timestamptz{Time: dtoTestNow, Valid: true}}, "normal", 0, 0, 0, dtoTestNow, 0)
+	if dto.PauseMode == nil || *dto.PauseMode != "reserve" || !dto.PauseRequested {
+		t.Errorf("reserve request DTO = (mode %v, requested %v), want (reserve, true)", dto.PauseMode, dto.PauseRequested)
+	}
+	full := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ReserveExemptUntil: &until}}
+	if got := apitypes.RunSummaryOf(full).ReserveExemptUntil; got == nil || !got.Equal(until) {
+		t.Errorf("summary dropped reserve_exempt_until: %v", got)
+	}
+	if got := apitypes.RunSummaryOf(full).ListItem().ReserveExemptUntil; got == nil || !got.Equal(until) {
+		t.Errorf("list item round trip dropped reserve_exempt_until: %v", got)
 	}
 }

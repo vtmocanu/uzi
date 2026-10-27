@@ -78,6 +78,10 @@ type reserveSnap struct {
 
 	claude map[uuid.UUID]usagereserve.Verdict // every enabled Anthropic token
 	codex  map[uuid.UUID]usagereserve.Verdict // every enabled, metered Codex alias
+	// synced is when each credential's reading was last synced (a token's synced_at, an alias's
+	// last_success_at); absent when it has no reading. The manual-resume override's observed-reset
+	// end only counts a reading synced AFTER the grant (overrideEndedByReading).
+	synced map[uuid.UUID]time.Time
 	// pooled is the auto-eligible token ids in id order; defaultID is the owner's default token
 	// (uuid.Nil when none); judgeMode/judgeSecret is the owner's judge-lane binding.
 	pooled      []uuid.UUID
@@ -124,6 +128,7 @@ func buildReserveSnapshot(ctx context.Context, q reserveQueries, userID uuid.UUI
 	snap.pauseRunning = set.WeeklyReservePauseRunning
 	snap.claude = map[uuid.UUID]usagereserve.Verdict{}
 	snap.codex = map[uuid.UUID]usagereserve.Verdict{}
+	snap.synced = map[uuid.UUID]time.Time{}
 
 	tokens, err := q.ListReserveClaudeTokens(ctx, userID)
 	if err != nil {
@@ -142,6 +147,7 @@ func buildReserveSnapshot(ctx context.Context, q reserveQueries, userID uuid.UUI
 		if t.SyncedAt.Valid {
 			v := t.SyncedAt.Time
 			r.SyncedAt = &v
+			snap.synced[t.UserSecretID] = v
 		}
 		snap.claude[t.UserSecretID] = usagereserve.EvaluateClaude(snap.threshold, r, iv.claude, now)
 		// A probe-rejected token is never picked by the auto lane (autoselect.Floor skips it), so it is
@@ -168,6 +174,7 @@ func buildReserveSnapshot(ctx context.Context, q reserveQueries, userID uuid.UUI
 		if a.LastSuccessAt.Valid {
 			v := a.LastSuccessAt.Time
 			r.LastSuccessAt = &v
+			snap.synced[a.AliasID] = v
 		}
 		if len(a.Buckets) > 0 {
 			var buckets []apitypes.CodexRateLimitBucketDTO
@@ -397,7 +404,7 @@ func reserveEnforced(run store.Run, snap *reserveSnap, now time.Time) bool {
 	if !snap.on() || run.Kind == runkind.Chat {
 		return false
 	}
-	if overrideActive(run, now) {
+	if overrideActive(run, snap, now) {
 		return false
 	}
 	if run.FirstStartedAt.Valid && !snap.pauseRunning {
@@ -406,10 +413,76 @@ func reserveEnforced(run store.Run, snap *reserveSnap, now time.Time) bool {
 	return true
 }
 
-// overrideActive reports a manual-resume override in force. It is the one seam the observed-reset
-// early end plugs into: ClaimRun's @reserve_override_ended list is the SQL side of the same rule.
-func overrideActive(run store.Run, now time.Time) bool {
-	return run.ReserveExemptUntil.Valid && run.ReserveExemptUntil.Time.After(now)
+// overrideActive reports a manual-resume override in force (PRD #3522 M4a). The persisted exemption
+// ends at the FIRST of: (1) the clock reaching reserve_exempt_until (the observed 7-day reset, or the
+// seven-day cap when no reset metadata was known at the grant); (2) a reading synced after the grant
+// in which the week's reset is observed against the anchor, which covers an early reset; (3) with no
+// anchor, the first fresh reading synced after the grant that is below the threshold. The reading
+// rules ride the snapshot, so ClaimRun's @reserve_override_ended list (the SQL side of arms 2 and 3,
+// which its time-only test cannot see) and every Go caller agree.
+func overrideActive(run store.Run, snap *reserveSnap, now time.Time) bool {
+	if !run.ReserveExemptUntil.Valid || !run.ReserveExemptUntil.Time.After(now) {
+		return false
+	}
+	return !overrideEndedByReading(run, snap)
+}
+
+// overrideEndedByReading is arms 2 and 3 of overrideActive: a fresh verdict of the credential the
+// exemption was granted against, from a reading synced after the grant. A stale, missing or
+// pre-grant reading proves nothing and ends nothing (the clock arm still ends the exemption).
+func overrideEndedByReading(run store.Run, snap *reserveSnap) bool {
+	if !snap.on() || !run.ReserveExemptGrantedAt.Valid || !run.ReserveExemptCredentialID.Valid {
+		return false
+	}
+	id := uuid.UUID(run.ReserveExemptCredentialID.Bytes)
+	codex := run.Harness == harnessCodex
+	v, ok := snap.claude[id]
+	if codex {
+		v, ok = snap.codex[id]
+	}
+	if !ok || !v.Fresh {
+		return false
+	}
+	if synced, has := snap.synced[id]; !has || !synced.After(run.ReserveExemptGrantedAt.Time) {
+		return false
+	}
+	if !run.ReserveExemptWindowReset.Valid {
+		return v.State == usagereserve.OK // arm 3: no anchor, the first fresh reading below the threshold
+	}
+	if v.ResetsAt == nil {
+		return false
+	}
+	anchor := run.ReserveExemptWindowReset.Time
+	// The utilization at the grant is not persisted; the run was held, so it read at or above the
+	// threshold. Utilization is monotonic within a week, so a fresh reading at or below
+	// usagereserve.PctResetCeil under an unmoved boundary is a reset whatever the exact prior was,
+	// and the floor keeps a tiny threshold from reading below the detectors' own floor.
+	prior := max(float64(*snap.threshold), usagereserve.PctResetFloor)
+	if codex {
+		fresh := float64(v.Pct)
+		return usagereserve.CodexResetObserved(anchor.Unix(), v.ResetsAt.Unix(), &prior, &fresh)
+	}
+	priorPct := int16(prior)
+	return usagereserve.ClaudeResetObserved(anchor, &priorPct, v.ResetsAt, v.Pct)
+}
+
+// spentVerdict is the verdict of the credential the run RECORDED as spent (runs.codex_secret_id for a
+// Codex run, runs.anthropic_secret_id otherwise). ok is false when no credential is recorded or it is
+// not in the snapshot (disabled, or no longer an owner credential): the pause pass then leaves the run
+// alone rather than guessing.
+func (r *reserveSnap) spentVerdict(run store.Run) (usagereserve.Verdict, bool) {
+	if run.Harness == harnessCodex {
+		if !run.CodexSecretID.Valid {
+			return usagereserve.Verdict{}, false
+		}
+		v, ok := r.codex[uuid.UUID(run.CodexSecretID.Bytes)]
+		return v, ok
+	}
+	if !run.AnthropicSecretID.Valid {
+		return usagereserve.Verdict{}, false
+	}
+	v, ok := r.claude[uuid.UUID(run.AnthropicSecretID.Bytes)]
+	return v, ok
 }
 
 // reserveLane is the Anthropic lane a worker's claim resolves a worker-lane run onto.

@@ -227,6 +227,13 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, gerr
 	}
 	ctx = gate.attach(ctx)
+	// PRD #3522 M4a: a pending RESERVE pause request the reserve no longer enforces (threshold cleared,
+	// pause toggle off, a manual-resume override in force) is withdrawn BEFORE it is re-delivered, so a
+	// requeued run does not park on a request nobody would now make. The sweeper's withdraw pass is the
+	// authority for the other withdrawals (a fresh OK reading); this is only the claim-time floor.
+	if gate == nil {
+		run = s.withdrawStaleReserveRequest(ctx, run)
+	}
 	if run.Harness == harnessCodex {
 		if herr := gate.checkCodex(run); herr != nil {
 			return nil, herr
@@ -785,7 +792,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// columns survive every requeue, so the re-claim carries the intent forward.
 		ParkRunSupported: slices.Contains(wkr.ProtocolCapabilities, capability.ParkRunV1),
 		PausePending:     run.PauseRequestedAt.Valid,
-		PauseMode:        run.PauseMode.String,
+		PauseMode:        servedPauseMode(run.PauseMode.String),
 		// PRD #400 M4a: when set, this task run is a diff-review of that target task, and
 		// the worker (M4b) routes on it. nil for a plain handoff and every non-task run.
 		ReviewTargetRunID: uuidPtr(run.ReviewTargetRunID),

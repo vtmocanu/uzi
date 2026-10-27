@@ -127,6 +127,16 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		s.publishSwept(r.ID, r.Status)
 	}
 
+	// PRD #3522 M4a: the weekly reserve's running-run side (request, withdraw, release, exemption
+	// expiry). It runs right after the wall request on purpose: a run the wall just requested carries
+	// a pending request and is skipped, and a wall or owner request always wins over the reserve's.
+	// Best effort and never blocking: ClaimRun's own gate is what withholds queued work.
+	reserveActed, reserveErr := s.reservePausePass(ctx, now)
+	if reserveErr != nil {
+		slog.Warn("sweeper: weekly reserve pause pass failed", "error", reserveErr)
+	}
+	res.ReservePauseActed = reserveActed
+
 	// PRD #1497 review (Fix 2): ParkRunsAtWall is the SERVER-side park — it fires precisely on a
 	// worker classified stale/incapable/unresponsive, so it belongs with the other stale-worker
 	// passes below, INSIDE the boot grace (PRD #1390 M1). RequestWallParks stays here, ungated: it

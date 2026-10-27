@@ -170,6 +170,11 @@ var (
 	// ErrNoPausePending rejects a `pause_cancel` (PRD #1190 M1) when no pause is pending on a
 	// still-running run → 409. A 0-row CancelPauseInput is the only cause.
 	ErrNoPausePending = errors.New("no pause is pending")
+	// ErrReservePausePending rejects a `pause_cancel` (PRD #3522 M4a) while the pending pause is
+	// the weekly usage reserve's own request → 409. The reserve withdraws its request itself (threshold
+	// cleared or raised past the reading, pause toggle off, a fresh reading below the threshold); the
+	// owner's levers are the threshold and, once the run parks, resume.
+	ErrReservePausePending = errors.New("the weekly usage reserve requested this pause, so it cannot be cancelled here: raise or clear the threshold in your usage settings to withdraw it, or resume the run once it pauses")
 	// ErrScopeNotMilestoneRun rejects a `scope` (PRD #634 M2) on a run that is not a
 	// milestone-structured issue run (kind='issue' with a non-empty frozen milestone
 	// list) → 409. A scope ceiling bounds how many of the frozen milestones the run may
@@ -3470,6 +3475,13 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		CodexCuratedModels: codexCuratedModelsSlice(),
 	}
 	reserveClaimParams(&params, reserve, wkr, reservePeers, claimNow)
+	// PRD #3522 M4a: the queued runs whose manual-resume exemption the reading-aware rule has ended
+	// early; ClaimRun's time-only test cannot see that.
+	ended, rerr := s.reserveEndedOverrides(ctx, reserve, claimNow)
+	if rerr != nil {
+		return nil, rerr
+	}
+	params.ReserveOverrideEnded = ended
 
 	// Bodyless claims also lock and re-read the worker in a separate statement.
 	// This serializes both lane and legacy child occupancy before ClaimRun's snapshot.
@@ -8309,6 +8321,10 @@ type SweepResult struct {
 	// ReserveMarked is the number of queued runs whose weekly-reserve hold marker this pass wrote or
 	// cleared (PRD #3522 M3). Only changes count: an owner whose markers are already right adds 0.
 	ReserveMarked int64
+	// ReservePauseActed is the number of runs the weekly reserve's pause pass changed (PRD #3522
+	// M4a): a pause requested or withdrawn, a reserve pause released, an ended exemption dropped.
+	// Normally 0.
+	ReservePauseActed int64
 	// PoolResumed is the number of runs this pass reactively resumed from pool_wait to
 	// queued because their owner's token pool became non-empty (PRD #754 M5). At most
 	// ONE per distinct held-run owner per tick (the anti-stampede stagger), so on a
