@@ -18443,11 +18443,13 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
   });
 
-  it("3466 repeated teardown revokes the exact captured disposal proof", async t => {
+  for (const outcome of ["rebuild", "reject", "cancel"] as const)
+    for (const deferred of [false, true])
+    it(`3466 repeated teardown revokes the exact captured disposal proof outcome=${outcome} deferred=${deferred}`, async t => {
     const rig = silentRevisionRig();
     const wire = rig.deps.wireFileop!;
     let disposals = 0, retries = 0;
-    rig.deps = { ...rig.deps, wireFileop: (...args) => {
+    rig.deps = { ...rig.deps, deferRegistryTeardown: deferred, wireFileop: (...args) => {
       const handle = wire(...args);
       return { ...handle, dispose: async () => {
         if (++disposals > 1) throw new Error("second teardown failed");
@@ -18455,6 +18457,17 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       } };
     } };
     const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const ownerExit = outcome === "reject" ? new PlanRejectedError("owner reject", 1) : new Error("run cancelled");
+    const tearDown = executor["tearDownEpoch"].bind(executor);
+    let teardownCalls = 0;
+    executor["tearDownEpoch"] = (...args) => {
+      if (++teardownCalls === 2) {
+        assert.equal(args[5], outcome === "rebuild" ? "replacement" : undefined,
+          "owner controls must exercise run() terminal cleanup directly");
+        assert.equal(args[4], outcome === "rebuild" ? true : !deferred);
+      }
+      return tearDown(...args);
+    };
     let oldSafety: Parameters<typeof executor["verifiedDisposedCaptureFacades"]["has"]>[0];
     let oldRegistry: ExecutionRegistry | undefined;
     const ctx = revisionContext({ beforePlanRevisionTurn: async () => {
@@ -18467,6 +18480,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       retries++;
       assert.ok(executor["verifiedDisposedCaptureFacades"].has(oldSafety!));
       assert.equal(executor["unverifiedEpochRegistries"].has(oldRegistry!), false);
+      if (outcome !== "rebuild") throw ownerExit;
     } });
     t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
     const running = executor.run(ctx);
@@ -18474,7 +18488,11 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     try {
       await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
       await tick(); t.mock.timers.tick(100);
-      await assert.rejects(running, EpochCleanupUnprovenError);
+      await assert.rejects(running, error => {
+        if (outcome === "rebuild") assert.ok(error instanceof EpochCleanupUnprovenError);
+        else assert.equal(error, ownerExit, "cleanup must preserve the owner control outcome");
+        return true;
+      });
       assert.equal(retries, 1);
       assert.equal(rig.client.releaseCalls.length, 1);
       assert.equal(rig.providerLaunches(), 1);

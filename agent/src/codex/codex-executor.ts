@@ -4751,7 +4751,8 @@ export class CodexExecutor implements Executor {
           // reap, so re-persisting would only overwrite that generation with an empty one.
           if (beforeReapPersist) await beforeReapPersist;
           if (!reapedSinceLastPersist) await epoch.persistSession();
-          await this.tearDownEpoch(epoch.registry, epoch.harness, epoch.fileopHandle, boundaryDeadlineMs, !this.deps.deferRegistryTeardown);
+          await this.tearDownEpoch(epoch.registry, epoch.harness, epoch.fileopHandle, boundaryDeadlineMs, !this.deps.deferRegistryTeardown, undefined,
+            epoch.safety instanceof CodexExecutionSafetyImpl ? epoch.safety : undefined);
         }
         // (C) Evict the DURING-run released tokens (every epoch's provider-root launches + refreshes)
         // from the logger's secret set — AFTER the harness/transport is closed above, so no late log
@@ -5185,7 +5186,7 @@ export class CodexExecutor implements Executor {
           let clean = false;
           try {
             await settleDepsInstall();
-            clean = await this.tearDownEpoch(registry, epochHarness, epochFileop, boundaryDeadlineMs, true, "replacement");
+            clean = await this.tearDownEpoch(registry, epochHarness, epochFileop, boundaryDeadlineMs, true, "replacement", safety);
           } finally {
             if (clean) this.unverifiedEpochRegistries.delete(registry);
             else {
@@ -5201,7 +5202,7 @@ export class CodexExecutor implements Executor {
       // Issue #1766: only a VERIFIED clean teardown clears the registry from the outstanding set,
       // so a failed or rejected one leaves a later capture settle answering `incomplete`.
       await settleDepsInstall();
-      const clean = await this.tearDownEpoch(registry, harness, fileopHandle, boundaryDeadlineMs, true).catch(() => false);
+      const clean = await this.tearDownEpoch(registry, harness, fileopHandle, boundaryDeadlineMs, true, undefined, safety).catch(() => false);
       if (clean) this.unverifiedEpochRegistries.delete(registry);
       throw error;
     }
@@ -5223,82 +5224,95 @@ export class CodexExecutor implements Executor {
     deadlineMs: number,
     disposeRegistry: boolean,
     purpose?: "replacement",
+    cleanupSafety?: CodexExecutionSafetyImpl,
   ): Promise<boolean> {
-    const deadlineAt = Date.now() + Math.max(0, deadlineMs);
-    const cap = MaintenanceBudget.current()?.cap(deadlineMs);
-    const remaining = () => Math.min(Math.max(0, deadlineAt - Date.now()),
-      cap?.() ?? Infinity, this.captureCleanupRemaining?.() ?? Infinity);
-    const captureProof = this.completedCaptures.get(registry);
-    // Only intentional capture poison with unchanged exact-epoch evidence permits
-    // outstanding-set removal. Pre-existing faults remain unproven.
-    const captureClean = () => captureProof !== undefined && registry.acceptsCompletedCapture(captureProof);
-    let terminalDisposal: ToolDisposal | undefined;
-    let ordinaryDrained = false;
-    let ordinaryObservationUnchanged: (() => boolean) | undefined;
-    let registryClean = !disposeRegistry || (registry.state() === "disposed" &&
-      (captureClean() || (!registry.isPoisoned() && !this.unverifiedEpochRegistries.has(registry))));
-    if (disposeRegistry && registry.state() !== "disposed") {
-      // A completed capture already observed every root empty; ordinary quiesce/reap
-      // refuses its poisoned epoch. Every other epoch still needs both observations.
-      let drained = captureClean();
-      if (!drained) {
-        try {
-          const q = await registry.quiesceChildren(remaining());
-          if (q.kind === "quiescent") {
-            const epoch = registry.epoch();
-            const roots = registry.rootCount();
-            const launches = registry.launchAdmissionCursor();
-            const callbacks = registry.callbackAdmissionCursor();
-            const initiallyEmpty = registry.pendingLaunchCount() === 0 && registry.inFlightCallbackCount() === 0;
-            // disposeTools clears pending tables; their later empty counts cannot rule out
-            // closed-state admissions during reap or handler/transport cleanup.
-            ordinaryObservationUnchanged = () => initiallyEmpty && registry.epoch() === epoch &&
-              registry.rootCount() === roots && registry.launchAdmissionCursor() === launches &&
-              registry.callbackAdmissionCursor() === callbacks;
-            const reaped = await registry.reapProcesses(remaining(), q.epoch);
-            drained = q.epoch === epoch && reaped.kind === "observed_empty" && reaped.epoch === epoch &&
-              ordinaryObservationUnchanged();
-            ordinaryDrained = drained;
-          }
-        } catch { /* Disposal is still attempted after a failed drain. */ }
-      }
-      try {
-        const disposal = await registry.disposeTools(remaining());
-        terminalDisposal = disposal;
-        registryClean = drained && registry.acceptsTerminalDisposal(disposal);
-      } catch { registryClean = false; }
-    }
-    if (disposeRegistry && !terminalDisposal) {
-      try {
-        terminalDisposal = await registry.disposeTools(remaining());
-        registryClean &&= registry.acceptsTerminalDisposal(terminalDisposal);
-      } catch { registryClean = false; }
-    }
-    try { await harness?.close(); } catch { registryClean = false; }
-    try { await fileopHandle?.dispose(); } catch { registryClean = false; }
-    // Closing transports can add poison too. Disposal alone never launders it.
-    registryClean &&= !disposeRegistry || (registry.state() === "disposed" && (!registry.isPoisoned() || captureClean()));
-    registryClean &&= !disposeRegistry || (terminalDisposal !== undefined && registry.acceptsTerminalDisposal(terminalDisposal));
-    registryClean &&= ordinaryObservationUnchanged?.() ?? true;
-    if (disposeRegistry && registryClean) {
-      // Preserve the public Codex refusal marker: absence would select legacy sinks.
-      // Only a later owned capture can use this exact completed teardown to select a
-      // fresh capture-only facade; it still needs its own settlement and deadline.
-      const retiredFacade = this.epochSafeties.get(registry);
-      if (retiredFacade && retiredFacade === this.safety) {
-        if (captureClean()) this.verifiedDisposedCaptureFacades.set(retiredFacade, captureClean);
-        else if (purpose === "replacement" && ordinaryDrained && !registry.isPoisoned()) {
-          // Terminal cleanup cannot manufacture ordinary capture eligibility from cleared tables.
-          // This replacement observed quiescence, every root reaped, disposal and transport cleanup.
-          // Later rejected root registration poisons even a disposed registry, invalidating this fact.
-          this.verifiedDisposedCaptureFacades.set(retiredFacade,
-            () => registry.state() === "disposed" && !registry.isPoisoned() && ordinaryObservationUnchanged?.() === true);
+    const exactSafety = cleanupSafety ?? this.epochSafeties.get(registry);
+    let provedClean = false;
+    try {
+      const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+      const cap = MaintenanceBudget.current()?.cap(deadlineMs);
+      const remaining = () => Math.min(Math.max(0, deadlineAt - Date.now()),
+        cap?.() ?? Infinity, this.captureCleanupRemaining?.() ?? Infinity);
+      const captureProof = this.completedCaptures.get(registry);
+      // Only intentional capture poison with unchanged exact-epoch evidence permits
+      // outstanding-set removal. Pre-existing faults remain unproven.
+      const captureClean = () => captureProof !== undefined && registry.acceptsCompletedCapture(captureProof);
+      let terminalDisposal: ToolDisposal | undefined;
+      let ordinaryDrained = false;
+      let ordinaryObservationUnchanged: (() => boolean) | undefined;
+      let registryClean = !disposeRegistry || (registry.state() === "disposed" &&
+        (captureClean() || (!registry.isPoisoned() && !this.unverifiedEpochRegistries.has(registry))));
+      if (disposeRegistry && registry.state() !== "disposed") {
+        // A completed capture already observed every root empty; ordinary quiesce/reap
+        // refuses its poisoned epoch. Every other epoch still needs both observations.
+        let drained = captureClean();
+        if (!drained) {
+          try {
+            const q = await registry.quiesceChildren(remaining());
+            if (q.kind === "quiescent") {
+              const epoch = registry.epoch();
+              const roots = registry.rootCount();
+              const launches = registry.launchAdmissionCursor();
+              const callbacks = registry.callbackAdmissionCursor();
+              const initiallyEmpty = registry.pendingLaunchCount() === 0 && registry.inFlightCallbackCount() === 0;
+              // disposeTools clears pending tables; their later empty counts cannot rule out
+              // closed-state admissions during reap or handler/transport cleanup.
+              ordinaryObservationUnchanged = () => initiallyEmpty && registry.epoch() === epoch &&
+                registry.rootCount() === roots && registry.launchAdmissionCursor() === launches &&
+                registry.callbackAdmissionCursor() === callbacks;
+              const reaped = await registry.reapProcesses(remaining(), q.epoch);
+              drained = q.epoch === epoch && reaped.kind === "observed_empty" && reaped.epoch === epoch &&
+                ordinaryObservationUnchanged();
+              ordinaryDrained = drained;
+            }
+          } catch { /* Disposal is still attempted after a failed drain. */ }
         }
+        try {
+          const disposal = await registry.disposeTools(remaining());
+          terminalDisposal = disposal;
+          registryClean = drained && registry.acceptsTerminalDisposal(disposal);
+        } catch { registryClean = false; }
       }
-      this.unverifiedEpochRegistries.delete(registry);
-      this.epochSafeties.delete(registry);
+      if (disposeRegistry && !terminalDisposal) {
+        try {
+          terminalDisposal = await registry.disposeTools(remaining());
+          registryClean &&= registry.acceptsTerminalDisposal(terminalDisposal);
+        } catch { registryClean = false; }
+      }
+      try { await harness?.close(); } catch { registryClean = false; }
+      try { await fileopHandle?.dispose(); } catch { registryClean = false; }
+      // Closing transports can add poison too. Disposal alone never launders it.
+      registryClean &&= !disposeRegistry || (registry.state() === "disposed" && (!registry.isPoisoned() || captureClean()));
+      registryClean &&= !disposeRegistry || (terminalDisposal !== undefined && registry.acceptsTerminalDisposal(terminalDisposal));
+      registryClean &&= ordinaryObservationUnchanged?.() ?? true;
+      if (disposeRegistry && registryClean) {
+        // Preserve the public Codex refusal marker: absence would select legacy sinks.
+        // Only a later owned capture can use this exact completed teardown to select a
+        // fresh capture-only facade; it still needs its own settlement and deadline.
+        const retiredFacade = this.epochSafeties.get(registry);
+        if (retiredFacade && retiredFacade === this.safety) {
+          if (captureClean()) this.verifiedDisposedCaptureFacades.set(retiredFacade, captureClean);
+          else if (purpose === "replacement" && ordinaryDrained && !registry.isPoisoned()) {
+            // Terminal cleanup cannot manufacture ordinary capture eligibility from cleared tables.
+            // This replacement observed quiescence, every root reaped, disposal and transport cleanup.
+            // Later rejected root registration poisons even a disposed registry, invalidating this fact.
+            this.verifiedDisposedCaptureFacades.set(retiredFacade,
+              () => registry.state() === "disposed" && !registry.isPoisoned() && ordinaryObservationUnchanged?.() === true);
+          }
+        }
+        this.unverifiedEpochRegistries.delete(registry);
+        this.epochSafeties.delete(registry);
+      }
+      provedClean = registryClean;
+      return registryClean;
+    } finally {
+      // Terminal and partial-build cleanup also revisit retired epochs. Failure
+      // revokes their prior proof even when registry disposal was deferred.
+      if (!provedClean) {
+        this.unverifiedEpochRegistries.add(registry);
+        if (exactSafety) this.verifiedDisposedCaptureFacades.delete(exactSafety);
+      }
     }
-    return registryClean;
   }
 
   // ─── the per-turn drive (run-lane precedence, Codex-specific) ─────────────────
