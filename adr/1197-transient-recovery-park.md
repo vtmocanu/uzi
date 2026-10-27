@@ -1276,7 +1276,11 @@ admission consume the unchanged wall budget. Silent-revision backoff slices are
 clamped to the remaining wall budget before sleeping; a spent wall returns to
 the executor's existing interruption routing. Time awaiting an owner event at
 the restored gate remains excluded; ownership checks and gate restoration
-between wait ticks remain charged. Cancel, pause, spent wall and completion
+between wait ticks remain charged. Both revision-retry entry paths check the
+remaining wall after source checks and gate restoration, before each owner-event
+wait. A spent wall returns to the executor's wall routing; an extension retains
+the exhausted retry state instead of admitting an uncharged reconstruction.
+Cancel, pause, spent wall and completion
 holds retain their existing precedence. Provider-origin revision
 retries continue on their existing epoch.
 

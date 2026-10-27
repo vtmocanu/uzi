@@ -3592,6 +3592,10 @@ export class CodexExecutor implements Executor {
         wall.remainingMs -= Math.max(0, now - silentRevision.checkedAt);
         silentRevision.checkedAt = now;
       };
+      const remainingSilentWall = (): number => {
+        chargeSilentRecovery();
+        return Math.max(0, wall.remainingMs);
+      };
       const observeOwnerWait: PlanRevisionOwnerWaitObserver = waiting => {
         if (!silentRevision?.needsRebuild) return;
         if (waiting) chargeSilentRecovery();
@@ -3618,7 +3622,10 @@ export class CodexExecutor implements Executor {
       };
       this.epochSourceAdmission = async () => {
         if (!silentRevision) return;
-        await ctx.beforePlanRevisionTurn?.(silentRevision?.needsRebuild ? observeOwnerWait : undefined);
+        const outcome = await ctx.beforePlanRevisionTurn?.(
+          silentRevision?.needsRebuild ? observeOwnerWait : undefined,
+          silentRevision?.needsRebuild ? remainingSilentWall : undefined);
+        if (outcome === "wall") throw this.tripError(REASON_WALL, pauseNow.capture(), 0);
         // Ownership probes await network I/O; check controls afterwards.
         this.epochAdmission?.();
       };
@@ -3789,7 +3796,16 @@ export class CodexExecutor implements Executor {
             if (stopped) return stopped;
             // Recovery carries measured-silence readiness into an owner replacement.
             // Debit its allowance before every reconstruction, including credential failures.
-            if (humanRevision) await ctx.beforePlanRevisionTurn?.(silentRevision?.needsRebuild ? observeOwnerWait : undefined);
+            if (humanRevision) {
+              const outcome = await ctx.beforePlanRevisionTurn?.(
+                silentRevision?.needsRebuild ? observeOwnerWait : undefined,
+                silentRevision?.needsRebuild ? remainingSilentWall : undefined);
+              if (outcome === "wall") {
+                const stopped = await routeSilentInterruption();
+                if (stopped) return stopped;
+                continue;
+              }
+            }
             if (humanRevision && silentRevision?.needsRebuild) {
               await recreateEpochAfterReap();
               chargeSilentRecovery();
@@ -3829,11 +3845,13 @@ export class CodexExecutor implements Executor {
                 (!cause.providerOrigin && !cause.zeroEvidenceIdle)) throw error;
             if (!ctx.retryPlanRevisionTurn) throw cause.zeroEvidenceIdle ? cause.originalIdle ?? cause : cause;
             try {
-              await ctx.retryPlanRevisionTurn(cause, silentRevision?.needsRebuild ? observeOwnerWait : undefined,
-                silentRevision?.needsRebuild ? () => {
-                  chargeSilentRecovery();
-                  return Math.max(0, wall.remainingMs);
-                } : undefined);
+              const outcome = await ctx.retryPlanRevisionTurn(cause,
+                silentRevision?.needsRebuild ? observeOwnerWait : undefined,
+                silentRevision?.needsRebuild ? remainingSilentWall : undefined);
+              if (outcome === "wall") {
+                const stopped = await routeSilentInterruption();
+                if (stopped) return stopped;
+              }
             } catch (rejected) {
               // Only identity rejection denotes unsupported recovery. Controls and
               // replacement-revise exceptions must retain their own routing.

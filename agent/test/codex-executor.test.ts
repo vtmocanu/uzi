@@ -18567,6 +18567,85 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
   });
 
+  for (const entry of ["retry", "beforeTurn", "owner tick"] as const)
+    for (const work of ["source", "restoration"] as const)
+    for (const extended of [false, true])
+    it(`3466 exhausted ${entry} ${work} work spends wall before owner wait; extended=${extended}`, async t => {
+      const rig = silentRevisionRig();
+      rig.deps = { ...rig.deps, wallMs: 1000 };
+      let waits = 0, parks = 0, spent = false, replacement = false, afterTick = false, replacementProbes = 0;
+      let restoring = false;
+      let status: "running" | "awaiting_approval" = "awaiting_approval";
+      const recovery = new PlanRevisionRecovery({ generation: 1,
+        ownership: async () => {
+          if (!spent && !restoring && rig.epochs[0]!.disposed() > 0 &&
+              (entry === "retry" || (entry === "beforeTurn" && replacement && ++replacementProbes === 2) ||
+                (entry === "owner tick" && afterTick))) {
+            if (work === "source") { spent = true; t.mock.timers.tick(1000); }
+            else { restoring = true; status = "running"; }
+          }
+          return { status, claim_generation: 1, gate_revision: 1, claim_released: false };
+        }, signal: () => new AbortController().signal, checkControl: () => {}, notice: async () => {},
+        policy: { redrives: 0, sleep: async (ms, signal) => {
+          if (entry === "owner tick" && !afterTick) {
+            assert.equal(ms, 30000);
+            t.mock.timers.tick(ms);
+            afterTick = true;
+            return;
+          }
+          return new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+        } },
+        steering: { takeRevisionRecoveryControl: () => undefined,
+          awaitRevisionRecoveryEvent: async (_source, _after, signal) => {
+            waits++;
+            if (entry === "beforeTurn" && waits === 1)
+              return { kind: "revise", inputId: 12, feedback: "replacement", sourceGateRevision: 1 };
+            if (entry === "owner tick" && waits === 1)
+              return new Promise((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+            return { kind: "reject", reason: "test complete", sourceGateRevision: 1 };
+          },
+          retirePersistedRevision: () => assert.fail("pending revision retired"), setGateRevision: () => {} },
+      });
+      recovery.seed({ status: "awaiting_approval", plan_md: "initial", presentation_id: "source" }, 1,
+        async () => {
+          if (restoring && !spent) { spent = true; t.mock.timers.tick(1000); }
+          status = "awaiting_approval";
+          return { applied: true, status, gateRevision: 1 };
+        });
+      recovery.accept({ kind: "revise", inputId: 11, sourceGateRevision: 1, feedback: "I" });
+      const ctx = revisionContext({
+        // Reflect keeps this regression executable against the old one-argument
+        // hook as well as the new remaining-wall hook for the red/green proof.
+        beforePlanRevisionTurn: async (observer?: (waiting: boolean) => void, remainingWallMs?: () => number) =>
+          Reflect.apply(recovery.beforeTurn, recovery, [observer, remainingWallMs]),
+        retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
+          try { return await recovery.retry(cause, observer, remainingWallMs); }
+          catch (error) {
+            if (error instanceof PlanRevisionReplacedError) replacement = true;
+            throw error;
+          }
+        },
+        parkForWall: async () => { parks++; return extended ? "refused" : "parked"; },
+        takeWallParkRefresh: () => ({ totalSeconds: 2, usedSeconds: 1 }),
+      });
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      void running.catch(() => undefined);
+      try {
+        await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+        await tick(); t.mock.timers.tick(100);
+        if (extended) await assert.rejects(running, PlanRejectedError);
+        else assert.equal((await running).walled?.reason, "codex run wall-clock timeout");
+        assert.equal(spent, true);
+        assert.equal(parks, 1, "source work spending the wall takes the wall route before owner waiting");
+        assert.equal(waits, (entry === "retry" ? 0 : 1) + (extended ? 1 : 0),
+          "only existing owner waits are free; extension re-enters the exhausted wait");
+        assert.equal(rig.providerLaunches(), 1, "wall extension must not admit an uncharged reconstruction");
+        assert.equal(rig.client.releaseCalls.length, 1);
+        assert.equal(rig.epochs[0]!.transport.turnStartCount, 2);
+      } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+    });
+
   it("3466 teardown, backoff and admission consume the same remaining wall", async t => {
     const rig = silentRevisionRig();
     rig.deps = { ...rig.deps, wallMs: 1000 };
