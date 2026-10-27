@@ -1,6 +1,6 @@
 -- +goose Up
 
--- Validate the two CHECKs added NOT VALID in 00360 and 00361 (PRD #3522 M1):
+-- Validate the two CHECKs added NOT VALID in 00366 and 00367 (PRD #3522 M1):
 -- users_weekly_reserve_pct_check and the widened runs_pause_mode_check (fourth value
 -- 'reserve'). VALIDATE CONSTRAINT takes only a SHARE UPDATE EXCLUSIVE lock (reads and writes
 -- proceed), unlike an inline validated ADD CONSTRAINT, per the two-step pattern of
@@ -13,8 +13,8 @@ ALTER TABLE runs VALIDATE CONSTRAINT runs_pause_mode_check;
 
 -- +goose Down
 
--- There is no VALIDATE inverse, so restore the pre-00362 state (each constraint present but
--- NOT VALID) by dropping and re-adding it NOT VALID. The CHECK bodies match 00360/00361
+-- There is no VALIDATE inverse, so restore the pre-00368 state (each constraint present but
+-- NOT VALID) by dropping and re-adding it NOT VALID. The CHECK bodies match 00366/00367
 -- verbatim. Mirrors 00243's Down.
 SET LOCAL lock_timeout = '5s';
 

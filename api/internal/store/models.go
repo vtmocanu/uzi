@@ -1134,13 +1134,13 @@ type Run struct {
 	SourcePublicationIntent     []byte             `json:"source_publication_intent"`
 	ContinuedIssueIid           pgtype.Int8        `json:"continued_issue_iid"`
 	CheckpointCoordinates       []byte             `json:"checkpoint_coordinates"`
+	RetainedParkCount           int32              `json:"retained_park_count"`
+	IgnoredInferredCapabilities []string           `json:"ignored_inferred_capabilities"`
 	ReserveHoldReason           pgtype.Text        `json:"reserve_hold_reason"`
 	ReserveExemptUntil          pgtype.Timestamptz `json:"reserve_exempt_until"`
 	ReserveExemptGrantedAt      pgtype.Timestamptz `json:"reserve_exempt_granted_at"`
 	ReserveExemptCredentialID   pgtype.UUID        `json:"reserve_exempt_credential_id"`
 	ReserveExemptWindowReset    pgtype.Timestamptz `json:"reserve_exempt_window_reset"`
-	RetainedParkCount           int32              `json:"retained_park_count"`
-	IgnoredInferredCapabilities []string           `json:"ignored_inferred_capabilities"`
 }
 
 type RunCompletionAttempt struct {

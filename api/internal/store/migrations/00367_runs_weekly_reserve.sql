@@ -12,7 +12,7 @@
 --
 -- runs_pause_mode_check is widened to a FOURTH value 'reserve', the system-authored pause the
 -- reserve files. The three existing values are carried VERBATIM from the live constraint
--- (00242's Up: 'milestone', 'now', 'wall'). Added NOT VALID, validated in 00362.
+-- (00242's Up: 'milestone', 'now', 'wall'). Added NOT VALID, validated in 00368.
 --
 -- The migration number is a draft: renumber the trio together above the live head at landing.
 SET LOCAL lock_timeout = '5s';

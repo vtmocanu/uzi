@@ -4,13 +4,13 @@
 -- default); users.weekly_reserve_pause_running says whether a running run is also paused.
 --
 -- Additive: one nullable column and one NOT NULL column with a constant default (no table
--- rewrite). The CHECK is added NOT VALID and validated in 00362, the two-step pattern of
+-- rewrite). The CHECK is added NOT VALID and validated in 00368, the two-step pattern of
 -- 00242/00243, so the ADD takes no validating scan under the ACCESS EXCLUSIVE lock. The ALTER
 -- takes a brief lock on users, so the statement times out rather than queue behind a long
 -- transaction and stall logins.
 --
 -- The migration number is a draft: it is renumbered above the live head at landing, the trio
--- (00360, 00361, 00362) together.
+-- (00366, 00367, 00368) together.
 SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE users
