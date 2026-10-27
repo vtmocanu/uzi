@@ -290,6 +290,8 @@ var runDTOKeys = []string{
 	"auto_approve_blocked_reasons", "issue_input_reason",
 	// PRD #2602: server-derived progress estimate (object, null for a terminal run).
 	"progress",
+	// Issue #3555: repo display path, overlaid on the single-run detail read only.
+	"repo_path",
 }
 
 func TestRunDTOTags(t *testing.T) {
@@ -364,12 +366,13 @@ func TestV1JobDTOTags(t *testing.T) {
 }
 
 func TestRunListItemDTOTags(t *testing.T) {
-	// Embeds RunDTO (keys flatten in) plus repo_path; owner_email is omitempty (absent when nil).
+	// Embeds RunDTO (keys flatten in, repo_path included since #3555: the list's own repo_path
+	// shadows it); owner_email is omitempty (absent when nil).
 	// PRD #1497 M1: worker_name is now on RunDTO too, so it is in runDTOKeys — RunListItemDTO's own
 	// worker_name field shadows the embedded one (json collapses the duplicate tag to one key), so it
 	// is NOT appended here any more.
 	// is_revising moved onto RunDTO (issue #2760), so it is in runDTOKeys.
-	want := append(append([]string{}, runDTOKeys...), "repo_path", "judge_verdict", "judge_todo_count")
+	want := append(append([]string{}, runDTOKeys...), "judge_verdict", "judge_todo_count")
 	assertTags(t, "RunListItemDTO(no owner)", RunListItemDTO{}, want...)
 	// owner_email present when set.
 	email := "u@example.test"
