@@ -171,9 +171,13 @@ jobs:
         id: bundle
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          failure_shell=$BASHPID
           reason='authorization-failed'
-          fail() { printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"; exit 1; }
+          fail() {
+            if [ "$BASHPID" = "$failure_shell" ]; then printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"; fi
+            exit 1
+          }
           trap fail ERR
           if [ "${GITHUB_RUN_ATTEMPT:-}" != 1 ]; then
             reason='re-dispatch-required'
@@ -183,7 +187,8 @@ jobs:
           export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0
           if ! { [ "$GITHUB_REPOSITORY" = vtmocanu/uzi ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; }; then fail; fi
           [ "$RELEASE_REF" = refs/heads/main ]
-          read -r -a dispatchers <<< "$(printf '%s' "$RELEASE_DISPATCHERS" | tr ',\t\r\n' '    ')"
+          dispatcher_words="$(printf '%s' "$RELEASE_DISPATCHERS" | tr ',\t\r\n' '    ')"
+          read -r -a dispatchers <<< "$dispatcher_words"
           allowed=false
           for dispatcher in "${dispatchers[@]}"; do
             if [ -n "$RELEASE_ACTOR" ] && [ "$dispatcher" = "$RELEASE_ACTOR" ]; then allowed=true; fi
@@ -217,7 +222,8 @@ jobs:
           for sha in "$PARENT" "$RELEASE_SHA" "$TAG_OID"; do [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; done
           for digest in "$BUNDLE_DIGEST" "$REFS_DIGEST"; do [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; done
           bundle="$RUNNER_TEMP/release-bundle/release.bundle"
-          [ "$(sha256sum "$bundle" | cut -d' ' -f1)" = "$BUNDLE_DIGEST" ]
+          actual_bundle_digest="$(sha256sum "$bundle" | cut -d' ' -f1)"
+          [ "$actual_bundle_digest" = "$BUNDLE_DIGEST" ]
           reason='invalid-prepared-bundle'
           bare="$RUNNER_TEMP/release-auto-push.git"
           [ ! -e "$bare" ]
@@ -227,15 +233,19 @@ jobs:
           g fetch --no-tags origin "$PARENT"
           g bundle verify "$bundle"
           heads="$(g bundle list-heads "$bundle")"
-          [ "$(printf '%s\n' "$heads" | wc -l | tr -d ' ')" = 2 ]
+          head_count="$(printf '%s\n' "$heads" | wc -l | tr -d ' ')"
+          [ "$head_count" = 2 ]
           printf '%s\n' "$heads" | awk -v r="$RELEASE_SHA" -v t="$RELEASE_TAG" -v o="$TAG_OID" '
             $1==r && $2=="refs/heads/release-auto-prepared" { a++ }
             $1==o && $2=="refs/tags/"t { b++ }
             END { exit !(a==1 && b==1 && NR==2) }'
           g fetch "$bundle" refs/heads/release-auto-prepared:refs/heads/release-auto-prepared "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-          [ "$(g rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$RELEASE_SHA" ]
-          [ "$(g cat-file -t "refs/tags/$RELEASE_TAG")" = tag ]
-          [ "$(g rev-list --parents -n 1 "$RELEASE_SHA")" = "$RELEASE_SHA $PARENT" ]
+          tag_sha="$(g rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          [ "$tag_sha" = "$RELEASE_SHA" ]
+          tag_type="$(g cat-file -t "refs/tags/$RELEASE_TAG")"
+          [ "$tag_type" = tag ]
+          parent_line="$(g rev-list --parents -n 1 "$RELEASE_SHA")"
+          [ "$parent_line" = "$RELEASE_SHA $PARENT" ]
           reason='non-metadata-bundle'
           changes="$RUNNER_TEMP/release-changes"
           g diff-tree --no-commit-id --no-renames --no-ext-diff --no-textconv --name-status -r -z "$PARENT" "$RELEASE_SHA" > "$changes"
@@ -272,9 +282,13 @@ jobs:
         env:
           GH_APP_TOKEN: ${{ steps.app.outputs.token }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          failure_shell=$BASHPID
           reason='remote-state-unreadable'
-          fail() { printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"; exit 1; }
+          fail() {
+            if [ "$BASHPID" = "$failure_shell" ]; then printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"; fi
+            exit 1
+          }
           trap fail ERR
           export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0
           unset GIT_TRACE GIT_TRACE_CURL GIT_CURL_VERBOSE GIT_TRACE_PACKET GIT_TRACE_SETUP GIT_TRACE_PERFORMANCE GIT_TRACE2 GIT_TRACE2_EVENT GIT_TRACE2_PERF
@@ -382,11 +396,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          failure_shell=$BASHPID
           reason='publication-unconfirmed'
-          fail() { printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"; exit 1; }
+          fail() {
+            if [ "$BASHPID" = "$failure_shell" ]; then printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"; fi
+            exit 1
+          }
           trap fail ERR
-          [ "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$RELEASE_SHA" ]
+          tag_sha="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          [ "$tag_sha" = "$RELEASE_SHA" ]
           receipt=confirmed
           if [ "$RELEASE_KIND" = rc ]; then
             git fetch origin refs/heads/main
@@ -398,9 +417,11 @@ jobs:
           .agents/skills/uzi-release/scripts/release-watch.sh "${RELEASE_TAG#v}" --max-reruns 2 --interval 60 --max-ticks 60 2>&1 | tee "$RUNNER_TEMP/release-watch.log" || watch_status=$?
           python3 -I scripts/release-auto.py watch-log
           [ "$watch_status" -eq 0 ]
-          echo "published_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          published_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "published_at=$published_at" >> "$GITHUB_OUTPUT"
           .agents/skills/uzi-release/scripts/release-verify.sh "$RELEASE_TAG"
-          echo "verified_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          verified_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "verified_at=$verified_at" >> "$GITHUB_OUTPUT"
           echo 'outcome=published-and-verified' >> "$GITHUB_OUTPUT"
 
   report:
