@@ -407,7 +407,7 @@ func ComputeReserveOverride(ctx context.Context, q *store.Queries, run store.Run
 	if v, ok := snap.spentVerdict(run); ok && v.Fresh && v.State == usagereserve.Held && v.ResetsAt != nil && v.ResetsAt.After(now) {
 		anchor := v.ResetsAt.UTC()
 		g.WindowReset = &anchor
-		prior := int16(v.Pct)
+		prior := int16(v.Pct) //nolint:gosec // G115: Verdict.Pct is a 7-day percentage, floored and clamped to 0..100 by both evaluators
 		g.PriorPct = &prior
 		if anchor.Before(g.Until) {
 			g.Until = anchor
