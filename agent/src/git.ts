@@ -2828,6 +2828,7 @@ export class GitCache {
   private async readBareCacheOrigin(barePath: string): Promise<BareCacheOrigin> {
     let out: string;
     try {
+      await this.assertCanonicalAlternatesAbsent(barePath);
       out = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
     } catch (err) {
       if (err instanceof RunResidueBlockedError) throw err;
@@ -2882,6 +2883,7 @@ export class GitCache {
         }) as [string, string];
       });
       if (path.dirname(realBare) !== realRoot) return undefined;
+      await this.assertCanonicalAlternatesAbsent(barePath);
     } catch {
       return undefined;
     }
@@ -17557,6 +17559,20 @@ try {
     return false;
   }
 
+  /** Canonical caches do not borrow object stores. Git 2.56 initializes alternates
+   * even for metadata probes, so refuse controls without opening or following them. */
+  private async assertCanonicalAlternatesAbsent(barePath: string): Promise<void> {
+    for (const name of ["alternates", "http-alternates"]) {
+      try {
+        await this.retainedIO(() => fs.lstat(path.join(barePath, "objects", "info", name)));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      throw new Error("maintenance_source_layout_unsupported");
+    }
+  }
+
   /** Worker-only directories are the ownership root; runner-provided Git config is not. */
   private async assertOwedBare(barePath: string, readOptions?: BoundedReadOptions): Promise<void> {
     const root = path.resolve(this.reposRoot);
@@ -17570,6 +17586,7 @@ try {
           ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() ||
             (uidSplitActive() && st.gid === RUNNER_UID)))) throw new Error("unsafe worker bare directory");
     }
+    await this.assertCanonicalAlternatesAbsent(barePath);
     const args = ["rev-parse", "--is-bare-repository"];
     const read = readOptions ? await this.readBare(barePath, args, readOptions) : undefined;
     if (read?.truncated || (read ? read.text : await this.runGit(barePath, args)).trim() !== "true") {
