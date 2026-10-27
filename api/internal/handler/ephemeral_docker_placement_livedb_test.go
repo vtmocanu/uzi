@@ -12,6 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -75,6 +76,7 @@ func (fx *ephemeralFixture) dockerClaimService(probe *dockerAllowlistProbe, tier
 		CustodyHoldLimit:     defaultCustodyLimit(),
 		WorkerHeartbeatStale: time.Minute, WorkerAffinityCeiling: time.Minute, WorkerSpreadGrace: time.Hour,
 	})
+	svc.SetVault(vault.NewPostgres(fx.box, fx.pool))
 	svc.SetTxBeginner(fx.pool)
 	svc.SetEphemeralLease(2 * time.Hour)
 	svc.SetDockerAllowlist(probe)

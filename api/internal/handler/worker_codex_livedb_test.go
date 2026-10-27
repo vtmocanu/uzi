@@ -19,6 +19,7 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -85,11 +86,13 @@ func TestWorkerCodexRoutesReleaseAndRefreshLiveDB(t *testing.T) {
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
 	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
+	wsvc.SetVault(vault.NewPostgres(box, pool))
+	wsvc.SetTxBeginner(pool)
 	h := &Handler{q: q, wsvc: wsvc}
 	router := h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))
 
 	ownerID, connectionID, repoID, workerID, runID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
-	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`,
 		ownerID, fmt.Sprintf("codex-route-%s@example.test", uuid.NewString()))
 	mustExecT(ctx, t, pool, `INSERT INTO forge_connections
 		(id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)

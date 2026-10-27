@@ -112,14 +112,7 @@ func assertPolicyMaterialOpens(t *testing.T, h *Handler, ctx context.Context, ui
 func TestHTTPSecretWritersRejectLifecycleRacesLiveDB(t *testing.T) {
 	h, pool := secretsCRUDHandler(t)
 	ctx := context.Background()
-	var previous string
-	if err := pool.QueryRow(ctx, "SELECT value FROM app_settings WHERE key='vault_policy'").Scan(&previous); err != nil {
-		t.Fatal(err)
-	}
-	mustExecT(ctx, t, pool, "UPDATE app_settings SET value='optional' WHERE key='vault_policy'")
-	t.Cleanup(func() {
-		mustExecT(context.Background(), t, pool, "UPDATE app_settings SET value=$1 WHERE key='vault_policy'", previous)
-	})
+	vaultFixturePolicy(t, pool, "optional")
 	for _, writer := range policyHTTPWriters() {
 		for _, transition := range []string{"enable", "disable", "disable-enable-ABA"} {
 			t.Run(writer.name+"/"+transition, func(t *testing.T) {

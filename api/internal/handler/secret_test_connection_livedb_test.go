@@ -16,7 +16,6 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 const liveModels = `{"object":"list","data":[{"id":"gpt-4o","object":"model"}]}`
@@ -142,9 +141,24 @@ func TestSecretConnectionDisabledAndVaultLockedLiveDB(t *testing.T) {
 		http.StatusOK, "inconclusive", "generic")
 
 	locked := seedTestConnection(t, h, pool, owner, "openai_api_key", "fixture-locked")
-	// A DEK-sealed row requires an unlocked user vault before any provider request.
-	cliMustExec(t, pool, `UPDATE user_secrets SET sealed_with = 'dek' WHERE id = $1`, locked)
-	h.vault = vault.NewPostgres(h.box, h.pool)
+	// Enable migrates the real master-sealed material to the user's DEK, then
+	// acknowledge a lock so the probe reaches the protected, locked-vault path.
+	vaultFixturePolicy(t, pool, "optional")
+	const password = "connection-probe-fixture-password"
+	setVaultFixturePassword(t, pool, owner, password)
+	if err := h.vault.Enable(context.Background(), owner, password); err != nil {
+		t.Fatal(err)
+	}
+	var marker string
+	if err := pool.QueryRow(context.Background(), "SELECT sealed_with FROM user_secrets WHERE id=$1", locked).Scan(&marker); err != nil {
+		t.Fatal(err)
+	}
+	if marker != store.SealedWithDEK {
+		t.Fatalf("enabled secret marker=%q, want DEK", marker)
+	}
+	if err := h.vault.LockAndAcknowledge(context.Background(), owner); err != nil {
+		t.Fatal(err)
+	}
 	requireTestResult(t, cookieReq(t, router, http.MethodPost, testConnectionPath("openai_api_key", locked), session, ""),
 		http.StatusOK, "inconclusive", "vault_locked")
 	if got := calls.Load(); got != 0 {

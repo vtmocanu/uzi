@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -37,6 +38,7 @@ func TestWorkerRecoveryOwnerResumeServiceClaimWireLiveDB(t *testing.T) {
 		RunTimeout: 24 * time.Hour, RunWallCeiling: 24 * time.Hour, WorkerHeartbeatStale: time.Minute,
 		CustodyHoldLimit: defaultCustodyLimit(),
 	})
+	svc.SetVault(vault.NewPostgres(fx.box, fx.pool))
 	svc.SetTxBeginner(fx.pool)
 	oldWorker := fx.onlineWorker("recovery-wire-old", false)
 	newWorker := fx.onlineWorker("recovery-wire-new", false)

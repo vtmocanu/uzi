@@ -81,6 +81,7 @@ func cliLiveDB(t *testing.T) (*Handler, http.Handler, *pgxpool.Pool) {
 		settings: settings.New(&settingsStore{}, time.Minute),
 		hub:      hub.New(),
 	}
+	h.wsvc.SetVault(h.vault)
 	lim := mw.NewLimiter(100000, time.Minute, nil)
 	router := h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim)
 	return h, router, pool

@@ -13,6 +13,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -71,6 +72,7 @@ func newSeededPlanFixture(ctx context.Context, t *testing.T) seededPlanFixture {
 	q := store.New(pool)
 
 	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
+	wsvc.SetVault(vault.NewPostgres(box, pool))
 	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
 	wsvc.SetTxBeginner(pool)
 	f := seededPlanFixture{
@@ -95,7 +97,7 @@ func newSeededPlanFixture(ctx context.Context, t *testing.T) seededPlanFixture {
 	}
 
 	connID := uuid.New()
-	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`,
 		f.owner, fmt.Sprintf("seed-owner-%s@e2e", uuid.NewString()[:8]))
 	mustExecT(ctx, t, pool, `INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 	          VALUES ($1, $2, 'gitlab', 'https://forge.example', 'uzi-bot', $3, $4)`,
