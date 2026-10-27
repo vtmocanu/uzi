@@ -4740,6 +4740,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		owned = locked
 		q = qtx
 	}
+	if req.RequiredCapabilities != nil {
+		caps := applyInferredCapabilityPolicy(owned, *req.RequiredCapabilities)
+		req.RequiredCapabilities = &caps
+	}
 	var rows int64
 	// PRD #1795 M1: a refused awaiting_approval report (historical id, changed payload on the
 	// current id, stale adoption). It wrote no report; it is returned AFTER the commit (its

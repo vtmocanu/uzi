@@ -366,6 +366,12 @@ export const forgeApi = {
   },
   // PRD #84 M2: static per-repo capability hint. Mirrors the server's
   // capability.Filter to the {docker, jvm} vocabulary so only valid names persist.
+  setRepoIgnoredInferredCapabilities: async (id: string, caps: string[]) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    r.ignored_inferred_capabilities = CAPABILITY_VOCABULARY.filter((cap) => caps.includes(cap));
+    return delay({ repo: { ...r } });
+  },
   setRepoRequiredCapabilities: async (id: string, caps: string[]) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");

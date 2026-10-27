@@ -971,8 +971,10 @@ type RunDTO struct {
 	// are non-nil ([] over null) via capsOrEmpty; SizeClass is "" for a run whose plan-time
 	// inference never set it (the column is NOT NULL DEFAULT '').
 	RequiredCapabilities []string `json:"required_capabilities"`
-	RequiredTools        []string `json:"required_tools"`
-	SizeClass            string   `json:"size_class"`
+	// Frozen repo inference policy; declared requirements still win on overlap.
+	IgnoredInferredCapabilities []string `json:"ignored_inferred_capabilities"`
+	RequiredTools               []string `json:"required_tools"`
+	SizeClass                   string   `json:"size_class"`
 	// PlanChangedFiles is the git-status list surfaced at the approval gate (PRD #212).
 	// [] (never omitempty) like required_tools: a pre-#212 run's NULL column and a clean
 	// plan turn both map to []; renderers show the section only when non-empty.
@@ -1798,9 +1800,10 @@ type RunSummaryItemDTO struct {
 	// authoritative enforcement is the 409 the approval gate returns. Capability/tool slices
 	// are non-nil ([] over null) via capsOrEmpty; SizeClass is "" for a run whose plan-time
 	// inference never set it (the column is NOT NULL DEFAULT '').
-	RequiredCapabilities []string `json:"required_capabilities"`
-	RequiredTools        []string `json:"required_tools"`
-	SizeClass            string   `json:"size_class"`
+	RequiredCapabilities        []string `json:"required_capabilities"`
+	IgnoredInferredCapabilities []string `json:"ignored_inferred_capabilities"`
+	RequiredTools               []string `json:"required_tools"`
+	SizeClass                   string   `json:"size_class"`
 	// PlanChangedFiles is the git-status list surfaced at the approval gate (PRD #212).
 	// [] (never omitempty) like required_tools: a pre-#212 run's NULL column and a clean
 	// plan turn both map to []; renderers show the section only when non-empty.
@@ -2002,6 +2005,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		OverrideSubagentModel:       item.OverrideSubagentModel,
 		Priority:                    item.Priority,
 		RequiredCapabilities:        item.RequiredCapabilities,
+		IgnoredInferredCapabilities: item.IgnoredInferredCapabilities,
 		RequiredTools:               item.RequiredTools,
 		SizeClass:                   item.SizeClass,
 		PlanChangedFiles:            item.PlanChangedFiles,
@@ -2169,6 +2173,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			OverrideSubagentModel:       s.OverrideSubagentModel,
 			Priority:                    s.Priority,
 			RequiredCapabilities:        s.RequiredCapabilities,
+			IgnoredInferredCapabilities: s.IgnoredInferredCapabilities,
 			RequiredTools:               s.RequiredTools,
 			SizeClass:                   s.SizeClass,
 			PlanChangedFiles:            s.PlanChangedFiles,

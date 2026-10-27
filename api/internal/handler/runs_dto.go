@@ -333,9 +333,10 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// web/CLI (4d) readiness/mismatch display. Capability/tool slices are normalized to
 		// a non-nil empty slice ([] over null), mirroring the repo DTO; size_class is the
 		// NOT NULL DEFAULT '' string (empty for a run whose inference never set it).
-		RequiredCapabilities: capsOrEmpty(r.RequiredCapabilities),
-		RequiredTools:        capsOrEmpty(r.RequiredTools),
-		SizeClass:            r.SizeClass,
+		RequiredCapabilities:        capsOrEmpty(r.RequiredCapabilities),
+		IgnoredInferredCapabilities: capsOrEmpty(r.IgnoredInferredCapabilities),
+		RequiredTools:               capsOrEmpty(r.RequiredTools),
+		SizeClass:                   r.SizeClass,
 		// PRD #212: the plan-turn git-status list, non-nil ([] over null) via capsOrEmpty
 		// like required_tools. runToDTO is the single chokepoint for every run-detail
 		// response, so this one line covers every consumer.

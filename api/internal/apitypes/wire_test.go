@@ -273,7 +273,7 @@ var runDTOKeys = []string{
 	// and required_tools (M4 4b, display-only) are non-nil slices ([] over null); size_class
 	// (M4 4b) is the NOT NULL DEFAULT '' string. All three always on the wire, and — via the
 	// RunListItemDTO embed pin — on both the list and detail reads.
-	"required_capabilities", "required_tools", "size_class",
+	"required_capabilities", "ignored_inferred_capabilities", "required_tools", "size_class",
 	// PRD #212: the git-status list surfaced at the approval gate, non-nil ([] over null)
 	// via capsOrEmpty like required_tools. On both list and detail via the RunListItemDTO embed.
 	"plan_changed_files",
@@ -848,7 +848,7 @@ func TestRepoDTOTags(t *testing.T) {
 		// improve_uzi backlog + selects the uzi worker directive). Default false.
 		"repo_fold_improve_uzi_backlog",
 		// PRD #84 M2: the static per-repo capability hint routed onto each run.
-		"required_capabilities", "pipeline",
+		"required_capabilities", "ignored_inferred_capabilities", "pipeline",
 		// PRD #66 M8 (D8): admin per-repo guardrail override metadata, null when no
 		// override is active. Display-only surfacing for M9's badge.
 		"guardrail_override",

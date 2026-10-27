@@ -25,6 +25,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       setRepoDevboxOptIn: vi.fn(),
       setRepoFoldImproveUziBacklog: vi.fn(),
       setRepoRequiredCapabilities: vi.fn(),
+      setRepoIgnoredInferredCapabilities: vi.fn(),
       setRepoGuardrailOverride: vi.fn(),
       clearRepoGuardrailOverride: vi.fn(),
       requestGuardrailOverride: vi.fn(),
@@ -593,7 +594,7 @@ describe("Repos — static capability hint (PRD #84 M2)", () => {
 
     fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
     // The fixed vocabulary renders as two checkboxes; tick docker.
-    const docker = await screen.findByRole("checkbox", { name: "docker" });
+    const docker = within(await screen.findByRole("group", { name: "Required capabilities" })).getByRole("checkbox", { name: "docker" });
     expect((docker as HTMLInputElement).checked).toBe(false);
     fireEvent.click(docker);
 
@@ -613,13 +614,42 @@ describe("Repos — static capability hint (PRD #84 M2)", () => {
     await screen.findByText("vtmocanu/uzi");
 
     fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
-    const docker = (await screen.findByRole("checkbox", { name: "docker" })) as HTMLInputElement;
+    const docker = within(await screen.findByRole("group", { name: "Required capabilities" })).getByRole("checkbox", { name: "docker" }) as HTMLInputElement;
     expect(docker.checked).toBe(true);
     fireEvent.click(docker);
 
     await waitFor(() =>
       expect(mockApi.setRepoRequiredCapabilities).toHaveBeenCalledWith("repo-uzi", ["jvm"]),
     );
+  });
+});
+
+describe("Repos ignored inference policy", () => {
+  it("changes only the ignored set and explains declared-hint precedence", async () => {
+    mockApi.listProjects.mockResolvedValue({ repos: [{ ...REPOS[0], required_capabilities: ["jvm"] }] });
+    mockApi.setRepoIgnoredInferredCapabilities.mockResolvedValue({ repo: { ...REPOS[0], required_capabilities: ["jvm"], ignored_inferred_capabilities: ["jvm"] } });
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
+    const group = await screen.findByRole("group", { name: "Ignored inferred capabilities" });
+    fireEvent.click(within(group).getByRole("checkbox", { name: "jvm" }));
+    await waitFor(() => expect(mockApi.setRepoIgnoredInferredCapabilities).toHaveBeenCalledWith("repo-uzi", ["jvm"]));
+    expect(mockApi.setRepoRequiredCapabilities).not.toHaveBeenCalled();
+    expect(await within(group).findByRole("note")).toHaveProperty("textContent", "Explicit requirements take precedence: jvm remain required.");
+    expect(within(screen.getByRole("group", { name: "Required capabilities" })).getByRole("checkbox", { name: "jvm" })).toHaveProperty("checked", true);
+  });
+
+  it("can clear ignored inference without clearing the declared hint", async () => {
+    mockApi.listProjects.mockResolvedValue({ repos: [{ ...REPOS[0], required_capabilities: ["jvm"], ignored_inferred_capabilities: ["jvm"] }] });
+    mockApi.setRepoIgnoredInferredCapabilities.mockResolvedValue({ repo: { ...REPOS[0], required_capabilities: ["jvm"], ignored_inferred_capabilities: [] } });
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
+    const group = await screen.findByRole("group", { name: "Ignored inferred capabilities" });
+    fireEvent.click(within(group).getByRole("checkbox", { name: "jvm" }));
+    await waitFor(() => expect(mockApi.setRepoIgnoredInferredCapabilities).toHaveBeenCalledWith("repo-uzi", []));
+    await waitFor(() => expect(within(group).queryByRole("note")).toBeNull());
+    expect(mockApi.setRepoRequiredCapabilities).not.toHaveBeenCalled();
   });
 });
 

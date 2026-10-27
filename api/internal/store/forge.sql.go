@@ -174,7 +174,7 @@ SET guardrail_override_reason = NULL,
     guardrail_override_by     = NULL,
     guardrail_override_at     = NULL
 WHERE id = $1
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
 `
 
 // PRD #66 M8 (D8): revoke the admin per-repo override, re-arming the guardrail
@@ -202,6 +202,7 @@ func (q *Queries) ClearRepoGuardrailOverride(ctx context.Context, id uuid.UUID) 
 		&i.FoldImproveUziBacklog,
 		&i.CodeCrossCheckGuidance,
 		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
 	)
 	return i, err
 }
@@ -279,7 +280,7 @@ WITH deletion_scope AS MATERIALIZED (
         THEN cc.lead_run_id ELSE candidates.id END
         AND parent.kind <> 'cross_check'
 ), locked_parents AS MATERIALIZED (
-    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons, lead.plan_cross_check_diff_refusal, lead.worker_recovery_episode, lead.requeue_episode_baseline, lead.worker_recovery_evidence, lead.cross_check_lane, lead.cross_check_lane_generation, lead.completion_final_head, lead.code_cross_check_required, lead.provider_park_count, lead.provider_park_streak_started_at, lead.ci_config_guard, lead.memory_episode, lead.memory_intervention_count, lead.memory_policy, lead.completion_non_closing_reason, lead.ci_artifact_manifest, lead.checkpoint_attested_source, lead.source_publication_intent, lead.continued_issue_iid, lead.checkpoint_coordinates, lead.retained_park_count FROM runs lead
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons, lead.plan_cross_check_diff_refusal, lead.worker_recovery_episode, lead.requeue_episode_baseline, lead.worker_recovery_evidence, lead.cross_check_lane, lead.cross_check_lane_generation, lead.completion_final_head, lead.code_cross_check_required, lead.provider_park_count, lead.provider_park_streak_started_at, lead.ci_config_guard, lead.memory_episode, lead.memory_intervention_count, lead.memory_policy, lead.completion_non_closing_reason, lead.ci_artifact_manifest, lead.checkpoint_attested_source, lead.source_publication_intent, lead.continued_issue_iid, lead.checkpoint_coordinates, lead.retained_park_count, lead.ignored_inferred_capabilities FROM runs lead
     WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
       AND lead.kind <> 'cross_check'
     ORDER BY lead.id
@@ -352,7 +353,7 @@ WITH deletion_scope AS MATERIALIZED (
         THEN cc.lead_run_id ELSE candidates.id END
         AND parent.kind <> 'cross_check'
 ), locked_parents AS MATERIALIZED (
-    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons, lead.plan_cross_check_diff_refusal, lead.worker_recovery_episode, lead.requeue_episode_baseline, lead.worker_recovery_evidence, lead.cross_check_lane, lead.cross_check_lane_generation, lead.completion_final_head, lead.code_cross_check_required, lead.provider_park_count, lead.provider_park_streak_started_at, lead.ci_config_guard, lead.memory_episode, lead.memory_intervention_count, lead.memory_policy, lead.completion_non_closing_reason, lead.ci_artifact_manifest, lead.checkpoint_attested_source, lead.source_publication_intent, lead.continued_issue_iid, lead.checkpoint_coordinates, lead.retained_park_count FROM runs lead
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons, lead.plan_cross_check_diff_refusal, lead.worker_recovery_episode, lead.requeue_episode_baseline, lead.worker_recovery_evidence, lead.cross_check_lane, lead.cross_check_lane_generation, lead.completion_final_head, lead.code_cross_check_required, lead.provider_park_count, lead.provider_park_streak_started_at, lead.ci_config_guard, lead.memory_episode, lead.memory_intervention_count, lead.memory_policy, lead.completion_non_closing_reason, lead.ci_artifact_manifest, lead.checkpoint_attested_source, lead.source_publication_intent, lead.continued_issue_iid, lead.checkpoint_coordinates, lead.retained_park_count, lead.ignored_inferred_capabilities FROM runs lead
     WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
       AND lead.kind <> 'cross_check'
     ORDER BY lead.id
@@ -860,7 +861,7 @@ func (q *Queries) ListEnabledRepoIDs(ctx context.Context) ([]uuid.UUID, error) {
 }
 
 const listEnabledReposByConnection = `-- name: ListEnabledReposByConnection :many
-SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled FROM repos WHERE connection_id = $1 AND enabled = true
+SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities FROM repos WHERE connection_id = $1 AND enabled = true
 ORDER BY path_with_namespace ASC
 `
 
@@ -894,6 +895,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 			&i.FoldImproveUziBacklog,
 			&i.CodeCrossCheckGuidance,
 			&i.CrossCheckRepoInstructionsEnabled,
+			&i.IgnoredInferredCapabilities,
 		); err != nil {
 			return nil, err
 		}
@@ -906,7 +908,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 }
 
 const listEnabledReposForUser = `-- name: ListEnabledReposForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE c.user_id = $1 AND r.enabled = true
 ORDER BY r.path_with_namespace ASC
@@ -940,6 +942,7 @@ func (q *Queries) ListEnabledReposForUser(ctx context.Context, userID uuid.UUID)
 			&i.FoldImproveUziBacklog,
 			&i.CodeCrossCheckGuidance,
 			&i.CrossCheckRepoInstructionsEnabled,
+			&i.IgnoredInferredCapabilities,
 		); err != nil {
 			return nil, err
 		}
@@ -1492,7 +1495,7 @@ func (q *Queries) ListPRDLinkPatchCandidates(ctx context.Context, arg ListPRDLin
 }
 
 const listReposByConnectionForUser = `-- name: ListReposByConnectionForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.connection_id = $1 AND c.user_id = $2
 ORDER BY r.path_with_namespace ASC
@@ -1531,6 +1534,7 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 			&i.FoldImproveUziBacklog,
 			&i.CodeCrossCheckGuidance,
 			&i.CrossCheckRepoInstructionsEnabled,
+			&i.IgnoredInferredCapabilities,
 		); err != nil {
 			return nil, err
 		}
@@ -1707,11 +1711,92 @@ func (q *Queries) SetForgeConnectionHumanUsername(ctx context.Context, arg SetFo
 	return i, err
 }
 
+const setRepoCapabilityPolicy = `-- name: SetRepoCapabilityPolicy :one
+UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
+`
+
+type SetRepoCapabilityPolicyParams struct {
+	ID                          uuid.UUID `json:"id"`
+	RequiredCapabilities        []string  `json:"required_capabilities"`
+	IgnoredInferredCapabilities []string  `json:"ignored_inferred_capabilities"`
+}
+
+func (q *Queries) SetRepoCapabilityPolicy(ctx context.Context, arg SetRepoCapabilityPolicyParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoCapabilityPolicy, arg.ID, arg.RequiredCapabilities, arg.IgnoredInferredCapabilities)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
+		&i.CodeCrossCheckGuidance,
+		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
+	)
+	return i, err
+}
+
+const setRepoCapabilityPolicyForUser = `-- name: SetRepoCapabilityPolicyForUser :one
+UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $4)
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
+`
+
+type SetRepoCapabilityPolicyForUserParams struct {
+	ID                          uuid.UUID `json:"id"`
+	RequiredCapabilities        []string  `json:"required_capabilities"`
+	IgnoredInferredCapabilities []string  `json:"ignored_inferred_capabilities"`
+	UserID                      uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) SetRepoCapabilityPolicyForUser(ctx context.Context, arg SetRepoCapabilityPolicyForUserParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoCapabilityPolicyForUser,
+		arg.ID,
+		arg.RequiredCapabilities,
+		arg.IgnoredInferredCapabilities,
+		arg.UserID,
+	)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
+		&i.CodeCrossCheckGuidance,
+		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
+	)
+	return i, err
+}
+
 const setRepoCodeCrossCheckInputs = `-- name: SetRepoCodeCrossCheckInputs :one
 UPDATE repos SET
  code_cross_check_guidance = CASE WHEN $1::boolean THEN $2::text ELSE code_cross_check_guidance END,
  cross_check_repo_instructions_enabled = COALESCE($3::boolean, cross_check_repo_instructions_enabled)
-WHERE id = $4 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled
+WHERE id = $4 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
 `
 
 type SetRepoCodeCrossCheckInputsParams struct {
@@ -1747,6 +1832,7 @@ func (q *Queries) SetRepoCodeCrossCheckInputs(ctx context.Context, arg SetRepoCo
 		&i.FoldImproveUziBacklog,
 		&i.CodeCrossCheckGuidance,
 		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
 	)
 	return i, err
 }
@@ -1756,7 +1842,7 @@ UPDATE repos SET
  code_cross_check_guidance = CASE WHEN $1::boolean THEN $2::text ELSE code_cross_check_guidance END,
  cross_check_repo_instructions_enabled = COALESCE($3::boolean, cross_check_repo_instructions_enabled)
 WHERE repos.id = $4 AND repos.connection_id IN (SELECT fc.id FROM forge_connections fc WHERE fc.user_id = $5)
-RETURNING repos.id, repos.connection_id, repos.forge_project_id, repos.path_with_namespace, repos.web_url, repos.default_branch, repos.enabled, repos.repo_skills_enabled, repos.repo_devbox_opt_in, repos.repo_claudemd_enabled, repos.guardrail_override_reason, repos.guardrail_override_by, repos.guardrail_override_at, repos.required_capabilities, repos.fold_improve_uzi_backlog, repos.code_cross_check_guidance, repos.cross_check_repo_instructions_enabled
+RETURNING repos.id, repos.connection_id, repos.forge_project_id, repos.path_with_namespace, repos.web_url, repos.default_branch, repos.enabled, repos.repo_skills_enabled, repos.repo_devbox_opt_in, repos.repo_claudemd_enabled, repos.guardrail_override_reason, repos.guardrail_override_by, repos.guardrail_override_at, repos.required_capabilities, repos.fold_improve_uzi_backlog, repos.code_cross_check_guidance, repos.cross_check_repo_instructions_enabled, repos.ignored_inferred_capabilities
 `
 
 type SetRepoCodeCrossCheckInputsForUserParams struct {
@@ -1794,12 +1880,13 @@ func (q *Queries) SetRepoCodeCrossCheckInputsForUser(ctx context.Context, arg Se
 		&i.FoldImproveUziBacklog,
 		&i.CodeCrossCheckGuidance,
 		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
 	)
 	return i, err
 }
 
 const setRepoDevboxOptIn = `-- name: SetRepoDevboxOptIn :one
-UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled
+UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
 `
 
 type SetRepoDevboxOptInParams struct {
@@ -1830,6 +1917,7 @@ func (q *Queries) SetRepoDevboxOptIn(ctx context.Context, arg SetRepoDevboxOptIn
 		&i.FoldImproveUziBacklog,
 		&i.CodeCrossCheckGuidance,
 		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
 	)
 	return i, err
 }
@@ -1838,7 +1926,7 @@ const setRepoDevboxOptInForUser = `-- name: SetRepoDevboxOptInForUser :one
 UPDATE repos SET repo_devbox_opt_in = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
 `
 
 type SetRepoDevboxOptInForUserParams struct {
@@ -1870,6 +1958,7 @@ func (q *Queries) SetRepoDevboxOptInForUser(ctx context.Context, arg SetRepoDevb
 		&i.FoldImproveUziBacklog,
 		&i.CodeCrossCheckGuidance,
 		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
 	)
 	return i, err
 }
@@ -1878,7 +1967,7 @@ const setRepoEnabledForUser = `-- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
 `
 
 type SetRepoEnabledForUserParams struct {
@@ -1908,12 +1997,13 @@ func (q *Queries) SetRepoEnabledForUser(ctx context.Context, arg SetRepoEnabledF
 		&i.FoldImproveUziBacklog,
 		&i.CodeCrossCheckGuidance,
 		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
 	)
 	return i, err
 }
 
 const setRepoFoldImproveUziBacklog = `-- name: SetRepoFoldImproveUziBacklog :one
-UPDATE repos SET fold_improve_uzi_backlog = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled
+UPDATE repos SET fold_improve_uzi_backlog = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
 `
 
 type SetRepoFoldImproveUziBacklogParams struct {
@@ -1944,6 +2034,7 @@ func (q *Queries) SetRepoFoldImproveUziBacklog(ctx context.Context, arg SetRepoF
 		&i.FoldImproveUziBacklog,
 		&i.CodeCrossCheckGuidance,
 		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
 	)
 	return i, err
 }
@@ -1952,7 +2043,7 @@ const setRepoFoldImproveUziBacklogForUser = `-- name: SetRepoFoldImproveUziBackl
 UPDATE repos SET fold_improve_uzi_backlog = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
 `
 
 type SetRepoFoldImproveUziBacklogForUserParams struct {
@@ -1985,6 +2076,7 @@ func (q *Queries) SetRepoFoldImproveUziBacklogForUser(ctx context.Context, arg S
 		&i.FoldImproveUziBacklog,
 		&i.CodeCrossCheckGuidance,
 		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
 	)
 	return i, err
 }
@@ -1995,7 +2087,7 @@ SET guardrail_override_reason = $2,
     guardrail_override_by     = $3,
     guardrail_override_at     = $4
 WHERE id = $1
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
 `
 
 type SetRepoGuardrailOverrideParams struct {
@@ -2037,12 +2129,87 @@ func (q *Queries) SetRepoGuardrailOverride(ctx context.Context, arg SetRepoGuard
 		&i.FoldImproveUziBacklog,
 		&i.CodeCrossCheckGuidance,
 		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
+	)
+	return i, err
+}
+
+const setRepoIgnoredInferredCapabilities = `-- name: SetRepoIgnoredInferredCapabilities :one
+UPDATE repos SET ignored_inferred_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
+`
+
+type SetRepoIgnoredInferredCapabilitiesParams struct {
+	ID                          uuid.UUID `json:"id"`
+	IgnoredInferredCapabilities []string  `json:"ignored_inferred_capabilities"`
+}
+
+func (q *Queries) SetRepoIgnoredInferredCapabilities(ctx context.Context, arg SetRepoIgnoredInferredCapabilitiesParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoIgnoredInferredCapabilities, arg.ID, arg.IgnoredInferredCapabilities)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
+		&i.CodeCrossCheckGuidance,
+		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
+	)
+	return i, err
+}
+
+const setRepoIgnoredInferredCapabilitiesForUser = `-- name: SetRepoIgnoredInferredCapabilitiesForUser :one
+UPDATE repos SET ignored_inferred_capabilities = $2
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
+`
+
+type SetRepoIgnoredInferredCapabilitiesForUserParams struct {
+	ID                          uuid.UUID `json:"id"`
+	IgnoredInferredCapabilities []string  `json:"ignored_inferred_capabilities"`
+	UserID                      uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) SetRepoIgnoredInferredCapabilitiesForUser(ctx context.Context, arg SetRepoIgnoredInferredCapabilitiesForUserParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoIgnoredInferredCapabilitiesForUser, arg.ID, arg.IgnoredInferredCapabilities, arg.UserID)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
+		&i.CodeCrossCheckGuidance,
+		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
 	)
 	return i, err
 }
 
 const setRepoRequiredCapabilities = `-- name: SetRepoRequiredCapabilities :one
-UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled
+UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
 `
 
 type SetRepoRequiredCapabilitiesParams struct {
@@ -2074,6 +2241,7 @@ func (q *Queries) SetRepoRequiredCapabilities(ctx context.Context, arg SetRepoRe
 		&i.FoldImproveUziBacklog,
 		&i.CodeCrossCheckGuidance,
 		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
 	)
 	return i, err
 }
@@ -2082,7 +2250,7 @@ const setRepoRequiredCapabilitiesForUser = `-- name: SetRepoRequiredCapabilities
 UPDATE repos SET required_capabilities = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
 `
 
 type SetRepoRequiredCapabilitiesForUserParams struct {
@@ -2116,6 +2284,7 @@ func (q *Queries) SetRepoRequiredCapabilitiesForUser(ctx context.Context, arg Se
 		&i.FoldImproveUziBacklog,
 		&i.CodeCrossCheckGuidance,
 		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
 	)
 	return i, err
 }
@@ -2125,7 +2294,7 @@ UPDATE repos SET
   repo_skills_enabled   = COALESCE($1, repo_skills_enabled),
   repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
 WHERE repos.id = $3
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
 `
 
 type SetRepoTrustFlagsParams struct {
@@ -2159,6 +2328,7 @@ func (q *Queries) SetRepoTrustFlags(ctx context.Context, arg SetRepoTrustFlagsPa
 		&i.FoldImproveUziBacklog,
 		&i.CodeCrossCheckGuidance,
 		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
 	)
 	return i, err
 }
@@ -2169,7 +2339,7 @@ UPDATE repos SET
   repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
 WHERE repos.id = $3
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $4)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
 `
 
 type SetRepoTrustFlagsForUserParams struct {
@@ -2207,6 +2377,7 @@ func (q *Queries) SetRepoTrustFlagsForUser(ctx context.Context, arg SetRepoTrust
 		&i.FoldImproveUziBacklog,
 		&i.CodeCrossCheckGuidance,
 		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
 	)
 	return i, err
 }
@@ -2588,7 +2759,7 @@ ON CONFLICT (connection_id, forge_project_id) DO UPDATE
 SET path_with_namespace = EXCLUDED.path_with_namespace,
     web_url             = EXCLUDED.web_url,
     default_branch      = EXCLUDED.default_branch
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities
 `
 
 type UpsertRepoParams struct {
@@ -2629,6 +2800,7 @@ func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (Repo, e
 		&i.FoldImproveUziBacklog,
 		&i.CodeCrossCheckGuidance,
 		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
 	)
 	return i, err
 }

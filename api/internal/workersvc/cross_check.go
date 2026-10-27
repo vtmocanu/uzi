@@ -159,6 +159,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
+	candidate.RequiredCapabilities = applyInferredCapabilityPolicy(locked, candidate.RequiredCapabilities)
 	candidate, digest, err = bindSemanticCheckerCandidate(ctx, retryQ, leadID, candidate)
 	if err != nil {
 		return store.CrossCheck{}, err
@@ -220,6 +221,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 			return store.Run{}, ErrCrossCheckRefused
 		}
+		candidate.RequiredCapabilities = applyInferredCapabilityPolicy(locked, candidate.RequiredCapabilities)
 		rebound, reboundDigest, e := bindSemanticCheckerCandidate(ctx, txq, leadID, candidate)
 		if e != nil || !bytes.Equal(reboundDigest, digest) {
 			return store.Run{}, ErrCrossCheckInterrupted

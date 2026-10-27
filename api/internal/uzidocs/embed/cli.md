@@ -3119,6 +3119,12 @@ installed at run time, never a blocker), and a `SIZE_CLASS` row (`s`/`m`/`l`,
 advisory only). All three are comma-joined where the value is a list, and
 readable the same way under `--json`.
 
+`IGNORED_INFERRED_CAPABILITIES` shows the run's captured repo inference policy
+when non-empty. The JSON field is `ignored_inferred_capabilities`. This affects
+inferred scheduling requirements only; explicit repo hints still win, and
+`required_tools` is unchanged. Configure the policy in the repo's Tools panel
+or through its settings API; the CLI has no repo-settings command.
+
 ### Run status, and what `--follow` waits for
 
 A run's raw `status` (in `run get --json`, `run list --json` and

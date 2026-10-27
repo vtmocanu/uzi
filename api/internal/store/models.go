@@ -899,6 +899,7 @@ type Repo struct {
 	FoldImproveUziBacklog             bool               `json:"fold_improve_uzi_backlog"`
 	CodeCrossCheckGuidance            pgtype.Text        `json:"code_cross_check_guidance"`
 	CrossCheckRepoInstructionsEnabled bool               `json:"cross_check_repo_instructions_enabled"`
+	IgnoredInferredCapabilities       []string           `json:"ignored_inferred_capabilities"`
 }
 
 type RepoToolProfile struct {
@@ -1109,6 +1110,7 @@ type Run struct {
 	ContinuedIssueIid           pgtype.Int8        `json:"continued_issue_iid"`
 	CheckpointCoordinates       []byte             `json:"checkpoint_coordinates"`
 	RetainedParkCount           int32              `json:"retained_park_count"`
+	IgnoredInferredCapabilities []string           `json:"ignored_inferred_capabilities"`
 }
 
 type RunCompletionAttempt struct {

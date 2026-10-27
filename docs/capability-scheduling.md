@@ -99,6 +99,20 @@ alongside the plan, between the proposed milestones and the plan body:
 
 ### Overriding a false-positive inference
 
+For a recurring false positive, open the repo's **Tools** panel and select
+**Ignored inferred capabilities** (`docker` or `jvm`). New runs snapshot this
+repo setting at creation. Existing runs keep their captured policy, including
+across retries and plan replays. The settings API accepts
+`ignored_inferred_capabilities` in a PATCH to `/api/repos/<id>` and drops unknown
+names. It may set both capability lists together; its response includes a
+`warning` when the ignored and required sets overlap.
+
+Suppression removes only newly inferred scheduling requirements. A capability
+in the repo's **Required capabilities** hint still remains required, even when
+also selected for ignored inference; the Tools panel explains that precedence.
+Provisionable `required_tools` stay unchanged, so ignoring the `jvm` capability
+does not suppress JVM tool provisioning. Runtime guardrails also stay active.
+
 When a capability is unmet, the owner gets a second approve action —
 **"Run without `<capability>`"** — alongside the ordinary Approve button.
 This is the deliberate escape hatch for a false-positive inference: it

@@ -432,6 +432,9 @@
   "required_capabilities": [
     "x"
   ],
+  "ignored_inferred_capabilities": [
+    "x"
+  ],
   "required_tools": [
     "x"
   ],

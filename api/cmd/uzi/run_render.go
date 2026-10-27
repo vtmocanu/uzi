@@ -188,6 +188,9 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) err
 	if len(r.RequiredCapabilities) > 0 {
 		rows = append(rows, []string{"REQUIRED_CAPABILITIES", sanitizeTTY(strings.Join(r.RequiredCapabilities, ","))})
 	}
+	if len(r.IgnoredInferredCapabilities) > 0 {
+		rows = append(rows, []string{"IGNORED_INFERRED_CAPABILITIES", sanitizeTTY(strings.Join(r.IgnoredInferredCapabilities, ","))})
+	}
 	if len(r.RequiredTools) > 0 {
 		rows = append(rows, []string{"REQUIRED_TOOLS", sanitizeTTY(strings.Join(r.RequiredTools, ","))})
 	}
