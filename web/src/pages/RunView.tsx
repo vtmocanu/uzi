@@ -32,6 +32,8 @@ import { ExtendTimePopover } from "../components/ExtendTimePopover";
 import { canReworkNow, canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
 import { repoAgentFolder } from "../lib/repoAgentFolder";
 import { stripDisplayCell, stripUnsafeChars } from "../lib/safeText";
+import { useDemoMode } from "../lib/demoMode";
+import { maskRepoPath } from "../lib/demoMask";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useNow } from "../lib/useNow";
 import { useMaintenance } from "../lib/useMaintenance";
@@ -1758,10 +1760,12 @@ function IssueInputHistory({ run }: { run: Run }) {
 }
 
 export function RunView() {
+  const demo = useDemoMode();
   const { id = "" } = useParams();
   const currentRunIdRef = useRef(id);
   currentRunIdRef.current = id;
   const { run, messages, connected, error, submit, refreshRun, inputs, canSteer: optimisticCanSteer, confirmedOwner, pauseOriginReady } = useRunStream(id);
+  const repoPath = maskRepoPath(stripUnsafeChars(run?.repo_path ?? ""), demo);
   const workerExhausted = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_requeue_exhausted";
   // All page control surfaces share this gate, including the existing top Stop.
   // Provider holds, memory holds and worker exhaustion require confirmed ownership; other holds
@@ -2359,8 +2363,8 @@ export function RunView() {
               <span>/</span>
               {/* PRD #1908: a job run has no repo, so no board to link; its tail is "Job". */}
               {run.repo_id ? (
-                <Link to={`/repos/${run.repo_id}/board`} className="transition-colors hover:text-fg">
-                  Board
+                <Link to={`/repos/${run.repo_id}/board`} title={repoPath || undefined} className="transition-colors hover:text-fg">
+                  {repoPath.split("/").filter(Boolean).pop() || "Board"}
                 </Link>
               ) : (
                 <span className="text-muted">{run.kind === "job" ? "Job" : "No repository"}</span>

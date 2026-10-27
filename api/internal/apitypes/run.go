@@ -218,6 +218,8 @@ type RunDTO struct {
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
 	// issue/ci_fix runs.
 	RepoID *string `json:"repo_id"`
+	// RepoPath is display context on the detail read, empty when the repo is unavailable.
+	RepoPath string `json:"repo_path"`
 	// ForgeType is the run's forge ("gitlab"|"forgejo"|"github"), so the web picks the
 	// per-run MR/PR noun and reference sigil (PRD #65 D2). "" on the worker/create
 	// DTO paths, which never render the MR affordance in a browser; set on the
@@ -2192,6 +2194,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 // admin view, the owning user's email.
 type RunListItemDTO struct {
 	RunDTO
+	// RepoPath shadows the detail field: list queries already join this display context.
 	RepoPath string `json:"repo_path"`
 	// WorkerName SHADOWS the embedded RunDTO.WorkerName (PRD #1497 M1 added that): the list query
 	// populates this depth-0 field, which json marshals in preference to the (null-in-the-list-path)

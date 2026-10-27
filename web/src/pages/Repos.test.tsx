@@ -140,6 +140,7 @@ describe("Repos — always-visible repo-agents guide link (PRD #57 M3)", () => {
     renderPage();
     await screen.findByText("vtmocanu/uzi");
     const docLink = screen.getByRole("link", { name: "repo agents" });
+    expect(screen.getByRole("heading", { name: "Repos" })).toBeTruthy();
     expect(docLink.getAttribute("href")).toBe("/docs/repo-agents");
   });
 });

@@ -47,7 +47,7 @@ function classifyGuardrailFindings(messages: string[]): {
 
 let connections = [{ ...mockConnection }];
 export let repos = mockRepos.map((r) => ({ ...r }));
-// PRD #534: a GitHub connection plus two GitHub repos so the Boards "Project
+// PRD #534: a GitHub connection plus two GitHub repos so the Repos "Project
 // sync" cell renders and its linked/unlinked panel states are exercisable under
 // VITE_UZI_MOCK=1. gitlab (conn-1) stays FIRST so it remains the demo's default
 // selection and the existing gitlab-oriented flows are untouched — select the

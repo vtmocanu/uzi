@@ -1,4 +1,4 @@
-// Boards home: the projects the bot can see. Enabling one starts tracking its
+// Repos home: the projects the bot can see. Enabling one starts tracking its
 // issues on a kanban board.
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -873,7 +873,7 @@ export function Repos() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title="Boards"
+        title="Repos"
         description={
           <>
             Projects your bot can see. Enable one to track its issues on a board. See the{" "}

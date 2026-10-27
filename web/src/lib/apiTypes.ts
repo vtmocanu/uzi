@@ -3026,6 +3026,8 @@ export interface SemanticDriftDTO {
 }
 
 export interface Run {
+  /** Repo display path on detail reads; absent on older servers, empty when unavailable. */
+  repo_path?: string;
   completion_pending?: CompletionPendingDTO;
   semantic_gate?: import("./semanticGate").SemanticGateDTO;
   semantic_drift?: SemanticDriftDTO;

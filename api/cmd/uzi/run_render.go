@@ -110,6 +110,9 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) err
 	if len(r.AutoApproveBlockedReasons) > 0 {
 		rows = append(rows, []string{"AUTO_APPROVE_BLOCKED", strings.Join(r.AutoApproveBlockedReasons, ", ")})
 	}
+	if r.RepoPath != "" {
+		rows = append(rows, []string{"REPO", sanitizeTTY(r.RepoPath)})
+	}
 	rows = append(rows, semanticGateRows(r)...)
 	rows = append(rows, completionPendingRows(r)...)
 	rows = append(rows, semanticDriftRows(r)...)

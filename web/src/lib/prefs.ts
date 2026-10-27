@@ -82,7 +82,7 @@ export const summaryCollapse = {
   },
 };
 
-// Issue #578: remember the last-selected Boards forge connection so a returning user lands
+// Issue #578: remember the last-selected Repos forge connection so a returning user lands
 // back on it. Unlike summaryCollapse this is a SINGLE scalar (the chosen connection id),
 // not a keyed map, so there is no GC loop — an entry past its 7-day TTL simply reads as
 // null and the next set overwrites it.

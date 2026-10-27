@@ -579,6 +579,13 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	// lookup error leaves forge_type "" (the web defaults to GitLab's noun), never
 	// failing the read of an otherwise-fine run.
 	if run.RepoID.Valid {
+		// Display context follows the run owner's connection, including for an admin
+		// viewer. A deleted or unreadable repo leaves the breadcrumb's Board fallback.
+		if repo, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: uuid.UUID(run.RepoID.Bytes), UserID: run.UserID}); err != nil {
+			slog.Debug("resolve run repo path", "run_id", run.ID, "error", err)
+		} else {
+			dto.RepoPath = repo.PathWithNamespace
+		}
 		if ft, err := h.q.GetForgeTypeForRepo(r.Context(), uuid.UUID(run.RepoID.Bytes)); err != nil {
 			slog.Error("resolve run forge type", "run_id", run.ID, "error", err)
 		} else {

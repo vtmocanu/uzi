@@ -1112,7 +1112,7 @@ export function Board() {
       <div className="sticky top-[49px] z-10 bg-ink lg:top-0">
       <PageHeader
         backTo="/repos"
-        backLabel="Boards"
+        backLabel="Repos"
         titleNode={
           <div className="flex flex-wrap items-center gap-2">
             <h1 className="text-xl font-semibold tracking-tight">{board?.path_with_namespace ? maskRepoPath(board.path_with_namespace, demo) : "Board"}</h1>

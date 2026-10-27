@@ -320,7 +320,7 @@ export function Dashboard() {
             hint="your fleet"
             to="/workers"
           />
-          <StatTile label="Boards" value={data.reposEnabled} hint="enabled repos" to="/repos" />
+          <StatTile label="Repos" value={data.reposEnabled} hint="enabled repos" to="/repos" />
           <StatTile label="Agent templates" value={data.templates} hint="roles available" to="/agents" />
         </div>
       )}

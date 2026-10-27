@@ -762,6 +762,7 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
   it("labels the implicit column Backlog and no lane reads Open", async () => {
     const { container } = renderBoard();
     await screen.findByText("Backlog");
+    expect(screen.getByRole("link", { name: /Repos/ }).getAttribute("href")).toBe("/repos");
     expect(within(container).queryByText("Open")).toBeNull();
   });
 

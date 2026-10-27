@@ -689,7 +689,7 @@ export const runsApi = {
     const history = (decorated.milestone_reconciliations ?? []).filter(r =>
       reconciliationBeforeGateRevision === undefined || (typeof r.gate_revision === "number" && r.gate_revision < reconciliationBeforeGateRevision));
     const page = history.slice(0, 50);
-    return delay({ run: { ...decorated, usage: runListItem(decorated).usage, own_agents,
+    return delay({ run: { ...decorated, repo_path: runListItem(decorated).repo_path, usage: runListItem(decorated).usage, own_agents,
       milestone_reconciliations: page,
       milestone_reconciliations_next_before_gate_revision: history.length > page.length
         ? page[page.length - 1]?.gate_revision as number : undefined,

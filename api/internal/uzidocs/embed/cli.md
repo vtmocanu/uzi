@@ -324,6 +324,9 @@ A few worth knowing:
   onto a branch you have not merged yet. `--force` overrides that one refusal
   so the new run is created anyway; it bypasses only the open-MR guard, and a
   run already in progress for the issue is never bypassed.
+- **`run get` names the repository.** The `REPO` row shows its full path;
+  `--json` and `--field repo_path` expose the same value. A repo-less run or an
+  unavailable repository has an empty `repo_path` and no `REPO` row.
 - **`run approve` picks the subagent roster explicitly.** By default a run
   uses its own default roster; `--agent-source own|repo` overrides it
   (`own` = your template roster, `repo` = the agents the worker detected in
