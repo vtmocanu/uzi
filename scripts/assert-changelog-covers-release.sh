@@ -50,7 +50,7 @@ RESULT_FILE=""; POSITIONAL=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --result-file)
-      if [ "$#" -lt 2 ] || [ -z "$2" ] || [ -n "$RESULT_FILE" ]; then
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" = -* ]] || [ -n "$RESULT_FILE" ]; then
         echo 'usage: assert-changelog-covers-release.sh [ref [prev [version]]] [--result-file FILE]' >&2; exit 2
       fi
       RESULT_FILE=$2; shift 2 ;;

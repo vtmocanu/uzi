@@ -79,7 +79,16 @@ def write(path, stage, reason, tag, *, missing=None, child=None, status=1, kind=
         rows = []
         for index, line in enumerate(lines):
             sha, pr = line.split('\t')
-            row = {'sha': sha, 'pr': int(pr) if pr else None}
+            number = None
+            if pr:
+                if not pr.isascii() or not pr.isdecimal():
+                    raise ValueError('invalid PR source')
+                digits = pr.lstrip('0') or '0'
+                if len(digits) <= 16:
+                    candidate = int(digits)
+                    if 0 < candidate < 2**53:
+                        number = candidate
+            row = {'sha': sha, 'pr': number}
             identities([row])
             if index < MAX_UNCITED:
                 rows.append(row)
@@ -100,8 +109,10 @@ def write(path, stage, reason, tag, *, missing=None, child=None, status=1, kind=
             stage = 'complete'
         if kind == 'oracle' and rows is None:
             rows, count = [], 0
+    elif status == 3 and reason in ('', 'release-cut-failed'):
+        reason = 'release-precondition-refused'
     elif not reason:
-        reason = 'release-precondition-refused' if status == 3 else 'release-cut-failed'
+        reason = 'release-cut-failed'
     data = validate(dict(schema=1, stage=stage, reason=reason, planned_tag=tag or None,
                          uncited=rows, uncited_count=count, uncited_truncated=truncated))
     raw = (json.dumps(data, sort_keys=True) + '\n').encode()

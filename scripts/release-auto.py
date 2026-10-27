@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location('release_coverage', ROOT / 'scripts/release-ci-coverage.py')
@@ -222,12 +223,16 @@ class Release:
         result_file = directory / 'cut-result.json'
         result_file.unlink(missing_ok=True)
         failed = None
+        command_token = uuid.uuid4().hex
+        print('::stop-commands::' + command_token, flush=True)
         try:
             self.run(*args, '--result-file', str(result_file), timeout=600, live=True)
         except Stop as error:
             failed = error
         except subprocess.TimeoutExpired:
             raise Stop('release-cut-timed-out') from None
+        finally:
+            print('::' + command_token + '::', flush=True)
         try:
             data = diagnostics.read(result_file)
         except (OSError, ValueError, TypeError):
@@ -377,7 +382,6 @@ class Release:
         cfg = self.config
         if cfg['kind'] == 'rc':
             parent, plan = self.tip()
-            self.evidence['parent'] = parent
             before = self.remote()
             require(before['main'] == parent, 'main-race')
             tag = plan['TAG']

@@ -149,6 +149,9 @@ with bounded uncited commit/PR identities; unavailable fields are `null`.
 A green `report` job confirms incident delivery, not a successful release: the
 failed prepare or watch job keeps the run red. Receipt/publication uncertainty
 fails watch; an issue-delivery failure fails report.
+An unconfirmed push receipt stops watch before publication recovery and
+verification, so automatic publication retries do not run in that branch.
+Inspect remote refs, then use local watch/verify against the same tag/SHA.
 
 Manual tip selection is bounded at 120 minutes plus 10 minutes for cutting.
 Publication watching retains its 60-minute bound within the 120-minute recovery

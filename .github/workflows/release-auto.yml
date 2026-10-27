@@ -426,6 +426,8 @@ jobs:
           pushed = needs['push'].get('outputs', {})
           push_outcome = pushed.get('outcome') or ('receipt-unknown' if pushed.get('attempted') == 'true' else '')
           watched = needs['watch'].get('outputs', {})
+          # Mirror the public identity wire contract in release-diagnostics.py:
+          # this job has no checkout and must not execute repository code.
           uncited = json.loads(prepared.get('uncited') or 'null')
           if uncited is not None:
               if not isinstance(uncited, list) or len(uncited) > 50:

@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -86,6 +87,21 @@ class OracleDiagnostics(unittest.TestCase):
             data = json.loads(result_file.read_text())
             self.assertEqual(data['reason'], 'changelog-coverage-error')
             self.assertIsNone(data['uncited'])
+
+    def test_oracle_usage_and_result_delivery_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, env, _ = self.fixture(directory)
+            changelog = repo / 'CHANGELOG.md'
+            changelog.write_text(changelog.read_text().replace('#999', '#3486'))
+            subprocess.run(['git', '-C', str(repo), 'commit', '-qam', 'docs: cite the shipping commit'], env=env, check=True)
+            oracle = ['bash', str(Path(__file__).with_name('assert-changelog-covers-release.sh')), 'HEAD', 'v0.1.0', '0.2.0']
+            self.assertEqual(subprocess.run(oracle, cwd=repo, env=env, capture_output=True).returncode, 0)
+            target = Path(directory) / 'output-directory'
+            target.mkdir()
+            self.assertEqual(subprocess.run(oracle + ['--result-file', str(target)], cwd=repo, env=env,
+                                            capture_output=True).returncode, 1)
+            self.assertEqual(subprocess.run(oracle + ['--result-file', 'one', '--result-file', 'two'],
+                                            cwd=repo, env=env, capture_output=True).returncode, 2)
 
 
 def context(**changes):
@@ -347,6 +363,12 @@ class Tip(unittest.TestCase):
 
 
 class Stable(unittest.TestCase):
+    def test_shell_gate_runs_promotion_diagnostics(self):
+        source = Path(__file__).with_name('release-scripts-test.sh').read_text()
+        blocks = re.findall(r'if \[ "\$#" -eq 0 \]; then\n(.*?)\nfi', source, re.S)
+        self.assertTrue(any("promotion_diagnostic_regressions || fail 'promotion diagnostic regressions'" in block
+                            for block in blocks), 'default shell gate must run the promotion diagnostics contract')
+
     def test_promotion_ignores_red_and_advancing_main(self):
         calls, reads = [], [H, NEW]
         api = Mock()
@@ -356,7 +378,10 @@ class Stable(unittest.TestCase):
             calls.append(args)
             if args[:2] == ('bash', auto.CUTTER):
                 if '--result-file' in args:
-                    cut_result(args[args.index('--result-file') + 1], 'v0.2.0')
+                    proof = subprocess.run(['bash', str(Path(__file__).with_name('release-scripts-test.sh')),
+                                            '--promotion-diagnostics-only', args[args.index('--result-file') + 1]],
+                                           capture_output=True, text=True)
+                    self.assertEqual(proof.returncode, 0, proof.stdout + proof.stderr)
                 return rendered(plan(OP='blocked', REASON='codex-runtime-needs-local-cut')) if '--plan' in args else ''
             if args[0] != 'git':
                 return ''
@@ -514,13 +539,20 @@ class CutDiagnostics(unittest.TestCase):
     def test_failed_cut_keeps_coded_reason_and_missing_merges(self):
         calls = []
         def command(*args, **kwargs):
+            self.assertTrue(output.call_args_list, 'workflow command suppression must precede live child output')
+            self.assertTrue(output.call_args_list[0].args[0].startswith('::stop-commands::'))
             calls.append((args, kwargs))
             cut_result(args[args.index('--result-file') + 1], 'v0.2.0-rc.11',
                        'changelog-coverage-refused', [{'sha': H, 'pr': 3486}])
             raise auto.Stop('command-failed')
         release = auto.Release(auto.inputs(context()), command)
-        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(auto.Stop, 'changelog-coverage-refused'):
-            release.cut(['bash', auto.CUTTER, '0.2.0', '--ci'], Path(directory), 'v0.2.0-rc.11')
+        with tempfile.TemporaryDirectory() as directory, patch('builtins.print') as output:
+            with self.assertRaisesRegex(auto.Stop, 'changelog-coverage-refused'):
+                release.cut(['bash', auto.CUTTER, '0.2.0', '--ci'], Path(directory), 'v0.2.0-rc.11')
+        marker = output.call_args_list[0].args[0].removeprefix('::stop-commands::')
+        self.assertRegex(marker, r'^[0-9a-f]{32}$')
+        self.assertEqual(output.call_args_list[-1].args[0], '::' + marker + '::')
+        self.assertTrue(all(call.kwargs.get('flush') for call in output.call_args_list))
         self.assertTrue(calls[0][1]['live'])
         self.assertEqual(release.evidence['planned_tag'], 'v0.2.0-rc.11')
         self.assertEqual(json.loads(release.evidence['uncited']), [{'sha': H, 'pr': 3486}])
@@ -601,6 +633,24 @@ class ResultCodec(unittest.TestCase):
             self.assertEqual((len(result['uncited']), result['uncited_count'], result['uncited_truncated']), (50, 51, True))
             self.assertEqual(set(Path(directory).iterdir()), {source, target})
             self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_large_source_and_untrusted_pr_numbers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory) / 'missing.tsv', Path(directory) / 'result.json'
+            source.write_text((H + '\t1234567890\n') * 21000)  # valid rows, beyond the 1 MiB source limit
+            with self.assertRaises(ValueError):
+                auto.diagnostics.write(target, 'changelog-coverage', 'changelog-coverage-refused', TAG,
+                                       missing=source, kind='oracle')
+            source.write_text(H + '\t0\n' + NEW + '\t9007199254740992\n')
+            auto.diagnostics.write(target, 'changelog-coverage', 'changelog-coverage-refused', TAG,
+                                   missing=source, kind='oracle')
+            self.assertEqual(auto.diagnostics.read(target)['uncited'], [{'sha': H, 'pr': None}, {'sha': NEW, 'pr': None}])
+
+    def test_exit_three_refusals_are_not_generic_cut_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'result.json'
+            auto.diagnostics.write(target, 'notes-assembly', 'release-cut-failed', TAG, status=3)
+            self.assertEqual(auto.diagnostics.read(target)['reason'], 'release-precondition-refused')
 
 class FailedEvidence(unittest.TestCase):
     def failure(self, request_error=False):

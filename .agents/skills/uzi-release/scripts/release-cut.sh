@@ -40,7 +40,8 @@
 #                     Applies to the main half only; rejected with --promote.
 #   --prev-tag TAG    override the derived coverage-window base tag (a repair).
 #   --ci              refuse unknown worker-pin publication state (also CI=true).
-#   --result-file FILE write optional bounded JSON diagnostics (cut mode only).
+#   --result-file FILE write optional bounded JSON diagnostics (cut mode only,
+#                     incompatible with --no-commit; relative to the caller).
 #
 # The prerelease form is exactly vX.Y.Z-rc.N (N from 1); nothing else (D2). Tag discovery
 # never sorts a mixed stable/prerelease list: stable tags are filtered first and the
@@ -66,6 +67,7 @@ set -uo pipefail
 VERSION=""; VERB=""; CL_FILE=""; DO_COMMIT=1; PREV_OVERRIDE=""; PLAN=0; ABANDON_TRAIN=0; VERSION_OPTION=0; POSITIONAL_VERSION=0
 CI_STRICT=0
 RESULT_FILE=""; RESULT_STAGE=preconditions; RESULT_REASON=""; RESULT_CHILD=""
+PROMOTE_GUARD_ARMED=0
 case "${CI:-}" in true|1) CI_STRICT=1 ;; esac
 cut_usage() {
   printf '%s\n' 'usage: release-cut.sh <X.Y.Z> [--promote|--promote-only|--skip-promote|--stable] [--changelog-file FILE] [--no-commit] [--prev-tag TAG] [--ci] [--result-file FILE]' \
@@ -89,8 +91,9 @@ while [ $# -gt 0 ]; do
     --prev-tag) PREV_OVERRIDE="${2:?}"; shift 2;;
     --ci) CI_STRICT=1; shift;;
     --result-file)
-      if [ "$#" -lt 2 ] || [ -z "$2" ] || [ -n "$RESULT_FILE" ]; then cut_usage; fi
-      RESULT_FILE=$2; shift 2;;
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" = -* ]] || [ -n "$RESULT_FILE" ]; then cut_usage; fi
+      case "$2" in /*) RESULT_FILE=$2 ;; *) RESULT_FILE="$PWD/$2" ;; esac
+      shift 2;;
     -h|--help) awk 'NR > 1 { if (/^#/) print; else exit }' "$0"; exit 3;;
     -*) echo "release-cut: unknown flag $1" >&2; exit 3;;
     *) if [ -z "$VERSION" ]; then VERSION="$1"; POSITIONAL_VERSION=1; shift
@@ -120,6 +123,8 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "not in a git repo
 cd "$ROOT" || { echo "cannot cd to repo root $ROOT" >&2; exit 3; }
 cut_exit() {
   local status=$? args
+  # Keep the original cut status: promotion cleanup itself may return zero.
+  if [ "$PROMOTE_GUARD_ARMED" -eq 1 ]; then promote_guard "$status"; fi
   if [ -n "$RESULT_FILE" ]; then
     args=(--stage "$RESULT_STAGE" --reason "$RESULT_REASON" --tag "${TAG:-}" --status "$status")
     [ -z "$RESULT_CHILD" ] || args+=(--child "$RESULT_CHILD")
@@ -132,7 +137,7 @@ cut_exit() {
   exit "$status"
 }
 trap cut_exit EXIT
-if [ "$PLAN" -eq 1 ] && [ -n "$RESULT_FILE" ]; then cut_usage; fi
+if [ -n "$RESULT_FILE" ] && { [ "$PLAN" -eq 1 ] || [ "$DO_COMMIT" -eq 0 ]; }; then cut_usage; fi
 # is_shipping: the shared release-train definition of "does this path ship" (same file the
 # coverage oracle uses), so promote-only and the oracle can never disagree about "shipping".
 # shellcheck source=scripts/lib/shipping-paths.sh
@@ -973,7 +978,7 @@ PROMOTED_TAG=""; PROMOTE_FINALIZED=0
 # vB already exists". The tag is not pushed, so deleting it loses nothing; a successful
 # run sets PROMOTE_FINALIZED=1 first so the guard is a no-op.
 promote_guard() {
-  local rc=$?
+  local rc=$1
   if [ "$rc" -ne 0 ] && [ -n "$PROMOTED_TAG" ] && [ "$PROMOTE_FINALIZED" -eq 0 ]; then
     git tag -d "$PROMOTED_TAG" >/dev/null 2>&1 \
       && echo "release-cut: rolled back the local promote tag $PROMOTED_TAG (the RC cut did not complete); fix the cause and re-run. To promote WITHOUT cutting a next candidate: release-cut $IB --promote-only." >&2
@@ -1033,14 +1038,16 @@ EOF
     } >&2
     exit 3
   fi
-  trap promote_guard EXIT
+  PROMOTE_GUARD_ARMED=1
   promote_inflight
+  RESULT_STAGE=preconditions; RESULT_REASON=""
   # --promote-only: the lead asked for the stable alone. Stop here whatever main carries:
   # shipping work landed after the RC is deliberately NOT in this stable (it is tagged from
   # the RC commit) and waits for the next plain cut, whose coverage window starts at this
   # stable. main is untouched, so the same two warts as the implicit branch below apply.
   if [ "$OP" = promoteonly ]; then
     PROMOTE_FINALIZED=1
+    TAG=$PROMOTED_TAG
     echo
     echo "=== promoted $PROMOTED_TAG only (--promote-only: no next candidate cut, main untouched) ==="
     if [ "$merges" -gt 0 ] || [ -n "$unrel" ]; then
@@ -1052,6 +1059,7 @@ EOF
   fi
   if [ "$merges" -eq 0 ] && [ -z "$unrel" ]; then
     PROMOTE_FINALIZED=1
+    TAG=$PROMOTED_TAG
     echo
     echo "=== promoted $PROMOTED_TAG only (nothing shipping since $INFLIGHT, [Unreleased] empty) ==="
     echo "Next:  git push origin $PROMOTED_TAG"
@@ -1139,7 +1147,6 @@ echo "  Chart.yaml: version + appVersion -> $CHARTVER"
 run_autobump "$CHARTVER"
 WT="$(awk -F'"' '/^PINNED_TAG=/{print $2; exit}' scripts/assert-worker-tag-decoupled.sh 2>/dev/null)"
 echo "  worker tag now: ${WT:-<unreadable>} (rolls the fleet iff it changed from the prior pin)"
-RESULT_STAGE=changelog-links; RESULT_REASON=changelog-links-refused
 run_links
 echo "  changelog-links: refreshed"
 # Freeze blocks already shipped by a candidate, before any release commit/tag.

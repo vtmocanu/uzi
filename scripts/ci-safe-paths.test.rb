@@ -678,6 +678,13 @@ Dir.mktmpdir('release-report') do |dir|
   rejection_body = File.read(environment.fetch('REPORT_BODY'))
   assert.call(rejection_body.include?('"push_attempted": true'), true, 'a rejected Git push was attempted even though watch is skipped')
   assert.call(rejection_body.include?('No push was attempted.'), false, 'recovery marker is not mistaken for literal push attempt status')
+  unconfirmed = Marshal.load(Marshal.dump(normal))
+  unconfirmed['watch'] = {'result' => 'failure', 'outputs' => {'receipt' => 'unconfirmed', 'reason' => 'push-receipt-unconfirmed'}}
+  _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => unconfirmed.to_json), 'bash', '-e', '-c', report_script)
+  assert.call(status.success?, true, "unconfirmed receipt incident is delivered: #{err}")
+  receipt_body = File.read(environment.fetch('REPORT_BODY'))
+  assert.call(receipt_body.include?('could not confirm that main contains the RC'), true, 'receipt failure has an actionable explanation')
+  assert.call(receipt_body.include?('"phase": "watch"'), true, 'receipt uncertainty is owned by watch')
   %w[failure cancelled].each do |result|
     interrupted = Marshal.load(Marshal.dump(normal))
     interrupted['push'] = {'result' => result, 'outputs' => {'attempted' => 'true'}}
