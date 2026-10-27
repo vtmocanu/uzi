@@ -3,10 +3,13 @@ package workersvc
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"slices"
 	"strconv"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -16,6 +19,10 @@ import (
 // These service calls supply authenticated identities, not HTTP authentication.
 // Immutable receipt corruption is exercised by unit input seams; database tests
 // retain the trigger that prevents overwriting an accepted receipt.
+// PRE-K server carrier proof: StateRequest has no R field yet, so the running
+// request omits R. Observed missing-R admission remains a mandatory open K SQL
+// gap, not independent SQL authorization or a successful missing-R contract.
+// When K lands, upgrade this test with valid-R positives and missing-R denial.
 func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 	for _, mode := range []string{"gated", "no_gate", "ordinary_question", "completion_question", "switch_off", "claim_commit_failure", "ack_commit_failure", "ack_switch_off", "terminal"} {
 		t.Run(mode, func(t *testing.T) {
@@ -148,30 +155,68 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 				*claim.PlanMd != "# Unapproved candidate B" || len(claim.Milestones) != 1 || claim.Milestones[0].ID != "b1") {
 				t.Fatal("gated candidate replaced or approved")
 			}
-			if mode == "ordinary_question" || mode == "completion_question" {
-				// Compare the receipt, audit row, source, execution and completed
-				// work through every park/answer/resume operation.
-				snapshot := func() []byte {
-					r := mustRun(t, e, created.ID)
-					scope, err := e.q.GetPolicyStopScopeInput(e.ctx, store.GetPolicyStopScopeInputParams{RunID: created.ID, InputID: record.ScopeInputID})
+			// Snapshot only persistent evidence: status, clocks and banked time
+			// legitimately change during ACK and question transitions.
+			snapshot := func() map[string][]byte {
+				t.Helper()
+				r := mustRun(t, e, created.ID)
+				scope, err := e.q.GetPolicyStopScopeInput(e.ctx, store.GetPolicyStopScopeInputParams{RunID: created.ID, InputID: record.ScopeInputID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if scope.Disposition.Valid || scope.SettledAt.Valid || scope.ConsumedAt.Valid ||
+					scope.ConsumedWorkerID.Valid || scope.ConsumedClaimGeneration.Valid || scope.AppliedAt.Valid ||
+					scope.IncludedAt.Valid || scope.InclusionReported {
+					t.Fatal("scope audit no longer pending and undelivered")
+				}
+				fields := map[string]any{
+					"accepted receipt": r.PolicyStopResolution, "scope audit": scope,
+					"source context": r.PolicyRevisionSource, "selected cross-check": r.PolicyCandidateCrossCheckID,
+					"scope ceiling": r.ScopeCeiling, "frozen execution": r.MilestonesFrozen,
+					"completed IDs": r.MilestonesCompleted, "completion contract": r.CompletionContract,
+					"contract version": r.CompletionContractVersion, "contract revision": r.ContractRevision,
+					"candidate plan": r.PlanMd, "candidate milestones": r.MilestonesCandidate,
+					"gate revision": r.GateRevision, "gate presentation": r.GatePresentationID,
+					"gate payload": r.GatePresentedPayload, "gate digest": r.GatePayloadDigest,
+					"worker": r.WorkerID, "claim generation": r.ClaimGeneration,
+					"refusal count": r.PolicyRefusalCount, "gate refusal count": r.GateRefusalCount,
+					"gate refusal generation": r.GateRefusalGeneration,
+					"original outcome":        r.PolicyLastOutcomeID, "source generation": r.PolicyLastSourceGeneration,
+					"session": r.SessionID,
+				}
+				if revisionID > 0 {
+					revision, err := e.q.GetPolicyStopRevisionInput(e.ctx, store.GetPolicyStopRevisionInputParams{RunID: created.ID, InputID: revisionID})
 					if err != nil {
 						t.Fatal(err)
 					}
-					if scope.Disposition.Valid || scope.SettledAt.Valid || scope.ConsumedAt.Valid ||
-						scope.ConsumedWorkerID.Valid || scope.ConsumedClaimGeneration.Valid || scope.AppliedAt.Valid ||
-						scope.IncludedAt.Valid || scope.InclusionReported {
-						t.Fatal("scope audit no longer pending and undelivered")
-					}
-					return mustStopJSON(t, []any{r.PolicyStopResolution, scope, r.PolicyRevisionSource,
-						r.ScopeCeiling, r.MilestonesFrozen, r.MilestonesCompleted, r.GateRevision, r.GatePresentedPayload})
+					fields["superseded human revision"] = revision
 				}
-				saved := snapshot()
-				assertPreserved := func() {
-					t.Helper()
-					if !bytes.Equal(saved, snapshot()) {
-						t.Fatal("question flow changed accepted scope or evidence")
+				encoded := make(map[string][]byte, len(fields))
+				for name, value := range fields {
+					encoded[name] = mustStopJSON(t, value)
+				}
+				return encoded
+			}
+			saved := snapshot()
+			assertPreserved := func() {
+				t.Helper()
+				current := snapshot()
+				if len(saved) != len(current) {
+					t.Fatal("Stop evidence field inventory changed")
+				}
+				names := make([]string, 0, len(current))
+				for name := range current {
+					names = append(names, name)
+				}
+				slices.Sort(names)
+				for _, name := range names {
+					value, present := saved[name]
+					if !present || !bytes.Equal(value, current[name]) {
+						t.Fatalf("Stop flow changed persisted %s", name)
 					}
 				}
+			}
+			if mode == "ordinary_question" || mode == "completion_question" {
 				qid := "stop-resume-question"
 				park, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{
 					State: "awaiting_input", ClaimGeneration: &generation, OpenQuestionID: &qid,
@@ -240,20 +285,34 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 				}
 				return
 			}
-			if gated || mode == "ack_commit_failure" || mode == "ack_switch_off" {
-				// Expect independent SQL admission to refuse gated running.
-				// This is deliberately not a positive gated ACK proof.
+			if mode == "ack_commit_failure" || mode == "ack_switch_off" {
 				if ack.Applied || ack.PolicyStopExecution != nil {
 					t.Fatalf("refused ACK leaked authority: %+v %v", ack, err)
 				}
-				if !gated && err == nil {
+				if err == nil {
 					t.Fatal("fault did not fail report")
 				}
+				assertPreserved()
 				return
 			}
-			if err != nil || !ack.Applied || ack.PolicyStopExecution == nil || *ack.PolicyStopExecution != *claim.PolicyStopExecution || string(ack.PolicyRevisionGate) != "null" {
-				t.Fatalf("actual no-gate ACK: %+v %v", ack, err)
+			if err != nil || !ack.Applied || ack.Run.Status != "running" || ack.PolicyStopExecution == nil || *ack.PolicyStopExecution != *claim.PolicyStopExecution {
+				t.Fatalf("actual running carrier ACK: %+v %v", ack, err)
 			}
+			if mustRun(t, e, created.ID).Status != "running" {
+				t.Fatal("running ACK was not committed")
+			}
+			if gated {
+				if ack.PlanApproved == nil || *ack.PlanApproved {
+					t.Fatal("gated ACK must explicitly leave candidate unapproved")
+				}
+				var gate apitypes.PolicyStopGateContext
+				if record.Manifest.SourceContext.Gate == nil || json.Unmarshal(ack.PolicyRevisionGate, &gate) != nil || gate != *record.Manifest.SourceContext.Gate {
+					t.Fatal("gated ACK did not preserve accepted source gate context")
+				}
+			} else if string(ack.PolicyRevisionGate) != "null" {
+				t.Fatal("no-gate ACK must carry JSON null")
+			}
+			assertPreserved()
 		})
 	}
 }
