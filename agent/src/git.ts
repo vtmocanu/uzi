@@ -6566,11 +6566,17 @@ export class GitCache {
    * directory) and read it back. The fence is returned only from that read-back; any failure to
    * settle or an inexact read-back throws and returns nothing. Idempotent for an identical fence.
    * `opts.sync` is a test seam replacing the per-handle fsync.
+   *
+   * A different fence already on the journal refuses, except with `opts.replaceStale`: the caller (publication,
+   * which proved under the authority transaction that the slot's current epoch is its own and that the old
+   * fence's epoch is neither current nor published) names the EXACT old fence, and only that fence is replaced.
+   * Any other fence on the journal still refuses, so a racing or unproven replacement changes nothing.
    */
   async installCompletionSourceFence(
     barePath: string, branch: string, expected: { runId: string; clonePath: string; attemptId?: string },
     fence: CompletionSourceFence,
-    opts: { bareLockHeld?: boolean; sync?: (handle: { sync(): Promise<void> }, what: "config" | "directory") => Promise<void> } = {},
+    opts: { bareLockHeld?: boolean; replaceStale?: { expectedOld: CompletionSourceFence };
+      sync?: (handle: { sync(): Promise<void> }, what: "config" | "directory") => Promise<void> } = {},
   ): Promise<CompletionSourceFence> {
     const want = parseSourceFence(fence);
     const section = async (): Promise<CompletionSourceFence> => {
@@ -6587,11 +6593,13 @@ export class GitCache {
         throw new CompletionSourceFenceError("completion source has a protected descriptor");
       }
       await this.assertNoStoppedMarker(barePath, journal.clonePath, journal);
-      if (journal.completionSourceFence !== undefined &&
-          serializeSourceFence(journal.completionSourceFence) !== serializeSourceFence(want)) {
+      const replacing = journal.completionSourceFence !== undefined &&
+        serializeSourceFence(journal.completionSourceFence) !== serializeSourceFence(want);
+      if (replacing && (opts.replaceStale === undefined ||
+          serializeSourceFence(journal.completionSourceFence!) !== serializeSourceFence(parseSourceFence(opts.replaceStale.expectedOld)))) {
         throw new CompletionSourceFenceError("completion source already carries a different fence");
       }
-      if (journal.completionSourceFence === undefined) {
+      if (journal.completionSourceFence === undefined || replacing) {
         await this.writeRecovery(barePath, branch, { ...journal, completionSourceFence: want });
       }
       const sync = opts.sync ?? (async (h: { sync(): Promise<void> }) => { await h.sync(); });
@@ -6608,6 +6616,23 @@ export class GitCache {
       return after.completionSourceFence;
     };
     return opts.bareLockHeld ? section() : this.withLock(barePath, section);
+  }
+
+  /**
+   * The completion-source fence the plain completing journal of exactly `expected` carries, or undefined
+   * when there is no such journal or it carries none. One bare-lock section; read-only. Publication uses it
+   * to name the exact old fence it may replace (see {@link GitCache.installCompletionSourceFence}).
+   */
+  async readCompletionSourceFence(
+    barePath: string, branch: string, expected: { runId: string; clonePath: string; attemptId?: string },
+  ): Promise<CompletionSourceFence | undefined> {
+    return this.withLock(barePath, async () => {
+      await this.assertRecoveryBare(barePath);
+      const journal = await this.readRecoveryCapture(barePath, branch);
+      if (!journal || journal.runId !== expected.runId || journal.clonePath !== expected.clonePath ||
+          journal.attemptId !== expected.attemptId) return undefined;
+      return journal.completionSourceFence;
+    });
   }
 
   /**

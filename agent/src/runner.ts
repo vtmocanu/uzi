@@ -27,8 +27,8 @@ import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budge
 import { MaintenanceResources } from "./recovery-maintenance.js";
 import { AuthorityRefusal } from "./authority-lock.js";
 import type { AuthorityRuntime, AuthorityWait } from "./authority-runtime.js";
-import { leaseHarness, type SourceUseLease } from "./completion-authority.js";
-import { buildClaudeSourceCore, buildCodexSourceCore, sourceFenceOf } from "./completion-source.js";
+import { leaseEpoch, leaseHarness, type SourceUseLease } from "./completion-authority.js";
+import { buildClaudeSourceCore, buildCodexSourceCore, serializeSourceFence, sourceFenceOf } from "./completion-source.js";
 import type { WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
@@ -3432,7 +3432,8 @@ export class RunRunner {
     const authority = this.authority;
     if (!authority) return;
     const paths = new Set(flight.sourceUsePaths ?? []);
-    for (const clone of [flight.worktreePath, flight.runnerClone?.path]) if (clone) paths.add(clone);
+    // Normalized like the authority's own keys (sourceUsePaths), so the publication check below compares like with like.
+    for (const clone of [flight.worktreePath, flight.runnerClone?.path]) if (clone) paths.add(resolvePath(clone));
     if (paths.size === 0) return;
     if (flight.sourceTailsJoined !== true) {
       runLog.warn("source use left active: this flight's source-capable tails were not positively joined", {
@@ -3488,6 +3489,9 @@ export class RunRunner {
         roots.map(r => ({ sha: r.sha, contexts: r.contexts.map(c => canonicalJson(c)).sort() })).sort((a, b) => a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0));
       const outcome = await authority.publishSource(bound.clonePath, lease, { timeoutMs: this.sourceUseEndWaitMs }, async ({ tx, store }) => {
         const { barePath, branch, runId, generation } = bound.context;
+        // The roots are read without the bare lock: a bare mutation another operation left unresolved on this
+        // bare (a running pending record) means they may not describe a settled bare, so publication refuses.
+        await authority.hooks.assertBareClear(barePath, "publish-source");
         if (await this.git.worktreeHead(bound.clonePath) !== bound.expectedHead) throw new Error("the source HEAD changed since it was bound");
         if (rootsKey(await this.completionRoots(barePath, runId, generation)) !== rootsKey(bound.roots)) {
           throw new Error("the source roots changed since they were bound");
@@ -3496,9 +3500,21 @@ export class RunRunner {
         const certified = await store.certifySource(tx, lease, core, codex ? { seal } : undefined);
         await this.recovery.publishCompletionSource({
           bound, certified,
-          installFence: () => this.git.installCompletionSourceFence(barePath, branch,
-            { runId, clonePath: bound.clonePath, ...(bound.attemptId === undefined ? {} : { attemptId: bound.attemptId }) },
-            sourceFenceOf(certified)),
+          installFence: async () => {
+            const expected = { runId, clonePath: bound.clonePath, ...(bound.attemptId === undefined ? {} : { attemptId: bound.attemptId }) };
+            const fence = sourceFenceOf(certified);
+            // A fence an earlier, never-completed publication (or a published source this clone later resumed
+            // from) left behind is replaced only when the authority slot proves it dead: this publication's
+            // lease is the slot's current, active, owned epoch, and the old fence names a different epoch.
+            const old = await this.git.readCompletionSourceFence(barePath, branch, expected);
+            let replaceStale: { expectedOld: typeof fence } | undefined;
+            if (old !== undefined && serializeSourceFence(old) !== serializeSourceFence(fence)) {
+              const slot = await store.readSlot(tx, await store.slotKey(tx, bound.clonePath));
+              if (slot && slot.state === "active" && slot.owner.worker === store.workerIncarnation &&
+                  slot.epoch === leaseEpoch(lease) && old.sourceUseEpoch !== slot.epoch) replaceStale = { expectedOld: old };
+            }
+            return this.git.installCompletionSourceFence(barePath, branch, expected, fence, replaceStale ? { replaceStale } : {});
+          },
           commit: captureIds => store.transition(tx, lease, codex ? "sealed" : "claude_ready", { source: certified, captureIds }),
         });
       });
@@ -4035,7 +4051,10 @@ export class RunRunner {
         binding = this.rememberCompletionSource(source, flight, executor, terminalSource);
         this.completionSourceBinds.add(binding);
         this.completionSourceBinds.delete(preparation);
-        if (await this.recovery.bindCompletionSource(source)) flight.completionSourceBound = source;
+        // A later bind that fails or throws leaves the journal in an unknown state: nothing stays bound for publication.
+        let bound = false;
+        try { bound = await this.recovery.bindCompletionSource(source); }
+        finally { flight.completionSourceBound = bound ? source : undefined; }
       } finally {
         this.completionSourceBinds.delete(preparation);
         if (binding) this.completionSourceBinds.delete(binding);

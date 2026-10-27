@@ -124,6 +124,22 @@ describe("installCompletionSourceFence", () => {
     assert.equal(rawJournal(), before);
   });
 
+  it("replaces a different fence only when the caller names that exact old fence", async () => {
+    await cache.installCompletionSourceFence(bare, BRANCH, expected(), FENCE);
+    const before = rawJournal();
+    // Naming a fence the journal does not carry changes nothing, and neither does naming none.
+    await assert.rejects(cache.installCompletionSourceFence(bare, BRANCH, expected(), OTHER, { replaceStale: { expectedOld: OTHER } }), /different fence/);
+    await assert.rejects(cache.installCompletionSourceFence(bare, BRANCH, expected(), OTHER, {}), /different fence/);
+    assert.equal(rawJournal(), before);
+    assert.equal(serializeSourceFence((await cache.readCompletionSourceFence(bare, BRANCH, expected()))!), serializeSourceFence(FENCE));
+    const back = await cache.installCompletionSourceFence(bare, BRANCH, expected(), OTHER, { replaceStale: { expectedOld: { ...FENCE } } });
+    assert.equal(serializeSourceFence(back), serializeSourceFence(OTHER));
+    assert.equal(JSON.stringify(journal().completionSourceFence), serializeSourceFence(OTHER));
+    assert.equal(Object.keys(journal()).at(-1), "completionSourceFence", "the fence stays the last key");
+    // Every other refusal still applies to a replacement.
+    await assert.rejects(cache.installCompletionSourceFence(bare, BRANCH, { runId: "run-other", clonePath }, FENCE, { replaceStale: { expectedOld: OTHER } }), /does not name this source/);
+  });
+
   it("refuses a missing journal, a different path and a different attempt without writing", async () => {
     await assert.rejects(cache.installCompletionSourceFence(bare, BRANCH, { runId: RUN, clonePath: clonePath + "-x" }, FENCE), /does not name this source/);
     await assert.rejects(cache.installCompletionSourceFence(bare, BRANCH, { runId: RUN, clonePath, attemptId: aid(2) }, FENCE), /does not name this source/);

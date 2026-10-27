@@ -135,7 +135,7 @@ export interface PublicationFsOps {
 }
 
 /** Publication refused or failed before the slot could be published; nothing eligible exists. */
-export class CompletionPublicationError extends Error {
+class CompletionPublicationError extends Error {
   constructor(message: string) { super(message); this.name = "CompletionPublicationError"; }
 }
 
@@ -4741,9 +4741,12 @@ export class RecoveryCoordinator {
 
   /**
    * issue #3404 M2 U4 - the separate terminal-publication path. It attaches ONLY the certified V2 form of the
-   * already-bound completing source to the N exact-generation records, and never rewrites receipt-era
-   * authority: every cohort record must already carry a source whose legacy core equals `bound` exactly (or,
-   * for an idempotent retry, `certified` itself), so a changed HEAD, roots, identity or cohort throws.
+   * already-bound completing source to the N exact-generation records. Every cohort record must already carry
+   * a source whose legacy core equals `bound` exactly (or, for an idempotent retry, `certified` itself), so a
+   * changed HEAD, roots, identity or cohort throws. A record that also carries a completion receipt is
+   * rewritten like any other member: its receipt and every other field are kept, only `completionSource`
+   * changes, and only to the certificate over the SAME core, so the receipt-era source identity (HEAD, roots,
+   * context, clone path, attempt) is never altered.
    *
    * The caller holds the outer authority transaction A; inside the journal lock J this
    *  1. enumerates the PHYSICAL run directory (every entry, not only the authenticated records): a
@@ -4818,6 +4821,15 @@ export class RecoveryCoordinator {
     } catch { throw new CompletionPublicationError("recovery journal is not fully readable"); }
     if (records.some(r => r.generation === undefined)) throw new CompletionPublicationError("legacy record in the journal");
     const known = new Set(records.map(r => r.captureId));
+    // The coordinator's own crash-era temps (exactly the names ordinaryTempEntry accepts, as checkedRecords
+    // tolerates them) carry no authority and are not part of the cohort. Each must still be a regular file;
+    // any other name, including a `.json`/`.bundle` impostor, falls through to the refusal below.
+    const temps = names.filter(ordinaryTempEntry);
+    for (const name of temps) {
+      const stat = await ownedRecoveryIO(() => fs.lstat(path.join(this.runDir(runId), name)));
+      if (!stat.isFile()) throw new CompletionPublicationError("unknown recovery journal entry");
+    }
+    names = names.filter(name => !ordinaryTempEntry(name));
     for (const name of names) {
       const stem = name.endsWith(".json") ? name.slice(0, -".json".length) : name.endsWith(".bundle") ? name.slice(0, -".bundle".length) : undefined;
       if (stem === undefined || !known.has(stem)) throw new CompletionPublicationError("unknown recovery journal entry");
@@ -5611,6 +5623,14 @@ export function validCompletionSource(value: unknown): value is CompletionSource
  * A persisted completion source is either the legacy V1 core (exact V1 key set) or a published V2 source
  * (exact V2 key set, certificate kept verbatim). Anything else, including a V2-looking value that fails the
  * strict V2 decode, refuses the whole record. A parser that predates V2 refuses the record the same way.
+ *
+ * Rollback protection (issue #3404, pinned by test/fixtures/base-valid-completion-source.ts, a verbatim copy of the
+ * pre-#3404 gate, and by the base journal parser fixture): a pre-#3404 coerceRecord returns null for a V2 source,
+ * so its listRecords silently skips the record, and a release() that saw no guarded record would remove the run
+ * directory. That worker cannot reach release() for such a run: publication installs the completionSourceFence in
+ * the bare journal BEFORE rewriting any record, and the old parseRecoveryJournal rejects the fence key, so the old
+ * worker's attach of the run's branch (runnerCloneForBranch) fails closed before its completed-run release. The
+ * protection therefore rests on the fence staying in the journal for as long as any record is V2.
  */
 function decodePersistedCompletionSource(value: unknown): CompletionSource | CompletionSourceV2 | undefined {
   if (value && typeof value === "object" && !Array.isArray(value) && (value as { version?: unknown }).version !== undefined) {

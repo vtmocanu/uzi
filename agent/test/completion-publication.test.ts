@@ -5,15 +5,18 @@ import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { acquireWorkerLifetime } from "../src/authority-lock.js";
+import { acquireWorkerLifetime, type WorkerLifetime } from "../src/authority-lock.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
-import { openAuthorityStore, type AuthorityFsOps, type SlotSnapshot } from "../src/completion-authority.js";
+import { openAuthorityStore, type AuthorityFsOps, type SlotSnapshot, type SourceUseLease } from "../src/completion-authority.js";
 import { sourceCoreDigest, sourceFenceOf, verifyCertifiedSource, verifyPublishedSource, type CompletionSourceV2 } from "../src/completion-source.js";
 import { ExecutorLifetime, type ExecutorTerminalSeal } from "../src/codex/executor-lifetime.js";
 import type { Executor } from "../src/executor.js";
 import { legacyCompletionCore, type CompletionSource, type PublicationFsOps, type RecoveryCoordinator } from "../src/recovery.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
 import { testLockOptions } from "./authority-test-support.js";
+import { validCompletionSource as baseValidCompletionSource } from "./fixtures/base-valid-completion-source.js";
+import { parseRecoveryJournal as baseParseRecoveryJournal } from "./fixtures/base-parse-recovery-journal.js";
+import type { CompletedPublicationReceipt } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 import { client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 
@@ -39,6 +42,7 @@ interface PrivateRunner {
 }
 
 interface Rig {
+  lifetime: WorkerLifetime;
   rt: AuthorityRuntime;
   p: PrivateRunner;
   flight: Record<string, unknown>;
@@ -145,7 +149,7 @@ async function rig(t: TestContext, options: { codex: boolean; cohort?: number; u
   const warnings: string[] = [];
   const log = Object.assign(nullLogger(), { warn: (message: string, fields?: unknown) => { warnings.push(`${message} ${JSON.stringify(fields ?? {})}`); } });
   return {
-    rt, p, flight, bound, bare, clone: cloneInfo.path, runId: claim.run_id, captureIds, executor, warnings, events, counts, fail,
+    lifetime, rt, p, flight, bound, bare, clone: cloneInfo.path, runId: claim.run_id, captureIds, executor, warnings, events, counts, fail,
     end: () => p.endFlightSourceUse(flight, log),
   };
 }
@@ -314,7 +318,7 @@ describe("durable publication at the end of source use", () => {
     assert.equal(fenceOf(r), undefined);
   });
 
-  for (const stray of ["junk.txt", "stray.json", `${randomUUID()}.json.${randomUUID()}.tmp`, `${randomUUID()}.bundle`, "subdir"]) {
+  for (const stray of ["junk.txt", "stray.json", "subdir"]) {
     it(`an unattributable cohort-directory entry (${stray.slice(0, 9)}) refuses publication`, async t => {
       const r = await rig(t, { codex: false, cohort: 2 });
       const target = path.join(recordDir(r), stray);
@@ -356,16 +360,16 @@ describe("durable publication at the end of source use", () => {
     assert.ok(fresh);
   });
 
-  it("an installed fence for a different source refuses and rewrites no record", async t => {
+  it("an installed fence naming the slot's live epoch is not stale: it refuses and rewrites no record", async t => {
     const r = await rig(t, { codex: false, cohort: 2 });
-    const original = git.installCompletionSourceFence.bind(git);
-    // A different, already-installed fence on the completing journal: the install must refuse it.
-    await original(r.bare, BRANCH, { runId: r.runId, clonePath: r.clone, attemptId: r.bound.attemptId! },
-      { version: 1, sourceUseEpoch: randomUUID(), sourceCoreDigest: "a".repeat(64) });
+    const live = { version: 1 as const, sourceUseEpoch: (await slotOf(r))!.epoch, sourceCoreDigest: "a".repeat(64) };
+    await git.installCompletionSourceFence(r.bare, BRANCH, { runId: r.runId, clonePath: r.clone, attemptId: r.bound.attemptId! }, live);
     const before = snapshotFiles(r);
     await r.end();
     assert.equal((await slotOf(r))?.state, "ineligible");
+    assert.deepEqual(fenceOf(r), live, "the foreign fence is untouched");
     assert.deepEqual(snapshotFiles(r), before);
+    assert.match(r.warnings.join("\n"), /different fence/);
   });
 });
 
@@ -559,5 +563,280 @@ describe("record decoding of published sources", () => {
     const [legacy] = await r.p.recovery.inspect(r.runId);
     assert.deepEqual(legacy!.completionSource, r.bound);
     assert.equal((legacy!.completionSource as { version?: number }).version, undefined);
+  });
+});
+
+// ---- U4 validator wave: stale fences, temps, bare clearance, path forms, lease identity, restart ----------
+
+const receiptOf = (r: Rig): CompletedPublicationReceipt => ({
+  hold_id: "11111111-1111-4111-8111-111111111111", run_id: r.runId,
+  owner_id: "33333333-3333-4333-8333-333333333333", worker_id: "44444444-4444-4444-8444-444444444444", generation: GENERATION,
+  final_head: r.bound.expectedHead, repo_id: "55555555-5555-4555-8555-555555555555",
+  connection_id: "66666666-6666-4666-8666-666666666666", project_id: 7, forge_type: "github",
+  base_url: "https://example.invalid", branch: BRANCH, mr_iid: 3, observed_branch_head: r.bound.expectedHead,
+});
+
+/** The run resumes on the same clone: a fresh epoch, the journal re-binds, and the flight publishes again. */
+async function resume(r: Rig, mint: () => Promise<void>): Promise<void> {
+  await mint();
+  await r.p.bindCompletionSource(r.flight);
+  const sink = new Set<string>();
+  r.flight.sourceUsePaths = sink;
+  r.flight.sourceLease = await r.rt.recordAdmissions(sink, () => r.rt.bindSource(r.clone, r.executor.executorIncarnation));
+  r.flight.sourceTailsJoined = true;
+}
+
+describe("a stale fence never wedges a clone", () => {
+  it("failed publication, then the resumed flight publishes over the fence the failure left", async t => {
+    const r = await rig(t, { codex: false, cohort: 3 });
+    r.fail.records = (what, n) => what === "syncFile" && n === 2;
+    await r.end();
+    const stale = fenceOf(r) as { sourceUseEpoch: string };
+    assert.ok(stale, "the failed publication left its fence");
+    assert.equal((await slotOf(r))?.state, "ineligible");
+    assert.equal(readRecords(r).filter(isV2).length, 1);
+
+    await resume(r, async () => undefined);
+    await r.end();
+    const slot = await slotOf(r);
+    assert.equal(slot?.state, "claude_ready");
+    const sources = readRecords(r).map(x => x.completionSource as CompletionSourceV2);
+    assert.equal(sources.length, 3);
+    for (const s of sources) assert.deepEqual(s, sources[0]);
+    const fence = fenceOf(r) as { sourceUseEpoch: string };
+    assert.deepEqual(fence, sourceFenceOf(sources[0]!), "the journal carries the new publication's fence");
+    assert.notEqual(fence.sourceUseEpoch, stale.sourceUseEpoch);
+    assert.equal(fence.sourceUseEpoch, slot?.epoch);
+    assert.equal(await eligibleRecords(r), 3);
+  });
+
+  it("published, then resumed without a receipt on a new epoch, republishes over the old fence", async t => {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    await r.end();
+    const old = fenceOf(r) as { sourceUseEpoch: string };
+    assert.equal((await slotOf(r))?.state, "claude_ready");
+    assert.equal(await eligibleRecords(r), 2);
+
+    // Consuming the publication (the seed admission) mints the new epoch; the records go back to the bound core.
+    await resume(r, () => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical")));
+    assert.equal(readRecords(r).some(isV2), false, "re-binding rewrote the records to the bare core");
+    assert.equal(await eligibleRecords(r), 0);
+    await r.end();
+    const slot = await slotOf(r);
+    assert.equal(slot?.state, "claude_ready");
+    const fence = fenceOf(r) as { sourceUseEpoch: string };
+    assert.notEqual(fence.sourceUseEpoch, old.sourceUseEpoch);
+    assert.equal(fence.sourceUseEpoch, slot?.epoch);
+    assert.equal(await eligibleRecords(r), 2);
+  });
+});
+
+describe("crash-era temps do not block publication", () => {
+  const uuid = (): string => randomUUID();
+  for (const [label, name] of [
+    ["record temp", (): string => `${uuid()}.json.${uuid()}.tmp`],
+    ["bundle temp", (): string => `${uuid()}.${uuid()}.bundle.tmp`],
+    ["orphan bundle", (): string => `${uuid()}.bundle`],
+  ] as const) {
+    it(`a ${label} left by the coordinator is tolerated and left in place`, async t => {
+      const r = await rig(t, { codex: false, cohort: 2 });
+      const temp = name();
+      fs.writeFileSync(path.join(recordDir(r), temp), "half written");
+      await r.end();
+      assert.equal((await slotOf(r))?.state, "claude_ready");
+      assert.equal(await eligibleRecords(r), 2);
+      assert.equal(fs.readFileSync(path.join(recordDir(r), temp), "utf8"), "half written");
+    });
+  }
+
+  for (const impostor of [
+    (): string => `${uuid()}.json.${uuid()}.tmp.extra`, (): string => `${uuid().toUpperCase()}.json.${uuid()}.tmp`,
+    (): string => `${uuid()}.json.not-a-uuid.tmp`, (): string => `x.json.${uuid()}.tmp`, (): string => `${uuid()}.bundle.tmp`,
+    (): string => `${uuid()}.json.bak`,
+  ]) {
+    it(`a near-miss name (${impostor().slice(0, 6)}...) still refuses`, async t => {
+      const r = await rig(t, { codex: false, cohort: 2 });
+      fs.writeFileSync(path.join(recordDir(r), impostor()), "{ not a record");
+      const before = snapshotFiles(r);
+      await r.end();
+      assert.equal((await slotOf(r))?.state, "ineligible");
+      assert.equal(fenceOf(r), undefined);
+      assert.deepEqual(snapshotFiles(r), before);
+    });
+  }
+
+  it("a directory carrying a temp name refuses", async t => {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    fs.mkdirSync(path.join(recordDir(r), `${uuid()}.json.${uuid()}.tmp`));
+    await r.end();
+    assert.equal((await slotOf(r))?.state, "ineligible");
+    assert.equal(fenceOf(r), undefined);
+  });
+});
+
+describe("publication preconditions", () => {
+  it("an unresolved bare mutation on the flight's bare refuses publication", async t => {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    // A bare mutator another operation began and never settled (its owner may be a dead incarnation).
+    await r.rt.withTransaction(() => r.rt.hooks.beginBareMutation(r.bare, "recovery-pin-anchor", ["refs/uzi/pin"]));
+    const before = snapshotFiles(r);
+    await r.end();
+    assert.equal((await slotOf(r))?.state, "ineligible");
+    assert.equal(fenceOf(r), undefined);
+    assert.deepEqual(snapshotFiles(r), before);
+    assert.match(r.warnings.join("\n"), /unresolved/);
+  });
+
+  it("source-use paths in a non-normalized form still publish", async t => {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    const odd = `${path.dirname(r.clone)}/./${path.basename(r.clone)}`;
+    assert.notEqual(odd, r.clone);
+    r.flight.sourceUsePaths = new Set();
+    r.flight.worktreePath = odd;
+    r.flight.runnerClone = { ...(r.flight.runnerClone as object), path: `${odd}/` };
+    await r.end();
+    assert.equal((await slotOf(r))?.state, "claude_ready");
+    assert.equal(await eligibleRecords(r), 2);
+  });
+
+  for (const how of ["false", "throw"] as const) {
+    it(`a later bind that ${how === "false" ? "returns false" : "throws"} clears the bound source`, async t => {
+      const r = await rig(t, { codex: false });
+      assert.ok(r.flight.completionSourceBound);
+      t.mock.method(r.p.recovery, "bindCompletionSource", async () => { if (how === "throw") throw new Error("journal down"); return false; });
+      await r.p.bindCompletionSource(r.flight);
+      assert.equal(r.flight.completionSourceBound, undefined);
+      // With nothing bound the flight is only ended, never published.
+      await r.end();
+      assert.equal((await slotOf(r))?.state, "ineligible");
+      assert.equal(fenceOf(r), undefined);
+    });
+  }
+});
+
+describe("lease identity at publication", () => {
+  async function refused(r: Rig, lease: SourceUseLease): Promise<void> {
+    const before = snapshotFiles(r);
+    let ran = 0;
+    const outcome = await r.rt.publishSource(r.clone, lease, { timeoutMs: 2000 }, async () => { ran++; });
+    assert.equal(outcome.published, false);
+    assert.equal(ran, 0, "the publication work never ran");
+    assert.equal(fenceOf(r), undefined);
+    assert.deepEqual(snapshotFiles(r), before);
+    assert.equal(r.rt.leaseFor(r.clone) !== undefined, true, "the current lease is untouched");
+    const slot = await slotOf(r);
+    assert.equal(slot?.state, "active");
+    assert.equal(slot?.publication ?? null, null);
+  }
+
+  it("a lease object that is not the runtime's current entry for the clone refuses and writes nothing", async t => {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    // Same epoch, different object.
+    await refused(r, Object.create(r.flight.sourceLease as SourceUseLease) as SourceUseLease);
+    // A stale lease: the clone was re-admitted since.
+    const stale = r.flight.sourceLease as SourceUseLease;
+    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    const before = snapshotFiles(r);
+    const outcome = await r.rt.publishSource(r.clone, stale, { timeoutMs: 2000 }, async () => { throw new Error("must not run"); });
+    assert.equal(outcome.published, false);
+    assert.deepEqual(snapshotFiles(r), before);
+    assert.equal(fenceOf(r), undefined);
+  });
+});
+
+describe("rollback: a pre-#3404 worker refuses what publication writes", () => {
+  it("the captured base gates reject the V2 source and the fenced journal, and accept the bound core", async t => {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    assert.equal(baseValidCompletionSource(r.bound), true, "the base gate accepts the V1 core (control)");
+    assert.doesNotThrow(() => baseParseRecoveryJournal(execFileSync("git", ["-C", r.bare, "config", "--get", `uzi-recovery.${BRANCH}.clone`], { encoding: "utf8", env: ENV }).trim()));
+    await r.end();
+    for (const record of readRecords(r)) {
+      assert.equal(baseValidCompletionSource(record.completionSource), false,
+        "base coerceRecord returns null for a V2 source, so the old listRecords skips the record");
+    }
+    const raw = execFileSync("git", ["-C", r.bare, "config", "--get", `uzi-recovery.${BRANCH}.clone`], { encoding: "utf8", env: ENV }).trim();
+    assert.throws(() => baseParseRecoveryJournal(raw), /invalid retained recovery clone journal/,
+      "an old worker cannot attach the branch's clone (the path that reaches release()), so it never runs there");
+  });
+});
+
+describe("restart retirement reads a published source as its legacy core", () => {
+  /** What the receipt-driven cleanup decides for a cohort in the given shape (run-id independent). */
+  async function decide(t: TestContext, shape: "v1" | "v2" | "mixed"): Promise<unknown> {
+    const r = await rig(t, { codex: false, cohort: 3 });
+    if (shape === "v2") await r.end();
+    if (shape === "mixed") {
+      r.fail.records = (what, n) => what === "syncFile" && n === 2;
+      await r.end();
+      const v2 = readRecords(r).filter(isV2).length;
+      assert.ok(v2 > 0 && v2 < 3, `a partial publication left ${v2} of 3 rewritten`);
+    }
+    assert.equal(await r.p.recovery.persistCompletionReceipt(receiptOf(r)), true);
+    const calls: unknown[][] = [];
+    t.mock.method(git, "cleanupRecoveryGeneration", async (...args: unknown[]) => { calls.push(args); return "retained"; });
+    const snapshot = (await r.p.recovery.inspect(r.runId)).filter(x => x.completionReceipt);
+    assert.equal(snapshot.length, 1);
+    await r.p.recovery.resumePending(undefined, snapshot);
+    return {
+      preflights: calls.length, modes: calls.map(c => c[7]),
+      barePath: calls.map(c => c[0] === r.bare), rootsAreTheBoundRoots: calls.map(c => JSON.stringify(c[2]) === JSON.stringify(r.bound.roots)),
+      finalHead: calls.map(c => c[5] === r.bound.expectedHead),
+    };
+  }
+  const V1_DECISION = { preflights: 1, modes: ["completion-check"], barePath: [true], rootsAreTheBoundRoots: [true], finalHead: [true] };
+
+  for (const shape of ["v1", "v2", "mixed"] as const) {
+    it(`${shape === "v1" ? "a V1 cohort (control)" : shape === "v2" ? "an all-V2 cohort" : "a mixed V1/V2 cohort (partial publication)"} reaches the V1 release decision`, async t => {
+      assert.deepEqual(await decide(t, shape), V1_DECISION);
+    });
+  }
+});
+
+describe("an interrupted publication (process death) confers nothing on a restart", () => {
+  it("fence plus k of N rewrites and no slot commit: a new incarnation finds nothing eligible and cannot publish over it", async t => {
+    const r = await rig(t, { codex: false, cohort: 3 });
+    // The publication dies after record 0 is rewritten; the demotion cannot be written either, which is
+    // exactly the durable state a killed process leaves: fence installed, 1 of 3 records V2, slot active.
+    r.fail.records = (what, n) => what === "syncFile" && n === 2;
+    r.fail.authority = () => true;
+    r.fail.always = true;
+    await r.end();
+    const dead = (await slotOf(r))!;
+    assert.equal(dead.state, "active");
+    assert.equal(dead.owner.worker !== undefined, true);
+    assert.equal(readRecords(r).filter(isV2).length, 1);
+    assert.ok(fenceOf(r), "the fence is installed");
+    const before = snapshotFiles(r);
+    const fence = fenceOf(r);
+
+    // Restart: a fresh worker incarnation and a fresh runner/coordinator over the same data dir and journal.
+    const incarnation = randomUUID();
+    const rt2 = new AuthorityRuntime({ lifetime: r.lifetime, workerToken: TOKEN, workerIncarnation: incarnation, timeoutMs: 5000 });
+    const p2 = runnerWith(() => ({ executor: r.executor }), fakeGitlab().gitlab, "u4-publication-join", undefined, { authority: rt2 }) as unknown as PrivateRunner;
+    const records = await p2.recovery.inspect(r.runId);
+    assert.equal(records.length, 3, "the successor decodes the mixed cohort");
+    await rt2.withTransaction(async tx => {
+      const store = await openAuthorityStore(tx, { workerToken: TOKEN, workerIncarnation: incarnation });
+      for (const record of records) {
+        const source = record.completionSource as { version?: number } | undefined;
+        if (source?.version === 2) await assert.rejects(verifyPublishedSource(tx, store, source), "a certified record without a published slot confers nothing");
+      }
+      const slot = await store.readSlot(tx, await store.slotKey(tx, r.clone));
+      assert.equal(slot?.state, "active", "the slot is still active under the dead incarnation");
+      assert.equal(slot?.epoch, dead.epoch);
+      assert.equal(slot?.publication ?? null, null);
+    });
+    // The successor can neither adopt the dead epoch nor publish with the dead owner's lease.
+    await assert.rejects(rt2.bindSource(r.clone, r.executor.executorIncarnation), /another worker incarnation|active/);
+    let ran = 0;
+    const outcome = await rt2.publishSource(r.clone, r.flight.sourceLease as SourceUseLease, { timeoutMs: 2000 }, async () => { ran++; });
+    assert.equal(outcome.published, false);
+    assert.equal(ran, 0);
+    assert.deepEqual(snapshotFiles(r), before, "no record changed");
+    assert.deepEqual(fenceOf(r), fence);
+    const after = (await slotOf(r))!;
+    assert.equal(after.state, "active");
+    assert.equal(after.epoch, dead.epoch);
+    assert.equal(await eligibleRecords(r), 0);
   });
 });
