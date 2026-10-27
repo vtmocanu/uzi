@@ -191,7 +191,13 @@ usage limit and resumes itself — keep waiting. `recovery_wait` with cause
 work (*Recovering a failed run's work*), then `uzi run resume` or cancel. It stops the same way on
 an owner-held `retained_recovery_exhausted` park (retry stamp explicitly null; retries capped):
 `STOP=recovery_wait:retained_recovery_exhausted`; custody is kept, so Resume or cancel. A stamped
-park of that cause retries itself and keeps polling, as do other `recovery_wait` causes. `uzi-lander` uses this same poller for its
+park of that cause retries itself and keeps polling. An integrity refusal,
+`retained_recovery_adoption_failed`, also stops the poller (exit 0,
+`STOP=recovery_wait:retained_recovery_adoption_failed`) regardless of retry timing:
+local work and custody are preserved, with no automatic retry. Back up available
+work, then ask the owner to Resume or Cancel; Resume requests a bounded attempt,
+not assured success, and another adoption failure holds again. Other
+`recovery_wait` causes keep polling under their existing rules. `uzi-lander` uses this same poller for its
 blind watch to terminal.
 
 **Watching for a REVISED plan (after `uzi run revise`) uses the plan-seq form.** The

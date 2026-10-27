@@ -1538,17 +1538,22 @@ chain in the diagram above, with no intervening `running`.
   one per run backing a healthy current claim without an owner decision;
   total custody remains protected. After discarded/released precedence, an OPEN
   hold at `recovery_wait` for `worker_requeue_exhausted`,
-  `worker_memory_pressure`, or `retained_recovery_exhausted` reports
+  `worker_memory_pressure`, `retained_recovery_exhausted`, or
+  `retained_recovery_adoption_failed` reports
   `needs_action` after failed latest capture,
   otherwise `source_only`, before available unguarded archives or capture
   progress. Retained-recovery exhaustion keeps this conservative protection
   for both timed retries and NULL-stamp owner holds throughout `recovery_wait`.
+  Adoption failure is owner-held with no automatic retry. Its renewal requires
+  a fresh owned claim and unconsumed raw owner grant; the external bare-config
+  `uzi-recoveryowner.<runId>.record` precharges accounting outside the strict
+  recovery journal and inventory schemas. It grants no custody or deletion authority.
   After timer promotion or owner Resume, existing proof-based release rules
   apply again; execution-claim release alone never permits source deletion.
   Archive availability remains independent of attention and does not release
   these causes' custody; other classifier decisions remain unchanged.
   See [ADR-2445](adr/2445-custody-admission-accounting.md),
-  [ADR-2396](adr/2396-worker-memory-guard.md), and the #3495 amendment in
+  [ADR-2396](adr/2396-worker-memory-guard.md), and the #3495 and #3527 amendments in
   [ADR-1197](adr/1197-transient-recovery-park.md).
   The **archive capture** (`recovery_captures`) is the later,
   immutable, encrypted artifact bound to that hold. PRD #1349 hardens the

@@ -1375,12 +1375,14 @@ uzi run recovery <run-id> [--json]
   `CAPTURE` and `WORKER` columns. It shows each hold's exact id, claim generation, and its attention state — active
   protection, a capture in flight, or a ready archive. Legacy holds can release
   automatically on archive readiness; guarded holds await final inventory acknowledgment.
-  The narrow exhaustion exception is an OPEN hold for `recovery_wait` /
-  `worker_requeue_exhausted`, `worker_memory_pressure`, or
-  `retained_recovery_exhausted` (timed or held): it remains `source_only`, or `needs_action` after a failed
-  latest capture, even with an available archive or capture in flight. Timed retained
-  recovery can retry automatically; NULL retry requires owner Resume/Cancel. Archive
-  readiness does not implicitly release this custody.
+  The narrow recovery-hold exception is an OPEN hold for `recovery_wait` /
+  `worker_requeue_exhausted`, `worker_memory_pressure`,
+  `retained_recovery_exhausted` (timed or held), or
+  `retained_recovery_adoption_failed`: it remains `source_only`, or `needs_action` after a failed
+  latest capture, even with an available archive or capture in flight. Retained
+  exhaustion with a finite retry can retry automatically; its NULL retry requires
+  owner Resume/Cancel. Adoption failure always requires owner Resume/Cancel.
+  Archive readiness does not implicitly release this custody.
   The latest capture state and available archive are independent: an older download may
   omit latest work while a newer capture prepares/uploads. The same source, coverage,
   export and discard guidance as above follows. `--json` prints
@@ -3168,7 +3170,10 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `worker_requeue_exhausted`, requiring explicit owner Resume or Cancel
   without an automatic timer. Retained-source budget exhaustion can use cause
   `retained_recovery_exhausted`: three timed retries by default, then an owner
-  hold with no countdown. See [Retained recovery exhausted](#retained-recovery-exhausted). A Codex credential
+  hold with no countdown. An integrity refusal uses `retained_recovery_adoption_failed`,
+  requiring owner Resume or Cancel with no automatic retry. See
+  [Retained recovery exhausted](#retained-recovery-exhausted) and
+  [Retained recovery adoption failed](#retained-recovery-adoption-failed). A Codex credential
   refresh or release that found the owner's vault locked also parks here
   (cause `vault_locked`); it takes the same capped backoff and no lifetime
   cap. The owner's explicit successful vault unlock best-effort queues an
@@ -3260,7 +3265,8 @@ hold presentation and remedies are unchanged. See
 `worker_requeue_exhausted` instead requires owner Resume or Cancel; the Codex
 account hold waits for its account. `retained_recovery_exhausted` retries when
 its timestamp is finite (even if due); NULL instead needs owner Resume/Cancel,
-and omitted timing is unknown. `pool_wait` instead clears only when a token is
+and omitted timing is unknown. `retained_recovery_adoption_failed` requires
+owner Resume/Cancel regardless of retry timing. `pool_wait` instead clears only when a token is
 opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
 does not resume it.
 
@@ -3404,6 +3410,24 @@ source custody; execution release does not authorize deleting source. See
 [Retained recovery exhausted](run-recovery-wait.md#retained-recovery-exhausted)
 for renewal bounds, storage risks and rollout requirements.
 
+### Retained recovery adoption failed
+
+`recovery_wait` / `retained_recovery_adoption_failed` means an integrity check
+refused adoption. Local work and custody are preserved; the run is owner-held
+with no automatic retry, regardless of a displayed retry timestamp.
+
+Read `uzi run recovery <id>` and export an available archive before deciding.
+Use `uzi run resume <id>` (or `resume-now`) to request another bounded attempt,
+or `uzi run cancel <id>` to end the run. Resume preserves remaining wall time
+and may need `uzi run extend` first. It does not guarantee success: repeated
+adoption failure holds again. An earlier archive may omit latest local work.
+Timers, token changes and credential changes do not release this hold.
+
+Default wait and log follow stop for this owner decision, and the TUI marks
+NEEDS YOU. Explicit `--until` keeps its selected status set. See
+[Retained recovery adoption failed](run-recovery-wait.md#retained-recovery-adoption-failed)
+for storage risks and rollout requirements.
+
 ### Waiting for a state: `uzi run wait`
 
 `uzi run wait <id>` blocks until the run reaches a state you can act on — the
@@ -3413,7 +3437,8 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 `awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
 rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`),
 except a default wait also stops at `recovery_wait` with cause
-`worker_requeue_exhausted`, `worker_memory_pressure`, or owner-held
+`worker_requeue_exhausted`, `worker_memory_pressure`,
+`retained_recovery_adoption_failed`, or owner-held
 `retained_recovery_exhausted` (NULL retry), and at a `paused` run held on
 `base_attestation_missing`, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,

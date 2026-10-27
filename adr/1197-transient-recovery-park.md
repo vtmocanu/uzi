@@ -467,7 +467,9 @@ a trusted, successfully settled real model turn. (The #3330 amendment below
 supersedes that sentence: an explicit owner Resume also renews the count.)
 
 The [#3495 amendment](#amendment-2026-10-26-3495-bounded-retained-recovery-parks)
-supersedes terminal exhaustion below only for durably confirmed `budget_exhausted` retained source.
+supersedes terminal exhaustion below for durably confirmed `budget_exhausted` retained source.
+The [#3527 amendment](#amendment-2026-10-27-3527-owner-held-retained-adoption-retry)
+also qualifies the adoption-failure terminal policy with an owner-held retry.
 
 A permanent blocker or exhaustion reports terminal `failed` with
 `keepCustody`; it neither auto-reclaims nor exposes failed-run Resume.
@@ -673,8 +675,9 @@ rebase before applying the persisted window. Failure classification uses the
 current claim's window, never a superseded deadline. Already-blocked records stay
 blocked with their original reason, including decoded-history exhaustion; neither
 a reclaim nor a deployment upgrade revives them (superseded for
-`budget_exhausted` blockers only by the #3330 amendment below; every other
-blocker stays permanent). Source protection, custody,
+`budget_exhausted` blockers by the #3330 amendment below, and for owner-authorized
+`adoption_failed` renewal by #3527; the remaining blockers stay permanent).
+Source protection, custody,
 publication proof, closure verification limits and retry backoff are unchanged.
 No claim fence, timer renewal or successful local verification authorizes deletion
 or release of retained work.
@@ -776,7 +779,9 @@ across fresh claims", and its "neither a reclaim nor a deployment upgrade revive
 them" (for `budget_exhausted` blockers only). A successful settled model turn
 still clears the completed episode, unchanged.
 
-Mechanism:
+Mechanism at #3330 (the #3495 amendment below adds retained-park Resume
+and derived claim episodes; #3527 adds the separate raw owner grant and
+owner-authorized adoption renewal):
 
 - `runs.worker_recovery_episode` is incremented by exactly 1 only by
   `ResumeWorkerRecoveryEpisode`, reached only from the owner Resume for
@@ -788,7 +793,9 @@ Mechanism:
   value is refused, and it is written only when above 0, so a never-resumed
   journal is byte-identical to before.
 - `reserveRecoveryIteration` checks, in order: the stale fence, refusal of any
-  blocker other than `budget_exhausted`, the clock, then renewal. It renews iff
+  blocker other than `budget_exhausted`, the clock, then renewal (the later
+  #3527 exception admits `adoption_failed` with a fresh raw owner grant).
+  Under #3330 it renews iff
   the claim's episode is above the stored episode **and** the claim is a new
   generation (a new window). That applies to a partly used, exhausted or
   `budget_exhausted`-blocked source. Renewal charges 1 of the 3 iterations,
@@ -1306,8 +1313,9 @@ Decision record (AI-synced 2026-10-26). This amendment qualifies #2512's
 terminal-exhaustion policy, #3330's owner-only renewal and server-requeue
 exclusion, and the verified-capture-before-promotable-park prerequisite.
 It applies only to an authoritative exact-source journal durably confirmed as
-`budget_exhausted`. Other permanent blockers keep the existing terminal fallback
-with custody retained. #3462's Codex zero-evidence idle still enters ordinary
+`budget_exhausted`. At #3495, other permanent blockers kept the terminal fallback
+with custody retained; #3527 below adds the owner-held `adoption_failed`
+exception. #3462's Codex zero-evidence idle still enters ordinary
 verified-capture recovery; this is not a broader retry for deterministic blockers.
 #3181 remains out of scope. There is no linked PRD.
 
@@ -1330,7 +1338,8 @@ verified-capture recovery; this is not a broader retry for deterministic blocker
   episode evidence; retained retries are not worker-death requeues.
 - Renewal requires both a fresh generation and a higher derived episode than
   the journal. It charges exactly one reservation of three in a new five-minute
-  window, clears only `budget_exhausted`, and requires quiescence again before
+  window, clears `budget_exhausted` (adoption renewal needs the separate #3527
+  owner grant below), and requires quiescence again before
   recovery work. Same generation or same episode cannot renew. Resume of a
   pending timed retry before its fresh claim can advance the derived episode
   by two but still grants one renewal, not two windows.
@@ -1389,3 +1398,119 @@ the terminal fallback. The existing worker-journal downgrade caution remains:
 older workers may reject or drop durable recovery fields. This amendment adds
 no operator watcher or lander policy, source-deletion authority or guarantee
 that the latest edits have an archive.
+
+## Amendment 2026-10-27, #3527: owner-held retained adoption retry
+
+Decision record (AI-synced 2026-10-27). This qualifies #2512's terminal
+adoption-failure policy, #3330's budget-only blocker renewal, and #3495's
+retained-recovery parks above. It adds an owner decision for confirmed adoption
+refusal without treating an integrity failure as transient. The #3031 model-free
+preservation producer receives no renewal or execution authority.
+
+### Hold, owner action and confirmation
+
+- A positive-generation worker negotiating
+  `recovery_cause_retained_recovery_adoption_failed` may report
+  `recovery_wait` / `retained_recovery_adoption_failed` after exact-source
+  journal readback confirms persisted `adoption_failed`. The worker proves
+  current ownership and fresh credential-free quiescence of retained source
+  paths, including a partial successor, before reporting the hold. An unproved
+  quiescence boundary does not authorize this park.
+- The existing locked park transaction releases execution, retains source and
+  custody, increments lifetime `recovery_wait_count`, leaves
+  `retained_park_count` unchanged, and writes a NULL retry. Timer promotion and
+  immediate token/credential promotion exclude the cause. It has no automatic
+  retry or new configuration. The accepted run-kind/status/generation fences
+  remain those of `parkRetainedRecovery` in
+  [retainedpark.go](../api/internal/workersvc/retainedpark.go).
+- Owner Resume uses `ResumeWorkerRecoveryEpisode`: increment stored
+  `worker_recovery_episode` by one, clear retry and queue through the existing
+  full Resume lifecycle, including hold clearing and requeue-baseline bookkeeping.
+  It preserves remaining wall semantics; extension may be needed. Cancel remains
+  terminal. A request for another attempt does not guarantee successful adoption.
+- Default CLI wait/log follow, watcher and lander stop for this cause regardless
+  of retry timing; explicit CLI `--until` retains its selected status set. The
+  TUI marks NEEDS YOU. Without a new owner grant, redispatch reholds without
+  capture or a model turn; another adoption failure reholds.
+- Feature absence or unconfirmed blocker persistence fails closed with custody
+  retained. A hold is confirmed by the generation-fenced report ACK naming the
+  exact status and cause. Lost, status-only or otherwise unconfirmed ACKs use
+  the existing bounded reconciliation (two reports and at most two ownership
+  probes under one boundary deadline), then stop nonterminal. Ownership permits
+  report replay, not hold confirmation. Stale/cancelled/newer outcomes stop
+  without overwriting the newer state. See `parkRetainedRecoveryExhausted` and
+  `recoverRetainedClaim` in [runner.ts](../agent/src/runner.ts).
+
+### Raw grant and durable accounting
+
+Ordinary, chat, job and judge claim builders carry both:
+
+- `worker_recovery_episode = stored worker_recovery_episode + retained_park_count`,
+  the existing #3495 derived budget-renewal episode;
+- `worker_recovery_owner_episode = stored worker_recovery_episode`, the raw
+  owner grant. Missing, negative or malformed raw values grant no adoption renewal.
+
+Adoption renewal requires a raw grant above its consumed high-water mark, a
+fresh positive claim generation, exact source/journal/reservation and bare-repo
+identity, and current ownership. It charges one reservation of the existing
+three-iteration/five-minute window before recovery work, with quiescence and
+verification required again before model admission. A higher derived episode
+alone cannot renew adoption; other blockers are not cleared. A failure persisted
+as `budget_exhausted` after the deadline follows #3495 instead; that overlap does
+not establish transience. The exact verified `ready-for-model` successor handoff
+is supported, but is not independent execution authority.
+
+Accounting is stored in local bare Git config at
+`uzi-recoveryowner.<runId>.record`. It is outside the strict recovery journal,
+`RecoveryProgress`, inventory fields and backup schemas read by older workers.
+The record binds the owner baseline and consumed high-water mark to immutable
+source/reservation identities, branch/key/run and bare path/device/inode. It
+records the original source and an explicitly matched successor handoff. Its
+canonical parser and match predicates are in
+[recovery-owner.ts](../agent/src/recovery-owner.ts); the locked read/write,
+reservation and handoff operations are in [git.ts](../agent/src/git.ts).
+
+Under the bare-repository lock, charging writes and reads back a **pending**
+owner record that burns the grant, writes and reads back the journal reservation,
+then writes and reads back a **committed** owner record before returning authority.
+A crash before the journal write consumes conservatively and refuses work. A
+pending record whose exact after-reservation landed can settle accounting and
+persist an abandoned blocker, but cannot execute that interrupted charge or use
+its old generation as authority. Uncertain writes stop with sources retained.
+
+The baseline is established on an eligible nonblocked charge before adoption
+failure; a missing baseline on an already-blocked journal is not reconstructed
+from the next claim. The consumed high-water mark survives episode completion,
+explicit discard and verified retirement: removing recovery evidence does not
+mint another owner grant. This accounting record supplies no source-deletion,
+custody-release or model authority by itself.
+
+### Custody, rollout and remaining limits
+
+The custody classifier includes this cause in its OPEN-hold exception, after
+discarded/released precedence and before archive readiness or capture progress:
+failed latest capture yields `needs_action`, otherwise `source_only`. Leaving
+the park restores existing proof-based release rules. An earlier archive remains
+exportable independently and may omit latest local edits. Custody can block
+worker image rolls (#3103); each Resume's fresh claim opens another counted hold
+and repeated failures may retain successor paths on disk (#3329/#2445).
+Same-worker affinity is retained, but a peer after worker death or affinity
+expiry can run a published checkpoint without the original local journal,
+potentially behind retained work. This amendment does not eliminate that risk.
+
+Deploy the API fully before consuming the feature on workers. Mixed API replicas
+and API rollback remain unsupported as inherited from #3495. New accounting is
+external to the old strict journal/progress/inventory schemas: the actual older
+parser, progress and inventory reader can accept these journals; the older
+worker still refuses `adoption_failed` terminally with sources and custody kept.
+The compatibility fixture is
+[recovery-owner-rollback.test.ts](../agent/test/recovery-owner-rollback.test.ts);
+it exercises the actual predecessor implementations from an isolated export,
+including old blocked-adoption refusal and unchanged budget renewal.
+
+The additive cause migration replaces a CHECK in a transaction, with table-scan
+and locking risk; there is no online migration component. Its Down converts
+this cause's held runs to terminal `worker_lost`, preserving custody and sources;
+that conversion is not recovery success and does not make rolling API downgrade
+supported. No database counter is added. The budget-exhaustion contract, strict
+backup schemas and verification before model execution remain unchanged.

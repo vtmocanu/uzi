@@ -863,6 +863,10 @@ type RunDTO struct {
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
 	// or about to fill; the run resumes at its next retry, see DiskParkCount);
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
+	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
+	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
+	// "retained_recovery_adoption_failed" is an integrity refusal: retained local work and
+	// custody are preserved, and only the owner can Resume or Cancel, without automatic retry.
 	// "empty_turn" remains reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
@@ -896,8 +900,10 @@ type RunDTO struct {
 	// queued — the retry stamp the forge-park surface counts down to ("retry at HH:MM"). It is
 	// the recovery-park analog of RetryNotBefore (the usage-limit park's stamp) and is a
 	// SEPARATE column: a run parks on at most one of the two at a time, but they never share a
-	// field. Null for a run that has never recovery-parked. Surfaced for EVERY recovery cause,
-	// not just the forge one (SC5).
+	// field. Null for a run that has never recovery-parked or an owner-held recovery park.
+	// For retained_recovery_exhausted, a timestamp (including a due one) means timed retry;
+	// null means owner-held. retained_recovery_adoption_failed always holds without a timer,
+	// regardless of any malformed supplied timestamp. Surfaced for every recovery cause (SC5).
 	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`
 	// ForgeParkCount is how many times this run has forge-parked in its lifetime (PRD #1392
 	// M1), the FORGE-ONLY counter the cap decides on — distinct from the backoff-shaping
@@ -1696,6 +1702,10 @@ type RunSummaryItemDTO struct {
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
 	// or about to fill; the run resumes at its next retry, see DiskParkCount);
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
+	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
+	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
+	// "retained_recovery_adoption_failed" is an integrity refusal: retained local work and
+	// custody are preserved, and only the owner can Resume or Cancel, without automatic retry.
 	// "empty_turn" remains reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
@@ -1729,8 +1739,10 @@ type RunSummaryItemDTO struct {
 	// queued — the retry stamp the forge-park surface counts down to ("retry at HH:MM"). It is
 	// the recovery-park analog of RetryNotBefore (the usage-limit park's stamp) and is a
 	// SEPARATE column: a run parks on at most one of the two at a time, but they never share a
-	// field. Null for a run that has never recovery-parked. Surfaced for EVERY recovery cause,
-	// not just the forge one (SC5).
+	// field. Null for a run that has never recovery-parked or an owner-held recovery park.
+	// For retained_recovery_exhausted, a timestamp (including a due one) means timed retry;
+	// null means owner-held. retained_recovery_adoption_failed always holds without a timer,
+	// regardless of any malformed supplied timestamp. Surfaced for every recovery cause (SC5).
 	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`
 	// ForgeParkCount is how many times this run has forge-parked in its lifetime (PRD #1392
 	// M1), the FORGE-ONLY counter the cap decides on — distinct from the backoff-shaping

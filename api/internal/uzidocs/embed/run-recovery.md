@@ -91,7 +91,8 @@ run can supply budget for a subsequent owner Resume, but does not itself
 queue the run. An available archive does not automatically release this
 hold's retained custody. After discarded/released precedence, an OPEN hold at
 `recovery_wait` for `worker_memory_pressure`,
-`worker_requeue_exhausted`, or `retained_recovery_exhausted` (timed or held),
+`worker_requeue_exhausted`, `retained_recovery_exhausted` (timed or held),
+or `retained_recovery_adoption_failed`,
 reports `needs_action` when its latest capture failed,
 otherwise `source_only`, before available unguarded archives or capture progress.
 Other custody attention decisions retain their existing ordering.
@@ -440,8 +441,9 @@ and process recreation within that claim preserve the window. A later verified
 claim renews only the deadline, retaining the cumulative count, source attribution
 and exponential retry cap of 16 times the base delay. A legacy episode without a
 claim fence binds once to a positively verified claim; its old claim identity is
-never inferred. Already-blocked episodes retain their original reason; only a
-`budget_exhausted` blocker can renew, and only as described below. A trusted, successfully settled real model turn resets the
+never inferred. Already-blocked episodes retain their original reason except for
+the `budget_exhausted` and owner-authorized `adoption_failed` renewals below.
+A trusted, successfully settled real model turn resets the
 reservation count. Owner Resume of `worker_requeue_exhausted` and bounded
 `retained_recovery_exhausted` retries can also renew: a fresh generation and
 higher derived episode charge one of three reservations in a new five-minute
@@ -456,10 +458,21 @@ Recovery adopts work on a fresh attempt path and model
 session even on an unwired worker; ordinary unwired keys that never entered
 retained recovery keep same-path continuity.
 
+A confirmed `adoption_failed` blocker can instead hold at `recovery_wait` /
+`retained_recovery_adoption_failed` for owner Resume or Cancel, with no timer.
+A fresh owned claim and a new raw owner grant charge one reservation in a new
+three-iteration/five-minute window; a higher derived episode alone cannot renew
+adoption. Without a new grant it reholds without capture or model execution;
+repeated adoption failure reholds. Quiescence and verification before model
+execution remain required, including an exact `ready-for-model` handoff. See
+[Retained recovery adoption failed](./run-recovery-wait.md#retained-recovery-adoption-failed)
+and the [ADR-1197 #3527 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-27-3527-owner-held-retained-adoption-retry).
+
 Other permanent blockers, or exhaustion without both durable journal confirmation
 and API support, end the run **failed** with custody kept,
 without automatic reclaim or failed-run Resume. The reason names the
-blocker: missing source, invalid clock, preservation/adoption failure,
+blocker: missing source, invalid clock, preservation failure, unsupported or
+unproven adoption recovery,
 missing or unverifiable needed prerequisites, or a fallback still oversized.
 `worker_residue_blocked` identifies an actual quiescence failure, not an
 archive or prerequisite failure. Transient capture, forge and disk failures
@@ -1351,8 +1364,9 @@ trusted unsent outcome protected against a second execution.
 
 The open hold for that originating worker and exact claim generation G
 stays in custody. An OPEN hold for `recovery_wait` /
-`worker_requeue_exhausted` or `retained_recovery_exhausted` (timed or held)
-reports `source_only`, or `needs_action` if its latest
+`worker_requeue_exhausted`, `retained_recovery_exhausted` (timed or held),
+or `retained_recovery_adoption_failed` reports `source_only`, or `needs_action`
+if its latest
 capture failed, before archive readiness or capture progress is considered.
 The same narrow OPEN-hold exception applies to `worker_memory_pressure` at
 `recovery_wait`; this worker-loss example does not make a rejected record
