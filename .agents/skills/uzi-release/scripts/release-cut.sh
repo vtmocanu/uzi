@@ -283,8 +283,12 @@ rc_tag_on_remote() {
 # PR number `#N`, else the short SHA; the oracle accepts either, so both identities are
 # carried to the already-cited check. Empty <prev> (first release ever) yields nothing.
 dependency_merge_refs() {
-  local prev="$1" sha subject f shipping manifest_only touched_cl pr short files_fd files_pid
+  local prev="$1" sha subject f shipping manifest_only touched_cl pr short files_fd files_pid commits
   [ -n "$prev" ] || return 0
+  if ! commits="$(git log --first-parent --reverse --format=%H "$prev..HEAD")"; then
+    echo 'release-cut: could not read dependency history' >&2
+    return 1
+  fi
   while IFS= read -r sha; do
     [ -n "$sha" ] || continue
     subject="$(git log -1 --format=%s "$sha")"
@@ -322,7 +326,7 @@ dependency_merge_refs() {
     short="$(git rev-parse --short "$sha")"
     if [ -n "$pr" ]; then printf '#%s\t%s\n' "$pr" "$short"; else printf '%s\t%s\n' "$short" "$short"; fi
   done <<EOF
-$(git log --first-parent --reverse --format=%H "$prev..HEAD")
+$commits
 EOF
 }
 
@@ -909,7 +913,11 @@ promote_inflight() {
 
   # Assert the promote commit changed ONLY allowlisted files, BEFORE any tag exists.
   local changed f
-  changed="$(git -C "$wt" diff --name-only "$INFLIGHT..HEAD")"
+  if ! changed="$(git -C "$wt" diff --name-only "$INFLIGHT..HEAD")"; then
+    echo 'release-cut: could not read promotion metadata diff' >&2
+    cleanup_promote
+    exit 1
+  fi
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     case "$f" in
