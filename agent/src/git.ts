@@ -11422,10 +11422,17 @@ export class GitCache {
    * fence the coordinator verified from the authenticated slot), and an attempt additionally has a `retired` ledger
    * entry for that run and path. A different or missing fence, or any other disagreement, changes nothing and
    * returns false. True when the journal was cleared by this call.
+   *
+   * `opts.retiring` is the caller's statement that an authenticated `retiring` record (whose manifest starts with
+   * exactly this clone path) already authorizes this retirement. Without it the clone's absence is never
+   * attribution, so a canonical source is never cleared and an attempt needs the ledger `retired` entry. With it a
+   * canonical source clears, and an attempt whose ledger entry is still `live` for this run and path (the crash fell
+   * between the clone move and the ledger append) gets the `retired` entry appended under this same bare lock first,
+   * exactly as retireRunnerClone writes it. An `abandoned`/`reclaimed` entry or a missing one never qualifies.
    */
   async clearRetiredCompletionJournal(barePath: string, branch: string, runId: string,
     clonePath: string, attemptId: string | undefined, expectedFence: CompletionSourceFence,
-    opts: { processProof?: () => boolean } = {}): Promise<boolean> {
+    opts: { processProof?: () => boolean; retiring?: boolean } = {}): Promise<boolean> {
     const processOpen = (): boolean => opts.processProof === undefined || opts.processProof() === true;
     if (!processOpen()) return false;
     return this.withLock(barePath, async () => {
@@ -11438,15 +11445,25 @@ export class GitCache {
       try {
         if (serializeSourceFence(pending.completionSourceFence) !== serializeSourceFence(expectedFence)) return false;
       } catch { return false; }
+      if (attemptId === undefined && opts.retiring !== true) return false;
+      let appendRetired = false;
       if (attemptId !== undefined) {
         const entry = (await this.readAttemptLedger(barePath, branch)).get(attemptId);
-        if (entry?.runId !== runId || entry.clonePath !== clonePath || entry.state !== "retired") return false;
+        if (entry?.runId !== runId || entry.clonePath !== clonePath) return false;
+        if (entry.state !== "retired") {
+          if (opts.retiring !== true || entry.state !== "live") return false;
+          appendRetired = true;
+        }
       }
       try { await fs.lstat(clonePath); return false; }
       catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
       if (!processOpen() || await this.hasPhysicalTerminalProtection(runId) || residueQuarantine() !== undefined || !processOpen()) return false;
       // Nothing may have changed the journal while the guards above awaited.
       if (await this.readRecoveryCaptureRaw(barePath, branch) !== stored.raw || !processOpen()) return false;
+      if (appendRetired) {
+        await this.appendAttemptLedger(barePath, branch, { attemptId: attemptId!, runId, clonePath, state: "retired" });
+        if (!processOpen()) return false;
+      }
       await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       return processOpen();
     });

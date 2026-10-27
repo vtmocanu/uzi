@@ -1231,8 +1231,9 @@ export class AuthorityStore {
    * discardRetainedSource, reached through retained-source-server) has already authorized exactly the paths in
    * `footprint` (the source and its paired skills dir); this stops authority state from blocking it for those
    * footprints. It admits a fresh epoch owned by this incarnation in state `retiring`, whatever the slot held:
-   * an `active` slot a crashed worker left behind, an `ineligible` slot, a published slot, or a `retiring` one
-   * (a stuck restart retirement). The retiring record is the discard's own transaction (manifest = footprint,
+   * an `active` slot a crashed worker left behind or an `ineligible` slot. It refuses a published slot and a
+   * `retiring` one that is not an earlier discard's own (a restart retirement owns those; see the checks below).
+   * The retiring record is the discard's own transaction (manifest = footprint,
    * `prior` = operatorDiscardPrior), so destructive records for the footprint are residue retries inside the
    * manifest and {@link endOperatorDiscard} tombstones the slot once the deletion is confirmed.
    *

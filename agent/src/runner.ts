@@ -3733,9 +3733,12 @@ export class RunRunner {
           processOpts) ||
           // A crash after the ledger `retired` append but before the journal clear leaves the fenced journal naming
           // the gone source: the certified clear (exact run/path/attempt and exactly the durable fence) finishes it.
-          (durable !== undefined && open() &&
+          // Only a resumed retirement may reach it: the clone's absence alone is never attribution, and the
+          // retiring record (entered before the clone move, its manifest led by exactly this clone path as
+          // verifyDurableRetirement's residue validation requires) is what attributes it.
+          (durable?.resumed === true && open() &&
             await this.git.clearRetiredCompletionJournal(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId,
-              durable.expectedFence, processOpts)) ||
+              durable.expectedFence, { ...processOpts, retiring: true })) ||
           (durable?.resumed === true && open() &&
             await this.git.completionSourceJournalAbsent(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId));
         if (!retired || !open()) return "retained";

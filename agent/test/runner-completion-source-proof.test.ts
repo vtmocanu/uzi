@@ -34,7 +34,8 @@ interface PrivateRunner {
   forgetCompletionSourceBinding(source: CompletionSource): void;
   bindCompletionSource(flight: Flight): Promise<void>;
   owedOptions(...args: unknown[]): Promise<{ context?: CompletionSource["context"] }>;
-  withCompletionSourceBoundary(source: CompletionSource, action: (open: () => boolean) => Promise<void>): Promise<"passed" | "retained">;
+  withCompletionSourceBoundary(source: CompletionSource, action: (open: () => boolean) => Promise<void>,
+    durable?: { expectedFence: unknown; resumed: boolean; enter(): Promise<void> }): Promise<"passed" | "retained">;
 }
 
 async function setup(codex = true) {
@@ -588,3 +589,49 @@ it("cleanup witness: empty cleanup never proves; leases are exact, idempotent an
     assert.equal(internals.completionCleanupWitnesses.size, 0);
   }
 });
+
+// issue #3404 M2 review: the certified journal clear after a vanished clone belongs to a RESUMED retirement only.
+const DURABLE_FENCE = { version: 1 as const, sourceUseEpoch: "0123abcd-0123-4abc-8def-0123456789ab", sourceCoreDigest: "a".repeat(64) };
+for (const shape of ["canonical", "attempt"] as const) {
+  it(`M2 boundary (${shape}): a vanished clone is retired by the certified clear only on a resumed retiring record`, async t => {
+    const f = await setup(false);
+    const bare = f.source.context.barePath, runId = f.claim.run_id;
+    let source = f.source;
+    if (shape === "canonical") {
+      const canonicalBranch = "agent/issue-3704";
+      const clone = await git.runnerCloneForBranch(bare, canonicalBranch, "m3-canonical", {
+        isLive: () => false, beforeFree: async () => { throw new Error("unexpected incumbent"); },
+      }, runId, false);
+      await git.markRecoveryCapture(bare, clone.path, canonicalBranch, runId, undefined);
+      const head = await git.worktreeHead(clone.path);
+      assert.ok(head);
+      source = { ...f.source, context: { ...f.source.context, branch: canonicalBranch }, clonePath: clone.path,
+        attemptId: undefined, expectedHead: head };
+    }
+    const ref = { runId, clonePath: source.clonePath, ...(source.attemptId === undefined ? {} : { attemptId: source.attemptId }) };
+    await git.installCompletionSourceFence(bare, source.context.branch, ref, DURABLE_FENCE);
+    const journalKey = `uzi-recovery.${source.context.branch}.clone`;
+    const configGet = (): string => execFileSync("git", ["--git-dir", bare, "config", "--get-all", journalKey], { encoding: "utf8" });
+    const ledgerKey = `uzi-attempts.${source.context.branch}.entry`;
+    const ledger = (): string => { try { return execFileSync("git", ["--git-dir", bare, "config", "--get-all", ledgerKey], { encoding: "utf8" }); } catch { return ""; } };
+    fs.rmSync(source.clonePath, { recursive: true, force: true });
+    const fenced = configGet(), ledgerBefore = ledger();
+    const reached = t.mock.method(git, "completionSourceAlreadyRetired");
+    const clear = t.mock.method(git, "clearRetiredCompletionJournal");
+    const durable = (resumed: boolean) => ({ expectedFence: DURABLE_FENCE, resumed, enter: async () => {} });
+    let actions = 0;
+    assert.equal(await f.p.withCompletionSourceBoundary(source, async () => { actions++; }, durable(false)), "retained");
+    assert.equal(reached.mock.callCount(), 1, "the vanished-clone branch was reached");
+    assert.equal(clear.mock.callCount(), 0, "no resumed retiring record: absence alone is not attribution");
+    assert.equal(actions, 0);
+    assert.equal(configGet(), fenced, "the fenced journal is unchanged");
+    assert.equal(ledger(), ledgerBefore, "the ledger is unchanged");
+    // The same state under a resumed retiring record: the attempt (ledger still live, crash before the append) and the
+    // canonical source both complete, and the attempt's ledger now says retired.
+    assert.equal(await f.p.withCompletionSourceBoundary(source, async () => { actions++; }, durable(true)), "passed");
+    assert.equal(clear.mock.callCount(), 1);
+    assert.equal(actions, 1);
+    assert.equal(configGet().trim(), "", "the journal was cleared");
+    if (shape === "attempt") assert.match(ledger(), /"state":"retired"/);
+  });
+}
