@@ -269,6 +269,60 @@ describe("completion retirement consumes the fence", () => {
   });
 });
 
+describe("a fenced journal is never cleared or rewritten without its fence by a non-certified path", () => {
+  let strict: GitCache;
+  const configBytes = (): Buffer => fs.readFileSync(path.join(bare, "config"));
+  const unfence = (): void => {
+    const { completionSourceFence: _drop, ...plain } = journal();
+    gitIn(bare, ["config", `uzi-recovery.${BRANCH}.clone`, JSON.stringify(plain)]);
+  };
+
+  beforeEach(async () => {
+    strict = new GitCache(fx.dataDir, nullLogger(), undefined,
+      testGitCacheOptions({ authority: recorder([]), authorityRequired: true }));
+    await cache.installCompletionSourceFence(bare, BRANCH, expected(), FENCE);
+  });
+
+  it("orphan reclaim (retireRunnerClone without a completion source) retains the clone and the journal", async () => {
+    const before = configBytes();
+    await assert.rejects(strict.retireRunnerClone(bare, clonePath, BRANCH, RUN, { discard: false }), /completion source fence/);
+    assert.ok(fs.existsSync(path.join(clonePath, ".git")), "the clone is untouched");
+    assert.deepEqual(configBytes(), before, "the journal is untouched");
+    // The same call on a journal without a fence still reclaims, so the refusal is the fence's.
+    unfence();
+    await strict.retireRunnerClone(bare, clonePath, BRANCH, RUN, { discard: false });
+    assert.equal(gitIn(bare, ["config", "--get", `uzi-recovery.${BRANCH}.clone`]), "");
+  });
+
+  it("releaseAttemptInPlace refuses before the ledger append or the clear", async () => {
+    const before = configBytes();
+    await assert.rejects(strict.releaseAttemptInPlace(bare, clonePath, BRANCH, RUN, "reclaimed"), /completion source fence/);
+    assert.deepEqual(configBytes(), before);
+    unfence();
+    await strict.releaseAttemptInPlace(bare, clonePath, BRANCH, RUN, "reclaimed");
+    assert.equal(gitIn(bare, ["config", "--get", `uzi-recovery.${BRANCH}.clone`]), "");
+  });
+
+  it("stopped-source retention answers unknown and writes nothing", async () => {
+    const before = configBytes();
+    assert.equal(await strict.markStoppedCanonical(bare, BRANCH, KEY, { runId: RUN, clonePath, generation: null, reason: "test" }), "unknown");
+    assert.deepEqual(configBytes(), before);
+    unfence();
+    assert.equal(await strict.markStoppedCanonical(bare, BRANCH, KEY, { runId: RUN, clonePath, generation: null, reason: "test" }), "retained");
+  });
+
+  it("adopting a successor over a fenced episode refuses before any effect (the successor object carries no fence)", async () => {
+    const source = reconstructionSource();
+    const r = await cache.reserveRecoveryIteration(bare, BRANCH, KEY, source);
+    await cache.recordRecoveryCapture(bare, BRANCH, KEY, source, r.attempts, gitIn(clonePath, ["rev-parse", "HEAD"]));
+    const before = configBytes();
+    const entries = fs.readdirSync(path.dirname(clonePath));
+    await assert.rejects(strict.prepareRecoverySuccessor(bare, BRANCH, KEY, source, r.attempts, aid(2)), /completion source fence/);
+    assert.deepEqual(configBytes(), before);
+    assert.deepEqual(fs.readdirSync(path.dirname(clonePath)), entries, "no successor clone was created");
+  });
+});
+
 describe("authority hooks", () => {
   it("authorityRequired without hooks refuses the seed before any effect", async () => {
     const required = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ authorityRequired: true }));

@@ -3507,9 +3507,10 @@ export class RunRunner {
           installFence: async () => {
             const expected = { runId, clonePath: bound.clonePath, ...(bound.attemptId === undefined ? {} : { attemptId: bound.attemptId }) };
             const fence = sourceFenceOf(certified);
-            // A fence an earlier, never-completed publication (or a published source this clone later resumed
-            // from) left behind is replaced only when the authority slot proves it dead: this publication's
-            // lease is the slot's current, active, owned epoch, and the old fence names a different epoch.
+            // A fence an earlier, never-completed publication left behind (a published source is never resumed:
+            // GitCache refuses a fenced journal) is replaced only when the authority slot proves it dead: this
+            // publication's lease is the slot's current, active, owned epoch, and the old fence names a
+            // different epoch.
             const old = await this.git.readCompletionSourceFence(barePath, branch, expected);
             let replaceStale: { expectedOld: typeof fence } | undefined;
             if (old !== undefined && serializeSourceFence(old) !== serializeSourceFence(fence)) {

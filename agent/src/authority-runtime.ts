@@ -586,7 +586,9 @@ export class AuthorityRuntime implements AuthorityScope {
       const held = this.#leases.get(key);
       const slot = held ? await this.#slotOf(tx, store, key) : null;
       // A held lease is kept only when it is this flight's harness: a Claude flight never inherits a Codex lease.
-      if (held && slot && this.#ownedActive(store, slot, held) &&
+      // A lease with a queued end is never re-adopted: its flight ended, so a later flight needs a fresh epoch
+      // (adopting it would let that queued end retire the slot under the new flight).
+      if (held && slot && this.#ends.get(key) !== held && this.#ownedActive(store, slot, held) &&
           (executorIncarnation === undefined ? leaseHarness(held) === "claude" : slot.owner.executor === executorIncarnation)) return held;
       if (executorIncarnation === undefined) return this.#mint(tx, store, key);
       const lease = await store.admitSourceUse(tx, key, { executor: executorIncarnation });
@@ -665,7 +667,7 @@ export class AuthorityRuntime implements AuthorityScope {
     if (op === "normalize") {
       const held = this.#leases.get(key);
       const slot = held ? await this.#slotOf(tx, store, key) : null;
-      if (held && slot && this.#ownedActive(store, slot, held)) {
+      if (held && slot && this.#ends.get(key) !== held && this.#ownedActive(store, slot, held)) {
         this.#note(key);
         await store.admitSourceUse(tx, key, { lease: held });
         return;

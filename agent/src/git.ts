@@ -7263,6 +7263,22 @@ export class GitCache {
     await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), value]);
   }
 
+  /**
+   * issue #3404 M2: whether clearing or rewriting-without-it `journal` would drop a completion-source
+   * fence. The fence is the rollback protection for a published source, so under authority only a
+   * certified completion retirement (retireRunnerClone with the matching expectedFence) may remove it.
+   */
+  private dropsFence(journal: RecoveryJournalEntry | undefined): boolean {
+    return this.authorityRequired && journal?.completionSourceFence !== undefined;
+  }
+
+  /** Throws {@link CompletionSourceFenceError} before any effect when {@link dropsFence}. */
+  private refuseFenceDrop(journal: RecoveryJournalEntry | undefined, op: string): void {
+    if (this.dropsFence(journal)) {
+      throw new CompletionSourceFenceError(`${op}: the journal carries a completion source fence; only a certified retirement may clear it`);
+    }
+  }
+
   private async recoveryClockCurrent(barePath: string, branch: string, journal: RecoveryJournalEntry, handoffComplete = false): Promise<boolean> {
     const recovery = journal.recovery!;
     const now = Date.now();
@@ -7334,6 +7350,7 @@ export class GitCache {
   private async healBoundStoppedJournal(barePath: string, branch: string, stored: { journal: RecoveryJournalEntry; raw: string }): Promise<boolean> {
     const { journal, raw } = stored;
     if (journal.attemptId !== undefined || journal.recovery || journal.retainedSources?.length) return false;
+    if (this.dropsFence(journal)) return false;
     if (residueQuarantine() !== undefined) return false;
     const markers = await this.readStoppedMarkers(barePath);
     const named = JSON.stringify(journal.clonePath).slice(1, -1);
@@ -7772,6 +7789,8 @@ export class GitCache {
       const recovery = journal.recovery;
       if (!recovery || recovery.stage !== "captured" || recovery.attempts !== iteration ||
           !recovery.restoreTip || !await this.recoveryClockCurrent(barePath, branch, journal)) throw new Error("successor iteration is not current");
+      // The successor journal below is a fresh object that deliberately omits the fence.
+      this.refuseFenceDrop(journal, "adopt successor");
       const tip = recovery.restoreTip;
       const pin = `refs/uzi-recovery-episode/${journal.runId}/${tip}`;
       if ((await this.runGit(barePath, ["rev-parse", "--verify", pin])).trim() !== tip) throw new Error("recovery pin changed");
@@ -8138,6 +8157,7 @@ export class GitCache {
         if (!(await this.realCloneDir(source.clonePath))) return "unknown";
         const pending = await this.readRecoveryCapture(barePath, branch);
         const named = pending !== undefined && sameRecoverySource(pending, source);
+        if (named && this.dropsFence(pending)) return "unknown";
         if (residueQuarantine() !== undefined) return named ? "retained" : "unknown";
         if (entry.state === "live") {
           await this.appendAttemptLedger(barePath, branch, { ...entry, state: "reclaimed" });
@@ -8188,7 +8208,7 @@ export class GitCache {
         if (input.generation !== null && (!Number.isSafeInteger(input.generation) || input.generation < 0)) return "unknown";
         const current = await this.readRecoveryCaptureWithRaw(barePath, branch);
         if (current && (current.journal.attemptId !== undefined || current.journal.recovery || current.journal.retainedSources?.length ||
-            !sameRecoverySource(current.journal, source))) return "unknown";
+            !sameRecoverySource(current.journal, source) || this.dropsFence(current.journal))) return "unknown";
         if (!(await this.realCloneDir(source.clonePath))) return "unknown";
         const markers = await this.readStoppedMarkers(barePath);
         if (markers.overflow.has(input.runId) || markers.malformed.some((m) => m.runId === input.runId)) return "unknown";
@@ -9939,6 +9959,7 @@ export class GitCache {
       if (pending?.runId !== runId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, runId);
       }
+      this.refuseFenceDrop(pending, "releaseAttemptInPlace");
       // Episodes retain source attribution/accounting; ordinary legacy release still clears.
       // issue #2213: a latch that landed during the lock wait / journal read keeps the journal.
       if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
@@ -11364,7 +11385,7 @@ export class GitCache {
       if (!processOpen()) return false;
       if (pending && (pending.runId !== runId || pending.clonePath !== clonePath || pending.attemptId !== attemptId))
         return false; // A successor/adoption owns this branch now.
-      if (pending?.recovery || pending?.retainedSources?.length) return false;
+      if (pending?.recovery || pending?.retainedSources?.length || this.dropsFence(pending)) return false;
       try { await fs.lstat(clonePath); return false; }
       catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
       if (!await open()) return false;
@@ -11487,6 +11508,9 @@ export class GitCache {
       if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, ownerRunId);
       }
+      // issue #3404 M2: only a certified completion retirement (checked against its expectedFence below)
+      // may clear a fenced journal; any other retirement (orphan reclaim included) refuses before effects.
+      if (!opts.completionSource) this.refuseFenceDrop(pending, "retireRunnerClone");
       // issue #1786: a marked stopped canonical source is retired only by the operator discard.
       checkProcessProof();
       await this.refuseMarkedPaths(barePath, [clonePath], ownerRunId);

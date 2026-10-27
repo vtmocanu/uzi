@@ -601,6 +601,26 @@ describe("ending a source use", () => {
     assert.equal(slot?.state, "ineligible");
   });
 
+  it("a lease with a queued end is not re-adopted by the next flight, so the end cannot retire the next flight's epoch", async (t) => {
+    const r = await rig(t);
+    const l1 = await r.rt.bindSource(r.clone);
+    const settlement = await r.rt.withTransaction(() => r.rt.hooks.beginDestructive([r.clone], "runner-uid-delete"));
+    assert.deepEqual(await r.rt.endSourceUse([r.clone]), { ended: [], kept: [r.clone] }, "flight 1's end is queued behind the running record");
+    // Flight 2 binds the same clone while flight 1's end is still queued behind the running record: it must not
+    // be handed flight 1's lease (whose queued end would later retire flight 2's slot).
+    await assert.rejects(r.rt.bindSource(r.clone), /unresolved pending footprint/);
+    await r.rt.withTransaction(() => settlement.settle({ ok: true }));
+    await r.rt.withTransaction(async () => undefined); // acquiring A applies the queued end
+    assert.equal((await slotOf(r.rt, r.clone))?.state, "ineligible", "flight 1's end applied to flight 1's epoch");
+    const l2 = await r.rt.bindSource(r.clone);
+    assert.notEqual(leaseEpoch(l2), leaseEpoch(l1), "a fresh epoch, never flight 1's");
+    await r.rt.withTransaction(async () => undefined);
+    const slot = await slotOf(r.rt, r.clone);
+    assert.equal(slot?.state, "active", "flight 2's slot stays active");
+    assert.equal(slot?.epoch, leaseEpoch(l2));
+    await r.rt.assertLaunchable(r.clone, l2, undefined);
+  });
+
   it("recordAdmissions names every path an admission touched, including one that was refused", async (t) => {
     const r = await rig(t);
     const sink = new Set<string>();

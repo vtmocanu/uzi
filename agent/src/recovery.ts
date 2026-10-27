@@ -5847,7 +5847,13 @@ export function validCompletionSource(value: unknown): value is CompletionSource
  * directory. That worker cannot reach release() for such a run: publication installs the completionSourceFence in
  * the bare journal BEFORE rewriting any record, and the old parseRecoveryJournal rejects the fence key, so the old
  * worker's attach of the run's branch (runnerCloneForBranch) fails closed before its completed-run release. The
- * protection therefore rests on the fence staying in the journal for as long as any record is V2.
+ * protection therefore rests on the fence staying in the journal for as long as any record is V2. Under
+ * authorityRequired, GitCache keeps it there: retireRunnerClone without a matching completionSource.expectedFence
+ * (orphan reclaim included), releaseAttemptInPlace, prepareRecoverySuccessor, markStoppedCanonical,
+ * retainStoppedAttempt, the stopped-journal heal and the already-retired check all refuse or retain a fenced
+ * journal before any effect. The only removals are the certified completion retirement (which verifies the
+ * fence it clears) and the guarded operator discard (discardRetained*, which carries its own authority); every
+ * other journal rewrite spreads the existing journal and so carries the fence along.
  */
 function decodePersistedCompletionSource(value: unknown): CompletionSource | CompletionSourceV2 | undefined {
   if (value && typeof value === "object" && !Array.isArray(value) && (value as { version?: unknown }).version !== undefined) {

@@ -610,25 +610,29 @@ describe("a stale fence never wedges a clone", () => {
     assert.equal(await eligibleRecords(r), 3);
   });
 
-  it("published, then resumed without a receipt on a new epoch, republishes over the old fence", async t => {
-    const r = await rig(t, { codex: false, cohort: 2 });
-    await r.end();
-    const old = fenceOf(r) as { sourceUseEpoch: string };
-    assert.equal((await slotOf(r))?.state, "claude_ready");
-    assert.equal(await eligibleRecords(r), 2);
-
-    // Consuming the publication (the seed admission) mints the new epoch; the records go back to the bound core.
-    await resume(r, () => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical")));
-    assert.equal(readRecords(r).some(isV2), false, "re-binding rewrote the records to the bare core");
-    assert.equal(await eligibleRecords(r), 0);
-    await r.end();
-    const slot = await slotOf(r);
-    assert.equal(slot?.state, "claude_ready");
-    const fence = fenceOf(r) as { sourceUseEpoch: string };
-    assert.notEqual(fence.sourceUseEpoch, old.sourceUseEpoch);
-    assert.equal(fence.sourceUseEpoch, slot?.epoch);
-    assert.equal(await eligibleRecords(r), 2);
-  });
+  // A published source is not resumed in production: git.ts throws PendingRecoveryCaptureError for a journal
+  // that carries a fence before any seed can consume it, so only a never-completed publication's fence is replaced.
+  for (const [label, disturb] of [
+    ["the slot was replaced by a fresh active epoch", (r: Rig) => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"))],
+    ["the slot is retiring under an operator discard", (r: Rig) => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "discard"))],
+  ] as const) {
+    it(`a stale fence is not replaced when ${label}`, async t => {
+      const r = await rig(t, { codex: false, cohort: 2 });
+      const stale = r.flight.sourceLease;
+      const foreign = { version: 1 as const, sourceUseEpoch: randomUUID(), sourceCoreDigest: "c".repeat(64) };
+      await git.installCompletionSourceFence(r.bare, BRANCH, { runId: r.runId, clonePath: r.clone, attemptId: r.bound.attemptId! }, foreign);
+      await disturb(r);
+      const slotBefore = await slotOf(r);
+      const before = snapshotFiles(r);
+      r.flight.sourceLease = stale;
+      await r.end();
+      assert.deepEqual(fenceOf(r), foreign, "the stale fence is untouched");
+      assert.deepEqual(snapshotFiles(r), before);
+      assert.equal(readRecords(r).some(isV2), false);
+      assert.equal((await slotOf(r))?.epoch, slotBefore?.epoch, "the slot's epoch is not adopted");
+      assert.notEqual((await slotOf(r))?.state, "claude_ready");
+    });
+  }
 });
 
 describe("crash-era temps do not block publication", () => {
