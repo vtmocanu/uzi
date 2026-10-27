@@ -83,6 +83,8 @@ interface AuthState {
   // banner, and the "waiting for vault unlock" run state. Defaults to true (a
   // server that predates the field, or a signed-out visitor, shows no banner).
   vaultUnlocked: boolean;
+  vaultMode?: "protected" | "unprotected";
+  vaultPolicy?: "optional" | "required";
   // vaultExists is whether the user has a vault row at all; hasPassword is false for
   // OIDC-only users (PRD #45). Together they let the locked banner choose between the
   // passphrase-create dialog (passwordless + no vault yet) and the unlock banner.
@@ -99,7 +101,7 @@ interface AuthState {
   register: (email: string, password: string, displayName: string) => Promise<void>;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
-  refresh: () => Promise<void>;
+  refresh: (fresh?: boolean) => Promise<void>;
   // Apply an authoritative current-user DTO returned by a successful settings save.
   updateUser: (savedUser: User) => void;
   // serverUnreachable is true when the session probe failed for a reason other than
@@ -129,18 +131,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [appearance, setAppearance] = useState<AppearanceState>(() =>
     fallbackAppearance("ember", null, "ember"),
   );
+  const [vaultMode, setVaultMode] = useState<"protected" | "unprotected">("protected");
+  const [vaultPolicy, setVaultPolicy] = useState<"optional" | "required">("required");
   const [vaultUnlocked, setVaultUnlocked] = useState(true);
   const [vaultExists, setVaultExists] = useState(true);
   const [hasPassword, setHasPassword] = useState(true);
   const [judgeEnforcedByAdmin, setJudgeEnforcedByAdmin] = useState(false);
   const [effectiveJudgeModel, setEffectiveJudgeModel] = useState("");
   const [serverUnreachable, setServerUnreachable] = useState(false);
-  // At most one session probe is in flight: a refresh while one is pending joins it,
-  // so probe results can never settle out of order. sessionGen is bumped by an
+  // Ordinary refreshes join a pending probe. A fresh refresh after a vault mutation
+  // supersedes it immediately; sessionGen drops the older response. It is also bumped by an
   // explicit login, register, logout, settings update or another request's 401;
   // a probe started before one of those drops its result rather than undoing it.
   const probeInFlight = useRef<Promise<void> | null>(null);
   const sessionGen = useRef(0);
+  const probeToken = useRef<object | null>(null);
 
   // applySession records the user and the instance labels from a session
   // response, falling back to the compiled-in defaults for a server that predates
@@ -170,6 +175,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       typeface: nextAppearance.typeface,
     });
     // Absent field (older server) reads as unlocked, so no spurious banner.
+    setVaultMode(session.vault?.mode ?? "protected");
+    setVaultPolicy(session.vault?.policy ?? "required");
     setVaultUnlocked(session.vault?.unlocked ?? true);
     // Absent → true so a password user / older server never sees the create dialog.
     setVaultExists(session.vault?.exists ?? true);
@@ -190,9 +197,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser((current) => (current?.id === savedUser.id ? savedUser : current));
   }, []);
 
-  const refresh = useCallback(() => {
+  const refresh = useCallback(async (fresh = false) => {
+    if (fresh) {
+      sessionGen.current += 1;
+      probeInFlight.current = null;
+    }
     if (probeInFlight.current) return probeInFlight.current;
     const gen = sessionGen.current;
+    const token = {};
+    probeToken.current = token;
     const probe = (async () => {
       try {
         const session = await api.me();
@@ -211,7 +224,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
         setLoading(false);
       } finally {
-        probeInFlight.current = null;
+        if (probeToken.current === token) probeInFlight.current = null;
       }
     })();
     probeInFlight.current = probe;
@@ -321,6 +334,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       uziLabel,
       autopilotLabel,
       appearance,
+      vaultMode,
+      vaultPolicy,
       vaultUnlocked,
       vaultExists,
       hasPassword,
@@ -340,6 +355,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       uziLabel,
       autopilotLabel,
       appearance,
+      vaultMode,
+      vaultPolicy,
       vaultUnlocked,
       vaultExists,
       hasPassword,

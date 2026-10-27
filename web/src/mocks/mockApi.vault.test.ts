@@ -277,3 +277,13 @@ describe("mock vault mode API", () => {
     expect(await ownAdminRow()).toMatchObject({ vault_mode: "unprotected", vault_locked: false });
   });
 });
+
+
+it.each(["optional", "required"])("new mock registrations follow %s policy without changing existing users", async policy => {
+  appSettings.vault_policy = policy;
+  const registered = await mockApi.register("new@example.com", "demo-password", "New user");
+  expect(registered.vault).toEqual(policy === "optional"
+    ? { mode: "unprotected", policy: "optional", exists: false, unlocked: false }
+    : { mode: "protected", policy: "required", exists: true, unlocked: true });
+  expect((await mockApi.getSettings()).unprotected_users).toBe(policy === "optional" ? 1 : 0);
+});

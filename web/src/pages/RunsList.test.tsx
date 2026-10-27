@@ -531,6 +531,15 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
     expect(screen.getByText("queued")).toBeTruthy();
   });
 
+  it("off users with an uncached vault get the ordinary queued state", async () => {
+    vi.mocked(useAuth).mockReturnValue({ user: { is_admin: false }, vaultUnlocked: false, vaultMode: "unprotected" } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "q", issue_title: "Off queued run", status: "queued" })] });
+    renderRuns();
+    await screen.findByText("Off queued run");
+    expect(screen.getByText("queued")).toBeTruthy();
+    expect(screen.queryByText(/waiting for vault unlock/)).toBeNull();
+  });
+
   it("renders a plain queued pill when the vault is unlocked", async () => {
     vi.mocked(useAuth).mockReturnValue({
       user: { is_admin: false },

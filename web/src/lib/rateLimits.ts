@@ -173,14 +173,14 @@ export interface StatusBadge {
 // green "Live" pill because no window has crossed 95 (Decision 3). A stale row is
 // a neutral pill: "vault locked" when the vault is the cause (Decision 3), else
 // "stale". vaultLocked has no bearing on a live row.
-export function statusBadge(limits: MyRateLimits, vaultLocked: boolean): StatusBadge {
+export function statusBadge(limits: MyRateLimits, vaultLocked: boolean, vaultMode?: "protected" | "unprotected"): StatusBadge {
   switch (rowState(limits)) {
     case "no_token":
       return { tone: "neutral", label: "no token", dot: false };
     case "unavailable":
       return { tone: "neutral", label: "no reading yet", dot: false };
     case "stale":
-      return { tone: "neutral", label: vaultLocked ? "🔒 vault locked" : "stale", dot: false };
+      return { tone: "neutral", label: vaultLocked && vaultMode !== "unprotected" ? "🔒 vault locked" : "stale", dot: false };
     case "live_ok":
     case "live_warn":
       return { tone: "ok", label: "Live", dot: true };

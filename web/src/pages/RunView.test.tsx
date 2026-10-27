@@ -5325,6 +5325,14 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     }
   });
 
+  it("off viewers retain another owner's recovery state without their own unlock hint", () => {
+    mockUseAuth.mockReturnValue({ vaultUnlocked: false, vaultMode: "unprotected" } as unknown as ReturnType<typeof useAuth>);
+    const { container } = render(<RecoveryWaitPanel run={vaultPark()} />);
+    expect(container.textContent).toContain("The run owner's explicit vault unlock queues this run promptly");
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("Waiting for vault unlock");
+    expect(container.textContent).not.toContain("If this is your run, unlock your vault with the banner at the top of the page.");
+  });
+
   it("vault_locked with no retry stamp drops the time, not the sentence", () => {
     viewerVault(true);
     const { container } = render(

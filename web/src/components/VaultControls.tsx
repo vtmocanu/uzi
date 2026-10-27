@@ -6,18 +6,20 @@
 import { useCallback, useState, type FormEvent } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError } from "../lib/api";
+import { emitSidebarTokensChanged } from "../lib/sidebarTokens";
 import { errorMessage } from "../lib/apiError";
 import { Badge, Button, Input, cx } from "./ui";
 
 // VaultBadge is the compact lock/unlock status pill. `compact` (the collapsed
 // sidebar rail) renders just the glyph with the description as a tooltip.
 export function VaultBadge({ compact = false }: { compact?: boolean }) {
-  const { vaultUnlocked } = useAuth();
+  const { vaultUnlocked, vaultMode, hasPassword } = useAuth();
+  if (vaultMode === "unprotected") return compact ? null : <Badge tone="neutral">Vault off</Badge>;
   const glyph = vaultUnlocked ? "🔓" : "🔒";
   const label = vaultUnlocked ? "Vault unlocked" : "Vault locked";
   const title = vaultUnlocked
     ? "Your secret vault is unlocked — your agents can run."
-    : "Your secret vault is locked — unlock it with your password to resume your agents.";
+    : `Your secret vault is locked — unlock it with your ${hasPassword === false ? "passphrase" : "password"} to resume your agents.`;
 
   if (compact) {
     return (
@@ -44,7 +46,8 @@ export function useVaultLock(onLocked?: () => void) {
     setLocking(true);
     try {
       await api.vaultLock();
-      await refresh();
+      await refresh(true);
+      emitSidebarTokensChanged();
       onLocked?.();
     } finally {
       setLocking(false);
@@ -60,8 +63,8 @@ export function useVaultLock(onLocked?: () => void) {
 // signed out. The `=== false` checks are deliberate: an undefined bit (older server
 // or a partial mock) never falls into the passwordless branch.
 export function VaultLockedBanner() {
-  const { user, vaultUnlocked, hasPassword, vaultExists } = useAuth();
-  if (!user || vaultUnlocked) return null;
+  const { user, vaultMode, vaultUnlocked, hasPassword, vaultExists } = useAuth();
+  if (!user || vaultMode === "unprotected" || vaultUnlocked) return null;
   if (hasPassword === false && vaultExists === false) return <VaultPassphraseCreate />;
   return <VaultUnlockBanner credential={hasPassword === false ? "passphrase" : "password"} />;
 }
@@ -92,7 +95,8 @@ function VaultUnlockBanner({ credential }: { credential: "password" | "passphras
       await api.vaultUnlock(secret);
       setSecret("");
       setFailures(0);
-      await refresh();
+      await refresh(true);
+      emitSidebarTokensChanged();
     } catch (err) {
       const next = failures + 1;
       setFailures(next);
@@ -187,7 +191,8 @@ function VaultPassphraseCreate() {
       await api.vaultCreatePassphrase(passphrase);
       setPassphrase("");
       setConfirm("");
-      await refresh();
+      await refresh(true);
+      emitSidebarTokensChanged();
     } catch (err) {
       setError(
         errorMessage(err, "Failed to set your vault passphrase."),
@@ -250,4 +255,13 @@ function VaultPassphraseCreate() {
       </div>
     </div>
   );
+}
+
+
+export function VaultRequiredPrompt() {
+  const { user, vaultMode, vaultPolicy } = useAuth();
+  if (!user || vaultMode !== "unprotected" || vaultPolicy === "optional") return null;
+  return <div role="alert" className="mb-4 rounded-lg border border-warn/40 p-3 text-sm">
+    Your administrator requires credential protection. Protection is currently off. <a href="/settings">Enable your vault in Settings</a>.
+  </div>;
 }

@@ -557,7 +557,7 @@ export function RunRow({
 // them and the layout must stay role-agnostic.
 export function RunsList() {
   const demo = useDemoMode();
-  const { user, vaultUnlocked } = useAuth();
+  const { user, vaultUnlocked, vaultMode } = useAuth();
   const isAdmin = !!user?.is_admin;
   // Issue #256 M3: a 1s tick drives the live duration token on every row; the 10s
   // data poll (PRD #518) refreshes the rows but does not re-derive the token between
@@ -651,7 +651,7 @@ export function RunsList() {
                       key={r.id}
                       run={r}
                       now={now}
-                      waitingForVault={!vaultUnlocked && r.status === "queued"}
+                      waitingForVault={vaultMode !== "unprotected" && !vaultUnlocked && r.status === "queued"}
                       showCredential={showsRunAccounts(credentialCounts)}
                       credentialCount={credentialCounts[r.harness]}
                       // The personal Active list is all the viewer's own runs, so the

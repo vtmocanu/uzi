@@ -1617,13 +1617,13 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
  * A separate component so useAuth runs only while this park is on screen.
  */
 function VaultLockedParkBody({ retryAt }: { retryAt: string | null }) {
-  const { vaultUnlocked } = useAuth();
+  const { vaultUnlocked, vaultMode } = useAuth();
   return (
     <>
       <p className="mt-0.5 text-xs text-muted">
         {`The run owner's vault was locked when this Codex run needed its credential. The run owner's explicit vault unlock queues this run promptly; work resumes when a worker picks it up. Scheduled retry fallback${retryAt ? ` (${retryAt})` : ""}.`}
       </p>
-      {!vaultUnlocked && (
+      {vaultMode !== "unprotected" && !vaultUnlocked && (
         <p className="mt-1.5 text-xs text-muted">
           If this is your run, unlock your vault with the banner at the top of the page.
         </p>

@@ -26,10 +26,12 @@ function deferredFetch() {
 }
 
 function Probe() {
-  const { user, loading, retry } = useAuth();
+  const { user, loading, retry, refresh, vaultMode, vaultPolicy, vaultUnlocked } = useAuth();
   return (
     <>
       <span data-testid="user">{user?.id ?? "none"}</span>
+      <span data-testid="vault">{vaultMode}/{vaultPolicy}/{String(vaultUnlocked)}</span>
+      <button onClick={() => void refresh(true)}>fresh session</button>
       <span data-testid="loading">{String(loading)}</span>
       <button type="button" onClick={() => void retry()}>
         retry
@@ -145,4 +147,28 @@ it("another request's 401 stops a pending probe from restoring the session", asy
   });
   expect(screen.getByTestId("user").textContent).toBe("none");
   expect(screen.getByTestId("loading").textContent).toBe("false");
+});
+
+
+it("fresh vault refresh invalidates a pending session and fetches post-toggle mode", async () => {
+  const resolves = deferredFetch();
+  render(<AuthProvider><Probe /></AuthProvider>);
+  await act(async () => { screen.getByText("fresh session").click(); });
+  await act(async () => {
+    resolves[0](new Response(JSON.stringify({ ...session, vault: { mode: "protected", policy: "required", unlocked: false } }), { status: 200 }));
+  });
+  expect(screen.getByTestId("user").textContent).toBe("none");
+  expect(resolves).toHaveLength(2);
+  await act(async () => {
+    resolves[1](new Response(JSON.stringify({ ...session, vault: { mode: "unprotected", policy: "optional", unlocked: false } }), { status: 200 }));
+  });
+  expect(screen.getByTestId("vault").textContent).toBe("unprotected/optional/false");
+  expect(screen.getByTestId("user").textContent).toBe("u1");
+});
+
+it("older servers retain protected/required defaults", async () => {
+  const resolves = deferredFetch();
+  render(<AuthProvider><Probe /></AuthProvider>);
+  await act(async () => { resolves[0](new Response(JSON.stringify(session), { status: 200 })); });
+  expect(screen.getByTestId("vault").textContent).toBe("protected/required/true");
 });

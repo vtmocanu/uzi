@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { VaultBadge, VaultLockedBanner } from "./VaultControls";
+import { VaultBadge, VaultLockedBanner, VaultRequiredPrompt } from "./VaultControls";
 import { api, ApiError } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
@@ -158,4 +158,34 @@ describe("VaultLockedBanner passwordless (SSO) dispatch", () => {
     expect(button().disabled).toBe(false);
     expect(mockApi.vaultCreatePassphrase).not.toHaveBeenCalled();
   });
+});
+
+
+describe("off vault", () => {
+  it.each([true, false])("suppresses automatic unlock/enrollment with hasPassword=%s", (hasPassword) => {
+    setAuth({ vaultMode: "protected", vaultUnlocked: false, vaultExists: false, hasPassword });
+    const view = render(<VaultLockedBanner />);
+    expect(screen.getByLabelText(hasPassword ? "Vault password" : "Vault passphrase")).toBeTruthy();
+    setAuth({ vaultMode: "unprotected", vaultUnlocked: false, vaultExists: false, hasPassword });
+    view.rerender(<VaultLockedBanner />);
+    expect(view.container.firstChild).toBeNull();
+    expect(mockApi.vaultUnlock).not.toHaveBeenCalled();
+    expect(mockApi.vaultCreatePassphrase).not.toHaveBeenCalled();
+  });
+  it("shows a neutral off badge even when unlocked is false", () => {
+    setAuth({ vaultMode: "unprotected", vaultUnlocked: false });
+    render(<VaultBadge />);
+    expect(screen.getByText("Vault off")).toBeTruthy();
+  });
+});
+
+
+it("keeps required enrollment visible for off users without automatic secret prompts", () => {
+  setAuth({ vaultMode: "unprotected", vaultPolicy: "required", hasPassword: false, vaultExists: false, vaultUnlocked: false });
+  const view = render(<><VaultRequiredPrompt /><VaultLockedBanner /></>);
+  expect(screen.getByRole("link", { name: "Enable your vault in Settings" }).getAttribute("href")).toBe("/settings");
+  expect(view.container.querySelector("input")).toBeNull();
+  setAuth({ vaultMode: "unprotected", vaultPolicy: "optional" });
+  view.rerender(<VaultRequiredPrompt />);
+  expect(view.container.firstChild).toBeNull();
 });

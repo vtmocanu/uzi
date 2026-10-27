@@ -15,7 +15,7 @@ import { presetAssetForSlug, presetForSlug } from "../lib/brandPresets";
 import { CountPill, cx, type CountPillTone } from "./ui";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail, maskName, maskRepoPath } from "../lib/demoMask";
-import { VaultBadge, VaultLockedBanner } from "./VaultControls";
+import { VaultBadge, VaultLockedBanner, VaultRequiredPrompt } from "./VaultControls";
 import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { HealthDangerBanner } from "./HealthDangerBanner";
 import { healthPipLabel } from "../lib/healthView";
@@ -1391,6 +1391,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div className={cx(!fullBleed && "mx-auto w-full max-w-[68rem]")}>
           {/* Vault locked banner (PRD #32): app-wide so the user can unlock from
               any page. Self-gates — renders nothing while unlocked. */}
+          <VaultRequiredPrompt />
           <VaultLockedBanner />
           {/* Update escalation banner (PRD #836 M6): app-wide, admin-only, self-gating —
               renders nothing unless the server says the instance is far behind and the

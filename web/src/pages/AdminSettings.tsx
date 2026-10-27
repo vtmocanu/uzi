@@ -147,6 +147,8 @@ export function AdminSettings() {
   // Vault migration progress (PRD #32): stored secrets still using pre-vault
   // (master-key) encryption. Fetched separately so a failure never blocks the
   // settings form; null = unknown/not-yet-loaded, rendered only when > 0.
+  const [vaultPolicy, setVaultPolicy] = useState("required");
+  const [unprotectedUsers, setUnprotectedUsers] = useState<number | null>(null);
   const [masterSealed, setMasterSealed] = useState<number | null>(null);
 
   // applyResponse fans a GET/PUT response out to the label-form fields and the
@@ -155,6 +157,8 @@ export function AdminSettings() {
   const applyResponse = useCallback((resp: SettingsResponse) => {
     const { settings, secrets: sec, sources: src } = resp;
     setSaved(settings);
+    setVaultPolicy(settings.vault_policy ?? "required");
+    setUnprotectedUsers(resp.unprotected_users ?? null);
     setSecrets(sec ?? {});
     setSources(src ?? {});
     setDefaults(resp.defaults ?? {});
@@ -275,6 +279,7 @@ export function AdminSettings() {
     ...(masterSealed !== null && masterSealed > 0
       ? [{ id: "vault-migration", label: "Vault migration" }]
       : []),
+    { id: "vault-policy", label: "Credential protection" },
     { id: "forge-labels", label: "Forge labels" },
     ...(!loading && saved ? [{ id: "run-judge", label: "Run judge" }] : []),
     ...(!loading && oidcStatus !== "disabled"
@@ -331,14 +336,41 @@ export function AdminSettings() {
             <strong className="text-fg">
               {masterSealed} stored secret{masterSealed === 1 ? "" : "s"}
             </strong>{" "}
-            still use pre-vault encryption — their owners haven&rsquo;t logged in since password
-            protection was enabled. Each re-seals under the owner&rsquo;s password automatically the
-            next time they log in (or unlock). For full protection those owners should also rotate
-            the affected token: sealing an existing value protects it from now on, not
-            retroactively.
+            belonging to protected users still use legacy server-key encryption. Those owners
+            need to log in or unlock to finish migration. Off users intentionally use server-key
+            encryption and are excluded from this count. Rotate affected credentials for protection
+            against older backups; migration cannot protect them retroactively.
           </p>
         </Card>
       )}
+
+      <Card id="vault-policy" className="space-y-4">
+        <SectionTitle>Credential protection</SectionTitle>
+        <p className="text-sm text-muted">TL;DR: Password encryption protects personal credentials against theft of the database together with the server key. A compromised running server can still read credentials while unlocked. Each release or server restart costs an unlock before new runs can start. Off uses server-key encryption, like forge bot tokens. <a href="/docs/vault-threat-model">Learn more</a>.</p>
+        <p>Optional starts new users with protection off. Required prompts off users to enroll and prevents protected users from switching off.</p>
+        <p>Unprotected users: {unprotectedUsers ?? "unknown (older server or unavailable)"}</p>
+        <div className="space-y-3">
+          <label>Vault policy
+            <Select aria-label="Vault policy" value={vaultPolicy} disabled={loading || busy} onChange={e => setVaultPolicy(e.target.value)}>
+              <option value="optional">Optional</option>
+              <option value="required">Required</option>
+            </Select>
+          </label>
+          <Button disabled={loading || busy || !saved || vaultPolicy === (saved.vault_policy ?? "required")} onClick={async () => {
+            if (!saved || busy || loading) return;
+            setBusy(true); setError(""); setNotice("");
+            try {
+              const resp = await api.updateSettings({ vault_policy: vaultPolicy });
+              setSaved(current => current ? { ...current, vault_policy: resp.settings.vault_policy } : current);
+              setVaultPolicy(resp.settings.vault_policy ?? "required");
+              setUnprotectedUsers(resp.unprotected_users ?? null);
+              await refresh(true);
+              setNotice("Vault policy saved.");
+            } catch (err) { setError(errorMessage(err, "Failed to save vault policy")); }
+            finally { setBusy(false); }
+          }}>Save vault policy</Button>
+        </div>
+      </Card>
 
       <Card id="forge-labels" className="scroll-mt-6 space-y-5">
         <div>

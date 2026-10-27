@@ -300,13 +300,13 @@ describe("AdminSettings — vault migration (PRD #32)", () => {
     mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
     renderPage();
     await screen.findByLabelText("uzi label");
-    expect(screen.queryByText(/pre-vault encryption/i)).toBeNull();
+    expect(screen.queryByText(/belonging to protected users/i)).toBeNull();
   });
 
   it("shows the migration notice with the count when secrets are still master-sealed", async () => {
     mockApi.vaultMigration.mockResolvedValue({ master_sealed: 3 });
     renderPage();
-    await waitFor(() => expect(screen.getByText(/pre-vault encryption/i)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/belonging to protected users/i)).toBeTruthy());
     expect(screen.getByText(/3 stored secrets/i)).toBeTruthy();
   });
 });
@@ -1786,5 +1786,23 @@ describe("AdminSettings hosted worker quota (#2960)", () => {
     expect((quota as HTMLInputElement).value).toBe("3");
     expect(screen.getByRole("button", { name: "Save hosted worker quota" })).toHaveProperty("disabled", true);
     expect(screen.getByRole("link", { name: "Hosted worker quota" }).getAttribute("href")).toBe("#hosted-worker-quota");
+  });
+});
+
+
+describe("vault policy", () => {
+  it("shows the policy, count and threat model even without migration", async () => {
+    mockApi.getSettings.mockResolvedValue({ ...response(), unprotected_users: 4, settings: { ...response().settings, vault_policy: "optional" } });
+    renderPage();
+    const select = await screen.findByRole("combobox", { name: "Vault policy" });
+    await waitFor(() => expect((select as HTMLSelectElement).value).toBe("optional"));
+    expect(screen.getByText("Unprotected users: 4")).toBeTruthy();
+    expect(screen.getByText(/TL;DR: Password encryption/).textContent).toContain("database together with the server key");
+    expect(screen.getByRole("link", { name: "Learn more" }).getAttribute("href")).toBe("/docs/vault-threat-model");
+    expect(screen.getByText(/Optional starts new users/)).toBeTruthy();
+    mockApi.updateSettings.mockResolvedValue({ ...response(), unprotected_users: 4, settings: { ...response().settings, vault_policy: "required" } });
+    fireEvent.change(select, { target: { value: "required" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save vault policy" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ vault_policy: "required" })));
   });
 });

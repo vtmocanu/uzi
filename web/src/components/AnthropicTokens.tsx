@@ -1,3 +1,4 @@
+import { CredentialStorageHint } from "./VaultSettings";
 // Settings → Anthropic tokens: the token LIST (PRD #104 M2/M6). A user may hold
 // several named credentials, exactly one of which is the default that unbound
 // workers and the judge lane spend.
@@ -852,10 +853,7 @@ export function AnthropicTokens({
             />
           </Field>
         )}
-        <p className="text-xs text-faint">
-          Encrypted with your login password. If you forget your password this token cannot be
-          recovered and must be re-entered.
-        </p>
+        <CredentialStorageHint />
         <Button type="submit" disabled={anyBusy || token.trim() === "" || (!first && label.trim() === "")}>
           {first ? "Save token" : "Add token"}
         </Button>

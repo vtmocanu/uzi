@@ -408,3 +408,10 @@ describe("rowForecast (PRD #310 — render-side stale short-circuit)", () => {
     expect(rowForecast(true, 58, RESET, W5, nowMs, "usage_endpoint")).toEqual({ state: "safe", projectedPct: 0 });
   });
 });
+
+
+it("off mode labels a stale reading without an unlock instruction", () => {
+  const stale = ok(25, 10, { stale: true });
+  expect(statusBadge(stale, true, "protected").label).toBe("🔒 vault locked");
+  expect(statusBadge(stale, true, "unprotected").label).toBe("stale");
+});

@@ -504,3 +504,5 @@ describe("CodexCredentials", () => {
     );
   });
 });
+
+vi.mock("../auth/AuthContext", () => ({ useAuth: () => ({ vaultMode: "protected", hasPassword: true }) }));

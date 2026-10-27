@@ -1,3 +1,4 @@
+import { CredentialStorageHint } from "./VaultSettings";
 // Settings → OpenAI / Codex credentials (PRD #1147 M3). The Codex sibling of the
 // Anthropic token card, deliberately SIMPLER: two kinds share one card and one
 // default, and none of the Anthropic-only machinery applies here.
@@ -1067,10 +1068,7 @@ export function CodexCredentials({
             onNotice={onNotice}
             reload={reload}
           />
-          <p className="text-xs text-faint">
-            Encrypted with your login password. If you forget your password these
-            credentials cannot be recovered and must be re-entered.
-          </p>
+          <CredentialStorageHint />
         </>
       )}
     </Card>
