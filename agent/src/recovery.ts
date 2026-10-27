@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { ProcessQuiescence } from "./run-quiescence.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import type { AuthorityScope } from "./authority-runtime.js";
+import { decodeCompletionSourceShape, type CompletionSourceV2 } from "./completion-source.js";
 import type { ExclusionRefusal, MaintenanceExclusion, MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { MaintenanceResources as M1MaintenanceResources, RecoveryMaintenance, type MaintenanceAdmission } from "./recovery-maintenance.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
@@ -28,6 +29,7 @@ import { prepareFrozenHeld, validFrozenHeldPolicy, type FrozenHeldPolicy, type H
 
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { constants, createReadStream } from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
@@ -125,6 +127,18 @@ export interface CompletionSource {
   roots: Array<{ sha: string; contexts: OwedCandidate["contexts"] }>;
 }
 
+/** The durability barriers of a published-source record write. Tests inject failures and count calls. */
+export interface PublicationFsOps {
+  syncFile(handle: FileHandle): Promise<void>;
+  syncDir(handle: FileHandle): Promise<void>;
+  rename(from: string, to: string): Promise<void>;
+}
+
+/** Publication refused or failed before the slot could be published; nothing eligible exists. */
+export class CompletionPublicationError extends Error {
+  constructor(message: string) { super(message); this.name = "CompletionPublicationError"; }
+}
+
 /** One authenticated journal record; its MAC covers every field. */
 export interface RecoveryRecord {
   version: 1;
@@ -148,8 +162,10 @@ export interface RecoveryRecord {
   finalAcknowledged?: boolean;
   /** Completion proof is independent of archive coverage and never covers another generation. */
   completionReceipt?: CompletedPublicationReceipt;
-  /** Exact completing attempt provenance, not a pending terminal intent. */
-  completionSource?: CompletionSource;
+  /** Exact completing attempt provenance, not a pending terminal intent. A V2 source (issue #3404 M2 U4)
+   *  is the same core plus the authority publication fields and certificate; it is written ONLY by
+   *  {@link RecoveryCoordinator.publishCompletionSource} and confers nothing without the matching slot. */
+  completionSource?: CompletionSource | CompletionSourceV2;
   /** The run this capture belongs to. Uniqueness by run_id (a per-run UUID) prevents a
    *  later run on the same ISSUE from overwriting or adopting this capture (D1). */
   runId: string;
@@ -534,6 +550,8 @@ export interface RecoveryCoordinatorOptions {
     source: CompletionSource,
     action: (canDelete: () => boolean) => Promise<void>,
   ) => Promise<"passed" | "retained">;
+  /** Tests only: the file/directory barriers of {@link RecoveryCoordinator.publishCompletionSource}. */
+  publicationOps?: PublicationFsOps;
   withInventorySourceBoundary?: (
     context: InventorySourceBoundaryContext,
     action: (prove: () => Promise<boolean>) => Promise<void>,
@@ -992,6 +1010,7 @@ export class RecoveryCoordinator {
   private readonly withInventorySourceBoundary: RecoveryCoordinatorOptions["withInventorySourceBoundary"];
   private readonly withCompletionSourceBoundary: RecoveryCoordinatorOptions["withCompletionSourceBoundary"];
   private readonly onCompletionSourceForgotten: RecoveryCoordinatorOptions["onCompletionSourceForgotten"];
+  private readonly publicationOps: PublicationFsOps;
   private readonly onCompletionGenerationForgotten: RecoveryCoordinatorOptions["onCompletionGenerationForgotten"];
   private readonly isExecuting: (runId: string) => boolean;
   private bootOwed: Awaited<ReturnType<NonNullable<RecoveryBundleProducer["discoverOwedCandidates"]>>> = [];
@@ -1192,6 +1211,9 @@ export class RecoveryCoordinator {
     this.withInventorySourceBoundary = opts.withInventorySourceBoundary;
     this.withCompletionSourceBoundary = opts.withCompletionSourceBoundary;
     this.onCompletionSourceForgotten = opts.onCompletionSourceForgotten;
+    this.publicationOps = opts.publicationOps ?? {
+      syncFile: handle => handle.sync(), syncDir: handle => handle.sync(), rename: (from, to) => fs.rename(from, to),
+    };
     this.onCompletionGenerationForgotten = opts.onCompletionGenerationForgotten;
     this.isExecuting = opts.isExecuting ?? (() => false);
     this.terminalRecordProtection = opts.terminalRecordProtection;
@@ -4403,7 +4425,9 @@ export class RecoveryCoordinator {
       const selected = records.filter(r => r.generation === generation);
       const authority = selected.find(r => r.completionReceipt && r.completionSource);
       if (!authority || !this.git.cleanupRecoveryGeneration || residueQuarantine() !== undefined) return;
-      const source = authority.completionSource!;
+      // A published V2 source is read as its legacy core here: restart retirement that consumes the
+      // certificate is a separate step, and this release decision stays exactly the legacy one.
+      const source = legacyCompletionCore(authority.completionSource!);
       const ctx = source.context;
       if (selected.some(r => !r.inventoryGuarded || r.branch !== ctx.branch || r.kind !== ctx.kind ||
           (r.completionReceipt && canonicalJson(r.completionReceipt) !== canonicalJson(authority.completionReceipt)))) return;
@@ -4415,7 +4439,7 @@ export class RecoveryCoordinator {
         if ((record.bareDir && record.bareDir !== path.basename(bare)) ||
             (record.recoveryPinBareDir && record.recoveryPinBareDir !== path.basename(bare)) ||
             (record.coverageContext && record.coverageContext!.barePath !== bare) ||
-            (record.completionSource && canonicalJson(record.completionSource) !== canonicalJson(source))) return;
+            (record.completionSource && canonicalJson(legacyCompletionCore(record.completionSource)) !== canonicalJson(source))) return;
         const canonical = path.resolve(this.bundlePath(record));
         if (record.bundlePath && path.resolve(record.bundlePath) !== canonical) return;
         if (path.dirname(canonical) !== path.resolve(this.runDir(runId))) return;
@@ -4713,6 +4737,127 @@ export class RecoveryCoordinator {
         return true;
       });
     } catch { MaintenanceBudget.current()?.check(); return false; }
+  }
+
+  /**
+   * issue #3404 M2 U4 - the separate terminal-publication path. It attaches ONLY the certified V2 form of the
+   * already-bound completing source to the N exact-generation records, and never rewrites receipt-era
+   * authority: every cohort record must already carry a source whose legacy core equals `bound` exactly (or,
+   * for an idempotent retry, `certified` itself), so a changed HEAD, roots, identity or cohort throws.
+   *
+   * The caller holds the outer authority transaction A; inside the journal lock J this
+   *  1. enumerates the PHYSICAL run directory (every entry, not only the authenticated records): a
+   *     malformed, unreadable, unknown or unattributable entry refuses, and the exact sorted capture-id
+   *     membership is taken from the authenticated generation records;
+   *  2. runs `installFence` (the bare journal fence; it takes the bare lock B beneath J);
+   *  3. rewrites each record (MAC, write, file sync, rename), syncs the run directory, and reads each back;
+   *  4. re-enumerates the directory and requires the same entries, then
+   *  5. runs `commit(captureIds)`, which publishes the slot's eligibility LAST.
+   * Any throw leaves the slot unpublished: certified records never confer eligibility without the matching
+   * published slot. Durability is awaited (async fs only); the exercised path costs N record file syncs plus
+   * one directory sync here, beside the fence's two and the slot write's own.
+   */
+  async publishCompletionSource(input: {
+    bound: CompletionSource;
+    certified: CompletionSourceV2;
+    installFence: () => Promise<unknown>;
+    commit: (captureIds: string[]) => Promise<void>;
+  }): Promise<void> {
+    const { bound, certified } = input;
+    if (!this.enabled || !this.key) throw new CompletionPublicationError("recovery journal unavailable");
+    if (!validCompletionSource(bound) || canonicalJson(legacyCompletionCore(certified)) !== canonicalJson(bound) ||
+        certified.certificate === undefined) {
+      throw new CompletionPublicationError("certified source does not carry the bound core");
+    }
+    const ctx = bound.context;
+    await this.withJournalLock(ctx.runId, async () => {
+      const first = await this.physicalGeneration(ctx.runId, ctx.generation);
+      const bareDir = path.basename(ctx.barePath);
+      const wanted = canonicalJson(bound), certifiedJson = canonicalJson(certified);
+      for (const r of first.selected) {
+        const source = r.completionSource;
+        if (!r.inventoryGuarded || r.runId !== ctx.runId || r.branch !== ctx.branch || r.kind !== ctx.kind ||
+            (r.bareDir && r.bareDir !== bareDir) || (r.recoveryPinBareDir && r.recoveryPinBareDir !== bareDir) ||
+            (r.coverageContext && canonicalJson(r.coverageContext) !== canonicalJson(ctx)) ||
+            (r.bundlePath && path.resolve(r.bundlePath) !== path.resolve(this.bundlePath(r))) ||
+            !source || canonicalJson(legacyCompletionCore(source)) !== wanted ||
+            ("version" in source && canonicalJson(source) !== certifiedJson)) {
+          throw new CompletionPublicationError("cohort record is not the bound completing source");
+        }
+      }
+      await input.installFence();
+      for (const record of first.selected) await this.writeRecordDurableUnlocked({ ...record, completionSource: certified });
+      await this.syncRunDirectory(ctx.runId);
+      for (const record of first.selected) {
+        const readback = await this.requireRecord(record);
+        if (!readback.completionSource || canonicalJson(readback.completionSource) !== certifiedJson) {
+          throw new CompletionPublicationError("published record did not read back");
+        }
+      }
+      const second = await this.physicalGeneration(ctx.runId, ctx.generation);
+      if (second.names !== first.names || second.captureIds.join() !== first.captureIds.join()) {
+        throw new CompletionPublicationError("cohort changed during publication");
+      }
+      await input.commit(first.captureIds);
+    });
+  }
+
+  /**
+   * Every physical entry of the run directory, authenticated: a `.json` entry must be a verified record of
+   * this run, a `.bundle` entry must belong to one, and anything else (an incomplete write, a stray file, a
+   * non-regular entry) refuses. Returns the exact sorted capture ids of `generation`. Caller holds J.
+   */
+  private async physicalGeneration(runId: string, generation: number): Promise<{
+    names: string; captureIds: string[]; selected: RecoveryRecord[];
+  }> {
+    let records: RecoveryRecord[];
+    let names: string[];
+    try {
+      records = await this.checkedRecords(runId);
+      names = await ownedRecoveryIO(() => fs.readdir(this.runDir(runId)));
+    } catch { throw new CompletionPublicationError("recovery journal is not fully readable"); }
+    if (records.some(r => r.generation === undefined)) throw new CompletionPublicationError("legacy record in the journal");
+    const known = new Set(records.map(r => r.captureId));
+    for (const name of names) {
+      const stem = name.endsWith(".json") ? name.slice(0, -".json".length) : name.endsWith(".bundle") ? name.slice(0, -".bundle".length) : undefined;
+      if (stem === undefined || !known.has(stem)) throw new CompletionPublicationError("unknown recovery journal entry");
+      const stat = await ownedRecoveryIO(() => fs.lstat(path.join(this.runDir(runId), name)));
+      if (!stat.isFile()) throw new CompletionPublicationError("unknown recovery journal entry");
+    }
+    if (records.some(r => !names.includes(r.captureId + ".json"))) throw new CompletionPublicationError("recovery journal changed");
+    const selected = records.filter(r => r.generation === generation)
+      .sort((a, b) => (a.captureId < b.captureId ? -1 : a.captureId > b.captureId ? 1 : 0));
+    if (selected.length === 0) throw new CompletionPublicationError("no cohort for this generation");
+    return { names: [...names].sort().join("\n"), captureIds: selected.map(r => r.captureId), selected };
+  }
+
+  /** MAC, write, file sync, rename: the durable variant of writeRecordUnlocked. The directory sync is the caller's. */
+  private async writeRecordDurableUnlocked(record: RecoveryRecord): Promise<void> {
+    this.invalidateCompletionCleanupWitness(record);
+    const mac = this.computeMac(record);
+    const dst = this.recordPath(record);
+    const tmp = `${dst}.${randomUUID()}.tmp`;
+    try {
+      await ownedRecoveryIO(async () => {
+        const handle = await fs.open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+        try {
+          await handle.writeFile(JSON.stringify({ ...record, mac }));
+          await this.publicationOps.syncFile(handle);
+        } finally { await handle.close(); }
+        await this.publicationOps.rename(tmp, dst);
+      });
+    } catch (error) {
+      // A leftover temp would make every later publication of this run refuse as an unknown entry.
+      await fs.unlink(tmp).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async syncRunDirectory(runId: string): Promise<void> {
+    await ownedRecoveryIO(async () => {
+      const handle = await fs.open(this.runDir(runId), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      try { await this.publicationOps.syncDir(handle); } finally { await handle.close(); }
+    });
   }
 
   /** One bounded authenticated write/readback, only to an existing exact-generation record.
@@ -5462,6 +5607,24 @@ export function validCompletionSource(value: unknown): value is CompletionSource
         c.branch === ctx.branch && c.kind === ctx.kind));
 }
 
+/**
+ * A persisted completion source is either the legacy V1 core (exact V1 key set) or a published V2 source
+ * (exact V2 key set, certificate kept verbatim). Anything else, including a V2-looking value that fails the
+ * strict V2 decode, refuses the whole record. A parser that predates V2 refuses the record the same way.
+ */
+function decodePersistedCompletionSource(value: unknown): CompletionSource | CompletionSourceV2 | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value) && (value as { version?: unknown }).version !== undefined) {
+    try { return decodeCompletionSourceShape(value); } catch { return undefined; }
+  }
+  return validCompletionSource(value) ? value : undefined;
+}
+
+/** The V1 core of a stored source: exactly the legacy key set, whatever version the record carries. */
+export function legacyCompletionCore(source: CompletionSource | CompletionSourceV2): CompletionSource {
+  return { context: source.context, clonePath: source.clonePath, expectedHead: source.expectedHead, roots: source.roots,
+    ...(source.attemptId === undefined ? {} : { attemptId: source.attemptId }) };
+}
+
 /** Strict persisted shape. Live identity validation belongs to WorkerClient; MAC binds it at rest. */
 function validCompletionReceipt(value: unknown): value is CompletedPublicationReceipt {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -5616,8 +5779,8 @@ function coerceRecord(obj: Record<string, unknown>): RecoveryRecord | null {
     record.finalRequest = req;
   }
   if (obj.completionSource !== undefined) {
-    if (!validCompletionSource(obj.completionSource)) return null;
-    const source = obj.completionSource;
+    const source = decodePersistedCompletionSource(obj.completionSource);
+    if (!source) return null;
     if (!record.inventoryGuarded || source.context.runId !== record.runId ||
         source.context.generation !== record.generation || source.context.branch !== record.branch ||
         source.context.kind !== record.kind) return null;

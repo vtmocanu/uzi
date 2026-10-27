@@ -180,6 +180,15 @@ function decodeSource(value: unknown, expected?: SourceExpectation): CompletionS
   return out;
 }
 
+/**
+ * Shape-only strict decode of a persisted V2 source (exact key set, bounded strings, hex and UUID
+ * formats), for a reader that has no storage identity: the journal record decoder. It proves nothing
+ * about the certificate or freshness; use `verifyPublishedSource` for that.
+ */
+export function decodeCompletionSourceShape(value: unknown): CompletionSourceV2 {
+  return decodeSource(value);
+}
+
 /** Strictly decode a V2 source against the storage identity it must belong to. */
 export function parseCompletionSourceV2(value: unknown, expected: SourceExpectation): CompletionSourceV2 {
   return decodeSource(value, expected);

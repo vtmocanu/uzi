@@ -241,6 +241,51 @@ export class AuthorityRuntime implements AuthorityScope {
   }
 
   /**
+   * issue #3404 M2 U4 - PUBLISH the source `lease` covers instead of ending it. One outer A, acquired here by
+   * the caller (never beneath J or B): it requires `lease` to be this process's current lease for `clonePath`
+   * and its slot to still be this worker's active epoch with nothing pending, then runs `work`, which does
+   * the certify / fence / record / slot-transition sequence under that same A. Anything else, or any throw
+   * from `work`, publishes nothing: the slot is moved to `ineligible` (best effort; `ended` says whether that
+   * write landed, and if it did not the slot stays active, fail closed) and the reason is returned. A stale publisher therefore refuses and writes
+   * nothing, and a publisher that lost its A wait is not retried. Never throws.
+   */
+  async publishSource(
+    clonePath: string, lease: SourceUseLease, options: AuthorityWait,
+    work: (context: { tx: AuthorityTransaction; store: AuthorityStore }) => Promise<void>,
+  ): Promise<{ published: true } | { published: false; reason: string; ended: boolean }> {
+    const key = path.resolve(clonePath);
+    const reasonOf = (error: unknown): string => error instanceof Error ? error.message : String(error);
+    try {
+      return await this.withTransaction(async (tx): Promise<{ published: true } | { published: false; reason: string; ended: boolean }> => {
+        const store = await this.#storeFor(tx);
+        if (this.#leases.get(key) !== lease) return { published: false, reason: "the flight's source lease is not the current lease for its clone", ended: false };
+        const slot = await this.#slotOf(tx, store, key);
+        if (!slot || !this.#ownedActive(store, slot, lease)) {
+          return { published: false, reason: "the source-use epoch is no longer this worker's active epoch", ended: false };
+        }
+        if (slot.pending !== null) return { published: false, reason: "an operation on the source is unresolved", ended: false };
+        try {
+          await work({ tx, store });
+          this.#leases.delete(key);
+          return { published: true };
+        } catch (error) {
+          let ended = false;
+          try {
+            await store.transition(tx, lease, "ineligible");
+            this.#leases.delete(key);
+            ended = true;
+          } catch (demote) {
+            this.#options.log?.warn("a failed publication left its source active", { error: reasonOf(demote) });
+          }
+          return { published: false, reason: reasonOf(error), ended };
+        }
+      }, options);
+    } catch (error) {
+      return { published: false, reason: reasonOf(error), ended: false };
+    }
+  }
+
+  /**
    * The executor-launch gate: refuse unless `lease` is this process's CURRENT lease for `clonePath`, the slot
    * is still this worker's active epoch under it, and the slot's owner carries exactly the launching
    * executor's incarnation (none for a claude flight). Runs under its own short A.

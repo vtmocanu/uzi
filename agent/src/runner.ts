@@ -27,7 +27,8 @@ import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budge
 import { MaintenanceResources } from "./recovery-maintenance.js";
 import { AuthorityRefusal } from "./authority-lock.js";
 import type { AuthorityRuntime, AuthorityWait } from "./authority-runtime.js";
-import type { SourceUseLease } from "./completion-authority.js";
+import { leaseHarness, type SourceUseLease } from "./completion-authority.js";
+import { buildClaudeSourceCore, buildCodexSourceCore, sourceFenceOf } from "./completion-source.js";
 import type { WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
@@ -2151,6 +2152,10 @@ interface RunFlight {
   sourceUsePaths?: Set<string>;
   /** issue #3404 M2 U3: every worker-owned source-capable tail of this flight was positively joined. */
   sourceTailsJoined?: boolean;
+  /** issue #3404 M2 U4: the V1 completing-source core whose cohort the journal durably bound (the last
+   *  bindCompletionSource that the coordinator accepted). Publication attaches the certificate to exactly
+   *  this core and to no other. */
+  completionSourceBound?: CompletionSource;
 
   /** Local observer only; preservation keeps its own operation and authority. */
   memoryHoldObserver?: () => void;
@@ -3399,8 +3404,9 @@ export class RunRunner {
    * END SOURCE USE: the one step where this flight's durable source-use slots leave `active`. It runs at
    * the end of the flight's teardown (the finally of executeClaimInAttempt), after every worker-owned
    * source-capable tail the flight owns was joined. Today every slot moves to `ineligible`, so a later
-   * worker incarnation (a pod roll, a restart) can use the path again. U4 publishes sealed/claude_ready
-   * through this seam instead, when it can prove the source. If the tails were NOT positively joined the
+   * worker incarnation (a pod roll, a restart) can use the path again. A flight whose completing source the
+   * journal bound publishes it through this seam instead (see publishFlightSource), when it can prove the
+   * source. If the tails were NOT positively joined the
    * slots stay `active` (fail closed) and that is logged: nothing here is retried or forced. Never throws.
    *
    * "Positively joined" is `sourceTailsJoined`, set in the teardown finally: this executor's process half
@@ -3422,8 +3428,75 @@ export class RunRunner {
         sources: paths.size });
       return;
     }
+    // U4: a flight whose completing source the journal durably bound publishes it (Codex: sealed; Claude:
+    // claude_ready) instead of ending it. Publication moves the slot out of `active` itself and returns its
+    // lease, so only the paths that did NOT publish still need the ineligible step below.
+    const bound = flight.completionSourceBound;
+    if (bound && paths.has(resolvePath(bound.clonePath))) {
+      // "ended": a failed publication already moved the slot to ineligible under its own A.
+      if (await this.publishFlightSource(flight, bound, runLog) !== "unpublished") paths.delete(resolvePath(bound.clonePath));
+    }
+    if (paths.size === 0) return;
     const outcome = await authority.endSourceUse(paths, { timeoutMs: SOURCE_USE_END_WAIT_MS });
     if (outcome.kept.length > 0) runLog.warn("source use left active for some paths", { kept: outcome.kept.length });
+  }
+
+  /**
+   * issue #3404 M2 U4 - terminal publication of the flight's already-bound completing source. Only reached
+   * from {@link endFlightSourceUse}: the worker-owned tails are joined, so nothing of this worker's can still
+   * write the source. Order: (Codex) the irreversible executor lifetime seal, BEFORE and outside A and every
+   * safety, journal and bare lock; then one outer A in which the live HEAD and roots must still equal the
+   * bound core, the store certifies the core, the coordinator installs the bare fence and rewrites the
+   * cohort (J, then B beneath it), and the slot transition is last. Any refusal or failure is "ended" (the
+   * slot was moved to ineligible) or "unpublished" (the caller still ends the source use as ineligible); it
+   * never fails the run and never retries model work.
+   */
+  private async publishFlightSource(flight: RunFlight, bound: CompletionSource, runLog: Logger): Promise<"published" | "ended" | "unpublished"> {
+    const authority = this.authority;
+    const lease = flight.sourceLease;
+    const unpublished = (reason: string): "unpublished" => {
+      runLog.warn("completion source not published; its source use ends ineligible", { reason });
+      return "unpublished";
+    };
+    if (!authority || !lease) return "unpublished";
+    try {
+      const executor = flight.executor;
+      const codex = leaseHarness(lease) === "codex";
+      if (flight.sourceJoinFailed) return unpublished("a source-capable cleanup did not complete");
+      if (codex !== (executor.executorIncarnation !== undefined)) return unpublished("the executor does not match the lease's harness");
+      if (!codex && (flight.initiallyCodex || executor.safety || executor.sealLifetime)) return unpublished("a Codex flight cannot publish as Claude");
+      if (authority.leaseFor(bound.clonePath) !== lease) return unpublished("the flight's source lease is not the current lease for its clone");
+      let seal: unknown;
+      if (codex) {
+        if (!executor.sealLifetime || !executor.acceptsLifetimeSeal) return unpublished("the executor cannot seal its lifetime");
+        const sealed = await executor.sealLifetime(lease);
+        if (sealed.kind !== "sealed" || !executor.acceptsLifetimeSeal(sealed.seal, lease)) return unpublished("the executor lifetime seal is unproven");
+        seal = sealed.seal;
+      }
+      const rootsKey = (roots: CompletionSource["roots"]): string => canonicalJson(
+        roots.map(r => ({ sha: r.sha, contexts: r.contexts.map(c => canonicalJson(c)).sort() })).sort((a, b) => a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0));
+      const outcome = await authority.publishSource(bound.clonePath, lease, { timeoutMs: SOURCE_USE_END_WAIT_MS }, async ({ tx, store }) => {
+        const { barePath, branch, runId, generation } = bound.context;
+        if (await this.git.worktreeHead(bound.clonePath) !== bound.expectedHead) throw new Error("the source HEAD changed since it was bound");
+        if (rootsKey(await this.completionRoots(barePath, runId, generation)) !== rootsKey(bound.roots)) {
+          throw new Error("the source roots changed since they were bound");
+        }
+        const core = codex ? buildCodexSourceCore({ store, base: bound, lease, seal }) : buildClaudeSourceCore({ store, base: bound, lease });
+        const certified = await store.certifySource(tx, lease, core, codex ? { seal } : undefined);
+        await this.recovery.publishCompletionSource({
+          bound, certified,
+          installFence: () => this.git.installCompletionSourceFence(barePath, branch,
+            { runId, clonePath: bound.clonePath, ...(bound.attemptId === undefined ? {} : { attemptId: bound.attemptId }) },
+            sourceFenceOf(certified)),
+          commit: captureIds => store.transition(tx, lease, codex ? "sealed" : "claude_ready", { source: certified, captureIds }),
+        });
+      });
+      if (outcome.published) return "published";
+      unpublished(outcome.reason);
+      return outcome.ended ? "ended" : "unpublished";
+    } catch (error) {
+      return unpublished(errMessage(error));
+    }
   }
 
   private async withInventorySourceBoundary(
@@ -3912,6 +3985,14 @@ export class RunRunner {
     }
   }
 
+  /** The completing generation's roots, exactly as the binder records them (also re-read by publication). */
+  private async completionRoots(barePath: string, runId: string, generation: number): Promise<CompletionSource["roots"]> {
+    const candidates = await this.git.enumerateOwedCandidates(barePath, runId);
+    return candidates.map(r => ({ sha: r.sha,
+      contexts: r.contexts.filter(c => c.generation === generation && !("origin" in c)) }))
+      .filter(r => r.contexts.length > 0);
+  }
+
   private async bindCompletionSource(flight: RunFlight): Promise<void> {
     if (!flight.barePath || !flight.worktreePath || !flight.branch || flight.predecessorCapture ||
         !flight.runnerClone || flight.runnerClone.path !== flight.worktreePath || flight.runnerClone.branch !== flight.branch) return;
@@ -3934,10 +4015,7 @@ export class RunRunner {
         if (!matchingIdentity) throw new Error("completion source preparation identity changed");
         const expectedHead = await this.git.worktreeHead(worktreePath);
         if (!expectedHead) return;
-        const candidates = await this.git.enumerateOwedCandidates(barePath, runId);
-        const roots = candidates.map(r => ({ sha: r.sha,
-          contexts: r.contexts.filter(c => c.generation === generation && !("origin" in c)) }))
-          .filter(r => r.contexts.length > 0);
+        const roots = await this.completionRoots(barePath, runId, generation);
         const source: CompletionSource = { context: context as CompletionSource["context"],
           clonePath: worktreePath, attemptId, expectedHead, roots };
         matchingIdentity = this.completionSourceIdentity(source) === preparation.key;
@@ -3946,7 +4024,7 @@ export class RunRunner {
         binding = this.rememberCompletionSource(source, flight, executor, terminalSource);
         this.completionSourceBinds.add(binding);
         this.completionSourceBinds.delete(preparation);
-        await this.recovery.bindCompletionSource(source);
+        if (await this.recovery.bindCompletionSource(source)) flight.completionSourceBound = source;
       } finally {
         this.completionSourceBinds.delete(preparation);
         if (binding) this.completionSourceBinds.delete(binding);
