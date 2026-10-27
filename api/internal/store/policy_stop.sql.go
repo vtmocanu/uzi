@@ -466,6 +466,43 @@ func (q *Queries) GetPolicyStopRevisionInput(ctx context.Context, arg GetPolicyS
 	return i, err
 }
 
+const getPolicyStopScopeInput = `-- name: GetPolicyStopScopeInput :one
+SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported, settled_at, superseded_by_stop_input_id FROM run_user_inputs
+WHERE run_id = $1::uuid AND id = $2::bigint
+ AND kind = 'scope'
+`
+
+type GetPolicyStopScopeInputParams struct {
+	RunID   uuid.UUID `json:"run_id"`
+	InputID int64     `json:"input_id"`
+}
+
+// Exact accepted Stop audit evidence; never infer authority from unrelated history.
+func (q *Queries) GetPolicyStopScopeInput(ctx context.Context, arg GetPolicyStopScopeInputParams) (RunUserInput, error) {
+	row := q.db.QueryRow(ctx, getPolicyStopScopeInput, arg.RunID, arg.InputID)
+	var i RunUserInput
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.Kind,
+		&i.Body,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+		&i.QuestionID,
+		&i.Disposition,
+		&i.ConsumedClaimGeneration,
+		&i.ConsumedWorkerID,
+		&i.AppliedAt,
+		&i.GateBinding,
+		&i.GateRevision,
+		&i.IncludedAt,
+		&i.InclusionReported,
+		&i.SettledAt,
+		&i.SupersededByStopInputID,
+	)
+	return i, err
+}
+
 const hasPolicyCurrentGateApproval = `-- name: HasPolicyCurrentGateApproval :one
 SELECT (EXISTS (
     SELECT 1 FROM run_user_inputs

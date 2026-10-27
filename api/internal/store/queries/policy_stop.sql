@@ -94,6 +94,12 @@ SELECT * FROM run_user_inputs
 WHERE run_id = sqlc.arg(run_id)::uuid AND id = sqlc.arg(input_id)::bigint
  AND kind = 'revise_plan';
 
+-- name: GetPolicyStopScopeInput :one
+-- Exact accepted Stop audit evidence; never infer authority from unrelated history.
+SELECT * FROM run_user_inputs
+WHERE run_id = sqlc.arg(run_id)::uuid AND id = sqlc.arg(input_id)::bigint
+ AND kind = 'scope';
+
 -- name: HasPolicyRevisionHistory :one
 -- The caller holds the parent run lock. Recorded revision history prevents an
 -- unknown source from regaining legacy approval after a plan frame or reclaim.
