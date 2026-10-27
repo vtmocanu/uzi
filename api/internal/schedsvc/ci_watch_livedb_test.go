@@ -14,6 +14,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -47,6 +48,10 @@ func newCILive(t *testing.T, runs ...forge.WorkflowRun) *ciLive {
 			}
 		}
 	})
+	// This positive claim fixture uses legacy master-sealed credentials in Off mode.
+	if _, err := pool.Exec(ctx, `UPDATE users SET vault_mode = $2 WHERE id = $1`, user, store.VaultModeUnprotected); err != nil {
+		t.Fatal(err)
+	}
 	seedAnthropicDefault(ctx, t, pool, box, user)
 	sealed, err := box.Seal([]byte("bot-pat-fixture"))
 	if err != nil {
@@ -61,6 +66,7 @@ func newCILive(t *testing.T, runs ...forge.WorkflowRun) *ciLive {
 	svc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimitReader{}})
 	svc.SetJobFiles(workersvc.NewJobFiles(pool, box, workersvc.JobFileLimits{}, nil))
 	svc.SetTxBeginner(pool)
+	svc.SetVault(vault.NewPostgres(box, pool))
 	cf := &ciForge{runs: runs, jobs: map[int64][]forge.Job{}, tails: map[int64]string{}}
 	rebuildJobs := func() {
 		for _, r := range cf.runs {
