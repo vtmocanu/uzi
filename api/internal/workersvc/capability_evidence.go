@@ -73,7 +73,7 @@ func NormalizeCapabilityEvidence(raw json.RawMessage) []byte {
 
 func validCapabilityTrigger(cap string, trigger apitypes.CapabilityTrigger) bool {
 	p := trigger.Path
-	if p == "" || len(p) > 512 || !utf8.ValidString(p) || path.IsAbs(p) || p == "." || path.Clean(p) != p || strings.HasPrefix(p, "../") || strings.Contains(p, "\\") {
+	if p == "" || len(p) > 512 || !utf8.ValidString(p) || path.IsAbs(p) || p == "." || p == ".." || path.Clean(p) != p || strings.HasPrefix(p, "../") || strings.Contains(p, "\\") {
 		return false
 	}
 	for _, r := range p {

@@ -28,7 +28,7 @@ func TestNormalizeCapabilityEvidence(t *testing.T) {
 	if len(got) != 1 || !reflect.DeepEqual(got["jvm"].Triggers, want) || !got["jvm"].Truncated {
 		t.Fatalf("normalization=%+v", got)
 	}
-	for _, p := range []string{"bad\x1b/pom.xml", "bad\u202e/pom.xml", strings.Repeat("é", 257) + "/pom.xml", `a\pom.xml`} {
+	for _, p := range []string{"..", "bad\x1b/pom.xml", "bad\u202e/pom.xml", strings.Repeat("é", 257) + "/pom.xml", `a\pom.xml`} {
 		if validCapabilityTrigger("jvm", apitypes.CapabilityTrigger{Path: p, Reason: "jvm_manifest"}) {
 			t.Fatalf("unsafe path accepted: %q", p)
 		}
