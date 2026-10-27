@@ -1302,7 +1302,13 @@ export class AuthorityStore {
       return "retired";
     }
     const prior = discardPriors.get(lease);
-    if (outcome.nothingDeleted === true && prior && JSON.stringify(prior.pending) === JSON.stringify(body.pending)) {
+    // An `active` prior owned by THIS incarnation is never put back: the discard's quiescence proof ended that
+    // epoch's use, its in-memory lease is released with the discard (so nobody in this process holds it any more),
+    // and restoring it would leave an active epoch no process can end, which a restart would read as a foreign
+    // worker's. It ends as `ineligible` below. A foreign active, an ineligible slot and settled_failed evidence are
+    // restored exactly.
+    const ownActive = prior?.state === "active" && prior.owner.worker === this.#init.incarnation;
+    if (outcome.nothingDeleted === true && prior && !ownActive && JSON.stringify(prior.pending) === JSON.stringify(body.pending)) {
       await this.#save(dir, { ...prior, seq: body.seq + 1 });
       return "restored";
     }

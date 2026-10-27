@@ -3599,7 +3599,8 @@ export class RunRunner {
     for (const binder of this.completionSourceBinds) {
       try {
         const tuple: unknown = JSON.parse(binder.key);
-        if (Array.isArray(tuple) && tuple[4] === clonePath) return true;
+        // The asking side passes a normalized (path.resolve'd) slot key; a binder tuple holds whatever path the source carried.
+        if (Array.isArray(tuple) && typeof tuple[4] === "string" && resolvePath(tuple[4]) === resolvePath(clonePath)) return true;
       } catch { return true; }
     }
     return false;
@@ -3727,8 +3728,14 @@ export class RunRunner {
       if (!clone) {
         // A resumed retirement's authenticated retiring record replaces the attempt-ledger/fence proof: the
         // clone is gone and no journal still names it.
+        const processOpts = classification.kind === "knownCodex" ? { processProof: open } : undefined;
         const retired = await this.git.completionSourceAlreadyRetired(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId,
-          classification.kind === "knownCodex" ? { processProof: open } : undefined) ||
+          processOpts) ||
+          // A crash after the ledger `retired` append but before the journal clear leaves the fenced journal naming
+          // the gone source: the certified clear (exact run/path/attempt and exactly the durable fence) finishes it.
+          (durable !== undefined && open() &&
+            await this.git.clearRetiredCompletionJournal(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId,
+              durable.expectedFence, processOpts)) ||
           (durable?.resumed === true && open() &&
             await this.git.completionSourceJournalAbsent(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId));
         if (!retired || !open()) return "retained";

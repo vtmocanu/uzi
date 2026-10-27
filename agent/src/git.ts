@@ -6907,7 +6907,11 @@ export class GitCache {
   }
 
   /** One bounded pass under the bare lock. A failure stops detachment, keeping active
-   * or both descriptors; no pins, bytes or server custody are released. */
+   * or both descriptors; no pins, bytes or server custody are released.
+   * issue #3404: a completion-source fence on `expected` is copied into the protected descriptor, so clearing
+   * the active journal key here does not drop the rollback protection: the base parser rejects the
+   * descriptor's journal for the unknown fence key (test/git-completion-fence.test.ts). It is therefore the
+   * one deliberate fence-carrying clear outside the certified retirement, and is not refused. */
   async detachTerminalRetained(barePath: string, branch: string, key: string, expected: RecoveryJournalEntry): Promise<void> {
     expected = parseRecoveryJournal(JSON.stringify(expected));
     await this.withLock(barePath, async () => {
@@ -7866,7 +7870,12 @@ export class GitCache {
     barePath: string, branch: string, key: string, expected: RecoverySource, ownerDiscard: true,
   ): Promise<void> {
     if (ownerDiscard !== true) throw new Error("explicit owner discard required");
-    await this.withLock(barePath, () => this.discardRetainedRecoveryUnderLock(barePath, branch, key, expected));
+    await this.withLock(barePath, async () => {
+      // issue #3404: this wrapper has no production caller and carries none of the operator discard's checks, so
+      // it must not be a way to drop a published fence under authority.
+      this.refuseFenceDrop(await this.readRecoveryCapture(barePath, branch), "discardRetainedRecovery");
+      await this.discardRetainedRecoveryUnderLock(barePath, branch, key, expected);
+    });
   }
 
   /**
@@ -11398,6 +11407,47 @@ export class GitCache {
         if (!processOpen()) return false;
         await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       }
+      return processOpen();
+    });
+  }
+
+  /**
+   * issue #3404 M2 - the crash-resume step of a certified completion retirement. retireRunnerClone's metadata order
+   * is move, dispose, ledger `retired`, journal clear; a crash (or a second EIO) between the ledger append and the
+   * clear leaves the clone gone, the ledger retired and the journal still naming the source WITH its fence.
+   * {@link completionSourceAlreadyRetired} refuses that fenced journal by design, so without this step the source is
+   * retained every cycle. Under the bare lock this clears the journal only when ALL hold: the clone path is absent,
+   * no terminal record protects the run, no residue latch is set, the journal names exactly this run, clone path and
+   * attempt (canonical: none) with no recovery episode or retained source, it carries exactly `expectedFence` (the
+   * fence the coordinator verified from the authenticated slot), and an attempt additionally has a `retired` ledger
+   * entry for that run and path. A different or missing fence, or any other disagreement, changes nothing and
+   * returns false. True when the journal was cleared by this call.
+   */
+  async clearRetiredCompletionJournal(barePath: string, branch: string, runId: string,
+    clonePath: string, attemptId: string | undefined, expectedFence: CompletionSourceFence,
+    opts: { processProof?: () => boolean } = {}): Promise<boolean> {
+    const processOpen = (): boolean => opts.processProof === undefined || opts.processProof() === true;
+    if (!processOpen()) return false;
+    return this.withLock(barePath, async () => {
+      if (!processOpen()) return false;
+      await this.assertRecoveryBare(barePath);
+      const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
+      const pending = stored?.journal;
+      if (!stored || !pending || pending.runId !== runId || pending.clonePath !== clonePath || pending.attemptId !== attemptId) return false;
+      if (pending.recovery || pending.retainedSources?.length || pending.completionSourceFence === undefined) return false;
+      try {
+        if (serializeSourceFence(pending.completionSourceFence) !== serializeSourceFence(expectedFence)) return false;
+      } catch { return false; }
+      if (attemptId !== undefined) {
+        const entry = (await this.readAttemptLedger(barePath, branch)).get(attemptId);
+        if (entry?.runId !== runId || entry.clonePath !== clonePath || entry.state !== "retired") return false;
+      }
+      try { await fs.lstat(clonePath); return false; }
+      catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+      if (!processOpen() || await this.hasPhysicalTerminalProtection(runId) || residueQuarantine() !== undefined || !processOpen()) return false;
+      // Nothing may have changed the journal while the guards above awaited.
+      if (await this.readRecoveryCaptureRaw(barePath, branch) !== stored.raw || !processOpen()) return false;
+      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       return processOpen();
     });
   }

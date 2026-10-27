@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -567,6 +567,26 @@ describe("a fully deleted retirement never wedges the next use of the path", () 
     });
   }
 
+  it("a pending binder holding a NON-normalized spelling of the path still defers the admission finisher", async t => {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    await r.end();
+    await r.receipt();
+    const second = r.restart();
+    (second.p.recovery as unknown as { publicationOps: { syncDir(h: unknown): Promise<void> } }).publicationOps.syncDir = async () => { throw new Error("injected run-directory sync failure"); };
+    await second.sweep().catch(() => undefined);
+    assert.equal((await slotVia(second.rt, r.clone))?.state, "retiring");
+    const odd = `${path.dirname(r.clone)}/./${path.basename(r.clone)}`;
+    assert.notEqual(odd, r.clone, "the spelling really differs from the resolved slot key");
+    assert.equal(path.resolve(odd), r.clone);
+    const binder = { key: JSON.stringify([r.runId, GENERATION, r.bare, BRANCH, odd, r.bound.attemptId]) };
+    binderSet(second.p).add(binder);
+    await assert.rejects(second.rt.withTransaction(() => second.rt.hooks.admitSourceUse(r.clone, "seed-canonical")), /being retired/);
+    assert.equal((await slotVia(second.rt, r.clone))?.state, "retiring", "no tombstone with a binder pending for this path");
+    binderSet(second.p).delete(binder);
+    await second.rt.withTransaction(() => second.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    assert.equal((await slotVia(second.rt, r.clone))?.state, "active");
+  });
+
   it("an artifact reappearing before the finisher runs (a stray record) keeps the slot retiring and the path refused", async t => {
     const r = await rig(t, { codex: false, cohort: 2 });
     await r.end();
@@ -770,3 +790,56 @@ describe("the bare ref deletions of the retirement go through the existing bare-
   });
 });
 
+
+describe("a retirement that crashed after the attempt ledger append and before the journal clear", () => {
+  /** Every write that clears the completing journal fails (Git retires once on EIO, so both tries fail). */
+  const failJournalClear = (t: TestContext): void => {
+    const target = git as unknown as { runGit(bare: string, args: string[], ...rest: unknown[]): Promise<string> };
+    const real = target.runGit.bind(git);
+    t.mock.method(target, "runGit", async (bare: string, args: string[], ...rest: unknown[]) => {
+      if (args[0] === "config" && args[2] === `uzi-recovery.${BRANCH}.clone` && args[3] === "") throw Object.assign(new Error("EIO"), { code: "EIO" });
+      return real(bare, args, ...rest);
+    });
+  };
+  const ledger = (r: Rig): string => execFileSync("git", ["-C", r.bare, "config", "--get-all", `uzi-attempts.${BRANCH}.entry`], { encoding: "utf8", env: ENV });
+
+  async function crashed(t: TestContext) {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    await r.end();
+    await r.receipt();
+    const first = r.restart();
+    failJournalClear(t);
+    await first.sweep();
+    assert.equal(fs.existsSync(r.clone), false, "the clone is gone");
+    assert.match(ledger(r), /retired/, "the ledger already says retired");
+    assert.ok(fenceOf(r), "the journal still names the source with its fence");
+    assert.equal((await slotOf(r))?.state, "retiring");
+    return { r, first };
+  }
+
+  for (const successor of [false, true]) {
+    it(`the retry clears the fenced journal and completes: records go and the slot tombstones (${successor ? "successor incarnation" : "same worker"})`, async t => {
+      const { r, first } = await crashed(t);
+      t.mock.restoreAll();
+      await (successor ? r.restart() : first).sweep();
+      assert.equal(journalRaw(r), "", "the fenced journal was cleared by the certified step");
+      assert.deepEqual(recordNames(r), []);
+      assert.equal(fs.existsSync(r.skills), false);
+      assert.equal((await slotOf(r))?.state, "retired");
+    });
+  }
+
+  it("a journal carrying a different fence is not cleared", async t => {
+    const { r, first } = await crashed(t);
+    t.mock.restoreAll();
+    execFileSync("git", ["-C", r.bare, "config", "--local", `uzi-recovery.${BRANCH}.clone`, JSON.stringify({
+      runId: r.runId, clonePath: r.clone, attemptId: r.bound.attemptId,
+      completionSourceFence: { version: 1, sourceUseEpoch: "99999999-9999-4999-8999-999999999999", sourceCoreDigest: "a".repeat(64) } })], { env: ENV });
+    const raw = journalRaw(r);
+    const files = snapshotFiles(r);
+    await first.sweep();
+    assert.equal(journalRaw(r), raw);
+    assert.deepEqual(snapshotFiles(r), files);
+    assert.equal((await slotOf(r))?.state, "retiring");
+  });
+});

@@ -612,9 +612,9 @@ describe("a stale fence never wedges a clone", () => {
 
   // A published source is not resumed in production: git.ts throws PendingRecoveryCaptureError for a journal
   // that carries a fence before any seed can consume it, so only a never-completed publication's fence is replaced.
-  for (const [label, disturb] of [
-    ["the slot was replaced by a fresh active epoch", (r: Rig) => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"))],
-    ["the slot is retiring under an operator discard", (r: Rig) => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "discard"))],
+  for (const [label, disturb, discard] of [
+    ["the slot was replaced by a fresh active epoch", (r: Rig) => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical")), false],
+    ["the slot is retiring under an operator discard", (r: Rig) => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "discard")), true],
   ] as const) {
     it(`a stale fence is not replaced when ${label}`, async t => {
       const r = await rig(t, { codex: false, cohort: 2 });
@@ -629,12 +629,39 @@ describe("a stale fence never wedges a clone", () => {
       assert.deepEqual(fenceOf(r), foreign, "the stale fence is untouched");
       assert.deepEqual(snapshotFiles(r), before);
       assert.equal(readRecords(r).some(isV2), false);
-      // A discard that deleted nothing restores the exact prior slot when its use ends, so the epoch may
-      // be the disturbance's or the one it displaced; publication never mints or adopts a third.
-      assert.ok([slotBefore?.epoch, leaseEpoch(stale!)].includes((await slotOf(r))?.epoch), "the slot's epoch is not adopted");
-      assert.notEqual((await slotOf(r))?.state, "claude_ready");
+      const after = await slotOf(r);
+      if (discard) {
+        // The discard's quiescence proof ended this incarnation's own active epoch: it is not put back (nobody in
+        // this process would hold it), it ends ineligible under the discard's epoch.
+        assert.equal(after?.state, "ineligible");
+        assert.equal(after?.epoch, slotBefore?.epoch);
+        assert.notEqual(after?.epoch, leaseEpoch(stale!), "the displaced own-incarnation active epoch is not resurrected");
+      } else {
+        assert.ok([slotBefore?.epoch, leaseEpoch(stale!)].includes(after?.epoch), "the slot's epoch is not adopted");
+      }
+      assert.notEqual(after?.state, "claude_ready");
     });
   }
+
+  it("a discard that deleted nothing leaves no dead own-incarnation active slot: a successor incarnation admits afterwards", async t => {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    const active = await slotOf(r);
+    assert.equal(active?.state, "active", "bindSource L1 left the slot active under this incarnation");
+    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "discard"));
+    await r.end();
+    const ended = await slotOf(r);
+    assert.equal(ended?.state, "ineligible");
+    assert.notEqual(ended?.epoch, active?.epoch);
+    const successor = new AuthorityRuntime({ lifetime: r.lifetime, workerToken: TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000 });
+    // A restored dead active epoch would be refused here as "active under another worker incarnation".
+    await successor.withTransaction(() => successor.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    const next = await successor.withTransaction(async tx => {
+      const store = await openAuthorityStore(tx, { workerToken: TOKEN });
+      return store.readSlot(tx, await store.slotKey(tx, r.clone));
+    });
+    assert.equal(next?.state, "active");
+    assert.notEqual(next?.epoch, ended?.epoch);
+  });
 });
 
 describe("crash-era temps do not block publication", () => {

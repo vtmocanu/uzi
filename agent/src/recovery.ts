@@ -5872,8 +5872,13 @@ export function validCompletionSource(value: unknown): value is CompletionSource
  * (orphan reclaim included), releaseAttemptInPlace, prepareRecoverySuccessor, markStoppedCanonical,
  * retainStoppedAttempt, the stopped-journal heal and the already-retired check all refuse or retain a fenced
  * journal before any effect. The only removals are the certified completion retirement (which verifies the
- * fence it clears) and the guarded operator discard (discardRetained*, which carries its own authority); every
- * other journal rewrite spreads the existing journal and so carries the fence along.
+ * fence it clears), its crash-resume sibling GitCache.clearRetiredCompletionJournal (clone already gone, exact
+ * run/path/attempt and the exact durable expected fence, under the bare lock), the guarded operator discard
+ * (discardRetained*, which carries its own authority) and detachTerminalRetained. The last copies the journal,
+ * fence included, into the protected `uzi-retained.<run>.journal` descriptor before it clears the active key;
+ * the captured base parser rejects that descriptor's journal for the unknown fence key (pinned by
+ * test/git-completion-fence.test.ts), so a worker built before the fence still refuses it. Every other journal
+ * rewrite spreads the existing journal and so carries the fence along.
  */
 function decodePersistedCompletionSource(value: unknown): CompletionSource | CompletionSourceV2 | undefined {
   if (value && typeof value === "object" && !Array.isArray(value) && (value as { version?: unknown }).version !== undefined) {

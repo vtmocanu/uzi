@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { GitCache, type FetchAgentBranchOptions, type PositiveOwedCandidateContext, type RecoveryJournalEntry } from "../src/git.js";
 import type { AuthoritySettlement, GitAuthorityHooks } from "../src/git-authority-hooks.js";
@@ -320,6 +321,126 @@ describe("a fenced journal is never cleared or rewritten without its fence by a 
     await assert.rejects(strict.prepareRecoverySuccessor(bare, BRANCH, KEY, source, r.attempts, aid(2)), /completion source fence/);
     assert.deepEqual(configBytes(), before);
     assert.deepEqual(fs.readdirSync(path.dirname(clonePath)), entries, "no successor clone was created");
+  });
+
+  describe("survivors of the non-certified paths", () => {
+    const AB = "agent/issue-2513", AKEY = "issue-2513", ARUN = "run-2513";
+    const aGit = (args: string[]): string => gitIn(bare, args);
+    const aRaw = (): string => aGit(["config", "--get", `uzi-recovery.${AB}.clone`]);
+    const aUnfence = (): void => {
+      const { completionSourceFence: _drop, ...plain } = JSON.parse(aRaw()) as Record<string, unknown>;
+      aGit(["config", `uzi-recovery.${AB}.clone`, JSON.stringify(plain)]);
+    };
+
+    /** A real attempt clone whose journal is fenced; the ledger says `live`. */
+    async function fencedAttempt(): Promise<{ path: string; attemptId: string }> {
+      const attemptId = aid(5);
+      const info = await cache.runnerCloneForBranch(bare, AB, AKEY, {
+        isLive: () => false, beforeFree: async () => { throw new Error("unexpected incumbent"); },
+      }, ARUN, false, undefined, { attemptId, isLive: () => false, beforeSeed: async () => {} });
+      await cache.markRecoveryCapture(bare, info.path, AB, ARUN, attemptId);
+      await cache.installCompletionSourceFence(bare, AB, { runId: ARUN, clonePath: info.path, attemptId }, FENCE);
+      return { path: info.path, attemptId };
+    }
+    const retireLedger = (c: { path: string; attemptId: string }): Promise<void> =>
+      (cache as unknown as { appendAttemptLedger(b: string, br: string, e: unknown): Promise<void> })
+        .appendAttemptLedger(bare, AB, { attemptId: c.attemptId, runId: ARUN, clonePath: c.path, state: "retired" });
+
+    it("retainStoppedAttempt answers unknown on a fenced attempt journal and leaves the config alone", async () => {
+      const c = await fencedAttempt();
+      const before = configBytes();
+      assert.equal(await strict.retainStoppedAttempt(bare, AB, { runId: ARUN, clonePath: c.path, attemptId: c.attemptId }), "unknown");
+      assert.deepEqual(configBytes(), before, "neither the ledger append nor the journal clear happened");
+      aUnfence();
+      assert.equal(await strict.retainStoppedAttempt(bare, AB, { runId: ARUN, clonePath: c.path, attemptId: c.attemptId }), "retained");
+      assert.equal(aGit(["config", "--get", `uzi-recovery.${AB}.clone`]), "");
+    });
+
+    it("the non-certified already-retired check refuses a fenced journal; unfenced it retires and clears", async () => {
+      const c = await fencedAttempt();
+      await retireLedger(c);
+      fs.rmSync(c.path, { recursive: true, force: true });
+      const before = configBytes();
+      assert.equal(await strict.completionSourceAlreadyRetired(bare, AB, ARUN, c.path, c.attemptId), false);
+      assert.deepEqual(configBytes(), before, "the fenced journal is untouched");
+      aUnfence();
+      assert.equal(await strict.completionSourceAlreadyRetired(bare, AB, ARUN, c.path, c.attemptId), true);
+      assert.equal(aGit(["config", "--get", `uzi-recovery.${AB}.clone`]), "");
+    });
+
+    it("healBoundStoppedJournal does not clear a fenced journal even when a marker's digest matches its raw value", async () => {
+      const marker = (raw: string): string => JSON.stringify({ version: 1, runId: RUN, generation: null, branch: BRANCH, key: KEY, clonePath,
+        journalDigest: createHash("sha256").update(raw).digest("hex"), reason: "test", at: "2026-10-27T00:00:00.000Z" });
+      const markerKey = `uzi-stopped.${RUN}.entry`;
+      gitIn(bare, ["config", "--add", markerKey, marker(rawJournal())]);
+      const before = configBytes();
+      await assert.rejects(strict.discoverRetainedRecovery(fx.originPath, BRANCH, KEY, RUN));
+      assert.deepEqual(configBytes(), before, "the fenced journal and the marker are untouched");
+      // The same state without the fence heals: the refusal above is the fence's.
+      unfence();
+      gitIn(bare, ["config", "--unset-all", markerKey]);
+      gitIn(bare, ["config", "--add", markerKey, marker(rawJournal())]);
+      assert.equal(await strict.discoverRetainedRecovery(fx.originPath, BRANCH, KEY, RUN), undefined);
+      assert.equal(gitIn(bare, ["config", "--get", `uzi-recovery.${BRANCH}.clone`]), "");
+    });
+
+    it("the public discardRetainedRecovery refuses a fenced journal before any effect", async () => {
+      const before = configBytes();
+      await assert.rejects(strict.discardRetainedRecovery(bare, BRANCH, KEY, { runId: RUN, clonePath }, true), /completion source fence/);
+      assert.deepEqual(configBytes(), before);
+    });
+
+    describe("clearRetiredCompletionJournal (the certified crash-resume clear)", () => {
+      const clear = (c: GitCache, fence: CompletionSourceFence = FENCE) => c.clearRetiredCompletionJournal(bare, BRANCH, RUN, clonePath, undefined, fence);
+
+      it("canonical: clears only when the clone is gone and the journal names the run and path with exactly the expected fence", async () => {
+        const before = configBytes();
+        assert.equal(await clear(strict), false, "the clone is still there");
+        fs.rmSync(clonePath, { recursive: true, force: true });
+        assert.equal(await clear(strict, OTHER), false, "a different fence");
+        assert.equal(await strict.clearRetiredCompletionJournal(bare, BRANCH, "run-other", clonePath, undefined, FENCE), false, "a different run");
+        assert.equal(await strict.clearRetiredCompletionJournal(bare, BRANCH, RUN, clonePath, aid(2), FENCE), false, "a different attempt");
+        assert.deepEqual(configBytes(), before, "nothing changed");
+        assert.equal(await clear(strict), true);
+        assert.equal(gitIn(bare, ["config", "--get", `uzi-recovery.${BRANCH}.clone`]), "");
+      });
+
+      it("canonical: a journal without a fence is not this step's to clear", async () => {
+        unfence();
+        fs.rmSync(clonePath, { recursive: true, force: true });
+        const before = configBytes();
+        assert.equal(await clear(strict), false);
+        assert.deepEqual(configBytes(), before);
+      });
+
+      it("attempt: needs the ledger to say retired", async () => {
+        const c = await fencedAttempt();
+        fs.rmSync(c.path, { recursive: true, force: true });
+        const before = configBytes();
+        const call = (fence = FENCE) => strict.clearRetiredCompletionJournal(bare, AB, ARUN, c.path, c.attemptId, fence);
+        assert.equal(await call(), false, "ledger still live");
+        assert.deepEqual(configBytes(), before);
+        await retireLedger(c);
+        const withLedger = configBytes();
+        assert.equal(await call(OTHER), false, "a different fence");
+        assert.deepEqual(configBytes(), withLedger);
+        assert.equal(await call(), true);
+        assert.equal(aGit(["config", "--get", `uzi-recovery.${AB}.clone`]), "");
+      });
+    });
+
+    it("detachTerminalRetained copies the fence into the protected descriptor, which the captured base parser rejects", async () => {
+      const source = reconstructionSource();
+      const r = await cache.reserveRecoveryIteration(bare, BRANCH, KEY, source);
+      await cache.recordRecoveryCapture(bare, BRANCH, KEY, source, r.attempts, gitIn(clonePath, ["rev-parse", "HEAD"]));
+      const active = journal() as unknown as RecoveryJournalEntry;
+      assert.deepEqual(active.completionSourceFence, FENCE);
+      await cache.detachTerminalRetained(bare, BRANCH, KEY, active);
+      assert.equal(gitIn(bare, ["config", "--get", `uzi-recovery.${BRANCH}.clone`]), "", "the active key is cleared");
+      const descriptor = JSON.parse(gitIn(bare, ["config", "--get", `uzi-retained.${RUN}.journal`])) as { journal: unknown };
+      assert.deepEqual((descriptor.journal as RecoveryJournalEntry).completionSourceFence, FENCE, "the fence rides in the descriptor");
+      assert.throws(() => baseParseRecoveryJournal(JSON.stringify(descriptor.journal)), /invalid retained recovery clone journal/);
+    });
   });
 });
 
