@@ -6,7 +6,7 @@ import { m3Calls } from "./m3-recovery-fixture.js";
 import { PARK_RUN_CONTINUATION } from "../src/park-run.js";
 import { SummaryRunner, type IntentSummaryInput, type PlanSummaryInput } from "../src/summary-runner.js";
 import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
-import { describe, it, mock } from "node:test";
+import { describe, it, mock, type TestContext } from "node:test";
 import { dependencyWaitQuestion, dependencyWaitAnswer, dependencyWaitProgress, scriptedDependencyWait, dependencyWaitCallbacks, observeDependencyWait, expectDependencyWaitPaused } from "./dependency-wait-fixture.js";
 import assert from "node:assert/strict";
 import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWallRunner } from "./dependency-wait-runner-fixture.js";
@@ -18689,6 +18689,132 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
   });
 
+  // Only these fixtures use a 100 ms idle and a 5 ms runner poll. Keep native,
+  // cancellable handles, but do not let startup latency choose which turn expires.
+  function fixtureIdleScheduler(t: TestContext) {
+    const nativeSetTimeout = globalThis.setTimeout;
+    const nativeClearTimeout = globalThis.clearTimeout;
+    const pending = new Map<ReturnType<typeof setTimeout>, () => void>();
+    const releases = new Set<ReturnType<typeof setImmediate>>();
+    let fired = 0, restored = false;
+    const set = t.mock.method(globalThis, "setTimeout", (callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+      if (ms !== 100) return nativeSetTimeout(callback, ms, ...args);
+      assert.equal(pending.size, 0, "the previous idle deadline was cancelled before rearming");
+      const handle = nativeSetTimeout(() => {}, 0);
+      nativeClearTimeout(handle);
+      pending.set(handle, callback);
+      return handle;
+    });
+    const clear = t.mock.method(globalThis, "clearTimeout", (handle: ReturnType<typeof setTimeout> | undefined) => {
+      if (handle !== undefined) pending.delete(handle);
+      nativeClearTimeout(handle);
+    });
+    return {
+      expireAfterTurnStart: () => {
+        // One immediate per silent turn; let queued thread/start frames re-arm idle
+        // first. Productive turns instead complete and cancel their own deadline.
+        const immediate = setImmediate(() => {
+          releases.delete(immediate);
+          assert.equal(pending.size, 1, "one idle deadline after the silent turn/start");
+          const [handle, callback] = pending.entries().next().value!;
+          pending.delete(handle);
+          fired++;
+          callback();
+        });
+        releases.add(immediate);
+      },
+      assertSettled: (expected: number) => {
+        assert.equal(fired, expected);
+        assert.equal(pending.size, 0, "initial, productive and replacement deadlines cancelled");
+        assert.equal(releases.size, 0, "no queued deadline releases");
+      },
+      restore: () => {
+        if (restored) return;
+        restored = true;
+        for (const immediate of releases) clearImmediate(immediate);
+        releases.clear();
+        pending.clear();
+        set.mock.restore();
+        clear.mock.restore();
+      },
+    };
+  }
+
+  it("3466 real idle expires while startup source admission is held", async t => {
+    const rig = silentRevisionRig();
+    const nativeSetTimeout = globalThis.setTimeout;
+    const scheduler = fixtureIdleScheduler(t);
+    rig.epochs[0]!.transport.requestOverride = c => {
+      if (c.method === "turn/start" && c.turnStartCount === 2) scheduler.expireAfterTurnStart();
+      return undefined;
+    };
+    let release!: () => void, entered!: () => void, expired!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const sourceEntered = new Promise<void>(resolve => { entered = resolve; });
+    const idleExpired = new Promise<void>(resolve => { expired = resolve; });
+    let holdSource = false, sourceHeld = false, retries = 0, realIdleTrips = 0;
+    let terminalRoots = -1, terminalCredentials = -1;
+    const adopt = rig.deps.sessionStore!.adopt;
+    rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!,
+      adopt: async (...args) => {
+        const result = await adopt(...args);
+        if (rig.epochs[0]!.disposed() > 0) holdSource = true;
+        return result;
+      },
+    } };
+    const ctx = revisionContext({
+      beforePlanRevisionTurn: async () => {
+        if (!holdSource) return;
+        sourceHeld = true;
+        entered();
+        try { await withTimeout(held, 3000, "held startup source admission"); }
+        finally { sourceHeld = false; }
+      },
+      retryPlanRevisionTurn: async cause => {
+        assert.ok(cause instanceof TransientRecoveryError && cause.zeroEvidenceIdle);
+        if (++retries > 1) {
+          terminalRoots = rig.providerLaunches();
+          terminalCredentials = rig.client.releaseCalls.length;
+          throw cause.originalIdle!;
+        }
+        scheduler.assertSettled(1);
+        scheduler.restore();
+        // The recreated turn uses the genuine 100 ms timer, including startup.
+        t.mock.method(globalThis, "setTimeout", (callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) =>
+          nativeSetTimeout(ms === 100 ? () => {
+            callback();
+            realIdleTrips++;
+            assert.equal(sourceHeld, true, "real idle expires before source admission returns");
+            expired();
+          } : callback, ms, ...args));
+      },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    const settled = running.catch(error => error);
+    try {
+      await withTimeout(sourceEntered, 3000, "startup source admission entered");
+      await withTimeout(idleExpired, 3000, "real startup idle expiry");
+      assert.equal(rig.providerLaunches(), 1, "held source has not admitted a replacement root");
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+      release();
+      const error = await withTimeout(settled, 3000, "startup idle terminal");
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "codex run idle timeout");
+      assert.equal(realIdleTrips, 1);
+      assert.equal(retries, 2, "second idle is terminal, with no further redrive");
+      await tick();
+      assert.equal(rig.providerLaunches(), terminalRoots, "no root after terminal decision");
+      assert.equal(rig.client.releaseCalls.length, terminalCredentials, "no credential after terminal decision");
+      assert.ok(rig.epochs.slice(0, terminalRoots).every(epoch => epoch.disposed() > 0), "all launched roots disposed");
+      assert.deepEqual(rig.epochs.map(epoch => epoch.transport.turnStartCount), [2, 0]);
+    } finally {
+      release();
+      for (const epoch of rig.epochs) epoch.transport.end();
+      try { await withTimeout(settled, 3000, "startup idle cleanup"); }
+      finally { scheduler.restore(); t.mock.restoreAll(); }
+    }
+  });
+
   for (const mode of ["redrive", "replacement", "cancel", "reject", "unnegotiated"] as const)
     it(`3466 real runner revision silence ${mode} preserves the negotiated source and receipts`, async t => {
     const api = new FakeApi("revision-idle-worker");
@@ -18700,16 +18826,18 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     const url = await api.listen();
     const fx = makeFixture();
     const diagnostics = recordingLog();
+    const scheduler = fixtureIdleScheduler(t);
     const rig = makeMultiEpochRig([c => {
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
       if (c.method === "turn/start") {
         if (c.turnStartCount === 1) c.transport.push(threadStarted())
           .push(toolCall(1, "submit_plan", { plan_md: "# Initial plan" }, "th-1", "tn-1", "plan"))
           .push(turnCompleted("completed"));
+        else scheduler.expireAfterTurnStart();
         return { turn: { id: "tn-1" } };
       }
       return {};
-    }, ...(mode === "redrive" ? [] : Array.from({ length: 3 }, () => epochResponder("th-1", "tn-1", () => {}))),
+    }, ...(mode === "redrive" ? [] : Array.from({ length: 3 }, () => epochResponder("th-1", "tn-1", () => scheduler.expireAfterTurnStart()))),
     epochResponder("th-1", "tn-1", transport => transport
       .push(toolCall(2, "submit_plan", { plan_md: "# Revised plan" }, "th-1", "tn-1", "revised"))
       .push(turnCompleted("completed")))]);
@@ -18802,6 +18930,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         for (const epoch of rig.epochs) epoch.transport.end();
         await withTimeout(running, 3000, "revision runner teardown");
       }
+      scheduler.assertSettled(mode === "redrive" || mode === "unnegotiated" ? 1 : 4);
       const states = api.states.filter(s => s.runId === claim.run_id).map(s => s.body);
       const revised = states.find(s => s.plan_md === "# Revised plan");
       const publishes = mode === "redrive" || mode === "replacement";
@@ -18859,7 +18988,11 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       }
       assert.ok(!states.some(s => s.status === "recovery_wait"));
       assert.ok(!states.some(s => s.failure_reason === "codex run idle timeout"));
-    } finally { for (const epoch of rig.epochs) epoch.transport.end(); await api.close(); fx.cleanup(); }
+    } finally {
+      scheduler.restore();
+      for (const epoch of rig.epochs) epoch.transport.end();
+      await api.close(); fx.cleanup();
+    }
   });
 
   it("3462 a plain idle-message Error has unknown evidence and cannot recover", async () => {
