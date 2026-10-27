@@ -132,7 +132,7 @@ it("claim gate decoding preserves unknown/null/object, closes malformed values a
 });
 
 it("actual state transport decodes the same top-level gate in plain and reconciled ACKs with atomic receipts", async () => {
-  for (const envelope of [{}, reconciliation]) for (const gate of [undefined, null, revisionGate,
+  for (const envelope of [{}, { gate_revision: 7 }, reconciliation]) for (const gate of [undefined, null, revisionGate,
     { ...revisionGate, extra: true }, { ...revisionGate, revision: "01" }]) {
     const wire = { run: revisionRunDTO, ...envelope,
       ...(gate === undefined ? {} : { policy_revision_gate: gate }),
@@ -158,6 +158,26 @@ it("actual state transport decodes the same top-level gate in plain and reconcil
     assert.equal(ack.policyRevisionGate, null);
     assert.equal(ack.revisionInputId, undefined);
     assert.equal(ack.supersededRevisionInputIds, undefined);
+  }
+});
+
+it("partial reconciliation never falls back to plain policy gate coverage", async () => {
+  const response = async (proof: Record<string, unknown>) => {
+    const { client } = await setup(() => Response.json({ run: revisionRunDTO,
+      policy_revision_gate: null, ...proof }), caps, features, 100, revisionWorker);
+    return client.reportState(revisionRun, { status: "running", claim_generation: 2 });
+  };
+  for (const missing of Object.keys(reconciliation)) {
+    const proof: Record<string, unknown> = { ...reconciliation };
+    delete proof[missing];
+    assert.equal((await response(proof)).policyRevisionGate, undefined, missing);
+  }
+  // Each proof-specific marker, even malformed/null, prevents plain-ACK fallback.
+  // gate_revision alone belongs to both encodings and has positive controls above.
+  for (const key of ["claim_generation", "lead_last_seq", "plan_cross_check_settled",
+    "gate_presentation_id", "gate_payload_digest", "current_plan_sha256"]) {
+    for (const value of [null, 0, "malformed"])
+      assert.equal((await response({ [key]: value })).policyRevisionGate, undefined, key);
   }
 });
 

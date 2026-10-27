@@ -5300,9 +5300,15 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     if (res.status === 200 && reconciliation !== undefined &&
         (out.status !== "awaiting_approval" || reconciliation.gateRevision > 0))
       out.reconciliation = reconciliation;
+    // gate_revision also appears on plain presentation ACKs. Any other flat proof
+    // field marks a reconciliation envelope; a partial envelope must not become plain.
+    const hasReconciliationFields = isRecord(parsed) && [
+      "claim_generation", "lead_last_seq", "plan_cross_check_settled",
+      "gate_presentation_id", "gate_payload_digest", "current_plan_sha256",
+    ].some(key => Object.hasOwn(parsed, key));
     if (res.status === 200 && isRecord(parsed) && !Object.hasOwn(parsed, "disposition") &&
         (!Object.hasOwn(parsed, "applied") || parsed.applied === true) &&
-        (!Object.hasOwn(parsed, "claim_generation") || out.reconciliation !== undefined)) {
+        (!hasReconciliationFields || out.reconciliation !== undefined)) {
       const gate = decodePolicyRevisionGate(parsed.policy_revision_gate);
       if (gate !== undefined) out.policyRevisionGate = gate;
     }
