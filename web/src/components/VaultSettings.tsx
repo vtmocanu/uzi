@@ -27,7 +27,7 @@ export function VaultIntroduction() {
 }
 
 export function VaultSettings({ onChanged }: { onChanged: () => Promise<void> }) {
-  const { vaultMode, vaultPolicy, vaultUnlocked, hasPassword, refresh } = useAuth();
+  const { vaultMode, vaultPolicy, vaultUnlocked, hasPassword, refresh, beginVaultChange, vaultMetadataPending } = useAuth();
   const off = vaultMode === "unprotected";
   const required = vaultPolicy !== "optional";
   const [enrolling, setEnrolling] = useState(false);
@@ -38,7 +38,11 @@ export function VaultSettings({ onChanged }: { onChanged: () => Promise<void> })
   const [notice, setNotice] = useState("");
   const { lock, locking } = useVaultLock(() => setNotice("Vault locked. Runs already in flight finish; new runs wait until you unlock from the banner above."));
   const changed = async () => {
-    await refresh(true);
+    try {
+      await refresh(true, true);
+    } catch {
+      setError("Protection changed, but vault/session metadata could not be refreshed. Retry when the server is available.");
+    }
     emitSidebarTokensChanged();
     await onChanged();
   };
@@ -46,8 +50,11 @@ export function VaultSettings({ onChanged }: { onChanged: () => Promise<void> })
     e.preventDefault();
     setBusy(true); setError(""); setNotice("");
     try {
+      const apply = beginVaultChange?.();
       const result = await api.vaultEnable(password);
-      setPassword(""); setConfirm(""); setEnrolling(false);
+      setPassword(""); setConfirm("");
+      if (apply && !apply(result.mode)) return;
+      setEnrolling(false);
       setNotice(result.rotation_advice || "Protection is on. Older database backups may still contain server-key encrypted credentials. Rotate credentials for protection against those backups.");
       await changed();
     } catch (err) {
@@ -57,7 +64,9 @@ export function VaultSettings({ onChanged }: { onChanged: () => Promise<void> })
   const disable = async () => {
     setBusy(true); setError(""); setNotice("");
     try {
-      await api.vaultDisable();
+      const apply = beginVaultChange?.();
+      const result = await api.vaultDisable();
+      if (apply && !apply(result.mode)) return;
       setNotice("Protection is off. Credentials now use server-key encryption.");
       await changed();
     } catch (err) { setError(errorMessage(err, "Failed to disable protection.")); }
@@ -74,6 +83,7 @@ export function VaultSettings({ onChanged }: { onChanged: () => Promise<void> })
     {error && <Alert message={error} />}
     {notice && <Alert tone="info" message={notice} />}
     <VaultBadge />
+    {vaultMetadataPending && <Alert tone="warning" message="Protection mode is confirmed. Vault lock and session metadata are unknown until a successful refresh." />}
     {off ? <Button disabled={busy || enrolling} onClick={() => setEnrolling(true)}>Enable protection</Button> : <>
       {vaultUnlocked ? <Button variant="secondary" disabled={busy || locking} onClick={() => void lock().catch(err => setError(errorMessage(err, "Failed to lock vault.")))}>Lock vault</Button> : <p>Unlock your vault from the banner above before disabling protection.</p>}
       <Button variant="secondary" disabled={busy || required || !vaultUnlocked} onClick={disable}>Disable protection</Button>

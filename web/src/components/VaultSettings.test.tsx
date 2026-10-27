@@ -65,7 +65,7 @@ it("enrolls OIDC off users intentionally, validates confirmation and refreshes c
   expect(await screen.findByText("Rotate credentials exposed in older backups.")).toBeTruthy();
   await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
   expect(api.vaultEnable).toHaveBeenCalledWith("oidc-passphrase-123");
-  expect(refresh).toHaveBeenCalledWith(true);
+  expect(refresh).toHaveBeenCalledWith(true, true);
   expect(changed).toHaveBeenCalledTimes(1);
   unsubscribe();
 });
@@ -77,7 +77,7 @@ it("disables unlocked optional protection and refreshes credentials", async () =
   fireEvent.click(screen.getByRole("button", { name: "Disable protection" }));
   await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
   expect(api.vaultDisable).toHaveBeenCalledTimes(1);
-  expect(refresh).toHaveBeenCalledWith(true);
+  expect(refresh).toHaveBeenCalledWith(true, true);
 });
 
 it("dismisses the off introduction across mounts without dismissing required enrollment", () => {
