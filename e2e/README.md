@@ -54,8 +54,9 @@ Phase34 retains protected lock → queued → unlock → claim, protected seed b
 unlock, normal-user restart lock, and legacy master → DEK lazy rewrap. It also
 disables the admin under optional policy, restores required policy, restarts with
 seed env retained, and proves Off stays wrapper-free, `master_aad`-sealed and
-runnable without login/unlock. Both admin rate-limit DTO families must report Off,
-not locked. Its Off run reaches the plan gate and completes. Success restores
+runnable without login/unlock. The Anthropic admin meter row must report Off,
+not locked. This phase has no linked Codex account, so its accountless owner is
+absent from the Codex meter list. Its Off run reaches the plan gate and completes. Success restores
 required policy and both users protected/unlocked; failure attempts independent
 bounded restoration and cancellation without hiding failures or strict-lane leaks.
 

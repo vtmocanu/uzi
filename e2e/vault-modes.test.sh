@@ -66,8 +66,9 @@ simulate() (
       /api/admin/settings) jq -cn --arg p "$(cat "$STATE/policy")" '{settings:{vault_policy:$p},unprotected_users:1}' ;;
       /api/admin/vault-migration)
         if [ "$(cat "$STATE/user2-sealed")" = master ]; then echo '{"master_sealed":1}'; else echo '{"master_sealed":0}'; fi ;;
-      /api/admin/rate-limits|/api/admin/codex-rate-limits)
+      /api/admin/rate-limits)
         echo '{"users":[{"email":"admin@uzi.e2e","vault_mode":"unprotected","vault_locked":false}]}' ;;
+      /api/admin/codex-rate-limits) echo '{"users":[]}' ;;
       /api/runs/*) echo '{"run":{"status":"queued"}}' ;;
       *) return 90 ;;
     esac
@@ -180,8 +181,16 @@ for scenario in success off-enrolled-at-boot off-claim-fails cleanup-enable-fail
     if [ "$scenario" = off-claim-fails ] || [ "$scenario" = cleanup-enable-fails ]; then
       grep -qF 'post /api/runs/off-run/inputs' "$fixture/$scenario/calls" || valid=false
     fi
+    if [ "$scenario" = off-claim-fails ]; then
+      [ "$(cat "$fixture/$scenario/admin")" = protected ] \
+        && [ "$(cat "$fixture/$scenario/admin-unlocked")" = true ] \
+        && [ "$(cat "$fixture/$scenario/admin-sealed")" = dek ] || valid=false
+    fi
     if [ "$scenario" = cleanup-enable-fails ]; then
       grep -qF 'admin enable failed' "$fixture/$scenario.log" || valid=false
+      [ "$(cat "$fixture/$scenario/admin")" = unprotected ] \
+        && [ "$(cat "$fixture/$scenario/admin-unlocked")" = false ] \
+        && [ "$(cat "$fixture/$scenario/admin-sealed")" = master_aad ] || valid=false
     fi
   fi
   if [ "$valid" = true ]; then

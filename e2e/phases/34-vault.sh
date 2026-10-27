@@ -178,11 +178,11 @@ vault_status_jar "$JAR" | jq -e '.mode == "unprotected" and .policy == "required
 assert_protected "$JAR2" false
 apiget /api/admin/settings | jq -e '.settings.vault_policy == "required" and .unprotected_users >= 1' >/dev/null \
   || fail "admin settings must count the existing Off user under required policy"
-for endpoint in /api/admin/rate-limits /api/admin/codex-rate-limits; do
-  apiget "$endpoint" | jq -e --arg email "$ADMIN_EMAIL" \
-    '[.users[] | select(.email == $email)] | length == 1 and (.[0] | .vault_mode == "unprotected" and .vault_locked == false)' >/dev/null \
-    || fail "Off admin mislabeled as locked in $endpoint"
-done
+# The Anthropic list includes this owner. Codex omits accountless owners;
+# this phase creates no linked Codex account and cannot assert its owner DTO.
+apiget /api/admin/rate-limits | jq -e --arg email "$ADMIN_EMAIL" \
+  '[.users[] | select(.email == $email)] | length == 1 and (.[0] | .vault_mode == "unprotected" and .vault_locked == false)' >/dev/null \
+  || fail "Off admin mislabeled as locked in /api/admin/rate-limits"
 IID_OFF="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E Off vault claim after restart","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
 RUN_OFF="$(create_run "$REPO_ID" "$IID_OFF")" || fail "Off run-create failed"
