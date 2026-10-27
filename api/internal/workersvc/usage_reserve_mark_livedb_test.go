@@ -489,6 +489,10 @@ func TestReserveQueueReasonBoardJobAndMaintenanceReadsLiveDB(t *testing.T) {
 		}
 		_ = tx.Commit(context.Background())
 	})
+	// ListMaintenanceHeldRuns is instance-wide, ordered by (status_since, id) and capped at 50; on a
+	// shared LiveDB, parked runs left by earlier tests can push this run past the cap. Make it the
+	// oldest held run so the assertion does not depend on other rows.
+	fx.env.exec(`UPDATE runs SET status_since = '1970-01-01T00:00:00Z' WHERE id = $1`, requeued)
 	held, err := fx.env.q.ListMaintenanceHeldRuns(fx.env.ctx)
 	if err != nil {
 		t.Fatal(err)
