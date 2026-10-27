@@ -21,9 +21,11 @@ import { nullLogger, noProofReseed } from "./helpers.js";
 // (see fixtures/authority-crash-child.ts). A successor is then built in this process over the same data
 // directory and the observable end states (filesystem, refs, the durable slot) are asserted.
 //
-// Host note: the production flock trust check wants util-linux; a BusyBox host uses the argument adapter of
-// test/authority-test-support.ts around the SAME kernel flock (the trust check itself is asserted by
-// test/authority-lock.test.ts, and is the one thing this host cannot run: `utilLinux` is false here).
+// Host note: the production flock trust check wants util-linux. The argument adapter of
+// test/authority-test-support.ts (around the SAME kernel flock) is used only when the host flock is not
+// util-linux (e.g. BusyBox); on CI, where util-linux is present, the production path runs unadapted. The
+// trust check itself is asserted by test/authority-lock.test.ts. This file was also verified under util-linux
+// 2.38.1 in a node:24.20.0-bookworm container.
 
 const TOKEN = "m4-crash-proof-join-token";
 const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
@@ -113,9 +115,12 @@ function alive(pid: number): boolean {
   } catch { return false; }
 }
 
-/** The helper has reported its status, so its `sh` is about to exit; wait for the kernel to say so. */
+/** The helper has reported its status, so its `sh` is about to exit; wait for the kernel to say so. The helper
+ * is an orphan of the SIGKILLed worker (reparented to init), so there is no exit event to subscribe to; this
+ * polls the kernel's view against a generous wall-clock deadline (not an iteration count, not an ordering sleep). */
 async function gone(pid: number): Promise<void> {
-  for (let i = 0; i < 5000 && alive(pid); i++) await new Promise((resolve) => setImmediate(resolve));
+  const deadline = Date.now() + 60_000;
+  while (alive(pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(alive(pid), false, "the helper process is gone");
 }
 
@@ -295,7 +300,9 @@ const refSha = (bare: string, ref: string): string => gitIn(bare, ["for-each-ref
 
 // UZI_M4_ABA_MUTANT=1 is set only against the disposable mutation export that bypasses assertBareClear's
 // pending-footprint check. The same scenario then witnesses the ABA the guard prevents; without it, the
-// production behaviour is asserted.
+// production behaviour is asserted. The exact one-line bypass (agent/src/authority-runtime.ts #assertBareClear):
+//   -    if (slot?.pending?.status === "running") {
+//   +    if (false && slot?.pending?.status === "running") {
 const ABA_MUTANT = process.env.UZI_M4_ABA_MUTANT === "1";
 
 test("proof 2: a delayed expected-SHA update-ref -d outlives its SIGKILLed owner; renewal of the same ref to the same SHA refuses", { timeout: 120_000 }, async (t) => {
@@ -332,6 +339,7 @@ test("proof 2: a delayed expected-SHA update-ref -d outlives its SIGKILLed owner
     // Witness of the regression the guard prevents: renewal "succeeds" on top of the pending deletion, then
     // the delayed child really deletes the ref the successor believes it re-pinned.
     assert.equal(refusal, undefined, "mutant: renewal was admitted over the unresolved bare record");
+    assert.equal(anchored, true, "mutant: the recovery-pin anchor renewal was admitted too");
     assert.equal(renewed?.sha, g.coverage.sha);
     assert.equal(survivors, "", "mutant: the released delayed child deleted the renewed ref");
     return;
