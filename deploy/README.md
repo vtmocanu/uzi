@@ -85,8 +85,8 @@ atomically, it does not ship a half-version.
 
 ## Release procedure
 
-Standard releases use `.github/workflows/release-auto.yml` on main. This first stage
-is **dispatch-only**; a schedule follows a proven live RC. The shared scripts below
+Standard releases use `.github/workflows/release-auto.yml` on main, with manual
+dispatch and opt-in nightly RC attempts. The shared scripts below
 remain the local fallback. [ADR-3512](../adr/3512-release-automation.md) records the
 accepted authorization boundary and staged recovery work.
 
@@ -99,6 +99,7 @@ Before the first live dispatch, the maintainer configures and verifies:
 | `release-rc` | Main-only Environment; `RELEASE_APP_ID` variable, `RELEASE_APP_KEY` secret |
 | `release-stable` | Main-only; same variable/secret names, required maintainer reviewer, prevent self-review off for the solo-maintainer case |
 | `RELEASE_DISPATCHERS` | Repository variable, comma/space-separated exact GitHub logins |
+| `RELEASE_NIGHTLY_ENABLED` | Repository variable; only exact `true` enables nightly RC attempts, unset/false pauses them |
 | Main review rules | Pull requests/checks; admin and RC App bypass |
 | Main integrity rules | Deletion/non-fast-forward; admin bypass only |
 | Stable-tag creation | `v*` excluding `v*-rc.*`; admin and stable App bypass |
@@ -153,13 +154,40 @@ An unconfirmed push receipt stops watch before publication recovery and
 verification, so automatic publication retries do not run in that branch.
 Inspect remote refs, then use local watch/verify against the same tag/SHA.
 
+Nightly attempts start at 04:47 Europe/Bucharest using GitHub's native timezone
+schedule, after the local maintenance window, aiming to cut near 05:00. They are
+off until the maintainer sets `RELEASE_NIGHTLY_ENABLED=true`. Unset it or set it
+to `false` to pause future nightly attempts; manual dispatch still works. Cancel
+any existing attempt separately if necessary. Disabling the whole workflow
+also disables manual dispatch. Scheduled authorization pins repository, main ref
+and event/run metadata, without treating the scheduler as an allowlisted human.
+
+The shared cutter's read-only plan decides nightly eligibility: at least one
+non-metadata shipping first-parent change since the newest open-train RC or
+previous stable, with releasable notes. Notes-only and exempt-only ranges can be
+reported no-ops; they do not wait for CI or create a bundle. Failed previous
+publication and other blocked plans still refuse. Manual RC respins preserve
+the cutter's existing empty-delta behavior.
+
+The provisional push cutoff is strictly before 06:00 on the original run's
+Bucharest calendar date. A queued run does not gain a fresh window tomorrow.
+Tip waiting ends by 05:50, reserving ten minutes for cutting; push independently
+checks the cutoff immediately before the atomic update. A missed window stops
+with `missed-target` and no push; a tip not green in its budget is reported
+separately. Main races never cause automatic rebasing or an older-tip fallback.
+Expected no-ops stay in the summary; misses and failures update the tracking
+issue. Once a tag is pushed, recovery ignores the cutoff and pause flag.
+Verification recorded after the 07:00 local target produces a late warning,
+retaining verified success without opening an extra incident. These times are
+best-effort targets, subject to Actions delays and the shared non-cancelling queue.
+
 Manual tip selection is bounded at 120 minutes plus 10 minutes for cutting.
 Publication watching retains its 60-minute bound within the 120-minute recovery
 allowance. **D10 is partial until 3e-3:** only the single eligible pre-cut main-CI
 infrastructure rerun and existing non-gate publication retries are automated.
 Tagged-KinD, release-commit CI and targeted assertion recovery remain fail-closed
-follow-up work. Scheduling, local morning cutoff and first-week contention
-measurements are separate rollout steps. The procedures below are the local path.
+follow-up work. First-week contention measurements remain a rollout check.
+The procedures below are the local path.
 
 **Releases are cut RC-first** (ADR-1265, PRD #1265). `release-cut X.Y.Z`
 (`.agents/skills/uzi-release/`) cuts a release **candidate** `vX.Y.Z-rc.1` by default: it

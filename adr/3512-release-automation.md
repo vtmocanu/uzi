@@ -89,7 +89,7 @@ flowchart LR
 
 ## Stages and limits
 
-3e-1 exposes dispatch only. Tip selection has 120 minutes plus 10 minutes for
+3e-1 introduced manual dispatch. Manual tip selection has 120 minutes plus 10 minutes for
 cutting; publication watching retains its 60-minute bound, within a 120-minute
 post-push recovery allowance and enclosing job timeouts. No morning cutoff
 applies to dispatch. A single allowlisted infrastructure rerun of pre-cut main
@@ -106,9 +106,30 @@ complete. Pre-cut CI retries already record steps, attempt and result.
 Publication/verification timestamps are recorded without claiming deployment
 health. Runner-slot and critical-path impact remain unmeasured until live use.
 
-3e-2 adds scheduling only after a proven live RC: Europe/Bucharest, target about
-05:00, provisional 06:00 pre-push cutoff. No schedule is active in 3e-1. All
-routes share a non-cancelling queue, bounded by GitHub's 100 pending runs. A
+3e-2 adds opt-in scheduling after the proven live RC. Cron `47 4 * * *` uses
+GitHub's native `timezone: Europe/Bucharest`, targeting a cut near 05:00 after
+the local maintenance window ([schedule syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onschedule)).
+Only exact `RELEASE_NIGHTLY_ENABLED=true` enables nightly attempts; unset/false
+is a reported no-op. Activation belongs to the maintainer. Pausing does not
+disable manual dispatch or interrupt an existing run. Schedule authorization
+pins repository, main ref, event and original run metadata, with canonical RC
+inputs only. Manual dispatch keeps the actor allowlist and input checks.
+Stable remains manual.
+
+Nightly eligibility comes only from `release-cut.sh --plan`: a non-metadata
+shipping change plus releasable notes. A no-op stops before CI waiting, cutting
+or artifact upload. Blocked plans are not converted into no-ops; manual empty
+respins retain the cutter's rules. The provisional cutoff is strictly before
+06:00 on the original run creation's Bucharest date. Tip waiting ends by 05:50,
+reserving the existing ten-minute cut budget without resetting on tip changes.
+The isolated push job independently requires the enable flag before minting
+and recomputes the cutoff inline immediately before pushing;
+an expired window records `missed-target` and no attempted push. A queued run
+cannot acquire a new window on the following date. Manual budgets are unchanged.
+After tagging, bounded recovery ignores the cutoff and pause flag. Verification
+recorded after 07:00 is marked late without changing verified success or opening
+an extra incident. No clock-driven recovery cancellation or D10 journal is added.
+All routes share a non-cancelling queue, bounded by GitHub's 100 pending runs. A
 pending stable approval can delay RC work. A run cancelled before starting
 cannot produce its own report; its Actions status remains the evidence.
 
