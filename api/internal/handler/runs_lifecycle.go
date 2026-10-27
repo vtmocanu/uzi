@@ -1084,7 +1084,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 				names = strings.Join(unmet.Unmet, ", ")
 			}
 			httpx.Error(w, http.StatusConflict, "the plan requires capabilities the assigned worker cannot satisfy: "+names+
-				". Provision or start a worker with: "+names+"; or re-run with: uzi run approve "+id.String()+" --override-capabilities to run without it")
+				". Provision or start a worker with: "+names+"; or approve without it: \"Run without "+names+"\" in the web UI, or uzi run approve "+id.String()+" --override-capabilities")
 		default:
 			slog.Error("submit run input", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
