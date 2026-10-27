@@ -32,6 +32,7 @@
 # --fold-order-only runs canonical pending/open-RC ordering fixtures.
 # --promote-main-race-only [cutter-path] pins promotion while remote main advances.
 # --plan-only [cutter-path] runs read-only decision and publication fixtures.
+# --diagnostics-only runs real cutter/oracle structured-refusal fixtures.
 # --fragments-only [cutter-path] runs fragment regressions, optionally against a frozen cutter.
 #
 # Wired as `task test:release-scripts` (its own gate member, not gate:repo's
@@ -525,7 +526,7 @@ if [ "${1:-}" = "--identity-only" ]; then
   exit $?
 fi
 
-if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ] && [ "${1:-}" != "--plan-only" ] && [ "${1:-}" != "--promote-main-race-only" ]; then
+if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ] && [ "${1:-}" != "--plan-only" ] && [ "${1:-}" != "--promote-main-race-only" ] && [ "${1:-}" != "--diagnostics-only" ]; then
 identity_regressions
 echo "=== building fixture in $REPO ==="
 build_fixture
@@ -663,6 +664,7 @@ seed_repo() {
   cp "$SCRIPTS_DIR/changelog-fragment-citations.py" "$d/scripts/changelog-fragment-citations.py"
   cp "$SCRIPTS_DIR/lib/release-mode.sh" "$d/scripts/lib/release-mode.sh"
   cp "$SCRIPTS_DIR/lib/changelog-bullets.awk" "$d/scripts/lib/changelog-bullets.awk"
+  [ ! -f "$SCRIPTS_DIR/lib/release-diagnostics.py" ] || cp "$SCRIPTS_DIR/lib/release-diagnostics.py" "$d/scripts/lib/release-diagnostics.py"
   [ ! -f "$SCRIPTS_DIR/lib/ghcr.sh" ] || cp "$SCRIPTS_DIR/lib/ghcr.sh" "$d/scripts/lib/ghcr.sh"
   cat > "$d/deploy/chart/Chart.yaml" <<'YAML'
 apiVersion: v2
@@ -727,6 +729,35 @@ add_origin() {
 push_tag_to_origin() { git -C "$1" push -q origin "refs/tags/$2"; }
 
 feature_201_changelog() { printf '# Changelog\n\n## [Unreleased]\n### Added\n- **Feature 201** (#201)\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' | put_changelog "$1"; }
+
+diagnostic_regressions() (
+  PASSES=0; FAILS=0
+  local d result before missing_sha
+  d=$(mktemp -d); result="$d.result.json"
+  trap 'rm -rf "$d"; rm -f "$result"' EXIT
+  seed_repo "$d"
+  add_feature "$d" 201
+  feature_201_changelog "$d"
+  run_rc "$d" 0.2.0 --result-file "$result"
+  assert_eq 'diagnostic cut succeeds' 0 "$RC_RC"
+  assert_eq 'diagnostic cut ready' ready "$(jq -r .reason "$result" 2>/dev/null)"
+  assert_eq 'diagnostic cut target' v0.2.0-rc.1 "$(jq -r .planned_tag "$result" 2>/dev/null)"
+  git -C "$d" tag v0.2.0-rc.1
+  add_feature "$d" 202
+  before=$(git -C "$d" rev-parse HEAD); missing_sha=$before
+  run_rc "$d" 0.2.0 --result-file "$result"
+  assert_eq 'diagnostic oracle refusal preserves cut exit' 1 "$RC_RC"
+  assert_eq 'diagnostic oracle reason survives rollback' changelog-coverage-refused "$(jq -r .reason "$result" 2>/dev/null)"
+  assert_eq 'diagnostic refusal target' v0.2.0-rc.2 "$(jq -r .planned_tag "$result" 2>/dev/null)"
+  assert_eq 'diagnostic refusal stage' changelog-coverage "$(jq -r .stage "$result" 2>/dev/null)"
+  assert_eq 'diagnostic uncited commit' "$missing_sha" "$(jq -r '.uncited[0].sha' "$result" 2>/dev/null)"
+  assert_eq 'diagnostic uncited PR' 202 "$(jq -r '.uncited[0].pr' "$result" 2>/dev/null)"
+  assert_eq 'diagnostic refusal still undoes the commit' "$before" "$(git -C "$d" rev-parse HEAD)"
+  echo "diagnostics: $PASSES passed, $FAILS failed"
+  [ "$FAILS" -eq 0 ]
+)
+if [ "${1:-}" = --diagnostics-only ]; then diagnostic_regressions; exit $?; fi
+if [ "$#" -eq 0 ]; then diagnostic_regressions || fail 'structured diagnostic regressions'; fi
 
 published_rc() {
   seed_repo "$1"; add_origin "$1"; add_feature "$1" 201

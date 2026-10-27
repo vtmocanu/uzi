@@ -255,6 +255,11 @@ auto_jobs.each do |name, job|
 end
 assert.call(auto_jobs.fetch('report').fetch('if'), 'always()', 'failure reporting runs after skipped jobs')
 auto_prepare = auto_jobs.fetch('prepare')
+%w[stage planned_tag uncited uncited_count uncited_truncated].each do |field|
+  assert.call(auto_prepare.fetch('outputs').fetch(field), "${{ steps.prepare.outputs.#{field} }}", "prepare forwards public diagnostic #{field}")
+end
+assert.call(auto_jobs.fetch('watch').fetch('outputs').fetch('reason'),
+            '${{ steps.admit.outputs.reason || steps.watch.outputs.reason }}', 'watch forwards admission and receipt/publication failure reasons')
 assert.call(auto_prepare.fetch('if'), "needs.authorize.outputs.outcome == 'authorized'", 'prepare requires current authorization')
 assert.call(auto_jobs.fetch('authorize').fetch('steps').find { |step| step['id'] == 'authorize' }.fetch('run'),
             'python3 -I scripts/release-auto.py authorize', 'dispatch schema and context validator actually runs')
@@ -580,6 +585,47 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   exercise.call({'TEST_REMOTE' => lost_remote, 'TEST_FAIL_AFTER_PUSH' => '1'}, true, true, bundle, {}, 'receipt-unknown')
   exercise.call({}, true, true)
 end
+# Execute the actual watch step with offline stand-ins. Receipt failure must be
+# owned by watch before reporting can become a successful delivery job (#3551).
+watch_script = auto_jobs.fetch('watch').fetch('steps').find { |step| step['id'] == 'watch' }.fetch('run')
+Dir.mktmpdir('release-watch-receipt') do |dir|
+  bin = File.join(dir, 'bin')
+  release_scripts = File.join(dir, '.agents/skills/uzi-release/scripts')
+  FileUtils.mkdir_p([bin, release_scripts])
+  File.write(File.join(bin, 'git'), <<~'SH')
+    #!/bin/sh
+    case "$1" in
+      rev-parse) printf '%s\n' "$RELEASE_SHA" ;;
+      fetch) exit 0 ;;
+      merge-base) exit "$WATCH_RECEIPT_RC" ;;
+      *) exit 99 ;;
+    esac
+  SH
+  File.write(File.join(bin, 'python3'), "#!/bin/sh\n[ \"$*\" = '-I scripts/release-auto.py watch-log' ] || exit 99\n")
+  File.write(File.join(bin, 'date'), "#!/bin/sh\nprintf '2026-10-27T09:00:00Z\\n'\n")
+  File.write(File.join(release_scripts, 'release-watch.sh'), "#!/bin/sh\nprintf 'watch\\n' >> \"$WATCH_CALLS\"\n")
+  File.write(File.join(release_scripts, 'release-verify.sh'), "#!/bin/sh\nprintf 'verify\\n' >> \"$WATCH_CALLS\"\nexit \"$VERIFY_RC\"\n")
+  Dir.glob(File.join(bin, '*')).concat(Dir.glob(File.join(release_scripts, '*'))).each { |path| File.chmod(0o700, path) }
+  environment = {'PATH' => "#{bin}:#{ENV.fetch('PATH')}", 'RELEASE_SHA' => '1' * 40,
+                 'RELEASE_TAG' => 'v0.2.0-rc.1', 'RELEASE_KIND' => 'rc', 'RUNNER_TEMP' => dir,
+                 'GITHUB_OUTPUT' => File.join(dir, 'outputs'), 'WATCH_CALLS' => File.join(dir, 'calls')}
+  [[1, 0, false], [0, 1, false], [0, 0, true]].each do |receipt_rc, verify_rc, expected|
+    FileUtils.rm_f(environment.fetch('WATCH_CALLS'))
+    File.write(environment.fetch('GITHUB_OUTPUT'), '')
+    _, err, status = Open3.capture3(environment.merge('WATCH_RECEIPT_RC' => receipt_rc.to_s, 'VERIFY_RC' => verify_rc.to_s),
+                                   'bash', '-e', '-c', watch_script, chdir: dir)
+    assert.call(status.success?, expected, "watch receipt=#{receipt_rc}, verify=#{verify_rc}: #{err}")
+    output = File.read(environment.fetch('GITHUB_OUTPUT'))
+    if receipt_rc != 0
+      assert.call(File.exist?(environment.fetch('WATCH_CALLS')), false, 'unconfirmed receipt stops before publication recovery')
+      assert.call(output.include?('reason=push-receipt-unconfirmed'), true, 'watch owns the receipt failure reason')
+    elsif verify_rc != 0
+      assert.call(output.include?('reason=publication-unconfirmed'), true, 'watch owns failed publication verification')
+    else
+      assert.call(output.include?('outcome=published-and-verified'), true, 'confirmed publication remains successful')
+    end
+  end
+end
 # Reporting has no checkout/contents grant. Execute its exact inline program with
 # a fake API; healthy publication is summary-only, and failures reuse one issue.
 report_script = auto_jobs.fetch('report').fetch('steps').first.fetch('run')
@@ -589,6 +635,7 @@ Dir.mktmpdir('release-report') do |dir|
   File.write(File.join(bin, 'gh'), <<~'RUBY')
     #!/usr/bin/env ruby
     require 'json'
+    abort 'fixture reporting failure' if ENV['REPORT_FAIL'] == '1'
     File.open(ENV.fetch('REPORT_CALLS'), 'a') { |file| file.puts(ARGV.join(' ')) }
     input = ARGV.include?('--input') ? JSON.parse(STDIN.read) : nil
     if ARGV.include?('--slurp')
@@ -598,6 +645,7 @@ Dir.mktmpdir('release-report') do |dir|
       puts({'number' => 42, 'state' => 'open'}.to_json)
     elsif ARGV.any? { |arg| arg.end_with?('/comments') }
       abort 'unsafe issue body' if input.fetch('body').include?('credential-sentinel')
+      File.write(ENV.fetch('REPORT_BODY'), input.fetch('body'))
       puts({'id' => 1}.to_json)
     else
       abort 'unexpected issue creation or API request'
@@ -611,25 +659,69 @@ Dir.mktmpdir('release-report') do |dir|
   environment = {'PATH' => "#{bin}:#{ENV.fetch('PATH')}", 'REPORT_CALLS' => File.join(dir, 'calls'),
                  'GH_TOKEN' => 'credential-sentinel', 'REPOSITORY' => 'vtmocanu/uzi', 'RUN_ID' => '123',
                  'RUN_URL' => 'https://github.com/vtmocanu/uzi/actions/runs/123', 'GITHUB_STEP_SUMMARY' => File.join(dir, 'summary')}
+  environment['REPORT_BODY'] = File.join(dir, 'body')
   _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => normal.to_json), 'bash', '-e', '-c', report_script)
   assert.call(status.success?, true, "healthy publication reporting: #{err}")
   assert.call(File.exist?(File.join(dir, 'calls')), false, 'healthy publication never opens or comments on an issue')
   failed = Marshal.load(Marshal.dump(normal))
   failed['prepare'] = {'result' => 'failure', 'outputs' => {'outcome' => 'blocked', 'reason' => 'codex-runtime-needs-local-cut'}}
   _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => failed.to_json), 'bash', '-e', '-c', report_script)
-  assert.call(status.exitstatus, 1, "blocked report remains visibly failed: #{err}")
+  assert.call(status.success?, true, "successful incident delivery does not create a second failure: #{err}")
   calls = File.read(File.join(dir, 'calls'))
   assert.call(calls.include?('PATCH repos/vtmocanu/uzi/issues/42'), true, 'closed tracking issue is reopened')
   assert.call(calls.include?('POST repos/vtmocanu/uzi/issues/42/comments'), true, 'existing tracking issue receives incident')
+  rejected = Marshal.load(Marshal.dump(normal))
+  rejected['push'] = {'result' => 'failure', 'outputs' => {'outcome' => 'push-rejected', 'attempted' => 'false', 'reason' => 'push-rejected'}}
+  rejected['watch'] = {'result' => 'skipped', 'outputs' => {}}
+  _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => rejected.to_json), 'bash', '-e', '-c', report_script)
+  assert.call(status.success?, true, "definitive rejection is delivered: #{err}")
+  rejection_body = File.read(environment.fetch('REPORT_BODY'))
+  assert.call(rejection_body.include?('"push_attempted": true'), true, 'a rejected Git push was attempted even though watch is skipped')
+  assert.call(rejection_body.include?('No push was attempted.'), false, 'recovery marker is not mistaken for literal push attempt status')
   %w[failure cancelled].each do |result|
     interrupted = Marshal.load(Marshal.dump(normal))
     interrupted['push'] = {'result' => result, 'outputs' => {'attempted' => 'true'}}
     interrupted['watch'] = {'result' => 'failure', 'outputs' => {}}
     _, _, status = Open3.capture3(environment.merge('NEEDS_JSON' => interrupted.to_json), 'bash', '-e', '-c', report_script)
-    assert.call(status.exitstatus, 1, "#{result} after send remains an incident")
+    assert.call(status.success?, true, "#{result} after send is delivered successfully")
     text = File.read(environment.fetch('GITHUB_STEP_SUMMARY'))
     assert.call(text.include?('"push_outcome": "receipt-unknown"'), true, "#{result} with missing receipt is unknown")
     assert.call(text.include?('"outcome": "partial-publication"'), true, "#{result} reports same-tag manual inspection")
+  end
+  failed['prepare']['outputs'].merge!('reason' => 'changelog-coverage-refused', 'phase' => 'prepare',
+                                    'stage' => 'changelog-coverage', 'planned_tag' => 'v0.2.0-rc.11',
+                                    'uncited' => [{sha: '1' * 40, pr: 3486}].to_json,
+                                    'uncited_count' => '1', 'uncited_truncated' => 'false')
+  failed['push'] = {'result' => 'skipped', 'outputs' => {}}
+  failed['watch'] = {'result' => 'skipped', 'outputs' => {}}
+  _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => failed.to_json), 'bash', '-e', '-c', report_script)
+  assert.call(status.success?, true, "oracle refusal is delivered: #{err}")
+  body = File.read(environment.fetch('REPORT_BODY'))
+  assert.call(body.include?('3486'), true, 'incident includes the uncited PR identity')
+  assert.call(body.include?('"planned_tag": "v0.2.0-rc.11"'), true, 'incident identifies the planned candidate')
+  assert.call(body.include?('"push_attempted": false'), true, 'prepare refusal explicitly proves push was skipped')
+  assert.call(body.include?('"changes": null'), true, 'uncollected changes are not described as an empty shipping set')
+  _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => failed.to_json, 'REPORT_FAIL' => '1'), 'bash', '-e', '-c', report_script)
+  assert.call(status.success?, false, 'a reporting API failure keeps the report job red')
+  assert.call(err.include?('fixture reporting failure'), true, 'the failure actually came from the reporting API')
+  [[{'sha' => 'credential-sentinel', 'pr' => 3486}], [{'sha' => '1' * 40, 'pr' => true}],
+   Array.new(51) { {'sha' => '1' * 40, 'pr' => 3486} }].each do |bad_rows|
+    malformed = Marshal.load(Marshal.dump(failed))
+    malformed['prepare']['outputs']['uncited'] = bad_rows.to_json
+    malformed['prepare']['outputs']['uncited_count'] = bad_rows.length.to_json
+    FileUtils.rm_f(environment.fetch('REPORT_CALLS'))
+    _, _, status = Open3.capture3(environment.merge('NEEDS_JSON' => malformed.to_json), 'bash', '-e', '-c', report_script)
+    assert.call(status.success?, false, 'invalid diagnostic identities are refused')
+    assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, 'invalid identities never reach the issue API')
+  end
+  [{'uncited_count' => 'true'}, {'uncited_count' => '0'}, {'uncited_truncated' => 'true'},
+   {'uncited' => 'null', 'uncited_count' => '1'}].each do |changes|
+    malformed = Marshal.load(Marshal.dump(failed))
+    malformed['prepare']['outputs'].merge!(changes)
+    FileUtils.rm_f(environment.fetch('REPORT_CALLS'))
+    _, _, status = Open3.capture3(environment.merge('NEEDS_JSON' => malformed.to_json), 'bash', '-e', '-c', report_script)
+    assert.call(status.success?, false, 'inconsistent diagnostic collection status is refused')
+    assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, 'inconsistent counts never reach the issue API')
   end
 end
 puts "ci-safe-paths: #{checks} assertions passed"

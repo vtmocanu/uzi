@@ -143,6 +143,13 @@ manual same-tag recovery. Only a confirmed publication and `release-verify.sh` s
 done; deployment health is a separate check. Problems use one `Release automation
 failures` tracking issue; expected no-ops remain in the summary.
 
+Prepare streams the cutter's output and logs tip SHA, CI run/attempt/state changes,
+elapsed time and its deadline. Failure summaries name the phase and planned tag,
+with bounded uncited commit/PR identities; unavailable fields are `null`.
+A green `report` job confirms incident delivery, not a successful release: the
+failed prepare or watch job keeps the run red. Receipt/publication uncertainty
+fails watch; an issue-delivery failure fails report.
+
 Manual tip selection is bounded at 120 minutes plus 10 minutes for cutting.
 Publication watching retains its 60-minute bound within the 120-minute recovery
 allowance. **D10 is partial until 3e-3:** only the single eligible pre-cut main-CI

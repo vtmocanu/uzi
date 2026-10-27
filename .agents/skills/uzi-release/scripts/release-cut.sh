@@ -40,6 +40,7 @@
 #                     Applies to the main half only; rejected with --promote.
 #   --prev-tag TAG    override the derived coverage-window base tag (a repair).
 #   --ci              refuse unknown worker-pin publication state (also CI=true).
+#   --result-file FILE write optional bounded JSON diagnostics (cut mode only).
 #
 # The prerelease form is exactly vX.Y.Z-rc.N (N from 1); nothing else (D2). Tag discovery
 # never sorts a mixed stable/prerelease list: stable tags are filtered first and the
@@ -64,9 +65,10 @@ set -uo pipefail
 
 VERSION=""; VERB=""; CL_FILE=""; DO_COMMIT=1; PREV_OVERRIDE=""; PLAN=0; ABANDON_TRAIN=0; VERSION_OPTION=0; POSITIONAL_VERSION=0
 CI_STRICT=0
+RESULT_FILE=""; RESULT_STAGE=preconditions; RESULT_REASON=""; RESULT_CHILD=""
 case "${CI:-}" in true|1) CI_STRICT=1 ;; esac
 cut_usage() {
-  printf '%s\n' 'usage: release-cut.sh <X.Y.Z> [--promote|--promote-only|--skip-promote|--stable] [--changelog-file FILE] [--no-commit] [--prev-tag TAG] [--ci]' \
+  printf '%s\n' 'usage: release-cut.sh <X.Y.Z> [--promote|--promote-only|--skip-promote|--stable] [--changelog-file FILE] [--no-commit] [--prev-tag TAG] [--ci] [--result-file FILE]' \
     '       release-cut.sh --plan [--version X.Y.Z] [--abandon-train] [--ci]' >&2
   exit 3
 }
@@ -86,6 +88,9 @@ while [ $# -gt 0 ]; do
     --no-commit) DO_COMMIT=0; shift;;
     --prev-tag) PREV_OVERRIDE="${2:?}"; shift 2;;
     --ci) CI_STRICT=1; shift;;
+    --result-file)
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [ -n "$RESULT_FILE" ]; then cut_usage; fi
+      RESULT_FILE=$2; shift 2;;
     -h|--help) awk 'NR > 1 { if (/^#/) print; else exit }' "$0"; exit 3;;
     -*) echo "release-cut: unknown flag $1" >&2; exit 3;;
     *) if [ -z "$VERSION" ]; then VERSION="$1"; POSITIONAL_VERSION=1; shift
@@ -113,6 +118,21 @@ TODAY="$(date +%F)"
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "not in a git repo" >&2; exit 3; }
 cd "$ROOT" || { echo "cannot cd to repo root $ROOT" >&2; exit 3; }
+cut_exit() {
+  local status=$? args
+  if [ -n "$RESULT_FILE" ]; then
+    args=(--stage "$RESULT_STAGE" --reason "$RESULT_REASON" --tag "${TAG:-}" --status "$status")
+    [ -z "$RESULT_CHILD" ] || args+=(--child "$RESULT_CHILD")
+    if ! python3 -I "$ROOT/scripts/lib/release-diagnostics.py" "${args[@]}" -- "$RESULT_FILE"; then
+      if [ "$status" -eq 0 ]; then status=1; fi
+    fi
+  fi
+  if [ -n "$RESULT_CHILD" ]; then rm -f -- "$RESULT_CHILD"; fi
+  trap - EXIT
+  exit "$status"
+}
+trap cut_exit EXIT
+if [ "$PLAN" -eq 1 ] && [ -n "$RESULT_FILE" ]; then cut_usage; fi
 # is_shipping: the shared release-train definition of "does this path ship" (same file the
 # coverage oracle uses), so promote-only and the oracle can never disagree about "shipping".
 # shellcheck source=scripts/lib/shipping-paths.sh
@@ -852,6 +872,7 @@ EOF
 
 # --- promote (D5): tag a stable vIB from a throwaway release branch -----------
 promote_inflight() {
+  RESULT_STAGE=promotion; RESULT_REASON=promotion-failed
   local relbranch="release/$IB" tagB="v$IB" wt
   if [ "${UZI_RELEASE_OFFLINE_FIXTURE:-}" != "1" ]; then
     # One hop, not two: the stable commit added below is itself a metadata hop, and the
@@ -911,10 +932,19 @@ verify_fail() {
   exit 1
 }
 commit_and_verify() { # $1 tag  $2 prev  $3 base
+  local oracle_args
+  RESULT_STAGE=commit; RESULT_REASON=release-cut-failed
   git commit -q -m "chore(release): $1" || { echo "release-cut: commit failed; preparation kept staged" >&2; print_recovery staged; exit 1; }
-  if ! bash scripts/assert-changelog-covers-release.sh HEAD "$2" "$3"; then
+  oracle_args=(HEAD "$2" "$3")
+  if [ -n "$RESULT_FILE" ]; then
+    RESULT_CHILD=$(mktemp) || { verify_fail 'could not prepare oracle diagnostics'; }
+    oracle_args=(HEAD "$2" "${1#v}" --result-file "$RESULT_CHILD")
+  fi
+  RESULT_STAGE=changelog-coverage; RESULT_REASON=changelog-coverage-error
+  if ! bash scripts/assert-changelog-covers-release.sh "${oracle_args[@]}"; then
     verify_fail "changelog coverage oracle rejected the release commit"
   fi
+  RESULT_STAGE=changelog-links; RESULT_REASON=changelog-links-refused
   if ! bash scripts/changelog-links.sh --check; then
     verify_fail "changelog-links --check found stale links (release.yml would reject the tag)"
   fi
@@ -1054,6 +1084,7 @@ case "$OP" in
 esac
 
 # --- CHANGELOG (main half) ----------------------------------------------------
+RESULT_STAGE=notes-assembly; RESULT_REASON=release-cut-failed
 # Every fold reads canonical pending categories. Keep the original writer input for
 # next RCs until fold_into_open has checked the assembled view, so refusal preserves bytes.
 CHANGELOG_VIEW=CHANGELOG.md
@@ -1102,14 +1133,17 @@ autocite_dependency_merges "$BASE"
 [ "$OP" = nextrc ] || sync_stable_heading "$(prev_stable_below "$BASE")"
 
 # --- Chart.yaml + autobump + links --------------------------------------------
+RESULT_STAGE=metadata-preparation; RESULT_REASON=release-cut-failed
 bump_chart "$CHARTVER"
 echo "  Chart.yaml: version + appVersion -> $CHARTVER"
 run_autobump "$CHARTVER"
 WT="$(awk -F'"' '/^PINNED_TAG=/{print $2; exit}' scripts/assert-worker-tag-decoupled.sh 2>/dev/null)"
 echo "  worker tag now: ${WT:-<unreadable>} (rolls the fleet iff it changed from the prior pin)"
+RESULT_STAGE=changelog-links; RESULT_REASON=changelog-links-refused
 run_links
 echo "  changelog-links: refreshed"
 # Freeze blocks already shipped by a candidate, before any release commit/tag.
+RESULT_STAGE=notes-assembly; RESULT_REASON=release-cut-failed
 bash scripts/changelog-section.sh check-rc-bullets "$TAG" || {
   echo "release-cut: frozen RC bullet check failed; add a new bullet instead" >&2
   exit 3
@@ -1132,8 +1166,10 @@ if [ "$DO_COMMIT" -eq 0 ]; then
 fi
 
 if [ -z "$PREV" ]; then
+  RESULT_STAGE=commit; RESULT_REASON=release-cut-failed
   # First release ever: the oracle self-skips with no previous tag. Commit without it.
   git commit -q -m "chore(release): $TAG" || { echo "release-cut: commit failed; preparation kept staged" >&2; print_recovery staged; exit 1; }
+  RESULT_STAGE=changelog-links; RESULT_REASON=changelog-links-refused
   if ! bash scripts/changelog-links.sh --check; then verify_fail "changelog-links --check found stale links"; fi
 else
   commit_and_verify "$TAG" "$PREV" "$BASE"

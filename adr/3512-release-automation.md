@@ -76,6 +76,10 @@ flowchart LR
   may rerun against the same existing tag/SHA; they cannot create a new tag.
   Recovery refuses an older stable when a newer stable tag exists, preventing
   a stale publication rerun from changing the latest channel.
+- Preparation failure metadata uses optional, bounded cutter/oracle result files;
+  raw command prose stays in logs. Watch owns receipt/publication validation.
+  Report succeeds after delivering the incident and fails on reporting errors;
+  it does not turn a failed upstream job green (#3551).
 
 ## Stages and limits
 
