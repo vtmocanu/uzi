@@ -1303,6 +1303,19 @@ export class WorkerClient {
    * A stripped rollback success clears it; later ordinary ticks can rediscover it.
    */
   private serverFeatures = new Set<string>();
+  private operationNegotiation = 0;
+  private readonly operationFlights = new Map<string, { generation: number; token: symbol }>();
+
+  /** Positive negotiation serial survives feature clearing and worker re-registration. */
+  get codexOperationNegotiation(): number { return this.operationNegotiation; }
+
+  retainCodexOperationFlight(runId: string, generation: number): () => void {
+    const token = Symbol();
+    this.operationFlights.set(runId, { generation, token });
+    return () => {
+      if (this.operationFlights.get(runId)?.token === token) this.operationFlights.delete(runId);
+    };
+  }
   private readonly codexAdmission = new Map<string, { generation: number; reporter: CodexAdmissionReporter }>();
   private readonly codexAdmissionClosed = new Map<string, number>();
   private codexAdmissionEpoch = {};
@@ -1514,7 +1527,9 @@ export class WorkerClient {
   }
 
   private replaceServerFeatures(features: readonly string[]): void {
+    const hadOperationAdmission = this.hasFeature("codex_account_operation_admission_v1");
     this.serverFeatures = new Set(features);
+    if (!hadOperationAdmission && this.hasFeature("codex_account_operation_admission_v1")) this.operationNegotiation++;
     if (!this.hasFeature("codex_account_admission_signal_v1")) {
       this.codexAdmissionEpoch = {};
       for (const owned of this.codexAdmission.values()) owned.reporter.seal();
@@ -1570,7 +1585,8 @@ export class WorkerClient {
   private snapshotForServer(snapshot: ActiveSnapshot): ActiveSnapshot {
     return { ...snapshot, active: snapshot.active.map(entry => {
       const { account_cooldown, ...rest } = entry;
-      return this.hasFeature("codex_account_operation_admission_v1") && account_cooldown !== undefined
+      return (this.hasFeature("codex_account_operation_admission_v1") ||
+        this.operationFlights.get(entry.run_id)?.generation === entry.claim_generation) && account_cooldown !== undefined
         ? { ...rest, account_cooldown: structuredClone(account_cooldown) } : rest;
     }) };
   }
@@ -1645,6 +1661,7 @@ export class WorkerClient {
         ? res.protocol_features.filter((f): f is string => typeof f === "string")
         : [],
     );
+    if (this.hasFeature("codex_account_operation_admission_v1")) this.operationNegotiation++;
     if (originalCapabilities !== undefined && originalCapabilities.length <= 256 &&
         originalCapabilities.every((cap) => typeof cap === "string" && Buffer.byteLength(cap, "utf8") <= 64) &&
         typeof maxConcurrentRuns === "number" && Number.isInteger(maxConcurrentRuns) && maxConcurrentRuns >= 1 && maxConcurrentRuns <= 256 &&

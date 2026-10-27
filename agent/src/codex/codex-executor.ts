@@ -2256,6 +2256,7 @@ export class CodexExecutor implements Executor {
   private unstartedLegClosed = false;
   private executionStarted = false;
   private captureRevision = 0;
+  private readonly rootAdmissionWaits = new Set<AbortController>();
   private captureCleanupRemaining?: () => number;
   private captureTail: Promise<void> = Promise.resolve();
   private provisionAbort?: AbortController;
@@ -2322,6 +2323,8 @@ export class CodexExecutor implements Executor {
     }
     this.captureOwners++;
     this.captureRevision++;
+    for (const waiting of this.rootAdmissionWaits)
+      waiting.abort(new TrustedExecutionRefusal("codex root dispatch invalidated by capture"));
     this.summaryLifecycleClosed = true;
     this.depsInstall?.abort.abort();
     const signals = [signal, purpose === "capture" ? this.captureLifecycleSignal : undefined].filter((value): value is AbortSignal => value !== undefined);
@@ -5429,12 +5432,13 @@ export class CodexExecutor implements Executor {
     // Issue #1789: a mid-turn vault-locked refresh deferral trips THIS turn the same way.
     vaultLock.activeTurnTrip = trip;
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    let startupResumed = false;
     let currentTurnCallbacks = registry.inFlightCallbackCountSince(callbackCursor);
     const armIdle = (): void => {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = undefined;
       currentTurnCallbacks = registry.inFlightCallbackCountSince(callbackCursor);
-      if (currentTurnCallbacks > 0) return;
+      if (!startupResumed || currentTurnCallbacks > 0) return;
       idleTimer = setTimeout(() => trip(REASON_IDLE), idleMs);
       idleTimer.unref?.();
     };
@@ -5472,9 +5476,39 @@ export class CodexExecutor implements Executor {
     try {
       harness.useBroker(buildPhaseBroker(phase, AbortSignal.any([turnAbort.signal, effectsAbort.signal])));
       if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents);
-      armIdle();
       if (beforeDispatch) prompt = beforeDispatch(prompt);
+      const captureRevision = this.captureRevision;
+      let sourceGuard: (() => void) | undefined;
+      const checkDispatch = (): void => {
+        if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents);
+        turnAbort.signal.throwIfAborted();
+        if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+        if (ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted)
+          throw new CodexRequestFailure("parent_abort");
+        this.assertCaptureAdmission(captureRevision);
+        if (registry.state() !== "open") throw new CodexRequestFailure("parent_abort");
+        assertResidueQuarantineOpen("provider_turn");
+      };
+      const dispatch = {
+        prepare: async (): Promise<void> => {
+          startupResumed = false;
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = undefined;
+          sourceGuard = undefined;
+          checkDispatch();
+          const waiting = new AbortController();
+          this.rootAdmissionWaits.add(waiting);
+          try {
+            sourceGuard = await ctx.prepareCodexRootDispatch?.(
+              AbortSignal.any([turnAbort.signal, waiting.signal]), checkDispatch);
+          } finally { this.rootAdmissionWaits.delete(waiting); }
+          checkDispatch();
+          sourceGuard?.();
+        },
+        check: (): void => { checkDispatch(); sourceGuard?.(); startupResumed = true; armIdle(); },
+      };
       const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
+      request.rootDispatch = dispatch;
       let turn = harness.startTurn(request);
       let events = turn.events[Symbol.asyncIterator]();
       let first = await (async () => {
@@ -5489,7 +5523,9 @@ export class CodexExecutor implements Executor {
             text: "the earlier Codex session was rejected by the provider — continuing WITHOUT its earlier context, so some work may be repeated",
             event: "resume_lineage_break",
           } });
-          turn = harness.startTurn(this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck));
+          const fallback = this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
+          fallback.rootDispatch = dispatch;
+          turn = harness.startTurn(fallback);
           events = turn.events[Symbol.asyncIterator]();
           return events.next();
         }

@@ -2,7 +2,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { TransientRecoveryError } from "./sdk-executor.js";
 import { RequestError, RevisionSourceFenceUnavailableError } from "./client.js";
 import { PlanRejectedError, PlanRevisionReplacedError, type PlanRevisionOwnerWaitObserver, type PlanRevisionRetryOutcome } from "./executor.js";
-import type { RunOwnershipResponse, StateAck, StateRequest } from "./protocol.js";
+import type { CodexOperationSource, RunOwnershipResponse, StateAck, StateRequest } from "./protocol.js";
 import type { PlanVerdict, SteeringChannel } from "./steering.js";
 
 export const PLAN_REVISION_RETRY_FEATURE = "plan_revision_retry_v1";
@@ -33,10 +33,11 @@ class PlanRevisionWallSpentError extends Error {}
 
 interface Dependencies {
   generation: number;
-  steering: Pick<SteeringChannel, "takeRevisionRecoveryControl" | "awaitRevisionRecoveryEvent" | "retirePersistedRevision" | "setGateRevision">;
+  steering: Pick<SteeringChannel, "takeRevisionRecoveryControl" | "takeRevisionRecoveryEvent" | "awaitRevisionRecoveryEvent" | "retirePersistedRevision" | "setGateRevision">;
   ownership: () => Promise<RunOwnershipResponse>;
   signal: () => AbortSignal;
   checkControl: () => void;
+  checkRecoverySupport?: () => void;
   notice: (text: string) => Promise<void>;
   policy?: PlanRevisionRetryPolicy;
 }
@@ -100,6 +101,40 @@ export class PlanRevisionRecovery {
       revision_input_id: a.id,
       superseded_revision_input_ids: [...this.predecessors],
     } : {};
+  }
+
+  /** Repeatable source proof; never consumes redrive readiness or settles a receipt. */
+  dispatchSource(): CodexOperationSource | undefined {
+    const a = this.active;
+    const presentation = a?.source.request.presentation_id;
+    return a && presentation ? { gate_revision: a.source.revision, presentation_id: presentation,
+      revision_input_id: a.id } : undefined;
+  }
+
+  assertDispatchSource(expected: CodexOperationSource | undefined): void {
+    const a = this.active;
+    if (a) {
+      this.deps.checkControl();
+      const verdict = this.deps.steering.takeRevisionRecoveryEvent(a.source.revision, a.id);
+      if (verdict?.kind === "cancel") throw new Error("run cancelled");
+      if (verdict?.kind === "reject") throw new PlanRejectedError(verdict.reason, a.source.revision);
+      if (verdict?.kind === "revise" && !verdict.automatic) {
+        this.predecessors.push(a.id);
+        this.accept(verdict);
+        throw new PlanRevisionReplacedError(verdict);
+      }
+    }
+    const current = this.dispatchSource();
+    if (JSON.stringify(current) !== JSON.stringify(expected))
+      throw new PlanRevisionRecoveryStoppedError("plan revision dispatch source changed");
+  }
+
+  async proveDispatchSource(expected: CodexOperationSource | undefined, check: () => void): Promise<void> {
+    this.assertDispatchSource(expected);
+    const a = this.active;
+    if (a) await this.confirmSource(a, false, () => { check(); return Infinity; }, true);
+    check();
+    this.assertDispatchSource(expected);
   }
 
   /** Called before human revision turns and at fresh epoch admission fences.
@@ -285,49 +320,50 @@ export class PlanRevisionRecovery {
     this.seed(retained, ack.gateRevision, report);
   }
 
-  private control(a: Active): void {
-    this.deps.checkControl(); // sticky cancel wins even over a queued reject
+  private control(a: Active, dispatchProof = false): void {
+    this.deps.checkControl(); // sticky cancel wins even over support loss or a queued reject
+    if (!dispatchProof) this.deps.checkRecoverySupport?.();
     const control = this.deps.steering.takeRevisionRecoveryControl(a.source.revision);
     if (control?.kind === "cancel") throw new Error("run cancelled");
     if (control?.kind === "reject") throw new PlanRejectedError(control.reason, a.source.revision);
   }
 
-  private async wait(ms: number, remainingWallMs?: () => number): Promise<void> {
+  private async wait(ms: number, remainingWallMs?: () => number, dispatchProof = false): Promise<void> {
     while (ms > 0) {
-      if (this.active) this.control(this.active);
+      if (this.active) this.control(this.active, dispatchProof);
       const slice = Math.min(250, ms, remainingWallMs?.() ?? Infinity);
       if (slice <= 0) break;
       try { await this.sleep(slice, this.deps.signal()); }
-      catch (err) { if (this.active) this.control(this.active); throw err; }
+      catch (err) { if (this.active) this.control(this.active, dispatchProof); throw err; }
       ms -= slice;
     }
-    if (this.active) this.control(this.active);
+    if (this.active) this.control(this.active, dispatchProof);
   }
 
   private requireRemainingWall(remainingWallMs?: () => number): void {
     if (remainingWallMs !== undefined && remainingWallMs() <= 0) throw new PlanRevisionWallSpentError();
   }
 
-  private async waitForProof(remainingWallMs?: () => number): Promise<void> {
-    if (this.active) this.control(this.active);
+  private async waitForProof(remainingWallMs?: () => number, dispatchProof = false): Promise<void> {
+    if (this.active) this.control(this.active, dispatchProof);
     this.requireRemainingWall(remainingWallMs);
-    await this.wait(250, remainingWallMs);
+    await this.wait(250, remainingWallMs, dispatchProof);
     this.requireRemainingWall(remainingWallMs);
   }
 
-  private async confirmSource(a: Active, replay = false, remainingWallMs?: () => number): Promise<RunOwnershipResponse> {
+  private async confirmSource(a: Active, replay = false, remainingWallMs?: () => number, dispatchProof = false): Promise<RunOwnershipResponse> {
     for (;;) {
-      this.control(a);
+      this.control(a, dispatchProof);
       let owned: RunOwnershipResponse;
       try { owned = await this.deps.ownership(); }
       catch (err) {
-        this.control(a);
+        this.control(a, dispatchProof);
         if (err instanceof RequestError && err.status === 404)
           throw new PlanRevisionRecoveryStoppedError("plan revision claim is no longer owned");
-        await this.waitForProof(remainingWallMs);
+        await this.waitForProof(remainingWallMs, dispatchProof);
         continue;
       }
-      this.control(a);
+      this.control(a, dispatchProof);
       if ((positive(owned.claim_generation) && owned.claim_generation !== this.deps.generation) || owned.claim_released === true)
         throw new PlanRevisionRecoveryStoppedError("plan revision claim changed or was released", owned.status);
       if (typeof owned.status === "string" && !["running", "awaiting_approval"].includes(owned.status))
@@ -337,7 +373,7 @@ export class PlanRevisionRecovery {
       this.requireRemainingWall(remainingWallMs);
       if (positive(owned.claim_generation) && positive(owned.gate_revision) &&
           owned.claim_released === false && ["running", "awaiting_approval"].includes(owned.status)) return owned;
-      await this.waitForProof(remainingWallMs); // uncertainty grants neither a provider start nor a write
+      await this.waitForProof(remainingWallMs, dispatchProof); // uncertainty grants neither a provider start nor a write
     }
   }
 }

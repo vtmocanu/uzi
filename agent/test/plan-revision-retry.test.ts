@@ -7,7 +7,7 @@ import { PlanRejectedError, PlanRevisionReplacedError } from "../src/executor.js
 import type { PlanVerdict } from "../src/steering.js";
 import type { RunOwnershipResponse, StateAck, StateRequest } from "../src/protocol.js";
 
-function fixture(redrives = 0, hasPresentation = true) {
+function fixture(redrives = 0, hasPresentation = true, checkRecoverySupport?: () => void) {
   let owner: RunOwnershipResponse = { status: "awaiting_approval", claim_generation: 7, gate_revision: 11, claim_released: false };
   let control: Error | undefined;
   let event: PlanVerdict = { kind: "reject", reason: "stop", sourceGateRevision: 11 };
@@ -29,7 +29,7 @@ function fixture(redrives = 0, hasPresentation = true) {
   const recovery = new PlanRevisionRecovery({
     generation: 7, policy,
     steering: {
-      takeRevisionRecoveryControl: () => undefined,
+      takeRevisionRecoveryEvent: () => undefined, takeRevisionRecoveryControl: () => undefined,
       awaitRevisionRecoveryEvent: (_source, after, signal) => { waits.push(after); return onEvent ? onEvent(signal) : Promise.resolve(event); },
       setGateRevision: (r) => assert.equal(r, 11),
       retirePersistedRevision: (id, predecessors) => { retired.push({ id, predecessors }); },
@@ -37,6 +37,7 @@ function fixture(redrives = 0, hasPresentation = true) {
     ownership: async () => { onOwner?.(); return structuredClone(owner); },
     signal: () => controllerAbort.signal,
     checkControl: () => { if (control) throw control; controllerAbort.signal.throwIfAborted(); },
+    checkRecoverySupport,
     notice: async (text) => { notices.push(text); },
   });
   const source: StateRequest = { status: "awaiting_approval", presentation_id: "00000000-0000-4000-8000-000000000001",
@@ -62,6 +63,73 @@ async function settledUntil(check: () => boolean): Promise<void> {
   }
   assert.fail("recovery did not reach the expected wait");
 }
+
+describe("M2 pure dispatch source proofs", () => {
+  it("M2 dispatch proof retries uncertain ownership without recovery support", async () => {
+    const f = fixture(0, true, () => { throw new Error("recovery support absent"); });
+    let reads = 0;
+    f.onOwner(() => { if (++reads === 1) throw new Error("ownership temporarily unavailable"); });
+    await f.recovery.proveDispatchSource(f.recovery.dispatchSource(), () => {});
+    assert.equal(reads, 2);
+    assert.deepEqual(f.sleeps, [250]);
+    assert.deepEqual(f.notices, []);
+    assert.deepEqual(f.writes, []);
+    assert.deepEqual(f.retired, []);
+  });
+
+  it("M2 cancellation outranks recovery support loss", async () => {
+    const f = fixture(0, true, () => { throw new Error("recovery support absent"); });
+    f.cancel();
+    await assert.rejects(f.recovery.beforeTurn(), /run cancelled/);
+  });
+
+  it("zero-redrive proofs cannot create recovery readiness or settle pending feedback", async () => {
+    const f = fixture(0);
+    const source = f.recovery.dispatchSource();
+    for (let n = 0; n < 8; n++) {
+      f.recovery.assertDispatchSource(source);
+      await f.recovery.proveDispatchSource(source, () => {});
+    }
+    assert.deepEqual(f.writes, []);
+    assert.deepEqual(f.retired, []);
+    assert.equal(f.notices.length, 0);
+    assert.deepEqual(f.sleeps, []);
+    assert.deepEqual(f.recovery.fields(101), {
+      expected_gate_revision: 11, revision_input_id: 101, superseded_revision_input_ids: [],
+    });
+    await f.recovery.beforeTurn();
+    assert.equal(f.notices.length, 0, "proof did not arm exhausted readiness");
+    const observed: boolean[] = [];
+    await assert.rejects(f.recovery.retry(new TransientRecoveryError("provider exhausted"), waiting => {
+      observed.push(waiting);
+    }), PlanRejectedError);
+    assert.deepEqual(observed, [true, false], "zero-redrive failure enters the owner wait");
+    assert.ok(f.notices.some(text => text.includes("0 automatic re-drives")));
+    assert.deepEqual(f.retired, []);
+    assert.deepEqual(f.writes, []);
+  });
+
+  it("proofs preserve a charged retry grant until beforeTurn consumes it exactly once", async () => {
+    const f = fixture(1);
+    await f.recovery.retry(new TransientRecoveryError("provider exhausted"));
+    const source = f.recovery.dispatchSource();
+    const sleepCount = f.sleeps.length;
+    for (let n = 0; n < 8; n++) await f.recovery.proveDispatchSource(source, () => {});
+    assert.equal(f.sleeps.length, sleepCount);
+    assert.equal(f.notices.length, 0);
+    await f.recovery.beforeTurn();
+    for (let n = 0; n < 8; n++) await f.recovery.proveDispatchSource(source, () => {});
+    await f.recovery.beforeTurn();
+    assert.equal(f.notices.filter(text => text.includes("re-driving the failed turn (1/1)")).length, 1);
+    const observed: boolean[] = [];
+    await assert.rejects(f.recovery.retry(new TransientRecoveryError("exhausted again"), waiting => {
+      observed.push(waiting);
+    }), PlanRejectedError);
+    assert.deepEqual(observed, [true, false], "proofs neither consume nor replenish the only retry grant");
+    assert.deepEqual(f.writes, []);
+    assert.deepEqual(f.retired, []);
+  });
+});
 
 describe("live-flight plan revision recovery", () => {
   it("3466 revalidates known-owned idle recovery every 30 seconds and aborts each losing event wait", async () => {

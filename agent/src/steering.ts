@@ -2230,7 +2230,7 @@ export class SteeringChannel {
       ? { ...verdict, sourceGateRevision: b.revision } : verdict;
   }
 
-  private takeRevisionRecoveryEvent(sourceRevision: number, afterInputId: number): PlanVerdict | undefined {
+  takeRevisionRecoveryEvent(sourceRevision: number, afterInputId: number): PlanVerdict | undefined {
     if (this.cancelled) return { kind: "cancel" };
     const index = this.reviseQueue.findIndex((r) => {
       const b = this.effectiveBinding(r.binding);
@@ -2243,6 +2243,14 @@ export class SteeringChannel {
       return { kind: "revise", feedback: r.feedback, inputId: r.id, sourceGateRevision: sourceRevision };
     }
     return this.takeRevisionRecoveryControl(sourceRevision);
+  }
+
+  private readonly revisionDispatchObservers = new Set<() => void>();
+
+  /** Input delivery wakes admission without adding another API poller. */
+  observeRevisionDispatchControl(check: () => void): () => void {
+    this.revisionDispatchObservers.add(check);
+    return () => this.revisionDispatchObservers.delete(check);
   }
 
   /** Backoff observes cancel/reject without taking a replacement before expiry. */
@@ -2752,6 +2760,7 @@ export class SteeringChannel {
       // batch resolve the gate before the revise routes — the revise would then sit
       // un-consumed (a silent drop that still burned a server cap slot). One service call
       // per batch evaluates full precedence (revise beats approve) once.
+      for (const check of this.revisionDispatchObservers) check();
       this.serviceGate();
       // Same batch-then-service-once position, for the same reason (PRD #88): an
       // answer that lands in this batch may satisfy a parked question.

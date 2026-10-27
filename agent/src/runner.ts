@@ -53,6 +53,8 @@ import type {
   WallParkRefresh,
 } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
+import { CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
+import { CodexOperationAdmissionError } from "./client.js";
 import { PLAN_REVISION_RETRY_FEATURE, PlanRevisionRecovery, PlanRevisionRecoveryStoppedError, type PlanRevisionRetryPolicy } from "./plan-revision-retry.js";
 import { checkPlan, type CheckedHumanGate, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
 import { captureSemanticSources, parseSemanticEnrollment } from "./semantic-plan.js";
@@ -2132,6 +2134,8 @@ type SourceGenesis = Readonly<{
 type ClaimCheckpointEvidence = Readonly<{ tip?: string; attestedSource?: string; writeUnresolved?: boolean }>;
 
 interface RunFlight {
+  operationAdmission?: CodexOperationController;
+  releaseOperationAdmission?: () => void;
   readonly checkpointCoordinates?: CheckpointCoordinates;
   readonly checkpointClaimEvidence: ClaimCheckpointEvidence;
   /** Initial trusted claim/executor classification; denial only, never disposal evidence. */
@@ -2601,6 +2605,7 @@ export interface CheckpointTestHooks {
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
+  codexOperationWaitPolicy?: CodexOperationWaitPolicy;
   memoryRuntime?: WorkerMemoryRuntime;
   /** Issue #3031: the claim-gate writer exclusion new terminal production runs inside. */
   maintenanceExclusion?: RecoveryCoordinatorOptions["writerExclusion"];
@@ -2940,6 +2945,7 @@ export class RunRunner {
    *  catch fetch the committed work back before the container dies. Registered before
    *  retained discovery so shutdown can interrupt pre-clone work too; deregistered
    *  in the terminal finally. */
+  private readonly codexOperationWaitPolicy?: CodexOperationWaitPolicy;
   private readonly activeRuns = new Map<string, ActiveRun>();
   /** Per-run announcement ledger, kept across a park/resume on this worker so a resume emits only
    *  heads it has not announced. Bounded: oldest run evicted past {@link OWED_ANNOUNCED_RUNS}. */
@@ -3102,6 +3108,7 @@ export class RunRunner {
         : 20_000;
     // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
     this.snapshotRegistry = opts.activeRuns;
+    this.codexOperationWaitPolicy = opts.codexOperationWaitPolicy;
     this.diskLocks = opts.diskLocks;
     this.cachesDropped = opts.cachesDropped;
     this.dataVolume = opts.dataVolume;
@@ -4238,7 +4245,25 @@ export class RunRunner {
     // The reportState choke point advances its phase as it parks/resumes; the terminal
     // finally removes it (a park that RETURNS from executeClaim — limit_wait/recovery/
     // pre-clone — is a requeue, so it stops being listed there too). Idempotent per run id.
-    this.snapshotRegistry?.add(runId, claim.claim_generation ?? 0);
+    const registration = this.snapshotRegistry?.add(runId, claim.claim_generation ?? 0);
+    // Repository task roots only; other lanes retain their existing policy.
+    if (claim.secrets.codex?.auth_mode === "subscription" &&
+        Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0) {
+      flight.operationAdmission = new CodexOperationController(flight.claimGeneration, {
+        ...this.codexOperationWaitPolicy,
+        supported: () => this.client.hasFeature("codex_account_operation_admission_v1"),
+        negotiation: () => this.client.codexOperationNegotiation,
+        engage: () => { flight.releaseOperationAdmission =
+          this.client.retainCodexOperationFlight(runId, flight.claimGeneration); },
+        read: (request, signal) => this.client.checkCodexOperationAdmission(runId, request, signal),
+        waiting: operation => {
+          const token = registration === undefined ? undefined :
+            this.snapshotRegistry?.setAccountCooldown(runId, flight.claimGeneration, operation, registration);
+          return token === undefined ? undefined :
+            () => this.snapshotRegistry?.clearAccountCooldown(runId, flight.claimGeneration, token);
+        },
+      });
+    }
     // PRD #1809 D4: watch this run's caches for its flight. Claude runs only (a Codex run has
     // `executor.safety`; its caches live on its own per-run volume) with a HOME, and only runs
     // that can take the claim-fenced disk park (a claim generation to fence it with): anything
@@ -5287,6 +5312,7 @@ export class RunRunner {
       // no longer executing on this worker, so it must stop being listed in the snapshot. A
       // run parked at a gate (awaiting_approval/awaiting_input/awaiting_followup) never reaches
       // here (its execute promise stays live), so it stays listed in its held phase.
+      flight.releaseOperationAdmission?.();
       this.snapshotRegistry?.remove(runId);
       // PRD #1391 M2: drop this run's re-arm registration. The batcher is closed by the
       // time we reach here, so a later drainer retire never needs to re-arm it; any
@@ -12680,9 +12706,11 @@ export class RunRunner {
           if (flight.active?.shuttingDown || this.shuttingDownGlobal) throw new Error("worker shutdown during plan revision recovery");
           const pause = steering.getPauseMode();
           if (pause === "now" || pause === "wall" || pause === "disk") throw new PauseNowSignal();
+          steering.lifecycleSignal().throwIfAborted();
+        },
+        checkRecoverySupport: () => {
           if (!this.client.hasFeature(PLAN_REVISION_RETRY_FEATURE))
             throw new PlanRevisionRecoveryStoppedError("plan revision source-fence support is unavailable");
-          steering.lifecycleSignal().throwIfAborted();
         },
         notice: async (text) => {
           batcher.emit({ kind: "status", agent: "worker", payload: { text } });
@@ -13054,6 +13082,42 @@ export class RunRunner {
           return verdict;
         } }
         : {}),
+      prepareCodexRootDispatch: async (signal, localCheck) => {
+        const source = revisionRecovery?.dispatchSource();
+        const control = new AbortController();
+        const operationSignal = AbortSignal.any([
+          signal, control.signal, steering.terminalLifecycleSignal(), this.shutdownSignal.signal,
+        ]);
+        const check = (): void => {
+          localCheck();
+          operationSignal.throwIfAborted();
+          if (steering.isCancelled()) throw new Error("run cancelled");
+          if (steering.claimFence() !== undefined || flight.claimGeneration !== claim.claim_generation)
+            throw new StaleClaimError();
+          if (flight.active?.shuttingDown || this.shuttingDownGlobal)
+            throw new Error("worker shutdown during Codex operation admission");
+          revisionRecovery?.assertDispatchSource(source);
+        };
+        check();
+        const unsubscribe = steering.observeRevisionDispatchControl(() => {
+          try { check(); } catch (error) { control.abort(error); }
+        });
+        try {
+          await flight.operationAdmission?.admit({ operation_id: randomUUID(), kind: "root",
+            ...(source ? { source } : {}) }, operationSignal, check,
+          async () => { await revisionRecovery?.proveDispatchSource(source, check); check(); });
+        } catch (error) {
+          check();
+          if (error instanceof CodexOperationAdmissionError) {
+            if (error.reason === "authority_lost") throw new StaleClaimError();
+            if (error.reason === "stale_source")
+              throw new PlanRevisionRecoveryStoppedError("plan revision dispatch lost its source");
+          }
+          throw error;
+        } finally { unsubscribe(); }
+        check();
+        return check;
+      },
       beforePlanRevisionTurn: (observer, remainingWallMs) => revisionRecovery?.beforeTurn(observer, remainingWallMs) ?? Promise.resolve(),
       retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
         if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && !cause.zeroEvidenceIdle) || !revisionRecovery) throw cause;

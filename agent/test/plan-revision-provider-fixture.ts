@@ -8,11 +8,15 @@ import type { CodexNotification, CodexTransport } from "../src/codex/transport.j
 import { client, homeDir } from "./runner-harness.js";
 import { nullLogger } from "./helpers.js";
 
-export type Frame = { plan: string } | { ask: true } | { failure: true };
+export type Frame = { plan: string } | { ask: true } | { failure: true } | { done: true } | { prose: string };
 export interface Start { prompt: string; resume?: string; threadId?: string }
-export function providerFixture(harness: "claude" | "codex", script: (n: number) => Frame, sessionless = false) {
+export function providerFixture(harness: "claude" | "codex", script: (n: number) => Frame, sessionless = false,
+  options: { subscription?: boolean; deps?: Partial<CodexExecutorDeps> } = {}) {
   const starts: Start[] = [];
-  const credential = { auth_mode: "api_key" as const, access_token: "fixture-key", capability: "fixture-cap" };
+  const credential = options.subscription
+    ? { auth_mode: "subscription" as const, access_token: "fixture-key", capability: "fixture-cap",
+      generation: 1, chatgpt_account_id: "fixture-account", chatgpt_plan_type: null }
+    : { auth_mode: "api_key" as const, access_token: "fixture-key", capability: "fixture-cap" };
   const frame = () => script(starts.length);
   if (harness === "claude") {
     const queryFn: SdkQueryFn = params => (async function* () {
@@ -27,7 +31,7 @@ export function providerFixture(harness: "claude" | "codex", script: (n: number)
       } else {
         yield { type: "assistant", session_id, message: { content: [{ type: "tool_use", id: `tool-${starts.length}`,
           name: "ask" in f ? "mcp__uzi__ask_user" : "mcp__uzi__submit_plan",
-          input: "ask" in f ? { questions: [{ question: "Which target?", header: "Target" }] } : { plan_md: f.plan } }] } } as unknown as SDKMessage;
+          input: "ask" in f ? { questions: [{ question: "Which target?", header: "Target" }] } : { plan_md: "plan" in f ? f.plan : "" } }] } } as unknown as SDKMessage;
         yield { type: "result", subtype: "success", is_error: false, num_turns: 1, session_id } as SDKMessage;
       }
     })();
@@ -39,7 +43,7 @@ export function providerFixture(harness: "claude" | "codex", script: (n: number)
   const transport = new RevisionTransport(starts, frame);
   const selected = selectCodexBinding({ codex: credential });
   if (selected.kind !== "codex") throw new Error("fixture credential selection failed");
-  client.releaseCodex = async () => ({ auth_mode: "api_key", access_token: "fixture-key" });
+  client.releaseCodex = async () => ({ ...credential, access_token: "fixture-key" });
   const deps: CodexExecutorDeps = {
     transientRetryMax: 1, transientBackoffBaseMs: 1,
     idleMs: 10000, wallMs: 20000, boundaryDeadlineMs: 1000,
@@ -66,7 +70,7 @@ export function providerFixture(harness: "claude" | "codex", script: (n: number)
   return { starts, credential, executor: new CodexExecutor(nullLogger(), homeDir, {
     binding: selected.binding, client, commandSandbox: "off",
     provider: { name: "openai", baseUrl: "http://127.0.0.1:9/v1", envKey: "OPENAI_API_KEY", model: "gpt-6-astra" },
-  }, deps) };
+  }, { ...deps, ...options.deps }) };
 }
 
 class RevisionTransport implements CodexTransport {
@@ -89,10 +93,12 @@ class RevisionTransport implements CodexTransport {
       if (n === 1) this.push({ kind: "thread_started", method: "thread/started", threadId: "th-revision", params: { thread: { id: "th-revision" } } });
       const f = this.frame();
       const status = "failure" in f ? "failed" : "completed";
-      if (!("failure" in f)) this.push({ kind: "activity", method: "item/tool/call", requestId: n,
+      if ("prose" in f) this.push({ kind: "activity", method: "item/completed",
+        params: { threadId: "th-revision", item: { type: "agentMessage", text: f.prose } } });
+      if (!("failure" in f) && !("prose" in f)) this.push({ kind: "activity", method: "item/tool/call", requestId: n,
         params: { threadId: "th-revision", turnId: "tn-revision", callId: `call-${n}`,
-          tool: "ask" in f ? "ask_user" : "submit_plan",
-          arguments: "ask" in f ? { questions: [{ question: "Which target?", header: "Target" }] } : { plan_md: f.plan } } });
+          tool: "ask" in f ? "ask_user" : "done" in f ? "signal_done" : "submit_plan",
+          arguments: "ask" in f ? { questions: [{ question: "Which target?", header: "Target" }] } : "plan" in f ? { plan_md: f.plan } : {} } });
       this.push({ kind: "turn_completed", method: "turn/completed", threadId: "th-revision", turnId: "tn-revision", status,
         params: { threadId: "th-revision", turn: { id: "tn-revision", status,
           ...(status === "failed" ? { error: { codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 429 } } } } : {}) } } });

@@ -1207,10 +1207,8 @@ export class CodexHarness implements RunHarness {
         this.turnClosed = true;
         return;
       }
-      // The peer can accept and persist spend before the RPC reply arrives. Record the
-      // resumed attempt before awaiting startTurnRpc, including a rejected pending reply.
-      if (this.resumedRoot) attemptedResumedRoot = this.threadId;
-      this.activeTurnId = await this.startTurnRpc(transport, this.threadId, rendered, request.signal);
+      this.activeTurnId = await this.startTurnRpc(transport, this.threadId, rendered, request.signal, request.rootDispatch,
+        () => { if (this.resumedRoot) attemptedResumedRoot = this.threadId; });
       if (request.signal.aborted || this.stopRequested) {
         // A stop during launch/thread/turn setup could not name a turn earlier. Now
         // that activeTurnId exists, issue the best-effort interrupt and end cleanly.
@@ -1625,6 +1623,8 @@ export class CodexHarness implements RunHarness {
     threadId: string,
     rendered: RenderedCodexRun,
     signal: AbortSignal,
+    dispatch?: RunTurnRequest["rootDispatch"],
+    onDispatch?: () => void,
   ): Promise<string> {
     const params: Record<string, unknown> = {
       threadId,
@@ -1636,10 +1636,16 @@ export class CodexHarness implements RunHarness {
     };
     if (this.currentModel !== undefined) params.model = this.currentModel;
     if (rendered.lead.modelReasoningEffort !== undefined) params.effort = rendered.lead.modelReasoningEffort;
+    await dispatch?.prepare();
+    // No await separates the final local controls/source/capture guard from send.
+    dispatch?.check();
+    signal.throwIfAborted();
     // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
     assertResidueQuarantineOpen("provider_turn");
     this.admissionAttempt = this.admissionReporter?.begin(threadId);
     this.dispatchStartedAt = this.nowMs();
+    // A sent RPC can spend even if its acknowledgement never arrives.
+    onDispatch?.();
     const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
     const id = res?.turn?.id;
     if (typeof id !== "string" || id.length === 0) {
