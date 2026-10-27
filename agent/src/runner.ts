@@ -12730,7 +12730,7 @@ export class RunRunner {
             claim: {
               kind: resolveRunKind(claim.kind),
               claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,
-              ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory),
+              ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory, claim.claim_generation),
             },
             emit: (m) => batcher.emit(m),
             redact: flight.redactText,

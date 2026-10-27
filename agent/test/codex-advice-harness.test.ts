@@ -263,6 +263,7 @@ interface Bits {
 
 function makeHarness(
   opts: {
+    admissionReporter?: import("../src/codex/admission-signal.js").CodexAdmissionReporter;
     transport?: FakeTransport;
     credentialValue?: string;
     cwd?: string;
@@ -291,6 +292,7 @@ function makeHarness(
     };
   };
   const harness = new CodexAdviceHarness({
+    admissionReporter: opts.admissionReporter,
     launchRoot,
     provider: opts.provider ?? provider,
     appServerAuth: opts.appServerAuth,
@@ -303,6 +305,35 @@ function makeHarness(
 }
 
 // --- tests --------------------------------------------------------------------------
+
+describe("admission observation on advice dispatch", () => {
+  it("allocates before turn/start and reports retry/final errors without changing final cause", async t => {
+    const { CodexAdmissionReporter } = await import("../src/codex/admission-signal.js");
+    const sent: import("../src/codex/admission-signal.js").AdmissionSignal[] = [];
+    const reporter = new CodexAdmissionReporter(7, () => true, async body => { sent.push(body); return 204; });
+    let attemptId: string | undefined;
+    const begin = reporter.begin.bind(reporter);
+    t.mock.method(reporter, "begin", (thread: string) => {
+      const attempt = begin(thread); attemptId = attempt.id; return attempt;
+    });
+    const transport = new FakeTransport(method => {
+      if (method === "turn/start") assert.match(attemptId!, /^[0-9a-f-]{36}$/);
+      return defaultResponder(method);
+    });
+    const { harness } = makeHarness({ transport, admissionReporter: reporter });
+    transport.push(codexError("unauthorized"))
+      .push(codexError("rateLimitExceeded", { willRetry: true }))
+      .push(turnCompletedWithError("serverOverloaded")).end();
+    try {
+      const result = await harness.run(makeAdviceRequest(), noThrowPolicy);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.deepEqual(sent.map(b => b.class), ["rate_limit", "overload"]);
+      assert.ok(sent.every(b => b.attempt_id === attemptId));
+      assert.ok(result.end.kind === "terminal");
+      assert.equal(result.end.terminal.failure?.materialize().failure.category, "authentication");
+    } finally { reporter.seal(true); }
+  });
+});
 
 describe("CodexAdviceHarness: kind + a text advice pass", () => {
   it("advertises kind codex", () => {

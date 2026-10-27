@@ -56,7 +56,48 @@ type Emit = (frame: unknown) => void;
 
 // Both injected roots speak the real NDJSON contracts. The fileop stand-in exposes
 // only its dictionary root. This proves functional wiring, not kernel isolation.
+it("admission observer binds checker dispatch and sees terminal HTTP429 independently of checker failure", async t => {
+ const { CodexAdmissionReporter } = await import("../src/codex/admission-signal.js");
+ const sent: import("../src/codex/admission-signal.js").AdmissionSignal[] = [];
+ const reporter = new CodexAdmissionReporter(9, () => true, async b => { sent.push(b); return 204; });
+ let attemptId: string | undefined;
+ const begin = reporter.begin.bind(reporter);
+ t.mock.method(reporter, "begin", (thread: string) => {
+  const attempt = begin(thread); attemptId = attempt.id; return attempt;
+ });
+ const r = rig({ subscription: true, admissionReporter: reporter,
+  beforeResponse(frame) {
+   if (frame.method === "turn/start") assert.match(attemptId!, /^[0-9a-f-]{36}$/);
+  },
+  notes(emit) {
+   emit({ method: "error", params: { threadId: "foreign", turnId: "turn", willRetry: true,
+    error: { codexErrorInfo: "serverOverloaded" } } });
+   emit({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "failed",
+    error: { codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 429 } } } } } });
+  },
+ });
+ try {
+  await assert.rejects(r.run(), /model error/); // existing foreign error behavior stays intact
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(sent.length, 0);
+ } finally { reporter.seal(true); }
+ const terminalOnly = new CodexAdmissionReporter(9, () => true, async b => { sent.push(b); return 204; });
+ const r2 = rig({ subscription: true, admissionReporter: terminalOnly,
+  notes(emit) {
+   emit({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "failed",
+    error: { codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 429 } } } } } });
+  },
+ });
+ try {
+  await assert.rejects(r2.run(), /terminal turn/);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(sent.map(b => b.class), ["rate_limit"]);
+  assert.equal(sent[0]!.claim_generation, 9);
+ } finally { terminalOnly.seal(true); }
+});
+
 function rig(options: {
+ admissionReporter?: import("../src/codex/admission-signal.js").CodexAdmissionReporter;
  round?: number;
  notes?: (emit: Emit) => void;
  beforeResponse?: (frame: Frame, emit: Emit) => void;
@@ -151,7 +192,8 @@ function rig(options: {
   launchProvider: async (spec) => { specs.push(spec); return provider; },
  };
  let releases = 0;
- const client: Pick<WorkerClient, "releaseCodex" | "refreshCodex"> = {
+ const client: Pick<WorkerClient, "releaseCodex" | "refreshCodex"> & Partial<Pick<WorkerClient, "codexAdmissionReporter">> = {
+  codexAdmissionReporter: () => options.admissionReporter,
   releaseCodex: async () => { releases++; return options.subscription
    ? { auth_mode: "subscription", access_token: "released-token", generation: 7, chatgpt_account_id: "account", chatgpt_plan_type: null }
    : { auth_mode: "api_key", access_token: "released-token" }; },
