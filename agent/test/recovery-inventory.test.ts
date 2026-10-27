@@ -4875,9 +4875,11 @@ function issue3152Backoff(c: RecoveryCoordinator, saved: RecoveryRecord) {
           assert.ok(old);
           assert.equal(old.reason, "inventory_snapshot_changed");
           assert.equal(old.finalRequest, undefined);
+          assert.ok(f.finals.length - finalsBefore <= 1, "reconstruction can settle at most one fresh archive");
           for (const call of f.finals.slice(finalsBefore)) {
-            assert.notEqual((call[3] as RecoveryFinalDisposition).kind === "archive" &&
-              (call[3] as { capture_id: string }).capture_id, old.serverCaptureId);
+            const disposition = call[3] as RecoveryFinalDisposition;
+            assert.equal(disposition.kind, "archive");
+            assert.notEqual((disposition as { capture_id: string }).capture_id, old.serverCaptureId);
           }
         } else assert.equal(f.finals.length, finalsBefore, "an exit never reaches FINAL");
       } finally { await f.close(); }
