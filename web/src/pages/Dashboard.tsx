@@ -541,10 +541,10 @@ export function Dashboard() {
                         the only stall signal on phones, where the cell is hidden. */}
                     {progressShowsStall(r) ? (
                       <span className="contents sm:hidden">
-                        <RunHealthBadge run={r} />
+                        <RunHealthBadge run={r} nowMs={now} />
                       </span>
                     ) : (
-                      <RunHealthBadge run={r} />
+                      <RunHealthBadge run={r} nowMs={now} />
                     )}
                     <StatusPill status={effectiveRunStatus(r)} progress={r.progress} />
                   </div>

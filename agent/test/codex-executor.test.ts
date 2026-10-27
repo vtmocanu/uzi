@@ -5272,6 +5272,51 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
     assert.equal(rig.transport.turnStartCount, 2, "one root and one child, no policy retry");
   });
 
+  it("admission signals follow the production child wrapper with pre-dispatch identity, exact binding and class deduplication", async t => {
+    const { CodexAdmissionReporter } = await import("../src/codex/admission-signal.js");
+    const sent: import("../src/codex/admission-signal.js").AdmissionSignal[] = [];
+    const reporter = new CodexAdmissionReporter(7, () => true, async body => { sent.push(body); return 204; });
+    const identities = new Map<string, string>();
+    const begin = reporter.begin.bind(reporter);
+    t.mock.method(reporter, "begin", (thread: string) => {
+      const attempt = begin(thread);
+      identities.set(thread, attempt.id);
+      return attempt;
+    });
+    const error = (info: string, th: string, tn: string): CodexNotification => ({
+      kind: "codex_error", method: "error", threadId: th, turnId: tn, willRetry: true,
+      params: { threadId: th, turnId: tn, willRetry: true, error: { codexErrorInfo: info } },
+    });
+    const responder = delegationResponder((transport, th, tn) => {
+      assert.match(identities.get(th)!, /^[0-9a-f-]{36}$/, "identity exists inside actual child turn/start");
+      transport.push(error("rateLimitExceeded", th, "stale"))
+        .push(error("rateLimitExceeded", th, tn))
+        .push(error("rateLimitExceeded", th, tn))
+        .push({ ...turnCompleted("failed", th, tn), params: { threadId: th, turn: { id: tn, status: "failed",
+          error: { codexErrorInfo: "serverOverloaded" } } } });
+    });
+    const rig = makeRig({ responder });
+    const getterCalls: unknown[][] = [];
+    Object.assign(rig.client, { codexAdmissionReporter: (...args: unknown[]) => {
+      getterCalls.push(args); return args[1] === 7 ? reporter : undefined;
+    } });
+    rig.transport.push(threadStarted()).push(spawn(1, "admission-child", { subagent_type: "coder", prompt: "work" }));
+    const { ctx } = makeCtx({ agents, claimGeneration: 7 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await finishRoot(rig, [1]);
+      const result = await withTimeout(running, 3000, "admission child integration");
+      await tick();
+      assert.ok(result.branch, "child provider failure preserves the root result");
+      assert.deepEqual(getterCalls, [[ctx.runId, 7]]);
+      assert.deepEqual(sent.map(body => body.class), ["rate_limit", "overload"]);
+      assert.ok(sent.every(body => body.provider_thread_id === "th-child-1" &&
+        body.provider_turn_id === "tn-th-child-1" &&
+        body.attempt_id === identities.get("th-child-1") && body.claim_generation === 7));
+      assert.notEqual(identities.get("th-1"), identities.get("th-child-1"));
+    } finally { reporter.seal(true); rig.transport.end(); await running.catch(() => {}); }
+  });
+
   const DISPATCH_ID = /^cx-[0-9a-f]{12}-t\d+-/;
 
   /** Root th-1/tn-1; the k-th child thread is `th-child-k` and its turn `tn-<thread>`. On a

@@ -8,9 +8,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/runprogress"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -251,7 +253,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		StopKind:      textPtrValue(r.StopKind.Valid, r.StopKind.String),
 		StopReason:    textPtrValue(r.StopReason.Valid, r.StopReason.String),
 		Health:        r.Health,
-		HealthReason:  textPtrValue(r.HealthReason.Valid, r.HealthReason.String),
+		HealthReason:  withoutCodexAdmissionReason(textPtrValue(r.HealthReason.Valid, r.HealthReason.String)),
 		HealthSince:   timePtr(r.HealthSince.Valid, r.HealthSince.Time),
 		// PRD #1170: the server-computed wall-clock deadline the near-timeout badge
 		// counts down to. RunDeadline returns nil for a run with no wall deadline
@@ -734,10 +736,9 @@ func queueReasonPtr(s string) *string {
 	return &s
 }
 
-// overlayQueueReasons sets queue_reason (PRD #3454) on the queued runs among dtos: "maintenance"
-// while intake is paused and the run is not admitted. runToDTO stays pure; the reason is derived
-// in SQL at read time (ListRunQueueReasons) so it never lags the pause. Only queued runs are
-// looked up, in one batched read per call. Best-effort: an error is logged and leaves it absent.
+// overlayQueueReasons reads current queue and admission fields for owner-authorized runs.
+// One batched read covers the supplied queued runs. A failed read is logged and leaves
+// the projection absent; persisted cooldown reasons have already been stripped.
 func (h *Handler) overlayQueueReasons(ctx context.Context, dtos ...*apitypes.RunDTO) {
 	if h.q == nil {
 		return
@@ -760,7 +761,8 @@ func (h *Handler) overlayQueueReasons(ctx context.Context, dtos ...*apitypes.Run
 	if len(ids) == 0 {
 		return
 	}
-	rows, err := h.q.ListRunQueueReasons(ctx, ids)
+	viewer, _ := mw.UserFromContext(ctx)
+	rows, err := h.q.ListRunAdmissionQueueReasons(ctx, store.ListRunAdmissionQueueReasonsParams{RunIds: ids, ViewerID: viewer.ID})
 	if err != nil {
 		slog.Error("run queue reasons", "runs", len(ids), "error", err)
 		return
@@ -768,6 +770,8 @@ func (h *Handler) overlayQueueReasons(ctx context.Context, dtos ...*apitypes.Run
 	for _, row := range rows {
 		for _, d := range byID[row.RunID] {
 			d.QueueReason = queueReasonPtr(row.QueueReason)
+			d.CodexAdmissionClass, d.CodexAdmissionEligibleAt = admissionFields(row.CodexAdmissionClass, row.CodexAdmissionEligibleAt)
+			d.HealthReason = overlayAdmissionReason(d.HealthReason, row.QueueReason, d.CodexAdmissionClass, d.CodexAdmissionEligibleAt)
 		}
 	}
 }
@@ -870,4 +874,34 @@ func memoryHoldDTO(r store.Run) *apitypes.MemoryHoldDTO {
 		dto.Max, dto.Remaining = &limit, &remaining
 	}
 	return dto
+}
+
+// withoutCodexAdmissionReason clears persisted cooldown text even after the projection expires.
+func withoutCodexAdmissionReason(reason *string) *string {
+	if reason != nil && apitypes.IsCodexAdmissionReason(*reason) {
+		return nil
+	}
+	return reason
+}
+
+func admissionFields(class pgtype.Text, eligibleAt pgtype.Timestamptz) (*string, *time.Time) {
+	if !class.Valid || !eligibleAt.Valid {
+		return nil, nil
+	}
+	return textPtrValue(true, class.String), timePtr(true, eligibleAt.Time)
+}
+
+func overlayAdmissionReason(reason *string, queueReason string, class *string, eligibleAt *time.Time) *string {
+	reason = withoutCodexAdmissionReason(reason)
+	if queueReason == "maintenance" || class == nil || eligibleAt == nil {
+		return reason
+	}
+	if reason != nil && workersvc.QueuedReasonPrecedesCodexAdmission(*reason) {
+		return reason
+	}
+	current := apitypes.CodexAdmissionReason(*class, *eligibleAt)
+	if current == "" {
+		return reason
+	}
+	return &current
 }

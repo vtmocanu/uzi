@@ -31,7 +31,7 @@ import {
 import { ExtendTimePopover } from "../components/ExtendTimePopover";
 import { canReworkNow, canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
 import { repoAgentFolder } from "../lib/repoAgentFolder";
-import { stripDisplayCell, stripUnsafeChars } from "../lib/safeText";
+import { stripUnsafeChars } from "../lib/safeText";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
@@ -45,6 +45,9 @@ import {
   healthFlagLabel,
   isMaintenanceQueued,
   maintenanceQueueText,
+  codexAdmissionText,
+  displayHealthReason,
+  queuedBlockerPrecedesCodexAdmission,
   isStoppedRun,
   isRejectedRun,
   milestoneBadge,
@@ -330,7 +333,10 @@ export function HealthFlag({ run }: { run: Run }) {
   // health flag (the detector may still say waiting_worker). A calm info line, no "stuck
   // for" clock: the wait is the admin's drain, not a fault.
   const maintenance = isMaintenanceQueued(run);
-  const show = !maintenance && shouldShowHealthFlag(run.health, run.status);
+  const admission = codexAdmissionText(run, now);
+  const primaryAdmission = !maintenance && !queuedBlockerPrecedesCodexAdmission(run) ? admission : null;
+  const reason = displayHealthReason(run);
+  const show = !maintenance && !primaryAdmission && shouldShowHealthFlag(run.health, run.status);
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
   // Near timeout ("slow", PRD #1170) counts DOWN to run.deadline_at instead of the
   // since-flagged "stuck for Xm" every other flag keeps: `· 1h 5m left`, or `· stopping`
@@ -353,13 +359,17 @@ export function HealthFlag({ run }: { run: Run }) {
   // the visible pill, which no screen reader is listening to.
   const announce = maintenance
     ? maintenanceQueueText(maintenanceReason)
-    : show
+    : primaryAdmission ?? (show
       ? (healthFlagLabel(run.health) ?? "")
-      : "";
+      : "");
   return (
     <>
+      {primaryAdmission && (
+        <span data-queue-reason={run.queue_reason} className="text-xs text-info">{primaryAdmission}</span>
+      )}
       {maintenance && (
         <span
+          title={admission ?? undefined}
           data-queue-reason="maintenance"
           className="inline-flex items-center gap-1 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info"
         >
@@ -372,12 +382,12 @@ export function HealthFlag({ run }: { run: Run }) {
         // live region mounted in the same tick as its first message is silent, because
         // assistive tech announces CHANGES to a region that already existed (#185;
         // Board.tsx S5). This pill mounts together with the flag, so it never announced.
-        // The reason is shown inline below, so no title tooltip (it would be redundant).
-        <span className="inline-flex items-center gap-1 rounded-full border border-warn/40 bg-warn/10 px-2 py-0.5 text-[11px] font-medium text-warn">
+        // The reason is inline; the tooltip keeps any independently active admission detail.
+        <span title={admission ?? undefined} className="inline-flex items-center gap-1 rounded-full border border-warn/40 bg-warn/10 px-2 py-0.5 text-[11px] font-medium text-warn">
           ⚠ {healthFlagLabel(run.health)}
           {stuck}
           {/* A single display cell, including server-composed manual attribution. */}
-          {run.health_reason && <span className="font-normal"> — {stripDisplayCell(run.health_reason)}</span>}
+          {reason && <span className="font-normal"> — {reason}</span>}
         </span>
       )}
       {/* ALWAYS MOUNTED, empty until a flag arrives — mirrors RunView's parkAnnounce

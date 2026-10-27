@@ -78,6 +78,7 @@ class Expression
 end
 
 root = File.expand_path('..', __dir__)
+traps_only = ARGV.delete('--release-traps-only')
 workflow = YAML.safe_load(File.read(ARGV[0] || File.join(root, '.github/workflows/ci.yml')))
 jobs = workflow.fetch('jobs')
 checks = 0
@@ -230,6 +231,63 @@ assert.call(release_auto.fetch('on').keys, ['workflow_dispatch'], 'automation re
 assert.call(release_auto.fetch('permissions'), {}, 'automation token defaults to no permissions')
 assert.call(release_auto.fetch('concurrency'), {'group' => 'release-auto', 'cancel-in-progress' => false, 'queue' => 'max'}, 'all release routes queue without cancellation')
 auto_jobs = release_auto.fetch('jobs')
+# Execute each actual failure-handler prologue in the shell contexts ERR inherits.
+# Keep a fast slice for guard-removal probes without repeating Git fixture setup.
+exercise_release_traps = lambda do
+  trap_steps = {'bundle' => auto_jobs.fetch('push').fetch('steps').find { |step| step['id'] == 'bundle' },
+                'push' => auto_jobs.fetch('push').fetch('steps').find { |step| step['id'] == 'push' },
+                'watch' => auto_jobs.fetch('watch').fetch('steps').find { |step| step['id'] == 'watch' }}
+  probe = lambda do |name, script, body|
+    parts = script.split("trap fail ERR\n", 2)
+    assert.call(parts.length, 2, "#{name}: actual ERR handler present")
+    prologue = parts.first + "trap fail ERR\nreason='probe-failed'\n"
+    Dir.mktmpdir('release-trap') do |dir|
+      output = File.join(dir, 'output')
+      File.write(output, '')
+      environment = {'GITHUB_OUTPUT' => output, 'RELEASE_DISPATCHERS' => 'maintainer',
+                     'RELEASE_SHA' => '1' * 40, 'PARENT' => '2' * 40, 'RELEASE_TAG' => 'v0.2.0-rc.1',
+                     'BUNDLE_DIGEST' => '3' * 64}
+      _, err, status = Open3.capture3(environment, 'bash', '-e', '-c', prologue + body, chdir: dir)
+      assert.call(status.exitstatus, 1, "#{name}: producer failure exits 1: #{err}")
+      assert.call(File.readlines(output).map(&:strip), ['reason=probe-failed'], "#{name}: exactly one parent reason write")
+    end
+  end
+  trap_steps.each do |name, step|
+    script = step.fetch('run')
+    {'function' => 'g(){ false; }; g', 'substitution' => 'g(){ false; }; observed=$(g)',
+     'pipeline' => 'g(){ false; }; g | cat'}.each do |context, body|
+      probe.call("#{name}/#{context}", script, body)
+    end
+    assert.call(script.lines[1].strip, 'failure_shell=$BASHPID', "#{name}: capture parent PID before any subshell")
+  end
+  # Extract production consumers plus their preceding checked assignment, when
+  # present. A producer emits the expected value before failing, so testing the
+  # value alone cannot detect its failure.
+  consumers = [
+    ['bundle', 'read -r -a dispatchers <<<', 'dispatcher_words', 'tr(){ printf maintainer; false; };'],
+    ['bundle', '"$BUNDLE_DIGEST" ]', 'actual_bundle_digest', 'bundle=fixture; sha256sum(){ printf "%s  fixture\n" "$BUNDLE_DIGEST"; false; };'],
+    ['bundle', '= 2 ]', 'head_count', 'heads=fixture; wc(){ printf "2\n"; false; };'],
+    ['bundle', '"$RELEASE_SHA" ]', 'tag_sha', 'g(){ printf "%s\n" "$RELEASE_SHA"; false; };'],
+    ['bundle', '= tag ]', 'tag_type', 'g(){ printf "tag\n"; false; };'],
+    ['bundle', '"$RELEASE_SHA $PARENT" ]', 'parent_line', 'g(){ printf "%s %s\n" "$RELEASE_SHA" "$PARENT"; false; };'],
+    ['watch', '"$RELEASE_SHA" ]', 'tag_sha', 'git(){ printf "%s\n" "$RELEASE_SHA"; false; };'],
+    ['watch', 'echo "published_at=', 'published_at', 'date(){ printf "2026-10-27T09:00:00Z\n"; false; };'],
+    ['watch', 'echo "verified_at=', 'verified_at', 'date(){ printf "2026-10-27T09:00:00Z\n"; false; };']
+  ]
+  consumers.each do |step_name, anchor, variable, stub|
+    script = trap_steps.fetch(step_name).fetch('run')
+    lines = script.lines
+    index = lines.index { |line| line.include?(anchor) }
+    raise "missing production consumer: #{anchor}" unless index
+    first = index > 0 && lines[index - 1].start_with?(variable + '=') ? index - 1 : index
+    probe.call("#{step_name}/#{variable}", script, stub + "\n" + lines[first..index].join)
+  end
+end
+if traps_only
+  exercise_release_traps.call
+  puts "ci-safe-paths: #{checks} assertions passed (release traps only)"
+  exit
+end
 assert.call(release_auto.fetch('on').fetch('workflow_dispatch').fetch('inputs').fetch('kind').fetch('options'), %w[rc stable], 'dispatch operation choices')
 assert.call(auto_jobs.keys, %w[authorize prepare push watch report], 'release automation job graph')
 permissions = {'authorize' => {'contents' => 'read'}, 'prepare' => {'contents' => 'read', 'actions' => 'write'},
@@ -346,6 +404,13 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   File.write(File.join(bin, 'git'), <<~'SH')
     #!/usr/bin/env bash
     set -e
+    case "${TEST_GIT_FAIL:-}/$*" in
+      bundle-verify/*' bundle verify '*|diff-tree/*' diff-tree '*)
+        printf '%s\n' "$TEST_GIT_FAIL" > "$TEST_GIT_FAILURE_MARKER"; exit 71 ;;
+      candidate-sha/*' rev-parse refs/tags/'*)
+        printf '%s\n' "$TEST_GIT_FAIL" > "$TEST_GIT_FAILURE_MARKER"
+        printf '%s\n' "$RELEASE_SHA"; exit 71 ;;
+    esac
     args=(); pushing=false
     for arg in "$@"; do
       args+=("$arg")
@@ -388,13 +453,19 @@ Dir.mktmpdir('release-auto-contract') do |dir|
                       'RELEASE_TAG' => 'v0.2.0-rc.11', 'TAG_OID' => tag_oid, 'BUNDLE_DIGEST' => Digest::SHA256.file(bundle).hexdigest,
                       'REFS_DIGEST' => refs_digest, 'PREVIOUS_RC' => 'v0.2.0-rc.10', 'PREVIOUS_RC_SHA' => parent,
                       'PREVIOUS_STABLE' => 'v0.1.0', 'PREVIOUS_STABLE_SHA' => stable_sha, 'GH_APP_TOKEN' => 'credential-sentinel')
-  exercise = lambda do |changes, expected, publish_expected = nil, source_bundle = bundle, after_validation = {}, expected_outcome = nil|
+  exercise = lambda do |changes, expected, publish_expected = nil, source_bundle = bundle, after_validation = {}, expected_outcome = nil, expected_reason = nil|
     Dir.mktmpdir('push-step', dir) do |work|
       FileUtils.mkdir_p(File.join(work, 'release-bundle'))
       FileUtils.cp(source_bundle, File.join(work, 'release-bundle/release.bundle'))
-      invocation = env.merge('RUNNER_TEMP' => work, 'GITHUB_OUTPUT' => File.join(work, 'output')).merge(changes)
+      invocation = env.merge('RUNNER_TEMP' => work, 'GITHUB_OUTPUT' => File.join(work, 'output'),
+                             'TEST_GIT_FAILURE_MARKER' => File.join(work, 'failed-git')).merge(changes)
       guard_out, err, status = Open3.capture3(invocation, 'bash', '-e', '-c', bundle_step.fetch('run'), chdir: work)
       assert.call(status.success?, expected, "actual pre-key guard #{changes.keys}: #{err[-300..]}")
+      if expected_reason
+        assert.call(File.read(invocation.fetch('TEST_GIT_FAILURE_MARKER')).strip, changes.fetch('TEST_GIT_FAIL'), 'exact Git failure was injected')
+        outputs = File.exist?(invocation.fetch('GITHUB_OUTPUT')) ? File.readlines(invocation.fetch('GITHUB_OUTPUT')).map(&:strip) : []
+        assert.call(outputs, ['reason=' + expected_reason], "#{changes.fetch('TEST_GIT_FAIL')}: one phase-correct reason before mint/push")
+      end
       if changes['GITHUB_RUN_ATTEMPT'] == '2'
         assert.call(status.success?, false, 'rerun never reaches the default-success token step')
         assert.call((guard_out + err).include?('Re-dispatch instead'), true, 'push rerun gives a clear recovery instruction')
@@ -420,6 +491,10 @@ Dir.mktmpdir('release-auto-contract') do |dir|
         end
       end
     end
+  end
+  {'bundle-verify' => 'invalid-prepared-bundle', 'candidate-sha' => 'invalid-prepared-bundle',
+   'diff-tree' => 'non-metadata-bundle'}.each do |fault, reason|
+    exercise.call({'TEST_GIT_FAIL' => fault}, false, nil, bundle, {}, nil, reason)
   end
   exercise.call({'RELEASE_ACTOR' => 'outside'}, false)
   exercise.call({'GITHUB_RUN_ATTEMPT' => '2'}, false)
@@ -774,4 +849,5 @@ Dir.mktmpdir('release-report') do |dir|
     assert.call(File.exist?(environment.fetch('REPORT_CALLS')), expected, "#{label}: only valid identities reach the issue API")
   end
 end
+exercise_release_traps.call
 puts "ci-safe-paths: #{checks} assertions passed"

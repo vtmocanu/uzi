@@ -257,7 +257,7 @@ export interface CrossCheckModelDeps {
 }
 
 export class CodexCrossCheck {
- constructor(private readonly client: Pick<WorkerClient, "releaseCodex" | "refreshCodex">, private readonly log: Logger, private readonly deps: CrossCheckModelDeps = {}) {}
+ constructor(private readonly client: Pick<WorkerClient, "releaseCodex" | "refreshCodex"> & Partial<Pick<WorkerClient, "codexAdmissionReporter">>, private readonly log: Logger, private readonly deps: CrossCheckModelDeps = {}) {}
 
  async run(claim: ClaimResponse, checkout: string, home: string, signal: AbortSignal,
   postUsage: (payload: Record<string, unknown>) => Promise<void>, confirmNativeCleanup?: () => void,
@@ -398,6 +398,7 @@ export class CodexCrossCheck {
    await postUsage({ event: "init", model, harness: "codex" });
    usageInit = true;
    startingTurn = true;
+   const admissionAttempt = this.client.codexAdmissionReporter?.(claim.run_id, claim.claim_generation)?.begin(threadId);
    const turn = await startupRequest<{ turn?: { id?: string } }>("turn/start", {
     threadId, model, ...(claim.config?.default_effort ? { effort: claim.config.default_effort } : {}),
     input: [{ type: "text", text: prompt }], environments: [],
@@ -405,6 +406,7 @@ export class CodexCrossCheck {
    startingTurn = false;
    const turnId = turn.turn?.id;
    if (typeof turnId !== "string" || !turnId) throw new Error("cross-check missing turn");
+   admissionAttempt?.bind(turnId);
    // The confirmed turn start is the first evidence that the model session started.
    try { activity?.modelStarted(); } catch { /* telemetry only */ }
    let calls = 0;
@@ -414,6 +416,7 @@ export class CodexCrossCheck {
    let streamedText = "";
    let assistantItemId: string | undefined;
    for await (const note of transport.notifications()) {
+    admissionAttempt?.observe(note);
     signal.throwIfAborted();
     if (await auth.handleServerRequest(transport, note, signal)) continue;
     const params = object(note.params);

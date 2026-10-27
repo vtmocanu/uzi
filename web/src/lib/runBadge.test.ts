@@ -6,6 +6,7 @@ import {
   formatElapsed,
   hasActiveRun,
   healthBadge,
+  codexAdmissionText,
   healthFlagLabel,
   isAwaitingApproval,
   isAwaitingFollowup,
@@ -1469,6 +1470,67 @@ describe("maintenance queue reason", () => {
     expect(isMaintenanceQueued(run({ status: "running", queue_reason: "maintenance" }))).toBe(false);
     const plain = runBadge(run({ status: "queued", health: "waiting_worker", health_since: "2026-07-04T12:00:00Z" }), NOW);
     expect(plain.kind === "badge" && plain.label).toBe("⚠ waiting for worker · 4m");
+  });
+});
+
+
+describe("Codex admission read-time projection", () => {
+  const at = "2026-07-04T12:05:37.123Z";
+  const held = run({ status: "queued", health: "waiting_worker", queue_reason: "codex_rate_limit",
+    codex_admission_class: "rate_limit", codex_admission_eligible_at: at });
+  it.each([
+    ["rate_limit", "a rate limit"], ["overload", "overload"],
+  ] as const)("renders %s with the server's spread unchanged", (cls, words) => {
+    const r = { ...held, codex_admission_class: cls };
+    const text = `waiting: provider reported ${words}; account admission eligible after ${at}`;
+    expect(codexAdmissionText(r, NOW)).toBe(text);
+    expect(runBadge(r, NOW)).toMatchObject({ label: text, tone: "info", pulse: false });
+    expect(healthBadge(r, NOW)).toMatchObject({ label: text });
+  });
+  it("clears at equality and in the past, including persisted provider copy", () => {
+    const stale = { ...held, health_reason: `waiting: provider reported overload; account admission eligible after ${at}` };
+    for (const now of [Date.parse(at), Date.parse(at) + 1]) {
+      expect(codexAdmissionText(stale, now)).toBeNull();
+      expect(healthBadge(stale, now)).toMatchObject({ label: "⚠ waiting for worker", title: undefined });
+    }
+  });
+  it("never infers a hold from queue reason, silence, or raw health copy", () => {
+    for (const patch of [
+      { codex_admission_class: undefined }, { codex_admission_class: null },
+      { codex_admission_class: "future_class" }, { codex_admission_eligible_at: undefined },
+      { codex_admission_eligible_at: "invalid" }, { codex_admission_eligible_at: "2027-02-30T12:00:00Z" }, { codex_admission_eligible_at: "2027-01-01" },
+      { status: "claimed" }, { status: "running" },
+    ]) expect(codexAdmissionText({ ...held, ...patch }, NOW)).toBeNull();
+    expect(codexAdmissionText({ status: "queued" }, NOW)).toBeNull();
+    const raw = { ...held, codex_admission_class: undefined,
+      health_reason: `waiting: provider reported overload; account admission eligible after ${at}` };
+    expect(healthBadge(raw, NOW)).toMatchObject({ label: "⚠ waiting for worker", title: undefined });
+  });
+  it("preserves maintenance and account-unavailability priority with admission detail", () => {
+    const text = `waiting: provider reported a rate limit; account admission eligible after ${at}`;
+    expect(healthBadge({ ...held, queue_reason: "maintenance" }, NOW)).toMatchObject({
+      label: "waiting: uzi is in maintenance mode", title: `waiting: uzi is in maintenance mode · ${text}`,
+    });
+    const reason = "your Codex account is unavailable (quarantined or being re-linked), so this run can't start";
+    expect(healthBadge({ ...held, health_reason: reason }, NOW)).toMatchObject({
+      label: "⚠ waiting for worker", title: `${reason} · ${text}`,
+    });
+  });
+  it.each([
+    "handoff setup has not finished",
+    "your vault is locked, so this run can't start",
+    "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs",
+    "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
+  ])("preserves the higher-priority queued blocker %s", (reason) => {
+    const text = codexAdmissionText(held, NOW);
+    const r = { ...held, health_reason: reason };
+    for (const badge of [healthBadge(r, NOW), runBadge(r, NOW)]) {
+      expect(badge).toMatchObject({ label: "⚠ waiting for worker", title: `${reason} · ${text}`, tone: "warning" });
+    }
+  });
+  it("renders a redacted shared summary without inventing account detail", () => {
+    expect(healthBadge(run({ status: "queued", health: "waiting_worker", health_reason: null }), NOW))
+      .toMatchObject({ label: "⚠ waiting for worker", title: undefined });
   });
 });
 

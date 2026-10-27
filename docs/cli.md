@@ -1204,6 +1204,17 @@ A few worth knowing:
   `uzi ci fix` and the other create paths), and `uzi run get` shows a `QUEUE_REASON`
   row for a queued run that maintenance is holding back. `--json` stdout is
   unchanged apart from the additive `queue_reason` and `notice` fields.
+- **Queued Codex subscription runs can show a temporary account admission wait.**
+  `uzi run get` prints `CODEX_ADMISSION`; run-list status cells and the TUI
+  detail rail show the same owner-only eligibility explanation. JSON exposes
+  `codex_admission_class` (`rate_limit` or `overload`) and
+  `codex_admission_eligible_at`, including recovery spread, while the wait is
+  active. Foreign shared/admin summaries omit these fields. The time is
+  eligibility, not a promised start; expired provider copy clears on a fresh
+  read. Maintenance and account-unavailability explanations retain precedence,
+  with admission shown independently. Cancel works; there is no admission
+  override. See [Temporary account admission waits](rate-limits.md#temporary-account-admission-waits)
+  for the shared-account policy and exact waiting messages.
 - **`uzi repo remove <id>` deletes a single stale repo** — the surgical
   counterpart to deleting a whole forge connection. It only works on a
   **disabled** repo, so disable it first (`enabled` shows in `uzi repo list`);

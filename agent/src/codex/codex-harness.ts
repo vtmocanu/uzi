@@ -206,6 +206,7 @@ export interface CodexChildSink {
 }
 
 export interface CodexHarnessOptions {
+  readonly admissionReporter?: import("./admission-signal.js").CodexAdmissionReporter;
   readonly registry: ExecutionRegistry;
   readonly launchRoot: LaunchRootSeam;
   readonly broker: CodexCallbackBroker;
@@ -511,6 +512,8 @@ function boundedJsonBytes(value: unknown, limit: number): number {
 export class CodexHarness implements RunHarness {
   readonly kind = "codex" as const;
 
+  private readonly admissionReporter?: import("./admission-signal.js").CodexAdmissionReporter;
+  private admissionAttempt?: import("./admission-signal.js").AdmissionAttempt;
   private readonly registry: ExecutionRegistry;
   private readonly launchRootSeam: LaunchRootSeam;
   // The active callback broker. NOT `readonly`: turns run strictly sequentially, so the
@@ -618,6 +621,7 @@ export class CodexHarness implements RunHarness {
   private stopTurn?: () => void;
 
   constructor(opts: CodexHarnessOptions) {
+    this.admissionReporter = opts.admissionReporter;
     this.nowMs = opts.nowMs ?? Date.now;
     this.registry = opts.registry;
     this.launchRootSeam = opts.launchRoot;
@@ -924,6 +928,10 @@ export class CodexHarness implements RunHarness {
    *  start/interrupt a child thread on the SAME app-server; the child's frames are
    *  demuxed back via {@link registerChildSink}. Rejects if the provider root is not
    *  launched (a child turn is only ever started from inside an active root turn). */
+  beginAdmissionAttempt(threadId: string): import("./admission-signal.js").AdmissionAttempt | undefined {
+    return this.admissionReporter?.begin(threadId);
+  }
+
   requestOnTransport<T = unknown>(
     method: string,
     params?: unknown,
@@ -1630,12 +1638,14 @@ export class CodexHarness implements RunHarness {
     if (rendered.lead.modelReasoningEffort !== undefined) params.effort = rendered.lead.modelReasoningEffort;
     // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
     assertResidueQuarantineOpen("provider_turn");
+    this.admissionAttempt = this.admissionReporter?.begin(threadId);
     this.dispatchStartedAt = this.nowMs();
     const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
     const id = res?.turn?.id;
     if (typeof id !== "string" || id.length === 0) {
       throw new CodexHarnessError({ category: "protocol", message: "codex turn/start returned no turn id" });
     }
+    this.admissionAttempt?.bind(id);
     return id;
   }
 
@@ -1649,6 +1659,7 @@ export class CodexHarness implements RunHarness {
     note: CodexNotification,
     signal?: AbortSignal,
   ): Promise<HarnessEvent> {
+    this.admissionAttempt?.observe(note);
     switch (note.kind) {
       case "rate_limits_updated":
         return { kind: "activity", sessionId: this.threadId };

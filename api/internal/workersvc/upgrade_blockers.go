@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -124,6 +125,9 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 		}
 		return fmt.Sprintf("automatic retry not before %s; recorded cause %s; %s", blockerTime(r.RecoveryRetryNotBefore), cause, action)
 	case "queued":
+		if r.HealthReason.Valid && apitypes.IsCodexAdmissionReason(r.HealthReason.String) {
+			r.HealthReason.String = "waiting: admission held"
+		}
 		return fmt.Sprintf("own continuation must become claimable; recorded reason %s; hold %s; exact fence unavailable, inspect run", blockerFact(r.HealthReason), blockerFact(r.HoldReason))
 	default:
 		return "releasing action unavailable; inspect run"

@@ -464,10 +464,51 @@ export type HealthFlaggable = {
   // near-timeout flag ("slow") counts DOWN to it; optional for api/web rollout skew —
   // an older api pod omits it and the badge falls back to the since-flagged suffix.
   deadline_at?: string | null;
-  // PRD #3454: "maintenance" while instance maintenance mode holds this queued run back.
-  // Optional for api/web rollout skew; absent reads as no instance hold.
+  // Optional read-time queue projection; absent fields establish no admission hold.
   queue_reason?: QueueReason | null;
+  codex_admission_class?: string | null;
+  codex_admission_eligible_at?: string | null;
 };
+
+const ADMISSION_PREFIXES = {
+  rate_limit: "waiting: provider reported a rate limit; account admission eligible after ",
+  overload: "waiting: provider reported overload; account admission eligible after ",
+};
+
+// Read-time fields alone establish a hold. Keep the server's timestamp (including
+// per-run spread) verbatim: eligibility is not a promised start time.
+export function codexAdmissionText(
+  run: Pick<HealthFlaggable, "status" | "codex_admission_class" | "codex_admission_eligible_at">,
+  nowMs: number,
+): string | null {
+  const cls = run.codex_admission_class;
+  const at = run.codex_admission_eligible_at;
+  if (run.status !== "queued" || (cls !== "rate_limit" && cls !== "overload") ||
+      !at || !/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(at) ||
+      !Number.isFinite(Date.parse(at)) || !(Date.parse(at) > nowMs)) return null;
+  // Date.parse normalizes impossible calendar dates such as February 30.
+  if (new Date(`${at.slice(0, 10)}T00:00:00Z`).toISOString().slice(0, 10) !== at.slice(0, 10)) return null;
+  return ADMISSION_PREFIXES[cls] + at;
+}
+
+// Persisted provider copy may outlive eligibility or refer to another class. Never
+// use that text to infer a class or keep displaying it after the read-time hold ends.
+export function displayHealthReason(run: Pick<HealthFlaggable, "health_reason">): string | null {
+  const reason = stripDisplayCell(run.health_reason);
+  return Object.values(ADMISSION_PREFIXES).some((prefix) => reason.startsWith(prefix))
+    ? null : reason || null;
+}
+
+export function queuedBlockerPrecedesCodexAdmission(run: { status: string; health_reason?: string | null }): boolean {
+  // Mirror the blockers before admission in queuedReasonWithEligibility (health.go).
+  return run.status === "queued" && [
+    "handoff setup has not finished",
+    "your vault is locked, so this run can't start",
+    "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs",
+    "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
+    "your Codex account is unavailable (quarantined or being re-linked), so this run can't start",
+  ].includes(run.health_reason ?? "");
+}
 
 // isMaintenanceQueued reports whether instance maintenance mode, not a missing worker, is
 // why this run waits. The server derives queue_reason from the same SQL function the claim
@@ -520,6 +561,7 @@ export function healthBadge(
   // pill, no pulse, no elapsed "stuck for" clock, since the wait is the admin's drain.
   // The visible label is the full PRD sentence (reason included), wrapping on a narrow
   // card; the title repeats it for a truncating surface.
+  const admission = codexAdmissionText(run, nowMs);
   if (isMaintenanceQueued(run)) {
     const text = maintenanceQueueText(maintenanceReason);
     return {
@@ -527,9 +569,12 @@ export function healthBadge(
       label: text,
       tone: "info",
       pulse: false,
-      title: text,
+      title: admission ? `${text} · ${admission}` : text,
       wrap: true,
     };
+  }
+  if (admission && !queuedBlockerPrecedesCodexAdmission(run)) {
+    return { kind: "badge", label: admission, title: admission, tone: "info", pulse: false, wrap: true };
   }
   if (!shouldShowHealthFlag(run.health, run.status)) return null;
   const label = healthFlagLabel(run.health);
@@ -538,7 +583,7 @@ export function healthBadge(
     label: `⚠ ${label}${healthSuffix(run, nowMs)}`,
     tone: "warning",
     pulse: true,
-    title: stripDisplayCell(run.health_reason) || undefined,
+    title: [displayHealthReason(run), admission].filter(Boolean).join(" · ") || undefined,
   };
 }
 

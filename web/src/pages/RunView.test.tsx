@@ -7513,3 +7513,50 @@ describe("RunView rejection presentation", () => {
     expect(pill.classList.contains(tone === "neutral" ? "text-neutral-fg" : "text-danger")).toBe(true);
   });
 });
+
+
+describe("HealthFlag Codex admission", () => {
+  it.each([["rate_limit", "a rate limit"], ["overload", "overload"]] as const)("shows %s from read-time fields and clears on expiry", (cls, words) => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-10-27T12:00:00Z"));
+    try {
+      const at = "2026-10-27T12:01:37Z";
+      const r = run({ status: "queued", health: "waiting_worker", codex_admission_class: cls,
+        codex_admission_eligible_at: at, health_reason: `waiting: provider reported a rate limit; account admission eligible after ${at}` });
+      const { container, unmount } = render(<HealthFlag run={r} />);
+      expect(container.textContent).toContain(`waiting: provider reported ${words}; account admission eligible after ${at}`);
+      expect(container.textContent).not.toContain("stuck for");
+      unmount();
+      now.mockReturnValue(Date.parse(at));
+      const expired = render(<HealthFlag run={r} />);
+      expect(expired.container.textContent).toContain("waiting for worker");
+      expect(expired.container.textContent).not.toContain("provider reported");
+    } finally { now.mockRestore(); }
+  });
+  it("keeps maintenance primary and eligibility in its tooltip", () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const { container } = render(<HealthFlag run={run({ status: "queued", queue_reason: "maintenance",
+        codex_admission_class: "overload", codex_admission_eligible_at: "2026-10-27T12:01:37Z" })} />);
+      const pill = container.querySelector('[data-queue-reason="maintenance"]')!;
+      expect(pill.textContent).toBe("waiting: uzi is in maintenance mode");
+      expect(pill.getAttribute("title")).toBe("waiting: provider reported overload; account admission eligible after 2026-10-27T12:01:37Z");
+    } finally { now.mockRestore(); }
+  });
+});
+
+
+it.each([
+  "handoff setup has not finished",
+  "your vault is locked, so this run can't start",
+  "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs",
+  "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
+  "your Codex account is unavailable (quarantined or being re-linked), so this run can't start",
+])("HealthFlag Codex admission keeps %s primary", (reason) => {
+  const now = vi.spyOn(Date, "now").mockReturnValue(0);
+  try {
+    const { container } = render(<HealthFlag run={run({ status: "queued", health: "waiting_worker", health_reason: reason,
+      codex_admission_class: "overload", codex_admission_eligible_at: "2026-10-27T12:01:37Z" })} />);
+    expect(container.textContent).toContain(reason);
+    expect(container.querySelector("[title]")!.getAttribute("title")).toBe("waiting: provider reported overload; account admission eligible after 2026-10-27T12:01:37Z");
+  } finally { now.mockRestore(); }
+});

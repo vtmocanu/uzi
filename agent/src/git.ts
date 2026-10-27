@@ -448,6 +448,27 @@ export class ScratchPublicationError extends Error {
 // Transport text is private and ephemeral. Only the safe formatter below reads it;
 // the public Error message and abort/residue classifications remain unchanged.
 const retainedGitDiagnostics = new WeakMap<Error, { stderr: string; context: string }>();
+const RETAINED_SUCCESSOR_REASONS = new Set([
+  "wrapper_tip_subject", "wrapper_source_subject", "wrapper_leaf_subject", "wrapper_commit_read",
+  "wrapper_walk_bound", "wrapper_tip_bound", "wrapper_coverage_leaf_bound", "wrapper_lookalike_bound",
+  "wrapper_aggregate_bound", "wrapper_leaf_bound", "wrapper_lookalike", "wrapper_source_missing",
+  "wrapper_aggregate_missing", "wrapper_fingerprint_mismatch", "wrapper_source_oid", "wrapper_source_tree",
+  "wrapper_tree", "wrapper_author", "wrapper_committer", "wrapper_source_leaf", "wrapper_fingerprint",
+  "wrapper_pin_read", "wrapper_pin", "wrapper_lineage_marker", "wrapper_lineage_membership",
+  "wrapper_marker_parent", "wrapper_lineage_ancestry", "wrapper_source_parent",
+  "final_head", "final_tree", "final_marker_restoration", "final_dirty_diff", "final_ancestry",
+  "attempt_invalid", "iteration_before", "episode_pin_changed", "identity_used", "seed_failed",
+  "iteration_after", "post_adoption_check",
+]);
+const retainedSuccessorDiagnostics = new WeakMap<Error, string>();
+
+/** Attach only a fixed successor reason, without changing the thrown value's public surface.
+ * Callers retain responsibility for excluding their abort and control-flow sentinels. */
+export function annotateRetainedSuccessorError<T>(error: T, reason: string): T {
+  if (error instanceof Error && RETAINED_SUCCESSOR_REASONS.has(reason)) retainedSuccessorDiagnostics.set(error, reason);
+  return error;
+}
+
 const RETAINED_DIAGNOSTIC_INPUT_MAX = 64 * 1024;
 
 /** Redact unsplit inputs before sanitizing or cutting. Both ends survive a cut so
@@ -479,6 +500,12 @@ export function formatRetainedRecoveryDiagnostic(
 ): { diagnostic_stage: string; diagnostic_code: string; cause: string; context?: string } {
   let stage = "recovery";
   try {
+    // WeakMap lookup inspects no properties and returns undefined for primitive keys too.
+    // Avoid adding an observable instanceof/prototype read to untagged formatting.
+    const successor = retainedSuccessorDiagnostics.get(error as Error);
+    if (successor !== undefined && RETAINED_SUCCESSOR_REASONS.has(successor)) {
+      return { diagnostic_stage: "successor", diagnostic_code: "retained_successor_" + successor, cause: "" };
+    }
     const transport = error instanceof Error ? retainedGitDiagnostics.get(error) : undefined;
     const message = error instanceof Error ? error.message : String(error);
     if (!transport && message.startsWith("retained_readiness_")) {
@@ -7424,21 +7451,25 @@ export class GitCache {
     // source (freezeInventory appends it to the roots) and the current source (buildRecoveryCoverage
     // adds it), and the two extras can be distinct.
     const MAX_LEAVES = MAX_OWED_CANDIDATES_PER_RUN + 2, MAX_AGGREGATES = 8, MAX_OBJECT_BYTES = 64 * 1024;
-    const fail = (): never => { throw new Error("successor recovery verification failed"); };
+    const fail = (reason?: string): never => {
+      const error = new Error("successor recovery verification failed");
+      if (reason !== undefined) annotateRetainedSuccessorError(error, reason);
+      throw error;
+    };
     // Throwing subject read (unlike isWipParkMarker/tryGitStdout, which answer "" on any non-abort
     // error): once a decision depends on the subject, an unreadable commit refuses.
-    const subjectOf = async (rev: string): Promise<string> => {
+    const subjectOf = async (rev: string, reason: string): Promise<string> => {
       try {
         return (await this.runGit(barePath, ["--no-replace-objects", "log", "-1", "--format=%s", `${rev}^{commit}`])).trim();
       } catch (err) {
         const abort = this.boundaryAbortError(err);
         if (abort) throw abort;
-        return fail();
+        return fail(err instanceof Error ? reason : undefined);
       }
     };
-    const subject = await subjectOf(tip);
+    const subject = await subjectOf(tip, "wrapper_tip_subject");
     if (subject.startsWith(WIP_PARK_COMMIT_PREFIX)) return undefined;
-    const srcMarker = src !== undefined && OWED_OID.test(src) && (await subjectOf(src)).startsWith(WIP_PARK_COMMIT_PREFIX);
+    const srcMarker = src !== undefined && OWED_OID.test(src) && (await subjectOf(src, "wrapper_source_subject")).startsWith(WIP_PARK_COMMIT_PREFIX);
     // From here the tip is a coverage commit or the source is a marker. A wrapper whose walk cannot be
     // completed cannot be shown to bury no marker, so every inability to verify below refuses; only a
     // non-tip commit that cannot be read within bounds is demoted to a leaf (it then meets the leaf rule).
@@ -7454,16 +7485,16 @@ export class GitCache {
       const sha = queue.shift()!;
       if (seen.has(sha)) continue;
       seen.add(sha);
-      if (seen.size > MAX_AGGREGATES + MAX_LEAVES) return fail();
+      if (seen.size > MAX_AGGREGATES + MAX_LEAVES) return fail("wrapper_walk_bound");
       let commit;
       try { commit = await this.readBoundedCommit(barePath, sha, MAX_OBJECT_BYTES); } catch (err) {
         const abort = this.boundaryAbortError(err);
         if (abort) throw abort;
-        return fail();
+        return fail(err instanceof Error ? "wrapper_commit_read" : undefined);
       }
       if (!commit) {
-        if (sha === tip) return fail();
-        if ((await subjectOf(sha)).startsWith("uzi recovery coverage ")) return fail();
+        if (sha === tip) return fail("wrapper_tip_bound");
+        if ((await subjectOf(sha, "wrapper_leaf_subject")).startsWith("uzi recovery coverage ")) return fail("wrapper_coverage_leaf_bound");
         leaves.add(sha);
         continue;
       }
@@ -7474,7 +7505,7 @@ export class GitCache {
         // marker involvement refuses below (defence in depth: the fingerprint/pin checks would too).
         if (commit.message.startsWith("uzi recovery coverage ")) {
           lookalike = true;
-          if (++lookalikes > MAX_AGGREGATES) return fail();
+          if (++lookalikes > MAX_AGGREGATES) return fail("wrapper_lookalike_bound");
           queue.push(...commit.parents);
           continue;
         }
@@ -7482,56 +7513,71 @@ export class GitCache {
         continue;
       }
       aggregates.push({ fp: m[1]!, tree: commit.tree, author: commit.author, committer: commit.committer });
-      if (aggregates.length > MAX_AGGREGATES) return fail();
+      if (aggregates.length > MAX_AGGREGATES) return fail("wrapper_aggregate_bound");
       queue.push(...commit.parents);
     }
-    if (leaves.size > MAX_LEAVES) return fail();
+    if (leaves.size > MAX_LEAVES) return fail("wrapper_leaf_bound");
     const markerLeaves = new Set<string>();
-    for (const leaf of leaves) if ((await subjectOf(leaf)).startsWith(WIP_PARK_COMMIT_PREFIX)) markerLeaves.add(leaf);
+    for (const leaf of leaves) if ((await subjectOf(leaf, "wrapper_leaf_subject")).startsWith(WIP_PARK_COMMIT_PREFIX)) markerLeaves.add(leaf);
     if (!srcMarker && markerLeaves.size === 0) return undefined;
-    if (lookalike) return fail();
+    if (lookalike) return fail("wrapper_lookalike");
 
     // From here the shape involves a marker: everything below is a hard requirement.
-    if (!src || !aggregates.length) return fail();
+    if (!src) return fail("wrapper_source_missing");
+    if (!aggregates.length) return fail("wrapper_aggregate_missing");
     const fp = aggregates[0]!.fp;
-    if (aggregates.some(a => a.fp !== fp)) return fail();
+    if (aggregates.some(a => a.fp !== fp)) return fail("wrapper_fingerprint_mismatch");
     // The source (and a marker leaf) is read by plumbing, not readBoundedCommit: a clean source may be
     // oversized or non-UTF-8 and must still be comparable.
-    if (!OWED_OID.test(src)) return fail();
-    const sha1Of = async (rev: string): Promise<string> => {
+    if (!OWED_OID.test(src)) return fail("wrapper_source_oid");
+    const sha1Of = async (rev: string, reason: string): Promise<string> => {
       const out = await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-parse", "--verify", rev]);
-      return OWED_OID.test(out) ? out : fail();
+      return OWED_OID.test(out) ? out : fail(reason);
     };
-    const srcTree = await sha1Of(`${src}^{tree}`);
+    const srcTree = await sha1Of(`${src}^{tree}`, "wrapper_source_tree");
     const identity = (kind: string) => `${kind} ${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
     for (const a of aggregates) {
-      if (a.tree !== srcTree || a.author !== identity("author") || a.committer !== identity("committer")) return fail();
+      if (a.tree !== srcTree) return fail("wrapper_tree");
+      if (a.author !== identity("author")) return fail("wrapper_author");
+      if (a.committer !== identity("committer")) return fail("wrapper_committer");
     }
     const sortedLeaves = [...leaves].sort();
-    if (!leaves.has(src)) return fail();
+    if (!leaves.has(src)) return fail("wrapper_source_leaf");
     // The roots are the leaves, with or without the current source (the producer passes both forms).
     const fingerprints = [sortedLeaves, sortedLeaves.filter(l => l !== src)].filter(r => r.length > 0)
       .map(roots => createHash("sha256").update(JSON.stringify({ roots, currentSha: src, tree: srcTree })).digest("hex"));
-    if (!fingerprints.includes(fp)) return fail();
+    if (!fingerprints.includes(fp)) return fail("wrapper_fingerprint");
     // Provenance: only the worker's own pin of this very wrapper, for this run, proves it is genuine.
-    const pins = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
-      `refs/uzi-coverage/${journal.runId}/`]);
+    let pins: string;
+    try {
+      pins = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
+        `refs/uzi-coverage/${journal.runId}/`]);
+    } catch (error) {
+      try {
+        if (!this.boundaryProcesses.getStore()?.signal.aborted && !isCheckpointBoundaryFailure(error) &&
+            !(error instanceof CheckpointChildStartupTimeoutError) && !isAbortLike(error)) {
+          annotateRetainedSuccessorError(error, "wrapper_pin_read");
+        }
+      } catch { /* Diagnostics must not replace the original failure. */ }
+      throw error;
+    }
     const pinned = pins.split("\n").some(line => {
       const [ref, oid] = line.split(" ");
       return oid === tip && ref !== undefined && new RegExp(`^refs/uzi-coverage/[^/]+/[^/]+/${fp}$`).test(ref);
     });
-    if (!pinned) return fail();
+    if (!pinned) return fail("wrapper_pin");
     // Leaves: the source, history of the source, or a marker this attempt's lineage proves superseded.
     const lineage = new Set(journal.peeledMarkers ?? []);
     const accepted: string[] = [];
     for (const leaf of sortedLeaves) {
       if (leaf === src || await this.isAncestor(barePath, leaf, src)) continue;
-      if (!markerLeaves.has(leaf) || !lineage.has(leaf)) return fail();
-      if (!await this.isAncestor(barePath, await sha1Of(`${leaf}^`), src)) return fail();
+      if (!markerLeaves.has(leaf)) return fail("wrapper_lineage_marker");
+      if (!lineage.has(leaf)) return fail("wrapper_lineage_membership");
+      if (!await this.isAncestor(barePath, await sha1Of(`${leaf}^`, "wrapper_marker_parent"), src)) return fail("wrapper_lineage_ancestry");
       accepted.push(leaf);
     }
     if (srcMarker) {
-      return { seedTip: src, expectedHead: await sha1Of(`${src}^`), expectedTree: srcTree,
+      return { seedTip: src, expectedHead: await sha1Of(`${src}^`, "wrapper_source_parent"), expectedTree: srcTree,
         peeledMarkers: unionPeeledMarkers(accepted, [src]) };
     }
     return { seedTip: src, expectedHead: src, expectedTree: srcTree, peeledMarkers: unionPeeledMarkers(accepted) };
@@ -7545,19 +7591,19 @@ export class GitCache {
     barePath: string, branch: string, key: string, expected: RecoverySource, iteration: number,
     attemptId: string, opts?: { selfContained?: boolean; checkpointKey?: string | null; checkpointWriteUnresolved?: boolean },
   ): Promise<RunnerClone> {
-    if (!ATTEMPT_ID_RE.test(attemptId)) throw new Error("invalid successor attempt");
+    if (!ATTEMPT_ID_RE.test(attemptId)) throw annotateRetainedSuccessorError(new Error("invalid successor attempt"), "attempt_invalid");
     return this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const recovery = journal.recovery;
       if (!recovery || recovery.stage !== "captured" || recovery.attempts !== iteration ||
-          !recovery.restoreTip || !await this.recoveryClockCurrent(barePath, branch, journal)) throw new Error("successor iteration is not current");
+          !recovery.restoreTip || !await this.recoveryClockCurrent(barePath, branch, journal)) throw annotateRetainedSuccessorError(new Error("successor iteration is not current"), "iteration_before");
       const tip = recovery.restoreTip;
       const pin = `refs/uzi-recovery-episode/${journal.runId}/${tip}`;
-      if ((await this.runGit(barePath, ["rev-parse", "--verify", pin])).trim() !== tip) throw new Error("recovery pin changed");
+      if ((await this.runGit(barePath, ["rev-parse", "--verify", pin])).trim() !== tip) throw annotateRetainedSuccessorError(new Error("recovery pin changed"), "episode_pin_changed");
       // issue #3239: before any write, so a refusal leaves no ledger entry, journal change or clone.
       const wrapped = await this.resolveMarkerWrapperAdoption(barePath, journal, tip, recovery.restoreSource);
       const clonePath = attemptClonePath(this.runnerClonePath(barePath, key), attemptId);
-      if (await this.pathPresent(clonePath) || (await this.readAttemptLedger(barePath, branch)).has(attemptId)) throw new Error("successor identity already used");
+      if (await this.pathPresent(clonePath) || (await this.readAttemptLedger(barePath, branch)).has(attemptId)) throw annotateRetainedSuccessorError(new Error("successor identity already used"), "identity_used");
       const successor: RecoverySource = { runId: journal.runId, clonePath, attemptId, restoreTip: tip };
       const existingSources: RecoverySource[] = [];
       for (const s of this.recoverySources(journal)) {
@@ -7570,18 +7616,32 @@ export class GitCache {
       await this.appendAttemptLedger(barePath, branch, { attemptId, runId: successor.runId, clonePath, state: "live" });
       await this.writeRecovery(barePath, branch, { ...journal, retainedSources,
         recovery: { ...recovery, successor, stage: "adopting" } });
-      const seeded = await this.seedRunnerClone(barePath, branch, clonePath, journal.runId, true, undefined,
-        { ...opts, recoveryTip: wrapped?.seedTip ?? tip });
+      let seeded: RunnerClone;
+      try {
+        seeded = await this.seedRunnerClone(barePath, branch, clonePath, journal.runId, true, undefined,
+          { ...opts, recoveryTip: wrapped?.seedTip ?? tip });
+      } catch (error) {
+        try {
+          if (!this.boundaryProcesses.getStore()?.signal.aborted && !isCheckpointBoundaryFailure(error) &&
+              !(error instanceof CheckpointChildStartupTimeoutError) && !isAbortLike(error)) {
+            annotateRetainedSuccessorError(error, "seed_failed");
+          }
+        } catch { /* Diagnostics must not replace the original failure. */ }
+        throw error;
+      }
       const head = (await this.runGitAsRunner(clonePath, ["rev-parse", "HEAD"])).trim();
       const tree = (await this.runGitAsRunner(clonePath, ["write-tree"])).trim();
       const expectedTree = wrapped?.expectedTree ?? (await this.runGit(barePath, ["rev-parse", `${tip}^{tree}`])).trim();
       const marker = wrapped ? wrapped.expectedHead !== wrapped.seedTip : await this.isWipParkMarker(barePath, tip);
       const expectedHead = wrapped?.expectedHead ?? (marker ? (await this.runGit(barePath, ["rev-parse", `${tip}^`])).trim() : tip);
-      if (head !== expectedHead || tree !== expectedTree || (wrapped && marker && seeded.wipRecovered !== true) ||
-          (await this.runGitAsRunner(clonePath, ["diff", "--name-only"])).trim() !== "" ||
-          !await this.isAncestor(barePath, expectedHead, tip)) throw new Error("successor recovery verification failed");
+      const failedProof = head !== expectedHead ? "final_head"
+        : tree !== expectedTree ? "final_tree"
+        : (wrapped && marker && seeded.wipRecovered !== true) ? "final_marker_restoration"
+        : (await this.runGitAsRunner(clonePath, ["diff", "--name-only"])).trim() !== "" ? "final_dirty_diff"
+        : !await this.isAncestor(barePath, expectedHead, tip) ? "final_ancestry" : undefined;
+      if (failedProof) throw annotateRetainedSuccessorError(new Error("successor recovery verification failed"), failedProof);
       if (!await this.recoveryClockCurrent(barePath, branch, { ...journal, retainedSources,
-        recovery: { ...recovery, successor, stage: "adopting" } })) throw new Error("successor iteration is not current");
+        recovery: { ...recovery, successor, stage: "adopting" } })) throw annotateRetainedSuccessorError(new Error("successor iteration is not current"), "iteration_after");
       await this.writeRecovery(barePath, branch, { ...successor, retainedSources,
         // issue #3239: the lineage of what this seed peeled: the wrapper's accepted markers, or the tip
         // itself when the tip is the marker the seed's `reset --soft` removed from history.

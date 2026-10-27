@@ -30,6 +30,7 @@ import {
   CheckpointSoftDeadlineError,
   RetainedReadinessCleanupUnconfirmedError,
   formatRetainedRecoveryDiagnostic,
+  annotateRetainedSuccessorError,
   gitBasicCredential,
   isNonFastForwardRejection,
   isPushProtectionRejection,
@@ -12742,7 +12743,7 @@ export class RunRunner {
             claim: {
               kind: resolveRunKind(claim.kind),
               claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,
-              ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory),
+              ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory, claim.claim_generation),
             },
             emit: (m) => batcher.emit(m),
             redact: flight.redactText,
@@ -22096,7 +22097,16 @@ export class RunRunner {
             () => flight.executor.recordedRootPids?.() ?? [], new Date(this.now()), attemptId);
           flight.attempt = attempt;
           this.liveAttempts.add(attempt);
-          await check();
+          try { await check(); }
+          catch (error) {
+            try {
+              if (!(error instanceof RetainedRecoveryStop) && !(error instanceof CredentialSwitchSignal) &&
+                  !isCheckpointBoundaryFailure(error) && !(error instanceof Error && error.name === "AbortError")) {
+                annotateRetainedSuccessorError(error, "post_adoption_check");
+              }
+            } catch { /* Diagnostics must not replace the original failure. */ }
+            throw error;
+          }
           // Capture boundaries may have closed the Codex executor. A new factory instance owns
           // model admission; the predecessor executor never runs the resumed model.
           if (claim.secrets.codex || flight.executor.safety || flight.executor.sandboxesCommands ||

@@ -309,7 +309,16 @@ function mockAdminListRuns(params?: {
     // other run belongs to the session admin. Before this map existed, EVERY
     // row here was stamped with the session email — the demo factory list was
     // 100% "mine", the exact duplication amendment 2 removes.
-    .map((r) => runListItem(r, mockOtherRunOwners[r.id] ?? requireSession().email));
+    .map((r) => {
+      const item = runListItem(r, mockOtherRunOwners[r.id] ?? requireSession().email);
+      if (r.id in mockOtherRunOwners) {
+        delete item.codex_admission_class;
+        delete item.codex_admission_eligible_at;
+        if (item.queue_reason !== "maintenance") delete item.queue_reason;
+        item.health_reason = null;
+      }
+      return item;
+    });
   return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
 }
 

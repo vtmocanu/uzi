@@ -278,6 +278,8 @@ const CARD_MIRRORED_FIELDS = [
   "deadline_at",
   // PRD #3454: the maintenance queue reason rides the card so the board badge agrees.
   "queue_reason",
+  "codex_admission_class",
+  "codex_admission_eligible_at",
   // PRD #1732 D14: the board projection sends hold_reason on every card, so a run parked
   // on (or released from) credential_disabled flips the card's badge along with its status.
   "hold_reason",
@@ -336,6 +338,12 @@ function syncCards(runId: string, patch: Partial<Run>): void {
       const merged = { ...card.latest_run, updated_at: new Date().toISOString() };
       for (const key of CARD_MIRRORED_FIELDS) {
         if (key in patch) (merged as Record<string, unknown>)[key] = patch[key];
+      }
+      if (!merged.is_mine) {
+        delete merged.codex_admission_class;
+        delete merged.codex_admission_eligible_at;
+        if (merged.queue_reason !== "maintenance") delete merged.queue_reason;
+        merged.health_reason = null;
       }
       card.latest_run = merged;
     }

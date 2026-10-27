@@ -862,10 +862,12 @@ export interface LatestRun {
   // null for a non-running/chat/judge/interactive run. Optional for the same api/web
   // rollout skew as is_planning: a pre-feature api pod omits the key.
   deadline_at?: string | null;
-  // queue_reason (PRD #3454): "maintenance" while instance maintenance mode holds this queued,
-  // not-yet-admitted run back; null/absent otherwise. Computed in SQL at read time, so it never
-  // lags the pause. Optional for api/web rollout skew.
+  // Read-time reason holding this queued run back; optional for api/web rollout skew.
   queue_reason?: QueueReason | null;
+  // Read-time owner projection; foreign/admin shared reads redact account details.
+  // Eligibility includes the per-run spread and is not a promised start time.
+  codex_admission_class?: CodexAdmissionClass | null;
+  codex_admission_eligible_at?: string | null;
   // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
@@ -1539,9 +1541,10 @@ export interface ReleaseCheckStatus {
 
 // ── Instance maintenance mode (PRD #3454) ───────────────────────────────────
 
-// QueueReason is why a queued run is held back by the instance, beyond waiting for a
-// worker. Only "maintenance" exists today.
-export type QueueReason = "maintenance";
+// QueueReason is why a queued run is held back, beyond waiting for a
+// worker: instance maintenance or a temporary provider admission hold.
+export type QueueReason = "maintenance" | "codex_rate_limit" | "codex_overload";
+export type CodexAdmissionClass = "rate_limit" | "overload";
 
 // MaintenanceState is `GET /api/maintenance` (any signed-in user): whether intake is paused,
 // since when, and the admin's plain-text reason. Render the reason via stripDisplayCell.
@@ -3187,9 +3190,12 @@ export interface Run {
   // null for a non-running/chat/judge/interactive run. Optional for the same api/web
   // rollout skew as is_planning: a pre-feature api pod omits the key.
   deadline_at?: string | null;
-  /** PRD #3454: "maintenance" while instance maintenance mode holds this queued run back
-   *  (see LatestRun.queue_reason). Optional for api/web rollout skew. */
+  /** Read-time queue hold (see LatestRun.queue_reason). Optional for rollout skew. */
   queue_reason?: QueueReason | null;
+  // Read-time owner projection; foreign/admin shared reads redact account details.
+  // Eligibility includes the per-run spread and is not a promised start time.
+  codex_admission_class?: CodexAdmissionClass | null;
+  codex_admission_eligible_at?: string | null;
   /** PRD #320 D8: the run's queue-priority CLASS, computed server-side (see RunPriority).
    *  Only a QUEUED run is ever non-"normal"; a running/terminal run renders no pill. It
    *  rides the shared run embed (RunListItemDTO embeds RunDTO), so it is present on BOTH

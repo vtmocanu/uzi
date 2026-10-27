@@ -544,6 +544,18 @@ test("real Git journal strictly decodes server episodes and leaves legacy absenc
   const decoded = await read();
   assert.equal(Object.hasOwn(decoded.recovery!, "episode"), false);
   assert.deepEqual(JSON.parse(JSON.stringify(decoded)), legacy);
+  assert.doesNotMatch(JSON.stringify(decoded), /diagnostic_/);
+  for (const diagnosticKey of ["diagnostic_stage", "diagnostic_code", "cause", "context"]) {
+    for (const nested of [false, true]) {
+      const value = nested ? { ...legacy, recovery: { ...legacy.recovery, [diagnosticKey]: "successor" } }
+        : { ...legacy, [diagnosticKey]: "successor" };
+      writeJournal(value);
+      const bytes = git(bare, ["config", `uzi-recovery.${branch}.clone`]);
+      await assert.rejects(read(), /invalid.*recovery/i);
+      assert.equal(git(bare, ["config", `uzi-recovery.${branch}.clone`]), bytes);
+    }
+  }
+  writeJournal(legacy);
   for (const episode of [0, 7, Number.MAX_SAFE_INTEGER]) {
     const value = { ...legacy, recovery: { ...legacy.recovery, episode } };
     writeJournal(value);

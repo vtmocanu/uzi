@@ -1,3 +1,4 @@
+import type { CodexAdmissionReporter } from "./admission-signal.js";
 import { checkCheckpointStop, cleanCheckpointAdmission, CheckpointSoftDeadlineError } from "../checkpoint-stop.js";
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production `CodexExecutor` and the
 // claim-aware DARK selection seam's Codex branch.
@@ -1176,6 +1177,7 @@ export async function makeCodexAdviceHarness(
   signal?: AbortSignal,
   refresh?: "deny",
   ownership?: SummaryOwnership,
+  admissionReporter?: CodexAdmissionReporter,
 ): Promise<CodexAdviceHarness> {
   // Register EVERY advice token — the initial release AND any subscription refresh — with the
   // harness redactor so neither can ride a log line verbatim. The advice lane has no separate
@@ -1191,7 +1193,7 @@ export async function makeCodexAdviceHarness(
   ownership?.guard();
   registerToken(initial);
   const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken, refresh === "deny"));
-  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log });
+  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log, admissionReporter });
 }
 
 /** One evaluator pass on a caller-provided key. Register CLI signal cleanup before run;
@@ -1413,6 +1415,7 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
  *  ({@link import("./select.js").selectCodexBinding}'s output). */
 export interface CodexAdviceHarnessBuildParams {
   readonly runId: string;
+  readonly claimGeneration?: number;
   readonly binding: CodexBinding;
   readonly signal?: AbortSignal;
   /** PRD #2603: "deny" makes the call's app-server refresh bridge fail instead of calling
@@ -1446,7 +1449,8 @@ export function makeProductionCodexAdviceHarnessFactory(
     ownership?.guard();
     const bridge = new CodexAdviceCredentialBridge(runId, client, binding);
     const launchRoot = makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log, ownership);
-    return makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership);
+    return makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership,
+      binding.authMode === "subscription" ? client.codexAdmissionReporter?.(runId, params.claimGeneration) : undefined);
   };
 }
 
@@ -3023,7 +3027,7 @@ export class CodexExecutor implements Executor {
     const prdInputP = summariesOn
       ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log) : undefined;
     const summaryInputs = async () => ({
-      claim: { run_id: ctx.runId, secrets: {
+      claim: { run_id: ctx.runId, claim_generation: ctx.claimGeneration, secrets: {
         codex: this.opts.summaryClaimCodex !== undefined ? this.opts.summaryClaimCodex : summaryBinding,
       } },
       token: "", model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
@@ -5154,6 +5158,7 @@ export class CodexExecutor implements Executor {
       };
 
       harness = new CodexHarness({
+        admissionReporter: this.opts.client.codexAdmissionReporter?.(ctx.runId, ctx.claimGeneration),
         registry,
         launchRoot: async (spec) => {
           this.assertCaptureAdmission(revision);
@@ -6083,6 +6088,7 @@ export class CodexExecutor implements Executor {
       const sink = new ChildFrameQueue();
       harness.registerChildSink(childThreadId, sink);
       let childTurnId: string;
+      let admissionAttempt: ReturnType<CodexHarness["beginAdmissionAttempt"]>;
       try {
         const turnParams: Record<string, unknown> = {
           threadId: childThreadId,
@@ -6090,10 +6096,12 @@ export class CodexExecutor implements Executor {
         };
         if (spec.model !== undefined) turnParams.model = spec.model;
         if (spec.effort !== undefined) turnParams.effort = spec.effort;
+        admissionAttempt = harness.beginAdmissionAttempt(childThreadId);
         const turnRes = await harness.requestOnTransport<{ turn?: { id?: string } }>("turn/start", turnParams, { signal: spec.signal });
         const id = turnRes?.turn?.id;
         if (typeof id !== "string" || id.length === 0) throw new Error("codex child turn/start returned no turn id");
         childTurnId = id;
+        admissionAttempt?.bind(id);
       } catch (err) {
         harness.unregisterChildSink(childThreadId);
         sink.end();
@@ -6106,7 +6114,12 @@ export class CodexExecutor implements Executor {
       return {
         threadId: childThreadId,
         turnId: childTurnId,
-        notifications: () => sink.iterator(),
+        notifications: async function* () {
+          for await (const note of sink.iterator()) {
+            admissionAttempt?.observe(note);
+            yield note;
+          }
+        },
         project: (items) => harness.emitChildFrame(childThreadId, items),
         respond: (requestId, reply) => harness.respondOnTransport(requestId, reply),
         // Issue #1864: the delegation interrupts only AFTER spec.signal aborted, and the transport

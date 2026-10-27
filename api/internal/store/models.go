@@ -204,6 +204,24 @@ type CliToken struct {
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
 }
 
+type CodexAccountAdmissionThrottle struct {
+	UserID                 uuid.UUID          `json:"user_id"`
+	ProviderAccountID      uuid.UUID          `json:"provider_account_id"`
+	RateStep               int32              `json:"rate_step"`
+	RateExpiry             pgtype.Timestamptz `json:"rate_expiry"`
+	RateLastQualifying     pgtype.Timestamptz `json:"rate_last_qualifying"`
+	OverloadStep           int32              `json:"overload_step"`
+	OverloadExpiry         pgtype.Timestamptz `json:"overload_expiry"`
+	OverloadLastQualifying pgtype.Timestamptz `json:"overload_last_qualifying"`
+	ObservationClock       pgtype.Timestamptz `json:"observation_clock"`
+	Receipts               []byte             `json:"receipts"`
+	OverloadVotes          []byte             `json:"overload_votes"`
+	EpisodeID              pgtype.UUID        `json:"episode_id"`
+	SpreadWidthMs          int32              `json:"spread_width_ms"`
+	EffectiveExpiry        pgtype.Timestamptz `json:"effective_expiry"`
+	RecoveryFloor          pgtype.Timestamptz `json:"recovery_floor"`
+}
+
 type CodexAccountRateLimit struct {
 	UserID                     uuid.UUID          `json:"user_id"`
 	ProviderAccountID          uuid.UUID          `json:"provider_account_id"`
@@ -253,6 +271,13 @@ type CodexProviderAccount struct {
 	ReauthCredentialRevision pgtype.Int8        `json:"reauth_credential_revision"`
 	ReauthReason             pgtype.Text        `json:"reauth_reason"`
 	RecoveryCause            pgtype.Text        `json:"recovery_cause"`
+}
+
+type CodexQueuedRunAdmission struct {
+	RunID                    uuid.UUID          `json:"run_id"`
+	UserID                   uuid.UUID          `json:"user_id"`
+	CodexAdmissionClass      string             `json:"codex_admission_class"`
+	CodexAdmissionEligibleAt pgtype.Timestamptz `json:"codex_admission_eligible_at"`
 }
 
 type CodexRefreshIntent struct {

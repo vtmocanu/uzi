@@ -565,11 +565,14 @@ type RunDTO struct {
 	// chat/judge/interactive run, or no started_at). The near-timeout badge counts down
 	// to it; the reason string stays static, so nothing stored ever ages (D4).
 	DeadlineAt *time.Time `json:"deadline_at"`
-	// QueueReason (PRD #3454) is "maintenance" while instance maintenance mode holds this
-	// queued run back (queued, intake paused, run not admitted); absent otherwise. Derived in
-	// SQL at read time (store ListRunQueueReasons) so it never lags the pause; runToDTO leaves it nil.
+	// QueueReason is maintenance, codex_rate_limit, or codex_overload while a queued
+	// run is held; absent otherwise. Maintenance takes precedence. The handler overlays
+	// this at read time from ListRunAdmissionQueueReasons on owner-authorized reads.
 	QueueReason *string `json:"queue_reason,omitempty"`
-	PlanMd      *string `json:"plan_md"`
+	// Read-time account admission details; absent when unrestricted.
+	CodexAdmissionClass      *string    `json:"codex_admission_class,omitempty"`
+	CodexAdmissionEligibleAt *time.Time `json:"codex_admission_eligible_at,omitempty"`
+	PlanMd                   *string    `json:"plan_md"`
 	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
 	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
 	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB
@@ -1415,10 +1418,13 @@ type RunSummaryItemDTO struct {
 	// chat/judge/interactive run, or no started_at). The near-timeout badge counts down
 	// to it; the reason string stays static, so nothing stored ever ages (D4).
 	DeadlineAt *time.Time `json:"deadline_at"`
-	// QueueReason (PRD #3454) is "maintenance" while instance maintenance mode holds this
-	// queued run back (queued, intake paused, run not admitted); absent otherwise. Derived in
-	// SQL at read time (store ListRunQueueReasons) so it never lags the pause; runToDTO leaves it nil.
+	// QueueReason is maintenance, codex_rate_limit, or codex_overload while a queued
+	// run is held; absent otherwise. Maintenance takes precedence. The handler overlays
+	// this at read time from ListRunAdmissionQueueReasons on owner-authorized reads.
 	QueueReason *string `json:"queue_reason,omitempty"`
+	// Read-time account admission details; absent when unrestricted.
+	CodexAdmissionClass      *string    `json:"codex_admission_class,omitempty"`
+	CodexAdmissionEligibleAt *time.Time `json:"codex_admission_eligible_at,omitempty"`
 	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
 	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
 	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB
@@ -1940,6 +1946,8 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		HealthSince:                 item.HealthSince,
 		DeadlineAt:                  item.DeadlineAt,
 		QueueReason:                 item.QueueReason,
+		CodexAdmissionClass:         item.CodexAdmissionClass,
+		CodexAdmissionEligibleAt:    item.CodexAdmissionEligibleAt,
 		PlanSource:                  item.PlanSource,
 		GateRevision:                item.GateRevision,
 		SummaryIntent:               item.SummaryIntent,
@@ -2108,6 +2116,8 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			HealthSince:                 s.HealthSince,
 			DeadlineAt:                  s.DeadlineAt,
 			QueueReason:                 s.QueueReason,
+			CodexAdmissionClass:         s.CodexAdmissionClass,
+			CodexAdmissionEligibleAt:    s.CodexAdmissionEligibleAt,
 			PlanSource:                  s.PlanSource,
 			GateRevision:                s.GateRevision,
 			SummaryIntent:               s.SummaryIntent,

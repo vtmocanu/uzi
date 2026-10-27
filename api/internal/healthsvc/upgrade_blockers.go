@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -52,6 +53,9 @@ func (s *Service) enrichCapacityBlockers(ctx context.Context, evidence *waitEvid
 	for i := range rows {
 		rows[i].Kind = fact(rows[i].Kind, 24)
 		rows[i].Status = fact(rows[i].Status, 24)
+		if rows[i].HealthReason.Valid && apitypes.IsCodexAdmissionReason(rows[i].HealthReason.String) {
+			rows[i].HealthReason.String = "waiting: admission held"
+		}
 		rows[i].HealthReason = fact(rows[i].HealthReason, 24)
 		rows[i].HoldReason = fact(rows[i].HoldReason, 24)
 		rows[i].RecoveryWaitCause = fact(rows[i].RecoveryWaitCause, 32)

@@ -1014,6 +1014,9 @@ WITH claimant AS MATERIALIZED (
 ), target AS (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id FROM runs r
     WHERE r.user_id = @user_id
+      -- Admission is a snapshot read, before generation advances or custody opens.
+      -- NULL is unrestricted; the deadline includes the account's recovery spread.
+      AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
       AND EXISTS (SELECT 1 FROM claimant c WHERE NOT c.maintenance_fenced
         AND (fn_worker_accepts_new_intake(c)
              OR r.worker_id = c.id))
@@ -1495,6 +1498,7 @@ WITH claimant AS MATERIALIZED (
                          AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(p.protocol_capabilities))
                          -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
                          AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(p.protocol_capabilities))))
+                AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
                 -- PRD #1590 M2 (D2, A1): mirror the claimant's account gate so a
                 -- busy worker never defers this run to a peer that cannot claim it.
                 AND NOT (
@@ -9795,7 +9799,8 @@ WHERE id = @id;
 -- owner row is gone (COALESCE keeps the scan target a plain string).
 -- #3000: owner_hold_pinnable projects ClaimRun's independent draining/maintenance
 -- hold; Go applies the inclusive updated_at + affinity ceiling and reuses the owner name.
-SELECT id, user_id, status, auto_approve,
+SELECT id, runs.user_id, status, auto_approve,
+       admission.codex_admission_class, admission.codex_admission_eligible_at,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
@@ -9867,6 +9872,8 @@ SELECT id, user_id, status, auto_approve,
        ((SELECT fn_instance_intake_paused()) AND status = 'queued'
         AND NOT fn_run_admitted_during_intake_pause(runs))::boolean AS intake_pause_held
 FROM runs
+LEFT JOIN codex_queued_run_admission admission
+  ON admission.run_id = runs.id AND admission.user_id = runs.user_id
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';
 
@@ -9997,6 +10004,7 @@ WHERE w.user_id = @user_id
 -- eligibility. Static requirements compose on ONE candidate; strict counts ignore slots.
 WITH candidates AS (
 SELECT w.id,
+       COALESCE(codex_admission_run_eligible_at(run.id) <= now(), true)::boolean AS admission_eligible,
        (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))::boolean AS strict_candidate,
        fn_worker_accepts_new_intake(w)::boolean AS accepts_intake,
        w.maintenance_fenced AS hard_fenced,
@@ -10148,14 +10156,14 @@ WHERE run.id = @run_id
        OR run.released_worker_nonce IS DISTINCT FROM w.snapshot_register_nonce)
 )
 SELECT COALESCE(bool_or(own_worker AND automatic_hold), false)::boolean AS automatic_owner_hold,
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND affinity AND strict_binding)::bigint AS strict_eligible,
+       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND affinity AND strict_binding)::bigint AS strict_eligible,
        -- Legacy advisory availability deliberately ignores status and affinity.
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND NOT hard_fenced AND (accepts_intake OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND NOT hard_fenced AND own_worker AND affinity AND free_slot AND advisory_binding)::bigint AS assigned_claimable,
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
-       max(draining_since) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
+       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND NOT hard_fenced AND (accepts_intake OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
+       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND NOT hard_fenced AND own_worker AND affinity AND free_slot AND advisory_binding)::bigint AS assigned_claimable,
+       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
+       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
+       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
+       max(draining_since) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
        , count(*) FILTER (WHERE strict_candidate AND diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding)::bigint AS diagnostic_suitable
        , count(*) FILTER (WHERE strict_candidate AND diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll)::bigint AS diagnostic_rolling
        , count(*) FILTER (WHERE strict_candidate AND diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll
@@ -10474,6 +10482,8 @@ SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
+  -- Filter admission before LIMIT so held accounts cannot crowd out demand.
+  AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
   AND r.kind <> 'chat'
   AND NOT EXISTS (SELECT 1 FROM cross_checks code_check
                   WHERE code_check.checker_run_id = r.id AND code_check.stage = 'code')
@@ -10696,6 +10706,8 @@ SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
+  -- Filter admission before LIMIT so held accounts cannot crowd out demand.
+  AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
   AND r.kind <> 'chat'
   AND NOT EXISTS (SELECT 1 FROM cross_checks code_check
                   WHERE code_check.checker_run_id = r.id AND code_check.stage = 'code')

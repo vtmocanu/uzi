@@ -33,6 +33,7 @@
 # --promote-main-race-only [cutter-path] pins promotion while remote main advances.
 # --plan-only [cutter-path] runs read-only decision and publication fixtures.
 # --diagnostics-only runs real cutter/oracle structured-refusal fixtures.
+# --producer-failures-only isolates Git producer failures in real release fixtures.
 # --fragments-only [cutter-path] runs fragment regressions, optionally against a frozen cutter.
 #
 # Wired as `task test:release-scripts` (its own gate member, not gate:repo's
@@ -526,7 +527,7 @@ if [ "${1:-}" = "--identity-only" ]; then
   exit $?
 fi
 
-if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ] && [ "${1:-}" != "--plan-only" ] && [ "${1:-}" != "--promote-main-race-only" ] && [ "${1:-}" != "--diagnostics-only" ] && [ "${1:-}" != "--promotion-diagnostics-only" ]; then
+if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ] && [ "${1:-}" != "--plan-only" ] && [ "${1:-}" != "--promote-main-race-only" ] && [ "${1:-}" != "--diagnostics-only" ] && [ "${1:-}" != "--promotion-diagnostics-only" ] && [ "${1:-}" != "--producer-failures-only" ]; then
 identity_regressions
 echo "=== building fixture in $REPO ==="
 build_fixture
@@ -635,7 +636,7 @@ fi
 REPO_ROOT="$(cd "$SCRIPTS_DIR/.." && pwd)"
 RC="$REPO_ROOT/.agents/skills/uzi-release/scripts/release-cut.sh"
 case "${1:-}" in
-  --fragments-only|--plan-only|--promote-main-race-only) RC="${2:-$RC}" ;;
+  --fragments-only|--plan-only|--promote-main-race-only|--producer-failures-only) RC="${2:-$RC}" ;;
 esac
 [ -f "$RC" ] || { echo "release-scripts-test: $RC not found" >&2; exit 2; }
 
@@ -873,6 +874,106 @@ diagnostic_option_regressions() (
   echo "diagnostic options: $PASSES passed, $FAILS failed"
   [ "$FAILS" -eq 0 ]
 )
+# Failed and partially emitted inventories never become release evidence.
+producer_failure_regressions() (
+  PASSES=0; FAILS=0
+  local root d site form before refs status worktrees marker result real_git
+  local -a args
+  root=$(mktemp -d)
+  trap 'rm -rf "$root"' EXIT
+  real_git=$(command -v git)
+  mkdir "$root/bin"
+  cat > "$root/bin/git" <<'STUB'
+#!/usr/bin/env bash
+original=("$@")
+while [ "$#" -gt 0 ]; do
+  case "$1" in -c|-C) shift 2 ;; *) break ;; esac
+done
+if [ "$READ_FAIL_FORM" != control ] && [ ! -e "$READ_FAIL_MARKER" ]; then
+  match=0
+  case "$READ_FAIL_SITE/$*" in
+    'history/log --first-parent --reverse --format=%H v0.1.0..HEAD') match=1 ;;
+    'allowlist/diff --name-only v0.2.0-rc.1..HEAD') match=1 ;;
+  esac
+  if [ "$match" -eq 1 ]; then
+    printf '%s\n' "$READ_FAIL_SITE/$READ_FAIL_FORM" > "$READ_FAIL_MARKER"
+    if [ "$READ_FAIL_FORM" = partial ]; then
+      if [ "$READ_FAIL_SITE" = history ]; then
+        history=$("$READ_REAL_GIT" "${original[@]}") || exit 92
+        printf '%s\n' "${history%%$'\n'*}"
+      else
+        printf 'CHANGELOG.md\n'
+      fi
+    fi
+    exit 71
+  fi
+fi
+exec "$READ_REAL_GIT" "${original[@]}"
+STUB
+  chmod +x "$root/bin/git"
+  for site in history allowlist; do
+    for form in empty partial control plan; do
+      if [ "$site" = allowlist ] && [ "$form" = plan ]; then continue; fi
+      d="$root/$site-$form"; marker="$root/$site-$form.marker"; result="$root/$site-$form.json"
+      if [ "$site" = history ]; then
+        seed_repo "$d"; add_feature "$d" 201
+        printf 'module example/producer\n' > "$d/api/go.mod"
+        git -C "$d" add api/go.mod; gcommit "$d" 'chore(deps): update manifest (#204)'
+        feature_201_changelog "$d"
+        awk '{gsub(/\(#201\)/, "(#201, #204)"); print}' "$d/CHANGELOG.md" > "$root/notes"
+        put_changelog "$d" < "$root/notes"
+      else
+        published_rc "$d"
+      fi
+      if [ "$form" = plan ]; then
+        cat > "$d/scripts/release-ci-coverage.py" <<'PY'
+import sys
+if sys.argv[1] == 'publication':
+    print('success')
+    sys.exit(0)
+sys.exit(1)  # metadata: these shipping fixture commits are not metadata-only
+PY
+        git -C "$d" add scripts/release-ci-coverage.py
+        gcommit "$d" 'test: offline publication evidence'
+      fi
+      before=$(git -C "$d" rev-parse HEAD)
+      refs=$(git -C "$d" for-each-ref --format='%(refname) %(objectname)')
+      status=$(git -C "$d" status --porcelain=v1 --untracked-files=all)
+      worktrees=$(git -C "$d" worktree list --porcelain)
+      args=(0.2.0 --result-file "$result")
+      [ "$site" = history ] || args+=(--promote-only)
+      [ "$form" != plan ] || args=(--plan)
+      READ_REAL_GIT="$real_git" READ_FAIL_SITE="$site" READ_FAIL_FORM="$form" READ_FAIL_MARKER="$marker" \
+        PATH="$root/bin:$PATH" run_rc "$d" "${args[@]}"
+      if [ "$form" = control ]; then
+        # The shim itself must preserve a normal cut/promotion.
+        # Control mode bypasses injection while using the same Git wrapper.
+        assert_eq "$site successful control" 0 "$RC_RC"
+        continue
+      fi
+      if [ "$site" = history ]; then
+        if [ "$form" = plan ]; then
+          assert_eq 'dependency history plan propagates instrument status' 2 "$RC_RC"
+        else
+          assert_eq "dependency history $form instrument refusal" 3 "$RC_RC"
+        fi
+        assert_contains "dependency history $form names failed read" 'could not read dependency history' "$RC_OUT"
+      else
+        assert_eq "promotion allowlist $form instrument failure" 1 "$RC_RC"
+        assert_contains "promotion allowlist $form names failed read" 'could not read promotion metadata diff' "$RC_OUT"
+      fi
+      assert_eq "$site $form injected exact producer" "$site/$form" "$(cat "$marker" 2>/dev/null)"
+      assert_eq "$site $form HEAD unchanged" "$before" "$(git -C "$d" rev-parse HEAD)"
+      assert_eq "$site $form refs unchanged" "$refs" "$(git -C "$d" for-each-ref --format='%(refname) %(objectname)')"
+      assert_eq "$site $form worktree unchanged" "$status" "$(git -C "$d" status --porcelain=v1 --untracked-files=all)"
+      assert_eq "$site $form temporary release worktree removed" "$worktrees" "$(git -C "$d" worktree list --porcelain)"
+    done
+  done
+  [ "$PASSES" -ge 40 ] || fail 'producer failure fixture assertion floor'
+  echo "git producer failures: $PASSES passed, $FAILS failed"
+  [ "$FAILS" -eq 0 ]
+)
+if [ "${1:-}" = --producer-failures-only ]; then producer_failure_regressions; exit $?; fi
 if [ "${1:-}" = --promotion-diagnostics-only ]; then promotion_diagnostic_regressions "${2:-}"; exit $?; fi
 if [ "${1:-}" = --diagnostics-only ]; then
   diagnostic_status=0
@@ -882,6 +983,7 @@ if [ "${1:-}" = --diagnostics-only ]; then
   exit "$diagnostic_status"
 fi
 if [ "$#" -eq 0 ]; then
+  producer_failure_regressions || fail 'git producer failure regressions'
   diagnostic_regressions || fail 'structured diagnostic regressions'
   promotion_diagnostic_regressions || fail 'promotion diagnostic regressions'
   diagnostic_option_regressions || fail 'diagnostic option regressions'

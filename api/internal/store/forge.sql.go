@@ -469,11 +469,17 @@ SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_
        r.budget_finalize_seconds, r.hold_reason,
        r.auto_approve_blocked_reasons,
        r.created_at, r.updated_at,
-       -- PRD #3454: "maintenance" while intake is paused and this queued run is not admitted, else '' (sqlc types a CASE column non-null; the handler maps '' to absent).
-       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' ELSE '' END)::text AS queue_reason,
+       -- Maintenance outranks account admission; the handler hides account details from nonowners.
+       -- Empty means unrestricted and maps to an absent queue_reason.
+       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance'
+             WHEN admission.codex_admission_class = 'rate_limit' THEN 'codex_rate_limit'
+             WHEN admission.codex_admission_class = 'overload' THEN 'codex_overload'
+             ELSE '' END)::text AS queue_reason,
+       admission.codex_admission_class, admission.codex_admission_eligible_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count
 FROM runs r
+LEFT JOIN codex_queued_run_admission admission ON admission.run_id = r.id AND admission.user_id = r.user_id
 LEFT JOIN users ru ON ru.id = r.user_id
 LEFT JOIN workers rw ON rw.id = r.worker_id
 WHERE r.repo_id = $1::uuid AND r.issue_iid = $2
@@ -516,6 +522,8 @@ type GetLatestRunForIssueRow struct {
 	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
 	QueueReason               string             `json:"queue_reason"`
+	CodexAdmissionClass       pgtype.Text        `json:"codex_admission_class"`
+	CodexAdmissionEligibleAt  pgtype.Timestamptz `json:"codex_admission_eligible_at"`
 	OwnerName                 pgtype.Text        `json:"owner_name"`
 	WorkerName                pgtype.Text        `json:"worker_name"`
 	RunCount                  int64              `json:"run_count"`
@@ -561,6 +569,8 @@ func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForI
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.QueueReason,
+		&i.CodexAdmissionClass,
+		&i.CodexAdmissionEligibleAt,
 		&i.OwnerName,
 		&i.WorkerName,
 		&i.RunCount,
@@ -1132,11 +1142,17 @@ SELECT DISTINCT ON (r.issue_iid)
        r.budget_finalize_seconds, r.hold_reason,
        r.auto_approve_blocked_reasons,
        r.created_at, r.updated_at,
-       -- PRD #3454: "maintenance" while intake is paused and this queued run is not admitted, else '' (sqlc types a CASE column non-null; the handler maps '' to absent).
-       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' ELSE '' END)::text AS queue_reason,
+       -- Maintenance outranks account admission; the handler hides account details from nonowners.
+       -- Empty means unrestricted and maps to an absent queue_reason.
+       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance'
+             WHEN admission.codex_admission_class = 'rate_limit' THEN 'codex_rate_limit'
+             WHEN admission.codex_admission_class = 'overload' THEN 'codex_overload'
+             ELSE '' END)::text AS queue_reason,
+       admission.codex_admission_class, admission.codex_admission_eligible_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
 FROM runs r
+LEFT JOIN codex_queued_run_admission admission ON admission.run_id = r.id AND admission.user_id = r.user_id
 LEFT JOIN users ru ON ru.id = r.user_id
 LEFT JOIN workers rw ON rw.id = r.worker_id
 WHERE r.repo_id = $1::uuid AND r.issue_iid IS NOT NULL   -- issue runs only; ci_fix runs (PRD #6) have no card; ::uuid keeps the param non-null after PRD #39
@@ -1174,6 +1190,8 @@ type ListLatestRunsForRepoRow struct {
 	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
 	QueueReason               string             `json:"queue_reason"`
+	CodexAdmissionClass       pgtype.Text        `json:"codex_admission_class"`
+	CodexAdmissionEligibleAt  pgtype.Timestamptz `json:"codex_admission_eligible_at"`
 	OwnerName                 pgtype.Text        `json:"owner_name"`
 	WorkerName                pgtype.Text        `json:"worker_name"`
 	RunCount                  int64              `json:"run_count"`
@@ -1236,6 +1254,8 @@ func (q *Queries) ListLatestRunsForRepo(ctx context.Context, repoID uuid.UUID) (
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.QueueReason,
+			&i.CodexAdmissionClass,
+			&i.CodexAdmissionEligibleAt,
 			&i.OwnerName,
 			&i.WorkerName,
 			&i.RunCount,

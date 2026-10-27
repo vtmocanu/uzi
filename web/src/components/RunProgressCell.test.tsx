@@ -277,3 +277,17 @@ describe("RunProgressCell (PRD #2602)", () => {
     expect(container.innerHTML).toBe("");
   });
 });
+
+
+it.each([["rate_limit", "a rate limit"], ["overload", "overload"]] as const)("Codex admission progress names %s eligibility", (cls, words) => {
+  const { container } = renderCell({ status: "queued", codex_admission_class: cls,
+    codex_admission_eligible_at: "2026-10-09T18:47:39Z", progress: progress({ state: "queued" }) });
+  expect(container.textContent).toBe(`Progress: waiting: provider reported ${words}; account admission eligible after 2026-10-09T18:47:39Z`);
+});
+
+it("Codex admission progress yields to a higher-priority queued blocker", () => {
+  const { container } = renderCell({ status: "queued", codex_admission_class: "rate_limit",
+    codex_admission_eligible_at: "2026-10-09T18:47:39Z", health_reason: "your vault is locked, so this run can't start",
+    progress: progress({ state: "queued" }) });
+  expect(container.textContent).toBe("Progress: queued");
+});

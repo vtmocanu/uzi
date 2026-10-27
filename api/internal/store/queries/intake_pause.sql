@@ -40,8 +40,10 @@ SELECT * FROM instance_intake_pause_events ORDER BY at DESC, id DESC LIMIT @row_
 -- PRD #3454: the ephemeral provisioner's per-candidate recheck, run inside provisionOne's
 -- transaction right after the advisory lock. Plain snapshot read: NO row lock (a FOR UPDATE /
 -- FOR SHARE here could deadlock against the lease path, see the 40P01 note in workersvc/ephemeral_lease.go). false means
--- the pause is on and the run is not admitted; no row means the run is gone.
-SELECT (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))::boolean AS admittable
+-- intake is paused for this run or its Codex account admission deadline is still ahead;
+-- no row means the run is gone. The deadline includes recovery spread.
+SELECT ((NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
+        AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true))::boolean AS admittable
 FROM runs r
 WHERE r.id = @run_id;
 
@@ -156,3 +158,18 @@ SELECT r.id AS run_id,
 FROM runs r
 WHERE r.id = ANY(@run_ids::uuid[])
   AND r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r);
+
+-- name: ListRunAdmissionQueueReasons :many
+-- Read-time maintenance precedence; owner admission details remain available independently.
+SELECT r.id AS run_id,
+       (CASE WHEN (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r)
+             THEN 'maintenance'
+             WHEN admission.codex_admission_class = 'rate_limit' THEN 'codex_rate_limit'
+             WHEN admission.codex_admission_class = 'overload' THEN 'codex_overload'
+             ELSE '' END)::text AS queue_reason,
+       admission.codex_admission_class, admission.codex_admission_eligible_at
+FROM runs r
+LEFT JOIN codex_queued_run_admission admission ON admission.run_id = r.id AND admission.user_id = r.user_id AND admission.user_id = @viewer_id::uuid
+WHERE r.id = ANY(@run_ids::uuid[]) AND r.status = 'queued'
+  AND (admission.run_id IS NOT NULL
+       OR ((SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r)));

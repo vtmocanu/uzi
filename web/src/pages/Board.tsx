@@ -31,6 +31,8 @@ import {
   isAwaitingFollowup,
   isAwaitingInput,
   isMaintenanceQueued,
+  codexAdmissionText,
+  queuedBlockerPrecedesCodexAdmission,
 } from "../lib/runBadge";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { lanePaging, visibleColumns } from "../lib/boardColumns";
@@ -582,6 +584,7 @@ export function Board() {
             // PRD #3454: a run held back by instance maintenance mode waits on purpose (the
             // detector may still flag waiting_worker); it is not stuck.
             !isMaintenanceQueued(r) &&
+            !(codexAdmissionText(r, Date.now()) && !queuedBlockerPrecedesCodexAdmission(r)) &&
             r.issue_iid != null,
         ),
       );

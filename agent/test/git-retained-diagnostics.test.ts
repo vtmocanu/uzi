@@ -1,6 +1,6 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
-import { GitCache, formatRetainedRecoveryDiagnostic } from "../src/git.js";
+import { GitCache, formatRetainedRecoveryDiagnostic, annotateRetainedSuccessorError } from "../src/git.js";
 import { makeTextRedactor } from "../src/redact.js";
 import { nullLogger } from "./helpers.js";
 
@@ -81,4 +81,75 @@ it("generic errors are redacted and bounded; helper and formatter failures use f
   assert.equal(failed.diagnostic_code, "formatter_failed");
   assert.equal(failed.cause, "");
   assert.ok(!JSON.stringify(failed).includes(secret));
+});
+
+it("M1 untagged formatting preserves prototype observations", () => {
+  let prototypeReads = 0;
+  const error = new Proxy(new Error("plain untagged failure"), {
+    getPrototypeOf() { return ++prototypeReads <= 2 ? Error.prototype : null; },
+  });
+  assert.deepEqual(formatRetainedRecoveryDiagnostic(error, s => s), {
+    diagnostic_stage: "recovery", diagnostic_code: "recovery_failed", cause: "plain untagged failure",
+  });
+  assert.equal(prototypeReads, 2, "only the original formatter checks the untagged value");
+});
+
+// Candidate-only annotation API tables; portable lifecycle assertions live in the fixture tests.
+const successorReasons = [
+  "wrapper_tip_subject", "wrapper_source_subject", "wrapper_leaf_subject", "wrapper_commit_read",
+  "wrapper_walk_bound", "wrapper_tip_bound", "wrapper_coverage_leaf_bound", "wrapper_lookalike_bound",
+  "wrapper_aggregate_bound", "wrapper_leaf_bound", "wrapper_lookalike", "wrapper_source_missing",
+  "wrapper_aggregate_missing", "wrapper_fingerprint_mismatch", "wrapper_source_oid", "wrapper_source_tree",
+  "wrapper_tree", "wrapper_author", "wrapper_committer", "wrapper_source_leaf", "wrapper_fingerprint",
+  "wrapper_pin_read", "wrapper_pin", "wrapper_lineage_marker", "wrapper_lineage_membership",
+  "wrapper_marker_parent", "wrapper_lineage_ancestry", "wrapper_source_parent",
+  "final_head", "final_tree", "final_marker_restoration", "final_dirty_diff", "final_ancestry",
+  "attempt_invalid", "iteration_before", "episode_pin_changed", "identity_used", "seed_failed",
+  "iteration_after", "post_adoption_check",
+];
+for (const reason of successorReasons) {
+  it("M1 fixed successor allowlist: " + reason, () => {
+    const error = new TypeError("retained_readiness_cleanup " + secret);
+    const own = Object.getOwnPropertyDescriptors(error);
+    assert.equal(annotateRetainedSuccessorError(error, reason), error);
+    assert.deepEqual(Object.getOwnPropertyDescriptors(error), own);
+    assert.equal(error.name, "TypeError");
+    assert.deepEqual(Object.keys(error), []);
+    assert.equal(JSON.stringify(error), "{}");
+    assert.deepEqual(formatRetainedRecoveryDiagnostic(error, () => { throw new Error("must not redact"); }), {
+      diagnostic_stage: "successor", diagnostic_code: "retained_successor_" + reason, cause: "",
+    });
+  });
+}
+
+it("M1 tags precede real transport metadata, throwing message getters and hostile redaction inputs", async () => {
+  for (const message of [secret, secret.slice(0, 10) + "\n" + secret.slice(10), "x".repeat(65537)]) {
+    const error = await failure(message);
+    annotateRetainedSuccessorError(error, "seed_failed");
+    Object.defineProperty(error, "message", { get() { throw new Error("message must not be read"); } });
+    assert.deepEqual(formatRetainedRecoveryDiagnostic(error, () => { throw new Error("redactor must not run"); }), {
+      diagnostic_stage: "successor", diagnostic_code: "retained_successor_seed_failed", cause: "",
+    });
+  }
+});
+
+it("M1 rejects unknown tags and untrusted successor prefixes, without altering untagged output", () => {
+  for (const reason of ["unknown", "retained_successor_seed_failed", "seed_failed ", "__proto__", "constructor"]) {
+    const error = Object.assign(new Error("retained_successor_" + reason), { diagnostic_code: "retained_successor_final_head" });
+    const before = formatRetainedRecoveryDiagnostic(error, s => s);
+    annotateRetainedSuccessorError(error, reason);
+    assert.deepEqual(formatRetainedRecoveryDiagnostic(error, s => s), before);
+    assert.deepEqual(before, { diagnostic_stage: "recovery", diagnostic_code: "recovery_failed", cause: error.message.trim() });
+  }
+  for (const value of ["retained_successor_seed_failed", null, 1, { message: "retained_successor_final_head" }]) {
+    const before = formatRetainedRecoveryDiagnostic(value, s => s);
+    assert.equal(annotateRetainedSuccessorError(value, "seed_failed"), value);
+    assert.deepEqual(formatRetainedRecoveryDiagnostic(value, s => s), before);
+  }
+  assert.deepEqual(formatRetainedRecoveryDiagnostic(new Error("retained_readiness_cleanup"), s => s), {
+    diagnostic_stage: "readiness", diagnostic_code: "retained_readiness_cleanup", cause: "",
+  });
+  assert.deepEqual(formatRetainedRecoveryDiagnostic(new Error("plain"), s => s), {
+    diagnostic_stage: "recovery", diagnostic_code: "recovery_failed", cause: "plain",
+  });
 });
