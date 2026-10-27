@@ -25,8 +25,9 @@ type policyRevisionLegacyReader interface {
 }
 
 // policyRevisionPlanApproved is read-only and independent of paused eligibility
-// and Stop actions. Future state/ACK/running callers must supply their locked row
-// and transaction-bound reader; claim assembly currently supplies its claim row.
+// and Stop actions. Claim handoff supplies its final locked row and transaction
+// reader; assembly supplies a provisional claim row. Future ACK/running callers
+// must likewise use their locked row and transaction-bound reader.
 // legacyApproved is used only outside the constrained source-authority boundary.
 func policyRevisionPlanApproved(ctx context.Context, reader any, r store.Run, legacyApproved bool) bool {
 	if r.PolicyRefusalCount <= 0 || !policyEligible(r) {

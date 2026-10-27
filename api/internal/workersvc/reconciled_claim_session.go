@@ -13,12 +13,12 @@ import (
 // reconciledClaimSession leaves the durable session in runs for custody/history,
 // but never offers the latest reconciliation's predecessor transcript to a lead.
 // Recovery claims remain fresh until a different session is durably recorded.
-func (s *Service) reconciledClaimSession(ctx context.Context, run store.Run) (*string, error) {
+func (s *Service) reconciledClaimSession(ctx context.Context, q any, run store.Run) (*string, error) {
 	session := textPtr(run.SessionID)
 	if session == nil || run.GateRevision == 0 {
 		return session, nil
 	}
-	reader, ok := s.q.(interface {
+	reader, ok := q.(interface {
 		LatestRunMilestoneReconciliationSession(context.Context, uuid.UUID) ([][]byte, error)
 	})
 	if !ok {

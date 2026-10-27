@@ -52,6 +52,7 @@ type claimRecoveryIdentity struct {
 // claimFinishQueries is the statement surface of finishRunClaim's exact-claim transaction.
 // *store.Queries bound to the pgx transaction satisfies it.
 type claimFinishQueries interface {
+	claimPlanReader
 	GetRunOwnedByWorkerForUpdate(ctx context.Context, arg store.GetRunOwnedByWorkerForUpdateParams) (store.Run, error)
 	LockCodexAliasForShareNowait(ctx context.Context, arg store.LockCodexAliasForShareNowaitParams) (store.LockCodexAliasForShareNowaitRow, error)
 	LockCodexAccountForShareNowait(ctx context.Context, arg store.LockCodexAccountForShareNowaitParams) (uuid.UUID, error)
@@ -395,6 +396,17 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	}
 	if decision == nil {
 		if payload != nil {
+			if locked.Kind != runkind.Judge && locked.Kind != runkind.Job {
+				rc, err := q.GetRunClaimContext(ctx, locked.ID)
+				if err != nil {
+					return nil, "", err
+				}
+				projection, err := s.claimPlanProjection(ctx, q, locked, rc)
+				if err != nil {
+					return nil, "", err
+				}
+				applyClaimPlanProjection(payload, projection)
+			}
 			// Replace any assembly value only under the final owned claim lock.
 			payload.PolicyRevisionGate = nil
 			if identity.policyRevisionProjection {

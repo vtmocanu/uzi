@@ -187,8 +187,19 @@ type fakeStore struct {
 	claimRequeued     *store.RequeueClaimAssemblyExactParams
 	claimParked       *store.ParkRunCodexAccountUnavailableParams
 	claimFinishLocked *store.Run
-	claimFinishHolds  []uuid.UUID
-	claimReleased     int
+	// Final projection reads are independent of assembly's claimCtx and claimRun.
+	claimFinishCtx          *store.GetRunClaimContextRow
+	claimFinishCtxErr       error
+	claimFinishPlanSeq      int64
+	claimFinishPlanSeqErr   error
+	claimFinishPlanAt       pgtype.Timestamptz
+	claimFinishPlanAtErr    error
+	claimFinishPlanAtParams []store.LatestPersistedPlanFrameAtForRunParams
+	claimFinishSessions     [][]byte
+	claimFinishSessionErr   error
+	claimFinishCommitErr    error
+	claimFinishHolds        []uuid.UUID
+	claimReleased           int
 	// claimReleaseRows overrides ReleaseCustodyHoldExact's affected-row count (default 1, the
 	// single exact hold) so a test can stage a release that matched no row.
 	claimReleaseRows *int64

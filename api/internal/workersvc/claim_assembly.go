@@ -1,7 +1,6 @@
 package workersvc
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,7 +8,6 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -187,7 +185,7 @@ func completionNonClosingClaim(run store.Run) *CompletionNonClosing {
 // CLAIMING worker, not just the run, because since PRD #104 M3 the credential a
 // run spends can depend on which worker picked it up.
 func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
-	pending, pendingErr := CompletionPending(run)
+	_, pendingErr := CompletionPending(run)
 	if pendingErr != nil {
 		return nil, pendingErr
 	}
@@ -493,22 +491,6 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		branch = run.PipelineRef
 	}
 
-	// PRD #122 M1: replay the FROZEN milestone list on every claim. A malformed column
-	// degrades to nil-and-log rather than failing the claim, matching the repo_agents
-	// decode on the DTO path — the column is data a prior write left, not an invariant
-	// of this claim, and stranding a run over it would be worse than serving no list.
-	milestones, err := DecodeMilestones(run.MilestonesFrozen)
-	if err != nil {
-		slog.Error("workersvc: decode run milestones", "run_id", run.ID, "error", err)
-		milestones = nil
-	}
-
-	var executionMilestones *[]Milestone
-	if len(run.MilestonesFrozen) > 0 && !bytes.Equal(bytes.TrimSpace(run.MilestonesFrozen), []byte("null")) && err == nil {
-		frozen := append([]Milestone{}, milestones...)
-		executionMilestones = &frozen
-	}
-
 	// PRD #381: replay the structured issue-comments snapshot captured at run
 	// creation. A malformed column degrades to nil-and-log rather than failing the
 	// claim, matching the milestone decode above — the column is data a prior write
@@ -614,80 +596,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		taskIdleTimeoutSeconds = int(s.p.WorkerTaskIdleTimeout.Seconds())
 	}
 
-	// plan_approved is computed once here so both the PlanApproved field and the
-	// resume_phase derivation (PRD #1247 M5, D13) read the SAME value — see the payload
-	// literal for the full provenance of the three ordinary disjuncts. Constrained
-	// revision/source authority overrides them before resume phase selection.
-	planApproved := policyRevisionPlanApproved(ctx, s.q, run, run.AutoApprove || rc.HumanPlanApproved || run.PlanSource == planSourceSeeded)
-	// PRD #1247 M5, D13: the server-derived phase a resumed claim RESTORES instead of
-	// re-entering the planning turn. Empty for a fresh run (omitted by omitempty).
-	resumePhase := resumePhaseFor(run, planApproved)
-	sessionID, err := s.reconciledClaimSession(ctx, run)
+	projection, err := s.claimPlanProjection(ctx, s.q, run, rc)
 	if err != nil {
 		return nil, err
-	}
-	// The submitted plan's seq rides ONLY the awaiting_approval resume (D13: "awaiting_approval
-	// with the submitted plan's seq"), so the query stays off the hot path for every other
-	// claim. A query error degrades to seq 0 and NEVER fails the claim — the same degrade-and-log
-	// posture as the milestone/issue-comments decodes above; the run still resumes its gate, the
-	// worker just cannot correlate a buffered approve_plan to a specific plan revision.
-	var resumePlanSeq int64
-	if resumePhase == "awaiting_approval" {
-		// A gate resume re-presents the submitted candidate with its plan, for both legacy and
-		// interlocked runs. This candidate can differ from an earlier frozen contract awaiting
-		// explicit owner reconciliation. A valid candidate, including [], replaces the execution
-		// list for gate presentation only; approved executing claims use the frozen list above.
-		// Missing or invalid candidate data must not present frozen definitions as the gate.
-		milestones = nil
-		if len(run.MilestonesCandidate) > 0 {
-			if cand, cerr := DecodeMilestones(run.MilestonesCandidate); cerr != nil {
-				slog.Error("workersvc: decode run milestone candidate", "run_id", run.ID, "error", cerr)
-			} else if _, valid := validateMilestones(cand); valid {
-				milestones = cand
-			}
-		}
-		if seq, err := s.q.LatestPlanSeqForRun(ctx, run.ID); err != nil {
-			slog.Warn("workersvc: latest plan seq for resume", "run_id", run.ID, "error", err)
-		} else {
-			resumePlanSeq = seq
-		}
-	}
-	// PRD #1795 M1: the gate resume carries the persisted gate revision, its presentation id
-	// (nil for an id-less gate) and the presented requirements, all from the immutable snapshot,
-	// never the live requirement columns. A gate published before the migration (revision 0)
-	// carries none of them.
-	var resumeGateRevision int64
-	var resumeGatePresentationID *uuid.UUID
-	var resumeGatePresented *GatePresentedRequirements
-	if resumePhase == "awaiting_approval" && run.GateRevision > 0 {
-		resumeGateRevision = run.GateRevision
-		if run.GatePresentationID.Valid {
-			id := uuid.UUID(run.GatePresentationID.Bytes)
-			resumeGatePresentationID = &id
-		}
-		if snap, ok, derr := decodeGatePresentedPayload(run.GatePresentedPayload); derr != nil {
-			slog.Error("workersvc: decode gate presented payload", "run_id", run.ID, "error", derr)
-		} else if ok {
-			resumeGatePresented = snap.requirements()
-		}
-	}
-	// Issue #1604: when the persisted plan is UNAPPROVED (both the awaiting_approval gate resume
-	// and the "" re-plan resume of a session-less run), carry when THAT plan was last shown: the
-	// latest `plan` frame whose plan_md equals the persisted run.PlanMd, so a newer frame for a
-	// plan whose awaiting_approval report never persisted cannot move it. The worker discards a
-	// replayed gate verdict written against an earlier plan. Same hasPlan test resumePhaseFor
-	// applies, same planApproved value. A query error or no matching plan frame omits the field
-	// (no fallback to the latest frame) and never fails the claim.
-	var resumePlanAt *time.Time
-	if run.PlanMd.Valid && strings.TrimSpace(run.PlanMd.String) != "" && !planApproved {
-		if at, err := s.q.LatestPersistedPlanFrameAtForRun(ctx, store.LatestPersistedPlanFrameAtForRunParams{
-			RunID: run.ID, PlanMd: run.PlanMd.String,
-		}); err != nil {
-			slog.Warn("workersvc: latest plan frame time for resume", "run_id", run.ID, "error", err)
-		} else if at.Valid {
-			t := at.Time
-			resumePlanAt = &t
-		}
 	}
 
 	inventoryGuarded, err := s.RunInventoryGuard(ctx, wkr, run.ID, run.ClaimGeneration)
@@ -710,8 +621,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		CheckpointCoordinates:  coordinates,
 		CIRepair:               ciRepair,
 		InventoryGuarded:       inventoryGuarded,
-		PolicyHoldResume:       run.PolicyRefusalCount > 0,
-		PolicyHoldFreshSession: run.PolicyRefusalCount > 0 && run.PolicyFreshClaimGeneration.Valid && run.PolicyFreshClaimGeneration.Int64 == run.ClaimGeneration,
+		PolicyHoldResume:       projection.PolicyHoldResume,
+		PolicyHoldFreshSession: projection.PolicyHoldFreshSession,
 		RunID:                  run.ID.String(),
 		Kind:                   run.Kind,
 		IssueIID:               issueIID,
@@ -726,7 +637,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		Status:         run.Status,
 		Pipeline:       pipeline,
 		Branch:         textPtr(branch),
-		SessionID:      sessionID,
+		SessionID:      projection.SessionID,
 		CheckpointTip:  textPtr(run.CheckpointTip),
 		// Issue #3194: read off the claimed run row, never derived from ownership or the tip.
 		CheckpointAttestedSource: textPtr(run.CheckpointAttestedSource),
@@ -744,12 +655,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		MemoryEpisode:            run.MemoryEpisode,
 		MemoryInterventionCount:  run.MemoryInterventionCount,
 		MemoryPolicy:             frozenMemoryPolicy,
-		PlanMd:                   textPtr(run.PlanMd),
-		AutoApprove:              run.AutoApprove,
-		PlanCrossCheckRequired:   run.PlanCrossCheckRequired,
-		CodeCrossCheckRequired:   run.CodeCrossCheckRequired,
-		PlanCrossCheckCodexLead:  planCrossCheckCodexLeadSupported(run),
-		PlanCrossCheckGateReason: textPtr(run.PlanCrossCheckGateReason),
+		PlanMd:                   projection.PlanMd,
+		AutoApprove:              projection.AutoApprove,
+		PlanCrossCheckRequired:   projection.PlanCrossCheckRequired,
+		CodeCrossCheckRequired:   projection.CodeCrossCheckRequired,
+		PlanCrossCheckCodexLead:  projection.PlanCrossCheckCodexLead,
+		PlanCrossCheckGateReason: projection.PlanCrossCheckGateReason,
 		// PRD #400 M2: task-run MR gate + source ref. open_mr is a plain bool (false
 		// for every non-task run); base_branch is pgtype.Text (nil for a run that has
 		// none). Both re-read from the row on every claim, like AutoApprove above.
@@ -776,7 +687,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// PRD #400 M4a: when set, this task run is a diff-review of that target task, and
 		// the worker (M4b) routes on it. nil for a plain handoff and every non-task run.
 		ReviewTargetRunID: uuidPtr(run.ReviewTargetRunID),
-		OpenQuestionID:    textPtr(run.OpenQuestionID),
+		OpenQuestionID:    projection.OpenQuestionID,
 		// PRD #35. Re-read from the row on EVERY claim, like AutoApprove above: a
 		// park-resume-park cycle must keep asking the row rather than remembering what
 		// the first claim said, so a per-run toggle flipped mid-flight takes effect on
@@ -803,41 +714,41 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// GATE by SetRunAwaitingApproval's symmetric auto_approve=false clear — parking a
 		// forceGate ci_fix run for human review clears auto_approve so a restart-requeued
 		// resume re-gates rather than shipping plan_approved=true past no human (runtime.sql).
-		PlanApproved: planApproved,
+		PlanApproved: projection.PlanApproved,
 		// PRD #1247 M5 (D13): the server-derived phase to RESTORE on a resume claim, so a run
 		// re-claimed after a held-state credential switch (or any requeue) resumes its held
 		// state — crucially, an UNAPPROVED submitted plan resumes the GATE — instead of
 		// re-entering the planning turn. Derived from the run row by resumePhaseFor just above,
 		// off the SAME planApproved this literal ships. Empty for a fresh run (omitted). The
 		// submitted plan's seq rides ONLY the awaiting_approval phase (0/omitted otherwise).
-		ResumePhase:   resumePhase,
-		ResumePlanSeq: resumePlanSeq,
+		ResumePhase:   projection.ResumePhase,
+		ResumePlanSeq: projection.ResumePlanSeq,
 		// Issue #1604: when the unapproved persisted plan was last shown (nil/omitted otherwise).
-		ResumePlanAt: resumePlanAt,
+		ResumePlanAt: projection.ResumePlanAt,
 		// PRD #1795 M1: the gate resume's revision, presentation id and presented requirements.
-		ResumeGateRevision:       resumeGateRevision,
-		ResumeGatePresentationID: resumeGatePresentationID,
-		ResumeGatePresented:      resumeGatePresented,
+		ResumeGateRevision:       projection.ResumeGateRevision,
+		ResumeGatePresentationID: projection.ResumeGatePresentationID,
+		ResumeGatePresented:      projection.ResumeGatePresented,
 		// PlanSource travels to the worker so it can tell D4 row 2 (seeded, no session ⇒
 		// implement) from row 3 (dropped session, not seeded ⇒ re-plan). Server writes
 		// it in M1; the worker consumes it in M2. Additive on the wire — an old worker
 		// ignores the key.
-		PlanSource: run.PlanSource,
+		PlanSource: projection.PlanSource,
 		// PRD #209 M4 staleness guard: the commit the seeded plan was written against and
 		// whether a divergence should fail the run. Read from the runs row like PlanSource,
 		// so both re-deliver unchanged on every resume. PlannedBaseCommit is nil for a run
 		// that supplied no commit (the compare is then inert); RequireBaseMatch is a plain
 		// bool (NOT NULL DEFAULT false), false for every non-opted-in run.
-		PlannedBaseCommit: textPtr(run.PlannedBaseCommit),
-		RequireBaseMatch:  run.RequireBaseMatch,
+		PlannedBaseCommit: projection.PlannedBaseCommit,
+		RequireBaseMatch:  projection.RequireBaseMatch,
 		// Ships with PlanApproved, deliberately adjacent: the two halves of one human
 		// verdict, and propagating the approval without the exclusions is what silently
 		// gives a user back a subagent they excluded. See ClaimPayload.AgentSelection.
-		AgentSelection: persistedSelection(run),
+		AgentSelection: projection.AgentSelection,
 		// PRD #122 M1: the frozen milestone list, decoded above. omitempty keeps a
 		// milestone-less run's claim byte-identical to today's.
-		Milestones:          milestones,
-		ExecutionMilestones: executionMilestones,
+		Milestones:          projection.Milestones,
+		ExecutionMilestones: projection.ExecutionMilestones,
 		// PRD #362 Decision 8: the model the inline run-summary generator runs on,
 		// resolved user-value-wins above. nil (omitted) when settings are unwired, so
 		// an old worker's wire shape is unchanged.
@@ -876,10 +787,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// PRD #1497 M1: add budget_finalize_seconds as the THIRD term, so a run that resumed on
 			// its Stop finalize allowance arms the larger wall too. NOT NULL DEFAULT 0, byte-identical
 			// for a run that never used the allowance.
-			RunTimeoutSeconds:      coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds())) + int(run.BudgetExtensionSeconds) + int(run.BudgetFinalizeSeconds),
+			RunTimeoutSeconds:      projection.Config.RunTimeoutSeconds,
 			IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
 			TaskIdleTimeoutSeconds: taskIdleTimeoutSeconds,
-			MaxIterations:          coalesceInt(run.BudgetMaxIterations, s.p.RunMaxIterations),
+			MaxIterations:          projection.Config.MaxIterations,
 			PlanMaxRevisions:       s.p.PlanMaxRevisions,
 			QuestionMax:            s.p.QuestionMax,
 			QuestionTimeoutSeconds: s.p.QuestionTimeoutSeconds,
@@ -912,18 +823,18 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// runs.completion_contract_version. Non-nil ⇒ the worker runs the structural
 			// completion protocol; nil (non-interlocked run) ⇒ omitted, legacy path. This
 			// is WORKER-ONLY claim config, NOT the web RunDTO, so it touches no api-contract fixture.
-			CompletionContractVersion: intPtr(run.CompletionContractVersion),
+			CompletionContractVersion: projection.Config.CompletionContractVersion,
 			// PRD #1226 M4 (D5): the frozen structural contract revision, read straight off
 			// runs.contract_revision. The worker echoes it in its completion permit request; nil
 			// (legacy / non-interlocked / contract not yet frozen) ⇒ omitted, same as above.
-			ContractRevision: intPtr(run.ContractRevision),
+			ContractRevision: projection.Config.ContractRevision,
 			// PRD #1227 M2: the worker-only projection of the run's frozen contract's owner
 			// decisions (deferred milestone ids+titles+reasons, accepted id+text+reason). nil for a
 			// contract with neither a deferred nor an accepted set (legacy / non-interlocked /
 			// revision-1), so omitempty keeps such a claim byte-identical to today's.
-			CompletionScope:   CompletionScopeClaim(run.CompletionContract, run.MilestonesFrozen),
-			CompletionPending: pending,
-			NonClosing:        completionNonClosingClaim(run),
+			CompletionScope:   projection.Config.CompletionScope,
+			CompletionPending: projection.Config.CompletionPending,
+			NonClosing:        projection.Config.NonClosing,
 		},
 	}
 

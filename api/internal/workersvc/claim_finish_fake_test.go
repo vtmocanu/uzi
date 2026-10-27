@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -105,7 +106,33 @@ func (t *fakeClaimFinishTx) FailClaimAssemblyExact(_ context.Context, arg store.
 	return 1, nil
 }
 
+func (t *fakeClaimFinishTx) GetRunClaimContext(ctx context.Context, id uuid.UUID) (store.GetRunClaimContextRow, error) {
+	if t.f.claimFinishCtxErr != nil {
+		return store.GetRunClaimContextRow{}, t.f.claimFinishCtxErr
+	}
+	if t.f.claimFinishCtx != nil {
+		return *t.f.claimFinishCtx, nil
+	}
+	return t.f.GetRunClaimContext(ctx, id)
+}
+
+func (t *fakeClaimFinishTx) LatestPlanSeqForRun(context.Context, uuid.UUID) (int64, error) {
+	return t.f.claimFinishPlanSeq, t.f.claimFinishPlanSeqErr
+}
+
+func (t *fakeClaimFinishTx) LatestPersistedPlanFrameAtForRun(_ context.Context, arg store.LatestPersistedPlanFrameAtForRunParams) (pgtype.Timestamptz, error) {
+	t.f.claimFinishPlanAtParams = append(t.f.claimFinishPlanAtParams, arg)
+	return t.f.claimFinishPlanAt, t.f.claimFinishPlanAtErr
+}
+
+func (t *fakeClaimFinishTx) LatestRunMilestoneReconciliationSession(context.Context, uuid.UUID) ([][]byte, error) {
+	return t.f.claimFinishSessions, t.f.claimFinishSessionErr
+}
+
 func (t *fakeClaimFinishTx) Commit(context.Context) error {
+	if t.f.claimFinishCommitErr != nil {
+		return t.f.claimFinishCommitErr
+	}
 	for _, apply := range t.pending {
 		apply()
 	}
