@@ -1570,6 +1570,9 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 
 // workerStateReportAck encodes projections returned by the committed report.
 func workerStateReportAck(ack map[string]any, result workersvc.StateReportResult) any {
+	if result.PlanApproved != nil {
+		ack["plan_approved"] = *result.PlanApproved
+	}
 	if len(result.PolicyRevisionGate) > 0 {
 		ack["policy_revision_gate"] = result.PolicyRevisionGate
 	}
@@ -1580,6 +1583,7 @@ func workerStateReportAck(ack map[string]any, result workersvc.StateReportResult
 			supersededIDs = &ids
 		}
 		return workerReconciledStateAck{
+			PlanApproved:       result.PlanApproved,
 			PolicyRevisionGate: result.PolicyRevisionGate,
 			RevisionInputID:    result.RevisionInputID, SupersededRevisionInputIDs: supersededIDs,
 			Run: ack["run"], CredentialSwitch: ack["credential_switch"], Disposition: ack["disposition"],

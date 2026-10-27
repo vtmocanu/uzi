@@ -4343,12 +4343,12 @@ func (s *Service) SetStateReport(ctx context.Context, wkr store.Worker, runID uu
 	return run, applied, gateRevision, err
 }
 
-func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation, policyRevisionGateOut *json.RawMessage) (run store.Run, applied bool, err error) {
-	return s.setStateWithTx(ctx, wkr, runID, req, gateRevisionOut, reconciliationOut, policyRevisionGateOut, nil)
+func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation, policyRevisionOut *policyRevisionStateProjection) (run store.Run, applied bool, err error) {
+	return s.setStateWithTx(ctx, wkr, runID, req, gateRevisionOut, reconciliationOut, policyRevisionOut, nil)
 }
 
 // setStateWithTx receives the actual parent transaction only from the claim-locked facade.
-func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation, policyRevisionGateOut *json.RawMessage, parentTx pgx.Tx) (run store.Run, applied bool, err error) {
+func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation, policyRevisionOut *policyRevisionStateProjection, parentTx pgx.Tx) (run store.Run, applied bool, err error) {
 	if err := validateRevisionRetry(req); err != nil {
 		return store.Run{}, false, err
 	}
@@ -5551,7 +5551,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// self-deadlock against the lock). A commit failure fails the report; the deferred Rollback
 	// is a no-op once fenceTx is cleared. Legacy reports also commit their locked audit check;
 	// an arm that did not acquire this transaction skips the commit.
-	var policyRevisionGate json.RawMessage
+	var policyRevision policyRevisionStateProjection
 	if fenceTx != nil {
 		if req.SourcePublication != nil && rows == 1 {
 			if err := bindSourcePublication(ctx, fenceTx, wkr, owned, req, settleScopeDisposition == "applied"); err != nil {
@@ -5567,15 +5567,22 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		// Capture after all state/settlement writes. Parent transactions and
 		// every early return omit this projection; only our successful commit
-		// may expose it through policyRevisionGateOut.
-		if policyRevisionGateOut != nil && parentTx == nil && rows > 0 && gateRefusal == nil &&
+		// may expose it through policyRevisionOut.
+		if policyRevisionOut != nil && parentTx == nil && rows > 0 && gateRefusal == nil &&
 			req.ClaimGeneration != nil && policyEligible(owned) && !owned.TargetRunID.Valid && s.policyRevisionProjectionNegotiated(wkr) {
 			current, readErr := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 			if readErr != nil {
 				return store.Run{}, false, readErr
 			}
-			if current.UserID == wkr.UserID && current.ClaimGeneration == *req.ClaimGeneration && !current.ClaimReleasedAt.Valid {
-				policyRevisionGate, err = policyRevisionGateProjection(ctx, q, current)
+			if current.UserID == wkr.UserID && current.ClaimGeneration == *req.ClaimGeneration && !current.ClaimReleasedAt.Valid &&
+				policyEligible(current) && !current.TargetRunID.Valid {
+				rc, readErr := q.GetRunClaimContext(ctx, current.ID)
+				if readErr != nil {
+					return store.Run{}, false, readErr
+				}
+				approved := policyRevisionPlanApproved(ctx, q, current, current.AutoApprove || rc.HumanPlanApproved || current.PlanSource == planSourceSeeded)
+				policyRevision.PlanApproved = &approved
+				policyRevision.Gate, err = policyRevisionGateProjection(ctx, q, current)
 				if err != nil {
 					return store.Run{}, false, err
 				}
@@ -5589,8 +5596,8 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if reconciliationOut != nil {
 		*reconciliationOut = reconciliation
 	}
-	if policyRevisionGateOut != nil {
-		*policyRevisionGateOut = policyRevisionGate
+	if policyRevisionOut != nil {
+		*policyRevisionOut = policyRevision
 	}
 	// issue #329: record the MR the worker opened INDEPENDENT of the terminal status
 	// the switch above wrote. If SetRunCompleted applied, ReconcileRunMR is a COALESCE

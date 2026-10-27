@@ -40,9 +40,13 @@ func TestPolicyRevisionProjectionStateLiveDB(t *testing.T) {
 				svc, w, req = f.svc, f.wkr, gateReq(i64(1), uid())
 			}
 			enableRevisionProjection(svc, &w)
+			e.exec("UPDATE runs SET policy_refusal_count=1 WHERE id=$1", run)
 			result, err := svc.SetStateReportWithReconciliation(e.ctx, w, run, req)
 			if err != nil || !result.Applied || len(result.PolicyRevisionGate) == 0 {
 				t.Fatalf("applied=%v gate=%s err=%v", result.Applied, result.PolicyRevisionGate, err)
+			}
+			if result.PlanApproved == nil || *result.PlanApproved {
+				t.Fatal("candidate must explicitly remain unapproved")
 			}
 			if (result.Reconciliation != nil) != checker {
 				t.Fatalf("unexpected reconciliation=%v", result.Reconciliation != nil)
@@ -60,7 +64,7 @@ func TestPolicyRevisionProjectionStateNoGateLiveDB(t *testing.T) {
 	e, f, run := revisionGateFixture(t)
 	enableRevisionProjection(f.svc, &f.wkr)
 	result, err := f.svc.SetStateReportWithReconciliation(e.ctx, f.wkr, run, StateRequest{State: "running", ClaimGeneration: i64(1)})
-	if err != nil || !result.Applied || string(result.PolicyRevisionGate) != "null" || result.Reconciliation != nil {
+	if err != nil || !result.Applied || string(result.PolicyRevisionGate) != "null" || result.Reconciliation != nil || result.PlanApproved == nil || *result.PlanApproved {
 		t.Fatalf("no-gate ACK applied=%v gate=%s error=%v", result.Applied, result.PolicyRevisionGate, err)
 	}
 }
@@ -77,7 +81,7 @@ func TestPolicyRevisionProjectionStateOmissionLiveDB(t *testing.T) {
 			case "noop":
 				f.svc.SetTxBeginner(&revisionGateBeginner{TxBeginner: e.pool, point: "update_zero"})
 			case "unknown":
-				e.exec("UPDATE runs SET policy_revision_source=NULL WHERE id=$1", run)
+				e.exec("UPDATE runs SET policy_refusal_count=1,policy_revision_source=NULL WHERE id=$1", run)
 			case "early_replay":
 				f.mustPublish(run, req, 1)
 				active := seedRevisionTarget(t, f, run, 1)
@@ -88,6 +92,13 @@ func TestPolicyRevisionProjectionStateOmissionLiveDB(t *testing.T) {
 			result, err := f.svc.SetStateReportWithReconciliation(e.ctx, f.wkr, run, req)
 			if (err != nil) != (mode == "commit") || len(result.PolicyRevisionGate) != 0 {
 				t.Fatalf("mode=%s gate=%s applied=%v err=%v", mode, result.PolicyRevisionGate, result.Applied, err)
+			}
+			if mode == "unknown" {
+				if result.PlanApproved == nil || *result.PlanApproved {
+					t.Fatal("unknown source must explicitly refuse approval")
+				}
+			} else if result.PlanApproved != nil {
+				t.Fatal("uncommitted/no-op/replay approval must be absent")
 			}
 			if mode == "commit" && (result.Applied || mustRun(t, e, run).GateRevision != 0) {
 				t.Fatal("failed commit leaked state")
@@ -165,12 +176,12 @@ func TestPolicyRevisionProjectionParentEarlyReturnLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(e.ctx) }()
-	var projection json.RawMessage
+	var projection policyRevisionStateProjection
 	_, _, err = locked.setStateWithTx(e.ctx, f.wkr, run, StateRequest{State: "pause_failed", ClaimGeneration: i64(1)}, nil, nil, &projection, tx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if projection != nil {
-		t.Fatalf("parent transaction leaked %s", projection)
+	if projection.Gate != nil || projection.PlanApproved != nil {
+		t.Fatalf("parent transaction leaked %+v", projection)
 	}
 }

@@ -16,6 +16,13 @@ func (s *Service) policyRevisionProjectionNegotiated(w store.Worker) bool {
 		slices.Contains(w.ProtocolCapabilities, capability.CredentialSwitchV1)
 }
 
+// policyRevisionStateProjection is captured under one owned lock and published
+// only after the state transaction commits. A false approval remains present.
+type policyRevisionStateProjection struct {
+	Gate         json.RawMessage
+	PlanApproved *bool
+}
+
 // policyRevisionGateProjection requires the caller's locked row and transaction
 // reader. Nil means unknown; JSON null means verified coverage without a gate.
 // Neither value authorizes execution or approves a plan.

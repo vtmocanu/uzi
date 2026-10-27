@@ -355,6 +355,7 @@ func reconciliationResponse(seq int32, proof *workersvc.LeadReconciliation) lead
 }
 
 type workerReconciledStateAck struct {
+	PlanApproved               *bool           `json:"plan_approved,omitempty"`
 	PolicyRevisionGate         json.RawMessage `json:"policy_revision_gate,omitempty"`
 	RevisionInputID            *int64          `json:"revision_input_id,omitempty"`
 	SupersededRevisionInputIDs *[]int64        `json:"superseded_revision_input_ids,omitempty"`
