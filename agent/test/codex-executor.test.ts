@@ -18191,8 +18191,9 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } finally { rig.transport.end(); t.mock.timers.reset(); }
   });
 
-  for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 ${interruption} during pre-recovery persistence`, async t => {
+  for (const productive of [false, true]) for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 ${interruption} during pre-recovery persistence productive=${productive}`, async t => {
     const rig = makeRig();
+    if (productive) rig.transport.push(agentMessage("partial model output"));
     let entered = false;
     let release!: () => void;
     const barrier = new Promise<void>(resolve => { release = resolve; });
@@ -18204,7 +18205,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     let mode: "now" | null = null;
     let interrupt: (() => void) | undefined;
     let cancelled = false, pauses = 0, walls = 0;
-    const { ctx } = makeCtx({
+    const { ctx, emitted } = makeCtx({ codexIdleStallRecovery: productive,
       onPauseNow: cb => { interrupt = cb; }, pauseModeRequested: () => mode,
       cancelRequested: () => cancelled,
       parkForPause: async () => { pauses++; return true; },
@@ -18215,13 +18216,18 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     void running.catch(() => undefined);
     try {
       await until(() => rig.transport.turnStartCount === 1);
+      if (productive) await until(() => emitted.some(m => m.kind === "text"));
       await tick(); t.mock.timers.tick(100);
       await until(() => entered);
       if (interruption === "pause") { mode = "now"; interrupt?.(); }
       if (interruption === "wall") t.mock.timers.tick(1000);
       if (interruption === "cancel") cancelled = true;
       release();
-      if (interruption === "none") await assert.rejects(running, isRecovery);
+      if (interruption === "none") await assert.rejects(running, productive ? (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError && error.idleStallKind === "productive");
+        assert.equal(error.providerOrigin, false);
+        return true;
+      } : isRecovery);
       else if (interruption === "cancel") await assert.rejects(running, /cancel/);
       else {
         const result = await running;
@@ -18233,17 +18239,17 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } finally { release(); rig.transport.end(); t.mock.timers.reset(); }
   });
 
-  for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 declined completion hold rechecks ${interruption}`, async t => {
+  for (const productive of [false, true]) for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 declined completion hold rechecks ${interruption} productive=${productive}`, async t => {
     const rig = makeMultiEpochRig([
       epochResponder("th-1", "tn-1", transport => transport.push(signalDone()).push(turnCompleted("completed"))),
-      epochResponder("th-2", "tn-2", () => {}),
+      epochResponder("th-2", "tn-2", transport => { if (productive) transport.push(agentMessage("partial model output", "th-2")); }),
     ]);
     rig.deps = { ...rig.deps, idleMs: 100, wallMs: 1000 };
     let entered = false, release!: () => void;
     const barrier = new Promise<void>(resolve => { release = resolve; });
     let mode: "now" | null = null, interrupt: (() => void) | undefined;
     let cancelled = false, holds = 0, pauses = 0, walls = 0;
-    const { ctx } = makeCtx({ kind: "issue", completionInterlock: true, config: { max_iterations: 3 },
+    const { ctx, emitted } = makeCtx({ codexIdleStallRecovery: productive, kind: "issue", completionInterlock: true, config: { max_iterations: 3 },
       recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
       enterCompletionHold: async reason => {
         holds++;
@@ -18266,13 +18272,18 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     void running.catch(() => undefined);
     try {
       await until(() => rig.epochs[1]!.transport.turnStartCount === 1);
+      if (productive) await until(() => emitted.some(m => m.kind === "text"));
       await tick(); t.mock.timers.tick(100);
       await until(() => entered);
       if (interruption === "pause") { mode = "now"; interrupt?.(); }
       if (interruption === "wall") t.mock.timers.tick(1000);
       if (interruption === "cancel") cancelled = true;
       release();
-      if (interruption === "none") await assert.rejects(running, isRecovery);
+      if (interruption === "none") await assert.rejects(running, productive ? (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError && error.idleStallKind === "productive");
+        assert.equal(error.providerOrigin, false);
+        return true;
+      } : isRecovery);
       else if (interruption === "cancel") await assert.rejects(running, /cancel/);
       else {
         const result = await running;
@@ -18286,11 +18297,13 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } finally { release(); for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
   });
 
-  it("3462 a vault latch after the first idle trip retains the idle outcome", async t => {
+  for (const productive of [false, true]) it(`3462 a vault latch after the first idle trip retains the idle outcome productive=${productive}`, async t => {
     const rig = makeRig({ responder: c => {
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
       if (c.method === "turn/start") {
-        c.transport.push(threadStarted()).push({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
+        c.transport.push(threadStarted());
+        if (productive) c.transport.push(agentMessage("partial model output"));
+        c.transport.push({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
           params: { reason: "unauthorized", previousAccountId: null } });
         return { turn: { id: "tn-1" } };
       }
@@ -18304,7 +18317,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     };
     rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
     t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
-    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({ codexIdleStallRecovery: productive }).ctx);
     void running.catch(() => undefined);
     try {
       await until(() => refreshing);
@@ -19674,6 +19687,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
         const resumeRun = resumeExecutor.run.bind(resumeExecutor);
         resumeExecutor.run = async ctx => {
           assert.equal(ctx.sessionId, parkedId);
+          assert.equal(ctx.claimGeneration, 4, "the next claim advances its generation");
           const head = commitInTree(ctx.worktreePath, "RESUMED.txt", "recovered work\n");
           assert.equal((await fs.readFile(path.join(ctx.worktreePath, ".git", "refs", "heads", ctx.branch), "utf8")).trim(), head,
             "the resumed work is committed on the runner branch before supervised capture");
@@ -19686,7 +19700,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
         git.discoverRetainedRecovery = async () => undefined;
         git.recoveryAttemptMode = async () => false;
         git.createOrAttachRunnerClone = async () => parkedClone!;
-        const resumeGeneration = 3;
+        const resumeGeneration = 4;
         if (typed) {
           api.registerNonce = "m2-idle-registration";
           api.setRegisterProtocolFeatures(client.protocolFeatures);
@@ -19695,9 +19709,9 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
           const observation = m3Calls();
           api.interruptedCallsResponse = { status: 200, body: { ...observation,
             run_id: claim.run_id, worker_id: identity.workerId, register_nonce: identity.nonce,
-            claim_generation: resumeGeneration, source_generation: mode === "initial" ? 2 : null,
+            claim_generation: resumeGeneration, source_generation: mode === "initial" ? 3 : null,
             inspected_count: mode === "initial" ? 1 : 0,
-            entries: mode === "initial" ? observation.entries : [],
+            entries: mode === "initial" ? observation.entries.map(entry => ({ ...entry, source_generation: 3 })) : [],
           } };
         }
         api.setOwnershipStatus(claim.run_id, "running", resumeGeneration);
@@ -19718,6 +19732,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
           assert.match(prompt, /printf interrupted-observation/);
         } else if (typed) assert.doesNotMatch(prompt, /interrupted_calls_/);
         assert.equal(api.states.at(-1)?.body.status, "completed", diagnostics.lines.join("\n"));
+        assert.equal(api.states.at(-1)?.body.claim_generation, 4);
         assert.equal(api.states.filter(s => s.body.status === "recovery_wait").length, 1);
       }
     } finally { if (typed) t.mock.timers.reset(); await api.close(); fx.cleanup(); }
