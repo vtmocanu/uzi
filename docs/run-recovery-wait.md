@@ -348,7 +348,7 @@ cancelled and re-created.
 
 ## Vault locked
 
-A `recovery_wait` park can also come from your own vault: a Codex
+A `recovery_wait` park can also come from your own protected vault: a Codex
 subscription or api\_key credential refresh or release reached a locked
 owner vault. The api only answers this after the request was authorized and
 authority still held on a recheck, so it is a typed refusal, not a generic
@@ -381,8 +381,15 @@ start** until an unlocked claim succeeds. After that, it resumes where it
 left off — the resume costs at least one model turn before finalize opens
 the merge request.
 
-A vault lock while sealing a refreshed login also keeps the login protected
-for recovery. Updated workers survive a lost refresh reply: they reconcile
+Off users have no vault-unlock dependency. A successful explicit enable or
+disable also best-effort promotes existing vault parks after commit; see
+[Vault choice](./anthropic-token.md#vault-choice).
+
+A protected vault lock while sealing a refreshed login retains the successful
+provider result in the recovery slot under owner/kind-bound server-key
+sealing (`master_aad`). Current mode/epoch fences preserve that same result
+across conversion races and background persistence retries without another
+provider exchange. Updated workers survive a lost refresh reply: they reconcile
 the same operation once, then retain the work, session and custody if the
 outcome remains unknown. A confirmed vault-lock reply uses the vault park;
 an unknown outcome uses an ordinary recovery wait without claiming that the

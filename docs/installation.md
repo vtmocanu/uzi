@@ -35,7 +35,7 @@ This generates the three required secrets and writes them to `.env` (starting fr
 
 All three are refused at boot / by compose if left empty. The script is
 **generate-once**: it writes `.env` only if it is absent and never regenerates,
-because `UZI_SECRET_KEY` (rotating it makes stored tokens undecryptable) and
+because `UZI_SECRET_KEY` (rotating it makes server-key-sealed tokens undecryptable) and
 `POSTGRES_PASSWORD` (only used to init the `pgdata` volume on first run) must stay
 stable. The rest have sane defaults for local use; see
 [configuration.md](configuration.md) for the full list.

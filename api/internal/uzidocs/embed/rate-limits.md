@@ -116,10 +116,11 @@ interval. That reading carries a **Recorded at usage limit** badge and says
 so next to the timestamp, because the timestamp itself still shows the last
 poll, not this park.
 
-If your vault is locked, uzi can't open your tokens to poll them: your
+If your protected vault is locked, uzi can't open your tokens to poll them: your
 last known reading stays on screen but greys out and is marked **stale**
 (or explicitly **vault locked** on the admin page) until you unlock again.
-Nothing is lost, and nothing renders as a false zero.
+Nothing is lost, and nothing renders as a false zero. Off accounts do not need
+an unlock for polling; see [Vault choice](./anthropic-token.md#vault-choice).
 
 ## Choosing a token near its limit
 
@@ -230,7 +231,7 @@ re-derived by the client:
 | `no_reading` | A poll was attempted and failed, with nothing successful yet. |
 | `fresh` | A successful reading no older than 3× the poll interval. |
 | `stale` | A reading exists but has aged past that window — shown greyed rather than dropped. |
-| `vault_locked` | Your vault is locked, so uzi can't open the login to poll it; the last known reading stays visible, marked stale. |
+| `vault_locked` | Your protected vault is locked, so uzi can't open the login to poll it; the last known reading stays visible, marked stale. |
 | `credential_action_required` | The login needs re-authentication (re-import it) before polling can resume. |
 | `polling_disabled` | The operator has turned the Codex poller off entirely (`UZI_CODEX_USAGE_POLL_INTERVAL=0`); any retained reading shows as stale, since nothing will ever refresh it again. |
 

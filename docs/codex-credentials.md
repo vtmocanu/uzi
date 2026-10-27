@@ -16,6 +16,13 @@ and its worker model. You still need an [Anthropic
 token](./anthropic-token.md) for a Claude run; the two harnesses' credentials
 are independent, so having one doesn't unlock the other.
 
+## Credential protection
+
+OpenAI API keys and Codex logins share your Anthropic credentials' protection
+choice in **Settings → Protect my credentials with my password (vault)**.
+See [Vault choice](./anthropic-token.md#vault-choice) for On/Off, SSO passphrases,
+restart unlocks and conversion limits. Off accounts do not need vault unlocks.
+
 ## What the field accepts
 
 The **Codex login** field wants a flat JSON object, not a raw token:
@@ -206,7 +213,7 @@ A linked account's meter can land in a state that needs your attention:
   Codex usage polling is turned off, the state reads **Polling off**
   instead (`polling_disabled (login rejected by provider)` in the CLI), and
   the rejection hint still shows.
-- **Vault locked** — uzi can't open the login to poll it until you unlock
+- **Vault locked** — your protected vault is locked, so uzi can't open the login to poll it until you unlock
   your vault again. The last known reading stays on screen, greyed and
   marked stale, rather than disappearing.
 

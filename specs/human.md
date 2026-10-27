@@ -329,11 +329,11 @@ Tracked as GitLab issue vtmocanu/uzi#25; PRD at `prds/done/25-slack-integration.
 Tracked as GitLab issue vtmocanu/uzi#32; PRD at `prds/done/32-user-vault-password-wrapped-secrets.md`.
 
 - Threat: a k8s operator can read env/Infisical/etcd (master key) plus the DB and decrypt every user's Anthropic token. etcd encryption at rest is not an option. [user-stated threat model]
-- Goal is to make token theft materially harder, not impossible — no decryption key at rest anywhere an operator can read. [user accepts residual risks: memory dump, trojaned image]
-- Each user's secrets are encrypted with a key derived from their own login password (vault); the server stores only the wrapped key.
-- Vault unlocks automatically at login and the key is kept in server memory until pod restart or an explicit "Lock vault" action — no per-session re-entry, so overnight/autopilot runs keep working while unlocked. [user choice over session-TTL caching]
-- UI shows an unlocked/locked vault status; when locked (e.g. after a deploy), runs queue as "waiting for vault unlock" and a password prompt unlocks without full re-login.
-- Forgotten password ⇒ vault contents unrecoverable by design; user re-enters tokens.
+- Protected mode makes token theft materially harder by keeping the plaintext per-user key out of persistent storage; password cracking, master-sealed backups/recovery copies, memory dumps and a trojaned running server remain residual risks. [user accepts residual risks: memory dump, trojaned image] (AI-synced 2026-10-26)
+- Personal credentials support protected (per-user DEK wrapped with a login-password-derived key) and unprotected/Off (server-key-sealed) modes, chosen in Settings → “Protect my credentials with my password (vault)”. Fresh databases start Optional before seed-admin creation; databases with any users start Required and retain existing users as protected without ciphertext migration. New users take the current policy's mode; policy changes do not convert existing credentials, and existing Off users remain runnable with an enrollment prompt under Required. See `adr/3507-optional-credential-vault.md`. (AI-synced 2026-10-26)
+- A protected password vault unlocks at login and its key stays in server memory until pod restart or explicit "Lock vault" — no per-session re-entry, so overnight/autopilot runs keep working while unlocked. Off users have no wrapper or unlock dependency; login, seed startup and ordinary unlock do not implicitly enroll them. [user choice over session-TTL caching] (AI-synced 2026-10-26)
+- UI distinguishes Off from protected unlocked/locked; protected locked runs wait for vault unlock after a restart. On requires verified login password or a create-only OIDC passphrase (12–1024 UTF-8 bytes); Off requires an unlocked protected vault and Optional policy. Mode changes atomically convert secrets and both Codex account slots under bounded row/byte/deadline limits. CLI provider tables show VAULT off and the TUI omits Off lock indicators; toggle/unlock remain web-only. (AI-synced 2026-10-26)
+- Forgotten protected password/passphrase ⇒ vault contents unrecoverable by design; user re-enters tokens. Enabling protection does not erase master-sealed backups; rotate previously exposed credentials. (AI-synced 2026-10-26)
 
 ## Feature #37 — Per-run agent selection: repo `.claude/agents` detection with plan-gate choice
 
@@ -464,7 +464,7 @@ Tracked as GitLab issue vtmocanu/uzi#45; PRD at `prds/done/45-oidc-sso-login.md`
 - Coexists with email+password login; a `UZI_PASSWORD_LOGIN_ENABLED` kill-switch lets operators go SSO-only. [user 2026-07-12]
 - JIT provisioning: first SSO login auto-creates the user; an existing account is linked by verified email. [user 2026-07-12]
 - Admin stays uzi-managed (existing first-user-is-admin rule); no groups/roles-claim mapping this iteration. [user 2026-07-12]
-- OIDC-created users have no password, so they set a dedicated vault passphrase for the PRD #32 vault. [user 2026-07-12]
+- OIDC-created users have no password; when protected or enabling protection, they create a dedicated vault passphrase (12–1024 UTF-8 bytes). Off users need no passphrase. Linked password + OIDC users retain their mode and password-based vault semantics; an unlocked key remains cached until explicit lock or server restart. [user 2026-07-12] (AI-synced 2026-10-26)
 - Operator docs include step-by-step walkthroughs for BOTH Keycloak and Pocket ID. [user 2026-07-12]
 - Supersedes the earlier "SSO with Keycloak" deferral in the Deferred list. [user 2026-07-12]
 

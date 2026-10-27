@@ -990,7 +990,9 @@ A few worth knowing:
   (`EMAIL`/`VAULT`/`TOKEN`/`STATUS`/`5H%`/`7D%`); `codex` is the per-user
   Codex view grouped by user, one row per `(account, bucket)`
   (`EMAIL`/`VAULT`/`ACCOUNT`/`STATUS`/`BUCKET`/`PRIMARY`/`SECONDARY`/`RESET`),
-  with a no-reading window shown as `—`. `--json` returns the raw
+  with a no-reading window shown as `—`. Both providers show `VAULT` as `off`
+  for unprotected users, otherwise `locked` or `unlocked`; a missing mode from an
+  older server retains the existing lock-state display. `--json` returns the raw
   `[]CodexAdminRateLimitRowDTO` for codex, unchanged for claude.
 - **`admin cli-tokens` is the factory-wide standing-credential inventory** —
   every CLI token, whoever owns it, with `OWNER`, `PREFIX`, `NAME`, `SCOPE`,
@@ -1806,7 +1808,7 @@ A newer release is available.
   rows and their per-run COST cells, along with status, health, milestones,
   age and the judge verdict. The header's `7d` cost fetches separately on
   the 60-second side-fetch, manual refresh and board toggle. **A locked
-  vault gets its own line** beside
+  protected vault gets its own line** beside
   the per-token rate-limit strip under the wordmark — the strip is never
   hidden — matching the web SPA's "waiting for vault unlock": a quiet, faint
   `🔒 vault locked` hint (`[locked] vault locked` under NO_COLOR or a
@@ -1816,7 +1818,10 @@ A newer release is available.
   resume`. On the admin/factory board the count is scoped to your own
   runs only — it never counts or names another user's locked vault. Either
   form is steady, never blinking, and clears on its own within about a
-  minute of the vault unlocking; there's no dismiss. Unlocking itself is done
+  minute of the vault unlocking; there's no dismiss. Off users have no lock
+  indicator. If an older server omits mode or unlocked metadata, the existing
+  fallback behavior is preserved. Protection toggles and unlock remain web-only;
+  see [Vault choice](./anthropic-token.md#vault-choice). Unlocking itself is done
   off-TUI, in the web app.
 - **Run detail** (`[enter]` from the board, or `uzi tui <run-id>` directly).
   A left rail of agent lanes — the lead plus each live subagent, one lane per

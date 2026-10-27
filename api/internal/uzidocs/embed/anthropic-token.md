@@ -489,13 +489,55 @@ Click **Delete** on the token's row. Two rules:
   with a hint explaining why. Deleting your *last* token is allowed, and returns you
   to the disconnected state: no token, no runs.
 
+## Vault choice
+
+In **Settings → Protect my credentials with my password (vault)**, choose
+whether personal credentials use password protection. The same choice covers
+[OpenAI keys and Codex logins](./codex-credentials.md).
+
+- **On (protected)** uses a per-user key wrapped with your login password.
+  It makes theft of the database together with the server key insufficient
+  to open those credentials, subject to password strength and retained
+  master-sealed copies. A compromised running server can still read them
+  while unlocked. Password login unlocks the vault; its key stays in server
+  memory until **Lock vault** or a server restart. After a restart, unlock
+  before new runs can start. Forgotten passwords leave protected contents
+  unrecoverable; you must re-enter credentials.
+- **Off (unprotected)** still encrypts credentials at rest, using the server
+  key like forge bot tokens. Theft of both the database and server key exposes
+  them. There is no vault wrapper, unlock step or lock notice; runs and usage
+  polling continue after restarts without unlocking.
+
+To turn On, verify your login password. If you use SSO without a password,
+create and confirm a dedicated vault passphrase of **12–1024 UTF-8 bytes**;
+this is create-only, with no passphrase change or recovery flow. Linking SSO
+to a password account retains its mode and password-based vault semantics.
+To turn Off, first unlock your protected vault; your administrator must allow
+optional protection. Login, seed startup and ordinary unlock do not turn
+protection On for an Off account.
+
+New users start Off on an optional-policy instance and protected on a
+required-policy instance. If your administrator later requires protection,
+an existing Off account stays runnable and keeps prompting you to enroll
+until you enable it. Changing policy does not convert your credentials.
+
+Enabling or disabling converts saved personal credentials together, including
+both live and recovery Codex logins. A resource-limit refusal reports measured
+totals and limits and leaves your mode and credentials unchanged: remove
+credentials through their existing management UI before retrying. Removing a
+saved Codex alias need not remove its underlying account, so it need not free
+conversion capacity. If the outcome is **uncertain**, refresh vault status
+before retrying and unlock if protection is enabled; the change may have
+committed. Credentials previously stored Off may remain in backups after
+enabling: rotate them to address that exposure.
+
 ## Good to know
 
 - **Encrypted, never returned.** uzi seals each token at rest and never
   echoes it back in any response or log; see
   [ARCHITECTURE.md](../ARCHITECTURE.md#secrets-per-user-credentials-at-rest)
-  for the mechanism and [the vault threat model](./vault-threat-model.md) for
-  what that does and does not protect against.
+  for the mechanism and [Vault choice](#vault-choice) for what your protection
+  setting means. Admins can read [the vault threat model](./vault-threat-model.md).
 - **Save does not wait for a verdict.** Saving or replacing a token requests
   a best-effort background usage poll, so a meter or rejection may appear soon
   afterwards; the save succeeds without waiting for that poll. Use **Test** on

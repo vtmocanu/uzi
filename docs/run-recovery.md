@@ -845,7 +845,7 @@ through existing in-budget requeue or owner Resume/hold policy, conditional on b
 and hold state; automatic recovery or Resume is not guaranteed. Retained-source recovery
 uses a fresh attempt path and model session (`thread/start`), not the old model thread.
 Newer cancellation, pause and vault-lock state are
-checked before credentials or another model turn; a locked vault can defer recreation
+checked before credentials or another model turn; a locked protected vault can defer recreation
 into credential recovery. This does not make an open approval gate parkable.
 Slice B now covers Codex wall/hold/ordinary recovery through source-dependent
 settlement; see [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).

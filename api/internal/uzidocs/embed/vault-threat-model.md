@@ -7,20 +7,27 @@ audience: operator
 # Vault threat model (per-user password-wrapped secrets)
 
 The per-user vault (PRD #32) exists to make one class of attack materially
-harder: a **passive operator read** of a user's personal Anthropic token. Before
+harder for **protected** users: a **passive operator read** of personal
+Anthropic, OpenAI and Codex credentials. Before
 the vault, every user's token was sealed under one master key
 (`UZI_SECRET_KEY`) that lives in the API's environment — so anyone who could read
 both the env (`kubectl describe`/exec, the Secret, Infisical, etcd) and the DB
-had every token in plaintext. The vault removes the token's decryption key from
-everywhere at rest.
+could decrypt those tokens. Protected mode removes the personal credential's
+DEK from persistent storage in plaintext. **Unprotected (Off)** mode deliberately
+uses server-key sealing instead: DB plus server-key theft exposes those values,
+as with forge bot tokens. A compromised running server can read credentials
+while a protected vault is unlocked.
 
 Design rationale lives in the PRD
 ([../prds/done/32-user-vault-password-wrapped-secrets.md](../prds/done/32-user-vault-password-wrapped-secrets.md));
 this page is the as-built residual-risk list and the operator hardening steps.
+[ADR-3507](../adr/3507-optional-credential-vault.md) records optional protection,
+conversion and compatibility boundaries; users should start at
+[Vault choice](./anthropic-token.md#vault-choice).
 
 ## What the vault protects — and what it does not
 
-- **Protected**: each user's `user_secrets` rows — three kinds today
+- **Protected mode**: the user's `user_secrets` rows — three kinds today
   (`anthropic_token`, `openai_api_key`, `codex_auth`; the latter two share one
   default slot per user, separate from the Anthropic token's own default) —
   plus the per-account Codex login material in `codex_provider_account`. They
@@ -30,10 +37,10 @@ this page is the as-built residual-risk list and the operator hardening steps.
   discarded; the plaintext DEK lives only in the API process's memory while
   the vault is unlocked, and is gone on lock or restart. Neither the KEK nor
   the plaintext DEK is ever written anywhere. **One narrow exception**: a
-  Codex account's *recovery* slot (a previously-good login retained so a
-  failed refresh can roll back) is sealed under the legacy `UZI_SECRET_KEY`
-  master box instead, but only when the owner's vault is locked at the exact
-  moment a refresh needs to protect newly-rotated material — never the live,
+  Codex account's *recovery* slot (a successful provider result retained while
+  its live commit cannot finish) is sealed under `UZI_SECRET_KEY` with the
+  owner/kind-bound `master_aad` marker instead, but only when the owner's vault
+  is locked at the exact moment a refresh needs to protect newly-rotated material — never the live,
   in-use login. A later reconcile pass re-seals that recovery copy under the
   user's DEK once the vault unlocks. This same protected login is what the
   Codex account-meter poller (PRD #1209 — see
@@ -44,23 +51,27 @@ this page is the as-built residual-risk list and the operator hardening steps.
   (`forge_connections.token_ciphertext`). The poller syncs issues 24/7 with no
   user present, so its credential cannot be password-wrapped. It stays sealed
   under `UZI_SECRET_KEY`, which therefore remains — for connection-level secrets
-  only. An operator can still recover the bot PAT; its blast radius is bounded by
+  and unprotected personal credentials. An operator can still recover the bot
+  PAT; its blast radius is bounded by
   PRD #5's least-privilege checks (a Developer-role bot on protected repos).
 
 ## OIDC-only users: the vault passphrase (PRD #45)
 
 An OIDC-only user (JIT-provisioned or linked via SSO with no password ever
-set) has no login password for the KEK above to derive from. Such a user
-instead sets a dedicated **vault passphrase** through a create-only endpoint,
+set) has no login password for the KEK above to derive from. When protected
+or explicitly enabling protection, this user sets a dedicated **vault
+passphrase** through a create-only endpoint,
 running the exact same Argon2id derivation path (`api/internal/vault/vault.go`)
-and enforcing the same 12-character floor as a login password — the KEK's
+and enforcing 12–1024 UTF-8 bytes — the KEK's
 real strength (residual risk 1, below) is unchanged by which secret feeds it.
 The DEK hierarchy underneath is identical; the vault has no notion of whether
 the string it was handed at creation was a password or a passphrase. Changing
 or recovering a lost passphrase is deferred (deleting and re-creating the
 vault would lose already-sealed secrets) — a documented limitation, not an
 oversight. See [auth-design.md](auth-design.md#oidc-single-sign-on) for how
-this fits into the OIDC login flow.
+this fits into the OIDC login flow. Off users need no passphrase or wrapper.
+Linking SSO to an existing password account retains its mode and password
+semantics.
 
 ## Residual risks (accepted)
 
@@ -76,16 +87,16 @@ this fits into the OIDC login flow.
    automatically. Consider also raising the password floor.
 2. **The seed admin is exempt.** `UZI_SEED_PASSWORD` and
    `UZI_SEED_ANTHROPIC_TOKEN` are environment variables: an operator reads the
-   token directly or derives the KEK from the seeded password. The seed admin's
-   vault is also **boot-unlocked** on every start (so a headless deployment runs
-   overnight autopilot from first boot), which means its DEK is in memory
-   unconditionally. See the hardening steps below.
-3. **A token that ever existed master-sealed may already be leaked.** Lazy rewrap
-   (on the owner's first unlock) improves the at-rest posture going forward, but an
-   operator could have snapshotted the DB before the rewrap. Rewrap is **not
-   retroactive** — the only real fix for a previously master-sealed token is to
-   **rotate it**. The UI says so (Settings → token notice) and the admin migration
-   count surfaces how many rows are still legacy-sealed.
+   token directly or derives the KEK from the seeded password. A **protected**
+   seed admin is **boot-unlocked** when the seed password remains configured,
+   keeping its DEK in memory. An Off seed admin skips boot unlock and is not
+   implicitly enrolled. See the hardening steps below.
+3. **A credential that ever existed master-sealed may remain exposed in backups.**
+   This includes values stored Off, legacy material and the protected Codex
+   recovery exception. Enabling protection or lazy rewrap improves current
+   storage but cannot erase earlier DB snapshots readable with the server key.
+   **Rotate credentials** to address that exposure; enabling displays rotation
+   advice. The admin migration count reports remaining master-sealed secrets.
 4. **A live-pod memory dump captures cached DEKs and in-flight plaintext.** With
    until-restart caching and overnight autopilot, DEK-in-RAM is the *common* state.
    `kubectl debug` + `SYS_PTRACE` on `/proc/1/mem` wins. This is an active, noisy,
@@ -100,13 +111,17 @@ this fits into the OIDC login flow.
 6. **The worker holds the plaintext token for a run's duration** (delivered in the
    claim payload). Unchanged by this PRD; short-lived per-run tokens are a future
    PRD.
-7. **The DEK cache is per-process.** uzi runs single-replica today (compose). If a
-   multi-replica API is ever deployed, **pin the API to `replicas: 1`** or accept
-   that each pod must be unlocked independently. Do **not** replicate DEKs across
-   pods.
+7. **The DEK cache is per-process.** A singleton API with coordinated
+   **Recreate** replacement is a required compatibility boundary. Mixed-version
+   API operation is unsupported; independently unlocking replicas is not a
+   supported alternative. Do not replicate DEKs across pods. The chart already
+   enforces this deployment shape; see [ADR-3507](../adr/3507-optional-credential-vault.md).
 8. **The AAD no longer pins a ciphertext to a *row*, only to `(user, kind)`
    (PRD #104).** Each sealed secret is bound to `user_id || 0x00 || kind` as
-   additional authenticated data, so a DB-write operator who moves a ciphertext
+   additional authenticated data (the raw 16-byte UUID, one zero byte, then
+   the kind bytes), for both DEK and new `master_aad` personal material. Legacy
+   `master` remains readable with nil AAD; unknown markers fail closed. Thus a
+   DB-write operator who moves a ciphertext
    between users or between kinds gets a GCM authentication failure rather than a
    working key. That guarantee is intact. What changed is that a user may now hold
    several `anthropic_token` rows, and all of them share one AAD — so swapping two
@@ -178,21 +193,53 @@ For the seed admin, after first boot:
 
 ## Rollout note
 
-The deploy that ships the vault has a **one-time rollout stall**: every existing
-user's runs stop claiming until they next log in. Their tokens are still
-master-sealed and the claim gate requires an unlocked vault, so nothing runs for a
-user until their first post-deploy login (which unlocks the vault and lazily
-rewraps their token). Communicate this before deploying. The seed admin is
-unaffected (boot-unlocked). Migration progress is visible to admins under
-Admin → Instance as a count of still-master-sealed secrets.
+The original PRD #32 rollout required existing users to unlock before work
+could claim. Optional protection preserves that behavior for protected users;
+Off users need no unlock after restart and receive no vault-lock notice.
+
+Migration 00358 sets existing users to protected, including wrapperless users,
+without migrating ciphertext. If any users exist, it seeds Required policy;
+an empty database gets Optional before seed-admin creation. New enrollment
+chooses an explicit mode under current policy; login, seed boot unlock and
+ordinary unlock do not enroll Off users. Admin policy changes neither convert
+nor re-seal existing material. Required leaves existing Off users runnable with
+a persistent enrollment prompt.
+
+Enabling/disabling atomically converts personal secrets and both live/recovery
+Codex account slots. Limits are **10,000 material rows, 64 MiB ciphertext per
+user**, with **64-row/1 MiB batches** and a **two-minute lifecycle deadline**.
+Recovery slots count separately; an account's live/recovery pair must fit
+1 MiB together. Disabled secrets and unused/orphan accounts count. Resource-limit
+refusal reports measured totals and limits and leaves material and mode
+unchanged. Use existing credential-management removal controls before retrying;
+removing aliases need not free canonical accounts. Orphan-account remediation,
+including a dedicated deletion API, index or UI, remains deferred; there is no
+orphan cleanup workflow to follow.
+
+A confirmed abort rolls back the conversion. A lost commit acknowledgment is
+**uncertain**, not proof that the database is unchanged: the unpublished key
+is discarded, reconciliation uses a fresh connection and applicable locks,
+and the user must refresh status and unlock if protected. Do not compensate
+by deleting a wrapper.
+
+Keep the API singleton and replace it with Recreate; do not run mixed API
+versions. Additive columns use constant defaults to avoid user/ciphertext
+rewrites, but ALTER TABLE locks and immediate CHECK validation scans have
+production-dependent duration. Plan maintenance and backups; no production
+size or migration-duration claim has been established. Down migration refuses
+any unprotected user or `master_aad` in secrets or either account slot. Use
+the **new binary** to convert safely before down; simply starting an older
+binary is unsafe because it rejects `master_aad`. See
+[ADR-3507](../adr/3507-optional-credential-vault.md) for the protocol and measured
+fixture evidence.
 
 ## Vault-lock Slack notice (PRD #890)
 
-Every restart is also an every-vault-lock event (the DEK cache is dropped, see
-residual #7), which is precisely the stall this section describes — not just
+A restart drops protected users' cached DEKs (see residual #7), causing the
+stall this section describes — not just
 the one-time first-vault-rollout, but any later restart too. A boot
 reconciler now closes the "nothing tells the user" gap directly: for each
-vault-having, Slack-linked user whose locked vault is blocking `queued`/
+protected, vault-having, Slack-linked user whose locked vault is blocking `queued`/
 `awaiting_approval`/`awaiting_input` work or a due schedule, it DMs them to
 unlock, once per lock-episode — deduped on `user_vaults.lock_notified_at`
 (atomic across replicas) and cleared on their next successful unlock. It is
@@ -207,8 +254,6 @@ is about an unauthenticated or other-user probe, not about telling the
 authenticated owner their own state. The DM body is a fixed, cause-neutral
 title and text plus an in-app deep link — never the password, KEK, or DEK.
 
-**Residual #7 interaction.** Because "locked" is per-process, an unlock on
-one pod re-arms the marker, so a sibling pod still locked in its own process
-can re-notify on its next tick. This is bounded — **at most one redundant DM
-per cross-pod unlock event**, never N — and single-replica deployments (the
-norm today) never hit it at all.
+**Residual #7 interaction.** Lock state is per-process; the singleton/Recreate
+requirement avoids cross-pod cache and notice inconsistencies. Off users have
+no wrapper or lock-notice episode.

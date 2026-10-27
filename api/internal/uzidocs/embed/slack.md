@@ -269,7 +269,8 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   the existing plan-gate message, right next to its action buttons.
   When the run recovers, the `⚠️ <flag>` context element drops off on its own
   and nudging stops — no action needed.
-- **Vault-locked nudge**: if your vault is locked (e.g. after a deploy
+- **Vault-locked nudge**: Off users receive no vault-lock notice. If your
+  protected vault is locked (e.g. after a deploy
   restarts the api) and it's blocking work that needs the vault — a run that is
   queued, awaiting your approval, or awaiting your input, or a due schedule — you
   get a one-time DM telling you to unlock so that work can proceed — it fires for

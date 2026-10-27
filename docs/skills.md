@@ -95,7 +95,7 @@ A product that starts [jobs](./jobs.md) can carry its own domain playbooks: how 
 On **Admin → Products**, open the product's skills panel:
 
 1. Enter the **repo URL** (an `https://` URL on the allowlist, with no credentials in it), and optionally a **branch, tag or commit** (the default branch when empty). A pinned tag or commit is the safer choice: a floating branch sends every push to the next sync you approve.
-2. For a private repo, paste a read-only **clone token** (for example a deploy token or a fine-grained read-only token on the skills repo). It is **write-only**: stored sealed, sent only to that repo's host, never shown again and never returned by any endpoint, which only say whether one is set. An empty token means a public repo. Rotating `UZI_SECRET_KEY` invalidates it like every other sealed secret.
+2. For a private repo, paste a read-only **clone token** (for example a deploy token or a fine-grained read-only token on the skills repo). It is **write-only**: stored sealed, sent only to that repo's host, never shown again and never returned by any endpoint, which only say whether one is set. An empty token means a public repo. Rotating `UZI_SECRET_KEY` invalidates this server-key-sealed clone token.
 3. Click **Sync**. uzi clones the repo, reads the skills and **stages** them: nothing reaches a job yet.
 4. Review the staged diff (skills added, changed, removed, unchanged, and any skill that was dropped with its reason) and click **Approve**. Approval is tied to the commit: it applies exactly the set you reviewed, records which admin approved it and the commit sha, and a sync that replaced the staged set in between is refused so you review again.
 
