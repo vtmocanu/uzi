@@ -1152,12 +1152,20 @@ stays retained until compatible tooling or that discard can address it.
 **What an operator must provide.**
 
 1. **One worker per data directory.** The worker takes an exclusive lock on
-   `<dataDir>/.uzi-authority/worker.lock` before it touches anything else. A second
+   `<dataDir>/.uzi-authority/worker.lock` in `main.ts` before the runner tmpdir is
+   prepared, the worker registers, or any sweep or admission runs (with
+   `UZI_EPOCH_LOCK=1` the pod-epoch bootstrap runs first). A second current
    worker on the same data directory, a missing util-linux `flock`, a data volume
    that is not local ext4 or XFS, or a missing procfs descriptor path makes
-   startup fail with an authority refusal. The `UZI_DATA_DIR` path must be absolute
-   and in canonical form: a trailing slash or a path that reaches the directory
-   through a symlink or alias is refused rather than treated as the same store.
+   startup fail with an authority refusal. The `UZI_DATA_DIR` path must be
+   absolute and normalized: acquiring the lock refuses a trailing slash, a `.` or
+   `..` segment, and a symlink as the final path component. A symlinked parent
+   directory or a bind mount is not caught there, because it reaches the same
+   lock file. The authority store then refuses any spelling that is not its own
+   canonical real path (and the enrollment's recorded data root), so a worker
+   started through such an alias runs, but every protected source operation
+   (admission, publication, retirement) is refused. Set `UZI_DATA_DIR` to the
+   canonical real path.
 2. **Indefinite blockers.** An operation that was in flight when a worker died
    (a deletion helper, a shared Git ref update) leaves a record that blocks
    reuse of its footprint, up to the whole repository's bare, until it is

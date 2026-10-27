@@ -1855,8 +1855,12 @@ this section is the map.
 
 - **Locks** (`agent/src/authority-lock.ts`). The worker takes a lifetime lock W
   (util-linux `flock` on a private file under `<dataDir>/.uzi-authority`) in
-  `main.ts` before anything else touches the data volume and never releases it,
-  so a second worker on the same volume refuses to start. A per-transaction lock A
+  `main.ts` before `ensureRunnerTmpdir`, registration, sweeps or admission (with
+  `UZI_EPOCH_LOCK=1` the pod-epoch bootstrap P runs first) and never releases it,
+  so a second current worker on the same volume refuses to start (a pre-#3404
+  worker takes no lock). It refuses non-normalized data-dir spellings and a
+  final-component symlink; the authority store separately refuses an aliased
+  spelling, so such a worker starts but refuses protected source operations. A per-transaction lock A
   in the same directory serializes authority changes. Order:
   `P -> W -> A -> C -> S -> J -> B -> O`.
 - **Authenticated slots** (`agent/src/completion-authority.ts`). Each source path

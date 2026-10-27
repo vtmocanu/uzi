@@ -42,8 +42,9 @@ Cut over with the old workers quiesced. A worker publishing a completed source
 writes a fence into the bare repository's recovery journal, and an older worker
 refuses to attach, recover or discard a journal that carries it. Rolling a worker
 back therefore leaves those sources unreachable until a current worker runs
-again. Two workers cannot share one data directory (the newer one refuses to
-start), and changing the worker join token on a reused data volume leaves
+again. A worker that predates #3404 takes no data-directory lock, so old workers
+must be quiesced before cutover: of two current workers on one data directory,
+the second one started refuses to start. Changing the worker join token on a reused data volume leaves
 existing authority records unauthenticated, so their sources are retained. See
 [Completed sources after a worker restart](run-recovery.md#completed-sources-after-a-worker-restart).
 
