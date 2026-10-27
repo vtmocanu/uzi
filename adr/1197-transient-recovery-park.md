@@ -1252,8 +1252,10 @@ including when the retry allowance is exhausted. A silent retry reconstructs
 inside the revision driver, after allowance consumption and the last awaited
 disposal. Exact source, claim and owner controls are checked again before
 construction and at credential/root admission, including before any capture.
-Unproven cleanup, including cleanup of a partially built replacement, and
-residue quarantine refuse continuation. Token redaction survives replacement
+Unproven cleanup, including cleanup of a partially built replacement or a
+failed repeated disposal, and residue quarantine refuse continuation. A failed
+repeated disposal revokes the earlier capture-only proof for that exact facade.
+Token redaction survives replacement
 until existing terminal cleanup.
 
 Each admitted reconstruction spends the existing three-redrive allowance
@@ -1261,8 +1263,10 @@ before fresh construction, including an owner replacement after exhaustion.
 Locked-vault and unavailable-credential construction failures remain inside
 that bounded driver, including an owner replacement revision after exhaustion;
 they do not escape into the runner credential hold. Teardown, backoff and
-admission consume the unchanged wall budget. Cancel, pause, spent wall and
-completion holds retain their existing precedence. Provider-origin revision
+admission consume the unchanged wall budget. Time awaiting an owner event at
+the restored gate remains excluded; ownership checks and gate restoration
+between wait ticks remain charged. Cancel, pause, spent wall and completion
+holds retain their existing precedence. Provider-origin revision
 retries continue on their existing epoch.
 
 The same failed prompt and clarification/prose budgets survive a silent retry.

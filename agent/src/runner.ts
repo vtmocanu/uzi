@@ -13053,10 +13053,10 @@ export class RunRunner {
           return verdict;
         } }
         : {}),
-      beforePlanRevisionTurn: () => revisionRecovery?.beforeTurn() ?? Promise.resolve(),
-      retryPlanRevisionTurn: async (cause) => {
+      beforePlanRevisionTurn: observer => revisionRecovery?.beforeTurn(observer) ?? Promise.resolve(),
+      retryPlanRevisionTurn: async (cause, observer) => {
         if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && !cause.zeroEvidenceIdle) || !revisionRecovery) throw cause;
-        await revisionRecovery.retry(cause);
+        await revisionRecovery.retry(cause, observer);
       },
       gatePlan: async (planMd, milestones, onPlanPersisted, settles, semanticSubmission) => {
         if (flight.workerMemory) flight.workerMemory.revisionContext = undefined;

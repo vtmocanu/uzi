@@ -1,7 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { TransientRecoveryError } from "./sdk-executor.js";
 import { RequestError, RevisionSourceFenceUnavailableError } from "./client.js";
-import { PlanRejectedError, PlanRevisionReplacedError } from "./executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, type PlanRevisionOwnerWaitObserver } from "./executor.js";
 import type { RunOwnershipResponse, StateAck, StateRequest } from "./protocol.js";
 import type { PlanVerdict, SteeringChannel } from "./steering.js";
 
@@ -100,11 +100,15 @@ export class PlanRevisionRecovery {
    * Repeated source probes spend an allowance only once, when redriveReady is set.
    * A successful clarification does not create a new allowance.
    */
-  async beforeTurn(): Promise<void> {
+  async beforeTurn(observer?: PlanRevisionOwnerWaitObserver): Promise<void> {
     const a = this.active;
     if (!a) return;
     await this.confirmSource(a);
     if (a.redriveReady) {
+      if (a.used >= this.limit) {
+        await this.retry(a.cause, observer);
+        return;
+      }
       const reason = a.cause instanceof TransientRecoveryError && a.cause.zeroEvidenceIdle
         ? "No model output within the idle timeout" : "Provider transient exhaustion";
       await this.deps.notice(`${reason} during plan revision ${a.id}; re-driving the failed turn (${a.used + 1}/${this.limit}).`);
@@ -115,7 +119,7 @@ export class PlanRevisionRecovery {
   }
 
   /** The runner admits typed provider exhaustion and measured Codex revision silence only. */
-  async retry(cause: unknown): Promise<void> {
+  async retry(cause: unknown, observer?: PlanRevisionOwnerWaitObserver): Promise<void> {
     const a = this.active;
     if (!a) throw cause; // missing source/older API keeps existing compatibility behavior
     await this.confirmSource(a);
@@ -159,10 +163,13 @@ export class PlanRevisionRecovery {
       const signal = AbortSignal.any([this.deps.signal(), abort.signal]);
       let verdict: PlanVerdict | undefined;
       try {
-        verdict = await Promise.race([
-          this.deps.steering.awaitRevisionRecoveryEvent(a.source.revision, a.id, signal),
-          this.sleep(30_000, signal).then(() => undefined),
-        ]);
+        try {
+          observer?.(true);
+          verdict = await Promise.race([
+            this.deps.steering.awaitRevisionRecoveryEvent(a.source.revision, a.id, signal),
+            this.sleep(30_000, signal).then(() => undefined),
+          ]);
+        } finally { observer?.(false); }
       } catch (err) {
         this.control(a);
         throw err;

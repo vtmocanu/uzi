@@ -111,6 +111,9 @@ export type SecretRemediationDecision =
   | { action: "remediate"; followUp: string }
   | { action: "fail" };
 
+/** Marks only the exhausted revision's owner-event wait, excluding recovery work. */
+export type PlanRevisionOwnerWaitObserver = (waiting: boolean) => void;
+
 /**
  * Everything an executor needs to work one run.
  *
@@ -428,9 +431,9 @@ export interface RunContext {
    * Resolves to redrive, or throws controls / PlanRevisionReplacedError to exit this driver.
    * The runner must prove ownership before resolving; unknown ownership permits no provider start.
    */
-  retryPlanRevisionTurn?(cause: unknown): Promise<void>;
+  retryPlanRevisionTurn?(cause: unknown, observer?: PlanRevisionOwnerWaitObserver): Promise<void>;
   /** Check the captured source before human revision turns and fresh epoch credential/root admission. */
-  beforePlanRevisionTurn?(): Promise<void>;
+  beforePlanRevisionTurn?(observer?: PlanRevisionOwnerWaitObserver): Promise<void>;
   /** An associated cross-check human gate continues its established wait after switch give-up. */
   continueExistingPlanGate?(otherwise: () => Promise<PlanVerdict>): Promise<PlanVerdict>;
   /**

@@ -79,7 +79,7 @@ import { TransientRecoveryError } from "../sdk-executor.js";
 import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
 import { CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
 import type { DockerWiring } from "../docker-wiring.js";
-import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type PlanRevisionOwnerWaitObserver, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
 import { PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES } from "../steering.js";
 import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
@@ -3585,12 +3585,18 @@ export class CodexExecutor implements Executor {
       let lastSessionId = ctx.sessionId ?? undefined;
       const wallMs = this.deps.wallMs ?? (ctx.config?.run_timeout_seconds ? ctx.config.run_timeout_seconds * 1000 : DEFAULT_WALL_MS);
       const wall: RunWall = { remainingMs: wallMs, maxServedMs: wallMs, claimMs: wallMs };
-      let silentRevision: { cause: TransientRecoveryError; needsRebuild: boolean; checkedAt: number } | undefined;
+      let silentRevision: { cause: TransientRecoveryError; needsRebuild: boolean; checkedAt: number; ownerWaiting?: boolean } | undefined;
       const chargeSilentRecovery = (): void => {
-        if (!silentRevision?.needsRebuild) return;
+        if (!silentRevision?.needsRebuild || silentRevision.ownerWaiting) return;
         const now = Date.now();
         wall.remainingMs -= Math.max(0, now - silentRevision.checkedAt);
         silentRevision.checkedAt = now;
+      };
+      const observeOwnerWait: PlanRevisionOwnerWaitObserver = waiting => {
+        if (!silentRevision?.needsRebuild) return;
+        if (waiting) chargeSilentRecovery();
+        else silentRevision.checkedAt = Date.now();
+        silentRevision.ownerWaiting = waiting;
       };
       let completionAttempted = false;
       const completion = { history: new CompletionHistory(), attempted: () => completionAttempted };
@@ -3612,7 +3618,7 @@ export class CodexExecutor implements Executor {
       };
       this.epochSourceAdmission = async () => {
         if (!silentRevision) return;
-        await ctx.beforePlanRevisionTurn?.();
+        await ctx.beforePlanRevisionTurn?.(silentRevision?.needsRebuild ? observeOwnerWait : undefined);
         // Ownership probes await network I/O; check controls afterwards.
         this.epochAdmission?.();
       };
@@ -3783,7 +3789,7 @@ export class CodexExecutor implements Executor {
             if (stopped) return stopped;
             // Recovery carries measured-silence readiness into an owner replacement.
             // Debit its allowance before every reconstruction, including credential failures.
-            if (humanRevision) await ctx.beforePlanRevisionTurn?.();
+            if (humanRevision) await ctx.beforePlanRevisionTurn?.(silentRevision?.needsRebuild ? observeOwnerWait : undefined);
             if (humanRevision && silentRevision?.needsRebuild) {
               await recreateEpochAfterReap();
               chargeSilentRecovery();
@@ -3823,7 +3829,7 @@ export class CodexExecutor implements Executor {
                 (!cause.providerOrigin && !cause.zeroEvidenceIdle)) throw error;
             if (!ctx.retryPlanRevisionTurn) throw cause.zeroEvidenceIdle ? cause.originalIdle ?? cause : cause;
             try {
-              await ctx.retryPlanRevisionTurn(cause);
+              await ctx.retryPlanRevisionTurn(cause, silentRevision?.needsRebuild ? observeOwnerWait : undefined);
             } catch (rejected) {
               // Only identity rejection denotes unsupported recovery. Controls and
               // replacement-revise exceptions must retain their own routing.
@@ -5176,9 +5182,17 @@ export class CodexExecutor implements Executor {
         // disposeTools the registry (WITHOUT the onDispose token-eviction hook — a live token must
         // survive into the next epoch), then close the harness/transport and dispose the fileop.
         dispose: async (): Promise<void> => {
-          await settleDepsInstall();
-          const clean = await this.tearDownEpoch(registry, epochHarness, epochFileop, boundaryDeadlineMs, true, "replacement");
-          if (clean) this.unverifiedEpochRegistries.delete(registry);
+          let clean = false;
+          try {
+            await settleDepsInstall();
+            clean = await this.tearDownEpoch(registry, epochHarness, epochFileop, boundaryDeadlineMs, true, "replacement");
+          } finally {
+            if (clean) this.unverifiedEpochRegistries.delete(registry);
+            else {
+              this.unverifiedEpochRegistries.add(registry);
+              this.verifiedDisposedCaptureFacades.delete(safety);
+            }
+          }
         },
       };
     } catch (error) {

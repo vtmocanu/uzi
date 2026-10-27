@@ -18258,11 +18258,11 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         recovery.accept({ kind: "revise", feedback: "change", inputId: 11, sourceGateRevision: 1 });
       }
       const ctx = revisionContext(fallback === "absent hook" ? {} : {
-        retryPlanRevisionTurn: async cause => {
+        retryPlanRevisionTurn: async (cause, observer) => {
           assert.ok(cause instanceof TransientRecoveryError && cause.zeroEvidenceIdle);
           original = cause.originalIdle;
           if (fallback === "unnegotiated") throw cause;
-          await recovery.retry(cause);
+          await recovery.retry(cause, observer);
         },
       });
       t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
@@ -18398,8 +18398,8 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       recovery.seed({ status: "awaiting_approval", plan_md: "initial", presentation_id: "source" }, 1,
         async () => ({ applied: true, status: "awaiting_approval", gateRevision: 1 }));
       recovery.accept({ kind: "revise", feedback: "change", inputId: 11, sourceGateRevision: 1 });
-      const ctx = revisionContext({ beforePlanRevisionTurn: () => recovery.beforeTurn(),
-        retryPlanRevisionTurn: async cause => { retries++; await recovery.retry(cause); } });
+      const ctx = revisionContext({ beforePlanRevisionTurn: observer => recovery.beforeTurn(observer),
+        retryPlanRevisionTurn: async (cause, observer) => { retries++; await recovery.retry(cause, observer); } });
       t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
       const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
       void running.catch(() => undefined);
@@ -18440,6 +18440,109 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       assert.equal(retries, 1);
       assert.equal(rig.client.releaseCalls.length, 1);
       assert.equal(rig.providerLaunches(), 1);
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  it("3466 repeated teardown revokes the exact captured disposal proof", async t => {
+    const rig = silentRevisionRig();
+    const wire = rig.deps.wireFileop!;
+    let disposals = 0, retries = 0;
+    rig.deps = { ...rig.deps, wireFileop: (...args) => {
+      const handle = wire(...args);
+      return { ...handle, dispose: async () => {
+        if (++disposals > 1) throw new Error("second teardown failed");
+        await handle.dispose();
+      } };
+    } };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    let oldSafety: Parameters<typeof executor["verifiedDisposedCaptureFacades"]["has"]>[0];
+    let oldRegistry: ExecutionRegistry | undefined;
+    const ctx = revisionContext({ beforePlanRevisionTurn: async () => {
+      if (!oldRegistry) {
+        const entry = [...executor["epochSafeties"]].find(([, safety]) => safety === executor.safety);
+        assert.ok(entry);
+        [oldRegistry, oldSafety] = entry;
+      }
+    }, retryPlanRevisionTurn: async () => {
+      retries++;
+      assert.ok(executor["verifiedDisposedCaptureFacades"].has(oldSafety!));
+      assert.equal(executor["unverifiedEpochRegistries"].has(oldRegistry!), false);
+    } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = executor.run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.epochs[0]!.transport.turnStartCount === 2);
+      await tick(); t.mock.timers.tick(100);
+      await assert.rejects(running, EpochCleanupUnprovenError);
+      assert.equal(retries, 1);
+      assert.equal(rig.client.releaseCalls.length, 1);
+      assert.equal(rig.providerLaunches(), 1);
+      assert.equal(executor["verifiedDisposedCaptureFacades"].has(oldSafety!), false);
+      assert.equal(executor["unverifiedEpochRegistries"].has(oldRegistry!), true);
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const wallMs of [100000, 34000]) it(`3466 owner wait is free but backoff is charged wall=${wallMs}`, async t => {
+    const rig = silentRevisionRig();
+    // Three further silent epochs, then a successful owner replacement.
+    const silent: Responder = c => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+      return {};
+    };
+    const extra = makeMultiEpochRig([silent, silent, silent]);
+    rig.epochs.splice(1, 0, ...extra.epochs);
+    rig.deps = { ...rig.deps, wallMs };
+    let waits = 0, retries = 0, parks = 0, suspended = false, backoff = 0;
+    const recovery = new PlanRevisionRecovery({ generation: 1,
+      ownership: async () => {
+        assert.equal(suspended, false, "source work must be charged");
+        t.mock.timers.tick(10);
+        return { status: "running", claim_generation: 1, gate_revision: 1, claim_released: false };
+      }, signal: () => new AbortController().signal, checkControl: () => {}, notice: async () => {},
+      policy: { random: () => 0, sleep: async (ms, signal) => {
+        if (ms !== 30000) { backoff += ms; t.mock.timers.tick(ms); return; }
+        if (++waits <= 4) { t.mock.timers.tick(ms); return; }
+        return new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      } },
+      steering: { takeRevisionRecoveryControl: () => undefined,
+        awaitRevisionRecoveryEvent: async () => waits >= 4
+          ? { kind: "revise", feedback: "J", inputId: 12, sourceGateRevision: 1 }
+          : new Promise(() => {}),
+        retirePersistedRevision: () => assert.fail("pending revision retired"), setGateRevision: () => {} },
+    });
+    recovery.seed({ status: "awaiting_approval", plan_md: "initial", presentation_id: "source" }, 1,
+      async () => { assert.equal(suspended, false); t.mock.timers.tick(10);
+        return { applied: true, status: "awaiting_approval", gateRevision: 1 }; });
+    recovery.accept({ kind: "revise", inputId: 11, sourceGateRevision: 1, feedback: "I" });
+    const ctx = revisionContext({ beforePlanRevisionTurn: observer => recovery.beforeTurn(observer),
+      retryPlanRevisionTurn: async (cause, observer) => {
+        retries++;
+        await recovery.retry(cause, waiting => { observer?.(waiting); suspended = waiting; });
+      }, parkForWall: async () => { parks++; return "parked"; } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      for (let epoch = 0; epoch < (wallMs === 100000 ? 4 : 3); epoch++) {
+        await until(() => rig.epochs[epoch]!.transport.turnStartCount === (epoch === 0 ? 2 : 1));
+        await tick(); t.mock.timers.tick(100);
+      }
+      if (wallMs === 100000) {
+        await assert.rejects(running, PlanRejectedError);
+        assert.equal(rig.providerLaunches(), 5);
+        assert.equal(waits, 5);
+        assert.deepEqual(recovery.fields(12).superseded_revision_input_ids, [11]);
+      } else {
+        assert.equal((await running).walled?.reason, "codex run wall-clock timeout");
+        assert.equal(parks, 1);
+        assert.equal(waits, 0);
+        assert.equal(rig.providerLaunches(), 3);
+      }
+      assert.equal(backoff, 35000);
+      assert.equal(retries, wallMs === 100000 ? 4 : 3);
+      assert.equal(suspended, false);
     } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
   });
 
@@ -18641,9 +18744,9 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         }
         return verdict;
       };
-      ctx.retryPlanRevisionTurn = async cause => {
+      ctx.retryPlanRevisionTurn = async (cause, observer) => {
         assert.ok(cause instanceof TransientRecoveryError && cause.zeroEvidenceIdle && !cause.providerOrigin);
-        retries++; await retry(cause);
+        retries++; await retry(cause, observer);
       };
       return run(ctx);
     };
