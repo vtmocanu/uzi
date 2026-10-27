@@ -246,3 +246,20 @@ it("chat list keeps omitted recovery metadata generic", async () => {
   render(<MemoryRouter><ChatList /></MemoryRouter>);
   expect(await screen.findByText("recovery wait")).toBeTruthy();
 });
+
+it.each([
+  ["2099-01-01T00:00:00Z", "Codex idle stall retrying"],
+  ["2020-01-01T00:00:00Z", "Codex idle stall retrying"],
+  [null, "Codex idle stall needs decision"],
+] as const)("chat detail forwards full run Codex idle stall timing %s", async (stamp, label) => {
+  mockApi.listChats.mockResolvedValue(chatList([]));
+  vi.mocked(useRunStream).mockReturnValue({
+    run: { ...mockRuns[0], id: "c1", status: "recovery_wait", recovery_wait_cause: "codex_idle_stall", recovery_retry_not_before: stamp },
+    messages: [], connected: true, error: "", refreshRun: vi.fn(),
+  } as unknown as ReturnType<typeof useRunStream>);
+  render(<MemoryRouter initialEntries={["/chat/c1"]}><Routes>
+    <Route path="/chat/:id" element={<ChatConversation />} />
+  </Routes></MemoryRouter>);
+  expect(screen.getByText(label)).toBeTruthy();
+  await waitFor(() => expect(mockApi.listChats).toHaveBeenCalled());
+});

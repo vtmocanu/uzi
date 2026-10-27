@@ -21,6 +21,7 @@ func retainedRecoveryRun(timing string) apitypes.RunDTO {
 	cause := "retained_recovery_exhausted"
 	r.RecoveryWaitCause = &cause
 	r.RecoveryRetryNotBefore = nil
+	r.RecoveryRetryNotBeforePresent = true
 	if timing != "held" {
 		stamp := time.Date(2099, 1, 2, 3, 4, 5, 0, time.UTC)
 		if timing == "due" {

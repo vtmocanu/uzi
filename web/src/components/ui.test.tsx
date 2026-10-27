@@ -405,6 +405,17 @@ it.each([
   expect(container.textContent).toBe(label);
   expect(container.querySelector(".text-warn")).toBeTruthy();
 });
+it.each([
+  [null, "Codex idle stall needs decision"],
+  ["2099-01-01T00:00:00Z", "Codex idle stall retrying"],
+  ["2000-01-01T00:00:00Z", "Codex idle stall retrying"],
+  [undefined, "Codex idle stall timing unknown"],
+  ["invalid", "Codex idle stall timing unknown"],
+] as const)("StatusPill preserves Codex idle stall timing %s", (stamp, label) => {
+  const { container } = render(<StatusPill status="recovery_wait" recovery_wait_cause="codex_idle_stall" recovery_retry_not_before={stamp} />);
+  expect(container.textContent).toBe(label);
+  expect(container.querySelector(".text-warn")).toBeTruthy();
+});
 it("StatusPill keeps a narrow projection's recovery cause unknown", () => {
   const { container } = render(<StatusPill status="recovery_wait" />);
   expect(container.textContent).toBe("recovery wait");

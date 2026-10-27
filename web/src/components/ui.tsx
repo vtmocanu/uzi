@@ -513,6 +513,9 @@ export const RUN_STATUS_TONES: Record<
    *  wait" de-underscores fine, so the default label already matches runBadge's word
    *  (the ui.test.tsx label-agreement loop over this map asserts the two surfaces agree). */
   recovery_wait: { tone: "warning" },
+  codex_idle_stall_retrying: { tone: "warning" },
+  codex_idle_stall_held: { tone: "warning" },
+  codex_idle_stall_unknown: { tone: "warning" },
   retained_recovery_retrying: { tone: "warning" },
   retained_recovery_held: { tone: "warning" },
   retained_recovery_unknown: { tone: "warning" },
@@ -588,6 +591,9 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   // matching "waiting for pool" label (the ui.test.tsx label-agreement loop over
   // RUN_STATUS_TONES asserts the two surfaces print one word).
   pool_wait: "waiting for pool",
+  codex_idle_stall_retrying: "Codex idle stall retrying",
+  codex_idle_stall_held: "Codex idle stall needs decision",
+  codex_idle_stall_unknown: "Codex idle stall timing unknown",
   retained_recovery_retrying: "retained recovery retrying",
   retained_recovery_held: "retained recovery needs decision",
   retained_recovery_unknown: "retained recovery timing unknown",

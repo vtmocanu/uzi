@@ -1558,3 +1558,18 @@ it.each([
   const badge = await screen.findByText(label);
   expect(badge.classList.contains("text-warn")).toBe(true);
 });
+
+it.each([
+  ["2099-01-01T00:00:00Z", "Codex idle stall retrying"],
+  ["2020-01-01T00:00:00Z", "Codex idle stall retrying"],
+  [null, "Codex idle stall needs decision"],
+  [undefined, "Codex idle stall timing unknown"],
+  ["invalid", "Codex idle stall timing unknown"],
+] as const)("Codex idle stall history renders timing %s", async (stamp, label) => {
+  setAuth();
+  mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+  mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status: "recovery_wait", recovery_wait_cause: "codex_idle_stall", recovery_retry_not_before: stamp } as Partial<RunListItem>)] });
+  renderIssueView();
+  const badge = await screen.findByText(label);
+  expect(badge.classList.contains("text-warn")).toBe(true);
+});

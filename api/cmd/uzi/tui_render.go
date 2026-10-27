@@ -437,11 +437,11 @@ func tuiRejectedRun(r apitypes.RunDTO) bool {
 // runStateToken gives typed provider, Codex relogin and credential holds their
 // own tokens; other runs use stateToken. Provider markers require matching status.
 func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
-	if isRetainedRecovery(r) {
-		if isRetainedRecoveryHold(r) {
-			return runToken{glyph: "!", word: retainedRecoveryWord(r), color: p.amber}
+	if isRecoveryDecisionPark(r) {
+		if isRecoveryDecisionHold(r) {
+			return runToken{glyph: "!", word: recoveryDecisionWord(r), color: p.amber}
 		}
-		return runToken{glyph: "~", word: retainedRecoveryWord(r), color: p.wait}
+		return runToken{glyph: "~", word: recoveryDecisionWord(r), color: p.wait}
 	}
 	if runpresentation.HumanStopReason(r.Status, strOr(r.StopKind, "")) != "" {
 		return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.StopKind, ""))

@@ -1391,8 +1391,11 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   onResume: () => void;
   onCancel: () => void;
 }) {
-  const retained = run.recovery_wait_cause === "retained_recovery_exhausted";
-  const retainedStatus = effectiveRunStatus(run);
+  const idleStall = run.recovery_wait_cause === "codex_idle_stall";
+  const retained = run.recovery_wait_cause === "retained_recovery_exhausted" || idleStall;
+  const decisionName = idleStall ? "Codex idle stall" : "Retained recovery";
+  const decisionHeld = run.recovery_retry_not_before === null;
+  const decisionRetrying = typeof run.recovery_retry_not_before === "string" && Number.isFinite(Date.parse(run.recovery_retry_not_before));
   const retryMs = typeof run.recovery_retry_not_before === "string" ? Date.parse(run.recovery_retry_not_before) : NaN;
   const memoryHeld = run.recovery_wait_cause === "worker_memory_pressure";
   const memory = run.memory_hold;
@@ -1400,15 +1403,16 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   const evidence = recovery?.evidence;
   return (
     <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
-      <p className="text-sm font-semibold text-warn">{retained ? retainedStatus === "retained_recovery_held" ? "Retained recovery needs your decision"
-        : retainedStatus === "retained_recovery_retrying" ? "Retained recovery retrying" : "Retained recovery timing unknown"
+      <p className="text-sm font-semibold text-warn">{retained ? decisionHeld ? `${decisionName} needs your decision`
+        : decisionRetrying ? `${decisionName} retrying` : `${decisionName} timing unknown`
         : memoryHeld ? "Worker memory pressure — waiting for owner" : "Worker recovery needs your decision"}</p>
       <p className="mt-0.5 text-xs text-muted">
         {retained ? <>
-          {retainedStatus === "retained_recovery_held"
+          {decisionHeld
             ? "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
-            : retainedStatus === "retained_recovery_retrying"
-              ? retryMs <= Date.now() ? "Automatic retry is due; the run will retry automatically. Only the run owner can Resume now or Cancel."
+            : decisionRetrying
+              ? idleStall ? `Automatic retry is scheduled not before ${new Date(retryMs).toLocaleString()}; it may still be pending when due. Only the run owner can Resume now or Cancel.`
+                : retryMs <= Date.now() ? "Automatic retry is due; the run will retry automatically. Only the run owner can Resume now or Cancel."
                 : `The run will retry automatically after ${new Date(retryMs).toLocaleString()}. Only the run owner can Resume now or Cancel.`
               : "Retry timing is unavailable. This does not establish an owner hold or an automatic retry date."}
         </> : <>{memoryHeld
@@ -1417,6 +1421,7 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
         {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
         This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.</>}
       </p>
+      {idleStall && <p className="mt-1.5 text-xs text-muted">Resume starts a fresh wall and resets the idle-stall count. Cancel ends this run. Resume requests an attempt; success is not assured.</p>}
       {!retained && <p className="mt-1.5 text-xs text-muted">
         {memoryHeld
           ? `Memory interventions: used ${memory?.used ?? "unknown"}. Maximum: ${memory?.max ?? "unknown"}. Remaining: ${memory?.remaining ?? "unknown"}.`
@@ -1516,7 +1521,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
   // sibling parks) renders nothing — PoolWaitPanel owns pool_wait, LimitWaitPanel owns
   // limit_wait, and this self-hides on both so mounting all three side by side is safe.
   if (run.status !== "recovery_wait") return null;
-  if (run.recovery_wait_cause === "worker_requeue_exhausted" || run.recovery_wait_cause === "worker_memory_pressure" || run.recovery_wait_cause === "retained_recovery_exhausted") {
+  if (run.recovery_wait_cause === "worker_requeue_exhausted" || run.recovery_wait_cause === "worker_memory_pressure" || (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall")) {
     return <WorkerDecisionPanel run={run} ownerProof={ownerProof} busy={busy} onResume={onResume} onCancel={onCancel} />;
   }
 
@@ -1774,7 +1779,7 @@ export function RunView() {
   const memoryHeld = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
   // Issue #3181: the token-switch holds are owner decisions too (Resume / Cancel).
   const switchHeld = run != null && credentialSwitchHold(run) !== null;
-  const retainedRecovery = run?.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_exhausted";
+  const retainedRecovery = run?.status === "recovery_wait" && (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall");
   const ownerDecisionHold = retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
   const canSteer = optimisticCanSteer && (!ownerDecisionHold || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
@@ -2197,7 +2202,7 @@ export function RunView() {
                   ? "data_volume_full"
                   : run.recovery_wait_cause === "provider_outage"
                     ? "provider_outage"
-                  : run.recovery_wait_cause === "retained_recovery_exhausted"
+                  : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall")
                     ? effectiveRunStatus(run)
                   : run.recovery_wait_cause === "worker_requeue_exhausted"
                     ? "worker_requeue_exhausted"
@@ -2228,6 +2233,12 @@ export function RunView() {
         ? "The run is waiting for your next follow-up."
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
+          : parkKey === "codex_idle_stall_held"
+            ? "Codex idle stall needs your decision. Only the run owner can Resume or Cancel. There is no scheduled retry. Resume starts a fresh wall and resets the idle-stall count; Cancel ends the run."
+          : parkKey === "codex_idle_stall_retrying"
+            ? "Codex idle stall has a scheduled retry, which may still be pending when due. Only the run owner can Resume now or Cancel. Resume starts a fresh wall and resets the idle-stall count; Cancel ends the run."
+          : parkKey === "codex_idle_stall_unknown"
+            ? "Codex idle stall timing is unavailable. An owner hold or automatic retry date cannot be inferred."
           : parkKey === "retained_recovery_held"
             ? "Retained recovery needs your decision. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "retained_recovery_retrying"

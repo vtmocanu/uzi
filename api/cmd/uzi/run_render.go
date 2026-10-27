@@ -1989,11 +1989,16 @@ func steerStateWithRun(in apitypes.SteerInputDTO, runStatus string, recoveryCaus
 	// it lives on the fuller run-get notice and the web panel). issue #1088 widened the
 	// non-forge cause to any transient interruption (a transient empty turn or provider outage).
 	recoveringSuffix := " (run recovering from a transient interruption)"
-	if len(recoveryCause) > 0 && recoveryCause[0] == retainedRecoveryExhaustedCause {
+	if len(recoveryCause) > 0 && (recoveryCause[0] == retainedRecoveryExhaustedCause || recoveryCause[0] == "codex_idle_stall") {
 		recoveringSuffix = " (retained recovery; retry timing unknown)"
-		if run != nil && isRetainedRecovery(*run) {
-			recoveringSuffix = " (timed retry)"
-			if isRetainedRecoveryHold(*run) {
+		if recoveryCause[0] == "codex_idle_stall" {
+			recoveringSuffix = " (Codex idle stall; retry timing unknown)"
+		}
+		if run != nil && isRecoveryDecisionPark(*run) {
+			if run.RecoveryRetryNotBefore != nil {
+				recoveringSuffix = " (timed retry)"
+			}
+			if isRecoveryDecisionHold(*run) {
 				recoveringSuffix = " (owner Resume/Cancel)"
 			}
 		}
@@ -2182,7 +2187,7 @@ var parkedStatuses = map[string]bool{statusLimitWait: true, statusRecoveryWait: 
 // reported it; it is shown only while the run is parked. "" when the run is not parked or the
 // worker did not report it.
 func checkpointDurabilityLine(r apitypes.RunDTO) string {
-	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] || isOwnerRequiredWorkerHold(r) || isRetainedRecovery(r) {
+	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] || isOwnerRequiredWorkerHold(r) || isRecoveryDecisionPark(r) {
 		return ""
 	}
 	if *r.CheckpointContainsLatest {
@@ -2343,7 +2348,7 @@ func codexAccountActionShort(r apitypes.RunDTO) string {
 // A run held on credential_disabled (PRD #1732 D14) gets "(credential disabled)" likewise.
 func runStatusCell(r apitypes.RunListItemDTO) string {
 	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.FailOrigin, ""))
-	if isOwnerRequiredWorkerHold(r.RunDTO) || isRetainedRecovery(r.RunDTO) {
+	if isOwnerRequiredWorkerHold(r.RunDTO) || isRecoveryDecisionPark(r.RunDTO) {
 		return workerExhaustionLine(r.RunDTO)
 	}
 	if short := codexAccountActionShort(r.RunDTO); short != "" {
