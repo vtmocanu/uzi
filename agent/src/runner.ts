@@ -18796,6 +18796,8 @@ export class RunRunner {
             }
             markParkKeep();
             const idleHeld = idleTyped && ack.recoveryRetryNotBefore === undefined;
+            const idleOpening = err instanceof TransientRecoveryError && err.idleStallKind === "zero_evidence" ? "provider sent no model output" : "model output stalled";
+            const idleCheckpoint = capture.published ? "published" : "saved on this worker";
             runLog.info(idleHeld ? "run held for Codex idle recovery" : "run parked for transient recovery", { detail: err.message });
             batcher.emit({
               kind: "status",
@@ -18803,8 +18805,8 @@ export class RunRunner {
               payload: {
                 text: idleTyped
                   ? idleHeld
-                    ? "paused after model output stalled; the work is kept and the run waits for its owner to resume it"
-                    : "paused after model output stalled; the recovery checkpoint is saved and it resumes automatically"
+                    ? `paused after ${idleOpening}; the recovery checkpoint is ${idleCheckpoint} and the run waits for its owner to resume it`
+                    : `paused after ${idleOpening}; the recovery checkpoint is ${idleCheckpoint} and it resumes automatically`
                   : capture.published
                   ? "paused to recover from a transient interruption; the recovery checkpoint is published and it resumes automatically"
                   : "paused to recover from a transient interruption; the recovery checkpoint is saved on this worker and it resumes automatically",
