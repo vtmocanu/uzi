@@ -287,11 +287,8 @@ it("pause intent preserves later evidence, while a paused or terminal ACK perman
     });
     const reporter = client.codexAdmissionReporter(claim.run_id, 7)!;
     emit(reporter);
-    if (status === "completed") await client.reportState(claim.run_id, { status: "running", claim_generation: 7 });
-    else {
-      const ack = await client.requestWorkerPause(claim.run_id, 7);
-      assert.equal(ack.status, status);
-    }
+    const ack = await client.requestWorkerPause(claim.run_id, 7);
+    assert.equal(ack.status, status);
     emit(reporter, "serverOverloaded");
     await barrier();
     assert.equal(requests.filter(r => r.path.endsWith("/admission-signal")).length, status === "running" ? 1 : 0);
@@ -425,5 +422,100 @@ it("old-generation reports do not revoke current authority and capability remova
   client.dropFeature(feature);
   client.protocolFeatures = [feature];
   emit(reporter, "serverOverloaded"); await barrier();
+  assert.equal(requests.filter(r => r.path.endsWith("/admission-signal")).length, 1);
+});
+
+it("stale and ended pause or state ACKs retire reporting without changing the acknowledgement", async () => {
+  for (const endpoint of ["pause", "state"] as const) {
+    for (const status of ["running", "awaiting_approval", "paused", "completed", "failed"]) {
+      for (const stale of [false, true]) {
+        const { client, claim, requests } = await clientFixture({
+          onRequest: path => path.endsWith("/" + endpoint)
+            ? Response.json({ run: { status }, applied: !stale,
+              ...(stale ? { disposition: "stale_claim" } : {}) }, { status: stale ? 409 : 200 })
+            : undefined,
+        });
+        const reporter = client.codexAdmissionReporter(claim.run_id, 7)!;
+        emit(reporter);
+        const ack = endpoint === "pause"
+          ? await client.requestWorkerPause(claim.run_id, 7)
+          : await client.reportState(claim.run_id, { status: "running", claim_generation: 7 });
+        assert.equal(ack.status, status);
+        assert.equal(ack.applied, !stale);
+        assert.equal(ack.staleClaim === true, stale);
+        emit(reporter, "serverOverloaded");
+        await barrier();
+        const live = !stale && ["running", "awaiting_approval"].includes(status);
+        assert.equal(requests.filter(r => r.path.endsWith("/admission-signal")).length,
+          live ? 1 : 0, endpoint + "/" + status + "/stale=" + stale);
+        await client.claimRun();
+        emit(client.codexAdmissionReporter(claim.run_id, 7)!);
+        await barrier();
+        assert.equal(requests.filter(r => r.path.endsWith("/admission-signal")).length,
+          live ? 2 : 0, "a repeated claim must not reopen retired telemetry");
+      }
+    }
+  }
+});
+
+it("a stale lifecycle ACK for another generation cannot retire the current reporter", async () => {
+  for (const endpoint of ["pause", "state"] as const) {
+    const { client, claim, requests } = await clientFixture({
+      onRequest: path => path.endsWith("/" + endpoint)
+        ? Response.json({ run: { status: "running" }, applied: false, disposition: "stale_claim" }, { status: 409 })
+        : undefined,
+    });
+    const reporter = client.codexAdmissionReporter(claim.run_id, 7)!;
+    if (endpoint === "pause") await client.requestWorkerPause(claim.run_id, 6);
+    else await client.reportState(claim.run_id, { status: "running", claim_generation: 6 });
+    emit(reporter);
+    await barrier();
+    assert.equal(requests.filter(r => r.path.endsWith("/admission-signal")).length, 1);
+  }
+});
+
+it("queued retry receives only the remaining absolute budget", async () => {
+  const clock = new Clock();
+  const sends: { at: number; signal: AbortSignal }[] = [];
+  const reporter = new CodexAdmissionReporter(7, () => true, async (_body, signal) => {
+    sends.push({ at: clock.now(), signal });
+    return new Promise<number>(() => {});
+  }, clock);
+  emit(reporter);
+  emit(reporter, "serverOverloaded");
+  await barrier();
+  for (let i = 0; i < 3; i++) { clock.advance(3000); await barrier(); }
+  assert.deepEqual(sends.map(s => s.at), [0, 3000, 6000, 9000]);
+  assert.deepEqual([...clock.timers.values()].map(t => t.at), [10000]);
+  clock.advance(1000);
+  await barrier();
+  assert.ok(sends.every(s => s.signal.aborted));
+  assert.equal(clock.timers.size, 0);
+  assert.equal(sends.length, 4);
+  reporter.seal(true);
+});
+
+it("capability loss aborts a fresh active request and discards queued evidence", async () => {
+  let active: AbortSignal | null | undefined;
+  const { client, claim, requests } = await clientFixture({
+    onRequest: (path, _body, signal) => {
+      if (path.endsWith("/admission-signal")) {
+        active = signal;
+        return new Promise<Response>(() => {});
+      }
+      return undefined;
+    },
+  });
+  const reporter = client.codexAdmissionReporter(claim.run_id, 7)!;
+  emit(reporter);
+  emit(reporter, "serverOverloaded");
+  await barrier();
+  assert.ok(active && !active.aborted);
+  client.dropFeature(feature);
+  assert.ok(active.aborted);
+  await barrier();
+  client.protocolFeatures = [feature, "claim_generation_fence"];
+  emit(reporter);
+  await barrier();
   assert.equal(requests.filter(r => r.path.endsWith("/admission-signal")).length, 1);
 });

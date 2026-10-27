@@ -2471,8 +2471,9 @@ export class WorkerClient {
           // already issued — learns its scaled cap here (a resume gets it on the claim
           // config instead). Absent/non-numeric ⇒ left undefined = "no budget update".
           const fields = await readRunAck(res, maxAckBytes);
-          if (fields.status && !["claimed", "running", "awaiting_approval"].includes(fields.status))
-            this.sealCodexAdmission(path, { status: fields.status, claim_generation: admissionGeneration ?? body.claim_generation });
+          if (fields.staleClaim === true ||
+              (fields.status && !["claimed", "running", "awaiting_approval"].includes(fields.status)))
+            this.codexAdmissionReporter(runId, admissionGeneration ?? body.claim_generation)?.seal(true);
           MaintenanceBudget.current()?.check();
           const ack: StateAck = {
             applied: res.status === 200,
@@ -3987,9 +3988,8 @@ export class WorkerClient {
       if (fields.status === undefined || fields.applied === undefined)
         throw new RequestError("POST", path, res.status, "invalid worker pause acknowledgement");
       const ack: StateAck = { status: fields.status, applied: fields.applied };
-      if (ack.status === "paused") this.sealCodexAdmission(
-        `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/state`,
-        { claim_generation: claimGeneration, status: "paused" });
+      if (fields.staleClaim === true || !["claimed", "running", "awaiting_approval"].includes(fields.status))
+        this.codexAdmissionReporter(runId, claimGeneration)?.seal(true);
       if (fields.holdReason !== undefined) ack.holdReason = fields.holdReason;
       if (fields.reason !== undefined) ack.reason = fields.reason;
       if (fields.staleClaim !== undefined) ack.staleClaim = fields.staleClaim;
