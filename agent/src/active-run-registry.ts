@@ -1,9 +1,11 @@
 import type {
   ActiveSnapshot,
+  CodexOperationIdentity,
   ActiveSnapshotEntry,
   ActiveSnapshotPhase,
   FinalizeResumeEntry,
 } from "./protocol.js";
+import { validCodexOperation } from "./codex-operation-admission.js";
 import type { PendingTerminal } from "./outbox.js";
 
 /** PRD #1391 Run B M4: the outbox pending-terminal lister the registry reads (a function seam so the
@@ -69,7 +71,7 @@ function oldestFirst(a: PendingTerminal, b: PendingTerminal): number {
  */
 export class ActiveRunRegistry {
   /** run_id → {phase, claimGeneration} for every live execution (run-lane + judge/review). */
-  private readonly runs = new Map<string, { phase: ActiveSnapshotPhase; claimGeneration: number }>();
+  private readonly runs = new Map<string, { phase: ActiveSnapshotPhase; claimGeneration: number; registrationToken: symbol; cooldown?: { token: symbol; operation: CodexOperationIdentity } }>();
   /** The single process-monotonic snapshot epoch, shared by every build (starts at 0;
    *  the first build returns 1). */
   private epoch = 0;
@@ -103,15 +105,35 @@ export class ActiveRunRegistry {
   /** Register a run as executing at `running`, at the generation it was claimed at.
    *  Idempotent per run id (re-registering, e.g. a promoted re-claim serialised behind an
    *  old park, overwrites the prior entry). */
-  add(runId: string, claimGeneration: number): void {
-    this.runs.set(runId, { phase: "running", claimGeneration });
+  add(runId: string, claimGeneration: number): symbol {
+    const registrationToken = Symbol();
+    this.runs.set(runId, { phase: "running", claimGeneration, registrationToken });
+    return registrationToken;
   }
 
   /** Update the current phase of a live run (no-op when the run is not registered, so a
    *  late transition after removal never revives an entry). */
   setPhase(runId: string, phase: ActiveSnapshotPhase): void {
     const entry = this.runs.get(runId);
-    if (entry) entry.phase = phase;
+    if (entry && entry.phase !== phase) {
+      entry.phase = phase;
+      delete entry.cooldown;
+    }
+  }
+
+  /** Caller selects waiting; each update owns a token so stale clears cannot erase a successor. */
+  setAccountCooldown(runId: string, generation: number, operation: CodexOperationIdentity, registrationToken: symbol): symbol | undefined {
+    const entry = this.runs.get(runId);
+    if (!entry || entry.registrationToken !== registrationToken || !Number.isSafeInteger(generation) || generation <= 0 ||
+        entry.claimGeneration !== generation || !validCodexOperation(operation)) return undefined;
+    const token = Symbol();
+    entry.cooldown = { token, operation: structuredClone(operation) };
+    return token;
+  }
+
+  clearAccountCooldown(runId: string, generation: number, token: symbol): void {
+    const entry = this.runs.get(runId);
+    if (entry?.claimGeneration === generation && entry.cooldown?.token === token) delete entry.cooldown;
   }
 
   /** Drop a run once its execution settles (terminal, or parked-and-returned for a
@@ -235,6 +257,7 @@ export class ActiveRunRegistry {
         claim_generation: entry.claimGeneration,
         phase: entry.phase,
         terminal_pending: false,
+        ...(entry.cooldown ? { account_cooldown: structuredClone(entry.cooldown.operation) } : {}),
       });
     }
 

@@ -1722,6 +1722,12 @@ type WorkerActiveRun struct {
 	SnapshotEpoch        int64              `json:"snapshot_epoch"`
 	ReportedAt           pgtype.Timestamptz `json:"reported_at"`
 	TerminalPendingSince pgtype.Timestamptz `json:"terminal_pending_since"`
+	CooldownOperation    []byte             `json:"cooldown_operation"`
+	CooldownClass        pgtype.Text        `json:"cooldown_class"`
+	CooldownEpisodeID    pgtype.UUID        `json:"cooldown_episode_id"`
+	CooldownEligibleAt   pgtype.Timestamptz `json:"cooldown_eligible_at"`
+	CooldownObservedAt   pgtype.Timestamptz `json:"cooldown_observed_at"`
+	CooldownUntil        pgtype.Timestamptz `json:"cooldown_until"`
 }
 
 type WorkerCordonEvent struct {

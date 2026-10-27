@@ -1342,6 +1342,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/codex/release", h.WorkerCodexRelease)
 		r.Post("/runs/{id}/codex/refresh", h.WorkerCodexRefresh)
 		r.Post("/runs/{id}/codex/admission-signal", h.WorkerCodexAdmissionSignal)
+		r.Post("/runs/{id}/codex/operation-admission", h.WorkerCodexOperationAdmission)
 
 		// Run judge (PRD #46 M3): a judge run reads the run it reviews and posts a
 		// verdict. Both are judge-run-scoped (the worker must own the active judge

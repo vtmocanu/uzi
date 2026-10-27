@@ -590,6 +590,36 @@ export interface OutboxHeartbeatEntry {
  *  a re-adopted run to. A judge/review attempt is always `running`. */
 export type ActiveSnapshotPhase = "running" | "awaiting_approval" | "awaiting_input" | "awaiting_followup";
 
+export interface CodexOperationSource {
+  gate_revision: number;
+  presentation_id: string;
+  revision_input_id: number;
+}
+
+export interface CodexOperationIdentity {
+  operation_id: string;
+  kind: "root" | "child" | "advice" | "checker";
+  source?: CodexOperationSource;
+}
+
+export interface CodexOperationRequest extends CodexOperationIdentity {
+  claim_generation: number;
+}
+
+export type CodexOperationDecision = {
+  decision: "admit";
+  operation_id: string;
+  claim_generation: number;
+} | {
+  decision: "wait";
+  operation_id: string;
+  claim_generation: number;
+  class: "rate_limit" | "overload";
+  episode_id: string;
+  server_now: string;
+  eligible_at: string;
+};
+
 /** One entry in an {@link ActiveSnapshot} (PRD #1390 M2a): a run-lane attempt (or a
  *  judge/review attempt) this worker is currently executing, named by its run id, the
  *  `claim_generation` it was claimed at, and its current `phase`. A #1390-only worker sets
@@ -597,6 +627,8 @@ export type ActiveSnapshotPhase = "running" | "awaiting_approval" | "awaiting_in
  *  terminal outcome is journaled and pending replay (the api then keeps that run unclaimable and
  *  its generation unbumped while the lease holds). */
 export interface ActiveSnapshotEntry {
+  /** Display metadata only; does not change phase, custody, or activity. */
+  account_cooldown?: CodexOperationIdentity;
   run_id: string;
   claim_generation: number;
   phase: ActiveSnapshotPhase;

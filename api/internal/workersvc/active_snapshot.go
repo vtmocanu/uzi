@@ -183,10 +183,11 @@ type FinalizeResumeEntry struct {
 // in; terminal_pending is true while the attempt's outcome is journaled on the worker but not
 // yet accepted by the api (#1391).
 type ActiveRunEntry struct {
-	RunID           string `json:"run_id"`
-	ClaimGeneration int64  `json:"claim_generation"`
-	Phase           string `json:"phase"`
-	TerminalPending bool   `json:"terminal_pending"`
+	RunID           string          `json:"run_id"`
+	ClaimGeneration int64           `json:"claim_generation"`
+	Phase           string          `json:"phase"`
+	TerminalPending bool            `json:"terminal_pending"`
+	AccountCooldown json.RawMessage `json:"account_cooldown,omitempty"`
 }
 
 // snapshotPhases is the closed set an ActiveRunEntry.Phase must belong to — the run lane's four
@@ -238,6 +239,7 @@ type validatedEntry struct {
 	claimGeneration int64
 	phase           string
 	terminalPending bool
+	cooldown        *CodexOperationIdentity
 }
 
 // validatedFinalizeResume is the shape-validated form of ActiveSnapshot.FinalizeResume: two
@@ -340,6 +342,7 @@ func normalizeActiveSnapshot(p Params, wkr store.Worker, snap *ActiveSnapshot, m
 			claimGeneration: e.ClaimGeneration,
 			phase:           e.Phase,
 			terminalPending: e.TerminalPending,
+			cooldown:        parseActiveCooldown(e.AccountCooldown),
 		})
 	}
 
@@ -495,6 +498,11 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 		})
 		if err != nil {
 			return false, err
+		}
+		if rows > 0 {
+			if err := applyActiveCooldown(ctx, qtx, wkr, e); err != nil {
+				return false, err
+			}
 		}
 		if rows == 0 {
 			// UpsertFrozenWorkerActiveRun rejected ownership or frozen identity drift.
