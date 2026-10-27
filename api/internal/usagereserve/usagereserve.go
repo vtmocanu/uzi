@@ -270,24 +270,34 @@ type WeeklyWindow struct {
 // CodexOverrideResetObserved reports whether a fresh Codex reading shows the week that a manual-resume
 // override was granted under has reset. An account can report several weekly windows, and the verdict
 // follows whichever is highest, so the anchor (the granted window's reset) identifies the window: a
-// window whose reset is within ResetEpochMoveMargin of the anchor is the same window, and only its own
-// usage drop can show a fixed-grid reset (CodexResetObserved on that window). When no window still
-// matches the anchor, the granted window reset and rolled forward iff some window now resets more than
-// the margin past the anchor. A nil priorPct disables the drop arm.
+// window whose reset is within ResetEpochMoveMargin of the anchor may be the granted one. Several
+// windows can share a reset, and a reading does not say which is which, so a match is conservative:
+// the granted week reset in place only when EVERY matching window shows the reset (CodexResetObserved
+// on each); an unrelated low window never proves it, whatever the order. A reset this misses still
+// ends the override at its anchor (the clock arm). When no window still matches the anchor, the
+// granted window reset and rolled forward iff some window now resets more than the margin past the
+// anchor. A nil priorPct disables the drop arm.
 func CodexOverrideResetObserved(anchor time.Time, priorPct *float64, weekly []WeeklyWindow) bool {
-	moved := false
+	moved, matched, allReset := false, false, true
 	for _, w := range weekly {
 		if w.ResetsAt == nil {
 			continue
 		}
 		d := w.ResetsAt.Sub(anchor)
 		if d >= -ResetEpochMoveMargin && d <= ResetEpochMoveMargin {
+			matched = true
 			fresh := w.Pct
-			return CodexResetObserved(anchor.Unix(), w.ResetsAt.Unix(), priorPct, &fresh)
+			if !CodexResetObserved(anchor.Unix(), w.ResetsAt.Unix(), priorPct, &fresh) {
+				allReset = false
+			}
+			continue
 		}
 		if d > ResetEpochMoveMargin {
 			moved = true
 		}
+	}
+	if matched {
+		return allReset
 	}
 	return moved
 }

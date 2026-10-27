@@ -260,3 +260,29 @@ func TestCodexOverrideFollowsGrantedWindow(t *testing.T) {
 		t.Fatal("with no recorded prior the drop arm cannot fire")
 	}
 }
+
+// TestCodexOverrideSharedResetIsConservative (buddy review #3568): windows sharing the anchor's
+// reset cannot be told apart, so the drop arm fires only when every matching window dropped, in any
+// order; an unrelated low window never proves the granted window reset.
+func TestCodexOverrideSharedResetIsConservative(t *testing.T) {
+	anchor := now.Add(48 * time.Hour).Truncate(time.Second)
+	prior := 90.0
+	a := WeeklyWindow{ResetsAt: tp(anchor), Pct: 90} // granted, unchanged
+	b := WeeklyWindow{ResetsAt: tp(anchor), Pct: 0}  // unrelated, already unused
+	for _, order := range [][]WeeklyWindow{{a, b}, {b, a}} {
+		if CodexOverrideResetObserved(anchor, &prior, order) {
+			t.Fatalf("order %+v: an unrelated low window with the same reset ended the override", order)
+		}
+	}
+	reset := WeeklyWindow{ResetsAt: tp(anchor), Pct: 1} // A reset in place
+	for _, order := range [][]WeeklyWindow{{reset, b}, {b, reset}} {
+		if !CodexOverrideResetObserved(anchor, &prior, order) {
+			t.Fatalf("order %+v: both matching windows dropped, want a reset", order)
+		}
+	}
+	// A shared-reset sibling still high hides an in-place reset; the clock arm ends it at the anchor.
+	high := WeeklyWindow{ResetsAt: tp(anchor), Pct: 50}
+	if CodexOverrideResetObserved(anchor, &prior, []WeeklyWindow{reset, high}) {
+		t.Fatal("an ambiguous match must stay conservative")
+	}
+}
