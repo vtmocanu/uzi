@@ -1,15 +1,14 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 import { mockApi } from "./mockApi";
 import { mockUsers } from "./data";
 
 afterEach(async () => {
   // Restore the seed so the shared session user does not leak into other tests.
   await mockApi.setUsageReserve(null, true);
-  vi.resetModules();
 });
 
-// PRD #3522 M2: the mock twin of PUT /api/me/usage-reserve (handler/usage_reserve.go).
+// PRD #3522 M1: the mock twin of PUT /api/me/usage-reserve (handler/usage_reserve.go).
 describe("mockApi.setUsageReserve (PRD #3522)", () => {
   it("seeds every demo user off, with pause-running at its default", () => {
     for (const u of mockUsers) {

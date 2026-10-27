@@ -1547,7 +1547,7 @@ export interface ReleaseCheckStatus {
 // ── Instance maintenance mode (PRD #3454) ───────────────────────────────────
 
 // QueueReason is why a queued run is held back by the instance, beyond waiting for a
-// worker. Only "maintenance" exists today.
+// worker: "maintenance" (instance maintenance mode) or "weekly_reserve" (below).
 /** "weekly_reserve" (PRD #3522): the owner's weekly usage reserve holds this queued run. */
 export type QueueReason = "maintenance" | "weekly_reserve";
 

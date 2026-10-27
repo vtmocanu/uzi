@@ -1134,7 +1134,7 @@ export const settingsApi = {
     return delay({ user: { ...u } }, 200);
   },
 
-  // ── Weekly usage reserve (PRD #3522 M2) ──────────────────────────────────────
+  // ── Weekly usage reserve (PRD #3522 M1) ──────────────────────────────────────
   // Mirrors PUT /api/me/usage-reserve (handler/usage_reserve.go): both fields are
   // required, the threshold is an integer 1..100 or null (off), pause_running a boolean,
   // and the write lands on the session user, never a body id. 400 messages match the server.

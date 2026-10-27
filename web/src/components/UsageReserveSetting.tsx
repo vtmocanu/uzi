@@ -1,14 +1,17 @@
-// Settings → Run defaults → Usage limits: the weekly usage reserve (PRD #3522 M2).
+// Settings → Run defaults → Usage limits: the weekly usage reserve (PRD #3522 M1).
 // The 7-day utilization percent at which uzi stops spending the user's subscription,
 // plus whether a running run also pauses after its current milestone.
 //
 // One endpoint owns the whole setting (PUT /api/me/usage-reserve, both fields always
 // sent), so every control here writes the pair. Writes are optimistic: the control moves
-// at once, a failed write rolls it back to the last saved pair and names the failure. The
+// at once, a failed write rolls it back to the last saved pair and names the failure.
+// Saves are serialized: a change made while one is in flight is merged into one pending
+// pair and sent right after it, so a click that follows a blur-commit is never dropped
+// and the last intent always wins. The
 // switch saves on click; the threshold saves on blur or Enter, after validating it as a
 // whole number 1..100, so a half-typed "7" on the way to "70" is never sent.
 
-import { useId, useState, type KeyboardEvent } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
@@ -25,6 +28,10 @@ const RANGE_MESSAGE = "Enter a whole number from 1 to 100.";
 interface Reserve {
   pct: number | null;
   pause: boolean;
+}
+
+function sameReserve(a: Reserve, b: Reserve): boolean {
+  return a.pct === b.pct && a.pause === b.pause;
 }
 
 // parseReservePct accepts only a plain whole number 1..100: "1.5", "-3", "1e2" and ""
@@ -45,38 +52,70 @@ export function UsageReserveSetting() {
   const pauseHelpId = `${ids}-pause-help`;
 
   // The saved pair comes from the session user. `local` holds an optimistic or
-  // just-confirmed value until the session refresh catches up; null follows the user.
+  // just-confirmed value together with the saved pair it was based on: it applies while a
+  // save is in flight, or while the session user still equals that base. Once the session
+  // user moves on (our own refresh, or a change made elsewhere such as the CLI) the
+  // session user wins again.
   const saved: Reserve = {
     pct: user?.weekly_reserve_pct ?? null,
     pause: user?.weekly_reserve_pause_running ?? true,
   };
-  const [local, setLocal] = useState<Reserve | null>(null);
-  const reserve = local ?? saved;
+  const savedRef = useRef(saved);
+  savedRef.current = saved;
+  const [local, setLocal] = useState<{ value: Reserve; base: Reserve } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const reserve =
+    local && (busy || sameReserve(local.base, saved)) ? local.value : saved;
   const on = reserve.pct !== null;
 
   const [draft, setDraft] = useState(() => String(user?.weekly_reserve_pct ?? DEFAULT_RESERVE_PCT));
-  const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [inputError, setInputError] = useState("");
 
+  // Save serialization: `pending` is the latest intent not yet sent; `running` is true
+  // while the drain loop below owns the endpoint.
+  const pending = useRef<Reserve | null>(null);
+  const running = useRef(false);
+  const editing = useRef(false);
+  // The pair every new change builds on: the newest intent, else what is shown.
+  const current = (): Reserve => pending.current ?? reserve;
+
+  // Re-seed the field from the effective pct unless the user is typing in it.
+  useEffect(() => {
+    if (reserve.pct !== null && !editing.current) setDraft(String(reserve.pct));
+  }, [reserve.pct]);
+
   const save = async (next: Reserve) => {
-    const previous = reserve;
+    const previous = current();
     setSaveError("");
-    setLocal(next);
+    pending.current = next;
+    setLocal({ value: next, base: savedRef.current });
+    if (running.current) return;
+    running.current = true;
     setBusy(true);
+    let confirmed = previous;
     try {
-      const { user: updated } = await api.setUsageReserve(next.pct, next.pause);
-      // Adopt what the server stored; an older response without the fields keeps ours.
-      setLocal({
-        pct: updated.weekly_reserve_pct === undefined ? next.pct : updated.weekly_reserve_pct,
-        pause: updated.weekly_reserve_pause_running ?? next.pause,
-      });
+      while (pending.current) {
+        const sending = pending.current;
+        pending.current = null;
+        const { user: updated } = await api.setUsageReserve(sending.pct, sending.pause);
+        // Adopt what the server stored; an older response without the fields keeps ours.
+        confirmed = {
+          pct: updated.weekly_reserve_pct === undefined ? sending.pct : updated.weekly_reserve_pct,
+          pause: updated.weekly_reserve_pause_running ?? sending.pause,
+        };
+        if (!pending.current) setLocal({ value: confirmed, base: savedRef.current });
+      }
       await refresh();
     } catch (err) {
-      setLocal(previous);
-      if (previous.pct !== null) setDraft(String(previous.pct));
+      // The failed write and anything queued behind it are dropped; roll back to the
+      // last pair the server confirmed.
+      pending.current = null;
+      setLocal({ value: confirmed, base: savedRef.current });
+      if (confirmed.pct !== null) setDraft(String(confirmed.pct));
       setSaveError(errorMessage(err, "Failed to update the weekly usage reserve"));
     } finally {
+      running.current = false;
       setBusy(false);
     }
   };
@@ -84,16 +123,17 @@ export function UsageReserveSetting() {
   const toggleReserve = (enable: boolean) => {
     setInputError("");
     if (!enable) {
-      void save({ pct: null, pause: reserve.pause });
+      void save({ pct: null, pause: current().pause });
       return;
     }
     const pct = parseReservePct(draft) ?? DEFAULT_RESERVE_PCT;
     setDraft(String(pct));
-    void save({ pct, pause: reserve.pause });
+    void save({ pct, pause: current().pause });
   };
 
   const commitDraft = () => {
-    if (!on) return;
+    editing.current = false;
+    if (current().pct === null) return;
     const pct = parseReservePct(draft);
     if (pct === null) {
       setInputError(RANGE_MESSAGE);
@@ -101,15 +141,15 @@ export function UsageReserveSetting() {
     }
     setInputError("");
     setDraft(String(pct));
-    if (pct !== reserve.pct) void save({ pct, pause: reserve.pause });
+    if (pct !== current().pct) void save({ pct, pause: current().pause });
   };
 
   const onPctKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") {
       e.preventDefault();
       commitDraft();
-    } else if (e.key === "Escape" && reserve.pct !== null) {
-      setDraft(String(reserve.pct));
+    } else if (e.key === "Escape" && current().pct !== null) {
+      setDraft(String(current().pct));
       setInputError("");
     }
   };
@@ -135,8 +175,6 @@ export function UsageReserveSetting() {
         <Toggle
           checked={on}
           onChange={toggleReserve}
-          disabled={busy}
-          focusableWhenDisabled
           label={SWITCH_LABEL}
           aria-describedby={helpId}
         />
@@ -161,9 +199,13 @@ export function UsageReserveSetting() {
                 step={1}
                 className="w-20 tabular-nums"
                 value={draft}
+                aria-label="Stop starting runs when your 7-day usage reaches, in percent"
                 aria-invalid={inputError !== "" || undefined}
                 aria-describedby={inputError ? pctErrorId : undefined}
                 onChange={(e) => setDraft(e.target.value)}
+                onFocus={() => {
+                  editing.current = true;
+                }}
                 onBlur={commitDraft}
                 onKeyDown={onPctKeyDown}
               />
@@ -203,9 +245,8 @@ export function UsageReserveSetting() {
               type="checkbox"
               className="h-4 w-4 accent-brand"
               checked={reserve.pause}
-              disabled={busy}
               aria-describedby={pauseHelpId}
-              onChange={(e) => void save({ pct: reserve.pct, pause: e.target.checked })}
+              onChange={(e) => void save({ pct: current().pct, pause: e.target.checked })}
             />
             <span className="text-fg">Also pause running runs after their current milestone</span>
           </label>
@@ -214,9 +255,9 @@ export function UsageReserveSetting() {
             itself once a fresh reading is below the threshold, or straight away when you resume it.
           </p>
           <p className="text-xs text-faint">
-            Best effort: uzi acts on the latest usage reading, so a run can go a little past the
-            threshold while it finishes its milestone. With no fresh reading, new work is held
-            rather than started.
+            Best effort: uzi acts on the latest usage reading, so usage can pass the threshold, and
+            by how much is not bounded (readings lag, and a run finishes its milestone first).
+            With no fresh reading, new work is held rather than started.
           </p>
         </div>
       )}

@@ -1886,7 +1886,7 @@ describe("checker defaults follow committed worker settings", () => {
   });
 });
 
-// PRD #3522 M2: the weekly usage reserve. One endpoint owns the pair (threshold, pause), so
+// PRD #3522 M1: the weekly usage reserve. One endpoint owns the pair (threshold, pause), so
 // every control sends both; writes are optimistic and roll back on failure.
 describe("Run defaults — weekly usage reserve (PRD #3522)", () => {
   const reserveSwitch = () => screen.getByRole("switch", { name: "Keep a weekly usage reserve" });
@@ -2010,5 +2010,126 @@ describe("Run defaults — weekly usage reserve (PRD #3522)", () => {
     ) as HTMLInputElement;
     expect(limit.disabled).toBe(false);
     expect(mockApi.setWaitOnLimit).not.toHaveBeenCalled();
+  });
+
+  it("gives the threshold input an accessible name that includes the unit", () => {
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    expect(screen.getByRole("spinbutton", { name: /percent/ })).toBe(pctInput());
+  });
+
+  it("Escape reverts an uncommitted edit and sends nothing", () => {
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    fireEvent.change(pctInput(), { target: { value: "55" } });
+    expect(pctInput().value).toBe("55");
+    fireEvent.keyDown(pctInput(), { key: "Escape" });
+    expect(pctInput().value).toBe("70");
+    expect(mockApi.setUsageReserve).not.toHaveBeenCalled();
+  });
+
+  // Deferred writes let a test act while a save is in flight.
+  const deferred = () => {
+    const calls: Array<{ pct: number | null; pause: boolean; done: () => void }> = [];
+    mockApi.setUsageReserve.mockImplementation(
+      (pct, pause) =>
+        new Promise((resolve) => {
+          calls.push({
+            pct,
+            pause,
+            done: () =>
+              resolve({ user: { ...baseUser, weekly_reserve_pct: pct, weekly_reserve_pause_running: pause } }),
+          });
+        }),
+    );
+    return calls;
+  };
+
+  it("a switch click right after a threshold blur-commit is not dropped", async () => {
+    const calls = deferred();
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    fireEvent.change(pctInput(), { target: { value: "60" } });
+    fireEvent.blur(pctInput());
+    fireEvent.click(reserveSwitch());
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]).toMatchObject({ pct: 60, pause: true });
+    calls[0].done();
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1]).toMatchObject({ pct: null, pause: true });
+    calls[1].done();
+    await waitFor(() => expect(reserveSwitch().getAttribute("aria-checked")).toBe("false"));
+  });
+
+  it("a pause click right after a threshold blur-commit keeps both changes", async () => {
+    const calls = deferred();
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    fireEvent.change(pctInput(), { target: { value: "60" } });
+    fireEvent.blur(pctInput());
+    fireEvent.click(pauseBox());
+    await waitFor(() => expect(calls).toHaveLength(1));
+    calls[0].done();
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1]).toMatchObject({ pct: 60, pause: false });
+    calls[1].done();
+    await waitFor(() => expect(mockApi.setUsageReserve).toHaveBeenCalledTimes(2));
+  });
+
+  it("overlapping saves are sent one at a time and end with the last intent", async () => {
+    const calls = deferred();
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    renderPage();
+    fireEvent.change(pctInput(), { target: { value: "60" } });
+    fireEvent.blur(pctInput());
+    fireEvent.change(pctInput(), { target: { value: "50" } });
+    fireEvent.blur(pctInput());
+    fireEvent.change(pctInput(), { target: { value: "40" } });
+    fireEvent.blur(pctInput());
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(mockApi.setUsageReserve).toHaveBeenCalledTimes(1);
+    calls[0].done();
+    await waitFor(() => expect(calls).toHaveLength(2));
+    // The 50 intent was superseded by 40 before it was sent.
+    expect(calls[1]).toMatchObject({ pct: 40, pause: true });
+    calls[1].done();
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    expect(pctInput().value).toBe("40");
+  });
+
+  it("follows a session user change made elsewhere, and a bare focus and blur sends nothing", () => {
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    const view = renderPage();
+    expect(pctInput().value).toBe("70");
+    mockAuth({ ...baseUser, weekly_reserve_pct: 50, weekly_reserve_pause_running: true });
+    view.rerender(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    expect(pctInput().value).toBe("50");
+    fireEvent.focus(pctInput());
+    fireEvent.blur(pctInput());
+    expect(mockApi.setUsageReserve).not.toHaveBeenCalled();
+  });
+
+  it("drops its optimistic value once the session user moves on after a save", async () => {
+    echo();
+    mockAuth({ ...baseUser, weekly_reserve_pct: 70, weekly_reserve_pause_running: true });
+    const view = renderPage();
+    fireEvent.change(pctInput(), { target: { value: "60" } });
+    fireEvent.blur(pctInput());
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    // The session catches up, then the CLI changes it again.
+    for (const pct of [60, 50]) {
+      mockAuth({ ...baseUser, weekly_reserve_pct: pct, weekly_reserve_pause_running: true });
+      view.rerender(
+        <MemoryRouter>
+          <RunDefaults />
+        </MemoryRouter>,
+      );
+    }
+    expect(pctInput().value).toBe("50");
+    expect(reserveSwitch().getAttribute("aria-checked")).toBe("true");
   });
 });
