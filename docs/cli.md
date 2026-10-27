@@ -172,6 +172,8 @@ uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
 uzi admin egress-profile list | show <name>
 uzi admin maintenance status [--json]
+uzi settings get
+uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -449,7 +451,13 @@ A few worth knowing:
   turn, judge/mr-rework/ci-fix runs finish on their own, and a run already
   at a gate or an involuntary park is refused too — all as a 409 (exit 5)
   naming the reason. This existing command is also the compatibility path
-  when dependency parking requires an API or worker upgrade.
+  when dependency parking requires an API or worker upgrade. A pending pause
+  that the [weekly usage reserve](./run-pause.md#paused-by-the-weekly-usage-reserve)
+  filed cannot be withdrawn with `--cancel`: that is a 409 (exit 5) pointing
+  at the threshold and `run resume`. While a `PAUSE_REQUESTED` row is
+  pending, a reserve request reads
+  `after M<n> (weekly usage reserve)` (or `after the current step (weekly
+  usage reserve)` with no frozen milestones).
 - **`run resume <id>`** resumes an ordinary pause requested by the owner or
   the run's lead: it moves the run
   from `paused` back to `queued`, keeps the worker pin, and preserves the
@@ -460,7 +468,13 @@ A few worth knowing:
   (exit 5). It posts to the same endpoint as `run resume-now` below, which
   also resumes an ordinary paused run in addition to a pool-held one.
   A `completion_blocked` hold refuses plain resume; use `run decide` or an
-  eligible `run set-token` switch.
+  eligible `run set-token` switch. Resuming a run the
+  [weekly usage reserve](./run-pause.md#paused-by-the-weekly-usage-reserve)
+  paused (`hold_reason: weekly_reserve`) is an explicit override: human output
+  prints `Resumed <id>: queued (overrides the weekly usage reserve until the
+  next weekly reset).` The line appears only when this resume lifted a reserve
+  hold and the server recorded the override (`reserve_exempt_until` in
+  `--json`); an ordinary resume prints `Resumed <id>: queued.`
 - **`run decide <id>`** (PRD #1226/#1227) records the owner's decision on a
   run the [structural completion interlock](./run-completion-hold.md) has
   blocked — either a live completion question or a run already parked in the
@@ -2870,6 +2884,43 @@ your own switch for the model-written [Now summary](./run-activity.md#now-summar
 [kill switch](./admin-settings.md#run-summaries) can still turn it off for the
 instance). `--json` carries it as `now_summary_enabled` (`null` when unset). Change it in
 **Settings → Run defaults → Run summaries**; there is no CLI write verb for it.
+
+### Weekly usage reserve
+
+```sh
+uzi settings reserve --threshold 70
+uzi settings reserve --threshold 90 --pause-running=false
+uzi settings reserve --threshold off
+```
+
+`uzi settings reserve` sets your [weekly usage
+reserve](./rate-limits.md#weekly-usage-reserve): the 7-day utilization percent
+at which uzi stops starting runs on your subscription and, with pausing on,
+pauses running runs at their next milestone. `--threshold` is required: an
+integer from 1 to 100, or `off`; anything else is a usage error (exit 2).
+`--pause-running` / `--pause-running=false` sets whether running runs are also
+paused; when you omit it the command reads your settings first and keeps the
+current value (the default for a fresh account is on). It posts to
+`PUT /api/me/usage-reserve`, which accepts a `uzc_` Bearer token. Human output
+prints the result, for example `Weekly usage reserve: 70% (pause running runs:
+on)` or `Weekly usage reserve: off`; `--json` returns
+`weekly_reserve_pct` (`null` = off) and `weekly_reserve_pause_running`.
+
+`uzi settings get` ends with the same `Weekly usage reserve:` line (after the
+`Now summary:` line), and its `--json` carries both fields.
+
+On a run the reserve touches, `uzi run get` shows:
+
+- a queued run held at admission: a `RESERVE` row with the reason
+  (`weekly usage reserve: 72% >= 70%`, or `weekly usage reserve: weekly usage
+  unknown`) and a `QUEUE_REASON` row reading `weekly_reserve (held by your
+  weekly usage reserve)`; `--json` adds `reserve_hold_reason` and
+  `queue_reason: "weekly_reserve"`;
+- a run the reserve parked: a `HOLD` row with the label `weekly usage reserve`
+  and the next step (`resumes when usage drops below the threshold; override:
+  uzi run resume <id>`);
+- a pending reserve pause: the `PAUSE_REQUESTED` suffix described under
+  `run pause` above.
 
 ### Plan cross-check evidence
 

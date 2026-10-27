@@ -699,6 +699,13 @@ scenarios are mutually exclusive by construction. Known values:
   `maintenance.active`. The switch and reason stay live for the session; the
   readout does not model the drain. Without the scenario, maintenance is off
   and the readout is clear. (PRD #3454.)
+- `weekly-reserve` — every queued run fixture is held by the owner's weekly
+  usage reserve (`queue_reason: "weekly_reserve"` with a reason), so
+  `/runs/run-queued?mock=weekly-reserve` shows the reserve queue label, and
+  every owner-paused fixture reads as parked by the reserve
+  (`hold_reason: "weekly_reserve"`). Resuming one asks for the override
+  confirmation and records `reserve_exempt_until`; cancelling a reserve pause
+  request is refused with a 409. Board cards are not touched. (PRD #3522.)
 
 ### What keeps the mock build current
 

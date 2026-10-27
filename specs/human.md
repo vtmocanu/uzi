@@ -1506,6 +1506,16 @@ Tracked as issue vtmocanu/uzi#2865; PRD at `prds/done/2865-default-branch-ci-rep
 - Dispatched M1 source implements GitHub UTF-8 text inputs for the exact observed execution; unknown/rerun attempt provenance stays logs-only. Caps are 50 files / 16 MiB per run (lowerable) / fixed 4 MiB per file, scrubbed before hashing, with bounded manifest/refusal reporting and unknown counts for uninspected omissions. Missing, expired, unsupported or budget-refused inputs permit logs-only repair. GitLab/Forgejo artifact providers remain deferred M2. (AI-synced 2026-10-17)
 - Repair inputs share sealed job-file quotas and retention (default 168h after repair end); workers get private 0700 directories/0400 files outside clones through read-only mediated tools for both harnesses/resumes, without collection URLs/tokens. File-bearing claims require `ci_artifacts_v1` plus `ci_config_guard_v1`. Existing default-branch, human-merge, no CI-config publication and initial auto-approve-OFF decisions remain in force. Final acceptance is pending as recorded in `prds/2866-ci-artifacts-repair-evidence.md`; source presence is not delivery acceptance. (AI-synced 2026-10-17)
 
+## Feature #3522 — Weekly usage reserve
+
+PRD at `prds/3522-weekly-usage-reserve.md`.
+
+- Each user may set a weekly reserve threshold (off by default, otherwise an integer 1..100) and a pause-running toggle (default on once set), through web settings, `uzi settings reserve` and `PUT /api/me/usage-reserve`. Only the 7-day window counts; the 5-hour window is ignored. [user 2026-10-26] (AI-synced 2026-10-27)
+- While the credential a run would spend reads at or above the threshold, new work stays `queued` with a visible reason (`weekly usage reserve: N% >= T%`, `queue_reason` `weekly_reserve`) for every worker run kind except chat; judge and cross-check are gated on their own credential, and the auto pool skips held tokens. A missing, stale, pre-reset or partial reading reads as unknown and holds new work (so console API keys and a disabled usage poller hold), but never pauses a running run; Codex API-key aliases and OpenAI API keys are never gated. [user 2026-10-26] (AI-synced 2026-10-27)
+- With the toggle on, a running non-interactive issue, task, prompt or self-improve run pauses after its current milestone on a fresh reading at or above the threshold; other kinds are held at admission only and finish. The sweeper releases only reserve-caused pauses (fresh reading below the threshold, threshold cleared, toggle off). An owner or wall pause is never overwritten, and a pending reserve request cannot be cancelled by the owner (409). (AI-synced 2026-10-27)
+- Manual resume of a reserve pause is a recorded override until the next observed 7-day reset (an early reset or, with no reset metadata, a fresh reading below the threshold ends it; capped at seven days). [user 2026-10-26] (AI-synced 2026-10-27)
+- Best effort, not a cap: poll lag, finishing the current milestone, admission-only kinds, exempt chat and checkpoint-failure continuation all allow usage to exceed the threshold, unbounded. After a rollback, reserve-paused runs need a manual resume. (AI-synced 2026-10-27)
+
 ## Deferred (user, "later stuff")
 
 - On-demand worker spawning: on compose the worker simply runs always-on (idle is
