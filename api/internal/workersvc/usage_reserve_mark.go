@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +21,7 @@ type reserveMarkQueries interface {
 	ListReserveWorkers(ctx context.Context, userID uuid.UUID) ([]store.ListReserveWorkersRow, error)
 	SetRunReserveHoldReason(ctx context.Context, arg store.SetRunReserveHoldReasonParams) (int64, error)
 	UserHasAutoEligibleAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
+	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
 }
 
 // markReserveHolds is the sweeper pass that keeps a queued run's persisted weekly-reserve reason
@@ -37,8 +39,8 @@ type reserveMarkQueries interface {
 //
 // A run is marked only when EVERY lane that could claim it is blocked: the lane of the worker its
 // resume affinity pins it to when that pin would hold, else every registered persistent worker's lane
-// plus the lane a fresh ephemeral worker would get (auto when the owner has a pooled token, else
-// default). One owner's failure is logged and skipped, never blocking a sibling owner's pass; the
+// plus, only when the provisioner could actually serve the run (ephemeralServes), the lane a fresh
+// ephemeral worker would get (auto when the owner has a pooled token, else default). One owner's failure is logged and skipped, never blocking a sibling owner's pass; the
 // loop is bounded by the owners with queued runs, one tick at a time.
 func (s *Service) markReserveHolds(ctx context.Context, now time.Time) (int64, error) {
 	q, ok := s.q.(reserveMarkQueries)
@@ -82,10 +84,13 @@ func (s *Service) markReserveHoldsForOwner(ctx context.Context, q reserveMarkQue
 			return 0, err
 		}
 	}
+	ownerEphemeral := s.ownerEphemeralEligible(ctx, q, uid)
 	var changed int64
 	for _, run := range runs {
 		want := ""
-		if d := s.reserveRunDecision(run, snap, workers, hasPool, now); d.held {
+		// A profile-bound run needs no per-user opt-in (ListIsolatedQueuedRunsForEphemeral).
+		ephemeral := ownerEphemeral || run.EgressProfileID.Valid
+		if d := s.reserveRunDecision(run, snap, workers, hasPool, ephemeral, now); d.held {
 			want = d.reason
 		}
 		cur := ""
@@ -96,7 +101,7 @@ func (s *Service) markReserveHoldsForOwner(ctx context.Context, q reserveMarkQue
 			continue
 		}
 		n, werr := q.SetRunReserveHoldReason(ctx, store.SetRunReserveHoldReasonParams{
-			ID: run.ID, Reason: pgconv.TextOrNull(want),
+			ID: run.ID, Reason: pgconv.TextOrNull(want), Expected: run.ReserveHoldReason,
 		})
 		if werr != nil {
 			return changed, werr
@@ -112,11 +117,11 @@ func (s *Service) markReserveHoldsForOwner(ctx context.Context, q reserveMarkQue
 // reserveRunDecision decides whether the reserve holds one queued run across every lane that could
 // claim it. The reason of the first lane's decision is shown (the lanes agree on a run whose
 // credential is not chosen by the worker, and differ only by which blocked token they name otherwise).
-func (s *Service) reserveRunDecision(run store.Run, snap *reserveSnap, workers []store.ListReserveWorkersRow, hasPool bool, now time.Time) reserveDecision {
+func (s *Service) reserveRunDecision(run store.Run, snap *reserveSnap, workers []store.ListReserveWorkersRow, hasPool, ephemeral bool, now time.Time) reserveDecision {
 	if !reserveEnforced(run, snap, now) {
 		return reserveDecision{}
 	}
-	lanes := s.reserveCandidateLanes(run, workers, hasPool, now)
+	lanes := s.reserveCandidateLanes(run, workers, hasPool, ephemeral, now)
 	var first reserveDecision
 	for i, lane := range lanes {
 		d := reserveHeld(run, snap, lane, now)
@@ -136,7 +141,7 @@ func (s *Service) reserveRunDecision(run store.Run, snap *reserveSnap, workers [
 // affinity ceiling; ClaimRun's pin arm) is claimable only on that worker's lane. Otherwise any of the
 // owner's persistent workers, a worker already bound to this very run, or a freshly provisioned
 // ephemeral worker may claim it.
-func (s *Service) reserveCandidateLanes(run store.Run, workers []store.ListReserveWorkersRow, hasPool bool, now time.Time) []reserveLane {
+func (s *Service) reserveCandidateLanes(run store.Run, workers []store.ListReserveWorkersRow, hasPool, ephemeral bool, now time.Time) []reserveLane {
 	laneOf := func(w store.ListReserveWorkersRow) reserveLane {
 		l := reserveLane{mode: w.AnthropicBindMode}
 		if w.AnthropicBindMode == BindModePinned && w.AnthropicSecretID.Valid {
@@ -155,7 +160,8 @@ func (s *Service) reserveCandidateLanes(run store.Run, workers []store.ListReser
 			staleRequeuePin := s.p.WorkerStaleRequeueGrace > 0 && run.StaleRequeueGeneration.Valid &&
 				run.StaleRequeueGeneration.Int64 == run.ClaimGeneration && run.StatusSince.Valid &&
 				run.StatusSince.Time.After(now.Add(-s.p.WorkerStaleRequeueGrace))
-			if ceilingOK && (w.DrainingSince.Valid || w.MaintenanceFenced || heartbeatFresh || staleRequeuePin) {
+			maintenance := slices.Contains([]string{"requested", "ready", "stopping", "recycling"}, w.MaintenancePhase)
+			if ceilingOK && (w.DrainingSince.Valid || maintenance || w.MaintenanceFenced || heartbeatFresh || staleRequeuePin) {
 				return []reserveLane{laneOf(w)}
 			}
 		}
@@ -167,5 +173,33 @@ func (s *Service) reserveCandidateLanes(run store.Run, workers []store.ListReser
 		}
 		lanes = append(lanes, laneOf(w))
 	}
+	if !ephemeral {
+		return lanes
+	}
 	return append(lanes, laneEphemeral(hasPool))
+}
+
+// ownerEphemeralEligible reports whether the ephemeral provisioner could serve this owner's
+// queued runs at all: the instance kill-switch (EphemeralSettingsReader, the same read
+// hostedsvc.ProvisionPass makes) is on AND the owner opted in (users.ephemeral_workers_enabled,
+// the demand queries' join). A reader that is not wired or a failed read cannot tell, so it counts
+// the ephemeral lane (never marks a run on a guess: a marked run is dropped from ephemeral demand).
+func (s *Service) ownerEphemeralEligible(ctx context.Context, q reserveMarkQueries, uid uuid.UUID) bool {
+	if s.ephemeralSettings == nil {
+		return true
+	}
+	on, err := s.ephemeralSettings.EphemeralWorkersEnabled(ctx)
+	if err != nil {
+		slog.Warn("sweeper: weekly reserve marker could not read the ephemeral kill-switch", "error", err)
+		return true
+	}
+	if !on {
+		return false
+	}
+	u, err := q.GetUserByID(ctx, uid)
+	if err != nil {
+		slog.Warn("sweeper: weekly reserve marker could not read the ephemeral opt-in", "user_id", uid.String(), "error", err)
+		return true
+	}
+	return u.EphemeralWorkersEnabled
 }

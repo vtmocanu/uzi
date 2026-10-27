@@ -32,7 +32,10 @@ import (
 // ClaimRun's reserve clause (store/queries/runtime.sql, PRD #3522 M3) mirrors reserveEnforced and
 // reserveHeld in SQL from the same snapshot, so a held run is never claimed; assembly re-applies the
 // same rules through the reserveGate carried in the context, so the credential a claim finally
-// spends is also checked (a pick that fell back, a reading that moved after admission).
+// spends is also checked. Assembly reuses the claim's snapshot (claimLane carries it in the context),
+// so it does NOT see a reading that moved after admission: an assembly-time hold arises only from a
+// Go/SQL divergence or from the open-failure floor (a permitted token that fails to open, whose
+// retry would otherwise floor onto a blocked one).
 
 // errReserveHeld marks a claim whose resolved credential the owner's weekly usage reserve blocks.
 // It is TRANSIENT, like errVaultLocked: finishRunClaim requeues the run (claimed -> queued, started_at
@@ -141,7 +144,10 @@ func buildReserveSnapshot(ctx context.Context, q reserveQueries, userID uuid.UUI
 			r.SyncedAt = &v
 		}
 		snap.claude[t.UserSecretID] = usagereserve.EvaluateClaude(snap.threshold, r, iv.claude, now)
-		if t.AutoEligible {
+		// A probe-rejected token is never picked by the auto lane (autoselect.Floor skips it), so it is
+		// not part of the pool the reserve reasons about: counting it as permitted would admit a run
+		// the picker then cannot place on any permitted token.
+		if t.AutoEligible && !t.Rejected {
 			snap.pooled = append(snap.pooled, t.UserSecretID)
 		}
 		if t.IsDefault {

@@ -5841,8 +5841,10 @@ UPDATE runs SET
     budget_paused_seconds = CASE WHEN @pool_wait::boolean THEN 0 ELSE runs.budget_paused_seconds END,
     health = 'ok', health_reason = NULL, health_since = NULL,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
-    -- PRD #3522 M3: a claim that resolved onto a credential the weekly reserve blocks (the reading
-    -- changed after admission) persists the visible reason here; only set when supplied, and the
+    -- PRD #3522 M3: a claim that resolved onto a credential the weekly reserve blocks at assembly
+    -- (assembly reuses the claim's own snapshot, so this arises from a Go/SQL divergence or the
+    -- open-failure floor, not from a reading that moved after admission) persists the visible
+    -- reason here; only set when supplied, and the
     -- sweeper's markReserveHolds pass keeps it current afterwards. No other counter or stamp moves.
     reserve_hold_reason = COALESCE(sqlc.narg('reserve_hold_reason')::text, runs.reserve_hold_reason),
     updated_at = now()

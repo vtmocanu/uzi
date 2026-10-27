@@ -255,7 +255,7 @@ func (fx *reserveFix) goHeld(runID uuid.UUID) reserveDecision {
 // ClaimRun's reserve clause each reddens at least one row below.
 func TestReserveClaimGateParityMatrixLiveDB(t *testing.T) {
 	fx := newReserveFix(t, 70, true)
-	fx.token("default", true, false, 72)           // owner default, held
+	defTok := fx.token("default", true, false, 72) // owner default, held
 	poolOK := fx.token("pool-ok", false, true, 10) // pooled, below
 	poolHi := fx.token("pool-hi", false, true, 90) // pooled, held
 	pinOK := fx.token("pin-ok", false, false, 5)   // non-pooled, below
@@ -314,6 +314,25 @@ func TestReserveClaimGateParityMatrixLiveDB(t *testing.T) {
 		{"started run, toggle on", worker(BindModeDefault, nil), reserveRun{firstStarted: true}, true},
 		{"active manual-resume override", worker(BindModeDefault, nil), reserveRun{exemptFor: time.Hour}, false},
 		{"expired manual-resume override", worker(BindModeDefault, nil), reserveRun{exemptFor: -time.Hour}, true},
+		// These rows mutate the shared tokens; they stay last, in order.
+		{"worker auto: a probe-rejected pooled token with a fresh ok reading is not permitted, the rest are blocked",
+			func() {
+				worker(BindModeAuto, nil)()
+				fx.env.exec(`UPDATE user_secrets SET anthropic_rejected_at = now() WHERE id = $1`, poolOK)
+			}, reserveRun{}, true},
+		{"judge auto, every pooled token blocked (default ok): held, no default fallback",
+			func() {
+				judge(BindModeAuto, nil)()
+				fx.env.exec(`UPDATE user_secrets SET anthropic_rejected_at = NULL WHERE id = $1`, poolOK)
+				fx.reading(poolOK, 90, 10, "1 minute")
+				fx.reading(defTok, 10, 10, "1 minute")
+			}, reserveRun{kind: runkind.Judge}, true},
+		{"judge auto, empty pool falls back to a blocked owner default: held",
+			func() {
+				judge(BindModeAuto, nil)()
+				fx.env.exec(`UPDATE user_secrets SET auto_eligible = false WHERE user_id = $1`, fx.userID)
+				fx.reading(defTok, 72, 10, "1 minute")
+			}, reserveRun{kind: runkind.Judge}, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -526,11 +545,13 @@ func TestReserveAutoPoolSkipsToBelowThresholdTokenLiveDB(t *testing.T) {
 	}
 }
 
-// TestReserveForcedRaceRequeuesWithReasonLiveDB: the reading crosses the threshold AFTER ClaimRun
-// admitted the run (a fresh assembly sees the new reading). Assembly returns errReserveHeld and the
-// claim settles claimed -> queued with the reason persisted, and touches no limit-park, requeue or
-// wall accounting.
-func TestReserveForcedRaceRequeuesWithReasonLiveDB(t *testing.T) {
+// TestReserveAssemblyHoldRequeuesWithReasonLiveDB pins the requeue/counter mechanics of an
+// assembly-time hold, not a production race: assembleAndFinishRunClaim is called with a bare
+// context, so it reads a FRESH snapshot that sees the moved reading (a real claim reuses the
+// admission snapshot, so an assembly hold there arises only from a Go/SQL divergence or the
+// open-failure floor). Assembly returns errReserveHeld and the claim settles claimed -> queued with
+// the reason persisted, and touches no limit-park, requeue or wall accounting.
+func TestReserveAssemblyHoldRequeuesWithReasonLiveDB(t *testing.T) {
 	fx := newReserveFix(t, 70, true)
 	tok := fx.token("only", true, false, 10)
 	fx.bindWorker(BindModeDefault, nil)
@@ -638,7 +659,8 @@ func TestReserveJudgeGatedLiveDB(t *testing.T) {
 }
 
 // TestReserveCodexAliasGatedLiveDB: a Codex run is held on its alias and claims nothing (no capability
-// is minted) while held; a held assembly returns before the mint.
+// is minted) while held; a held assembly (driven here with a fresh snapshot read, see
+// TestReserveAssemblyHoldRequeuesWithReasonLiveDB) returns before the mint.
 func TestReserveCodexAliasGatedLiveDB(t *testing.T) {
 	fx := newReserveFix(t, 70, true)
 	fx.token("default", true, false, 10)
@@ -647,8 +669,9 @@ func TestReserveCodexAliasGatedLiveDB(t *testing.T) {
 	if p := fx.claim(); p != nil {
 		t.Fatal("a Codex run on an alias above the threshold was claimed")
 	}
-	// Race: admitted at a low reading, the account reading crosses before assembly. No capability
-	// may have been minted by the time the claim is requeued.
+	// Requeue mechanics with a fresh snapshot read at assembly (bare ctx, not a production race):
+	// admitted at a low reading, the assembly then sees a crossed reading. No capability may have
+	// been minted by the time the claim is requeued.
 	fx.codexReading(alias, weeklyBuckets(codexWindow(fiveHourSecs, 5), codexWindow(weekSecs, 10)), "1 minute")
 	w := wkrRow(t, fx.env, fx.workerID)
 	run, err := fx.env.q.ClaimRun(fx.env.ctx, fx.claimParams(fx.workerID))

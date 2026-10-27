@@ -2,13 +2,13 @@ package workersvc
 
 import (
 	"context"
-	"github.com/vtmocanu/uzi/api/internal/capability"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/usagereserve"
@@ -53,8 +53,12 @@ func TestReserveMarkerWritesAndClearsOnChangeLiveDB(t *testing.T) {
 	id := fx.queueRun(reserveRun{})
 	other := fx.queueRun(reserveRun{kind: runkind.Judge}) // also on the blocked default
 
+	updatedBefore := mustRun(t, fx.env, id).UpdatedAt
 	if n := fx.mark(); n != 2 {
 		t.Fatalf("first pass changed %d runs, want 2", n)
+	}
+	if !mustRun(t, fx.env, id).UpdatedAt.Time.Equal(updatedBefore.Time) {
+		t.Fatal("a WRITING marker pass bumped updated_at, which feeds the affinity ceiling and spread grace")
 	}
 	for _, rid := range []uuid.UUID{id, other} {
 		if got, ok := fx.reasonOf(rid); !ok || got != usagereserve.HeldReason(72, 70) {
@@ -90,6 +94,9 @@ func TestReserveMarkerWritesAndClearsOnChangeLiveDB(t *testing.T) {
 	}
 	if _, ok := fx.reasonOf(id); ok {
 		t.Fatal("marker survived a below-threshold reading")
+	}
+	if !mustRun(t, fx.env, id).UpdatedAt.Time.Equal(updatedBefore.Time) {
+		t.Fatal("a CLEARING marker pass bumped updated_at")
 	}
 
 	// Clearing the threshold drops markers even when the reading is stale (a poller outage).
@@ -329,8 +336,9 @@ func TestReserveHealthRowCarriesMarkerLiveDB(t *testing.T) {
 
 // TestReserveClaudeCheckerHeldStaysQueuedLiveDB: a Claude cross_check checker is gated on its OWN
 // (opposite-harness) credential. While held it stays queued and its check stays pending (it
-// settles through its deadline like any unclaimed check); a hold discovered at assembly requeues it
-// instead of failing it checker_unavailable.
+// settles through its deadline like any unclaimed check, driven below through the existing expiry
+// path); an assembly-time hold (driven with a fresh snapshot read, not a production race) requeues
+// it instead of failing it checker_unavailable.
 func TestReserveClaudeCheckerHeldStaysQueuedLiveDB(t *testing.T) {
 	fx := newClaudeCheckerFix(t, BindModePinned)
 	fx.env.exec(`UPDATE users SET weekly_reserve_pct = 70, weekly_reserve_pause_running = true WHERE id = $1`, fx.userID)
@@ -355,7 +363,8 @@ func TestReserveClaudeCheckerHeldStaysQueuedLiveDB(t *testing.T) {
 		t.Fatalf("check verdict = %q (%v), want pending: a held checker waits for its deadline, it is not decided", verdict, err)
 	}
 
-	// A hold found at assembly (the reading crossed after admission) requeues, never decides the check.
+	// Requeue mechanics of a hold found at assembly, driven with a fresh snapshot read (bare ctx):
+	// it requeues, never decides the check.
 	reading(10)
 	w := wkrRow(t, fx.env, fx.workerID)
 	run, err := fx.env.q.ClaimRun(fx.env.ctx, claimRunParamsForChecker(w))
@@ -376,9 +385,123 @@ func TestReserveClaudeCheckerHeldStaysQueuedLiveDB(t *testing.T) {
 
 	// Below the threshold the same checker is admitted.
 	reading(10)
-	if p := fx.claim(t); p == nil && mustRun(t, fx.env, fx.kid).Status == "queued" {
-		t.Fatal("the checker was not claimed below the threshold")
+	p := fx.claim(t)
+	child = mustRun(t, fx.env, fx.kid)
+	if p == nil || p.Secrets.AnthropicOAuthToken == "" || child.Status != "claimed" || child.ReserveHoldReason.Valid {
+		t.Fatalf("below the threshold the checker must be claimed with its credential and a cleared marker: payload=%v status=%s marker=%v",
+			p != nil, child.Status, child.ReserveHoldReason)
 	}
+}
+
+// TestReserveClaudeCheckerHeldExpiresThroughDeadlineLiveDB: a marked, held Claude checker never
+// decides its check by itself; when the check's deadline passes the existing expiry path
+// (PlanCrossCheckStatus) settles it failed/timed_out and cancels the still-queued child.
+func TestReserveClaudeCheckerHeldExpiresThroughDeadlineLiveDB(t *testing.T) {
+	fx := newClaudeCheckerFix(t, BindModePinned)
+	fx.env.exec(`UPDATE users SET weekly_reserve_pct = 70, weekly_reserve_pause_running = true WHERE id = $1`, fx.userID)
+	fx.svc.p.UsagePollInterval = 5 * time.Minute
+	fx.svc.ephemeralSettings = fakeEphemeralSettings{on: false} // no burst lane: the pinned worker is the only lane
+	// The lead's own worker row is a registered lane too: pin it to the same blocked credential.
+	fx.env.exec(`UPDATE workers SET anthropic_bind_mode = 'pinned', anthropic_secret_id = $2 WHERE user_id = $1`, fx.userID, fx.tok)
+	fx.env.exec(`INSERT INTO anthropic_rate_limits (user_secret_id, user_id, five_hour_pct, five_hour_resets_at,
+	                 seven_day_pct, seven_day_resets_at, source, synced_at)
+	             VALUES ($1, $2, 10, now() + interval '1 hour', 85, now() + interval '48 hours', 'usage_endpoint', now() - interval '1 minute')`,
+		fx.tok, fx.userID)
+	if p := fx.claim(t); p != nil {
+		t.Fatal("a checker on a credential above the threshold was claimed")
+	}
+	if _, err := fx.svc.markReserveHolds(fx.env.ctx, time.Now()); err != nil {
+		t.Fatalf("markReserveHolds: %v", err)
+	}
+	if child := mustRun(t, fx.env, fx.kid); child.Status != "queued" || child.ReserveHoldReason.String != usagereserve.HeldReason(85, 70) {
+		t.Fatalf("held checker: status=%s marker=%q, want queued with the reserve reason", child.Status, child.ReserveHoldReason.String)
+	}
+
+	fx.env.exec(`UPDATE cross_checks SET deadline_at = now() - interval '1 second' WHERE lead_run_id = $1`, fx.lead)
+	leadWorker := mustRun(t, fx.env, fx.lead).WorkerID.Bytes
+	cc, _, err := fx.svc.PlanCrossCheckStatus(fx.env.ctx, store.Worker{ID: leadWorker, UserID: fx.userID}, fx.lead, 1, 1)
+	if err != nil || cc.Verdict != "failed" || cc.ReasonClass.String != "timed_out" {
+		t.Fatalf("expiry: verdict=%s reason=%s err=%v, want failed/timed_out", cc.Verdict, cc.ReasonClass.String, err)
+	}
+	if child := mustRun(t, fx.env, fx.kid); child.Status != "cancelled" {
+		t.Fatalf("expired held checker status = %s, want cancelled", child.Status)
+	}
+}
+
+// TestReserveQueueReasonBoardJobAndMaintenanceReadsLiveDB: a marked queued run reads queue_reason
+// weekly_reserve on a board read (ListLatestRunsForRepo) and a job read (GetJobForCaller), and a
+// marked requeued run is listed by ListMaintenanceHeldRuns as progressing (it is admitted during the
+// intake pause, not an owner-needed hold).
+func TestReserveQueueReasonBoardJobAndMaintenanceReadsLiveDB(t *testing.T) {
+	fx := newReserveFix(t, 70, true)
+	fx.token("only", true, false, 90)
+	fx.bindWorker(BindModeDefault, nil)
+	fx.env.exec(`UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, fx.workerID, []string{capability.JobRunnerV1})
+	issue := fx.queueRun(reserveRun{})
+	job := uuid.New()
+	fx.env.exec(`INSERT INTO runs (id, user_id, kind, job_type, issue_title, issue_description, status, budget_wall_seconds)
+	             VALUES ($1, $2, 'job', 'research', 't', 'd', 'queued', 600)`, job, fx.userID)
+	fx.env.exec(`INSERT INTO job_origins (run_id) VALUES ($1)`, job)
+	requeued := fx.queueRun(reserveRun{})
+	fx.env.exec(`UPDATE runs SET claim_generation = 1 WHERE id = $1`, requeued)
+	fx.mark()
+
+	board, err := fx.env.q.ListLatestRunsForRepo(fx.env.ctx, fx.repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := false
+	for _, r := range board {
+		if r.ID == issue {
+			seen = true
+			if r.QueueReason != "weekly_reserve" {
+				t.Fatalf("board queue_reason = %q, want weekly_reserve", r.QueueReason)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("the marked issue run is missing from the board read")
+	}
+	j, err := fx.env.q.GetJobForCaller(fx.env.ctx, store.GetJobForCallerParams{RunID: job, UserID: fx.userID})
+	if err != nil || j.QueueReason != "weekly_reserve" {
+		t.Fatalf("job queue_reason = %q (%v), want weekly_reserve", j.QueueReason, err)
+	}
+
+	tx, err := fx.env.pool.Begin(fx.env.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.SetInstanceIntakePause(fx.env.ctx, store.New(tx), true, "m3 test", pgtype.UUID{}, "test"); err != nil {
+		_ = tx.Rollback(fx.env.ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(fx.env.ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		tx, err := fx.env.pool.Begin(context.Background())
+		if err != nil {
+			return
+		}
+		if _, _, err := store.SetInstanceIntakePause(context.Background(), store.New(tx), false, "m3 test", pgtype.UUID{}, "test"); err != nil {
+			_ = tx.Rollback(context.Background())
+			return
+		}
+		_ = tx.Commit(context.Background())
+	})
+	held, err := fx.env.q.ListMaintenanceHeldRuns(fx.env.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range held {
+		if h.RunID == requeued {
+			if h.Tag != "progressing" {
+				t.Fatalf("reserve-marked requeued run tag = %q, want progressing", h.Tag)
+			}
+			return
+		}
+	}
+	t.Fatal("the marked requeued run is not listed by ListMaintenanceHeldRuns")
 }
 
 // claimRunParamsForChecker is ClaimRun's parameter set for a legacy checker child claimed on the run
@@ -394,8 +517,9 @@ func claimRunParamsForChecker(w store.Worker) store.ClaimRunParams {
 }
 
 // TestReserveJobGatedLiveDB: a job (repo-less, never parks) resolves its credential through
-// claimSecretID like a run, so the reserve gates it at admission and, when the reading moves after
-// admission, requeues it (queued, with the reason) rather than failing it or pool-waiting it.
+// claimSecretID like a run, so the reserve gates it at admission and, when assembly's fresh snapshot
+// read sees a moved reading (bare ctx: the requeue mechanics, not a production race), requeues it
+// (queued, with the reason) rather than failing it or pool-waiting it.
 func TestReserveJobGatedLiveDB(t *testing.T) {
 	fx := newReserveFix(t, 70, true)
 	tok := fx.token("only", true, false, 90)
@@ -424,5 +548,99 @@ func TestReserveJobGatedLiveDB(t *testing.T) {
 	r := mustRun(t, fx.env, id)
 	if r.Status != "queued" || r.FailOrigin.Valid || r.ReserveHoldReason.String != usagereserve.HeldReason(92, 70) {
 		t.Fatalf("status=%s origin=%v reason=%q, want a requeued job with the reserve reason", r.Status, r.FailOrigin, r.ReserveHoldReason.String)
+	}
+}
+
+// TestReserveMarkerEphemeralLaneNeedsProvisionerLiveDB: the burst lane counts toward "every lane
+// blocked" only when the provisioner could actually serve the run (instance kill-switch on AND the
+// owner opted in). One worker pinned to a blocked token plus an unblocked owner default is held by
+// ClaimRun when no burst worker can ever be provisioned, so the run must carry the marker.
+func TestReserveMarkerEphemeralLaneNeedsProvisionerLiveDB(t *testing.T) {
+	fx := newReserveFix(t, 70, true)
+	hi := fx.token("pin-hi", false, false, 90)
+	fx.token("default", true, false, 10) // unblocked: the ephemeral `default` lane could serve the run
+	fx.bindWorker(BindModePinned, &hi)
+	id := fx.queueRun(reserveRun{})
+
+	fx.svc.ephemeralSettings = fakeEphemeralSettings{on: false}
+	fx.mark()
+	if got, ok := fx.reasonOf(id); !ok || got != usagereserve.HeldReason(90, 70) {
+		t.Fatalf("kill-switch off: reason = (%q, %v), want %q (ClaimRun holds the run, nothing can serve it)", got, ok, usagereserve.HeldReason(90, 70))
+	}
+	if p := fx.claim(); p != nil {
+		t.Fatal("control: ClaimRun must hold this run")
+	}
+
+	// Kill-switch on but the owner has not opted in: still no burst worker for them.
+	fx.svc.ephemeralSettings = fakeEphemeralSettings{on: true}
+	fx.mark()
+	if _, ok := fx.reasonOf(id); !ok {
+		t.Fatal("kill-switch on, owner not opted in: the marker must stay")
+	}
+
+	// Opted in: a fresh ephemeral worker (default lane, unblocked) can serve it, so no marker.
+	fx.env.exec(`UPDATE users SET ephemeral_workers_enabled = true WHERE id = $1`, fx.userID)
+	fx.mark()
+	if _, ok := fx.reasonOf(id); ok {
+		t.Fatal("kill-switch on and owner opted in: the ephemeral lane can serve the run, so it must not be marked")
+	}
+}
+
+// TestReserveMarkerMaintenanceAffinityPinLiveDB: ClaimRun's affinity pin holds a run for a worker
+// whose maintenance_phase is requested/ready/stopping/recycling even with a stale heartbeat; the
+// marker must follow that pin (only the pinned, blocked worker may claim the run).
+func TestReserveMarkerMaintenanceAffinityPinLiveDB(t *testing.T) {
+	fx := newReserveFix(t, 70, true)
+	fx.token("default", true, false, 85) // blocked
+	okTok := fx.token("ok", false, false, 5)
+	fx.bindWorker(BindModeDefault, nil) // the pinned worker: blocked default
+	fx.extraWorker(BindModePinned, &okTok)
+	fx.svc.ephemeralSettings = fakeEphemeralSettings{on: false}
+	fx.svc.p.WorkerHeartbeatStale = time.Minute
+	fx.svc.p.WorkerAffinityCeiling = 2 * time.Hour
+	fx.env.exec(`UPDATE workers SET last_heartbeat_at = now() - interval '1 hour' WHERE id = $1`, fx.workerID)
+	id := fx.queueRun(reserveRun{workerPin: &fx.workerID})
+
+	fx.mark()
+	if _, ok := fx.reasonOf(id); ok {
+		t.Fatal("control: a stale-heartbeat owner outside maintenance releases the pin, so the ok worker may claim")
+	}
+	fx.env.exec(`UPDATE workers SET maintenance_phase = 'requested' WHERE id = $1`, fx.workerID)
+	fx.mark()
+	if _, ok := fx.reasonOf(id); !ok {
+		t.Fatal("a worker in a maintenance phase keeps the pin (ClaimRun's affinity arm): the run is claimable only on its blocked lane and must be marked")
+	}
+}
+
+// TestReserveMarkerWriteIsGuardedOnTheReadValueLiveDB: SetRunReserveHoldReason writes only while the
+// stored marker still equals the value the pass read, so a claim-requeue that wrote its own reason
+// between the sweeper's read and write is not clobbered.
+func TestReserveMarkerWriteIsGuardedOnTheReadValueLiveDB(t *testing.T) {
+	fx := newReserveFix(t, 70, true)
+	fx.token("only", true, false, 90)
+	fx.bindWorker(BindModeDefault, nil)
+	id := fx.queueRun(reserveRun{})
+	text := func(s string) pgtype.Text { return pgtype.Text{String: s, Valid: s != ""} }
+	set := func(reason, expected string) int64 {
+		t.Helper()
+		n, err := fx.env.q.SetRunReserveHoldReason(fx.env.ctx, store.SetRunReserveHoldReasonParams{ID: id, Reason: text(reason), Expected: text(expected)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if set("first", "") != 1 {
+		t.Fatal("a write against the value read (none) must land")
+	}
+	// The pass read NULL, but a requeue has since written "first": a clear computed from the old
+	// read must not overwrite it.
+	if set("", "") != 0 {
+		t.Fatal("a write based on a stale read clobbered a newer marker")
+	}
+	if got, _ := fx.reasonOf(id); got != "first" {
+		t.Fatalf("marker = %q, want the newer value preserved", got)
+	}
+	if set("", "first") != 1 {
+		t.Fatal("a clear against the value read must land")
 	}
 }

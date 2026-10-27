@@ -267,7 +267,7 @@ func (q *Queries) ListReserveMarkOwners(ctx context.Context) ([]uuid.UUID, error
 
 const listReserveWorkers = `-- name: ListReserveWorkers :many
 SELECT id, ephemeral, ephemeral_run_id, anthropic_bind_mode, anthropic_secret_id,
-       last_heartbeat_at, draining_since, maintenance_fenced
+       last_heartbeat_at, draining_since, maintenance_fenced, maintenance_phase
 FROM workers
 WHERE user_id = $1
 `
@@ -281,6 +281,7 @@ type ListReserveWorkersRow struct {
 	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
 	DrainingSince     pgtype.Timestamptz `json:"draining_since"`
 	MaintenanceFenced bool               `json:"maintenance_fenced"`
+	MaintenancePhase  string             `json:"maintenance_phase"`
 }
 
 // The owner's registered workers with just the fields that decide which Anthropic lane a claim
@@ -303,6 +304,7 @@ func (q *Queries) ListReserveWorkers(ctx context.Context, userID uuid.UUID) ([]L
 			&i.LastHeartbeatAt,
 			&i.DrainingSince,
 			&i.MaintenanceFenced,
+			&i.MaintenancePhase,
 		); err != nil {
 			return nil, err
 		}
@@ -318,19 +320,23 @@ const setRunReserveHoldReason = `-- name: SetRunReserveHoldReason :execrows
 UPDATE runs SET reserve_hold_reason = $1::text
 WHERE id = $2 AND status = 'queued'
   AND reserve_hold_reason IS DISTINCT FROM $1::text
+  AND reserve_hold_reason IS NOT DISTINCT FROM $3::text
 `
 
 type SetRunReserveHoldReasonParams struct {
-	Reason pgtype.Text `json:"reason"`
-	ID     uuid.UUID   `json:"id"`
+	Reason   pgtype.Text `json:"reason"`
+	ID       uuid.UUID   `json:"id"`
+	Expected pgtype.Text `json:"expected"`
 }
 
 // Writes (or clears, with a NULL reason) a QUEUED run's weekly-reserve hold marker, only on
 // change. updated_at is deliberately untouched: the affinity ceiling and spread grace read it,
 // and a display marker must not extend either. Guarded status = 'queued' so a claim that won the
-// race (ClaimRun clears the marker itself) is never overwritten.
+// race (ClaimRun clears the marker itself) is never overwritten, and guarded on the marker value
+// the caller READ (@expected, NULL for none) so a claim-requeue that wrote its own reason between
+// the sweeper's read and this write is not clobbered by a verdict computed from the older read.
 func (q *Queries) SetRunReserveHoldReason(ctx context.Context, arg SetRunReserveHoldReasonParams) (int64, error) {
-	result, err := q.db.Exec(ctx, setRunReserveHoldReason, arg.Reason, arg.ID)
+	result, err := q.db.Exec(ctx, setRunReserveHoldReason, arg.Reason, arg.ID, arg.Expected)
 	if err != nil {
 		return 0, err
 	}

@@ -532,6 +532,7 @@ const listReserveClaudeTokens = `-- name: ListReserveClaudeTokens :many
 SELECT s.id            AS user_secret_id,
        s.is_default    AS is_default,
        s.auto_eligible AS auto_eligible,
+       (s.anthropic_rejected_at IS NOT NULL)::boolean AS rejected,
        (rl.user_secret_id IS NOT NULL)::boolean AS has_reading,
        rl.seven_day_pct,
        rl.seven_day_resets_at,
@@ -549,6 +550,7 @@ type ListReserveClaudeTokensRow struct {
 	UserSecretID     uuid.UUID          `json:"user_secret_id"`
 	IsDefault        bool               `json:"is_default"`
 	AutoEligible     bool               `json:"auto_eligible"`
+	Rejected         bool               `json:"rejected"`
 	HasReading       bool               `json:"has_reading"`
 	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
 	SevenDayResetsAt pgtype.Timestamptz `json:"seven_day_resets_at"`
@@ -557,8 +559,9 @@ type ListReserveClaudeTokensRow struct {
 
 // PRD #3522 M3: every ENABLED anthropic_token one user holds with the 7-day reading the weekly
 // usage reserve evaluates (usagereserve.EvaluateClaude), plus the two facts the reserve's lane
-// resolution needs: is_default (the credential an unbound lane opens) and auto_eligible (the
-// pooled set an auto lane draws from). Driven from user_secrets so a token with no reading
+// resolution needs: is_default (the credential an unbound lane opens), auto_eligible (the
+// pooled set an auto lane draws from) and rejected (a probe-rejected token is skipped by the auto
+// picker, autoselect.Floor, so it is not a permitted pooled token however fresh its reading). Driven from user_secrets so a token with no reading
 // still appears (has_reading false, which the evaluator turns into "unknown", never "ok"). A
 // reading counts only at the token's current enablement revision, exactly like
 // ListAutoSelectCandidates, so a pre-disable reading cannot vouch for a re-enabled token. A
@@ -576,6 +579,7 @@ func (q *Queries) ListReserveClaudeTokens(ctx context.Context, userID uuid.UUID)
 			&i.UserSecretID,
 			&i.IsDefault,
 			&i.AutoEligible,
+			&i.Rejected,
 			&i.HasReading,
 			&i.SevenDayPct,
 			&i.SevenDayResetsAt,

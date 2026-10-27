@@ -26,7 +26,7 @@ ORDER BY created_at, id;
 -- The owner's registered workers with just the fields that decide which Anthropic lane a claim
 -- on that worker resolves to, and whether the worker pins a queued run to itself (affinity).
 SELECT id, ephemeral, ephemeral_run_id, anthropic_bind_mode, anthropic_secret_id,
-       last_heartbeat_at, draining_since, maintenance_fenced
+       last_heartbeat_at, draining_since, maintenance_fenced, maintenance_phase
 FROM workers
 WHERE user_id = @user_id;
 
@@ -34,7 +34,10 @@ WHERE user_id = @user_id;
 -- Writes (or clears, with a NULL reason) a QUEUED run's weekly-reserve hold marker, only on
 -- change. updated_at is deliberately untouched: the affinity ceiling and spread grace read it,
 -- and a display marker must not extend either. Guarded status = 'queued' so a claim that won the
--- race (ClaimRun clears the marker itself) is never overwritten.
+-- race (ClaimRun clears the marker itself) is never overwritten, and guarded on the marker value
+-- the caller READ (@expected, NULL for none) so a claim-requeue that wrote its own reason between
+-- the sweeper's read and this write is not clobbered by a verdict computed from the older read.
 UPDATE runs SET reserve_hold_reason = sqlc.narg('reason')::text
 WHERE id = @id AND status = 'queued'
-  AND reserve_hold_reason IS DISTINCT FROM sqlc.narg('reason')::text;
+  AND reserve_hold_reason IS DISTINCT FROM sqlc.narg('reason')::text
+  AND reserve_hold_reason IS NOT DISTINCT FROM sqlc.narg('expected')::text;
