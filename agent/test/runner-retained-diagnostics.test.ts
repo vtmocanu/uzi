@@ -151,13 +151,28 @@ it("an asynchronous readiness refusal stops retained recovery before successor a
   assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "local work\n");
 });
 
-for (const mode of ["operational", "non-error", "abort", "ownership", "credential"] as const) {
+for (const mode of ["operational", "non-error", "abort", "ownership", "credential", "getter-boundary", "getter-name"] as const) {
   it("M1 post-adoption check: " + mode, async () => {
     const { claim, bare, clone } = await seed();
     const log = recordingLogger();
     const operational = new TypeError("check /private/source/" + "a".repeat(40) + " " + secret);
     const before = Object.getOwnPropertyDescriptors(operational);
+    if (mode === "getter-boundary" || mode === "getter-name") {
+      Object.defineProperty(operational, mode === "getter-boundary" ? "checkpointBoundary" : "name", {
+        get() { throw new Error("classification getter failed"); },
+      });
+    }
     let adopted = false, faulted = false, models = 0, factories = 0;
+    let observedFailure: unknown;
+    const recovery = git as any;
+    const operation = recovery.withRecoveryOperation.bind(git);
+    recovery.withRecoveryOperation = async (...args: unknown[]) => {
+      try { return await operation(...args); }
+      catch (error) {
+        if (adopted && faulted && observedFailure === undefined) observedFailure = error;
+        throw error;
+      }
+    };
     const prepare = git.prepareRecoverySuccessor.bind(git);
     const runner = runnerWith(() => {
       factories++;
@@ -169,7 +184,7 @@ for (const mode of ["operational", "non-error", "abort", "ownership", "credentia
       flight = args[0];
       if (adopted && !faulted) {
         faulted = true;
-        if (mode === "operational") throw operational;
+        if (mode === "operational" || mode === "getter-boundary" || mode === "getter-name") throw operational;
         if (mode === "non-error") throw "postcheck ordinary value";
         if (mode === "abort") throw Object.assign(new Error("postcheck aborted"), { name: "AbortError" });
       }
@@ -204,6 +219,11 @@ for (const mode of ["operational", "non-error", "abort", "ownership", "credentia
       assert.equal(diagnostics.length, 1);
       assert.equal(diagnostics[0]!.diagnostic_code, "recovery_failed");
       assert.equal(diagnostics[0]!.cause, mode === "abort" ? "postcheck aborted" : "postcheck ordinary value");
+    } else if (mode === "getter-boundary" || mode === "getter-name") {
+      assert.equal(observedFailure === operational, true, "classification must preserve original Error identity");
+      assert.equal(diagnostics.length, 1);
+      assert.equal(diagnostics[0]!.diagnostic_code, "recovery_failed");
+      assert.doesNotMatch(diagnostics[0]!.cause, /classification getter failed/);
     } else {
       assert.equal(diagnostics.length, 0, "runtime stop sentinels bypass operational warnings");
       assert.equal(api.states.some(s => s.body.status === "failed" || s.body.status === "recovery_wait"), false);

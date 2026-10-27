@@ -7551,10 +7551,12 @@ export class GitCache {
       pins = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
         `refs/uzi-coverage/${journal.runId}/`]);
     } catch (error) {
-      if (!this.boundaryProcesses.getStore()?.signal.aborted && !isCheckpointBoundaryFailure(error) &&
-          !(error instanceof CheckpointChildStartupTimeoutError) && !isAbortLike(error)) {
-        annotateRetainedSuccessorError(error, "wrapper_pin_read");
-      }
+      try {
+        if (!this.boundaryProcesses.getStore()?.signal.aborted && !isCheckpointBoundaryFailure(error) &&
+            !(error instanceof CheckpointChildStartupTimeoutError) && !isAbortLike(error)) {
+          annotateRetainedSuccessorError(error, "wrapper_pin_read");
+        }
+      } catch { /* Diagnostics must not replace the original failure. */ }
       throw error;
     }
     const pinned = pins.split("\n").some(line => {
@@ -7617,10 +7619,12 @@ export class GitCache {
         seeded = await this.seedRunnerClone(barePath, branch, clonePath, journal.runId, true, undefined,
           { ...opts, recoveryTip: wrapped?.seedTip ?? tip });
       } catch (error) {
-        if (!this.boundaryProcesses.getStore()?.signal.aborted && !isCheckpointBoundaryFailure(error) &&
-            !(error instanceof CheckpointChildStartupTimeoutError) && !isAbortLike(error)) {
-          annotateRetainedSuccessorError(error, "seed_failed");
-        }
+        try {
+          if (!this.boundaryProcesses.getStore()?.signal.aborted && !isCheckpointBoundaryFailure(error) &&
+              !(error instanceof CheckpointChildStartupTimeoutError) && !isAbortLike(error)) {
+            annotateRetainedSuccessorError(error, "seed_failed");
+          }
+        } catch { /* Diagnostics must not replace the original failure. */ }
         throw error;
       }
       const head = (await this.runGitAsRunner(clonePath, ["rev-parse", "HEAD"])).trim();

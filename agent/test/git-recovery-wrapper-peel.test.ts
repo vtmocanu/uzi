@@ -672,3 +672,31 @@ for (const seam of ["pin", "seed", "subject", "commit"] as const) {
     });
   }
 }
+
+// Diagnostic classification is best-effort; getters must never replace a propagated failure.
+for (const seam of ["pin", "seed"] as const) {
+  for (const property of ["checkpointBoundary", "name"] as const) {
+    test(`M1 getter identity: ${seam} ${property}`, async t => {
+      const { r } = await capturedMarker();
+      const original = new Error("original failure");
+      Object.defineProperty(original, property, { get() { throw new Error("classification getter failed"); } });
+      if (seam === "seed") t.mock.method(cache as any, "seedRunnerClone", async () => { throw original; });
+      else {
+        const run = (cache as any).runGit.bind(cache);
+        t.mock.method(cache as any, "runGit", async (dir: string, args: string[], ...rest: unknown[]) => {
+          if (args.includes(`refs/uzi-coverage/${runId}/`)) throw original;
+          return run(dir, args, ...rest);
+        });
+      }
+      await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2)), caught => {
+        assert.equal(caught === original, true, "classification must preserve original Error identity");
+        assert.deepEqual(formatRetainedRecoveryDiagnostic(caught, s => s), {
+          diagnostic_stage: "recovery", diagnostic_code: "recovery_failed", cause: "original failure",
+        });
+        return true;
+      });
+      assert.equal(journal().recovery.stage, seam === "seed" ? "adopting" : "captured");
+      assert.equal(fs.readFileSync(path.join(source.clonePath, "work.txt"), "utf8"), "work.txt\n");
+    });
+  }
+}

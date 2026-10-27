@@ -22099,10 +22099,12 @@ export class RunRunner {
           this.liveAttempts.add(attempt);
           try { await check(); }
           catch (error) {
-            if (!(error instanceof RetainedRecoveryStop) && !(error instanceof CredentialSwitchSignal) &&
-                !isCheckpointBoundaryFailure(error) && !(error instanceof Error && error.name === "AbortError")) {
-              annotateRetainedSuccessorError(error, "post_adoption_check");
-            }
+            try {
+              if (!(error instanceof RetainedRecoveryStop) && !(error instanceof CredentialSwitchSignal) &&
+                  !isCheckpointBoundaryFailure(error) && !(error instanceof Error && error.name === "AbortError")) {
+                annotateRetainedSuccessorError(error, "post_adoption_check");
+              }
+            } catch { /* Diagnostics must not replace the original failure. */ }
             throw error;
           }
           // Capture boundaries may have closed the Codex executor. A new factory instance owns
