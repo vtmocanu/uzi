@@ -626,7 +626,7 @@ export function StatusPill({ status: rawStatus, progress, health, recovery_wait_
   const status = effectiveRunStatus({ status: rawStatus, recovery_wait_cause, recovery_retry_not_before });
   // Callers may already have projected live raw states to planning or revising.
   const accountWait = health === "waiting_account_cooldown" &&
-    ["claimed", "running", "planning", "awaiting_approval", "revising"].includes(status);
+    ["claimed", "running", "planning", "awaiting_approval", "revising", "completion_checking", "completion_reworking"].includes(status);
   const cfg = accountWait ? { tone: "info" as BadgeTone, pulse: false } :
     RUN_STATUS_TONES[status] ?? { tone: "neutral" as BadgeTone };
   const label = accountWait ? "waiting" : RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
