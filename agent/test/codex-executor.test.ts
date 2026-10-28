@@ -25855,14 +25855,18 @@ describe("M2 lazy root operation admission", () => {
       });
       t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
       const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
-      const result = running.catch(error => error);
+      let settled = false;
+      const result = running.then(value => { settled = true; return value; },
+        error => { settled = true; return error; });
       try {
         await ready(() => admission);
         t.mock.timers.tick(control === "wall" ? 1000 : 100);
         if (control !== "wall") {
           mode = control === "pause" ? "now" : null;
           abort.abort(control === "pause" ? new PauseNowSignal() : new Error("cancel"));
+          if (control === "cancel") t.mock.timers.tick(1000); // cancel remains first even if wall also expires
         }
+        await ready(() => settled);
         const outcome = await result;
         if (control === "cancel") assert.match(outcome.message, /cancel/);
         else assert.ok(control === "wall" ? outcome.walled : outcome.pausedAt);
@@ -25870,7 +25874,7 @@ describe("M2 lazy root operation admission", () => {
         assert.equal(rig.transport.turnStartCount, 0);
         assert.equal(evidence, 0);
         assert.equal(emitted.some(m => /idle/i.test(JSON.stringify(m.payload))), false);
-      } finally { abort.abort(); rig.transport.end(); t.mock.timers.reset(); }
+      } finally { abort.abort(); rig.transport.end(); await result; t.mock.timers.reset(); }
     });
 
   it("M2 HTTP cooldown and source proof debit the wall exactly once across turns", async t => {
