@@ -6712,6 +6712,15 @@ export class HeldRunCommandCache implements RunCommandCache {
     return this.settling;
   }
 
+  /**
+   * A `pending` result's `settlement` is the helper's ACTUAL settlement and has no deadline: release waits
+   * for the holder channel to close, and remove waits for the helper process, which is never killed. It is
+   * retained deliberately, unbounded: a release/remove timeout never counts as settlement, never permits
+   * source-use demotion, and never enables conflicting reuse while source-capable work is unresolved. The
+   * cost is that a helper that never settles keeps the lifetime seal, and so this execution reservation,
+   * pending indefinitely, which the approved #3404 plan (disclosure 4) accepts for cleanup tails. Bounding
+   * it as unproven delivery needs an owner decision on the source-lease and reservation consequences.
+   */
   private observeCleanup(result: CacheCleanupResult): void {
     if (!this.lifetime) return;
     if (result.state === "pending" && result.settlement) {

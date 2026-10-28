@@ -49,8 +49,12 @@ interface Incarnation {
  * One executor's irreversible admission fence. Monotonic: open, sealing, sealed. A failed
  * or unproven seal stays in `sealing` forever (permanently closed, never re-sealable).
  * Cleanup may retain already admitted work after closure; it cannot admit a new producer.
- * Settlement has no delivery timeout: each retained operation must terminate under its
- * own original bound. A failed sibling does not skip any other tail. No execute/run
+ * Settlement has no delivery timeout: `seal` awaits every retained operation until it
+ * actually settles. Most tails carry their own bound, but some do not: the codex command
+ * cache helper's settlement (HeldRunCommandCache.observeCleanup) ends only when the helper's
+ * channel closes or its process exits. A holder that never closes keeps the seal pending,
+ * and with it the flight's end-of-run publication (publishFlightSource awaits
+ * sealLifetime); that fails closed. A failed sibling does not skip any other tail. No execute/run
  * promise belongs in this owner. Nothing here may be awaited while holding a safety,
  * journal or bare lock.
  */
