@@ -57,6 +57,9 @@ const (
 	dbSizeWarnPercent   = 75
 	dbSizeDangerPercent = 85
 
+	// recovery.storage: any enabled byte budget warns at this percentage.
+	recoveryStorageWarnPercent = 80
+
 	// slack.socket: configured but not connected for at least this long warns. Below it a
 	// reconnect blip is not worth alarming (the manager auto-reconnects).
 	slackDisconnectedWarn = 5 * time.Minute

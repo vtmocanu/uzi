@@ -3,6 +3,7 @@ package healthsvc
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -13,7 +14,7 @@ import (
 const recoveryStorageReadBudget = 4 * time.Second
 const recoveryStorageExamples = 8
 
-// checkRecoveryStorage observes current persisted refusal markers, independently of custody.
+// checkRecoveryStorage observes byte-budget pressure and persisted refusal markers, independently of custody.
 func (s *Service) checkRecoveryStorage(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
 	c := s.base("recovery.storage")
 	ctx, cancel := context.WithTimeout(ctx, recoveryStorageReadBudget)
@@ -34,11 +35,27 @@ func (s *Service) checkRecoveryStorage(ctx context.Context, now time.Time) apity
 		return degradeUnknown(c, c.ID, fmt.Errorf("missing storage aggregate"))
 	}
 	t := rows[0]
+	recoveryBytes := t.AvailableBytes + t.PreparingBytes + t.UploadingBytes
+	sharedBytes := recoveryBytes + t.JobBytes
+	var pressured []string
+	if s.cfg.RecoveryReadyPayloadPerOwner > 0 && atLeastPercent(t.MaxOwnerRecoveryBytes, s.cfg.RecoveryReadyPayloadPerOwner, recoveryStorageWarnPercent) {
+		pressured = append(pressured, "per-owner recovery")
+	}
+	if s.cfg.RecoveryInstanceBytes > 0 && atLeastPercent(recoveryBytes, s.cfg.RecoveryInstanceBytes, recoveryStorageWarnPercent) {
+		pressured = append(pressured, "instance recovery")
+	}
+	if s.cfg.StoredFilesBudgetBytes > 0 && atLeastPercent(sharedBytes, s.cfg.StoredFilesBudgetBytes, recoveryStorageWarnPercent) {
+		pressured = append(pressured, "shared stored files")
+	}
 	c.Severity = sevOK
-	if t.RefusedCount > 0 {
+	if t.RefusedCount > 0 || len(pressured) > 0 {
 		c.Severity = sevWarn
 	}
 	c.Summary = fmt.Sprintf("%d captures currently marked quota-refused.", t.RefusedCount)
+	if len(pressured) > 0 {
+		c.Summary = fmt.Sprintf("At least %d%% of budget: %s; %d captures currently marked quota-refused.",
+			recoveryStorageWarnPercent, strings.Join(pressured, ", "), t.RefusedCount)
+	}
 	limit := func(n int64) string {
 		if n <= 0 {
 			return "disabled"
@@ -54,8 +71,9 @@ func (s *Service) checkRecoveryStorage(ctx context.Context, now time.Time) apity
 		{Label: "Quota-refused captures", Value: fmt.Sprint(t.RefusedCount)},
 		{Label: "Owners", Value: fmt.Sprint(t.OwnerCount)},
 		{Label: "Omitted owner examples", Value: fmt.Sprint(t.OmittedCount)},
-		{Label: "Recovery bytes", Value: fmt.Sprint(t.AvailableBytes + t.PreparingBytes + t.UploadingBytes)},
-		{Label: "Shared stored bytes", Value: fmt.Sprint(t.AvailableBytes + t.PreparingBytes + t.UploadingBytes + t.JobBytes)},
+		{Label: "Maximum owner recovery bytes", Value: fmt.Sprint(t.MaxOwnerRecoveryBytes)},
+		{Label: "Recovery bytes", Value: fmt.Sprint(recoveryBytes)},
+		{Label: "Shared stored bytes", Value: fmt.Sprint(sharedBytes)},
 		{Label: "Recovery per-owner limit", Value: limit(s.cfg.RecoveryReadyPayloadPerOwner)},
 		{Label: "Recovery instance limit", Value: limit(s.cfg.RecoveryInstanceBytes)},
 		{Label: "Shared stored-files limit", Value: limit(s.cfg.StoredFilesBudgetBytes)},
@@ -73,7 +91,12 @@ func (s *Service) checkRecoveryStorage(ctx context.Context, now time.Time) apity
 				r.OwnerReclaimableBytes, r.OwnerRefusedCount),
 		})
 	}
-	if c.Severity == sevWarn {
+	switch {
+	case len(pressured) > 0 && t.RefusedCount > 0:
+		c.Action = strPtr("Reduce stored bytes or raise the pressured budgets, and review currently quota-refused captures with their owners (uzi run recovery). An admitted retry clears the marker before upload succeeds.")
+	case len(pressured) > 0:
+		c.Action = strPtr("Reduce stored bytes or raise the pressured budgets before recovery uploads are refused.")
+	case t.RefusedCount > 0:
 		c.Action = strPtr("Review currently quota-refused captures with their owners (uzi run recovery). This observes stored state; an admitted retry clears the marker before upload succeeds.")
 	}
 	return c

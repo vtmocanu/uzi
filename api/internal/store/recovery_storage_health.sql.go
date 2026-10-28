@@ -49,12 +49,13 @@ WITH contributions AS (
     COALESCE(sum(job_count), 0)::bigint AS job_count,
     COALESCE(sum(job_bytes), 0)::bigint AS job_bytes,
     COALESCE(sum(reclaimable_bytes), 0)::bigint AS reclaimable_bytes,
-    COALESCE(sum(refused_count), 0)::bigint AS refused_count
+    COALESCE(sum(refused_count), 0)::bigint AS refused_count,
+    COALESCE(max(available_bytes + preparing_bytes + uploading_bytes), 0)::bigint AS max_owner_recovery_bytes
   FROM owners
 ), examples AS (
   SELECT user_id, available_count, available_bytes, preparing_count, preparing_bytes, uploading_count, uploading_bytes, job_count, job_bytes, reclaimable_bytes, refused_count FROM owners ORDER BY refused_count DESC, user_id LIMIT $2::int
 )
-SELECT t.owner_count, t.available_count, t.available_bytes, t.preparing_count, t.preparing_bytes, t.uploading_count, t.uploading_bytes, t.job_count, t.job_bytes, t.reclaimable_bytes, t.refused_count, GREATEST(t.owner_count - (SELECT count(*) FROM examples), 0)::bigint AS omitted_count,
+SELECT t.owner_count, t.available_count, t.available_bytes, t.preparing_count, t.preparing_bytes, t.uploading_count, t.uploading_bytes, t.job_count, t.job_bytes, t.reclaimable_bytes, t.refused_count, t.max_owner_recovery_bytes, GREATEST(t.owner_count - (SELECT count(*) FROM examples), 0)::bigint AS omitted_count,
   e.user_id AS owner_id,
   COALESCE(e.available_count, 0)::bigint AS owner_available_count,
   COALESCE(e.available_bytes, 0)::bigint AS owner_available_bytes,
@@ -87,6 +88,7 @@ type RecoveryStorageHealthRow struct {
 	JobBytes              int64       `json:"job_bytes"`
 	ReclaimableBytes      int64       `json:"reclaimable_bytes"`
 	RefusedCount          int64       `json:"refused_count"`
+	MaxOwnerRecoveryBytes int64       `json:"max_owner_recovery_bytes"`
 	OmittedCount          int64       `json:"omitted_count"`
 	OwnerID               pgtype.UUID `json:"owner_id"`
 	OwnerAvailableCount   int64       `json:"owner_available_count"`
@@ -124,6 +126,7 @@ func (q *Queries) RecoveryStorageHealth(ctx context.Context, arg RecoveryStorage
 			&i.JobBytes,
 			&i.ReclaimableBytes,
 			&i.RefusedCount,
+			&i.MaxOwnerRecoveryBytes,
 			&i.OmittedCount,
 			&i.OwnerID,
 			&i.OwnerAvailableCount,

@@ -38,7 +38,8 @@ WITH contributions AS (
     COALESCE(sum(job_count), 0)::bigint AS job_count,
     COALESCE(sum(job_bytes), 0)::bigint AS job_bytes,
     COALESCE(sum(reclaimable_bytes), 0)::bigint AS reclaimable_bytes,
-    COALESCE(sum(refused_count), 0)::bigint AS refused_count
+    COALESCE(sum(refused_count), 0)::bigint AS refused_count,
+    COALESCE(max(available_bytes + preparing_bytes + uploading_bytes), 0)::bigint AS max_owner_recovery_bytes
   FROM owners
 ), examples AS (
   SELECT * FROM owners ORDER BY refused_count DESC, user_id LIMIT @example_limit::int
