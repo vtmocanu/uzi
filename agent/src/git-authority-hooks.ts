@@ -66,12 +66,14 @@
  * beginBareMutation(barePath, op, footprint) -> settlement — a git child that mutates the SHARED bare
  *  and whose outcome the authority must be able to reconcile.
  *  - "recovery-cleanup-delete-ref": GitCache.cleanupRecoveryGeneration's deleteRef
- *    (`update-ref -d`). Footprint: the ref. Join: runGit resolving (exit 0) then a read-back of the
- *    ref; a rejected runGit does not distinguish exit-nonzero from timeout or spawn failure, so it is
- *    left unsettled. The slot epoch covers clone sources, not refs of the shared bare that other
- *    runs' cleanup and pinning also touch.
- *  - "owed-reconcile-delete-ref": GitCache.reconcileOwedCandidates (`update-ref -d` of the owed pin).
- *    Same footprint, join and reasoning.
+ *    (`update-ref -d`, via GitCache.deleteRefSettled). Footprint: the ref. Join: a known exit (0, or a
+ *    numeric code with no kill and no signal) then a read-back, settling ok when the ref is gone and
+ *    residue when it remains or cannot be read; a spawn failure where no child started (string code,
+ *    "spawn" syscall, not killed) settles as residue; anything else (timeout or kill, signal, null code,
+ *    non-spawn string code) is left unsettled. The slot epoch covers clone sources, not refs of the
+ *    shared bare that other runs' cleanup and pinning also touch.
+ *  - "owed-reconcile-delete-ref": GitCache.reconcileOwedCandidates (`update-ref -d` of the owed pin,
+ *    via GitCache.deleteRefSettled). Same footprint, join and reasoning.
  *  - "recovery-pin-delete-ref": GitCache.deleteRecoveryPin (`update-ref -d` of refs/uzi-recovery-pin/
  *    <run>/<gen>, the ref anchorRecoveryHead re-creates). Join: tryGitExit returning a real exit status
  *    (0 or not), then a read-back; null leaves it unsettled (timeout, signal) unless Node's own spawn

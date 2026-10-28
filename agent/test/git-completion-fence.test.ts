@@ -6,7 +6,7 @@ import fs from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { GitBoundaryAbortError } from "../src/checkpoint-stop.js";
-import { GitCache,type FetchAgentBranchOptions, type PositiveOwedCandidateContext, type RecoveryJournalEntry } from "../src/git.js";
+import { GitCache, type FetchAgentBranchOptions, type PositiveOwedCandidateContext, type RecoveryJournalEntry } from "../src/git.js";
 import type { AuthoritySettlement, GitAuthorityHooks } from "../src/git-authority-hooks.js";
 import { serializeSourceFence, type CompletionSourceFence } from "../src/completion-source.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
@@ -18,14 +18,11 @@ import { parseRecoveryJournal as baseParseRecoveryJournal } from "./fixtures/bas
 // Real git in temp dirs; the hooks are a recording fake.
 
 // An ambient GIT_DIR (a hook, a worktree gate) would redirect every `git -C` below at someone else's repo.
-const AMBIENT_GIT = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
-  "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES", "GIT_PREFIX", "GIT_SHALLOW_FILE",
-  "GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
+// Drop every GIT_* key (the repo convention, see makeFixture), then pin the global and system config off.
 function scrubGitEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...base, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
-  for (const key of AMBIENT_GIT) delete env[key];
-  for (const key of Object.keys(env)) if (/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)) delete env[key];
-  return env;
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(base)) if (!key.startsWith("GIT_")) env[key] = value;
+  return { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
 }
 const ENV = scrubGitEnv(process.env);
 const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
@@ -91,24 +88,33 @@ beforeEach(async () => {
 afterEach(() => fx.cleanup());
 
 describe("scrubGitEnv", () => {
-  it("keeps a decoy GIT_DIR from redirecting a config write away from the target repo", () => {
+  it("keeps decoy GIT_DIR and GIT_CONFIG from redirecting a config write away from the target repo", () => {
     const sentinel = fs.mkdtempSync(path.join(fx.dataDir, "sentinel-"));
     execFileSync("git", ["init", "-q", sentinel], { env: ENV });
-    const decoy = { ...process.env, GIT_DIR: path.join(sentinel, ".git"), GIT_WORK_TREE: sentinel };
+    const sentinelConfig = path.join(sentinel, "sentinel.config");
+    fs.writeFileSync(sentinelConfig, "");
+    const dirDecoy = { ...process.env, GIT_DIR: path.join(sentinel, ".git"), GIT_WORK_TREE: sentinel };
+    const fileDecoy = { ...process.env, GIT_CONFIG: sentinelConfig };
+    const both = { ...dirDecoy, ...fileDecoy };
     const cfg = (): string => fs.readFileSync(path.join(sentinel, ".git", "config"), "utf8");
+    const extra = (): string => fs.readFileSync(sentinelConfig, "utf8");
     const refs = (): string => execFileSync("git", ["-C", sentinel, "for-each-ref"], { encoding: "utf8", env: ENV });
     const write = (env: NodeJS.ProcessEnv): void => {
       execFileSync("git", ["-C", bare, "config", "uzi-test.k", "v"], { env: { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } });
     };
-    const cfgBefore = cfg(), refsBefore = refs();
-    write(scrubGitEnv(decoy));
+    const cfgBefore = cfg(), refsBefore = refs(), extraBefore = extra();
+    write(scrubGitEnv(both));
     assert.equal(gitIn(bare, ["config", "--get", "uzi-test.k"]), "v");
     assert.equal(cfg(), cfgBefore);
+    assert.equal(extra(), extraBefore);
     assert.equal(refs(), refsBefore);
-    // Control: the unscrubbed decoy does hit the sentinel, so the scrub is what protects it.
-    write(decoy);
+    // Controls: each unscrubbed decoy does hit its sentinel, so the scrub is what protects it.
+    write(dirDecoy);
     assert.notEqual(cfg(), cfgBefore);
     assert.match(cfg(), /uzi-test/);
+    write(fileDecoy);
+    assert.notEqual(extra(), extraBefore);
+    assert.match(extra(), /uzi-test/);
   });
 });
 
@@ -669,6 +675,19 @@ describe("authority hooks", () => {
         outcome: "unsettled", reject: /git update-ref -d .* failed/ },
       { name: "a signal death stays unsettled", plan: { error: childError({ code: 1, signal: "SIGKILL" }) },
         outcome: "unsettled", reject: /git update-ref -d .* failed/ },
+      { name: "a non-spawn string code (output limit) stays unsettled",
+        plan: { error: childError({ code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }), runFirst: true },
+        outcome: "unsettled", reject: /git update-ref -d .* failed/ },
+      { name: "a spawn-syscall string code with killed stays unsettled",
+        plan: { error: childError({ code: "ENOENT", syscall: "spawn git", killed: true }) },
+        outcome: "unsettled", reject: /git update-ref -d .* failed/ },
+      { name: "a nonzero exit with a failed read-back settles residue and rejects with the child's error",
+        plan: { error: childError({ code: 1 }), runFirst: true, readError: true }, outcome: "residue",
+        reject: (e: unknown) => {
+          assert.match((e as Error).message, /git update-ref -d .* failed/);
+          assert.doesNotMatch((e as Error).message, /read-back boom/);
+          return true;
+        } },
       { name: "a boundary abort propagates unsettled", plan: { error: new GitBoundaryAbortError("aborted") },
         outcome: "unsettled", reject: GitBoundaryAbortError },
     ];

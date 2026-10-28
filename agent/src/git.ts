@@ -17272,8 +17272,13 @@ try {
    *  - a known exit (0, or a numeric code with no kill and no signal) reads the ref back and settles
    *    ok when gone, residue when present or unreadable; a nonzero exit then rethrows the wrapped error;
    *  - a spawn failure (string code, "spawn" syscall, not killed) settles residue and rethrows;
-   *  - anything else (timeout, kill, signal, null code, maxBuffer) leaves the record unsettled and rethrows,
-   *    as do residue and boundary-abort errors. */
+   *  - anything else (timeout, kill, signal, null code, non-spawn string code such as maxBuffer) leaves the
+   *    record unsettled and rethrows, as do residue and boundary-abort errors.
+   *  The "signal and maxBuffer stay unsettled" statements describe the execFile path. Inside a boundary-process
+   *  scope execScoped throws `subprocess exited <code>` with a NUMERIC code: the tick spawner reports a signal
+   *  death as `code ?? (sig ? 128 : 1)` (and `code || -1` after its own kill), and its `completed` resolves
+   *  only after the process group is gone. That numeric code is therefore a known, joined exit and is read
+   *  back like any other nonzero exit; an output-limit failure there also carries the joined numeric code. */
   private async deleteRefSettled(barePath: string, ref: string, sha: string,
     settlement: AuthoritySettlement | undefined, mismatch: string): Promise<void> {
     const args = ["update-ref", "-d", ref, sha];
