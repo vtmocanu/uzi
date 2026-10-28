@@ -94,7 +94,10 @@ func TestRunResumeNamesTheReserveOverride(t *testing.T) {
 		t.Errorf("stdout = %q, want it to contain %q", stdout, want)
 	}
 
-	plain := &uzicli.FakeClient{ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued"}}
+	plain := &uzicli.FakeClient{
+		RunByID:    map[string]apitypes.RunDTO{"r1": {ID: "r1", Status: "paused"}},
+		ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued"},
+	}
 	stdout, _, code = runCLI(t, fakeEnv(plain), "run", "resume", "r1")
 	if code != uzicli.ExitOK || strings.Contains(stdout, "weekly usage reserve") || !strings.Contains(stdout, "Resumed r1: queued.\n") {
 		t.Errorf("an ordinary resume printed %q (exit %d), want the plain queued line", stdout, code)
