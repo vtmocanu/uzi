@@ -683,3 +683,64 @@ for (const kind of ["child", "advice"] as const) {
     } finally { r.shutdown(); await done; }
   });
 }
+
+for (const queued of ["root", "child"] as const) it(`M4 production required ${queued} remains visible across queued HTTP and cancellation`, async t => {
+  enable();
+  const clock = new AdmissionClock();
+  const registry = new ActiveRunRegistry();
+  const fixture = providerFixture("codex", () => ({ plan: "# Plan" }), false, { subscription: true });
+  let releaseRead!: () => void;
+  let reads = 0;
+  let inFlight = 0;
+  let maxFlight = 0;
+  const requests: CodexOperationRequest[] = [];
+  t.mock.method(client, "checkCodexOperationAdmission", async (_id: string, request: CodexOperationRequest) => {
+    reads++;
+    requests.push(request);
+    maxFlight = Math.max(maxFlight, ++inFlight);
+    try {
+      if (reads === 1) return { decision: "wait", ...request, class: "overload",
+        episode_id: "00000000-0000-4000-8000-000000000091", server_now: new Date(0).toISOString(), eligible_at: new Date(1000).toISOString() };
+      if (reads === 2) await new Promise<void>(resolve => { releaseRead = resolve; });
+      return { decision: "admit", operation_id: request.operation_id, claim_generation: request.claim_generation };
+    } finally { inFlight--; }
+  });
+  const claim = freshClaim(7, { secrets: { forge_pat: "fixture-forge-pat", codex: fixture.credential } });
+  const marker = () => registry.build().active.find(e => e.run_id === claim.run_id)?.account_cooldown;
+  const original = fixture.executor.run.bind(fixture.executor);
+  let exercised = false;
+  t.mock.method(fixture.executor, "run", async (ctx: RunContext) => {
+    const firstAbort = new AbortController();
+    const secondAbort = new AbortController();
+    const prepare = ctx.prepareCodexRootDispatch!;
+    const first = prepare(firstAbort.signal, () => {}, queued === "root" ? "advice" : "child");
+    await flushUntil(() => clock.sleepers.size === 1);
+    assert.equal(marker()?.kind, queued === "root" ? undefined : "child", "optional advice alone has no whole-run label");
+    const second = prepare(secondAbort.signal, () => {}, queued);
+    const rejected = assert.rejects(second, /selected cancelled/);
+    await flushUntil(() => marker()?.operation_id !== requests[0]!.operation_id && marker()?.kind === queued);
+    const selected = marker()!.operation_id;
+    clock.advance(1000);
+    await flushUntil(() => reads === 2);
+    assert.equal(marker()!.operation_id, selected, "queued required work survives another operation's held HTTP");
+    secondAbort.abort(new Error("selected cancelled"));
+    await rejected;
+    assert.equal(marker()?.operation_id, queued === "child" ? requests[0]!.operation_id : undefined, "selected cancellation falls back to a surviving required child");
+    releaseRead();
+    assert.equal((await first)(), true);
+    assert.equal(marker(), undefined);
+    assert.equal(maxFlight, 1);
+    exercised = true;
+    return original(ctx);
+  });
+  const r = runner(fixture.executor, fakeGitlab().gitlab, undefined, { activeRuns: registry,
+    codexOperationWaitPolicy: { now: () => clock.now, sleep: clock.sleep } });
+  const done = r.execute(claim);
+  try {
+    assert.ok(await until(() => gates(claim.run_id).length === 1));
+    assert.equal(exercised, true);
+    send(claim.run_id, row("cancel"));
+    await done;
+    assert.equal(registry.size, 0);
+  } finally { releaseRead?.(); r.shutdown(); await done; }
+});

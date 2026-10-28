@@ -211,7 +211,7 @@ export class CrossCheckRunner {
         if (registration === undefined || op.kind !== "checker") return undefined;
         const token = this.opts.activeRuns?.setAccountCooldown(runId, generation, op, registration);
         return token === undefined ? undefined : () => this.opts.activeRuns?.clearAccountCooldown(runId, generation, token);
-      }, ["checker"]) : undefined;
+      }, ["checker"], this.log) : undefined;
     operation?.own();
     try {
       const ack = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation });

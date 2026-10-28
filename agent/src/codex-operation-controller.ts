@@ -1,3 +1,4 @@
+import type { Logger } from "./log.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { CodexOperationAdmissionError } from "./client.js";
 import type { CodexOperationDecision, CodexOperationIdentity, CodexOperationRequest } from "./protocol.js";
@@ -8,6 +9,7 @@ export interface CodexOperationWaitPolicy {
 }
 
 interface Dependencies extends CodexOperationWaitPolicy {
+  logger?: Logger;
   supported(): boolean;
   /** Changes on every positive negotiation, including a negotiation later cleared. */
   negotiation(): number;
@@ -23,6 +25,13 @@ interface Dependencies extends CodexOperationWaitPolicy {
  */
 export class CodexOperationController {
   private engaged = false;
+  private readonly diagnostics = new Set<string>();
+
+  private diagnose(code: "codex_operation_admission_unavailable" | "codex_operation_cooldown"): void {
+    if (this.diagnostics.has(code)) return;
+    this.diagnostics.add(code);
+    try { this.deps.logger?.warn(code); } catch { /* Diagnostics never control admission. */ }
+  }
   private readonly initialNegotiation: number;
   private tail: Promise<void> = Promise.resolve();
   private nextReadAt = 0;
@@ -52,86 +61,89 @@ export class CodexOperationController {
     signal.throwIfAborted();
     if (!this.observe()) return () => !this.observe();
     const request = { ...structuredClone(operation), claim_generation: this.generation };
-    // Join the queue once per read, letting independent operations progress between retries.
-    for (;;) {
-      let release!: () => void;
-      const prior = this.tail;
-      this.tail = new Promise<void>(resolve => { release = resolve; });
-      let clear: (() => void) | undefined;
-      let pendingRead: Promise<CodexOperationDecision> | undefined;
-      try {
-        await this.cancellable(prior, signal);
-        check();
-        signal.throwIfAborted();
-        let remaining = this.nextReadAt - this.now();
-        if (remaining > 0) {
-          clear = this.deps.waiting(operation);
-          // Recompute after an early timer wake. The minimum 1s deadline is set
-          // after reads, not after wakeups, so a reached deadline always settles.
-          while (remaining > 0) {
-            await this.sleep(remaining, signal);
+    // One display registration spans queue transfers, HTTP, proof and retry waits.
+    const clear = this.deps.waiting(operation);
+    try {
+      // Join the queue once per read, letting independent operations progress between retries.
+      for (;;) {
+        let release!: () => void;
+        const prior = this.tail;
+        this.tail = new Promise<void>(resolve => { release = resolve; });
+        let pendingRead: Promise<CodexOperationDecision> | undefined;
+        try {
+          await this.cancellable(prior, signal);
+          check();
+          signal.throwIfAborted();
+          let remaining = this.nextReadAt - this.now();
+          if (remaining > 0) {
+            // Recompute after an early timer wake. The minimum 1s deadline is set
+            // after reads, not after wakeups, so a reached deadline always settles.
+            while (remaining > 0) {
+              await this.sleep(remaining, signal);
+              check();
+              signal.throwIfAborted();
+              await prove();
+              check();
+              remaining = this.nextReadAt - this.now();
+            }
+          }
+          let decision: CodexOperationDecision | undefined;
+          let negotiation: number | undefined;
+          try {
+            if (this.deps.supported()) {
+              negotiation = this.deps.negotiation();
+              pendingRead = this.deps.read(request, signal).then(value => {
+                if (value.decision === "wait") this.defer(value);
+                return value;
+              }, error => { this.deferUnavailable(); throw error; });
+              decision = await this.cancellable(pendingRead, signal);
+              // A worker re-registration or feature loss invalidates the old reply.
+              if (!this.deps.supported() || negotiation !== this.deps.negotiation()) decision = undefined;
+            }
+          } catch (error) {
+            // Even a cancelled/obsolete read establishes the shared unavailable
+            // deadline. Only the two strict typed refusals leave the wait route.
+            this.deferUnavailable();
+            if (error instanceof CodexOperationAdmissionError &&
+                (error.reason === "authority_lost" || error.reason === "stale_source")) throw error;
+          }
+          // Set the schedule before checking caller currency: source churn cannot
+          // erase an unsuccessful read's deadline.
+          if (!decision) this.deferUnavailable();
+          else if (decision.decision === "wait") {
+            this.defer(decision);
+          }
+          try {
             check();
             signal.throwIfAborted();
             await prove();
             check();
-            remaining = this.nextReadAt - this.now();
+            signal.throwIfAborted();
+          } catch (error) {
+            // An admitted reply made obsolete by local control cannot bypass the
+            // shared unavailable deadline when its replacement joins the queue.
+            if (decision?.decision === "admit") this.deferUnavailable();
+            throw error;
           }
-        }
-        let decision: CodexOperationDecision | undefined;
-        let negotiation: number | undefined;
-        try {
-          if (this.deps.supported()) {
-            negotiation = this.deps.negotiation();
-            pendingRead = this.deps.read(request, signal).then(value => {
-              if (value.decision === "wait") this.defer(value);
-              return value;
-            }, error => { this.deferUnavailable(); throw error; });
-            decision = await this.cancellable(pendingRead, signal);
-            // A worker re-registration or feature loss invalidates the old reply.
-            if (!this.deps.supported() || negotiation !== this.deps.negotiation()) decision = undefined;
+          if (!decision) this.diagnose("codex_operation_admission_unavailable");
+          else if (decision.decision === "wait") this.diagnose("codex_operation_cooldown");
+          if (decision?.decision === "admit") {
+            let invalidated = false;
+            const permit = (): boolean => {
+              if (!invalidated && (!this.deps.supported() || negotiation !== this.deps.negotiation())) {
+                invalidated = true;
+                this.deferUnavailable();
+              }
+              return !invalidated;
+            };
+            if (permit()) return permit;
           }
-        } catch (error) {
-          // Even a cancelled/obsolete read establishes the shared unavailable
-          // deadline. Only the two strict typed refusals leave the wait route.
-          this.deferUnavailable();
-          if (error instanceof CodexOperationAdmissionError &&
-              (error.reason === "authority_lost" || error.reason === "stale_source")) throw error;
+        } finally {
+          // A cancelled queued waiter must not release successors ahead of prior.
+          void Promise.allSettled([prior, pendingRead]).then(release);
         }
-        // Set the schedule before checking caller currency: source churn cannot
-        // erase an unsuccessful read's deadline.
-        if (!decision) this.deferUnavailable();
-        else if (decision.decision === "wait") {
-          this.defer(decision);
-        }
-        try {
-          check();
-          signal.throwIfAborted();
-          await prove();
-          check();
-          signal.throwIfAborted();
-        } catch (error) {
-          // An admitted reply made obsolete by local control cannot bypass the
-          // shared unavailable deadline when its replacement joins the queue.
-          if (decision?.decision === "admit") this.deferUnavailable();
-          throw error;
-        }
-        if (decision?.decision === "admit") {
-          let invalidated = false;
-          const permit = (): boolean => {
-            if (!invalidated && (!this.deps.supported() || negotiation !== this.deps.negotiation())) {
-              invalidated = true;
-              this.deferUnavailable();
-            }
-            return !invalidated;
-          };
-          if (permit()) return permit;
-        }
-      } finally {
-        clear?.();
-        // A cancelled queued waiter must not release successors ahead of prior.
-        void Promise.allSettled([prior, pendingRead]).then(release);
       }
-    }
+    } finally { clear?.(); }
   }
 
   private deferUnavailable(): void {

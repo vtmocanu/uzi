@@ -4258,7 +4258,7 @@ export class RunRunner {
             this.snapshotRegistry?.setAccountCooldown(runId, flight.claimGeneration, operation, registration);
           return token === undefined ? undefined :
             () => this.snapshotRegistry?.clearAccountCooldown(runId, flight.claimGeneration, token);
-      }, ["root", "child"]);
+      }, ["root", "child"], flight.runLog);
       flight.operationScope.own();
       flight.operationAdmission = flight.operationScope.controller;
       flight.releaseOperationAdmission = () => flight.operationScope?.close();

@@ -142,7 +142,7 @@ export class ReviewRunner {
    *  worker's claim loop keeps going. */
   async execute(claim: ClaimResponse, signal?: AbortSignal): Promise<void> {
     const scope = claim.secrets.codex?.auth_mode === "subscription"
-      ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0) : undefined;
+      ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log) : undefined;
     scope?.own();
     try { await this.executeClaim(claim, signal); }
     finally { scope?.close(); }
@@ -190,7 +190,7 @@ export class ReviewRunner {
         if (registration === undefined || operation.kind !== "advice") return undefined;
         const token = this.activeRuns?.setAccountCooldown(reviewRunId, claim.claim_generation ?? 0, operation, registration);
         return token === undefined ? undefined : () => this.activeRuns?.clearAccountCooldown(reviewRunId, claim.claim_generation ?? 0, token);
-      }, ["advice"]) : undefined;
+      }, ["advice"], this.log) : undefined;
     // Compute the review. Any failure BEFORE the post falls back to a `failed` review so
     // the reviewed run still receives a (report-only) result rather than nothing.
     let review: TaskReviewRequest;

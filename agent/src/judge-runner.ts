@@ -194,7 +194,7 @@ export class JudgeRunner {
    *  failed and returns, so the worker's claim loop keeps going. */
   async execute(claim: ClaimResponse, signal?: AbortSignal): Promise<void> {
     const scope = claim.secrets.codex?.auth_mode === "subscription"
-      ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0) : undefined;
+      ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log) : undefined;
     scope?.own();
     try { await this.executeClaim(claim, signal); }
     finally { scope?.close(); }
@@ -226,7 +226,7 @@ export class JudgeRunner {
         if (registration === undefined || operation.kind !== "advice") return undefined;
         const token = this.activeRuns?.setAccountCooldown(judgeRunId, claim.claim_generation ?? 0, operation, registration);
         return token === undefined ? undefined : () => this.activeRuns?.clearAccountCooldown(judgeRunId, claim.claim_generation ?? 0, token);
-      }, ["advice"]) : undefined;
+      }, ["advice"], this.log) : undefined;
     // Build the review. Any failure BEFORE the post still lands the deterministic
     // command-not-found findings the claim carries (Decision 4): a trace-fetch throw
     // must not lose them, so it falls back rather than failing the run with no review.

@@ -71,7 +71,7 @@ function oldestFirst(a: PendingTerminal, b: PendingTerminal): number {
  */
 export class ActiveRunRegistry {
   /** run_id → {phase, claimGeneration} for every live execution (run-lane + judge/review). */
-  private readonly runs = new Map<string, { phase: ActiveSnapshotPhase; claimGeneration: number; registrationToken: symbol; cooldown?: { token: symbol; operation: CodexOperationIdentity } }>();
+  private readonly runs = new Map<string, { phase: ActiveSnapshotPhase; claimGeneration: number; registrationToken: symbol; cooldowns?: Map<symbol, CodexOperationIdentity> }>();
   /** The single process-monotonic snapshot epoch, shared by every build (starts at 0;
    *  the first build returns 1). */
   private epoch = 0;
@@ -117,23 +117,24 @@ export class ActiveRunRegistry {
     const entry = this.runs.get(runId);
     if (entry && entry.phase !== phase) {
       entry.phase = phase;
-      delete entry.cooldown;
+      delete entry.cooldowns;
     }
   }
 
-  /** Caller selects waiting; each update owns a token so stale clears cannot erase a successor. */
+  /** Display registrations only: select the latest surviving operation, falling back
+   * when it exits. Tokens keep independent waiters and stale clears isolated. */
   setAccountCooldown(runId: string, generation: number, operation: CodexOperationIdentity, registrationToken: symbol): symbol | undefined {
     const entry = this.runs.get(runId);
     if (!entry || entry.registrationToken !== registrationToken || !Number.isSafeInteger(generation) || generation <= 0 ||
         entry.claimGeneration !== generation || !validCodexOperation(operation)) return undefined;
     const token = Symbol();
-    entry.cooldown = { token, operation: structuredClone(operation) };
+    (entry.cooldowns ??= new Map()).set(token, structuredClone(operation));
     return token;
   }
 
   clearAccountCooldown(runId: string, generation: number, token: symbol): void {
     const entry = this.runs.get(runId);
-    if (entry?.claimGeneration === generation && entry.cooldown?.token === token) delete entry.cooldown;
+    if (entry?.claimGeneration === generation) entry.cooldowns?.delete(token);
   }
 
   /** Drop a run once its execution settles (terminal, or parked-and-returned for a
@@ -257,7 +258,7 @@ export class ActiveRunRegistry {
         claim_generation: entry.claimGeneration,
         phase: entry.phase,
         terminal_pending: false,
-        ...(entry.cooldown ? { account_cooldown: structuredClone(entry.cooldown.operation) } : {}),
+        ...(entry.cooldowns?.size ? { account_cooldown: structuredClone([...entry.cooldowns.values()].at(-1)!) } : {}),
       });
     }
 

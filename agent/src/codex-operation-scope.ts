@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { Logger } from "./log.js";
 import type { WorkerClient } from "./client.js";
 import { CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
 import type { CodexOperationIdentity } from "./protocol.js";
@@ -37,7 +38,7 @@ const scopes = new WeakMap<Client, Map<string, Scope>>();
  * operations share scheduling and negotiation history, never an admitted reply. */
 export function acquireCodexOperationScope(client: Client, runId: string, generation: number,
   policy: CodexOperationWaitPolicy = {}, waiting: (operation: CodexOperationIdentity) => (() => void) | undefined = () => undefined,
-  requiredKinds: readonly Kind[] = ["root"]) {
+  requiredKinds: readonly Kind[] = ["root"], logger?: Logger) {
   let runs = scopes.get(client);
   if (!runs) { runs = new Map(); scopes.set(client, runs); }
   const key = JSON.stringify([runId, generation]);
@@ -46,6 +47,7 @@ export function acquireCodexOperationScope(client: Client, runId: string, genera
     const created: Scope = { controller: undefined!, users: 0, ownerClosed: new AbortController(), waiters: new Set() };
     created.controller = new CodexOperationController(generation, {
       ...policy,
+      logger,
       supported: () => client.hasFeature?.("codex_account_operation_admission_v1") ?? false,
       negotiation: () => client.codexOperationNegotiation ?? 0,
       read: (request, signal) => client.checkCodexOperationAdmission?.(runId, request, signal) ?? Promise.reject(new Error("operation admission unavailable")),

@@ -1304,7 +1304,7 @@ export class WorkerClient {
    */
   private serverFeatures = new Set<string>();
   private operationNegotiation = 0;
-  private readonly operationFlights = new Map<string, { generation: number; token: symbol }>();
+  private readonly operationFlights = new Map<string, { generation: number; token: symbol; reportingUnavailable?: boolean }>();
 
   /** Positive negotiation serial survives feature clearing and worker re-registration. */
   get codexOperationNegotiation(): number { return this.operationNegotiation; }
@@ -1582,6 +1582,17 @@ export class WorkerClient {
     return decodeCodexOperationDecision(wire, boundRequest);
   }
 
+  private diagnoseOperationReporting(snapshot: ActiveSnapshot | undefined): void {
+    if (this.hasFeature("active_run_snapshot") && snapshot !== undefined && this.registerNonce !== undefined) return;
+    // Retained bindings exist only for engaged subscription operation flights.
+    // One fixed diagnostic per flight bounds repeated polls and source churn.
+    for (const flight of this.operationFlights.values()) {
+      if (flight.reportingUnavailable) continue;
+      flight.reportingUnavailable = true;
+      try { this.log.warn("codex_operation_snapshot_unavailable"); } catch { /* Display only. */ }
+    }
+  }
+
   private snapshotForServer(snapshot: ActiveSnapshot): ActiveSnapshot {
     return { ...snapshot, active: snapshot.active.map(entry => {
       const { account_cooldown, ...rest } = entry;
@@ -1762,6 +1773,7 @@ export class WorkerClient {
     // `active_run_snapshot` AND the worker built one, stamped with the register nonce so the
     // api can trust its epoch across a restart. Same "byte-identical wire on an old api" shape
     // as `outbox`.
+    this.diagnoseOperationReporting(activeSnapshot);
     const includeSnapshot = this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined && this.registerNonce !== undefined;
     if (includeSnapshot) body.active_snapshot = { ...this.snapshotForServer(activeSnapshot), register_nonce: this.registerNonce };
     if (this.hasFeature("dind_maintenance_v1") && isDindUUID(this.registerNonce)) {
@@ -1927,6 +1939,7 @@ export class WorkerClient {
       const deadline = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);
       deadline.throwIfAborted();
       const body: ClaimRequest = {};
+      this.diagnoseOperationReporting(activeSnapshot);
       if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined && this.registerNonce !== undefined) {
         body.active_snapshot = { ...this.snapshotForServer(activeSnapshot), register_nonce: this.registerNonce };
       }

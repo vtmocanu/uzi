@@ -294,7 +294,7 @@ export class CodexCrossCheck {
   let completedText: string | undefined;
   let failure: { error: unknown } | undefined;
   const operation = binding.authMode === "subscription"
-   ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0) : undefined;
+   ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log) : undefined;
   const failedRoot = new AbortController();
   signal = AbortSignal.any([signal, failedRoot.signal]);
   const stopAdmission = (): void => {
