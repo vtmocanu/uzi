@@ -87,12 +87,19 @@ for (const phase of ["before-successor", "partial-clone", "handoff-write-landed"
   });
 }
 
-test("owner Resume verifies the successor before model admission and preserves its consumed grant after settlement", async t => {
+for (const legacyBudget of [false, true]) test((legacyBudget ? "legacy budget renewal: " : "") + "owner Resume verifies the successor before model admission and preserves its consumed grant after settlement", async t => {
   const claim = gitlabClaim(3527, { claim_generation: 2, worker_recovery_episode: 7, worker_recovery_owner_episode: 0 });
   const bare = await git.ensureClone(fx.originPath);
   fs.chmodSync(path.dirname(bare), 0o700); fs.chmodSync(bare, 0o700);
   const clone = await git.createOrAttachRunnerClone(bare, 3527, noProofReseed, claim.run_id);
   await git.markRecoveryCapture(bare, clone.path, clone.branch, claim.run_id);
+  if (legacyBudget) {
+    const source = { runId: claim.run_id, clonePath: clone.path };
+    for (let i = 0; i < 3; i++) await git.reserveRecoveryIteration(bare, clone.branch, "issue-3527", source, 1, 1, 7);
+    await assert.rejects(git.reserveRecoveryIteration(bare, clone.branch, "issue-3527", source, 1, 1, 7), /budget/);
+    assert.throws(() => command(bare, "config", `uzi-recoveryowner.${claim.run_id}.record`), "old budget journal has no owner record");
+    claim.worker_recovery_episode = 8;
+  }
   fs.writeFileSync(path.join(clone.path, "retained.txt"), "owner retained work\n");
   client.protocolFeatures = ["recovery_cause_retained_recovery_adoption_failed"];
   let failAdoption = true, parks = 0, models = 0, settlements = 0, verified = false;
@@ -148,7 +155,7 @@ test("owner Resume verifies the successor before model admission and preserves i
   assert.equal(parks, 1); assert.equal(models, 0); assert.equal(owner().baseline, 0);
   failAdoption = false;
   claim.claim_generation = 3;
-  claim.worker_recovery_episode = 8;
+  claim.worker_recovery_episode = (claim.worker_recovery_episode ?? 0) + 1;
   claim.worker_recovery_owner_episode = 1;
   await execute();
   assert.equal(parks, 1); assert.equal(models, 1); assert.equal(settlements, 1);

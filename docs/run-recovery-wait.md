@@ -304,6 +304,12 @@ with **no automatic retry**, regardless of any displayed retry timestamp.
 3. If adoption fails again, the run holds again. Without a fresh owner Resume,
    redispatch reholds without another capture or model turn.
 
+A valid legacy budget-exhaustion renewal on an upgraded worker records its raw
+owner baseline before recovery work. If adoption then fails, the next owner
+Resume can authorize a new verified attempt. An already-blocked adoption journal
+without that baseline cannot gain execution authority from Resume alone; retain
+and export/recover its work instead.
+
 Resume preserves remaining run wall time and may require an extension. Timers,
 token changes and credential changes do not release this hold. Default CLI wait,
 log follow and the watcher stop for the owner decision; explicit `--until` keeps

@@ -1616,9 +1616,14 @@ cannot replace the pending charge stops or reholds an already-persisted blocker;
 it does not relabel an accounting interruption as an integrity refusal.
 Uncertain writes stop with sources retained.
 
-The baseline is established on an eligible nonblocked charge before adoption
-failure; a missing baseline on an already-blocked journal is not reconstructed
-from the next claim. The consumed high-water mark survives episode completion,
+The baseline is established before adoption can fail, on an eligible nonblocked
+charge or a valid legacy `budget_exhausted` renewal under the existing episode
+and fresh-claim guards. With a valid raw owner value, that renewal records the
+current value as both baseline and consumed high-water through the same pending,
+precharge and committed readbacks. It creates no additional owner grant; a later
+adoption retry still needs a new owner Resume. A missing baseline on an
+already-blocked `adoption_failed` journal is never reconstructed from the next
+claim. The consumed high-water mark survives episode completion,
 explicit discard and verified retirement: removing recovery evidence does not
 mint another owner grant. This accounting record supplies no source-deletion,
 custody-release or model authority by itself.

@@ -7294,9 +7294,12 @@ export class GitCache {
         backoffMs: recoveryRetryMs * 2 ** Math.min(renewal ? 0 : old?.attempts ?? 0, 4), stage: "capturing",
       };
       if (renewal) delete recovery.blocker;
-      // Bootstrap only an eligible, nonblocked charge with an actual raw owner baseline.
+      // A valid legacy budget renewal may establish the baseline before work too.
+      // The renewal/new-claim guards above already admitted that charge; blocked
+      // adoption still requires an existing record and cannot bootstrap here.
       // A completed episode can change source, but never resets the consumed highwater.
-      if (!owner && old?.stage !== "blocked" && claimGeneration !== undefined && ownerGrant(rawOwnerGrant)) {
+      const bootstrapEligible = old?.stage !== "blocked" || (old.blocker === "budget_exhausted" && renewal);
+      if (!owner && bootstrapEligible && claimGeneration !== undefined && ownerGrant(rawOwnerGrant)) {
         owner = { version: 1, bare: await this.recoveryOwnerBareIdentity(barePath), runId: journal.runId,
           branch, key, source, root: recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
             ...(journal.attemptId ? { attemptId: journal.attemptId } : {}) }),

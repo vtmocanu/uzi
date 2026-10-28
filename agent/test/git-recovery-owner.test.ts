@@ -129,7 +129,7 @@ test("changed journal source, root and reservation refuse resolution and renewal
   }
 });
 
-test("bootstrap requires a positive claim fence and never occurs on an existing blocker", async () => {
+test("bootstrap requires a positive claim fence and never reconstructs blocked adoption", async () => {
   const f = ownerFixture();
   await f.recreate().reserveRecoveryIteration(f.bare, f.branch, f.key, f.source, 1, undefined, 7, 0);
   assert.equal(f.values.has(f.ownerKey), false);
@@ -318,3 +318,28 @@ test("pending BEFORE budget needs derived renewal; ordinary charge needs no raw 
   await assert.rejects(g.reserve(2, 0, 7)); g.fault();
   assert.equal((await g.reserve(3, 0, 7)).attempts, 2);
 });
+
+for (const baseline of [0, 3]) {
+  test(`legacy budget renewal bootstraps raw owner baseline ${baseline} before adoption can fail`, async () => {
+    const f = ownerFixture();
+    const legacy = f.recreate();
+    const reserveLegacy = () => legacy.reserveRecoveryIteration(f.bare, f.branch, f.key, f.read(), 1000, 1, 7);
+    for (let i = 0; i < 3; i++) await reserveLegacy();
+    await assert.rejects(reserveLegacy(), /budget/);
+    assert.equal(f.read().recovery!.blocker, "budget_exhausted");
+    assert.equal(f.values.has(f.ownerKey), false);
+    const renewed = await f.reserve(2, baseline, 8);
+    assert.equal(renewed.attempts, 1);
+    assert.ok(f.values.has(f.ownerKey), "eligible legacy budget renewal must persist its owner baseline before work");
+    const owner = JSON.parse(f.values.get(f.ownerKey)![0]!);
+    assert.equal(owner.baseline, baseline);
+    assert.equal(owner.consumed, baseline, "bootstrap snapshots the existing grant without inventing another");
+    assert.equal(owner.state, "committed");
+    await f.block();
+    await assert.rejects(f.reserve(3, baseline, 99), /blocked/);
+    assert.equal((await f.reserve(3, baseline + 1, 9)).attempts, 1);
+    assert.equal(JSON.parse(f.values.get(f.ownerKey)![0]!).consumed, baseline + 1);
+    await f.block();
+    await assert.rejects(f.reserve(4, baseline + 1, 100), /blocked/);
+  });
+}
