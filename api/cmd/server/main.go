@@ -362,15 +362,20 @@ func run() error {
 		// internally consistent while the meter and the selector disagreed about the
 		// same token, with nothing going red.
 		Autoselect: cfg.AutoselectPolicy(),
+		// PRD #3522: the weekly usage reserve's freshness window is three of these, the rule the
+		// rate-limit surfaces already apply.
+		UsagePollInterval:      cfg.UsagePollInterval,
+		CodexUsagePollInterval: cfg.CodexUsagePollInterval,
 		// PRD #35 usage-limit park. Both are server-side bounds on a WORKER-REPORTED
 		// event: the worker asks to park, the server decides for how long and how often.
 		RunLimitMaxWaits: cfg.RunLimitMaxWaits,
 		RunLimitMaxPark:  cfg.RunLimitMaxPark,
 		// Transient-recovery park (issue #1197): the base/ceiling of the server-owned
-		// exponential backoff the sweeper auto-promotes a 'recovery_wait' run on. No
-		// per-run cap — a park always becomes promotable again.
-		RunRecoveryParkBase: cfg.RunRecoveryParkBase,
-		RunRecoveryMaxPark:  cfg.RunRecoveryMaxPark,
+		// exponential backoff used by timed recovery parks. Codex idle stalls have
+		// their own count bound and wait for owner Resume above that bound.
+		RunCodexIdleStallMaxParks: cfg.RunCodexIdleStallMaxParks,
+		RunRecoveryParkBase:       cfg.RunRecoveryParkBase,
+		RunRecoveryMaxPark:        cfg.RunRecoveryMaxPark,
 		// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2): past this many forge parks
 		// the run fails with fail_origin='forge_unreachable' instead of parking again. 0 =
 		// unlimited. Counted separately from the recovery-park backoff (recovery_wait_count).
@@ -789,6 +794,9 @@ func run() error {
 		WorkerAffinityGrace:     cfg.WorkerAffinityGrace,
 		WorkerStaleRequeueGrace: cfg.WorkerStaleRequeueGrace,
 		WorkerAffinityCeiling:   cfg.WorkerAffinityCeiling,
+		// PRD #3522: the weekly usage reserve's freshness window for provisionOne's recheck.
+		UsagePollInterval:      cfg.UsagePollInterval,
+		CodexUsagePollInterval: cfg.CodexUsagePollInterval,
 		// Issue #1965: lane workers are provisioned only where the chart enabled the lane.
 		IsolatedLaneEnabled: cfg.IsolatedLaneEnabled(),
 		DockerEnabled:       cfg.WorkerDockerEnabled,

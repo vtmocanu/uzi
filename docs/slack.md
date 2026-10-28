@@ -285,7 +285,7 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   page. **Guardrail override decided** fires when an admin approves or
   rejects your [guardrail override
   request](./admin-settings.md#guardrail-override-per-repo), and links the
-  Boards page. All three need Slack enabled and your account linked, like
+  Repos page. All three need Slack enabled and your account linked, like
   every DM here. If Slack does not take one of the two halt DMs the first
   time (a full queue, a Slack error), uzi retries it every few minutes for
   up to about a day, so you may rarely see one twice or a while after the

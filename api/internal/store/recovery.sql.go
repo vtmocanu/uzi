@@ -1502,7 +1502,7 @@ WHERE h.state = 'open' AND NOT h.inventory_guarded
   AND NOT EXISTS (SELECT 1 FROM runs r
                     WHERE r.id = h.run_id
                       AND r.status = 'recovery_wait'
-                      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted'))
+                      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed'))
   AND (
       EXISTS (SELECT 1 FROM runs r
                 WHERE r.id = h.run_id
@@ -1942,7 +1942,7 @@ WHERE target.id = $2 AND target.state = 'open' AND NOT target.inventory_guarded
   AND NOT EXISTS (
       SELECT 1 FROM locked_run r
       WHERE r.status = 'recovery_wait'
-        AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted')
+        AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')
   )
 `
 
@@ -1991,7 +1991,7 @@ WHERE run_id = $2
   AND live_worker_id = $4::uuid
   AND state = 'open' AND NOT inventory_guarded
   AND NOT EXISTS (SELECT 1 FROM locked_run r WHERE r.status = 'recovery_wait'
-      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted'))
+      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed'))
 `
 
 type ReleaseCustodyHoldExactParams struct {

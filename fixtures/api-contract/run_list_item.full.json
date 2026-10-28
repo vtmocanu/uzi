@@ -12,6 +12,27 @@
     "can_resume": true,
     "can_cancel": true
   },
+  "capability_provenance": {
+    "hints_known": true,
+    "inference_known": true,
+    "capabilities": [
+      {
+        "capability": "x",
+        "sources": [
+          "x"
+        ],
+        "required": true,
+        "inference_ignored": true,
+        "triggers": [
+          {
+            "path": "x",
+            "reason": "x"
+          }
+        ],
+        "truncated": true
+      }
+    ]
+  },
   "completion_pending": {
     "version": 1,
     "contract_revision": 1,
@@ -465,6 +486,10 @@
   "health_since": "2020-01-02T03:04:05Z",
   "deadline_at": "2020-01-02T03:04:05Z",
   "queue_reason": "x",
+  "reserve_hold_reason": "x",
+  "reserve_exempt_until": "2020-01-02T03:04:05Z",
+  "codex_admission_class": "x",
+  "codex_admission_eligible_at": "2020-01-02T03:04:05Z",
   "plan_md": "x",
   "plan_source": "x",
   "gate_revision": 1,
@@ -682,6 +707,9 @@
   "override_subagent_model": true,
   "priority": "x",
   "required_capabilities": [
+    "x"
+  ],
+  "ignored_inferred_capabilities": [
     "x"
   ],
   "required_tools": [

@@ -12,6 +12,7 @@ import (
 )
 
 const recoveryCauseRetainedRecoveryExhausted = "retained_recovery_exhausted"
+const recoveryCauseRetainedRecoveryAdoptionFailed = "retained_recovery_adoption_failed"
 
 // claimRecoveryEpisode projects harness recovery restarts without changing the stored
 // worker-death allowance or its finalize/requeue predicates.
@@ -53,7 +54,7 @@ func (s *Service) parkRetainedRecovery(ctx context.Context, wkr store.Worker, ow
 	default:
 		return run, 0, nil
 	}
-	counted := int64(run.RetainedParkCount) < int64(s.p.RunRetainedRecoveryMaxParks)
+	counted := *req.RecoveryCause == recoveryCauseRetainedRecoveryExhausted && int64(run.RetainedParkCount) < int64(s.p.RunRetainedRecoveryMaxParks)
 	retry := pgtype.Timestamptz{}
 	if counted {
 		retry = pgconv.Time(s.now().Add(s.recoveryParkFallbackFor(run.RetainedParkCount) + recoveryParkJitter()))
@@ -66,7 +67,7 @@ func (s *Service) parkRetainedRecovery(ctx context.Context, wkr store.Worker, ow
 	}
 	parked, err := q.ParkRunRetainedRecovery(ctx, store.ParkRunRetainedRecoveryParams{
 		ID: run.ID, WorkerID: workerID, ClaimGeneration: *req.ClaimGeneration,
-		Counted: counted, RetryNotBefore: retry, SessionID: sessionID,
+		RecoveryCause: *req.RecoveryCause, Counted: counted, RetryNotBefore: retry, SessionID: sessionID,
 		CheckpointContainsLatest: checkpoint,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {

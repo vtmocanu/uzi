@@ -185,6 +185,7 @@ uzi auth status [--all]
 uzi whoami
 uzi settings
 uzi settings get
+uzi settings reserve
 uzi context list
 uzi context current
 uzi context use <name>
@@ -342,7 +343,7 @@ uzi version
 ### Account settings
 
 - `uzi settings` — show settings command help.
-- `uzi settings get` — read your own non-secret account settings; no setters.
+- `uzi settings get` — read your own non-secret account settings.
   The default table shows the Claude and Codex plan cross-check cells, including
   active/inactive status, stored model/effort pins, worker default model,
   resolved model/effort, and their sources (`pin` or `worker default`, with
@@ -351,6 +352,18 @@ uzi version
   server reports inactive is still shown; its stored pin remains visible. Table rendering inspects at most twenty response cells and
   displays each harness once. `uzi settings get --json` returns the settings
   object at the top level, including `cross_check_pins` and source fields.
+  The table output ends with a `Weekly usage reserve:` line (`off`, or the threshold
+  and whether running runs are paused); `--json` carries `weekly_reserve_pct` (null =
+  off) and `weekly_reserve_pause_running`.
+- `uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]` — set
+  your weekly usage reserve, the 7-day utilization percent at which uzi stops starting
+  runs on your subscription (and, with pausing on, pauses running runs at their next
+  milestone). `--threshold` is required: an integer from 1 to 100, or `off`.
+  `--pause-running` / `--pause-running=false` sets whether running runs are also paused;
+  when omitted the current value is kept (the command reads your settings first).
+  Prints the resulting reserve; `--json` returns `weekly_reserve_pct` and
+  `weekly_reserve_pause_running`. Usage exit 2 on an out-of-range threshold. A uzc_ token
+  can run it.
 
 ### Named contexts
 
@@ -424,6 +437,8 @@ uzi version
   `worker_requeue_exhausted`, owner Resume/Cancel only, no timer — or
   retained-source budget exhaustion, `retained_recovery_exhausted`, with three
   timed retries by default followed by an owner hold (NULL retry) — or
+  an integrity refusal, `retained_recovery_adoption_failed`, owner Resume/Cancel
+  with no automatic retry regardless of retry timing — or
   because the forge was unreachable at clone — cause `forge_unreachable`, capped by
   `RUN_FORGE_UNREACHABLE_MAX_PARKS`; the sweep retries it on a capped backoff; cause
   `codex_account_unavailable` is held on its Codex account until that account is usable
@@ -443,7 +458,10 @@ uzi version
   always works) or `credential_switch_unsettled` (the worker finished its own operations
   but the run's processes were not proven stopped; work and custody stay on that worker;
   Resume requeues on the newly chosen token and the next claim re-proves quiescence fail
-  closed, or Cancel);
+  closed, or Cancel); or the weekly usage reserve, `hold_reason` `weekly_reserve` (the credential the
+  run spends reached the owner's weekly threshold; it releases by itself once usage drops below it,
+  and `uzi run resume <id>` overrides the reserve until the next weekly reset, printing
+  `Resumed <id>: queued (overrides the weekly usage reserve until the next weekly reset).`);
   ordinary pauses do not auto-resume). System holds also use `paused`; follow
   their hold-specific remedy. Human `run get` may distinguish execution paths
   using current pause evidence, otherwise it says `paused`. `park_run` and
@@ -480,7 +498,8 @@ uzi version
   bare wait stops there too), `completed`, `failed`, `cancelled` — and keeps
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
   `recovery_wait`/`paused`, except a default wait stops on recovery cause
-  `worker_requeue_exhausted`, `worker_memory_pressure`, owner-held
+  `worker_requeue_exhausted`, `worker_memory_pressure`,
+  `retained_recovery_adoption_failed`, owner-held
   `retained_recovery_exhausted` (NULL retry), or a paused credential-switch hold (`credential_switch_settling` /
   `credential_switch_unsettled`; it prints the next step on stderr): timed limit and recovery waits retry on a timer, pool waits
   need an available pooled token, and ordinary owner or lead pauses need `uzi run resume`. A
@@ -809,6 +828,21 @@ uzi version
   `landing_state` is `needs_landing` carries human-landable work: recover it with
   `uzi run export` when an archive is available, or from the preserved diff
   (`uzi run get <run-id> --field preserved_patch`) when it isn't.
+  An integrity refusal is `recovery_wait` / `retained_recovery_adoption_failed`:
+  local work and custody are preserved, with no automatic retry regardless of
+  retry timing. Read `uzi run recovery <id>` and export an available archive
+  before owner Resume/Cancel. Resume requests another bounded attempt; success
+  is not assured and repeated adoption failure holds again. Without a new owner
+  grant, redispatch reholds without capture or model execution. A fresh positive
+  claim generation and unconsumed raw `worker_recovery_owner_episode` grant,
+  exact source/reservation identity, current ownership and quiescence are required;
+  the derived `worker_recovery_episode` alone cannot renew adoption. Default wait,
+  log follow and watcher stop; explicit `--until` keeps its selected set. Timers,
+  token changes and credential changes do not release the hold. Resume preserves
+  remaining wall and may need extension. Each fresh claim adds counted custody;
+  retained successors can consume disk and block image rolls. Earlier archives
+  may omit latest work; losing local storage or resuming on a peer can lose it.
+  See [adoption retry guidance](../../../../docs/run-recovery-wait.md#retained-recovery-adoption-failed).
   Retained-source exhaustion is `recovery_wait` / `retained_recovery_exhausted`.
   A finite retry, including due, means timed retry; NULL means owner-held without
   a countdown; omitted timing is unknown. Default wait/log follow stop on the

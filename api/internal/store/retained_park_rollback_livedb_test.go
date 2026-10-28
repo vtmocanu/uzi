@@ -83,6 +83,10 @@ func TestRetainedParkRollbackLiveDB(t *testing.T) {
 	for _, id := range ids {
 		before[id] = snapshot(preserved, id)
 	}
+	// Roll back the additive cause first: earlier LiveDB tests may leave its rows.
+	for _, stmt := range migrationDownStatements(t, "00372_retained_recovery_adoption_failed.sql") {
+		exec(stmt)
+	}
 	for _, stmt := range migrationDownStatements(t, "00362_retained_recovery_parks.sql") {
 		exec(stmt)
 	}

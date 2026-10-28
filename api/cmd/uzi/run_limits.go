@@ -101,7 +101,10 @@ func newRunResumeNowCmd(env Env, gf *globalFlags) *cobra.Command {
 // a plain RunDTO that carries neither the worker's NAME nor its liveness (draining/gone),
 // which the richer "pinned to worker <name> …" wording would need — and the PRD is explicit
 // that a round-trip must not be added just for that wording — so the plain form is what a CLI
-// resume prints today. --json emits the run object for the agent contract.
+// resume prints today. The pre-resume read binds policy actions to the presented hold in every
+// output mode. Human output also uses that read so the weekly-usage-reserve override line names
+// only a resume that lifted a reserve hold (an exemption from an earlier resume survives an
+// ordinary one). --json emits the run object for the agent contract.
 func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 	var guidance string
 	var fresh bool
@@ -129,6 +132,7 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			p := env.printer(gf)
 			if err := validatePolicyGuidance(guidance); err != nil {
 				return err
 			}
@@ -151,16 +155,21 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			} else if cmd.Flags().Changed("fresh-session") || cmd.Flags().Changed("guidance") {
 				return uzicli.Exitf(uzicli.ExitUsage, "--fresh-session and --guidance require a paused policy context")
 			}
+			reserveHold := presented.HoldReason != nil && *presented.HoldReason == holdWeeklyReserve
 			run, err := c.ResumeRunNowWithOptions(cmd.Context(), args[0], opts)
 			if err != nil {
 				return err
 			}
-			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(run)
 			}
 			if !gf.quiet {
-				p.Printf("Resumed %s: queued.\n", args[0])
+				if reserveHold && run.ReserveExemptUntil != nil {
+					// The server records the override only when it resumed a weekly_reserve hold.
+					p.Printf("Resumed %s: queued (overrides the weekly usage reserve until the next weekly reset).\n", args[0])
+				} else {
+					p.Printf("Resumed %s: queued.\n", args[0])
+				}
 				if w := run.WorkerRecovery; w != nil && w.Episode > 0 {
 					p.Printf("Worker recovery episode %d; only owner Resume from exhaustion starts a fresh worker recovery episode; automatic requeue allowance %d; %d used, %d remaining; lifetime charged count %d.\n", w.Episode, w.AutomaticRequeueLimit, w.EpisodeUsed, w.EpisodeRemaining, run.RequeueCount)
 					if w.AutomaticRequeueLimit == 0 {

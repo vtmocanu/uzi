@@ -2,6 +2,8 @@ package workersvc
 
 import (
 	"context"
+	"errors"
+	"math"
 	"math/rand"
 	"time"
 
@@ -11,24 +13,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Transient-recovery park (issue #1197): the server's half of the 'recovery_wait' status.
-//
-// It is modelled CLOSELY on the usage-limit park (limitwait.go's setLimitWait +
-// limitParkFallbackFor + limitParkJitter) but with two deliberate differences that are the
-// whole point of it being a RECOVERY park rather than a LIMIT park:
-//
-//   - NO lifetime cap. There is no RUN_RECOVERY_MAX_WAITS and no budget-exhausted branch:
-//     recoveryParkFallbackFor ALWAYS returns a finite positive duration, so a park always
-//     becomes promotable again. The sweeper (PromoteRecoveryWaitRuns) auto-resumes the run
-//     at the capped cadence until it recovers or the owner cancels (CancelRunServerSide's
-//     negative admit-set covers a recovery_wait run for free).
-//   - NO terminal / opt-out / gauge branch. Unlike decideLimitPark there is no opt-out,
-//     no credential cross-check and no failure path here — a recovery_wait report always
-//     parks. recovery_wait_count shapes the backoff curve ONLY; it is never a limit.
-//
-// This is the reusable transient-recovery park PRIMITIVE: any transient cause can report
-// `recovery_wait` and reuse the capture->park->promote->reclaim lifecycle, so issue #1088's
-// provider classifier can adopt it later without building a competing mechanism.
+// Ordinary recovery parks retry with capped backoff. Codex idle stalls also
+// count a park-observed streak and hold for the owner after RunCodexIdleStallMaxParks.
 
 // Recovery-park jitter bounds. Smaller than the usage-limit park's 60-180s because the
 // recovery base is minutes-scale, not hours: this spreads a promoted wave of recovering
@@ -91,23 +77,16 @@ func recoveryParkJitter() time.Duration {
 	return recoveryParkJitterMin + time.Duration(rand.Int63n(int64(recoveryParkJitterMax-recoveryParkJitterMin+1))) //nolint:gosec // G404: retry jitter spreads promotion waves; not a security token
 }
 
-// setRecoveryWait is SetState's `recovery_wait` arm: the impure half of the transient park.
-//
-// It mirrors setLimitWait's signature/shape but is far simpler — there is no decision to
-// make. Every recovery_wait report parks: the server computes retry_not_before = now +
-// capped-exponential-backoff + jitter and calls SetRunRecoveryWait, whose POSITIVE source
-// guard (status='running') makes a re-delivered/out-of-order report a 0-row no-op that
-// SetState maps to applied=false / 409 (idempotent, like the limit park). It returns the
-// row count SetState maps to `applied`.
-//
-// The StateRequest parameter carries the reported claim_generation (threaded to the per-query
-// fence, PRD #1247 M5a-1 rework) and the already-validated recovery_cause, of which only
-// 'vault_locked' is persisted (recoveryCauseStored, issue #1766 M2).
+// setRecoveryWait opens the claim mutation transaction. Typed idle accounting
+// requires this transaction; callers already holding it use setRecoveryWaitLocked.
 type recoveryWaitWriter interface {
 	SetRunRecoveryWait(context.Context, store.SetRunRecoveryWaitParams) (int64, error)
 }
 
 func (s *Service) setRecoveryWait(ctx context.Context, writer recoveryWaitWriter, cause pgtype.Text, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
+	if cause.Valid && cause.String == recoveryCauseCodexIdleStall && s.txBeginner == nil {
+		return 0, errors.New("idle stall park unavailable: no tx beginner")
+	}
 	if s.txBeginner != nil {
 		locked, current, tx, err := s.beginClaimMutation(ctx, wkr, run.ID, req.ClaimGeneration)
 		if err != nil {
@@ -129,30 +108,55 @@ func (s *Service) setRecoveryWait(ctx context.Context, writer recoveryWaitWriter
 // setRecoveryWaitLocked stays on an existing fenced run transaction. Its caller
 // must already have checked claim generation and release under the run lock.
 func (s *Service) setRecoveryWaitLocked(ctx context.Context, writer recoveryWaitWriter, cause pgtype.Text, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
-	retryNotBefore := s.now().Add(s.recoveryParkFallbackFor(run.RecoveryWaitCount) + recoveryParkJitter())
+	idle := cause.Valid && cause.String == recoveryCauseCodexIdleStall
+	if idle {
+		if req.ClaimGeneration == nil || *req.ClaimGeneration <= 0 {
+			return 0, ErrMissingClaimGeneration
+		}
+		if run.ClaimGeneration != *req.ClaimGeneration || run.ClaimReleasedAt.Valid {
+			return 0, ErrStaleClaim
+		}
+		if run.Status != "running" {
+			return 0, nil
+		}
+		if run.StopKind.Valid && run.StopKind.String != "" {
+			return s.q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{ID: run.ID, WorkerID: pgconv.UUID(wkr.ID)})
+		}
+	}
+	retry := pgconv.Time(s.now().Add(s.recoveryParkFallbackFor(run.RecoveryWaitCount) + recoveryParkJitter()))
+	var idleCount pgtype.Int4
+	if idle {
+		count := run.IdleStallParkCount
+		if req.ProviderProgressTurns != nil && *req.ProviderProgressTurns > 0 {
+			count = 1
+		} else if count < math.MaxInt32 {
+			count++
+		}
+		idleCount = pgtype.Int4{Int32: count, Valid: true}
+		if int64(count) > int64(s.p.RunCodexIdleStallMaxParks) {
+			retry = pgtype.Timestamptz{}
+		}
+	}
 	return writer.SetRunRecoveryWait(ctx, store.SetRunRecoveryWaitParams{
 		ResetProviderStreak: req.ProviderProgressTurns != nil && *req.ProviderProgressTurns > 0 &&
-			(req.RecoveryCause == nil || *req.RecoveryCause == "empty_turn"),
-		RecoveryCause:  cause,
-		RetryNotBefore: pgconv.Time(retryNotBefore),
-		SessionID:      sessionID,
-		ID:             run.ID,
-		WorkerID:       pgconv.UUID(wkr.ID),
+			(idle || req.RecoveryCause == nil || *req.RecoveryCause == "empty_turn"),
+		RecoveryCause:      cause,
+		RetryNotBefore:     retry,
+		IdleStallParkCount: idleCount,
+		SessionID:          sessionID,
+		ID:                 run.ID,
+		WorkerID:           pgconv.UUID(wkr.ID),
 		// PRD #1247 M5a-1 rework (reviewer NB1): the reported generation, threaded to the fence in
 		// SetRunRecoveryWait. A stale/reclaimed old flight's park matches 0 rows; nil parks unfenced.
 		ClaimGeneration: pgconv.Int8Ptr(req.ClaimGeneration),
 	})
 }
 
-// recoveryCauseStored is the recovery_wait_cause the ordinary park writes for a reported cause
-// (issue #1766 M2). Only 'vault_locked' is persisted; every other cause, and an absent one, is
-// stored NULL — empty_turn stays the untyped park (PRD #1392 D9); provider_outage never reaches
-// this park either (PRD #1733: SetState routes it to parkProviderOutage, which stores and counts
-// it), nor does forge_unreachable (SetState routes it to parkForgeUnreachable), nor
-// does data_volume_full (routed to parkDataVolumeFull, PRD #1809 M5).
+// recoveryCauseStored retains ordinary causes with distinct owner controls.
+// Other typed parks have separate writers; empty_turn remains untyped.
 func recoveryCauseStored(cause *string) pgtype.Text {
-	if cause != nil && *cause == recoveryCauseVaultLocked {
-		return pgtype.Text{String: recoveryCauseVaultLocked, Valid: true}
+	if cause != nil && (*cause == recoveryCauseVaultLocked || *cause == recoveryCauseCodexIdleStall) {
+		return pgtype.Text{String: *cause, Valid: true}
 	}
 	return pgtype.Text{}
 }

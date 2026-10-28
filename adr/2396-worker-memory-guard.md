@@ -50,6 +50,8 @@ The later #3495 amendment in [ADR-1197](1197-transient-recovery-park.md) adds
 `retained_recovery_exhausted` to that conservative custody protection for its
 whole wait, including timed parks. This changes neither memory holds' owner-only
 Resume policy nor the proof required to release custody after a park ends.
+The #3527 amendment there also protects `retained_recovery_adoption_failed`
+throughout its owner-held wait, before archive readiness or capture progress.
 
 ### D7: Rollout, disable and command deadlines
 

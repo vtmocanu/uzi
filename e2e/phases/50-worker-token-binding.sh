@@ -336,10 +336,8 @@ pass "binding-phase cleanup: the three claimed binding runs terminated so they c
 
   # Public CreateWorker has no ephemeral flag. Seed only this freshly API-created
   # worker as ephemeral, as manual_cordon_livedb_test.go does; never fake affinity.
-  M5_EPHEMERAL="$(apipost /api/workers "{\"name\":\"ephemeral-$M5_FIXTURE\"}" | jq -er '.worker.id')"
-  m5_uuid "$M5_EPHEMERAL" || fail "manual intake: ephemeral fixture UUID missing"
-  [ "$(db_psql "UPDATE workers SET ephemeral=true WHERE id='$M5_EPHEMERAL' AND user_id='$M5_OWNER'
-    AND NOT ephemeral RETURNING id")" = "$M5_EPHEMERAL" ] || fail "manual intake: ephemeral seed owner mismatch"
+  # With no bound run it may be reaped on any tick. Retry only verified absence;
+  # a surviving row, transport/SQL error, or wrong rejection is still a failure.
   m5_ephemeral_snapshot() {
     db_psql "SELECT jsonb_build_object(
       'tuple',jsonb_build_array(manual_cordoned_at,manual_cordoned_by,manual_cordoned_by_label,manual_cordon_reason),
@@ -347,24 +345,44 @@ pass "binding-phase cleanup: the three claimed binding runs terminated so they c
         FROM worker_cordon_events e WHERE e.worker_id=w.id))::text
       FROM workers w WHERE id='$M5_EPHEMERAL' AND user_id='$M5_OWNER'"
   }
-  M5_EPHEMERAL_BEFORE="$(m5_ephemeral_snapshot)"
-  [ -n "$M5_EPHEMERAL_BEFORE" ] || fail "manual intake: missing ephemeral snapshot"
-  for M5_METHOD in POST DELETE; do
-    M5_REJECTION="$(curl -sS -w $'\n%{http_code}' -b "$JAR" -X "$M5_METHOD" \
-      "$BASE/api/workers/$M5_EPHEMERAL/cordon" -H 'Content-Type: application/json' \
-      -H "X-CSRF-Token: $(csrf)" -d '{}')"
-    [ "${M5_REJECTION##*$'\n'}" = 409 ] || fail "manual intake: ephemeral $M5_METHOD did not return 409"
-    printf '%s' "${M5_REJECTION%$'\n'*}" | jq -e \
-      '.error == "manual cordon is only supported for persistent workers"' >/dev/null \
-      || fail "manual intake: ephemeral conflict reason mismatch"
-    [ "$(m5_ephemeral_snapshot)" = "$M5_EPHEMERAL_BEFORE" ] \
-      || fail "manual intake: ephemeral rejection changed manual tuple or audit events"
+  M5_EPHEMERAL_OK=0
+  for M5_ATTEMPT in 1 2 3; do
+    M5_EPHEMERAL="$(apipost /api/workers "{\"name\":\"ephemeral-$M5_FIXTURE-$M5_ATTEMPT\"}" | jq -er '.worker.id')" \
+      || fail "manual intake: ephemeral fixture creation failed"
+    m5_uuid "$M5_EPHEMERAL" || fail "manual intake: ephemeral fixture UUID missing"
+    M5_SEEDED="$(db_psql "UPDATE workers SET ephemeral=true WHERE id='$M5_EPHEMERAL' AND user_id='$M5_OWNER'
+      AND NOT ephemeral RETURNING id")" || fail "manual intake: ephemeral seed failed"
+    if [ "$M5_SEEDED" != "$M5_EPHEMERAL" ]; then
+      if [ -z "$M5_SEEDED" ] && fixture_worker_absent "$M5_EPHEMERAL"; then continue; fi
+      fail "manual intake: ephemeral seed owner mismatch"
+    fi
+    M5_EPHEMERAL_BEFORE="$(m5_ephemeral_snapshot)" || fail "manual intake: ephemeral snapshot failed"
+    if [ -z "$M5_EPHEMERAL_BEFORE" ]; then
+      if fixture_worker_absent "$M5_EPHEMERAL"; then continue; fi
+      fail "manual intake: missing ephemeral snapshot"
+    fi
+    for M5_METHOD in POST DELETE; do
+      M5_REJECTION="$(curl -sS --max-time 10 -w $'\n%{http_code}' -b "$JAR" -X "$M5_METHOD" \
+        "$BASE/api/workers/$M5_EPHEMERAL/cordon" -H 'Content-Type: application/json' \
+        -H "X-CSRF-Token: $(csrf)" -d '{}')" || fail "manual intake: ephemeral $M5_METHOD transport failed"
+      if [ "${M5_REJECTION##*$'\n'}" = 404 ] && fixture_worker_absent "$M5_EPHEMERAL"; then continue 2; fi
+      [ "${M5_REJECTION##*$'\n'}" = 409 ] || fail "manual intake: ephemeral $M5_METHOD did not return 409"
+      printf '%s' "${M5_REJECTION%$'\n'*}" | jq -e \
+        '.error == "manual cordon is only supported for persistent workers"' >/dev/null \
+        || fail "manual intake: ephemeral conflict reason mismatch"
+      M5_EPHEMERAL_AFTER="$(m5_ephemeral_snapshot)" || fail "manual intake: ephemeral snapshot failed"
+      if [ -z "$M5_EPHEMERAL_AFTER" ] && fixture_worker_absent "$M5_EPHEMERAL"; then continue 2; fi
+      [ "$M5_EPHEMERAL_AFTER" = "$M5_EPHEMERAL_BEFORE" ] \
+        || fail "manual intake: ephemeral rejection changed manual tuple or audit events"
+    done
+    # Both verbs and their unchanged tuple/audit snapshots were observed on one
+    # surviving peer. Its subsequent reaping is already a successful cleanup.
+    remove_fixture_ephemeral_worker "$M5_EPHEMERAL" "$M5_OWNER" || fail "manual intake: ephemeral cleanup failed"
+    M5_EPHEMERAL=""
+    M5_EPHEMERAL_OK=1
+    break
   done
-  # Remove the unsuitable peer before health classification, leaving exactly one
-  # persistent peer for this owner. No shared worker lifecycle is changed here.
-  [ "$(db_psql "DELETE FROM workers WHERE id='$M5_EPHEMERAL' AND user_id='$M5_OWNER' AND ephemeral RETURNING id")" = "$M5_EPHEMERAL" ] \
-    || fail "manual intake: ephemeral cleanup failed"
-  M5_EPHEMERAL=""
+  [ "$M5_EPHEMERAL_OK" = 1 ] || fail "manual intake: ephemeral fixture reaped on every attempt"
   [ "$(db_psql "SELECT count(*) FROM workers WHERE user_id='$M5_OWNER'")" = 1 ] \
     || fail "manual intake: expected only the owned persistent worker"
 

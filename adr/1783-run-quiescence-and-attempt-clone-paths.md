@@ -946,8 +946,15 @@ This original terminal policy is narrowed by the #3495 amendment in
 `budget_exhausted` blocker can enter bounded timed retries, then an owner-held
 park, when the API advertises support. Owner Resume of either retained park
 can also renew the budget on a fresh claim; automatic grants contribute to
-the derived claim episode. Other blockers and the documented compatibility
-fallback still end `failed` with `keepCustody`, with no failed-run Resume.
+the derived claim episode. The later #3527 amendment adds an owner-held
+`retained_recovery_adoption_failed` park for exact persisted adoption refusal,
+with current ownership and quiescence proved. A fresh raw owner grant and
+fresh owned claim renew one charged window; no grant reholds without capture
+or model execution. Repeated adoption failure reholds. Other blockers and the
+documented compatibility fallback still end `failed` with `keepCustody`, with
+no failed-run Resume. The #3031 model-free preservation producer gains no
+renewal authority. See the
+[ADR-1197 #3527 amendment](1197-transient-recovery-park.md#amendment-2026-10-27-3527-owner-held-retained-adoption-retry).
 In this retained-recovery path,
 `worker_residue_blocked` denotes actual quiescence failure; archive size,
 prerequisite, source, clock, preservation and adoption blockers have their

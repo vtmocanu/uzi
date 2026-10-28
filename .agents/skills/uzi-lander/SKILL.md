@@ -202,6 +202,8 @@ locally in step 4. The advisory still prints until the window expires.
 
 ## The loop
 
+For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at filing with a pre-queue baseline, repo selector and verified completion route.
+
 1. **Run still active.** Poll blind to terminal with the watcher's poller, in the background:
    `.agents/skills/uzi-watcher/scripts/watch-run.sh RUN completed,failed,cancelled,awaiting_approval,awaiting_input,paused 60 MAX SEQ`,
    with `SEQ` the seq of the plan that was approved, carried from the approval or the watcher's
@@ -228,8 +230,12 @@ locally in step 4. The advisory still prints until the window expires.
    (usually a lost worker resumed from the default branch): before steering the new gate with
    `uzi-watcher`, check `uzi run recovery RUN` for committed work worth landing instead; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
    keep polling (`limit_wait` and `pool_wait` resume on their own; a `recovery_wait` may need an owner action, so read its cause; a `data_volume_full` park is counted and exits the poller 4), except `recovery_wait` with cause
-   `worker_requeue_exhausted`: the poller stops on it (exit 0) because only the owner can
-   Resume or Cancel; back up first (`uzi-watcher` recovery). `paused` stops the poller because it never
+   `worker_requeue_exhausted`, `retained_recovery_adoption_failed` (regardless of retry timing),
+   or `retained_recovery_exhausted` with its retry stamp explicitly null: the poller
+   stops on it (exit 0) because only the owner can Resume or Cancel; back up first (`uzi-watcher` recovery).
+   Adoption failure means an integrity check refused adoption, with local work and custody
+   preserved and no automatic retry. Resume requests a bounded attempt; success is not assured,
+   and repeated failure holds again. `paused` stops the poller because it never
    resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`
    with `hold_reason: budget_exhausted` (PRD #1497), never `failed`: extend it (`uzi run
    extend RUN --by 2h`) and re-arm the poller; an owner pause waits for its owner.
@@ -458,6 +464,8 @@ locally in step 4. The advisory still prints until the window expires.
    S/merge.sh OWNER/REPO PR --expect-head <sha you watched> --expect-closes <N,...|none>   # squash + delete-branch + admin
    ```
 
+   For `vtmocanu/uzi` main, exit 12 means main changed changelog-policy files since the PR's merge-base: rebase or merge main, wait for fresh exact-head CI, re-run `merge.sh`; merges outside it bypass this guard.
+   That check uses the helper's own checkout and an exact GitHub origin URL allowlist for `vtmocanu/uzi`.
    It refuses on a moved head, an active rework, red, pending or no passing required checks, a
    git conflict, or (exit 5) any unresolved thread, open code-scanning alert or
    unacknowledged comment, or (exit 10) a `chore(release):` commit's CI still running on

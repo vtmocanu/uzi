@@ -1138,6 +1138,12 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 		if err != nil {
 			return nil, err
 		}
+		// PRD #3522 M3: the weekly usage reserve gates the judge lane on the credential judgeChoice
+		// resolved (a pinned judge token, the default, or the empty-pool default fallback); the
+		// auto ranker inside judgeChoice already filtered its pool. A nil gate is today's behaviour.
+		if herr := reserveGateFrom(ctx).checkChoice(choice); herr != nil {
+			return nil, herr
+		}
 		// Open with the SAME open-failed retry the run lane uses (PRD #1140 M2): before the
 		// extraction the judge lane opened directly, so an `auto` judge pick that would not
 		// decrypt failed terminally while the run lane floored onto another pooled token.
@@ -1267,19 +1273,20 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 		// judge runner threads this onto its running/completed reports + usage batch — omitting it
 		// (a non-pointer int64, so 0) makes the server fence every capability worker's judge as
 		// stale (ErrMissingClaimGeneration / staleClaim), silently breaking the whole judge lane.
-		ClaimGeneration:        run.ClaimGeneration,
-		WorkerRecoveryEpisode:  claimRecoveryEpisode(run),
-		IssueTitle:             run.IssueTitle,
-		IssueDescription:       run.IssueDescription,
-		Status:                 run.Status,
-		TargetRunID:            targetRunID,
-		JudgeModel:             judgeModel,
-		JudgeSignal:            signal,
-		FailureClass:           failureClass,
-		TargetCostStatus:       targetCostStatus,
-		TargetCostUSD:          targetCostUSD,
-		KnownImproveUziTargets: knownTargets,
-		SessionID:              textPtr(run.SessionID),
+		ClaimGeneration:            run.ClaimGeneration,
+		WorkerRecoveryEpisode:      claimRecoveryEpisode(run),
+		WorkerRecoveryOwnerEpisode: run.WorkerRecoveryEpisode,
+		IssueTitle:                 run.IssueTitle,
+		IssueDescription:           run.IssueDescription,
+		Status:                     run.Status,
+		TargetRunID:                targetRunID,
+		JudgeModel:                 judgeModel,
+		JudgeSignal:                signal,
+		FailureClass:               failureClass,
+		TargetCostStatus:           targetCostStatus,
+		TargetCostUSD:              targetCostUSD,
+		KnownImproveUziTargets:     knownTargets,
+		SessionID:                  textPtr(run.SessionID),
 		// PRD #1429 M3: recordedLastSeq starts at run.LastSeq and only advances if the D6
 		// model-fallback note above landed one — the judge lane never emits a
 		// 'credential_switch' message (recordRunCredential's return is discarded above), so

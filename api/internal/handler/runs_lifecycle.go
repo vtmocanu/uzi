@@ -459,6 +459,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
+	dto.CapabilityProvenance = workersvc.CapabilityProvenanceForRun(run)
 	if user.ID == run.UserID {
 		dto.CompletionPending, err = workersvc.CompletionPending(run)
 		if err != nil {
@@ -579,6 +580,13 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	// lookup error leaves forge_type "" (the web defaults to GitLab's noun), never
 	// failing the read of an otherwise-fine run.
 	if run.RepoID.Valid {
+		// Display context follows the run owner's connection, including for an admin
+		// viewer. A deleted or unreadable repo leaves the breadcrumb's Board fallback.
+		if repo, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: uuid.UUID(run.RepoID.Bytes), UserID: run.UserID}); err != nil {
+			slog.Debug("resolve run repo path", "run_id", run.ID, "error", err)
+		} else {
+			dto.RepoPath = repo.PathWithNamespace
+		}
 		if ft, err := h.q.GetForgeTypeForRepo(r.Context(), uuid.UUID(run.RepoID.Bytes)); err != nil {
 			slog.Error("resolve run forge type", "run_id", run.ID, "error", err)
 		} else {
@@ -1034,6 +1042,9 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, workersvc.ErrNoPausePending):
 			// PRD #1190 M1: pause_cancel with nothing pending → 409.
 			httpx.Error(w, http.StatusConflict, "no pause is pending")
+		case errors.Is(err, workersvc.ErrReservePausePending):
+			// PRD #3522 M4a: the pending pause is the weekly reserve's own → 409 naming the levers.
+			httpx.Error(w, http.StatusConflict, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidPauseMode):
 			// PRD #1190 M1: the pause body was neither 'milestone' nor 'now' → 400 (a caller
 			// error). The service built the reason clause, so surface it verbatim.
@@ -1092,7 +1103,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 				names = strings.Join(unmet.Unmet, ", ")
 			}
 			httpx.Error(w, http.StatusConflict, "the plan requires capabilities the assigned worker cannot satisfy: "+names+
-				". Provision or start a worker with: "+names+"; or approve with override_capabilities to run without it")
+				". Provision or start a worker with: "+names+"; or approve without it: \"Run without "+names+"\" in the web UI, or uzi run approve "+id.String()+" --override-capabilities")
 		default:
 			slog.Error("submit run input", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")

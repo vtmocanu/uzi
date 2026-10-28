@@ -43,7 +43,7 @@ Project → **Manage → Members → Invite members**, add the bot with role **D
 
 ## 5. Enable the repo
 
-Open **Boards**, pick the connection, and enable each project you added the bot to. This makes its board appear in the sidebar and starts syncing its issues: the `uzi`-labeled ones, which are the ones uzi works, plus its other open issues, which the board hides until you ask for them (see [Board](./board.md)).
+Open **Repos**, pick the connection, and enable each project you added the bot to. This makes its board appear in the sidebar and starts syncing its issues: the `uzi`-labeled ones, which are the ones uzi works, plus its other open issues, which the board hides until you ask for them (see [Board](./board.md)).
 
 If verification fails, check: the PAT's scope is `api`, it hasn't expired, and the bot is at least Developer on the target project.
 
@@ -69,7 +69,7 @@ uzi does not just document the "bot = Developer, `main` protected" rule — it *
 - **On demand.** Settings → Forge → **Check privileges** runs the full report (token + every enabled repo) and refreshes the badges.
 - **Periodically.** A background sweep (default daily, `UZI_PRIVILEGE_CHECK_INTERVAL`) re-runs everything, so drift surfaces within one interval without anyone asking.
 
-Findings show as a per-connection badge (`least-privilege ✓` / `N warnings` / `N violations` / `unchecked`) expandable to the finding list, plus per-repo badges on the Boards page. Most per-repo findings — a role drift, a missing membership — **warn** and never block sync: membership changes happen on the forge after connect, and blocking sync over a role finding would punish the wrong action.
+Findings show as a per-connection badge (`least-privilege ✓` / `N warnings` / `N violations` / `unchecked`) expandable to the finding list, plus per-repo badges on the Repos page. Most per-repo findings (a role drift, a missing membership) **warn** and never block sync: membership changes happen on the forge after connect, and blocking sync over a role finding would punish the wrong action.
 
 **uzi refuses to run against a repo the bot could push or merge to `main` on.** An unprotected default branch, or one where the Developer role (or the bot specifically) can push or merge to it, is a **blocking** finding, not a warning: uzi won't let you enable the repo, and refuses to start or claim a run against one that's already enabled but still misconfigured. Sync is unaffected — the board keeps syncing so you can see the badge and fix the branch protection. The check is live and fails closed, so a GitLab that errors or times out while uzi reads branch protection also refuses. An instance admin can override the refusal for one named repo, with a recorded reason, if the risk is knowingly accepted — see [Admin settings](./admin-settings.md#guardrail-override-per-repo).
 

@@ -1544,6 +1544,16 @@ describe("IssueView history rejection presentation", () => {
 });
 
 
+it.each([null, "2099-01-01T00:00:00Z"])("adoption refusal history uses integrity hold label with timestamp %s", async (stamp) => {
+  setAuth();
+  mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+  mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status: "recovery_wait", recovery_wait_cause: "retained_recovery_adoption_failed", recovery_retry_not_before: stamp } as Partial<RunListItem>)] });
+  renderIssueView();
+  const badge = await screen.findByText("retained recovery integrity hold");
+  expect(badge.classList.contains("text-warn")).toBe(true);
+  expect(screen.queryByText("retained recovery retrying")).toBeNull();
+});
+
 it.each([
   ["2099-01-01T00:00:00Z", "retained recovery retrying"],
   ["2020-01-01T00:00:00Z", "retained recovery retrying"],
@@ -1554,6 +1564,21 @@ it.each([
   setAuth();
   mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
   mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status: "recovery_wait", recovery_wait_cause: "retained_recovery_exhausted", recovery_retry_not_before: stamp } as Partial<RunListItem>)] });
+  renderIssueView();
+  const badge = await screen.findByText(label);
+  expect(badge.classList.contains("text-warn")).toBe(true);
+});
+
+it.each([
+  ["2099-01-01T00:00:00Z", "Codex idle stall retrying"],
+  ["2020-01-01T00:00:00Z", "Codex idle stall retrying"],
+  [null, "Codex idle stall needs decision"],
+  [undefined, "Codex idle stall timing unknown"],
+  ["invalid", "Codex idle stall timing unknown"],
+] as const)("Codex idle stall history renders timing %s", async (stamp, label) => {
+  setAuth();
+  mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+  mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status: "recovery_wait", recovery_wait_cause: "codex_idle_stall", recovery_retry_not_before: stamp } as Partial<RunListItem>)] });
   renderIssueView();
   const badge = await screen.findByText(label);
   expect(badge.classList.contains("text-warn")).toBe(true);

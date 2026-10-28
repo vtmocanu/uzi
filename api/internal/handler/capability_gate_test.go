@@ -57,8 +57,8 @@ func TestCreateRunInputCapabilityBlock409(t *testing.T) {
 	if !strings.Contains(body, "docker") {
 		t.Errorf("body %q must name the unmet capability docker", body)
 	}
-	if !strings.Contains(body, "override_capabilities") {
-		t.Errorf("body %q must hint the override_capabilities remediation", body)
+	if !strings.Contains(body, "uzi run approve "+runID.String()+" --override-capabilities") {
+		t.Errorf("body %q must name the CLI override command", body)
 	}
 	if st.createdApproval != nil {
 		t.Error("a blocked approve must not enqueue an approve_plan input")

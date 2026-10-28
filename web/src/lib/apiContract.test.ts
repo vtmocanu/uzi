@@ -364,6 +364,7 @@ void _releaseCheckStatusFull;
     Run,
     | "plan_changed_files"
     | "required_capabilities"
+    | "ignored_inferred_capabilities"
     | "required_tools"
     | "completion_unmet"
     | "completion_deferred"
@@ -409,6 +410,7 @@ void _releaseCheckStatusFull;
     RunListItem,
     | "plan_changed_files"
     | "required_capabilities"
+    | "ignored_inferred_capabilities"
     | "required_tools"
     | "completion_unmet"
     | "completion_deferred"
@@ -435,6 +437,7 @@ void _releaseCheckStatusFull;
     RunSummaryItem,
     | "plan_changed_files"
     | "required_capabilities"
+    | "ignored_inferred_capabilities"
     | "required_tools"
     | "completion_unmet"
     | "completion_deferred"
@@ -458,7 +461,7 @@ void _releaseCheckStatusFull;
 {
   const _repoMissing: never = null as unknown as Exclude<keyof Repo, keyof typeof repoFull>;
   const _repoExtra: never = null as unknown as Exclude<keyof typeof repoFull, keyof Repo>;
-  const _repoZero: ZeroOf<Repo, "required_capabilities"> = repoZero;
+  const _repoZero: ZeroOf<Repo, "required_capabilities" | "ignored_inferred_capabilities"> = repoZero;
   const _repoFull: Widen<Repo> = repoFull;
   void _repoMissing;
   void _repoExtra;

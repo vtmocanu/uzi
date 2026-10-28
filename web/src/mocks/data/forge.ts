@@ -58,7 +58,7 @@ export const mockForgeConfigSyncForges = {
   forge_types: ["gitlab", "forgejo", "github"],
 };
 
-// PRD #66 M9 (D8): the atlas repo's admin override, shared by the Boards repo fixture
+// PRD #66 M9 (D8): the atlas repo's admin override, shared by the Repos repo fixture
 // and the admin blocked-repos list so both read ONE literal. Typed as the wire
 // GuardrailOverrideMeta (the same shape RepoDTO.guardrail_override and
 // BlockedRepoDTO.guardrail_override carry).
@@ -138,7 +138,7 @@ export const mockRepos: Repo[] = [
   },
   {
     // PRD #66 M9 (D8): a repo the push/merge guardrail REFUSES right now
-    // (guardrail_blocked, server-computed). It makes the Boards "runs blocked" badge,
+    // (guardrail_blocked, server-computed). It makes the Repos "runs blocked" badge,
     // the admin inline "Allow anyway" modal, and the member "ask an admin" pointer all
     // reachable under VITE_UZI_MOCK=1, and it is the row the admin blocked-repos list's
     // Allow/Revoke round-trips against (see mockBlockedRepoMeta + mockApi).
@@ -187,7 +187,7 @@ export const mockRepos: Repo[] = [
     // enabled:false AND guardrail_blocked:true, so clicking Enable here is the
     // one-click path that trips mockApi.setRepoEnabled's 422 guardrail block
     // (reasons from mockBlockedRepoMeta below). We add this row rather than
-    // flipping repo-payments, whose enabled:true state the Boards "runs blocked"
+    // flipping repo-payments, whose enabled:true state the Repos "runs blocked"
     // badge and admin Allow-anyway demo depend on.
     //
     // issue #1432: this row is the NON-waivable case — its block_messages carry a
@@ -245,7 +245,7 @@ export const mockRepos: Repo[] = [
 // PRD #66 M9 (D8): per-repo metadata the admin cross-user blocked-repos list needs but
 // the wire Repo does not carry — owner identity and the UNDERLYING (pre-override) block
 // reasons live on the connection/report server-side. mockApi.adminListBlockedRepos JOINS
-// this with the SHARED, mutable repos state (the same state the Boards page and the
+// this with the SHARED, mutable repos state (the same state the Repos page and the
 // Allow/Revoke mutations act on), so a demo Allow or Revoke round-trips into the list
 // instead of 404ing against a static deep-copy. Keyed by repo id; a repo absent here
 // falls back to the demo owner/connection.

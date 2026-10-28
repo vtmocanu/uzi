@@ -25,6 +25,23 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("repo ignored inference request contract", () => {
+  it("patches only the ignored set with session cookies and CSRF", async () => {
+    expect(MOCK_MODE).toBe(false);
+    const response = { repo: { id: "repo-1", ignored_inferred_capabilities: ["jvm"] }, warning: "Explicitly required capabilities remain required: jvm" };
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, response));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "uzi_csrf=csrf-value" });
+    expect(await api.setRepoIgnoredInferredCapabilities("repo-1", ["jvm"])).toEqual(response);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]).toEqual(["/api/repos/repo-1", {
+      method: "PATCH", credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": "csrf-value" },
+      body: JSON.stringify({ ignored_inferred_capabilities: ["jvm"] }),
+    }]);
+  });
+});
+
 describe("manual worker cordon request contract", () => {
   it.each([undefined, "", " raw\n\u202ereason 🚀 "])("posts the raw optional reason %j with cookies and CSRF", async (reason) => {
     expect(MOCK_MODE).toBe(false);

@@ -1,3 +1,4 @@
+import { CredentialSwitchSignal } from "../src/steering.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Readable } from "node:stream";
@@ -14,7 +15,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { RecoveryCoordinator, canonicalJson, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type RecoveryArchiveClient, type RecoveryRecord } from "../src/recovery.js";
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { GitCache, RecoveryBundleTooLargeError, type OwedCandidate, type PositiveOwedCandidateContext } from "../src/git.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { buildRecoveryLiveTiming } from "../src/main.js";
@@ -4867,7 +4868,20 @@ function issue3152Backoff(c: RecoveryCoordinator, saved: RecoveryRecord) {
         const finalsBefore = f.finals.length;
         await live(3);
         issue3152Assert(lines, before, { path: "live", reason: c.reason, ...(c.field ? { field: c.field } : {}) }, rec);
-        assert.equal(f.finals.length, finalsBefore, "an exit never reaches FINAL");
+        if (c.name === "not_live_candidate") {
+          // The invalidated identity stays excluded; reconstruction may now settle
+          // an independently proven fresh archive for the same generation (#3561).
+          const old = (await f.coordinator.inspect(rec.runId)).find(r => r.captureId === rec.captureId)!;
+          assert.ok(old);
+          assert.equal(old.reason, "inventory_snapshot_changed");
+          assert.equal(old.finalRequest, undefined);
+          assert.ok(f.finals.length - finalsBefore <= 1, "reconstruction can settle at most one fresh archive");
+          for (const call of f.finals.slice(finalsBefore)) {
+            const disposition = call[3] as RecoveryFinalDisposition;
+            assert.equal(disposition.kind, "archive");
+            assert.notEqual((disposition as { capture_id: string }).capture_id, old.serverCaptureId);
+          }
+        } else assert.equal(f.finals.length, finalsBefore, "an exit never reaches FINAL");
       } finally { await f.close(); }
     });
   }
@@ -5198,4 +5212,676 @@ for (const key of [undefined, "uzi/task/11111111-1111-4111-8111-111111111111"]) 
         "a valid journal MAC cannot authorize another task key or an unbound confirmed tip");
     } finally { await f.close(); }
   });
+}
+
+// #3544: diagnostics describe existing refusals without changing custody decisions.
+function issue3544Lines(f: Awaited<ReturnType<typeof fixture>>) {
+  const lines: Array<Record<string, unknown>> = [];
+  f.log.info = (message, fields) => {
+    if (message === "recovery: inventory reconstruction") lines.push(structuredClone(fields!));
+  };
+  return lines;
+}
+
+for (const branch of ["source_ancestry_unproven", "root_context_uncovered"] as const) {
+  it(`#3544 coverage refusal identifies ${branch}`, async () => {
+    const f = await fixture(true);
+    try {
+      const lines = issue3544Lines(f);
+      f.state.sourceRefused = true;
+      const old = await f.freeze(); assert.ok(old);
+      await f.capture(old);
+      f.state.sourceRefused = false;
+      if (branch === "source_ancestry_unproven") f.state.cloneHeads = [H2];
+      else {
+        f.state.candidates.push({ sha: H2, pinRef: "refs/owed/PRIVATE-CONTEXT", contexts: [f.context] });
+        f.state.ancestors.add(H2);
+      }
+      await f.coordinator.resumePending(undefined, [(await f.coordinator.inspect("run-1"))[0]!]);
+      assert.equal((await f.coordinator.inspect("run-1"))[0]?.reason, "inventory_snapshot_changed");
+      assert.deepEqual(lines, [{ path: "boot", reason: branch, run_id: "run-1", generation: 7, capture_id: old.captureId }]);
+      assert.equal(f.finals.length, 0);
+      assert.equal(JSON.stringify(lines).includes("PRIVATE-CONTEXT"), false);
+    } finally { await f.close(); }
+  });
+}
+
+it("#3561 reconstruction replaces an invalidated match and reuses its eligible replacement", async () => {
+  const f = await fixture(true);
+  try {
+    const lines = issue3544Lines(f);
+    await f.coordinator.snapshotOwedInventory();
+    const [old] = await f.coordinator.materializeBootInventory(); assert.ok(old);
+    assert.equal(lines.at(-1)?.reason, "snapshot_created");
+    await f.coordinator.materializeBootInventory();
+    assert.equal(lines.at(-1)?.reason, "matching_snapshot_reused");
+    const count = lines.length;
+    await f.coordinator.materializeBootInventory();
+    assert.equal(lines.length, count, "unchanged matching outcome is not logged every pass");
+    f.state.sourceRefused = true;
+    await f.capture(old);
+    f.state.sourceRefused = false;
+    f.state.candidates.push({ sha: H2, pinRef: "refs/owed/temporary", contexts: [f.context] });
+    f.state.ancestors.add(H2);
+    await f.coordinator.resumePending(undefined, [(await f.coordinator.inspect("run-1"))[0]!]);
+    f.state.candidates.pop(); // synthetic characterization only; real-source test below accounts for pins
+    const oldBytes = await fs.readFile(issue3561File(f, old));
+    const [fresh] = await f.coordinator.materializeBootInventory();
+    assert.ok(fresh);
+    assert.notEqual(fresh.captureId, old.captureId, "a positively re-proven invalidated match needs a fresh identity");
+    assert.equal(lines.at(-1)?.reason, "snapshot_created");
+    assert.equal(fresh.reason, undefined);
+    const [same] = await f.coordinator.materializeBootInventory();
+    assert.equal(same?.captureId, fresh.captureId, "repeat reconstruction reuses the eligible replacement");
+    assert.equal(lines.at(-1)?.reason, "matching_snapshot_reused");
+    assert.deepEqual(await fs.readFile(issue3561File(f, old)), oldBytes);
+    assert.equal(f.finals.length, 0);
+    assert.equal(f.state.pinDeletes, 0);
+  } finally { await f.close(); }
+});
+
+for (const mode of ["generation", "kind", "executing", "inventory_feature", "hold_unavailable", "ownership_unsupported", "provenance_unavailable", "inventory_not_inactive", "nonpreferred_context", "current_source_missing", "source_boundary_retained", "source_proof_unavailable"] as const) {
+  it(`#3544 reconstruction refusal identifies ${mode}`, async () => {
+    const f = await fixture(true);
+    try {
+      const lines = issue3544Lines(f);
+      let context = f.context;
+      if (mode === "generation") context = { ...context, generation: null } as unknown as PositiveOwedCandidateContext;
+      if (mode === "kind") context = { ...context, kind: null } as unknown as PositiveOwedCandidateContext;
+      if (mode === "executing") (f.coordinator as any).isExecuting = () => true;
+      if (mode === "inventory_feature") f.state.feature = false;
+      if (mode === "hold_unavailable") f.state.open = false;
+      if (mode === "ownership_unsupported") delete (f.client as any).getRunOwnership;
+      if (mode === "provenance_unavailable") {
+        await fs.mkdir(path.join(f.root, "journal", "run-1"), { recursive: true });
+        await fs.writeFile(path.join(f.root, "journal", "run-1", "untrusted.json"), '{"private":"PRIVATE-PROVENANCE"}');
+      }
+      if (mode === "inventory_not_inactive") f.state.status = "running";
+      if (mode === "nonpreferred_context") { await f.freeze(); context = { ...context, branch: "other" }; }
+      if (mode === "current_source_missing") f.state.candidates = [];
+      if (mode === "source_boundary_retained") f.state.sourceRefused = true;
+      if (mode === "source_proof_unavailable") f.state.sourceProofRefused = true;
+      f.git.discoverOwedCandidates = async () => [{ context, candidates: structuredClone(f.state.candidates) }];
+      await f.coordinator.snapshotOwedInventory();
+      assert.deepEqual(await f.coordinator.materializeBootInventory(), []);
+      assert.equal(lines.at(-1)?.reason, mode);
+      const count = lines.length;
+      await f.coordinator.materializeBootInventory();
+      assert.equal(lines.length, count);
+      assert.equal(f.finals.length, 0); assert.equal(f.state.pinDeletes, 0);
+      assert.equal(JSON.stringify(lines).includes("PRIVATE-PROVENANCE"), false);
+      for (const line of lines) assert.ok(Object.keys(line).every(k => ["path", "reason", "run_id", "generation", "capture_id"].includes(k)));
+    } finally { await f.close(); }
+  });
+}
+
+it("#3544 reconstruction diagnostics remain bounded and throwing logs do not alter snapshots", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3544Lines(f);
+    const c = f.coordinator as any;
+    for (let n = 0; n < 300; n++) c.noteRedriveExit("boot", { runId: `run-${n}`, generation: 7, captureId: "" }, "current_source_missing", undefined, true);
+    assert.equal((c.inventoryDiagnosticLogged ?? c.redriveExitLogged).size, 256);
+    assert.equal(lines.length, 300);
+    c.noteRedriveExit("boot", { runId: "run-299", generation: 7, captureId: "" }, "current_source_missing", undefined, true);
+    assert.equal(lines.length, 300);
+    f.log.info = () => { throw new Error("PRIVATE-LOGGER"); };
+    await f.coordinator.snapshotOwedInventory();
+    const [record] = await f.coordinator.materializeBootInventory();
+    assert.ok(record);
+    assert.equal(record.reason, undefined);
+    assert.equal(f.finals.length, 0);
+  } finally { await f.close(); }
+});
+
+for (const publish of [false, true]) {
+  it(`#3561 real GitCache heartbeat reconstruction after ${publish ? "confirmed publication restores the fingerprint" : "changed inventory stays owed"}`, async () => {
+    const f = await fixture(true, os.tmpdir(), true);
+    const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+    const git = (cwd: string, args: string[], input?: string) => execFileSync("git", ["-C", cwd, ...args],
+      { env, input, encoding: "utf8", timeout: 10000 }).trim();
+    try {
+      const data = path.join(f.root, "real-data"), bare = path.join(data, "repos", "repo.git"), remote = path.join(f.root, "published.git");
+      await fs.mkdir(path.dirname(bare), { recursive: true });
+      for (const dir of [bare, remote]) execFileSync("git", ["init", "--bare", dir], { env, stdio: "pipe", timeout: 10000 });
+      const tree = git(bare, ["mktree"], "");
+      const commit = (message: string, parent?: string) => git(bare, ["hash-object", "-t", "commit", "-w", "--stdin"],
+        `tree ${tree}\n${parent ? `parent ${parent}\n` : ""}author Fixture <fixture@example.com> 946684800 +0000\ncommitter Fixture <fixture@example.com> 946684800 +0000\n\n${message}\n`);
+      const base = commit("base"), h = commit("original", base), h2 = commit("transient head", h);
+      git(bare, ["update-ref", "refs/remotes/origin/main", base]);
+      Object.assign(f.context, { barePath: bare, defaultIdentity: { ref: "refs/remotes/origin/main", sha: base } });
+      const bind = (cache: GitCache) => Object.assign(f.git, {
+        enumerateOwedCandidates: cache.enumerateOwedCandidates.bind(cache),
+        discoverOwedCandidates: cache.discoverOwedCandidates.bind(cache),
+        buildRecoveryCoverage: cache.buildRecoveryCoverage.bind(cache),
+        readInventoryCloneHeads: cache.readInventoryCloneHeads.bind(cache),
+        committedTrackingOwnership: cache.committedTrackingOwnership.bind(cache),
+        ancestry: cache.ancestry.bind(cache),
+        produceRecoveryBundle: cache.produceRecoveryBundle.bind(cache),
+      });
+      let cache = new GitCache(data, f.log, undefined, testGitCacheOptions());
+      bind(cache);
+      const earlier = { ...f.context, runId: "earlier-context", generation: 6, branch: "earlier" };
+      assert.equal((await cache.updateTrackingRef(bare, earlier.branch, h, { context: earlier })).kind, "updated");
+      assert.deepEqual((await cache.enumerateOwedCandidates(bare, earlier.runId)).map(r => r.sha), [h]);
+      git(bare, ["push", remote, `${h}:refs/heads/published`]);
+      const confirmed = git(bare, ["ls-remote", remote, "refs/heads/published"]).split(/\s+/)[0]!;
+      assert.equal(confirmed, h);
+      assert.equal((await cache.updateTrackingRef(bare, f.context.branch, h, { context: f.context, remotelyConfirmedSha: confirmed })).kind, "updated");
+      assert.deepEqual(await cache.enumerateOwedCandidates(bare, "run-1"), []);
+      f.state.status = "running";
+      const old = await f.coordinator.freezeInventory({ context: f.context, currentSha: h, defaultBranch: "main", locallyQuiescent: true });
+      assert.ok(old);
+      f.state.sourceRefused = true;
+      await f.capture(old);
+      assert.equal(f.state.uploads, 1);
+      // A running claim may rewrite and then restore H. GitCache must retain the displaced H2.
+      assert.equal((await cache.updateTrackingRef(bare, f.context.branch, h2, { context: f.context, remotelyConfirmedSha: h })).kind, "updated");
+      assert.equal((await cache.updateTrackingRef(bare, f.context.branch, h, { context: f.context, remotelyConfirmedSha: h })).kind, "updated");
+      const owed = await cache.enumerateOwedCandidates(bare, "run-1");
+      assert.deepEqual(owed.map(r => r.sha), [h2]);
+      f.state.status = "cancelled"; f.state.sourceRefused = false;
+      await f.coordinator.resumePending(undefined, [(await f.coordinator.inspect("run-1"))[0]!]);
+      assert.equal((await f.coordinator.inspect("run-1"))[0]?.reason, "inventory_snapshot_changed");
+      if (publish) {
+        // Real independent publication and the existing positive-confirmation reconciler,
+        // never a raw pin deletion or a fake enumeration omitting H2.
+        git(bare, ["push", remote, `${h2}:refs/heads/published`]);
+        const tip = git(bare, ["ls-remote", remote, "refs/heads/published"]).split(/\s+/)[0]!;
+        assert.equal(tip, h2);
+        await cache.reconcileOwedCandidates(bare, "run-1", tip);
+        assert.deepEqual(await cache.enumerateOwedCandidates(bare, "run-1"), []);
+        assert.equal(git(remote, ["cat-file", "-t", h2]), "commit", "the displaced source survives independent publication");
+      }
+      // A new cache and coordinator read the persisted Git metadata and authenticated journals.
+      cache = new GitCache(data, f.log, undefined, testGitCacheOptions()); bind(cache);
+      const restarted = f.make(true);
+      const runner = new RunRunner(f.client as never, f.git as never,
+        () => { throw new Error("unreached executor"); }, f.log, 20, "local-worker-fixture", { recovery: restarted });
+      const lines = issue3544Lines(f);
+      // The earlier context comes from real persisted owed metadata, not an injected listing.
+      assert.deepEqual((await cache.enumerateOwedCandidates(bare, earlier.runId)).map(r => r.sha), [h]);
+      const list = f.client.listRecoveryHolds.bind(f.client);
+      (f.client as any).listRecoveryHolds = async (id: string) => id === "earlier-context" ? { run_id: id, holds: [] } : list(id);
+      (restarted as any).liveMaxPerPass = 1;
+      f.state.closeOnRelease = true;
+      const oldBytes = await fs.readFile(issue3561File(f, old));
+      let inspectedBeforeAck = false;
+      f.state.beforeFinalAck = async () => {
+        assert.deepEqual(await fs.readFile(issue3561File(f, old)), oldBytes, "historical refusal and signed bytes survive until settlement");
+        inspectedBeforeAck = true;
+      };
+      const visits: Array<{ pass: number; reason: unknown }> = [];
+      for (let pass = 0; pass < 4; pass++) {
+        const from = lines.length;
+        f.state.now += 3_600_000;
+        await runner.resumeLiveRecoveries(f.state.now);
+        visits.push(...lines.slice(from).map(l => ({ pass, reason: l.reason })));
+      }
+      // Settlement assertions precede diagnostics so the baseline red identifies liveness.
+      assert.equal(f.finals.length, 1, "reconstruction must obtain one exact archive FINAL ACK");
+      assert.equal(f.state.open, false, "the exact fixture hold must settle");
+      const records = await restarted.inspect("run-1");
+      const fresh = records.find(r => r.captureId !== old.captureId);
+      assert.ok(fresh?.finalAcknowledged, "the eligible replacement receives the ACK");
+      assert.equal(inspectedBeforeAck, true);
+      assert.deepEqual(visits.slice(0, 2), [
+        { pass: 0, reason: "hold_unavailable" },
+        { pass: 1, reason: "snapshot_created" },
+      ], "the earlier context rotates before the target, rather than starving it");
+      assert.ok(lines.some(l => l.path === "live" && l.reason === "snapshot_created" && l.capture_id === fresh.captureId));
+      assert.equal(f.state.pinDeletes, 0, "diagnostics never retire source records");
+      assert.deepEqual((await cache.enumerateOwedCandidates(bare, earlier.runId)).map(r => r.sha), [h], "the sibling source remains protected");
+    } finally { await f.close(); }
+  });
+}
+
+it("#3544 reconstruction keeps the pending immutable FINAL identity instead of replacing it", async () => {
+  const f = await fixture();
+  try {
+    const old = await f.freeze(); assert.ok(old);
+    f.state.finalError = new Error("API unavailable");
+    await f.capture(old);
+    const saved = (await f.coordinator.inspect("run-1"))[0]!;
+    assert.ok(saved.finalRequest);
+    f.state.candidates.push({ sha: H2, pinRef: "refs/owed/new", contexts: [f.context] });
+    f.state.ancestors.add(H2);
+    const lines = issue3544Lines(f);
+    await f.coordinator.snapshotOwedInventory();
+    assert.deepEqual(await f.coordinator.materializeBootInventory(), []);
+    assert.equal(lines.at(-1)?.reason, "pending_final");
+    assert.equal(lines.at(-1)?.capture_id, old.captureId);
+    assert.deepEqual((await f.coordinator.inspect("run-1"))[0]!.finalRequest, saved.finalRequest);
+    assert.equal(f.state.uploads, 1);
+    assert.equal(f.finals.length, 1);
+  } finally { await f.close(); }
+});
+
+it("#3544 reconstruction retains a pending held-publication identity before freezing", async () => {
+  const f = await v2FrozenFixture();
+  try {
+    f.state.finalError = new Error("FINAL unavailable");
+    await f.operate();
+    const saved = (await f.coordinator.inspect(f.context.runId))[0]!;
+    assert.equal(saved.finalRequest?.disposition.kind, "held_publication");
+    const lines = issue3544Lines(f);
+    await f.coordinator.snapshotOwedInventory();
+    assert.deepEqual(await f.coordinator.materializeBootInventory(), []);
+    assert.equal(lines.at(-1)?.reason, "pending_held_final");
+    assert.deepEqual((await f.coordinator.inspect(f.context.runId))[0]!.finalRequest, saved.finalRequest);
+    assert.equal(f.state.produced, 0);
+  } finally { await f.close(); }
+});
+
+it("#3544 unchanged reconstruction refusals stay deduplicated across live passes without a capture", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3544Lines(f);
+    f.state.status = "running";
+    await issue3152LivePasses(f, f.coordinator, 3);
+    assert.deepEqual(lines, [{ path: "live", reason: "inventory_not_inactive", run_id: "run-1", generation: 7 }]);
+    assert.equal(f.state.uploads, 0);
+    assert.equal(f.finals.length, 0);
+  } finally { await f.close(); }
+});
+
+type Issue3561Fixture = Awaited<ReturnType<typeof fixture>>;
+const issue3561File = (f: Issue3561Fixture, r: Pick<RecoveryRecord, "runId" | "captureId">) => path.join(f.root, "journal", r.runId, r.captureId + ".json");
+
+// Represent independently persisted capture identities, then authenticate them through
+// the production reader. No source inventory or release authority is fabricated here.
+async function issue3561Sibling(f: Issue3561Fixture, record: RecoveryRecord, patch: Partial<RecoveryRecord> = {}) {
+  const { mac: _mac, ...payload } = JSON.parse(await fs.readFile(issue3561File(f, record), "utf8"));
+  const body = { ...payload, captureId: randomUUID(), ...patch };
+  const key = createHmac("sha256", "local-worker-fixture").update("uzi-recovery-journal-v1").digest();
+  await fs.writeFile(issue3561File(f, body), JSON.stringify({ ...body, mac: createHmac("sha256", key).update(canonicalJson(body)).digest("hex") }));
+  const read = (await f.coordinator.inspect(body.runId)).find(r => r.captureId === body.captureId);
+  assert.ok(read, "sibling fixture must pass the real MAC and shape reader");
+  return read;
+}
+
+async function issue3561Invalidated(f: Issue3561Fixture) {
+  f.state.sourceRefused = true;
+  const old = await f.freeze(); assert.ok(old);
+  await f.capture(old);
+  await patchAuthenticated(f, old, { reason: "inventory_snapshot_changed" });
+  f.state.sourceRefused = false;
+  return (await f.coordinator.inspect(f.context.runId)).find(r => r.captureId === old.captureId)!;
+}
+
+for (const proof of ["unproven", "unavailable"] as const) {
+  it(`#3561 ${proof} ancestry retains the invalidated match without stamping signed bytes`, async () => {
+    const f = await fixture(true);
+    try {
+      const old = await issue3561Invalidated(f), before = await fs.readFile(issue3561File(f, old));
+      if (proof === "unproven") f.state.cloneHeads = [H2]; else f.state.cloneReadable = false;
+      let writes = 0;
+      const c = f.coordinator as any;
+      const write = c.writeExistingRecord.bind(c);
+      c.writeExistingRecord = (...args: any[]) => {
+        if (args[0].captureId === old.captureId) { writes++; throw new Error("ancestry selection attempted a journal write"); }
+        return write(...args);
+      };
+      const same = await f.freeze();
+      assert.equal(same?.captureId, old.captureId);
+      assert.deepEqual(await fs.readFile(issue3561File(f, old)), before);
+      assert.equal(writes, 0); assert.equal(f.state.produced, 1); assert.equal(f.state.uploads, 1);
+    } finally { await f.close(); }
+  });
+}
+
+for (const blocked of ["clone", "earlier journal"] as const) {
+  it(`#3561 stable uncovered ${blocked} creates no new records bundles uploads or FINALs across restart`, async () => {
+    const f = await fixture(true);
+    try {
+      const old = await issue3561Invalidated(f);
+      if (blocked === "clone") f.state.cloneHeads = [H2];
+      else {
+        const holds = f.client.listRecoveryHolds.bind(f.client);
+        f.client.listRecoveryHolds = async (...args: Parameters<typeof holds>) => {
+          const view = await holds(...args);
+          return { ...view, holds: [...view.holds, { hold_id: "hold-6", generation: 6, inventory_guarded: true, has_available_capture: false }] };
+        };
+        assert.ok(await f.coordinator.pin({ runId: "run-1", generation: 6, kind: "issue", branch: "earlier", sourceSha: H2, inventoryGuarded: true }),
+          "the exact earlier hold must permit a real authenticated source journal");
+      }
+      const before = await fs.readFile(issue3561File(f, old));
+      const count = (await f.coordinator.inspect("run-1")).length;
+      let c = f.coordinator;
+      for (let pass = 0; pass < 6; pass++) {
+        if (pass === 3) c = f.make(true);
+        f.state.now += 3_600_000;
+        await c.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+        assert.equal((await c.inspect("run-1")).length, count, `pass ${pass}: no replacement under unchanged incomplete coverage`);
+        assert.equal(f.state.produced, 1); assert.equal(f.state.uploads, 1); assert.equal(f.reserves(), 1); assert.equal(f.finals.length, 0);
+        assert.equal(f.state.open, true); assert.equal(f.state.pinDeletes, 0);
+        assert.deepEqual(await fs.readFile(issue3561File(f, old)), before);
+      }
+    } finally { await f.close(); }
+  });
+}
+
+for (const excluded of ["unauthenticated", "producer", "unknown origin", "not invalidated", "quiescence breach", "saved FINAL", "FINAL ACK", "completion receipt"] as const) {
+  it(`#3561 replacement eligibility excludes ${excluded}`, async () => {
+    const runId = "11111111-1111-4111-8111-111111111111";
+    const f = await fixture(true, os.tmpdir(), false, runId);
+    try {
+      let old = await f.freeze(); assert.ok(old);
+      if (excluded === "saved FINAL" || excluded === "FINAL ACK") {
+        old = await issue3152SaveFinal(f, old);
+      }
+      await patchAuthenticated(f, old, { reason: excluded === "not invalidated" ? undefined : excluded === "quiescence breach" ? "inventory_quiescence_breach" : "inventory_snapshot_changed",
+        ...(excluded === "FINAL ACK" ? { finalAcknowledged: true } : {}) });
+      if (excluded === "completion receipt") {
+        const receipt = JSON.parse(await fs.readFile(new URL("../../fixtures/completed-publication/state-ack.json", import.meta.url), "utf8")).ack.completed_publication_receipt;
+        await patchAuthenticated(f, old, { completionReceipt: { ...receipt, run_id: runId, generation: 7, branch: f.context.branch, final_head: H, observed_branch_head: H } });
+      }
+      if (excluded === "producer" || excluded === "unknown origin") {
+        const next = await issue3561Sibling(f, old, { captureId: excluded === "producer" ? "maintenance-v1-00000000-0000-4000-8000-000000000001" : "maintenance-invalid" });
+        await fs.unlink(issue3561File(f, old)); old = next;
+      }
+      if (excluded === "unauthenticated") {
+        const file = issue3561File(f, old), raw = JSON.parse(await fs.readFile(file, "utf8"));
+        await fs.writeFile(file, JSON.stringify({ ...raw, mac: "0".repeat(64) }));
+      }
+      const before = await fs.readFile(issue3561File(f, old));
+      const counts = [f.state.produced, f.state.uploads, f.reserves(), f.finals.length];
+      const same = excluded === "producer"
+        ? await (f.coordinator as any).producerPermit.run({ captureIds: new Set([old.captureId]), live: () => true }, () => f.freeze())
+        : await f.freeze();
+      if (excluded === "unauthenticated" || excluded === "unknown origin") assert.equal(same, undefined);
+      else assert.equal(same?.captureId, old.captureId);
+      assert.deepEqual(await fs.readFile(issue3561File(f, old)), before);
+      assert.deepEqual([f.state.produced, f.state.uploads, f.reserves(), f.finals.length], counts);
+    } finally { await f.close(); }
+  });
+}
+
+for (const order of ["invalidated first", "eligible first"] as const) {
+  it(`#3561 mixed records preserve eligible precedence and pending FINAL veto: ${order}`, async () => {
+    const f = await fixture(true);
+    try {
+      const old = await issue3561Invalidated(f);
+      const eligible = await issue3561Sibling(f, old, { reason: undefined, state: "pinned", bundlePath: undefined, byteSize: undefined, checksum: undefined, serverCaptureId: undefined });
+      const pending = await f.coordinator.freezeInventory({ context: f.context, currentSha: H2, originalSourceSha: H2, defaultBranch: "main" }); assert.ok(pending);
+      f.state.ancestors.add(H2);
+      const saved = await issue3152SaveFinal(f, pending);
+      const savedBytes = await fs.readFile(issue3561File(f, saved));
+      const c = f.coordinator as any, read = c.newReconstructionRecords.bind(c);
+      c.newReconstructionRecords = async (...args: any[]) => {
+        const rows: RecoveryRecord[] | undefined = await read(...args);
+        if (!rows) return rows;
+        const ids = order === "invalidated first" ? [old.captureId, eligible.captureId, saved.captureId] : [eligible.captureId, old.captureId, saved.captureId];
+        return [...rows].sort((a, b) => ids.indexOf(a.captureId) - ids.indexOf(b.captureId));
+      };
+      const count = (await f.coordinator.inspect("run-1")).length;
+      const costs = [f.state.produced, f.state.uploads, f.reserves(), f.finals.length];
+      assert.equal((await f.freeze())?.captureId, eligible.captureId, "existing eligible match precedes invalidated candidates and the allocation veto");
+      assert.deepEqual([f.state.produced, f.state.uploads, f.reserves(), f.finals.length], costs);
+      await fs.unlink(issue3561File(f, eligible));
+      assert.equal(await f.freeze(), undefined, "a distinct pending FINAL vetoes fresh allocation when no eligible match remains");
+      assert.equal((await f.coordinator.inspect("run-1")).length, count - 1);
+      assert.deepEqual(await fs.readFile(issue3561File(f, saved)), savedBytes);
+      assert.deepEqual([f.state.produced, f.state.uploads, f.reserves(), f.finals.length], costs);
+    } finally { await f.close(); }
+  });
+}
+
+it("#3561 stale uploaded archive cannot mint a twin FINAL after fresh reconstruction", async () => {
+  const f = await fixture(true, os.tmpdir(), true);
+  try {
+    const old = await issue3561Invalidated(f);
+    const fresh = await issue3561Sibling(f, old, { reason: undefined, state: "pinned", bundlePath: undefined, byteSize: undefined, checksum: undefined, serverCaptureId: undefined });
+    f.state.sourceRefused = true; await f.capture(fresh); f.state.sourceRefused = false;
+    const ready = (await f.coordinator.inspect("run-1")).find(r => r.captureId === fresh.captureId)!;
+    assert.notEqual(ready.serverCaptureId, old.serverCaptureId);
+    const oldBytes = await fs.readFile(issue3561File(f, old)), bundle = await fs.readFile(old.bundlePath!);
+    await (f.coordinator as any).finalizeInventory(old);
+    assert.equal(f.finals.length, 0, "an invalidated old reference must not mint the twin archive FINAL");
+    assert.equal(f.state.open, true);
+    assert.deepEqual(await fs.readFile(issue3561File(f, old)), oldBytes);
+    assert.deepEqual(await fs.readFile(old.bundlePath!), bundle);
+    await (f.coordinator as any).finalizeInventory(ready);
+    assert.equal(f.finals.length, 1);
+    assert.equal(f.state.open, false);
+    assert.equal((await f.coordinator.inspect("run-1")).find(r => r.captureId === ready.captureId)?.finalAcknowledged, true);
+  } finally { await f.close(); }
+});
+
+for (const kind of ["saved FINAL", "FINAL ACK", "completion receipt", "non-invalidated"] as const) {
+  it(`#3561 archive mint guard preserves ${kind} handling`, async () => {
+    const f = await fixture(true, os.tmpdir(), false, "11111111-1111-4111-8111-111111111111");
+    try {
+      f.state.sourceRefused = true; const r = await f.freeze(); assert.ok(r); await f.capture(r); f.state.sourceRefused = false;
+      let record = (await f.coordinator.inspect(f.context.runId))[0]!;
+      if (kind !== "non-invalidated") {
+        record = await issue3152SaveFinal(f, record);
+        await patchAuthenticated(f, record, { reason: "inventory_snapshot_changed", ...(kind === "FINAL ACK" || kind === "completion receipt" ? { finalAcknowledged: true } : {}) });
+        record = (await f.coordinator.inspect(f.context.runId))[0]!;
+      }
+      if (kind === "completion receipt") {
+        const receipt = JSON.parse(await fs.readFile(new URL("../../fixtures/completed-publication/state-ack.json", import.meta.url), "utf8")).ack.completed_publication_receipt;
+        await patchAuthenticated(f, record, { completionReceipt: { ...receipt, run_id: f.context.runId, generation: 7, branch: f.context.branch, final_head: H, observed_branch_head: H } });
+        record = (await f.coordinator.inspect(f.context.runId))[0]!;
+      }
+      const before = f.finals.length, request = structuredClone(record.finalRequest);
+      await (f.coordinator as any).finalizeInventory(record);
+      assert.equal(f.finals.length, before + (kind === "FINAL ACK" || kind === "completion receipt" ? 0 : 1));
+      if (request) assert.deepEqual((await f.coordinator.inspect(f.context.runId))[0]?.finalRequest, request);
+    } finally { await f.close(); }
+  });
+}
+
+it("#3561 generation cycle serializes concurrent replacement before source reads", async () => {
+  const f = await fixture(true);
+  let release!: () => void;
+  let first: Promise<RecoveryRecord | undefined> | undefined, second: Promise<RecoveryRecord | undefined> | undefined;
+  try {
+    const old = await issue3561Invalidated(f);
+    let entered!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const enumerate = f.git.enumerateOwedCandidates.bind(f.git);
+    let reads = 0;
+    f.git.enumerateOwedCandidates = async (...args: Parameters<typeof enumerate>) => {
+      if (++reads === 1) { entered(); await gate; }
+      return enumerate(...args);
+    };
+    const c = f.coordinator as any, cycleKey = c.cycleKey.bind(c);
+    const reconstruction = c.newReconstructionRecords.bind(c);
+    let attempts = 0;
+    c.newReconstructionRecords = (...args: any[]) => { attempts++; return reconstruction(...args); };
+    let keyReads = 0, secondAtCycle!: () => void;
+    const queued = new Promise<void>(resolve => { secondAtCycle = resolve; });
+    c.cycleKey = async (...args: any[]) => {
+      const key = await cycleKey(...args);
+      if (++keyReads === 2) secondAtCycle();
+      return key;
+    };
+    first = f.freeze(); await ready;
+    second = f.freeze(); await queued;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(attempts, 1, "second attempt cannot enter reconstruction before the held generation cycle");
+    assert.equal(reads, 1, "second attempt cannot overtake the held generation cycle");
+    release();
+    const [a, b] = await Promise.all([first, second]);
+    assert.ok(a && b);
+    assert.notEqual(a.captureId, old.captureId, "healthy replacement obtains a fresh identity");
+    assert.equal(a.captureId, b.captureId);
+    assert.equal((await f.coordinator.inspect("run-1")).length, 2);
+  } finally { release?.(); await Promise.allSettled([first, second]); await f.close(); }
+});
+
+it("#3561 journal ownership prevents replacement writes until its holder releases", async () => {
+  const f = await fixture(true);
+  let release!: () => void;
+  let held: Promise<void> | undefined, replacing: Promise<RecoveryRecord | undefined> | undefined;
+  try {
+    const old = await issue3561Invalidated(f), c = f.coordinator as any;
+    let entered!: () => void, built!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const coverageReady = new Promise<void>(resolve => { built = resolve; });
+    held = c.withJournalLock("run-1", async () => { entered(); await gate; }); await ready;
+    const coverage = f.git.buildRecoveryCoverage.bind(f.git);
+    f.git.buildRecoveryCoverage = async (...args: Parameters<typeof coverage>) => { const value = await coverage(...args); built(); return value; };
+    let writes = 0;
+    const write = c.writeRecordUnlocked.bind(c);
+    c.writeRecordUnlocked = async (...args: any[]) => { writes++; return write(...args); };
+    const lock = c.withJournalLock.bind(c);
+    let selectionEntered = false, selectionAtLock!: () => void;
+    const queued = new Promise<void>(resolve => { selectionAtLock = resolve; });
+    c.withJournalLock = (run: string, action: () => Promise<unknown>, ...rest: unknown[]) => {
+      const waiting = lock(run, async () => { selectionEntered = true; return action(); }, ...rest);
+      selectionAtLock();
+      return waiting;
+    };
+    replacing = f.freeze(); await coverageReady; await queued;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(selectionEntered, false, "journal waiter cannot enter selection before the current holder");
+    assert.equal(writes, 0, "journal waiter cannot write before the current holder");
+    release(); await held;
+    const fresh = await replacing;
+    assert.ok(fresh);
+    assert.notEqual(fresh.captureId, old.captureId);
+    assert.equal(writes, 1);
+  } finally { release?.(); await Promise.allSettled([held, replacing]); await f.close(); }
+});
+
+// These route tests simulate upstream transport/quiescence facts, but execute both
+// production callers, the real freezeInventory, and the real downstream capture.
+async function issue3561RunnerCase(route: "terminal settlement" | "retained capture", proof: "verified" | "unproven", staleReference = false) {
+  const f = await fixture(true);
+  const budget = new MaintenanceBudget(60_000, () => 0);
+  try {
+    f.context.branch = "agent/issue-3561";
+    for (const candidate of f.state.candidates) candidate.contexts = [f.context];
+    const old = await issue3561Invalidated(f), oldBytes = await fs.readFile(issue3561File(f, old));
+    if (proof === "unproven") f.state.cloneHeads = [H2];
+    const signal = new AbortController().signal;
+    const downstream: string[] = [], captureIds: string[] = [], budgets: Array<MaintenanceBudget | undefined> = [];
+    let staleMinted = 0, staleFresh: RecoveryRecord | undefined, routeError: unknown;
+    Object.assign(f.client, { hasHeldPublicationV2: () => false });
+    Object.assign(f.git, {
+      retainCurrentOwedCandidate: async () => ({ kind: "updated", candidateSha: H, retainedShas: [] }),
+      withRecoveryOperation: async (_signal: AbortSignal, _deadline: number, action: (signal: AbortSignal) => Promise<unknown>, inherited?: MaintenanceBudget) =>
+        inherited ? MaintenanceBudget.run(inherited, () => action(inherited.signal)) : action(signal),
+      reserveRecoveryIteration: async () => ({ attempts: 1, deadline: Date.now() + 60_000, backoffMs: 0, claimGeneration: 7 }),
+      ensureClone: async () => f.context.barePath,
+      revParse: async () => H,
+    });
+    const runner = new RunRunner(f.client as never, f.git as never, () => { throw new Error("no model in route test"); },
+      f.log, 20, "local-worker-fixture", { recovery: f.coordinator });
+    const r = runner as any;
+    const flight: any = {
+      runId: f.context.runId, claimGeneration: 7, runKind: "issue", inventoryGuarded: true,
+      barePath: f.context.barePath, branch: f.context.branch, worktreePath: path.join(f.root, "kept-clone"),
+      owedContext: Promise.resolve(f.context), owedAnnounced: { heads: new Set(), archived: new Set() },
+      inventoryArchiveNotices: new Set(), ciConfigGuardGlobs: [], publishedRealTips: [],
+      runLog: f.log, executor: { sandboxesCommands: false }, cancel: new AbortController(),
+      cancellationBudget: budget, preserveRecoveryClone: true, preserveSession: true,
+      steering: { lifecycleSignal: () => signal, terminalLifecycleSignal: () => signal, claimFence: () => undefined,
+        isCancelled: () => false, pendingCredentialSwitch: () => undefined },
+      batcher: { emit() {} },
+    };
+    await fs.mkdir(flight.worktreePath); await fs.writeFile(path.join(flight.worktreePath, "source.txt"), "kept source");
+    const claim: any = { run_id: f.context.runId, kind: "issue", claim_generation: 7, issue_iid: 3561, inventory_guarded: true,
+      repo: { id: "00000000-0000-4000-8000-000000000008", default_branch: "main", clone_url: "https://fixture.invalid/repo" }, secrets: {} };
+    // Observe actual downstream arguments; do not substitute a freeze result.
+    const captureFrozen = r.captureFrozenInventory.bind(r);
+    r.captureFrozenInventory = async (...args: any[]) => { downstream.push(args[2].captureId); return captureFrozen(...args); };
+    const freeze = f.coordinator.freezeInventory.bind(f.coordinator);
+    Object.assign(f.coordinator, { freezeInventory: async (...args: Parameters<typeof freeze>) => {
+      budgets.push(MaintenanceBudget.current()); return freeze(...args);
+    } });
+    const capture = f.coordinator.captureAndUpload.bind(f.coordinator);
+    const stop = new CredentialSwitchSignal();
+    Object.assign(f.coordinator, { captureAndUpload: async (...args: Parameters<typeof capture>) => {
+      captureIds.push(args[0].record.captureId);
+      assert.deepEqual(await fs.readFile(issue3561File(f, old)), oldBytes, "freeze selection must not stamp or clear the old record");
+      let value: Awaited<ReturnType<typeof capture>> | undefined;
+      try {
+        if (staleReference) {
+          f.state.status = "failed";
+          // Freeze returned the retained old identity. Before its actual capture
+          // starts, another eligible capture exists; this caller still holds old.
+          f.state.cloneHeads = [];
+          const fresh = await issue3561Sibling(f, old, { reason: undefined, state: "pinned", bundlePath: undefined,
+            byteSize: undefined, checksum: undefined, serverCaptureId: undefined });
+          const c = f.coordinator as any, read = c.newReconstructionRecords.bind(c);
+          c.newReconstructionRecords = async (...values: any[]) => {
+            const rows: RecoveryRecord[] | undefined = await read(...values);
+            return rows && [...rows].sort((a, b) => Number(b.captureId === fresh.captureId) - Number(a.captureId === fresh.captureId));
+          };
+          assert.equal((await f.freeze())?.captureId, fresh.captureId, "independent eligible reconstruction works on the unmodified baseline too");
+          f.state.sourceRefused = true;
+          await capture({ record: fresh, barePath: f.context.barePath, defaultBranch: "main" });
+          f.state.sourceRefused = false;
+          staleFresh = (await f.coordinator.inspect(f.context.runId)).find(r => r.captureId === fresh.captureId)!;
+        }
+        // The running retained source may become terminal between its last check and capture.
+        f.state.status = "failed";
+        const before = f.finals.length;
+        value = await capture(...args);
+        if (staleReference) {
+          staleMinted = f.finals.length - before;
+          if (staleMinted === 0) {
+            assert.deepEqual(await fs.readFile(issue3561File(f, old)), oldBytes);
+            f.state.closeOnRelease = true;
+            await (f.coordinator as any).finalizeInventory(staleFresh!);
+          }
+        }
+      } catch (error) {
+        routeError = error;
+        if (route !== "retained capture") throw error;
+      }
+      if (route === "retained capture") throw stop; // stop before unrelated successor/model work
+      return value!;
+    } });
+    if (route === "terminal settlement") {
+      await r.settleGuardedInventory(claim, flight, H, undefined, undefined, true);
+    } else {
+      f.state.status = "running";
+      r.runFreeCapture = async (_claim: unknown, _flight: unknown, _deadline: number, _signal: AbortSignal, action: (held: unknown) => Promise<unknown>) =>
+        ({ kind: "observed_empty", value: await action({ signal }) });
+      r.assertHeldFreeCapture = () => {};
+      r.quiesceRun = async () => ({ blocked: false });
+      r.preflightDataVolume = async () => {};
+      r.checkWorkerResidueBeforeFetch = async () => {};
+      r.captureRecoveryRestorePoint = async () => ({ verified: true, published: false });
+      await assert.rejects(MaintenanceBudget.run(budget, () => r.recoverRetainedClaim(claim, flight, "issue-3561",
+        { runId: f.context.runId, clonePath: flight.worktreePath, attemptId: "predecessor" })), error => error === stop);
+    }
+    assert.equal(routeError, undefined, "downstream setup and actual capture must succeed before the controlled stop");
+    assert.equal(captureIds.length, 1, "the actual route must reach downstream archive capture");
+    if (staleReference) assert.equal(staleMinted, 0, "runner stale old reference must not mint a twin archive FINAL");
+    if (route === "terminal settlement") assert.deepEqual(downstream, captureIds);
+    if (proof === "verified") assert.notEqual(captureIds[0], old.captureId, "runner must drive the eligible fresh identity");
+    else assert.equal(captureIds[0], old.captureId, "unproven ancestry keeps the retained identity");
+    assert.ok(budgets.length > 0); assert.ok(budgets.every(b => b === budget));
+    assert.equal(flight.cancellationBudget, budget, "new ancestry work does not renew the existing allowance");
+    assert.equal(flight.preserveRecoveryClone, true);
+    assert.equal(await fs.readFile(path.join(flight.worktreePath, "source.txt"), "utf8"), "kept source");
+    // Existing finalization may persist its refusal again on the retained path.
+    // The no-write selection assertion above precedes that downstream operation.
+    if (proof === "verified" || staleReference) assert.deepEqual(await fs.readFile(issue3561File(f, old)), oldBytes);
+    else {
+      assert.equal((await f.coordinator.inspect(f.context.runId)).find(r => r.captureId === old.captureId)?.reason, "inventory_snapshot_changed");
+      assert.equal(f.finals.length, 0); assert.equal(f.state.uploads, 1);
+    }
+    if (staleReference) {
+      assert.equal(f.finals.length, 1);
+      assert.equal(f.state.open, false);
+      assert.equal((await f.coordinator.inspect(f.context.runId)).find(r => r.captureId === staleFresh?.captureId)?.finalAcknowledged, true);
+    }
+  } finally { budget.dispose(); await f.close(); }
+}
+
+for (const route of ["terminal settlement", "retained capture"] as const) {
+  for (const proof of ["verified", "unproven"] as const) {
+    it(`#3561 runner ${route} passes the ${proof === "verified" ? "fresh" : "retained"} identity from real freeze to downstream capture`,
+      () => issue3561RunnerCase(route, proof));
+  }
+  it(`#3561 runner ${route} blocks a stale archive mint while the fresh capture settles`,
+    () => issue3561RunnerCase(route, "unproven", true));
 }

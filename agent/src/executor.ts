@@ -135,6 +135,8 @@ export interface RunContext {
   runId: string;
   /** Current server claim fence; required to consume a checked plan approval. */
   claimGeneration?: number;
+  /** Negotiated before execution/capture; remains binding if registration features shrink. */
+  codexIdleStallRecovery?: boolean;
   /** Claim support assertion; absent means false. The runner separately gates root and phase. */
   parkRunSupported?: boolean;
   /** Request a park and await its authoritative outcome or a racing owner answer. */
@@ -848,7 +850,7 @@ export interface ExecutorResult {
    *  runner completes it with NO push/MR. Issue runs only. Absent ⇒ normal push+MR path. */
   reportOnly?: boolean;
   /** issue #279: the one-line/short findings summary from signal_done, persisted as
-   *  report_md on a report-only completion. Issue runs only. */
+   *  report_md on a report-only issue completion or a prompt completion. Issue and prompt runs only. */
   summary?: string;
   /** PRD #929 M2: a scheduled `prompt` run's structured proposal (title + body) from
    *  signal_done, forwarded verbatim on the prompt-run completion report so the server can

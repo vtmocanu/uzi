@@ -680,7 +680,10 @@ its timed parks. Its finite retry stamp permits automatic retry; only its
 NULL-stamp form requires owner Resume/Cancel. Protection lasts throughout
 `recovery_wait`; after promotion or Resume, existing proof-based custody
 rules apply again. Neither execution-claim release nor promotion proves source
-redundancy or permits deletion by itself.
+redundancy or permits deletion by itself. The #3527 amendment in
+[ADR-1197](1197-transient-recovery-park.md#amendment-2026-10-27-3527-owner-held-retained-adoption-retry)
+extends this protection to `retained_recovery_adoption_failed`, which requires
+owner Resume/Cancel regardless of retry timing.
 
 ## Amendment 2026-10-07 — #2394 owner-resumed recovery episodes
 

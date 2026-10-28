@@ -254,6 +254,14 @@ describe("RunProgressCell (PRD #2602)", () => {
     expect(cell.textContent).toBe("Progress: queued: uzi is in maintenance mode");
   });
 
+  it("queued by the weekly usage reserve: the sr-only word names the reserve; maintenance wins (PRD #3522)", () => {
+    const reserve = renderCell({ status: "queued", queue_reason: "weekly_reserve", progress: progress({ state: "queued" }) });
+    expect((cellOf(reserve.container) as HTMLElement).textContent).toBe("Progress: queued: weekly usage reserve");
+    reserve.unmount();
+    const maint = renderCell({ status: "queued", queue_reason: "maintenance", progress: progress({ state: "queued" }) });
+    expect((cellOf(maint.container) as HTMLElement).textContent).toBe("Progress: queued: uzi is in maintenance mode");
+  });
+
   it("none: screen-reader-only no estimate without a visible placeholder", () => {
     const { container } = renderCell({ progress: progress({ state: "none" }) });
     const cell = cellOf(container) as HTMLElement;
@@ -276,4 +284,18 @@ describe("RunProgressCell (PRD #2602)", () => {
     });
     expect(container.innerHTML).toBe("");
   });
+});
+
+
+it.each([["rate_limit", "a rate limit"], ["overload", "overload"]] as const)("Codex admission progress names %s eligibility", (cls, words) => {
+  const { container } = renderCell({ status: "queued", codex_admission_class: cls,
+    codex_admission_eligible_at: "2026-10-09T18:47:39Z", progress: progress({ state: "queued" }) });
+  expect(container.textContent).toBe(`Progress: waiting: provider reported ${words}; account admission eligible after 2026-10-09T18:47:39Z`);
+});
+
+it("Codex admission progress yields to a higher-priority queued blocker", () => {
+  const { container } = renderCell({ status: "queued", codex_admission_class: "rate_limit",
+    codex_admission_eligible_at: "2026-10-09T18:47:39Z", health_reason: "your vault is locked, so this run can't start",
+    progress: progress({ state: "queued" }) });
+  expect(container.textContent).toBe("Progress: queued");
 });

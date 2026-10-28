@@ -168,6 +168,18 @@ function seed(): MockState {
   if (maintenance) {
     for (const r of runs.values()) if (r.status === "queued") r.queue_reason = "maintenance";
   }
+  // ?mock=weekly-reserve (PRD #3522): queued fixtures are held by the weekly usage reserve and
+  // owner-paused fixtures read as parked by it (resuming one records the override).
+  if (mockScenario() === "weekly-reserve") {
+    for (const r of runs.values()) {
+      if (r.status === "queued") {
+        r.queue_reason = "weekly_reserve";
+        r.reserve_hold_reason = "weekly usage reserve: 85% >= 80%";
+      } else if (r.status === "paused" && !r.hold_reason) {
+        r.hold_reason = "weekly_reserve";
+      }
+    }
+  }
   const proposals = new Map<string, IssueProposal>();
   for (const p of mockProposals) proposals.set(p.id, { ...p });
   const boards = new Map<string, Board>();
@@ -278,6 +290,8 @@ const CARD_MIRRORED_FIELDS = [
   "deadline_at",
   // PRD #3454: the maintenance queue reason rides the card so the board badge agrees.
   "queue_reason",
+  "codex_admission_class",
+  "codex_admission_eligible_at",
   // PRD #1732 D14: the board projection sends hold_reason on every card, so a run parked
   // on (or released from) credential_disabled flips the card's badge along with its status.
   "hold_reason",
@@ -336,6 +350,12 @@ function syncCards(runId: string, patch: Partial<Run>): void {
       const merged = { ...card.latest_run, updated_at: new Date().toISOString() };
       for (const key of CARD_MIRRORED_FIELDS) {
         if (key in patch) (merged as Record<string, unknown>)[key] = patch[key];
+      }
+      if (!merged.is_mine) {
+        delete merged.codex_admission_class;
+        delete merged.codex_admission_eligible_at;
+        if (merged.queue_reason !== "maintenance") delete merged.queue_reason;
+        merged.health_reason = null;
       }
       card.latest_run = merged;
     }

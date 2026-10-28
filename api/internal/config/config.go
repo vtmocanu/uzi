@@ -496,15 +496,18 @@ type Config struct {
 
 	// Transient-recovery park (issue #1197). A run that reports a positively-empty SDK
 	// turn (after bounded in-process retries) parks in 'recovery_wait' and the sweeper
-	// auto-promotes it on a capped exponential backoff. UNLIKE the usage-limit park there
-	// is NO per-run park cap (no RUN_RECOVERY_MAX_WAITS): a park always becomes promotable
-	// again, so the run recovers repeatedly until it succeeds or the owner cancels.
+	// auto-promotes timed parks on a capped exponential backoff. Untyped recovery has
+	// no per-run park cap; typed causes such as Codex idle stalls apply their own
+	// retry bound and may instead wait for the owner.
 	//
 	// RunRecoveryParkBase is the FIRST park's wait (the backoff's base); each subsequent
 	// park doubles it, clamped at RunRecoveryMaxPark. Both shape only the retry cadence —
 	// neither can fail a run. recovery_wait_count feeds the curve, never a limit.
 	RunRecoveryParkBase time.Duration // first recovery park's wait; doubles per prior park
 	RunRecoveryMaxPark  time.Duration // ceiling on one recovery park's backoff
+
+	// Idle parks above this count wait for owner Resume. Zero holds the first park.
+	RunCodexIdleStallMaxParks int
 
 	// RunRetainedRecoveryMaxParks bounds automatic budget-exhaustion renewals only.
 	// RUN_RETAINED_RECOVERY_MAX_PARKS defaults to 3; zero holds for the owner immediately.
@@ -1246,6 +1249,10 @@ func Load() (Config, error) {
 	// value silently falls back to the default (like RUN_LIMIT_MAX_PARK): these shape the
 	// auto-promote cadence and have no off switch — there is no "never recover" mode.
 	cfg.RunRecoveryParkBase = parseDuration("RUN_RECOVERY_PARK_BASE", time.Minute)
+	cfg.RunCodexIdleStallMaxParks = 3
+	if n, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("RUN_CODEX_IDLE_STALL_MAX_PARKS")), 10, 32); err == nil && n >= 0 && n <= 2147483646 {
+		cfg.RunCodexIdleStallMaxParks = int(n)
+	}
 	cfg.RunRetainedRecoveryMaxParks = parseNonNegInt("RUN_RETAINED_RECOVERY_MAX_PARKS", 3)
 	cfg.RunRecoveryMaxPark = parseDuration("RUN_RECOVERY_MAX_PARK", 30*time.Minute)
 

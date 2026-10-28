@@ -37,7 +37,7 @@ func (m tuiModel) renderLaneRail() string {
 	}
 	sb.WriteString(title + "\n")
 	sb.WriteString(m.railWorkerLine())
-	sb.WriteString(m.railWaitingLine())
+	sb.WriteString(m.railWaitingLineAt(now))
 
 	if len(d.lanes) == 0 {
 		sb.WriteString(m.pal.faint.Render("(no activity yet)"))
@@ -111,20 +111,34 @@ const railWaitingMaxRows = 5
 const railWaitingLabel = "queued ▸ "
 
 // railWaitingLine explains why a queued run is waiting (issue #2705: for example a stale-requeued
-// run held for its returning worker, with the deadline). It draws only for a queued run whose
-// health is waiting_worker and carries a reason, wraps to railWaitingMaxRows rows within
-// railWidth(), and is also counted by railAutoFolded before the protected blocks. The reason is
-// server text but derived from worker names, so it goes through renderer.Plain (D7).
+// run held for its returning worker, with the deadline). Existing waiting-worker reasons occupy
+// at most railWaitingMaxRows; active typed admission gets up to eight additional rows, even
+// without a health reason. Both are width-bounded, counted by railAutoFolded and drawn through
+// renderer.Plain (D7).
 func (m tuiModel) railWaitingLine() string {
+	return m.railWaitingLineAt(time.Now())
+}
+
+func (m tuiModel) railWaitingLineAt(now time.Time) string {
 	run := m.detail.run
-	if run.Status != "queued" || run.Health != "waiting_worker" || run.HealthReason == nil || *run.HealthReason == "" {
+	if run.Status != "queued" {
 		return ""
 	}
-	text := struct{ runHealthReason string }{runHealthReason: *run.HealthReason}
-	plain := m.renderer.Plain(text.runHealthReason, m.railWidth()*railWaitingMaxRows+railWaitingMaxRows)
-	rows := wrapWords(railWaitingLabel+plain, m.railWidth(), railWaitingMaxRows)
-	if len(rows) == 0 {
-		return ""
+	reason := runHealthReasonAt(run, now)
+	admission := codexAdmissionLineAt(run, now)
+	var rows []string
+	if run.Health == "waiting_worker" && reason != "" && reason != admission {
+		text := struct{ runHealthReason string }{runHealthReason: reason}
+		plain := m.renderer.Plain(text.runHealthReason, m.railWidth()*railWaitingMaxRows+railWaitingMaxRows)
+		rows = wrapWords(railWaitingLabel+plain, m.railWidth(), railWaitingMaxRows)
+	} else if queue := runQueueReason(run); queue != "" {
+		rows = wrapWords(railWaitingLabel+m.renderer.Plain(queue, m.railWidth()*railWaitingMaxRows), m.railWidth(), railWaitingMaxRows)
+	}
+	if admission != "" {
+		// Eight rows retain the class and UTC nanosecond timestamp at the 26-column floor.
+		// A separate bound preserves an existing blocker above the admission explanation.
+		const admissionRows = 8
+		rows = append(rows, wrapWords(m.renderer.Plain(admission, m.railWidth()*admissionRows), m.railWidth(), admissionRows)...)
 	}
 	var sb strings.Builder
 	for i, row := range rows {
@@ -248,14 +262,14 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 		accountFloorRows++ // ACCOUNTS header
 	}
 	codexRows, hasCodex := m.railCodexFloorRows()
-	if block == "" && !spend && accountFloorRows == 0 && !hasCodex && m.railWorkerLine() == "" && m.railWaitingLine() == "" {
+	if block == "" && !spend && accountFloorRows == 0 && !hasCodex && m.railWorkerLine() == "" && m.railWaitingLineAt(now) == "" {
 		return false // empty required set: nothing below the roster to protect (D2/D5)
 	}
 	vp := m.transcriptViewport()
 	var sb strings.Builder
 	sb.WriteString("crew\n") // stand-in title row: only its trailing "\n" counts toward the budget
 	sb.WriteString(m.railWorkerLine())
-	sb.WriteString(m.railWaitingLine())
+	sb.WriteString(m.railWaitingLineAt(now))
 	sb.WriteString(m.expandedRoster(now))
 	appendRailBlock(&sb, progress)
 	appendRailBlock(&sb, block)

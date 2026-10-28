@@ -157,8 +157,13 @@ type JobView struct {
 	FinishedAt        *time.Time
 	UpdatedAt         time.Time
 	// QueueReason is "maintenance" while instance maintenance mode holds this queued job back
-	// (PRD #3454); nil otherwise.
+	// (PRD #3454), or "weekly_reserve" while the owner's weekly usage reserve does (PRD #3522); nil
+	// otherwise.
 	QueueReason *string
+	// ReserveHoldReason is the run's human-readable weekly-reserve hold reason (PRD #3522), set
+	// only while QueueReason is "weekly_reserve"; nil otherwise. The v1 surface exposes it as
+	// reserve_hold_reason because v1 queue_reason stays maintenance-only.
+	ReserveHoldReason *string
 }
 
 // JobFindingView is one structured finding of a job result.
@@ -571,6 +576,9 @@ func jobViewFromRow(f store.ListJobsForCallerRow) JobView {
 	if f.QueueReason != "" {
 		r := f.QueueReason
 		v.QueueReason = &r
+		if r == "weekly_reserve" {
+			v.ReserveHoldReason = textPtr(f.ReserveHoldReason)
+		}
 	}
 	if f.FailureReason.Valid {
 		// failure_reason is server-authored but can quote worker text: scrub, then bound.

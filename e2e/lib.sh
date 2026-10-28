@@ -540,6 +540,26 @@ wait_custody_headroom() {
   done
 }
 
+# An ephemeral fixture with no bound run may be reaped between any two checks.
+# Absence is global by exact UUID, never inferred from an empty owner-filtered read.
+fixture_worker_absent() {
+  local worker="$1" count
+  [[ "$worker" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || return 1
+  count="$(db_psql "SELECT count(*) FROM workers WHERE id='$worker'")" || return 1
+  [ "$count" = 0 ]
+}
+
+# Delete only the owned ephemeral peer, or prove the reaper already removed it.
+# SQL errors and unexpected RETURNING values remain failures, even if a later read is empty.
+remove_fixture_ephemeral_worker() {
+  local worker="$1" owner="$2" removed
+  [[ "$worker" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ &&
+     "$owner" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || return 1
+  removed="$(db_psql "DELETE FROM workers WHERE id='$worker' AND user_id='$owner' AND ephemeral RETURNING id")" || return 1
+  [ "$removed" != "$worker" ] || return 0
+  [ -z "$removed" ] && fixture_worker_absent "$worker"
+}
+
 # End-of-fixture owner choice, ONLY for an explicit run/generation whose phase
 # already proved preservation. Captured holds wait for the worker's exact archive
 # FINAL; only capture-less holds use owner discard. Available archives are preserved.

@@ -3,12 +3,12 @@ package codexusagepoller
 import (
 	"bytes"
 	"encoding/json"
-	"math"
 	"strings"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/usagereserve"
 )
 
 // codexEarlyReset compares only the uniquely identified main weekly meter.
@@ -42,9 +42,8 @@ func codexEarlyReset(prior store.GetCodexEarlyResetBaselineRow, next []apitypes.
 	if !expected.After(prior.LastSuccessAt.Time) || !now.Before(expected.Add(-8*time.Hour)) {
 		return time.Time{}, false
 	}
-	forward := *fresh.ResetAt > *old.ResetAt+3600
-	cleared := *fresh.ResetAt == *old.ResetAt && validPercent(old.UsedPercent) && validPercent(fresh.UsedPercent) && *old.UsedPercent >= 5 && *fresh.UsedPercent <= 1
-	return expected, forward || cleared
+	observed := usagereserve.CodexResetObserved(*old.ResetAt, *fresh.ResetAt, old.UsedPercent, fresh.UsedPercent)
+	return expected, observed
 }
 
 func mainWeeklyWindow(buckets []apitypes.CodexRateLimitBucketDTO) *apitypes.CodexRateLimitWindowDTO {
@@ -75,10 +74,6 @@ func mainWeeklyWindow(buckets []apitypes.CodexRateLimitBucketDTO) *apitypes.Code
 
 func validReset(reset *int64) bool {
 	return reset != nil && *reset > 0 && *reset <= 253402300799
-}
-
-func validPercent(pct *float64) bool {
-	return pct != nil && !math.IsNaN(*pct) && !math.IsInf(*pct, 0) && *pct >= 0 && *pct <= 100
 }
 
 func baselineMatches(prior store.GetCodexEarlyResetBaselineRow, t pollTarget) bool {

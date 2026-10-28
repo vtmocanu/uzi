@@ -14,7 +14,7 @@
 # Usage: watch-run.sh <run-id> [stop-csv] [interval-secs] [max-polls] [min-plan-seq] [min-question-seq]
 #   stop-csv (default) covers a plan gate, a question park, and every terminal
 #   state: completed,failed,cancelled,awaiting_approval,awaiting_input
-#   (`paused` and recovery_wait/worker_requeue_exhausted always stop; see below)
+#   (`paused`, recovery_wait/worker_requeue_exhausted and recovery_wait/retained_recovery_adoption_failed always stop; retained_recovery_exhausted stops only when owner-held; see below)
 #   For "watch to the end only" (after you have approved), pass:
 #     watch-run.sh <id> completed,failed,cancelled 60
 #
@@ -67,7 +67,12 @@
 # Owner-decision park: `recovery_wait` with recovery_wait_cause `worker_requeue_exhausted` never
 # resumes on its own (the owner must Resume or Cancel), so it always stops the watch, whatever the
 # stop set (also when the stop set names recovery_wait): STOP=recovery_wait:worker_requeue_exhausted,
-# RESULT=stop:recovery_wait, exit 0. Other recovery_wait causes keep polling unless the stop set names
+# RESULT=stop:recovery_wait, exit 0. So does an owner-held `retained_recovery_exhausted` park (#3495:
+# recovery_retry_not_before present and explicitly null = retries capped):
+# STOP=recovery_wait:retained_recovery_exhausted. A stamped, omitted or malformed exhaustion stamp keeps polling.
+# A retained_recovery_adoption_failed park always stops as an owner decision regardless of retry stamp:
+# integrity checks refused adoption; local work and custody are preserved, with no automatic retry.
+# Other recovery_wait causes keep polling unless the stop set names
 # recovery_wait, except a `data_volume_full` park, which is an attention signal (above).
 # `paused` never resumes on its own either (an owner pause, or hold_reason budget_exhausted /
 # completion hold that needs extend, resume or decide), so it always stops the watch, whatever the
@@ -164,9 +169,23 @@ while [ "$i" -lt "$MAX" ]; do
   rj=""
   if [ "$s" = recovery_wait ]; then
     rj="$(uzi run get "$RID" --json 2>/dev/null)" || rj=""
-    if [ "$(printf '%s' "$rj" | jq -r '.recovery_wait_cause // ""' 2>/dev/null)" = worker_requeue_exhausted ]; then
+    rc_cause="$(printf '%s' "$rj" | jq -r '.recovery_wait_cause // ""' 2>/dev/null)" || rc_cause=""
+    if [ "$rc_cause" = worker_requeue_exhausted ]; then
       printf 'STOP=recovery_wait:worker_requeue_exhausted\n'
       printf 'NOTE owner decision: automatic worker recovery stopped; back up the work, then uzi run resume or cancel\n'
+      printf 'RESULT=stop:recovery_wait\n'
+      exit 0
+    fi
+    if [ "$rc_cause" = retained_recovery_adoption_failed ]; then
+      printf 'STOP=recovery_wait:retained_recovery_adoption_failed\n'
+      printf 'NOTE owner decision: integrity check refused adoption; local work and custody preserved; no automatic retry; owner uzi run resume or cancel; source/archive availability unverified\n'
+      printf 'RESULT=stop:recovery_wait\n'
+      exit 0
+    fi
+    if [ "$rc_cause" = retained_recovery_exhausted ] &&
+       printf '%s' "$rj" | jq -e 'has("recovery_retry_not_before") and .recovery_retry_not_before == null' >/dev/null 2>&1; then
+      printf 'STOP=recovery_wait:retained_recovery_exhausted\n'
+      printf 'NOTE owner decision: automatic retained-recovery retries are capped (no retry stamp); local work and custody are retained; uzi run resume or cancel\n'
       printf 'RESULT=stop:recovery_wait\n'
       exit 0
     fi

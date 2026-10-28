@@ -115,7 +115,7 @@ export class PlanRevisionRecovery {
         if (a.used >= this.limit) {
           return this.retry(a.cause, observer, remainingWallMs);
         }
-        const reason = a.cause instanceof TransientRecoveryError && a.cause.zeroEvidenceIdle
+        const reason = a.cause instanceof TransientRecoveryError && a.cause.idleStallKind === "zero_evidence"
           ? "No model output within the idle timeout" : "Provider transient exhaustion";
         await this.deps.notice(`${reason} during plan revision ${a.id}; re-driving the failed turn (${a.used + 1}/${this.limit}).`);
         await this.confirmSource(a, false, remainingWallMs);
@@ -172,7 +172,7 @@ export class PlanRevisionRecovery {
     await restoreSourceGate(await this.confirmSource(a, false, remainingWallMs));
     this.deps.steering.setGateRevision(a.source.revision);
     await this.deps.notice(
-      `${a.cause instanceof TransientRecoveryError && a.cause.zeroEvidenceIdle ? "No model output within the idle timeout. " : ""}Plan revision retry allowance exhausted (generation ${this.deps.generation}, source gate ${a.source.revision}, pending revision ${a.id}, ${this.limit} automatic re-drives in this flight). Feedback remains pending; no revised plan answering it has persisted. ` +
+      `${a.cause instanceof TransientRecoveryError && a.cause.idleStallKind === "zero_evidence" ? "No model output within the idle timeout. " : ""}Plan revision retry allowance exhausted (generation ${this.deps.generation}, source gate ${a.source.revision}, pending revision ${a.id}, ${this.limit} automatic re-drives in this flight). Feedback remains pending; no revised plan answering it has persisted. ` +
       "Use an ordinary revise bound to this source gate for a new, normally charged revision, if the server's PLAN_MAX_REVISIONS permits. If that cap is exhausted, no further revise/retry is available on this run. " +
       "Cancel and source-bound reject remain available. Approval and follow-up cannot resume this wait. For further changes after the cap, cancel/reject and dispatch a new run. This live gate remains busy and can defer a worker image roll until it ends or existing drain/shutdown policy acts.",
     );
@@ -214,7 +214,7 @@ export class PlanRevisionRecovery {
       this.predecessors.push(a.id);
       this.accept(verdict);
       delete a.replacement;
-      if (this.active && a.cause instanceof TransientRecoveryError && a.cause.zeroEvidenceIdle) {
+      if (this.active && a.cause instanceof TransientRecoveryError && a.cause.idleStallKind === "zero_evidence") {
         // The replacement still needs a fresh epoch. Charge its first construction
         // at beforeTurn(), without retrying or restoring the exhausted predecessor.
         this.active.cause = a.cause;

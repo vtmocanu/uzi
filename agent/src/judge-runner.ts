@@ -491,7 +491,7 @@ export class JudgeRunner {
         queryFn: this.queryFn,
         denyReason: "the judge is read-only and runs no tools",
         log: this.log,
-        codex: { runId: claim.run_id, binding, buildHarness: this.codexAdviceHarnessFactory },
+        codex: { runId: claim.run_id, claimGeneration: claim.claim_generation, binding, buildHarness: this.codexAdviceHarnessFactory },
         onUsage: (modelUsage) => {
           usageMessage = { kind: "status", agent: JUDGE_AGENT, payload: { event: "result", modelUsage } };
         },

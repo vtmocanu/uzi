@@ -93,7 +93,9 @@ The Maintenance card and `uzi admin maintenance status` show the same snapshot:
 Each held and custody item is tagged `progressing` or `needs_owner`, with its
 owner and how long it has been open. `needs_owner` covers an approval without
 auto-approve, `awaiting_input`, `paused`, a `recovery_wait` caused by
-`worker_requeue_exhausted` or `worker_memory_pressure`, and a custody hold that
+`worker_requeue_exhausted`, `worker_memory_pressure`,
+`retained_recovery_adoption_failed`, or owner-held `retained_recovery_exhausted`
+(NULL retry), and a custody hold that
 needs an owner decision. Each list shows up to 50 items; the counts are exact.
 
 **Clear** means active, held and custody are all zero in one snapshot, shown

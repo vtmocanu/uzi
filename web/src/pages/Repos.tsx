@@ -1,4 +1,4 @@
-// Boards home: the projects the bot can see. Enabling one starts tracking its
+// Repos home: the projects the bot can see. Enabling one starts tracking its
 // issues on a kanban board.
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -18,6 +18,7 @@ import { selectedForge } from "../lib/prefs";
 import { CAPABILITY_VOCABULARY } from "../lib/capabilityVocabulary";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail, maskHost, maskRepoPath, maskUsername } from "../lib/demoMask";
+import { stripUnsafeChars } from "../lib/safeText";
 
 export function Repos() {
   // The guardrail override write is admin-only (PRD #66 D8): a member sees the block
@@ -734,6 +735,19 @@ export function Repos() {
     }
   };
 
+  const setRepoIgnoredInferredCapabilities = async (repo: Repo, nextCaps: string[]) => {
+    setError("");
+    setToolsBusy(true);
+    try {
+      const { repo: updated } = await api.setRepoIgnoredInferredCapabilities(repo.id, nextCaps);
+      setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+    } catch (err) {
+      setError(errorMessage(err, "Update failed"));
+    } finally {
+      setToolsBusy(false);
+    }
+  };
+
   // Open the Allow-anyway modal for a blocked repo (admin only). Resets the reason.
   const openAllow = (repo: Repo) => {
     setError("");
@@ -873,7 +887,7 @@ export function Repos() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title="Boards"
+        title="Repos"
         description={
           <>
             Projects your bot can see. Enable one to track its issues on a board. See the{" "}
@@ -1770,6 +1784,33 @@ export function Repos() {
                       );
                     })}
                   </div>
+                </div>
+                <div role="group" aria-label="Ignored inferred capabilities" className="space-y-1.5 border-t border-edge pt-3">
+                  <p className="text-sm text-fg">Ignored inferred capabilities</p>
+                  <p className="text-xs text-muted">
+                    New runs ignore these inferred scheduling requirements. Explicitly required capabilities still win.
+                    Tool provisioning and runtime guardrails stay unchanged.
+                  </p>
+                  <div className="flex flex-wrap gap-x-6 gap-y-2 pt-1">
+                    {CAPABILITY_VOCABULARY.map((cap) => {
+                      const current = toolsRepo.ignored_inferred_capabilities ?? [];
+                      return (
+                        <label key={cap} className="flex items-center gap-2 text-sm text-fg">
+                          <input type="checkbox" checked={current.includes(cap)} disabled={toolsBusy}
+                            onChange={(e) => setRepoIgnoredInferredCapabilities(toolsRepo,
+                              e.target.checked ? [...current, cap] : current.filter((c) => c !== cap))} />
+                          <span className="font-mono text-xs">{cap}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  {(toolsRepo.required_capabilities ?? []).some((cap) => (toolsRepo.ignored_inferred_capabilities ?? []).includes(cap)) && (
+                    <p role="note" className="text-xs text-muted">
+                      Explicit requirements take precedence: {(toolsRepo.required_capabilities ?? [])
+                        .filter((cap) => (toolsRepo.ignored_inferred_capabilities ?? []).includes(cap))
+                        .map((cap) => stripUnsafeChars(cap)).join(", ")} remain required.
+                    </p>
+                  )}
                 </div>
               </div>
             )}

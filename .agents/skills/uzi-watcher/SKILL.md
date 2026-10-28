@@ -155,6 +155,11 @@ timeout is at most 10 minutes; other hosts have their own limits.
 <this skill's directory>/scripts/watch-run.sh RUN completed,failed,cancelled 60   # to the end only
 ```
 
+For a sweep issue you will land, capture `SINCE=$(jq -nr now)` before queueing and arm
+`<this skill's directory>/scripts/watch-issue.sh --repo PATH_OR_UUID --since "$SINCE" ISSUE` at filing with a verified
+completion route. Keep that baseline on re-arms. It discovers a new run, even if already
+terminal, then delegates to `watch-run.sh` with the remaining poll budget and no plan watermark.
+
 For post-approval delivery, prefer the lander's full stop set (new plan, question,
 pause and terminal states), approved-plan watermark and explicit MAX covering the
 remaining budget. A terminal-only watch can miss a parked duty. Observation expiry
@@ -188,8 +193,16 @@ immediately `uzi run pause RUN --now`. A run at `limit_wait` is parked on an Ant
 usage limit and resumes itself — keep waiting. `recovery_wait` with cause
 `worker_requeue_exhausted` never resumes itself: the poller always stops on it
 (`STOP=recovery_wait:worker_requeue_exhausted`, exit 0, whatever the stop set, even one naming `recovery_wait`). Back up the
-work (*Recovering a failed run's work*), then `uzi run resume` or cancel; other
-`recovery_wait` causes keep their existing polling behaviour. `uzi-lander` uses this same poller for its
+work (*Recovering a failed run's work*), then `uzi run resume` or cancel. It stops the same way on
+an owner-held `retained_recovery_exhausted` park (retry stamp explicitly null; retries capped):
+`STOP=recovery_wait:retained_recovery_exhausted`; custody is kept, so Resume or cancel. A stamped
+park of that cause retries itself and keeps polling. An integrity refusal,
+`retained_recovery_adoption_failed`, also stops the poller (exit 0,
+`STOP=recovery_wait:retained_recovery_adoption_failed`) regardless of retry timing:
+local work and custody are preserved, with no automatic retry. Back up available
+work, then ask the owner to Resume or Cancel; Resume requests a bounded attempt,
+not assured success, and another adoption failure holds again. Other
+`recovery_wait` causes keep polling under their existing rules. `uzi-lander` uses this same poller for its
 blind watch to terminal.
 
 **Watching for a REVISED plan (after `uzi run revise`) uses the plan-seq form.** The

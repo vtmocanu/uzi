@@ -709,6 +709,9 @@ func toDTO(u store.User) apitypes.UserDTO {
 		// "pinned" row whose pointer was nulled back to "default". Since SetUserJudgeBinding
 		// writes NULL for every non-"pinned" mode, the id always agrees with the mode.
 		JudgeAnthropicBindMode: effectiveBindMode(u.JudgeAnthropicBindMode, u.JudgeAnthropicSecretID),
+		// The weekly usage reserve (PRD #3522): a NULL threshold is JSON null (off).
+		WeeklyReservePct:          intPtrFromInt2(u.WeeklyReservePct),
+		WeeklyReservePauseRunning: u.WeeklyReservePauseRunning,
 	}
 	if u.DisplayName.Valid {
 		dto.DisplayName = &u.DisplayName.String
@@ -1340,6 +1343,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// Claude run never has a Codex binding, so these fail closed for it (not codex-bound).
 		r.Post("/runs/{id}/codex/release", h.WorkerCodexRelease)
 		r.Post("/runs/{id}/codex/refresh", h.WorkerCodexRefresh)
+		r.Post("/runs/{id}/codex/admission-signal", h.WorkerCodexAdmissionSignal)
 
 		// Run judge (PRD #46 M3): a judge run reads the run it reviews and posts a
 		// verdict. Both are judge-run-scoped (the worker must own the active judge

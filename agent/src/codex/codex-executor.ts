@@ -1,3 +1,4 @@
+import type { CodexAdmissionReporter } from "./admission-signal.js";
 import { checkCheckpointStop, cleanCheckpointAdmission, CheckpointSoftDeadlineError } from "../checkpoint-stop.js";
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production `CodexExecutor` and the
 // claim-aware DARK selection seam's Codex branch.
@@ -1179,6 +1180,7 @@ export async function makeCodexAdviceHarness(
   signal?: AbortSignal,
   refresh?: "deny",
   ownership?: SummaryOwnership,
+  admissionReporter?: CodexAdmissionReporter,
 ): Promise<CodexAdviceHarness> {
   // Register EVERY advice token — the initial release AND any subscription refresh — with the
   // harness redactor so neither can ride a log line verbatim. The advice lane has no separate
@@ -1194,7 +1196,7 @@ export async function makeCodexAdviceHarness(
   ownership?.guard();
   registerToken(initial);
   const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken, refresh === "deny"));
-  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log });
+  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log, admissionReporter });
 }
 
 /** One evaluator pass on a caller-provided key. Register CLI signal cleanup before run;
@@ -1416,6 +1418,7 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
  *  ({@link import("./select.js").selectCodexBinding}'s output). */
 export interface CodexAdviceHarnessBuildParams {
   readonly runId: string;
+  readonly claimGeneration?: number;
   readonly binding: CodexBinding;
   readonly signal?: AbortSignal;
   /** PRD #2603: "deny" makes the call's app-server refresh bridge fail instead of calling
@@ -1449,7 +1452,8 @@ export function makeProductionCodexAdviceHarnessFactory(
     ownership?.guard();
     const bridge = new CodexAdviceCredentialBridge(runId, client, binding);
     const launchRoot = makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log, ownership);
-    return makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership);
+    return makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership,
+      binding.authMode === "subscription" ? client.codexAdmissionReporter?.(runId, params.claimGeneration) : undefined);
   };
 }
 
@@ -3049,7 +3053,7 @@ export class CodexExecutor implements Executor {
     const prdInputP = summariesOn
       ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log) : undefined;
     const summaryInputs = async () => ({
-      claim: { run_id: ctx.runId, secrets: {
+      claim: { run_id: ctx.runId, claim_generation: ctx.claimGeneration, secrets: {
         codex: this.opts.summaryClaimCodex !== undefined ? this.opts.summaryClaimCodex : summaryBinding,
       } },
       token: "", model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
@@ -3906,7 +3910,7 @@ export class CodexExecutor implements Executor {
               continue;
             }
             let cause = error;
-            if (humanRevision && error instanceof TransientRecoveryError && error.zeroEvidenceIdle) {
+            if (humanRevision && error instanceof TransientRecoveryError && error.idleStallKind === "zero_evidence") {
               silentRevision = { cause: error, needsRebuild: true, checkedAt: Date.now() };
               // Persist already happened in the measured-idle branch. Dispose before
               // the hook, even when it will restore the exhausted owner gate.
@@ -3929,8 +3933,8 @@ export class CodexExecutor implements Executor {
               cause = silentRevision.cause;
             }
             if (!humanRevision || !(cause instanceof TransientRecoveryError) ||
-                (!cause.providerOrigin && !cause.zeroEvidenceIdle)) throw error;
-            if (!ctx.retryPlanRevisionTurn) throw cause.zeroEvidenceIdle ? cause.originalIdle ?? cause : cause;
+                (!cause.providerOrigin && cause.idleStallKind !== "zero_evidence")) throw error;
+            if (!ctx.retryPlanRevisionTurn) throw cause.idleStallKind === "zero_evidence" ? cause.originalIdle ?? cause : cause;
             try {
               const outcome = await ctx.retryPlanRevisionTurn(cause,
                 silentRevision?.needsRebuild ? observeOwnerWait : undefined,
@@ -3942,7 +3946,7 @@ export class CodexExecutor implements Executor {
             } catch (rejected) {
               // Only identity rejection denotes unsupported recovery. Controls and
               // replacement-revise exceptions must retain their own routing.
-              if (rejected === cause && cause.zeroEvidenceIdle) throw cause.originalIdle ?? cause;
+              if (rejected === cause && cause.idleStallKind === "zero_evidence") throw cause.originalIdle ?? cause;
               throw rejected;
             } finally { chargeSilentRecovery(); }
             continue;
@@ -4217,6 +4221,8 @@ export class CodexExecutor implements Executor {
       // turn's milestones_completed reaches the ExecutorResult after the loop breaks.
       let declaredMilestonesCompleted: string[] | undefined;
       let declaredReportOnly = false;
+      let declaredSummary: string | undefined;
+      let declaredProposal: ReducedTurnResult["proposal"];
       // PRD #1798 M2 (D4, D13 parity with sdk-executor): the latched signal_done pr_summary,
       // stamped with the worktree HEAD on the done turn that declared it.
       let declaredPrSummary: PrSummaryClaim | undefined;
@@ -4254,6 +4260,8 @@ export class CodexExecutor implements Executor {
         ...(pausedAt ? { pausedAt } : {}),
         ...(isIssueRun && scopeCapped ? { scopeCapped } : {}),
         ...(isIssueRun && declaredReportOnly ? { reportOnly: true } : {}),
+        ...((isIssueRun || resolveRunKind(ctx.kind) === "prompt") && declaredSummary !== undefined ? { summary: declaredSummary } : {}),
+        ...(declaredProposal !== undefined ? { proposal: declaredProposal } : {}),
         // Issue #1674 (PRD #265 M1 parity): forward the declared finished-milestone ids on issue
         // runs only, OMITTED when nothing was declared, as sdk-executor does; runner.ts reads it.
         ...(isIssueRun && declaredMilestonesCompleted !== undefined ? { milestonesCompleted: declaredMilestonesCompleted } : {}),
@@ -4504,6 +4512,13 @@ export class CodexExecutor implements Executor {
           if (!hasQuestions && result.milestonesCompleted !== undefined) {
             declaredMilestonesCompleted = result.milestonesCompleted;
             for (const id of result.milestonesCompleted) seenCompletedIds.add(id);
+          }
+          // Keep the latest declaration across later turns that omit it.
+          if (!hasQuestions && result.summary !== undefined) {
+            declaredSummary = result.summary;
+          }
+          if (!hasQuestions && result.proposal !== undefined) {
+            declaredProposal = result.proposal;
           }
           // PRD #1798 M2: last-wins, and stamped with the worktree HEAD only on the turn that
           // carried the claims, so a later bare signal_done keeps the earlier claims with the sha
@@ -5260,6 +5275,7 @@ export class CodexExecutor implements Executor {
       };
 
       harness = new CodexHarness({
+        admissionReporter: this.opts.client.codexAdmissionReporter?.(ctx.runId, ctx.claimGeneration),
         registry,
         launchRoot: async (spec) => {
           this.assertCaptureAdmission(revision);
@@ -5805,7 +5821,7 @@ export class CodexExecutor implements Executor {
     idleOperation?: () => Promise<ReducedTurnResult>,
     beforeDispatch?: (prompt: string) => string,
     ownerCompletionRecheck = false,
-    zeroEvidenceRecoveryEligible = false,
+    idleRecoveryEligible = false,
     humanRevision = false,
   ): Promise<
     | { kind: "turn"; result: ReducedTurnResult }
@@ -5907,8 +5923,13 @@ export class CodexExecutor implements Executor {
         }
         // Human revision silence stays inside its negotiated driver. Synthetic
         // trips and unknown evidence retain the terminal idle contract.
-        const zeroEvidenceIdle = (zeroEvidenceRecoveryEligible || humanRevision) && !idleOperation &&
-          err instanceof CodexTurnTripError && err.message === REASON_IDLE && err.processedEvents === 0;
+        const measuredIdle = !idleOperation && err instanceof CodexTurnTripError &&
+          err.message === REASON_IDLE && err.processedEvents !== undefined;
+        const idleStallKind = measuredIdle && (idleRecoveryEligible || humanRevision) && err instanceof CodexTurnTripError
+          ? err.processedEvents === 0 ? "zero_evidence"
+            : idleRecoveryEligible && !humanRevision && ctx.codexIdleStallRecovery && err.processedEvents! > 0
+              ? "productive" : undefined
+          : undefined;
         let recoveryCheckedAt = Date.now();
         const recoveryInterruption = (): CodexTurnTripError | undefined => {
           // The turn disarmed its wall timer. Charge only this candidate's post-idle
@@ -5920,7 +5941,7 @@ export class CodexExecutor implements Executor {
           const reason = this.pendingInterruption(ctx, pauseNow, wall);
           return reason === undefined ? undefined : new CodexTurnTripError(reason, pauseNow.capture());
         };
-        if (zeroEvidenceIdle) err = recoveryInterruption() ?? err;
+        if (idleStallKind) err = recoveryInterruption() ?? err;
         // At most one idle capture and one declined hold; each new interruption leaves
         // the idle arm and follows the existing pause/wall route with its own snapshot.
         routeTrip: for (;;) {
@@ -5968,7 +5989,7 @@ export class CodexExecutor implements Executor {
             if (held) return { kind: "held", reason };
             if (wallTrip) return { kind: "walled" };
           }
-          if (zeroEvidenceIdle && msg === REASON_IDLE) {
+          if (idleStallKind && msg === REASON_IDLE) {
             const interrupted = recoveryInterruption();
             if (interrupted) { err = interrupted; continue routeTrip; }
             if (!pauseNow.vaultLock.latched) {
@@ -5976,8 +5997,12 @@ export class CodexExecutor implements Executor {
               const afterCapture = recoveryInterruption();
               if (afterCapture) { err = afterCapture; continue routeTrip; }
               if (!pauseNow.vaultLock.latched) {
-                throw new TransientRecoveryError("provider sent no model output within the idle timeout",
-                  humanRevision ? { zeroEvidenceIdle: true, originalIdle: caught instanceof Error ? caught : undefined } : {});
+                throw new TransientRecoveryError(idleStallKind === "productive"
+                  ? "model output stalled within the idle timeout"
+                  : "provider sent no model output within the idle timeout", {
+                  ...(humanRevision || ctx.codexIdleStallRecovery ? { idleStallKind } : {}),
+                  originalIdle: caught instanceof Error ? caught : undefined,
+                });
               }
             }
           }
@@ -6207,6 +6232,7 @@ export class CodexExecutor implements Executor {
       const sink = new ChildFrameQueue();
       harness.registerChildSink(childThreadId, sink);
       let childTurnId: string;
+      let admissionAttempt: ReturnType<CodexHarness["beginAdmissionAttempt"]>;
       try {
         const turnParams: Record<string, unknown> = {
           threadId: childThreadId,
@@ -6214,10 +6240,12 @@ export class CodexExecutor implements Executor {
         };
         if (spec.model !== undefined) turnParams.model = spec.model;
         if (spec.effort !== undefined) turnParams.effort = spec.effort;
+        admissionAttempt = harness.beginAdmissionAttempt(childThreadId);
         const turnRes = await harness.requestOnTransport<{ turn?: { id?: string } }>("turn/start", turnParams, { signal: spec.signal });
         const id = turnRes?.turn?.id;
         if (typeof id !== "string" || id.length === 0) throw new Error("codex child turn/start returned no turn id");
         childTurnId = id;
+        admissionAttempt?.bind(id);
       } catch (err) {
         harness.unregisterChildSink(childThreadId);
         sink.end();
@@ -6230,7 +6258,12 @@ export class CodexExecutor implements Executor {
       return {
         threadId: childThreadId,
         turnId: childTurnId,
-        notifications: () => sink.iterator(),
+        notifications: async function* () {
+          for await (const note of sink.iterator()) {
+            admissionAttempt?.observe(note);
+            yield note;
+          }
+        },
         project: (items) => harness.emitChildFrame(childThreadId, items),
         respond: (requestId, reply) => harness.respondOnTransport(requestId, reply),
         // Issue #1864: the delegation interrupts only AFTER spec.signal aborted, and the transport
