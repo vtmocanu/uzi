@@ -17266,6 +17266,57 @@ try {
     }
   }
 
+  /** Delete one pin ref and settle its authority record from what the child proved. runGit's
+   *  failure handling is reproduced here (capture-credentials refusal, residue and boundary-abort
+   *  rethrows, the wrapped error) because the settlement needs the raw exec outcome:
+   *  - a known exit (0, or a numeric code with no kill and no signal) reads the ref back and settles
+   *    ok when gone, residue when present or unreadable; a nonzero exit then rethrows the wrapped error;
+   *  - a spawn failure (string code, "spawn" syscall, not killed) settles residue and rethrows;
+   *  - anything else (timeout, kill, signal, null code, maxBuffer) leaves the record unsettled and rethrows,
+   *    as do residue and boundary-abort errors. */
+  private async deleteRefSettled(barePath: string, ref: string, sha: string,
+    settlement: AuthoritySettlement | undefined, mismatch: string): Promise<void> {
+    const args = ["update-ref", "-d", ref, sha];
+    // runGit's capture-credentials refusal needs a credential; none is passed here, so it cannot fire.
+    this.log.debug("git", { cwd: barePath, args });
+    let childFailure: Error | undefined;
+    try {
+      await this.execScoped("git", withDir(barePath, args), {
+        env: gitEnv(undefined, undefined, undefined),
+        timeout: GIT_TIMEOUT_MS,
+        maxBuffer: GIT_MAX_BUFFER,
+      });
+    } catch (err) {
+      if (err instanceof RunResidueBlockedError) throw err;
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      const stderr = (err as { stderr?: unknown })?.stderr;
+      retainedGitDiagnostics.set(failure, {
+        stderr: typeof stderr === "string" ? stderr : "",
+        context: `${barePath}: git ${args.join(" ")}`,
+      });
+      const e = err as { code?: unknown; killed?: unknown; signal?: unknown; syscall?: unknown };
+      const knownExit = typeof e.code === "number" && e.killed !== true && !e.signal;
+      const noStart = typeof e.code === "string" && typeof e.syscall === "string" &&
+        e.syscall.startsWith("spawn") && e.killed !== true;
+      if (noStart) {
+        await settlement?.settle({ ok: false, residue: [ref] });
+        throw failure;
+      }
+      if (!knownExit) throw failure;
+      childFailure = failure;
+    }
+    let remains = true;
+    let readError: unknown;
+    try { remains = await this.checkedRefSha(barePath, ref) !== undefined; }
+    catch (err) { readError = err; }
+    await settlement?.settle(remains ? { ok: false, residue: [ref] } : { ok: true });
+    if (childFailure) throw childFailure;
+    if (readError !== undefined) throw readError;
+    if (remains) throw new Error(mismatch);
+  }
+
   /** Bind values allocated/read by the private object-DB producers to this exact
    * invocation. Revocation follows the awaited child; no sibling inherits authority. */
   private async runSynthesisGit(cwd: string, args: string[], extraEnv: NodeJS.ProcessEnv): Promise<string> {
@@ -18916,15 +18967,8 @@ try {
       const deleteRef = async (ref: string, sha: string): Promise<void> => {
         open();
         const settlement = await this.beginBare(barePath, "recovery-cleanup-delete-ref", [ref]);
-        // A rejected child is left unsettled: nothing here proves it exited or never started.
-        await this.runGit(barePath, ["update-ref", "-d", ref, sha]);
-        let remains = true;
-        let readError: unknown;
-        try { remains = await this.checkedRefSha(barePath, ref) !== undefined; }
-        catch (err) { readError = err; }
-        await settlement?.settle(remains ? { ok: false, residue: [ref] } : { ok: true });
-        if (readError !== undefined) throw readError;
-        if (remains) throw new Error("recovery cleanup ref deletion mismatch");
+        // A known exit or a proven spawn failure settles; a timeout, kill or ambiguous rejection stays unsettled.
+        await this.deleteRefSettled(barePath, ref, sha, settlement, "recovery cleanup ref deletion mismatch");
       };
       if (authority === "completion-check") { open(); return "verified"; }
       for (const pin of ownedPins) await deleteRef(pin.ref, pin.sha);
@@ -18972,15 +19016,8 @@ try {
       for (const candidate of candidates) {
         if (await this.remotelyCovers(barePath, candidate.sha, remotelyConfirmedSha)) {
           const settlement = await this.beginBare(barePath, "owed-reconcile-delete-ref", [candidate.pinRef]);
-          // A rejected child is left unsettled: nothing here proves it exited or never started.
-          await this.runGit(barePath, ["update-ref", "-d", candidate.pinRef, candidate.sha]);
-          let remains = true;
-          let readError: unknown;
-          try { remains = await this.checkedRefSha(barePath, candidate.pinRef) !== undefined; }
-          catch (err) { readError = err; }
-          await settlement?.settle(remains ? { ok: false, residue: [candidate.pinRef] } : { ok: true });
-          if (readError !== undefined) throw readError;
-          if (remains) throw new Error("owed pin deletion mismatch");
+          // A known exit or a proven spawn failure settles; a timeout, kill or ambiguous rejection stays unsettled.
+          await this.deleteRefSettled(barePath, candidate.pinRef, candidate.sha, settlement, "owed pin deletion mismatch");
           // Ref first, metadata second: a crash between them leaves harmless metadata, never a
           // pin without discovery metadata. Without this, candidate-*.json would outlive every
           // released pin and enumerateOwedUnderLock would read them all forever.

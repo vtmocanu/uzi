@@ -5,7 +5,8 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { GitCache, type FetchAgentBranchOptions, type PositiveOwedCandidateContext, type RecoveryJournalEntry } from "../src/git.js";
+import { GitBoundaryAbortError } from "../src/checkpoint-stop.js";
+import { GitCache,type FetchAgentBranchOptions, type PositiveOwedCandidateContext, type RecoveryJournalEntry } from "../src/git.js";
 import type { AuthoritySettlement, GitAuthorityHooks } from "../src/git-authority-hooks.js";
 import { serializeSourceFence, type CompletionSourceFence } from "../src/completion-source.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
@@ -16,7 +17,17 @@ import { parseRecoveryJournal as baseParseRecoveryJournal } from "./fixtures/bas
 // consumption by completion retirement, and the authority hooks GitCache consults before effects.
 // Real git in temp dirs; the hooks are a recording fake.
 
-const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+// An ambient GIT_DIR (a hook, a worktree gate) would redirect every `git -C` below at someone else's repo.
+const AMBIENT_GIT = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES", "GIT_PREFIX", "GIT_SHALLOW_FILE",
+  "GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
+function scrubGitEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+  for (const key of AMBIENT_GIT) delete env[key];
+  for (const key of Object.keys(env)) if (/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)) delete env[key];
+  return env;
+}
+const ENV = scrubGitEnv(process.env);
 const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
 const BRANCH = "agent/issue-2512";
 const KEY = "issue-2512";
@@ -78,6 +89,28 @@ beforeEach(async () => {
   await cache.markRecoveryCapture(bare, clonePath, BRANCH, RUN);
 });
 afterEach(() => fx.cleanup());
+
+describe("scrubGitEnv", () => {
+  it("keeps a decoy GIT_DIR from redirecting a config write away from the target repo", () => {
+    const sentinel = fs.mkdtempSync(path.join(fx.dataDir, "sentinel-"));
+    execFileSync("git", ["init", "-q", sentinel], { env: ENV });
+    const decoy = { ...process.env, GIT_DIR: path.join(sentinel, ".git"), GIT_WORK_TREE: sentinel };
+    const cfg = (): string => fs.readFileSync(path.join(sentinel, ".git", "config"), "utf8");
+    const refs = (): string => execFileSync("git", ["-C", sentinel, "for-each-ref"], { encoding: "utf8", env: ENV });
+    const write = (env: NodeJS.ProcessEnv): void => {
+      execFileSync("git", ["-C", bare, "config", "uzi-test.k", "v"], { env: { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } });
+    };
+    const cfgBefore = cfg(), refsBefore = refs();
+    write(scrubGitEnv(decoy));
+    assert.equal(gitIn(bare, ["config", "--get", "uzi-test.k"]), "v");
+    assert.equal(cfg(), cfgBefore);
+    assert.equal(refs(), refsBefore);
+    // Control: the unscrubbed decoy does hit the sentinel, so the scrub is what protects it.
+    write(decoy);
+    assert.notEqual(cfg(), cfgBefore);
+    assert.match(cfg(), /uzi-test/);
+  });
+});
 
 describe("journal fence serialization", () => {
   it("installs the fence as the last key in fixed field order and round-trips it", async () => {
@@ -537,8 +570,19 @@ describe("authority hooks", () => {
     const OWED_RUN = "19241924-1111-2222-3333-444444444444";
     const BR = "agent/issue-1924";
 
+    let cloneDir: string;
+    /** A new head on BR in the real clone, on top of `pinned`. */
+    const commitNewHead = (): string => {
+      const head = gitIn(cloneDir, [...IDENT, "commit-tree", `${pinned}^{tree}`, "-m", "next", "-p", pinned]);
+      gitIn(cloneDir, ["update-ref", `refs/heads/${BR}`, head, pinned]);
+      return head;
+    };
+    const newHeadOptions = (): FetchAgentBranchOptions => ({ context: { runId: OWED_RUN, generation: 1, branch: BR, kind: "issue",
+      barePath: bare, defaultIdentity: { ref: "refs/remotes/origin/main", sha: base() } } });
+
     beforeEach(async () => {
       const dir = (await cache.runnerCloneForBranch(bare, BR, "issue-1924", noProofReseed, OWED_RUN)).path;
+      cloneDir = dir;
       const tree = gitIn(dir, ["rev-parse", `${base()}^{tree}`]);
       pinned = gitIn(dir, [...IDENT, "commit-tree", tree, "-m", "pinned", "-p", base()]);
       gitIn(dir, ["update-ref", `refs/heads/${BR}`, pinned]);
@@ -567,11 +611,89 @@ describe("authority hooks", () => {
     it("an unjoined child (rejected update-ref) is never settled and the pin stays", async () => {
       const events: string[] = [];
       const hooked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ authority: recorder(events) }));
-      watchGit(hooked, isDelete, events, Object.assign(new Error("timed out"), { code: 128, stdout: "", stderr: "" }));
+      watchGit(hooked, isDelete, events, Object.assign(new Error("timed out"),
+        { code: null, killed: true, signal: "SIGTERM", stdout: "", stderr: "" }));
       await assert.rejects(hooked.reconcileOwedCandidates(bare, OWED_RUN, pinned));
       assert.deepEqual(events.map(e => e.split(":")[0]), ["bare", "git"]);
       assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-owed/${OWED_RUN}/${pinned}`]), pinned);
     });
+
+    /** Intercept `update-ref -d`: optionally run the real child first, then fail; optionally fail the read-back. */
+    function interceptDelete(c: GitCache, events: string[], plan: { error?: Error; runFirst?: boolean; readError?: boolean }): void {
+      const internals = c as unknown as Internals;
+      const original = internals.execScoped.bind(c);
+      let deleted: string | undefined;
+      internals.execScoped = async (command, args, options) => {
+        if (command === "git" && isDelete(args)) {
+          events.push("git:update-ref-d");
+          if (plan.error && !plan.runFirst) throw plan.error;
+          const out = await original(command, args, options);
+          deleted = args[args.indexOf("-d") + 1];
+          if (plan.error) throw plan.error;
+          return out;
+        }
+        if (plan.readError && deleted && command === "git" && args.includes("for-each-ref") && args.includes(deleted)) {
+          throw new Error("read-back boom");
+        }
+        return original(command, args, options);
+      };
+    }
+    const childError = (over: object): Error => Object.assign(new Error("child failed"), { stdout: "", stderr: "", ...over });
+
+    type Site = { name: string; op: string; prepare(h: GitCache): Promise<() => Promise<unknown>> };
+    const sites: Site[] = [
+      { name: "reconcileOwedCandidates", op: "owed-reconcile-delete-ref",
+        prepare: async (h) => () => h.reconcileOwedCandidates(bare, OWED_RUN, pinned) },
+      { name: "cleanupRecoveryGeneration", op: "recovery-cleanup-delete-ref",
+        prepare: async (h) => {
+          const frozen = await h.enumerateOwedCandidates(bare, OWED_RUN);
+          const coverage = await cache.buildRecoveryCoverage(bare, context, [pinned], pinned);
+          gitIn(bare, ["update-ref", `refs/uzi-recovery-pin/${OWED_RUN}/1`, coverage.sha]);
+          return () => h.cleanupRecoveryGeneration(bare, context, frozen,
+            [{ fingerprint: coverage.fingerprint, sha: coverage.sha }], [pinned, coverage.sha], coverage.sha);
+        } },
+    ];
+    type Outcome = "ok" | "residue" | "unsettled";
+    const cases: Array<{ name: string; plan: Parameters<typeof interceptDelete>[2]; outcome: Outcome; reject?: RegExp | Function }> = [
+      { name: "exit 0 and ref gone settles ok", plan: {}, outcome: "ok" },
+      { name: "nonzero exit with the ref gone settles ok and rejects", plan: { error: childError({ code: 1 }), runFirst: true },
+        outcome: "ok", reject: /git update-ref -d .* failed/ },
+      { name: "nonzero exit with the ref remaining settles residue and rejects", plan: { error: childError({ code: 1 }) },
+        outcome: "residue", reject: /git update-ref -d .* failed/ },
+      { name: "a failed read-back settles residue and rejects", plan: { readError: true }, outcome: "residue", reject: /read-back boom/ },
+      { name: "a spawn failure settles residue and rejects", plan: { error: childError({ code: "ENOENT", syscall: "spawn git" }) },
+        outcome: "residue", reject: /git update-ref -d .* failed/ },
+      { name: "a timeout kill stays unsettled", plan: { error: childError({ code: null, killed: true, signal: "SIGTERM" }) },
+        outcome: "unsettled", reject: /git update-ref -d .* failed/ },
+      { name: "a numeric code with killed stays unsettled", plan: { error: childError({ code: 1, killed: true }), runFirst: true },
+        outcome: "unsettled", reject: /git update-ref -d .* failed/ },
+      { name: "a signal death stays unsettled", plan: { error: childError({ code: 1, signal: "SIGKILL" }) },
+        outcome: "unsettled", reject: /git update-ref -d .* failed/ },
+      { name: "a boundary abort propagates unsettled", plan: { error: new GitBoundaryAbortError("aborted") },
+        outcome: "unsettled", reject: GitBoundaryAbortError },
+    ];
+    for (const site of sites) {
+      for (const c of cases) {
+        it(`${site.name}: ${c.name}`, async () => {
+          const events: string[] = [];
+          const hooked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ authority: recorder(events) }));
+          const run = await site.prepare(hooked);
+          interceptDelete(hooked, events, c.plan);
+          if (c.reject) await assert.rejects(run(), c.reject);
+          else assert.ok(await run());
+          const first = events.findIndex(e => e.startsWith("bare:"));
+          const ref = events[first]!.slice(`bare:${site.op}:`.length);
+          const settles = events.filter(e => e.startsWith("settle:"));
+          if (c.outcome === "unsettled") {
+            assert.deepEqual(events.map(e => e.split(":")[0]), ["bare", "git"]);
+            return;
+          }
+          const want = c.outcome === "ok" ? `settle:${site.op}:{"ok":true}` : `settle:${site.op}:{"ok":false,"residue":["${ref}"]}`;
+          assert.equal(settles[0], want);
+          if (c.reject) assert.equal(settles.length, 1, "a rejected deletion stops after its own settlement");
+        });
+      }
+    }
 
     it("a refused beginBareMutation aborts before update-ref -d", async () => {
       const events: string[] = [];
@@ -595,13 +717,23 @@ describe("authority hooks", () => {
       assert.equal(await hooked.anchorRecoveryHead(bare, OWED_RUN, 1, pinned), false);
       assert.equal(gitIn(bare, ["for-each-ref", "refs/uzi-recovery-pin/"]), "");
       assert.ok(events.includes("clear:recovery-pin-anchor"));
-      const second = gitIn(bare, [...IDENT, "commit-tree", `${pinned}^{tree}`, "-m", "second", "-p", pinned]);
-      gitIn(bare, ["update-ref", "refs/uzi-test/second", second]);
       const before = gitIn(bare, ["for-each-ref", "--format=%(refname)", "refs/uzi-owed/"]);
-      await hooked.fetchAgentBranch(bare, path.join(fx.dataDir, "runner"), BR, OWED_RUN, {
-        context: { runId: OWED_RUN, generation: 1, branch: BR, kind: "issue", barePath: bare,
-          defaultIdentity: { ref: "refs/remotes/origin/main", sha: base() } } }).catch(() => undefined);
+      events.length = 0;
+      commitNewHead();
+      const result = await hooked.fetchAgentBranch(bare, cloneDir, BR, OWED_RUN, newHeadOptions());
+      assert.deepEqual(result, { kind: "not_updated", reason: "preservation_failed" });
+      assert.ok(events.includes("clear:owed-pin"), events.join("\n"));
       assert.equal(gitIn(bare, ["for-each-ref", "--format=%(refname)", "refs/uzi-owed/"]), before);
+    });
+
+    it("control: the same fetch with non-refusing hooks reaches pin renewal", async () => {
+      const events: string[] = [];
+      const hooked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ authority: recorder(events) }));
+      const newHead = commitNewHead();
+      const result = await hooked.fetchAgentBranch(bare, cloneDir, BR, OWED_RUN, newHeadOptions());
+      assert.equal(result.kind, "updated");
+      assert.ok(events.includes("clear:owed-pin"), events.join("\n"));
+      assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-owed/${OWED_RUN}/${newHead}`]), newHead);
     });
 
     it("cleanupRecoveryGeneration registers each ref deletion before the child and settles after read-back", async () => {
