@@ -14,7 +14,7 @@ async function fixture(options: {
   const f = ownerFixture();
   await f.reserve(); await f.block();
   const cache = f.recreate();
-  let captures = 0, models = 0, proofs = 0, ownership = 0, terminal = 0;
+  let captures = 0, models = 0, proofs = 0, ownership = 0, terminal = 0, observedCancellations = 0;
   const reports: unknown[] = [];
   const flight: any = { barePath: f.bare, runId: f.source.runId, claimGeneration: 2,
     executor: {}, runLog: nullLogger(), parked: false,
@@ -45,6 +45,8 @@ async function fixture(options: {
           claim_generation: options.ownership === "stale" || (options.ownership === "newer-after-proof" && ownership > 1) ? 3 : 2 };
       } },
     cloneCoordinates: () => ({ branch: f.branch }),
+    // This fixture tests ownership decisions, independently of cancellation maintenance.
+    observeCancellation: () => { observedCancellations++; },
     retainedLifecycleGuard: () => {}, retainedLifecycleSignal: () => new AbortController().signal,
     runFreeCapture: async (_claim: unknown, _flight: unknown, _deadline: number, _signal: AbortSignal, action: (held: unknown) => Promise<unknown>) =>
       options.quiescent === "incomplete" ? { kind: "incomplete" } : { kind: "observed_empty", value: await action({}) },
@@ -56,7 +58,8 @@ async function fixture(options: {
   });
   const claim: any = { run_id: f.source.runId, worker_recovery_episode: 99, worker_recovery_owner_episode: 0 };
   return { f, runner, flight, claim, run: () => runner.recoverRetainedClaim(claim, flight, f.key, f.read()),
-    counts: () => ({ captures, models, proofs, ownership, terminal, sends: reports.length }), reports };
+    counts: () => ({ captures, models, proofs, ownership, terminal, sends: reports.length }),
+    observedCancellations: () => observedCancellations, reports };
 }
 
 test("same raw grant with a derived rise reholds repeatedly without capture/model and proves ownership/quiescence", async () => {
@@ -180,6 +183,7 @@ for (const ownership of [undefined, "stale", "cancelled", "unknown"] as const) {
     await assert.rejects(h.run());
     assert.ok(h.counts().ownership > 0);
     assert.equal(admitted, ownership === undefined);
+    assert.equal(h.observedCancellations(), ownership === "cancelled" ? 1 : 0);
     assert.equal(h.counts().captures, 0);
     assert.equal(h.counts().models, 0);
     if (ownership !== undefined) {
