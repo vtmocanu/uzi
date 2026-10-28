@@ -233,7 +233,7 @@ The original PRD #32 rollout required existing users to unlock before work
 could claim. Optional protection preserves that behavior for protected users;
 Off users need no unlock after restart and receive no vault-lock notice.
 
-Migration 00372 sets existing users to protected, including wrapperless users,
+Migration 00373 sets existing users to protected, including wrapperless users,
 without migrating ciphertext. If any users exist, it seeds Required policy;
 an empty database gets Optional before seed-admin creation. New enrollment
 chooses an explicit mode under current policy; login, seed boot unlock and
