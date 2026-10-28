@@ -19,8 +19,8 @@ import (
 // These service calls supply authenticated identities, not HTTP authentication.
 // Immutable receipt corruption is exercised by unit input seams; database tests
 // retain the trigger that prevents overwriting an accepted receipt.
-// Scalar checks below exercise the Go service preflight only. Independent SQL K
-// authorization remains required; this is not SQL completion or seam readiness.
+// Scalar checks exercise the Go service preflight. Reset checks also call the
+// guarded clear directly on the same actual owner-accepted receipt fixture.
 func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 	for _, mode := range []string{"gated", "no_gate", "ordinary_question", "completion_question", "switch_off", "claim_commit_failure", "ack_commit_failure", "ack_switch_off", "terminal"} {
 		t.Run(mode, func(t *testing.T) {
@@ -231,7 +231,39 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 					t.Fatal("scalar refusal changed full run/input/check snapshot")
 				}
 			}
+			refuseReset := func() {
+				t.Helper()
+				var progress []string
+				if err := json.Unmarshal(mustRun(t, e, created.ID).MilestonesCompleted, &progress); err != nil || !slices.Equal(progress, []string{"m1"}) {
+					t.Fatalf("accepted reset fixture must retain completed m1: %v err=%v", progress, err)
+				}
+				before := policyOwnerStopSnapshot(t, e, created.ID)
+				// This is the actual owner-accepted receipt delivered by Service.Claim,
+				// not a synthetic non-NULL receipt used only to test fail-closed SQL.
+				rows, err := e.q.ClearRunMilestonesCompleted(e.ctx, store.ClearRunMilestonesCompletedParams{
+					ID: created.ID, WorkerID: current.WorkerID,
+				})
+				if err != nil || rows != 0 {
+					t.Fatalf("accepted receipt direct clear: rows=%d err=%v", rows, err)
+				}
+				if before != policyOwnerStopSnapshot(t, e, created.ID) {
+					t.Fatal("accepted receipt direct clear changed full run/input/check snapshot")
+				}
+				seeded := true
+				ack, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{
+					State: "running", ClaimGeneration: &generation, PolicyStopResolutionID: &resolutionID,
+					SeededFromDefault: &seeded, SessionID: strPtr("refused-reset-session"),
+				})
+				requirePolicyOwnerStopConflict(t, err, "policy_stop_execution_unverifiable")
+				if ack.Applied || ack.PolicyStopExecution != nil || ack.PlanApproved != nil || ack.PolicyRevisionGate != nil {
+					t.Fatal("exact-R reset refusal issued authority or approval")
+				}
+				if before != policyOwnerStopSnapshot(t, e, created.ID) {
+					t.Fatal("exact-R reset refusal changed full run/input/check snapshot")
+				}
+			}
 			if mode == "gated" || mode == "no_gate" {
+				refuseReset()
 				for _, state := range []string{"running", "awaiting_approval", "awaiting_input"} {
 					refuseScalar(state, nil)
 					refuseScalar(state, strPtr(uuid.NewString()))
@@ -355,6 +387,17 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 			}
 			if mustRun(t, e, created.ID).Status != "running" {
 				t.Fatal("running ACK was not committed")
+			}
+			if mode == "gated" || mode == "no_gate" {
+				refuseReset()
+				seeded := false
+				ordinary, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{
+					State: "running", ClaimGeneration: &generation, PolicyStopResolutionID: &resolutionID,
+					SeededFromDefault: &seeded,
+				})
+				if err != nil || !ordinary.Applied || ordinary.PolicyStopExecution == nil || *ordinary.PolicyStopExecution != *claim.PolicyStopExecution {
+					t.Fatalf("false reset flag refused or lost authority: %+v %v", ordinary, err)
+				}
 			}
 			if gated {
 				if ack.PlanApproved == nil || *ack.PlanApproved {

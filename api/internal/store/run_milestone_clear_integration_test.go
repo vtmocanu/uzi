@@ -149,6 +149,41 @@ func TestClearRunMilestonesCompletedLiveDB(t *testing.T) {
 		}
 	})
 
+	// This deliberately incomplete receipt satisfies storage constraints but has no
+	// accepted manifest. It proves non-NULL fail-closed behavior only; the actual
+	// owner-accepted receipt is exercised in TestPolicyStopProjectionActualClaimLiveDB.
+	for _, status := range []string{"claimed", "running"} {
+		t.Run("incomplete receipt blocks clear in "+status, func(t *testing.T) {
+			run := newRun(status)
+			var scopeID int64
+			if err := pool.QueryRow(ctx,
+				`INSERT INTO run_user_inputs (run_id, kind, body) VALUES ($1, 'scope', 'fixture scope') RETURNING id`, run).Scan(&scopeID); err != nil {
+				t.Fatal(err)
+			}
+			mustExec(ctx, t, pool, `UPDATE runs SET milestones_completed = '["m0","m1"]'::jsonb,
+				policy_stop_resolution = jsonb_build_object('version', 1, 'scope_input_id', $2::bigint) WHERE id = $1`, run, scopeID)
+			var before, after string
+			if err := pool.QueryRow(ctx, `SELECT to_jsonb(runs)::text FROM runs WHERE id = $1`, run).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			rows, err := q.ClearRunMilestonesCompleted(ctx, store.ClearRunMilestonesCompletedParams{
+				ID: run, WorkerID: ownerID,
+			})
+			if err != nil || rows != 0 {
+				t.Fatalf("incomplete receipt clear: rows=%d err=%v", rows, err)
+			}
+			if got := decodeIDs(run, "milestones_completed"); !eqIDs(got, []string{"m0", "m1"}) {
+				t.Fatalf("incomplete receipt clear changed progress: %v", got)
+			}
+			if err := pool.QueryRow(ctx, `SELECT to_jsonb(runs)::text FROM runs WHERE id = $1`, run).Scan(&after); err != nil {
+				t.Fatal(err)
+			}
+			if before != after {
+				t.Fatal("incomplete receipt clear changed run snapshot")
+			}
+		})
+	}
+
 	// ── (3): the ownership guard. A clear from a worker that does NOT own the run affects
 	//    0 rows and leaves the live owner's progress intact — a superseded/zombie worker
 	//    cannot wipe it. ──

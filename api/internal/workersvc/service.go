@@ -4770,6 +4770,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// approval. This statement follows the parent lock and uses its transaction.
 	// Terminal transitions retain historical evidence without issuing authority.
 	if len(owned.PolicyStopResolution) > 0 && (req.State == "running" || req.State == "awaiting_approval" || req.State == "awaiting_input") {
+		// Exact receipt identity authorizes execution, never a reset of frozen progress.
+		if req.State == "running" && req.SeededFromDefault != nil && *req.SeededFromDefault {
+			return owned, false, stopReviewConflict("policy_stop_execution_unverifiable")
+		}
 		if fenceTx == nil || req.ClaimGeneration == nil {
 			return owned, false, stopReviewConflict("policy_stop_execution_unverifiable")
 		}
@@ -4945,8 +4949,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// via checkpoint while the session still breaks). Additive-optional: an old/omitting
 		// worker sends nil ⇒ no clear. Run BEFORE SetRunRunning so its union refills from empty;
 		// the run-start report carries no milestones, so that same-call union is a no-op. The
-		// SQL is ownership+status guarded (id + worker_id, non-terminal), so a superseded worker
-		// cannot wipe the live owner's progress; a 0-row refusal is benign and not surfaced.
+		// SQL keeps ownership, claimed/running status and cross-check guards, and refuses any
+		// non-NULL Stop receipt independently of the service preflight. An ordinary 0-row
+		// refusal is benign and not surfaced.
 		if req.SeededFromDefault != nil && *req.SeededFromDefault {
 			if _, cerr := q.ClearRunMilestonesCompleted(ctx, store.ClearRunMilestonesCompletedParams{
 				ID:       runID,

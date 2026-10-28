@@ -2056,6 +2056,8 @@ const clearRunMilestonesCompleted = `-- name: ClearRunMilestonesCompleted :execr
 UPDATE runs SET milestones_completed = '[]'::jsonb, updated_at = now()
 WHERE id = $1 AND worker_id = $2
   AND status IN ('claimed', 'running')
+  -- Accepted Stop freezes completion progress; unknown receipt shapes fail closed too.
+  AND policy_stop_resolution IS NULL
   AND (NOT (plan_cross_check_required AND auto_approve) OR plan_md IS NOT NULL)
 `
 

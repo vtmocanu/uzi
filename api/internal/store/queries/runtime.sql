@@ -4352,6 +4352,8 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
 UPDATE runs SET milestones_completed = '[]'::jsonb, updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status IN ('claimed', 'running')
+  -- Accepted Stop freezes completion progress; unknown receipt shapes fail closed too.
+  AND policy_stop_resolution IS NULL
   AND (NOT (plan_cross_check_required AND auto_approve) OR plan_md IS NOT NULL);
 
 -- name: SetRunAwaitingFollowup :execrows
