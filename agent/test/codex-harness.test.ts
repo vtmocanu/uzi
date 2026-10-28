@@ -1505,6 +1505,24 @@ describe("CodexHarness: resumed usage evidence", () => {
       });
     }
 
+    it(`${authMode}: M2 final false guard repeats preparation before a single send`, async () => {
+      let preparations = 0, checks = 0;
+      const { harness, transport } = makeHarness({ authMode });
+      transport.push(threadStarted()).push(turnCompleted("completed")).end();
+      try {
+        await collect(harness.startTurn(makeRequest({ rootDispatch: {
+          prepare: async () => {
+            preparations++;
+            assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 0);
+          },
+          check: () => { checks++; return checks > 1; },
+        } })).events);
+        assert.equal(preparations, 2);
+        assert.equal(checks, 2);
+        assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 1);
+      } finally { await harness.close(); }
+    });
+
     it(`${authMode}: M2 resumed admission abort does not fabricate incomplete usage`, async () => {
       const accountant = new CodexUsageAccountant();
       const controller = new AbortController();

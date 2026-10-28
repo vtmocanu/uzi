@@ -144,7 +144,8 @@ export interface RunContext {
   /** Root-only, fresh operation admission at the lazy provider send boundary.
    * Returns the repeatable local source guard; no recovery grant is consumed.
    */
-  prepareCodexRootDispatch?(signal: AbortSignal, check: () => void): Promise<() => void>;
+  codexRootAdmissionActive?(): boolean;
+  prepareCodexRootDispatch?(signal: AbortSignal, check: () => void): Promise<() => boolean | void>;
   /** Run kind (PRD #6). "issue" (default when absent) works issueIid's card;
    *  "ci_fix" diagnoses + fixes `pipeline`. */
   kind?: RunKind;

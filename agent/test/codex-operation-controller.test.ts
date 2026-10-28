@@ -197,3 +197,64 @@ it("source/capture invalidation during HTTP prevents proof, dispatch and stale m
   reply(admit(r.calls[1]!.request));
   await next;
 });
+
+for (const mode of ["rollback", "reregister"]) it("M2 negotiation changes during proof: " + mode, async () => {
+  const clock = new AdmissionClock();
+  let supported = true, negotiation = 1, dispatched = false, reads = 0;
+  let finishProof!: () => void;
+  const controller = new CodexOperationController(7, {
+    supported: () => supported, negotiation: () => negotiation, engage: () => {},
+    now: () => clock.now, sleep: clock.sleep, waiting: () => () => {},
+    read: async r => { reads++; return { decision: "admit", ...r }; },
+  });
+  const abort = new AbortController();
+  const pending = controller.admit({
+    kind: "root", operation_id: "00000000-0000-4000-8000-000000000001",
+    source: { gate_revision: 1, presentation_id: "00000000-0000-4000-8000-000000000002", revision_input_id: 1 },
+  }, abort.signal, () => {}, async () => {
+    await new Promise<void>(resolve => { finishProof = resolve; });
+  }).then(() => { dispatched = true; });
+  try {
+    await flushUntil(() => !!finishProof);
+    if (mode === "rollback") supported = false;
+    else negotiation++;
+    finishProof();
+    await flushUntil(() => dispatched || clock.sleepers.size > 0);
+    assert.equal(dispatched, false, "obsolete negotiation admit must not dispatch after source-proof await");
+    assert.equal(reads, 1);
+  } finally { abort.abort(); finishProof?.(); await pending.catch(() => {}); }
+});
+
+for (const change of ["rollback", "reregister"] as const)
+  it(`M2 final permit ${change} establishes one shared unavailable deadline`, async () => {
+    const r = rig(async req => admit(req));
+    const permit = await r.start(1);
+    assert.equal(permit(), true);
+    if (change === "rollback") r.state.supported = false;
+    else r.state.negotiation++;
+    r.clock.advance(17);
+    assert.equal(permit(), false);
+    r.clock.advance(23);
+    assert.equal(permit(), false);
+    r.state.supported = true;
+    const sibling = r.start(2);
+    await flushUntil(() => r.clock.sleepers.size === 1);
+    r.clock.advance(14976);
+    assert.equal(r.calls.length, 1);
+    r.clock.advance(1);
+    assert.equal((await sibling)(), true);
+    assert.deepEqual(r.calls.map(c => c.at), [0, 15017]);
+    assert.equal(permit(), false, "restored features cannot revive an obsolete permit");
+  });
+
+it("M2 legacy final permit observes first engagement and requires a fresh read", async () => {
+  const r = rig(async req => admit(req), false);
+  const permit = await r.start(1);
+  assert.equal(permit(), true);
+  r.state.supported = true;
+  r.state.negotiation++;
+  assert.equal(permit(), false);
+  assert.equal(r.state.engagements, 1);
+  assert.equal((await r.start(2))(), true);
+  assert.equal(r.calls.length, 1);
+});

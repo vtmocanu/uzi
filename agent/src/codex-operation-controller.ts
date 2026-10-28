@@ -44,11 +44,13 @@ export class CodexOperationController {
     return this.engaged;
   }
 
+  active(): boolean { return this.observe(); }
+
   async admit(operation: CodexOperationIdentity, signal: AbortSignal, check: () => void,
-    prove: () => Promise<void>): Promise<void> {
+    prove: () => Promise<void>): Promise<() => boolean> {
     check();
     signal.throwIfAborted();
-    if (!this.observe()) return;
+    if (!this.observe()) return () => !this.observe();
     const request = { ...structuredClone(operation), claim_generation: this.generation };
     // Join the queue once per read, letting independent operations progress between retries.
     for (;;) {
@@ -76,9 +78,10 @@ export class CodexOperationController {
           }
         }
         let decision: CodexOperationDecision | undefined;
+        let negotiation: number | undefined;
         try {
           if (this.deps.supported()) {
-            const negotiation = this.deps.negotiation();
+            negotiation = this.deps.negotiation();
             pendingRead = this.deps.read(request, signal).then(value => {
               if (value.decision === "wait") this.defer(value);
               return value;
@@ -100,12 +103,29 @@ export class CodexOperationController {
         else if (decision.decision === "wait") {
           this.defer(decision);
         }
-        check();
-        signal.throwIfAborted();
-        await prove();
-        check();
-        signal.throwIfAborted();
-        if (decision?.decision === "admit") return;
+        try {
+          check();
+          signal.throwIfAborted();
+          await prove();
+          check();
+          signal.throwIfAborted();
+        } catch (error) {
+          // An admitted reply made obsolete by local control cannot bypass the
+          // shared unavailable deadline when its replacement joins the queue.
+          if (decision?.decision === "admit") this.nextReadAt = this.now() + 15_000;
+          throw error;
+        }
+        if (decision?.decision === "admit") {
+          let invalidated = false;
+          const permit = (): boolean => {
+            if (!invalidated && (!this.deps.supported() || negotiation !== this.deps.negotiation())) {
+              invalidated = true;
+              this.nextReadAt = this.now() + 15_000;
+            }
+            return !invalidated;
+          };
+          if (permit()) return permit;
+        }
       } finally {
         clear?.();
         // A cancelled queued waiter must not release successors ahead of prior.

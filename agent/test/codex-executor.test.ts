@@ -26174,7 +26174,7 @@ describe("M2 lazy root operation admission", () => {
     });
     const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
     const abort = new AbortController();
-    let sibling: Promise<void> | undefined;
+    let sibling: Promise<() => boolean> | undefined;
     try {
       await ready(() => rig.epochs[0]!.transport.turnStartCount === 1);
       sibling = controller.admit({ kind: "root", operation_id: "00000000-0000-4000-8000-000000000099" },

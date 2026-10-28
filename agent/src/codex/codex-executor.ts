@@ -5432,7 +5432,8 @@ export class CodexExecutor implements Executor {
     // Issue #1789: a mid-turn vault-locked refresh deferral trips THIS turn the same way.
     vaultLock.activeTurnTrip = trip;
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
-    let startupResumed = false;
+    const accountAdmissionActive = (): boolean => ctx.codexRootAdmissionActive?.() ?? !!ctx.prepareCodexRootDispatch;
+    let startupResumed = !accountAdmissionActive();
     let currentTurnCallbacks = registry.inFlightCallbackCountSince(callbackCursor);
     const armIdle = (): void => {
       if (idleTimer) clearTimeout(idleTimer);
@@ -5442,6 +5443,7 @@ export class CodexExecutor implements Executor {
       idleTimer = setTimeout(() => trip(REASON_IDLE), idleMs);
       idleTimer.unref?.();
     };
+    armIdle();
     const unsubscribeCallbacks = registry.subscribeCallbacks(() => {
       if (registry.inFlightCallbackCountSince(callbackCursor) !== currentTurnCallbacks) armIdle();
     });
@@ -5478,12 +5480,12 @@ export class CodexExecutor implements Executor {
       if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents);
       if (beforeDispatch) prompt = beforeDispatch(prompt);
       const captureRevision = this.captureRevision;
-      let sourceGuard: (() => void) | undefined;
+      let sourceGuard: (() => boolean | void) | undefined;
       const checkDispatch = (): void => {
         if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents);
         turnAbort.signal.throwIfAborted();
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
-        if (ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted)
+        if (accountAdmissionActive() && (ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted))
           throw new CodexRequestFailure("parent_abort");
         this.assertCaptureAdmission(captureRevision);
         if (registry.state() !== "open") throw new CodexRequestFailure("parent_abort");
@@ -5491,9 +5493,8 @@ export class CodexExecutor implements Executor {
       };
       const dispatch = {
         prepare: async (): Promise<void> => {
-          startupResumed = false;
-          if (idleTimer) clearTimeout(idleTimer);
-          idleTimer = undefined;
+          startupResumed = !accountAdmissionActive();
+          armIdle();
           sourceGuard = undefined;
           checkDispatch();
           const waiting = new AbortController();
@@ -5503,9 +5504,14 @@ export class CodexExecutor implements Executor {
               AbortSignal.any([turnAbort.signal, waiting.signal]), checkDispatch);
           } finally { this.rootAdmissionWaits.delete(waiting); }
           checkDispatch();
-          sourceGuard?.();
         },
-        check: (): void => { checkDispatch(); sourceGuard?.(); startupResumed = true; armIdle(); },
+        check: (): boolean => {
+          checkDispatch();
+          if (sourceGuard?.() === false) return false;
+          startupResumed = true;
+          armIdle();
+          return true;
+        },
       };
       const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
       request.rootDispatch = dispatch;

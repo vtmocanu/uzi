@@ -353,7 +353,7 @@ export interface HarnessAgent {
 
 export interface RunTurnRequest {
   /** Worker-owned lazy root dispatch boundary, after all asynchronous setup. */
-  rootDispatch?: { prepare(): Promise<void>; check(): void };
+  rootDispatch?: { prepare(): Promise<void>; check(): boolean | void };
   semanticPlanning?: import("./semantic-plan.js").SemanticPlanning;
   /** Worker has materialized and bound the current claim evidence reader. */
   ciEvidencePrepared?: boolean;

@@ -1636,9 +1636,13 @@ export class CodexHarness implements RunHarness {
     };
     if (this.currentModel !== undefined) params.model = this.currentModel;
     if (rendered.lead.modelReasoningEffort !== undefined) params.effort = rendered.lead.modelReasoningEffort;
-    await dispatch?.prepare();
+    // Retry only preparation when negotiation invalidates an unsent permit.
+    // Cancellation and the run wall bound this wait; no provider attempt is started.
+    do {
+      await dispatch?.prepare();
+      signal.throwIfAborted();
+    } while (dispatch?.check() === false);
     // No await separates the final local controls/source/capture guard from send.
-    dispatch?.check();
     signal.throwIfAborted();
     // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
     assertResidueQuarantineOpen("provider_turn");

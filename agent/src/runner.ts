@@ -4247,8 +4247,7 @@ export class RunRunner {
     // pre-clone — is a requeue, so it stops being listed there too). Idempotent per run id.
     const registration = this.snapshotRegistry?.add(runId, claim.claim_generation ?? 0);
     // Repository task roots only; other lanes retain their existing policy.
-    if (claim.secrets.codex?.auth_mode === "subscription" &&
-        Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0) {
+    if (claim.secrets.codex?.auth_mode === "subscription") {
       flight.operationAdmission = new CodexOperationController(flight.claimGeneration, {
         ...this.codexOperationWaitPolicy,
         supported: () => this.client.hasFeature("codex_account_operation_admission_v1"),
@@ -13082,7 +13081,10 @@ export class RunRunner {
           return verdict;
         } }
         : {}),
+      codexRootAdmissionActive: () => flight.operationAdmission?.active() ?? false,
       prepareCodexRootDispatch: async (signal, localCheck) => {
+        if (!flight.operationAdmission?.active())
+          return () => !flight.operationAdmission?.active();
         const source = revisionRecovery?.dispatchSource();
         const control = new AbortController();
         const operationSignal = AbortSignal.any([
@@ -13092,18 +13094,25 @@ export class RunRunner {
           localCheck();
           operationSignal.throwIfAborted();
           if (steering.isCancelled()) throw new Error("run cancelled");
-          if (steering.claimFence() !== undefined || flight.claimGeneration !== claim.claim_generation)
+          if (steering.claimFence() !== undefined || flight.claimGeneration !== (claim.claim_generation ?? 0))
             throw new StaleClaimError();
           if (flight.active?.shuttingDown || this.shuttingDownGlobal)
             throw new Error("worker shutdown during Codex operation admission");
-          revisionRecovery?.assertDispatchSource(source);
+          try { revisionRecovery?.assertDispatchSource(source); }
+          catch (error) {
+            // assertDispatchSource can consume a replacement verdict. Preserve
+            // that control outcome when the admission catch rechecks currency.
+            control.abort(error);
+            throw error;
+          }
         };
         check();
         const unsubscribe = steering.observeRevisionDispatchControl(() => {
           try { check(); } catch (error) { control.abort(error); }
         });
+        let permit!: () => boolean;
         try {
-          await flight.operationAdmission?.admit({ operation_id: randomUUID(), kind: "root",
+          permit = await flight.operationAdmission.admit({ operation_id: randomUUID(), kind: "root",
             ...(source ? { source } : {}) }, operationSignal, check,
           async () => { await revisionRecovery?.proveDispatchSource(source, check); check(); });
         } catch (error) {
@@ -13116,7 +13125,7 @@ export class RunRunner {
           throw error;
         } finally { unsubscribe(); }
         check();
-        return check;
+        return () => { check(); return permit(); };
       },
       beforePlanRevisionTurn: (observer, remainingWallMs) => revisionRecovery?.beforeTurn(observer, remainingWallMs) ?? Promise.resolve(),
       retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {

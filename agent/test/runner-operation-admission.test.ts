@@ -22,6 +22,42 @@ function enable(): void {
   api.planRevisionRetries = true;
   client.protocolFeatures = [...client.protocolFeatures, "plan_revision_retry_v1", FEATURE];
 }
+for (const generation of [0, undefined]) for (const supported of [false, true])
+  it(`M2 subscription missing positive generation ${generation} uses negotiated policy=${supported}`, async t => {
+    enable();
+    if (!supported) client.protocolFeatures = client.protocolFeatures.filter(f => f !== FEATURE);
+    const clock = new AdmissionClock();
+    const registry = new ActiveRunRegistry();
+    const fixture = providerFixture("codex", () => ({ plan: "# legacy or unavailable" }), false, { subscription: true });
+    const claim = freshClaim(7, { claim_generation: generation,
+      secrets: { forge_pat: "fixture-forge-pat", codex: fixture.credential } });
+    const original = client.checkCodexOperationAdmission.bind(client);
+    let reads = 0;
+    t.mock.method(client, "checkCodexOperationAdmission", async (...args: Parameters<typeof original>) => {
+      reads++;
+      return original(...args);
+    });
+    const r = runner(fixture.executor, fakeGitlab().gitlab, undefined, { activeRuns: registry,
+      codexOperationWaitPolicy: { now: () => clock.now, sleep: clock.sleep } });
+    let ended = false;
+    const done = r.execute(claim).finally(() => { ended = true; });
+    try {
+      assert.ok(await until(() => ended || fixture.starts.length > 0 || clock.sleepers.size > 0));
+      if (supported) {
+        assert.equal(fixture.starts.length, 0, "negotiated admission cannot spend with an unproven generation");
+        assert.equal(ended, false, "missing generation is unavailable, not proven ownership loss");
+        assert.equal(clock.sleepers.size, 1);
+        assert.equal(reads, 1);
+        const entry = registry.build().active.find(e => e.run_id === claim.run_id)!;
+        assert.equal(entry.claim_generation, 0);
+        assert.equal(entry.account_cooldown, undefined, "zero generation cannot carry valid cooldown display");
+      } else {
+        assert.equal(fixture.starts.length, 1, "never-negotiated flight retains legacy dispatch");
+        assert.equal(reads, 0);
+      }
+    } finally { r.shutdown(); await done; }
+  });
+
 it("M2 actual runner checkpoint packs local bytes while admission HTTP remains held", async t => {
   enable();
   const fixture = providerFixture("codex", () => ({ plan: "# never dispatched" }), false, {
@@ -442,3 +478,75 @@ for (const control of ["cancel", "shutdown", "reject"] as const)
       assert.equal(reads, 2);
     } finally { r.shutdown(); await done; }
   });
+
+// Retained reviewer/tester/auditor repros: invalidate both sides of the awaited proof.
+for (const boundary of ["source proof", "final guard"] as const)
+  for (const change of ["rollback", "re-registration"] as const)
+    it(`M2 ${change} during ${boundary} retains feedback until a fresh admit`, async t => {
+      enable();
+      const features = [...client.protocolFeatures];
+      const clock = new AdmissionClock();
+      const fixture = providerFixture("codex", n => ({ plan: n === 1 ? "# source" : "# revised" }), false, { subscription: true });
+      const claim = freshClaim(7, { secrets: { forge_pat: "fixture-forge-pat", codex: fixture.credential } });
+      let reads = 0, holdNextProof = false;
+      let release: (() => void) | undefined;
+      t.mock.method(client, "checkCodexOperationAdmission", async (_id: string, request: CodexOperationRequest) => {
+        if (++reads === 2 && boundary === "source proof") holdNextProof = true;
+        return { decision: "admit", operation_id: request.operation_id, claim_generation: request.claim_generation };
+      });
+      const ownership = client.getRunOwnership.bind(client);
+      t.mock.method(client, "getRunOwnership", async (...args: Parameters<typeof client.getRunOwnership>) => {
+        if (holdNextProof) {
+          holdNextProof = false;
+          await new Promise<void>(resolve => { release = resolve; });
+        }
+        return ownership(...args);
+      });
+      if (boundary === "final guard") {
+        const run = fixture.executor.run.bind(fixture.executor);
+        t.mock.method(fixture.executor, "run", async (ctx: RunContext) => {
+          const prepare = ctx.prepareCodexRootDispatch!;
+          let preparations = 0;
+          ctx.prepareCodexRootDispatch = async (...args) => {
+            const permit = await prepare(...args);
+            if (++preparations === 2) await new Promise<void>(resolve => { release = resolve; });
+            return permit;
+          };
+          return run(ctx);
+        });
+      }
+      const r = runner(fixture.executor, fakeGitlab().gitlab, undefined,
+        { codexOperationWaitPolicy: { now: () => clock.now, sleep: clock.sleep } });
+      const done = r.execute(claim);
+      try {
+        assert.ok(await until(() => gates(claim.run_id).length === 1));
+        const [feedback] = send(claim.run_id, row("revise_plan", "retain pending feedback"));
+        assert.ok(await until(() => !!release));
+        assert.equal(reads, 2);
+        assert.equal(fixture.starts.length, 1);
+        client.clearFeatures();
+        if (change === "re-registration") client.protocolFeatures = features;
+        release!();
+        assert.ok(await until(() => fixture.starts.length > 1 || clock.sleepers.size > 0));
+        assert.equal(fixture.starts.length, 1);
+        assert.equal(api.isApplied(claim.run_id, feedback!.id), false);
+        assert.equal(gates(claim.run_id).length, 1);
+        client.protocolFeatures = features;
+        clock.advance(14999);
+        assert.equal(reads, 2);
+        assert.equal(fixture.starts.length, 1);
+        clock.advance(1);
+        assert.ok(await until(() => gates(claim.run_id).length === 2));
+        assert.equal(reads, 3);
+        assert.equal(fixture.starts.length, 2);
+        assert.equal(fixture.starts[1]!.threadId, fixture.starts[0]!.threadId);
+        assert.equal(fixture.starts[1]!.prompt.split("retain pending feedback").length - 1, 1);
+        assert.equal(api.isApplied(claim.run_id, feedback!.id), true);
+      } finally {
+        client.protocolFeatures = features;
+        release?.();
+        send(claim.run_id, row("cancel"));
+        r.shutdown();
+        await done;
+      }
+    });
