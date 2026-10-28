@@ -3379,7 +3379,9 @@ export class RunRunner {
 
   /** The wait for A at an authorized cancellation/park cleanup: shutdown and the current independent
    *  maintenance budget only. The flight's cancel/lifecycle signals are deliberately absent: they are
-   *  already aborted during a cancellation, and this cleanup runs precisely then. */
+   *  usually already aborted when a cancellation, park or early-terminal cleanup runs, and a flight that is
+   *  not cancelled (an early failed/terminal caller) gains nothing from them either. Without a current
+   *  maintenance budget the wait is shutdown plus the boundary deadline only. */
   private cleanupAuthorityWait(boundaryMs: number = this.codexBoundaryDeadlineMs): AuthorityWait {
     const budget = MaintenanceBudget.current();
     return {
@@ -17964,7 +17966,8 @@ export class RunRunner {
       // with the pinned head as the expected SHA so a moved ref is retained. On any retain
       // (needs_action) LEAVE it as the durable anchor that keeps the retained source reachable.
       if (outcome.state === "uploaded" && outcome.reason === "already_published") {
-        // Runs at a cancellation/park cleanup: wait on shutdown and the maintenance budget, not the aborted flight signals.
+        // Runs at a cancellation, park or early-terminal cleanup: wait on shutdown and the maintenance budget,
+        // not the flight signals. Without a current budget the wait is shutdown plus the boundary deadline.
         await this.inAuthority(() => this.git.deleteRecoveryPin(barePath, claim.run_id, generation, record.sourceSha),
           this.cleanupAuthorityWait());
       }

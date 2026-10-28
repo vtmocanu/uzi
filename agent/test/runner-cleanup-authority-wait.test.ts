@@ -17,7 +17,7 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 
-// issue #3404 M3 — the recovery-pin deletion at an authorized cancellation/park cleanup waits for A on
+// issue #3404 M2 rework 13 item 3 — the recovery-pin deletion at an authorized cancellation/park cleanup waits for A on
 // shutdown and the independent maintenance budget only. The flight's cancel/lifecycle signals are already
 // aborted during a cancellation, so waiting on them refused the deletion the cleanup exists to perform.
 // Both cleanup sites are driven through their real methods over a real authority runtime and GitCache; the
@@ -65,6 +65,44 @@ describe("cancellation/park cleanup waits for A without the flight's aborted sig
   let outcome: Record<string, unknown>;
 
   const internals = (): Internals => runner as unknown as Internals;
+  const abortBudget = () => (budget as unknown as { controller: AbortController }).controller.abort(new Error("budget exhausted"));
+  const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+  /** The single outermost wait the cleanup recorded. */
+  const onlyWait = (): Wait["options"] => {
+    assert.equal(waits.length, 1, "exactly one outermost wait for A");
+    return waits[0]!.options;
+  };
+
+  /**
+   * Hold A in a competing transaction, start `start` so its cleanup wait blocks on A, then `abort` while it
+   * is waiting. The cleanup must be refused while A is STILL held (settled before the competitor releases),
+   * so a wait that ignored the aborted source would only finish after the release and delete the pin.
+   */
+  async function abortWhileWaitingForA<T>(start: () => Promise<T>, abort: () => void): Promise<T> {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let holding!: () => void;
+    const held = new Promise<void>(resolve => { holding = resolve; });
+    const competitor = rt.withTransaction(async () => { holding(); await gate; });
+    await held;
+    waits.length = 0;
+    let settled = false;
+    const run = start().finally(() => { settled = true; });
+    run.catch(() => undefined);
+    for (let i = 0; i < 300 && waits.length === 0; i++) await sleep(10);
+    assert.equal(waits.length, 1, "the cleanup is waiting for A");
+    await sleep(50);
+    assert.equal(settled, false, "still blocked on the competing transaction");
+    abort();
+    await sleep(200);
+    const refusedWhileHeld = settled;
+    release();
+    await competitor;
+    const result = await run;
+    assert.equal(refusedWhileHeld, true, "the wait was refused while A was still held");
+    return result;
+  }
 
   const claim = (generation = GEN) => ({
     run_id: RUN, kind: "issue", issue_iid: 3404, claim_generation: generation, session_id: null,
@@ -166,44 +204,68 @@ describe("cancellation/park cleanup waits for A without the flight's aborted sig
       assert.deepEqual(released, [[RUN, GEN]]);
       assert.deepEqual(forgotten, [[RUN, GEN]]);
       assert.equal(pinPresent(bare), false, "the pin was deleted");
-      const wait = waits.at(-1)?.options;
+      const wait = onlyWait();
       assert.ok(wait?.signal instanceof AbortSignal);
       assert.ok(typeof wait?.timeoutMs === "number" && wait.timeoutMs > 0 && wait.timeoutMs <= 300_000);
     });
 
     it("the wait for A is aborted by the maintenance budget, not by the flight's cancellation", async () => {
       assert.equal(await internals().disposeCredentialFreeOwnerCancel(claim(), cancelledFlight()), "released");
-      const signal = waits.at(-1)!.options!.signal!;
+      const signal = onlyWait()!.signal!;
       assert.equal(signal.aborted, false, "cancel and lifecycle are aborted yet the wait is live");
-      (budget as unknown as { controller: AbortController }).controller.abort(new Error("budget exhausted"));
+      abortBudget();
       assert.equal(signal.aborted, true);
     });
 
     it("the wait for A is aborted by worker shutdown", async () => {
       assert.equal(await internals().disposeCredentialFreeOwnerCancel(claim(), cancelledFlight()), "released");
-      const signal = waits.at(-1)!.options!.signal!;
+      const signal = onlyWait()!.signal!;
       assert.equal(signal.aborted, false);
       internals().shutdownSignal.abort(new Error("shutdown"));
       assert.equal(signal.aborted, true);
     });
 
-    it("an exhausted cancellation budget retains the pin", async () => {
-      (budget as unknown as { controller: AbortController }).controller.abort(new Error("budget exhausted"));
+    it("the wait is clamped to the budget's remaining time, below the boundary deadline", async () => {
+      budget.dispose();
+      budget = new MaintenanceBudget(2_000);
+      assert.equal(await internals().disposeCredentialFreeOwnerCancel(claim(), cancelledFlight()), "released");
+      const timeoutMs = onlyWait()!.timeoutMs!;
+      assert.ok(timeoutMs <= 2_000, `timeoutMs ${timeoutMs} is within the budget`);
+      assert.ok(timeoutMs < 30_000, "and below the boundary deadline");
+    });
+
+    it("pre-wait guard negative: an exhausted cancellation budget retains the pin", async () => {
+      abortBudget();
       assert.equal(await internals().disposeCredentialFreeOwnerCancel(claim(), cancelledFlight()), "retained");
       assert.equal(pinPresent(bare), true);
     });
 
-    it("a budget that expires before the deletion retains the pin", async () => {
-      onForget = () => (budget as unknown as { controller: AbortController }).controller.abort(new Error("budget exhausted"));
+    it("pre-wait guard negative: a budget that expires before the deletion retains the pin", async () => {
+      onForget = abortBudget;
       assert.equal(await internals().disposeCredentialFreeOwnerCancel(claim(), cancelledFlight()), "retained");
       assert.equal(pinPresent(bare), true);
     });
 
-    it("worker shutdown before the deletion retains the pin", async () => {
+    it("pre-wait guard negative: worker shutdown before the deletion retains the pin", async () => {
       onForget = () => internals().shutdownSignal.abort(new Error("shutdown"));
       assert.equal(await internals().disposeCredentialFreeOwnerCancel(claim(), cancelledFlight()), "retained");
       assert.equal(pinPresent(bare), true);
-      assert.equal(waits.at(-1)?.options?.signal?.aborted, true, "the wait for A was opened already aborted and refused");
+      assert.equal(onlyWait()?.signal?.aborted, true, "the wait for A was opened already aborted and refused");
+    });
+
+    it("a budget that expires while waiting for A retains the pin", async () => {
+      const result = await abortWhileWaitingForA(
+        () => internals().disposeCredentialFreeOwnerCancel(claim(), cancelledFlight()), abortBudget);
+      assert.equal(result, "retained");
+      assert.equal(pinPresent(bare), true);
+    });
+
+    it("worker shutdown while waiting for A retains the pin", async () => {
+      const result = await abortWhileWaitingForA(
+        () => internals().disposeCredentialFreeOwnerCancel(claim(), cancelledFlight()),
+        () => internals().shutdownSignal.abort(new Error("shutdown")));
+      assert.equal(result, "retained");
+      assert.equal(pinPresent(bare), true);
     });
 
     it("a fenced claim retains the pin", async () => {
@@ -233,27 +295,49 @@ describe("cancellation/park cleanup waits for A without the flight's aborted sig
       const flight = cancelledFlight();
       await internals().settleRecoveryGeneration(claim(), flight, nullLogger());
       assert.equal(pinPresent(bare), false, "the pin was deleted");
-      const signal = waits.at(-1)!.options!.signal!;
+      const signal = onlyWait()!.signal!;
       assert.equal(signal.aborted, false);
-      (budget as unknown as { controller: AbortController }).controller.abort(new Error("budget exhausted"));
+      abortBudget();
       assert.equal(signal.aborted, true, "the wait follows the maintenance budget");
     });
 
     it("the wait for A is aborted by worker shutdown", async () => {
       await internals().settleRecoveryGeneration(claim(), cancelledFlight(), nullLogger());
-      const signal = waits.at(-1)!.options!.signal!;
+      const signal = onlyWait()!.signal!;
       assert.equal(signal.aborted, false);
       internals().shutdownSignal.abort(new Error("shutdown"));
       assert.equal(signal.aborted, true);
     });
 
-    it("an exhausted cancellation budget retains the pin", async () => {
-      (budget as unknown as { controller: AbortController }).controller.abort(new Error("budget exhausted"));
+    it("the wait is clamped to the budget's remaining time, below the boundary deadline", async () => {
+      budget.dispose();
+      budget = new MaintenanceBudget(2_000);
+      await internals().settleRecoveryGeneration(claim(), cancelledFlight(), nullLogger());
+      const timeoutMs = onlyWait()!.timeoutMs!;
+      assert.ok(timeoutMs <= 2_000, `timeoutMs ${timeoutMs} is within the budget`);
+      assert.ok(timeoutMs < 30_000, "and below the boundary deadline");
+    });
+
+    it("pre-wait guard negative: an exhausted cancellation budget retains the pin", async () => {
+      abortBudget();
       await internals().settleRecoveryGeneration(claim(), cancelledFlight(), nullLogger());
       assert.equal(pinPresent(bare), true);
     });
 
-    it("worker shutdown before the deletion retains the pin", async () => {
+    it("a budget that expires while waiting for A retains the pin", async () => {
+      await abortWhileWaitingForA(
+        () => internals().settleRecoveryGeneration(claim(), cancelledFlight(), nullLogger()), abortBudget);
+      assert.equal(pinPresent(bare), true);
+    });
+
+    it("worker shutdown while waiting for A retains the pin", async () => {
+      await abortWhileWaitingForA(
+        () => internals().settleRecoveryGeneration(claim(), cancelledFlight(), nullLogger()),
+        () => internals().shutdownSignal.abort(new Error("shutdown")));
+      assert.equal(pinPresent(bare), true);
+    });
+
+    it("pre-wait guard negative: worker shutdown before the deletion retains the pin", async () => {
       outcome = { state: "uploaded", reason: "already_published", captureId: "cap-1" };
       (runner as unknown as { recovery: { captureAndUpload: () => Promise<unknown> } }).recovery.captureAndUpload = async () => {
         internals().shutdownSignal.abort(new Error("shutdown"));
