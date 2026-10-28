@@ -56,4 +56,3 @@ RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
   ELSE 'source_only' END
 $$;
 -- +goose StatementEnd
-
