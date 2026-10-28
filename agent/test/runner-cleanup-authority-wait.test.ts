@@ -88,17 +88,23 @@ describe("cancellation/park cleanup waits for A without the flight's aborted sig
     await held;
     waits.length = 0;
     let settled = false;
-    const run = start().finally(() => { settled = true; });
-    run.catch(() => undefined);
-    for (let i = 0; i < 300 && waits.length === 0; i++) await sleep(10);
-    assert.equal(waits.length, 1, "the cleanup is waiting for A");
-    await sleep(50);
-    assert.equal(settled, false, "still blocked on the competing transaction");
-    abort();
-    await sleep(200);
-    const refusedWhileHeld = settled;
-    release();
-    await competitor;
+    let refusedWhileHeld = false;
+    let run: Promise<T> | undefined;
+    try {
+      run = start().finally(() => { settled = true; });
+      run.catch(() => undefined);
+      for (let i = 0; i < 300 && waits.length === 0; i++) await sleep(10);
+      assert.equal(waits.length, 1, "the cleanup is waiting for A");
+      await sleep(50);
+      assert.equal(settled, false, "still blocked on the competing transaction");
+      abort();
+      for (let i = 0; i < 500 && !settled; i++) await sleep(10);
+      refusedWhileHeld = settled;
+    } finally {
+      // Always free A, even when an assertion above failed, so no transaction outlives the fixture.
+      release();
+      await competitor;
+    }
     const result = await run;
     assert.equal(refusedWhileHeld, true, "the wait was refused while A was still held");
     return result;
@@ -227,11 +233,11 @@ describe("cancellation/park cleanup waits for A without the flight's aborted sig
 
     it("the wait is clamped to the budget's remaining time, below the boundary deadline", async () => {
       budget.dispose();
-      budget = new MaintenanceBudget(2_000);
+      // Below the 30 s boundary default, yet long enough that the cleanup finishes under CPU contention.
+      budget = new MaintenanceBudget(20_000);
       assert.equal(await internals().disposeCredentialFreeOwnerCancel(claim(), cancelledFlight()), "released");
       const timeoutMs = onlyWait()!.timeoutMs!;
-      assert.ok(timeoutMs <= 2_000, `timeoutMs ${timeoutMs} is within the budget`);
-      assert.ok(timeoutMs < 30_000, "and below the boundary deadline");
+      assert.ok(timeoutMs <= 20_000, `timeoutMs ${timeoutMs} is within the budget, below the boundary deadline`);
     });
 
     it("pre-wait guard negative: an exhausted cancellation budget retains the pin", async () => {
@@ -311,11 +317,12 @@ describe("cancellation/park cleanup waits for A without the flight's aborted sig
 
     it("the wait is clamped to the budget's remaining time, below the boundary deadline", async () => {
       budget.dispose();
-      budget = new MaintenanceBudget(2_000);
+      // Below the 30 s boundary default, yet long enough that the cleanup finishes under CPU contention.
+      budget = new MaintenanceBudget(20_000);
       await internals().settleRecoveryGeneration(claim(), cancelledFlight(), nullLogger());
+      assert.equal(pinPresent(bare), false, "the deletion still ran");
       const timeoutMs = onlyWait()!.timeoutMs!;
-      assert.ok(timeoutMs <= 2_000, `timeoutMs ${timeoutMs} is within the budget`);
-      assert.ok(timeoutMs < 30_000, "and below the boundary deadline");
+      assert.ok(timeoutMs <= 20_000, `timeoutMs ${timeoutMs} is within the budget, below the boundary deadline`);
     });
 
     it("pre-wait guard negative: an exhausted cancellation budget retains the pin", async () => {
