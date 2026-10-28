@@ -1,0 +1,452 @@
+package store_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"errors"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/vtmocanu/uzi/api/internal/auth"
+	"github.com/vtmocanu/uzi/api/internal/secretbox"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
+)
+
+type bsFixture struct {
+	pool   *pgxpool.Pool
+	id     uuid.UUID
+	master *secretbox.Box
+	v      *vault.Vault
+}
+
+func bsSeed(t *testing.T, pool *pgxpool.Pool) bsFixture {
+	t.Helper()
+	id := uuid.New()
+	hash, err := auth.HashPassword(vlLoginPhrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vlExec(t, pool, "INSERT INTO users(id,email,password_hash,vault_mode) VALUES($1,$2,$3,'protected')", id, id.String()+"@example.test", hash)
+	master, err := secretbox.New(bytes.Repeat([]byte{79}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bsFixture{pool: pool, id: id, master: master, v: vault.NewPostgres(master, pool)}
+}
+func (f bsFixture) user(t *testing.T) store.User {
+	t.Helper()
+	user, err := store.New(f.pool).GetUserByID(context.Background(), f.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return user
+}
+func (f bsFixture) mint(t *testing.T, browser uuid.UUID) *vault.BrowserKey {
+	t.Helper()
+	key, err := f.v.UnlockAndMint(context.Background(), vault.Snapshot(f.user(t)), vlLoginPhrase, vault.InteractiveCreate,
+		&vault.BrowserMintRequest{HTTPS: true, BrowserID: browser, SessionExpiresAt: time.Now().Add(2 * time.Hour)})
+	if err != nil || key == nil {
+		t.Fatalf("mint: %v", err)
+	}
+	t.Cleanup(key.Destroy)
+	return key
+}
+func (f bsFixture) count(t *testing.T) int {
+	t.Helper()
+	var count int
+	if err := f.pool.QueryRow(context.Background(), "SELECT count(*) FROM vault_browser_slots WHERE user_id=$1", f.id).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+func (f bsFixture) session(t *testing.T, browser uuid.UUID) vault.VerifiedSession {
+	user := f.user(t)
+	return vault.VerifiedSession{Auth: vault.Snapshot(user), TokenVersion: user.TokenVersion, BrowserID: browser}
+}
+func (f bsFixture) cold() *vault.Vault { return vault.NewPostgres(f.master, f.pool) }
+
+func TestVaultBrowserSlotsLiveDB(t *testing.T) {
+	pool := vlIsolatedPool(t)
+	ctx := context.Background()
+	t.Run("restore constraints and absolute lifetime", func(t *testing.T) {
+		f := bsSeed(t, pool)
+		browser := uuid.New()
+		key := f.mint(t, browser)
+		value, err := key.CookieValue()
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := vault.DecodeBrowserKey(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer decoded.Destroy()
+		before := f.user(t)
+		var wrapped []byte
+		var expiry time.Time
+		if err := pool.QueryRow(ctx, "SELECT wrapped_dek,expires_at FROM vault_browser_slots WHERE user_id=$1", f.id).Scan(&wrapped, &expiry); err != nil {
+			t.Fatal(err)
+		}
+		if time.Until(key.ExpiresAt()) > 2*time.Hour {
+			t.Fatal("session expiry not applied")
+		}
+		vlExec(t, pool, "INSERT INTO app_settings(key,value) VALUES('vault_reunlock_days','1') ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value")
+		cold := f.cold()
+		if err := cold.Restore(ctx, f.session(t, browser), decoded); err != nil || !cold.Unlocked(f.id) {
+			t.Fatalf("restore: %v", err)
+		}
+		var afterWrapped []byte
+		var afterExpiry time.Time
+		if err := pool.QueryRow(ctx, "SELECT wrapped_dek,expires_at FROM vault_browser_slots WHERE user_id=$1", f.id).Scan(&afterWrapped, &afterExpiry); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(wrapped, afterWrapped) || !expiry.Equal(afterExpiry) || f.count(t) != 1 {
+			t.Fatal("restore extended/minted")
+		}
+		// Exercise the real minted row, with its actual AAD. A detached crypto
+		// example or a wrong-AAD master probe would not catch master wrapping.
+		parts := strings.Split(value, ".")
+		slotID, err := uuid.Parse(parts[1])
+		if err != nil {
+			t.Fatal("invalid minted slot identity")
+		}
+		cookieSecret, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			t.Fatal("invalid minted cookie encoding")
+		}
+		defer clear(cookieSecret)
+		aad := append([]byte("uzi-vault-browser-dek-v1\x00"), f.id[:]...)
+		aad = append(aad, slotID[:]...)
+		cookieBox, err := secretbox.New(cookieSecret)
+		if err != nil {
+			t.Fatal("invalid minted cookie key")
+		}
+		dek, err := cookieBox.OpenWithAAD(wrapped, aad)
+		if err != nil || len(dek) != 32 {
+			t.Fatal("cookie key did not open the actual persisted DEK envelope")
+		}
+		defer clear(dek)
+		if _, err := f.master.OpenWithAAD(wrapped, aad); err == nil {
+			t.Fatal("server key opened the actual slot without its cookie")
+		}
+		metadataKey := append(append([]byte(nil), f.id[:]...), slotID[:]...)
+		metadataBox, err := secretbox.New(metadataKey)
+		if err != nil {
+			t.Fatal("metadata test key")
+		}
+		if _, err := metadataBox.OpenWithAAD(wrapped, aad); err == nil {
+			t.Fatal("database metadata opened the actual slot without its cookie")
+		}
+		const kind = "browser-slot-proof"
+		plain := []byte("credential encrypted by the cached DEK")
+		sealed, err := f.v.Seal(ctx, f.id, kind, plain, vault.SealForUse)
+		if err != nil || sealed.SealedWith != store.SealedWithDEK {
+			t.Fatal("failed to seal DEK proof")
+		}
+		dekBox, err := secretbox.New(dek)
+		if err != nil {
+			t.Fatal("invalid recovered DEK")
+		}
+		materialAAD := append(append([]byte(nil), f.id[:]...), 0)
+		materialAAD = append(materialAAD, kind...)
+		opened, err := dekBox.OpenWithAAD(sealed.Ciphertext, materialAAD)
+		if err != nil || !bytes.Equal(opened, plain) {
+			t.Fatal("persisted slot did not wrap the live credential DEK")
+		}
+		clear(opened)
+		cases := []struct {
+			name    string
+			user    store.User
+			version int32
+			browser uuid.UUID
+		}{
+			{"browser", before, before.TokenVersion, uuid.New()},
+			{"version", before, before.TokenVersion + 1, browser},
+			{"epoch", func() store.User { u := before; u.VaultEpoch++; return u }(), before.TokenVersion, browser},
+			{"generation", func() store.User { u := before; u.VaultSlotGeneration++; return u }(), before.TokenVersion, browser},
+			{"owner", func() store.User { u := before; u.ID = bsSeed(t, pool).id; return u }(), before.TokenVersion, browser},
+			{"inactive snapshot", func() store.User { u := before; u.IsActive = false; return u }(), before.TokenVersion, browser},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				v := f.cold()
+				if err := v.Restore(ctx, vault.VerifiedSession{Auth: vault.Snapshot(tc.user), TokenVersion: tc.version, BrowserID: tc.browser}, decoded); err == nil || v.Unlocked(f.id) {
+					t.Fatal("invalid restore published")
+				}
+			})
+		}
+		vlExec(t, pool, "UPDATE vault_browser_slots SET created_at=now()-interval '2 days',expires_at=now()-interval '1 day' WHERE user_id=$1", f.id)
+		if err := f.cold().Restore(ctx, f.session(t, browser), decoded); err == nil {
+			t.Fatal("expired restore")
+		}
+	})
+	t.Run("durable lock and stale interactive snapshot", func(t *testing.T) {
+		f := bsSeed(t, pool)
+		browser := uuid.New()
+		key := f.mint(t, browser)
+		before := f.user(t)
+		stale := f.session(t, browser)
+		if err := f.v.LockAndAcknowledge(ctx, f.id); err != nil {
+			t.Fatal(err)
+		}
+		after := f.user(t)
+		if f.v.Unlocked(f.id) || f.count(t) != 0 || after.VaultEpoch != before.VaultEpoch || after.VaultSlotGeneration <= before.VaultSlotGeneration {
+			t.Fatal("lock did not fence slots independently of epoch")
+		}
+		if err := f.v.Restore(ctx, stale, key); err == nil {
+			t.Fatal("stale restore")
+		}
+		if k, err := f.v.UnlockAndMint(ctx, vault.Snapshot(before), vlLoginPhrase, vault.InteractiveExisting, &vault.BrowserMintRequest{HTTPS: true, BrowserID: browser, SessionExpiresAt: time.Now().Add(time.Hour)}); err == nil || k != nil || f.v.Unlocked(f.id) {
+			t.Fatal("stale interactive auth survived lock")
+		}
+		f.mint(t, browser)
+		f.v.Lock(f.id)
+		if f.count(t) != 0 || f.v.Unlocked(f.id) {
+			t.Fatal("legacy Lock allowed restore")
+		}
+	})
+	t.Run("logout password and deactivation storage revocation", func(t *testing.T) {
+		f := bsSeed(t, pool)
+		browser := uuid.New()
+		f.mint(t, browser)
+		version, err := f.v.Logout(ctx, f.id)
+		if err != nil || version != f.user(t).TokenVersion || !f.v.Unlocked(f.id) || f.count(t) != 0 {
+			t.Fatalf("logout cache/version/slots: %v", err)
+		}
+		f.mint(t, browser)
+		q := store.New(pool)
+		hash := f.user(t).PasswordHash
+		if err := q.UpdatePassword(ctx, store.UpdatePasswordParams{ID: f.id, PasswordHash: hash}); err != nil || f.count(t) != 0 {
+			t.Fatalf("direct password query: %v", err)
+		}
+		f.mint(t, browser)
+		if _, err := q.BumpTokenVersion(ctx, f.id); err != nil || f.count(t) != 0 {
+			t.Fatalf("direct token bump: %v", err)
+		}
+		f.mint(t, browser)
+		if err := f.v.UpdatePassword(ctx, store.UpdatePasswordParams{ID: f.id, PasswordHash: hash}); err != nil || f.count(t) != 0 {
+			t.Fatalf("typed password seam: %v", err)
+		}
+		f.mint(t, browser)
+		user, err := f.v.SetUserActive(ctx, store.SetUserActiveParams{ID: f.id, IsActive: false})
+		if err != nil || user.IsActive || f.count(t) != 0 || f.v.Unlocked(f.id) {
+			t.Fatalf("typed deactivation: %v", err)
+		}
+		if key, err := f.v.UnlockAndMint(ctx, vault.Snapshot(f.user(t)), vlLoginPhrase, vault.InteractiveExisting, nil); err == nil || key != nil {
+			t.Fatal("inactive unlock")
+		}
+	})
+	t.Run("preference off and mode ABA", func(t *testing.T) {
+		f := bsSeed(t, pool)
+		browser := uuid.New()
+		key := f.mint(t, browser)
+		before := f.user(t)
+		if err := f.v.SetAutoReunlock(ctx, vault.Snapshot(before), false); err != nil || f.count(t) != 0 {
+			t.Fatalf("optout: %v", err)
+		}
+		if k, err := f.v.UnlockAndMint(ctx, vault.Snapshot(f.user(t)), vlLoginPhrase, vault.InteractiveExisting, &vault.BrowserMintRequest{HTTPS: true, BrowserID: browser, SessionExpiresAt: time.Now().Add(time.Hour)}); err != nil || k != nil {
+			t.Fatal("optout minted")
+		}
+		if err := f.v.SetAutoReunlock(ctx, vault.Snapshot(f.user(t)), true); err != nil || f.count(t) != 0 {
+			t.Fatal("optin minted")
+		}
+		f.mint(t, browser)
+		stale := f.session(t, browser)
+		if err := f.v.Disable(ctx, f.id); err != nil || f.count(t) != 0 {
+			t.Fatalf("off revocation: %v", err)
+		}
+		if k, err := f.v.UnlockAndMint(ctx, vault.Snapshot(f.user(t)), vlLoginPhrase, vault.InteractiveExisting, nil); err != nil || k != nil {
+			t.Fatal("Off unlock")
+		}
+		if err := f.v.Enable(ctx, f.id, vlLoginPhrase); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.cold().Restore(ctx, stale, key); err == nil {
+			t.Fatal("mode ABA revived slot")
+		}
+	})
+	t.Run("cap replacement expiry sweep and setting validation", func(t *testing.T) {
+		f := bsSeed(t, pool)
+		vlExec(t, pool, "DELETE FROM app_settings WHERE key='vault_reunlock_days'")
+		browsers := make([]uuid.UUID, 33)
+		for i := range browsers {
+			browsers[i] = uuid.New()
+			f.mint(t, browsers[i])
+		}
+		if f.count(t) != 32 {
+			t.Fatal("cap")
+		}
+		var firstPresent bool
+		if err := pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM vault_browser_slots WHERE user_id=$1 AND browser_id=$2)", f.id, browsers[0]).Scan(&firstPresent); err != nil || firstPresent {
+			t.Fatal("oldest not evicted")
+		}
+		f.mint(t, browsers[32])
+		if f.count(t) != 32 {
+			t.Fatal("same browser replacement")
+		}
+		vlExec(t, pool, "UPDATE vault_browser_slots SET created_at=now()-interval '2 days',expires_at=now()-interval '1 day' WHERE user_id=$1", f.id)
+		f.mint(t, uuid.New())
+		if f.count(t) != 1 {
+			t.Fatal("expired slots count against cap")
+		}
+		vlExec(t, pool, "UPDATE vault_browser_slots SET created_at=now()-interval '2 days',expires_at=now()-interval '1 day' WHERE user_id=$1", f.id)
+		q := store.New(pool)
+		n, err := q.DeleteExpiredVaultBrowserSlots(ctx, store.DeleteExpiredVaultBrowserSlotsParams{ObservedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, BatchSize: 1})
+		if err != nil || n != 1 {
+			t.Fatalf("bounded expiry delete: %d %v", n, err)
+		}
+		for _, value := range []string{"0", "31", "invalid", ""} {
+			vlExec(t, pool, "INSERT INTO app_settings(key,value) VALUES('vault_reunlock_days',$1) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", value)
+			k, err := f.v.UnlockAndMint(ctx, vault.Snapshot(f.user(t)), vlLoginPhrase, vault.InteractiveExisting, &vault.BrowserMintRequest{HTTPS: true, BrowserID: uuid.New(), SessionExpiresAt: time.Now().Add(time.Hour)})
+			if err == nil || k != nil || f.count(t) != 0 {
+				t.Fatalf("invalid DB setting %q minted", value)
+			}
+		}
+		vlExec(t, pool, "DELETE FROM app_settings WHERE key='vault_reunlock_days'")
+	})
+	t.Run("rollback and overflow fail closed", func(t *testing.T) {
+		f := bsSeed(t, pool)
+		f.mint(t, uuid.New())
+		before := f.user(t)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.New(tx).RevokeVaultBrowserSlots(ctx, f.id); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if f.count(t) != 1 || f.user(t).VaultSlotGeneration != before.VaultSlotGeneration {
+			t.Fatal("revocation escaped rollback")
+		}
+		vlExec(t, pool, "UPDATE users SET vault_slot_generation=9223372036854775807 WHERE id=$1", f.id)
+		if err := f.v.LockWithContext(ctx, f.id); err == nil || f.v.Unlocked(f.id) {
+			t.Fatal("overflow lock success")
+		}
+		if _, err := store.New(pool).BumpTokenVersion(ctx, f.id); err == nil {
+			t.Fatal("auth revocation overflow succeeded")
+		}
+	})
+}
+
+// bsBarrier blocks one slot read inside the owner's locked restore transaction.
+// The wait is bounded by the request context; sibling work proceeds only after
+// the test explicitly releases the barrier.
+type bsBarrier struct {
+	vault.BrowserStore
+	once    *sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *bsBarrier) GetVaultBrowserSlot(ctx context.Context, arg store.GetVaultBrowserSlotParams) (store.VaultBrowserSlot, error) {
+	slot, err := b.BrowserStore.GetVaultBrowserSlot(ctx, arg)
+	b.once.Do(func() {
+		close(b.entered)
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+		}
+	})
+	if ctx.Err() != nil {
+		return store.VaultBrowserSlot{}, ctx.Err()
+	}
+	return slot, err
+}
+func bsWrapped(f bsFixture, wrap func(vault.BrowserStore) vault.BrowserStore, commitError bool, opts ...vault.Option) *vault.Vault {
+	q := store.New(f.pool)
+	return vault.New(f.master, q, func(ctx context.Context, fn func(context.Context, vault.Store) error) error {
+		tx, err := f.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		tq := q.WithTx(tx)
+		if err := fn(vault.WithStateReader(ctx, tq), wrap(tq)); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return &vault.CommitError{Err: err}
+		}
+		if commitError {
+			return &vault.CommitError{Err: errors.New("injected lost commit acknowledgment")}
+		}
+		return nil
+	}, opts...)
+}
+func bsWait(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatal("barrier deadline")
+	}
+}
+func TestVaultBrowserRestoreLockRaceLiveDB(t *testing.T) {
+	pool := vlIsolatedPool(t)
+	f := bsSeed(t, pool)
+	browser := uuid.New()
+	key := f.mint(t, browser)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	entered, release, waiting := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var once, waitOnce sync.Once
+	cold := bsWrapped(f, func(q vault.BrowserStore) vault.BrowserStore {
+		return &bsBarrier{BrowserStore: q, once: &once, entered: entered, release: release}
+	}, false,
+		vault.WithLifecycleWaitObserverForTest(func(uuid.UUID) { waitOnce.Do(func() { close(waiting) }) }))
+	restored, locked := make(chan error, 1), make(chan error, 1)
+	go func() { restored <- cold.Restore(ctx, f.session(t, browser), key) }()
+	bsWait(t, entered)
+	stale := vault.Snapshot(f.user(t))
+	go func() { locked <- cold.LockWithContext(ctx, f.id) }()
+	bsWait(t, waiting)
+	close(release)
+	if err := <-restored; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-locked; err != nil {
+		t.Fatal(err)
+	}
+	if cold.Unlocked(f.id) || f.count(t) != 0 {
+		t.Fatal("read-before-lock restore survived durable revoke")
+	}
+	if k, err := cold.UnlockAndMint(ctx, stale, vlLoginPhrase, vault.InteractiveExisting, nil); err == nil || k != nil || cold.Unlocked(f.id) {
+		t.Fatal("stale auth republished after lock")
+	}
+}
+func TestVaultBrowserAmbiguousCommitLiveDB(t *testing.T) {
+	pool := vlIsolatedPool(t)
+	f := bsSeed(t, pool)
+	ctx := context.Background()
+	ambiguous := bsWrapped(f, func(q vault.BrowserStore) vault.BrowserStore { return q }, true)
+	key, err := ambiguous.UnlockAndMint(ctx, vault.Snapshot(f.user(t)), vlLoginPhrase, vault.InteractiveCreate, &vault.BrowserMintRequest{HTTPS: true, BrowserID: uuid.New(), SessionExpiresAt: time.Now().Add(time.Hour)})
+	if !errors.Is(err, vault.ErrUncertainOutcome) || key != nil || ambiguous.Unlocked(f.id) {
+		t.Fatalf("uncertain mint leaked publication: %v", err)
+	}
+	if f.count(t) != 1 {
+		t.Fatal("injected committed mint not durable")
+	}
+	browser := uuid.New()
+	valid := f.mint(t, browser)
+	if err := ambiguous.Restore(ctx, f.session(t, browser), valid); !errors.Is(err, vault.ErrUncertainOutcome) || ambiguous.Unlocked(f.id) {
+		t.Fatalf("uncertain restore published: %v", err)
+	}
+	if err := ambiguous.LockWithContext(ctx, f.id); !errors.Is(err, vault.ErrUncertainOutcome) {
+		t.Fatal("uncertain revoke reported success")
+	}
+	if f.count(t) != 0 {
+		t.Fatal("committed revoke left slots")
+	}
+}
