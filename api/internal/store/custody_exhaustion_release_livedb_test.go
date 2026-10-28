@@ -36,7 +36,7 @@ func assertExhaustionCustodyRetained(t *testing.T, f *admissionFixture) {
 }
 
 func TestExhaustionArchiveRetainsCustodyDecisionLiveDB(t *testing.T) {
-	for _, cause := range []string{"worker_requeue_exhausted", "retained_recovery_exhausted"} {
+	for _, cause := range []string{"worker_requeue_exhausted", "retained_recovery_exhausted", "retained_recovery_adoption_failed"} {
 		for _, timed := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/timed=%v", cause, timed), func(t *testing.T) {
 				for _, newerUpload := range []bool{false, true} {
@@ -87,7 +87,7 @@ func TestExhaustionArchiveRetainsCustodyDecisionLiveDB(t *testing.T) {
 }
 
 func TestExhaustionDelayedSelectionRetainsCustodyLiveDB(t *testing.T) {
-	for _, cause := range []string{"worker_requeue_exhausted", "retained_recovery_exhausted"} {
+	for _, cause := range []string{"worker_requeue_exhausted", "retained_recovery_exhausted", "retained_recovery_adoption_failed"} {
 		for _, timed := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/timed=%v", cause, timed), func(t *testing.T) {
 				f := newAdmissionFixture(t, 1)
@@ -118,7 +118,7 @@ func TestExhaustionDelayedSelectionRetainsCustodyLiveDB(t *testing.T) {
 }
 
 func TestExhaustionConcurrentReleaseRechecksLockedRunLiveDB(t *testing.T) {
-	for _, cause := range []string{"worker_requeue_exhausted", "retained_recovery_exhausted"} {
+	for _, cause := range []string{"worker_requeue_exhausted", "retained_recovery_exhausted", "retained_recovery_adoption_failed"} {
 		for _, timed := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/timed=%v", cause, timed), func(t *testing.T) {
 				f := newAdmissionFixture(t, 1)

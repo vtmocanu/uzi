@@ -296,7 +296,7 @@ func TestJudgeClaimCarriesModelAndSignal(t *testing.T) {
 		anthropic:     sealedTok,
 		toolTraceRows: rawResultRows(`{"text":"bash: shellcheck: command not found"}`),
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
 	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)

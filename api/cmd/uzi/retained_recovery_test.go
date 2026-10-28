@@ -19,6 +19,10 @@ import (
 func retainedRecoveryRun(timing string) apitypes.RunDTO {
 	r := workerExhaustionRun(3)
 	cause := "retained_recovery_exhausted"
+	if strings.HasPrefix(timing, "adoption/") {
+		cause = "retained_recovery_adoption_failed"
+		timing = strings.TrimPrefix(timing, "adoption/")
+	}
 	r.RecoveryWaitCause = &cause
 	r.RecoveryRetryNotBefore = nil
 	r.RecoveryRetryNotBeforePresent = true
@@ -293,7 +297,7 @@ func TestRetainedRecoveryNarrowAndStale(t *testing.T) {
 }
 
 func TestRetainedRecoveryOwnerActions(t *testing.T) {
-	for _, timing := range []string{"future", "due", "held"} {
+	for _, timing := range []string{"future", "due", "held", "adoption/future"} {
 		for _, verb := range []string{"resume", "cancel"} {
 			for _, status := range []int{http.StatusOK, http.StatusNotFound, http.StatusConflict} {
 				t.Run(fmt.Sprintf("%s/%s/%d", timing, verb, status), func(t *testing.T) {
@@ -366,6 +370,154 @@ func TestRetainedRecoveryOwnerActions(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+// Adoption refusal is an owner hold even if a malformed response supplies a
+// finite retry stamp. Exercise consumer seams rather than the classifier alone.
+func TestRetainedAdoptionCLI(t *testing.T) {
+	r := retainedRecoveryRun("adoption/future")
+	for _, verb := range []string{"get", "list", "inputs"} {
+		t.Run(verb, func(t *testing.T) {
+			polls, mutation := 0, false
+			srv := workerExhaustionServer(t, []apitypes.RunDTO{r}, &polls, &mutation)
+			defer srv.Close()
+			args := []string{"run", verb}
+			if verb != "list" {
+				args = append(args, "r1")
+			}
+			out, errout, code := runCLI(t, httpEnv(srv), args...)
+			if code != 0 || mutation {
+				t.Fatalf("exit %d mutation %v: %s", code, mutation, errout)
+			}
+			copy := out + errout
+			requireWorkerCopy(t, copy, "adoption failed", "integrity check refused adoption",
+				"local work and custody preserved", "owner-held", "no automatic resume",
+				"uzi run resume r1", "uzi run cancel r1", "availability")
+			for _, bad := range []string{"timed retry", "2099-", "fresh allowance", "contains the latest work"} {
+				if strings.Contains(copy, bad) {
+					t.Errorf("misleading %q: %s", bad, copy)
+				}
+			}
+			if verb == "inputs" {
+				requireWorkerCopy(t, out, "queued (owner Resume/Cancel)")
+			}
+		})
+	}
+	for _, verb := range []string{"get", "list", "inputs"} {
+		t.Run(verb+"/json", func(t *testing.T) {
+			polls, mutation := 0, false
+			srv := workerExhaustionServer(t, []apitypes.RunDTO{r}, &polls, &mutation)
+			defer srv.Close()
+			args := []string{"run", verb}
+			if verb != "list" {
+				args = append(args, "r1")
+			}
+			out, errout, code := runCLI(t, httpEnv(srv), append(args, "--json")...)
+			if code != 0 || errout != "" || mutation || !json.Valid([]byte(out)) {
+				t.Fatalf("JSON changed: exit %d mutation %v: %s %s", code, mutation, out, errout)
+			}
+			if verb == "get" {
+				var got apitypes.RunDTO
+				if err := json.Unmarshal([]byte(out), &got); err != nil {
+					t.Fatal(err)
+				}
+				if strOr(got.RecoveryWaitCause, "") != "retained_recovery_adoption_failed" ||
+					got.RecoveryRetryNotBefore == nil || !got.RecoveryRetryNotBefore.Equal(*r.RecoveryRetryNotBefore) ||
+					got.WorkerRecovery == nil || got.WorkerRecovery.EpisodeUsed != 3 {
+					t.Fatalf("raw contract lost: %s", out)
+				}
+			}
+			if verb == "inputs" && polls != 0 {
+				t.Fatalf("input JSON fetched run: %d", polls)
+			}
+		})
+	}
+}
+
+func TestRetainedAdoptionWaitAndFollow(t *testing.T) {
+	old := logsPollInterval
+	logsPollInterval = time.Millisecond
+	t.Cleanup(func() { logsPollInterval = old })
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		polls int
+	}{
+		{"default wait", []string{"wait", "r1", "--interval", "1ms", "--timeout", "1s", "--min-plan-seq", "99"}, 1},
+		{"explicit wait", []string{"wait", "r1", "--interval", "1ms", "--timeout", "1s", "--until", "completed"}, 3},
+		{"explicit recovery", []string{"wait", "r1", "--until", "recovery_wait"}, 1},
+		{"follow", []string{"logs", "r1", "--follow"}, 1},
+		{"follow JSON", []string{"logs", "r1", "--follow", "--json"}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := retainedRecoveryRun("adoption/future")
+			changedStamp := retainedRecoveryRun("adoption/due")
+			done := r
+			done.Status = "completed"
+			polls, mutation := 0, false
+			srv := workerExhaustionServer(t, []apitypes.RunDTO{r, changedStamp, done}, &polls, &mutation)
+			defer srv.Close()
+			_, errout, code := runCLI(t, httpEnv(srv), append([]string{"run"}, tc.args...)...)
+			if code != 0 || polls != tc.polls || mutation {
+				t.Fatalf("exit %d polls %d want %d mutation %v: %s", code, polls, tc.polls, mutation, errout)
+			}
+			requireWorkerCopy(t, errout, "owner-held", "adoption failed")
+			if strings.Count(errout, "adoption failed") != 1 || strings.Contains(errout, "timed retry") {
+				t.Fatalf("wrong notices: %s", errout)
+			}
+		})
+	}
+}
+
+func TestRetainedAdoptionTUI(t *testing.T) {
+	for _, timing := range []string{"held", "future", "due"} {
+		t.Run(timing, func(t *testing.T) {
+			r := retainedRecoveryRun("adoption/" + timing)
+			row := apitypes.RunListItemDTO{RunDTO: r}
+			m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+			m.width, m.height = 60, 36
+			m = step(m, tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+			m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{row}})
+			if runBandOf(row) != bandNeedsYou || runStateWord(row) != "recovery held" ||
+				m.pal.runStateToken(r, false).word != "recovery held" {
+				t.Fatal("adoption refusal missing owner attention")
+			}
+			requireWorkerCopy(t, stripANSI(m.View().Content), "NEEDS YOU", "recovery held", "Resume now/Cancel")
+			m = tuiTestModel(t, &uzicli.FakeClient{}, r.ID)
+			m = applyDetail(m, r, nil)
+			m.detail.steer.access = steerAllowed
+			m.detail.steer.queue = []apitypes.SteerInputDTO{{Kind: "follow_up", CreatedAt: time.Now()}}
+			m = step(m, tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+			m = step(m, tea.WindowSizeMsg{Width: 60, Height: 36})
+			out := stripANSI(m.View().Content)
+			requireWorkerCopy(t, out, "adoption failed", "Integrity check refused adoption",
+				"Local work and custody preserved", "no automatic resume", "owner Resume/Cancel",
+				"uzi run resume r1", "uzi run cancel r1", "availability and latest edits unverified")
+			for _, line := range strings.Split(out, "\n") {
+				if visualWidth(line) > 60 {
+					t.Errorf("overflow: %q", line)
+				}
+			}
+			if strings.Contains(out, "Timed retry") || strings.Contains(out, "2099-") {
+				t.Fatalf("held timer: %s", out)
+			}
+		})
+	}
+	if got := steerState(queuedIn(), statusRecoveryWait, "retained_recovery_adoption_failed"); got != "queued (owner Resume/Cancel)" {
+		t.Fatalf("cause-only input projection: %s", got)
+	}
+	if glyph, word := stateGlyphWord(statusRecoveryWait, "", false, false, "", "", "retained_recovery_adoption_failed"); glyph != "!" || word != "recovery held" {
+		t.Fatalf("cause-only token: %s %s", glyph, word)
+	}
+	for _, status := range []string{"running", "completed"} {
+		r := retainedRecoveryRun("adoption/held")
+		r.Status = status
+		row := apitypes.RunListItemDTO{RunDTO: r}
+		out, errout, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": r}}), "run", "get", "r1")
+		if code != 0 || strings.Contains(out+errout, "adoption failed") || runBandOf(row) == bandNeedsYou || strings.Contains(runStateWord(row), "recovery") {
+			t.Fatalf("stale hold: %d %s %s", code, out, errout)
 		}
 	}
 }

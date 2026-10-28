@@ -876,6 +876,10 @@ type RunDTO struct {
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
 	// or about to fill; the run resumes at its next retry, see DiskParkCount);
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
+	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
+	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
+	// "retained_recovery_adoption_failed" is an integrity refusal: retained local work and
+	// custody are preserved, and only the owner can Resume or Cancel, without automatic retry.
 	// "empty_turn" remains reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
@@ -910,6 +914,8 @@ type RunDTO struct {
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
 	// or retained_recovery_exhausted park. An omitted key in a partial client read means
 	// timing is unknown; consult RecoveryRetryNotBeforePresent before inferring a hold.
+	// retained_recovery_adoption_failed is always owner-held, even if a malformed
+	// response supplies a retry timestamp; the cause never schedules a timer.
 	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`
 	// RecoveryRetryNotBeforePresent records JSON key presence for partial client reads.
 	// It never changes the wire representation.
@@ -1722,6 +1728,10 @@ type RunSummaryItemDTO struct {
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
 	// or about to fill; the run resumes at its next retry, see DiskParkCount);
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
+	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
+	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
+	// "retained_recovery_adoption_failed" is an integrity refusal: retained local work and
+	// custody are preserved, and only the owner can Resume or Cancel, without automatic retry.
 	// "empty_turn" remains reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
@@ -1756,6 +1766,8 @@ type RunSummaryItemDTO struct {
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
 	// or retained_recovery_exhausted park. An omitted key in a partial client read means
 	// timing is unknown; consult RecoveryRetryNotBeforePresent before inferring a hold.
+	// retained_recovery_adoption_failed is always owner-held, even if a malformed
+	// response supplies a retry timestamp; the cause never schedules a timer.
 	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`
 	// RecoveryRetryNotBeforePresent records JSON key presence for partial client reads.
 	// It never changes the wire representation.

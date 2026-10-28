@@ -189,7 +189,7 @@ func ciFixClaimPayload(t *testing.T) ClaimPayload {
 		},
 		anthropic: sealedTok,
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil || payload == nil {
 		t.Fatalf("Claim: %v (payload=%v)", err, payload)

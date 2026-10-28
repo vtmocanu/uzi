@@ -28,6 +28,7 @@ import (
 // embeds the (nil) broad Store only so it can sit in Service.q; the narrow surfaces the
 // refresh and poll paths use are all implemented here, so the nil embed is never reached.
 type rejFakeStore struct {
+	epoch int64
 	Store
 	acct       store.CodexProviderAccount
 	markReauth int
@@ -35,6 +36,11 @@ type rejFakeStore struct {
 
 func (f *rejFakeStore) GetCodexProviderAccountByID(context.Context, store.GetCodexProviderAccountByIDParams) (store.CodexProviderAccount, error) {
 	return f.acct, nil
+}
+
+func (f *rejFakeStore) GetCodexProviderAccountSnapshot(ctx context.Context, arg store.GetCodexProviderAccountSnapshotParams) (store.GetCodexProviderAccountSnapshotRow, error) {
+	acct, err := f.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams(arg))
+	return store.GetCodexProviderAccountSnapshotRow{CodexProviderAccount: acct, VaultEpoch: f.epoch}, err
 }
 
 func (f *rejFakeStore) GetCodexRefreshIntent(context.Context, store.GetCodexRefreshIntentParams) (store.CodexRefreshIntent, error) {
@@ -150,7 +156,9 @@ func newRejHarness(t *testing.T, providerErr error, rejector *recordingRejector)
 	acct.CoordState = codexCoordIdle
 	st := &rejFakeStore{acct: acct}
 	client := &rejFakeRefresh{err: providerErr}
-	svc := &Service{q: st, box: box, codexRefresh: client}
+	svc := newOffModeService(st, box, Params{})
+	svc.codexRefresh = client
+	svc.SetTxBeginner(rejectionNoMaterialWriteBeginner{})
 	if rejector != nil {
 		svc.codexRejector = rejector
 	}
@@ -439,4 +447,11 @@ func TestCodexRefreshPhaseLogOAuthErrorOnlyWhenPresent(t *testing.T) {
 			assertKeySet(t, recs[0], "operation_id", "phase", "elapsed_ms", "result", "oauth_error")
 		})
 	}
+}
+
+// Rejection must finish without opening a material-write transaction.
+type rejectionNoMaterialWriteBeginner struct{}
+
+func (rejectionNoMaterialWriteBeginner) Begin(context.Context) (pgx.Tx, error) {
+	return nil, errors.New("rejection fixture: unexpected material-write transaction")
 }

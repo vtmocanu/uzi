@@ -29,6 +29,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/producttoken"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -59,6 +60,7 @@ func newSiteListEnv(t *testing.T) *siteListEnv {
 		TerminalPendingLease: time.Hour, ActiveSnapshotMaxEntries: 256, WorkerOutboxMaxPending: 32,
 		WorkerGapFillMax: 10000, WorkerAffinityGrace: 2 * time.Minute,
 	})
+	svc.SetVault(vault.NewPostgres(h.box, pool))
 	svc.SetTxBeginner(pool)
 	svc.SetJobFiles(workersvc.NewJobFiles(pool, h.box, workersvc.JobFileLimits{}, nil))
 	svcTok := "fetcher-svc-" + uuid.NewString()

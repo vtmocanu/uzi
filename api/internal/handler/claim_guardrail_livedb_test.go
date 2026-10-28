@@ -12,6 +12,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -73,6 +74,7 @@ func newClaimGuardFixtureWith(ctx context.Context, t *testing.T, mkReader func(*
 	svc := newZeroWaitForgeService(q, box)
 	pcheck := privcheck.NewService(q, svc)
 	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: mkReader(q)})
+	wsvc.SetVault(vault.NewPostgres(box, pool))
 	wsvc.SetRepoGuard(pcheck)
 	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
 	wsvc.SetTxBeginner(pool)
@@ -94,7 +96,7 @@ func newClaimGuardFixtureWith(ctx context.Context, t *testing.T, mkReader func(*
 		t.Fatalf("seal token: %v", err)
 	}
 
-	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`,
 		f.owner, fmt.Sprintf("claim-owner-%s@e2e", uuid.NewString()[:8]))
 	mustExecT(ctx, t, pool,
 		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)

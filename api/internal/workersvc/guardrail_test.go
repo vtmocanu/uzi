@@ -270,7 +270,7 @@ func TestClaimJudgeSkipsGuard(t *testing.T) {
 	sealedTok, _ := box.Seal([]byte("anthropic-judge-token-abcdef1234567890"))
 	uid, target := uuid.New(), uuid.New()
 	fs := &fakeStore{claimRun: judgeRun(uid, target), anthropic: sealedTok}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	guard := &fakeGuard{res: privcheck.GuardResult{Blocked: true}}
 	svc.SetRepoGuard(guard)
 

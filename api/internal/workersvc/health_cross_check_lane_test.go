@@ -12,7 +12,6 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 type healthCrossCheckPlacementStore struct {
@@ -140,7 +139,7 @@ func TestHealthQueuedCheckerVaultPrecedesPlacement(t *testing.T) {
 	r.StatusSince = ago(15 * time.Minute)
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, custodyHolds: 9}
 	svc := healthSvc(fs, defaultHealthSettings())
-	svc.SetVault(vault.New(newBox(t), newMemVaultStore()))
+	svc.SetVault(newMemoryVault(newBox(t), newMemVaultStore()))
 	svc.detectRunHealth(context.Background(), t0)
 	if got := lastWrite(t, fs, r.ID).HealthReason.String; got != reasonVaultLocked {
 		t.Fatalf("locked checker reason=%s", got)

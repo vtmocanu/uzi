@@ -1602,6 +1602,8 @@ type User struct {
 	CodexJudgeModel           pgtype.Text        `json:"codex_judge_model"`
 	WeeklyReservePct          pgtype.Int2        `json:"weekly_reserve_pct"`
 	WeeklyReservePauseRunning bool               `json:"weekly_reserve_pause_running"`
+	VaultMode                 string             `json:"vault_mode"`
+	VaultEpoch                int64              `json:"vault_epoch"`
 }
 
 type UserCrossCheckPin struct {

@@ -185,3 +185,44 @@ for (const refusal of ["invalid request body", "invalid recovery cause"]) it(`re
     error instanceof Error && !(error instanceof RequestError && error.status === 400));
   assert.deepEqual(sent, [body, body]);
 });
+
+
+it("both claim decoders preserve only safe natural raw owner grants independently of derived episodes", async () => {
+  await client.register("episode-worker");
+  for (const raw of [undefined, 0, 1, Number.MAX_SAFE_INTEGER, -1, 0.5, Number.MAX_SAFE_INTEGER + 1, "1", null, true, [], {}]) {
+    claim.worker_recovery_owner_episode = raw;
+    claim.worker_recovery_episode = 99;
+    const run = await client.claimRun(), chat = await client.claimChat();
+    for (const decoded of [run, chat]) {
+      assert.ok(decoded);
+      assert.equal(decoded.worker_recovery_episode, 99);
+      if (Number.isSafeInteger(raw) && (raw as number) >= 0) assert.equal(decoded.worker_recovery_owner_episode, raw);
+      else assert.equal(Object.hasOwn(decoded, "worker_recovery_owner_episode"), false);
+    }
+  }
+});
+
+for (const outcome of ["ok", "400", "stale", "ambiguous-400", "missing-feature", "missing-generation"] as const) {
+  it(`adoption typed park ${outcome} never downgrades or drops its generation`, async () => {
+    const sent: unknown[] = [];
+    client.protocolFeatures = outcome === "missing-feature" ? [] : ["recovery_cause_retained_recovery_adoption_failed"];
+    mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
+      sent.push(JSON.parse(String(init?.body)));
+      if (outcome === "400" || (outcome === "ambiguous-400" && sent.length > 1))
+        return Response.json({ error: "invalid recovery cause" }, { status: 400 });
+      if (outcome === "ambiguous-400") return Response.json({}, { status: 500 });
+      return Response.json({ run: { status: "recovery_wait", recovery_wait_cause: "retained_recovery_adoption_failed" },
+        ...(outcome === "stale" ? { disposition: "stale_claim" } : {}) }, { status: outcome === "stale" ? 409 : 200 });
+    });
+    const body = { status: "recovery_wait", recovery_cause: "retained_recovery_adoption_failed",
+      ...(outcome === "missing-generation" ? {} : { claim_generation: 5 }) } as const;
+    if (outcome === "ok" || outcome === "stale") {
+      const ack = await client.reportState("episode-run", body);
+      assert.equal(ack.recoveryCause, body.recovery_cause);
+      assert.equal(ack.staleClaim === true, outcome === "stale");
+    } else await assert.rejects(client.reportState("episode-run", body), (error: unknown) =>
+      outcome !== "ambiguous-400" || !(error instanceof RequestError && error.status === 400));
+    assert.deepEqual(sent, ["missing-feature", "missing-generation"].includes(outcome) ? []
+      : outcome === "ambiguous-400" ? [body, body] : [body]);
+  });
+}

@@ -73,6 +73,7 @@ func (e codexTestEnv) seedQueuedRunWithOverride(t *testing.T, userID, repoID uui
 func TestRunOverrideBeatsWorkerBindLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
 	svc.SetTxBeginner(env.pool)
 
@@ -153,6 +154,7 @@ func TestRunOverrideBeatsWorkerBindLiveDB(t *testing.T) {
 func TestRecordRunCredentialEpochIdempotentAtGenerationLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
 	svc.SetTxBeginner(env.pool)
 

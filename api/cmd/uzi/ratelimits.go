@@ -171,7 +171,7 @@ func runAdminCodexRateLimits(cmd *cobra.Command, c uzicli.Client, p *uzicli.Prin
 	rows := make([][]string, 0, len(users))
 	for _, u := range users {
 		email := cellText(u.Email)
-		vault := vaultCell(u.VaultLocked)
+		vault := vaultCell(u.VaultMode, u.VaultLocked)
 		if len(u.Accounts) == 0 {
 			rows = append(rows, []string{email, vault, "-", "-", "-", "—", "—", "—"})
 			continue

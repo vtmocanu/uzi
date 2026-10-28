@@ -63,6 +63,7 @@ func newCRFix(t *testing.T) *crFix {
 	}
 	env.exec(`UPDATE forge_connections SET token_ciphertext = $1 WHERE user_id = $2`, sealedPAT, user)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
 	sched, err := env.q.CreateRunSchedule(env.ctx, store.CreateRunScheduleParams{
 		UserID: user, RepoID: repo, Target: "ci_watch", Prompt: pgtype.Text{String: "repair the build", Valid: true},

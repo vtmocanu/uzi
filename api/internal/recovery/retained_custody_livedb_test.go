@@ -16,6 +16,14 @@ import (
 // The run holder must still be able to lock custody while v1 release waits.
 // Deadlines and the operation helpers bound every wait and drain the release.
 func TestRetainedCustodyV1ReleaseRunBeforeHoldLiveDB(t *testing.T) {
+	for _, cause := range []string{"retained_recovery_exhausted", "retained_recovery_adoption_failed"} {
+		t.Run(cause, func(t *testing.T) {
+			testRetainedCustodyV1ReleaseRunBeforeHoldLiveDB(t, cause)
+		})
+	}
+}
+
+func testRetainedCustodyV1ReleaseRunBeforeHoldLiveDB(t *testing.T, cause string) {
 	for _, timed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("timed=%v", timed), func(t *testing.T) {
 			e := newInventoryEnv(t)
@@ -39,7 +47,7 @@ func TestRetainedCustodyV1ReleaseRunBeforeHoldLiveDB(t *testing.T) {
 			if err := tx.QueryRow(ctx, "SELECT id FROM recovery_custody_holds WHERE id=$1 FOR UPDATE NOWAIT", e.hold).Scan(&id); err != nil {
 				t.Fatalf("v1 release locked hold before run: %v", err)
 			}
-			if _, err := tx.Exec(ctx, "UPDATE runs SET status='recovery_wait', recovery_wait_cause='retained_recovery_exhausted', recovery_retry_not_before=CASE WHEN $2::boolean THEN now()+interval '1 hour' END, claim_released_at=now() WHERE id=$1", e.run, timed); err != nil {
+			if _, err := tx.Exec(ctx, "UPDATE runs SET status='recovery_wait', recovery_wait_cause=$3, recovery_retry_not_before=CASE WHEN $2::boolean THEN now()+interval '1 hour' END, claim_released_at=now() WHERE id=$1", e.run, timed, cause); err != nil {
 				t.Fatal(err)
 			}
 			if err := tx.Commit(ctx); err != nil {
@@ -58,6 +66,14 @@ func TestRetainedCustodyV1ReleaseRunBeforeHoldLiveDB(t *testing.T) {
 }
 
 func TestRetainedCustodyWorkerFinalReleaseRefusedLiveDB(t *testing.T) {
+	for _, cause := range []string{"retained_recovery_exhausted", "retained_recovery_adoption_failed"} {
+		t.Run(cause, func(t *testing.T) {
+			testRetainedCustodyWorkerFinalReleaseRefusedLiveDB(t, cause)
+		})
+	}
+}
+
+func testRetainedCustodyWorkerFinalReleaseRefusedLiveDB(t *testing.T, cause string) {
 	for _, timed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("timed=%v", timed), func(t *testing.T) {
 			for _, kind := range []string{"archive", "settled"} {
@@ -65,7 +81,7 @@ func TestRetainedCustodyWorkerFinalReleaseRefusedLiveDB(t *testing.T) {
 					e := newInventoryEnv(t)
 					id := e.reserve("retained-final")
 					body := e.upload(id)
-					e.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='retained_recovery_exhausted', recovery_retry_not_before=CASE WHEN $2::boolean THEN now()+interval '1 hour' END, claim_released_at=now() WHERE id=$1", e.run, timed)
+					e.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause=$3, recovery_retry_not_before=CASE WHEN $2::boolean THEN now()+interval '1 hour' END, claim_released_at=now() WHERE id=$1", e.run, timed, cause)
 					req := e.request(id)
 					if kind == "settled" {
 						evidence := "forge_no_output"
@@ -92,13 +108,21 @@ func TestRetainedCustodyWorkerFinalReleaseRefusedLiveDB(t *testing.T) {
 }
 
 func TestRetainedCustodyLegacyWorkerReleaseRefusedLiveDB(t *testing.T) {
+	for _, cause := range []string{"retained_recovery_exhausted", "retained_recovery_adoption_failed"} {
+		t.Run(cause, func(t *testing.T) {
+			testRetainedCustodyLegacyWorkerReleaseRefusedLiveDB(t, cause)
+		})
+	}
+}
+
+func testRetainedCustodyLegacyWorkerReleaseRefusedLiveDB(t *testing.T, cause string) {
 	for _, timed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("timed=%v", timed), func(t *testing.T) {
 			e := newInventoryEnv(t)
 			e.exec("UPDATE recovery_custody_holds SET inventory_guarded=false WHERE id=$1", e.hold)
 			id := e.reserve("legacy-retained")
 			body := e.upload(id)
-			e.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='retained_recovery_exhausted', recovery_retry_not_before=CASE WHEN $2::boolean THEN now()+interval '1 hour' END, claim_released_at=now() WHERE id=$1", e.run, timed)
+			e.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause=$3, recovery_retry_not_before=CASE WHEN $2::boolean THEN now()+interval '1 hour' END, claim_released_at=now() WHERE id=$1", e.run, timed, cause)
 			for _, generation := range []*int64{&e.gen, nil} {
 				ack, err := e.svc.Release(e.ctx, e.w, e.run, apitypes.RecoveryReleaseRequest{Generation: generation})
 				if err != nil || ack.Released || ack.HoldsReleased != 0 {

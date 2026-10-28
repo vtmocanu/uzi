@@ -9,7 +9,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 func ownerHeldRun() store.ListActiveRunsForHealthRow {
@@ -100,7 +99,7 @@ func TestHealthOwnerHoldDisabledAndPrecedence(t *testing.T) {
 				case "disabled":
 					th.queued = 0
 				case "vault":
-					svc.SetVault(vault.New(newBox(t), newMemVaultStore()))
+					svc.SetVault(newMemoryVault(newBox(t), newMemVaultStore()))
 					want = reasonVaultLocked
 				case "custody":
 					fs.custodyHolds = int64(testCustodyLimit)

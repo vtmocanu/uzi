@@ -55,7 +55,7 @@ func selfImproveClaimFixture(t *testing.T, selfRunID uuid.UUID, repoID uuid.UUID
 			workerID: {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedDefault, SealedWith: store.SealedWithMaster},
 		},
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	wkr := store.Worker{
 		ID: uuid.New(), UserID: owner,
 		AnthropicBindMode: BindModePinned,

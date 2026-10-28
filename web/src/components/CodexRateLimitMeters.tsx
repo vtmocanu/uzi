@@ -152,14 +152,16 @@ function CodexAccountBlock({
   sidebarShown,
   onToggle,
   busy,
+  vaultMode,
 }: {
+  vaultMode?: "protected" | "unprotected";
   account: CodexAccountRateLimit;
   now: number;
   sidebarShown: boolean;
   onToggle: (accountId: string, shown: boolean) => void;
   busy: boolean;
 }) {
-  const badge = codexStatusBadge(account);
+  const badge = codexStatusBadge(account, vaultMode);
   // A non-fresh reading (stale / vault-locked / polling-off snapshot) is dimmed and draws
   // no forecast; pending / no_reading carry no buckets, and any other status may still carry
   // the last stored buckets.
@@ -250,7 +252,9 @@ export function CodexRateLimitCard({
   sidebarAccountIds,
   onToggleSidebarAccount,
   busy = false,
+  vaultMode,
 }: {
+  vaultMode?: "protected" | "unprotected";
   sidebarAccountIds: string[];
   onToggleSidebarAccount: (accountId: string, shown: boolean) => void;
   busy?: boolean;
@@ -275,6 +279,7 @@ export function CodexRateLimitCard({
         {accounts.map((a) => (
           <CodexAccountBlock
             key={a.account_id}
+            vaultMode={vaultMode}
             account={a}
             now={now}
             sidebarShown={isCodexAccountShownInSidebar(a, sidebarAccountIds)}

@@ -242,7 +242,8 @@ exponential backoff capped at 16 times its base. Capture, publication,
 adoption or reclaim does not reset the budget; a trusted, successfully
 settled real model turn does. An owner Resume of a
 `worker_requeue_exhausted` hold or the retained-recovery retry described below
-can renew it on a fresh claim with a higher recovery episode.
+can renew it on a fresh claim with a higher recovery episode. Adoption failure
+has a separate owner-only retry, described below.
 
 ### Retained recovery exhausted
 
@@ -290,12 +291,58 @@ custody retained. Uncertain park responses instead stop nonterminal while
 bounded reconciliation checks the outcome. Deploy the API fully before
 upgrading workers; mixed API replicas and API rollback are unsupported.
 
+### Retained recovery adoption failed
+
+`recovery_wait` / `retained_recovery_adoption_failed` means an integrity check
+refused adoption. Local work and custody are preserved. This is an owner hold
+with **no automatic retry**, regardless of any displayed retry timestamp.
+
+1. Read `uzi run recovery <id>` and export an available archive before deciding;
+   an earlier archive may omit the latest local work.
+2. Choose `uzi run resume <id>` to request another bounded attempt, or
+   `uzi run cancel <id>` to end the run. Resume does not guarantee success.
+3. If adoption fails again, the run holds again. Without a fresh owner Resume,
+   redispatch reholds without another capture or model turn.
+
+A valid legacy budget-exhaustion renewal on an upgraded worker records its raw
+owner baseline before recovery work. If adoption then fails, the next owner
+Resume can authorize a new verified attempt. An already-blocked adoption journal
+without that baseline cannot gain execution authority from Resume alone; retain
+and export/recover its work instead.
+
+Resume preserves remaining run wall time and may require an extension. Timers,
+token changes and credential changes do not release this hold. Default CLI wait,
+log follow and the watcher stop for the owner decision; explicit `--until` keeps
+its status set. Retained sources can block image rolls and occupy storage; each
+fresh claim opens another counted custody hold and repeated failures can leave
+retained successor paths. Keep the original worker storage: a peer after worker
+loss or affinity expiry may use a published checkpoint behind the retained work.
+
+A positively identified temporary local resource error during the read-only
+renewal check stops the claim without consuming its owner grant or creating a
+new owner hold. The existing bounded claim-recovery policy may retry it.
+Unverified or invalid authorization remains fail-closed; unknown errors do not
+receive this retry treatment.
+
+Owner authorization remains bound to the recorded repository path, device and
+inode. A changed storage identity refuses execution; Resume cannot override that
+check. With the source journal still valid, the run re-holds instead of failing
+and keeps its local work and custody. Export/recover the retained work rather than
+expecting Resume alone to rebind changed storage. Reholding does
+not rebind the owner record or consume the pending execution grant.
+
+This path requires API feature support, exact persisted `adoption_failed`
+evidence, current ownership and proven quiescence. Missing support or unconfirmed
+persistence fails closed with custody kept. An uncertain park response uses
+bounded reconciliation and a nonterminal stop; it does not confirm the hold.
+Deploy the API fully before workers; API rollback remains unsupported. See the
+[ADR-1197 #3527 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-27-3527-owner-held-retained-adoption-retry).
+
 Other permanent blockers end the run **failed**, keeping local work and
-custody, without automatic reclaim or failed-run Resume. Only
-`budget_exhausted` is renewable; other permanent blockers stay permanent.
-Actual quiescence failure uses `worker_residue_blocked`; a missing
-source, invalid recovery clock, preservation or adoption failure, missing
-needed prerequisites, or an oversized fallback is not a quiescence failure.
+custody, without automatic reclaim or failed-run Resume. The adoption retry
+does not clear missing source, invalid clock, preservation failure, missing
+needed prerequisites, oversized fallback or decoded-history blockers.
+Actual quiescence failure uses `worker_residue_blocked`.
 Transient capture, forge or disk failures consume the same reserved budget.
 These bounds do not change the healthy provider/empty-turn park budgets or
 the owner-only worker-recovery-exhaustion hold below.
@@ -462,7 +509,7 @@ cancelled and re-created.
 
 ## Vault locked
 
-A `recovery_wait` park can also come from your own vault: a Codex
+A `recovery_wait` park can also come from your own protected vault: a Codex
 subscription or api\_key credential refresh or release reached a locked
 owner vault. The api only answers this after the request was authorized and
 authority still held on a recheck, so it is a typed refusal, not a generic
@@ -495,8 +542,15 @@ start** until an unlocked claim succeeds. After that, it resumes where it
 left off — the resume costs at least one model turn before finalize opens
 the merge request.
 
-A vault lock while sealing a refreshed login also keeps the login protected
-for recovery. Updated workers survive a lost refresh reply: they reconcile
+Off users have no vault-unlock dependency. A successful explicit enable or
+disable also best-effort promotes existing vault parks after commit; see
+[Vault choice](./anthropic-token.md#vault-choice).
+
+A protected vault lock while sealing a refreshed login retains the successful
+provider result in the recovery slot under owner/kind-bound server-key
+sealing (`master_aad`). Current mode/epoch fences preserve that same result
+across conversion races and background persistence retries without another
+provider exchange. Updated workers survive a lost refresh reply: they reconcile
 the same operation once, then retain the work, session and custody if the
 outcome remains unknown. A confirmed vault-lock reply uses the vault park;
 an unknown outcome uses an ordinary recovery wait without claiming that the
@@ -749,6 +803,8 @@ historical-evidence rules above remain in force.
   Resume starts a new episode; Cancel ends the run. It has no automatic retry.
   `retained_recovery_exhausted` has bounded timed retries followed by an owner
   hold; see [Retained recovery exhausted](#retained-recovery-exhausted).
+  `retained_recovery_adoption_failed` instead requires owner Resume or Cancel,
+  with no automatic retry; see [Retained recovery adoption failed](#retained-recovery-adoption-failed).
 - `limit_wait`: a usage-limit window must reset. See
   [Paused on a usage limit](run-limit-wait.md).
 - `pool_wait`: no token is available in the selected pool. It needs an

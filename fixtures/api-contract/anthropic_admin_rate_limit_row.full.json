@@ -1,0 +1,30 @@
+{
+  "id": "x",
+  "email": "x",
+  "name": "x",
+  "vault_mode": "x",
+  "vault_locked": true,
+  "tokens": [
+    {
+      "secret_id": "x",
+      "label": "x",
+      "is_default": true,
+      "auto_eligible": true,
+      "auto_status": "x",
+      "limits": {
+        "status": "x",
+        "five_hour": {
+          "pct": 1,
+          "resets_at": 1
+        },
+        "seven_day": {
+          "pct": 1,
+          "resets_at": 1
+        },
+        "source": "x",
+        "synced_at": "x",
+        "stale": true
+      }
+    }
+  ]
+}

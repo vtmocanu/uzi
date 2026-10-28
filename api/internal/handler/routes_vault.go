@@ -21,6 +21,8 @@ func (h *Handler) mountVaultRoutes(r chi.Router, authLimiter *mw.Limiter) {
 		})
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.With(authLimiter.PerUserMiddleware).Post("/enable", h.VaultEnable)
+			r.With(authLimiter.PerUserMiddleware).Post("/disable", h.VaultDisable)
 			// Create-only passphrase for passwordless (OIDC) users (PRD #45).
 			// Lock and passphrase creation remain cookie-only.
 			r.With(authLimiter.PerUserMiddleware).Post("/passphrase", h.VaultPassphrase)

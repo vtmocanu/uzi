@@ -11,9 +11,11 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 type linkedProbeStore struct {
+	epoch int64
 	Store
 	account store.CodexProviderAccount
 	reads   int
@@ -23,6 +25,11 @@ func (f *linkedProbeStore) GetCodexProviderAccountByID(_ context.Context, _ stor
 	f.reads++
 	return f.account, nil
 }
+func (f *linkedProbeStore) GetCodexProviderAccountSnapshot(ctx context.Context, arg store.GetCodexProviderAccountSnapshotParams) (store.GetCodexProviderAccountSnapshotRow, error) {
+	acct, err := f.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams(arg))
+	return store.GetCodexProviderAccountSnapshotRow{CodexProviderAccount: acct, VaultEpoch: f.epoch}, err
+}
+
 func (*linkedProbeStore) CountEnabledLinkedAliasesForCodexAccount(context.Context, store.CountEnabledLinkedAliasesForCodexAccountParams) (int64, error) {
 	return 1, nil
 }
@@ -66,7 +73,7 @@ func TestCodexLinkedProbeUnit(t *testing.T) {
 				SealedLogin: sealed, SealedWith: store.SealedWithMaster,
 				ProviderUserID: "user", WorkspaceAccountID: "workspace",
 			}}
-			svc := &Service{q: q, box: box}
+			svc := newOffModeService(q, box, Params{})
 			calls := 0
 			reader := linkedProbeReader(func(_ context.Context, token, workspace string) (codexauth.UsageReading, error) {
 				calls++
@@ -81,6 +88,65 @@ func TestCodexLinkedProbeUnit(t *testing.T) {
 			}
 			if q.account.ReauthRequired {
 				t.Fatal("reauth changed")
+			}
+		})
+	}
+}
+
+func TestCodexLinkedProbeVaultMode(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, coord, wantStatus, wantReason string
+		unlocked                                  bool
+		wantCalls                                 int
+	}{
+		{name: "off uncached", mode: store.VaultModeUnprotected, coord: codexCoordIdle, wantStatus: "ok", wantCalls: 1},
+		{name: "protected locked", mode: store.VaultModeProtected, coord: codexCoordIdle, wantStatus: "inconclusive", wantReason: "vault_locked"},
+		{name: "protected unlocked", mode: store.VaultModeProtected, coord: codexCoordIdle, unlocked: true, wantStatus: "ok", wantCalls: 1},
+		{name: "off quarantine", mode: store.VaultModeUnprotected, coord: codexCoordQuarantined, wantStatus: "inconclusive", wantReason: "generic"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			uid, aid := uuid.New(), uuid.New()
+			box := newBox(t)
+			m := newMemVaultStore()
+			m.states[uid] = store.LockVaultAuthStateRow{VaultMode: tc.mode}
+			v := newMemoryVault(box, m)
+			if tc.unlocked {
+				if err := v.Unlock(ctx, uid, "probe-fixture-password"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Capture the epoch when sealing protected material, after Unlock.
+			raw, err := json.Marshal(codexLoginBlob{AccessToken: "access", RefreshToken: "renewal"}) //nolint:gosec // G117: synthetic credential fixture
+			if err != nil {
+				t.Fatal(err)
+			}
+			sealed, err := box.Seal(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			marker, epoch := store.SealedWithMaster, int64(0)
+			if tc.unlocked {
+				material, serr := v.Seal(ctx, uid, store.KindCodexAuth, raw, vault.SealForUse)
+				if serr != nil {
+					t.Fatal(serr)
+				}
+				sealed, marker, epoch = material.Ciphertext, material.SealedWith, material.Epoch
+			}
+			q := &linkedProbeStore{epoch: epoch, account: store.CodexProviderAccount{
+				UserID: uid, ID: aid, CoordState: tc.coord,
+				SealedLogin: sealed, SealedWith: marker,
+				ProviderUserID: "user", WorkspaceAccountID: "workspace",
+			}}
+			svc := &Service{q: q, box: box, vlt: v}
+			calls := 0
+			reader := linkedProbeReader(func(context.Context, string, string) (codexauth.UsageReading, error) {
+				calls++
+				return codexauth.UsageReading{UserID: "user"}, nil
+			})
+			status, reason := svc.TestCodexLinkedAccount(ctx, uid, aid, reader)
+			if status != tc.wantStatus || reason != tc.wantReason || calls != tc.wantCalls {
+				t.Fatalf("status=%s reason=%s calls=%d", status, reason, calls)
 			}
 		})
 	}

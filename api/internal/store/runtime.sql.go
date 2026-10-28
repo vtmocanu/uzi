@@ -15044,22 +15044,23 @@ func (q *Queries) ParkRunForgeUnreachable(ctx context.Context, arg ParkRunForgeU
 
 const parkRunRetainedRecovery = `-- name: ParkRunRetainedRecovery :one
 UPDATE runs SET status='recovery_wait', status_since=now(), updated_at=now(),
- recovery_wait_cause='retained_recovery_exhausted',
+ recovery_wait_cause = $1::text,
  recovery_wait_count=recovery_wait_count+1,
- retained_park_count=retained_park_count+CASE WHEN $1::boolean THEN 1 ELSE 0 END,
- recovery_retry_not_before=$2::timestamptz,
- session_id=COALESCE($3::text, session_id),
- checkpoint_contains_latest=$4::boolean,
+ retained_park_count=retained_park_count+CASE WHEN $2::boolean THEN 1 ELSE 0 END,
+ recovery_retry_not_before=$3::timestamptz,
+ session_id=COALESCE($4::text, session_id),
+ checkpoint_contains_latest=$5::boolean,
  claim_released_at=now(),
  health='ok', health_reason=NULL, health_since=NULL
-WHERE id = $5 AND worker_id = $6 AND status='running'
- AND claim_generation = $7::bigint AND $7::bigint > 0
+WHERE id = $6 AND worker_id = $7 AND status='running'
+ AND claim_generation = $8::bigint AND $8::bigint > 0
  AND claim_released_at IS NULL AND COALESCE(stop_kind, '')=''
  AND kind IN ('issue','ci_fix','self_improve','prompt','task','mr_rework')
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates, retained_park_count, ignored_inferred_capabilities, reserve_hold_reason, reserve_exempt_until, reserve_exempt_granted_at, reserve_exempt_credential_id, reserve_exempt_window_reset, reserve_exempt_prior_pct, hinted_capabilities, capability_inference_evidence, idle_stall_park_count
 `
 
 type ParkRunRetainedRecoveryParams struct {
+	RecoveryCause            string             `json:"recovery_cause"`
 	Counted                  bool               `json:"counted"`
 	RetryNotBefore           pgtype.Timestamptz `json:"retry_not_before"`
 	SessionID                pgtype.Text        `json:"session_id"`
@@ -15072,6 +15073,7 @@ type ParkRunRetainedRecoveryParams struct {
 // Called under GetRunOwnedByWorkerForUpdate. Execution release is not custody release.
 func (q *Queries) ParkRunRetainedRecovery(ctx context.Context, arg ParkRunRetainedRecoveryParams) (Run, error) {
 	row := q.db.QueryRow(ctx, parkRunRetainedRecovery,
+		arg.RecoveryCause,
 		arg.Counted,
 		arg.RetryNotBefore,
 		arg.SessionID,
@@ -15889,6 +15891,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted'
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -15944,6 +15947,7 @@ WHERE runs.id = $1 AND runs.user_id = $2 AND runs.status = 'recovery_wait'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted'
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
@@ -15990,6 +15994,7 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.status = 'recovery_wait' AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
   AND runs.recovery_retry_not_before <= $1
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -16042,6 +16047,7 @@ UPDATE runs SET
 WHERE runs.status = 'recovery_wait' AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
   AND runs.recovery_retry_not_before <= $1
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
@@ -18838,7 +18844,7 @@ const resumeWorkerRecoveryEpisode = `-- name: ResumeWorkerRecoveryEpisode :one
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = $1 AND runs.user_id = $2
-  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted')
+  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
        OR (COALESCE(runs.budget_wall_seconds, $3::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
@@ -18887,7 +18893,7 @@ UPDATE runs SET
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
                ELSE 0 END,
     -- Retained recovery preserves affinity even though its execution claim is released.
-    worker_id = CASE WHEN runs.claim_released_at IS NOT NULL AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted' THEN NULL ELSE runs.worker_id END,
+    worker_id = CASE WHEN runs.claim_released_at IS NOT NULL AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted' AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed' THEN NULL ELSE runs.worker_id END,
     hold_reason = NULL,
     hold_captured_head = NULL,
     worker_recovery_episode = runs.worker_recovery_episode + 1,
@@ -18898,7 +18904,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at            = now()
 WHERE runs.id = $1 AND runs.user_id = $2
-  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted')
+  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')
   -- Honor the wall sweep's chat/judge/interactive exemptions; timed runs still need remaining budget.
   -- Extending does not itself release this hold; checker parent/deadline guards below still apply.
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL

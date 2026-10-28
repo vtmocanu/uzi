@@ -620,13 +620,16 @@ func (n *fakeNotifier) Notify(_ context.Context, notif notifysvc.Notification) (
 	return store.Notification{}, nil
 }
 
-// fakeVault satisfies VaultGate (PRD #590 M1): unlocked controls the self_improve vault
-// gate. For the PRD #890 M2 vault-lock reconciler, unlockedSet (when non-nil) overrides the
-// bool per user so a test can mark one user unlocked (the seed-admin skip) and others locked;
-// a nil unlockedSet preserves the original "same for everyone" behavior self_improve relies on.
+// fakeVault keeps raw cache presence separate from Off mode. Existing fixtures default
+// to protected; unlockedSet overrides cache presence per owner when non-nil.
 type fakeVault struct {
-	unlocked    bool
-	unlockedSet map[uuid.UUID]bool
+	unlocked        bool
+	unlockedSet     map[uuid.UUID]bool
+	unprotectedMode bool
+}
+
+func (v *fakeVault) RequiresUnlock(_ context.Context, id uuid.UUID) bool {
+	return !v.unprotectedMode && !v.Unlocked(id)
 }
 
 func (v *fakeVault) Unlocked(id uuid.UUID) bool {

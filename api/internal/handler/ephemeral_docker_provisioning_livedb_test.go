@@ -15,6 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -339,6 +340,7 @@ func TestEphemeralDockerWarmStepAsideLiveDB(t *testing.T) {
 	_, probe := fx.dockerProvisioner(true, true, true, 2, false)
 	p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute, DockerEnabled: true, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour})
 	svc := workersvc.New(fx.q, fx.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), WorkerHeartbeatStale: time.Minute, WorkerAffinityCeiling: time.Minute})
+	svc.SetVault(vault.NewPostgres(fx.box, fx.pool))
 	svc.SetTxBeginner(fx.pool)
 	svc.SetEphemeralLease(2 * time.Hour)
 	svc.SetDockerAllowlist(probe)

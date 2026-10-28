@@ -13,13 +13,13 @@ import { useAuth } from "../auth/AuthContext";
 import { api } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
-import { Alert, Button, Card, SectionTitle } from "../components/ui";
+import { Alert, Card, SectionTitle } from "../components/ui";
 import { AnthropicTokens } from "../components/AnthropicTokens";
 import { CodexCredentials } from "../components/CodexCredentials";
 import { SettingsShell } from "../components/SettingsShell";
 import { RateLimitCard } from "../components/RateLimitMeters";
 import { CodexRateLimitCard } from "../components/CodexRateLimitMeters";
-import { VaultBadge, useVaultLock } from "../components/VaultControls";
+import { VaultSettings, VaultIntroduction } from "../components/VaultSettings";
 import { SlackNotifications } from "../components/SlackNotifications";
 import { prefs } from "../lib/prefs";
 import { emitSidebarTokensChanged } from "../lib/sidebarTokens";
@@ -30,13 +30,7 @@ import { maskEmail, maskName } from "../lib/demoMask";
 const ROTATE_NOTICE_KEY = "uzi.vault.rotateNoticeDismissed";
 
 export function Settings() {
-  const { user, vaultUnlocked } = useAuth();
-  const [vaultNotice, setVaultNotice] = useState("");
-  const { lock, locking } = useVaultLock(() =>
-    setVaultNotice(
-      "Vault locked. Runs already in flight finish; your new runs wait as “waiting for vault unlock” until you unlock again.",
-    ),
-  );
+  const { user, vaultMode } = useAuth();
   const [rotateDismissed, setRotateDismissed] = useState(() => prefs.get(ROTATE_NOTICE_KEY, false));
   const dismissRotate = () => {
     prefs.set(ROTATE_NOTICE_KEY, true);
@@ -126,6 +120,8 @@ export function Settings() {
       {(loadError || error) && <Alert message={loadError || error} />}
       {notice && <Alert tone="success" message={notice} />}
 
+      <VaultIntroduction key={user?.id} />
+
       <AnthropicTokens
         secrets={secrets}
         loading={loading}
@@ -153,6 +149,7 @@ export function Settings() {
           no subscription account is linked (an API-key-only default supplies none). The
           "Show in sidebar and TUI" checkboxes write sidebar_codex_account_ids. */}
       <CodexRateLimitCard
+        vaultMode={vaultMode}
         sidebarAccountIds={sidebarCodexAccountIds}
         onToggleSidebarAccount={toggleSidebarCodexAccount}
         busy={busy}
@@ -160,7 +157,7 @@ export function Settings() {
 
       {/* The rotate-your-legacy-token reminder (PRD #32): password protection
           applies from the save forward, never retroactively. */}
-      {secrets.length > 0 && !rotateDismissed && (
+      {vaultMode !== "unprotected" && secrets.length > 0 && !rotateDismissed && (
         <div className="rounded-lg border border-info/40 bg-info/10 px-4 py-3 text-sm text-info">
           <p className="text-fg">
             <strong className="font-semibold">Protecting an older token?</strong> If you first saved
@@ -182,33 +179,7 @@ export function Settings() {
           set, greyed on "unavailable", live meters once a reading lands. */}
       <RateLimitCard allDisabled={secrets.length > 0 && secrets.every((s) => s.enabled === false)} />
 
-      <Card className="space-y-4">
-        <div>
-          <SectionTitle>Vault</SectionTitle>
-          <p className="mt-2 text-sm text-muted">
-            Your Anthropic token is sealed with a key derived from your login password, so it is
-            readable only while your vault is unlocked in this session. It unlocks
-            automatically when you log in and stays unlocked — including overnight — until you lock it
-            or the server restarts. While locked, your agents pause: new runs wait as{" "}
-            <em>waiting for vault unlock</em> rather than failing.
-          </p>
-        </div>
-
-        {/* Info (not success/green): locking flips the badge amber, so a green
-            "success" toast would clash with the color language. */}
-        {vaultNotice && <Alert tone="info" message={vaultNotice} />}
-
-        <div className="flex items-center justify-between rounded-lg border border-edge bg-raised/60 px-4 py-3">
-          <VaultBadge />
-          {vaultUnlocked ? (
-            <Button variant="secondary" size="sm" disabled={locking} onClick={lock}>
-              {locking ? "Locking…" : "Lock vault"}
-            </Button>
-          ) : (
-            <span className="text-sm text-muted">Locked — unlock from the banner above.</span>
-          )}
-        </div>
-      </Card>
+      <VaultSettings onChanged={reload} />
 
       <SlackNotifications />
 

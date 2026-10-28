@@ -16,9 +16,10 @@ import (
 // shape/cap validation, ownership-drop, epoch ordering, nonce checks, the heartbeat-ignore vs
 // claim-sentinel split, and the terminal-pending / pending_overflow lease stamping.
 
-// snapshotSvc builds a Service wired with the pool as its tx beginner and the given params.
+// snapshotSvc builds a Service with the live vault, pool tx beginner and given params.
 func snapshotSvc(env codexTestEnv, p Params) *Service {
 	svc := New(env.q, env.box, p)
+	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
 	return svc
 }

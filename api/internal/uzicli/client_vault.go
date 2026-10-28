@@ -9,7 +9,8 @@ import (
 
 // VaultStatusResult is the caller's current vault state.
 type VaultStatusResult struct {
-	Unlocked bool `json:"unlocked"`
+	Unlocked bool   `json:"unlocked"`
+	Mode     string `json:"mode,omitempty"`
 }
 
 // ErrVaultIncorrectPassword marks a trusted wrong-password response.

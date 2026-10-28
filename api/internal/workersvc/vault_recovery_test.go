@@ -8,7 +8,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 func TestPromoteVaultLockedRecoveryWaitRunsGuards(t *testing.T) {
@@ -26,7 +25,7 @@ func TestPromoteVaultLockedRecoveryWaitRunsGuards(t *testing.T) {
 			var want error
 			switch mode {
 			case "locked":
-				svc.SetVault(vault.New(box, newMemVaultStore()))
+				svc.SetVault(newMemoryVault(box, newMemVaultStore()))
 			case "foreign-unlocked":
 				svc.SetVault(unlockedVault(t, uuid.New(), box))
 			case "cancelled", "expired":
@@ -54,7 +53,7 @@ func TestPromoteVaultLockedRecoveryWaitRunsGuards(t *testing.T) {
 }
 
 func TestPromoteVaultLockedRecoveryWaitRunsQueryPublication(t *testing.T) {
-	for _, mode := range []string{"success", "empty", "error", "cancelled-query"} {
+	for _, mode := range []string{"success", "off-uncached", "empty", "error", "cancelled-query"} {
 		t.Run(mode, func(t *testing.T) {
 			uid := uuid.New()
 			box := newBox(t)
@@ -96,7 +95,13 @@ func TestPromoteVaultLockedRecoveryWaitRunsQueryPublication(t *testing.T) {
 				return rows, nil
 			}}
 			svc := New(fs, box, testParams())
-			svc.SetVault(unlockedVault(t, uid, box))
+			if mode == "off-uncached" {
+				m := newMemVaultStore()
+				m.states[uid] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected}
+				svc.SetVault(newMemoryVault(box, m))
+			} else {
+				svc.SetVault(unlockedVault(t, uid, box))
+			}
 			svc.SetBroadcaster(bc)
 			svc.SetLifecycle(lc)
 			err := svc.PromoteVaultLockedRecoveryWaitRuns(ctx, uid)
@@ -106,7 +111,7 @@ func TestPromoteVaultLockedRecoveryWaitRunsQueryPublication(t *testing.T) {
 			if !errors.Is(queryCtx.Err(), context.Canceled) {
 				t.Fatalf("child context was not cancelled on return: %v", queryCtx.Err())
 			}
-			if mode != "success" {
+			if mode != "success" && mode != "off-uncached" {
 				if len(bc.states) != 0 || len(lc.notes) != 0 {
 					t.Fatalf("unsuccessful/empty query published states=%v notes=%v", bc.states, lc.notes)
 				}

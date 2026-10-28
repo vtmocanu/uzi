@@ -99,7 +99,7 @@ func TestCompletionNonClosingClaimWire(t *testing.T) {
 				ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com", BotUsername: "uzi-bot", TokenCiphertext: pat,
 			},
 		}
-		svc := New(fs, box, testParams())
+		svc := newOffModeService(fs, box, testParams())
 		payload, err := svc.Claim(context.Background(), worker(), nil)
 		if err != nil || payload == nil {
 			t.Fatalf("Claim=%+v err=%v", payload, err)

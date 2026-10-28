@@ -144,6 +144,9 @@ const (
 	// A whole number in [1, maxCustodyHoldLimit], validated by validateCustodyHoldLimit; there
 	// is no zero-as-disable. Read only through Cache.CustodyHoldLimit, which fails closed.
 	KeyCustodyHoldLimit = "custody_hold_limit"
+
+	// KeyVaultPolicy is DB-only; admission uses store.GetVaultPolicy under its lock.
+	KeyVaultPolicy = "vault_policy"
 	// Docker-worker repo allowlist (PRD #89 M-allow): the set of repos a
 	// docker-enabled worker is permitted to CLAIM runs for. Stored as a
 	// comma-separated list of repo UUIDs. This is the accepted-risk likelihood
@@ -398,6 +401,7 @@ const (
 	// the workers service; every custody-admission consumer reads it through
 	// Cache.CustodyHoldLimit.
 	DefaultCustodyHoldLimit = "8"
+	DefaultVaultPolicy      = "required"
 	// PRD #89 M-allow: the docker repo allowlist is EMPTY by default, which the claim
 	// gate reads as fail-closed — a docker worker claims no repo-bearing run until an
 	// admin lists the trusted repos. Empty is the safe default precisely because this
@@ -547,6 +551,7 @@ var Defaults = map[string]string{
 	KeyJobMaxActivePerUser: DefaultJobMaxActivePerUser,
 	// #3150 per-owner custody admission limit. Same no-seeded-row pattern: unset reads as 8.
 	KeyCustodyHoldLimit: DefaultCustodyHoldLimit,
+	KeyVaultPolicy:      DefaultVaultPolicy,
 	// PRD #89 M-allow docker repo allowlist. Same no-seeded-row pattern: an absent
 	// row synthesizes to the empty (fail-closed) default, so All/AdminView surface it
 	// to the settings page on every instance and no migration seeds it.

@@ -2,6 +2,7 @@
   "id": "x",
   "email": "x",
   "name": "x",
+  "vault_mode": "x",
   "vault_locked": true,
   "accounts": [
     {

@@ -258,14 +258,14 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			for _, rl := range rls {
 				if len(rl.Tokens) == 0 {
 					rows = append(rows, []string{
-						rl.Email, vaultCell(rl.VaultLocked), "-", "no_enabled_token", "-", "-",
+						rl.Email, vaultCell(rl.VaultMode, rl.VaultLocked), "-", "no_enabled_token", "-", "-",
 					})
 					continue
 				}
 				for _, tk := range rl.Tokens {
 					rows = append(rows, []string{
 						rl.Email,
-						vaultCell(rl.VaultLocked),
+						vaultCell(rl.VaultMode, rl.VaultLocked),
 						tokenCell(tk.Label, tk.IsDefault),
 						tk.Limits.Status,
 						windowPct(tk.Limits.FiveHour),
@@ -962,7 +962,10 @@ func sinceLastFailure(o apitypes.RunOutcomesDTO, now time.Time) string {
 	return fmt.Sprintf("%dd", minutes/1440)
 }
 
-func vaultCell(locked bool) string {
+func vaultCell(mode string, locked bool) string {
+	if mode == "unprotected" {
+		return "off"
+	}
 	if locked {
 		return "locked"
 	}

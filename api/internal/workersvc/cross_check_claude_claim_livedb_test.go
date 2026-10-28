@@ -80,6 +80,7 @@ func newClaudeCheckerFix(t *testing.T, bindMode string) *claudeCheckerFix {
 		VALUES ($1,'plan',1,1,$2,$3,'s',$4,$5,$6,$7,'claude',now()+interval '30 minutes',now()-interval '90 seconds')`,
 		fx.lead, c.PlanMd, c.Milestones, c.BaseCommit, c.PlanningDiff, digest, fx.kid)
 	fx.svc = New(env.q, env.box, testParams())
+	fx.svc.SetVault(env.vlt)
 	fx.svc.SetTxBeginner(env.pool)
 	return fx
 }

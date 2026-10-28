@@ -11,13 +11,19 @@ import (
 // recovery parks after an explicit successful unlock. The timer remains the fallback
 // for parks that arrive after this query.
 func (s *Service) PromoteVaultLockedRecoveryWaitRuns(ctx context.Context, userID uuid.UUID) error {
-	if s.vlt == nil || !s.vlt.Unlocked(userID) {
+	if s.vlt == nil {
 		return nil
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// Lock can race between Unlocked and the UPDATE, queuing a locked run just as
+	if s.vlt.RequiresUnlock(ctx, userID) {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Lock or enable can race with the UPDATE, queuing a locked run just as
 	// the timer does. Service.Claim returns idle until the owner unlocks again.
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

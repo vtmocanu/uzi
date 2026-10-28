@@ -60,7 +60,7 @@ func TestGetSettingsSecretShape(t *testing.T) {
 		{Key: settings.KeySlackBotToken, Value: sealed},
 	}}, time.Minute)
 	cache.ConfigureSecrets(box, nil)
-	h := &Handler{settings: cache}
+	h := &Handler{q: store.New(fakeCountDB{}), settings: cache}
 
 	rec := httptest.NewRecorder()
 	h.GetSettings(rec, httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil))
@@ -105,7 +105,7 @@ func TestGetSettingsReportsSlackStatus(t *testing.T) {
 	cache.ConfigureSecrets(slackTestBox(t), nil)
 
 	// Default (no manager wired) → disabled.
-	h := &Handler{settings: cache}
+	h := &Handler{q: store.New(fakeCountDB{}), settings: cache}
 	rec := httptest.NewRecorder()
 	h.GetSettings(rec, httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil))
 	var resp struct {
@@ -171,7 +171,7 @@ func TestUpdateSettingsRejectsEnvSourcedSecretKey(t *testing.T) {
 // the token — even a poorly-behaved error that embeds it.
 func TestUpdateSettingsLiveValidationScrubsToken(t *testing.T) {
 	admin := adminUser()
-	const token = "xoxb-realtoken-SECRETVALUE"
+	const token = "xoxb-realtoken-SECRETVALUE" //nolint:gosec // G101: synthetic fixture checks that validation errors redact submitted tokens.
 	fake := &fakeSlackValidator{botErr: errors.New("boom " + token + " boom")}
 	cache := settings.New(&settingsStore{}, time.Minute)
 	cache.ConfigureSecrets(slackTestBox(t), nil)

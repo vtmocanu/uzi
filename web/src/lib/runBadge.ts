@@ -163,6 +163,7 @@ const PARK_LABELS = {
   codex_idle_stall_unknown: "Codex idle stall timing unknown",
   retained_recovery_retrying: "retained recovery retrying",
   retained_recovery_held: "retained recovery needs decision",
+  retained_recovery_adoption_failed: "retained recovery integrity hold",
   retained_recovery_unknown: "retained recovery timing unknown",
   worker_requeue_exhausted: "recovery needs decision",
   worker_memory_pressure: "memory pressure: owner hold",
@@ -238,6 +239,8 @@ export function effectiveRunStatus(
   // and the board card's LatestRun (the server's board projection sends hold_reason on every
   // card, so runBadge meets this key too).
   if (run.status === "paused" && run.hold_reason === "credential_disabled") return "credential_disabled";
+  // Integrity refusal is always owner-held, even if a malformed DTO carries a retry stamp.
+  if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_adoption_failed") return "retained_recovery_adoption_failed";
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_exhausted") {
     // Only explicit null means owner-held. Omitted or invalid timing stays unknown.
     if (run.recovery_retry_not_before === null) return "retained_recovery_held";
@@ -389,7 +392,7 @@ export function runStatusTone(
   if (status === "pool_wait") return "warning";
   // Recovery holds use warning: transient recovery and worker exhaustion are
   // non-terminal, though exhaustion requires an owner decision.
-  if (status === "codex_idle_stall_retrying" || status === "codex_idle_stall_held" || status === "codex_idle_stall_unknown" || status === "retained_recovery_retrying" || status === "retained_recovery_held" || status === "retained_recovery_unknown" || status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure") return "warning";
+  if (status === "retained_recovery_adoption_failed" || status === "codex_idle_stall_retrying" || status === "codex_idle_stall_held" || status === "codex_idle_stall_unknown" || status === "retained_recovery_retrying" || status === "retained_recovery_held" || status === "retained_recovery_unknown" || status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure") return "warning";
   // PRD #1190: an ordinary paused run. INFO, not the warn the involuntary holds carry
   // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
   // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
@@ -811,6 +814,11 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
         title:
           "Waiting for a pooled Anthropic token. It resumes automatically once one is added to the pool.",
       };
+    case "retained_recovery_adoption_failed":
+      return {
+        kind: "badge", label: PARK_LABELS.retained_recovery_adoption_failed, tone: "warning", pulse: false,
+        title: "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. Only the run owner can Resume or Cancel; there is no scheduled retry.",
+      };
     case "codex_idle_stall_retrying":
     case "codex_idle_stall_held":
     case "codex_idle_stall_unknown":
@@ -1124,6 +1132,7 @@ export function needsHumanAttention(status: string): boolean {
     isAwaitingFollowup(status) ||
     status === "codex_idle_stall_held" ||
     status === "retained_recovery_held" ||
+    status === "retained_recovery_adoption_failed" ||
     status === "worker_requeue_exhausted" ||
     status === "worker_memory_pressure" ||
     status === "provider_unavailable" ||

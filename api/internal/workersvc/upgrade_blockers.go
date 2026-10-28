@@ -126,7 +126,7 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 				return fmt.Sprintf("automatic retry not before %s; recorded cause %s; owner may inspect or Resume", blockerTime(r.RecoveryRetryNotBefore), cause)
 			}
 			return fmt.Sprintf("recorded cause %s; owner reviews retained recovery and chooses Resume; no timer", cause)
-		case "worker_requeue_exhausted":
+		case "worker_requeue_exhausted", recoveryCauseRetainedRecoveryAdoptionFailed:
 			return fmt.Sprintf("recorded cause %s; owner reviews recovery evidence and chooses Resume; no timer", cause)
 		}
 		action := "owner action if needed: inspect run"

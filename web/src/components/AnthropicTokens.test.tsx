@@ -666,3 +666,5 @@ describe("AnthropicTokens", () => {
     expect(seen[0]).not.toMatch(/pool/i);
   });
 });
+
+vi.mock("../auth/AuthContext", () => ({ useAuth: () => ({ vaultMode: "protected", hasPassword: true }) }));

@@ -96,7 +96,7 @@ func (f *fakeStore) GetAnthropicTokenToPoll(_ context.Context, arg store.GetAnth
 			return store.GetAnthropicTokenToPollRow{
 				ID: r.ID, UserID: r.UserID, Ciphertext: r.Ciphertext, SealedWith: r.SealedWith,
 				NotifyEarlyLimitReset: f.notify[r.UserID], EnablementRev: f.rev[r.ID],
-				AnthropicSuccessGeneration: f.generation[r.ID],
+				AnthropicSuccessGeneration: f.generation[r.ID], VaultEpoch: r.VaultEpoch,
 			}, nil
 		}
 	}
@@ -196,7 +196,7 @@ func (f *fakeOpener) resolve(userID uuid.UUID) ([]byte, error) {
 	}
 	return []byte("token"), nil
 }
-func (f *fakeOpener) OpenSealed(userID uuid.UUID, _ string, _ string, _ []byte) ([]byte, error) {
+func (f *fakeOpener) OpenSealedAtEpoch(_ context.Context, userID uuid.UUID, _ string, _ string, _ []byte, _ int64) ([]byte, error) {
 	return f.resolve(userID)
 }
 
@@ -497,7 +497,7 @@ func (m *multiTokenStore) ListAnthropicTokensToPoll(context.Context) ([]store.Li
 }
 func (m *multiTokenStore) GetAnthropicTokenToPoll(context.Context, store.GetAnthropicTokenToPollParams) (store.GetAnthropicTokenToPollRow, error) {
 	r := m.rows[0]
-	return store.GetAnthropicTokenToPollRow{ID: r.ID, UserID: r.UserID, Ciphertext: r.Ciphertext, SealedWith: r.SealedWith}, nil
+	return store.GetAnthropicTokenToPollRow(r), nil
 }
 func (m *multiTokenStore) UpsertRateLimits(_ context.Context, arg store.UpsertRateLimitsParams) (int64, error) {
 	m.mu.Lock()
@@ -613,7 +613,7 @@ func TestPerTokenBackoffIsolation(t *testing.T) {
 // test's client can tell the tokens apart by their bytes.
 type passthroughOpener struct{}
 
-func (passthroughOpener) OpenSealed(_ uuid.UUID, _, _ string, ciphertext []byte) ([]byte, error) {
+func (passthroughOpener) OpenSealedAtEpoch(_ context.Context, _ uuid.UUID, _, _ string, ciphertext []byte, _ int64) ([]byte, error) {
 	return ciphertext, nil
 }
 

@@ -62,6 +62,7 @@ func (f judgeLaneFixture) claim(t *testing.T, harness string, userClaude, userCo
 	          VALUES ($1, $2, 'judge', $3, 'Judge of run', '', 'claimed', $4, 'judge', $5)`,
 		judgeID, f.userID, target, f.workerID, harness)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	svc.SetSettings(settings.New(env.q, time.Minute))
 	if harness == "codex" {
 		if err := svc.FreezeCodexBinding(env.ctx, f.userID, judgeID, f.aliasID, codexAuthModeSubscription); err != nil {

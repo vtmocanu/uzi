@@ -49,9 +49,15 @@
 say "PRD #95: steer-queue delivery — Queued → Received on consume, no run_message, no forge/token"
 STEER_MRS_BEFORE="$(fake_state | jq '.mrs | length')"
 
+# Bootstrap explicitly enrolled the seed admin. Off has unlocked=false too,
+# so establish protection before treating a lock as a claim barrier.
+apiget /api/vault/status | jq -e '.mode == "protected" and .policy == "required" and .exists == true and .unlocked == true' >/dev/null \
+  || fail "steer queue requires the explicitly protected, unlocked seed admin"
+# One bounded recovery request on failure; the driver still detects leaked runs.
+trap 'curl --max-time 15 -fsS -b "$JAR" -X POST "$BASE/api/vault/unlock" -H "Content-Type: application/json" -H "X-CSRF-Token: $(csrf)" -d "{\"password\":\"$ADMIN_PASS\"}" >/dev/null 2>&1 || true' EXIT
 # Lock FIRST: the run must be un-claimable from the instant it exists.
 apipost /api/vault/lock '' >/dev/null
-[ "$(apiget /api/auth/me | jq -r '.vault.unlocked')" = false ] \
+apiget /api/vault/status | jq -e '.mode == "protected" and .exists == true and .unlocked == false' >/dev/null \
   || fail "PRD #95: the vault must lock before the steer run is created — without it the Queued read below is a ~500ms race, not an assertion"
 
 IID_S="$(apipost "/api/repos/$REPO_ID/issues" \
@@ -96,8 +102,9 @@ pass "follow_up submitted: write returned the row (id=$STEER_ID); Queued is STAB
 # awaiting_approval — Received, S3 flavor. Everything from here is the ORIGINAL
 # assertion set, driven by the real worker poll.
 apipost /api/vault/unlock "{\"password\":\"$ADMIN_PASS\"}" >/dev/null
-[ "$(apiget /api/auth/me | jq -r '.vault.unlocked')" = true ] \
+apiget /api/vault/status | jq -e '.mode == "protected" and .exists == true and .unlocked == true' >/dev/null \
   || fail "PRD #95: the vault must be unlocked again — later phases (and the dedicated PRD #32 phase) assume an unlocked admin vault"
+trap - EXIT  # explicit unlock confirmed; avoid another password derivation on success
 wait_status "$RUN_S" awaiting_approval
 wait_eq received 30 "run $RUN_S follow-up receipt" run_input_delivery "$RUN_S"
 DLV="$(apiget "/api/runs/$RUN_S/inputs")"

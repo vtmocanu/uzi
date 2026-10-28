@@ -291,3 +291,13 @@ func TestVaultUnlockDoubleSanitization(t *testing.T) {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, out, stderr)
 	}
 }
+
+// The new vault-mode API must not make main's recently added CLI report an
+// opted-out owner as locked. Missing mode retains older-server behavior.
+func TestVaultStatusUnprotected(t *testing.T) {
+	f := &uzicli.FakeClient{VaultLocked: true, VaultMode: "unprotected"}
+	out, stderr, code := runCLI(t, fakeEnv(f), "--url", "https://example.com", "vault", "status")
+	if code != 0 || out != "off\n" || stderr != "" {
+		t.Fatalf("off status: code=%d stdout=%q stderr=%q", code, out, stderr)
+	}
+}

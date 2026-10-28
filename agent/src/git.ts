@@ -41,6 +41,8 @@ import {
   parseRetainedArtifactName,
 } from "./attempt-path.js";
 import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
+import { ownerGrant, ownerJournalBeforeMatches, ownerJournalMatches, RecoveryChargeInterruptedError, ownerReservation, parseRecoveryOwner, sameOwnerReservation, type RecoveryOwnerRecord } from "./recovery-owner.js";
+export { RecoveryChargeInterruptedError } from "./recovery-owner.js";
 import { sanitizeForLog } from "./run-quiescence.js";
 import { RECOVERY_DECODED_LIMIT, validateRecoveryDecodedLimitBytes, RecoveryClosureLimitError, verifyClosureFrames, type ClosureBudget, type ClosureObject } from "./recovery-closure.js";
 import { REASON_WORKER_RESIDUE_BLOCKED, RetainedStoppedSourceError, RunResidueBlockedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen, residueQuarantine } from "./residue-quarantine.js";
@@ -7162,14 +7164,83 @@ export class GitCache {
     return true;
   }
 
+  // Path alone, or path plus inode, cannot distinguish a replacement filesystem.
+  // Retain the full binding for execution grants; preservation-only rehold does
+  // not use owner accounting as authority.
+  private async recoveryOwnerBareIdentity(barePath: string): Promise<string> {
+    await this.assertRecoveryBare(barePath);
+    const st = await this.retainedIO(() => fs.lstat(barePath));
+    return JSON.stringify([barePath, String(st.dev), String(st.ino)]);
+  }
+
+  private async readRecoveryOwner(barePath: string, branch: string, key: string, runId: string): Promise<RecoveryOwnerRecord | undefined> {
+    recoverySource({ runId, clonePath: path.resolve(this.runnerRoot) });
+    const name = `uzi-recoveryowner.${runId}.record`;
+    const entries = (await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]))
+      .split("\0").filter(item => item === name || item.startsWith(name + "\n"));
+    if (!entries.length) return undefined;
+    if (entries.length !== 1 || !entries[0]!.startsWith(name + "\n")) throw new Error("duplicate or missing recovery owner record");
+    const record = parseRecoveryOwner(entries[0]!.slice(name.length + 1));
+    if (record.bare !== await this.recoveryOwnerBareIdentity(barePath) || record.branch !== branch ||
+        record.key !== key || record.runId !== runId) throw new Error("recovery owner binding changed");
+    return record;
+  }
+
+  private async writeRecoveryOwner(barePath: string, record: RecoveryOwnerRecord): Promise<void> {
+    const raw = JSON.stringify(record);
+    parseRecoveryOwner(raw);
+    await this.runGit(barePath, ["config", "--local", `uzi-recoveryowner.${record.runId}.record`, raw]);
+    if (JSON.stringify(await this.readRecoveryOwner(barePath, record.branch, record.key, record.runId)) !== raw)
+      throw new Error("recovery owner readback mismatch");
+  }
+
+  /** Read-only eligibility; the reservation repeats this under its lock after ownership proof. */
+  async canRenewRecoveryAdoption(barePath: string, branch: string, key: string, expected: RecoverySource,
+    claimGeneration: number | undefined, grant: number | undefined): Promise<boolean> {
+    return this.withLock(barePath, async () => {
+      const journal = await this.checkedRecovery(barePath, branch, key, expected);
+      const record = await this.readRecoveryOwner(barePath, branch, key, expected.runId);
+      return journal.recovery?.stage === "blocked" && journal.recovery.blocker === "adoption_failed" &&
+        !!record && (record.state === "committed" ? ownerJournalMatches(record, journal) :
+          ownerJournalBeforeMatches(record, journal) && (claimGeneration ?? 0) > record.after.claimGeneration) &&
+        (journal.recovery.claimGeneration ?? 0) > 0 &&
+        ownerGrant(grant) && grant > record.consumed && Number.isSafeInteger(claimGeneration) &&
+        (claimGeneration ?? 0) > Math.max(0, journal.recovery.claimGeneration ?? 0);
+    });
+  }
+
+  /** Resolve only the exact charged source/reservation, or its explicitly verified handoff.
+   * This handles a journal-root write landing before prepareRecoverySuccessor throws. */
+  async recoveryReservationSnapshot(barePath: string, branch: string, key: string,
+    expected: RecoverySource, reservation: RecoveryProgress): Promise<RecoveryJournalEntry> {
+    return this.withLock(barePath, async () => {
+      const record = await this.readRecoveryOwner(barePath, branch, key, expected.runId);
+      const journal = await this.readRecoveryCapture(barePath, branch);
+      if (!journal || !journal.recovery ||
+          JSON.stringify(journal.recovery.source) !== JSON.stringify(reservation.source) ||
+          !sameOwnerReservation(ownerReservation(journal.recovery), ownerReservation(reservation)))
+        throw new Error("recovery reservation changed");
+      if (record) {
+        const committed = record.state === "committed" && ownerJournalMatches(record, journal);
+        const blockedBefore = record.state === "pending" && ownerJournalBeforeMatches(record, journal) &&
+          journal.recovery.stage === "blocked" &&
+          (journal.recovery.blocker === "adoption_failed" || journal.recovery.blocker === "budget_exhausted");
+        if (!committed && !blockedBefore) throw new Error("recovery owner reservation changed");
+      } else if (!sameRecoverySource(journal, expected)) throw new Error("recovery identity changed");
+      await this.checkedRecovery(barePath, branch, key, journal, true);
+      return journal;
+    });
+  }
+
   /** Precharge one of three iterations before capture. Legacy journals start at zero.
    * A newer server episode with a new positive claim fence renews attempts and its five-minute
-   * window, including budget exhaustion. Other blockers are permanent. A new claim fence alone
+   * window, including budget exhaustion. Adoption failure additionally needs an unconsumed raw
+   * owner grant bound to this reservation. A new claim fence alone
    * can rebase the deadline but cannot renew attempts; callers without it keep the old window.
    * recoveryRetryMs is the existing base (1..30000ms). Returned backoff is base times
    * 2^(charged attempts - 1), capped at 16x base; caller sleeps outside lock/deadline. */
   async reserveRecoveryIteration(
-    barePath: string, branch: string, key: string, expected: RecoverySource, recoveryRetryMs = 1_000, claimGeneration?: number, episode?: number,
+    barePath: string, branch: string, key: string, expected: RecoverySource, recoveryRetryMs = 1_000, claimGeneration?: number, episode?: number, rawOwnerGrant?: number, proveOwnership?: () => Promise<void>,
   ): Promise<RecoveryProgress> {
     if (claimGeneration !== undefined && (!Number.isSafeInteger(claimGeneration) || claimGeneration < 1)) throw new Error("invalid recovery claim fence");
     if (!Number.isSafeInteger(recoveryRetryMs) || recoveryRetryMs < 1 || recoveryRetryMs > 30_000) throw new Error("invalid recovery backoff");
@@ -7180,9 +7251,28 @@ export class GitCache {
       if (old?.claimGeneration !== undefined && (claimGeneration === undefined || claimGeneration < old.claimGeneration)) {
         throw new Error("stale recovery claim fence");
       }
-      if (old?.stage === "blocked" && old.blocker !== "budget_exhausted") throw new Error("recovery episode is blocked");
+      if (old?.stage === "blocked" && old.blocker !== "budget_exhausted" && old.blocker !== "adoption_failed") throw new Error("recovery episode is blocked");
+      let owner = await this.readRecoveryOwner(barePath, branch, key, expected.runId);
+      if (owner) {
+        if (owner.state === "pending") {
+          if (ownerJournalMatches(owner, journal)) {
+            // Settle accounting only. The interrupted reservation never authorizes this call.
+            await this.writeRecoveryOwner(barePath, { ...owner, state: "committed" });
+            throw new RecoveryChargeInterruptedError();
+          }
+          if (!ownerJournalBeforeMatches(owner, journal)) throw new Error("recovery owner reservation changed");
+          if (claimGeneration === undefined || claimGeneration <= owner.after.claimGeneration || !proveOwnership)
+            throw new RecoveryChargeInterruptedError();
+          // The old grant remains consumed. Only a separately charged reservation may run.
+          await proveOwnership();
+        } else if (old && !ownerJournalMatches(owner, journal)) throw new Error("recovery owner reservation changed");
+      }
+      const adoptionRenewal = old?.stage === "blocked" && old.blocker === "adoption_failed";
+      if (adoptionRenewal && (!owner || (old.claimGeneration ?? 0) < 1 || !ownerGrant(rawOwnerGrant) || rawOwnerGrant <= owner.consumed ||
+          claimGeneration === undefined || claimGeneration <= (old.claimGeneration ?? 0)))
+        throw new Error("recovery episode is blocked; no new owner grant");
       const newWindow = claimGeneration !== undefined && old?.claimGeneration !== claimGeneration;
-      const renewal = old !== undefined && (episode ?? 0) > (old.episode ?? 0);
+      const renewal = adoptionRenewal || (old !== undefined && (episode ?? 0) > (old.episode ?? 0));
       const now = Date.now();
       if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(now + 300_000) || (old && now < old.startedAt)) {
         if (old && old.stage !== "blocked" && (!renewal || newWindow)) {
@@ -7203,12 +7293,37 @@ export class GitCache {
         startedAt: newWindow ? now : old?.startedAt ?? now,
         deadline: newWindow ? now + 300_000 : old?.deadline ?? now + 300_000,
         ...(claimGeneration === undefined ? {} : { claimGeneration }),
-        ...(!old || renewal ? (episode !== undefined && episode > 0 ? { episode } : {}) : {}),
+        ...(!old || renewal ? (Math.max(episode ?? 0, old?.episode ?? 0) > 0 ? { episode: Math.max(episode ?? 0, old?.episode ?? 0) } : {}) : {}),
         backoffMs: recoveryRetryMs * 2 ** Math.min(renewal ? 0 : old?.attempts ?? 0, 4), stage: "capturing",
       };
       if (renewal) delete recovery.blocker;
+      // A valid legacy budget renewal may establish the baseline before work too.
+      // The renewal/new-claim guards above already admitted that charge; blocked
+      // adoption still requires an existing record and cannot bootstrap here.
+      // A completed episode can change source, but never resets the consumed highwater.
+      const bootstrapEligible = old?.stage !== "blocked" || (old.blocker === "budget_exhausted" && renewal);
+      if (!owner && bootstrapEligible && claimGeneration !== undefined && ownerGrant(rawOwnerGrant)) {
+        owner = { version: 1, bare: await this.recoveryOwnerBareIdentity(barePath), runId: journal.runId,
+          branch, key, source, root: recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
+            ...(journal.attemptId ? { attemptId: journal.attemptId } : {}) }),
+          baseline: rawOwnerGrant, consumed: rawOwnerGrant, state: "committed",
+          before: old ? ownerReservation(old) : null, after: ownerReservation(recovery) };
+      }
+      const charged: RecoveryOwnerRecord | undefined = owner ? {
+        ...owner, source, root: recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
+          ...(journal.attemptId ? { attemptId: journal.attemptId } : {}) }),
+        consumed: Math.max(owner.consumed, ownerGrant(rawOwnerGrant) ? rawOwnerGrant : owner.consumed),
+        state: "pending", before: old ? ownerReservation(old) : null, after: ownerReservation(recovery),
+      } : undefined;
+      if (charged) { delete charged.successor; await this.writeRecoveryOwner(barePath, charged); }
       await this.runGit(barePath, ["config", "--local", `uzi-attemptmode.${key}.enabled`, "true"]);
-      await this.writeRecovery(barePath, branch, { ...journal, recovery });
+      const reserved = { ...journal, recovery };
+      await this.writeRecovery(barePath, branch, reserved);
+      if (charged) {
+        if (await this.readRecoveryCaptureRaw(barePath, branch) !== JSON.stringify(reserved))
+          throw new Error("recovery reservation readback mismatch");
+        await this.writeRecoveryOwner(barePath, { ...charged, state: "committed" });
+      }
       return recovery;
     });
   }
@@ -7360,6 +7475,9 @@ export class GitCache {
     if (capturedSource !== undefined && !SHA40_RE.test(capturedSource)) throw new Error("invalid recovery source");
     await this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
+      const owner = await this.readRecoveryOwner(barePath, branch, key, expected.runId);
+      if (owner && (owner.state !== "committed" || !ownerJournalMatches(owner, journal)))
+        throw new Error("recovery owner reservation changed");
       const recovery = journal.recovery;
       if (!recovery || recovery.stage !== "capturing" || recovery.attempts !== iteration ||
           !await this.recoveryClockCurrent(barePath, branch, journal)) throw new Error("capture iteration is not current");
@@ -7596,6 +7714,9 @@ export class GitCache {
     if (!ATTEMPT_ID_RE.test(attemptId)) throw annotateRetainedSuccessorError(new Error("invalid successor attempt"), "attempt_invalid");
     return this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
+      const owner = await this.readRecoveryOwner(barePath, branch, key, expected.runId);
+      if (owner && (owner.state !== "committed" || !ownerJournalMatches(owner, journal)))
+        throw new Error("recovery owner reservation changed");
       const recovery = journal.recovery;
       if (!recovery || recovery.stage !== "captured" || recovery.attempts !== iteration ||
           !recovery.restoreTip || !await this.recoveryClockCurrent(barePath, branch, journal)) throw annotateRetainedSuccessorError(new Error("successor iteration is not current"), "iteration_before");
@@ -7644,12 +7765,19 @@ export class GitCache {
       if (failedProof) throw annotateRetainedSuccessorError(new Error("successor recovery verification failed"), failedProof);
       if (!await this.recoveryClockCurrent(barePath, branch, { ...journal, retainedSources,
         recovery: { ...recovery, successor, stage: "adopting" } })) throw annotateRetainedSuccessorError(new Error("successor iteration is not current"), "iteration_after");
+      if (owner) await this.writeRecoveryOwner(barePath, { ...owner, successor });
       await this.writeRecovery(barePath, branch, { ...successor, retainedSources,
         // issue #3239: the lineage of what this seed peeled: the wrapper's accepted markers, or the tip
         // itself when the tip is the marker the seed's `reset --soft` removed from history.
         ...(wrapped ? (wrapped.peeledMarkers.length ? { peeledMarkers: wrapped.peeledMarkers } : {})
           : marker ? { peeledMarkers: [tip] } : {}),
         recovery: { ...recovery, successor, stage: "ready-for-model" } });
+      if (owner) {
+        const ready = await this.readRecoveryCapture(barePath, branch);
+        if (!ready || ready.recovery?.stage !== "ready-for-model" ||
+            !sameRecoverySource(ready, successor) || !ownerJournalMatches({ ...owner, successor }, ready))
+          throw new Error("recovery handoff readback mismatch");
+      }
       // issue #3194: hand the guard the content source this wrapper verifiably stands for.
       return { ...seeded, attemptId, ...(recovery.restoreSource ? { adoptedContentSource: recovery.restoreSource } : {}) };
     });
@@ -7667,6 +7795,9 @@ export class GitCache {
         evidence.processedEvents <= 0 || evidence.attemptId !== expected.attemptId) throw new Error("model processing evidence required");
     return this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
+      const owner = await this.readRecoveryOwner(barePath, branch, key, expected.runId);
+      if (owner && (owner.state !== "committed" || !ownerJournalMatches(owner, journal)))
+        throw new Error("recovery owner reservation changed");
       if (journal.recovery?.stage !== "ready-for-model" ||
           !journal.recovery.successor || !sameRecoverySource(journal, journal.recovery.successor)) throw new Error("episode cannot complete");
       if (!await this.recoveryClockCurrent(barePath, branch, journal, true)) throw new Error("episode cannot complete: invalid recovery clock");

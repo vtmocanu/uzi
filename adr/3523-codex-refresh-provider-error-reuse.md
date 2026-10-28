@@ -79,15 +79,23 @@ crash between admission and the provider call.
 
 ### In-flight and terminal fences
 
-The shared in-flight policy bound is **52.14 seconds** from durable consumption:
+The shared in-flight policy bound is **832.14 seconds (13 minutes, 52.14 seconds)** from durable consumption:
 
 ```text
 7s lease allowance
-+ (2 synchronous + 6 background) × 5s recovery writes
++ 2 synchronous × 5s recovery writes
++ 6 background × 135s recovery writes
 + (1 synchronous + 6 background) × 20ms backoffs
 + 5s terminal write
-= 52.14s
+= 832.14s
 ```
+
+The user-visible cost: if the API crashes or pauses after admission, the account
+shows "Codex account is reconciling" for up to about 13m52s before relogin is
+offered (about 52s before background writes waited out a vault conversion).
+This longer delay lets the configured persistence attempts finish before an
+unchanged retry without surviving material is treated as unrecoverable;
+scheduling pauses can still exceed the policy bound.
 
 `codexRefreshReuseInFlightBound` is shared by survivor resolution and account-action
 display. An unconsumed, receipt-bearing intent inside the 30-minute window

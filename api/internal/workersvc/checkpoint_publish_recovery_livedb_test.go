@@ -31,6 +31,7 @@ func TestLiveUnknownPublishRecoveryAndReclaimLiveDB(t *testing.T) {
 	run := uuid.New()
 	e.exec("INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,status) VALUES($1,$2,$3,'issue',101,'t','d','queued')", run, user, repo)
 	svc := New(e.q, e.box, testParams())
+	svc.SetVault(e.vlt)
 	svc.SetTxBeginner(e.pool)
 	svc.SetRetentionLockPool(e.pool)
 	svc.SetForgeBaseURLAllowed(func(u string) bool { return u == "https://forge.e2e" })

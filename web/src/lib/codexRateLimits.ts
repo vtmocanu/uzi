@@ -202,7 +202,11 @@ export function codexLoginRejected(account: Pick<CodexAccountRateLimit, "status"
 // deployed ahead of the bundle by a newer server.
 export function codexStatusBadge(
   account: Pick<CodexAccountRateLimit, "status" | "reason">,
+  vaultMode?: "protected" | "unprotected",
 ): CodexStatusBadge {
+  if (vaultMode === "unprotected" && account.status === "vault_locked") {
+    return { tone: "neutral", label: "Status pending", hint: "Vault protection is off. Waiting for a current credential reading." };
+  }
   const badge = CODEX_STATUS_BADGES[account.status];
   // Tone and label stay the status's own ("Action required" / "Polling off"); only the hint
   // is refined.

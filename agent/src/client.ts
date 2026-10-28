@@ -1891,6 +1891,8 @@ export class WorkerClient {
         : JSON.parse(await readBoundedText(res, CLAIM_RESPONSE_MAX_BYTES, true, deadline))) as ClaimResponse;
       if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_episode) ||
           (claim.worker_recovery_episode as number) < 0)) delete claim.worker_recovery_episode;
+      if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_owner_episode) ||
+          (claim.worker_recovery_owner_episode as number) < 0)) delete claim.worker_recovery_owner_episode;
       if (isRecord(claim) && claim.semantic_planning !== undefined) claim.semantic_planning = parseSemanticEnrollment(claim.semantic_planning);
       // PRD #1230 M4: a present-but-malformed maintainer-pending projection fails the claim closed.
       if (isRecord(claim) && isRecord(claim.config) && Object.hasOwn(claim.config, "completion_pending")) {
@@ -1984,6 +1986,8 @@ export class WorkerClient {
     const claim = JSON.parse(await readBoundedText(res, CLAIM_RESPONSE_MAX_BYTES, true)) as ChatClaimResponse;
     if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_episode) ||
         (claim.worker_recovery_episode as number) < 0)) delete claim.worker_recovery_episode;
+    if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_owner_episode) ||
+        (claim.worker_recovery_owner_episode as number) < 0)) delete claim.worker_recovery_owner_episode;
     validateClaimMemory(claim);
     return claim;
   }
@@ -2303,8 +2307,9 @@ export class WorkerClient {
         throw error;
       }
     }
-    if (body.recovery_cause === "retained_recovery_exhausted") {
-      if (!this.hasFeature("recovery_cause_retained_recovery_exhausted") ||
+    if (body.recovery_cause === "retained_recovery_exhausted" ||
+        body.recovery_cause === "retained_recovery_adoption_failed") {
+      if (!this.hasFeature(`recovery_cause_${body.recovery_cause}`) ||
           body.status !== "recovery_wait" || !Number.isSafeInteger(body.claim_generation) ||
           (body.claim_generation ?? 0) < 1) throw new Error("retained recovery park requires support and a positive generation");
       // This contract cannot degrade to an unfenced or untyped recovery park on rollback.

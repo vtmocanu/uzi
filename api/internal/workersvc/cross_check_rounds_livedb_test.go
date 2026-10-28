@@ -31,6 +31,7 @@ func newAutomaticRoundsFixtureWithParams(t *testing.T, p Params) (codexTestEnv, 
 	env.exec(`INSERT INTO runs(id,user_id,repo_id,worker_id,issue_iid,issue_title,issue_description,status,harness,auto_approve,plan_cross_check_required,claim_generation)
  VALUES($1,$2,$3,$4,2150,'round issue','body','running','claude',true,true,1)`, lead, user, repo, worker)
 	svc := New(env.q, env.box, p)
+	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
 	c := PlanCrossCheckCandidate{PlanMd: "plan", Milestones: []byte("[]"), RequiredCapabilities: []string{}, RequiredTools: []string{}, SizeClass: "s", BaseCommit: strings.Repeat("a", 40), PlanningDiff: "diff"}
 	return env, svc, store.Worker{ID: worker, UserID: user}, lead, c
