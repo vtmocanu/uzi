@@ -26,7 +26,8 @@ holds; the exact share remains unknown.
 This diagnosis changes no quota, expiry, custody or bundle policy.
 [#2625](https://github.com/vtmocanu/uzi/issues/2625) tracks early expiry separately;
 [#2623](https://github.com/vtmocanu/uzi/issues/2623) tracks the capacity-share
-warning separately (including a proposed 25% warning).
+proposal separately (including a proposed 25% warning); the current health
+check uses the [80% byte-budget warning](./admin-health.md#recovery-storage).
 [#2507](https://github.com/vtmocanu/uzi/issues/2507) covers source-only custody.
 None is claimed as implemented by #2544.
 
@@ -47,7 +48,7 @@ The surfaces carry different evidence:
 | Worker API | `mapRecoveryError` returns HTTP 507 with typed `reason: quota`; both capture-count reserve and byte refusal use it. |
 | Worker journal / outcome | `classifyUploadFailure` preserves typed quota as transient `storage_quota_exceeded`, eligible for retained live retry and backoff. Source, bytes and identity remain retained; a successful upload clears the diagnostic. Untyped/unknown 507 stays generic transient, without a quota diagnosis. 401 retains credential precedence. |
 | CLI `run recovery`, human and JSON | `recoveryHoldCapture` projects id, state, source SHA, byte size and creation time; it omits capture reason. The hold DTO supplied by `custodyHoldToDTO` has no capture reason either. Absence here is not absence in storage. |
-| Admin Health | Counts current persisted quota markers, independently of custody; it is not a failure history. |
+| Admin Health | Warns at 80% or more of any enabled recovery/shared byte budget, or on current persisted quota markers, independently of custody. Logical snapshot evidence is not physical disk usage or a refusal history; see [Recovery storage](./admin-health.md#recovery-storage). |
 
 Implementation: [error mapping](../api/internal/handler/recovery.go),
 [worker classification and retry](../agent/src/recovery.ts),
@@ -284,10 +285,13 @@ per-owner counts captures whose state is neither `discarded` nor `expired`;
 any other state, including one added later, counts.
 An existing idempotency key bypasses these new-capture checks. Nonpositive
 ceilings disable them. Count refusal also returns 507 `quota`, potentially
-before any capture row is created; it is absent from `recovery.storage`
-unless a current persisted upload-refusal marker exists. Expired metadata rows
-are retained without a pruning window, so they accumulate as audit rows but no
-longer consume per-owner count slots.
+before any capture row is created. Without a current persisted upload-refusal
+marker, that refusal adds no marker to `recovery.storage`; the check can still
+warn independently at 80% or more of an enabled byte budget. Absence of a
+capture row or marker does not rule out that pressure. An admitted retry
+clears a marker before upload succeeds and can leave the pressure warning
+in place. Expired metadata rows are retained without a pruning window, so
+they accumulate as audit rows but no longer consume per-owner count slots.
 
 ```sql
 SELECT h.id AS hold_id, h.generation, count(c.id) AS per_claim_count,
@@ -394,10 +398,16 @@ not a reproduction on the operator's deployment.
 > #2544 preserves typed worker API quota as transient
 > `storage_quota_exceeded` with retained bytes/source/identity and retry;
 > untyped 507 stays generic. Admin Health now exposes `recovery.storage`,
-> warning on current persisted `needs_action` / `storage quota exceeded`
-> captures, independently of custody. Logical byte evidence and bounded
-> owner examples support diagnosis; this is not physical-capacity telemetry
-> or a refusal history. Count refusals without a capture row are not covered.
+> warning at 80% or more of any enabled recovery/shared byte budget or on
+> current persisted `needs_action` / `storage quota exceeded` captures,
+> independently of custody. Nonpositive limits disable their utilization
+> signals; persisted refusals still warn. Logical byte evidence and bounded,
+> refusal-first owner examples support diagnosis; the examples need not
+> include the largest owner. This is not physical-capacity telemetry or a
+> refusal history. Count refusals without a capture row add no marker, but
+> independent byte pressure can still warn, including after retry clears a
+> marker before upload succeeds. See [Recovery storage](./admin-health.md#recovery-storage)
+> for the accounting formulas and warning/notification boundary.
 >
 > Regression evidence: U1's same
 > [live recovery](https://github.com/vtmocanu/uzi/blob/4adc57f5f2148de389652f3a2566321e1a550aa0/agent/test/issue-1995-live-recovery.test.ts) and
@@ -436,8 +446,8 @@ not a reproduction on the operator's deployment.
 > [pending]. Quota `needs_action` and source-only custody coexist;
 > their exact share is unknown.
 >
-> No quota increase, expiry/custody/bundle policy change or 25% capacity
-> warning is included. Early expiry
+> The recorded #2544 fixes included no quota increase, expiry/custody/bundle
+> policy change or 25% capacity warning. Early expiry
 > [#2625](https://github.com/vtmocanu/uzi/issues/2625), capacity-share warning
 > [#2623](https://github.com/vtmocanu/uzi/issues/2623) and source-only custody
-> [#2507](https://github.com/vtmocanu/uzi/issues/2507) remain separate.
+> [#2507](https://github.com/vtmocanu/uzi/issues/2507) were tracked separately.

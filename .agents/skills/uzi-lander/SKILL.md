@@ -466,6 +466,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
 
    For `vtmocanu/uzi` main, exit 12 means main changed changelog-policy files since the PR's merge-base: rebase or merge main, wait for fresh exact-head CI, re-run `merge.sh`; merges outside it bypass this guard.
    That check uses the helper's own checkout and an exact GitHub origin URL allowlist for `vtmocanu/uzi`.
+   Exit 13 (`MIGRATION_COLLISION`) means an added, renamed or copied migration destination is at or below the live base head: run `land-prep.sh` to renumber, then require fresh exact-head CI and review. Unreadable PR files or base migrations refuse with exit 2. The final check shares takeover's parser; a base move outside the lander lock after the snapshot remains a race.
    It refuses on a moved head, an active rework, red, pending or no passing required checks, a
    git conflict, or (exit 5) any unresolved thread, open code-scanning alert or
    unacknowledged comment, or (exit 10) a `chore(release):` commit's CI still running on

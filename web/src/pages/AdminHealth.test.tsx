@@ -133,6 +133,43 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("shows budget pressure with zero quota refusals as an owner housekeeping warning", async () => {
+    const doc = healthySilentDoc();
+    const storage = doc.checks.find((c) => c.id === "recovery.storage")!;
+    storage.severity = "warn";
+    storage.summary = "At least 80% of budget: per-owner recovery, instance recovery, shared stored files; 0 captures currently marked quota-refused.";
+    storage.evidence = [
+      { label: "Quota-refused captures", value: "0" },
+      { label: "Maximum owner recovery bytes", value: "80" },
+      { label: "Recovery bytes", value: "160" },
+      { label: "Shared stored bytes", value: "240" },
+      { label: "Recovery per-owner limit", value: "100 bytes" },
+      { label: "Recovery instance limit", value: "200 bytes" },
+      { label: "Shared stored-files limit", value: "300 bytes" },
+    ];
+    storage.action = "Reduce stored bytes or raise the pressured budgets before recovery uploads are refused.";
+    expect(storage.scope).toBe("owner");
+    expect(storage.group).toBe("housekeeping");
+    const pressured = retally(doc);
+    expect(pressured.status).toBe("warn");
+    expect(pressured.blocking).toBe(false);
+
+    const { container } = await renderHealth(pressured);
+    expect(attentionIds(container)).toEqual(["recovery.storage"]);
+    const item = attentionItem(container, "recovery.storage")!;
+    expect(within(item).getByText("Warn")).toBeTruthy();
+    expect(within(item).getByText("Recovery storage")).toBeTruthy();
+    expect(within(item).getByText(/· Housekeeping/)).toBeTruthy();
+    expect(within(item).getByText("At least 80% of budget: per-owner recovery, instance recovery, shared stored files; 0 captures currently marked quota-refused.")).toBeTruthy();
+    for (const e of storage.evidence) {
+      const label = within(item).getByText(e.label);
+      expect(label.nextElementSibling?.textContent).toBe(e.value);
+    }
+    expect(within(item).getByText(storage.action)).toBeTruthy();
+    expect(band("1 check needs attention").getAttribute("role")).toBe("status");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("shows both Codex pricing reasons and operator docs without blocking work", async () => {
     const doc = healthySilentDoc();
     expect(doc.checks).toHaveLength(23);

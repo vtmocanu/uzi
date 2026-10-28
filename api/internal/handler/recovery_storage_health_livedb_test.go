@@ -88,7 +88,7 @@ func TestRecoveryStorageAccountingLiveDB(t *testing.T) {
 	for _, r := range rows {
 		if r.OwnerCount != 10 || r.OmittedCount != 2 || r.AvailableCount != 10 || r.AvailableBytes != 110 ||
 			r.PreparingCount != 10 || r.PreparingBytes != 70 || r.UploadingCount != 10 || r.UploadingBytes != 70 ||
-			r.JobCount != 50 || r.JobBytes != 650 || r.ReclaimableBytes != 260 || r.RefusedCount != 10 {
+			r.JobCount != 50 || r.JobBytes != 650 || r.ReclaimableBytes != 260 || r.RefusedCount != 10 || r.MaxOwnerRecoveryBytes != 25 {
 			t.Errorf("global accounting: %+v", r)
 		}
 		if !r.OwnerID.Valid || r.OwnerAvailableCount != 1 || r.OwnerAvailableBytes != 11 ||
@@ -104,8 +104,90 @@ func TestRecoveryStorageAccountingLiveDB(t *testing.T) {
 	e.mustExec("DELETE FROM job_files")
 	e.mustExec("DELETE FROM recovery_captures")
 	c = storageCheck(t, h)
-	if c.Severity != "ok" || storageEvidence(c, "Owners") != "0" {
+	if c.Severity != "ok" || storageEvidence(c, "Owners") != "0" || storageEvidence(c, "Maximum owner recovery bytes") != "0" {
 		t.Errorf("empty accounting: %+v", c)
+	}
+}
+
+// The only pressured owner sorts ninth, beyond the fixed eight owner examples.
+func TestRecoveryStorageUnsampledOwnerPressureLiveDB(t *testing.T) {
+	e := newRecoveryEnv(t)
+	e.mustExec("DELETE FROM job_files")
+	e.mustExec("DELETE FROM recovery_captures")
+	h := e.handler()
+	h.settings = settings.New(&settingsStore{}, time.Minute)
+	h.cfg.RecoveryReadyPayloadPerOwner = 100
+	h.cfg.RecoveryInstanceBytes = 0
+	h.cfg.StoredFilesBudgetBytes = 0
+	var owners []uuid.UUID
+	for i := 1; i <= 9; i++ {
+		owner := uuid.MustParse(fmt.Sprintf("35840000-0000-4000-8000-%012d", i))
+		owners = append(owners, owner)
+		// Repeated live-DB runs can retain users, but all their contributions were cleared above.
+		e.mustExec("INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x') ON CONFLICT (id) DO NOTHING", owner, owner.String()+"@storage.example.com")
+		available := int64(10)
+		if i == 9 {
+			available = 30
+		}
+		for _, capture := range []struct {
+			state           string
+			bytes, reserved int64
+		}{
+			{"available", available, 999},
+			{"preparing", 999, 20},
+			{"uploading", 999, 30},
+		} {
+			e.mustExec(`INSERT INTO recovery_captures(hold_id,run_id,user_id,original_worker_identity,source_sha,idempotency_key,state,byte_size,reserved_bytes)
+   VALUES($1,$2,$3,'fixed-worker','abcd',$4,$5,$6,$7)`,
+				e.holdID, e.run, owner, fmt.Sprintf("pressure-%d-%s", i, capture.state), capture.state, capture.bytes, capture.reserved)
+		}
+		// Reclaimable files still consume the shared budget, and never the recovery budgets.
+		id := uuid.New()
+		e.mustExec(`INSERT INTO job_files(id,user_id,direction,display_name,content_type,byte_size,sha256,storage_name,chunk_count,state,run_id)
+   VALUES($1,$2,'input','fixed.txt','text/plain',100,$3,$4,0,'available',$5)`,
+			id, owner, sha256hex([]byte("fixed")), sha256hex([]byte("fixed"))+".txt", e.run)
+	}
+	rows, err := h.q.RecoveryStorageHealth(e.ctx, store.RecoveryStorageHealthParams{Now: pgtype.Timestamptz{Time: time.Now(), Valid: true}, ExampleLimit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 8 {
+		t.Fatalf("examples: %d, want 8", len(rows))
+	}
+	for i, r := range rows {
+		if r.MaxOwnerRecoveryBytes != 80 {
+			t.Fatalf("maximum owner recovery bytes=%d, want 80 including unsampled owner", r.MaxOwnerRecoveryBytes)
+		}
+		if r.OwnerCount != 9 || r.OmittedCount != 1 || r.RefusedCount != 0 ||
+			r.AvailableCount != 9 || r.AvailableBytes != 110 || r.PreparingCount != 9 || r.PreparingBytes != 180 ||
+			r.UploadingCount != 9 || r.UploadingBytes != 270 || r.JobCount != 9 || r.JobBytes != 900 || r.ReclaimableBytes != 900 {
+			t.Errorf("global accounting: %+v", r)
+		}
+		if !r.OwnerID.Valid || r.OwnerID.Bytes != [16]byte(owners[i]) || r.OwnerID.Bytes == [16]byte(owners[8]) ||
+			r.OwnerAvailableCount != 1 || r.OwnerAvailableBytes != 10 || r.OwnerPreparingCount != 1 || r.OwnerPreparingBytes != 20 ||
+			r.OwnerUploadingCount != 1 || r.OwnerUploadingBytes != 30 || r.OwnerJobCount != 1 || r.OwnerJobBytes != 100 ||
+			r.OwnerReclaimableBytes != 100 || r.OwnerRefusedCount != 0 {
+			t.Errorf("ordered unpressured example %d: %+v", i, r)
+		}
+	}
+	c := storageCheck(t, h)
+	if c.Severity != "warn" || c.Scope != "owner" ||
+		c.Summary != "At least 80% of budget: per-owner recovery; 0 captures currently marked quota-refused." {
+		t.Errorf("unsampled pressure: %+v", c)
+	}
+	for label, want := range map[string]string{
+		"Maximum owner recovery bytes": "80", "Recovery bytes": "560", "Shared stored bytes": "1460",
+		"Reclaimable job bytes": "900", "Quota-refused captures": "0", "Omitted owner examples": "1",
+		"Recovery per-owner limit": "100 bytes", "Recovery instance limit": "disabled", "Shared stored-files limit": "disabled",
+	} {
+		if got := storageEvidence(c, label); got != want {
+			t.Errorf("%s=%q, want %q", label, got, want)
+		}
+	}
+	for _, evidence := range c.Evidence {
+		if evidence.Label == "Owner "+owners[8].String() {
+			t.Errorf("ninth owner leaked into health examples: %+v", evidence)
+		}
 	}
 }
 
@@ -226,6 +308,10 @@ func TestRecoveryStorageUploadRefusalHealthLiveDB(t *testing.T) {
 		e.mustExec("UPDATE recovery_custody_holds SET state='open',released_at=NULL,live_worker_id=$2,live_run_id=$3 WHERE id=$1", e.holdID, e.worker.ID, e.run)
 	})
 	// Admit the same manifest under a higher ceiling; inspect BEFORE the reader yields bytes.
+	previous := h
+	h = e.handler()
+	h.cfg = previous.cfg
+	h.settings = previous.settings
 	h.cfg.RecoveryReadyPayloadPerOwner = 1000
 	h.recoverySvc = e.service(h.recoveryLimits())
 	t.Run("admitted retry clears before success", func(t *testing.T) {

@@ -457,7 +457,7 @@ These are bounded observations, not a globally ordered snapshot:
 | `maintenance.active` | [Instance maintenance mode](instance-maintenance.md) is on: new runs wait in the queue. Carries the start time, reason and readout counts (active, held, custody). Liveness and readiness are unaffected | while on | — | `unknown` when the state cannot be read. A missing state row reads as paused, so the check warns |
 | `board.drift` | A board column move given up (stuck pending past the give-up boundary) on a run that has an issue, in the last 24 hours | any given-up move | — | — |
 | `custody.holds` | An owner at the [recovery custody admission limit](run-recovery.md) | any owner at the limit | — | `unknown` when the `custody_hold_limit` setting cannot be read; `na` only when the health service has no settings wired |
-| `recovery.storage` | Current persisted quota-refused recovery captures; [diagnosis](./recovery-storage-diagnosis.md) | any matching capture | — | `unknown` when the read fails or exceeds four seconds |
+| `recovery.storage` | Logical recovery/shared byte-budget pressure and current persisted quota-refused recovery captures; [diagnosis](./recovery-storage-diagnosis.md) | any enabled byte budget at 80% or more, or any matching refusal marker | — | `unknown` when the read fails, the aggregate is missing or the four-second deadline is reached |
 | `release.check` | Whether this instance is far behind the latest release, per the same derivation [Update checks](updates.md) uses | far behind | — | `na` when the upstream release check is disabled |
 | `agentsource.update` | Persisted [agent-source discovery](agent-source.md#update-checks-and-the-update-badge), compared with the current pin and last-applied SHA | newer semver tag or tracked branch moved | — | `na` when disabled, unconfigured or SHA-pinned; `unknown` before a recorded check or on a settings read failure |
 | `pricing.codex` | Recent Codex usage on models without a currently valid price in this release's table | any such model | — | `unknown` when the usage query fails or exceeds its five-second deadline |
@@ -492,26 +492,54 @@ review workflow and badge behavior.
 ### Recovery storage
 
 `recovery.storage` is an owner-scoped housekeeping check for
-[#2544](https://github.com/vtmocanu/uzi/issues/2544). It is `warn` when
-the current persisted capture count is greater than zero for the exact pair
-`state = needs_action`, `reason = storage quota exceeded`; otherwise it
-is `ok`. A failed read, missing aggregate or four-second read deadline
-is `unknown`. There is no danger or percentage-capacity band.
+[#2544](https://github.com/vtmocanu/uzi/issues/2544). It is `warn` when any
+enabled byte budget is at **80% or more**, including equality, or when a
+persisted capture has the exact pair `state = needs_action`,
+`reason = storage quota exceeded`. These are independent signals; otherwise
+it is `ok`. A failed read, missing aggregate or four-second read deadline
+is `unknown`. There is no `danger` band. The warning appears on the Health
+page and contributes to attention counts; it does not raise the instance
+Danger banner, set `blocking`, open or hold an episode, or send an admin
+Slack DM.
+
+The three utilization signals use one logical snapshot:
+
+- **Per-owner recovery:** the maximum across owners of available capture
+  payload bytes plus preparing and uploading reserved bytes. Job files do
+  not enter this signal.
+- **Instance recovery:** the sum of those recovery bytes across owners.
+- **Shared stored files:** instance recovery bytes plus job-file bytes whose
+  `state != expired`, including overdue files before cleanup.
+
+Reclaimable job bytes are evidence, not a deduction from these signals.
+A limit `<= 0` disables only its utilization signal (shown as `disabled`);
+persisted refusals still warn. The summary lists pressured budgets in the
+stable order **per-owner recovery**, **instance recovery**, **shared stored
+files**, followed by the current quota-refused count.
 
 Evidence reports global bytes and counts across owners: available recovery
 captures, preparing/uploading reservations, non-expired job files, quota
 refusals and owners, plus reclaimable job bytes, recovery/shared totals and
-the effective owner/instance/shared byte limits (`<= 0` reads disabled).
-At most eight owner examples follow, ordered by refusal count then owner
-ID, with an omitted-owner count. The totals are computed before this cap;
-the cap does not narrow the global accounting.
+the effective owner/instance/shared byte limits. **Maximum owner recovery
+bytes** is a scalar without an owner identifier. At most eight owner examples
+follow, ordered by refusal count descending then owner ID, with an
+omitted-owner count. The maximum and totals are computed across owners
+before this cap. These refusal-first examples may omit the owner with the
+largest recovery usage.
+
+With pressure and zero refused captures, the action is to reduce stored
+bytes or raise the pressured budgets before recovery uploads are refused.
+When markers exist, the action also asks operators to review those captures
+with their owners using `uzi run recovery`.
 
 Custody release does not remove a persisted refusal, so a released hold can
 still warn. An admitted retry clears the marker as it becomes uploading,
-**before success**, so a cleared warning is not proof of an available archive.
-Discard, a nonquota reason or a stalled-upload reason replacing the quota
-marker also removes that capture from the warning. Capture-count reserve
-refusals that create no capture row are absent from this signal.
+**before success**; independent byte pressure can keep the check at `warn`.
+Marker clearance is not proof of an available archive. Discard, a nonquota
+reason or a stalled-upload reason replacing the quota marker also removes
+that capture from the refused count. Capture-count reserve refusals that
+create no capture row add no persisted marker. Neither an absent marker nor
+an absent capture row rules out independent byte pressure.
 
 Upload-failure recording is best-effort. The check observes current state,
 not history, and its logical byte totals are not PostgreSQL/PVC physical

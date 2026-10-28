@@ -690,6 +690,36 @@ async function runDiffScenario(t: TestContext, issue: number, spec: {
   match?: (request: BoundaryProcessRequest) => boolean;
 }): Promise<DiffRun> {
   const clock = virtualBoundaryClock();
+  const started = clock.now();
+  let deferredFenceCloses = 0;
+  let maskedOperations = 0, maskedOperationSettled = false;
+  if (spec.stop === "soft_then_hard") {
+    const scoped = git as unknown as { runGit(cwd: string | undefined, args: string[], ...rest: unknown[]): Promise<string> };
+    const runGit = scoped.runGit.bind(scoped);
+    t.mock.method(scoped, "runGit", (...args: Parameters<typeof scoped.runGit>) => {
+      const running = runGit(...args);
+      if (args[1][0] === "update-ref" && args[1].some(arg => arg.startsWith("refs/uzi-cross-check/"))) {
+        maskedOperations++;
+        void running.then(() => { maskedOperationSettled = true; }, () => { maskedOperationSettled = true; });
+      }
+      return running;
+    });
+    const open = fs.promises.open.bind(fs.promises);
+    t.mock.method(fs.promises, "open", async (...args: Parameters<typeof fs.promises.open>) => {
+      const file = await open(...args);
+      if (String(args[0]).includes("code-snapshot-") && String(args[0]).endsWith(".fence")) {
+        const close = file.close.bind(file);
+        t.mock.method(file, "close", async () => {
+          await close();
+          deferredFenceCloses++;
+          // Inject delayed I/O delivery beyond the old observation cap. These turns
+          // are fixture load, not a pass criterion or an extension of virtual time.
+          for (let turn = 0; turn < 400; turn++) await new Promise<void>(resolve => setImmediate(resolve));
+        });
+      }
+      return file;
+    });
+  }
   const { logger, lines } = recordingLogger();
   const timers = trackReadTimers(t);
   const events: string[] = [];
@@ -735,6 +765,9 @@ async function runDiffScenario(t: TestContext, issue: number, spec: {
     };
   };
   let rig: ReturnType<typeof codexRig> | undefined;
+  let hardSignal: AbortSignal | undefined;
+  let childStopSignals: AbortSignal[] | undefined;
+  let scenarioError: unknown;
   let record: Omit<DiffRun, "lines" | "failedStates" | "submitted" | "spawnedNameOnly" | "cancels"> | undefined;
   const match = spec.match ?? isNameOnlyDiff;
   let matched = false;
@@ -754,10 +787,22 @@ async function runDiffScenario(t: TestContext, issue: number, spec: {
       if (ctx.signal?.aborted) forward(); else ctx.signal?.addEventListener("abort", forward, { once: true });
       rig = codexRig({ lifecycleSignal: AbortSignal.any([execution.signal, ctx.terminalLifecycleSignal!]),
         armDeadline: clock.armDeadline, now: clock.now,
-        boundaryProcess: request => !matched && match(request) ? (matched = true, spawnDiff()) : undefined });
+        boundaryProcess: request => {
+          if (matched || !match(request)) return undefined;
+          matched = true;
+          if (spec.stop === "soft_then_hard") {
+            childStopSignals = (git as unknown as { boundaryStopSignals(): AbortSignal[] }).boundaryStopSignals();
+          }
+          return spawnDiff();
+        } });
       const withBoundary = rig.safety.withBoundary.bind(rig.safety);
       rig.safety.withBoundary = async (request, action) => {
-        try { return await withBoundary(request, action); }
+        try {
+          return await withBoundary(request, permit => {
+            if (request.sink === "done_checkpoint") hardSignal = permit.signal;
+            return action(permit);
+          });
+        }
         finally { if (request.sink === "done_checkpoint") events.push("boundary-returned"); }
       };
       commitInTree(ctx.worktreePath, "prompt.txt", "prompt candidate\n");
@@ -784,18 +829,35 @@ async function runDiffScenario(t: TestContext, issue: number, spec: {
         if (spec.stop === "cancel") { route("cancel"); await observeTurns(() => settled); }
         else if (spec.stop === "pause_now") { route("pause", "now"); await observeTurns(() => settled); }
         else if (spec.stop === "soft_then_hard") {
+          assert.equal(childStopSignals?.length, 1, "the masked mutation receives no soft stop signal");
+          assert.equal(childStopSignals[0], hardSignal, "the masked mutation retains the held hard signal");
           clock.advance(60_000);
           settledAfterSoft = await observeTurns(() => settled);
+          // This child exited cleanly before soft expiry, but its output never
+          // ended. Observe runGit before fence cleanup can delay the outer gate.
+          assert.equal(maskedOperations, 1, "the controlled masked operation was observed");
+          assert.equal(cancels, 0, "soft expiry must not cancel the masked child");
+          assert.equal(maskedOperationSettled, false, "soft expiry must leave the masked operation pending");
+          assert.equal(hardSignal?.aborted, false, "the soft deadline must leave the masked hard signal live");
           clock.advance(30_000);
-          await observeTurns(() => settled);
+          assert.equal(hardSignal?.aborted, true, "hard stop did not settle the gate: hard deadline did not fire");
+          // The hard stop owns settlement, including real fence-close I/O. A fixed
+          // number of immediate turns cannot establish that this unwind is done.
+          await gate;
+          assert.equal(deferredFenceCloses, 1, "the delayed fence-close delivery was exercised");
+          assert.equal(clock.now() - started, 90_000, "settlement used only the original hard deadline");
         } else if (spec.stop !== "none") {
           clock.advance(spec.stop === "soft" ? 60_000 : 90_000);
           await observeTurns(() => settled);
         }
         record = { settledAtStop: settled, settledAfterSoft, outcome: undefined, events, timersAtStop: timers.pending(),
           poisoned: rig.registry.isPoisoned() };
+      } catch (error) {
+        scenarioError = error;
+        throw error;
       } finally {
-        // A red run must end by assertion, never by the 600 s timer: unblock whatever is still pending.
+        // Unblock pending work after a refusal without waiting for the 600 s timer.
+        // A fired hard stop ignored by production is bounded by the existing test timeout.
         stdout?.destroy();
         if (!settled) timers.flush();
         if (!settled && !(await observeTurns(() => settled))) clock.advance(120_000);
@@ -810,6 +872,7 @@ async function runDiffScenario(t: TestContext, issue: number, spec: {
     checkpointTestHooks: { absoluteNow: clock.now, armSoftDeadline: clock.arm },
   });
   await worker.execute(claim);
+  if (scenarioError) throw scenarioError;
   assert.ok(record, "the executor reached the scenario record");
   return { ...record, submitted, lines: lines as DiffRun["lines"], cancels, spawnedNameOnly: nameOnly,
     failedStates: api.states.filter(s => s.body.status === "failed").length };
