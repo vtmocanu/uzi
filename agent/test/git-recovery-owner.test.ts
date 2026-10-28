@@ -41,9 +41,23 @@ for (const control of ["missing", "malformed", "duplicate", "baseline", "bare", 
       f.values.set(f.ownerKey, [JSON.stringify(record)]);
     }
     const before = f.read();
-    await assert.rejects(f.reserve(2, 1, 8));
+    const refusal = {
+      missing: { message: /^recovery episode is blocked; no new owner grant$/ },
+      malformed: SyntaxError,
+      duplicate: { message: /^duplicate or missing recovery owner record$/ },
+      baseline: { message: /^invalid recovery owner record$/ },
+      bare: { message: /^recovery owner binding changed$/ },
+      key: { message: /^recovery owner binding changed$/ },
+      branch: { message: /^recovery owner binding changed$/ },
+      runId: { message: /^invalid recovery owner record$/ },
+      source: { message: /^recovery owner reservation changed$/ },
+      episode: { message: /^recovery owner reservation changed$/ },
+    }[control];
+    await assert.rejects(f.reserve(2, 1, 8), refusal);
     assert.deepEqual(f.read(), before);
-    assert.equal(await f.recreate().canRenewRecoveryAdoption(f.bare, f.branch, f.key, before, 2, 1).catch(() => false), false);
+    const eligible = f.recreate().canRenewRecoveryAdoption(f.bare, f.branch, f.key, before, 2, 1);
+    if (control === "missing" || control === "source" || control === "episode") assert.equal(await eligible, false);
+    else await assert.rejects(eligible, refusal);
   });
 }
 
@@ -124,8 +138,9 @@ test("changed journal source, root and reservation refuse resolution and renewal
     if (change === "attempts") j.recovery!.attempts++;
     if (change === "clock") { j.recovery!.startedAt++; j.recovery!.deadline++; }
     f.write(j);
-    await assert.rejects(f.recreate().recoveryReservationSnapshot(f.bare, f.branch, f.key, f.source, reservation));
-    await assert.rejects(f.reserve(3, 1, 8));
+    await assert.rejects(f.recreate().recoveryReservationSnapshot(f.bare, f.branch, f.key, f.source, reservation),
+      change === "source" || change === "root" ? { message: /^recovery source identity mismatch$/ } : { message: /^recovery reservation changed$/ });
+    await assert.rejects(f.reserve(3, 1, 8), { message: /^recovery owner reservation changed$/ });
   }
 });
 
@@ -134,7 +149,7 @@ test("bootstrap requires a positive claim fence and never reconstructs blocked a
   await f.recreate().reserveRecoveryIteration(f.bare, f.branch, f.key, f.source, 1, undefined, 7, 0);
   assert.equal(f.values.has(f.ownerKey), false);
   await f.block();
-  await assert.rejects(f.reserve(2, 1, 8));
+  await assert.rejects(f.reserve(2, 1, 8), { message: /^recovery episode is blocked; no new owner grant$/ });
   assert.equal(f.values.has(f.ownerKey), false);
 });
 
@@ -144,7 +159,7 @@ test("external record rejects duplicate JSON keys and bounded record overflow", 
   const raw = f.values.get(f.ownerKey)![0]!;
   for (const value of ['{"version":1,' + raw.slice(1), raw + " ".repeat(32_768)]) {
     f.values.set(f.ownerKey, [value]);
-    await assert.rejects(f.reserve(2, 1, 8));
+    await assert.rejects(f.reserve(2, 1, 8), { message: /^invalid recovery owner record$/ });
   }
 });
 
@@ -155,8 +170,8 @@ test("a journal missing its charged claim fence cannot renew through a zero-gene
   record.after.claimGeneration = 0;
   f.values.set(f.ownerKey, [JSON.stringify(record)]);
   const journal = f.read(); delete journal.recovery!.claimGeneration; f.write(journal);
-  await assert.rejects(f.reserve(2, 1, 8));
-  assert.equal(await f.recreate().canRenewRecoveryAdoption(f.bare, f.branch, f.key, journal, 2, 1).catch(() => false), false);
+  await assert.rejects(f.reserve(2, 1, 8), { message: /^invalid recovery owner record$/ });
+  await assert.rejects(f.recreate().canRenewRecoveryAdoption(f.bare, f.branch, f.key, journal, 2, 1), { message: /^invalid recovery owner record$/ });
 });
 
 test("owner fixture works without a TMPDIR override", () => {
@@ -242,8 +257,11 @@ for (const change of ["source", "root", "reservation", "bare", "null-with-progre
     }
     f.values.set(f.ownerKey, [JSON.stringify(record)]);
     const before = f.read();
-    await assert.rejects(f.reserve(3, 2, 9));
-    assert.equal(await f.recreate().canRenewRecoveryAdoption(f.bare, f.branch, f.key, before, 3, 2).catch(() => false), false);
+    await assert.rejects(f.reserve(3, 2, 9), change === "bare" ? { message: /^recovery owner binding changed$/ }
+      : change === "zero-generation" ? { message: /^recovery episode is blocked; no new owner grant$/ } : { message: /^recovery owner reservation changed$/ });
+    const eligible = f.recreate().canRenewRecoveryAdoption(f.bare, f.branch, f.key, before, 3, 2);
+    if (change === "bare") await assert.rejects(eligible, { message: /^recovery owner binding changed$/ });
+    else assert.equal(await eligible, false);
     assert.deepEqual(f.read(), before);
   });
 }
@@ -252,7 +270,7 @@ test("pending BEFORE snapshot only reads an existing blocker", async () => {
   const { f, original } = await interrupted("adoption", "before");
   assert.equal(JSON.stringify(await f.recreate().recoveryReservationSnapshot(f.bare, f.branch, f.key, original, original.recovery!)), JSON.stringify(original));
   const journal = f.read(); journal.recovery!.stage = "capturing"; delete journal.recovery!.blocker; f.write(journal);
-  await assert.rejects(f.recreate().recoveryReservationSnapshot(f.bare, f.branch, f.key, journal, journal.recovery!));
+  await assert.rejects(f.recreate().recoveryReservationSnapshot(f.bare, f.branch, f.key, journal, journal.recovery!), { message: /^recovery owner reservation changed$/ });
 });
 
 for (const operation of ["replacement", "settlement"] as const) {

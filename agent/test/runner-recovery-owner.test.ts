@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { RunRunner } from "../src/runner.js";
 import { RequestError } from "../src/client.js";
+import { RecoveryChargeInterruptedError } from "../src/recovery-owner.js";
 import { ownerFixture } from "./recovery-owner-fixture.js";
 import { nullLogger } from "./helpers.js";
 
@@ -171,18 +172,28 @@ for (const ownership of [undefined, "stale", "cancelled", "unknown"] as const) {
     const before = h.f.read();
     const ownerBefore = h.f.values.get(h.f.ownerKey)![0];
     const reserve = h.runner.git.reserveRecoveryIteration.bind(h.runner.git);
-    let admitted = false;
+    let observed: { claimGeneration: unknown; ownerState: unknown } | undefined;
+    const stopped = new RecoveryChargeInterruptedError();
     h.runner.git.reserveRecoveryIteration = async (...args: Parameters<typeof reserve>) => {
       const charged = await reserve(...args);
-      admitted = true;
-      assert.equal(charged.claimGeneration, 2);
-      assert.equal(JSON.parse(h.f.values.get(h.f.ownerKey)![0]!).state, "committed");
+      observed = { claimGeneration: charged.claimGeneration,
+        ownerState: JSON.parse(h.f.values.get(h.f.ownerKey)![0]!).state };
       // Stop at the reservation boundary; capture/model are outside this test's seam.
-      throw new Error("charged boundary reached");
+      throw stopped;
     };
-    await assert.rejects(h.run());
+    await assert.rejects(h.run(), error => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.constructor.name, "RetainedRecoveryStop");
+      if (ownership === undefined) assert.equal(error.cause, stopped, "only the intended interruption ends the admitted charge");
+      return true;
+    });
     assert.ok(h.counts().ownership > 0);
-    assert.equal(admitted, ownership === undefined);
+    assert.equal(observed !== undefined, ownership === undefined);
+    if (ownership === undefined) {
+      assert.equal(observed!.claimGeneration, 2);
+      assert.equal(observed!.ownerState, "committed");
+    }
+    assert.equal(h.counts().terminal, 0, "the reservation boundary never reports terminal failure");
     assert.equal(h.observedCancellations(), ownership === "cancelled" ? 1 : 0);
     assert.equal(h.counts().captures, 0);
     assert.equal(h.counts().models, 0);
