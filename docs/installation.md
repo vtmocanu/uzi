@@ -57,8 +57,10 @@ Register the first account — it becomes admin automatically. Subsequent regist
 
 Deploy the **API first, then workers**. The API applies the additive
 `00364_codex_account_admission_throttle.sql` and
-`00365_codex_admission_projection.sql` schema before serving. The supported
-Helm API deployment remains a singleton with `Recreate`
+`00365_codex_admission_projection.sql` schema, plus
+`00369_codex_operation_admission.sql` (operation metadata) and
+`00370_account_cooldown_projection.sql` (active owner projection), before
+serving. The supported Helm API deployment remains a singleton with `Recreate`
 ([deployment template](../deploy/chart/templates/api-deployment.yaml));
 mixed old/new API replicas outside that topology have no enforcement promise.
 
@@ -67,6 +69,28 @@ provider evidence. Older workers still obey the server's claim gate but
 supply less evidence. Missing or refused reporting drops telemetry without
 changing run lifecycle behavior. See the
 [user contract](rate-limits.md#temporary-account-admission-waits).
+
+Workers independently negotiate `codex_account_operation_admission_v1` for
+fresh supported model dispatches; evidence reporting and optional active
+snapshots do not grant operation permission. A flight that has never negotiated
+this feature retains legacy behavior. Once negotiated, it stays engaged through
+feature loss, clear/re-registration and application rollback. **An admission-service
+outage blocks the next dispatch of every negotiated subscription flight,
+including accounts with no known cooldown.** Already dispatched turns and
+preservation continue with existing controls, budgets and deadlines effective.
+Transport errors, 5xx, malformed/untyped responses and an untyped missing-route
+404 mean unavailable wait, not allow or a provider failure. Strict typed
+`authority_lost` / `stale_source` refusals use the existing ownership/source routes.
+
+Operation reads have a three-second client deadline and 2.5-second server
+context, bounded to 4 KiB actual request bytes and 8 KiB actual response bytes,
+including error bodies. One serialized read per run/generation shares the
+unsuccessful-read schedule across siblings and replacement sources: churn
+cannot bypass it. Cooldown rechecks wait 1–15 seconds using server time;
+unavailability waits 15 seconds. Each later dispatch still needs a fresh read.
+The server uses the existing episode/class policy and finite per-run spread;
+this adds no provider backoff/streak policy. Missing optional active snapshots
+make specialized owner visibility unknown without disabling enforcement.
 
 Reporting is bounded best effort and does not block the provider or lifecycle
 path. Each observation gets at most two HTTP attempts, at most three seconds
@@ -102,7 +126,10 @@ does not use Retry-After.
 
 An ordinary API restart reconstructs admission from persisted database state.
 Application rollback leaves the additive tables and view in place: an old
-API does not read this state and admits without this account gate.
+API does not read this state and admits new claims without this account gate.
+An already engaged operation flight remains closed to new dispatch until the
+admission service returns or existing controls/deadlines settle it; rollback
+is not an operation-admission bypass. Never-negotiated flights remain legacy.
 Roll-forward reapplies still-live finite state; expired rows follow the
 quiet-reset policy when qualifying evidence next arrives. Do not run the
 schema Down migrations as an application rollback.
@@ -110,7 +137,11 @@ schema Down migrations as an application rollback.
 Automated reconstruction coverage creates a separate database pool and service
 instance; it does not exercise a binary or Kubernetes restart. An optional
 operator rollout smoke check can observe a queued run across an API restart
-and confirm admission after eligibility; it is separate from CI gates.
+and confirm admission after eligibility; that smoke check is unperformed here
+and does not replace required CI. M5 **full agent suite: exact-head PR CI**
+remains pending maintainer/hosted-CI verification at the published head:
+`validate-agent`, both `test-agent-shard` legs, `test-agent-worker-uid` and
+`test-agent`. Hosted queue/cache/rerun and critical-path costs remain unmeasured.
 See [ADR-1106](../adr/1106-codex-harness.md#amendment-temporary-account-admission-3530-2026-10-27)
 for the statement-snapshot boundary and critical invariants.
 

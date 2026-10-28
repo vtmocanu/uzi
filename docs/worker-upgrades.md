@@ -20,7 +20,13 @@ by watching the pod rather than by asking the worker.
 
 For `codex_account_admission_signal_v1`, upgrade the API before workers.
 Older workers obey the server claim gate but provide less pressure evidence;
-missing or refused telemetry does not change run lifecycle behavior.
+missing or refused telemetry does not change run lifecycle behavior. This
+best-effort reporting is distinct from independently negotiated
+`codex_account_operation_admission_v1`: once engaged, loss of the admission
+service blocks the next supported model dispatch, even without a known
+cooldown. Already dispatched turns and preservation continue under existing
+controls and deadlines. Never-negotiated flights keep legacy behavior;
+engaged flights cannot downgrade on feature loss or re-registration.
 Operators: see [upgrade, rollback and reporting limits](installation.md#codex-account-admission-upgrades).
 The [account admission policy](rate-limits.md#temporary-account-admission-waits)
 is shared across aliases and adds no account seat limit.

@@ -21,6 +21,7 @@ left to the deadline (e.g. `1h 5m left`).
 | ⚠ stalled | No new activity for a while, and nothing is currently running (a long build or test suite in progress does **not** count as stalled) — or one tool call has been running far longer than a normal build or test suite would (see [Long tool calls](#long-tool-calls)). | Open the run view — it's either quietly working on something the flag doesn't see, or genuinely wedged. |
 | ⚠ near timeout | Has used most (default 85%) of its wall-clock budget while running, gate time excluded; it will park and wait for you at the timeout, not fail — see [Running out of time](#running-out-of-time). | Let it finish if it is on its last milestone, `uzi run scope --through N` / `run stop` to finalize what is committed, or [give it more time](#giving-a-run-more-time) instead. Raising `RUN_TIMEOUT` only helps a run whose budget isn't already frozen — a milestone-scaled run freezes its `budget_wall_seconds` at plan approval, so a later `RUN_TIMEOUT` bump won't extend it. |
 | ⚠ waiting for worker | Queued longer than expected with no worker claiming it — or, for a repo the Docker worker allowlist blocks, as soon as the next health sweep detects it (see below). | The reason names why, if you own the run: no worker online, your vault is locked, or just a wait — start a worker or unlock your vault as needed. A judge or self-improve run instead reads **deprioritized** (yielding to interactive work on purpose, not stuck) or, once it's waited past the grace window, **priority restored** — see [Queue priority](#queue-priority). |
+| waiting for account cooldown | Required new Codex subscription work is blocked by a current account cooldown in `claimed`, `running` or `awaiting_approval`; this is an expected wait, not a fault. | Wait for a fresh admission check, or use the existing run controls. Earliest eligibility does not promise dispatch; see [Account cooldown waits](#account-cooldown-waits). |
 | ⚠ needs approval | Sitting at `awaiting_approval` longer than expected (never shown for autopilot runs, which approve themselves). | Approve, reject, or request changes to the plan — see [Plan approval gate](./run-activity.md#plan-approval-gate). |
 
 Tool-loop detection considers the newest 12 tool uses within 40 fetched tool-use/result rows. Only valid calls with a unique ID and one matching later result count; unmatched or malformed uses occupy a slot without being counted or replaced by older calls. Repeated calls with varying results can still be stuck, but this detector does not flag them.
@@ -221,20 +222,48 @@ health exists so you notice a sick run sooner than a hard deadline would
 tell you, nothing more. Treat the badge as a hint to go look, not as proof
 something is wrong (or that nothing is).
 
+## Account cooldown waits
+
+Owner surfaces show `waiting for account cooldown` with
+`account_cooldown_class` (`rate_limit` or `overload`) and
+`account_cooldown_eligible_at`, including finite per-run recovery spread.
+Health `waiting_account_cooldown` changes neither lifecycle nor worker queue
+reason. Required blocked work can explain the wait; optional background advice
+cannot label an otherwise working root blocked. Waiting uses existing wall or
+whole-call deadlines, without model processing, progress or productivity.
+
+Current ownership, positive claim generation, credential binding and revision
+source must match an accepted active snapshot with a 45-second lease.
+Omission, expiry or source/status changes clear specialized metadata on an
+accepted fresh read. Foreign shared/admin summaries omit class and time.
+Missing, disabled or unsupported optional snapshots (including an old API)
+leave specialized visibility unknown; operation enforcement remains independent.
+Absence proves neither cooldown nor a hung model.
+
+Independent faults, freshness and near-spent wall warnings retain precedence.
+Entry, extension, refresh, expiry and exit do not send per-run Slack nudges.
+Identical root renders are deduplicated for cooldown churn; unknown/faulted roots
+can still need edits and later genuine faults can notify normally.
+See [Temporary account admission waits](rate-limits.md#temporary-account-admission-waits).
+
 ## Timing
 
-Flags are (re-)computed on a periodic sweep, so one can appear a little after
-its raw threshold — never before. This is most visible on **waiting for
+Threshold flags are (re-)computed on a periodic sweep, so one can appear a
+little after its raw threshold — never before. This is most visible on **waiting for
 worker**: the clock starts when the run enters the queue, so a run queued
 right at the threshold may take one more sweep before the badge shows up.
+The account-cooldown owner overlay also validates evidence at read time and can
+appear before that sweep; operation admission does not immediately recompute
+every health signal. The wait stays quiet until a fresh health read: reaching
+the earliest eligibility time triggers no fake activity or progress event.
 
 ## Tuning or turning a flag off
 
-An admin can change any threshold, or disable a single signal entirely by
+An admin can change a threshold, or disable its threshold-based signal by
 setting it to `0`, from **Admin → Instance → Run health** — see
 [Admin settings](./admin-settings.md#run-health). The loop-detection window
-itself (how many repeats, over how large a window) isn't tunable; every other
-signal is — the plain seconds thresholds, and **near timeout**'s share of the
+itself (how many repeats, over how large a window) isn't tunable; the other
+thresholds are — the plain seconds thresholds, and **near timeout**'s share of the
 run's wall-clock budget (a percent, not a duration, so it means the same
 thing regardless of the run's timeout or frozen budget). The undelivered-outcome
 **stalled** reason is the other exception: its threshold is fixed at 4 of the

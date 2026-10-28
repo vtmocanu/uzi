@@ -1061,17 +1061,18 @@ snapshot may race acceptance. See the enforcing
 [service](../api/internal/workersvc/codex_admission.go).
 
 This adds no standing seat lock, ceiling or active-count policy, per-request
-limiter, mid-turn pause, force-park or retry change. Admitted runs continue
-existing execution and preservation. Usage and account-unavailability parked
-policies are independent. Resume, restart, schedules, same-account aliases
-and provisioning pass through the next claim gate. Live admitted approval
-uses existing rules; cancellation remains available. Checker deadlines
-include queued time without exemption or extension. API keys, Claude, chat,
-versioned jobs and the isolated lane keep their prior behavior.
-Running-turn limiting remains the separate [#3531 follow-up](https://github.com/vtmocanu/uzi/issues/3531).
+limiter, mid-turn pause or force-park. Already dispatched turns and preservation
+continue; supported new dispatches, including retries and live approval/revision
+continuations, now use the [durable model-operation boundary](#durable-model-operation-boundary-3531-2026-10-28).
+Usage and account-unavailability parked policies are independent. Resume,
+restart, schedules, same-account aliases and provisioning pass through the next
+claim gate. Checker deadlines include queued/setup time without exemption or
+extension. API keys, Claude, chat, versioned jobs and isolated-lane eligibility
+keep their prior policy.
 
-The owner-only read-time class and eligibility including spread appear on
-run detail/list/board and CLI; foreign shared/admin summaries redact them.
+The queued owner-only read-time class and eligibility including spread appear
+on run detail/list/board and CLI; foreign shared/admin summaries redact them.
+Active operation waits use the separate owner projection described below.
 Finite expiry clears the copy on subsequent reads. Maintenance and account
 unavailability retain precedence with independent admission details.
 Eligibility is not a promised start. There is no per-run Slack burst,
@@ -1079,7 +1080,11 @@ account panel, settings control or Resume now override.
 
 ### Best-effort reporter and acceptance boundary
 
-The negotiated feature is `codex_account_admission_signal_v1`.
+The evidence-reporting feature is `codex_account_admission_signal_v1`,
+independent of strict `codex_account_operation_admission_v1`. Reporter loss or
+an ACK neither revokes nor grants model-operation authority. References below
+to claims/execution continuing concern telemetry loss; an engaged operation
+flight still requires the fresh authorization described below.
 [The reporter](../agent/src/codex/admission-signal.ts) queues without awaiting
 network from provider/lifecycle handlers. It permits two HTTP attempts capped
 at three seconds each within ten seconds monotonic total. The implementation
@@ -1114,7 +1119,9 @@ reporters remain closed; old workers still obey server admission.
 
 The supported API deployment remains singleton Recreate. Deploy the additive
 schema/API before workers. Application rollback leaves the schema in place;
-an old API admits without reading this state. Roll-forward uses still-live
+an old API admits new claims without reading this state, while already engaged
+operation flights remain closed to fresh dispatch until admission service
+returns or existing controls/deadlines settle them. Roll-forward uses still-live
 finite state and the normal quiet-reset policy. Mixed old/new replicas outside
 the singleton carry no enforcement promise. The M4 separate-pool/service
 reconstruction test models persisted recovery, not a binary/Kubernetes
@@ -1125,4 +1132,98 @@ maintainer/CI success for required `validate-agent`, both
 `test-agent-shard` legs and the worker-UID lane on the exact published head
 before merge. The worker cannot trigger hosted jobs before publication;
 these checks are not verified here. An optional operator rollout smoke
-check is separate and does not substitute for required gates.
+check is unperformed here and does not substitute for required gates.
+The required `test-agent` aggregate is also pending; hosted queue/cache/rerun
+and critical-path costs remain unmeasured.
+
+### Durable model-operation boundary (#3531, 2026-10-28)
+
+[#3531](https://github.com/vtmocanu/uzi/issues/3531) extends the same canonical
+subscription-account cooldown policy to fresh supported model dispatches.
+The [scope inventory](../agent/src/codex-operation-scope.ts) connects four sinks:
+root `startTurnRpc`, worker-created `startChildTurn`, production advice
+`startTurnRpc`, and the plan/code checker `run` path. Coverage includes lead
+planning and initial implementation, human and automatic revisions,
+prose/clarification continuations, classified-provider retries and fresh-session
+fallbacks; child delegation; intent, plan, Now, delivery/PR-description summaries,
+judge and diff-review advice; and both checker stages. Every fresh supported
+dispatch reads authorization again; no admitted reply is reused across operations.
+Caller-key PR-description evaluation and offline checker replay have no worker
+subscription authority. Native HTTP retries, tool continuations and possible
+compaction/internal requests within an already dispatched turn have no
+demonstrated worker seam. This is not a gate on every upstream request.
+Native `multi_agent` and `multi_agent_v2` remain disabled.
+
+The [controller](../agent/src/codex-operation-controller.ts) waits in place,
+retaining flight/session, positive claim generation, custody, gate presentation
+and pending feedback in `claimed`, `running` or `awaiting_approval`. It holds
+no account seat lock and creates no standing limit, active counter, provider
+streak/backoff, rotation or Retry-After policy. A concurrent cooldown or
+credential/source update may race the authorization read and send: this is
+snapshot authorization, not atomic revocation. Already dispatched turns continue.
+
+Elapsed waiting is charged once to the existing wall or whole-call deadline.
+The idle watchdog is disarmed before dispatch; waiting fabricates no model
+processing, progress or productivity and consumes/creates no owner recovery
+grant. Cancel, reject, replacement revision, pause, wall, vault and ownership
+routes remain effective; Resume grants no bypass. Capture/checkpoint, refresh
+needed for preservation, tool settlement, persistence and teardown are not
+gated. Children independently wait within deadlines including existing setup;
+there is no exemption, extension or parent-held permit. Notification reading
+and settlement continue without a demultiplexer deadlock. Optional summaries
+may time out without dispatch.
+
+`codex_account_operation_admission_v1` is negotiated independently of signal
+reporting and optional active snapshots. A never-negotiated flight retains
+legacy behavior; once negotiated, its latch survives feature loss, clear and
+re-registration. **Admission-service outage blocks the next dispatch of every
+negotiated subscription flight, including accounts with no known cooldown.**
+Already dispatched turns and preservation continue with existing controls,
+budgets and deadlines. Transport failures, 5xx, malformed/untyped responses and
+untyped route 404 are unavailable waits, not allows or provider failures.
+Strict typed authority/source refusals retain their existing control routes.
+Deploy API first, workers second; rollback keeps additive migrations and
+engaged flights closed until service returns or controls/deadlines settle them.
+See [installation](../docs/installation.md#codex-account-admission-upgrades).
+
+[Client reads](../agent/src/client.ts) have a three-second deadline, 4 KiB
+actual request and 8 KiB actual response limits including error bodies;
+the [server handler](../api/internal/handler/worker_codex_operation_admission.go)
+uses a 2.5-second context. One serialized read per run/generation shares the
+unsuccessful schedule across siblings and source replacements, so churn cannot
+bypass it. Cooldown rechecks take 1–15 seconds from server-clock eligibility;
+unavailable reads wait 15 seconds. Finite waits/extensions require a fresh read.
+The [service](../api/internal/workersvc/codex_operation_admission.go) and
+[authority query](../api/internal/store/queries/codex_operation_admission.sql)
+reuse existing episode/class policy and finite per-run spread.
+
+The owner projection carries `account_cooldown_class` (`rate_limit` or
+`overload`) and absolute `account_cooldown_eligible_at`, with exact reason
+`waiting for account cooldown` and health `waiting_account_cooldown`.
+Eligibility is earliest eligibility, not a promised dispatch. This is expected
+wait health, not lifecycle or `waiting_worker`. The
+[projection boundary](../api/internal/store/migrations/00370_account_cooldown_projection.sql)
+requires blocked required work, current positive generation, ownership,
+credential binding and revision source plus a 45-second accepted snapshot lease.
+Optional background advice cannot label a working root blocked.
+Omission/expiry or source/status change clears metadata at an accepted fresh
+read; foreign shared/admin summaries omit class and time. Missing/disabled
+optional snapshots or an old API leave specialized visibility unknown while
+operation enforcement remains independent. A read-time owner overlay can precede
+the periodic health sweep; an operation read does not recompute every health.
+Cooldown health remains quiet until a fresh health read, not an earliest-time
+timer that invents activity. Independent fault/freshness and near-spent wall
+signals outrank it; see [Run health](../docs/run-health.md#account-cooldown-waits).
+
+Entry, extension, refresh, expiry and exit create no per-run Slack nudge.
+Identical root-render deduplication is scoped to cooldown churn, not a broader
+notifier change; an unknown or faulted root can still need an edit and a later
+genuine fault can notify. The existing
+[actual root-path tests](../api/internal/slacksvc/account_cooldown_test.go)
+exercise state/health entry, exit, retries and direct-fault transitions.
+
+Queued maintenance/weekly-reserve precedence, credential selection and slots
+remain independent; waiting may occupy a worker slot. API keys, Claude, chat,
+versioned jobs and isolated-lane eligibility retain their prior policy.
+The M5 hosted exact-head acceptance and optional smoke boundaries above remain
+pending; this documentation does not establish them as passed.

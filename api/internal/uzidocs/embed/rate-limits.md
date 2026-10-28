@@ -228,14 +228,18 @@ Recovery adds a stable spread per run, up to the opening wait's duration or
 60 seconds, whichever is smaller. A new episode cannot bring eligibility
 forward; after the finite recovery window, account admission is unlimited again.
 
-Runs stay **queued**, and admitted runs continue with their existing retries
-and preservation rules. There is no standing account seat limit, per-request
-limiter, mid-turn pause or force-park. Claim and provisioning decisions use a
-database statement snapshot: an already in-flight statement may admit a run
-after new evidence commits.
+New runs stay **queued** while held. Already claimed subscription runs check
+the same canonical-account policy before each supported **new model dispatch**
+and wait in place, keeping their flight, session, positive claim generation,
+custody, gate presentation and pending feedback. Their lifecycle stays
+`claimed`, `running` or `awaiting_approval`. A turn already dispatched continues.
+There is no standing account seat limit, active counter, mid-turn pause or
+force-park. Claim/provisioning statement snapshots and operation reads can race
+concurrent cooldown evidence or credential/source updates; neither is atomic
+revocation or an account seat lock.
 
-Your run detail, list, board and CLI show the current class and eligibility
-time, including recovery spread:
+For queued waits, your run detail, list, board and CLI show the current class
+and eligibility time, including recovery spread:
 
 - `waiting: provider reported a rate limit; account admission eligible after <time>`
 - `waiting: provider reported overload; account admission eligible after <time>`
@@ -246,14 +250,56 @@ admission details available independently. Shared views and admin summaries
 for another owner omit these fields. There is no per-run Slack burst,
 account settings panel or Resume now override for this wait.
 
-Cancel still works. Resume, restart, schedules, another alias of the same
-account and provisioning pass through the new-claim gate; a live admitted
-approval continues under existing rules. Checker deadlines include queued
-time without an exemption or extension. Usage-window and account-unavailability
-parking policies, OpenAI API keys, Claude, chat, versioned jobs and the
-isolated lane are unchanged. Running-turn limiting remains a separate
-[follow-up (#3531)](https://github.com/vtmocanu/uzi/issues/3531).
-Operators: see [upgrade and reporting limits](installation.md#codex-account-admission-upgrades).
+For required blocked work in a claimed run, owner surfaces instead say
+`waiting for account cooldown`, with `account_cooldown_class` (`rate_limit`
+or `overload`) and `account_cooldown_eligible_at`. The absolute earliest time
+includes finite per-run spread and is not a promised dispatch time. This is
+`waiting_account_cooldown` health, not a lifecycle state or `waiting_worker`.
+Optional background advice cannot label an otherwise working root blocked.
+The display requires current ownership, positive generation, credential binding
+and revision source, plus an accepted active snapshot with a 45-second lease.
+Omission, lease/eligibility expiry or a source/status change clears it on an
+accepted fresh read. Foreign shared/admin summaries omit account class and time.
+Missing, disabled or unsupported optional snapshots (including an old API) mean
+specialized visibility is unknown; operation enforcement is independent.
+Independent faults, freshness warnings and near-spent wall budgets retain
+precedence. See [Run health](run-health.md#account-cooldown-waits).
+
+Each supported new dispatch needs fresh authorization: root planning and initial
+implementation, human and automatic revisions, prose/clarification continuations,
+classified-provider retries and fresh-session fallbacks; worker-created children;
+production advice for intent, plan, Now, delivery/PR description, judge and diff
+review; and both plan/code checker stages. An earlier admission is not reused.
+Native HTTP retries, tool continuations and possible compaction/internal requests
+inside a dispatched turn have no demonstrated worker seam. This does not gate
+every upstream request; native `multi_agent` and `multi_agent_v2` stay disabled.
+Caller-key evaluators and offline replay have no worker subscription authority.
+
+Waiting charges elapsed wall time or the existing whole-call deadline once,
+with the model idle watchdog disarmed and no fabricated progress, processing
+or productivity. It neither consumes nor creates an owner recovery grant.
+Cancel, reject, replacement revision, pause, wall deadlines and vault/ownership
+controls remain effective; Resume cannot bypass admission. Capture/checkpoint,
+refresh needed for preservation, tool settlement, persistence and teardown are
+not gated. Children wait independently within deadlines that include existing
+setup time, without an exemption, extension or parent-held permit; notification
+reading and settlement continue without a demultiplexer deadlock. Optional
+summaries may time out without dispatch.
+
+**An admission-service outage blocks the next dispatch of every negotiated
+subscription flight, including accounts with no known cooldown.** Already
+running turns and preservation continue under existing controls, budgets and
+deadlines. Never-negotiated flights retain legacy behavior; once negotiated,
+feature loss, clear/re-registration, transport errors, 5xx, malformed replies
+and an untyped route 404 cannot downgrade a flight to allow or fabricate a
+provider failure. See [upgrade and rollback limits](installation.md#codex-account-admission-upgrades)
+and the [durable operation boundary](../adr/1106-codex-harness.md#durable-model-operation-boundary-3531-2026-10-28).
+
+Queued maintenance and weekly reserve precedence, credential selection and
+worker slots remain independent; waiting can occupy a slot. Usage-window and
+account-unavailability parking, OpenAI API keys, Claude, chat, versioned jobs
+and isolated-lane eligibility keep their existing policy. There is no new
+provider streak, backoff policy, automatic account rotation or Retry-After use.
 
 ### Where to look
 
