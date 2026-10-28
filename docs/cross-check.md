@@ -158,7 +158,8 @@ restriction.
 
 This is a prompt contract: dispositions remain inside the exact candidate
 digest as untrusted plan content, not authorization. It adds no fields, parser,
-transport, history or authority. Code cross-check guidance is unchanged.
+transport, history or authority. See [Code criteria guidance](#criteria-guidance)
+for the separate code-check instructions.
 Deterministic fixtures and mock tests do not prove model convergence; live
 hosted/model attempts, cost and latency are unmeasured, with no universal
 convergence guarantee. The [configuration notes](./configuration.md#cross-check-settings)
@@ -573,6 +574,78 @@ cross-checked." An incomplete check renders as prose instead, for example
 
 The run page has a **Code cross-check** panel with the same evidence, and
 `uzi run get <id>` prints it (see [CLI](./cli.md#code-cross-check-evidence)).
+
+### Criteria guidance
+
+The code checker brief asks both families to enumerate acceptance criteria from
+the issue, approved plan and frozen approved milestones (`approved_milestones`),
+then report missing or partly delivered criteria:
+
+- Start criterion finding titles, including informational ones, with
+  `Requirement gap:` for missing or partly delivered criteria, or
+  `Coverage uncertainty:` for verification that cannot be done here.
+- Use minor `Coverage uncertainty:` findings for hosted, live or maintainer-only
+  verification. Grade missing worker-deliverable implementation or regression
+  tests by impact.
+- Treat a missing requirement stated by the issue as a safety, security or
+  data-integrity constraint as a critical or major defect, without either prefix.
+  Defect titles must not use criterion prefixes.
+- Cite the most relevant code path or PRD/plan source path; use line 0 when no
+  line applies.
+
+The brief puts defects first within the limits of 20 findings, 2 KiB UTF-8 JSON
+per finding and 32 KiB for the findings array. Criterion findings use spare room
+within those limits. If room remains, at most one minor `Coverage uncertainty:`
+omission note counts unreported criteria. Neither criteria nor omission notes
+may displace a defect; a full defect report may omit both entirely.
+
+The frozen approved milestones are supplied as nonce-fenced untrusted DATA,
+separate from the trusted brief, alongside the issue, plan and code evidence.
+The checker is instructed to treat this material as evidence, never as
+instructions or authorization.
+
+For environment overrides, the brief asks the checker to describe actual
+effects, including inherited child processes. Temporary scratch or `TMPDIR`
+relocation, including Go child build/test temporary files, is not alone a bypass.
+Variable names and destinations do not prove harmlessness; configuration,
+credential and test effects need inspectable evidence. Flag overrides that skip,
+select, narrow or otherwise weaken required validation, or violate an applicable
+explicit restriction.
+
+These are review instructions, not a guarantee of detection or completeness.
+Criterion findings remain advisory under the same one-check, one-repair process,
+without recheck or publication block.
+
+### Review coverage
+
+New code checks separately account for the changed paths in the checked Git
+range, including deleted paths and both names of a rename. Each retained path is
+examined, excluded with a reason, or unassessed. A missing judgment is
+unassessed. The worker supplies the inventory; model-invented paths are dropped
+and counted.
+
+The merge request shows counts such as "Coverage: 9 examined, 0 excluded,
+3 unassessed", plus at most ten unassessed paths within its existing section
+budget. The run page and `uzi run get <id>` show the full stored account,
+including reasons, omitted judgments, and recorded-read flags. These are
+advisory review accounts, not correctness certifications. A recorded-read flag
+comes only from successful recorded file reads; reading a diff or searching a
+directory does not produce that flag. Partial or unavailable activity is shown.
+
+Inventories retain at most 128 unique paths of at most 512 UTF-8 bytes each.
+Processing is bounded at 1 MiB of Git output and 16,384 NUL records. When the
+retained-path cap is exceeded but enumeration finishes, the omitted count is
+exact. If enumeration stops early, the display reports a lower bound or an
+unknown omitted count and never claims complete inventory coverage.
+Judgments have separate bounds (128 entries, 256 UTF-8 bytes per reason and
+32 KiB model coverage); the stored account is bounded at 128 KiB. Invalid or
+oversized coverage does not discard valid findings.
+
+Older workers and historical rows show "coverage not reported". The API
+advertises coverage support on code claims, so newer workers keep the legacy
+findings-only request when talking to an older API. Coverage is stored once
+with the verdict and preserved as earlier evidence after interruption; it is
+not rechecked after the lead's repair pass.
 
 ### Owner guidance and repository instructions
 

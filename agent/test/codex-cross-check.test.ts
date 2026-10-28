@@ -56,7 +56,48 @@ type Emit = (frame: unknown) => void;
 
 // Both injected roots speak the real NDJSON contracts. The fileop stand-in exposes
 // only its dictionary root. This proves functional wiring, not kernel isolation.
+it("admission observer binds checker dispatch and sees terminal HTTP429 independently of checker failure", async t => {
+ const { CodexAdmissionReporter } = await import("../src/codex/admission-signal.js");
+ const sent: import("../src/codex/admission-signal.js").AdmissionSignal[] = [];
+ const reporter = new CodexAdmissionReporter(9, () => true, async b => { sent.push(b); return 204; });
+ let attemptId: string | undefined;
+ const begin = reporter.begin.bind(reporter);
+ t.mock.method(reporter, "begin", (thread: string) => {
+  const attempt = begin(thread); attemptId = attempt.id; return attempt;
+ });
+ const r = rig({ subscription: true, admissionReporter: reporter,
+  beforeResponse(frame) {
+   if (frame.method === "turn/start") assert.match(attemptId!, /^[0-9a-f-]{36}$/);
+  },
+  notes(emit) {
+   emit({ method: "error", params: { threadId: "foreign", turnId: "turn", willRetry: true,
+    error: { codexErrorInfo: "serverOverloaded" } } });
+   emit({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "failed",
+    error: { codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 429 } } } } } });
+  },
+ });
+ try {
+  await assert.rejects(r.run(), /model error/); // existing foreign error behavior stays intact
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(sent.length, 0);
+ } finally { reporter.seal(true); }
+ const terminalOnly = new CodexAdmissionReporter(9, () => true, async b => { sent.push(b); return 204; });
+ const r2 = rig({ subscription: true, admissionReporter: terminalOnly,
+  notes(emit) {
+   emit({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "failed",
+    error: { codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 429 } } } } } });
+  },
+ });
+ try {
+  await assert.rejects(r2.run(), /terminal turn/);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(sent.map(b => b.class), ["rate_limit"]);
+  assert.equal(sent[0]!.claim_generation, 9);
+ } finally { terminalOnly.seal(true); }
+});
+
 function rig(options: {
+ admissionReporter?: import("../src/codex/admission-signal.js").CodexAdmissionReporter;
  round?: number;
  notes?: (emit: Emit) => void;
  beforeResponse?: (frame: Frame, emit: Emit) => void;
@@ -151,7 +192,8 @@ function rig(options: {
   launchProvider: async (spec) => { specs.push(spec); return provider; },
  };
  let releases = 0;
- const client: Pick<WorkerClient, "releaseCodex" | "refreshCodex"> = {
+ const client: Pick<WorkerClient, "releaseCodex" | "refreshCodex"> & Partial<Pick<WorkerClient, "codexAdmissionReporter">> = {
+  codexAdmissionReporter: () => options.admissionReporter,
   releaseCodex: async () => { releases++; return options.subscription
    ? { auth_mode: "subscription", access_token: "released-token", generation: 7, chatgpt_account_id: "account", chatgpt_plan_type: null }
    : { auth_mode: "api_key", access_token: "released-token" }; },
@@ -212,12 +254,12 @@ it("code checker uses the confined provider and file broker and returns only fin
  assert.match(input, /<code_context_[a-f0-9]{32}>/);
 });
 
-// PRD #2170. The goldens are the sha256 of the pre-change brief and nonce-stripped DATA prompt for
-// codeClaim() (computed from the tree before owner guidance and repository instructions existed).
+// PRD #3167 M3a: shared code brief and nonce-stripped milestones DATA prompt goldens.
+// These are separate from the byte-frozen pre-M2 replay corpus pins.
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 const stripNonces = (text: string) => text.replace(/_[a-f0-9]{32}>/g, "_NONCE>");
-const GOLDEN_CODE_PROMPT = "40aa10669f27861a6f35882e8c95b82b67979a37b738cb53c01506ff1eda0f03";
-const GOLDEN_CODEX_CODE_BRIEF = "29e410c44476fb6e2560fd03c2d990de24cee2193e6df6c250085cb1b39252a5";
+const GOLDEN_CODE_PROMPT = "35fd960289a82fde40b0d12e24533b5130a8db60687b4023ddb14b07d5c080a9";
+const GOLDEN_CODEX_CODE_BRIEF = "67ea80eefc42d66f40db3774f6845f6ad9d2d5bd143bc1d28b9cc3fb3a2c85be";
 
 async function codeRequests(c: ClaimResponse) {
  const r = rig({ claim: c, notes: (emit) => r.terminal(emit, '{"findings":[]}') });
@@ -228,13 +270,24 @@ async function codeRequests(c: ClaimResponse) {
  };
 }
 
-it("code checker with empty guidance and instructions off is byte-identical to the previous brief and DATA prompt", async () => {
+it("code checker with empty guidance and instructions off is pinned to the revised brief and DATA prompt", async () => {
  const { brief, prompt } = await codeRequests(codeClaim());
  assert.equal(sha256(brief), GOLDEN_CODEX_CODE_BRIEF);
  assert.equal(sha256(stripNonces(prompt)), GOLDEN_CODE_PROMPT);
  const off = codeClaim();
  Object.assign(off.cross_check!, { repo_instructions_enabled: false, custom_guidance_applied: false });
  assert.equal(sha256(stripNonces((await codeRequests(off)).prompt)), GOLDEN_CODE_PROMPT);
+});
+
+it("Codex code run carries populated approved milestones only in DATA", async () => {
+ const c = codeClaim();
+ const milestones = [{ id: "m1", title: "FROZEN-CRITERION" }];
+ Object.assign(c.cross_check!, { milestones });
+ const { brief, prompt } = await codeRequests(c);
+ assert.doesNotMatch(brief, /FROZEN-CRITERION/);
+ const match = /^<approved_milestones_([a-f0-9]{32})>\n([^\n]+)\n<\/approved_milestones_\1>$/m.exec(prompt);
+ assert.ok(match);
+ assert.deepEqual(JSON.parse(match[2]!), milestones);
 });
 
 it("code checker puts owner guidance in the trusted brief, nonce-delimited, and never in the DATA prompt", async () => {

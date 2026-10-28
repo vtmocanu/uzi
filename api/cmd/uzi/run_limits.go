@@ -88,7 +88,10 @@ func newRunResumeNowCmd(env Env, gf *globalFlags) *cobra.Command {
 // a plain RunDTO that carries neither the worker's NAME nor its liveness (draining/gone),
 // which the richer "pinned to worker <name> …" wording would need — and the PRD is explicit
 // that a round-trip must not be added just for that wording — so the plain form is what a CLI
-// resume prints today. --json emits the run object for the agent contract.
+// resume prints today. The one pre-resume read it does make is PRD #3522's: human output reads the
+// run's hold first, so the weekly-usage-reserve override line names only a resume that lifted a
+// reserve hold (an exemption from an earlier resume survives an ordinary one). --json and --quiet
+// skip that read. --json emits the run object for the agent contract.
 func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 	resume := &cobra.Command{
 		Use:   "resume <run-id>",
@@ -97,6 +100,9 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			"keeps the worker pin, and banks the parked time so the remaining budget is what it was — the " +
 			"clock stopped while paused. The claim then continues the SDK session on the same worker if it " +
 			"is still alive, or recovers the branch from the checkpoint on another worker if it is gone.\n\n" +
+			"For retained recovery exhausted (recovery_wait), Resume now requests another attempt; success is not assured. " +
+			"A finite retry stamp means timed retry, even after it is due; NULL means owner-held with no automatic resume. " +
+			"Cancel is terminal. Resume does not reset the retained recovery cap or promise a fresh archive or latest edits.\n\n" +
 			"For worker memory pressure (recovery_wait), only owner Resume starts a fresh memory episode; " +
 			"Cancel is terminal. There is no automatic resume. Source/archive availability and latest edits remain unverified.\n\n" +
 			"For worker recovery exhausted (recovery_wait), only owner Resume starts a fresh recovery episode " +
@@ -111,16 +117,31 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			p := env.printer(gf)
+			human := p.Format != uzicli.FormatJSON && !gf.quiet
+			// PRD #3522: the override line names THIS resume's effect, so it needs the hold the run had
+			// before the resume (an exemption recorded by an earlier resume survives an ordinary one). A
+			// failed read only costs the wording: the resume itself is still attempted below.
+			reserveHold := false
+			if human {
+				if prior, gerr := c.GetRun(cmd.Context(), args[0]); gerr == nil && prior.HoldReason != nil {
+					reserveHold = *prior.HoldReason == holdWeeklyReserve
+				}
+			}
 			run, err := c.ResumeRunNow(cmd.Context(), args[0])
 			if err != nil {
 				return err
 			}
-			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(run)
 			}
 			if !gf.quiet {
-				p.Printf("Resumed %s: queued.\n", args[0])
+				if reserveHold && run.ReserveExemptUntil != nil {
+					// The server records the override only when it resumed a weekly_reserve hold.
+					p.Printf("Resumed %s: queued (overrides the weekly usage reserve until the next weekly reset).\n", args[0])
+				} else {
+					p.Printf("Resumed %s: queued.\n", args[0])
+				}
 				if w := run.WorkerRecovery; w != nil && w.Episode > 0 {
 					p.Printf("Worker recovery episode %d; only owner Resume from exhaustion starts a fresh worker recovery episode; automatic requeue allowance %d; %d used, %d remaining; lifetime charged count %d.\n", w.Episode, w.AutomaticRequeueLimit, w.EpisodeUsed, w.EpisodeRemaining, run.RequeueCount)
 					if w.AutomaticRequeueLimit == 0 {
@@ -342,7 +363,7 @@ func newRunReworkCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			// renderCreatedRun is `run create`'s renderer: renderRunDetail for humans and the
 			// SAME {"run": <dto>} envelope for --json, since this creates a new mr_rework run.
-			return renderCreatedRun(env, gf, run)
+			return renderCreatedRun(env, gf, run.RunDTO, run.Notice)
 		},
 	}
 	rework.Flags().StringP("message", "m", "", "optional guidance to steer the rework (or pipe it on stdin)")

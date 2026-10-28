@@ -33,9 +33,16 @@ import (
 // review still needs the nil Reviews entry — otherwise it is asking about a 404.
 type FakeClient struct {
 	User apitypes.UserDTO
-	// VaultLocked drives WhoamiVault's `locked` return (PRD #1251 M2), so a test can drive
-	// the TUI's tier-1 vault-locked hint on/off. Whoami ignores it (it stays {user}-only).
+	// VaultLocked drives WhoamiVault and VaultStatus, so fixtures share one vault state.
+	// Whoami ignores it (it stays {user}-only).
 	VaultLocked bool
+	VaultMode   string
+
+	VaultStatusErr       error
+	VaultUnlockErr       error
+	VaultStatusCalls     int
+	VaultUnlockCalls     int
+	VaultUnlockPasswords []string
 
 	Runs                 []apitypes.RunListItemDTO
 	RunByID              map[string]apitypes.RunDTO
@@ -90,6 +97,7 @@ type FakeClient struct {
 	CodexRateLimits []apitypes.CodexAdminRateLimitRowDTO
 	GuardrailV      apitypes.GuardrailImpactDTO
 	BlockedReposV   apitypes.AdminBlockedReposDTO
+	MaintenanceV    apitypes.MaintenanceAdminDTO
 	AdminSettingsV  AdminSettingsView
 	AgentSourceV    apitypes.AgentSourceDTO
 	// EgressProfiles drives AdminListEgressProfiles and AdminGetEgressProfile (PRD #1906
@@ -139,7 +147,10 @@ type FakeClient struct {
 	// Write-verb capture + canned replies. CreateRun returns CreatedRun and records
 	// its args; SubmitRunInput returns InputResp and records kind/body/selection, so
 	// a test can assert the exact wire mapping of each write verb.
-	CreatedRun         apitypes.RunDTO
+	CreatedRun apitypes.RunDTO
+	// CreatedNotice is the canned maintenance notice (PRD #3454) CreateRun and CreateTaskRun
+	// return beside the run; empty = maintenance off.
+	CreatedNotice      string
 	LastCreateRepoID   string
 	LastCreateIssueIID int64
 	// LastCreateWaitOnLimit keeps the POINTER rather than a bool, so a test can tell
@@ -329,6 +340,12 @@ type FakeClient struct {
 
 	// Settings drives GetMySettings: the caller's own non-secret settings.
 	Settings apitypes.UserSettingsDTO
+
+	// SetUsageReserve capture (PRD #3522): how many times it was called and the threshold
+	// (nil = off) and pause flag the command sent.
+	ReserveCalls     int
+	LastReservePct   *int
+	LastReservePause bool
 
 	// Secrets drives ListSecrets (PRD #104 M2).
 	Secrets                  []apitypes.SecretDTO

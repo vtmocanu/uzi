@@ -66,8 +66,9 @@ type ClaimPayload struct {
 	LastSeq                  int32   `json:"last_seq"` // resume: continue message numbering
 	IterationCount           int32   `json:"iteration_count"`
 	RequeueCount             int32   `json:"requeue_count"`
-	// WorkerRecoveryEpisode is the run row's owner-authorized recovery episode.
-	// ResumeWorkerRecoveryEpisode alone increments it; automatic requeues and claims
+	// WorkerRecoveryEpisode combines the stored owner-authorized episode and retained parks.
+	// ResumeWorkerRecoveryEpisode increments the stored episode; retained parks advance
+	// this projection. Automatic requeues and claims
 	// preserve it. Always present, including zero; older workers ignore the key.
 	// Run-backed cross-check claims use the child run's episode, never the lead's.
 	// Non-run cross-check records have no recovery episode to project.
@@ -133,7 +134,8 @@ type ClaimPayload struct {
 	// (no requeue writer touches them), so a worker that dies with a pause pending re-arms it
 	// on resume — the re-claim seeds the flag, and pause_after_count still compares against the
 	// monotone milestones_completed. PausePending is (pause_requested_at IS NOT NULL);
-	// PauseMode passes the mode through ('milestone'|'now'), empty/omitted when none is
+	// PauseMode passes the mode through ('milestone'|'now'|'wall'; the weekly reserve's
+	// own 'reserve' request is served as 'milestone', servedPauseMode), empty/omitted when none is
 	// pending. Additive on the wire — an old worker ignores both keys.
 	// ParkRunSupported negotiates the protocol for the entire flight; endpoint
 	// authorization independently checks its current phase and persisted plan.

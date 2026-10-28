@@ -324,7 +324,9 @@ test("runner-shared inventory requires the nine literal top-level real-uid leave
     }
     const run = (lane: string) => JSON.parse(execFileSync(process.execPath,
       [path.join(repo, "e2e/worker-uid/inventory.mjs"), lane], { cwd: repo, encoding: "utf8" }));
-    assert.deepEqual(run("shared"), wanted);
+    const shared = run("shared");
+    assert.deepEqual(shared.filter((item: { file: string }) => item.file === sharedFile), wanted);
+    assert.ok(shared.some((item: { file: string }) => item.file === "e2e/worker-uid/pod-epoch-real.test.mts"));
     // The root-started leaves stay out of the other lanes.
     for (const lane of ["worker", "command", "single"]) {
       assert.equal(run(lane).some((item: { file: string }) => item.file === sharedFile), false, lane);
@@ -333,4 +335,40 @@ test("runner-shared inventory requires the nine literal top-level real-uid leave
     api.close();
     rmSync(scratch, { recursive: true, force: true });
   }
+});
+
+const epochFile = "e2e/worker-uid/pod-epoch-real.test.mts";
+const epochTitles = [
+  "pod epoch real Node fd survives flock helper exit, excludes peers and releases only with its owner",
+  "pod epoch real concurrent consumers preserve S to T to S history and the full immutable ledger bound",
+  "pod epoch rendered seed and runner-init wait under EX in both real UID modes",
+  "pod epoch real entrypoint fences protected initialization under EX and confines both UID bootstrap launches",
+  "pod epoch private API CA survives both real UID launch chains without relaxing preload refusal",
+  "pod epoch restores observable persistent worker and runner scratch in both UID modes and refuses invalid saved paths",
+];
+test("pod epoch inventory independently requires every literal image proof and keeps other lanes unchanged", () => {
+  const scratch = mkdtempSync(path.join(repo, ".uzi/scratch/epoch-inventory."));
+  const api = new API({ cwd: scratch });
+  try {
+    const source = readFileSync(path.join(repo, epochFile), "utf8");
+    const fixtures = [{ name: "actual", source, error: false }];
+    for (const [index, title] of epochTitles.entries()) {
+      assert.ok(source.includes(JSON.stringify(title)), "literal title exists");
+      fixtures.push({ name: "renamed-" + index, source: source.replace(JSON.stringify(title), JSON.stringify(title + " changed")), error: true });
+      fixtures.push({ name: "nonliteral-" + index, source: source.replace(JSON.stringify(title), JSON.stringify(title) + ' + ""'), error: true });
+    }
+    writeFileSync(path.join(scratch, "tsconfig.json"), JSON.stringify({ files: fixtures.map(f => f.name + ".mts") }));
+    for (const fixture of fixtures) writeFileSync(path.join(scratch, fixture.name + ".mts"), fixture.source);
+    const program = api.updateSnapshot({ openProjects: [path.join(scratch, "tsconfig.json")] }).getProjects()[0].program;
+    for (const fixture of fixtures) {
+      const collect = () => inventoryForSource(program.getSourceFile(path.join(scratch, fixture.name + ".mts")), "pod-epoch-real");
+      if (fixture.error) assert.throws(collect, /missing required literal pod-epoch|nonliteral targeted/, fixture.name);
+      else assert.deepEqual(collect(), epochTitles.map(name => ({ file: epochFile, names: [name] })));
+    }
+    for (const lane of ["shared", "worker", "command", "single"]) {
+      const actual = JSON.parse(execFileSync(process.execPath, [path.join(repo, "e2e/worker-uid/inventory.mjs"), lane], { encoding: "utf8" }));
+      assert.deepEqual(actual.filter((item: { file: string }) => item.file === epochFile),
+        lane === "shared" ? epochTitles.map(name => ({ file: epochFile, names: [name] })) : [], lane);
+    }
+  } finally { api.close(); rmSync(scratch, { recursive: true, force: true }); }
 });

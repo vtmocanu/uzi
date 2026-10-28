@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { it } from "node:test";
+import { it, type TestContext } from "node:test";
+import { once } from "node:events";
+import { PassThrough } from "node:stream";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -7,6 +9,8 @@ import { createHash } from "node:crypto";
 import { SinkGate } from "../src/sink-gate.js";
 import type { CheckpointStop } from "../src/checkpoint-stop.js";
 import type { Executor } from "../src/executor.js";
+import type { SpawnedBoundaryProcess } from "../src/codex/safety.js";
+import type { BoundaryProcessRequest } from "../src/harness.js";
 import { CheckpointSoftDeadlineError, GitBoundaryAbortError, CheckpointUnsafeCleanupError } from "../src/checkpoint-stop.js";
 import { checkCode } from "../src/code-cross-check-gate.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
@@ -609,4 +613,434 @@ it("a shutdown sink keeps its wall-clock budget when the test clock is far from 
     worker.shutdown();
     await Promise.allSettled([execution, rig?.installer.settle() ?? Promise.resolve()]);
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Issue #3304 (code-snapshot half): the done-gate code-head read (`readBare` of the `--name-only`
+// diff, a Codex prompt claim) must settle at its boundary. Only that one child is faked; the safety
+// facade, registry, `spawnCheckpointProcess`, `exitGatedStream`, `spawnGit` and `readBare` are real.
+// ---------------------------------------------------------------------------------------------
+
+type DiffStdout = "never_ends" | "ended_unread" | "read_then_ended" | "destroyed" | "errored";
+interface DiffChild {
+  stdout: DiffStdout;
+  /** `clean_exit`: waitChild resolves 0 at once. `until_cancelled`: it never resolves by itself. */
+  exit: "clean_exit" | "until_cancelled";
+  /** `unclean`: the whole-root reap fails. `dispose_throws`: the root's dispose rejects. */
+  cleanup?: "unclean_reap" | "dispose_throws";
+}
+/** `soft_then_hard` records whether the gate was still pending after the soft deadline alone. The `during`
+ *  actions replace the clock: an owner cancel, or a `now` pause, lands while the child is stalled. */
+type Stop = "none" | "soft" | "hard" | "soft_then_hard" | "cancel" | "pause_now";
+
+/** Observe the controlled child's consequences without advancing any wall-clock timer. */
+async function observeTurns(done: () => boolean = () => false): Promise<boolean> {
+  for (let turn = 0; !done() && turn < 200; turn++) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+  return done();
+}
+
+function eventSignal(): { ready: Promise<void>; mark: () => void } {
+  let mark!: () => void;
+  const ready = new Promise<void>(resolve => { mark = resolve; });
+  return { ready, mark };
+}
+
+/** Track (and unref) every pending 600 s timer, so a red run can neither hang the process nor hide one. */
+function trackReadTimers(t: TestContext): { pending: () => number; flush: () => number } {
+  const real = globalThis.setTimeout, realClear = globalThis.clearTimeout;
+  const live = new Map<unknown, () => void>();
+  t.mock.method(globalThis, "setTimeout", ((fn: (...args: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+    if (ms !== 600_000) return real(fn, ms, ...rest);
+    const run = (): void => { live.delete(handle); fn(...rest); };
+    const handle: NodeJS.Timeout = real(run, ms);
+    handle.unref();
+    live.set(handle, run);
+    return handle;
+  }) as unknown as typeof setTimeout);
+  t.mock.method(globalThis, "clearTimeout", ((handle?: NodeJS.Timeout) => {
+    live.delete(handle);
+    return realClear(handle);
+  }) as typeof clearTimeout);
+  // Only a red run uses this: it plays the 600 s timers out so the run still ends by assertion.
+  return { pending: () => live.size, flush: () => { const runs = [...live.values()]; runs.forEach(run => run()); return runs.length; } };
+}
+
+const isNameOnlyDiff = (request: BoundaryProcessRequest): boolean =>
+  request.argv.includes("--name-only") && request.argv.includes("--no-textconv");
+
+interface DiffRun {
+  settledAtStop: boolean;
+  settledAfterSoft: boolean | undefined;
+  outcome: { kind: "resolved"; value: unknown } | { kind: "rejected"; error: unknown } | undefined;
+  submitted: unknown[];
+  lines: Array<{ msg?: string; outcome?: string; step?: string }>;
+  events: string[];
+  poisoned: boolean;
+  timersAtStop: number;
+  cancels: number;
+  failedStates: number;
+  spawnedNameOnly: number;
+}
+
+async function runDiffScenario(t: TestContext, issue: number, spec: {
+  child: DiffChild; stop: Stop; claim?: Record<string, unknown>;
+  /** Which boundary child is faked; the first matching spawn only. Default: the `--name-only` diff. */
+  match?: (request: BoundaryProcessRequest) => boolean;
+}): Promise<DiffRun> {
+  const clock = virtualBoundaryClock();
+  const { logger, lines } = recordingLogger();
+  const timers = trackReadTimers(t);
+  const events: string[] = [];
+  const submitted: unknown[] = [];
+  t.mock.method(client, "codeCrossCheckStatus", async () => ({ stage: "code", result: "no_row", repo_instructions_enabled: false }));
+  t.mock.method(client, "recordCompletionAttempt", async () => ({ unmet: [], attemptCount: 1 }));
+  t.mock.method(client, "submitCodeCrossCheck", async (_id: string, _generation: number, snapshot: unknown) => {
+    submitted.push(snapshot);
+    throw new Error("fixture response unavailable");
+  });
+  let nameOnly = 0, cancels = 0;
+  const launched = eventSignal(), reaped = eventSignal();
+  let stdout!: PassThrough;
+  const spawnDiff = async (): Promise<SpawnedBoundaryProcess> => {
+    stdout = new PassThrough();
+    const stderr = new PassThrough(), stdin = new PassThrough();
+    for (const stream of [stdout, stderr, stdin]) stream.on("error", () => undefined);
+    const closed = new Promise<void>(resolve => stdout.once("close", () => resolve()));
+    nameOnly++; launched.mark();
+    events.push("spawned");
+    if (spec.child.stdout === "ended_unread") { stdout.resume(); stdout.end(); await once(stdout, "end"); }
+    else if (spec.child.stdout === "read_then_ended") { stdout.write("lost\n"); stdout.resume(); stdout.end(); await once(stdout, "end"); }
+    else if (spec.child.stdout === "destroyed") { stdout.destroy(); await closed; }
+    else if (spec.child.stdout === "errored") { stdout.destroy(new Error("fixture stdout failure")); await closed; }
+    return {
+      root: {
+        kind: "boundary_action",
+        reap: async () => {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          events.push("reap");
+          reaped.mark();
+          return spec.child.cleanup === "unclean_reap"
+            ? { ok: false as const, error: { category: "tool" as const, message: "fixture root did not reap" } }
+            : { ok: true as const };
+        },
+        dispose: async () => {
+          cancels++; events.push("dispose");
+          if (spec.child.cleanup === "dispose_throws") throw new Error("fixture dispose failed");
+        },
+      },
+      stdin, stdout, stderr,
+      waitChild: () => spec.child.exit === "clean_exit" ? Promise.resolve({ code: 0 }) : new Promise(() => undefined),
+    };
+  };
+  let rig: ReturnType<typeof codexRig> | undefined;
+  let record: Omit<DiffRun, "lines" | "failedStates" | "submitted" | "spawnedNameOnly" | "cancels"> | undefined;
+  const match = spec.match ?? isNameOnlyDiff;
+  let matched = false;
+  const claim = gitlabClaim(issue, { kind: "prompt", issue_iid: null, issue_description: "Do the prompt task.",
+    code_cross_check_required: true, claim_generation: 1, ...spec.claim });
+  const route = (kind: string, body?: string): void => {
+    const active = (worker as unknown as { activeRuns: Map<string, { steering: { route(kind: string, body?: string, id?: number): void } }> })
+      .activeRuns.get(claim.run_id)!;
+    active.steering.route(kind, body, 1);
+  };
+  const executor: Executor = {
+    get safety() { return rig?.safety; },
+    run: async ctx => {
+      // As the production run context does for a `now` pause: that abort never reaches the execution.
+      const execution = new AbortController();
+      const forward = (): void => { if (!(ctx.signal?.reason instanceof PauseNowSignal)) execution.abort(ctx.signal?.reason); };
+      if (ctx.signal?.aborted) forward(); else ctx.signal?.addEventListener("abort", forward, { once: true });
+      rig = codexRig({ lifecycleSignal: AbortSignal.any([execution.signal, ctx.terminalLifecycleSignal!]),
+        armDeadline: clock.armDeadline, now: clock.now,
+        boundaryProcess: request => !matched && match(request) ? (matched = true, spawnDiff()) : undefined });
+      const withBoundary = rig.safety.withBoundary.bind(rig.safety);
+      rig.safety.withBoundary = async (request, action) => {
+        try { return await withBoundary(request, action); }
+        finally { if (request.sink === "done_checkpoint") events.push("boundary-returned"); }
+      };
+      commitInTree(ctx.worktreePath, "prompt.txt", "prompt candidate\n");
+      let settled = false;
+      const gate = ctx.codeCrossCheckGate!({ interlocked: false }).then(
+        value => ({ kind: "resolved" as const, value }), error => ({ kind: "rejected" as const, error }));
+      void gate.then(() => { settled = true; });
+      try {
+        if (spec.stop !== "none") {
+          await launched.ready;
+          // A clean exit must have fully settled (exit, reap, completion) BEFORE the stop arrives.
+          if (spec.child.exit === "clean_exit") {
+            await reaped.ready;
+            await observeTurns();
+          }
+        }
+        else {
+          // The step-label control uses only real children. For fake early-EOF cases, first
+          // reach the controlled completion, then observe whether the bounded read settled.
+          if (spec.match) await gate;
+          else { await launched.ready; await reaped.ready; await observeTurns(() => settled); }
+        }
+        let settledAfterSoft: boolean | undefined;
+        if (spec.stop === "cancel") { route("cancel"); await observeTurns(() => settled); }
+        else if (spec.stop === "pause_now") { route("pause", "now"); await observeTurns(() => settled); }
+        else if (spec.stop === "soft_then_hard") {
+          clock.advance(60_000);
+          settledAfterSoft = await observeTurns(() => settled);
+          clock.advance(30_000);
+          await observeTurns(() => settled);
+        } else if (spec.stop !== "none") {
+          clock.advance(spec.stop === "soft" ? 60_000 : 90_000);
+          await observeTurns(() => settled);
+        }
+        record = { settledAtStop: settled, settledAfterSoft, outcome: undefined, events, timersAtStop: timers.pending(),
+          poisoned: rig.registry.isPoisoned() };
+      } finally {
+        // A red run must end by assertion, never by the 600 s timer: unblock whatever is still pending.
+        stdout?.destroy();
+        if (!settled) timers.flush();
+        if (!settled && !(await observeTurns(() => settled))) clock.advance(120_000);
+        const outcome = await gate;
+        if (record) record.outcome = outcome;
+      }
+      return { branch: ctx.branch };
+    },
+  };
+  const worker = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, logger, {
+    checkpointIntervalMs: 0,
+    checkpointTestHooks: { absoluteNow: clock.now, armSoftDeadline: clock.arm },
+  });
+  await worker.execute(claim);
+  assert.ok(record, "the executor reached the scenario record");
+  return { ...record, submitted, lines: lines as DiffRun["lines"], cancels, spawnedNameOnly: nameOnly,
+    failedStates: api.states.filter(s => s.body.status === "failed").length };
+}
+
+const attemptOutcomes = (r: DiffRun): Array<string | undefined> =>
+  r.lines.filter(l => l.msg === "checkpoint attempt").map(l => l.outcome);
+
+it("m3304 v1: a clean exit with a stdout that never ends settles at the soft deadline as snapshot_failed", async t => {
+  const r = await runDiffScenario(t, 330401, { child: { stdout: "never_ends", exit: "clean_exit" }, stop: "soft" });
+  assert.equal(r.spawnedNameOnly, 1);
+  assert.equal(r.settledAtStop, true, "the gate settles at the soft deadline, not after the 600 s read timer");
+  assert.deepEqual(r.submitted, [{ reason_class: "snapshot_failed" }]);
+  assert.ok(r.lines.some(l => l.msg === "code snapshot unavailable"));
+  assert.deepEqual(attemptOutcomes(r), ["soft_stop"]);
+  assert.equal(r.failedStates, 0, "the run does not fail");
+  assert.equal(r.poisoned, false);
+  assert.equal(r.timersAtStop, 0, "no 600 s read timer is left pending");
+  assert.ok(r.events.indexOf("reap") >= 0 && r.events.indexOf("reap") < r.events.indexOf("boundary-returned"),
+    "the child's completion settled before the boundary returned");
+});
+
+it("m3304 v1: a hard expiry with a stdout that never ends is terminal and leaves no read timer", async t => {
+  const r = await runDiffScenario(t, 330402, { child: { stdout: "never_ends", exit: "clean_exit" }, stop: "hard" });
+  assert.equal(r.settledAtStop, true);
+  assert.equal(r.outcome?.kind, "rejected");
+  assert.equal((r.outcome as { error: Error }).error.name, "CodexBoundaryError");
+  assert.deepEqual(r.submitted, [], "a hard expiry is never reported as snapshot_failed");
+  assert.equal(r.timersAtStop, 0, "the hard expiry settles the read; its 600 s timer is cleared");
+});
+
+it("m3304 v2 control: a child running until cancelled settles at the soft deadline as snapshot_failed", async t => {
+  const r = await runDiffScenario(t, 330403, { child: { stdout: "never_ends", exit: "until_cancelled" }, stop: "soft" });
+  assert.equal(r.settledAtStop, true);
+  assert.deepEqual(r.submitted, [{ reason_class: "snapshot_failed" }]);
+  assert.deepEqual(attemptOutcomes(r), ["soft_stop"]);
+  assert.equal(r.failedStates, 0);
+  assert.equal(r.poisoned, false);
+  assert.ok(r.events.indexOf("dispose") >= 0 && r.events.indexOf("reap") >= 0, "cancellation disposed and reaped the child");
+});
+
+for (const [name, child, stop] of [
+  ["unclean reap after a clean exit", { stdout: "never_ends", exit: "clean_exit", cleanup: "unclean_reap" }, "none"],
+  ["a throwing dispose while cancelled", { stdout: "never_ends", exit: "until_cancelled", cleanup: "dispose_throws" }, "soft"],
+] as const) {
+  it(`m3304 v3: ${name} stays terminal, never snapshot_failed`, async t => {
+    const r = await runDiffScenario(t, name.startsWith("unclean") ? 330404 : 330405, { child, stop });
+    assert.equal(r.settledAtStop, true);
+    assert.equal(r.outcome?.kind, "rejected");
+    assert.equal((r.outcome as { error: Error }).error.name, "CodexBoundaryError");
+    assert.deepEqual(r.submitted, []);
+  });
+}
+
+it("m3304 v4(i): a source that already ended with nothing read is an empty diff, so the gate proceeds without a stall", async t => {
+  const r = await runDiffScenario(t, 330406, { child: { stdout: "ended_unread", exit: "clean_exit" }, stop: "none" });
+  assert.equal(r.settledAtStop, true, "no stall: the empty ended source settles at the child's clean exit");
+  assert.deepEqual(r.outcome, { kind: "resolved", value: { action: "proceed" } });
+  assert.ok(!r.lines.some(l => l.msg === "code snapshot unavailable"));
+  assert.deepEqual(r.submitted, []);
+  assert.equal(r.timersAtStop, 0);
+});
+
+for (const [stdout, label] of [
+  ["read_then_ended", "data already read"], ["destroyed", "destroyed without end"], ["errored", "errored"],
+] as const) {
+  it(`m3304 v4: a source with ${label} at the handle is refused as snapshot_failed, never an empty diff`, async t => {
+    const r = await runDiffScenario(t, 330407 + ["read_then_ended", "destroyed", "errored"].indexOf(stdout),
+      { child: { stdout, exit: "clean_exit" }, stop: "none" });
+    assert.equal(r.settledAtStop, true, "settles at the child's clean exit");
+    assert.deepEqual(r.submitted, [{ reason_class: "snapshot_failed" }]);
+    assert.ok(r.lines.some(l => l.msg === "code snapshot unavailable"));
+    assert.equal(r.failedStates, 0);
+    assert.equal(r.timersAtStop, 0);
+  });
+}
+
+it("m3304 v1 on an unmasked shared read (merge-base in the capture) settles at the soft deadline as snapshot_failed", async t => {
+  const r = await runDiffScenario(t, 330411, { child: { stdout: "never_ends", exit: "clean_exit" }, stop: "soft",
+    match: request => request.argv.includes("merge-base") && !request.argv.includes("--is-ancestor") });
+  assert.equal(r.spawnedNameOnly, 1, "the unmasked merge-base child was the stalled one");
+  assert.equal(r.settledAtStop, true, "the collector settles at the soft deadline after the child's completion");
+  assert.deepEqual(r.submitted, [{ reason_class: "snapshot_failed" }]);
+  assert.deepEqual(attemptOutcomes(r), ["soft_stop"]);
+  assert.equal(r.failedStates, 0);
+  assert.equal(r.poisoned, false);
+});
+
+it("m3304 negative: a masked child (the pin's update-ref) stays hard-only, so soft leaves it pending and hard is terminal", async t => {
+  const r = await runDiffScenario(t, 330412, { child: { stdout: "never_ends", exit: "clean_exit" }, stop: "soft_then_hard",
+    match: request => request.argv.includes("update-ref") && request.argv.some(arg => arg.startsWith("refs/uzi-cross-check/")) });
+  assert.equal(r.spawnedNameOnly, 1, "the masked update-ref child was the stalled one");
+  assert.equal(r.settledAfterSoft, false, "a started mutation is never reported half-done at the soft deadline");
+  assert.equal(r.settledAtStop, true);
+  assert.equal(r.outcome?.kind, "rejected");
+  assert.equal((r.outcome as { error: Error }).error.name, "CodexBoundaryError");
+  assert.deepEqual(r.submitted, []);
+});
+
+it("m3304 negative: an owner cancel during the stall is terminal, never snapshot_failed", async t => {
+  const r = await runDiffScenario(t, 330413, { child: { stdout: "never_ends", exit: "clean_exit" }, stop: "cancel" });
+  assert.equal(r.settledAtStop, true);
+  assert.equal(r.outcome?.kind, "rejected");
+  assert.equal((r.outcome as { error: Error }).error.name, "CodexBoundaryError");
+  assert.deepEqual(r.submitted, []);
+});
+
+it("m3304 negative: a now-pause during the stall settles without failing the run", async t => {
+  const r = await runDiffScenario(t, 330414, { child: { stdout: "never_ends", exit: "clean_exit" }, stop: "pause_now" });
+  assert.equal(r.settledAtStop, true, "the pause stops the stalled read");
+  assert.equal(r.failedStates, 0);
+  assert.equal(r.poisoned, false);
+});
+
+it("m3304 negative: a claim without code_cross_check_required has no gate and never reads the code head", async () => {
+  let rig: ReturnType<typeof codexRig> | undefined;
+  let gate: unknown = "unset";
+  const executor: Executor = {
+    get safety() { return rig?.safety; },
+    run: async ctx => {
+      rig = codexRig({ lifecycleSignal: AbortSignal.any([ctx.signal!, ctx.terminalLifecycleSignal!]) });
+      commitInTree(ctx.worktreePath, "plain.txt", "no cross-check\n");
+      await ctx.checkpoint!({ reap: true, sink: "done_checkpoint" });
+      gate = ctx.codeCrossCheckGate;
+      return { branch: ctx.branch };
+    },
+  };
+  await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0 })
+    .execute(gitlabClaim(330415, { kind: "prompt", issue_iid: null, issue_description: "Do the prompt task." }));
+  assert.equal(gate, undefined);
+  assert.ok(!rig!.processArgv.some(argv => argv.includes("--name-only") && argv.includes("--no-textconv")));
+});
+
+// ---------------------------------------------------------------------------------------------
+// Issue #3304 (done-body half): the reaped done checkpoint's own code-head capture takes the same
+// snapshot, so an unmasked shared read that stalls there must settle at the soft deadline too.
+// ---------------------------------------------------------------------------------------------
+
+async function runDoneBodyScenario(t: TestContext, issue: number, spec: {
+  exit: "clean_exit" | "until_cancelled"; stop: "soft" | "none"; match?: (request: BoundaryProcessRequest) => boolean;
+}): Promise<{ settled: boolean; error: unknown; poisoned: boolean; lines: DiffRun["lines"]; failedStates: number; spawnedNameOnly: number; spawnedStalled: number }> {
+  const clock = virtualBoundaryClock();
+  const { logger, lines } = recordingLogger();
+  const timers = trackReadTimers(t);
+  let stalled = 0, nameOnly = 0;
+  const launched = eventSignal(), reaped = eventSignal();
+  let stdout: PassThrough | undefined;
+  const match = spec.match ?? (request => request.argv.includes("merge-base") && !request.argv.includes("--is-ancestor"));
+  let matched = false;
+  let rig: ReturnType<typeof codexRig> | undefined;
+  let result: { settled: boolean; error: unknown; poisoned: boolean } | undefined;
+  const spawnStalled = async (): Promise<SpawnedBoundaryProcess> => {
+    stalled++;
+    launched.mark();
+    const out = stdout = new PassThrough();
+    const stderr = new PassThrough(), stdin = new PassThrough();
+    for (const stream of [out, stderr, stdin]) stream.on("error", () => undefined);
+    return {
+      root: {
+        kind: "boundary_action",
+        reap: async () => { await new Promise<void>(resolve => setImmediate(resolve)); reaped.mark(); return { ok: true as const }; },
+        dispose: async () => undefined,
+      },
+      stdin, stdout: out, stderr,
+      waitChild: () => spec.exit === "clean_exit" ? Promise.resolve({ code: 0 }) : new Promise(() => undefined),
+    };
+  };
+  const executor: Executor = {
+    get safety() { return rig?.safety; },
+    run: async ctx => {
+      rig = codexRig({ lifecycleSignal: AbortSignal.any([ctx.signal!, ctx.terminalLifecycleSignal!]),
+        armDeadline: clock.armDeadline, now: clock.now,
+        boundaryProcess: request => {
+          if (isNameOnlyDiff(request)) nameOnly++;
+          return spec.stop !== "none" && !matched && match(request) ? (matched = true, spawnStalled()) : undefined;
+        } });
+      commitInTree(ctx.worktreePath, "done-body.txt", "done body candidate\n");
+      let settled = false, error: unknown;
+      const done = ctx.checkpoint!({ reap: true, sink: "done_checkpoint" }).catch(err => { error = err; }).then(() => { settled = true; });
+      try {
+        if (spec.stop !== "none") {
+          await launched.ready;
+          if (spec.exit === "clean_exit") {
+            await reaped.ready;
+            await observeTurns();
+          }
+          clock.advance(60_000);
+        }
+        await observeTurns(() => settled);
+        result = { settled, error, poisoned: rig.registry.isPoisoned() };
+      } finally {
+        stdout?.destroy();
+        if (!settled) timers.flush();
+        if (!settled && !(await observeTurns(() => settled))) clock.advance(120_000);
+        await done;
+        if (result) result.error = error;
+      }
+      return { branch: ctx.branch };
+    },
+  };
+  const worker = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, logger, {
+    checkpointIntervalMs: 0,
+    checkpointTestHooks: { absoluteNow: clock.now, armSoftDeadline: clock.arm },
+  });
+  await worker.execute(gitlabClaim(issue, { code_cross_check_required: true, claim_generation: 1 }));
+  assert.ok(result, "the executor reached the scenario record");
+  return { ...result, lines: lines as DiffRun["lines"], spawnedNameOnly: nameOnly, spawnedStalled: stalled,
+    failedStates: api.states.filter(s => s.body.status === "failed").length };
+}
+
+for (const exit of ["clean_exit", "until_cancelled"] as const) {
+  it(`m3304 done body ${exit === "clean_exit" ? "v1" : "v2 control"}: an unmasked shared read stalling in the code-head capture settles at the soft deadline`, async t => {
+    const r = await runDoneBodyScenario(t, exit === "clean_exit" ? 330421 : 330422, { exit, stop: "soft" });
+    assert.equal(r.spawnedStalled, 1, "the unmasked merge-base child was the stalled one");
+    assert.equal(r.settled, true, "the done checkpoint settles at the soft deadline, not after the 600 s read timer");
+    assert.deepEqual(attemptOutcomes(r as unknown as DiffRun), ["soft_stop"]);
+    assert.equal(r.failedStates, 0, "the run does not fail");
+    assert.equal(r.poisoned, false);
+    // An issue claim never runs the prompt-only changed-files diff; this pins that the done body did not either.
+    assert.equal(r.spawnedNameOnly, 0, "an issue claim's done body never runs the prompt-only changed-files diff");
+    // The done-body caller passes its step callback: the stall is reported under the pin sub-step.
+    const steps = r.lines.filter(l => l.msg === "checkpoint step").map(l => l.step);
+    assert.equal(steps.at(-1), "checkpoint_code_head_pin", `the stalled read is labelled by the done-body pin step, saw ${JSON.stringify(steps)}`);
+  });
+}
+
+it("m3304 steps: the code-head capture reports each split step in checkpoint step records", async t => {
+  const r = await runDiffScenario(t, 330423, { child: { stdout: "ended_unread", exit: "clean_exit" }, stop: "none", match: () => false });
+  const steps = r.lines.filter(l => l.msg === "checkpoint step").map(l => l.step);
+  const split = ["runner_tip", "tracking", "default_tip", "pin", "changed_files"].map(s => `checkpoint_code_head_${s}`);
+  let at = 0;
+  for (const step of steps) if (step === split[at]) at++;
+  assert.equal(at, split.length, `the split steps appear in capture order, saw ${JSON.stringify(steps)}`);
 });

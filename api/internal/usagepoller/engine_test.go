@@ -685,7 +685,7 @@ func TestEarlyResetDetection(t *testing.T) {
 	tReset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
 	synced := tReset.Add(-72 * time.Hour)
 	moved := tReset.Add(72 * time.Hour)
-	movedTiny := tReset.Add(30 * time.Minute)  // +30m < resetEpochMoveMargin(1h): Arm A must stay silent
+	movedTiny := tReset.Add(30 * time.Minute)  // +30m < ResetEpochMoveMargin(1h): Arm A must stay silent
 	movedBack := tReset.Add(-30 * time.Minute) // boundary earlier than T: not an unmoved fixed grid -> Arm B must stay silent
 
 	cases := []struct {
@@ -746,7 +746,7 @@ func TestEarlyResetDetection(t *testing.T) {
 			name: "silent_pct_jitter_epoch_unchanged", prevPct: 100, prevSource: anthropic.SourceLimitReport,
 			nextResets: &tReset, nextPct: 99, nextSource: anthropic.SourceUsageEndpoint,
 			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
-			why: "epoch unchanged (== T, Arm A false) AND used% 100->99 not a zeroing (99 > pctResetCeil, Arm B false) -> silent",
+			why: "epoch unchanged (== T, Arm A false) AND used% 100->99 not a zeroing (99 > PctResetCeil, Arm B false) -> silent",
 		},
 		{
 			name: "fires_arm_b_util_zeroed", prevPct: 12, prevSource: anthropic.SourceHeaderProbe,
@@ -758,25 +758,25 @@ func TestEarlyResetDetection(t *testing.T) {
 			name: "fires_arm_b_at_floor", prevPct: 5, prevSource: anthropic.SourceUsageEndpoint,
 			nextResets: &tReset, nextPct: 0, nextSource: anthropic.SourceUsageEndpoint,
 			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: true,
-			why: "prev == pctResetFloor(5) and next <= pctResetCeil(1) fires Arm B; pins the floor boundary",
+			why: "prev == PctResetFloor(5) and next <= PctResetCeil(1) fires Arm B; pins the floor boundary",
 		},
 		{
 			name: "silent_epoch_move_below_margin", prevPct: 50, prevSource: anthropic.SourceUsageEndpoint,
 			nextResets: &movedTiny, nextPct: 50, nextSource: anthropic.SourceUsageEndpoint,
 			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
-			why: "+30m < resetEpochMoveMargin(1h) so Arm A silent; pct 50->50 unchanged so Arm B false; WOULD fire if the margin were 0",
+			why: "+30m < ResetEpochMoveMargin(1h) so Arm A silent; pct 50->50 unchanged so Arm B false; WOULD fire if the margin were 0",
 		},
 		{
 			name: "silent_pct_drop_below_floor", prevPct: 3, prevSource: anthropic.SourceUsageEndpoint,
 			nextResets: &tReset, nextPct: 0, nextSource: anthropic.SourceUsageEndpoint,
 			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
-			why: "prev 3 < pctResetFloor(5) so Arm B silent (near-zero-usage clear indistinguishable from jitter, D5); WOULD fire if the floor were 0",
+			why: "prev 3 < PctResetFloor(5) so Arm B silent (near-zero-usage clear indistinguishable from jitter, D5); WOULD fire if the floor were 0",
 		},
 		{
 			name: "silent_pct_drop_above_ceil", prevPct: 40, prevSource: anthropic.SourceUsageEndpoint,
 			nextResets: &tReset, nextPct: 20, nextSource: anthropic.SourceUsageEndpoint,
 			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
-			why: "next 20 > pctResetCeil(1) is a source-flip/partial delta, not a zeroing, so Arm B silent; WOULD fire if the ceil were raised",
+			why: "next 20 > PctResetCeil(1) is a source-flip/partial delta, not a zeroing, so Arm B silent; WOULD fire if the ceil were raised",
 		},
 		{
 			name: "silent_arm_b_boundary_nil", prevPct: 12, prevSource: anthropic.SourceHeaderProbe,
@@ -788,7 +788,7 @@ func TestEarlyResetDetection(t *testing.T) {
 			name: "silent_arm_b_sub_margin_move", prevPct: 12, prevSource: anthropic.SourceHeaderProbe,
 			nextResets: &movedTiny, nextPct: 0, nextSource: anthropic.SourceHeaderProbe,
 			now: tReset.Add(-10 * time.Hour), notify: true, wantFire: false,
-			why: "+30m < resetEpochMoveMargin(1h) so Arm A silent; boundary moved (!= T) so the grid is not unmoved -> Arm B silent even though used% 12->0; WOULD fire if Arm B ignored the boundary",
+			why: "+30m < ResetEpochMoveMargin(1h) so Arm A silent; boundary moved (!= T) so the grid is not unmoved -> Arm B silent even though used% 12->0; WOULD fire if Arm B ignored the boundary",
 		},
 		{
 			name: "silent_arm_b_backward_move", prevPct: 12, prevSource: anthropic.SourceHeaderProbe,

@@ -29,11 +29,14 @@ import {
   RecoveryWaitPanel,
   MrReworkPanel,
   PausedPanel,
+  ReserveExemptLine,
+  pauseRequestedLabel,
   RunView,
   RunSummary,
   derivePlanRevision,
 } from "./RunView";
 import { useRunStream } from "../lib/useRunStream";
+import { useMaintenance } from "../lib/useMaintenance";
 import { useAuth } from "../auth/AuthContext";
 // ?raw rather than node:fs — the web tsconfig has no node types, and this repo
 // already makes the same choice for the same reason in WorkerUpgradeBadge.test.tsx
@@ -128,6 +131,11 @@ const mockApi = vi.mocked(api);
 // directly (the real hook opens a websocket). useRunStream is used ONLY by RunView, so
 // this mock does not touch the sub-component tests above.
 vi.mock("../lib/useRunStream", () => ({ useRunStream: vi.fn() }));
+// PRD #3454: the shared maintenance state, defaulting to "no provider" (status null) so every
+// existing case renders as before; the maintenance HealthFlag cases set a reason.
+vi.mock("../lib/useMaintenance", () => ({
+  useMaintenance: vi.fn(() => ({ status: null, reload: () => {} })),
+}));
 const mockUseRunStream = vi.mocked(useRunStream);
 
 // Issue #1766: the vault_locked park body reads the VIEWER's vault state off useAuth (the
@@ -1407,6 +1415,41 @@ it("HealthFlag renders manual attribution as escaped single-cell text", () => {
   expect(container.textContent).not.toContain("[object Object]");
 });
 
+describe("HealthFlag — maintenance queue reason (PRD #3454)", () => {
+  const held = { status: "queued" as const, queue_reason: "maintenance" as const, health: "waiting_worker" as const,
+    health_since: "2026-10-25T12:00:00Z", health_reason: "waiting for a worker to pick up this run" };
+
+  it("replaces the waiting-for-worker flag with the maintenance line", () => {
+    const { container } = render(<HealthFlag run={run(held)} />);
+    const pill = container.querySelector('[data-queue-reason="maintenance"]')!;
+    expect(pill.textContent).toBe("waiting: uzi is in maintenance mode");
+    expect(container.textContent).not.toContain("waiting for worker");
+    expect(container.textContent).not.toContain("stuck for");
+    expect(container.querySelector('[role="status"]')!.textContent).toBe("waiting: uzi is in maintenance mode");
+  });
+
+  it("appends the maintenance reason from the shared state", () => {
+    vi.mocked(useMaintenance).mockReturnValue({
+      status: { active: true, since: null, reason: "Node pool upgrade\u202e" },
+      reload: () => {},
+    });
+    try {
+      const { container } = render(<HealthFlag run={run(held)} />);
+      expect(container.querySelector('[data-queue-reason="maintenance"]')!.textContent).toBe(
+        "waiting: uzi is in maintenance mode (Node pool upgrade)",
+      );
+    } finally {
+      vi.mocked(useMaintenance).mockReturnValue({ status: null, reload: () => {} });
+    }
+  });
+
+  it("leaves a plain queued run's waiting-for-worker flag alone", () => {
+    const { container } = render(<HealthFlag run={run({ ...held, queue_reason: null })} />);
+    expect(container.querySelector('[data-queue-reason="maintenance"]')).toBeNull();
+    expect(container.textContent).toContain("waiting for worker");
+  });
+});
+
 describe("HealthFlag — the health reason (#124, text channel)", () => {
   it("strips bidi/zero-width characters out of the rendered reason", () => {
     const { container } = render(
@@ -2020,6 +2063,185 @@ describe("RunView — a paused run shows no live 'now' activity strip (PRD #1190
     expect(container.querySelector("[data-run-progress-card] ul")).not.toBeNull();
     // … but the live "now" strip is gone (nothing runs while paused).
     expect(nowStrip(container)).toBeNull();
+  });
+});
+
+// PRD #3522 M5: the weekly usage reserve on the run view.
+describe("RunView — weekly usage reserve (PRD #3522)", () => {
+  const CONFIRM = "Resuming overrides your weekly usage reserve until the next weekly reset";
+  function renderPage(over: Partial<Run>, canSteer = true) {
+    const refreshRun = vi.fn();
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun,
+      inputs: [],
+      canSteer,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    const utils = render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    return { ...utils, refreshRun };
+  }
+  const RESERVE_PAUSED: Partial<Run> = {
+    status: "paused",
+    hold_reason: "weekly_reserve",
+    started_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T03:42:00Z",
+    branch: "agent/issue-33",
+  };
+  const RESERVE_REQUEST: Partial<Run> = {
+    status: "running",
+    pause_requested_at: "2026-01-01T02:00:00Z",
+    pause_mode: "reserve",
+    pause_after_count: 1,
+    milestones: [
+      { id: "m1", title: "a" },
+      { id: "m2", title: "b" },
+    ],
+    milestones_completed: ["m1"],
+  };
+
+  const realConfirm = window.confirm;
+  afterEach(() => { window.confirm = realConfirm; });
+
+  it("labels a pending reserve request and hides Cancel pause, offering guidance and Pause now", async () => {
+    renderPage(RESERVE_REQUEST);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByText("Pause requested · weekly usage reserve · after M2")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /cancel pause/i })).toBeNull();
+    expect(screen.getByText(/Run defaults/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /pause now/i })).toBeTruthy();
+  });
+
+  it("keeps Cancel pause for an owner request (positive control for the hidden button)", async () => {
+    renderPage({ ...RESERVE_REQUEST, pause_mode: "milestone" });
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByRole("button", { name: /cancel pause/i })).toBeTruthy();
+    expect(screen.queryByText(/weekly usage reserve/)).toBeNull();
+  });
+
+  it("pauseRequestedLabel words the reserve source with and without milestones", () => {
+    expect(pauseRequestedLabel(run({ pause_mode: "reserve" }))).toBe(
+      "Pause requested · weekly usage reserve · after the current step",
+    );
+    expect(pauseRequestedLabel(run({ pause_mode: "milestone" }))).toBe("Pause requested · after the current step");
+  });
+
+  it("a reserve-parked run explains the hold in the panel", async () => {
+    renderPage(RESERVE_PAUSED);
+    await screen.findByText("Add rate limiting");
+    const note = document.querySelector('[data-hold-reason="weekly_reserve"]')!;
+    expect(note.textContent).toMatch(/Held by your weekly usage reserve/);
+    expect(note.textContent).toMatch(/resumes automatically when usage drops below the\s+threshold/);
+    expect(note.textContent).toMatch(/until the next weekly reset/);
+  });
+
+  it("an ordinary pause shows no reserve note", async () => {
+    renderPage({ ...RESERVE_PAUSED, hold_reason: null });
+    await screen.findByText("Add rate limiting");
+    expect(document.querySelector('[data-hold-reason="weekly_reserve"]')).toBeNull();
+  });
+
+  it("header Resume asks the exact confirmation and does not resume on cancel", async () => {
+    const confirm = vi.fn(() => false);
+    window.confirm = confirm;
+    renderPage(RESERVE_PAUSED);
+    await screen.findByText("Add rate limiting");
+    mockApi.resumeRun.mockClear();
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole("button", { name: /resume/i })[0]);
+    });
+    expect(confirm).toHaveBeenCalledWith(CONFIRM);
+    expect(mockApi.resumeRun).not.toHaveBeenCalled();
+  });
+
+  it("header Resume proceeds once the owner confirms", async () => {
+    const confirm = vi.fn(() => true);
+    window.confirm = confirm;
+    const { refreshRun } = renderPage(RESERVE_PAUSED);
+    await screen.findByText("Add rate limiting");
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole("button", { name: /resume/i })[0]);
+    });
+    expect(confirm).toHaveBeenCalledWith(CONFIRM);
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+
+  it("the panel Resume asks too, and an ordinary pause resumes with no prompt", async () => {
+    const confirm = vi.fn(() => false);
+    window.confirm = confirm;
+    const onResume = vi.fn();
+    const { unmount } = render(
+      <PausedPanel run={run(RESERVE_PAUSED)} busy={false} canSteer onResume={onResume} onStop={vi.fn()} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /resume/i }));
+    expect(confirm).toHaveBeenCalledWith(CONFIRM);
+    expect(onResume).not.toHaveBeenCalled();
+    unmount();
+    confirm.mockClear();
+    render(<PausedPanel run={run({ ...RESERVE_PAUSED, hold_reason: null })} busy={false} canSteer onResume={onResume} onStop={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /resume/i }));
+    expect(confirm).not.toHaveBeenCalled();
+    expect(onResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the override line while reserve_exempt_until is in the future, and only then", async () => {
+    const future = new Date(Date.now() + 3 * 24 * 3600 * 1000).toISOString();
+    const { unmount } = render(<ReserveExemptLine run={run({ reserve_exempt_until: future })} />);
+    expect(document.querySelector("[data-reserve-exempt]")!.textContent).toMatch(/^Weekly usage reserve overridden until /);
+    unmount();
+    const none = render(<ReserveExemptLine run={run({ reserve_exempt_until: null })} />);
+    expect(none.container.firstChild).toBeNull();
+    none.unmount();
+    const past = render(<ReserveExemptLine run={run({ reserve_exempt_until: "2020-01-01T00:00:00Z" })} />);
+    expect(past.container.firstChild).toBeNull();
+  });
+
+  it("shows the override line for a live run but not a finished one that still carries a future stamp", () => {
+    // The server never clears reserve_exempt_until on completed/failed/cancelled runs.
+    const future = new Date(Date.now() + 3 * 24 * 3600 * 1000).toISOString();
+    for (const status of ["paused", "queued"] as const) {
+      const live = render(<ReserveExemptLine run={run({ status, reserve_exempt_until: future })} />);
+      expect(document.querySelector("[data-reserve-exempt]")).not.toBeNull();
+      live.unmount();
+    }
+    for (const status of ["completed", "failed", "cancelled"] as const) {
+      const done = render(<ReserveExemptLine run={run({ status, reserve_exempt_until: future })} />);
+      expect(done.container.firstChild).toBeNull();
+      done.unmount();
+    }
+  });
+
+  it("the page header carries the override line for a run with an active override", async () => {
+    renderPage({ status: "running", reserve_exempt_until: new Date(Date.now() + 86_400_000).toISOString() });
+    await screen.findByText("Add rate limiting");
+    expect(document.querySelector("[data-reserve-exempt]")).not.toBeNull();
+  });
+
+  it("HealthFlag shows the reserve reason for a held queued run, with a fallback and maintenance precedence", () => {
+    const held = { status: "queued" as const, queue_reason: "weekly_reserve" as const, health: "waiting_worker" as const,
+      health_since: "2026-10-25T12:00:00Z", health_reason: "waiting for a worker to pick up this run" };
+    const a = render(<HealthFlag run={run({ ...held, reserve_hold_reason: "weekly usage reserve: 85% >= 80%" })} />);
+    expect(a.container.querySelector('[data-queue-reason="weekly_reserve"]')!.textContent).toBe(
+      "waiting: weekly usage reserve: 85% >= 80%",
+    );
+    expect(a.container.textContent).not.toContain("stuck for");
+    expect(a.container.querySelector('[role="status"]')!.textContent).toBe("waiting: weekly usage reserve: 85% >= 80%");
+    a.unmount();
+    const b = render(<HealthFlag run={run(held)} />);
+    expect(b.container.querySelector('[data-queue-reason="weekly_reserve"]')!.textContent).toBe("waiting: weekly usage reserve");
+    b.unmount();
+    const c = render(<HealthFlag run={run({ ...held, queue_reason: "maintenance" })} />);
+    expect(c.container.querySelector('[data-queue-reason="weekly_reserve"]')).toBeNull();
+    expect(c.container.querySelector('[data-queue-reason="maintenance"]')).not.toBeNull();
   });
 });
 
@@ -7479,4 +7701,51 @@ describe("RunView rejection presentation", () => {
     const pill = screen.getByText(label === "failed" ? "needs landing" : label);
     expect(pill.classList.contains(tone === "neutral" ? "text-neutral-fg" : "text-danger")).toBe(true);
   });
+});
+
+
+describe("HealthFlag Codex admission", () => {
+  it.each([["rate_limit", "a rate limit"], ["overload", "overload"]] as const)("shows %s from read-time fields and clears on expiry", (cls, words) => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-10-27T12:00:00Z"));
+    try {
+      const at = "2026-10-27T12:01:37Z";
+      const r = run({ status: "queued", health: "waiting_worker", codex_admission_class: cls,
+        codex_admission_eligible_at: at, health_reason: `waiting: provider reported a rate limit; account admission eligible after ${at}` });
+      const { container, unmount } = render(<HealthFlag run={r} />);
+      expect(container.textContent).toContain(`waiting: provider reported ${words}; account admission eligible after ${at}`);
+      expect(container.textContent).not.toContain("stuck for");
+      unmount();
+      now.mockReturnValue(Date.parse(at));
+      const expired = render(<HealthFlag run={r} />);
+      expect(expired.container.textContent).toContain("waiting for worker");
+      expect(expired.container.textContent).not.toContain("provider reported");
+    } finally { now.mockRestore(); }
+  });
+  it("keeps maintenance primary and eligibility in its tooltip", () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const { container } = render(<HealthFlag run={run({ status: "queued", queue_reason: "maintenance",
+        codex_admission_class: "overload", codex_admission_eligible_at: "2026-10-27T12:01:37Z" })} />);
+      const pill = container.querySelector('[data-queue-reason="maintenance"]')!;
+      expect(pill.textContent).toBe("waiting: uzi is in maintenance mode");
+      expect(pill.getAttribute("title")).toBe("waiting: provider reported overload; account admission eligible after 2026-10-27T12:01:37Z");
+    } finally { now.mockRestore(); }
+  });
+});
+
+
+it.each([
+  "handoff setup has not finished",
+  "your vault is locked, so this run can't start",
+  "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs",
+  "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
+  "your Codex account is unavailable (quarantined or being re-linked), so this run can't start",
+])("HealthFlag Codex admission keeps %s primary", (reason) => {
+  const now = vi.spyOn(Date, "now").mockReturnValue(0);
+  try {
+    const { container } = render(<HealthFlag run={run({ status: "queued", health: "waiting_worker", health_reason: reason,
+      codex_admission_class: "overload", codex_admission_eligible_at: "2026-10-27T12:01:37Z" })} />);
+    expect(container.textContent).toContain(reason);
+    expect(container.querySelector("[title]")!.getAttribute("title")).toBe("waiting: provider reported overload; account admission eligible after 2026-10-27T12:01:37Z");
+  } finally { now.mockRestore(); }
 });

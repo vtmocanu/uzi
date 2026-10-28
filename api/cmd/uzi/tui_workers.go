@@ -873,7 +873,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 	if selected {
 		pre = "▌"
 	}
-	fields := []string{paintSeg(m.pal.tungsten, bg, true, pre), cell(m.renderer.Plain(t.workerName, 13), 13, nil)}
+	fields := []string{paintSeg(m.pal.tungsten, bg, true, pre), cell(m.renderer.WorkerName(t.workerName, 13), 13, nil)}
 	if width >= 120 && m.board.admin {
 		fields = append(fields, cell(m.workerOwnerCell(r), 7, m.pal.faintC))
 	}
@@ -936,18 +936,30 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 }
 func (m tuiModel) workerReadout(r workerRow, width int) []string {
 	t := workerTextOf(r)
-	selected := m.pal.faint.Render("selected ") + m.pal.title.Render(m.renderer.Plain(t.workerName, max(0, width-9)))
+	selected := clampVisual(m.pal.faint.Render("selected ")+m.pal.title.Render(m.renderer.WorkerName(t.workerName, max(0, width-9))), width)
+	metadata := ""
 	if m.board.admin {
-		selected += m.pal.faint.Render(" · owner ") + m.renderer.Plain(t.workerOwner, width)
+		metadata = m.pal.faint.Render(" · owner ") + m.renderer.Plain(t.workerOwner, width)
 	}
 	items := workerAttention(r, time.Now())
-	if width >= 120 && workerIntakeLabel(r.w) == "" {
+	inline := width >= 120 && workerIntakeLabel(r.w) == ""
+	if inline {
 		for _, item := range items {
-			selected += m.pal.faint.Render(" · ") + paintSeg(m.workerAttentionColor(item), nil, false, m.renderer.Plain(item.attnShort, width))
+			metadata += m.pal.faint.Render(" · ") + paintSeg(m.workerAttentionColor(item), nil, false, m.renderer.Plain(item.attnShort, width))
 		}
-		return []string{clampVisual(selected, width)}
 	}
-	lines := []string{clampVisual(selected, width)}
+	// Clamp metadata independently so its ellipsis cannot replace the name's tail.
+	minimumMetadata := visualWidth(" · ") + 1
+	if m.board.admin {
+		minimumMetadata = visualWidth(" · owner ") + 1
+	}
+	if remaining := width - visualWidth(selected); remaining >= minimumMetadata {
+		selected += clampVisual(metadata, remaining)
+	}
+	if inline {
+		return []string{selected}
+	}
+	lines := []string{selected}
 	lines = append(lines, m.manualCordonLines(r, width)...)
 	for _, item := range items {
 		lines = append(lines, clampVisual("  "+paintSeg(m.workerAttentionColor(item), nil, false, m.renderer.Plain(item.attnShort, max(0, width-2))), width))

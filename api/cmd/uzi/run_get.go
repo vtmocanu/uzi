@@ -227,7 +227,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 				// NDJSON there for an agent to parse line by line (renderMessage). A
 				// human-readable notice on that stream would corrupt the contract. This
 				// is the same split cobra's deprecation notice already uses here.
-				holdKey := run.Status + "/" + strOr(run.HoldReason, "") + "/" + strOr(run.RecoveryWaitCause, "")
+				holdKey := workerHoldNoticeKey(run)
 				if run.Status == statusLimitWait || run.Status == statusPoolWait || run.Status == statusRecoveryWait ||
 					isCredentialDisabledHold(run) || isProviderUnavailableHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run) {
 					if parkedIn != holdKey {
@@ -264,7 +264,10 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 								for _, evidence := range workerExhaustionEvidence(run) {
 									_, _ = fmt.Fprintln(env.Stderr, evidence)
 								}
-								return drain()
+								if isOwnerRequiredWorkerHold(run) {
+									return drain()
+								}
+								_, _ = fmt.Fprintln(env.Stderr, "still following")
 							} else if line := codexAccountActionLine(run); line != "" {
 								// PRD #1590: a Codex account hold has no retry clock; it
 								// says what the account needs and does not promise a resume.

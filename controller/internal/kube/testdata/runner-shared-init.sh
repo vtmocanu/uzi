@@ -6,6 +6,14 @@ if [ -L "$M" ] || [ ! -f "$M" ] || [ "$(cat "$M")" != "runner-shared-v1" ]; then
   echo "uzi-runner-init: worker image lacks runner-shared layout support (want runner-shared-v1); refusing; upgrade the worker image or roll back the controller" >&2
   exit 1
 fi
+if [ "${UZI_EPOCH_LOCK:-}" = 1 ]; then
+  identity="$(/usr/local/bin/node /usr/local/lib/uzi/pod-epoch-init.cjs prepare /data-seed)"
+  if [ "$identity" != unsupported ]; then
+    exec 9</data-seed/.uzi-epoch.lock
+    /usr/local/bin/node /usr/local/lib/uzi/pod-epoch-init.cjs hold /data-seed "$identity" 9
+    trap 'exec 9>&-' EXIT
+  fi
+fi
 R=/data-seed/runner-shared
 T=/data-seed/runner-shared/.tmp
 fail() { echo "uzi-runner-init: $1" >&2; exit 1; }
@@ -51,3 +59,4 @@ check_dir "$R"
 check_dir "$T"
 [ -d "$R" ] && [ -d "$T" ] || fail "$R or $T is not a directory"
 echo "uzi-runner-init: runner-shared ready ($R, $T)"
+if [ "${UZI_EPOCH_LOCK:-}" = 1 ]; then exec 9>&-; fi

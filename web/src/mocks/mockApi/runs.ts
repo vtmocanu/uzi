@@ -309,7 +309,16 @@ function mockAdminListRuns(params?: {
     // other run belongs to the session admin. Before this map existed, EVERY
     // row here was stamped with the session email — the demo factory list was
     // 100% "mine", the exact duplication amendment 2 removes.
-    .map((r) => runListItem(r, mockOtherRunOwners[r.id] ?? requireSession().email));
+    .map((r) => {
+      const item = runListItem(r, mockOtherRunOwners[r.id] ?? requireSession().email);
+      if (r.id in mockOtherRunOwners) {
+        delete item.codex_admission_class;
+        delete item.codex_admission_eligible_at;
+        if (item.queue_reason !== "maintenance") delete item.queue_reason;
+        item.health_reason = null;
+      }
+      return item;
+    });
   return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
 }
 
@@ -697,7 +706,7 @@ export const runsApi = {
     const history = (decorated.milestone_reconciliations ?? []).filter(r =>
       reconciliationBeforeGateRevision === undefined || (typeof r.gate_revision === "number" && r.gate_revision < reconciliationBeforeGateRevision));
     const page = history.slice(0, 50);
-    return delay({ run: { ...decorated, usage: runListItem(decorated).usage, own_agents,
+    return delay({ run: { ...decorated, repo_path: runListItem(decorated).repo_path, usage: runListItem(decorated).usage, own_agents,
       milestone_reconciliations: page,
       milestone_reconciliations_next_before_gate_revision: history.length > page.length
         ? page[page.length - 1]?.gate_revision as number : undefined,
@@ -966,7 +975,13 @@ export const runsApi = {
     // Issue #3181: mirrors the server's ErrRunHoldSettling refusal; an unsettled hold resumes.
     const switchHold = credentialSwitchHold(run);
     if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
+    // PRD #3522: an owner resume of a reserve hold records the override until the next weekly
+    // reset (the mock stands in with seven days).
+    const reserveHeld = run.status === "paused" && run.hold_reason === "weekly_reserve";
     patchRun(id, { status: "queued", updated_at: new Date().toISOString(),
+      ...(reserveHeld
+        ? { hold_reason: null, reserve_exempt_until: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString() }
+        : {}),
       // The held-only projection disappears on Resume; the API owns the fresh episode.
       ...(memoryHeld ? { memory_hold: undefined, recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
       ...(switchHold === "unsettled" ? { hold_reason: null, status_since: new Date().toISOString() } : {}),

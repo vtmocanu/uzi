@@ -20,6 +20,7 @@ import { secretsApi } from "./secrets";
 import { workersApi } from "./workers";
 import { settingsApi } from "./settings";
 import { healthApi } from "./health";
+import { maintenanceApi } from "./maintenance";
 import { boardsApi } from "./boards";
 import { usersApi } from "./users";
 import { schedulesApi } from "./schedules";
@@ -38,6 +39,9 @@ export const mockApi = {
 
   // ── Admin health (PRD #1484) ─────────────────────────────────────────────────
   ...healthApi,
+
+  // ── Maintenance mode (PRD #3454) ─────────────────────────────────────────────
+  ...maintenanceApi,
 
   // ── Agent source (PRD #602 M5) ───────────────────────────────────────────────
   ...agentSourceApi,

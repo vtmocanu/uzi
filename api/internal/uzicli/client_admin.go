@@ -153,6 +153,15 @@ func (c *HTTPClient) AdminBlockedRepos(ctx context.Context) (apitypes.AdminBlock
 	return out, nil
 }
 
+// AdminMaintenance reads GET /api/admin/maintenance: the pause state plus the drain readout.
+func (c *HTTPClient) AdminMaintenance(ctx context.Context) (apitypes.MaintenanceAdminDTO, error) {
+	var out apitypes.MaintenanceAdminDTO
+	if err := c.get(ctx, "/api/admin/maintenance", &out); err != nil {
+		return apitypes.MaintenanceAdminDTO{}, err
+	}
+	return out, nil
+}
+
 // AdminSettingsView is the subset of GET /api/admin/settings the CLI renders: the
 // effective non-secret settings and where each value came from ("db", "env", "default").
 type AdminSettingsView struct {

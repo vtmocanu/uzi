@@ -21,7 +21,7 @@
 # TRANSIENT vs REAL, signature-independent by design. A failed job is auto-rerun
 # ONLY if it is not a publication GATE — the gates are `assert-version`,
 # `assert-changelog`, `assert-ci-coverage`, `assert-release-metadata`,
-# `assert-tag-smoke` and `prep`, which fail for a real reason (wrong Chart version,
+# `assert-tag-smoke`, Brew's `assert-release-published` and `prep`, which fail for a real reason (wrong Chart version,
 # an uncited merge). Coverage/smoke gates can also fail on transient API or
 # pagination errors; a manual rerun of failed release jobs can clear those.
 # Auto-rerun stays disabled for every gate. Every other job (publish-*, the
@@ -154,6 +154,9 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
 
         if [ "$gatefail" = "1" ] || [ "$rrleft" -le 0 ]; then
           reason="publication gate failure; manual recovery required"
+          if [ "$wf" = "brew.yml" ] && [ "$gatefail" = "1" ]; then
+            printf '%s\n' "After the same tag's release.yml succeeds: gh run rerun $id --failed" >&2
+          fi
           [ "$gatefail" != "1" ] && reason="reruns exhausted ($MAX_RERUNS used for $wf)"
           echo "=== $wf run $id: FAILED ($reason) — react now (gh run view --job <id> --log-failed) ==="
           printf '%s\n' "$failrows" | awk -F'\t' 'NF{printf "  FAIL  %-28s %s\n",$1,$2}'

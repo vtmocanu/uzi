@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -95,6 +96,11 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 	case "awaiting_followup":
 		return "owner follows up or ends the run"
 	case "paused":
+		// PRD #3522: a run parked by the weekly usage reserve leaves by itself once usage drops
+		// below the threshold, or when the owner resumes it (overriding the reserve).
+		if r.HoldReason.Valid && r.HoldReason.String == holdWeeklyReserve {
+			return "held by the weekly usage reserve; resumes when usage drops below the threshold, or the owner resumes the run (overriding the reserve)"
+		}
 		return "owner resumes the run"
 	case "claimed", "running":
 		return "run must finish"
@@ -107,6 +113,19 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 		switch r.RecoveryWaitCause.String {
 		case recoveryCauseCodexAccountUnavailable:
 			return fmt.Sprintf("recorded cause %s; wait for the same Codex account to become available; inspect account recovery; no timer", cause)
+		case "codex_idle_stall":
+			if r.RecoveryRetryNotBefore.Valid && r.RecoveryRetryNotBefore.InfinityModifier == pgtype.Finite && !r.RecoveryRetryNotBefore.Time.IsZero() {
+				return fmt.Sprintf("automatic retry not before %s; recorded cause %s; owner may Resume with a fresh wall and reset idle-stall count, or Cancel", blockerTime(r.RecoveryRetryNotBefore), cause)
+			}
+			if r.RecoveryRetryNotBefore.Valid {
+				return fmt.Sprintf("retry timing unavailable; recorded cause %s; owner may inspect run", cause)
+			}
+			return fmt.Sprintf("recorded cause %s; owner chooses Resume with a fresh wall and reset idle-stall count, or Cancel; no timer", cause)
+		case recoveryCauseRetainedRecoveryExhausted:
+			if r.RecoveryRetryNotBefore.Valid {
+				return fmt.Sprintf("automatic retry not before %s; recorded cause %s; owner may inspect or Resume", blockerTime(r.RecoveryRetryNotBefore), cause)
+			}
+			return fmt.Sprintf("recorded cause %s; owner reviews retained recovery and chooses Resume; no timer", cause)
 		case "worker_requeue_exhausted":
 			return fmt.Sprintf("recorded cause %s; owner reviews recovery evidence and chooses Resume; no timer", cause)
 		}
@@ -119,6 +138,9 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 		}
 		return fmt.Sprintf("automatic retry not before %s; recorded cause %s; %s", blockerTime(r.RecoveryRetryNotBefore), cause, action)
 	case "queued":
+		if r.HealthReason.Valid && apitypes.IsCodexAdmissionReason(r.HealthReason.String) {
+			r.HealthReason.String = "waiting: admission held"
+		}
 		return fmt.Sprintf("own continuation must become claimable; recorded reason %s; hold %s; exact fence unavailable, inspect run", blockerFact(r.HealthReason), blockerFact(r.HoldReason))
 	default:
 		return "releasing action unavailable; inspect run"

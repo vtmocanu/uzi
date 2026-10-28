@@ -97,7 +97,40 @@ alongside the plan, between the proposed milestones and the plan body:
   only, never blocking.
 - The size estimate, as a small badge.
 
+### Why a capability is required
+
+The run detail's read-only **Capability sources** section remains available while
+the run is running and after it finishes, including autopilot runs. At approval,
+the same information appears in **Run requirements**. Sources can be the repo hint,
+inference, or both. Expand a source to see sampled repo-relative
+trigger paths and the detector rule they matched. Ignored inferences appear as
+non-blocking observations; an explicit hint can still keep that capability required.
+Demo mode hides trigger paths.
+
+Evidence is bounded to three triggers per capability and 512 UTF-8 bytes per path.
+A truncation note signals omitted entries. The latest accepted plan scan replaces
+the observations; replaying a gate preserves them. Evidence is display-only and
+does not change approval identity, scheduling or runtime guardrails.
+
+Runs retain the hint captured at creation. Older runs or workers can have unknown
+provenance or unavailable paths; current repo settings do not fill in that history.
+New workers send evidence when the API advertises support. Older workers keep working.
+
 ### Overriding a false-positive inference
+
+For a recurring false positive, open the repo's **Tools** panel and select
+**Ignored inferred capabilities** (`docker` or `jvm`). New runs snapshot this
+repo setting at creation. Existing runs keep their captured policy, including
+across retries and plan replays. The settings API accepts
+`ignored_inferred_capabilities` in a PATCH to `/api/repos/<id>` and drops unknown
+names. It may set both capability lists together; its response includes a
+`warning` when the ignored and required sets overlap.
+
+Suppression removes only newly inferred scheduling requirements. A capability
+in the repo's **Required capabilities** hint still remains required, even when
+also selected for ignored inference; the Tools panel explains that precedence.
+Provisionable `required_tools` stay unchanged, so ignoring the `jvm` capability
+does not suppress JVM tool provisioning. Runtime guardrails also stay active.
 
 When a capability is unmet, the owner gets a second approve action —
 **"Run without `<capability>`"** — alongside the ordinary Approve button.

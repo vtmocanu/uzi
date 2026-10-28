@@ -100,7 +100,7 @@ test("negative controls reject guidance moved into DATA or supplied only to code
   const brief = crossCheckBrief("Read and Search");
   assert.throws(() => requireRules(`<candidate_0123456789abcdef>\n${brief}\n</candidate_0123456789abcdef>`, ["effects"]),
     /trusted instruction: effects/);
-  assert.throws(() => requireRules(codeCrossCheckBrief("Read and Search"), ["effects"]), /trusted instruction: effects/);
+  requireRules(codeCrossCheckBrief("Read and Search"), ["effects"]);
   // Positive controls make these helper tests red until the plan-specific contract lands.
   requireRules(plan, ["latestItems"]);
   requireRules(brief, ["effects"]);

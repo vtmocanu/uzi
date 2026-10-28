@@ -145,6 +145,7 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 		return uzicli.Exitf(uzicli.ExitGeneric, "task run %s was created without a branch (server contract error); nothing was pushed", run.ID)
 	}
 	branch := *run.Branch
+	printNotice(env, run.Notice)
 
 	// (2) Push — local HEAD (or --base) to the server-named branch, user's creds. The
 	// source ref is `base` when --base is set, else HEAD.

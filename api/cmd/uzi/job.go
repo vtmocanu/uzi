@@ -116,6 +116,9 @@ func newJobCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if j.Notice != nil {
+				printNotice(env, *j.Notice)
+			}
 			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(j)

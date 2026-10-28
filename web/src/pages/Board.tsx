@@ -30,6 +30,10 @@ import {
   isAwaitingApproval,
   isAwaitingFollowup,
   isAwaitingInput,
+  isMaintenanceQueued,
+  isReserveQueued,
+  codexAdmissionText,
+  queuedBlockerPrecedesCodexAdmission,
 } from "../lib/runBadge";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { lanePaging, visibleColumns } from "../lib/boardColumns";
@@ -578,6 +582,11 @@ export function Board() {
             // status should not exist — but if one ever did, "looks stuck" would be
             // the wrong words for it.
             r.health !== "approval_idle" &&
+            // PRD #3454: a run held back by instance maintenance mode waits on purpose (the
+            // detector may still flag waiting_worker); it is not stuck.
+            !isMaintenanceQueued(r) &&
+            !isReserveQueued(r) &&
+            !(codexAdmissionText(r, Date.now()) && !queuedBlockerPrecedesCodexAdmission(r)) &&
             r.issue_iid != null,
         ),
       );
@@ -1108,7 +1117,7 @@ export function Board() {
       <div className="sticky top-[49px] z-10 bg-ink lg:top-0">
       <PageHeader
         backTo="/repos"
-        backLabel="Boards"
+        backLabel="Repos"
         titleNode={
           <div className="flex flex-wrap items-center gap-2">
             <h1 className="text-xl font-semibold tracking-tight">{board?.path_with_namespace ? maskRepoPath(board.path_with_namespace, demo) : "Board"}</h1>

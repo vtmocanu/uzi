@@ -232,7 +232,14 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 	w, t := r.w, workerTextOf(r)
 	width := max(1, m.width)
 	state := workerState(r)
-	header := m.pal.faint.Render("worker › ") + m.pal.title.Render(m.renderer.Plain(t.workerName, width)) + "  " + paintSeg(m.workerStateColor(state), nil, false, workerStateGlyph(state)+" "+state) + "  " + m.pal.faint.Render(m.workerKind(r))
+	headerTail := "  " + paintSeg(m.workerStateColor(state), nil, false, workerStateGlyph(state)+" "+state) + "  " + m.pal.faint.Render(m.workerKind(r))
+	// Preserve a useful name within the width remaining after the prefix.
+	// Fit state/kind separately so their ellipsis cannot replace the name's tail.
+	nameWidth := min(max(min(visualWidth(cellText(t.workerName)), 13), width-9-visualWidth(headerTail)), max(0, width-9))
+	header := m.pal.faint.Render("worker › ") + m.pal.title.Render(m.renderer.WorkerName(t.workerName, nameWidth))
+	if remaining := width - visualWidth(header); remaining >= 4 { // two spaces, state glyph, and one more column
+		header += clampVisual(headerTail, remaining)
+	}
 	lines := []string{m.tabStrip(m.board.admin, viewWorkers, false)}
 	var timing []string
 	if w.Status == "online" {

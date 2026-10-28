@@ -9,7 +9,7 @@ import (
 
 func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
-		Use: "settings", Short: "Read your account settings", Args: cobra.NoArgs,
+		Use: "settings", Short: "Read your account settings and set the weekly usage reserve", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
 	}
 	cmd.AddCommand(&cobra.Command{
@@ -41,9 +41,12 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			// PRD #2603: nil means the per-user switch was never set, which reads as on.
 			p.Println(settingsNowSummaryLine(settings))
+			// PRD #3522: the weekly usage reserve, off when no threshold is set.
+			p.Println(settingsReserveLine(settings))
 			return nil
 		},
 	})
+	cmd.AddCommand(newSettingsReserveCmd(env, gf))
 	return cmd
 }
 

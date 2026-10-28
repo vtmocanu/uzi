@@ -75,6 +75,16 @@ func (f *FakeClient) GetMySettings(context.Context) (apitypes.UserSettingsDTO, e
 	return f.Settings, nil
 }
 
+func (f *FakeClient) SetUsageReserve(_ context.Context, thresholdPct *int, pauseRunning bool) (apitypes.UserDTO, error) {
+	f.ReserveCalls++
+	f.LastReservePct = thresholdPct
+	f.LastReservePause = pauseRunning
+	if f.Err != nil {
+		return apitypes.UserDTO{}, f.Err
+	}
+	return apitypes.UserDTO{WeeklyReservePct: thresholdPct, WeeklyReservePauseRunning: pauseRunning}, nil
+}
+
 func (f *FakeClient) ListMemory(context.Context) ([]apitypes.AgentMemoryDTO, error) {
 	if f.Err != nil {
 		return nil, f.Err

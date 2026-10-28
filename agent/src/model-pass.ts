@@ -108,6 +108,7 @@ export interface ReadOnlyModelPassOpts {
    *  in practice — `token` is simply unused when this is set. */
   codex?: {
     readonly runId: string;
+    readonly claimGeneration?: number;
     readonly binding: CodexBinding;
     readonly buildHarness: CodexAdviceHarnessFactory;
     /** PRD #2603: "deny" ⇒ the call may not refresh the shared credential (see
@@ -388,6 +389,7 @@ async function runCodexAdviceModelPass(
   const runPromise = (async (): Promise<string> => {
     const params = {
       runId: codex.runId,
+      claimGeneration: codex.claimGeneration,
       binding: codex.binding,
       signal: abort.signal,
       ...(codex.refresh ? { refresh: codex.refresh } : {}),

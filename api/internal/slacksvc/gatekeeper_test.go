@@ -91,6 +91,7 @@ type fakeSubmitter struct {
 	chatTurnErr     error
 	workerOnline    bool // PRD #191 M6: HasOnlineWorker (default false)
 	workerOnlineErr error
+	maintenance     string // PRD #3454: the MaintenanceNotice text ("" = not paused)
 
 	// PRD #322 M4 steer.
 	steers   []submittedSteer
@@ -160,6 +161,7 @@ func (f *fakeSubmitter) LiveChatForUser(context.Context, uuid.UUID) (store.Run, 
 func (f *fakeSubmitter) HasOnlineWorker(context.Context, uuid.UUID) (bool, error) {
 	return f.workerOnline, f.workerOnlineErr
 }
+func (f *fakeSubmitter) MaintenanceNotice(context.Context) string { return f.maintenance }
 func (f *fakeSubmitter) CreateChatRun(_ context.Context, userID uuid.UUID, message string) (store.Run, error) {
 	f.createdChats = append(f.createdChats, createdChat{userID, message})
 	return f.createdChat, f.createChatErr

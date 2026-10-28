@@ -341,6 +341,37 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+describe("admission observation on root dispatch", () => {
+  it("allocates before turn/start and observes retry/final independently of final cause", async t => {
+    const { CodexAdmissionReporter } = await import("../src/codex/admission-signal.js");
+    const sent: import("../src/codex/admission-signal.js").AdmissionSignal[] = [];
+    const reporter = new CodexAdmissionReporter(7, () => true, async body => { sent.push(body); return 204; });
+    let attemptId: string | undefined;
+    const begin = reporter.begin.bind(reporter);
+    t.mock.method(reporter, "begin", (thread: string) => {
+      const attempt = begin(thread); attemptId = attempt.id; return attempt;
+    });
+    const transport = new FakeTransport(method => {
+      if (method === "turn/start") assert.match(attemptId!, /^[0-9a-f-]{36}$/);
+      return defaultResponder(method);
+    });
+    const { harness } = makeHarness({ transport, admissionReporter: reporter });
+    transport.push(codexError("rateLimitExceeded", { threadId: "foreign" }))
+      .push(codexError("unauthorized"))
+      .push(codexError("rateLimitExceeded", { willRetry: true }))
+      .push(turnCompletedWithError("serverOverloaded")).end();
+    try {
+      const events = await collect(harness.startTurn(makeRequest()).events);
+      await tick();
+      assert.deepEqual(sent.map(b => b.class), ["rate_limit", "overload"]);
+      assert.ok(sent.every(b => b.attempt_id === attemptId));
+      const terminal = events.find(e => e.kind === "turn_finished");
+      assert.ok(terminal?.kind === "turn_finished");
+      assert.equal(terminal.terminal.failure?.materialize().failure.category, "authentication");
+    } finally { reporter.seal(true); await harness.close(); }
+  });
+});
+
 describe("m1 response usage", () => {
   const records = (events: HarnessEvent[]) => events.filter((e): e is Extract<HarnessEvent, { kind: "usage_record" }> => e.kind === "usage_record");
   const last = { inputTokens: 100, cachedInputTokens: 30, cacheWriteInputTokens: 20, outputTokens: 40, totalTokens: 140 };
@@ -608,6 +639,7 @@ interface HarnessBits {
 
 function makeHarness(
   opts: {
+    admissionReporter?: import("../src/codex/admission-signal.js").CodexAdmissionReporter;
     transport?: FakeTransport;
     registry?: ExecutionRegistry;
     broker?: CodexCallbackBroker;
@@ -629,6 +661,7 @@ function makeHarness(
   const launchRoot: LaunchRootSeam =
     opts.launchRoot ?? (async (): Promise<CodexLaunchRootResult> => ({ root: fakeRoot, transport, supervisorPid: 4321 }));
   const harness = new CodexHarness({
+    admissionReporter: opts.admissionReporter,
     registry,
     launchRoot,
     broker: opts.broker ?? stubBroker(),

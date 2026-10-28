@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, it, mock } from "node:test";
-import { WorkerClient } from "../src/client.js";
+import { RequestError, WorkerClient } from "../src/client.js";
 import { GitCache, type RecoveryJournalEntry } from "../src/git.js";
 import { recoveryProgress } from "../src/recovery-progress.js";
 import { makeClaim, nullLogger } from "./helpers.js";
@@ -112,3 +112,76 @@ for (const [label, episode] of [
     assert.deepEqual(journal.recovery, charged);
   });
 }
+
+for (const status of [200, 409, 400]) it(`retained exhaustion wire preserves cause and generation on ${status}`, async () => {
+  const sent: unknown[] = [];
+  mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).endsWith("/register")) return Response.json({ worker_id: "episode-worker",
+      protocol_features: ["recovery_cause_retained_recovery_exhausted"] });
+    sent.push(JSON.parse(String(init?.body)));
+    return status === 400 ? Response.json({ error: "invalid request body" }, { status }) : Response.json({
+      run: { status: "recovery_wait", recovery_wait_cause: "retained_recovery_exhausted" },
+      ...(status === 409 ? { disposition: "stale_claim" } : {}),
+    }, { status });
+  });
+  await client.register("episode-worker");
+  const body = { status: "recovery_wait", recovery_cause: "retained_recovery_exhausted", claim_generation: 5 } as const;
+  if (status === 400) await assert.rejects(client.reportState("episode-run", body),
+    (error: unknown) => error instanceof RequestError && error.status === 400);
+  else {
+    const ack = await client.reportState("episode-run", body);
+    assert.equal(ack.status, "recovery_wait");
+    assert.equal(ack.recoveryCause, "retained_recovery_exhausted");
+    assert.equal(ack.sentClaimGeneration, 5);
+    if (status === 409) {
+      assert.equal(ack.applied, false);
+      assert.equal(ack.staleClaim, true);
+    }
+  }
+  assert.deepEqual(sent, [body], "no untyped or generation-stripped retry, even without the generic fence feature");
+});
+
+it("retained exhaustion lost ACK retries the same fenced body and returns stale without confirmation", async () => {
+  const sent: unknown[] = [];
+  client.protocolFeatures = ["recovery_cause_retained_recovery_exhausted"];
+  mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
+    sent.push(JSON.parse(String(init?.body)));
+    return sent.length === 1 ? Response.json({ error: "response lost after write" }, { status: 500 })
+      : Response.json({
+        run: { status: "recovery_wait", recovery_wait_cause: "retained_recovery_exhausted" },
+        disposition: "stale_claim",
+      }, { status: 409 });
+  });
+  const body = { status: "recovery_wait", recovery_cause: "retained_recovery_exhausted", claim_generation: 5 } as const;
+  const ack = await client.reportState("episode-run", body);
+  assert.equal(ack.applied, false);
+  assert.equal(ack.staleClaim, true);
+  assert.equal(ack.status, "recovery_wait");
+  assert.equal(ack.recoveryCause, "retained_recovery_exhausted");
+  assert.equal(ack.sentClaimGeneration, 5);
+  assert.deepEqual(sent, [body, body], "one retry keeps the typed cause and generation");
+});
+
+it("retained exhaustion requires negotiated support and positive generation before sending", async () => {
+  await client.register("episode-worker");
+  const body = { status: "recovery_wait", recovery_cause: "retained_recovery_exhausted", claim_generation: 5 } as const;
+  await assert.rejects(client.reportState("episode-run", body));
+  client.protocolFeatures = ["recovery_cause_retained_recovery_exhausted"];
+  for (const generation of [undefined, 0, -1, 0.5, Number.MAX_SAFE_INTEGER + 1])
+    await assert.rejects(client.reportState("episode-run", { ...body, claim_generation: generation }));
+  assert.equal(paths.length, 1);
+});
+
+for (const refusal of ["invalid request body", "invalid recovery cause"]) it(`retained exhaustion HTTP uncertainty survives later 400 ${refusal}`, async () => {
+  const sent: unknown[] = [];
+  client.protocolFeatures = ["recovery_cause_retained_recovery_exhausted"];
+  mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
+    sent.push(JSON.parse(String(init?.body)));
+    return sent.length === 1 ? Response.json({ error: "response lost after write" }, { status: 500 })
+      : Response.json({ error: refusal }, { status: 400 });
+  });
+  const body = { status: "recovery_wait", recovery_cause: "retained_recovery_exhausted", claim_generation: 5 } as const;
+  await assert.rejects(client.reportState("episode-run", body), (error: unknown) =>
+    error instanceof Error && !(error instanceof RequestError && error.status === 400));
+  assert.deepEqual(sent, [body, body]);
+});

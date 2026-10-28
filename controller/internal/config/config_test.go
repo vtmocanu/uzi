@@ -37,6 +37,26 @@ func setWorkerEnv(t *testing.T) {
 	t.Setenv("UZI_WORKER_API_URL", "https://api.uzi.svc.cluster.local:8443")
 }
 
+func TestPodEpochRuntimeConfig(t *testing.T) {
+	for _, raw := range []string{"", "containerd-runc", "crio-crun", "docker", " containerd-runc", "CONTAINERD-RUNC"} {
+		t.Run(raw, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://api.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "token"))
+			t.Setenv("UZI_WORKER_POD_EPOCH_RUNTIME", raw)
+			t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "")
+			cfg, err := Load()
+			valid := raw == "" || raw == "containerd-runc" || raw == "crio-crun"
+			if valid && (err != nil || cfg.WorkerPodEpochRuntime != raw) {
+				t.Fatalf("runtime=%q err=%v", cfg.WorkerPodEpochRuntime, err)
+			}
+			if !valid && (err == nil || !strings.Contains(err.Error(), "UZI_WORKER_POD_EPOCH_RUNTIME")) {
+				t.Fatalf("invalid runtime accepted: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadReadsTheTokenFromFileAndDefaultsTheKnobs(t *testing.T) {
 	setWorkerEnv(t)
 	t.Setenv("UZI_API_URL", "https://uzi.example.com/some/path")

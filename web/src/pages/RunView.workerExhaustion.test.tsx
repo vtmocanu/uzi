@@ -235,3 +235,100 @@ it("badge and shared pill describe the owner decision without automatic retry", 
   render(<StatusPill status={effectiveRunStatus(run)} />);
   expect(screen.getByText("recovery needs decision")).toBeTruthy();
 });
+
+
+function retained(stamp: string | null): Run {
+  return { ...held(), recovery_wait_cause: "retained_recovery_exhausted", recovery_retry_not_before: stamp };
+}
+it.each(["2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z", null])("retained recovery %s uses the actual Resume and Cancel handlers", async (stamp) => {
+  render(view(retained(stamp), true));
+  expect(screen.getByText(stamp === null ? "Retained recovery needs your decision" : "Retained recovery retrying")).toBeTruthy();
+  if (stamp === null) {
+    expect(screen.getByText(/This hold has no scheduled retry/)).toBeTruthy();
+    expect(screen.queryByText(/The run will retry automatically|Automatic retry is due/)).toBeNull();
+  } else {
+    expect(screen.getByText(stamp.startsWith("2099") ? /The run will retry automatically after/ : /Automatic retry is due/)).toBeTruthy();
+    expect(screen.queryByText(/This hold has no scheduled retry/)).toBeNull();
+  }
+  expect(screen.queryByText(/Automatic recovery limit:|Lifetime automatic requeues:|Recovery episode:/)).toBeNull();
+  expect(screen.getByText(/Historical checkpoint or capture reports do not verify current availability/)).toBeTruthy();
+  expect(screen.getByText(/A recovery capture was recorded as available/)).toBeTruthy();
+  expect(screen.queryByText("The published checkpoint contains the latest work.")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));
+  await waitFor(() => expect(api.resumeRun).toHaveBeenCalledWith("held"));
+  await waitFor(() => expect(refreshRun).toHaveBeenCalledOnce());
+  fireEvent.click(screen.getByRole("button", { name: /^Cancel$/ }));
+  await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+});
+it.each([
+  [null, undefined, true], [null, false, true], [null, true, false],
+  ["2099-01-01T00:00:00Z", undefined, true], ["2099-01-01T00:00:00Z", false, true], ["2099-01-01T00:00:00Z", true, false],
+] as const)("retained recovery %s requires owner proof %s and canSteer %s", (stamp, proof, canSteer) => {
+  render(view(retained(stamp), proof, canSteer));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+  expect(api.getRunArchives).not.toHaveBeenCalled();
+  expect(api.resumeRun).not.toHaveBeenCalled();
+  expect(submit).not.toHaveBeenCalled();
+});
+it("announces retained recovery timing changing to explicit owner hold", async () => {
+  const { container, rerender } = render(view(retained("2020-01-01T00:00:00Z"), true));
+  const notice = container.querySelector('div.sr-only[role="status"]')!;
+  await waitFor(() => expect(notice.textContent).toMatch(/retry automatically/));
+  expect(screen.getByText(/Automatic retry is due/)).toBeTruthy();
+  expect(screen.queryByText(/This hold has no scheduled retry/)).toBeNull();
+  rerender(view(retained(null), true));
+  await waitFor(() => expect(notice.textContent).toMatch(/There is no scheduled retry/));
+  expect(notice.textContent).not.toMatch(/automatically/);
+  expect(screen.getByText(/This hold has no scheduled retry/)).toBeTruthy();
+});
+it.each([undefined, "invalid"])("retained recovery unknown timing %s promises no retry or owner hold", (stamp) => {
+  const run = { ...retained(null), recovery_retry_not_before: stamp } as Run;
+  render(view(run, true));
+  expect(screen.getByText("Retained recovery timing unknown")).toBeTruthy();
+  expect(screen.getByText(/Retry timing is unavailable/)).toBeTruthy();
+  expect(screen.queryByText(/This hold has no scheduled retry|The run will retry automatically/)).toBeNull();
+});
+it.each([null, "2099-01-01T00:00:00Z"])("retained recovery %s shares busy and error handling", async (stamp) => {
+  let reject!: (error: Error) => void;
+  vi.mocked(api.resumeRun).mockImplementationOnce(() => new Promise((_, fail) => { reject = fail; }));
+  render(view(retained(stamp), true));
+  fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));
+  expect((screen.getByRole("button", { name: /^Cancel$/ }) as HTMLButtonElement).disabled).toBe(true);
+  await act(async () => reject(new ApiError(409, "Retained recovery refused")));
+  expect(screen.getByText("Retained recovery refused")).toBeTruthy();
+  expect((screen.getByRole("button", { name: /^Resume$/ }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+function idleStall(stamp: string | null | undefined): Run {
+  return { ...retained(null), recovery_wait_cause: "codex_idle_stall", recovery_retry_not_before: stamp } as Run;
+}
+it.each([null, "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z", undefined, "invalid"])("Codex idle stall %s has owner actions and honest timing", async (stamp) => {
+  render(view(idleStall(stamp), true));
+  expect(screen.getByText(stamp === null ? "Codex idle stall needs your decision" : stamp && stamp !== "invalid" ? "Codex idle stall retrying" : "Codex idle stall timing unknown", { selector: "p" })).toBeTruthy();
+  expect(screen.getByText("Resume starts a fresh wall and resets the idle-stall count. Cancel ends this run. Resume requests an attempt; success is not assured.")).toBeTruthy();
+  if (stamp === null) expect(screen.getByText(/This hold has no scheduled retry/)).toBeTruthy();
+  if (stamp === undefined || stamp === "invalid") {
+    expect(screen.getByText(/Retry timing is unavailable/)).toBeTruthy();
+    expect(screen.queryByText(/This hold has no scheduled retry|The run will retry automatically|Automatic retry is due/)).toBeNull();
+  }
+  expect(screen.queryByText(/Automatic recovery limit:|Lifetime automatic requeues:|Recovery episode:/)).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));
+  await waitFor(() => expect(api.resumeRun).toHaveBeenCalledWith("held"));
+  await waitFor(() => expect(refreshRun).toHaveBeenCalledOnce());
+  fireEvent.click(screen.getByRole("button", { name: /^Cancel$/ }));
+  await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+});
+it.each([null, "2099-01-01T00:00:00Z", undefined])("Codex idle stall %s requires confirmed ownership", (stamp) => {
+  render(view(idleStall(stamp), false));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+  expect(api.getRunArchives).not.toHaveBeenCalled();
+});
+it("announces Codex idle stall omitted, timed and held transitions", async () => {
+  const { container, rerender } = render(view(idleStall(undefined), true));
+  const notice = container.querySelector('div.sr-only[role="status"]')!;
+  await waitFor(() => expect(notice.textContent).toMatch(/timing is unavailable/));
+  rerender(view(idleStall("2020-01-01T00:00:00Z"), true));
+  await waitFor(() => expect(notice.textContent).toMatch(/scheduled retry/));
+  rerender(view(idleStall(null), true));
+  await waitFor(() => expect(notice.textContent).toMatch(/There is no scheduled retry/));
+});

@@ -1,0 +1,149 @@
+[
+  {
+    "name": "five-criteria-four-delivered",
+    "scenario": "The issue and approved plan require five criteria; code delivers four, with no defect.",
+    "expected": "Criterion-only Requirement gap: for the fifth.",
+    "rules": [
+      "criteria",
+      "markers",
+      "empty"
+    ]
+  },
+  {
+    "name": "partly-delivered",
+    "scenario": "An approved milestone is partly implemented.",
+    "expected": "Report the incomplete criterion.",
+    "rules": [
+      "criteria",
+      "markers"
+    ]
+  },
+  {
+    "name": "path-and-line-zero",
+    "scenario": "The missing criterion belongs to a PRD and has no code line.",
+    "expected": "Use the PRD/plan path and line 0.",
+    "rules": [
+      "location"
+    ]
+  },
+  {
+    "name": "informational-prefixes",
+    "scenario": "An informational criterion cannot be verified here.",
+    "expected": "Coverage uncertainty: remains mandatory.",
+    "rules": [
+      "markers",
+      "hosted"
+    ]
+  },
+  {
+    "name": "defects-forbid-prefixes",
+    "scenario": "A correctness defect exists beside criterion notes.",
+    "expected": "Neither prefix belongs on a defect.",
+    "rules": [
+      "markers",
+      "safety"
+    ]
+  },
+  {
+    "name": "defects-first-no-eviction",
+    "scenario": "Nineteen defects and several criterion notes compete for space.",
+    "expected": "Defects first and never evicted.",
+    "rules": [
+      "caps",
+      "order"
+    ]
+  },
+  {
+    "name": "spare-room-omission",
+    "scenario": "Some criteria will not fit but one note will.",
+    "expected": "At most one minor omission note counts unreported criteria.",
+    "rules": [
+      "omission",
+      "order"
+    ]
+  },
+  {
+    "name": "full-defect-cap",
+    "scenario": "Twenty defects exhaust capacity.",
+    "expected": "All criterion and omission notes may be omitted.",
+    "rules": [
+      "caps",
+      "omission",
+      "order"
+    ]
+  },
+  {
+    "name": "hosted-only-minor",
+    "scenario": "Only maintainer hosted/live verification remains.",
+    "expected": "Minor Coverage uncertainty:.",
+    "rules": [
+      "hosted",
+      "advisory"
+    ]
+  },
+  {
+    "name": "missing-implementation-and-tests",
+    "scenario": "Worker implementation and regression tests are missing.",
+    "expected": "Criterion findings graded by impact.",
+    "rules": [
+      "worker"
+    ]
+  },
+  {
+    "name": "issue-safety-carveout",
+    "scenario": "An issue-stated security/data-integrity requirement is missing.",
+    "expected": "Critical or major defect without a criterion prefix.",
+    "rules": [
+      "safety",
+      "markers"
+    ]
+  },
+  {
+    "name": "advisory-single-pass",
+    "scenario": "A criterion-only report reaches the lead.",
+    "expected": "One check, one fix, no recheck or block; no rewriting.",
+    "rules": [
+      "advisory",
+      "empty"
+    ]
+  },
+  {
+    "name": "regression-cannot-fail",
+    "scenario": "The new regression test passes on the unfixed code.",
+    "expected": "Flag invalid regression coverage.",
+    "rules": [
+      "tests"
+    ]
+  },
+  {
+    "name": "tmpdir-go-children",
+    "scenario": "TMPDIR moves temporary logs and inherited Go build/test temporary files into permitted scratch.",
+    "expected": "Relocation alone is not bypass.",
+    "rules": [
+      "effects",
+      "scratch",
+      "children",
+      "relied"
+    ]
+  },
+  {
+    "name": "tmpdir-narrows-tests",
+    "scenario": "An override selects fewer required tests.",
+    "expected": "Flag weakened validation.",
+    "rules": [
+      "effects",
+      "reject"
+    ]
+  },
+  {
+    "name": "misleading-scratch-destination",
+    "scenario": "A scratch-looking destination changes config, credentials or tests without inspectable evidence.",
+    "expected": "The name and destination prove no harmlessness.",
+    "rules": [
+      "effects",
+      "name",
+      "evidence",
+      "reject"
+    ]
+  }
+]

@@ -61,5 +61,5 @@ func (h *Handler) WorkerRunBaseAttestationHold(w http.ResponseWriter, r *http.Re
 	if !applied {
 		code = http.StatusConflict
 	}
-	httpx.JSON(w, code, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
+	httpx.JSON(w, code, map[string]any{"run": h.workerRunDTO(r.Context(), run)})
 }

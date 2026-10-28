@@ -207,8 +207,8 @@ func (m tuiModel) reworkCmd(runID string) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(parent, boardPollTimeout)
 		defer cancel()
-		run, err := c.RunRework(ctx, runID, "")
-		return prActionMsg{kind: "rework", run: run, err: err}
+		res, err := c.RunRework(ctx, runID, "")
+		return prActionMsg{kind: "rework", run: res.RunDTO, err: err}
 	}
 }
 
@@ -219,8 +219,8 @@ func (m tuiModel) fixCICmd(repoID, ref string) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(parent, boardPollTimeout)
 		defer cancel()
-		run, err := c.CreateCIFixRun(ctx, repoID, ref)
-		return prActionMsg{kind: "fixci", run: run, err: err}
+		res, err := c.CreateCIFixRun(ctx, repoID, ref)
+		return prActionMsg{kind: "fixci", run: res.RunDTO, err: err}
 	}
 }
 

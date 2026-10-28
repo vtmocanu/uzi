@@ -24,10 +24,6 @@
 #   - A non-merge commit on the branch carries `Changelog: none` (the oracle's regex). The
 #     repo squashes with COMMIT_MESSAGES, so the line reaches the squash body and exempts
 #     the merge at release time too; it is therefore PR-wide by design. Add a reason.
-#   - Every non-merge commit touching a shipping path has a `docs(...)`/`docs:` subject and
-#     no shipping change is uncommitted. The oracle reads the SQUASH subject, so a docs-only
-#     branch squashed under a non-docs PR title still fails there: a stricter later check,
-#     never a bypass.
 #   - Every shipping path is a dependency manifest (basename go.mod, go.sum, Dockerfile,
 #     devbox.lock, package.json or package-lock.json; not the Codex runtime lock) AND every
 #     shipping commit is `chore(deps):`/`fix(deps):`/`build(deps):`
@@ -37,6 +33,9 @@
 #     time; this only spares the bot branch a per-PR commit.
 # Merge commits (a pull_request checkout's synthetic merge, a merged-in main) are skipped
 # for messages, so their "Merge ..." subject neither breaks nor satisfies a rule.
+# Docs-typed subjects alone supply no PR-time exemption: a non-docs squash title loses
+# that implicit declaration. Docs-only shipping branches use an entry or the explicit
+# `Changelog: none` declaration above, which survives in the squash body.
 #
 # BASE AND FAILING CLOSED. When refs/remotes/origin/main does not resolve it is fetched
 # (CI's lint-repo job checks out with fetch-depth 0, so this is the offline-laptop path). No
@@ -45,7 +44,8 @@
 # diff is empty.
 #
 # EXIT CODES (check-migration-numbering.sh convention; `task` itself reports 201):
-#     2 = instrument broken (not a git repo, base unresolvable, no merge-base)
+#     2 = instrument broken (not a git repo, base unresolvable, no merge-base,
+#         or an unreadable commit/path inventory)
 #     1 = malformed/unsafe fragment, or shipping change without entry/exemption
 #     0 = nothing shipping, or an entry or exemption covers it
 set -euo pipefail
@@ -138,28 +138,42 @@ grep -qiE '^Changelog:[[:space:]]*none' "$TMP/bodies" && pass "a branch commit c
 # left uncommitted (the committed subjects must describe the whole diff).
 all_shipping_commits() {
   local n=0 sha f touches
+  if ! git rev-list --no-merges "$BASE..HEAD" > "$TMP/commits"; then
+    echo 'check-changelog-entry.sh: could not read branch commits' >&2
+    exit 2
+  fi
   while read -r sha; do
     [ -n "$sha" ] || continue
     touches=0
+    # Complete the NUL inventory before a loop that may break on its first path.
+    if ! git diff-tree --no-commit-id --name-only -z -r "$sha" > "$TMP/commit-files"; then
+      echo 'check-changelog-entry.sh: could not read commit paths' >&2
+      exit 2
+    fi
     while IFS= read -r -d '' f; do
       [ -n "$f" ] || continue
       if is_shipping "$f"; then touches=1; break; fi
-    done < <(git diff-tree --no-commit-id --name-only -z -r "$sha")
+    done < "$TMP/commit-files"
     [ "$touches" = 1 ] || continue
     n=$((n + 1))
     git log -1 --format=%s "$sha" > "$TMP/subject"
     grep -qE "$1" "$TMP/subject" || return 1
-  done < <(git rev-list --no-merges "$BASE..HEAD")
+  done < "$TMP/commits"
   [ "$n" -gt 0 ] || return 1
-  { git diff --name-only -z HEAD --; git ls-files -z --others --exclude-standard; } > "$TMP/uncommitted"
+  if ! git diff --name-only -z HEAD -- > "$TMP/uncommitted"; then
+    echo 'check-changelog-entry.sh: could not read uncommitted tracked paths' >&2
+    exit 2
+  fi
+  if ! git ls-files -z --others --exclude-standard >> "$TMP/uncommitted"; then
+    echo 'check-changelog-entry.sh: could not read untracked paths' >&2
+    exit 2
+  fi
   while IFS= read -r -d '' f; do
     [ -n "$f" ] || continue
     if is_shipping "$f"; then return 1; fi
   done < "$TMP/uncommitted"
   return 0
 }
-
-all_shipping_commits '^docs(\([^)]*\))?:' && pass "every shipping commit is docs-typed"
 
 # Dependency exemption: manifest paths only AND every shipping commit dependency-typed
 # (Renovate's `chore(deps):` / `fix(deps):`), so a behavior edit to a Dockerfile under a
@@ -175,8 +189,8 @@ Add a new UUID-v4 fragment under changelog.d/ (see changelog.d/README.md), or a
 legacy line under `## [Unreleased]` in CHANGELOG.md. When there is genuinely
 nothing to announce, put
 
-    Changelog: none    # and why
+    Changelog: none (reason for no announcement)
 
-in a commit message on this branch.
+in a non-merge branch commit. Retain that declaration in the squash commit body.
 MSG
 exit 1

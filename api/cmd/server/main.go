@@ -110,12 +110,14 @@ var (
 // collector is the workersvc Service, so this keeps a signature drift a build error.
 var _ codexusagepoller.Recoverer = (*workersvc.Service)(nil)
 
-// codexProviderRequestTimeout bounds one Codex provider HTTP call in the production
-// codexauth.Client (PRD #1171 M1). The refresh callback spends it only on the oauth exchange;
-// import and recovery spend it on their nonrotating identity reads. Request-entry anchoring
-// leaves commit/recheck and response-delivery margin inside the 7.5s route budget, while the
-// worker HTTP client remains capped at 8s.
+// codexProviderRequestTimeout bounds nonrotating identity and usage reads in the
+// production codexauth.Client (PRD #1171 M1).
 const codexProviderRequestTimeout = 2500 * time.Millisecond
+
+// codexRefreshTimeout bounds the refresh callback's single OAuth exchange. Request-entry
+// anchoring leaves commit/recheck and response-delivery margin inside the unchanged 7.5s
+// route budget, while the worker HTTP client remains capped at 8s.
+const codexRefreshTimeout = 5 * time.Second
 
 // bindWorkerListeners binds the worker-facing listener(s) and, ONLY after every enabled bind
 // succeeds, calls setReady — so the boot-grace anchor (Service.SetReadyAt) fires after the api
@@ -356,15 +358,20 @@ func run() error {
 		// internally consistent while the meter and the selector disagreed about the
 		// same token, with nothing going red.
 		Autoselect: cfg.AutoselectPolicy(),
+		// PRD #3522: the weekly usage reserve's freshness window is three of these, the rule the
+		// rate-limit surfaces already apply.
+		UsagePollInterval:      cfg.UsagePollInterval,
+		CodexUsagePollInterval: cfg.CodexUsagePollInterval,
 		// PRD #35 usage-limit park. Both are server-side bounds on a WORKER-REPORTED
 		// event: the worker asks to park, the server decides for how long and how often.
 		RunLimitMaxWaits: cfg.RunLimitMaxWaits,
 		RunLimitMaxPark:  cfg.RunLimitMaxPark,
 		// Transient-recovery park (issue #1197): the base/ceiling of the server-owned
-		// exponential backoff the sweeper auto-promotes a 'recovery_wait' run on. No
-		// per-run cap — a park always becomes promotable again.
-		RunRecoveryParkBase: cfg.RunRecoveryParkBase,
-		RunRecoveryMaxPark:  cfg.RunRecoveryMaxPark,
+		// exponential backoff used by timed recovery parks. Codex idle stalls have
+		// their own count bound and wait for owner Resume above that bound.
+		RunCodexIdleStallMaxParks: cfg.RunCodexIdleStallMaxParks,
+		RunRecoveryParkBase:       cfg.RunRecoveryParkBase,
+		RunRecoveryMaxPark:        cfg.RunRecoveryMaxPark,
 		// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2): past this many forge parks
 		// the run fails with fail_origin='forge_unreachable' instead of parking again. 0 =
 		// unlimited. Counted separately from the recovery-park backoff (recovery_wait_count).
@@ -372,7 +379,8 @@ func run() error {
 		RunGateRefusalMax:           cfg.RunGateRefusalMax,
 		// Data-volume-full park cap (PRD #1809 M5, D6): past this many COUNTED disk parks the run
 		// fails with fail_origin='data_volume_full'. 0 = unlimited. Preventive parks never count.
-		RunDiskParkMax: cfg.RunDiskParkMax,
+		RunDiskParkMax:              cfg.RunDiskParkMax,
+		RunRetainedRecoveryMaxParks: cfg.RunRetainedRecoveryMaxParks,
 		// PRD #1733: elapsed-time bound on an unbroken provider-outage park streak; past it the next
 		// provider park becomes a paused 'provider_unavailable' hold. 0 disables the hold.
 		RunProviderParkMaxDuration: cfg.RunProviderParkMaxDuration,
@@ -418,13 +426,13 @@ func run() error {
 	// Reject-without-reason buttons. It rides workersvc's ownership-checked
 	// SubmitInput (via the gateSubmitter adapter, which keeps slacksvc free of a
 	// workersvc import) and reads run status itself for stale-click handling.
-	slackGate := slacksvc.NewGatekeeper(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
+	slackGate := slacksvc.NewGatekeeper(q, gateSubmitter{wsvc, q}, slackPoster, slog.Default())
 
 	// Reply-from-Slack handler (PRD #25 M5): inbound message.im thread replies →
 	// reasoned reject during a reject-pending gate, follow_up on a live run, a nudge
 	// during an open gate, or a coalesced ephemeral otherwise. Same ownership-checked
 	// submitter as the gatekeeper.
-	slackReplier := slacksvc.NewReplier(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
+	slackReplier := slacksvc.NewReplier(q, gateSubmitter{wsvc, q}, slackPoster, slog.Default())
 
 	// Per-user chat budget (PRD #39): a spend guard on chat create + message posts.
 	// Created here (ahead of the other route limiters) because the Slack chat opener
@@ -441,7 +449,7 @@ func run() error {
 	// Dismiss on an issue-proposal card — routed as a THIRD InboundMux member beside the
 	// linker and the gatekeeper. The forge write rides the same claim-first
 	// ConfirmProposalForUser the web confirm uses (lifted in M1).
-	slackChatActions := slacksvc.NewChatActions(q, gateSubmitter{wsvc}, slackPoster, settingsCache.PublicBaseURL, slog.Default())
+	slackChatActions := slacksvc.NewChatActions(q, gateSubmitter{wsvc, q}, slackPoster, settingsCache.PublicBaseURL, slog.Default())
 	// The Continue button mints a run and spends the owner's token, so it draws from the
 	// SAME shared per-user chat budget the opener uses (PRD #191 M6) — same key, one pool.
 	slackChatActions.SetChatSpendGuard(func(userID uuid.UUID) bool {
@@ -613,7 +621,7 @@ func run() error {
 	// (codexauth.NewClient) — NEVER from a claim, model, repo, saved label or callback. Tests
 	// inject a fake through WithHTTPDoer; production takes the fixed defaults.
 	//
-	// The per-provider-request deadline (codexProviderRequestTimeout) is the innermost of a
+	// The refresh-only deadline (codexRefreshTimeout) is the innermost of a
 	// nested budget that keeps the WHOLE worker → API → provider → durable-commit → callback
 	// round trip UNDER the pinned app-server 10-second external-auth callback deadline
 	// (PRD #1147 M2 B6):
@@ -624,7 +632,7 @@ func run() error {
 	//	worker → API HTTP timeout ............................. 8s   (agent WorkerClient)
 	//	API route handling timeout .......................... 7.5s   (worker_codex.go)
 	//	coordinated-refresh lease ............................. 7s   (codexrefresh.go)
-	//	oauth exchange (codexProviderRequestTimeout) ........ 2.5s   (the callback's only
+	//	oauth exchange (codexRefreshTimeout) .................. 5s   (the callback's only
 	//	                                                           provider network call)
 	//
 	// Each outer layer therefore has actual response/cancellation margin. A timeout keeps
@@ -632,6 +640,7 @@ func run() error {
 	// the same operation instead of blindly starting another exchange.
 	wsvc.SetCodexRefresh(codexauth.NewClient(
 		codexauth.WithPerRequestTimeout(codexProviderRequestTimeout),
+		codexauth.WithRefreshTimeout(codexRefreshTimeout),
 	))
 
 	// Browser live-event hub (M5): workersvc broadcasts persisted run events to
@@ -772,6 +781,9 @@ func run() error {
 		WorkerAffinityGrace:     cfg.WorkerAffinityGrace,
 		WorkerStaleRequeueGrace: cfg.WorkerStaleRequeueGrace,
 		WorkerAffinityCeiling:   cfg.WorkerAffinityCeiling,
+		// PRD #3522: the weekly usage reserve's freshness window for provisionOne's recheck.
+		UsagePollInterval:      cfg.UsagePollInterval,
+		CodexUsagePollInterval: cfg.CodexUsagePollInterval,
 		// Issue #1965: lane workers are provisioned only where the chart enabled the lane.
 		IsolatedLaneEnabled: cfg.IsolatedLaneEnabled(),
 		DockerEnabled:       cfg.WorkerDockerEnabled,
@@ -1114,10 +1126,13 @@ func run() error {
 	// debounced claimed fan-out is M6). Wired beside the custody-episode reconciler above: a
 	// standalone reconciler with a boot pass then a one-minute ticker.
 	healthSvc := healthsvc.New(healthsvc.Config{
-		WorkerEligibilityForHealth:   wsvc.WorkerEligibilityForHealth,
-		ResidueQuarantine:            wsvc.ResidueQuarantineFor,
-		MemoryAuthorityLost:          wsvc.MemoryAuthorityLostFor,
-		Store:                        q,
+		WorkerEligibilityForHealth: wsvc.WorkerEligibilityForHealth,
+		ResidueQuarantine:          wsvc.ResidueQuarantineFor,
+		MemoryAuthorityLost:        wsvc.MemoryAuthorityLostFor,
+		Store:                      q,
+		MaintenanceReadout: func(ctx context.Context) (store.MaintenanceReadout, error) {
+			return store.ReadMaintenanceReadout(ctx, pool)
+		},
 		Pool:                         pool,
 		DiskFull:                     diskFull,
 		DBStorageCapacityBytes:       cfg.DBStorageCapacityBytes,
@@ -1635,7 +1650,10 @@ func run() error {
 // slice the Slack approval gatekeeper needs (read a run, submit an approve/reject
 // input). It drops SubmitInput's result (the gatekeeper only cares whether it
 // succeeded) and keeps slacksvc free of a workersvc import.
-type gateSubmitter struct{ svc *workersvc.Service }
+type gateSubmitter struct {
+	svc *workersvc.Service
+	q   *store.Queries
+}
 
 func (g gateSubmitter) GetRun(ctx context.Context, userID, runID uuid.UUID) (store.Run, error) {
 	return g.svc.GetRun(ctx, userID, runID)
@@ -1754,6 +1772,16 @@ func (g gateSubmitter) CreateChatRun(ctx context.Context, userID uuid.UUID, mess
 // HasOnlineWorker adapts the opener's no-worker check (PRD #191 M6).
 func (g gateSubmitter) HasOnlineWorker(ctx context.Context, userID uuid.UUID) (bool, error) {
 	return g.svc.HasOnlineWorker(ctx, userID)
+}
+
+// MaintenanceNotice adapts the create-time maintenance notice (PRD #3454).
+func (g gateSubmitter) MaintenanceNotice(ctx context.Context) string {
+	st, err := store.ReadInstanceIntakePause(ctx, g.q)
+	if err != nil {
+		slog.Warn("read intake pause for create notice", "error", err)
+		return ""
+	}
+	return store.MaintenanceNoticeText(st)
 }
 
 // EndChat adapts the Slack End-chat button (PRD #191 M6): cancel the live chat, with

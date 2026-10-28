@@ -597,6 +597,13 @@ func rootBlocks(rc store.GetSlackRunContextRow, base string) (blocks []slack.Blo
 	return blocks, fallback
 }
 
+// weeklyReserveHold reports a run the weekly usage reserve parked (PRD #3522): paused with the
+// weekly_reserve hold. It is a system park, not an owner or lead pause, so the notices name the
+// reserve and how it ends instead of the neutral owner-pause wording.
+func weeklyReserveHold(rc store.GetSlackRunContextRow) bool {
+	return rc.Status == "paused" && rc.HoldReason.Valid && rc.HoldReason.String == "weekly_reserve"
+}
+
 func providerHold(rc store.GetSlackRunContextRow) bool {
 	return rc.Status == "paused" && rc.HoldReason.Valid && rc.HoldReason.String == "provider_unavailable"
 }
@@ -914,6 +921,20 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 			}
 			return blocks, fmt.Sprintf("Needs your attention · provider unavailable · %s#%d", repo, iid(rc.IssueIid)), true
 		}
+		if weeklyReserveHold(rc) {
+			blocks = []slack.Block{threadSectionBlock("⏸️ *Paused · weekly usage reserve*")}
+			var detail strings.Builder
+			if n := len(decodeMilestoneIDs(rc.MilestonesCompleted)); n > 0 {
+				fmt.Fprintf(&detail, "after milestone %d · ", n)
+			}
+			detail.WriteString("usage reached your weekly reserve threshold · resumes when usage drops below it, or override with `uzi run resume " + rc.ID.String() + "`")
+			ctxElems := []slack.MixedElement{threadMrkdwnElem(ScrubSecrets(detail.String()))}
+			if el, has := linkElem(); has {
+				ctxElems = append(ctxElems, el)
+			}
+			blocks = append(blocks, slack.NewContextBlock("slack_thread_reserve_ctx", ctxElems...))
+			return blocks, fmt.Sprintf("Paused · weekly usage reserve · %s#%d", repo, iid(rc.IssueIid)), true
+		}
 		// PRD #1190 M1: an ordinary pause. The notifier has no pause-origin evidence, so
 		// the header stays neutral about who paused the run. The last checkpoint-published
 		// branch tip (checkpoint_tip) rides the detail as `checkpoint <short>` — its first 7
@@ -1059,12 +1080,15 @@ func statusGlyph(rc store.GetSlackRunContextRow) (emoji, label string) {
 		if providerHold(rc) {
 			return "⚠️", "Needs your attention · provider unavailable"
 		}
+		if weeklyReserveHold(rc) {
+			return "⏸️", "Paused · weekly usage reserve"
+		}
 		return "", rc.Status
 	case "recovery_wait":
 		if rc.RecoveryWaitCause.Valid && rc.RecoveryWaitCause.String == "provider_outage" {
 			return "🔄", "Recovering · provider outage"
 		}
-		// issue #1197: a transient-recovery park that auto-resumes on a capped backoff.
+		// issue #1197: recovery parks include timed retries and owner-held causes (#3509).
 		// Without this case the default arm below renders the raw enum `recovery_wait` on
 		// the root line of a user-facing DM (Slack has no _→space fallback, PRD #88 M3
 		// added the explicit awaiting_input/awaiting_followup cases for exactly this bug).

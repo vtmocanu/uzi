@@ -160,7 +160,7 @@ step](./github-project-sync.md#the-adopt-flow-step-by-step).
 
 ## 6. Enable the repo
 
-Open **Boards**, pick the connection, and enable each repo you added the bot to.
+Open **Repos**, pick the connection, and enable each repo you added the bot to.
 This makes its board appear in the sidebar and starts syncing its `uzi`-labeled
 issues (see [Board](./board.md)).
 
@@ -219,7 +219,7 @@ waivable.** A blocking push/merge finding is **waivable** whenever uzi could
 actually read who can reach `main` — a readable ruleset that admits the write
 role, or a default branch with no protection at all. There, if the risk is
 knowingly accepted, the repo owner clicks **Request admin approval** on their
-Boards page (with a required reason of their own), an instance admin approves it
+Repos page (with a required reason of their own), an instance admin approves it
 from **Admin → Blocked repos**, and the owner then retries Enable so the live
 guard runs again. This is the common first-onboarding case on a repo whose
 default branch simply isn't protected — including a **GitHub Free private

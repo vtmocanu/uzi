@@ -47,6 +47,10 @@ export interface User {
    *  creation and overridable on the run view — so the two disagreeing is the normal
    *  state of a user who overrode one run, not a sync bug to fix. */
   wait_on_limit: boolean;
+  /** PRD #3522: weekly usage reserve threshold (1..100), null when off. */
+  weekly_reserve_pct?: number | null;
+  /** PRD #3522: also pause running runs at the reserve (default true). */
+  weekly_reserve_pause_running?: boolean;
   /** PRD #1020: this user's opt-in to an alert when the poller observes their
    *  Anthropic usage window has reset earlier than its previously reported reset
    *  time. Default true; toggled from their own Settings. */
@@ -223,6 +227,10 @@ export interface UserSettings {
    *  default ON. null/absent reads as enabled; an explicit false opts this account out. The
    *  instance kill-switch (AppSettings.now_summary_enabled) is separate. */
   now_summary_enabled?: boolean | null;
+  /** PRD #3522: weekly usage reserve threshold (1..100), null when off. */
+  weekly_reserve_pct?: number | null;
+  /** PRD #3522: also pause running runs at the reserve (default true). */
+  weekly_reserve_pause_running?: boolean;
   /** Per-user default harness (PRD #1429 M1 / D3); null = "no preference", so implicit run
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */
@@ -538,6 +546,7 @@ export interface PipelineStatus {
 }
 
 export interface Repo {
+  ignored_inferred_capabilities?: string[];
   /** Separate checker consent; absent on older APIs means off. */
   cross_check_repo_instructions_enabled?: boolean;
   code_cross_check_guidance?: string | null;
@@ -861,6 +870,12 @@ export interface LatestRun {
   // null for a non-running/chat/judge/interactive run. Optional for the same api/web
   // rollout skew as is_planning: a pre-feature api pod omits the key.
   deadline_at?: string | null;
+  // Read-time reason holding this queued run back; optional for api/web rollout skew.
+  queue_reason?: QueueReason | null;
+  // Read-time owner projection; foreign/admin shared reads redact account details.
+  // Eligibility includes the per-run spread and is not a promised start time.
+  codex_admission_class?: CodexAdmissionClass | null;
+  codex_admission_eligible_at?: string | null;
   // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
@@ -1555,6 +1570,68 @@ export interface ReleaseCheckStatus {
   partial?: boolean;
 }
 
+// ── Instance maintenance mode (PRD #3454) ───────────────────────────────────
+
+// QueueReason is why a queued run is held back, beyond waiting for a worker: instance
+// maintenance, the owner's weekly usage reserve ("weekly_reserve", PRD #3522), or a temporary
+// provider admission hold. Precedence is in that order.
+export type QueueReason = "maintenance" | "weekly_reserve" | "codex_rate_limit" | "codex_overload";
+export type CodexAdmissionClass = "rate_limit" | "overload";
+
+// MaintenanceState is `GET /api/maintenance` (any signed-in user): whether intake is paused,
+// since when, and the admin's plain-text reason. Render the reason via stripDisplayCell.
+export interface MaintenanceState {
+  active: boolean;
+  since: string | null;
+  reason: string | null;
+}
+
+// MaintenanceRunItem is one run in an admin readout category. tag says whether the run will
+// finish on its own ("progressing") or needs its owner to act ("needs_owner"); null when the
+// category does not tag (active, queued).
+export interface MaintenanceRunItem {
+  run_id: string;
+  kind: string;
+  status: string;
+  owner_label: string;
+  repo: string | null;
+  since: string | null;
+  tag: "progressing" | "needs_owner" | null;
+  hold_id: string | null;
+}
+
+export interface MaintenanceIdleWorker {
+  worker_id: string;
+  owner_label: string;
+  run_id: string;
+  since: string | null;
+}
+
+// MaintenanceCategory: an exact count plus up to 50 items.
+export interface MaintenanceCategory<T> {
+  count: number;
+  items: T[];
+}
+
+// MaintenanceReadout is the drain snapshot. clear = no active, held or custody blockers
+// visible as of as_of; queued and idle_bound_workers are informational.
+export interface MaintenanceReadout {
+  as_of: string;
+  clear: boolean;
+  active: MaintenanceCategory<MaintenanceRunItem>;
+  held: MaintenanceCategory<MaintenanceRunItem>;
+  custody: MaintenanceCategory<MaintenanceRunItem>;
+  queued: MaintenanceCategory<MaintenanceRunItem>;
+  idle_bound_workers: MaintenanceCategory<MaintenanceIdleWorker>;
+}
+
+// AdminMaintenance is `GET`/`PUT /api/admin/maintenance` (admin): the state with who last
+// changed it, plus the readout.
+export interface AdminMaintenance {
+  state: MaintenanceState & { by_label: string | null };
+  readout: MaintenanceReadout;
+}
+
 // HealthDoc is the admin-health document (PRD #1484 M1): the response of
 // `GET /api/admin/health` (RequireAdminRO). It mirrors `apitypes.HealthDocDTO`
 // byte-for-byte (snake_case JSON keys). Admin-only by route — it carries owner and
@@ -2056,6 +2133,8 @@ export type RunNowResponse = {
   ineligible_matched?: number | null;
   started: LastFireStarted[];
   skips: LastFireSkip[];
+  // PRD #3454: set when the fire started runs while uzi is in maintenance mode.
+  notice?: string | null;
 };
 
 export interface CIEpisodeDTO {
@@ -2983,6 +3062,22 @@ export interface SemanticDriftDTO {
 }
 
 export interface Run {
+  capability_provenance?: {
+    hints_known: boolean;
+    inference_known: boolean;
+    capabilities: {
+      capability: string;
+      sources: string[];
+      required: boolean;
+      inference_ignored: boolean;
+      triggers: { path: string; reason: string }[];
+      truncated: boolean;
+    }[];
+  };
+  /** Repo display path on detail reads; absent on older servers, empty when unavailable. */
+  repo_path?: string;
+  /** Frozen repo inference policy; explicit requirements take precedence. */
+  ignored_inferred_capabilities?: string[];
   completion_pending?: CompletionPendingDTO;
   semantic_gate?: import("./semanticGate").SemanticGateDTO;
   semantic_drift?: SemanticDriftDTO;
@@ -3139,6 +3234,18 @@ export interface Run {
   // null for a non-running/chat/judge/interactive run. Optional for the same api/web
   // rollout skew as is_planning: a pre-feature api pod omits the key.
   deadline_at?: string | null;
+  /** Read-time queue hold (see LatestRun.queue_reason). Optional for rollout skew. */
+  queue_reason?: QueueReason | null;
+  /** PRD #3522: why the weekly usage reserve holds this queued run (e.g. "weekly usage reserve:
+   *  72% >= 70%"); absent when not held or not queued. */
+  reserve_hold_reason?: string | null;
+  /** PRD #3522: RFC3339 end of the owner's manual-resume override of the weekly usage reserve
+   *  (the next weekly reset); absent/null when no override is active. */
+  reserve_exempt_until?: string | null;
+  // Read-time owner projection; foreign/admin shared reads redact account details.
+  // Eligibility includes the per-run spread and is not a promised start time.
+  codex_admission_class?: CodexAdmissionClass | null;
+  codex_admission_eligible_at?: string | null;
   /** PRD #320 D8: the run's queue-priority CLASS, computed server-side (see RunPriority).
    *  Only a QUEUED run is ever non-"normal"; a running/terminal run renders no pill. It
    *  rides the shared run embed (RunListItemDTO embeds RunDTO), so it is present on BOTH
@@ -3547,7 +3654,9 @@ export interface Run {
   pause_requested_at?: string | null;
   /** PRD #1497 M1 widens pause_mode with "wall": the system-authored wall-park request mode the
    *  timeout sweep stamps at the deadline (alongside the owner's "milestone"/"now"). */
-  pause_mode?: "milestone" | "now" | "wall" | null;
+  pause_mode?: "milestone" | "now" | "wall" | "reserve" | null;
+  // PRD #3522: "reserve" is the system pause request the weekly usage reserve files; it parks
+  // after the current milestone and cannot be withdrawn by the owner (cancel 409s).
   pause_after_count?: number | null;
   checkpoint_tip_at?: string | null;
   /** PRD #1226 M5 (D8): the honest-state completion fields — the wire contract the web + CLI
@@ -3780,7 +3889,22 @@ export interface PlanCrossCheckFinding {
   rationale: string;
 }
 
+export interface CodeCrossCheckCoverage {
+  version: 1;
+  entries: { path: string; status: "examined" | "excluded" | "unassessed"; reason: string; recorded_read: boolean }[];
+  inventory_incomplete: boolean;
+  omitted_paths: number;
+  omitted_count_exact: boolean;
+  unknown_judgments: number;
+  invalid_judgments: number;
+  omitted_judgments: number;
+  activity_complete: boolean;
+  reasons: string[];
+}
+
 export interface CodeCrossCheckSummary {
+  /** Raw JSON from the API; the card validates it before rendering. */
+  coverage?: unknown;
   custom_guidance_applied?: boolean;
   guidance_digest?: string;
   repo_instructions_enabled?: boolean;
@@ -3901,6 +4025,7 @@ export type RunSummaryItem = Omit<
   "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
+  | "capability_provenance"
 >;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).

@@ -53,6 +53,67 @@ This builds and starts three services (`db`, `api`, `web`) in dependency order: 
 
 Register the first account — it becomes admin automatically. Subsequent registrations are regular users.
 
+## Codex account admission upgrades
+
+Deploy the **API first, then workers**. The API applies the additive
+`00364_codex_account_admission_throttle.sql` and
+`00365_codex_admission_projection.sql` schema before serving. The supported
+Helm API deployment remains a singleton with `Recreate`
+([deployment template](../deploy/chart/templates/api-deployment.yaml));
+mixed old/new API replicas outside that topology have no enforcement promise.
+
+Workers negotiate `codex_account_admission_signal_v1` before reporting
+provider evidence. Older workers still obey the server's claim gate but
+supply less evidence. Missing or refused reporting drops telemetry without
+changing run lifecycle behavior. See the
+[user contract](rate-limits.md#temporary-account-admission-waits).
+
+Reporting is bounded best effort and does not block the provider or lifecycle
+path. Each observation gets at most two HTTP attempts, at most three seconds
+each, within a ten-second monotonic budget. The current implementation starts
+that budget at observation, including queue time, stricter than starting at
+first send. The pending queue holds 32 observations including the active
+send; overflow drops signals rather than inventing evidence.
+
+The worker client has separate bounds of **1,024 live reporters** and
+**1,024 recent closed/refused generation markers**. Closing removes the live
+reporter and frees capacity for future bindings. Concurrent live overflow drops the telemetry binding but
+records its generation to fence older pending responses. Closed markers retain
+recent generation high-water marks in FIFO order. Eviction rotates the claim
+observation epoch to prevent pre-eviction responses from rebinding forgotten
+old authority; unrelated pending telemetry bindings may also be dropped.
+Claims and execution continue. A fresh server claim increments the generation;
+retained closed handles stay inert.
+
+Nonclosing running/awaiting-approval state sends, pause intent and completion
+attempts seal queued work and unsent retries. Active HTTP may finish within
+its existing three-second attempt and ten-second observation bounds under the
+server's live-state fence. Ending authority permanently closes reporting and
+aborts active HTTP, allowing loss of the last attempt. Lifecycle and preservation
+do not wait for a reporting ACK.
+
+Registration and temporarily missing feature support discard pending work and
+suspend new reporting while support is absent. Fresh attempts on live reporters
+resume when support is advertised; closed, refused or stale-generation reporters
+stay closed. Claims started before registration or feature invalidation are
+ignored for telemetry binding through the observation epoch, without changing
+execution. The signal retains typed evidence rather than raw provider text and
+does not use Retry-After.
+
+An ordinary API restart reconstructs admission from persisted database state.
+Application rollback leaves the additive tables and view in place: an old
+API does not read this state and admits without this account gate.
+Roll-forward reapplies still-live finite state; expired rows follow the
+quiet-reset policy when qualifying evidence next arrives. Do not run the
+schema Down migrations as an application rollback.
+
+Automated reconstruction coverage creates a separate database pool and service
+instance; it does not exercise a binary or Kubernetes restart. An optional
+operator rollout smoke check can observe a queued run across an API restart
+and confirm admission after eligibility; it is separate from CI gates.
+See [ADR-1106](../adr/1106-codex-harness.md#amendment-temporary-account-admission-3530-2026-10-27)
+for the statement-snapshot boundary and critical invariants.
+
 ## Smoke test
 
 `scripts/smoke.sh` drives the full journey against a running stack (registration race, login, admin list, deactivation/revocation, CSRF enforcement) and expects a **fresh, empty** `users` table:

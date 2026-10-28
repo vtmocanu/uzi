@@ -30,7 +30,7 @@ import (
 func validateProviderPark(req StateRequest) error {
 	if req.ProviderProgressTurns != nil {
 		allowed := req.RecoveryCause == nil ||
-			*req.RecoveryCause == "empty_turn" || *req.RecoveryCause == recoveryCauseDataVolumeFull
+			*req.RecoveryCause == "empty_turn" || *req.RecoveryCause == recoveryCauseCodexIdleStall || *req.RecoveryCause == recoveryCauseDataVolumeFull
 		if req.State != "recovery_wait" || !allowed || *req.ProviderProgressTurns < 0 ||
 			req.ClaimGeneration == nil || *req.ClaimGeneration <= 0 {
 			return fmt.Errorf("%w: provider_progress_turns requires a non-negative count and positive generation on an ordinary or disk recovery park", ErrInvalidState)
@@ -47,8 +47,9 @@ func validateProviderPark(req StateRequest) error {
 	}
 	// Typed accounting needs a positive generation: the nil-generation compatibility path must
 	// never become authority for a new streak or a progress reset (generation 0 is a chat run).
-	if typed && (req.ClaimGeneration == nil || *req.ClaimGeneration <= 0) {
-		return fmt.Errorf("%w: provider_outage park requires a positive claim_generation", ErrInvalidState)
+	idle := req.State == "recovery_wait" && req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseCodexIdleStall
+	if (typed || idle) && (req.ClaimGeneration == nil || *req.ClaimGeneration <= 0) {
+		return fmt.Errorf("%w: %s park requires a positive claim_generation", ErrInvalidState, *req.RecoveryCause)
 	}
 	return nil
 }

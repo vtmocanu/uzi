@@ -24,6 +24,8 @@ export const MOCK_MODE = import.meta.env.VITE_UZI_MOCK === "1";
 // request helpers, ProjectSyncVisibility) references in its signatures.
 import type {
   AdminBlockedRepos,
+  AdminMaintenance,
+  MaintenanceState,
   AdminDockerAllowlistRepos,
   AdminCodexRateLimits,
   AdminRateLimits,
@@ -574,6 +576,14 @@ const realApi = {
   // RequireAdminRO (a uza_ CLI token or an admin session); unlike release-check it returns
   // the document unwrapped. The endpoint caches one evaluation for 5s server-side.
   getAdminHealth: () => request<HealthDoc>("GET", "/admin/health"),
+  // Instance maintenance mode (PRD #3454). getMaintenance is the all-user read behind the
+  // app-wide banner; getAdminMaintenance/setMaintenance back the admin card (state + drain
+  // readout). setMaintenance is a PUT through request(), so CSRF rides along (admin, cookie
+  // session only). Reason is plain text, at most 280 characters.
+  getMaintenance: () => request<MaintenanceState>("GET", "/maintenance"),
+  getAdminMaintenance: () => request<AdminMaintenance>("GET", "/admin/maintenance"),
+  setMaintenance: (active: boolean, reason: string) =>
+    request<AdminMaintenance>("PUT", "/admin/maintenance", { active, reason }),
   // Snooze the caller's admin Danger banner for the current health episode (PRD #1484 M5,
   // D2). A POST through the request wrapper so the CSRF header rides along — RequireAdmin
   // (cookie + CSRF), no CLI verb, matching "no admin write verbs" in the CLI. Returns the
@@ -628,6 +638,15 @@ const realApi = {
    */
   setWaitOnLimit: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/wait-on-limit", { enabled }),
+  // Set the current user's weekly usage reserve (PRD #3522). Both fields are always sent
+  // (the server 400s an absent one): thresholdPct is an integer 1..100, or null to turn
+  // the reserve off; pauseRunning also pauses running runs after their current milestone.
+  // Session identity only. Returns the updated user.
+  setUsageReserve: (thresholdPct: number | null, pauseRunning: boolean) =>
+    request<{ user: User }>("PUT", "/me/usage-reserve", {
+      threshold_pct: thresholdPct,
+      pause_running: pauseRunning,
+    }),
   // Flip the current user's early-limit-reset Slack alert opt-in (PRD #1020 M4/M5).
   // Session identity only — the body carries no user id. Returns the updated user.
   setNotifyEarlyReset: (enabled: boolean) =>
@@ -956,6 +975,10 @@ const realApi = {
   setRepoRequiredCapabilities: (id: string, caps: string[]) =>
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
       required_capabilities: caps,
+    }),
+  setRepoIgnoredInferredCapabilities: (id: string, caps: string[]) =>
+    request<{ repo: Repo; warning?: string }>("PATCH", `/repos/${id}`, {
+      ignored_inferred_capabilities: caps,
     }),
   // Admin per-repo guardrail override (PRD #66 D8). ADMIN-ONLY, no member path — a
   // dedicated route, not PatchRepo. Requires a non-empty reason; returns the repo.

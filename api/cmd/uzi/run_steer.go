@@ -39,7 +39,7 @@ func newRunScopeCmd(env Env, gf *globalFlags) *cobra.Command {
 				return uzicli.Exitf(uzicli.ExitUsage, "run scope needs --through N")
 			}
 			n, _ := cmd.Flags().GetInt("through")
-			if err := submitInput(env, gf, c, cmd, args[0], kindScope, strconv.Itoa(n), nil, false, nil); err != nil {
+			if err := submitInput(env, gf, c, cmd, args[0], kindScope, strconv.Itoa(n), false, nil); err != nil {
 				return err
 			}
 			// The server clamps the ceiling to [already-completed, total]; the applied value
@@ -324,7 +324,7 @@ func newRunFollowUpCmd(env Env, gf *globalFlags) *cobra.Command {
 			if strings.TrimSpace(msg) == "" {
 				return uzicli.Exitf(uzicli.ExitUsage, "a follow-up needs a message: pass -m <message> or pipe it on stdin")
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindFollowUp, msg, nil, false, nil)
+			return submitInput(env, gf, c, cmd, args[0], kindFollowUp, msg, false, nil)
 		},
 	}
 	followUp.Flags().StringP("message", "m", "", "the follow-up message (or pipe it on stdin)")
@@ -361,7 +361,7 @@ func newRunReviseCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindRevisePlan, msg, nil, false, expected)
+			return submitInput(env, gf, c, cmd, args[0], kindRevisePlan, msg, false, expected)
 		},
 	}
 	revise.Flags().StringP("message", "m", "", "the plan feedback to send back (or pipe it on stdin)")
@@ -426,7 +426,7 @@ func newRunAnswerCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindAnswer, string(body), nil, false, nil)
+			return submitInput(env, gf, c, cmd, args[0], kindAnswer, string(body), false, nil)
 		},
 	}
 	answer.Flags().StringArrayP("message", "m", nil, "the answer (repeat once per question; or pipe a single answer on stdin)")
@@ -478,17 +478,13 @@ func newRunInputsCmd(env Env, gf *globalFlags) *cobra.Command {
 			// the run's live status for the gate/terminal nuance. One cheap GetRun; if
 			// it fails, status stays "" and the state degrades to the receipt-derived
 			// floor (Decision 10). Skipped entirely for an empty queue.
-			status := ""
-			recoveryCause := ""
+			var presentationRun apitypes.RunDTO
 			if len(list) > 0 {
 				if run, err := c.GetRun(cmd.Context(), args[0]); err == nil {
-					status = run.Status
+					presentationRun = run
 					if line := workerExhaustionLine(run); line != "" {
 						_, _ = fmt.Fprintln(env.Stderr, line)
 					}
-					// PRD #1392 M5: carry the recovery cause so a forge-unreachable park's
-					// queue row names the forge rather than a transient empty turn.
-					recoveryCause = strOr(run.RecoveryWaitCause, "")
 					if run.Kind == runkind.Chat {
 						// N3: a chat run's queue is every chat turn. Note it only when it
 						// actually applies, so an issue run's output stays clean.
@@ -496,7 +492,7 @@ func newRunInputsCmd(env Env, gf *globalFlags) *cobra.Command {
 					}
 				}
 			}
-			return renderRunInputs(p, list, status, recoveryCause)
+			return renderRunInputs(p, list, presentationRun)
 		},
 	}
 	return inputs

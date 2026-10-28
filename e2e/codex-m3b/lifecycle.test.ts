@@ -2069,7 +2069,7 @@ async function runLiveSubscription(): Promise<void> {
   const log = recordingLog();
   const WorkerClient = await loadWorkerClientCtor();
   // Default to the PRODUCTION worker budget (8s codexHTTPTimeoutMs) so pass/fail is production-
-  // equivalent; the server keeps its production 7.5s route / 7s lease + 2.5s per-provider-call cap.
+  // equivalent; the server keeps its production 7.5s route / 7s lease + 5s OAuth cap (2.5s reads).
   // CODEX_M3B_LIVE_RELAX_TIMEOUTS=1 relaxes the client to 30s (and drops the server per-call cap) as
   // an explicit diagnostic mode only.
   const relaxTimeouts = process.env.CODEX_M3B_LIVE_RELAX_TIMEOUTS === "1";

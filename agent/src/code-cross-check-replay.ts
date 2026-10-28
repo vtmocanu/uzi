@@ -2,6 +2,7 @@
 // existing checker classes unchanged against a frozen corpus of reconstructed pre-fix snapshots and
 // scores their findings with a documented proxy. Nothing here is wired into the production runner.
 import fs from "node:fs/promises";
+import { REPLAY_PROFILES, type ReplayProfile } from "./code-cross-check-replay-profiles.js";
 import { constants as FS, type Stats } from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -101,6 +102,7 @@ export interface ReplayPins {
   credential_mode: typeof CREDENTIAL_MODE;
 }
 export interface ReplayCorpus {
+  profile?: ReplayProfile;
   corpus_version: string;
   brief_sha256: { codex: string; claude: string };
   pins: ReplayPins;
@@ -312,7 +314,7 @@ async function loadCase(root: string, id: string, expectedSha: string): Promise<
 }
 
 /** Load and verify the frozen corpus. `manifestSha256` is injectable so tests can use a temp corpus. */
-export async function loadReplayCorpus(checkout: string, opts: { manifestSha256?: string } = {}): Promise<ReplayCorpus> {
+export async function loadReplayCorpus(checkout: string, opts: { manifestSha256?: string; profile?: ReplayProfile } = {}): Promise<ReplayCorpus> {
   const root = path.join(checkout, CORPUS_DIR);
   const manifestBytes = await readReplayAsset(root, "manifest.json", ASSET_MAX);
   if (!manifestBytes || sha256Hex(manifestBytes) !== (opts.manifestSha256 ?? CORPUS_MANIFEST_SHA256)) return integrity();
@@ -328,8 +330,11 @@ export async function loadReplayCorpus(checkout: string, opts: { manifestSha256?
   const cred = strict(p.credential_mode, ["codex", "claude"]);
   if (reader.codex !== READER_IMPLEMENTATION.codex || reader.claude !== READER_IMPLEMENTATION.claude ||
       cred.codex !== CREDENTIAL_MODE.codex || cred.claude !== CREDENTIAL_MODE.claude) return integrity();
+  const profile = opts.profile ?? "baseline";
+  if (profile !== "baseline" && profile !== "revised") throw new ReplayError("brief_drift");
   for (const family of ["codex", "claude"] as const) {
-    if (brief_sha256[family] !== sha256Hex(codeCrossCheckBrief(BRIEF_TOOLS[family]))) throw new ReplayError("brief_drift");
+    if (brief_sha256[family] !== REPLAY_PROFILES.baseline[family]
+      || REPLAY_PROFILES[profile][family] !== sha256Hex(codeCrossCheckBrief(BRIEF_TOOLS[family]))) throw new ReplayError("brief_drift");
   }
   const entries = arr(manifest.cases, 200).map((raw) => {
     const e = strict(raw, ["id", "case_sha256"]);
@@ -341,7 +346,7 @@ export async function loadReplayCorpus(checkout: string, opts: { manifestSha256?
   const cases: ReplayCase[] = [];
   for (const e of entries) cases.push(await loadCase(root, e.id, e.sha));
   return {
-    corpus_version, brief_sha256, cases,
+    corpus_version, brief_sha256: { ...REPLAY_PROFILES[profile] }, profile, cases,
     pins: { corpus_version, brief_sha256, reader_implementation: READER_IMPLEMENTATION, credential_mode: CREDENTIAL_MODE },
   };
 }
@@ -659,6 +664,7 @@ export function codexReleaseSeam(openaiKey: string): Pick<WorkerClient, "release
 // The replay loop
 
 export interface ReplayRecord {
+  profile?: ReplayProfile;
   case_id: string;
   kind: "defect" | "control";
   input_provenance: "reconstructed" | "recorded";
@@ -827,7 +833,7 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
           case_id: c.id, kind: c.kind, input_provenance: c.input_provenance, family, repeat,
           corpus_version: deps.corpus.corpus_version,
           checker_version: { ...deps.checkerVersion, corpus_version: deps.corpus.corpus_version },
-          brief_sha256: deps.corpus.brief_sha256[family], model: deps.model, effort: deps.effort,
+          profile: deps.corpus.profile ?? "baseline", brief_sha256: deps.corpus.brief_sha256[family], model: deps.model, effort: deps.effort,
           reader_implementation: READER_IMPLEMENTATION[family], credential_mode: CREDENTIAL_MODE[family],
           outcome, latency_ms: latency, cost_usd: cost,
           findings: outcome === "completed" ? findings : [],
@@ -852,7 +858,7 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
 
 export interface Adjudication { record_key: string; finding_id: string; verdict: "false_positive" | "valid" | "duplicate" }
 type ScoreCase = Pick<ReplayCase, "id" | "kind" | "input_provenance" | "expected">;
-export interface ScoreCorpus { corpus_version: string; brief_sha256: { codex: string; claude: string }; cases: ScoreCase[] }
+export interface ScoreCorpus { profile?: ReplayProfile; corpus_version: string; brief_sha256: { codex: string; claude: string }; cases: ScoreCase[] }
 
 export interface DefectScore { case_id: string; id: string; attempted: number; completed: number; matched: number }
 export interface GroupAggregate {
@@ -884,6 +890,7 @@ export interface GroupAggregate {
   credential_mode: string[];
 }
 export interface Aggregate {
+  profile?: ReplayProfile;
   corpus_version: string;
   brief_sha256: { codex: string; claude: string };
   scoring: string;
@@ -916,7 +923,7 @@ export function scoreReplays(corpus: ScoreCorpus, records: ReplayRecord[], adjud
     const c = cases.get(r.case_id);
     if (!c) throw new ReplayError("score_unknown_case");
     // A record must agree with the loaded corpus; a mismatch is a stale or foreign records file.
-    if (byKey.has(recordKey(r)) || r.corpus_version !== corpus.corpus_version ||
+    if ((r.profile !== undefined && r.profile !== (corpus.profile ?? "baseline")) || byKey.has(recordKey(r)) || r.corpus_version !== corpus.corpus_version ||
         r.checker_version.corpus_version !== corpus.corpus_version ||
         r.brief_sha256 !== corpus.brief_sha256[r.family] || r.kind !== c.kind ||
         r.input_provenance !== c.input_provenance || (r.outcome !== "completed" && r.findings.length > 0)) invalidRecords();
@@ -998,14 +1005,14 @@ export function scoreReplays(corpus: ScoreCorpus, records: ReplayRecord[], adjud
     }
     out.push(group);
   }
-  return { corpus_version: corpus.corpus_version, brief_sha256: corpus.brief_sha256, scoring: SCORING_NOTE, groups: out };
+  return { corpus_version: corpus.corpus_version, profile: corpus.profile ?? "baseline", brief_sha256: corpus.brief_sha256, scoring: SCORING_NOTE, groups: out };
 }
 
 /** Built field by field: ids, counts, rates and pins only. No finding text, issue text or credential. */
 export function sanitizedAggregate(agg: Aggregate): string {
   return JSON.stringify({
     corpus_version: agg.corpus_version,
-    brief_sha256: { codex: agg.brief_sha256.codex, claude: agg.brief_sha256.claude },
+    profile: agg.profile ?? "baseline", brief_sha256: { codex: agg.brief_sha256.codex, claude: agg.brief_sha256.claude },
     scoring: agg.scoring,
     groups: agg.groups.map((g) => ({
       family: g.family, input_provenance: g.input_provenance, replays: g.replays, completed: g.completed,
@@ -1030,6 +1037,7 @@ export function sanitizedAggregate(agg: Aggregate): string {
 function parseRecord(v: unknown, env: NodeJS.ProcessEnv): ReplayRecord {
   try {
     const r = strict(v, [
+      ...(typeof v === "object" && v !== null && "profile" in v ? ["profile"] : []),
       "case_id", "kind", "input_provenance", "family", "repeat", "corpus_version", "checker_version", "brief_sha256",
       "model", "effort", "reader_implementation", "credential_mode", "outcome", "latency_ms", "cost_usd", "findings",
     ]);
@@ -1050,6 +1058,7 @@ function parseRecord(v: unknown, env: NodeJS.ProcessEnv): ReplayRecord {
       family, repeat: int(r.repeat, 1),
       corpus_version: str(r.corpus_version, 64),
       checker_version: { uzi_head: str(cv.uzi_head, 128), agent_version: str(cv.agent_version, 128), corpus_version: str(cv.corpus_version, 64) },
+      ...(r.profile === undefined ? {} : { profile: oneOf(r.profile, ["baseline", "revised"] as const) }),
       brief_sha256: hex(r.brief_sha256, HEX64), model,
       effort: oneOf(r.effort, REPLAY_EFFORTS),
       reader_implementation: oneOf(r.reader_implementation, [READER_IMPLEMENTATION[family]]),

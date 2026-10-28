@@ -1,6 +1,6 @@
 # PRD #3454: Instance maintenance mode (drain uzi before infrastructure work)
 
-**Status**: Draft. Priority high. Reviewed by buddy and two architecture reviewers (2026-10-25).
+**Status**: Done (M1 and M2 delivered, 2026-10-26). Priority high. Reviewed by buddy and two architecture reviewers (2026-10-25). Live hosted acceptance is tracked separately in #3465.
 
 ## Problem
 
@@ -117,7 +117,7 @@ Blocked by: M1.
 - `/api/maintenance`, all-user banner, derived `queue_reason` in run and v1 job DTOs + OpenAPI, create notices (web, CLI, chat, Slack), CLI warning and `uzi admin maintenance status`, health check, docs: a new operator page in `docs/` (when and how to use it, enable only after an api rollout completes, what "clear" means and that it can need owner action, the enable race) and a short user note; `task docs:sync`; `docs/cli.md`.
 - Acceptance: example 1 (visibility half) and 3; `check:api-v1-compat` green; `check-docs:web` green.
 
-A linked `acceptance` issue (owner: maintainer) covers the live check: enable on the hosted k8s instance, confirm no pod is provisioned for a new run, drain a worker node once the readout says clear (re-checked), disable, confirm the queue starts.
+The linked acceptance issue #3465 (owner: maintainer; blocks neither merge nor close) covers the live check: enable on the hosted k8s instance, confirm no pod is provisioned for a new run, drain a worker node once the readout says clear (re-checked), disable, confirm the queue starts.
 
 ## Decision Log
 
@@ -132,3 +132,5 @@ A linked `acceptance` issue (owner: maintainer) covers the live check: enable on
 - **D9 Queue reason computed in SQL at read time; health detector knows the pause.** The health pipeline is threshold-based and would lag, so the DTO reason is derived; but the detector must still resolve `reasonMaintenance` first, or it mislabels and nudges every held root. One SQL function serves claims, demand, readout and queue reason, so there is no Go mirror to drift. Rejected: persisting a health reason; a Go mirror.
 - **D10 Rolling update ordering is documented, not engineered.** Old replicas lack the conjunct during a rollout; the window is bounded by rollout duration and the docs say to enable after it completes. The reverse order (migration applied, pause off) is inert. Rejected: a version handshake.
 - **D11 One M1, not split.** A guard-only milestone has no way to enable the pause and is not verifiable end to end. Rejected: splitting M1 into guards and routes.
+- **D12 No post-lift nudge burst.** Leaving maintenance re-stamps `health_since` but does not nudge on that tick; a run still stuck after the lift is not nudged until it clears to ok and re-flags. Accepted to avoid a DM burst for the whole backlog at lift. Rejected: nudging every held root on the first post-lift tick.
+- **D13 Delivery notes (#3454 run).** Migration 00359 adds a concurrent partial index `idx_runs_nonterminal_since` so the readout and health check stay cheap at large `runs` volumes. A test helper truncating `users` must re-seed the pause row (its `by_user_id` FK cascades on TRUNCATE; a missing row reads as paused). The readout sanitizes owner labels and repo names at render. Every `fn_instance_intake_paused()` call is wrapped as `(SELECT fn_instance_intake_paused())` for one evaluation per statement.

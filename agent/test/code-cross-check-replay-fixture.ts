@@ -5,9 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import {
-  BRIEF_TOOLS, CORPUS_DIR, CREDENTIAL_MODE, READER_IMPLEMENTATION, REPLAY_DIFF_ARGS, replayGit, replayIdentityEnv,
+  CORPUS_DIR, CREDENTIAL_MODE, READER_IMPLEMENTATION, REPLAY_DIFF_ARGS, replayGit, replayIdentityEnv,
 } from "../src/code-cross-check-replay.js";
-import { codeCrossCheckBrief } from "../src/codex/cross-check.js";
+import { REPLAY_PROFILES } from "../src/code-cross-check-replay-profiles.js";
 
 export interface TempCorpus {
   root: string;
@@ -121,7 +121,7 @@ export async function buildTempCorpus(opts: { symlinks?: Record<string, string> 
   const pinsSha = await write("pins.json", JSON.stringify({
     corpus_version: "test-1",
     brief_sha256: {
-      codex: sha256(codeCrossCheckBrief(BRIEF_TOOLS.codex)), claude: sha256(codeCrossCheckBrief(BRIEF_TOOLS.claude)),
+      codex: REPLAY_PROFILES.baseline.codex, claude: REPLAY_PROFILES.baseline.claude,
     },
     reader_implementation: READER_IMPLEMENTATION, credential_mode: CREDENTIAL_MODE,
   }));

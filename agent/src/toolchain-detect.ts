@@ -32,8 +32,10 @@
 
 import { lstat, open, readdir } from "node:fs/promises";
 import { join } from "node:path";
+import type { CapabilityInferenceEvidence } from "./protocol.js";
 
 export interface ToolchainDetection {
+  evidence: CapabilityInferenceEvidence;
   /** Non-provisionable capabilities a worker must already have, from the CLOSED
    *  vocabulary {docker, jvm}. A worker cannot be provisioned with these at run time,
    *  so they gate which workers are eligible to claim the run. */
@@ -41,9 +43,8 @@ export interface ToolchainDetection {
   /** Provisionable toolchain names (e.g. go, node, python, rust, jvm). A worker without
    *  one can install it, so these steer provisioning rather than hard-gating eligibility. */
   required_tools: string[];
-  /** A coarse, SOFT/display-only size bucket derived from how many directories the scan
-   *  read. Never used to gate anything — it exists purely to give a human a sense of the
-   *  repo's shape. */
+  /** Coarse directory-count bucket. The server may use large-repo size to floor
+   *  iteration and wall budgets; it is separate from capability eligibility. */
   size_class: "s" | "m" | "l";
 }
 
@@ -198,6 +199,13 @@ function sizeClassFor(dirCount: number): "s" | "m" | "l" {
 export async function detectToolchain(clonePath: string): Promise<ToolchainDetection> {
   const capabilities = new Set<string>();
   const tools = new Set<string>();
+  const evidence: CapabilityInferenceEvidence = {};
+  const record = (cap: "docker" | "jvm", path: string, reason: NonNullable<CapabilityInferenceEvidence["docker"]>["triggers"][number]["reason"]) => {
+    const entry = evidence[cap] ??= { triggers: [], truncated: false };
+    if (entry.triggers.some(t => t.path === path && t.reason === reason)) return;
+    if (Buffer.byteLength(path, "utf8") > 512 || entry.triggers.length >= 3) { entry.truncated = true; return; }
+    entry.triggers.push({ path, reason });
+  };
 
   const queue: { abs: string; rel: string; depth: number }[] = [
     { abs: clonePath, rel: ".", depth: 0 },
@@ -221,7 +229,10 @@ export async function detectToolchain(clonePath: string): Promise<ToolchainDetec
     const files = new Set(entries.filter((e) => !e.isDirectory()).map((e) => e.name));
 
     // ── Docker: marker files present in ANY directory ──
-    if (DOCKER_MARKERS.some((m) => files.has(m))) capabilities.add("docker");
+    for (const marker of DOCKER_MARKERS) if (files.has(marker)) {
+      capabilities.add("docker");
+      record("docker", cur.rel === "." ? marker : `${cur.rel}/${marker}`, "docker_marker");
+    }
 
     // ── Docker: a manifest naming a testcontainers dependency ──
     for (const manifest of TESTCONTAINERS_MANIFESTS) {
@@ -229,6 +240,7 @@ export async function detectToolchain(clonePath: string): Promise<ToolchainDetec
       const text = await readTextBestEffort(join(cur.abs, manifest));
       if (text.includes("testcontainers")) {
         capabilities.add("docker");
+        record("docker", cur.rel === "." ? manifest : `${cur.rel}/${manifest}`, "testcontainers_reference");
         break;
       }
     }
@@ -237,11 +249,12 @@ export async function detectToolchain(clonePath: string): Promise<ToolchainDetec
     if (cur.rel === ".") {
       const scripts = [...files].filter(
         (f) => f === "Makefile" || f === "Taskfile.yml" || f.endsWith(".sh"),
-      );
+      ).sort();
       for (const script of scripts) {
         const text = await readTextBestEffort(join(cur.abs, script));
         if (scriptInvokesDocker(text)) {
           capabilities.add("docker");
+          record("docker", script, "docker_command");
           break;
         }
       }
@@ -251,6 +264,8 @@ export async function detectToolchain(clonePath: string): Promise<ToolchainDetec
     if (JVM_MARKERS.some((m) => files.has(m))) {
       capabilities.add("jvm");
       tools.add("jvm");
+      for (const marker of JVM_MARKERS) if (files.has(marker))
+        record("jvm", cur.rel === "." ? marker : `${cur.rel}/${marker}`, "jvm_manifest");
     }
 
     // ── Language tools ──
@@ -274,6 +289,7 @@ export async function detectToolchain(clonePath: string): Promise<ToolchainDetec
   }
 
   return {
+    evidence,
     required_capabilities: [...capabilities].sort(),
     required_tools: [...tools].sort(),
     size_class: sizeClassFor(scanned),

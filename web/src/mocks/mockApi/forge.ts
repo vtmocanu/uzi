@@ -47,7 +47,7 @@ function classifyGuardrailFindings(messages: string[]): {
 
 let connections = [{ ...mockConnection }];
 export let repos = mockRepos.map((r) => ({ ...r }));
-// PRD #534: a GitHub connection plus two GitHub repos so the Boards "Project
+// PRD #534: a GitHub connection plus two GitHub repos so the Repos "Project
 // sync" cell renders and its linked/unlinked panel states are exercisable under
 // VITE_UZI_MOCK=1. gitlab (conn-1) stays FIRST so it remains the demo's default
 // selection and the existing gitlab-oriented flows are untouched — select the
@@ -366,6 +366,12 @@ export const forgeApi = {
   },
   // PRD #84 M2: static per-repo capability hint. Mirrors the server's
   // capability.Filter to the {docker, jvm} vocabulary so only valid names persist.
+  setRepoIgnoredInferredCapabilities: async (id: string, caps: string[]) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    r.ignored_inferred_capabilities = CAPABILITY_VOCABULARY.filter((cap) => caps.includes(cap));
+    return delay({ repo: { ...r } });
+  },
   setRepoRequiredCapabilities: async (id: string, caps: string[]) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");

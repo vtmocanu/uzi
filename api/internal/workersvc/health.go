@@ -25,10 +25,12 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/usagereserve"
 )
 
 // ReasonWorkersUpgrading is shared with fleet.capacity's stored-reason confirmation.
@@ -126,6 +128,11 @@ const (
 	// runs.health_reason is free text). The sweeper (SweepTaskNeverDispatched) expires
 	// the run to 'failed' with a terminal failure_reason after DispatchGrace.
 	reasonHandoffSetup = "handoff setup has not finished"
+	// reasonMaintenance (PRD #3454) is the honest queued reason for a run the instance intake pause
+	// holds (fn_instance_intake_paused() and the run not admitted by
+	// fn_run_admitted_during_intake_pause): ClaimRun matches no row for it, so no worker gap is the
+	// cause. Same fixed-string contract and healthWaitingWorker enum as its siblings.
+	reasonMaintenance = "waiting: uzi is in maintenance mode"
 	// reasonStaleRequeuePinPrefix opens both expected owner-hold reasons: stale requeue
 	// (#2705) and draining or maintenance (#3000). Unlike its fixed
 	// siblings they embed values (the deadline and the worker name). isStaleRequeuePinReason
@@ -455,6 +462,15 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// nudge (its flag was already waiting_worker) and would carry the hold in its "stuck for".
 		leftPin := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			isStaleRequeuePinReason(r.HealthReason.String) && !isStaleRequeuePinReason(reason)
+		// PRD #3454: a run leaving the maintenance hold has health_since restamped so its "stuck for"
+		// excludes the pause, but it is NOT nudge-eligible on that tick: the whole backlog leaves the
+		// hold at once, and nudging here would burst a Slack DM per run right after the lift. Accepted
+		// trade-off (PRD #3454 D12): a run still stuck after the lift is not nudged until it
+		// clears to ok and flags again; only that later ok->flagged episode nudges.
+		leftMaintenance := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
+			r.HealthReason.String == reasonMaintenance && reason != reasonMaintenance
+		leftAdmission := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
+			apitypes.IsCodexAdmissionReason(r.HealthReason.String) && !apitypes.IsCodexAdmissionReason(reason)
 		nudge := target != healthOK && (r.Health == healthOK || leftPin) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
@@ -489,6 +505,15 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if reason == reasonHandoffSetup {
 			nudge = false
 		}
+		// PRD #3454: maintenance is an expected, operator-announced wait; a worker-pickup nudge is noise.
+		if reason == reasonMaintenance || apitypes.IsCodexAdmissionReason(reason) || leftAdmission {
+			nudge = false
+		}
+		// PRD #3522 M3: the weekly usage reserve is the owner's own deliberate limit, not a stuck
+		// run; a worker-pickup nudge would say the opposite of the truth. State still written below.
+		if isReserveHoldReason(reason) {
+			nudge = false
+		}
 		// Issues #2705/#3000: both owner-hold reasons are expected waiting; a worker-pickup
 		// nudge would be noise. Match the prefix shared by their deadline and worker name.
 		if isStaleRequeuePinReason(reason) {
@@ -501,8 +526,13 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			(r.Status == "running" && isManualCordonWaitReason(reason)) {
 			nudge = false
 		}
+		// PRD #3522 M3: a run leaving the reserve hold (the line was raised, the week reset) but
+		// still waiting restarts its "stuck for" clock like leaving maintenance, so the hold is not
+		// counted as time stuck; it is not nudge-eligible on that tick either (r.Health is not ok).
+		leftReserve := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
+			isReserveHoldReason(r.HealthReason.String) && !isReserveHoldReason(reason)
 		since := healthSince(now, target, r)
-		if leftPin {
+		if leftPin || leftMaintenance || leftReserve || leftAdmission {
 			since = pgconv.Time(now)
 		}
 		notifiedAt := pgtype.Timestamptz{}
@@ -535,6 +565,12 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 	return changed
 }
 
+// isReserveHoldReason reports a health reason that is a weekly-usage-reserve hold text
+// (usagereserve.HeldReason or UnknownReason).
+func isReserveHoldReason(reason string) bool {
+	return strings.HasPrefix(reason, usagereserve.ReasonPrefix)
+}
+
 // healthTargetFor computes the (flag, reason) a run should carry now. It returns
 // (healthOK, "") when the run looks healthy, which the caller writes as a
 // self-clear. Exactly one flag per run; the running-run priority is inside
@@ -555,6 +591,14 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		// real status change with an incidental row write and reset this clock).
 		if th.queued == 0 {
 			return healthOK, ""
+		}
+		// PRD #3522 M3: a run the owner's weekly usage reserve holds is explained from the first
+		// tick, not after the queued threshold: the owner set the line on purpose and the reason is
+		// the answer to "why is it not starting". The reason IS the persisted reserve text. The
+		// intake pause (reasonMaintenance) still outranks it, so a paused instance keeps its own
+		// pill; a run past the age gate resolves it in queuedReason, in the same order.
+		if !r.IntakePauseHeld && r.ReserveHoldReason != "" {
+			return healthWaitingWorker, r.ReserveHoldReason
 		}
 		// Issue #2705: a run held for its returning worker is explained from the first tick of the
 		// hold, not after the queued threshold. Issue #2501: the unambiguous, persistent
@@ -1147,7 +1191,32 @@ type healthEligibilityResult struct {
 	err    error
 }
 
+// QueuedReasonPrecedesCodexAdmission identifies the owner/setup blockers that
+// queuedReasonWithEligibility resolves before temporary provider admission.
+// Maintenance is projected separately at read time, so stale maintenance text
+// must not keep outranking an active cooldown after maintenance ends.
+func QueuedReasonPrecedesCodexAdmission(reason string) bool {
+	switch reason {
+	case reasonHandoffSetup, reasonVaultLocked, reasonCustodyLimit,
+		reasonCustodyLimitUnavailable, reasonCodexAccountUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, early bool, projection *healthEligibilityResult) string {
+	// PRD #3454: the instance intake pause outranks every rung, the handoff one included, since the
+	// pause is the reason ClaimRun matches nothing.
+	if r.IntakePauseHeld {
+		return reasonMaintenance
+	}
+	// PRD #3522 M3: the weekly usage reserve is the next most fundamental cause: ClaimRun matches no
+	// row for the run whatever the fleet looks like, so none of the worker-side rungs below is
+	// the reason. The reason is the persisted reserve text.
+	if r.ReserveHoldReason != "" {
+		return r.ReserveHoldReason
+	}
 	// PRD #400 Decision 6 / issue #1367: an undispatched task run (its uzi/task/<id> branch
 	// push or dispatch never landed) is NOT waiting for a worker — ClaimRun never offers it
 	// (kind<>'task' OR dispatched_at IS NOT NULL), so none of the fleet reasons below is the
@@ -1201,6 +1270,13 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 	// limit it is owner-account state no worker can clear, so it precedes every worker reason.
 	if r.CodexAccountGated {
 		return reasonCodexAccountUnavailable
+	}
+	// Temporary provider admission is separate from account availability. The
+	// owner-scoped projection already includes this run\'s stable recovery offset.
+	if r.CodexAdmissionClass.Valid && r.CodexAdmissionEligibleAt.Valid && now.Before(r.CodexAdmissionEligibleAt.Time) {
+		if reason := apitypes.CodexAdmissionReason(r.CodexAdmissionClass.String, r.CodexAdmissionEligibleAt.Time); reason != "" {
+			return reason
+		}
 	}
 	// PRD #1906 M5: a profile-bound run is claimable ONLY by an api-provisioned lane worker, so
 	// the ordinary fleet rungs below (online, capable, busy workers) cannot describe it; every one

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -40,6 +41,9 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// auditBody is the body of the kind='resume' audit row; empty for an ordinary resume, and the
+	// recorded weekly-reserve override (PRD #3522 M4a) when the owner resumed a reserve pause.
+	var auditBody pgtype.Text
 	switch run.Status {
 	case "recovery_wait":
 		if run.RecoveryWaitCause.Valid && run.RecoveryWaitCause.String == "provider_outage" {
@@ -52,16 +56,19 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, hint)
 			return
 		}
-		if !run.RecoveryWaitCause.Valid || (run.RecoveryWaitCause.String != "worker_requeue_exhausted" && run.RecoveryWaitCause.String != "worker_memory_pressure") {
+		if !run.RecoveryWaitCause.Valid || (run.RecoveryWaitCause.String != "worker_requeue_exhausted" && run.RecoveryWaitCause.String != "worker_memory_pressure" && run.RecoveryWaitCause.String != "retained_recovery_exhausted" && run.RecoveryWaitCause.String != "codex_idle_stall") {
 			httpx.Error(w, http.StatusConflict, fmt.Sprintf("run is %s", run.Status))
 			return
 		}
 		var resumeErr error
-		if run.RecoveryWaitCause.String == "worker_memory_pressure" {
+		switch run.RecoveryWaitCause.String {
+		case "codex_idle_stall":
+			_, resumeErr = h.q.ResumeCodexIdleStall(r.Context(), store.ResumeCodexIdleStallParams{ID: runID, UserID: user.ID})
+		case "worker_memory_pressure":
 			_, resumeErr = h.q.ResumeMemoryEpisode(r.Context(), store.ResumeMemoryEpisodeParams{
 				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
 			})
-		} else {
+		default:
 			_, resumeErr = h.q.ResumeWorkerRecoveryEpisode(r.Context(), store.ResumeWorkerRecoveryEpisodeParams{
 				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
 			})
@@ -107,13 +114,43 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		// (allow=false) and a budget_exhausted park with no remaining budget (D7). pgx.ErrNoRows means
 		// a race moved the run out of paused, or — for a budget_exhausted hold — that there is no
 		// budget left to resume on.
-		if _, err := h.q.ResumePausedRun(r.Context(), store.ResumePausedRunParams{
+		resumeParams := store.ResumePausedRunParams{
 			ID:                         runID,
 			UserID:                     user.ID,
 			AllowCompletionBlockedHold: false,
 			GlobalTimeoutSeconds:       int32(h.cfg.RunTimeout.Seconds()),
 			StaleCutoff:                workersvc.HeartbeatStaleCutoff(h.clock(), h.cfg.WorkerHeartbeatStale),
-		}); err != nil {
+		}
+		// PRD #3522 M4a (D9): resuming a weekly-reserve pause is an explicit, recorded OVERRIDE until
+		// the next observed 7-day reset, so the requeue is not held again at admission and the run
+		// does not re-pause at once. The grant is computed from the owner's current reading of the
+		// credential the run spent; the hold guard makes a hold that changed since the read above a
+		// 409 rather than an override granted under the wrong cause.
+		if run.HoldReason.Valid && run.HoldReason.String == "weekly_reserve" {
+			resumeParams.RequiredHoldReason = pgtype.Text{String: "weekly_reserve", Valid: true}
+			grant, gerr := workersvc.ComputeReserveOverride(r.Context(), h.q, run,
+				workersvc.ReserveIntervals{Claude: h.cfg.UsagePollInterval, Codex: h.cfg.CodexUsagePollInterval}, h.clock())
+			if gerr != nil {
+				slog.Error("resume run now: compute weekly reserve override", "error", gerr)
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			if grant != nil {
+				resumeParams.ReserveExemptGrantedAt = pgtype.Timestamptz{Time: grant.GrantedAt, Valid: true}
+				resumeParams.ReserveExemptUntil = pgtype.Timestamptz{Time: grant.Until, Valid: true}
+				if grant.CredentialID != nil {
+					resumeParams.ReserveExemptCredentialID = pgtype.UUID{Bytes: *grant.CredentialID, Valid: true}
+				}
+				if grant.WindowReset != nil {
+					resumeParams.ReserveExemptWindowReset = pgtype.Timestamptz{Time: *grant.WindowReset, Valid: true}
+				}
+				if grant.PriorPct != nil {
+					resumeParams.ReserveExemptPriorPct = pgtype.Int2{Int16: *grant.PriorPct, Valid: true}
+				}
+				auditBody = pgtype.Text{String: "overrode the weekly usage reserve until " + grant.Until.UTC().Format(time.RFC3339), Valid: true}
+			}
+		}
+		if _, err := h.q.ResumePausedRun(r.Context(), resumeParams); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				// Issue #3181: a credential_switch_settling hold whose worker is still finishing its own
 				// operations for the run is its own refusal, not "no longer paused". Re-read the fence
@@ -156,7 +193,7 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 	// resume mechanism, so exactly one writer. Best-effort — the transition already committed,
 	// so a failed audit write must not fail the resume. 'resume' is a server-only kind excluded
 	// from ConsumeRunInputs, so the worker never drains it.
-	if _, err := h.q.CreateRunInput(r.Context(), store.CreateRunInputParams{RunID: runID, Kind: "resume", Body: pgtype.Text{}}); err != nil {
+	if _, err := h.q.CreateRunInput(r.Context(), store.CreateRunInputParams{RunID: runID, Kind: "resume", Body: auditBody}); err != nil {
 		slog.Warn("write resume audit row", "run", runID, "error", err)
 	}
 

@@ -507,7 +507,7 @@ export function RunRow({
               {/* The health flag (PRD #47) sits beside the status pill; hidden here
                   when waitingForVault already explains a locked queued run, and when
                   the progress cell's stalled flag already shows the stall. */}
-              {!progressShowsStall(run) && <RunHealthBadge run={run} />}
+              {!progressShowsStall(run) && <RunHealthBadge run={run} nowMs={now} />}
               {/* The judge verdict (PRD #98 M4) sits with the other per-run pills;
                   absent entirely on an unjudged run. */}
               <JudgeRunBadge run={run} />

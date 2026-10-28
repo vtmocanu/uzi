@@ -90,8 +90,9 @@ follow-up and pause do not release a held memory episode. Extending a timed
 run can supply budget for a subsequent owner Resume, but does not itself
 queue the run. An available archive does not automatically release this
 hold's retained custody. After discarded/released precedence, an OPEN hold at
-`recovery_wait` for either `worker_memory_pressure` or
-`worker_requeue_exhausted` reports `needs_action` when its latest capture failed,
+`recovery_wait` for `worker_memory_pressure`,
+`worker_requeue_exhausted`, or `retained_recovery_exhausted` (timed or held),
+reports `needs_action` when its latest capture failed,
 otherwise `source_only`, before available unguarded archives or capture progress.
 Other custody attention decisions retain their existing ordering.
 
@@ -441,18 +442,22 @@ and exponential retry cap of 16 times the base delay. A legacy episode without a
 claim fence binds once to a positively verified claim; its old claim identity is
 never inferred. Already-blocked episodes retain their original reason; only a
 `budget_exhausted` blocker can renew, and only as described below. A trusted, successfully settled real model turn resets the
-reservation count. So does an explicit owner Resume of a run held at
-`recovery_wait` with cause `worker_requeue_exhausted`: the next fresh claim
-(episode above the journal's stored one) charges 1 of 3, opens a new window and
-clears a `budget_exhausted` blocker, at most once per Resume and still capped at
-3 iterations. No server requeue, `data_volume_full` retry, memory-pressure
-Resume or new claim alone renews, and no other blocker is ever renewed (see the
-[ADR-1197 #3330 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-25-3330-an-owner-resume-renews-the-retained-source-budget)).
+reservation count. Owner Resume of `worker_requeue_exhausted` and bounded
+`retained_recovery_exhausted` retries can also renew: a fresh generation and
+higher derived episode charge one of three reservations in a new five-minute
+window and clear only `budget_exhausted`. The default three timed parks are
+followed by an owner hold; Resume preserves that count. Timer promotion resets
+the run wall, while manual Resume preserves remaining wall budget and may need
+an owner extension. Other requeues, disk retries, memory-pressure Resume or a
+new claim alone do not renew. See
+[Retained recovery exhausted](./run-recovery-wait.md#retained-recovery-exhausted)
+and the [ADR-1197 #3495 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-26-3495-bounded-retained-recovery-parks).
 Recovery adopts work on a fresh attempt path and model
 session even on an unwired worker; ordinary unwired keys that never entered
 retained recovery keep same-path continuity.
 
-Permanent blockers or exhaustion end the run **failed** with custody kept,
+Other permanent blockers, or exhaustion without both durable journal confirmation
+and API support, end the run **failed** with custody kept,
 without automatic reclaim or failed-run Resume. The reason names the
 blocker: missing source, invalid clock, preservation/adoption failure,
 missing or unverifiable needed prerequisites, or a fallback still oversized.
@@ -1346,7 +1351,8 @@ trusted unsent outcome protected against a second execution.
 
 The open hold for that originating worker and exact claim generation G
 stays in custody. An OPEN hold for `recovery_wait` /
-`worker_requeue_exhausted` reports `source_only`, or `needs_action` if its latest
+`worker_requeue_exhausted` or `retained_recovery_exhausted` (timed or held)
+reports `source_only`, or `needs_action` if its latest
 capture failed, before archive readiness or capture progress is considered.
 The same narrow OPEN-hold exception applies to `worker_memory_pressure` at
 `recovery_wait`; this worker-loss example does not make a rejected record

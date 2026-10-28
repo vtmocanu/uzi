@@ -21,7 +21,7 @@
 // (a newer server's enum member) renders nothing, so the row reads exactly as before.
 import type { Run, RunProgress } from "../lib/apiTypes";
 import { formatLocalTime } from "../lib/budget";
-import { formatElapsed, parkLabel } from "../lib/runBadge";
+import { codexAdmissionText, formatElapsed, isMaintenanceQueued, isReserveQueued, parkLabel, queuedBlockerPrecedesCodexAdmission } from "../lib/runBadge";
 import { stripUnsafeChars } from "../lib/safeText";
 import { Badge } from "./ui";
 
@@ -29,7 +29,7 @@ import { Badge } from "./ui";
 // (the stalled flag's wording), and whatever parkLabel folds through effectiveRunStatus
 // to name a park.
 type ProgressRun = Pick<Run, "progress" | "status_since" | "health_since"> &
-  Partial<Pick<Run, "health" | "health_reason">> &
+  Partial<Pick<Run, "health" | "health_reason" | "queue_reason" | "codex_admission_class" | "codex_admission_eligible_at">> &
   Parameters<typeof parkLabel>[0];
 
 // progressShowsStall reports whether the cell shows the stalled flag. A row whose cell is
@@ -142,7 +142,22 @@ export function RunProgressCell({ run, now }: { run: ProgressRun; now?: number }
     case "parked":
       return <Quiet state="parked" word={parkLabel(run)} />;
     case "queued":
-      return <Quiet state="queued" word="queued" />;
+      // PRD #3454: the adjacent RunHealthBadge draws the visible maintenance pill; the
+      // screen-reader word names why the run waits.
+      // PRD #3522: the same for the weekly usage reserve (maintenance wins; the reserve outranks
+      // Codex account admission, as in the server's health ladder).
+      return (
+        <Quiet
+          state="queued"
+          word={
+            isMaintenanceQueued(run)
+              ? "queued: uzi is in maintenance mode"
+              : isReserveQueued(run)
+                ? "queued: weekly usage reserve"
+                : (!queuedBlockerPrecedesCodexAdmission(run) && codexAdmissionText(run, clock)) || "queued"
+          }
+        />
+      );
     case "planning":
       return <Quiet state="planning" word="planning" />;
     case "none":

@@ -76,6 +76,13 @@ type EphemeralConfig struct {
 	// ProvisionPass never lists or provisions isolated-lane workers (issue #1965), since the
 	// chart did not deploy the fetcher those workers depend on.
 	IsolatedLaneEnabled bool
+	// UsagePollInterval and CodexUsagePollInterval mirror the server's usage poll cadences
+	// (config.UsagePollInterval / CodexUsagePollInterval): provisionOne's weekly-usage-reserve
+	// recheck (PRD #3522) judges a reading stale after three of them, exactly as ClaimRun's admission
+	// does. The zero value makes every reading stale, which only matters for an owner who has set a
+	// threshold (an owner without one is never held).
+	UsagePollInterval      time.Duration
+	CodexUsagePollInterval time.Duration
 	// MaxPerUser is the per-user concurrent-ephemeral cap (UZI_EPHEMERAL_MAX_PER_USER).
 	MaxPerUser int
 	// DefaultSize is the workersize preset every ephemeral worker is provisioned at
@@ -365,6 +372,38 @@ func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID u
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)",
 		store.HostedProvisionLockClass, ephemeralProvisionLockObjID(userID)); err != nil {
 		return false, err
+	}
+
+	// PRD #3454: re-check intake admission under the lock, before any count/evict/token/create.
+	// The demand queries filter at selection time, but the pause can be enabled between selection
+	// and here. Plain snapshot read (no row lock). A vanished run is skipped; any other error
+	// fails closed (the next pass retries).
+	admittable, err := qtx.RunAdmittableForEphemeralProvision(ctx, runID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !admittable {
+		slog.Debug("ephemeral provisioner: instance intake is paused and the run is not admitted; skipping", "run_id", runID)
+		return false, nil
+	}
+
+	// PRD #3522 M3: re-check the weekly usage reserve under the lock, on the lane the worker about
+	// to be provisioned would get. The demand queries already drop a run carrying the sweeper's
+	// marker; this closes the window between that marker and now (a reading that crossed the
+	// threshold since, a threshold set since). A held run would be claimed by no worker, so
+	// provisioning one would only burn a pod. A plain read like the admission recheck above; a
+	// failure fails closed (the next pass retries).
+	reserveHeld, err := workersvc.EphemeralReserveHeld(ctx, qtx, runID,
+		workersvc.ReserveIntervals{Claude: p.cfg.UsagePollInterval, Codex: p.cfg.CodexUsagePollInterval}, p.now())
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, err
+	}
+	if reserveHeld {
+		slog.Debug("ephemeral provisioner: the weekly usage reserve holds the run; skipping", "run_id", runID)
+		return false, nil
 	}
 
 	n, err := qtx.CountEphemeralHostedWorkersForUser(ctx, userID)

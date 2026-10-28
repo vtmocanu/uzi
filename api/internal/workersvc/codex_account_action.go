@@ -34,7 +34,7 @@ func IsCodexAccountHold(status string, recoveryWaitCause *string) bool {
 
 // codexAccountActionStore is the derivation's one batched read. *store.Queries satisfies it.
 type codexAccountActionStore interface {
-	ListCodexAccountActionInputs(ctx context.Context, runIds []uuid.UUID) ([]store.ListCodexAccountActionInputsRow, error)
+	ListCodexAccountActionInputs(ctx context.Context, arg store.ListCodexAccountActionInputsParams) ([]store.ListCodexAccountActionInputsRow, error)
 }
 
 // CodexAccountHold is one held run's D6 surface: the derived action, plus the run's OWN
@@ -59,7 +59,10 @@ func (s *Service) CodexAccountActionsForRuns(ctx context.Context, runIDs []uuid.
 	if !ok {
 		return nil, errCodexStoreUnavailable
 	}
-	rows, err := q.ListCodexAccountActionInputs(ctx, runIDs)
+	rows, err := q.ListCodexAccountActionInputs(ctx, store.ListCodexAccountActionInputsParams{
+		RunIds:                    runIDs,
+		ReuseInFlightMicroseconds: codexRefreshReuseInFlightBound.Microseconds(),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -89,6 +92,7 @@ type codexAccountActionInputs struct {
 	recoveryAtGeneration bool // recovery material at the account's current generation
 	leaseLive            bool // the account's lease_deadline is still in the future
 	leaseExpired         bool // the account's lease_deadline is set and has passed
+	retryPending         bool // SQL receipt eligibility or consumed retry still within its policy bound
 	reauthRequired       bool // codex_provider_account.reauth_required
 }
 
@@ -127,6 +131,7 @@ func codexAccountActionInputsFromRow(row store.ListCodexAccountActionInputsRow, 
 			coordState:      row.CurrentCoordState.String,
 			coordStateValid: row.CurrentCoordState.Valid,
 		},
+		retryPending:         row.RetryPending,
 		recoveryAtGeneration: row.RecoveryAtGeneration,
 		leaseLive:            row.LeaseDeadline.Valid && row.LeaseDeadline.Time.After(now),
 		leaseExpired:         row.LeaseDeadline.Valid && !row.LeaseDeadline.Time.After(now),
@@ -155,7 +160,8 @@ func codexAccountActionInputsFromRow(row store.ListCodexAccountActionInputsRow, 
 //     included) leaves the account quarantined with the flag still set. "reconciling" would
 //     then mislead the owner for as long as that lasts, whereas a same-alias re-login is
 //     always a valid way out (D5 re-admits the run on the fresh material). Without the flag:
-//     reconciling when recovery material sits at the current generation or a lease is live,
+//     reconciling when recovery material sits at the current generation, a lease is live, or a
+//     receipt-bearing retry is eligible or still within its consumed in-flight bound,
 //     otherwise relogin_required;
 //   - stay on an in_progress account with a live lease (a refresh in flight, the promoter waits
 //     for it to finish before re-admitting): reconciling. D6's table names the live lease only
@@ -196,7 +202,7 @@ func deriveCodexAccountAction(in codexAccountActionInputs) string {
 	case rel.coordState == codexCoordQuarantined && in.reauthRequired:
 		// Before the recovery material: its promotion can defer indefinitely, a re-login cannot.
 		return CodexAccountActionReloginRequired
-	case rel.coordState == codexCoordQuarantined && (in.recoveryAtGeneration || in.leaseLive):
+	case rel.coordState == codexCoordQuarantined && (in.recoveryAtGeneration || in.leaseLive || in.retryPending):
 		return CodexAccountActionReconciling
 	case rel.coordState == codexCoordInProgress && (in.leaseLive || in.leaseExpired):
 		return CodexAccountActionReconciling

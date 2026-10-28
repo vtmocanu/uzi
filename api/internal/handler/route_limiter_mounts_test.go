@@ -387,6 +387,7 @@ var wantRouteMounts = []routeMount{
 	// call → noLimiter, like the agent-source GET beside it.
 	{"GET", "/api/admin/release-check", noLimiter},
 	{"GET", "/api/admin/settings", noLimiter},
+	{"GET", "/api/admin/maintenance", noLimiter},
 	{"GET", "/api/admin/docker-allowlist-repos", noLimiter},
 	{"GET", "/api/admin/slack/status", noLimiter},
 	{"GET", "/api/admin/usage", noLimiter},
@@ -473,6 +474,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/me/runs/in-progress-count", noLimiter},
 	// Schedule list/get (PRD #241 M4): owner-scoped reads, no forge → noLimiter.
 	{"GET", "/api/me/schedules/", noLimiter},
+	{"GET", "/api/maintenance/", noLimiter},
 	{"GET", "/api/schedules/{id}", noLimiter},
 	{"GET", "/api/schedules/{id}/ci-episodes", noLimiter},
 	// Pause-all singleton (PRD #1093 M2, D7): the user-level kill switch. All three are
@@ -844,6 +846,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/memory/reserve", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory/outcome", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/refresh", noLimiter},
+	{"POST", "/api/worker/runs/{id}/codex/admission-signal", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/release", noLimiter},
 	// PRD #1226 M2: the completion-interlock permit-issue and same-lead attempt endpoints.
 	// Worker-authenticated, scoped to the worker's own run, no forge call → noLimiter, matching
@@ -960,6 +963,7 @@ var wantRouteMounts = []routeMount{
 	// (set_via='admin', ON CONFLICT DO NOTHING), no forge call and no token spend → noLimiter.
 	{"PUT", "/api/admin/judge/recommendations/disposition", noLimiter},
 	{"PUT", "/api/admin/settings", noLimiter},
+	{"PUT", "/api/admin/maintenance", noLimiter},
 	{"PUT", "/api/admin/users/{id}/ci-autofix", noLimiter},
 	// PRD #1976 M1: allow one site list for a product — a cookie-only admin DB write → noLimiter.
 	{"PUT", "/api/admin/products/{id}/egress-profiles/{name}", noLimiter},
@@ -996,6 +1000,9 @@ var wantRouteMounts = []routeMount{
 	// makes no forge call, sends no DM at toggle time, and mints nothing — none of
 	// the three things the per-user limiters exist to bound. Cookie+CSRF gates it.
 	{"PUT", "/api/me/notify-early-reset", noLimiter},
+	// PRD #3522: the weekly usage reserve (SetUsageReserve). One owner-scoped UPDATE of two
+	// columns, no spend, no forge write, no fan-out: the same shape as /me/notify-early-reset.
+	{"PUT", "/api/me/usage-reserve", noLimiter},
 	// PRD #46: the run-judge consent toggle (SetJudgeEnabled). A single boolean
 	// UPDATE on the caller's own users row, spends no Anthropic token at toggle time
 	// — noLimiter, matching /me/autopilot and /me/ci-autofix beside it. Its route

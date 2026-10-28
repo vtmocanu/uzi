@@ -16,6 +16,25 @@ function rig(opts: { cap?: number } = {}) {
   return { out, rec, activity, summary };
 }
 
+it("coverage evidence includes only exact recorded successful reads and marks dropped capture incomplete", () => {
+  const { rec } = rig({ cap: 2 });
+  rec.start(); rec.modelStarted();
+  rec.begin("ok", "read", CHECKOUT + "/ok.ts"); rec.settle("ok", { outcome: "ok" });
+  rec.begin("search", "search", CHECKOUT + "/scope"); rec.settle("search", { outcome: "ok", matches: 1 });
+  rec.begin("dropped", "read", CHECKOUT + "/dropped.ts"); rec.settle("dropped", { outcome: "ok" });
+  rec.summary("codex", "code", true);
+  assert.deepEqual([...rec.coverageEvidence().reads], ["ok.ts"]);
+  assert.equal(rec.coverageEvidence().complete, false);
+  const fresh = rig();
+  fresh.rec.start(); fresh.rec.modelStarted();
+  fresh.rec.begin("denied", "read", CHECKOUT + "/denied.ts"); fresh.rec.settle("denied", { outcome: "denied" });
+  fresh.rec.begin("unsafe", "read", CHECKOUT + "/bad\u202e.ts"); fresh.rec.settle("unsafe", { outcome: "ok" });
+  fresh.rec.begin("ok", "read", CHECKOUT + "/exact.ts"); fresh.rec.settle("ok", { outcome: "ok" });
+  fresh.rec.summary("claude", "code", true);
+  assert.deepEqual([...fresh.rec.coverageEvidence().reads], ["exact.ts"]);
+  assert.equal(fresh.rec.coverageEvidence().complete, true);
+});
+
 describe("CheckActivityRecorder", () => {
   it("emits the marker and a complete summary for a settled session", () => {
     const { out, rec, summary } = rig();

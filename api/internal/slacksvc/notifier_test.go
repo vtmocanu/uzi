@@ -1147,10 +1147,11 @@ func TestRecoveryWaitRendersAsRecoveringNotARawStatus(t *testing.T) {
 
 // A recovery_wait park must NOT thread a per-park event, unlike limit_wait. The widening
 // that let limit_wait thread is bounded by construction — RUN_LIMIT_MAX_WAITS caps parks
-// per run (renderThreadBlocks' doc comment, property 1). recovery_wait has NO lifetime cap
-// (it auto-resumes indefinitely on a capped backoff until it recovers or is cancelled), so
-// threading it would violate that bound and could spam the thread. It therefore falls to
-// the default (ok=false) exactly like pool_wait; the edited root line still carries
+// per run (renderThreadBlocks' doc comment, property 1). Legacy empty/untyped recovery
+// has no lifetime cap; cause-specific caps and owner holds (#3509) do not change this
+// shared no-per-park-thread policy. Threading uncapped retries could spam the thread.
+// recovery_wait therefore falls to the default (ok=false) exactly like pool_wait;
+// the edited root line still carries
 // "Recovering". Reddening mutation: add a recovery_wait arm to renderThreadBlocks → ok
 // becomes true and this fails.
 func TestRenderThreadBlocksDoesNotThreadRecoveryWait(t *testing.T) {

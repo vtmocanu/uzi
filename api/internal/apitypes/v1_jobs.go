@@ -38,8 +38,10 @@ type V1JobCreateRequest struct {
 // V1JobDTO is one job as the API shows it. Status is the small public vocabulary
 // (queued, running, waiting, completed, failed, cancelled), never the internal run status.
 // FailureReason is a bounded, secret-scrubbed human message, set only for a failed job.
-// WallSeconds is the job's wall-clock limit in seconds, null while the instance default
-// applies.
+// WallSeconds is the job's wall-clock limit in seconds, frozen at creation (the requested value,
+// else the instance default, capped at the ceiling); it counts from claim, not from queueing, so
+// a job held in the queue by maintenance mode loses none of it. It is null only for a job created
+// before defaults were frozen at create.
 type V1JobDTO struct {
 	ID               string     `json:"id"`
 	Type             string     `json:"type"`
@@ -51,6 +53,19 @@ type V1JobDTO struct {
 	CreatedAt        time.Time  `json:"created_at"`
 	StartedAt        *time.Time `json:"started_at"`
 	FinishedAt       *time.Time `json:"finished_at"`
+	// QueueReason is "maintenance" while instance maintenance mode holds this queued job back
+	// (PRD #3454); absent otherwise. Status stays "queued". /api/v1 is additive only, so the
+	// weekly usage reserve (PRD #3522) never appears here: see ReserveHoldReason.
+	QueueReason *string `json:"queue_reason,omitempty"`
+	// ReserveHoldReason is the fixed display text V1ReserveHoldText while the owner's weekly usage reserve holds
+	// this queued job and maintenance does not (PRD #3522); absent otherwise. It deliberately omits
+	// the owner's usage percentage and threshold: a product token is scoped to its jobs, not to the
+	// owner's account-wide usage. Clients must not parse it.
+	ReserveHoldReason *string `json:"reserve_hold_reason,omitempty"`
+	// Notice is create-only (POST /api/v1/jobs): a human-readable line, present while instance
+	// maintenance mode is active, saying the job is queued and starts when maintenance ends.
+	// Absent on GET and list responses and when maintenance is off.
+	Notice *string `json:"notice,omitempty"`
 }
 
 // V1JobListDTO is one page of GET /api/v1/jobs, newest first. NextCursor is null on the
@@ -106,3 +121,7 @@ type V1JobMessageDTO struct {
 type V1JobMessagesDTO struct {
 	Messages []V1JobMessageDTO `json:"messages"`
 }
+
+// V1ReserveHoldText is the only reserve_hold_reason value /api/v1 serves (PRD #3522 D21): the
+// blocking cause without the owner's usage figures, which stay on owner-facing web/CLI surfaces.
+const V1ReserveHoldText = "Waiting for the owner's weekly usage reserve."
