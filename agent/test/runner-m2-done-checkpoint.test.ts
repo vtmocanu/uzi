@@ -692,7 +692,18 @@ async function runDiffScenario(t: TestContext, issue: number, spec: {
   const clock = virtualBoundaryClock();
   const started = clock.now();
   let deferredFenceCloses = 0;
+  let maskedOperations = 0, maskedOperationSettled = false;
   if (spec.stop === "soft_then_hard") {
+    const scoped = git as unknown as { runGit(cwd: string | undefined, args: string[], ...rest: unknown[]): Promise<string> };
+    const runGit = scoped.runGit.bind(scoped);
+    t.mock.method(scoped, "runGit", (...args: Parameters<typeof scoped.runGit>) => {
+      const running = runGit(...args);
+      if (args[1][0] === "update-ref" && args[1].some(arg => arg.startsWith("refs/uzi-cross-check/"))) {
+        maskedOperations++;
+        void running.then(() => { maskedOperationSettled = true; }, () => { maskedOperationSettled = true; });
+      }
+      return running;
+    });
     const open = fs.promises.open.bind(fs.promises);
     t.mock.method(fs.promises, "open", async (...args: Parameters<typeof fs.promises.open>) => {
       const file = await open(...args);
@@ -822,6 +833,11 @@ async function runDiffScenario(t: TestContext, issue: number, spec: {
           assert.equal(childStopSignals[0], hardSignal, "the masked mutation retains the held hard signal");
           clock.advance(60_000);
           settledAfterSoft = await observeTurns(() => settled);
+          // This child exited cleanly before soft expiry, but its output never
+          // ended. Observe runGit before fence cleanup can delay the outer gate.
+          assert.equal(maskedOperations, 1, "the controlled masked operation was observed");
+          assert.equal(cancels, 0, "soft expiry must not cancel the masked child");
+          assert.equal(maskedOperationSettled, false, "soft expiry must leave the masked operation pending");
           assert.equal(hardSignal?.aborted, false, "the soft deadline must leave the masked hard signal live");
           clock.advance(30_000);
           assert.equal(hardSignal?.aborted, true, "hard stop did not settle the gate: hard deadline did not fire");
