@@ -154,7 +154,7 @@ for (const side of ["before", "after"] as const) {
   });
 }
 
-for (const ownership of [undefined, "stale", "unknown"] as const) {
+for (const ownership of [undefined, "stale", "cancelled", "unknown"] as const) {
   test(`runner pending BEFORE first charge checks ${ownership ?? "current"} ownership inside reservation`, async () => {
     const h = await fixture({ ownership });
     h.f.values.delete(h.f.ownerKey);
@@ -166,6 +166,7 @@ for (const ownership of [undefined, "stale", "unknown"] as const) {
     h.f.fault();
     h.claim.worker_recovery_episode = 7;
     const before = h.f.read();
+    const ownerBefore = h.f.values.get(h.f.ownerKey)![0];
     const reserve = h.runner.git.reserveRecoveryIteration.bind(h.runner.git);
     let admitted = false;
     h.runner.git.reserveRecoveryIteration = async (...args: Parameters<typeof reserve>) => {
@@ -181,9 +182,10 @@ for (const ownership of [undefined, "stale", "unknown"] as const) {
     assert.equal(admitted, ownership === undefined);
     assert.equal(h.counts().captures, 0);
     assert.equal(h.counts().models, 0);
-    if (ownership === "stale") {
+    if (ownership !== undefined) {
       assert.deepEqual(h.f.read(), before);
-      assert.equal(h.counts().terminal, 0);
+      assert.equal(h.f.values.get(h.f.ownerKey)![0], ownerBefore);
+      assert.equal(h.counts().terminal, 0, "unavailable or lost ownership must stop without terminal failure");
     }
   });
 }

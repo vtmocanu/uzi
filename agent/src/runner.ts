@@ -22024,7 +22024,15 @@ export class RunRunner {
             }
           }
           return this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs, flight.claimGeneration, recoveryEpisode, claim.worker_recovery_owner_episode,
-            () => this.requireRetainedOwnership(flight, deadline, signal));
+            async () => {
+              try { await this.requireRetainedOwnership(flight, deadline, signal); }
+              catch (error) {
+                this.retainedLifecycleGuard(flight);
+                if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal || !isTransient(error)) throw error;
+                // No replacement was charged; retain its pending evidence for a later claim.
+                throw new RetainedRecoveryStop({ cause: error });
+              }
+            });
         });
       } catch (error) {
         this.retainedLifecycleGuard(flight);
