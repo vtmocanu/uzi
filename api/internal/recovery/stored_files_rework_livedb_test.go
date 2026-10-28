@@ -322,6 +322,11 @@ func TestMarkCaptureFailedNeverOverwritesADiscardLiveDB(t *testing.T) {
 
 	for _, state := range []string{"discarded", "expired", "available"} {
 		id := e.newCapture(t, svc)
+		if state == "available" {
+			if n, err := e.q.StampCaptureReservation(e.ctx, store.StampCaptureReservationParams{ID: id, ReservedBytes: pgtype.Int8{Int64: 1, Valid: true}}); err != nil || n != 1 {
+				t.Fatalf("StampCaptureReservation: rows=%d err=%v", n, err)
+			}
+		}
 		e.exec(`UPDATE recovery_captures SET state = $2 WHERE id = $1`, id, state)
 		if _, err := e.q.MarkCaptureFailed(e.ctx, store.MarkCaptureFailedParams{Reason: reason, ID: id}); !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("%s: MarkCaptureFailed = %v, want pgx.ErrNoRows (nothing written)", state, err)
