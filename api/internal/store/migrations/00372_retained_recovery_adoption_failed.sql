@@ -26,7 +26,7 @@ $$;
 
 -- +goose Down
 UPDATE runs SET status='failed', fail_origin='worker_lost',
- failure_reason='retained recovery adoption hold ended by schema rollback (00366)',
+ failure_reason='retained recovery adoption hold ended by schema rollback (00372)',
  finished_at=now(), status_since=now(), updated_at=now(),
  recovery_wait_cause=NULL, recovery_retry_not_before=NULL
 WHERE status='recovery_wait' AND recovery_wait_cause='retained_recovery_adoption_failed';

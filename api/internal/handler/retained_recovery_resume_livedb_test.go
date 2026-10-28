@@ -31,7 +31,7 @@ func testRetainedRecoveryOwnerResumeLiveDB(t *testing.T, cause string) {
 		worker_id=$2, claim_generation=7, claim_released_at=now(),
 		recovery_wait_cause=$4,
 		recovery_retry_not_before=CASE WHEN $3::boolean THEN now()+interval '1 hour' END,
-		retained_park_count=1, worker_recovery_episode=0,
+		retained_park_count=1, worker_recovery_episode=0, idle_stall_park_count=4,
 		requeue_count=7, requeue_episode_baseline=5,
 		started_at=now()-interval '10 minutes', budget_wall_seconds=3600,
 		status_since=now()-interval '2 minutes' WHERE id=$1`, id, w, timed, cause)
@@ -54,7 +54,7 @@ func testRetainedRecoveryOwnerResumeLiveDB(t *testing.T, cause string) {
 				t.Fatal(err)
 			}
 			if after.Status != "queued" || after.WorkerRecoveryEpisode != 1 || after.RetainedParkCount != 1 ||
-				after.RequeueCount != 7 || after.RequeueEpisodeBaseline != 7 ||
+				after.RequeueCount != 7 || after.RequeueEpisodeBaseline != 7 || after.IdleStallParkCount != before.IdleStallParkCount ||
 				after.ClaimReleasedAt != before.ClaimReleasedAt || after.WorkerID != before.WorkerID ||
 				after.StartedAt != before.StartedAt || after.BudgetPausedSeconds < 120 ||
 				after.RecoveryRetryNotBefore.Valid || after.RecoveryWaitCause.Valid {
