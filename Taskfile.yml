@@ -1261,13 +1261,14 @@ tasks:
       - bash ./e2e/codex-meter-fixture.test.sh
 
   test:uzi-watcher-backups:
-    desc: hermetic tests of uzi-watcher live-clone/bare-ref backups, retention, detached loop and the label-sync create retry
+    desc: hermetic tests of uzi-watcher backups, retention, detached loop, label-sync create retry and run discovery/watching
     cmds:
       - python3 -B ./.agents/skills/uzi-watcher/scripts/backup-directory.test.py
       - ./.agents/skills/uzi-watcher/scripts/backup-runs.test.sh
       - ./.agents/skills/uzi-watcher/scripts/backup-loop.test.sh
       - ./.agents/skills/uzi-watcher/scripts/create-run.test.sh
       - ./.agents/skills/uzi-watcher/scripts/watch-run.test.sh
+      - ./.agents/skills/uzi-watcher/scripts/watch-issue.test.sh
 
   test:brew-tap-guard:
     desc: hermetic tests of stable/RC tap version ordering and fail-closed formula parsing
