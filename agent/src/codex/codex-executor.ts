@@ -2136,7 +2136,7 @@ export class CodexExecutor implements Executor {
    * disposal, never while holding a safety, journal or bare lock. It never joins run()/execute() or
    * the runner's execution-tail release (those own this call's caller), and never fails or retries
    * a completed run: any uncertainty yields `{ kind: "unproven" }` and the executor stays closed.
-   * Dormant: no runner wiring consumes the seal yet.
+   * The runner's publishFlightSource awaits it with no bound (see HeldRunCommandCache.observeCleanup).
    */
   sealLifetime(sourceUse: object): Promise<ExecutorSealResult> {
     const wasRunning = this.runActive;

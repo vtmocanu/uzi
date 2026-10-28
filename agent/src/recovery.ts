@@ -4655,12 +4655,16 @@ export class RecoveryCoordinator {
           try { await ownedRecoveryIO(() => fs.unlink(file)); }
           catch (err) { MaintenanceBudget.current()?.check(); if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
         };
+        // The last record removed: the manifest's own final item when retiring, else the receipt-bearing record.
+        let finalRecord = authorityRecord;
         if (handle) {
           // The retiring contract: delete in the authenticated manifest's order (first attempt and retry alike), so
           // whatever a partial failure leaves is a suffix residueExplained accepts. Enumeration order is not sorted.
+          const recordItems = handle.manifest.filter(item => item.startsWith(RECORD_ITEM)).map(item => item.slice(RECORD_ITEM.length));
+          finalRecord = recordItems.pop() ?? authorityRecord;
           for (const item of handle.manifest) if (item.startsWith(BUNDLE_ITEM)) await unlink(item.slice(BUNDLE_ITEM.length));
           await progress();
-          for (const item of handle.manifest) if (item.startsWith(RECORD_ITEM)) await unlink(item.slice(RECORD_ITEM.length));
+          for (const record of recordItems) await unlink(record);
           await progress();
         } else {
           for (const bundle of bundles) await unlink(bundle);
@@ -4668,7 +4672,7 @@ export class RecoveryCoordinator {
           for (const record of selected) if (record.captureId !== authority.captureId) await unlink(this.recordPath(record));
           await progress();
         }
-        await unlink(authorityRecord);
+        await unlink(finalRecord);
         if (handle) await this.syncRunDirectory(runId);
         await ownedRecoveryIO(() => fs.rmdir(this.runDir(runId))).catch(() => undefined);
         if (handle) {
@@ -4761,7 +4765,8 @@ export class RecoveryCoordinator {
           !manifest.has(BUNDLE_ITEM + path.join(runDir, name))) return false;
       if (ordinaryTempEntry(name)) continue;
       // A bundle the manifest names is residue the suffix check below accounts for; a bundle of another known
-      // record of this run is a sibling the retirement does not own (the rule physicalGeneration applies).
+      // record of this run is a sibling the retirement does not own (physicalGeneration's name rule; unlike it,
+      // no regular-file check here: the retirement never deletes a sibling).
       if (name.endsWith(".bundle") && (manifest.has(BUNDLE_ITEM + path.join(runDir, name)) ||
           known.has(name.slice(0, -".bundle".length)))) continue;
       const stem = name.endsWith(".json") ? name.slice(0, -".json".length) : undefined;

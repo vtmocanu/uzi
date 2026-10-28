@@ -519,6 +519,25 @@ describe("partial retirement keeps the authenticated retiring record as the only
     });
   }
 
+  it("a non-v4 bundle of another generation's record is a sibling a retry leaves alone", async t => {
+    const r = await rig(t, { codex: false, cohort: 3, memberIds: NON_V4 });
+    await r.end();
+    await r.receipt();
+    const first = r.restart();
+    const injected = failFirstBundle(t);
+    await first.sweep();
+    assert.equal(injected.fired(), true);
+    t.mock.restoreAll();
+    const internals = r.p.recovery as unknown as { writeRecordUnlocked(rec: unknown): Promise<void> };
+    const [seed] = await first.p.recovery.inspect(r.runId);
+    const sibling = "00000000-0000-1000-8000-0000000000ab";
+    await internals.writeRecordUnlocked({ ...seed, captureId: sibling, generation: 30, completionSource: undefined, completionReceipt: undefined });
+    fs.writeFileSync(path.join(recordDir(r), `${sibling}.bundle`), "sibling bundle");
+    await first.sweep();
+    assert.deepEqual(recordNames(r), [`${sibling}.bundle`, `${sibling}.json`]);
+    assert.equal((await slotOf(r))?.state, "retired");
+  });
+
   it("a bundle appearing for a non-v4 member the manifest never named refuses the retry", async t => {
     const r = await rig(t, { codex: false, cohort: 3, memberIds: NON_V4 });
     fs.rmSync(path.join(recordDir(r), `${NON_V4[1]}.bundle`));

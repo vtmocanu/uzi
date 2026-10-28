@@ -54,7 +54,9 @@ interface Incarnation {
  * cache helper's settlement (HeldRunCommandCache.observeCleanup) ends only when the helper's
  * channel closes or its process exits. A holder that never closes keeps the seal pending,
  * and with it the flight's end-of-run publication (publishFlightSource awaits
- * sealLifetime); that fails closed. A failed sibling does not skip any other tail. No execute/run
+ * sealLifetime) and the rest of that flight's source-use end and teardown, which run after
+ * it. Nothing publishes or is released early: it fails closed. A failed sibling does not
+ * skip any other tail. No execute/run
  * promise belongs in this owner. Nothing here may be awaited while holding a safety,
  * journal or bare lock.
  */
