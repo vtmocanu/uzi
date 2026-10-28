@@ -18155,6 +18155,81 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } finally { mocked.mock.restore(); rig.transport.end(); t.mock.timers.reset(); }
   });
 
+  for (const late of [
+    { name: "final missing classification", note: retryNote(undefined, false), expected: undefined },
+    { name: "final unknown classification", note: retryNote("unrecognized", false), expected: undefined },
+    { name: "permanent replacement retry", note: retryNote({ httpConnectionFailed: { httpStatusCode: 400 } }),
+      expected: { classification: "httpConnectionFailed", category: "transport", httpStatus: 400 } },
+  ]) it(`3506 watchdog snapshot survives late ${late.name} after idle trip`, async t => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(threadStarted()).push(retryNote("rateLimitExceeded"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    const atTrip = { classification: "rateLimitExceeded", category: "rate_limit" };
+    let harness: CodexHarness | undefined;
+    let lateMapped: Promise<void> | undefined;
+    let persistedAfterLate = false;
+    const persist = rig.deps.sessionStore!.persist.bind(rig.deps.sessionStore);
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000,
+      sessionStore: { ...rig.deps.sessionStore!, persist: async (...args) => {
+        assert.ok(lateMapped, "abort admitted the late notification before recovery persistence");
+        await lateMapped;
+        assert.deepEqual(harness!.retryClassification, late.expected);
+        persistedAfterLate = true;
+        return persist(...args);
+      } },
+    };
+    const original = CodexHarness.prototype.startTurn;
+    const mocked = mock.method(CodexHarness.prototype, "startTurn", function(this: CodexHarness, request: Parameters<typeof original>[0]) {
+      harness = this;
+      const turn = original.call(this, request);
+      request.signal.addEventListener("abort", () => {
+        // runTurn checks the aborted signal before mapping queued notes. Invoke its existing
+        // mapper here: the real idle trip has captured context, but recovery has not routed.
+        const mapper = this as unknown as {
+          mapNote(transport: CodexTransport, note: CodexNotification, signal?: AbortSignal): Promise<unknown>;
+        };
+        lateMapped = (async () => {
+          assert.deepEqual(this.retryClassification, atTrip);
+          const event = await mapper.mapNote(rig.transport, late.note, request.signal);
+          assert.deepEqual(event, { kind: "activity", sessionId: "th-1" });
+          assert.deepEqual(this.retryClassification, late.expected, "late normalized notification changed live context");
+          assert.notDeepEqual(this.retryClassification, atTrip);
+        })();
+        void lateMapped.catch(() => undefined);
+      }, { once: true });
+      return turn;
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => harness?.retryClassification?.classification === "rateLimitExceeded");
+      for (let i = 0; i < 10; i++) await tick();
+      t.mock.timers.tick(100);
+      await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError);
+        assert.equal(error.providerOrigin, true, "classification comes from the trip, before the late note");
+        assert.equal(error.idleStallKind, "zero_evidence");
+        assert.equal(error.message, "silence after a provider-reported rate limit or transport retry");
+        assert.ok(error.originalIdle instanceof Error);
+        assert.equal(error.originalIdle.message, "codex run idle timeout");
+        assert.equal(rec(error.originalIdle).processedEvents, 0);
+        assert.deepEqual(rec(error.originalIdle).retryClassification, atTrip);
+        return true;
+      });
+      assert.ok(lateMapped);
+      await lateMapped;
+      assert.equal(persistedAfterLate, true);
+      assert.equal(rig.sessionOps.persist, 1);
+      assert.equal(rig.transport.turnStartCount, 1, "no replacement root or in-process retry");
+    } finally { mocked.mock.restore(); rig.transport.end(); t.mock.timers.reset(); }
+  });
+
   // Readiness polls real event-loop turns against a real-time deadline (performance.now is not
   // mocked), independently of the frozen Date. A turn count alone runs out before real I/O on a
   // loaded runner: 500 turns elapsed in under 5 ms on CI.
@@ -18338,10 +18413,10 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } finally { rig.transport.end(); t.mock.timers.reset(); }
   });
 
-  for (const productive of [false, true]) for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 ${interruption} during pre-recovery persistence productive=${productive}`, async t => {
+  for (const productive of [false, true]) for (const retry of productive ? [false] : [false, true]) for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 ${interruption} during pre-recovery persistence productive=${productive} retry=${retry}`, async t => {
     const rig = makeRig();
     if (productive) rig.transport.push(agentMessage("partial model output"));
-    else rig.transport.push(retryNote("rateLimitExceeded"));
+    else if (retry) rig.transport.push(retryNote("rateLimitExceeded"));
     let entered = false;
     let release!: () => void;
     const barrier = new Promise<void>(resolve => { release = resolve; });
@@ -18373,8 +18448,8 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       release();
       if (interruption === "none") await assert.rejects(running, (error: unknown) => {
         assert.ok(error instanceof TransientRecoveryError);
-        assert.equal(error.idleStallKind, productive ? "productive" : "zero_evidence");
-        assert.equal(error.providerOrigin, !productive);
+        assert.equal(error.idleStallKind, productive ? "productive" : retry ? "zero_evidence" : undefined);
+        assert.equal(error.providerOrigin, retry);
         return true;
       });
       else if (interruption === "cancel") await assert.rejects(running, /cancel/);
@@ -18388,12 +18463,12 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } finally { release(); rig.transport.end(); t.mock.timers.reset(); }
   });
 
-  for (const productive of [false, true]) for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 declined completion hold rechecks ${interruption} productive=${productive}`, async t => {
+  for (const productive of [false, true]) for (const retry of productive ? [false] : [false, true]) for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 declined completion hold rechecks ${interruption} productive=${productive} retry=${retry}`, async t => {
     const rig = makeMultiEpochRig([
       epochResponder("th-1", "tn-1", transport => transport.push(signalDone()).push(turnCompleted("completed"))),
       epochResponder("th-2", "tn-2", transport => {
         if (productive) transport.push(agentMessage("partial model output", "th-2"));
-        else transport.push(retryNote("rateLimitExceeded", true, "th-2", "tn-2"));
+        else if (retry) transport.push(retryNote("rateLimitExceeded", true, "th-2", "tn-2"));
       }),
     ]);
     rig.deps = { ...rig.deps, idleMs: 100, wallMs: 1000 };
@@ -18433,8 +18508,8 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       release();
       if (interruption === "none") await assert.rejects(running, (error: unknown) => {
         assert.ok(error instanceof TransientRecoveryError);
-        assert.equal(error.idleStallKind, productive ? "productive" : "zero_evidence");
-        assert.equal(error.providerOrigin, !productive);
+        assert.equal(error.idleStallKind, productive ? "productive" : retry ? "zero_evidence" : undefined);
+        assert.equal(error.providerOrigin, retry);
         return true;
       });
       else if (interruption === "cancel") await assert.rejects(running, /cancel/);
@@ -18450,11 +18525,12 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } finally { release(); for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
   });
 
-  for (const productive of [false, true]) it(`3462 a vault latch after the first idle trip retains the idle outcome productive=${productive}`, async t => {
+  for (const productive of [false, true]) for (const retry of productive ? [true] : [false, true]) it(`3462 a vault latch after the first idle trip retains the idle outcome productive=${productive} retry=${retry}`, async t => {
     const rig = makeRig({ responder: c => {
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
       if (c.method === "turn/start") {
-        c.transport.push(threadStarted()).push(retryNote("rateLimitExceeded"));
+        c.transport.push(threadStarted());
+        if (retry) c.transport.push(retryNote("rateLimitExceeded"));
         if (productive) c.transport.push(agentMessage("partial model output"));
         c.transport.push({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
           params: { reason: "unauthorized", previousAccountId: null } });
