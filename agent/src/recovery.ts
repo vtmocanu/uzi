@@ -4655,10 +4655,19 @@ export class RecoveryCoordinator {
           try { await ownedRecoveryIO(() => fs.unlink(file)); }
           catch (err) { MaintenanceBudget.current()?.check(); if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
         };
-        for (const bundle of bundles) await unlink(bundle);
-        await progress();
-        for (const record of selected) if (record.captureId !== authority.captureId) await unlink(this.recordPath(record));
-        await progress();
+        if (handle) {
+          // The retiring contract: delete in the authenticated manifest's order (first attempt and retry alike), so
+          // whatever a partial failure leaves is a suffix residueExplained accepts. Enumeration order is not sorted.
+          for (const item of handle.manifest) if (item.startsWith(BUNDLE_ITEM)) await unlink(item.slice(BUNDLE_ITEM.length));
+          await progress();
+          for (const item of handle.manifest) if (item.startsWith(RECORD_ITEM)) await unlink(item.slice(RECORD_ITEM.length));
+          await progress();
+        } else {
+          for (const bundle of bundles) await unlink(bundle);
+          await progress();
+          for (const record of selected) if (record.captureId !== authority.captureId) await unlink(this.recordPath(record));
+          await progress();
+        }
         await unlink(authorityRecord);
         if (handle) await this.syncRunDirectory(runId);
         await ownedRecoveryIO(() => fs.rmdir(this.runDir(runId))).catch(() => undefined);

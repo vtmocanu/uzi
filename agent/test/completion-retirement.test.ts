@@ -536,6 +536,47 @@ describe("partial retirement keeps the authenticated retiring record as the only
     assert.equal((await slotOf(r))?.state, "retiring");
   });
 
+  // The run directory enumerates in reverse-sorted order (readdir/opendir order is not sorted), and the deletion
+  // fails after the first SUCCESSFUL unlink of the given kind: the residue must still be a manifest suffix.
+  for (const kind of ["bundle", "record"] as const) {
+    for (const successor of [false, true]) {
+      it(`an unsorted enumeration still deletes in manifest order: a failure after the first ${kind} unlink resumes (${successor ? "successor incarnation" : "same worker"})`, async t => {
+        const r = await rig(t, { codex: false, cohort: 3 });
+        await r.end();
+        await r.receipt();
+        const first = r.restart();
+        const realReaddir = fsp.readdir.bind(fsp) as (...args: unknown[]) => Promise<unknown>;
+        t.mock.method(fsp, "readdir", async (...args: unknown[]) => {
+          const names = await realReaddir(...args);
+          return path.resolve(String(args[0])) === path.resolve(recordDir(r)) && Array.isArray(names) && names.every(n => typeof n === "string")
+            ? [...(names as string[])].sort().reverse() : names;
+        });
+        const realUnlink = fsp.unlink.bind(fsp);
+        const suffix = kind === "bundle" ? ".bundle" : ".json";
+        let succeeded = 0;
+        let failed = false;
+        t.mock.method(fsp, "unlink", async (file: string) => {
+          if (path.dirname(String(file)) === recordDir(r) && String(file).endsWith(suffix)) {
+            if (succeeded >= 1 && !failed) { failed = true; throw Object.assign(new Error("EIO"), { code: "EIO" }); }
+            await realUnlink(file);
+            succeeded++;
+            return;
+          }
+          return realUnlink(file);
+        });
+        await first.sweep();
+        assert.equal(failed, true, "the injected failure fired after one successful unlink");
+        assert.equal((await slotOf(r))?.state, "retiring");
+        // Keep the unsorted enumeration on the retry; only the failure injection goes.
+        (fsp.unlink as unknown as { mock: { restore(): void } }).mock.restore();
+        const retry = successor ? r.restart() : first;
+        await retry.sweep();
+        assert.deepEqual(recordNames(r), []);
+        assert.equal((await slotOf(r))?.state, "retired");
+      });
+    }
+  }
+
   it("an unknown non-UUID bundle with no record refuses the retry", async t => {
     const r = await rig(t, { codex: false, cohort: 3, memberIds: NON_V4 });
     await r.end();
