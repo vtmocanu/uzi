@@ -22,6 +22,8 @@ Not a *fully* dark factory, and on purpose: those two decisions stay human, and 
 
 **Read the story:** [uzi: an AI dark factory](https://hai.wxs.ro/ai-stuff/uzi-dark-factory/), the long-form write-up on my blog: where it came from, a tour of the floor, and both install paths.
 
+**Join the community:** [uzi on Slack](https://join.slack.com/t/uzi-dark-factory/shared_invite/zt-4eppr0sf5-LTvGru83gPhpVGwFgllt8w) for questions, feedback, and discussion.
+
 > [!NOTE]
 > uzi ships both a light and a dark theme, and the screenshots below match your theme. Switch your browser (or GitHub) between light and dark and they change with it.
 
