@@ -263,9 +263,10 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 					t.Fatal("exact-R reset refusal changed full run/input/check snapshot")
 				}
 			}
+			var runPositiveControls func()
 			if mode == "gated" || mode == "no_gate" {
 				// Keep the retained reset refusal at the actual claimed boundary,
-				// before the positive running controls advance the persisted status.
+				// before the service ACK advances the persisted status.
 				refuseReset()
 				// Exercise the generated query independently of the locked service
 				// validator, using the real accepted receipt and actual reclaim.
@@ -318,7 +319,7 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 				// Run the production builder against the same real row, then call
 				// actual SQL. Inferring G from the row would admit these no-gate
 				// requests; dropping G is caught by the positive and service ACK.
-				for _, name := range []string{"missing_G", "zero_G", "stale_G", "exact_G"} {
+				runBuilder := func(name string) {
 					t.Run("builder_running_"+name, func(t *testing.T) {
 						var supplied *int64
 						want := int64(0)
@@ -355,17 +356,23 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 						assertPreserved()
 					})
 				}
-				t.Run("direct_running_exact_WGR", func(t *testing.T) {
-					rows, err := e.q.SetRunRunning(e.ctx, params)
-					if err != nil || rows != 1 {
-						t.Fatalf("direct running exact W/G/R: rows=%d err=%v, want 1 and nil", rows, err)
-					}
-					if mustRun(t, e, created.ID).Status != "running" {
-						t.Fatal("direct exact W/G/R did not persist running")
-					}
-					assertPreserved()
-				})
-				refuseReset()
+				for _, name := range []string{"missing_G", "zero_G", "stale_G"} {
+					runBuilder(name)
+				}
+				runPositiveControls = func() {
+					runBuilder("exact_G")
+					t.Run("direct_running_exact_WGR", func(t *testing.T) {
+						rows, err := e.q.SetRunRunning(e.ctx, params)
+						if err != nil || rows != 1 {
+							t.Fatalf("direct running exact W/G/R: rows=%d err=%v, want 1 and nil", rows, err)
+						}
+						if mustRun(t, e, created.ID).Status != "running" {
+							t.Fatal("direct exact W/G/R did not persist running")
+						}
+						assertPreserved()
+					})
+					refuseReset()
+				}
 				for _, state := range []string{"running", "awaiting_approval", "awaiting_input"} {
 					refuseScalar(state, nil)
 					refuseScalar(state, strPtr(uuid.NewString()))
@@ -467,7 +474,16 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 			if mode == "terminal" {
 				state = "failed"
 			}
+			if runPositiveControls != nil && mustRun(t, e, created.ID).Status != "claimed" {
+				t.Errorf("actual running carrier ACK must begin from persisted claimed status")
+			}
 			ack, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{State: state, ClaimGeneration: &generation, PolicyStopResolutionID: &resolutionID})
+			// Capture the committed service result before positive SQL can advance
+			// status; keep child controls visible even when the service ACK fails.
+			committedRunning := mustRun(t, e, created.ID).Status == "running"
+			if runPositiveControls != nil {
+				runPositiveControls()
+			}
 			if mode == "terminal" {
 				if err != nil || !ack.Applied || ack.PolicyStopExecution != nil {
 					t.Fatalf("terminal ACK: %+v %v", ack, err)
@@ -487,7 +503,7 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 			if err != nil || !ack.Applied || ack.Run.Status != "running" || ack.PolicyStopExecution == nil || *ack.PolicyStopExecution != *claim.PolicyStopExecution {
 				t.Fatalf("actual running carrier ACK: %+v %v", ack, err)
 			}
-			if mustRun(t, e, created.ID).Status != "running" {
+			if !committedRunning {
 				t.Fatal("running ACK was not committed")
 			}
 			if mode == "gated" || mode == "no_gate" {
