@@ -18,6 +18,7 @@ import { maskEmail, maskName, maskRepoPath } from "../lib/demoMask";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { HealthDangerBanner } from "./HealthDangerBanner";
+import { HealthAttentionBanner } from "./HealthAttentionBanner";
 import { healthPipLabel } from "../lib/healthView";
 import { HealthStatusProvider, useHealthStatus } from "../lib/useAdminHealth";
 import { MaintenanceProvider } from "../lib/useMaintenance";
@@ -1408,6 +1409,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               self-gating, with a 1 h per-episode snooze. Reads the shared HealthStatusProvider,
               so a non-admin never fetches the admin endpoint. */}
           <HealthDangerBanner />
+          {user?.is_admin === true && <HealthAttentionBanner key={user.id} />}
           {/* The publisher for the one canonical to-triage number (PRD #98): how the Judge
               page keeps the nav badge fresh after a dispose. */}
           {/* Findings' twin of the judge channel (PRD #1183 M4): the setter lets the Findings

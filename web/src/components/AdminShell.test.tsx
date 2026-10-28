@@ -97,8 +97,8 @@ describe("AdminShell health tab pip", () => {
 
   it("retains owner danger in the attention pip", async () => {
     await renderShell(ownerOnlyDoc());
-    const pip = await screen.findByLabelText("3 health checks need attention: 2 danger, 1 warning");
-    expect(within(pip).getByText("3")).toBeTruthy();
+    const pip = await screen.findByLabelText("4 health checks need attention: 2 danger, 2 warning");
+    expect(within(pip).getByText("4")).toBeTruthy();
   });
 
   it("names unknown as unknown rather than folding it into warning", async () => {

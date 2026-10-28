@@ -169,7 +169,7 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
 
   it("keeps owner danger evidence and action visible without claiming an instance block", async () => {
     const { container } = await renderHealth(ownerOnlyDoc());
-    expect(band("3 checks need attention; no instance-wide blocker detected").getAttribute("role")).toBe("alert");
+    expect(band("4 checks need attention; no instance-wide blocker detected").getAttribute("role")).toBe("alert");
     const capacity = attentionItem(container, "fleet.capacity")!;
     expect(within(capacity).getByText("2")).toBeTruthy();
     for (const id of ["fleet.capacity", "queue.waiting"]) {
@@ -178,7 +178,7 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
       expect(within(item).getByText(`run ${ownerOnlyWaitingRunId}; owner ${ownerOnlyWaitingOwnerId}; waited 36m; stored reason no online worker can run this — it needs a capability none of your workers has; provision a ca`)).toBeTruthy();
     }
     expect(within(capacity).getByText(/Recover or provision a worker/)).toBeTruthy();
-    expect(attentionIds(container)).toEqual(["fleet.capacity", "queue.waiting", "forge.ciwatch"]);
+    expect(attentionIds(container)).toEqual(["fleet.capacity", "queue.waiting", "forge.ciwatch", "recovery.storage"]);
   });
 
   it("warn (degraded): a warn status band and both warn items expanded with their action", async () => {

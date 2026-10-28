@@ -65,7 +65,7 @@ const OK_SUMMARY: Record<string, string> = {
 };
 
 // Fields a fixture overrides for a non-ok (or otherwise reshaped) check.
-type CheckOverride = Partial<Pick<HealthCheck, "severity" | "summary" | "since" | "evidence" | "action" | "command">>;
+type CheckOverride = Partial<Pick<HealthCheck, "severity" | "summary" | "since" | "evidence" | "action" | "command" | "attention_banner">>;
 
 function build(overrides: Record<string, CheckOverride>): HealthCheck[] {
   return CHECK_META.map((m) => ({
@@ -240,7 +240,9 @@ export function ownerOnlyDoc(): HealthDoc {
       ? { ...c, evidence: [...ownerOnlyWaitingEvidence, { label: "Owners affected", value: "2" }] }
       : c.id === "queue.waiting"
         ? { ...c, summary: "A run has been waiting for a worker for 36m.", since: minsAgo(36), evidence: [...ownerOnlyWaitingEvidence] }
-        : c);
+        : c.id === "recovery.storage"
+          ? { ...c, severity: "warn", attention_banner: true, summary: "2 captures currently marked quota-refused.", evidence: [{ label: "Quota-refused captures", value: "2" }] }
+          : c);
   return doc(checks);
 }
 

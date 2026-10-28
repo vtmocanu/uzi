@@ -80,6 +80,10 @@ describe("health scenario routing", () => {
     expect(doc.episode_id).toBeNull();
     expect(doc.snoozed_until).toBeNull();
     expect(doc.checks.find((c) => c.id === "fleet.capacity")).toMatchObject({ scope: "owner", severity: "danger" });
+    expect(doc.checks.filter((c) => c.attention_banner === true)).toMatchObject([
+      { id: "recovery.storage", scope: "owner", severity: "warn", summary: "2 captures currently marked quota-refused." },
+    ]);
+    expect(doc.counts).toEqual({ ok: 19, warn: 2, danger: 2, unknown: 0, na: 0 });
     for (const id of ["fleet.capacity", "queue.waiting"]) {
       expect(doc.checks.find((c) => c.id === id)?.evidence[0]).toEqual({
         label: "Waiting run",

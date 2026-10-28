@@ -64,7 +64,7 @@ describe("HealthOverviewCard", () => {
     mockApi.getAdminHealth.mockResolvedValue(doc);
     renderCard();
     const card = await screen.findByRole("alert", { name: "System health" });
-    expect(within(card).getByText("System health: 3 checks need attention; no instance-wide blocker detected")).toBeTruthy();
+    expect(within(card).getByText("System health: 4 checks need attention; no instance-wide blocker detected")).toBeTruthy();
     expect(within(card).getByText(doc.checks.find((c) => c.id === "fleet.capacity")!.summary)).toBeTruthy();
     const items = within(card).getAllByRole("listitem");
     expect(items).toHaveLength(3);
