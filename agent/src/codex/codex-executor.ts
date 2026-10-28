@@ -2141,7 +2141,11 @@ export class CodexExecutor implements Executor {
    * Under deferRegistryTeardown the final epoch's registry stays in the outstanding set until the
    * runner's terminal safety.dispose; the seal then accepts it only through deferredFinalProven,
    * evaluated both before and after the joins (so a poison during the joins leaves it unproven).
-   * The set itself is not edited: the predicate is the proof, never a cleared table.
+   * That predicate is one guard; ExecutorLifetime's own inventory check (proven()) also rejects a
+   * revoked disposal. The set is never edited to earn the seal: only after the lifetime has
+   * resolved "sealed" (past its post-join eligibility re-check) is that one registry retired from
+   * the bookkeeping, and only while the predicate still holds. The result object is returned
+   * unchanged so a repeat call still yields the identical cached result.
    */
   sealLifetime(sourceUse: object): Promise<ExecutorSealResult> {
     const wasRunning = this.runActive;
@@ -2160,7 +2164,14 @@ export class CodexExecutor implements Executor {
         ...(this.intentFlight ? [this.intentFlight] : []),
       ].map(flight => flight.done));
     }, () => !this.runActive && this.captureOwners === 0 &&
-      (this.unverifiedEpochRegistries.size === 0 || this.deferredFinalProven()));
+      (this.unverifiedEpochRegistries.size === 0 || this.deferredFinalProven()))
+      .then(result => {
+        const final = this.deferredFinal;
+        if (result.kind === "sealed" && final && this.deferredFinalProven()) {
+          this.unverifiedEpochRegistries.delete(final.registry);
+        }
+        return result;
+      });
   }
 
   /**

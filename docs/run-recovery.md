@@ -1192,18 +1192,20 @@ stays retained until compatible tooling or that discard can address it.
    worker join token. Changing the token on a reused data volume makes the
    existing records fail authentication, so they are retained and not trusted.
    No token-rotation path ships.
-6. **Slow uploads delay other runs' authority waits.** The authority lock is
+6. **Slow uploads delay other runs' authority waits.** The per-transaction authority
+   lock (`<dataDir>/.uzi-authority/authority.lock`) is
    held across a recovery capture cycle, including its bundle upload (it must be
    taken before the per-record capture-cycle lock, so it cannot be released
    during the upload). One run's slow upload therefore holds up every other
-   operation on the same worker that needs the lock. Those waits are bounded: a
-   flight boundary waits at most its Codex boundary deadline (or the remaining
-   maintenance budget, if shorter), recovery capture cycles wait at most the
-   remaining maintenance budget when one is running (otherwise the lock's default
-   wait), and the retained-source
-   discard waits at most 30 seconds. When a wait expires the operation does not
-   run and fails with an `authority lock timeout` refusal, and nothing is
-   changed by it. The discard then ends in `internal_error` and its claim gate is
+   operation on the same worker that needs the lock. Those waits are bounded; for
+   example, a flight boundary waits at most its Codex boundary deadline (or the
+   remaining maintenance budget, if shorter), recovery capture cycles wait at most
+   the remaining maintenance budget when one is running (otherwise the lock's
+   default wait of 10 minutes), and the retained-source discard waits at most
+   30 seconds. When the deadline expires the operation does not run and fails
+   with an `authority lock timeout` refusal; a wait ended earlier by its
+   cancel, shutdown or maintenance signal rejects with that abort instead.
+   Nothing guarded runs in either case, and nothing is changed by it. The discard then ends in `internal_error` and its claim gate is
    reopened; other callers handle the refusal at their own site (for example,
    owed-head reconciliation logs it and keeps the extra pins). Ensure uploads
    have enough bandwidth to finish within those bounds.

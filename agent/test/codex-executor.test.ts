@@ -26019,7 +26019,40 @@ describe("3404 terminal executor lifetime", () => {
       assert.equal((await executor.sealLifetime(source)).kind, "unproven");
     });
 
-    it("3404 a terminal hook failure (unsettled cache removal) leaves the deferred final registry unproven", async () => {
+    it("3404 a throwing terminal hook (installer cleanup proof unavailable) is incomplete and leaves the seal unproven", async () => {
+      // An exhausted terminal deadline: the hook's installState.settle cannot prove the installer
+      // cleanup inside it and throws "installer cleanup proof unavailable".
+      const { executor, source } = await deferredRun();
+      await executor.safety!.withBoundary({ boundary: "finalize", deadlineMs: 2000 }, async () => {});
+      const disposal = await executor.safety!.dispose({ boundary: "terminal", deadlineMs: 0 });
+      assert.equal(disposal.kind, "incomplete");
+      assert.ok(disposal.kind === "incomplete" &&
+        disposal.errors.some(error => /terminal cleanup hook failed/.test(error.message)));
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a disposal that bypasses safety.dispose and its hook leaves the seal unproven", async () => {
+      const { executor, source } = await deferredRun();
+      await executor.safety!.withBoundary({ boundary: "finalize", deadlineMs: 2000 }, async () => {});
+      const registry = (executor as unknown as DeferredInternals).deferredFinal!.registry as unknown as
+        { disposeTools(deadlineMs: number): Promise<{ kind: string }> };
+      assert.equal((await registry.disposeTools(2000)).kind, "disposed");
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a seal retires only the final registry bookkeeping and repeats identically", async () => {
+      const { executor, source } = await deferredRun();
+      await sinkThenDispose(executor);
+      const internals = executor as unknown as DeferredInternals;
+      const registry = internals.deferredFinal!.registry;
+      assert.equal(internals.unverifiedEpochRegistries.has(registry), true);
+      const first = await executor.sealLifetime(source);
+      assert.equal(first.kind, "sealed");
+      assert.equal(internals.unverifiedEpochRegistries.has(registry), false);
+      assert.equal(await executor.sealLifetime(source), first);
+    });
+
+    it("3404 an unsettled command-cache removal leaves the deferred final registry unproven", async () => {
       const { executor, source } = await deferredRun(rig => {
         rig.deps = { ...rig.deps,
           startCacheHolder: async token => ({ token, path: "/cache", alive: () => false,
