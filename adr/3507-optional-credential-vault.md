@@ -29,7 +29,7 @@ OIDC users awaiting enrollment. Policy changes do not convert or re-seal
 material. Existing Off users remain runnable under Required and receive a
 persistent enrollment prompt; protected users cannot disable under Required.
 
-Migration 00372 uses constant-default additive mode/epoch columns: existing
+Migration 00373 uses constant-default additive mode/epoch columns: existing
 users, including inactive/OIDC/wrapperless users, become protected without a
 ciphertext migration. If any users exist, policy starts Required; an empty
 database starts Optional. Migrations run before seed-admin creation, so a
@@ -159,7 +159,7 @@ immediate CHECK validation scans expose production-dependent lock duration.
 Plan maintenance and backups. Production database sizes, conversion times and
 DDL lock durations are unknown; fixture timings below do not establish them.
 
-The [down migration](../api/internal/store/migrations/00372_vault_mode.sql)
+The [down migration](../api/internal/store/migrations/00373_vault_mode.sql)
 refuses any unprotected user or `master_aad` in personal secrets or either
 Codex account slot. Operators must use the **new binary** to safely convert
 affected users/material before down, quiesce credential mutations, verify
