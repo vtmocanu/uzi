@@ -57,6 +57,7 @@ function resumeAt(run: CardRun, now: number): string | null {
 function StateFlag({ run, now }: { run: CardRun; now: number }) {
   const p = run.progress;
   if (!p) return null;
+  if (run.health === "waiting_account_cooldown") return null;
   switch (p.state) {
     case "stalled": {
       const since = formatLocalTime(run.health_since);
@@ -141,13 +142,14 @@ export function RunProgressCard({ run, activity = null, usage, stage = null }: {
   const p = run.progress;
   const milestones = run.milestones ?? [];
   const badge = milestoneBadge(run);
-  const percent = p?.state === "percent" && typeof p.pct === "number" && Number.isFinite(p.pct)
+  const accountWait = run.health === "waiting_account_cooldown";
+  const percent = !accountWait && p?.state === "percent" && typeof p.pct === "number" && Number.isFinite(p.pct)
     ? Math.max(0, Math.min(100, Math.round(p.pct))) : null;
-  const active = p?.active_milestone_id;
+  const active = accountWait ? undefined : p?.active_milestone_id;
   const hasActiveRow = milestones.some(m => m.id === active);
   const terminal = ["completed", "failed", "cancelled"].includes(run.status);
-  const live = terminal || run.status === "paused" ? null : activity;
-  const note = !terminal && p?.state === "percent" ? stripUnsafeChars(p.now_note?.text ?? "").trim() : "";
+  const live = terminal || run.status === "paused" || accountWait ? null : activity;
+  const note = !accountWait && !terminal && p?.state === "percent" ? stripUnsafeChars(p.now_note?.text ?? "").trim() : "";
   const completed = new Set(run.milestones_completed ?? []);
   const knownState = p && ["percent", "waiting", "parked", "queued", "stalled", "planning"].includes(p.state);
   const hasUsage = usage && usagePanelVisible(usage);
@@ -155,8 +157,8 @@ export function RunProgressCard({ run, activity = null, usage, stage = null }: {
   const nowLine = note ? <p data-progress-now className="my-2 rounded-md bg-raised px-2 py-1 text-sm [overflow-wrap:anywhere]">
     <b>Now: </b>{note}{" "}<span className="ml-2 text-xs text-faint">· model summary{p?.now_note?.at && ` · ${formatAgo(p.now_note.at, now)}`}</span>
   </p> : null;
-  const safeStage = run.status === "running" ? stripUnsafeChars(stage ?? "") : "";
-  const phase = !terminal && p?.state === "percent" && ["review", "validate", "implement"].includes(p.phase) ? p.phase : "";
+  const safeStage = !accountWait && run.status === "running" ? stripUnsafeChars(stage ?? "") : "";
+  const phase = !accountWait && !terminal && p?.state === "percent" && ["review", "validate", "implement"].includes(p.phase) ? p.phase : "";
   const iteration = !terminal && (run.iteration_count ?? 0) > 0 ? `iteration ${run.iteration_count}` : "";
   const contextLine = [phase && `phase: ${stripUnsafeChars(phase)}`, iteration, safeStage && `run: ${safeStage}`].filter(Boolean).join(" · ");
   const phaseLine = contextLine ? <div data-progress-context data-progress-phase={phase ? "" : undefined} className="mt-2 inline-flex rounded bg-raised px-2 py-1 text-xs text-muted" aria-current={phase ? "step" : undefined}>{contextLine}</div> : null;

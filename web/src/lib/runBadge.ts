@@ -411,6 +411,7 @@ const HEALTH_FLAG_LABELS: Record<Exclude<RunHealth, "ok">, string> = {
   slow: "near timeout",
   waiting_worker: "waiting for worker",
   approval_idle: "needs approval",
+  waiting_account_cooldown: "waiting for account cooldown",
 };
 
 // HEALTH_FLAGGABLE_STATUSES mirrors the server's flaggable set: a health flag is
@@ -449,7 +450,7 @@ export function shouldShowHealthFlag(
   health: RunHealth,
   status: string,
 ): boolean {
-  return health !== "ok" && isHealthFlaggableStatus(status);
+  return health !== "ok" && health !== "waiting_account_cooldown" && isHealthFlaggableStatus(status);
 }
 
 // HealthFlaggable is the minimal run shape the health badge reads — satisfied by
@@ -471,6 +472,8 @@ export type HealthFlaggable = {
   reserve_hold_reason?: string | null;
   codex_admission_class?: string | null;
   codex_admission_eligible_at?: string | null;
+  account_cooldown_class?: string | null;
+  account_cooldown_eligible_at?: string | null;
 };
 
 const ADMISSION_PREFIXES = {
@@ -486,19 +489,35 @@ export function codexAdmissionText(
 ): string | null {
   const cls = run.codex_admission_class;
   const at = run.codex_admission_eligible_at;
-  if (run.status !== "queued" || (cls !== "rate_limit" && cls !== "overload") ||
-      !at || !/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(at) ||
-      !Number.isFinite(Date.parse(at)) || !(Date.parse(at) > nowMs)) return null;
-  // Date.parse normalizes impossible calendar dates such as February 30.
-  if (new Date(`${at.slice(0, 10)}T00:00:00Z`).toISOString().slice(0, 10) !== at.slice(0, 10)) return null;
+  if (run.status !== "queued" || (cls !== "rate_limit" && cls !== "overload") || !futureEligibility(at, nowMs)) return null;
   return ADMISSION_PREFIXES[cls] + at;
+}
+
+function futureEligibility(at: unknown, nowMs: number): at is string {
+  if (typeof at !== "string" || !/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(at) ||
+      !Number.isFinite(Date.parse(at)) || !(Date.parse(at) > nowMs)) return false;
+  // Date.parse normalizes impossible calendar dates such as February 30.
+  return new Date(`${at.slice(0, 10)}T00:00:00Z`).toISOString().slice(0, 10) === at.slice(0, 10);
+}
+
+// Only positive, current server evidence establishes this expected active wait.
+// Advice attached to an independent fault must never replace that fault.
+export function accountCooldownText(
+  run: Pick<HealthFlaggable, "status"> & Partial<Pick<HealthFlaggable, "health" | "account_cooldown_class" | "account_cooldown_eligible_at">>,
+  nowMs: number,
+): string | null {
+  const cls = run.account_cooldown_class;
+  const at = run.account_cooldown_eligible_at;
+  if (run.health !== "waiting_account_cooldown" || !["claimed", "running", "awaiting_approval"].includes(run.status) ||
+      (cls !== "rate_limit" && cls !== "overload") || !futureEligibility(at, nowMs)) return null;
+  return `waiting for account cooldown · ${cls} · earliest eligibility ${at}`;
 }
 
 // Persisted provider copy may outlive eligibility or refer to another class. Never
 // use that text to infer a class or keep displaying it after the read-time hold ends.
 export function displayHealthReason(run: Pick<HealthFlaggable, "health_reason">): string | null {
   const reason = stripDisplayCell(run.health_reason);
-  return Object.values(ADMISSION_PREFIXES).some((prefix) => reason.startsWith(prefix))
+  return reason.startsWith("waiting for account cooldown") || Object.values(ADMISSION_PREFIXES).some((prefix) => reason.startsWith(prefix))
     ? null : reason || null;
 }
 
@@ -615,6 +634,8 @@ export function healthBadge(
   if (admission && !queuedBlockerPrecedesCodexAdmission(run)) {
     return { kind: "badge", label: admission, title: admission, tone: "info", pulse: false, wrap: true };
   }
+  const cooldown = accountCooldownText(run, nowMs);
+  if (cooldown) return { kind: "badge", label: cooldown, title: cooldown, tone: "info", pulse: false, wrap: true };
   if (!shouldShowHealthFlag(run.health, run.status)) return null;
   const label = healthFlagLabel(run.health);
   return {
@@ -660,7 +681,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
   // ring/favicon dropping the run entirely. Non-revising runs are byte-identical (the
   // `eff !== "revising"` guard is a no-op unless the run is revising).
   const flagged = healthBadge(run, nowMs, maintenanceReason);
-  if (flagged && eff !== "revising") return flagged;
+  if (flagged && (eff !== "revising" || accountCooldownText(run, nowMs))) return flagged;
   switch (eff) {
     case "queued":
       return { kind: "badge", label: "queued", tone: "queue", pulse: false };

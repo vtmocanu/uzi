@@ -472,3 +472,24 @@ it("old gate mismatch after a round trip cannot resync or clear newer action bus
   await settle(newer, "success");
   expect((screen.getByRole("button", { name: /Approve plan/ }) as HTMLButtonElement).disabled).toBe(false);
 });
+
+it.each(["cancel", "reject_plan", "revise_plan"] as const)("account cooldown preserves %s control and gate identity", async kind => {
+  runOverrides = { status: kind === "cancel" ? "running" : "awaiting_approval", health: "waiting_account_cooldown",
+    account_cooldown_class: "overload", account_cooldown_eligible_at: new Date(Date.now() + 300_037).toISOString() };
+  mount("gate");
+  expect(screen.getAllByText(/waiting for account cooldown/).length).toBeGreaterThan(0);
+  expect(screen.queryByRole("button", { name: /^Resume(?: now)?$/ })).toBeNull();
+  if (kind === "cancel") await act(async () => click("Stop run"));
+  else if (kind === "reject_plan") {
+    click("Reject");
+    fireEvent.change(screen.getByPlaceholderText(/sent back to the agent/), { target: { value: "Reject this plan" } });
+    await act(async () => click("Send rejection"));
+  } else {
+    click("Request changes");
+    fireEvent.change(screen.getByPlaceholderText(/sent to the planning session/), { target: { value: "Replace with a smaller plan" } });
+    await act(async () => click("Send & revise"));
+  }
+  expect(submit.mock.calls[0][0]).toBe(kind);
+  if (kind !== "cancel") expect(submit.mock.calls[0][5]).toBe(2);
+  expect(api.resumeRun).not.toHaveBeenCalled();
+});

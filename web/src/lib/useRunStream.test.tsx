@@ -1024,3 +1024,78 @@ describe("pause origin readiness", () => {
     expect(result.current.pauseOriginReady).toBe(true);
   });
 });
+
+describe("quiet account cooldown metadata", () => {
+  const now = Date.parse("2026-10-28T12:00:00Z");
+  const held = (over: Partial<Run> = {}): Run => ({ ...fakeRun(), health: "waiting_account_cooldown", account_cooldown_class: "rate_limit",
+    account_cooldown_eligible_at: "2026-10-28T12:01:37Z", ...over });
+  const flush = () => act(async () => { await Promise.resolve(); });
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
+    vi.stubGlobal("WebSocket", LiveSocket as unknown as typeof WebSocket);
+    vi.spyOn(api, "getRunMessages").mockResolvedValue({ messages: [] });
+    vi.spyOn(api, "getRunInputs").mockResolvedValue({ inputs: [] });
+  });
+  afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  it("refreshes quiet extension/class changes and lease expiry with no activity or new operations", async () => {
+    const get = vi.spyOn(api, "getRun").mockResolvedValue({ run: held() });
+    const { result, unmount } = renderHook(() => useRunStream("run-1"));
+    await flush();
+    expect(result.current.run?.account_cooldown_class).toBe("rate_limit");
+    const replayCount = vi.mocked(api.getRunMessages).mock.calls.length;
+    get.mockResolvedValue({ run: held({ account_cooldown_class: "overload", account_cooldown_eligible_at: "2026-10-28T12:05:37Z" }) });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(result.current.run?.account_cooldown_eligible_at).toBe("2026-10-28T12:05:37Z");
+    expect(result.current.run?.account_cooldown_class).toBe("overload");
+    get.mockResolvedValue({ run: held({ health: "ok", account_cooldown_class: undefined, account_cooldown_eligible_at: undefined }) });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(result.current.run?.health).toBe("ok");
+    expect(result.current.messages).toEqual([]);
+    expect(api.getRunMessages).toHaveBeenCalledTimes(replayCount);
+    unmount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(get).toHaveBeenCalledTimes(3);
+  });
+
+  it("coalesces pending quiet reads and drops a pre-cancel GET after the owner submits", async () => {
+    let resolve!: (value: { run: Run }) => void;
+    const pending = new Promise<{ run: Run }>(done => { resolve = done; });
+    const get = vi.spyOn(api, "getRun").mockResolvedValue({ run: held() });
+    const send = vi.spyOn(api, "submitRunInput").mockResolvedValue({ server_side: true });
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await flush();
+    get.mockReturnValueOnce(pending);
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(get).toHaveBeenCalledTimes(2);
+    get.mockResolvedValue({ run: held({ status: "cancelled", health: "ok", account_cooldown_class: undefined, account_cooldown_eligible_at: undefined }) });
+    await act(async () => { await result.current.submit("cancel"); });
+    expect(send).toHaveBeenCalledWith("run-1", "cancel", "", undefined, undefined, undefined, undefined);
+    await act(async () => { resolve({ run: held() }); });
+    expect(result.current.run?.status).toBe("cancelled");
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(get).toHaveBeenCalledTimes(3);
+  });
+
+  it("ignores a quiet GET across source roundtrip and stops polling after unmount", async () => {
+    let resolve!: (value: { run: Run }) => void;
+    const get = vi.spyOn(api, "getRun").mockResolvedValue({ run: held() });
+    const { result, rerender, unmount } = renderHook(({ id }) => useRunStream(id), { initialProps: { id: "run-1" } });
+    await flush();
+    get.mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    rerender({ id: "run-2" });
+    await flush();
+    get.mockResolvedValue({ run: held({ health: "ok", account_cooldown_class: undefined, account_cooldown_eligible_at: undefined }) });
+    rerender({ id: "run-1" });
+    await flush();
+    await act(async () => { resolve({ run: held() }); });
+    expect(result.current.run?.health).toBe("ok");
+    unmount();
+    const count = get.mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(get).toHaveBeenCalledTimes(count);
+  });
+});

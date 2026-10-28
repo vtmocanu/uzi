@@ -4,7 +4,7 @@
 // table (moved to Settings), which told a new user nothing about what to do
 // next.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, type AdminUsage, type RunSummaryItem, type RunStatus, type SelfUsage, type Worker } from "../lib/api";
@@ -202,9 +202,15 @@ export function Dashboard() {
   // rarely and stay mount-only. A poll failure keeps the last-good data — unlike
   // the first load, a transient re-poll error must NOT blank the page back to
   // skeletons.
+  const pollAliveRef = useRef(false);
+  useEffect(() => {
+    pollAliveRef.current = true;
+    return () => { pollAliveRef.current = false; };
+  }, []);
   const poll = useCallback(async () => {
     try {
       const [{ runs }, { workers }] = await Promise.all([api.listRuns({ view: "summary" }), api.listWorkers()]);
+      if (!pollAliveRef.current) return;
       setData((prev) =>
         prev
           ? {
@@ -546,7 +552,7 @@ export function Dashboard() {
                     ) : (
                       <RunHealthBadge run={r} nowMs={now} />
                     )}
-                    <StatusPill status={effectiveRunStatus(r)} progress={r.progress} />
+                    <StatusPill health={r.health} status={effectiveRunStatus(r)} progress={r.progress} />
                   </div>
                 </div>
               </li>

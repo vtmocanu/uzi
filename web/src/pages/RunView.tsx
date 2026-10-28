@@ -50,6 +50,7 @@ import {
   reserveQueueText,
   RESERVE_RESUME_CONFIRM,
   codexAdmissionText,
+  accountCooldownText,
   displayHealthReason,
   queuedBlockerPrecedesCodexAdmission,
   isStoppedRun,
@@ -342,6 +343,7 @@ export function HealthFlag({ run }: { run: Run }) {
   const reserve = !maintenance && isReserveQueued(run);
   const admission = codexAdmissionText(run, now);
   const primaryAdmission = !maintenance && !reserve && !queuedBlockerPrecedesCodexAdmission(run) ? admission : null;
+  const cooldown = accountCooldownText(run, now);
   const reason = displayHealthReason(run);
   const show = !maintenance && !reserve && !primaryAdmission && shouldShowHealthFlag(run.health, run.status);
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
@@ -368,11 +370,12 @@ export function HealthFlag({ run }: { run: Run }) {
     ? maintenanceQueueText(maintenanceReason)
     : reserve
       ? reserveQueueText(run.reserve_hold_reason)
-      : primaryAdmission ?? (show
+      : cooldown ?? primaryAdmission ?? (show
         ? (healthFlagLabel(run.health) ?? "")
         : "");
   return (
     <>
+      {cooldown && <span className="text-xs text-info">{cooldown}</span>}
       {primaryAdmission && (
         <span data-queue-reason={run.queue_reason} className="text-xs text-info">{primaryAdmission}</span>
       )}
@@ -2457,7 +2460,7 @@ export function RunView() {
               <span ref={statusRef} tabIndex={-1} className="rounded-md focus-visible:ring-2 focus-visible:ring-brand/60 focus:outline-none">
                 {pillStatus === "provider_unavailable" || pillStatus === "provider_outage"
                   ? <Badge tone="warning" dot>{parkLabel(run)}</Badge>
-                  : <StatusPill status={pillStatus} />}
+                  : <StatusPill health={run.health} status={pillStatus} />}
               </span>
               {/* PRD #320 M6: the queue-priority pill + the owner's Expedite/undo action.
                   Both are QUEUED-ONLY (the pill self-hides on any other status; the action

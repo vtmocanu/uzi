@@ -15,7 +15,7 @@
 // not a failure" nuance: isStoppedRun collapses cancelled / stop_kind-stamped-
 // failed runs (PRD #33) to a calm "stopped" pill, not "failed".
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, NavLink, Outlet, useOutletContext, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, preferForgeUrl, type AdminWorker, type RunSummaryItem, type RunUsage } from "../lib/api";
@@ -186,12 +186,17 @@ export function RunsLayout() {
   // Refresh rows and credential counts independently every 10s while visible,
   // catching up on focus. Each endpoint keeps its last-good state on failure;
   // polls never re-flash the skeleton or show an error banner.
+  const pollAliveRef = useRef(false);
+  useEffect(() => {
+    pollAliveRef.current = true;
+    return () => { pollAliveRef.current = false; };
+  }, []);
   const poll = useCallback(async () => {
     await Promise.all([
-      api.listRuns({ view: "summary" }).then(({ runs }) => setRuns(runs)).catch(() => {
+      api.listRuns({ view: "summary" }).then(({ runs }) => { if (pollAliveRef.current) setRuns(runs); }).catch(() => {
         // keep the last-good rows
       }),
-      refreshCredentialCounts(),
+      refreshCredentialCounts(() => pollAliveRef.current),
     ]);
   }, [refreshCredentialCounts]);
   usePollWhileVisible(poll, 10000);
@@ -514,7 +519,7 @@ export function RunRow({
               {/* PRD #320 M6: the queue-priority pill (Deprioritized/Expedited/Restored),
                   self-hiding on a normal or non-queued run. */}
               <RunPriorityBadge priority={run.priority} status={run.status} />
-              <StatusPill status={pillStatus} progress={run.progress} />
+              <StatusPill health={run.health} status={pillStatus} progress={run.progress} />
               {/* PRD #320 M6: the owner-only Expedite/undo control, queued rows only. It is
                   raised above the card's stretched-link overlay (relative z-10, issue #485
                   NB1) so the click hits the button rather than the run-details Link; it

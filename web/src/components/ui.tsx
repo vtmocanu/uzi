@@ -13,7 +13,7 @@ import {
 } from "react";
 import { Link } from "react-router-dom";
 import { effectiveRunStatus } from "../lib/runBadge";
-import type { RunProgress } from "../lib/apiTypes";
+import type { RunHealth, RunProgress } from "../lib/apiTypes";
 import { ArrowLeftIcon, EyeIcon, EyeOffIcon } from "./icons";
 
 export function cx(...parts: (string | false | null | undefined)[]): string {
@@ -618,8 +618,8 @@ const RUN_STATUS_LABELS: Record<string, string> = {
 
 // A running or live completion row may attach its server estimate to the status pill.
 // Other callers and non-percent states retain the ordinary status presentation.
-export function StatusPill({ status: rawStatus, progress, recovery_wait_cause, recovery_retry_not_before }: {
-  status: string; progress?: RunProgress | null;
+export function StatusPill({ status: rawStatus, progress, health, recovery_wait_cause, recovery_retry_not_before }: {
+  status: string; progress?: RunProgress | null; health?: RunHealth;
   recovery_wait_cause?: string | null;
   recovery_retry_not_before?: string | null;
 }) {
@@ -627,7 +627,8 @@ export function StatusPill({ status: rawStatus, progress, recovery_wait_cause, r
   const cfg = RUN_STATUS_TONES[status] ?? { tone: "neutral" as BadgeTone };
   const label = RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
   const showsProgress = status === "running" || status === "completion_checking" || status === "completion_reworking";
-  const pct = showsProgress && progress?.state === "percent" &&
+  const accountWait = health === "waiting_account_cooldown";
+  const pct = !accountWait && showsProgress && progress?.state === "percent" &&
     typeof progress.pct === "number" && Number.isFinite(progress.pct)
     ? Math.max(0, Math.min(100, Math.round(progress.pct))) : null;
   const valueText = pct === null ? undefined :
@@ -656,7 +657,7 @@ export function StatusPill({ status: rawStatus, progress, recovery_wait_cause, r
         className={cx(
           "h-1.5 w-1.5 rounded-full",
           pct === null ? "bg-current" : "relative bg-info",
-          cfg.pulse && "animate-pulse",
+          !accountWait && cfg.pulse && "animate-pulse",
         )}
       />
       {pct === null ? label : <span className="relative" aria-hidden="true">{label} · {pct}%</span>}

@@ -2119,3 +2119,17 @@ it.each([["rate_limit", "a rate limit"], ["overload", "overload"]] as const)("Co
   expect(container.textContent).toContain("waiting for worker");
   expect(container.textContent).not.toContain("provider reported");
 });
+
+
+it.each(["claimed", "running", "awaiting_approval"] as const)("account cooldown %s summary row keeps one visible wait", status => {
+  const at = "2026-07-05T12:05:37Z";
+  const r = aRun({ status, health: "waiting_account_cooldown", account_cooldown_class: "overload", account_cooldown_eligible_at: at,
+    progress: { state: "waiting", pct: null, milestone_done: 0, milestone_total: 0, active_milestone_id: "", phase: "" } });
+  const { container, rerender } = render(<MemoryRouter><ul><RunRow run={r} now={Date.parse("2026-07-05T12:04:00Z")} /></ul></MemoryRouter>);
+  const text = `waiting for account cooldown · overload · earliest eligibility ${at}`;
+  expect(screen.getByText(text).classList.contains("sr-only")).toBe(false);
+  expect(container.textContent).not.toMatch(/waits on you|⚠|stuck/);
+  expect(container.querySelector(".animate-pulse")).toBeNull();
+  rerender(<MemoryRouter><ul><RunRow run={r} now={Date.parse(at)} /></ul></MemoryRouter>);
+  expect(container.textContent).not.toMatch(/waiting for account cooldown|provider reported|⚠|stuck|waits on you/);
+});

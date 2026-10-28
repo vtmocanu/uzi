@@ -16,6 +16,8 @@ import {
 } from "./api";
 import { applyFrame, emptyStream, hasRefreshKind, ingestMany, type StreamState } from "./runStream";
 
+import { usePollWhileVisible } from "./usePollWhileVisible";
+
 const RECONNECT_MS = 1500;
 const CATCHUP_DEBOUNCE_MS = 150;
 
@@ -59,9 +61,8 @@ export function useRunStream(runId: string) {
   const activeRunIdRef = useRef(runId);
   // Same-run run reads can overlap (a state frame and a plan_revising frame each
   // re-read it). Each read takes a ticket; a response older than the newest one
-  // already applied is dropped, so a slow read never restores stale state (issue #2760).
+  // issued is dropped, so a slow read never restores stale state (issue #2760).
   const runReadTicketRef = useRef(0);
-  const runReadAppliedRef = useRef(0);
 
   // Display evidence only: these refs never drive transport, retries or reads.
   // An epoch fences status/disconnect invalidations; per-read tickets fence
@@ -97,8 +98,7 @@ export function useRunStream(runId: string) {
     try {
       const { run } = await api.getRun(runId);
       if (gen !== genRef.current) return;
-      if (ticket < runReadAppliedRef.current) return;
-      runReadAppliedRef.current = ticket;
+      if (ticket !== runReadTicketRef.current) return;
       setRun(run);
       statusRef.current = run.status;
       if (epoch === evidenceRef.current.epoch && ticket === runReadTicketRef.current) {
@@ -112,7 +112,7 @@ export function useRunStream(runId: string) {
       }
     } catch (e) {
       if (gen !== genRef.current) return;
-      if (ticket < runReadAppliedRef.current) return;
+      if (ticket !== runReadTicketRef.current) return;
       if (epoch === evidenceRef.current.epoch && ticket === runReadTicketRef.current) {
         evidenceRef.current.metadata = false;
         publishReadiness();
@@ -120,6 +120,20 @@ export function useRunStream(runId: string) {
       if (e instanceof ApiError) setError(e.message);
     }
   }, [runId, publishReadiness]);
+
+  // Eligibility and source leases can change without a reason-changing WS frame.
+  // Reuse the visible-view cadence for metadata only, one outstanding quiet read;
+  // WS/action reads still supersede it via tickets and navigation via generation.
+  const quietReadRef = useRef<Promise<void> | null>(null);
+  usePollWhileVisible(() => {
+    if (run?.id !== runId || !["claimed", "running", "awaiting_approval"].includes(run.status)) return;
+    if (quietReadRef.current) return quietReadRef.current;
+    const pending = refreshRun();
+    quietReadRef.current = pending;
+    return pending.finally(() => {
+      if (quietReadRef.current === pending) quietReadRef.current = null;
+    });
+  }, 10_000, `${runId}:${run?.status ?? ""}`);
 
   // refreshOnKinds is set only by the debounced catch-up: the mount and onopen paths
   // already re-read the run themselves, so they skip it rather than fetch it twice.
@@ -194,6 +208,7 @@ export function useRunStream(runId: string) {
 
     // Reset for a new run id, invalidating any REST read still in flight for the old one.
     genRef.current += 1;
+    quietReadRef.current = null;
     const generation = genRef.current;
     activeRunIdRef.current = runId;
     streamRef.current = emptyStream();
@@ -299,6 +314,7 @@ export function useRunStream(runId: string) {
 
     return () => {
       closed = true;
+      genRef.current += 1;
       invalidateEvidence();
       if (catchup != null) clearTimeout(catchup);
       if (reconnect != null) clearTimeout(reconnect);
@@ -370,6 +386,8 @@ export function useRunStream(runId: string) {
         void refreshRun();
         return;
       }
+      // Fence metadata captured before an owner action, including a quiet cooldown read.
+      runReadTicketRef.current += 1;
       const args = [
         runId,
         kind,

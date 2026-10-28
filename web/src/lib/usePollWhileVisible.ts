@@ -11,16 +11,27 @@ import { useEffect, useRef } from "react";
 // recreate the interval (which would reset the clock and, for a callback that is
 // recreated every render, never fire). It also does not silently rely on the
 // caller memoising `cb` with useCallback.
-export function usePollWhileVisible(cb: () => void, intervalMs: number): void {
+export function usePollWhileVisible(cb: () => void | Promise<unknown>, intervalMs: number, scopeKey?: string): void {
   const cbRef = useRef(cb);
   useEffect(() => {
     cbRef.current = cb;
   }, [cb]);
 
   useEffect(() => {
+    let inFlight = false;
+    let closed = false;
     const tick = () => {
-      if (document.hidden) return;
-      cbRef.current();
+      if (document.hidden || closed || inFlight) return;
+      inFlight = true;
+      // At most one batch per view. A failed batch releases the next visible tick;
+      // no retry loop and no timer per card.
+      try {
+        const result = cbRef.current();
+        if (result) void result.catch(() => {}).finally(() => { inFlight = false; });
+        else inFlight = false;
+      } catch {
+        inFlight = false;
+      }
     };
     const interval = setInterval(tick, intervalMs);
     const onVisible = () => {
@@ -28,8 +39,9 @@ export function usePollWhileVisible(cb: () => void, intervalMs: number): void {
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => {
+      closed = true;
       clearInterval(interval);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [intervalMs]);
+  }, [intervalMs, scopeKey]);
 }

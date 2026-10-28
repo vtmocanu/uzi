@@ -523,14 +523,19 @@ export function Board() {
   // persistPrefs) can tell whether it resolved after the route swapped :id — the same
   // stale-repo trap the prefs load effect guards with its `cancelled` flag.
   const repoIdRef = useRef(repoId);
+  const sourceEpochRef = useRef(0);
   useEffect(() => {
     repoIdRef.current = repoId;
+    sourceEpochRef.current += 1;
+    return () => { sourceEpochRef.current += 1; };
   }, [repoId]);
 
   const load = useCallback(async () => {
+    const sourceEpoch = sourceEpochRef.current;
     setError("");
     try {
       const { board } = await api.getBoard(repoId);
+      if (sourceEpochRef.current !== sourceEpoch || repoIdRef.current !== repoId) return;
       setBoard(board);
     } catch (err) {
       setError(errorMessage(err, "Failed to load board"));
@@ -540,6 +545,7 @@ export function Board() {
   }, [repoId]);
 
   const loadPreconditions = useCallback(async () => {
+    const sourceEpoch = sourceEpochRef.current;
     try {
       const [{ workers }, { secrets }, { runs }, { settings }] = await Promise.all([
         api.listWorkers(),
@@ -549,6 +555,7 @@ export function Board() {
         // IssueView's start dialog so a card's effective-Codex gate agrees with it.
         api.getMySettings(),
       ]);
+      if (sourceEpochRef.current !== sourceEpoch || repoIdRef.current !== repoId) return;
       setHasWorker(workers.length > 0);
       setHasToken(hasAnthropicToken(secrets));
       // PRD #1429 M4a, D3: harness-aware credential facts alongside hasToken.
@@ -569,6 +576,7 @@ export function Board() {
         runs.filter(
           (r) =>
             r.health !== "ok" &&
+            r.health !== "waiting_account_cooldown" &&
             // Whatever the three buckets above already show, this one must not repeat.
             !isAwaitingApproval(r.status) &&
             !isAwaitingInput(r.status) &&
@@ -600,12 +608,13 @@ export function Board() {
   // last good board; the next tick retries) — only the foreground load surfaces them.
   const poll = useCallback(async () => {
     const gen = mutationGenRef.current;
+    const sourceEpoch = sourceEpochRef.current;
     try {
       const { board: fresh } = await api.getBoard(repoId);
       // #1060: a mutation started or settled while this poll's getBoard was in
       // flight — its payload predates the mutation's authoritative card, so drop
       // it (toasts included) rather than clobber the just-applied local state.
-      if (mutationGenRef.current !== gen) return;
+      if (mutationGenRef.current !== gen || sourceEpochRef.current !== sourceEpoch || repoIdRef.current !== repoId) return;
       const prev = boardRef.current;
       if (prev) {
         for (const card of fresh.cards) {
@@ -635,9 +644,8 @@ export function Board() {
   // again triggers an immediate catch-up. No WebSocket (out of scope). The shared
   // hook stashes this callback in a ref, so the inline arrow is safe.
   usePollWhileVisible(() => {
-    poll();
-    loadPreconditions();
-  }, 10000);
+    return Promise.all([poll(), loadPreconditions()]);
+  }, 10000, repoId);
 
   const startRun = async (card: CardData) => {
     setError("");

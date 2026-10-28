@@ -2412,6 +2412,43 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
   });
 
+  it("quiet board refresh batches cards and observes cooldown extension and expiry", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-28T12:00:00Z"));
+    try {
+      const fresh = (at?: string): BoardData => ({ ...aBoard(), cards: [7, 8, 9].map(iid => aCard({ iid, column: "Planned",
+        latest_run: { id: `wait-${iid}`, status: "running", health: "waiting_account_cooldown", health_since: null, health_reason: null,
+          is_mine: true, owner_name: "Demo", worker_name: null, created_at: "2026-10-28T11:59:00Z", updated_at: "2026-10-28T11:59:00Z",
+          ...(at ? { account_cooldown_class: "overload", account_cooldown_eligible_at: at } : {}) } as NonNullable<Card["latest_run"]> })) });
+      mockApi.listRuns.mockResolvedValue({ runs: [] });
+      mockApi.getBoard.mockResolvedValue({ board: fresh("2026-10-28T12:01:37Z") });
+      renderBoard();
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(screen.getAllByText(/waiting for account cooldown/)).toHaveLength(3);
+      let resolve!: (value: { board: BoardData }) => void;
+      mockApi.getBoard.mockReturnValueOnce(new Promise(done => { resolve = done; }));
+      const before = mockApi.getBoard.mock.calls.length;
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      expect(mockApi.getBoard).toHaveBeenCalledTimes(before + 1);
+      await act(async () => { resolve({ board: fresh("2026-10-28T12:05:37Z") }); });
+      expect(screen.getAllByText("waiting for account cooldown · overload · earliest eligibility 2026-10-28T12:05:37Z")).toHaveLength(3);
+      mockApi.getBoard.mockResolvedValue({ board: fresh() });
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+      expect(screen.queryByText(/waiting for account cooldown|⚠/)).toBeNull();
+    } finally { cleanup(); vi.useRealTimers(); }
+  });
+
+  it("excludes expected active account health from looks stuck even when private fields are absent", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [
+      aRun({ id: "foreign-wait", status: "running", health: "waiting_account_cooldown", issue_iid: 8 }),
+      aRun({ id: "real-fault", status: "running", health: "slow", issue_iid: 7 }),
+    ] });
+    renderBoard();
+    await screen.findByText("1 run looks stuck");
+    expect(strip().textContent).toBe("1 run looks stuck");
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
+  });
+
   it("does not call a maintenance-held run stuck (PRD #3454)", async () => {
     // The detector can still flag a maintenance-held queued run waiting_worker; the strip
     // must not read "looks stuck" for a wait the admin chose. The genuinely stalled run

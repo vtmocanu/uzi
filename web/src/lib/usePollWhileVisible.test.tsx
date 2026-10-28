@@ -95,3 +95,34 @@ describe("usePollWhileVisible", () => {
     expect(removeSpy).toHaveBeenCalledWith("visibilitychange", expect.any(Function));
   });
 });
+
+it("coalesces a slow view batch across timer and visibility ticks, then retries on the next tick", async () => {
+  let resolve!: () => void;
+  const cb = vi.fn().mockReturnValueOnce(new Promise<void>(done => { resolve = done; }));
+  const { unmount } = renderHook(() => usePollWhileVisible(cb, 1000));
+  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+  act(() => document.dispatchEvent(new Event("visibilitychange")));
+  expect(cb).toHaveBeenCalledTimes(1);
+  await act(async () => { resolve(); });
+  act(() => vi.advanceTimersByTime(1000));
+  expect(cb).toHaveBeenCalledTimes(2);
+  unmount();
+  act(() => document.dispatchEvent(new Event("visibilitychange")));
+  expect(cb).toHaveBeenCalledTimes(2);
+});
+
+it("retires a pending batch on source change so the new source can refresh", async () => {
+  let resolve!: () => void;
+  const old = vi.fn().mockReturnValue(new Promise<void>(done => { resolve = done; }));
+  const next = vi.fn();
+  const { rerender } = renderHook(({ source, cb }) => usePollWhileVisible(cb, 1000, source), { initialProps: { source: "A", cb: old } });
+  act(() => vi.advanceTimersByTime(1000));
+  expect(old).toHaveBeenCalledOnce();
+  rerender({ source: "B", cb: next });
+  act(() => vi.advanceTimersByTime(1000));
+  expect(next).toHaveBeenCalledOnce();
+  await act(async () => { resolve(); });
+  act(() => vi.advanceTimersByTime(1000));
+  expect(old).toHaveBeenCalledOnce();
+  expect(next).toHaveBeenCalledTimes(2);
+});

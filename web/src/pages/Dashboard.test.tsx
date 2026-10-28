@@ -993,3 +993,25 @@ describe("Dashboard — summary run projection (#2661)", () => {
     for (const call of mockApi.listRuns.mock.calls) expect(call[0]).toEqual({ view: "summary" });
   });
 });
+
+it("quiet dashboard polling refreshes account extension and expiry with one visible owner wait", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-10-28T12:00:00Z"));
+  const at = "2026-10-28T12:01:37Z";
+  const r = aRun({ health: "waiting_account_cooldown", account_cooldown_class: "rate_limit", account_cooldown_eligible_at: at,
+    progress: { state: "waiting", pct: null, milestone_done: 0, milestone_total: 0, active_milestone_id: "", phase: "" } });
+  mockApi.listRuns.mockResolvedValue({ runs: [r] });
+  renderDashboard();
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  const row = () => screen.getByText("Live run row").closest("li")!;
+  const visibleWaits = () => [...row().querySelectorAll("*")].filter(el => !el.childElementCount && !el.closest(".sr-only") && el.textContent?.includes("waiting for account cooldown"));
+  expect(visibleWaits()).toHaveLength(1);
+  expect(row().textContent).not.toMatch(/waits on you|⚠|%/);
+  mockApi.listRuns.mockResolvedValue({ runs: [{ ...r, account_cooldown_class: "overload", account_cooldown_eligible_at: "2026-10-28T12:05:37Z" }] });
+  await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+  expect(visibleWaits()[0].textContent).toBe("waiting for account cooldown · overload · earliest eligibility 2026-10-28T12:05:37Z");
+  mockApi.listRuns.mockResolvedValue({ runs: [{ ...r, account_cooldown_class: undefined, account_cooldown_eligible_at: undefined }] });
+  await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+  expect(visibleWaits()).toHaveLength(0);
+  expect(row().textContent).not.toMatch(/waits on you|⚠|provider reported/);
+});
