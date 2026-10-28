@@ -215,6 +215,8 @@ export class ReviewRunner {
         this.log.warn("review claim superseded (stale) at running report; abandoning without posting", {
           run_id: reviewRunId,
         });
+        required?.close();
+        this.activeRuns?.remove(reviewRunId);
         return;
       }
       // ensureClone mirrors every origin head into refs/remotes/origin/* (a bare

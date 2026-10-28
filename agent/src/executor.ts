@@ -18,6 +18,7 @@ import type {
   ClaimPipeline,
   ClaimSkill,
   ClaimSkillDrop,
+  CodexOperationIdentity,
   FixVerdict,
   IssueCommentsSnapshot,
   IterationBudget,
@@ -145,7 +146,7 @@ export interface RunContext {
    * Returns the repeatable local source guard; no recovery grant is consumed.
    */
   codexRootAdmissionActive?(): boolean;
-  prepareCodexRootDispatch?(signal: AbortSignal, check: () => void, kind?: import("./protocol.js").CodexOperationIdentity["kind"]): Promise<() => boolean | void>;
+  prepareCodexRootDispatch?(signal: AbortSignal, check: () => void, kind?: CodexOperationIdentity["kind"]): Promise<() => boolean | void>;
   /** Run kind (PRD #6). "issue" (default when absent) works issueIid's card;
    *  "ci_fix" diagnoses + fixes `pipeline`. */
   kind?: RunKind;

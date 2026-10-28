@@ -833,6 +833,7 @@ for (const cancel of [false, true]) {
   const { ActiveRunRegistry } = await import("../src/active-run-registry.js");
   const { acquireCodexOperationScope } = await import("../src/codex-operation-scope.js");
   const { AdmissionClock, flushUntil } = await import("./operation-admission-clock.js");
+  await fs.mkdir(new URL("../../.uzi/scratch/", import.meta.url), { recursive: true });
   const root = await fs.mkdtemp(fileURLToPath(new URL("../../.uzi/scratch/m3-checker-", import.meta.url)));
   const clock = new AdmissionClock();
   const registry = new ActiveRunRegistry();

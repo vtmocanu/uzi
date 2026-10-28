@@ -778,3 +778,25 @@ describe("ReviewRunner terminal journaling (PRD #1391 Run B M3b, D6)", () => {
     assert.equal(outbox.hasPendingTerminal("review-1", 8), false, "a 200 terminal ack retires the journal");
   });
 });
+
+it("stale initial subscription review releases its operation scope and active registration", async () => {
+  const { ActiveRunRegistry } = await import("../src/active-run-registry.js");
+  const { acquireCodexOperationScope } = await import("../src/codex-operation-scope.js");
+  let retained = 0;
+  const client = {
+    hasFeature: () => true, codexOperationNegotiation: 1,
+    retainCodexOperationFlight: () => { retained++; return () => { retained--; }; },
+    reportState: async () => ({ applied: false, staleClaim: true }),
+  } as unknown as WorkerClient;
+  const activeRuns = new ActiveRunRegistry();
+  const claim = { run_id: "review-stale", claim_generation: 7, review_target_run_id: "target",
+    branch: "topic", secrets: { codex: { auth_mode: "subscription" } } } as ClaimResponse;
+  await new ReviewRunner(client, {} as never, nullLogger(), { activeRuns }).execute(claim);
+  assert.equal(retained, 0, "stale review must release its operation flight");
+  assert.equal(activeRuns.size, 0, "stale review must clear its active registration");
+  const next = acquireCodexOperationScope(client, claim.run_id, 7);
+  try {
+    assert.doesNotThrow(() => next.bind(async () => () => true), "reacquisition must get a fresh scope");
+  } finally { next.close(); }
+  assert.equal(retained, 0);
+});

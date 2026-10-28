@@ -1650,6 +1650,7 @@ for (const family of ["judge", "review", "intent", "plan", "delivery", "now"] as
       const { SummaryRunner } = await import("../src/summary-runner.js");
       const { ActiveRunRegistry } = await import("../src/active-run-registry.js");
       const { NowSummaryController, nowSummaryCodexClaim } = await import("../src/now-summary.js");
+      await fs.mkdir(new URL("../../.uzi/scratch/", import.meta.url), { recursive: true });
       const homeRoot = await fs.mkdtemp(fileURLToPath(new URL("../../.uzi/scratch/m3-advice-", import.meta.url)));
       const clock = new AdmissionClock();
       const reads: CodexOperationRequest[] = [];

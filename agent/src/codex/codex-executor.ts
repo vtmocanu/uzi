@@ -220,7 +220,7 @@ import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "./config.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
 import { isSeededOwnerPlan, SEEDED_PLAN_RULES } from "../seeded-plan.js";
-import { CodexAdviceHarness, type LaunchAdviceRootSeam } from "./codex-advice-harness.js";
+import { CodexAdviceHarness, type CodexAdviceHarnessOptions, type LaunchAdviceRootSeam } from "./codex-advice-harness.js";
 import { makePrDescriptionEvalLaunch, type PrDescriptionEvalLaunchTestSeams } from "./pr-description-eval-launch.js";
 import type { AdviceRequest, AdviceResultPolicy } from "../harness.js";
 import {
@@ -1179,7 +1179,7 @@ export async function makeCodexAdviceHarness(
   refresh?: "deny",
   ownership?: SummaryOwnership,
   admissionReporter?: CodexAdmissionReporter,
-  operationScope?: import("./codex-advice-harness.js").CodexAdviceHarnessOptions["operationScope"],
+  operationScope?: CodexAdviceHarnessOptions["operationScope"],
 ): Promise<CodexAdviceHarness> {
   // Register EVERY advice token — the initial release AND any subscription refresh — with the
   // harness redactor so neither can ride a log line verbatim. The advice lane has no separate
