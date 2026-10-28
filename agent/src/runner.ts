@@ -3377,6 +3377,17 @@ export class RunRunner {
     return { signal: this.retainedLifecycleSignal(flight), timeoutMs: Math.max(1, Math.min(boundaryMs, budget)) };
   }
 
+  /** The wait for A at an authorized cancellation/park cleanup: shutdown and the current independent
+   *  maintenance budget only. The flight's cancel/lifecycle signals are deliberately absent: they are
+   *  already aborted during a cancellation, and this cleanup runs precisely then. */
+  private cleanupAuthorityWait(boundaryMs: number = this.codexBoundaryDeadlineMs): AuthorityWait {
+    const budget = MaintenanceBudget.current();
+    return {
+      signal: AbortSignal.any([this.shutdownSignal.signal, ...(budget ? [budget.signal] : [])]),
+      timeoutMs: Math.max(1, Math.min(boundaryMs, budget?.remainingMs() ?? Infinity)),
+    };
+  }
+
   /**
    * Bind the flight's executor to its clone's source-use epoch BEFORE the executor launches anything
    * against the clone: a Codex executor's admission carries its executor incarnation; a Claude flight
@@ -17807,7 +17818,8 @@ export class RunRunner {
         MaintenanceBudget.current()?.check();
         this.assertHeldFreeCapture(flight, held);
         if (residueQuarantine() !== undefined) return "retained" as const;
-        await this.inAuthority(() => this.git.deleteRecoveryPin(flight.barePath!, flight.runId, gen), this.authorityWait(flight));
+        // The flight is cancelled here by definition; wait for A on the independent cancellation budget.
+        await this.inAuthority(() => this.git.deleteRecoveryPin(flight.barePath!, flight.runId, gen), this.cleanupAuthorityWait());
         MaintenanceBudget.current()?.check();
         this.assertHeldFreeCapture(flight, held);
         if (residueQuarantine() !== undefined) return "retained" as const;
@@ -17952,8 +17964,9 @@ export class RunRunner {
       // with the pinned head as the expected SHA so a moved ref is retained. On any retain
       // (needs_action) LEAVE it as the durable anchor that keeps the retained source reachable.
       if (outcome.state === "uploaded" && outcome.reason === "already_published") {
+        // Runs at a cancellation/park cleanup: wait on shutdown and the maintenance budget, not the aborted flight signals.
         await this.inAuthority(() => this.git.deleteRecoveryPin(barePath, claim.run_id, generation, record.sourceSha),
-          this.authorityWait(flight));
+          this.cleanupAuthorityWait());
       }
       runLog.info("recovery: park/early-terminal disposition outcome", {
         run_id: claim.run_id,

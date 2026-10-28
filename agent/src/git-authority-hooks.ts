@@ -70,7 +70,9 @@
  *    numeric code with no kill and no signal) then a read-back, settling ok when the ref is gone and
  *    residue when it remains or cannot be read; a spawn failure where no child started (string code,
  *    "spawn" syscall, not killed) settles as residue; anything else (timeout or kill, signal, null code,
- *    non-spawn string code) is left unsettled. The slot epoch covers clone sources, not refs of the
+ *    non-spawn string code) is left unsettled. That last list is the execFile path: inside a
+ *    boundary-process scope the tick spawner reports a joined signal death or its own kill as a numeric
+ *    code only after the process group is gone, so it is a known exit. The slot epoch covers clone sources, not refs of the
  *    shared bare that other runs' cleanup and pinning also touch.
  *  - "owed-reconcile-delete-ref": GitCache.reconcileOwedCandidates (`update-ref -d` of the owed pin,
  *    via GitCache.deleteRefSettled). Same footprint, join and reasoning.
