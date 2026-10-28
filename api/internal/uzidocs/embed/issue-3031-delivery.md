@@ -137,11 +137,17 @@ terminal-origin admission, which returns early while
 `TERMINAL_ORIGIN_ADMISSION_ENABLED` is false; `importMaintenanceTip` is reached only
 from that admission path.
 
-This conflicts with the C2 hard gate (#3442 item 5): the two-source family must
-complete with genesis preserved and the sibling protected, and a cap refusal is not
-a PASS. No cap, accounting or scheduling change is made or approved here. C2 inherits
-this as a recorded R3 input; C3 to C8 stay blocked until C2 records a PASS. #3440
-(multi-source settlement) does not absorb or waive it.
+The earlier two-source success requirement (#3442 Design 5 / acceptance 4) is
+outside the current single-attempt PASS conjunction under the maintainer's
+[scope amendment](https://github.com/vtmocanu/uzi/issues/3442#issuecomment-6463625538).
+Its fixture-injected descriptor-budget refusal remains diagnostic evidence, and
+multi-source preservation remains undelivered. Reachability and capacity are
+independent unresolved requirements: the two-member diagnostic refused at 128
+`sources`; completing 31 paid reads at six units plus two would project to about
+188 against 128, not a measured complete-path total. Any future multi-source design
+must resolve both constructor/coverage authority and the unchanged aggregate
+budget. #3440 does not absorb or waive either. C2 remains UNRUN; C3-C8 and producer
+enablement remain blocked. No cap, accounting or scheduling change is made here.
 
 ## Delivery status of #3441 (non-closing)
 

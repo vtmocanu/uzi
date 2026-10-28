@@ -378,8 +378,15 @@ Representative measurement: see the delivery report.
 **Boundary.** The composed gate (C2) is UNRUN: no qualifying measurement exists, and
 the diagnostic run shows `sourceEntries` refusals at 65,536 on representative
 fixtures, with no archive outcome reached (see the MEASURE section of the delivery
-report). No contract change follows. The terminal producer guard stays off. U4b, U4c, U4d, U5, F, M3
-and M4 remain undelivered, and MO is unperformed.
+report). The diagnostic itself grants no contract change or PASS. Under the
+maintainer's [scope amendment](https://github.com/vtmocanu/uzi/issues/3442#issuecomment-6463625538),
+the current C2 conjunction is single-attempt-only. Multi-source and unprovable
+families remain protected; multi-source preservation is undelivered. Future
+expansion requires independently proved membership and coverage, plus a composed
+measurement resolving the separately recorded `sources` budget shortfall. Neither
+local retention nor the diagnostic's projected 188/128 complete-path cost is a
+qualifying preservation result. The terminal producer guard stays off. U4b, U4c,
+U4d, U5, F, M3 and M4 remain undelivered, and MO is unperformed.
 
 ### Server-owned backoff
 
