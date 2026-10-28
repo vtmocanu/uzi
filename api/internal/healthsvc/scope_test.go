@@ -92,6 +92,66 @@ func TestEvaluateBlocking(t *testing.T) {
 	}
 }
 
+func TestRecoveryStorageAttentionNoEpisodeOrNotice(t *testing.T) {
+	fs := &fakeStore{
+		controller:  pgtype.Timestamptz{Time: fixedNow, Valid: true},
+		storageRows: []store.RecoveryStorageHealthRow{{RefusedCount: 1}},
+	}
+	svc := newSvc(fs, &fakeSettings{healthEnabled: true})
+	svc.probeDB = func(context.Context) dbStat { return dbStat{schemaAtHead: true} }
+	st := &fakeEpisodeStore{
+		openErr: pgx.ErrNoRows, openReturn: uuid.New(),
+		admins: []uuid.UUID{uuid.New(), uuid.New()},
+	}
+	nf := &fakeEpisodeNotifier{}
+	r := NewEpisodeReconciler(svc, st, nf, &fakeEpisodeSettings{enabled: true}, nil)
+	r.now = func() time.Time { return fixedNow }
+	for tick := 0; tick < 3; tick++ {
+		doc, err := svc.Evaluate(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		attention := 0
+		for _, c := range doc.Checks {
+			if c.AttentionBanner {
+				attention++
+				if c.ID != "recovery.storage" || c.Scope != "owner" || c.Severity != sevWarn {
+					t.Fatalf("unexpected attention check: %+v", c)
+				}
+			}
+		}
+		if attention != 1 || doc.Blocking || doc.Status != sevWarn || doc.Counts.Danger != 0 || doc.EpisodeID != nil {
+			t.Fatalf("tick %d: attention=%d doc=%+v", tick, attention, doc)
+		}
+		r.Reconcile(context.Background())
+	}
+	if st.opened != 0 || len(st.closed) != 0 || len(st.claims) != 0 || len(st.releases) != 0 || len(nf.sent) != 0 {
+		t.Fatalf("owner Warn changed episodes/notices: store=%+v notices=%+v", st, nf.sent)
+	}
+
+	// Removing the persisted refusal changes just the recovery verdict and its tally.
+	warnDoc, err := svc.Evaluate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.storageRows = []store.RecoveryStorageHealthRow{{}}
+	okDoc, err := svc.Evaluate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCounts := warnDoc.Counts
+	wantCounts.Warn--
+	wantCounts.OK++
+	if okDoc.Counts != wantCounts || okDoc.Blocking || okDoc.EpisodeID != nil {
+		t.Fatalf("recovery tally: got %+v, want %+v", okDoc, wantCounts)
+	}
+	for _, c := range okDoc.Checks {
+		if c.AttentionBanner {
+			t.Fatalf("OK evaluation opted into attention: %+v", c)
+		}
+	}
+}
+
 // The server-provided scope, rather than the ID, selects notification checks.
 // Missing and invalid scopes cannot produce a notice even with a blocking document.
 func TestEpisodeNoticeScopeSelection(t *testing.T) {

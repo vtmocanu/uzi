@@ -23,7 +23,7 @@ func TestRecoveryStorageCurrentSignal(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := New(Config{Store: &fakeStore{storageRows: []store.RecoveryStorageHealthRow{{RefusedCount: tc.refused, AvailableBytes: tc.bytes}}}})
 			c := s.checkRecoveryStorage(context.Background(), time.Now())
-			if c.Severity != tc.want || c.Scope != "owner" || c.Group != groupHousekeeping || !strings.Contains(c.Summary, "captures currently marked quota-refused") {
+			if c.Severity != tc.want || c.AttentionBanner != (tc.want == sevWarn) || c.Scope != "owner" || c.Group != groupHousekeeping || !strings.Contains(c.Summary, "captures currently marked quota-refused") {
 				t.Errorf("check: %+v", c)
 			}
 			disabled := 0
@@ -225,7 +225,7 @@ func TestRecoveryStorageReadFailureAndDeadline(t *testing.T) {
 				}
 			}
 			c := New(Config{Store: f}).checkRecoveryStorage(ctx, time.Now())
-			if c.Severity != sevUnknown {
+			if c.Severity != sevUnknown || c.AttentionBanner {
 				t.Errorf("check: %+v", c)
 			}
 		})
@@ -250,10 +250,13 @@ func TestRecoveryStorageEvaluateRollup(t *testing.T) {
 			found := false
 			for _, c := range d.Checks {
 				if c.ID != "recovery.storage" {
+					if c.AttentionBanner {
+						t.Errorf("unexpected attention opt-in: %+v", c)
+					}
 					continue
 				}
 				found = true
-				if c.Severity != sevWarn || c.Scope != "owner" || c.Group != groupHousekeeping {
+				if c.Severity != sevWarn || c.Scope != "owner" || c.Group != groupHousekeeping || !c.AttentionBanner {
 					t.Errorf("check: %+v", c)
 				}
 				for _, want := range []string{"11 bytes", "22 bytes", "33 bytes"} {
