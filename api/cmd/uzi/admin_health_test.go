@@ -398,7 +398,7 @@ func codexPricingWarnCheck() apitypes.HealthCheckDTO {
 }
 
 func TestAdminHealthRecoveryStorageEvidence(t *testing.T) {
-	check := apitypes.HealthCheckDTO{ID: "recovery.storage", Scope: "owner", Group: "housekeeping", Title: "Recovery storage", Severity: "warn",
+	check := apitypes.HealthCheckDTO{ID: "recovery.storage", Scope: "owner", Group: "housekeeping", Title: "Recovery storage", Severity: "warn", AttentionBanner: true,
 		Summary:  "1 captures currently marked quota-refused.",
 		Evidence: []apitypes.HealthEvidenceDTO{{Label: "Shared stored-files limit", Value: "disabled"}, {Label: "Omitted owner examples", Value: "2"}}}
 	for _, strict := range []bool{false, true} {
@@ -417,6 +417,36 @@ func TestAdminHealthRecoveryStorageEvidence(t *testing.T) {
 				t.Errorf("missing %q: %s", s, out)
 			}
 		}
+	}
+}
+
+func TestAdminHealthAttentionJSON(t *testing.T) {
+	for _, attention := range []bool{false, true} {
+		t.Run(fmt.Sprintf("attention=%v", attention), func(t *testing.T) {
+			check := apitypes.HealthCheckDTO{
+				ID: "recovery.storage", Scope: "owner", Severity: "warn", AttentionBanner: attention,
+			}
+			for _, strict := range []bool{false, true} {
+				args := []string{"admin", "health", "--json"}
+				wantExit := uzicli.ExitOK
+				if strict {
+					args = append(args, "--strict")
+					wantExit = uzicli.ExitHealthDanger
+				}
+				out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{AdminHealthDoc: healthDoc("warn", check)}), args...)
+				var doc apitypes.HealthDocDTO
+				if err := json.Unmarshal([]byte(out), &doc); err != nil {
+					t.Fatal(err)
+				}
+				if code != wantExit || doc.Blocking || doc.Status != "warn" || doc.Counts.Warn != 1 ||
+					len(doc.Checks) != 1 || doc.Checks[0].AttentionBanner != attention || doc.Checks[0].Severity != "warn" {
+					t.Fatalf("exit=%d doc=%+v", code, doc)
+				}
+				if strings.Contains(out, "\"attention_banner\"") != attention {
+					t.Fatalf("optional flag changed: %s", out)
+				}
+			}
+		})
 	}
 }
 

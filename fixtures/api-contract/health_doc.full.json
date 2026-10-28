@@ -18,6 +18,7 @@
       "scope": "x",
       "title": "x",
       "severity": "x",
+      "attention_banner": true,
       "summary": "x",
       "since": "x",
       "evidence": [

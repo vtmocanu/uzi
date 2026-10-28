@@ -1650,6 +1650,8 @@ export interface HealthCheck {
   group: string;
   title: string;
   severity: string;
+  // Presentation-only opt-in; does not affect severity, counts, blocking or episodes.
+  attention_banner?: boolean;
   summary: string;
   // When the check first went non-ok, where the source has one, else null.
   since: string | null;

@@ -55,6 +55,9 @@ type HealthCheckDTO struct {
 	Scope    string `json:"scope"`
 	Title    string `json:"title"`
 	Severity string `json:"severity"`
+	// AttentionBanner is a presentation-only opt-in; it does not affect severity,
+	// counts, blocking, episodes or notices.
+	AttentionBanner bool `json:"attention_banner,omitempty"`
 	// Summary is the one-line server-authored verdict for this check.
 	Summary string `json:"summary"`
 	// Since is when this check first went non-ok, where the source carries one (RFC3339),
