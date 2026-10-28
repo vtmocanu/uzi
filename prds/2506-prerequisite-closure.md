@@ -1,7 +1,7 @@
 # PRD #2506 (option A): a pinned prerequisite closure lets a thin guarded capture release custody
 
 **Issue:** #2506 (option A only). Delivery under this PRD is **non-closing**: every PR uses `Refs #2506` and closes only its own child issue. #2506 stays open until the whole acceptance below is met. Option D shipped separately (ADR-2506) and does not complete this.
-**Status:** DRAFT, revision 17 (2026-10-28), approved C1a/C1b split and review folds, pending exact-text final review. C1a and C1b are API-only; no filing or dispatch follows from this draft. Based on the exact revision-11 artifact (SHA256 `2205e1146950263b2aa90f35863cadec3f3debfbd350590b9e65bd560a9640ec`, whose header still said revision 10). The earlier paired architecture reviews and owner decisions remain the design history; this new evidence fold requires recov6 review and is not filing, dispatch or implementation approval. **E2 ran on GitHub on 2026-10-27 and returned FINDING (one measured workflow-scope refusal, zero probe malfunctions), conclusive for the tested production credential class.** The anchor strategy is feasible in that tested case; other forges and protected/ruleset configurations remain unverified. Existing source line anchors are historical at `91647464c02bd12ae30d4fce6aa656f2245e88e1`, not refreshed line numbers for current main. The new E2 section states the exact observed scope and remaining gates.
+**Status:** DRAFT, revision 18 (2026-10-28), approved C1a/C1b split and review folds, pending exact-text final review. C1a and C1b are API-only; no filing or dispatch follows from this draft. Based on the exact revision-11 artifact (SHA256 `2205e1146950263b2aa90f35863cadec3f3debfbd350590b9e65bd560a9640ec`, whose header still said revision 10). The earlier paired architecture reviews and owner decisions remain the design history; this new evidence fold requires recov6 review and is not filing, dispatch or implementation approval. **E2 ran on GitHub on 2026-10-27 and returned FINDING (one measured workflow-scope refusal, zero probe malfunctions), conclusive for the tested production credential class.** The anchor strategy is feasible in that tested case; other forges and protected/ruleset configurations remain unverified. Existing source line anchors are historical at `91647464c02bd12ae30d4fce6aa656f2245e88e1`, not refreshed line numbers for current main. The new E2 section states the exact observed scope and remaining gates.
 **Priority:** High (inherits #2506). The independent architecture review CLAUDE.md requires for priority::high applies to this PRD and to each child before dispatch; no waiver. M0 is evidence-only and is never auto-dispatched.
 **Related:** ADR-1296 D5 (thin-capture rule) and its 2026-10-09 amendment (the "Later user deletion or rewriting is outside the proof" residual), ADR-1197 (local thin proof grants no custody release), ADR-2417 (guarded local retention), ADR-2545 (terminal held publication, `create_unknown` precedent), ADR-1810 and ADR-1867 (create-only uzi ref namespaces), ADR-2213 (residue quarantine), ADR-2506 (option D), ADR-456 (`adr/0456-rebase-before-finalize-push.md`, GitHub workflow-scope rule), the #2746 programme (`prds/2746-automatic-hold-settlement.md`), #2476, #2494, #2507, #2544, #2809, #2884 (open; another `recovery_inventory_hold_guard` rebuild), #3030 (PR #3058), #3105, **#2969** (re-scoped behind this PRD on 2026-10-23), **#3031 U1** and its children #3443 and #3444.
 **Delivery shape:** M0 (maintainer-owned evidence and probes, not a uzi run), then four child issues, one gated run/PR each: C1a, C1b, C2 and C3. C1b waits for C1a; C2 waits for C1b; C3 may parallel C2 only with disjoint file ownership. No uzi run's implementation or validation creates, modifies or commits any path under `.github/workflows/`; the single exception is E2's maintainer-only disposable scratch repository. Do not reserve a draft migration number here: choose the next free number above the live head at landing (`task migration:renumber`). PR #3580 has overlapping recovery files and a pending migration; rebase and re-audit if it lands first. Existing code anchors remain historical at `91647464`; new split/review anchors explicitly use `c750b802`.
@@ -207,7 +207,7 @@ Every forge call runs with no transaction open and its own per-call timeout.
 | S4 Reconcile | lane | For `create_unknown`: listing only. At D → **commit `pinned` before anything else** (including any delete); at another tip → `foreign`; absent → unchanged. | Capped backoff, indefinitely (ADR-2545 `create_unknown` precedent); the live pointer stays set, so removal stays blocked. Elapsed time is never proof. |
 | S5 Status | worker | Reads capture status; additive `prerequisite_closure` reports `pending` (covers `pending`, `invoked`, `create_unknown`, **and `pinned` with `absent_since` set**, the last with reason `pin_absence_unconfirmed`), `pinned` (only with `absent_since` null), `refused`, `lost`, `unsupported`. The mint gate accepts only `pinned`. | Read-only; the worker never triggers or waits on the lane, except #2969's bounded poll. |
 | S6 FINAL | worker, API | Worker mints only under the closure-mint permission (Worker behaviour). API: exact replay first; existing preconditions; one listing of the pin outside transactions behind a per-worker limiter; release transaction in FINAL lock order rechecks `pinned` and binding. | Pin absent: the absence candidate is recorded in **its own short transaction** (capture then closure lock; CAS on `pinned` and `absent_since IS NULL`), committed before the response and before any release transaction is opened; FINAL is denied with **409 `prerequisite_pin_missing`**; the pointer is kept until a confirming listing (see States). Pin present at `pin_tip` but an absence candidate is recorded: still denied until a later pass clears the candidate. Foreign: `foreign`, 409. Listing failure or **limiter denial**: 503 `prerequisite_pin_unavailable`; the journaled FINAL retries through `final_retry_unknown`. |
-| S7 Cleanup | lane | Only for rows whose capture is `expired` or `discarded` (rechecked under the capture lock). For `pinned`: listing; absent → `deleted`; at `pin_tip` → CAS delete, confirming listing, `deleted`; foreign → `foreign`, untouched. `create_unknown` is first resolved by S4 (persisting `pinned` before any delete). | An ambiguous delete (sent, no answer) leaves the row `pinned`; the next listing finding the ref absent ends it `deleted`. **Ceiling:** after the cleanup attempt ceiling, set `cleanup_exhausted_at`, keep the row `pinned` with its live pointer (removal stays blocked), surface `pin_cleanup_exhausted` to the owner and audit, and continue listings at the maximum backoff so a manual delete is eventually recorded. No timeout or label clears the pointer. |
+| S7 Cleanup | lane | Only for rows whose capture is `expired` or `discarded` (rechecked under the capture lock). For `pinned`: listing; absent → `deleted`; at `pin_tip` → CAS delete, confirming listing, `deleted`; foreign → `foreign`, untouched. `create_unknown` is first resolved by S4 (persisting `pinned` before any delete). | An ambiguous delete (sent, no answer) leaves the row `pinned`; the next listing finding the ref absent ends it `deleted`. **Ceiling:** after the cleanup attempt ceiling, set `cleanup_exhausted_at`, keep the row `pinned` with its live pointer (removal stays blocked), surface `pin_cleanup_exhausted` to the owner and audit, and continue listings at the maximum backoff so later observed ref absence is recorded under S7. This does not authorize an out-of-band delete or reset the delete-attempt ceiling. No timeout or label clears the pointer. |
 
 **Bounded, fair pass.** The `prerequisite_closure` sweeper pass is always registered (knob gates S0 only, never S1 to S7 on existing rows). Per pass: a whole-pass budget, a per-item timeout with a reserved tail for the outcome write, a per-lane scan limit and a total item cap (initial values follow the salvage pass's documented share of the tick, not the held cleanup pass's 30 s: **10 s pass budget, at most 5 items per pass, plus up to 5 s for the outcome write of the item in flight**, per the `run_salvage` registration comment in `api/cmd/server/main.go`; per-lane scan limit 10 as `heldCleanupScanLimit`; tuned from E6).
 
@@ -425,16 +425,19 @@ garbage collector, override endpoint or permission:
    repository identity. A changed/foreign binding is not permission to rebind,
    resend a create or reset attempts. Owner-visible/audit diagnostics must identify
    why removal remains blocked, without exposing credentials or raw forge errors.
-3. **Use the proved cleanup route.** Only after the capture is confirmed expired
-   or discarded may S7 clean a `pinned` row. If automatic deletes reached their
-   ceiling, a manual delete requires explicit authorization from that capture's
-   owner (or an already authorized custodian) and an operator already permitted to
-   write that forge repository. It is scoped to the exact recorded prerequisite ref
-   and expected tip, after a fresh same-tip listing, using compare-and-swap deletion.
-   A moved/foreign ref is left untouched. A timeout remains ambiguous; do not clear
-   database evidence. The existing later listing records `deleted` and clears the
-   pointer only under S7's rules. Pins of still-available archives are not capacity
-   reclamation targets, even if the hold settled by another route.
+3. **Use only the existing S7 cleanup route.** Only after the capture is confirmed
+   expired or discarded may S7 clean a `pinned` row. It rechecks capture state and
+   frozen binding, lists the exact ref, CAS-deletes only at its recorded expected
+   tip, and records absence before clearing the pointer. A moved/foreign ref is
+   left untouched; an ambiguous delete retains evidence for later listing. Once
+   automatic deletes reach their ceiling, keep the pin and live pointer, perform
+   only the scheduled listings, and escalate unresolved cleanup to a separate
+   maintainer decision. This runbook grants no manual forge-delete procedure,
+   owner/custodian-authorization shortcut, attempt reset or database override.
+   Repository-write access is not product authorization to dispose of a capture.
+   Pins of still-available archives are not capacity-reclamation targets, even if
+   the hold settled by another route. Indefinite retention/removal blocking remains
+   possible under O10; no eventual-cleanup promise is made.
 4. **Unknown is not operator disposal authority.** For `create_unknown`, first let
    S4 observe the expected tip and durably commit `pinned` before any deletion.
    An absent ref, expired capture, elapsed time, owner pressure or storage pressure
@@ -444,10 +447,10 @@ garbage collector, override endpoint or permission:
    path resolves it, retain it and escalate a separate maintainer contract decision;
    this runbook promises no override or eventual resolution.
 
-A broad owner-authorized history/privacy purge is a separate deliberate action
-under the accepted external-writer residual, not this capacity-recovery procedure.
-It may destroy archive restorability and does not itself erase server evidence or
-authorize clearing blockers. C1b must document this distinction and verify that
+An external history/privacy purge is outside this capacity-recovery procedure
+and remains subject to the accepted external-writer residual. This PRD grants no
+such out-of-band action. It may destroy archive restorability and does not itself
+erase server evidence or authorize clearing blockers. C1b must document this distinction and verify that
 knob-off processing, confirmed-pin cleanup, wrong-tip refusal and unresolved-row
 retention obey these same boundaries. C1a is unaffected by this clarification.
 
