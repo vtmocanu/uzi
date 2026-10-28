@@ -1015,3 +1015,44 @@ it("quiet dashboard polling refreshes account extension and expiry with one visi
   expect(visibleWaits()).toHaveLength(0);
   expect(row().textContent).not.toMatch(/waits on you|⚠|provider reported/);
 });
+
+it.each(["running", "awaiting_approval"] as const)("dashboard keeps %s quiet with expired or missing metadata until healthy poll", async status => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-10-28T12:00:00Z"));
+  const run = aRun({ status, health: "waiting_account_cooldown", account_cooldown_class: "rate_limit",
+    account_cooldown_eligible_at: "2026-10-28T11:59:59Z",
+    current_activity: { agent: "coder", agent_label: "Coder", tool: "Bash", detail: "retained cooldown activity", at: new Date().toISOString(), seq: 1 } });
+  mockApi.listRuns.mockResolvedValue({ runs: [run] });
+  renderDashboard();
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  for (const metadata of [
+    {},
+    { account_cooldown_class: undefined },
+    { account_cooldown_eligible_at: undefined },
+  ]) {
+    mockApi.listRuns.mockResolvedValue({ runs: [{ ...run, ...metadata }] });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    const row = screen.getByText("Live run row").closest("li")!;
+    expect(row.textContent).toContain("waiting");
+    expect(row.textContent).not.toMatch(/waiting for account cooldown|Coder/);
+    expect(row.querySelector(".animate-pulse")).toBeNull();
+    expect(screen.getByText("1 waiting to resume")).toBeTruthy();
+    expect(screen.queryByText("1 needs you")).toBeNull();
+    expect(screen.queryByText("1 running")).toBeNull();
+  }
+  mockApi.listRuns.mockResolvedValue({ runs: [{ ...run, health: "ok" }] });
+  await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+  expect(screen.getByText("Coder")).toBeTruthy();
+  expect(screen.getByText(status === "running" ? "1 running" : "1 needs you")).toBeTruthy();
+  expect(screen.queryByText("1 waiting to resume")).toBeNull();
+});
+
+it.each([false, true])("account cooldown suppresses retained activity and approval counts (revising=%s)", async is_revising => {
+  mockApi.listRuns.mockResolvedValue({ runs: [aRun({ status: "awaiting_approval", is_revising,
+    health: "waiting_account_cooldown", account_cooldown_class: "rate_limit", account_cooldown_eligible_at: "2099-01-01T00:00:37Z",
+    current_activity: { agent: "coder", agent_label: "Coder", tool: "Bash", detail: "retained cooldown activity", at: new Date().toISOString(), seq: 1 } })] });
+  renderDashboard();
+  await act(async () => { await Promise.resolve(); });
+  expect(screen.queryByText("Coder")).toBeNull();
+  expect(screen.queryByText("1 needs you")).toBeNull();
+});

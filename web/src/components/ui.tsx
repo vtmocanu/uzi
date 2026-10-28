@@ -624,10 +624,13 @@ export function StatusPill({ status: rawStatus, progress, health, recovery_wait_
   recovery_retry_not_before?: string | null;
 }) {
   const status = effectiveRunStatus({ status: rawStatus, recovery_wait_cause, recovery_retry_not_before });
-  const cfg = RUN_STATUS_TONES[status] ?? { tone: "neutral" as BadgeTone };
-  const label = RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
+  // Callers may already have projected live raw states to planning or revising.
+  const accountWait = health === "waiting_account_cooldown" &&
+    ["claimed", "running", "planning", "awaiting_approval", "revising"].includes(status);
+  const cfg = accountWait ? { tone: "info" as BadgeTone, pulse: false } :
+    RUN_STATUS_TONES[status] ?? { tone: "neutral" as BadgeTone };
+  const label = accountWait ? "waiting" : RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
   const showsProgress = status === "running" || status === "completion_checking" || status === "completion_reworking";
-  const accountWait = health === "waiting_account_cooldown";
   const pct = !accountWait && showsProgress && progress?.state === "percent" &&
     typeof progress.pct === "number" && Number.isFinite(progress.pct)
     ? Math.max(0, Math.min(100, Math.round(progress.pct))) : null;

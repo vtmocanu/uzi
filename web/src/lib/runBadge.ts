@@ -271,13 +271,16 @@ export function shadowSignal(
         status: string;
         is_planning?: boolean;
         is_revising?: boolean;
+        health?: HealthFlaggable["health"];
+        account_cooldown_class?: string | null;
+        account_cooldown_eligible_at?: string | null;
         mr_iid?: number | null;
         mr_state?: string | null;
       }
     | null
     | undefined,
 ): "live" | "attention" | null {
-  if (run == null) return null;
+  if (run == null || isAccountCooldownWaiting(run)) return null;
   const eff = effectiveRunStatus(run);
   if (eff === "claimed" || eff === "running" || eff === "planning") return "live";
   if (eff === "awaiting_approval" || eff === "revising") return "attention";
@@ -500,6 +503,13 @@ function futureEligibility(at: unknown, nowMs: number): at is string {
   return new Date(`${at.slice(0, 10)}T00:00:00Z`).toISOString().slice(0, 10) === at.slice(0, 10);
 }
 
+// Eligibility is an earliest time, not evidence of a new dispatch. Retain quiet
+// presentation until a fresh health result replaces the expected-wait state.
+export function isAccountCooldownWaiting(run: { status: string; health?: string }): boolean {
+  return run.health === "waiting_account_cooldown" &&
+    ["claimed", "running", "awaiting_approval"].includes(run.status);
+}
+
 // Only positive, current server evidence establishes this expected active wait.
 // Advice attached to an independent fault must never replace that fault.
 export function accountCooldownText(
@@ -508,7 +518,7 @@ export function accountCooldownText(
 ): string | null {
   const cls = run.account_cooldown_class;
   const at = run.account_cooldown_eligible_at;
-  if (run.health !== "waiting_account_cooldown" || !["claimed", "running", "awaiting_approval"].includes(run.status) ||
+  if (!isAccountCooldownWaiting(run) ||
       (cls !== "rate_limit" && cls !== "overload") || !futureEligibility(at, nowMs)) return null;
   return `waiting for account cooldown · ${cls} · earliest eligibility ${at}`;
 }
@@ -682,6 +692,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
   // `eff !== "revising"` guard is a no-op unless the run is revising).
   const flagged = healthBadge(run, nowMs, maintenanceReason);
   if (flagged && (eff !== "revising" || accountCooldownText(run, nowMs))) return flagged;
+  if (isAccountCooldownWaiting(run)) {
+    return { kind: "badge", label: "waiting", tone: "info", pulse: false };
+  }
   switch (eff) {
     case "queued":
       return { kind: "badge", label: "queued", tone: "queue", pulse: false };

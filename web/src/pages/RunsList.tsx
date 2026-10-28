@@ -27,6 +27,7 @@ import { RunIssueRef } from "../components/RunIssueRef";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import {
+  isAccountCooldownWaiting,
   effectiveRunStatus,
   firstInProgressMilestoneId,
   isStoppedRun,
@@ -326,7 +327,7 @@ export function RunRow({
   // current_activity DTO field; hidden when null or terminal, so a pre-feature run and a
   // finished run read exactly as before (D5). Untrusted fields render escaped.
   const activity = run.current_activity;
-  const showNow = activity != null && !isTerminalRun(run.status);
+  const showNow = activity != null && !isAccountCooldownWaiting(run) && !isTerminalRun(run.status);
   const age = showNow && activity ? activityAge(activity.at, now) : "";
   const nowMilestone = firstInProgressMilestoneId(run);
   // Issue #256 M3: a live, per-state duration token ("running 1h 30m", "ran 42m", …);

@@ -1040,6 +1040,20 @@ describe("quiet account cooldown metadata", () => {
   });
   afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
+  it("quiet metadata failure keeps last good run without a foreground banner through recovery", async () => {
+    const get = vi.spyOn(api, "getRun").mockResolvedValue({ run: held() });
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await flush();
+    get.mockRejectedValueOnce(new ApiError(503, "temporary metadata outage"));
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(result.current.run?.id).toBe("run-1");
+    expect(result.current.error).toBe("");
+    expect(result.current.pauseOriginReady).toBe(false);
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(get).toHaveBeenCalledTimes(3);
+    expect(result.current.error).toBe("");
+  });
+
   it("refreshes quiet extension/class changes and lease expiry with no activity or new operations", async () => {
     const get = vi.spyOn(api, "getRun").mockResolvedValue({ run: held() });
     const { result, unmount } = renderHook(() => useRunStream("run-1"));

@@ -58,3 +58,16 @@ export function deriveMockProgress(run: Run): RunProgress | null {
   }
   return percent;
 }
+
+// The API strips owner-only cooldown evidence before deriving a foreign DTO's progress.
+export function foreignCooldownRun(run: Run): Run {
+  const projected = { ...run };
+  delete projected.account_cooldown_class;
+  delete projected.account_cooldown_eligible_at;
+  projected.health_reason = null;
+  if (projected.health === "waiting_account_cooldown") {
+    projected.health = "ok";
+    projected.progress = deriveMockProgress(projected);
+  }
+  return projected;
+}

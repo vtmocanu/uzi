@@ -3,7 +3,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import type { Run } from "../lib/apiTypes";
-import { accountCooldownText, healthBadge, runBadge } from "../lib/runBadge";
+import { accountCooldownText, healthBadge, runBadge, shadowSignal } from "../lib/runBadge";
 import { RunHealthBadge } from "./RunHealthBadge";
 import { RunProgressCell } from "./RunProgressCell";
 import { RunProgressCard } from "./RunProgressCard";
@@ -44,7 +44,7 @@ it.each([
   { account_cooldown_eligible_at: "2026-10-28T12:00:00Z" }, { account_cooldown_eligible_at: "not a date" },
   { account_cooldown_eligible_at: "2026-10-28" }, { account_cooldown_eligible_at: {} },
   { status: "queued" }, { status: "completed" }, { status: "paused" }, { health: "ok" },
-] as Partial<Run>[])("unknown, expired, malformed and stale metadata establishes no wait: %j", over => {
+] as Partial<Run>[])("unknown, expired, malformed and stale metadata establishes no detailed wait: %j", over => {
   const r = waiting(over);
   expect(accountCooldownText(r, now)).toBeNull();
   const { container } = render(<><HealthFlag run={r} /><RunHealthBadge run={r} nowMs={now} /></>);
@@ -81,4 +81,35 @@ it("foreign progress with redacted fields makes no false cooldown or human-actio
   const { container } = render(<MemoryRouter><RunHealthBadge run={r} nowMs={now} /><RunProgressCell run={r} now={now} /><RunProgressCard run={r} /></MemoryRouter>);
   expect(container.textContent).toContain("1 of 2 reported complete");
   expect(container.textContent).not.toMatch(/waits on you|waiting for account cooldown|⚠|%/);
+});
+
+
+it.each(["claimed", "running", "awaiting_approval"] as const)("incomplete or expired metadata keeps %s quiet until fresh healthy evidence", status => {
+  for (const metadata of [
+    { account_cooldown_eligible_at: "2026-10-28T11:59:59Z" },
+    { account_cooldown_class: undefined },
+    { account_cooldown_eligible_at: undefined },
+  ]) {
+    const run = waiting({ status, ...metadata });
+    expect(accountCooldownText(run, now)).toBeNull();
+    expect(runBadge(run as never, now)).toEqual({ kind: "badge", label: "waiting", tone: "info", pulse: false });
+    expect(shadowSignal(run)).toBeNull();
+    const healthy = { ...run, health: "ok" as const };
+    expect(runBadge(healthy as never, now)).not.toMatchObject({ label: "waiting" });
+    expect(shadowSignal(healthy)).toBe(status === "awaiting_approval" ? "attention" : "live");
+  }
+});
+
+it.each(["queued", "paused", "completed", "failed"] as const)("stale waiting health leaves %s presentation unchanged", status => {
+  const run = waiting({ status });
+  expect(runBadge(run as never, now)).toEqual(runBadge({ ...run, health: "ok" } as never, now));
+  expect(shadowSignal(run)).toBe(shadowSignal({ ...run, health: "ok" }));
+});
+
+it.each([false, true])("account wait suppresses shared live and attention signals (revising=%s)", is_revising => {
+  const run = waiting({ status: "awaiting_approval", is_revising, account_cooldown_eligible_at: "2099-01-01T00:00:37Z" });
+  expect(shadowSignal(run)).toBeNull();
+  expect(shadowSignal({ ...run, health: "ok" })).toBe("attention");
+  expect(shadowSignal({ ...run, account_cooldown_class: undefined })).toBeNull();
+  expect(shadowSignal({ ...run, status: "running", is_revising: false })).toBeNull();
 });

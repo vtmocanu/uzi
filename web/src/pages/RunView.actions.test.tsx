@@ -493,3 +493,19 @@ it.each(["cancel", "reject_plan", "revise_plan"] as const)("account cooldown pre
   if (kind !== "cancel") expect(submit.mock.calls[0][5]).toBe(2);
   expect(api.resumeRun).not.toHaveBeenCalled();
 });
+
+it.each([false, true])("account cooldown leaves approval usable and detail chrome quiet (revising=%s)", async is_revising => {
+  runOverrides = { status: "awaiting_approval", is_revising, health: "waiting_account_cooldown",
+    account_cooldown_class: "rate_limit", account_cooldown_eligible_at: "2099-01-01T00:00:37Z" };
+  mount("gate");
+  expect(document.querySelector("[data-live], [data-attention]")).toBeNull();
+  if (!is_revising) {
+    await act(async () => click(/Approve plan/));
+    expect(submit.mock.calls[0][0]).toBe("approve_plan");
+  } else {
+    click("Request changes");
+    fireEvent.change(screen.getByPlaceholderText(/sent to the planning session/), { target: { value: "Replacement revision" } });
+    await act(async () => click("Send & revise"));
+    expect(submit.mock.calls[0][0]).toBe("revise_plan");
+  }
+});

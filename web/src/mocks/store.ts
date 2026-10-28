@@ -6,7 +6,7 @@
 
 import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
 import { seedUnifiedProgress } from "./data/unifiedProgress";
-import { deriveMockProgress } from "./runProgress";
+import { deriveMockProgress, foreignCooldownRun } from "./runProgress";
 import { mockScenario } from "./mockScenario";
 import {
   mockAdmin,
@@ -185,6 +185,8 @@ function seed(): MockState {
     for (const id of ["run-live", "run-mira-embed", "run-stalled"]) {
       const r = runs.get(id);
       if (!r) continue;
+      r.harness = "codex";
+      r.model = null;
       r.health = id === "run-stalled" ? "slow" : "waiting_account_cooldown";
       r.account_cooldown_class = id === "run-live" ? "rate_limit" : "overload";
       r.account_cooldown_eligible_at = new Date(Date.now() + 300_037).toISOString();
@@ -214,7 +216,8 @@ function seed(): MockState {
     for (const board of boards.values()) for (const card of board.cards) {
       const r = card.latest_run && runs.get(card.latest_run.id);
       if (!r?.account_cooldown_class || !card.latest_run) continue;
-      card.latest_run = { ...card.latest_run, health: r.health, health_reason: null,
+      const projected = card.latest_run.is_mine ? r : foreignCooldownRun(r);
+      card.latest_run = { ...card.latest_run, health: projected.health, health_reason: null,
         ...(card.latest_run.is_mine ? { account_cooldown_class: r.account_cooldown_class,
           account_cooldown_eligible_at: r.account_cooldown_eligible_at } : {}) };
     }
@@ -376,6 +379,11 @@ function syncCards(runId: string, patch: Partial<Run>): void {
         if (key in patch) (merged as Record<string, unknown>)[key] = patch[key];
       }
       if (!merged.is_mine) {
+        const run = state.runs.get(runId);
+        if (run) {
+          const projected = foreignCooldownRun(run);
+          merged.health = projected.health;
+        }
         delete merged.account_cooldown_class;
         delete merged.account_cooldown_eligible_at;
         delete merged.codex_admission_class;

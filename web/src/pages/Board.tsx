@@ -25,6 +25,7 @@ import { startRunWithCredential } from "../lib/startRun";
 import { INHERIT_SELECTION, type CredentialSelection } from "../lib/credentialOverride";
 import { bothHarnessesUsable, INHERIT_HARNESS, type HarnessSelection } from "../lib/harnessSelection";
 import {
+  isAccountCooldownWaiting,
   effectiveRunStatus,
   hasActiveRun,
   isAwaitingApproval,
@@ -569,7 +570,7 @@ export function Board() {
       // effectiveRunStatus returns "revising" for it (is_revising true), so
       // isAwaitingApproval reads false and it drops out of the attention strip. The next
       // `plan` flips is_revising false server-side and it returns to this bucket.
-      setAwaitingRuns(runs.filter((r) => isAwaitingApproval(effectiveRunStatus(r))));
+      setAwaitingRuns(runs.filter((r) => !isAccountCooldownWaiting(r) && isAwaitingApproval(effectiveRunStatus(r))));
       setQuestionRuns(runs.filter((r) => isAwaitingInput(r.status)));
       setFollowupRuns(runs.filter((r) => isAwaitingFollowup(r.status)));
       setStuckRuns(

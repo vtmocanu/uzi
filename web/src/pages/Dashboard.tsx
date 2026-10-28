@@ -10,6 +10,7 @@ import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, type AdminUsage, type RunSummaryItem, type RunStatus, type SelfUsage, type Worker } from "../lib/api";
 import { hasAnthropicToken } from "../lib/hasToken";
 import {
+  isAccountCooldownWaiting,
   effectiveRunStatus,
   firstInProgressMilestoneId,
   milestoneBadge,
@@ -252,7 +253,7 @@ export function Dashboard() {
   const active = data?.runs.filter((r) => !isTerminalRun(r.status)) ?? [];
   const activeCounts = { running: 0, needsYou: 0, queued: 0, waiting: 0 };
   for (const run of active) {
-    const bucket = activeRunBuckets[run.status];
+    const bucket = isAccountCooldownWaiting(run) ? "waiting" : activeRunBuckets[run.status];
     if (bucket) activeCounts[bucket]++;
   }
   // PRD #1349 M6 (D8/D10): recovery_wait_count, derived CLIENT-SIDE from the runs the
@@ -445,6 +446,7 @@ export function Dashboard() {
               // states must not turn that history into a pulsing live-work indicator.
               const showNow =
                 activity != null &&
+                !isAccountCooldownWaiting(r) &&
                 !isTerminalRun(r.status) &&
                 r.status !== "paused" &&
                 r.status !== "limit_wait" &&

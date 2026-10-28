@@ -40,6 +40,7 @@ import {
   cx,
 } from "../components/ui";
 import { ChatIcon } from "../components/icons";
+import { accountCooldownText } from "../lib/runBadge";
 import { stripUnsafeChars } from "../lib/safeText";
 
 // WorkerOfflineBanner (Decision 15): honest liveness, derived from the existing
@@ -60,7 +61,7 @@ function WorkerOfflineBanner() {
 // terminal run is an "ended" conversation, not a "completed"/"failed" job.
 function ChatStatusBadge({ status, run }: { status: string; run?: Run | null }) {
   if (isTerminalRun(status)) return <Badge tone="neutral">ended</Badge>;
-  return <StatusPill status={status} recovery_wait_cause={run?.recovery_wait_cause} recovery_retry_not_before={run?.recovery_retry_not_before} />;
+  return <StatusPill health={run?.health} status={status} recovery_wait_cause={run?.recovery_wait_cause} recovery_retry_not_before={run?.recovery_retry_not_before} />;
 }
 
 // ── Conversation list (/chat) ────────────────────────────────────────────────
@@ -305,6 +306,7 @@ export function ChatConversation() {
   // agent-written, and the fallback is the forge ISSUE title. One strip covers both. This
   // site is the one the audit's enumeration missed — it looked for judge-DTO consumers, and
   // a run title reaches a fourth page through this fallback.
+  const cooldown = run ? accountCooldownText(run, Date.now()) : null;
   const title = stripUnsafeChars(meta ? conversationTitle(meta) : (run?.issue_title?.trim() || "Untitled chat"));
 
   return (
@@ -317,6 +319,7 @@ export function ChatConversation() {
             <div className="flex flex-wrap items-center gap-x-2">
               <h1 className="truncate text-xl font-semibold tracking-tight">{title}</h1>
               <ChatStatusBadge status={status} run={run} />
+              {cooldown && <Badge tone="info" title={cooldown} wrap>{cooldown}</Badge>}
               {!ended && (
                 <span
                   title={connected ? "Live" : "Reconnecting…"}

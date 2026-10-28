@@ -88,7 +88,7 @@ export function useRunStream(runId: string) {
     publishReadiness();
   }, [publishReadiness]);
 
-  const refreshRun = useCallback(async () => {
+  const readRun = useCallback(async (quiet: boolean) => {
     if (runId !== activeRunIdRef.current) return;
     const gen = genRef.current;
     const ticket = ++runReadTicketRef.current;
@@ -117,9 +117,11 @@ export function useRunStream(runId: string) {
         evidenceRef.current.metadata = false;
         publishReadiness();
       }
-      if (e instanceof ApiError) setError(e.message);
+      if (!quiet && e instanceof ApiError) setError(e.message);
     }
   }, [runId, publishReadiness]);
+
+  const refreshRun = useCallback(() => readRun(false), [readRun]);
 
   // Eligibility and source leases can change without a reason-changing WS frame.
   // Reuse the visible-view cadence for metadata only, one outstanding quiet read;
@@ -128,7 +130,7 @@ export function useRunStream(runId: string) {
   usePollWhileVisible(() => {
     if (run?.id !== runId || !["claimed", "running", "awaiting_approval"].includes(run.status)) return;
     if (quietReadRef.current) return quietReadRef.current;
-    const pending = refreshRun();
+    const pending = readRun(true);
     quietReadRef.current = pending;
     return pending.finally(() => {
       if (quietReadRef.current === pending) quietReadRef.current = null;

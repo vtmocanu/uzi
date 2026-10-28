@@ -2412,6 +2412,32 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
   });
 
+  it.each([
+    { account_cooldown_class: "rate_limit", account_cooldown_eligible_at: "2026-01-01T00:00:00Z" },
+    { account_cooldown_class: undefined, account_cooldown_eligible_at: "2099-01-01T00:00:00Z" },
+    { account_cooldown_class: "rate_limit", account_cooldown_eligible_at: undefined },
+  ] as const)("board keeps incomplete cooldown out of attention until healthy poll: %j", async metadata => {
+    vi.useFakeTimers();
+    const run = { ...aRun({ id: "wait", status: "awaiting_approval", health: "waiting_account_cooldown", issue_iid: 7 }), ...metadata };
+    mockApi.listRuns.mockResolvedValue({ runs: [run] });
+    renderBoard();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(mockApi.listRuns).toHaveBeenCalled();
+    expect(screen.queryByText("1 run needs approval")).toBeNull();
+    mockApi.listRuns.mockResolvedValue({ runs: [{ ...run, health: "ok" }] });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(screen.getByText("1 run needs approval")).toBeTruthy();
+  });
+
+  it.each([false, true])("account cooldown excludes approval attention (revising=%s)", async is_revising => {
+    mockApi.listRuns.mockResolvedValue({ runs: [{ ...aRun({ id: "wait", status: "awaiting_approval", is_revising,
+      health: "waiting_account_cooldown", issue_iid: 7 }), account_cooldown_class: "rate_limit",
+      account_cooldown_eligible_at: "2099-01-01T00:00:37Z" }] });
+    renderBoard();
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.queryByText("1 run needs approval")).toBeNull();
+  });
+
   it("quiet board refresh batches cards and observes cooldown extension and expiry", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-10-28T12:00:00Z"));
@@ -3453,4 +3479,32 @@ describe("IssueCard rejection presentation", () => {
     renderCard({ latest_run: { id: "r-rejection", status: "failed", fail_origin, stop_kind, health: "ok", is_mine: true } as LatestRun });
     expect(screen.getByText(label).classList.contains(tone === "neutral" ? "text-neutral-fg" : "text-danger")).toBe(true);
   });
+});
+
+it.each([
+  { account_cooldown_class: "rate_limit", account_cooldown_eligible_at: "2026-01-01T00:00:00Z" },
+  { account_cooldown_class: undefined, account_cooldown_eligible_at: "2099-01-01T00:00:00Z" },
+  { account_cooldown_class: "rate_limit", account_cooldown_eligible_at: undefined },
+] as const)("card keeps incomplete cooldown quiet and restores healthy attention: %j", metadata => {
+  const latest_run: LatestRun = { ...aCard().latest_run!, id: "wait", status: "awaiting_approval",
+    health: "waiting_account_cooldown", ...metadata };
+  const { container, unmount } = renderCard({ latest_run });
+  expect(screen.getByText("waiting")).toBeTruthy();
+  expect(container.textContent).not.toContain("waiting for account cooldown");
+  expect(container.querySelector("[data-live], [data-attention], .animate-pulse, .ring-2")).toBeNull();
+  unmount();
+  const healthy = renderCard({ latest_run: { ...latest_run, health: "ok" } });
+  expect(healthy.container.querySelector("[data-attention]")).not.toBeNull();
+  expect(healthy.container.querySelector(".ring-2")).not.toBeNull();
+});
+
+it.each([false, true])("account cooldown card keeps quiet chrome (revising=%s)", is_revising => {
+  const { container } = renderCard({ latest_run: {
+    ...aCard().latest_run!, id: "wait", status: "awaiting_approval", is_revising,
+    health: "waiting_account_cooldown", account_cooldown_class: "rate_limit",
+    account_cooldown_eligible_at: "2099-01-01T00:00:37Z",
+  } });
+  expect(container.textContent).toContain("waiting for account cooldown");
+  expect(container.querySelector("[data-live], [data-attention], .animate-pulse")).toBeNull();
+  expect(container.querySelector(".ring-2")).toBeNull();
 });

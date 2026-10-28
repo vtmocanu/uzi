@@ -7,6 +7,7 @@ import { TokenPicker } from "../../components/TokenPicker";
 import { HarnessPicker } from "../../components/HarnessPicker";
 import {
   canOpenRunView,
+  isAccountCooldownWaiting,
   effectiveRunStatus,
   needsHumanAttention,
   retryHint,
@@ -240,7 +241,7 @@ export function IssueCard({
   // loud attention ring. Such a run keeps status === "awaiting_approval" server-side, but
   // effectiveRunStatus returns "revising" for it, so needsHumanAttention reads false. Its
   // badge (runBadge → effectiveRunStatus) already reads "revising" in the calm info tone.
-  const loud = needsHumanAttention(effectiveRunStatus(run ?? { status: "" }));
+  const loud = !(run && isAccountCooldownWaiting(run)) && needsHumanAttention(effectiveRunStatus(run ?? { status: "" }));
   // The MR/PR link (PRD #65 D8): prefer the forge-supplied URL the worker persisted
   // (the forge's own canonical URL), guarded through isHttpsUrl by preferForgeUrl
   // before it becomes an anchor. A null (rows created before it landed) falls back to a
