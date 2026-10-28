@@ -308,6 +308,10 @@ func TestRecoveryStorageUploadRefusalHealthLiveDB(t *testing.T) {
 		e.mustExec("UPDATE recovery_custody_holds SET state='open',released_at=NULL,live_worker_id=$2,live_run_id=$3 WHERE id=$1", e.holdID, e.worker.ID, e.run)
 	})
 	// Admit the same manifest under a higher ceiling; inspect BEFORE the reader yields bytes.
+	previous := h
+	h = e.handler()
+	h.cfg = previous.cfg
+	h.settings = previous.settings
 	h.cfg.RecoveryReadyPayloadPerOwner = 1000
 	h.recoverySvc = e.service(h.recoveryLimits())
 	t.Run("admitted retry clears before success", func(t *testing.T) {
