@@ -669,7 +669,7 @@ for (const variant of m1Cases) {
       assert.deepEqual(rig.boundaries, [], "negative capture never requests admission");
       assert.equal(rig.processSpawns(), 0);
       assert.deepEqual(rig.disposeBoundaries, ["terminal"]);
-      assert.equal(rig.registry.state(), "disposed");
+      assert.equal(rig.registry.state(), "poisoned", "unproved cleanup cannot claim a disposed epoch");
     }
     assert.equal(settlements, shouldSettle ? 1 : 0);
     if (shouldSettle) {
