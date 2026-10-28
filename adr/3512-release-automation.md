@@ -12,13 +12,17 @@ installation or shared build cache. Installation tokens request only
 
 The RC App may bypass main review and create RC tags. The stable App may create
 stable tags only, after the `release-stable` Environment reviewer approves.
-Both Environments admit only main. A dispatcher allowlist and input checks run
-before preparation and again before minting. Prepare and push reject run attempts
-above one; watch recovery rechecks the dispatcher and exact tag. Stable age is
+Both Environments admit only main. Manual dispatch repeats its dispatcher
+allowlist before preparation and minting; schedule uses event, repository, ref
+and enablement checks. Input checks apply to both routes. Prepare and push reject
+run attempts above one. Watch recovery rechecks the exact tag for both routes
+and the dispatcher for manual runs. Stable age is
 measured from the original run's `created_at`, with a 24-hour bound checked after
 approval and immediately before the only push attempt. The bundle is retained
 for one day for inspection; watch/report recovery reads the existing tag and
-stored outputs without preparing or pushing again. Agents never dispatch stable or approve
+stored outputs without preparing or pushing again. Each watch rerun starts its
+own bounded recovery operation; retry budgets never replenish within an operation.
+Agents never dispatch stable or approve
 the stable Environment. GitHub cannot distinguish a human from an agent using
 the same credential; this behavioral boundary remains explicit.
 
@@ -39,7 +43,7 @@ The full content classifier still runs during preparation.
 
 ```mermaid
 flowchart LR
-  A[Authorize dispatch] --> B[Prepare without App key]
+  A[Authorize release route] --> B[Prepare without App key]
   B --> C[Environment and isolated atomic push]
   C --> D[Watch and verify exact tag]
   A --> E[Always report]
@@ -89,7 +93,7 @@ flowchart LR
 
 ## Stages and limits
 
-3e-1 exposes dispatch only. Tip selection has 120 minutes plus 10 minutes for
+3e-1 introduced manual dispatch. Manual tip selection has 120 minutes plus 10 minutes for
 cutting; publication watching retains its 60-minute bound, within a 120-minute
 post-push recovery allowance and enclosing job timeouts. No morning cutoff
 applies to dispatch. A single allowlisted infrastructure rerun of pre-cut main
@@ -106,9 +110,44 @@ complete. Pre-cut CI retries already record steps, attempt and result.
 Publication/verification timestamps are recorded without claiming deployment
 health. Runner-slot and critical-path impact remain unmeasured until live use.
 
-3e-2 adds scheduling only after a proven live RC: Europe/Bucharest, target about
-05:00, provisional 06:00 pre-push cutoff. No schedule is active in 3e-1. All
-routes share a non-cancelling queue, bounded by GitHub's 100 pending runs. A
+3e-2 adds opt-in scheduling after the proven live RC. Cron `47 4 * * *` uses
+GitHub's native `timezone: Europe/Bucharest`, targeting a cut near 05:00 after
+the local maintenance window ([schedule syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onschedule)).
+Only exact `RELEASE_NIGHTLY_ENABLED=true` enables nightly attempts; unset/false
+is a reported no-op. Activation requires the user's decision. Enablement is
+rechecked at job boundaries; pausing may stop a not-yet-pushed attempt there,
+possibly red with `nightly-disabled`. To stop an in-flight run immediately,
+cancel it explicitly. Recovery of a pushed tag and manual dispatch are unaffected.
+Schedule authorization
+pins repository, main ref, event and original run metadata, with canonical RC
+inputs only. Manual dispatch keeps the actor allowlist and input checks.
+Stable remains manual.
+
+Nightly eligibility comes only from `release-cut.sh --plan`: a non-metadata
+shipping change plus releasable notes. A no-op stops before CI waiting, cutting
+or artifact upload. Blocked plans are not converted into no-ops; manual empty
+respins retain the cutter's rules. The provisional cutoff is strictly before
+08:00 on the original run creation's Bucharest date. Tip waiting ends by 07:50,
+reserving a provisional fixed 600 seconds without resetting on tip changes.
+This is the existing cutter timeout, not a measured cut duration; it is an
+approved rollout deviation from D6 until timing evidence supports adjustment.
+The scheduled wait uses all remaining time until 07:50, rather than the manual
+7200-second limit. At a 04:47 start this is 183 minutes of eligible tip polling
+under the account's 20-job cap. The prepare ceiling is 210 minutes: 183 for
+waiting, ten for cutting and 17 for setup/overhead. Manual wait and cut budgets
+remain unchanged; only their job ceiling rises. Push/watch ceilings remain
+15/125 minutes. Exact-head CI impact and live contention remain unmeasured.
+The isolated push job independently requires the enable flag and checks the
+window before minting, then recomputes the window immediately before pushing.
+Both inline checks require numeric epochs, a +0200/+0300 Bucharest offset and
+a fail-closed comparison. Original creation time permits at most 60 seconds of
+runner clock skew; the 08:00 cutoff itself has no grace period.
+An expired window records `missed-target` and no attempted push. A queued run
+cannot acquire a new window on the following date. Manual budgets are unchanged.
+After tagging, bounded recovery ignores the cutoff and pause flag. Verification
+recorded after 09:00 is marked late without changing verified success or opening
+an extra incident. No clock-driven recovery cancellation or D10 journal is added.
+All routes share a non-cancelling queue, bounded by GitHub's 100 pending runs. A
 pending stable approval can delay RC work. A run cancelled before starting
 cannot produce its own report; its Actions status remains the evidence.
 

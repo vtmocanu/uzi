@@ -172,6 +172,12 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if reason := codexAdmissionLineAt(r, now); reason != "" {
 		rows = append(rows, []string{"CODEX_ADMISSION", reason})
 	}
+	// RESERVE (PRD #3522): the weekly usage reserve's visible reason on a queued run it holds
+	// ("weekly usage reserve: 72% >= 70%", or "... weekly usage unknown"), emit-only-when-set. The
+	// text is server-built from numbers, but it rides a persisted column, so it is sanitized.
+	if r.ReserveHoldReason != nil && *r.ReserveHoldReason != "" {
+		rows = append(rows, []string{"RESERVE", sanitizeTTY(*r.ReserveHoldReason)})
+	}
 	if r.FailureReason != nil && *r.FailureReason != "" {
 		rows = append(rows, []string{"FAILURE_REASON", sanitizeTTY(*r.FailureReason)})
 	}
@@ -195,6 +201,32 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	}
 	if len(r.IgnoredInferredCapabilities) > 0 {
 		rows = append(rows, []string{"IGNORED_INFERRED_CAPABILITIES", sanitizeTTY(strings.Join(r.IgnoredInferredCapabilities, ","))})
+	}
+	if r.CapabilityProvenance != nil {
+		if len(r.CapabilityProvenance.Capabilities) > 0 {
+			if !r.CapabilityProvenance.HintsKnown {
+				rows = append(rows, []string{"CAPABILITY_PROVENANCE", "repo-hint history unknown"})
+			}
+			if !r.CapabilityProvenance.InferenceKnown {
+				rows = append(rows, []string{"CAPABILITY_PROVENANCE", "inference evidence unknown"})
+			}
+		}
+		for _, item := range r.CapabilityProvenance.Capabilities {
+			status := "required"
+			if !item.Required {
+				status = "not currently required"
+			}
+			if item.InferenceIgnored {
+				status += "; inference ignored"
+			}
+			rows = append(rows, []string{"CAPABILITY_SOURCE", sanitizeTTY(item.Capability + ": " + strings.Join(item.Sources, "+") + "; " + status)})
+			for _, trigger := range item.Triggers {
+				rows = append(rows, []string{"CAPABILITY_TRIGGER", sanitizeTTY(item.Capability + ": " + trigger.Reason + ": " + trigger.Path)})
+			}
+			if item.Truncated {
+				rows = append(rows, []string{"CAPABILITY_TRIGGER", sanitizeTTY(item.Capability + ": additional or invalid trigger paths omitted")})
+			}
+		}
 	}
 	if len(r.RequiredTools) > 0 {
 		rows = append(rows, []string{"REQUIRED_TOOLS", sanitizeTTY(strings.Join(r.RequiredTools, ","))})
@@ -540,6 +572,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, credentialSwitchAction(r))
 	case holdBaseAttestation:
 		clauses = append(clauses, baseAttestationAction(r))
+	case holdWeeklyReserve:
+		clauses = append(clauses, weeklyReserveAction(r))
 	}
 	return []string{"HOLD", strings.Join(clauses, " · ")}
 }
@@ -562,9 +596,18 @@ func holdReasonLabel(reason string) string {
 		return "credential switch unsettled"
 	case holdBaseAttestation:
 		return "base not attested"
+	case holdWeeklyReserve:
+		return "weekly usage reserve"
 	default:
 		return cellText(reason)
 	}
+}
+
+// weeklyReserveAction is the owner's next step for a weekly_reserve hold (PRD #3522): the run resumes
+// by itself when usage falls below the threshold, and `uzi run resume` overrides the reserve until the
+// next weekly reset.
+func weeklyReserveAction(r apitypes.RunDTO) string {
+	return "resumes when usage drops below the threshold; override: uzi run resume " + cellText(r.ID)
 }
 
 // isBaseAttestationHold reports whether r is held because its kept work carries no
@@ -639,6 +682,8 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "held, credential switch unsettled; " + credentialSwitchAction(r)
 	case holdBaseAttestation:
 		return "held, its kept work is not attested against the planned base (--require-base); " + baseAttestationAction(r)
+	case holdWeeklyReserve:
+		return "held by the weekly usage reserve; " + weeklyReserveAction(r)
 	default:
 		return "paused (" + holdReasonLabel(reason) + ")"
 	}
@@ -800,14 +845,20 @@ func pauseBoundaryClause(r apitypes.RunDTO) string {
 	if r.PauseMode != nil && *r.PauseMode == "now" {
 		return "now"
 	}
+	// PRD #3522: the weekly usage reserve files the same milestone-boundary request; name the cause so
+	// the owner does not read it as their own pause.
+	suffix := ""
+	if r.PauseMode != nil && *r.PauseMode == "reserve" {
+		suffix = " (weekly usage reserve)"
+	}
 	if len(r.Milestones) == 0 {
-		return "after the current step"
+		return "after the current step" + suffix
 	}
 	n := 1
 	if r.PauseAfterCount != nil {
 		n = *r.PauseAfterCount + 1
 	}
-	return fmt.Sprintf("after M%d", n)
+	return fmt.Sprintf("after M%d", n) + suffix
 }
 
 // joinSheddingClauses joins clauses with " · ", DROPPING trailing clauses (from the right)
@@ -1994,11 +2045,16 @@ func steerStateWithRun(in apitypes.SteerInputDTO, runStatus string, recoveryCaus
 	// it lives on the fuller run-get notice and the web panel). issue #1088 widened the
 	// non-forge cause to any transient interruption (a transient empty turn or provider outage).
 	recoveringSuffix := " (run recovering from a transient interruption)"
-	if len(recoveryCause) > 0 && recoveryCause[0] == retainedRecoveryExhaustedCause {
+	if len(recoveryCause) > 0 && (recoveryCause[0] == retainedRecoveryExhaustedCause || recoveryCause[0] == "codex_idle_stall") {
 		recoveringSuffix = " (retained recovery; retry timing unknown)"
-		if run != nil && isRetainedRecovery(*run) {
-			recoveringSuffix = " (timed retry)"
-			if isRetainedRecoveryHold(*run) {
+		if recoveryCause[0] == "codex_idle_stall" {
+			recoveringSuffix = " (Codex idle stall; retry timing unknown)"
+		}
+		if run != nil && isRecoveryDecisionPark(*run) {
+			if run.RecoveryRetryNotBefore != nil {
+				recoveringSuffix = " (timed retry)"
+			}
+			if isRecoveryDecisionHold(*run) {
 				recoveringSuffix = " (owner Resume/Cancel)"
 			}
 		}
@@ -2187,7 +2243,7 @@ var parkedStatuses = map[string]bool{statusLimitWait: true, statusRecoveryWait: 
 // reported it; it is shown only while the run is parked. "" when the run is not parked or the
 // worker did not report it.
 func checkpointDurabilityLine(r apitypes.RunDTO) string {
-	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] || isOwnerRequiredWorkerHold(r) || isRetainedRecovery(r) {
+	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] || isOwnerRequiredWorkerHold(r) || isRecoveryDecisionPark(r) {
 		return ""
 	}
 	if *r.CheckpointContainsLatest {
@@ -2352,7 +2408,7 @@ func runStatusCell(r apitypes.RunListItemDTO) string {
 
 func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.FailOrigin, ""))
-	if isOwnerRequiredWorkerHold(r.RunDTO) || isRetainedRecovery(r.RunDTO) {
+	if isOwnerRequiredWorkerHold(r.RunDTO) || isRecoveryDecisionPark(r.RunDTO) {
 		return workerExhaustionLine(r.RunDTO)
 	}
 	if short := codexAccountActionShort(r.RunDTO); short != "" {
@@ -2671,10 +2727,15 @@ func pauseOriginLabel(r apitypes.RunDTO, personal bool, origin ...string) string
 	return runpresentation.PauseLabel(value, personal)
 }
 
-// queueReasonCell spells out maintenance; unknown future values render sanitized.
+// queueReasonCell renders a run's queue_reason. The two reasons today are spelled out:
+// "maintenance" (PRD #3454) and "weekly_reserve" (PRD #3522, the exact figures are on the
+// RESERVE row beside it); an unknown future value still renders, sanitized.
 func queueReasonCell(reason string) string {
-	if reason == "maintenance" {
+	switch reason {
+	case "maintenance":
 		return "maintenance (uzi is in maintenance mode)"
+	case "weekly_reserve":
+		return "weekly_reserve (held by your weekly usage reserve)"
 	}
 	return sanitizeTTY(reason)
 }

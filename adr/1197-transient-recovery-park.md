@@ -37,7 +37,9 @@ Retry backoff consumes the turn's wall budget. Genuine wall/idle timeout,
 typed pause and cancellation remain higher-priority outcomes; budget
 exhaustion is not itself a reason to enter recovery. The #3462 amendment below
 adds a narrow Codex zero-model-processing-evidence idle exception to this
-historical timeout precedence.
+historical timeout precedence. The [#3509 amendment](#amendment-2026-10-27-3509-bounded-codex-idle-stall-parks)
+qualifies that exception with typed zero-evidence/productive idle parks and an
+owner hold; #3466's human revision driver remains separate.
 
 ### Verified capture before a promotable park
 
@@ -390,7 +392,10 @@ approval reports cannot exit the park.
 The server uses a capped exponential backoff, from `RUN_RECOVERY_PARK_BASE`
 (default 1m) to `RUN_RECOVERY_MAX_PARK` (default 30m), with jitter. There is
 no lifetime park cap or terminal branch caused solely by repeated empty
-results. Normal running watchdogs and owner cancellation still apply.
+results. This uncapped policy does not apply to negotiated Codex idle stalls;
+see the [#3509 amendment](#amendment-2026-10-27-3509-bounded-codex-idle-stall-parks)
+for the cause-specific cap and fresh-wall cost. Normal running watchdogs and
+owner cancellation still apply.
 The exponent is bounded to avoid duration overflow.
 
 ## Consequences
@@ -444,7 +449,8 @@ during the retries still ends `cancelled`, and the promotion cadence is
 the same `recovery_wait` sweeper this ADR already describes. What differs
 is only the *entry* condition and a forge-only lifetime cap this cause
 adds on top (`RUN_FORGE_UNREACHABLE_MAX_PARKS`) — the empty-turn park
-above keeps its uncapped lifetime, unchanged. See
+above keeps its uncapped lifetime, except for negotiated Codex idle stalls under
+[#3509](#amendment-2026-10-27-3509-bounded-codex-idle-stall-parks). See
 [adr/1296-durable-run-recovery.md](1296-durable-run-recovery.md) (the
 2026-09-16 PRD #1392 amendment) for the matching custody-side exception —
 a generation that never adopted a source releases its hold without the
@@ -838,6 +844,10 @@ parse the new journal field, treats the journal as corrupt and fails closed.
 Scope: the `data_volume_full` task-run symptom is not fixed here (#3329).
 
 ## Amendment 2026-10-25, #3462: Codex zero-evidence idle enters ordinary recovery
+
+Historical decision: the [#3509 amendment](#amendment-2026-10-27-3509-bounded-codex-idle-stall-parks)
+below supersedes the untyped, productive-idle and uncapped-silence claims for
+negotiated lead idle recovery. The human revision and evidence boundaries remain.
 
 An eligible Codex lead turn that reaches the idle timeout with zero
 model-processing evidence now enters ordinary recovery. This is the narrow
@@ -1315,8 +1325,9 @@ exclusion, and the verified-capture-before-promotable-park prerequisite.
 It applies only to an authoritative exact-source journal durably confirmed as
 `budget_exhausted`. At #3495, other permanent blockers kept the terminal fallback
 with custody retained; #3527 below adds the owner-held `adoption_failed`
-exception. #3462's Codex zero-evidence idle still enters ordinary
-verified-capture recovery; this is not a broader retry for deterministic blockers.
+exception. #3462's Codex zero-evidence idle still requires verified capture; its
+typed park policy is superseded by #3509 below. This is not a broader retry for
+other deterministic blockers.
 #3181 remains out of scope. There is no linked PRD.
 
 ### Retry allowance and renewal
@@ -1398,6 +1409,122 @@ the terminal fallback. The existing worker-journal downgrade caution remains:
 older workers may reject or drop durable recovery fields. This amendment adds
 no operator watcher or lander policy, source-deletion authority or guarantee
 that the latest edits have an archive.
+
+## Amendment 2026-10-27, #3509: bounded Codex idle-stall parks
+
+Decision record (AI-synced 2026-10-27). For Codex idle stalls this amendment
+explicitly supersedes #3462's earlier claims:
+
+> "Ordinary recovery retains its uncapped lifetime park count"
+
+> "Repeated silence can recover until the run wall requires an owner park"
+
+Promotion resets the wall: silence was not bounded by one original
+wall window. Up to the configured cap of automatic parks may grant that many
+extra fresh wall windows (three by default), an accepted cost of recovery.
+Other causes, #3466 human revision recovery and retained-source policies keep
+their separate rules. No live-provider or live-rollout acceptance is claimed.
+
+### Classification and capture boundary
+
+Measured lead initial-planning, automatic-plan-revision and implementation idle
+trips use `codex_idle_stall` for both `zero_evidence` and `productive` stalls.
+“Productive” here means observed output before the stall, not a completed turn.
+Human revision productive idle keeps failure; zero-evidence silence stays inside
+the existing revision driver. Child turns, Claude, callback-based idle suppression
+and `idleOperation` remain unchanged. Cancel, pause, spent wall, vault lock,
+completion hold and first-trip precedence retain their existing boundaries in
+[the Codex executor](../agent/src/codex/codex-executor.ts).
+
+Before capture, typing requires negotiated `recovery_cause_codex_idle_stall_v1`
+and a positive, stampable claim generation. Session persistence, executor cleanup,
+dirty-work WIP, fetch-back and verified ref coverage precede an accepted park.
+The error has `providerOrigin: false`; it does not enter provider-outage counting.
+Acceptance requires returned `recovery_wait` and exact `codex_idle_stall` cause,
+including when the full worker ACK has no retry timestamp (held).
+Without negotiation, zero-evidence idle keeps legacy untyped recovery and
+productive idle keeps terminal failure. An advertised feature followed by HTTP
+400 or feature loss must not cause an untyped resend; source stays kept.
+See [the runner](../agent/src/runner.ts) and [client](../agent/src/client.ts).
+
+### Park-observed accounting and owner controls
+
+`RUN_CODEX_IDLE_STALL_MAX_PARKS` accepts integers `0..2147483646`, default **3**;
+malformed, negative or above-bound values fall back to 3. A qualifying park
+increments internal `idle_stall_park_count` with int32 saturation, or sets it to
+1 when `provider_progress_turns` reports positive completed turns in that flight.
+A count above the cap sets `recovery_retry_not_before` to NULL; otherwise the
+existing lifetime backoff and jitter produce a finite timestamp. Default parks
+1–3 are timed; park 4 is held. **0 holds on the first park**. The counter is not
+a public DTO field. See [recoverywait.go](../api/internal/workersvc/recoverywait.go)
+and [configuration parsing](../api/internal/config/config.go).
+
+This is a park-observed streak, not an exact unsuccessful-turn count. Output on
+the current stalled turn is not completed progress. Another flight's progress
+may be unseen if it does not end in an idle park, allowing an earlier hold.
+Reclaims, checkpointing and credential parks are neutral for the idle counter.
+Positive completed progress on the idle park can also clear a provider streak
+under its existing progress rules, without charging a provider outage.
+
+Owner Resume of either timed or held form queues it, clears retry, resets idle
+count to 0, sets `started_at = NULL` and `budget_paused_seconds = 0`, and revokes
+the Codex capability/advances its epoch. It preserves lifetime recovery backoff,
+provider streak, session, worker affinity, worker recovery episode and requeue
+baseline. Ordinary claim-release/custody semantics remain. Timer promotion
+preserves the idle count and grants a fresh wall window. Timed set-token promotion
+is permitted under existing credential behavior; a held set-token request returns
+a named 409 requiring Resume. Cancel remains available. These boundaries are in
+[Resume and promotion SQL](../api/internal/store/queries/runtime.sql) and
+[credential switching](../api/internal/workersvc/run_credential.go).
+
+UI/CLI finite timestamps, including due ones, mean timed recovery. NULL means
+owner-held without countdown; omitted public timing means unknown, distinct from
+the full worker ACK. Default wait and follow stop for held, continue through
+finite/unknown timing, and notice timed-to-held changes within the same
+status/cause. Explicit `--until` keeps its chosen stop set.
+
+### Session, source custody and admission limits
+
+Same-session continuity is conditional on a resolvable ordinary unwired
+non-Docker path. Retained-source and Docker recovery use fresh paths/threads.
+A rejected thread resume retains the `resume_lineage_break` warning and
+fresh-thread fallback. Interrupted-turn notes, reconciliation and snapshots
+do not prevent duplicate work or guarantee exactly-once external effects.
+
+An execution hold adds no custody-retention policy. Ordinary settlement and
+exact-generation ACK guards still govern release; uncaptured, guarded,
+unresolved and 507-refused sources remain retained. Open holds still count
+toward admission. The cap limits further generation minting for one run; it
+does not relieve custody quota, storage or admission pressure. #2969/#2544
+remain outside this change. See [custody admission in ClaimRun](../api/internal/store/queries/runtime.sql)
+and the runner's existing source-settlement boundaries.
+
+### Deployment and destructive Down
+
+Deploy the API to **all replicas before workers**. Mixed old/new API replicas
+and application rollback while idle holds exist are unsupported: the old
+token promoter can bypass the held NULL-retry shape. Held runs block worker
+image rollout under #3103's existing upgrade-blocker policy. No live rollout
+has been executed as evidence for this documentation unit.
+
+[00370_codex_idle_stall.sql](../api/internal/store/migrations/00370_codex_idle_stall.sql)
+adds a constant-default counter and `NOT VALID` checks in a short schema
+transaction; [00371_validate_codex_idle_stall.sql](../api/internal/store/migrations/00371_validate_codex_idle_stall.sql)
+validates in a separately committed migration. The brief ACCESS EXCLUSIVE DDL
+lock can wait; separate validation avoids holding that lock through the scan.
+Production table size, lock duration and row-update/WAL/replica costs are unmeasured.
+
+Down changes active idle parks (timed or held) to `failed` / `worker_lost`
+with the 00370 schema-rollback reason and finish/status/update timestamps, then
+clears historical idle cause/retry fields before restoring the old check and
+dropping the counter. It does not mutate custody. Counter history and idle-cause
+evidence are lost; assess backup/PITR needs first. This destructive downgrade
+failure is not normal cap policy or supported application rollback.
+
+The setting is wired into the Compose API environment (including literal 0)
+and `.env.example`. Helm uses existing
+`api.config.RUN_CODEX_IDLE_STALL_MAX_PARKS` → ConfigMap → API `envFrom`;
+no chart mechanism is added. See [operator configuration](../docs/configuration.md#codex-idle-stall-deployment-and-schema-rollback).
 
 ## Amendment 2026-10-27, #3527: owner-held retained adoption retry
 

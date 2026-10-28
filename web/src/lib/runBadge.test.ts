@@ -13,6 +13,8 @@ import {
   isAwaitingInput,
   isHealthFlaggableStatus,
   isMaintenanceQueued,
+  isReserveQueued,
+  reserveQueueText,
   maintenanceQueueText,
   isPlanningRun,
   isRevisingRun,
@@ -1473,6 +1475,42 @@ describe("maintenance queue reason", () => {
   });
 });
 
+describe("weekly usage reserve (PRD #3522)", () => {
+  it("a reserve-held queued run reads as a calm waiting pill carrying the reason as text", () => {
+    // The board's LatestRun does not carry reserve_hold_reason; the run view's Run does.
+    const held = { ...run({ status: "queued", queue_reason: "weekly_reserve", health: "waiting_worker" }), reserve_hold_reason: "weekly usage reserve: 85% >= 80%" };
+    expect(isReserveQueued(held)).toBe(true);
+    expect(isMaintenanceQueued(held)).toBe(false);
+    expect(runBadge(held, 0)).toMatchObject({
+      kind: "badge",
+      label: "waiting: weekly usage reserve: 85% >= 80%",
+      tone: "info",
+      pulse: false,
+    });
+  });
+  it("falls back to the plain hold name, and a non-queued run is never reserve-queued", () => {
+    expect(reserveQueueText(null)).toBe("waiting: weekly usage reserve");
+    expect(reserveQueueText("\u202e")).toBe("waiting: weekly usage reserve");
+    expect(isReserveQueued(run({ status: "running", queue_reason: "weekly_reserve" }))).toBe(false);
+  });
+  it("maintenance takes precedence over the reserve", () => {
+    const both = { ...run({ status: "queued", queue_reason: "maintenance" }), reserve_hold_reason: "weekly usage reserve: 85% >= 80%" };
+    const b = runBadge(both, 0);
+    expect(b.kind === "badge" && b.label).toBe("waiting: uzi is in maintenance mode");
+  });
+  it("a run paused by the reserve gets its own pause chip and park label", () => {
+    const r = run({ status: "paused", hold_reason: "weekly_reserve" });
+    const b = runBadge(r, 0);
+    expect(b).toMatchObject({ kind: "badge", label: "\u2016 paused: weekly usage reserve", tone: "info", pulse: false });
+    expect(b.kind === "badge" && b.title).toMatch(/resumes automatically when usage drops below the threshold/);
+    expect(b.kind === "badge" && b.title).toMatch(/overrides the reserve until the next weekly reset/);
+    expect(parkLabel(r)).toBe("paused: weekly usage reserve");
+    // positive control: an owner pause keeps the plain wording
+    expect(runBadge(run({ status: "paused", hold_reason: null }), 0)).toMatchObject({ label: "\u2016 paused" });
+    expect(parkLabel(run({ status: "paused", hold_reason: null }))).toBe("paused");
+  });
+});
+
 
 describe("Codex admission read-time projection", () => {
   const at = "2026-07-04T12:05:37.123Z";
@@ -1570,4 +1608,22 @@ it("omitted board cause and timing remain generic even if retry stamp is null", 
   expect(runBadge(run({ status: "recovery_wait" }), NOW)).toMatchObject({ label: "recovery wait" });
   expect(effectiveRunStatus({ status: "recovery_wait", recovery_retry_not_before: null })).toBe("recovery_wait");
   expect(effectiveRunStatus({ status: "recovery_wait", recovery_wait_cause: "retained_recovery_exhausted" })).toBe("retained_recovery_unknown");
+});
+
+it.each([
+  ["2099-01-01T00:00:00Z", "codex_idle_stall_retrying", "Codex idle stall retrying", false],
+  ["2020-01-01T00:00:00Z", "codex_idle_stall_retrying", "Codex idle stall retrying", false],
+  [null, "codex_idle_stall_held", "Codex idle stall needs decision", true],
+  [undefined, "codex_idle_stall_unknown", "Codex idle stall timing unknown", false],
+  ["invalid", "codex_idle_stall_unknown", "Codex idle stall timing unknown", false],
+] as const)("Codex idle stall normalizes timing %s honestly", (stamp, status, label, attention) => {
+  const input = { ...run({ status: "recovery_wait" }), recovery_wait_cause: "codex_idle_stall", recovery_retry_not_before: stamp };
+  expect(effectiveRunStatus(input)).toBe(status);
+  expect(parkLabel(input)).toBe(label);
+  expect(needsHumanAttention(status)).toBe(attention);
+  expect(runStatusTone(status, null)).toBe("warning");
+  const badge = runBadge(input, NOW);
+  expect(badge).toMatchObject({ label, tone: "warning", pulse: false });
+  expect(badge.kind === "badge" && badge.title).not.toMatch(/requeues|episode|Used:|Remaining:/);
+  expect(effectiveRunStatus({ ...input, status: "running" })).toBe("running");
 });

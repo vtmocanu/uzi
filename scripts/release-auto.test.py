@@ -2,6 +2,7 @@
 """Offline release dispatch/orchestration fixtures; no live API or publication."""
 import importlib.util
 import contextlib
+import datetime as dt
 import io
 import json
 import os
@@ -105,7 +106,7 @@ class OracleDiagnostics(unittest.TestCase):
 
 
 def context(**changes):
-    env = dict(GITHUB_ACTIONS='true', GITHUB_REPOSITORY='vtmocanu/uzi', RELEASE_REF='refs/heads/main',
+    env = dict(GITHUB_ACTIONS='true', GITHUB_REPOSITORY='vtmocanu/uzi', GITHUB_EVENT_NAME='workflow_dispatch', RELEASE_REF='refs/heads/main',
                RELEASE_ACTOR='maintainer', RELEASE_DISPATCHERS='other,maintainer third', RELEASE_KIND='rc',
                RELEASE_VERSION='', RELEASE_ABANDON='false', RELEASE_SUPERSEDE='', RELEASE_RC_TAG='',
                RELEASE_RC_SHA='', GITHUB_RUN_ID='123', GITHUB_SHA=H, GITHUB_RUN_ATTEMPT='1')
@@ -746,6 +747,263 @@ class Recovery(unittest.TestCase):
             self.assertNotIn('<unsafe>', text)
             self.assertNotIn('END_NOT_INCLUDED', text)
             self.assertIn('Truncated at 32 source bytes', text)
+
+
+class Nightly(unittest.TestCase):
+    created = '2026-10-27T02:47:00Z'
+
+    @staticmethod
+    def epoch(stamp):
+        return dt.datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp()
+
+    def env(self, **changes):
+        values = context(GITHUB_EVENT_NAME='schedule', RELEASE_ACTOR='scheduler', RELEASE_DISPATCHERS='',
+                         RELEASE_NIGHTLY_ENABLED='true', RUN_CREATED_AT=self.created)
+        values.update(changes)
+        return values
+
+    def release(self, selected=None, heads=None, now='2026-10-27T03:00:00Z'):
+        fixture = TipFixture(heads or [H])
+        cfg = auto.inputs(context())
+        cfg.update(scheduled=True, nightly_enabled=True, created_at=self.created)
+        api = Mock()
+        api.run.return_value = run()
+        def command(*args, **kwargs):
+            if args[:2] == ('bash', auto.CUTTER):
+                fixture.calls.append(args)
+                return rendered({**(selected or plan()), 'HEAD_SHA': fixture.head})
+            return fixture.command(*args, **kwargs)
+        release = auto.Release(cfg, command, api, lambda: fixture.now, fixture.sleep)
+        release.wall_time = lambda: self.epoch(now) + fixture.now
+        return release, fixture, api
+
+    def cli(self, env, mode='authorize', release=None, now='2026-10-27T03:00:00Z', metadata_error=False):
+        with tempfile.TemporaryDirectory() as directory:
+            output, note = Path(directory) / 'output', Path(directory) / 'summary'
+            values = {**env, 'RUNNER_TEMP': directory, 'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': str(note)}
+            if mode == 'authorize':
+                values.pop('RUN_CREATED_AT', None)
+            with patch.dict(os.environ, values, clear=True), patch.object(auto.sys, 'argv', ['release-auto.py', mode]), \
+                 patch.object(auto, 'created_at', return_value=self.created,
+                              side_effect=AssertionError('paused route queried run metadata') if metadata_error else None), \
+                 patch.object(auto.time, 'time', return_value=self.epoch(now)), \
+                 patch.object(auto, 'Release', return_value=release) as constructor, contextlib.redirect_stderr(io.StringIO()):
+                status = auto.main()
+            data = dict(line.split('=', 1) for line in output.read_text().splitlines())
+            return status, data, note.read_text(), constructor
+
+    def test_schedule_has_no_actor_allowlist_but_dispatch_still_does(self):
+        self.assertTrue(auto.inputs(self.env())['scheduled'])
+        with self.assertRaisesRegex(auto.Stop, 'dispatcher-not-allowed'):
+            auto.inputs(self.env(GITHUB_EVENT_NAME='workflow_dispatch'))
+        for event in ('push', 'pull_request', ''):
+            with self.subTest(event=event), self.assertRaisesRegex(auto.Stop, 'invalid-event'):
+                auto.inputs(context(GITHUB_EVENT_NAME=event))
+        for field, value in (('GITHUB_REPOSITORY', 'other/uzi'), ('RELEASE_REF', 'refs/heads/feature')):
+            with self.subTest(field=field), self.assertRaises(auto.Stop):
+                auto.inputs(self.env(**{field: value}))
+
+    def test_schedule_cannot_override_the_canonical_rc_route(self):
+        for changes in ({'RELEASE_VERSION': '0.3.0'}, {'RELEASE_SUPERSEDE': TAG},
+                        {'RELEASE_ABANDON': 'true', 'RELEASE_VERSION': '0.3.0'},
+                        {'RELEASE_KIND': 'stable', 'RELEASE_RC_TAG': TAG, 'RELEASE_RC_SHA': CANDIDATE}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(auto.Stop, 'scheduled-input-mismatch'):
+                auto.inputs(self.env(RELEASE_ACTOR='maintainer', RELEASE_DISPATCHERS='maintainer', **changes))
+
+    def test_schedule_metadata_is_bound_to_the_actual_event_and_original_run(self):
+        data = dict(id=123, event='schedule', head_branch='main', head_sha=H,
+                    repository={'full_name': 'vtmocanu/uzi'}, path='.github/workflows/release-auto.yml',
+                    created_at=self.created, updated_at='2026-10-28T03:00:00Z')
+        try:
+            metadata = auto.created_at(self.env(), lambda url: data)
+        except auto.Stop as error:
+            self.fail('valid scheduled run metadata was refused: ' + error.reason)
+        self.assertEqual(metadata, self.created)
+        with self.assertRaisesRegex(auto.Stop, 'invalid-run-metadata'):
+            auto.created_at(self.env(), lambda url: {**data, 'event': 'workflow_dispatch'})
+
+    def test_nightly_flag_defaults_off_and_only_exact_true_enables(self):
+        for value in ('', 'false', 'TRUE', '1'):
+            with self.subTest(value=value):
+                status, data, note, constructor = self.cli(self.env(RELEASE_NIGHTLY_ENABLED=value), metadata_error=True)
+                self.assertEqual(status, 0)
+                self.assertEqual((data['outcome'], data['reason']), ('no-op', 'nightly-disabled'))
+                self.assertIn('nightly-disabled', note)
+                constructor.assert_not_called()
+        status, data, _, _ = self.cli(self.env())
+        self.assertEqual((status, data['outcome']), (0, 'authorized'))
+        status, data, _, _ = self.cli(context(RELEASE_NIGHTLY_ENABLED='false'))
+        self.assertEqual((status, data['outcome']), (0, 'authorized'))
+
+    def test_paused_prepare_does_not_wait_or_cut(self):
+        release, fixture, api = self.release()
+        release.config['nightly_enabled'] = False
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(auto.Stop, 'nightly-disabled') as stopped:
+            release.prepare(Path(directory))
+        self.assertEqual(stopped.exception.outcome, 'no-op')
+        self.assertEqual(fixture.calls, [])
+        api.run.assert_not_called()
+
+    def test_planned_noops_stop_before_ci_wait_for_every_nightly_baseline(self):
+        cases = [plan(OP='noop', REASON='no-new-shipping-change', SHIPPING_COUNT='0'),
+                 plan(OP='noop', TAG='v0.2.0-rc.1', PREVIOUS_TAG='v0.1.0', REASON='no-new-shipping-change', SHIPPING_COUNT='0'),
+                 plan(OP='noop', REASON='no-releasable-notes', SHIPPING_COUNT='1')]
+        for selected in cases:
+            with self.subTest(tag=selected['TAG'], reason=selected['REASON']):
+                release, fixture, api = self.release(selected)
+                with self.assertRaises(auto.Stop) as stopped:
+                    release.tip()
+                self.assertEqual((stopped.exception.outcome, stopped.exception.reason), ('no-op', selected['REASON']))
+                api.run.assert_not_called()
+                self.assertFalse(any('--plan' not in call for call in fixture.calls if call[:2] == ('bash', auto.CUTTER)))
+
+    def test_blocked_publication_is_not_lifted_by_a_zero_threshold(self):
+        release, _, _ = self.release(plan(OP='blocked', REASON='previous-publication-not-successful', SHIPPING_COUNT='0'))
+        with self.assertRaisesRegex(auto.Stop, 'previous-publication-not-successful'):
+            release.tip()
+
+    def test_noop_cli_succeeds_without_creating_a_bundle(self):
+        release, _, api = self.release(plan(OP='noop', REASON='no-new-shipping-change', SHIPPING_COUNT='0'))
+        status, data, note, _ = self.cli(self.env(), 'prepare', release)
+        self.assertEqual((status, data['outcome'], data['reason']), (0, 'no-op', 'no-new-shipping-change'))
+        self.assertEqual((data['parent'], data['planned_tag']), (H, 'v0.2.0-rc.11'))
+        self.assertNotIn('digest', data)
+        self.assertIn('no-new-shipping-change', note)
+        api.run.assert_not_called()
+
+    def test_manual_noop_respin_and_morning_independent_budget_remain(self):
+        release, fixture, api = self.release(plan(OP='noop', SHIPPING_COUNT='0'))
+        release.config['scheduled'] = False
+        release.config['nightly_enabled'] = False
+        release.wall_time = lambda: self.epoch('2026-10-27T16:00:00Z')
+        try:
+            selected = release.tip()
+        except auto.Stop as error:
+            self.fail('manual respin was gated by the nightly policy: ' + error.reason)
+        self.assertEqual(selected[0], H)
+        api.run.return_value = run('queued', None)
+        with self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-deadline'):
+            release.tip(seconds=30, interval=5)
+        self.assertEqual(fixture.now, 30)
+
+    def test_window_uses_bucharest_date_and_dst_offsets(self):
+        cases = [('2026-01-15T02:47:00Z', '2026-01-15T06:00:00Z', '2026-01-15T07:00:00Z'),
+                 ('2026-07-15T01:47:00Z', '2026-07-15T05:00:00Z', '2026-07-15T06:00:00Z'),
+                 ('2026-03-29T01:47:00Z', '2026-03-29T05:00:00Z', '2026-03-29T06:00:00Z'),
+                 ('2026-10-25T02:47:00Z', '2026-10-25T06:00:00Z', '2026-10-25T07:00:00Z'),
+                 ('2026-10-26T22:30:00Z', '2026-10-27T06:00:00Z', '2026-10-27T07:00:00Z')]
+        for created, cutoff, target in cases:
+            with self.subTest(created=created):
+                self.assertEqual(auto.nightly_window(created), (self.epoch(cutoff), self.epoch(target)))
+        for created in ('', None, True, 'not-a-date', '2026-02-30T03:00:00Z',
+                        '2026-10-27 02:47:00+00:00', '2026-10-27T02:47:00+00:00'):
+            with self.subTest(created=created), self.assertRaises(auto.Stop):
+                auto.nightly_window(created)
+
+    def test_schedule_uses_full_window_while_manual_keeps_two_hours(self):
+        for scheduled, expected in ((True, 10980), (False, 7200)):
+            with self.subTest(scheduled=scheduled):
+                release, fixture, api = self.release(now=self.created)
+                release.config['scheduled'] = scheduled
+                api.run.return_value = run('queued', None)
+                reason = 'tip-not-green-by-cutoff' if scheduled else 'tip-not-green-by-deadline'
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(auto.Stop, reason):
+                    release.tip(interval=60)
+                self.assertEqual(fixture.now, expected)
+
+    def test_tip_deadline_reserves_cut_time_and_does_not_reset_on_main_move(self):
+        release, fixture, api = self.release(heads=[H, NEW], now='2026-10-27T05:49:50Z')
+        api.run.return_value = run('queued', None)
+        with self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-cutoff'):
+            release.tip(seconds=7200, interval=5)
+        self.assertEqual(fixture.now, 10)
+        self.assertGreaterEqual(fixture.index, 1)
+
+    def test_green_response_after_cut_start_deadline_does_not_cut(self):
+        release, fixture, api = self.release(now='2026-10-27T05:49:50Z')
+        def slow_run(*args):
+            fixture.now += 20
+            return run()
+        api.run.side_effect = slow_run
+        with self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-cutoff'):
+            release.tip()
+
+    def test_final_plan_cannot_extend_the_cut_start_deadline(self):
+        release, fixture, _ = self.release(now='2026-10-27T05:49:50Z')
+        original, reads = release.run, 0
+        def slow_plan(*args, **kwargs):
+            nonlocal reads
+            result = original(*args, **kwargs)
+            if args[:2] == ('bash', auto.CUTTER):
+                reads += 1
+                if reads == 2:
+                    fixture.now += 20
+            return result
+        release.run = slow_plan
+        with self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-cutoff'):
+            release.tip()
+
+    def test_scheduled_retry_cap_still_one_when_main_advances(self):
+        release, fixture, api = self.release(heads=[H, NEW])
+        api.pages.return_value = [job()]
+        api.run.side_effect = lambda workflow, sha, branch: run(conclusion='failure', number=10 if sha == H else 11) if workflow == 'ci.yml' else run()
+        with self.assertRaisesRegex(auto.Stop, 'tip-ci-retry-failed'):
+            release.tip()
+        self.assertEqual(sum(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls), 1)
+
+    def test_cut_is_refused_if_window_expires_after_tip_returns(self):
+        release, fixture, _ = self.release(now='2026-10-27T06:01:00Z')
+        release.tip = lambda: (H, plan())
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(auto.Stop, 'missed-target'):
+            release.prepare(Path(directory))
+        self.assertEqual(fixture.calls, [])
+
+    def test_expired_or_next_day_preparation_does_not_acquire_a_new_window(self):
+        for now in ('2026-10-27T05:50:01Z', '2026-10-27T06:00:00Z', '2026-10-28T02:00:00Z'):
+            release, fixture, api = self.release(now=now)
+            with self.subTest(now=now), tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(auto.Stop, 'missed-target'):
+                release.prepare(Path(directory))
+            self.assertEqual(fixture.calls, [])
+            api.run.assert_not_called()
+            with self.assertRaisesRegex(auto.Stop, 'missed-target'):
+                release.tip()
+
+    def test_future_run_metadata_cannot_extend_the_window(self):
+        release, fixture, api = self.release(now='2026-10-27T02:40:00Z')
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(auto.Stop, 'invalid-run-age'):
+            release.prepare(Path(directory))
+        self.assertEqual(fixture.calls, [])
+        api.run.assert_not_called()
+        status, data, _, _ = self.cli(self.env(), now='2026-10-27T02:40:00Z')
+        self.assertEqual((status, data.get('reason')), (1, 'invalid-run-age'))
+
+    def test_scheduled_creation_clock_skew_is_bounded(self):
+        for seconds in (0, 59, 60):
+            now = dt.datetime.fromtimestamp(self.epoch(self.created) - seconds, dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            with self.subTest(skew=seconds):
+                status, data, _, _ = self.cli(self.env(), now=now)
+                self.assertEqual((status, data['outcome']), (0, 'authorized'))
+        now = dt.datetime.fromtimestamp(self.epoch(self.created) - 61, dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        status, data, _, _ = self.cli(self.env(), now=now)
+        self.assertEqual((status, data.get('reason')), (1, 'invalid-run-age'))
+
+    def test_scheduled_prepare_rerun_still_requires_redispatch(self):
+        status, data, _, constructor = self.cli(self.env(GITHUB_RUN_ATTEMPT='2'), 'prepare')
+        self.assertEqual((status, data['reason']), (1, 're-dispatch-required'))
+        constructor.assert_not_called()
+
+    def test_tagged_recovery_ignores_pause_flag_and_morning_window(self):
+        release, _, _ = self.release(now='2026-10-28T16:00:00Z')
+        release.config.update(nightly_enabled=False, created_at='not-needed-for-recovery')
+        release.remote = lambda: dict(tags={'v0.2.0-rc.11': RELEASE}, previous_stable='v0.1.0')
+        try:
+            admitted = release.watch_admission('v0.2.0-rc.11', RELEASE)
+        except auto.Stop as error:
+            self.fail('tagged recovery was gated by the nightly policy: ' + error.reason)
+        self.assertEqual(admitted['outcome'], 'watch-admitted')
+        status, data, _, _ = self.cli(self.env(GITHUB_RUN_ATTEMPT='2', RELEASE_NIGHTLY_ENABLED='false', RELEASE_TAG='v0.2.0-rc.11', RELEASE_SHA=RELEASE),
+                                    'watch-check', release, now='2026-10-28T16:00:00Z')
+        self.assertEqual((status, data['outcome']), (0, 'watch-admitted'))
 
 
 if __name__ == '__main__':

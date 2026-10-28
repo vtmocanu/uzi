@@ -254,12 +254,12 @@ it("code checker uses the confined provider and file broker and returns only fin
  assert.match(input, /<code_context_[a-f0-9]{32}>/);
 });
 
-// PRD #3167 M2: coverage brief and nonce-stripped DATA prompt goldens.
+// PRD #3167 M3a: shared code brief and nonce-stripped milestones DATA prompt goldens.
 // These are separate from the byte-frozen pre-M2 replay corpus pins.
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 const stripNonces = (text: string) => text.replace(/_[a-f0-9]{32}>/g, "_NONCE>");
-const GOLDEN_CODE_PROMPT = "f95c12b182d1a8b0b4426cfb0d52558d982a7da3965c860456e935d3ba201581";
-const GOLDEN_CODEX_CODE_BRIEF = "d8dd1257d920c6aa5f467d54f7a7b169ef445facf05932d45790d7f500fc5841";
+const GOLDEN_CODE_PROMPT = "35fd960289a82fde40b0d12e24533b5130a8db60687b4023ddb14b07d5c080a9";
+const GOLDEN_CODEX_CODE_BRIEF = "67ea80eefc42d66f40db3774f6845f6ad9d2d5bd143bc1d28b9cc3fb3a2c85be";
 
 async function codeRequests(c: ClaimResponse) {
  const r = rig({ claim: c, notes: (emit) => r.terminal(emit, '{"findings":[]}') });
@@ -270,13 +270,24 @@ async function codeRequests(c: ClaimResponse) {
  };
 }
 
-it("code checker with empty guidance and instructions off is byte-identical to the previous brief and DATA prompt", async () => {
+it("code checker with empty guidance and instructions off is pinned to the revised brief and DATA prompt", async () => {
  const { brief, prompt } = await codeRequests(codeClaim());
  assert.equal(sha256(brief), GOLDEN_CODEX_CODE_BRIEF);
  assert.equal(sha256(stripNonces(prompt)), GOLDEN_CODE_PROMPT);
  const off = codeClaim();
  Object.assign(off.cross_check!, { repo_instructions_enabled: false, custom_guidance_applied: false });
  assert.equal(sha256(stripNonces((await codeRequests(off)).prompt)), GOLDEN_CODE_PROMPT);
+});
+
+it("Codex code run carries populated approved milestones only in DATA", async () => {
+ const c = codeClaim();
+ const milestones = [{ id: "m1", title: "FROZEN-CRITERION" }];
+ Object.assign(c.cross_check!, { milestones });
+ const { brief, prompt } = await codeRequests(c);
+ assert.doesNotMatch(brief, /FROZEN-CRITERION/);
+ const match = /^<approved_milestones_([a-f0-9]{32})>\n([^\n]+)\n<\/approved_milestones_\1>$/m.exec(prompt);
+ assert.ok(match);
+ assert.deepEqual(JSON.parse(match[2]!), milestones);
 });
 
 it("code checker puts owner guidance in the trusted brief, nonce-delimited, and never in the DATA prompt", async () => {

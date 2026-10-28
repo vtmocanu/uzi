@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dispatch-only release orchestration; the cutter and coverage tool own policy."""
+"""Scheduled/manual release orchestration; the cutter and coverage tool own policy."""
 import argparse
 import datetime as dt
 import hashlib
@@ -14,6 +14,7 @@ import sys
 import time
 import urllib.request
 import uuid
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location('release_coverage', ROOT / 'scripts/release-ci-coverage.py')
@@ -51,13 +52,20 @@ def require(condition, reason):
 def inputs(env):
     require(env.get('GITHUB_REPOSITORY') == 'vtmocanu/uzi', 'wrong-repository')
     require(env.get('RELEASE_REF') == 'refs/heads/main', 'main-required')
-    dispatchers = re.split(r'[,\s]+', env.get('RELEASE_DISPATCHERS', '').strip())
-    require(bool(env.get('RELEASE_ACTOR')) and env['RELEASE_ACTOR'] in dispatchers, 'dispatcher-not-allowed')
+    event = env.get('GITHUB_EVENT_NAME', '')
+    require(event in ('workflow_dispatch', 'schedule'), 'invalid-event')
+    scheduled = event == 'schedule'
+    if not scheduled:
+        dispatchers = re.split(r'[,\s]+', env.get('RELEASE_DISPATCHERS', '').strip())
+        require(bool(env.get('RELEASE_ACTOR')) and env['RELEASE_ACTOR'] in dispatchers, 'dispatcher-not-allowed')
     kind = env.get('RELEASE_KIND', '')
     require(kind in ('rc', 'stable'), 'invalid-kind')
     version, supersede = env.get('RELEASE_VERSION', ''), env.get('RELEASE_SUPERSEDE', '')
     abandon = env.get('RELEASE_ABANDON', 'false')
     tag, sha = env.get('RELEASE_RC_TAG', ''), env.get('RELEASE_RC_SHA', '')
+    if scheduled:
+        require(kind == 'rc' and not version and not supersede and not tag and not sha and abandon == 'false',
+                'scheduled-input-mismatch')
     require(abandon in ('true', 'false'), 'invalid-abandon')
     require(not version or (len(version) <= 100 and re.fullmatch(BASE, version)), 'invalid-version')
     require(not supersede or (len(supersede) <= 128 and re.fullmatch(RC, supersede)), 'invalid-supersede')
@@ -67,7 +75,27 @@ def inputs(env):
     else:
         require(not tag and not sha, 'rc-input-mismatch')
         require(abandon == 'false' or bool(version), 'abandon-needs-version')
-    return dict(kind=kind, version=version, abandon=abandon == 'true', supersede=supersede, rc_tag=tag, rc_sha=sha)
+    return dict(kind=kind, version=version, abandon=abandon == 'true', supersede=supersede, rc_tag=tag, rc_sha=sha,
+                scheduled=scheduled, nightly_enabled=env.get('RELEASE_NIGHTLY_ENABLED') == 'true',
+                created_at=env.get('RUN_CREATED_AT', ''))
+
+
+def nightly_window(stamp):
+    require(isinstance(stamp, str) and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', stamp), 'invalid-run-age')
+    try:
+        zone = ZoneInfo('Europe/Bucharest')
+        day = dt.datetime.fromisoformat(stamp.replace('Z', '+00:00')).astimezone(zone).date()
+        return tuple(dt.datetime.combine(day, dt.time(hour), zone).timestamp() for hour in (8, 9))
+    except (ValueError, OverflowError, ZoneInfoNotFoundError):
+        raise Stop('invalid-nightly-window') from None
+
+
+def nightly_cutoff(stamp, now, reserve=0):
+    cutoff, _ = nightly_window(stamp)
+    require(dt.datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() <= now + 60, 'invalid-run-age')
+    if now >= cutoff - reserve:
+        raise Stop('missed-target', 'defer')
+    return cutoff
 
 
 def parse_plan(text):
@@ -181,7 +209,8 @@ def created_at(env, fetch=None):
             with urllib.request.urlopen(request, timeout=20) as response:
                 return json.load(response)
     run = fetch(url)
-    require(run.get('id') == int(run_id) and run.get('event') == 'workflow_dispatch'
+    require(run.get('id') == int(run_id) and env.get('GITHUB_EVENT_NAME') in ('workflow_dispatch', 'schedule')
+            and run.get('event') == env.get('GITHUB_EVENT_NAME')
             and run.get('head_branch') == 'main' and run.get('head_sha') == env.get('GITHUB_SHA')
             and run.get('repository', {}).get('full_name') == 'vtmocanu/uzi'
             and run.get('path', '').split('@')[0] == '.github/workflows/release-auto.yml', 'invalid-run-metadata')
@@ -196,6 +225,7 @@ class Release:
         self.config, self.run = config, run
         self.api = api or policy.GitHub('vtmocanu/uzi')
         self.clock, self.sleep = clock, sleep
+        self.wall_time = time.time
         self.retries = []
         self.evidence = {}
 
@@ -268,19 +298,28 @@ class Release:
             require(cfg['supersede'] and plan['PREVIOUS_TAG'] == cfg['supersede']
                     and plan['REASON'] == 'previous-publication-not-successful'
                     and plan['PUBLICATION_STATE'] in ('failed', 'absent'), plan['REASON'])
+        if cfg['scheduled'] and plan['OP'] == 'noop':
+            raise Stop(plan['REASON'], 'no-op')
         # Dispatch explicitly preserves manual empty-delta respins. The cutter
         # still enforces notes/releasability and every mutation/publication guard.
         require(re.fullmatch(BASE, plan['BASE']) and re.fullmatch(RC, plan['TAG']), 'invalid-plan')
 
     def tip(self, seconds=7200, interval=15):
+        if self.config['scheduled']:
+            if not self.config['nightly_enabled']:
+                raise Stop('nightly-disabled', 'no-op')
+            now = self.wall_time()
+            cutoff = nightly_cutoff(self.config['created_at'], now, reserve=600)
+            seconds = cutoff - 600 - now
+        deadline_reason = 'tip-not-green-by-cutoff' if self.config['scheduled'] else 'tip-not-green-by-deadline'
         started = self.clock()
         deadline, retried, pending_retry = started + seconds, False, None
-        deadline_utc = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)).isoformat(timespec='seconds')
+        deadline_utc = dt.datetime.fromtimestamp(self.wall_time() + seconds, dt.timezone.utc).isoformat(timespec='seconds')
         last_progress = None
         selected, plan = None, None
         while True:
             if self.clock() > deadline:
-                raise Stop('tip-not-green-by-deadline', 'defer')
+                raise Stop(deadline_reason, 'defer')
             self.git('fetch', '--prune', '--tags', 'origin')
             sha = self.git('rev-parse', 'refs/remotes/origin/main')
             self.evidence['parent'] = sha
@@ -344,7 +383,7 @@ class Release:
                     raise Stop('tip-ci-retry-failed')
             elif ci_state == 'success' and smoke_state == 'success':
                 if self.clock() > deadline:
-                    raise Stop('tip-not-green-by-deadline', 'defer')
+                    raise Stop(deadline_reason, 'defer')
                 for retry in self.retries:
                     if retry['sha'] == sha and retry['run'] == ci['id'] and ci['run_attempt'] > retry['attempt']:
                         retry['result'] = 'passed on retry'
@@ -352,9 +391,11 @@ class Release:
                 plan = self.plan()
                 require(plan['HEAD_SHA'] == sha, 'plan-head-mismatch')
                 self.accept_rc(plan)
+                if self.config['scheduled'] and self.clock() > deadline:
+                    raise Stop(deadline_reason, 'defer')
                 return sha, plan
             if self.clock() >= deadline:
-                raise Stop('tip-not-green-by-deadline', 'defer')
+                raise Stop(deadline_reason, 'defer')
             self.sleep(min(interval, max(0, deadline - self.clock())))
 
     def chart(self, ref, tag):
@@ -381,7 +422,10 @@ class Release:
     def prepare(self, directory):
         cfg = self.config
         if cfg['kind'] == 'rc':
+            self.evidence.update(phase='prepare', stage='preconditions')
             parent, plan = self.tip()
+            if cfg['scheduled']:
+                nightly_cutoff(cfg['created_at'], self.wall_time())
             before = self.remote()
             require(before['main'] == parent, 'main-race')
             tag = plan['TAG']
@@ -464,7 +508,12 @@ def main():
             append_watch_log(Path(os.environ['RUNNER_TEMP']) / 'release-watch.log', Path(os.environ['GITHUB_STEP_SUMMARY']))
             return 0
         if args.mode == 'authorize':
-            result = dict(outcome='authorized', kind=cfg['kind'], created_at=created_at(os.environ))
+            if cfg['scheduled'] and not cfg['nightly_enabled']:
+                result = dict(outcome='no-op', reason='nightly-disabled', kind='rc', phase='authorize')
+            else:
+                result = dict(outcome='authorized', kind=cfg['kind'], created_at=created_at(os.environ))
+                if cfg['scheduled']:
+                    nightly_cutoff(result['created_at'], time.time())
         elif args.mode == 'prepare':
             require(os.environ.get('GITHUB_RUN_ATTEMPT') == '1', 're-dispatch-required')
             directory = Path(os.environ['RUNNER_TEMP']) / 'release-auto'
@@ -486,7 +535,7 @@ def main():
         if result['reason'] == 're-dispatch-required':
             print('Re-dispatch instead of rerunning prepare or push.', file=sys.stderr)
         print(str(error)[-8192:], file=sys.stderr)
-        return 1
+        return 0 if result['outcome'] == 'no-op' else 1
 
 
 if __name__ == '__main__':

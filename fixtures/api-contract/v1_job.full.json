@@ -10,5 +10,6 @@
   "started_at": "2020-01-02T03:04:05Z",
   "finished_at": "2020-01-02T03:04:05Z",
   "queue_reason": "x",
+  "reserve_hold_reason": "x",
   "notice": "x"
 }

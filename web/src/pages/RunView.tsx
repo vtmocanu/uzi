@@ -45,6 +45,10 @@ import {
   healthFlagLabel,
   isMaintenanceQueued,
   maintenanceQueueText,
+  isReserveQueued,
+  isReserveHeldPause,
+  reserveQueueText,
+  RESERVE_RESUME_CONFIRM,
   codexAdmissionText,
   displayHealthReason,
   queuedBlockerPrecedesCodexAdmission,
@@ -99,6 +103,7 @@ import { Modal } from "../components/Modal";
 import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon } from "../components/icons";
 import { gateMismatchMessage, PlanPanel, SeededPlanPanel, type GateMismatch } from "./runView/PlanPanel";
+import { CapabilitySources } from "./runView/CapabilitySources";
 import { FullPlanPanel } from "./runView/FullPlanPanel";
 import { CompletionPending } from "./runView/CompletionPending";
 import { SemanticDrift } from "./runView/SemanticDrift";
@@ -333,10 +338,13 @@ export function HealthFlag({ run }: { run: Run }) {
   // health flag (the detector may still say waiting_worker). A calm info line, no "stuck
   // for" clock: the wait is the admin's drain, not a fault.
   const maintenance = isMaintenanceQueued(run);
+  // PRD #3522: the weekly usage reserve is the same kind of deliberate wait (maintenance wins;
+  // the reserve outranks Codex account admission, as in the server's health ladder).
+  const reserve = !maintenance && isReserveQueued(run);
   const admission = codexAdmissionText(run, now);
-  const primaryAdmission = !maintenance && !queuedBlockerPrecedesCodexAdmission(run) ? admission : null;
+  const primaryAdmission = !maintenance && !reserve && !queuedBlockerPrecedesCodexAdmission(run) ? admission : null;
   const reason = displayHealthReason(run);
-  const show = !maintenance && !primaryAdmission && shouldShowHealthFlag(run.health, run.status);
+  const show = !maintenance && !reserve && !primaryAdmission && shouldShowHealthFlag(run.health, run.status);
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
   // Near timeout ("slow", PRD #1170) counts DOWN to run.deadline_at instead of the
   // since-flagged "stuck for Xm" every other flag keeps: `· 1h 5m left`, or `· stopping`
@@ -359,9 +367,11 @@ export function HealthFlag({ run }: { run: Run }) {
   // the visible pill, which no screen reader is listening to.
   const announce = maintenance
     ? maintenanceQueueText(maintenanceReason)
-    : primaryAdmission ?? (show
-      ? (healthFlagLabel(run.health) ?? "")
-      : "");
+    : reserve
+      ? reserveQueueText(run.reserve_hold_reason)
+      : primaryAdmission ?? (show
+        ? (healthFlagLabel(run.health) ?? "")
+        : "");
   return (
     <>
       {primaryAdmission && (
@@ -374,6 +384,14 @@ export function HealthFlag({ run }: { run: Run }) {
           className="inline-flex items-center gap-1 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info"
         >
           {maintenanceQueueText(maintenanceReason)}
+        </span>
+      )}
+      {reserve && (
+        <span
+          data-queue-reason="weekly_reserve"
+          className="inline-flex items-center gap-1 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info"
+        >
+          {reserveQueueText(run.reserve_hold_reason)}
         </span>
       )}
       {show && (
@@ -811,12 +829,35 @@ const MAX_GUIDANCE_BYTES = 8192;
 // on a milestone-structured run (N = pause_after_count + 1, the milestone the request waits
 // to see complete); "· after the current step" on a milestone mode request against a run
 // with no frozen list (milestone mode then parks at the next turn boundary).
-function pauseRequestedLabel(run: Run): string {
+// PRD #3522: a "reserve" request is filed by the weekly usage reserve, not the owner, and
+// names itself ("· weekly usage reserve · after M<N>"), matching the CLI's suffix.
+export function pauseRequestedLabel(run: Run): string {
   if (run.pause_mode === "now") return "Pause requested · now";
+  const source = run.pause_mode === "reserve" ? " · weekly usage reserve" : "";
   const hasMilestones = milestoneBadge(run) != null;
-  if (!hasMilestones) return "Pause requested · after the current step";
+  if (!hasMilestones) return `Pause requested${source} · after the current step`;
   const n = (run.pause_after_count ?? 0) + 1;
-  return `Pause requested · after M${n}`;
+  return `Pause requested${source} · after M${n}`;
+}
+
+// confirmReserveResume gates an owner Resume of a run the weekly usage reserve parked: the
+// resume records an override until the next weekly reset, so the owner confirms first. Any
+// other run resumes without a prompt.
+function confirmReserveResume(run: Run): boolean {
+  return !isReserveHeldPause(run) || window.confirm(RESERVE_RESUME_CONFIRM);
+}
+
+// ReserveExemptLine states the owner's override of the weekly usage reserve while it lasts.
+export function ReserveExemptLine({ run }: { run: Run }) {
+  const until = run.reserve_exempt_until ? Date.parse(run.reserve_exempt_until) : NaN;
+  // The server never clears the stamp on a finished run, so the line is for live runs only.
+  if (isTerminalRun(run.status) || !Number.isFinite(until) || until <= Date.now()) return null;
+  return (
+    <span className="text-xs text-muted" data-reserve-exempt="true">
+      Weekly usage reserve overridden until{" "}
+      {new Date(until).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+    </span>
+  );
 }
 
 // checkpointLine renders the PausedPanel's "the checkpoint is safe" sentence from the
@@ -919,6 +960,12 @@ export function PausedPanel({
           <p className="mt-1.5 text-xs text-muted">
             Nothing runs and nothing is spent while it waits.
           </p>
+          {isReserveHeldPause(run) && (
+            <p className="mt-1.5 text-xs text-muted" data-hold-reason="weekly_reserve">
+              Held by your weekly usage reserve. It resumes automatically when usage drops below the
+              threshold. Resuming now overrides the reserve until the next weekly reset.
+            </p>
+          )}
           {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
           <RunParkDiskFacts run={run} />
           {/* Worker / re-planning mechanics live behind a disclosure so the panel stays
@@ -937,7 +984,7 @@ export function PausedPanel({
               who can, never a greyed button that 404s. */}
           {canSteer ? (
             <>
-              <Button size="sm" disabled={busy} onClick={onResume}>
+              <Button size="sm" disabled={busy} onClick={() => { if (confirmReserveResume(run)) onResume(); }}>
                 ▶ Resume
               </Button>
               {showExtend && onExtend && (
@@ -1402,8 +1449,11 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   onCancel: () => void;
 }) {
   const adoptionFailed = run.recovery_wait_cause === "retained_recovery_adoption_failed";
-  const retained = adoptionFailed || run.recovery_wait_cause === "retained_recovery_exhausted";
-  const retainedStatus = effectiveRunStatus(run);
+  const idleStall = run.recovery_wait_cause === "codex_idle_stall";
+  const retained = adoptionFailed || run.recovery_wait_cause === "retained_recovery_exhausted" || idleStall;
+  const decisionName = idleStall ? "Codex idle stall" : "Retained recovery";
+  const decisionHeld = adoptionFailed || run.recovery_retry_not_before === null;
+  const decisionRetrying = !adoptionFailed && typeof run.recovery_retry_not_before === "string" && Number.isFinite(Date.parse(run.recovery_retry_not_before));
   const retryMs = typeof run.recovery_retry_not_before === "string" ? Date.parse(run.recovery_retry_not_before) : NaN;
   const memoryHeld = run.recovery_wait_cause === "worker_memory_pressure";
   const memory = run.memory_hold;
@@ -1411,16 +1461,17 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   const evidence = recovery?.evidence;
   return (
     <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
-      <p className="text-sm font-semibold text-warn">{adoptionFailed ? "Retained recovery integrity check failed" : retained ? retainedStatus === "retained_recovery_held" ? "Retained recovery needs your decision"
-        : retainedStatus === "retained_recovery_retrying" ? "Retained recovery retrying" : "Retained recovery timing unknown"
+      <p className="text-sm font-semibold text-warn">{adoptionFailed ? "Retained recovery integrity check failed" : retained ? decisionHeld ? `${decisionName} needs your decision`
+        : decisionRetrying ? `${decisionName} retrying` : `${decisionName} timing unknown`
         : memoryHeld ? "Worker memory pressure — waiting for owner" : "Worker recovery needs your decision"}</p>
       <p className="mt-0.5 text-xs text-muted">
         {retained ? <>
           {adoptionFailed && "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. "}
-          {adoptionFailed || retainedStatus === "retained_recovery_held"
+          {decisionHeld
             ? "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
-            : retainedStatus === "retained_recovery_retrying"
-              ? retryMs <= Date.now() ? "Automatic retry is due; the run will retry automatically. Only the run owner can Resume now or Cancel."
+            : decisionRetrying
+              ? idleStall ? `Automatic retry is scheduled not before ${new Date(retryMs).toLocaleString()}; it may still be pending when due. Only the run owner can Resume now or Cancel.`
+                : retryMs <= Date.now() ? "Automatic retry is due; the run will retry automatically. Only the run owner can Resume now or Cancel."
                 : `The run will retry automatically after ${new Date(retryMs).toLocaleString()}. Only the run owner can Resume now or Cancel.`
               : "Retry timing is unavailable. This does not establish an owner hold or an automatic retry date."}
         </> : <>{memoryHeld
@@ -1429,6 +1480,7 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
         {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
         This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.</>}
       </p>
+      {idleStall && <p className="mt-1.5 text-xs text-muted">Resume starts a fresh wall and resets the idle-stall count. Cancel ends this run. Resume requests an attempt; success is not assured.</p>}
       {!retained && <p className="mt-1.5 text-xs text-muted">
         {memoryHeld
           ? `Memory interventions: used ${memory?.used ?? "unknown"}. Maximum: ${memory?.max ?? "unknown"}. Remaining: ${memory?.remaining ?? "unknown"}.`
@@ -1528,7 +1580,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
   // sibling parks) renders nothing — PoolWaitPanel owns pool_wait, LimitWaitPanel owns
   // limit_wait, and this self-hides on both so mounting all three side by side is safe.
   if (run.status !== "recovery_wait") return null;
-  if (run.recovery_wait_cause === "worker_requeue_exhausted" || run.recovery_wait_cause === "worker_memory_pressure" || run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "retained_recovery_adoption_failed") {
+  if (run.recovery_wait_cause === "worker_requeue_exhausted" || run.recovery_wait_cause === "worker_memory_pressure" || (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed")) {
     return <WorkerDecisionPanel run={run} ownerProof={ownerProof} busy={busy} onResume={onResume} onCancel={onCancel} />;
   }
 
@@ -1786,7 +1838,7 @@ export function RunView() {
   const memoryHeld = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
   // Issue #3181: the token-switch holds are owner decisions too (Resume / Cancel).
   const switchHeld = run != null && credentialSwitchHold(run) !== null;
-  const retainedRecovery = run?.status === "recovery_wait" && (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "retained_recovery_adoption_failed");
+  const retainedRecovery = run?.status === "recovery_wait" && (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed");
   const ownerDecisionHold = retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
   const canSteer = optimisticCanSteer && (!ownerDecisionHold || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
@@ -2209,7 +2261,7 @@ export function RunView() {
                   ? "data_volume_full"
                   : run.recovery_wait_cause === "provider_outage"
                     ? "provider_outage"
-                  : run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "retained_recovery_adoption_failed"
+                  : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed")
                     ? effectiveRunStatus(run)
                   : run.recovery_wait_cause === "worker_requeue_exhausted"
                     ? "worker_requeue_exhausted"
@@ -2242,6 +2294,12 @@ export function RunView() {
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
           : parkKey === "retained_recovery_adoption_failed"
             ? "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
+          : parkKey === "codex_idle_stall_held"
+            ? "Codex idle stall needs your decision. Only the run owner can Resume or Cancel. There is no scheduled retry. Resume starts a fresh wall and resets the idle-stall count; Cancel ends the run."
+          : parkKey === "codex_idle_stall_retrying"
+            ? "Codex idle stall has a scheduled retry, which may still be pending when due. Only the run owner can Resume now or Cancel. Resume starts a fresh wall and resets the idle-stall count; Cancel ends the run."
+          : parkKey === "codex_idle_stall_unknown"
+            ? "Codex idle stall timing is unavailable. An owner hold or automatic retry date cannot be inferred."
           : parkKey === "retained_recovery_held"
             ? "Retained recovery needs your decision. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "retained_recovery_retrying"
@@ -2471,12 +2529,13 @@ export function RunView() {
                   <Button
                     size="sm"
                     disabled={busy}
-                    onClick={() =>
-                      act(async (isCurrent) => {
+                    onClick={() => {
+                      if (!confirmReserveResume(run)) return;
+                      void act(async (isCurrent) => {
                         await api.resumeRun(run.id);
                         if (isCurrent()) await refreshRun();
-                      })
-                    }
+                      });
+                    }}
                   >
                     ▶ Resume
                   </Button>
@@ -2500,21 +2559,31 @@ export function RunView() {
               {run.pause_requested_at && (
                 <span className="inline-flex flex-wrap items-center gap-2">
                   <Badge tone="info">{pauseRequestedLabel(run)}</Badge>
+                  {run.pause_mode === "reserve" && (
+                    // PRD #3522: the reserve's request cannot be withdrawn (the server 409s a
+                    // cancel), so no Cancel pause is offered; say how to get out of it instead.
+                    <span className="text-xs text-muted" data-pause-source="weekly_reserve">
+                      Set by your weekly usage reserve. Resume the run after it parks, or change the
+                      threshold in Run defaults.
+                    </span>
+                  )}
                   {canSteer && run.status === "running" && (
                     <>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        disabled={busy}
-                        onClick={() =>
-                          act(async () => {
-                            await api.cancelPause(run.id);
-                            await refreshRun();
-                          })
-                        }
-                      >
-                        Cancel pause
-                      </Button>
+                      {run.pause_mode !== "reserve" && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={busy}
+                          onClick={() =>
+                            act(async () => {
+                              await api.cancelPause(run.id);
+                              await refreshRun();
+                            })
+                          }
+                        >
+                          Cancel pause
+                        </Button>
+                      )}
                       {run.pause_mode !== "now" && (
                         <Button
                           variant="secondary"
@@ -2534,6 +2603,7 @@ export function RunView() {
                   )}
                 </span>
               )}
+              <ReserveExemptLine run={run} />
               {run.auto_approve && (
                 <Badge tone="brand" title="Autopilot: started from the label, plan auto-approved">
                   autopilot
@@ -2666,6 +2736,12 @@ export function RunView() {
       {actionErr && <Alert message={actionErr} />}
       <CompletionPending run={run} />
       <SemanticDrift run={run} />
+      {run.status !== "awaiting_approval" && (run.capability_provenance?.capabilities.length ?? 0) > 0 && (
+        <section aria-label="Run capability sources" className="rounded-xl border border-edge bg-surface p-4">
+          <h2 className="mb-2 text-sm font-semibold text-fg">Capability sources</h2>
+          <CapabilitySources provenance={run.capability_provenance} />
+        </section>
+      )}
       {/* PRD #1795 D5: a refused plan verdict whose refetch shows the run has left the gate.
           The panel that would word it has unmounted, so the page says it instead. */}
       {revisionMismatch && run.status !== "awaiting_approval" && (

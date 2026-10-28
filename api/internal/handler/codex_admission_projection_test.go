@@ -29,6 +29,9 @@ func TestCodexAdmissionBoardProjection(t *testing.T) {
 		{"owner vault", true, "codex_overload", "overload", "your vault is locked, so this run can't start", "your vault is locked, so this run can't start", true},
 		{"owner custody", true, "codex_overload", "overload", "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs", "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs", true},
 		{"owner custody unavailable", true, "codex_overload", "overload", "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings", "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings", true},
+		// PRD #3522: the weekly reserve outranks an open cooldown for the owner and, like it, is owner-only.
+		{"owner reserve over cooldown", true, "weekly_reserve", "rate_limit", "weekly usage reserve: 72% >= 70%", "weekly usage reserve: 72% >= 70%", true},
+		{"shared reserve", false, "weekly_reserve", "", "weekly usage reserve: 72% >= 70%", "", false},
 		{"shared cooldown", false, "codex_rate_limit", "rate_limit", "private", "", false},
 		{"shared maintenance", false, "maintenance", "overload", "private", "", false},
 		{"expired", true, "", "", "waiting: provider reported overload; account admission eligible after 2026-10-26T12:00:00Z", "", false},
@@ -65,7 +68,7 @@ func TestCodexAdmissionBoardProjection(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if strings.Contains(string(data), "codex_admission_") || strings.Contains(string(data), "private") || strings.Contains(string(data), "codex_rate_limit") {
+				if strings.Contains(string(data), "codex_admission_") || strings.Contains(string(data), "private") || strings.Contains(string(data), "codex_rate_limit") || strings.Contains(string(data), "weekly") {
 					t.Fatalf("private details leaked: %s", data)
 				}
 			}
@@ -97,3 +100,19 @@ func TestCodexAdmissionMappersStripPersistedReason(t *testing.T) {
 
 func ptrAdmissionClass(s string) *string      { return &s }
 func ptrAdmissionTime(t time.Time) *time.Time { return &t }
+
+// TestWeeklyReserveOutranksCodexAdmissionReason pins the PRD #3522 / #3530 merge precedence: a
+// queued run the weekly reserve holds keeps its reserve health reason even while a Codex account
+// admission window is also open, matching the health ladder (reserve before admission).
+func TestWeeklyReserveOutranksCodexAdmissionReason(t *testing.T) {
+	reserve := "weekly usage reserve: 72% >= 70%"
+	at := ptrAdmissionTime(time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC))
+	got := overlayAdmissionReason(&reserve, "weekly_reserve", ptrAdmissionClass("rate_limit"), at)
+	if got == nil || *got != reserve {
+		t.Fatalf("weekly_reserve reason = %v, want %q kept over the admission text", got, reserve)
+	}
+	got = overlayAdmissionReason(&reserve, "codex_rate_limit", ptrAdmissionClass("rate_limit"), at)
+	if got == nil || !apitypes.IsCodexAdmissionReason(*got) {
+		t.Fatalf("codex_rate_limit reason = %v, want the admission text", got)
+	}
+}

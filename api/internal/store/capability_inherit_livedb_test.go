@@ -103,6 +103,7 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 		t.Fatalf("CreateTaskRun: %v", err)
 	}
 	assertCaps(t, "CreateTaskRun", taskRun.RequiredCapabilities, want)
+	assertCaps(t, "CreateTaskRun hinted snapshot", taskRun.HintedCapabilities, want)
 	if len(ignored) > 0 {
 		assertCaps(t, "CreateTaskRun ignored inference", taskRun.IgnoredInferredCapabilities, ignored[0])
 	}
@@ -122,6 +123,7 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 		t.Fatalf("CreateTaskReviewRun: %v", err)
 	}
 	assertCaps(t, "CreateTaskReviewRun", reviewRun.RequiredCapabilities, want)
+	assertCaps(t, "CreateTaskReviewRun hinted snapshot", reviewRun.HintedCapabilities, want)
 	if len(ignored) > 0 {
 		assertCaps(t, "CreateTaskReviewRun ignored inference", reviewRun.IgnoredInferredCapabilities, ignored[0])
 	}
@@ -142,6 +144,7 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 		t.Fatalf("CreateThenFixRun: %v", err)
 	}
 	assertCaps(t, "CreateThenFixRun", fixRun.RequiredCapabilities, want)
+	assertCaps(t, "CreateThenFixRun hinted snapshot", fixRun.HintedCapabilities, want)
 	if len(ignored) > 0 {
 		assertCaps(t, "CreateThenFixRun ignored inference", fixRun.IgnoredInferredCapabilities, ignored[0])
 	}
@@ -165,6 +168,7 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 		t.Fatalf("CreateCIFixRun: %v", err)
 	}
 	assertCaps(t, "CreateCIFixRun", ciFixRun.RequiredCapabilities, want)
+	assertCaps(t, "CreateCIFixRun hinted snapshot", ciFixRun.HintedCapabilities, want)
 	if len(ignored) > 0 {
 		assertCaps(t, "CreateCIFixRun ignored inference", ciFixRun.IgnoredInferredCapabilities, ignored[0])
 	}
@@ -190,6 +194,7 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 		t.Fatalf("CreatePromptRun: %v", err)
 	}
 	assertCaps(t, "CreatePromptRun", promptRun.RequiredCapabilities, want)
+	assertCaps(t, "CreatePromptRun hinted snapshot", promptRun.HintedCapabilities, want)
 	if len(ignored) > 0 {
 		assertCaps(t, "CreatePromptRun ignored inference", promptRun.IgnoredInferredCapabilities, ignored[0])
 	}
@@ -213,6 +218,7 @@ func assertPathsInherit(ctx context.Context, t *testing.T, q *store.Queries, poo
 		t.Fatalf("CreateSelfImproveRun: %v", err)
 	}
 	assertCaps(t, "CreateSelfImproveRun", selfRun.RequiredCapabilities, want)
+	assertCaps(t, "CreateSelfImproveRun hinted snapshot", selfRun.HintedCapabilities, want)
 	if len(ignored) > 0 {
 		assertCaps(t, "CreateSelfImproveRun ignored inference", selfRun.IgnoredInferredCapabilities, ignored[0])
 	}

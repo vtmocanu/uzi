@@ -47,6 +47,10 @@ export interface User {
    *  creation and overridable on the run view — so the two disagreeing is the normal
    *  state of a user who overrode one run, not a sync bug to fix. */
   wait_on_limit: boolean;
+  /** PRD #3522: weekly usage reserve threshold (1..100), null when off. */
+  weekly_reserve_pct?: number | null;
+  /** PRD #3522: also pause running runs at the reserve (default true). */
+  weekly_reserve_pause_running?: boolean;
   /** PRD #1020: this user's opt-in to an alert when the poller observes their
    *  Anthropic usage window has reset earlier than its previously reported reset
    *  time. Default true; toggled from their own Settings. */
@@ -223,6 +227,10 @@ export interface UserSettings {
    *  default ON. null/absent reads as enabled; an explicit false opts this account out. The
    *  instance kill-switch (AppSettings.now_summary_enabled) is separate. */
   now_summary_enabled?: boolean | null;
+  /** PRD #3522: weekly usage reserve threshold (1..100), null when off. */
+  weekly_reserve_pct?: number | null;
+  /** PRD #3522: also pause running runs at the reserve (default true). */
+  weekly_reserve_pause_running?: boolean;
   /** Per-user default harness (PRD #1429 M1 / D3); null = "no preference", so implicit run
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */
@@ -1541,9 +1549,10 @@ export interface ReleaseCheckStatus {
 
 // ── Instance maintenance mode (PRD #3454) ───────────────────────────────────
 
-// QueueReason is why a queued run is held back, beyond waiting for a
-// worker: instance maintenance or a temporary provider admission hold.
-export type QueueReason = "maintenance" | "codex_rate_limit" | "codex_overload";
+// QueueReason is why a queued run is held back, beyond waiting for a worker: instance
+// maintenance, the owner's weekly usage reserve ("weekly_reserve", PRD #3522), or a temporary
+// provider admission hold. Precedence is in that order.
+export type QueueReason = "maintenance" | "weekly_reserve" | "codex_rate_limit" | "codex_overload";
 export type CodexAdmissionClass = "rate_limit" | "overload";
 
 // MaintenanceState is `GET /api/maintenance` (any signed-in user): whether intake is paused,
@@ -3030,6 +3039,18 @@ export interface SemanticDriftDTO {
 }
 
 export interface Run {
+  capability_provenance?: {
+    hints_known: boolean;
+    inference_known: boolean;
+    capabilities: {
+      capability: string;
+      sources: string[];
+      required: boolean;
+      inference_ignored: boolean;
+      triggers: { path: string; reason: string }[];
+      truncated: boolean;
+    }[];
+  };
   /** Repo display path on detail reads; absent on older servers, empty when unavailable. */
   repo_path?: string;
   /** Frozen repo inference policy; explicit requirements take precedence. */
@@ -3192,6 +3213,12 @@ export interface Run {
   deadline_at?: string | null;
   /** Read-time queue hold (see LatestRun.queue_reason). Optional for rollout skew. */
   queue_reason?: QueueReason | null;
+  /** PRD #3522: why the weekly usage reserve holds this queued run (e.g. "weekly usage reserve:
+   *  72% >= 70%"); absent when not held or not queued. */
+  reserve_hold_reason?: string | null;
+  /** PRD #3522: RFC3339 end of the owner's manual-resume override of the weekly usage reserve
+   *  (the next weekly reset); absent/null when no override is active. */
+  reserve_exempt_until?: string | null;
   // Read-time owner projection; foreign/admin shared reads redact account details.
   // Eligibility includes the per-run spread and is not a promised start time.
   codex_admission_class?: CodexAdmissionClass | null;
@@ -3612,7 +3639,9 @@ export interface Run {
   pause_requested_at?: string | null;
   /** PRD #1497 M1 widens pause_mode with "wall": the system-authored wall-park request mode the
    *  timeout sweep stamps at the deadline (alongside the owner's "milestone"/"now"). */
-  pause_mode?: "milestone" | "now" | "wall" | null;
+  pause_mode?: "milestone" | "now" | "wall" | "reserve" | null;
+  // PRD #3522: "reserve" is the system pause request the weekly usage reserve files; it parks
+  // after the current milestone and cannot be withdrawn by the owner (cancel 409s).
   pause_after_count?: number | null;
   checkpoint_tip_at?: string | null;
   /** PRD #1226 M5 (D8): the honest-state completion fields — the wire contract the web + CLI
@@ -3981,6 +4010,7 @@ export type RunSummaryItem = Omit<
   "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
+  | "capability_provenance"
 >;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).

@@ -967,7 +967,13 @@ export const runsApi = {
     // Issue #3181: mirrors the server's ErrRunHoldSettling refusal; an unsettled hold resumes.
     const switchHold = credentialSwitchHold(run);
     if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
+    // PRD #3522: an owner resume of a reserve hold records the override until the next weekly
+    // reset (the mock stands in with seven days).
+    const reserveHeld = run.status === "paused" && run.hold_reason === "weekly_reserve";
     patchRun(id, { status: "queued", updated_at: new Date().toISOString(),
+      ...(reserveHeld
+        ? { hold_reason: null, reserve_exempt_until: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString() }
+        : {}),
       // The held-only projection disappears on Resume; the API owns the fresh episode.
       ...(memoryHeld ? { memory_hold: undefined, recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
       ...(switchHold === "unsettled" ? { hold_reason: null, status_since: new Date().toISOString() } : {}),

@@ -296,3 +296,127 @@ A user with **no linked Codex subscription account** — including one whose
 only saved Codex credential is an API key — sees no accounts at all here: no
 row, no placeholder meter, on any surface. That's the empty-set shape, not a
 status of its own.
+
+## Weekly usage reserve
+
+If you share one subscription between uzi and your own work, you can keep part
+of the weekly allowance untouched. The **weekly usage reserve** is a per-user
+threshold on the **7-day** window: while the credential a run would spend reads
+at or above it, uzi starts no new work on that credential and, optionally,
+pauses running runs at their next milestone. It is **off by default**; with no
+threshold set, nothing in this section applies to you.
+
+### Setting it
+
+| Surface | How |
+|---|---|
+| **Settings → Run defaults → Usage limits** | The **Keep a weekly usage reserve** switch, a threshold (a whole number from 1 to 100) and the pause-running toggle. |
+| **CLI** | `uzi settings reserve --threshold <1..100\|off> [--pause-running=true\|false]`. Omitting `--pause-running` keeps the stored value. `uzi settings get` ends with a `Weekly usage reserve:` line. |
+| **API** | `PUT /api/me/usage-reserve` with `{"threshold_pct": <1..100 or null>, "pause_running": <bool>}`. Both fields are required; `null` turns the reserve off. A `uzc_` Bearer token works. |
+
+**Also pause running runs** is on by default once a threshold is set. A change
+takes effect on the next claim and the next sweeper pass; it is not
+instantaneous. See [CLI](cli.md#weekly-usage-reserve) for the command.
+
+### What is measured
+
+- **Only the 7-day window counts.** The 5-hour window is ignored by the
+  reserve; a 5-hour exhaustion is still handled by
+  [`limit_wait`](run-limit-wait.md).
+- **A credential is held when its 7-day percent is at or above the
+  threshold** (`pct >= threshold`, compared on the unrounded reading), so a
+  70% threshold holds at exactly 70%.
+- **Claude:** the `seven_day` reading of the token the run would spend.
+- **Codex:** the account window whose reported duration is exactly 7 days,
+  whether it is the primary or the secondary window. Codex buckets carry no
+  model, so when several buckets report a weekly window the **highest** one
+  decides.
+
+### When the reading is unknown, new work holds
+
+With a threshold set, a reading that cannot be trusted reads as **unknown**
+and **holds** new work rather than silently dropping the protection. Unknown
+means:
+
+- no reading at all (not polled yet);
+- a **stale** reading, older than 3× the poll interval (the same rule as
+  [How fresh is this?](#how-fresh-is-this));
+- a reading synced **before** a 7-day reset that has since passed, because it
+  describes the old week: release waits for the next poll after the reset;
+- a **partial** reading, such as a successful poll with no weekly utilization
+  (Claude), or a weekly window whose percent is missing or invalid (Codex).
+
+Two consequences to plan for:
+
+- **Console API keys hold.** Every Anthropic credential is treated as metered,
+  because OAuth tokens and console API keys cannot be told apart reliably. A
+  console API key has no subscription usage to read, so with a threshold set
+  it reads unknown and holds new work. If a console key is the only Anthropic
+  credential you use, leave the reserve off.
+- **A disabled poller holds.** With the usage poller turned off
+  (`UZI_USAGE_POLL_INTERVAL=0` for Claude, `UZI_CODEX_USAGE_POLL_INTERVAL=0`
+  for Codex), no reading is ever fresh, so every subscription credential reads
+  unknown while a threshold is set. This is an operator setting; see
+  [Configuration](./configuration.md).
+
+An unknown reading holds **new work only**. It never pauses a run that is
+already running, so a poller outage cannot stop every active run.
+
+### What it holds
+
+A held run stays `queued`; it is not a new status and it does not touch the
+usage-limit counters or wall budget. A run is held when it would spend a
+credential that reads held or unknown:
+
+- **Every worker run kind except chat**: issue, task, prompt, self-improve,
+  CI-fix, MR-rework, job, judge and cross-check, whether started by hand, by a
+  schedule or as a resume.
+- **Chat is never gated.** It is the interactive use the reserve protects.
+- **Judge and self-improve** are gated on your judge-lane credential, and a
+  **cross-check** on its own credential, which is on the opposite harness from
+  the run it checks. A held checker keeps its deadline; if it expires, it
+  settles as an expired check does today.
+- **Not gated, by structure:** a Codex API-key alias and an OpenAI API key have
+  no subscription meter, so they are never held. A missing reading is never
+  used to decide this.
+- **The auto pool skips held tokens.** A run on [auto
+  credential selection](anthropic-token.md) can start on another pooled token
+  that reads below the threshold; it never leaves the pool or its pinning
+  rules to do so. It holds only when every pooled token is held or unknown.
+
+A previously started run's resume claim is gated only while **Also pause
+running runs** is on. With it off, started runs continue above the threshold
+and only never-started work stays held.
+
+### What you see
+
+A held queued run shows the reason `weekly usage reserve: 72% >= 70%`, or
+`weekly usage reserve: weekly usage unknown` when the reading is unknown. The
+run DTO carries it as `reserve_hold_reason`, with `queue_reason` set to
+`weekly_reserve` (`maintenance` wins when both apply). `uzi run get` prints a
+`RESERVE` row and a `QUEUE_REASON` row. The reason is written by the periodic
+sweeper, so it can appear a short while after the run is queued. It is dropped
+on the next pass once you clear the threshold, whatever the freshness of any
+reading. Turning the toggle off drops it only for a run that has already
+started; never-started work stays held. On `/api/v1/jobs` the job carries the
+reason as `reserve_hold_reason`, the fixed text `Waiting for the owner's weekly
+usage reserve.` without your usage figures, and leaves `queue_reason` to
+maintenance.
+
+Running runs pause after their current milestone and resume on a fresh reading
+below the threshold; see [Pausing and resuming a run](run-pause.md#paused-by-the-weekly-usage-reserve).
+
+### It is best effort
+
+The reserve is not a strict cap, and usage can exceed the threshold:
+
+- the poll lags (default 5 minutes), so a reading can trail real usage;
+- a pausing run first finishes its current milestone;
+- kinds that cannot pause mid-run (CI-fix, MR-rework, job, judge, cross-check,
+  interactive tasks) are held at admission only, and one already running
+  finishes;
+- chat is exempt;
+- a pause whose checkpoint fails lets the run continue and is re-requested at
+  the next boundary.
+
+Overshoot is not bounded.

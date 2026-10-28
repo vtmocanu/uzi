@@ -98,12 +98,12 @@ it("Claude code stub returns exact empty findings and confirms cleanup despite p
   assert.equal(confirmed, 1);
 });
 
-// PRD #3167 M2: coverage brief and nonce-stripped DATA prompt goldens.
+// PRD #3167 M3a: shared code brief and nonce-stripped milestones DATA prompt goldens.
 // These are separate from the byte-frozen pre-M2 replay corpus pins.
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 const stripNonces = (text: string) => text.replace(/_[a-f0-9]{32}>/g, "_NONCE>");
-const GOLDEN_CLAUDE_CODE_PROMPT = "655e293835b439076e65db2c628bb14d14abcf5ce353b0288db36463308dec96";
-const GOLDEN_CLAUDE_CODE_BRIEF = "60dbc88ffad1ff0f7cef763ca71d6263541ffe9573be2082435406db32822321";
+const GOLDEN_CLAUDE_CODE_PROMPT = "a8c6f3483904d377afb8abaa3fc6d2075840ae6c2f10bac2020fdc3c271f4fa0";
+const GOLDEN_CLAUDE_CODE_BRIEF = "3ec4bad6fcf40e0a3e24aa16872cfc979cc9a886b6c38ef7d940339da2cf6651";
 
 async function claudeRequest(c: ClaimResponse): Promise<{ brief: string; prompt: string }> {
   let brief = "";
@@ -119,7 +119,7 @@ async function claudeRequest(c: ClaimResponse): Promise<{ brief: string; prompt:
   return { brief, prompt };
 }
 
-it("Claude code run with empty guidance and instructions off is byte-identical to the previous brief and DATA prompt", async () => {
+it("Claude code run with empty guidance and instructions off is pinned to the revised brief and DATA prompt", async () => {
   const plain = await claudeRequest(claim());
   assert.equal(sha256(plain.brief), GOLDEN_CLAUDE_CODE_BRIEF);
   assert.equal(sha256(stripNonces(plain.prompt)), GOLDEN_CLAUDE_CODE_PROMPT);
@@ -127,6 +127,17 @@ it("Claude code run with empty guidance and instructions off is byte-identical t
   Object.assign(off.cross_check!, { repo_instructions_enabled: false, custom_guidance_applied: false });
   assert.deepEqual(await claudeRequest(off).then(r => [sha256(r.brief), sha256(stripNonces(r.prompt))]),
     [GOLDEN_CLAUDE_CODE_BRIEF, GOLDEN_CLAUDE_CODE_PROMPT]);
+});
+
+it("Claude code run carries populated approved milestones only in DATA", async () => {
+  const c = claim();
+  const milestones = [{ id: "m1", title: "FROZEN-CRITERION" }];
+  Object.assign(c.cross_check!, { milestones });
+  const { brief, prompt } = await claudeRequest(c);
+  assert.doesNotMatch(brief, /FROZEN-CRITERION/);
+  const match = /^<approved_milestones_([a-f0-9]{32})>\n([^\n]+)\n<\/approved_milestones_\1>$/m.exec(prompt);
+  assert.ok(match);
+  assert.deepEqual(JSON.parse(match[2]!), milestones);
 });
 
 it("Claude code run puts owner guidance in the trusted brief after the locked text, never in the DATA prompt", async () => {

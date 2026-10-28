@@ -3823,7 +3823,7 @@ export class CodexExecutor implements Executor {
               continue;
             }
             let cause = error;
-            if (humanRevision && error instanceof TransientRecoveryError && error.zeroEvidenceIdle) {
+            if (humanRevision && error instanceof TransientRecoveryError && error.idleStallKind === "zero_evidence") {
               silentRevision = { cause: error, needsRebuild: true, checkedAt: Date.now() };
               // Persist already happened in the measured-idle branch. Dispose before
               // the hook, even when it will restore the exhausted owner gate.
@@ -3846,8 +3846,8 @@ export class CodexExecutor implements Executor {
               cause = silentRevision.cause;
             }
             if (!humanRevision || !(cause instanceof TransientRecoveryError) ||
-                (!cause.providerOrigin && !cause.zeroEvidenceIdle)) throw error;
-            if (!ctx.retryPlanRevisionTurn) throw cause.zeroEvidenceIdle ? cause.originalIdle ?? cause : cause;
+                (!cause.providerOrigin && cause.idleStallKind !== "zero_evidence")) throw error;
+            if (!ctx.retryPlanRevisionTurn) throw cause.idleStallKind === "zero_evidence" ? cause.originalIdle ?? cause : cause;
             try {
               const outcome = await ctx.retryPlanRevisionTurn(cause,
                 silentRevision?.needsRebuild ? observeOwnerWait : undefined,
@@ -3859,7 +3859,7 @@ export class CodexExecutor implements Executor {
             } catch (rejected) {
               // Only identity rejection denotes unsupported recovery. Controls and
               // replacement-revise exceptions must retain their own routing.
-              if (rejected === cause && cause.zeroEvidenceIdle) throw cause.originalIdle ?? cause;
+              if (rejected === cause && cause.idleStallKind === "zero_evidence") throw cause.originalIdle ?? cause;
               throw rejected;
             } finally { chargeSilentRecovery(); }
             continue;
@@ -5690,7 +5690,7 @@ export class CodexExecutor implements Executor {
     idleOperation?: () => Promise<ReducedTurnResult>,
     beforeDispatch?: (prompt: string) => string,
     ownerCompletionRecheck = false,
-    zeroEvidenceRecoveryEligible = false,
+    idleRecoveryEligible = false,
     humanRevision = false,
   ): Promise<
     | { kind: "turn"; result: ReducedTurnResult }
@@ -5788,8 +5788,13 @@ export class CodexExecutor implements Executor {
         }
         // Human revision silence stays inside its negotiated driver. Synthetic
         // trips and unknown evidence retain the terminal idle contract.
-        const zeroEvidenceIdle = (zeroEvidenceRecoveryEligible || humanRevision) && !idleOperation &&
-          err instanceof CodexTurnTripError && err.message === REASON_IDLE && err.processedEvents === 0;
+        const measuredIdle = !idleOperation && err instanceof CodexTurnTripError &&
+          err.message === REASON_IDLE && err.processedEvents !== undefined;
+        const idleStallKind = measuredIdle && (idleRecoveryEligible || humanRevision) && err instanceof CodexTurnTripError
+          ? err.processedEvents === 0 ? "zero_evidence"
+            : idleRecoveryEligible && !humanRevision && ctx.codexIdleStallRecovery && err.processedEvents! > 0
+              ? "productive" : undefined
+          : undefined;
         let recoveryCheckedAt = Date.now();
         const recoveryInterruption = (): CodexTurnTripError | undefined => {
           // The turn disarmed its wall timer. Charge only this candidate's post-idle
@@ -5801,7 +5806,7 @@ export class CodexExecutor implements Executor {
           const reason = this.pendingInterruption(ctx, pauseNow, wall);
           return reason === undefined ? undefined : new CodexTurnTripError(reason, pauseNow.capture());
         };
-        if (zeroEvidenceIdle) err = recoveryInterruption() ?? err;
+        if (idleStallKind) err = recoveryInterruption() ?? err;
         // At most one idle capture and one declined hold; each new interruption leaves
         // the idle arm and follows the existing pause/wall route with its own snapshot.
         routeTrip: for (;;) {
@@ -5849,7 +5854,7 @@ export class CodexExecutor implements Executor {
             if (held) return { kind: "held", reason };
             if (wallTrip) return { kind: "walled" };
           }
-          if (zeroEvidenceIdle && msg === REASON_IDLE) {
+          if (idleStallKind && msg === REASON_IDLE) {
             const interrupted = recoveryInterruption();
             if (interrupted) { err = interrupted; continue routeTrip; }
             if (!pauseNow.vaultLock.latched) {
@@ -5857,8 +5862,12 @@ export class CodexExecutor implements Executor {
               const afterCapture = recoveryInterruption();
               if (afterCapture) { err = afterCapture; continue routeTrip; }
               if (!pauseNow.vaultLock.latched) {
-                throw new TransientRecoveryError("provider sent no model output within the idle timeout",
-                  humanRevision ? { zeroEvidenceIdle: true, originalIdle: caught instanceof Error ? caught : undefined } : {});
+                throw new TransientRecoveryError(idleStallKind === "productive"
+                  ? "model output stalled within the idle timeout"
+                  : "provider sent no model output within the idle timeout", {
+                  ...(humanRevision || ctx.codexIdleStallRecovery ? { idleStallKind } : {}),
+                  originalIdle: caught instanceof Error ? caught : undefined,
+                });
               }
             }
           }

@@ -68,7 +68,8 @@ func (h *Handler) runPriorityClass(ctx context.Context, r store.Run) string {
 //   - "wall"      → park immediately, exactly like "now" (PRD #1497 M1): the system's wall
 //     request means the deadline is reached, so the worker drops the in-flight turn and takes
 //     the capture-first wall park at once.
-//   - "milestone" → park once there is no frozen list to wait on (park at the next turn
+//   - "milestone", "reserve" → ("reserve" is the weekly usage reserve's system request, PRD #3522
+//     M4a, served to the worker exactly as a milestone request) park once there is no frozen list to wait on (park at the next turn
 //     boundary) OR the in-flight milestone has completed (completed count now exceeds the
 //     count captured at request time).
 //   - any other value (empty / no pause pending) → false.
@@ -76,7 +77,7 @@ func pauseRequestedRule(pauseMode string, frozenLen, completedLen, afterCount in
 	switch pauseMode {
 	case "now", "wall":
 		return true
-	case "milestone":
+	case "milestone", "reserve":
 		return frozenLen == 0 || completedLen > afterCount
 	default:
 		return false
@@ -255,6 +256,11 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		Health:        r.Health,
 		HealthReason:  withoutCodexAdmissionReason(textPtrValue(r.HealthReason.Valid, r.HealthReason.String)),
 		HealthSince:   timePtr(r.HealthSince.Valid, r.HealthSince.Time),
+		// PRD #3522: the weekly-usage-reserve reason, only while the run is queued (the marker
+		// describes a queued run; ClaimRun clears it on claim).
+		ReserveHoldReason: reserveHoldReasonPtr(r),
+		// PRD #3522 M4a: when a manual-resume override of the reserve ends, while one is in force.
+		ReserveExemptUntil: timePtr(r.ReserveExemptUntil.Valid, r.ReserveExemptUntil.Time),
 		// PRD #1170: the server-computed wall-clock deadline the near-timeout badge
 		// counts down to. RunDeadline returns nil for a run with no wall deadline
 		// (not running, chat/judge/interactive, or no started_at).
@@ -728,6 +734,15 @@ func (h *Handler) overlayCodexAccountActions(ctx context.Context, dtos ...*apity
 	}
 }
 
+// reserveHoldReasonPtr is the DTO's reserve_hold_reason: the persisted marker, only while the run
+// is queued, nil otherwise.
+func reserveHoldReasonPtr(r store.Run) *string {
+	if r.Status != "queued" || !r.ReserveHoldReason.Valid {
+		return nil
+	}
+	return textPtrValue(true, r.ReserveHoldReason.String)
+}
+
 // queueReasonPtr maps a SQL-derived queue_reason column (” = none) to the wire pointer.
 func queueReasonPtr(s string) *string {
 	if s == "" {
@@ -893,7 +908,8 @@ func admissionFields(class pgtype.Text, eligibleAt pgtype.Timestamptz) (*string,
 
 func overlayAdmissionReason(reason *string, queueReason string, class *string, eligibleAt *time.Time) *string {
 	reason = withoutCodexAdmissionReason(reason)
-	if queueReason == "maintenance" || class == nil || eligibleAt == nil {
+	// The weekly reserve (PRD #3522) outranks account admission, as in the health ladder.
+	if queueReason == "maintenance" || queueReason == "weekly_reserve" || class == nil || eligibleAt == nil {
 		return reason
 	}
 	if reason != nil && workersvc.QueuedReasonPrecedesCodexAdmission(*reason) {

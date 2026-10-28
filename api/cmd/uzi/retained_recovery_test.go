@@ -25,6 +25,7 @@ func retainedRecoveryRun(timing string) apitypes.RunDTO {
 	}
 	r.RecoveryWaitCause = &cause
 	r.RecoveryRetryNotBefore = nil
+	r.RecoveryRetryNotBeforePresent = true
 	if timing != "held" {
 		stamp := time.Date(2099, 1, 2, 3, 4, 5, 0, time.UTC)
 		if timing == "due" {
@@ -305,6 +306,13 @@ func TestRetainedRecoveryOwnerActions(t *testing.T) {
 						want := "/api/runs/r1/resume-now"
 						if verb == "cancel" {
 							want = "/api/runs/r1/inputs"
+						}
+						// PRD #3522: human `run resume` first reads the run's hold to word the
+						// weekly-reserve override line; serve that read, it is not an owner action.
+						if verb == "resume" && req.Method == http.MethodGet && req.URL.Path == "/api/runs/r1" {
+							w.Header().Set("Content-Type", "application/json")
+							_ = json.NewEncoder(w).Encode(retainedRecoveryRun(timing))
+							return
 						}
 						if req.Method != http.MethodPost || req.URL.Path != want {
 							t.Errorf("unexpected request %s %s", req.Method, req.URL.Path)

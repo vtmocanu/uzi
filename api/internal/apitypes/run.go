@@ -205,6 +205,8 @@ type MemoryHoldDTO struct {
 
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
+	// Detail-only detector provenance; never approval authority or summary polling data.
+	CapabilityProvenance                           *CapabilityProvenance `json:"capability_provenance,omitempty"`
 	CompletionPending                              *CompletionPendingDTO `json:"completion_pending,omitempty"`
 	SemanticGate                                   *SemanticGateDTO      `json:"semantic_gate,omitempty"`
 	SemanticDrift                                  *SemanticDriftDTO     `json:"semantic_drift,omitempty"`
@@ -565,10 +567,21 @@ type RunDTO struct {
 	// chat/judge/interactive run, or no started_at). The near-timeout badge counts down
 	// to it; the reason string stays static, so nothing stored ever ages (D4).
 	DeadlineAt *time.Time `json:"deadline_at"`
-	// QueueReason is maintenance, codex_rate_limit, or codex_overload while a queued
-	// run is held; absent otherwise. Maintenance takes precedence. The handler overlays
-	// this at read time from ListRunAdmissionQueueReasons on owner-authorized reads.
+	// QueueReason is maintenance, weekly_reserve (PRD #3522), codex_rate_limit, or
+	// codex_overload while a queued run is held; absent otherwise. Precedence is in that
+	// order. The handler overlays this at read time from ListRunAdmissionQueueReasons on
+	// owner-authorized reads.
 	QueueReason *string `json:"queue_reason,omitempty"`
+	// ReserveHoldReason (PRD #3522) is the visible weekly-usage-reserve reason ("weekly usage
+	// reserve: 72% >= 70%" or "weekly usage reserve: weekly usage unknown") while this QUEUED run is
+	// held because the credential it would spend reads at or above the owner's threshold, or
+	// cannot be read. Absent otherwise; runToDTO fills it only while status is "queued".
+	ReserveHoldReason *string `json:"reserve_hold_reason,omitempty"`
+	// ReserveExemptUntil (PRD #3522 M4a) is when the owner's manual resume of a weekly-reserve pause
+	// stops exempting this run from the reserve (the next observed 7-day reset, or seven days after
+	// the resume when no reset time was known). Absent when no exemption is in force; it clears early
+	// when the reset is observed sooner.
+	ReserveExemptUntil *time.Time `json:"reserve_exempt_until,omitempty"`
 	// Read-time account admission details; absent when unrestricted.
 	CodexAdmissionClass      *string    `json:"codex_admission_class,omitempty"`
 	CodexAdmissionEligibleAt *time.Time `json:"codex_admission_eligible_at,omitempty"`
@@ -896,15 +909,17 @@ type RunDTO struct {
 	// The label is USER-SUPPLIED text, so terminal consumers must sanitize it as they
 	// do AnthropicSecretLabel.
 	CodexSecretLabel *string `json:"codex_secret_label"`
-	// RecoveryRetryNotBefore is when the server will promote a 'recovery_wait' run back to
-	// queued — the retry stamp the forge-park surface counts down to ("retry at HH:MM"). It is
-	// the recovery-park analog of RetryNotBefore (the usage-limit park's stamp) and is a
-	// SEPARATE column: a run parks on at most one of the two at a time, but they never share a
-	// field. Null for a run that has never recovery-parked or an owner-held recovery park.
-	// For retained_recovery_exhausted, a timestamp (including a due one) means timed retry;
-	// null means owner-held. retained_recovery_adoption_failed always holds without a timer,
-	// regardless of any malformed supplied timestamp. Surfaced for every recovery cause (SC5).
+	// RecoveryRetryNotBefore is the earliest scheduled recovery promotion time, not
+	// a promise of immediate execution. It is separate from the usage-limit RetryNotBefore.
+	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
+	// or retained_recovery_exhausted park. An omitted key in a partial client read means
+	// timing is unknown; consult RecoveryRetryNotBeforePresent before inferring a hold.
+	// retained_recovery_adoption_failed is always owner-held, even if a malformed
+	// response supplies a retry timestamp; the cause never schedules a timer.
 	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`
+	// RecoveryRetryNotBeforePresent records JSON key presence for partial client reads.
+	// It never changes the wire representation.
+	RecoveryRetryNotBeforePresent bool `json:"-"`
 	// ForgeParkCount is how many times this run has forge-parked in its lifetime (PRD #1392
 	// M1), the FORGE-ONLY counter the cap decides on — distinct from the backoff-shaping
 	// recovery_wait_count. 0 for a run that has never forge-parked (including every empty-turn
@@ -1424,10 +1439,21 @@ type RunSummaryItemDTO struct {
 	// chat/judge/interactive run, or no started_at). The near-timeout badge counts down
 	// to it; the reason string stays static, so nothing stored ever ages (D4).
 	DeadlineAt *time.Time `json:"deadline_at"`
-	// QueueReason is maintenance, codex_rate_limit, or codex_overload while a queued
-	// run is held; absent otherwise. Maintenance takes precedence. The handler overlays
-	// this at read time from ListRunAdmissionQueueReasons on owner-authorized reads.
+	// QueueReason is maintenance, weekly_reserve (PRD #3522), codex_rate_limit, or
+	// codex_overload while a queued run is held; absent otherwise. Precedence is in that
+	// order. The handler overlays this at read time from ListRunAdmissionQueueReasons on
+	// owner-authorized reads.
 	QueueReason *string `json:"queue_reason,omitempty"`
+	// ReserveHoldReason (PRD #3522) is the visible weekly-usage-reserve reason ("weekly usage
+	// reserve: 72% >= 70%" or "weekly usage reserve: weekly usage unknown") while this QUEUED run is
+	// held because the credential it would spend reads at or above the owner's threshold, or
+	// cannot be read. Absent otherwise; runToDTO fills it only while status is "queued".
+	ReserveHoldReason *string `json:"reserve_hold_reason,omitempty"`
+	// ReserveExemptUntil (PRD #3522 M4a) is when the owner's manual resume of a weekly-reserve pause
+	// stops exempting this run from the reserve (the next observed 7-day reset, or seven days after
+	// the resume when no reset time was known). Absent when no exemption is in force; it clears early
+	// when the reset is observed sooner.
+	ReserveExemptUntil *time.Time `json:"reserve_exempt_until,omitempty"`
 	// Read-time account admission details; absent when unrestricted.
 	CodexAdmissionClass      *string    `json:"codex_admission_class,omitempty"`
 	CodexAdmissionEligibleAt *time.Time `json:"codex_admission_eligible_at,omitempty"`
@@ -1735,15 +1761,17 @@ type RunSummaryItemDTO struct {
 	// The label is USER-SUPPLIED text, so terminal consumers must sanitize it as they
 	// do AnthropicSecretLabel.
 	CodexSecretLabel *string `json:"codex_secret_label"`
-	// RecoveryRetryNotBefore is when the server will promote a 'recovery_wait' run back to
-	// queued — the retry stamp the forge-park surface counts down to ("retry at HH:MM"). It is
-	// the recovery-park analog of RetryNotBefore (the usage-limit park's stamp) and is a
-	// SEPARATE column: a run parks on at most one of the two at a time, but they never share a
-	// field. Null for a run that has never recovery-parked or an owner-held recovery park.
-	// For retained_recovery_exhausted, a timestamp (including a due one) means timed retry;
-	// null means owner-held. retained_recovery_adoption_failed always holds without a timer,
-	// regardless of any malformed supplied timestamp. Surfaced for every recovery cause (SC5).
+	// RecoveryRetryNotBefore is the earliest scheduled recovery promotion time, not
+	// a promise of immediate execution. It is separate from the usage-limit RetryNotBefore.
+	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
+	// or retained_recovery_exhausted park. An omitted key in a partial client read means
+	// timing is unknown; consult RecoveryRetryNotBeforePresent before inferring a hold.
+	// retained_recovery_adoption_failed is always owner-held, even if a malformed
+	// response supplies a retry timestamp; the cause never schedules a timer.
 	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`
+	// RecoveryRetryNotBeforePresent records JSON key presence for partial client reads.
+	// It never changes the wire representation.
+	RecoveryRetryNotBeforePresent bool `json:"-"`
 	// ForgeParkCount is how many times this run has forge-parked in its lifetime (PRD #1392
 	// M1), the FORGE-ONLY counter the cap decides on — distinct from the backoff-shaping
 	// recovery_wait_count. 0 for a run that has never forge-parked (including every empty-turn
@@ -1881,167 +1909,170 @@ type RunSummaryItemDTO struct {
 // key-set test in run_summary_test.go fails until the field is placed here on purpose.
 func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 	return RunSummaryItemDTO{
-		WorkerRecovery:              item.WorkerRecovery,
-		MemoryHold:                  item.MemoryHold,
-		ID:                          item.ID,
-		RepoID:                      item.RepoID,
-		ForgeType:                   item.ForgeType,
-		Kind:                        item.Kind,
-		IssueIID:                    item.IssueIID,
-		ContinuedIssueIID:           item.ContinuedIssueIID,
-		IssueTitle:                  item.IssueTitle,
-		Harness:                     item.Harness,
-		HasPRDLink:                  item.HasPRDLink,
-		Title:                       item.Title,
-		ResumeOfRunID:               item.ResumeOfRunID,
-		Status:                      item.Status,
-		RequeueCount:                item.RequeueCount,
-		IterationCount:              item.IterationCount,
-		IsPlanning:                  item.IsPlanning,
-		Progress:                    item.Progress,
-		AutoApprove:                 item.AutoApprove,
-		AutoApproveBlockedReasons:   item.AutoApproveBlockedReasons,
-		IssueInputReason:            item.IssueInputReason,
-		PlanCrossCheckRequired:      item.PlanCrossCheckRequired,
-		PlanCrossCheckGateReason:    item.PlanCrossCheckGateReason,
-		PlanCrossCheckDiffRefusal:   item.PlanCrossCheckDiffRefusal,
-		PlanCrossCheckSummary:       item.PlanCrossCheckSummary,
-		TriggerSource:               item.TriggerSource,
-		Milestones:                  item.Milestones,
-		MilestonesCandidate:         item.MilestonesCandidate,
-		MilestonesCompleted:         item.MilestonesCompleted,
-		MilestonesInProgress:        item.MilestonesInProgress,
-		MilestonesAgents:            item.MilestonesAgents,
-		MilestonesLive:              item.MilestonesLive,
-		BudgetMaxIterations:         item.BudgetMaxIterations,
-		BudgetWallSeconds:           item.BudgetWallSeconds,
-		BudgetExtensionSeconds:      item.BudgetExtensionSeconds,
-		BudgetExtensionCapSeconds:   item.BudgetExtensionCapSeconds,
-		BudgetFinalizeSeconds:       item.BudgetFinalizeSeconds,
-		BudgetTotalSeconds:          item.BudgetTotalSeconds,
-		BudgetUsedSeconds:           item.BudgetUsedSeconds,
-		ScopeCeiling:                item.ScopeCeiling,
-		PauseRequested:              item.PauseRequested,
-		CompletionBudgetExhausted:   item.CompletionBudgetExhausted,
-		PauseRequestedAt:            item.PauseRequestedAt,
-		PauseMode:                   item.PauseMode,
-		PauseAfterCount:             item.PauseAfterCount,
-		CheckpointTipAt:             item.CheckpointTipAt,
-		CompletionInterlock:         item.CompletionInterlock,
-		CompletionAttempts:          item.CompletionAttempts,
-		CompletionUnmet:             item.CompletionUnmet,
-		HoldReason:                  item.HoldReason,
-		HoldContext:                 item.HoldContext,
-		CanStopAtWall:               item.CanStopAtWall,
-		CanStopAtProviderHold:       item.CanStopAtProviderHold,
-		CompletionPhase:             item.CompletionPhase,
-		CompletionRevision:          item.CompletionRevision,
-		CompletionDeferred:          item.CompletionDeferred,
-		CompletionAccepted:          item.CompletionAccepted,
-		WorkerID:                    item.WorkerID,
-		Branch:                      item.Branch,
-		BaseBranch:                  item.BaseBranch,
-		OpenMr:                      item.OpenMr,
-		Interactive:                 item.Interactive,
-		DispatchedAt:                item.DispatchedAt,
-		MrIID:                       item.MrIID,
-		MrWebURL:                    item.MrWebURL,
-		BranchHasActiveRun:          item.BranchHasActiveRun,
-		BranchHasOpenMr:             item.BranchHasOpenMr,
-		IssueWebURL:                 item.IssueWebURL,
-		MrState:                     item.MrState,
-		FailureReason:               item.FailureReason,
-		StopKind:                    item.StopKind,
-		StopReason:                  item.StopReason,
-		Health:                      item.Health,
-		HealthReason:                item.HealthReason,
-		HealthSince:                 item.HealthSince,
-		DeadlineAt:                  item.DeadlineAt,
-		QueueReason:                 item.QueueReason,
-		CodexAdmissionClass:         item.CodexAdmissionClass,
-		CodexAdmissionEligibleAt:    item.CodexAdmissionEligibleAt,
-		PlanSource:                  item.PlanSource,
-		GateRevision:                item.GateRevision,
-		SummaryIntent:               item.SummaryIntent,
-		SummaryPlan:                 item.SummaryPlan,
-		SummaryDeltas:               item.SummaryDeltas,
-		PrDescription:               item.PrDescription,
-		PrDescriptionOutcome:        item.PrDescriptionOutcome,
-		Job:                         item.Job,
-		PipelineRef:                 item.PipelineRef,
-		PipelineWebURL:              item.PipelineWebURL,
-		FixVerdict:                  item.FixVerdict,
-		ReportOnly:                  item.ReportOnly,
-		ReportMd:                    item.ReportMd,
-		FailOrigin:                  item.FailOrigin,
-		LandingState:                item.LandingState,
-		SalvageState:                item.SalvageState,
-		SalvageRef:                  item.SalvageRef,
-		SalvageTip:                  item.SalvageTip,
-		SalvageExpiresAt:            item.SalvageExpiresAt,
-		SalvageLastError:            item.SalvageLastError,
-		PrdDonePath:                 item.PrdDonePath,
-		PrdPatchSettledAt:           item.PrdPatchSettledAt,
-		ClaimedAt:                   item.ClaimedAt,
-		StartedAt:                   item.StartedAt,
-		FirstStartedAt:              item.FirstStartedAt,
-		ClaimGeneration:             item.ClaimGeneration,
-		FinishedAt:                  item.FinishedAt,
-		CreatedAt:                   item.CreatedAt,
-		UpdatedAt:                   item.UpdatedAt,
-		StatusSince:                 item.StatusSince,
-		AgentSource:                 item.AgentSource,
-		AgentExclusions:             item.AgentExclusions,
-		OwnAgents:                   item.OwnAgents,
-		AnthropicSecretID:           item.AnthropicSecretID,
-		AnthropicSecretLabel:        item.AnthropicSecretLabel,
-		AnthropicSelectReason:       item.AnthropicSelectReason,
-		AnthropicHeadroomPct:        item.AnthropicHeadroomPct,
-		Usage:                       item.Usage,
-		UsageEstimatedTail:          item.UsageEstimatedTail,
-		WaitOnLimit:                 item.WaitOnLimit,
-		MrReworkEnabled:             item.MrReworkEnabled,
-		MrReworkAutoCycles:          item.MrReworkAutoCycles,
-		MrReworkAutoCap:             item.MrReworkAutoCap,
-		LimitResetsAt:               item.LimitResetsAt,
-		RetryNotBefore:              item.RetryNotBefore,
-		LimitWaitCount:              item.LimitWaitCount,
-		RateLimitType:               item.RateLimitType,
-		RecoveryWaitCause:           item.RecoveryWaitCause,
-		CodexAccountAction:          item.CodexAccountAction,
-		CodexSecretID:               item.CodexSecretID,
-		CodexSecretLabel:            item.CodexSecretLabel,
-		RecoveryRetryNotBefore:      item.RecoveryRetryNotBefore,
-		ForgeParkCount:              item.ForgeParkCount,
-		ForgeParkMax:                item.ForgeParkMax,
-		DiskParkCount:               item.DiskParkCount,
-		ProviderParkCount:           item.ProviderParkCount,
-		ProviderParkStreakStartedAt: item.ProviderParkStreakStartedAt,
-		CheckpointContainsLatest:    item.CheckpointContainsLatest,
-		HomeBytes:                   item.HomeBytes,
-		CacheBytes:                  item.CacheBytes,
-		DiskTruncated:               item.DiskTruncated,
-		Model:                       item.Model,
-		OverrideSubagentModel:       item.OverrideSubagentModel,
-		Priority:                    item.Priority,
-		RequiredCapabilities:        item.RequiredCapabilities,
-		IgnoredInferredCapabilities: item.IgnoredInferredCapabilities,
-		RequiredTools:               item.RequiredTools,
-		SizeClass:                   item.SizeClass,
-		PlanChangedFiles:            item.PlanChangedFiles,
-		CurrentActivity:             item.CurrentActivity,
-		CredentialOverride:          item.CredentialOverride,
-		CredentialSwitch:            item.CredentialSwitch,
-		CredentialEpochs:            item.CredentialEpochs,
-		OutcomePending:              item.OutcomePending,
-		RepoPath:                    item.RepoPath,
-		WorkerName:                  item.WorkerName,
-		OwnerEmail:                  item.OwnerEmail,
-		JudgeVerdict:                item.JudgeVerdict,
-		JudgeTodoCount:              item.JudgeTodoCount,
-		IsRevising:                  item.IsRevising,
-		CodeCrossCheckRequired:      item.CodeCrossCheckRequired,
-		CodeCrossCheckSummary:       item.CodeCrossCheckSummary,
+		WorkerRecovery:                item.WorkerRecovery,
+		MemoryHold:                    item.MemoryHold,
+		ID:                            item.ID,
+		RepoID:                        item.RepoID,
+		ForgeType:                     item.ForgeType,
+		Kind:                          item.Kind,
+		IssueIID:                      item.IssueIID,
+		ContinuedIssueIID:             item.ContinuedIssueIID,
+		IssueTitle:                    item.IssueTitle,
+		Harness:                       item.Harness,
+		HasPRDLink:                    item.HasPRDLink,
+		Title:                         item.Title,
+		ResumeOfRunID:                 item.ResumeOfRunID,
+		Status:                        item.Status,
+		RequeueCount:                  item.RequeueCount,
+		IterationCount:                item.IterationCount,
+		IsPlanning:                    item.IsPlanning,
+		Progress:                      item.Progress,
+		AutoApprove:                   item.AutoApprove,
+		AutoApproveBlockedReasons:     item.AutoApproveBlockedReasons,
+		IssueInputReason:              item.IssueInputReason,
+		PlanCrossCheckRequired:        item.PlanCrossCheckRequired,
+		PlanCrossCheckGateReason:      item.PlanCrossCheckGateReason,
+		PlanCrossCheckDiffRefusal:     item.PlanCrossCheckDiffRefusal,
+		PlanCrossCheckSummary:         item.PlanCrossCheckSummary,
+		TriggerSource:                 item.TriggerSource,
+		Milestones:                    item.Milestones,
+		MilestonesCandidate:           item.MilestonesCandidate,
+		MilestonesCompleted:           item.MilestonesCompleted,
+		MilestonesInProgress:          item.MilestonesInProgress,
+		MilestonesAgents:              item.MilestonesAgents,
+		MilestonesLive:                item.MilestonesLive,
+		BudgetMaxIterations:           item.BudgetMaxIterations,
+		BudgetWallSeconds:             item.BudgetWallSeconds,
+		BudgetExtensionSeconds:        item.BudgetExtensionSeconds,
+		BudgetExtensionCapSeconds:     item.BudgetExtensionCapSeconds,
+		BudgetFinalizeSeconds:         item.BudgetFinalizeSeconds,
+		BudgetTotalSeconds:            item.BudgetTotalSeconds,
+		BudgetUsedSeconds:             item.BudgetUsedSeconds,
+		ScopeCeiling:                  item.ScopeCeiling,
+		PauseRequested:                item.PauseRequested,
+		CompletionBudgetExhausted:     item.CompletionBudgetExhausted,
+		PauseRequestedAt:              item.PauseRequestedAt,
+		PauseMode:                     item.PauseMode,
+		PauseAfterCount:               item.PauseAfterCount,
+		CheckpointTipAt:               item.CheckpointTipAt,
+		CompletionInterlock:           item.CompletionInterlock,
+		CompletionAttempts:            item.CompletionAttempts,
+		CompletionUnmet:               item.CompletionUnmet,
+		HoldReason:                    item.HoldReason,
+		HoldContext:                   item.HoldContext,
+		CanStopAtWall:                 item.CanStopAtWall,
+		CanStopAtProviderHold:         item.CanStopAtProviderHold,
+		CompletionPhase:               item.CompletionPhase,
+		CompletionRevision:            item.CompletionRevision,
+		CompletionDeferred:            item.CompletionDeferred,
+		CompletionAccepted:            item.CompletionAccepted,
+		WorkerID:                      item.WorkerID,
+		Branch:                        item.Branch,
+		BaseBranch:                    item.BaseBranch,
+		OpenMr:                        item.OpenMr,
+		Interactive:                   item.Interactive,
+		DispatchedAt:                  item.DispatchedAt,
+		MrIID:                         item.MrIID,
+		MrWebURL:                      item.MrWebURL,
+		BranchHasActiveRun:            item.BranchHasActiveRun,
+		BranchHasOpenMr:               item.BranchHasOpenMr,
+		IssueWebURL:                   item.IssueWebURL,
+		MrState:                       item.MrState,
+		FailureReason:                 item.FailureReason,
+		StopKind:                      item.StopKind,
+		StopReason:                    item.StopReason,
+		Health:                        item.Health,
+		HealthReason:                  item.HealthReason,
+		HealthSince:                   item.HealthSince,
+		DeadlineAt:                    item.DeadlineAt,
+		QueueReason:                   item.QueueReason,
+		ReserveHoldReason:             item.ReserveHoldReason,
+		ReserveExemptUntil:            item.ReserveExemptUntil,
+		CodexAdmissionClass:           item.CodexAdmissionClass,
+		CodexAdmissionEligibleAt:      item.CodexAdmissionEligibleAt,
+		PlanSource:                    item.PlanSource,
+		GateRevision:                  item.GateRevision,
+		SummaryIntent:                 item.SummaryIntent,
+		SummaryPlan:                   item.SummaryPlan,
+		SummaryDeltas:                 item.SummaryDeltas,
+		PrDescription:                 item.PrDescription,
+		PrDescriptionOutcome:          item.PrDescriptionOutcome,
+		Job:                           item.Job,
+		PipelineRef:                   item.PipelineRef,
+		PipelineWebURL:                item.PipelineWebURL,
+		FixVerdict:                    item.FixVerdict,
+		ReportOnly:                    item.ReportOnly,
+		ReportMd:                      item.ReportMd,
+		FailOrigin:                    item.FailOrigin,
+		LandingState:                  item.LandingState,
+		SalvageState:                  item.SalvageState,
+		SalvageRef:                    item.SalvageRef,
+		SalvageTip:                    item.SalvageTip,
+		SalvageExpiresAt:              item.SalvageExpiresAt,
+		SalvageLastError:              item.SalvageLastError,
+		PrdDonePath:                   item.PrdDonePath,
+		PrdPatchSettledAt:             item.PrdPatchSettledAt,
+		ClaimedAt:                     item.ClaimedAt,
+		StartedAt:                     item.StartedAt,
+		FirstStartedAt:                item.FirstStartedAt,
+		ClaimGeneration:               item.ClaimGeneration,
+		FinishedAt:                    item.FinishedAt,
+		CreatedAt:                     item.CreatedAt,
+		UpdatedAt:                     item.UpdatedAt,
+		StatusSince:                   item.StatusSince,
+		AgentSource:                   item.AgentSource,
+		AgentExclusions:               item.AgentExclusions,
+		OwnAgents:                     item.OwnAgents,
+		AnthropicSecretID:             item.AnthropicSecretID,
+		AnthropicSecretLabel:          item.AnthropicSecretLabel,
+		AnthropicSelectReason:         item.AnthropicSelectReason,
+		AnthropicHeadroomPct:          item.AnthropicHeadroomPct,
+		Usage:                         item.Usage,
+		UsageEstimatedTail:            item.UsageEstimatedTail,
+		WaitOnLimit:                   item.WaitOnLimit,
+		MrReworkEnabled:               item.MrReworkEnabled,
+		MrReworkAutoCycles:            item.MrReworkAutoCycles,
+		MrReworkAutoCap:               item.MrReworkAutoCap,
+		LimitResetsAt:                 item.LimitResetsAt,
+		RetryNotBefore:                item.RetryNotBefore,
+		LimitWaitCount:                item.LimitWaitCount,
+		RateLimitType:                 item.RateLimitType,
+		RecoveryWaitCause:             item.RecoveryWaitCause,
+		CodexAccountAction:            item.CodexAccountAction,
+		CodexSecretID:                 item.CodexSecretID,
+		CodexSecretLabel:              item.CodexSecretLabel,
+		RecoveryRetryNotBefore:        item.RecoveryRetryNotBefore,
+		RecoveryRetryNotBeforePresent: item.RecoveryRetryNotBeforePresent,
+		ForgeParkCount:                item.ForgeParkCount,
+		ForgeParkMax:                  item.ForgeParkMax,
+		DiskParkCount:                 item.DiskParkCount,
+		ProviderParkCount:             item.ProviderParkCount,
+		ProviderParkStreakStartedAt:   item.ProviderParkStreakStartedAt,
+		CheckpointContainsLatest:      item.CheckpointContainsLatest,
+		HomeBytes:                     item.HomeBytes,
+		CacheBytes:                    item.CacheBytes,
+		DiskTruncated:                 item.DiskTruncated,
+		Model:                         item.Model,
+		OverrideSubagentModel:         item.OverrideSubagentModel,
+		Priority:                      item.Priority,
+		RequiredCapabilities:          item.RequiredCapabilities,
+		IgnoredInferredCapabilities:   item.IgnoredInferredCapabilities,
+		RequiredTools:                 item.RequiredTools,
+		SizeClass:                     item.SizeClass,
+		PlanChangedFiles:              item.PlanChangedFiles,
+		CurrentActivity:               item.CurrentActivity,
+		CredentialOverride:            item.CredentialOverride,
+		CredentialSwitch:              item.CredentialSwitch,
+		CredentialEpochs:              item.CredentialEpochs,
+		OutcomePending:                item.OutcomePending,
+		RepoPath:                      item.RepoPath,
+		WorkerName:                    item.WorkerName,
+		OwnerEmail:                    item.OwnerEmail,
+		JudgeVerdict:                  item.JudgeVerdict,
+		JudgeTodoCount:                item.JudgeTodoCount,
+		IsRevising:                    item.IsRevising,
+		CodeCrossCheckRequired:        item.CodeCrossCheckRequired,
+		CodeCrossCheckSummary:         item.CodeCrossCheckSummary,
 	}
 }
 
@@ -2051,162 +2082,165 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 	return RunListItemDTO{
 		RunDTO: RunDTO{
-			WorkerRecovery:              s.WorkerRecovery,
-			MemoryHold:                  s.MemoryHold,
-			ID:                          s.ID,
-			RepoID:                      s.RepoID,
-			ForgeType:                   s.ForgeType,
-			Kind:                        s.Kind,
-			IssueIID:                    s.IssueIID,
-			ContinuedIssueIID:           s.ContinuedIssueIID,
-			IssueTitle:                  s.IssueTitle,
-			Harness:                     s.Harness,
-			HasPRDLink:                  s.HasPRDLink,
-			Title:                       s.Title,
-			ResumeOfRunID:               s.ResumeOfRunID,
-			Status:                      s.Status,
-			RequeueCount:                s.RequeueCount,
-			IterationCount:              s.IterationCount,
-			IsPlanning:                  s.IsPlanning,
-			Progress:                    s.Progress,
-			AutoApprove:                 s.AutoApprove,
-			AutoApproveBlockedReasons:   s.AutoApproveBlockedReasons,
-			IssueInputReason:            s.IssueInputReason,
-			PlanCrossCheckRequired:      s.PlanCrossCheckRequired,
-			PlanCrossCheckGateReason:    s.PlanCrossCheckGateReason,
-			PlanCrossCheckDiffRefusal:   s.PlanCrossCheckDiffRefusal,
-			PlanCrossCheckSummary:       s.PlanCrossCheckSummary,
-			TriggerSource:               s.TriggerSource,
-			Milestones:                  s.Milestones,
-			MilestonesCandidate:         s.MilestonesCandidate,
-			MilestonesCompleted:         s.MilestonesCompleted,
-			MilestonesInProgress:        s.MilestonesInProgress,
-			MilestonesAgents:            s.MilestonesAgents,
-			MilestonesLive:              s.MilestonesLive,
-			BudgetMaxIterations:         s.BudgetMaxIterations,
-			BudgetWallSeconds:           s.BudgetWallSeconds,
-			BudgetExtensionSeconds:      s.BudgetExtensionSeconds,
-			BudgetExtensionCapSeconds:   s.BudgetExtensionCapSeconds,
-			BudgetFinalizeSeconds:       s.BudgetFinalizeSeconds,
-			BudgetTotalSeconds:          s.BudgetTotalSeconds,
-			BudgetUsedSeconds:           s.BudgetUsedSeconds,
-			ScopeCeiling:                s.ScopeCeiling,
-			PauseRequested:              s.PauseRequested,
-			CompletionBudgetExhausted:   s.CompletionBudgetExhausted,
-			PauseRequestedAt:            s.PauseRequestedAt,
-			PauseMode:                   s.PauseMode,
-			PauseAfterCount:             s.PauseAfterCount,
-			CheckpointTipAt:             s.CheckpointTipAt,
-			CompletionInterlock:         s.CompletionInterlock,
-			CompletionAttempts:          s.CompletionAttempts,
-			CompletionUnmet:             s.CompletionUnmet,
-			HoldReason:                  s.HoldReason,
-			HoldContext:                 s.HoldContext,
-			CanStopAtWall:               s.CanStopAtWall,
-			CanStopAtProviderHold:       s.CanStopAtProviderHold,
-			CompletionPhase:             s.CompletionPhase,
-			CompletionRevision:          s.CompletionRevision,
-			CompletionDeferred:          s.CompletionDeferred,
-			CompletionAccepted:          s.CompletionAccepted,
-			WorkerID:                    s.WorkerID,
-			Branch:                      s.Branch,
-			BaseBranch:                  s.BaseBranch,
-			OpenMr:                      s.OpenMr,
-			Interactive:                 s.Interactive,
-			DispatchedAt:                s.DispatchedAt,
-			MrIID:                       s.MrIID,
-			MrWebURL:                    s.MrWebURL,
-			BranchHasActiveRun:          s.BranchHasActiveRun,
-			BranchHasOpenMr:             s.BranchHasOpenMr,
-			IssueWebURL:                 s.IssueWebURL,
-			MrState:                     s.MrState,
-			FailureReason:               s.FailureReason,
-			StopKind:                    s.StopKind,
-			StopReason:                  s.StopReason,
-			Health:                      s.Health,
-			HealthReason:                s.HealthReason,
-			HealthSince:                 s.HealthSince,
-			DeadlineAt:                  s.DeadlineAt,
-			QueueReason:                 s.QueueReason,
-			CodexAdmissionClass:         s.CodexAdmissionClass,
-			CodexAdmissionEligibleAt:    s.CodexAdmissionEligibleAt,
-			PlanSource:                  s.PlanSource,
-			GateRevision:                s.GateRevision,
-			SummaryIntent:               s.SummaryIntent,
-			SummaryPlan:                 s.SummaryPlan,
-			SummaryDeltas:               s.SummaryDeltas,
-			PrDescription:               s.PrDescription,
-			PrDescriptionOutcome:        s.PrDescriptionOutcome,
-			Job:                         s.Job,
-			PipelineRef:                 s.PipelineRef,
-			PipelineWebURL:              s.PipelineWebURL,
-			FixVerdict:                  s.FixVerdict,
-			ReportOnly:                  s.ReportOnly,
-			ReportMd:                    s.ReportMd,
-			FailOrigin:                  s.FailOrigin,
-			LandingState:                s.LandingState,
-			SalvageState:                s.SalvageState,
-			SalvageRef:                  s.SalvageRef,
-			SalvageTip:                  s.SalvageTip,
-			SalvageExpiresAt:            s.SalvageExpiresAt,
-			SalvageLastError:            s.SalvageLastError,
-			PrdDonePath:                 s.PrdDonePath,
-			PrdPatchSettledAt:           s.PrdPatchSettledAt,
-			ClaimedAt:                   s.ClaimedAt,
-			StartedAt:                   s.StartedAt,
-			FirstStartedAt:              s.FirstStartedAt,
-			ClaimGeneration:             s.ClaimGeneration,
-			FinishedAt:                  s.FinishedAt,
-			CreatedAt:                   s.CreatedAt,
-			UpdatedAt:                   s.UpdatedAt,
-			StatusSince:                 s.StatusSince,
-			AgentSource:                 s.AgentSource,
-			AgentExclusions:             s.AgentExclusions,
-			OwnAgents:                   s.OwnAgents,
-			AnthropicSecretID:           s.AnthropicSecretID,
-			AnthropicSecretLabel:        s.AnthropicSecretLabel,
-			AnthropicSelectReason:       s.AnthropicSelectReason,
-			AnthropicHeadroomPct:        s.AnthropicHeadroomPct,
-			Usage:                       s.Usage,
-			UsageEstimatedTail:          s.UsageEstimatedTail,
-			WaitOnLimit:                 s.WaitOnLimit,
-			MrReworkEnabled:             s.MrReworkEnabled,
-			MrReworkAutoCycles:          s.MrReworkAutoCycles,
-			MrReworkAutoCap:             s.MrReworkAutoCap,
-			LimitResetsAt:               s.LimitResetsAt,
-			RetryNotBefore:              s.RetryNotBefore,
-			LimitWaitCount:              s.LimitWaitCount,
-			RateLimitType:               s.RateLimitType,
-			RecoveryWaitCause:           s.RecoveryWaitCause,
-			CodexAccountAction:          s.CodexAccountAction,
-			CodexSecretID:               s.CodexSecretID,
-			CodexSecretLabel:            s.CodexSecretLabel,
-			RecoveryRetryNotBefore:      s.RecoveryRetryNotBefore,
-			ForgeParkCount:              s.ForgeParkCount,
-			ForgeParkMax:                s.ForgeParkMax,
-			DiskParkCount:               s.DiskParkCount,
-			ProviderParkCount:           s.ProviderParkCount,
-			ProviderParkStreakStartedAt: s.ProviderParkStreakStartedAt,
-			CheckpointContainsLatest:    s.CheckpointContainsLatest,
-			HomeBytes:                   s.HomeBytes,
-			CacheBytes:                  s.CacheBytes,
-			DiskTruncated:               s.DiskTruncated,
-			Model:                       s.Model,
-			OverrideSubagentModel:       s.OverrideSubagentModel,
-			Priority:                    s.Priority,
-			RequiredCapabilities:        s.RequiredCapabilities,
-			IgnoredInferredCapabilities: s.IgnoredInferredCapabilities,
-			RequiredTools:               s.RequiredTools,
-			SizeClass:                   s.SizeClass,
-			PlanChangedFiles:            s.PlanChangedFiles,
-			CurrentActivity:             s.CurrentActivity,
-			CredentialOverride:          s.CredentialOverride,
-			CredentialSwitch:            s.CredentialSwitch,
-			CredentialEpochs:            s.CredentialEpochs,
-			OutcomePending:              s.OutcomePending,
-			IsRevising:                  s.IsRevising,
-			CodeCrossCheckRequired:      s.CodeCrossCheckRequired,
-			CodeCrossCheckSummary:       s.CodeCrossCheckSummary,
+			WorkerRecovery:                s.WorkerRecovery,
+			MemoryHold:                    s.MemoryHold,
+			ID:                            s.ID,
+			RepoID:                        s.RepoID,
+			ForgeType:                     s.ForgeType,
+			Kind:                          s.Kind,
+			IssueIID:                      s.IssueIID,
+			ContinuedIssueIID:             s.ContinuedIssueIID,
+			IssueTitle:                    s.IssueTitle,
+			Harness:                       s.Harness,
+			HasPRDLink:                    s.HasPRDLink,
+			Title:                         s.Title,
+			ResumeOfRunID:                 s.ResumeOfRunID,
+			Status:                        s.Status,
+			RequeueCount:                  s.RequeueCount,
+			IterationCount:                s.IterationCount,
+			IsPlanning:                    s.IsPlanning,
+			Progress:                      s.Progress,
+			AutoApprove:                   s.AutoApprove,
+			AutoApproveBlockedReasons:     s.AutoApproveBlockedReasons,
+			IssueInputReason:              s.IssueInputReason,
+			PlanCrossCheckRequired:        s.PlanCrossCheckRequired,
+			PlanCrossCheckGateReason:      s.PlanCrossCheckGateReason,
+			PlanCrossCheckDiffRefusal:     s.PlanCrossCheckDiffRefusal,
+			PlanCrossCheckSummary:         s.PlanCrossCheckSummary,
+			TriggerSource:                 s.TriggerSource,
+			Milestones:                    s.Milestones,
+			MilestonesCandidate:           s.MilestonesCandidate,
+			MilestonesCompleted:           s.MilestonesCompleted,
+			MilestonesInProgress:          s.MilestonesInProgress,
+			MilestonesAgents:              s.MilestonesAgents,
+			MilestonesLive:                s.MilestonesLive,
+			BudgetMaxIterations:           s.BudgetMaxIterations,
+			BudgetWallSeconds:             s.BudgetWallSeconds,
+			BudgetExtensionSeconds:        s.BudgetExtensionSeconds,
+			BudgetExtensionCapSeconds:     s.BudgetExtensionCapSeconds,
+			BudgetFinalizeSeconds:         s.BudgetFinalizeSeconds,
+			BudgetTotalSeconds:            s.BudgetTotalSeconds,
+			BudgetUsedSeconds:             s.BudgetUsedSeconds,
+			ScopeCeiling:                  s.ScopeCeiling,
+			PauseRequested:                s.PauseRequested,
+			CompletionBudgetExhausted:     s.CompletionBudgetExhausted,
+			PauseRequestedAt:              s.PauseRequestedAt,
+			PauseMode:                     s.PauseMode,
+			PauseAfterCount:               s.PauseAfterCount,
+			CheckpointTipAt:               s.CheckpointTipAt,
+			CompletionInterlock:           s.CompletionInterlock,
+			CompletionAttempts:            s.CompletionAttempts,
+			CompletionUnmet:               s.CompletionUnmet,
+			HoldReason:                    s.HoldReason,
+			HoldContext:                   s.HoldContext,
+			CanStopAtWall:                 s.CanStopAtWall,
+			CanStopAtProviderHold:         s.CanStopAtProviderHold,
+			CompletionPhase:               s.CompletionPhase,
+			CompletionRevision:            s.CompletionRevision,
+			CompletionDeferred:            s.CompletionDeferred,
+			CompletionAccepted:            s.CompletionAccepted,
+			WorkerID:                      s.WorkerID,
+			Branch:                        s.Branch,
+			BaseBranch:                    s.BaseBranch,
+			OpenMr:                        s.OpenMr,
+			Interactive:                   s.Interactive,
+			DispatchedAt:                  s.DispatchedAt,
+			MrIID:                         s.MrIID,
+			MrWebURL:                      s.MrWebURL,
+			BranchHasActiveRun:            s.BranchHasActiveRun,
+			BranchHasOpenMr:               s.BranchHasOpenMr,
+			IssueWebURL:                   s.IssueWebURL,
+			MrState:                       s.MrState,
+			FailureReason:                 s.FailureReason,
+			StopKind:                      s.StopKind,
+			StopReason:                    s.StopReason,
+			Health:                        s.Health,
+			HealthReason:                  s.HealthReason,
+			HealthSince:                   s.HealthSince,
+			DeadlineAt:                    s.DeadlineAt,
+			QueueReason:                   s.QueueReason,
+			ReserveHoldReason:             s.ReserveHoldReason,
+			ReserveExemptUntil:            s.ReserveExemptUntil,
+			CodexAdmissionClass:           s.CodexAdmissionClass,
+			CodexAdmissionEligibleAt:      s.CodexAdmissionEligibleAt,
+			PlanSource:                    s.PlanSource,
+			GateRevision:                  s.GateRevision,
+			SummaryIntent:                 s.SummaryIntent,
+			SummaryPlan:                   s.SummaryPlan,
+			SummaryDeltas:                 s.SummaryDeltas,
+			PrDescription:                 s.PrDescription,
+			PrDescriptionOutcome:          s.PrDescriptionOutcome,
+			Job:                           s.Job,
+			PipelineRef:                   s.PipelineRef,
+			PipelineWebURL:                s.PipelineWebURL,
+			FixVerdict:                    s.FixVerdict,
+			ReportOnly:                    s.ReportOnly,
+			ReportMd:                      s.ReportMd,
+			FailOrigin:                    s.FailOrigin,
+			LandingState:                  s.LandingState,
+			SalvageState:                  s.SalvageState,
+			SalvageRef:                    s.SalvageRef,
+			SalvageTip:                    s.SalvageTip,
+			SalvageExpiresAt:              s.SalvageExpiresAt,
+			SalvageLastError:              s.SalvageLastError,
+			PrdDonePath:                   s.PrdDonePath,
+			PrdPatchSettledAt:             s.PrdPatchSettledAt,
+			ClaimedAt:                     s.ClaimedAt,
+			StartedAt:                     s.StartedAt,
+			FirstStartedAt:                s.FirstStartedAt,
+			ClaimGeneration:               s.ClaimGeneration,
+			FinishedAt:                    s.FinishedAt,
+			CreatedAt:                     s.CreatedAt,
+			UpdatedAt:                     s.UpdatedAt,
+			StatusSince:                   s.StatusSince,
+			AgentSource:                   s.AgentSource,
+			AgentExclusions:               s.AgentExclusions,
+			OwnAgents:                     s.OwnAgents,
+			AnthropicSecretID:             s.AnthropicSecretID,
+			AnthropicSecretLabel:          s.AnthropicSecretLabel,
+			AnthropicSelectReason:         s.AnthropicSelectReason,
+			AnthropicHeadroomPct:          s.AnthropicHeadroomPct,
+			Usage:                         s.Usage,
+			UsageEstimatedTail:            s.UsageEstimatedTail,
+			WaitOnLimit:                   s.WaitOnLimit,
+			MrReworkEnabled:               s.MrReworkEnabled,
+			MrReworkAutoCycles:            s.MrReworkAutoCycles,
+			MrReworkAutoCap:               s.MrReworkAutoCap,
+			LimitResetsAt:                 s.LimitResetsAt,
+			RetryNotBefore:                s.RetryNotBefore,
+			LimitWaitCount:                s.LimitWaitCount,
+			RateLimitType:                 s.RateLimitType,
+			RecoveryWaitCause:             s.RecoveryWaitCause,
+			CodexAccountAction:            s.CodexAccountAction,
+			CodexSecretID:                 s.CodexSecretID,
+			CodexSecretLabel:              s.CodexSecretLabel,
+			RecoveryRetryNotBefore:        s.RecoveryRetryNotBefore,
+			RecoveryRetryNotBeforePresent: s.RecoveryRetryNotBeforePresent,
+			ForgeParkCount:                s.ForgeParkCount,
+			ForgeParkMax:                  s.ForgeParkMax,
+			DiskParkCount:                 s.DiskParkCount,
+			ProviderParkCount:             s.ProviderParkCount,
+			ProviderParkStreakStartedAt:   s.ProviderParkStreakStartedAt,
+			CheckpointContainsLatest:      s.CheckpointContainsLatest,
+			HomeBytes:                     s.HomeBytes,
+			CacheBytes:                    s.CacheBytes,
+			DiskTruncated:                 s.DiskTruncated,
+			Model:                         s.Model,
+			OverrideSubagentModel:         s.OverrideSubagentModel,
+			Priority:                      s.Priority,
+			RequiredCapabilities:          s.RequiredCapabilities,
+			IgnoredInferredCapabilities:   s.IgnoredInferredCapabilities,
+			RequiredTools:                 s.RequiredTools,
+			SizeClass:                     s.SizeClass,
+			PlanChangedFiles:              s.PlanChangedFiles,
+			CurrentActivity:               s.CurrentActivity,
+			CredentialOverride:            s.CredentialOverride,
+			CredentialSwitch:              s.CredentialSwitch,
+			CredentialEpochs:              s.CredentialEpochs,
+			OutcomePending:                s.OutcomePending,
+			IsRevising:                    s.IsRevising,
+			CodeCrossCheckRequired:        s.CodeCrossCheckRequired,
+			CodeCrossCheckSummary:         s.CodeCrossCheckSummary,
 		},
 		RepoPath:       s.RepoPath,
 		WorkerName:     s.WorkerName,
@@ -2452,4 +2486,63 @@ type RunJobFindingDTO struct {
 	URL       *string `json:"url"`
 	File      *string `json:"file"`
 	Line      *int    `json:"line"`
+}
+
+// UnmarshalJSON preserves absent versus explicitly null recovery timing while
+// retaining time.Time's standard validation of non-null dates.
+func (r *RunDTO) UnmarshalJSON(data []byte) error {
+	type plain RunDTO
+	var wire plain
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	var timing struct {
+		Retry json.RawMessage `json:"recovery_retry_not_before"`
+	}
+	if err := json.Unmarshal(data, &timing); err != nil {
+		return err
+	}
+	wire.RecoveryRetryNotBeforePresent = len(timing.Retry) > 0
+	*r = RunDTO(wire)
+	return nil
+}
+
+// UnmarshalJSON decodes the embedded run and list-only display context separately
+// so RunDTO.UnmarshalJSON does not swallow the outer list fields.
+func (r *RunListItemDTO) UnmarshalJSON(data []byte) error {
+	var run RunDTO
+	if err := json.Unmarshal(data, &run); err != nil {
+		return err
+	}
+	var context struct {
+		RepoPath       string  `json:"repo_path"`
+		WorkerName     *string `json:"worker_name"`
+		OwnerEmail     *string `json:"owner_email"`
+		JudgeVerdict   *string `json:"judge_verdict"`
+		JudgeTodoCount int     `json:"judge_todo_count"`
+	}
+	if err := json.Unmarshal(data, &context); err != nil {
+		return err
+	}
+	*r = RunListItemDTO{RunDTO: run, RepoPath: context.RepoPath, WorkerName: context.WorkerName,
+		OwnerEmail: context.OwnerEmail, JudgeVerdict: context.JudgeVerdict, JudgeTodoCount: context.JudgeTodoCount}
+	return nil
+}
+
+// UnmarshalJSON gives compact client reads the same timing semantics as full reads.
+func (r *RunSummaryItemDTO) UnmarshalJSON(data []byte) error {
+	type plain RunSummaryItemDTO
+	var wire plain
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	var timing struct {
+		Retry json.RawMessage `json:"recovery_retry_not_before"`
+	}
+	if err := json.Unmarshal(data, &timing); err != nil {
+		return err
+	}
+	wire.RecoveryRetryNotBeforePresent = len(timing.Retry) > 0
+	*r = RunSummaryItemDTO(wire)
+	return nil
 }

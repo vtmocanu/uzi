@@ -18,6 +18,7 @@ import type { ResidueQuarantineState } from "./residue-quarantine.js";
 import type { UsageWireRequest } from "./usage-recorder.js";
 import {
   WORKER_API_PREFIX,
+  CAPABILITY_INFERENCE_EVIDENCE_FEATURE,
   type MemoryBinding,
   type MemoryPolicy,
   type MemoryOutcome,
@@ -67,7 +68,7 @@ import {
   type OutgoingMessage,
   type RegisterRequest,
   type RegisterResponse,
-  type StateAck as ProtocolStateAck,
+  type StateAck,
   type CompletedPublicationReceipt,
   type CompletedPublicationReason,
   type PlanCrossCheckReconciliation,
@@ -125,9 +126,6 @@ export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model
   | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
   | "approved_not_stored" | "revisions_exhausted";
 import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions } from "./code-cross-check-contract.js";
-
-// Same-row classification decoded by readRunAck; status alone cannot confirm a typed park.
-type StateAck = ProtocolStateAck & { recoveryCause?: string };
 
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -2232,7 +2230,7 @@ export class WorkerClient {
     return this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
   }
 
-  /** Semantic writes require existing fences and never use compatibility stripping. */
+  /** Semantic authority fields never downgrade; advisory observations negotiate separately. */
   async reportSemanticPlanGateState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const frozen: PlanCrossCheckStateRequest = JSON.parse(JSON.stringify(body));
     if (!Number.isSafeInteger(frozen.claim_generation) || (frozen.claim_generation ?? 0) <= 0 ||
@@ -2298,6 +2296,17 @@ export class WorkerClient {
         throw err;
       }
     }
+    if (body.recovery_cause === "codex_idle_stall") {
+      // Freeze the negotiated obligation before generic generation/progress fallbacks.
+      const outbound: PlanCrossCheckStateRequest = Object.freeze(structuredClone(body));
+      const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+      try {
+        return await this.reportStateOnce(runId, path, outbound, signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
+      } catch (error) {
+        if (evidence.refusedAfterAmbiguity) throw new Error("Codex idle park outcome uncertain", { cause: error });
+        throw error;
+      }
+    }
     if (body.recovery_cause === "retained_recovery_exhausted" ||
         body.recovery_cause === "retained_recovery_adoption_failed") {
       if (!this.hasFeature(`recovery_cause_${body.recovery_cause}`) ||
@@ -2350,7 +2359,8 @@ export class WorkerClient {
         throw new Error("guarded question state requires awaiting_input and positive claim_generation");
       return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
-    // PRD #1247 fix round (E): /state carries claim_generation on EVERY mutating report (M5b's
+    // PRD #1247 fix round (E): reports without the advisory-evidence path below retain
+    // the legacy generation fallback. /state carries claim_generation on EVERY mutating report (M5b's
     // reportState closure stamps it), but /state DisallowUnknownFields-decodes, so a rolled-back api
     // that predates the field 400s the report and — force-roll off — a busy newer worker wedges every
     // run. Route the report through the SAME send-gate + skew-safe fallback as postMessages and the
@@ -2395,7 +2405,11 @@ export class WorkerClient {
         b.claim_generation,
       );
     try {
-      if (outbound.provider_progress_turns !== undefined && included) {
+      if (outbound.capability_inference_evidence !== undefined && this.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)) {
+        // Advisory rollback is resolved before the legacy generation fallback.
+        // A refusal of its stripped variant must never select an unfenced third body.
+        ack = await sendWith(outbound)(included);
+      } else if (outbound.provider_progress_turns !== undefined && included) {
         // Both attempts retain the fence. A stripped retry refusal propagates without
         // invoking the older generation fallback or sending a third variant.
         try {
@@ -2483,11 +2497,36 @@ export class WorkerClient {
     return receipt;
   }
 
-  /** One /state POST WITH the given body, including the transient-retry loop, AbortSignal
-   *  handling, 200/409 single-body ACK parse, already-terminal handling and logging. Split out of
-   *  reportState (PRD #1247 fix round E) so the claim_generation send-gate + strict-decode
-   *  strip-and-retry can drive it through withGenerationFallback, exactly as postMessages. */
+  /** Own and freeze evidence-bearing state-report wire variants. Only a proven decoder
+   * refusal selects the advisory-free variant; every authority field stays intact. */
   private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number, evidence?: StateAttemptEvidence, memoryPark?: {
+    incarnation: MemoryIncarnation;
+    binding: NonNullable<StateAck["memoryParkAccepted"]>;
+  }, admissionGeneration?: number): Promise<StateAck> {
+    const send = (variant: PlanCrossCheckStateRequest) =>
+      this.reportStateVariant(runId, path, variant, signal, maxAckBytes, evidence, memoryPark, admissionGeneration);
+    if (body.capability_inference_evidence === undefined) return send(body);
+    // Own the nested metadata and choose its wire presence once. Heartbeat refresh
+    // or caller mutation during backoff cannot change a variant's transport retries.
+    const primary = structuredClone(body);
+    if (!this.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)) delete primary.capability_inference_evidence;
+    Object.freeze(primary);
+    try { return await send(primary); }
+    catch (error) {
+      if (primary.capability_inference_evidence === undefined || !(error instanceof StateDecodeRefusalError)) throw error;
+    }
+    // The complete strict-decoder 400 proves this attempt did not reach state
+    // mutation. Freeze a compatibility variant with every authority field intact.
+    const compatible = structuredClone(primary);
+    delete compatible.capability_inference_evidence;
+    const ack = await send(Object.freeze(compatible));
+    if (ack.runId === runId && ack.status !== undefined && !ack.semanticGateMalformed)
+      this.dropFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE);
+    return ack;
+  }
+
+  /** Transient retries and ACK handling for one chosen state-report wire variant. */
+  private async reportStateVariant(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number, evidence?: StateAttemptEvidence, memoryPark?: {
     incarnation: MemoryIncarnation;
     binding: NonNullable<StateAck["memoryParkAccepted"]>;
   }, admissionGeneration?: number): Promise<StateAck> {
@@ -2504,6 +2543,13 @@ export class WorkerClient {
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
       // Revalidate on every actual attempt: registration may shrink while retry sleep yields.
+      if (body.recovery_cause === "codex_idle_stall" &&
+          (!this.hasFeature("recovery_cause_codex_idle_stall_v1") ||
+           !this.includeClaimGeneration(body.claim_generation) ||
+           !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+           body.status !== "recovery_wait" || !Number.isInteger(body.provider_progress_turns) ||
+           (body.provider_progress_turns ?? -1) < 0 || (body.provider_progress_turns ?? 0) > 2147483647))
+        throw new Error("Codex idle park requires support, a positive generation and provider progress");
       if (body.source_publication !== undefined) {
         const proof = body.source_publication;
         if (!this.hasFeature("refresh_publication_context_v1") ||
@@ -2519,8 +2565,9 @@ export class WorkerClient {
           throw new Error("source publication requires negotiated support, positive claim_generation and matching terminal proof");
       }
       try {
-        this.sealCodexAdmission(path, { ...body, claim_generation: admissionGeneration ?? body.claim_generation });
-        const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
+        const outbound = { ...body };
+        this.sealCodexAdmission(path, { ...outbound, claim_generation: admissionGeneration ?? outbound.claim_generation });
+        const res = await this.fetchRaw("POST", path, outbound, this.httpTimeoutMs, signal);
         // 409 = the server declined the transition and is telling us the run's real
         // status. Not an error, and not a retry: the server has moved on.
         if (res.status === 200 || res.status === 409) {
@@ -2652,7 +2699,7 @@ export class WorkerClient {
           }
           return ack;
         }
-        if (res.status === 400 && evidence) {
+        if (res.status === 400 && (evidence || body.capability_inference_evidence !== undefined)) {
           let text = "";
           let exact = false;
           try {

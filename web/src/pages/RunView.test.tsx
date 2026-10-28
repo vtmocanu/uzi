@@ -29,6 +29,8 @@ import {
   RecoveryWaitPanel,
   MrReworkPanel,
   PausedPanel,
+  ReserveExemptLine,
+  pauseRequestedLabel,
   RunView,
   RunSummary,
   derivePlanRevision,
@@ -2061,6 +2063,185 @@ describe("RunView — a paused run shows no live 'now' activity strip (PRD #1190
     expect(container.querySelector("[data-run-progress-card] ul")).not.toBeNull();
     // … but the live "now" strip is gone (nothing runs while paused).
     expect(nowStrip(container)).toBeNull();
+  });
+});
+
+// PRD #3522 M5: the weekly usage reserve on the run view.
+describe("RunView — weekly usage reserve (PRD #3522)", () => {
+  const CONFIRM = "Resuming overrides your weekly usage reserve until the next weekly reset";
+  function renderPage(over: Partial<Run>, canSteer = true) {
+    const refreshRun = vi.fn();
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun,
+      inputs: [],
+      canSteer,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    const utils = render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+    return { ...utils, refreshRun };
+  }
+  const RESERVE_PAUSED: Partial<Run> = {
+    status: "paused",
+    hold_reason: "weekly_reserve",
+    started_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T03:42:00Z",
+    branch: "agent/issue-33",
+  };
+  const RESERVE_REQUEST: Partial<Run> = {
+    status: "running",
+    pause_requested_at: "2026-01-01T02:00:00Z",
+    pause_mode: "reserve",
+    pause_after_count: 1,
+    milestones: [
+      { id: "m1", title: "a" },
+      { id: "m2", title: "b" },
+    ],
+    milestones_completed: ["m1"],
+  };
+
+  const realConfirm = window.confirm;
+  afterEach(() => { window.confirm = realConfirm; });
+
+  it("labels a pending reserve request and hides Cancel pause, offering guidance and Pause now", async () => {
+    renderPage(RESERVE_REQUEST);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByText("Pause requested · weekly usage reserve · after M2")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /cancel pause/i })).toBeNull();
+    expect(screen.getByText(/Run defaults/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /pause now/i })).toBeTruthy();
+  });
+
+  it("keeps Cancel pause for an owner request (positive control for the hidden button)", async () => {
+    renderPage({ ...RESERVE_REQUEST, pause_mode: "milestone" });
+    await screen.findByText("Add rate limiting");
+    expect(screen.getByRole("button", { name: /cancel pause/i })).toBeTruthy();
+    expect(screen.queryByText(/weekly usage reserve/)).toBeNull();
+  });
+
+  it("pauseRequestedLabel words the reserve source with and without milestones", () => {
+    expect(pauseRequestedLabel(run({ pause_mode: "reserve" }))).toBe(
+      "Pause requested · weekly usage reserve · after the current step",
+    );
+    expect(pauseRequestedLabel(run({ pause_mode: "milestone" }))).toBe("Pause requested · after the current step");
+  });
+
+  it("a reserve-parked run explains the hold in the panel", async () => {
+    renderPage(RESERVE_PAUSED);
+    await screen.findByText("Add rate limiting");
+    const note = document.querySelector('[data-hold-reason="weekly_reserve"]')!;
+    expect(note.textContent).toMatch(/Held by your weekly usage reserve/);
+    expect(note.textContent).toMatch(/resumes automatically when usage drops below the\s+threshold/);
+    expect(note.textContent).toMatch(/until the next weekly reset/);
+  });
+
+  it("an ordinary pause shows no reserve note", async () => {
+    renderPage({ ...RESERVE_PAUSED, hold_reason: null });
+    await screen.findByText("Add rate limiting");
+    expect(document.querySelector('[data-hold-reason="weekly_reserve"]')).toBeNull();
+  });
+
+  it("header Resume asks the exact confirmation and does not resume on cancel", async () => {
+    const confirm = vi.fn(() => false);
+    window.confirm = confirm;
+    renderPage(RESERVE_PAUSED);
+    await screen.findByText("Add rate limiting");
+    mockApi.resumeRun.mockClear();
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole("button", { name: /resume/i })[0]);
+    });
+    expect(confirm).toHaveBeenCalledWith(CONFIRM);
+    expect(mockApi.resumeRun).not.toHaveBeenCalled();
+  });
+
+  it("header Resume proceeds once the owner confirms", async () => {
+    const confirm = vi.fn(() => true);
+    window.confirm = confirm;
+    const { refreshRun } = renderPage(RESERVE_PAUSED);
+    await screen.findByText("Add rate limiting");
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole("button", { name: /resume/i })[0]);
+    });
+    expect(confirm).toHaveBeenCalledWith(CONFIRM);
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+
+  it("the panel Resume asks too, and an ordinary pause resumes with no prompt", async () => {
+    const confirm = vi.fn(() => false);
+    window.confirm = confirm;
+    const onResume = vi.fn();
+    const { unmount } = render(
+      <PausedPanel run={run(RESERVE_PAUSED)} busy={false} canSteer onResume={onResume} onStop={vi.fn()} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /resume/i }));
+    expect(confirm).toHaveBeenCalledWith(CONFIRM);
+    expect(onResume).not.toHaveBeenCalled();
+    unmount();
+    confirm.mockClear();
+    render(<PausedPanel run={run({ ...RESERVE_PAUSED, hold_reason: null })} busy={false} canSteer onResume={onResume} onStop={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /resume/i }));
+    expect(confirm).not.toHaveBeenCalled();
+    expect(onResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the override line while reserve_exempt_until is in the future, and only then", async () => {
+    const future = new Date(Date.now() + 3 * 24 * 3600 * 1000).toISOString();
+    const { unmount } = render(<ReserveExemptLine run={run({ reserve_exempt_until: future })} />);
+    expect(document.querySelector("[data-reserve-exempt]")!.textContent).toMatch(/^Weekly usage reserve overridden until /);
+    unmount();
+    const none = render(<ReserveExemptLine run={run({ reserve_exempt_until: null })} />);
+    expect(none.container.firstChild).toBeNull();
+    none.unmount();
+    const past = render(<ReserveExemptLine run={run({ reserve_exempt_until: "2020-01-01T00:00:00Z" })} />);
+    expect(past.container.firstChild).toBeNull();
+  });
+
+  it("shows the override line for a live run but not a finished one that still carries a future stamp", () => {
+    // The server never clears reserve_exempt_until on completed/failed/cancelled runs.
+    const future = new Date(Date.now() + 3 * 24 * 3600 * 1000).toISOString();
+    for (const status of ["paused", "queued"] as const) {
+      const live = render(<ReserveExemptLine run={run({ status, reserve_exempt_until: future })} />);
+      expect(document.querySelector("[data-reserve-exempt]")).not.toBeNull();
+      live.unmount();
+    }
+    for (const status of ["completed", "failed", "cancelled"] as const) {
+      const done = render(<ReserveExemptLine run={run({ status, reserve_exempt_until: future })} />);
+      expect(done.container.firstChild).toBeNull();
+      done.unmount();
+    }
+  });
+
+  it("the page header carries the override line for a run with an active override", async () => {
+    renderPage({ status: "running", reserve_exempt_until: new Date(Date.now() + 86_400_000).toISOString() });
+    await screen.findByText("Add rate limiting");
+    expect(document.querySelector("[data-reserve-exempt]")).not.toBeNull();
+  });
+
+  it("HealthFlag shows the reserve reason for a held queued run, with a fallback and maintenance precedence", () => {
+    const held = { status: "queued" as const, queue_reason: "weekly_reserve" as const, health: "waiting_worker" as const,
+      health_since: "2026-10-25T12:00:00Z", health_reason: "waiting for a worker to pick up this run" };
+    const a = render(<HealthFlag run={run({ ...held, reserve_hold_reason: "weekly usage reserve: 85% >= 80%" })} />);
+    expect(a.container.querySelector('[data-queue-reason="weekly_reserve"]')!.textContent).toBe(
+      "waiting: weekly usage reserve: 85% >= 80%",
+    );
+    expect(a.container.textContent).not.toContain("stuck for");
+    expect(a.container.querySelector('[role="status"]')!.textContent).toBe("waiting: weekly usage reserve: 85% >= 80%");
+    a.unmount();
+    const b = render(<HealthFlag run={run(held)} />);
+    expect(b.container.querySelector('[data-queue-reason="weekly_reserve"]')!.textContent).toBe("waiting: weekly usage reserve");
+    b.unmount();
+    const c = render(<HealthFlag run={run({ ...held, queue_reason: "maintenance" })} />);
+    expect(c.container.querySelector('[data-queue-reason="weekly_reserve"]')).toBeNull();
+    expect(c.container.querySelector('[data-queue-reason="maintenance"]')).not.toBeNull();
   });
 });
 

@@ -628,9 +628,11 @@ SELECT DISTINCT ON (r.issue_iid)
        r.budget_finalize_seconds, r.hold_reason,
        r.auto_approve_blocked_reasons,
        r.created_at, r.updated_at,
-       -- Maintenance outranks account admission; the handler hides account details from nonowners.
-       -- Empty means unrestricted and maps to an absent queue_reason.
+       -- Maintenance outranks the PRD #3522 weekly reserve, which outranks account admission; the
+       -- handler hides account details from nonowners. Empty means unrestricted and maps to an
+       -- absent queue_reason.
        (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance'
+             WHEN r.status = 'queued' AND r.reserve_hold_reason IS NOT NULL THEN 'weekly_reserve'
              WHEN admission.codex_admission_class = 'rate_limit' THEN 'codex_rate_limit'
              WHEN admission.codex_admission_class = 'overload' THEN 'codex_overload'
              ELSE '' END)::text AS queue_reason,
@@ -669,9 +671,11 @@ SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_
        r.budget_finalize_seconds, r.hold_reason,
        r.auto_approve_blocked_reasons,
        r.created_at, r.updated_at,
-       -- Maintenance outranks account admission; the handler hides account details from nonowners.
-       -- Empty means unrestricted and maps to an absent queue_reason.
+       -- Maintenance outranks the PRD #3522 weekly reserve, which outranks account admission; the
+       -- handler hides account details from nonowners. Empty means unrestricted and maps to an
+       -- absent queue_reason.
        (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance'
+             WHEN r.status = 'queued' AND r.reserve_hold_reason IS NOT NULL THEN 'weekly_reserve'
              WHEN admission.codex_admission_class = 'rate_limit' THEN 'codex_rate_limit'
              WHEN admission.codex_admission_class = 'overload' THEN 'codex_overload'
              ELSE '' END)::text AS queue_reason,

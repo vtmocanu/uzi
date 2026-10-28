@@ -813,6 +813,16 @@ components:
             its wall-clock limit counts from that claim, not from queueing (and not necessarily
             from the moment maintenance ends). Absent or null otherwise.
             status stays queued.
+        reserve_hold_reason:
+          type:
+            - string
+            - "null"
+          description: >-
+            Optional. The fixed display text "Waiting for the owner's weekly usage reserve."
+            while the job owner's weekly usage reserve holds this queued job and maintenance does
+            not; it starts once a fresh reading is below the owner's threshold. It never carries
+            the owner's usage figures. Display it as is; do not parse it. Absent or null otherwise.
+            status stays queued.
         notice:
           type:
             - string

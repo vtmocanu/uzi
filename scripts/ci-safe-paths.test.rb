@@ -227,10 +227,12 @@ Dir.mktmpdir('brew-watch-proof') do |dir|
   assert.call(stderr.include?("After the same tag's release.yml succeeds: gh run rerun 202 --failed"), true, 'watcher names guarded recovery command')
 end
 release_auto = YAML.safe_load(File.read(File.join(root, '.github/workflows/release-auto.yml')), aliases: true)
-assert.call(release_auto.fetch('on').keys, ['workflow_dispatch'], 'automation remains dispatch-only until live RC proof')
+assert.call(release_auto.fetch('on').keys.sort, %w[schedule workflow_dispatch], 'manual and nightly routes are explicit')
+assert.call(release_auto.fetch('on').fetch('schedule'), [{'cron' => '47 4 * * *', 'timezone' => 'Europe/Bucharest'}], 'nightly uses local time after the sweep window')
 assert.call(release_auto.fetch('permissions'), {}, 'automation token defaults to no permissions')
 assert.call(release_auto.fetch('concurrency'), {'group' => 'release-auto', 'cancel-in-progress' => false, 'queue' => 'max'}, 'all release routes queue without cancellation')
 auto_jobs = release_auto.fetch('jobs')
+assert.call(auto_jobs.fetch('prepare').fetch('timeout-minutes'), 210, 'prepare permits 183 minute wait, 10 minute cut and 17 minute overhead')
 # Execute each actual failure-handler prologue in the shell contexts ERR inherits.
 # Keep a fast slice for guard-removal probes without repeating Git fixture setup.
 exercise_release_traps = lambda do
@@ -279,7 +281,7 @@ exercise_release_traps = lambda do
     lines = script.lines
     index = lines.index { |line| line.include?(anchor) }
     raise "missing production consumer: #{anchor}" unless index
-    first = index > 0 && lines[index - 1].start_with?(variable + '=') ? index - 1 : index
+    first = index > 0 && lines[index - 1].lstrip.start_with?(variable + '=') ? index - 1 : index
     probe.call("#{step_name}/#{variable}", script, stub + "\n" + lines[first..index].join)
   end
 end
@@ -287,6 +289,24 @@ if traps_only
   exercise_release_traps.call
   puts "ci-safe-paths: #{checks} assertions passed (release traps only)"
   exit
+end
+%w[authorize prepare push watch].each do |name|
+  values = auto_jobs.fetch(name).fetch('env')
+  assert.call(values.fetch('RELEASE_KIND'), "${{ github.event_name == 'schedule' && 'rc' || inputs.kind }}", "#{name}: scheduled kind cannot become stable")
+  assert.call(values.fetch('RELEASE_ABANDON'), "${{ github.event_name == 'schedule' && 'false' || inputs.abandon_train }}", "#{name}: nightly never abandons the train")
+end
+%w[authorize prepare push].each do |name|
+  assert.call(auto_jobs.fetch(name).fetch('env').fetch('RELEASE_NIGHTLY_ENABLED'), '${{ vars.RELEASE_NIGHTLY_ENABLED }}', "#{name}: nightly requires the operator flag")
+end
+[auto_jobs.fetch('prepare').fetch('env'), auto_jobs.fetch('push').fetch('env'),
+ auto_jobs.fetch('report').fetch('steps').first.fetch('env')].each do |values|
+  assert.call(values['RUN_CREATED_AT'], '${{ needs.authorize.outputs.created_at }}', 'nightly window uses original API metadata, not preparation output')
+end
+upload = auto_jobs.fetch('prepare').fetch('steps').find { |step| step.fetch('uses', '').start_with?('actions/upload-artifact@') }
+assert.call(upload['if'], "steps.prepare.outputs.outcome == 'prepared'", 'a no-op cannot upload a nonexistent bundle')
+%w[no-op prepared].each do |outcome|
+  assert.call(Expression.new(upload.fetch('if'), {'steps.prepare.outputs.outcome' => outcome}).value,
+              outcome == 'prepared', "artifact guard evaluates #{outcome}")
 end
 assert.call(release_auto.fetch('on').fetch('workflow_dispatch').fetch('inputs').fetch('kind').fetch('options'), %w[rc stable], 'dispatch operation choices')
 assert.call(auto_jobs.keys, %w[authorize prepare push watch report], 'release automation job graph')
@@ -336,6 +356,30 @@ assert.call(mint.fetch('with'), {'client-id' => '${{ vars.RELEASE_APP_ID }}', 'p
                                'owner' => 'vtmocanu', 'repositories' => 'uzi', 'permission-contents' => 'write'}, 'installation token scope')
 bundle_step = auto_push.fetch('steps').find { |step| step['id'] == 'bundle' }
 publish_step = auto_push.fetch('steps').find { |step| step['id'] == 'push' }
+assert.call(auto_push.fetch('outputs').fetch('attempted'), '${{ steps.push.outputs.attempted || steps.bundle.outputs.attempted }}',
+            'actual push status overrides the pre-mint no-push fallback')
+windows = [bundle_step, publish_step].map do |step|
+  block = step.fetch('run').match(/^if \[ "\$GITHUB_EVENT_NAME" = schedule \]; then\n.*?^fi\n/m)
+  assert.call(block.nil?, false, 'nightly window is checked before minting and before pushing')
+  block[0]
+end
+assert.call(windows[0], windows[1], 'pre-mint and pre-push inline window policies stay identical')
+# Isolate the actual comparison as a second defense, even if its numeric input
+# guards were later removed. An operand error must select refusal, never push.
+comparison = windows.last.match(/^  if (?:! )?\[ "\$now" -(?:lt|ge) "\$cutoff" \]; then\n.*?^  fi\n/m)
+assert.call(comparison.nil?, false, 'actual nightly cutoff comparison is present')
+[['5', ''], ['bad-now', '6'], ['5', 'bad-cutoff']].each do |now, cutoff|
+  Dir.mktmpdir('nightly-compare') do |dir|
+    output = File.join(dir, 'output')
+    File.write(output, '')
+    prefix = publish_step.fetch('run').split("trap fail ERR\n", 2).first + "trap fail ERR\n"
+    body = "now=$PROBE_NOW\ncutoff=$PROBE_CUTOFF\n" + comparison[0]
+    _, _, status = Open3.capture3({'GITHUB_OUTPUT' => output, 'PROBE_NOW' => now, 'PROBE_CUTOFF' => cutoff},
+                                 'bash', '-e', '-c', prefix + body, chdir: dir)
+    assert.call(status.exitstatus, 1, 'malformed cutoff comparison refuses')
+    assert.call(File.readlines(output).map(&:strip), ['reason=missed-target'], 'comparison errors have one refusal reason')
+  end
+end
 # Execute the classifier from the actual step, including its defensive mixed
 # receipt branch. A reported ref update must never be called "nothing changed".
 receipt_parts = publish_step.fetch('run').split("if awk -F '\\t' ", 2)
@@ -440,7 +484,26 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   File.write(File.join(bin, 'date'), <<~'RUBY')
     #!/usr/bin/env ruby
     require 'time'
-    puts(ARGV.include?('-d') ? Time.iso8601(ARGV[ARGV.index('-d') + 1]).to_i : ENV.fetch('TEST_NOW'))
+    if ARGV.include?('-d')
+      text = ARGV[ARGV.index('-d') + 1]
+      if ARGV.include?('+%s') && !text.include?('T') && ENV['TEST_BAD_CUTOFF']
+        puts(ENV['TEST_BAD_CUTOFF'] == 'empty' ? '' : 'bad-cutoff')
+        exit
+      end
+      stamp = text.include?('T') ? Time.iso8601(text) : Time.strptime(text, '%Y-%m-%d %H:%M:%S')
+      if ARGV.include?('+%z')
+        puts ENV.fetch('TEST_OFFSET', stamp.getlocal.strftime('%z'))
+      else
+        puts(ARGV.include?('+%F') ? stamp.getlocal.strftime('%F') : stamp.to_i)
+      end
+    else
+      if ARGV.include?('+%s') && ENV['TEST_BAD_NOW']
+        puts(ENV['TEST_BAD_NOW'] == 'empty' ? '' : 'bad-now')
+        exit
+      end
+      now = Time.at(Integer(ENV.fetch('TEST_NOW')))
+      puts(ARGV.include?('+%F') ? now.getlocal.strftime('%F') : now.to_i)
+    end
   RUBY
   %w[git receive-pack sha256sum date].each { |name| File.chmod(0o700, File.join(bin, name)) }
   env = hermetic.merge('PATH' => "#{bin}:#{ENV.fetch('PATH')}", 'TEST_REAL_GIT' => real_git, 'TEST_REMOTE' => remote,
@@ -462,9 +525,12 @@ Dir.mktmpdir('release-auto-contract') do |dir|
       guard_out, err, status = Open3.capture3(invocation, 'bash', '-e', '-c', bundle_step.fetch('run'), chdir: work)
       assert.call(status.success?, expected, "actual pre-key guard #{changes.keys}: #{err[-300..]}")
       if expected_reason
-        assert.call(File.read(invocation.fetch('TEST_GIT_FAILURE_MARKER')).strip, changes.fetch('TEST_GIT_FAIL'), 'exact Git failure was injected')
+        if changes.key?('TEST_GIT_FAIL')
+          assert.call(File.read(invocation.fetch('TEST_GIT_FAILURE_MARKER')).strip, changes.fetch('TEST_GIT_FAIL'), 'exact Git failure was injected')
+        end
         outputs = File.exist?(invocation.fetch('GITHUB_OUTPUT')) ? File.readlines(invocation.fetch('GITHUB_OUTPUT')).map(&:strip) : []
-        assert.call(outputs, ['reason=' + expected_reason], "#{changes.fetch('TEST_GIT_FAIL')}: one phase-correct reason before mint/push")
+        assert.call(outputs.select { |line| line.start_with?('reason=') }, ['reason=' + expected_reason], 'one phase-correct reason before mint/push')
+        assert.call(outputs.include?('attempted=true'), false, 'pre-mint refusal cannot have attempted a push')
       end
       if changes['GITHUB_RUN_ATTEMPT'] == '2'
         assert.call(status.success?, false, 'rerun never reaches the default-success token step')
@@ -481,8 +547,14 @@ Dir.mktmpdir('release-auto-contract') do |dir|
         assert.call(pushed.success?, publish_expected, "actual atomic publish: #{push_err}")
         if expected_outcome
           receipt = File.read(invocation.fetch('GITHUB_OUTPUT')).lines.map { |line| line.strip.split('=', 2) }.to_h
-          assert.call(receipt['outcome'], expected_outcome, 'push result classification')
-          assert.call(receipt['attempted'], expected_outcome == 'push-rejected' ? 'false' : 'true', 'rejected push never enters watch')
+          if %w[missed-target invalid-nightly-window].include?(expected_outcome)
+            reasons = File.readlines(invocation.fetch('GITHUB_OUTPUT')).map(&:strip).select { |line| line.start_with?('reason=') }
+            assert.call(reasons, ['reason=' + expected_outcome], 'nightly cutoff has exactly one typed reason')
+            assert.call(receipt['attempted'], 'false', 'nightly cutoff skips the push and watch')
+          else
+            assert.call(receipt['outcome'], expected_outcome, 'push result classification')
+            assert.call(receipt['attempted'], expected_outcome == 'push-rejected' ? 'false' : 'true', 'rejected push never enters watch')
+          end
         end
         if publish_expected
           assert.call(git.call('--git-dir=' + active_remote, 'rev-parse', 'refs/tags/' + invocation['RELEASE_TAG'] + '^{}'), invocation['RELEASE_SHA'], 'atomic publish creates exact tag')
@@ -496,6 +568,50 @@ Dir.mktmpdir('release-auto-contract') do |dir|
    'diff-tree' => 'non-metadata-bundle'}.each do |fault, reason|
     exercise.call({'TEST_GIT_FAIL' => fault}, false, nil, bundle, {}, nil, reason)
   end
+  # Validate a normal bundle first, then execute the actual final publisher as a
+  # scheduled route delayed by its runner queue. Its clock guard is independent.
+  [['empty-cutoff', {'TEST_BAD_CUTOFF' => 'empty'}], ['garbage-cutoff', {'TEST_BAD_CUTOFF' => 'garbage'}],
+   ['empty-now', {'TEST_BAD_NOW' => 'empty'}], ['garbage-now', {'TEST_BAD_NOW' => 'garbage'}],
+   ['wrong-offset', {'TEST_OFFSET' => '+0000'}]].each do |label, faults|
+    faulty_remote = File.join(dir, 'faulty-date-' + label + '.git')
+    git.call('clone', '--bare', remote, faulty_remote)
+    exercise.call({'TEST_REMOTE' => faulty_remote, 'RUN_CREATED_AT' => '2026-10-27T02:47:00Z'}, true, false, bundle,
+                  {'GITHUB_EVENT_NAME' => 'schedule', 'TEST_NOW' => Time.utc(2026, 10, 27, 3).to_i.to_s}.merge(faults), 'invalid-nightly-window')
+  end
+  [['winter-at', '2026-10-27T02:47:00Z', '2026-10-27T06:00:00Z', false],
+   ['winter-before', '2026-10-27T02:47:00Z', '2026-10-27T05:59:59Z', true],
+   ['winter-after', '2026-10-27T02:47:00Z', '2026-10-27T06:01:00Z', false],
+   ['queued-next-day', '2026-10-27T02:47:00Z', '2026-10-28T02:00:00Z', false],
+   ['summer-at', '2026-07-15T01:47:00Z', '2026-07-15T05:00:00Z', false],
+   ['summer-before', '2026-07-15T01:47:00Z', '2026-07-15T04:59:59Z', true],
+   ['spring-at', '2026-03-29T01:47:00Z', '2026-03-29T05:00:00Z', false],
+   ['autumn-at', '2026-10-25T02:47:00Z', '2026-10-25T06:00:00Z', false],
+   ['future-run', '2026-10-27T02:47:00Z', '2026-10-27T02:40:00Z', false, 'invalid-nightly-window'],
+   ['noncanonical-time', '2026-10-27 02:47:00+00:00', '2026-10-27T03:00:00Z', false, 'invalid-nightly-window']].each do |label, created, now, allowed, reason|
+    scheduled_remote = File.join(dir, 'scheduled-' + label + '.git')
+    git.call('clone', '--bare', remote, scheduled_remote)
+    exercise.call({'TEST_REMOTE' => scheduled_remote, 'RUN_CREATED_AT' => created}, true, allowed, bundle,
+                  {'GITHUB_EVENT_NAME' => 'schedule', 'TEST_NOW' => Time.iso8601(now).to_i.to_s}, allowed ? nil : reason || 'missed-target')
+  end
+  schedule_env = {'GITHUB_EVENT_NAME' => 'schedule', 'RELEASE_NIGHTLY_ENABLED' => 'true',
+                  'RUN_CREATED_AT' => '2026-10-27T02:47:00Z', 'TEST_NOW' => Time.utc(2026, 10, 27, 3).to_i.to_s}
+  exercise.call(schedule_env.merge('TEST_NOW' => Time.utc(2026, 10, 27, 5, 59, 59).to_i.to_s), true)
+  exercise.call(schedule_env.merge('TEST_NOW' => Time.utc(2026, 10, 27, 6).to_i.to_s), false, nil, bundle, {}, nil, 'missed-target')
+  [{'TEST_BAD_CUTOFF' => 'empty'}, {'TEST_BAD_CUTOFF' => 'garbage'}, {'TEST_BAD_NOW' => 'empty'},
+   {'TEST_BAD_NOW' => 'garbage'}, {'TEST_OFFSET' => '+0000'}].each do |faults|
+    exercise.call(schedule_env.merge(faults), false, nil, bundle, {}, nil, 'invalid-nightly-window')
+  end
+  [59, 60].each do |skew|
+    exercise.call(schedule_env.merge('TEST_NOW' => (Time.iso8601(schedule_env.fetch('RUN_CREATED_AT')).to_i - skew).to_s), true)
+  end
+  exercise.call(schedule_env.merge('TEST_NOW' => (Time.iso8601(schedule_env.fetch('RUN_CREATED_AT')).to_i - 61).to_s),
+                false, nil, bundle, {}, nil, 'invalid-nightly-window')
+  ['', 'false', 'TRUE', '1'].each do |disabled|
+    exercise.call(schedule_env.merge('RELEASE_NIGHTLY_ENABLED' => disabled), false)
+  end
+  exercise.call(schedule_env.merge('RELEASE_ACTOR' => 'scheduler', 'RELEASE_DISPATCHERS' => ''), true)
+  exercise.call(schedule_env.merge('RELEASE_VERSION' => '0.2.0'), false)
+  exercise.call(schedule_env.merge('RELEASE_KIND' => 'stable', 'RELEASE_RC_TAG' => 'v0.2.0-rc.10', 'RELEASE_RC_SHA' => parent), false)
   exercise.call({'RELEASE_ACTOR' => 'outside'}, false)
   exercise.call({'GITHUB_RUN_ATTEMPT' => '2'}, false)
   exercise.call({'RELEASE_REF' => 'refs/heads/feature'}, false)
@@ -700,6 +816,12 @@ Dir.mktmpdir('release-watch-receipt') do |dir|
       assert.call(output.include?('outcome=published-and-verified'), true, 'confirmed publication remains successful')
     end
   end
+  File.write(environment.fetch('GITHUB_OUTPUT'), '')
+  _, err, status = Open3.capture3(environment.merge('GITHUB_EVENT_NAME' => 'schedule', 'RELEASE_NIGHTLY_ENABLED' => 'false',
+                                  'RUN_CREATED_AT' => '2026-10-26T02:47:00Z', 'WATCH_RECEIPT_RC' => '0', 'VERIFY_RC' => '0'),
+                                'bash', '-e', '-c', watch_script, chdir: dir)
+  assert.call(status.success?, true, "tagged nightly recovery continues after cutoff and pause: #{err}")
+  assert.call(File.read(environment.fetch('GITHUB_OUTPUT')).include?('outcome=published-and-verified'), true, 'late recovery retains verified success')
 end
 # Reporting has no checkout/contents grant. Execute its exact inline program with
 # a fake API; healthy publication is summary-only, and failures reuse one issue.
@@ -738,6 +860,72 @@ Dir.mktmpdir('release-report') do |dir|
   _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => normal.to_json), 'bash', '-e', '-c', report_script)
   assert.call(status.success?, true, "healthy publication reporting: #{err}")
   assert.call(File.exist?(File.join(dir, 'calls')), false, 'healthy publication never opens or comments on an issue')
+  [['authorize', 'nightly-disabled'], ['prepare', 'no-new-shipping-change'], ['prepare', 'no-releasable-notes']].each do |phase, reason|
+    noop = Marshal.load(Marshal.dump(normal))
+    noop[phase] = {'result' => 'success', 'outputs' => {'outcome' => 'no-op', 'reason' => reason}}
+    %w[prepare push watch].each do |name|
+      next if name == phase
+      noop[name] = {'result' => 'skipped', 'outputs' => {}}
+    end
+    FileUtils.rm_f(environment.fetch('REPORT_CALLS'))
+    File.write(environment.fetch('GITHUB_STEP_SUMMARY'), '')
+    _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => noop.to_json, 'GITHUB_EVENT_NAME' => 'schedule'), 'bash', '-e', '-c', report_script)
+    assert.call(status.success?, true, "#{reason}: no-op reporting succeeds: #{err}")
+    text = File.read(environment.fetch('GITHUB_STEP_SUMMARY'))
+    assert.call(text.include?('"outcome": "no-op"'), true, "#{reason}: no-op is explicit")
+    assert.call(text.include?('"reason": "' + reason + '"'), true, "#{reason}: planned reason survives skipped jobs")
+    assert.call(text.include?('"phase": "' + phase + '"'), true, "#{reason}: phase is truthful")
+    assert.call(text.include?('Nightly RC'), true, "#{reason}: human-readable nightly result")
+    assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, "#{reason}: expected no-op never files an incident")
+  end
+  [['2026-10-27T02:47:00Z', '2026-10-27T07:00:00Z', false],
+   ['2026-10-27T02:47:00Z', '2026-10-27T07:00:01Z', true],
+   ['2026-07-15T01:47:00Z', '2026-07-15T06:00:00Z', false],
+   ['2026-07-15T01:47:00Z', '2026-07-15T06:00:01Z', true],
+   ['2026-10-26T22:30:00Z', '2026-10-27T06:59:59Z', false]].each do |created, verified, late|
+    completed = Marshal.load(Marshal.dump(normal))
+    completed['watch']['outputs'].merge!('verified_at' => verified, 'published_at' => verified)
+    File.write(environment.fetch('GITHUB_STEP_SUMMARY'), '')
+    FileUtils.rm_f(environment.fetch('REPORT_CALLS'))
+    stdout, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => completed.to_json, 'GITHUB_EVENT_NAME' => 'schedule',
+                                        'RUN_CREATED_AT' => created), 'bash', '-e', '-c', report_script)
+    assert.call(status.success?, true, "late=#{late}: verification report succeeds: #{err}")
+    text = File.read(environment.fetch('GITHUB_STEP_SUMMARY'))
+    assert.call(text.include?('"outcome": "published-and-verified"'), true, 'late success is still verified')
+    assert.call(text.include?('"late_finish": ' + late.to_json), true, 'late finish uses the original local-date target')
+    assert.call(stdout.include?('::warning::'), late, 'only late verified completion produces a warning')
+    assert.call(text.include?('09:00 Europe/Bucharest target.'), late, 'late warning names the current local target')
+    assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, 'late success does not file an extra incident')
+  end
+  ['credential-sentinel', '2026-10-27 05:00:00+00:00'].each do |invalid|
+    malformed_time = Marshal.load(Marshal.dump(normal))
+    malformed_time['watch']['outputs']['verified_at'] = invalid
+    FileUtils.rm_f(environment.fetch('REPORT_CALLS'))
+    _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => malformed_time.to_json, 'GITHUB_EVENT_NAME' => 'schedule',
+                                    'RUN_CREATED_AT' => '2026-10-27T02:47:00Z'), 'bash', '-e', '-c', report_script)
+    assert.call(status.success?, false, 'malformed nightly timing metadata is refused')
+    assert.call(err.include?('invalid nightly timing metadata'), true, 'timing refusal is a controlled diagnostic')
+    assert.call(err.include?('credential-sentinel'), false, 'timing validation does not echo untrusted input')
+    assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, 'malformed timestamps never reach the issue API')
+  end
+  manual_complete = Marshal.load(Marshal.dump(normal))
+  manual_complete['watch']['outputs']['verified_at'] = '2026-10-27T16:00:00Z'
+  FileUtils.rm_f(environment.fetch('REPORT_CALLS'))
+  File.write(environment.fetch('GITHUB_STEP_SUMMARY'), '')
+  stdout, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => manual_complete.to_json, 'GITHUB_EVENT_NAME' => 'workflow_dispatch',
+                                      'RUN_CREATED_AT' => '2026-10-27T02:47:00Z'), 'bash', '-e', '-c', report_script)
+  assert.call(status.success?, true, "manual late-day verification has no morning target: #{err}")
+  assert.call(File.read(environment.fetch('GITHUB_STEP_SUMMARY')).include?('"late_finish": null'), true, 'manual verification has no late flag')
+  assert.call(stdout.include?('::warning::'), false, 'manual completion after 09:00 does not warn')
+  assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, 'manual verified completion is not an incident')
+  missed = Marshal.load(Marshal.dump(normal))
+  missed['push'] = {'result' => 'failure', 'outputs' => {'reason' => 'missed-target', 'attempted' => 'false'}}
+  missed['watch'] = {'result' => 'skipped', 'outputs' => {}}
+  _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => missed.to_json, 'GITHUB_EVENT_NAME' => 'schedule'), 'bash', '-e', '-c', report_script)
+  assert.call(status.success?, true, "missed-target incident delivery succeeds: #{err}")
+  missed_body = File.read(environment.fetch('REPORT_BODY'))
+  assert.call(missed_body.include?('pre-push cutoff'), true, 'missed-target explains the clock refusal')
+  assert.call(missed_body.include?('"push_attempted": false'), true, 'missed target proves the push was skipped')
   failed = Marshal.load(Marshal.dump(normal))
   failed['prepare'] = {'result' => 'failure', 'outputs' => {'outcome' => 'blocked', 'reason' => 'codex-runtime-needs-local-cut'}}
   _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => failed.to_json), 'bash', '-e', '-c', report_script)

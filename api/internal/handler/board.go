@@ -163,7 +163,8 @@ type latestRunDTO struct {
 	// shared card unconditionally; the near-timeout badge counts down to it.
 	DeadlineAt *time.Time `json:"deadline_at"`
 	// QueueReason is derived at read time. Maintenance is visible to every viewer;
-	// codex_rate_limit and codex_overload are owner-only account admission reasons.
+	// weekly_reserve (PRD #3522), codex_rate_limit and codex_overload are owner-only
+	// account reasons.
 	QueueReason *string `json:"queue_reason,omitempty"`
 	// Account admission fields are owner-only, including the account queue reason.
 	CodexAdmissionClass      *string    `json:"codex_admission_class,omitempty"`

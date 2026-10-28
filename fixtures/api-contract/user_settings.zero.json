@@ -18,5 +18,7 @@
   "default_harness": null,
   "default_claude_model": null,
   "default_codex_model": null,
-  "judge_models": null
+  "judge_models": null,
+  "weekly_reserve_pct": null,
+  "weekly_reserve_pause_running": false
 }

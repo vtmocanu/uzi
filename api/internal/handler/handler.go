@@ -709,6 +709,9 @@ func toDTO(u store.User) apitypes.UserDTO {
 		// "pinned" row whose pointer was nulled back to "default". Since SetUserJudgeBinding
 		// writes NULL for every non-"pinned" mode, the id always agrees with the mode.
 		JudgeAnthropicBindMode: effectiveBindMode(u.JudgeAnthropicBindMode, u.JudgeAnthropicSecretID),
+		// The weekly usage reserve (PRD #3522): a NULL threshold is JSON null (off).
+		WeeklyReservePct:          intPtrFromInt2(u.WeeklyReservePct),
+		WeeklyReservePauseRunning: u.WeeklyReservePauseRunning,
 	}
 	if u.DisplayName.Valid {
 		dto.DisplayName = &u.DisplayName.String

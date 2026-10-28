@@ -2427,6 +2427,19 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     expect(strip().textContent).toBe("1 run looks stuck");
   });
 
+  it("does not call a reserve-held run stuck (PRD #3522)", async () => {
+    // Reserve twin of the maintenance case: a weekly-reserve hold is a wait the owner chose.
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "run-r", status: "queued", health: "waiting_worker", queue_reason: "weekly_reserve", issue_iid: 8 }),
+        aRun({ id: "run-2", status: "running", health: "stalled", issue_iid: 7 }),
+      ],
+    });
+    renderBoard();
+    await screen.findByText("1 run looks stuck");
+    expect(strip().textContent).toBe("1 run looks stuck");
+  });
+
   it("keeps the buckets separate when two different runs are in different states", async () => {
     mockApi.listRuns.mockResolvedValue({
       runs: [

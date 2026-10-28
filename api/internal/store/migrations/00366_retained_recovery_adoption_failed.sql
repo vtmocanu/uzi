@@ -3,7 +3,7 @@ ALTER TABLE runs DROP CONSTRAINT runs_recovery_wait_cause_check;
 ALTER TABLE runs ADD CONSTRAINT runs_recovery_wait_cause_check CHECK (
     recovery_wait_cause IS NULL OR recovery_wait_cause IN (
         'forge_unreachable','empty_turn','provider_outage','codex_account_unavailable',
-        'vault_locked','data_volume_full','worker_requeue_exhausted','worker_memory_pressure','retained_recovery_exhausted','retained_recovery_adoption_failed'
+        'vault_locked','data_volume_full','worker_requeue_exhausted','worker_memory_pressure','retained_recovery_exhausted','codex_idle_stall','retained_recovery_adoption_failed'
     )
 );
 -- +goose StatementBegin
@@ -36,7 +36,7 @@ ALTER TABLE runs DROP CONSTRAINT runs_recovery_wait_cause_check;
 ALTER TABLE runs ADD CONSTRAINT runs_recovery_wait_cause_check CHECK (
     recovery_wait_cause IS NULL OR recovery_wait_cause IN (
         'forge_unreachable','empty_turn','provider_outage','codex_account_unavailable',
-        'vault_locked','data_volume_full','worker_requeue_exhausted','worker_memory_pressure','retained_recovery_exhausted'
+        'vault_locked','data_volume_full','worker_requeue_exhausted','worker_memory_pressure','retained_recovery_exhausted','codex_idle_stall'
     )
 );
 -- +goose StatementBegin

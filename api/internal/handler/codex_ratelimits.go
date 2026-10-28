@@ -12,6 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/usagereserve"
 )
 
 // The closed set of per-account Codex rate-limit statuses (PRD #1209 M3), mirroring the
@@ -210,7 +211,7 @@ func codexRateLimitStatus(interval time.Duration, vaultLocked, reauthRequired bo
 	case reauthRequired:
 		return codexRateLimitStatusCredentialActionRequired
 	case lastSuccessAt.Valid:
-		if now.Sub(lastSuccessAt.Time) <= 3*interval {
+		if !usagereserve.Stale(lastSuccessAt.Time, true, interval, now) {
 			return codexRateLimitStatusFresh
 		}
 		return codexRateLimitStatusStale

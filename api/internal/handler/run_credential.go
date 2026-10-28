@@ -97,6 +97,8 @@ func (h *Handler) writeSetRunCredentialError(w http.ResponseWriter, err error) {
 		httpx.Error(w, http.StatusConflict, workersvc.ErrRunHoldSettling.Error())
 	case errors.Is(err, workersvc.ErrBaseAttestationHeld):
 		httpx.Error(w, http.StatusConflict, err.Error())
+	case errors.Is(err, workersvc.ErrCodexIdleStallHeld):
+		httpx.Error(w, http.StatusConflict, workersvc.ErrCodexIdleStallHeld.Error())
 	case errors.Is(err, workersvc.ErrCredentialSwitchRaced):
 		httpx.Error(w, http.StatusConflict, "the run changed state while switching its token; retry")
 	default:

@@ -55,11 +55,12 @@ interface Rig {
   custody: () => number;
   homePath: () => string;
   assertRefusal: () => void;
+  archive: ReturnType<typeof enabledRecovery>["archive"];
 }
 
 function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
   const { gitlab } = fakeGitlab();
-  const { coord } = enabledRecovery();
+  const { coord, archive } = enabledRecovery();
   const error = scenario.error ?? (() => new TransientRecoveryError("provider transient error persisted", { providerOrigin: true }));
   let runHome = "";
   let thrown = false;
@@ -173,7 +174,7 @@ function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
     };
   }
   return {
-    runner, custody: spyCustodySettle(runner), homePath: () => runHome,
+    runner, archive, custody: spyCustodySettle(runner), homePath: () => runHome,
     assertRefusal: () => {
       if (harness !== "codex") return;
       assert.ok(initialCleanup.length > 0 && initialCleanup.every(Boolean), "the runner used genuine full-root cleanup proof before capture");
@@ -568,4 +569,165 @@ describe("RunRunner #1733 — a provider outage parks typed provider_outage", ()
       assert.equal(client.hasFeature("recovery_cause_provider_outage"), true);
     });
   });
+});
+
+
+describe("M2 Codex idle typed ACK and custody", () => {
+  const feature = "recovery_cause_codex_idle_stall_v1";
+  for (const kind of ["zero_evidence", "productive"] as const) for (const turns of [0, 2]) {
+    it(`M2 ${kind} sends settled progress=${turns} and uses ordinary settlement`, async t => {
+      await withHome(async home => {
+        client.protocolFeatures = ["claim_generation_fence", feature, "run_checkpoint_durability"];
+        t.mock.method(client, "publishCheckpoint", async (...args: Parameters<typeof client.publishCheckpoint>) => {
+          for await (const chunk of args[2]) void chunk;
+          return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/idle-fixture" } };
+        });
+        api.stateAckWire = (body, run) => body.recovery_cause === "codex_idle_stall"
+          ? { status: 200, body: { run: { ...run, recovery_wait_cause: "codex_idle_stall",
+              recovery_retry_not_before: "2026-10-28T00:00:00Z" } } } : undefined;
+        const rig = rigFor("codex", { turns, error: () => new TransientRecoveryError("idle", { idleStallKind: kind }) }, home);
+        const claim = gitlabClaim(3509, { claim_generation: 3 });
+        const providerDisposition = rig.runner["dispositionProviderPark"];
+        rig.runner["dispositionProviderPark"] = async () => { throw new Error("idle must not use provider disposition"); };
+        try { await rig.runner.execute(claim); }
+        finally { rig.runner["dispositionProviderPark"] = providerDisposition; t.mock.restoreAll(); }
+        assert.equal(parks(claim.run_id).length, 1);
+        const [park] = parks(claim.run_id);
+        assert.equal(park?.recovery_cause, "codex_idle_stall");
+        assert.equal(park?.provider_progress_turns, turns);
+        assert.equal(park?.productive_turns, undefined);
+        assert.equal(park?.claim_generation, 3);
+        assert.equal(rig.custody(), 1, "ordinary exact-generation settlement");
+        const opening = kind === "zero_evidence" ? "provider sent no model output" : "model output stalled";
+        assert.ok(feedTexts(claim.run_id).includes(
+          `paused after ${opening}; the recovery checkpoint is published and it resumes automatically`,
+        ));
+      });
+    });
+  }
+
+  for (const kind of ["zero_evidence", "productive"] as const) for (const held of [false, true]) {
+    it(`M2 ${kind} ${held ? "held" : "timed"} ordinary checkpoint HTTP507 still accepts typed idle and retains source and custody`, async t => {
+      await withHome(async home => {
+        client.protocolFeatures = ["claim_generation_fence", feature, "run_checkpoint_durability"];
+        api.checkpointPublishHttpStatus = 507;
+        api.stateAckWire = (body, run) => body.recovery_cause === "codex_idle_stall"
+          ? { status: 200, body: { run: { ...run, recovery_wait_cause: "codex_idle_stall",
+              ...(held ? {} : { recovery_retry_not_before: "2026-10-28T00:00:00Z" }) } } } : undefined;
+        const rig = rigFor("codex", { error: () => new TransientRecoveryError("idle", { idleStallKind: kind }) }, home);
+        const publish = client.publishCheckpoint.bind(client);
+        const outcomes: unknown[] = [];
+        t.mock.method(client, "publishCheckpoint", async (...args: Parameters<typeof publish>) => {
+          const outcome = await publish(...args);
+          outcomes.push(outcome);
+          return outcome;
+        });
+        const claim = gitlabClaim(3511, { claim_generation: 3 });
+        try { await rig.runner.execute(claim); }
+        finally { t.mock.restoreAll(); }
+        assert.deepEqual(outcomes, Array.from({ length: 3 }, () => ({ ok: false, httpStatus: 507 })),
+          "ordinary checkpoint broker exhausts its bounded retries, not archive upload");
+        assert.equal(parks(claim.run_id).length, 1);
+        assert.equal(parks(claim.run_id)[0]?.recovery_cause, "codex_idle_stall");
+        assert.ok(fs.existsSync(worktreeDirFor(3511)));
+        assert.ok(fs.existsSync(rig.homePath()));
+        assert.deepEqual(rig.archive.releaseCalls, [], "checkpoint refusal never releases custody");
+        const texts = feedTexts(claim.run_id);
+        const opening = kind === "zero_evidence" ? "provider sent no model output" : "model output stalled";
+        assert.ok(texts.includes(
+          `paused after ${opening}; the recovery checkpoint is saved on this worker and ${held ? "the run waits for its owner to resume it" : "it resumes automatically"}`,
+        ));
+        assert.ok(!texts.some(text => /checkpoint is published/.test(text)), "local capture is never described as published");
+        if (held) assert.ok(!texts.some(text => /resumes automatically/.test(text)));
+      });
+    });
+  }
+
+  for (const { ack, kind } of [
+    ...(["held", "missing cause", "wrong cause", "statusless", "strict refusal", "validation refusal"] as const)
+      .map(ack => ({ ack, kind: "productive" as const })),
+    ...(["held", "strict refusal", "validation refusal"] as const)
+      .map(ack => ({ ack, kind: "zero_evidence" as const })),
+  ]) {
+    it(`M2 ${kind} ${ack} keeps source with no false automatic-resume promise`, async t => {
+      await withHome(async home => {
+        client.protocolFeatures = ["claim_generation_fence", feature, "run_checkpoint_durability"];
+        t.mock.method(client, "publishCheckpoint", async (...args: Parameters<typeof client.publishCheckpoint>) => {
+          for await (const chunk of args[2]) void chunk;
+          return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/idle-fixture" } };
+        });
+        api.stateAckWire = (body, run) => {
+          if (body.recovery_cause !== "codex_idle_stall") return undefined;
+          return { status: 200, body: { run: {
+            ...run, ...(ack === "statusless" ? { status: undefined } : {}),
+            recovery_wait_cause: ack === "held" ? "codex_idle_stall" : ack === "wrong cause" ? "provider_outage" : undefined,
+          } } };
+        };
+        const refusal = ack.endsWith("refusal");
+        const rig = rigFor("codex", { turns: refusal ? 2 : 0,
+          error: () => new TransientRecoveryError("idle", { idleStallKind: kind }) }, home);
+        const claim = gitlabClaim(3510, { claim_generation: 3 });
+        const refusedBodies: Parameters<typeof client.reportState>[1][] = [];
+        const refuseNext = () => api.failStateWhen(claim.run_id, body => {
+          if (body.status !== "recovery_wait") return false;
+          refusedBodies.push({ ...body });
+          return true;
+        }, { httpStatus: 400, error: ack === "strict refusal" ? "invalid request body" : "invalid progress" });
+        if (refusal) refuseNext();
+        let reports = 0;
+        const reportBodies: Parameters<typeof client.reportState>[1][] = [];
+        const report = client.reportState.bind(client);
+        t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
+          if (args[1].status === "recovery_wait") {
+            reports++;
+            reportBodies.push({ ...args[1] });
+            assert.equal(args[1].recovery_cause, "codex_idle_stall", "no untyped resend");
+          }
+          return report(...args);
+        });
+        const wait = rig.runner["waitRecoveryRetry"].bind(rig.runner);
+        let waits = 0;
+        t.mock.method(rig.runner as unknown as { waitRecoveryRetry: typeof wait }, "waitRecoveryRetry", async (...args: Parameters<typeof wait>) => {
+          waits++;
+          assert.equal(reports, waits);
+          if (refusal && waits === 1) {
+            assert.equal(refusedBodies.length, 1, "first actual HTTP request refused");
+            refuseNext();
+            return;
+          }
+          // Refusals get two actual requests without backoff; shutdown bounds all other retries at one.
+          rig.runner.shutdown();
+          return wait(...args);
+        });
+        try {
+          const executing = rig.runner.execute(claim);
+          if (ack === "held") await executing;
+          else await assert.rejects(executing, { name: "AbortError" });
+        } finally { rig.runner.shutdown(); t.mock.restoreAll(); }
+        assert.equal(reports, refusal ? 2 : 1);
+        assert.equal(waits, ack === "held" ? 0 : refusal ? 2 : 1);
+        if (refusal) {
+          assert.equal(refusedBodies.length, 2, "both retries reached the actual HTTP refusal hook");
+          for (const body of [...reportBodies, ...refusedBodies]) {
+            assert.equal(body.recovery_cause, "codex_idle_stall", "no untyped fallback, including internal client resends");
+            assert.equal(body.claim_generation, 3);
+            assert.equal(body.provider_progress_turns, 2, "settled progress is independent of idle kind");
+            assert.equal(body.productive_turns, undefined);
+            assert.deepEqual(body, refusedBodies[0], "the complete typed request stays frozen across retry");
+          }
+        }
+        assert.equal(parks(claim.run_id).length, refusal ? 0 : 1, "refusal never persists");
+        assert.equal(rig.custody(), ack === "held" ? 1 : 0, "only exact typed ACK authorizes settlement");
+        assert.ok(fs.existsSync(worktreeDirFor(3510)), "source retained");
+        assert.ok(fs.existsSync(rig.homePath()), "HOME retained");
+        assert.ok(!feedTexts(claim.run_id).some(t => /resumes automatically/.test(t)));
+        if (ack === "held") {
+          const opening = kind === "zero_evidence" ? "provider sent no model output" : "model output stalled";
+          assert.ok(feedTexts(claim.run_id).includes(
+            `paused after ${opening}; the recovery checkpoint is published and the run waits for its owner to resume it`,
+          ));
+        }
+      });
+    });
+  }
 });

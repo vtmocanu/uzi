@@ -19,7 +19,7 @@ import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
-import { BASE_ATTESTATION_HOLD_REASON } from "./protocol.js";
+import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE } from "./protocol.js";
 import { PublicationContextLatch } from "./publication-context.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CREDENTIAL_SWITCH_HOLD_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
@@ -12796,6 +12796,9 @@ export class RunRunner {
       } : {}),
       runId,
       claimGeneration: claim.claim_generation,
+      codexIdleStallRecovery: this.client.hasFeature("recovery_cause_codex_idle_stall_v1") &&
+        Number.isSafeInteger(claim.claim_generation) && (claim.claim_generation ?? 0) > 0 &&
+        this.client.stampsClaimGeneration(claim.claim_generation),
       ...(flight.workerMemory ? {
         capturedMemory: () => this.captureWorkerMemory(flight),
         // Issue #2471: the run's redaction secrets for the guarded command lane's output windows.
@@ -13057,7 +13060,7 @@ export class RunRunner {
         : {}),
       beforePlanRevisionTurn: (observer, remainingWallMs) => revisionRecovery?.beforeTurn(observer, remainingWallMs) ?? Promise.resolve(),
       retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
-        if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && !cause.zeroEvidenceIdle) || !revisionRecovery) throw cause;
+        if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && cause.idleStallKind !== "zero_evidence") || !revisionRecovery) throw cause;
         return revisionRecovery.retry(cause, observer, remainingWallMs);
       },
       gatePlan: async (planMd, milestones, onPlanPersisted, settles, semanticSubmission) => {
@@ -18117,6 +18120,10 @@ export class RunRunner {
     // proof from the single pre-report reap (undefined = not attempted); `providerTypedSent` is set
     // once a typed body has gone out, so a lost ack can be reconciled against the ownership probe.
     const providerOrigin = cause.kind === "transient" && err instanceof TransientRecoveryError && err.providerOrigin;
+    // The executor marks only measured, negotiated ordinary idle. Do not recompute
+    // this obligation after capture: registration rollback must refuse, never downgrade.
+    const idleTyped = cause.kind === "transient" && err instanceof TransientRecoveryError &&
+      err.idleStallKind !== undefined;
     let providerReap: boolean | undefined;
     let providerTypedSent = false;
     const terminal = TERMINAL_RUN_STATUSES;
@@ -18396,7 +18403,7 @@ export class RunRunner {
             if (cancelReap) await this.settleRecoveryGeneration(claim, flight, runLog);
           }
           if (!terminal.has(status)) markParkKeep();
-          return status === "recovery_wait";
+          return !idleTyped && status === "recovery_wait";
         }
         if (flight.steering.isCancelled()) {
           this.observeCancellation(flight);
@@ -18681,7 +18688,9 @@ export class RunRunner {
         }
         try {
           const parkBody: StateRequest = {
-            ...(providerTyped
+            ...(idleTyped
+              ? { status: "recovery_wait", recovery_cause: "codex_idle_stall", provider_progress_turns: flight.productiveTurns ?? 0 }
+              : providerTyped
               ? { status: "recovery_wait", recovery_cause: "provider_outage", productive_turns: flight.productiveTurns ?? 0 }
               : cause.kind === "vault_locked" && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
               ? { status: "recovery_wait", recovery_cause: "vault_locked" }
@@ -18690,7 +18699,7 @@ export class RunRunner {
                 : !credentialDeferred && disk
                 ? this.diskParkBody(claim, disk.preventive)
                 : { status: "recovery_wait" }),
-            ...(!providerOrigin && !credentialDeferred && (cause.kind === "transient" || disk) &&
+            ...(!idleTyped && !providerOrigin && !credentialDeferred && (cause.kind === "transient" || disk) &&
               (flight.productiveTurns ?? 0) > 0 &&
               this.client.protocolFeatures.includes("provider_progress_on_recovery_park_v1") &&
               (claim.claim_generation ?? 0) > 0 && this.client.stampsClaimGeneration(claim.claim_generation)
@@ -18711,7 +18720,8 @@ export class RunRunner {
           // ACK before a scoped expiry can interrupt disposition; the joined continuation
           // consumes this evidence without another POST or source settlement.
           const ack = await report(parkBody, captureSignal);
-          if (progress && (ack.status === "recovery_wait" ||
+          const idleAccepted = ack.status === "recovery_wait" && ack.recoveryCause === "codex_idle_stall";
+          if (progress && ((!idleTyped && ack.status === "recovery_wait") || (idleTyped && idleAccepted) ||
               (providerTyped && ack.status === "paused" && ack.holdReason === PROVIDER_HOLD_REASON)))
             progress.parkAcknowledged = true;
           captureSignal?.throwIfAborted();
@@ -18763,7 +18773,7 @@ export class RunRunner {
             markParkKeep();
             return true;
           }
-          if (ack.status === "recovery_wait") {
+          if (ack.status === "recovery_wait" && (!idleTyped || idleAccepted)) {
             if (opts.freeFallback && !credentialDeferred) {
               markParkKeep();
               runLog.info("run parked after capture boundary refusal; source and custody retained");
@@ -18787,12 +18797,19 @@ export class RunRunner {
               return true;
             }
             markParkKeep();
-            runLog.info("run parked for transient recovery", { detail: err.message });
+            const idleHeld = idleTyped && ack.recoveryRetryNotBefore === undefined;
+            const idleOpening = err instanceof TransientRecoveryError && err.idleStallKind === "zero_evidence" ? "provider sent no model output" : "model output stalled";
+            const idleCheckpoint = capture.published ? "published" : "saved on this worker";
+            runLog.info(idleHeld ? "run held for Codex idle recovery" : "run parked for transient recovery", { detail: err.message });
             batcher.emit({
               kind: "status",
               agent: "worker",
               payload: {
-                text: capture.published
+                text: idleTyped
+                  ? idleHeld
+                    ? `paused after ${idleOpening}; the recovery checkpoint is ${idleCheckpoint} and the run waits for its owner to resume it`
+                    : `paused after ${idleOpening}; the recovery checkpoint is ${idleCheckpoint} and it resumes automatically`
+                  : capture.published
                   ? "paused to recover from a transient interruption; the recovery checkpoint is published and it resumes automatically"
                   : "paused to recover from a transient interruption; the recovery checkpoint is saved on this worker and it resumes automatically",
               },
@@ -18814,7 +18831,7 @@ export class RunRunner {
             }
             return true;
           }
-          if (ack.status && ack.status !== "running") {
+          if (ack.status && ack.status !== "running" && !(idleTyped && ack.status === "recovery_wait")) {
             if (terminal.has(ack.status)) {
               markReleaseEligible("recovery_park_ack_terminal");
               flight.preserveSession = false;
@@ -22576,12 +22593,12 @@ export class RunRunner {
       // PRD #122 M1 (Decision 2): an autopilot run never reports awaiting_approval, so
       // the FROZEN milestone list rides this self-contained running report instead —
       // mirroring the repo_agents conditional above. Only when non-empty (additive-
-      // optional, never []). Reporting stays fire-and-forget via the .catch below.
+      // optional, never []). The storage report is awaited before implementation.
       if (milestones?.length) autopilotState.milestones = milestones;
       // PRD #84 M4: the FROZEN requirement set rides this same self-contained running
       // report (an autopilot run never reports awaiting_approval), each field only when
       // non-empty — same conditional-spread discipline as milestones/repo_agents above.
-      Object.assign(autopilotState, toolchainReportFields(toolchainDetection));
+      Object.assign(autopilotState, toolchainReportFields(toolchainDetection, this.client.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)));
       // RC1 (#1197): the approved autopilot plan rides this running report so the
       // server persists it durably via the guarded SetRunAutopilotPlan write — an
       // autopilot run never reports awaiting_approval, the channel the human-gated
@@ -22703,7 +22720,7 @@ export class RunRunner {
       // the server can gate plan-approval on worker eligibility. Each field only when
       // non-empty (additive-optional), matching the milestones conditional above.
       // PRD #1795: a re-presentation sends the requirements the human was shown instead.
-      ...(reuse ? presentedReportFields(reuse.presented) : toolchainReportFields(toolchainDetection)),
+      ...(reuse ? presentedReportFields(reuse.presented) : toolchainReportFields(toolchainDetection, this.client.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE))),
       // PRD #212 (Decision 3): ALWAYS send (empty [] when clean), NOT conditionally
       // spread — so each gate round REPLACES the server's list (M1's COALESCE clears on
       // empty), keeping a revision gate from showing a stale earlier round's writes.
@@ -23376,16 +23393,16 @@ function presentedReportFields(presented: GatePresentedRequirements | undefined)
   return fields;
 }
 
-/** PRD #84 M4: the additive `StateRequest` fields for a plan-time toolchain detection.
- *  Each array field is included ONLY when non-empty — mirroring the `milestones?.length ?
- *  {milestones} : {}` conditional-spread discipline, so a run that detected nothing (or
- *  whose scan failed and passed `undefined`) reports byte-for-byte as before. `size_class`
- *  is included whenever a detection was computed (it is soft/display-only). */
+/** Negotiate observations before freezing the plan report so the full captured
+ *  request matches its wire body and retries retain identical JSON. WorkerClient
+ *  still defends against feature shrink. Failed scans emit nothing; {} is known empty. */
 function toolchainReportFields(
   detection: ToolchainDetection | undefined,
+  evidenceSupported: boolean,
 ): Partial<StateRequest> {
   if (!detection) return {};
   const fields: Partial<StateRequest> = { size_class: detection.size_class };
+  if (evidenceSupported) fields.capability_inference_evidence = detection.evidence;
   if (detection.required_capabilities.length)
     fields.required_capabilities = detection.required_capabilities;
   if (detection.required_tools.length)

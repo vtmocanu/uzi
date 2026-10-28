@@ -124,7 +124,7 @@ func (e *Engine) runOnce(ctx context.Context) {
 	}
 	// Only log when the pass actually did something, to keep the log quiet on an
 	// idle system.
-	if res.WorkersOffline+res.ClaimedReset+res.WallParkRequested+res.WallParked+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.LimitReevaluated+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.CheckpointRetentionsReconciled+res.RecoveryStalled+res.RecoveryExpired+res.TaskUndispatchedFailed+res.CodexRefreshRecovered+res.CodexAccountParked+res.CodexAccountPromoted+res.CodexAccountFailed > 0 {
+	if res.WorkersOffline+res.ClaimedReset+res.WallParkRequested+res.WallParked+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.LimitReevaluated+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.CheckpointRetentionsReconciled+res.RecoveryStalled+res.RecoveryExpired+res.TaskUndispatchedFailed+res.CodexRefreshRecovered+res.CodexAccountParked+res.CodexAccountPromoted+res.CodexAccountFailed+res.ReserveMarked > 0 {
 		slog.Info("sweeper pass",
 			"workers_offline", res.WorkersOffline,
 			"claimed_reset", res.ClaimedReset,
@@ -199,6 +199,9 @@ func (e *Engine) runOnce(ctx context.Context) {
 			// a terminal failure of a held run is summed so it is never silent.
 			"codex_account_readmitted", res.CodexAccountReadmitted,
 			"codex_account_failed", res.CodexAccountFailed,
+			// PRD #3522 M3: same reasoning — in the sum above as well as emitted here, so a tick that
+			// only writes or clears a weekly-reserve hold marker still raises this line.
+			"reserve_marked", res.ReserveMarked,
 		)
 	}
 }

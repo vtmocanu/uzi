@@ -247,10 +247,11 @@ const EMPTY_TURN_BACKOFF_SLICE_MS = 250;
  *    events and no terminal at all;
  *  - the Codex lane, `CodexExecutor.driveTurnWithWallPark` (issue #2099): a turn that kept
  *    failing with a transient provider classification after its bounded same-thread retries,
- *    or an eligible turn that idled with zero model-processing evidence (#3462, #3466).
+ *    or an eligible measured idle turn: zero model-processing evidence (#3462, #3466),
+ *    or productive evidence under the negotiated Codex idle-stall contract.
  *    Human revision silence is consumed by its in-flight driver, never the ordinary recovery park.
  *
- * Except for that Codex zero-evidence idle, wall/idle/cancel/pause interruptions keep their
+ * Except for eligible measured Codex idle, wall/idle/cancel/pause interruptions keep their
  * existing terminal/cancelled/paused outcome. It is never thrown on the Claude lane for a turn that RAN but
  * did not submit a plan (that stays REASON_NO_PLAN). A distinct typed error is what lets the
  * runner catch route it to the non-terminal park instead of the generic failure path.
@@ -260,20 +261,20 @@ export class TransientRecoveryError extends Error {
    *  error. The runner types the recovery_wait park `provider_outage` from this alone; the
    *  empty-turn and gate-recovery throws stay unmarked. */
   public readonly providerOrigin: boolean;
-  /** Measured Codex human-revision silence, never provider-outage evidence. */
-  public readonly zeroEvidenceIdle: boolean;
+  /** Measured Codex idle evidence, never provider-outage evidence. */
+  public readonly idleStallKind?: "zero_evidence" | "productive";
   /** Original idle trip retained by identity for unsupported revision recovery. */
   public readonly originalIdle?: Error;
   /** Session resolved by the final failed attempt; undefined means resume no session. */
   public readonly sessionId?: string;
   constructor(
     message = "the model returned a positively-empty result (0 turns, no activity) after bounded in-process retries",
-    opts: { providerOrigin?: boolean; sessionId?: string; zeroEvidenceIdle?: boolean; originalIdle?: Error } = {},
+    opts: { providerOrigin?: boolean; sessionId?: string; idleStallKind?: "zero_evidence" | "productive"; originalIdle?: Error } = {},
   ) {
     super(message);
     this.name = "TransientRecoveryError";
     this.providerOrigin = opts.providerOrigin === true;
-    this.zeroEvidenceIdle = opts.zeroEvidenceIdle === true;
+    this.idleStallKind = opts.idleStallKind;
     this.originalIdle = opts.originalIdle;
     this.sessionId = opts.sessionId;
   }

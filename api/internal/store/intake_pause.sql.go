@@ -235,7 +235,7 @@ SELECT r.id AS run_id, r.kind, r.status,
                   -- #3495: a capped retained-recovery park (NULL retry stamp) waits for owner
                   -- Resume; a stamped one is an automatic retry still progressing.
                   OR (r.status = 'recovery_wait'
-                      AND r.recovery_wait_cause = 'retained_recovery_exhausted'
+                      AND r.recovery_wait_cause IN ('retained_recovery_exhausted', 'codex_idle_stall')
                       AND r.recovery_retry_not_before IS NULL)
              THEN 'needs_owner' ELSE 'progressing' END)::text AS tag,
        count(*) OVER ()::bigint AS total
@@ -395,6 +395,7 @@ const listRunAdmissionQueueReasons = `-- name: ListRunAdmissionQueueReasons :man
 SELECT r.id AS run_id,
        (CASE WHEN (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r)
              THEN 'maintenance'
+             WHEN r.reserve_hold_reason IS NOT NULL THEN 'weekly_reserve'
              WHEN admission.codex_admission_class = 'rate_limit' THEN 'codex_rate_limit'
              WHEN admission.codex_admission_class = 'overload' THEN 'codex_overload'
              ELSE '' END)::text AS queue_reason,
@@ -403,6 +404,7 @@ FROM runs r
 LEFT JOIN codex_queued_run_admission admission ON admission.run_id = r.id AND admission.user_id = r.user_id AND admission.user_id = $1::uuid
 WHERE r.id = ANY($2::uuid[]) AND r.status = 'queued'
   AND (admission.run_id IS NOT NULL
+       OR r.reserve_hold_reason IS NOT NULL
        OR ((SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r)))
 `
 
@@ -418,7 +420,8 @@ type ListRunAdmissionQueueReasonsRow struct {
 	CodexAdmissionEligibleAt pgtype.Timestamptz `json:"codex_admission_eligible_at"`
 }
 
-// Read-time maintenance precedence; owner admission details remain available independently.
+// Read-time precedence: maintenance, then the PRD #3522 weekly reserve, then Codex account
+// admission; owner admission details remain available independently.
 func (q *Queries) ListRunAdmissionQueueReasons(ctx context.Context, arg ListRunAdmissionQueueReasonsParams) ([]ListRunAdmissionQueueReasonsRow, error) {
 	rows, err := q.db.Query(ctx, listRunAdmissionQueueReasons, arg.ViewerID, arg.RunIds)
 	if err != nil {
@@ -446,10 +449,13 @@ func (q *Queries) ListRunAdmissionQueueReasons(ctx context.Context, arg ListRunA
 
 const listRunQueueReasons = `-- name: ListRunQueueReasons :many
 SELECT r.id AS run_id,
-       'maintenance'::text AS queue_reason
+       (CASE WHEN (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r)
+             THEN 'maintenance' ELSE 'weekly_reserve' END)::text AS queue_reason
 FROM runs r
 WHERE r.id = ANY($1::uuid[])
-  AND r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r)
+  AND r.status = 'queued'
+  AND (((SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r))
+       OR r.reserve_hold_reason IS NOT NULL)
 `
 
 type ListRunQueueReasonsRow struct {
@@ -458,8 +464,9 @@ type ListRunQueueReasonsRow struct {
 }
 
 // PRD #3454: the derived queue_reason for a set of runs, evaluated at read time so it never lags
-// the pause. Only runs that are queued, not admitted, while intake is paused are returned (reason
-// "maintenance"); every other id is absent.
+// the pause. A queued run that is not admitted while intake is paused reads "maintenance"; PRD
+// #3522: a queued run carrying a weekly-reserve hold marker otherwise reads "weekly_reserve"
+// (maintenance wins when both apply). Every other id is absent.
 func (q *Queries) ListRunQueueReasons(ctx context.Context, runIds []uuid.UUID) ([]ListRunQueueReasonsRow, error) {
 	rows, err := q.db.Query(ctx, listRunQueueReasons, runIds)
 	if err != nil {

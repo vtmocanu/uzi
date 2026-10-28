@@ -2558,6 +2558,13 @@ export type PublishResult =
   | { ok: true; body: PublishResponse }
   | { ok: false; httpStatus: number };
 
+export const CAPABILITY_INFERENCE_EVIDENCE_FEATURE = "capability_inference_evidence_v1";
+
+export type CapabilityInferenceEvidence = Partial<Record<"docker" | "jvm", {
+  triggers: { path: string; reason: "docker_marker" | "jvm_manifest" | "testcontainers_reference" | "docker_command" }[];
+  truncated: boolean;
+}>>;
+
 export interface StateRequest {
   /** Memory-pressure park fence, bound to the current registration. */
   register_nonce?: string;
@@ -2714,6 +2721,8 @@ export interface StateRequest {
    *  reports as `milestones` (candidate on awaiting_approval, frozen on the autopilot
    *  running report). */
   required_capabilities?: string[];
+  /** Display-only raw detector samples. Absent preserves old observations; {} is a known empty scan. */
+  capability_inference_evidence?: CapabilityInferenceEvidence;
   /** Provisionable toolchain names the run needs (e.g. go, node, python, rust, jvm).
    *  Additive + optional, OMITTED ENTIRELY when empty, same discipline as above. */
   required_tools?: string[];
@@ -2829,6 +2838,9 @@ export interface StateRequest {
    *  stay byte-identical on the wire; an api that predates the field 400s a report carrying it,
    *  which the worker's capability-aware fallback avoids by only sending it when the api
    *  advertised `recovery_park_cause` at register (D7). */
+  /** Codex measured idle parks use codex_idle_stall only with
+   * recovery_cause_codex_idle_stall_v1 and a positive, stampable generation. This
+   * contract never downgrades after negotiation; both idle kinds carry progress. */
   recovery_cause?: string;
   /** PRD #1733: with `recovery_cause: "provider_outage"` only (the api 400s it on any other report),
    *  the count of successful model turns completed since this flight started, so the api
@@ -2838,7 +2850,9 @@ export interface StateRequest {
   /** Successful model turns since this flight started, durably consumed by the api to clear
    *  the old provider-outage streak on a nonprovider recovery_wait park (cause absent,
    *  empty_turn or data_volume_full). Nonnegative int32; requires a positive claim_generation
-   *  and provider_progress_on_recovery_park_v1. Credential deferrals never send this evidence. */
+   *  and provider_progress_on_recovery_park_v1. A negotiated codex_idle_stall park
+   *  requires it, including zero, under recovery_cause_codex_idle_stall_v1 alone.
+   *  Credential deferrals never send this evidence. */
   provider_progress_turns?: number;
   /** PRD #1809 D6: qualifies a `recovery_cause: "data_volume_full"` park. `true` parks WITHOUT
    *  counting toward the api's lifetime cap (UZI_RUN_DISK_PARK_MAX), for M4's soft cache-cap park;
@@ -2927,6 +2941,8 @@ export type CompletedPublicationReason =
  * construction. An enumeration would go stale; this cannot.
  */
 export interface StateAck {
+  /** Cause read from the same RunDTO as status; required to confirm a typed idle park. */
+  recoveryCause?: string;
   /** Local acceptance proof from the memory park RPC, never a serialized API receipt.
    *  Only this binding authorizes marking a memory park; status/applied alone do not. */
   readonly memoryParkAccepted?: Readonly<{
