@@ -84,7 +84,9 @@ export const receiptOf = (runId: string, head: string): CompletedPublicationRece
   base_url: "https://example.invalid", branch: BRANCH, mr_iid: 3, observed_branch_head: head,
 });
 
-export async function rig(_t: TestContext, options: { codex: boolean; cohort?: number; unproven?: boolean; issue?: number }): Promise<Rig> {
+export async function rig(_t: TestContext, options: { codex: boolean; cohort?: number; unproven?: boolean; issue?: number;
+  /** Explicit capture ids for the extra cohort members (default randomUUID()). */
+  memberIds?: string[] }): Promise<Rig> {
   const dataDir = fs.realpathSync(fx.dataDir);
   const lifetime = await acquireWorkerLifetime(dataDir, testLockOptions());
   const rt = new AuthorityRuntime({ lifetime, workerToken: TOKEN, timeoutMs: 5000 });
@@ -113,7 +115,7 @@ export async function rig(_t: TestContext, options: { codex: boolean; cohort?: n
   assert.ok(first);
   const captureIds = [first.captureId];
   for (let i = 1; i < (options.cohort ?? 1); i++) {
-    const extra = { ...first, captureId: randomUUID() };
+    const extra = { ...first, captureId: options.memberIds?.[i - 1] ?? randomUUID() };
     await (p.recovery as unknown as { writeRecordUnlocked(r: unknown): Promise<void> }).writeRecordUnlocked(extra);
     captureIds.push(extra.captureId);
   }

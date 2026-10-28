@@ -486,6 +486,71 @@ describe("partial retirement keeps the authenticated retiring record as the only
     assert.deepEqual(snapshotFiles(r), files);
     assert.equal((await slotOf(r))?.state, "retiring");
   });
+
+  // Capture ids the authority store admits that are NOT v4 UUIDs: their bundles do not match the ordinary-temp
+  // pattern, so the residue check must accept a manifest-named bundle on its own terms.
+  const NON_V4 = ["00000000-0000-1000-8000-000000000001", "00000000-0000-1000-8000-000000000002"];
+  const failFirstBundle = (t: TestContext): { fired(): boolean } => {
+    const real = fsp.unlink.bind(fsp);
+    let failed = false;
+    t.mock.method(fsp, "unlink", async (file: string) => {
+      if (!failed && String(file).endsWith(".bundle")) { failed = true; throw Object.assign(new Error("EIO"), { code: "EIO" }); }
+      return real(file);
+    });
+    return { fired: () => failed };
+  };
+
+  for (const successor of [false, true]) {
+    it(`bundles of non-v4 members left by a partial retirement are residue a retry removes (${successor ? "successor incarnation" : "same worker"})`, async t => {
+      const r = await rig(t, { codex: false, cohort: 3, memberIds: NON_V4 });
+      await r.end();
+      await r.receipt();
+      const first = r.restart();
+      const injected = failFirstBundle(t);
+      await first.sweep();
+      assert.equal(injected.fired(), true);
+      t.mock.restoreAll();
+      assert.ok(recordNames(r).some(n => n === `${NON_V4[0]}.bundle`), "a non-v4 bundle is part of the residue");
+      assert.equal((await slotOf(r))?.state, "retiring");
+      const retry = successor ? r.restart() : first;
+      await retry.sweep();
+      assert.deepEqual(recordNames(r), []);
+      assert.equal((await slotOf(r))?.state, "retired");
+    });
+  }
+
+  it("a bundle appearing for a non-v4 member the manifest never named refuses the retry", async t => {
+    const r = await rig(t, { codex: false, cohort: 3, memberIds: NON_V4 });
+    fs.rmSync(path.join(recordDir(r), `${NON_V4[1]}.bundle`));
+    await r.end();
+    await r.receipt();
+    const first = r.restart();
+    const injected = failFirstBundle(t);
+    await first.sweep();
+    assert.equal(injected.fired(), true);
+    t.mock.restoreAll();
+    fs.writeFileSync(path.join(recordDir(r), `${NON_V4[1]}.bundle`), "late bundle");
+    const files = snapshotFiles(r);
+    await first.sweep();
+    assert.deepEqual(snapshotFiles(r), files);
+    assert.equal((await slotOf(r))?.state, "retiring");
+  });
+
+  it("an unknown non-UUID bundle with no record refuses the retry", async t => {
+    const r = await rig(t, { codex: false, cohort: 3, memberIds: NON_V4 });
+    await r.end();
+    await r.receipt();
+    const first = r.restart();
+    const injected = failFirstBundle(t);
+    await first.sweep();
+    assert.equal(injected.fired(), true);
+    t.mock.restoreAll();
+    fs.writeFileSync(path.join(recordDir(r), "00000000-0000-1000-8000-0000000000ff.bundle"), "stray bundle");
+    const files = snapshotFiles(r);
+    await first.sweep();
+    assert.deepEqual(snapshotFiles(r), files);
+    assert.equal((await slotOf(r))?.state, "retiring");
+  });
 });
 
 /** The identity the runner's pending-binder set uses for this rig's completing source (completionSourceIdentity). */

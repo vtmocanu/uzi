@@ -4751,6 +4751,10 @@ export class RecoveryCoordinator {
       if (name.endsWith(".bundle") && selected.some(r => r.captureId === name.slice(0, -".bundle".length)) &&
           !manifest.has(BUNDLE_ITEM + path.join(runDir, name))) return false;
       if (ordinaryTempEntry(name)) continue;
+      // A bundle the manifest names is residue the suffix check below accounts for; a bundle of another known
+      // record of this run is a sibling the retirement does not own (the rule physicalGeneration applies).
+      if (name.endsWith(".bundle") && (manifest.has(BUNDLE_ITEM + path.join(runDir, name)) ||
+          known.has(name.slice(0, -".bundle".length)))) continue;
       const stem = name.endsWith(".json") ? name.slice(0, -".json".length) : undefined;
       if (stem === undefined || !known.has(stem)) return false;
     }
