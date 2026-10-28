@@ -22,6 +22,13 @@ fi
 base_limit=$(jq -cn '[range(0;1000)|{name:"00001_base.sql"}]')
 if migration_report '[]' "$base_limit" >/dev/null; then fail "capped base directory was accepted as complete"; fi
 unset base_limit
+# A rename or copy introduces its destination version just as an added file does.
+for status in renamed copied; do
+  files=$(jq -cn --arg s "$status" '[{filename:"api/internal/store/migrations/00371_vault.sql",status:$s,previous_filename:"api/internal/store/migrations/99999_source.sql"}]')
+  report=$(migration_report "$files" '[{"name":"00372_base.sql"}]')
+  [ "$(printf '%s' "$report" | jq '.collisions|length')" -eq 1 ] || fail "$status destination bypassed migration check"
+done
+unset files report
 
 HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 MSHA=abcabcabcabcabcabcabcabcabcabcabcabcabca
@@ -661,6 +668,15 @@ done
 export PR_FILES_JSON='[{"filename":"api/internal/store/migrations/00373_vault.sql","status":"added"}]'
 merge_run migration_above
 [ "$rc" -eq 0 ] && [ -s "$WORK/merge.log" ] || fail "migration above head did not merge: $(cat "$WORK/m.migration_above")"
+for status in renamed copied; do
+  export PR_FILES_JSON="[{\"filename\":\"api/internal/store/migrations/00371_vault.sql\",\"status\":\"$status\",\"previous_filename\":\"api/internal/store/migrations/99999_source.sql\"}]"
+  merge_run "migration_${status}_below"
+  [ "$rc" -eq 13 ] || fail "$status below head: want 13, got $rc: $(cat "$WORK/m.migration_${status}_below")"
+  [ ! -e "$WORK/merge.log" ] || fail "$status below head reached gh pr merge"
+  export PR_FILES_JSON="[{\"filename\":\"api/internal/store/migrations/00373_vault.sql\",\"status\":\"$status\",\"previous_filename\":\"api/internal/store/migrations/00372_source.sql\"}]"
+  merge_run "migration_${status}_above"
+  [ "$rc" -eq 0 ] && [ -s "$WORK/merge.log" ] || fail "$status above head did not merge: $(cat "$WORK/m.migration_${status}_above")"
+done
 # An existing migration edited in the PR is not an added migration.
 export PR_FILES_JSON='[{"filename":"api/internal/store/migrations/00372_retained.sql","status":"modified"}]'
 merge_run migration_modified

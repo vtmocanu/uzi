@@ -71,7 +71,7 @@
 #      keyword, e.g. reword "does not close #N" to "Refs #N"), then re-run
 #  12  main changed changelog policy since the PR's merge-base: integrate main and
 #      require fresh exact-head CI before retrying
-#  13  MIGRATION_COLLISION: an added migration is at or below the live base head;
+#  13  MIGRATION_COLLISION: an added/renamed/copied migration is at or below the live base head;
 #      renumber with land-prep.sh, then require fresh exact-head CI and review
 set -uo pipefail
 
@@ -450,12 +450,13 @@ if [ "$REPO" = vtmocanu/uzi ] && [ "$base" = main ]; then
 fi
 
 # Read the live base inside the merge-lock window, after all other preflights.
-# No migration in the diff means no base-directory lookup (other repos may lack it).
+# Added, renamed and copied destinations introduce migration versions.
+# No such migration in the diff means no base-directory lookup (other repos may lack it).
 # Out-of-band base moves after this snapshot remain a race; GitHub pins only the head.
 migration_files=$(migration_pr_files "$REPO" "$PR") \
   || { echo 'cannot read PR files for migration check; not merging'; exit 2; }
 migration_info=$(migration_report "$migration_files" '[]') \
-  || { echo 'cannot read added migration versions; not merging'; exit 2; }
+  || { echo 'cannot read introduced migration versions; not merging'; exit 2; }
 if [ "$(printf '%s' "$migration_info" | jq '.added | length')" -gt 0 ]; then
   [ -n "$base" ] || { echo 'cannot read base ref for migration check; not merging'; exit 2; }
   migration_ref=$(printf '%s' "$base" | jq -sRr @uri)

@@ -26,7 +26,7 @@
 #                         DIRTY (wins over a CI-only unknown) — rebase with land-prep.sh.
 #                         GitHub may never run pull_request CI on a DIRTY PR, so empty checks
 #                         are expected there
-#   migration_collision   PR adds a migration at or below the base head: rebase + renumber
+#   migration_collision   PR adds/renames/copies a migration at or below the base head: rebase + renumber
 #                         (wins over a CI-only unknown)
 #   ci_red | ci_pending   required checks
 #   mr_rework_active      defer to uzi's rework
@@ -426,7 +426,7 @@ echo "MR_REWORK_ACTIVE=$mrw"
 echo "CI_FIX_ACTIVE=$CI_FIX_ACTIVE"
 echo "CI_FIX_RECENT=$CI_FIX_RECENT"
 
-# Workflow files and migrations in the PR diff (added files), vs the base's migration set.
+# Workflow files and migration destinations (added/renamed/copied), vs the base set.
 # An unreadable files list or base listing is UNKNOWN: a missed migration collision
 # bricks boot, so it must never read as "no collision".
 files=$(migration_pr_files "$REPO" "$PR") || { UNKNOWN=1; echo "PR_FILES=unreadable"; files='[]'; }

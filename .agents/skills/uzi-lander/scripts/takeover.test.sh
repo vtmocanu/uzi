@@ -328,6 +328,11 @@ has below-head 'NEXT=migration_collision'
 export PR_FILES_JSON='[{"filename":"api/internal/store/migrations/00099_old.sql","status":"added"}]'
 snap noreq same-filename
 has same-filename 'NEXT=migration_collision'
+for status in renamed copied; do
+  export PR_FILES_JSON="[{\"filename\":\"api/internal/store/migrations/00098_new.sql\",\"status\":\"$status\",\"previous_filename\":\"api/internal/store/migrations/00999_old.sql\"}]"
+  snap noreq "${status}-below-head"
+  has "${status}-below-head" 'NEXT=migration_collision'
+done
 unset PR_FILES_JSON BASE_MIG_JSON CHECKS_JSON
 
 export CLASSIC_HTTP=200 CLASSIC_RC=0 CLASSIC_BODY='{"contexts":["ci","slow"],"checks":[]}'

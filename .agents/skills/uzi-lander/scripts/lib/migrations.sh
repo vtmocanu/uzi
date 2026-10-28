@@ -14,6 +14,7 @@ migration_pr_files() { # OWNER/REPO PR -> complete paginated file array
 }
 
 migration_report() { # PR file array, base contents array -> {head,added,collisions}
+  # added includes rename/copy destinations; previous_filename is never the candidate.
   { printf '%s\n' "$1"; printf '%s\n' "$2"; } | jq -cse '
     def version:
       if test("^[0-9]+_.+\\.sql$") then capture("^(?<n>[0-9]+)_").n | tonumber
@@ -28,7 +29,7 @@ migration_report() { # PR file array, base contents array -> {head,added,collisi
          and ($base|all(.[]; type == "object" and (.name|type) == "string"))
         then . else error("unreadable migration entry") end
     | [$base[].name | select(endswith(".sql")) | version] | (max // 0) as $head
-    | [$files[] | select(.status == "added" and (.filename|test("^api/internal/store/migrations/[^/]+\\.sql$")))
+    | [$files[] | select((.status|IN("added", "renamed", "copied")) and (.filename|test("^api/internal/store/migrations/[^/]+\\.sql$")))
          | .filename | split("/") | last] as $added
     | {head:$head, added:$added, collisions:[$added[] | select(version <= $head)]}' 2>/dev/null
 }
