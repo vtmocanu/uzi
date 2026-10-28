@@ -155,6 +155,11 @@ timeout is at most 10 minutes; other hosts have their own limits.
 <this skill's directory>/scripts/watch-run.sh RUN completed,failed,cancelled 60   # to the end only
 ```
 
+For a sweep issue you will land, capture `SINCE=$(jq -nr now)` before queueing and arm
+`<this skill's directory>/scripts/watch-issue.sh --repo PATH_OR_UUID --since "$SINCE" ISSUE` at filing with a verified
+completion route. Keep that baseline on re-arms. It discovers a new run, even if already
+terminal, then delegates to `watch-run.sh` with the remaining poll budget and no plan watermark.
+
 For post-approval delivery, prefer the lander's full stop set (new plan, question,
 pause and terminal states), approved-plan watermark and explicit MAX covering the
 remaining budget. A terminal-only watch can miss a parked duty. Observation expiry

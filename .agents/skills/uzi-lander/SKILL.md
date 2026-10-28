@@ -202,6 +202,8 @@ locally in step 4. The advisory still prints until the window expires.
 
 ## The loop
 
+For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at filing with a pre-queue baseline, repo selector and verified completion route.
+
 1. **Run still active.** Poll blind to terminal with the watcher's poller, in the background:
    `.agents/skills/uzi-watcher/scripts/watch-run.sh RUN completed,failed,cancelled,awaiting_approval,awaiting_input,paused 60 MAX SEQ`,
    with `SEQ` the seq of the plan that was approved, carried from the approval or the watcher's
