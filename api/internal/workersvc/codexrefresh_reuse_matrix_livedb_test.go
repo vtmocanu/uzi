@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -181,7 +182,11 @@ func newJoinedReuseFix(t *testing.T) *joinedReuseFix {
 	}
 	q := &joinedReuseStore{Queries: e.q}
 	fx.svc.q, fx.svc.codexRefresh = q, p
-	e.exec("UPDATE users SET vault_mode='protected' WHERE id=$1", fx.userID)
+	hash, err := auth.HashPassword("joined-fixture-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.exec("UPDATE users SET vault_mode='protected', password_hash=$2 WHERE id=$1", fx.userID, hash)
 	fx.svc.vlt = vault.NewPostgres(e.box, e.pool)
 	if err := fx.svc.vlt.Unlock(e.ctx, fx.userID, "joined-fixture-password"); err != nil {
 		t.Fatal(err)
