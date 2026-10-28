@@ -524,8 +524,8 @@ the effective owner/instance/shared byte limits. **Maximum owner recovery
 bytes** is a scalar without an owner identifier. At most eight owner examples
 follow, ordered by refusal count descending then owner ID, with an
 omitted-owner count. The maximum and totals are computed across owners
-before this cap. These refusal-first examples cannot establish which owner
-has the largest recovery usage.
+before this cap. These refusal-first examples may omit the owner with the
+largest recovery usage.
 
 With pressure and zero refused captures, the action is to reduce stored
 bytes or raise the pressured budgets before recovery uploads are refused.
