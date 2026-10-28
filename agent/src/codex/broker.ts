@@ -166,7 +166,8 @@ const CHILD_FAILURE_CODES: ReadonlySet<string> = new Set([
 ]);
 
 /** Closed helper/client failure vocabulary permitted into model-visible output.
- *  The Go helper owns every `E_*` code except the client's local timeout sentinel. */
+ *  Helper and client share codes; client-minted provenance separately identifies
+ *  correlated helper errors, including those eligible for Read fallback. */
 const FILEOP_FAILURE_CODES: ReadonlySet<string> = new Set([
   "E_OVERSIZE",
   "E_NOT_TEXT",
