@@ -43,6 +43,7 @@ func newReserveFix(t *testing.T, threshold int16, pause bool) *reserveFix {
 	p.UsagePollInterval = 5 * time.Minute
 	p.CodexUsagePollInterval = 5 * time.Minute
 	svc := New(env.q, env.box, p)
+	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
 	fx := &reserveFix{t: t, env: env, svc: svc, userID: userID, repoID: repoID, workerID: workerID, targetID: uuid.New()}
 	env.exec(`UPDATE workers SET last_heartbeat_at = now(), protocol_capabilities = $2 WHERE id = $1`,

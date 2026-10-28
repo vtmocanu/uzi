@@ -138,6 +138,8 @@ type fakeStore struct {
 	// anthropicSealedWith is the row's sealed_with (defaults to 'master' when
 	// empty, so existing fixtures are unchanged); set to 'dek' for vault tests.
 	anthropicSealedWith string
+	// anthropicVaultEpoch is captured with the default ciphertext at seal time.
+	anthropicVaultEpoch int64
 	// onClaimRun, if set, runs inside ClaimRun — used to simulate the vault locking
 	// between the claim gate and the token open (the M3 lock race).
 	onClaimRun func()
@@ -871,6 +873,11 @@ func (f *fakeStore) GetUserJudgeAnthropicBinding(context.Context, uuid.UUID) (st
 func (f *fakeStore) GetUserSecretCiphertextByID(_ context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error) {
 	f.byIDLookups = append(f.byIDLookups, arg)
 	if row, ok := f.byIDSecrets[arg.ID]; ok {
+		// Legacy fixtures key rows by their stored ID. Preserve explicit IDs so
+		// malformed-row tests can still exercise the reader's identity guard.
+		if row.ID == uuid.Nil {
+			row.ID = arg.ID
+		}
 		return row, nil
 	}
 	// Since PRD #111 D8 the DEFAULT credential is opened by id too, so this lookup
@@ -885,8 +892,8 @@ func (f *fakeStore) GetUserSecretCiphertextByID(_ context.Context, arg store.Get
 			sealedWith = store.SealedWithMaster
 		}
 		return store.GetUserSecretCiphertextByIDRow{
-			UserID: arg.UserID, Kind: store.KindAnthropicToken,
-			Ciphertext: f.anthropic, SealedWith: sealedWith,
+			ID: arg.ID, UserID: arg.UserID, Kind: store.KindAnthropicToken,
+			Ciphertext: f.anthropic, SealedWith: sealedWith, VaultEpoch: f.anthropicVaultEpoch,
 		}, f.defaultCiphertextErr
 	}
 	return store.GetUserSecretCiphertextByIDRow{}, pgx.ErrNoRows
@@ -1271,6 +1278,10 @@ func (f *fakeStore) PromoteLimitWaitRuns(_ context.Context, now pgtype.Timestamp
 // Issue #1197. setRecoveryWaitRows defaults to 0 — the SQL guard refusing — so a fixture
 // that wants a park to land must say so, matching the safe default for a fake whose real
 // query carries a positive source guard (same convention as SetRunLimitWait above).
+func (f *fakeStore) LockUserVaultStateForMutation(ctx context.Context, _ uuid.UUID) (store.LockUserVaultStateRow, error) {
+	return store.LockUserVaultStateRow{VaultMode: store.VaultModeProtected}, ctx.Err()
+}
+
 func (f *fakeStore) SetRunRecoveryWait(_ context.Context, arg store.SetRunRecoveryWaitParams) (int64, error) {
 	f.setRecoveryWait = &arg
 	return f.setRecoveryWaitRows, f.setRecoveryWaitErr
@@ -1984,7 +1995,12 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 	defer slog.SetDefault(prev)
 
 	svc := New(fs, box, testParams())
-	payload, err := svc.Claim(context.Background(), worker(), nil)
+	wkr := worker()
+	fs.claimRun.UserID = wkr.UserID
+	m := newMemVaultStore()
+	m.states[wkr.UserID] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected}
+	svc.SetVault(newMemoryVault(box, m))
+	payload, err := svc.Claim(context.Background(), wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2069,7 +2085,7 @@ func TestClaimCarriesTaskOpenMrAndBaseBranch(t *testing.T) {
 		anthropic: sealedTok,
 	}
 
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -2117,7 +2133,7 @@ func TestClaimCarriesTaskIdleTimeoutForInteractiveRun(t *testing.T) {
 		anthropic: sealedTok,
 	}
 
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -2155,7 +2171,7 @@ func TestClaimOmitsTaskIdleTimeoutForNonInteractiveRun(t *testing.T) {
 		anthropic: sealedTok,
 	}
 
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -2222,7 +2238,7 @@ func TestClaimDerivesStopPending(t *testing.T) {
 				anthropic: sealedTok,
 			}
 
-			svc := New(fs, box, testParams())
+			svc := newOffModeService(fs, box, testParams())
 			payload, err := svc.Claim(context.Background(), worker(), nil)
 			if err != nil {
 				t.Fatalf("Claim: %v", err)
@@ -2254,7 +2270,7 @@ func TestClaimOmitsDefaultModelWhenOwnerHasNone(t *testing.T) {
 		// defaultModel left zero ⇒ NULL ⇒ the owner has no per-user default.
 	}
 
-	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
+	payload, err := newOffModeService(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2314,7 +2330,7 @@ func TestClaimScheduleModelOverridesUserDefault(t *testing.T) {
 		{Name: "reviewer", Description: "reviews", PromptBody: "you review", Model: pgconv.TextOrNull("claude-opus-4-8")},
 	}
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
+	payload, err := newOffModeService(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2336,7 +2352,7 @@ func TestClaimDeliversOverrideSubagentModelWhenFrozenOn(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	fs.claimRun.OverrideSubagentModel = true
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
+	payload, err := newOffModeService(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2353,7 +2369,7 @@ func TestClaimOmitsOverrideSubagentModelWhenFrozenOff(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	// claimRun.OverrideSubagentModel left zero ⇒ the run did not opt in.
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
+	payload, err := newOffModeService(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2377,7 +2393,7 @@ func TestClaimDeliversAttributionEnabledWhenOwnerOn(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	fs.attributionEnabled = true
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
+	payload, err := newOffModeService(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2404,7 +2420,7 @@ func TestClaimDeliversAttributionDisabledWhenOwnerOff(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	fs.attributionEnabled = false
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
+	payload, err := newOffModeService(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2430,7 +2446,7 @@ func TestClaimReReadsAttributionLivePerClaim(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 	fs.attributionEnabled = true
 
-	svc := New(fs, newBox(t), testParams())
+	svc := newOffModeService(fs, newBox(t), testParams())
 
 	first, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
@@ -2457,7 +2473,7 @@ func TestClaimReReadsAttributionLivePerClaim(t *testing.T) {
 func TestClaimScheduleModelOverridesEvenWithNoUserDefault(t *testing.T) {
 	fs := scheduleModelStore(t, pgconv.TextOrNull("fable"), pgtype.Text{})
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
+	payload, err := newOffModeService(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2472,7 +2488,7 @@ func TestClaimScheduleModelOverridesEvenWithNoUserDefault(t *testing.T) {
 func TestClaimNoScheduleModelUsesUserDefault(t *testing.T) {
 	fs := scheduleModelStore(t, pgtype.Text{}, pgconv.TextOrNull("sonnet"))
 
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
+	payload, err := newOffModeService(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2496,7 +2512,7 @@ func TestClaimNoScheduleModelUsesUserDefault(t *testing.T) {
 func TestClaimCarriesSummaryModelFromInstanceDefault(t *testing.T) {
 	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
 	// summaryModel left NULL ⇒ inherit the instance value.
-	svc := New(fs, newBox(t), testParams())
+	svc := newOffModeService(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{summaryModel: "haiku"})
 
 	payload, err := svc.Claim(context.Background(), worker(), nil)
@@ -2513,7 +2529,7 @@ func TestClaimCarriesSummaryModelFromInstanceDefault(t *testing.T) {
 func TestClaimSummaryModelUserOverrideWins(t *testing.T) {
 	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
 	fs.summaryModel = pgconv.TextOrNull("opus") // per-user override
-	svc := New(fs, newBox(t), testParams())
+	svc := newOffModeService(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{summaryModel: "haiku"})
 
 	payload, err := svc.Claim(context.Background(), worker(), nil)
@@ -2529,8 +2545,8 @@ func TestClaimSummaryModelUserOverrideWins(t *testing.T) {
 // omitempty keeps the wire byte-identical for a deployment that has not wired settings.
 func TestClaimOmitsSummaryModelWhenNoSettings(t *testing.T) {
 	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
-	// New(...) leaves s.settings nil unless SetSettings is called.
-	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
+	// newOffModeService(...) leaves s.settings nil unless SetSettings is called.
+	payload, err := newOffModeService(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2561,7 +2577,7 @@ func TestClaimFailsOnDefaultModelLookupError(t *testing.T) {
 		defaultModelErr: errors.New("db down"),
 	}
 
-	_, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
+	_, err := newOffModeService(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err == nil {
 		t.Fatal("expected Claim to fail when the default-model lookup errors")
 	}
@@ -2596,7 +2612,7 @@ func TestClaimDefaultsEffortToMediumWhenOwnerHasNone(t *testing.T) {
 		// defaultEffort left zero ⇒ NULL ⇒ the owner has no per-user default.
 	}
 
-	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
+	payload, err := newOffModeService(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2631,7 +2647,7 @@ func TestClaimCarriesDefaultEffort(t *testing.T) {
 		defaultEffort: pgconv.TextOrNull("low"),
 	}
 
-	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
+	payload, err := newOffModeService(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -2658,7 +2674,7 @@ func TestClaimFailsOnDefaultEffortLookupError(t *testing.T) {
 		defaultEffortErr: errors.New("db down"),
 	}
 
-	_, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
+	_, err := newOffModeService(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err == nil {
 		t.Fatal("expected Claim to fail when the default-effort lookup errors")
 	}
@@ -2688,7 +2704,7 @@ func TestClaimFailsOnAttributionLookupError(t *testing.T) {
 		attributionEnabledErr: errors.New("db down"),
 	}
 
-	_, err := New(fs, box, testParams()).Claim(context.Background(), worker(), nil)
+	_, err := newOffModeService(fs, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err == nil {
 		t.Fatal("expected Claim to fail when the attribution lookup errors")
 	}
@@ -2819,7 +2835,7 @@ func TestClaimFailsRunWhenToolPackagesRejected(t *testing.T) {
 		toolProfile:   store.RepoToolProfile{Packages: []byte(`["opentofu"]`)},
 		toolAllowlist: []store.ToolAllowlist{}, // shrank to nothing
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -5035,7 +5051,7 @@ func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
 
 	// Fresh autopilot run: no branch/session yet, auto_approve set on the row.
 	fresh := newFS(store.Run{ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, Status: "claimed", AutoApprove: true})
-	p, err := New(fresh, box, testParams()).Claim(context.Background(), worker(), nil)
+	p, err := newOffModeService(fresh, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil || p == nil {
 		t.Fatalf("fresh Claim: payload=%v err=%v", p, err)
 	}
@@ -5050,7 +5066,7 @@ func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
 		ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, Status: "claimed", AutoApprove: true,
 		Branch: pgconv.TextOrNull("agent/issue-4"), SessionID: pgconv.TextOrNull("sess-xyz"), RequeueCount: 1,
 	})
-	p, err = New(resume, box, testParams()).Claim(context.Background(), worker(), nil)
+	p, err = newOffModeService(resume, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil || p == nil {
 		t.Fatalf("resume Claim: payload=%v err=%v", p, err)
 	}
@@ -5060,7 +5076,7 @@ func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
 
 	// A manual run never carries it.
 	manual := newFS(store.Run{ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, Status: "claimed"})
-	p, err = New(manual, box, testParams()).Claim(context.Background(), worker(), nil)
+	p, err = newOffModeService(manual, box, testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil || p == nil {
 		t.Fatalf("manual Claim: payload=%v err=%v", p, err)
 	}
@@ -5652,7 +5668,7 @@ func TestClaimRebindChangesCredentialWithoutRestart(t *testing.T) {
 			},
 		},
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 
 	// ONE worker identity throughout: same id, same owner, same join-token hash.
 	// Only the binding column changes between claims.
@@ -5795,7 +5811,7 @@ func TestJudgeClaimIgnoresWorkerBinding(t *testing.T) {
 			consoleID: {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedConsole, SealedWith: store.SealedWithMaster},
 		},
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 
 	wkr := store.Worker{
 		ID: uuid.New(), UserID: owner,
@@ -5872,7 +5888,7 @@ func TestJudgeClaimUsesJudgeBinding(t *testing.T) {
 			judgeID: {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedJudge, SealedWith: store.SealedWithMaster},
 		},
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 
 	// The claiming worker is bound to something ELSE entirely, to prove the judge
 	// lane ignores it (D1).
@@ -5921,7 +5937,7 @@ func TestJudgeClaimUnboundUsesDefault(t *testing.T) {
 		anthropic:   sealedDefault,
 		judgeSecret: pgtype.UUID{}, // unbound
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 
 	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: owner}, nil)
 	if err != nil {
@@ -6035,7 +6051,7 @@ func TestSelfImproveClaimFollowsJudgeBinding(t *testing.T) {
 			workerID: {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedDefault, SealedWith: store.SealedWithMaster},
 		},
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 
 	// Claimed by a worker bound to a DIFFERENT credential: the judge binding wins.
 	wkr := store.Worker{

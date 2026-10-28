@@ -80,9 +80,10 @@ const statusPoolWait = "pool_wait"
 // `uzi run get`'s detail block compare against one literal.
 //
 // NON-TERMINAL, like limit_wait/pool_wait. The cause and retry stamp distinguish
-// timed recovery from an owner-required hold. Retained recovery with a finite stamp
-// stays timed even after it is due; NULL requires owner Resume or Cancel. Default
-// wait and follow stop on owner-required worker holds; timed recovery keeps polling.
+// timed recovery from an owner-required hold. Retained recovery exhaustion with a
+// finite stamp stays timed even after it is due; NULL requires owner Resume or Cancel.
+// Retained recovery adoption failure always requires the owner, regardless of stamp.
+// Default wait and follow stop on owner-required worker holds; timed recovery keeps polling.
 const statusRecoveryWait = "recovery_wait"
 
 // statusPaused is the status a run carries while parked by an OWNER pause (PRD #1190):
@@ -202,7 +203,8 @@ var allRunStatuses = func() map[string]bool {
 // OMITS recovery_wait (issue #1197: a transient-recovery park auto-resumes on a capped
 // backoff, so it is legitimate to wait through, exactly like limit_wait/pool_wait).
 // runWait separately stops a default wait on owner-required worker holds, including
-// retained recovery exhausted only when its retry stamp is NULL; an explicit --until retains the exact status-set semantics.
+// retained recovery exhaustion when its retry stamp is NULL and adoption failure
+// regardless of stamp. An explicit --until retains the exact status-set semantics.
 var defaultWaitStates = []string{"awaiting_approval", "awaiting_input", "awaiting_followup", "completed", "failed", "cancelled"}
 
 // run wait poll cadence and transient-blip resilience knobs (PRD #264 D1/D9). Vars,

@@ -22,6 +22,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -236,6 +237,7 @@ func TestAdminDockerAllowlistTrustUnlocksMemberClaimLiveDB(t *testing.T) {
 	}
 	cache := settings.New(q, time.Minute)
 	svc := workersvc.New(q, f.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), WorkerHeartbeatStale: time.Minute})
+	svc.SetVault(vault.NewPostgres(f.box, f.pool))
 	svc.SetTxBeginner(f.pool)
 	svc.SetDockerAllowlist(cache)
 	svc.SetCapabilitySettings(cache)

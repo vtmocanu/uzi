@@ -12,7 +12,6 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 type reuseReceiptStore struct {
@@ -187,7 +186,7 @@ func TestCodexReuseAdmissionPrechecks(t *testing.T) {
 			box, acct := newInstrFixture(t)
 			acct.UserID, acct.ID = uuid.New(), uuid.New()
 			svc := &Service{box: box}
-			svc.vlt = vault.New(box, newMemVaultStore())
+			svc.vlt = newMemoryVault(box, newMemVaultStore())
 			if kind != "locked" {
 				if err := svc.vlt.Unlock(context.Background(), acct.UserID, "test-password"); err != nil {
 					t.Fatal(err)
@@ -214,7 +213,15 @@ func TestCodexReuseAdmissionPrechecks(t *testing.T) {
 				it.FromGeneration--
 			}
 			calls := 0
-			login, ok, err := svc.admitCodexRefreshReuse(context.Background(), acct, it, func(_ context.Context, arg store.CodexRefreshReuseParams) (bool, error) {
+			epoch := int64(0)
+			if svc.vlt != nil {
+				state, err := svc.vlt.State(context.Background(), acct.UserID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				epoch = state.VaultEpoch
+			}
+			login, ok, err := svc.admitCodexRefreshReuse(context.Background(), codexAccountSnapshot{CodexProviderAccount: acct, VaultEpoch: epoch}, it, func(_ context.Context, arg store.CodexRefreshReuseParams) (bool, error) {
 				calls++
 				if arg.UserID != acct.UserID || arg.AccountID != acct.ID || arg.OperationID != it.OperationID || arg.FromGeneration != acct.Generation {
 					t.Fatal("wrong admission fence")
@@ -272,7 +279,7 @@ func TestCodexReuseResolution(t *testing.T) {
 			}
 		})
 	}
-	if codexRefreshReuseInFlightBound != 52140*time.Millisecond {
+	if codexRefreshReuseInFlightBound != 832_140*time.Millisecond {
 		t.Fatalf("policy bound changed: %v; review actual retry schedule", codexRefreshReuseInFlightBound)
 	}
 }

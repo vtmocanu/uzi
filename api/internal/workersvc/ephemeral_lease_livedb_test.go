@@ -51,6 +51,7 @@ func newLeaseEnv(t *testing.T) leaseEnv {
 // service builds a Service over the live store, the given transaction beginner and lease.
 func (e leaseEnv) service(lease time.Duration, tx TxBeginner) *Service {
 	svc := New(e.q, e.box, testParams())
+	svc.SetVault(e.vlt)
 	svc.SetTxBeginner(tx)
 	svc.SetBackground(func(func()) {})
 	svc.SetEphemeralLease(lease)

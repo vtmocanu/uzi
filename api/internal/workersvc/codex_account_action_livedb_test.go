@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -180,7 +181,7 @@ func TestCodexAccountActionRetryPendingLiveDB(t *testing.T) {
 		{name: "eligible", pending: true, want: CodexAccountActionReconciling},
 		{name: "consumed disabled alias old intent", intentSet: "created_at=now()-interval '1 hour', reuse_attempted_at=now()", disabled: true, pending: true, want: CodexAccountActionReconciling},
 		{name: "expired unconsumed window", intentSet: "created_at=now()-interval '31 minutes'", want: CodexAccountActionReloginRequired},
-		{name: "consumed crash bound expired", intentSet: "reuse_attempted_at=now()-interval '53 seconds'", want: CodexAccountActionReloginRequired},
+		{name: "consumed crash bound expired", intentSet: fmt.Sprintf("reuse_attempted_at=now()-interval '%d microseconds'", (codexRefreshReuseInFlightBound + time.Second).Microseconds()), want: CodexAccountActionReloginRequired},
 		{name: "consumed inside bound", intentSet: "reuse_attempted_at=now()-interval '30 seconds'", pending: true, want: CodexAccountActionReconciling},
 		{name: "wrong operation", accountSet: "coord_operation_id=gen_random_uuid()", want: CodexAccountActionReloginRequired},
 		{name: "moved generation", accountSet: "generation=generation+1", want: CodexAccountActionReloginRequired},
@@ -240,17 +241,19 @@ func TestCodexAccountActionRetryBoundParamLiveDB(t *testing.T) {
 	fx, _ := heldCodexFix(t, env)
 	op := uuid.New()
 	env.exec("UPDATE codex_provider_account SET coord_operation_id=$2, lease_deadline=NULL WHERE id=$1", fx.accountID, op)
+	attemptAge := codexRefreshReuseInFlightBound + time.Minute
 	env.exec(`INSERT INTO codex_refresh_intent
         (operation_id,user_id,provider_account_id,from_generation,state,created_at,provider_error_at,reuse_attempted_at)
-        SELECT $1,user_id,id,generation,'rotating',now()-interval '1 hour',now()-interval '1 minute',now()-interval '1 minute'
-        FROM codex_provider_account WHERE id=$2`, op, fx.accountID)
+        SELECT $1,user_id,id,generation,'rotating',now()-interval '1 hour',
+               now()-($3::bigint * interval '1 microsecond'),now()-($3::bigint * interval '1 microsecond')
+        FROM codex_provider_account WHERE id=$2`, op, fx.accountID, attemptAge.Microseconds())
 	t.Cleanup(func() { env.exec("DELETE FROM codex_refresh_intent WHERE operation_id=$1", op) })
 	for _, tc := range []struct {
 		bound   time.Duration
 		pending bool
 	}{
 		{codexRefreshReuseInFlightBound, false},
-		{2 * time.Minute, true},
+		{attemptAge + time.Minute, true},
 	} {
 		rows, err := env.q.ListCodexAccountActionInputs(env.ctx, store.ListCodexAccountActionInputsParams{
 			RunIds: []uuid.UUID{fx.runID}, ReuseInFlightMicroseconds: tc.bound.Microseconds(),

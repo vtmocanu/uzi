@@ -97,14 +97,15 @@ jq -e '.code == "no_credential_for_harness"' "$CX_UNAVAIL_BODY" >/dev/null \
 assert_no_run_for_issue "$CX_UNAVAIL_IID" 2
 pass "explicit harness=codex with no codex credential: 422 no_credential_for_harness, no run created"
 
-# --- (2) save a runtime-assembled dummy openai_api_key through the boot-unlocked vault --
-# The admin session's vault was boot-unlocked at login (PRD #32); PUT/POST secrets seal
+# --- (2) save a runtime-assembled dummy openai_api_key through the enrolled vault --
+# Bootstrap explicitly enabled the initially-Off admin; login re-unlocks that
+# protected vault (PRD #32). PUT/POST secrets seal
 # under its DEK exactly like the anthropic_token save in 34-vault.sh. This is the user's
 # FIRST codex credential, so it is forced default regardless of the explicit flag.
 CX_OPENAI_ID="$(apipost /api/me/secrets/openai_api_key \
   "$(jq -nc --arg t "$DUMMY_OPENAI" '{token:$t, label:"e2e-codex-key", default:true}')" | jq -r '.secret.id')"
 { [ -n "$CX_OPENAI_ID" ] && [ "$CX_OPENAI_ID" != null ]; } || fail "could not save the dummy openai_api_key"
-pass "saved a runtime-assembled dummy openai_api_key through the boot-unlocked vault ($CX_OPENAI_ID, default)"
+pass "saved a runtime-assembled dummy openai_api_key through the enrolled vault ($CX_OPENAI_ID, default)"
 
 # --- (3) an EXPLICITLY Codex-selected issue run, start to MR -----------------------
 # Through the public API (harness:"codex" — PRD #1429 M2/D2's `uzi run create --harness

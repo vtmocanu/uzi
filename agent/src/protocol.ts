@@ -1482,6 +1482,8 @@ export interface ClaimResponse extends ClaimMemoryState {
   claim_generation?: number;
   /** Server recovery allowance; malformed values are ignored at the claim boundary. */
   worker_recovery_episode?: number;
+  /** Raw owner resume grant; malformed or absent grants confer no adoption renewal. */
+  worker_recovery_owner_episode?: number;
   /** Structured PRD #3 templates — the lead plus any subagents — consumed
    *  programmatically by M3 (mapped to SDK AgentDefinitions). M2 ignores them. */
   agents: AgentTemplate[];
@@ -1899,6 +1901,8 @@ export interface ChatClaimResponse extends ClaimMemoryState {
   run_id: string;
   claim_generation?: number;
   worker_recovery_episode?: number;
+  /** Raw owner resume grant; malformed or absent grants confer no adoption renewal. */
+  worker_recovery_owner_episode?: number;
   kind: "chat";
   /** Conversation display title (server-derived; may be empty). */
   title: string;
@@ -2822,14 +2826,21 @@ export interface StateRequest {
    *  "data_volume_full" (a write to the worker's data volume stayed
    *  disk-full after a reclaim and one retry, or the claim preflight found the volume full; gated
    *  on `recovery_cause_data_volume_full`, an api without it gets the untyped park; the api 400s
-   *  this cause without `claim_generation`, so it is never sent for a chat claim). The api
-   *  validates it against its own enum
-   *  (forge_unreachable|empty_turn|provider_outage|vault_locked|codex_account_unavailable|data_volume_full) before any SQL
-   *  and a legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
+   *  this cause without `claim_generation`, so it is never sent for a chat claim).
+   *  Retained recovery uses "retained_recovery_exhausted" for confirmed budget exhaustion
+   *  (feature `recovery_cause_retained_recovery_exhausted`, timed or owner-held) and
+   *  "retained_recovery_adoption_failed" for a confirmed persisted adoption refusal
+   *  (feature `recovery_cause_retained_recovery_adoption_failed`, owner Resume or Cancel only,
+   *  no automatic retry). Both require a positive claim generation and exact fenced ACK;
+   *  feature absence keeps the retained terminal fallback. The api validates its cause enum
+   *  before SQL, and a legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
    *  other report so a pre-#1392 worker's payload and an ordinary (empty-turn) recovery park
    *  stay byte-identical on the wire; an api that predates the field 400s a report carrying it,
    *  which the worker's capability-aware fallback avoids by only sending it when the api
    *  advertised `recovery_park_cause` at register (D7). */
+  /** Codex measured idle parks use codex_idle_stall only with
+   * recovery_cause_codex_idle_stall_v1 and a positive, stampable generation. This
+   * contract never downgrades after negotiation; both idle kinds carry progress. */
   recovery_cause?: string;
   /** PRD #1733: with `recovery_cause: "provider_outage"` only (the api 400s it on any other report),
    *  the count of successful model turns completed since this flight started, so the api
@@ -2839,7 +2850,9 @@ export interface StateRequest {
   /** Successful model turns since this flight started, durably consumed by the api to clear
    *  the old provider-outage streak on a nonprovider recovery_wait park (cause absent,
    *  empty_turn or data_volume_full). Nonnegative int32; requires a positive claim_generation
-   *  and provider_progress_on_recovery_park_v1. Credential deferrals never send this evidence. */
+   *  and provider_progress_on_recovery_park_v1. A negotiated codex_idle_stall park
+   *  requires it, including zero, under recovery_cause_codex_idle_stall_v1 alone.
+   *  Credential deferrals never send this evidence. */
   provider_progress_turns?: number;
   /** PRD #1809 D6: qualifies a `recovery_cause: "data_volume_full"` park. `true` parks WITHOUT
    *  counting toward the api's lifetime cap (UZI_RUN_DISK_PARK_MAX), for M4's soft cache-cap park;
@@ -2928,6 +2941,8 @@ export type CompletedPublicationReason =
  * construction. An enumeration would go stale; this cannot.
  */
 export interface StateAck {
+  /** Cause read from the same RunDTO as status; required to confirm a typed idle park. */
+  recoveryCause?: string;
   /** Local acceptance proof from the memory park RPC, never a serialized API receipt.
    *  Only this binding authorizes marking a memory park; status/applied alone do not. */
   readonly memoryParkAccepted?: Readonly<{

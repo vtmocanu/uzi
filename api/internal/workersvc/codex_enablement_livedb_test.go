@@ -73,7 +73,7 @@ func TestCodexNewAliasLinksWhileSiblingDisabledLiveDB(t *testing.T) {
 
 	fid := newFakeCodexIdentity()
 	fid.idByToken[fx.access] = codexauth.Identity{ProviderUserID: fx.providerUserID, WorkspaceAccountID: fx.workspaceID}
-	if err := NewCodexReconciler(env.q, nil, env.box, fid, env.pool).ReconcileCodexAuthIdentity(env.ctx, fx.userID, fresh); err != nil {
+	if err := NewCodexReconciler(env.q, env.vlt, env.box, fid, env.pool).ReconcileCodexAuthIdentity(env.ctx, fx.userID, fresh); err != nil {
 		t.Fatalf("reconcile the new alias: %v", err)
 	}
 	st, err := env.q.GetCodexCredentialState(env.ctx, store.GetCodexCredentialStateParams{UserSecretID: fresh, UserID: fx.userID})
@@ -102,7 +102,7 @@ func TestCollectCodexUsageNeedsEnabledAliasLiveDB(t *testing.T) {
 	sibling := env.seedStagingAlias(t, fx.userID, "codex-sibling-"+uuid.NewString(), codexLoginBlob{AccessToken: fx.access, RefreshToken: codexToken("refresh")})
 	fid := newFakeCodexIdentity()
 	fid.idByToken[fx.access] = codexauth.Identity{ProviderUserID: fx.providerUserID, WorkspaceAccountID: fx.workspaceID}
-	if err := NewCodexReconciler(env.q, nil, env.box, fid, env.pool).ReconcileCodexAuthIdentity(env.ctx, fx.userID, sibling); err != nil {
+	if err := NewCodexReconciler(env.q, env.vlt, env.box, fid, env.pool).ReconcileCodexAuthIdentity(env.ctx, fx.userID, sibling); err != nil {
 		t.Fatalf("link sibling: %v", err)
 	}
 	reading := usageResult{reading: codexauth.UsageReading{UserID: fx.providerUserID, Buckets: []codexauth.UsageBucket{{ID: "codex"}}}}

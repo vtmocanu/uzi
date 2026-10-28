@@ -1589,8 +1589,41 @@ it.each([
   expect(badge.kind === "badge" && badge.title).not.toMatch(/requeues|episode|Used:|Remaining:/);
   expect(effectiveRunStatus({ ...input, status: "running" })).toBe("running");
 });
+it.each([null, undefined, "invalid", "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z"])("adoption refusal is owner-held regardless of retry timestamp %s", (stamp) => {
+  const input = { ...run({ status: "recovery_wait" }), recovery_wait_cause: "retained_recovery_adoption_failed", recovery_retry_not_before: stamp };
+  const status = effectiveRunStatus(input);
+  expect(status).toBe("retained_recovery_adoption_failed");
+  expect(parkLabel(input)).toBe("retained recovery integrity hold");
+  expect(needsHumanAttention(status)).toBe(true);
+  expect(runStatusTone(status, null)).toBe("warning");
+  const badge = runBadge(input, NOW);
+  expect(badge).toMatchObject({ label: "retained recovery integrity hold", tone: "warning", pulse: false });
+  expect(badge.kind === "badge" && badge.title).toMatch(/Integrity checks refused/);
+  expect(badge.kind === "badge" && badge.title).toMatch(/local work and its custody are preserved/i);
+  expect(badge.kind === "badge" && badge.title).toMatch(/owner can Resume or Cancel.*no scheduled retry/);
+  expect(badge.kind === "badge" && badge.title).not.toMatch(/automatically|retrying in|retry in/);
+  expect(effectiveRunStatus({ ...input, status: "running" })).toBe("running");
+});
 it("omitted board cause and timing remain generic even if retry stamp is null", () => {
   expect(runBadge(run({ status: "recovery_wait" }), NOW)).toMatchObject({ label: "recovery wait" });
   expect(effectiveRunStatus({ status: "recovery_wait", recovery_retry_not_before: null })).toBe("recovery_wait");
   expect(effectiveRunStatus({ status: "recovery_wait", recovery_wait_cause: "retained_recovery_exhausted" })).toBe("retained_recovery_unknown");
+});
+
+it.each([
+  ["2099-01-01T00:00:00Z", "codex_idle_stall_retrying", "Codex idle stall retrying", false],
+  ["2020-01-01T00:00:00Z", "codex_idle_stall_retrying", "Codex idle stall retrying", false],
+  [null, "codex_idle_stall_held", "Codex idle stall needs decision", true],
+  [undefined, "codex_idle_stall_unknown", "Codex idle stall timing unknown", false],
+  ["invalid", "codex_idle_stall_unknown", "Codex idle stall timing unknown", false],
+] as const)("Codex idle stall normalizes timing %s honestly", (stamp, status, label, attention) => {
+  const input = { ...run({ status: "recovery_wait" }), recovery_wait_cause: "codex_idle_stall", recovery_retry_not_before: stamp };
+  expect(effectiveRunStatus(input)).toBe(status);
+  expect(parkLabel(input)).toBe(label);
+  expect(needsHumanAttention(status)).toBe(attention);
+  expect(runStatusTone(status, null)).toBe("warning");
+  const badge = runBadge(input, NOW);
+  expect(badge).toMatchObject({ label, tone: "warning", pulse: false });
+  expect(badge.kind === "badge" && badge.title).not.toMatch(/requeues|episode|Used:|Remaining:/);
+  expect(effectiveRunStatus({ ...input, status: "running" })).toBe("running");
 });

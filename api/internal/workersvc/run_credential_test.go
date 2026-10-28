@@ -62,7 +62,7 @@ func newClaimFixture(t *testing.T) claimFixture {
 		},
 		byIDLabels: map[uuid.UUID]string{consoleID: "console-key"},
 	}
-	return claimFixture{fs: fs, svc: New(fs, box, testParams()), owner: owner, consoleID: consoleID, runID: runID}
+	return claimFixture{fs: fs, svc: newOffModeService(fs, box, testParams()), owner: owner, consoleID: consoleID, runID: runID}
 }
 
 // onlyRecord returns the single credential write the fixture made, failing if the
@@ -306,7 +306,7 @@ func TestJudgeClaimRecordsItsBinding(t *testing.T) {
 		},
 		byIDLabels: map[uuid.UUID]string{judgeID: "review-key"},
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 
 	if _, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: owner}, nil); err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -348,7 +348,7 @@ func TestChatClaimRecordsTheDefault(t *testing.T) {
 		anthropic:          sealedDefault,
 		defaultSecretLabel: "default",
 	}
-	svc := New(fs, box, testParams())
+	svc := newOffModeService(fs, box, testParams())
 
 	payload, err := svc.ClaimChat(context.Background(), store.Worker{ID: uuid.New(), UserID: owner})
 	if err != nil {

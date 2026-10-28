@@ -68,7 +68,7 @@ import {
   type OutgoingMessage,
   type RegisterRequest,
   type RegisterResponse,
-  type StateAck as ProtocolStateAck,
+  type StateAck,
   type CompletedPublicationReceipt,
   type CompletedPublicationReason,
   type PlanCrossCheckReconciliation,
@@ -126,9 +126,6 @@ export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model
   | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
   | "approved_not_stored" | "revisions_exhausted";
 import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions } from "./code-cross-check-contract.js";
-
-// Same-row classification decoded by readRunAck; status alone cannot confirm a typed park.
-type StateAck = ProtocolStateAck & { recoveryCause?: string };
 
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -1894,6 +1891,8 @@ export class WorkerClient {
         : JSON.parse(await readBoundedText(res, CLAIM_RESPONSE_MAX_BYTES, true, deadline))) as ClaimResponse;
       if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_episode) ||
           (claim.worker_recovery_episode as number) < 0)) delete claim.worker_recovery_episode;
+      if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_owner_episode) ||
+          (claim.worker_recovery_owner_episode as number) < 0)) delete claim.worker_recovery_owner_episode;
       if (isRecord(claim) && claim.semantic_planning !== undefined) claim.semantic_planning = parseSemanticEnrollment(claim.semantic_planning);
       // PRD #1230 M4: a present-but-malformed maintainer-pending projection fails the claim closed.
       if (isRecord(claim) && isRecord(claim.config) && Object.hasOwn(claim.config, "completion_pending")) {
@@ -1987,6 +1986,8 @@ export class WorkerClient {
     const claim = JSON.parse(await readBoundedText(res, CLAIM_RESPONSE_MAX_BYTES, true)) as ChatClaimResponse;
     if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_episode) ||
         (claim.worker_recovery_episode as number) < 0)) delete claim.worker_recovery_episode;
+    if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_owner_episode) ||
+        (claim.worker_recovery_owner_episode as number) < 0)) delete claim.worker_recovery_owner_episode;
     validateClaimMemory(claim);
     return claim;
   }
@@ -2295,8 +2296,20 @@ export class WorkerClient {
         throw err;
       }
     }
-    if (body.recovery_cause === "retained_recovery_exhausted") {
-      if (!this.hasFeature("recovery_cause_retained_recovery_exhausted") ||
+    if (body.recovery_cause === "codex_idle_stall") {
+      // Freeze the negotiated obligation before generic generation/progress fallbacks.
+      const outbound: PlanCrossCheckStateRequest = Object.freeze(structuredClone(body));
+      const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+      try {
+        return await this.reportStateOnce(runId, path, outbound, signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
+      } catch (error) {
+        if (evidence.refusedAfterAmbiguity) throw new Error("Codex idle park outcome uncertain", { cause: error });
+        throw error;
+      }
+    }
+    if (body.recovery_cause === "retained_recovery_exhausted" ||
+        body.recovery_cause === "retained_recovery_adoption_failed") {
+      if (!this.hasFeature(`recovery_cause_${body.recovery_cause}`) ||
           body.status !== "recovery_wait" || !Number.isSafeInteger(body.claim_generation) ||
           (body.claim_generation ?? 0) < 1) throw new Error("retained recovery park requires support and a positive generation");
       // This contract cannot degrade to an unfenced or untyped recovery park on rollback.
@@ -2530,6 +2543,13 @@ export class WorkerClient {
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
       // Revalidate on every actual attempt: registration may shrink while retry sleep yields.
+      if (body.recovery_cause === "codex_idle_stall" &&
+          (!this.hasFeature("recovery_cause_codex_idle_stall_v1") ||
+           !this.includeClaimGeneration(body.claim_generation) ||
+           !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+           body.status !== "recovery_wait" || !Number.isInteger(body.provider_progress_turns) ||
+           (body.provider_progress_turns ?? -1) < 0 || (body.provider_progress_turns ?? 0) > 2147483647))
+        throw new Error("Codex idle park requires support, a positive generation and provider progress");
       if (body.source_publication !== undefined) {
         const proof = body.source_publication;
         if (!this.hasFeature("refresh_publication_context_v1") ||

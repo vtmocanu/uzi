@@ -271,7 +271,8 @@ func TestHTTPClientWhoami(t *testing.T) {
 
 // TestHTTPClientWhoamiVault pins the PRD #1251 M2 decode: WhoamiVault reads the SAME GET
 // /api/auth/me response and derives `locked` from the sibling top-level `vault.unlocked`.
-//   - vault.unlocked=false ⇒ locked true (the lock is shown);
+//   - vault.mode=unprotected ⇒ locked false regardless of vault.unlocked;
+//   - otherwise vault.unlocked=false ⇒ locked true (the lock is shown);
 //   - vault.unlocked=true  ⇒ locked false (no hint);
 //   - `vault` absent (a pre-vault server) ⇒ locked false, NOT a spurious lock — the *bool
 //     decodes nil, which the absent-⇒-unlocked convention treats as unlocked.
@@ -286,6 +287,13 @@ func TestHTTPClientWhoamiVault(t *testing.T) {
 		{"unlocked=false is locked", `{"user":{"id":"u1","email":"a@b.c"},"vault":{"unlocked":false}}`, true},
 		{"unlocked=true is unlocked", `{"user":{"id":"u1","email":"a@b.c"},"vault":{"unlocked":true}}`, false},
 		{"absent vault is unlocked", `{"user":{"id":"u1","email":"a@b.c"}}`, false},
+		{"off overrides unlocked=false", `{"user":{"id":"u1","email":"a@b.c"},"vault":{"mode":"unprotected","unlocked":false}}`, false},
+		{"off with unlocked=true", `{"user":{"id":"u1","email":"a@b.c"},"vault":{"mode":"unprotected","unlocked":true}}`, false},
+		{"protected locked", `{"user":{"id":"u1","email":"a@b.c"},"vault":{"mode":"protected","unlocked":false}}`, true},
+		{"protected unlocked", `{"user":{"id":"u1","email":"a@b.c"},"vault":{"mode":"protected","unlocked":true}}`, false},
+		{"absent unlocked", `{"user":{"id":"u1","email":"a@b.c"},"vault":{"mode":"protected"}}`, false},
+		{"null unlocked", `{"user":{"id":"u1","email":"a@b.c"},"vault":{"unlocked":null}}`, false},
+		{"unknown mode preserves lock", `{"user":{"id":"u1","email":"a@b.c"},"vault":{"mode":"future","unlocked":false}}`, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

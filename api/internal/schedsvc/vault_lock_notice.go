@@ -56,8 +56,8 @@ func NewVaultLockReconciler(store Store, vault VaultGate, notifier Notifier, set
 // Reconcile notifies every eligible locked user once. It is best-effort: every error
 // is logged, never returned, and one user's failure never aborts the rest.
 //
-// Per user: a local vlt.Unlocked skip (fail-safe — can only SUPPRESS a send, covering
-// the boot-unlocked seed admin and anyone unlocked on this pod), then the atomic
+// Per user: skip owners who do not require an unlock (Off or protected with a current
+// DEK cached on this pod), then the atomic
 // ClaimVaultLockNotice claim (pgx.ErrNoRows ⇒ another replica/tick already claimed it,
 // skip silently) — only the returned id proceeds. The mark is set BEFORE Notify, so the
 // send is at-most-once (Decision D2) and atomic across replicas (Decision D1).
@@ -72,10 +72,9 @@ func (r *VaultLockReconciler) Reconcile(ctx context.Context) {
 	base, _ := r.settings.PublicBaseURL(ctx)
 
 	for _, row := range rows {
-		// Local fail-safe skip: the user is unlocked in THIS process. Covers the
-		// boot-unlocked seed admin and anyone unlocked on this pod. A nil gate is
-		// treated as locked (do not skip); the nil is guarded so it cannot panic.
-		if r.vault != nil && r.vault.Unlocked(row.ID) {
+		// Skip before claiming so Off and locally unlocked owners retain their mark.
+		// A nil notice gate is treated as locked (do not skip).
+		if r.vault != nil && !r.vault.RequiresUnlock(ctx, row.ID) {
 			continue
 		}
 		// Atomic claim: only the returned id proceeds. A no-row result means another

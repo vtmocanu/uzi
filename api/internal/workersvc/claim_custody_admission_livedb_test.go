@@ -145,6 +145,9 @@ func TestFreshClaimCustodyAdmissionLiveDB(t *testing.T) {
 		{name: "paused run", counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) {
 			f.env.exec("UPDATE runs SET status='paused' WHERE id=$1", f.runs[i])
 		}},
+		{name: "held codex idle stall", counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) {
+			f.env.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='codex_idle_stall', recovery_retry_not_before=NULL WHERE id=$1", f.runs[i])
+		}},
 		{name: "recovery wait", counted: 8, mutate: func(f *liveCustodyClaimFixture, i int) {
 			f.env.exec("UPDATE runs SET status='recovery_wait' WHERE id=$1", f.runs[i])
 		}},

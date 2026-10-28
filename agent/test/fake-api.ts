@@ -209,6 +209,7 @@ export class FakeApi {
     if (this.admittedAttempts.has(runId)) this.admittedAttempts.set(runId, count);
     this.publicationState.set(runId, { deferred, attempts: count });
   }
+  checkpointPublishHttpStatus = 404;
   stateAckWire?: (body: StateRequest, run: Record<string, unknown>) => { status: number; body: unknown } | undefined;
   completionAttemptHttpStatus = 200;
   completionAttemptDropReplies = 0;
@@ -232,6 +233,7 @@ export class FakeApi {
     {
       matchesState: (body: StateRequest) => boolean;
       httpStatus: number;
+      error?: string;
       runStatus?: string;
       // PRD #1247 M5b: when set, a 409 refusal carries this TOP-LEVEL disposition (e.g.
       // "stale_claim"), the shape the server produces when a held-state switch released this
@@ -598,6 +600,7 @@ export class FakeApi {
     matchesState: (body: StateRequest) => boolean,
     opts: {
       httpStatus?: number;
+      error?: string;
       runStatus?: string;
       disposition?: string;
       holdReason?: string;
@@ -607,6 +610,7 @@ export class FakeApi {
     this.stateFailWhen.set(runId, {
       matchesState,
       httpStatus: opts.httpStatus ?? 409,
+      error: opts.error,
       runStatus: opts.runStatus,
       disposition: opts.disposition,
       holdReason: opts.holdReason,
@@ -1165,7 +1169,10 @@ export class FakeApi {
     // The checkpoint broker streams a Git pack, not JSON. This fake has no publisher:
     // preserve the ordinary missing-route answer instead of throwing on the PACK header.
     if (req.method === "POST" && /^\/api\/worker\/runs\/[^/]+\/publish$/.test(p))
-      return send(res, 404, { error: "not found", path: p });
+      return send(res, this.checkpointPublishHttpStatus, {
+        error: this.checkpointPublishHttpStatus === 404 ? "not found" : "checkpoint unavailable",
+        path: p,
+      });
     const json: Record<string, unknown> = body ? JSON.parse(body) : {};
 
     if (req.method === "POST" && p === "/api/worker/register") {
@@ -1923,7 +1930,7 @@ export class FakeApi {
           ...(when.disposition ? { disposition: when.disposition } : {}),
         });
       }
-      return send(res, when.httpStatus, { error: "injected state failure" });
+      return send(res, when.httpStatus, { error: when.error ?? "injected state failure" });
     }
     const terminal = body.status === "completed" || body.status === "failed";
     // Both answers carry `{"run": {...}}` because BOTH real handlers do

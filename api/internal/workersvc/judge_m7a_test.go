@@ -30,7 +30,7 @@ func TestJudgeClaimCarriesFailureClass(t *testing.T) {
 			anthropic:    sealedTok,
 			runByIDPlain: store.Run{ID: target, FailOrigin: pgconv.TextOrNull("provisioning_failed")},
 		}
-		svc := New(fs, box, testParams())
+		svc := newOffModeService(fs, box, testParams())
 		svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
 		payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)
@@ -52,7 +52,7 @@ func TestJudgeClaimCarriesFailureClass(t *testing.T) {
 			// runByIDPlain default zero value ⇒ FailOrigin invalid (SQL NULL).
 			runByIDPlain: store.Run{ID: target},
 		}
-		svc := New(fs, box, testParams())
+		svc := newOffModeService(fs, box, testParams())
 		svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
 
 		payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid}, nil)

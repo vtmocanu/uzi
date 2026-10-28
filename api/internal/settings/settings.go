@@ -452,6 +452,11 @@ func Effective(rows []store.AppSetting) map[string]string {
 // ValidateMerged — this is the single-value gate the settings PUT runs per key.
 func Validate(key, value string) error {
 	switch key {
+	case KeyVaultPolicy:
+		if value != "optional" && value != "required" {
+			return errors.New("vault_policy must be optional or required")
+		}
+		return nil
 	case KeyDefaultTheme:
 		return theme.Validate(value)
 	case KeyDefaultAppearanceMode:

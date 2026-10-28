@@ -16,7 +16,11 @@ import (
 )
 
 func retainedReport(gen int64) StateRequest {
-	return StateRequest{State: "recovery_wait", RecoveryCause: strPtr(recoveryCauseRetainedRecoveryExhausted), ClaimGeneration: &gen}
+	return retainedReportCause(gen, recoveryCauseRetainedRecoveryExhausted)
+}
+
+func retainedReportCause(gen int64, cause string) StateRequest {
+	return StateRequest{State: "recovery_wait", RecoveryCause: strPtr(cause), ClaimGeneration: &gen}
 }
 
 func TestRetainedParkCountsAndResumeLiveDB(t *testing.T) {
@@ -130,6 +134,14 @@ func TestRetainedParkCountsAndResumeLiveDB(t *testing.T) {
 }
 
 func TestRetainedParkRefusalsWriteNothingLiveDB(t *testing.T) {
+	for _, cause := range []string{"retained_recovery_exhausted", "retained_recovery_adoption_failed"} {
+		t.Run(cause, func(t *testing.T) {
+			testRetainedParkRefusalsWriteNothingLiveDB(t, cause)
+		})
+	}
+}
+
+func testRetainedParkRefusalsWriteNothingLiveDB(t *testing.T, cause string) {
 	for _, scenario := range []string{"stale", "released", "stop", "cancelled", "newer outcome", "chat", "job", "judge", "cross_check"} {
 		t.Run(scenario, func(t *testing.T) {
 			e := setupInterlockLiveDB(t)
@@ -154,16 +166,16 @@ func TestRetainedParkRefusalsWriteNothingLiveDB(t *testing.T) {
 				// reaches the park writer instead of failing fixture setup.
 				target := e.fpSeedRunning(t, w, 1)
 				e.exec(t, `UPDATE runs SET kind=$2, issue_iid=NULL, branch=NULL,
-					repo_id=CASE WHEN $2='cross_check' THEN repo_id ELSE NULL END,
-					target_run_id=CASE WHEN $2 IN ('judge','cross_check') THEN $3::uuid ELSE NULL END,
-					job_type=CASE WHEN $2='job' THEN 'research' ELSE NULL END,
-					report_only=($2='cross_check'), budget_wall_seconds=3600 WHERE id=$1`, id, scenario, target)
+			repo_id=CASE WHEN $2='cross_check' THEN repo_id ELSE NULL END,
+			target_run_id=CASE WHEN $2 IN ('judge','cross_check') THEN $3::uuid ELSE NULL END,
+			job_type=CASE WHEN $2='job' THEN 'research' ELSE NULL END,
+			report_only=($2='cross_check'), budget_wall_seconds=3600 WHERE id=$1`, id, scenario, target)
 			}
 			before, err := e.q.GetRunByID(e.ctx, id)
 			if err != nil {
 				t.Fatal(err)
 			}
-			req := retainedReport(gen)
+			req := retainedReportCause(gen, cause)
 			req.MrIID = i64Ptr(42)
 			_, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, id, req)
 			var wantErr error
@@ -242,6 +254,14 @@ func TestRetainedParkRequiresPositiveGeneration(t *testing.T) {
 }
 
 func TestRetainedParkCheckpointDurabilityLiveDB(t *testing.T) {
+	for _, cause := range []string{"retained_recovery_exhausted", "retained_recovery_adoption_failed"} {
+		t.Run(cause, func(t *testing.T) {
+			testRetainedParkCheckpointDurabilityLiveDB(t, cause)
+		})
+	}
+}
+
+func testRetainedParkCheckpointDurabilityLiveDB(t *testing.T, cause string) {
 	for _, reconciled := range []bool{false, true} {
 		for _, value := range []struct {
 			name     string
@@ -260,12 +280,12 @@ func TestRetainedParkCheckpointDurabilityLiveDB(t *testing.T) {
 						t.Fatal(err)
 					}
 					e.exec(t, `INSERT INTO run_milestone_reconciliations(id,run_id,owner_id,gate_revision,presentation_id,
-						gate_digest,reset_state_digest,worker_id,claim_generation,reason,consent,before_state,after_state,
-						applied_input_id,stop_cutoff)
-						VALUES($1,$2,$3,1,$4,$5,'fixture',$6,1,'fixture','{}','{}','{}',$7,0)`,
+				gate_digest,reset_state_digest,worker_id,claim_generation,reason,consent,before_state,after_state,
+				applied_input_id,stop_cutoff)
+				VALUES($1,$2,$3,1,$4,$5,'fixture',$6,1,'fixture','{}','{}','{}',$7,0)`,
 						uuid.New(), id, e.userID, uuid.New(), []byte{1}, w, input)
 				}
-				req := retainedReport(1)
+				req := retainedReportCause(1, cause)
 				req.CheckpointContainsLatest = value.reported
 				run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, id, req)
 				if err != nil || !applied || !run.ClaimReleasedAt.Valid {

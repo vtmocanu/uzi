@@ -1626,11 +1626,13 @@ type Params struct {
 	// Transient-recovery park (issue #1197), mirrored from config. RunRecoveryParkBase is
 	// the FIRST recovery park's wait (the exponential backoff's base); each subsequent
 	// park doubles it, clamped at RunRecoveryMaxPark. UNLIKE the usage-limit knobs above,
-	// NEITHER can fail a run: there is no per-run park cap, so a 'recovery_wait' run always
-	// becomes promotable again after its capped backoff (until it recovers or the owner
-	// cancels). recovery_wait_count shapes the curve only. The defaults live in config.go.
+	// NEITHER can fail a run: recovery_wait_count shapes the curve only. Untyped
+	// recovery has no per-run cap; typed idle stalls have a separate count bound
+	// and may hold for the owner. The defaults live in config.go.
 	RunRecoveryParkBase time.Duration
 	RunRecoveryMaxPark  time.Duration
+	// RunCodexIdleStallMaxParks bounds automatic idle-stall retries; zero holds immediately.
+	RunCodexIdleStallMaxParks int
 
 	// RunForgeUnreachableMaxParks (PRD #1392 M1, D2), mirrored from config. The FORGE-park
 	// lifetime cap: past it, SetState's forge-park transaction fails the run with
@@ -1911,6 +1913,9 @@ type Service struct {
 	// production: codexRejectionTransition then runs store.QuarantineRejectedCodexRefresh
 	// over txBeginner. Tests set it to a recording fake.
 	codexRejector codexRefreshRejector
+	// codexWriteContext is a test-only timeout seam for barrier-driven persistence
+	// races. Nil in production; all attempts use detached, bounded contexts.
+	codexWriteContext func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 	// Two narrow settings views over the same *settings.Cache: `settings` =
 	// judge/self-improve reads, `healthSettings` = run-health reads (interface
 	// segregation — each feature's tests fake only what they use).
@@ -3275,11 +3280,11 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// Vault gate (PRD #32 M3): while the run owner's vault is locked (after a pod
 	// restart, or a manual lock), do not claim any of their runs — report idle so
 	// they stay queued as "waiting for vault unlock" instead of failing. This is a
-	// pure in-memory check on the worker's own user, NOT a SQL filter: ClaimRun is
-	// already scoped to wkr.UserID, and the DEK cache is per-process. A queued run
+	// mode-aware check on the worker's own user before the claim transaction:
+	// protection off needs no cached DEK. ClaimRun is scoped to wkr.UserID. A queued run
 	// sits indefinitely by design (no sweep touches status='queued'); the next
 	// unlock lets it claim within one poll cycle.
-	if s.vlt != nil && !s.vlt.Unlocked(wkr.UserID) {
+	if s.vlt != nil && s.vlt.RequiresUnlock(ctx, wkr.UserID) {
 		return nil, nil // idle: owner locked
 	}
 
@@ -5346,7 +5351,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			}
 			break
 		}
-		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseRetainedRecoveryExhausted {
+		if req.RecoveryCause != nil && (*req.RecoveryCause == recoveryCauseRetainedRecoveryExhausted || *req.RecoveryCause == recoveryCauseRetainedRecoveryAdoptionFailed) {
 			var retained store.Run
 			retained, rows, err = s.parkRetainedRecovery(ctx, wkr, owned, req, sessionID)
 			if err != nil {
@@ -5376,8 +5381,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// backoff and the sweeper auto-promotes it. This is the reusable transient-recovery
 		// park primitive (any transient cause reports it and reuses the park->promote
 		// lifecycle); it is NOT a usage limit — see setRecoveryWait / recoverywait.go. Issue
-		// #1766 M2: a vault_locked report parks here too and is the one cause this park stores;
-		// the timer promoter re-queues it and Claim holds it idle while the vault stays locked.
+		// #1766 M2: vault_locked is stored here too; Claim keeps it idle while the
+		// vault stays locked. Codex idle stalls also use this writer, preserving their
+		// typed cause and count with a finite retry or an owner-held NULL deadline.
 		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseCodexAccountUnavailable {
 			var crun store.Run
 			crun, rows, err = s.parkRunningCodexAccountUnavailable(ctx, wkr, owned, req, sessionID)
@@ -5585,7 +5591,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// The bounded provider park left the run 'paused', not 'recovery_wait': store the
 			// durability report against the status the run actually holds.
 			s.setCheckpointDurability(ctx, wkr, owned, "paused", req.CheckpointContainsLatest)
-		} else if req.State != "recovery_wait" || req.RecoveryCause == nil || *req.RecoveryCause != recoveryCauseRetainedRecoveryExhausted {
+		} else if req.State != "recovery_wait" || req.RecoveryCause == nil || (*req.RecoveryCause != recoveryCauseRetainedRecoveryExhausted && *req.RecoveryCause != recoveryCauseRetainedRecoveryAdoptionFailed) {
 			// Retained recovery records this value atomically before releasing
 			// execution; a post-park mutation is stale on reconciled runs.
 			s.recordCheckpointDurability(ctx, wkr, owned, req)

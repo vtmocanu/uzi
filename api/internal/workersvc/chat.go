@@ -90,11 +90,13 @@ const (
 // logged.
 type ChatClaimPayload struct {
 	// WorkerRecoveryEpisode has the same projected meaning as ClaimPayload.WorkerRecoveryEpisode.
-	WorkerRecoveryEpisode   int64         `json:"worker_recovery_episode"`
-	MemoryEpisode           int64         `json:"memory_episode"`
-	MemoryInterventionCount int32         `json:"memory_intervention_count"`
-	MemoryPolicy            *MemoryPolicy `json:"memory_policy"`
-	RunID                   string        `json:"run_id"`
+	WorkerRecoveryEpisode int64 `json:"worker_recovery_episode"`
+	// WorkerRecoveryOwnerEpisode is the stored owner-authorized episode, including zero.
+	WorkerRecoveryOwnerEpisode int64         `json:"worker_recovery_owner_episode"`
+	MemoryEpisode              int64         `json:"memory_episode"`
+	MemoryInterventionCount    int32         `json:"memory_intervention_count"`
+	MemoryPolicy               *MemoryPolicy `json:"memory_policy"`
+	RunID                      string        `json:"run_id"`
 	// Kind is always "chat" — the worker's chat lane asserts it, and it keeps the
 	// two lanes' payloads self-describing.
 	Kind string `json:"kind"`
@@ -158,7 +160,7 @@ type ChatClaimConfig struct {
 // Claim's vault gate and assembly-error recovery, so a locked owner's chats wait
 // and a chat with no Anthropic token fails cleanly instead of wedging the loop.
 func (s *Service) ClaimChat(ctx context.Context, wkr store.Worker) (*ChatClaimPayload, error) {
-	if s.vlt != nil && !s.vlt.Unlocked(wkr.UserID) {
+	if s.vlt != nil && s.vlt.RequiresUnlock(ctx, wkr.UserID) {
 		return nil, nil // idle: owner locked
 	}
 	// PRD #1906 M5 (Decision D-D): a chat run is never profile-bound (runs_egress_profile_not_chat),
@@ -401,19 +403,20 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 		return nil, err
 	}
 	return &ChatClaimPayload{
-		RunID:                   run.ID.String(),
-		Kind:                    run.Kind,
-		Title:                   run.Title.String,
-		Status:                  run.Status,
-		SessionID:               textPtr(sessionID),
-		ResumeOfRunID:           uuidPtr(run.ResumeOfRunID),
-		LastSeq:                 run.LastSeq,
-		RequeueCount:            run.RequeueCount,
-		ClaimGeneration:         run.ClaimGeneration,
-		WorkerRecoveryEpisode:   claimRecoveryEpisode(run),
-		MemoryEpisode:           run.MemoryEpisode,
-		MemoryInterventionCount: run.MemoryInterventionCount,
-		MemoryPolicy:            frozenMemoryPolicy,
+		RunID:                      run.ID.String(),
+		Kind:                       run.Kind,
+		Title:                      run.Title.String,
+		Status:                     run.Status,
+		SessionID:                  textPtr(sessionID),
+		ResumeOfRunID:              uuidPtr(run.ResumeOfRunID),
+		LastSeq:                    run.LastSeq,
+		RequeueCount:               run.RequeueCount,
+		ClaimGeneration:            run.ClaimGeneration,
+		WorkerRecoveryEpisode:      claimRecoveryEpisode(run),
+		WorkerRecoveryOwnerEpisode: run.WorkerRecoveryEpisode,
+		MemoryEpisode:              run.MemoryEpisode,
+		MemoryInterventionCount:    run.MemoryInterventionCount,
+		MemoryPolicy:               frozenMemoryPolicy,
 		Secrets: ChatClaimSecrets{
 			AnthropicOAuthToken: string(anthropic),
 		},

@@ -52,12 +52,22 @@ func cliVaultStatus(t *testing.T, router http.Handler, token string, want bool) 
 func cliVaultLiveDB(t *testing.T, authLimiters ...*mw.Limiter) (*Handler, http.Handler, *pgxpool.Pool) {
 	t.Helper()
 	h, router, pool := cliLiveDB(t, authLimiters...)
-	h.vault = vault.New(h.box, h.q)
+	h.vault = vault.NewPostgres(h.box, pool)
 	return h, router, pool
+}
+
+// The shared CLI helper defaults to unprotected users; these route tests
+// explicitly exercise protected vaults without changing other CLI suites.
+func cliVaultUser(t *testing.T, pool *pgxpool.Pool, admin bool) uuid.UUID {
+	t.Helper()
+	id := cliSeedUser(t, pool, admin)
+	cliMustExec(t, pool, "UPDATE users SET vault_mode='protected' WHERE id=$1", id)
+	return id
 }
 
 func cliVaultSeed(t *testing.T, h *Handler, id uuid.UUID) {
 	t.Helper()
+	setVaultFixturePassword(t, h.pool, id, cliVaultPassword)
 	if err := h.vault.Unlock(context.Background(), id, cliVaultPassword); err != nil {
 		t.Fatalf("create vault: %v", err)
 	}
@@ -66,7 +76,7 @@ func cliVaultSeed(t *testing.T, h *Handler, id uuid.UUID) {
 
 func TestCLIVaultUnlockStatusLiveDB(t *testing.T) {
 	h, router, pool := cliVaultLiveDB(t)
-	owner := cliSeedUser(t, pool, false)
+	owner := cliVaultUser(t, pool, false)
 	token := cliMintToken(t, pool, owner, clitoken.ScopeUser)
 	cliVaultSeed(t, h, owner)
 	cliVaultStatus(t, router, token, false)
@@ -81,7 +91,7 @@ func TestCLIVaultUnlockStatusLiveDB(t *testing.T) {
 
 func TestCLIVaultOIDCPassphraseLiveDB(t *testing.T) {
 	h, router, pool := cliVaultLiveDB(t)
-	owner := cliSeedUser(t, pool, false)
+	owner := cliVaultUser(t, pool, false)
 	cliMustExec(t, pool, "UPDATE users SET password_hash = NULL WHERE id = $1", owner)
 	jwt := cliMintJWT(t, pool, owner)
 	token := cliMintToken(t, pool, owner, clitoken.ScopeUser)
@@ -100,7 +110,7 @@ func TestCLIVaultOIDCPassphraseLiveDB(t *testing.T) {
 
 func TestCLIVaultWrongPasswordNoVaultLiveDB(t *testing.T) {
 	h, router, pool := cliVaultLiveDB(t)
-	owner, absent := cliSeedUser(t, pool, false), cliSeedUser(t, pool, false)
+	owner, absent := cliVaultUser(t, pool, false), cliVaultUser(t, pool, false)
 	cliVaultSeed(t, h, owner)
 	ownerToken := cliMintToken(t, pool, owner, clitoken.ScopeUser)
 	absentToken := cliMintToken(t, pool, absent, clitoken.ScopeUser)
@@ -123,7 +133,7 @@ func TestCLIVaultWrongPasswordNoVaultLiveDB(t *testing.T) {
 
 func TestCLIVaultOwnerIsolationLiveDB(t *testing.T) {
 	h, router, pool := cliVaultLiveDB(t)
-	owner, admin := cliSeedUser(t, pool, false), cliSeedUser(t, pool, true)
+	owner, admin := cliVaultUser(t, pool, false), cliVaultUser(t, pool, true)
 	cliVaultSeed(t, h, owner)
 	ownerToken := cliMintToken(t, pool, owner, clitoken.ScopeUser)
 	// A valid admin_ro credential retains IsAdmin. Vault handlers must still
@@ -151,7 +161,7 @@ func TestCLIVaultOwnerIsolationLiveDB(t *testing.T) {
 
 func TestCLIVaultSharedUserLimitLiveDB(t *testing.T) {
 	h, router, pool := cliVaultLiveDB(t, mw.NewLimiter(2, time.Hour, nil))
-	owner, other := cliSeedUser(t, pool, false), cliSeedUser(t, pool, false)
+	owner, other := cliVaultUser(t, pool, false), cliVaultUser(t, pool, false)
 	cliVaultSeed(t, h, owner)
 	cliVaultSeed(t, h, other)
 	first := cliMintToken(t, pool, owner, clitoken.ScopeUser)
@@ -179,7 +189,7 @@ func TestCLIVaultAuthenticationCSRFLiveDB(t *testing.T) {
 	// A one-request budget also proves rejected authentication/CSRF attempts
 	// never consume the authenticated owner's unlock allowance.
 	h, router, pool := cliVaultLiveDB(t, mw.NewLimiter(1, time.Hour, nil))
-	owner := cliSeedUser(t, pool, false)
+	owner := cliVaultUser(t, pool, false)
 	cliVaultSeed(t, h, owner)
 	jwt := cliMintJWT(t, pool, owner)
 	token := cliMintToken(t, pool, owner, clitoken.ScopeUser)
@@ -219,7 +229,7 @@ func TestCLIVaultAuthenticationCSRFLiveDB(t *testing.T) {
 
 func TestCLIVaultCookieOnlyWritesLiveDB(t *testing.T) {
 	h, router, pool := cliVaultLiveDB(t)
-	owner := cliSeedUser(t, pool, true)
+	owner := cliVaultUser(t, pool, true)
 	cliMustExec(t, pool, "UPDATE users SET password_hash = NULL WHERE id = $1", owner)
 	jwt := cliMintJWT(t, pool, owner)
 	uzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)

@@ -73,6 +73,7 @@ type CodexAdminRateLimitRowDTO struct {
 	ID          string                     `json:"id"`
 	Email       string                     `json:"email"`
 	Name        string                     `json:"name"`
+	VaultMode   string                     `json:"vault_mode"`
 	VaultLocked bool                       `json:"vault_locked"`
 	Accounts    []CodexAccountRateLimitDTO `json:"accounts"`
 }

@@ -40,6 +40,7 @@ func newCustodyContinuationFixture(t *testing.T, env codexTestEnv) *custodyConti
 	          VALUES ($1, $2, 'anthropic_token', $3, true, $4, 'master')`,
 		uuid.New(), userID, "anthropic-"+uuid.NewString(), anthropicSealed)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
 	// ListOwnersOverCustodyLimit is instance-wide, so an owner this fixture leaves at/over the
 	// cap would leak into other packages' LiveDB tests sharing the database. Drop this owner's

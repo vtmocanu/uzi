@@ -29,7 +29,7 @@ func (s *settingsStore) ListAppSettings(context.Context) ([]store.AppSetting, er
 }
 
 func newSettingsHandler(rows ...store.AppSetting) *Handler {
-	return &Handler{settings: settings.New(&settingsStore{rows: rows}, time.Minute)}
+	return &Handler{q: store.New(fakeCountDB{}), settings: settings.New(&settingsStore{rows: rows}, time.Minute)}
 }
 
 func adminUser() store.User {

@@ -160,7 +160,7 @@ func TestCodexAdmissionSharedAliasesAndOtherAccountLiveDB(t *testing.T) {
 	reimport := e.seedStagingAlias(t, owner, uuid.NewString(), codexLoginBlob{AccessToken: access, RefreshToken: codexToken("rr")})
 	fake := newFakeCodexIdentity()
 	fake.idByToken[access] = identity
-	reconciler := NewCodexReconciler(e.q, nil, e.box, fake, e.pool)
+	reconciler := NewCodexReconciler(e.q, e.vlt, e.box, fake, e.pool)
 	if err := reconciler.ReconcileCodexAuthIdentity(e.ctx, owner, reimport); err != nil {
 		t.Fatal(err)
 	}

@@ -2,6 +2,7 @@ package uzicli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -441,6 +442,23 @@ type CreateRunCredentialOverride struct {
 type CreatedRunResult struct {
 	apitypes.RunDTO
 	Notice string
+}
+
+// UnmarshalJSON decodes the embedded run and outer notice separately so
+// RunDTO.UnmarshalJSON does not swallow Notice.
+func (r *CreatedRunResult) UnmarshalJSON(data []byte) error {
+	var run apitypes.RunDTO
+	if err := json.Unmarshal(data, &run); err != nil {
+		return err
+	}
+	notice := struct {
+		Notice string
+	}{Notice: r.Notice}
+	if err := json.Unmarshal(data, &notice); err != nil {
+		return err
+	}
+	*r = CreatedRunResult{RunDTO: run, Notice: notice.Notice}
+	return nil
 }
 
 func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error) {

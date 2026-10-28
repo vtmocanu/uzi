@@ -540,3 +540,13 @@ describe("AdminRateLimits — flush Card first-cell selector", () => {
     }
   });
 });
+
+
+it("uses each owner's mode when rendering outdated lock states", async () => {
+  mockApi.getAdminRateLimits.mockResolvedValue({ users: [{ ...row("Off owner", ok(20, 10, { stale: true }), true), vault_mode: "unprotected" }] });
+  render(<MemoryRouter><AdminRateLimits /></MemoryRouter>);
+  await screen.findByText("Off owner");
+  const cells = within(screen.getByText("Off owner").closest("tr")!).getAllByRole("cell");
+  expect(cells[cells.length - 1].textContent).toContain("stale");
+  expect(screen.queryByText("🔒 vault locked")).toBeNull();
+});

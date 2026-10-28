@@ -264,3 +264,9 @@ describe("Codex bucket naming (PRD #1653 D-W3)", () => {
     expect(hasCodexMicroReading({ buckets: [bucket("codex", null), bucket("code", win(0, 10800, null))] })).toBe(true);
   });
 });
+
+
+it("off mode cannot advertise a vault unlock for an outdated locked reading", () => {
+  expect(codexStatusBadge({ status: "vault_locked" }, "protected").label).toBe("🔒 Vault locked");
+  expect(codexStatusBadge({ status: "vault_locked" }, "unprotected")).toEqual({ tone: "neutral", label: "Status pending", hint: "Vault protection is off. Waiting for a current credential reading." });
+});

@@ -347,9 +347,9 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// Transient-recovery promotion (issue #1197): recovery_wait → queued once
 	// recovery_retry_not_before has elapsed. Placed beside the limit-wait promote for the
 	// same "transitions first, enforcement second" reason, and it is a distinct clock-based
-	// hold — never folded into PromoteLimitWaitRuns. Unlike the limit park there is no
-	// lifetime cap, so this pass keeps auto-promoting a recovering run at the capped cadence
-	// until it succeeds or the owner cancels.
+	// hold — never folded into PromoteLimitWaitRuns. This pass promotes eligible timed
+	// retries; NULL-retry owner holds (including capped Codex idle stalls, #3509) do not
+	// promote. Legacy empty/untyped recovery retains its uncapped lifetime cadence.
 	recoveryPromoted, err := s.q.PromoteRecoveryWaitRuns(ctx, pgconv.Time(now))
 	if err != nil {
 		return res, fmt.Errorf("promote recovery-wait runs: %w", err)

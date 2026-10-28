@@ -362,3 +362,62 @@ describe("reportState send-gate fallback (PRD #1247 fix round E)", () => {
     }
   });
 });
+
+
+describe("M2 Codex idle park never downgrades", () => {
+  const feature = "recovery_cause_codex_idle_stall_v1";
+  const body = { status: "recovery_wait" as const, claim_generation: 7,
+    recovery_cause: "codex_idle_stall", provider_progress_turns: 0 };
+  for (const count of [0, 2]) for (const reply of ["accepted", "strict", "validation"] as const) {
+    it(`M2 idle progress=${count}, ${reply}`, async () => {
+      const s = await stateServer({ worker_id: "w", protocol_features: ["claim_generation_fence", feature] },
+        () => reply === "accepted"
+          ? { status: 200, body: { run: { status: "recovery_wait", recovery_wait_cause: "codex_idle_stall" } } }
+          : { status: 400, body: { error: reply === "strict" ? "invalid request body" : "invalid provider_progress_turns" } });
+      try {
+        const c = clientFor(s.url);
+        await c.register("test");
+        const outbound = { ...body, provider_progress_turns: count };
+        if (reply === "accepted") {
+          const ack = await c.reportState("run", outbound);
+          assert.equal(ack.status, "recovery_wait");
+          assert.equal(ack.recoveryCause, "codex_idle_stall");
+        } else await assert.rejects(c.reportState("run", outbound));
+        assert.deepEqual(s.posts.map(p => p.body), [outbound]);
+        assert.ok(c.hasFeature(feature));
+      } finally { await s.close(); }
+    });
+  }
+
+  it("M2 rejects absent feature/fence, invalid generation and progress before sending", async () => {
+    const c = clientFor("http://no-send.test");
+    for (const features of [[], [feature], ["claim_generation_fence"], ["claim_generation_fence", feature]]) {
+      c.protocolFeatures = features;
+      const bodies = features.length === 2 ? [
+        ...[undefined, 0, -1, 0.5].map(claim_generation => ({ ...body, claim_generation })),
+        ...[undefined, -1, 0.5, 2147483648].map(provider_progress_turns => ({ ...body, provider_progress_turns })),
+      ] : [body];
+      for (const invalid of bodies) await assert.rejects(c.reportState("run", invalid), /requires support/);
+    }
+  });
+
+  for (const loseFeature of [false, true]) it(`M2 freezes retries and retains ambiguity, feature loss=${loseFeature}`, async () => {
+    const c = clientFor("http://idle.test");
+    c.protocolFeatures = ["claim_generation_fence", feature];
+    const outbound = { ...body };
+    const sends: unknown[] = [];
+    const mocked = mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
+      sends.push(JSON.parse(String(init?.body)));
+      if (sends.length === 1) {
+        outbound.provider_progress_turns = 9;
+        if (loseFeature) c.protocolFeatures = ["claim_generation_fence"];
+        throw new Error("lost ACK");
+      }
+      return Response.json({ error: "invalid request body" }, { status: 400 });
+    });
+    try {
+      await assert.rejects(c.reportState("run", outbound), loseFeature ? /requires support/ : /outcome uncertain/);
+      assert.deepEqual(sends, loseFeature ? [body] : [body, body]);
+    } finally { mocked.mock.restore(); }
+  });
+});

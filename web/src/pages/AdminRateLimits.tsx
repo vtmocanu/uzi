@@ -309,7 +309,7 @@ function CodexAdminSection() {
             <tbody className="divide-y divide-edge">
               {rows.flatMap((u) =>
                 u.accounts.map((a, i) => {
-                  const badge = codexStatusBadge(a);
+                  const badge = codexStatusBadge(a, u.vault_mode);
                   return (
                     <tr key={`${u.id}:${a.account_id}`} className="transition-colors hover:bg-raised/30">
                       {i === 0 ? <CodexUserCell user={u} rowSpan={u.accounts.length} /> : null}
@@ -419,7 +419,7 @@ export function AdminRateLimits() {
                         </tr>,
                       ]
                     : u.tokens.map((t, i) => {
-                        const badge = statusBadge(t.limits, u.vault_locked);
+                        const badge = statusBadge(t.limits, u.vault_locked, u.vault_mode);
                         // The mock's absolute "resets <Day HH:MM>" line under the token
                         // name (PRD #310 M3), from the 7-day reset — the weekly quota
                         // users plan around. The map also runs for non-ok tokens (which

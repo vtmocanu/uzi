@@ -385,16 +385,36 @@ one every unbound consumer resolves (PRD #104). The
 single 32-byte key that `config.Load` validates from `UZI_SECRET_KEY` at boot
 (refusing to start if it is missing, malformed, or a low-entropy placeholder)
 and then builds, already validated, into one `*secretbox.Box` shared by every
-handler (see [docs/configuration.md](docs/configuration.md)). **Since the
-per-user vault (PRD #32), this master box is no longer the normal sealing
-path**: a secret is sealed under the owner's own 256-bit DEK once their vault
-has been unlocked once, and the master box is reserved for a row that has
-never been rewrapped plus one narrow Codex exception — a refresh's *recovery*
-copy is sealed under the master box only while the owner's vault happens to
-be locked at that exact moment, then re-sealed under the DEK on the next
-reconcile pass. See [docs/vault-threat-model.md](docs/vault-threat-model.md)
-for the full model. Either way, rotating `UZI_SECRET_KEY` invalidates every
-row still master-sealed, across every feature at once, not just one.
+handler (see [docs/configuration.md](docs/configuration.md)). Personal
+credentials have explicit **protected** and **unprotected** modes. Protected
+users seal with a per-user 256-bit DEK wrapped by a password-derived KEK;
+login/unlock caches that DEK until explicit lock or API restart. Off users
+have no wrapper or unlock dependency and seal under the master key using
+`master_aad`. The protected Codex refresh recovery-slot exception also uses
+`master_aad` while locked, then re-seals under the DEK during reconciliation.
+AAD binds to the raw user UUID, a zero byte and credential kind; legacy
+`master` (nil AAD) stays readable and unknown markers fail closed.
+
+Mode changes atomically convert personal secrets and both Codex account
+slots behind the per-user lifecycle mutex and transactional mode/monotonic
+epoch fences. Keys publish after commit; the cache mutex does not span I/O.
+Ordinary writers check mode and epoch in their transaction, including provider
+result persistence without a second exchange. Enrollment/disable take shared
+settings admission before the user-secret advisory guard and owner state;
+admin policy edits take exclusive admission. Claim finishers retain their
+run/alias/account NOWAIT exception without waiting for lifecycle/advisory
+locks. Promotions and poller pokes follow commit and lifecycle-mutex release.
+
+The database-only policy chooses new-user mode; it does not convert existing
+users. An empty database starts Optional before seed-admin creation; a database
+with any users starts Required, marking existing users protected without
+rewriting ciphertext. Required leaves existing Off users runnable with an
+enrollment prompt. The supported API boundary is **singleton/Recreate**, with
+no mixed-version API operation. See
+[ADR-3507](adr/3507-optional-credential-vault.md) for lock order, bounded
+conversion, uncertain commits and rollback restrictions, and
+[the vault threat model](docs/vault-threat-model.md) for residual risks.
+Rotating `UZI_SECRET_KEY` invalidates rows still master-sealed across features.
 
 The API around it is deliberately minimal, and **every read is metadata only**:
 `GET /api/me/secrets` returns `id`, `kind`, `label`, `is_default` and
@@ -445,7 +465,7 @@ rule and the failure/backoff semantics; user-facing behavior is in
 A sibling background engine (`api/internal/codexusagepoller`) does the same
 job for a linked Codex **subscription** account, entirely idle (no worker,
 run, or model call): it opens the account's committed login through the same
-vault-then-master path above, reads its rate-limit buckets from the fixed
+mode/epoch-aware opening path above, reads its rate-limit buckets from the fixed
 Codex usage host (redirects refused, response body size-bounded), and
 upserts one JSONB snapshot per **canonical account**
 (`codex_account_rate_limits`, keyed `(user_id, provider_account_id)` against
@@ -469,7 +489,7 @@ when its durable receipt authorizes reuse. Admission consumes the retry under
 user secret mutation/account/intent locks with a fresh database clock and an
 enabled linked alias; local vault/login failures defer without consumption.
 Recovered material stays quarantined until identity-verified promotion. The
-survivor and account-action display share a 52.14-second in-flight policy bound;
+survivor and account-action display share an 832.14-second in-flight policy bound;
 owner restore advances the generation and fences stale installs. Mixed API
 versions are unsupported for receipt-aware resolution/display. See
 [ADR-3523](adr/3523-codex-refresh-provider-error-reuse.md) for the fixed 30-minute
@@ -1538,17 +1558,22 @@ chain in the diagram above, with no intervening `running`.
   one per run backing a healthy current claim without an owner decision;
   total custody remains protected. After discarded/released precedence, an OPEN
   hold at `recovery_wait` for `worker_requeue_exhausted`,
-  `worker_memory_pressure`, or `retained_recovery_exhausted` reports
+  `worker_memory_pressure`, `retained_recovery_exhausted`, or
+  `retained_recovery_adoption_failed` reports
   `needs_action` after failed latest capture,
   otherwise `source_only`, before available unguarded archives or capture
   progress. Retained-recovery exhaustion keeps this conservative protection
   for both timed retries and NULL-stamp owner holds throughout `recovery_wait`.
+  Adoption failure is owner-held with no automatic retry. Its renewal requires
+  a fresh owned claim and unconsumed raw owner grant; the external bare-config
+  `uzi-recoveryowner.<runId>.record` precharges accounting outside the strict
+  recovery journal and inventory schemas. It grants no custody or deletion authority.
   After timer promotion or owner Resume, existing proof-based release rules
   apply again; execution-claim release alone never permits source deletion.
   Archive availability remains independent of attention and does not release
   these causes' custody; other classifier decisions remain unchanged.
   See [ADR-2445](adr/2445-custody-admission-accounting.md),
-  [ADR-2396](adr/2396-worker-memory-guard.md), and the #3495 amendment in
+  [ADR-2396](adr/2396-worker-memory-guard.md), and the #3495 and #3527 amendments in
   [ADR-1197](adr/1197-transient-recovery-park.md).
   The **archive capture** (`recovery_captures`) is the later,
   immutable, encrypted artifact bound to that hold. PRD #1349 hardens the

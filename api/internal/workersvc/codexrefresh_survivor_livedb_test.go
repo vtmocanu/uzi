@@ -75,6 +75,8 @@ func TestSweepSurvivorRecoversWedgedViaServiceSweepLiveDB(t *testing.T) {
 	// Sweep live-DB tests (wall_park_grace_livedb_test.go). Its clock is time.Now (New's
 	// default), so codexNow() agrees with the already-expired lease deadline above.
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
+	svc.SetTxBeginner(env.pool)
 	svc.SetReadyAt(time.Now())
 
 	res, err := svc.Sweep(env.ctx)
@@ -183,7 +185,7 @@ func TestSweepThenRelinkRecoversCodexAccountLiveDB(t *testing.T) {
 	preAlias := env.seedStagingAlias(t, f.userID, "codex-relink-pre-"+uuid.NewString(), codexLoginBlob{AccessToken: relinkAccess, RefreshToken: codexToken("relink-refresh")})
 	preFid := newFakeCodexIdentity()
 	preFid.idByToken[relinkAccess] = codexauth.Identity{ProviderUserID: f.providerUserID, WorkspaceAccountID: f.workspaceAcctID}
-	preReconciler := NewCodexReconciler(env.q, nil, env.box, preFid, env.pool)
+	preReconciler := NewCodexReconciler(env.q, env.vlt, env.box, preFid, env.pool)
 	if err := preReconciler.ReconcileCodexAuthIdentity(env.ctx, f.userID, preAlias); err != nil {
 		t.Fatalf("pre-sweep reconcile: %v", err)
 	}
@@ -226,7 +228,7 @@ func TestSweepThenRelinkRecoversCodexAccountLiveDB(t *testing.T) {
 	postAlias := env.seedStagingAlias(t, f.userID, "codex-relink-post-"+uuid.NewString(), codexLoginBlob{AccessToken: relinkAccess2, RefreshToken: codexToken("relink-refresh-2")})
 	postFid := newFakeCodexIdentity()
 	postFid.idByToken[relinkAccess2] = codexauth.Identity{ProviderUserID: f.providerUserID, WorkspaceAccountID: f.workspaceAcctID}
-	postReconciler := NewCodexReconciler(env.q, nil, env.box, postFid, env.pool)
+	postReconciler := NewCodexReconciler(env.q, env.vlt, env.box, postFid, env.pool)
 	if err := postReconciler.ReconcileCodexAuthIdentity(env.ctx, f.userID, postAlias); err != nil {
 		t.Fatalf("post-sweep reconcile: %v", err)
 	}
@@ -321,6 +323,8 @@ func TestSweepSurvivorRetriesDeferredRecoveryViaServiceSweepLiveDB(t *testing.T)
 	// A FULL Sweep-capable Service (time.Now clock) with the transient-first fake as its
 	// identity seam — like the acceptance control, plus the recovery-verification seam.
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
+	svc.SetTxBeginner(env.pool)
 	svc.SetReadyAt(time.Now())
 	svc.SetCodexRefresh(fake)
 
@@ -697,6 +701,8 @@ func TestSweepSurvivorMismatchClearIsAtomicAndRetriableLiveDB(t *testing.T) {
 	// clear-and-mark exactly ONCE.
 	wrapper := &clearMismatchFailOnceStore{Queries: env.q, failNext: true}
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
+	svc.SetTxBeginner(env.pool)
 	svc.SetReadyAt(time.Now())
 	svc.SetCodexRefresh(fake)
 	svc.q = wrapper
@@ -750,4 +756,26 @@ func TestSweepSurvivorMismatchClearIsAtomicAndRetriableLiveDB(t *testing.T) {
 	if survivorScanContains(t, env, f.accountID) {
 		t.Fatal("tick 2: account still a survivor candidate after the clear, want it dropped from arm (c)")
 	}
+}
+
+// Keep the same failure/barrier state while delegating material writes to the real transaction.
+func (h *intentListBarrierStore) bindCodexRefreshTx(q *store.Queries) codexRefreshStore {
+	return &intentListBarrierStore{Queries: q, onIntentList: h.onIntentList, fired: h.fired}
+}
+
+func (h *clearMismatchFailOnceStore) bindCodexRefreshTx(q *store.Queries) codexRefreshStore {
+	return &clearMismatchBoundStore{Queries: q, parent: h}
+}
+
+type clearMismatchBoundStore struct {
+	*store.Queries
+	parent *clearMismatchFailOnceStore
+}
+
+func (h *clearMismatchBoundStore) ClearMismatchedCodexRecoveryAndMarkIntents(ctx context.Context, arg store.ClearMismatchedCodexRecoveryAndMarkIntentsParams) (store.ClearMismatchedCodexRecoveryAndMarkIntentsRow, error) {
+	if h.parent.failNext {
+		h.parent.failNext = false
+		return store.ClearMismatchedCodexRecoveryAndMarkIntentsRow{}, errors.New("transient clear-and-mark failure")
+	}
+	return h.Queries.ClearMismatchedCodexRecoveryAndMarkIntents(ctx, arg)
 }

@@ -38,6 +38,7 @@ func TestPlanCrossCheckClaimInputLiveDB(t *testing.T) {
 		leadID, candidate.PlanMd, candidate.Milestones, candidate.BaseCommit, candidate.PlanningDiff, digest, f.runID)
 	env.exec(`UPDATE users SET default_codex_model=$2, default_claude_model='claude-opus-4-8',default_codex_effort='high' WHERE id=$1`, f.userID, customCodexModel)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
 	child := mustRun(t, env, f.runID)
 	worker := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{

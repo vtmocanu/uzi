@@ -60,6 +60,7 @@ func newCrossCheckContentionFixture(t *testing.T) crossCheckContentionFixture {
 		f.workerID, []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2,
 			capability.RecoveryArchiveV1, capability.CodexCustomModelV1})
 	f.svc = New(env.q, env.box, testParams())
+	f.svc.SetVault(env.vlt)
 	f.svc.SetTxBeginner(env.pool)
 	return crossCheckContentionFixture{f, env, lead, c}
 }

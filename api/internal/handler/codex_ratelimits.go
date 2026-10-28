@@ -72,7 +72,7 @@ func (h *Handler) SelfCodexRateLimits(w http.ResponseWriter, r *http.Request) {
 	// The caller's live vault-lock state, looked up ONCE (not per account): a locked vault
 	// means the poller cannot read the login, so every one of this user's accounts is
 	// vault_locked.
-	vaultLocked := !h.vaultUnlocked(user.ID)
+	vaultLocked := h.vault.RequiresUnlock(r.Context(), user.ID)
 	accounts := make([]apitypes.CodexAccountRateLimitDTO, 0, len(rows))
 	for _, row := range rows {
 		accounts = append(accounts, h.codexAccountDTO(
@@ -107,14 +107,21 @@ func (h *Handler) AdminCodexRateLimits(w http.ResponseWriter, r *http.Request) {
 	}
 	users := make([]apitypes.CodexAdminRateLimitRowDTO, 0)
 	for _, row := range rows {
-		// A new user starts a new group; vault-lock is resolved once per user, on the
-		// first row, not once per account.
+		// Resolve one coordinated mode/lock snapshot on the first row per user.
 		if len(users) == 0 || users[len(users)-1].ID != row.UserID.String() {
+			mode, locked, err := h.adminRateVaultSnapshot(r.Context(), row.UserID, row.VaultMode)
+			if err != nil {
+				slog.Error("codex rate limits: vault status unavailable", "user", row.UserID)
+				w.Header().Set("Cache-Control", "private, no-store")
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+				return
+			}
 			users = append(users, apitypes.CodexAdminRateLimitRowDTO{
 				ID:          row.UserID.String(),
 				Email:       row.Email,
 				Name:        row.DisplayName.String, // "" when the user has no display name
-				VaultLocked: !h.vaultUnlocked(row.UserID),
+				VaultMode:   mode,
+				VaultLocked: locked,
 				Accounts:    []apitypes.CodexAccountRateLimitDTO{},
 			})
 		}

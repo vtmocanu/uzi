@@ -15,6 +15,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // PRD #1171 M1 (activated by PRD #1429): prove the coordinated refresher through the REAL production
@@ -94,6 +95,8 @@ func freshIdentityAccessToken(t *testing.T, accountID, userID string) string {
 func TestCoordinatedRefreshThroughProductionCodexauthClientLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	f := newSubscriptionFixture(t, env)
+	f.svc.SetVault(vault.NewPostgres(env.box, env.pool))
+	f.svc.SetTxBeginner(env.pool)
 
 	// Resolve the account's frozen tuple so the exchanged JWT can carry matching claims.
 	st := mustState(t, env, f.userID, f.aliasID)

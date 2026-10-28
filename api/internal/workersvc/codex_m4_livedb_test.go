@@ -139,7 +139,7 @@ func seedTwoRunsSameAccount(t *testing.T, env codexTestEnv, refresh CodexRefresh
 	sameID := codexauth.Identity{ProviderUserID: providerUser, WorkspaceAccountID: workspace}
 	fid.idByToken[access1] = sameID
 	fid.idByToken[access2] = sameID
-	r := NewCodexReconciler(env.q, nil, env.box, fid, env.pool)
+	r := NewCodexReconciler(env.q, env.vlt, env.box, fid, env.pool)
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
 		t.Fatalf("reconcile alias1: %v", err)
 	}
@@ -164,7 +164,8 @@ func seedTwoRunsSameAccount(t *testing.T, env codexTestEnv, refresh CodexRefresh
 	// shared account tuple across every rotation.
 	setFakeMatchIdentity(refresh, codexauth.Identity{ProviderUserID: providerUser, WorkspaceAccountID: workspace})
 
-	svc := &Service{q: env.q, box: env.box, codexRefresh: refresh}
+	svc := &Service{q: env.q, box: env.box, vlt: env.vlt, codexRefresh: refresh}
+	svc.SetTxBeginner(env.pool)
 	// Two runs on the SAME account but DISTINCT repos: uq_runs_one_active_per_issue is
 	// (repo_id, issue_iid), and both seeded runs use issue_iid=1, so they must not share a
 	// repo. The shared thing under test is the account, not the repo.
@@ -532,8 +533,8 @@ func TestCoordinatedCodexRefreshCancelledMidExchangeRecoverableLiveDB(t *testing
 
 	// ADR-3523: cancellation is a non-rejection provider error. Its detached receipt
 	// keeps the intent eligible for one retry even though this survivor has no
-	// provider/vault configured. It reaps the lease without discarding eligibility.
-	recSvc := &Service{q: env.q, box: env.box, now: func() time.Time { return time.Now().Add(codexRefreshLeaseTTL + time.Minute) }}
+	// provider configured. It reaps the lease without discarding eligibility.
+	recSvc := &Service{q: env.q, box: env.box, vlt: env.vlt, txBeginner: env.pool, now: func() time.Time { return time.Now().Add(codexRefreshLeaseTTL + time.Minute) }}
 	n, err := recSvc.ReconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID)
 	if err != nil {
 		t.Fatalf("reconcile after cancel: %v", err)
@@ -587,6 +588,7 @@ func TestCodexDarkNoCodexOnNormalClaimPathLiveDB(t *testing.T) {
 	          VALUES ($1, $2, 'anthropic_token', $3, true, $4, 'master')`,
 		uuid.New(), userID, "anthropic-"+uuid.NewString(), anthropicSealed)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	wkr := store.Worker{ID: workerID, UserID: userID}
 
 	// The normal run has NO codex binding frozen and stays harness='claude' (the assembly branch

@@ -56,16 +56,19 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, hint)
 			return
 		}
-		if !run.RecoveryWaitCause.Valid || (run.RecoveryWaitCause.String != "worker_requeue_exhausted" && run.RecoveryWaitCause.String != "worker_memory_pressure" && run.RecoveryWaitCause.String != "retained_recovery_exhausted") {
+		if !run.RecoveryWaitCause.Valid || (run.RecoveryWaitCause.String != "worker_requeue_exhausted" && run.RecoveryWaitCause.String != "worker_memory_pressure" && run.RecoveryWaitCause.String != "retained_recovery_exhausted" && run.RecoveryWaitCause.String != "codex_idle_stall" && run.RecoveryWaitCause.String != "retained_recovery_adoption_failed") {
 			httpx.Error(w, http.StatusConflict, fmt.Sprintf("run is %s", run.Status))
 			return
 		}
 		var resumeErr error
-		if run.RecoveryWaitCause.String == "worker_memory_pressure" {
+		switch run.RecoveryWaitCause.String {
+		case "codex_idle_stall":
+			_, resumeErr = h.q.ResumeCodexIdleStall(r.Context(), store.ResumeCodexIdleStallParams{ID: runID, UserID: user.ID})
+		case "worker_memory_pressure":
 			_, resumeErr = h.q.ResumeMemoryEpisode(r.Context(), store.ResumeMemoryEpisodeParams{
 				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
 			})
-		} else {
+		default:
 			_, resumeErr = h.q.ResumeWorkerRecoveryEpisode(r.Context(), store.ResumeWorkerRecoveryEpisodeParams{
 				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
 			})

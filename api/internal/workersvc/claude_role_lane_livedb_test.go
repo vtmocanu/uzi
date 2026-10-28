@@ -12,6 +12,7 @@ func TestClaimCodexRoleLaneUnchangedLiveDB(t *testing.T) {
 	f := newSubscriptionFixture(t, env)
 	resealBotPAT(t, env, f.userID)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	run := mustRun(t, env, f.runID)
 	w := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}}
 	// Luna is deliberately included: the Codex lane accepts it as a custom root under

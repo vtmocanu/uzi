@@ -194,7 +194,7 @@ func TestCodexAccountActionsRetryQueryParams(t *testing.T) {
 	if _, err := svc.CodexAccountActionsForRuns(context.Background(), ids); err != nil {
 		t.Fatal(err)
 	}
-	if st.calls != 1 || !slices.Equal(st.arg.RunIds, ids) || st.arg.ReuseInFlightMicroseconds != codexRefreshReuseInFlightBound.Microseconds() || st.arg.ReuseInFlightMicroseconds != 52140000 {
+	if st.calls != 1 || !slices.Equal(st.arg.RunIds, ids) || st.arg.ReuseInFlightMicroseconds != codexRefreshReuseInFlightBound.Microseconds() || st.arg.ReuseInFlightMicroseconds != 832_140_000 {
 		t.Fatalf("query params: calls=%d arg=%+v", st.calls, st.arg)
 	}
 	if _, err := svc.CodexAccountActionsForRuns(context.Background(), nil); err != nil || st.calls != 1 {

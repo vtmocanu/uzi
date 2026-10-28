@@ -8,7 +8,30 @@ audience: user
 
 uzi keeps a small set of instance-wide settings in the database, editable by
 an admin from **Admin → Instance**. Today: two forge labels, a
-default theme, and the run judge.
+default theme, credential protection, and the run judge.
+
+## Credential protection
+
+**Admin → Instance → Credential protection** stores the database-only
+`vault_policy`: **Optional** or **Required**. There is no environment override.
+Missing or invalid policy is treated as Required.
+
+- **Optional** starts new users with protection Off and allows an unlocked
+  protected user to disable it.
+- **Required** starts new users protected and prevents disabling protection.
+  Existing Off users remain runnable and see a persistent enrollment prompt;
+  saving the policy does not convert or re-seal anyone's credentials.
+
+A database with no users when the migration runs starts Optional, before
+the seed admin is created: that admin and later new users start Off.
+A database with any users starts Required and retains every existing user
+as protected, including users without a vault wrapper. The migration does
+not rewrite ciphertext.
+
+The card reports the number of unprotected users. See the operator
+[Vault threat model](./vault-threat-model.md) for security boundaries,
+conversion bounds and coordinated upgrade/rollback planning. Users' choice
+help is [Vault choice](./anthropic-token.md#vault-choice).
 
 ## The two labels
 

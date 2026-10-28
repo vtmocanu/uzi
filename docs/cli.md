@@ -81,8 +81,10 @@ see [Named contexts](#named-contexts) below.
 ## Vault: check status and unlock
 
 After authenticating, run `uzi vault status` to print `locked` or `unlocked`
-for the active user. `--json` returns only `{"unlocked":false}` or
-`{"unlocked":true}`. Status output remains visible with `--quiet`.
+for the active user. A server supporting optional vaults reports `off` for
+unprotected users. `--json` includes `unlocked` and, when the server provides
+it, `mode`. Older servers retain locked/unlocked behavior. Status output
+remains visible with `--quiet`.
 
 Run `uzi vault unlock` in a terminal to enter your login password or, for
 an OIDC-only account, your dedicated vault passphrase. The prompt goes to
@@ -1060,7 +1062,9 @@ A few worth knowing:
   (`EMAIL`/`VAULT`/`TOKEN`/`STATUS`/`5H%`/`7D%`); `codex` is the per-user
   Codex view grouped by user, one row per `(account, bucket)`
   (`EMAIL`/`VAULT`/`ACCOUNT`/`STATUS`/`BUCKET`/`PRIMARY`/`SECONDARY`/`RESET`),
-  with a no-reading window shown as `—`. `--json` returns the raw
+  with a no-reading window shown as `—`. Both providers show `VAULT` as `off`
+  for unprotected users, otherwise `locked` or `unlocked`; a missing mode from an
+  older server retains the existing lock-state display. `--json` returns the raw
   `[]CodexAdminRateLimitRowDTO` for codex, unchanged for claude.
 - **`admin cli-tokens` is the factory-wide standing-credential inventory** —
   every CLI token, whoever owns it, with `OWNER`, `PREFIX`, `NAME`, `SCOPE`,
@@ -1389,12 +1393,14 @@ uzi run recovery <run-id> [--json]
   `CAPTURE` and `WORKER` columns. It shows each hold's exact id, claim generation, and its attention state — active
   protection, a capture in flight, or a ready archive. Legacy holds can release
   automatically on archive readiness; guarded holds await final inventory acknowledgment.
-  The narrow exhaustion exception is an OPEN hold for `recovery_wait` /
-  `worker_requeue_exhausted`, `worker_memory_pressure`, or
-  `retained_recovery_exhausted` (timed or held): it remains `source_only`, or `needs_action` after a failed
-  latest capture, even with an available archive or capture in flight. Timed retained
-  recovery can retry automatically; NULL retry requires owner Resume/Cancel. Archive
-  readiness does not implicitly release this custody.
+  The narrow recovery-hold exception is an OPEN hold for `recovery_wait` /
+  `worker_requeue_exhausted`, `worker_memory_pressure`,
+  `retained_recovery_exhausted` (timed or held), or
+  `retained_recovery_adoption_failed`: it remains `source_only`, or `needs_action` after a failed
+  latest capture, even with an available archive or capture in flight. Retained
+  exhaustion with a finite retry can retry automatically; its NULL retry requires
+  owner Resume/Cancel. Adoption failure always requires owner Resume/Cancel.
+  Archive readiness does not implicitly release this custody.
   The latest capture state and available archive are independent: an older download may
   omit latest work while a newer capture prepares/uploads. The same source, coverage,
   export and discard guidance as above follows. `--json` prints
@@ -1906,7 +1912,7 @@ A newer release is available.
   rows and their per-run COST cells, along with status, health, milestones,
   age and the judge verdict. The header's `7d` cost fetches separately on
   the 60-second side-fetch, manual refresh and board toggle. **A locked
-  vault gets its own line** beside
+  protected vault gets its own line** beside
   the per-token rate-limit strip under the wordmark — the strip is never
   hidden — matching the web SPA's "waiting for vault unlock": a quiet, faint
   `🔒 vault locked` hint (`[locked] vault locked` under NO_COLOR or a
@@ -1916,7 +1922,10 @@ A newer release is available.
   On the admin/factory board the count is scoped to your own
   runs only — it never counts or names another user's locked vault. Either
   form is steady, never blinking, and clears on its own within about a
-  minute of the vault unlocking; there's no dismiss. Unlocking itself is done
+  minute of the vault unlocking; there's no dismiss. Off users have no lock
+  indicator. If an older server omits mode or unlocked metadata, the existing
+  fallback behavior is preserved. Protection toggles remain web-only; see
+  [Vault choice](./anthropic-token.md#vault-choice). Unlocking itself is done
   outside the TUI, with `uzi vault unlock` or in the web app.
 - **Run detail** (`[enter]` from the board, or `uzi tui <run-id>` directly).
   A left rail of agent lanes — the lead plus each live subagent, one lane per
@@ -3222,13 +3231,18 @@ A run's raw `status` (in `run get --json`, `run list --json` and
 - `recovery_wait` — parked to recover from a resumed turn that came back empty
   (no model activity) or hit a transient provider error; the sweep auto-resumes
   it on a capped backoff. Empty-turn and resumed-gate recovery have no lifetime cap;
-  typed `provider_outage` parks use the elapsed streak bound and can become
+  negotiated `codex_idle_stall` parks instead have three timed retries by default,
+  then require owner Resume/Cancel. See [Codex idle stalls](#codex-idle-stalls).
+  Typed `provider_outage` parks use the elapsed streak bound and can become
   `paused` / `provider_unavailable` — see [Recovering
   from a transient interruption](run-recovery-wait.md). An exhausted worker-death episode also parks here with cause
   `worker_requeue_exhausted`, requiring explicit owner Resume or Cancel
   without an automatic timer. Retained-source budget exhaustion can use cause
   `retained_recovery_exhausted`: three timed retries by default, then an owner
-  hold with no countdown. See [Retained recovery exhausted](#retained-recovery-exhausted). A Codex credential
+  hold with no countdown. An integrity refusal uses `retained_recovery_adoption_failed`,
+  requiring owner Resume or Cancel with no automatic retry. See
+  [Retained recovery exhausted](#retained-recovery-exhausted) and
+  [Retained recovery adoption failed](#retained-recovery-adoption-failed). A Codex credential
   refresh or release that found the owner's vault locked also parks here
   (cause `vault_locked`); it takes the same capped backoff and no lifetime
   cap. The owner's explicit successful vault unlock best-effort queues an
@@ -3318,9 +3332,15 @@ hold presentation and remedies are unchanged. See
 
 `limit_wait` and timed `recovery_wait` causes auto-resume on a timer.
 `worker_requeue_exhausted` instead requires owner Resume or Cancel; the Codex
+account hold waits for its account. `codex_idle_stall` and
+`retained_recovery_exhausted` retry when
+their timestamp is finite (even if due); NULL instead needs owner Resume/Cancel,
+and omitted timing is unknown. `pool_wait` instead clears only when a token is
+
 account hold waits for its account. `retained_recovery_exhausted` retries when
 its timestamp is finite (even if due); NULL instead needs owner Resume/Cancel,
-and omitted timing is unknown. `pool_wait` instead clears only when a token is
+and omitted timing is unknown. `retained_recovery_adoption_failed` requires
+owner Resume/Cancel regardless of retry timing. `pool_wait` instead clears only when a token is
 opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
 does not resume it.
 
@@ -3379,8 +3399,9 @@ belongs to the current streak, separately from the recovery backoff count.
 The default elapsed bound is 24h from the first park; operators can change
 `RUN_PROVIDER_PARK_MAX_DURATION` or use `0` to disable the hold while
 typing/counting remain enabled. Positive completed `productive_turns` on
-a provider park starts a new streak; the same evidence on an ordinary or
-disk recovery park (`provider_progress_turns`) clears an open streak. Owner Resume, early credential-driven
+a provider park starts a new streak; the same evidence on an ordinary,
+typed idle-stall or disk recovery park (`provider_progress_turns`) clears an
+open streak. Provider-outage owner Resume, early credential-driven
 promotion and credential switching clear it; automatic and vault-unlock
 promotion preserve it. Detection is at the next qualifying park, with no
 maximum overshoot promised.
@@ -3440,6 +3461,33 @@ set written explicitly. Ordinary recovery waits continue as before.
 status stays `recovery_wait`. The TUI puts this hold in NEEDS YOU with
 owner actions, counts and historical evidence, without a self-retry countdown.
 
+### Codex idle stalls
+
+`recovery_wait` / `codex_idle_stall` covers measured no-output and productive
+Codex stalls. The default allows three automatic parks, then holds for the owner.
+A finite `recovery_retry_not_before`, including a due timestamp, means timed
+recovery; NULL means held with no countdown, and omitted timing means unknown.
+The full worker ACK lacking a retry time is held; an omitted public DTO field
+does not establish that fact.
+
+Use `uzi run resume <id>` (or `resume-now`) to queue either form early, or
+`uzi run cancel <id>` to end it. Resume clears the retry, resets the internal
+idle count to 0, grants a fresh wall window and revokes the Codex capability.
+It preserves lifetime recovery backoff, provider streak, session, affinity,
+worker recovery episode and requeue baseline, with ordinary claim-release and
+custody semantics. Timer promotion preserves the count and grants a fresh wall
+window too; the default can therefore buy three extra full wall windows.
+`set-token` can promote a timed park; a held park returns a named 409 requiring
+Resume first.
+
+Default wait and log follow stop for a NULL-retry hold, continue through finite
+or unknown timing, and report finite-to-held changes within the same cause/status.
+Explicit `--until` is unchanged. Same-session recovery requires a resolvable
+ordinary unwired non-Docker path; retained-source and Docker recovery use fresh
+paths/threads. Read `resume_lineage_break` warnings: recovery does not guarantee
+exactly-once effects. See [Codex idle stalls](run-recovery-wait.md#codex-idle-stalls)
+for progress accounting, source custody and deployment limits.
+
 ### Retained recovery exhausted
 
 `recovery_wait` / `retained_recovery_exhausted` means a durably confirmed
@@ -3464,6 +3512,24 @@ source custody; execution release does not authorize deleting source. See
 [Retained recovery exhausted](run-recovery-wait.md#retained-recovery-exhausted)
 for renewal bounds, storage risks and rollout requirements.
 
+### Retained recovery adoption failed
+
+`recovery_wait` / `retained_recovery_adoption_failed` means an integrity check
+refused adoption. Local work and custody are preserved; the run is owner-held
+with no automatic retry, regardless of a displayed retry timestamp.
+
+Read `uzi run recovery <id>` and export an available archive before deciding.
+Use `uzi run resume <id>` (or `resume-now`) to request another bounded attempt,
+or `uzi run cancel <id>` to end the run. Resume preserves remaining wall time
+and may need `uzi run extend` first. It does not guarantee success: repeated
+adoption failure holds again. An earlier archive may omit latest local work.
+Timers, token changes and credential changes do not release this hold.
+
+Default wait and log follow stop for this owner decision, and the TUI marks
+NEEDS YOU. Explicit `--until` keeps its selected status set. See
+[Retained recovery adoption failed](run-recovery-wait.md#retained-recovery-adoption-failed)
+for storage risks and rollout requirements.
+
 ### Waiting for a state: `uzi run wait`
 
 `uzi run wait <id>` blocks until the run reaches a state you can act on — the
@@ -3473,8 +3539,9 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 `awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
 rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`),
 except a default wait also stops at `recovery_wait` with cause
-`worker_requeue_exhausted`, `worker_memory_pressure`, or owner-held
-`retained_recovery_exhausted` (NULL retry), and at a `paused` run held on
+`worker_requeue_exhausted`, `worker_memory_pressure`,
+`retained_recovery_adoption_failed`, or owner-held `retained_recovery_exhausted`
+or `codex_idle_stall` (NULL retry), and at a `paused` run held on
 `base_attestation_missing`, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means

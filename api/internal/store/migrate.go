@@ -144,7 +144,8 @@ func SecretMutationLockObjID(userID uuid.UUID) int32 {
 
 // LockSecretMutation takes the per-user secret mutation lock inside db's transaction. It is
 // the one lock order every credential enablement, default, binding and reassignment writer
-// shares with the credential_disabled promoter (PRD #1732 D14): this user lock FIRST, then
+// shares with the credential_disabled promoter (PRD #1732 D14): after any settings
+// admission lock, take this user lock, then
 // any run row, then requirement-source and credential rows. Callers must never take it
 // while already holding a run row lock.
 func LockSecretMutation(ctx context.Context, db DBTX, userID uuid.UUID) error {
@@ -183,6 +184,17 @@ func LockSecretMutation(ctx context.Context, db DBTX, userID uuid.UUID) error {
 // would miss the new row and the race would reopen. The sibling locks above make the
 // same assumption; do not add an isolation level to the DSN without revisiting this.
 const SettingsMutationLockKey int64 = 0x757A7365 // "uzse"
+
+// LockSettingsAdmission takes the shared counterpart of the settings writer's
+// exclusive SettingsMutationLockKey in the caller's transaction. It is the lock
+// prefix before LockSecretMutation and any user row locks. Under READ COMMITTED,
+// call GetVaultPolicy as a SEPARATE statement after this returns, so its snapshot
+// includes a settings writer that committed while admission waited. Do not use a
+// cached policy for admission. Commit or rollback releases this lock.
+func LockSettingsAdmission(ctx context.Context, db DBTX) error {
+	_, err := db.Exec(ctx, "SELECT pg_advisory_xact_lock_shared($1)", SettingsMutationLockKey)
+	return err
+}
 
 // JudgeDispositionCoordLockClass is the class half of the two-int advisory lock that
 // serializes an admin cross-user "Mark done" write against a concurrent issue-filing on

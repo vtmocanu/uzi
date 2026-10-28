@@ -20,6 +20,7 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -43,6 +44,7 @@ func TestMilestoneReconciliationHTTPReclaimLiveDB(t *testing.T) {
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
 	svc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), PlanMaxRevisions: 3, WorkerHeartbeatStale: time.Minute})
+	svc.SetVault(vault.NewPostgres(box, pool))
 	svc.SetTxBeginner(pool)
 	svc.SetRetentionLockPool(pool)
 	svc.SetBackground(func(func()) {})
@@ -74,7 +76,7 @@ func TestMilestoneReconciliationHTTPReclaimLiveDB(t *testing.T) {
 		t.Helper()
 		cliMustExec(t, pool, sql, args...)
 	}
-	exec(`INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')`, owner, fmt.Sprintf("reconciliation-http-%s@e2e", owner))
+	exec(`INSERT INTO users(id,email,password_hash,vault_mode) VALUES($1,$2,'x','unprotected')`, owner, fmt.Sprintf("reconciliation-http-%s@e2e", owner))
 	t.Cleanup(func() {
 		// Delete only this fixture's rows, in FK order.
 		exec("DELETE FROM runs WHERE id=$1", runID)

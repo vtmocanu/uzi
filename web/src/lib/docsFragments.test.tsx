@@ -94,6 +94,8 @@ it("collects nested targets in order with GFM and encoded hashes", () => {
   ]);
 });
 
+// Full-corpus Markdown rendering took 38.4s under coverage in a contended suite.
+// Keep every document and assertion; allow bounded rendering headroom, not a wait.
 it("resolves all parsed fragments targeting the docs corpus", () => {
   const docs = new Map(Object.entries(rawDocs).map(([key, raw]) => [
     "docs/" + key.slice(key.lastIndexOf("/") + 1), collect(raw),
@@ -137,4 +139,4 @@ it("resolves all parsed fragments targeting the docs corpus", () => {
   expect(sameDoc).toBeGreaterThan(0);
   expect(relativeDoc).toBeGreaterThan(0);
   expect(failures, failures.join("\n")).toEqual([]);
-}, 30000);
+}, 60000);

@@ -12,6 +12,28 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const advanceUserVaultMode = `-- name: AdvanceUserVaultMode :one
+UPDATE users SET vault_mode = $1, vault_epoch = vault_epoch + 1
+WHERE id = $2 RETURNING vault_mode, vault_epoch
+`
+
+type AdvanceUserVaultModeParams struct {
+	VaultMode string    `json:"vault_mode"`
+	ID        uuid.UUID `json:"id"`
+}
+
+type AdvanceUserVaultModeRow struct {
+	VaultMode  string `json:"vault_mode"`
+	VaultEpoch int64  `json:"vault_epoch"`
+}
+
+func (q *Queries) AdvanceUserVaultMode(ctx context.Context, arg AdvanceUserVaultModeParams) (AdvanceUserVaultModeRow, error) {
+	row := q.db.QueryRow(ctx, advanceUserVaultMode, arg.VaultMode, arg.ID)
+	var i AdvanceUserVaultModeRow
+	err := row.Scan(&i.VaultMode, &i.VaultEpoch)
+	return i, err
+}
+
 const claimVaultLockNotice = `-- name: ClaimVaultLockNotice :one
 UPDATE user_vaults SET lock_notified_at = now()
 WHERE user_id = $1 AND lock_notified_at IS NULL
@@ -42,6 +64,17 @@ func (q *Queries) ClearVaultLockNotice(ctx context.Context, userID uuid.UUID) er
 	return err
 }
 
+const countUnprotectedUsers = `-- name: CountUnprotectedUsers :one
+SELECT count(*) FROM users WHERE vault_mode = 'unprotected'
+`
+
+func (q *Queries) CountUnprotectedUsers(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countUnprotectedUsers)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createUserVaultIfAbsent = `-- name: CreateUserVaultIfAbsent :one
 INSERT INTO user_vaults (user_id, kek_salt, wrapped_dek)
 VALUES ($1, $2, $3)
@@ -55,15 +88,10 @@ type CreateUserVaultIfAbsentParams struct {
 	WrappedDek []byte    `json:"wrapped_dek"`
 }
 
-// First-unlock vault creation, race-safe. Two concurrent first-unlocks for the
-// same user both run this; ON CONFLICT DO NOTHING lets exactly one insert win and
-// returns no row (pgx.ErrNoRows) to the loser, who re-reads the winner's row and
-// unwraps it with the same password — so the cached DEK always equals the
-// persisted one (fixes the check-then-act race where each request would otherwise
-// cache a different DEK than the DB holds). Deliberately DO NOTHING, never DO
-// UPDATE: overwriting a live wrapped_dek would orphan every secret sealed under
-// the previous DEK. kek_salt is the per-user Argon2 salt, distinct from
-// users.password_hash's salt so the DB never contains the KEK.
+// Lifecycle creation holds the owner users-row lock before checking wrapper
+// presence. DO NOTHING defensively prevents replacing a live DEK; a conflicting
+// insert returns pgx.ErrNoRows and aborts the lifecycle transaction.
+// The independent KEK salt prevents password_hash from supplying the wrapping key.
 func (q *Queries) CreateUserVaultIfAbsent(ctx context.Context, arg CreateUserVaultIfAbsentParams) (UserVault, error) {
 	row := q.db.QueryRow(ctx, createUserVaultIfAbsent, arg.UserID, arg.KekSalt, arg.WrappedDek)
 	var i UserVault
@@ -82,13 +110,9 @@ const deleteUserVault = `-- name: DeleteUserVault :execrows
 DELETE FROM user_vaults WHERE user_id = $1
 `
 
-// Drops ONLY the vault row (there is no FK cascade user_vaults → user_secrets).
-// Intended for the future password-reset flow, where the DEK is unrecoverable by
-// design: that flow MUST also delete this user's sealed_with='dek' user_secrets
-// rows and force re-entry — keeping unreadable ciphertext would be a worse bug
-// than the data loss. Reset itself is out of scope (PRD #32); this is the
-// primitive it will build on. Account deletion is already handled by the
-// ON DELETE CASCADE from users.
+// Drops ONLY the wrapper. The vault-disable transaction must first reseal all
+// owned secret and account slots under master_aad while holding the owner fence.
+// Deleting a wrapper with remaining DEK material would strand those credentials.
 func (q *Queries) DeleteUserVault(ctx context.Context, userID uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteUserVault, userID)
 	if err != nil {
@@ -103,7 +127,8 @@ SELECT user_id, kek_salt, wrapped_dek, created_at, updated_at, lock_notified_at 
 
 // The user's KEK salt + wrapped DEK. The plaintext DEK is never selected (it is
 // never stored); the caller derives the KEK from the login password and unwraps
-// in memory. pgx.ErrNoRows ⇒ no vault yet, and the first-ever unlock creates one.
+// in memory. pgx.ErrNoRows means no wrapper; explicit enable or required
+// enrollment may create one.
 func (q *Queries) GetUserVault(ctx context.Context, userID uuid.UUID) (UserVault, error) {
 	row := q.db.QueryRow(ctx, getUserVault, userID)
 	var i UserVault
@@ -115,6 +140,22 @@ func (q *Queries) GetUserVault(ctx context.Context, userID uuid.UUID) (UserVault
 		&i.UpdatedAt,
 		&i.LockNotifiedAt,
 	)
+	return i, err
+}
+
+const getUserVaultState = `-- name: GetUserVaultState :one
+SELECT vault_mode, vault_epoch FROM users WHERE id = $1
+`
+
+type GetUserVaultStateRow struct {
+	VaultMode  string `json:"vault_mode"`
+	VaultEpoch int64  `json:"vault_epoch"`
+}
+
+func (q *Queries) GetUserVaultState(ctx context.Context, id uuid.UUID) (GetUserVaultStateRow, error) {
+	row := q.db.QueryRow(ctx, getUserVaultState, id)
+	var i GetUserVaultStateRow
+	err := row.Scan(&i.VaultMode, &i.VaultEpoch)
 	return i, err
 }
 
@@ -195,4 +236,56 @@ func (q *Queries) ListUsersNeedingVaultLockNotice(ctx context.Context) ([]ListUs
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockUserVault = `-- name: LockUserVault :one
+SELECT user_id, kek_salt, wrapped_dek, created_at, updated_at, lock_notified_at FROM user_vaults WHERE user_id = $1 FOR UPDATE
+`
+
+func (q *Queries) LockUserVault(ctx context.Context, userID uuid.UUID) (UserVault, error) {
+	row := q.db.QueryRow(ctx, lockUserVault, userID)
+	var i UserVault
+	err := row.Scan(
+		&i.UserID,
+		&i.KekSalt,
+		&i.WrappedDek,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LockNotifiedAt,
+	)
+	return i, err
+}
+
+const lockUserVaultState = `-- name: LockUserVaultState :one
+SELECT vault_mode, vault_epoch FROM users WHERE id = $1 FOR UPDATE
+`
+
+type LockUserVaultStateRow struct {
+	VaultMode  string `json:"vault_mode"`
+	VaultEpoch int64  `json:"vault_epoch"`
+}
+
+func (q *Queries) LockUserVaultState(ctx context.Context, id uuid.UUID) (LockUserVaultStateRow, error) {
+	row := q.db.QueryRow(ctx, lockUserVaultState, id)
+	var i LockUserVaultStateRow
+	err := row.Scan(&i.VaultMode, &i.VaultEpoch)
+	return i, err
+}
+
+const lockVaultAuthState = `-- name: LockVaultAuthState :one
+SELECT vault_mode, vault_epoch, password_hash FROM users WHERE id = $1 FOR UPDATE
+`
+
+type LockVaultAuthStateRow struct {
+	VaultMode    string      `json:"vault_mode"`
+	VaultEpoch   int64       `json:"vault_epoch"`
+	PasswordHash pgtype.Text `json:"password_hash"`
+}
+
+// Lifecycle operations lock the durable mode/epoch and current login hash together.
+func (q *Queries) LockVaultAuthState(ctx context.Context, id uuid.UUID) (LockVaultAuthStateRow, error) {
+	row := q.db.QueryRow(ctx, lockVaultAuthState, id)
+	var i LockVaultAuthStateRow
+	err := row.Scan(&i.VaultMode, &i.VaultEpoch, &i.PasswordHash)
+	return i, err
 }

@@ -11,7 +11,6 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // Issue #2705 M3: the health detector explains a stale-requeued run that ClaimRun is holding for
@@ -156,7 +155,7 @@ func TestHealthStaleRequeuePinVaultLockedWins(t *testing.T) {
 	r.StatusSince = ago(15 * time.Minute) // past the 10m threshold, inside the 20m grace
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 	svc, _ := pinSvc(fs, defaultHealthSettings())
-	svc.SetVault(vault.New(newBox(t), newMemVaultStore())) // r.UserID never unlocked
+	svc.SetVault(newMemoryVault(newBox(t), newMemVaultStore())) // r.UserID never unlocked
 
 	svc.detectRunHealth(context.Background(), t0)
 	if got := lastWrite(t, fs, r.ID).HealthReason.String; got != reasonVaultLocked {
@@ -170,7 +169,7 @@ func TestHealthStaleRequeuePinYoungRunWithLockedVaultStaysOK(t *testing.T) {
 	r := pinnedRun() // 1m old
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 	svc, b := pinSvc(fs, defaultHealthSettings())
-	svc.SetVault(vault.New(newBox(t), newMemVaultStore()))
+	svc.SetVault(newMemoryVault(newBox(t), newMemVaultStore()))
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
 		t.Fatalf("changed = %d, want 0; writes=%v", n, fs.writes)

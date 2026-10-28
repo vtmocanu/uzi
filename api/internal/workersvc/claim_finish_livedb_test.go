@@ -70,6 +70,7 @@ func newCodexClaimFix(t *testing.T, env codexTestEnv, olderHold bool) *codexClai
 		fx.workerB, f.userID, "wb-"+fx.workerB.String(), fx.workerB[:],
 		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.RecoveryArchiveV1})
 	fx.svc = New(env.q, env.box, testParams())
+	fx.svc.SetVault(env.vlt)
 	fx.svc.SetTxBeginner(env.pool)
 	return fx
 }

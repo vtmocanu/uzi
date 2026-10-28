@@ -73,6 +73,7 @@ func newLifecycleFixture(t *testing.T, harness Harness) *lifecycleFixture {
 		enableClaimAssembly(t, env, userID)
 	}
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
 	svc.SetBackground(func(func()) {})
 	f := &lifecycleFixture{env: env, svc: svc, userID: userID, repoID: repoID, harness: harness, nextIID: 1}

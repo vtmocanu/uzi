@@ -70,11 +70,12 @@ func (q *Queries) CountEnabledSecretSlot(ctx context.Context, arg CountEnabledSe
 }
 
 const countMasterSealedSecrets = `-- name: CountMasterSealedSecrets :one
-SELECT count(*) FROM user_secrets WHERE sealed_with = 'master'
+SELECT count(*) FROM user_secrets s JOIN users u ON u.id = s.user_id
+WHERE s.sealed_with = 'master' AND u.vault_mode = 'protected'
 `
 
-// Admin migration-progress signal (PRD #32): how many stored user secrets still
-// use the legacy master-key sealing — i.e. owners who have not unlocked since the
+// Admin migration-progress signal (PRD #32): how many protected users' secrets
+// still use legacy master-key sealing — i.e. owners who have not unlocked since the
 // vault rolled out. New saves are born 'dek' and lazy rewrap flips old rows on the
 // owner's next unlock, so this trends to zero; a persistently non-zero count flags
 // dormant accounts an operator may want to nudge.
@@ -356,8 +357,13 @@ func (q *Queries) GetUserSecretCiphertext(ctx context.Context, arg GetUserSecret
 }
 
 const getUserSecretCiphertextByID = `-- name: GetUserSecretCiphertextByID :one
-SELECT user_id, kind, ciphertext, sealed_with, (disabled_at IS NOT NULL)::boolean AS disabled FROM user_secrets
-WHERE id = $1 AND user_id = $2
+SELECT s.id, s.user_id, s.kind, s.ciphertext, s.sealed_with,
+       (s.disabled_at IS NOT NULL)::boolean AS disabled, s.enablement_rev,
+       u.vault_epoch, cs.material_revision
+FROM user_secrets s
+JOIN users u ON u.id = s.user_id
+LEFT JOIN codex_credential_state cs ON cs.user_secret_id = s.id AND cs.user_id = s.user_id
+WHERE s.id = $1 AND s.user_id = $2
 `
 
 type GetUserSecretCiphertextByIDParams struct {
@@ -366,11 +372,15 @@ type GetUserSecretCiphertextByIDParams struct {
 }
 
 type GetUserSecretCiphertextByIDRow struct {
-	UserID     uuid.UUID `json:"user_id"`
-	Kind       string    `json:"kind"`
-	Ciphertext []byte    `json:"ciphertext"`
-	SealedWith string    `json:"sealed_with"`
-	Disabled   bool      `json:"disabled"`
+	ID               uuid.UUID   `json:"id"`
+	UserID           uuid.UUID   `json:"user_id"`
+	Kind             string      `json:"kind"`
+	Ciphertext       []byte      `json:"ciphertext"`
+	SealedWith       string      `json:"sealed_with"`
+	Disabled         bool        `json:"disabled"`
+	EnablementRev    int64       `json:"enablement_rev"`
+	VaultEpoch       int64       `json:"vault_epoch"`
+	MaterialRevision pgtype.Int8 `json:"material_revision"`
 }
 
 // Fetch one specific secret by identity, for the bound-credential resolution M3
@@ -387,15 +397,21 @@ type GetUserSecretCiphertextByIDRow struct {
 //
 // disabled (PRD #1732 D5) rides along for the binding writers, which confirm ownership
 // through this read and must refuse a disabled credential from the same row.
+// Ciphertext, crypto epoch and credential authority belong to one SQL snapshot.
+// The LEFT JOIN retains non-Codex secrets that have no alias state.
 func (q *Queries) GetUserSecretCiphertextByID(ctx context.Context, arg GetUserSecretCiphertextByIDParams) (GetUserSecretCiphertextByIDRow, error) {
 	row := q.db.QueryRow(ctx, getUserSecretCiphertextByID, arg.ID, arg.UserID)
 	var i GetUserSecretCiphertextByIDRow
 	err := row.Scan(
+		&i.ID,
 		&i.UserID,
 		&i.Kind,
 		&i.Ciphertext,
 		&i.SealedWith,
 		&i.Disabled,
+		&i.EnablementRev,
+		&i.VaultEpoch,
+		&i.MaterialRevision,
 	)
 	return i, err
 }

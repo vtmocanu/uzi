@@ -14,6 +14,14 @@ import (
 )
 
 func TestRetainedParkNonOwnerGuardsLiveDB(t *testing.T) {
+	for _, cause := range []string{"retained_recovery_exhausted", "retained_recovery_adoption_failed"} {
+		t.Run(cause, func(t *testing.T) {
+			testRetainedParkNonOwnerGuardsLiveDB(t, cause)
+		})
+	}
+}
+
+func testRetainedParkNonOwnerGuardsLiveDB(t *testing.T, cause string) {
 	env := setupCodexLiveDB(t)
 	user, _, repo := env.seedCodexInfra(t)
 	worker := seedSnapshotWorker(t, env, user, "exhaustion-guards")
@@ -23,11 +31,14 @@ func TestRetainedParkNonOwnerGuardsLiveDB(t *testing.T) {
 	env.exec("INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity,live_worker_id,live_run_id) VALUES($1,$2,$3,$4,2,'open',$5,'guard-fixture',$5,$4)", hold, user, repo, run, worker)
 	svc := snapshotSvc(env, testParams())
 	svc.p.RunRetainedRecoveryMaxParks = 0
-	if _, ok, err := svc.SetState(env.ctx, store.Worker{ID: worker}, run, retainedReport(2)); err != nil || !ok {
+	if _, ok, err := svc.SetState(env.ctx, store.Worker{ID: worker}, run, retainedReportCause(2, cause)); err != nil || !ok {
 		t.Fatalf("park=%v %v", ok, err)
 	}
+	if cause == recoveryCauseRetainedRecoveryAdoptionFailed {
+		env.exec("UPDATE runs SET recovery_retry_not_before=now()-interval '1 second' WHERE id=$1", run)
+	}
 	before := exhaustionRun(t, env, run)
-	if before.Status != "recovery_wait" || before.RecoveryWaitCause.String != "retained_recovery_exhausted" || !before.ClaimReleasedAt.Valid {
+	if before.Status != "recovery_wait" || before.RecoveryWaitCause.String != cause || !before.ClaimReleasedAt.Valid {
 		t.Fatalf("not exhausted: %+v", before)
 	}
 	custody := func() string {

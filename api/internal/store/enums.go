@@ -1,5 +1,11 @@
 package store
 
+// Vault modes describe the persisted personal-secret protection policy.
+const (
+	VaultModeProtected   = "protected"
+	VaultModeUnprotected = "unprotected"
+)
+
 // Hand-maintained mirrors of DB CHECK-constraint enum values. Binding Go code to
 // one symbol per value (instead of scattering the string literal across handlers,
 // the worker service, the seed, and the vault) removes the drift hazard where one
@@ -30,8 +36,10 @@ const KindCodexAuth = "codex_auth"
 const LabelDefaultSecret = "default"
 
 // user_secrets.sealed_with (migration 00051): which key sealed the ciphertext.
-// 'master' = the legacy UZI_SECRET_KEY box; 'dek' = the per-user vault DEK.
+// 'master' = the legacy UZI_SECRET_KEY box; 'master_aad' = the master box
+// with authenticated context; 'dek' = the per-user vault DEK.
 const (
-	SealedWithMaster = "master"
-	SealedWithDEK    = "dek"
+	SealedWithMaster    = "master"
+	SealedWithMasterAAD = "master_aad"
+	SealedWithDEK       = "dek"
 )

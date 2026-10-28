@@ -45,7 +45,8 @@ func TestCodexReuseReceiptSurvivorLiveDB(t *testing.T) {
 			if _, err := env.pool.Exec(env.ctx, "UPDATE user_secrets SET disabled_at=now() WHERE id=$1", f.aliasID); err != nil {
 				t.Fatal(err)
 			}
-			f.svc.vlt = vault.New(env.box, env.q) // locked, even the master-sealed login must defer
+			env.exec("UPDATE users SET vault_mode='protected' WHERE id=$1", f.userID)
+			f.svc.vlt = vault.NewPostgres(env.box, env.pool) // protected and locked; legacy master material must not admit reuse
 			resolved, err := f.svc.ReconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID)
 			if err != nil || resolved != 0 {
 				t.Fatalf("eligible receipt resolved=%d,%v", resolved, err)

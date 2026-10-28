@@ -15,7 +15,9 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
+	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // These tests exercise ReconcileCodexAuthIdentity end to end against a REAL Postgres
@@ -81,6 +83,7 @@ type codexTestEnv struct {
 	pool *pgxpool.Pool
 	q    *store.Queries
 	box  *secretbox.Box
+	vlt  *vault.Vault
 	exec func(sql string, args ...any)
 }
 
@@ -105,7 +108,7 @@ func setupCodexLiveDB(t *testing.T) codexTestEnv {
 		t.Fatalf("open pool: %v", err)
 	}
 	t.Cleanup(pool.Close)
-	// A real master box: with a nil vault the reconciler seals/open on the master path.
+	// A real master box opens legacy inputs; the policy vault seals new writes.
 	box, err := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
 	if err != nil {
 		t.Fatalf("secretbox: %v", err)
@@ -116,14 +119,14 @@ func setupCodexLiveDB(t *testing.T) codexTestEnv {
 			t.Fatalf("exec %q: %v", sql, err)
 		}
 	}
-	return codexTestEnv{ctx: ctx, pool: pool, q: store.New(pool), box: box, exec: exec}
+	return codexTestEnv{ctx: ctx, pool: pool, q: store.New(pool), box: box, vlt: vault.NewPostgres(box, pool), exec: exec}
 }
 
 // seedUser inserts a fresh user and returns its id.
 func (e codexTestEnv) seedUser(t *testing.T) uuid.UUID {
 	t.Helper()
 	userID := uuid.New()
-	e.exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+	e.exec(`INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`,
 		userID, fmt.Sprintf("codex-%s@e2e", userID))
 	return userID
 }
@@ -182,7 +185,7 @@ func TestReconcileCodexIncompleteIdentityStaysFailedLiveDB(t *testing.T) {
 	fake := newFakeCodexIdentity()
 	fake.errByToken[incompleteTok] = codexauth.ErrIdentityIncomplete
 	fake.errByToken[expiredTok] = &codexauth.AuthError{Op: "discover_identity", StatusCode: 401}
-	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
+	r := NewCodexReconciler(env.q, env.vlt, env.box, fake, env.pool)
 
 	for _, alias := range []uuid.UUID{aliasIncomplete, aliasExpired} {
 		err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias)
@@ -232,7 +235,7 @@ func TestReconcileCodexSameTupleConvergesLiveDB(t *testing.T) {
 	sameID := codexauth.Identity{ProviderUserID: providerUser, WorkspaceAccountID: workspace}
 	fake.idByToken[tok1] = sameID
 	fake.idByToken[tok2] = sameID
-	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
+	r := NewCodexReconciler(env.q, env.vlt, env.box, fake, env.pool)
 
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
 		t.Fatalf("reconcile alias1: %v", err)
@@ -268,6 +271,9 @@ func TestReconcileCodexSameTupleConvergesLiveDB(t *testing.T) {
 	if acct.ProviderUserID != providerUser || acct.WorkspaceAccountID != workspace {
 		t.Fatalf("account tuple = (%s,%s), want (%s,%s)", acct.ProviderUserID, acct.WorkspaceAccountID, providerUser, workspace)
 	}
+	if acct.SealedWith != store.SealedWithMasterAAD {
+		t.Fatalf("new off account marker = %q", acct.SealedWith)
+	}
 	if acct.Generation != 0 {
 		t.Fatalf("new account generation = %d, want 0", acct.Generation)
 	}
@@ -294,7 +300,7 @@ func TestReconcileCodexDifferentUserSameWorkspaceLiveDB(t *testing.T) {
 	fake := newFakeCodexIdentity()
 	fake.idByToken[tokA] = codexauth.Identity{ProviderUserID: providerUserA, WorkspaceAccountID: workspace}
 	fake.idByToken[tokB] = codexauth.Identity{ProviderUserID: providerUserB, WorkspaceAccountID: workspace}
-	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
+	r := NewCodexReconciler(env.q, env.vlt, env.box, fake, env.pool)
 
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, aliasA); err != nil {
 		t.Fatalf("reconcile aliasA: %v", err)
@@ -346,7 +352,7 @@ func TestReconcileCodexRelinkRaceLostLiveDB(t *testing.T) {
 	alias1 := env.seedStagingAlias(t, userID, "codex-race-a", codexLoginBlob{AccessToken: tok1, RefreshToken: codexToken("r")})
 	fakeA := newFakeCodexIdentity()
 	fakeA.idByToken[tok1] = sameID
-	if err := NewCodexReconciler(env.q, nil, env.box, fakeA, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
+	if err := NewCodexReconciler(env.q, env.vlt, env.box, fakeA, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
 		t.Fatalf("reconcile alias1: %v", err)
 	}
 
@@ -364,7 +370,7 @@ func TestReconcileCodexRelinkRaceLostLiveDB(t *testing.T) {
 		}
 	}
 
-	err := NewCodexReconciler(env.q, nil, env.box, fakeB, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias2)
+	err := NewCodexReconciler(env.q, env.vlt, env.box, fakeB, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias2)
 	if !errors.Is(err, ErrCodexRelinkRaceLost) {
 		t.Fatalf("err = %v, want ErrCodexRelinkRaceLost", err)
 	}
@@ -398,7 +404,7 @@ func TestReconcileCodexReLoginRestoresQuarantinedLiveDB(t *testing.T) {
 	alias1 := env.seedStagingAlias(t, userID, "codex-relogin-a", codexLoginBlob{AccessToken: tok1, RefreshToken: codexToken("r")})
 	fake := newFakeCodexIdentity()
 	fake.idByToken[tok1] = sameID
-	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
+	r := NewCodexReconciler(env.q, env.vlt, env.box, fake, env.pool)
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
 		t.Fatalf("reconcile alias1: %v", err)
 	}
@@ -424,7 +430,7 @@ func TestReconcileCodexReLoginRestoresQuarantinedLiveDB(t *testing.T) {
 		t.Fatalf("generation = %d, want 1 (re-login advances)", acct.Generation)
 	}
 	// The canonical login now OPENS to the NEW access token — the dead login was replaced.
-	if blob := env.accountBlob(t, userID, accountID); blob.AccessToken != tok2 {
+	if blob := env.credAccountBlob(t, userID, accountID); blob.AccessToken != tok2 {
 		t.Fatalf("restored sealed_login access token = %q, want the re-login %q", blob.AccessToken, tok2)
 	}
 	// alias2 is linked to the same account.
@@ -444,7 +450,7 @@ func TestReconcileCodexRefusesLinkedStatusLiveDB(t *testing.T) {
 
 	fake := newFakeCodexIdentity()
 	fake.idByToken[tok] = codexauth.Identity{ProviderUserID: "u-" + uuid.NewString(), WorkspaceAccountID: "a-" + uuid.NewString()}
-	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
+	r := NewCodexReconciler(env.q, env.vlt, env.box, fake, env.pool)
 
 	// First reconcile links it.
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias); err != nil {
@@ -492,7 +498,7 @@ func TestReconcileCodexStaleFirstEnrollmentRollsBackLiveDB(t *testing.T) {
 		}
 	}
 
-	err := NewCodexReconciler(env.q, nil, env.box, fake, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias)
+	err := NewCodexReconciler(env.q, env.vlt, env.box, fake, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias)
 	if !errors.Is(err, ErrCodexRelinkRaceLost) {
 		t.Fatalf("err = %v, want ErrCodexRelinkRaceLost", err)
 	}
@@ -528,7 +534,7 @@ func TestReconcileCodexStaleQuarantineRestoreRollsBackLiveDB(t *testing.T) {
 	alias1 := env.seedStagingAlias(t, userID, "codex-stale-q-a", codexLoginBlob{AccessToken: tok1, RefreshToken: codexToken("r")})
 	fake := newFakeCodexIdentity()
 	fake.idByToken[tok1] = sameID
-	if err := NewCodexReconciler(env.q, nil, env.box, fake, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
+	if err := NewCodexReconciler(env.q, env.vlt, env.box, fake, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
 		t.Fatalf("reconcile alias1: %v", err)
 	}
 	st1 := mustState(t, env, userID, alias1)
@@ -537,7 +543,7 @@ func TestReconcileCodexStaleQuarantineRestoreRollsBackLiveDB(t *testing.T) {
 	// Quarantine the account (a dead login) and record its pre-restore login + generation.
 	env.exec(`UPDATE codex_provider_account SET coord_state='quarantined' WHERE id=$1`, accountID)
 	preGen := env.mustAccount(t, userID, accountID).Generation
-	if blob := env.accountBlob(t, userID, accountID); blob.AccessToken != tok1 {
+	if blob := env.credAccountBlob(t, userID, accountID); blob.AccessToken != tok1 {
 		t.Fatalf("precondition: account login access token = %q, want %q", blob.AccessToken, tok1)
 	}
 
@@ -555,7 +561,7 @@ func TestReconcileCodexStaleQuarantineRestoreRollsBackLiveDB(t *testing.T) {
 		}
 	}
 
-	err := NewCodexReconciler(env.q, nil, env.box, fakeB, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias2)
+	err := NewCodexReconciler(env.q, env.vlt, env.box, fakeB, env.pool).ReconcileCodexAuthIdentity(env.ctx, userID, alias2)
 	if !errors.Is(err, ErrCodexRelinkRaceLost) {
 		t.Fatalf("err = %v, want ErrCodexRelinkRaceLost", err)
 	}
@@ -567,7 +573,7 @@ func TestReconcileCodexStaleQuarantineRestoreRollsBackLiveDB(t *testing.T) {
 	if acct.CoordState != codexCoordQuarantined {
 		t.Fatalf("coord_state = %q, want %q (the restore must have rolled back)", acct.CoordState, codexCoordQuarantined)
 	}
-	if blob := env.accountBlob(t, userID, accountID); blob.AccessToken != tok1 {
+	if blob := env.credAccountBlob(t, userID, accountID); blob.AccessToken != tok1 {
 		t.Fatalf("account login access token = %q, want the ORIGINAL %q (the restore must have rolled back)", blob.AccessToken, tok1)
 	}
 }
@@ -587,7 +593,7 @@ func TestReconcileCodexStaleFailureWriteFencedLiveDB(t *testing.T) {
 
 	fake := newFakeCodexIdentity()
 	fake.idByToken[tok] = codexauth.Identity{ProviderUserID: "u-" + uuid.NewString(), WorkspaceAccountID: "a-" + uuid.NewString()}
-	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
+	r := NewCodexReconciler(env.q, env.vlt, env.box, fake, env.pool)
 
 	// Healthy reconcile → linked at material_revision 0; grab the bound account.
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias); err != nil {
@@ -673,7 +679,7 @@ func TestReconcileCodexTransientDiscoveryStaysStagingLiveDB(t *testing.T) {
 		aliases[i] = env.seedStagingAlias(t, userID, tc.label, codexLoginBlob{AccessToken: tok, RefreshToken: codexToken("r")})
 		fake.errByToken[tok] = tc.err
 	}
-	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
+	r := NewCodexReconciler(env.q, env.vlt, env.box, fake, env.pool)
 
 	for i, tc := range cases {
 		alias := aliases[i]
@@ -729,7 +735,7 @@ func TestReconcileCodexTransientOpenStaysStagingLiveDB(t *testing.T) {
 
 	fake := newFakeCodexIdentity() // never reached: the open fails before discovery
 	q := transientOpenStore{codexCredStore: env.q, err: errors.New("read tcp: connection reset by peer")}
-	r := NewCodexReconciler(q, nil, env.box, fake, env.pool)
+	r := NewCodexReconciler(q, env.vlt, env.box, fake, env.pool)
 
 	err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias)
 	if err == nil {
@@ -748,4 +754,22 @@ func TestReconcileCodexTransientOpenStaysStagingLiveDB(t *testing.T) {
 	if fake.refreshCalls != 0 {
 		t.Fatalf("refresh counter = %d, want 0 (discovery never reached)", fake.refreshCalls)
 	}
+}
+
+// credAccountBlob authenticates the actual discriminator, including new master-AAD writes.
+func (e codexTestEnv) credAccountBlob(t *testing.T, userID, accountID uuid.UUID) codexLoginBlob {
+	t.Helper()
+	acct, err := e.q.GetCodexProviderAccountByID(e.ctx, store.GetCodexProviderAccountByIDParams{UserID: userID, ID: accountID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := secretopen.OpenSealed(e.vlt, e.box, userID, store.KindCodexAuth, acct.SealedWith, acct.SealedLogin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blob codexLoginBlob
+	if err := json.Unmarshal(plain, &blob); err != nil {
+		t.Fatal(err)
+	}
+	return blob
 }

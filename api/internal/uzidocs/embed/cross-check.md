@@ -122,7 +122,8 @@ A Claude checker also fails with `plan cross-check: checker unavailable`,
 and the lead parks for a human, when your Claude credential is unavailable or
 disabled at claim time, or the automatic Claude pool is empty. No credential is
 delivered, and your non-pooled default is never spent. A locked credential
-vault remains a transient wait. A pinned Claude model the account cannot use
+vault remains a transient wait for protected users; Off users have no unlock
+dependency (see [Vault choice](./anthropic-token.md#vault-choice)). A pinned Claude model the account cannot use
 (the SDK reports `model_not_found`) is treated the same way. A checker session
 whose confinement cannot be confirmed at startup fails the check with
 `confinement_failed`.
