@@ -18170,7 +18170,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       return {};
     } });
     const atTrip = { classification: "rateLimitExceeded", category: "rate_limit" };
-    let harness: CodexHarness | undefined;
+    let retryContext: (() => CodexHarness["retryClassification"]) | undefined;
     let lateMapped: Promise<void> | undefined;
     let persistedAfterLate = false;
     const persist = rig.deps.sessionStore!.persist.bind(rig.deps.sessionStore);
@@ -18178,14 +18178,14 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       sessionStore: { ...rig.deps.sessionStore!, persist: async (...args) => {
         assert.ok(lateMapped, "abort admitted the late notification before recovery persistence");
         await lateMapped;
-        assert.deepEqual(harness!.retryClassification, late.expected);
+        assert.deepEqual(retryContext!(), late.expected);
         persistedAfterLate = true;
         return persist(...args);
       } },
     };
     const original = CodexHarness.prototype.startTurn;
     const mocked = mock.method(CodexHarness.prototype, "startTurn", function(this: CodexHarness, request: Parameters<typeof original>[0]) {
-      harness = this;
+      retryContext = () => this.retryClassification;
       const turn = original.call(this, request);
       request.signal.addEventListener("abort", () => {
         // runTurn checks the aborted signal before mapping queued notes. Invoke its existing
@@ -18208,7 +18208,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
     void running.catch(() => undefined);
     try {
-      await until(() => harness?.retryClassification?.classification === "rateLimitExceeded");
+      await until(() => retryContext?.()?.classification === "rateLimitExceeded");
       for (let i = 0; i < 10; i++) await tick();
       t.mock.timers.tick(100);
       await assert.rejects(running, (error: unknown) => {
