@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { ProviderPolicyRefusal, admitPolicyTurn } from "../src/provider-policy-refusal.js";
 import type { Executor, RunContext } from "../src/executor.js";
 import { nullLogger } from "./helpers.js";
+import { codexRig, type CodexRig } from "./runner-codex-sinks-fixture.js";
 import { installHarness, api, client, homeDir, git, TOKEN, gitlabClaim, fakeGitlab, runner, runnerWith, worktreeDirFor, fx } from "./runner-harness.js";
 
 installHarness();
@@ -409,6 +410,16 @@ type PolicyHoldBoundaries = {
   waitRecoveryRetry: RunRunner["waitRecoveryRetry"];
 };
 
+function assertAdmittedCapture(rig: CodexRig): void {
+  assert.ok(rig.boundaries.includes("shutdown"), "capture entered the real authenticated boundary");
+  assert.ok(rig.refreshCalls() > 0, "the boundary reconciled through the fixture credential client");
+  assert.ok(rig.processSpawns() > 0, "capture spawned real permit-held Git processes");
+  assert.ok(rig.reaps() > 0, "the facade reaped its registered provider root");
+  assert.deepEqual(rig.disposeBoundaries, ["terminal"], "execute awaited terminal facade cleanup");
+  assert.equal(rig.registry.state(), "disposed");
+  assert.ok(rig.disposes() > 0, "the registered provider root was disposed");
+}
+
 const m1Cases = [
   { name: "verified published guarded capture", published: true },
   { name: "verified local-only guarded capture" },
@@ -464,7 +475,10 @@ for (const variant of m1Cases) {
     const boundary = (name: string) => { flags(); trace.push(name); };
     const localHead = () => execFileSync("git", ["-C", clonePath, "rev-parse", "HEAD"],
       { encoding: "utf8" }).trim();
+    const rig = codexRig();
     const executor: Executor = {
+      safety: rig.safety,
+      withCredentialFreeCapture: rig.capture,
       async run(ctx) {
         calls++;
         clonePath = ctx.worktreePath;
@@ -514,6 +528,8 @@ for (const variant of m1Cases) {
     });
     const capture = observed.captureHoldContext.bind(subject);
     t.mock.method(observed, "captureHoldContext", async (...args: Parameters<typeof capture>) => {
+      // The facade re-enters capture with its held proof; observe the outer request once.
+      if (args[3]?.heldAuthenticated || args[3]?.heldCapture) return capture(...args);
       boundary("capture");
       assert.ok(args[0] === claim, "capture uses the exact claim");
       assert.ok(args[1] === flight, "capture uses the exact flight");
@@ -648,6 +664,13 @@ for (const variant of m1Cases) {
     const shouldSettle = !options.noHead && !options.blocked && !unresolved &&
       !options.unguarded && !options.disposition;
     assert.equal(calls, 1, "no executor retry");
+    if (!options.noHead && !options.blocked) assertAdmittedCapture(rig);
+    else {
+      assert.deepEqual(rig.boundaries, [], "negative capture never requests admission");
+      assert.equal(rig.processSpawns(), 0);
+      assert.deepEqual(rig.disposeBoundaries, ["terminal"]);
+      assert.equal(rig.registry.state(), "disposed");
+    }
     assert.equal(settlements, shouldSettle ? 1 : 0);
     if (shouldSettle) {
       assert.ok(settlementArgs, "settlement arguments were observed");
@@ -744,19 +767,24 @@ for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
         try { return await work(); }
         catch (error) { callbackError ??= error; flight?.steering.markCancelled(); throw error; }
       };
-      const executor: Executor = { async run(ctx) {
-        await checked(async () => {
-          calls++;
-          clonePath = ctx.worktreePath;
-          ctx.onSessionId?.(sessionId);
-          fs.writeFileSync(path.join(clonePath, "m1-cancel-work.txt"), bytes);
-          const result = await outbox.journalFinalize(claim.run_id, 2);
-          assert.equal(result.written, true);
-          finalizeBytes = fs.readFileSync(finalizePath);
-        });
-        // The refusal itself must reach execute's actual catch, not checked's fixture-error arm.
-        throw refusal(tag);
-      } };
+      const rig = codexRig();
+      const executor: Executor = {
+        safety: rig.safety,
+        withCredentialFreeCapture: rig.capture,
+        async run(ctx) {
+          await checked(async () => {
+            calls++;
+            clonePath = ctx.worktreePath;
+            ctx.onSessionId?.(sessionId);
+            fs.writeFileSync(path.join(clonePath, "m1-cancel-work.txt"), bytes);
+            const result = await outbox.journalFinalize(claim.run_id, 2);
+            assert.equal(result.written, true);
+            finalizeBytes = fs.readFileSync(finalizePath);
+          });
+          // The refusal itself must reach execute's actual catch, not checked's fixture-error arm.
+          throw refusal(tag);
+        },
+      };
       const subject = runnerWith(() => ({ executor, homeDir }), forge.gitlab, TOKEN,
         nullLogger(), { outbox });
       const observed = subject as unknown as PolicyHoldBoundaries;
@@ -767,6 +795,7 @@ for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
       });
       const capture = observed.captureHoldContext.bind(subject);
       t.mock.method(observed, "captureHoldContext", (...args: Parameters<typeof capture>) => checked(async () => {
+        if (args[3]?.heldAuthenticated || args[3]?.heldCapture) return capture(...args);
         const result = await capture(...args);
         captures++;
         capturedHead = result.head;
@@ -897,6 +926,7 @@ for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
         await execution;
         assert.ifError(callbackError);
         assert.equal(calls, 1, "Cancel never retries provider/root execution");
+        assertAdmittedCapture(rig);
         assert.equal(captures, 1);
         assert.equal(arrivals, 1);
         assert.equal(journalCalls, beforeJournal ? (stage === "capture complete" ? 0 : 1) : 1);
@@ -968,23 +998,87 @@ test("root refusal journals a flat hold and parks without terminal failure or MR
     return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-3068" } };
   };
   let calls = 0;
-  const executor: Executor = { async run(ctx: RunContext) {
-    calls++;
-    assert.equal(ctx.policyHoldSupported, true);
-    throw new ProviderPolicyRefusal({ ...admitPolicyTurn("implement"), event: "provider_policy_refusal",
-      provider: "codex", category: "policy_refusal", origin: "root", policy_tag: "cyberPolicy" });
-  } };
+  const rig = codexRig();
+  const executor: Executor = {
+    safety: rig.safety,
+    withCredentialFreeCapture: rig.capture,
+    async run(ctx: RunContext) {
+      calls++;
+      assert.equal(ctx.policyHoldSupported, true);
+      throw new ProviderPolicyRefusal({ ...admitPolicyTurn("implement"), event: "provider_policy_refusal",
+        provider: "codex", category: "policy_refusal", origin: "root", policy_tag: "cyberPolicy" });
+    },
+  };
   const forge = fakeGitlab();
   await runner(executor, forge.gitlab, undefined, { outbox }).execute(claim);
   assert.equal(calls, 1);
   assert.equal(api.policyHoldRequests.length, 1);
   assert.equal(api.policyHoldRequests[0]!.body.detail, "refused");
+  assertAdmittedCapture(rig);
   assert.equal(api.policyHoldRequests[0]!.body.tag, "cyberPolicy");
   assert.equal(forge.calls.length, 0);
   assert.equal(api.states.some(s => s.body.status === "failed" || s.body.status === "completed"), false);
   assert.match(String(api.policyHoldRequests[0]!.body.head), /^[0-9a-f]{40}$/);
   assert.equal(api.policyHoldRequests[0]!.body.published, true);
   assert.equal(outbox.listPendingPolicies(claim.run_id)[0]?.server_settled, true);
+});
+
+test("missing Codex safety retains an empty-head pending hold without capture or publication", async (t) => {
+  const { outbox, claim } = await setup();
+  claim.inventory_guarded = true;
+  api.policyHoldDisposition = "pending";
+  const forge = fakeGitlab();
+  let calls = 0, sourceReads = 0, authCalls = 0, publications = 0, retries = 0;
+  let clonePath = "";
+  const bytes = Buffer.from("missing safety retains the only source\n");
+  const homeMarker = path.join(homeDir, "missing-safety-home");
+  fs.writeFileSync(homeMarker, bytes);
+  for (const name of ["worktreeStatus", "commitWipMarker", "worktreeHead",
+    "verifyRunnerTrackingCovers", "trackingTip"] as const) {
+    const original = git[name].bind(git);
+    t.mock.method(git, name, async (...args: any[]) => {
+      if (calls) sourceReads++;
+      return Reflect.apply(original, git, args);
+    });
+  }
+  for (const name of ["refreshCodex", "releaseCodex"] as const) {
+    t.mock.method(client, name, async () => { authCalls++; throw new Error("unexpected credential reconcile"); });
+  }
+  t.mock.method(client, "publishCheckpoint", async () => {
+    publications++;
+    throw new Error("unexpected checkpoint publication");
+  });
+  const executor: Executor = { async run(ctx) {
+    calls++;
+    clonePath = ctx.worktreePath;
+    fs.writeFileSync(path.join(clonePath, "missing-safety-work.txt"), bytes);
+    throw refusal();
+  } };
+  const subject = runnerWith(() => ({ executor, homeDir }), forge.gitlab, TOKEN,
+    nullLogger(), { outbox });
+  // Production bounds capture/delivery attempts; remove retry delay without retrying the model.
+  t.mock.method(subject as unknown as PolicyHoldBoundaries, "waitRecoveryRetry", async () => { retries++; });
+  await subject.execute(claim);
+  assert.equal(calls, 1, "missing safety never retries the model");
+  assert.equal(sourceReads, 0, "no Git capture begins without a held scope");
+  assert.equal(authCalls, 0, "missing safety never authenticates");
+  assert.equal(publications, 0);
+  assert.equal(forge.calls.length, 0);
+  assert.equal(retries, 1, "refused capture admission stops immediately; only pending delivery retries");
+  assert.equal(api.policyHoldRequests.length, 2);
+  const pending = outbox.listPendingPolicies(claim.run_id);
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0]!.outcome.head, "");
+  assert.equal(pending[0]!.outcome.published, false);
+  assert.equal(pending[0]!.server_settled === true, false);
+  for (const request of api.policyHoldRequests) {
+    assert.equal(request.body.head, "");
+    assert.equal(request.body.published, false);
+    assert.equal(request.body.outcome_id, pending[0]!.outcome.outcome_id);
+  }
+  assert.deepEqual(fs.readFileSync(homeMarker), bytes);
+  assert.deepEqual(fs.readFileSync(path.join(clonePath, "missing-safety-work.txt")), bytes);
+  assert.equal(api.states.some(s => s.body.status === "failed" || s.body.status === "completed"), false);
 });
 
 const transportedGate = { revision: "7", presentation_id: "12345678-1234-5678-9abc-123456789abc",
