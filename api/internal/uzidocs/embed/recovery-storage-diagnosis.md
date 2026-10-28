@@ -13,8 +13,9 @@ held work is quota-related. See [Recovering unpublished work](./run-recovery.md)
 for owner actions and [Admin health](./admin-health.md#recovery-storage)
 for the current-state warning.
 
-A persisted-refusal Warn also opts into the separate admin-only
-[attention banner](./admin-health.md#attention-banner). Its per-check **Dismiss**
+An owner-scoped `recovery.storage` Warn opts into the separate admin-only
+[attention banner](./admin-health.md#attention-banner), based on its final
+severity rather than the warning source. Its per-check **Dismiss**
 is local presentation state, not a retry, quota change or custody release;
 Health evidence remains visible. A successful document explicitly reporting
 `ok`, `unknown`, `danger` or `na` for that check ID clears dismissal; missing
