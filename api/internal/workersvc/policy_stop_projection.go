@@ -2,7 +2,10 @@ package workersvc
 
 import (
 	"context"
+	"fmt"
 	"strconv"
+
+	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -34,6 +37,40 @@ func (s *Service) policyStopEvidenceLocked(ctx context.Context, reader any, w st
 		return nil, stopReviewConflict("policy_stop_execution_not_negotiated")
 	}
 	return evidence, nil
+}
+
+// validatePolicyStopStateRequest runs before store access in setStateWithTx.
+func validatePolicyStopStateRequest(req StateRequest) error {
+	if req.PolicyStopResolutionID == nil {
+		return nil
+	}
+	id, err := uuid.Parse(*req.PolicyStopResolutionID)
+	if err != nil || id == uuid.Nil || id.String() != *req.PolicyStopResolutionID {
+		return fmt.Errorf("%w: policy_stop_resolution_id must be a canonical nonzero UUID", ErrInvalidState)
+	}
+	return nil
+}
+
+// policyStopStateRequestLocked binds the scalar to checked evidence under the
+// existing parent lock. The scalar supplies neither worker nor claim generation.
+func (s *Service) policyStopStateRequestLocked(ctx context.Context, reader any, w store.Worker, r store.Run, req StateRequest) error {
+	if req.ClaimGeneration == nil {
+		return stopReviewConflict("policy_stop_execution_unverifiable")
+	}
+	evidence, err := s.policyStopEvidenceLocked(ctx, reader, w, r, *req.ClaimGeneration, s.policyRevisionProjectionNegotiated(w))
+	if err != nil {
+		return err
+	}
+	if evidence == nil {
+		if req.PolicyStopResolutionID == nil {
+			return nil
+		}
+		return stopReviewConflict("policy_stop_execution_unverifiable")
+	}
+	if req.PolicyStopResolutionID == nil || *req.PolicyStopResolutionID != evidence.record.ResolutionID.String() {
+		return stopReviewConflict("policy_stop_execution_unverifiable")
+	}
+	return nil
 }
 
 // policyStopProjectionLocked issues authority only for an executing status after

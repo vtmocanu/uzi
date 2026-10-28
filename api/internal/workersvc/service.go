@@ -3971,6 +3971,8 @@ type StateRequest struct {
 	// (PRD #1392 M1): the forge_unreachable park transaction requires it to equal the locked
 	// run's claim_generation and answers 409 stale_claim on a mismatch (#1247's precedence).
 	ClaimGeneration *int64 `json:"claim_generation"`
+	// PolicyStopResolutionID echoes the current claim's accepted Stop identity.
+	PolicyStopResolutionID *string `json:"policy_stop_resolution_id,omitempty"`
 	// MessagesThroughSeq is the terminal fence (PRD #1391 Run B M3c, D3): the highest message
 	// seq the worker asserts it has durably delivered to the api at the moment it reports a
 	// TERMINAL transition (completed/failed). When present, SetState refuses the terminal write
@@ -4349,6 +4351,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 
 // setStateWithTx receives the actual parent transaction only from the claim-locked facade.
 func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation, policyRevisionOut *policyRevisionStateProjection, parentTx pgx.Tx) (run store.Run, applied bool, err error) {
+	if err := validatePolicyStopStateRequest(req); err != nil {
+		return store.Run{}, false, err
+	}
 	if err := validateRevisionRetry(req); err != nil {
 		return store.Run{}, false, err
 	}
@@ -4407,6 +4412,11 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	owned, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return store.Run{}, false, err
+	}
+	// A supplied identity cannot create Stop authority on an ordinary owned row.
+	// Historical publication replays above retain their existing no-authority result.
+	if req.PolicyStopResolutionID != nil && len(owned.PolicyStopResolution) == 0 {
+		return owned, false, stopReviewConflict("policy_stop_execution_unverifiable")
 	}
 	if err := validateCappedReportOnly(owned, req); err != nil {
 		return owned, false, err
@@ -4758,7 +4768,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		if fenceTx == nil || req.ClaimGeneration == nil {
 			return owned, false, stopReviewConflict("policy_stop_execution_unverifiable")
 		}
-		if _, err := s.policyStopEvidenceLocked(ctx, q, wkr, owned, *req.ClaimGeneration, s.policyRevisionProjectionNegotiated(wkr)); err != nil {
+		if err := s.policyStopStateRequestLocked(ctx, q, wkr, owned, req); err != nil {
 			return owned, false, err
 		}
 	}

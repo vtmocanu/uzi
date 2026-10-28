@@ -49,6 +49,7 @@ type stateRequestMinusGateRevision struct {
 	CompletionFinalHead        *string                            `json:"completion_final_head,omitempty"`
 	State                      string                             `json:"status"`
 	ClaimGeneration            *int64                             `json:"claim_generation"`
+	PolicyStopResolutionID     *string                            `json:"policy_stop_resolution_id,omitempty"`
 	MessagesThroughSeq         *int64                             `json:"messages_through_seq"`
 	CandidateDigest            string                             `json:"candidate_digest,omitempty"`
 	PlanCrossCheckGateReason   *string                            `json:"plan_cross_check_gate_reason"`

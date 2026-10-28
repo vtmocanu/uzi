@@ -87,6 +87,10 @@ func captureLeadReconciliation(ctx context.Context, q reconciliationReader, work
 // SetStateReportWithReconciliation exposes proof only after the state transaction commits.
 func (s *Service) SetStateReportWithReconciliation(ctx context.Context, worker store.Worker, runID uuid.UUID, req StateRequest) (StateReportResult, error) {
 	var result StateReportResult
+	// Syntax is checked before either historical publication replay can return.
+	if err := validatePolicyStopStateRequest(req); err != nil {
+		return result, err
+	}
 	if err := validateReportOnlyShape(req); err != nil {
 		return result, err
 	}

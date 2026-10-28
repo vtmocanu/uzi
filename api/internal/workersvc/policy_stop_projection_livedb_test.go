@@ -19,10 +19,8 @@ import (
 // These service calls supply authenticated identities, not HTTP authentication.
 // Immutable receipt corruption is exercised by unit input seams; database tests
 // retain the trigger that prevents overwriting an accepted receipt.
-// PRE-K server carrier proof: StateRequest has no R field yet, so the running
-// request omits R. Observed missing-R admission remains a mandatory open K SQL
-// gap, not independent SQL authorization or a successful missing-R contract.
-// When K lands, upgrade this test with valid-R positives and missing-R denial.
+// Scalar checks below exercise the Go service preflight only. Independent SQL K
+// authorization remains required; this is not SQL completion or seam readiness.
 func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 	for _, mode := range []string{"gated", "no_gate", "ordinary_question", "completion_question", "switch_off", "claim_commit_failure", "ack_commit_failure", "ack_switch_off", "terminal"} {
 		t.Run(mode, func(t *testing.T) {
@@ -141,6 +139,7 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 			if err != nil || claim == nil || claim.PolicyStopExecution == nil {
 				t.Fatalf("real reclaim: %v", err)
 			}
+			resolutionID := claim.PolicyStopExecution.ResolutionID
 			current := mustRun(t, e, created.ID)
 			generation = current.ClaimGeneration
 			if generation <= 1 || claim.PolicyStopExecution.ResolutionID != record.ResolutionID.String() ||
@@ -216,10 +215,32 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 					}
 				}
 			}
+			// Each refusal compares the full run/input/check snapshot, including
+			// status, clocks and accounting excluded from the transition snapshot.
+			refuseScalar := func(state string, resolution *string) {
+				t.Helper()
+				before := policyOwnerStopSnapshot(t, e, created.ID)
+				ack, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{
+					State: state, ClaimGeneration: &generation, PolicyStopResolutionID: resolution,
+				})
+				requirePolicyOwnerStopConflict(t, err, "policy_stop_execution_unverifiable")
+				if ack.Applied || ack.PolicyStopExecution != nil {
+					t.Fatal("scalar refusal issued authority")
+				}
+				if before != policyOwnerStopSnapshot(t, e, created.ID) {
+					t.Fatal("scalar refusal changed full run/input/check snapshot")
+				}
+			}
+			if mode == "gated" || mode == "no_gate" {
+				for _, state := range []string{"running", "awaiting_approval", "awaiting_input"} {
+					refuseScalar(state, nil)
+					refuseScalar(state, strPtr(uuid.NewString()))
+				}
+			}
 			if mode == "ordinary_question" || mode == "completion_question" {
 				qid := "stop-resume-question"
 				park, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{
-					State: "awaiting_input", ClaimGeneration: &generation, OpenQuestionID: &qid,
+					State: "awaiting_input", ClaimGeneration: &generation, PolicyStopResolutionID: &resolutionID, OpenQuestionID: &qid,
 					CompletionQuestion: mode == "completion_question",
 				})
 				if err != nil || !park.Applied || park.PolicyStopExecution != nil {
@@ -233,8 +254,8 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 				assertPreserved()
 				refuseRunning := func(stage string) {
 					t.Helper()
-					ack, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{State: "running", ClaimGeneration: &generation})
-					// Baseline may reject preflight; either refusal must omit authority.
+					ack, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{State: "running", ClaimGeneration: &generation, PolicyStopResolutionID: &resolutionID})
+					// An unanswered question must not issue authority.
 					if ack.Applied || ack.PolicyStopExecution != nil {
 						t.Fatalf("%s running bypassed answer guard: %+v %v", stage, ack, err)
 					}
@@ -257,7 +278,7 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 					t.Fatalf("answer APPLIED: %+v %v", receipt, err)
 				}
 				assertPreserved()
-				resume, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{State: "running", ClaimGeneration: &generation})
+				resume, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{State: "running", ClaimGeneration: &generation, PolicyStopResolutionID: &resolutionID})
 				if err != nil || !resume.Applied || resume.PolicyStopExecution == nil || *resume.PolicyStopExecution != *claim.PolicyStopExecution {
 					t.Fatalf("answered resume refused or lost current-generation authority: %+v %v", resume, err)
 				}
@@ -278,7 +299,7 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 			if mode == "terminal" {
 				state = "failed"
 			}
-			ack, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{State: state, ClaimGeneration: &generation})
+			ack, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{State: state, ClaimGeneration: &generation, PolicyStopResolutionID: &resolutionID})
 			if mode == "terminal" {
 				if err != nil || !ack.Applied || ack.PolicyStopExecution != nil {
 					t.Fatalf("terminal ACK: %+v %v", ack, err)

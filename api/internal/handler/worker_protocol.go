@@ -1386,13 +1386,18 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req workersvc.StateRequest
-	if err := httpx.DecodeJSON(r, &req); err != nil {
+	if err := httpx.DecodeJSONStrict(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	result, err := h.wsvc.SetStateReportWithReconciliation(r.Context(), wkr, runID, req)
 	run, applied, gateRevision := result.Run, result.Applied, result.GateRevision
 	if err != nil {
+		var stopConflict *workersvc.PolicyStopReviewConflict
+		if errors.As(err, &stopConflict) {
+			httpx.ErrorReason(w, http.StatusConflict, "policy Stop authority unavailable", stopConflict.Reason)
+			return
+		}
 		// PRD #1795 M1: a refused awaiting_approval report (historical presentation id, changed
 		// payload under the current id, stale adoption) published nothing. 409 with the same
 		// {run, reason} shape as the forge-park refusals; the worker parks through transient
