@@ -40,9 +40,11 @@ export function ownerFixture() {
     });
     return cache;
   }
+  let ownershipProofs = 0;
+  const proveOwnership = async () => { ownershipProofs++; };
   const reserve = (generation = 1, grant: number | undefined = 0, episode = 7, cache = recreate()) =>
-    cache.reserveRecoveryIteration(bare, branch, key, read(), 1000, generation, episode, grant);
-  return { bare, branch, key, source, journalKey, ownerKey, values, read, recreate, reserve,
+    cache.reserveRecoveryIteration(bare, branch, key, read(), 1000, generation, episode, grant, proveOwnership);
+  return { bare, branch, key, source, journalKey, ownerKey, values, read, recreate, reserve, proveOwnership, ownershipProofs: () => ownershipProofs,
     write: (j: RecoveryJournalEntry) => values.set(journalKey, [JSON.stringify(j)]),
     fault: (f?: typeof fault) => { fault = f; },
     block: async (cache = recreate()) => {

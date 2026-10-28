@@ -1473,10 +1473,21 @@ reservation and handoff operations are in [git.ts](../agent/src/git.ts).
 Under the bare-repository lock, charging writes and reads back a **pending**
 owner record that burns the grant, writes and reads back the journal reservation,
 then writes and reads back a **committed** owner record before returning authority.
-A crash before the journal write consumes conservatively and refuses work. A
-pending record whose exact after-reservation landed can settle accounting and
-persist an abandoned blocker, but cannot execute that interrupted charge or use
-its old generation as authority. Uncertain writes stop with sources retained.
+A crash before the journal write consumes the grant conservatively. A pending
+record whose exact after-reservation landed settles accounting only, leaves the
+journal unchanged and stops that invocation without manufacturing an adoption
+failure. Neither case authorizes execution under the interrupted charge.
+
+When the exact before-journal remains, a later owned claim with a generation
+strictly newer than the interrupted charge can fund a new reservation. A blocked
+`adoption_failed` journal additionally requires a raw owner grant above the
+consumed high-water mark; a burned grant is never replayed. First charges,
+nonblocked recovery and `budget_exhausted` renewals retain their existing budget
+and episode guards, without requiring an extra owner grant. The replacement
+uses the same pending, precharge and committed readback sequence. A claim that
+cannot replace the pending charge stops or reholds an already-persisted blocker;
+it does not relabel an accounting interruption as an integrity refusal.
+Uncertain writes stop with sources retained.
 
 The baseline is established on an eligible nonblocked charge before adoption
 failure; a missing baseline on an already-blocked journal is not reconstructed
@@ -1505,8 +1516,11 @@ parser, progress and inventory reader can accept these journals; the older
 worker still refuses `adoption_failed` terminally with sources and custody kept.
 The compatibility fixture is
 [recovery-owner-rollback.test.ts](../agent/test/recovery-owner-rollback.test.ts);
-it exercises the actual predecessor implementations from an isolated export,
-including old blocked-adoption refusal and unchanged budget renewal.
+it was executed against the actual predecessor implementations from an isolated
+export, including old blocked-adoption refusal and unchanged budget renewal.
+This is an explicit local compatibility proof: the fixture requires
+`UZI_M2_OLD_EXPORT` pointing at that export and skips when it is absent. Ordinary
+CI invocations do not repeat this predecessor proof automatically.
 
 The additive cause migration replaces a CHECK in a transaction, with table-scan
 and locking risk; there is no online migration component. Its Down converts

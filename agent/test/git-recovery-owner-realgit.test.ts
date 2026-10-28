@@ -102,3 +102,33 @@ test("real Git completion preserves consumed grant and current inventory ignores
   await cache.discardRetainedRecovery(bare, branch, key, expected, true);
   assert.equal(JSON.parse(command(bare, "config", `uzi-recoveryowner.${source.runId}.record`)).consumed, 1);
 });
+
+for (const side of ["before", "after"] as const) {
+  test(`real Git pending ${side.toUpperCase()} interrupts accounting without losing retained clones`, async t => {
+    const f = await setup(t);
+    const { cache, bare, branch, key, source, charged } = f;
+    await cache.blockRecoveryEpisode(bare, branch, key, source, "adoption_failed", charged);
+    fs.writeFileSync(path.join(source.clonePath, "pending-work.txt"), "retained pending bytes\n");
+    const seam = cache as any;
+    const run = seam.runGit.bind(cache);
+    t.mock.method(seam, "runGit", async (cwd: string, args: string[], ...rest: any[]) => {
+      const journalWrite = args.at(-2) === `uzi-recovery.${branch}.clone`;
+      if (journalWrite && side === "before") throw new Error("interrupted reservation");
+      const result = await run(cwd, args, ...rest);
+      if (journalWrite && side === "after") throw new Error("interrupted reservation");
+      return result;
+    });
+    await assert.rejects(cache.reserveRecoveryIteration(bare, branch, key, source, 1, 3, 9, 2), /interrupted/);
+    t.mock.restoreAll();
+    const raw = command(bare, "config", `uzi-recovery.${branch}.clone`);
+    await assert.rejects(cache.reserveRecoveryIteration(bare, branch, key, source, 1, 3, 9, 2), /pending/);
+    assert.equal(command(bare, "config", `uzi-recovery.${branch}.clone`), raw);
+    let ownership = 0;
+    const next = await cache.reserveRecoveryIteration(bare, branch, key, source, 1, 4, 9, side === "before" ? 3 : 2,
+      async () => { ownership++; });
+    assert.equal(ownership, side === "before" ? 1 : 0);
+    assert.equal(next.claimGeneration, 4);
+    assert.equal(next.attempts, side === "before" ? 1 : 2);
+    assert.equal(fs.readFileSync(path.join(source.clonePath, "pending-work.txt"), "utf8"), "retained pending bytes\n");
+  });
+}

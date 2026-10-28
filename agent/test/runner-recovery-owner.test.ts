@@ -133,3 +133,57 @@ test("confirmed earlier blocker takes precedence over attempted adoption-failure
   assert.equal(h.counts().sends, 0);
   assert.equal(h.counts().terminal, 1);
 });
+
+for (const side of ["before", "after"] as const) {
+  test(`runner pending ${side.toUpperCase()} preserves journal without false failure`, async () => {
+    const h = await fixture();
+    h.f.fault((args, phase) => {
+      if (args.at(-2) === h.f.journalKey && phase === side) throw new Error("interrupted charge");
+    });
+    await assert.rejects(h.f.reserve(2, 1, 8), /interrupted/);
+    h.f.fault();
+    h.claim.worker_recovery_owner_episode = 1;
+    const raw = h.f.values.get(h.f.journalKey)![0];
+    await assert.rejects(h.run());
+    assert.equal(h.f.values.get(h.f.journalKey)![0], raw);
+    assert.equal(h.counts().terminal, 0);
+    assert.equal(h.counts().captures, 0);
+    assert.equal(h.counts().models, 0);
+    assert.equal(h.counts().sends, side === "before" ? 1 : 0);
+    assert.equal(h.counts().proofs, side === "before" ? 1 : 0);
+  });
+}
+
+for (const ownership of [undefined, "stale", "unknown"] as const) {
+  test(`runner pending BEFORE first charge checks ${ownership ?? "current"} ownership inside reservation`, async () => {
+    const h = await fixture({ ownership });
+    h.f.values.delete(h.f.ownerKey);
+    h.f.write(h.f.source);
+    h.f.fault((args, phase) => {
+      if (args.at(-2) === h.f.journalKey && phase === "before") throw new Error("interrupted first");
+    });
+    await assert.rejects(h.f.reserve(1, 0, 7), /interrupted/);
+    h.f.fault();
+    h.claim.worker_recovery_episode = 7;
+    const before = h.f.read();
+    const reserve = h.runner.git.reserveRecoveryIteration.bind(h.runner.git);
+    let admitted = false;
+    h.runner.git.reserveRecoveryIteration = async (...args: Parameters<typeof reserve>) => {
+      const charged = await reserve(...args);
+      admitted = true;
+      assert.equal(charged.claimGeneration, 2);
+      assert.equal(JSON.parse(h.f.values.get(h.f.ownerKey)![0]!).state, "committed");
+      // Stop at the reservation boundary; capture/model are outside this test's seam.
+      throw new Error("charged boundary reached");
+    };
+    await assert.rejects(h.run());
+    assert.ok(h.counts().ownership > 0);
+    assert.equal(admitted, ownership === undefined);
+    assert.equal(h.counts().captures, 0);
+    assert.equal(h.counts().models, 0);
+    if (ownership === "stale") {
+      assert.deepEqual(h.f.read(), before);
+      assert.equal(h.counts().terminal, 0);
+    }
+  });
+}

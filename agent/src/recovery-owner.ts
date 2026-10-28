@@ -69,3 +69,16 @@ export function ownerJournalMatches(record: RecoveryOwnerRecord, journal: Recove
       (!!record.successor && sameRecoverySource(journal, record.successor) &&
        !!p.successor && JSON.stringify(p.successor) === JSON.stringify(record.successor)));
 }
+
+/** The journal still names the exact reservation preceding an interrupted charge. */
+export function ownerJournalBeforeMatches(record: RecoveryOwnerRecord, journal: RecoverySource & { recovery?: RecoveryProgress }): boolean {
+  if (!sameRecoverySource(journal, record.root)) return false;
+  const p = journal.recovery;
+  if (record.before === null) return !p && sameRecoverySource(journal, record.source);
+  return !!p && JSON.stringify(p.source) === JSON.stringify(record.source) &&
+    sameOwnerReservation(record.before, ownerReservation(p));
+}
+
+export class RecoveryChargeInterruptedError extends Error {
+  constructor() { super("recovery owner pending charge; work refused"); }
+}

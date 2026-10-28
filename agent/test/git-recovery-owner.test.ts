@@ -78,22 +78,26 @@ for (const point of ["pending-write-before", "pending-write-after", "pending-rea
       return;
     }
     assert.equal(record.consumed, 1);
-    if (record.state === "pending") await assert.rejects(f.reserve(2, 1, 8), /pending/);
-    else await f.block();
-    await assert.rejects(f.reserve(3, 1, 9));
-    if (["pending-write-after", "pending-read", "pending-read-after", "journal-write-before"].includes(point)) {
-      await assert.rejects(f.reserve(3, 2, 9), /pending/);
-      assert.equal(f.read().recovery?.claimGeneration, 1);
-    } else {
-      const renewed = await f.reserve(3, 2, 9);
-      assert.equal(renewed.claimGeneration, 3);
-      assert.equal(renewed.attempts, 1);
-      const landed = JSON.parse(f.values.get(f.ownerKey)![0]!);
-      assert.equal(landed.state, "committed");
-      assert.equal(landed.consumed, 2);
-      assert.equal(landed.after.claimGeneration, 3);
-      assert.equal(landed.after.attempts, 1);
+    const before = f.read();
+    const isBefore = ["pending-write-after", "pending-read", "pending-read-after", "journal-write-before"].includes(point);
+    if (record.state === "pending") {
+      await assert.rejects(f.reserve(2, 1, 8), /pending/);
+      assert.deepEqual(f.read(), before, "settlement changes accounting only");
     }
+    if (isBefore) {
+      await assert.rejects(f.reserve(2, 2, 9), /pending/);
+      await assert.rejects(f.reserve(3, 1, 9), /blocked/);
+      assert.equal(await f.recreate().canRenewRecoveryAdoption(f.bare, f.branch, f.key, before, 3, 2), true);
+    }
+    const renewed = await f.reserve(3, isBefore ? 2 : 1, 9);
+    assert.equal(renewed.claimGeneration, 3);
+    assert.equal(renewed.attempts, 1);
+    const landed = JSON.parse(f.values.get(f.ownerKey)![0]!);
+    assert.equal(landed.state, "committed");
+    assert.equal(landed.consumed, isBefore ? 2 : 1);
+    assert.equal(landed.after.claimGeneration, 3);
+    await f.block();
+    await assert.rejects(f.reserve(4, landed.consumed, 10), /blocked/);
   });
 }
 
@@ -163,4 +167,154 @@ test("owner fixture works without a TMPDIR override", () => {
     if (previous === undefined) delete process.env.TMPDIR;
     else process.env.TMPDIR = previous;
   }
+});
+
+async function interrupted(kind: "first" | "budget" | "adoption", side: "before" | "after") {
+  const f = ownerFixture();
+  if (kind !== "first") {
+    await f.reserve();
+    if (kind === "budget") {
+      await f.reserve(); await f.reserve();
+      await assert.rejects(f.reserve(), /budget/);
+    } else await f.block();
+  }
+  const original = f.read();
+  f.fault((args, phase) => {
+    if (args.at(-2) === f.journalKey && phase === side) throw new Error("interrupted journal");
+  });
+  await assert.rejects(f.reserve(2, 1, 8), /interrupted/);
+  f.fault();
+  return { f, original };
+}
+
+for (const kind of ["first", "budget", "adoption"] as const) {
+  test(`pending AFTER ${kind} settles accounting without inventing a blocker`, async () => {
+    const { f } = await interrupted(kind, "after");
+    const raw = f.values.get(f.journalKey)![0];
+    const owner = JSON.parse(f.values.get(f.ownerKey)![0]!);
+    await assert.rejects(f.reserve(3, 1, 8), { name: "Error", message: /pending/ });
+    assert.equal(f.values.get(f.journalKey)![0], raw);
+    assert.deepEqual(JSON.parse(f.values.get(f.ownerKey)![0]!), { ...owner, state: "committed" });
+    const charged = await f.reserve(3, 1, 8);
+    assert.equal(charged.attempts, 2);
+    assert.equal(charged.claimGeneration, 3);
+    assert.equal(JSON.parse(f.values.get(f.ownerKey)![0]!).consumed, 1);
+    await f.block();
+    await assert.rejects(f.reserve(4, 1, 99), /blocked/);
+  });
+
+  test(`pending BEFORE ${kind} requires fresh generation and current ownership for a new charge`, async () => {
+    const { f, original } = await interrupted(kind, "before");
+    const pending = f.values.get(f.ownerKey)![0];
+    await assert.rejects(f.reserve(2, 2, 99), /pending/);
+    await assert.rejects(f.recreate().reserveRecoveryIteration(f.bare, f.branch, f.key, f.read(), 1, 3, 9, 2), /pending/);
+    await assert.rejects(f.recreate().reserveRecoveryIteration(f.bare, f.branch, f.key, f.read(), 1, 3, 9, 2,
+      async () => { throw new Error("not current owner"); }), /not current owner/);
+    assert.deepEqual(f.read(), original);
+    assert.equal(f.values.get(f.ownerKey)![0], pending);
+    if (kind === "adoption") {
+      await assert.rejects(f.reserve(3, 1, 99), /blocked/);
+      assert.equal(await f.recreate().canRenewRecoveryAdoption(f.bare, f.branch, f.key, f.read(), 2, 2), false);
+    }
+    const charged = await f.reserve(3, kind === "adoption" ? 2 : 1, 9);
+    assert.equal(charged.attempts, 1);
+    assert.equal(charged.claimGeneration, 3);
+    assert.ok(f.ownershipProofs() > 0);
+    const owner = JSON.parse(f.values.get(f.ownerKey)![0]!);
+    assert.equal(owner.baseline, kind === "first" ? 1 : 0);
+    assert.equal(owner.consumed, kind === "adoption" ? 2 : 1);
+    assert.equal(owner.state, "committed");
+  });
+}
+
+for (const change of ["source", "root", "reservation", "bare", "null-with-progress", "zero-generation"] as const) {
+  test(`pending BEFORE refuses ${change} evidence`, async () => {
+    const { f } = await interrupted("adoption", "before");
+    const record = JSON.parse(f.values.get(f.ownerKey)![0]!);
+    if (change === "source") record.source.clonePath += "-other";
+    if (change === "root") record.root.clonePath += "-other";
+    if (change === "reservation") record.before.attempts++;
+    if (change === "bare") record.bare += "-other";
+    if (change === "null-with-progress") record.before = null;
+    if (change === "zero-generation") {
+      record.before.claimGeneration = 0;
+      const journal = f.read(); delete journal.recovery!.claimGeneration; f.write(journal);
+    }
+    f.values.set(f.ownerKey, [JSON.stringify(record)]);
+    const before = f.read();
+    await assert.rejects(f.reserve(3, 2, 9));
+    assert.equal(await f.recreate().canRenewRecoveryAdoption(f.bare, f.branch, f.key, before, 3, 2).catch(() => false), false);
+    assert.deepEqual(f.read(), before);
+  });
+}
+
+test("pending BEFORE snapshot only reads an existing blocker", async () => {
+  const { f, original } = await interrupted("adoption", "before");
+  assert.equal(JSON.stringify(await f.recreate().recoveryReservationSnapshot(f.bare, f.branch, f.key, original, original.recovery!)), JSON.stringify(original));
+  const journal = f.read(); journal.recovery!.stage = "capturing"; delete journal.recovery!.blocker; f.write(journal);
+  await assert.rejects(f.recreate().recoveryReservationSnapshot(f.bare, f.branch, f.key, journal, journal.recovery!));
+});
+
+for (const operation of ["replacement", "settlement"] as const) {
+  for (const point of ["pending-write-before", "pending-write-after", "pending-read", "pending-read-after",
+    "journal-write-before", "journal-write-after", "journal-read", "journal-read-after",
+    "commit-write-before", "commit-write-after", "commit-read", "commit-read-after"] as const) {
+    if (operation === "settlement" && !point.startsWith("commit")) continue;
+    test(`${operation} interruption ${point} never returns an interrupted charge`, async () => {
+      const { f } = await interrupted("adoption", operation === "replacement" ? "before" : "after");
+      const original = f.values.get(f.journalKey)![0];
+      let lastWrite = "";
+      f.fault((args, phase) => {
+        const ownerWrite = args.at(-2) === f.ownerKey;
+        const label = ownerWrite ? (JSON.parse(args.at(-1)!).state === "pending" ? "pending" : "commit") :
+          args.at(-2) === f.journalKey ? "journal" : "";
+        if (label && point === label + "-write-" + phase) throw new Error("injected " + point);
+        if (args.includes("--list") && point === lastWrite + "-read" + (phase === "after" ? "-after" : ""))
+          throw new Error("injected " + point);
+        if (label && phase === "after") lastWrite = label;
+      });
+      await assert.rejects(f.reserve(3, 2, 9), /injected/);
+      f.fault();
+      const record = JSON.parse(f.values.get(f.ownerKey)![0]!);
+      const journal = f.read();
+      if (operation === "settlement") assert.equal(f.values.get(f.journalKey)![0], original);
+      if (record.state === "pending" && (record.after.claimGeneration === 3 || operation === "settlement")) {
+        await assert.rejects(f.reserve(3, 2, 9), /pending/);
+        assert.deepEqual(f.read(), journal);
+      }
+      // A completed replacement consumes grant 2; an interrupted BEFORE requires grant 3.
+      const stillBefore = f.read().recovery?.stage === "blocked";
+      const next = await f.reserve(4, stillBefore ? 3 : record.consumed, operation === "settlement" ? 8 : 9);
+      assert.equal(next.claimGeneration, 4);
+      assert.equal(next.attempts, stillBefore ? 1 : 2);
+      const landed = JSON.parse(f.values.get(f.ownerKey)![0]!);
+      assert.equal(landed.after.claimGeneration, 4);
+      assert.equal(landed.state, "committed");
+    });
+  }
+}
+
+test("pending BEFORE ordinary legacy generation zero stays distinct from null and can charge normally", async () => {
+  const { f } = await interrupted("adoption", "before");
+  const record = JSON.parse(f.values.get(f.ownerKey)![0]!);
+  const journal = f.read();
+  record.before.claimGeneration = 0;
+  delete journal.recovery!.claimGeneration;
+  journal.recovery!.stage = "capturing"; delete journal.recovery!.blocker;
+  f.values.set(f.ownerKey, [JSON.stringify(record)]); f.write(journal);
+  const next = await f.reserve(3, 1, 7);
+  assert.equal(next.attempts, 2);
+  assert.equal(next.claimGeneration, 3);
+});
+
+test("pending BEFORE budget needs derived renewal; ordinary charge needs no raw increase", async () => {
+  const { f } = await interrupted("budget", "before");
+  const raw = f.values.get(f.journalKey)![0];
+  await assert.rejects(f.reserve(3, 2, 7), /blocked/);
+  assert.equal(f.values.get(f.journalKey)![0], raw);
+  assert.equal((await f.reserve(3, 1, 8)).attempts, 1);
+  const g = ownerFixture(); await g.reserve();
+  g.fault((args, phase) => { if (args.at(-2) === g.journalKey && phase === "before") throw new Error("interrupted"); });
+  await assert.rejects(g.reserve(2, 0, 7)); g.fault();
+  assert.equal((await g.reserve(3, 0, 7)).attempts, 2);
 });

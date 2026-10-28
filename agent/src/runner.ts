@@ -28,6 +28,7 @@ import { MaintenanceResources } from "./recovery-maintenance.js";
 import type { WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
+  RecoveryChargeInterruptedError,
   RetainedReadinessCleanupUnconfirmedError,
   formatRetainedRecoveryDiagnostic,
   annotateRetainedSuccessorError,
@@ -22022,11 +22023,13 @@ export class RunRunner {
               throw new RetainedRecoveryStop();
             }
           }
-          return this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs, flight.claimGeneration, recoveryEpisode, claim.worker_recovery_owner_episode);
+          return this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs, flight.claimGeneration, recoveryEpisode, claim.worker_recovery_owner_episode,
+            () => this.requireRetainedOwnership(flight, deadline, signal));
         });
       } catch (error) {
         this.retainedLifecycleGuard(flight);
         if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
+        if (error instanceof RecoveryChargeInterruptedError) throw new RetainedRecoveryStop({ cause: error });
         const message = errMessage(error);
         blocker = message.includes("clock") ? "clock_invalid" : message.includes("budget") || message.includes("blocked") ? "budget_exhausted" : "preservation_failed";
         flight.runLog.warn("retained recovery reservation failed", { ...formatRetainedRecoveryDiagnostic(error, flight.redactText), blocker });

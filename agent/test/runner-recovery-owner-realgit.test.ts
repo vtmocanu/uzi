@@ -155,3 +155,115 @@ test("owner Resume verifies the successor before model admission and preserves i
   assert.deepEqual(modelErrors, []);
   assert.equal(owner().consumed, 1);
 });
+
+for (const kind of ["first", "budget", "adoption"] as const) {
+  test(`runner entrypoint pending AFTER ${kind} stops without capture, model or recovery reports`, async t => {
+    const claim = gitlabClaim(3527, { claim_generation: 3, worker_recovery_episode: 8, worker_recovery_owner_episode: 1 });
+    const bare = await git.ensureClone(fx.originPath);
+    fs.chmodSync(path.dirname(bare), 0o700); fs.chmodSync(bare, 0o700);
+    const clone = await git.createOrAttachRunnerClone(bare, 3527, noProofReseed, claim.run_id);
+    const source = { runId: claim.run_id, clonePath: clone.path };
+    const key = "issue-3527";
+    await git.markRecoveryCapture(bare, clone.path, clone.branch, claim.run_id);
+    fs.writeFileSync(path.join(clone.path, "interrupted.txt"), "keep these bytes\n");
+    if (kind !== "first") {
+      const old = await git.reserveRecoveryIteration(bare, clone.branch, key, source, 1, 1, 7, 0);
+      if (kind === "budget") {
+        await git.reserveRecoveryIteration(bare, clone.branch, key, source, 1, 1, 7, 0);
+        await git.reserveRecoveryIteration(bare, clone.branch, key, source, 1, 1, 7, 0);
+        await assert.rejects(git.reserveRecoveryIteration(bare, clone.branch, key, source, 1, 1, 7, 0), /budget/);
+      } else await git.blockRecoveryEpisode(bare, clone.branch, key, source, "adoption_failed", old);
+    }
+    const seam = git as any;
+    const run = seam.runGit.bind(git);
+    const journalKey = `uzi-recovery.${clone.branch}.clone`;
+    t.mock.method(seam, "runGit", async (cwd: string, args: string[], ...rest: any[]) => {
+      const result = await run(cwd, args, ...rest);
+      if (args.at(-2) === journalKey) throw new Error("interrupted AFTER charge");
+      return result;
+    });
+    await assert.rejects(git.reserveRecoveryIteration(bare, clone.branch, key, source, 1, 2, 8, 1), /interrupted/);
+    t.mock.restoreAll();
+    const raw = command(bare, "config", journalKey);
+    const ownerKey = `uzi-recoveryowner.${claim.run_id}.record`;
+    const before = JSON.parse(command(bare, "config", ownerKey));
+    let captures = 0, models = 0;
+    const reports: unknown[] = [];
+    const capture = git.recordRecoveryCapture.bind(git);
+    t.mock.method(git, "recordRecoveryCapture", async (...args: Parameters<typeof capture>) => { captures++; return capture(...args); });
+    t.mock.method(client, "reportState", async (_runId: string, body: any) => { reports.push(body); return {}; });
+    api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation);
+    const runner = runnerWith(runId => ({ homeDir: path.join(homeDir, runId),
+      executor: { run: async () => { models++; throw new Error("must not model"); } } }),
+      fakeGitlab().gitlab, undefined, undefined, { recoveryRetryMs: 1 });
+    await runner.execute(claim);
+    assert.equal(captures, 0); assert.equal(models, 0);
+    assert.deepEqual(reports, [{ status: "running", claim_generation: 3 }], "only the entrypoint running acknowledgment precedes recovery");
+    assert.equal(command(bare, "config", journalKey), raw);
+    assert.deepEqual(JSON.parse(command(bare, "config", ownerKey)), { ...before, state: "committed" });
+    assert.equal(fs.readFileSync(path.join(clone.path, "interrupted.txt"), "utf8"), "keep these bytes\n");
+  });
+}
+
+test("runner entrypoint pending BEFORE adoption reholds consumed grant and admits a newly owned grant", async t => {
+  const claim = gitlabClaim(3527, { claim_generation: 3, worker_recovery_episode: 99, worker_recovery_owner_episode: 1 });
+  const bare = await git.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700); fs.chmodSync(bare, 0o700);
+  const clone = await git.createOrAttachRunnerClone(bare, 3527, noProofReseed, claim.run_id);
+  const source = { runId: claim.run_id, clonePath: clone.path };
+  const key = "issue-3527", journalKey = `uzi-recovery.${clone.branch}.clone`;
+  await git.markRecoveryCapture(bare, clone.path, clone.branch, claim.run_id);
+  fs.writeFileSync(path.join(clone.path, "before-work.txt"), "keep BEFORE bytes\n");
+  const old = await git.reserveRecoveryIteration(bare, clone.branch, key, source, 1, 1, 7, 0);
+  await git.blockRecoveryEpisode(bare, clone.branch, key, source, "adoption_failed", old);
+  const seam = git as any;
+  const run = seam.runGit.bind(git);
+  t.mock.method(seam, "runGit", async (cwd: string, args: string[], ...rest: any[]) => {
+    if (args.at(-2) === journalKey) throw new Error("interrupted BEFORE charge");
+    return run(cwd, args, ...rest);
+  });
+  await assert.rejects(git.reserveRecoveryIteration(bare, clone.branch, key, source, 1, 2, 8, 1), /interrupted/);
+  t.mock.restoreAll();
+  const raw = command(bare, "config", journalKey);
+  let captures = 0, models = 0, parks = 0;
+  const failures: unknown[] = [], modelErrors: unknown[] = [];
+  client.protocolFeatures = ["recovery_cause_retained_recovery_adoption_failed"];
+  const report = client.reportState.bind(client);
+  t.mock.method(client, "reportState", async (runId: Parameters<typeof report>[0], body: Parameters<typeof report>[1], signal?: AbortSignal) => {
+    if (body.status === "recovery_wait") {
+      parks++; return { status: body.status, recoveryCause: body.recovery_cause };
+    }
+    if (body.status === "failed") failures.push(body);
+    return report(runId, body, signal);
+  });
+  const capture = git.recordRecoveryCapture.bind(git);
+  t.mock.method(git, "recordRecoveryCapture", async (...args: Parameters<typeof capture>) => { captures++; return capture(...args); });
+  const execute = async () => {
+    api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation);
+    const runner = runnerWith(runId => ({ homeDir: path.join(homeDir, runId), executor: {
+      run: async (ctx: import("../src/executor.js").RunContext) => {
+        models++;
+        try {
+          const journal = JSON.parse(command(bare, "config", journalKey));
+          assert.equal(journal.recovery.claimGeneration, 4);
+          assert.equal(journal.recovery.attempts, 1);
+          assert.equal(journal.recovery.stage, "ready-for-model");
+          const owner = JSON.parse(command(bare, "config", `uzi-recoveryowner.${claim.run_id}.record`));
+          assert.equal(owner.state, "committed"); assert.equal(owner.consumed, 2);
+          assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "before-work.txt"), "utf8"), "keep BEFORE bytes\n");
+        } catch (error) { modelErrors.push(error); }
+        throw new Error("stop after model admission");
+      },
+    } }), fakeGitlab().gitlab, undefined, undefined, { recoveryRetryMs: 1 });
+    await runner.execute(claim);
+  };
+  await execute();
+  assert.equal(parks, 1); assert.equal(captures, 0); assert.equal(models, 0);
+  assert.deepEqual(failures, []);
+  assert.equal(command(bare, "config", journalKey), raw);
+  claim.claim_generation = 4; claim.worker_recovery_owner_episode = 2;
+  await execute();
+  assert.equal(models, 1); assert.ok(captures > 0);
+  assert.deepEqual(modelErrors, []);
+  assert.equal(fs.readFileSync(path.join(clone.path, "before-work.txt"), "utf8"), "keep BEFORE bytes\n");
+});

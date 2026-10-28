@@ -41,7 +41,8 @@ import {
   parseRetainedArtifactName,
 } from "./attempt-path.js";
 import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
-import { ownerGrant, ownerJournalMatches, ownerReservation, parseRecoveryOwner, sameOwnerReservation, type RecoveryOwnerRecord } from "./recovery-owner.js";
+import { ownerGrant, ownerJournalBeforeMatches, ownerJournalMatches, RecoveryChargeInterruptedError, ownerReservation, parseRecoveryOwner, sameOwnerReservation, type RecoveryOwnerRecord } from "./recovery-owner.js";
+export { RecoveryChargeInterruptedError } from "./recovery-owner.js";
 import { sanitizeForLog } from "./run-quiescence.js";
 import { RECOVERY_DECODED_LIMIT, validateRecoveryDecodedLimitBytes, RecoveryClosureLimitError, verifyClosureFrames, type ClosureBudget, type ClosureObject } from "./recovery-closure.js";
 import { REASON_WORKER_RESIDUE_BLOCKED, RetainedStoppedSourceError, RunResidueBlockedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen, residueQuarantine } from "./residue-quarantine.js";
@@ -7195,7 +7196,9 @@ export class GitCache {
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const record = await this.readRecoveryOwner(barePath, branch, key, expected.runId);
       return journal.recovery?.stage === "blocked" && journal.recovery.blocker === "adoption_failed" &&
-        !!record && record.state === "committed" && ownerJournalMatches(record, journal) &&
+        !!record && (record.state === "committed" ? ownerJournalMatches(record, journal) :
+          ownerJournalBeforeMatches(record, journal) && (claimGeneration ?? 0) > record.after.claimGeneration) &&
+        (journal.recovery.claimGeneration ?? 0) > 0 &&
         ownerGrant(grant) && grant > record.consumed && Number.isSafeInteger(claimGeneration) &&
         (claimGeneration ?? 0) > Math.max(0, journal.recovery.claimGeneration ?? 0);
     });
@@ -7213,7 +7216,11 @@ export class GitCache {
           !sameOwnerReservation(ownerReservation(journal.recovery), ownerReservation(reservation)))
         throw new Error("recovery reservation changed");
       if (record) {
-        if (record.state !== "committed" || !ownerJournalMatches(record, journal)) throw new Error("recovery owner reservation changed");
+        const committed = record.state === "committed" && ownerJournalMatches(record, journal);
+        const blockedBefore = record.state === "pending" && ownerJournalBeforeMatches(record, journal) &&
+          journal.recovery.stage === "blocked" &&
+          (journal.recovery.blocker === "adoption_failed" || journal.recovery.blocker === "budget_exhausted");
+        if (!committed && !blockedBefore) throw new Error("recovery owner reservation changed");
       } else if (!sameRecoverySource(journal, expected)) throw new Error("recovery identity changed");
       await this.checkedRecovery(barePath, branch, key, journal, true);
       return journal;
@@ -7228,7 +7235,7 @@ export class GitCache {
    * recoveryRetryMs is the existing base (1..30000ms). Returned backoff is base times
    * 2^(charged attempts - 1), capped at 16x base; caller sleeps outside lock/deadline. */
   async reserveRecoveryIteration(
-    barePath: string, branch: string, key: string, expected: RecoverySource, recoveryRetryMs = 1_000, claimGeneration?: number, episode?: number, rawOwnerGrant?: number,
+    barePath: string, branch: string, key: string, expected: RecoverySource, recoveryRetryMs = 1_000, claimGeneration?: number, episode?: number, rawOwnerGrant?: number, proveOwnership?: () => Promise<void>,
   ): Promise<RecoveryProgress> {
     if (claimGeneration !== undefined && (!Number.isSafeInteger(claimGeneration) || claimGeneration < 1)) throw new Error("invalid recovery claim fence");
     if (!Number.isSafeInteger(recoveryRetryMs) || recoveryRetryMs < 1 || recoveryRetryMs > 30_000) throw new Error("invalid recovery backoff");
@@ -7243,25 +7250,20 @@ export class GitCache {
       let owner = await this.readRecoveryOwner(barePath, branch, key, expected.runId);
       if (owner) {
         if (owner.state === "pending") {
-          // Either side of an interrupted charge burns the grant. Bookkeeping may land,
-          // but this invocation can never execute work from that interrupted charge.
           if (ownerJournalMatches(owner, journal)) {
-            // A landed reservation without a confirmed charge is abandoned. Persist
-            // its blocker before committing bookkeeping, so later claims rehold it.
-            const abandoned = { ...journal, recovery: { ...old!,
-              stage: "blocked" as const, blocker: old?.stage === "blocked" ? old.blocker
-                : Date.now() >= old!.deadline ? "budget_exhausted" as const : "adoption_failed" as const } };
-            await this.writeRecovery(barePath, branch, abandoned);
-            if (await this.readRecoveryCaptureRaw(barePath, branch) !== JSON.stringify(abandoned))
-              throw new Error("recovery pending blocker readback mismatch");
+            // Settle accounting only. The interrupted reservation never authorizes this call.
             await this.writeRecoveryOwner(barePath, { ...owner, state: "committed" });
+            throw new RecoveryChargeInterruptedError();
           }
-          throw new Error("recovery owner pending charge; work refused");
-        }
-        if (old && !ownerJournalMatches(owner, journal)) throw new Error("recovery owner reservation changed");
+          if (!ownerJournalBeforeMatches(owner, journal)) throw new Error("recovery owner reservation changed");
+          if (claimGeneration === undefined || claimGeneration <= owner.after.claimGeneration || !proveOwnership)
+            throw new RecoveryChargeInterruptedError();
+          // The old grant remains consumed. Only a separately charged reservation may run.
+          await proveOwnership();
+        } else if (old && !ownerJournalMatches(owner, journal)) throw new Error("recovery owner reservation changed");
       }
       const adoptionRenewal = old?.stage === "blocked" && old.blocker === "adoption_failed";
-      if (adoptionRenewal && (!owner || !ownerGrant(rawOwnerGrant) || rawOwnerGrant <= owner.consumed ||
+      if (adoptionRenewal && (!owner || (old.claimGeneration ?? 0) < 1 || !ownerGrant(rawOwnerGrant) || rawOwnerGrant <= owner.consumed ||
           claimGeneration === undefined || claimGeneration <= (old.claimGeneration ?? 0)))
         throw new Error("recovery episode is blocked; no new owner grant");
       const newWindow = claimGeneration !== undefined && old?.claimGeneration !== claimGeneration;
