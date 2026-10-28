@@ -35,6 +35,7 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 	// by setupChatConvo's terminal check + the evict-cap.
 	if isTerminalStatus(ev.status) {
 		defer n.evictChatConvo(ev.runID)
+		defer func() { delete(n.rootRenders, ev.runID) }()
 	}
 	rc, err := n.store.GetSlackRunContext(ctx, ev.runID)
 	if err != nil {
@@ -88,6 +89,7 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 			n.logf("post root", perr)
 			return
 		}
+		n.rememberRoot(rc, channel, ts, fallback, blocks)
 		saved, uerr := n.store.UpsertSlackRunMessage(ctx, store.UpsertSlackRunMessageParams{
 			RunID: rc.ID, ChannelID: channel, RootTs: ts,
 		})
@@ -108,9 +110,7 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 		return
 	default:
 		anchor = existing
-		if uerr := n.poster.UpdateBlocks(ctx, existing.ChannelID, existing.RootTs, fallback, blocks); uerr != nil {
-			n.logf("update root", uerr)
-		}
+		n.updateRoot(ctx, rc, existing, fallback, blocks)
 		// State events are serial, but can be late or repeated. The fetched hold and
 		// its status_since identify the announcement, rather than ev.status.
 		holdAnnounced := providerHold(rc) && existing.ParkKind.String == "paused" &&

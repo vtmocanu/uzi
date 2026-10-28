@@ -2,9 +2,11 @@ package workersvc
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -80,6 +82,74 @@ func TestHealthAccountCooldownPrecedence(t *testing.T) {
 		flag, reason := svc.healthTargetFor(context.Background(), t0, r, svc.healthThresholds(context.Background()))
 		if flag != healthSlow || reason != reasonNearTimeout {
 			t.Fatalf("wall elapsed=%s: %s/%s", elapsed, flag, reason)
+		}
+	}
+}
+
+func TestHealthAccountCooldownDirectTransitions(t *testing.T) {
+	for _, fault := range []string{"persistence", "tools", "near_wall", "outcome", "silence", "approval_age"} {
+		for _, recent := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/recent_nudge=%t", fault, recent), func(t *testing.T) {
+				r := runRow("running")
+				r.Health = healthWaitingAccountCooldown
+				r.HealthReason = pgconv.TextOrNull(apitypes.AccountCooldownReason)
+				r.HealthSince = ago(time.Hour)
+				r.AccountCooldownClass = pgconv.TextOrNull("rate_limit")
+				r.AccountCooldownEligibleAt = pgconv.Time(t0.Add(time.Minute))
+				r.LastActivityAt = pgconv.Time(t0)
+				if recent {
+					r.HealthNotifiedAt = ago(time.Minute)
+				}
+				fs := &healthFakeStore{}
+				svc := healthSvc(fs, defaultHealthSettings())
+				want, reason := healthLooping, reasonPersistFailing
+				switch fault {
+				case "persistence":
+					wedge(svc, r.ID, persistFlagStreak, persistFlagWindow+time.Second)
+				case "tools":
+					reason = reasonLooping
+					rows := []store.ListRunToolWindowRow{}
+					for i := int32(0); i < 4; i++ {
+						id := fmt.Sprintf("call%d", i)
+						rows = append(rows, useMsg(t, i*2+1, id, "Read", map[string]any{"file_path": "same"}), store.ListRunToolWindowRow{Seq: i*2 + 2, Kind: "tool_result", Payload: mustJSON(t, map[string]any{"tool_use_id": id, "content": "same result"})})
+					}
+					fs.window = map[uuid.UUID][]store.ListRunToolWindowRow{r.ID: rows}
+				case "near_wall":
+					want, reason = healthSlow, reasonNearTimeout
+					r.Kind, r.StartedAt = "issue", ago(95*time.Second)
+					r.BudgetWallSeconds = pgtype.Int4{Int32: 100, Valid: true}
+				case "outcome":
+					want, reason = healthStalled, reasonOutcomeUndelivered
+					r.TerminalPendingSince = ago(time.Hour)
+				case "silence":
+					want, reason = healthStalled, reasonStalled
+					r.AccountCooldownEligibleAt, r.LastActivityAt = pgconv.Time(t0), ago(time.Hour)
+				case "approval_age":
+					want, reason = healthApprovalIdle, reasonApprovalIdle
+					r.Status, r.StatusSince = "awaiting_approval", ago(2*time.Hour)
+					r.AccountCooldownEligibleAt = pgconv.Time(t0)
+				}
+				fs.active = []store.ListActiveRunsForHealthRow{r}
+				b := &fakeBroadcaster{}
+				svc.SetBroadcaster(b)
+				svc.detectRunHealth(context.Background(), t0)
+				w := lastWrite(t, fs, r.ID)
+				if w.Health != want || w.HealthReason.String != reason || !w.HealthSince.Time.Equal(t0) {
+					t.Fatalf("transition = %+v, want %s/%s restamped", w, want, reason)
+				}
+				wantNudge := !recent && fault != "silence" && fault != "approval_age"
+				if len(b.healthNudges) != 1 || b.healthNudges[0] != wantNudge || w.HealthNotifiedAt.Valid != wantNudge {
+					t.Fatalf("nudges=%v stamp=%+v want=%t", b.healthNudges, w.HealthNotifiedAt, wantNudge)
+				}
+				if wantNudge && !w.HealthNotifiedAt.Time.Equal(t0) {
+					t.Fatal("wrong notification stamp")
+				}
+				r.Health, r.HealthReason, r.HealthSince = w.Health, w.HealthReason, w.HealthSince
+				fs.active[0] = r
+				if n := svc.detectRunHealth(context.Background(), t0); n != 0 || len(b.healthNudges) != 1 {
+					t.Fatal("unchanged fault rebroadcast")
+				}
+			})
 		}
 	}
 }

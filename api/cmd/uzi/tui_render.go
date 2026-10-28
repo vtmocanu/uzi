@@ -266,6 +266,9 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 	if status != statusRecoveryWait && stalledHealth[health] {
 		return "▲", displayHealth(health)
 	}
+	if health == "waiting_account_cooldown" && (status == "claimed" || status == "running" || status == "awaiting_approval") {
+		return "~", "account cooldown"
+	}
 	switch effectiveRunStatus(status, isPlanning, isRevising) {
 	case "running":
 		return "●", "running"

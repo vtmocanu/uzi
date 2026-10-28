@@ -456,6 +456,8 @@
   "queue_reason": "x",
   "reserve_hold_reason": "x",
   "reserve_exempt_until": "2020-01-02T03:04:05Z",
+  "account_cooldown_class": "x",
+  "account_cooldown_eligible_at": "2020-01-02T03:04:05Z",
   "codex_admission_class": "x",
   "codex_admission_eligible_at": "2020-01-02T03:04:05Z",
   "plan_md": "x",

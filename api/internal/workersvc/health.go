@@ -473,7 +473,11 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		leftAdmission := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			apitypes.IsCodexAdmissionReason(r.HealthReason.String) && !apitypes.IsCodexAdmissionReason(reason)
 		leftAccountCooldown := r.Health == healthWaitingAccountCooldown && target != healthWaitingAccountCooldown
-		nudge := target != healthOK && (r.Health == healthOK || leftPin) &&
+		// Only independent faults start an episode directly from account cooldown.
+		// Expiry into ordinary silence or approval age stays quiet across the cohort.
+		independentFault := reason == reasonPersistFailing || reason == reasonLooping ||
+			reason == reasonNearTimeout || reason == reasonOutcomeUndelivered
+		nudge := target != healthOK && (r.Health == healthOK || leftPin || (leftAccountCooldown && independentFault)) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
 		// owner-level custody-episode reconciler (slacksvc) coalesces this crossing into ONE owner
@@ -508,7 +512,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			nudge = false
 		}
 		// PRD #3454: maintenance is an expected, operator-announced wait; a worker-pickup nudge is noise.
-		if reason == reasonMaintenance || apitypes.IsCodexAdmissionReason(reason) || leftAdmission || target == healthWaitingAccountCooldown || leftAccountCooldown {
+		if reason == reasonMaintenance || apitypes.IsCodexAdmissionReason(reason) || leftAdmission || target == healthWaitingAccountCooldown {
 			nudge = false
 		}
 		// PRD #3522 M3: the weekly usage reserve is the owner's own deliberate limit, not a stuck
