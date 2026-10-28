@@ -1139,6 +1139,15 @@ type Run struct {
 	CheckpointCoordinates       []byte             `json:"checkpoint_coordinates"`
 	RetainedParkCount           int32              `json:"retained_park_count"`
 	IgnoredInferredCapabilities []string           `json:"ignored_inferred_capabilities"`
+	ReserveHoldReason           pgtype.Text        `json:"reserve_hold_reason"`
+	ReserveExemptUntil          pgtype.Timestamptz `json:"reserve_exempt_until"`
+	ReserveExemptGrantedAt      pgtype.Timestamptz `json:"reserve_exempt_granted_at"`
+	ReserveExemptCredentialID   pgtype.UUID        `json:"reserve_exempt_credential_id"`
+	ReserveExemptWindowReset    pgtype.Timestamptz `json:"reserve_exempt_window_reset"`
+	ReserveExemptPriorPct       pgtype.Int2        `json:"reserve_exempt_prior_pct"`
+	HintedCapabilities          []string           `json:"hinted_capabilities"`
+	CapabilityInferenceEvidence []byte             `json:"capability_inference_evidence"`
+	IdleStallParkCount          int32              `json:"idle_stall_park_count"`
 	PolicyRefusalCount          int32              `json:"policy_refusal_count"`
 	PolicyLastTag               pgtype.Text        `json:"policy_last_tag"`
 	PolicyLastPhase             pgtype.Text        `json:"policy_last_phase"`
@@ -1153,15 +1162,6 @@ type Run struct {
 	PolicyStopResolution        []byte             `json:"policy_stop_resolution"`
 	PolicyRevisionSource        []byte             `json:"policy_revision_source"`
 	PolicyCandidateCrossCheckID pgtype.UUID        `json:"policy_candidate_cross_check_id"`
-	ReserveHoldReason           pgtype.Text        `json:"reserve_hold_reason"`
-	ReserveExemptUntil          pgtype.Timestamptz `json:"reserve_exempt_until"`
-	ReserveExemptGrantedAt      pgtype.Timestamptz `json:"reserve_exempt_granted_at"`
-	ReserveExemptCredentialID   pgtype.UUID        `json:"reserve_exempt_credential_id"`
-	ReserveExemptWindowReset    pgtype.Timestamptz `json:"reserve_exempt_window_reset"`
-	ReserveExemptPriorPct       pgtype.Int2        `json:"reserve_exempt_prior_pct"`
-	HintedCapabilities          []string           `json:"hinted_capabilities"`
-	CapabilityInferenceEvidence []byte             `json:"capability_inference_evidence"`
-	IdleStallParkCount          int32              `json:"idle_stall_park_count"`
 }
 
 type RunCompletionAttempt struct {
