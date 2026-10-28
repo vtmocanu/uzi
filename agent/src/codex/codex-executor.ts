@@ -2137,6 +2137,11 @@ export class CodexExecutor implements Executor {
    * the runner's execution-tail release (those own this call's caller), and never fails or retries
    * a completed run: any uncertainty yields `{ kind: "unproven" }` and the executor stays closed.
    * The runner's publishFlightSource awaits it with no bound (see HeldRunCommandCache.observeCleanup).
+   *
+   * Under deferRegistryTeardown the final epoch's registry stays in the outstanding set until the
+   * runner's terminal safety.dispose; the seal then accepts it only through deferredFinalProven,
+   * evaluated both before and after the joins (so a poison during the joins leaves it unproven).
+   * The set itself is not edited: the predicate is the proof, never a cleared table.
    */
   sealLifetime(sourceUse: object): Promise<ExecutorSealResult> {
     const wasRunning = this.runActive;
@@ -2154,7 +2159,8 @@ export class CodexExecutor implements Executor {
         ...this.planFlights, ...this.retiredIntentFlights,
         ...(this.intentFlight ? [this.intentFlight] : []),
       ].map(flight => flight.done));
-    }, () => !this.runActive && this.captureOwners === 0 && this.unverifiedEpochRegistries.size === 0);
+    }, () => !this.runActive && this.captureOwners === 0 &&
+      (this.unverifiedEpochRegistries.size === 0 || this.deferredFinalProven()));
   }
 
   /**
@@ -2327,6 +2333,22 @@ export class CodexExecutor implements Executor {
   private provisionDeadline?: (deadlineAt: number) => void;
   private readonly epochSetups = new Map<Promise<unknown>, Set<ExecutionRegistry> | undefined>();
   private runActive = false;
+  /** Under deferRegistryTeardown: the final epoch's registry and safety, set only when run()'s
+   *  deferred teardown succeeded. Cleared at the start of every run leg. */
+  private deferredFinal?: { readonly registry: ExecutionRegistry; readonly safety: CodexExecutionSafetyImpl };
+
+  /**
+   * True only when the sole outstanding registry is the deferred final epoch and its safety's own
+   * settled terminal disposal is still accepted by the registry (exact witness, unchanged poison
+   * revision and cursors, every root reaped and disposed). Cleared tables or state() never count.
+   */
+  private deferredFinalProven(): boolean {
+    const final = this.deferredFinal;
+    if (!final || this.unverifiedEpochRegistries.size !== 1 || !this.unverifiedEpochRegistries.has(final.registry)) return false;
+    if (this.epochSafeties.get(final.registry) !== final.safety || final.safety !== this.safety) return false;
+    const outcome = final.safety.terminalDisposalOutcome();
+    return outcome !== undefined && outcome.kind === "disposed" && final.safety.acceptsTerminalDisposal(outcome);
+  }
 
   /** Reserve synchronously: a later capture must queue behind the entire operation. */
   private async withCaptureOwnership<T>(action: () => Promise<T>): Promise<T> {
@@ -2921,6 +2943,7 @@ export class CodexExecutor implements Executor {
     let summaryResult: ExecutorResult | undefined;
     this.depsInstall = undefined;
     this.safety = undefined;
+    this.deferredFinal = undefined;
     // Everything that needs the worktree is built at the TOP of run() (the executor is
     // constructed before the claim's worktree exists).
     const binding = this.opts.binding;
@@ -4866,8 +4889,13 @@ export class CodexExecutor implements Executor {
           // reap, so re-persisting would only overwrite that generation with an empty one.
           if (beforeReapPersist) await beforeReapPersist;
           if (!reapedSinceLastPersist) await epoch.persistSession();
-          await this.tearDownEpoch(epoch.registry, epoch.harness, epoch.fileopHandle, boundaryDeadlineMs, !this.deps.deferRegistryTeardown, undefined,
+          const finalClean = await this.tearDownEpoch(epoch.registry, epoch.harness, epoch.fileopHandle, boundaryDeadlineMs, !this.deps.deferRegistryTeardown, undefined,
             epoch.safety instanceof CodexExecutionSafetyImpl ? epoch.safety : undefined);
+          // The deferred final registry stays outstanding until the runner's terminal safety.dispose
+          // proves it (see deferredFinalProven); remember the exact pair that proof must name.
+          if (this.deps.deferRegistryTeardown && finalClean && epoch.safety instanceof CodexExecutionSafetyImpl) {
+            this.deferredFinal = { registry: epoch.registry, safety: epoch.safety };
+          }
         }
         // (C) Evict the DURING-run released tokens (every epoch's provider-root launches + refreshes)
         // from the logger's secret set — AFTER the harness/transport is closed above, so no late log

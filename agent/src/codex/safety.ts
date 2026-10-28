@@ -1400,6 +1400,11 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     return this.disposalOutcome === outcome && this.registry.acceptsTerminalDisposal(outcome);
   }
 
+  /** The settled terminal disposal outcome, if dispose() has completed; read-only. */
+  terminalDisposalOutcome(): ToolDisposal | undefined {
+    return this.disposalOutcome;
+  }
+
   dispose(request: BoundaryRequest): Promise<ToolDisposal> {
     this.disposing = true;
     if (this.disposalPromise) return this.disposalPromise;

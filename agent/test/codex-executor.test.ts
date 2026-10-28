@@ -25977,6 +25977,78 @@ describe("3404 terminal executor lifetime", () => {
     assert.equal(refreshed, 0, "refused before the underlying bridge.refresh");
   });
 
+  describe("deferred final registry (deferRegistryTeardown)", () => {
+    type DeferredInternals = {
+      unverifiedEpochRegistries: Set<{ poison(error: unknown): void }>;
+      deferredFinal?: { registry: { poison(error: unknown): void } };
+    };
+    async function sinkThenDispose(executor: CodexExecutor) {
+      // The runner's durability sinks reap the provider root through a boundary before the dispose.
+      await executor.safety!.withBoundary({ boundary: "finalize", deadlineMs: 2000 }, async () => {});
+      return executor.safety!.dispose({ boundary: "terminal", deadlineMs: 2000 });
+    }
+    async function deferredRun(mutate?: (rig: ReturnType<typeof makeRig>) => void) {
+      const rig = makeRig({ responder: done });
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+      mutate?.(rig);
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      const { ctx } = makeCtx();
+      await executor.run(ctx);
+      return { rig, executor, source: Object.freeze({ runId: ctx.runId }) };
+    }
+
+    it("3404 seals after the runner's terminal safety.dispose proved the deferred final registry", async () => {
+      const { executor, source } = await deferredRun();
+      const disposal = await sinkThenDispose(executor);
+      assert.equal(disposal.kind, "disposed");
+      const result = await executor.sealLifetime(source);
+      assert.equal(result.kind, "sealed");
+      if (result.kind === "sealed") assert.equal(executor.acceptsLifetimeSeal(result.seal, source), true);
+    });
+
+    it("3404 a deferred final registry is unproven before the terminal dispose", async () => {
+      const { executor, source } = await deferredRun();
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a rejected terminal dispose leaves the deferred final registry unproven", async () => {
+      const { executor, source } = await deferredRun(rig => {
+        rig.root.dispose = async () => { throw new Error("cleanup unconfirmed"); };
+      });
+      await sinkThenDispose(executor).catch(() => undefined);
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a terminal hook failure (unsettled cache removal) leaves the deferred final registry unproven", async () => {
+      const { executor, source } = await deferredRun(rig => {
+        rig.deps = { ...rig.deps,
+          startCacheHolder: async token => ({ token, path: "/cache", alive: () => false,
+            release: async () => ({ state: "error", reason: "unused" }) }),
+          removeCommandCache: async () => ({ state: "pending", reason: "",
+            settlement: Promise.resolve({ state: "retained", reason: "busy" }) }),
+        };
+      });
+      await sinkThenDispose(executor).catch(() => undefined);
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 poisoning the registry after an accepted terminal dispose revokes the proof", async () => {
+      const { executor, source } = await deferredRun();
+      const disposal = await sinkThenDispose(executor);
+      assert.equal(disposal.kind, "disposed");
+      const registry = (executor as unknown as DeferredInternals).deferredFinal!.registry;
+      registry.poison({ category: "tool", message: "late poison" });
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 an unverified prior-epoch registry keeps the deferred final seal unproven", async () => {
+      const { executor, source } = await deferredRun();
+      await sinkThenDispose(executor);
+      (executor as unknown as DeferredInternals).unverifiedEpochRegistries.add({ poison() {} });
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+  });
+
   it("3404 structural source strings confer no authority", async () => {
     const rig = makeRig({ responder: done });
     const executor = makeExecutor(rig, bindingOf(API_KEY));
