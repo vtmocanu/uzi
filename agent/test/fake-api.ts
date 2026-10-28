@@ -1169,7 +1169,10 @@ export class FakeApi {
     // The checkpoint broker streams a Git pack, not JSON. This fake has no publisher:
     // preserve the ordinary missing-route answer instead of throwing on the PACK header.
     if (req.method === "POST" && /^\/api\/worker\/runs\/[^/]+\/publish$/.test(p))
-      return send(res, this.checkpointPublishHttpStatus, { error: "checkpoint unavailable", path: p });
+      return send(res, this.checkpointPublishHttpStatus, {
+        error: this.checkpointPublishHttpStatus === 404 ? "not found" : "checkpoint unavailable",
+        path: p,
+      });
     const json: Record<string, unknown> = body ? JSON.parse(body) : {};
 
     if (req.method === "POST" && p === "/api/worker/register") {
