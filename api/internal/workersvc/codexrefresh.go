@@ -77,8 +77,8 @@ const codexCoordInProgress = "in_progress"
 // (context.WithoutCancel + a bounded WithTimeout) with a bounded synchronous retry, then
 // hands continued retry off to s.background rather than declaring loss.
 const (
-	// codexRecoverySlotWriteTimeout bounds ONE SetCodexRecoverySlot attempt on the detached
-	// context, so a wedged write cannot hang the caller (nor a background goroutine) forever.
+	// codexRecoverySlotWriteTimeout bounds one foreground SetCodexRecoverySlot
+	// attempt on its detached context.
 	codexRecoverySlotWriteTimeout = 5 * time.Second
 	// A queued background result must survive the full bounded conversion, not
 	// exhaust short attempts while that conversion owns the user fence.
@@ -98,7 +98,8 @@ const (
 // budget, all recovery writes/backoffs (including the final background sleep), and
 // the terminal write tail. Scheduling pauses are not bounded by this policy.
 const codexRefreshReuseInFlightBound = codexRefreshLeaseTTL +
-	(codexRecoverySlotSyncAttempts+codexRecoverySlotBgAttempts)*codexRecoverySlotWriteTimeout +
+	codexRecoverySlotSyncAttempts*codexRecoverySlotWriteTimeout +
+	codexRecoverySlotBgAttempts*codexRecoverySlotBgWriteTimeout +
 	(codexRecoverySlotSyncAttempts-1+codexRecoverySlotBgAttempts)*codexRecoverySlotRetryBackoff +
 	codexRecoverySlotWriteTimeout
 

@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
@@ -39,5 +41,25 @@ func TestCodexBackgroundWriteBudgetCoversVaultLifecycle(t *testing.T) {
 	}
 	if codexRecoverySlotWriteTimeout != 5*time.Second {
 		t.Fatalf("foreground timeout = %s, want 5s", codexRecoverySlotWriteTimeout)
+	}
+}
+
+// A consumed retry must remain pending while its result can still be saved.
+// In particular, background writes can wait through a full vault conversion;
+// applying the short foreground timeout to them prematurely resolves the intent.
+func TestCodexReuseInFlightBoundCoversPersistence(t *testing.T) {
+	persistence := time.Duration(codexRecoverySlotSyncAttempts)*codexRecoverySlotWriteTimeout +
+		time.Duration(codexRecoverySlotBgAttempts)*codexRecoverySlotBgWriteTimeout
+	backoffs := time.Duration(codexRecoverySlotSyncAttempts-1+codexRecoverySlotBgAttempts) * codexRecoverySlotRetryBackoff
+	minimum := codexRefreshLeaseTTL + persistence + backoffs + codexRecoverySlotWriteTimeout
+	if codexRefreshReuseInFlightBound < minimum {
+		t.Errorf("reuse bound %s expires before the provider/persistence/terminal budget %s", codexRefreshReuseInFlightBound, minimum)
+	}
+	admitted := time.Date(2026, 10, 28, 0, 0, 0, 0, time.UTC)
+	stamp := pgtype.Timestamptz{Time: admitted, Valid: true}
+	account := store.CodexProviderAccount{CoordState: codexCoordQuarantined}
+	intent := store.CodexRefreshIntent{State: codexIntentRotating, CreatedAt: stamp, ProviderErrorAt: stamp, ReuseAttemptedAt: stamp}
+	if got := codexRefreshResolution(admitted.Add(minimum-time.Nanosecond), account, intent); got != codexIntentPending {
+		t.Errorf("retry with persistence still in budget resolved as %q, want pending", got)
 	}
 }

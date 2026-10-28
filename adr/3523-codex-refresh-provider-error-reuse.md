@@ -79,14 +79,15 @@ crash between admission and the provider call.
 
 ### In-flight and terminal fences
 
-The shared in-flight policy bound is **52.14 seconds** from durable consumption:
+The shared in-flight policy bound is **832.14 seconds (13 minutes, 52.14 seconds)** from durable consumption:
 
 ```text
 7s lease allowance
-+ (2 synchronous + 6 background) × 5s recovery writes
++ 2 synchronous × 5s recovery writes
++ 6 background × 135s recovery writes
 + (1 synchronous + 6 background) × 20ms backoffs
 + 5s terminal write
-= 52.14s
+= 832.14s
 ```
 
 `codexRefreshReuseInFlightBound` is shared by survivor resolution and account-action

@@ -279,7 +279,7 @@ func TestCodexReuseResolution(t *testing.T) {
 			}
 		})
 	}
-	if codexRefreshReuseInFlightBound != 52140*time.Millisecond {
+	if codexRefreshReuseInFlightBound != 832_140*time.Millisecond {
 		t.Fatalf("policy bound changed: %v; review actual retry schedule", codexRefreshReuseInFlightBound)
 	}
 }

@@ -88,15 +88,10 @@ type CreateUserVaultIfAbsentParams struct {
 	WrappedDek []byte    `json:"wrapped_dek"`
 }
 
-// First-unlock vault creation, race-safe. Two concurrent first-unlocks for the
-// same user both run this; ON CONFLICT DO NOTHING lets exactly one insert win and
-// returns no row (pgx.ErrNoRows) to the loser, who re-reads the winner's row and
-// unwraps it with the same password — so the cached DEK always equals the
-// persisted one (fixes the check-then-act race where each request would otherwise
-// cache a different DEK than the DB holds). Deliberately DO NOTHING, never DO
-// UPDATE: overwriting a live wrapped_dek would orphan every secret sealed under
-// the previous DEK. kek_salt is the per-user Argon2 salt, distinct from
-// users.password_hash's salt so the DB never contains the KEK.
+// Lifecycle creation holds the owner users-row lock before checking wrapper
+// presence. DO NOTHING defensively prevents replacing a live DEK; a conflicting
+// insert returns pgx.ErrNoRows and aborts the lifecycle transaction.
+// The independent KEK salt prevents password_hash from supplying the wrapping key.
 func (q *Queries) CreateUserVaultIfAbsent(ctx context.Context, arg CreateUserVaultIfAbsentParams) (UserVault, error) {
 	row := q.db.QueryRow(ctx, createUserVaultIfAbsent, arg.UserID, arg.KekSalt, arg.WrappedDek)
 	var i UserVault
@@ -132,7 +127,8 @@ SELECT user_id, kek_salt, wrapped_dek, created_at, updated_at, lock_notified_at 
 
 // The user's KEK salt + wrapped DEK. The plaintext DEK is never selected (it is
 // never stored); the caller derives the KEK from the login password and unwraps
-// in memory. pgx.ErrNoRows ⇒ no vault yet, and the first-ever unlock creates one.
+// in memory. pgx.ErrNoRows means no wrapper; explicit enable or required
+// enrollment may create one.
 func (q *Queries) GetUserVault(ctx context.Context, userID uuid.UUID) (UserVault, error) {
 	row := q.db.QueryRow(ctx, getUserVault, userID)
 	var i UserVault
