@@ -1784,7 +1784,13 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   controller report, background loops, the database, integrations, housekeeping), a
   verdict and a per-severity tally. By default it prints only the checks needing
   attention (not `ok`, not `na`); `--all` lists every check; `--json` emits the endpoint's
-  document unchanged. **Exit code, for a cron probe:** 0 unless the overall status is
+  document unchanged. Checks may carry optional `attention_banner: true`
+  presentation metadata (false is omitted); currently only owner-scoped
+  `recovery.storage` Warn opts in. The CLI has no dismissal state, and the flag
+  or browser dismissal does not change scope, severity, counts, status, blocking,
+  episodes, Slack, authentication, malformed-document handling or exit codes.
+  Warn exits 0 by default and 8 under `--strict`.
+  **Exit code, for a cron probe:** 0 unless the overall status is
   `danger`, then **8**; `--strict` also exits 8 on `warn` or `unknown`. Exit 8 is a
   **success-path** exit (HTTP 200 carrying an unhealthy verdict), so the full report prints
   first and a transport/auth failure keeps its own code — 8 means "unhealthy", 3/6 means

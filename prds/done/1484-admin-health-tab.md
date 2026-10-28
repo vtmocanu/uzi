@@ -123,10 +123,12 @@ Nothing here needs a file under `.github/workflows/`.
 - Every non-`ok` check carries `since`, where the source has one.
 
 **#2293 supersession (2026-10-05).** Overall status still rolls up the full
-registry, but banner, snooze, episodes and admin notices follow server-emitted
+registry, but Danger banner, snooze, episodes and admin notices follow server-emitted
 `blocking`, true exactly when an instance-scoped check is danger. The registry
 marks `db`, `controller.report`, `loops`, `fleet.roll` as instance and the rest
 owner. The original severity/banner rule above is retained as design history.
+#3589 adds a separate opted-in owner-Warn presentation below; it does not
+change the Danger notice or episode rules.
 
 ### Checks in v1
 
@@ -182,16 +184,22 @@ Layout, top to bottom: verdict with per-severity tally; the needs-attention list
 - **Banner**, mounted in `AppShell` beside `UpdateEscalationBanner`: admins only, `danger` only, `role="alert"`, the verdict line, the cause line, an Open health link, and **Snooze 1 h**. A snooze is per admin and applies to the current Danger episode only; a new episode shows the banner again. The banner follows `status`, so it appears at once; the Snooze button renders only while `episode_id` is non-null (an episode opens within one evaluation, see Danger notice).
 - **Non-admin line**: shown when the viewer has at least one queued run, owns at least one hosted worker, and every hosted worker they own reads `upgrade_failed`. It is derived entirely from the `listRuns` and `listWorkers` responses Overview already polls. No new endpoint, nothing about any other user. Copy: "Your hosted workers cannot start right now: the worker image cannot be pulled. This is a platform problem, not your run. Queued runs start on their own once it is fixed." The cause clause follows the viewer's own `upgrade_blocking_*` fields through the existing `likelyCause` lookup in `WorkerUpgradeBadge.tsx`, which already yields the image-pull cause for `ImagePullBackOff` and `ErrImagePull`; it is never free text. Admins get the card instead of this line.
 
-**#2293 banner supersession (2026-10-05).** The banner rule above now follows
+**#2293 banner supersession (2026-10-05).** The Danger banner rule above now follows
 `blocking`; blocker count/cause use server-scoped instance danger. Owner-only
 danger stays in Health/Overview with "N checks need attention; no instance-wide
-blocker detected" (singular for one), without a banner or episode. Warn/unknown
+blocker detected" (singular for one), without a Danger banner or episode. Warn/unknown
 use neutral attention copy. Web honors present true/false exactly with no ID
 map. The accepted follow-up replaces the originally deferred mixed-version
 fallback: absent `blocking` conservatively uses legacy status/danger count/first
 danger, including the snooze expiry timer. Api-before-web upgrades and
 web-before-api rollbacks are preferred to avoid legacy owner false positives,
-not required to prevent suppressed banners.
+not required to prevent suppressed Danger banners.
+
+**#3589 attention-banner addition (2026-10-28).** A separate admin-only
+owner-Warn banner is a sixth surface, not a change to the historical Danger
+design. It requires optional `attention_banner: true`, owner scope and Warn;
+see [attention banner](../../docs/admin-health.md#attention-banner) and D19.
+The Danger banner's D2 snooze and #2293 blocking/episode rules remain unchanged.
 
 ### CLI
 
@@ -263,14 +271,17 @@ It reuses the existing health-notification enablement gate; no new enable flag. 
 
 **#2293 contract addition (2026-10-05).** The original example above is
 historical: current documents also emit `blocking` (boolean, including false),
-and each check emits `scope` (`instance` or `owner`). See
+and each check emits `scope` (`instance` or `owner`). #3589 adds optional
+`attention_banner` (boolean, omitted when false), independent of CLI exits and
+without CLI dismissal state. See
 [admin health](../../docs/admin-health.md#severity) for the current contract.
 
 ## Milestones
 
 **#2293 supersession.** The completed milestones below record the original
 landing and remain checked. M5's overall-danger banner acceptance is replaced
-by the scoped `blocking` rule above; this annotation does not reopen milestones.
+by the scoped `blocking` rule above; #3589 adds a separate owner-Warn surface.
+These annotations do not reopen or change the historical milestone checkboxes.
 
 Per-milestone gate lines: M1, M2, M3, M6 `task gate:api`; M4, M5 `task gate:web`; M7 `task check-docs:web`; and `task gate:repo` once before finalize. Run each gate once, to a log, then read the log. Any milestone that edits `docs/*.md` also runs `task docs:sync` and commits the mirror.
 
@@ -307,7 +318,7 @@ A single uzi run executes these in order. M3, M4 and M6 share no files except th
 
 **#2293 acceptance boundary.** Criterion 1's stuck `fleet.roll` remains an
 instance incident. Owner capacity/queue danger alone still appears in Health,
-Overview and CLI (exit 8), but raises no banner, episode or admin notice.
+Overview and CLI (exit 8), but raises no Danger banner, episode or admin notice.
 
 ## Risks
 
@@ -352,3 +363,5 @@ Overview and CLI (exit 8), but raises no banner, episode or admin notice.
 - **D17 (user, 2026-10-03): Admin tab order updated.** Site lists and Products follow Branding, in that order, with Health still last. This supersedes D1's adjacency to Branding while preserving its last-tab decision.
 
 - **D18 (AI, 2026-10-03, per issue #2184): Worker-roll capacity waits.** This supersedes the fleet.capacity row: ordinary confirmed roll waits are informational `ok`, never warn; genuine waits remain danger at five minutes. Confirm the exact stored roll reason against current composed eligibility, with a diagnosis-wide suitable-own-draining veto. Roll danger starts when the overlap of health_since and the latest currently suitable other persistent worker drain reaches 24h, independently of controller deadlines. Failed, missing or negative confirmation follows genuine capacity treatment per run.
+
+- **D19 (AI, 2026-10-28, per approved issue #3589): Separate owner-Warn attention.** Optional `attention_banner` is omitted when false; `recovery.storage` is the sole producer, derived from final owner scope and Warn severity. Web selects strict true + owner + Warn in server order. The admin-only component is keyed by `user.id`, after Danger in the shared provider, with a polite status named "Admin health attention", React text, Open health and per-check Dismiss. Local check-ID dismissal survives Warn/metadata changes, navigation and failed polls; only explicit successful non-Warn observations rearm it, and reload/remount/admin changes reset it. See the [complete dismissal contract](../../docs/admin-health.md#attention-banner). No storage, timer, write, episode or snooze coupling is added. Severity, blocking/counts/status, episodes, Slack, D2 Danger snooze and CLI exits remain unchanged. The historical design and milestone checkboxes remain as landed. Combined pressure-only verification depends on #3584 and is not established by this presentation change.

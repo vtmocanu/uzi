@@ -2707,12 +2707,29 @@ The health registry supplies each check's `scope` (#2293): `db`,
 the rest are `owner`. `fleet.roll` remains instance infrastructure even for a single owner.
 The server emits `blocking` on every document, true exactly when an instance
 check is danger. Overall status, counts, attention pips, history and CLI exit
-status still cover the full registry. Episodes, admin Slack notices, banner
+status still cover the full registry. Episodes, admin Slack notices, Danger banner
 and snooze follow `blocking`, superseding #2271's overall-episode timing:
 the opening tick sends nothing; the next still-blocking tick claims a notice
 per admin with instance-danger checks. Clearing instance danger closes and
 rearms even if owner danger remains. Owner-only danger opens no episode,
-sends no admin DM and raises no banner; owner run-health routing is unchanged.
+sends no admin DM and raises no Danger banner; owner run-health routing is unchanged.
+
+A separate owner-Warn attention banner (#3589) requires the optional per-check
+`attention_banner: true`, `scope: owner` and `severity: warn`; it preserves server
+order. `recovery.storage` is the sole producer, opting in from its final
+owner/Warn result. False flags are omitted. This metadata
+does not affect severity, counts, status, blocking, episodes, Slack or CLI exits.
+The admin-only `HealthAttentionBanner`, keyed by `user.id`, mounts after Danger
+inside the shared `HealthStatusProvider` (one visible-tab 10-second poll).
+It renders React text in one polite status surface with Open health and per-check
+Dismiss. Dismissals are React state keyed by check ID, independent of episodes,
+navigation, summaries, counts and flags. Missing checks/flags and loading or failed
+polls retain dismissals; the provider keeps the last-good document on failure. An explicitly observed
+`ok`/`unknown`/`danger`/`na` in a successful document clears that ID even without
+a flag. Remount, reload or admin identity changes reset state. No browser storage,
+timer, write or snooze is added; Danger's per-admin, per-episode 1h snooze stays
+unchanged. See [attention banner](docs/admin-health.md#attention-banner) and
+[PRD #1484's decision log](prds/done/1484-admin-health-tab.md#scope-and-decision-log).
 
 Database storage has two signals, both from inside the api (no volume or
 Kubernetes access). A pgx query tracer on the pool

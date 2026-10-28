@@ -14,7 +14,7 @@ signals. It exists because, before this, an admin had no instance-level way to
 see that the whole fleet was stuck — only each affected user's own worker page
 showed anything, and nothing pushed a notice to anyone.
 
-It surfaces five ways:
+It surfaces six ways:
 
 - **Admin → Health**, the last tab in the admin strip, laid
   out triage first ([PRD #1648](../prds/done/1648-admin-health-triage-first.md)),
@@ -49,6 +49,9 @@ It surfaces five ways:
   episode. The snooze button appears only while an episode is open; a new
   episode (a fresh incident, not a continuation of the same one) shows the
   banner again even if the prior one was snoozed.
+- **An app-wide attention banner**, admins only, for explicitly opted-in
+  owner-scoped warnings; see [Attention banner](#attention-banner). It is
+  separate from the Danger banner and has a per-check **Dismiss** control.
 - **`uzi admin health`** (below), plus roll-health columns (`VERSION`,
   `UPGRADE`, `BLOCKING`) on `uzi admin workers`, which previously showed no
   upgrade information at all for another user's worker.
@@ -80,6 +83,29 @@ hosted worker, and every hosted worker they own reads `upgrade_failed`. It is
 built entirely from the viewer's own runs and workers (the same data their
 Workers page already shows them), so it needs no new endpoint and names no
 other user.
+
+## Attention banner
+
+The optional per-check boolean `attention_banner` is presentation metadata,
+omitted when false. The web banner selects checks with
+`attention_banner === true`, `scope: owner` and `severity: warn`, in server
+order. Currently `recovery.storage` is the sole producer. This does not change
+scope, severity, overall status, counts, `blocking`, episodes or Slack notices.
+
+One warning surface renders after the Danger banner, with `role="status"`,
+`aria-live="polite"` and accessible name "Admin health attention". Titles and
+summaries render as React text, with **Open health** and a **Dismiss** control
+per check. The admin-only component is keyed by `user.id` and reads the shared
+`HealthStatusProvider`: one poll every 10 seconds while the tab is visible.
+
+Dismissal is local React state keyed by check ID. It survives Warn updates,
+counts, summaries, flag changes, changes to other checks or episodes, navigation,
+missing checks or flags, loading and failed polls; the provider retains the
+last-good document. A dismissal clears only when a successful document explicitly
+reports that check as `ok`, `unknown`, `danger` or `na`, even without the flag.
+Remount, reload or a change of admin identity resets local dismissals. There is
+no browser storage, timer, write request, snooze or episode coupling. The Danger
+banner's per-admin, per-episode **Snooze 1 h** is unchanged.
 
 ## The boundary: no Kubernetes access, ever
 
@@ -114,7 +140,7 @@ or `na`.
   all-`ok` deployment — compose, with no hosted workers and no Slack — reads
   overall `ok`). Each check carries `scope: instance` or `scope: owner`.
   The server emits `blocking` on every document, `true` exactly when an
-  instance check is `danger`. Episodes, admin notices, banner and snooze
+  instance check is `danger`. Episodes, admin notices, Danger banner and snooze
   follow this separate field, not overall status.
 - Owner-only danger reads **"N checks need attention; no instance-wide blocker
   detected"** ("1 check needs attention" for one). Warn/unknown use neutral
@@ -498,6 +524,11 @@ the current persisted capture count is greater than zero for the exact pair
 is `ok`. A failed read, missing aggregate or four-second read deadline
 is `unknown`. There is no danger or percentage-capacity band.
 
+When its final scope is `owner` and severity is `warn`, this check emits
+`attention_banner: true` for the separate [attention banner](#attention-banner).
+Otherwise the flag is omitted. Dismissing it hides this presentation locally;
+the refusal and Health evidence remain.
+
 Evidence reports global bytes and counts across owners: available recovery
 captures, preparing/uploading reservations, non-expired job files, quota
 refusals and owners, plus reclaimable job bytes, recovery/shared totals and
@@ -603,6 +634,11 @@ Text output includes `blocking: true (instance-wide)` or
 `blocking: false (instance-wide)` alongside the overall status and tally.
 Owner-only danger still exits `8`; `blocking` does not change `--strict`,
 transport/auth handling or malformed-document handling.
+
+JSON may include the optional per-check `attention_banner` boolean (omitted
+when false). It is presentation metadata; the CLI has no dismissal state.
+A Warn still exits `0` by default and `8` with `--strict`, independently of
+that flag or a browser dismissal.
 
 The text table's `EVIDENCE` column prints bounded evidence entries, using
 continuation rows for additional entries, including the capped model list
