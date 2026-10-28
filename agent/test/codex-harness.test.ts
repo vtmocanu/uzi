@@ -6028,3 +6028,82 @@ describe("M3 Codex producer projection compatibility", () => {
     await harness.close();
   });
 });
+
+
+describe("3506 retry context lifetime", () => {
+  for (const evidence of ["text", "native tool", "projected tool"] as const) {
+    it(`3506 emitted ${evidence} clears retained retry context`, async () => {
+      let calls = 0;
+      const { harness, transport } = makeHarness({ broker: stubBroker(async () => {
+        calls++;
+        return { ok: true, output: {} };
+      }) });
+      const note: CodexNotification = evidence === "text" ? agentMessage("working")
+        : evidence === "native tool" ? {
+          kind: "activity", method: "item/started",
+          params: { threadId: "th-1", item: { type: "commandExecution" } },
+        } : toolCall(91, "Bash", { command: "true" }, "th-1", "tn-1", "retry-tool");
+      transport.push(threadStarted()).push(codexError("rateLimitExceeded", { willRetry: true }))
+        .push(note).push(turnCompleted("completed")).end();
+      let retained = false, cleared = false;
+      try {
+        for await (const event of harness.startTurn(makeRequest()).events) {
+          if (evidencesModelProcessing(event)) {
+            assert.equal(retained, true, "retry context was present before model evidence");
+            assert.equal(harness.retryClassification, undefined, "cleared before evidence is yielded");
+            cleared = true;
+          } else if (!cleared && harness.retryClassification !== undefined) {
+            assert.equal(harness.retryClassification.classification, "rateLimitExceeded");
+            retained = true;
+          }
+        }
+        assert.equal(cleared, true, "the fixture emitted model evidence");
+        assert.equal(harness.retryClassification, undefined, "context stays cleared at turn end");
+        assert.equal(calls, evidence === "projected tool" ? 1 : 0);
+      } finally { await harness.close(); }
+    });
+  }
+
+
+  it("3506 retry context resets synchronously for a new turn without affecting terminal selection", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(codexError("rateLimitExceeded", { willRetry: true }))
+      .push(turnCompleted("completed"));
+    await collect(harness.startTurn(makeRequest()).events);
+    assert.deepEqual(harness.retryClassification, { classification: "rateLimitExceeded", category: "rate_limit" });
+    const turn = harness.startTurn(makeRequest());
+    assert.equal(harness.retryClassification, undefined);
+    transport.push(codexError("rateLimitExceeded", { willRetry: true })).push(turnCompleted("failed")).end();
+    const events = await collect(turn.events);
+    const terminal = events.find(event => event.kind === "turn_finished");
+    assert.ok(terminal?.kind === "turn_finished");
+    assert.deepEqual(terminal.terminal.errors, ["codex turn ended with status: failed"]);
+    assert.deepEqual(harness.retryClassification, { classification: "rateLimitExceeded", category: "rate_limit" }, "new turn accepts retries again");
+  });
+
+  it("3506 a registered child retry cannot create root context", async () => {
+    const { harness, transport } = makeHarness();
+    const notes: CodexNotification[] = [];
+    harness.registerChildSink("child", { push: note => { notes.push(note); } });
+    transport.push(threadStarted())
+      .push(codexError("rateLimitExceeded", { willRetry: true, threadId: "child" }))
+      .push(turnCompleted("completed")).end();
+    try {
+      await collect(harness.startTurn(makeRequest()).events);
+      assert.equal(notes.length, 1);
+      assert.equal(harness.retryClassification, undefined);
+    } finally { await harness.close(); }
+  });
+
+  it("3506 a registered child retry cannot replace root context", async () => {
+    const { harness, transport } = makeHarness();
+    const notes: CodexNotification[] = [];
+    harness.registerChildSink("child", { push: note => { notes.push(note); } });
+    transport.push(threadStarted()).push(codexError("rateLimitExceeded", { willRetry: true }))
+      .push(codexError("unauthorized", { willRetry: false, threadId: "child" }))
+      .push(turnCompleted("completed")).end();
+    await collect(harness.startTurn(makeRequest()).events);
+    assert.equal(notes.length, 1);
+    assert.equal(harness.retryClassification?.classification, "rateLimitExceeded");
+  });
+});

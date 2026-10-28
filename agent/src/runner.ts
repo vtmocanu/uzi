@@ -18114,15 +18114,16 @@ export class RunRunner {
     // terminal report); false = a blocked/failed reap (RETAIN the hold, still report the cancel).
     let cancelReap: boolean | undefined;
     let cancelDisposition: "released" | "retained" | undefined;
-    // PRD #1733: this park is provider-origin (the final in-process attempt failed with a provider
-    // error). Whether it is TYPED on the wire is decided per report below. `providerReap` is the
+    // PRD #1733: provider-origin covers a final transient provider failure or measured
+    // zero-evidence idle retaining a transient provider retry. Wire typing is decided per
+    // report below. `providerReap` is the
     // proof from the single pre-report reap (undefined = not attempted); `providerTypedSent` is set
     // once a typed body has gone out, so a lost ack can be reconciled against the ownership probe.
     const providerOrigin = cause.kind === "transient" && err instanceof TransientRecoveryError && err.providerOrigin;
     // The executor marks only measured, negotiated ordinary idle. Do not recompute
     // this obligation after capture: registration rollback must refuse, never downgrade.
     const idleTyped = cause.kind === "transient" && err instanceof TransientRecoveryError &&
-      err.idleStallKind !== undefined;
+      !providerOrigin && err.idleStallKind !== undefined;
     let providerReap: boolean | undefined;
     let providerTypedSent = false;
     const terminal = TERMINAL_RUN_STATUSES;
@@ -18736,7 +18737,9 @@ export class RunRunner {
               kind: "status",
               agent: "worker",
               payload: {
-                text: held
+                text: err instanceof TransientRecoveryError && err.providerOrigin && err.idleStallKind === "zero_evidence"
+                  ? `paused following silence after a provider-reported rate limit or transport retry; the recovery checkpoint is ${capture.published ? "published" : "saved on this worker"} and ${held ? "the run waits for its owner to resume it" : "it resumes automatically"}`
+                  : held
                   ? "paused after repeated provider outages without progress; the work is kept on this worker and the run waits for its owner to resume it"
                   : capture.published
                     ? "paused to recover from a provider outage; the recovery checkpoint is published and it resumes automatically"
@@ -18808,6 +18811,8 @@ export class RunRunner {
                   ? idleHeld
                     ? `paused after ${idleOpening}; the recovery checkpoint is ${idleCheckpoint} and the run waits for its owner to resume it`
                     : `paused after ${idleOpening}; the recovery checkpoint is ${idleCheckpoint} and it resumes automatically`
+                  : providerOrigin && err instanceof TransientRecoveryError && err.idleStallKind === "zero_evidence"
+                  ? `paused following silence after a provider-reported rate limit or transport retry; the recovery checkpoint is ${idleCheckpoint} and it resumes automatically`
                   : capture.published
                   ? "paused to recover from a transient interruption; the recovery checkpoint is published and it resumes automatically"
                   : "paused to recover from a transient interruption; the recovery checkpoint is saved on this worker and it resumes automatically",

@@ -18057,6 +18057,104 @@ describe("CodexExecutor planning settlement (#1733)", () => {
 });
 
 describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
+  const retryNote = (info: unknown, willRetry = true, threadId = "th-1", turnId = "tn-1"): CodexNotification => ({
+    kind: "codex_error", method: "error", threadId, turnId, willRetry,
+    params: { error: { message: "untrusted provider detail", codexErrorInfo: info } },
+  });
+  const retryCases = [
+    { name: "initial planning", phase: "initial", notes: [retryNote("rateLimitExceeded")], provider: true },
+    { name: "automatic revision", phase: "automatic", notes: [retryNote("rateLimitExceeded")], provider: true },
+    { name: "rate limit", notes: [retryNote("rateLimitExceeded")], provider: true },
+    { name: "transport absent status", notes: [retryNote({ httpConnectionFailed: {} })], provider: true },
+    { name: "transport 503", notes: [retryNote({ httpConnectionFailed: { httpStatusCode: 503 } })], provider: true },
+    { name: "transport 400", notes: [retryNote({ httpConnectionFailed: { httpStatusCode: 400 } })], provider: false },
+    { name: "latest permanent", notes: [retryNote("rateLimitExceeded"), retryNote({ httpConnectionFailed: { httpStatusCode: 400 } })], provider: false },
+    { name: "latest transient", notes: [retryNote({ httpConnectionFailed: { httpStatusCode: 400 } }), retryNote("rateLimitExceeded")], provider: true },
+    { name: "final missing then late retry", notes: [retryNote("rateLimitExceeded"), retryNote(undefined, false), retryNote("rateLimitExceeded")], provider: false },
+    { name: "final unknown then late retry", notes: [retryNote("rateLimitExceeded"), retryNote("unrecognized", false), retryNote("rateLimitExceeded")], provider: false },
+    { name: "final transient", notes: [retryNote("rateLimitExceeded"), retryNote("rateLimitExceeded", false)], provider: false },
+    { name: "stale", notes: [retryNote("rateLimitExceeded", true, "th-1", "old")], provider: false },
+    { name: "foreign", notes: [retryNote("rateLimitExceeded", true, "foreign")], provider: false },
+  ];
+  for (const scenario of retryCases) it(`3506 blackbox retry notification watchdog: ${scenario.name}`, async t => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(threadStarted());
+        if (scenario.phase === "automatic" && c.turnStartCount === 1)
+          c.transport.push(toolCall(1, "submit_plan", { plan_md: "initial" }, "th-1", "tn-1", "plan")).push(turnCompleted("completed"));
+        else for (const note of scenario.notes) c.transport.push(note);
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+    const { ctx, emitted } = makeCtx({ codexIdleStallRecovery: true,
+      ...(scenario.phase ? { planApproved: false, approvedPlan: undefined } : {}),
+      gatePlan: async () => ({ kind: "revise", feedback: "change", automatic: true, round: 1 }),
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      const starts = scenario.phase === "automatic" ? 2 : 1;
+      await until(() => rig.transport.turnStartCount === starts);
+      for (let i = 0; i < 10; i++) await tick();
+      t.mock.timers.tick(100);
+      await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError);
+        assert.equal(error.providerOrigin, scenario.provider);
+        assert.equal(error.idleStallKind, "zero_evidence");
+        assert.equal(error.originalIdle?.message, "codex run idle timeout");
+        if (scenario.provider) assert.equal(error.message, "silence after a provider-reported rate limit or transport retry");
+        return true;
+      });
+      assert.equal(rig.transport.turnStartCount, starts, "watchdog parks directly without a #2099 retry");
+      assert.equal(rig.sessionOps.persist, 1);
+      assert.ok(!JSON.stringify(emitted).includes("untrusted provider detail"));
+    } finally { rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  it("3506 blackbox watchdog snapshots retry context before abort replaces the turn", async t => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(threadStarted()).push(retryNote("rateLimitExceeded"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+    const original = CodexHarness.prototype.startTurn;
+    let replaced = false;
+    const mocked = mock.method(CodexHarness.prototype, "startTurn", function(this: CodexHarness, request: Parameters<typeof original>[0]) {
+      const turn = original.call(this, request);
+      request.signal.addEventListener("abort", () => {
+        // A replacement resets context synchronously before the old iterator rejects.
+        original.call(this, { ...request, signal: new AbortController().signal });
+        replaced = true;
+      }, { once: true });
+      return turn;
+    });
+    const { ctx } = makeCtx();
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.transport.turnStartCount === 1);
+      for (let i = 0; i < 10; i++) await tick();
+      t.mock.timers.tick(100);
+      await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError && error.providerOrigin);
+        assert.equal(error.idleStallKind, "zero_evidence");
+        assert.equal(error.originalIdle?.message, "codex run idle timeout");
+        return true;
+      });
+      assert.equal(replaced, true);
+      assert.equal(rig.transport.turnStartCount, 1);
+    } finally { mocked.mock.restore(); rig.transport.end(); t.mock.timers.reset(); }
+  });
+
   // Readiness polls real event-loop turns against a real-time deadline (performance.now is not
   // mocked), independently of the frozen Date. A turn count alone runs out before real I/O on a
   // loaded runner: 500 turns elapsed in under 5 ms on CI.
@@ -18207,12 +18305,13 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
       if (c.method === "turn/start") {
         c.transport.push(threadStarted());
+        c.transport.push(retryNote("rateLimitExceeded"));
         if (evidence === "text") c.transport.push(agentMessage("working"));
         else if (evidence === "tool") c.transport.push(toolCall(91, "Bash", { command: "true" }, "th-1", "tn-1", "settled-tool"));
         else c.transport.push({ kind: "turn_started", method: "turn/started", threadId: "th-1", turnId: "tn-1", params: {} })
           .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 10 }))
           .push({ kind: "codex_error", method: "error", threadId: "th-1", turnId: "tn-1", willRetry: true,
-            params: { threadId: "th-1", turnId: "tn-1", willRetry: true, error: { message: "retrying" } } });
+            params: { threadId: "th-1", turnId: "tn-1", willRetry: true, error: { message: "retrying", codexErrorInfo: "rateLimitExceeded" } } });
         return { turn: { id: "tn-1" } };
       }
       return {};
@@ -18227,7 +18326,10 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         : evidence === "text" ? emitted.some(m => m.kind === "text") : rig.transport.turnStartCount === 1);
       for (let i = 0; i < 5; i++) await tick();
       t.mock.timers.tick(100);
-      await assert.rejects(running, evidence === "lifecycle" ? isRecovery : (error: unknown) => {
+      await assert.rejects(running, evidence === "lifecycle" ? (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError && error.providerOrigin);
+        return true;
+      } : (error: unknown) => {
         assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
         assert.equal(error.message, "codex run idle timeout");
         return true;
@@ -18239,6 +18341,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
   for (const productive of [false, true]) for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 ${interruption} during pre-recovery persistence productive=${productive}`, async t => {
     const rig = makeRig();
     if (productive) rig.transport.push(agentMessage("partial model output"));
+    else rig.transport.push(retryNote("rateLimitExceeded"));
     let entered = false;
     let release!: () => void;
     const barrier = new Promise<void>(resolve => { release = resolve; });
@@ -18268,11 +18371,12 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       if (interruption === "wall") t.mock.timers.tick(1000);
       if (interruption === "cancel") cancelled = true;
       release();
-      if (interruption === "none") await assert.rejects(running, productive ? (error: unknown) => {
-        assert.ok(error instanceof TransientRecoveryError && error.idleStallKind === "productive");
-        assert.equal(error.providerOrigin, false);
+      if (interruption === "none") await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError);
+        assert.equal(error.idleStallKind, productive ? "productive" : "zero_evidence");
+        assert.equal(error.providerOrigin, !productive);
         return true;
-      } : isRecovery);
+      });
       else if (interruption === "cancel") await assert.rejects(running, /cancel/);
       else {
         const result = await running;
@@ -18287,7 +18391,10 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
   for (const productive of [false, true]) for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 declined completion hold rechecks ${interruption} productive=${productive}`, async t => {
     const rig = makeMultiEpochRig([
       epochResponder("th-1", "tn-1", transport => transport.push(signalDone()).push(turnCompleted("completed"))),
-      epochResponder("th-2", "tn-2", transport => { if (productive) transport.push(agentMessage("partial model output", "th-2")); }),
+      epochResponder("th-2", "tn-2", transport => {
+        if (productive) transport.push(agentMessage("partial model output", "th-2"));
+        else transport.push(retryNote("rateLimitExceeded", true, "th-2", "tn-2"));
+      }),
     ]);
     rig.deps = { ...rig.deps, idleMs: 100, wallMs: 1000 };
     let entered = false, release!: () => void;
@@ -18324,11 +18431,12 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       if (interruption === "wall") t.mock.timers.tick(1000);
       if (interruption === "cancel") cancelled = true;
       release();
-      if (interruption === "none") await assert.rejects(running, productive ? (error: unknown) => {
-        assert.ok(error instanceof TransientRecoveryError && error.idleStallKind === "productive");
-        assert.equal(error.providerOrigin, false);
+      if (interruption === "none") await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof TransientRecoveryError);
+        assert.equal(error.idleStallKind, productive ? "productive" : "zero_evidence");
+        assert.equal(error.providerOrigin, !productive);
         return true;
-      } : isRecovery);
+      });
       else if (interruption === "cancel") await assert.rejects(running, /cancel/);
       else {
         const result = await running;
@@ -18346,7 +18454,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     const rig = makeRig({ responder: c => {
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
       if (c.method === "turn/start") {
-        c.transport.push(threadStarted());
+        c.transport.push(threadStarted()).push(retryNote("rateLimitExceeded"));
         if (productive) c.transport.push(agentMessage("partial model output"));
         c.transport.push({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
           params: { reason: "unauthorized", previousAccountId: null } });
@@ -18376,7 +18484,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } finally { release(); rig.transport.end(); t.mock.timers.reset(); }
   });
 
-  for (const followup of ["none", "clarification", "prose"] as const) it(`3466 human revision ${followup} silence retries the exact prompt in a fresh epoch`, async t => {
+  for (const retry of [false, true]) for (const followup of ["none", "clarification", "prose"] as const) it(`3466 human revision ${followup} silence retry=${retry} retries the exact prompt in a fresh epoch`, async t => {
     const silentTurn = followup === "none" ? 2 : 3;
     const rig = makeMultiEpochRig([c => {
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
@@ -18389,6 +18497,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
             : toolCall(2, "ask_user", { questions: [{ question: "Which?", header: "Target" }] }, "th-1", "tn-1", "ask"))
             .push(turnCompleted("completed"));
         }
+        if (retry && c.turnStartCount === silentTurn) c.transport.push(retryNote("rateLimitExceeded"));
         return { turn: { id: "tn-1" } };
       }
       return {};
@@ -18414,7 +18523,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       askUser: async () => { questions++; return { kind: "answer", answers: ["server"] }; },
       retryPlanRevisionTurn: async cause => {
         assert.ok(cause instanceof TransientRecoveryError && cause.idleStallKind === "zero_evidence");
-        assert.equal(cause.providerOrigin, false);
+        assert.equal(cause.providerOrigin, retry);
         assert.equal(cause.originalIdle?.message, "codex run idle timeout");
         assert.ok(rig.epochs[0]!.disposed() > 0);
         retries++;
@@ -18484,6 +18593,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         if (c.turnStartCount === 1) c.transport.push(threadStarted())
           .push(toolCall(1, "submit_plan", { plan_md: "initial" }, "th-1", "tn-1", "plan"))
           .push(turnCompleted("completed"));
+        else c.transport.push(retryNote("rateLimitExceeded"));
         return { turn: { id: "tn-1" } };
       }
       return {};
@@ -19566,10 +19676,11 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(retryNotices(emitted).length, 2);
   });
 
-  for (const mode of ["provider", "legacy zero", "typed zero", "initial", "automatic", "implement"] as const) it(`real runner M2 ${mode} captures and resumes the persisted session`, async t => {
+  for (const mode of ["provider retry silence", "provider", "legacy zero", "typed zero", "initial", "automatic", "implement"] as const) it(`real runner M2 ${mode} captures and resumes the persisted session`, async t => {
     const silence = mode !== "provider";
     const typed = silence && mode !== "legacy zero";
-    const productive = typed && mode !== "typed zero";
+    const retrySilence = mode === "provider retry silence";
+    const productive = typed && mode !== "typed zero" && !retrySilence;
     const planning = mode === "initial" || mode === "automatic";
     const parkedId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     const api = new FakeApi("rate-limit-worker");
@@ -19584,6 +19695,8 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
           c.transport.push(toolCall(1, "submit_plan", { plan_md: "initial" }, parkedId, "tn-1", "plan"))
             .push(turnCompleted("completed", parkedId));
         else if (productive) c.transport.push(agentMessage("partial output", parkedId));
+        else if (retrySilence) c.transport.push({ kind: "codex_error", method: "error", threadId: parkedId, turnId: "tn-1", willRetry: true,
+          params: { error: { codexErrorInfo: "rateLimitExceeded", message: "untrusted retry text" } } });
         return { turn: { id: "tn-1" } };
       }
       return {};
@@ -19695,7 +19808,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
       await executing;
       assert.ok(produced instanceof TransientRecoveryError, diagnostics.lines.join("\n"));
       assert.equal(produced.idleStallKind, typed ? productive ? "productive" : "zero_evidence" : undefined);
-      assert.equal(produced.providerOrigin, !silence);
+      assert.equal(produced.providerOrigin, !silence || retrySilence);
       assert.ok(captureGitLaunches.some(spec => spec.identity === "worker_pat" && spec.cwd === barePath),
         "capture uses real supervised Git in the trusted worker bare");
       assert.ok(captureGitLaunches.some(spec => spec.identity === "command" && spec.cwd === clonePath),
@@ -19703,9 +19816,9 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
       assert.equal(rig.transport.turnStartCount, silence ? mode === "automatic" ? 2 : 1 : 3, "idle parks directly; classified errors spend two retries");
       const reports = api.states.filter(s => s.runId === claim.run_id && s.body.status === "recovery_wait");
       assert.equal(reports.length, 1, diagnostics.lines.join("\n"));
-      assert.equal(reports[0]!.body.recovery_cause, typed ? "codex_idle_stall" : silence ? undefined : "provider_outage");
-      assert.equal(reports[0]!.body.provider_progress_turns, typed ? mode === "automatic" ? 1 : 0 : undefined);
-      assert.equal(reports[0]!.body.productive_turns, silence ? undefined : 0);
+      assert.equal(reports[0]!.body.recovery_cause, retrySilence ? "provider_outage" : typed ? "codex_idle_stall" : silence ? undefined : "provider_outage");
+      assert.equal(reports[0]!.body.provider_progress_turns, typed && !retrySilence ? mode === "automatic" ? 1 : 0 : undefined);
+      assert.equal(reports[0]!.body.productive_turns, silence && !retrySilence ? undefined : 0);
       assert.equal(reports[0]!.body.claim_generation, 3);
       assert.equal(rig.client.refreshCalls.length, 1, "only the held recovery boundary reconciles credentials");
       assert.ok(!api.states.some(s => s.body.status === "failed" || s.body.status === "limit_wait"));

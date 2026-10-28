@@ -78,7 +78,7 @@ import type { Logger } from "../log.js";
 import { CodexRequestFailure, RequestError, codexDeferralReason, codexRefreshFailure, isTransientStatus, type PlanCrossCheckFindings, type WorkerClient } from "../client.js";
 import { TransientRecoveryError } from "../sdk-executor.js";
 import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
-import { CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
+import { type CodexErrorClassification, CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
 import type { DockerWiring } from "../docker-wiring.js";
 import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type PlanRevisionOwnerWaitObserver, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
@@ -383,7 +383,7 @@ interface PauseNowToken {
  * caller that matches on it) plus the pause-now snapshot taken when the trip fired.
  */
 class CodexTurnTripError extends Error {
-  constructor(reason: string, readonly pauseToken: PauseNowToken, readonly processedEvents?: number) {
+  constructor(reason: string, readonly pauseToken: PauseNowToken, readonly processedEvents?: number, readonly retryClassification?: Readonly<CodexErrorClassification>) {
     super(reason);
   }
 }
@@ -5397,10 +5397,12 @@ export class CodexExecutor implements Executor {
     // was outstanding at THAT moment: an owner `now` that lands between the trip and the handler
     // (its own trip is a first-wins no-op) stays pending and drops the re-driven turn.
     let tripToken: PauseNowToken | undefined;
+    let tripRetryClassification: Readonly<CodexErrorClassification> | undefined;
     const trip = (reason: string): void => {
       if (tripReason === undefined) {
         tripReason = reason;
         tripToken = pauseNow.capture();
+        if (reason === REASON_IDLE) tripRetryClassification = harness.retryClassification;
         turnAbort.abort();
       }
     };
@@ -5471,7 +5473,7 @@ export class CodexExecutor implements Executor {
     const effectsAbort = new AbortController();
     try {
       harness.useBroker(buildPhaseBroker(phase, AbortSignal.any([turnAbort.signal, effectsAbort.signal])));
-      if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents);
+      if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
       armIdle();
       if (beforeDispatch) prompt = beforeDispatch(prompt);
       const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
@@ -5541,7 +5543,7 @@ export class CodexExecutor implements Executor {
         if (pending !== undefined) trip(pending);
       }
       // (a) FIRST-WINS trip.
-      if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents);
+      if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
       // (c) a failed terminal is classified ONCE and materialized+thrown here.
       if (sawTerminal && terminal && terminal.outcome === "failed") {
         const thrown = terminal.failure
@@ -5559,7 +5561,7 @@ export class CodexExecutor implements Executor {
       if (rootText) result.finalText = scrubLeadText(rootText);
     } catch (err) {
       // (a) again: a trip beats the raw aborted/protocol error the iterator threw.
-      if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents);
+      if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
       throw err instanceof Error ? err : new Error(errMessage(err));
     } finally {
       effectsAbort.abort();
@@ -5573,7 +5575,7 @@ export class CodexExecutor implements Executor {
     }
     // No await separates cleanup from this live-state check and notification entry.
     // The async notification owner must recheck its ownership before journaling.
-    if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents);
+    if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
     if (sawTerminal && terminal?.outcome === "success" && processedEvents > 0 &&
         !ctx.cancelRequested?.() && !ctx.terminalLifecycleSignal?.aborted && !vaultLock.latched &&
         this.pendingInterruption(ctx, pauseNow, wall) === undefined &&
@@ -5642,8 +5644,8 @@ export class CodexExecutor implements Executor {
     }
   }
 
-  private tripError(reason: string, pauseToken: PauseNowToken, processedEvents: number): Error {
-    return new CodexTurnTripError(reason, pauseToken, processedEvents);
+  private tripError(reason: string, pauseToken: PauseNowToken, processedEvents: number, retryClassification?: Readonly<CodexErrorClassification>): Error {
+    return new CodexTurnTripError(reason, pauseToken, processedEvents, retryClassification);
   }
 
   /**
@@ -5862,6 +5864,12 @@ export class CodexExecutor implements Executor {
               const afterCapture = recoveryInterruption();
               if (afterCapture) { err = afterCapture; continue routeTrip; }
               if (!pauseNow.vaultLock.latched) {
+                if (idleStallKind === "zero_evidence" && caught instanceof CodexTurnTripError &&
+                    isCodexTransientClassification(caught.retryClassification, isTransientStatus)) {
+                  throw new TransientRecoveryError("silence after a provider-reported rate limit or transport retry", {
+                    providerOrigin: true, idleStallKind: "zero_evidence", originalIdle: caught,
+                  });
+                }
                 throw new TransientRecoveryError(idleStallKind === "productive"
                   ? "model output stalled within the idle timeout"
                   : "provider sent no model output within the idle timeout", {
