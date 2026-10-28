@@ -161,8 +161,14 @@ func TestRecoveryStorageDisabledBudgets(t *testing.T) {
 					if c.Severity != want {
 						t.Errorf("check: %+v, want %s", c, want)
 					}
+					if signal == "none" && (c.Summary != "0 captures currently marked quota-refused." || c.Action != nil) {
+						t.Errorf("no signal: %+v", c)
+					}
 					if signal == "another budget" && c.Summary != "At least 80% of budget: "+pressured+"; 0 captures currently marked quota-refused." {
 						t.Errorf("wrong pressured budgets: %+v", c)
+					}
+					if signal == "refusal" && (c.Summary != "1 captures currently marked quota-refused." || c.Action == nil || *c.Action != "Review currently quota-refused captures with their owners (uzi run recovery). This observes stored state; an admitted retry clears the marker before upload succeeds.") {
+						t.Errorf("refusal only: %+v", c)
 					}
 				})
 			}
