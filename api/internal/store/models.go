@@ -237,6 +237,13 @@ type CodexAccountRateLimit struct {
 	EnablementSig              pgtype.Text        `json:"enablement_sig"`
 }
 
+type CodexActiveRunCooldown struct {
+	RunID                     uuid.UUID          `json:"run_id"`
+	UserID                    uuid.UUID          `json:"user_id"`
+	AccountCooldownClass      string             `json:"account_cooldown_class"`
+	AccountCooldownEligibleAt pgtype.Timestamptz `json:"account_cooldown_eligible_at"`
+}
+
 type CodexCredentialState struct {
 	UserSecretID      uuid.UUID          `json:"user_secret_id"`
 	UserID            uuid.UUID          `json:"user_id"`

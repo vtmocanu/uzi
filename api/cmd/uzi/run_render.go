@@ -2398,6 +2398,9 @@ func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 		s += " (credential switch unsettled)"
 	}
 	admission := codexAdmissionLineAt(r.RunDTO, now)
+	if cooldown := accountCooldownLineAt(r.RunDTO, now); cooldown != "" {
+		admission = cooldown
+	}
 	if reason := runQueueReason(r.RunDTO); reason != "" {
 		s += " (" + reason + ")"
 	} else if reason := strOr(r.HealthReason, ""); r.Status == "queued" && (reason == "your Codex account is unavailable (quarantined or being re-linked), so this run can't start" || (admission != "" && reason != "" && !apitypes.IsCodexAdmissionReason(reason))) {
@@ -2422,6 +2425,9 @@ func codexAdmissionLineAt(r apitypes.RunDTO, now time.Time) string {
 // runHealthReasonAt discards stale persisted provider reasons, retaining other blockers.
 func runHealthReasonAt(r apitypes.RunDTO, now time.Time) string {
 	reason := strOr(r.HealthReason, "")
+	if reason == apitypes.AccountCooldownReason {
+		return accountCooldownLineAt(r, now)
+	}
 	if apitypes.IsCodexAdmissionReason(reason) {
 		return codexAdmissionLineAt(r, now)
 	}
@@ -2707,4 +2713,11 @@ func queueReasonCell(reason string) string {
 		return "weekly_reserve (held by your weekly usage reserve)"
 	}
 	return sanitizeTTY(reason)
+}
+
+func accountCooldownLineAt(r apitypes.RunDTO, now time.Time) string {
+	if r.Health != "waiting_account_cooldown" || (r.Status != "claimed" && r.Status != "running" && r.Status != "awaiting_approval") || r.AccountCooldownClass == nil || r.AccountCooldownEligibleAt == nil || !r.AccountCooldownEligibleAt.After(now) {
+		return ""
+	}
+	return apitypes.AccountCooldownLine(*r.AccountCooldownClass, *r.AccountCooldownEligibleAt)
 }

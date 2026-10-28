@@ -43,6 +43,11 @@ SELECT EXISTS (
    AND i.consumed_claim_generation = @claim_generation::bigint
 )::boolean;
 
+-- name: ListRunAccountCooldowns :many
+SELECT run_id, account_cooldown_class, account_cooldown_eligible_at
+FROM codex_active_run_cooldown
+WHERE run_id = ANY(@run_ids::uuid[]) AND user_id = @viewer_id::uuid;
+
 -- name: SetWorkerActiveCooldown :exec
 -- Only display metadata is updated; the frozen custody upsert has already succeeded.
 UPDATE worker_active_runs SET

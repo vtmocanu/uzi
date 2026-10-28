@@ -103,7 +103,7 @@ func (e *waitEvidence) append(id, owner uuid.UUID, reason pgtype.Text, since pgt
 	stored := "unavailable"
 	if reason.Valid {
 		stored = safe(reason.String)
-		if apitypes.IsCodexAdmissionReason(reason.String) {
+		if apitypes.IsCodexAdmissionReason(reason.String) || reason.String == apitypes.AccountCooldownReason {
 			stored = "waiting: admission held"
 		}
 	}

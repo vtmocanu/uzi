@@ -90,6 +90,43 @@ func (q *Queries) GetCodexOperationAuthority(ctx context.Context, arg GetCodexOp
 	return i, err
 }
 
+const listRunAccountCooldowns = `-- name: ListRunAccountCooldowns :many
+SELECT run_id, account_cooldown_class, account_cooldown_eligible_at
+FROM codex_active_run_cooldown
+WHERE run_id = ANY($1::uuid[]) AND user_id = $2::uuid
+`
+
+type ListRunAccountCooldownsParams struct {
+	RunIds   []uuid.UUID `json:"run_ids"`
+	ViewerID uuid.UUID   `json:"viewer_id"`
+}
+
+type ListRunAccountCooldownsRow struct {
+	RunID                     uuid.UUID          `json:"run_id"`
+	AccountCooldownClass      string             `json:"account_cooldown_class"`
+	AccountCooldownEligibleAt pgtype.Timestamptz `json:"account_cooldown_eligible_at"`
+}
+
+func (q *Queries) ListRunAccountCooldowns(ctx context.Context, arg ListRunAccountCooldownsParams) ([]ListRunAccountCooldownsRow, error) {
+	rows, err := q.db.Query(ctx, listRunAccountCooldowns, arg.RunIds, arg.ViewerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRunAccountCooldownsRow{}
+	for rows.Next() {
+		var i ListRunAccountCooldownsRow
+		if err := rows.Scan(&i.RunID, &i.AccountCooldownClass, &i.AccountCooldownEligibleAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const setWorkerActiveCooldown = `-- name: SetWorkerActiveCooldown :exec
 UPDATE worker_active_runs SET
  cooldown_operation = $1::jsonb,

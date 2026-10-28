@@ -53,7 +53,7 @@ func (s *Service) enrichCapacityBlockers(ctx context.Context, evidence *waitEvid
 	for i := range rows {
 		rows[i].Kind = fact(rows[i].Kind, 24)
 		rows[i].Status = fact(rows[i].Status, 24)
-		if rows[i].HealthReason.Valid && apitypes.IsCodexAdmissionReason(rows[i].HealthReason.String) {
+		if rows[i].HealthReason.Valid && (apitypes.IsCodexAdmissionReason(rows[i].HealthReason.String) || rows[i].HealthReason.String == apitypes.AccountCooldownReason) {
 			rows[i].HealthReason.String = "waiting: admission held"
 		}
 		rows[i].HealthReason = fact(rows[i].HealthReason, 24)

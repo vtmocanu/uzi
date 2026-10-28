@@ -97,12 +97,13 @@ type Settings interface {
 // Health flag values. These mirror the CHECK constraint on runs.health; keep them
 // in sync with migration 00057.
 const (
-	healthOK            = "ok"
-	healthStalled       = "stalled"
-	healthLooping       = "looping"
-	healthSlow          = "slow"
-	healthWaitingWorker = "waiting_worker"
-	healthApprovalIdle  = "approval_idle"
+	healthOK                     = "ok"
+	healthStalled                = "stalled"
+	healthLooping                = "looping"
+	healthSlow                   = "slow"
+	healthWaitingWorker          = "waiting_worker"
+	healthWaitingAccountCooldown = "waiting_account_cooldown"
+	healthApprovalIdle           = "approval_idle"
 )
 
 // Reason templates. FIXED, server-controlled strings: they never carry a tool name,
@@ -471,6 +472,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			r.HealthReason.String == reasonMaintenance && reason != reasonMaintenance
 		leftAdmission := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			apitypes.IsCodexAdmissionReason(r.HealthReason.String) && !apitypes.IsCodexAdmissionReason(reason)
+		leftAccountCooldown := r.Health == healthWaitingAccountCooldown && target != healthWaitingAccountCooldown
 		nudge := target != healthOK && (r.Health == healthOK || leftPin) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
@@ -506,7 +508,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			nudge = false
 		}
 		// PRD #3454: maintenance is an expected, operator-announced wait; a worker-pickup nudge is noise.
-		if reason == reasonMaintenance || apitypes.IsCodexAdmissionReason(reason) || leftAdmission {
+		if reason == reasonMaintenance || apitypes.IsCodexAdmissionReason(reason) || leftAdmission || target == healthWaitingAccountCooldown || leftAccountCooldown {
 			nudge = false
 		}
 		// PRD #3522 M3: the weekly usage reserve is the owner's own deliberate limit, not a stuck
@@ -532,7 +534,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		leftReserve := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			isReserveHoldReason(r.HealthReason.String) && !isReserveHoldReason(reason)
 		since := healthSince(now, target, r)
-		if leftPin || leftMaintenance || leftReserve || leftAdmission {
+		if leftPin || leftMaintenance || leftReserve || leftAdmission || leftAccountCooldown {
 			since = pgconv.Time(now)
 		}
 		notifiedAt := pgtype.Timestamptz{}
@@ -632,7 +634,15 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		// re-label, then the fleet reasons). The flag is always healthWaitingWorker; only the
 		// reason string differs, so healthSince's "stuck for Xm" preservation keeps working.
 		return healthWaitingWorker, s.queuedReason(ctx, now, r, th)
+	case "claimed":
+		if activeAccountCooldown(now, r) {
+			return healthWaitingAccountCooldown, apitypes.AccountCooldownReason
+		}
+		return healthOK, ""
 	case "awaiting_approval":
+		if activeAccountCooldown(now, r) {
+			return healthWaitingAccountCooldown, apitypes.AccountCooldownReason
+		}
 		// auto_approve runs self-resolve their gate and must never nudge anyone to
 		// approve them (Decision 8).
 		if r.AutoApprove || th.approval == 0 || !olderThan(now, r.StatusSince, th.approval) {
@@ -771,6 +781,18 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 				return healthWaitingWorker, "waiting until " + deadline.Time.UTC().Format(time.RFC3339) + reasonCodeCrossCheckWaitingSuffix
 			}
 		}
+	}
+
+	// Current authority is supplied by codex_active_run_cooldown; wall exhaustion
+	// remains actionable while an operation is waiting.
+	if activeAccountCooldown(now, r) {
+		if eff, ok := runWallClock(r.BudgetWallSeconds, r.Kind, r.Interactive, r.Status, r.StartedAt.Valid, s.p.RunTimeout, r.BudgetExtensionSeconds, r.BudgetFinalizeSeconds); ok {
+			active := now.Sub(r.StartedAt.Time) - time.Duration(r.BudgetPausedSeconds)*time.Second
+			if active >= eff || (th.nearTimeoutPct > 0 && active >= eff/100*time.Duration(th.nearTimeoutPct)) {
+				return healthSlow, reasonNearTimeout
+			}
+		}
+		return healthWaitingAccountCooldown, apitypes.AccountCooldownReason
 	}
 
 	// stalled: silence past the threshold, suppressed while a LEAD tool call is in
@@ -2094,4 +2116,8 @@ func toolResultID(payload []byte) string {
 		return ""
 	}
 	return p.ToolUseID
+}
+
+func activeAccountCooldown(now time.Time, r store.ListActiveRunsForHealthRow) bool {
+	return r.AccountCooldownClass.Valid && (r.AccountCooldownClass.String == "rate_limit" || r.AccountCooldownClass.String == "overload") && r.AccountCooldownEligibleAt.Valid && r.AccountCooldownEligibleAt.InfinityModifier == pgtype.Finite && r.AccountCooldownEligibleAt.Time.After(now)
 }

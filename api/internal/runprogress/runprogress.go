@@ -58,6 +58,8 @@ func Derive(in Input) *apitypes.RunProgress {
 		ActiveMilestoneID: active,
 	}
 	switch {
+	case in.Health == "waiting_account_cooldown":
+		p.State = StateWaiting
 	case in.Status == "awaiting_approval" && in.IsRevising:
 		// The lead is re-planning after a revise: the run is not waiting on the human.
 		p.State = StatePlanning

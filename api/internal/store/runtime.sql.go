@@ -9274,6 +9274,7 @@ const listActiveRunsForHealth = `-- name: ListActiveRunsForHealth :many
 
 SELECT id, runs.user_id, status, auto_approve,
        admission.codex_admission_class, admission.codex_admission_eligible_at,
+       cooldown.account_cooldown_class, cooldown.account_cooldown_eligible_at,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
@@ -9348,9 +9349,10 @@ SELECT id, runs.user_id, status, auto_approve,
        -- COALESCE column non-null); healthTargetFor reports it right after maintenance.
        COALESCE(CASE WHEN status = 'queued' THEN reserve_hold_reason END, '')::text AS reserve_hold_reason
 FROM runs
+LEFT JOIN codex_active_run_cooldown cooldown ON cooldown.run_id = runs.id
 LEFT JOIN codex_queued_run_admission admission
   ON admission.run_id = runs.id AND admission.user_id = runs.user_id
-WHERE status IN ('queued', 'running', 'awaiting_approval')
+WHERE status IN ('queued', 'claimed', 'running', 'awaiting_approval')
   AND kind <> 'chat'
 `
 
@@ -9361,6 +9363,8 @@ type ListActiveRunsForHealthRow struct {
 	AutoApprove               bool               `json:"auto_approve"`
 	CodexAdmissionClass       pgtype.Text        `json:"codex_admission_class"`
 	CodexAdmissionEligibleAt  pgtype.Timestamptz `json:"codex_admission_eligible_at"`
+	AccountCooldownClass      pgtype.Text        `json:"account_cooldown_class"`
+	AccountCooldownEligibleAt pgtype.Timestamptz `json:"account_cooldown_eligible_at"`
 	StartedAt                 pgtype.Timestamptz `json:"started_at"`
 	LastActivityAt            pgtype.Timestamptz `json:"last_activity_at"`
 	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
@@ -9481,6 +9485,8 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 			&i.AutoApprove,
 			&i.CodexAdmissionClass,
 			&i.CodexAdmissionEligibleAt,
+			&i.AccountCooldownClass,
+			&i.AccountCooldownEligibleAt,
 			&i.StartedAt,
 			&i.LastActivityAt,
 			&i.UpdatedAt,
