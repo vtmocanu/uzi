@@ -39,7 +39,9 @@ exhaustion is not itself a reason to enter recovery. The #3462 amendment below
 adds a narrow Codex zero-model-processing-evidence idle exception to this
 historical timeout precedence. The [#3509 amendment](#amendment-2026-10-27-3509-bounded-codex-idle-stall-parks)
 qualifies that exception with typed zero-evidence/productive idle parks and an
-owner hold; #3466's human revision driver remains separate.
+owner hold; #3506 below routes qualifying retry-associated zero-evidence silence
+through provider recovery instead. #3466's human revision driver remains separate.
+(AI-synced 2026-10-28)
 
 ### Verified capture before a promotable park
 
@@ -840,7 +842,9 @@ Scope: the `data_volume_full` task-run symptom is not fixed here (#3329).
 
 Historical decision: the [#3509 amendment](#amendment-2026-10-27-3509-bounded-codex-idle-stall-parks)
 below supersedes the untyped, productive-idle and uncapped-silence claims for
-negotiated lead idle recovery. The human revision and evidence boundaries remain.
+negotiated lead idle recovery. The #3506 note below qualifies provider attribution
+for retry-associated zero-evidence silence. The human revision and evidence
+boundaries remain. (AI-synced 2026-10-28)
 
 An eligible Codex lead turn that reaches the idle timeout with zero
 model-processing evidence now enters ordinary recovery. This is the narrow
@@ -856,14 +860,17 @@ model-initiated activity count as evidence. Unknown evidence, a synthetic
 trip or an ordinary error whose text happens to match the idle reason
 does not qualify.
 
+For plain zero-evidence silence,
 [CodexExecutor.driveTurnWithWallPark](../agent/src/codex/codex-executor.ts)
 persists the session through the existing pre-reaping sink and throws
 `TransientRecoveryError` with
 the exact message `provider sent no model output within the idle timeout`.
-It leaves `providerOrigin` false. The runner captures and verifies the
-restore point before reporting an ordinary, untyped `recovery_wait`, without
-`provider_outage` or provider-streak accounting: silence proves neither a
-provider error nor that the model processed the prompt.
+Without the #3506 retry context below, it leaves `providerOrigin` false.
+The runner captures and verifies the restore point before recovery; #3509
+supersedes the original untyped report when idle-stall typing is negotiated.
+That plain-silence route has no `provider_outage` or provider-streak accounting:
+silence alone proves neither a provider error nor that the model processed the
+prompt. (AI-synced 2026-10-28)
 
 Eligibility covers initial planning, automatic plan revisions and implementation
 model turns.
@@ -897,17 +904,76 @@ The existing verified-capture and settlement requirements still apply.
 Ordinary recovery retains its uncapped lifetime park count and existing
 exponential server backoff clamped at the configured maximum, plus jitter.
 Repeated silence can recover until the run wall requires an owner park or
-the owner cancels. This adds no provider-outage
-cap. A resolvable persisted session can resume on the new harness. If the
-provider rejects `thread/resume`, the existing fresh-thread fallback emits
-`resume_lineage_break` and warns that earlier context is lost and work may
-be repeated.
+the owner cancels. These are historical lifetime claims superseded by #3509;
+#3506 below routes qualifying retry-associated silence through the existing
+provider-outage bound instead. A resolvable persisted session can resume on the
+new harness. If the provider rejects `thread/resume`, the existing fresh-thread
+fallback emits `resume_lineage_break` and warns that earlier context is lost and work may
+be repeated. (AI-synced 2026-10-28)
 
 **Evidence boundary.** Evidence is limited to scripted app-server/executor
 and runner fixtures in [the Codex executor tests](../agent/test/codex-executor.test.ts).
 The resume fixture covers a resolvable non-Docker session path, with
 retained-source successor selection bypassed; it does not establish general
 successor-path or Docker resume coverage. There is no live-provider proof.
+
+### Issue #3506: provider retry followed by zero-evidence silence
+
+Decision record (AI-synced 2026-10-28). This narrow exception qualifies this
+#3462 amendment, [#3466 human revision recovery](#issue-3466-amendment--silent-human-revisions)
+and [#3509 idle-stall recovery](#amendment-2026-10-27-3509-bounded-codex-idle-stall-parks).
+It supersedes #3509's blanket not-provider-outage claim for qualifying
+retry-associated zero-evidence idle; other stalls keep their existing policy.
+
+[The Codex harness](../agent/src/codex/codex-harness.ts) retains the latest
+`willRetry: true` `codex_error` bound to the active root thread and turn,
+normalized by `normalizeCodexErrorInfo`. This closed classification contains no
+raw provider text. It resets at each root turn and on emitted
+`evidencesModelProcessing` evidence. An active-root `willRetry: false` invalidates
+the retry fallback even when its classification is missing or unknown, and
+blocks later retry notes from restoring it in that turn. Terminal selection is
+unchanged; a retry note is not a terminal failure or completed progress.
+
+At the first actual `REASON_IDLE` trip, the executor snapshots the retained retry
+classification. An eligible measured `processedEvents === 0` trip routes directly
+to `TransientRecoveryError` with `providerOrigin: true`,
+`idleStallKind: "zero_evidence"` and the identity of `originalIdle` retained when
+`isCodexTransientClassification` accepts that snapshot: exact `rateLimitExceeded`,
+or transport with absent or retryable HTTP status (408/429/5xx). The message is
+`silence after a provider-reported rate limit or transport retry`. The reported
+retry condition does not prove it caused the silence. Lifecycle/retry liveness
+never fabricates model progress. This does not invoke #2099 retries on the
+interrupted root or debit its transient retry allowance. Plain zero-evidence and
+productive idle keep #3509's policy; child turns and Claude are unchanged.
+Cancel, pause, wall, vault, completion and first-trip precedence remain as above.
+
+An accepted human revision, including clarification and prose followups, keeps
+both markers and follows #3466: verified disposal before the retry hook, then
+source/claim/control-fenced fresh-epoch construction after allowance admission.
+This idle error does not take the same-epoch provider-redrive path. Missing or
+unsupported hooks retain the `originalIdle` fallback. Exhaustion, owner wait,
+source safety and control routing remain unchanged. Generic provider revision
+errors keep their existing behavior. Retry and exhaustion notices use the same
+retry-associated silence phrase without claiming a proven cause.
+
+For ordinary recovery, provider origin excludes `idleTyped` in
+[the runner](../agent/src/runner.ts). Existing provider capability negotiation and
+positive, stampable claim-generation wire checks decide whether the report uses
+`provider_outage`; older APIs retain the untyped fallback, which promises neither
+provider counting nor a provider hold. Verified capture and settlement remain
+required. Typed provider parks use the existing streak and
+`RUN_PROVIDER_PARK_MAX_DURATION` (default `24h`; `0` disables the hold while
+retaining typing/counting). At a qualifying park at or past that duration, the
+run can enter owner-resumable `paused` / `provider_unavailable`. Backoff, jitter,
+queue/claim delay and the next attempt can delay detection; there is no exact
+24-hour deadline or bounded overshoot. Successful completed model turns reset
+the streak under the existing progress rules; retry liveness does not.
+Owner Resume uses the existing provider-unavailable route, not #3527's worker
+owner episode or adoption renewal. Existing lost-ACK and definitive HTTP 400
+typed-park-refusal behavior is unchanged and outside this amendment.
+
+This note records the M1 behavior at `a212cd5d`; it adds no live-provider,
+rollout or newly executed test evidence.
 
 ## Amendment 2026-10-25: #3441 U4b verified delta transfer
 
@@ -1261,12 +1327,14 @@ and hosted timing retain their separate unproven boundaries.
 
 A real Codex idle trip with exactly zero measured model-processing events can
 use `plan_revision_retry_v1` during an accepted human revision, including its
-clarification and prose followups. A typed `zeroEvidenceIdle` discriminator
-retains the original idle trip; `providerOrigin` stays false. Silence does not
-establish a provider error. This path uses `PlanRevisionRecovery`, without an
-ordinary recovery park or provider-outage accounting. Missing negotiation,
+clarification and prose followups. The `idleStallKind: "zero_evidence"` marker
+retains the original idle trip; `providerOrigin` stays false except for #3506's
+qualifying retry-associated silence above, which retains both markers. Silence
+alone does not establish a provider error. This path uses `PlanRevisionRecovery`,
+without an ordinary recovery park or provider-outage accounting. Missing negotiation,
 hook, active revision or presentation identity retains the original terminal
 idle outcome. Control and ownership exceptions retain their own routes.
+(AI-synced 2026-10-28)
 
 The pre-reaping sink persists the session before verified epoch disposal,
 including when the retry allowance is exhausted. A silent retry reconstructs
@@ -1296,8 +1364,10 @@ Retry waits for unknown ownership and gate-restoration evidence use that same
 remaining budget. A replacement revise already taken from the owner queue stays
 pending across a wall unwind until its source proof can complete.
 Cancel, pause, spent wall and completion
-holds retain their existing precedence. Provider-origin revision
-retries continue on their existing epoch.
+holds retain their existing precedence. Generic provider-origin revision
+retries continue on their existing epoch; #3506's dual-marker idle error keeps
+verified disposal before the hook and fenced fresh-epoch construction after
+allowance admission. (AI-synced 2026-10-28)
 
 The same failed prompt and clarification/prose budgets survive a silent retry.
 Feedback remains pending until source-fenced revised publication succeeds.
@@ -1305,7 +1375,9 @@ Exhaustion restores the original presentation and an operable busy owner wait;
 source-bound reject and cancel remain available. An ordinary replacement revise
 spends the normal revision cap and receives a fresh allowance, while predecessor
 feedback settles only with the successor publication receipt. Retry notices
-describe silence as no model output, without attributing it to a provider outage.
+describe plain silence as no model output. For #3506's dual-marker error they
+say `silence after a provider-reported rate limit or transport retry`, without
+asserting that the retry condition caused it. (AI-synced 2026-10-28)
 
 Validation uses scripted executor and runner fixtures. No live-provider or
 compose-stack proof is claimed for this amendment.
@@ -1419,7 +1491,9 @@ their separate rules. No live-provider or live-rollout acceptance is claimed.
 ### Classification and capture boundary
 
 Measured lead initial-planning, automatic-plan-revision and implementation idle
-trips use `codex_idle_stall` for both `zero_evidence` and `productive` stalls.
+trips use `codex_idle_stall` for both `zero_evidence` and `productive` stalls,
+except for #3506's qualifying retry-associated zero-evidence idle, which uses
+provider recovery as described above. (AI-synced 2026-10-28)
 “Productive” here means observed output before the stall, not a completed turn.
 Human revision productive idle keeps failure; zero-evidence silence stays inside
 the existing revision driver. Child turns, Claude, callback-based idle suppression
@@ -1430,7 +1504,10 @@ completion hold and first-trip precedence retain their existing boundaries in
 Before capture, typing requires negotiated `recovery_cause_codex_idle_stall_v1`
 and a positive, stampable claim generation. Session persistence, executor cleanup,
 dirty-work WIP, fetch-back and verified ref coverage precede an accepted park.
-The error has `providerOrigin: false`; it does not enter provider-outage counting.
+These nonqualifying idle errors have `providerOrigin: false` and do not enter
+provider-outage counting; #3506's qualifying dual-marker errors instead take the
+provider wire checks and accounting above. The remaining rules in this amendment
+apply to `codex_idle_stall`. (AI-synced 2026-10-28)
 Acceptance requires returned `recovery_wait` and exact `codex_idle_stall` cause,
 including when the full worker ACK has no retry timestamp (held).
 Without negotiation, zero-evidence idle keeps legacy untyped recovery and

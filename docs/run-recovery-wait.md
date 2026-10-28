@@ -35,7 +35,7 @@ recovery checkpoint before parking the run in `recovery_wait`.
 This recovery is automatic and requires no per-run setting. A missing plan
 after a turn that actually did work, missing turn-count metadata, a real
 wall timeout, and cancellation are not classified as a transient recovery.
-Measured Codex idle timeouts have the separate [idle-stall policy](#codex-idle-stalls) below.
+Measured Codex idle timeouts generally use the [idle-stall policy](#codex-idle-stalls) below; qualifying zero-output silence after a provider-reported retry uses [provider-outage recovery](#provider-outage-streaks) instead.
 
 A **permanent** provider error — for example 401, 403, or 400 (bad
 credentials or a bad request) — is not a transient interruption. The run
@@ -101,13 +101,24 @@ turn; an approval flag alone is not an implementation-ready plan.
 
 ## Codex idle stalls
 
-A compatible worker reports measured Codex idle timeouts as `recovery_wait` /
+Except for the provider-retry case below, a compatible worker reports measured Codex idle timeouts as `recovery_wait` /
 `codex_idle_stall`, for both no model output (`zero_evidence`) and output that
 stalled (`productive`). This covers lead initial planning, automatic plan
 revisions and implementation. Human plan-revision productive idle still fails;
 zero-evidence revision silence uses its existing in-flight revision driver.
 Child turns, Claude and `idleOperation` keep their existing behavior. Cancel,
 pause, spent wall, vault-lock, completion-hold and first-trip precedence remain.
+
+Zero-output silence after a qualifying, current-turn provider rate limit or
+transport retry goes directly to provider recovery, without another retry on
+the interrupted root. The notice says "silence after a provider-reported rate limit or transport retry":
+the retry report does not prove what caused the later silence. These recoveries use the [provider-outage streak and owner
+hold](#provider-outage-streaks), rather than the idle park count below. A
+permanent transport status does not qualify. Retry context is cleared by model
+activity and at the next turn; final non-retrying errors retain precedence.
+Human plan revisions still use their revision driver, with verified disposal
+and a fenced fresh epoch before another turn, rather than an ordinary recovery
+park.
 
 By default, **three automatic parks** get finite retry times; the fourth stays
 **held for the owner** with a NULL retry. `RUN_CODEX_IDLE_STALL_MAX_PARKS=0`
@@ -137,9 +148,9 @@ commit when dirty, fetch-back and verified ref coverage. Typing requires
 `recovery_cause_codex_idle_stall_v1` and a positive, stampable generation before
 capture; acceptance requires the exact returned status and cause. A full worker
 ACK without a retry timestamp confirms held, whereas an omitted public DTO
-field means unknown timing. These errors have `providerOrigin: false` and do
-not charge provider-outage accounting.
-Without feature support, zero-evidence idle keeps legacy untyped recovery and
+field means unknown timing. These non-provider idle-stall errors have
+`providerOrigin: false` and do not charge provider-outage accounting.
+For those stalls, without feature support, zero-evidence idle keeps legacy untyped recovery and
 productive idle keeps terminal failure. After negotiation, HTTP 400 or feature
 loss does not trigger an untyped downgrade; the worker keeps the source.
 
