@@ -93,8 +93,10 @@ describe("scrubGitEnv", () => {
     execFileSync("git", ["init", "-q", sentinel], { env: ENV });
     const sentinelConfig = path.join(sentinel, "sentinel.config");
     fs.writeFileSync(sentinelConfig, "");
-    const dirDecoy = { ...process.env, GIT_DIR: path.join(sentinel, ".git"), GIT_WORK_TREE: sentinel };
-    const fileDecoy = { ...process.env, GIT_CONFIG: sentinelConfig };
+    // Built from the scrubbed ENV so the unscrubbed controls carry only the decoy under test, never an
+    // ambient GIT_* override that could send a control write into a real external config.
+    const dirDecoy = { ...ENV, GIT_DIR: path.join(sentinel, ".git"), GIT_WORK_TREE: sentinel };
+    const fileDecoy = { ...ENV, GIT_CONFIG: sentinelConfig };
     const both = { ...dirDecoy, ...fileDecoy };
     const cfg = (): string => fs.readFileSync(path.join(sentinel, ".git", "config"), "utf8");
     const extra = (): string => fs.readFileSync(sentinelConfig, "utf8");
