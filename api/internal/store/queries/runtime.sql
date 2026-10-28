@@ -2199,6 +2199,41 @@ UPDATE runs SET
                ELSE 0 END,
     updated_at       = now()
 WHERE runs.id = @id AND worker_id = @worker_id
+  -- Preserve legacy generation omission only for ordinary reports. These W/G/R
+  -- checks are prerequisites, not full accepted-snapshot validation; the locked
+  -- Go validator remains mandatory and the ordinary approval predicates below stay.
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR runs.claim_generation = sqlc.narg('claim_generation')::bigint)
+  AND CASE WHEN runs.policy_stop_resolution IS NULL THEN
+      sqlc.narg('policy_stop_resolution_id')::text IS NULL
+    ELSE
+      sqlc.narg('claim_generation')::bigint > 0
+      AND runs.claim_generation = sqlc.narg('claim_generation')::bigint
+      AND runs.claim_released_at IS NULL
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+      AND EXISTS (SELECT 1 FROM workers w
+          WHERE w.id = @worker_id AND w.user_id = runs.user_id)
+      -- Keep R as nullable text: malformed UUID syntax refuses without a cast.
+      AND sqlc.narg('policy_stop_resolution_id')::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      AND sqlc.narg('policy_stop_resolution_id')::text <> '00000000-0000-0000-0000-000000000000'
+      -- CASE confines object-only subtraction to objects, including for JSON null.
+      AND CASE WHEN jsonb_typeof(runs.policy_stop_resolution) = 'object' THEN
+          runs.policy_stop_resolution ?& ARRAY[
+              'version', 'resolution_id', 'accepted_by', 'accepted_at',
+              'scope_input_id', 'if_match', 'manifest']
+          AND (runs.policy_stop_resolution - ARRAY[
+              'version', 'resolution_id', 'accepted_by', 'accepted_at',
+              'scope_input_id', 'if_match', 'manifest']) = '{}'::jsonb
+        ELSE false END
+      AND runs.policy_stop_resolution->'version' = '1'::jsonb
+      AND jsonb_typeof(runs.policy_stop_resolution->'resolution_id') = 'string'
+      AND runs.policy_stop_resolution->>'resolution_id' = sqlc.narg('policy_stop_resolution_id')::text
+      AND jsonb_typeof(runs.policy_stop_resolution->'accepted_by') = 'string'
+      AND runs.policy_stop_resolution->>'accepted_by' = runs.user_id::text
+      AND jsonb_typeof(runs.policy_stop_resolution->'manifest') = 'object'
+      AND jsonb_typeof(runs.policy_stop_resolution->'manifest'->'run_id') = 'string'
+      AND runs.policy_stop_resolution->'manifest'->>'run_id' = runs.id::text
+    END
   -- Semantic freeze has no structural fallback when cross-check is disabled.
   AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
        OR (COALESCE(runs.completion_contract, sqlc.narg('completion_contract')::jsonb)->>'profile' = 'semantic'

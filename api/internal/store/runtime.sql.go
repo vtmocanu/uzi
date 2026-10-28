@@ -22175,6 +22175,41 @@ UPDATE runs SET
                ELSE 0 END,
     updated_at       = now()
 WHERE runs.id = $19 AND worker_id = $20
+  -- Preserve legacy generation omission only for ordinary reports. These W/G/R
+  -- checks are prerequisites, not full accepted-snapshot validation; the locked
+  -- Go validator remains mandatory and the ordinary approval predicates below stay.
+  AND ($21::bigint IS NULL
+       OR runs.claim_generation = $21::bigint)
+  AND CASE WHEN runs.policy_stop_resolution IS NULL THEN
+      $22::text IS NULL
+    ELSE
+      $21::bigint > 0
+      AND runs.claim_generation = $21::bigint
+      AND runs.claim_released_at IS NULL
+      AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+      AND EXISTS (SELECT 1 FROM workers w
+          WHERE w.id = $20 AND w.user_id = runs.user_id)
+      -- Keep R as nullable text: malformed UUID syntax refuses without a cast.
+      AND $22::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      AND $22::text <> '00000000-0000-0000-0000-000000000000'
+      -- CASE confines object-only subtraction to objects, including for JSON null.
+      AND CASE WHEN jsonb_typeof(runs.policy_stop_resolution) = 'object' THEN
+          runs.policy_stop_resolution ?& ARRAY[
+              'version', 'resolution_id', 'accepted_by', 'accepted_at',
+              'scope_input_id', 'if_match', 'manifest']
+          AND (runs.policy_stop_resolution - ARRAY[
+              'version', 'resolution_id', 'accepted_by', 'accepted_at',
+              'scope_input_id', 'if_match', 'manifest']) = '{}'::jsonb
+        ELSE false END
+      AND runs.policy_stop_resolution->'version' = '1'::jsonb
+      AND jsonb_typeof(runs.policy_stop_resolution->'resolution_id') = 'string'
+      AND runs.policy_stop_resolution->>'resolution_id' = $22::text
+      AND jsonb_typeof(runs.policy_stop_resolution->'accepted_by') = 'string'
+      AND runs.policy_stop_resolution->>'accepted_by' = runs.user_id::text
+      AND jsonb_typeof(runs.policy_stop_resolution->'manifest') = 'object'
+      AND jsonb_typeof(runs.policy_stop_resolution->'manifest'->'run_id') = 'string'
+      AND runs.policy_stop_resolution->'manifest'->>'run_id' = runs.id::text
+    END
   -- Semantic freeze has no structural fallback when cross-check is disabled.
   AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
        OR (COALESCE(runs.completion_contract, $10::jsonb)->>'profile' = 'semantic'
@@ -22361,6 +22396,8 @@ type SetRunRunningParams struct {
 	MilestonesAgents         []byte      `json:"milestones_agents"`
 	ID                       uuid.UUID   `json:"id"`
 	WorkerID                 pgtype.UUID `json:"worker_id"`
+	ClaimGeneration          pgtype.Int8 `json:"claim_generation"`
+	PolicyStopResolutionID   pgtype.Text `json:"policy_stop_resolution_id"`
 }
 
 // claimed/awaiting_approval → running, AND running → running: the worker reports
@@ -22417,6 +22454,8 @@ func (q *Queries) SetRunRunning(ctx context.Context, arg SetRunRunningParams) (i
 		arg.MilestonesAgents,
 		arg.ID,
 		arg.WorkerID,
+		arg.ClaimGeneration,
+		arg.PolicyStopResolutionID,
 	)
 	if err != nil {
 		return 0, err

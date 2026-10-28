@@ -3697,6 +3697,65 @@ func TestSetStateClearsMilestonesOnSeededFromDefault(t *testing.T) {
 	})
 }
 
+// This builder-to-store fake checks transport only. It does not emulate the
+// locked accepted-Stop validator or establish that SQL would admit the report.
+func TestRunningStateParamsPreservesRequestFlightAuthority(t *testing.T) {
+	generation := int64(17)
+	zero := int64(0)
+	resolution := "12345678-1234-4abc-8def-123456789abc"
+	for _, tc := range []struct {
+		name       string
+		generation *int64
+		resolution *string
+		wantG      pgtype.Int8
+		wantR      pgtype.Text
+	}{
+		{
+			name:       "supplied G and R",
+			generation: &generation,
+			resolution: &resolution,
+			wantG:      pgtype.Int8{Int64: 17, Valid: true},
+			wantR:      pgtype.Text{String: resolution, Valid: true},
+		},
+		{name: "ordinary omission"},
+		{
+			name:       "ordinary supplied generation",
+			generation: &generation,
+			wantG:      pgtype.Int8{Int64: 17, Valid: true},
+		},
+		{
+			name:       "missing G stays absent with supplied R",
+			resolution: &resolution,
+			wantR:      pgtype.Text{String: resolution, Valid: true},
+		},
+		{
+			name:       "zero G stays supplied",
+			generation: &zero,
+			wantG:      pgtype.Int8{Int64: 0, Valid: true},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &fakeStore{setRunningRows: 1}
+			svc := New(fs, newBox(t), testParams())
+			// Deliberately differ from the request so filling from the row fails.
+			run := store.Run{ClaimGeneration: 99}
+			params, err := svc.runningStateParams(context.Background(), run, StateRequest{
+				State: "running", ClaimGeneration: tc.generation, PolicyStopResolutionID: tc.resolution,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fs.SetRunRunning(context.Background(), params); err != nil {
+				t.Fatal(err)
+			}
+			if fs.setRunningParams == nil || fs.setRunningParams.ClaimGeneration != tc.wantG ||
+				fs.setRunningParams.PolicyStopResolutionID != tc.wantR {
+				t.Fatalf("query params = %+v, want G=%+v R=%+v", fs.setRunningParams, tc.wantG, tc.wantR)
+			}
+		})
+	}
+}
+
 // TestSetStatePersistsAutopilotPlanOnRunning pins RC1 (issue #1197): a `running` report
 // that CARRIES plan_md (the autopilot gate's self-contained approved-plan report) persists
 // it via the guarded SetRunAutopilotPlan BEFORE SetRunRunning acknowledges the report, so a
@@ -3816,6 +3875,9 @@ func TestSetStatePersistsAutopilotPlanOnRunning(t *testing.T) {
 		}
 		if fs.setRunningParams == nil {
 			t.Fatal("SetRunRunning must run for an ordinary heartbeat")
+		}
+		if fs.setRunningParams.ClaimGeneration.Valid || fs.setRunningParams.PolicyStopResolutionID.Valid {
+			t.Fatalf("ordinary heartbeat gained flight authority: %+v", fs.setRunningParams)
 		}
 	})
 }

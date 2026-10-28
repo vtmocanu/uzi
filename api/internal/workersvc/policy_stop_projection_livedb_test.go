@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -263,6 +264,107 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 				}
 			}
 			if mode == "gated" || mode == "no_gate" {
+				// Keep the retained reset refusal at the actual claimed boundary,
+				// before the positive running controls advance the persisted status.
+				refuseReset()
+				// Exercise the generated query independently of the locked service
+				// validator, using the real accepted receipt and actual reclaim.
+				// This fixture is nonrequired cross-check, reclaimed as claimed:
+				// ordinary SQL permits running without approving mutable gate B.
+				if current.Status != "claimed" || current.PlanCrossCheckRequired {
+					t.Fatal("direct running controls require ordinary claimed/nonrequired predicate")
+				}
+				params := store.SetRunRunningParams{
+					ID: created.ID, WorkerID: current.WorkerID,
+					ClaimGeneration:        pgtype.Int8{Int64: generation, Valid: true},
+					PolicyStopResolutionID: pgtype.Text{String: resolutionID, Valid: true},
+					RunMaxIterations:       5, RunTimeoutSeconds: 7200,
+					MilestoneBudgetCap: 12, BudgetWallCeilingSeconds: 28800, SizeBudgetFactorL: 5,
+				}
+				for _, name := range []string{"missing_R", "malformed_R", "wrong_R", "missing_G", "zero_G", "stale_G", "foreign_W"} {
+					t.Run("direct_running_"+name, func(t *testing.T) {
+						p := params
+						switch name {
+						case "missing_R":
+							p.PolicyStopResolutionID = pgtype.Text{}
+						case "malformed_R":
+							p.PolicyStopResolutionID = pgtype.Text{String: "not-a-resolution-uuid", Valid: true}
+						case "wrong_R":
+							p.PolicyStopResolutionID = pgtype.Text{String: "11111111-1111-4111-8111-111111111111", Valid: true}
+						case "missing_G":
+							p.ClaimGeneration = pgtype.Int8{}
+						case "zero_G":
+							p.ClaimGeneration = pgtype.Int8{Int64: 0, Valid: true}
+						case "stale_G":
+							p.ClaimGeneration = pgtype.Int8{Int64: generation - 1, Valid: true}
+						case "foreign_W":
+							// Worker A is a real fixture worker, distinct from claimant B.
+							foreign := wkrRow(t, e, f.workerA)
+							if foreign.ID == w.ID {
+								t.Fatal("foreign worker fixture equals claimant")
+							}
+							p.WorkerID = pgtype.UUID{Bytes: foreign.ID, Valid: true}
+						}
+						before := policyOwnerStopSnapshot(t, e, created.ID)
+						rows, err := e.q.SetRunRunning(e.ctx, p)
+						if err != nil || rows != 0 {
+							t.Fatalf("direct running prerequisite %s: rows=%d err=%v, want 0 and nil", name, rows, err)
+						}
+						if before != policyOwnerStopSnapshot(t, e, created.ID) {
+							t.Fatal("direct running refusal changed full run/input/check snapshot")
+						}
+					})
+				}
+				// Run the production builder against the same real row, then call
+				// actual SQL. Inferring G from the row would admit these no-gate
+				// requests; dropping G is caught by the positive and service ACK.
+				for _, name := range []string{"missing_G", "zero_G", "stale_G", "exact_G"} {
+					t.Run("builder_running_"+name, func(t *testing.T) {
+						var supplied *int64
+						want := int64(0)
+						if name != "missing_G" {
+							value := int64(0)
+							switch name {
+							case "stale_G":
+								value = generation - 1
+							case "exact_G":
+								value, want = generation, 1
+							}
+							supplied = &value
+						}
+						p, err := f.svc.runningStateParams(e.ctx, mustRun(t, e, created.ID), StateRequest{
+							State: "running", ClaimGeneration: supplied, PolicyStopResolutionID: &resolutionID,
+						})
+						if err != nil {
+							t.Fatal(err)
+						}
+						p.ID, p.WorkerID = params.ID, params.WorkerID
+						p.RunMaxIterations, p.RunTimeoutSeconds = params.RunMaxIterations, params.RunTimeoutSeconds
+						p.MilestoneBudgetCap, p.BudgetWallCeilingSeconds, p.SizeBudgetFactorL = params.MilestoneBudgetCap, params.BudgetWallCeilingSeconds, params.SizeBudgetFactorL
+						before := policyOwnerStopSnapshot(t, e, created.ID)
+						rows, err := e.q.SetRunRunning(e.ctx, p)
+						if err != nil || rows != want {
+							t.Fatalf("builder original generation %s: rows=%d err=%v, want %d and nil", name, rows, err, want)
+						}
+						if want == 0 && before != policyOwnerStopSnapshot(t, e, created.ID) {
+							t.Fatal("builder running refusal changed full run/input/check snapshot")
+						}
+						if want == 1 && mustRun(t, e, created.ID).Status != "running" {
+							t.Fatal("builder exact generation did not persist running")
+						}
+						assertPreserved()
+					})
+				}
+				t.Run("direct_running_exact_WGR", func(t *testing.T) {
+					rows, err := e.q.SetRunRunning(e.ctx, params)
+					if err != nil || rows != 1 {
+						t.Fatalf("direct running exact W/G/R: rows=%d err=%v, want 1 and nil", rows, err)
+					}
+					if mustRun(t, e, created.ID).Status != "running" {
+						t.Fatal("direct exact W/G/R did not persist running")
+					}
+					assertPreserved()
+				})
 				refuseReset()
 				for _, state := range []string{"running", "awaiting_approval", "awaiting_input"} {
 					refuseScalar(state, nil)

@@ -5910,6 +5910,9 @@ func sanitizePlanChangedLine(s string, max int) string {
 // them there.
 func (s *Service) runningStateParams(ctx context.Context, run store.Run, req StateRequest) (store.SetRunRunningParams, error) {
 	var p store.SetRunRunningParams
+	// Preserve supplied flight authority, including omission; never infer it from run.
+	p.ClaimGeneration = pgconv.Int8Ptr(req.ClaimGeneration)
+	p.PolicyStopResolutionID = pgconv.TextPtr(req.PolicyStopResolutionID)
 
 	// PRD #122 M1: an AUTOPILOT run reports its FROZEN milestone list on this report.
 	// Validated + kind-gated exactly like the candidate path (Decision 12/13); a
