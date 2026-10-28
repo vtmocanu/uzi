@@ -19619,6 +19619,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
       repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
       claim_generation: 3,
       plan_approved: !planning, plan_source: "agent", plan_md: planning ? undefined : "approved plan",
+      ...(planning ? { auto_approve: true } : {}),
       secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
     });
     const git = new GitCache(fx.dataDir, diagnostics.log, undefined, testGitCacheOptions());
@@ -19716,11 +19717,22 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
       if (silence) {
         assert.equal(reports[0]!.body.session_id, parkedId);
         assert.equal(await CodexSessionStore.inspect(path.join(homeDir, "codex-session-store")), "present");
+        const resumedPlan = `recovered ${mode} plan`;
+        let implementationSawStoredPlan = !planning;
         const resumed = makeRig({ responder: c => {
           if (c.method === "thread/resume") return { thread: { id: parkedId } };
           if (c.method === "turn/start") {
-            c.transport.push(signalDone(parkedId)).push(turnCompleted("completed", parkedId));
-            return { turn: { id: "tn-1" } };
+            const turnId = `tn-resumed-${c.turnStartCount}`;
+            c.transport.push(threadStarted(parkedId));
+            if (planning && c.turnStartCount === 1) {
+              c.transport.push(toolCall(1701, "submit_plan", { plan_md: resumedPlan }, parkedId, turnId, "resumed-plan"));
+            } else {
+              implementationSawStoredPlan = !planning || api.states.some(s => s.runId === claim.run_id &&
+                s.body.claim_generation === 4 && s.body.status === "running" && s.body.plan_md === resumedPlan);
+              c.transport.push(signalDone(parkedId, turnId, 1702));
+            }
+            c.transport.push(turnCompleted("completed", parkedId, turnId));
+            return { turn: { id: turnId } };
           }
           return {};
         } });
@@ -19733,6 +19745,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
         resumeExecutor.run = async ctx => {
           assert.equal(ctx.sessionId, parkedId);
           assert.equal(ctx.claimGeneration, 4, "the next claim advances its generation");
+          assert.equal(ctx.planApproved, !planning, "planning stalls resume unapproved and must submit a plan before implementation");
           const head = commitInTree(ctx.worktreePath, "RESUMED.txt", "recovered work\n");
           assert.equal((await fs.readFile(path.join(ctx.worktreePath, ".git", "refs", "heads", ctx.branch), "utf8")).trim(), head,
             "the resumed work is committed on the runner branch before supervised capture");
@@ -19767,15 +19780,29 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
             process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
             docker: { state: "not_wired", removed: [], detail: "not wired" },
           }),
-        }).execute({ ...claim, plan_approved: true, plan_md: "approved plan", session_id: parkedId, claim_generation: resumeGeneration, last_seq: 1000 });
-        assert.equal(resumed.transport.requests.filter(r => r.method === "thread/resume").length, 1, diagnostics.lines.join("\n"));
-        assert.equal(rec(resumed.transport.requests.find(r => r.method === "thread/resume")!.params).threadId, parkedId);
+        }).execute({ ...claim, plan_approved: !planning,
+          plan_md: planning ? mode === "automatic" ? "initial" : undefined : "approved plan",
+          session_id: parkedId, claim_generation: resumeGeneration, last_seq: 1000 });
+        // Planning recovery must persist a new plan through the real runner gate before
+        // its approval creates the fresh implementation epoch. The stale automatic plan
+        // above is not approval of either the interrupted or recovered planning turn.
+        assert.equal(implementationSawStoredPlan, true, "implementation waits for durable recovered-plan storage");
+        const resumedTurns = resumed.transport.requests.filter(r => r.method === "turn/start");
+        assert.equal(resumedTurns.length, planning ? 2 : 1);
+        assert.deepEqual(resumed.transport.requests.filter(r => r.method === "thread/resume").map(r => rec(r.params).threadId),
+          Array(planning ? 2 : 1).fill(parkedId), diagnostics.lines.join("\n"));
         assert.equal(resumed.transport.requests.filter(r => r.method === "thread/start").length, 0);
-        const prompt = JSON.stringify(resumed.transport.requests.find(r => r.method === "turn/start")!.params);
+        const implementationPrompt = JSON.stringify(resumedTurns.at(-1)!.params);
+        if (planning) {
+          assert.match(JSON.stringify(resumedTurns[0]!.params), /Produce a plan for this work and submit it for approval/);
+          assert.ok(implementationPrompt.includes(resumedPlan), "implementation uses the recovered plan, not the stale claim plan");
+        }
+        // Interrupted-call notes are composed at the implementation boundary, after
+        // the recovered read-only planning turn and its durable approval, if needed.
         if (mode === "initial") {
-          assert.match(prompt, /interrupted_calls_/);
-          assert.match(prompt, /printf interrupted-observation/);
-        } else if (typed) assert.doesNotMatch(prompt, /interrupted_calls_/);
+          assert.match(implementationPrompt, /interrupted_calls_/);
+          assert.match(implementationPrompt, /printf interrupted-observation/);
+        } else if (typed) assert.doesNotMatch(JSON.stringify(resumedTurns), /interrupted_calls_/);
         assert.equal(api.states.at(-1)?.body.status, "completed", diagnostics.lines.join("\n"));
         assert.equal(api.states.at(-1)?.body.claim_generation, 4);
         assert.equal(api.states.filter(s => s.body.status === "recovery_wait").length, 1);
