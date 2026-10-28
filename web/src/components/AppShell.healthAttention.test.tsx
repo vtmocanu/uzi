@@ -135,6 +135,8 @@ function setAdmin(id: string, is_admin = true) {
     user: { ...user, id, is_admin },
   });
 }
+// Synthetic wire data exercises presentation, not backend pressure calculation.
+// Real configured pressure-only Warn validation awaits the combined #3584 candidate.
 function warning(): HealthDoc {
   const doc = healthySilentDoc();
   doc.checks = doc.checks.map((check) => check.id === "recovery.storage"
