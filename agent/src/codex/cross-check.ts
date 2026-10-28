@@ -1,3 +1,4 @@
+import { acquireCodexOperationScope } from "../codex-operation-scope.js";
 // Dedicated one-turn checker lifecycle. It never enters CodexExecutor's lead loop.
 import { CODE_COVERAGE_LIMITS } from "../code-cross-check-coverage.js";
 import type { ActivityOp, CheckActivityRecorder } from "../cross-check-activity.js";
@@ -257,7 +258,7 @@ export interface CrossCheckModelDeps {
 }
 
 export class CodexCrossCheck {
- constructor(private readonly client: Pick<WorkerClient, "releaseCodex" | "refreshCodex"> & Partial<Pick<WorkerClient, "codexAdmissionReporter">>, private readonly log: Logger, private readonly deps: CrossCheckModelDeps = {}) {}
+ constructor(private readonly client: Pick<WorkerClient, "releaseCodex" | "refreshCodex"> & Partial<Pick<WorkerClient, "codexAdmissionReporter" | "hasFeature" | "codexOperationNegotiation" | "checkCodexOperationAdmission" | "retainCodexOperationFlight">>, private readonly log: Logger, private readonly deps: CrossCheckModelDeps = {}) {}
 
  async run(claim: ClaimResponse, checkout: string, home: string, signal: AbortSignal,
   postUsage: (payload: Record<string, unknown>) => Promise<void>, confirmNativeCleanup?: () => void,
@@ -292,6 +293,8 @@ export class CodexCrossCheck {
   let succeeded = false;
   let completedText: string | undefined;
   let failure: { error: unknown } | undefined;
+  const operation = binding.authMode === "subscription"
+   ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0) : undefined;
   const failedRoot = new AbortController();
   signal = AbortSignal.any([signal, failedRoot.signal]);
   const stopAdmission = (): void => {
@@ -397,6 +400,11 @@ export class CodexCrossCheck {
    accountant.registerThread(threadId, model, false);
    await postUsage({ event: "init", model, harness: "codex" });
    usageInit = true;
+   let permit: (() => boolean | void) | undefined;
+   do {
+    permit = await operation?.prepare("checker", signal, () => signal.throwIfAborted());
+    signal.throwIfAborted();
+   } while (permit?.() === false);
    startingTurn = true;
    const admissionAttempt = this.client.codexAdmissionReporter?.(claim.run_id, claim.claim_generation)?.begin(threadId);
    const turn = await startupRequest<{ turn?: { id?: string } }>("turn/start", {
@@ -498,6 +506,7 @@ export class CodexCrossCheck {
   } catch (error) {
    failure = { error };
   } finally {
+   operation?.close();
    signal.removeEventListener("abort", stopAdmission);
    auth?.closeAdmissionAndCancel();
    try { await transport?.close(); } catch { cleanupOK = false; }

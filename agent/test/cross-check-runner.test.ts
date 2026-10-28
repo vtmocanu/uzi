@@ -824,3 +824,50 @@ it("checker delivery: a tombstone-set overflow alone fails the check model_error
   assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_error", "terminal:failed"]);
  } finally { spy.mock.restore(); }
 });
+
+for (const cancel of [false, true]) {
+ it(`M3 actual checker runner ${cancel ? "cancels" : "admits"} a required subscription wait`, async () => {
+  const fs = await import("node:fs/promises");
+  const { fileURLToPath } = await import("node:url");
+  const { CrossCheckRunner } = await import("../src/cross-check-runner.js");
+  const { ActiveRunRegistry } = await import("../src/active-run-registry.js");
+  const { acquireCodexOperationScope } = await import("../src/codex-operation-scope.js");
+  const { AdmissionClock, flushUntil } = await import("./operation-admission-clock.js");
+  const root = await fs.mkdtemp(fileURLToPath(new URL("../../.uzi/scratch/m3-checker-", import.meta.url)));
+  const clock = new AdmissionClock();
+  const registry = new ActiveRunRegistry();
+  const c = claim(true); c.claim_generation = 7;
+  const owner = new AbortController();
+  const r = rig({ subscription: true });
+  let reads = 0;
+  const client = {
+   hasFeature: () => true, codexOperationNegotiation: 1,
+   checkCodexOperationAdmission: async (_id: string, request: import("../src/protocol.js").CodexOperationRequest) => {
+    reads++;
+    return reads === 1 ? { decision: "wait", ...request, class: "overload",
+     episode_id: "00000000-0000-4000-8000-000000000091",
+     server_now: new Date(0).toISOString(), eligible_at: new Date(1000).toISOString() }
+     : { decision: "admit", operation_id: request.operation_id, claim_generation: request.claim_generation };
+   },
+   releaseCodex: async () => ({ auth_mode: "subscription", access_token: "released-token", generation: 7, chatgpt_account_id: "account", chatgpt_plan_type: null }),
+   reportState: async () => ({ applied: true }), getInputs: async () => ({ inputs: [] }),
+   postMessages: async () => {}, reportCrossCheckVerdict: async () => {},
+  } as unknown as WorkerClient;
+  const scope = acquireCodexOperationScope(client, c.run_id, 7, { now: () => clock.now, sleep: clock.sleep });
+  const git = { ensureClone: async () => "bare", runnerCloneAtCommit: async () => "checkout", removeRunnerClone: async () => {} } as never;
+  const runner = new CrossCheckRunner(client, git, { ...r.log, warn() {}, info() {}, error() {}, debug() {} } as Logger,
+   { homeRoot: root, activeRuns: registry, pollMs: 1000, model: new CodexCrossCheck(client, r.log, r.deps) });
+  const done = runner.execute(c, owner.signal);
+  try {
+   await flushUntil(() => clock.sleepers.size === 1);
+   assert.equal(registry.build().active[0]?.account_cooldown?.kind, "checker");
+   assert.equal(r.requests.some(f => f.method === "turn/start"), false);
+   if (cancel) owner.abort(); else clock.advance(1000);
+   await done;
+   assert.equal(r.requests.filter(f => f.method === "turn/start").length, cancel ? 0 : 1);
+   assert.equal(reads, cancel ? 1 : 2);
+   assert.equal(registry.size, 0);
+   assert.deepEqual(r.disposed.sort(), ["fileop", "provider"]);
+  } finally { owner.abort(); await done; scope.close(); await fs.rm(root, { recursive: true, force: true }); }
+ });
+}

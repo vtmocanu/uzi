@@ -1,3 +1,4 @@
+import { acquireCodexOperationScope } from "./codex-operation-scope.js";
 import fs from "node:fs/promises";
 import { collectCodeInventory, normalizeCodeCoverage, type CodeInventory } from "./code-cross-check-coverage.js";
 import { decodeCrossCheckClaim, decodeCodeSnapshotCleanup } from "./code-cross-check-contract.js";
@@ -204,7 +205,14 @@ export class CrossCheckRunner {
       } catch (err) { return isStaleClaimRefusal(err); }
     };
     let reason: "malformed" | "model_error" | "model_timeout" | "checker_unavailable" | "confinement_failed" = "checker_unavailable";
-    this.opts.activeRuns?.add(runId, generation);
+    const registration = this.opts.activeRuns?.add(runId, generation);
+    const operation = claim.secrets.codex?.auth_mode === "subscription"
+      ? acquireCodexOperationScope(this.client, runId, generation, {}, op => {
+        if (registration === undefined || op.kind !== "checker") return undefined;
+        const token = this.opts.activeRuns?.setAccountCooldown(runId, generation, op, registration);
+        return token === undefined ? undefined : () => this.opts.activeRuns?.clearAccountCooldown(runId, generation, token);
+      }, ["checker"]) : undefined;
+    operation?.own();
     try {
       const ack = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation });
       if (ack?.staleClaim) return;
@@ -424,6 +432,7 @@ export class CrossCheckRunner {
           this.log.warn("code snapshot retained after cleanup error", { error: errMessage(err) });
         }
       }
+      operation?.close();
       this.opts.activeRuns?.remove(runId);
     }
   }

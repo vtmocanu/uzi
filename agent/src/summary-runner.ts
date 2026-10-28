@@ -141,6 +141,7 @@ export interface DeliverySummaryClaimView {
 }
 
 export interface DeliverySummaryInput {
+  signal?: AbortSignal;
   claim: DeliverySummaryClaimView;
   /** Publication generation, when known, for local diagram diagnostics. */
   claimGeneration?: number;
@@ -308,6 +309,7 @@ export class SummaryRunner {
         homeRoot: this.homeRoot,
         homePrefix: "uzi-summary-",
         label: "summary",
+        signal: input.signal,
         timeoutMs,
         queryFn: this.queryFn,
         denyReason: "the summary runner is read-only and runs no tools",

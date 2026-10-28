@@ -1,3 +1,4 @@
+import { acquireCodexOperationScope } from "./codex-operation-scope.js";
 // The JudgeRunner (PRD #46 M3, Decision 1): a slim runner for a `judge` claim. It
 // fetches the reviewed run's trace through the Bearer trace endpoint, compacts it to a
 // budget, makes ONE structured-output model call on the run owner's Anthropic token,
@@ -191,7 +192,15 @@ export class JudgeRunner {
 
   /** Run one judge claim end to end. Never throws — a failure reports the judge run
    *  failed and returns, so the worker's claim loop keeps going. */
-  async execute(claim: ClaimResponse): Promise<void> {
+  async execute(claim: ClaimResponse, signal?: AbortSignal): Promise<void> {
+    const scope = claim.secrets.codex?.auth_mode === "subscription"
+      ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0) : undefined;
+    scope?.own();
+    try { await this.executeClaim(claim, signal); }
+    finally { scope?.close(); }
+  }
+
+  private async executeClaim(claim: ClaimResponse, signal?: AbortSignal): Promise<void> {
     const judgeRunId = claim.run_id;
     const targetId = claim.target_run_id;
     if (!targetId) {
@@ -211,7 +220,13 @@ export class JudgeRunner {
     // PRD #1390 M2a: a judge attempt holds a run slot, so list it in the worker's
     // ActiveSnapshot at `running` for its whole life (a judge never parks). Removed in the
     // finally below, on every exit path.
-    this.activeRuns?.add(judgeRunId, claim.claim_generation ?? 0);
+    const registration = this.activeRuns?.add(judgeRunId, claim.claim_generation ?? 0);
+    const required = claim.secrets.codex?.auth_mode === "subscription"
+      ? acquireCodexOperationScope(this.client, judgeRunId, claim.claim_generation ?? 0, {}, operation => {
+        if (registration === undefined || operation.kind !== "advice") return undefined;
+        const token = this.activeRuns?.setAccountCooldown(judgeRunId, claim.claim_generation ?? 0, operation, registration);
+        return token === undefined ? undefined : () => this.activeRuns?.clearAccountCooldown(judgeRunId, claim.claim_generation ?? 0, token);
+      }, ["advice"]) : undefined;
     // Build the review. Any failure BEFORE the post still lands the deterministic
     // command-not-found findings the claim carries (Decision 4): a trace-fetch throw
     // must not lose them, so it falls back rather than failing the run with no review.
@@ -249,6 +264,8 @@ export class JudgeRunner {
         this.log.warn("judge claim superseded (stale) at running report; abandoning without posting", {
           run_id: judgeRunId,
         });
+        required?.close();
+        this.activeRuns?.remove(judgeRunId);
         return;
       }
       const trace = await this.fetchTrace(targetId);
@@ -259,7 +276,7 @@ export class JudgeRunner {
       // any other trace/prep failure — the judge lane's "never spuriously fail" posture.
       const selection = selectCodexBinding({ codex: claim.secrets.codex });
       if (selection.kind === "codex") {
-        const judged = await this.judgeCodex(claim, trace, selection.binding);
+        const judged = await this.judgeCodex(claim, trace, selection.binding, signal);
         review = judged.review;
         usageMessage = judged.usageMessage;
       } else {
@@ -296,6 +313,7 @@ export class JudgeRunner {
         );
         // The finally that removes it belongs to the post/complete try below, which this
         // return skips.
+        required?.close();
         this.activeRuns?.remove(judgeRunId);
         return;
       }
@@ -394,6 +412,7 @@ export class JudgeRunner {
       );
     } finally {
       // PRD #1390 M2a: the judge is terminal here on every path — stop listing it.
+      required?.close();
       this.activeRuns?.remove(judgeRunId);
     }
   }
@@ -464,6 +483,7 @@ export class JudgeRunner {
     claim: ClaimResponse,
     trace: JudgeTraceResponse,
     binding: CodexBinding,
+    signal?: AbortSignal,
   ): Promise<{ review: ReviewRequest; usageMessage?: EmittedMessage }> {
     const model = (claim.judge_model ?? "").trim();
     let usageMessage: EmittedMessage | undefined;
@@ -491,6 +511,7 @@ export class JudgeRunner {
         queryFn: this.queryFn,
         denyReason: "the judge is read-only and runs no tools",
         log: this.log,
+        signal,
         codex: { runId: claim.run_id, claimGeneration: claim.claim_generation, binding, buildHarness: this.codexAdviceHarnessFactory },
         onUsage: (modelUsage) => {
           usageMessage = { kind: "status", agent: JUDGE_AGENT, payload: { event: "result", modelUsage } };

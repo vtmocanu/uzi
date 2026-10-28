@@ -1,3 +1,4 @@
+import { acquireCodexOperationScope } from "./codex-operation-scope.js";
 // The ReviewRunner (PRD #400 M4b): the WORKER-side executor for a handoff `--review`
 // run. A review run is a `task`-kind claim carrying a non-null `review_target_run_id`
 // (the reviewed target task run's id). Structurally it mirrors JudgeRunner — a slim
@@ -139,7 +140,15 @@ export class ReviewRunner {
   /** Run one diff-review claim end to end. Never throws — a failure reports the review
    *  run failed (and, where possible, posts a `failed` review) and returns, so the
    *  worker's claim loop keeps going. */
-  async execute(claim: ClaimResponse): Promise<void> {
+  async execute(claim: ClaimResponse, signal?: AbortSignal): Promise<void> {
+    const scope = claim.secrets.codex?.auth_mode === "subscription"
+      ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0) : undefined;
+    scope?.own();
+    try { await this.executeClaim(claim, signal); }
+    finally { scope?.close(); }
+  }
+
+  private async executeClaim(claim: ClaimResponse, signal?: AbortSignal): Promise<void> {
     const reviewRunId = claim.run_id;
     const targetId = claim.review_target_run_id;
     if (!targetId) {
@@ -175,7 +184,13 @@ export class ReviewRunner {
     // PRD #1390 M2a: a review attempt holds a run slot, so list it in the worker's
     // ActiveSnapshot at `running` for its whole life (a review never parks). Removed in the
     // finally below, on every exit path.
-    this.activeRuns?.add(reviewRunId, claim.claim_generation ?? 0);
+    const registration = this.activeRuns?.add(reviewRunId, claim.claim_generation ?? 0);
+    const required = claim.secrets.codex?.auth_mode === "subscription"
+      ? acquireCodexOperationScope(this.client, reviewRunId, claim.claim_generation ?? 0, {}, operation => {
+        if (registration === undefined || operation.kind !== "advice") return undefined;
+        const token = this.activeRuns?.setAccountCooldown(reviewRunId, claim.claim_generation ?? 0, operation, registration);
+        return token === undefined ? undefined : () => this.activeRuns?.clearAccountCooldown(reviewRunId, claim.claim_generation ?? 0, token);
+      }, ["advice"]) : undefined;
     // Compute the review. Any failure BEFORE the post falls back to a `failed` review so
     // the reviewed run still receives a (report-only) result rather than nothing.
     let review: TaskReviewRequest;
@@ -238,7 +253,7 @@ export class ReviewRunner {
           modelUsage = snapshot;
         };
         if (selection.kind === "codex") {
-          review = await this.reviewCodex(claim, diff, selection.binding, onUsage);
+          review = await this.reviewCodex(claim, diff, selection.binding, onUsage, signal);
         } else {
           const token = claim.secrets?.anthropic_oauth_token?.trim();
           if (!token) {
@@ -344,6 +359,7 @@ export class ReviewRunner {
       );
     } finally {
       // PRD #1390 M2a: the review is terminal here on every path — stop listing it.
+      required?.close();
       this.activeRuns?.remove(reviewRunId);
     }
   }
@@ -375,6 +391,7 @@ export class ReviewRunner {
   private async reviewCodex(
     claim: ClaimResponse, diff: string, binding: CodexBinding,
     onUsage: (snapshot: AdviceUsageSnapshot) => void,
+    signal?: AbortSignal,
   ): Promise<TaskReviewRequest> {
     try {
       if (!this.codexAdviceHarnessFactory) {
@@ -393,6 +410,7 @@ export class ReviewRunner {
         homePrefix: "uzi-review-",
         label: "review",
         timeoutMs: this.modelTimeoutMs,
+        signal,
         queryFn: this.queryFn,
         denyReason: "the reviewer is read-only and runs no tools",
         log: this.log,

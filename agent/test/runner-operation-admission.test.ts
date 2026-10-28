@@ -601,3 +601,85 @@ it("M2 re-registration plus source replacement at final guard preserves unavaila
     await done;
   }
 });
+
+it("M3 revision child and advice reuse the immutable source without spending another revision", async t => {
+  enable();
+  const fixture = providerFixture("codex", n => ({ plan: n === 1 ? "# original" : "# revised" }), false, { subscription: true });
+  const reads: CodexOperationRequest[] = [];
+  t.mock.method(client, "checkCodexOperationAdmission", async (_id: string, request: CodexOperationRequest) => {
+    reads.push(structuredClone(request));
+    return { decision: "admit", operation_id: request.operation_id, claim_generation: request.claim_generation };
+  });
+  const original = fixture.executor.run.bind(fixture.executor);
+  t.mock.method(fixture.executor, "run", async (ctx: RunContext) => {
+    const prepare = ctx.prepareCodexRootDispatch!;
+    ctx.prepareCodexRootDispatch = async (signal, check, kind) => {
+      const permit = await prepare(signal, check, kind);
+      if (reads.at(-1)?.source && (!kind || kind === "root")) {
+        assert.equal((await prepare(signal, check, "child"))(), true);
+        assert.equal((await prepare(signal, check, "advice"))(), true);
+      }
+      return permit;
+    };
+    return original(ctx);
+  });
+  const claim = freshClaim(7, { config: { plan_max_revisions: 1 },
+    secrets: { forge_pat: "fixture-forge-pat", codex: fixture.credential } });
+  const r = runner(fixture.executor, fakeGitlab().gitlab);
+  const done = r.execute(claim);
+  try {
+    assert.ok(await until(() => gates(claim.run_id).length === 1));
+    const [revision] = send(claim.run_id, row("revise_plan", "one revision only"));
+    assert.ok(await until(() => gates(claim.run_id).length === 2));
+    const revisionReads = reads.filter(read => !!read.source);
+    assert.deepEqual(revisionReads.map(read => read.kind), ["root", "child", "advice"]);
+    for (const read of revisionReads) assert.deepEqual(read.source, {
+      gate_revision: 1,
+      presentation_id: gates(claim.run_id)[0]!.presentation_id,
+      revision_input_id: revision!.id,
+    });
+    assert.equal(new Set(revisionReads.map(read => read.operation_id)).size, 3);
+    assert.equal(fixture.starts.length, 2);
+    assert.ok(api.isApplied(claim.run_id, revision!.id));
+    send(claim.run_id, row("cancel"));
+    await done;
+  } finally { r.shutdown(); await done; }
+});
+
+for (const kind of ["child", "advice"] as const) {
+  it(`M3 ${kind === "child" ? "child admission" : "actual advice"} snapshot labels only required work`, async t => {
+    enable();
+    const clock = new AdmissionClock();
+    const registry = new ActiveRunRegistry();
+    const fixture = providerFixture("codex", () => ({ plan: "# Plan" }), false, { subscription: true });
+    let waited = false;
+    t.mock.method(client, "checkCodexOperationAdmission", async (_id: string, request: CodexOperationRequest) => {
+      if (request.kind === kind && !waited) {
+        waited = true;
+        return { decision: "wait", ...request, class: "overload", episode_id: "00000000-0000-4000-8000-000000000091",
+          server_now: new Date(0).toISOString(), eligible_at: new Date(1000).toISOString() };
+      }
+      return { decision: "admit", operation_id: request.operation_id, claim_generation: request.claim_generation };
+    });
+    const original = fixture.executor.run.bind(fixture.executor);
+    t.mock.method(fixture.executor, "run", async (ctx: RunContext) => {
+      const permit = await ctx.prepareCodexRootDispatch!(new AbortController().signal, () => {}, kind);
+      assert.equal(permit(), true);
+      return original(ctx);
+    });
+    const claim = freshClaim(7, { secrets: { forge_pat: "fixture-forge-pat", codex: fixture.credential } });
+    const r = runner(fixture.executor, fakeGitlab().gitlab, undefined, { activeRuns: registry,
+      codexOperationWaitPolicy: { now: () => clock.now, sleep: clock.sleep } });
+    const done = r.execute(claim);
+    try {
+      assert.ok(await until(() => clock.sleepers.size === 1));
+      const snapshot = registry.build().active.find(entry => entry.run_id === claim.run_id)!;
+      assert.equal(snapshot.account_cooldown?.kind, kind === "child" ? "child" : undefined);
+      clock.advance(1000);
+      assert.ok(await until(() => gates(claim.run_id).length === 1));
+      assert.equal(registry.build().active.find(entry => entry.run_id === claim.run_id)?.account_cooldown, undefined);
+      send(claim.run_id, row("cancel"));
+      await done;
+    } finally { r.shutdown(); await done; }
+  });
+}

@@ -1,3 +1,4 @@
+import { acquireCodexOperationScope } from "../codex-operation-scope.js";
 import type { CodexAdmissionReporter } from "./admission-signal.js";
 import { checkCheckpointStop, cleanCheckpointAdmission, CheckpointSoftDeadlineError } from "../checkpoint-stop.js";
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production `CodexExecutor` and the
@@ -1178,6 +1179,7 @@ export async function makeCodexAdviceHarness(
   refresh?: "deny",
   ownership?: SummaryOwnership,
   admissionReporter?: CodexAdmissionReporter,
+  operationScope?: import("./codex-advice-harness.js").CodexAdviceHarnessOptions["operationScope"],
 ): Promise<CodexAdviceHarness> {
   // Register EVERY advice token — the initial release AND any subscription refresh — with the
   // harness redactor so neither can ride a log line verbatim. The advice lane has no separate
@@ -1193,7 +1195,7 @@ export async function makeCodexAdviceHarness(
   ownership?.guard();
   registerToken(initial);
   const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken, refresh === "deny"));
-  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log, admissionReporter });
+  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log, admissionReporter, operationScope });
 }
 
 /** One evaluator pass on a caller-provided key. Register CLI signal cleanup before run;
@@ -1442,15 +1444,26 @@ export function makeProductionCodexAdviceHarnessFactory(
   client: WorkerClient,
   log: Logger,
   homeRoot: string,
+  deps: { launchRoot?: LaunchAdviceRootSeam } = {},
 ): CodexAdviceHarnessFactory {
   return async (params: CodexAdviceHarnessBuildParams): Promise<CodexAdviceHarness> => {
     const { runId, binding, signal, refresh } = params;
     const ownership = summaryOwnership.get(params);
     ownership?.guard();
-    const bridge = new CodexAdviceCredentialBridge(runId, client, binding);
-    const launchRoot = makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log, ownership);
-    return makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership,
-      binding.authMode === "subscription" ? client.codexAdmissionReporter?.(runId, params.claimGeneration) : undefined);
+    // Retain the owner's scope before credential release can yield. A delayed advice
+    // launch must still observe root closure, rather than create a fresh unbound scope.
+    const scope = binding.authMode === "subscription"
+      ? acquireCodexOperationScope(client, runId, params.claimGeneration ?? 0) : undefined;
+    const close = (): void => { signal?.removeEventListener("abort", close); scope?.close(); };
+    signal?.addEventListener("abort", close, { once: true });
+    if (signal?.aborted) close();
+    try {
+      const bridge = new CodexAdviceCredentialBridge(runId, client, binding);
+      const launchRoot = deps.launchRoot ?? makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log, ownership);
+      return await makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership,
+        binding.authMode === "subscription" ? client.codexAdmissionReporter?.(runId, params.claimGeneration) : undefined,
+        scope ? () => ({ prepare: (signal, check) => scope.prepare("advice", signal, () => { ownership?.guard(); check(); }), close }) : undefined);
+    } catch (error) { close(); throw error; }
   };
 }
 
@@ -2828,8 +2841,16 @@ export class CodexExecutor implements Executor {
     this.assertCaptureAdmission();
     if (this.runActive) throw new TrustedExecutionRefusal("codex run already active");
     this.runActive = true;
+    const operation = this.opts.binding.authMode === "subscription" && !ctx.prepareCodexRootDispatch
+      ? acquireCodexOperationScope(this.opts.client, ctx.runId, ctx.claimGeneration ?? 0) : undefined;
+    operation?.own();
+    if (operation) ctx = { ...ctx,
+      codexRootAdmissionActive: () => operation.controller.active(),
+      prepareCodexRootDispatch: (signal, check, kind = "root") => operation.prepare(kind,
+        AbortSignal.any([signal, ...[ctx.terminalLifecycleSignal].filter((s): s is AbortSignal => !!s)]), check),
+    };
     try { return await this.runLeg(ctx); }
-    finally { this.runActive = false; }
+    finally { operation?.close(); this.runActive = false; }
   }
 
   private async runLeg(ctx: RunContext): Promise<ExecutorResult> {
@@ -5075,7 +5096,7 @@ export class CodexExecutor implements Executor {
           registry,
           roles: runPlan.roles,
           startChildTurn: (spec: StartChildTurnSpec) =>
-            this.startChildTurn(harness!, provider, worktreePath, spec, childInterruptDeadlineMs(boundaryDeadlineMs)),
+            this.startChildTurn(harness!, provider, worktreePath, spec, childInterruptDeadlineMs(boundaryDeadlineMs), ctx),
           spawnCommand,
           fileop,
           worktreePath,
@@ -6100,6 +6121,7 @@ export class CodexExecutor implements Executor {
     workspace: string,
     spec: StartChildTurnSpec,
     interruptDeadlineMs: number,
+    ctx: RunContext,
   ): Promise<ChildThreadController> {
     return (async (): Promise<ChildThreadController> => {
       // Start a CHILD thread on the SAME app-server transport as the root (same untrusted
@@ -6140,6 +6162,23 @@ export class CodexExecutor implements Executor {
         };
         if (spec.model !== undefined) turnParams.model = spec.model;
         if (spec.effort !== undefined) turnParams.effort = spec.effort;
+        const revision = this.captureRevision;
+        const check = (): void => {
+          spec.signal?.throwIfAborted();
+          if (ctx.cancelRequested?.() || ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted)
+            throw new CodexRequestFailure("parent_abort");
+          this.assertCaptureAdmission(revision);
+          assertResidueQuarantineOpen("provider_turn");
+        };
+        let permit: (() => boolean | void) | undefined;
+        const waiting = new AbortController();
+        this.rootAdmissionWaits.add(waiting);
+        try {
+          do {
+            permit = await ctx.prepareCodexRootDispatch?.(AbortSignal.any([waiting.signal, ...(spec.signal ? [spec.signal] : [])]), check, "child");
+            check();
+          } while (permit?.() === false);
+        } finally { this.rootAdmissionWaits.delete(waiting); }
         admissionAttempt = harness.beginAdmissionAttempt(childThreadId);
         const turnRes = await harness.requestOnTransport<{ turn?: { id?: string } }>("turn/start", turnParams, { signal: spec.signal });
         const id = turnRes?.turn?.id;

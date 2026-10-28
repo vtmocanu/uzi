@@ -141,11 +141,11 @@ export interface RunContext {
   /** Issue #2686: true once this run's claim is fenced (lost), so accounting-only side messages
    *  (summary_usage) are suppressed. Absent = never fenced (stub/test executors). */
   claimFenced?(): boolean;
-  /** Root-only, fresh operation admission at the lazy provider send boundary.
+  /** Fresh operation admission for root/child/advice at the lazy provider send boundary.
    * Returns the repeatable local source guard; no recovery grant is consumed.
    */
   codexRootAdmissionActive?(): boolean;
-  prepareCodexRootDispatch?(signal: AbortSignal, check: () => void): Promise<() => boolean | void>;
+  prepareCodexRootDispatch?(signal: AbortSignal, check: () => void, kind?: import("./protocol.js").CodexOperationIdentity["kind"]): Promise<() => boolean | void>;
   /** Run kind (PRD #6). "issue" (default when absent) works issueIid's card;
    *  "ci_fix" diagnoses + fixes `pipeline`. */
   kind?: RunKind;

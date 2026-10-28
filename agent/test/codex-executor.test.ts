@@ -26207,3 +26207,67 @@ describe("M2 lazy root operation admission", () => {
   });
 
 });
+
+it("M3 actual child send retries final permits and leaves the root demux running during its independent wait", async () => {
+  const rig = makeRig({ responder: c => {
+    if (c.method === "turn/start" && c.turnStartCount > 1) {
+      c.transport.push(turnCompleted("completed", "th-child", "tn-child"));
+    }
+    return defaultResponder(c);
+  } });
+  const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+  let release!: () => void;
+  let preparations = 0;
+  const { ctx } = makeCtx({ agents: [
+    { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+    { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+  ], prepareCodexRootDispatch: async (signal, check, kind) => {
+    if (kind !== "child") return () => true;
+    const n = ++preparations;
+    if (n === 1) await new Promise<void>(resolve => { release = resolve; });
+    signal.throwIfAborted(); check();
+    return () => n > 1;
+  } });
+  rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "work" }, "th-1", "tn-1", "m3-delegate"));
+  const done = executor.run(ctx);
+  await waitFor(() => !!release, "child admission wait");
+  assert.equal(rig.transport.requests.filter(r => r.method === "turn/start").length, 1);
+  rig.transport.push(toolCall(2, "uzi_bash", { command: "echo demux" }, "th-1", "tn-1", "m3-root-shell"));
+  await waitFor(() => rig.transport.responses.some(r => r.requestId === 2), "root callback while child waits");
+  release();
+  await waitFor(() => rig.transport.responses.some(r => r.requestId === 1), "child settles");
+  rig.transport.push(signalDone()).push(turnCompleted()).end();
+  await withTimeout(done, 3000, "M3 child dispatch");
+  assert.equal(preparations, 2);
+  assert.equal(rig.transport.requests.filter(r => r.method === "turn/start").length, 2);
+});
+
+for (const stop of ["deadline", "parent terminal", "parent cancel"] as const) {
+  it(`M3 child admission settles on ${stop} without sending its turn`, async () => {
+    const rig = makeRig();
+    const executor = makeExecutor({ ...rig, deps: { ...rig.deps, childTurnDeadlineMs: stop === "deadline" ? 30 : 5000 } }, bindingOf(SUBSCRIPTION));
+    const owner = new AbortController();
+    let waiting = false;
+    const { ctx } = makeCtx({ signal: owner.signal, agents: [
+      { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+      { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+    ], prepareCodexRootDispatch: async (signal, _check, kind) => {
+      if (kind !== "child") return () => true;
+      waiting = true;
+      await new Promise<void>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      throw new Error("unreachable");
+    } });
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "work" }, "th-1", "tn-1", "m3-delegate"));
+    const done = executor.run(ctx);
+    const settled = stop === "parent cancel" ? assert.rejects(done, /run cancelled/) : done;
+    await waitFor(() => waiting, "child waits before send");
+    if (stop === "parent cancel") owner.abort();
+    else if (stop === "parent terminal") rig.transport.push(signalDone()).push(turnCompleted()).end();
+    else {
+      await waitFor(() => rig.transport.responses.some(r => r.requestId === 1), "child deadline reply");
+      rig.transport.push(signalDone()).push(turnCompleted()).end();
+    }
+    await withTimeout(settled.then(() => undefined), 3000, `M3 child ${stop}`);
+    assert.equal(rig.transport.requests.filter(r => r.method === "turn/start").length, 1);
+  });
+}

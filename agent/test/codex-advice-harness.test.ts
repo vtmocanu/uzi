@@ -1,3 +1,6 @@
+import { acquireCodexOperationScope } from "../src/codex-operation-scope.js";
+import { AdmissionClock, flushUntil } from "./operation-admission-clock.js";
+import type { CodexOperationRequest } from "../src/protocol.js";
 import { describe, it } from "node:test";
 import { ownedSummaryHarnesses } from "../src/codex/summary-ownership.js";
 import assert from "node:assert/strict";
@@ -15,7 +18,7 @@ import type { AdviceRequest, AdviceResultPolicy } from "../src/harness.js";
 import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
 import type { Logger } from "../src/log.js";
 import { runReadOnlyModelPass } from "../src/model-pass.js";
-import { CodexAdviceCredentialBridge, CODEX_PRODUCTION_PROVIDER, makeCodexAdviceHarness } from "../src/codex/codex-executor.js";
+import { CodexAdviceCredentialBridge, CODEX_PRODUCTION_PROVIDER, makeCodexAdviceHarness, makeProductionCodexAdviceHarnessFactory } from "../src/codex/codex-executor.js";
 import { selectCodexBinding } from "../src/codex/select.js";
 import type { AdviceUsageSnapshot } from "../src/harness.js";
 import {
@@ -263,6 +266,7 @@ interface Bits {
 
 function makeHarness(
   opts: {
+    operationScope?: CodexAdviceHarnessOptions["operationScope"];
     admissionReporter?: import("../src/codex/admission-signal.js").CodexAdmissionReporter;
     transport?: FakeTransport;
     credentialValue?: string;
@@ -293,6 +297,7 @@ function makeHarness(
   };
   const harness = new CodexAdviceHarness({
     admissionReporter: opts.admissionReporter,
+    operationScope: opts.operationScope,
     launchRoot,
     provider: opts.provider ?? provider,
     appServerAuth: opts.appServerAuth,
@@ -1569,4 +1574,220 @@ describe("makeCodexAdviceHarness: refresh deny (PRD #2603, the Now summary share
   it("control: without the deny the same request refreshes through the client", async () => {
     assert.deepEqual(await runWithRefreshRequest(undefined), { refreshCalls: 1, replied: "result" });
   });
+});
+
+
+it("M3 actual advice dispatch shares the flight schedule but requires its own admit without blocking the root", async () => {
+  const clock = new AdmissionClock();
+  const reads: CodexOperationRequest[] = [];
+  let badges = 0;
+  const client = {
+    hasFeature: () => true, codexOperationNegotiation: 1,
+    retainCodexOperationFlight: () => () => {},
+    checkCodexOperationAdmission: async (_id: string, r: CodexOperationRequest) => {
+      reads.push(r);
+      return reads.length === 1 ? { decision: "wait" as const, ...r, class: "overload" as const,
+        episode_id: "00000000-0000-4000-8000-000000000091",
+        server_now: new Date(0).toISOString(), eligible_at: new Date(1000).toISOString() }
+        : { decision: "admit" as const, operation_id: r.operation_id, claim_generation: r.claim_generation };
+    },
+  };
+  const flight = acquireCodexOperationScope(client, "run", 7, { now: () => clock.now, sleep: clock.sleep },
+    () => { badges++; return () => { badges--; }; });
+  const bits = makeHarness({ operationScope: () => {
+    const scope = acquireCodexOperationScope(client, "run", 7);
+    return { prepare: (signal, check) => scope.prepare("advice", signal, check), close: scope.close };
+  } });
+  bits.transport.push(agentMessage("ok")).push(turnCompleted()).end();
+  const done = bits.harness.run(makeAdviceRequest(), noThrowPolicy);
+  try {
+    await flushUntil(() => clock.sleepers.size === 1);
+    assert.equal(bits.transport.requests.some(r => r.method === "turn/start"), false);
+    assert.equal(badges, 0, "optional advice cannot label the working root blocked");
+    const sibling = flight.prepare("child", new AbortController().signal, () => {});
+    clock.advance(1000);
+    await Promise.all([done, sibling]);
+    assert.deepEqual(reads.map(r => r.kind), ["advice", "advice", "child"]);
+    assert.equal(new Set(reads.map(r => r.operation_id)).size, 2);
+    assert.equal(bits.transport.requests.filter(r => r.method === "turn/start").length, 1);
+    assert.equal(bits.disposeCalls(), 1);
+  } finally { flight.close(); }
+});
+
+it("M3 actual advice retries an invalidated final permit and retains its whole-call timeout", async () => {
+  let preparations = 0;
+  let closed = 0;
+  const bits = makeHarness({ operationScope: () => ({
+    prepare: async () => { const n = ++preparations; return () => n > 1; },
+    close: () => { closed++; },
+  }) });
+  bits.transport.push(agentMessage("ok")).push(turnCompleted()).end();
+  await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
+  assert.equal(preparations, 2);
+  assert.equal(bits.transport.requests.filter(r => r.method === "turn/start").length, 1);
+  assert.equal(closed, 1);
+  const held = makeHarness({ operationScope: () => ({
+    prepare: (signal) => new Promise((_, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }), close: () => { closed++; },
+  }) });
+  await assert.rejects(held.harness.run(makeAdviceRequest({ timeoutMs: 30 }), noThrowPolicy),
+    /review model call exceeded 30ms/);
+  assert.equal(held.transport.requests.some(r => r.method === "turn/start"), false);
+  assert.equal(held.disposeCalls(), 1);
+  assert.equal(closed, 2);
+});
+
+// This table drives callers through the production factory/auth/harness, not a
+// factory returning a precomputed successful AdviceResult.
+for (const family of ["judge", "review", "intent", "plan", "delivery", "now"] as const) {
+  for (const cancel of [false, true]) {
+    it(`M3 actual advice caller ${family} ${cancel ? "cancels" : "admits"} through the production subscription factory`, async () => {
+      const fs = await import("node:fs/promises");
+      const { fileURLToPath } = await import("node:url");
+      const { JudgeRunner } = await import("../src/judge-runner.js");
+      const { ReviewRunner } = await import("../src/review-runner.js");
+      const { SummaryRunner } = await import("../src/summary-runner.js");
+      const { ActiveRunRegistry } = await import("../src/active-run-registry.js");
+      const { NowSummaryController, nowSummaryCodexClaim } = await import("../src/now-summary.js");
+      const homeRoot = await fs.mkdtemp(fileURLToPath(new URL("../../.uzi/scratch/m3-advice-", import.meta.url)));
+      const clock = new AdmissionClock();
+      const reads: CodexOperationRequest[] = [];
+      const owner = new AbortController();
+      const registry = new ActiveRunRegistry();
+      let releases = 0;
+      let retained = 0;
+      let posted: unknown;
+      const codex = { auth_mode: "subscription" as const, access_token: "claim-token", capability: "cap", generation: 3,
+        chatgpt_account_id: "verified-account", chatgpt_plan_type: null };
+      const claim = { run_id: "run", claim_generation: 7, kind: family === "judge" ? "judge" : "task", target_run_id: "target",
+        review_target_run_id: "target", branch: "topic", last_seq: 0, judge_model: "gpt-6-astra", agents: [],
+        repo: { clone_url: "https://example.test/repo.git", default_branch: "main" }, secrets: { forge_pat: "", codex } } as unknown as import("../src/protocol.js").ClaimResponse;
+      const client = {
+        hasFeature: () => true, codexOperationNegotiation: 1,
+        retainCodexOperationFlight: () => { retained++; return () => { retained--; }; },
+        checkCodexOperationAdmission: async (_id: string, r: CodexOperationRequest) => {
+          reads.push(r);
+          return reads.length === 1 ? { decision: "wait" as const, ...r, class: "overload" as const,
+            episode_id: "00000000-0000-4000-8000-000000000091",
+            server_now: new Date(0).toISOString(), eligible_at: new Date(1000).toISOString() }
+            : { decision: "admit" as const, operation_id: r.operation_id, claim_generation: r.claim_generation };
+        },
+        releaseCodex: async () => { releases++; return { auth_mode: "subscription", access_token: "released-token", generation: 3, chatgpt_account_id: "verified-account" }; },
+        getTrace: async () => ({ target: { id: "target", kind: "issue", status: "completed", issue_title: "Work", issue_description: "Work" }, messages: [], inputs: [] }),
+        reportState: async () => ({ applied: true }), postMessages: async () => {},
+        postReview: async (_id: string, value: unknown) => { posted = value; },
+        postTaskReview: async (_id: string, value: unknown) => { posted = value; },
+      } as unknown as import("../src/client.js").WorkerClient;
+      const scope = acquireCodexOperationScope(client, "run", 7, { now: () => clock.now, sleep: clock.sleep });
+      const output = family === "judge" ? { verdict: "ok", summary: "Reviewed", recommendations: [] }
+        : family === "review" ? { status: "complete", summary: "Reviewed", findings: [] }
+        : family === "plan" ? { summary: "Planned", deltas: [] }
+        : { summary: "Delivered", changes: [], scope_notes: [], review_pointers: [] };
+      const transport = new FakeTransport(authResponder);
+      transport.push(agentMessage(family === "intent" || family === "now" ? "Implement the change" : JSON.stringify(output))).push(turnCompleted()).end();
+      const factory = makeProductionCodexAdviceHarnessFactory(client, noopLog, homeRoot, {
+        launchRoot: async () => ({ transport, cwd: homeRoot, dispose: async () => {} }),
+      });
+      const options = { homeRoot, activeRuns: registry, modelTimeoutMs: 5000, codexAdviceHarnessFactory: factory };
+      const summary = new SummaryRunner(noopLog, options);
+      const input = { claim, token: "", model: "", issueTitle: "Work", issueBody: "Work", signal: owner.signal };
+      const runNow = async (): Promise<string | undefined> => {
+        let pass: Promise<string> | undefined;
+        const controller = new NowSummaryController({
+          steering: { lifecycleSignal: () => owner.signal, claimFence: () => undefined, nowSummaryEnabled: () => true },
+          claim: { kind: "issue", claude: false, ...nowSummaryCodexClaim("run", codex, factory, 7) },
+          emit() {}, runPass: opts => { pass = runReadOnlyModelPass(opts); return pass; },
+          pass: { homeRoot, queryFn: (async () => { throw new Error("unexpected Claude call"); }) as never },
+          now: Date.now, setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: timer => clearTimeout(timer as NodeJS.Timeout), log: noopLog,
+        });
+        controller.start();
+        controller.observeProgress({ in_progress: ["m1"], completed: [] }, [{ id: "m1", title: "Work" }]);
+        controller.observeFrame({ kind: "tool_use", agent: "lead", payload: { id: "tool", name: "Read", input: { file_path: "a.ts" } } });
+        try {
+          await flushUntil(() => pass !== undefined);
+          return await pass?.catch(() => undefined);
+        } finally { await controller.stop(); }
+      };
+      const invoke = () => family === "now" ? runNow() : family === "judge" ? new JudgeRunner(client, noopLog, options).execute(claim, owner.signal)
+        : family === "review" ? new ReviewRunner(client, { ensureClone: async () => "bare", reviewDiff: async () => "diff" } as never, noopLog, options).execute(claim, owner.signal)
+        : family === "intent" ? summary.generateIntentSummary(input)
+        : family === "plan" ? summary.generatePlanSummary({ ...input, planMd: "Plan" })
+        : summary.generateDeliverySummary({ claim, deadlineMs: Date.now() + 5000, signal: owner.signal,
+          context: { issue: "Work", prd: null, plan: null, previous: null, claims: null, commits: "", paths: "", diff: "", bytes: 4,
+            truncated: { issue: false, prd: false, plan: false, previous: false, claims: false, commits: false, paths: false, diff: false } } });
+      const done = invoke();
+      try {
+        await flushUntil(() => clock.sleepers.size === 1);
+        assert.equal(releases, 1, "credential release remains usable before admission");
+        assert.equal(transport.requests.some(r => r.method === "turn/start"), false);
+        const snapshot = registry.build().active[0];
+        if (family === "judge" || family === "review") {
+          assert.equal(snapshot?.account_cooldown?.kind, "advice");
+        } else assert.equal(snapshot, undefined, "optional advice never registers a blocked root");
+        if (cancel) owner.abort(); else clock.advance(1000);
+        const result = await done;
+        assert.equal(transport.requests.filter(r => r.method === "turn/start").length, cancel ? 0 : 1);
+        assert.equal(reads.length, cancel ? 1 : 2);
+        assert.equal(reads[0]?.kind, "advice");
+        assert.equal(reads[0]?.claim_generation, 7);
+        if (!cancel && reads[1]) assert.equal(reads[0]?.operation_id, reads[1].operation_id);
+        if (!cancel && (family === "judge" || family === "review")) assert.equal((posted as { summary: string }).summary, "Reviewed");
+        if (!cancel && family !== "judge" && family !== "review") assert.ok(result);
+        assert.equal(registry.size, 0);
+      } finally {
+        owner.abort();
+        await done;
+        scope.close();
+        assert.equal(retained, 0);
+        assert.deepEqual(await fs.readdir(homeRoot), [], "model-pass cleaned its HOME");
+        await fs.rm(homeRoot, { recursive: true });
+      }
+    });
+  }
+}
+
+it("M3 actual advice built before root closure cannot acquire a fresh unbound scope at dispatch", async () => {
+  let reads = 0;
+  const codex = { auth_mode: "subscription", access_token: "claim-token", capability: "cap", generation: 3,
+    chatgpt_account_id: "verified-account", chatgpt_plan_type: null };
+  const selection = selectCodexBinding({ codex });
+  assert.equal(selection.kind, "codex");
+  if (selection.kind !== "codex") return;
+  const client = {
+    hasFeature: () => true, codexOperationNegotiation: 1,
+    releaseCodex: async () => ({ auth_mode: "subscription", access_token: "released-token", generation: 3, chatgpt_account_id: "verified-account" }),
+    checkCodexOperationAdmission: async () => { reads++; throw new Error("unexpected read"); },
+  } as unknown as import("../src/client.js").WorkerClient;
+  const root = acquireCodexOperationScope(client, "run", 7);
+  root.bind(async () => () => true);
+  const transport = new FakeTransport(authResponder);
+  transport.push(agentMessage("ok")).push(turnCompleted()).end();
+  const factory = makeProductionCodexAdviceHarnessFactory(client, noopLog, "/unused", {
+    launchRoot: async () => ({ transport, cwd: "/isolated", dispose: async () => {} }),
+  });
+  const harness = await factory({ runId: "run", claimGeneration: 7, binding: selection.binding });
+  root.close();
+  await assert.rejects(harness.run(makeAdviceRequest(), noThrowPolicy), /owner closed/);
+  assert.equal(reads, 0);
+  assert.equal(transport.requests.some(r => r.method === "turn/start"), false);
+});
+
+it("M3 advice inventory names every worker send sink and model-pass caller", async () => {
+  const fs = await import("node:fs/promises");
+  const src = new URL("../src/", import.meta.url);
+  const paths = (await fs.readdir(src, { recursive: true })).filter(p => p.endsWith(".ts"));
+  const sinks: string[] = [];
+  const callers: string[] = [];
+  for (const path of paths) {
+    const source = await fs.readFile(new URL(path, src), "utf8");
+    if (/\b(?:transport!?\.request|harness\.requestOnTransport|startupRequest)<[^;]+?>\("turn\/start"/.test(source)) sinks.push(path);
+    if (/\b(?:await|return) runReadOnlyModelPass\(/.test(source)) callers.push(path);
+  }
+  assert.deepEqual(sinks.sort(), ["codex/codex-advice-harness.ts", "codex/codex-executor.ts", "codex/codex-harness.ts", "codex/cross-check.ts"]);
+  assert.deepEqual(callers.sort(), ["judge-runner.ts", "plan-contract-review.ts", "pr-description-eval-cli.ts", "review-runner.ts", "summary-runner.ts"]);
+  const inventory = await fs.readFile(new URL("codex-operation-scope.ts", src), "utf8");
+  for (const family of ["JudgeRunner", "ReviewRunner", "SummaryRunner", "NowSummaryController", "CrossCheckRunner", "coverage", "replay", "evaluator", "compaction", "continuations", "retries"]) {
+    assert.ok(inventory.includes(family), `inventory omits ${family}`);
+  }
 });

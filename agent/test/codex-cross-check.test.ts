@@ -1,3 +1,4 @@
+import type { CodexOperationRequest, CodexOperationDecision } from "../src/protocol.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough, Writable } from "node:stream";
@@ -97,6 +98,7 @@ it("admission observer binds checker dispatch and sees terminal HTTP429 independ
 });
 
 function rig(options: {
+ operationRead?: (r: CodexOperationRequest, signal?: AbortSignal) => Promise<CodexOperationDecision>;
  admissionReporter?: import("../src/codex/admission-signal.js").CodexAdmissionReporter;
  round?: number;
  notes?: (emit: Emit) => void;
@@ -192,8 +194,12 @@ function rig(options: {
   launchProvider: async (spec) => { specs.push(spec); return provider; },
  };
  let releases = 0;
- const client: Pick<WorkerClient, "releaseCodex" | "refreshCodex"> & Partial<Pick<WorkerClient, "codexAdmissionReporter">> = {
+ const client: Pick<WorkerClient, "releaseCodex" | "refreshCodex"> & Partial<Pick<WorkerClient, "codexAdmissionReporter" | "hasFeature" | "codexOperationNegotiation" | "checkCodexOperationAdmission" | "retainCodexOperationFlight">> = {
   codexAdmissionReporter: () => options.admissionReporter,
+  hasFeature: () => !!options.operationRead,
+  codexOperationNegotiation: options.operationRead ? 1 : 0,
+  checkCodexOperationAdmission: (_id, request, signal) => options.operationRead!(request, signal),
+  retainCodexOperationFlight: () => () => {},
   releaseCodex: async () => { releases++; return options.subscription
    ? { auth_mode: "subscription", access_token: "released-token", generation: 7, chatgpt_account_id: "account", chatgpt_plan_type: null }
    : { auth_mode: "api_key", access_token: "released-token" }; },
@@ -1048,4 +1054,40 @@ it("activity: a throwing recorder never fails the check", async () => {
   onToolReply: (_f, emit) => r.terminal(emit) });
  assert.equal(await r.run(), verdict);
  assert.ok(sent);
+});
+
+
+it("M3 actual checker admission holds the actual RPC, owner cancellation settles both roots", async () => {
+ const control = new AbortController();
+ let entered!: () => void;
+ const ready = new Promise<void>(resolve => { entered = resolve; });
+ const reads: CodexOperationRequest[] = [];
+ const r = rig({ subscription: true, operationRead: async (request, signal) => {
+  reads.push(request); entered();
+  await new Promise<void>((_, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+  throw new Error("unreachable");
+ } });
+ const done = r.run(control.signal);
+ const rejected = assert.rejects(done);
+ await ready;
+ assert.equal(reads[0]!.kind, "checker");
+ assert.equal(r.requests.some(frame => frame.method === "turn/start"), false);
+ control.abort(new Error("owner cancelled"));
+ await rejected;
+ assert.deepEqual(r.disposed.sort(), ["fileop", "provider"]);
+ assert.equal(r.requests.some(frame => frame.method === "turn/start"), false);
+});
+
+it("M3 actual checker gets a fresh admit immediately before its actual turn", async () => {
+ const reads: CodexOperationRequest[] = [];
+ const r = rig({ subscription: true, operationRead: async request => {
+  reads.push(request);
+  return { decision: "admit", operation_id: request.operation_id, claim_generation: request.claim_generation };
+ }, beforeResponse(frame) {
+  if (frame.method === "turn/start") assert.equal(reads.length, 1);
+ } });
+ await r.run();
+ assert.equal(reads.length, 1);
+ assert.equal(reads[0]!.kind, "checker");
+ assert.equal(r.requests.filter(frame => frame.method === "turn/start").length, 1);
 });

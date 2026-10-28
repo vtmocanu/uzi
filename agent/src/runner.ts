@@ -53,7 +53,8 @@ import type {
   WallParkRefresh,
 } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
-import { CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
+import { acquireCodexOperationScope } from "./codex-operation-scope.js";
+import { type CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
 import { CodexOperationAdmissionError } from "./client.js";
 import { PLAN_REVISION_RETRY_FEATURE, PlanRevisionRecovery, PlanRevisionRecoveryStoppedError, type PlanRevisionRetryPolicy } from "./plan-revision-retry.js";
 import { checkPlan, type CheckedHumanGate, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
@@ -2135,6 +2136,7 @@ type ClaimCheckpointEvidence = Readonly<{ tip?: string; attestedSource?: string;
 
 interface RunFlight {
   operationAdmission?: CodexOperationController;
+  operationScope?: ReturnType<typeof acquireCodexOperationScope>;
   releaseOperationAdmission?: () => void;
   readonly checkpointCoordinates?: CheckpointCoordinates;
   readonly checkpointClaimEvidence: ClaimCheckpointEvidence;
@@ -4248,20 +4250,18 @@ export class RunRunner {
     const registration = this.snapshotRegistry?.add(runId, claim.claim_generation ?? 0);
     // Repository task roots only; other lanes retain their existing policy.
     if (claim.secrets.codex?.auth_mode === "subscription") {
-      flight.operationAdmission = new CodexOperationController(flight.claimGeneration, {
-        ...this.codexOperationWaitPolicy,
-        supported: () => this.client.hasFeature("codex_account_operation_admission_v1"),
-        negotiation: () => this.client.codexOperationNegotiation,
-        engage: () => { flight.releaseOperationAdmission =
-          this.client.retainCodexOperationFlight(runId, flight.claimGeneration); },
-        read: (request, signal) => this.client.checkCodexOperationAdmission(runId, request, signal),
-        waiting: operation => {
+      flight.operationScope = acquireCodexOperationScope(this.client, runId, flight.claimGeneration,
+        this.codexOperationWaitPolicy, operation => {
+          // Synchronous delegation is required work; optional advice never blocks the root.
+          if (operation.kind !== "root" && operation.kind !== "child") return undefined;
           const token = registration === undefined ? undefined :
             this.snapshotRegistry?.setAccountCooldown(runId, flight.claimGeneration, operation, registration);
           return token === undefined ? undefined :
             () => this.snapshotRegistry?.clearAccountCooldown(runId, flight.claimGeneration, token);
-        },
-      });
+      }, ["root", "child"]);
+      flight.operationScope.own();
+      flight.operationAdmission = flight.operationScope.controller;
+      flight.releaseOperationAdmission = () => flight.operationScope?.close();
     }
     // PRD #1809 D4: watch this run's caches for its flight. Claude runs only (a Codex run has
     // `executor.safety`; its caches live on its own per-run volume) with a HOME, and only runs
@@ -13082,7 +13082,7 @@ export class RunRunner {
         } }
         : {}),
       codexRootAdmissionActive: () => flight.operationAdmission?.active() ?? false,
-      prepareCodexRootDispatch: async (signal, localCheck) => {
+      prepareCodexRootDispatch: flight.operationScope?.bind(async (signal, localCheck, kind = "root") => {
         if (!flight.operationAdmission?.active())
           return () => !flight.operationAdmission?.active();
         const source = revisionRecovery?.dispatchSource();
@@ -13112,7 +13112,7 @@ export class RunRunner {
         });
         let permit!: () => boolean;
         try {
-          permit = await flight.operationAdmission.admit({ operation_id: randomUUID(), kind: "root",
+          permit = await flight.operationAdmission.admit({ operation_id: randomUUID(), kind,
             ...(source ? { source } : {}) }, operationSignal, check,
           async () => { await revisionRecovery?.proveDispatchSource(source, check); check(); });
         } catch (error) {
@@ -13127,7 +13127,7 @@ export class RunRunner {
         permit();
         check();
         return () => { const valid = permit(); check(); return valid; };
-      },
+      }),
       beforePlanRevisionTurn: (observer, remainingWallMs) => revisionRecovery?.beforeTurn(observer, remainingWallMs) ?? Promise.resolve(),
       retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
         if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && !cause.zeroEvidenceIdle) || !revisionRecovery) throw cause;
