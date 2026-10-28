@@ -318,6 +318,12 @@ fresh claim opens another counted custody hold and repeated failures can leave
 retained successor paths. Keep the original worker storage: a peer after worker
 loss or affinity expiry may use a published checkpoint behind the retained work.
 
+A positively identified temporary local resource error during the read-only
+renewal check stops the claim without consuming its owner grant or creating a
+new owner hold. The existing bounded claim-recovery policy may retry it.
+Unverified or invalid authorization remains fail-closed; unknown errors do not
+receive this retry treatment.
+
 Owner authorization remains bound to the recorded repository path, device and
 inode. A changed storage identity refuses execution; Resume cannot override that
 check. With the source journal still valid, the run re-holds instead of failing

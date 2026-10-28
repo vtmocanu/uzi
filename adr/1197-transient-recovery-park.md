@@ -1625,6 +1625,15 @@ cannot replace the pending charge stops or reholds an already-persisted blocker;
 it does not relabel an accounting interruption as an integrity refusal.
 Uncertain writes stop with sources retained.
 
+The read-only owner-eligibility probe reuses retained-I/O classification. Only
+`EAGAIN`, `EMFILE`, `ENFILE` or `ENOMEM` with OS syscall metadata stops the claim
+nonterminal for the existing bounded claim-recovery policy to retry. No charge,
+accounting write, capture, model or held report occurs; the same unspent owner
+grant may be rechecked on the next owned claim. No deadline is inferred for this
+classification. Deterministic identity/journal errors, unknown errors, missing
+syscall evidence and unreadable error metadata keep the existing fail-closed
+handling rather than looping. Credential and lifecycle controls retain precedence.
+
 The baseline is established before adoption can fail, on an eligible nonblocked
 charge or a valid legacy `budget_exhausted` renewal under the existing episode
 and fresh-claim guards. With a valid raw owner value, that renewal records the

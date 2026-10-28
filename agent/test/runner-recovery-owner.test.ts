@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { RunRunner } from "../src/runner.js";
 import { RequestError } from "../src/client.js";
 import { RecoveryChargeInterruptedError } from "../src/recovery-owner.js";
+import { CredentialSwitchSignal } from "../src/steering.js";
 import { ownerFixture } from "./recovery-owner-fixture.js";
 import { nullLogger } from "./helpers.js";
 
@@ -249,4 +250,72 @@ test("changed owner device binding reholds a persisted budget block without gran
   assert.deepEqual(h.f.read(), journal);
   assert.equal(h.f.values.get(h.f.ownerKey)![0], record);
   await assert.rejects(h.f.reserve(3, 1, 100, h.runner.git), /binding changed/);
+});
+
+for (const code of ["EAGAIN", "EMFILE", "ENFILE", "ENOMEM"]) {
+  test(`retryable owner probe ${code} stops for claim recovery without consuming the grant`, async () => {
+    const h = await fixture();
+    h.claim.worker_recovery_owner_episode = 1;
+    const journal = h.f.read();
+    const record = h.f.values.get(h.f.ownerKey)![0]!;
+    const failure = Object.assign(new Error("temporary local metadata read failure"), { code, syscall: "open" });
+    const eligible = h.runner.git.canRenewRecoveryAdoption.bind(h.runner.git);
+    h.runner.git.canRenewRecoveryAdoption = async () => { throw failure; };
+    await assert.rejects(h.run(), error => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.constructor.name, "RetainedRecoveryStop");
+      assert.equal(error.cause, failure);
+      return true;
+    });
+    assert.equal(h.flight.parked, false, "a temporary read must not manufacture an owner hold");
+    assert.deepEqual(h.counts(), { captures: 0, models: 0, proofs: 0, ownership: 0, terminal: 0, sends: 0 });
+    assert.deepEqual(h.f.read(), journal);
+    assert.equal(h.f.values.get(h.f.ownerKey)![0], record);
+    assert.equal(h.flight.preserveRecoveryClone, true);
+    assert.equal(h.flight.preserveSession, true);
+    // The next fenced claim can use this same unspent owner grant after the read recovers.
+    assert.equal(await eligible(h.f.bare, h.f.branch, h.f.key, h.f.read(), 3, 1), true);
+    assert.equal((await h.f.reserve(3, 1, 100, h.runner.git)).claimGeneration, 3);
+    assert.equal(JSON.parse(h.f.values.get(h.f.ownerKey)![0]!).consumed, 1);
+  });
+}
+
+for (const [name, failure] of [
+  ["binding", new Error("recovery owner binding changed")],
+  ["reservation", new Error("recovery owner reservation changed")],
+  ["malformed", new SyntaxError("invalid owner JSON")],
+  ["unknown", new Error("metadata unavailable")],
+  ["errno without syscall", Object.assign(new Error("unconfirmed resource failure"), { code: "EMFILE" })],
+  ["permission", Object.assign(new Error("read refused"), { code: "EACCES", syscall: "open" })],
+  ["missing", Object.assign(new Error("file missing"), { code: "ENOENT", syscall: "open" })],
+  ["io", Object.assign(new Error("I/O failed"), { code: "EIO", syscall: "read" })],
+  ["stale", Object.assign(new Error("handle stale"), { code: "ESTALE", syscall: "lstat" })],
+  ["syntax with errno", Object.assign(new SyntaxError("invalid record"), { code: "EMFILE", syscall: "open" })],
+  ["throwing metadata", Object.defineProperty(new Error("unreadable error metadata"), "code", { get() { throw new Error("classifier failed"); } })],
+] as const) {
+  test(`non-retryable owner probe ${name} retains the existing owner hold`, async () => {
+    const h = await fixture();
+    h.claim.worker_recovery_owner_episode = 1;
+    const journal = h.f.read(), record = h.f.values.get(h.f.ownerKey)![0]!;
+    h.runner.git.canRenewRecoveryAdoption = async () => { throw failure; };
+    await assert.rejects(h.run(), error => error instanceof Error && error.constructor.name === "RetainedRecoveryStop");
+    assert.equal(h.flight.parked, true);
+    assert.equal(h.counts().sends, 1);
+    assert.equal(h.counts().terminal, 0);
+    assert.equal(h.counts().captures, 0);
+    assert.equal(h.counts().models, 0);
+    assert.deepEqual(h.f.read(), journal);
+    assert.equal(h.f.values.get(h.f.ownerKey)![0], record);
+  });
+}
+
+test("owner probe credential control preserves its identity and sends no hold", async () => {
+  const h = await fixture();
+  const control = new CredentialSwitchSignal();
+  h.runner.git.canRenewRecoveryAdoption = async () => { throw control; };
+  await assert.rejects(h.run(), error => error === control);
+  assert.equal(h.counts().sends, 0);
+  assert.equal(h.counts().terminal, 0);
+  assert.equal(h.counts().captures, 0);
+  assert.equal(h.counts().models, 0);
 });

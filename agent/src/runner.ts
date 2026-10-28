@@ -1192,7 +1192,8 @@ const RETAINED_CORRUPTION_MARKERS = [
 ];
 
 /**
- * Classifies a pre-clone retained-discovery failure. Typed and corruption rejections come first,
+ * Classifies retained read failures for pre-clone discovery and owner eligibility probes.
+ * Typed and corruption rejections come first,
  * before any deadline-text match, so a corrupt journal can never be retried as "busy". A deadline
  * error is retryable only when the caller's absolute attempt deadline has elapsed AND the error
  * carries positive deadline evidence; a bare AbortError is terminal.
@@ -22011,6 +22012,17 @@ export class RunRunner {
             flight.claimGeneration, claim.worker_recovery_owner_episode);
         } catch (error) {
           this.retainedLifecycleGuard(flight);
+          if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
+          // No probe deadline is inferred here. Only positive retained-I/O errno
+          // evidence can stop for the existing bounded claim-recovery retry path.
+          let retryableProbe = false;
+          try { retryableProbe = classifyRetainedDiscoveryError(error, false) === "retryable"; }
+          catch { /* Unreadable error metadata is not retry authority. */ }
+          if (retryableProbe) {
+            flight.runLog.warn("retained adoption renewal probe temporarily unavailable; stopping claim for retry",
+              formatRetainedRecoveryDiagnostic(error, flight.redactText));
+            throw new RetainedRecoveryStop({ cause: error });
+          }
           flight.runLog.warn("retained adoption renewal evidence unavailable",
             formatRetainedRecoveryDiagnostic(error, flight.redactText));
         }
