@@ -258,3 +258,25 @@ it("M2 legacy final permit observes first engagement and requires a fresh read",
   assert.equal((await r.start(2))(), true);
   assert.equal(r.calls.length, 1);
 });
+
+it("M2 late wait response cannot shorten an invalidated permit's shared deadline", async () => {
+  let release!: (reply: CodexOperationDecision) => void;
+  const r = rig(req => r.calls.length === 2
+    ? new Promise(resolve => { release = resolve; })
+    : Promise.resolve(admit(req)));
+  const firstPermit = await r.start(1);
+  r.state.negotiation++;
+  const second = r.start(2);
+  try {
+    await flushUntil(() => r.calls.length === 2);
+    assert.equal(firstPermit(), false);
+    release(wait(r.calls[1]!.request, 1000));
+    await flushUntil(() => r.clock.sleepers.size === 1);
+    r.clock.advance(1000);
+    await flushUntil(() => r.calls.length > 2 || r.clock.sleepers.size > 0);
+    assert.equal(r.calls.length, 2, "a late cooldown response cannot shorten the shared unavailable deadline");
+    r.clock.advance(14000);
+    await second;
+    assert.deepEqual(r.calls.map(call => call.at), [0, 0, 15000]);
+  } finally { r.clock.advance(30000); await second; }
+});

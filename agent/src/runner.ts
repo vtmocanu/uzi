@@ -13124,8 +13124,9 @@ export class RunRunner {
           }
           throw error;
         } finally { unsubscribe(); }
+        permit();
         check();
-        return () => { check(); return permit(); };
+        return () => { const valid = permit(); check(); return valid; };
       },
       beforePlanRevisionTurn: (observer, remainingWallMs) => revisionRecovery?.beforeTurn(observer, remainingWallMs) ?? Promise.resolve(),
       retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {

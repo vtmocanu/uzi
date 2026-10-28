@@ -85,7 +85,7 @@ export class CodexOperationController {
             pendingRead = this.deps.read(request, signal).then(value => {
               if (value.decision === "wait") this.defer(value);
               return value;
-            }, error => { this.nextReadAt = this.now() + 15_000; throw error; });
+            }, error => { this.deferUnavailable(); throw error; });
             decision = await this.cancellable(pendingRead, signal);
             // A worker re-registration or feature loss invalidates the old reply.
             if (!this.deps.supported() || negotiation !== this.deps.negotiation()) decision = undefined;
@@ -93,13 +93,13 @@ export class CodexOperationController {
         } catch (error) {
           // Even a cancelled/obsolete read establishes the shared unavailable
           // deadline. Only the two strict typed refusals leave the wait route.
-          this.nextReadAt = this.now() + 15_000;
+          this.deferUnavailable();
           if (error instanceof CodexOperationAdmissionError &&
               (error.reason === "authority_lost" || error.reason === "stale_source")) throw error;
         }
         // Set the schedule before checking caller currency: source churn cannot
         // erase an unsuccessful read's deadline.
-        if (!decision) this.nextReadAt = this.now() + 15_000;
+        if (!decision) this.deferUnavailable();
         else if (decision.decision === "wait") {
           this.defer(decision);
         }
@@ -112,7 +112,7 @@ export class CodexOperationController {
         } catch (error) {
           // An admitted reply made obsolete by local control cannot bypass the
           // shared unavailable deadline when its replacement joins the queue.
-          if (decision?.decision === "admit") this.nextReadAt = this.now() + 15_000;
+          if (decision?.decision === "admit") this.deferUnavailable();
           throw error;
         }
         if (decision?.decision === "admit") {
@@ -120,7 +120,7 @@ export class CodexOperationController {
           const permit = (): boolean => {
             if (!invalidated && (!this.deps.supported() || negotiation !== this.deps.negotiation())) {
               invalidated = true;
-              this.nextReadAt = this.now() + 15_000;
+              this.deferUnavailable();
             }
             return !invalidated;
           };
@@ -134,9 +134,14 @@ export class CodexOperationController {
     }
   }
 
+  private deferUnavailable(): void {
+    this.nextReadAt = Math.max(this.nextReadAt, this.now() + 15_000);
+  }
+
   private defer(decision: Extract<CodexOperationDecision, { decision: "wait" }>): void {
-    this.nextReadAt = this.now() + Math.max(1_000, Math.min(15_000,
+    const deadline = this.now() + Math.max(1_000, Math.min(15_000,
       Math.max(0, Date.parse(decision.eligible_at) - Date.parse(decision.server_now))));
+    this.nextReadAt = Math.max(this.nextReadAt, deadline);
   }
 
   private async cancellable<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {

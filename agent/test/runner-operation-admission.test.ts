@@ -550,3 +550,54 @@ for (const boundary of ["source proof", "final guard"] as const)
         await done;
       }
     });
+
+it("M2 re-registration plus source replacement at final guard preserves unavailable deadline", async t => {
+  enable();
+  const features = [...client.protocolFeatures];
+  const clock = new AdmissionClock();
+  const fixture = providerFixture("codex", n => ({ plan: n === 1 ? "# source" : "# replacement" }), false, { subscription: true });
+  const claim = freshClaim(7, { config: { plan_max_revisions: 3 }, secrets: { forge_pat: "fixture-forge-pat", codex: fixture.credential } });
+  let reads = 0;
+  let release: (() => void) | undefined;
+  t.mock.method(client, "checkCodexOperationAdmission", async (_id: string, request: CodexOperationRequest) => {
+    reads++;
+    return { decision: "admit", operation_id: request.operation_id, claim_generation: request.claim_generation };
+  });
+  const run = fixture.executor.run.bind(fixture.executor);
+  t.mock.method(fixture.executor, "run", async (ctx: RunContext) => {
+    const prepare = ctx.prepareCodexRootDispatch!;
+    let preparations = 0;
+    ctx.prepareCodexRootDispatch = async (...args) => {
+      const permit = await prepare(...args);
+      if (++preparations === 2) await new Promise<void>(resolve => { release = resolve; });
+      return permit;
+    };
+    return run(ctx);
+  });
+  const r = runner(fixture.executor, fakeGitlab().gitlab, undefined,
+    { codexOperationWaitPolicy: { now: () => clock.now, sleep: clock.sleep } });
+  const done = r.execute(claim);
+  try {
+    assert.ok(await until(() => gates(claim.run_id).length === 1));
+    send(claim.run_id, row("revise_plan", "old feedback"));
+    assert.ok(await until(() => !!release));
+    client.clearFeatures();
+    client.protocolFeatures = features;
+    const [replacement] = send(claim.run_id, row("revise_plan", "new feedback"));
+    assert.ok(await until(() => api.isAcked(claim.run_id, replacement!.id)));
+    release!();
+    assert.ok(await until(() => reads > 2 || clock.sleepers.size > 0));
+    assert.equal(reads, 2, "obsolete permit must establish 15s unavailable deadline before replacement reads");
+    assert.equal(fixture.starts.length, 1);
+    clock.advance(14999);
+    assert.equal(reads, 2);
+    clock.advance(1);
+    assert.ok(await until(() => gates(claim.run_id).length === 2));
+  } finally {
+    client.protocolFeatures = features;
+    release?.();
+    send(claim.run_id, row("cancel"));
+    r.shutdown();
+    await done;
+  }
+});

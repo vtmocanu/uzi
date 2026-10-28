@@ -5503,11 +5503,13 @@ export class CodexExecutor implements Executor {
             sourceGuard = await ctx.prepareCodexRootDispatch?.(
               AbortSignal.any([turnAbort.signal, waiting.signal]), checkDispatch);
           } finally { this.rootAdmissionWaits.delete(waiting); }
+          sourceGuard?.();
           checkDispatch();
         },
         check: (): boolean => {
+          const valid = sourceGuard?.();
           checkDispatch();
-          if (sourceGuard?.() === false) return false;
+          if (valid === false) return false;
           startupResumed = true;
           armIdle();
           return true;
