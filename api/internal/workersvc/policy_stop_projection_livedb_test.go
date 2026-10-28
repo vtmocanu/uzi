@@ -252,6 +252,40 @@ func TestPolicyStopProjectionActualClaimLiveDB(t *testing.T) {
 					t.Fatal("question park identity or completion marker lost")
 				}
 				assertPreserved()
+				// A lost question ACK is read-only but must still bind the exact
+				// accepted identity before reporting success (reviewer B1).
+				for _, replayMode := range []string{"exact", "missing_null", "mismatch"} {
+					t.Run("guarded_replay_"+replayMode, func(t *testing.T) {
+						resolution := &resolutionID
+						switch replayMode {
+						case "missing_null":
+							resolution = nil
+						case "mismatch":
+							resolution = strPtr(uuid.NewString())
+						}
+						before := policyOwnerStopSnapshot(t, e, created.ID)
+						replay, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{
+							State: "awaiting_input", ClaimGeneration: &generation, PolicyStopResolutionID: resolution,
+							RequireRunning: true, OpenQuestionID: &qid,
+						})
+						if replay.PolicyStopExecution != nil || replay.PlanApproved != nil || replay.PolicyRevisionGate != nil {
+							t.Fatal("question replay issued live policy authority or approval")
+						}
+						if before != policyOwnerStopSnapshot(t, e, created.ID) {
+							t.Fatal("question replay changed full run/input/check snapshot")
+						}
+						if replayMode == "exact" {
+							if err != nil || !replay.Applied {
+								t.Fatalf("exact replay applied=%v err=%v", replay.Applied, err)
+							}
+						} else {
+							if replay.Applied {
+								t.Fatalf("wrong identity replay was accepted: mode=%s err=%v", replayMode, err)
+							}
+							requirePolicyOwnerStopConflict(t, err, "policy_stop_execution_unverifiable")
+						}
+					})
+				}
 				refuseRunning := func(stage string) {
 					t.Helper()
 					ack, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{State: "running", ClaimGeneration: &generation, PolicyStopResolutionID: &resolutionID})

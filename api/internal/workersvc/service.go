@@ -4700,6 +4700,11 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				// The same accepted question can be replayed after a lost ACK. Return
 				// under the lock without repeating accounting or transition fan-out.
 				if qid != "" && len([]rune(qid)) <= maxQuestionIDRunes && locked.OpenQuestionID.Valid && locked.OpenQuestionID.String == qid {
+					if len(locked.PolicyStopResolution) > 0 {
+						if err := s.policyStopStateRequestLocked(ctx, qtx, wkr, locked, req); err != nil {
+							return locked, false, err
+						}
+					}
 					return locked, true, nil
 				}
 				return locked, false, nil
