@@ -1,7 +1,7 @@
 # PRD #2506 (option A): a pinned prerequisite closure lets a thin guarded capture release custody
 
 **Issue:** #2506 (option A only). Delivery under this PRD is **non-closing**: every PR uses `Refs #2506` and closes only its own child issue. #2506 stays open until the whole acceptance below is met. Option D shipped separately (ADR-2506) and does not complete this.
-**Status:** DRAFT, revision 16 (2026-10-28), approved C1a/C1b split and review folds, pending exact-text final review. C1a and C1b are API-only; no filing or dispatch follows from this draft. Based on the exact revision-11 artifact (SHA256 `2205e1146950263b2aa90f35863cadec3f3debfbd350590b9e65bd560a9640ec`, whose header still said revision 10). The earlier paired architecture reviews and owner decisions remain the design history; this new evidence fold requires recov6 review and is not filing, dispatch or implementation approval. **E2 ran on GitHub on 2026-10-27 and returned FINDING (one measured workflow-scope refusal, zero probe malfunctions), conclusive for the tested production credential class.** The anchor strategy is feasible in that tested case; other forges and protected/ruleset configurations remain unverified. Existing source line anchors are historical at `91647464c02bd12ae30d4fce6aa656f2245e88e1`, not refreshed line numbers for current main. The new E2 section states the exact observed scope and remaining gates.
+**Status:** DRAFT, revision 17 (2026-10-28), approved C1a/C1b split and review folds, pending exact-text final review. C1a and C1b are API-only; no filing or dispatch follows from this draft. Based on the exact revision-11 artifact (SHA256 `2205e1146950263b2aa90f35863cadec3f3debfbd350590b9e65bd560a9640ec`, whose header still said revision 10). The earlier paired architecture reviews and owner decisions remain the design history; this new evidence fold requires recov6 review and is not filing, dispatch or implementation approval. **E2 ran on GitHub on 2026-10-27 and returned FINDING (one measured workflow-scope refusal, zero probe malfunctions), conclusive for the tested production credential class.** The anchor strategy is feasible in that tested case; other forges and protected/ruleset configurations remain unverified. Existing source line anchors are historical at `91647464c02bd12ae30d4fce6aa656f2245e88e1`, not refreshed line numbers for current main. The new E2 section states the exact observed scope and remaining gates.
 **Priority:** High (inherits #2506). The independent architecture review CLAUDE.md requires for priority::high applies to this PRD and to each child before dispatch; no waiver. M0 is evidence-only and is never auto-dispatched.
 **Related:** ADR-1296 D5 (thin-capture rule) and its 2026-10-09 amendment (the "Later user deletion or rewriting is outside the proof" residual), ADR-1197 (local thin proof grants no custody release), ADR-2417 (guarded local retention), ADR-2545 (terminal held publication, `create_unknown` precedent), ADR-1810 and ADR-1867 (create-only uzi ref namespaces), ADR-2213 (residue quarantine), ADR-2506 (option D), ADR-456 (`adr/0456-rebase-before-finalize-push.md`, GitHub workflow-scope rule), the #2746 programme (`prds/2746-automatic-hold-settlement.md`), #2476, #2494, #2507, #2544, #2809, #2884 (open; another `recovery_inventory_hold_guard` rebuild), #3030 (PR #3058), #3105, **#2969** (re-scoped behind this PRD on 2026-10-23), **#3031 U1** and its children #3443 and #3444.
 **Delivery shape:** M0 (maintainer-owned evidence and probes, not a uzi run), then four child issues, one gated run/PR each: C1a, C1b, C2 and C3. C1b waits for C1a; C2 waits for C1b; C3 may parallel C2 only with disjoint file ownership. No uzi run's implementation or validation creates, modifies or commits any path under `.github/workflows/`; the single exception is E2's maintainer-only disposable scratch repository. Do not reserve a draft migration number here: choose the next free number above the live head at landing (`task migration:renumber`). PR #3580 has overlapping recovery files and a pending migration; rebase and re-audit if it lands first. Existing code anchors remain historical at `91647464`; new split/review anchors explicitly use `c750b802`.
@@ -393,6 +393,63 @@ sequenceDiagram
 - `UZI_RECOVERY_MAX_CAPTURES_PER_OWNER` (default 256) counts only captures not `expired` or `discarded` (`service.go` ~124-132). It bounds **active** captures and therefore pins with intended retention. It does **not** bound closure rows of expired captures, rows stuck in `create_unknown`, or `pinned` rows past the cleanup ceiling (leaked pins); those accumulate and each keeps its run, repository and connection removal blocked.
 - **Accepted (O10, owners 2026-10-25):** unresolved rows and leaked pins accumulate. They get bounded, fair processing (pass budgets, one-slot concurrency), keep their removal blockers, and E6 reports their counts. **No total inventory bound is claimed**; no live-pin admission bound is added. Terminal rows are audit tombstones (like capture metadata).
 - Forge: one ref per qualifying capture for its intended lifetime (`UZI_RECOVERY_READY_RETENTION`, default 168 hours), longer for leaked pins.
+
+### Operator policy for accumulation (O10 clarification)
+
+O10 accepts an unbounded total inventory, not automatic eviction. E6 reports the
+counts and growth of unresolved rows, leaked pins and removal blockers; it is not
+an admission bound or an overflow-prevention mechanism. No row, pin, live pointer
+or tombstone ages out merely because the active-capture limit, an attempt ceiling,
+a storage threshold or an operational deadline is reached. Retention is the
+state-machine retention above: unknown rows and cleanup-exhausted pins may remain
+indefinitely; terminal rows remain audit tombstones. A failure to persist S0 must
+fail/roll back the upload transaction rather than publish availability without its
+required row. It grants no release or deletion authority.
+
+Before C1b dispatch, its plan must commit to carrying this procedure into
+`docs/run-recovery.md` and `docs/configuration.md`, with tests for its existing
+state-machine paths. This defines the operational response without a new quota,
+garbage collector, override endpoint or permission:
+
+1. **Contain incoming work.** The deployment operator can turn off the existing
+   prerequisite-forge knob through normal configuration management to stop new S0
+   admissions for the affected kind. This is not an instantaneous cancellation of
+   in-flight transactions. Existing rows continue through the always-registered
+   bounded pass; do not disable their reconciliation/cleanup or increase its limits
+   to hide backlog. Ordinary capture quotas/failures keep their existing behavior;
+   no separate closure-overflow eviction or promise of bounded storage is implied.
+2. **Preserve and diagnose.** Record the exact capture/hold/row identity, checksum,
+   frozen binding, pin_ref/pin_tip, state, outstanding attempts and fresh listings;
+   preserve recoverable archive bytes before an owner chooses early expiry/discard.
+   Restore failed connectivity or credentials only under the existing frozen
+   repository identity. A changed/foreign binding is not permission to rebind,
+   resend a create or reset attempts. Owner-visible/audit diagnostics must identify
+   why removal remains blocked, without exposing credentials or raw forge errors.
+3. **Use the proved cleanup route.** Only after the capture is confirmed expired
+   or discarded may S7 clean a `pinned` row. If automatic deletes reached their
+   ceiling, a manual delete requires explicit authorization from that capture's
+   owner (or an already authorized custodian) and an operator already permitted to
+   write that forge repository. It is scoped to the exact recorded prerequisite ref
+   and expected tip, after a fresh same-tip listing, using compare-and-swap deletion.
+   A moved/foreign ref is left untouched. A timeout remains ambiguous; do not clear
+   database evidence. The existing later listing records `deleted` and clears the
+   pointer only under S7's rules. Pins of still-available archives are not capacity
+   reclamation targets, even if the hold settled by another route.
+4. **Unknown is not operator disposal authority.** For `create_unknown`, first let
+   S4 observe the expected tip and durably commit `pinned` before any deletion.
+   An absent ref, expired capture, elapsed time, owner pressure or storage pressure
+   does not resolve that ambiguity. An absent `create_unknown` row can remain an
+   indefinite removal blocker under O10. Do not manually clear its live pointer,
+   delete its row, recreate/move its ref, or retry its create. If no existing proof
+   path resolves it, retain it and escalate a separate maintainer contract decision;
+   this runbook promises no override or eventual resolution.
+
+A broad owner-authorized history/privacy purge is a separate deliberate action
+under the accepted external-writer residual, not this capacity-recovery procedure.
+It may destroy archive restorability and does not itself erase server evidence or
+authorize clearing blockers. C1b must document this distinction and verify that
+knob-off processing, confirmed-pin cleanup, wrong-tip refusal and unresolved-row
+retention obey these same boundaries. C1a is unaffected by this clarification.
 
 ### Accepted races and residuals
 
