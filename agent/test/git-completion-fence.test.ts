@@ -226,6 +226,18 @@ describe("installCompletionSourceFence", () => {
 });
 
 describe("fence preserved by every reconstruction of the SAME source, never inherited by another", () => {
+  it("commits owner accounting when reserving a fenced source without an existing recovery field", async () => {
+    await cache.installCompletionSourceFence(bare, BRANCH, expected(), FENCE);
+    assert.equal(journal().recovery, undefined);
+
+    const reservation = await cache.reserveRecoveryIteration(bare, BRANCH, KEY, reconstructionSource(), 1_000, 1, 1, 0);
+    assert.equal(reservation.stage, "capturing");
+    const owner = JSON.parse(gitIn(bare, ["config", "--get", `uzi-recoveryowner.${RUN}.record`])) as { state: string };
+    assert.equal(owner.state, "committed");
+    assert.equal(JSON.stringify(journal().completionSourceFence), serializeSourceFence(FENCE));
+    assert.equal(Object.keys(journal()).at(-1), "completionSourceFence");
+  });
+
   it("survives reserve and capture of the same source", async () => {
     await cache.installCompletionSourceFence(bare, BRANCH, expected(), FENCE);
     const source = reconstructionSource();

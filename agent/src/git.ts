@@ -7614,7 +7614,7 @@ export class GitCache {
       const reserved = { ...journal, recovery };
       await this.writeRecovery(barePath, branch, reserved);
       if (charged) {
-        if (await this.readRecoveryCaptureRaw(barePath, branch) !== JSON.stringify(reserved))
+        if (await this.readRecoveryCaptureRaw(barePath, branch) !== recoveryJournalJson(reserved))
           throw new Error("recovery reservation readback mismatch");
         await this.writeRecoveryOwner(barePath, { ...charged, state: "committed" });
       }

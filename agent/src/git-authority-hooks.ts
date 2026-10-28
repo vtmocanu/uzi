@@ -15,9 +15,10 @@
  *    record stays unresolved and the footprint stays fenced.
  *
  * Implementation: `AuthorityRuntime.hooks` (authority-runtime.ts), built in main.ts over the worker lifetime
- * and passed by buildWorkerGitCache. Each hook REQUIRES the transaction the outermost entry point opened in
- * the current async context and refuses (AuthorityRefusal) when there is none; it never acquires A beneath
- * B. Every `settle` call is awaited inside the caller's own B section and borrows its transaction, except
+ * and passed by buildWorkerGitCache. admitSourceUse, beginBareMutation and beginDestructive REQUIRE the
+ * transaction the outermost entry point opened in the current async context and refuse (AuthorityRefusal)
+ * when there is none; assertBareClear does not (see its entry below). No hook acquires A beneath B.
+ * Every `settle` call is awaited inside the caller's own B section and borrows its transaction, except
  * two that can run with none active: the runner-uid delete's late `close` (a child that outlived its
  * caller) and the continuation GitCache.cleanupArchivedRecoveryPin abandons when its caller's deadline
  * passes (it still holds B). `settle` NEVER acquires A: with no active transaction the settlement is
