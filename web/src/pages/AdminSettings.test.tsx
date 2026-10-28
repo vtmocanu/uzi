@@ -1799,7 +1799,7 @@ describe("vault policy", () => {
     expect(screen.getByText("Unprotected users: 4")).toBeTruthy();
     expect(screen.getByText(/TL;DR: Password encryption/).textContent).toContain("database together with the server key");
     expect(screen.getByRole("link", { name: "Learn more" }).getAttribute("href")).toBe("/docs/vault-threat-model");
-    expect(screen.getByText(/Optional starts new users/)).toBeTruthy();
+    expect(screen.getByText(/Optional lets each user turn protection on or off; new users start with protection off/)).toBeTruthy();
     mockApi.updateSettings.mockResolvedValue({ ...response(), unprotected_users: 4, settings: { ...response().settings, vault_policy: "required" } });
     fireEvent.change(select, { target: { value: "required" } });
     fireEvent.click(screen.getByRole("button", { name: "Save vault policy" }));

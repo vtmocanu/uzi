@@ -347,7 +347,7 @@ export function AdminSettings() {
       <Card id="vault-policy" className="space-y-4">
         <SectionTitle>Credential protection</SectionTitle>
         <p className="text-sm text-muted">TL;DR: Password encryption protects personal credentials against theft of the database together with the server key. A compromised running server can still read credentials while unlocked. Each release or server restart costs an unlock before new runs can start. Off uses server-key encryption, like forge bot tokens. <a href="/docs/vault-threat-model">Learn more</a>.</p>
-        <p>Optional starts new users with protection off. Required prompts off users to enroll and prevents protected users from switching off.</p>
+        <p>Optional lets each user turn protection on or off; new users start with protection off. Required prompts off users to enroll and prevents protected users from switching off.</p>
         <p>Unprotected users: {unprotectedUsers ?? "unknown (older server or unavailable)"}</p>
         <div className="space-y-3">
           <label>Vault policy
