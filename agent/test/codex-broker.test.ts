@@ -1129,6 +1129,8 @@ describe("CodexCallbackBroker: helper-origin range fallback", () => {
       { data: "", linesReturned: 1 }, { data: "", linesReturned: 0, partialLastLine: true },
       { data: "", linesReturned: 0, truncated: true },
       { data: "", linesReturned: 0, truncated: false, size: 9 * 1024 * 1024, scannedBytes: 8 * 1024 * 1024 },
+      ...["a\n", "a"].map(content => ({ data: Buffer.from(content).toString("base64"),
+        linesReturned: 1, truncated: false, size: 9 * 1024 * 1024, scannedBytes: 8 * 1024 * 1024 })),
       { data: Buffer.from("x").toString("base64") },
     ];
     for (const metadata of cases) {
@@ -1150,6 +1152,19 @@ describe("CodexCallbackBroker: helper-origin range fallback", () => {
       assertDenied(await call(makeBroker({ fileop })), "fileop_denied");
       assert.equal(fileop.calls.length, 2);
     }
+  });
+
+  it("accepts a completed truncated range with full-budget prefetch", async () => {
+    const fileop = new FileopSpy([oversize, range("b\n", {
+      size: 9 * 1024 * 1024, scannedBytes: 8 * 1024 * 1024,
+    })]);
+    const result = await call(makeBroker({ fileop }));
+    assert.equal(result.ok, true);
+    if (result.ok) assert.deepEqual(result.output, {
+      size: 9 * 1024 * 1024, content: "b\n", offset: 2,
+      linesReturned: 1, partialLastLine: false, truncated: true,
+    });
+    assert.equal(fileop.calls.length, 2);
   });
 
   it("does not write a fallback after the owning client closes between replies", async () => {

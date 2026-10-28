@@ -1084,8 +1084,8 @@ export class CodexCallbackBroker {
         ? res.reason !== "scan_budget" || !res.truncated || res.scannedBytes !== scanCap
         : Object.hasOwn(res, "reason")) ||
       (bytes.length === 0 && (res.linesReturned !== 0 || res.partialLastLine || (!res.incomplete && res.truncated))) ||
-      // With no excerpt and unread opening extent, exhausting the budget cannot prove EOF.
-      (bytes.length === 0 && !res.incomplete && res.scannedBytes === scanCap && res.size > scanCap) ||
+      // Exhausting the budget below the opening extent cannot establish completed EOF.
+      (!res.incomplete && !res.truncated && res.scannedBytes === scanCap && res.size > scanCap) ||
       (res.partialLastLine && (!res.truncated || bytes.length === 0 || bytes.at(-1) === 10))
     ) return malformed();
     let content: string;
