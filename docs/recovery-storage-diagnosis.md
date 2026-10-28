@@ -13,6 +13,13 @@ held work is quota-related. See [Recovering unpublished work](./run-recovery.md)
 for owner actions and [Admin health](./admin-health.md#recovery-storage)
 for the current-state warning.
 
+A persisted-refusal Warn also opts into the separate admin-only
+[attention banner](./admin-health.md#attention-banner). Its per-check **Dismiss**
+is local presentation state, not a retry, quota change or custody release;
+Health evidence remains visible. A successful document explicitly reporting
+`ok`, `unknown`, `danger` or `na` for that check ID clears dismissal; missing
+checks or flags and failed polls do not. Reload, remount or admin identity changes reset it.
+
 The operator attributes the refusals to the default 1 GiB per-owner quota,
 pending byte-accurate reproduction, with roughly sixteen large self-contained
 archives retained. Exact usage, reservations and the refused bundle's size
