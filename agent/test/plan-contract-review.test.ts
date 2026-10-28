@@ -9,6 +9,7 @@ import {
   type CoverageReservation, type CoverageClock,
 } from "../src/plan-contract-review.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
+import type { CodexOperationRequest } from "../src/protocol.js";
 import { CodexAdviceHarness } from "../src/codex/codex-advice-harness.js";
 import type { CodexTransport, CodexNotification } from "../src/codex/transport.js";
 import { selectCodexBinding } from "../src/codex/select.js";
@@ -398,3 +399,65 @@ it("bounded injected Codex succeeds through real read-only harness with tool-les
   const turn = wire.requests.find(r => r.method === "turn/start")!.params as { input: { text: string }[] };
   assert.equal(JSON.parse(turn.input[0]!.text).sources[0].text, sourceText);
 });
+
+for (const expire of [false, true]) {
+  it(`bounded injected subscription reviewer ${expire ? "expires without dispatch" : "waits for its own operation admit"}`, async () => {
+    const { acquireCodexOperationScope } = await import("../src/codex-operation-scope.js");
+    const { AdmissionClock, flushUntil } = await import("./operation-admission-clock.js");
+    const f = await setup();
+    const clock = new AdmissionClock();
+    let reads = 0;
+    const client = {
+      hasFeature: () => true, codexOperationNegotiation: 1,
+      checkCodexOperationAdmission: async (_run: string, request: CodexOperationRequest) => {
+        reads++;
+        return reads === 1 ? { decision: "wait" as const, operation_id: request.operation_id,
+          claim_generation: request.claim_generation, class: "overload" as const,
+          episode_id: "00000000-0000-4000-8000-000000000001",
+          server_now: new Date(0).toISOString(), eligible_at: new Date(1000).toISOString() }
+          : { decision: "admit" as const, operation_id: request.operation_id, claim_generation: request.claim_generation };
+      },
+    };
+    const scope = acquireCodexOperationScope(client, "coverage", 7, { now: () => clock.now, sleep: clock.sleep });
+    const selection = selectCodexBinding({ codex: { auth_mode: "subscription", access_token: "fixture",
+      capability: "fixture-capability", chatgpt_account_id: "fixture-account", generation: 3, chatgpt_plan_type: null } });
+    assert.equal(selection.kind, "codex");
+    if (selection.kind !== "codex") throw new Error("Invalid fixture");
+    const breakdown = { inputTokens: 130, cachedInputTokens: 30, cacheWriteInputTokens: 0,
+      outputTokens: 10, reasoningOutputTokens: 5, totalTokens: 140 };
+    const wire = new ScriptedCodex([
+      { kind: "token_usage_updated", method: "thread/tokenUsage/updated", threadId: "th", turnId: "tn",
+        usage: { total: breakdown, last: breakdown, pricingEvidenceComplete: true }, params: { threadId: "th", turnId: "tn" } },
+      { kind: "activity", method: "item/completed", params: { threadId: "th", item: { type: "agentMessage", text: JSON.stringify(fixture().report) } } },
+      { kind: "turn_completed", method: "turn/completed", threadId: "th", turnId: "tn", status: "completed",
+        params: { threadId: "th", turn: { id: "tn", status: "completed" } } },
+    ]);
+    let disposed = 0;
+    f.transport.harness = "codex";
+    f.transport.pass.codex = {
+      binding: selection.binding, runId: "coverage", claimGeneration: 7,
+      buildHarness: async params => {
+        assert.equal(params.refresh, "deny");
+        return new CodexAdviceHarness({
+          provider: { name: "openai", baseUrl: "http://127.0.0.1:9/v1", envKey: "OPENAI_API_KEY", model: "gpt-6-astra" },
+          log: nullLogger(), authMode: "subscription",
+          operationScope: () => ({ prepare: (signal, check) => scope.prepare("advice", signal, check), close() {} }),
+          launchRoot: async () => ({ transport: wire, cwd: "/isolated/coverage/work", dispose: async () => { disposed++; } }),
+        });
+      },
+    };
+    const done = reviewPlanContract(f.input);
+    try {
+      await flushUntil(() => clock.sleepers.size === 1);
+      assert.equal(wire.requests.some(r => r.method === "turn/start"), false);
+      if (expire) f.clock.expire(); else clock.advance(1000);
+      const result = await done;
+      assert.equal(result.outcome, expire ? "uncertain" : "complete");
+      assert.equal(wire.requests.filter(r => r.method === "turn/start").length, expire ? 0 : 1);
+      assert.equal(reads, expire ? 1 : 2);
+      assert.equal(f.reservations.length, 1, "admission never renews the original review reservation");
+      assert.equal(disposed, 1);
+      assert.equal(f.options.length, 0, "no Claude fallback");
+    } finally { scope.close(); await done; }
+  });
+}
