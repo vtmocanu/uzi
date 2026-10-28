@@ -10,7 +10,7 @@ installHarness();
 function command(dir: string, ...args: string[]) {
   return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: "pipe" }).trim();
 }
-for (const phase of ["before-successor", "partial-clone", "handoff-write-landed", "postreturn", "deadline"] as const) {
+for (const phase of ["before-successor", "partial-clone", "handoff-write-landed", "postreturn", "deadline", "identity-change"] as const) {
   test(`runner real Git adoption ${phase} parks, owner resumes once, then same grant reholds`, async t => {
     const claim = gitlabClaim(3527, { claim_generation: 2, worker_recovery_episode: 7, worker_recovery_owner_episode: 0 });
     const bare = await git.ensureClone(fx.originPath);
@@ -31,7 +31,7 @@ for (const phase of ["before-successor", "partial-clone", "handoff-write-landed"
     const capture = git.recordRecoveryCapture.bind(git);
     t.mock.method(git, "recordRecoveryCapture", async (...args: Parameters<typeof capture>) => { captures++; return capture(...args); });
     const seam = git as any;
-    if (phase === "before-successor") t.mock.method(seam, "resolveMarkerWrapperAdoption", async () => { throw new Error("injected adoption"); });
+    if (phase === "before-successor" || phase === "identity-change") t.mock.method(seam, "resolveMarkerWrapperAdoption", async () => { throw new Error("injected adoption"); });
     if (phase === "partial-clone") {
       const seed = seam.seedRunnerClone.bind(git);
       t.mock.method(seam, "seedRunnerClone", async (...args: any[]) => { await seed(...args); throw new Error("injected partial clone"); });
@@ -73,6 +73,23 @@ for (const phase of ["before-successor", "partial-clone", "handoff-write-landed"
     claim.claim_generation = 3;
     claim.worker_recovery_episode = 8;
     claim.worker_recovery_owner_episode = 1;
+    if (phase === "identity-change") {
+      const record = command(bare, "config", `uzi-recoveryowner.${claim.run_id}.record`);
+      const journal = JSON.stringify(read());
+      const identity = JSON.parse(await seam.recoveryOwnerBareIdentity(bare)) as string[];
+      identity[1] = String(BigInt(identity[1]!) + 1n);
+      t.mock.method(seam, "recoveryOwnerBareIdentity", async () => JSON.stringify(identity));
+      const captured = captures;
+      await execute();
+      assert.equal(api.states.some(s => s.body.status === "failed"), false, "device change leaves adoption owner-held instead of failed");
+      assert.equal(parks.length, 2);
+      assert.equal(captures, captured, "reholding needs quiescence, not another capture");
+      assert.equal(models, 0);
+      assert.equal(JSON.stringify(read()), journal);
+      assert.equal(command(bare, "config", `uzi-recoveryowner.${claim.run_id}.record`), record);
+      assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "local retained work\n");
+      return;
+    }
     await execute();
     assert.equal(parks.length, 2);
     const count = captures;

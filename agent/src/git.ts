@@ -7164,6 +7164,9 @@ export class GitCache {
     return true;
   }
 
+  // Path alone, or path plus inode, cannot distinguish a replacement filesystem.
+  // Retain the full binding for execution grants; preservation-only rehold does
+  // not use owner accounting as authority.
   private async recoveryOwnerBareIdentity(barePath: string): Promise<string> {
     await this.assertRecoveryBare(barePath);
     const st = await this.retainedIO(() => fs.lstat(barePath));

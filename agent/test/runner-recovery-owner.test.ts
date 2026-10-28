@@ -193,3 +193,49 @@ for (const ownership of [undefined, "stale", "cancelled", "unknown"] as const) {
     }
   });
 }
+
+for (const field of ["device", "inode", "path"] as const) {
+  test(`changed owner ${field} binding reholds adoption without using a new grant`, async () => {
+    const h = await fixture();
+    h.claim.worker_recovery_owner_episode = 1;
+    const originalJournal = h.f.read();
+    const originalRecord = h.f.values.get(h.f.ownerKey)![0]!;
+    const identity = JSON.parse(JSON.parse(originalRecord).bare) as string[];
+    identity[field === "path" ? 0 : field === "device" ? 1 : 2] += "-changed";
+    h.runner.git.recoveryOwnerBareIdentity = async () => JSON.stringify(identity);
+    await assert.rejects(h.run());
+    assert.equal(h.counts().terminal, 0, "accounting identity drift must not terminalize an already-blocked adoption journal");
+    assert.equal(h.flight.parked, true);
+    assert.deepEqual(h.counts(), { captures: 0, models: 0, proofs: 1, ownership: 2, terminal: 0, sends: 1 });
+    assert.deepEqual(h.f.read(), originalJournal);
+    assert.equal(h.f.values.get(h.f.ownerKey)![0], originalRecord, "rehold must not rebind or consume owner accounting");
+    await assert.rejects(h.f.reserve(3, 2, 100, h.runner.git), /binding changed/);
+    assert.equal(h.flight.preserveRecoveryClone, true);
+    assert.equal(h.flight.preserveSession, true);
+  });
+}
+
+test("changed owner device binding reholds a persisted budget block without granting work", async () => {
+  const h = await fixture();
+  const journal = h.f.read();
+  journal.recovery!.blocker = "budget_exhausted";
+  h.f.write(journal);
+  const record = h.f.values.get(h.f.ownerKey)![0]!;
+  const identity = JSON.parse(JSON.parse(record).bare) as string[];
+  identity[1] += "-changed";
+  h.runner.git.recoveryOwnerBareIdentity = async () => JSON.stringify(identity);
+  h.runner.client.protocolFeatures = ["recovery_cause_retained_recovery_exhausted"];
+  h.flight.reportState = async (body: { status: string; recovery_cause: string }) => {
+    h.reports.push(body);
+    return { status: body.status, recoveryCause: body.recovery_cause };
+  };
+  await assert.rejects(h.run());
+  assert.equal(h.counts().terminal, 0, "mismatched accounting cannot turn a persisted owner-decision block into failure");
+  assert.equal(h.flight.parked, true);
+  assert.equal(h.counts().captures, 0);
+  assert.equal(h.counts().models, 0);
+  assert.equal(h.counts().sends, 1);
+  assert.deepEqual(h.f.read(), journal);
+  assert.equal(h.f.values.get(h.f.ownerKey)![0], record);
+  await assert.rejects(h.f.reserve(3, 1, 100, h.runner.git), /binding changed/);
+});

@@ -318,6 +318,13 @@ fresh claim opens another counted custody hold and repeated failures can leave
 retained successor paths. Keep the original worker storage: a peer after worker
 loss or affinity expiry may use a published checkpoint behind the retained work.
 
+Owner authorization remains bound to the recorded repository path, device and
+inode. A changed storage identity refuses execution; Resume cannot override that
+check. With the source journal still valid, the run re-holds instead of failing
+and keeps its local work and custody. Export/recover the retained work rather than
+expecting Resume alone to rebind changed storage. Reholding does
+not rebind the owner record or consume the pending execution grant.
+
 This path requires API feature support, exact persisted `adoption_failed`
 evidence, current ownership and proven quiescence. Missing support or unconfirmed
 persistence fails closed with custody kept. An uncertain park response uses

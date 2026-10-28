@@ -21900,7 +21900,14 @@ export class RunRunner {
         await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
           async () => {
             this.retainedLifecycleGuard(flight);
-            if (episode && Number.isSafeInteger(claim.worker_recovery_owner_episode) &&
+            // Owner accounting authorizes renewed work, never preservation. A
+            // supported blocker already persisted on this exact journal can rehold
+            // through the source/episode, ownership and park checks below even when
+            // accounting identity changed. Active charges and handoffs still need
+            // their owner-bound reservation snapshot before resolving a new root.
+            const preservingRecordedBlock = episode?.stage === "blocked" &&
+              (episode.blocker === "adoption_failed" || episode.blocker === "budget_exhausted");
+            if (episode && !preservingRecordedBlock && Number.isSafeInteger(claim.worker_recovery_owner_episode) &&
                 (claim.worker_recovery_owner_episode ?? -1) >= 0) {
               expectedSource = await this.git.recoveryReservationSnapshot(bare, branch, key, expectedSource, episode);
               this.retainedLifecycleGuard(flight);

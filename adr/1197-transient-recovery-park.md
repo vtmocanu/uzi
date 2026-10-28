@@ -1592,7 +1592,16 @@ Accounting is stored in local bare Git config at
 `RecoveryProgress`, inventory fields and backup schemas read by older workers.
 The record binds the owner baseline and consumed high-water mark to immutable
 source/reservation identities, branch/key/run and bare path/device/inode. It
-records the original source and an explicitly matched successor handoff. Its
+records the original source and an explicitly matched successor handoff. Device
+and inode remain part of the execution binding: a path alone cannot identify a
+replacement filesystem. A remount or volume reattach may invalidate that binding.
+An already-persisted `adoption_failed` or `budget_exhausted` block can still be
+reheld through exact journal/source/episode verification and the existing fenced
+park route; adoption also requires fresh quiescence as above. This reporting path
+neither rebinds accounting nor consumes an owner grant, captures work or admits a
+model. Active reservations and successor handoffs retain the owner-bound snapshot
+checks. Invalid accounting still refuses renewed execution; retained work may
+need export/recovery when its recorded storage identity cannot be verified. Its
 canonical parser and match predicates are in
 [recovery-owner.ts](../agent/src/recovery-owner.ts); the locked read/write,
 reservation and handoff operations are in [git.ts](../agent/src/git.ts).
