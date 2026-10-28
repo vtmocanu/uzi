@@ -921,6 +921,39 @@ const activityReply = (op: { op: string; path: string }): Record<string, unknown
  return undefined;
 };
 
+it("activity: scan exhaustion records limit without a successful read, EOF stays ok, binary stays error", async () => {
+ const { r, events, recorder } = activityRig([
+  { tool: "Read", arguments: { path: "budget.ts", limit: 2 } },
+  { tool: "Read", arguments: { path: "empty-budget.ts", limit: 2 } },
+  { tool: "Read", arguments: { path: "partial-budget.ts", limit: 2 } },
+  { tool: "Read", arguments: { path: "empty.ts", limit: 2 } },
+  { tool: "Read", arguments: { path: "binary.ts", limit: 2 } },
+ ], op => {
+  if (op.op === "read") return { ok: false, code: "E_OVERSIZE" };
+  if (op.op !== "read_range") return undefined;
+  if (op.path === "binary.ts") return { ok: false, code: "E_NOT_TEXT" };
+  const incomplete = op.path !== "empty.ts";
+  const partial = op.path === "partial-budget.ts";
+  const data = op.path === "budget.ts" ? bodyOf(1) : partial ? Buffer.from("part").toString("base64") : "";
+  return { ok: true, data, size: 9 * 1024 * 1024,
+   offset: 1, linesReturned: data ? 1 : 0, partialLastLine: partial, truncated: incomplete,
+   incomplete, scannedBytes: incomplete ? 8 * 1024 * 1024 : 0, ...(incomplete ? { reason: "scan_budget" } : {}) };
+ });
+ assert.equal(await r.run(), verdict);
+ recorder.summary("codex", "plan", true);
+ assert.deepEqual(events.filter(e => e["event"] === "check_activity"), [
+  { event: "check_activity", op: "read", outcome: "limit", path: "budget.ts" },
+  { event: "check_activity", op: "read", outcome: "limit", path: "empty-budget.ts" },
+  { event: "check_activity", op: "read", outcome: "limit", path: "partial-budget.ts" },
+  { event: "check_activity", op: "read", outcome: "ok", path: "empty.ts" },
+  { event: "check_activity", op: "read", outcome: "error", path: "binary.ts" },
+ ]);
+ assert.deepEqual(events.find(e => e["event"] === "check_activity_summary")!["reads"], { ok: 1, denied: 0, oversize: 0, limit: 3, error: 1 });
+ for (const file of ["budget.ts", "empty-budget.ts", "partial-budget.ts"]) {
+  assert.equal(recorder.coverageEvidence().reads.has(file), false);
+ }
+});
+
 it("activity: a normal run marks the model started and a pre-model refusal does not", async () => {
  const done = activityRig([]);
  assert.equal(await done.r.run(), verdict);

@@ -72,6 +72,57 @@ function makeClient(opts: { maxLineBytes?: number; requestTimeoutMs?: number } =
   };
 }
 
+describe("FileopHelperClient: range protocol provenance", () => {
+  it("forwards known range fields and preserves reason presence and type", async () => {
+    const h = makeClient();
+    try {
+      for (const reason of [undefined, null, 7, "scan_budget"]) {
+        const request = { op: "read_range" as const, path: "x", offset: 2, limit: 3, origin: "helper" };
+        const pending = h.client.op(request);
+        const req = await h.requests.next();
+        assert.deepEqual(req, { id: req.id, op: "read_range", path: "x", offset: 2, limit: 3 });
+        const fields = { offset: 2, linesReturned: 1, partialLastLine: false, incomplete: false, scannedBytes: 12 };
+        h.respond({ id: req.id, ok: true, ...fields, ...(reason === undefined ? {} : { reason }), origin: "helper" });
+        const res = await pending;
+        for (const [key, value] of Object.entries(fields)) assert.equal((res as unknown as Record<string, unknown>)[key], value);
+        assert.equal(Object.hasOwn(res, "reason"), reason !== undefined);
+        assert.equal(res.reason, reason);
+        assert.equal(res.origin, undefined);
+      }
+    } finally { h.client.close(); }
+  });
+
+  it("mints origin only on exact false with a string code, ignoring wire origin", async () => {
+    const h = makeClient();
+    try {
+      for (const [fields, origin] of [
+        [{ ok: false, code: "E_OVERSIZE", origin: "spoof" }, "helper"],
+        [{ ok: true, code: "E_OVERSIZE", origin: "helper" }, undefined],
+        [{ code: "E_OVERSIZE", origin: "helper" }, undefined],
+        [{ ok: 0, code: "E_OVERSIZE", origin: "helper" }, undefined],
+        [{ ok: false, code: 7, origin: "helper" }, undefined],
+        [{ ok: false, origin: "helper" }, undefined],
+      ] as const) {
+        const pending = h.client.op({ op: "read", path: "x" });
+        const req = await h.requests.next();
+        h.respond({ id: req.id, ...fields });
+        assert.equal((await pending).origin, origin);
+      }
+    } finally { h.client.close(); }
+  });
+
+  it("local request oversize has no helper provenance at default and small caps", async () => {
+    for (const maxLineBytes of [undefined, 80]) {
+      const h = makeClient({ maxLineBytes });
+      try {
+        const res = await h.client.op({ op: "read", path: "x".repeat(maxLineBytes === undefined ? 2 * 1024 * 1024 : 100) });
+        assert.deepEqual(res, { ok: false, code: "E_OVERSIZE" });
+        assert.equal(h.writes(), 0);
+      } finally { h.client.close(); }
+    }
+  });
+});
+
 describe("FileopHelperClient: request/response round trip", () => {
   it("writes a framed request and resolves the correlated response", async () => {
     const h = makeClient();

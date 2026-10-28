@@ -1,4 +1,5 @@
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
+import { FileopHelperClient } from "../src/codex/fileop-client.js";
 import { admitPolicyTurn, type PolicyRefusalPayload } from "../src/provider-policy-refusal.js";
 import assert from "node:assert/strict";
 
@@ -991,6 +992,227 @@ describe("CodexCallbackBroker: bounded text Read (#296)", () => {
     }
     assert.equal(output((await read(Buffer.alloc(max, 1))).result).size, max);
     assert.deepEqual(output((await read("")).result).content, "");
+  });
+});
+
+
+describe("CodexCallbackBroker: helper-origin range fallback", () => {
+  const oversize: FileopResponse = { ok: false, code: "E_OVERSIZE", origin: "helper" };
+  const range = (content = "b\n", overrides: Partial<FileopResponse> = {}): FileopResponse => ({
+    ok: true, size: 2 * 1024 * 1024, data: Buffer.from(content).toString("base64"),
+    offset: 2, linesReturned: 1, partialLastLine: false, truncated: true,
+    incomplete: false, scannedBytes: 32768, ...overrides,
+  });
+  const call = (h: Harness, args: Record<string, unknown> = { file_path: "src/x.ts", offset: 2, limit: 1 }) =>
+    h.broker.handleToolCall(rt(), "Read", args, "root");
+
+  it("uses exactly read/read_range and exposes only second-response metadata", async () => {
+    const fileop = new FileopSpy([oversize, range()]);
+    const result = await call(makeBroker({ fileop }));
+    assert.deepEqual(result, { ok: true, output: {
+      size: 2 * 1024 * 1024, content: "b\n", offset: 2, linesReturned: 1, partialLastLine: false, truncated: true,
+    } });
+    assert.deepEqual(fileop.calls, [{ op: "read", path: "src/x.ts" }, { op: "read_range", path: "src/x.ts", offset: 2, limit: 1 }]);
+  });
+
+  it("retains range defaults and uses the screened path with the second operation", async () => {
+    for (const [args, offset, limit] of [[{ offset: 2 }, 2, 200], [{ limit: 1 }, 1, 1]] as const) {
+      const fileop = new FileopSpy([oversize, range("b\n", { offset })]);
+      assert.equal((await call(makeBroker({ fileop }), { path: WORKTREE + "/src/x.ts", ...args })).ok, true);
+      assert.deepEqual(fileop.calls[1], { op: "read_range", path: "src/x.ts", offset, limit });
+    }
+  });
+
+  it("local client frame refusals never acquire fallback authority", async () => {
+    for (const maxLineBytes of [undefined, 80]) {
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const client = new FileopHelperClient({ inbound, outbound, maxLineBytes });
+      let writes = 0;
+      outbound.on("data", () => { writes++; });
+      const requests: FileopRequest[] = [];
+      try {
+        const h = makeBroker({ fileop: { op: async req => { requests.push(req); return client.op(req); } } });
+        const result = await call(h, { path: "x".repeat(maxLineBytes === undefined ? 2 * 1024 * 1024 : 100), limit: 1 });
+        assertDenied(result, "fileop_denied");
+        assert.equal(result.fileopCode, "E_OVERSIZE");
+        assert.equal(requests.length, 1);
+        assert.equal(writes, 0);
+      } finally { client.close(); inbound.destroy(); outbound.destroy(); }
+    }
+  });
+
+  it("does not fall back on malformed or oversized inbound frames or malformed error objects", async () => {
+    for (const kind of ["json", "frame", "missing-ok", "wrong-ok", "wrong-code", "reason"] as const) {
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const client = new FileopHelperClient({ inbound, outbound, maxLineBytes: 512 });
+      const requests: FileopRequest[] = [];
+      outbound.on("data", chunk => {
+        const req = JSON.parse(String(chunk)) as { id: number; op: string };
+        if (kind === "json") inbound.write("not json\n");
+        else if (kind === "frame") inbound.write("x".repeat(513) + "\n");
+        else if (kind === "reason" && req.op === "read") inbound.write(JSON.stringify({ id: req.id, ok: false, code: "E_OVERSIZE" }) + "\n");
+        else {
+          const fields = kind === "missing-ok" ? { code: "E_OVERSIZE", origin: "helper" }
+            : kind === "wrong-ok" ? { ok: 0, code: "E_OVERSIZE", origin: "helper" }
+            : kind === "wrong-code" ? { ok: false, code: 7, origin: "helper" }
+            : range("b\n", { reason: 7 });
+          inbound.write(JSON.stringify({ id: req.id, ...fields }) + "\n");
+        }
+      });
+      try {
+        const h = makeBroker({ fileop: { op: async req => { requests.push(req); return client.op(req); } } });
+        const result = await call(h);
+        assertDenied(result, "fileop_denied");
+        assert.equal(requests.length, kind === "reason" ? 2 : 1, kind);
+        if (kind === "reason") assert.equal(result.fileopCode, "E_MALFORMED");
+      } finally { client.close(); inbound.destroy(); outbound.destroy(); }
+    }
+  });
+
+  it("handles coherent shrink, BOM, EOF and scan exhaustion", async () => {
+    for (const [content, metadata] of [
+      ["\ufeffx", { size: 4, scannedBytes: 4, truncated: false }],
+      ["", { size: 0, scannedBytes: 0, linesReturned: 0, truncated: false }],
+      ["", { size: 9 * 1024 * 1024, scannedBytes: 8 * 1024 * 1024, linesReturned: 0, incomplete: true, reason: "scan_budget" }],
+      ["prefix", { size: 9 * 1024 * 1024, scannedBytes: 8 * 1024 * 1024, partialLastLine: true, incomplete: true, reason: "scan_budget" }],
+    ] as const) {
+      const response = range(content, metadata);
+      const result = await call(makeBroker({ fileop: new FileopSpy([oversize, response]) }));
+      assert.equal(result.ok, true);
+      if (!result.ok) continue;
+      const out = result.output as Record<string, unknown>;
+      assert.equal(out.content, content);
+      assert.equal(out.size, metadata.size);
+      assert.equal(Object.hasOwn(out, "contentBase64"), false);
+      assert.equal(Object.hasOwn(out, "origin"), false);
+      assert.equal(out.incomplete, response.incomplete ? true : undefined);
+      assert.equal(out.scannedBytes, response.incomplete ? response.scannedBytes : undefined);
+    }
+  });
+
+  it("never falls back on local/other errors, unranged calls or invalid success", async () => {
+    for (const response of [
+      { ok: false, code: "E_OVERSIZE" },
+      ...["E_TIMEOUT", "E_IO", "E_NOT_TEXT", "E_MALFORMED"].map(code => ({ ok: false, code, origin: "helper" as const })),
+      { ok: true, size: 2 * 1024 * 1024, data: "" },
+      { ok: true, size: 2, data: Buffer.from([0, 10]).toString("base64") },
+      { ok: true, size: 1024 * 1024 + 1, data: "!".repeat(4 * Math.ceil(1024 * 1024 / 3) + 1) },
+    ]) {
+      const fileop = new FileopSpy(response);
+      assert.equal((await call(makeBroker({ fileop }))).ok, false);
+      assert.equal(fileop.calls.length, 1);
+    }
+    const fileop = new FileopSpy(oversize);
+    assert.equal((await call(makeBroker({ fileop }), { path: "x" })).ok, false);
+    assert.equal(fileop.calls.length, 1);
+    for (const args of [{ path: "../escape", limit: 1 }, { path: ".git/config", limit: 1 }, { path: "x", offset: 0 }]) {
+      const denied = new FileopSpy(oversize);
+      assert.equal((await call(makeBroker({ fileop: denied }), args)).ok, false);
+      assert.equal(denied.calls.length, 0);
+    }
+  });
+
+  it("rejects hostile range metadata, encoding and fake EOF without retrying", async () => {
+    const cases: Partial<FileopResponse>[] = [
+      ...["size", "offset", "linesReturned", "scannedBytes", "partialLastLine", "truncated", "incomplete", "data"].map(key => ({ [key]: undefined })),
+      ...["size", "offset", "linesReturned", "scannedBytes", "partialLastLine", "truncated", "incomplete"].map(key => ({ [key]: "wrong type" })),
+      ...[-1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity].map(size => ({ size })),
+      { offset: 1 }, { offset: 2.5 }, { linesReturned: -1 }, { linesReturned: 1.5 }, { linesReturned: 2 },
+      { scannedBytes: -1 }, { scannedBytes: 1.5 }, { scannedBytes: 1 }, { scannedBytes: 8 * 1024 * 1024 + 1 },
+      { size: 100, scannedBytes: 101 }, { partialLastLine: true },
+      { reason: undefined }, { reason: null }, { reason: 7 }, { reason: "scan_budget" },
+      { incomplete: true }, { incomplete: true, reason: "scan_budget", truncated: false },
+      { incomplete: true, reason: "scan_budget" },
+      ...["a", "Ygo", "Ygo==", "Ygp=", "====", "!".repeat(87385), Buffer.alloc(65537, 97).toString("base64")].map(data => ({ data })),
+      { data: "", linesReturned: 1 }, { data: "", linesReturned: 0, partialLastLine: true },
+      { data: "", linesReturned: 0, truncated: true },
+      { data: "", linesReturned: 0, truncated: false, size: 9 * 1024 * 1024, scannedBytes: 8 * 1024 * 1024 },
+      { data: Buffer.from("x").toString("base64") },
+    ];
+    for (const metadata of cases) {
+      const fileop = new FileopSpy([oversize, range("b\n", metadata)]);
+      const result = await call(makeBroker({ fileop }));
+      assertDenied(result, "fileop_denied");
+      assert.equal(result.fileopCode, "E_MALFORMED", JSON.stringify(metadata));
+      assert.equal(fileop.calls.length, 2);
+    }
+    for (const response of [range("\u0000"), range("", { data: "/w==" }), { ok: false, code: "E_NOT_TEXT" }]) {
+      const fileop = new FileopSpy([oversize, response]);
+      const result = await call(makeBroker({ fileop }));
+      assertDenied(result, "bad_args");
+      assert.equal(result.message, "line ranges require a text file");
+      assert.equal(fileop.calls.length, 2);
+    }
+    for (const code of ["E_OVERSIZE", "E_TIMEOUT", "E_IO", "hostile path"]) {
+      const fileop = new FileopSpy([oversize, { ok: false, code }]);
+      assertDenied(await call(makeBroker({ fileop })), "fileop_denied");
+      assert.equal(fileop.calls.length, 2);
+    }
+  });
+
+  it("does not write a fallback after the owning client closes between replies", async () => {
+    const inbound = new PassThrough();
+    const outbound = new PassThrough();
+    const client = new FileopHelperClient({ inbound, outbound });
+    const requests: Record<string, unknown>[] = [];
+    outbound.on("data", chunk => requests.push(JSON.parse(String(chunk))));
+    try {
+      const h = makeBroker({ fileop: client });
+      const pending = call(h);
+      inbound.write(JSON.stringify({ id: requests[0]!.id, ...oversize }) + "\n");
+      client.close();
+      const result = await pending;
+      assertDenied(result, "fileop_denied");
+      assert.equal(result.fileopCode, "E_IO");
+      assert.deepEqual(requests.map(r => r.op), ["read"]);
+      assert.equal(h.registry.inFlightCallbackCount(), 0);
+    } finally {
+      client.close(); inbound.destroy(); outbound.destroy();
+    }
+  });
+
+  it("keeps independent 30s operation timers and ignores late replies", async () => {
+    mock.timers.enable({ apis: ["setTimeout"] });
+    const inbound = new PassThrough();
+    const outbound = new PassThrough();
+    const client = new FileopHelperClient({ inbound, outbound });
+    const requests: Record<string, unknown>[] = [];
+    outbound.on("data", chunk => requests.push(JSON.parse(String(chunk))));
+    try {
+      const h = makeBroker({ fileop: client });
+      const pending = call(h);
+      mock.timers.tick(29999);
+      inbound.write(JSON.stringify({ id: requests[0]!.id, ...oversize }) + "\n");
+      await Promise.resolve();
+      assert.deepEqual(requests.map(r => r.op), ["read", "read_range"]);
+      mock.timers.tick(1);
+      inbound.write(JSON.stringify({ id: requests[1]!.id, ...range() }) + "\n");
+      assert.equal((await pending).ok, true);
+
+      const timed = call(h);
+      mock.timers.tick(30000);
+      assertDenied(await timed, "fileop_denied");
+      assert.equal(requests.length, 3);
+      inbound.write(JSON.stringify({ id: requests[2]!.id, ...oversize }) + "\n");
+      assert.equal(requests.length, 3);
+
+      for (const close of [false, true]) {
+        const next = call(h);
+        inbound.write(JSON.stringify({ id: requests.at(-1)!.id, ...oversize }) + "\n");
+        await Promise.resolve();
+        const id = requests.at(-1)!.id;
+        if (close) client.close(); else mock.timers.tick(30000);
+        const result = await next;
+        assertDenied(result, "fileop_denied");
+        assert.equal(result.fileopCode, close ? "E_IO" : "E_TIMEOUT");
+        inbound.write(JSON.stringify({ id, ...range() }) + "\n");
+      }
+      assert.equal(h.registry.inFlightCallbackCount(), 0);
+    } finally {
+      client.close(); inbound.destroy(); outbound.destroy(); mock.timers.reset();
+    }
   });
 });
 

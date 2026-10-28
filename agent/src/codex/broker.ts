@@ -169,6 +169,7 @@ const CHILD_FAILURE_CODES: ReadonlySet<string> = new Set([
  *  The Go helper owns every `E_*` code except the client's local timeout sentinel. */
 const FILEOP_FAILURE_CODES: ReadonlySet<string> = new Set([
   "E_OVERSIZE",
+  "E_NOT_TEXT",
   "E_MALFORMED",
   "E_UNKNOWN_OP",
   "E_DENIED",
@@ -252,8 +253,10 @@ export type CallbackResult =
  *  within the pinned parent directory.
  *  The `id` correlation is the production client's job, not the broker's. */
 export interface FileopRequest {
-  readonly op: "stat" | "read" | "write" | "apply" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
+  readonly op: "stat" | "read" | "read_range" | "write" | "apply" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
   readonly path: string;
+  readonly offset?: number;
+  readonly limit?: number;
   readonly newPath?: string;
   readonly data?: string;
   readonly old?: string;
@@ -264,6 +267,15 @@ export interface FileopRequest {
  *  raw errno/path/content. */
 export interface FileopResponse {
   readonly ok: boolean;
+  /** Minted only by the client for a correlated, well-formed helper error. */
+  readonly origin?: "helper";
+  readonly offset?: number;
+  readonly linesReturned?: number;
+  readonly partialLastLine?: boolean;
+  readonly incomplete?: boolean;
+  /** Preserve presence and invalid wire types so range validation can fail closed. */
+  readonly reason?: unknown;
+  readonly scannedBytes?: number;
   readonly code?: string;
   readonly size?: number;
   readonly data?: string;
@@ -976,7 +988,17 @@ export class CodexCallbackBroker {
     if ("ok" in screened) return screened;
 
     const res = await this.fileop.op({ op: "read", path: screened.rel });
-    if (!res.ok) return this.mapFileopError(res);
+    if (!res.ok) {
+      if (explicitRange && res.origin === "helper" && res.code === "E_OVERSIZE") {
+        const range = await this.fileop.op({ op: "read_range", path: screened.rel, offset, limit });
+        if (!range.ok) {
+          if (range.code === "E_NOT_TEXT") return deny("bad_args", "line ranges require a text file");
+          return this.mapFileopError(range);
+        }
+        return this.validateRangeRead(range, offset, limit);
+      }
+      return this.mapFileopError(res);
+    }
     const maxReadBytes = 1024 * 1024;
     const malformed = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_MALFORMED" });
     const oversized = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_OVERSIZE" });
@@ -1007,7 +1029,7 @@ export class CodexCallbackBroker {
     }
 
     // LF ends a logical line, including its delimiter. Scan at most the validated 1 MiB
-    // body; there is no phantom line after a final LF. A range never changes the helper read.
+    // body after a successful ordinary read; there is no phantom line after a final LF.
     const lineEnds: number[] = [];
     for (let i = 0; i < bytes.length; i++) {
       if (bytes[i] === 10) lineEnds.push(i + 1);
@@ -1036,6 +1058,52 @@ export class CodexCallbackBroker {
         truncated: res.truncated === true || end < bytes.length,
       },
     };
+  }
+
+  /** Validate the independent range descriptor's response before exposing any text. */
+  private validateRangeRead(res: FileopResponse, offset: number, limit: number): CallbackResult {
+    const malformed = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_MALFORMED" });
+    const cap = 64 * 1024;
+    const scanCap = 8 * 1024 * 1024;
+    // Bound the encoded input before either regex or decoding.
+    if (typeof res.data !== "string") return malformed();
+    if (res.data.length > 4 * Math.ceil(cap / 3)) return malformed();
+    if (res.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(res.data)) return malformed();
+    const bytes = Buffer.from(res.data, "base64");
+    if (bytes.length > cap || bytes.toString("base64") !== res.data) return malformed();
+    if (
+      typeof res.size !== "number" || !Number.isSafeInteger(res.size) || res.size < 0 ||
+      res.offset !== offset ||
+      typeof res.scannedBytes !== "number" || !Number.isSafeInteger(res.scannedBytes) ||
+      res.scannedBytes < bytes.length || res.scannedBytes > scanCap || res.scannedBytes > res.size ||
+      typeof res.linesReturned !== "number" || !Number.isSafeInteger(res.linesReturned) ||
+      res.linesReturned < 0 || res.linesReturned > limit ||
+      typeof res.partialLastLine !== "boolean" || typeof res.truncated !== "boolean" ||
+      typeof res.incomplete !== "boolean" ||
+      (res.incomplete
+        ? res.reason !== "scan_budget" || !res.truncated || res.scannedBytes !== scanCap
+        : Object.hasOwn(res, "reason")) ||
+      (bytes.length === 0 && (res.linesReturned !== 0 || res.partialLastLine || (!res.incomplete && res.truncated))) ||
+      // With no excerpt and unread opening extent, exhausting the budget cannot prove EOF.
+      (bytes.length === 0 && !res.incomplete && res.scannedBytes === scanCap && res.size > scanCap) ||
+      (res.partialLastLine && (!res.truncated || bytes.length === 0 || bytes.at(-1) === 10))
+    ) return malformed();
+    let content: string;
+    try {
+      content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    } catch {
+      return deny("bad_args", "line ranges require a text file");
+    }
+    if (content.includes("\u0000")) return deny("bad_args", "line ranges require a text file");
+    let lines = bytes.length > 0 && bytes.at(-1) !== 10 ? 1 : 0;
+    for (const byte of bytes) if (byte === 10) lines++;
+    if (lines !== res.linesReturned ||
+      (bytes.length > 0 && bytes.at(-1) !== 10 && res.truncated && !res.partialLastLine)) return malformed();
+    return { ok: true, output: {
+      size: res.size, content, offset, linesReturned: res.linesReturned,
+      partialLastLine: res.partialLastLine, truncated: res.truncated,
+      ...(res.incomplete ? { incomplete: true, reason: "scan_budget", scannedBytes: res.scannedBytes } : {}),
+    } };
   }
 
   /** Search only through fileop list/stat/read. Every traversal and returned byte has

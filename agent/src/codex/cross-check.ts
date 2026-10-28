@@ -175,6 +175,10 @@ function settleActivity(activity: CheckActivityRecorder, callId: string, kind: A
   if (result.ok) {
    const out = object(result.output);
    if (kind === "read") {
+    if (out?.incomplete === true) {
+     activity.settle(callId, { outcome: "limit" });
+     return;
+    }
     const lines = positiveSafeInt(out?.offset) && positiveSafeInt(out?.linesReturned) && out?.replay !== true
      ? [out.offset, out.offset + out.linesReturned - 1] as const : undefined;
     activity.settle(callId, lines ? { outcome: "ok", lines } : { outcome: "ok" });
