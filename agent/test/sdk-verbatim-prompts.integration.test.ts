@@ -267,8 +267,12 @@ describe("streamed prompts are not preprocessed by the CLI (issue #1563)", () =>
     const d = await drive(prompt);
     assert.ok(!sent(d, OUTSIDE_MARKER), "the outside-worktree @path file reached the provider");
     assert.ok(lastUserText(d).includes(`@${outside}`), "the outside @path mention was not delivered literally");
-    // The other half of the bypass: the same file read through the tool path is refused by the
-    // guard's worktree confinement, so only the CLI preprocessing could have reached it.
+  });
+
+  // The other half of the bypass: the same file read through the tool path is refused by the
+  // guard's worktree confinement, so only the CLI preprocessing could have reached it. A separate
+  // test so no test runs more than two drives against its 120 s cap.
+  it("a direct Read of a file outside the worktree is denied by the path guard", { timeout: 120_000 }, async () => {
     readTarget = outside;
     const direct = await drive("Read the file, please.");
     const reads = guardedReads(direct);
