@@ -1412,7 +1412,15 @@ export interface ClaimMemoryState {
   memory_policy?: MemoryPolicy | null;
 }
 
+export interface ForgeOriginReservation {
+  incarnation: string;
+  version: number;
+  observation_version: number;
+}
+
 export interface ClaimResponse extends ClaimMemoryState {
+  /** Optional negotiated telemetry token; grants no execution or custody authority. */
+  forge_origin_reservation?: ForgeOriginReservation;
   /** Server row only; no production enrollment writer in M2. */
   semantic_planning?: import("./semantic-plan.js").SemanticPlanning;
   /** Guarded prompt repair inputs; metadata is untrusted. */
@@ -3057,8 +3065,8 @@ export interface StateAck {
   /** PRD #1392 M2 (D10): the retry-not-before stamp the api returns on a `recovery_wait` ack —
    *  a field ON the RunDTO (`run.recovery_retry_not_before`), NOT top-level — so the pre-clone
    *  forge-park feed event can quote when the run resumes. An RFC3339 string as the api marshals
-   *  it; absent (older server, no stamp, unparseable body) ⇒ the feed event says "after backoff". */
-  recoveryRetryNotBefore?: string;
+   *  it; NULL means automatic forge retries exhausted; waiting for owner Resume or Cancel; absent retains historical backoff copy. */
+  recoveryRetryNotBefore?: string | null;
   /** PRD #1247 M5b: the worker-facing held-state credential-switch signal, read TOP-LEVEL off the
    *  /state ack body (beside `run`, on both the 200 ack and the ordinary not-applied 409). Present
    *  when a switch is pending for the claim the worker still holds; the `generation` is the one the
@@ -3155,9 +3163,8 @@ export interface RunOwnershipResponse {
   /** PRD #1392 M2 (D10): the run's `recovery_retry_not_before` stamp, added to the ownership
    *  probe so a forge park reconciled through the probe (a transport failure lost the report
    *  ack) can still quote when it resumes. An RFC3339 string when the run is parked with a
-   *  stamp; absent otherwise (an older api, or a non-parked run) ⇒ the feed event falls back
-   *  to "retry after backoff". */
-  recovery_retry_not_before?: string;
+   *  stamp; NULL means automatic forge retries exhausted; waiting for owner Resume or Cancel. An absent stamp retains historical backoff copy. */
+  recovery_retry_not_before?: string | null;
 }
 
 /** PRD #1391 Run B M3 (D3): one missing seq range in a run's message trace, as the message-gaps

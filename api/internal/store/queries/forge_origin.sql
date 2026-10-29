@@ -79,6 +79,43 @@ SELECT EXISTS (
     WHERE r.id = @run_id::uuid AND r.status = 'claimed'
 )::boolean AS refused;
 
+-- name: GetForgeOriginReservation :one
+-- A token is advisory telemetry, never network or custody authority.
+SELECT c.reservation_incarnation, c.reservation_version, c.reservation_observation_version
+FROM run_forge_origins m
+JOIN runs r ON r.id = m.run_id AND r.user_id = m.user_id
+    AND r.worker_id = m.worker_id AND r.claim_generation = m.generation
+JOIN authorized_forge_origins a ON a.repo_id = r.repo_id AND a.user_id = m.user_id
+    AND a.connection_id = m.connection_id AND a.origin = m.origin
+JOIN forge_origin_cooldowns c ON c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin = m.origin
+WHERE m.run_id = @run_id::uuid AND m.worker_id = @worker_id::uuid AND m.generation = @generation::bigint
+    AND c.reservation_run_id = m.run_id AND c.reservation_generation = m.generation
+    AND c.incarnation = m.reservation_incarnation AND c.reservation_incarnation = m.reservation_incarnation
+    AND c.reservation_version = m.reservation_version
+    AND c.observation_version = c.reservation_observation_version;
+
+-- name: ClearForgeOriginOnCloneSuccess :execrows
+-- Caller locks authenticated worker, then exact run. Lock the current authorized
+-- mapping without waiting on repo deletion; a refusal rolls back this one attempt.
+WITH mapping AS MATERIALIZED (
+    SELECT m.* FROM run_forge_origins m
+    JOIN runs r ON r.id = m.run_id AND r.user_id = m.user_id
+        AND r.worker_id = m.worker_id AND r.claim_generation = m.generation
+    JOIN authorized_forge_origins a ON a.repo_id = r.repo_id AND a.user_id = m.user_id
+        AND a.connection_id = m.connection_id AND a.origin = m.origin
+    WHERE m.run_id = @run_id::uuid AND m.worker_id = @worker_id::uuid AND m.generation = @generation::bigint
+        AND r.status IN ('claimed', 'running') AND r.claim_released_at IS NULL AND r.stop_kind IS NULL
+        AND m.reservation_incarnation = @incarnation::uuid AND m.reservation_version = @version::bigint
+    FOR SHARE OF a NOWAIT
+)
+DELETE FROM forge_origin_cooldowns c USING mapping m
+WHERE c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin = m.origin
+    AND c.incarnation = @incarnation::uuid AND c.reservation_incarnation = @incarnation::uuid
+    AND c.reservation_run_id = m.run_id AND c.reservation_generation = m.generation
+    AND c.reservation_version = @version::bigint
+    AND c.reservation_observation_version = @observation_version::bigint
+    AND c.observation_version = @observation_version::bigint;
+
 -- name: CanonicalForgeOrigin :one
 -- Empty means unknown and is never a cooldown key (the table rejects it).
 SELECT COALESCE(canonical_forge_origin(@raw::text), '')::text AS origin;

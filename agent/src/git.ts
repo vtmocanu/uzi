@@ -2965,7 +2965,7 @@ export class GitCache {
   }
 
   /** Clone the repo bare if absent, else fetch to refresh. Returns the bare path. */
-  async ensureClone(repoUrl: string, pat?: string, username?: string, checkpointKey?: string): Promise<string> {
+  async ensureClone(repoUrl: string, pat?: string, username?: string, checkpointKey?: string, onDirectSuccess?: () => void): Promise<string> {
     const barePath = this.barePathFor(repoUrl);
     const scope = httpScopeForUrl(repoUrl);
     return this.withLock(barePath, async () => {
@@ -3032,6 +3032,8 @@ export class GitCache {
           this.taskCheckpointFreshness.delete(this.taskCheckpointFreshness.keys().next().value!);
         }
       }
+      // Advisory reporting cannot change a successful direct Git operation.
+      try { onDirectSuccess?.(); } catch { /* best effort */ }
       return barePath;
     });
   }

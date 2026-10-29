@@ -2134,6 +2134,7 @@ type SourceGenesis = Readonly<{
 type ClaimCheckpointEvidence = Readonly<{ tip?: string; attestedSource?: string; writeUnresolved?: boolean }>;
 
 interface RunFlight {
+  forgeCloneSuccess?: AbortController;
   readonly checkpointCoordinates?: CheckpointCoordinates;
   readonly checkpointClaimEvidence: ClaimCheckpointEvidence;
   /** Initial trusted claim/executor classification; denial only, never disposal evidence. */
@@ -5192,6 +5193,7 @@ export class RunRunner {
     } catch (err) {
       await dispatchFailure(err, true);
     } finally {
+      flight.forgeCloneSuccess?.abort();
       await flight.ciEvidence?.dispose().catch(() => runLog.warn("CI evidence reader disposal failed"));
       flight.ciEvidence = undefined;
       // #1539: AWAIT the permanent-failure hook's settlement BEFORE the Codex registry disposal
@@ -7098,7 +7100,7 @@ export class RunRunner {
    * finally treats it as a park (no terminal report) whose resume artifacts follow preserveSession.
    */
   private async finishForgePark(
-    retryAt: string | undefined,
+    retryAt: string | null | undefined,
     claim: ClaimResponse,
     flight: RunFlight,
     runLog: Logger,
@@ -7106,7 +7108,9 @@ export class RunRunner {
     copy: PreCloneParkCopy = FORGE_PARK_COPY,
   ): Promise<void> {
     const { batcher } = flight;
-    const when = retryAt ? `retry at ${retryAt}` : "retry after backoff";
+    const when = retryAt === null && copy === FORGE_PARK_COPY
+      ? "automatic forge retries exhausted; waiting for owner Resume or Cancel"
+      : retryAt ? `retry at ${retryAt}` : "retry after backoff";
     batcher.emit({
       kind: "status",
       agent: "worker",
@@ -11325,6 +11329,14 @@ export class RunRunner {
             claim.secrets.forge_pat,
             claim.secrets.forge_username,
             flight.runKind === "task" ? flight.checkpointCoordinates?.checkpoint_key : undefined,
+            () => {
+              // Exactly one report per ordinary clone flight; never join model execution.
+              if (flight.forgeCloneSuccess) return;
+              flight.forgeCloneSuccess = new AbortController();
+              this.client.reportForgeCloneSuccess(claim, AbortSignal.any([
+                flight.forgeCloneSuccess.signal, flight.cancel.signal, this.shutdownSignal.signal,
+              ]));
+            },
           ),
       );
     } catch (err) {

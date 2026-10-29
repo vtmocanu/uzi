@@ -402,6 +402,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // worker never sends the snapshot — the same shape an old worker sees.
 func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []string {
 	groups := [][]string{
+		{workersvc.ForgeCloneSuccessFeature},
 		{workersvc.CapabilityEvidenceFeature},
 		{"heartbeat_protocol_refresh_v1"},
 		{"codex_account_admission_signal_v1"},
@@ -1794,8 +1795,8 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	}
 	// PRD #1392 M1 (D10): recovery_retry_not_before rides the ownership probe so a worker
 	// reconciling an unknown forge-park outcome (a transport failure after the report was sent)
-	// can still quote the acknowledged retry time on its feed event. Omitted (nil) for a run
-	// that is not recovery-parked.
+	// can still quote the acknowledged retry time on its feed event. Explicit NULL
+	// distinguishes an owner hold from an omitted stamp on a non-parked run.
 	//
 	// PRD #1391 Run B M4: claim_generation rides the same probe (additive) so the run-lane claim
 	// router can proceed ONLY on a claimed/running row AT the claim's generation, and end the
@@ -1806,7 +1807,7 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded, "hold_reason": holdReason, "claim_released": claimReleased, "gate_revision": gateRevision}
-	if recoveryRetryNotBefore != nil {
+	if recoveryRetryNotBefore != nil || status == "recovery_wait" {
 		body["recovery_retry_not_before"] = recoveryRetryNotBefore
 	}
 	httpx.JSON(w, http.StatusOK, body)

@@ -1071,6 +1071,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			}
 		}
 	}
+	if !isolated {
+		payload.ForgeOriginReservation = s.forgeOriginReservation(ctx, wkr, run)
+	}
 	return payload, nil
 }
 

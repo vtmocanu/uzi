@@ -1502,8 +1502,53 @@ export class WorkerClient {
     this.replaceServerFeatures(v);
   }
 
+  private readonly forgeCloneReports = new Set<AbortController>();
+
+  /** One attempt, no retries/backlog, no response authority. The ordinary clone
+   * flight alone calls this after its actual successful direct Git operation. */
+  reportForgeCloneSuccess(claim: ClaimResponse, flightSignal: AbortSignal): void {
+    const token = claim.forge_origin_reservation;
+    if (!this.hasFeature("forge_clone_success_v1") || flightSignal.aborted ||
+        !terminalUUID(claim.run_id) || !terminalGeneration(claim.claim_generation) ||
+        (claim.claim_generation ?? 0) <= 0 || !isRecord(token) ||
+        Object.keys(token).some(k => !["incarnation", "version", "observation_version"].includes(k)) ||
+        !terminalUUID(token.incarnation) ||
+        !Number.isSafeInteger(token.version) || token.version <= 0 ||
+        !Number.isSafeInteger(token.observation_version) || token.observation_version <= 0) return;
+    const scope = new AbortController();
+    const signal = AbortSignal.any([scope.signal, flightSignal]);
+    const timer = setTimeout(() => scope.abort(), 5_000);
+    timer.unref();
+    this.forgeCloneReports.add(scope);
+    const finish = () => {
+      clearTimeout(timer);
+      this.forgeCloneReports.delete(scope);
+      signal.removeEventListener("abort", finish);
+    };
+    signal.addEventListener("abort", finish, { once: true });
+    try {
+      void (this.transport ?? fetch)(
+        this.baseUrl + WORKER_API_PREFIX + "/runs/" + encodeURIComponent(claim.run_id) + "/forge-clone-success",
+        { method: "POST", headers: { Authorization: "Bearer " + this.token,
+          "Content-Type": "application/json", "X-Client-Version": this.version },
+          body: JSON.stringify({ claim_generation: claim.claim_generation,
+            incarnation: token.incarnation, version: token.version, observation_version: token.observation_version }), signal },
+      ).then(response => {
+        // Status and body never authorize anything; strict legacy endpoints can
+        // refuse this optional report without changing the flight.
+        if (!signal.aborted && [400, 404, 405].includes(response.status)) this.dropFeature("forge_clone_success_v1");
+        void response.body?.cancel().catch(() => {});
+      }).catch(() => {}).finally(finish);
+    } catch { finish(); }
+  }
+
+  private cancelForgeCloneReports(): void {
+    for (const scope of this.forgeCloneReports) scope.abort();
+  }
+
   private replaceServerFeatures(features: readonly string[]): void {
     this.serverFeatures = new Set(features);
+    if (!this.hasFeature("forge_clone_success_v1")) this.cancelForgeCloneReports();
     if (!this.hasFeature("codex_account_admission_signal_v1")) {
       this.codexAdmissionEpoch = {};
       for (const owned of this.codexAdmission.values()) owned.reporter.seal();
@@ -1658,6 +1703,7 @@ export class WorkerClient {
    *  rollback fallback succeeds, later ordinary heartbeat adverts can repopulate it. */
   clearFeatures(): void {
     this.serverFeatures.clear();
+    this.cancelForgeCloneReports();
     this.codexAdmissionEpoch = {};
     for (const owned of this.codexAdmission.values()) owned.reporter.seal();
     this.revokeMemoryAuthority();
@@ -1669,6 +1715,7 @@ export class WorkerClient {
    *  closes and every other negotiated extension stays on. */
   dropFeature(f: string): void {
     this.serverFeatures.delete(f);
+    if (f === "forge_clone_success_v1") this.cancelForgeCloneReports();
     if (f === "codex_account_admission_signal_v1") {
       this.codexAdmissionEpoch = {};
       for (const owned of this.codexAdmission.values()) owned.reporter.seal();
@@ -5079,7 +5126,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   pauseRequested?: boolean;
   budgetExhausted?: boolean;
   reason?: string;
-  recoveryRetryNotBefore?: string;
+  recoveryRetryNotBefore?: string | null;
   credentialSwitch?: { generation: number };
   staleClaim?: boolean;
   credentialSwitchReleased?: boolean;
@@ -5170,7 +5217,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       pauseRequested?: boolean;
       budgetExhausted?: boolean;
       reason?: string;
-      recoveryRetryNotBefore?: string;
+      recoveryRetryNotBefore?: string | null;
       credentialSwitch?: { generation: number };
       staleClaim?: boolean;
       credentialSwitchReleased?: boolean;
@@ -5285,11 +5332,10 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     if (typeof run?.completion_budget_exhausted === "boolean")
       out.budgetExhausted = run.completion_budget_exhausted;
     // PRD #1392 M2 (D10): the TOP-LEVEL disposition reason ("stale_claim"|"custody_unsettled")
-    // and the RunDTO's `recovery_retry_not_before` stamp for a forge-unreachable park ack. Both
-    // string-only; a non-string (older server, unparseable value) leaves them absent, which the
-    // forge-park dispatch reads as "no reason" / "retry after backoff" — the safe defaults.
+    // and the RunDTO's recovery retry stamp. Explicit NULL means an owner hold;
+    // absent/malformed values keep the historical backoff copy.
     if (typeof parsed?.reason === "string") out.reason = parsed.reason;
-    if (typeof run?.recovery_retry_not_before === "string")
+    if (typeof run?.recovery_retry_not_before === "string" || run?.recovery_retry_not_before === null)
       out.recoveryRetryNotBefore = run.recovery_retry_not_before;
     // PRD #1247 M5b: the held-state credential-switch signal and the stale-claim disposition ride
     // the SAME single-use body, TOP-LEVEL beside `run` (present on the 200 ack, the ordinary 409,

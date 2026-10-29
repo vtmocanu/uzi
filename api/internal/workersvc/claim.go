@@ -24,6 +24,7 @@ import (
 // structured templates (PRD #3 provides several subagents that map to
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
+	ForgeOriginReservation *ForgeOriginReservation `json:"forge_origin_reservation,omitempty"`
 	// CheckpointWriteUnresolved is admission-time evidence for validated enrolled tasks;
 	// nil leaves recovery status unknown for legacy claims.
 	CheckpointWriteUnresolved *bool                        `json:"checkpoint_write_unresolved,omitempty"`

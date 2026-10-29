@@ -9,6 +9,7 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const canonicalForgeOrigin = `-- name: CanonicalForgeOrigin :one
@@ -21,6 +22,53 @@ func (q *Queries) CanonicalForgeOrigin(ctx context.Context, raw string) (string,
 	var origin string
 	err := row.Scan(&origin)
 	return origin, err
+}
+
+const clearForgeOriginOnCloneSuccess = `-- name: ClearForgeOriginOnCloneSuccess :execrows
+WITH mapping AS MATERIALIZED (
+    SELECT m.run_id, m.user_id, m.worker_id, m.generation, m.connection_id, m.origin, m.reservation_incarnation, m.reservation_version FROM run_forge_origins m
+    JOIN runs r ON r.id = m.run_id AND r.user_id = m.user_id
+        AND r.worker_id = m.worker_id AND r.claim_generation = m.generation
+    JOIN authorized_forge_origins a ON a.repo_id = r.repo_id AND a.user_id = m.user_id
+        AND a.connection_id = m.connection_id AND a.origin = m.origin
+    WHERE m.run_id = $4::uuid AND m.worker_id = $5::uuid AND m.generation = $6::bigint
+        AND r.status IN ('claimed', 'running') AND r.claim_released_at IS NULL AND r.stop_kind IS NULL
+        AND m.reservation_incarnation = $1::uuid AND m.reservation_version = $2::bigint
+    FOR SHARE OF a NOWAIT
+)
+DELETE FROM forge_origin_cooldowns c USING mapping m
+WHERE c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin = m.origin
+    AND c.incarnation = $1::uuid AND c.reservation_incarnation = $1::uuid
+    AND c.reservation_run_id = m.run_id AND c.reservation_generation = m.generation
+    AND c.reservation_version = $2::bigint
+    AND c.reservation_observation_version = $3::bigint
+    AND c.observation_version = $3::bigint
+`
+
+type ClearForgeOriginOnCloneSuccessParams struct {
+	Incarnation        uuid.UUID `json:"incarnation"`
+	Version            int64     `json:"version"`
+	ObservationVersion int64     `json:"observation_version"`
+	RunID              uuid.UUID `json:"run_id"`
+	WorkerID           uuid.UUID `json:"worker_id"`
+	Generation         int64     `json:"generation"`
+}
+
+// Caller locks authenticated worker, then exact run. Lock the current authorized
+// mapping without waiting on repo deletion; a refusal rolls back this one attempt.
+func (q *Queries) ClearForgeOriginOnCloneSuccess(ctx context.Context, arg ClearForgeOriginOnCloneSuccessParams) (int64, error) {
+	result, err := q.db.Exec(ctx, clearForgeOriginOnCloneSuccess,
+		arg.Incarnation,
+		arg.Version,
+		arg.ObservationVersion,
+		arg.RunID,
+		arg.WorkerID,
+		arg.Generation,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getForgeOriginCooldown = `-- name: GetForgeOriginCooldown :one
@@ -56,6 +104,41 @@ func (q *Queries) GetForgeOriginCooldown(ctx context.Context, arg GetForgeOrigin
 		&i.ReservationVersion,
 		&i.ReservationObservationVersion,
 	)
+	return i, err
+}
+
+const getForgeOriginReservation = `-- name: GetForgeOriginReservation :one
+SELECT c.reservation_incarnation, c.reservation_version, c.reservation_observation_version
+FROM run_forge_origins m
+JOIN runs r ON r.id = m.run_id AND r.user_id = m.user_id
+    AND r.worker_id = m.worker_id AND r.claim_generation = m.generation
+JOIN authorized_forge_origins a ON a.repo_id = r.repo_id AND a.user_id = m.user_id
+    AND a.connection_id = m.connection_id AND a.origin = m.origin
+JOIN forge_origin_cooldowns c ON c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin = m.origin
+WHERE m.run_id = $1::uuid AND m.worker_id = $2::uuid AND m.generation = $3::bigint
+    AND c.reservation_run_id = m.run_id AND c.reservation_generation = m.generation
+    AND c.incarnation = m.reservation_incarnation AND c.reservation_incarnation = m.reservation_incarnation
+    AND c.reservation_version = m.reservation_version
+    AND c.observation_version = c.reservation_observation_version
+`
+
+type GetForgeOriginReservationParams struct {
+	RunID      uuid.UUID `json:"run_id"`
+	WorkerID   uuid.UUID `json:"worker_id"`
+	Generation int64     `json:"generation"`
+}
+
+type GetForgeOriginReservationRow struct {
+	ReservationIncarnation        pgtype.UUID `json:"reservation_incarnation"`
+	ReservationVersion            pgtype.Int8 `json:"reservation_version"`
+	ReservationObservationVersion pgtype.Int8 `json:"reservation_observation_version"`
+}
+
+// A token is advisory telemetry, never network or custody authority.
+func (q *Queries) GetForgeOriginReservation(ctx context.Context, arg GetForgeOriginReservationParams) (GetForgeOriginReservationRow, error) {
+	row := q.db.QueryRow(ctx, getForgeOriginReservation, arg.RunID, arg.WorkerID, arg.Generation)
+	var i GetForgeOriginReservationRow
+	err := row.Scan(&i.ReservationIncarnation, &i.ReservationVersion, &i.ReservationObservationVersion)
 	return i, err
 }
 
