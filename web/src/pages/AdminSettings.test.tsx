@@ -1816,6 +1816,28 @@ describe("vault policy", () => {
 });
 
 describe("browser grant lifetime", () => {
+  it("keeps confirmed lifetime when an older sibling-card save returns later", async () => {
+    let finishHealth!: (value: ReturnType<typeof response>) => void;
+    mockApi.updateSettings.mockImplementation(patch => {
+      if ("health_stall_seconds" in patch) return new Promise(resolve => { finishHealth = resolve; });
+      if ("vault_reunlock_days" in patch) return Promise.resolve(response({ vault_reunlock_days: "30" }));
+      throw new Error("unexpected settings patch");
+    });
+    renderPage();
+    const lifetime = await screen.findByLabelText("Browser grant lifetime (days)") as HTMLInputElement;
+    await waitFor(() => expect(lifetime.disabled).toBe(false));
+    fireEvent.change(screen.getByLabelText("Stalled after (seconds of silence)"), { target: { value: "901" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save run health" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ health_stall_seconds: "901" }));
+    fireEvent.change(lifetime, { target: { value: "30" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save browser grant lifetime" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ vault_reunlock_days: "30" }));
+    await waitFor(() => expect(lifetime.disabled).toBe(false));
+    await act(async () => { finishHealth(response({ health_stall_seconds: "901", vault_reunlock_days: "7" })); });
+    expect(lifetime.value).toBe("30");
+    fireEvent.change(lifetime, { target: { value: "7" } });
+    expect(screen.getByRole("button", { name: "Save browser grant lifetime" })).toHaveProperty("disabled", false);
+  });
   it.each(["1", "30"])("saves canonical %s days and defaults to 7", async days => {
     mockApi.updateSettings.mockResolvedValueOnce(response({ vault_reunlock_days: days }));
     render(<MemoryRouter><AdminSettings /></MemoryRouter>);

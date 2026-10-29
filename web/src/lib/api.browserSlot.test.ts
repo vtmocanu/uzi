@@ -32,6 +32,18 @@ it.each(["uzi_csrf=%", "uzi_csrf=%E0%A4"])("keeps ordinary reads functional for 
   expect(fetch.mock.calls[0][1]?.headers).toEqual({});
 });
 
+it.each(["%00", "%0D%0A", "%E2%80%A8"])("skips header-unsafe readable CSRF %s without blocking a safe read", async encoded => {
+  vi.stubGlobal("document", { cookie: `uzi_csrf=${encoded}`, hidden: false });
+  const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+    // Exercise the same header-value validation as the browser's native fetch.
+    new Headers(init?.headers);
+    return new Response("{}");
+  });
+  vi.stubGlobal("fetch", fetch);
+  await expect(api.me()).resolves.toEqual({});
+  expect(fetch.mock.calls[0][1]?.headers).toEqual({});
+});
+
 it("tags hidden dispatches passive, preserves explicit passive when visible, then permits foreground probes", async () => {
   const doc = { cookie: "uzi_csrf=readable", hidden: true };
   vi.stubGlobal("document", doc);

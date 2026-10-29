@@ -5,7 +5,7 @@
 // (Decision 8) for immediate feedback, but the server stays the source of truth.
 
 import { useLocation } from "react-router-dom";
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   api,
   type AppSettings,
@@ -149,6 +149,7 @@ export function AdminSettings() {
   // (master-key) encryption. Fetched separately so a failure never blocks the
   // settings form; null = unknown/not-yet-loaded, rendered only when > 0.
   const [reunlockDays, setReunlockDays] = useState("7");
+  const confirmedReunlockDays = useRef<string | null>(null);
   const [reunlockError, setReunlockError] = useState("");
   const [vaultPolicy, setVaultPolicy] = useState("required");
   const [unprotectedUsers, setUnprotectedUsers] = useState<number | null>(null);
@@ -159,9 +160,15 @@ export function AdminSettings() {
   // consistent snapshot.
   const applyResponse = useCallback((resp: SettingsResponse) => {
     const { settings, secrets: sec, sources: src } = resp;
-    setSaved(settings);
+    // Sibling cards save independently and may return an older full map.
+    // Only the initial load and this field's own save confirm its lifetime.
+    const lifetime = confirmedReunlockDays.current ?? settings.vault_reunlock_days ?? "7";
+    if (confirmedReunlockDays.current === null) {
+      confirmedReunlockDays.current = lifetime;
+      setReunlockDays(lifetime);
+    }
+    setSaved({ ...settings, vault_reunlock_days: lifetime });
     setVaultPolicy(settings.vault_policy ?? "required");
-    setReunlockDays(settings.vault_reunlock_days ?? "7");
     setUnprotectedUsers(resp.unprotected_users ?? null);
     setSecrets(sec ?? {});
     setSources(src ?? {});
@@ -362,6 +369,7 @@ export function AdminSettings() {
           try {
             const resp = await api.updateSettings({ vault_reunlock_days: reunlockDays });
             const days = resp.settings.vault_reunlock_days ?? "7";
+            confirmedReunlockDays.current = days;
             setSaved(current => current ? { ...current, vault_reunlock_days: days } : current);
             setReunlockDays(days);
           } catch (err) { setReunlockError(errorMessage(err, "Failed to save browser grant lifetime")); }

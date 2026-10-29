@@ -231,7 +231,10 @@ function readCookie(name: string): string | null {
   );
   if (!match) return null;
   try {
-    return decodeURIComponent(match[1]);
+    const value = decodeURIComponent(match[1]);
+    // The server's base64url token is printable ASCII. Ignore cookie corruption
+    // that would make fetch reject the header before an ordinary safe read.
+    return /^[\x21-\x7e]+$/.test(value) ? value : null;
   } catch {
     // A malformed readable cookie cannot authorize restoration. Safe reads
     // still reach the API and retain its ordinary authentication behavior.
