@@ -62,7 +62,7 @@ func TestForgeOriginParkObservationLiveDB(t *testing.T) {
 			case "stale":
 				gen = 0
 			case "cancel":
-				e.exec(t, "UPDATE runs SET stop_kind = 'cancelled' WHERE id = $1", id)
+				e.exec(t, "UPDATE runs SET stop_kind = 'cancelled', forge_park_count=6 WHERE id = $1", id)
 			case "released":
 				e.exec(t, "UPDATE runs SET claim_released_at = now() WHERE id = $1", id)
 			case "cap":
@@ -116,7 +116,7 @@ func TestForgeOriginParkObservationLiveDB(t *testing.T) {
 					t.Fatalf("transition = %v, %v", applied, err)
 				}
 			}
-			if mode != "applied_lost_ack" {
+			if mode != "applied_lost_ack" && mode != "cap" {
 				if e.originCount(t, w) != 0 {
 					t.Fatal("non-park observed network failure")
 				}
@@ -192,7 +192,7 @@ func TestForgeOriginClaimMappingBarrierLiveDB(t *testing.T) {
 // Another repository retaining the old origin must not authorize this run after
 // its own mapping changes between claim and the service's park transaction.
 func TestForgeOriginParkMappingEditLiveDB(t *testing.T) {
-	for _, mode := range []string{"origin", "connection"} {
+	for _, mode := range []string{"origin", "connection", "cap_origin", "cap_connection"} {
 		t.Run(mode, func(t *testing.T) {
 			e := setupInterlockLiveDB(t)
 			w := e.seedWorker(t, nil)
@@ -201,7 +201,10 @@ func TestForgeOriginParkMappingEditLiveDB(t *testing.T) {
 			e.exec(t, `INSERT INTO repos (id,connection_id,forge_project_id,path_with_namespace,web_url)
                 SELECT $2,connection_id,999,'group/retained','https://forge.e2e/group/retained'
                 FROM repos WHERE id=$1`, e.repoID, uuid.New())
-			if mode == "origin" {
+			if strings.HasPrefix(mode, "cap_") {
+				e.exec(t, "UPDATE runs SET forge_park_count=6 WHERE id=$1", id)
+			}
+			if strings.HasSuffix(mode, "origin") {
 				e.exec(t, "UPDATE repos SET web_url='https://edited.example/repo' WHERE id=$1", e.repoID)
 			} else {
 				conn := uuid.New()

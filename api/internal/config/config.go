@@ -516,10 +516,10 @@ type Config struct {
 	// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2). A transient forge failure at
 	// clone parks the run in 'recovery_wait' with recovery_wait_cause='forge_unreachable';
 	// forge_park_count is its FORGE-ONLY lifetime counter (distinct from the backoff-shaping
-	// recovery_wait_count), and this is the cap the park-or-fail decision consults inside
-	// SetState. Past the cap the run fails with fail_origin='forge_unreachable'. UNLIKE the
-	// recovery-park cadence knobs above, this CAN fail a run — it is the forge park's lifetime
-	// bound. 0 = unlimited (never fail on the count), the deliberate off switch; the default
+	// recovery_wait_count). After this many timed parks, the next exhausted group holds
+	// in recovery_wait with a NULL retry stamp until owner Resume. Resume preserves the
+	// lifetime allowance, so another exhausted group holds again. Zero means unlimited
+	// automatic retry, the deliberate off switch; the default
 	// (6 parks ≈ an hour at the recovery-park defaults) lives in Load. Counted separately from
 	// recovery_wait_count so the empty-turn park keeps its no-lifetime-cap contract (fact 7).
 	RunForgeUnreachableMaxParks int

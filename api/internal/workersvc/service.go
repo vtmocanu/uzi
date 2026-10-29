@@ -1635,11 +1635,10 @@ type Params struct {
 	RunCodexIdleStallMaxParks int
 
 	// RunForgeUnreachableMaxParks (PRD #1392 M1, D2), mirrored from config. The FORGE-park
-	// lifetime cap: past it, SetState's forge-park transaction fails the run with
-	// fail_origin='forge_unreachable' instead of parking. UNLIKE the recovery-park cadence
-	// knobs above, this CAN fail a run. The ZERO VALUE is "unlimited" (never fail on the
-	// count) — the safe off direction and NOT a hole (a Params literal that omits it never
-	// caps the forge park), matching RUN_LIMIT_MAX_WAITS==0's "never park" shape. The positive
+	// lifetime allowance of timed parks. The next exhausted group enters a NULL-stamp
+	// recovery_wait owner hold, preserving custody and counts. Resume permits one more
+	// bounded attempt; another exhausted group holds again. Zero means unlimited automatic
+	// retry, so a Params literal that omits it never exhausts the forge allowance. The positive
 	// default lives in config.go where the env is read.
 	RunForgeUnreachableMaxParks int
 	// RunDiskParkMax (PRD #1809 M5, D6), mirrored from config (UZI_RUN_DISK_PARK_MAX). The
@@ -3013,7 +3012,7 @@ var checkpointDurabilityParks = map[string]bool{"limit_wait": true, "recovery_wa
 // recordCheckpointDurability stores a park report's checkpoint_contains_latest (PRD #1809 M6,
 // D8) after the park transition applied. The write is guarded on the run still being this
 // worker's in the status the report asked for, so a park the transaction turned into something
-// else (a forge or disk park that cancelled or failed the run past its cap) or a run that already
+// else (a stamped forge cancellation or a disk park past its failure cap) or a run that already
 // moved on records nothing.
 //
 // Each park overwrites the value with what it carried, so the flag describes the LATEST park: a
@@ -5323,7 +5322,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	case "recovery_wait":
 		// PRD #1392 M1: the FORGE pre-clone park is a DEDICATED transaction — validate the claim
 		// generation, lock the run, settle the exact-generation custody hold, and park (or
-		// cancel, or fail past the cap) atomically. It COMMITS its own transaction and returns
+		// cancel, or hold past the cap) atomically. It COMMITS its own transaction and returns
 		// the committed run + a rows count, then falls through to the shared post-switch fan-out
 		// (re-read, broadcast, judge — which the pre-clone origin skips, teardown), so the whole
 		// terminal automation is reused rather than duplicated. Its two typed precedence errors
@@ -5336,8 +5335,8 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// park fails or cancels never applied its scope cap, so its pending audit row must
 			// settle 'declined'. The applied-transition block decides that off the post-switch
 			// re-read, not frun or owned: parkForgeUnreachable returns the PRE-transition row for
-			// cancel/cap-fail, failForgeUnsettleable returns no row at all, and `owned` is
-			// unlocked. A normal park re-reads as recovery_wait and leaves the row pending.
+			// cancel, failForgeUnsettleable returns no row at all, and `owned` is
+			// unlocked. Both a timed park and a cap hold re-read as recovery_wait and leave it pending.
 			if s.txBeginner == nil {
 				rows, err = s.failForgeUnsettleable(ctx, wkr, runID, owned.Harness, req, sessionID)
 				break

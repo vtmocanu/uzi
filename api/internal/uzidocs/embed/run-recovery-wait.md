@@ -418,24 +418,49 @@ a genuine timeout or cancellation.
 A `recovery_wait` park can also come from a different cause: the forge
 (GitHub, GitLab, Forgejo) was unreachable when the worker tried to clone or
 fetch your repo — a DNS blip, a dropped connection, or a transient 5xx.
-On this healthy path, retained-source discovery found no local source,
-so there is no checkpoint to capture; the run just parks and retries.
-If retained source exists, recovery uses the acquired-claim bound above
-instead of this no-local-source forge park.
+Local protected-source admission remains unchanged: discovered retained
+source uses the acquired-claim recovery bound above. A forge park can also
+follow a legacy warm fetch; it does not prove that no local source exists.
+Existing source and custody protections remain in force, without promising
+a new checkpoint or an available recovery archive.
 
-The run's badge and feed say **waiting for the forge, retry at HH:MM (N of
-MAX)**, naming the next retry time and how many of this run's lifetime
-forge parks it has used. It auto-resumes on the same capped backoff as an
-empty-turn park (`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`) —
-no action needed while `N` stays under `MAX`.
+`RUN_FORGE_UNREACHABLE_MAX_PARKS` (default 6) allows up to that many timed
+forge parks over the run's lifetime. Each follows the capped backoff from
+`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`. After the allowance
+is consumed, the **next exhausted clone/fetch retry group** holds the run
+in `recovery_wait`, with cause `forge_unreachable` and
+`recovery_retry_not_before = NULL`. This is an owner hold, without terminal
+failure or a judge run. `forge_park_count` remains the consumed timed
+allowance; the hold does not increment it, though `recovery_wait_count`
+still increments. `0` deliberately permits unlimited timed forge parks.
 
-Unlike an empty-turn park, this one **does** have a lifetime cap:
-`RUN_FORGE_UNREACHABLE_MAX_PARKS` (default 6). If the forge is still
-unreachable past that many parks, the run fails instead of parking again,
-so a genuinely dead forge does not hold the run open forever. A permanent
-forge error (401/403/404 — bad credentials or a deleted repo) fails the run
-immediately instead of parking, since retrying would not help. Cancelling
-the run at any point during these retries ends it `cancelled`, as usual.
+Explicit owner **Resume** queues one ordinary bounded attempt. It preserves
+the counts, custody, forge cooldown and unrelated grants; it does not renew
+the timed allowance. Resume preserves remaining wall budget and banks the
+hold time after execution has started. If the existing wall budget is
+exhausted, an extension may be needed before Resume succeeds. Another
+exhausted clone/fetch group returns the run to the owner hold. Queuing does
+not promise execution: cooldown, worker cordon, a custody limit of one,
+already-saturated custody or worker capacity can still block admission.
+
+This NULL-retry hold requires compatible serving APIs. On those APIs, the
+timer, token changes, `set-token` and generic recovery promoters cannot
+release it; use explicit Resume. An older API's `set-token` promoter can
+still queue a NULL-retry hold, causing an extra attempt that can end in the
+legacy cap-failure outcome. Upgrade the serving APIs together; this does
+not require a new worker ACK protocol.
+
+An older worker may still say “retry after backoff” without a retry stamp
+even when the current server has owner-held the run. For timed parks,
+existing badge/feed wording names the next retry time and
+the lifetime forge park count; it must not be taken as proof that a
+NULL-retry hold will resume automatically.
+
+A permanent forge error (401/403/404 — bad credentials or a deleted repo)
+still fails the run immediately instead of parking. Cancel ends the run
+`cancelled`, as usual. The original incident is recorded in issue #3585.
+Publication-only recovery (#1324) is separate follow-up after the first
+merge; this clone/fetch policy does not provide publication recovery.
 
 ## Codex account unavailable
 

@@ -74,13 +74,13 @@ var serverRecoveryWaitCauses = map[string]bool{
 // parkForgeUnreachable is SetState's forge pre-clone park transaction (PRD #1392 M1, D2/D3/D4).
 // A transient forge failure at clone parks the run on 'recovery_wait' with a typed cause,
 // settling a legacy exact-generation custody hold in the SAME locked transaction while
-// retaining guarded inventory, or fails it past the forge cap, or cancels it when an owner
+// retaining guarded inventory, or holds it past the forge cap, or cancels it when an owner
 // cancel was stamped during the retries. Guarded custody survives each transition.
 // It returns (run, rows, err):
 //
-//   - rows == 1, err == nil: an APPLIED transition (park, cap-fail, or cancel). The committed
-//     run is returned; SetState re-reads it and runs the shared terminal fan-out (the pre-clone
-//     origin skips the judge). The caller maps this to 200.
+//   - rows == 1, err == nil: an APPLIED transition (park, cap-hold, or cancel). The committed
+//     run is returned; SetState re-reads it for shared fan-out. Only cancel is terminal.
+//     The caller maps this to 200.
 //   - rows == 0, err == nil: a NO-OP the caller maps to 409 {run}: the idempotent duplicate of
 //     an already-applied forge park (status recovery_wait, cause forge_unreachable — never
 //     double-incremented), or a stale report onto a run that is no longer 'running'.
@@ -190,7 +190,10 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 	// A delivered claim can have adopted local sources before reporting a forge failure.
 	// Retain guarded inventory through this park; only the server's pre-delivery
 	// ReleaseClaimCustodyNoAdoptedSource path supplies that final disposition.
-	if !hold.InventoryGuarded {
+	maxParks := s.p.RunForgeUnreachableMaxParks
+	capHold := maxParks != 0 && int(run.ForgeParkCount) >= maxParks
+	stopping := run.StopKind.Valid && run.StopKind.String != ""
+	if !hold.InventoryGuarded && (!capHold || stopping) {
 		released, err := qtx.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
 			RunID: run.ID, Generation: *req.ClaimGeneration, WorkerID: wkr.ID,
 			ReleaseEvidence: pgconv.TextOrNull("no_adopted_source"),
@@ -208,7 +211,7 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 	// transition to 'cancelled' and commit. The legacy hold was released above; guarded
 	// inventory remains in custody pending final disposition. An owner cancel is the realistic pre-clone verdict; a
 	// graceful 'stopped' converges to 'cancelled' the same way the failed arm does
-	// (CancelRunByWorker). Only a run with NO stamped verdict proceeds to park-or-fail.
+	// (CancelRunByWorker). Only a run with NO stamped verdict proceeds to park-or-hold.
 	//
 	// Issue #1399: the verdicts expected before the clone are an owner cancel ('cancelled') and a
 	// graceful stop ('stopped'); both converge to 'cancelled' here, as in SetState's failed arm,
@@ -233,37 +236,27 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 		return run, 1, nil
 	}
 
-	// Park-or-fail. forge_park_count is read from the LOCKED row (the value BEFORE this park); the
-	// (count+1)th park past the cap fails the run with the server-derived origin instead of parking
-	// again. RUN_FORGE_UNREACHABLE_MAX_PARKS == 0 disables the cap (unlimited).
-	maxParks := s.p.RunForgeUnreachableMaxParks
-	if maxParks != 0 && int(run.ForgeParkCount)+1 > maxParks {
-		reason := fmt.Sprintf("the forge stayed unreachable at clone across %d parks", run.ForgeParkCount+1)
-		n, ferr := qtx.SetRunFailed(ctx, store.SetRunFailedParams{
-			FailureReason: pgconv.TextOrNull(reason),
-			// SERVER-DERIVED, set directly — NOT through CoerceFailOrigin's worker-reportable gate
-			// (forge_unreachable is server-only). The pre-clone origin excludes it from the judge.
-			FailOrigin: pgconv.TextOrNull("forge_unreachable"),
-			SessionID:  sessionID,
-			ID:         run.ID,
-			WorkerID:   workerID,
-			// PRD #1247 M5a-1 rework (m6): this path is ALREADY fenced by the FOR UPDATE lock on the
-			// row (parkForgeUnreachable) plus the explicit run.ClaimGeneration == *req.ClaimGeneration
-			// check above, so the per-query fence is redundant here — pass explicit nil (behavior
-			// preserved: an unfenced fail on the already-locked, already-generation-checked row).
-			ClaimGeneration: pgtype.Int8{},
+	// The finite allowance counts timed parks only. The next exhausted group holds
+	// without releasing even legacy custody or consuming another timed allowance.
+	// A stamped stop has already won above and never observes network evidence.
+	if capHold {
+		parked, err := qtx.HoldRunForgeUnreachable(ctx, store.HoldRunForgeUnreachableParams{
+			ID: run.ID, WorkerID: workerID, ClaimGeneration: *req.ClaimGeneration,
+			SessionID: sessionID,
 		})
-		if ferr != nil {
-			return store.Run{}, 0, ferr
-		}
-		if n != 1 {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return run, 0, ErrForgeParkCustodyUnsettled
+		}
+		if err != nil {
+			return store.Run{}, 0, err
+		}
+		if err := s.observeParkedForgeOrigin(ctx, qtx, parked); err != nil {
+			return store.Run{}, 0, err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return store.Run{}, 0, err
 		}
-		s.SettleRetainedCheckpoint(run.ID) // PRD #1810 D3: the exact hold's release committed
-		return run, 1, nil
+		return parked, 1, nil
 	}
 
 	// Park. The retry stamp is computed EXACTLY as setRecoveryWait does — now + capped

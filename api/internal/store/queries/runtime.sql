@@ -3376,6 +3376,45 @@ WHERE id = @id AND worker_id = @worker_id
   AND kind NOT IN ('judge', 'job', 'cross_check')
 RETURNING *;
 
+-- name: HoldRunForgeUnreachable :one
+-- The exhausted finite forge allowance holds for an explicit owner Resume.
+-- Preserve lifetime counts, custody, worker/session affinity and claim posture.
+-- The service holds the exact-generation run and custody locks before this write.
+UPDATE runs SET
+    status = 'recovery_wait', status_since = now(),
+    recovery_wait_cause = 'forge_unreachable', recovery_retry_not_before = NULL,
+    recovery_wait_count = recovery_wait_count + 1,
+    session_id = COALESCE(sqlc.narg('session_id'), session_id),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status = 'running' AND claim_generation = @claim_generation::bigint
+  AND claim_released_at IS NULL AND COALESCE(stop_kind, '') = ''
+  AND kind NOT IN ('judge', 'job', 'cross_check')
+RETURNING *;
+
+-- name: ResumeForgeUnreachableHold :one
+-- One ordinary queued attempt, without a new allowance, grant or episode.
+-- Keep cooldown and custody independent: Resume is not evidence of forge health.
+-- Preserve started_at and bank the hold only after execution started, as in ResumeWorkerRecoveryEpisode.
+UPDATE runs SET
+    status = 'queued', status_since = now(),
+    recovery_wait_cause = NULL, recovery_retry_not_before = NULL,
+    budget_paused_seconds = runs.budget_paused_seconds
+        + CASE WHEN runs.started_at IS NOT NULL
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
+               ELSE 0 END,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
+  AND recovery_wait_cause = 'forge_unreachable' AND recovery_retry_not_before IS NULL
+  AND COALESCE(stop_kind, '') = ''
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
+       OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+          - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
+RETURNING *;
+
 -- name: ParkRunDataVolumeFull :one
 -- PRD #1809 M5 (D6): the DATA-VOLUME-FULL park writer, the typed sibling of
 -- ParkRunForgeUnreachable — same 'recovery_wait' transition, same backoff-shaping
@@ -3663,6 +3702,7 @@ WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
   AND (runs.recovery_wait_cause IS DISTINCT FROM 'codex_idle_stall' OR runs.recovery_retry_not_before IS NOT NULL)
+  AND (runs.recovery_wait_cause IS DISTINCT FROM 'forge_unreachable' OR runs.recovery_retry_not_before IS NOT NULL)
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
@@ -3719,6 +3759,7 @@ UPDATE runs SET
     updated_at = now()
 WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
   AND (runs.recovery_wait_cause IS DISTINCT FROM 'codex_idle_stall' OR runs.recovery_retry_not_before IS NOT NULL)
+  AND (runs.recovery_wait_cause IS DISTINCT FROM 'forge_unreachable' OR runs.recovery_retry_not_before IS NOT NULL)
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'

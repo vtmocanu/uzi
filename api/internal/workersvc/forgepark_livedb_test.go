@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 // PRD #1392 M1 forge pre-clone park, against a REAL Postgres. A transient forge failure at
 // clone parks the run on 'recovery_wait' with recovery_wait_cause='forge_unreachable',
 // settling the exact-generation custody hold in the SAME locked transaction (release evidence
-// 'no_adopted_source'), or fails it past the forge cap, or — if a cancel was stamped during
+// 'no_adopted_source'), or holds it past the forge cap, or — if a cancel was stamped during
 // the retries — cancels it (still releasing the hold). These drive the real Service (real
 // *store.Queries + the pool as the tx beginner), not fakes.
 //
@@ -249,117 +250,30 @@ func TestForgeParkCancelStampedBeforeParkLiveDB(t *testing.T) {
 	}
 }
 
-// TestForgeParkCapExceededFailsLiveDB: the (cap+1)th forge park fails the run with
-// fail_origin='forge_unreachable' (server-derived) and a reason naming the count, and enqueues
-// no judge run. The hold is still released with evidence 'no_adopted_source'.
-//
-// enableJudge wires the judge path so the judges==0 assertion is GENUINE: without it the
-// service's settings==nil short-circuits maybeEnqueueJudge at Gate 2 before the fail-origin
-// skip is reached, and judges==0 would hold no matter what the exclusion did. The
-// iteration_count>0 companion (TestForgeParkCapExceededResumedRunNoJudgeLiveDB) is what pins
-// the FIX-1 regression; this iteration_count==0 case stays as the base cap-fail case.
-func TestForgeParkCapExceededFailsLiveDB(t *testing.T) {
-	e := setupInterlockLiveDB(t)
-	svc := e.forgeParkService(t, 2) // cap 2
-	e.enableJudge(t, svc)
-
-	w := e.seedWorker(t, nil)
-	runID := e.fpSeedRunning(t, w, 1)
-	// This run has already forge-parked twice; the next park would be the 3rd (> cap 2) → fail.
-	e.exec(t, `UPDATE runs SET forge_park_count = 2 WHERE id = $1`, runID)
-	hold := mhOpenHold(t, e, runID, 1, w)
-
-	run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID,
-		StateRequest{State: "recovery_wait", RecoveryCause: strPtr("forge_unreachable"), ClaimGeneration: i64Ptr(1)})
-	if err != nil || !applied {
-		t.Fatalf("SetState(cap-exceeded): applied=%v err=%v", applied, err)
-	}
-	if run.Status != "failed" {
-		t.Fatalf("run status = %q, want failed (past the cap)", run.Status)
-	}
-	var origin, reason pgtype.Text
-	if err := e.pool.QueryRow(e.ctx, `SELECT fail_origin, failure_reason FROM runs WHERE id = $1`, runID).Scan(&origin, &reason); err != nil {
-		t.Fatalf("read fail_origin: %v", err)
-	}
-	if !origin.Valid || origin.String != "forge_unreachable" {
-		t.Fatalf("fail_origin = %v, want forge_unreachable", origin)
-	}
-	if !reason.Valid || reason.String != "the forge stayed unreachable at clone across 3 parks" {
-		t.Fatalf("failure_reason = %q, want the count-naming reason", reason.String)
-	}
-	if state, ev := e.fpHoldEvidence(t, hold); state != "released" || ev == nil || *ev != "no_adopted_source" {
-		t.Fatalf("hold state=%q evidence=%v after cap-fail, want released/no_adopted_source", state, ev)
-	}
-	// No judge run targets this run: forge_unreachable is in neverJudgeFailOrigins, so it skips
-	// the judge (SC3). The judge path is reachable here (enableJudge), so this is a real assertion
-	// of the exclusion, not the settings==nil early-return the pre-#1392 helper left it as.
-	var judges int
-	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM runs WHERE kind = 'judge' AND target_run_id = $1`, runID).Scan(&judges); err != nil {
-		t.Fatalf("count judge runs: %v", err)
-	}
-	if judges != 0 {
-		t.Fatalf("judge runs targeting the forge-failed run = %d, want 0", judges)
-	}
-}
-
-// TestForgeParkCapExceededResumedRunNoJudgeLiveDB is the FIX-1 regression against a REAL
-// Postgres (PRD #1392 M1, SC3): a RESUMED run that already did work (iteration_count > 0), then
-// hit a forge outage and forge-parked to the cap, cap-fails with fail_origin='forge_unreachable'
-// — and must enqueue NO judge, even though its iteration_count is not 0. This is the case the
-// pre-fix gate got wrong: forge_unreachable lived in preStartInfraFailOrigins, gated on
-// iteration_count==0, so a run with iteration_count>0 fell through the skip and WAS judged.
-//
-// It reddens on the unfixed code (judges==1 — the judge wrongly enqueued for the resumed run)
-// and passes once forge_unreachable skips the judge regardless of iteration_count
-// (neverJudgeFailOrigins). enableJudge makes the judge path genuinely reachable, so judges==0 is
-// a real assertion of the exclusion rather than a settings==nil early-return.
-func TestForgeParkCapExceededResumedRunNoJudgeLiveDB(t *testing.T) {
-	e := setupInterlockLiveDB(t)
-	svc := e.forgeParkService(t, 2) // cap 2
-	e.enableJudge(t, svc)
-
-	w := e.seedWorker(t, nil)
-	runID := e.fpSeedRunning(t, w, 1)
-	// A resumed run that DID work: iteration_count advanced to 5 (SetRunRunning uses GREATEST and
-	// never resets it across park/promote/claim/fail), and it has already forge-parked twice — so
-	// the next park is the 3rd (> cap 2) → cap-fail with iteration_count still 5.
-	e.exec(t, `UPDATE runs SET forge_park_count = 2, iteration_count = 5 WHERE id = $1`, runID)
-	hold := mhOpenHold(t, e, runID, 1, w)
-
-	run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID,
-		StateRequest{State: "recovery_wait", RecoveryCause: strPtr("forge_unreachable"), ClaimGeneration: i64Ptr(1)})
-	if err != nil || !applied {
-		t.Fatalf("SetState(cap-exceeded, resumed): applied=%v err=%v", applied, err)
-	}
-	if run.Status != "failed" {
-		t.Fatalf("run status = %q, want failed (past the cap)", run.Status)
-	}
-	// The failed run still carries the work it did — the iteration_count>0 the pre-fix gate keyed
-	// off — and the server-derived forge origin. Asserting iteration_count>0 pins the precondition
-	// this regression turns on: if it were 0 the case would collapse into the base cap-fail test.
-	var origin pgtype.Text
-	var iter int32
-	if err := e.pool.QueryRow(e.ctx, `SELECT fail_origin, iteration_count FROM runs WHERE id = $1`, runID).Scan(&origin, &iter); err != nil {
-		t.Fatalf("read run: %v", err)
-	}
-	if !origin.Valid || origin.String != "forge_unreachable" {
-		t.Fatalf("fail_origin = %v, want forge_unreachable", origin)
-	}
-	if iter == 0 {
-		t.Fatal("iteration_count = 0, want > 0 (the resumed-run precondition this test turns on)")
-	}
-	if state, ev := e.fpHoldEvidence(t, hold); state != "released" || ev == nil || *ev != "no_adopted_source" {
-		t.Fatalf("hold state=%q evidence=%v after cap-fail, want released/no_adopted_source", state, ev)
-	}
-	// NO judge run targets this run: forge_unreachable skips the judge REGARDLESS of
-	// iteration_count. On the pre-FIX-1 gate this count is 1 (the judge wrongly enqueued for the
-	// resumed run), which is exactly how this test reddens without FIX 1.
-	var judges int
-	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM runs WHERE kind = 'judge' AND target_run_id = $1`, runID).Scan(&judges); err != nil {
-		t.Fatalf("count judge runs: %v", err)
-	}
-	if judges != 0 {
-		t.Fatalf("judge runs targeting the resumed forge-failed run = %d, want 0 (SC3, regardless of iteration_count)", judges)
+// A cap hold is nonterminal even for a resumed run that already did work.
+func TestForgeParkCapExceededHoldsWithoutJudgeLiveDB(t *testing.T) {
+	for _, iter := range []int{0, 5} {
+		t.Run(fmt.Sprint(iter), func(t *testing.T) {
+			e := setupInterlockLiveDB(t)
+			svc := e.forgeParkService(t, 2)
+			e.enableJudge(t, svc)
+			w := e.seedWorker(t, nil)
+			id := e.fpSeedRunning(t, w, 1)
+			e.exec(t, `UPDATE runs SET forge_park_count=2, iteration_count=$2 WHERE id=$1`, id, iter)
+			hold := mhOpenHold(t, e, id, 1, w)
+			run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, id, fpForgeParkReport())
+			if err != nil || !applied || run.Status != "recovery_wait" || run.RecoveryRetryNotBefore.Valid ||
+				run.ForgeParkCount != 2 || run.FailOrigin.Valid || run.FailureReason.Valid || run.FinishedAt.Valid || int(run.IterationCount) != iter {
+				t.Fatalf("cap hold: status=%s count=%d retry=%v terminal=%v/%v/%v iter=%d applied=%v err=%v", run.Status, run.ForgeParkCount, run.RecoveryRetryNotBefore.Valid, run.FailOrigin, run.FailureReason, run.FinishedAt, run.IterationCount, applied, err)
+			}
+			if state, ev := e.fpHoldEvidence(t, hold); state != "open" || ev != nil {
+				t.Fatalf("cap hold released custody: %s/%v", state, ev)
+			}
+			var judges int
+			if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM runs WHERE kind='judge' AND target_run_id=$1`, id).Scan(&judges); err != nil || judges != 0 {
+				t.Fatalf("cap hold judges=%d err=%v", judges, err)
+			}
+		})
 	}
 }
 
