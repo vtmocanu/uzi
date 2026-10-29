@@ -682,6 +682,7 @@ func (h *Handler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) workerDTOWithOverlays(ctx context.Context, row store.ListWorkersByUserRow) apitypes.WorkerDTO {
 	ids := []uuid.UUID{row.ID}
 	dto := workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+	dto.ForgeOriginCooldowns = h.workerForgeOriginCooldowns(ctx, ids)[row.ID]
 	if row.Kind == "hosted" && row.DrainingSince.Valid {
 		appendUpgradeBlockers(&dto, h.upgradeBlockersByWorker(ctx, ids), row.ID)
 	}
@@ -722,9 +723,11 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	blockers := h.upgradeBlockersByWorker(r.Context(), blockerIDs)
 	decisions := h.custodyDecisionsByWorker(r.Context(), ids)
 	reported := h.reportedRunsByWorker(r.Context(), ids)
+	cooldowns := h.workerForgeOriginCooldowns(r.Context(), ids)
 	runDisk := h.runDiskByWorker(r.Context(), ids)
 	for _, row := range rows {
 		dto := workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+		dto.ForgeOriginCooldowns = cooldowns[row.ID]
 		appendUpgradeBlockers(&dto, blockers, row.ID)
 		if count, ok := decisions[row.ID]; ok {
 			dto.CustodyDecisionsNeeded = &count

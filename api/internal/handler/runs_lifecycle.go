@@ -545,6 +545,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	h.overlayCodexAccountActions(r.Context(), &dto)
 	// PRD #3454: queue_reason "maintenance" for a queued run the intake pause holds back.
 	h.overlayQueueReasons(r.Context(), &dto)
+	h.overlayRunForgeOriginCooldowns(r.Context(), &dto)
 	// PRD #1798: the run's PR's published description and last write outcome. runToDTO stays
 	// pure, so this detail-only overlay sets both here. Best-effort: a lookup error leaves both
 	// null rather than failing the read of an otherwise-fine run.

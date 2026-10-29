@@ -142,6 +142,146 @@ func (q *Queries) GetForgeOriginReservation(ctx context.Context, arg GetForgeOri
 	return i, err
 }
 
+const listOwnerRunForgeOriginCooldowns = `-- name: ListOwnerRunForgeOriginCooldowns :many
+SELECT r.id AS run_id, c.origin, c.cooled_until,
+       ('forge_clone_success_v1' = ANY(w.protocol_capabilities))::boolean AS success_reporting,
+       (c.reservation_run_id IS NOT NULL)::boolean AS reserved,
+       COALESCE((SELECT probe.id::text FROM runs probe
+        JOIN run_forge_origins m ON m.run_id = probe.id AND m.user_id = probe.user_id
+          AND m.worker_id = probe.worker_id AND m.generation = probe.claim_generation
+        JOIN authorized_forge_origins a ON a.repo_id = probe.repo_id AND a.user_id = m.user_id
+          AND a.connection_id = m.connection_id AND a.origin = m.origin
+        WHERE probe.id = c.reservation_run_id AND probe.user_id = c.user_id
+          AND probe.worker_id = c.worker_id AND probe.claim_generation = c.reservation_generation
+          AND probe.status IN ('claimed','running','awaiting_approval','awaiting_input','awaiting_followup')
+          AND probe.claim_released_at IS NULL AND probe.stop_kind IS NULL
+          AND m.origin = c.origin AND m.reservation_incarnation = c.incarnation
+          AND c.reservation_incarnation = c.incarnation AND m.reservation_version = c.reservation_version
+       ), '')::text AS half_open_run_id
+FROM runs r
+JOIN workers w ON w.id = r.worker_id AND w.user_id = r.user_id
+JOIN authorized_forge_origins current_origin ON current_origin.repo_id = r.repo_id AND current_origin.user_id = r.user_id
+JOIN forge_origin_cooldowns c ON c.user_id = r.user_id AND c.worker_id = w.id AND c.origin = current_origin.origin
+WHERE r.user_id = $1::uuid AND r.id = ANY($2::uuid[])
+  AND r.kind <> 'chat' AND r.egress_profile_id IS NULL
+  AND r.status NOT IN ('completed','failed','cancelled')
+ORDER BY r.id
+`
+
+type ListOwnerRunForgeOriginCooldownsParams struct {
+	UserID uuid.UUID   `json:"user_id"`
+	RunIds []uuid.UUID `json:"run_ids"`
+}
+
+type ListOwnerRunForgeOriginCooldownsRow struct {
+	RunID            uuid.UUID          `json:"run_id"`
+	Origin           string             `json:"origin"`
+	CooledUntil      pgtype.Timestamptz `json:"cooled_until"`
+	SuccessReporting bool               `json:"success_reporting"`
+	Reserved         bool               `json:"reserved"`
+	HalfOpenRunID    string             `json:"half_open_run_id"`
+}
+
+// At most one row per requested owner run. Current authorized identity only;
+// repo-less, isolated and chat runs do not use this direct-forge cooldown lane.
+func (q *Queries) ListOwnerRunForgeOriginCooldowns(ctx context.Context, arg ListOwnerRunForgeOriginCooldownsParams) ([]ListOwnerRunForgeOriginCooldownsRow, error) {
+	rows, err := q.db.Query(ctx, listOwnerRunForgeOriginCooldowns, arg.UserID, arg.RunIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOwnerRunForgeOriginCooldownsRow{}
+	for rows.Next() {
+		var i ListOwnerRunForgeOriginCooldownsRow
+		if err := rows.Scan(
+			&i.RunID,
+			&i.Origin,
+			&i.CooledUntil,
+			&i.SuccessReporting,
+			&i.Reserved,
+			&i.HalfOpenRunID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOwnerWorkerForgeOriginCooldowns = `-- name: ListOwnerWorkerForgeOriginCooldowns :many
+SELECT w.id AS worker_id, c.origin, c.cooled_until,
+       ('forge_clone_success_v1' = ANY(w.protocol_capabilities))::boolean AS success_reporting,
+       (c.reservation_run_id IS NOT NULL)::boolean AS reserved,
+       COALESCE((SELECT probe.id::text FROM runs probe
+        JOIN run_forge_origins m ON m.run_id = probe.id AND m.user_id = probe.user_id
+          AND m.worker_id = probe.worker_id AND m.generation = probe.claim_generation
+        JOIN authorized_forge_origins a ON a.repo_id = probe.repo_id AND a.user_id = m.user_id
+          AND a.connection_id = m.connection_id AND a.origin = m.origin
+        WHERE probe.id = c.reservation_run_id AND probe.user_id = c.user_id
+          AND probe.worker_id = c.worker_id AND probe.claim_generation = c.reservation_generation
+          AND probe.status IN ('claimed','running','awaiting_approval','awaiting_input','awaiting_followup')
+          AND probe.claim_released_at IS NULL AND probe.stop_kind IS NULL
+          AND m.origin = c.origin AND m.reservation_incarnation = c.incarnation
+          AND c.reservation_incarnation = c.incarnation AND m.reservation_version = c.reservation_version
+       ), '')::text AS half_open_run_id
+FROM workers w
+CROSS JOIN LATERAL (
+    SELECT fc.user_id, fc.worker_id, fc.origin, fc.incarnation, fc.observation_version, fc.failure_step, fc.cooled_until, fc.last_reason, fc.observed_at, fc.reservation_run_id, fc.reservation_generation, fc.reservation_incarnation, fc.reservation_version, fc.reservation_observation_version FROM forge_origin_cooldowns fc
+    WHERE fc.user_id = w.user_id AND fc.worker_id = w.id
+      AND EXISTS (SELECT 1 FROM authorized_forge_origins a
+                  WHERE a.user_id = fc.user_id AND a.origin = fc.origin)
+    ORDER BY fc.cooled_until, fc.origin LIMIT 32
+) c
+WHERE w.user_id = $1::uuid AND w.id = ANY($2::uuid[])
+ORDER BY w.id, c.cooled_until, c.origin
+`
+
+type ListOwnerWorkerForgeOriginCooldownsParams struct {
+	UserID    uuid.UUID   `json:"user_id"`
+	WorkerIds []uuid.UUID `json:"worker_ids"`
+}
+
+type ListOwnerWorkerForgeOriginCooldownsRow struct {
+	WorkerID         uuid.UUID          `json:"worker_id"`
+	Origin           string             `json:"origin"`
+	CooledUntil      pgtype.Timestamptz `json:"cooled_until"`
+	SuccessReporting bool               `json:"success_reporting"`
+	Reserved         bool               `json:"reserved"`
+	HalfOpenRunID    string             `json:"half_open_run_id"`
+}
+
+// Display only, no locks or reservations. One batch for response worker IDs;
+// at most 32 origins per worker, soonest deadline then canonical origin.
+func (q *Queries) ListOwnerWorkerForgeOriginCooldowns(ctx context.Context, arg ListOwnerWorkerForgeOriginCooldownsParams) ([]ListOwnerWorkerForgeOriginCooldownsRow, error) {
+	rows, err := q.db.Query(ctx, listOwnerWorkerForgeOriginCooldowns, arg.UserID, arg.WorkerIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOwnerWorkerForgeOriginCooldownsRow{}
+	for rows.Next() {
+		var i ListOwnerWorkerForgeOriginCooldownsRow
+		if err := rows.Scan(
+			&i.WorkerID,
+			&i.Origin,
+			&i.CooledUntil,
+			&i.SuccessReporting,
+			&i.Reserved,
+			&i.HalfOpenRunID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockForgeOriginCooldown = `-- name: LockForgeOriginCooldown :one
 SELECT c.user_id, c.worker_id, c.origin, c.incarnation, c.observation_version, c.failure_step, c.cooled_until, c.last_reason, c.observed_at, c.reservation_run_id, c.reservation_generation, c.reservation_incarnation, c.reservation_version, c.reservation_observation_version FROM forge_origin_cooldowns c
 JOIN workers w ON w.id = c.worker_id AND w.user_id = c.user_id

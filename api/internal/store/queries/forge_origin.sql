@@ -119,3 +119,59 @@ WHERE c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin = m.origi
 -- name: CanonicalForgeOrigin :one
 -- Empty means unknown and is never a cooldown key (the table rejects it).
 SELECT COALESCE(canonical_forge_origin(@raw::text), '')::text AS origin;
+
+-- name: ListOwnerWorkerForgeOriginCooldowns :many
+-- Display only, no locks or reservations. One batch for response worker IDs;
+-- at most 32 origins per worker, soonest deadline then canonical origin.
+SELECT w.id AS worker_id, c.origin, c.cooled_until,
+       ('forge_clone_success_v1' = ANY(w.protocol_capabilities))::boolean AS success_reporting,
+       (c.reservation_run_id IS NOT NULL)::boolean AS reserved,
+       COALESCE((SELECT probe.id::text FROM runs probe
+        JOIN run_forge_origins m ON m.run_id = probe.id AND m.user_id = probe.user_id
+          AND m.worker_id = probe.worker_id AND m.generation = probe.claim_generation
+        JOIN authorized_forge_origins a ON a.repo_id = probe.repo_id AND a.user_id = m.user_id
+          AND a.connection_id = m.connection_id AND a.origin = m.origin
+        WHERE probe.id = c.reservation_run_id AND probe.user_id = c.user_id
+          AND probe.worker_id = c.worker_id AND probe.claim_generation = c.reservation_generation
+          AND probe.status IN ('claimed','running','awaiting_approval','awaiting_input','awaiting_followup')
+          AND probe.claim_released_at IS NULL AND probe.stop_kind IS NULL
+          AND m.origin = c.origin AND m.reservation_incarnation = c.incarnation
+          AND c.reservation_incarnation = c.incarnation AND m.reservation_version = c.reservation_version
+       ), '')::text AS half_open_run_id
+FROM workers w
+CROSS JOIN LATERAL (
+    SELECT fc.* FROM forge_origin_cooldowns fc
+    WHERE fc.user_id = w.user_id AND fc.worker_id = w.id
+      AND EXISTS (SELECT 1 FROM authorized_forge_origins a
+                  WHERE a.user_id = fc.user_id AND a.origin = fc.origin)
+    ORDER BY fc.cooled_until, fc.origin LIMIT 32
+) c
+WHERE w.user_id = @user_id::uuid AND w.id = ANY(@worker_ids::uuid[])
+ORDER BY w.id, c.cooled_until, c.origin;
+
+-- name: ListOwnerRunForgeOriginCooldowns :many
+-- At most one row per requested owner run. Current authorized identity only;
+-- repo-less, isolated and chat runs do not use this direct-forge cooldown lane.
+SELECT r.id AS run_id, c.origin, c.cooled_until,
+       ('forge_clone_success_v1' = ANY(w.protocol_capabilities))::boolean AS success_reporting,
+       (c.reservation_run_id IS NOT NULL)::boolean AS reserved,
+       COALESCE((SELECT probe.id::text FROM runs probe
+        JOIN run_forge_origins m ON m.run_id = probe.id AND m.user_id = probe.user_id
+          AND m.worker_id = probe.worker_id AND m.generation = probe.claim_generation
+        JOIN authorized_forge_origins a ON a.repo_id = probe.repo_id AND a.user_id = m.user_id
+          AND a.connection_id = m.connection_id AND a.origin = m.origin
+        WHERE probe.id = c.reservation_run_id AND probe.user_id = c.user_id
+          AND probe.worker_id = c.worker_id AND probe.claim_generation = c.reservation_generation
+          AND probe.status IN ('claimed','running','awaiting_approval','awaiting_input','awaiting_followup')
+          AND probe.claim_released_at IS NULL AND probe.stop_kind IS NULL
+          AND m.origin = c.origin AND m.reservation_incarnation = c.incarnation
+          AND c.reservation_incarnation = c.incarnation AND m.reservation_version = c.reservation_version
+       ), '')::text AS half_open_run_id
+FROM runs r
+JOIN workers w ON w.id = r.worker_id AND w.user_id = r.user_id
+JOIN authorized_forge_origins current_origin ON current_origin.repo_id = r.repo_id AND current_origin.user_id = r.user_id
+JOIN forge_origin_cooldowns c ON c.user_id = r.user_id AND c.worker_id = w.id AND c.origin = current_origin.origin
+WHERE r.user_id = @user_id::uuid AND r.id = ANY(@run_ids::uuid[])
+  AND r.kind <> 'chat' AND r.egress_profile_id IS NULL
+  AND r.status NOT IN ('completed','failed','cancelled')
+ORDER BY r.id;

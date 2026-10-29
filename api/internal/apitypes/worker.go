@@ -7,15 +7,17 @@ import (
 
 // WorkerDTO is the browser/CLI view of a worker.
 type WorkerDTO struct {
-	ManualCordonedAt      *time.Time      `json:"manual_cordoned_at"`
-	ManualCordonedBy      *string         `json:"manual_cordoned_by"`
-	ManualCordonedByLabel *string         `json:"manual_cordoned_by_label"`
-	ManualCordonReason    *string         `json:"manual_cordon_reason"`
-	EffectiveCordoned     bool            `json:"effective_cordoned"`
-	RollPacing            json.RawMessage `json:"roll_pacing,omitempty"`
-	ID                    string          `json:"id"`
-	Name                  string          `json:"name"`
-	Status                string          `json:"status"`
+	// Optional advisory owner projection; absent on older APIs or unavailable reads.
+	ForgeOriginCooldowns  []ForgeOriginCooldownDTO `json:"forge_origin_cooldowns,omitempty"`
+	ManualCordonedAt      *time.Time               `json:"manual_cordoned_at"`
+	ManualCordonedBy      *string                  `json:"manual_cordoned_by"`
+	ManualCordonedByLabel *string                  `json:"manual_cordoned_by_label"`
+	ManualCordonReason    *string                  `json:"manual_cordon_reason"`
+	EffectiveCordoned     bool                     `json:"effective_cordoned"`
+	RollPacing            json.RawMessage          `json:"roll_pacing,omitempty"`
+	ID                    string                   `json:"id"`
+	Name                  string                   `json:"name"`
+	Status                string                   `json:"status"`
 	// Kind is "external" (a worker its owner runs by hand) or "hosted" (one the
 	// controller runs in the cluster, PRD #58). HostedSize is the preset name (s/m/l/l-highmem),
 	// null for an external worker. Together they are what lets the UI mark hosted

@@ -205,6 +205,8 @@ type MemoryHoldDTO struct {
 
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
+	// Optional advisory cooldown for the assigned worker and current authorized origin.
+	ForgeOriginCooldown *ForgeOriginCooldownDTO `json:"forge_origin_cooldown,omitempty"`
 	// Detail-only detector provenance; never approval authority or summary polling data.
 	CapabilityProvenance                           *CapabilityProvenance `json:"capability_provenance,omitempty"`
 	CompletionPending                              *CompletionPendingDTO `json:"completion_pending,omitempty"`
@@ -1099,8 +1101,10 @@ type CredentialEpochDTO struct {
 // RunDTO / RunListItemDTO source fields exactly; the nested value types are reused. There is
 // exactly one worker_name here, the list-level one (RunListItemDTO.WorkerName).
 type RunSummaryItemDTO struct {
-	WorkerRecovery *WorkerRecoveryDTO `json:"worker_recovery,omitempty"`
-	MemoryHold     *MemoryHoldDTO     `json:"memory_hold,omitempty"`
+	// Optional advisory cooldown for the assigned worker and current authorized origin.
+	ForgeOriginCooldown *ForgeOriginCooldownDTO `json:"forge_origin_cooldown,omitempty"`
+	WorkerRecovery      *WorkerRecoveryDTO      `json:"worker_recovery,omitempty"`
+	MemoryHold          *MemoryHoldDTO          `json:"memory_hold,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
@@ -2038,6 +2042,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		LimitWaitCount:                item.LimitWaitCount,
 		RateLimitType:                 item.RateLimitType,
 		RecoveryWaitCause:             item.RecoveryWaitCause,
+		ForgeOriginCooldown:           item.ForgeOriginCooldown,
 		CodexAccountAction:            item.CodexAccountAction,
 		CodexSecretID:                 item.CodexSecretID,
 		CodexSecretLabel:              item.CodexSecretLabel,
@@ -2211,6 +2216,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			LimitWaitCount:                s.LimitWaitCount,
 			RateLimitType:                 s.RateLimitType,
 			RecoveryWaitCause:             s.RecoveryWaitCause,
+			ForgeOriginCooldown:           s.ForgeOriginCooldown,
 			CodexAccountAction:            s.CodexAccountAction,
 			CodexSecretID:                 s.CodexSecretID,
 			CodexSecretLabel:              s.CodexSecretLabel,
