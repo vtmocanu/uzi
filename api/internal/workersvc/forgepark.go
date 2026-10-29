@@ -110,6 +110,15 @@ func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, ow
 	qtx := store.New(tx)
 
 	workerID := pgconv.UUID(wkr.ID)
+	// Match claimant lock order before touching a shared origin/reservation.
+	if _, err := qtx.LockForgeOriginWorker(ctx, store.LockForgeOriginWorkerParams{
+		WorkerID: wkr.ID, RunID: owned.ID,
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.Run{}, 0, ErrRunNotOwned
+		}
+		return store.Run{}, 0, err
+	}
 	run, err := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: owned.ID, WorkerID: workerID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -258,6 +267,9 @@ func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, ow
 			return run, 0, ErrForgeParkCustodyUnsettled
 		}
 		return store.Run{}, 0, perr
+	}
+	if err := s.observeParkedForgeOrigin(ctx, qtx, parked); err != nil {
+		return store.Run{}, 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.Run{}, 0, err

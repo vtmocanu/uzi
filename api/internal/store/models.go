@@ -84,6 +84,13 @@ type AppSetting struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type AuthorizedForgeOrigin struct {
+	RepoID       uuid.UUID `json:"repo_id"`
+	UserID       uuid.UUID `json:"user_id"`
+	ConnectionID uuid.UUID `json:"connection_id"`
+	Origin       string    `json:"origin"`
+}
+
 type AutopilotTrigger struct {
 	RepoID      uuid.UUID          `json:"repo_id"`
 	IssueIid    int64              `json:"issue_iid"`
@@ -409,6 +416,23 @@ type ForgeConnection struct {
 	PrivilegeCheckedAt pgtype.Timestamptz `json:"privilege_checked_at"`
 	PrivilegeStatus    pgtype.Text        `json:"privilege_status"`
 	HumanUsername      pgtype.Text        `json:"human_username"`
+}
+
+type ForgeOriginCooldown struct {
+	UserID                        uuid.UUID          `json:"user_id"`
+	WorkerID                      uuid.UUID          `json:"worker_id"`
+	Origin                        string             `json:"origin"`
+	Incarnation                   uuid.UUID          `json:"incarnation"`
+	ObservationVersion            int64              `json:"observation_version"`
+	FailureStep                   int32              `json:"failure_step"`
+	CooledUntil                   pgtype.Timestamptz `json:"cooled_until"`
+	LastReason                    string             `json:"last_reason"`
+	ObservedAt                    pgtype.Timestamptz `json:"observed_at"`
+	ReservationRunID              pgtype.UUID        `json:"reservation_run_id"`
+	ReservationGeneration         pgtype.Int8        `json:"reservation_generation"`
+	ReservationIncarnation        pgtype.UUID        `json:"reservation_incarnation"`
+	ReservationVersion            pgtype.Int8        `json:"reservation_version"`
+	ReservationObservationVersion pgtype.Int8        `json:"reservation_observation_version"`
 }
 
 type GithubProjectItem struct {
@@ -1227,6 +1251,17 @@ type RunFetchReservation struct {
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	Settled         bool               `json:"settled"`
 	SettledAt       pgtype.Timestamptz `json:"settled_at"`
+}
+
+type RunForgeOrigin struct {
+	RunID                  uuid.UUID   `json:"run_id"`
+	UserID                 uuid.UUID   `json:"user_id"`
+	WorkerID               uuid.UUID   `json:"worker_id"`
+	Generation             int64       `json:"generation"`
+	ConnectionID           uuid.UUID   `json:"connection_id"`
+	Origin                 pgtype.Text `json:"origin"`
+	ReservationIncarnation pgtype.UUID `json:"reservation_incarnation"`
+	ReservationVersion     pgtype.Int8 `json:"reservation_version"`
 }
 
 type RunGatePresentation struct {

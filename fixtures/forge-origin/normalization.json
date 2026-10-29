@@ -1,0 +1,85 @@
+[
+  {
+    "url": "https://Example.COM/group/repo",
+    "origin": "https://example.com",
+    "legacy": "https://example.com"
+  },
+  {
+    "url": "https://Example.COM.:443/group/repo?x=1#ref",
+    "origin": "https://example.com",
+    "legacy": "https://example.com.:443"
+  },
+  {
+    "url": "https://user:pass@Example.COM:8443/group/repo",
+    "origin": "https://example.com:8443",
+    "legacy": "https://example.com:8443"
+  },
+  {
+    "url": "https://[2001:DB8::1]:443/group/repo",
+    "origin": "https://[2001:db8::1]",
+    "legacy": "https://[2001:db8::1]:443"
+  },
+  {
+    "url": "https://[::1]:8443/repo",
+    "origin": "https://[::1]:8443",
+    "legacy": "https://[::1]:8443"
+  },
+  {
+    "url": "https://example.com:444/repo",
+    "origin": "https://example.com:444",
+    "legacy": "https://example.com:444"
+  },
+  {
+    "url": "https://example.com:0443/repo",
+    "origin": "https://example.com",
+    "legacy": "https://example.com:0443",
+    "redirect_refused": true
+  },
+  {
+    "url": "https://example.com:008443/repo",
+    "origin": "https://example.com:8443",
+    "legacy": "https://example.com:008443",
+    "redirect_refused": true
+  },
+  {
+    "url": "https://[2001:0DB8:0000:0000:0000:0000:0000:0001]:0443/repo",
+    "origin": "https://[2001:db8::1]",
+    "legacy": "https://[2001:0db8:0000:0000:0000:0000:0000:0001]:0443",
+    "redirect_refused": true
+  },
+  {
+    "url": "https://[2001:0DB8:0000:0000:0000:0000:0000:0001]/repo",
+    "origin": "https://[2001:db8::1]",
+    "legacy": "https://[2001:0db8:0000:0000:0000:0000:0000:0001]",
+    "redirect_refused": true
+  },
+  {
+    "url": "https://[2001:db8::1]/repo",
+    "origin": "https://[2001:db8::1]",
+    "legacy": "https://[2001:db8::1]"
+  },
+  {
+    "url": "http://example.com/repo",
+    "origin": ""
+  },
+  {
+    "url": "https:///repo",
+    "origin": ""
+  },
+  {
+    "url": "",
+    "origin": ""
+  },
+  {
+    "url": "garbage",
+    "origin": ""
+  },
+  {
+    "url": "https://example.com:65536/repo",
+    "origin": ""
+  },
+  {
+    "url": "https://[bad]/repo",
+    "origin": ""
+  }
+]

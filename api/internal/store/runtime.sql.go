@@ -6643,6 +6643,17 @@ FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
 WHERE r.id = $1
+  -- Claims predating this migration have no snapshot: preserve their existing
+  -- authorization. New claims stamp a row even when normalization is unknown.
+  -- Never reauthorize a stamped generation against a changed or unknown mapping.
+  AND (r.status <> 'claimed' OR NOT EXISTS (
+      SELECT 1 FROM run_forge_origins m
+      WHERE m.run_id = r.id AND m.worker_id = r.worker_id AND m.generation = r.claim_generation)
+    OR EXISTS (
+      SELECT 1 FROM run_forge_origins m
+      JOIN authorized_forge_origins a ON a.repo_id = r.repo_id AND a.user_id = r.user_id
+      WHERE m.run_id = r.id AND m.worker_id = r.worker_id AND m.generation = r.claim_generation
+        AND m.connection_id = c.id AND m.origin = a.origin))
 `
 
 type GetRunClaimContextRow struct {
