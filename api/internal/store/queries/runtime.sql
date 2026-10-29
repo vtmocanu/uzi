@@ -1872,8 +1872,10 @@ JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id --
 WHERE r.id = @run_id
   -- Claims predating this migration have no snapshot: preserve their existing
   -- authorization. New claims stamp a row even when normalization is unknown.
-  -- Never reauthorize a stamped generation against a changed or unknown mapping.
-  AND (r.status <> 'claimed' OR NOT EXISTS (
+  -- Noncloning isolated research still uses the owner-scoped context for its
+  -- fetch credential; Git placement metadata never grants or denies that lane.
+  -- Never reauthorize a cloning generation against a changed or unknown mapping.
+  AND (r.status <> 'claimed' OR r.egress_profile_id IS NOT NULL OR NOT EXISTS (
       SELECT 1 FROM run_forge_origins m
       WHERE m.run_id = r.id AND m.worker_id = r.worker_id AND m.generation = r.claim_generation)
     OR EXISTS (

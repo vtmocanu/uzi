@@ -284,6 +284,36 @@ func TestForgeOriginLegacyClaimWithoutSnapshotLiveDB(t *testing.T) {
 	}
 }
 
+// Isolated research uses the owner-scoped context to mint its fetch credential,
+// but never receives a repository or Git credential. Git placement metadata must
+// not become an authorization check for this noncloning lane.
+func TestForgeOriginIsolatedClaimIgnoresGitMappingLiveDB(t *testing.T) {
+	f := newIsoFix(t)
+	id := f.queuedRun(t, 3585, true)
+	lane := f.laneWorker(t, id)
+	f.env.exec("UPDATE runs SET status='claimed', worker_id=$2, claim_generation=1 WHERE id=$1", id, lane.ID)
+	f.env.exec("UPDATE repos SET web_url='https://edited.example/repo' WHERE id=$1", f.repo)
+	run, err := f.env.q.GetRunByID(f.env.ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := f.svc.assembleClaim(f.env.ctx, lane, run)
+	if err != nil || payload == nil || payload.IsolatedFetch == nil {
+		t.Fatalf("noncloning claim refused by Git placement metadata: payload=%v err=%v", payload != nil, err)
+	}
+	if payload.Repo != (ClaimRepo{}) || payload.Secrets.ForgePAT != "" || payload.Secrets.ForgeUsername != "" {
+		t.Fatal("noncloning exemption exposed Git identity or credentials")
+	}
+	// The exemption removes only a Git-placement check, never owner scoping.
+	other := uuid.New()
+	f.env.exec("INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", other, other.String()+"@example.com")
+	t.Cleanup(func() { f.env.exec("DELETE FROM users WHERE id=$1", other) })
+	f.env.exec("UPDATE forge_connections SET user_id=$2 WHERE id=(SELECT connection_id FROM repos WHERE id=$1)", f.repo, other)
+	if _, err := f.env.q.GetRunClaimContext(f.env.ctx, id); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("noncloning exemption crossed connection ownership: %v", err)
+	}
+}
+
 func TestForgeOriginConcurrentFailuresLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	w := e.seedWorker(t, nil)
