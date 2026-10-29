@@ -3078,6 +3078,7 @@ export interface Run {
     phase: "planning" | "implementation" | null;
     correlation_id: string | null;
     published: boolean | null;
+    captured_head?: string | null;
   };
   capability_provenance?: {
     hints_known: boolean;

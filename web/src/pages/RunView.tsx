@@ -419,22 +419,51 @@ export function HealthFlag({ run }: { run: Run }) {
   );
 }
 
-// CompletionStatePanel renders the HONEST completion-interlock detail (PRD #1226 M5, D8):
-// the bounded still-unmet milestone ids, the structural attempt count, and the hold
-// context. It renders ONLY these bounded server fields — never raw model output, repo
-// text, credentials or arbitrary logs — and sanitizes each untrusted id/string through
-// stripUnsafeChars at the render boundary (D8: the unmet ids are server-validated milestone
-// keys, but sanitized like milestone titles here, and hold_context is a fixed server
-// constant that is still scrubbed on the way to the DOM). The completion PHASE itself is
-// rendered by the run-header StatusPill via effectiveRunStatus (do NOT re-derive it); this
-// panel is the complementary detail. Shown when the run is in a live completion state
-// (completion_phase non-empty) OR parked in a completion hold (hold_reason set), and renders
-// nothing otherwise — so a non-interlocked run (legacy, or the rollout OFF) looks as today.
-//
-// D8 durability honesty: hold_context is the constant "unavailable(same_worker_only)", and
-// the copy states the hold is available on the same worker only — it must NOT claim the
-// completion hold is durable across workers.
+// Only the run state confirms a hold. Delivery telemetry blocks continuation controls;
+// it does not establish a paused state, preservation evidence, or consent.
+function isPolicyHeld(run: Run): boolean {
+  return run.status === "paused" && run.hold_reason === "codex_policy_hold";
+}
+
+function isPolicyPending(run: Run): boolean {
+  return !isTerminalRun(run.status) && run.outcome_pending?.reason === "codex_policy_hold_pending";
+}
+
+function policyBlocksContinuation(run: Run): boolean {
+  return isPolicyHeld(run) || isPolicyPending(run);
+}
+
+function PolicyHoldPanel({ run }: { run: Run }) {
+  if (!isPolicyHeld(run)) return null;
+  const hold = run.policy_hold;
+  const head = hold?.captured_head;
+  const preservation = head
+    ? hold?.published === true
+      ? "Worker-reported published checkpoint"
+      : "Verified local checkpoint; publication is not confirmed"
+    : hold?.published === false
+      ? "Local-only retention; checkpoint capture is unverified"
+      : "Preservation is unverified";
+  return <Card className="p-4">
+    <h2 className="text-sm font-semibold text-warn">Codex policy hold</h2>
+    <p className="mt-1 text-xs text-muted">{preservation}{head ? <>: <span className="font-mono">{head}</span></> : "."} Preservation evidence was last reported by the worker.</p>
+    <p className="mt-1 text-xs text-muted">
+      {hold?.continuation_mode === "same_conversation"
+        ? "Continuation requires preserving the provider session."
+        : hold?.continuation_mode === "fresh_from_saved_work"
+          ? "Any future continuation would use a fresh conversation from the saved work."
+          : "Continuation requirements are unverified."}
+      {" "}The provider conversation's availability and ability to resume are not confirmed.
+    </p>
+    <p className="mt-1 text-xs text-muted">Resume and policy-specific Stop are unavailable. Cancel remains available to the run owner.</p>
+  </Card>;
+}
+
+// CompletionStatePanel shows bounded server completion fields, with untrusted text
+// sanitized at the render boundary. A hold's context describes same-worker custody,
+// never durability across workers. Policy cases have their own presentation.
 export function CompletionStatePanel({ run }: { run: Run }) {
+  if (policyBlocksContinuation(run)) return null;
   if (run.status === "paused" && run.hold_reason === "provider_unavailable") return null;
   const phase = run.completion_phase ?? "";
   // PRD #1732: a credential_disabled hold is not a completion state; its own panel covers it.
@@ -916,6 +945,7 @@ export function PausedPanel({
   // plain Resume; CredentialDisabledPanel covers it.
   if (
     run.status !== "paused" ||
+    policyBlocksContinuation(run) ||
     run.hold_reason === "completion_blocked" ||
     run.hold_reason === "credential_disabled" ||
     run.hold_reason === "provider_unavailable" ||
@@ -1839,7 +1869,10 @@ export function RunView() {
   // Issue #3181: the token-switch holds are owner decisions too (Resume / Cancel).
   const switchHeld = run != null && credentialSwitchHold(run) !== null;
   const retainedRecovery = run?.status === "recovery_wait" && (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed");
-  const ownerDecisionHold = retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
+  const policyHeld = run != null && isPolicyHeld(run);
+  const policyPending = run != null && isPolicyPending(run);
+  const policyBlocked = policyHeld || policyPending;
+  const ownerDecisionHold = policyBlocked || retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
   const canSteer = optimisticCanSteer && (!ownerDecisionHold || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
   const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
@@ -2237,7 +2270,7 @@ export function RunView() {
   // ("paused") since a pause has no per-instance identity to re-announce on. The persistent
   // region owns this so the announcement is not missed on mount — PausedPanel's heading
   // therefore drops its own role="status" to avoid a duplicate announcement.
-  const parkKey =
+  const parkKey = policyHeld ? "codex_policy_hold" : policyPending ? "codex_policy_hold_pending" :
     questionId !== ""
       ? `question:${questionId}`
       : run?.status === "awaiting_followup"
@@ -2288,7 +2321,11 @@ export function RunView() {
     }
     setResumeAnnounce("");
     setParkAnnounce(
-      parkKey === "followup"
+      parkKey === "codex_policy_hold"
+        ? "Codex policy hold. Resume and policy-specific Stop are unavailable. The owner can Cancel."
+        : parkKey === "codex_policy_hold_pending"
+          ? "Policy report delivery pending. The server has not confirmed a policy hold. Continuation is blocked pending delivery."
+        : parkKey === "followup"
         ? "The run is waiting for your next follow-up."
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
@@ -2399,11 +2436,11 @@ export function RunView() {
         actionsBesideTitle
         actions={<div className="relative flex flex-wrap items-center gap-2">
           <RunSettingsDisclosure>
-            {!isCredentialDisabledHold(run) && !(run.status === "awaiting_approval" && changedMilestones(run)) && (
+            {!policyBlocked && !isCredentialDisabledHold(run) && !(run.status === "awaiting_approval" && changedMilestones(run)) && (
               <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
             )}
             <CredentialEpochList epochs={run.credential_epochs} />
-            {run.kind !== "job" && run.status !== "limit_wait" && (
+            {!policyBlocked && run.kind !== "job" && run.status !== "limit_wait" && (
               <LimitWaitPanel run={run} busy={busy} canSteer={canSteer}
                 onStop={() => cancelRun()}
                 onToggle={(enabled) => act(async () => {
@@ -2411,14 +2448,14 @@ export function RunView() {
                   await refreshRun();
                 })} />
             )}
-            <MrReworkPanel run={run} busy={busy} canSteer={canSteer} userDefault={mrReworkDefault}
+            {!policyBlocked && <MrReworkPanel run={run} busy={busy} canSteer={canSteer} userDefault={mrReworkDefault}
               onToggle={(enabled) => act(async () => {
                 await api.setRunMrRework(run.id, enabled);
                 await refreshRun();
-              })} />
+              })} />}
           </RunSettingsDisclosure>
-          <RunControls run={run} busy={busy} canSteer={canSteer} terminal={terminal}
-            onStop={() => cancelRun()} onPause={(mode) => act(async () => { await api.pauseRun(run.id, mode); await refreshRun(); })} />
+          {policyBlocked ? canSteer && <Button variant="danger" size="sm" disabled={busy} onClick={() => cancelRun()}>Cancel run</Button> : <RunControls run={run} busy={busy} canSteer={canSteer} terminal={terminal}
+            onStop={() => cancelRun()} onPause={(mode) => act(async () => { await api.pauseRun(run.id, mode); await refreshRun(); })} />}
         </div>}
         titleNode={
           <div
@@ -2479,7 +2516,7 @@ export function RunView() {
                   Both are QUEUED-ONLY (the pill self-hides on any other status; the action
                   is wrapped in the status guard) — the server is queued-only too (409). */}
               <RunPriorityBadge priority={run.priority} status={run.status} />
-              {run.status === "queued" &&
+              {!policyBlocked && run.status === "queued" &&
                 (canSteer ? (
                   <Button
                     variant="secondary"
@@ -2514,7 +2551,7 @@ export function RunView() {
                   `paused` but recovers via the continue-decision path, not a plain
                   resume — so it is excluded here; the informational CompletionStatePanel
                   + the "Completion blocked" StatusPill cover it. */}
-              {run.status === "paused" &&
+              {!policyBlocked && run.status === "paused" &&
                 run.hold_reason !== "completion_blocked" &&
                 // PRD #1732: a credential_disabled hold resumes on Enable (its panel), and a
                 // plain Resume would only park it again.
@@ -2556,7 +2593,7 @@ export function RunView() {
                   status === "running": the server accepts pause_cancel ONLY while running
                   (M1 review), so a parked run shows the chip with no actions rather than
                   offering a Cancel that would 409. */}
-              {run.pause_requested_at && (
+              {!policyBlocked && run.pause_requested_at && (
                 <span className="inline-flex flex-wrap items-center gap-2">
                   <Badge tone="info">{pauseRequestedLabel(run)}</Badge>
                   {run.pause_mode === "reserve" && (
@@ -2627,7 +2664,7 @@ export function RunView() {
                   queued run — shown ONLY while the near-timeout ("slow") flag is up, and only when
                   the admin cap allows extending (extendEnabled: a 0 or unknown cap hides it). Owner
                   gets the chooser; a non-owner gets inert text, never a button that 404s. */}
-              {shouldShowHealthFlag(run.health, run.status) &&
+              {!policyBlocked && shouldShowHealthFlag(run.health, run.status) &&
                 run.health === "slow" &&
                 extendEnabled(run) &&
                 (canSteer ? (
@@ -2750,7 +2787,7 @@ export function RunView() {
 
 
       {canSteer && confirmedOwner === true && <MilestoneResetHistory key={`reset-history-${run.id}`} run={run} />}
-      {run.status === "awaiting_approval" && (
+      {!policyBlocked && run.status === "awaiting_approval" && (
         <PlanPanel
           key={run.id}
           run={run}
@@ -2789,7 +2826,7 @@ export function RunView() {
       )}
 
 
-      {run.status === "awaiting_input" &&
+      {!policyBlocked && run.status === "awaiting_input" &&
         (openQuestion ? (
           <QuestionPanel
             open={openQuestion}
@@ -2810,28 +2847,28 @@ export function RunView() {
         ))}
 
 
-      {run.outcome_pending && (
+      {run.outcome_pending && (run.outcome_pending.reason !== "codex_policy_hold_pending" || policyPending) && (
         <div
           role="status"
           className="rounded-lg border border-warn/40 bg-warn/10 px-3 py-2.5 text-sm"
         >
           <p className="font-medium text-fg">
-            Outcome held on the worker: {outcomePendingReasonLabel(run.outcome_pending.reason)}
+            {policyPending ? "Policy report delivery pending" : <>Outcome held on the worker: {outcomePendingReasonLabel(run.outcome_pending.reason)}</>}
           </p>
           <p className="mt-1 text-xs text-muted">
-            The run finished on its worker, but that outcome has not reached uzi yet.
+            {policyPending ? "The worker last reported a retained policy report. The server has not confirmed a policy hold. Continuation is blocked pending delivery." : "The run finished on its worker, but that outcome has not reached uzi yet."}
             {/* A terminal run's outcome is already resolved, so the stop-to-discard action no
                 longer applies — drop the now-meaningless sentence rather than dangle it with no
                 button (the resolve button below is gated out for a terminal run too). */}
             {!isTerminalRun(run.status) &&
               (canSteer
-                ? " Stopping the run discards the held outcome — you will be asked to confirm."
-                : " The run's owner can discard it by stopping the run.")}
+                ? policyPending ? " Cancelling discards the retained report — you will be asked to confirm." : " Stopping the run discards the held outcome — you will be asked to confirm."
+                : policyPending ? " The run's owner can Cancel to discard the retained report." : " The run's owner can discard it by stopping the run.")}
           </p>
           {canSteer && !isTerminalRun(run.status) && (
             <div className="mt-2">
               <Button variant="ghost" size="sm" disabled={busy} onClick={() => cancelRun()}>
-                Discard held outcome…
+                {policyPending ? "Cancel run…" : "Discard held outcome…"}
               </Button>
             </div>
           )}
@@ -2839,15 +2876,17 @@ export function RunView() {
       )}
 
 
-      <CompletionDecisionPanel
+      <PolicyHoldPanel run={run} />
+      {!policyBlocked && <CompletionDecisionPanel
         run={run}
         canSteer={canSteer}
         busy={busy}
         act={act}
         refreshRun={refreshRun}
-      />
+      />}
 
 
+      {!policyBlocked && <>
       <CredentialDisabledPanel
         run={run}
         canSteer={canSteer}
@@ -2964,6 +3003,7 @@ export function RunView() {
             }
           />
  </>)}
+      </>}
       <CompletionStatePanel run={run} />
 
 
@@ -3221,7 +3261,7 @@ export function RunView() {
         inputs={inputs}
         terminal={terminal}
         status={run.status}
-        canSteer={canSteer}
+        canSteer={canSteer && !policyBlocked}
         busy={busy}
         onSend={(text) => act(() => submit("follow_up", text))}
         run={run}
@@ -3243,12 +3283,11 @@ export function RunView() {
             </div>
             <div className="space-y-3 px-5 py-5 text-sm text-muted">
               <p>
-                This run finished on its worker, but its result never reached uzi. Discarding it
-                cancels the run and throws that finished result away — this can&rsquo;t be undone.
+                {policyBlocked ? "Cancelling discards the retained policy report and cancels the run. This cannot be undone." : "This run finished on its worker, but its result never reached uzi. Discarding it cancels the run and throws that finished result away — this can’t be undone."}
               </p>
               {run.outcome_pending && (
                 <p className="text-xs">
-                  Held because {outcomePendingReasonLabel(run.outcome_pending.reason)}.
+                  {policyPending ? "Policy report delivery is pending; the server has not confirmed a policy hold." : <>Held because {outcomePendingReasonLabel(run.outcome_pending.reason)}.</>}
                 </p>
               )}
               {/* The confirmed retry's failure surfaces HERE, not on the page banner behind the
