@@ -303,6 +303,202 @@ describe("ActiveRunRegistry — run_not_owned journals are not leasable (issue #
   });
 });
 
+describe("policy pending snapshot projection", () => {
+  function policy(runId: string, generation: number, since = 1): PendingTerminal {
+    return { ...pt(runId, generation, { since }), outcome_kind: "policy_hold" };
+  }
+
+  it("leases current G3 while preserving every source generation, counting one policy run", () => {
+    const sources = [policy(RUN_A, 1), policy(RUN_A, 2, 2)];
+    const reg = new ActiveRunRegistry(() => sources, () => 1);
+    assert.strictEqual(reg.notePolicyOwnership(RUN_A, 3), true);
+    const snap = reg.build();
+    assert.deepStrictEqual(snap.active, [
+      { run_id: RUN_A, claim_generation: 3, phase: "running", terminal_pending: true },
+    ]);
+    assert.deepStrictEqual(snap.pending_all, [
+      { run_id: RUN_A, claim_generation: 1 }, { run_id: RUN_A, claim_generation: 2 },
+    ]);
+    assert.strictEqual(snap.pending_overflow, false);
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), false);
+  });
+
+  it("a live G3 overlap emits one pending lease rather than rejecting the whole snapshot", () => {
+    const reg = new ActiveRunRegistry(() => [policy(RUN_A, 1)], () => 8);
+    reg.add(RUN_A, 3);
+    reg.notePolicyOwnership(RUN_A, 3);
+    assert.deepStrictEqual(reg.build().active, [
+      { run_id: RUN_A, claim_generation: 3, phase: "running", terminal_pending: true },
+    ]);
+  });
+
+  it("late asynchronous observations cannot replace newer or initially unknown claim evidence", () => {
+    const reg = new ActiveRunRegistry(() => [policy(RUN_A, 1)], () => 8);
+    const oldUnknown = reg.beginPolicyOwnershipObservation(RUN_A);
+    reg.notePolicyOwnership(RUN_A, 4);
+    assert.strictEqual(oldUnknown(null), false);
+    assert.strictEqual(reg.build().active[0]!.claim_generation, 4);
+    const oldClaim = reg.beginPolicyOwnershipObservation(RUN_A);
+    reg.add(RUN_A, 5);
+    assert.strictEqual(oldClaim(3), false);
+    const current = reg.beginPolicyOwnershipObservation(RUN_A);
+    assert.strictEqual(current(5), true);
+    assert.strictEqual(current(null), false, "one observation commits at most once");
+    assert.strictEqual(reg.build().active[0]!.claim_generation, 5);
+  });
+
+  it("G1 alone projects G3 without changing the register source identity", () => {
+    const reg = new ActiveRunRegistry(() => [policy(RUN_A, 1)], () => 8);
+    reg.notePolicyOwnership(RUN_A, 3);
+    assert.strictEqual(reg.build().active[0]!.claim_generation, 3);
+    const boot = reg.buildRegisterSnapshot();
+    assert.deepStrictEqual(boot.pending_all, [{ run_id: RUN_A, claim_generation: 1 }]);
+    assert.deepStrictEqual(boot.active, []);
+    assert.strictEqual(boot.snapshot_epoch, 2);
+  });
+
+  it("unknown ownership blocks before boot, while cap zero/undefined blocks verified pending", () => {
+    for (const cap of [undefined, 0, 8]) {
+      const reg = new ActiveRunRegistry(() => [policy(RUN_A, 1)], () => cap);
+      assert.strictEqual(reg.claimsPausedByPendingOverflow(), true);
+      assert.strictEqual(reg.build().pending_overflow, true);
+      assert.deepStrictEqual(reg.build().active, []);
+      assert.strictEqual(reg.buildRegisterSnapshot().pending_overflow, true);
+      reg.notePolicyOwnership(RUN_A, 3);
+      assert.strictEqual(reg.build().pending_overflow, cap !== 8);
+    }
+  });
+
+  it("unknown journal type never becomes an ordinary or guessed lease", () => {
+    const reg = new ActiveRunRegistry(() => [
+      { ...pt(RUN_A, 1), outcome_kind: "unknown", blocked_reason: "run_not_owned" },
+    ], () => 8);
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), true);
+    reg.notePolicyOwnership(RUN_A, 3);
+    assert.deepStrictEqual(reg.build().active, []);
+    assert.strictEqual(reg.build().pending_overflow, true);
+    reg.notePolicyOwnership(RUN_A, null, 3);
+    assert.strictEqual(reg.build().pending_overflow, false);
+  });
+
+  it("positive release omits leasing/overflow but preserves physical source identities", () => {
+    const sources = [policy(RUN_A, 1)];
+    const reg = new ActiveRunRegistry(() => sources, () => 0);
+    reg.notePolicyOwnership(RUN_A, null);
+    for (const method of ["build", "buildRegisterSnapshot"] as const) {
+      const snap = reg[method]();
+      assert.deepStrictEqual(snap.active, []);
+      assert.strictEqual(snap.pending_overflow, false);
+      assert.deepStrictEqual(snap.pending_all, [{ run_id: RUN_A, claim_generation: 1 }]);
+    }
+    assert.strictEqual(sources.length, 1);
+  });
+
+  it("fallback closes execution, obeys capacity, and invents no pending_all identity", () => {
+    let cap = 1;
+    const reg = new ActiveRunRegistry(() => [], () => cap);
+    assert.strictEqual(reg.markPolicyPendingOnly(RUN_A, 3), false);
+    reg.add(RUN_A, 3);
+    assert.strictEqual(reg.markPolicyPendingOnly(RUN_A, 2), false);
+    assert.strictEqual(reg.has(RUN_A), true);
+    assert.strictEqual(reg.markPolicyPendingOnly(RUN_A, 3), true);
+    assert.strictEqual(reg.has(RUN_A), false);
+    assert.strictEqual(reg.size, 1);
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), true);
+    reg.notePolicyOwnership(RUN_A, 3);
+    assert.deepStrictEqual(reg.build().active, [
+      { run_id: RUN_A, claim_generation: 3, phase: "running", terminal_pending: true },
+    ]);
+    assert.deepStrictEqual(reg.build().pending_all, []);
+    cap = 0;
+    assert.deepStrictEqual(reg.build().active, []);
+    assert.strictEqual(reg.build().pending_overflow, true);
+    reg.remove(RUN_A, 3);
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), false);
+  });
+
+  it("settled sources lose leases and prune proofs; live entries remain independent", () => {
+    let sources = [policy(RUN_A, 1)];
+    const reg = new ActiveRunRegistry(() => sources, () => 8);
+    reg.notePolicyOwnership(RUN_A, 3);
+    reg.add(RUN_A, 4);
+    assert.deepStrictEqual(reg.build().active, [], "new claim invalidates the earlier projection");
+    assert.strictEqual(reg.build().pending_overflow, true);
+    reg.notePolicyOwnership(RUN_A, 4);
+    assert.deepStrictEqual(reg.build().active.map(e => [e.claim_generation, e.terminal_pending]), [[4, true]]);
+    sources = [{ ...sources[0]!, server_settled: true }];
+    const snap = reg.build();
+    assert.deepStrictEqual(snap.active.map(e => [e.claim_generation, e.terminal_pending]), [[4, false]]);
+    assert.deepStrictEqual(snap.pending_all, []);
+    assert.strictEqual(snap.pending_overflow, false);
+    sources = [policy(RUN_A, 1)];
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), true, "retired proof must not revive");
+  });
+
+  it("rejects unsafe generations and ignores proofs for absent or settled-only sources", () => {
+    let sources = [policy(RUN_A, 1)];
+    const reg = new ActiveRunRegistry(() => sources, () => 8);
+    assert.strictEqual(reg.notePolicyOwnership(RUN_B, 3), false);
+    for (const generation of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.strictEqual(reg.notePolicyOwnership(RUN_A, generation), false);
+    }
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), true);
+    sources = [{ ...sources[0]!, server_settled: true }];
+    assert.strictEqual(reg.notePolicyOwnership(RUN_A, 3), false);
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), false);
+  });
+
+  it("settling a journal does not discard an explicit in-memory fallback", () => {
+    const reg = new ActiveRunRegistry(() => [
+      { ...policy(RUN_A, 1), server_settled: true },
+    ], () => 1);
+    reg.add(RUN_A, 3);
+    reg.markPolicyPendingOnly(RUN_A, 3);
+    reg.notePolicyOwnership(RUN_A, 3);
+    const snap = reg.build();
+    assert.deepStrictEqual(snap.pending_all, []);
+    assert.deepStrictEqual(snap.active, [
+      { run_id: RUN_A, claim_generation: 3, phase: "running", terminal_pending: true },
+    ]);
+  });
+
+  it("late G3 clear/remove/release cannot erase a newer G4 projection", () => {
+    const reg = new ActiveRunRegistry(() => [policy(RUN_A, 1)], () => 8);
+    reg.add(RUN_A, 3);
+    reg.markPolicyPendingOnly(RUN_A, 3);
+    reg.notePolicyOwnership(RUN_A, 3);
+    reg.add(RUN_A, 4);
+    reg.markPolicyPendingOnly(RUN_A, 4);
+    reg.notePolicyOwnership(RUN_A, 4);
+    reg.remove(RUN_A, 3);
+    assert.strictEqual(reg.clearPolicyOwnership(RUN_A, 3), false);
+    assert.strictEqual(reg.notePolicyOwnership(RUN_A, null, 3), false);
+    assert.strictEqual(reg.markPolicyPendingOnly(RUN_A, 3), false);
+    assert.strictEqual(reg.size, 1);
+    assert.strictEqual(reg.build().active[0]!.claim_generation, 4);
+    assert.strictEqual(reg.clearPolicyOwnership(RUN_A, 4), true);
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), true);
+  });
+
+  it("policy rotation stays blocked-first/oldest and mixed ordinary duplicates remain visible", () => {
+    const sources = [
+      { ...policy(RUN_A, 1), blocked: true },
+      policy(RUN_A, 2, 2), policy(RUN_B, 1, 3),
+      pt("ordinary", 1, { since: 4 }), pt("ordinary", 2, { since: 5 }),
+    ];
+    const reg = new ActiveRunRegistry(() => sources, () => 8);
+    reg.notePolicyOwnership(RUN_A, 3);
+    reg.notePolicyOwnership(RUN_B, 4);
+    assert.deepStrictEqual(reg.build().active.map(e => [e.run_id, e.claim_generation]),
+      [[RUN_A, 3], [RUN_B, 4], ["ordinary", 1], ["ordinary", 2]]);
+    const rotating = new ActiveRunRegistry(() => sources.slice(0, 3), () => 1);
+    rotating.notePolicyOwnership(RUN_A, 3);
+    rotating.notePolicyOwnership(RUN_B, 4);
+    assert.deepStrictEqual(Array.from({ length: 4 }, () => rotating.build().active[0]!.run_id),
+      [RUN_A, RUN_B, RUN_A, RUN_B]);
+  });
+});
+
 describe("issue 2009 — complete pending_all wire coverage regressions", () => {
   // JSON observes the additive wire field as serialized for the API.
   function wire(snapshot: ReturnType<ActiveRunRegistry["build"]>) {
