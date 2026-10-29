@@ -286,7 +286,8 @@ func (r *m3Remote) serve(w http.ResponseWriter, req *http.Request) {
 		_ = enc.Flush()
 		return
 	}
-	if (r.mode == "ambiguous-readback" || r.mode == "refuse-readback") && len(r.commands) > 0 {
+	if (r.mode == "ambiguous-readback" || r.mode == "refuse-readback") && len(r.commands) > 0 ||
+		r.mode == "ambiguous-cleanup-readback" && len(r.commands) > 1 {
 		http.Error(w, "readback unavailable", 503)
 		return
 	}
