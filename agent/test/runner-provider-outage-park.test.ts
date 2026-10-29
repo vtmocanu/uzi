@@ -840,7 +840,7 @@ describe("3617 idle park delivery evidence", () => {
         let release!: () => void, entered!: () => void;
         const held = new Promise<void>(resolve => { release = resolve; });
         const joining = new Promise<void>(resolve => { entered = resolve; });
-        let refused = false, done = false, posts = 0, publicErrors = 0;
+        let refused = false, done = false, posts = 0, publicErrors = 0, retryWaits = 0;
         const rig = rigFor("codex", { clock, turns: 2,
           error: () => new TransientRecoveryError("idle", { idleStallKind: kind }),
           afterIdleReport: async () => { if (refused) { entered(); await held; } },
@@ -851,8 +851,11 @@ describe("3617 idle park delivery evidence", () => {
         api.failStateWhen(claim.run_id, body => {
           if (body.recovery_cause !== "codex_idle_stall") return false;
           posts++;
+          refused = true;
           return true;
         }, { httpStatus: 400, error: "invalid request body" });
+        t.mock.method(rig.runner as unknown as { waitRecoveryRetry: () => Promise<void> }, "waitRecoveryRetry",
+          async () => { retryWaits++; throw new Error("definitive refusal must not enter the recovery retry wait"); });
         const report = client.reportState.bind(client);
         t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
           try { return await report(...args); }
@@ -873,9 +876,9 @@ describe("3617 idle park delivery evidence", () => {
           assert.ok(!feedTexts(claim.run_id).includes(IDLE_REFUSED), "no joined notice inside held cleanup");
           assert.ok(!raw.includes(IDLE_REFUSED), "no notice emitted before join");
           clock.advance(1000);
-        } finally { release(); }
-        await operation;
+        } finally { release(); await operation; }
         assert.ok(clock.now() - started < 120_000, "retained stop precedes both original deadlines");
+        assert.equal(retryWaits, 0, "a definitive refusal never enters the retry wait");
         assert.equal(posts, 1);
         assert.equal(parks(claim.run_id).length, 0);
         assert.equal(feedTexts(claim.run_id).filter(text => text === IDLE_REFUSED).length, 1);
