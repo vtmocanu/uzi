@@ -131,17 +131,17 @@ BEGIN
         AND NEW.cleanup_deadline IS NOT NULL THEN
         RAISE EXCEPTION 'cleanup lease requires a new generation' USING ERRCODE='55000';
     END IF;
-    IF NEW.attempts <> OLD.attempts AND NOT (OLD.state='pending' AND NEW.state='pending'
+    IF NEW.attempts <> OLD.attempts AND (OLD.state='pending' AND NEW.state='pending'
         AND NEW.attempts=OLD.attempts+1 AND OLD.attempts<8 AND OLD.next_attempt_at<=now()
         AND (OLD.attempt_deadline IS NULL OR OLD.attempt_deadline<=now())
-        AND NEW.attempt_deadline>now() AND NEW.next_attempt_at>NEW.attempt_deadline) THEN
+        AND NEW.attempt_deadline>now() AND NEW.next_attempt_at>NEW.attempt_deadline) IS NOT TRUE THEN
         RAISE EXCEPTION 'invalid preparation reservation' USING ERRCODE='55000';
     END IF;
-    IF NEW.cleanup_attempts <> OLD.cleanup_attempts AND NOT (OLD.state='pinned' AND NEW.state='pinned'
+    IF NEW.cleanup_attempts <> OLD.cleanup_attempts AND (OLD.state='pinned' AND NEW.state='pinned'
         AND NEW.cleanup_attempts=OLD.cleanup_attempts+1 AND OLD.cleanup_attempts<8
         AND OLD.cleanup_exhausted_at IS NULL AND OLD.next_attempt_at<=now()
         AND (OLD.cleanup_deadline IS NULL OR OLD.cleanup_deadline<=now())
-        AND NEW.cleanup_deadline>now() AND NEW.next_attempt_at>NEW.cleanup_deadline) THEN
+        AND NEW.cleanup_deadline>now() AND NEW.next_attempt_at>NEW.cleanup_deadline) IS NOT TRUE THEN
         RAISE EXCEPTION 'invalid cleanup reservation' USING ERRCODE='55000';
     END IF;
     IF OLD.state='pending' AND NEW.state='invoked' THEN
