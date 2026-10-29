@@ -656,6 +656,10 @@ interface CaptureProgress {
   holdOutcome?: boolean;
   wallOutcome?: WallParkOutcome;
 }
+
+// Marker only: the episode's private progress carries the refusal evidence.
+const IDLE_PARK_REFUSAL_UNWIND = Object.freeze({});
+
 interface FinalizeCaptureContinuation {
   pending?: () => Promise<void>;
   readonly unwind: object;
@@ -18472,7 +18476,19 @@ export class RunRunner {
               { kind: codexDeferralOf(error)! },
               // Carry policy context, never the joined episode or expired held capabilities.
               { terminalDisk: opts.terminalDisk, diskCause: disk,
-                credentialDeadlineAt: captureEpisode.deadlineAt, dispositionSignal: signal })));
+                credentialDeadlineAt: captureEpisode.deadlineAt, dispositionSignal: signal }))).catch(async error => {
+        // The region has joined. Cancel/fence retain their existing report-before-close
+        // ordering in recoveryDisposition; every other refusal unwind must close here.
+        if (this.captureProgressFor(flight, captureEpisode).idleParkRefusal &&
+            flight.steering.claimFence() === undefined && !flight.steering.isCancelled()) {
+          const budget = MaintenanceBudget.current();
+          const remaining = Math.max(0, Math.floor(Math.min(this.codexBoundaryDeadlineMs,
+            (this.shutdownDeadlineAt ?? Infinity) - Date.now(), budget?.remainingMs() ?? Infinity)));
+          const expiry = remaining > 0 ? AbortSignal.timeout(remaining) : AbortSignal.abort();
+          await batcher.close(budget ? AbortSignal.any([expiry, budget.signal]) : expiry).catch(() => undefined);
+        }
+        throw error;
+      });
     }
     const report = reportState;
     reportState = async (body, signal = captureSignal) => {
@@ -19292,7 +19308,7 @@ export class RunRunner {
         } catch (reportError) {
           // Only this episode's actual typed report can issue refusal provenance.
           // Unwind before retrying; the capture owner consumes it after safety joins.
-          if (idleTyped && progress?.idleParkRefusal && !progress.idleParkPossiblyApplied) throw {};
+          if (idleTyped && progress?.idleParkRefusal && !progress.idleParkPossiblyApplied) throw IDLE_PARK_REFUSAL_UNWIND;
           // A refused held cleanup checkpoint cannot be retried inside its own poisoned
           // callback. Join the parent before any free proof or retained disposition.
           if (opts.heldAuthenticated && (reportError instanceof CheckpointUnsafeCleanupError ||

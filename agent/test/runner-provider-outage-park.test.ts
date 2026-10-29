@@ -1,5 +1,6 @@
 import { describe, it, type TestContext } from "node:test";
 import { MessageBatcher } from "../src/batcher.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -901,6 +902,103 @@ describe("3617 idle park delivery evidence", () => {
       });
     });
 
+    for (const control of ["shutdown", "shutdown fractional budget", "cancel", "fence"] as const) {
+      it(`3617 ${kind} refusal join closes its batcher after ${control}`, async t => {
+        await withHome(async home => {
+          client.protocolFeatures = ["claim_generation_fence", feature];
+          api.strictReceiptGenerations = true;
+          const clock = virtualBoundaryClock();
+          t.mock.method(Date, "now", clock.now);
+          let release!: () => void, entered!: () => void;
+          const held = new Promise<void>(resolve => { release = resolve; });
+          const joining = new Promise<void>(resolve => { entered = resolve; });
+          let refused = false, joined = false, done = false, posts = 0, closes = 0, closedBeforeJoin = false;
+          const rig = rigFor("codex", { clock, turns: 2,
+            error: () => new TransientRecoveryError("idle", { idleStallKind: kind }),
+            afterIdleReport: async () => { if (refused) { entered(); await held; joined = true; } },
+            wrapIdleRefusal: true,
+          }, home);
+          const claim = gitlabClaim(36178, { claim_generation: 3 });
+          api.setInputClaimGeneration(claim.run_id, 3);
+          const recovery = rig.runner["handleRecoveryExhausted"].bind(rig.runner);
+          let flight: Parameters<typeof recovery>[2] | undefined;
+          let ownerBatcher: MessageBatcher | undefined;
+          rig.runner["handleRecoveryExhausted"] = async (...args: Parameters<typeof recovery>) => {
+            flight = args[2]; ownerBatcher = args[4];
+            return recovery(...args);
+          };
+          const closeSignals: Array<AbortSignal | undefined> = [];
+          const close = MessageBatcher.prototype.close;
+          t.mock.method(MessageBatcher.prototype, "close", async function(this: MessageBatcher, ...args: Parameters<typeof close>) {
+            if (this === ownerBatcher) {
+              closedBeforeJoin ||= !joined;
+              closes++; closeSignals.push(args[0]);
+            }
+            return close.apply(this, args);
+          });
+          api.failStateWhen(claim.run_id, body => {
+            if (body.recovery_cause !== "codex_idle_stall") return false;
+            posts++; refused = true; return true;
+          }, { httpStatus: 400, error: "invalid request body" });
+          let budgetNow = 0.25;
+          const budget = control === "shutdown fractional budget" ? new MaintenanceBudget(600_000, () => budgetNow) : undefined;
+          const operation = (budget ? MaintenanceBudget.run(budget, () => rig.runner.execute(claim)) : rig.runner.execute(claim))
+            .finally(() => { done = true; budget?.dispose(); });
+          // Attach the rejection observer before delivering shutdown.
+          const outcome = operation.then(() => undefined, error => error);
+          try {
+            await Promise.race([joining, operation.then(() => { throw new Error("execute returned before join barrier"); })]);
+            assert.equal(done, false);
+            assert.equal(closes, 0);
+            assert.equal(posts, 1);
+            assert.ok(flight);
+            if (control.startsWith("shutdown")) rig.runner.shutdown();
+            else {
+              const delivered = flight.steering.terminalLifecycleSignal();
+              const observed = new Promise<void>((resolve, reject) => {
+                const timer = setTimeout(() => {
+                  delivered.removeEventListener("abort", finish);
+                  reject(new Error("control was not delivered"));
+                }, 2000);
+                const finish = (): void => { clearTimeout(timer); resolve(); };
+                if (delivered.aborted) finish();
+                else delivered.addEventListener("abort", finish, { once: true });
+              });
+              if (control === "fence") {
+                api.setInputClaimGeneration(claim.run_id, 4);
+                api.setInputFenceReason(claim.run_id, "released");
+              }
+              api.setInputs(claim.run_id, [{ id: 1, kind: control === "cancel" ? "cancel" : "follow_up" }]);
+              await observed;
+              assert.equal(control === "cancel" ? flight.steering.isCancelled() : flight.steering.claimFence() !== undefined, true);
+            }
+            // Exhaust the old capture and shutdown grace while cleanup is held.
+            if (budget) budgetNow += 599_999.5;
+            else clock.advance(240_000);
+            assert.equal(done, false);
+            assert.equal(closes, 0);
+          } finally { release(); await outcome; }
+          const error: unknown = await outcome;
+          if (control.startsWith("shutdown")) assert.ok(error instanceof Error && error.name === "AbortError", String(error));
+          else assert.equal(error, undefined);
+          assert.equal(closedBeforeJoin, false, "never close inside held cleanup before join");
+          assert.equal(closes, 1, "one post-join close, including control exits bypassing the refusal notice");
+          if (control.startsWith("shutdown")) {
+            assert.ok(closeSignals[0], "shutdown cleanup has an explicit bounded close signal");
+            assert.equal(closeSignals[0].aborted, true, "expired grace or less than one remaining millisecond grants no fresh flush allowance");
+          }
+          assert.equal(posts, 1);
+          assert.equal(parks(claim.run_id).length, 0);
+          assert.equal(rig.custody(), 0);
+          assert.deepEqual(rig.archive.releaseCalls, []);
+          assert.equal(fs.readFileSync(path.join(worktreeDirFor(36178), "WORK.txt"), "utf8"), "work before the outage\n");
+          assert.equal(fs.readFileSync(path.join(rig.homePath(), "session"), "utf8"), "transcript");
+          if (control === "cancel") assert.ok(api.states.some(s => s.runId === claim.run_id && s.body.failure_reason === "run cancelled"));
+          else assert.ok(!api.states.some(s => s.runId === claim.run_id && ["failed", "completed"].includes(s.body.status ?? "")));
+        });
+      });
+    }
+
     it(`3617 ${kind} disposition-only free fallback refuses after capture join and closes its batcher`, async t => {
       await withHome(async home => {
         client.protocolFeatures = ["claim_generation_fence", feature];
@@ -1127,6 +1225,7 @@ describe("3617 idle park delivery evidence", () => {
       it(`3617 ${kind} ${wire} is ambiguous and stays frozen`, async () => {
         const claim = gitlabClaim(36174, { claim_generation: 3 });
         const requests: string[] = [];
+        let truncatedPrefixRead = false;
         const transport: typeof fetch = async (url, init) => {
           requests.push(String(init?.body));
           api.failStateWhen(claim.run_id, () => true, { httpStatus: 400, error: "invalid request body" });
@@ -1137,12 +1236,15 @@ describe("3617 idle park delivery evidence", () => {
           if (wire === "unreadable") return new Response(new ReadableStream({
             start(controller) { controller.error(new Error("unreadable response")); },
           }), { status: 400 });
-          if (wire === "truncated") return new Response(new ReadableStream({
-            start(controller) {
-              controller.enqueue(new TextEncoder().encode('{"error":"invalid request body"}'));
-              controller.error(new Error("stream failed before EOF"));
-            },
-          }), { status: 400 });
+          if (wire === "truncated") {
+            let sent = false;
+            return new Response(new ReadableStream({
+              pull(controller) {
+                if (!sent) { sent = true; controller.enqueue(new TextEncoder().encode('{"error":"invalid request body"}')); }
+                else { truncatedPrefixRead = true; controller.error(new Error("stream failed before EOF")); }
+              },
+            }), { status: 400 });
+          }
           return new Response(wire === "oversized" ? JSON.stringify({ error: "invalid request body" }) + " ".repeat(8192)
             : wire === "malformed" ? '{"error":"invalid request body"'
             : JSON.stringify({ error: "invalid progress" }), { status: 400 });
@@ -1155,6 +1257,7 @@ describe("3617 idle park delivery evidence", () => {
           recovery_cause: "codex_idle_stall" as const, provider_progress_turns: 2 };
         await assert.rejects(real.reportState(claim.run_id, body), error => !(error instanceof StateReportUnappliedError));
         assert.ok(requests.length > 0 && requests.length <= 3);
+        if (wire === "truncated") assert.equal(truncatedPrefixRead, true, "complete-looking JSON was read before EOF failed");
         for (const request of requests) assert.deepEqual(JSON.parse(request), body);
         assert.equal(parks(claim.run_id).length, 0);
         assert.equal(real.hasFeature(feature), true);
