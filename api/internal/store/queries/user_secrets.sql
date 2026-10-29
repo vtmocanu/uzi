@@ -122,8 +122,15 @@ WHERE user_id = $1 AND kind = $2 AND is_default;
 --
 -- disabled (PRD #1732 D5) rides along for the binding writers, which confirm ownership
 -- through this read and must refuse a disabled credential from the same row.
-SELECT user_id, kind, ciphertext, sealed_with, (disabled_at IS NOT NULL)::boolean AS disabled FROM user_secrets
-WHERE id = $1 AND user_id = $2;
+-- Ciphertext, crypto epoch and credential authority belong to one SQL snapshot.
+-- The LEFT JOIN retains non-Codex secrets that have no alias state.
+SELECT s.id, s.user_id, s.kind, s.ciphertext, s.sealed_with,
+       (s.disabled_at IS NOT NULL)::boolean AS disabled, s.enablement_rev,
+       u.vault_epoch, cs.material_revision
+FROM user_secrets s
+JOIN users u ON u.id = s.user_id
+LEFT JOIN codex_credential_state cs ON cs.user_secret_id = s.id AND cs.user_id = s.user_id
+WHERE s.id = $1 AND s.user_id = $2;
 
 -- name: GetEnabledUserSecretForKind :one
 -- Pick an enabled row for compatibility PUT when the slot has no default.
@@ -335,12 +342,13 @@ RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 DELETE FROM user_secrets WHERE id = $1 AND user_id = $2;
 
 -- name: CountMasterSealedSecrets :one
--- Admin migration-progress signal (PRD #32): how many stored user secrets still
--- use the legacy master-key sealing — i.e. owners who have not unlocked since the
+-- Admin migration-progress signal (PRD #32): how many protected users' secrets
+-- still use legacy master-key sealing — i.e. owners who have not unlocked since the
 -- vault rolled out. New saves are born 'dek' and lazy rewrap flips old rows on the
 -- owner's next unlock, so this trends to zero; a persistently non-zero count flags
 -- dormant accounts an operator may want to nudge.
-SELECT count(*) FROM user_secrets WHERE sealed_with = 'master';
+SELECT count(*) FROM user_secrets s JOIN users u ON u.id = s.user_id
+WHERE s.sealed_with = 'master' AND u.vault_mode = 'protected';
 
 -- name: ListMasterSealedSecrets :many
 -- The user's still-legacy secrets, for lazy rewrap on unlock (PRD #32): the vault

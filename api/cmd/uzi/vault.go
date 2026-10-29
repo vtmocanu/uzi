@@ -41,7 +41,9 @@ func newVaultCmd(env Env, gf *globalFlags) *cobra.Command {
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(result)
 			}
-			if result.Unlocked {
+			if result.Mode == "unprotected" {
+				p.Println("off")
+			} else if result.Unlocked {
 				p.Println("unlocked")
 			} else {
 				p.Println("locked")

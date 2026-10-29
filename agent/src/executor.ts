@@ -6,6 +6,7 @@ import { watch } from "node:fs";
 import path from "node:path";
 import type { Logger } from "./log.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
+import type { ExecutorSealResult, ExecutorTerminalSeal } from "./codex/executor-lifetime.js";
 import type { UsageSink } from "./usage-recorder.js";
 import type { RunCacheDropResult } from "./run-caches.js";
 import type { BoundarySink, CodexExecutionSafety, CredentialFreeCaptureContext, HarnessError } from "./harness.js";
@@ -133,6 +134,8 @@ export interface RunContext {
   runId: string;
   /** Current server claim fence; required to consume a checked plan approval. */
   claimGeneration?: number;
+  /** Negotiated before execution/capture; remains binding if registration features shrink. */
+  codexIdleStallRecovery?: boolean;
   /** Claim support assertion; absent means false. The runner separately gates root and phase. */
   parkRunSupported?: boolean;
   /** Request a park and await its authoritative outcome or a racing owner answer. */
@@ -952,6 +955,18 @@ export interface Executor {
   /** Close summary admission synchronously, then abort/join within the remaining sink deadline. */
   closeAndSettlePlanSummary?(deadlineMs?: number): Promise<void>;
   /**
+   * #3404 M1b: irreversibly close this executor's lifetime and, only when every owned producer,
+   * observer and cleanup tail has settled with unchanged successful disposal facts, return an opaque
+   * seal bound to `sourceUse` (an opaque caller-owned identity, e.g. the source-use lease). Failure
+   * is `{ kind: "unproven" }`, permanently closed, and never changes a completed run. Only the Codex
+   * executor implements it; absent means the executor has no closed lifetime to prove. The runner
+   * calls it at publication (RunRunner.publishFlightSource): only after every executor-dependent terminal sink, never under a
+   * safety, journal or bare lock.
+   */
+  sealLifetime?(sourceUse: object): Promise<ExecutorSealResult>;
+  /** True only for the exact, still-current seal this executor issued for `sourceUse`. */
+  acceptsLifetimeSeal?(seal: unknown, sourceUse: object): seal is ExecutorTerminalSeal;
+  /**
    * Group-kill every subprocess the agent spawned for the last run. The runner
    * calls this BEFORE any PAT-bearing git op (push) so an agent-backgrounded
    * process cannot survive to read the PAT out of the git child's /proc/environ
@@ -1010,6 +1025,10 @@ export interface Executor {
    * inside `run()`), this is readable before the runner clone is seeded, so the seed can make
    * the clone self-contained. Every other executor leaves it unset. */
   readonly sandboxesCommands?: boolean;
+  /** issue #3404 M2: this executor's lifetime incarnation, the value a source-use admission binds
+   * (`admitSourceUse(tx, clonePath, { executor })`) before the executor launches anything against the
+   * flight's clone. Only the Codex executor has one; every other executor leaves it unset. */
+  readonly executorIncarnation?: string;
   /** Issue #1604: true when run() awaits a resumed claim's pending gate inputs
    * (ctx.takeResumedGateEvent) and may RE-PRESENT its persisted unapproved plan at the gate
    * (resume_phase "awaiting_approval"). The runner then lets the re-presented gate keep epoch 0.

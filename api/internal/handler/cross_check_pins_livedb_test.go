@@ -190,7 +190,8 @@ func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 	}
 	initial := request("{}", 200)
 	if initial[0].Harness != "claude" || !initial[0].Active || !initial[1].Active || initial[1].ResolvedModel == nil ||
-		*initial[1].ResolvedModel != "gpt-6.1-sol" || initial[1].ResolvedEffort != "medium" || initial[1].Model != nil {
+		*initial[1].ResolvedModel != "gpt-6.1-sol" || initial[1].ResolvedEffort != "high" || initial[1].Model != nil ||
+		initial[1].EffortSource != "cross-check default" || initial[0].ResolvedEffort != "high" {
 		t.Fatalf("defaults/both-cells-active: %+v", initial)
 	}
 	exec("UPDATE users SET default_codex_model='gpt-6-sol',default_codex_effort='high' WHERE id=$1", user)
@@ -217,7 +218,10 @@ func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 	}
 	exec("UPDATE users SET default_codex_model='gpt-6.1-sol',default_codex_effort='low' WHERE id=$1", user)
 	got = request(`{"cross_check_pins":[{"stage":"plan","harness":"codex","effort":"  "}]}`, 200)
-	if *got[1].ResolvedModel != "gpt-6.1-sol" || got[1].Effort != nil || got[1].ResolvedEffort != "low" {
+	// The model Default follows the updated lane; the effort Default stays the cross-check
+	// default, so an explicit worker low does not lower the checker.
+	if *got[1].ResolvedModel != "gpt-6.1-sol" || got[1].Effort != nil || got[1].ResolvedEffort != "high" ||
+		got[1].EffortSource != "cross-check default" {
 		t.Fatal("Default did not follow updated lane")
 	}
 	for _, body := range []string{

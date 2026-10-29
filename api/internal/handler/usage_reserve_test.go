@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,8 +19,8 @@ import (
 )
 
 // fakeUsageReserveDB answers SetUserUsageReserve from memory, capturing the arguments the
-// handler passed and echoing them back as the RETURNING row (the last two users columns are
-// weekly_reserve_pct and weekly_reserve_pause_running).
+// handler passed and echoing them back by name in sqlc's expanded RETURNING row.
+// Vault or other appended columns must not change which reserve fields are populated.
 type fakeUsageReserveDB struct {
 	called bool
 	id     uuid.UUID
@@ -41,15 +42,24 @@ func (f *fakeUsageReserveDB) QueryRow(_ context.Context, sql string, args ...any
 	f.id, _ = args[0].(uuid.UUID)
 	f.pct, _ = args[1].(pgtype.Int2)
 	f.pause, _ = args[2].(bool)
+	_, returning, ok := strings.Cut(sql, "\nRETURNING ")
+	if !ok {
+		return fakeScanRow{func(...any) error { return fmt.Errorf("reserve fixture: missing expanded RETURNING columns") }}
+	}
+	columns := strings.Split(strings.TrimSpace(returning), ",")
 	return fakeScanRow{func(dest ...any) error {
-		if p, ok := dest[0].(*uuid.UUID); ok {
-			*p = f.id
+		if len(dest) != len(columns) {
+			return fmt.Errorf("reserve fixture: %d destinations for %d columns", len(dest), len(columns))
 		}
-		if p, ok := dest[len(dest)-2].(*pgtype.Int2); ok {
-			*p = f.pct
-		}
-		if p, ok := dest[len(dest)-1].(*bool); ok {
-			*p = f.pause
+		for i, column := range columns {
+			switch strings.TrimSpace(column) {
+			case "id":
+				*dest[i].(*uuid.UUID) = f.id
+			case "weekly_reserve_pct":
+				*dest[i].(*pgtype.Int2) = f.pct
+			case "weekly_reserve_pause_running":
+				*dest[i].(*bool) = f.pause
+			}
 		}
 		return nil
 	}}

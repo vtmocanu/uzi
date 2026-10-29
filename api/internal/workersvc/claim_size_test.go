@@ -49,7 +49,7 @@ func claimSizeStore(t *testing.T) *fakeStore {
 
 func TestOversizeRunClaimFailsTerminallyClaimSize(t *testing.T) {
 	fs := claimSizeStore(t)
-	svc := New(fs, newBox(t), testParams())
+	svc := newOffModeService(fs, newBox(t), testParams())
 	svc.claimSizeLimit = 8192
 	payload, err := svc.assembleAndFinishRunClaim(context.Background(), worker(), fs.claimRun, false)
 	if payload != nil || err != nil {
@@ -72,7 +72,7 @@ func TestOversizeRunClaimFailsTerminallyClaimSize(t *testing.T) {
 
 func TestUnderLimitRunClaimClaimSizeDelivers(t *testing.T) {
 	fs := claimSizeStore(t)
-	svc := New(fs, newBox(t), testParams())
+	svc := newOffModeService(fs, newBox(t), testParams())
 	svc.claimSizeLimit = 1 << 20
 	payload, err := svc.assembleAndFinishRunClaim(context.Background(), worker(), fs.claimRun, false)
 	if err != nil || payload == nil {

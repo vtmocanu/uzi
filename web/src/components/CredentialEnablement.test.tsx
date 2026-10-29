@@ -12,6 +12,8 @@ import { CodexCredentials } from "./CodexCredentials";
 import { api, type SecretDependents, type SecretMeta } from "../lib/api";
 import { ApiError } from "../lib/apiError";
 
+vi.mock("../auth/AuthContext", () => ({ useAuth: () => ({ vaultMode: "protected", hasPassword: true }) }));
+
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
   return {

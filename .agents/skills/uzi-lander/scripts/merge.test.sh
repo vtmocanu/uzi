@@ -13,6 +13,23 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# API listing caps cannot establish completeness, even when the response is valid JSON.
+# Keep these tests hermetic and avoid placing a large JSON fixture in the environment.
+. "$HERE/lib/migrations.sh"
+if (gh() { jq -cn '[range(0;3000)|{filename:"README.md",status:"modified"}]'; }; migration_pr_files test/repo 42 >/dev/null); then
+  fail "capped PR files were accepted as complete"
+fi
+base_limit=$(jq -cn '[range(0;1000)|{name:"00001_base.sql"}]')
+if migration_report '[]' "$base_limit" >/dev/null; then fail "capped base directory was accepted as complete"; fi
+unset base_limit
+# A rename or copy introduces its destination version just as an added file does.
+for status in renamed copied; do
+  files=$(jq -cn --arg s "$status" '[{filename:"api/internal/store/migrations/00371_vault.sql",status:$s,previous_filename:"api/internal/store/migrations/99999_source.sql"}]')
+  report=$(migration_report "$files" '[{"name":"00372_base.sql"}]')
+  [ "$(printf '%s' "$report" | jq '.collisions|length')" -eq 1 ] || fail "$status destination bypassed migration check"
+done
+unset files report
+
 HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 MSHA=abcabcabcabcabcabcabcabcabcabcabcabcabca
 
@@ -88,6 +105,15 @@ if [ "\${1:-}" = api ]; then
   case "\$*" in
     *'/commits/deadbee '*) [ "\${EXPECT_AMBIGUOUS:-0}" = 1 ] && exit 1; echo '$HEAD'; exit 0 ;;
     *'/commits/abcdef0 '*) echo 'abcdef0123456789abcdef0123456789abcdef01'; exit 0 ;;
+    *'/pulls/42/files'*)
+      [ "\${PR_FILES_FAIL:-0}" = 1 ] && { echo '[]'; exit 1; }
+      if [ -n "\${PR_FILES_RAW:-}" ]; then printf '%s\n' "\$PR_FILES_RAW"; else printf '%s\n' "\${PR_FILES_JSON:-[]}"; fi
+      exit 0 ;;
+    *'/contents/api/internal/store/migrations?'*)
+      [ -f "\$UZI_LANDER_STATE_DIR/locks/merge/uuid" ] || { echo 'base lookup outside merge lock' >&2; exit 99; }
+      [ "\${BASE_MIG_FAIL:-0}" = 1 ] && exit 1
+      printf '%s\n' "\${BASE_MIG_JSON:-[]}"
+      exit 0 ;;
     *'/pulls/42/commits'*) [ "\${CLOSES_FAIL:-0}" = 1 ] && exit 1; printf '[%s]\n' "\${COMMITS_JSON:-[]}"; exit 0 ;;
     *'/pulls/42 --jq .commits'*) printf '%s\n' "\${COMMIT_COUNT:-\$(printf '%s' "\${COMMITS_JSON:-[]}" | jq length)}"; exit 0 ;;
     *'/protection/required_status_checks'*)
@@ -629,6 +655,48 @@ merge_run closes_owner_names
 grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "owner names fixes/ closed/ parsed as keywords, or a separator form missed: $(cat "$WORK/m.closes_owner_names")"
 grep -q 'CLOSES=10,11,12,13' "$WORK/m.closes_owner_names" || fail "unexpected parse: $(cat "$WORK/m.closes_owner_names")"
 unset CLOSES_JSON COMMITS_JSON; MERGE_ARGS=()
+# Last-moment migration checks use live base max, even when all CI is green.
+export CONFIRM_AFTER_MERGE=1
+export BASE_MIG_JSON='[{"name":"00372_retained.sql"}]'
+for version in 00372 00371; do
+  export PR_FILES_JSON="[{\"filename\":\"api/internal/store/migrations/${version}_vault.sql\",\"status\":\"added\"}]"
+  merge_run "migration_$version"
+  [ "$rc" -eq 13 ] || fail "migration $version: want 13, got $rc: $(cat "$WORK/m.migration_$version")"
+  [ ! -e "$WORK/merge.log" ] || fail "colliding migration reached gh pr merge"
+  grep -qF 'MIGRATION_COLLISION: renumber above 372 with land-prep.sh' "$WORK/m.migration_$version" || fail "migration remediation missing"
+done
+export PR_FILES_JSON='[{"filename":"api/internal/store/migrations/00373_vault.sql","status":"added"}]'
+merge_run migration_above
+[ "$rc" -eq 0 ] && [ -s "$WORK/merge.log" ] || fail "migration above head did not merge: $(cat "$WORK/m.migration_above")"
+for status in renamed copied; do
+  export PR_FILES_JSON="[{\"filename\":\"api/internal/store/migrations/00371_vault.sql\",\"status\":\"$status\",\"previous_filename\":\"api/internal/store/migrations/99999_source.sql\"}]"
+  merge_run "migration_${status}_below"
+  [ "$rc" -eq 13 ] || fail "$status below head: want 13, got $rc: $(cat "$WORK/m.migration_${status}_below")"
+  [ ! -e "$WORK/merge.log" ] || fail "$status below head reached gh pr merge"
+  export PR_FILES_JSON="[{\"filename\":\"api/internal/store/migrations/00373_vault.sql\",\"status\":\"$status\",\"previous_filename\":\"api/internal/store/migrations/00372_source.sql\"}]"
+  merge_run "migration_${status}_above"
+  [ "$rc" -eq 0 ] && [ -s "$WORK/merge.log" ] || fail "$status above head did not merge: $(cat "$WORK/m.migration_${status}_above")"
+done
+# An existing migration edited in the PR is not an added migration.
+export PR_FILES_JSON='[{"filename":"api/internal/store/migrations/00372_retained.sql","status":"modified"}]'
+merge_run migration_modified
+[ "$rc" -eq 0 ] || fail "modified migration misclassified as added"
+export PR_FILES_JSON='[{"filename":"api/internal/store/migrations/00373_vault.sql","status":"added"}]'
+for scenario in files_failed files_malformed files_entry_malformed base_failed base_malformed; do
+  case "$scenario" in
+    files_failed) export PR_FILES_FAIL=1 ;;
+    files_malformed) export PR_FILES_RAW='{}' ;;
+    files_entry_malformed) export PR_FILES_RAW='[{"filename":"api/internal/store/migrations/00373_vault.sql"}]' ;;
+    base_failed) export BASE_MIG_FAIL=1 ;;
+    base_malformed) export BASE_MIG_JSON='{}' ;;
+  esac
+  merge_run "migration_$scenario"
+  [ "$rc" -eq 2 ] || fail "$scenario: want unreadable=2, got $rc: $(cat "$WORK/m.migration_$scenario")"
+  [ ! -e "$WORK/merge.log" ] || fail "$scenario reached gh pr merge"
+  unset PR_FILES_FAIL PR_FILES_RAW BASE_MIG_FAIL
+  export BASE_MIG_JSON='[{"name":"00372_retained.sql"}]'
+done
+unset PR_FILES_JSON BASE_MIG_JSON CONFIRM_AFTER_MERGE
 # --confirm-only never reads the run list.
 MERGE_STATE=MERGED; export MERGE_STATE RUNS_FAIL=1
 seed_state

@@ -17,7 +17,7 @@ const pin = (harness: "claude" | "codex", over: Partial<CrossCheckPinDTO> = {}):
 });
 const settings = (over: Partial<UserSettings> = {}): UserSettings => ({
   default_model: null, default_harness: null, default_claude_model: null, default_codex_model: null,
-  default_effort: null, default_codex_effort: null, judge_model: null, summary_model: null, theme: null,
+  default_effort: "low", default_codex_effort: "low", judge_model: null, summary_model: null, theme: null,
   appearance_mode: null, light_theme: null, dark_theme: null, typeface: null,
   cross_check_pins: [pin("claude"), pin("codex")], ...over,
 });
@@ -66,6 +66,7 @@ describe("checker defaults", () => {
       expect((code.getByLabelText(`Code ${family} checker model`) as HTMLSelectElement).value).toBe("inherit");
       expect((code.getByLabelText(`Code ${family} checker effort`) as HTMLSelectElement).value).toBe("");
       expect(code.getByLabelText(`Code ${family} checker model`).textContent).toContain("Default · Unavailable (worker default)");
+      expect(code.getByLabelText(`Code ${family} checker effort`).textContent).toContain("Default · high (cross-check default)");
     }
     fireEvent.change(code.getByLabelText("Code Claude checker effort"), { target: { value: "high" } });
     mocked.putMySettings.mockResolvedValueOnce({ settings: settings() });
@@ -144,7 +145,7 @@ describe("checker defaults", () => {
     fireEvent.change(model("Codex"), { target: { value: "gpt-6-sol" } });
     r.rerender(<CrossCheckDefaults settings={{ ...initial, default_claude_model: "haiku", default_effort: "max", default_codex_model: "custom-worker", cross_check_pins: [pin("claude", { worker_default_model: "haiku" }), pin("codex", { worker_default_model: "custom-worker" })] }} onSaved={vi.fn()} />);
     expect(within(model("Claude")).getByRole("option", { name: "Default · haiku (worker default)" })).toBeTruthy();
-    expect(within(effort("Claude")).getByRole("option", { name: "Default · max (worker default)" })).toBeTruthy();
+    expect(within(effort("Claude")).getByRole("option", { name: "Default · high (cross-check default)" })).toBeTruthy();
     expect(model("Codex").value).toBe("gpt-6-sol");
     fireEvent.change(model("Codex"), { target: { value: "inherit" } });
     fireEvent.change(model("Claude"), { target: { value: "inherit" } });

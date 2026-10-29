@@ -37,7 +37,11 @@ Retry backoff consumes the turn's wall budget. Genuine wall/idle timeout,
 typed pause and cancellation remain higher-priority outcomes; budget
 exhaustion is not itself a reason to enter recovery. The #3462 amendment below
 adds a narrow Codex zero-model-processing-evidence idle exception to this
-historical timeout precedence.
+historical timeout precedence. The [#3509 amendment](#amendment-2026-10-27-3509-bounded-codex-idle-stall-parks)
+qualifies that exception with typed zero-evidence/productive idle parks and an
+owner hold; #3506 below routes qualifying retry-associated zero-evidence silence
+through provider recovery instead. #3466's human revision driver remains separate.
+(AI-synced 2026-10-28)
 
 ### Verified capture before a promotable park
 
@@ -376,8 +380,15 @@ Representative measurement: see the delivery report.
 **Boundary.** The composed gate (C2) is UNRUN: no qualifying measurement exists, and
 the diagnostic run shows `sourceEntries` refusals at 65,536 on representative
 fixtures, with no archive outcome reached (see the MEASURE section of the delivery
-report). No contract change follows. The terminal producer guard stays off. U4b, U4c, U4d, U5, F, M3
-and M4 remain undelivered, and MO is unperformed.
+report). The diagnostic itself grants no contract change or PASS. Under the
+maintainer's [scope amendment](https://github.com/vtmocanu/uzi/issues/3442#issuecomment-6463625538),
+the current C2 conjunction is single-attempt-only. Multi-source and unprovable
+families remain protected; multi-source preservation is undelivered. Future
+expansion requires independently proved membership and coverage, plus a composed
+measurement resolving the separately recorded `sources` budget shortfall. Neither
+local retention nor the diagnostic's projected 188/128 complete-path cost is a
+qualifying preservation result. The terminal producer guard stays off. U4b, U4c,
+U4d, U5, F, M3 and M4 remain undelivered, and MO is unperformed.
 
 ### Server-owned backoff
 
@@ -390,7 +401,10 @@ approval reports cannot exit the park.
 The server uses a capped exponential backoff, from `RUN_RECOVERY_PARK_BASE`
 (default 1m) to `RUN_RECOVERY_MAX_PARK` (default 30m), with jitter. There is
 no lifetime park cap or terminal branch caused solely by repeated empty
-results. Normal running watchdogs and owner cancellation still apply.
+results. This uncapped policy does not apply to negotiated Codex idle stalls;
+see the [#3509 amendment](#amendment-2026-10-27-3509-bounded-codex-idle-stall-parks)
+for the cause-specific cap and fresh-wall cost. Normal running watchdogs and
+owner cancellation still apply.
 The exponent is bounded to avoid duration overflow.
 
 ## Consequences
@@ -444,7 +458,8 @@ during the retries still ends `cancelled`, and the promotion cadence is
 the same `recovery_wait` sweeper this ADR already describes. What differs
 is only the *entry* condition and a forge-only lifetime cap this cause
 adds on top (`RUN_FORGE_UNREACHABLE_MAX_PARKS`) — the empty-turn park
-above keeps its uncapped lifetime, unchanged. See
+above keeps its uncapped lifetime, except for negotiated Codex idle stalls under
+[#3509](#amendment-2026-10-27-3509-bounded-codex-idle-stall-parks). See
 [adr/1296-durable-run-recovery.md](1296-durable-run-recovery.md) (the
 2026-09-16 PRD #1392 amendment) for the matching custody-side exception —
 a generation that never adopted a source releases its hold without the
@@ -467,7 +482,9 @@ a trusted, successfully settled real model turn. (The #3330 amendment below
 supersedes that sentence: an explicit owner Resume also renews the count.)
 
 The [#3495 amendment](#amendment-2026-10-26-3495-bounded-retained-recovery-parks)
-supersedes terminal exhaustion below only for durably confirmed `budget_exhausted` retained source.
+supersedes terminal exhaustion below for durably confirmed `budget_exhausted` retained source.
+The [#3527 amendment](#amendment-2026-10-27-3527-owner-held-retained-adoption-retry)
+also qualifies the adoption-failure terminal policy with an owner-held retry.
 
 A permanent blocker or exhaustion reports terminal `failed` with
 `keepCustody`; it neither auto-reclaims nor exposes failed-run Resume.
@@ -673,8 +690,9 @@ rebase before applying the persisted window. Failure classification uses the
 current claim's window, never a superseded deadline. Already-blocked records stay
 blocked with their original reason, including decoded-history exhaustion; neither
 a reclaim nor a deployment upgrade revives them (superseded for
-`budget_exhausted` blockers only by the #3330 amendment below; every other
-blocker stays permanent). Source protection, custody,
+`budget_exhausted` blockers by the #3330 amendment below, and for owner-authorized
+`adoption_failed` renewal by #3527; the remaining blockers stay permanent).
+Source protection, custody,
 publication proof, closure verification limits and retry backoff are unchanged.
 No claim fence, timer renewal or successful local verification authorizes deletion
 or release of retained work.
@@ -776,7 +794,9 @@ across fresh claims", and its "neither a reclaim nor a deployment upgrade revive
 them" (for `budget_exhausted` blockers only). A successful settled model turn
 still clears the completed episode, unchanged.
 
-Mechanism:
+Mechanism at #3330 (the #3495 amendment below adds retained-park Resume
+and derived claim episodes; #3527 adds the separate raw owner grant and
+owner-authorized adoption renewal):
 
 - `runs.worker_recovery_episode` is incremented by exactly 1 only by
   `ResumeWorkerRecoveryEpisode`, reached only from the owner Resume for
@@ -788,7 +808,9 @@ Mechanism:
   value is refused, and it is written only when above 0, so a never-resumed
   journal is byte-identical to before.
 - `reserveRecoveryIteration` checks, in order: the stale fence, refusal of any
-  blocker other than `budget_exhausted`, the clock, then renewal. It renews iff
+  blocker other than `budget_exhausted`, the clock, then renewal (the later
+  #3527 exception admits `adoption_failed` with a fresh raw owner grant).
+  Under #3330 it renews iff
   the claim's episode is above the stored episode **and** the claim is a new
   generation (a new window). That applies to a partly used, exhausted or
   `budget_exhausted`-blocked source. Renewal charges 1 of the 3 iterations,
@@ -832,6 +854,12 @@ Scope: the `data_volume_full` task-run symptom is not fixed here (#3329).
 
 ## Amendment 2026-10-25, #3462: Codex zero-evidence idle enters ordinary recovery
 
+Historical decision: the [#3509 amendment](#amendment-2026-10-27-3509-bounded-codex-idle-stall-parks)
+below supersedes the untyped, productive-idle and uncapped-silence claims for
+negotiated lead idle recovery. The #3506 note below qualifies provider attribution
+for retry-associated zero-evidence silence. The human revision and evidence
+boundaries remain. (AI-synced 2026-10-28)
+
 An eligible Codex lead turn that reaches the idle timeout with zero
 model-processing evidence now enters ordinary recovery. This is the narrow
 exception to the historical genuine wall/idle precedence above; it does not
@@ -846,14 +874,17 @@ model-initiated activity count as evidence. Unknown evidence, a synthetic
 trip or an ordinary error whose text happens to match the idle reason
 does not qualify.
 
+For plain zero-evidence silence,
 [CodexExecutor.driveTurnWithWallPark](../agent/src/codex/codex-executor.ts)
 persists the session through the existing pre-reaping sink and throws
 `TransientRecoveryError` with
 the exact message `provider sent no model output within the idle timeout`.
-It leaves `providerOrigin` false. The runner captures and verifies the
-restore point before reporting an ordinary, untyped `recovery_wait`, without
-`provider_outage` or provider-streak accounting: silence proves neither a
-provider error nor that the model processed the prompt.
+Without the #3506 retry context below, it leaves `providerOrigin` false.
+The runner captures and verifies the restore point before recovery; #3509
+supersedes the original untyped report when idle-stall typing is negotiated.
+That plain-silence route has no `provider_outage` or provider-streak accounting:
+silence alone proves neither a provider error nor that the model processed the
+prompt. (AI-synced 2026-10-28)
 
 Eligibility covers initial planning, automatic plan revisions and implementation
 model turns.
@@ -887,17 +918,76 @@ The existing verified-capture and settlement requirements still apply.
 Ordinary recovery retains its uncapped lifetime park count and existing
 exponential server backoff clamped at the configured maximum, plus jitter.
 Repeated silence can recover until the run wall requires an owner park or
-the owner cancels. This adds no provider-outage
-cap. A resolvable persisted session can resume on the new harness. If the
-provider rejects `thread/resume`, the existing fresh-thread fallback emits
-`resume_lineage_break` and warns that earlier context is lost and work may
-be repeated.
+the owner cancels. These are historical lifetime claims superseded by #3509;
+#3506 below routes qualifying retry-associated silence through the existing
+provider-outage bound instead. A resolvable persisted session can resume on the
+new harness. If the provider rejects `thread/resume`, the existing fresh-thread
+fallback emits `resume_lineage_break` and warns that earlier context is lost and work may
+be repeated. (AI-synced 2026-10-28)
 
 **Evidence boundary.** Evidence is limited to scripted app-server/executor
 and runner fixtures in [the Codex executor tests](../agent/test/codex-executor.test.ts).
 The resume fixture covers a resolvable non-Docker session path, with
 retained-source successor selection bypassed; it does not establish general
 successor-path or Docker resume coverage. There is no live-provider proof.
+
+### Issue #3506: provider retry followed by zero-evidence silence
+
+Decision record (AI-synced 2026-10-28). This narrow exception qualifies this
+#3462 amendment, [#3466 human revision recovery](#issue-3466-amendment--silent-human-revisions)
+and [#3509 idle-stall recovery](#amendment-2026-10-27-3509-bounded-codex-idle-stall-parks).
+It supersedes #3509's blanket not-provider-outage claim for qualifying
+retry-associated zero-evidence idle; other stalls keep their existing policy.
+
+[The Codex harness](../agent/src/codex/codex-harness.ts) retains the latest
+`willRetry: true` `codex_error` bound to the active root thread and turn,
+normalized by `normalizeCodexErrorInfo`. This closed classification contains no
+raw provider text. It resets at each root turn and on emitted
+`evidencesModelProcessing` evidence. An active-root `willRetry: false` invalidates
+the retry fallback even when its classification is missing or unknown, and
+blocks later retry notes from restoring it in that turn. Terminal selection is
+unchanged; a retry note is not a terminal failure or completed progress.
+
+At the first actual `REASON_IDLE` trip, the executor snapshots the retained retry
+classification. An eligible measured `processedEvents === 0` trip routes directly
+to `TransientRecoveryError` with `providerOrigin: true`,
+`idleStallKind: "zero_evidence"` and the identity of `originalIdle` retained when
+`isCodexTransientClassification` accepts that snapshot: exact `rateLimitExceeded`,
+or transport with absent or retryable HTTP status (408/429/5xx). The message is
+`silence after a provider-reported rate limit or transport retry`. The reported
+retry condition does not prove it caused the silence. Lifecycle/retry liveness
+never fabricates model progress. This does not invoke #2099 retries on the
+interrupted root or debit its transient retry allowance. Plain zero-evidence and
+productive idle keep #3509's policy; child turns and Claude are unchanged.
+Cancel, pause, wall, vault, completion and first-trip precedence remain as above.
+
+An accepted human revision, including clarification and prose followups, keeps
+both markers and follows #3466: verified disposal before the retry hook, then
+source/claim/control-fenced fresh-epoch construction after allowance admission.
+This idle error does not take the same-epoch provider-redrive path. Missing or
+unsupported hooks retain the `originalIdle` fallback. Exhaustion, owner wait,
+source safety and control routing remain unchanged. Generic provider revision
+errors keep their existing behavior. Retry and exhaustion notices use the same
+retry-associated silence phrase without claiming a proven cause.
+
+For ordinary recovery, provider origin excludes `idleTyped` in
+[the runner](../agent/src/runner.ts). Existing provider capability negotiation and
+positive, stampable claim-generation wire checks decide whether the report uses
+`provider_outage`; older APIs retain the untyped fallback, which promises neither
+provider counting nor a provider hold. Verified capture and settlement remain
+required. Typed provider parks use the existing streak and
+`RUN_PROVIDER_PARK_MAX_DURATION` (default `24h`; `0` disables the hold while
+retaining typing/counting). At a qualifying park at or past that duration, the
+run can enter owner-resumable `paused` / `provider_unavailable`. Backoff, jitter,
+queue/claim delay and the next attempt can delay detection; there is no exact
+24-hour deadline or bounded overshoot. Successful completed model turns reset
+the streak under the existing progress rules; retry liveness does not.
+Owner Resume uses the existing provider-unavailable route, not #3527's worker
+owner episode or adoption renewal. Existing lost-ACK and definitive HTTP 400
+typed-park-refusal behavior is unchanged and outside this amendment.
+
+This note records the M1 behavior at `a212cd5d`; it adds no live-provider,
+rollout or newly executed test evidence.
 
 ## Amendment 2026-10-25: #3441 U4b verified delta transfer
 
@@ -1251,12 +1341,14 @@ and hosted timing retain their separate unproven boundaries.
 
 A real Codex idle trip with exactly zero measured model-processing events can
 use `plan_revision_retry_v1` during an accepted human revision, including its
-clarification and prose followups. A typed `zeroEvidenceIdle` discriminator
-retains the original idle trip; `providerOrigin` stays false. Silence does not
-establish a provider error. This path uses `PlanRevisionRecovery`, without an
-ordinary recovery park or provider-outage accounting. Missing negotiation,
+clarification and prose followups. The `idleStallKind: "zero_evidence"` marker
+retains the original idle trip; `providerOrigin` stays false except for #3506's
+qualifying retry-associated silence above, which retains both markers. Silence
+alone does not establish a provider error. This path uses `PlanRevisionRecovery`,
+without an ordinary recovery park or provider-outage accounting. Missing negotiation,
 hook, active revision or presentation identity retains the original terminal
 idle outcome. Control and ownership exceptions retain their own routes.
+(AI-synced 2026-10-28)
 
 The pre-reaping sink persists the session before verified epoch disposal,
 including when the retry allowance is exhausted. A silent retry reconstructs
@@ -1286,8 +1378,10 @@ Retry waits for unknown ownership and gate-restoration evidence use that same
 remaining budget. A replacement revise already taken from the owner queue stays
 pending across a wall unwind until its source proof can complete.
 Cancel, pause, spent wall and completion
-holds retain their existing precedence. Provider-origin revision
-retries continue on their existing epoch.
+holds retain their existing precedence. Generic provider-origin revision
+retries continue on their existing epoch; #3506's dual-marker idle error keeps
+verified disposal before the hook and fenced fresh-epoch construction after
+allowance admission. (AI-synced 2026-10-28)
 
 The same failed prompt and clarification/prose budgets survive a silent retry.
 Feedback remains pending until source-fenced revised publication succeeds.
@@ -1295,7 +1389,9 @@ Exhaustion restores the original presentation and an operable busy owner wait;
 source-bound reject and cancel remain available. An ordinary replacement revise
 spends the normal revision cap and receives a fresh allowance, while predecessor
 feedback settles only with the successor publication receipt. Retry notices
-describe silence as no model output, without attributing it to a provider outage.
+describe plain silence as no model output. For #3506's dual-marker error they
+say `silence after a provider-reported rate limit or transport retry`, without
+asserting that the retry condition caused it. (AI-synced 2026-10-28)
 
 Validation uses scripted executor and runner fixtures. No live-provider or
 compose-stack proof is claimed for this amendment.
@@ -1306,9 +1402,11 @@ Decision record (AI-synced 2026-10-26). This amendment qualifies #2512's
 terminal-exhaustion policy, #3330's owner-only renewal and server-requeue
 exclusion, and the verified-capture-before-promotable-park prerequisite.
 It applies only to an authoritative exact-source journal durably confirmed as
-`budget_exhausted`. Other permanent blockers keep the existing terminal fallback
-with custody retained. #3462's Codex zero-evidence idle still enters ordinary
-verified-capture recovery; this is not a broader retry for deterministic blockers.
+`budget_exhausted`. At #3495, other permanent blockers kept the terminal fallback
+with custody retained; #3527 below adds the owner-held `adoption_failed`
+exception. #3462's Codex zero-evidence idle still requires verified capture; its
+typed park policy is superseded by #3509 below. This is not a broader retry for
+other deterministic blockers.
 #3181 remains out of scope. There is no linked PRD.
 
 ### Retry allowance and renewal
@@ -1330,7 +1428,8 @@ verified-capture recovery; this is not a broader retry for deterministic blocker
   episode evidence; retained retries are not worker-death requeues.
 - Renewal requires both a fresh generation and a higher derived episode than
   the journal. It charges exactly one reservation of three in a new five-minute
-  window, clears only `budget_exhausted`, and requires quiescence again before
+  window, clears `budget_exhausted` (adoption renewal needs the separate #3527
+  owner grant below), and requires quiescence again before
   recovery work. Same generation or same episode cannot renew. Resume of a
   pending timed retry before its fresh claim can advance the derived episode
   by two but still grants one renewal, not two windows.
@@ -1389,3 +1488,277 @@ the terminal fallback. The existing worker-journal downgrade caution remains:
 older workers may reject or drop durable recovery fields. This amendment adds
 no operator watcher or lander policy, source-deletion authority or guarantee
 that the latest edits have an archive.
+
+## Amendment 2026-10-27, #3509: bounded Codex idle-stall parks
+
+Decision record (AI-synced 2026-10-27). For Codex idle stalls this amendment
+explicitly supersedes #3462's earlier claims:
+
+> "Ordinary recovery retains its uncapped lifetime park count"
+
+> "Repeated silence can recover until the run wall requires an owner park"
+
+Promotion resets the wall: silence was not bounded by one original
+wall window. Up to the configured cap of automatic parks may grant that many
+extra fresh wall windows (three by default), an accepted cost of recovery.
+Other causes, #3466 human revision recovery and retained-source policies keep
+their separate rules. No live-provider or live-rollout acceptance is claimed.
+
+### Classification and capture boundary
+
+Measured lead initial-planning, automatic-plan-revision and implementation idle
+trips use `codex_idle_stall` for both `zero_evidence` and `productive` stalls,
+except for #3506's qualifying retry-associated zero-evidence idle, which uses
+provider recovery as described above. (AI-synced 2026-10-28)
+“Productive” here means observed output before the stall, not a completed turn.
+Human revision productive idle keeps failure; zero-evidence silence stays inside
+the existing revision driver. Child turns, Claude, callback-based idle suppression
+and `idleOperation` remain unchanged. Cancel, pause, spent wall, vault lock,
+completion hold and first-trip precedence retain their existing boundaries in
+[the Codex executor](../agent/src/codex/codex-executor.ts).
+
+Before capture, typing requires negotiated `recovery_cause_codex_idle_stall_v1`
+and a positive, stampable claim generation. Session persistence, executor cleanup,
+dirty-work WIP, fetch-back and verified ref coverage precede an accepted park.
+These nonqualifying idle errors have `providerOrigin: false` and do not enter
+provider-outage counting; #3506's qualifying dual-marker errors instead take the
+provider wire checks and accounting above. The remaining rules in this amendment
+apply to `codex_idle_stall`. (AI-synced 2026-10-28)
+Acceptance requires returned `recovery_wait` and exact `codex_idle_stall` cause,
+including when the full worker ACK has no retry timestamp (held).
+Without negotiation, zero-evidence idle keeps legacy untyped recovery and
+productive idle keeps terminal failure. An advertised feature followed by HTTP
+400 or feature loss must not cause an untyped resend; source stays kept.
+See [the runner](../agent/src/runner.ts) and [client](../agent/src/client.ts).
+
+### Park-observed accounting and owner controls
+
+`RUN_CODEX_IDLE_STALL_MAX_PARKS` accepts integers `0..2147483646`, default **3**;
+malformed, negative or above-bound values fall back to 3. A qualifying park
+increments internal `idle_stall_park_count` with int32 saturation, or sets it to
+1 when `provider_progress_turns` reports positive completed turns in that flight.
+A count above the cap sets `recovery_retry_not_before` to NULL; otherwise the
+existing lifetime backoff and jitter produce a finite timestamp. Default parks
+1–3 are timed; park 4 is held. **0 holds on the first park**. The counter is not
+a public DTO field. See [recoverywait.go](../api/internal/workersvc/recoverywait.go)
+and [configuration parsing](../api/internal/config/config.go).
+
+This is a park-observed streak, not an exact unsuccessful-turn count. Output on
+the current stalled turn is not completed progress. Another flight's progress
+may be unseen if it does not end in an idle park, allowing an earlier hold.
+Reclaims, checkpointing and credential parks are neutral for the idle counter.
+Positive completed progress on the idle park can also clear a provider streak
+under its existing progress rules, without charging a provider outage.
+
+Owner Resume of either timed or held form queues it, clears retry, resets idle
+count to 0, sets `started_at = NULL` and `budget_paused_seconds = 0`, and revokes
+the Codex capability/advances its epoch. It preserves lifetime recovery backoff,
+provider streak, session, worker affinity, worker recovery episode and requeue
+baseline. Ordinary claim-release/custody semantics remain. Timer promotion
+preserves the idle count and grants a fresh wall window. Timed set-token promotion
+is permitted under existing credential behavior; a held set-token request returns
+a named 409 requiring Resume. Cancel remains available. These boundaries are in
+[Resume and promotion SQL](../api/internal/store/queries/runtime.sql) and
+[credential switching](../api/internal/workersvc/run_credential.go).
+
+UI/CLI finite timestamps, including due ones, mean timed recovery. NULL means
+owner-held without countdown; omitted public timing means unknown, distinct from
+the full worker ACK. Default wait and follow stop for held, continue through
+finite/unknown timing, and notice timed-to-held changes within the same
+status/cause. Explicit `--until` keeps its chosen stop set.
+
+### Session, source custody and admission limits
+
+Same-session continuity is conditional on a resolvable ordinary unwired
+non-Docker path. Retained-source and Docker recovery use fresh paths/threads.
+A rejected thread resume retains the `resume_lineage_break` warning and
+fresh-thread fallback. Interrupted-turn notes, reconciliation and snapshots
+do not prevent duplicate work or guarantee exactly-once external effects.
+
+An execution hold adds no custody-retention policy. Ordinary settlement and
+exact-generation ACK guards still govern release; uncaptured, guarded,
+unresolved and 507-refused sources remain retained. Open holds still count
+toward admission. The cap limits further generation minting for one run; it
+does not relieve custody quota, storage or admission pressure. #2969/#2544
+remain outside this change. See [custody admission in ClaimRun](../api/internal/store/queries/runtime.sql)
+and the runner's existing source-settlement boundaries.
+
+### Deployment and destructive Down
+
+Deploy the API to **all replicas before workers**. Mixed old/new API replicas
+and application rollback while idle holds exist are unsupported: the old
+token promoter can bypass the held NULL-retry shape. Held runs block worker
+image rollout under #3103's existing upgrade-blocker policy. No live rollout
+has been executed as evidence for this documentation unit.
+
+[00370_codex_idle_stall.sql](../api/internal/store/migrations/00370_codex_idle_stall.sql)
+adds a constant-default counter and `NOT VALID` checks in a short schema
+transaction; [00371_validate_codex_idle_stall.sql](../api/internal/store/migrations/00371_validate_codex_idle_stall.sql)
+validates in a separately committed migration. The brief ACCESS EXCLUSIVE DDL
+lock can wait; separate validation avoids holding that lock through the scan.
+Production table size, lock duration and row-update/WAL/replica costs are unmeasured.
+
+Down changes active idle parks (timed or held) to `failed` / `worker_lost`
+with the 00370 schema-rollback reason and finish/status/update timestamps, then
+clears historical idle cause/retry fields before restoring the old check and
+dropping the counter. It does not mutate custody. Counter history and idle-cause
+evidence are lost; assess backup/PITR needs first. This destructive downgrade
+failure is not normal cap policy or supported application rollback.
+
+The setting is wired into the Compose API environment (including literal 0)
+and `.env.example`. Helm uses existing
+`api.config.RUN_CODEX_IDLE_STALL_MAX_PARKS` → ConfigMap → API `envFrom`;
+no chart mechanism is added. See [operator configuration](../docs/configuration.md#codex-idle-stall-deployment-and-schema-rollback).
+
+## Amendment 2026-10-27, #3527: owner-held retained adoption retry
+
+Decision record (AI-synced 2026-10-27). This qualifies #2512's terminal
+adoption-failure policy, #3330's budget-only blocker renewal, and #3495's
+retained-recovery parks above. It adds an owner decision for confirmed adoption
+refusal without treating an integrity failure as transient. The #3031 model-free
+preservation producer receives no renewal or execution authority.
+
+### Hold, owner action and confirmation
+
+- A positive-generation worker negotiating
+  `recovery_cause_retained_recovery_adoption_failed` may report
+  `recovery_wait` / `retained_recovery_adoption_failed` after exact-source
+  journal readback confirms persisted `adoption_failed`. The worker proves
+  current ownership and fresh credential-free quiescence of retained source
+  paths, including a partial successor, before reporting the hold. An unproved
+  quiescence boundary does not authorize this park.
+- The existing locked park transaction releases execution, retains source and
+  custody, increments lifetime `recovery_wait_count`, leaves
+  `retained_park_count` unchanged, and writes a NULL retry. Timer promotion and
+  immediate token/credential promotion exclude the cause. It has no automatic
+  retry or new configuration. The accepted run-kind/status/generation fences
+  remain those of `parkRetainedRecovery` in
+  [retainedpark.go](../api/internal/workersvc/retainedpark.go).
+- Owner Resume uses `ResumeWorkerRecoveryEpisode`: increment stored
+  `worker_recovery_episode` by one, clear retry and queue through the existing
+  full Resume lifecycle, including hold clearing and requeue-baseline bookkeeping.
+  It preserves remaining wall semantics; extension may be needed. Cancel remains
+  terminal. A request for another attempt does not guarantee successful adoption.
+- Default CLI wait/log follow, watcher and lander stop for this cause regardless
+  of retry timing; explicit CLI `--until` retains its selected status set. The
+  TUI marks NEEDS YOU. Without a new owner grant, redispatch reholds without
+  capture or a model turn; another adoption failure reholds.
+- Feature absence or unconfirmed blocker persistence fails closed with custody
+  retained. A hold is confirmed by the generation-fenced report ACK naming the
+  exact status and cause. Lost, status-only or otherwise unconfirmed ACKs use
+  the existing bounded reconciliation (two reports and at most two ownership
+  probes under one boundary deadline), then stop nonterminal. Ownership permits
+  report replay, not hold confirmation. Stale/cancelled/newer outcomes stop
+  without overwriting the newer state. See `parkRetainedRecoveryExhausted` and
+  `recoverRetainedClaim` in [runner.ts](../agent/src/runner.ts).
+
+### Raw grant and durable accounting
+
+Ordinary, chat, job and judge claim builders carry both:
+
+- `worker_recovery_episode = stored worker_recovery_episode + retained_park_count`,
+  the existing #3495 derived budget-renewal episode;
+- `worker_recovery_owner_episode = stored worker_recovery_episode`, the raw
+  owner grant. Missing, negative or malformed raw values grant no adoption renewal.
+
+Adoption renewal requires a raw grant above its consumed high-water mark, a
+fresh positive claim generation, exact source/journal/reservation and bare-repo
+identity, and current ownership. It charges one reservation of the existing
+three-iteration/five-minute window before recovery work, with quiescence and
+verification required again before model admission. A higher derived episode
+alone cannot renew adoption; other blockers are not cleared. A failure persisted
+as `budget_exhausted` after the deadline follows #3495 instead; that overlap does
+not establish transience. The exact verified `ready-for-model` successor handoff
+is supported, but is not independent execution authority.
+
+Accounting is stored in local bare Git config at
+`uzi-recoveryowner.<runId>.record`. It is outside the strict recovery journal,
+`RecoveryProgress`, inventory fields and backup schemas read by older workers.
+The record binds the owner baseline and consumed high-water mark to immutable
+source/reservation identities, branch/key/run and bare path/device/inode. It
+records the original source and an explicitly matched successor handoff. Device
+and inode remain part of the execution binding: a path alone cannot identify a
+replacement filesystem. A remount or volume reattach may invalidate that binding.
+An already-persisted `adoption_failed` or `budget_exhausted` block can still be
+reheld through exact journal/source/episode verification and the existing fenced
+park route; adoption also requires fresh quiescence as above. This reporting path
+neither rebinds accounting nor consumes an owner grant, captures work or admits a
+model. Active reservations and successor handoffs retain the owner-bound snapshot
+checks. Invalid accounting still refuses renewed execution; retained work may
+need export/recovery when its recorded storage identity cannot be verified. Its
+canonical parser and match predicates are in
+[recovery-owner.ts](../agent/src/recovery-owner.ts); the locked read/write,
+reservation and handoff operations are in [git.ts](../agent/src/git.ts).
+
+Under the bare-repository lock, charging writes and reads back a **pending**
+owner record that burns the grant, writes and reads back the journal reservation,
+then writes and reads back a **committed** owner record before returning authority.
+A crash before the journal write consumes the grant conservatively. A pending
+record whose exact after-reservation landed settles accounting only, leaves the
+journal unchanged and stops that invocation without manufacturing an adoption
+failure. Neither case authorizes execution under the interrupted charge.
+
+When the exact before-journal remains, a later owned claim with a generation
+strictly newer than the interrupted charge can fund a new reservation. A blocked
+`adoption_failed` journal additionally requires a raw owner grant above the
+consumed high-water mark; a burned grant is never replayed. First charges,
+nonblocked recovery and `budget_exhausted` renewals retain their existing budget
+and episode guards, without requiring an extra owner grant. The replacement
+uses the same pending, precharge and committed readback sequence. A claim that
+cannot replace the pending charge stops or reholds an already-persisted blocker;
+it does not relabel an accounting interruption as an integrity refusal.
+Uncertain writes stop with sources retained.
+
+The read-only owner-eligibility probe reuses retained-I/O classification. Only
+`EAGAIN`, `EMFILE`, `ENFILE` or `ENOMEM` with OS syscall metadata stops the claim
+nonterminal for the existing bounded claim-recovery policy to retry. No charge,
+accounting write, capture, model or held report occurs; the same unspent owner
+grant may be rechecked on the next owned claim. No deadline is inferred for this
+classification. Deterministic identity/journal errors, unknown errors, missing
+syscall evidence and unreadable error metadata keep the existing fail-closed
+handling rather than looping. Credential and lifecycle controls retain precedence.
+
+The baseline is established before adoption can fail, on an eligible nonblocked
+charge or a valid legacy `budget_exhausted` renewal under the existing episode
+and fresh-claim guards. With a valid raw owner value, that renewal records the
+current value as both baseline and consumed high-water through the same pending,
+precharge and committed readbacks. It creates no additional owner grant; a later
+adoption retry still needs a new owner Resume. A missing baseline on an
+already-blocked `adoption_failed` journal is never reconstructed from the next
+claim. The consumed high-water mark survives episode completion,
+explicit discard and verified retirement: removing recovery evidence does not
+mint another owner grant. This accounting record supplies no source-deletion,
+custody-release or model authority by itself.
+
+### Custody, rollout and remaining limits
+
+The custody classifier includes this cause in its OPEN-hold exception, after
+discarded/released precedence and before archive readiness or capture progress:
+failed latest capture yields `needs_action`, otherwise `source_only`. Leaving
+the park restores existing proof-based release rules. An earlier archive remains
+exportable independently and may omit latest local edits. Custody can block
+worker image rolls (#3103); each Resume's fresh claim opens another counted hold
+and repeated failures may retain successor paths on disk (#3329/#2445).
+Same-worker affinity is retained, but a peer after worker death or affinity
+expiry can run a published checkpoint without the original local journal,
+potentially behind retained work. This amendment does not eliminate that risk.
+
+Deploy the API fully before consuming the feature on workers. Mixed API replicas
+and API rollback remain unsupported as inherited from #3495. New accounting is
+external to the old strict journal/progress/inventory schemas: the actual older
+parser, progress and inventory reader can accept these journals; the older
+worker still refuses `adoption_failed` terminally with sources and custody kept.
+The compatibility fixture is
+[recovery-owner-rollback.test.ts](../agent/test/recovery-owner-rollback.test.ts);
+it was executed against the actual predecessor implementations from an isolated
+export, including old blocked-adoption refusal and unchanged budget renewal.
+This is an explicit local compatibility proof: the fixture requires
+`UZI_M2_OLD_EXPORT` pointing at that export and skips when it is absent. Ordinary
+CI invocations do not repeat this predecessor proof automatically.
+
+The additive cause migration replaces a CHECK in a transaction, with table-scan
+and locking risk; there is no online migration component. Its Down converts
+this cause's held runs to terminal `worker_lost`, preserving custody and sources;
+that conversion is not recovery success and does not make rolling API downgrade
+supported. No database counter is added. The budget-exhaustion contract, strict
+backup schemas and verification before model execution remain unchanged.

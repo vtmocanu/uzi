@@ -2274,9 +2274,10 @@ type OneLineRun =
   | { readonly kind: "done"; readonly line: string | undefined; readonly code: number | null; readonly breach?: string }
   | StillRunningMode
   | { readonly kind: "spawn"; readonly message: string };
+type CompletedOneLineRun = Extract<OneLineRun, { kind: "done" }>;
 type StillRunningMode =
-  | { readonly kind: "timeout"; readonly pid?: number; readonly closed: Promise<void> }
-  | { readonly kind: "aborted"; readonly pid?: number; readonly closed: Promise<void> };
+  | { readonly kind: "timeout"; readonly pid?: number; readonly closed: Promise<void>; readonly completion?: Promise<CompletedOneLineRun> }
+  | { readonly kind: "aborted"; readonly pid?: number; readonly closed: Promise<void>; readonly completion?: Promise<CompletedOneLineRun> };
 
 /** One run of a one-line mode: spawn, read at most two lines (a second is a breach),
  *  and settle at `close`, the deadline, or an abort of `signal`. An already-aborted
@@ -2299,7 +2300,9 @@ function runOneLineMode(
     let breach: string | undefined;
     let markClosed!: () => void;
     const closed = new Promise<void>((r) => { markClosed = r; });
-    const onAbort = (): void => settle({ kind: "aborted", pid: child?.pid, closed });
+    let complete!: (outcome: CompletedOneLineRun) => void;
+    const completion = new Promise<CompletedOneLineRun>(resolve => { complete = resolve; });
+    const onAbort = (): void => settle({ kind: "aborted", pid: child?.pid, closed, completion });
     const settle = (value: OneLineRun): void => {
       if (settled) return;
       settled = true;
@@ -2307,7 +2310,7 @@ function runOneLineMode(
       signal?.removeEventListener("abort", onAbort);
       resolve(value);
     };
-    const timer = setTimeout(() => settle({ kind: "timeout", pid: child?.pid, closed }), timeoutMs);
+    const timer = setTimeout(() => settle({ kind: "timeout", pid: child?.pid, closed, completion }), timeoutMs);
     if (typeof timer.unref === "function") timer.unref();
     signal?.addEventListener("abort", onAbort, { once: true });
     try {
@@ -2324,7 +2327,9 @@ function runOneLineMode(
     readModeLines(child.stdout, 1, (line) => lines.push(line), (why) => { breach = why; });
     child.once("close", (code: number | null) => {
       markClosed();
-      settle({ kind: "done", line: lines.length === 1 ? lines[0] : undefined, code, ...(breach ? { breach } : {}) });
+      const outcome: CompletedOneLineRun = { kind: "done", line: lines.length === 1 ? lines[0] : undefined, code, ...(breach ? { breach } : {}) };
+      complete(outcome);
+      settle(outcome);
     });
   });
 }
@@ -2448,6 +2453,8 @@ export async function reapCodexCommandOrphans(deps: StandaloneModeDeps = {}): Pr
  *  running and settles on its own). `error` is a worker-side failure ("spawn",
  *  "protocol", "exited", "token") or a cache_error reason. */
 export interface CacheCleanupResult {
+  /** Actual process/channel settlement when delivery returned pending. Never a retry. */
+  readonly settlement?: Promise<CacheCleanupResult>;
   readonly state: "removed" | "absent" | "retained" | "pending" | "error";
   readonly reason: string;
 }
@@ -2492,7 +2499,9 @@ export async function removeCommandCache(token: string, deps: StandaloneModeDeps
     const run = await runOneLineMode("--remove-cache", token, deps.timeoutMs ?? DEFAULT_REMOVE_CACHE_TIMEOUT_MS, deps);
     if (run.kind === "spawn") return { state: "error", reason: "spawn" };
     // Not killed: the remover keeps running and removes or retains on its own.
-    if (run.kind !== "done") return { state: "pending", reason: "" };
+    if (run.kind !== "done") return { state: "pending", reason: "", settlement: run.completion?.then(outcome =>
+      outcome.breach !== undefined || outcome.line === undefined ? { state: "error", reason: "protocol" }
+        : parseCacheOutcome(outcome.line, outcome.code, "remove") ?? { state: "error", reason: "protocol" }) };
     if (run.breach !== undefined || run.line === undefined) return { state: "error", reason: "protocol" };
     return parseCacheOutcome(run.line, run.code, "remove") ?? { state: "error", reason: "protocol" };
   } catch {
@@ -2680,7 +2689,16 @@ export async function startCommandCacheHolder(token: string, deps: StandaloneMod
         waiters.add(check);
         releaseTimer = setTimeout(() => {
           waiters.delete(check);
-          resolve({ state: "pending", reason: "" });
+          const settlement = new Promise<CacheCleanupResult>(done => {
+            const actual = (): void => {
+              if (!closed) return;
+              waiters.delete(actual);
+              done(settledOutcome() ?? { state: "error", reason: "protocol" });
+            };
+            waiters.add(actual);
+            actual();
+          });
+          resolve({ state: "pending", reason: "", settlement });
         }, Math.max(0, releaseTimeoutMs));
         if (typeof releaseTimer.unref === "function") releaseTimer.unref();
         check();

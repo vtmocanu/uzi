@@ -80,6 +80,7 @@ func newClaudeCheckerFix(t *testing.T, bindMode string) *claudeCheckerFix {
 		VALUES ($1,'plan',1,1,$2,$3,'s',$4,$5,$6,$7,'claude',now()+interval '30 minutes',now()-interval '90 seconds')`,
 		fx.lead, c.PlanMd, c.Milestones, c.BaseCommit, c.PlanningDiff, digest, fx.kid)
 	fx.svc = New(env.q, env.box, testParams())
+	fx.svc.SetVault(env.vlt)
 	fx.svc.SetTxBeginner(env.pool)
 	return fx
 }
@@ -340,8 +341,8 @@ func TestClaudeCheckerChildVaultLockedStaysTransientLiveDB(t *testing.T) {
 }
 
 // PRD #2151 x #2460: the Plan cross-check x Claude cell reaches the Claude checker. A pin is
-// delivered with model_source=pin; with the cell at Default the checker follows the owner's
-// Claude lanes (default_claude_model / default_effort), never the Codex lanes.
+// delivered with model_source=pin; with the cell at Default the checker model follows the
+// owner's Claude model lane (never the Codex lanes) and its effort is the cross-check default.
 func TestClaudeCheckerChildPinsLiveDB(t *testing.T) {
 	for _, tc := range []struct {
 		name                                             string
@@ -349,8 +350,9 @@ func TestClaudeCheckerChildPinsLiveDB(t *testing.T) {
 		wantModel, wantEffort, modelSource, effortSource string
 	}{
 		{"pinned sonnet", "sonnet", "high", "sonnet", "high", "pin", "pin"},
-		{"model-only pin keeps the worker effort", "sonnet", nil, "sonnet", "low", "pin", "worker default"},
-		{"Default follows the Claude worker lanes", nil, nil, "opus", "low", "worker default", "worker default"},
+		{"model-only pin uses the cross-check effort", "sonnet", nil, "sonnet", "high", "pin", "cross-check default"},
+		{"Default follows the Claude model lane, not its low effort", nil, nil, "opus", "high", "worker default", "cross-check default"},
+		{"medium effort pin kept", nil, "medium", "opus", "medium", "worker default", "pin"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fx := newClaudeCheckerFix(t, BindModePinned)

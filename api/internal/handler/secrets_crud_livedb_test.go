@@ -18,11 +18,11 @@ import (
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // secretsCRUDHandler builds a live-DB Handler for the PRD #104 M2 token CRUD: real
-// pool (so the advisory-lock transaction actually runs), real box (nil vault → the
-// master-box seal path, which is all these tests need), no poker.
+// pool and policy-aware vault. mkSecretUser explicitly chooses unprotected mode.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres
 // (./e2e/run-store-it.sh provides one and sweeps this package for the LiveDB suffix).
@@ -42,6 +42,7 @@ func secretsCRUDHandler(t *testing.T) (*Handler, *pgxpool.Pool) {
 	}
 	t.Cleanup(pool.Close)
 	h := &Handler{pool: pool, q: store.New(pool), box: newHandlerTestBox(t)}
+	h.vault = vault.NewPostgres(h.box, pool)
 	return h, pool
 }
 
@@ -49,7 +50,7 @@ func mkSecretUser(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
 	t.Helper()
 	u := uuid.New()
 	if _, err := pool.Exec(context.Background(),
-		`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		`INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`,
 		u, fmt.Sprintf("secrets-crud-%s@e2e", u)); err != nil {
 		t.Fatalf("insert user: %v", err)
 	}

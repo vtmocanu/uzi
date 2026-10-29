@@ -15,6 +15,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // PRD #1795 M1 live-DB coverage of plan-gate revision allocation, against the real migrated
@@ -62,6 +63,7 @@ func newGateFix(t *testing.T, maxRefusals int) *gateFix {
 	params := testParams()
 	params.RunGateRefusalMax = maxRefusals
 	svc := New(q, box, params)
+	svc.SetVault(vault.NewPostgres(box, pool))
 	svc.SetTxBeginner(pool)
 	f := &gateFix{t: t, ctx: ctx, pool: pool, q: q, svc: svc, userID: uuid.New(), repoID: uuid.New()}
 
@@ -74,7 +76,7 @@ func newGateFix(t *testing.T, maxRefusals int) *gateFix {
 	if err != nil {
 		t.Fatalf("seal anthropic token: %v", err)
 	}
-	f.exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, f.userID, fmt.Sprintf("gate1795-%s@e2e", f.userID))
+	f.exec(`INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`, f.userID, fmt.Sprintf("gate1795-%s@e2e", f.userID))
 	f.exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 	      VALUES ($1, $2, 'github', 'https://forge.e2e', 'bot', 1, $3)`, connID, f.userID, sealedPAT)
 	f.exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)

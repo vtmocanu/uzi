@@ -9,7 +9,7 @@ import (
 )
 
 // The live test executes today's creators. This guard also covers a future
-// creator that copies a repo hint but forgets the matching frozen policy.
+// creator that copies a repo hint but forgets frozen hint origin or policy.
 func TestRepoHintCreatorsSnapshotIgnoredInference(t *testing.T) {
 	files, err := filepath.Glob("queries/*.sql")
 	if err != nil {
@@ -51,8 +51,8 @@ func TestRepoHintCreatorsSnapshotIgnoredInference(t *testing.T) {
 			seenCreateRun = seenCreateRun || name == "CreateRun"
 			seenPlanChild = seenPlanChild || name == "CreatePlanCrossCheckChild"
 			columns := columnsRE.FindStringSubmatch(query)
-			if len(columns) != 2 || !strings.Contains(columns[1], "ignored_inferred_capabilities") || !copiesPolicy {
-				t.Errorf("%s in %s copies the repo hint without its ignored-inference snapshot", name, path)
+			if len(columns) != 2 || !strings.Contains(columns[1], "ignored_inferred_capabilities") || !copiesPolicy || !strings.Contains(columns[1], "hinted_capabilities") {
+				t.Errorf("%s in %s copies the repo hint without its frozen hint/policy snapshots", name, path)
 			}
 		}
 	}

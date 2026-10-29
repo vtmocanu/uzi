@@ -139,10 +139,21 @@ func (h *Handler) TestMySecret(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) testAnthropicSecret(ctx context.Context, userID, id uuid.UUID, rev int64) secretTestResult {
 	row, err := h.q.GetAnthropicTokenToPoll(ctx, store.GetAnthropicTokenToPollParams{UserID: userID, SecretID: pgconv.UUID(id)})
-	if err != nil || row.EnablementRev != rev {
+	if err != nil || row.ID != id || row.UserID != userID || row.EnablementRev != rev {
 		return secretTestResult{Status: "inconclusive", Reason: "superseded"}
 	}
-	plain, err := secretopen.OpenSealed(h.vault, h.box, userID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext)
+	plain, err := secretopen.OpenSealedAtEpoch(ctx, h.vault, h.box, userID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext, row.VaultEpoch)
+	if err == store.ErrVaultSealStale {
+		fresh, lookupErr := h.q.GetAnthropicTokenToPoll(ctx, store.GetAnthropicTokenToPollParams{UserID: userID, SecretID: pgconv.UUID(id)})
+		if lookupErr != nil || fresh.ID != row.ID || fresh.UserID != row.UserID ||
+			fresh.EnablementRev != row.EnablementRev || fresh.AnthropicSuccessGeneration != row.AnthropicSuccessGeneration {
+			return secretTestResult{Status: "inconclusive", Reason: "superseded"}
+		}
+		plain, err = secretopen.OpenSealedAtEpoch(ctx, h.vault, h.box, userID, store.KindAnthropicToken, fresh.SealedWith, fresh.Ciphertext, fresh.VaultEpoch)
+	}
+	if err == store.ErrVaultSealStale {
+		return secretTestResult{Status: "inconclusive", Reason: "superseded"}
+	}
 	if errors.Is(err, secretopen.ErrVaultLocked) {
 		return secretTestResult{Status: "inconclusive", Reason: "vault_locked"}
 	}

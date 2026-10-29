@@ -11,6 +11,7 @@ import (
 
 func TestRunGetPlanCrossCheckSources(t *testing.T) {
 	pin, worker, future := "pin", "worker default", "future\n\x1b[31m\u202e"
+	checkDefault := "cross-check default"
 	for _, tc := range []struct {
 		name                  string
 		model, effort         *string
@@ -18,6 +19,8 @@ func TestRunGetPlanCrossCheckSources(t *testing.T) {
 	}{
 		{"model pin", &pin, &worker, "pin", "worker default"},
 		{"effort pin", &worker, &pin, "worker default", "pin"},
+		{"cross-check default effort", &worker, &checkDefault, "worker default", "cross-check default"},
+		{"cross-check default is never a model source", &checkDefault, &pin, "unknown", "pin"},
 		{"legacy", nil, nil, "unknown", "unknown"},
 		{"unrecognised", &future, &future, "unknown", "unknown"},
 	} {

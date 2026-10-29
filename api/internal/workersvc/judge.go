@@ -1273,19 +1273,20 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 		// judge runner threads this onto its running/completed reports + usage batch — omitting it
 		// (a non-pointer int64, so 0) makes the server fence every capability worker's judge as
 		// stale (ErrMissingClaimGeneration / staleClaim), silently breaking the whole judge lane.
-		ClaimGeneration:        run.ClaimGeneration,
-		WorkerRecoveryEpisode:  claimRecoveryEpisode(run),
-		IssueTitle:             run.IssueTitle,
-		IssueDescription:       run.IssueDescription,
-		Status:                 run.Status,
-		TargetRunID:            targetRunID,
-		JudgeModel:             judgeModel,
-		JudgeSignal:            signal,
-		FailureClass:           failureClass,
-		TargetCostStatus:       targetCostStatus,
-		TargetCostUSD:          targetCostUSD,
-		KnownImproveUziTargets: knownTargets,
-		SessionID:              textPtr(run.SessionID),
+		ClaimGeneration:            run.ClaimGeneration,
+		WorkerRecoveryEpisode:      claimRecoveryEpisode(run),
+		WorkerRecoveryOwnerEpisode: run.WorkerRecoveryEpisode,
+		IssueTitle:                 run.IssueTitle,
+		IssueDescription:           run.IssueDescription,
+		Status:                     run.Status,
+		TargetRunID:                targetRunID,
+		JudgeModel:                 judgeModel,
+		JudgeSignal:                signal,
+		FailureClass:               failureClass,
+		TargetCostStatus:           targetCostStatus,
+		TargetCostUSD:              targetCostUSD,
+		KnownImproveUziTargets:     knownTargets,
+		SessionID:                  textPtr(run.SessionID),
 		// PRD #1429 M3: recordedLastSeq starts at run.LastSeq and only advances if the D6
 		// model-fallback note above landed one — the judge lane never emits a
 		// 'credential_switch' message (recordRunCredential's return is discarded above), so

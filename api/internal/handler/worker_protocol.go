@@ -402,6 +402,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // worker never sends the snapshot — the same shape an old worker sees.
 func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []string {
 	groups := [][]string{
+		{workersvc.CapabilityEvidenceFeature},
 		{"heartbeat_protocol_refresh_v1"},
 		{"codex_account_admission_signal_v1"},
 		{"codex_account_operation_admission_v1"},
@@ -433,7 +434,9 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		// the cause and counts the park toward UZI_RUN_DISK_PARK_MAX. Advertised UNCONDITIONALLY
 		// (no config gates the park; 0 only lifts the cap): a worker must see it before sending
 		// the cause or the flag, because an older api 400s both.
+		{"recovery_cause_codex_idle_stall_v1"},
 		{"recovery_cause_retained_recovery_exhausted"},
+		{"recovery_cause_retained_recovery_adoption_failed"},
 		{"recovery_cause_data_volume_full"},
 		// PRD #1733: this api accepts {status:"recovery_wait", recovery_cause:"provider_outage"}
 		// with the optional productive_turns count, stores and counts the typed park, bounds an

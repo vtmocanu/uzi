@@ -58,7 +58,7 @@ func TestCrossCheckRoundsPinsAttemptProvenanceLiveDB(t *testing.T) {
 	env, svc, w, lead, c := roundsPinsFixture(t)
 	first := roundsPinsSubmit(t, env, svc, w, lead, c, 1)
 	p := roundsPinsClaim(t, env, svc, w, first)
-	if p.Config.DefaultModel == nil || *p.Config.DefaultModel != "gpt-6-sol" || p.Config.DefaultEffort == nil || *p.Config.DefaultEffort != "high" || p.CrossCheck.ModelSource == nil || *p.CrossCheck.ModelSource != "worker default" || p.CrossCheck.EffortSource == nil || *p.CrossCheck.EffortSource != "worker default" {
+	if p.Config.DefaultModel == nil || *p.Config.DefaultModel != "gpt-6-sol" || p.Config.DefaultEffort == nil || *p.Config.DefaultEffort != "high" || p.CrossCheck.ModelSource == nil || *p.CrossCheck.ModelSource != "worker default" || p.CrossCheck.EffortSource == nil || *p.CrossCheck.EffortSource != "cross-check default" {
 		t.Fatal("round 1 defaults not delivered")
 	}
 	roundsPinsRevise(t, env, svc, w, first)

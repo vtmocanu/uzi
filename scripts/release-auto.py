@@ -85,7 +85,7 @@ def nightly_window(stamp):
     try:
         zone = ZoneInfo('Europe/Bucharest')
         day = dt.datetime.fromisoformat(stamp.replace('Z', '+00:00')).astimezone(zone).date()
-        return tuple(dt.datetime.combine(day, dt.time(hour), zone).timestamp() for hour in (6, 7))
+        return tuple(dt.datetime.combine(day, dt.time(hour), zone).timestamp() for hour in (8, 9))
     except (ValueError, OverflowError, ZoneInfoNotFoundError):
         raise Stop('invalid-nightly-window') from None
 
@@ -310,7 +310,7 @@ class Release:
                 raise Stop('nightly-disabled', 'no-op')
             now = self.wall_time()
             cutoff = nightly_cutoff(self.config['created_at'], now, reserve=600)
-            seconds = min(seconds, cutoff - 600 - now)
+            seconds = cutoff - 600 - now
         deadline_reason = 'tip-not-green-by-cutoff' if self.config['scheduled'] else 'tip-not-green-by-deadline'
         started = self.clock()
         deadline, retried, pending_retry = started + seconds, False, None

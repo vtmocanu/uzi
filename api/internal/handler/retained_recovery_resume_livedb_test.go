@@ -12,6 +12,14 @@ import (
 // Exercise owner admission as well as the SQL cause filters. A pending retry is
 // resumable now; the execution fence and source-worker affinity survive it.
 func TestRetainedRecoveryOwnerResumeLiveDB(t *testing.T) {
+	for _, cause := range []string{"retained_recovery_exhausted", "retained_recovery_adoption_failed"} {
+		t.Run(cause, func(t *testing.T) {
+			testRetainedRecoveryOwnerResumeLiveDB(t, cause)
+		})
+	}
+}
+
+func testRetainedRecoveryOwnerResumeLiveDB(t *testing.T, cause string) {
 	for _, timed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("timed=%v", timed), func(t *testing.T) {
 			fx := newEphemeralFixture(t, false)
@@ -20,13 +28,13 @@ func TestRetainedRecoveryOwnerResumeLiveDB(t *testing.T) {
 			w := fx.onlineWorker("retained-resume", true)
 			id := fx.queuedRun([]string{})
 			_, err := fx.pool.Exec(fx.ctx, `UPDATE runs SET status='recovery_wait',
-				worker_id=$2, claim_generation=7, claim_released_at=now(),
-				recovery_wait_cause='retained_recovery_exhausted',
-				recovery_retry_not_before=CASE WHEN $3::boolean THEN now()+interval '1 hour' END,
-				retained_park_count=1, worker_recovery_episode=0,
-				requeue_count=7, requeue_episode_baseline=5,
-				started_at=now()-interval '10 minutes', budget_wall_seconds=3600,
-				status_since=now()-interval '2 minutes' WHERE id=$1`, id, w, timed)
+		worker_id=$2, claim_generation=7, claim_released_at=now(),
+		recovery_wait_cause=$4,
+		recovery_retry_not_before=CASE WHEN $3::boolean THEN now()+interval '1 hour' END,
+		retained_park_count=1, worker_recovery_episode=0, idle_stall_park_count=4,
+		requeue_count=7, requeue_episode_baseline=5,
+		started_at=now()-interval '10 minutes', budget_wall_seconds=3600,
+		status_since=now()-interval '2 minutes' WHERE id=$1`, id, w, timed, cause)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -46,7 +54,7 @@ func TestRetainedRecoveryOwnerResumeLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			if after.Status != "queued" || after.WorkerRecoveryEpisode != 1 || after.RetainedParkCount != 1 ||
-				after.RequeueCount != 7 || after.RequeueEpisodeBaseline != 7 ||
+				after.RequeueCount != 7 || after.RequeueEpisodeBaseline != 7 || after.IdleStallParkCount != before.IdleStallParkCount ||
 				after.ClaimReleasedAt != before.ClaimReleasedAt || after.WorkerID != before.WorkerID ||
 				after.StartedAt != before.StartedAt || after.BudgetPausedSeconds < 120 ||
 				after.RecoveryRetryNotBefore.Valid || after.RecoveryWaitCause.Valid {

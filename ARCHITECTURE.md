@@ -385,16 +385,36 @@ one every unbound consumer resolves (PRD #104). The
 single 32-byte key that `config.Load` validates from `UZI_SECRET_KEY` at boot
 (refusing to start if it is missing, malformed, or a low-entropy placeholder)
 and then builds, already validated, into one `*secretbox.Box` shared by every
-handler (see [docs/configuration.md](docs/configuration.md)). **Since the
-per-user vault (PRD #32), this master box is no longer the normal sealing
-path**: a secret is sealed under the owner's own 256-bit DEK once their vault
-has been unlocked once, and the master box is reserved for a row that has
-never been rewrapped plus one narrow Codex exception — a refresh's *recovery*
-copy is sealed under the master box only while the owner's vault happens to
-be locked at that exact moment, then re-sealed under the DEK on the next
-reconcile pass. See [docs/vault-threat-model.md](docs/vault-threat-model.md)
-for the full model. Either way, rotating `UZI_SECRET_KEY` invalidates every
-row still master-sealed, across every feature at once, not just one.
+handler (see [docs/configuration.md](docs/configuration.md)). Personal
+credentials have explicit **protected** and **unprotected** modes. Protected
+users seal with a per-user 256-bit DEK wrapped by a password-derived KEK;
+login/unlock caches that DEK until explicit lock or API restart. Off users
+have no wrapper or unlock dependency and seal under the master key using
+`master_aad`. The protected Codex refresh recovery-slot exception also uses
+`master_aad` while locked, then re-seals under the DEK during reconciliation.
+AAD binds to the raw user UUID, a zero byte and credential kind; legacy
+`master` (nil AAD) stays readable and unknown markers fail closed.
+
+Mode changes atomically convert personal secrets and both Codex account
+slots behind the per-user lifecycle mutex and transactional mode/monotonic
+epoch fences. Keys publish after commit; the cache mutex does not span I/O.
+Ordinary writers check mode and epoch in their transaction, including provider
+result persistence without a second exchange. Enrollment/disable take shared
+settings admission before the user-secret advisory guard and owner state;
+admin policy edits take exclusive admission. Claim finishers retain their
+run/alias/account NOWAIT exception without waiting for lifecycle/advisory
+locks. Promotions and poller pokes follow commit and lifecycle-mutex release.
+
+The database-only policy chooses new-user mode; it does not convert existing
+users. An empty database starts Optional before seed-admin creation; a database
+with any users starts Required, marking existing users protected without
+rewriting ciphertext. Required leaves existing Off users runnable with an
+enrollment prompt. The supported API boundary is **singleton/Recreate**, with
+no mixed-version API operation. See
+[ADR-3507](adr/3507-optional-credential-vault.md) for lock order, bounded
+conversion, uncertain commits and rollback restrictions, and
+[the vault threat model](docs/vault-threat-model.md) for residual risks.
+Rotating `UZI_SECRET_KEY` invalidates rows still master-sealed across features.
 
 The API around it is deliberately minimal, and **every read is metadata only**:
 `GET /api/me/secrets` returns `id`, `kind`, `label`, `is_default` and
@@ -445,7 +465,7 @@ rule and the failure/backoff semantics; user-facing behavior is in
 A sibling background engine (`api/internal/codexusagepoller`) does the same
 job for a linked Codex **subscription** account, entirely idle (no worker,
 run, or model call): it opens the account's committed login through the same
-vault-then-master path above, reads its rate-limit buckets from the fixed
+mode/epoch-aware opening path above, reads its rate-limit buckets from the fixed
 Codex usage host (redirects refused, response body size-bounded), and
 upserts one JSONB snapshot per **canonical account**
 (`codex_account_rate_limits`, keyed `(user_id, provider_account_id)` against
@@ -469,7 +489,7 @@ when its durable receipt authorizes reuse. Admission consumes the retry under
 user secret mutation/account/intent locks with a fresh database clock and an
 enabled linked alias; local vault/login failures defer without consumption.
 Recovered material stays quarantined until identity-verified promotion. The
-survivor and account-action display share a 52.14-second in-flight policy bound;
+survivor and account-action display share an 832.14-second in-flight policy bound;
 owner restore advances the generation and fences stale installs. Mixed API
 versions are unsupported for receipt-aware resolution/display. See
 [ADR-3523](adr/3523-codex-refresh-provider-error-reuse.md) for the fixed 30-minute
@@ -1538,17 +1558,22 @@ chain in the diagram above, with no intervening `running`.
   one per run backing a healthy current claim without an owner decision;
   total custody remains protected. After discarded/released precedence, an OPEN
   hold at `recovery_wait` for `worker_requeue_exhausted`,
-  `worker_memory_pressure`, or `retained_recovery_exhausted` reports
+  `worker_memory_pressure`, `retained_recovery_exhausted`, or
+  `retained_recovery_adoption_failed` reports
   `needs_action` after failed latest capture,
   otherwise `source_only`, before available unguarded archives or capture
   progress. Retained-recovery exhaustion keeps this conservative protection
   for both timed retries and NULL-stamp owner holds throughout `recovery_wait`.
+  Adoption failure is owner-held with no automatic retry. Its renewal requires
+  a fresh owned claim and unconsumed raw owner grant; the external bare-config
+  `uzi-recoveryowner.<runId>.record` precharges accounting outside the strict
+  recovery journal and inventory schemas. It grants no custody or deletion authority.
   After timer promotion or owner Resume, existing proof-based release rules
   apply again; execution-claim release alone never permits source deletion.
   Archive availability remains independent of attention and does not release
   these causes' custody; other classifier decisions remain unchanged.
   See [ADR-2445](adr/2445-custody-admission-accounting.md),
-  [ADR-2396](adr/2396-worker-memory-guard.md), and the #3495 amendment in
+  [ADR-2396](adr/2396-worker-memory-guard.md), and the #3495 and #3527 amendments in
   [ADR-1197](adr/1197-transient-recovery-park.md).
   The **archive capture** (`recovery_captures`) is the later,
   immutable, encrypted artifact bound to that hold. PRD #1349 hardens the
@@ -1858,6 +1883,62 @@ worker) and not a deny-by-default allowlist (too narrow for the coder
 subagent's legitimate file/bash needs). Read-only roles (reviewer, tester)
 are constrained per-subagent via their `tools` allowlist instead, since
 subagents inherit the parent's permission mode and cannot loosen it.
+
+### Worker-private completion authority (#3404)
+
+Whether a worker may delete a completed run's retained source (the attempt clone,
+its bare journal, paired skills, bundles and cohort records) after a restart is
+decided by state only the worker can write, never by the api, a process scan or a
+Docker listing. This sits beside the guardrail layers above: it protects
+worker-only work from being retired on a guess. Rationale, write ordering and
+costs are in the
+[#3404 amendment to ADR-1783](adr/1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement);
+this section is the map.
+
+- **Locks** (`agent/src/authority-lock.ts`). The worker takes a lifetime lock W
+  (util-linux `flock` on a private file under `<dataDir>/.uzi-authority`) in
+  `main.ts` before `ensureRunnerTmpdir`, registration, sweeps or admission (with
+  `UZI_EPOCH_LOCK=1` the pod-epoch bootstrap P runs first) and never releases it,
+  so a second current worker on the same volume refuses to start (a pre-#3404
+  worker takes no lock). It refuses non-normalized data-dir spellings and a
+  final-component symlink; the authority store separately refuses an aliased
+  spelling, so such a worker starts but refuses protected source operations. A per-transaction lock A
+  in the same directory serializes authority changes. Order:
+  `P -> W -> A -> C -> S -> J -> B -> O`.
+- **Authenticated slots** (`agent/src/completion-authority.ts`). Each source path
+  has one MAC-authenticated slot under `<dataDir>/.uzi-authority`
+  (`active`, `claude_ready`, `sealed`, `ineligible`, `retiring`, `retired`); the
+  MAC key is derived from the worker join token. Before a source is used, a fresh
+  epoch is installed in an `active` slot, so a successor process cannot adopt a
+  foreign epoch.
+- **Codex lifetime seal** (`agent/src/codex/executor-lifetime.ts`). A Codex
+  executor's admission fence is monotonic and irreversible; Codex eligibility
+  requires `sealed`. A fresh Claude source uses `claude_ready`, which carries no
+  seal.
+- **Publication and the bare-journal fence.** When a flight ends
+  (`endFlightSourceUse` in `agent/src/runner.ts`) the worker certifies the source,
+  writes a fence `{version, sourceUseEpoch, sourceCoreDigest}` as the last key of
+  the completing bare journal, rewrites the cohort records, and publishes the slot
+  transition last. A failure at any step leaves the slot unpublished. A journal
+  carrying the fence is rejected by an older worker's parser (the accepted
+  rollback fence).
+- **Restart retirement** (`forgetCompletedGeneration` and
+  `verifyDurableRetirement` in `agent/src/recovery.ts`). A persisted completed
+  source is released only when the slot is published, the cohort and fence match
+  the certified source, and the existing receipt, custody and liveness checks pass.
+  Destruction is a `retiring` transaction with a manifest in deletion order,
+  ending in a never-collected `retired` tombstone. The guarded operator discard is
+  the only takeover. Legacy, unauthenticated, partial, corrupt, unproven and
+  crashed-`active` sources are retained.
+
+Residuals, none closed here (#2852 is not completed): Docker
+accepted-but-invisible creates (#1860) and unregistered or sibling writers; Claude
+terminal proof (`claude_ready` rests on the existing quiescence checks); the
+custody reclaim and SETTLE/CLEANUP separation (#2746), automatic reclaim (#1858)
+and per-attempt cgroups (#1862); and unbounded retention, since there is no TTL,
+cap or disk-pressure reclaim and capacity cost is unknown. Hosted and
+multi-worker acceptance of the crash behavior is a separate human step and is not
+claimed.
 
 ### Live message stream
 
@@ -2707,12 +2788,29 @@ The health registry supplies each check's `scope` (#2293): `db`,
 the rest are `owner`. `fleet.roll` remains instance infrastructure even for a single owner.
 The server emits `blocking` on every document, true exactly when an instance
 check is danger. Overall status, counts, attention pips, history and CLI exit
-status still cover the full registry. Episodes, admin Slack notices, banner
+status still cover the full registry. Episodes, admin Slack notices, Danger banner
 and snooze follow `blocking`, superseding #2271's overall-episode timing:
 the opening tick sends nothing; the next still-blocking tick claims a notice
 per admin with instance-danger checks. Clearing instance danger closes and
 rearms even if owner danger remains. Owner-only danger opens no episode,
-sends no admin DM and raises no banner; owner run-health routing is unchanged.
+sends no admin DM and raises no Danger banner; owner run-health routing is unchanged.
+
+A separate owner-Warn attention banner (#3589) requires the optional per-check
+`attention_banner: true`, `scope: owner` and `severity: warn`; it preserves server
+order. `recovery.storage` is the sole producer, opting in from its final
+owner/Warn result. False flags are omitted. This metadata
+does not affect severity, counts, status, blocking, episodes, Slack or CLI exits.
+The admin-only `HealthAttentionBanner`, keyed by `user.id`, mounts after Danger
+inside the shared `HealthStatusProvider` (one visible-tab 10-second poll).
+It renders React text in one polite status surface with Open health and per-check
+Dismiss. Dismissals are React state keyed by check ID, independent of episodes,
+navigation, summaries, counts and flags. Missing checks/flags and loading or failed
+polls retain dismissals; the provider keeps the last-good document on failure. An explicitly observed
+`ok`/`unknown`/`danger`/`na` in a successful document clears that ID even without
+a flag. Remount, reload or admin identity changes reset state. No browser storage,
+timer, write or snooze is added; Danger's per-admin, per-episode 1h snooze stays
+unchanged. See [attention banner](docs/admin-health.md#attention-banner) and
+[PRD #1484's decision log](prds/done/1484-admin-health-tab.md#scope-and-decision-log).
 
 Database storage has two signals, both from inside the api (no volume or
 Kubernetes access). A pgx query tracer on the pool

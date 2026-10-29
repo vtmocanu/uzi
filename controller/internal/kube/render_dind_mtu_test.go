@@ -51,7 +51,7 @@ type dindLaunchOptions struct {
 }
 
 // runRenderedDind executes the actual rendered Command and Args, replacing only
-// the sysfs positional argument. Discovery failures must launch the original daemon argv without config artifacts.
+// the sysfs positional argument. Discovery failures must preserve unchanged MTU defaults without config artifacts.
 func runRenderedDind(t *testing.T, dind corev1.Container, netDir string, options ...dindLaunchOptions) (dindLaunch, string, error) {
 	t.Helper()
 	if len(dind.Command) != 5 || dind.Command[0] != "/bin/sh" || dind.Command[1] != "-c" ||
@@ -214,7 +214,7 @@ func TestNonRootlessDindMTU(t *testing.T) {
 				t.Fatalf("launch: %v; stderr: %s", err, stderr)
 			}
 			want := []string{
-				"--host=tcp://127.0.0.1:2375", "--tls=false", "--mtu=" + tt.want,
+				"--host=tcp://127.0.0.1:2375", "--tls=false", "--dns-search=.", "--dns-opt=ndots:0", "--mtu=" + tt.want,
 				"--config-file=" + launch.configPath,
 			}
 			if !reflect.DeepEqual(launch.argv, want) {
@@ -341,9 +341,9 @@ func TestNonRootlessDindMTUDiscoveryFallback(t *testing.T) {
 			if err != nil {
 				t.Fatalf("discovery failure must preserve startup: %v; stderr=%q", err, stderr)
 			}
-			wantArgs := []string{"--host=tcp://127.0.0.1:2375", "--tls=false"}
+			wantArgs := []string{"--host=tcp://127.0.0.1:2375", "--tls=false", "--dns-search=.", "--dns-opt=ndots:0"}
 			if !reflect.DeepEqual(launch.argv, wantArgs) || launch.config != nil || launch.configPath != "" {
-				t.Fatalf("fallback launch = %#v, want exact original argv %q and no config", launch, wantArgs)
+				t.Fatalf("fallback launch = %#v, want exact argv %q with unchanged MTU defaults and no config", launch, wantArgs)
 			}
 			reason := "invalid MTU (expected decimal 1..65535): " + mtuPath
 			switch tt.name {
@@ -358,7 +358,7 @@ func TestNonRootlessDindMTUDiscoveryFallback(t *testing.T) {
 			case "missing-net-directory":
 				reason = "network interface directory unavailable: " + netDir
 			}
-			wantDiagnostic := "dind MTU warning: " + reason + "; starting dockerd with unchanged defaults\n"
+			wantDiagnostic := "dind MTU warning: " + reason + "; starting dockerd with unchanged MTU defaults\n"
 			if stderr != wantDiagnostic {
 				t.Fatalf("discovery diagnostic = %q, want %q", stderr, wantDiagnostic)
 			}

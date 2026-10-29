@@ -13,11 +13,11 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 type reuseWorkerStore struct {
 	*rejFakeStore
+	memory                                                             *memVaultStore
 	intent                                                             store.CodexRefreshIntent
 	accountReads, intentReads, admissions, writes, promotes, terminals int
 	live                                                               bool
@@ -57,7 +57,7 @@ func (f *reuseWorkerStore) SetCodexRecoverySlot(ctx context.Context, arg store.S
 	if f.writeErr != nil {
 		return 0, f.writeErr
 	}
-	if f.fenceLost {
+	if f.fenceLost || arg.Gen != f.acct.Generation || !f.acct.CoordOperationID.Valid || uuid.UUID(f.acct.CoordOperationID.Bytes) != arg.Op {
 		return 0, nil
 	}
 	f.acct.RecoverySealed = arg.Sealed
@@ -148,11 +148,20 @@ func newReuseWorker(t *testing.T) (*Service, *reuseWorkerStore, *reuseWorkerProv
 	}}
 	p := &reuseWorkerProvider{t: t, st: st, result: codexauth.RefreshResult{AccessToken: "reuse-access"}}
 	h.svc.q, h.svc.codexRefresh = st, p
+	h.svc.background = nil // each test explicitly owns any background retry
 	h.svc.now = func() time.Time { return now }
-	h.svc.vlt = vault.New(h.svc.box, newMemVaultStore())
+	memory := newMemVaultStore()
+	h.svc.vlt = newMemoryVault(h.svc.box, memory)
+	h.svc.SetTxBeginner(reuseWorkerBeginner{memory: memory})
+	st.memory = memory
 	if err := h.svc.vlt.Unlock(context.Background(), h.userID, "test-password"); err != nil {
 		t.Fatal(err)
 	}
+	state, err := memory.GetUserVaultState(context.Background(), h.userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.epoch = state.VaultEpoch
 	admit := func(_ context.Context, arg store.CodexRefreshReuseParams) (bool, error) {
 		if st.intent.ReuseAttemptedAt.Valid {
 			return false, nil
@@ -183,7 +192,7 @@ func TestCodexReuseWorkerSuccess(t *testing.T) {
 			if p.calls != 1 || p.discoveries != 1 || st.writes != 1 || st.promotes != 1 || st.accountReads != 2 || st.intentReads != 2 {
 				t.Fatalf("calls=%d discoveries=%d writes=%d promotes=%d reads=%d/%d", p.calls, p.discoveries, st.writes, st.promotes, st.accountReads, st.intentReads)
 			}
-			blob, err := s.openCodexAccountLogin(st.acct.UserID, st.acct)
+			blob, err := s.openCodexAccountLogin(context.Background(), st.acct.UserID, codexAccountSnapshot{CodexProviderAccount: st.acct, VaultEpoch: st.epoch})
 			if err != nil || blob.AccessToken != "reuse-access" || blob.RefreshToken != wantRefresh {
 				t.Fatal("incorrect merged promotion")
 			}
@@ -246,7 +255,7 @@ func TestCodexReuseWorkerDeferrals(t *testing.T) {
 					return false, errors.New("db unavailable")
 				}
 			}
-			applied, err := s.retryCodexRefreshReuse(context.Background(), st, st.acct, st.intent, admit)
+			applied, err := s.retryCodexRefreshReuse(context.Background(), st, codexAccountSnapshot{CodexProviderAccount: st.acct, VaultEpoch: st.epoch}, st.intent, admit)
 			if applied || p.calls != 0 || st.admissions != 0 || st.writes != 0 {
 				t.Fatal("deferral consumed or exchanged")
 			}
@@ -276,7 +285,7 @@ func TestCodexReuseWorkerProviderFailure(t *testing.T) {
 			if kind == "rejection_error" {
 				rej.err = errors.New("db unavailable")
 			}
-			applied, err := s.retryCodexRefreshReuse(ctx, st, st.acct, st.intent, admit)
+			applied, err := s.retryCodexRefreshReuse(ctx, st, codexAccountSnapshot{CodexProviderAccount: st.acct, VaultEpoch: st.epoch}, st.intent, admit)
 			if !applied || err != nil || p.calls != 1 || st.writes != 0 {
 				t.Fatal("wrong failed exchange handling")
 			}
@@ -330,7 +339,7 @@ func TestCodexReuseWorkerPersistenceExhausted(t *testing.T) {
 			if background {
 				s.background = func(fn func()) { bg = fn }
 			}
-			if applied, err := s.retryCodexRefreshReuse(context.Background(), st, st.acct, st.intent, admit); !applied || err != nil {
+			if applied, err := s.retryCodexRefreshReuse(context.Background(), st, codexAccountSnapshot{CodexProviderAccount: st.acct, VaultEpoch: st.epoch}, st.intent, admit); !applied || err != nil {
 				t.Fatal("not admitted")
 			}
 			if background {
@@ -353,7 +362,7 @@ func TestCodexReuseWorkerPersistenceExhausted(t *testing.T) {
 func TestCodexReuseWorkerOwnerFence(t *testing.T) {
 	s, st, p, admit := newReuseWorker(t)
 	st.fenceLost = true
-	if applied, err := s.retryCodexRefreshReuse(context.Background(), st, st.acct, st.intent, admit); !applied || err != nil {
+	if applied, err := s.retryCodexRefreshReuse(context.Background(), st, codexAccountSnapshot{CodexProviderAccount: st.acct, VaultEpoch: st.epoch}, st.intent, admit); !applied || err != nil {
 		t.Fatal("not admitted")
 	}
 	if p.calls != 1 || st.writes != 1 || len(st.acct.RecoverySealed) != 0 || st.promotes != 0 {
@@ -396,7 +405,7 @@ func TestCodexReuseWorkerLateTerminalPreservesRestore(t *testing.T) {
 				st.writeErr = errors.New("db unavailable")
 				s.background = func(fn func()) { bg = fn }
 			}
-			if applied, err := s.retryCodexRefreshReuse(context.Background(), st, st.acct, st.intent, admit); !applied || err != nil {
+			if applied, err := s.retryCodexRefreshReuse(context.Background(), st, codexAccountSnapshot{CodexProviderAccount: st.acct, VaultEpoch: st.epoch}, st.intent, admit); !applied || err != nil {
 				t.Fatalf("retry applied=%v err=%v", applied, err)
 			}
 			if kind == "background_loss" {
@@ -419,13 +428,13 @@ func TestCodexReuseWorkerLateTerminalPreservesRestore(t *testing.T) {
 func TestCodexReuseWorkerVaultLocksAfterExchange(t *testing.T) {
 	s, st, p, admit := newReuseWorker(t)
 	p.onRefresh = func() { s.vlt.Lock(st.acct.UserID) }
-	if applied, err := s.retryCodexRefreshReuse(context.Background(), st, st.acct, st.intent, admit); !applied || err != nil {
+	if applied, err := s.retryCodexRefreshReuse(context.Background(), st, codexAccountSnapshot{CodexProviderAccount: st.acct, VaultEpoch: st.epoch}, st.intent, admit); !applied || err != nil {
 		t.Fatal("not admitted")
 	}
-	if st.lastWrite.RecoverySealedWith.String != store.SealedWithMaster || st.lastWrite.RecoveryCause.String != "vault_locked" || st.terminals != 0 {
+	if st.lastWrite.RecoverySealedWith.String != store.SealedWithMasterAAD || st.lastWrite.RecoveryCause.String != "vault_locked" || st.terminals != 0 {
 		t.Fatal("missing master recovery fallback")
 	}
-	blob, err := s.openCodexSealed(st.acct.UserID, st.acct.RecoverySealed, store.SealedWithMaster)
+	blob, err := openReuseSealed(s, st.acct.UserID, st.acct.RecoverySealed, store.SealedWithMasterAAD)
 	if err != nil || blob.AccessToken != "reuse-access" || blob.RefreshToken != "CANARY_REFRESH" {
 		t.Fatal("master recovery not merged")
 	}

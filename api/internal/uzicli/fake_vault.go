@@ -11,7 +11,7 @@ func (f *FakeClient) VaultStatus(_ context.Context) (VaultStatusResult, error) {
 	if f.Err != nil {
 		return VaultStatusResult{}, f.Err
 	}
-	return VaultStatusResult{Unlocked: !f.VaultLocked}, nil
+	return VaultStatusResult{Unlocked: !f.VaultLocked, Mode: f.VaultMode}, nil
 }
 
 // VaultUnlock records every attempted password, including failed attempts.

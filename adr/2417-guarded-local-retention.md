@@ -352,3 +352,62 @@ clone, pins and open hold. A transient retention keeps the journaled request
 for replay. A definitive one clears it, and the worker captures an archive on
 the same record, which then follows the archive rules above. #2544 and #2506
 remain excluded.
+
+## Amendment 2026-10-28 — available capture UPDATE entry rule (#3590)
+
+**Status**: Implemented in API/store at `991df8b3`; exact-head CI/lander
+acceptance remains pending. This is C1a of
+[PRD-2506](../prds/2506-prerequisite-closure.md#c1a-execution-and-evidence-2026-10-28-child-3590),
+not completion of #2506 or prerequisite-closure release.
+
+### The invariant
+
+An UPDATE of `recovery_captures` into `available` is permitted by the
+state-entry branch only when `OLD.state` is `uploading` or `available`
+(same-state). Migration `00374_recovery_available_guard.sql` replaces
+`recovery_inventory_capture_guard` with the preceding 00322 Up function body
+plus this refusal:
+
+```sql
+IF NEW.state = 'available' AND OLD.state NOT IN ('uploading', 'available') THEN
+    RAISE EXCEPTION 'recovery capture must be uploading before becoming available' USING ERRCODE = '55000';
+END IF;
+```
+
+Raw UPDATE and parameterized `MarkCaptureState` requests entering available
+from expired, discarded, preparing or needs_action raise SQLSTATE 55000.
+The branch precedes the identity guard's silent `RETURN NULL`, so a combined
+identity/state change receives that exception too. This is a selected entry
+rule; it does not establish that expired or discarded can never leave those
+states through arbitrary SQL or a sequence of other transitions.
+
+The `MarkCaptureReady` query separately requires `manifest_bound = true`
+AND `state = 'uploading'` for the selected capture ID. If no row matches, it
+returns exactly `pgx.ErrNoRows` through sqlc, rather than relying on a trigger
+exception. This also rejects same-state available calls through that query;
+the trigger permits same-state available metadata changes subject to its
+existing proof, expiry and identity checks.
+
+### Retained authority and rollback
+
+The trigger remains BEFORE UPDATE; INSERT authority is unchanged. Existing
+redundancy-proof immutability and validation, protected-final expiry and
+identity rules are retained. An uploading-to-available transition or
+same-available metadata update gains no exemption from those rules.
+
+Down restores the preceding `00322_recovery_archive_redundancy.sql` Up
+function body exactly. The 373→374→373→374 LiveDB round trip checks the
+preceding, Up, Down and reapplied guards and exact captured
+`pg_get_functiondef` restoration. This rollback removes C1a's guard branch;
+it grants no future C1b rollback authority.
+
+The migration replaces the function in a normal goose transaction and
+rewrites no capture data. Function replacement/catalog-lock contention is
+unmeasured. Focused test timings are recorded in the PRD; representative
+production latency, mixed-version operation, comparable full-job cost and
+CI critical-path impact have not been demonstrated.
+
+This amendment adds no pin, custody-release, cleanup, capability or TTL
+authority. C1b remains blocked until C1a is merged AND exact-head CI/lander
+validation passes. C2 release, #2969 integration and producer enablement
+remain separate work.

@@ -47,6 +47,7 @@ func TestAssembleCodexClaimCustomLaneLiveDB(t *testing.T) {
 		f.userID, customCodexModel, "claude-opus-4-8")
 
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	run := mustRun(t, env, f.runID)
 
 	t.Run("capable worker: custom id shipped unchanged", func(t *testing.T) {
@@ -121,6 +122,7 @@ func TestAssembleCodexReviewClaimShipsNoModelLiveDB(t *testing.T) {
 
 	aliasID := env.seedLinkedSubscription(t, userID, "codex-review-"+uuid.NewString(), codexToken("access"), codexToken("refresh"))
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	if err := svc.FreezeCodexBinding(env.ctx, userID, reviewID, aliasID, codexAuthModeSubscription); err != nil {
 		t.Fatalf("FreezeCodexBinding on the review run: %v", err)
 	}
@@ -167,6 +169,7 @@ func TestAssembleClaudeClaimReadsClaudeLaneNotLegacyLiveDB(t *testing.T) {
 	          VALUES ($1, $2, $3, 'issue', 4242, 't', 'd', 'claimed', $4)`, runID, userID, repoID, workerID)
 
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	wkr := store.Worker{ID: workerID, UserID: userID}
 
 	run := mustRun(t, env, runID)

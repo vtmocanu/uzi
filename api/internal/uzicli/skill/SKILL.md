@@ -82,9 +82,10 @@ it.
 ### Vault
 
 - `uzi vault` — show vault command help.
-- `uzi vault status` — report `locked` or `unlocked` for the active user;
-  `--json` returns only `{"unlocked":false}` or `{"unlocked":true}`.
-  Status output remains visible with `--quiet`.
+- `uzi vault status` — report `locked` or `unlocked` for the active user,
+  or `off` for an unprotected user when the server supports optional vaults.
+  `--json` includes `unlocked` and the server-provided `mode` when available.
+  Missing mode preserves older-server behavior. Output remains visible with `--quiet`.
 - `uzi vault unlock` — ask the owner to run this when their vault is locked.
   It prompts on stderr without echo for their login password or OIDC vault
   passphrase. Never solicit, read, or handle the owner's password or passphrase
@@ -437,6 +438,8 @@ uzi version
   `worker_requeue_exhausted`, owner Resume/Cancel only, no timer — or
   retained-source budget exhaustion, `retained_recovery_exhausted`, with three
   timed retries by default followed by an owner hold (NULL retry) — or
+  an integrity refusal, `retained_recovery_adoption_failed`, owner Resume/Cancel
+  with no automatic retry regardless of retry timing — or
   because the forge was unreachable at clone — cause `forge_unreachable`, capped by
   `RUN_FORGE_UNREACHABLE_MAX_PARKS`; the sweep retries it on a capped backoff; cause
   `codex_account_unavailable` is held on its Codex account until that account is usable
@@ -496,7 +499,8 @@ uzi version
   bare wait stops there too), `completed`, `failed`, `cancelled` — and keeps
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
   `recovery_wait`/`paused`, except a default wait stops on recovery cause
-  `worker_requeue_exhausted`, `worker_memory_pressure`, owner-held
+  `worker_requeue_exhausted`, `worker_memory_pressure`,
+  `retained_recovery_adoption_failed`, owner-held
   `retained_recovery_exhausted` (NULL retry), or a paused credential-switch hold (`credential_switch_settling` /
   `credential_switch_unsettled`; it prints the next step on stderr): timed limit and recovery waits retry on a timer, pool waits
   need an available pooled token, and ordinary owner or lead pauses need `uzi run resume`. A
@@ -825,6 +829,21 @@ uzi version
   `landing_state` is `needs_landing` carries human-landable work: recover it with
   `uzi run export` when an archive is available, or from the preserved diff
   (`uzi run get <run-id> --field preserved_patch`) when it isn't.
+  An integrity refusal is `recovery_wait` / `retained_recovery_adoption_failed`:
+  local work and custody are preserved, with no automatic retry regardless of
+  retry timing. Read `uzi run recovery <id>` and export an available archive
+  before owner Resume/Cancel. Resume requests another bounded attempt; success
+  is not assured and repeated adoption failure holds again. Without a new owner
+  grant, redispatch reholds without capture or model execution. A fresh positive
+  claim generation and unconsumed raw `worker_recovery_owner_episode` grant,
+  exact source/reservation identity, current ownership and quiescence are required;
+  the derived `worker_recovery_episode` alone cannot renew adoption. Default wait,
+  log follow and watcher stop; explicit `--until` keeps its selected set. Timers,
+  token changes and credential changes do not release the hold. Resume preserves
+  remaining wall and may need extension. Each fresh claim adds counted custody;
+  retained successors can consume disk and block image rolls. Earlier archives
+  may omit latest work; losing local storage or resuming on a peer can lose it.
+  See [adoption retry guidance](../../../../docs/run-recovery-wait.md#retained-recovery-adoption-failed).
   Retained-source exhaustion is `recovery_wait` / `retained_recovery_exhausted`.
   A finite retry, including due, means timed retry; NULL means owner-held without
   a countdown; omitted timing is unknown. Default wait/log follow stop on the
@@ -1784,7 +1803,13 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   controller report, background loops, the database, integrations, housekeeping), a
   verdict and a per-severity tally. By default it prints only the checks needing
   attention (not `ok`, not `na`); `--all` lists every check; `--json` emits the endpoint's
-  document unchanged. **Exit code, for a cron probe:** 0 unless the overall status is
+  document unchanged. Checks may carry optional `attention_banner: true`
+  presentation metadata (false is omitted); currently only owner-scoped
+  `recovery.storage` Warn opts in. The CLI has no dismissal state, and the flag
+  or browser dismissal does not change scope, severity, counts, status, blocking,
+  episodes, Slack, authentication, malformed-document handling or exit codes.
+  Warn exits 0 by default and 8 under `--strict`.
+  **Exit code, for a cron probe:** 0 unless the overall status is
   `danger`, then **8**; `--strict` also exits 8 on `warn` or `unknown`. Exit 8 is a
   **success-path** exit (HTTP 200 carrying an unhealthy verdict), so the full report prints
   first and a transport/auth failure keeps its own code — 8 means "unhealthy", 3/6 means

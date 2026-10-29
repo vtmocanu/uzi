@@ -2,6 +2,7 @@
   "id": "",
   "email": "",
   "name": "",
+  "vault_mode": "",
   "vault_locked": false,
   "accounts": null
 }

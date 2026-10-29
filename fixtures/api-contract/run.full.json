@@ -1,4 +1,25 @@
 {
+  "capability_provenance": {
+    "hints_known": true,
+    "inference_known": true,
+    "capabilities": [
+      {
+        "capability": "x",
+        "sources": [
+          "x"
+        ],
+        "required": true,
+        "inference_ignored": true,
+        "triggers": [
+          {
+            "path": "x",
+            "reason": "x"
+          }
+        ],
+        "truncated": true
+      }
+    ]
+  },
   "completion_pending": {
     "version": 1,
     "contract_revision": 1,

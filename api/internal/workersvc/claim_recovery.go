@@ -164,7 +164,7 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 	// errReserveHeld (PRD #3522 M3) is transient like errVaultLocked: the run returns to queued with
 	// the visible reserve reason. It is deliberately NOT mapped by claudeCheckerClaimError, so a held
 	// Claude checker stays queued and expires through its own cc.deadline_at path.
-	transient := errors.Is(assemblyErr, errVaultLocked) || errors.Is(assemblyErr, errAutoPoolEmpty) ||
+	transient := errors.Is(assemblyErr, store.ErrVaultSealStale) || errors.Is(assemblyErr, errVaultLocked) || errors.Is(assemblyErr, errAutoPoolEmpty) ||
 		errors.Is(assemblyErr, errCustomModelCapabilityMissing) || errors.Is(assemblyErr, errCrossCheckPinsCapabilityMissing) ||
 		errors.Is(assemblyErr, errReserveHeld)
 	// errCredentialDisabled is its own non-terminal classification (PRD #1732 D14): neither
@@ -220,7 +220,7 @@ func isClaudeCheckerChild(run store.Run) bool {
 // carries no credential detail. The finalizer selects the stage-specific failure
 // reason; the sentinel retains its legacy plan text. Other run shapes return err unchanged.
 func claudeCheckerClaimError(run store.Run, err error) error {
-	if err == nil || !isClaudeCheckerChild(run) || errors.Is(err, errVaultLocked) {
+	if err == nil || !isClaudeCheckerChild(run) || errors.Is(err, errVaultLocked) || errors.Is(err, store.ErrVaultSealStale) {
 		return err
 	}
 	if errors.Is(err, errCredentialUnavailable) || errors.Is(err, errCredentialDisabled) || errors.Is(err, errAutoPoolEmpty) {

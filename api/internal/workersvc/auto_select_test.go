@@ -17,6 +17,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // PRD #111 M4 — the `auto` bind mode, from the claim path's side.
@@ -108,6 +109,9 @@ func newAutoFixture(t *testing.T) autoFixture {
 		candRow(emptyID, "spare-key", true, 90, time.Minute, 0),
 	}
 	svc := New(fs, box, autoParams())
+	m := newMemVaultStore()
+	m.states[owner] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected}
+	svc.SetVault(newMemoryVault(box, m))
 	svc.now = func() time.Time { return autoNow }
 	return autoFixture{
 		fs: fs, svc: svc, owner: owner, runID: runID, emptyID: emptyID, fullID: fullID,
@@ -620,6 +624,10 @@ func TestAutoDoesNotRetryOnALockedVault(t *testing.T) {
 	box := newBox(t)
 	owner := uuid.New()
 	v := unlockedVault(t, owner, box) // passes Claim's gate...
+	sealed, err := v.Seal(context.Background(), owner, store.KindAnthropicToken, []byte("auto-lock-race-token"), vault.SealForUse)
+	if err != nil {
+		t.Fatalf("vault Seal: %v", err)
+	}
 
 	sealedPAT, _ := box.Seal([]byte("bot-pat-AUTOLOCK-abcdef1234567890"))
 	runID, pickID := uuid.New(), uuid.New()
@@ -637,7 +645,8 @@ func TestAutoDoesNotRetryOnALockedVault(t *testing.T) {
 		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{
 			pickID: {
 				UserID: owner, Kind: store.KindAnthropicToken,
-				Ciphertext: []byte("dek-sealed-never-decrypted"), SealedWith: store.SealedWithDEK,
+				Ciphertext: sealed.Ciphertext, SealedWith: sealed.SealedWith,
+				VaultEpoch: sealed.Epoch,
 			},
 		},
 		byIDLabels: map[uuid.UUID]string{pickID: "spare-key"},

@@ -4,6 +4,14 @@ import "fmt"
 
 const CrossCheckWorkerDefault = "worker default"
 const CrossCheckPin = "pin"
+
+// CrossCheckDefaultEffort is the effort of an unpinned checker of either family and
+// stage. It is independent of the owner's worker effort preferences, which keep
+// UziDefaultEffort / UziDefaultCodexEffort for ordinary runs.
+const CrossCheckDefaultEffort = "high"
+
+// CrossCheckDefaultSource is the effort provenance of an unpinned checker.
+const CrossCheckDefaultSource = "cross-check default"
 const DefaultCodexModel = "gpt-6.1-sol"
 
 // CuratedCodexModels and KnownClaudeAliases are the closed family guards shared
@@ -68,6 +76,7 @@ func ValidateFamilyEffort(harness, raw string) (string, error) {
 
 // CrossCheckResolution preserves independent field provenance. templateModel is
 // the first delivered lead/orchestrator's model, even when that model is nil.
+// An unpinned effort is CrossCheckDefaultEffort, never the worker effort.
 type CrossCheckResolution struct {
 	Model        *string
 	Effort       string
@@ -75,12 +84,9 @@ type CrossCheckResolution struct {
 	EffortSource string
 }
 
-func ResolveCrossCheck(harness string, model, effort, workerModel, workerEffort, templateModel *string) CrossCheckResolution {
-	r := CrossCheckResolution{Model: workerModel, Effort: ResolveDefaultEffort(workerEffort),
-		ModelSource: CrossCheckWorkerDefault, EffortSource: CrossCheckWorkerDefault}
-	if harness == "codex" {
-		r.Effort = ResolveDefaultCodexEffort(workerEffort)
-	}
+func ResolveCrossCheck(harness string, model, effort, workerModel, templateModel *string) CrossCheckResolution {
+	r := CrossCheckResolution{Model: workerModel, Effort: CrossCheckDefaultEffort,
+		ModelSource: CrossCheckWorkerDefault, EffortSource: CrossCheckDefaultSource}
 	if r.Model == nil {
 		if harness == "codex" {
 			fallback := DefaultCodexModel

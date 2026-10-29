@@ -251,6 +251,11 @@ export class CodexDelegationRunner {
 
   /** Run one delegated child to full settlement and return its bounded result. */
   async run(request: ChildDelegationRequest): Promise<ChildDelegationResult> {
+    return this.registry.admitWork(() => this.runAdmitted(request));
+  }
+
+  private async runAdmitted(request: ChildDelegationRequest): Promise<ChildDelegationResult> {
+    this.registry.assertWorkAdmission();
     const roleDef = this.roles.get(request.role);
     // Fail closed on an unknown role or a role that is NOT a subagent (isRoot). The
     // broker already checked its own allowedRoles set; this is the runner's own

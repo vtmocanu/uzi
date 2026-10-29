@@ -12,6 +12,7 @@ func TestAssembleCodexClaimEffortLaneLiveDB(t *testing.T) {
 	f := newSubscriptionFixture(t, env)
 	resealBotPAT(t, env, f.userID)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	run := mustRun(t, env, f.runID)
 	worker := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}}
 	for _, c := range []struct {
@@ -39,6 +40,7 @@ func TestAssembleCodexJudgeEffortLaneLiveDB(t *testing.T) {
 	target := env.seedCodexRun(t, userID, workerID, repoID)
 	judge := env.seedCodexJudgeRun(t, userID, workerID, target)
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	if err := svc.FreezeCodexBinding(env.ctx, userID, judge, aliasID, codexAuthModeSubscription); err != nil {
 		t.Fatal(err)
 	}

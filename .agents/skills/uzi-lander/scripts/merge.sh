@@ -44,6 +44,7 @@
 #      not merged
 #      Also malformed repository syntax or unreadable changelog-policy checkout/origin,
 #      fetched main/PR head, merge-base or diff; no merge attempted.
+#      Also unreadable PR files or live-base migration listing.
 #   3  gh error, or the merge command was refused (classifier block, ruleset, conflict):
 #      the exact command is printed for the user to run via a `!` line. Also the PR
 #      conflicting with its base (mergeable=CONFLICTING), checked before the required
@@ -70,6 +71,8 @@
 #      keyword, e.g. reword "does not close #N" to "Refs #N"), then re-run
 #  12  main changed changelog policy since the PR's merge-base: integrate main and
 #      require fresh exact-head CI before retrying
+#  13  MIGRATION_COLLISION: an added/renamed/copied migration is at or below the live base head;
+#      renumber with land-prep.sh, then require fresh exact-head CI and review
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -81,6 +84,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/review-threads.sh"
 # shellcheck source=lib/pr-comments.sh
 . "$HERE/lib/pr-comments.sh"
+# shellcheck source=lib/migrations.sh
+. "$HERE/lib/migrations.sh"
 
 REPO=""; PR=""; EXPECT=""; EXPECT_CLOSES=""; METHOD="squash"; ADMIN=1; DELETE=1; REWORK_CHECK=1; CONFIRM_ONLY=0
 while [ $# -gt 0 ]; do
@@ -441,6 +446,29 @@ if [ "$REPO" = vtmocanu/uzi ] && [ "$base" = main ]; then
     printf 'CHANGELOG_POLICY_STALE: main changed policy since this PR merge-base:\n%s\n' "$policy_changed"
     echo 'Rebase or merge origin/main into the PR branch, then require fresh exact-head CI and review before retrying merge.sh.'
     exit 12
+  fi
+fi
+
+# Read the live base inside the merge-lock window, after all other preflights.
+# Added, renamed and copied destinations introduce migration versions.
+# No such migration in the diff means no base-directory lookup (other repos may lack it).
+# Out-of-band base moves after this snapshot remain a race; GitHub pins only the head.
+migration_files=$(migration_pr_files "$REPO" "$PR") \
+  || { echo 'cannot read PR files for migration check; not merging'; exit 2; }
+migration_info=$(migration_report "$migration_files" '[]') \
+  || { echo 'cannot read introduced migration versions; not merging'; exit 2; }
+if [ "$(printf '%s' "$migration_info" | jq '.added | length')" -gt 0 ]; then
+  [ -n "$base" ] || { echo 'cannot read base ref for migration check; not merging'; exit 2; }
+  migration_ref=$(printf '%s' "$base" | jq -sRr @uri)
+  migration_base=$(gh api "repos/$REPO/contents/api/internal/store/migrations?ref=$migration_ref" 2>/dev/null) \
+    || { echo 'cannot read live-base migrations; not merging'; exit 2; }
+  migration_info=$(migration_report "$migration_files" "$migration_base") \
+    || { echo 'cannot read live-base migration listing; not merging'; exit 2; }
+  if [ "$(printf '%s' "$migration_info" | jq '.collisions | length')" -gt 0 ]; then
+    migration_head=$(printf '%s' "$migration_info" | jq -r .head)
+    echo "MIGRATION_COLLISION: renumber above $migration_head with land-prep.sh"
+    printf '%s' "$migration_info" | jq -r '.collisions[]'
+    exit 13
   fi
 fi
 

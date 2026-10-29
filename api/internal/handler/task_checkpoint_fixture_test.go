@@ -13,6 +13,7 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -35,6 +36,8 @@ func (taskCheckpointSchedulingOff) CapabilityAwareScheduling(context.Context) (b
 func newTaskCheckpointHandlerFixture(t *testing.T) *taskCheckpointHandlerFixture {
 	t.Helper()
 	e := newLiveEnv(t)
+	// This claim fixture deliberately exercises legacy master-sealed credentials.
+	e.exec("UPDATE users SET vault_mode='unprotected' WHERE id=$1", e.user)
 	// The inherited issue fixture must not occupy the worker's execution slot.
 	e.exec("UPDATE runs SET status='failed',finished_at=now() WHERE id=$1", e.run)
 	box := newHandlerTestBox(t)
@@ -92,6 +95,7 @@ func (f *taskCheckpointHandlerFixture) wire() {
 		CustodyHoldLimit: defaultCustodyLimit(), WorkerHeartbeatStale: time.Minute,
 		WorkerHeartbeatInterval: 10 * time.Second, WorkerAffinityCeiling: 2 * time.Hour, RunTimeout: time.Hour,
 	})
+	e.wsvc.SetVault(vault.NewPostgres(box, e.pool))
 	e.wsvc.SetTxBeginner(e.pool)
 	e.wsvc.SetCapabilitySettings(taskCheckpointSchedulingOff{})
 	e.wsvc.SetForges(settleForgeBuilder{f: e.lf})

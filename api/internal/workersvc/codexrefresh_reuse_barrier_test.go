@@ -55,7 +55,7 @@ func TestCodexReuseWorkerPersistenceBarrier(t *testing.T) {
 				t.Fatal("initial reconcile did not consume once and retain a pending writer after two failures")
 			}
 			retained := append([]byte(nil), st.lastWrite.Sealed...)
-			blob, err := s.openCodexSealed(st.acct.UserID, retained, st.lastWrite.RecoverySealedWith.String)
+			blob, err := openReuseSealed(s, st.acct.UserID, retained, st.lastWrite.RecoverySealedWith.String)
 			if err != nil || len(retained) == 0 || st.lastWrite.Gen != gen ||
 				blob.AccessToken != "reuse-access" || blob.RefreshToken != "CANARY_REFRESH" {
 				t.Fatal("pending writer did not retain protected merged material at the current generation")
@@ -100,7 +100,7 @@ func TestCodexReuseWorkerPersistenceBarrier(t *testing.T) {
 			}
 			if leg == "owner_restore" {
 				reconcile()
-				blob, err := s.openCodexAccountLogin(st.acct.UserID, st.acct)
+				blob, err := s.openCodexAccountLogin(context.Background(), st.acct.UserID, codexAccountSnapshot{CodexProviderAccount: st.acct, VaultEpoch: st.epoch})
 				if err != nil || blob.AccessToken != "owner-access" || blob.RefreshToken != "owner-refresh" ||
 					!bytes.Equal(st.acct.SealedLogin, ownerSealed) || st.acct.Generation != gen+1 ||
 					st.intent.State != codexIntentReconciled || st.acct.CoordState != codexCoordIdle ||
@@ -110,17 +110,18 @@ func TestCodexReuseWorkerPersistenceBarrier(t *testing.T) {
 				}
 				return
 			}
-			if !bytes.Equal(st.acct.RecoverySealed, retained) || st.acct.Generation != gen ||
+			// Each retry reseals with a fresh nonce; plaintext equality is checked below.
+			if len(st.acct.RecoverySealed) == 0 || st.acct.Generation != gen ||
 				!st.acct.RecoveryGeneration.Valid || st.acct.RecoveryGeneration.Int64 != gen ||
 				st.promotes != 0 || p.discoveries != 0 {
 				t.Fatal("writer did not install the retained current-generation protected slot")
 			}
-			blob, err = s.openCodexSealed(st.acct.UserID, st.acct.RecoverySealed, st.acct.RecoverySealedWith.String)
+			blob, err = openReuseSealed(s, st.acct.UserID, st.acct.RecoverySealed, st.acct.RecoverySealedWith.String)
 			if err != nil || blob.AccessToken != "reuse-access" || blob.RefreshToken != "CANARY_REFRESH" {
 				t.Fatal("installed protected slot lost the original refresh token")
 			}
 			reconcile()
-			blob, err = s.openCodexAccountLogin(st.acct.UserID, st.acct)
+			blob, err = s.openCodexAccountLogin(context.Background(), st.acct.UserID, codexAccountSnapshot{CodexProviderAccount: st.acct, VaultEpoch: st.epoch})
 			if err != nil || blob.AccessToken != "reuse-access" || blob.RefreshToken != "CANARY_REFRESH" ||
 				st.acct.Generation != gen+1 || st.promotes != 1 || p.discoveries != 1 ||
 				p.calls != 1 || st.admissions != 1 || st.writes != 3 || len(st.acct.RecoverySealed) != 0 {

@@ -668,8 +668,8 @@ WHERE status = 'online'
 -- query's own "name every column" convention so an unstamped path is visible in a diff
 -- of THIS file, and guarded by a per-path test rather than the compiler (the narg trap
 -- above applies identically).
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, issue_saved_body, issue_raw_digest, issue_input_reason, auto_approve_blocked_reasons, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, ignored_inferred_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required, code_cross_check_required)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('issue_saved_body'), sqlc.narg('issue_raw_digest'), sqlc.narg('issue_input_reason'), COALESCE(sqlc.narg('auto_approve_blocked_reasons')::text[], '{}'), sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.ignored_inferred_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'),
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, issue_saved_body, issue_raw_digest, issue_input_reason, auto_approve_blocked_reasons, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required, code_cross_check_required)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('issue_saved_body'), sqlc.narg('issue_raw_digest'), sqlc.narg('issue_input_reason'), COALESCE(sqlc.narg('auto_approve_blocked_reasons')::text[], '{}'), sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.ignored_inferred_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'),
     (@auto_approve AND @plan_source <> 'seeded' AND (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id)), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id))
 RETURNING *;
 
@@ -2154,6 +2154,7 @@ UPDATE runs SET
     -- authoritative inferred toolchain list), an absent (NULL) param COALESCEs back to the
     -- existing column. The service only passes a non-empty filtered set, so a garbled/empty
     -- report leaves the param nil rather than wiping the column.
+    capability_inference_evidence = COALESCE(sqlc.narg('capability_inference_evidence')::jsonb, runs.capability_inference_evidence),
     required_tools = CASE WHEN plan_cross_check_required AND (auto_approve OR plan_md IS NOT NULL) THEN required_tools
         ELSE COALESCE(sqlc.narg('inferred_tools')::text[], required_tools) END,
     -- size_class is SET, absent-safe like required_tools: a present (clamped s/m/l) value
@@ -2620,6 +2621,7 @@ UPDATE runs SET
     -- required_tools is SET, absent-safe: a present set REPLACES (it is the run's single
     -- authoritative inferred toolchain list, not merged with a prior source), and an
     -- absent (NULL) param COALESCEs back to the existing column, leaving it untouched.
+    capability_inference_evidence = COALESCE(sqlc.narg('capability_inference_evidence')::jsonb, runs.capability_inference_evidence),
     required_tools = COALESCE(sqlc.narg('inferred_tools')::text[], runs.required_tools),
     -- PRD #212: the changed-file list the plan turn produced (git status --porcelain,
     -- run as the RUNNER uid). Absent-safe COALESCE like required_tools, but note the
@@ -3232,64 +3234,15 @@ UPDATE runs SET retry_not_before = now(), updated_at = now()
 WHERE id = @id AND user_id = @user_id AND status = 'limit_wait';
 
 -- name: SetRunRecoveryWait :execrows
--- Park a run in the TRANSIENT-RECOVERY hold (issue #1197). running -> recovery_wait,
--- non-terminal: the run keeps its issue, its session, its worker affinity, its message
--- history and its plan_md, and the sweeper (PromoteRecoveryWaitRuns) promotes it back to
--- queued once recovery_retry_not_before passes. It is modelled CLOSELY on SetRunLimitWait
--- but is a DISTINCT park with a distinct purpose:
---
--- 🔴 recovery_wait IS NOT A USAGE LIMIT. A worker enters it after a positively-empty SDK
--- turn survived bounded in-process retries — a transient recovery, not credential
--- exhaustion. So this query MUST NOT touch any limit/credential gauge: limit_wait_count,
--- limit_resets_at, retry_not_before, rate_limit_type and limit_dead_secret_id are ALL left
--- untouched. Its own recovery_wait_count/recovery_retry_not_before are the only park
--- bookkeeping, and recovery_wait_count is a backoff SHAPER, never a cap (there is no
--- lifetime-park cap and no terminal branch — a park always becomes promotable again).
---
--- 🔴 THE SOURCE GUARD IS POSITIVE (status = 'running'), exactly as SetRunLimitWait's, and
--- for the same reasons: a negative guard would admit queued/claimed -> recovery_wait (a
--- stale report parking a run no worker holds), awaiting_approval -> recovery_wait
--- (swallowing a pending human approval), and recovery_wait -> recovery_wait (a re-delivered
--- report bumping the backoff count a second time on one event). With the positive guard
--- each is a 0-row no-op, surfaced to the worker as 409 / applied=false, so re-delivery is
--- idempotent and the worker's cleanup carve-out keys off the RETURNED STATUS.
---
--- kind <> 'judge' mirrors SetRunLimitWait (Decision 14): a judge run is executed by a
--- different runner with its own error path and is never re-enqueued.
---
--- recovery_retry_not_before is computed in GO and passed in (now + capped exponential
--- backoff + jitter; see workersvc/recoverywait.go), never derived here.
---
--- recovery_wait_count bumps HERE, in the same statement as the transition, so a run cannot
--- end up parked without its backoff shaper advancing. It is distinct from limit_wait_count
--- and requeue_count on purpose — a shared counter would let one park's budget leak into
--- another's curve.
---
--- The health reset is MANDATORY for the same reason SetRunLimitWait's is: a parked run is
--- absent from ListActiveRunsForHealth (a POSITIVE allowlist), so whatever flag was live at
--- park time would FREEZE for the whole park with nothing able to clear it. Do NOT "fix" it
--- by adding recovery_wait to that allowlist: stalled/looping/slow describe a RUNNING agent.
--- plan_md and worker_id are PRESERVED (worker_id is in the WHERE, never the SET). This is a
--- NON-TERMINAL transition, so the run's checkpoint is NOT deleted (that fires only on
--- terminal transitions).
---
--- PRD #1392 M1 (D9): this is the UNTYPED park (empty turn, and #1088's provider park once
--- it adopts recovery_wait). It REPLACES recovery_wait_cause with @recovery_cause, never
--- coalescing it — a later untyped park on a run that forge-parked earlier must drop the typed
--- cause, so its surface reads the generic wording and its forge cap counter is not consulted.
--- Issue #1766 M2: the Go caller (setRecoveryWait) passes a non-NULL recovery_cause ONLY for
--- 'vault_locked' (the worker's codex refresh/release answered 409 vault_locked: the owner's
--- vault is locked, so the run waits for an unlock) and NULL for every other reported cause,
--- so empty_turn/provider_outage still store NULL (D9). The column CHECK is the backstop. It does NOT
--- touch forge_park_count: that lifetime counter belongs to the forge park alone (fact 7 /
--- D2), so an empty-turn park neither increments nor resets it (a run keeps its forge-park
--- lifetime count through a later empty-turn park). The forge park has its own writer,
--- ParkRunForgeUnreachable, which sets the cause and bumps forge_park_count.
+-- Park a running claim without releasing custody or its execution claim. The caller
+-- computes the retry and optional idle count under the run lock. Untyped parks
+-- preserve the idle counter; typed idle parks can hold with a NULL deadline.
 UPDATE runs SET
     status                    = 'recovery_wait',
     status_since              = now(),
     recovery_wait_count       = recovery_wait_count + 1,
     recovery_wait_cause       = sqlc.narg('recovery_cause')::text,
+    idle_stall_park_count = COALESCE(sqlc.narg('idle_stall_park_count')::integer, idle_stall_park_count),
     provider_park_count = CASE WHEN sqlc.arg('reset_provider_streak')::boolean
         AND sqlc.narg('claim_generation')::bigint > 0
         AND claim_generation = sqlc.narg('claim_generation')::bigint
@@ -3534,8 +3487,8 @@ WHERE id = @id AND user_id = @user_id AND status = @status::text;
 --
 -- Unlike limit_wait there is NO lifetime cap: recovery_wait_count is left in place (it
 -- keeps shaping the next park's backoff) and this promotion always fires once the stamp
--- passes, so the run auto-resumes repeatedly at the capped cadence until it recovers or the
--- owner cancels (CancelRunServerSide's negative admit-set covers a recovery_wait run).
+-- passes. A finite stamp permits automatic retry at the capped cadence; a NULL stamp
+-- instead keeps a typed owner hold, including a bounded Codex idle-stall park.
 --
 -- started_at = NULL so the resumed run gets a FRESH RUN_TIMEOUT wall, and
 -- budget_paused_seconds = 0 so the pause banked against the OLD baseline is not
@@ -3554,6 +3507,7 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.status = 'recovery_wait' AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
   AND runs.recovery_retry_not_before <= @now
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -3606,6 +3560,7 @@ UPDATE runs SET
 WHERE runs.status = 'recovery_wait' AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
   AND runs.recovery_retry_not_before <= @now
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
@@ -3655,9 +3610,11 @@ RETURNING id, user_id, status;
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
+  AND (runs.recovery_wait_cause IS DISTINCT FROM 'codex_idle_stall' OR runs.recovery_retry_not_before IS NOT NULL)
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted'
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -3709,9 +3666,11 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
+  AND (runs.recovery_wait_cause IS DISTINCT FROM 'codex_idle_stall' OR runs.recovery_retry_not_before IS NOT NULL)
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted'
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
@@ -11663,10 +11622,10 @@ SELECT * FROM cross_checks WHERE lead_run_id = @lead_run_id AND stage = 'plan' O
 -- Preserve the lead's frozen inference policy; declared requirements keep their repo-hint source.
 INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
                   report_only, budget_wall_seconds, dispatched_at, auto_approve,
-                  issue_title, issue_description, required_capabilities, ignored_inferred_capabilities, trigger_source, worker_id)
+                  issue_title, issue_description, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, worker_id)
 SELECT @child_id, lead.user_id, lead.repo_id, 'cross_check', lead.id, @child_harness::text, 2,
        true, @budget_wall_seconds::int, now(), true, lead.issue_title, lead.issue_description,
-       COALESCE(repo.required_capabilities, '{}'), lead.ignored_inferred_capabilities, 'cross_check', lead.worker_id
+       COALESCE(repo.required_capabilities, '{}'), COALESCE(repo.required_capabilities, '{}'), lead.ignored_inferred_capabilities, 'cross_check', lead.worker_id
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id
 WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
   AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation
@@ -11840,7 +11799,7 @@ WHERE lead.id = @lead_run_id AND cc.stage = 'plan'
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id
-  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted')
+  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
@@ -11889,7 +11848,7 @@ UPDATE runs SET
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
                ELSE 0 END,
     -- Retained recovery preserves affinity even though its execution claim is released.
-    worker_id = CASE WHEN runs.claim_released_at IS NOT NULL AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted' THEN NULL ELSE runs.worker_id END,
+    worker_id = CASE WHEN runs.claim_released_at IS NOT NULL AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted' AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed' THEN NULL ELSE runs.worker_id END,
     hold_reason = NULL,
     hold_captured_head = NULL,
     worker_recovery_episode = runs.worker_recovery_episode + 1,
@@ -11900,7 +11859,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at            = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
-  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted')
+  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')
   -- Honor the wall sweep's chat/judge/interactive exemptions; timed runs still need remaining budget.
   -- Extending does not itself release this hold; checker parent/deadline guards below still apply.
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
@@ -11973,7 +11932,7 @@ RETURNING *;
 -- name: ParkRunRetainedRecovery :one
 -- Called under GetRunOwnedByWorkerForUpdate. Execution release is not custody release.
 UPDATE runs SET status='recovery_wait', status_since=now(), updated_at=now(),
- recovery_wait_cause='retained_recovery_exhausted',
+ recovery_wait_cause = @recovery_cause::text,
  recovery_wait_count=recovery_wait_count+1,
  retained_park_count=retained_park_count+CASE WHEN @counted::boolean THEN 1 ELSE 0 END,
  recovery_retry_not_before=sqlc.narg('retry_not_before')::timestamptz,
@@ -11985,4 +11944,15 @@ WHERE id = @id AND worker_id = @worker_id AND status='running'
  AND claim_generation = @claim_generation::bigint AND @claim_generation::bigint > 0
  AND claim_released_at IS NULL AND COALESCE(stop_kind, '')=''
  AND kind IN ('issue','ci_fix','self_improve','prompt','task','mr_rework')
+RETURNING *;
+
+-- name: ResumeCodexIdleStall :one
+UPDATE runs SET
+    status = 'queued', recovery_retry_not_before = NULL, idle_stall_park_count = 0,
+    started_at = NULL, budget_paused_seconds = 0,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    status_since = now(), health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
+  AND recovery_wait_cause = 'codex_idle_stall'
 RETURNING *;

@@ -232,3 +232,14 @@ func TestFakeVault(t *testing.T) {
 		t.Fatal("failed global attempt not recorded")
 	}
 }
+
+func TestHTTPClientVaultStatusMode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"mode":"unprotected","policy":"optional","unlocked":false,"exists":false}`))
+	}))
+	defer srv.Close()
+	got, err := newTestClient(srv).VaultStatus(context.Background())
+	if err != nil || got.Mode != "unprotected" || got.Unlocked {
+		t.Fatalf("status mode=%+v err=%v", got, err)
+	}
+}

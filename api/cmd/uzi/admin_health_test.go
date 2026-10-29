@@ -398,25 +398,73 @@ func codexPricingWarnCheck() apitypes.HealthCheckDTO {
 }
 
 func TestAdminHealthRecoveryStorageEvidence(t *testing.T) {
-	check := apitypes.HealthCheckDTO{ID: "recovery.storage", Scope: "owner", Group: "housekeeping", Title: "Recovery storage", Severity: "warn",
-		Summary:  "1 captures currently marked quota-refused.",
-		Evidence: []apitypes.HealthEvidenceDTO{{Label: "Shared stored-files limit", Value: "disabled"}, {Label: "Omitted owner examples", Value: "2"}}}
-	for _, strict := range []bool{false, true} {
-		args := []string{"admin", "health", "--no-color"}
-		want := uzicli.ExitOK
-		if strict {
-			args = append(args, "--strict")
-			want = 8
-		}
-		out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{AdminHealthDoc: healthDoc("warn", check)}), args...)
-		if code != want {
-			t.Errorf("exit=%d want %d", code, want)
-		}
-		for _, s := range []string{"recovery.storage", "quota-refused", "Shared stored-files limit: disabled", "Omitted owner examples: 2", "blocking: false"} {
-			if !strings.Contains(out, s) {
-				t.Errorf("missing %q: %s", s, out)
+	for _, tc := range []struct {
+		name, summary, refused, maximum, sharedLimit string
+	}{
+		{"refusal only", "1 captures currently marked quota-refused.", "1", "0", "disabled"},
+		{"pressure only", "At least 80% of budget: per-owner recovery, instance recovery, shared stored files; 0 captures currently marked quota-refused.", "0", "80", "100 bytes"},
+		{"pressure and refusals", "At least 80% of budget: per-owner recovery, instance recovery, shared stored files; 9223372036854775807 captures currently marked quota-refused.", "9223372036854775807", "80", "100 bytes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			check := apitypes.HealthCheckDTO{ID: "recovery.storage", Scope: "owner", Group: "housekeeping", Title: "Recovery storage", Severity: "warn", AttentionBanner: true,
+				Summary: tc.summary,
+				Evidence: []apitypes.HealthEvidenceDTO{
+					{Label: "Quota-refused captures", Value: tc.refused},
+					{Label: "Maximum owner recovery bytes", Value: tc.maximum},
+					{Label: "Shared stored-files limit", Value: tc.sharedLimit},
+					{Label: "Omitted owner examples", Value: "2"},
+				}}
+			for _, strict := range []bool{false, true} {
+				args := []string{"admin", "health", "--no-color"}
+				want := uzicli.ExitOK
+				if strict {
+					args = append(args, "--strict")
+					want = 8
+				}
+				out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{AdminHealthDoc: healthDoc("warn", check)}), args...)
+				if code != want {
+					t.Errorf("exit=%d want %d", code, want)
+				}
+				// Exact summary coverage checks every budget name and its order after cell compaction.
+				for _, s := range []string{"recovery.storage", tc.summary, "Quota-refused captures: " + tc.refused,
+					"Maximum owner recovery bytes: " + tc.maximum, "Shared stored-files limit: " + tc.sharedLimit,
+					"Omitted owner examples: 2", "blocking: false"} {
+					if !strings.Contains(out, s) {
+						t.Errorf("missing %q: %s", s, out)
+					}
+				}
 			}
-		}
+		})
+	}
+}
+
+func TestAdminHealthAttentionJSON(t *testing.T) {
+	for _, attention := range []bool{false, true} {
+		t.Run(fmt.Sprintf("attention=%v", attention), func(t *testing.T) {
+			check := apitypes.HealthCheckDTO{
+				ID: "recovery.storage", Scope: "owner", Severity: "warn", AttentionBanner: attention,
+			}
+			for _, strict := range []bool{false, true} {
+				args := []string{"admin", "health", "--json"}
+				wantExit := uzicli.ExitOK
+				if strict {
+					args = append(args, "--strict")
+					wantExit = uzicli.ExitHealthDanger
+				}
+				out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{AdminHealthDoc: healthDoc("warn", check)}), args...)
+				var doc apitypes.HealthDocDTO
+				if err := json.Unmarshal([]byte(out), &doc); err != nil {
+					t.Fatal(err)
+				}
+				if code != wantExit || doc.Blocking || doc.Status != "warn" || doc.Counts.Warn != 1 ||
+					len(doc.Checks) != 1 || doc.Checks[0].AttentionBanner != attention || doc.Checks[0].Severity != "warn" {
+					t.Fatalf("exit=%d doc=%+v", code, doc)
+				}
+				if strings.Contains(out, "\"attention_banner\"") != attention {
+					t.Fatalf("optional flag changed: %s", out)
+				}
+			}
+		})
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -118,6 +119,10 @@ func (q *joinedReuseStore) RecordCodexRefreshProviderError(ctx context.Context, 
 }
 
 func (q *joinedReuseStore) SetCodexRecoverySlot(ctx context.Context, arg store.SetCodexRecoverySlotParams) (int64, error) {
+	return q.setSlot(ctx, q.Queries, arg)
+}
+
+func (q *joinedReuseStore) setSlot(ctx context.Context, queries *store.Queries, arg store.SetCodexRecoverySlotParams) (int64, error) {
 	q.mu.Lock()
 	q.slotCalls++
 	fail := q.slotCalls <= q.failSlots
@@ -125,8 +130,8 @@ func (q *joinedReuseStore) SetCodexRecoverySlot(ctx context.Context, arg store.S
 	if fail {
 		return 0, errors.New("transient slot write failure")
 	}
-	n, err := q.Queries.SetCodexRecoverySlot(ctx, arg)
-	row, rerr := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: arg.UserID, ID: arg.ID})
+	n, err := queries.SetCodexRecoverySlot(ctx, arg)
+	row, rerr := queries.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: arg.UserID, ID: arg.ID})
 	if err == nil {
 		err = rerr
 	}
@@ -177,11 +182,16 @@ func newJoinedReuseFix(t *testing.T) *joinedReuseFix {
 	}
 	q := &joinedReuseStore{Queries: e.q}
 	fx.svc.q, fx.svc.codexRefresh = q, p
-	fx.svc.vlt = vault.New(e.box, newMemVaultStore())
+	hash, err := auth.HashPassword("joined-fixture-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.exec("UPDATE users SET vault_mode='protected', password_hash=$2 WHERE id=$1", fx.userID, hash)
+	fx.svc.vlt = vault.NewPostgres(e.box, e.pool)
 	if err := fx.svc.vlt.Unlock(e.ctx, fx.userID, "joined-fixture-password"); err != nil {
 		t.Fatal(err)
 	}
-	blob, err := fx.svc.openCodexAccountLogin(fx.userID, acct)
+	blob, err := fx.svc.openCodexAccountLogin(e.ctx, fx.userID, codexAccountSnapshot{CodexProviderAccount: acct})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +292,7 @@ func (f *joinedReuseFix) quarantined(t *testing.T) {
 func (f *joinedReuseFix) recovered(t *testing.T, wantRefresh string) {
 	t.Helper()
 	acct := f.env.mustAccount(t, f.fx.userID, f.fx.accountID)
-	blob, err := f.fx.svc.openCodexAccountLogin(f.fx.userID, acct)
+	blob, err := f.fx.svc.openCodexAccountLogin(f.env.ctx, f.fx.userID, codexAccountSnapshot{CodexProviderAccount: acct})
 	if err != nil || blob.AccessToken != f.p.result.AccessToken || blob.RefreshToken != wantRefresh ||
 		acct.Generation != f.gen+1 || acct.CoordState == codexCoordQuarantined || len(acct.RecoverySealed) != 0 {
 		t.Fatalf("recovered login/access/refresh match=%v/%v gen=%d state=%s slot=%d err=%v",
@@ -312,7 +322,7 @@ func (f *joinedReuseFix) assertSlot(t *testing.T, wantN int64, wantRefresh strin
 	if s.arg.UserID != f.fx.userID || s.arg.ID != f.fx.accountID || s.arg.Op != f.op || s.arg.Gen != f.gen {
 		t.Fatal("slot write lost owner/operation/generation fence")
 	}
-	blob, err := f.fx.svc.openCodexSealed(f.fx.userID, s.arg.Sealed, s.arg.RecoverySealedWith.String)
+	blob, err := openReuseSealed(f.fx.svc, f.fx.userID, s.arg.Sealed, s.arg.RecoverySealedWith.String)
 	if err != nil || blob.AccessToken != f.p.result.AccessToken || blob.RefreshToken != wantRefresh {
 		t.Fatalf("sealed slot material mismatch, err=%v", err)
 	}
@@ -438,7 +448,7 @@ func TestCodexReuseJoinedNegativeControlsLiveDB(t *testing.T) {
 			}
 			if kind == "recovery" || kind == "owner_restore" {
 				acct := e.mustAccount(t, f.fx.userID, f.fx.accountID)
-				blob, openErr := f.fx.svc.openCodexAccountLogin(f.fx.userID, acct)
+				blob, openErr := f.fx.svc.openCodexAccountLogin(f.env.ctx, f.fx.userID, codexAccountSnapshot{CodexProviderAccount: acct})
 				if acct.Generation != f.gen+1 || acct.CoordState == codexCoordQuarantined ||
 					acct.CoordOperationID.Valid || len(acct.RecoverySealed) != 0 || openErr != nil || blob.AccessToken != f.p.result.AccessToken {
 					t.Fatal("existing genuine recovery/owner restore was not retained without Refresh")
@@ -447,7 +457,7 @@ func TestCodexReuseJoinedNegativeControlsLiveDB(t *testing.T) {
 			}
 			if kind != "recovery" && kind != "owner_restore" {
 				acct := e.mustAccount(t, f.fx.userID, f.fx.accountID)
-				blob, openErr := f.fx.svc.openCodexAccountLogin(f.fx.userID, acct)
+				blob, openErr := f.fx.svc.openCodexAccountLogin(f.env.ctx, f.fx.userID, codexAccountSnapshot{CodexProviderAccount: acct})
 				if openErr != nil || blob.AccessToken != f.fx.access || blob.RefreshToken != f.old ||
 					acct.CoordState != codexCoordQuarantined || len(acct.RecoverySealed) != 0 {
 					t.Fatal("negative control changed original login or quarantine")
@@ -637,7 +647,7 @@ func TestCodexReuseJoinedConcurrentResolversLiveDB(t *testing.T) {
 func (f *joinedReuseFix) assertRestored(t *testing.T, access string) {
 	t.Helper()
 	acct := f.env.mustAccount(t, f.fx.userID, f.fx.accountID)
-	blob, err := f.fx.svc.openCodexAccountLogin(f.fx.userID, acct)
+	blob, err := f.fx.svc.openCodexAccountLogin(f.env.ctx, f.fx.userID, codexAccountSnapshot{CodexProviderAccount: acct})
 	if err != nil || blob.AccessToken != access || acct.Generation != f.gen+1 ||
 		acct.CoordState == codexCoordQuarantined || acct.CoordOperationID.Valid || len(acct.RecoverySealed) != 0 {
 		t.Fatalf("owner restore overwritten: access match=%v gen=%d state=%s op=%v slot=%d err=%v",
@@ -757,7 +767,7 @@ func TestCodexReuseJoinedPausedBackgroundWriterLiveDB(t *testing.T) {
 				// material still promotes under the existing account/operation fence.
 				if kind == "past_bound" {
 					acct := f.env.mustAccount(t, f.fx.userID, f.fx.accountID)
-					blob, openErr := f.fx.svc.openCodexAccountLogin(f.fx.userID, acct)
+					blob, openErr := f.fx.svc.openCodexAccountLogin(f.env.ctx, f.fx.userID, codexAccountSnapshot{CodexProviderAccount: acct})
 					if openErr != nil || blob.AccessToken != f.p.result.AccessToken || blob.RefreshToken != f.old || acct.Generation != f.gen+1 {
 						t.Fatal("late current-generation material was not promoted")
 					}
@@ -777,4 +787,17 @@ func TestCodexReuseJoinedPausedBackgroundWriterLiveDB(t *testing.T) {
 			}
 		})
 	}
+}
+
+type joinedReuseTxStore struct {
+	*store.Queries
+	root *joinedReuseStore
+}
+
+func (q *joinedReuseStore) bindCodexRefreshTx(queries *store.Queries) codexRefreshStore {
+	return &joinedReuseTxStore{Queries: queries, root: q}
+}
+
+func (q *joinedReuseTxStore) SetCodexRecoverySlot(ctx context.Context, arg store.SetCodexRecoverySlotParams) (int64, error) {
+	return q.root.setSlot(ctx, q.Queries, arg)
 }

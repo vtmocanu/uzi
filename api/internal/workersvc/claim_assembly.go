@@ -24,6 +24,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
 	"github.com/vtmocanu/uzi/api/internal/toolseed"
@@ -456,7 +457,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// resolves to the uzi default `medium` at this sink (via resolveEffortPtr /
 	// agenttmpl.ResolveDefaultEffort, issue #1157); an explicit choice is carried
 	// verbatim. Unlike DefaultModel there is no per-schedule freeze — the owner's
-	// per-user value is the only source.
+	// per-user value is the only source, except for a checker child, which carries
+	// its frozen cross-check resolution (an unpinned checker is CrossCheckDefaultEffort).
 	var defaultEffort pgtype.Text
 	if checkerResolution != nil {
 		defaultEffort = pgconv.TextOrNull(checkerResolution.Effort)
@@ -759,17 +761,18 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		RequeueCount:   run.RequeueCount,
 		// PRD #1296 M1 (D2): the claim-lane counter the ClaimRun CTE just incremented, read
 		// straight off the returned run row and returned in the claim payload.
-		ClaimGeneration:          run.ClaimGeneration,
-		WorkerRecoveryEpisode:    claimRecoveryEpisode(run),
-		MemoryEpisode:            run.MemoryEpisode,
-		MemoryInterventionCount:  run.MemoryInterventionCount,
-		MemoryPolicy:             frozenMemoryPolicy,
-		PlanMd:                   textPtr(run.PlanMd),
-		AutoApprove:              run.AutoApprove,
-		PlanCrossCheckRequired:   run.PlanCrossCheckRequired,
-		CodeCrossCheckRequired:   run.CodeCrossCheckRequired,
-		PlanCrossCheckCodexLead:  planCrossCheckCodexLeadSupported(run),
-		PlanCrossCheckGateReason: textPtr(run.PlanCrossCheckGateReason),
+		ClaimGeneration:            run.ClaimGeneration,
+		WorkerRecoveryEpisode:      claimRecoveryEpisode(run),
+		WorkerRecoveryOwnerEpisode: run.WorkerRecoveryEpisode,
+		MemoryEpisode:              run.MemoryEpisode,
+		MemoryInterventionCount:    run.MemoryInterventionCount,
+		MemoryPolicy:               frozenMemoryPolicy,
+		PlanMd:                     textPtr(run.PlanMd),
+		AutoApprove:                run.AutoApprove,
+		PlanCrossCheckRequired:     run.PlanCrossCheckRequired,
+		CodeCrossCheckRequired:     run.CodeCrossCheckRequired,
+		PlanCrossCheckCodexLead:    planCrossCheckCodexLeadSupported(run),
+		PlanCrossCheckGateReason:   textPtr(run.PlanCrossCheckGateReason),
 		// PRD #400 M2: task-run MR gate + source ref. open_mr is a plain bool (false
 		// for every non-task run); base_branch is pgtype.Text (nil for a run that has
 		// none). Both re-read from the row on every claim, like AutoApprove above.
@@ -969,15 +972,16 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// transaction and matches these by IDENTITY, so pass them through untouched:
 			// errVaultLocked (transient requeue), errRunVanished (drop) and
 			// errCodexMintAmbiguous (no payload, no mutation: the mint write may have landed).
-			// Every other Codex error is wrapped as errCredentialUnavailable with %w, so the
+			// Snapshot reader infrastructure errors pass through with their underlying cause.
+			// Other Codex errors are wrapped as errCredentialUnavailable with %w, so the
 			// sentinel and any minted epoch/hash survive for that classifier: a quarantine or a
 			// same-alias re-login in flight parks the run in recovery_wait, and the other
 			// credential failures (kind/mode mismatch, login blob, revoked revision, identity
-			// change, a store defect) stay terminal.
+			// change) stay terminal.
 			// errCredentialDisabled (the frozen alias is disabled, refused before any mint) passes
 			// through too: finishRunClaim parks it on credential_disabled (PRD #1732 D14).
 			if errors.Is(err, errVaultLocked) || errors.Is(err, errRunVanished) || errors.Is(err, errCodexMintAmbiguous) ||
-				errors.Is(err, errCredentialDisabled) {
+				errors.Is(err, errCredentialDisabled) || errors.Is(err, store.ErrVaultSealStale) || errors.Is(err, secretopen.ErrReaderFailure) {
 				return nil, err
 			}
 			return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)

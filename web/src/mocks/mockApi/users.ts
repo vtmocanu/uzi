@@ -2,7 +2,7 @@ import { ApiError } from "../../lib/apiError";
 import { mockAdmin, mockBuildInfo } from "../data";
 import { state } from "../store";
 import { delay, oidcDemo, users } from "./shared";
-import { sessionBody } from "./settings";
+import { appSettings, sessionBody } from "./settings";
 
 export const usersApi = {
   // ── Auth: instant and fake. Any credentials sign in as the admin. ──────────
@@ -10,6 +10,9 @@ export const usersApi = {
   // the real API (PRD #19 M2), so the mocked SPA resolves them the same way.
   register: async (email: string, _password: string, displayName: string) => {
     state.session = { ...mockAdmin, email, display_name: displayName || mockAdmin.display_name };
+    state.vaultMode = appSettings.vault_policy === "optional" ? "unprotected" : "protected";
+    state.vaultExists = state.vaultMode === "protected";
+    state.vaultUnlocked = state.vaultMode === "protected";
     return delay(sessionBody());
   },
   login: async (email: string, _password: string) => {

@@ -23,8 +23,8 @@ func workerRecoveryAllowance(r apitypes.RunDTO) string {
 }
 
 func workerExhaustionLine(r apitypes.RunDTO) string {
-	if isRetainedRecovery(r) {
-		return retainedRecoveryLine(r)
+	if isRecoveryDecisionPark(r) {
+		return recoveryDecisionLine(r)
 	}
 	if isMemoryHold(r) {
 		return memoryHoldLine(r)
@@ -44,23 +44,23 @@ func workerExhaustionEvidence(r apitypes.RunDTO) []string {
 	if isMemoryHold(r) {
 		return []string{"Source/archive availability and latest local edits are unverified. Historical checkpoints and captures do not verify current availability or latest edits."}
 	}
-	if !isWorkerRecoveryExhausted(r) && !isRetainedRecovery(r) {
+	if !isWorkerRecoveryExhausted(r) && !isRecoveryDecisionPark(r) {
 		return nil
 	}
 	if r.WorkerRecovery == nil || r.WorkerRecovery.Evidence == nil {
-		if isRetainedRecovery(r) {
+		if isRecoveryDecisionPark(r) {
 			return []string{"Recovery evidence unavailable or unknown. Source/archive availability and latest local edits are unverified."}
 		}
 		return []string{"Recovery evidence unavailable or unknown."}
 	}
 	e := r.WorkerRecovery.Evidence
 	var lines []string
-	if isRetainedRecovery(r) {
+	if isRecoveryDecisionPark(r) {
 		lines = append(lines, "Historical evidence: source/archive availability and latest local edits are unverified.")
 	}
 	if e.CheckpointTip != nil && *e.CheckpointTip != "" {
 		when := " before this hold"
-		if isRetainedRecovery(r) {
+		if isRecoveryDecisionPark(r) {
 			when = ""
 		}
 		lines = append(lines, "The server recorded checkpoint "+cellText(*e.CheckpointTip)+when+". Current availability and the latest local edits are not verified.")
@@ -94,8 +94,8 @@ func workerExhaustionEvidence(r apitypes.RunDTO) []string {
 // workerExhaustionTUILines puts owner actions and historical caveats before
 // values that a narrow terminal may clip. Each entry occupies one physical row.
 func workerExhaustionTUILines(r apitypes.RunDTO) []string {
-	if isRetainedRecovery(r) {
-		return retainedRecoveryTUILines(r)
+	if isRecoveryDecisionPark(r) {
+		return recoveryDecisionTUILines(r)
 	}
 	if isMemoryHold(r) {
 		return memoryHoldTUILines(r)
@@ -143,12 +143,15 @@ func workerExhaustionTUILines(r apitypes.RunDTO) []string {
 }
 
 func workerExhaustionRows(r apitypes.RunDTO) [][]string {
-	if !isOwnerRequiredWorkerHold(r) && !isRetainedRecovery(r) {
+	if !isOwnerRequiredWorkerHold(r) && !isRecoveryDecisionPark(r) {
 		return nil
 	}
 	label := "WORKER_RECOVERY"
-	if isRetainedRecovery(r) {
+	if isRecoveryDecisionPark(r) {
 		label = "RETAINED_RECOVERY"
+		if strOr(r.RecoveryWaitCause, "") == "codex_idle_stall" {
+			label = "CODEX_IDLE_STALL"
+		}
 	}
 	if isMemoryHold(r) {
 		label = "MEMORY_HOLD"

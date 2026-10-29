@@ -250,6 +250,9 @@ func TestRecoveryStoreLifecycleLiveDB(t *testing.T) {
 			t.Fatalf("InsertCaptureChunk(%d): %v", i, err)
 		}
 	}
+	if n, err := q.StampCaptureReservation(ctx, store.StampCaptureReservationParams{ID: cap1.ID, ReservedBytes: pgtype.Int8{Int64: 4096, Valid: true}}); err != nil || n != 1 {
+		t.Fatalf("StampCaptureReservation: rows=%d err=%v", n, err)
+	}
 	ready, err := q.MarkCaptureReady(ctx, store.MarkCaptureReadyParams{
 		ID: cap1.ID, ExpiresAt: pgtype.Timestamptz{Time: now.Add(7 * 24 * time.Hour), Valid: true},
 	})

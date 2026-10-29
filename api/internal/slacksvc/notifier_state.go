@@ -1088,7 +1088,7 @@ func statusGlyph(rc store.GetSlackRunContextRow) (emoji, label string) {
 		if rc.RecoveryWaitCause.Valid && rc.RecoveryWaitCause.String == "provider_outage" {
 			return "🔄", "Recovering · provider outage"
 		}
-		// issue #1197: a transient-recovery park that auto-resumes on a capped backoff.
+		// issue #1197: recovery parks include timed retries and owner-held causes (#3509).
 		// Without this case the default arm below renders the raw enum `recovery_wait` on
 		// the root line of a user-facing DM (Slack has no _→space fallback, PRD #88 M3
 		// added the explicit awaiting_input/awaiting_followup cases for exactly this bug).

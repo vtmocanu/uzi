@@ -77,6 +77,7 @@ func TestAssembleClaimCodexOnlyFullAssemblySucceedsLiveDB(t *testing.T) {
 	resealBotPAT(t, env, f.userID)
 
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	run := mustRun(t, env, f.runID)
 	if run.Harness != harnessCodex {
 		t.Fatalf("fixture run harness = %q, want codex", run.Harness)
@@ -108,6 +109,7 @@ func TestAssembleClaimCodexBothCredentialsNoAnthropicEpochLiveDB(t *testing.T) {
 	seedDefaultAnthropicToken(t, env, f.userID) // the user ALSO holds a usable Anthropic token
 
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	run := mustRun(t, env, f.runID)
 
 	payload, err := svc.assembleClaim(env.ctx, f.wkr, run)
@@ -137,6 +139,7 @@ func TestAssembleClaimClaudeRunUnchangedLiveDB(t *testing.T) {
 	runID := env.seedCodexRun(t, userID, workerID, repoID) // harness defaults to 'claude'
 
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	run := mustRun(t, env, runID)
 	if run.Harness != harnessClaude {
 		t.Fatalf("fixture run harness = %q, want claude", run.Harness)
@@ -171,6 +174,7 @@ func TestAssembleClaimD6ModelFallbackDropsClaudeAliasLiveDB(t *testing.T) {
 	env.exec(`UPDATE runs SET model = $2 WHERE id = $1`, f.runID, claudeAlias)
 
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	run := mustRun(t, env, f.runID)
 	if run.Model.String != claudeAlias || !run.Model.Valid {
 		t.Fatalf("fixture run model = %+v, want the stored claude alias %q", run.Model, claudeAlias)

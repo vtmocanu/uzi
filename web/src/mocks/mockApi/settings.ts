@@ -8,6 +8,8 @@ import {
   type UpdateSettingsPayload,
   type UserSettings,
   type UserSettingsPatch,
+  type VaultStatus,
+  type VaultDisableResponse,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { trimAllowlistToken, uuidIdentity } from "../../lib/dockerAllowlist";
@@ -24,7 +26,7 @@ import {
 import { daysAgo, mockBuildInfo } from "../data";
 import { hasAnthropicToken, isCodexUsable } from "../../lib/hasToken";
 import { trustedBotsValueError } from "../../lib/trustedReviewBots";
-import { state } from "../store";
+import { mockVaultMaterial, state } from "../store";
 import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
@@ -110,7 +112,7 @@ const SEED_USER_SETTINGS: UserSettings = {
 if (mockScenario() === "cross-check-mixed") {
   SEED_USER_SETTINGS.cross_check_pins = [
     { stage: "plan", harness: "codex", model: "gpt-6-sol", effort: null,
-      worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "pin", effort_source: "worker default", active: true },
+      worker_default_model: null, resolved_model: null, resolved_effort: "high", model_source: "pin", effort_source: "cross-check default", active: true },
   ];
 }
 if (mockScenario() === "cross-check-dormant-claude") {
@@ -121,6 +123,7 @@ if (mockScenario() === "cross-check-dormant-claude") {
 }
 
 const SEED_APP_SETTINGS: AppSettings = {
+  vault_policy: "required",
   autopilot_label: "autopilot",
   // PRD #764: the single run-eligibility label.
   uzi_label: "uzi",
@@ -290,6 +293,7 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
       (Array.isArray(u.sidebar_codex_account_ids) &&
         u.sidebar_codex_account_ids.every((id) => typeof id === "string")));
   const okApp =
+    (a.vault_policy === undefined || a.vault_policy === "optional" || a.vault_policy === "required") &&
     typeof a.autopilot_label === "string" &&
     // PRD #764: accept legacy blobs that predate this field (undefined) — it is filled
     // from the seed default ("uzi") on load — but reject a malformed non-string.
@@ -516,10 +520,10 @@ function mySettingsResponse(): { settings: UserSettings } {
     const model = pin?.model ?? null, effort = pin?.effort ?? null;
     const workerModel = harness === "claude" ? userSettings.default_claude_model ?? mockDefaultClaudeModel()
       : userSettings.default_codex_model ?? "gpt-6.1-sol";
-    const workerEffort = harness === "claude" ? userSettings.default_effort : userSettings.default_codex_effort;
+    // An unpinned checker effort is the server's cross-check default, never the worker effort.
     return { stage, harness, model, effort, worker_default_model: workerModel, resolved_model: model ?? workerModel,
-      resolved_effort: effort ?? workerEffort ?? "medium", model_source: model === null ? "worker default" : "pin",
-      effort_source: effort === null ? "worker default" : "pin", active: true };
+      resolved_effort: effort ?? "high", model_source: model === null ? "worker default" : "pin",
+      effort_source: effort === null ? "cross-check default" : "pin", active: true };
   }));
   // PRD #3245: both judge cells through the one mock resolver (pinned to the server's by
   // fixtures/model-settings/judge.json), from the stored user lanes and instance values.
@@ -584,6 +588,7 @@ function settingsResponse(): SettingsResponse {
   }
   // The demo has no real socket, so Slack is always "disabled" here.
   return {
+    unprotected_users: state.vaultMode === "unprotected" ? 1 : 0,
     settings: effective,
     secrets: { ...slackSecrets },
     sources,
@@ -592,6 +597,21 @@ function settingsResponse(): SettingsResponse {
     oidc_status: oidcDemo().oidcStatus,
     oidc_provider_name: oidcDemo().providerName,
   };
+}
+
+// Shared session/status projection; wrapper absence does not determine mode.
+function mockVaultStatus(): VaultStatus {
+  return {
+    ...mockVaultMaterial(oidcDemo().passwordless),
+    policy: appSettings.vault_policy === "optional" ? "optional" : "required",
+  };
+}
+
+// Project mode and lock state from one status observation for both admin meters.
+export function mockVaultRateFields(userId: string) {
+  if (userId !== state.session?.id) return {};
+  const vault = mockVaultStatus();
+  return { vault_mode: vault.mode, vault_locked: vault.mode === "protected" && !vault.unlocked };
 }
 
 // sessionBody is the auth/session bootstrap payload: the signed-in user, the
@@ -648,11 +668,7 @@ export function sessionBody() {
       {},
       { dark: appSettings.default_dark_theme || appSettings.default_theme },
     ).dark,
-    // A passwordless (OIDC) demo user has no vault yet, so the SPA shows the
-    // passphrase-create banner; a password demo user keeps the existing behavior.
-    vault: oidcDemo().passwordless
-      ? { unlocked: false, exists: false }
-      : { unlocked: state.vaultUnlocked, exists: true },
+    vault: mockVaultStatus(),
     has_password: !oidcDemo().passwordless,
     // Judge consent (PRD #69 M4), resolved exactly like the server: enforced only when
     // BOTH the kill-switch and enforce-all are on (Gate-2-wins), and the effective model
@@ -663,6 +679,20 @@ export function sessionBody() {
 }
 
 export const settingsApi = {
+  vaultStatus: async () => delay(mockVaultStatus(), 40),
+  vaultDisable: async (): Promise<VaultDisableResponse> => {
+    const vault = mockVaultStatus();
+    if (vault.policy === "required") throw new ApiError(403, "instance policy requires credential protection");
+    if (vault.mode === "protected") {
+      if (!vault.exists) throw new ApiError(409, "vault is not set up; enable it before disabling protection");
+      if (!vault.unlocked) throw new ApiError(409, "vault is locked; unlock before disabling protection");
+    }
+    state.vaultMode = "unprotected";
+    state.vaultExists = false;
+    state.vaultUnlocked = false;
+    return delay({ mode: "unprotected" }, 150);
+  },
+
   // PRD #685: public branding read. Coerces the string-space settings to the typed
   // (bool) chrome shape and derives the two *_present flags from the tracked assets.
   branding: async () =>
@@ -737,6 +767,13 @@ export const settingsApi = {
     const nonSecret: Partial<AppSettings> = {};
     for (const [key, raw] of Object.entries(updates)) {
       const value = raw ?? "";
+      if (key === "vault_policy") {
+        if (value !== "optional" && value !== "required") {
+          throw new ApiError(400, "vault_policy must be optional or required");
+        }
+        nonSecret.vault_policy = value;
+        continue;
+      }
       if (key === "slack_bot_token" || key === "slack_app_token") {
         const prefix = key === "slack_bot_token" ? "xoxb-" : "xapp-";
         if (!value.startsWith(prefix)) {

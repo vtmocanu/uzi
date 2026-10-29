@@ -11,6 +11,14 @@ import (
 )
 
 func TestRetainedParkSweepersPreserveHeldRowLiveDB(t *testing.T) {
+	for _, cause := range []string{"retained_recovery_exhausted", "retained_recovery_adoption_failed"} {
+		t.Run(cause, func(t *testing.T) {
+			testRetainedParkSweepersPreserveHeldRowLiveDB(t, cause)
+		})
+	}
+}
+
+func testRetainedParkSweepersPreserveHeldRowLiveDB(t *testing.T, cause string) {
 	for _, name := range []string{
 		"health", "RequestWallParks", "ParkRunsAtWall",
 		"FailRunsOfStaleWorkersOverCap", "RequeueRunsOfStaleWorkers",
@@ -35,14 +43,14 @@ func TestRetainedParkSweepersPreserveHeldRowLiveDB(t *testing.T) {
 			env.exec("INSERT INTO recovery_captures(id,hold_id,run_id,user_id,original_worker_identity,source_sha,idempotency_key,state,expires_at) VALUES($1,$2,$3,$4,'retained-sweep','aaaa1111','retained-sweep','available',now()+interval '1 hour')", capture, hold, held, user)
 			svc := snapshotSvc(env, testParams())
 			svc.p.RunRetainedRecoveryMaxParks = 0
-			if _, applied, err := svc.SetState(env.ctx, store.Worker{ID: worker}, held, retainedReport(2)); err != nil || !applied {
+			if _, applied, err := svc.SetState(env.ctx, store.Worker{ID: worker}, held, retainedReportCause(2, cause)); err != nil || !applied {
 				t.Fatalf("park applied=%v err=%v", applied, err)
 			}
 			// The held row has both an expired wall and a stale worker. Snapshot-based
 			// writers additionally see no active-run evidence for its generation.
 			env.exec("UPDATE workers SET last_heartbeat_at=now()-interval '1 hour' WHERE id=$1", worker)
 			before := exhaustionRun(t, env, held)
-			if before.Status != "recovery_wait" || before.RecoveryWaitCause.String != recoveryCauseRetainedRecoveryExhausted || before.RecoveryRetryNotBefore.Valid || !before.ClaimReleasedAt.Valid {
+			if before.Status != "recovery_wait" || before.RecoveryWaitCause.String != cause || before.RecoveryRetryNotBefore.Valid || !before.ClaimReleasedAt.Valid {
 				t.Fatalf("not a fenced NULL-stamp retained hold: %+v", before)
 			}
 			custody := func() string {

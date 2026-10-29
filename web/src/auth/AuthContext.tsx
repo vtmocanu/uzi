@@ -83,6 +83,8 @@ interface AuthState {
   // banner, and the "waiting for vault unlock" run state. Defaults to true (a
   // server that predates the field, or a signed-out visitor, shows no banner).
   vaultUnlocked: boolean;
+  vaultMode?: "protected" | "unprotected";
+  vaultPolicy?: "optional" | "required";
   // vaultExists is whether the user has a vault row at all; hasPassword is false for
   // OIDC-only users (PRD #45). Together they let the locked banner choose between the
   // passphrase-create dialog (passwordless + no vault yet) and the unlock banner.
@@ -99,7 +101,10 @@ interface AuthState {
   register: (email: string, password: string, displayName: string) => Promise<void>;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
-  refresh: () => Promise<void>;
+  refresh: (fresh?: boolean, strict?: boolean) => Promise<void>;
+  // Capture before sending a toggle; reject results from a superseded session.
+  beginVaultChange?: () => (mode: "protected" | "unprotected") => boolean;
+  vaultMetadataPending?: boolean;
   // Apply an authoritative current-user DTO returned by a successful settings save.
   updateUser: (savedUser: User) => void;
   // serverUnreachable is true when the session probe failed for a reason other than
@@ -129,18 +134,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [appearance, setAppearance] = useState<AppearanceState>(() =>
     fallbackAppearance("ember", null, "ember"),
   );
+  const [vaultMode, setVaultMode] = useState<"protected" | "unprotected">("protected");
+  const [vaultPolicy, setVaultPolicy] = useState<"optional" | "required">("required");
   const [vaultUnlocked, setVaultUnlocked] = useState(true);
   const [vaultExists, setVaultExists] = useState(true);
+  const [vaultMetadataPending, setVaultMetadataPending] = useState(false);
   const [hasPassword, setHasPassword] = useState(true);
   const [judgeEnforcedByAdmin, setJudgeEnforcedByAdmin] = useState(false);
   const [effectiveJudgeModel, setEffectiveJudgeModel] = useState("");
   const [serverUnreachable, setServerUnreachable] = useState(false);
-  // At most one session probe is in flight: a refresh while one is pending joins it,
-  // so probe results can never settle out of order. sessionGen is bumped by an
+  // Ordinary refreshes join a pending probe. A fresh refresh after a vault mutation
+  // supersedes it immediately; sessionGen drops the older response. It is also bumped by an
   // explicit login, register, logout, settings update or another request's 401;
   // a probe started before one of those drops its result rather than undoing it.
   const probeInFlight = useRef<Promise<void> | null>(null);
   const sessionGen = useRef(0);
+  // Authentication changes retire mutation authority; ordinary probes and
+  // same-user preference saves only invalidate older session snapshots.
+  const authSessionGen = useRef(0);
+  const probeToken = useRef<object | null>(null);
 
   // applySession records the user and the instance labels from a session
   // response, falling back to the compiled-in defaults for a server that predates
@@ -170,6 +182,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       typeface: nextAppearance.typeface,
     });
     // Absent field (older server) reads as unlocked, so no spurious banner.
+    setVaultMetadataPending(false);
+    setVaultMode(session.vault?.mode ?? "protected");
+    setVaultPolicy(session.vault?.policy ?? "required");
     setVaultUnlocked(session.vault?.unlocked ?? true);
     // Absent → true so a password user / older server never sees the create dialog.
     setVaultExists(session.vault?.exists ?? true);
@@ -190,9 +205,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser((current) => (current?.id === savedUser.id ? savedUser : current));
   }, []);
 
-  const refresh = useCallback(() => {
-    if (probeInFlight.current) return probeInFlight.current;
+  const beginVaultChange = useCallback(() => {
+    const id = currentUserID.current;
+    const gen = authSessionGen.current;
+    return (mode: "protected" | "unprotected") => {
+      if (id === null || id !== currentUserID.current || gen !== authSessionGen.current) return false;
+      sessionGen.current += 1;
+      probeInFlight.current = null;
+      setVaultMode(mode);
+      // Successful toggles create/delete the wrapper atomically with mode.
+      setVaultExists(mode === "protected");
+      setVaultUnlocked(false);
+      setVaultMetadataPending(true);
+      return true;
+    };
+  }, []);
+
+  const refresh = useCallback(async (fresh = false, strict = false) => {
+    if (fresh) {
+      sessionGen.current += 1;
+      probeInFlight.current = null;
+    }
+    if (probeInFlight.current) {
+      return strict ? probeInFlight.current : probeInFlight.current.catch(() => undefined);
+    }
     const gen = sessionGen.current;
+    const token = {};
+    probeToken.current = token;
     const probe = (async () => {
       try {
         const session = await api.me();
@@ -201,6 +240,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       } catch (err) {
         if (gen !== sessionGen.current) return;
         if (err instanceof ApiError && err.status === 401) {
+          authSessionGen.current += 1;
           currentUserID.current = null;
           setUser(null);
           setServerUnreachable(false);
@@ -210,12 +250,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setServerUnreachable(true);
         }
         setLoading(false);
+        throw err;
       } finally {
-        probeInFlight.current = null;
+        if (probeToken.current === token) probeInFlight.current = null;
       }
     })();
     probeInFlight.current = probe;
-    return probe;
+    return strict ? probe : probe.catch(() => undefined);
   }, [applySession]);
 
   // Any authenticated request that comes back 401 (a session expired or deleted
@@ -228,6 +269,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // Another request's 401: the session is gone. Invalidate any pending probe
       // so its later result cannot restore the user.
       sessionGen.current += 1;
+      authSessionGen.current += 1;
       currentUserID.current = null;
       setUser(null);
       setServerUnreachable(false);
@@ -288,6 +330,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     async (email: string, password: string, displayName: string) => {
       const session = await api.register(email, password, displayName);
       sessionGen.current += 1;
+      authSessionGen.current += 1;
       applySession(session);
     },
     [applySession],
@@ -297,6 +340,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     async (email: string, password: string) => {
       const session = await api.login(email, password);
       sessionGen.current += 1;
+      authSessionGen.current += 1;
       applySession(session);
     },
     [applySession],
@@ -307,6 +351,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       await api.logout();
     } finally {
       sessionGen.current += 1;
+      authSessionGen.current += 1;
       currentUserID.current = null;
       setUser(null);
       setServerUnreachable(false);
@@ -321,6 +366,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       uziLabel,
       autopilotLabel,
       appearance,
+      vaultMode,
+      vaultPolicy,
       vaultUnlocked,
       vaultExists,
       hasPassword,
@@ -331,6 +378,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       logout,
       refresh,
       updateUser,
+      beginVaultChange,
+      vaultMetadataPending,
       serverUnreachable,
       retry: refresh,
     }),
@@ -340,6 +389,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       uziLabel,
       autopilotLabel,
       appearance,
+      vaultMode,
+      vaultPolicy,
       vaultUnlocked,
       vaultExists,
       hasPassword,
@@ -350,6 +401,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       logout,
       refresh,
       updateUser,
+      beginVaultChange,
+      vaultMetadataPending,
       serverUnreachable,
     ],
   );

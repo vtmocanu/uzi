@@ -11,6 +11,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // PRD #1209 M4, DELIVERABLE C: the zero-worker reauth-restart REGRESSION, end to end. Begin
@@ -81,7 +82,7 @@ func TestCodexReauthSurvivesRestartThenReplacementClearsLiveDB(t *testing.T) {
 	// A collect on the restarted Service, while still flagged, is disabled (not a poll target)
 	// — the flag stops collection until a verified replacement lands.
 	fake2 := &fakeUsageClient{}
-	freshSvc := &Service{q: freshQ, box: freshBox, codexRefresh: fake2}
+	freshSvc := &Service{q: freshQ, box: freshBox, vlt: vault.NewPostgres(freshBox, freshPool), codexRefresh: fake2}
 	if _, cerr := freshSvc.CollectCodexAccountUsage(env.ctx, fx.userID, fx.accountID); mustUsageFailure(t, cerr).Kind != CodexUsageFailDisabled {
 		t.Fatalf("a reauth-flagged account must be disabled for polling, got %v", cerr)
 	}
@@ -96,7 +97,7 @@ func TestCodexReauthSurvivesRestartThenReplacementClearsLiveDB(t *testing.T) {
 		codexLoginBlob{AccessToken: newAccess, RefreshToken: codexToken("refresh-reimport")})
 	fid := newFakeCodexIdentity()
 	fid.idByToken[newAccess] = codexauth.Identity{ProviderUserID: fx.providerUserID, WorkspaceAccountID: fx.workspaceID}
-	r := NewCodexReconciler(freshQ, nil, freshBox, fid, freshPool)
+	r := NewCodexReconciler(freshQ, vault.NewPostgres(freshBox, freshPool), freshBox, fid, freshPool)
 	if rerr := r.ReconcileCodexAuthIdentity(env.ctx, fx.userID, newAlias); rerr != nil {
 		t.Fatalf("reconcile verified replacement: %v", rerr)
 	}

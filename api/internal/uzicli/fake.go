@@ -36,6 +36,7 @@ type FakeClient struct {
 	// VaultLocked drives WhoamiVault and VaultStatus, so fixtures share one vault state.
 	// Whoami ignores it (it stays {user}-only).
 	VaultLocked bool
+	VaultMode   string
 
 	VaultStatusErr       error
 	VaultUnlockErr       error

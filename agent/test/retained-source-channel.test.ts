@@ -436,6 +436,58 @@ describe("discard through the real socket", () => {
     assert.deepEqual(rig.holdsCalls.filter((x) => x === a.runId).length >= 1, true);
   });
 
+  it("issue #3404 opens the authority transaction before the run reservation and keeps it through the deletion", { skip: LINUX_ONLY }, async () => {
+    const a = await retainedAttempt("run-authority", 1);
+    const holder: { events: string[] } = { events: [] };
+    const authority = {
+      withTransaction: async <T,>(fn: (tx: never) => Promise<T>): Promise<T> => {
+        holder.events.push("authority_enter");
+        try { return await fn(undefined as never); } finally { holder.events.push("authority_exit"); }
+      },
+    };
+    const rig = await rigOf({ server: { authority } });
+    holder.events = rig.events;
+    const ev = await inspectOne(rig, a);
+    rig.events.length = 0;
+    const r = await send(rig.sock, { op: "discard", run: a.runId, generation: 1, attempt: a.attemptId, confirm: ev.descriptor });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const ix = (name: string): number => rig.events.indexOf(name);
+    assert.ok(ix("authority_enter") >= 0 && ix("authority_enter") < ix("reservation_installed"), rig.events.join(","));
+    assert.ok(ix("delete") < ix("reservation_released") && ix("reservation_released") < ix("authority_exit"), rig.events.join(","));
+    assert.ok(ix("authority_exit") < ix("gate_opened:retained_ops"), rig.events.join(","));
+  });
+
+  it("issue #3404 bounds the discard's wait for A and ends the discarded paths' source use under the same A", { skip: LINUX_ONLY }, async () => {
+    const a = await retainedAttempt("run-authority-wait", 1);
+    const holder: { events: string[]; options: Array<{ signal?: AbortSignal; timeoutMs?: number } | undefined>; ended: string[][] } =
+      { events: [], options: [], ended: [] };
+    const authority = {
+      withTransaction: async <T,>(fn: (tx: never) => Promise<T>, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<T> => {
+        holder.events.push("authority_enter");
+        holder.options.push(options);
+        try { return await fn(undefined as never); } finally { holder.events.push("authority_exit"); }
+      },
+      endSourceUse: async (paths: Iterable<string>) => {
+        holder.events.push("end_source_use");
+        holder.ended.push([...paths]);
+        return { ended: [], kept: [] };
+      },
+    };
+    const rig = await rigOf({ server: { authority } });
+    holder.events = rig.events;
+    const ev = await inspectOne(rig, a);
+    rig.events.length = 0;
+    const r = await send(rig.sock, { op: "discard", run: a.runId, generation: 1, attempt: a.attemptId, confirm: ev.descriptor });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const [options] = holder.options;
+    assert.ok(options?.signal instanceof AbortSignal, "the shutdown signal ends the wait");
+    assert.ok(typeof options?.timeoutMs === "number" && options.timeoutMs > 0 && options.timeoutMs <= 60_000,
+      `an explicit short deadline, not the 600 s default: ${options?.timeoutMs}`);
+    assert.deepEqual(holder.ended, [[a.path]], "the discarded clone's source use is ended");
+    const ix = (name: string): number => rig.events.indexOf(name);
+    assert.ok(ix("reservation_released") < ix("end_source_use") && ix("end_source_use") < ix("authority_exit"), rig.events.join(","));
+  });
+
   it("the quiescence the boundary hands GitCache is capture-mode and scoped to the clone and its skills sibling", { skip: LINUX_ONLY }, async () => {
     const a = await retainedAttempt("run-q", 1);
     const skills = path.join(path.dirname(a.path), `.uzi-skills-${path.basename(a.path)}`);

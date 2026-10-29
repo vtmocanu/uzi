@@ -43,6 +43,7 @@ func TestAssembleClaimPausePendingTrueLiveDB(t *testing.T) {
 	env.exec(`UPDATE runs SET pause_requested_at = now(), pause_mode = 'milestone' WHERE id = $1`, runID)
 
 	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
 	wkr := store.Worker{ID: workerID, UserID: userID}
 
 	run := mustRun(t, env, runID)

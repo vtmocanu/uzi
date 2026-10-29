@@ -172,18 +172,23 @@ reported no-ops; they do not wait for CI or create a bundle. Failed previous
 publication and other blocked plans still refuse. Manual RC respins preserve
 the cutter's existing empty-delta behavior.
 
-The provisional push cutoff is strictly before 06:00 on the original run's
+The provisional push cutoff is strictly before 08:00 on the original run's
 Bucharest calendar date. A queued run does not gain a fresh window tomorrow.
-Tip waiting ends by 05:50, reserving a provisional 600 seconds from the existing
-cutter timeout, not a measured cut duration. The key job checks the window before
+Tip waiting ends by 07:50, reserving a provisional 600 seconds from the existing
+cutter timeout, not a measured cut duration. Scheduled waiting uses the full
+remaining window, about three hours from 04:47, under the 20-job concurrency cap.
+The prepare job ceiling is 210 minutes (183 waiting, ten cutting, 17 overhead).
+Manual waits remain 7200 seconds and their cutter timeout remains 600 seconds;
+only the job ceiling rises. Push/watch ceilings remain 15/125 minutes.
+The key job checks the window before
 minting and independently again immediately before the atomic update, validating
 numeric epochs and the Bucharest offset. Creation timestamps tolerate 60 seconds
-of clock skew; the 06:00 push cutoff has no grace period. A missed window stops
+of clock skew; the 08:00 push cutoff has no grace period. A missed window stops
 with `missed-target` and no push; a tip not green in its budget is reported
 separately. Main races never cause automatic rebasing or an older-tip fallback.
 Expected no-ops stay in the summary; misses and failures update the tracking
 issue. Once a tag is pushed, recovery ignores the cutoff and pause flag.
-Verification recorded after the 07:00 local target produces a late warning,
+Verification recorded after the 09:00 local target produces a late warning,
 retaining verified success without opening an extra incident. These times are
 best-effort targets, subject to Actions delays and the shared non-cancelling queue.
 

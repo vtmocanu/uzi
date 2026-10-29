@@ -133,6 +133,43 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("shows budget pressure with zero quota refusals as an owner housekeeping warning", async () => {
+    const doc = healthySilentDoc();
+    const storage = doc.checks.find((c) => c.id === "recovery.storage")!;
+    storage.severity = "warn";
+    storage.summary = "At least 80% of budget: per-owner recovery, instance recovery, shared stored files; 0 captures currently marked quota-refused.";
+    storage.evidence = [
+      { label: "Quota-refused captures", value: "0" },
+      { label: "Maximum owner recovery bytes", value: "80" },
+      { label: "Recovery bytes", value: "160" },
+      { label: "Shared stored bytes", value: "240" },
+      { label: "Recovery per-owner limit", value: "100 bytes" },
+      { label: "Recovery instance limit", value: "200 bytes" },
+      { label: "Shared stored-files limit", value: "300 bytes" },
+    ];
+    storage.action = "Reduce stored bytes or raise the pressured budgets before recovery uploads are refused.";
+    expect(storage.scope).toBe("owner");
+    expect(storage.group).toBe("housekeeping");
+    const pressured = retally(doc);
+    expect(pressured.status).toBe("warn");
+    expect(pressured.blocking).toBe(false);
+
+    const { container } = await renderHealth(pressured);
+    expect(attentionIds(container)).toEqual(["recovery.storage"]);
+    const item = attentionItem(container, "recovery.storage")!;
+    expect(within(item).getByText("Warn")).toBeTruthy();
+    expect(within(item).getByText("Recovery storage")).toBeTruthy();
+    expect(within(item).getByText(/· Housekeeping/)).toBeTruthy();
+    expect(within(item).getByText("At least 80% of budget: per-owner recovery, instance recovery, shared stored files; 0 captures currently marked quota-refused.")).toBeTruthy();
+    for (const e of storage.evidence) {
+      const label = within(item).getByText(e.label);
+      expect(label.nextElementSibling?.textContent).toBe(e.value);
+    }
+    expect(within(item).getByText(storage.action)).toBeTruthy();
+    expect(band("1 check needs attention").getAttribute("role")).toBe("status");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("shows both Codex pricing reasons and operator docs without blocking work", async () => {
     const doc = healthySilentDoc();
     expect(doc.checks).toHaveLength(23);
@@ -169,7 +206,7 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
 
   it("keeps owner danger evidence and action visible without claiming an instance block", async () => {
     const { container } = await renderHealth(ownerOnlyDoc());
-    expect(band("3 checks need attention; no instance-wide blocker detected").getAttribute("role")).toBe("alert");
+    expect(band("4 checks need attention; no instance-wide blocker detected").getAttribute("role")).toBe("alert");
     const capacity = attentionItem(container, "fleet.capacity")!;
     expect(within(capacity).getByText("2")).toBeTruthy();
     for (const id of ["fleet.capacity", "queue.waiting"]) {
@@ -178,7 +215,7 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
       expect(within(item).getByText(`run ${ownerOnlyWaitingRunId}; owner ${ownerOnlyWaitingOwnerId}; waited 36m; stored reason no online worker can run this — it needs a capability none of your workers has; provision a ca`)).toBeTruthy();
     }
     expect(within(capacity).getByText(/Recover or provision a worker/)).toBeTruthy();
-    expect(attentionIds(container)).toEqual(["fleet.capacity", "queue.waiting", "forge.ciwatch"]);
+    expect(attentionIds(container)).toEqual(["fleet.capacity", "queue.waiting", "forge.ciwatch", "recovery.storage"]);
   });
 
   it("warn (degraded): a warn status band and both warn items expanded with their action", async () => {

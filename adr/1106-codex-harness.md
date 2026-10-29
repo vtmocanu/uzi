@@ -513,8 +513,12 @@ inert and hardened; witness checks continue through destructive dispatches.
 Current-process completion bindings record exact executor/facade in memory before
 durable bind; knownCodex missing/non-disposed/swapped proof retains before inventory,
 with no legacy fallback. KnownClaude is unchanged. Owner decision 2026-10-24
-narrows R1857-02(e): persisted/unknown-provenance sources keep today's behavior for
-both harnesses, without prior-process topology proof or durable format changes.
+narrowed R1857-02(e): persisted/unknown-provenance sources kept the pre-C behavior for
+both harnesses. **Superseded by #3404 (2026-10-27):** after a restart such a source is
+released only when durable published authority proves it (`forgetCompletedGeneration` /
+`verifyDurableRetirement` in `agent/src/recovery.ts`); legacy and unproven sources are
+retained until guarded operator discard (see
+[ADR-1783's #3404 amendment](1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement)).
 This is registered-process strengthening; Docker accepted invisible creates (#1860),
 unregistered/sibling writers and Claude terminal residuals remain. The canonical
 sink contract records the unchanged retention and ownership boundaries.

@@ -12,7 +12,6 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 func TestHealthQueuedCrossCheckCapability(t *testing.T) {
@@ -434,7 +433,7 @@ func TestHealthQueuedLockedVaultBeatsCapabilityReason(t *testing.T) {
 	}
 	svc := healthSvc(fs, defaultHealthSettings())
 	svc.capabilitySettings = fakeCapabilitySettings{on: true}
-	svc.SetVault(vault.New(box, newMemVaultStore())) // r.UserID never unlocked → locked
+	svc.SetVault(newMemoryVault(box, newMemVaultStore())) // r.UserID never unlocked → locked
 
 	svc.detectRunHealth(context.Background(), t0)
 	w := lastWrite(t, fs, r.ID)

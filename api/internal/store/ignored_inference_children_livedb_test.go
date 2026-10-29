@@ -44,6 +44,9 @@ func TestCrossCheckChildrenInheritFrozenInferencePolicyLiveDB(t *testing.T) {
 				if !reflect.DeepEqual(child.IgnoredInferredCapabilities, []string{"jvm"}) {
 					t.Fatalf("child policy=%v, want frozen lead policy [jvm], not live repo [docker] or default []", child.IgnoredInferredCapabilities)
 				}
+				if !reflect.DeepEqual(child.HintedCapabilities, []string{"docker"}) {
+					t.Fatalf("child hint origin=%v", child.HintedCapabilities)
+				}
 				if !reflect.DeepEqual(child.RequiredCapabilities, []string{"docker"}) {
 					t.Fatalf("existing live-repo requirement changed: %v", child.RequiredCapabilities)
 				}

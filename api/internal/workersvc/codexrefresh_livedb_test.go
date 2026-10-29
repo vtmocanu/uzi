@@ -147,8 +147,8 @@ type releaseHookStore struct {
 	onAccountRead func()
 }
 
-func (h releaseHookStore) GetCodexProviderAccountByID(ctx context.Context, arg store.GetCodexProviderAccountByIDParams) (store.CodexProviderAccount, error) {
-	acct, err := h.Queries.GetCodexProviderAccountByID(ctx, arg)
+func (h releaseHookStore) GetCodexProviderAccountSnapshot(ctx context.Context, arg store.GetCodexProviderAccountSnapshotParams) (store.GetCodexProviderAccountSnapshotRow, error) {
+	acct, err := h.Queries.GetCodexProviderAccountSnapshot(ctx, arg)
 	if h.onAccountRead != nil {
 		h.onAccountRead()
 	}
@@ -167,11 +167,15 @@ type recoverySlotHookStore struct {
 }
 
 func (h *recoverySlotHookStore) SetCodexRecoverySlot(ctx context.Context, arg store.SetCodexRecoverySlotParams) (int64, error) {
+	return h.setCodexRecoverySlot(ctx, h.Queries, arg)
+}
+
+func (h *recoverySlotHookStore) setCodexRecoverySlot(ctx context.Context, q codexRefreshStore, arg store.SetCodexRecoverySlotParams) (int64, error) {
 	h.calls++
 	if h.calls <= h.failFirst {
 		return 0, errors.New("recovery write blip")
 	}
-	return h.Queries.SetCodexRecoverySlot(ctx, arg)
+	return q.SetCodexRecoverySlot(ctx, arg)
 }
 
 // recoverySlotZeroStore simulates a recovery CAS whose operation fence moved before
@@ -218,7 +222,8 @@ func newRefreshFixture(t *testing.T, env codexTestEnv, fake CodexRefreshClient) 
 		ProviderUserID:     "user-" + uuid.NewString(),
 		WorkspaceAccountID: "acct-" + uuid.NewString(),
 	}
-	r := NewCodexReconciler(env.q, nil, env.box, fid, env.pool)
+	vlt := vault.NewPostgres(env.box, env.pool)
+	r := NewCodexReconciler(env.q, vlt, env.box, fid, env.pool)
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, aliasID); err != nil {
 		t.Fatalf("reconcile subscription alias: %v", err)
 	}
@@ -232,7 +237,8 @@ func newRefreshFixture(t *testing.T, env codexTestEnv, fake CodexRefreshClient) 
 	accountID := uuid.UUID(st.ProviderAccountID.Bytes)
 
 	runID := env.seedCodexRun(t, userID, workerID, repoID)
-	svc := &Service{q: env.q, box: env.box, codexRefresh: fake}
+	svc := &Service{q: env.q, box: env.box, vlt: vlt, codexRefresh: fake}
+	svc.SetTxBeginner(env.pool)
 	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeSubscription); err != nil {
 		t.Fatalf("FreezeCodexBinding: %v", err)
 	}
@@ -472,7 +478,8 @@ func TestCoordinatedCodexRefreshSameOpConcurrentRetryDoesNotStrandLeaseLiveDB(t 
 
 	// Attempt A shares the fixture but runs on the un-hooked store, so its own step-2 read
 	// does not recurse into the hook below.
-	attemptA := &Service{q: env.q, box: env.box, codexRefresh: fake}
+	attemptA := &Service{q: env.q, box: env.box, vlt: f.svc.vlt, codexRefresh: fake}
+	attemptA.SetTxBeginner(env.pool)
 
 	var raced bool
 	f.svc.q = intentReadHookStore{
@@ -536,7 +543,8 @@ func TestCoordinatedCodexRefreshStaleLoserCannotExchangeLiveDB(t *testing.T) {
 
 	// The winner op A shares the fixture but runs on the un-hooked store, so its own step-2
 	// read does not recurse into the hook below. It uses a DISTINCT operation id from B.
-	attemptA := &Service{q: env.q, box: env.box, codexRefresh: fake}
+	attemptA := &Service{q: env.q, box: env.box, vlt: f.svc.vlt, codexRefresh: fake}
+	attemptA.SetTxBeginner(env.pool)
 	opA := uuid.New()
 	opB := uuid.New()
 
@@ -1228,7 +1236,7 @@ func TestReleaseCodexCredentialAPIKeyLiveDB(t *testing.T) {
 	key := codexToken("sk")
 	aliasID := env.seedStaticAPIKey(t, userID, "codex-key-"+uuid.NewString(), key)
 	runID := env.seedCodexRun(t, userID, workerID, repoID)
-	svc := &Service{q: env.q, box: env.box}
+	svc := &Service{q: env.q, box: env.box, vlt: env.vlt}
 	if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeAPIKey); err != nil {
 		t.Fatalf("FreezeCodexBinding: %v", err)
 	}
@@ -1398,11 +1406,10 @@ func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 	capw := env.mintCap(t, f.runID, f.workerID)
 	op := uuid.New()
 
-	// Wire a real vault that is LOCKED for this user. The account's sealed_login is
-	// master-sealed (opens without an unlock), but the post-rotation canonical seal takes the
-	// DEK path and returns vault.ErrLocked. The recovery path must still retain the new login.
-	vlt := vault.New(env.box, env.q)
-	f.svc.SetVault(vlt)
+	// Enroll before exchange and lock when the provider returns the rotated login.
+	vlt := f.svc.vlt
+	enrollCodexProtectedVault(t, env, vlt, f.userID, codexVaultLockedTestPassword)
+	fake.onRefresh = func() { vlt.Lock(f.userID) }
 
 	res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
 	if !errors.Is(err, ErrCodexRefreshQuarantined) {
@@ -1430,7 +1437,7 @@ func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 	if len(acct.RecoverySealed) == 0 || !acct.RecoveryGeneration.Valid || acct.RecoveryGeneration.Int64 != 0 {
 		t.Fatalf("vault-locked refresh did not retain protected recovery: sealed=%d gen=%v", len(acct.RecoverySealed), acct.RecoveryGeneration)
 	}
-	if !acct.RecoverySealedWith.Valid || acct.RecoverySealedWith.String != store.SealedWithMaster {
+	if !acct.RecoverySealedWith.Valid || acct.RecoverySealedWith.String != store.SealedWithMasterAAD {
 		t.Fatalf("recovery sealed_with = %v, want temporary master protection", acct.RecoverySealedWith)
 	}
 	// The intent stays 'rotating' — retried by a later pass, NOT marked unrecoverable.
@@ -1440,7 +1447,7 @@ func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 
 	// Once the user vault unlocks, reconciliation must re-seal the protected recovery under
 	// the DEK before making it live, then return the account to an idle usable generation.
-	if uerr := vlt.Unlock(env.ctx, f.userID, "vault-lock-recovery-password"); uerr != nil {
+	if uerr := vlt.Unlock(env.ctx, f.userID, codexVaultLockedTestPassword); uerr != nil {
 		t.Fatalf("unlock vault: %v", uerr)
 	}
 	if _, rerr := f.svc.ReconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID); rerr != nil {
@@ -1453,7 +1460,7 @@ func TestCoordinatedCodexRefreshVaultLockedSealRetainsLiveDB(t *testing.T) {
 	if acct.SealedWith != store.SealedWithDEK {
 		t.Fatalf("promoted sealed_with = %q, want %q", acct.SealedWith, store.SealedWithDEK)
 	}
-	blob, oerr := f.svc.openCodexAccountLogin(f.userID, acct)
+	blob, oerr := f.svc.openCodexAccountLogin(env.ctx, f.userID, env.mustAccountSnapshot(t, f.userID, f.accountID))
 	if oerr != nil {
 		t.Fatalf("open promoted login: %v", oerr)
 	}
@@ -1659,4 +1666,56 @@ func TestReconcileUnresolvedCodexRefreshLeavesLiveLeaseLiveDB(t *testing.T) {
 	if row.Generation != 1 {
 		t.Fatalf("committed generation = %d, want 1", row.Generation)
 	}
+}
+
+// Bind the real transaction without bypassing the injected failures/counters.
+func (h refreshHookStore) bindCodexRefreshTx(q *store.Queries) codexRefreshStore {
+	h.Queries = q
+	return h
+}
+
+func (h intentReadHookStore) bindCodexRefreshTx(q *store.Queries) codexRefreshStore {
+	h.Queries = q
+	return h
+}
+
+func (h releaseHookStore) bindCodexRefreshTx(q *store.Queries) codexRefreshStore {
+	h.Queries = q
+	return h
+}
+
+type boundRecoverySlotHookStore struct {
+	codexRefreshStore
+	hook *recoverySlotHookStore
+}
+
+func (h *recoverySlotHookStore) bindCodexRefreshTx(q *store.Queries) codexRefreshStore {
+	return boundRecoverySlotHookStore{codexRefreshStore: q, hook: h}
+}
+
+func (h boundRecoverySlotHookStore) SetCodexRecoverySlot(ctx context.Context, arg store.SetCodexRecoverySlotParams) (int64, error) {
+	return h.hook.setCodexRecoverySlot(ctx, h.codexRefreshStore, arg)
+}
+
+type boundRecoverySlotZeroStore struct {
+	codexRefreshStore
+	hook *recoverySlotZeroStore
+}
+
+func (h *recoverySlotZeroStore) bindCodexRefreshTx(q *store.Queries) codexRefreshStore {
+	return boundRecoverySlotZeroStore{codexRefreshStore: q, hook: h}
+}
+
+func (h boundRecoverySlotZeroStore) SetCodexRecoverySlot(ctx context.Context, arg store.SetCodexRecoverySlotParams) (int64, error) {
+	return h.hook.SetCodexRecoverySlot(ctx, arg)
+}
+
+// mustAccountSnapshot reads material and epoch in the same executed query.
+func (e codexTestEnv) mustAccountSnapshot(t *testing.T, userID, accountID uuid.UUID) codexAccountSnapshot {
+	t.Helper()
+	row, err := readCodexAccountSnapshot(e.ctx, e.q, store.GetCodexProviderAccountSnapshotParams{UserID: userID, ID: accountID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return row
 }

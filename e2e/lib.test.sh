@@ -1718,6 +1718,7 @@ for mode in lost-response empty-response not-committed preexisting lookup-error 
   else echo "FAIL: manual registration cleanup $mode result=$got sql=[$calls] http=[$http] output=[$output]"; fi
 done
 
+bash "$ROOT/e2e/vault-modes.test.sh"
 
 # Phase 50's API-created ephemeral peer may legitimately be reaped while unbound.
 eval "$(awk '/^fixture_worker_absent\(\) \{/,/^\}/' "$LIB")"

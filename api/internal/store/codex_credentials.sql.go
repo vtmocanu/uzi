@@ -245,6 +245,56 @@ func (q *Queries) GetCodexProviderAccountByTuple(ctx context.Context, arg GetCod
 	return i, err
 }
 
+const getCodexProviderAccountSnapshot = `-- name: GetCodexProviderAccountSnapshot :one
+SELECT a.id, a.user_id, a.provider_user_id, a.workspace_account_id, a.sealed_login, a.sealed_with, a.generation, a.credential_revision, a.recovery_sealed, a.recovery_generation, a.recovery_sealed_with, a.coord_state, a.coord_operation_id, a.lease_deadline, a.committed_generation, a.created_at, a.updated_at, a.reauth_required, a.reauth_generation, a.reauth_credential_revision, a.reauth_reason, a.recovery_cause, u.vault_epoch
+FROM codex_provider_account a
+JOIN users u ON u.id = a.user_id
+WHERE a.user_id = $1 AND a.id = $2
+`
+
+type GetCodexProviderAccountSnapshotParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	ID     uuid.UUID `json:"id"`
+}
+
+type GetCodexProviderAccountSnapshotRow struct {
+	CodexProviderAccount CodexProviderAccount `json:"codex_provider_account"`
+	VaultEpoch           int64                `json:"vault_epoch"`
+}
+
+// Owner-scoped material and epoch for decrypting a selected account slot.
+// GetCodexProviderAccountByID remains the metadata-only read.
+func (q *Queries) GetCodexProviderAccountSnapshot(ctx context.Context, arg GetCodexProviderAccountSnapshotParams) (GetCodexProviderAccountSnapshotRow, error) {
+	row := q.db.QueryRow(ctx, getCodexProviderAccountSnapshot, arg.UserID, arg.ID)
+	var i GetCodexProviderAccountSnapshotRow
+	err := row.Scan(
+		&i.CodexProviderAccount.ID,
+		&i.CodexProviderAccount.UserID,
+		&i.CodexProviderAccount.ProviderUserID,
+		&i.CodexProviderAccount.WorkspaceAccountID,
+		&i.CodexProviderAccount.SealedLogin,
+		&i.CodexProviderAccount.SealedWith,
+		&i.CodexProviderAccount.Generation,
+		&i.CodexProviderAccount.CredentialRevision,
+		&i.CodexProviderAccount.RecoverySealed,
+		&i.CodexProviderAccount.RecoveryGeneration,
+		&i.CodexProviderAccount.RecoverySealedWith,
+		&i.CodexProviderAccount.CoordState,
+		&i.CodexProviderAccount.CoordOperationID,
+		&i.CodexProviderAccount.LeaseDeadline,
+		&i.CodexProviderAccount.CommittedGeneration,
+		&i.CodexProviderAccount.CreatedAt,
+		&i.CodexProviderAccount.UpdatedAt,
+		&i.CodexProviderAccount.ReauthRequired,
+		&i.CodexProviderAccount.ReauthGeneration,
+		&i.CodexProviderAccount.ReauthCredentialRevision,
+		&i.CodexProviderAccount.ReauthReason,
+		&i.CodexProviderAccount.RecoveryCause,
+		&i.VaultEpoch,
+	)
+	return i, err
+}
+
 const insertCodexCredentialState = `-- name: InsertCodexCredentialState :one
 INSERT INTO codex_credential_state (user_secret_id, user_id, status)
 VALUES ($1, $2, $3)

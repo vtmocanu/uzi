@@ -1,6 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { ProcessQuiescence } from "./run-quiescence.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
+import type { AuthorityScope, RetirementHandle, RetirementView } from "./authority-runtime.js";
+import {
+  decodeCompletionSourceShape, serializeSourceFence, sourceFenceOf, type CompletionSourceFence, type CompletionSourceV2,
+} from "./completion-source.js";
 import type { ExclusionRefusal, MaintenanceExclusion, MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { MaintenanceResources as M1MaintenanceResources, RecoveryMaintenance, type MaintenanceAdmission } from "./recovery-maintenance.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
@@ -27,6 +31,7 @@ import { prepareFrozenHeld, validFrozenHeldPolicy, type FrozenHeldPolicy, type H
 
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { constants, createReadStream } from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
@@ -82,6 +87,36 @@ function ordinaryTempEntry(name: string): boolean {
   return ORDINARY_TEMP_RE.test(name);
 }
 
+/** Retiring-manifest item prefixes. A bare absolute path is the clone or its paired skills dir (the destructive footprint). */
+const FENCE_ITEM = "fence:";
+const BUNDLE_ITEM = "bundle:";
+const RECORD_ITEM = "record:";
+
+/**
+ * The exact artifacts a completed generation's retirement destroys, in the ORDER forgetCompletedGeneration
+ * actually deletes them, so what remains at any moment is a suffix: the clone and the journal fence (both go
+ * in GitCache.retireRunnerClone's one step: the clone is moved, then the journal entry is cleared), then the
+ * paired skills dir (only when present; removed by removeCompletionSkillsDir after that step), the bundle
+ * files that exist, the cohort's records and the receipt-bearing record last.
+ *
+ * The manifest names files and the fence, not Git refs or recovery pins. The ref and pin deletions of
+ * cleanupRecoveryGeneration are bound through the RECORDS instead: a retry derives its pins and recovery
+ * sources only from the generation's records still on disk, and residueExplained refuses any such record the
+ * manifest does not name or that does not carry the retiring source, so a retry cannot delete a ref or pin
+ * the retiring generation's own manifest-bound records do not account for.
+ */
+function retiringManifest(input: { clonePath: string; skillsPath: string | undefined; fence: CompletionSourceFence;
+  bundles: string[]; records: string[]; authorityRecord: string }): string[] {
+  return [
+    input.clonePath,
+    FENCE_ITEM + serializeSourceFence(input.fence),
+    ...(input.skillsPath === undefined ? [] : [input.skillsPath]),
+    ...[...input.bundles].sort().map(file => BUNDLE_ITEM + file),
+    ...input.records.filter(file => file !== input.authorityRecord).sort().map(file => RECORD_ITEM + file),
+    RECORD_ITEM + input.authorityRecord,
+  ];
+}
+
 /** Issue #3031 staged groundwork: new-origin admission (charged WIP capture after a terminal
  *  source) stays unreachable in production until the verified transfer, archive handoff and
  *  boot rediscovery ship with it. Saved-evidence replay is unaffected. Not configurable; the
@@ -124,6 +159,18 @@ export interface CompletionSource {
   roots: Array<{ sha: string; contexts: OwedCandidate["contexts"] }>;
 }
 
+/** The durability barriers of a published-source record write. Tests inject failures and count calls. */
+export interface PublicationFsOps {
+  syncFile(handle: FileHandle): Promise<void>;
+  syncDir(handle: FileHandle): Promise<void>;
+  rename(from: string, to: string): Promise<void>;
+}
+
+/** Publication refused or failed before the slot could be published; nothing eligible exists. */
+class CompletionPublicationError extends Error {
+  constructor(message: string) { super(message); this.name = "CompletionPublicationError"; }
+}
+
 /** One authenticated journal record; its MAC covers every field. */
 export interface RecoveryRecord {
   version: 1;
@@ -147,8 +194,10 @@ export interface RecoveryRecord {
   finalAcknowledged?: boolean;
   /** Completion proof is independent of archive coverage and never covers another generation. */
   completionReceipt?: CompletedPublicationReceipt;
-  /** Exact completing attempt provenance, not a pending terminal intent. */
-  completionSource?: CompletionSource;
+  /** Exact completing attempt provenance, not a pending terminal intent. A V2 source (issue #3404 M2 U4)
+   *  is the same core plus the authority publication fields and certificate; it is written ONLY by
+   *  {@link RecoveryCoordinator.publishCompletionSource} and confers nothing without the matching slot. */
+  completionSource?: CompletionSource | CompletionSourceV2;
   /** The run this capture belongs to. Uniqueness by run_id (a per-run UUID) prevents a
    *  later run on the same ISSUE from overwriting or adopting this capture (D1). */
   runId: string;
@@ -310,6 +359,9 @@ export interface RecoveryBundleProducer {
   readInventoryCloneHeadsUnderLock?: GitCache["readInventoryCloneHeadsUnderLock"];
   enumerateOwedUnderLock?: GitCache["enumerateOwedUnderLock"];
   cleanupRecoveryGeneration?: GitCache["cleanupRecoveryGeneration"];
+  /** issue #3404 M2 U5: restart retirement reads the completing journal's fence and removes the paired skills dir. */
+  readCompletionSourceFence?: GitCache["readCompletionSourceFence"];
+  removeCompletionSkillsDir?: GitCache["removeCompletionSkillsDir"];
   readInventoryCloneHeads?: GitCache["readInventoryCloneHeads"];
   committedTrackingOwnership?: GitCache["committedTrackingOwnership"];
   ancestry?: GitCache["ancestry"];
@@ -509,7 +561,26 @@ function inventorySourceReason(diagnostic?: InventorySourceDiagnostic): string {
     (diagnostic.check === "inventory_read_not_verified" ? ":" + diagnostic.cause : "");
 }
 
+/**
+ * issue #3404 M2 U5: what the completion-source boundary needs when the release rests on durable authority
+ * rather than on this process's memory. Built only after the coordinator verified the published (or retiring)
+ * slot, the whole physical cohort and the journal fence, under the outer authority transaction A.
+ */
+export interface DurableCompletionRetirement {
+  /** The fence the completing bare journal must still carry; retireRunnerClone refuses anything else. */
+  expectedFence: CompletionSourceFence;
+  /** A retiring record already authorizes the cleanup: the clone may already be gone and the fence cleared. */
+  resumed: boolean;
+  /** Enter `retiring` (idempotent): awaited immediately before the first destructive effect. */
+  enter(): Promise<void>;
+}
+
 export interface RecoveryCoordinatorOptions {
+  /** issue #3404 M2: opens (or borrows) the authority transaction A. Every capture cycle that can
+   *  reach a hooked Git effect is entered inside it, so A is taken BEFORE the cycle lock C, the
+   *  source reservation S, the journal lock J and the bare lock B (order A -> C -> S -> J -> B).
+   *  Absent: legacy behaviour (unit tests). */
+  authority?: AuthorityScope;
   /** Issue #3031: the claim-gate writer exclusion every new terminal production runs inside. */
   writerExclusion?: Pick<MaintenanceWriterExclusion, "run">;
   /** After a terminal boundary returns: whether its children actually joined. False keeps claims gated. */
@@ -522,12 +593,22 @@ export interface RecoveryCoordinatorOptions {
   }) => Promise<T>, signal?: AbortSignal) => Promise<{ entered: false } | { entered: true; value: T }>;
   /** Notification only, after exact-source and generation cleanup actually completed. */
   onCompletionSourceForgotten?: (source: CompletionSource) => void;
+  /** issue #3404 M2 U5: whether a binder for this source's identity is still pending in the process. No retired
+   *  tombstone is written while one is: not by this coordinator's retirement (forgetCompletedGeneration leaves
+   *  the slot `retiring`) and not by AuthorityRuntime's finisher, which consults the same pending-binder state
+   *  through the runner's registration (AuthorityRuntime.registerBinderPending). Absent: nothing is pending. */
+  completionBinderPending?: (source: CompletionSource) => boolean;
   /** Notification only, after guarded archive/FINAL cleanup removed the full generation. */
   onCompletionGenerationForgotten?: (runId: string, generation: number) => void;
   withCompletionSourceBoundary?: (
     source: CompletionSource,
-    action: (canDelete: () => boolean) => Promise<void>,
+    /** `quiesceSkills` proves the paired skills dir's writers gone (and, on a Docker-wired worker, that no
+     *  container is known to mount it), the same proof the guarded operator discard demands before it deletes. */
+    action: (canDelete: () => boolean, quiesceSkills?: (paths: string[]) => Promise<boolean>) => Promise<void>,
+    durable?: DurableCompletionRetirement,
   ) => Promise<"passed" | "retained">;
+  /** Tests only: the file/directory barriers of {@link RecoveryCoordinator.publishCompletionSource}. */
+  publicationOps?: PublicationFsOps;
   withInventorySourceBoundary?: (
     context: InventorySourceBoundaryContext,
     action: (prove: () => Promise<boolean>) => Promise<void>,
@@ -982,9 +1063,12 @@ const recoveryJournalLocks = new RunDiskLocks();
  * upload can safely happen after (or across a restart from) the terminal report.
  */
 export class RecoveryCoordinator {
+  private readonly authority: AuthorityScope | undefined;
   private readonly withInventorySourceBoundary: RecoveryCoordinatorOptions["withInventorySourceBoundary"];
   private readonly withCompletionSourceBoundary: RecoveryCoordinatorOptions["withCompletionSourceBoundary"];
   private readonly onCompletionSourceForgotten: RecoveryCoordinatorOptions["onCompletionSourceForgotten"];
+  private readonly completionBinderPending: RecoveryCoordinatorOptions["completionBinderPending"];
+  private readonly publicationOps: PublicationFsOps;
   private readonly onCompletionGenerationForgotten: RecoveryCoordinatorOptions["onCompletionGenerationForgotten"];
   private readonly isExecuting: (runId: string) => boolean;
   private bootOwed: Awaited<ReturnType<NonNullable<RecoveryBundleProducer["discoverOwedCandidates"]>>> = [];
@@ -1163,7 +1247,29 @@ export class RecoveryCoordinator {
     return undefined;
   }
 
+  /**
+   * Run `fn` inside the authority transaction (borrowed when one is already active). Use it ONLY for a
+   * capture cycle that can reach a mutating authority hook (cleanupArchivedRecoveryPin,
+   * cleanupRecoveryGeneration, deleteRecoveryPin via forgetGeneration): A must be outermost there (A -> C).
+   * A cycle whose only hook is assertBareClear (freezeInventory's buildRecoveryCoverage) takes no A.
+   *
+   * The wait for A ends with the maintenance budget the caller runs under, if any: its signal ends the wait
+   * and its remaining time is the explicit deadline. A cycle that uploads (captureCycle / uploadCycle) holds
+   * A for the upload because A must precede the capture-cycle lock C that serializes uploads of one record
+   * (see captureCycleTails): A cannot be released and retaken beneath C.
+   */
+  private inAuthority<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this.authority) return fn();
+    const signal = maintenanceSignal();
+    const remaining = MaintenanceBudget.current()?.remainingMs();
+    return this.authority.withTransaction(() => fn(), {
+      ...(signal ? { signal } : {}),
+      ...(remaining === undefined ? {} : { timeoutMs: Math.max(1, remaining) }),
+    });
+  }
+
   constructor(opts: RecoveryCoordinatorOptions) {
+    this.authority = opts.authority;
     this.withTerminalSourceBoundary = opts.withTerminalSourceBoundary;
     this.writerExclusion = opts.writerExclusion;
     this.terminalSettlementConfirmed = opts.terminalSettlementConfirmed;
@@ -1175,6 +1281,10 @@ export class RecoveryCoordinator {
     this.withInventorySourceBoundary = opts.withInventorySourceBoundary;
     this.withCompletionSourceBoundary = opts.withCompletionSourceBoundary;
     this.onCompletionSourceForgotten = opts.onCompletionSourceForgotten;
+    this.completionBinderPending = opts.completionBinderPending;
+    this.publicationOps = opts.publicationOps ?? {
+      syncFile: handle => handle.sync(), syncDir: handle => handle.sync(), rename: (from, to) => fs.rename(from, to),
+    };
     this.onCompletionGenerationForgotten = opts.onCompletionGenerationForgotten;
     this.isExecuting = opts.isExecuting ?? (() => false);
     this.terminalRecordProtection = opts.terminalRecordProtection;
@@ -1305,6 +1415,7 @@ export class RecoveryCoordinator {
   }): Promise<RecoveryRecord | undefined> {
     if (!this.enabled) return undefined;
     const { context } = input;
+    // No A: the only authority hook this cycle reaches is assertBareClear (buildRecoveryCoverage), a read.
     return this.withCancellationAttempt({ runId: context.runId, generation: context.generation, inventoryGuarded: true } as RecoveryRecord, async () =>
       runCaptureCycle(await this.cycleKey({ runId: context.runId, generation: context.generation, captureId: "", inventoryGuarded: true }), "wait", async () => {
       if (!await this.newReconstructionRecords(context.runId, context.generation)) return undefined;
@@ -2201,8 +2312,8 @@ export class RecoveryCoordinator {
     if (!this.enabled || !HELD_PUBLICATION_ID_RE.test(publicationId)) return "fallback";
     if (residueQuarantine() !== undefined) return "kept";
     try {
-      return await this.withCancellationAttempt(record, async () =>
-        runCaptureCycle(await this.cycleKey(record), "wait", () => this.releaseHeldWithinCycle(record, publicationId)));
+      return await this.withCancellationAttempt(record, () => this.inAuthority(async () =>
+        runCaptureCycle(await this.cycleKey(record), "wait", () => this.releaseHeldWithinCycle(record, publicationId))));
     } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: held publication final not completed; custody retained", {
         run_id: record.runId, generation: record.generation, error: errText(err) });
@@ -2398,9 +2509,9 @@ export class RecoveryCoordinator {
   /** Shared foreground/boot/live ordering, serialized once per frozen generation. */
   async operateFrozenInventory(input: CaptureInput, options: FrozenOperationOptions = {}): Promise<RecoveryOutcome> {
     if (!this.enabled || residueQuarantine() !== undefined) return quarantinedOutcome(input.record.captureId);
-    return this.withCancellationAttempt(input.record, async () =>
+    return this.withCancellationAttempt(input.record, () => this.inAuthority(async () =>
       runCaptureCycle(await this.cycleKey(input.record), "wait",
-        () => this.frozenOperationCycle(input, options)), undefined, input.onCancellationObserved);
+        () => this.frozenOperationCycle(input, options))), undefined, input.onCancellationObserved);
   }
 
   private async frozenOperationCycle(input: CaptureInput, options: FrozenOperationOptions = {}): Promise<RecoveryOutcome> {
@@ -2713,6 +2824,7 @@ export class RecoveryCoordinator {
         // freezeInventory alone compares the complete source/tree/context fingerprint.
         // Equal pin lists cannot justify reusing an archive of an earlier disposition source.
         const diagnostics = this.inventorySourceDiagnostics({ ...ctx, generation: ctx.generation }, original?.captureId);
+        // No A around the source boundary: freezeInventory below reaches only assertBareClear, a read.
         const boundary = await this.inventorySourceBoundary(diagnostics.context, async prove => {
           if (!await this.inactiveInventory(probe)) { note("inventory_not_inactive"); return; }
           if (!await prove()) { note("source_proof_unavailable"); return; }
@@ -2766,8 +2878,8 @@ export class RecoveryCoordinator {
     if (!this.enabled) return { state: "pinned", captureId: input.record.captureId };
     // issue #2213: a latched worker captures and uploads nothing; the record and pin stay as they are.
     if (residueQuarantine() !== undefined) return quarantinedOutcome(input.record.captureId);
-    return this.withCancellationAttempt(input.record, async () =>
-      runCaptureCycle(await this.cycleKey(input.record), "wait", () => this.captureCycle(input)), undefined, input.onCancellationObserved);
+    return this.withCancellationAttempt(input.record, () => this.inAuthority(async () =>
+      runCaptureCycle(await this.cycleKey(input.record), "wait", () => this.captureCycle(input))), undefined, input.onCancellationObserved);
   }
 
   /** The capture cycle; the caller holds the record's capture-cycle lock. */
@@ -3460,13 +3572,13 @@ export class RecoveryCoordinator {
               residueQuarantine() !== undefined || this.isExecuting(runId)) break;
           if (!this.finalRetryReady(snap)) continue;
           try {
-            await this.withCancellationAttempt(snap, async () =>
+            await this.withCancellationAttempt(snap, () => this.inAuthority(async () =>
               runCaptureCycle(await this.cycleKey(snap), "wait", async () => {
                 if (passSignal.aborted || residueQuarantine() !== undefined || this.isExecuting(runId)) return;
                 const current = await this.readRecord(this.recordPath(snap));
                 if (!current || !this.savedSourceCandidate(current) || !this.finalRetryReady(current)) return;
                 await this.pendingStep(current, passSignal, "terminal_source");
-              }), attempts);
+              })), attempts);
           } catch {
             this.log.warn("recovery: terminal saved evidence retained");
           }
@@ -3965,8 +4077,8 @@ export class RecoveryCoordinator {
         }
         if (snap.state === "uploaded" && !snap.inventoryGuarded) { if (archiveProvesPin(snap)) cleanups.push(snap); continue; }
         try {
-          await this.withCancellationAttempt(snap, async () =>
-            runCaptureCycle(await this.cycleKey(snap), "wait", () => this.pendingStep(snap, signal)), attempts);
+          await this.withCancellationAttempt(snap, () => this.inAuthority(async () =>
+            runCaptureCycle(await this.cycleKey(snap), "wait", () => this.pendingStep(snap, signal))), attempts);
         } catch (err) { MaintenanceBudget.current()?.check(); failure ??= err; }
       }
       await this.bootPinCleanups(cleanups, signal);
@@ -3989,7 +4101,7 @@ export class RecoveryCoordinator {
       handled++;
       this.lastAttemptAt.set(snap.captureId, this.now());
       try {
-        await runCaptureCycle(await this.cycleKey(snap), "wait", async () => {
+        await this.inAuthority(async () => runCaptureCycle(await this.cycleKey(snap), "wait", async () => {
           const record = await this.readRecord(this.recordPath(snap));
           if (!record || record.state !== "uploaded" || record.inventoryGuarded) return;
           const res = await this.cleanupUploadedRecoveryPin(record, { mode: "boot", signal, deadline });
@@ -3999,7 +4111,7 @@ export class RecoveryCoordinator {
             outcome: "pin_cleanup",
             reason: res.state === "retained" ? res.reason : res.state,
           });
-        });
+        }));
       } catch (err) { MaintenanceBudget.current()?.check();
         this.log.warn("recovery: uploaded pin cleanup step failed; continuing", { run_id: snap.runId, error: errText(err).slice(0, 512) });
       }
@@ -4279,8 +4391,8 @@ export class RecoveryCoordinator {
         if (opts.signal?.aborted) break;
         let res;
         try {
-          res = await this.withCancellationAttempt(snap, async () =>
-            runCaptureCycle(await this.cycleKey(snap), "skip", () => this.liveStep(snap, opts)), attempts);
+          res = await this.withCancellationAttempt(snap, () => this.inAuthority(async () =>
+            runCaptureCycle(await this.cycleKey(snap), "skip", () => this.liveStep(snap, opts))), attempts);
         } catch (err) {
           MaintenanceBudget.current()?.check();
           transient = true;
@@ -4301,7 +4413,8 @@ export class RecoveryCoordinator {
       }
       for (const snap of cleanupCandidates) {
         if (opts.signal?.aborted) break;
-        const res = await runCaptureCycle(await this.cycleKey(snap), "skip", () => this.livePinCleanupStep(snap, opts));
+        const res = await this.inAuthority(async () =>
+          runCaptureCycle(await this.cycleKey(snap), "skip", () => this.livePinCleanupStep(snap, opts)));
         if (!res.ran) this.lastAttemptAt.set(snap.captureId, this.now());
       }
     } catch (err) { MaintenanceBudget.current()?.check();
@@ -4409,15 +4522,24 @@ export class RecoveryCoordinator {
    */
   async forgetGeneration(runId: string, generation: number): Promise<void> {
     if (!this.enabled) return;
-    await runCaptureCycle(await this.cycleKey({ runId, captureId: "", generation, inventoryGuarded: true }), "wait",
-      () => this.forgetGenerationWithinCycle(runId, generation));
+    await this.inAuthority(async () => runCaptureCycle(await this.cycleKey({ runId, captureId: "", generation, inventoryGuarded: true }), "wait",
+      () => this.forgetGenerationWithinCycle(runId, generation)));
   }
 
   /** Receipt cleanup visits only this authenticated generation. No archive ancestry or capture RPC
    * gates it: the issue #2625 redundancy claims are built under the journal lock from the records
    * read there, but submitted only after the lock is released, bounded by one deadline, and their
    * answers are logged and otherwise ignored, so no refusal, error or timeout changes the cleanup.
-   * One attempt per existing sweep; any failed proof stops this generation and retains authority. */
+   * One attempt per existing sweep; any failed proof stops this generation and retains authority.
+   *
+   * issue #3404 M2 U5: with an authority scope (every production worker) the release rests on DURABLE
+   * authority, checked first and before any source inspection or source-dependent preflight, under the
+   * outer authority transaction A the cycle already holds: the published (or retiring) slot, a physical
+   * run directory whose generation members are exactly the slot's cohort and all carry the identical
+   * certified V2 source, and the completing bare journal's fence. Legacy V1, mixed, partial, corrupt or
+   * unknown records retain. The in-memory binding of the runner stays a veto (never the authority): a
+   * restarted process has none and proceeds only on the durable proof. Destruction is a retiring
+   * transaction (see {@link retiringManifest}). */
   private async forgetCompletedGeneration(runId: string, generation: number, isExecuting: (runId: string) => boolean,
     signal?: AbortSignal): Promise<void> {
     if (!this.withCompletionSourceBoundary || isExecuting(runId) || this.isExecuting(runId)) return;
@@ -4428,25 +4550,34 @@ export class RecoveryCoordinator {
       const selected = records.filter(r => r.generation === generation);
       const authority = selected.find(r => r.completionReceipt && r.completionSource);
       if (!authority || !this.git.cleanupRecoveryGeneration || residueQuarantine() !== undefined) return;
-      const source = authority.completionSource!;
+      const source = legacyCompletionCore(authority.completionSource!);
       const ctx = source.context;
       if (selected.some(r => !r.inventoryGuarded || r.branch !== ctx.branch || r.kind !== ctx.kind ||
           (r.completionReceipt && canonicalJson(r.completionReceipt) !== canonicalJson(authority.completionReceipt)))) return;
+      // The durable authority comes BEFORE the bare resolution, the redundancy claims, the bundle checks and the
+      // completion-check preflight: an unknown or unproven source never reaches any of them.
+      const plan = this.authority ? await this.verifyDurableRetirement(runId, generation, authority, records, selected, source) : undefined;
+      if (this.authority && !plan) return;
+      // Without an authority scope nothing can verify a V2 source, and reading it as its legacy core would turn
+      // an unverified certificate into release authority: a coordinator that cannot check it retains.
+      if (!this.authority && selected.some(r => r.completionSource !== undefined && "version" in r.completionSource)) return;
       const bare = await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(path.basename(ctx.barePath)));
       if (bare !== ctx.barePath) return;
       claims = await this.buildRedundancyClaims(selected, generation, bare, budget, authority.completionReceipt!.final_head);
       const bundles = new Set<string>();
+      const presentBundles = new Set<string>();
       for (const record of selected) {
         if ((record.bareDir && record.bareDir !== path.basename(bare)) ||
             (record.recoveryPinBareDir && record.recoveryPinBareDir !== path.basename(bare)) ||
             (record.coverageContext && record.coverageContext!.barePath !== bare) ||
-            (record.completionSource && canonicalJson(record.completionSource) !== canonicalJson(source))) return;
+            (record.completionSource && canonicalJson(legacyCompletionCore(record.completionSource)) !== canonicalJson(source))) return;
         const canonical = path.resolve(this.bundlePath(record));
         if (record.bundlePath && path.resolve(record.bundlePath) !== canonical) return;
         if (path.dirname(canonical) !== path.resolve(this.runDir(runId))) return;
         try {
           const stat = await fs.lstat(canonical);
           if (!stat.isFile() || stat.isSymbolicLink()) return;
+          presentBundles.add(canonical);
         } catch (err) { MaintenanceBudget.current()?.check();
           if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         }
@@ -4460,8 +4591,62 @@ export class RecoveryCoordinator {
         recoverySources, authority.completionReceipt!.final_head,
         () => residueQuarantine() === undefined && !isExecuting(runId) && !this.isExecuting(runId), "completion-check"));
       if (preflight !== "verified") return;
+      // The retiring manifest: every artifact this retirement destroys, in deletion order. Only a fresh
+      // retirement uses it; a resume is bound to the retiring record's own.
+      const authorityRecord = this.recordPath(authority);
+      let items: string[] = [];
+      if (plan && plan.view.phase === "published") {
+        const skills = path.join(path.dirname(plan.v2.clonePath), `.uzi-skills-${path.basename(plan.v2.clonePath)}`);
+        const skillsPresent = await ownedRecoveryIO(() => fs.lstat(skills)).then(() => true, (err: NodeJS.ErrnoException) => {
+          if (err.code === "ENOENT") return false;
+          throw err;
+        });
+        items = retiringManifest({
+          clonePath: plan.v2.clonePath, skillsPath: skillsPresent ? skills : undefined, fence: plan.fence,
+          bundles: [...presentBundles], records: selected.map(r => this.recordPath(r)), authorityRecord,
+        });
+      }
+      let handle: RetirementHandle | undefined;
+      const expected = plan?.expected;
+      const durable: DurableCompletionRetirement | undefined = plan ? {
+        expectedFence: plan.fence, resumed: plan.view.phase === "retiring",
+        enter: async () => { handle ??= await this.authority!.retirement!.enter(plan.view, items); },
+      } : undefined;
       let forgotten = false;
-      const boundary = await this.withCompletionSourceBoundary!(source, async canDelete => {
+      const boundary = await this.withCompletionSourceBoundary!(source, async (canDelete, quiesceSkills) => {
+        // Idempotent: normally the clone move already entered it; a source that is already gone enters here,
+        // before the first ref, bundle or record is destroyed.
+        await durable?.enter();
+        let recorded = handle?.deleted ?? 0;
+        const present = async (item: string): Promise<boolean> => {
+          if (item.startsWith(FENCE_ITEM)) return await ownedRecoveryIO(() => this.git.readCompletionSourceFence!(ctx.barePath, ctx.branch, expected!)) !== undefined;
+          const file = item.startsWith(BUNDLE_ITEM) ? item.slice(BUNDLE_ITEM.length) : item.startsWith(RECORD_ITEM) ? item.slice(RECORD_ITEM.length) : item;
+          return ownedRecoveryIO(() => fs.lstat(file)).then(() => true, (err: NodeJS.ErrnoException) => {
+            if (err.code === "ENOENT") return false;
+            throw err;
+          });
+        };
+        // Progress is recorded from what is CONFIRMED gone: the leading absent prefix of the manifest.
+        const progress = async (): Promise<void> => {
+          if (!handle) return;
+          let leading = 0;
+          for (const item of handle.manifest) { if (await present(item)) break; leading++; }
+          if (leading > recorded) { await handle.advance(leading); recorded = leading; }
+        };
+        if (handle) {
+          const skills = handle.manifest.find(item => path.basename(item).startsWith(".uzi-skills-") && !item.startsWith(RECORD_ITEM) && !item.startsWith(BUNDLE_ITEM));
+          if (skills !== undefined) {
+            const removeSkills = this.git.removeCompletionSkillsDir;
+            if (!removeSkills || !canDelete()) throw new Error("completion skills directory cannot be removed");
+            // The clone's quiescence was proven before the clone moved, but the skills dir is a separate footprint and
+            // on a resume the clone is already gone: its writers (and, Docker-wired, its mounts) are proven gone here,
+            // exactly as the operator discard does. A refusal throws: the retiring record stays for a later retry.
+            if (!quiesceSkills || !await quiesceSkills([skills]) || !canDelete()) throw new Error("completion skills directory not proven quiescent");
+            const gone = await ownedRecoveryIO(() => removeSkills.call(this.git, bare, plan!.v2.clonePath, canDelete));
+            if (!gone) throw new Error("completion skills directory retained");
+            await progress();
+          }
+        }
         const result = await ownedRecoveryIO(() => this.git.cleanupRecoveryGeneration!(bare, ctx, source.roots, pins,
           recoverySources, authority.completionReceipt!.final_head, canDelete, "completion"));
         if (result !== "removed") return;
@@ -4470,16 +4655,142 @@ export class RecoveryCoordinator {
           try { await ownedRecoveryIO(() => fs.unlink(file)); }
           catch (err) { MaintenanceBudget.current()?.check(); if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
         };
-        for (const bundle of bundles) await unlink(bundle);
-        for (const record of selected) if (record.captureId !== authority.captureId) await unlink(this.recordPath(record));
-        await unlink(this.recordPath(authority));
+        // The last record removed: the manifest's own final item when retiring, else the receipt-bearing record.
+        let finalRecord = authorityRecord;
+        if (handle) {
+          // The retiring contract: delete in the authenticated manifest's order (first attempt and retry alike), so
+          // whatever a partial failure leaves is a suffix residueExplained accepts. Enumeration order is not sorted.
+          const recordItems = handle.manifest.filter(item => item.startsWith(RECORD_ITEM)).map(item => item.slice(RECORD_ITEM.length));
+          finalRecord = recordItems.pop() ?? authorityRecord;
+          for (const item of handle.manifest) if (item.startsWith(BUNDLE_ITEM)) await unlink(item.slice(BUNDLE_ITEM.length));
+          await progress();
+          for (const record of recordItems) await unlink(record);
+          await progress();
+        } else {
+          for (const bundle of bundles) await unlink(bundle);
+          await progress();
+          for (const record of selected) if (record.captureId !== authority.captureId) await unlink(this.recordPath(record));
+          await progress();
+        }
+        await unlink(finalRecord);
+        if (handle) await this.syncRunDirectory(runId);
         await ownedRecoveryIO(() => fs.rmdir(this.runDir(runId))).catch(() => undefined);
+        if (handle) {
+          await progress();
+          if (this.completionBinderPending?.(source)) throw new Error("a completion source binder is pending; the retired tombstone waits");
+          await handle.finish();
+        }
         forgotten = true;
-      });
+      }, durable);
       // A pass whose action returned early, or any partial failure, keeps provenance.
       if (boundary === "passed" && forgotten) this.onCompletionSourceForgotten?.(source);
     });
     await this.submitRedundancyClaims(claims, budget);
+  }
+
+  /**
+   * issue #3404 M2 U5 - the durable authority for retiring a completed generation, read under A and J.
+   * Returns the verified source, the slot view and the journal fence it must see; undefined (retain) for
+   * anything else. Nothing here inspects the source clone. FIRST retirement (slot published): the physical
+   * run directory's generation members are exactly the slot's cohort, every member carries the identical
+   * certified V2 source, and the completing bare journal carries exactly the source's fence. RESUME (slot
+   * retiring): the retiring record alone authorizes the residue cleanup, see {@link residueExplained}.
+   */
+  private async verifyDurableRetirement(runId: string, generation: number, authority: RecoveryRecord, records: RecoveryRecord[],
+    selected: RecoveryRecord[], legacy: CompletionSource): Promise<{
+    view: RetirementView; v2: CompletionSourceV2; fence: CompletionSourceFence;
+    expected: { runId: string; clonePath: string; attemptId?: string };
+  } | undefined> {
+    const scope = this.authority?.retirement;
+    if (!scope || !this.git.readCompletionSourceFence) return undefined;
+    try {
+      const stored = authority.completionSource;
+      if (!stored || !("version" in stored) || stored.version !== 2) return undefined;
+      const view = await scope.inspect(stored);
+      const v2 = view.source;
+      const ctx = v2.context;
+      if (canonicalJson(legacyCompletionCore(v2)) !== canonicalJson(legacy) || ctx.runId !== runId || ctx.generation !== generation ||
+          view.cohort.runId !== runId || view.cohort.generation !== generation) return undefined;
+      const wanted = canonicalJson(v2);
+      const expected = { runId, clonePath: v2.clonePath, ...(v2.attemptId === undefined ? {} : { attemptId: v2.attemptId }) };
+      const fence = sourceFenceOf(v2);
+      const journalFence = await ownedRecoveryIO(() => this.git.readCompletionSourceFence!(ctx.barePath, ctx.branch, expected));
+      if (view.phase === "published") {
+        const physical = await this.physicalGeneration(runId, generation);
+        if (physical.captureIds.join("\n") !== view.cohort.captureIds.join("\n") ||
+            physical.selected.some(r => canonicalJson(r.completionSource) !== wanted)) return undefined;
+        if (journalFence === undefined || serializeSourceFence(journalFence) !== serializeSourceFence(fence)) return undefined;
+      } else if (!await this.residueExplained(runId, view, v2, wanted, journalFence, records, selected)) return undefined;
+      return { view, v2, fence, expected };
+    } catch { MaintenanceBudget.current()?.check(); return undefined; }
+  }
+
+  /**
+   * The residue retry's validation: the authenticated retiring record is the ONLY authority, because the original
+   * fence or a manifest member was intentionally removed by the retirement itself. It refuses additions (a record
+   * or bundle of the run that the manifest does not name, a member whose source is not the retiring one, a stray
+   * directory entry), changes (a journal fence other than the manifest's) and unexplained absence. Deletion
+   * order is the manifest order (see {@link retiringManifest}), so what remains must be a SUFFIX of it: the
+   * leading absent items are explained by the deletions the retirement made (confirmed or not yet recorded), but
+   * an item absent behind a present one is not, and an item the record counts as deleted must not be present.
+   * Git refs and recovery pins are not manifest items: the retry's ref/pin deletions are derived from the
+   * generation's records, and every record present must be a named manifest member carrying the retiring source
+   * (checked first below), which is what binds them. Caller holds J.
+   */
+  private async residueExplained(runId: string, view: RetirementView, v2: CompletionSourceV2, wanted: string,
+    journalFence: CompletionSourceFence | undefined, records: RecoveryRecord[], selected: RecoveryRecord[]): Promise<boolean> {
+    const retiring = view.retiring;
+    if (!retiring || retiring.manifest[0] !== v2.clonePath) return false;
+    const skills = path.join(path.dirname(v2.clonePath), `.uzi-skills-${path.basename(v2.clonePath)}`);
+    const manifest = new Set(retiring.manifest);
+    for (const item of retiring.manifest.slice(1)) {
+      if (item === skills || item.startsWith(FENCE_ITEM) || item.startsWith(BUNDLE_ITEM) || item.startsWith(RECORD_ITEM)) continue;
+      return false;
+    }
+    // Additions: every record of this generation still present is a named member carrying the retiring source.
+    for (const record of selected) {
+      if (!manifest.has(RECORD_ITEM + this.recordPath(record)) || canonicalJson(record.completionSource) !== wanted) return false;
+    }
+    const runDir = path.resolve(this.runDir(runId));
+    const known = new Set(records.map(r => r.captureId));
+    const names = await ownedRecoveryIO(() => fs.readdir(runDir)).catch((err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT") return [] as string[];
+      throw err;
+    });
+    for (const name of names) {
+      // A bundle of a member of THIS generation that the manifest never named is an addition. (A bundle whose
+      // record is gone, and the coordinator's own crash-era temps, are tolerated exactly as publication does:
+      // they carry no authority and the retirement does not own them.)
+      if (name.endsWith(".bundle") && selected.some(r => r.captureId === name.slice(0, -".bundle".length)) &&
+          !manifest.has(BUNDLE_ITEM + path.join(runDir, name))) return false;
+      if (ordinaryTempEntry(name)) continue;
+      // A bundle the manifest names is residue the suffix check below accounts for; a bundle of another known
+      // record of this run is a sibling the retirement does not own (physicalGeneration's name rule; unlike it,
+      // no regular-file check here: the retirement never deletes a sibling).
+      if (name.endsWith(".bundle") && (manifest.has(BUNDLE_ITEM + path.join(runDir, name)) ||
+          known.has(name.slice(0, -".bundle".length)))) continue;
+      const stem = name.endsWith(".json") ? name.slice(0, -".json".length) : undefined;
+      if (stem === undefined || !known.has(stem)) return false;
+    }
+    // Absence: the present items must form a suffix, and none the record counts as deleted may be present.
+    let firstPresent = -1;
+    for (const [index, item] of retiring.manifest.entries()) {
+      let present: boolean;
+      if (item.startsWith(FENCE_ITEM)) {
+        present = journalFence !== undefined;
+        if (present && FENCE_ITEM + serializeSourceFence(journalFence!) !== item) return false;
+      } else {
+        const file = item.startsWith(BUNDLE_ITEM) || item.startsWith(RECORD_ITEM) ? item.slice(item.indexOf(":") + 1) : item;
+        present = await ownedRecoveryIO(() => fs.lstat(file)).then(() => true, (err: NodeJS.ErrnoException) => {
+          if (err.code === "ENOENT") return false;
+          throw err;
+        });
+      }
+      if (present && firstPresent < 0) firstPresent = index;
+      if (!present && firstPresent >= 0) return false;
+    }
+    const remaining = firstPresent < 0 ? retiring.manifest.length : firstPresent;
+    return remaining >= retiring.deleted;
   }
 
   /** Caller owns the generation cycle. The journal lock spans selection and every destructive
@@ -4738,6 +5049,139 @@ export class RecoveryCoordinator {
         return true;
       });
     } catch { MaintenanceBudget.current()?.check(); return false; }
+  }
+
+  /**
+   * issue #3404 M2 U4 - the separate terminal-publication path. It attaches ONLY the certified V2 form of the
+   * already-bound completing source to the N exact-generation records. Every cohort record must already carry
+   * a source whose legacy core equals `bound` exactly (or, for an idempotent retry, `certified` itself), so a
+   * changed HEAD, roots, identity or cohort throws. A record that also carries a completion receipt is
+   * rewritten like any other member: its receipt and every other field are kept, only `completionSource`
+   * changes, and only to the certificate over the SAME core, so the receipt-era source identity (HEAD, roots,
+   * context, clone path, attempt) is never altered.
+   *
+   * The caller holds the outer authority transaction A; inside the journal lock J this
+   *  1. enumerates the PHYSICAL run directory (every entry, not only the authenticated records): a
+   *     malformed, unreadable, unknown or unattributable entry refuses, and the exact sorted capture-id
+   *     membership is taken from the authenticated generation records;
+   *  2. runs `installFence` (the bare journal fence; it takes the bare lock B beneath J);
+   *  3. rewrites each record (MAC, write, file sync, rename), syncs the run directory, and reads each back;
+   *  4. re-enumerates the directory and requires the same entries, then
+   *  5. runs `commit(captureIds)`, which publishes the slot's eligibility LAST.
+   * Any throw leaves the slot unpublished: certified records never confer eligibility without the matching
+   * published slot. Durability is awaited (async fs only); the exercised path costs N record file syncs plus
+   * one directory sync here, beside the fence's two and the slot write's own.
+   */
+  async publishCompletionSource(input: {
+    bound: CompletionSource;
+    certified: CompletionSourceV2;
+    installFence: () => Promise<unknown>;
+    commit: (captureIds: string[]) => Promise<void>;
+  }): Promise<void> {
+    const { bound, certified } = input;
+    if (!this.enabled || !this.key) throw new CompletionPublicationError("recovery journal unavailable");
+    if (!validCompletionSource(bound) || canonicalJson(legacyCompletionCore(certified)) !== canonicalJson(bound) ||
+        certified.certificate === undefined) {
+      throw new CompletionPublicationError("certified source does not carry the bound core");
+    }
+    const ctx = bound.context;
+    await this.withJournalLock(ctx.runId, async () => {
+      const first = await this.physicalGeneration(ctx.runId, ctx.generation);
+      const bareDir = path.basename(ctx.barePath);
+      const wanted = canonicalJson(bound), certifiedJson = canonicalJson(certified);
+      for (const r of first.selected) {
+        const source = r.completionSource;
+        if (!r.inventoryGuarded || r.runId !== ctx.runId || r.branch !== ctx.branch || r.kind !== ctx.kind ||
+            (r.bareDir && r.bareDir !== bareDir) || (r.recoveryPinBareDir && r.recoveryPinBareDir !== bareDir) ||
+            (r.coverageContext && canonicalJson(r.coverageContext) !== canonicalJson(ctx)) ||
+            (r.bundlePath && path.resolve(r.bundlePath) !== path.resolve(this.bundlePath(r))) ||
+            !source || canonicalJson(legacyCompletionCore(source)) !== wanted ||
+            ("version" in source && canonicalJson(source) !== certifiedJson)) {
+          throw new CompletionPublicationError("cohort record is not the bound completing source");
+        }
+      }
+      await input.installFence();
+      for (const record of first.selected) await this.writeRecordDurableUnlocked({ ...record, completionSource: certified });
+      await this.syncRunDirectory(ctx.runId);
+      for (const record of first.selected) {
+        const readback = await this.requireRecord(record);
+        if (!readback.completionSource || canonicalJson(readback.completionSource) !== certifiedJson) {
+          throw new CompletionPublicationError("published record did not read back");
+        }
+      }
+      const second = await this.physicalGeneration(ctx.runId, ctx.generation);
+      if (second.names !== first.names || second.captureIds.join() !== first.captureIds.join()) {
+        throw new CompletionPublicationError("cohort changed during publication");
+      }
+      await input.commit(first.captureIds);
+    });
+  }
+
+  /**
+   * Every physical entry of the run directory, authenticated: a `.json` entry must be a verified record of
+   * this run, a `.bundle` entry must belong to one, and anything else (an incomplete write, a stray file, a
+   * non-regular entry) refuses. Returns the exact sorted capture ids of `generation`. Caller holds J.
+   */
+  private async physicalGeneration(runId: string, generation: number): Promise<{
+    names: string; captureIds: string[]; selected: RecoveryRecord[];
+  }> {
+    let records: RecoveryRecord[];
+    let names: string[];
+    try {
+      records = await this.checkedRecords(runId);
+      names = await ownedRecoveryIO(() => fs.readdir(this.runDir(runId)));
+    } catch { throw new CompletionPublicationError("recovery journal is not fully readable"); }
+    if (records.some(r => r.generation === undefined)) throw new CompletionPublicationError("legacy record in the journal");
+    const known = new Set(records.map(r => r.captureId));
+    // The coordinator's own crash-era temps (exactly the names ordinaryTempEntry accepts, as checkedRecords
+    // tolerates them) carry no authority and are not part of the cohort. Each must still be a regular file;
+    // any other name, including a `.json`/`.bundle` impostor, falls through to the refusal below.
+    const temps = names.filter(ordinaryTempEntry);
+    for (const name of temps) {
+      const stat = await ownedRecoveryIO(() => fs.lstat(path.join(this.runDir(runId), name)));
+      if (!stat.isFile()) throw new CompletionPublicationError("unknown recovery journal entry");
+    }
+    names = names.filter(name => !ordinaryTempEntry(name));
+    for (const name of names) {
+      const stem = name.endsWith(".json") ? name.slice(0, -".json".length) : name.endsWith(".bundle") ? name.slice(0, -".bundle".length) : undefined;
+      if (stem === undefined || !known.has(stem)) throw new CompletionPublicationError("unknown recovery journal entry");
+      const stat = await ownedRecoveryIO(() => fs.lstat(path.join(this.runDir(runId), name)));
+      if (!stat.isFile()) throw new CompletionPublicationError("unknown recovery journal entry");
+    }
+    if (records.some(r => !names.includes(r.captureId + ".json"))) throw new CompletionPublicationError("recovery journal changed");
+    const selected = records.filter(r => r.generation === generation)
+      .sort((a, b) => (a.captureId < b.captureId ? -1 : a.captureId > b.captureId ? 1 : 0));
+    if (selected.length === 0) throw new CompletionPublicationError("no cohort for this generation");
+    return { names: [...names].sort().join("\n"), captureIds: selected.map(r => r.captureId), selected };
+  }
+
+  /** MAC, write, file sync, rename: the durable variant of writeRecordUnlocked. The directory sync is the caller's. */
+  private async writeRecordDurableUnlocked(record: RecoveryRecord): Promise<void> {
+    this.invalidateCompletionCleanupWitness(record);
+    const mac = this.computeMac(record);
+    const dst = this.recordPath(record);
+    const tmp = `${dst}.${randomUUID()}.tmp`;
+    try {
+      await ownedRecoveryIO(async () => {
+        const handle = await fs.open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+        try {
+          await handle.writeFile(JSON.stringify({ ...record, mac }));
+          await this.publicationOps.syncFile(handle);
+        } finally { await handle.close(); }
+        await this.publicationOps.rename(tmp, dst);
+      });
+    } catch (error) {
+      // A leftover temp would make every later publication of this run refuse as an unknown entry.
+      await fs.unlink(tmp).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async syncRunDirectory(runId: string): Promise<void> {
+    await ownedRecoveryIO(async () => {
+      const handle = await fs.open(this.runDir(runId), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      try { await this.publicationOps.syncDir(handle); } finally { await handle.close(); }
+    });
   }
 
   /** One bounded authenticated write/readback, only to an existing exact-generation record.
@@ -5468,7 +5912,7 @@ function validInventoryContext(value: unknown, runId: string, barePath?: string)
 }
 
 /** Completion source shape is checked before authenticating the containing record. */
-function validCompletionSource(value: unknown): value is CompletionSource {
+export function validCompletionSource(value: unknown): value is CompletionSource {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const s = value as CompletionSource;
   const keys = Object.keys(s).sort().join(",");
@@ -5485,6 +5929,43 @@ function validCompletionSource(value: unknown): value is CompletionSource {
       r.contexts.every(c => validInventoryContext(c, ctx.runId, ctx.barePath) &&
         !("legacy" in c) && !("origin" in c) && c.generation === ctx.generation &&
         c.branch === ctx.branch && c.kind === ctx.kind));
+}
+
+/**
+ * A persisted completion source is either the legacy V1 core (exact V1 key set) or a published V2 source
+ * (exact V2 key set, certificate kept verbatim). Anything else, including a V2-looking value that fails the
+ * strict V2 decode, refuses the whole record. A parser that predates V2 refuses the record the same way.
+ *
+ * Rollback protection (issue #3404, pinned by test/fixtures/base-valid-completion-source.ts, a verbatim copy of the
+ * pre-#3404 gate, and by the base journal parser fixture): a pre-#3404 coerceRecord returns null for a V2 source,
+ * so its listRecords silently skips the record, and a release() that saw no guarded record would remove the run
+ * directory. That worker cannot reach release() for such a run: publication installs the completionSourceFence in
+ * the bare journal BEFORE rewriting any record, and the old parseRecoveryJournal rejects the fence key, so the old
+ * worker's attach of the run's branch (runnerCloneForBranch) fails closed before its completed-run release. The
+ * protection therefore rests on the fence staying in the journal for as long as any record is V2. Under
+ * authorityRequired, GitCache keeps it there: retireRunnerClone without a matching completionSource.expectedFence
+ * (orphan reclaim included), releaseAttemptInPlace, prepareRecoverySuccessor, markStoppedCanonical,
+ * retainStoppedAttempt, the stopped-journal heal and the already-retired check all refuse or retain a fenced
+ * journal before any effect. The only removals are the certified completion retirement (which verifies the
+ * fence it clears), its crash-resume sibling GitCache.clearRetiredCompletionJournal (clone already gone, exact
+ * run/path/attempt and the exact durable expected fence, under the bare lock), the guarded operator discard
+ * (discardRetained*, which carries its own authority) and detachTerminalRetained. The last copies the journal,
+ * fence included, into the protected `uzi-retained.<run>.journal` descriptor before it clears the active key;
+ * the captured base parser rejects that descriptor's journal for the unknown fence key (pinned by
+ * test/git-completion-fence.test.ts), so a worker built before the fence still refuses it. Every other journal
+ * rewrite spreads the existing journal and so carries the fence along.
+ */
+function decodePersistedCompletionSource(value: unknown): CompletionSource | CompletionSourceV2 | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value) && (value as { version?: unknown }).version !== undefined) {
+    try { return decodeCompletionSourceShape(value); } catch { return undefined; }
+  }
+  return validCompletionSource(value) ? value : undefined;
+}
+
+/** The V1 core of a stored source: exactly the legacy key set, whatever version the record carries. */
+export function legacyCompletionCore(source: CompletionSource | CompletionSourceV2): CompletionSource {
+  return { context: source.context, clonePath: source.clonePath, expectedHead: source.expectedHead, roots: source.roots,
+    ...(source.attemptId === undefined ? {} : { attemptId: source.attemptId }) };
 }
 
 /** Strict persisted shape. Live identity validation belongs to WorkerClient; MAC binds it at rest. */
@@ -5641,8 +6122,8 @@ function coerceRecord(obj: Record<string, unknown>): RecoveryRecord | null {
     record.finalRequest = req;
   }
   if (obj.completionSource !== undefined) {
-    if (!validCompletionSource(obj.completionSource)) return null;
-    const source = obj.completionSource;
+    const source = decodePersistedCompletionSource(obj.completionSource);
+    if (!source) return null;
     if (!record.inventoryGuarded || source.context.runId !== record.runId ||
         source.context.generation !== record.generation || source.context.branch !== record.branch ||
         source.context.kind !== record.kind) return null;

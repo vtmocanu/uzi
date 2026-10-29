@@ -33,6 +33,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 ### Changed
 
+- **Routine dependency updates ([#3578](https://github.com/vtmocanu/uzi/pull/3578)).**
+  Dependency manifest and image bumps that carry no entry of their own.
+
 - **Routine dependency updates ([#3517](https://github.com/vtmocanu/uzi/pull/3517)).**
   Dependency manifest and image bumps that carry no entry of their own.
 
@@ -328,6 +331,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Built-in Anthropic token and developer convention docs corrected ([#3486](https://github.com/vtmocanu/uzi/pull/3486)).**
   The in-app and CLI docs now carry fixed broken links, current CI job names, the launcher flag location and an accurate release coverage claim.
 
+- **Code cross-check reviews delivery criteria and environment effects ([#3167](https://github.com/vtmocanu/uzi/pull/3167), [#3569](https://github.com/vtmocanu/uzi/pull/3569)).**
+  The advisory checker receives frozen milestones, reports missing or unverifiable criteria after defects, and evaluates validation overrides by their actual effects.
+
 ### Added
 
 - **Healthy busy workers no longer show custody attention.**
@@ -476,6 +482,21 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Recovery logs explain inventory reconstruction decisions ([#3544](https://github.com/vtmocanu/uzi/pull/3544), [#3548](https://github.com/vtmocanu/uzi/pull/3548)).**
   The `recovery: inventory reconstruction` event distinguishes coverage failures, reconstruction refusals and invalidated snapshot reuse; custody behavior is unchanged.
+
+- **Codex account pressure temporarily delays new runs with visible eligibility times ([#3530](https://github.com/vtmocanu/uzi/pull/3530), [#3562](https://github.com/vtmocanu/uzi/pull/3562)).**
+  Linked subscription aliases share persisted cooldowns after model rate limits or overload from distinct runs; admitted runs continue, bounded best-effort evidence can be lost, and default account admission remains unlimited. Handoff setup, vault and custody blockers retain priority over cooldown details.
+
+- **CLI plan approvals can override unmet capabilities ([#3399](https://github.com/vtmocanu/uzi/pull/3399), [#3556](https://github.com/vtmocanu/uzi/pull/3556)).**
+  `uzi run approve --override-capabilities` explicitly clears the run's requirements, and capability errors show the command to use.
+
+- **Repos can suppress recurring inferred capability requirements for new runs ([#3553](https://github.com/vtmocanu/uzi/pull/3553), [#3559](https://github.com/vtmocanu/uzi/pull/3559)).**
+  The Tools panel configures a frozen per-run inference policy; explicit requirements still win, and run details expose the policy in the API and CLI.
+
+- **Run requirements explain capability inference with bounded trigger paths ([#3553](https://github.com/vtmocanu/uzi/pull/3553), [#3564](https://github.com/vtmocanu/uzi/pull/3564)).**
+  Web and CLI show frozen repo-hint sources, sampled detector observations and ignored inference without changing approval identity or worker admission; older workers remain supported.
+
+- **Weekly usage reserve holds new work and pauses running runs at a per-user 7-day threshold ([#3522](https://github.com/vtmocanu/uzi/pull/3522), [#3568](https://github.com/vtmocanu/uzi/pull/3568)).**
+  Set it with `uzi settings reserve` or `PUT /api/me/usage-reserve`; it is best effort, not a cap, and unknown readings (such as console API keys or a disabled usage poller) hold new work, while after a rollback reserve-paused runs need a manual resume.
 
 ### Fixed
 
@@ -1236,6 +1257,21 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **The worker bare cache refuses a shallow repository ([#3450](https://github.com/vtmocanu/uzi/pull/3450), [#3491](https://github.com/vtmocanu/uzi/pull/3491)).**
   Cloning from a shallow source or reusing a shallow bare now fails with a non-retryable error instead of caching refs with incomplete history.
+
+- **Run breadcrumbs name their repository and repository navigation says Repos ([#3555](https://github.com/vtmocanu/uzi/pull/3555), [#3557](https://github.com/vtmocanu/uzi/pull/3557)).**
+  Run details expose the repo path in the API and CLI, and the repo list's sidebar, title, back link and dashboard tile share the Repos label.
+
+- **Repeated Codex idle stalls wait for the owner after bounded automatic recovery ([#3509](https://github.com/vtmocanu/uzi/pull/3509), [#3576](https://github.com/vtmocanu/uzi/pull/3576)).**
+  Both no-output and productive stalls use one configurable park cap, defaulting to three timed retries before a hold; Resume resets the allowance and wall, while source custody and API-first rollout constraints still apply.
+
+- **Invalidated ordinary recovery inventories can settle after reconstruction ([#3561](https://github.com/vtmocanu/uzi/pull/3561), [#3572](https://github.com/vtmocanu/uzi/pull/3572)).**
+  Recovery creates a fresh archive only when current source ancestry is proven, retains custody when it is not, and prevents stale invalidated archives from minting a new FINAL.
+
+- **Recovery metadata rejects unsupported canonical alternate controls before Git ([#3574](https://github.com/vtmocanu/uzi/pull/3574)).**
+  Worker caches refuse alternate controls without opening them, preventing newer Git versions from blocking metadata probes on hostile object-store layouts while retaining cached work.
+
+- **Release validation refuses unreadable history ([#3551](https://github.com/vtmocanu/uzi/pull/3551)).**
+  A failed history lookup can no longer be mistaken for a fully covered release.
 
 ### Security
 

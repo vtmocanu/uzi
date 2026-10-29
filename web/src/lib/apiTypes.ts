@@ -145,7 +145,7 @@ export interface CrossCheckPinDTO {
   resolved_model: string | null;
   resolved_effort: string;
   model_source: "pin" | "worker default";
-  effort_source: "pin" | "worker default";
+  effort_source: "pin" | "worker default" | "cross-check default";
   active: boolean;
 }
 
@@ -1018,6 +1018,9 @@ export interface ForgeConfig {
 // every field is always present. default_theme is the instance-default UI theme
 // (PRD #21).
 export interface AppSettings {
+  // Settings are a string map; callers accept only optional, otherwise required.
+  // Missing on older APIs must also be treated as required.
+  vault_policy?: string;
   autopilot_label: string;
   // PRD #764: the single run-eligibility label (default "uzi"). An issue is runnable
   // iff it carries this label; served as a raw string like every other setting.
@@ -1186,6 +1189,8 @@ export type SettingSource = "env" | "db" | "default";
 // non-secret effective values; `secrets` reports, per secret key, whether a value
 // is configured (never the value itself); `sources` reports every key's source.
 export interface SettingsResponse {
+  // Always reported by current GET/PUT handlers; absent on older APIs is unknown.
+  unprotected_users?: number;
   settings: AppSettings;
   secrets: Record<string, boolean>;
   sources: Record<string, SettingSource>;
@@ -1371,6 +1376,26 @@ export interface AppearanceState {
   };
 }
 
+export type VaultMode = "protected" | "unprotected";
+export type VaultPolicy = "optional" | "required";
+
+// Mode is independent of wrapper presence: protected users may still need enrollment.
+export interface VaultStatus {
+  mode: VaultMode;
+  policy: VaultPolicy;
+  unlocked: boolean;
+  exists: boolean;
+}
+
+// The shared Go toggle DTO omits rotation_advice for disable.
+export interface VaultToggleResponse {
+  mode: VaultMode;
+  rotation_advice?: string;
+}
+
+export type VaultEnableResponse = Required<VaultToggleResponse> & { mode: "protected" };
+export type VaultDisableResponse = Pick<VaultToggleResponse, "mode"> & { mode: "unprotected" };
+
 // SessionResponse is the auth/session bootstrap body (login, register, me). It
 // carries the user, the instance forge labels the board and issue-creation UI
 // need before their first call (PRD #19 M2, PRD #764: the single `uzi`
@@ -1396,12 +1421,10 @@ export interface SessionResponse {
   /** @deprecated PRD #1167: use `appearance.defaults.dark_theme` instead. The instance
    *  dark-polarity default (the legacy single-theme instance default). */
   default_theme: string;
-  // Vault status (PRD #32): whether the user's per-user secret vault is unlocked
-  // in the server process. Optional so a server that predates the field reads as
-  // unlocked (no banner, legacy behavior) rather than falsely locked. `exists`
-  // (PRD #45) is whether a vault row exists at all; with has_password it lets a
-  // passwordless user's SPA pick the passphrase-create dialog vs the unlock banner.
-  vault?: { unlocked: boolean; exists?: boolean };
+  // Older sessions may omit vault or its newer metadata. Missing mode/policy
+  // must be treated as protected/required, never inferred from exists. Preserve
+  // the pre-vault unlocked fallback when the entire object is absent.
+  vault?: Pick<VaultStatus, "unlocked"> & Partial<Omit<VaultStatus, "unlocked">>;
   // has_password is false for OIDC-only users (NULL password_hash; PRD #45). Absent
   // (older server, or a password user) reads as true — no passphrase-create dialog.
   has_password?: boolean;
@@ -1653,6 +1676,8 @@ export interface HealthCheck {
   group: string;
   title: string;
   severity: string;
+  // Presentation-only opt-in; does not affect severity, counts, blocking or episodes.
+  attention_banner?: boolean;
   summary: string;
   // When the check first went non-ok, where the source has one, else null.
   since: string | null;
@@ -3042,6 +3067,18 @@ export interface SemanticDriftDTO {
 }
 
 export interface Run {
+  capability_provenance?: {
+    hints_known: boolean;
+    inference_known: boolean;
+    capabilities: {
+      capability: string;
+      sources: string[];
+      required: boolean;
+      inference_ignored: boolean;
+      triggers: { path: string; reason: string }[];
+      truncated: boolean;
+    }[];
+  };
   /** Repo display path on detail reads; absent on older servers, empty when unavailable. */
   repo_path?: string;
   /** Frozen repo inference policy; explicit requirements take precedence. */
@@ -3515,6 +3552,10 @@ export interface Run {
    *  while it stays locked), and "data_volume_full" (PRD #1809 M5: the worker's data volume
    *  was full or about to fill; the run resumes at its next retry, see disk_park_count);
    *  "provider_outage" is a counted provider interruption with a scheduled retry;
+   *  "retained_recovery_exhausted" can be timed or owner-held (see recovery_retry_not_before);
+   *  "retained_recovery_adoption_failed" means integrity checks refused adoption of retained
+   *  work: always owner-held with local work and custody preserved, no automatic retry.
+   *  Only the owner can Resume or Cancel, through the existing owner authorization.
    *  "empty_turn" remains reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
@@ -3539,7 +3580,11 @@ export interface Run {
    *  the next retry a `vault_locked` park resumes at once the vault is unlocked. The
    *  recovery-park analog of retry_not_before (the usage-limit park's stamp) and a SEPARATE
    *  field: a run parks on at most one of the two at a time. Null for a run that has never
-   *  recovery-parked. ISO-8601 string, like every other timestamp on this type. */
+   *  recovery-parked. For retained_recovery_exhausted, explicit null means owner-held;
+   *  a valid timestamp means timed retry (including when already due). Missing or invalid
+   *  timing is unknown. For retained_recovery_adoption_failed this is always null and must
+   *  never produce a retry countdown, even if a malformed response supplies a timestamp.
+   *  ISO-8601 string, like every other timestamp on this type. */
   recovery_retry_not_before: string | null;
   /** PRD #1392 M1: how many times this run has forge-parked in its lifetime — the
    *  FORGE-ONLY counter the cap decides on. 0 for a run that has never forge-parked
@@ -3911,7 +3956,7 @@ export interface PlanCrossCheckSummary {
   checker_model: string | null;
   checker_effort: string | null;
   checker_model_source: "pin" | "worker default" | null;
-  checker_effort_source: "pin" | "worker default" | null;
+  checker_effort_source: "pin" | "worker default" | "cross-check default" | null;
   usage: RunUsage | null;
   historical: boolean;
 }
@@ -3996,6 +4041,7 @@ export type RunSummaryItem = Omit<
   "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
+  | "capability_provenance"
 >;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
@@ -4212,6 +4258,8 @@ export interface AdminRateLimitUser {
   id: string;
   email: string;
   name: string;
+  // Older rows omit mode; absence means protected, independently of lock state.
+  vault_mode?: VaultMode;
   vault_locked: boolean;
   tokens: TokenRateLimits[];
 }
@@ -4287,6 +4335,8 @@ export interface CodexAdminRateLimitRow {
   id: string;
   email: string;
   name: string;
+  // Older rows omit mode; absence means protected, independently of lock state.
+  vault_mode?: VaultMode;
   vault_locked: boolean;
   accounts: CodexAccountRateLimit[];
 }

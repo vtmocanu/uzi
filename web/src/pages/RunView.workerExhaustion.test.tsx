@@ -237,6 +237,40 @@ it("badge and shared pill describe the owner decision without automatic retry", 
 });
 
 
+function adoptionFailed(stamp: string | null = null): Run {
+  return { ...held(), recovery_wait_cause: "retained_recovery_adoption_failed", recovery_retry_not_before: stamp };
+}
+it.each([null, "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "invalid"])("adoption integrity refusal ignores retry timestamp %s and uses owner actions", async (stamp) => {
+  const { container } = render(view(adoptionFailed(stamp), true));
+  expect(screen.getByText("Retained recovery integrity check failed")).toBeTruthy();
+  expect(screen.getByText(/Integrity checks refused to adopt the retained work/, { selector: "p" })).toBeTruthy();
+  expect(screen.getByText(/Local work and its custody are preserved/, { selector: "p" })).toBeTruthy();
+  expect(screen.getByText(/This hold has no scheduled retry. Only the run owner can Resume or Cancel/)).toBeTruthy();
+  expect(container.textContent).not.toMatch(/retry automatically|retrying in|retry in|Automatic retry is due|Retry timing is unavailable/i);
+  const notice = container.querySelector('div.sr-only[role="status"]')!;
+  await waitFor(() => expect(notice.textContent).toMatch(/Integrity checks refused/));
+  expect(notice.textContent).toMatch(/no scheduled retry/);
+  expect(api.getRunArchives).toHaveBeenCalledWith("held");
+  fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));
+  await waitFor(() => expect(api.resumeRun).toHaveBeenCalledWith("held"));
+  await waitFor(() => expect(refreshRun).toHaveBeenCalledOnce());
+  fireEvent.click(screen.getByRole("button", { name: /^Cancel$/ }));
+  await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+});
+it.each([undefined, false])("adoption refusal requires confirmed owner proof %s", (proof) => {
+  render(view(adoptionFailed("2099-01-01T00:00:00Z"), proof));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+  expect(api.getRunArchives).not.toHaveBeenCalled();
+});
+it("adoption refusal requires steer permission and reacts to owner proof changes", () => {
+  const { rerender } = render(view(adoptionFailed(), true, false));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+  rerender(view(adoptionFailed(), true));
+  expect((screen.getByRole("button", { name: /^Resume$/ }) as HTMLButtonElement).disabled).toBe(false);
+  rerender(view(adoptionFailed(), false));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+});
+
 function retained(stamp: string | null): Run {
   return { ...held(), recovery_wait_cause: "retained_recovery_exhausted", recovery_retry_not_before: stamp };
 }
@@ -297,4 +331,38 @@ it.each([null, "2099-01-01T00:00:00Z"])("retained recovery %s shares busy and er
   await act(async () => reject(new ApiError(409, "Retained recovery refused")));
   expect(screen.getByText("Retained recovery refused")).toBeTruthy();
   expect((screen.getByRole("button", { name: /^Resume$/ }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+function idleStall(stamp: string | null | undefined): Run {
+  return { ...retained(null), recovery_wait_cause: "codex_idle_stall", recovery_retry_not_before: stamp } as Run;
+}
+it.each([null, "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z", undefined, "invalid"])("Codex idle stall %s has owner actions and honest timing", async (stamp) => {
+  render(view(idleStall(stamp), true));
+  expect(screen.getByText(stamp === null ? "Codex idle stall needs your decision" : stamp && stamp !== "invalid" ? "Codex idle stall retrying" : "Codex idle stall timing unknown", { selector: "p" })).toBeTruthy();
+  expect(screen.getByText("Resume starts a fresh wall and resets the idle-stall count. Cancel ends this run. Resume requests an attempt; success is not assured.")).toBeTruthy();
+  if (stamp === null) expect(screen.getByText(/This hold has no scheduled retry/)).toBeTruthy();
+  if (stamp === undefined || stamp === "invalid") {
+    expect(screen.getByText(/Retry timing is unavailable/)).toBeTruthy();
+    expect(screen.queryByText(/This hold has no scheduled retry|The run will retry automatically|Automatic retry is due/)).toBeNull();
+  }
+  expect(screen.queryByText(/Automatic recovery limit:|Lifetime automatic requeues:|Recovery episode:/)).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));
+  await waitFor(() => expect(api.resumeRun).toHaveBeenCalledWith("held"));
+  await waitFor(() => expect(refreshRun).toHaveBeenCalledOnce());
+  fireEvent.click(screen.getByRole("button", { name: /^Cancel$/ }));
+  await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+});
+it.each([null, "2099-01-01T00:00:00Z", undefined])("Codex idle stall %s requires confirmed ownership", (stamp) => {
+  render(view(idleStall(stamp), false));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+  expect(api.getRunArchives).not.toHaveBeenCalled();
+});
+it("announces Codex idle stall omitted, timed and held transitions", async () => {
+  const { container, rerender } = render(view(idleStall(undefined), true));
+  const notice = container.querySelector('div.sr-only[role="status"]')!;
+  await waitFor(() => expect(notice.textContent).toMatch(/timing is unavailable/));
+  rerender(view(idleStall("2020-01-01T00:00:00Z"), true));
+  await waitFor(() => expect(notice.textContent).toMatch(/scheduled retry/));
+  rerender(view(idleStall(null), true));
+  await waitFor(() => expect(notice.textContent).toMatch(/There is no scheduled retry/));
 });

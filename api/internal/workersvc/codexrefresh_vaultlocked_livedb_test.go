@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/vault"
@@ -21,27 +22,38 @@ import (
 
 const codexVaultLockedTestPassword = "codex-vault-locked-test-password" //nolint:gosec // G101: synthetic vault password for a throwaway test user, never a real secret
 
+// enrollCodexProtectedVault authenticates enrollment with a real current password hash.
+func enrollCodexProtectedVault(t *testing.T, env codexTestEnv, vlt *vault.Vault, userID uuid.UUID, password string) {
+	t.Helper()
+	hash, err := auth.HashPassword(password)
+	if err != nil {
+		t.Fatalf("hash enrollment password: %v", err)
+	}
+	env.exec(`UPDATE users SET password_hash = $1 WHERE id = $2`, hash, userID)
+	if err := vlt.Enable(env.ctx, userID, password); err != nil {
+		t.Fatalf("enable protected vault: %v", err)
+	}
+}
+
 // dekSealAccountAndLock wires a real vault into f.svc, creates and unlocks the user's vault,
 // re-seals the account's committed login under the user DEK (sealed_with='dek'), and locks
 // the vault again. The fixture's master-sealed login would open without an unlock, so this is
 // what makes the pre-exchange open of the login hit the locked vault.
 func dekSealAccountAndLock(t *testing.T, env codexTestEnv, f refreshFixture) *vault.Vault {
 	t.Helper()
-	vlt := vault.New(env.box, env.q)
+	vlt := vault.NewPostgres(env.box, env.pool)
 	f.svc.SetVault(vlt)
-	if err := vlt.Unlock(env.ctx, f.userID, codexVaultLockedTestPassword); err != nil {
-		t.Fatalf("create+unlock vault: %v", err)
-	}
+	enrollCodexProtectedVault(t, env, vlt, f.userID, codexVaultLockedTestPassword)
 	raw, err := json.Marshal(codexLoginBlob{AccessToken: f.accessToken, RefreshToken: f.prevRefreshToken}) //nolint:gosec // G117: synthetic fixture login, DEK-sealed below
 	if err != nil {
 		t.Fatalf("encode login: %v", err)
 	}
-	sealed, err := vlt.Seal(f.userID, store.KindCodexAuth, raw)
+	sealed, err := vlt.Seal(env.ctx, f.userID, store.KindCodexAuth, raw, vault.SealForUse)
 	if err != nil {
 		t.Fatalf("seal login under DEK: %v", err)
 	}
 	env.exec(`UPDATE codex_provider_account SET sealed_login = $1, sealed_with = $2 WHERE id = $3`,
-		sealed, store.SealedWithDEK, f.accountID)
+		sealed.Ciphertext, sealed.SealedWith, f.accountID)
 	vlt.Lock(f.userID)
 	if vlt.Unlocked(f.userID) {
 		t.Fatal("vault still unlocked after Lock")
@@ -123,13 +135,11 @@ func TestReleaseCodexCredentialVaultLockedLiveDB(t *testing.T) {
 		if err := svc.FreezeCodexBinding(env.ctx, userID, runID, aliasID, codexAuthModeAPIKey); err != nil {
 			t.Fatalf("FreezeCodexBinding: %v", err)
 		}
-		// The first unlock creates the vault and rewraps the master-sealed key under the DEK;
+		// Enrollment creates the vault and rewraps the master-sealed key under the DEK;
 		// locking it again leaves the key unopenable until the next unlock.
-		vlt := vault.New(env.box, env.q)
+		vlt := vault.NewPostgres(env.box, env.pool)
 		svc.SetVault(vlt)
-		if err := vlt.Unlock(env.ctx, userID, codexVaultLockedTestPassword); err != nil {
-			t.Fatalf("create+unlock vault: %v", err)
-		}
+		enrollCodexProtectedVault(t, env, vlt, userID, codexVaultLockedTestPassword)
 		vlt.Lock(userID)
 		wkr := store.Worker{ID: workerID, UserID: userID}
 		capw := env.mintCap(t, runID, workerID)
@@ -284,10 +294,13 @@ func TestCoordinatedCodexRefreshVaultLockedSealAuthorityLostLiveDB(t *testing.T)
 				target = f.accountID
 			}
 
-			// A real vault that is locked for this user: the master-sealed login opens, but
-			// the post-rotation canonical seal takes the DEK path and meets the lock.
-			f.svc.SetVault(vault.New(env.box, env.q))
-			fake.onRefresh = func() { env.exec(tc.loseSQL, target) }
+			// Enroll before exchange, then lock when the provider returns material.
+			vlt := f.svc.vlt
+			enrollCodexProtectedVault(t, env, vlt, f.userID, codexVaultLockedTestPassword)
+			fake.onRefresh = func() {
+				vlt.Lock(f.userID)
+				env.exec(tc.loseSQL, target)
+			}
 
 			res, err := f.svc.CoordinatedCodexRefresh(env.ctx, f.wkr, f.runID, capw, op, 0)
 			if !errors.Is(err, tc.want) {
@@ -306,7 +319,7 @@ func TestCoordinatedCodexRefreshVaultLockedSealAuthorityLostLiveDB(t *testing.T)
 			if acct.Generation != 0 || acct.CoordState != codexCoordQuarantined {
 				t.Fatalf("account = (state=%q gen=%d), want (quarantined,0)", acct.CoordState, acct.Generation)
 			}
-			if len(acct.RecoverySealed) == 0 || !acct.RecoverySealedWith.Valid || acct.RecoverySealedWith.String != store.SealedWithMaster {
+			if len(acct.RecoverySealed) == 0 || !acct.RecoverySealedWith.Valid || acct.RecoverySealedWith.String != store.SealedWithMasterAAD {
 				t.Fatalf("recovery not retained under master protection: sealed=%d with=%v", len(acct.RecoverySealed), acct.RecoverySealedWith)
 			}
 			if it := mustIntent(t, env, op, f.userID); it.State != codexIntentRotating {

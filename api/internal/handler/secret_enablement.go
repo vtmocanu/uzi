@@ -65,7 +65,7 @@ func (h *Handler) PatchSecretEnabled(w http.ResponseWriter, r *http.Request) {
 	}
 	var row store.GetSecretEnablementRow
 	found, transitioned := false, false
-	err := h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+	err := h.withSecretLock(r.Context(), user.ID, nil, func(q *store.Queries) error {
 		cur, err := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{ID: id, UserID: user.ID})
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil

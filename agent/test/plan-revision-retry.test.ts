@@ -246,7 +246,7 @@ describe("live-flight plan revision recovery", () => {
 
   it("3466 zero allowance replacement readiness waits instead of admitting construction", async () => {
     const f = fixture(0);
-    const cause = new TransientRecoveryError("silence", { zeroEvidenceIdle: true });
+    const cause = new TransientRecoveryError("silence", { idleStallKind: "zero_evidence" });
     const observed: boolean[] = [];
     const observer = (waiting: boolean) => { observed.push(waiting); };
     f.onOwner(() => assert.notEqual(observed.at(-1), true));
@@ -260,11 +260,12 @@ describe("live-flight plan revision recovery", () => {
     assert.deepEqual(observed, [true, false, true, false]);
   });
 
-  it("3466 measured silence shares exactly three re-drives and names the idle cause", async () => {
+  for (const providerOrigin of [false, true]) it(`3506 revision retry and exhaustion providerOrigin=${providerOrigin}`, async () => {
     const f = fixture(3);
     const cause = new TransientRecoveryError("silent revision", {
-      zeroEvidenceIdle: true, originalIdle: new Error("codex run idle timeout"),
+      providerOrigin, idleStallKind: "zero_evidence", originalIdle: new Error("codex run idle timeout"),
     });
+    const reason = providerOrigin ? "silence after a provider-reported rate limit or transport retry" : "No model output within the idle timeout";
     await f.recovery.beforeTurn();
     for (let attempt = 1; attempt <= 3; attempt++) {
       const slept = f.sleeps.reduce((sum, ms) => sum + ms, 0);
@@ -273,11 +274,11 @@ describe("live-flight plan revision recovery", () => {
       await f.recovery.beforeTurn();
       await f.recovery.beforeTurn();
       assert.equal(f.notices.at(-1),
-        `No model output within the idle timeout during plan revision 101; re-driving the failed turn (${attempt}/3).`);
+        `${reason} during plan revision 101; re-driving the failed turn (${attempt}/3).`);
     }
     assert.equal(f.sleeps.reduce((sum, ms) => sum + ms, 0), 35000);
     await assert.rejects(f.recovery.retry(cause), PlanRejectedError);
-    assert.match(f.notices.at(-1)!, /^No model output within the idle timeout\. Plan revision retry allowance exhausted/);
+    assert.ok(f.notices.at(-1)!.startsWith(`${reason}. Plan revision retry allowance exhausted`));
     assert.match(f.notices.at(-1)!, /Feedback remains pending/);
     assert.ok(f.notices.every(text => !text.includes("Provider transient")));
     assert.deepEqual(f.writes, []);
@@ -287,7 +288,7 @@ describe("live-flight plan revision recovery", () => {
   for (const silence of [false, true]) it(`3466 owner replacement charges first rebuild only for measured silence=${silence}`, async () => {
     const f = fixture(3);
     const cause = new TransientRecoveryError("exhausted revision", silence
-      ? { zeroEvidenceIdle: true, originalIdle: new Error("codex run idle timeout") }
+      ? { idleStallKind: "zero_evidence", originalIdle: new Error("codex run idle timeout") }
       : { providerOrigin: true });
     for (let attempt = 0; attempt < 3; attempt++) {
       await f.recovery.retry(cause);
@@ -460,7 +461,7 @@ describe("live-flight plan revision recovery", () => {
       throw new RequestError("GET", "/ownership", 503, "unavailable");
     });
     f.onSleep(ms => { if (ms <= 250) remaining -= ms; });
-    const cause = new TransientRecoveryError("silence", { zeroEvidenceIdle: true });
+    const cause = new TransientRecoveryError("silence", { idleStallKind: "zero_evidence" });
     assert.equal(await f.recovery.retry(cause, undefined, () => remaining), "wall");
     assert.equal(remaining, 0);
     assert.deepEqual(f.waits, [101]);

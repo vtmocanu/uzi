@@ -25,7 +25,8 @@ func (c *HTTPClient) Whoami(ctx context.Context) (apitypes.UserDTO, error) {
 
 // WhoamiVault decodes the SAME GET /api/auth/me response as Whoami, but reads the
 // sibling top-level `vault` object the response also carries and returns `locked`
-// (PRD #1251 M2). vault.unlocked is decoded as a *bool so ABSENT (a pre-vault server,
+// (PRD #1251 M2). An unprotected vault is off and never locked, regardless of
+// vault.unlocked. Otherwise vault.unlocked is decoded as a *bool so ABSENT (a pre-vault server,
 // which sends no `vault`) reads as unlocked rather than as `false` — a nil pointer
 // yields locked=false, so an older server never shows a spurious lock. This mirrors
 // the web client's absent-⇒-unlocked convention (web/src/auth/AuthContext.tsx). The
@@ -35,13 +36,14 @@ func (c *HTTPClient) WhoamiVault(ctx context.Context) (apitypes.UserDTO, bool, e
 	var env struct {
 		User  apitypes.UserDTO `json:"user"`
 		Vault struct {
-			Unlocked *bool `json:"unlocked"`
+			Mode     string `json:"mode"`
+			Unlocked *bool  `json:"unlocked"`
 		} `json:"vault"`
 	}
 	if err := c.get(ctx, "/api/auth/me", &env); err != nil {
 		return apitypes.UserDTO{}, false, err
 	}
-	locked := env.Vault.Unlocked != nil && !*env.Vault.Unlocked
+	locked := env.Vault.Mode != "unprotected" && env.Vault.Unlocked != nil && !*env.Vault.Unlocked
 	return env.User, locked, nil
 }
 

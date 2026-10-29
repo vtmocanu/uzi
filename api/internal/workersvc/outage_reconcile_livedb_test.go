@@ -698,6 +698,7 @@ func newOutageCodexFlight(t *testing.T, mode string) outageCodexFlight {
 		t.Fatal("initial fixture must not seed generation, epoch or capability")
 	}
 	f.svc = New(env.q, env.box, testParams())
+	f.svc.SetVault(env.vlt)
 	f.svc.SetTxBeginner(env.pool)
 	w, nonce, err := f.svc.Register(env.ctx, hbWorker(t, env, f.workerID), "m1-test", "base", nil, nil,
 		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.RecoveryArchiveV1, capability.CodexAccountParkV1}, nil)

@@ -17,6 +17,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -79,6 +80,7 @@ func newSkewFixture(ctx context.Context, t *testing.T) skewFixture {
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
 	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
+	wsvc.SetVault(vault.NewPostgres(box, pool))
 	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
 	wsvc.SetTxBeginner(pool)
 	h := &Handler{
@@ -116,7 +118,7 @@ func newSkewFixture(ctx context.Context, t *testing.T) skewFixture {
 	}
 
 	connID, repoID := uuid.New(), uuid.New()
-	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`,
 		f.owner, fmt.Sprintf("skew-owner-%s@e2e", uuid.NewString()[:8]))
 	mustExecT(ctx, t, pool,
 		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)

@@ -170,3 +170,14 @@ func TestUpgradeBlockerUntrustedFactsAndTimes(t *testing.T) {
 		}
 	}
 }
+
+func TestAdoptionFailureBlockerRequiresOwnerRegardlessOfStamp(t *testing.T) {
+	for _, retry := range []pgtype.Timestamptz{{}, {Time: time.Now(), Valid: true}} {
+		action := blockerAction(store.ListWorkerUpgradeBlockersRow{
+			Status: blockerText("recovery_wait"), RecoveryWaitCause: blockerText("retained_recovery_adoption_failed"),
+			RecoveryRetryNotBefore: retry})
+		if !strings.Contains(action, "Resume") || !strings.Contains(action, "no timer") {
+			t.Fatalf("adoption hold action=%s", action)
+		}
+	}
+}

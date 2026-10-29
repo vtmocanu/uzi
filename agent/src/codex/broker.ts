@@ -617,6 +617,14 @@ export class CodexCallbackBroker {
     args: unknown,
     origin: CallbackOrigin,
   ): Promise<CallbackResult> {
+    if (!this.registry.workAdmissionOpen()) return deny("admission_closed", "executor lifetime closed");
+    return this.registry.admitWork(() => this.handleAdmittedToolCall(rt, name, args, origin));
+  }
+
+  private async handleAdmittedToolCall(
+    rt: CallbackRuntimeId, name: unknown, args: unknown, origin: CallbackOrigin,
+  ): Promise<CallbackResult> {
+    this.registry.assertWorkAdmission();
     // 1. Ingestion bounds. A malformed/oversize frame is a bounded deny; it must not
     // poison the epoch (that is reserved for a changed-payload reuse, decided by the
     // registry).
@@ -722,6 +730,7 @@ export class CodexCallbackBroker {
     args: unknown,
     origin: CallbackOrigin,
   ): Promise<CallbackResult> {
+    this.registry.assertWorkAdmission();
     const canonical = canonicalizeCodexToolName(name);
     const cap = capabilityOf(canonical);
 
@@ -1225,6 +1234,7 @@ export class CodexCallbackBroker {
       return deny("denied_tool", `no handler is wired for "${safeId(name)}"`);
     }
     try {
+      this.registry.assertWorkAdmission();
       const output = await handler(args);
       return { ok: true, output };
     } catch {

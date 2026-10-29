@@ -26,7 +26,7 @@ Prepare an owner with at least three persistent restricted workers in the same
 coverage pool, and a separate Docker owner/pool. Include workers that can claim
 real test runs; synthetic Ready pods alone cannot prove retained capacity.
 Use runs with known harness/capability/binding eligibility, usable credentials
-and an unlocked vault. Include a busy old provider, legacy checker fallback and
+and either an unlocked protected vault or protection Off. Include a busy old provider, legacy checker fallback and
 dedicated checker coverage where supported. Ordinary primary-job eligibility
 must not be inferred from the wire's `ordinary_coverage` checker-fallback flag.
 Size/template differences alone must not create separate canaries.

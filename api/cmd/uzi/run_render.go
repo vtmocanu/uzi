@@ -202,6 +202,32 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if len(r.IgnoredInferredCapabilities) > 0 {
 		rows = append(rows, []string{"IGNORED_INFERRED_CAPABILITIES", sanitizeTTY(strings.Join(r.IgnoredInferredCapabilities, ","))})
 	}
+	if r.CapabilityProvenance != nil {
+		if len(r.CapabilityProvenance.Capabilities) > 0 {
+			if !r.CapabilityProvenance.HintsKnown {
+				rows = append(rows, []string{"CAPABILITY_PROVENANCE", "repo-hint history unknown"})
+			}
+			if !r.CapabilityProvenance.InferenceKnown {
+				rows = append(rows, []string{"CAPABILITY_PROVENANCE", "inference evidence unknown"})
+			}
+		}
+		for _, item := range r.CapabilityProvenance.Capabilities {
+			status := "required"
+			if !item.Required {
+				status = "not currently required"
+			}
+			if item.InferenceIgnored {
+				status += "; inference ignored"
+			}
+			rows = append(rows, []string{"CAPABILITY_SOURCE", sanitizeTTY(item.Capability + ": " + strings.Join(item.Sources, "+") + "; " + status)})
+			for _, trigger := range item.Triggers {
+				rows = append(rows, []string{"CAPABILITY_TRIGGER", sanitizeTTY(item.Capability + ": " + trigger.Reason + ": " + trigger.Path)})
+			}
+			if item.Truncated {
+				rows = append(rows, []string{"CAPABILITY_TRIGGER", sanitizeTTY(item.Capability + ": additional or invalid trigger paths omitted")})
+			}
+		}
+	}
 	if len(r.RequiredTools) > 0 {
 		rows = append(rows, []string{"REQUIRED_TOOLS", sanitizeTTY(strings.Join(r.RequiredTools, ","))})
 	}
@@ -2027,16 +2053,21 @@ func steerStateWithRun(in apitypes.SteerInputDTO, runStatus string, recoveryCaus
 	// it lives on the fuller run-get notice and the web panel). issue #1088 widened the
 	// non-forge cause to any transient interruption (a transient empty turn or provider outage).
 	recoveringSuffix := " (run recovering from a transient interruption)"
-	if len(recoveryCause) > 0 && recoveryCause[0] == retainedRecoveryExhaustedCause {
+	if len(recoveryCause) > 0 && (recoveryCause[0] == retainedRecoveryExhaustedCause || recoveryCause[0] == "codex_idle_stall") {
 		recoveringSuffix = " (retained recovery; retry timing unknown)"
-		if run != nil && isRetainedRecovery(*run) {
-			recoveringSuffix = " (timed retry)"
-			if isRetainedRecoveryHold(*run) {
+		if recoveryCause[0] == "codex_idle_stall" {
+			recoveringSuffix = " (Codex idle stall; retry timing unknown)"
+		}
+		if run != nil && isRecoveryDecisionPark(*run) {
+			if run.RecoveryRetryNotBefore != nil {
+				recoveringSuffix = " (timed retry)"
+			}
+			if isRecoveryDecisionHold(*run) {
 				recoveringSuffix = " (owner Resume/Cancel)"
 			}
 		}
 	}
-	if len(recoveryCause) > 0 && (recoveryCause[0] == workerRequeueExhaustedCause || recoveryCause[0] == workerMemoryPressureCause) {
+	if len(recoveryCause) > 0 && (recoveryCause[0] == workerRequeueExhaustedCause || recoveryCause[0] == workerMemoryPressureCause || recoveryCause[0] == retainedRecoveryAdoptionFailedCause) {
 		recoveringSuffix = " (owner Resume/Cancel)"
 	}
 	if len(recoveryCause) > 0 && recoveryCause[0] == forgeUnreachableCause {
@@ -2220,7 +2251,7 @@ var parkedStatuses = map[string]bool{statusLimitWait: true, statusRecoveryWait: 
 // reported it; it is shown only while the run is parked. "" when the run is not parked or the
 // worker did not report it.
 func checkpointDurabilityLine(r apitypes.RunDTO) string {
-	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] || isOwnerRequiredWorkerHold(r) || isRetainedRecovery(r) {
+	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] || isOwnerRequiredWorkerHold(r) || isRecoveryDecisionPark(r) {
 		return ""
 	}
 	if *r.CheckpointContainsLatest {
@@ -2385,7 +2416,7 @@ func runStatusCell(r apitypes.RunListItemDTO) string {
 
 func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.FailOrigin, ""))
-	if isOwnerRequiredWorkerHold(r.RunDTO) || isRetainedRecovery(r.RunDTO) {
+	if isOwnerRequiredWorkerHold(r.RunDTO) || isRecoveryDecisionPark(r.RunDTO) {
 		return workerExhaustionLine(r.RunDTO)
 	}
 	if short := codexAccountActionShort(r.RunDTO); short != "" {

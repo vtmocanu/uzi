@@ -1149,6 +1149,9 @@ type Run struct {
 	ReserveExemptCredentialID   pgtype.UUID        `json:"reserve_exempt_credential_id"`
 	ReserveExemptWindowReset    pgtype.Timestamptz `json:"reserve_exempt_window_reset"`
 	ReserveExemptPriorPct       pgtype.Int2        `json:"reserve_exempt_prior_pct"`
+	HintedCapabilities          []string           `json:"hinted_capabilities"`
+	CapabilityInferenceEvidence []byte             `json:"capability_inference_evidence"`
+	IdleStallParkCount          int32              `json:"idle_stall_park_count"`
 }
 
 type RunCompletionAttempt struct {
@@ -1606,6 +1609,8 @@ type User struct {
 	CodexJudgeModel           pgtype.Text        `json:"codex_judge_model"`
 	WeeklyReservePct          pgtype.Int2        `json:"weekly_reserve_pct"`
 	WeeklyReservePauseRunning bool               `json:"weekly_reserve_pause_running"`
+	VaultMode                 string             `json:"vault_mode"`
+	VaultEpoch                int64              `json:"vault_epoch"`
 }
 
 type UserCrossCheckPin struct {

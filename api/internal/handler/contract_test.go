@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes/apitypestest"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // The api ⇄ SPA JSON wire-contract for the HANDLER-PACKAGE DTOs (PRD #982 M3).
@@ -73,6 +74,9 @@ func contractCases() []contractCase {
 		newContractCase[columnDTO]("column"),
 		newContractCase[skillDTO]("skill"),
 		newContractCase[settingsResponse]("settings"),
+		newContractCase[sessionResponse]("auth_session"),
+		newContractCase[vault.Status]("vault_status"),
+		newContractCase[vaultToggleResponse]("vault_toggle"),
 		newContractCase[userSettingsDTO]("settings_user_settings"),
 		newContractCase[brandingResponse]("branding"),
 		newContractCase[chatListDTO]("chat"),

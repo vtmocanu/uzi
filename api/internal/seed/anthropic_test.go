@@ -12,16 +12,23 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // fakeSecretStore records the Anthropic-token seed's reads/writes, standing in
 // for *store.Queries.
 type fakeSecretStore struct {
-	user     store.User
-	userErr  error
-	secrets  []store.ListUserSecretsMetaRow
-	listErr  error
-	inserted *store.InsertUserSecretParams
+	user       store.User
+	userErr    error
+	secrets    []store.ListUserSecretsMetaRow
+	listErr    error
+	inserted   *store.InsertUserSecretParams
+	txHook     func()
+	locked     bool
+	fenced     bool
+	fenceErr   error
+	fenceMode  string
+	fenceEpoch int64
 }
 
 func (s *fakeSecretStore) GetUserByEmail(context.Context, string) (store.User, error) {
@@ -31,8 +38,30 @@ func (s *fakeSecretStore) ListUserSecretsMeta(context.Context, uuid.UUID) ([]sto
 	return s.secrets, s.listErr
 }
 func (s *fakeSecretStore) InsertUserSecret(_ context.Context, arg store.InsertUserSecretParams) (store.InsertUserSecretRow, error) {
+	if !s.fenced {
+		return store.InsertUserSecretRow{}, errors.New("insert without fence")
+	}
 	s.inserted = &arg
 	return store.InsertUserSecretRow{Kind: arg.Kind, Label: arg.Label, IsDefault: arg.WantDefault}, nil
+}
+
+func (s *fakeSecretStore) WithSecretTx(_ context.Context, fn func(SecretTx) error) error {
+	if s.txHook != nil {
+		s.txHook()
+	}
+	return fn(s)
+}
+func (s *fakeSecretStore) LockSecretMutation(context.Context, uuid.UUID) error {
+	s.locked = true
+	return nil
+}
+func (s *fakeSecretStore) FenceVaultWrite(_ context.Context, _ uuid.UUID, mode string, epoch int64) (store.LockUserVaultStateRow, error) {
+	if !s.locked {
+		return store.LockUserVaultStateRow{}, errors.New("fence without advisory lock")
+	}
+	s.fenced = true
+	s.fenceMode, s.fenceEpoch = mode, epoch
+	return store.LockUserVaultStateRow{}, s.fenceErr
 }
 
 // fakeSealer stands in for the vault: it DEK-seals with a recognizable prefix so
@@ -42,19 +71,27 @@ type fakeSealer struct {
 	sealed     int
 	lastUserID uuid.UUID
 	lastKind   string
+	material   vault.SealedMaterial
+	purpose    vault.SealPurpose
 }
 
-func (s *fakeSealer) Seal(userID uuid.UUID, kind string, plaintext []byte) ([]byte, error) {
+func (s *fakeSealer) Seal(_ context.Context, userID uuid.UUID, kind string, plaintext []byte, purpose vault.SealPurpose) (vault.SealedMaterial, error) {
+	s.purpose = purpose
 	s.sealed++
 	s.lastUserID = userID
 	s.lastKind = kind
-	return append([]byte("dek:"), plaintext...), nil
+	out := s.material
+	if out.Mode == "" {
+		out.Mode, out.Epoch, out.SealedWith = store.VaultModeProtected, 7, store.SealedWithDEK
+	}
+	out.Ciphertext = append([]byte("dek:"), plaintext...)
+	return out, nil
 }
 
 func anthropicCfg() config.Config {
 	return config.Config{
 		SeedEmail:          "admin@uzi.test",
-		SeedAnthropicToken: "sk-ant-oat-abc123",
+		SeedAnthropicToken: "sk-ant-" + "oat-abc123",
 	}
 }
 
@@ -75,10 +112,10 @@ func TestAnthropicTokenSeedsWhenAbsent(t *testing.T) {
 	if st.inserted.Kind != store.KindAnthropicToken {
 		t.Fatalf("token stored under the wrong kind: %q", st.inserted.Kind)
 	}
-	if got := string(st.inserted.Ciphertext); got != "dek:sk-ant-oat-abc123" {
+	if got := string(st.inserted.Ciphertext); got != "dek:"+anthropicCfg().SeedAnthropicToken {
 		t.Fatalf("token not DEK-sealed via the vault: %q", got)
 	}
-	// M2 seeds a DEK-sealed token (the seed admin's vault is boot-unlocked by main);
+	// The fake returns a protected snapshot (boot-unlocked by main);
 	// sealed_with must record 'dek' (an empty value would violate the migration's
 	// CHECK at runtime, which the fake hides), and the seal must be bound to the
 	// seed admin + the anthropic kind.
@@ -178,5 +215,45 @@ func TestAnthropicSeedConfigRejectsTokenWithoutEmail(t *testing.T) {
 
 	if _, err := config.Load(); err == nil {
 		t.Fatal("config.Load must reject UZI_SEED_ANTHROPIC_TOKEN without UZI_SEED_EMAIL")
+	}
+}
+
+func TestAnthropicTokenUsesSealSnapshot(t *testing.T) {
+	st := &fakeSecretStore{user: store.User{ID: uuid.New()}}
+	box := &fakeSealer{material: vault.SealedMaterial{Mode: store.VaultModeUnprotected, Epoch: 12, SealedWith: store.SealedWithMasterAAD}}
+	if err := AnthropicToken(context.Background(), st, box, anthropicCfg()); err != nil {
+		t.Fatal(err)
+	}
+	if st.inserted == nil || st.inserted.SealedWith != store.SealedWithMasterAAD || st.fenceMode != store.VaultModeUnprotected || st.fenceEpoch != 12 || box.purpose != vault.SealForUse {
+		t.Fatal("seed must persist and fence the policy seal snapshot")
+	}
+}
+
+func TestAnthropicTokenRechecksCreateOnlyInTransaction(t *testing.T) {
+	st := &fakeSecretStore{user: store.User{ID: uuid.New()}}
+	st.txHook = func() { st.secrets = []store.ListUserSecretsMetaRow{{Kind: store.KindAnthropicToken}} }
+	if err := AnthropicToken(context.Background(), st, &fakeSealer{}, anthropicCfg()); err != nil {
+		t.Fatal(err)
+	}
+	if !st.fenced || st.inserted != nil {
+		t.Fatal("concurrent token must remain untouched under the fence")
+	}
+}
+
+func TestAnthropicTokenStaleSnapshotRefused(t *testing.T) {
+	st := &fakeSecretStore{user: store.User{ID: uuid.New()}, fenceErr: store.ErrVaultSealStale}
+	err := AnthropicToken(context.Background(), st, &fakeSealer{}, anthropicCfg())
+	if !errors.Is(err, store.ErrVaultSealStale) || st.inserted != nil {
+		t.Fatal("stale seal must never be persisted")
+	}
+}
+
+func TestAnthropicTokenMissingVaultRefused(t *testing.T) {
+	st := &fakeSecretStore{user: store.User{ID: uuid.New()}}
+	if err := AnthropicToken(context.Background(), st, nil, anthropicCfg()); !errors.Is(err, vault.ErrNotConfigured) {
+		t.Fatal("missing vault must fail closed")
+	}
+	if st.inserted != nil {
+		t.Fatal("missing vault must not write")
 	}
 }

@@ -22,6 +22,7 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -112,6 +113,7 @@ func TestCodexRetainedStopE2E(t *testing.T) {
 		ActiveSnapshotMaxEntries: 100, RunTimeout: time.Hour,
 	})
 	svc.SetTxBeginner(pool)
+	svc.SetVault(vault.NewPostgres(box, pool))
 	svc.SetForges(settleForgeBuilder{f: &lostReplyForge{origin: origin}})
 	svc.SetForgeBaseURLAllowed(func(string) bool { return true })
 	// Exercise the real broker against the owned bare origin, without external DNS.
@@ -127,7 +129,7 @@ func TestCodexRetainedStopE2E(t *testing.T) {
 	clock := time.Now()
 	svc.SetClock(func() time.Time { clockMu.Lock(); defer clockMu.Unlock(); return clock })
 	owner, conn, repo, worker, run, secret := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
-	mustExecT(ctx, t, pool, `INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')`, owner, owner.String()+"@example.test")
+	mustExecT(ctx, t, pool, `INSERT INTO users(id,email,password_hash,vault_mode) VALUES($1,$2,'x','unprotected')`, owner, owner.String()+"@example.test")
 	pat, err := box.Seal([]byte("fixture-forge-pat"))
 	if err != nil {
 		t.Fatal(err)

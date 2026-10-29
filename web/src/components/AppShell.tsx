@@ -15,9 +15,10 @@ import { presetAssetForSlug, presetForSlug } from "../lib/brandPresets";
 import { CountPill, cx, type CountPillTone } from "./ui";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail, maskName, maskRepoPath } from "../lib/demoMask";
-import { VaultBadge, VaultLockedBanner } from "./VaultControls";
+import { VaultBadge, VaultLockedBanner, VaultRequiredPrompt } from "./VaultControls";
 import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { HealthDangerBanner } from "./HealthDangerBanner";
+import { HealthAttentionBanner } from "./HealthAttentionBanner";
 import { healthPipLabel } from "../lib/healthView";
 import { HealthStatusProvider, useHealthStatus } from "../lib/useAdminHealth";
 import { MaintenanceProvider } from "../lib/useMaintenance";
@@ -1396,6 +1397,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div className={cx(!fullBleed && "mx-auto w-full max-w-[68rem]")}>
           {/* Vault locked banner (PRD #32): app-wide so the user can unlock from
               any page. Self-gates — renders nothing while unlocked. */}
+          <VaultRequiredPrompt />
           <VaultLockedBanner />
           {/* Maintenance mode (PRD #3454): app-wide, every signed-in user, info tone, self-gating
               — renders nothing unless an admin has paused intake. */}
@@ -1408,6 +1410,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               self-gating, with a 1 h per-episode snooze. Reads the shared HealthStatusProvider,
               so a non-admin never fetches the admin endpoint. */}
           <HealthDangerBanner />
+          {user?.is_admin === true && <HealthAttentionBanner key={user.id} />}
           {/* The publisher for the one canonical to-triage number (PRD #98): how the Judge
               page keeps the nav badge fresh after a dispose. */}
           {/* Findings' twin of the judge channel (PRD #1183 M4): the setter lets the Findings

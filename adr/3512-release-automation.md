@@ -127,19 +127,25 @@ Nightly eligibility comes only from `release-cut.sh --plan`: a non-metadata
 shipping change plus releasable notes. A no-op stops before CI waiting, cutting
 or artifact upload. Blocked plans are not converted into no-ops; manual empty
 respins retain the cutter's rules. The provisional cutoff is strictly before
-06:00 on the original run creation's Bucharest date. Tip waiting ends by 05:50,
+08:00 on the original run creation's Bucharest date. Tip waiting ends by 07:50,
 reserving a provisional fixed 600 seconds without resetting on tip changes.
 This is the existing cutter timeout, not a measured cut duration; it is an
 approved rollout deviation from D6 until timing evidence supports adjustment.
+The scheduled wait uses all remaining time until 07:50, rather than the manual
+7200-second limit. At a 04:47 start this is 183 minutes of eligible tip polling
+under the account's 20-job cap. The prepare ceiling is 210 minutes: 183 for
+waiting, ten for cutting and 17 for setup/overhead. Manual wait and cut budgets
+remain unchanged; only their job ceiling rises. Push/watch ceilings remain
+15/125 minutes. Exact-head CI impact and live contention remain unmeasured.
 The isolated push job independently requires the enable flag and checks the
 window before minting, then recomputes the window immediately before pushing.
 Both inline checks require numeric epochs, a +0200/+0300 Bucharest offset and
 a fail-closed comparison. Original creation time permits at most 60 seconds of
-runner clock skew; the 06:00 cutoff itself has no grace period.
+runner clock skew; the 08:00 cutoff itself has no grace period.
 An expired window records `missed-target` and no attempted push. A queued run
 cannot acquire a new window on the following date. Manual budgets are unchanged.
 After tagging, bounded recovery ignores the cutoff and pause flag. Verification
-recorded after 07:00 is marked late without changing verified success or opening
+recorded after 09:00 is marked late without changing verified success or opening
 an extra incident. No clock-driven recovery cancellation or D10 journal is added.
 All routes share a non-cancelling queue, bounded by GitHub's 100 pending runs. A
 pending stable approval can delay RC work. A run cancelled before starting

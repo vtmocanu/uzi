@@ -57,7 +57,7 @@ func newEphemeralFixture(t *testing.T, optIn bool) *ephemeralFixture {
 
 	fx := &ephemeralFixture{t: t, ctx: ctx, pool: pool, q: store.New(pool), box: newHandlerTestBox(t), userID: uuid.New(), repoID: uuid.New()}
 	connID := uuid.New()
-	if _, err := pool.Exec(ctx, `INSERT INTO users (id, email, password_hash, ephemeral_workers_enabled) VALUES ($1, $2, 'x', $3)`,
+	if _, err := pool.Exec(ctx, `INSERT INTO users (id, email, password_hash, ephemeral_workers_enabled, vault_mode) VALUES ($1, $2, 'x', $3, 'unprotected')`,
 		fx.userID, fmt.Sprintf("eph-%s@e2e", fx.userID), optIn); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}

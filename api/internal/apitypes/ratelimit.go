@@ -60,6 +60,7 @@ type AdminRateLimitRowDTO struct {
 	ID          string              `json:"id"`
 	Email       string              `json:"email"`
 	Name        string              `json:"name"`
+	VaultMode   string              `json:"vault_mode"`
 	VaultLocked bool                `json:"vault_locked"`
 	Tokens      []TokenRateLimitDTO `json:"tokens"`
 }
