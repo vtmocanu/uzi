@@ -71,13 +71,13 @@ successful pushed SHA, including on legacy non-interlocked runs. The API stores
 an immutable `runs.source_publication_intent` stamp in the same transaction
 as successful issue completion, independently of recovery inventory or permit
 negotiation. It does not stamp before push. A rejected or rolled-back initial
-completion creates no stamp and leaves the source non-completed, so a later
-refresh refuses. A lost commit acknowledgement can leave completion and the stamp
+completion creates no stamp and leaves the source non-completed; absent
+affirmative restriction evidence a later refresh refuses. A lost commit acknowledgement can leave completion and the stamp
 durable; exact terminal replay validates that paired outcome.
 
 MR rework and pipeline-branch-adopting CI fix on new workers require the
-negotiated feature and an authenticated resolver; a worker without the feature,
-or a resolver that answers unknown, refuses publication. Closing needs the
+negotiated feature and an authenticated resolver; a new worker without the
+negotiated feature, or a resolver that answers unknown, refuses publication. Closing needs the
 terminal stamp. Historical affirmative non-closing evidence can restrict
 without one, and a completed issue source without a stamp refreshes as
 non-closing (#3420); historical publications receive no backfill. Old workers retain their earlier publication behavior;

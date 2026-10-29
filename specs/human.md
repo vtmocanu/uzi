@@ -965,7 +965,8 @@ in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#addendum
   The report carries the exact frozen successful push SHA, independently of
   recovery inventory or completion-permit negotiation, including legacy issue
   runs. There is no pre-push writer. A rejected or rolled-back initial completion
-  creates no stamp and leaves the source non-completed, so its refresh refuses.
+  creates no stamp and leaves the source non-completed; absent affirmative
+  restriction evidence its refresh refuses.
   A lost commit acknowledgement can leave completion and the stamp durable;
   exact terminal replay validates that paired outcome. Historical
   affirmative non-closing evidence can restrict without a stamp; historical
@@ -989,8 +990,9 @@ in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#addendum
   identity and contract authority, no stamp and no restriction refreshes as
   non-closing (`source_publication` null), including sources completed by an
   old worker during a mixed rollout; age is never inferred from a null stamp.
-  Unrestricted non-completed sources and unresolved or invalid authority still
-  refuse. Old PRs whose branch history closes the source issue still refuse and
+  Unrestricted non-completed sources, and unresolved or invalid authority
+  without affirmative restriction evidence, still refuse. Old PRs whose branch
+  history closes the source issue still refuse and
   need owner remediation; a refresh neither adds nor strips a `Closes #N` in
   body text outside uzi's region. No backfill or retroactive proof. Fallback use
   logs `publication_context_unstamped_fallback`; worker refusals name the

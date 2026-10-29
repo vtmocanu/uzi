@@ -413,12 +413,12 @@ source proceed with the non-closing commit-history scan.
   merging such a PR can still close the issue.
 - **No retroactive proof.** No backfill, history rewrite, migration or proof of
   completion is added, and this does not make every historical PR reworkable.
-- **Observability.** A successful fallback is logged once at Info as
+- **Observability.** Each successful fallback resolution is logged at Info as
   `publication_context_unstamped_fallback` (run and source run IDs), after
   forge verification and the final snapshot recheck. The worker refusal
   diagnostic now names the validated reason from an allowlisted enum, for
-  example `(publication_unproven)`; transport, malformed and unknown failures
-  carry no parenthetical.
+  example `(publication_unproven)`; transport, malformed, unrecognized-reason
+  and identity-change failures carry no parenthetical.
 - **Negotiation unchanged.** A new worker against an old API still refuses
   affected refreshes; old workers keep their earlier behavior.
 
