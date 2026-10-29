@@ -21,6 +21,16 @@ it("shared Go/TypeScript policy wire cases", async () => {
   }
 });
 
+it("shared Go/TypeScript raw policy wire cases", async () => {
+  const cases = JSON.parse(await fs.readFile(new URL("../../fixtures/policy-hold/raw-requests.json", import.meta.url), "utf8")) as
+    { name: string; valid: boolean; wire: string }[];
+  assert.ok(cases.length > 0);
+  for (const fixture of cases) {
+    if (fixture.valid) assert.doesNotThrow(() => validatePolicyHoldRequest(JSON.parse(fixture.wire)), fixture.name);
+    else assert.throws(() => validatePolicyHoldRequest(JSON.parse(fixture.wire)), fixture.name);
+  }
+});
+
 function assertUnprovenPolicySnapshot(registry: ActiveRunRegistry): void {
   const snapshot = registry.build();
   assert.deepEqual(snapshot.active, [], "unknown ownership cannot supply a source-generation lease");

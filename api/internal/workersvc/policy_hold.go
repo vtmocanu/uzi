@@ -72,8 +72,8 @@ func (r *PolicyHoldRequest) UnmarshalJSON(data []byte) error {
 	if _, ok := fields["published"]; !ok {
 		return fmt.Errorf("%w: published required", ErrInvalidState)
 	}
-	for _, key := range []string{"published", "tag", "phase", "correlation_id", "session_id", "head", "checkpoint_contains_latest"} {
-		if raw, ok := fields[key]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+	for _, raw := range fields {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 			return fmt.Errorf("%w: null policy field", ErrInvalidState)
 		}
 	}
