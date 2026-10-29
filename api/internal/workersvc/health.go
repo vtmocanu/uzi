@@ -183,6 +183,9 @@ const (
 	// owner-visible reason string differs.
 	reasonDeprioritized = "deprioritized — yields to interactive work"
 	reasonRestored      = "priority restored — no longer yielding"
+	// Shared by admin health presentation; the persisted worker wording stays fixed.
+	ReasonDeprioritized    = reasonDeprioritized
+	ReasonPriorityRestored = reasonRestored
 	// reasonNoEligibleWorker (PRD #84 M3) is emitted for a queued run whose
 	// required_capabilities are not a subset of ANY online worker's effective caps —
 	// distinct from reasonNoWorker (no worker online at all) and reasonAllWorkersBusy

@@ -77,4 +77,8 @@ type HealthCheckDTO struct {
 type HealthEvidenceDTO struct {
 	Label string `json:"label"`
 	Value string `json:"value"`
+	// RunID optionally links a retained waiting run; absent on older producers.
+	RunID string `json:"run_id,omitempty"`
+	// OwnerID disambiguates user-set display names; web copy uses its short form.
+	OwnerID string `json:"owner_id,omitempty"`
 }

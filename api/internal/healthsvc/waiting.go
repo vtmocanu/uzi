@@ -3,6 +3,7 @@ package healthsvc
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -80,8 +81,14 @@ const waitingEvidenceLimit = 5
 type waitEvidence struct {
 	rows            []apitypes.HealthEvidenceDTO
 	owners          []uuid.UUID
+	details         []waitDetail
 	unknownRetained bool
 	total           int
+}
+
+type waitDetail struct {
+	id          uuid.UUID
+	age, reason string
 }
 
 func (e *waitEvidence) append(id, owner uuid.UUID, reason pgtype.Text, since pgtype.Timestamptz, now time.Time) {
@@ -93,6 +100,7 @@ func (e *waitEvidence) append(id, owner uuid.UUID, reason pgtype.Text, since pgt
 		}
 		e.rows = e.rows[:waitingEvidenceLimit-1]
 		e.owners = e.owners[:waitingEvidenceLimit-1]
+		e.details = e.details[:waitingEvidenceLimit-1]
 	}
 	e.owners = append(e.owners, owner)
 	e.unknownRetained = e.unknownRetained || unknown
@@ -107,7 +115,43 @@ func (e *waitEvidence) append(id, owner uuid.UUID, reason pgtype.Text, since pgt
 			stored = "waiting: admission held"
 		}
 	}
+	e.details = append(e.details, waitDetail{id: id, age: age, reason: stored})
 	e.rows = append(e.rows, apitypes.HealthEvidenceDTO{Label: "Waiting run", Value: fmt.Sprintf("run %s; owner %s; waited %s; stored reason %s", safe(id.String()), safe(owner.String()), age, stored)})
+}
+
+// presentQueue changes only retained queue evidence, never capacity's diagnostic
+// format or verdicts. Identity enrichment is best-effort and capped at five owners.
+func (s *Service) presentQueue(ctx context.Context, e *waitEvidence) {
+	lookupCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	names := make(map[uuid.UUID]string)
+	for i, owner := range e.owners {
+		name, found := names[owner]
+		if !found {
+			u, err := s.cfg.Store.GetUserByID(lookupCtx, owner)
+			if err == nil && u.ID == owner && u.DisplayName.Valid {
+				name = strings.TrimSpace(safe(u.DisplayName.String))
+			}
+			names[owner] = name
+		}
+		identity := "Owner: " + name + " (" + owner.String()[:8] + ")"
+		if name == "" {
+			identity = "Owner name unavailable (user " + owner.String()[:8] + ")"
+		}
+		d := e.details[i]
+		reason := d.reason
+		switch reason {
+		case workersvc.ReasonPriorityRestored:
+			reason = "This background run is no longer deprioritized, but has not yet been picked up."
+		case workersvc.ReasonDeprioritized:
+			reason = "This background run is deliberately waiting behind interactive work."
+		case "unavailable":
+			reason = "The reason for this wait is unavailable."
+		}
+		e.rows[i].RunID = d.id.String()
+		e.rows[i].OwnerID = owner.String()
+		e.rows[i].Value = fmt.Sprintf("%s; waited %s. %s", identity, d.age, reason)
+	}
 }
 
 func (e *waitEvidence) finish() []apitypes.HealthEvidenceDTO {

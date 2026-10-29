@@ -506,7 +506,13 @@ func runAdminHealth(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Comman
 				row = []string{"", "", "", "", ""}
 			}
 			text := evidence.Label + ": " + evidence.Value
-			if ck.ID == "fleet.capacity" {
+			if evidence.RunID != "" {
+				text = "run " + evidence.RunID + "; " + text
+			}
+			if evidence.OwnerID != "" {
+				text = "owner " + evidence.OwnerID + "; " + text
+			}
+			if ck.ID == "fleet.capacity" || evidence.RunID != "" {
 				pieces := safeDetailLines(text)
 				for j, piece := range pieces {
 					if j > 0 {

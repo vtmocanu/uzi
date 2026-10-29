@@ -178,7 +178,7 @@ func TestWaitingM2InvalidAndEvidence(t *testing.T) {
 			text := ""
 			named := 0
 			for _, e := range c.Evidence {
-				text += e.Value
+				text += e.RunID + e.Value
 				if e.Label == "Waiting run" {
 					named++
 				}
@@ -293,11 +293,11 @@ func TestWaitingM2LateSuccessAndSharedBudget(t *testing.T) {
 			}
 			late := map[uuid.UUID]bool{second: false, third: false}
 			for _, e := range c.Evidence {
-				if strings.Contains(e.Value, first.String()) {
+				if e.RunID == first.String() {
 					t.Fatal("timely memo was discarded after expiry")
 				}
 				for id := range late {
-					if strings.Contains(e.Value, id.String()) {
+					if e.RunID == id.String() {
 						late[id] = true
 					}
 				}
@@ -381,7 +381,7 @@ func TestWaitingM2QueueConfirmationFallback(t *testing.T) {
 				t.Fatalf("check=%+v calls=%d want=%d", c, calls, tc.calls)
 			}
 			if tc.want == sevUnknown {
-				if c.Since != nil || c.Summary != "Waiting run age is unavailable." || !strings.Contains(c.Evidence[0].Value, "waited unavailable;") {
+				if c.Since != nil || c.Summary != "Waiting run age is unavailable." || !strings.Contains(c.Evidence[0].Value, "waited unavailable.") {
 					t.Fatalf("unknown wait=%+v", c)
 				}
 			} else if c.Since == nil || *c.Since != valid.Time.Format(time.RFC3339) || c.Summary != "A run has been waiting for a worker for 40m." {
