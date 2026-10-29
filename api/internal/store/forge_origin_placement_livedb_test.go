@@ -399,12 +399,31 @@ func TestForgeOriginPlacementDuplicateGenerationLiveDB(t *testing.T) {
 	}
 	f.exec(`UPDATE recovery_custody_holds SET state='discarded',release_evidence='owner_discard',
 		live_worker_id=NULL,live_run_id=NULL WHERE id=$1`, duplicate)
-	// Both dispositions are positive and closed: only the complete-domain
-	// check distinguishes this malformed ledger from a safe history.
-	// No unique ledger key exists. Count before filtering or accepting any
-	// disposition so duplicates cannot masquerade as complete history.
+	third := f.open(3, true)
+	f.exec(`UPDATE recovery_custody_holds SET state='discarded',release_evidence='owner_discard',
+		live_worker_id=NULL,live_run_id=NULL WHERE id=$1`, third)
+	f.queue()
+	// Exactly three positive, guarded, closed holds at [1,1,3] satisfy total
+	// count and range at G=3. Only DISTINCT detects the missing generation.
 	f.safe(false)
 	f.peerClaim(false)
+}
+
+func TestForgeOriginPlacementIncomingCustodyLiveDB(t *testing.T) {
+	f := newForgePlacementFixture(t)
+	f.history("no_adopted_source")
+	predecessor := f.pinnedRun(f.owner, 0)
+	f.exec("UPDATE runs SET claim_generation=1,status='failed' WHERE id=$1", predecessor)
+	// Legacy live custody can retain another run's immutable provenance while
+	// pointing at this run. Its absence from this run's generation ledger is
+	// not evidence that the retained source is gone.
+	f.exec(`INSERT INTO recovery_custody_holds
+		(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity,
+		 live_worker_id,live_run_id,inventory_guarded)
+		VALUES($1,$2,$3,$4,1,'open',$5,'predecessor',$5,$6,false)`,
+		uuid.New(), f.userID, f.repoID, predecessor, f.owner, f.run)
+	f.peerClaim(false)
+	f.safe(false)
 }
 
 // No sleeps: all clock boundaries use SQL timestamps, all concurrency is joined.

@@ -741,6 +741,9 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 							if reason := rollWaitReason(now, counts); reason != "" {
 								return healthWaitingWorker, reason
 							}
+							if counts.ForgeBlocked > 0 && counts.Claimable == 0 {
+								return healthWaitingWorker, reasonForgeOriginWait
+							}
 							if counts.StrictEligible == 0 {
 								return healthWaitingWorker, reasonNoCrossCheckWorker
 							}

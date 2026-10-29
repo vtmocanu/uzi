@@ -931,7 +931,7 @@ WITH claimant AS MATERIALIZED (
     FROM runs r
     LEFT JOIN authorized_forge_origins fo
       ON fo.repo_id = r.repo_id AND fo.user_id = r.user_id
-        AND r.kind <> 'chat' AND r.egress_profile_id IS NULL
+        AND r.egress_profile_id IS NULL
     LEFT JOIN forge_origin_cooldowns fc
       ON fc.user_id = r.user_id AND fc.worker_id = $1 AND fc.origin = fo.origin
     WHERE r.user_id = $3
@@ -2478,6 +2478,9 @@ const countOnlineWorkersClaimableForRun = `-- name: CountOnlineWorkersClaimableF
 WITH candidates AS (
 SELECT w.id,
        fn_forge_origin_eligible(w,run,$1::timestamptz)::boolean AS forge_eligible,
+       EXISTS (SELECT 1 FROM authorized_forge_origins a JOIN forge_origin_cooldowns c
+               ON c.user_id = a.user_id AND c.origin = a.origin AND c.worker_id = w.id
+               WHERE a.repo_id = run.repo_id AND a.user_id = run.user_id)::boolean AS has_cooldown,
        COALESCE(codex_admission_run_eligible_at(run.id) <= now(), true)::boolean AS admission_eligible,
        (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), $1::timestamptz, $2::timestamptz))::boolean AS strict_candidate,
        fn_worker_accepts_new_intake(w)::boolean AS accepts_intake,
@@ -2503,6 +2506,11 @@ SELECT w.id,
        (w.status = 'online') AS online,
        (CASE WHEN run.kind = 'cross_check' THEN fn_cross_check_child_eligible(w, run, true, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), $1::timestamptz, $2::timestamptz)
              ELSE w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs END) AS free_slot,
+       -- Counterfactual capacity for diagnostics only; free_slot retains admission filtering.
+       (CASE WHEN run.kind = 'cross_check' AND w.max_cross_check_slots IS NOT NULL THEN
+             (SELECT count(*) FROM runs active WHERE active.worker_id = w.id AND active.cross_check_lane
+              AND active.status IN ('claimed','running','awaiting_approval','awaiting_input','awaiting_followup')) < w.max_cross_check_slots
+             ELSE w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs END) AS capacity_free,
        (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, NOT fn_worker_accepts_new_intake(w),
               $4::interval, now(),
@@ -2632,8 +2640,8 @@ WHERE run.id = $9
 )
 SELECT COALESCE(bool_or(own_worker AND automatic_hold), false)::boolean AS automatic_owner_hold,
        count(*) FILTER (WHERE admission_eligible AND forge_eligible AND strict_candidate AND heartbeat_recent AND online AND affinity AND strict_binding)::bigint AS strict_eligible,
-       count(*) FILTER (WHERE admission_eligible AND NOT forge_eligible AND strict_candidate AND heartbeat_recent AND online
-                             AND NOT hard_fenced AND (accepts_intake OR own_worker) AND affinity AND strict_binding AND free_slot)::bigint AS forge_blocked,
+       count(*) FILTER (WHERE admission_eligible AND NOT forge_eligible AND has_cooldown AND strict_candidate AND heartbeat_recent AND online
+                             AND NOT hard_fenced AND (accepts_intake OR own_worker) AND affinity AND strict_binding AND capacity_free)::bigint AS forge_blocked,
        -- Legacy advisory availability deliberately ignores status and affinity.
        count(*) FILTER (WHERE admission_eligible AND forge_eligible AND strict_candidate AND heartbeat_recent AND NOT hard_fenced AND (accepts_intake OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
        count(*) FILTER (WHERE admission_eligible AND forge_eligible AND strict_candidate AND heartbeat_recent AND online AND NOT hard_fenced AND own_worker AND affinity AND free_slot AND advisory_binding)::bigint AS assigned_claimable,

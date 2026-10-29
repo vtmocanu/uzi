@@ -165,6 +165,61 @@ func TestForgeOriginPlacementConsumersLiveDB(t *testing.T) {
 	}
 }
 
+func TestForgeOriginPlacementSaturationDemandLiveDB(t *testing.T) {
+	fx := newRollAffinityFixture(t)
+	worker := fx.worker("saturated-origin", 0, false)
+	matching, unrelated := fx.unclaimedRun(), fx.unclaimedRun()
+	otherRepo := uuid.New()
+	mustExec(fx.ctx, t, fx.pool, `INSERT INTO repos
+		(id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch,enabled)
+		SELECT $1,connection_id,2,'g/other','https://other.example/g/other','main',true
+		FROM repos WHERE id=$2`, otherRepo, fx.repoID)
+	mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET repo_id=$1 WHERE id=$2", otherRepo, unrelated)
+	mustExec(fx.ctx, t, fx.pool, "UPDATE users SET ephemeral_workers_enabled=true WHERE id=$1", fx.userID)
+	mustExec(fx.ctx, t, fx.pool, "UPDATE workers SET max_concurrent_runs=1 WHERE id=$1", worker)
+	busy := fx.pinnedRun(worker, time.Hour)
+	mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET status='running',claim_generation=1 WHERE id=$1", busy)
+	mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET status_since=now()-interval '5 minutes',updated_at=now()-interval '1 hour' WHERE id IN ($1,$2)", matching, unrelated)
+	forgeAdmissionCooldown(fx, worker, false)
+	now := time.Now()
+	params := store.ListSaturationQueuedRunsForEphemeralParams{
+		MaxRows:                  10000,
+		MaxPerUser:               1000,
+		AffinityCutoff:           pgtype.Timestamptz{Time: now.Add(-30 * time.Minute), Valid: true},
+		BackgroundGraceCutoff:    pgtype.Timestamptz{Time: now.Add(-15 * time.Minute), Valid: true},
+		CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
+		CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+		SaturationDelay:          leaseInterval(time.Minute),
+		EphemeralLease:           leaseInterval(0),
+		DockerRepoAllowlist:      []uuid.UUID{},
+		CodexCuratedModels:       []string{},
+	}
+	demand := func(wantMatching, wantUnrelated bool) {
+		t.Helper()
+		rows, err := fx.q.ListSaturationQueuedRunsForEphemeral(fx.ctx, params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := map[uuid.UUID]bool{}
+		for _, row := range rows {
+			found[row.ID] = true
+		}
+		if found[matching] != wantMatching || found[unrelated] != wantUnrelated {
+			t.Fatalf("saturation demand matching %s=%v want=%v unrelated %s=%v want=%v",
+				matching, found[matching], wantMatching, unrelated, found[unrelated], wantUnrelated)
+		}
+	}
+	// Both targets have no owner affinity and an empty required-capability set.
+	// The unrelated target exercises both capable-worker and free-slot arms
+	// even while matching-origin demand is suppressed.
+	demand(false, true)
+	mustExec(fx.ctx, t, fx.pool, "UPDATE forge_origin_cooldowns SET origin='https://unused.example' WHERE worker_id=$1", worker)
+	demand(true, true)
+	// Changing only capacity proves these were saturation candidates.
+	mustExec(fx.ctx, t, fx.pool, "UPDATE workers SET max_concurrent_runs=2 WHERE id=$1", worker)
+	demand(false, false)
+}
+
 func TestForgeOriginPlacementCustodyAdmissionLiveDB(t *testing.T) {
 	for _, limit := range []int32{1, 8} {
 		name := "limit_one"

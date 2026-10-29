@@ -11,8 +11,9 @@ SELECT COALESCE(
     AND (SELECT count(*) FROM history) = r.claim_generation
     AND (SELECT count(DISTINCT generation) FROM history) = r.claim_generation
     AND NOT EXISTS (
-        SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = r.id AND h.state = 'open'
-          AND (h.original_worker_id = r.worker_id OR h.live_worker_id = r.worker_id)
+        SELECT 1 FROM recovery_custody_holds h WHERE h.state = 'open'
+          AND (h.live_run_id = r.id OR (h.run_id = r.id
+               AND (h.original_worker_id = r.worker_id OR h.live_worker_id = r.worker_id)))
     )
     AND NOT EXISTS (
         SELECT 1 FROM history h WHERE (

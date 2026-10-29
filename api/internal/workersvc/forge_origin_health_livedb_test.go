@@ -7,6 +7,24 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 )
 
+func TestForgeOriginUnknownMappingNotNetworkEvidenceLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	at := time.Now().UTC()
+	worker := e.seedWorker(t, nil)
+	id := e.fpSeedRunning(t, worker, 1)
+	e.exec(t, "UPDATE workers SET last_heartbeat_at=$2 WHERE id=$1", worker, at)
+	e.exec(t, "UPDATE runs SET status='queued' WHERE id=$1", id)
+	e.exec(t, "UPDATE repos SET web_url='http://forge.e2e/group/repo' WHERE id=$1", e.repoID)
+	svc := e.permitService(t)
+	counts, err := svc.WorkerEligibilityForHealth(e.ctx, at, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.originCount(t, worker) != 0 || counts.ForgeBlocked != 0 {
+		t.Fatalf("unknown authorized origin invented network evidence: %+v", counts)
+	}
+}
+
 // Read the real per-run projection: online heartbeat and static capabilities
 // must not turn an origin-admission wait into "busy" or a capability gap.
 func TestForgeOriginHealthAdmissionLiveDB(t *testing.T) {
