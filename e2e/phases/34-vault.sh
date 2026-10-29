@@ -21,7 +21,9 @@ login   # refresh the already-protected admin session
 # vault-specific and phases above this line need them.
 # sealed_of EMAIL — the sealed_with of a user's anthropic_token row.
 sealed_of() { db_psql "SELECT s.sealed_with FROM user_secrets s JOIN users u ON u.id = s.user_id WHERE u.email = '$1' AND s.kind = 'anthropic_token'"; }
-# vault_status_jar JAR — GET /api/vault/status with JAR's cookie; a read that never unlocks.
+# vault_status_jar JAR — headerless GET: ordinary status without restore authorization.
+# A foreground SPA read with a valid JWT-bound CSRF header and HTTPS-minted slot
+# may restore after restart. This HTTP harness deliberately retains manual unlock.
 vault_status_jar() { curl -fsS -b "$1" "$BASE/api/vault/status"; }
 assert_protected() {
   vault_status_jar "$1" | jq -e --argjson unlocked "$2" '.mode == "protected" and .policy == "required" and .exists == true and .unlocked == $unlocked' >/dev/null \
@@ -87,6 +89,15 @@ master_seal_hex() {
 [ "$(sealed_of admin@uzi.e2e)" = dek ] || fail "seeded admin token is not sealed_with='dek'"
 assert_protected "$JAR" true
 assert_protected "$JAR2" true
+# HTTP must never mint a browser grant, even when login/unlock succeeds. Check
+# persisted state as well as cookies: Secure alone would not protect emission.
+assert_no_http_slots() {
+  [ "$(db_psql 'SELECT count(*) FROM vault_browser_slots')" = 0 ] \
+    || fail "HTTP deployment minted a vault browser slot"
+  [ "$(awk '$6=="uzi_vault_slot" {found++} END {print found+0}' "$JAR" "$JAR2")" = 0 ] \
+    || fail "HTTP deployment has a vault browser slot cookie or unreadable jar"
+}
+assert_no_http_slots
 RUN_V=""
 RUN_OFF=""
 trap vault_fail_safe EXIT
@@ -144,8 +155,9 @@ db_psql "INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext,
 pass "staged a legacy master-sealed row for user2; admin migration count >= 1"
 
 # 5) Restart the api (recreate the process → the in-memory DEK cache is gone): the
-# seed admin is boot-unlocked, a normal user is not. Both JWTs survive the restart,
-# so the difference is purely who the boot path re-unlocks.
+# seed admin is boot-unlocked, a normal user is not. Both JWTs survive the restart.
+# HTTP minted no slot, and the headerless status probe cannot authorize restore.
+assert_no_http_slots
 "${COMPOSE[@]}" up -d --no-deps --force-recreate api >/dev/null
 wait_http
 assert_protected "$JAR" true
@@ -155,6 +167,7 @@ pass "after the api restart: seed admin boot-unlocked (true); user2 locked (fals
 # 6) user2 unlocks (no re-login) → lazy rewrap flips their legacy row to 'dek', and
 # the admin migration count drops back to zero.
 unlock_user2 || fail "user2 unlock (no re-login) failed"
+assert_no_http_slots
 assert_protected "$JAR2" true
 [ "$(sealed_of user2@uzi.e2e)" = dek ] || fail "lazy rewrap did not flip user2's row 'master' -> 'dek' on unlock"
 [ "$(apiget /api/admin/vault-migration | jq -r '.master_sealed')" = 0 ] \
