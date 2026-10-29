@@ -301,6 +301,16 @@ describe("IssueView run history — forge-aware MR/PR link when mr_web_url is nu
   });
 });
 
+it.each([["paused", "Codex policy hold"], ["queued", "queued"], ["completed", "completed"]] as const)("policy history label for %s", async (status, label) => {
+  setAuth();
+  mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+  mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status, hold_reason: "codex_policy_hold" })] });
+  renderIssueView();
+  expect(await screen.findByText(label)).toBeTruthy();
+  expect(screen.queryByText("codex policy_hold")).toBeNull();
+  if (status !== "paused") expect(screen.queryByText("Codex policy hold")).toBeNull();
+});
+
 // issue #2004: a resumed run's started_at is reset to the last leg, so the history row's
 // duration must span from first_started_at to finished_at.
 describe("IssueView run history — duration spans from first start (#2004)", () => {
