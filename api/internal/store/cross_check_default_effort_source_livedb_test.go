@@ -9,10 +9,11 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// The migration that widens checker_effort_source accepts the cross-check default,
-// still rejects unknown values, and refuses to roll back while a row records it.
+// The two-step migration that widens checker_effort_source (00375 NOT VALID, 00376
+// VALIDATE) accepts the cross-check default, still rejects unknown values at every step,
+// and refuses to roll back past 00375 while a row records it.
 func TestCrossCheckDefaultEffortSourceMigrationLiveDB(t *testing.T) {
-	const widened, previous = 374, 373 // renumbered with the migration at merge
+	const validated, widened, previous = 376, 375, 374 // renumbered with the migrations at merge
 	ctx, dsn := standIsolatedDB(t, "xc_effort_source_")
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
@@ -44,13 +45,42 @@ func TestCrossCheckDefaultEffortSourceMigrationLiveDB(t *testing.T) {
 			'pending',now(),now()+interval '10 minutes')`, lead, []byte("digest"), child, source)
 		return lead, err
 	}
-	lead, err := insertCheck("cross-check default")
-	if err != nil {
-		t.Fatalf("widened constraint refused the cross-check default: %v", err)
+	isValidated := func(label string, want bool) {
+		t.Helper()
+		var got bool
+		if err := pool.QueryRow(ctx, `SELECT convalidated FROM pg_constraint
+			WHERE conname='cross_checks_checker_effort_source_check' AND conrelid='cross_checks'::regclass`).Scan(&got); err != nil || got != want {
+			t.Fatalf("%s: convalidated=%v err=%v, want %v", label, got, err, want)
+		}
 	}
-	if _, err := insertCheck("bogus"); err == nil || !strings.Contains(err.Error(), "cross_checks_checker_effort_source_check") {
-		t.Fatalf("unknown source accepted or wrong refusal: %v", err)
+	appliedVersion := func() int64 {
+		t.Helper()
+		var v int64
+		if err := pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
 	}
+	writes := func(label string) uuid.UUID {
+		t.Helper()
+		lead, err := insertCheck("cross-check default")
+		if err != nil {
+			t.Fatalf("%s: widened constraint refused the cross-check default: %v", label, err)
+		}
+		if _, err := insertCheck("bogus"); err == nil || !strings.Contains(err.Error(), "cross_checks_checker_effort_source_check") {
+			t.Fatalf("%s: unknown source accepted or wrong refusal: %v", label, err)
+		}
+		return lead
+	}
+
+	isValidated("head", true)
+	lead := writes("head")
+	// Down 00376 restores the NOT VALID state of 00375; new writes are still checked.
+	if err := store.MigrateDownTo(ctx, dsn, widened); err != nil {
+		t.Fatalf("rollback of the validation step: %v", err)
+	}
+	isValidated("after 00376 Down", false)
+	writes("after 00376 Down")
 
 	if err := store.MigrateDownTo(ctx, dsn, previous); err == nil ||
 		!strings.Contains(err.Error(), "refusing to narrow the constraint") {
@@ -61,10 +91,27 @@ func TestCrossCheckDefaultEffortSourceMigrationLiveDB(t *testing.T) {
 		source != "cross-check default" {
 		t.Fatalf("refused rollback changed history: %q %v", source, err)
 	}
-	var version int64
-	if err := pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil || version < widened {
-		t.Fatalf("refused rollback left version %d: %v", version, err)
+	if v := appliedVersion(); v != widened {
+		t.Fatalf("refused rollback left version %d, want %d", v, widened)
 	}
+	isValidated("after refused 00375 Down", false)
+	if _, err := insertCheck("bogus"); err == nil {
+		t.Fatal("refused rollback dropped the constraint")
+	}
+	// A row written after the Down guard (a race) is still caught: the narrowing re-adds
+	// the two-value CHECK validated, so it fails on its own and the Down rolls back.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = tx.Exec(ctx, `ALTER TABLE cross_checks DROP CONSTRAINT cross_checks_checker_effort_source_check;
+		ALTER TABLE cross_checks ADD CONSTRAINT cross_checks_checker_effort_source_check
+			CHECK (checker_effort_source IN ('pin', 'worker default'))`)
+	_ = tx.Rollback(ctx)
+	if err == nil || !strings.Contains(err.Error(), "violated by some row") {
+		t.Fatalf("validated narrowing accepted a cross-check default row: %v", err)
+	}
+	isValidated("after unguarded narrowing rollback", false)
 
 	mustExec(ctx, t, pool, `DELETE FROM runs WHERE user_id=$1`, user)
 	if err := store.MigrateDownTo(ctx, dsn, previous); err != nil {
@@ -76,4 +123,16 @@ func TestCrossCheckDefaultEffortSourceMigrationLiveDB(t *testing.T) {
 	if _, err := insertCheck("worker default"); err != nil {
 		t.Fatalf("narrowed constraint refused a historical source: %v", err)
 	}
+	isValidated("after 00375 Down", true)
+	if v := appliedVersion(); v != previous {
+		t.Fatalf("rollback left version %d, want %d", v, previous)
+	}
+	// Forward again: both steps re-apply cleanly.
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("re-apply: %v", err)
+	}
+	if v := appliedVersion(); v < validated {
+		t.Fatalf("re-apply reached version %d, want >= %d", v, validated)
+	}
+	isValidated("re-applied", true)
 }
