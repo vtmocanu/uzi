@@ -644,12 +644,13 @@ describe("M2 Codex idle typed ACK and custody", () => {
   }
 
   for (const { ack, kind } of [
-    ...(["held", "missing cause", "wrong cause", "statusless", "strict refusal", "validation refusal"] as const)
+    ...(["held", "held null", "missing cause", "wrong cause", "statusless", "strict refusal", "validation refusal"] as const)
       .map(ack => ({ ack, kind: "productive" as const })),
-    ...(["held", "strict refusal", "validation refusal"] as const)
+    ...(["held", "held null", "strict refusal", "validation refusal"] as const)
       .map(ack => ({ ack, kind: "zero_evidence" as const })),
   ]) {
     it(`M2 ${kind} ${ack} keeps source with no false automatic-resume promise`, async t => {
+      const held = ack === "held" || ack === "held null";
       await withHome(async home => {
         client.protocolFeatures = ["claim_generation_fence", feature, "run_checkpoint_durability"];
         t.mock.method(client, "publishCheckpoint", async (...args: Parameters<typeof client.publishCheckpoint>) => {
@@ -660,7 +661,8 @@ describe("M2 Codex idle typed ACK and custody", () => {
           if (body.recovery_cause !== "codex_idle_stall") return undefined;
           return { status: 200, body: { run: {
             ...run, ...(ack === "statusless" ? { status: undefined } : {}),
-            recovery_wait_cause: ack === "held" ? "codex_idle_stall" : ack === "wrong cause" ? "provider_outage" : undefined,
+            ...(ack === "held null" ? { recovery_retry_not_before: null } : {}),
+            recovery_wait_cause: held ? "codex_idle_stall" : ack === "wrong cause" ? "provider_outage" : undefined,
           } } };
         };
         const refusal = ack.endsWith("refusal");
@@ -701,11 +703,11 @@ describe("M2 Codex idle typed ACK and custody", () => {
         });
         try {
           const executing = rig.runner.execute(claim);
-          if (ack === "held") await executing;
+          if (held) await executing;
           else await assert.rejects(executing, { name: "AbortError" });
         } finally { rig.runner.shutdown(); t.mock.restoreAll(); }
         assert.equal(reports, refusal ? 2 : 1);
-        assert.equal(waits, ack === "held" ? 0 : refusal ? 2 : 1);
+        assert.equal(waits, held ? 0 : refusal ? 2 : 1);
         if (refusal) {
           assert.equal(refusedBodies.length, 2, "both retries reached the actual HTTP refusal hook");
           for (const body of [...reportBodies, ...refusedBodies]) {
@@ -717,11 +719,11 @@ describe("M2 Codex idle typed ACK and custody", () => {
           }
         }
         assert.equal(parks(claim.run_id).length, refusal ? 0 : 1, "refusal never persists");
-        assert.equal(rig.custody(), ack === "held" ? 1 : 0, "only exact typed ACK authorizes settlement");
+        assert.equal(rig.custody(), held ? 1 : 0, "only exact typed ACK authorizes settlement");
         assert.ok(fs.existsSync(worktreeDirFor(3510)), "source retained");
         assert.ok(fs.existsSync(rig.homePath()), "HOME retained");
         assert.ok(!feedTexts(claim.run_id).some(t => /resumes automatically/.test(t)));
-        if (ack === "held") {
+        if (held) {
           const opening = kind === "zero_evidence" ? "provider sent no model output" : "model output stalled";
           assert.ok(feedTexts(claim.run_id).includes(
             `paused after ${opening}; the recovery checkpoint is published and the run waits for its owner to resume it`,

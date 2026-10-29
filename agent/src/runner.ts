@@ -18813,7 +18813,7 @@ export class RunRunner {
               return true;
             }
             markParkKeep();
-            const idleHeld = idleTyped && ack.recoveryRetryNotBefore === undefined;
+            const idleHeld = idleTyped && (ack.recoveryRetryNotBefore === undefined || ack.recoveryRetryNotBefore === null);
             const idleOpening = err instanceof TransientRecoveryError && err.idleStallKind === "zero_evidence" ? "provider sent no model output" : "model output stalled";
             const idleCheckpoint = capture.published ? "published" : "saved on this worker";
             runLog.info(idleHeld ? "run held for Codex idle recovery" : "run parked for transient recovery", { detail: err.message });
