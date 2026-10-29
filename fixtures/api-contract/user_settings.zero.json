@@ -19,6 +19,7 @@
   "default_claude_model": null,
   "default_codex_model": null,
   "judge_models": null,
+  "effort_settings": null,
   "weekly_reserve_pct": null,
   "weekly_reserve_pause_running": false
 }

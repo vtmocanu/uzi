@@ -7,6 +7,9 @@ export const MODEL_SETTING_SOURCE_LABELS: readonly { field: string; token: strin
   { field: "model", token: "user_default", label: "your choice" },
   { field: "model", token: "instance_default", label: "instance default" },
   { field: "model", token: "builtin", label: "built-in" },
+  { field: "effort", token: "user_default", label: "your choice" },
+  { field: "effort", token: "builtin", label: "built-in" },
+  { field: "effort", token: "runtime_default", label: "runtime default" },
 ];
 
 // modelSettingSourceLabel renders a (field, token) provenance pair; an unfamiliar pair

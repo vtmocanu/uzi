@@ -45,6 +45,17 @@
       "source": "x"
     }
   ],
+  "effort_settings": [
+    {
+      "harness": "x",
+      "effort": "x",
+      "default_effort": "x",
+      "default_source": "x",
+      "resolved_effort": "x",
+      "source": "x",
+      "mode": "x"
+    }
+  ],
   "weekly_reserve_pct": 1,
   "weekly_reserve_pause_running": true
 }

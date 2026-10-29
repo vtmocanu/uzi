@@ -7,7 +7,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
@@ -112,14 +111,13 @@ func int64Ptr(v pgtype.Int8) *int64 {
 	return &n
 }
 
-// resolveEffortPtr resolves the owner's per-user default reasoning effort to the
-// level the worker applies (PRD #617 + issue #1157): the owner's explicit choice,
-// or the uzi default (medium) when the column is NULL/blank. The wire field stays
-// *string+omitempty but is now ALWAYS populated — a NULL owner rides medium, not an
-// omitted effort key.
+// resolveEffortPtr resolves the owner's Claude default reasoning effort to the
+// level the worker applies (PRD #617, #1157, #3247): the owner's explicit choice,
+// or the uzi default (medium) when the column is NULL/blank. It returns nil (the
+// omitempty wire key is dropped, the runtime decides) exactly when the owner
+// chose Runtime default.
 func resolveEffortPtr(t pgtype.Text) *string {
-	e := agenttmpl.ResolveDefaultEffort(textPtr(t))
-	return &e
+	return resolveHarnessEffortPtr(HarnessClaude, t)
 }
 
 // coalesceInt returns the persisted int4 when present and def otherwise (PRD #122

@@ -1,0 +1,547 @@
+{
+  "_comment": "Shared cases for PRD #3247. ordinary: the stored per-harness preference to its resolution and settings cell. validators: ValidateDefaultEffort inputs and the NULL/token stored. checker: Plan/Code checker effort is independent of the ordinary preference (ordinary_stored is documentation: ResolveCrossCheck takes no worker-effort input). Go reads this in api/internal/handler; the Vitest mock consumer is added with the web change.",
+  "ordinary": [
+    {
+      "id": "claude-null",
+      "harness": "claude",
+      "stored": null,
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "medium",
+        "source": "builtin"
+      }
+    },
+    {
+      "id": "claude-blank",
+      "harness": "claude",
+      "stored": "",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "medium",
+        "source": "builtin"
+      }
+    },
+    {
+      "id": "claude-whitespace",
+      "harness": "claude",
+      "stored": " \t ",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "medium",
+        "source": "builtin"
+      }
+    },
+    {
+      "id": "claude-low",
+      "harness": "claude",
+      "stored": "low",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "low",
+        "source": "user_default"
+      }
+    },
+    {
+      "id": "claude-medium",
+      "harness": "claude",
+      "stored": "medium",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "medium",
+        "source": "user_default"
+      }
+    },
+    {
+      "id": "claude-high",
+      "harness": "claude",
+      "stored": "high",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "high",
+        "source": "user_default"
+      }
+    },
+    {
+      "id": "claude-xhigh",
+      "harness": "claude",
+      "stored": "xhigh",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "xhigh",
+        "source": "user_default"
+      }
+    },
+    {
+      "id": "claude-max",
+      "harness": "claude",
+      "stored": "max",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "max",
+        "source": "user_default"
+      }
+    },
+    {
+      "id": "claude-runtime",
+      "harness": "claude",
+      "stored": "runtime",
+      "expect": {
+        "mode": "runtime_default",
+        "resolved_effort": null,
+        "source": "user_default"
+      }
+    },
+    {
+      "id": "claude-corrupt-ultra",
+      "harness": "claude",
+      "stored": "ultra",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "medium",
+        "source": "builtin"
+      }
+    },
+    {
+      "id": "claude-corrupt-uppercase",
+      "harness": "claude",
+      "stored": "HIGH",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "medium",
+        "source": "builtin"
+      }
+    },
+    {
+      "id": "codex-null",
+      "harness": "codex",
+      "stored": null,
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "medium",
+        "source": "builtin"
+      }
+    },
+    {
+      "id": "codex-blank",
+      "harness": "codex",
+      "stored": "",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "medium",
+        "source": "builtin"
+      }
+    },
+    {
+      "id": "codex-whitespace",
+      "harness": "codex",
+      "stored": " \t ",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "medium",
+        "source": "builtin"
+      }
+    },
+    {
+      "id": "codex-low",
+      "harness": "codex",
+      "stored": "low",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "low",
+        "source": "user_default"
+      }
+    },
+    {
+      "id": "codex-medium",
+      "harness": "codex",
+      "stored": "medium",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "medium",
+        "source": "user_default"
+      }
+    },
+    {
+      "id": "codex-high",
+      "harness": "codex",
+      "stored": "high",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "high",
+        "source": "user_default"
+      }
+    },
+    {
+      "id": "codex-xhigh",
+      "harness": "codex",
+      "stored": "xhigh",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "xhigh",
+        "source": "user_default"
+      }
+    },
+    {
+      "id": "codex-max",
+      "harness": "codex",
+      "stored": "max",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "max",
+        "source": "user_default"
+      }
+    },
+    {
+      "id": "codex-runtime",
+      "harness": "codex",
+      "stored": "runtime",
+      "expect": {
+        "mode": "runtime_default",
+        "resolved_effort": null,
+        "source": "user_default"
+      }
+    },
+    {
+      "id": "codex-corrupt-ultra",
+      "harness": "codex",
+      "stored": "ultra",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "medium",
+        "source": "builtin"
+      }
+    },
+    {
+      "id": "codex-corrupt-uppercase",
+      "harness": "codex",
+      "stored": "HIGH",
+      "expect": {
+        "mode": "explicit",
+        "resolved_effort": "medium",
+        "source": "builtin"
+      }
+    }
+  ],
+  "validators": [
+    {
+      "id": "runtime-accepted",
+      "input": "runtime",
+      "accepted": true,
+      "stored": "runtime"
+    },
+    {
+      "id": "runtime-padded-accepted",
+      "input": " runtime ",
+      "accepted": true,
+      "stored": "runtime"
+    },
+    {
+      "id": "level-accepted",
+      "input": "max",
+      "accepted": true,
+      "stored": "max"
+    },
+    {
+      "id": "level-padded-trimmed",
+      "input": " high ",
+      "accepted": true,
+      "stored": "high"
+    },
+    {
+      "id": "blank-clears",
+      "input": "",
+      "accepted": true,
+      "stored": null
+    },
+    {
+      "id": "whitespace-clears",
+      "input": "   ",
+      "accepted": true,
+      "stored": null
+    },
+    {
+      "id": "ultra-rejected",
+      "input": "ultra",
+      "accepted": false,
+      "stored": null
+    },
+    {
+      "id": "uppercase-rejected",
+      "input": "HIGH",
+      "accepted": false,
+      "stored": null
+    },
+    {
+      "id": "runtime-uppercase-rejected",
+      "input": "Runtime",
+      "accepted": false,
+      "stored": null
+    }
+  ],
+  "checker": [
+    {
+      "id": "claude-plan-ordinary-null-unpinned",
+      "family": "claude",
+      "stage": "plan",
+      "ordinary_stored": null,
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "claude-plan-ordinary-low-unpinned",
+      "family": "claude",
+      "stage": "plan",
+      "ordinary_stored": "low",
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "claude-plan-ordinary-runtime-unpinned",
+      "family": "claude",
+      "stage": "plan",
+      "ordinary_stored": "runtime",
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "claude-plan-ordinary-ultra-unpinned",
+      "family": "claude",
+      "stage": "plan",
+      "ordinary_stored": "ultra",
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "claude-plan-ordinary-null-pin-low",
+      "family": "claude",
+      "stage": "plan",
+      "ordinary_stored": null,
+      "pin": "low",
+      "expect": {
+        "effort": "low",
+        "source": "pin"
+      }
+    },
+    {
+      "id": "claude-plan-ordinary-runtime-pin-low",
+      "family": "claude",
+      "stage": "plan",
+      "ordinary_stored": "runtime",
+      "pin": "low",
+      "expect": {
+        "effort": "low",
+        "source": "pin"
+      }
+    },
+    {
+      "id": "claude-code-ordinary-null-unpinned",
+      "family": "claude",
+      "stage": "code",
+      "ordinary_stored": null,
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "claude-code-ordinary-low-unpinned",
+      "family": "claude",
+      "stage": "code",
+      "ordinary_stored": "low",
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "claude-code-ordinary-runtime-unpinned",
+      "family": "claude",
+      "stage": "code",
+      "ordinary_stored": "runtime",
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "claude-code-ordinary-ultra-unpinned",
+      "family": "claude",
+      "stage": "code",
+      "ordinary_stored": "ultra",
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "claude-code-ordinary-null-pin-low",
+      "family": "claude",
+      "stage": "code",
+      "ordinary_stored": null,
+      "pin": "low",
+      "expect": {
+        "effort": "low",
+        "source": "pin"
+      }
+    },
+    {
+      "id": "claude-code-ordinary-runtime-pin-low",
+      "family": "claude",
+      "stage": "code",
+      "ordinary_stored": "runtime",
+      "pin": "low",
+      "expect": {
+        "effort": "low",
+        "source": "pin"
+      }
+    },
+    {
+      "id": "codex-plan-ordinary-null-unpinned",
+      "family": "codex",
+      "stage": "plan",
+      "ordinary_stored": null,
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "codex-plan-ordinary-low-unpinned",
+      "family": "codex",
+      "stage": "plan",
+      "ordinary_stored": "low",
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "codex-plan-ordinary-runtime-unpinned",
+      "family": "codex",
+      "stage": "plan",
+      "ordinary_stored": "runtime",
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "codex-plan-ordinary-ultra-unpinned",
+      "family": "codex",
+      "stage": "plan",
+      "ordinary_stored": "ultra",
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "codex-plan-ordinary-null-pin-low",
+      "family": "codex",
+      "stage": "plan",
+      "ordinary_stored": null,
+      "pin": "low",
+      "expect": {
+        "effort": "low",
+        "source": "pin"
+      }
+    },
+    {
+      "id": "codex-plan-ordinary-runtime-pin-low",
+      "family": "codex",
+      "stage": "plan",
+      "ordinary_stored": "runtime",
+      "pin": "low",
+      "expect": {
+        "effort": "low",
+        "source": "pin"
+      }
+    },
+    {
+      "id": "codex-code-ordinary-null-unpinned",
+      "family": "codex",
+      "stage": "code",
+      "ordinary_stored": null,
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "codex-code-ordinary-low-unpinned",
+      "family": "codex",
+      "stage": "code",
+      "ordinary_stored": "low",
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "codex-code-ordinary-runtime-unpinned",
+      "family": "codex",
+      "stage": "code",
+      "ordinary_stored": "runtime",
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "codex-code-ordinary-ultra-unpinned",
+      "family": "codex",
+      "stage": "code",
+      "ordinary_stored": "ultra",
+      "pin": null,
+      "expect": {
+        "effort": "high",
+        "source": "cross-check default"
+      }
+    },
+    {
+      "id": "codex-code-ordinary-null-pin-low",
+      "family": "codex",
+      "stage": "code",
+      "ordinary_stored": null,
+      "pin": "low",
+      "expect": {
+        "effort": "low",
+        "source": "pin"
+      }
+    },
+    {
+      "id": "codex-code-ordinary-runtime-pin-low",
+      "family": "codex",
+      "stage": "code",
+      "ordinary_stored": "runtime",
+      "pin": "low",
+      "expect": {
+        "effort": "low",
+        "source": "pin"
+      }
+    }
+  ]
+}

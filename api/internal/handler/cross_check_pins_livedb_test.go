@@ -224,6 +224,24 @@ func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 		got[1].EffortSource != "cross-check default" {
 		t.Fatal("Default did not follow updated lane")
 	}
+	// PRD #3247: an ordinary Runtime default preference never changes any unpinned checker
+	// cell (plan and code, both families): it stays high / cross-check default.
+	exec("UPDATE users SET default_effort='runtime',default_codex_effort='runtime' WHERE id=$1", user)
+	got = request("{}", 200)
+	unpinned := 0
+	for _, cell := range got {
+		if cell.Effort != nil {
+			continue
+		}
+		unpinned++
+		if cell.ResolvedEffort != "high" || cell.EffortSource != "cross-check default" {
+			t.Fatalf("ordinary runtime changed %s/%s checker effort: %+v", cell.Stage, cell.Harness, cell)
+		}
+	}
+	if unpinned < 3 {
+		t.Fatalf("expected the code cells and an unpinned plan cell, got %d unpinned in %+v", unpinned, got)
+	}
+	exec("UPDATE users SET default_effort=NULL,default_codex_effort='low' WHERE id=$1", user)
 	for _, body := range []string{
 		`{"cross_check_pins":[{"stage":"plan","harness":"claude","worker_default_model":null}]}`,
 		`{"cross_check_pins":null}`, `{"cross_check_pins":{}}`,

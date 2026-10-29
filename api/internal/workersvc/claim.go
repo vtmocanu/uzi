@@ -639,13 +639,13 @@ type ClaimConfig struct {
 	// DefaultEffort is the SDK effort level the worker applies to the lead/main
 	// thread: the owner's explicit per-user reasoning effort (PRD #617), or the uzi
 	// default `medium` (issue #1157) when the owner has not chosen (NULL). It is
-	// populated for every issue-lane claim assembled through resolveEffortPtr; the
-	// judge lane (issue #1157) now ALSO populates it best-effort through the same
-	// resolveEffortPtr, inheriting the owner's per-user default_effort (uzi default
-	// `medium` when NULL) just like the run/chat lanes, so judge runs carry the owner's
-	// effort rather than riding the SDK's own fallback. omitempty is retained. Unlike
-	// DefaultModel there is no per-run/per-schedule freeze; the owner's per-user value
-	// is the only source.
+	// populated for every ordinary claim assembled through resolveHarnessEffortPtr /
+	// resolveEffortPtr (the judge lane included, best-effort) EXCEPT when the owner
+	// chose Runtime default (stored `runtime`, PRD #3247): then it is nil and omitempty
+	// drops the key so the runtime picks. A claim never carries the string `runtime`.
+	// Unlike DefaultModel there is no per-run/per-schedule freeze; the owner's
+	// per-user value is the only source (a checker child carries its frozen
+	// cross-check effort instead).
 	DefaultEffort *string `json:"default_effort,omitempty"`
 	// AttributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
 	// LIVE from the owner's users row on every claim. When false, the worker suppresses

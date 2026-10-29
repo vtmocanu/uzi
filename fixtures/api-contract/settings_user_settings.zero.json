@@ -19,6 +19,7 @@
   "typeface": null,
   "default_harness": null,
   "judge_models": null,
+  "effort_settings": null,
   "weekly_reserve_pct": null,
   "weekly_reserve_pause_running": false
 }

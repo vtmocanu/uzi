@@ -46,7 +46,7 @@ func TestModelSettingSourceMatchesContractFixture(t *testing.T) {
 	if len(modelSettingLabels) != len(rows) {
 		t.Errorf("Go label table has %d rows, fixture %d", len(modelSettingLabels), len(rows))
 	}
-	for _, c := range [][2]string{{"model", "bogus"}, {"effort", "builtin"}, {"", ""}} {
+	for _, c := range [][2]string{{"model", "bogus"}, {"effort", "bogus"}, {"", ""}} {
 		if got := modelSettingSource(c[0], c[1]); got != "unknown" {
 			t.Errorf("modelSettingSource(%q,%q) = %q, want unknown", c[0], c[1], got)
 		}
@@ -127,5 +127,78 @@ func TestSettingsGetJSONCarriesJudgeFields(t *testing.T) {
 	if code != 0 || json.Unmarshal([]byte(out), &got) != nil || got.CodexJudgeModel == nil ||
 		*got.CodexJudgeModel != codex || len(got.JudgeModels) != 1 || got.JudgeModels[0].Source != "user_default" {
 		t.Fatalf("json = %s", out)
+	}
+}
+
+func TestSettingsGetEffortRowsRuntimeDefault(t *testing.T) {
+	runtime, level := "runtime", "high"
+	pinned := "runtime" // a judge MODEL pin that happens to be named runtime stays a pin
+	medium := "medium"
+	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{
+		JudgeModels: []apitypes.ModelSettingCellDTO{
+			{Harness: "claude", Model: &pinned, DefaultModel: "opus", DefaultSource: "builtin", ResolvedModel: "runtime", Source: "user_default"},
+		},
+		EffortSettings: []apitypes.EffortSettingCellDTO{
+			{Harness: "claude", Effort: &runtime, DefaultEffort: "medium", DefaultSource: "builtin", Source: "user_default", Mode: "runtime_default"},
+			{Harness: "codex", Effort: &level, DefaultEffort: "medium", DefaultSource: "builtin", ResolvedEffort: &level, Source: "user_default", Mode: "explicit"},
+			{Harness: "third", ResolvedEffort: &medium, Source: "builtin", Mode: "explicit"},
+		},
+	}}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	idx := strings.Index(out, "Model settings")
+	if idx < 0 {
+		t.Fatalf("no Model settings table: %q", out)
+	}
+	lines := strings.Split(strings.TrimSpace(out[idx:]), "\n")
+	want := []string{
+		"Model settings",
+		"SETTING HARNESS STORED DEFAULT RESOLVED SOURCE",
+		"judge claude Pin · runtime opus runtime your choice",
+		"effort claude runtime default medium runtime default (value not reported) your choice",
+		"effort codex Pin · high medium high your choice",
+	}
+	for i, w := range want {
+		if got := strings.Join(strings.Fields(lines[i]), " "); got != w {
+			t.Errorf("line %d: %q, want %q", i, got, w)
+		}
+	}
+	if strings.Contains(out, "third") {
+		t.Errorf("third effort cell was read: %q", out)
+	}
+}
+
+func TestSettingsGetCodexEffortRuntimeDefaultRow(t *testing.T) {
+	runtime := "runtime"
+	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{EffortSettings: []apitypes.EffortSettingCellDTO{
+		{Harness: "codex", Effort: &runtime, DefaultEffort: "medium", DefaultSource: "builtin", Source: "user_default", Mode: "runtime_default"},
+	}}}
+	out, _, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 || !strings.Contains(strings.Join(strings.Fields(out), " "), "effort codex runtime default medium runtime default your choice") {
+		t.Fatalf("codex runtime row missing: exit %d %q", code, out)
+	}
+}
+
+func TestSettingsGetEffortRowsHostile(t *testing.T) {
+	hostile := "evil\x1b]8;;https://evil.example\x07link\x1b]8;;\x07‮" + strings.Repeat("x", 10000)
+	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{EffortSettings: []apitypes.EffortSettingCellDTO{
+		{Harness: hostile, Effort: &hostile, DefaultEffort: hostile, ResolvedEffort: &hostile, Source: "from_the_future", Mode: hostile},
+	}}}
+	out, _, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 || strings.ContainsAny(out, "\x1b\x07‮") || strings.Contains(out, strings.Repeat("x", 201)) ||
+		!strings.Contains(out, "unknown") {
+		t.Fatalf("unsafe or unlabelled output: exit %d %q", code, out)
+	}
+}
+
+func TestSettingRowStoredRuntimeIsEffortOnly(t *testing.T) {
+	runtime := "runtime"
+	for field, want := range map[string]string{"effort": "runtime default", "model": "Pin · runtime"} {
+		got := settingRowsTable([]settingRow{{Setting: "s", Harness: "h", Stored: &runtime, Field: field, Source: "builtin"}})
+		if len(got) != 1 || got[0][2] != want {
+			t.Errorf("field %s: STORED = %v, want %q", field, got, want)
+		}
 	}
 }

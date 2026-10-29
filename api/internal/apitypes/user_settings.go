@@ -71,6 +71,9 @@ type UserSettingsDTO struct {
 	DefaultCodexModel  *string `json:"default_codex_model"`
 	// JudgeModels is read-only (never sent on a PUT): one cell per harness, claude then codex.
 	JudgeModels []ModelSettingCellDTO `json:"judge_models"`
+	// EffortSettings is read-only (never sent on a PUT): the resolved ordinary effort
+	// preference per harness (PRD #3247), claude then codex.
+	EffortSettings []EffortSettingCellDTO `json:"effort_settings"`
 	// WeeklyReservePct and WeeklyReservePauseRunning mirror the weekly usage reserve (PRD
 	// #3522): the 7-day utilization percent (1..100) at which uzi stops spending the user's
 	// subscription (null = off), and whether a running run is also paused. They are NOT

@@ -454,11 +454,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 
 	// The run owner's per-user default reasoning effort (PRD #617). NULL now
-	// resolves to the uzi default `medium` at this sink (via resolveEffortPtr /
-	// agenttmpl.ResolveDefaultEffort, issue #1157); an explicit choice is carried
-	// verbatim. Unlike DefaultModel there is no per-schedule freeze — the owner's
-	// per-user value is the only source, except for a checker child, which carries
-	// its frozen cross-check resolution (an unpinned checker is CrossCheckDefaultEffort).
+	// resolves to the uzi default `medium` at this sink (via resolveHarnessEffortPtr /
+	// agenttmpl.ResolveHarnessEffort, issue #1157); an explicit level is carried and
+	// the owner's `runtime` choice (PRD #3247) yields no default_effort at all. Unlike
+	// DefaultModel there is no per-schedule freeze — the owner's per-user value is the
+	// only source, except for a checker child, which carries its frozen cross-check
+	// resolution (an unpinned checker is CrossCheckDefaultEffort). That checker effort
+	// is always a canonical level (validated pin or high), never `runtime`, so it
+	// passes through resolveHarnessEffortPtr unchanged and the worker's ordinary
+	// preference cannot omit it.
 	var defaultEffort pgtype.Text
 	if checkerResolution != nil {
 		defaultEffort = pgconv.TextOrNull(checkerResolution.Effort)

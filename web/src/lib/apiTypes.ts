@@ -162,6 +162,21 @@ export interface ModelSettingCell {
   source: string;
 }
 
+/** One harness's cell of the ordinary reasoning-effort setting (PRD #3247), parallel to
+ *  ModelSettingCell. `effort` is the stored token (null = Default, a level, or
+ *  "runtime"); `resolved_effort` is the level a claim sends, null exactly when `mode`
+ *  is "runtime_default". `source` is user_default | builtin; labelled by
+ *  fixtures/model-settings/contract.json. */
+export interface EffortSettingCell {
+  harness: Harness;
+  effort: string | null;
+  default_effort: string;
+  default_source: string;
+  resolved_effort: string | null;
+  source: string;
+  mode: "explicit" | "runtime_default";
+}
+
 export interface UserSettings {
   cross_check_pins?: CrossCheckPinDTO[];
   /** @deprecated PRD #1551 D2: superseded by the explicit per-harness lanes below.
@@ -195,6 +210,9 @@ export interface UserSettings {
   /** Read-only resolved view of both judge lanes (PRD #3245), claude then codex.
    *  Never sent on a PUT. Optional for older servers. */
   judge_models?: ModelSettingCell[];
+  /** Read-only resolved view of both ordinary effort preferences (PRD #3247), claude
+   *  then codex. Never sent on a PUT. Optional for older servers. */
+  effort_settings?: EffortSettingCell[];
   /** Per-user run-summary model override (PRD #362 M2); null means inherit the
    *  instance summary_model (which itself falls back to haiku). Written through
    *  PUT /me/settings alongside judge_model, validated by the same model rules. */

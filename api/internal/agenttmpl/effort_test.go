@@ -2,17 +2,6 @@ package agenttmpl
 
 import "testing"
 
-func TestResolveDefaultCodexEffort(t *testing.T) {
-	if got := ResolveDefaultCodexEffort(nil); got != "medium" {
-		t.Fatalf("NULL Codex effort = %q, want medium", got)
-	}
-	for input, want := range map[string]string{"": "medium", " \t ": "medium", "low": "low", " xhigh ": "xhigh", "max": "max"} {
-		if got := ResolveDefaultCodexEffort(&input); got != want {
-			t.Errorf("ResolveDefaultCodexEffort(%q) = %q, want %q", input, got, want)
-		}
-	}
-}
-
 func TestValidateEffort(t *testing.T) {
 	// Blank / whitespace-only means inherit: no error, empty result.
 	for _, in := range []string{"", "   ", "\t"} {
@@ -58,41 +47,54 @@ func TestValidateEffort(t *testing.T) {
 	}
 }
 
-// TestUziDefaultEffort pins uzi's effective default reasoning effort (issue #1157)
-// to medium for an inheriting owner.
-func TestUziDefaultEffort(t *testing.T) {
-	if got := ResolveDefaultEffort(nil); got != "medium" {
-		t.Errorf("ResolveDefaultEffort(nil) = %q, want \"medium\"", got)
+func TestResolveHarnessEffort(t *testing.T) {
+	str := func(v string) *string { return &v }
+	explicitBuiltin := EffortResolution{Mode: EffortModeExplicit, Level: "medium", Source: EffortSourceBuiltin}
+	runtimeDefault := EffortResolution{Mode: EffortModeRuntimeDefault, Source: EffortSourceUserDefault}
+	cases := []struct {
+		name   string
+		stored *string
+		want   EffortResolution
+	}{
+		{"NULL", nil, explicitBuiltin},
+		{"blank", str(""), explicitBuiltin},
+		{"whitespace", str(" \t "), explicitBuiltin},
+		{"low", str("low"), EffortResolution{EffortModeExplicit, "low", EffortSourceUserDefault}},
+		{"medium", str("medium"), EffortResolution{EffortModeExplicit, "medium", EffortSourceUserDefault}},
+		{"high", str("high"), EffortResolution{EffortModeExplicit, "high", EffortSourceUserDefault}},
+		{"xhigh trimmed", str(" xhigh "), EffortResolution{EffortModeExplicit, "xhigh", EffortSourceUserDefault}},
+		{"max", str("max"), EffortResolution{EffortModeExplicit, "max", EffortSourceUserDefault}},
+		{"runtime", str("runtime"), runtimeDefault},
+		{"runtime trimmed", str(" runtime "), runtimeDefault},
+		{"corrupt ultra", str("ultra"), explicitBuiltin},
+		{"corrupt uppercase", str("HIGH"), explicitBuiltin},
+	}
+	for _, harness := range []string{"claude", "codex"} {
+		for _, tc := range cases {
+			if got := ResolveHarnessEffort(harness, tc.stored); got != tc.want {
+				t.Errorf("%s/%s: ResolveHarnessEffort = %+v, want %+v", harness, tc.name, got, tc.want)
+			}
+		}
 	}
 }
 
-// TestResolveDefaultEffort covers the inherit-vs-explicit resolution (issue #1157):
-// nil (NULL) and blank/whitespace-only values ride the uzi default; an explicit
-// level is returned trimmed and verbatim, never "".
-func TestResolveDefaultEffort(t *testing.T) {
-	strptr := func(s string) *string { return &s }
-
-	// Inherit cases: nil pointer and blank/whitespace-only values → the uzi default.
-	if got := ResolveDefaultEffort(nil); got != UziDefaultEffort {
-		t.Errorf("ResolveDefaultEffort(nil) = %q, want %q", got, UziDefaultEffort)
-	}
-	for _, in := range []string{"", "   ", "\t"} {
-		if got := ResolveDefaultEffort(strptr(in)); got != UziDefaultEffort {
-			t.Errorf("ResolveDefaultEffort(%q) = %q, want %q (inherit)", in, got, UziDefaultEffort)
-		}
-	}
-
-	// Explicit levels are returned verbatim; surrounding whitespace is trimmed.
+func TestValidateDefaultEffort(t *testing.T) {
 	for in, want := range map[string]string{
-		"low":    "low",
-		"medium": "medium",
-		"high":   "high",
-		"xhigh":  "xhigh",
-		"max":    "max",
-		" low ":  "low",
+		"": "", "  ": "", "runtime": "runtime", " runtime ": "runtime",
+		"low": "low", "max": "max", " high ": "high",
 	} {
-		if got := ResolveDefaultEffort(strptr(in)); got != want {
-			t.Errorf("ResolveDefaultEffort(%q) = %q, want %q", in, got, want)
+		got, err := ValidateDefaultEffort(in)
+		if err != nil || got != want {
+			t.Errorf("ValidateDefaultEffort(%q) = %q, %v; want %q", in, got, err, want)
 		}
+	}
+	for _, in := range []string{"ultra", "HIGH", "Runtime", "hi gh", "none"} {
+		if _, err := ValidateDefaultEffort(in); err == nil {
+			t.Errorf("ValidateDefaultEffort(%q) accepted", in)
+		}
+	}
+	// The pin validator still refuses the preference-only token.
+	if _, err := ValidateEffort("runtime"); err == nil {
+		t.Error("ValidateEffort accepted runtime")
 	}
 }

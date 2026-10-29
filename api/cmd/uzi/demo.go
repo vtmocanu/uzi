@@ -102,6 +102,8 @@ var demoLiveLines = []string{
 // UserSettingsDTO.MrReworkEnabled, where nil = the default-ON state).
 func boolPtr(b bool) *bool { return &b }
 
+func demoStr(s string) *string { return &s }
+
 // fPtr returns a pointer to a float64, for the nullable Codex window fields (e.g.
 // CodexRateLimitWindowDTO.UsedPercent, where nil = no reading rather than 0%).
 func fPtr(f float64) *float64 { return &f }
@@ -197,6 +199,14 @@ func newDemoClient() *uzicli.FakeClient {
 			SidebarTokenIds:        []string{"sec-meta"},
 			SidebarCodexAccountIds: []string{"cx-team", "cx-old"},
 			MrReworkEnabled:        boolPtr(false),
+			// Ordinary effort cells (PRD #3247): Claude on the built-in default, Codex on
+			// Runtime default, so the demo renders the runtime-default row.
+			EffortSettings: []apitypes.EffortSettingCellDTO{
+				{Harness: "claude", DefaultEffort: "medium", DefaultSource: "builtin",
+					ResolvedEffort: demoStr("medium"), Source: "builtin", Mode: "explicit"},
+				{Harness: "codex", Effort: demoStr("runtime"), DefaultEffort: "medium", DefaultSource: "builtin",
+					Source: "user_default", Mode: "runtime_default"},
+			},
 		},
 		// StreamEvents nil: NewRunStream emits nothing and stays OPEN (so the detail reads
 		// "live"); the ticker above supplies the live frames.

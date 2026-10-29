@@ -38,6 +38,33 @@ func judgeModelCell(harness string, user *string, instance string) apitypes.Mode
 	}
 }
 
+// effortSettingCells builds the ordinary effort setting's cells (PRD #3247), always
+// ordered claude then codex, from the stored preference tokens of one row read.
+func effortSettingCells(claude, codex *string) []apitypes.EffortSettingCellDTO {
+	return []apitypes.EffortSettingCellDTO{
+		effortSettingCell("claude", claude),
+		effortSettingCell("codex", codex),
+	}
+}
+
+func effortSettingCell(harness string, stored *string) apitypes.EffortSettingCellDTO {
+	def := agenttmpl.ResolveHarnessEffort(harness, nil)
+	r := agenttmpl.ResolveHarnessEffort(harness, stored)
+	cell := apitypes.EffortSettingCellDTO{
+		Harness:       harness,
+		Effort:        stored,
+		DefaultEffort: def.Level,
+		DefaultSource: def.Source,
+		Source:        r.Source,
+		Mode:          r.Mode,
+	}
+	if r.Mode == agenttmpl.EffortModeExplicit {
+		level := r.Level
+		cell.ResolvedEffort = &level
+	}
+	return cell
+}
+
 // validateCodexJudgeModel validates a user Codex judge lane value: nil or blank clears
 // to NULL; anything else must be a curated Codex id after trimming, and is stored trimmed.
 func validateCodexJudgeModel(raw *string) (pgtype.Text, error) {

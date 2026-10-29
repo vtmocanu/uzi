@@ -23,6 +23,9 @@ var modelSettingLabels = map[[2]string]string{
 	{"model", "user_default"}:     "your choice",
 	{"model", "instance_default"}: "instance default",
 	{"model", "builtin"}:          "built-in",
+	{"effort", "user_default"}:    "your choice",
+	{"effort", "builtin"}:         "built-in",
+	{"effort", "runtime_default"}: "runtime default",
 }
 
 // modelSettingSource labels a provenance token for a settings field. An unknown
@@ -49,12 +52,46 @@ func modelSettingRows(setting string, cells []apitypes.ModelSettingCellDTO) []se
 	return rows
 }
 
+// effortSettingRows adapts the ordinary effort cells (PRD #3247, field "effort") into
+// settingRows. At most two cells are read. A runtime-default cell has no resolved level:
+// Claude reports no value at all, so its RESOLVED says so.
+func effortSettingRows(cells []apitypes.EffortSettingCellDTO) []settingRow {
+	var rows []settingRow
+	for _, c := range cells[:min(len(cells), 2)] {
+		resolved := ""
+		switch {
+		case c.ResolvedEffort != nil:
+			resolved = *c.ResolvedEffort
+		case c.Harness == "claude":
+			resolved = "runtime default (value not reported)"
+		default:
+			resolved = "runtime default"
+		}
+		rows = append(rows, settingRow{
+			Setting: "effort", Harness: c.Harness, Stored: c.Effort,
+			Default: c.DefaultEffort, Resolved: resolved,
+			Field: "effort", Source: c.Source,
+		})
+	}
+	return rows
+}
+
+// settingRowStored renders the STORED column. Only an effort row holding exactly the
+// Runtime default token shows it as the label; every other row, including a model pin
+// that happens to be named runtime, keeps the Pin formatting.
+func settingRowStored(r settingRow) string {
+	if r.Field == "effort" && r.Stored != nil && *r.Stored == "runtime" {
+		return modelSettingSource("effort", "runtime_default")
+	}
+	return settingsStoredPin(r.Stored)
+}
+
 // settingRowsTable renders neutral rows; every cell passes through crossCheckPlain.
 func settingRowsTable(rows []settingRow) [][]string {
 	out := make([][]string, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, []string{
-			crossCheckPlain(r.Setting), crossCheckPlain(r.Harness), settingsStoredPin(r.Stored),
+			crossCheckPlain(r.Setting), crossCheckPlain(r.Harness), settingRowStored(r),
 			crossCheckPlain(r.Default), crossCheckPlain(r.Resolved),
 			crossCheckPlain(modelSettingSource(r.Field, r.Source)),
 		})
@@ -64,5 +101,5 @@ func settingRowsTable(rows []settingRow) [][]string {
 
 // settingsModelRows collects every setting family's rows for `uzi settings get`.
 func settingsModelRows(s apitypes.UserSettingsDTO) []settingRow {
-	return modelSettingRows("judge", s.JudgeModels)
+	return append(modelSettingRows("judge", s.JudgeModels), effortSettingRows(s.EffortSettings)...)
 }

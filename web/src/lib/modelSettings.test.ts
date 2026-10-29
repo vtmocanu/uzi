@@ -21,7 +21,7 @@ describe("modelSettingSourceLabel vs fixtures/model-settings/contract.json", () 
 
   it("renders an unknown (field, token) as unknown", () => {
     expect(modelSettingSourceLabel("model", "harness")).toBe("unknown");
-    expect(modelSettingSourceLabel("effort", "builtin")).toBe("unknown");
+    expect(modelSettingSourceLabel("effort", "bogus")).toBe("unknown");
     expect(modelSettingSourceLabel("", "")).toBe("unknown");
   });
 });
