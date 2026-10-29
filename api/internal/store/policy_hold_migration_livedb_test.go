@@ -22,10 +22,12 @@ func TestCompactPolicyHoldMigrationLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, "INSERT INTO workers(id,user_id,name,token_hash) VALUES($1,$2,'policy fixture',$3)", worker, owner, []byte(worker.String()))
 	mustExec(ctx, t, pool, `INSERT INTO forge_connections(id,user_id,forge_type,base_url,bot_username,bot_forge_user_id,token_ciphertext) VALUES($1,$2,'github','https://example.com','bot',1,'x')`, conn, owner)
 	mustExec(ctx, t, pool, `INSERT INTO repos(id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch) VALUES($1,$2,1,'example/policy','https://example.com/policy','main')`, repo, conn)
+	issueIID := int64(3607)
 	seed := func(status string) uuid.UUID {
 		t.Helper()
 		id := uuid.New()
-		mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,repo_id,issue_iid,issue_title,issue_description,status,harness,worker_id,claim_generation,session_id) VALUES($1,$2,$3,3607,'policy fixture','desc',$4,'codex',$5,1,'saved-session')`, id, owner, repo, status, worker)
+		issueIID++
+		mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,repo_id,issue_iid,issue_title,issue_description,status,harness,worker_id,claim_generation,session_id) VALUES($1,$2,$3,$6,'policy fixture','desc',$4,'codex',$5,1,'saved-session')`, id, owner, repo, status, worker, issueIID)
 		return id
 	}
 	ordinary := seed("running")
