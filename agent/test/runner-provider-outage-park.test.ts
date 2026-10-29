@@ -901,6 +901,108 @@ describe("3617 idle park delivery evidence", () => {
       });
     });
 
+    it(`3617 ${kind} disposition-only free fallback refuses after capture join and closes its batcher`, async t => {
+      await withHome(async home => {
+        client.protocolFeatures = ["claim_generation_fence", feature];
+        const clock = virtualBoundaryClock();
+        t.mock.method(Date, "now", clock.now);
+        let release!: () => void, entered!: () => void;
+        const held = new Promise<void>(resolve => { release = resolve; });
+        const joining = new Promise<void>(resolve => { entered = resolve; });
+        let captures = 0, joined = false, posts = 0, publicErrors = 0, closes = 0, waits = 0;
+        const rig = rigFor("codex", { clock, turns: 2,
+          error: () => new TransientRecoveryError("idle", { idleStallKind: kind }),
+          afterIdleReport: async () => {
+            if (captures === 1 && !joined) { entered(); await held; joined = true; }
+          },
+        }, home);
+        const claim = gitlabClaim(36177, { claim_generation: 3 });
+        const raw = rawIdleNotices(t);
+        const capture = rig.runner["captureRecoveryRestorePoint"].bind(rig.runner);
+        rig.runner["captureRecoveryRestorePoint"] = async (...args: Parameters<typeof capture>) => {
+          const result = await capture(...args);
+          assert.equal(result.verified, true, "real capture supplies the joined local evidence");
+          captures++;
+          // Refuse the authenticated continuation AFTER local capture, BEFORE any POST.
+          // This enters the actual joined disposition, rather than wrapping a refusal.
+          throw new CodexBoundaryError("action", [], new Error("post-capture action unavailable"));
+        };
+        const recovery = rig.runner["handleRecoveryExhausted"].bind(rig.runner);
+        let dispositionBatcher: MessageBatcher | undefined;
+        let dispositions = 0;
+        rig.runner["handleRecoveryExhausted"] = async (...args: Parameters<typeof recovery>) => {
+          const options = args[8];
+          if (options?.dispositionOnly) {
+            dispositions++;
+            assert.equal(joined, true);
+            assert.equal(options.freeFallback, true);
+            assert.equal(options.heldAuthenticated, undefined);
+            assert.equal(options.heldCapture, undefined);
+            dispositionBatcher = args[4];
+          }
+          return recovery(...args);
+        };
+        const close = MessageBatcher.prototype.close;
+        t.mock.method(MessageBatcher.prototype, "close", async function (this: MessageBatcher, ...args: Parameters<typeof close>) {
+          if (this === dispositionBatcher) closes++;
+          return close.apply(this, args);
+        });
+        rig.runner["waitRecoveryRetry"] = async () => {
+          waits++;
+          throw new Error("definitive refusal must not retry");
+        };
+        api.failStateWhen(claim.run_id, body => {
+          if (body.recovery_cause !== "codex_idle_stall") return false;
+          posts++;
+          assert.equal(joined, true, "no report before authenticated capture joins");
+          assert.equal(dispositions, 1, "real HTTP refusal occurs in the disposition-only continuation");
+          assert.equal(body.provider_progress_turns, 2);
+          assert.equal(body.claim_generation, 3);
+          return true;
+        }, { httpStatus: 400, error: "invalid request body" });
+        const report = client.reportState.bind(client);
+        t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
+          try { return await report(...args); }
+          catch (error) {
+            if (error instanceof StateReportUnappliedError) {
+              assert.equal(error.runId, claim.run_id);
+              publicErrors++;
+            }
+            throw error;
+          }
+        });
+        const started = clock.now();
+        const operation = rig.runner.execute(claim);
+        try {
+          await Promise.race([joining, operation.then(() => { throw new Error("execute returned before capture join"); })]);
+          assert.equal(posts, 0);
+          assert.ok(!raw.includes(IDLE_REFUSED));
+          clock.advance(1000);
+        } finally { release(); await operation; }
+        assert.equal(captures, 1, "joined disposition consumes local evidence without recapture");
+        assert.equal(dispositions, 1);
+        assert.equal(publicErrors, 1, "actual client proves the report was unapplied");
+        assert.equal(closes, 1, "existing retained stop closes the disposition batcher");
+        assert.equal(waits, 0);
+        assert.equal(posts, 1);
+        assert.ok(clock.now() - started < 120_000);
+        assert.equal(parks(claim.run_id).length, 0);
+        assert.equal(raw.filter(text => text === IDLE_REFUSED).length, 1);
+        assert.equal(feedTexts(claim.run_id).filter(text => text === IDLE_REFUSED).length, 1);
+        assert.ok(!feedTexts(claim.run_id).includes(IDLE_UNCONFIRMED));
+        assert.equal(rig.custody(), 0);
+        assert.deepEqual(rig.archive.releaseCalls, []);
+        assert.equal(fs.readFileSync(path.join(worktreeDirFor(36177), "WORK.txt"), "utf8"), "work before the outage\n");
+        assert.equal(fs.readFileSync(path.join(rig.homePath(), "session"), "utf8"), "transcript");
+        clock.advance(240_000);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(posts, 1);
+        assert.equal(closes, 1);
+        assert.equal(captures, 1);
+        assert.ok(!api.states.some(s => s.runId === claim.run_id && ["failed", "completed"].includes(s.body.status ?? "")));
+      });
+    });
+
     for (const initial of ["client retry", "statusless", "wrong cause", "runner retry"] as const) {
       it(`3617 ${kind} ambiguity before refusal across ${initial}`, async t => {
         await withHome(async home => {
@@ -969,7 +1071,7 @@ describe("3617 idle park delivery evidence", () => {
           const claim = gitlabClaim(36176, { claim_generation: 3 });
           api.strictReceiptGenerations = true;
           api.setInputClaimGeneration(claim.run_id, 3);
-          let posts = 0, waits = 0, interrupted = false;
+          let posts = 0, waits = 0, interrupted = false, waitExpired = false;
           const stop = api.dropStatesWhen(claim.run_id, body => {
             if (body.recovery_cause !== "codex_idle_stall") return false;
             posts++;
@@ -979,8 +1081,15 @@ describe("3617 idle park delivery evidence", () => {
           t.mock.method(rig.runner as unknown as { waitRecoveryRetry: typeof wait }, "waitRecoveryRetry",
             async (...args: Parameters<typeof wait>) => {
               waits++;
-              // Arm a real interruptible wait; the delivered control, not elapsed time, must end it.
-              const pending = wait(args[0], args[1], 10_000, args[3]);
+              // Keep the real interruptible wait. A separate fail-fast signal prevents
+              // a broken control path from spending its full ten seconds in this test.
+              const watchdog = new AbortController();
+              const timer = setTimeout(() => {
+                waitExpired = true;
+                watchdog.abort(new Error("control did not interrupt recovery wait"));
+              }, 2000);
+              const signal = args[3] ? AbortSignal.any([args[3], watchdog.signal]) : watchdog.signal;
+              const pending = wait(args[0], args[1], 10_000, signal);
               if (control === "shutdown") rig.runner.shutdown();
               else {
                 if (control === "fence") {
@@ -990,7 +1099,12 @@ describe("3617 idle park delivery evidence", () => {
                 api.setInputs(claim.run_id, [{ id: 1, kind: control === "cancel" ? "cancel" : "follow_up" }]);
               }
               try { await pending; }
-              finally { interrupted = true; }
+              finally {
+                clearTimeout(timer);
+                interrupted = control === "cancel" ? args[0].steering.isCancelled()
+                  : control === "fence" ? args[0].steering.claimFence() !== undefined
+                  : args[3]?.aborted === true;
+              }
             });
           try {
             const operation = rig.runner.execute(claim);
@@ -998,7 +1112,8 @@ describe("3617 idle park delivery evidence", () => {
             else await operation;
           } finally { stop(); rig.runner.shutdown(); }
           assert.equal(waits, 1);
-          assert.equal(interrupted, true);
+          assert.equal(waitExpired, false, "the control interrupts before the fail-fast deadline");
+          assert.equal(interrupted, true, "the wait observes the delivered control");
           assert.equal(posts, 3, "no idle resend after the control interrupts the client-exhausted attempt");
           assert.ok(!feedTexts(claim.run_id).includes(IDLE_REFUSED));
           if (control === "cancel")
