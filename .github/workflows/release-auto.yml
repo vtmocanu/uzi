@@ -421,6 +421,7 @@ jobs:
       receipt: ${{ steps.watch.outputs.receipt }}
       published_at: ${{ steps.watch.outputs.published_at }}
       verified_at: ${{ steps.watch.outputs.verified_at }}
+      journal: ${{ steps.watch.outputs.journal }}
       reason: ${{ steps.admit.outputs.reason || steps.watch.outputs.reason }}
     env:
       RELEASE_KIND: ${{ github.event_name == 'schedule' && 'rc' || inputs.kind }}
@@ -437,7 +438,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
-          ref: ${{ needs.prepare.outputs.release }}
+          # Run recovery policy from this operation's trusted workflow commit.
+          # A pinned older candidate can lack the current controller entirely.
+          ref: ${{ github.sha }}
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: false
@@ -467,7 +470,10 @@ jobs:
           echo "receipt=$receipt" >> "$GITHUB_OUTPUT"
           if [ "$receipt" != confirmed ]; then reason='push-receipt-unconfirmed'; fail; fi
           watch_status=0
-          .agents/skills/uzi-release/scripts/release-watch.sh "${RELEASE_TAG#v}" --max-reruns 2 --interval 60 --max-ticks 60 2>&1 | tee "$RUNNER_TEMP/release-watch.log" || watch_status=$?
+          .agents/skills/uzi-release/scripts/release-watch.sh "${RELEASE_TAG#v}" --max-reruns 2 --interval 60 --max-ticks 60 \
+            --journal "$RUNNER_TEMP/release-watch.json" --operation "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --repository "$GITHUB_REPOSITORY" --sha "$RELEASE_SHA" --kind "$RELEASE_KIND" \
+            2>&1 | tee "$RUNNER_TEMP/release-watch.log" || watch_status=$?
           python3 -I scripts/release-auto.py watch-log
           [ "$watch_status" -eq 0 ]
           published_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -504,6 +510,127 @@ jobs:
           pushed = needs['push'].get('outputs', {})
           push_outcome = pushed.get('outcome') or ('receipt-unknown' if pushed.get('attempted') == 'true' else '')
           watched = needs['watch'].get('outputs', {})
+          # BEGIN JOURNAL CODEC: parity-tested with scripts/lib/release-journal.py
+          LIMIT = 32768
+
+          WORKFLOWS = {'release.yml', 'brew.yml', 'ci.yml', 'kind-smoke.yml'}
+
+          STATES = {'queued', 'in_progress', 'completed', 'waiting', 'pending', 'requested'}
+
+          CONCLUSIONS = {'success', 'failure', 'cancelled', 'timed_out', 'action_required',
+                         'startup_failure', 'neutral', 'skipped', 'stale', None, ''}
+
+          MAIN_STATES = {'not-applicable', 'unavailable', 'absent', 'pending', 'passed', 'failed', 'cancelled'}
+
+          FIELDS = {'schema', 'operation', 'repository', 'tag', 'sha', 'main_ci', 'attempts', 'decisions', 'truncated', 'state', 'reason'}
+
+          def integer(value, minimum=1):
+              if type(value) is not int or not minimum <= value < 2**53:
+                  raise ValueError('invalid journal integer')
+              return value
+
+          def label(value):
+              if not isinstance(value, str):
+                  raise ValueError('invalid journal label')
+              return ''.join(char for char in value if char.isprintable())[:160]
+
+          def status(value, conclusion):
+              if value not in STATES or conclusion not in CONCLUSIONS:
+                  raise ValueError('invalid journal state')
+
+          def validate(data):
+              if (not isinstance(data, dict) or data.keys() != FIELDS or type(data['schema']) is not int
+                      or data['schema'] != 1 or not isinstance(data['operation'], str)
+                      or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', data['operation'])
+                      or not isinstance(data['repository'], str)
+                      or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', data['repository'])
+                      or not isinstance(data['tag'], str)
+                      or not re.fullmatch(r'v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*)?', data['tag'])
+                      or not isinstance(data['sha'], str) or not re.fullmatch(r'[0-9a-f]{40}', data['sha'])
+                      or type(data['truncated']) is not bool or not isinstance(data['attempts'], list)
+                      or not isinstance(data['decisions'], list)
+                      or not isinstance(data['main_ci'], dict)
+                      or data['main_ci'] != {'policy': 'report-only', 'state': data['main_ci'].get('state')}
+                      or data['main_ci']['state'] not in MAIN_STATES):
+                  raise ValueError('invalid journal envelope')
+              for attempt in data['attempts']:
+                  if not isinstance(attempt, dict) or attempt.keys() != {'workflow', 'run', 'attempt', 'status', 'conclusion',
+                          'initial_status', 'initial_conclusion', 'first_observed_at', 'observed_at', 'url', 'jobs', 'jobs_omitted'}:
+                      raise ValueError('invalid journal attempt')
+                  if attempt['workflow'] not in WORKFLOWS:
+                      raise ValueError('invalid journal workflow')
+                  integer(attempt['run'])
+                  integer(attempt['attempt'])
+                  if attempt['url'] != f"https://github.com/{data['repository']}/actions/runs/{attempt['run']}/attempts/{attempt['attempt']}":
+                      raise ValueError('invalid canonical run URL')
+                  integer(attempt['jobs_omitted'], 0)
+                  status(attempt['status'], attempt['conclusion'])
+                  status(attempt['initial_status'], attempt['initial_conclusion'])
+                  for timestamp in (attempt['observed_at'], attempt['first_observed_at']):
+                      if not isinstance(timestamp, str) or not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', timestamp):
+                          raise ValueError('invalid journal timestamp')
+                  if not isinstance(attempt['jobs'], list):
+                      raise ValueError('invalid journal job list')
+                  for job in attempt['jobs']:
+                      if not isinstance(job, dict) or job.keys() != {'id', 'name', 'status', 'conclusion', 'original_conclusion', 'url', 'steps', 'steps_omitted'}:
+                          raise ValueError('invalid journal job')
+                      integer(job['id'])
+                      if job['url'] != f"https://github.com/{data['repository']}/actions/runs/{attempt['run']}/job/{job['id']}":
+                          raise ValueError('invalid canonical job URL')
+                      integer(job['steps_omitted'], 0)
+                      if label(job['name']) != job['name']:
+                          raise ValueError('invalid bounded job label')
+                      status(job['status'], job['conclusion'])
+                      status(job['status'], job['original_conclusion'])
+                      if not isinstance(job['steps'], list):
+                          raise ValueError('invalid journal step list')
+                      for step in job['steps']:
+                          if not isinstance(step, dict) or step.keys() != {'number', 'name', 'status', 'conclusion'}:
+                              raise ValueError('invalid journal step')
+                          integer(step['number'])
+                          if label(step['name']) != step['name']:
+                              raise ValueError('invalid bounded step label')
+                          status(step['status'], step['conclusion'])
+              for decision in data['decisions']:
+                  if not isinstance(decision, dict) or decision.keys() != {'workflow', 'run', 'attempt', 'reason', 'before', 'after', 'state', 'at'}:
+                      raise ValueError('invalid journal decision')
+                  if (decision['workflow'] not in WORKFLOWS or decision['reason'] not in
+                          {'publication-role', 'gate-refused', 'budget-exhausted', 'evidence-unavailable'}
+                          or decision['state'] not in {'reserved', 'requested', 'uncertain', 'blocked', 'passed-on-retry', 'failed-on-retry'}):
+                      raise ValueError('invalid journal decision state')
+                  integer(decision['run'])
+                  integer(decision['attempt'])
+                  integer(decision['before'], 0)
+                  integer(decision['after'], 0)
+                  if decision['after'] > decision['before']:
+                      raise ValueError('journal budget increased')
+                  if not isinstance(decision['at'], str) or not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', decision['at']):
+                      raise ValueError('invalid decision timestamp')
+              reasons = {'watching': {'publication-pending'}, 'workflows-green': {'publication-workflows-green'},
+                         'blocked': {'gate-refused', 'budget-exhausted', 'retry-request-unconfirmed', 'publication-refused'},
+                         'pending-timeout': {'publication-timeout'}, 'instrument-error': {'evidence-unavailable'}}
+              if not isinstance(data['state'], str) or data['state'] not in reasons or data['reason'] not in reasons[data['state']]:
+                  raise ValueError('invalid journal operation result')
+              return data
+
+          def decode(raw):
+              if isinstance(raw, str):
+                  raw = raw.encode('utf-8')
+              if len(raw) > LIMIT:
+                  raise ValueError('journal exceeds source limit')
+              def unique(pairs):
+                  result = {}
+                  for key, value in pairs:
+                      if key in result:
+                          raise ValueError('duplicate journal key')
+                      result[key] = value
+                  return result
+              return validate(json.loads(raw, object_pairs_hook=unique))
+          # END JOURNAL CODEC
+          try:
+              recovery_journal = decode(watched.get('journal') or 'null')
+          except (ValueError, KeyError, TypeError, AttributeError):
+              recovery_journal = None
           # Mirror the public identity wire contract in release-diagnostics.py:
           # this job has no checkout and must not execute repository code.
           uncited = json.loads(prepared.get('uncited') or 'null')
@@ -541,7 +668,7 @@ jobs:
                     'published_at': watched.get('published_at') or None, 'verified_at': watched.get('verified_at') or None,
                     'changes': json.loads(prepared.get('changes') or 'null'), 'uncited': uncited,
                     'uncited_count': uncited_count, 'uncited_truncated': uncited_truncated,
-                    'retries': json.loads(prepared.get('retry_log') or '[]')}
+                    'retries': json.loads(prepared.get('retry_log') or '[]'), 'journal': recovery_journal}
           problem = bool(failed) or watched.get('receipt') == 'unconfirmed'
           result['outcome'] = 'blocked' if problem else (watched.get('outcome') or prepared.get('outcome') or 'no-op')
           result['reason'] = next((needs[name].get('outputs', {}).get('reason') or name + '-failed' for name in failed),
@@ -576,7 +703,11 @@ jobs:
                              result['reason'], 'Release automation stopped during ' + phase + '.' if problem else 'Release automation summary.')
           if problem and attempted is False: explanation += ' No push was attempted.'
           elif problem and attempted is None: explanation += ' Push attempt status is unavailable; inspect remote refs.'
-          body = explanation + '\n\n```json\n' + json.dumps(result, indent=2, sort_keys=True) + '\n```\n'
+          # Keep the bounded journal compact in incident bodies; indentation can
+          # multiply its source size. The job summary renders it separately.
+          body = explanation + '\n\n```json\n' + json.dumps(result, separators=(',', ':'), sort_keys=True) + '\n```\n'
+          if needs['watch']['result'] != 'skipped' and recovery_journal is None:
+              body += '\nRecovery attempt journal unavailable; inspect the watch log. This is not a recovery certificate.\n'
           if result['late_finish']:
               warning = 'Nightly release verified after the 14:00 Europe/Bucharest target.'
               body += '\n**Late completion:** ' + warning + '\n'

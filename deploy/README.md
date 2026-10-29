@@ -213,14 +213,16 @@ daytime merges, so exact-tip CI may take longer to settle within the same cap.
 
 Manual tip selection is bounded at 120 minutes plus 10 minutes for cutting.
 Publication watching retains its 60-minute bound within the 120-minute recovery
-allowance. **D10 is partial until 3e-3:** only the single eligible pre-cut main-CI
-infrastructure rerun and existing non-gate publication retries are automated.
-Tagged-KinD and targeted assertion recovery remain fail-closed follow-up work.
-The release commit's own main CI will be classified in the planned journal and
-report without automatic reruns. This is deliberate: publication uses strict
-inherited coverage and the next RC needs a newer CI-bearing tip; isolating old
-reruns would change cancellation behavior for every main rerun. ci.yml stays
-unchanged. First-week contention measurements remain a rollout check.
+allowance. One publication watcher owns the existing per-workflow retry budgets
+and records a bounded attempt journal, including failing jobs/steps and retry
+reservations/results. The first failed job's detail is retained. The journal
+keeps every observed attempt and explicitly counts omitted detail when it reaches
+32,768 source bytes; unavailable evidence is not proof of recovery.
+Release-commit main CI is report-only, without waiting or rerunning. Automatic
+recovery was deliberately excluded: publication uses strict inherited coverage,
+the next RC needs a newer CI-bearing tip, and rerun isolation would change main
+cancellation behavior. Tagged-KinD and targeted assertion recovery remain
+fail-closed follow-up work. First-week contention measurements remain a rollout check.
 The procedures below are the local path.
 
 **Releases are cut RC-first** (ADR-1265, PRD #1265). `release-cut X.Y.Z`

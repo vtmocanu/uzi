@@ -799,6 +799,7 @@ Dir.mktmpdir('release-watch-receipt') do |dir|
   Dir.glob(File.join(bin, '*')).concat(Dir.glob(File.join(release_scripts, '*'))).each { |path| File.chmod(0o700, path) }
   environment = {'PATH' => "#{bin}:#{ENV.fetch('PATH')}", 'RELEASE_SHA' => '1' * 40,
                  'RELEASE_TAG' => 'v0.2.0-rc.1', 'RELEASE_KIND' => 'rc', 'RUNNER_TEMP' => dir,
+                 'GITHUB_RUN_ID' => '123', 'GITHUB_RUN_ATTEMPT' => '1', 'GITHUB_REPOSITORY' => 'vtmocanu/uzi',
                  'GITHUB_OUTPUT' => File.join(dir, 'outputs'), 'WATCH_CALLS' => File.join(dir, 'calls')}
   [[1, 0, false], [0, 1, false], [0, 0, true]].each do |receipt_rc, verify_rc, expected|
     FileUtils.rm_f(environment.fetch('WATCH_CALLS'))
@@ -827,6 +828,7 @@ end
 # a fake API; healthy publication is summary-only, and failures reuse one issue.
 report_script = auto_jobs.fetch('report').fetch('steps').first.fetch('run')
 Dir.mktmpdir('release-report') do |dir|
+  report_payload = lambda { |text| JSON.parse(text.split("```json\n").last.split("\n```", 2).first) }
   bin = File.join(dir, 'bin')
   FileUtils.mkdir_p(bin)
   File.write(File.join(bin, 'gh'), <<~'RUBY')
@@ -872,9 +874,10 @@ Dir.mktmpdir('release-report') do |dir|
     _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => noop.to_json, 'GITHUB_EVENT_NAME' => 'schedule'), 'bash', '-e', '-c', report_script)
     assert.call(status.success?, true, "#{reason}: no-op reporting succeeds: #{err}")
     text = File.read(environment.fetch('GITHUB_STEP_SUMMARY'))
-    assert.call(text.include?('"outcome": "no-op"'), true, "#{reason}: no-op is explicit")
-    assert.call(text.include?('"reason": "' + reason + '"'), true, "#{reason}: planned reason survives skipped jobs")
-    assert.call(text.include?('"phase": "' + phase + '"'), true, "#{reason}: phase is truthful")
+    payload = report_payload.call(text)
+    assert.call(payload['outcome'], 'no-op', "#{reason}: no-op is explicit")
+    assert.call(payload['reason'], reason, "#{reason}: planned reason survives skipped jobs")
+    assert.call(payload['phase'], phase, "#{reason}: phase is truthful")
     assert.call(text.include?('Nightly RC'), true, "#{reason}: human-readable nightly result")
     assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, "#{reason}: expected no-op never files an incident")
   end
@@ -891,8 +894,9 @@ Dir.mktmpdir('release-report') do |dir|
                                         'RUN_CREATED_AT' => created), 'bash', '-e', '-c', report_script)
     assert.call(status.success?, true, "late=#{late}: verification report succeeds: #{err}")
     text = File.read(environment.fetch('GITHUB_STEP_SUMMARY'))
-    assert.call(text.include?('"outcome": "published-and-verified"'), true, 'late success is still verified')
-    assert.call(text.include?('"late_finish": ' + late.to_json), true, 'late finish uses the original local-date target')
+    payload = report_payload.call(text)
+    assert.call(payload['outcome'], 'published-and-verified', 'late success is still verified')
+    assert.call(payload['late_finish'], late, 'late finish uses the original local-date target')
     assert.call(stdout.include?('::warning::'), late, 'only late verified completion produces a warning')
     assert.call(text.include?('14:00 Europe/Bucharest target.'), late, 'late warning names the current local target')
     assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, 'late success does not file an extra incident')
@@ -915,7 +919,7 @@ Dir.mktmpdir('release-report') do |dir|
   stdout, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => manual_complete.to_json, 'GITHUB_EVENT_NAME' => 'workflow_dispatch',
                                       'RUN_CREATED_AT' => '2026-10-27T02:47:00Z'), 'bash', '-e', '-c', report_script)
   assert.call(status.success?, true, "manual late-day verification has no morning target: #{err}")
-  assert.call(File.read(environment.fetch('GITHUB_STEP_SUMMARY')).include?('"late_finish": null'), true, 'manual verification has no late flag')
+  assert.call(report_payload.call(File.read(environment.fetch('GITHUB_STEP_SUMMARY')))['late_finish'], nil, 'manual verification has no late flag')
   assert.call(stdout.include?('::warning::'), false, 'manual completion after 14:00 does not warn')
   assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, 'manual verified completion is not an incident')
   skipped_tip = Marshal.load(Marshal.dump(normal))
@@ -941,7 +945,7 @@ Dir.mktmpdir('release-report') do |dir|
   assert.call(status.success?, true, "missed-target incident delivery succeeds: #{err}")
   missed_body = File.read(environment.fetch('REPORT_BODY'))
   assert.call(missed_body.include?('pre-push cutoff'), true, 'missed-target explains the clock refusal')
-  assert.call(missed_body.include?('"push_attempted": false'), true, 'missed target proves the push was skipped')
+  assert.call(report_payload.call(missed_body)['push_attempted'], false, 'missed target proves the push was skipped')
   failed = Marshal.load(Marshal.dump(normal))
   failed['prepare'] = {'result' => 'failure', 'outputs' => {'outcome' => 'blocked', 'reason' => 'codex-runtime-needs-local-cut'}}
   _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => failed.to_json), 'bash', '-e', '-c', report_script)
@@ -955,7 +959,7 @@ Dir.mktmpdir('release-report') do |dir|
   _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => rejected.to_json), 'bash', '-e', '-c', report_script)
   assert.call(status.success?, true, "definitive rejection is delivered: #{err}")
   rejection_body = File.read(environment.fetch('REPORT_BODY'))
-  assert.call(rejection_body.include?('"push_attempted": true'), true, 'a rejected Git push was attempted even though watch is skipped')
+  assert.call(report_payload.call(rejection_body)['push_attempted'], true, 'a rejected Git push was attempted even though watch is skipped')
   assert.call(rejection_body.include?('No push was attempted.'), false, 'recovery marker is not mistaken for literal push attempt status')
   unconfirmed = Marshal.load(Marshal.dump(normal))
   unconfirmed['watch'] = {'result' => 'failure', 'outputs' => {'receipt' => 'unconfirmed', 'reason' => 'push-receipt-unconfirmed'}}
@@ -963,7 +967,16 @@ Dir.mktmpdir('release-report') do |dir|
   assert.call(status.success?, true, "unconfirmed receipt incident is delivered: #{err}")
   receipt_body = File.read(environment.fetch('REPORT_BODY'))
   assert.call(receipt_body.include?('could not confirm that main contains the RC'), true, 'receipt failure has an actionable explanation')
-  assert.call(receipt_body.include?('"phase": "watch"'), true, 'receipt uncertainty is owned by watch')
+  assert.call(report_payload.call(receipt_body)['phase'], 'watch', 'receipt uncertainty is owned by watch')
+  ['credential-sentinel', '{"schema":1}', 'null'].each do |invalid_journal|
+    malformed_journal = Marshal.load(Marshal.dump(unconfirmed))
+    malformed_journal['watch']['outputs']['journal'] = invalid_journal
+    _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => malformed_journal.to_json), 'bash', '-e', '-c', report_script)
+    assert.call(status.success?, true, "unavailable journal still delivers the incident: #{err}")
+    journal_body = File.read(environment.fetch('REPORT_BODY'))
+    assert.call(report_payload.call(journal_body)['journal'], nil, 'malformed journal is explicitly unavailable')
+    assert.call(journal_body.include?('credential-sentinel'), false, 'malformed journal is never echoed')
+  end
   %w[failure cancelled].each do |result|
     interrupted = Marshal.load(Marshal.dump(normal))
     interrupted['push'] = {'result' => result, 'outputs' => {'attempted' => 'true'}}
@@ -971,8 +984,8 @@ Dir.mktmpdir('release-report') do |dir|
     _, _, status = Open3.capture3(environment.merge('NEEDS_JSON' => interrupted.to_json), 'bash', '-e', '-c', report_script)
     assert.call(status.success?, true, "#{result} after send is delivered successfully")
     text = File.read(environment.fetch('GITHUB_STEP_SUMMARY'))
-    assert.call(text.include?('"push_outcome": "receipt-unknown"'), true, "#{result} with missing receipt is unknown")
-    assert.call(text.include?('"outcome": "partial-publication"'), true, "#{result} reports same-tag manual inspection")
+    assert.call(report_payload.call(text)['push_outcome'], 'receipt-unknown', "#{result} with missing receipt is unknown")
+    assert.call(report_payload.call(text)['outcome'], 'partial-publication', "#{result} reports same-tag manual inspection")
   end
   failed['prepare']['outputs'].merge!('reason' => 'changelog-coverage-refused', 'phase' => 'prepare',
                                     'stage' => 'changelog-coverage', 'planned_tag' => 'v0.2.0-rc.11',
@@ -984,9 +997,10 @@ Dir.mktmpdir('release-report') do |dir|
   assert.call(status.success?, true, "oracle refusal is delivered: #{err}")
   body = File.read(environment.fetch('REPORT_BODY'))
   assert.call(body.include?('3486'), true, 'incident includes the uncited PR identity')
-  assert.call(body.include?('"planned_tag": "v0.2.0-rc.11"'), true, 'incident identifies the planned candidate')
-  assert.call(body.include?('"push_attempted": false'), true, 'prepare refusal explicitly proves push was skipped')
-  assert.call(body.include?('"changes": null'), true, 'uncollected changes are not described as an empty shipping set')
+  payload = report_payload.call(body)
+  assert.call(payload['planned_tag'], 'v0.2.0-rc.11', 'incident identifies the planned candidate')
+  assert.call(payload['push_attempted'], false, 'prepare refusal explicitly proves push was skipped')
+  assert.call(payload['changes'], nil, 'uncollected changes are not described as an empty shipping set')
   _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => failed.to_json, 'REPORT_FAIL' => '1'), 'bash', '-e', '-c', report_script)
   assert.call(status.success?, false, 'a reporting API failure keeps the report job red')
   assert.call(err.include?('fixture reporting failure'), true, 'the failure actually came from the reporting API')

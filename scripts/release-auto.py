@@ -23,6 +23,9 @@ spec.loader.exec_module(policy)
 diag_spec = importlib.util.spec_from_file_location('release_diagnostics', ROOT / 'scripts/lib/release-diagnostics.py')
 diagnostics = importlib.util.module_from_spec(diag_spec)
 diag_spec.loader.exec_module(diagnostics)
+journal_spec = importlib.util.spec_from_file_location('release_journal', ROOT / 'scripts/lib/release-journal.py')
+journals = importlib.util.module_from_spec(journal_spec)
+journal_spec.loader.exec_module(journals)
 BASE = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
 RC = rf'v{BASE}-rc\.[1-9][0-9]*'
 SHA = r'[0-9a-f]{40}'
@@ -195,6 +198,20 @@ def append_watch_log(source, target, limit=32768):
         stream.write(f'### Publication watcher log (source limit: {limit} bytes)\n\n<pre>{html.escape(text)}</pre>\n')
         if truncated:
             stream.write(f'\n**Truncated at {limit} source bytes; full output remains in the step log.**\n')
+
+
+def append_watch_journal(source, target):
+    try:
+        data = journals.read(source)
+    except (ValueError, KeyError, TypeError, AttributeError, OSError):
+        data = None
+    with target.open('a') as stream:
+        stream.write('### Recovery attempt journal\n\n')
+        if data is None:
+            stream.write('Journal unavailable. This is not evidence of successful recovery.\n')
+        else:
+            stream.write('<pre>' + html.escape(json.dumps(data, indent=2, sort_keys=True)) + '</pre>\n')
+    return data
 
 
 def created_at(env, fetch=None):
@@ -513,6 +530,9 @@ def main():
         cfg = inputs(os.environ)
         if args.mode == 'watch-log':
             append_watch_log(Path(os.environ['RUNNER_TEMP']) / 'release-watch.log', Path(os.environ['GITHUB_STEP_SUMMARY']))
+            data = append_watch_journal(Path(os.environ['RUNNER_TEMP']) / 'release-watch.json',
+                                        Path(os.environ['GITHUB_STEP_SUMMARY']))
+            outputs({'journal': json.dumps(data, separators=(',', ':'))})
             return 0
         if args.mode == 'authorize':
             if cfg['scheduled'] and not cfg['nightly_enabled']:

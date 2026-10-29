@@ -27,6 +27,29 @@ def cut_result(path, tag, reason='ready', uncited=None):
     Path(path).write_text(json.dumps(data))
 
 
+class RecoveryJournal(unittest.TestCase):
+    def test_journal_summary_escapes_job_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory) / 'journal.json', Path(directory) / 'summary.md'
+            journal = auto.journals.Journal(source, 'fixture-operation', 'vtmocanu/uzi', 'v0.2.0', 'a' * 40)
+            journal.observe('release.yml', dict(id=101, run_attempt=1, status='completed', conclusion='failure'),
+                            [dict(id=303, name='<script>fixture</script>', status='completed', conclusion='failure', steps=[])])
+            data = auto.append_watch_journal(source, target)
+            self.assertEqual(data['attempts'][0]['jobs'][0]['id'], 303)
+            self.assertIn('&lt;script&gt;fixture&lt;/script&gt;', target.read_text())
+            self.assertNotIn('<script>', target.read_text())
+
+    def test_missing_or_malformed_journal_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory) / 'journal.json', Path(directory) / 'summary.md'
+            for raw in (None, '{bad', '{}', '[]'):
+                with self.subTest(raw=raw):
+                    if raw is not None:
+                        source.write_text(raw)
+                    self.assertIsNone(auto.append_watch_journal(source, target))
+            self.assertIn('not evidence of successful recovery', target.read_text())
+
+
 class OracleDiagnostics(unittest.TestCase):
     def fixture(self, directory):
         repo = Path(directory) / 'repo'
