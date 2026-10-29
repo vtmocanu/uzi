@@ -657,6 +657,59 @@ for (const method of ["item/agentMessage/delta", "item/completed", "turn/complet
  });
 }
 
+const diagnosticDelta = (params: Record<string, unknown> = {}) => ({
+ method: "item/agentMessage/delta",
+ params: { threadId: "thread", turnId: "turn", itemId: "assistant", delta: verdict, ...params },
+});
+const diagnosticCompletion = (item: Record<string, unknown> = {}, params: Record<string, unknown> = {}) => ({
+ method: "item/completed",
+ params: { threadId: "thread", turnId: "turn",
+  item: { type: "agentMessage", id: "assistant", text: verdict, ...item }, ...params },
+});
+
+for (const [name, subreason, frames] of [
+ ["foreign delta thread", "foreign_item", [diagnosticDelta({ threadId: "foreign" })]],
+ ["foreign delta turn", "foreign_item", [diagnosticDelta({ turnId: "stale" })]],
+ ["foreign completion thread", "foreign_item", [diagnosticCompletion({}, { threadId: "foreign" })]],
+ ["foreign completion turn", "foreign_item", [diagnosticCompletion({}, { turnId: "stale" })]],
+ ["delta after completion before terminal", "delta_after_completion", [diagnosticCompletion(), diagnosticDelta()]],
+ ["delta missing identity", "invalid_item_identity", [diagnosticDelta({ itemId: undefined })]],
+ ["delta empty identity", "invalid_item_identity", [diagnosticDelta({ itemId: "" })]],
+ ["delta non-string identity", "invalid_item_identity", [diagnosticDelta({ itemId: 7 })]],
+ ["delta conflicting identity", "invalid_item_identity", [diagnosticDelta(), diagnosticDelta({ itemId: "other" })]],
+ ["completion missing identity", "invalid_item_identity", [diagnosticCompletion({ id: undefined })]],
+ ["completion empty identity", "invalid_item_identity", [diagnosticCompletion({ id: "" })]],
+ ["completion non-string identity", "invalid_item_identity", [diagnosticCompletion({ id: 7 })]],
+ ["completion conflicting identity", "invalid_item_identity", [diagnosticDelta(), diagnosticCompletion({ id: "other" })]],
+ ["non-string delta", "stream_cap", [diagnosticDelta({ delta: 7 })]],
+ ["oversized delta", "stream_cap", [diagnosticDelta({ delta: "é".repeat(32769) })]],
+ ["cumulative oversized delta", "stream_cap", [
+  diagnosticDelta({ delta: "é".repeat(32768) }), diagnosticDelta({ delta: "x" }),
+ ]],
+ ["invalid completion text", "completion_invalid", [diagnosticCompletion({ text: 7 })]],
+ ["missing completion text", "completion_invalid", [diagnosticCompletion({ text: undefined })]],
+ ["oversized completion", "completion_invalid", [diagnosticCompletion({ text: "é".repeat(32769) })]],
+ ["duplicate completion same item", "completion_invalid", [diagnosticCompletion(), diagnosticCompletion()]],
+ ["stream mismatch prefix", "stream_mismatch", [diagnosticDelta({ delta: "prefix " + verdict }), diagnosticCompletion()]],
+ ["stream mismatch suffix", "stream_mismatch", [diagnosticDelta({ delta: verdict + " suffix" }), diagnosticCompletion()]],
+] as const) {
+ it("malformed diagnostic stream " + name, async () => {
+  const r = rig({ notes: (emit) => {
+   for (const frame of frames) emit(frame);
+   emit({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "completed" } } });
+  } });
+  await assert.rejects(r.run(), (err: unknown) => {
+   assert.ok(err instanceof CrossCheckMalformedError);
+   assert.equal(err.subreason, subreason);
+   return true;
+  });
+  assert.deepEqual(r.ops, ["stat"]);
+  assert.deepEqual(r.disposed, ["provider", "fileop"]);
+  assert.equal(r.usage.at(-1)!.is_error, true);
+  assert.equal(r.secrets.size, 0);
+ });
+}
+
 it("denies effects, delegation and Skill and charges all callbacks including repeated denials", async () => {
  let count = 0;
  const r = rig({ notes: (emit) => next(emit), onToolReply: (frame, emit) => {

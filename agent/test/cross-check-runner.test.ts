@@ -427,12 +427,22 @@ for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "
  });
 }
 
+class SentinelXyzError extends Error {}
+class DiagnosticSyntaxError extends SyntaxError {}
+
+const diagnosticRunnerModes = [
+ "typed explicit", "typed unannotated", "plain JSON error", "returned invalid JSON",
+ "exact SyntaxError", "exact TypeError", "exact RangeError", "exact Error",
+ "custom alphabetic class", "built-in subclass", "name spoof", "constructor-name spoof",
+] as const;
+
 for (const stage of ["plan", "code"] as const) {
- for (const mode of ["typed explicit", "typed unannotated", "plain JSON error", "returned invalid JSON"] as const) {
+ for (const mode of diagnosticRunnerModes) {
   it("malformed diagnostic runner " + stage + " " + mode, async () => {
    const root = await fs.mkdtemp(path.join(path.resolve(import.meta.dirname, "../../.uzi/scratch"), "malformed-diagnostic-"));
    const recorded = recordingLogger();
    const sentinel = "SENTINEL-malformed-provider-output-3432";
+   const classSentinel = "SentinelXyzError";
    const states: Record<string, unknown>[] = [];
    const decisions: unknown[] = [];
    const messages: unknown[] = [];
@@ -470,7 +480,24 @@ for (const stage of ["plan", "code"] as const) {
       if (stage === "code") { assert.equal(typeof cleanupConfirmed, "function"); cleanupConfirmed!(); }
       if (mode === "typed explicit") throw new CrossCheckMalformedError(sentinel, "finding_schema");
       if (mode === "typed unannotated") throw new CrossCheckMalformedError(sentinel);
+      const message = "JSON invalid code cross-check " + sentinel;
       if (mode === "plain JSON error") throw new Error("JSON " + sentinel);
+      if (mode === "exact Error") throw new Error(message);
+      if (mode === "exact SyntaxError") throw new SyntaxError(message);
+      if (mode === "exact TypeError") throw new TypeError(message);
+      if (mode === "exact RangeError") throw new RangeError(message);
+      if (mode === "custom alphabetic class") throw new SentinelXyzError(message);
+      if (mode === "built-in subclass") throw new DiagnosticSyntaxError(message);
+      if (mode === "name spoof") {
+       const error = new SentinelXyzError(message);
+       error.name = "SyntaxError";
+       throw error;
+      }
+      if (mode === "constructor-name spoof") {
+       const error = new SentinelXyzError(message);
+       Object.defineProperty(error, "constructor", { value: { name: "SyntaxError" } });
+       throw error;
+      }
       return "{invalid JSON " + sentinel;
      } },
     }).execute(c);
@@ -484,12 +511,22 @@ for (const stage of ["plan", "code"] as const) {
     assert.deepEqual(decisions, [stage === "plan"
      ? { verdict: "failed", reason_class: "malformed", summary: "The cross-check did not complete.", items: [] }
      : { outcome: "failed", reason_class: "malformed", findings: [] }]);
-    assert.equal(JSON.stringify({ logs: recorded.lines, messages, decisions, states }).includes(sentinel), false);
+    const serialized = JSON.stringify({ logs: recorded.lines, messages, decisions, states });
+    for (const forbidden of [sentinel, classSentinel]) {
+     assert.equal(serialized.includes(forbidden), false, "diagnostics must not expose " + forbidden);
+    }
+    const typed = mode === "typed explicit" || mode === "typed unannotated";
+    const codeFindings = mode === "returned invalid JSON" && stage === "code";
+    const errorName = mode === "exact SyntaxError" || (mode === "returned invalid JSON" && stage === "plan") ? "SyntaxError"
+     : mode === "exact TypeError" ? "TypeError"
+     : mode === "exact RangeError" ? "RangeError"
+     : mode === "exact Error" || mode === "plain JSON error" ? "Error" : "unknown";
     const warnings = recorded.lines.filter((line) => (line as { level?: string }).level === "warn");
     assert.deepEqual(warnings, [{
      level: "warn", msg: "cross-check verdict malformed", run_id: "check", stage,
-     subreason: mode === "typed explicit" ? "finding_schema"
-      : mode === "returned invalid JSON" && stage === "code" ? "code_findings" : "unknown",
+     subreason: mode === "typed explicit" ? "finding_schema" : typed ? "unknown"
+      : codeFindings ? "code_findings" : "unclassified_error",
+     ...(!typed && !codeFindings ? { error_name: errorName } : {}),
     }]);
    } finally { await fs.rm(root, { recursive: true, force: true }); }
   });

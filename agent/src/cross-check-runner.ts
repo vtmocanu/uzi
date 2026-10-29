@@ -356,7 +356,13 @@ export class CrossCheckRunner {
       await finishTelemetry();
       if (reason === "malformed") {
         this.log.warn("cross-check verdict malformed", { run_id: runId, stage: code ? "code" : "plan",
-          subreason: err instanceof CrossCheckMalformedError ? err.subreason ?? "unknown" : "unknown",
+          ...(err instanceof CrossCheckMalformedError ? { subreason: err.subreason ?? "unknown" } : {
+            subreason: "unclassified_error",
+            error_name: err instanceof Error && err.constructor === SyntaxError ? "SyntaxError"
+              : err instanceof Error && err.constructor === TypeError ? "TypeError"
+              : err instanceof Error && err.constructor === RangeError ? "RangeError"
+              : err instanceof Error && err.constructor === Error ? "Error" : "unknown",
+          }),
         });
       }
       if (err instanceof CrossCheckConfinementError || reason === "confinement_failed") {
