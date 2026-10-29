@@ -373,7 +373,7 @@ describe("WorkersSettings hosted workers (PRD #58 M5)", () => {
     expect(screen.queryByText("docker")).toBeNull();
   });
 
-  it("renders at most one docker chip per worker row, with or without the capability set (#3627)", async () => {
+  it("renders exactly one docker chip per worker row when capabilities include docker (#3627)", async () => {
     // A docker-capable hosted worker carries docker twice: WorkerDTO.docker (the hosted
     // badge) and the server-authoritative capability set. The hosted badge stays; the
     // capability chip yields only when that badge rendered.
@@ -395,6 +395,9 @@ describe("WorkersSettings hosted workers (PRD #58 M5)", () => {
       if (c.name === "hosted-nd" || c.name.startsWith("ext-")) {
         // No hosted badge here, so the one chip is the capability chip.
         expect(screen.getByText("docker").getAttribute("title")).toBe("Worker capability: docker");
+      } else {
+        // Hosted with docker:true: the surviving chip is the untitled hosted badge.
+        expect(screen.getByText("docker").getAttribute("title")).toBeNull();
       }
     }
   });
