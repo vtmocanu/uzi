@@ -1,7 +1,8 @@
 # Protected manual releases and opt-in nightly RCs (#3512, stage 3e-2).
 # App/environment/ruleset setup and the first live dispatch belong to the maintainer.
 # D10 is partial: one eligible pre-cut CI rerun and existing non-gate publication
-# retries. Tagged smoke, post-cut CI and targeted assertion recovery follow in 3e-3.
+# retries. Tagged smoke and targeted assertions follow in 3e-3; post-cut main CI
+# will be report-only, with automatic reruns deliberately excluded.
 name: Release automation
 
 "on":
@@ -565,6 +566,7 @@ jobs:
                          'nightly-disabled': 'Nightly RC paused: RELEASE_NIGHTLY_ENABLED is not true.',
                          'no-new-shipping-change': 'Nightly RC skipped: no new non-metadata shipping changes.',
                          'no-releasable-notes': 'Nightly RC skipped: no releasable notes.',
+                         'skip-ci-tip': 'Release preparation refused: this tip has a skip-ci instruction and lacks exact CI proof; use a newer CI-bearing main tip.',
                          'missed-target': 'Nightly RC stopped because its remaining pre-push cutoff budget was exhausted.',
                          'tip-not-green-by-cutoff': 'Nightly RC found no exact green tip within its pre-cut budget.',
                          'push-receipt-unconfirmed': 'Release recovery could not confirm that main contains the RC.'}.get(

@@ -356,6 +356,9 @@ class Release:
                 last_progress = progress
             if smoke_state == 'failed':
                 raise Stop('tip-smoke-failed')
+            if (ci is None or smoke is None) and policy.skips_ci(self.git('show', '-s', '--format=%B', sha)):
+                require(ci_state != 'failed', 'tip-ci-not-retryable')
+                raise Stop('skip-ci-tip')
             if ci_state == 'failed':
                 marker = ci['id'], ci['run_attempt']
                 if not retried:
