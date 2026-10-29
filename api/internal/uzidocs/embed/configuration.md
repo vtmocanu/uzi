@@ -126,7 +126,7 @@ Explicit container or Compose DNS settings override daemon defaults: Docker CLI 
 
 Deploy the updated controller through the ordinary rollout and let it recreate idle worker pods; do not bypass active-run protection with `ForceRoll`. Recreate owned containers and networks as appropriate to acquire the defaults. Separately managed buildx builders are not assumed to inherit these daemon defaults; check their own DNS configuration.
 
-**Sanitized live observations — 2026-10-28, M1 `3c43a551`.** Lead-owned independent nested-daemon probes used pinned Docker 29.8.0 rootful and rootless images. These observations are separate from operator rollout acceptance; full hosted production rollout remains M3 pending.
+**Sanitized live observations: 2026-10-28, M1 `3c43a551`.** Lead-owned independent nested-daemon probes used pinned Docker 29.8.0 rootful and rootless images. These observations are separate from operator rollout acceptance; full hosted production rollout remains M3 pending.
 
 | Check | Observation / boundary |
 |---|---|
