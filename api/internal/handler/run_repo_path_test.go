@@ -20,9 +20,18 @@ import (
 
 type runRepoPathDB struct {
 	store.DBTX
-	path string
-	err  error
-	args []any
+	path         string
+	err          error
+	args         []any
+	cooldownArgs []any
+}
+
+func (db *runRepoPathDB) Query(_ context.Context, query string, args ...any) (pgx.Rows, error) {
+	if strings.Contains(query, "-- name: ListOwnerRunForgeOriginCooldowns") {
+		db.cooldownArgs = args
+		return nil, errors.New("optional cooldown projection unavailable")
+	}
+	return nil, errors.New("unexpected query: " + query)
 }
 
 func (db *runRepoPathDB) QueryRow(_ context.Context, query string, args ...any) pgx.Row {
@@ -87,6 +96,18 @@ func TestGetRunRepoPath(t *testing.T) {
 				}
 				if got.Run.RepoPath != tc.want {
 					t.Fatalf("repo_path=%q want %q", got.Run.RepoPath, tc.want)
+				}
+				var body struct {
+					Run map[string]json.RawMessage `json:"run"`
+				}
+				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+					t.Fatal(err)
+				}
+				if _, present := body.Run["forge_origin_cooldown"]; present {
+					t.Fatal("optional cooldown field must be absent when its projection fails")
+				}
+				if !reflect.DeepEqual(db.cooldownArgs, []any{tc.viewer.ID, []uuid.UUID{runID}}) {
+					t.Fatalf("cooldown lookup must use viewer and run: %v", db.cooldownArgs)
 				}
 			}
 			if tc.repo && tc.status == http.StatusOK {

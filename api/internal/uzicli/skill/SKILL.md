@@ -257,6 +257,7 @@ uzi findings resolve <finding-id>
 uzi findings stats [--repo <repo-id>]
 uzi findings undo <disposition-id>
 uzi worker list
+uzi worker get <worker-id>
 uzi worker cordon <id> [-m <reason>] [--json]
 uzi worker uncordon <id> [--json]
 uzi worker rm <worker-id>
