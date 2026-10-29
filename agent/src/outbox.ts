@@ -255,6 +255,8 @@ interface TerminalJournalData {
  *  which the store never needs to re-read for depth/list/retire). */
 interface TerminalMeta {
   outcomeKind?: "terminal" | "policy_hold" | "unknown";
+  /** Canonical UUID from validated policy evidence only; no authority or report body. */
+  policyOutcomeId?: string;
   unpersistedPolicy?: PolicyHoldRequest;
   policyBytes?: number;
   materializationBlocked?: boolean;
@@ -308,14 +310,18 @@ interface FinalizeRecordData {
 }
 
 /** The per-run outbox depth surfaced on the heartbeat (M5) and in `uzi admin
- *  workers`. `pendingTerminal` counts the run's pending (installed, un-retired)
- *  terminal journals (Run B / M3); `blockedReason` is the run's oldest blocked
+ *  workers`. `pendingTerminal` counts delivery work, excluding exactly settled policy
+ *  journals whose physical custody is still retained; ordinary terminal counts are unchanged.
+ *  `blockedReason` is the run's oldest blocked
  *  terminal reason, if any (D13). Both stay 0/unset for a run with no terminal
  *  journal, so a Run A worker's depth is unchanged. */
 export interface OutboxDepth {
   runId: string;
   pendingMessages: number;
   pendingTerminal: number;
+  /** Content-free facts from the newest known unsettled policy source; presentation only. */
+  policyPendingOutcomeId?: string;
+  policyPendingSourceGeneration?: number;
   staleRetired: number;
   blockedReason?: string;
   since: number;
@@ -1352,11 +1358,27 @@ export class Outbox {
     let pendingMessages = 0;
     for (const r of m.records) if (r.lastSeq > m.cursor) pendingMessages += seqCount(r);
     const blockedReason = oldestBlockedReason(rs);
+    let pendingTerminal = 0;
+    let pendingPolicy: TerminalMeta | undefined;
+    for (const meta of rs.terminals.values()) {
+      // Match listPendingTerminals: a disabled store cannot trust settlement observations.
+      const settledPolicy = meta.outcomeKind === "policy_hold" && !this.disabled &&
+        this.terminalRetirementIdentities.get(meta)?.serverSettled === true;
+      if (settledPolicy) continue;
+      pendingTerminal++;
+      if (meta.outcomeKind === "policy_hold" && meta.policyOutcomeId !== undefined &&
+          (!pendingPolicy || meta.claimGeneration > pendingPolicy.claimGeneration)) pendingPolicy = meta;
+    }
     return {
       runId,
       pendingMessages,
-      // Run B: every installed, un-retired terminal journal for this run (blocked or not).
-      pendingTerminal: rs.terminals.size,
+      pendingTerminal,
+      // The filename generation is the original source, never a projected current claim.
+      // Transient pending facts do not populate blockedReason or change admission.
+      ...(pendingPolicy ? {
+        policyPendingOutcomeId: pendingPolicy.policyOutcomeId,
+        policyPendingSourceGeneration: pendingPolicy.claimGeneration,
+      } : {}),
       staleRetired: m.staleRetired,
       // The run's oldest blocked terminal reason, if any (D13) — omitted when none is blocked.
       ...(blockedReason !== undefined ? { blockedReason } : {}),
@@ -1475,7 +1497,8 @@ export class Outbox {
         const meta: TerminalMeta = {
           fileName: terminalFileName(claimGeneration), claimGeneration, phaseAtJournal,
           since: this.now(), blocked: false, outcomeKind: fits ? "policy_hold" : "unknown",
-          ...(fits ? { unpersistedPolicy: canonicalBody as unknown as PolicyHoldRequest, policyBytes: bytes } : {}),
+          ...(fits ? { unpersistedPolicy: canonicalBody as unknown as PolicyHoldRequest, policyBytes: bytes,
+            policyOutcomeId: (canonicalBody as unknown as PolicyHoldRequest).outcome_id } : {}),
         };
         if (!this.admitPolicyMetadata(runId, meta)) return { journaled: false, reason: "reserve_exhausted" };
         this.ensureInMemoryRun(runId, this.now()).terminals.set(claimGeneration, meta);
@@ -1578,6 +1601,7 @@ export class Outbox {
         rs.terminals.set(claimGeneration, {
           fileName: terminalFileName(claimGeneration),
           outcomeKind,
+          ...(outcomeKind === "policy_hold" ? { policyOutcomeId: (canonicalBody as unknown as PolicyHoldRequest).outcome_id } : {}),
           policyBytes: Buffer.byteLength(serialized),
           claimGeneration,
           phaseAtJournal,
@@ -3100,7 +3124,8 @@ const TERMINAL_BLOCKED_REASONS: ReadonlySet<string> = new Set<TerminalBlockedRea
  *  embedded `claim_generation` to the filename, so a copied/misfiled journal is skipped. Returns
  *  null on any mismatch. */
 function coerceTerminal(obj: Record<string, unknown>, runId: string, fileGen: number, fileName = terminalFileName(fileGen)): TerminalMeta | null {
-  if (!coerceTerminalRecord(obj, runId, fileGen)) return null;
+  const record = coerceTerminalRecord(obj, runId, fileGen);
+  if (!record) return null;
   if (obj.version !== 1) return null;
   if (obj.run_id !== runId) return null;
   if (typeof obj.claim_generation !== "number" || obj.claim_generation !== fileGen) return null;
@@ -3114,6 +3139,7 @@ function coerceTerminal(obj: Record<string, unknown>, runId: string, fileGen: nu
   return {
     fileName,
     outcomeKind: obj.outcome_kind === "policy_hold" ? "policy_hold" : "terminal",
+    ...(record.outcome_kind === "policy_hold" ? { policyOutcomeId: record.body.outcome_id as string } : {}),
     claimGeneration: obj.claim_generation,
     phaseAtJournal: obj.phase_at_journal,
     since: obj.since,

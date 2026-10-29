@@ -1206,6 +1206,10 @@ export class Worker {
         run_id: d.runId,
         pending_messages: d.pendingMessages,
         pending_terminal: d.pendingTerminal,
+        ...(d.policyPendingOutcomeId !== undefined && d.policyPendingSourceGeneration !== undefined ? {
+          policy_pending_outcome_id: d.policyPendingOutcomeId,
+          policy_pending_source_generation: d.policyPendingSourceGeneration,
+        } : {}),
         stale_retired: d.staleRetired,
         since: d.since,
         ...(d.blockedReason ? { blocked_reason: d.blockedReason } : {}),

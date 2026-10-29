@@ -657,6 +657,9 @@ export interface OutboxHeartbeatEntry {
   run_id: string;
   pending_messages: number;
   pending_terminal: number;
+  /** Presentation only: newest known unsettled original policy outcome. */
+  policy_pending_outcome_id?: string;
+  policy_pending_source_generation?: number;
   stale_retired: number;
   blocked_reason?: string;
   since: number;

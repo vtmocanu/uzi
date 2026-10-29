@@ -557,6 +557,28 @@ describe("Worker policy ownership reconciliation", () => {
     });
   }
 
+  it("heartbeat delivery facts clear after exact settlement without deleting custody evidence", async () => {
+    const outbox = await mkOutbox();
+    await outbox.journalPolicyHold(RUN, body);
+    const worker = new Worker(fakeConfig(), fakeClient(), idleRunner, idleChat, noJudge, noReview,
+      nullLogger(), okPreflight, outbox) as unknown as {
+        outboxEntries(): { pending_terminal: number; policy_pending_outcome_id?: string; policy_pending_source_generation?: number }[];
+      };
+    const pending = worker.outboxEntries()[0]!;
+    assert.equal(pending.pending_terminal, 1);
+    assert.equal(pending.policy_pending_outcome_id, body.outcome_id);
+    assert.equal(pending.policy_pending_source_generation, 1);
+    const observed = await outbox.readTerminalJournalForRetirement(RUN, 1);
+    assert.ok(observed);
+    await outbox.markTerminalServerSettled(RUN, 1, observed.context);
+    const settled = worker.outboxEntries()[0]!;
+    assert.equal(settled.pending_terminal, 0);
+    assert.equal(settled.policy_pending_outcome_id, undefined);
+    assert.equal(settled.policy_pending_source_generation, undefined);
+    assert.deepEqual((await outbox.readTerminalJournal(RUN, 1))?.body, body);
+    assert.equal(outbox.listPendingTerminals().length, 1);
+  });
+
   it("late G3 response cannot remove the G4 lease during a sweep", async () => {
     const outbox = await mkOutbox();
     await outbox.journalPolicyHold(RUN, body);
