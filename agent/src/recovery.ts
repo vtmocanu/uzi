@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { ProcessQuiescence } from "./run-quiescence.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
-import type { AuthorityScope, RetirementHandle, RetirementView } from "./authority-runtime.js";
+import type { AuthorityScope, AuthorityWait, RetirementHandle, RetirementView } from "./authority-runtime.js";
 import {
   decodeCompletionSourceShape, serializeSourceFence, sourceFenceOf, type CompletionSourceFence, type CompletionSourceV2,
 } from "./completion-source.js";
@@ -4600,9 +4600,10 @@ export class RecoveryCoordinator {
    * restarted process has none and proceeds only on the durable proof. Destruction is a retiring
    * transaction (see {@link retiringManifest}). */
   private async forgetCompletedGeneration(runId: string, generation: number, isExecuting: (runId: string) => boolean,
-    signal?: AbortSignal): Promise<void> {
-    if (!this.withCompletionSourceBoundary || isExecuting(runId) || this.isExecuting(runId)) return;
+    signal?: AbortSignal): Promise<boolean> {
+    if (!this.withCompletionSourceBoundary || isExecuting(runId) || this.isExecuting(runId)) return false;
     let claims: PendingRedundancyClaim[] = [];
+    let retired = false;
     const budget = this.startRedundancyBudget(signal);
     await this.withJournalLock(runId, async () => {
       const records = await this.checkedRecords(runId);
@@ -4742,9 +4743,36 @@ export class RecoveryCoordinator {
         forgotten = true;
       }, durable);
       // A pass whose action returned early, or any partial failure, keeps provenance.
-      if (boundary === "passed" && forgotten) this.onCompletionSourceForgotten?.(source);
+      if (boundary === "passed" && forgotten) { this.onCompletionSourceForgotten?.(source); retired = true; }
     });
     await this.submitRedundancyClaims(claims, budget);
+    return retired;
+  }
+
+  /**
+   * A successor claim that found a completed owner's journal still carrying its completion-source fence
+   * retires that owner through the SAME certified path the boot sweep and the live pass use
+   * ({@link forgetCompletedGeneration}: durable retirement proof, slot, cohort, fence, execution veto,
+   * retiring manifest), so the successor need not wait for a paced pass. It opens its own authority
+   * transaction under the caller's explicit `wait` (not the maintenance default) and takes each
+   * generation's capture cycle in `wait` mode, like {@link forgetGeneration}. True only when EVERY
+   * receipt-bearing generation of the run passed its boundary and was forgotten; any refusal or error is
+   * false and the caller keeps its original failure.
+   */
+  async retireCompletedOwner(runId: string, wait: AuthorityWait): Promise<boolean> {
+    if (!this.enabled || !this.authority) return false;
+    try {
+      return await this.authority.withTransaction(async () => {
+        const generations = [...new Set((await this.listRecords(runId))
+          .filter(r => r.completionReceipt && r.inventoryGuarded && typeof r.generation === "number").map(r => r.generation!))];
+        if (generations.length === 0) return false;
+        for (const generation of generations) {
+          if (!await runCaptureCycle(await this.cycleKey({ runId, captureId: "", generation, inventoryGuarded: true }), "wait",
+            () => this.forgetCompletedGeneration(runId, generation, this.isExecuting))) return false;
+        }
+        return true;
+      }, wait);
+    } catch { return false; }
   }
 
   /**

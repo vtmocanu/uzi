@@ -372,6 +372,8 @@ const CODEX_BOUNDARY_NAMES: ReadonlySet<SafeBoundary> = new Set<SafeBoundary>([
 /** issue #3404 M2 U3: how long a clone seed / executor-launch / predecessor admission waits for A. A holder
  *  can be a recovery capture cycle; the caller's cancel/lifecycle/shutdown signal ends the wait sooner. */
 const CLONE_AUTHORITY_WAIT_MS = 300_000;
+/** How long a successor waits for a completed same-branch owner's execution tail to drain before retiring it. */
+const OWNER_TAIL_WAIT_MS = 10_000;
 /** issue #3404 M2 U3: the end-of-flight source-use step waits at most this long for A (it never blocks teardown longer). */
 const SOURCE_USE_END_WAIT_MS = 30_000;
 /** issue #3404 M2 U3: the predecessor settler's pin cleanup (it holds the per-hold lock H) waits at most this long for A. */
@@ -11083,6 +11085,38 @@ export class RunRunner {
     return flight;
   }
 
+  /** A successor claiming the branch of a just-completed owner whose journal still carries the owner's
+   *  completion-source fence: let the owner's execution tail drain (bounded by the flight's signal and
+   *  {@link OWNER_TAIL_WAIT_MS}, outside any authority lock), then retire the owner through the
+   *  coordinator's certified completed-generation retirement. True only when that retirement passed; false
+   *  leaves the caller on the unchanged {@link reclaimTerminalOrphan} path (and its original failure). */
+  private async retireCompletedSameBranchOwner(flight: RunFlight, ownerRunId: string): Promise<boolean> {
+    if (!this.recovery.enabled) return false;
+    const tail = this.executionTails.get(ownerRunId);
+    if (tail) {
+      const wait = this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS);
+      let timer: NodeJS.Timeout | undefined;
+      let onAbort: (() => void) | undefined;
+      try {
+        await Promise.race([
+          tail.then(() => undefined, () => undefined),
+          new Promise<void>(resolve => { timer = setTimeout(resolve, OWNER_TAIL_WAIT_MS); }),
+          new Promise<void>(resolve => {
+            if (wait.signal?.aborted) return resolve();
+            onAbort = resolve;
+            wait.signal?.addEventListener("abort", onAbort, { once: true });
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+        if (onAbort) wait.signal?.removeEventListener("abort", onAbort);
+      }
+    }
+    const retired = await this.recovery.retireCompletedOwner(ownerRunId, this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
+    if (retired) flight.runLog.info("completed same-branch owner retired by certified retirement; reseeding", { owner_run_id: ownerRunId });
+    return retired;
+  }
+
   /** issue #1319 — authoritative owner-derived reclaim for a terminal-owner clone orphan.
    *  Runs the NEW owner-scoped orphan-classification read and quarantines the journaled
    *  residue (RETAINED, discard:false) ONLY when EVERY predicate holds: (a) the owner run is
@@ -11691,6 +11725,13 @@ export class RunRunner {
       attemptSeed = this.attemptSeedOptions(claim, flight);
     };
     const reseed = this.canonicalReseedOptions(flight);
+    // The single re-seed after a reclaim or a certified owner retirement; any error propagates (no loop).
+    const seedAfterReclaim = async () => {
+      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence, flight));
+      flight.worktreePath = runnerClone.path;
+      flight.branch = runnerClone.branch;
+      await this.bindFlightSource(flight, runnerClone.path);
+    };
     // issue #1786: a canonical seed refused because the key now has a kept stopped canonical source
     // (or recovered attempt mode) is retried ONCE on a fresh attempt path when the re-read mode says
     // so: the mode can land between the read above and the seed under the bare lock.
@@ -11731,22 +11772,20 @@ export class RunRunner {
           // canonical path match the journal is reclaimed (residue quarantined, RETAINED),
           // else fail closed. Replaces the old worker-scoped getRunOwnership probe, which
           // 404'd on a worker move (Gap 2).
-          await this.reclaimTerminalOrphan(barePath, claim, flight, err.clonePath, err.branch, err.ownerRunId, err);
+          if (!await this.retireCompletedSameBranchOwner(flight, err.ownerRunId)) {
+            await this.reclaimTerminalOrphan(barePath, claim, flight, err.clonePath, err.branch, err.ownerRunId, err);
+          }
           await refreshAttemptSeed();
-          const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence, flight));
-          flight.worktreePath = runnerClone.path;
-          flight.branch = runnerClone.branch;
-          await this.bindFlightSource(flight, runnerClone.path);
+          await seedAfterReclaim();
         } else if (err instanceof CapturePathMismatchError) {
           // issue #1319 Case A: a claimant-relative clone-path mismatch (the cross-kind slug
           // divergence, e.g. an issue owner's `issue-N` vs this mr_rework's `agent-issue-N`).
           // The SAME owner-derived validation decides; any unmet predicate fails closed.
-          await this.reclaimTerminalOrphan(barePath, claim, flight, err.journaledPath, err.branch, err.ownerRunId, err);
+          if (!await this.retireCompletedSameBranchOwner(flight, err.ownerRunId)) {
+            await this.reclaimTerminalOrphan(barePath, claim, flight, err.journaledPath, err.branch, err.ownerRunId, err);
+          }
           await refreshAttemptSeed();
-          const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence, flight));
-          flight.worktreePath = runnerClone.path;
-          flight.branch = runnerClone.branch;
-          await this.bindFlightSource(flight, runnerClone.path);
+          await seedAfterReclaim();
         } else {
           throw err;
         }
