@@ -150,8 +150,17 @@ func TestTextRangePathBoundary(t *testing.T) {
 		t.Fatalf("socket setup unavailable: %v", err)
 	}
 	defer listener.Close()
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".git", "config"), []byte("ok\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	for _, op := range []string{opRead, opReadTextRange} {
-		for _, p := range []string{"link", "intermediate/text", "outside/text", "../escape", "/absolute", ".git/config", "pipe", "socket", "dir"} {
+		t.Run(op+"/git-config", func(t *testing.T) {
+			wantErr(t, s.handle(request{Op: op, Path: ".git/config", Offset: 1, Limit: 1}), codeDenied)
+		})
+		for _, p := range []string{"link", "intermediate/text", "outside/text", "../escape", "/absolute", "pipe", "socket", "dir"} {
 			r := s.handle(request{Op: op, Path: p, Offset: 1, Limit: 1})
 			if r["ok"] != false {
 				t.Fatal(fmt.Sprintf("boundary accepted %s %s", op, p))
