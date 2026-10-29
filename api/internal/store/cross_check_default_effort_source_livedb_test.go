@@ -15,7 +15,9 @@ import (
 func TestCrossCheckDefaultEffortSourceMigrationLiveDB(t *testing.T) {
 	const validated, widened, previous = 376, 375, 374 // renumbered with the migrations at merge
 	ctx, dsn := standIsolatedDB(t, "xc_effort_source_")
-	if err := store.Migrate(ctx, dsn); err != nil {
+	// Stop after 00375 first: its Up must leave the widened CHECK NOT VALID, which a
+	// head-only start cannot observe once 00376 has validated it.
+	if err := store.MigrateTo(ctx, dsn, widened); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -73,6 +75,11 @@ func TestCrossCheckDefaultEffortSourceMigrationLiveDB(t *testing.T) {
 		return lead
 	}
 
+	isValidated("after 00375 Up", false)
+	writes("after 00375 Up")
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
 	isValidated("head", true)
 	lead := writes("head")
 	// Down 00376 restores the NOT VALID state of 00375; new writes are still checked.
