@@ -71,6 +71,7 @@ it.each([
 ] as const)("presents preservation evidence: published=%s head=%s", (published, captured_head, copy) => {
   render(view(held({ policy_hold: { ...hold, published, captured_head } })));
   expect(screen.getByRole("heading", { name: "Codex policy hold" })).toBeTruthy();
+  expect(screen.queryByText("Completion blocked")).toBeNull();
   expect(screen.getByText(copy)).toBeTruthy();
   expect(screen.getByText(/Continuation requires preserving the provider session/)).toBeTruthy();
   expect(screen.queryByText(/private-episode|private-correlation|cyberPolicy/)).toBeNull();
