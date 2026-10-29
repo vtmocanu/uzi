@@ -152,13 +152,13 @@ describe("verbatimPrompts reaches every Claude SDK query (#1563 M2)", () => {
     };
     const { queryFn, seen } = capturing();
     // No init frame arrives, so the run fails closed; only the captured options matter here.
-    await assert.rejects(new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true, secretPaths: ["/run/secrets/worker_token"] }).run(ctx));
+    await assert.rejects(new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true, secretPaths: ["/tmp/uzi-synthetic-deny/denied-file"] }).run(ctx));
     assertVerbatim(seen.options, "isolated");
   });
 
   it("checker: ClaudeCrossCheck.run passes verbatimPrompts true to the query", async () => {
     const { queryFn, seen } = capturing();
-    const checker = new ClaudeCrossCheck(nullLogger(), { secretPaths: ["/run/secrets/"], queryFn, kill: () => true });
+    const checker = new ClaudeCrossCheck(nullLogger(), { secretPaths: ["/tmp/uzi-synthetic-deny/"], queryFn, kill: () => true });
     const claim = {
       kind: "cross_check", run_id: "check", issue_iid: null, issue_title: "Issue",
       repo: { id: "repo", full_name: "owner/repo", url: "https://example.test/owner/repo", clone_url: "https://example.test/owner/repo.git", default_branch: "main" },
@@ -244,7 +244,7 @@ describe("verbatimPrompts is set by every exported options builder (#1563 M2)", 
       systemPrompt: buildChatSystemPrompt(),
       cwd: UZI_SRC_DIR,
       log: nullLogger(),
-      secretPaths: ["/run/secrets/worker_token"],
+      secretPaths: ["/tmp/uzi-synthetic-deny/denied-file"],
     });
     assert.equal(options.verbatimPrompts, true);
   });
@@ -256,7 +256,7 @@ describe("verbatimPrompts is set by every exported options builder (#1563 M2)", 
       env: isolateSdkEnv(buildSdkEnv(OAUTH, root)),
       cwd: root,
       log: nullLogger(),
-      secretPaths: ["/run/secrets/worker_token"],
+      secretPaths: ["/tmp/uzi-synthetic-deny/denied-file"],
       fetchServer: fetch.server,
       gate: { passed: false },
       maxTurns: 5,
@@ -267,7 +267,7 @@ describe("verbatimPrompts is set by every exported options builder (#1563 M2)", 
   it("buildClaudeCrossCheckOptions", () => {
     const options = buildClaudeCrossCheckOptions({
       cwd: "/checkout", homeDir: "/home", oauthToken: OAUTH, log: nullLogger(),
-      secretPaths: ["/run/secrets/"], gate: { passed: true }, brief: "brief",
+      secretPaths: ["/tmp/uzi-synthetic-deny/"], gate: { passed: true }, brief: "brief",
     });
     assert.equal(options.verbatimPrompts, true);
   });
@@ -288,4 +288,28 @@ describe("verbatimPrompts is set by every exported options builder (#1563 M2)", 
       assert.equal(options.verbatimPrompts, true);
     });
   }
+});
+
+// A future Claude options builder must not silently omit the option. Every builder keeps the
+// literal `settingSources: []` (semgrep/settings-sources-isolation.yml), so each such literal in
+// agent/src must be followed by `verbatimPrompts: true` within the same object (issue #1563; a test,
+// not a Semgrep rule, by the issue's choice).
+describe("every settingSources: [] literal in agent/src is paired with verbatimPrompts: true (#1563)", () => {
+  it("finds the seven known builders and no unpaired literal", () => {
+    const srcDir = path.join(path.dirname(new URL(import.meta.url).pathname), "..", "src");
+    const files = fs.readdirSync(srcDir, { recursive: true, encoding: "utf8" }).filter((f) => f.endsWith(".ts"));
+    const sites: string[] = [];
+    const unpaired: string[] = [];
+    for (const rel of files) {
+      const lines = fs.readFileSync(path.join(srcDir, rel), "utf8").split("\n");
+      lines.forEach((line, i) => {
+        if (line.trim() !== "settingSources: [],") return;
+        sites.push(`${rel}:${i + 1}`);
+        const next = lines.slice(i + 1, i + 6).map((l) => l.trim());
+        if (!next.includes("verbatimPrompts: true,")) unpaired.push(`${rel}:${i + 1}`);
+      });
+    }
+    assert.deepEqual(unpaired, [], `settingSources: [] without verbatimPrompts: true at ${unpaired.join(", ")}`);
+    assert.equal(sites.length, 7, `expected the seven known Claude options builders, found ${sites.join(", ")}`);
+  });
 });
