@@ -4,6 +4,23 @@
 **Date**: 2026-10-07
 **Issue**: [vtmocanu/uzi#2417](https://github.com/vtmocanu/uzi/issues/2417)
 
+## Amendment 2026-10-29 — C1b pins do not authorize local retirement (#3591)
+
+[ADR-3591](3591-prerequisite-closure.md) adds API prerequisite pin retention
+without changing covering FINAL ACK authority. A pinned thin capture still
+cannot authorize archive FINAL, inventory retirement or physical source
+disposal. C2 release and its proof/permission work remain separate.
+
+C1a's available-entry/query guard and its rollback boundary above are unchanged.
+S7 prerequisite cleanup requires confirmed expired/discarded capture state,
+frozen binding, expected-tip CAS and confirmed absence. Available pins survive
+hold settlement by another route. Unknown creation is listing-only indefinitely;
+eight exhausted cleanup attempts retain the live pointer and removal blocker,
+then list with backoff capped at one hour. No manual delete, owner shortcut,
+database override, rebind or attempt reset is granted. The active-capture limit
+does not bound leaked pins or audit tombstones. Local lifecycle tests are
+documented in ADR-3591; hosted acceptance and timing remain open.
+
 ## Context
 
 A guarded generation can close custody with a durable API disposition while

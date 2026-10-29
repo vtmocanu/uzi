@@ -652,6 +652,150 @@ its `coverage_digest`; it does not provide a new server-side root list or
 prove Git ancestry. Preserve the downloaded bundle while reviewing which
 original head to land.
 
+## Prerequisite pins: API lifecycle, release still disabled
+
+C1b (#3591) implements the API pin lifecycle for qualifying new thin captures.
+It does **not** advertise `recovery_prerequisite_closure_v1`, change the agent,
+or permit a thin archive FINAL. Even a `pinned` response retains the existing
+custody and local-source rules. C2 owns release; C3 owns owner/CLI pin visibility.
+The parent #2506 remains active. See [ADR-3591](../adr/3591-prerequisite-closure.md)
+for the implementation and local evidence boundaries.
+
+### When a pin can be created
+
+Admission (S0) occurs in the upload transaction after verified bytes become
+available. It requires an open inventory-guarded hold, a bound manifest with
+1–64 prerequisites, the original authenticated uploading worker's registered
+`recovery_prerequisite_closure_v1` capability, and the configured reviewed
+forge strategy. Existing available receipts, upload retries and sweeps do not
+backfill rows. The current agent does not advertise this capability.
+
+`UZI_PREREQUISITE_CLOSURE_FORGES` defaults to empty. Its parser accepts
+comma-separated `github`, `gitlab`, and `forgejo` (trimmed, lowercased,
+deduplicated; empty entries ignored); an unknown kind refuses API boot.
+Syntax acceptance is not forge support: actual S0 admission currently requires
+`github` and base URL `https://github.com` (trailing slashes normalized).
+The reviewed E2 probe covered one GitHub credential/repository configuration;
+GitHub Enterprise, other forges, rulesets and protected configurations need
+their own reviewed probe before enablement. Local synthetic driver tests do
+not establish live provider compatibility.
+
+The API reads a fresh default-tip D from the same bounded advertisement that
+proves the target ref absent, then positively proves **each declared**
+prerequisite P is an ancestor of or equal to D. It creates
+`refs/uzi-prereq/<capture-id>` at D, create-only, with no run-content pack.
+D must remain compatible with the forge's workflow/policy checks at send time;
+a workflow-tree change can cause refusal. There is no retry at a new D after
+the durable invocation marker.
+
+The marker freezes connection identity, forge kind, normalized base URL,
+project ID, default branch and pin tip, against the immutable capture/hold,
+checksum and prerequisite list. A changed binding grants no rebind or resend.
+A matching read-back establishes `pinned`; explicit refusal plus confirmed
+absence establishes `pin_refused`; ambiguity becomes `create_unknown`.
+A crash after the marker can leave an unknown even if nothing was sent.
+
+### What pinning proves
+
+This is the conditional trusted-worker T1–T5 proof:
+
+| Fact | Boundary |
+|---|---|
+| T1 | The trusted worker produces/verifies the bundle and records its actual header prerequisites. |
+| T2 | The API checks byte length/checksum and binds the immutable manifest. It does not parse, apply or verify Git bundle contents. |
+| T3 | The forge positively proves every declared P ancestor/equal to fresh D. Undeclared dependencies are outside that proof. |
+| T4 | Create-only pinning and read-back observe the ref at frozen D. |
+| T5 | Exact capture/hold binding and uzi's cleanup rules retain the pin while its archive is available. Future FINAL-time observation/revalidation belongs to C2. |
+
+A pin cannot repair an incorrect worker declaration. Native restore tests
+include an omitted second prerequisite: the declared prerequisite is fetched,
+but bundle verification/import still fails naming the omitted one. No
+independent server bundle-validity or per-capture restore claim follows.
+
+### Restoring with a confirmed pin
+
+For an exact capture whose pin has been independently identified and confirmed
+at its recorded tip, fetch that ref into the destination clone before the
+normal [bundle import](#importing-the-bundle):
+
+```sh
+git fetch origin refs/uzi-prereq/<capture-id>:refs/uzi-prereq/<capture-id>
+git bundle verify ../recovered.bundle
+git fetch ../recovered.bundle refs/heads/recovered-source:refs/heads/recovered-source
+git rev-parse recovered-source
+```
+
+Compare the restored SHA with the selected capture's recorded source, and
+inspect its original roots as above. These are native Git commands, not a new
+CLI pin-discovery or expiry command. Preserve retained source when verification
+fails or pin identity is unknown.
+
+Local tests exercise public sweep → production broker → real HTTP Git backend:
+after pinning D (a strict descendant of P), rewriting default history leaves a
+fresh `--no-local` clone missing P; fetching the pin permits verify/import and
+restores the exact source commit, tree and file. The no-pin control fails on P.
+A rewrite before preparation is refused without marker/send. These fixtures use
+fake persistence and native graph ancestry; separate LiveDB tests exercise
+upload/manifest/state/locking behavior. They are not a new live forge probe or
+a released-custody end-to-end test.
+
+### Unknown pins, cleanup and removal blockers
+
+`create_unknown` is listing-only indefinitely. Expected tip → commit `pinned`
+before any later cleanup; foreign tip → terminal `foreign`, untouched;
+absence or failed listing → retain the unknown and live removal blocker.
+Never resend, rebind, reset attempts, recreate/move the ref or clear its pointer
+because of elapsed time, archive expiry, storage pressure or owner action.
+
+S7 cleanup applies to `pinned` rows after the capture is confirmed `expired`
+or `discarded`. Under the frozen binding it lists the exact ref, CAS-deletes
+at the recorded expected tip, and confirms absence before recording `deleted`
+and clearing the live pointer. A foreign ref is untouched. An ambiguous delete
+keeps `pinned` and the pointer until a later successful absence listing.
+Settling a hold by another route does not clean an available archive's pin.
+
+After eight cleanup attempts, `cleanup_exhausted_at`/`pin_cleanup_exhausted`
+retain the pinned row and live blocker; further processing is listing-only,
+with backoff capped at one hour. A later confirmed absence can settle cleanup,
+but does not grant another delete attempt. This is a schedule cap, not a
+one-hour completion guarantee. Available-pin audits normally run at 24 hours;
+absence requires a different pass at least ten minutes later to become `lost`.
+Owner-facing pin diagnostics/CLI display remain C3 work; raw forge errors are
+not a worker status contract.
+
+The active-capture cap (default 256) excludes expired/discarded captures. It
+does not bound leaked pins, unresolved rows or permanent audit tombstones.
+Live pointers block run/repository/connection removal; terminal tombstones
+remain. O10 accepts unbounded total accumulation with bounded processing:
+one forge-work slot per API process, ten-second pass, up to five items, an
+eight-second item budget and an absolute outcome tail up to five seconds.
+These bounds do not promise production latency or eventual resolution.
+
+### Operating an O10 backlog
+
+1. Turn the prerequisite-forge knob off through normal deployment configuration
+   to contain incoming S0 admission. This does not instantly cancel in-flight
+   upload transactions. Existing rows continue through the registered pass;
+   do not disable their reconciliation/cleanup or enlarge limits to hide backlog.
+2. Preserve archive bytes and diagnostics: exact capture/hold/row identity,
+   checksum, frozen binding, pin ref/tip, state, attempts and fresh observations.
+   Repair connectivity or credentials under that **same frozen identity**.
+   A changed binding is not permission to rebind, resend or reset a ceiling.
+3. Use the existing S7 route after confirmed capture expiry/discard. Available
+   pins are not capacity-reclamation targets. For unknowns, wait for S4's
+   durable positive observation before cleanup; absent unknowns may block forever.
+4. Escalate unresolved accumulation as a separate maintainer contract decision.
+   This runbook grants no manual forge-delete procedure, database override,
+   pointer clearing, attempt reset or owner/custodian-authorization shortcut.
+   Repository-write access does not authorize product capture disposal.
+
+External history/privacy purges are outside this procedure. Pins under
+`refs/uzi-*`, including `refs/uzi-prereq/*`, can keep pre-purge history reachable.
+An external writer deleting pins or rewriting their history can defeat restore;
+this is ADR-1296's accepted external-writer residual, not authorization to purge
+or erase server evidence. No eventual-cleanup or bounded-storage guarantee is
+made.
+
 ## Limits
 
 These are the shipped defaults. Every one below except the last is an

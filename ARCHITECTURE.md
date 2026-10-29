@@ -1749,6 +1749,30 @@ chain in the diagram above, with no intervening `running`.
   when even reclaiming them all would not fit); the reclaim itself, of expired
   then oldest finished-job files, runs when the verified upload is recorded
   (see [adr/1909-stored-file-budget.md](adr/1909-stored-file-budget.md)).
+- **Prerequisite closure pins (C1b, #3591)** — API-only lifecycle for new
+  qualifying guarded thin captures, not thin archive custody release.
+  Recovery upload commits S0 with availability using the original authenticated
+  worker's registered capability and the reviewed GitHub.com strategy; receipts
+  and sweeps do not backfill. The worker-service lane reads fresh default D,
+  proves every declared P ancestor/equal to D, freezes binding under DB locks,
+  then creates `refs/uzi-prereq/<capture-id>` at D with an empty pack outside
+  transactions. This adds no worker credential or server bundle parser.
+  Unknown creation is listing-only indefinitely, never resent or rebound.
+  Capture-locked S7 requires expired/discarded, exact-tip CAS and confirmed
+  absence; eight exhausted cleanup attempts retain the live removal blocker
+  and continue listings with at most one-hour backoff. Unknowns, leaked pins
+  and tombstones have no total inventory bound under O10; active capture quotas
+  do not bound them. Knob-off contains incoming S0 while existing rows continue
+  through the always-registered bounded pass (one I/O slot/process, ten-second
+  pass plus absolute outcome tail up to five seconds).
+  T1–T5 is a conditional trusted-worker preservation proof; native omission
+  negatives demonstrate that pinning does not verify bundle validity.
+  External pin deletion/history rewrite remains ADR-1296's accepted residual.
+  C1b advertises no feature, changes no agent and still refuses pinned thin
+  FINALs. C2 release, C3 visibility and hosted exact-head/timing acceptance
+  remain pending. See [ADR-3591](adr/3591-prerequisite-closure.md),
+  [PRD-2506 current execution](prds/2506-prerequisite-closure.md#c1b-current-execution-2026-10-29-child-3591)
+  and the [O10 runbook](docs/run-recovery.md#operating-an-o10-backlog).
 - **Milestone tracker reconciliation** (PRD #122/#265/#390) — a milestone-structured
   `issue` run shows a *reported-complete* tracker (`runs.milestones_completed`,
   monotone union, never "verified"), fed by mid-run `report_progress` and the lead's
