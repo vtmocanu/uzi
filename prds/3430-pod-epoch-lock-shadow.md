@@ -365,7 +365,7 @@ The full audit, with READ / INFERRED / NOT READ markings and source references, 
 - **Not verified:**
   - installed conmon and crun packages, `/proc` options, NRI plugins, the storage class's attach enforcement;
   - the audit's inference that conmon's `container_pid` probe runs in the host pid namespace;
-  - the el10 kernel backport.
+  - the running kernel build's identity against the audited source. The exact `kernel-6.12.0-243.el10` source tag now has the same audited exit/PID/procfs guarantees (2026-10-29 source extension); other kernel builds remain unaudited.
 
   These are acceptance prerequisites, not residuals.
 

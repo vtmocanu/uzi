@@ -15,7 +15,7 @@ Read-only source audit. Markings: **READ** = read in source at the pinned tag; *
 | conmon | `v2.2.1` primary; function-level comparison `v2.1.0`, `v2.1.8`, `v2.1.10`, `v2.1.12`, `v2.1.13`, `v2.2.0` | |
 | crun | `1.30.1` primary; `1.28` namespace/state-output re-read; function-level comparison `1.26`, `1.27`, `1.28`, `1.29.1` | 1.28 commit `54f16ffbefcd022bf032af768b5c5ce075c18bfc`; 1.30.1 commit `079ff6a7a16d029460af882f9ea44674e6a510b6` |
 | kubelet | `k8s.io/kubernetes v1.35.3` (`pkg/kubelet`, `pkg/features`) | |
-| Linux | upstream `v6.12`: `kernel/exit.c`, `kernel/pid_namespace.c`, `fs/proc/base.c`, `fs/proc/array.c`, `fs/seq_file.c` | the el10 `6.12.0-*` backport tree was NOT READ |
+| Linux | upstream `v6.12` (`adc218676eef25575469234709c2d87185ca223a`) and CentOS Stream 10 `kernel-6.12.0-243.el10` (`0b8a0810bb0046bdee2b6b4a2ff2538ec523881f`) | exit/PID teardown, procfs, seq-file and populated-cgroup removal paths compared 2026-10-29; see the el10 extension below |
 | CentOS Stream 10 dist-git | `gitlab.com/redhat/centos-stream/rpms/crun` branch `c10s` (head `5471d4c`, 2026-09-25); `.../rpms/conmon` branch `c10s` (head `37f945c`, 2026-05-29) | |
 
 **Versions on a target cluster's nodes: not determined.**
@@ -68,11 +68,11 @@ Read-only source audit. Markings: **READ** = read in source at the pinned tag; *
 - `libcrun_container_kill` signals init only (`libcrun_kill_linux`).
 - CRI-O sends SIGKILL to all processes (`signalContainer(..., all=true)`) only for `nodeLevelPIDNamespace()` (`runtime_oci.go:UpdateContainerStatus`).
 
-**Kernel v6.12** (READ):
+**Kernel v6.12 and el10 6.12.0-243.el10** (READ; per-function comparison below):
 - `kernel/exit.c:exit_notify` calls `forget_original_parent`, then `find_child_reaper`. When the exiting task is the namespace's `child_reaper` and no other thread is alive, `find_child_reaper` calls `zap_pid_ns_processes(pid_ns)`. Only *after* that does `exit_notify` set `tsk->exit_state = EXIT_ZOMBIE`.
 - `kernel/pid_namespace.c:zap_pid_ns_processes` disables pid allocation, sends SIGKILL to every pid in the namespace's idr (descendant-namespace tasks have a pid there too), reaps, then sleeps until `pid_allocated == init_pids`.
-- **So once init is a zombie or gone, every other process of that pid namespace and its descendants is gone.** This does not depend on conmon having reaped it.
-- That the el10 backport keeps this is INFERRED.
+- **The namespace init's last live thread completes namespace teardown before its `EXIT_ZOMBIE` transition.** A zombie group leader alone is insufficient while other threads remain: `find_child_reaper` can transfer the reaper to a live thread, and `wait_consider_task` delays reaping the leader until its threads are gone. Conmon's wait/reap or host-PID ESRCH evidence therefore follows namespace teardown.
+- The el10 source preserves this ordering (READ).
 
 ## Q1-follow-up (item 1). Private pid namespace for pods without hostPID or shareProcessNamespace: proven
 
@@ -140,7 +140,7 @@ Exhaustive search of non-vendor, non-test CRI-O for `Status = ContainerStateStop
 | Route | Runtime-state evidence | Exit-file provenance | Init exit |
 |---|---|---|---|
 | C1 | `crun state` "stopped" (pid ESRCH, zombie or `X`, start-time mismatch, or the item-3 cases) | conmon `waitpid` returned `container_pid`; value is `WEXITSTATUS` or `128+sig` (≥ 0) | **Proven (READ):** waitpid only returns a terminated child, which is past `exit_notify`, so `zap_pid_ns_processes` has already run |
-| C2 | `crun state` "stopped" | conmon v2.2.x ESRCH probe, value **0** | **Proven (READ + INFERRED):** ESRCH means no task holds that pid, so init was released, which follows `exit_notify`. That `release_task` frees the pid is INFERRED (not re-read). That `container_pid` is a host-pidns pid (crun's pidfile, read by conmon in the host pid ns) is INFERRED |
+| C2 | `crun state` "stopped" | conmon v2.2.x ESRCH probe, value **0** | **Proven (READ + INFERRED):** ESRCH means no task holds that pid, so init was released, which follows `exit_notify`. The `release_task` → `__exit_signal` → `__unhash_process` → `detach_pid`/`__change_pid` → `free_pid` chain was re-read in both kernels: it removes task PID associations and removes the numeric PID from each namespace IDR when no PID-type users remain (READ; el10 extension below). That `container_pid` is a host-pidns pid (crun's pidfile, read by conmon in the host pid ns) is INFERRED |
 | B1 | `crun state` **errors** (state dir missing, `kill` EPERM, `/proc` open error, etc.) | as C1 | **Proven (READ)**, same as C1. The `crun state` error is irrelevant to the proof |
 | B2 | `crun state` errors | as C2 | **Proven**, same as C2 |
 | C3 / B3 | either | value **-1** (ECHILD with no pid, other kill errno, timeout) | **Not proven.** Under conmon v2.1.x ECHILD can quit while init is alive. Refuse all negatives |
@@ -193,10 +193,10 @@ Exhaustive search of non-vendor, non-test CRI-O for `Status = ContainerStateStop
 - **read errors:** `proc_single_show` returns **ESRCH** only when `get_pid_task` finds no task, i.e. the task was released (genuinely gone). `do_task_stat` (`fs/proc/array.c`) has no error return (READ). `fs/seq_file.c:seq_read_iter` can return **ENOMEM** when `seq_buf_alloc` fails (READ).
   - **So a read-time ENOMEM on a live pid makes crun report "stopped".** That is plausible only under severe memory pressure, or if the crun process itself is the OOM victim (INFERRED likelihood).
 - **cgroup branch** (`container.c:libcrun_get_container_state_string`, READ): with the pid alive, an ENOENT/ENODEV reading `cgroup.freeze` means **stopped**.
-  - On cgroup v2 a populated cgroup cannot be removed, so this needs init to have migrated out of its cgroup, which takes a privileged actor (INFERRED; kernel cgroup rmdir NOT READ).
+  - On cgroup v2, `cgroup_destroy_locked` rejects a populated cgroup with EBUSY (READ in both kernels; extension below). This does not mean every still-present PID keeps a cgroup populated: `cgroup_exit` removes accounted task membership before `exit_notify`, so exit accounting as well as migration can permit removal before PID release. A missing freeze file alone is not termination proof.
   - crun 1.29.1 and earlier also short-circuit an empty cgroup path to "not paused". 1.30.1 instead normalizes an empty status path to NULL (commits `d150477d`, `d43a070f`; INFERRED equivalent).
 
-**Plainly:** yes, `crun state` can report a live init as "stopped", via proc ENOMEM, via `hidepid=2/4` with ptrace denied, or via a cgroup migrated out.
+**Plainly:** yes, `crun state` can report a live init as "stopped", via proc ENOMEM, via `hidepid=2/4` with ptrace denied, or via an empty/deleted cgroup.
 
 **Impact on the guarantee:**
 - In each case conmon is still waiting on init, so **no exit file exists**. CRI-O takes **route D: exit -1, Error**. If `crun state` instead errored, it takes **route B4: 255**.
@@ -310,7 +310,7 @@ This holds even when `crun state` misreports a live init as stopped (item 3), be
 1. An **NRI plugin** replacing the pid namespace (operator-installed). Defer if any NRI plugin is present, or treat it as an operator residual.
 2. **Ephemeral containers** without a target: add an `ephemeralContainerStatuses` check.
 3. A **deliberate escape** or a privileged cgroup migration: an accepted PRD residual. It also cannot yield a file of 0 or more without init exiting.
-4. **el10 kernel backport and actual node RPM versions**: NOT verified.
+4. **Actual node RPM versions and identity of the running kernel build**: require operator verification. The exact el10 source tag was compared below; this does not attest a target node or a reproducible binary build.
 5. **conmon-rs, runtimeVM, the runc handler under CRI-O, and CRI-O versions other than v1.36.2**: NOT READ. Those must defer.
 
 **Allowlist changes needed for CRI-O + crun:**
@@ -320,9 +320,92 @@ This holds even when `crun state` misreports a live init as stopped (item 3), be
 - Add the `ephemeralContainerStatuses` check.
 - Gate on a declared runtime of "CRI-O 1.36.2, `runtime_type` oci (conmon v2.1.10 to v2.2.1), crun 1.28 or 1.30.1 default handler, kubelet 1.35.3, no `runtimeClassName`, no NRI plugin that adjusts namespaces".
 
+### el10 kernel extension (2026-10-29, READ)
+
+Compared upstream v6.12 commit `adc218676eef25575469234709c2d87185ca223a`
+with CentOS Stream 10 tag `kernel-6.12.0-243.el10`, peeled commit
+`0b8a0810bb0046bdee2b6b4a2ff2538ec523881f` (tag object
+`afc3d38a5c41a3e8b8b44d1d767db54c404e2908`). This comparison uses the
+matching source tag, not an SRPM extraction. It extends the kernel source
+evidence only to this exact release. No audited termination-evidence property
+changes in the compared paths.
+
+Each link identifies the function's starting line at the pinned commit:
+
+| File and function | Upstream v6.12 | el10 6.12.0-243 | Comparison |
+|---|---|---|---|
+| kernel/exit.c: `exit_notify` | [L731](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/exit.c#L731) | [L734](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/exit.c#L734) | byte-identical |
+| kernel/exit.c: `forget_original_parent` | [L692](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/exit.c#L692) | [L695](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/exit.c#L695) | byte-identical |
+| kernel/exit.c: `find_child_reaper` | [L587](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/exit.c#L587) | [L590](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/exit.c#L590) | byte-identical |
+| kernel/exit.c: `find_alive_thread` | [L576](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/exit.c#L576) | [L579](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/exit.c#L579) | byte-identical |
+| kernel/exit.c: `wait_consider_task` | [L1423](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/exit.c#L1423) | [L1428](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/exit.c#L1428) | byte-identical |
+| kernel/exit.c: `release_task` | [L241](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/exit.c#L241) | [L242](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/exit.c#L242) | differs; explained below |
+| kernel/exit.c: `__exit_signal` | [L145](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/exit.c#L145) | [L146](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/exit.c#L146) | byte-identical |
+| kernel/exit.c: `__unhash_process` | [L126](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/exit.c#L126) | [L127](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/exit.c#L127) | byte-identical |
+| kernel/pid_namespace.c: `zap_pid_ns_processes` | [L170](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/pid_namespace.c#L170) | [L170](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/pid_namespace.c#L170) | byte-identical |
+| kernel/pid.c: `detach_pid` | [L370](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/pid.c#L370) | [L370](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/pid.c#L370) | byte-identical |
+| kernel/pid.c: `__change_pid` | [L346](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/pid.c#L346) | [L346](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/pid.c#L346) | byte-identical |
+| kernel/pid.c: `free_pid` | [L133](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/pid.c#L133) | [L130](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/pid.c#L130) | differs; explained below |
+| kernel/pid.c: `get_pid_task` | [L461](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/pid.c#L461) | [L461](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/pid.c#L461) | byte-identical |
+| fs/proc/base.c: `proc_pid_lookup` | [L3501](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/proc/base.c#L3501) | [L3509](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/fs/proc/base.c#L3509) | byte-identical |
+| fs/proc/base.c: `proc_pid_permission` | [L766](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/proc/base.c#L766) | [L766](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/fs/proc/base.c#L766) | byte-identical |
+| fs/proc/base.c: `has_pid_permissions` | [L746](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/proc/base.c#L746) | [L746](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/fs/proc/base.c#L746) | byte-identical |
+| fs/proc/base.c: `proc_single_show` | [L801](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/proc/base.c#L801) | [L801](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/fs/proc/base.c#L801) | byte-identical |
+| fs/proc/array.c: `do_task_stat` | [L467](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/proc/array.c#L467) | [L467](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/fs/proc/array.c#L467) | differs; explained below |
+| fs/seq_file.c: `seq_read_iter` | [L171](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/seq_file.c#L171) | [L171](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/fs/seq_file.c#L171) | byte-identical |
+| fs/seq_file.c: `seq_buf_alloc` | [L33](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/fs/seq_file.c#L33) | [L33](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/fs/seq_file.c#L33) | byte-identical |
+| kernel/cgroup/cgroup.c: `cgroup_rmdir` | [L6037](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/cgroup/cgroup.c#L6037) | [L6222](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/cgroup/cgroup.c#L6222) | byte-identical |
+| kernel/cgroup/cgroup.c: `cgroup_destroy_locked` | [L5965](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/cgroup/cgroup.c#L5965) | [L6148](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/cgroup/cgroup.c#L6148) | differs; explained below |
+| kernel/cgroup/cgroup.c: `cgroup_has_tasks` | [L355](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/cgroup/cgroup.c#L355) | [L393](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/cgroup/cgroup.c#L393) | byte-identical |
+| kernel/cgroup/cgroup.c: `cgroup_update_populated` | [L790](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/cgroup/cgroup.c#L790) | [L841](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/cgroup/cgroup.c#L841) | byte-identical |
+| kernel/cgroup/cgroup.c: `css_set_update_populated` | [L830](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/cgroup/cgroup.c#L830) | [L881](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/cgroup/cgroup.c#L881) | byte-identical |
+| kernel/cgroup/cgroup.c: `css_set_move_task` | [L870](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/cgroup/cgroup.c#L870) | [L921](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/cgroup/cgroup.c#L921) | byte-identical |
+| kernel/cgroup/cgroup.c: `css_set_populated` | [L766](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/cgroup/cgroup.c#L766) | [L817](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/cgroup/cgroup.c#L817) | byte-identical |
+| kernel/cgroup/cgroup.c: `cgroup_exit` | [L6760](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/kernel/cgroup/cgroup.c#L6760) | [L6978](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/kernel/cgroup/cgroup.c#L6978) | byte-identical |
+| include/linux/cgroup.h: `cgroup_is_populated` | [L556](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/include/linux/cgroup.h#L556) | [L580](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/include/linux/cgroup.h#L580) | byte-identical |
+
+**Differences and added hooks (READ):**
+
+- `release_task` adds `pidfs_exit(p)` before the unchanged unhash/freeing chain. [el10 fs/pidfs.c:535](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/fs/pidfs.c#L535) snapshots exit code/cgroup identity into a stashed pidfs inode; it does not detach a live task or bypass namespace teardown.
+- `free_pid` adds `pidfs_remove_pid(pid)` after the unchanged namespace-IDR removal loop. [el10 fs/pidfs.c:133](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-10/-/blob/0b8a0810bb0046bdee2b6b4a2ff2538ec523881f/fs/pidfs.c#L133) removes a pidfs inode-index entry. The namespace allocation-count decrement, reaper wakeups and numeric-IDR removal remain unchanged.
+- `do_task_stat` adds `PF_POSTCOREDUMP` to the permitted stack-pointer-reporting branch. Its process-state/start-time output and unconditional return 0 remain unchanged; this adds no read-time error or false-stopped path to crun's proc-stat interpretation.
+- `cgroup_destroy_locked` replaces a later BPF-offline call with a lifetime notifier and adds an error warning. Its populated/online-child EBUSY checks precede directory removal and are unchanged. The counter helpers above are byte-identical; the notifier change does not bypass populated-cgroup rejection.
+
+**Exit and PID-release property (READ):** `exit_notify` calls
+`forget_original_parent` before setting EXIT_ZOMBIE. When no live init thread
+remains, `find_child_reaper` calls `zap_pid_ns_processes`, which disables PID
+allocation, sends SIGKILL to namespace IDR tasks and waits until
+`pid_allocated == init_pids`. A still-live init thread instead becomes reaper;
+the identical `wait_consider_task` and `delay_group_leader` guard (upstream
+include/linux/sched/signal.h:734; el10:737) prevent ordinary leader reaping
+while subthreads remain. The read release/unhash/free chain establishes the
+numeric-PID removal used by the conmon ESRCH argument. A zombie leader alone
+is not sufficient evidence; the accepted conmon wait/reap or ESRCH paths remain
+the proof boundary.
+
+**Procfs/seq-file property (READ):** the four compared proc lookup/permission/show
+functions preserve hidepid/ptrace checks and the missing-task ESRCH result.
+`seq_read_iter` and `seq_buf_alloc` preserve allocation-failure ENOMEM handling.
+The do_task_stat difference does not change its return/error behavior or the
+fields crun reads. Capability/LSM policy itself was not newly audited.
+
+**Cgroup limit (READ):** rmdir rejects populated groups under cgroup_mutex, but
+population is accounting state, not proof that a PID no longer exists.
+`cgroup_exit` moves the task out of its css_set before `exit_notify` (upstream
+kernel/exit.c:951/959; el10:955/963); the source therefore does not justify the
+older "missing freeze file requires privileged migration" inference. Neither
+kernel makes a missing cgroup file sufficient for acceptance: the existing
+proof still requires conmon's genuine exit-file evidence and rejects synthetic
+negative/255 statuses.
+
+The source-tag comparison closes the previously unread el10 ordering, PID
+freeing and populated-cgroup-rmdir paths. It does not attest a target node's
+binary provenance or unrelated kernel code; no whole-kernel equivalence is
+claimed.
+
 ## Not read / not determined
 - The exact conmon, crun and cri-o RPMs in the OKD 4.22 SCOS node image, and the node `/proc` mount options (hidepid).
-- The el10 kernel source (only upstream v6.12 was read). Kernel cgroup v2 rmdir and `release_task` pid freeing were not re-read.
+- Kernel versions other than upstream v6.12 and the exact `kernel-6.12.0-243.el10` source tag; binary/source provenance on a target node, reproducible kernel builds, and unrelated kernel paths/configuration were not audited. Existing capability/LSM access inferences remain INFERRED.
 - The glibc `WIF*` decode of -1.
 - crun namespace creation and state output at versions other than 1.28 and 1.30.1.
 - conmon `conmon.c` before v2.1.10 beyond the exit section, and the v2.1.0 subreaper call.
