@@ -64,7 +64,8 @@ func readEffortDefaults(t *testing.T) effortDefaultsFixture {
 	return f
 }
 
-// markCase records a fixture case ID as exercised and fails on an empty or duplicate ID.
+// markCase records a fixture case ID as exercised (call it after the case's assertions)
+// and fails on an empty or duplicate ID.
 func markCase(t *testing.T, seen map[string]bool, id string) {
 	t.Helper()
 	if id == "" || seen[id] {
@@ -91,7 +92,6 @@ func TestEffortDefaultsFixtureOrdinary(t *testing.T) {
 	seen := map[string]bool{}
 	var ids []string
 	for _, c := range f.Ordinary {
-		markCase(t, seen, c.ID)
 		ids = append(ids, c.ID)
 		r := agenttmpl.ResolveHarnessEffort(c.Harness, c.Stored)
 		if r.Mode != c.Expect.Mode || r.Source != c.Expect.Source {
@@ -119,6 +119,7 @@ func TestEffortDefaultsFixtureOrdinary(t *testing.T) {
 			!reflect.DeepEqual(cell.ResolvedEffort, c.Expect.ResolvedEffort) || !reflect.DeepEqual(cell.Effort, c.Stored) {
 			t.Errorf("%s: cell = %+v", c.ID, cell)
 		}
+		markCase(t, seen, c.ID) // last: a skipped case stays unmarked
 	}
 	assertExercised(t, ids, seen)
 }
@@ -128,7 +129,6 @@ func TestEffortDefaultsFixtureValidators(t *testing.T) {
 	seen := map[string]bool{}
 	var ids []string
 	for _, c := range f.Validators {
-		markCase(t, seen, c.ID)
 		ids = append(ids, c.ID)
 		input := c.Input
 		got, err := validateDefaultEffort(&input)
@@ -144,6 +144,7 @@ func TestEffortDefaultsFixtureValidators(t *testing.T) {
 				t.Errorf("%s: stored = %+v, want %+v", c.ID, got, want)
 			}
 		}
+		markCase(t, seen, c.ID) // last: a skipped case stays unmarked
 	}
 	assertExercised(t, ids, seen)
 }
@@ -155,7 +156,6 @@ func TestEffortDefaultsFixtureChecker(t *testing.T) {
 	seen := map[string]bool{}
 	var ids []string
 	for _, c := range f.Checker {
-		markCase(t, seen, c.ID)
 		ids = append(ids, c.ID)
 		r := agenttmpl.ResolveCrossCheck(c.Family, nil, c.Pin, nil, nil)
 		if r.Effort != c.Expect.Effort || r.EffortSource != c.Expect.Source {
@@ -164,6 +164,7 @@ func TestEffortDefaultsFixtureChecker(t *testing.T) {
 		if c.Pin == nil && r.EffortSource != agenttmpl.CrossCheckDefaultSource {
 			t.Errorf("%s: unpinned source = %q", c.ID, r.EffortSource)
 		}
+		markCase(t, seen, c.ID) // last: a skipped case stays unmarked
 	}
 	assertExercised(t, ids, seen)
 }

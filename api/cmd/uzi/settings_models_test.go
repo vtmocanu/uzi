@@ -202,3 +202,14 @@ func TestSettingRowStoredRuntimeIsEffortOnly(t *testing.T) {
 		}
 	}
 }
+
+// RESOLVED follows the cell's mode, not the presence of resolved_effort.
+func TestEffortSettingRowsResolvedFollowsMode(t *testing.T) {
+	rows := effortSettingRows([]apitypes.EffortSettingCellDTO{
+		{Harness: "claude", Effort: strp("runtime"), DefaultEffort: "medium", ResolvedEffort: strp("high"), Source: "user_default", Mode: "runtime_default"},
+		{Harness: "codex", Effort: strp("high"), DefaultEffort: "medium", Source: "user_default", Mode: "explicit"},
+	})
+	if len(rows) != 2 || rows[0].Resolved != "runtime default (value not reported)" || rows[1].Resolved != "unknown" {
+		t.Fatalf("rows = %+v, want runtime default label for runtime_default and unknown for explicit without a level", rows)
+	}
+}

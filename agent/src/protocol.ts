@@ -17,11 +17,12 @@ import type { HarnessEffort } from "./harness.js";
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
 
-/** Compile-time two-way tie between the SDK's EffortLevel and HARNESS_EFFORTS: resolves to
- *  EffortLevel while the sets are equal, and to `never` (breaking every use) when either side drifts. */
-type SdkAlignedEffort = [EffortLevel] extends [HarnessEffort]
-  ? [HarnessEffort] extends [EffortLevel] ? EffortLevel : never
-  : never;
+/** Compile-time two-way tie between the SDK's EffortLevel and HARNESS_EFFORTS: this line fails
+ *  to typecheck when either side drifts. */
+const effortSetsAligned: [EffortLevel] extends [HarnessEffort]
+  ? [HarnessEffort] extends [EffortLevel] ? true : never
+  : never = true;
+void effortSetsAligned;
 
 /** Fresh, worker-only authority for one refresh candidate. */
 export interface PublicationContextRequest {
@@ -1003,14 +1004,14 @@ export interface ClaimConfig {
   /** The run owner's per-user default reasoning effort (PRD #617). When present it
    *  is applied to the SDK's top-level `Options.effort` for the main thread and
    *  inherited by the implement-turn/subagent options via the baseOptions spread. The
-   *  API now populates this for every issue/chat claim — the owner's explicit choice,
+   *  API populates this on issue/chat claims with the owner's explicit choice,
    *  or the uzi default `medium` for an owner who never chose (issue #1157); it is
-   *  absent only from an un-upgraded API, in which case the worker omits the key and
+   *  absent for a Runtime default preference (#3247) and from an un-upgraded API, in which case the worker omits the key and
    *  the SDK applies its own fallback (the worker adds no default of its own). Typed as
    *  the SDK's own EffortLevel so the worker tracks the SDK's closed set (mirror of the
    *  Go `agenttmpl.EffortLevels` and the web EffortSelect list — no shared source, keep
    *  in lockstep). */
-  default_effort?: SdkAlignedEffort;
+  default_effort?: EffortLevel;
   /** The run owner's AI-attribution opt-out (issue #916), read live per claim. When
    *  false, the worker suppresses the Agent SDK's Co-Authored-By: Claude commit trailer
    *  for this run. Always sent by an upgraded server (NOT null); absent on an older
@@ -1975,9 +1976,9 @@ export interface ChatClaimConfig {
   /** The owner's per-user default model (PRD #17); omitted when unset. */
   default_model?: string;
   /** The owner's per-user default reasoning effort (PRD #617); the API populates it
-   *  with the owner's choice or the uzi default `medium` (issue #1157), and it is
-   *  optional only for an un-upgraded API. */
-  default_effort?: SdkAlignedEffort;
+   *  with the owner's choice or the uzi default `medium` (issue #1157); it is
+   *  absent for a Runtime default preference (#3247) and from an un-upgraded API. */
+  default_effort?: EffortLevel;
 }
 
 // ── Chat agent read surface (PRD #39 M3, Decision 7) ─────────────────────────

@@ -57,6 +57,8 @@ for (const [label, kind, claim] of LANES) {
         const warns = (lines as Array<{ level: string; msg: string }>).filter((l) => l.level === "warn"
           && l.msg.includes("default_effort"));
         assert.equal(warns.length, 1);
+        assert.match(JSON.stringify(warns[0]), new RegExp(`"run_id":"${String((body as { run_id?: unknown }).run_id)}"`));
+        assert.match(JSON.stringify(warns[0]), new RegExp(`"kind":"${kind}"`));
         if (typeof bad === "string" && bad !== "") assert.ok(!JSON.stringify(lines).includes(bad));
       });
     }
