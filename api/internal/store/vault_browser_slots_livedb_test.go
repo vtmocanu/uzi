@@ -516,20 +516,9 @@ func bsNewPublicationRace(t *testing.T, f bsFixture) (*vault.Vault, *bsPublicati
 		waiting: make(chan struct{}, 1),
 	}
 	t.Cleanup(func() {
-		cancel()
-		r.resume()
-		joined := make(chan struct{})
-		go func() {
-			r.work.Wait()
-			close(joined)
-		}()
 		timer := time.NewTimer(10 * time.Second)
 		defer timer.Stop()
-		select {
-		case <-joined:
-		case <-timer.C:
-			t.Error("publication race cleanup join deadline")
-		}
+		r.cleanup(cancel, timer.C, func(message string) { t.Error(message) })
 	})
 	var paused atomic.Bool
 	v := bsWrappedAfterCommit(f, func(q vault.BrowserStore) vault.BrowserStore { return q }, false,
@@ -554,6 +543,90 @@ func bsNewPublicationRace(t *testing.T, f bsFixture) (*vault.Vault, *bsPublicati
 			}
 		}))
 	return v, r
+}
+
+func (r *bsPublicationRace) cleanup(cancel context.CancelFunc, deadline <-chan time.Time, report func(string)) {
+	cancel()
+	r.resume()
+	joined := make(chan struct{})
+	go func() {
+		r.work.Wait()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+	case <-deadline:
+		report("publication race cleanup join deadline")
+	}
+}
+
+func TestVaultBrowserPublicationCleanupDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &bsPublicationRace{ctx: ctx, release: make(chan struct{})}
+	stopWorker, workerStarted, workerDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	cleanupDone := make(chan struct{})
+	cleanupStarted := false
+	r.work.Add(1)
+	go func() {
+		defer r.work.Done()
+		close(workerStarted)
+		<-stopWorker // Deliberately ignore request cancellation and publication release.
+		close(workerDone)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		close(stopWorker)
+		joinCtx, cancelJoin := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelJoin()
+		work := []<-chan struct{}{workerDone}
+		if cleanupStarted {
+			work = append(work, cleanupDone)
+		}
+		for _, done := range work {
+			select {
+			case <-done:
+			case <-joinCtx.Done():
+				t.Error("cleanup guard's controlled work did not stop")
+				return
+			}
+		}
+	})
+	watchdog := time.NewTimer(5 * time.Second)
+	defer watchdog.Stop()
+	select {
+	case <-workerStarted:
+	case <-watchdog.C:
+		t.Fatal("cleanup guard worker did not start")
+	}
+	expired := make(chan time.Time)
+	close(expired) // An event-driven deadline; passing tests never wait for a timer.
+	reported := make(chan string, 1)
+	cleanupStarted = true
+	go func() {
+		defer close(cleanupDone)
+		r.cleanup(cancel, expired, func(message string) { reported <- message })
+	}()
+	select {
+	case message := <-reported:
+		if message != "publication race cleanup join deadline" {
+			t.Fatalf("unexpected cleanup failure: %s", message)
+		}
+	case <-watchdog.C:
+		t.Error("cleanup ignored its expired deadline while work ignored cancellation")
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Error("cleanup did not cancel the request")
+	}
+	select {
+	case <-r.release:
+	default:
+		t.Error("cleanup did not release publication")
+	}
+	select {
+	case <-workerDone:
+		t.Error("cleanup deadline was not independent of unfinished work")
+	default:
+	}
 }
 
 func (r *bsPublicationRace) resume() { r.unpause.Do(func() { close(r.release) }) }
