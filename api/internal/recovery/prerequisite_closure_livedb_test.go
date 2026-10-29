@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -105,6 +106,12 @@ func TestRecoveryPrerequisiteClosureUploadLostACKLiveDB(t *testing.T) {
 	status, err := e.svc.Status(e.ctx, e.w, e.run, id)
 	if err != nil || status.PrerequisiteClosure == nil || status.PrerequisiteClosure.State != "pending" {
 		t.Fatalf("status %+v %v", status, err)
+	}
+	// Deterministically exercise the stream-loser receipt branch: a concurrent
+	// start alone may instead observe availability in the earlier admission step.
+	streamReceipt, err := e.svc.stream(e.ctx, e.w, e.run, id, m, bytes.NewReader(nil))
+	if err != nil || !reflect.DeepEqual(streamReceipt.PrerequisiteClosure, status.PrerequisiteClosure) {
+		t.Fatalf("stream-loser closure receipt: %+v want %+v: %v", streamReceipt.PrerequisiteClosure, status.PrerequisiteClosure, err)
 	}
 	after, err := e.q.GetPrerequisiteClosure(e.ctx, store.GetPrerequisiteClosureParams{UserID: e.w.UserID, CaptureID: id})
 	if err != nil || after.ID != before.ID || !after.UpdatedAt.Time.Equal(before.UpdatedAt.Time) || kicks != 1 {
