@@ -15,12 +15,12 @@ func (h *Handler) mountVaultRoutes(r chi.Router, authLimiter *mw.Limiter) {
 		r.Group(func(r chi.Router) {
 			// Session or CLI token; cookie POSTs still require CSRF. Authenticate
 			// before limiting so cookies and every token share the user's budget.
-			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Use(h.requireUser())
 			r.With(authLimiter.PerUserMiddleware).Post("/unlock", h.VaultUnlock)
 			r.Get("/status", h.VaultStatus)
 		})
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Use(h.requireAuth())
 			r.With(authLimiter.PerUserMiddleware).Post("/enable", h.VaultEnable)
 			r.With(authLimiter.PerUserMiddleware).Post("/disable", h.VaultDisable)
 			// Create-only passphrase for passwordless (OIDC) users (PRD #45).

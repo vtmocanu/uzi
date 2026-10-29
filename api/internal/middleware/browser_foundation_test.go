@@ -173,7 +173,7 @@ func TestRequireUserBearerIgnoresBrowserHook(t *testing.T) {
 	mw := RequireUser(st, authTestCfg(), func(*http.Request, store.User, *auth.Claims) { t.Fatal("bearer invoked browser hook") })
 	req := bearerRequest(context.Background(), token)
 	// Both credentials present still dispatch exclusively to Bearer.
-	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: "invalid-cookie"})
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: "invalid-cookie", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	rec := httptest.NewRecorder()
 	mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := ClaimsFromContext(r.Context()); ok {

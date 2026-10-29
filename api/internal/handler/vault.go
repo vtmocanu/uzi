@@ -41,7 +41,7 @@ func (h *Handler) VaultUnlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := h.vault.UnlockExisting(r.Context(), user.ID, req.Password)
+	err := h.interactiveVault(w, r, user, req.Password, vault.InteractiveExisting)
 	switch {
 	case err == nil:
 		h.vaultReady(r.Context(), user.ID)
@@ -50,7 +50,7 @@ func (h *Handler) VaultUnlock(w http.ResponseWriter, r *http.Request) {
 		// One response for both: whether a vault row exists is not something the
 		// unlock form should disclose, and it matches login's generic failure.
 		httpx.Error(w, http.StatusForbidden, "incorrect password")
-	case errors.Is(err, vault.ErrUncertainOutcome):
+	case errors.Is(err, vault.ErrUncertainOutcome), errors.Is(err, vault.ErrStaleAuth):
 		h.vaultToggleError(w, user.ID, err)
 	default:
 		slog.Error("vault unlock failed", "user", user.ID)
@@ -104,15 +104,11 @@ func (h *Handler) VaultPassphrase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.vault.Enable(r.Context(), user.ID, req.Passphrase); err != nil {
+	if err := h.interactiveVault(w, r, user, req.Passphrase, vault.InteractiveEnable); err != nil {
 		h.vaultToggleError(w, user.ID, err)
 		return
 	}
-	// A successful create+unlock lets the Codex poller read this user's linked accounts;
-	// poke so their account meters refresh within seconds (PRD #1209). Best-effort.
-	if h.codexUsagePoker != nil {
-		h.codexUsagePoker.Poke(user.ID)
-	}
+	h.vaultReady(r.Context(), user.ID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -125,9 +121,10 @@ func (h *Handler) VaultLock(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+	clearVaultSlot(w)
 	if h.vault != nil {
 		if err := h.vault.LockAndAcknowledge(r.Context(), user.ID); err != nil {
-			slog.Error("vault lock", "user", user.ID, "error", err)
+			slog.Error("vault lock", "owner", user.ID)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
@@ -194,7 +191,7 @@ func (h *Handler) VaultEnable(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := h.vault.Enable(r.Context(), user.ID, req.Password); err != nil {
+	if err := h.interactiveVault(w, r, user, req.Password, vault.InteractiveEnable); err != nil {
 		h.vaultToggleError(w, user.ID, err)
 		return
 	}
@@ -212,6 +209,7 @@ func (h *Handler) VaultDisable(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+	clearVaultSlot(w)
 	if err := h.vault.Disable(r.Context(), user.ID); err != nil {
 		h.vaultToggleError(w, user.ID, err)
 		return
@@ -225,7 +223,7 @@ func (h *Handler) VaultDisable(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) vaultReady(ctx context.Context, userID uuid.UUID) {
 	if h.wsvc != nil {
 		if err := h.wsvc.PromoteVaultLockedRecoveryWaitRuns(ctx, userID); err != nil {
-			slog.Error("vault ready: promote recovery waits", "user", userID, "error", err)
+			slog.Error("vault ready: promote recovery waits", "owner", userID)
 		}
 	}
 	h.requestCredentialPromotion(userID)
@@ -247,6 +245,8 @@ func (h *Handler) vaultToggleError(w http.ResponseWriter, userID uuid.UUID, err 
 		// Core supplies measured totals, limits, rollback confirmation and existing
 		// management UI guidance; it contains no credential material.
 		httpx.Error(w, http.StatusRequestEntityTooLarge, limit.Error())
+	case errors.Is(err, vault.ErrStaleAuth):
+		httpx.Error(w, http.StatusConflict, "authentication changed; retry")
 	case errors.Is(err, vault.ErrWrongPassword):
 		httpx.Error(w, http.StatusForbidden, "incorrect password")
 	case errors.Is(err, vault.ErrRequiredPolicy):

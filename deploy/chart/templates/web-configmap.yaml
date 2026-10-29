@@ -23,6 +23,9 @@ data:
         root /usr/share/nginx/html;
         index index.html;
 
+        # Do not inherit an image access-log format that could expose browser cookies.
+        access_log off;
+
         add_header X-Content-Type-Options nosniff always;
         add_header X-Frame-Options DENY always;
         add_header Referrer-Policy no-referrer always;

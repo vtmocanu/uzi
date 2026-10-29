@@ -37,7 +37,7 @@ func TestValidateCSRFTokenAllMethods(t *testing.T) {
 			t.Run(method+"/"+tc.name, func(t *testing.T) {
 				r := httptest.NewRequest(method, "/", nil)
 				if tc.cookie != "" {
-					r.AddCookie(&http.Cookie{Name: AuthCookieName, Value: tc.cookie})
+					r.AddCookie(&http.Cookie{Name: AuthCookieName, Value: tc.cookie, Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 				}
 				r.Header.Set(CSRFHeaderName, tc.header)
 				if got := ValidateCSRFToken(r); got != tc.want {

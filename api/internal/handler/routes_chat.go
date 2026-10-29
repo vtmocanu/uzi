@@ -19,14 +19,14 @@ func (h *Handler) mountChatRoutes(r chi.Router, chatLimiter, forgeLimiter *mw.Li
 	// the owner-scoped context ID; SelfUsage has no admin branch, outbound/forge
 	// call, or secret material.
 	r.Group(func(r chi.Router) {
-		r.Use(mw.RequireUser(h.q, h.cfg))
+		r.Use(h.requireUser())
 		r.Get("/usage", h.SelfUsage)
 	})
 
 	// Chat mints runs and stays cookie-only. The WS follow channel moved to its
 	// own /ws group (PRD #112 M1).
 	r.Group(func(r chi.Router) {
-		r.Use(mw.RequireAuth(h.q, h.cfg))
+		r.Use(h.requireAuth())
 
 		// In-app chat agent (PRD #39): conversations ride runs.kind='chat'. The
 		// live view reuses /api/ws + the /api/runs/{id}/messages replay (a chat run
