@@ -12,6 +12,7 @@ import {
   type TextareaHTMLAttributes,
 } from "react";
 import { Link } from "react-router-dom";
+import { forgeWaitLabel } from "../lib/forgeCooldown";
 import { effectiveRunStatus } from "../lib/runBadge";
 import type { RunProgress } from "../lib/apiTypes";
 import { ArrowLeftIcon, EyeIcon, EyeOffIcon } from "./icons";
@@ -633,7 +634,7 @@ export function StatusPill({ status: rawStatus, progress, recovery_wait_cause, r
 }) {
   const status = effectiveRunStatus({ status: rawStatus, recovery_wait_cause, recovery_retry_not_before });
   const cfg = RUN_STATUS_TONES[status] ?? { tone: "neutral" as BadgeTone };
-  const label = RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
+  const label = forgeWaitLabel({ status: rawStatus, recovery_wait_cause, recovery_retry_not_before }) ?? RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
   const showsProgress = status === "running" || status === "completion_checking" || status === "completion_reworking";
   const pct = showsProgress && progress?.state === "percent" &&
     typeof progress.pct === "number" && Number.isFinite(progress.pct)

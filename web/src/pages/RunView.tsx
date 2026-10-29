@@ -37,6 +37,8 @@ import { maskRepoPath } from "../lib/demoMask";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useNow } from "../lib/useNow";
 import { useMaintenance } from "../lib/useMaintenance";
+import { ForgeOriginStatus } from "../components/ForgeOriginStatus";
+import { forgeWaitMode, forgeWaitLabel } from "../lib/forgeCooldown";
 import { credentialSwitchHold } from "../lib/credentialSwitchHold";
 import {
   effectiveRunStatus,
@@ -345,6 +347,7 @@ export function HealthFlag({ run }: { run: Run }) {
   const primaryAdmission = !maintenance && !reserve && !queuedBlockerPrecedesCodexAdmission(run) ? admission : null;
   const reason = displayHealthReason(run);
   const show = !maintenance && !reserve && !primaryAdmission && shouldShowHealthFlag(run.health, run.status);
+  const queueAdvice = !maintenance && !reserve && !primaryAdmission && !show && run.status === "queued" ? reason : null;
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
   // Near timeout ("slow", PRD #1170) counts DOWN to run.deadline_at instead of the
   // since-flagged "stuck for Xm" every other flag keeps: `· 1h 5m left`, or `· stopping`
@@ -371,9 +374,10 @@ export function HealthFlag({ run }: { run: Run }) {
       ? reserveQueueText(run.reserve_hold_reason)
       : primaryAdmission ?? (show
         ? (healthFlagLabel(run.health) ?? "")
-        : "");
+        : queueAdvice ?? "");
   return (
     <>
+      {queueAdvice && <span className="text-xs text-warn">{queueAdvice}</span>}
       {primaryAdmission && (
         <span data-queue-reason={run.queue_reason} className="text-xs text-info">{primaryAdmission}</span>
       )}
@@ -1417,10 +1421,9 @@ function codexHoldCopy(
  * recovers or the owner cancels it (cancel is the separate Stop control, not offered
  * here — same rule as LimitWaitPanel's parked state).
  *
- * PRD #1392 M5: when the typed cause is `forge_unreachable` (the forge stayed unreachable
- * at clone) the panel swaps in forge-specific copy — "Waiting for the forge", the retry
- * time from `recovery_retry_not_before`, and the park count against its cap ("N of MAX",
- * or "N of unlimited" when `forge_park_max` is 0).
+ * Forge parks distinguish an explicit NULL owner hold, a timed automatic retry (even
+ * overdue), and missing timing from an older API. Counts are historical; cooldown advice
+ * neither verifies recovery nor grants execution authority.
  *
  * PRD #1590 D6: when the cause is `codex_account_unavailable` the panel swaps in the
  * per-action Codex copy from codexHoldCopy instead, with no retry time or park count.
@@ -1562,7 +1565,7 @@ function BaseAttestationHoldPanel({ run, ownerProof = false, busy = false, onCan
     <h2 className="text-sm font-semibold text-warn">Base unverified: waiting for owner</h2>
     <p className="mt-1 text-xs text-muted">This run requires its planned base commit, but no checkpoint attests that the retained work was produced on it. The agent was not started. The work and its custody are kept.</p>
     <p className="mt-1 text-xs text-muted">Nothing resumes this run automatically, and Resume and Extend are not available for this hold.</p>
-    <p className="mt-1 text-xs text-muted">Inspect custody with <code>uzi run recovery {run.id}</code>. Recover the work with <code>uzi run export {run.id} --output &lt;path&gt;</code>, or start a successor run. Discarding held custody stays a separate explicit action.</p>
+    <p className="mt-1 text-xs text-muted">Inspect custody with <code>uzi run recovery {run.id}</code>. Only if a verified available recovery archive exists, export it with <code>uzi run export {sanitizeLabel(run.id)} --output &lt;path&gt;</code>. Local-only work stays protected on its worker; a successor does not guarantee recovery of uncaptured edits. Discarding held custody stays a separate explicit action.</p>
     {ownerProof ? <div className="mt-3 flex gap-2">
       <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
     </div> : <p className="mt-2 text-xs text-muted">Only the run owner can cancel this hold.</p>}
@@ -1589,6 +1592,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
   // the null/untyped transient-interruption park, issue #1197/#1088) keeps the generic copy.
   const providerPark = run.recovery_wait_cause === "provider_outage";
   const forgePark = run.recovery_wait_cause === "forge_unreachable";
+  const forgeMode = forgeWaitMode(run);
   // Issue #1766: a vault_locked park waits for the run owner's vault to be unlocked; it
   // explicit unlock queues it promptly, and the timer remains the fallback (#1792).
   const vaultPark = run.recovery_wait_cause === "vault_locked";
@@ -1626,7 +1630,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
             : providerPark
               ? "Waiting for the provider"
             : forgePark
-              ? "Waiting for the forge"
+              ? forgeWaitLabel(run)
               : vaultPark
                 ? "Waiting for vault unlock"
                 : diskPark
@@ -1657,12 +1661,25 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
         ) : forgePark ? (
           <>
             <p className="mt-0.5 text-xs text-muted">
-              This run paused because the forge was unreachable when it went to clone. It
-              retries on its own on a capped backoff — no action is needed. If it never
-              recovers it holds here so you can cancel it.
+              {forgeMode === "held"
+                ? "The finite automatic forge recovery allowance is exhausted. This owner hold has no scheduled retry. Only the run owner can Resume or Cancel."
+                : forgeMode === "timed"
+                  ? "The forge was unreachable. Retries automatically after the scheduled time, including when already due; a due retry may still be waiting for admission."
+                  : "The forge was unreachable. Retry timing is unavailable; this does not establish an owner hold or an automatic retry date."}
             </p>
             <p className="mt-1.5 text-xs text-muted">
-              {retryAt ? `Retry at ${retryAt} (${parkLabel}).` : `Attempt ${parkLabel}.`}
+              {retryAt ? `Retry at ${retryAt}. ` : ""}Forge parks: {parkLabel}. The count and allowance are unchanged by Resume.
+            </p>
+            {forgeMode === "held" && <>
+              <p className="mt-1.5 text-xs text-muted">Resume permits one bounded ordinary attempt; it does not promise execution or reset counts, custody or grants. Origin cooldown, manual cordon, a custody limit of 1, or saturated capacity may still block admission.</p>
+              {run.health_reason && <p className="mt-1.5 text-xs text-muted">Admission: {displayHealthReason(run)}</p>}
+              {ownerProof ? <div className="mt-3 flex flex-wrap gap-2">
+                <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+                <Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>Cancel</Button>
+              </div> : <p className="mt-1.5 text-xs text-muted">Only the confirmed run owner can Resume or Cancel.</p>}
+            </>}
+            <p className="mt-1.5 text-xs text-muted">
+              Local-only work and custody remain protected. Export requires a verified available recovery archive; an old checkpoint does not prove that the latest local edits are recoverable elsewhere.
             </p>
           </>
         ) : vaultPark ? (
@@ -1682,7 +1699,9 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
           </>
         )}
         <p className="mt-1.5 text-xs text-muted">
-          {vaultPark
+          {forgePark
+            ? "A worker heartbeat or an OK health flag does not verify forge reachability. Retry eligibility is not proof of recovery."
+            : vaultPark
             ? "The run saved its work before parking; resume uses that recovery data."
             : diskPark
               ? // PRD #1809: a disk park frees space on the worker, so the generic "keeps its
@@ -1839,7 +1858,8 @@ export function RunView() {
   // Issue #3181: the token-switch holds are owner decisions too (Resume / Cancel).
   const switchHeld = run != null && credentialSwitchHold(run) !== null;
   const retainedRecovery = run?.status === "recovery_wait" && (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed");
-  const ownerDecisionHold = retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
+  const forgeHeld = run != null && forgeWaitMode(run) === "held";
+  const ownerDecisionHold = forgeHeld || retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
   const canSteer = optimisticCanSteer && (!ownerDecisionHold || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
   const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
@@ -1943,7 +1963,7 @@ export function RunView() {
     setBusy(false);
   };
   const resumeWorkerHold = async () => {
-    if (!canSteer || !(workerExhausted || memoryHeld || retainedRecovery) || run?.id !== id) return;
+    if (!canSteer || !(forgeHeld || workerExhausted || memoryHeld || retainedRecovery) || run?.id !== id) return;
     const requestRunId = id;
     const isCurrent = startAction();
     try {
@@ -2226,7 +2246,7 @@ export function RunView() {
   // stable key ("pool_wait"), since a pool hold has no per-instance identity to
   // re-announce on the way awaiting_input keys on the question.
   // Issue #1197: recovery_wait announces here for the SAME reason as pool_wait — it
-  // is a non-terminal, self-resuming hold with no ActivityFeed message backup (unlike
+  // is a non-terminal recovery park with no ActivityFeed message backup (unlike
   // limit_wait, whose run message ActivityFeed's polite region narrates), so this
   // always-mounted region is its only reliable announcement. RecoveryWaitPanel mounts
   // in the same tick as its content, and a region created with its first content is
@@ -2259,6 +2279,8 @@ export function RunView() {
                   // transient interruption, so it gets its own stable key and sentence.
                   run.recovery_wait_cause === "data_volume_full"
                   ? "data_volume_full"
+                  : run.recovery_wait_cause === "forge_unreachable"
+                    ? `forge:${forgeWaitMode(run)}`
                   : run.recovery_wait_cause === "provider_outage"
                     ? "provider_outage"
                   : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed")
@@ -2312,6 +2334,12 @@ export function RunView() {
             ? "Worker memory pressure. Only the run owner can resume or cancel this hold. Resume starts a fresh memory episode. There is no scheduled retry."
           : parkKey === "provider_outage"
             ? "The provider is unavailable. Retries automatically. If a provider recovery bound is enabled and reached, the run enters an owner hold."
+          : parkKey === "forge:held"
+            ? "Forge recovery needs your decision. Only the run owner can Resume or Cancel. There is no scheduled retry. Resume permits one bounded ordinary attempt without promising execution or resetting counts, custody or grants."
+          : parkKey === "forge:timed"
+            ? "Forge retry scheduled. Retries automatically after the scheduled time, including when already due. Admission may still block execution; forge recovery is unverified."
+          : parkKey === "forge:unknown"
+            ? "Forge retry timing is unavailable. An owner hold or automatic retry date cannot be inferred."
           : parkKey === "recovery_wait"
             ? "This run paused to recover from a transient interruption and will resume automatically."
             : parkKey === "vault_locked"
@@ -2473,7 +2501,7 @@ export function RunView() {
               <span ref={statusRef} tabIndex={-1} className="rounded-md focus-visible:ring-2 focus-visible:ring-brand/60 focus:outline-none">
                 {pillStatus === "provider_unavailable" || pillStatus === "provider_outage"
                   ? <Badge tone="warning" dot>{parkLabel(run)}</Badge>
-                  : <StatusPill status={pillStatus} />}
+                  : <StatusPill status={pillStatus} recovery_wait_cause={run.recovery_wait_cause} recovery_retry_not_before={run.recovery_retry_not_before} />}
               </span>
               {/* PRD #320 M6: the queue-priority pill + the owner's Expedite/undo action.
                   Both are QUEUED-ONLY (the pill self-hides on any other status; the action
@@ -2939,6 +2967,7 @@ export function RunView() {
 
 
       <PoolWaitPanel run={run} canSteer={canSteer} onResumed={refreshRun} />
+      <ForgeOriginStatus cooldown={run.forge_origin_cooldown} />
       <RecoveryWaitPanel
         run={run}
         ownerProof={canSteer && confirmedOwner === true}
@@ -3139,7 +3168,7 @@ export function RunView() {
           nothing for every other kind. */}
       <JobResultPanel run={run} />
 
-      {(!(workerExhausted || memoryHeld || retainedRecovery) || canSteer) && <RecoveryArchivesPanel run={run} />}
+      {(!(forgeHeld || workerExhausted || memoryHeld || retainedRecovery) || canSteer) && <RecoveryArchivesPanel run={run} />}
 
       {/* Checkpoint salvage (PRD #1867): the bounded archive copy of a failed run's last
           published checkpoint at refs/uzi-salvage/<run-id>. Renders only for a failed run

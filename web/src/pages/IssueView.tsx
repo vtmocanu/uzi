@@ -554,7 +554,7 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunSummaryItem; projectWeb
       </div>
       <div className="flex items-center gap-2">
         <Badge tone={runStatusTone(effectiveRunStatus(run), run.stop_kind, run.fail_origin)}>
-          {stopped ? "stopped" : isRejectedRun(run.status, run.fail_origin) ? "rejected" : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed") ? parkLabel(run) : effectiveRunStatus(run).replace("_", " ")}
+          {stopped ? "stopped" : isRejectedRun(run.status, run.fail_origin) ? "rejected" : (run.recovery_wait_cause === "forge_unreachable" || run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed") ? parkLabel(run) : effectiveRunStatus(run).replace("_", " ")}
         </Badge>
         {/* Every run here is the viewer's own (the endpoint is owner-scoped), so
             the run view is always reachable — no is_mine gate needed. */}

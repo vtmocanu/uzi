@@ -969,8 +969,11 @@ export const runsApi = {
     if (!run) throw new ApiError(404, "run not found");
     if (id.startsWith("run-memory-hold") && mockScenario() === "memory-hold-nonowner")
       throw new ApiError(404, "run not found");
+    if (id.startsWith("run-forge-") && mockScenario() === "forge-hold-nonowner")
+      throw new ApiError(404, "run not found");
+    const forgeHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "forge_unreachable" && run.recovery_retry_not_before === null;
     const memoryHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
-    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld)
+    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld)
       throw new ApiError(409, `run is ${run.status}`);
     // Issue #3181: mirrors the server's ErrRunHoldSettling refusal; an unsettled hold resumes.
     const switchHold = credentialSwitchHold(run);
@@ -983,6 +986,9 @@ export const runsApi = {
         ? { hold_reason: null, reserve_exempt_until: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString() }
         : {}),
       // The held-only projection disappears on Resume; the API owns the fresh episode.
+      ...(forgeHeld ? { recovery_wait_cause: null, recovery_retry_not_before: null,
+        health_reason: "Owner resumed one bounded forge attempt; origin cooldown and other admission limits may still block execution.",
+      } : {}),
       ...(memoryHeld ? { memory_hold: undefined, recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
       ...(switchHold === "unsettled" ? { hold_reason: null, status_since: new Date().toISOString() } : {}),
       ...(run.hold_reason === "provider_unavailable" ? {
@@ -1017,6 +1023,8 @@ export const runsApi = {
   // SteerQueueCard renders every chip). A run with no sample inputs returns an empty
   // queue; a missing run 404s (which the card treats as "no queue", never an error).
   getRunInputs: async (id: string) => {
+    if (id.startsWith("run-forge-") && mockScenario() === "forge-hold-nonowner")
+      throw new ApiError(404, "run not found");
     if (id.startsWith("run-memory-hold") && mockScenario() === "memory-hold-nonowner")
       throw new ApiError(404, "run not found");
     if (!getRun(id)) throw new ApiError(404, "run not found");
@@ -1139,6 +1147,8 @@ export const runsApi = {
     reset?: MilestoneResetOptions,
   ) => {
     if (id.startsWith("run-memory-hold") && mockScenario() === "memory-hold-nonowner")
+      throw new ApiError(404, "run not found");
+    if (id.startsWith("run-forge-") && mockScenario() === "forge-hold-nonowner")
       throw new ApiError(404, "run not found");
     const current = getRun(id);
     if (!current) throw new ApiError(404, "run not found");

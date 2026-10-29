@@ -25,6 +25,7 @@ import { ActivityIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
 import { RunIssueRef } from "../components/RunIssueRef";
 import { mrAbbrev } from "../lib/forgeNoun";
+import { ForgeOriginStatus } from "../components/ForgeOriginStatus";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import {
   effectiveRunStatus,
@@ -514,7 +515,8 @@ export function RunRow({
               {/* PRD #320 M6: the queue-priority pill (Deprioritized/Expedited/Restored),
                   self-hiding on a normal or non-queued run. */}
               <RunPriorityBadge priority={run.priority} status={run.status} />
-              <StatusPill status={pillStatus} progress={run.progress} />
+              <StatusPill status={pillStatus} progress={run.progress} recovery_wait_cause={run.recovery_wait_cause} recovery_retry_not_before={run.recovery_retry_not_before} />
+              <ForgeOriginStatus cooldown={run.forge_origin_cooldown} />
               {/* PRD #320 M6: the owner-only Expedite/undo control, queued rows only. It is
                   raised above the card's stretched-link overlay (relative z-10, issue #485
                   NB1) so the click hits the button rather than the run-details Link; it

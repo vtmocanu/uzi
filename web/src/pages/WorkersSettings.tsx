@@ -16,6 +16,7 @@ import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES, hasTemplateDrift } from "../
 import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerPendingOutcomeBadge } from "../components/WorkerPendingOutcomeBadge";
+import { ForgeOriginStatus } from "../components/ForgeOriginStatus";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { WorkerCordonMetadata } from "../components/WorkerCordonMetadata";
 import { WorkerCordonControls } from "../components/WorkerCordonControls";
@@ -829,7 +830,7 @@ export function WorkersSettings() {
                               {cap}
                             </Badge>
                           ))}
-                          <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
+                          <Badge tone="neutral" dot title="Worker heartbeat status; does not verify forge reachability.">
                             {w.status}
                           </Badge>
                           <WorkerCordonBadge worker={w} />
@@ -842,6 +843,9 @@ export function WorkersSettings() {
                       </div>
 
                       <WorkerCordonMetadata worker={w} />
+                      {w.forge_origin_cooldowns?.map((cooldown, index) => <ForgeOriginStatus key={index} cooldown={cooldown} />)}
+                      <p className="mt-1 text-xs text-muted">Forge reachability is unverified. Cooldown advice is a bounded snapshot; missing origins do not prove health.</p>
+                      {(w.forge_origin_cooldowns?.length ?? 0) >= 32 && <p className="mt-1 text-xs text-muted">Showing up to 32 origins for this worker; additional origins may be omitted.</p>}
 
                       {/* Meta line — full width */}
                       <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">

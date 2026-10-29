@@ -13,6 +13,7 @@ import type {
   RunPriority,
   StopKind,
 } from "./apiTypes";
+import { forgeWaitLabel, forgeWaitMode } from "./forgeCooldown";
 import { isTerminalRun } from "./runStatus";
 import { credentialSwitchHold } from "./credentialSwitchHold";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
@@ -182,6 +183,8 @@ const PARK_LABELS = {
 // completion hold (raw status "paused") and an exhausted recovery read as they do on the
 // status pill. An unlisted status falls back to its de-underscored enum, never "".
 export function parkLabel(run: Parameters<typeof effectiveRunStatus>[0]): string {
+  const forge = forgeWaitLabel(run);
+  if (forge) return forge;
   const eff = effectiveRunStatus(run);
   if (isReserveHeldPause(run) && eff === "paused") return RESERVE_PAUSED_LABEL;
   return (PARK_LABELS as Record<string, string>)[eff] ?? eff.replace(/_/g, " ");
@@ -629,7 +632,10 @@ export function healthBadge(
   if (admission && !queuedBlockerPrecedesCodexAdmission(run)) {
     return { kind: "badge", label: admission, title: admission, tone: "info", pulse: false, wrap: true };
   }
-  if (!shouldShowHealthFlag(run.health, run.status)) return null;
+  if (!shouldShowHealthFlag(run.health, run.status)) {
+    const reason = run.status === "queued" ? displayHealthReason(run) : null;
+    return reason ? { kind: "badge", label: reason, title: reason, tone: "queue", pulse: false, wrap: true } : null;
+  }
   const label = healthFlagLabel(run.health);
   return {
     kind: "badge",
@@ -658,6 +664,15 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
   }
   if (isRejectedRun(run.status, run.fail_origin)) {
     return { kind: "badge", label: "rejected", tone: "neutral", pulse: false };
+  }
+  const forgeMode = forgeWaitMode(run);
+  if (forgeMode) {
+    return { kind: "badge", label: forgeWaitLabel(run)!, tone: "warning", pulse: false,
+      title: forgeMode === "held"
+        ? "Only the run owner can Resume or Cancel; no scheduled retry. Resume permits one bounded ordinary attempt, without promising execution or resetting counts, custody or grants."
+        : forgeMode === "timed"
+          ? "Retries automatically after the scheduled time, including when already due. Admission may still block execution; forge recovery is unverified."
+          : "Retry timing is unavailable; neither an owner hold nor an automatic retry date is established." };
   }
   const eff = effectiveRunStatus(run);
   // A health flag overrides the normal status label while the run is alive but looks
