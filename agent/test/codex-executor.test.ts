@@ -3666,12 +3666,17 @@ describe("compact policy hold production producer", () => {
       (["cyberPolicy", "misalignmentPolicyViolation"] as const).map(tag => ({ phase, tag, mode: "verified", kind: "issue" }))),
     ...["degraded", "lost_ack", "journal_failure", "cancel", "worker_off", "server_off", "no_outbox", "no_snapshot", "long_session", "interactive", "invalid_generation", "metadata_failure", "metadata_cancel", "guarded_cancel", "home_retention"].map(mode =>
       ({ phase: "implement" as const, tag: "cyberPolicy" as const, mode, kind: "issue" })),
+    ...["awaiting_approval", "persisted_unapproved", "stale_gate", "unknown_gate", "revision"].map(mode =>
+      ({ phase: "plan" as const, tag: "cyberPolicy" as const, mode, kind: "issue" })),
     ...["task", "prompt", "self_improve"].map(kind =>
       ({ phase: "plan" as const, tag: "cyberPolicy" as const, mode: "verified", kind })),
   ];
   for (const { phase, tag, mode, kind } of cases) {
     it(`holds genuine root ${kind} ${phase} ${tag}: ${mode}`, async () => {
+      const excludedPlanning = ["awaiting_approval", "persisted_unapproved", "stale_gate", "unknown_gate", "revision"].includes(mode);
+      const persistedPlan = excludedPlanning && mode !== "revision";
       const api = new FakeApi("compact-policy-worker");
+      api.gateRevisions = excludedPlanning;
       const url = await api.listen();
       const fx = makeFixture();
       let worktree = "";
@@ -3682,6 +3687,15 @@ describe("compact policy hold production producer", () => {
       const rig = makeRig({ responder: c => {
         if (c.method === "thread/start") return { thread: { id: rootThread } };
         if (c.method === "turn/start") {
+          if (mode === "revision" && c.turnStartCount === 1) {
+            c.transport.push(toolCall(901, "submit_plan", { plan_md: "source plan" }, rootThread, "tn-1", "source-plan"))
+              .push(turnCompleted("completed", rootThread, "tn-1"));
+            return { turn: { id: "tn-1" } };
+          }
+          if (excludedPlanning) {
+            assert.equal(api.gateOf(claim.run_id).revision, mode === "unknown_gate" ? 0 : mode === "stale_gate" ? 2 : 1,
+              "refusal occurs with the actual current gate evidence");
+          }
           c.transport.push({ ...turnCompleted("failed", rootThread), params: {
             threadId: rootThread, turn: { id: "tn-1", status: "failed",
               error: { codexErrorInfo: tag, message: "PRIVATE-PROVIDER-TEXT" } },
@@ -3696,7 +3710,7 @@ describe("compact policy hold production producer", () => {
           forwardCredentialFreeGitRoot(spec, deadline, await launch(spec, deadline)) };
       const client = new WorkerClient(url, "compact-policy-worker", "test", noopLog);
       api.setRegisterProtocolFeatures(mode === "server_off" ? ["claim_generation_fence"] :
-        ["provider_policy_hold_v1", "claim_generation_fence",
+        ["provider_policy_hold_v1", "claim_generation_fence", ...(excludedPlanning ? ["gate_revision_v1"] : []),
           ...(mode === "guarded_cancel" ? ["recovery_held_publication_v2"] : [])]);
       await client.register("compact-test", "base", 1, [], mode === "worker_off" ? [] :
         ["provider_policy_hold_v1", ...(mode === "guarded_cancel" ? ["recovery_held_publication_v2"] : [])], undefined, 0);
@@ -3747,12 +3761,31 @@ describe("compact policy hold production producer", () => {
         if (failMetadata) throw new Error("fixture metadata unavailable");
         return journalPolicy(id, body);
       };
-      const claim = makeClaim({ claim_generation: mode === "invalid_generation" ? 0 : 7,
+      const claim = makeClaim({
+        ...(excludedPlanning ? { auto_approve: false, plan_approved: false, config: { plan_max_revisions: 1 } } : {}),
+        ...(persistedPlan ? { plan_md: mode === "awaiting_approval" ? "" : "source plan", plan_source: "agent",
+          resume_plan_at: new Date(Date.now() - 1000).toISOString(),
+          ...(mode === "awaiting_approval" ? { resume_phase: "awaiting_approval" } : {}),
+          ...(mode !== "unknown_gate" ? { resume_gate_revision: 1 } : {}),
+        } : {}),
+        claim_generation: mode === "invalid_generation" ? 0 : 7,
         interactive: mode === "interactive", kind: kind as ClaimResponse["kind"],
         ...(mode === "guarded_cancel" ? { inventory_guarded: true } : {}),
         ...(kind === "task" ? { branch: "uzi/task/policy-fixture", issue_iid: null } : {}),
         repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
         ...(phase === "implement" ? { plan_approved: true, plan_source: "seeded", plan_md: "approved work" } : {}),
+      });
+      if (persistedPlan) {
+        if (mode !== "unknown_gate") api.seedGate(claim.run_id, {
+          revision: mode === "stale_gate" ? 2 : 1, presentationId: null, payload: { plan_md: "source plan" },
+        });
+        api.setInputs(claim.run_id, [{ id: 1, kind: "revise_plan", body: "tighten the scope",
+          created_at: new Date().toISOString(), gate_binding: "bound", gate_revision: 1 }]);
+      }
+      if (mode === "revision") api.onState(claim.run_id, body => {
+        if (body.status === "awaiting_approval") api.setInputs(claim.run_id, [
+          { id: 1, kind: "revise_plan", body: "tighten the scope", gate_binding: "bound", gate_revision: 1 },
+        ]);
       });
       if (kind === "task") {
         const seeded = spawnSync("git", ["-C", fx.originPath, "branch", claim.branch!], { env: gitEnv(), encoding: "utf8" });
@@ -3779,14 +3812,31 @@ describe("compact policy hold production producer", () => {
           });
         await runner.execute(claim);
         assert.equal(lateSessionReports, 0, "late session callback never reaches client reportState boundary");
-        const supported = !["worker_off", "server_off", "no_outbox", "no_snapshot", "interactive", "invalid_generation"].includes(mode);
+        const supported = !excludedPlanning && !["worker_off", "server_off", "no_outbox", "no_snapshot", "interactive", "invalid_generation"].includes(mode);
         assert.equal(packets.length, supported && !["journal_failure", "cancel", "metadata_failure", "metadata_cancel", "guarded_cancel"].includes(mode) ? 1 : 0,
           String(rec(captureLog.lines.filter(line => rec(line).level === "error").at(-1)).error ?? "no terminal diagnostic").slice(0, 240));
-        assert.equal(rig.transport.turnStartCount, 1);
+        assert.equal(rig.transport.turnStartCount, mode === "revision" ? 2 : 1, "real provider turn reaches the typed refusal");
         assert.equal(await fs.readFile(path.join(worktree, "POLICY-WORK.txt"), "utf8"), "retained work\n");
         if (homeDir) assert.equal(await fs.readFile(path.join(homeDir, "retained-session-evidence"), "utf8"), "session kept");
         if (!supported) {
           assert.equal(api.states.find(s => s.body.status === "failed")?.body.fail_origin, "provider_policy_refusal");
+          if (excludedPlanning) {
+            const failed = api.states.filter(s => s.body.status === "failed");
+            assert.equal(failed.length, 1);
+            assert.equal(failed[0]?.body.failure_reason, `Codex provider safety-policy refusal (${tag})`);
+            const refusal = api.messages(claim.run_id).find(m => m.payload.event === "provider_policy_refusal");
+            assert.equal(refusal?.payload.origin, "root");
+            assert.equal(refusal?.payload.phase, "planning");
+            assert.equal(refusal?.payload.policy_tag, tag);
+            assert.equal(api.states.some(s => s.body.status === "completed"), false);
+            assert.equal(await outbox.hasPendingPolicyOutcome(claim.run_id), false);
+            assert.equal(api.isApplied(claim.run_id, 1), false, "refusal does not successfully settle the revision");
+            if (mode === "revision") {
+              assert.equal(api.states.filter(s => s.body.status === "awaiting_approval").length, 1);
+              const turns = rig.transport.requests.filter(r => r.method === "turn/start");
+              assert.match(JSON.stringify(turns[1]?.params), /tighten the scope/, "the refused turn is the owner revision");
+            }
+          }
           return;
         }
         assert.ok(!api.states.some(s => ["failed", "completed"].includes(s.body.status ?? "")));
