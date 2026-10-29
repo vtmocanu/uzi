@@ -2,15 +2,19 @@ package recovery
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -19,8 +23,61 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// isolateClosureUploadDatabase registers the drop before newInventoryEnv opens
+// its pool, so LIFO cleanup closes that pool before dropping the database.
+func isolateClosureUploadDatabase(t *testing.T) {
+	t.Helper()
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL unset; run ./e2e/run-store-it.sh")
+	}
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse closure database DSN: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	admin, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("connect closure database admin: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := admin.Close(ctx); err != nil {
+			t.Errorf("close closure database admin: %v", err)
+		}
+	})
+	name := "closure_upload_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	ident := pgx.Identifier{name}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+ident); err != nil {
+		t.Fatalf("create closure database: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := admin.Exec(ctx, "DROP DATABASE "+ident); err != nil {
+			t.Errorf("drop closure database: %v", err)
+		}
+	})
+	childDSN := dsn + " dbname='" + name + "'"
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatalf("parse closure database URL: %v", err)
+		}
+		u.Path, u.RawPath = "/"+name, ""
+		query := u.Query()
+		query.Set("dbname", name)
+		u.RawQuery = query.Encode()
+		childDSN = u.String()
+	}
+	t.Setenv("UZI_TEST_DATABASE_URL", childDSN)
+}
+
 func closureUploadEnv(t *testing.T) *inventoryEnv {
 	t.Helper()
+	isolateClosureUploadDatabase(t)
 	e := newInventoryEnv(t)
 	e.w.ProtocolCapabilities = append(e.w.ProtocolCapabilities, capability.RecoveryPrerequisiteClosureV1)
 	e.exec("UPDATE forge_connections SET base_url='https://github.com' WHERE user_id=$1", e.w.UserID)
@@ -39,6 +96,50 @@ func closureCount(t *testing.T, e *inventoryEnv, id uuid.UUID, want int) {
 	var n int
 	if err := e.pool.QueryRow(e.ctx, "SELECT count(*) FROM recovery_prerequisite_closures WHERE capture_id=$1", id).Scan(&n); err != nil || n != want {
 		t.Fatalf("closure count %d want %d: %v", n, want, err)
+	}
+}
+
+func TestRecoveryPrerequisiteClosureUploadFixtureIsolationLiveDB(t *testing.T) {
+	originalDSN := os.Getenv("UZI_TEST_DATABASE_URL")
+	if originalDSN == "" {
+		t.Skip("UZI_TEST_DATABASE_URL unset; run ./e2e/run-store-it.sh")
+	}
+	ctx := context.Background()
+	shared, err := pgx.Connect(ctx, originalDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := shared.Close(ctx); err != nil {
+			t.Errorf("close shared database connection: %v", err)
+		}
+	}()
+	var originalDatabase string
+	if err := shared.QueryRow(ctx, "SELECT current_database()").Scan(&originalDatabase); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("child-upload", func(t *testing.T) {
+		e := closureUploadEnv(t)
+		var childDatabase string
+		if err := e.pool.QueryRow(e.ctx, "SELECT current_database()").Scan(&childDatabase); err != nil {
+			t.Fatal(err)
+		}
+		if childDatabase == originalDatabase {
+			t.Fatalf("closure fixture reused shared database %q", originalDatabase)
+		}
+		id := e.reserve("isolated-upload")
+		body, manifest := closureManifest()
+		ack, err := e.svc.Upload(e.ctx, e.w, e.run, id, manifest, bytes.NewReader(body))
+		if err != nil || ack.PrerequisiteClosure == nil || ack.PrerequisiteClosure.State != "pending" {
+			t.Fatalf("isolated upload: %+v %v", ack, err)
+		}
+		closureCount(t, e, id, 1)
+		e.bytes(id, body)
+		// Distinct actual database identities establish that the shared database
+		// cannot observe this capture, even when it has not been migrated.
+	})
+	if got := os.Getenv("UZI_TEST_DATABASE_URL"); got != originalDSN {
+		t.Fatal("closure fixture did not restore the parent database environment")
 	}
 }
 

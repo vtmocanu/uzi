@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
@@ -28,8 +29,11 @@ type prerequisiteRegistrationEnv struct {
 
 func newPrerequisiteRegistrationEnv(t *testing.T) *prerequisiteRegistrationEnv {
 	t.Helper()
+	// Both constructors must share one isolated DSN; their pools close before drop.
+	ephemeralPriorityDatabase(t)
 	e := newRecoveryEnvGuarded(t, true)
-	h, router, _ := cliLiveDB(t)
+	h, router, pool := cliLiveDB(t)
+	assertPriorityDatabase(t, e.ctx, pool, e.pool.Config().ConnConfig.Database)
 	h.box = e.box
 	h.cfg = recoveryTestCfg()
 	h.cfg.PrerequisiteClosureForges = []string{"github"}
@@ -100,6 +104,12 @@ func (f *prerequisiteRegistrationEnv) assertRows(t *testing.T, capture string, w
 		}
 	}
 }
+func TestRecoveryPrerequisiteRegistrationFixtureIsolationLiveDB(t *testing.T) {
+	assertPrerequisiteFixtureIsolation(t, func(t *testing.T) *pgxpool.Pool {
+		return newPrerequisiteRegistrationEnv(t).e.pool
+	})
+}
+
 func TestRecoveryPrerequisiteRegistrationBearerLiveDB(t *testing.T) {
 	f := newPrerequisiteRegistrationEnv(t)
 	f.register(t, false)
