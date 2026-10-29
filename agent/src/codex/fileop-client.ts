@@ -232,7 +232,13 @@ export class FileopHelperClient implements FileopClient {
       if (entry === undefined) continue; // unknown/late id (already timed out): ignore
       this.pending.delete(id);
       if (entry.timer) clearTimeout(entry.timer);
-      entry.resolve(entry.op === "read_text_range" ? rangeResponse(parsed) : coerceResponse(parsed));
+      const response = entry.op === "read_text_range" ? rangeResponse(parsed) : coerceResponse(parsed);
+      // Only a raw boolean false may authorize the broker's oversized read fallback.
+      if (entry.op === "read" && response.ok === false && response.code === "E_OVERSIZE" && asObject(parsed)?.ok !== false) {
+        entry.resolve({ ok: false, code: "E_MALFORMED" });
+      } else {
+        entry.resolve(response);
+      }
     }
   }
 

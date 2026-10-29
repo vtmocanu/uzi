@@ -22,6 +22,7 @@ import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry
 import { buildCodexToolHandlers, makeDefaultSpawnCommand } from "../src/codex/codex-executor.js";
 import { SupervisedChildExitTimeoutError, type CodexRootHandle, type DisposeOutcome } from "../src/codex/launcher.js";
 import { PassThrough } from "node:stream";
+import { FileopHelperClient } from "../src/codex/fileop-client.js";
 import { forgeToolNames } from "../src/forge-tools.js";
 import { memoryToolNames } from "../src/memory-tools.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
@@ -1458,6 +1459,41 @@ describe("U3 D9 live code repair broker", () => {
 describe("CodexCallbackBroker: explicit large text fallback", () => {
   const valid: FileopResponse = { ok: true, kind: "text", data: Buffer.from("body\n").toString("base64"),
     size: 2 * 1024 * 1024, offset: 1, linesReturned: 1, partialLastLine: false, truncated: true };
+  it("requires raw boolean false on the wire to authorize oversized read fallback", async () => {
+    for (const ok of [undefined, null, "false", "true", 0, 1, false]) {
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const client = new FileopHelperClient({ inbound, outbound });
+      const ops: string[] = [];
+      outbound.setEncoding("utf8");
+      outbound.on("data", (line: string) => {
+        const request = JSON.parse(line) as { id: number; op: string };
+        ops.push(request.op);
+        const response = request.op === "read" ? { ok, code: "E_OVERSIZE" } : valid;
+        inbound.write(`${JSON.stringify({ id: request.id, ...response })}\n`);
+      });
+      try {
+        const h = makeBroker({ fileop: client });
+        const result = await h.broker.handleToolCall(rt(), "Read", { path: "text", limit: 1 }, "root");
+        if (ok === false) {
+          assert.equal(result.ok, true);
+          if (result.ok) assert.deepEqual(result.output, {
+            size: valid.size, content: "body\n", offset: 1, linesReturned: 1, partialLastLine: false, truncated: true,
+          });
+          assert.deepEqual(ops, ["read", "read_text_range"]);
+        } else {
+          assert.equal(result.ok, false, `raw ok: ${String(ok)}`);
+          if (!result.ok) assert.equal(result.fileopCode, "E_MALFORMED");
+          assert.deepEqual(ops, ["read"]);
+        }
+        assert.equal(h.registry.inFlightCallbackCount(), 0);
+      } finally {
+        client.close();
+        inbound.destroy();
+        outbound.destroy();
+      }
+    }
+  });
   it("opts in only for supplied ranges and a helper oversize failure", async () => {
     for (const args of [{ offset: 1 }, { limit: 200 }, {}]) {
       const fileop = new FileopSpy([{ ok: false, code: "E_OVERSIZE" }, { ...valid, data: Buffer.from("body\n".repeat(200)).toString("base64"), linesReturned: 200 }]);
