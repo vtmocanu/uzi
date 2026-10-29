@@ -86,8 +86,34 @@ function coerceResponse(value: unknown): FileopResponse {
   };
 }
 
+// Validate the raw discriminated response before legacy coercion can erase
+// forbidden fields or malformed types. Legacy operations keep their coercion.
+function rangeResponse(value: unknown): FileopResponse {
+  const o = asObject(value);
+  const malformed: FileopResponse = { ok: false, code: "E_MALFORMED" };
+  if (!o || typeof o.ok !== "boolean") return malformed;
+  const allowed = o.ok === false ? ["id", "ok", "code"] : o.kind === "binary" ? ["id", "ok", "kind"] :
+    ["id", "ok", "kind", "data", "size", "offset", "linesReturned", "partialLastLine", "truncated"];
+  if (Object.keys(o).some((key) => !allowed.includes(key))) return malformed;
+  if (!o.ok) return typeof o.code === "string" ? { ok: false, code: o.code } : malformed;
+  if (o.kind === "binary") return { ok: true, kind: "binary" };
+  if (o.kind !== "text" || typeof o.data !== "string" ||
+      typeof o.size !== "number" || !Number.isSafeInteger(o.size) || o.size < 0 || o.size > 64 * 1024 * 1024 ||
+      typeof o.offset !== "number" || !Number.isSafeInteger(o.offset) || o.offset < 1 ||
+      typeof o.linesReturned !== "number" || !Number.isSafeInteger(o.linesReturned) || o.linesReturned < 0 || o.linesReturned > 2000 ||
+      typeof o.partialLastLine !== "boolean" || typeof o.truncated !== "boolean") return malformed;
+  if (o.data.length > 4 * Math.ceil(65536 / 3)) return { ok: false, code: "E_OVERSIZE" };
+  if (o.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(o.data)) return malformed;
+  const bytes = Buffer.from(o.data, "base64");
+  if (bytes.toString("base64") !== o.data) return malformed;
+  if (bytes.length > 65536) return { ok: false, code: "E_OVERSIZE" };
+  return { ok: true, kind: "text", data: o.data, size: o.size, offset: o.offset,
+    linesReturned: o.linesReturned, partialLastLine: o.partialLastLine, truncated: o.truncated };
+}
+
 interface PendingOp {
   readonly resolve: (r: FileopResponse) => void;
+  readonly op: FileopRequest["op"];
   timer: ReturnType<typeof setTimeout> | undefined;
 }
 
@@ -137,6 +163,8 @@ export class FileopHelperClient implements FileopClient {
       if (request.newPath !== undefined) frame.newPath = request.newPath;
       if (request.data !== undefined) frame.data = request.data;
       if (request.old !== undefined) frame.old = request.old;
+      if (request.offset !== undefined) frame.offset = request.offset;
+      if (request.limit !== undefined) frame.limit = request.limit;
       let line: string;
       try {
         line = `${JSON.stringify(frame)}\n`;
@@ -148,7 +176,7 @@ export class FileopHelperClient implements FileopClient {
         resolve({ ok: false, code: "E_OVERSIZE" });
         return;
       }
-      const entry: PendingOp = { resolve, timer: undefined };
+      const entry: PendingOp = { resolve, timer: undefined, op: request.op };
       entry.timer = setTimeout(() => {
         if (this.pending.delete(id)) resolve({ ok: false, code: "E_TIMEOUT" });
       }, this.requestTimeoutMs);
@@ -204,7 +232,7 @@ export class FileopHelperClient implements FileopClient {
       if (entry === undefined) continue; // unknown/late id (already timed out): ignore
       this.pending.delete(id);
       if (entry.timer) clearTimeout(entry.timer);
-      entry.resolve(coerceResponse(parsed));
+      entry.resolve(entry.op === "read_text_range" ? rangeResponse(parsed) : coerceResponse(parsed));
     }
   }
 

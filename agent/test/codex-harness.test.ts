@@ -2475,6 +2475,7 @@ describe("CodexHarness: notifications are bound to the active (thread, turn)", (
 
 describe("CodexHarness: bounded Read transport serialization (#296)", () => {
   for (const { name, raw, args, expected, offset, lines, partial, truncated } of [
+    { name: "large ranged hostile escaping", raw: '\u0001"\\'.repeat(400000), args: { path: "src/x.ts", offset: 1, limit: 1 }, expected: '\u0001"\\'.repeat(21845) + '\u0001', offset: 1, lines: 1, partial: true, truncated: true },
     { name: "middle excerpt", raw: "a\nb\nc\n", args: { file_path: "src/x.ts", offset: 2, limit: 1 }, expected: "b\n", offset: 2, lines: 1, partial: false, truncated: true },
     { name: "near 1 MiB U+0001", raw: "\u0001".repeat(1024 * 1024 - 2), args: { path: "src/x.ts" }, expected: "\u0001".repeat(64 * 1024), offset: 1, lines: 1, partial: true, truncated: true },
     { name: "near 1 MiB quotes and backslashes", raw: '"\\'.repeat((1024 * 1024 - 2) / 2), args: { path: "src/x.ts" }, expected: '"\\'.repeat(32 * 1024), offset: 1, lines: 1, partial: true, truncated: true },
@@ -2489,7 +2490,12 @@ describe("CodexHarness: bounded Read transport serialization (#296)", () => {
       const broker = new CodexCallbackBroker({
         registry,
         spawnCommand: async () => ({ code: 0, stdout: "", stderr: "" }),
-        fileop: { op: async () => { calls++; return { ok: true, size: Buffer.byteLength(raw), data: Buffer.from(raw).toString("base64") }; } },
+        fileop: { op: async (request) => { calls++;
+          if (Buffer.byteLength(raw) > 1024 * 1024) {
+            if (request.op === "read") return { ok: false, code: "E_OVERSIZE" };
+            return { ok: true, kind: "text", size: Buffer.byteLength(raw), data: Buffer.from(expected).toString("base64"), offset, linesReturned: lines, partialLastLine: partial, truncated };
+          }
+          return { ok: true, size: Buffer.byteLength(raw), data: Buffer.from(raw).toString("base64") }; } },
         worktreePath: WORKSPACE,
         grants: renderCodexRun(request).leadGrants,
         delegate: async () => ({ ok: false, code: "x", message: "no" }),
@@ -2537,13 +2543,13 @@ describe("CodexHarness: bounded Read transport serialization (#296)", () => {
         assert.deepEqual(JSON.parse(items[0]!.text), {
           size: Buffer.byteLength(raw), content: expected, offset, linesReturned: lines, partialLastLine: partial, truncated,
         });
-        assert.equal(calls, 1);
+        assert.equal(calls, Buffer.byteLength(raw) > 1024 * 1024 ? 2 : 1);
         assert.equal(registry.inFlightCallbackCount(), 0);
         assert.equal(registry.isPoisoned(), false);
         const replay = await broker.handleToolCall({ threadId: "th-1", turnId: "tn-1", callId: "read-296" }, "uzi_read", args, "root");
         assert.equal(replay.ok, true);
         if (replay.ok) assert.deepEqual(replay.output, { replay: true });
-        assert.equal(calls, 1);
+        assert.equal(calls, Buffer.byteLength(raw) > 1024 * 1024 ? 2 : 1);
       } finally {
         transport.close();
         inbound.destroy();

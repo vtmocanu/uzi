@@ -235,3 +235,47 @@ describe("wireFileopHelper: registered process wiring", () => {
     );
   });
 });
+
+
+describe("FileopHelperClient: raw ranged response validation", () => {
+  it("validates discriminated fields before coercion and preserves request bounds", async () => {
+    const good = { ok: true, kind: "text", data: "eA==", size: 1, offset: 1, linesReturned: 1, partialLastLine: false, truncated: false };
+    for (const response of [
+      { ...good, kind: "unknown" }, { ...good, ok: "true" }, { ...good, size: "1" },
+      { ...good, offset: null }, { ...good, linesReturned: 1.5 }, { ...good, partialLastLine: 0 },
+      { ...good, truncated: "false" }, { ...good, extra: true },
+      ...["Zh==", "Yg", "Yg==\n", "====", "Yg_="].map(data => ({ ...good, data })), { ok: true, kind: "binary", data: 7 },
+      { ok: true, kind: "binary", size: null }, { ok: true, kind: "binary", truncated: false },
+    ]) {
+      const h = makeClient();
+      const p = h.client.op({ op: "read_text_range", path: "x", offset: 1, limit: 200 });
+      const req = await h.requests.next();
+      assert.deepEqual(req, { id: 1, op: "read_text_range", path: "x", offset: 1, limit: 200 });
+      h.respond({ id: req.id, ...response });
+      assert.deepEqual(await p, { ok: false, code: "E_MALFORMED" });
+      h.client.close();
+    }
+    for (const response of [good, { ok: true, kind: "binary" }, { ok: false, code: "E_UNKNOWN_OP" }]) {
+      const h = makeClient();
+      const p = h.client.op({ op: "read_text_range", path: "x", offset: 1, limit: 1 });
+      const req = await h.requests.next();
+      h.respond({ id: req.id, ...response });
+      assert.deepEqual(await p, response);
+      h.client.close();
+    }
+  });
+  it("settles a timeout once and ignores its late reply while a new range is pending", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = makeClient({ requestTimeoutMs: 30 });
+    const old = h.client.op({ op: "read_text_range", path: "x", offset: 1, limit: 1 });
+    const first = await h.requests.next();
+    t.mock.timers.tick(30);
+    assert.deepEqual(await old, { ok: false, code: "E_TIMEOUT" });
+    const next = h.client.op({ op: "read_text_range", path: "x", offset: 2, limit: 1 });
+    const second = await h.requests.next();
+    h.respond({ id: first.id, ok: true, kind: "binary" });
+    h.respond({ id: second.id, ok: false, code: "E_UNKNOWN_OP" });
+    assert.deepEqual(await next, { ok: false, code: "E_UNKNOWN_OP" });
+    h.client.close();
+  });
+});

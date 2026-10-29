@@ -38,15 +38,16 @@ const (
 
 // Operation names carried on the request channel (stdin).
 const (
-	opStat   = "stat"
-	opRead   = "read"
-	opWrite  = "write"
-	opApply  = "apply"
-	opMkdir  = "mkdir"
-	opRename = "rename"
-	opUnlink = "unlink"
-	opRmdir  = "rmdir"
-	opList   = "list"
+	opStat          = "stat"
+	opRead          = "read"
+	opReadTextRange = "read_text_range"
+	opWrite         = "write"
+	opApply         = "apply"
+	opMkdir         = "mkdir"
+	opRename        = "rename"
+	opUnlink        = "unlink"
+	opRmdir         = "rmdir"
+	opList          = "list"
 )
 
 // Stable, bounded error-code vocabulary. A response NEVER carries a raw errno
@@ -88,6 +89,8 @@ var (
 // Old is base64-encoded bytes of the text apply must find-and-replace.
 type request struct {
 	ID      int    `json:"id"`
+	Offset  int64  `json:"offset"`
+	Limit   int64  `json:"limit"`
 	Op      string `json:"op"`
 	Path    string `json:"path"`
 	NewPath string `json:"newPath"`
@@ -100,6 +103,9 @@ type request struct {
 // with small caps and deterministic failures; newServer wires every production value.
 type server struct {
 	rootFD          int
+	maxScan         int64
+	maxExcerpt      int
+	afterRangeStat  func()
 	maxRead         int
 	maxWrite        int
 	lineMax         int
@@ -113,6 +119,9 @@ type server struct {
 func newServer(rootFD int) *server {
 	return &server{
 		rootFD:          rootFD,
+		maxScan:         64 * 1024 * 1024,
+		maxExcerpt:      64 * 1024,
+		afterRangeStat:  func() {},
 		maxRead:         maxReadBytes,
 		maxWrite:        maxWriteBytes,
 		lineMax:         maxRequestLine,
@@ -216,6 +225,8 @@ func (s *server) handle(req request) map[string]any {
 		return s.doStat(req)
 	case opRead:
 		return s.doRead(req)
+	case opReadTextRange:
+		return s.doReadTextRange(req)
 	case opWrite:
 		return s.doWrite(req)
 	case opApply:

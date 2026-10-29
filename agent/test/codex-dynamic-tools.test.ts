@@ -174,3 +174,13 @@ it("U3 D9 disposition wire tool has a closed authority-neutral schema", () => {
   assert.deepEqual(Object.keys(batch.items.properties as object).sort(), ["disposition", "finding_id", "reason"]);
   assert.deepEqual(batch.items.required, ["finding_id", "disposition", "reason"]);
 });
+
+
+it("Read describes explicit opt-in, scan and excerpt bounds without treating omitted defaults as supplied", () => {
+  const spec = buildCodexDynamicTools(grants(["Read"]))[0]!;
+  assert.match(spec.description, /at most 64 KiB/);
+  assert.match(spec.description, /Unranged files over 1 MiB are denied/);
+  assert.match(spec.description, /Supplying offset or limit \(including a supplied default\)/);
+  assert.match(spec.description, /at most 64 MiB/);
+  assert.match(spec.description, /omitted defaults do not opt in/);
+});

@@ -1453,3 +1453,55 @@ describe("U3 D9 live code repair broker", () => {
     assert.equal(effects, 0);
   });
 });
+
+
+describe("CodexCallbackBroker: explicit large text fallback", () => {
+  const valid: FileopResponse = { ok: true, kind: "text", data: Buffer.from("body\n").toString("base64"),
+    size: 2 * 1024 * 1024, offset: 1, linesReturned: 1, partialLastLine: false, truncated: true };
+  it("opts in only for supplied ranges and a helper oversize failure", async () => {
+    for (const args of [{ offset: 1 }, { limit: 200 }, {}]) {
+      const fileop = new FileopSpy([{ ok: false, code: "E_OVERSIZE" }, { ...valid, data: Buffer.from("body\n".repeat(200)).toString("base64"), linesReturned: 200 }]);
+      const h = makeBroker({ fileop });
+      const result = await h.broker.handleToolCall(rt(), "Read", { path: "text", ...args }, "root");
+      assert.equal(result.ok, Object.keys(args).length > 0);
+      assert.deepEqual(fileop.calls, Object.keys(args).length ? [
+        { op: "read", path: "text" }, { op: "read_text_range", path: "text", offset: 1, limit: 200 },
+      ] : [{ op: "read", path: "text" }]);
+    }
+    for (const response of [{ ok: false, code: "E_IO" }, { ok: true, data: "!".repeat(1400000), size: 1 }]) {
+      const fileop = new FileopSpy(response);
+      await makeBroker({ fileop }).broker.handleToolCall(rt(), "Read", { path: "text", offset: 1 }, "root");
+      assert.equal(fileop.calls.length, 1);
+    }
+  });
+  it("screens secret paths before either operation even with an explicit range", async () => {
+    const h = makeBroker({ fileop: new FileopSpy({ ok: false, code: "E_OVERSIZE" }),
+      screenPolicy: { extraSecretPaths: [`${WORKTREE}/creds.env`] } });
+    for (const path of ["creds.env", ".git/config", "../../outside"]) {
+      const result = await h.broker.handleToolCall(rt(), "Read", { path, offset: 1 }, "root");
+      assert.equal(result.ok, false);
+    }
+    assert.equal(h.fileop.calls.length, 0);
+  });
+  it("validates the range discriminator, canonical bytes and metadata independently", async () => {
+    for (const patch of [
+      { kind: undefined }, { kind: "binary", data: "" }, { extra: true }, { data: 7 }, { data: "Zh==" }, { data: "Yg" },
+      { data: "Yg==\n" }, { size: -1 }, { size: 67108865 }, { size: 1.5 }, { size: "5" },
+      { offset: 2 }, { offset: "1" }, { linesReturned: 2 }, { linesReturned: -1 }, { linesReturned: "1" },
+      { partialLastLine: "false" }, { partialLastLine: true }, { truncated: "true" }, { truncated: false },
+      { data: Buffer.from([0xff]).toString("base64") }, { data: "AA==" },
+    ]) {
+      const h = makeBroker({ fileop: new FileopSpy([{ ok: false, code: "E_OVERSIZE" }, { ...valid, ...patch } as FileopResponse]) });
+      const result = await h.broker.handleToolCall(rt(), "Read", { path: "text", limit: 1 }, "root");
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.fileopCode, "E_MALFORMED", JSON.stringify(patch));
+      assert.equal(h.registry.inFlightCallbackCount(), 0);
+    }
+    const h = makeBroker({ fileop: new FileopSpy([{ ok: false, code: "E_OVERSIZE" }, valid]) });
+    const r = await h.broker.handleToolCall(rt(), "Read", { path: "text", limit: 1 }, "root");
+    assert.equal(r.ok, true);
+    if (r.ok) assert.deepEqual(r.output, { size: valid.size, content: "body\n", offset: 1, linesReturned: 1, partialLastLine: false, truncated: true });
+    const binary = makeBroker({ fileop: new FileopSpy([{ ok: false, code: "E_OVERSIZE" }, { ok: true, kind: "binary" }]) });
+    assertDenied(await binary.broker.handleToolCall(rt(), "Read", { path: "text", offset: 1 }, "root"), "bad_args");
+  });
+});

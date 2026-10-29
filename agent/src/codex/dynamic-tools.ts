@@ -71,7 +71,7 @@ function definition(name: string, grants: RunGrants): Omit<CodexDynamicToolSpec,
       };
     case "Read":
       return {
-        description: "Read text lines through the worker-owned no-symlink boundary inside the current worktree (offset defaults to 1, limit to 200; at most 64 KiB). Unranged binary reads return exact base64. Files over 1 MiB are denied. Reads may run while a shell command is pending and are not a snapshot of concurrent changes.",
+        description: "Read text lines through the worker-owned no-symlink boundary inside the current worktree (offset defaults to 1, limit to 200; at most 64 KiB). Unranged binary reads return exact base64. Unranged files over 1 MiB are denied. Supplying offset or limit (including a supplied default) permits text scanning through at most 64 MiB; omitted defaults do not opt in. Reads may run while a shell command is pending and are not a snapshot of concurrent changes.",
         inputSchema: {
           ...objectSchema({
             path: STRING,

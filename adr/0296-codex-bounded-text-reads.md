@@ -1,6 +1,6 @@
 # ADR 0296: Bounded Codex text reads
 
-Status: accepted; issue #296, milestone 1.
+Status: accepted; issue #296, milestone 1. Updated 2026-10-29.
 
 ## Context and evidence
 
@@ -30,13 +30,46 @@ numbers are bad_args. Presence of either property is an explicit range, includin
 an explicitly supplied default. An explicitly present undefined is invalid.
 
 Registry admission, grants, replay, secret-path checks and worktree/no-symlink
-guards remain authoritative. Range arguments never reach the helper. It still
-reads the whole allowed file and denies files over 1 MiB; this change is not a
-larger-file reader or a Go protocol change.
+guards remain authoritative. The original decision kept all ranges in the broker
+and retained the helper's 1 MiB ceiling. That remains the legacy path and the
+unranged contract. The approved extension permits **explicit ranged text only**:
+first call legacy read; only its failed E_OVERSIZE response permits retrying with
+read_text_range and the validated offset/limit. Malformed or oversized successes
+and all other failures never trigger a retry. Search continues using legacy raw
+reads with its 64 KiB per-file and 256 KiB total budgets. Supplying either default
+explicitly opts in; omitted defaults do not. (AI-synced 2026-10-29)
+
+## Explicit large text scan
+
+The new helper operation independently validates offset as a positive safe JS
+integer and limit in 1–2000. It uses the same openat2 containment, nonblocking
+open and fstat regular-file checks. It scans the observed descriptor to EOF with
+a fixed 4096-byte reader, constant UTF-8 state and at most 64 KiB retained text;
+no source line, file or line index accumulates. Actual consumed input, including
+growth after stat, is capped at 64 MiB plus a one-byte overflow probe. Exceeding
+that budget returns E_OVERSIZE with a fixed path-free explanation at the broker.
+The successful size is the actual bytes scanned. No snapshot is promised.
+
+Every observed byte is checked for UTF-8 and NUL, including omitted prefix,
+suffix and bytes after the excerpt fills. Binary success carries only the binary
+discriminator (besides correlation id and ok); it has no body or text metadata.
+The broker maps it to the existing bad_args text-file requirement. Text success
+carries kind=text, canonical base64 data, size, offset, linesReturned,
+partialLastLine and truncated, with the same line semantics below.
+
+The client tracks the pending operation and validates this raw discriminated
+schema before legacy coercion, rejecting unknown/forbidden fields and malformed
+types. The broker independently checks the discriminator, encoded length before
+decoding, canonical base64 including padding bits, decoded 64 KiB bound, UTF-8/NUL,
+safe numeric bounds and metadata consistency. Failures remain neutral E_MALFORMED
+or E_OVERSIZE. An old helper's unsupported operation fails closed. The 2 MiB client
+framing and 30-second request deadline remain unchanged; timeout settles the
+request but does not cancel the helper scan, and late replies cannot settle a
+new request. Package and supervisor authority are unchanged.
 
 ## Helper success validation
 
-After a successful helper response, the broker validates in this exact order:
+After a successful **legacy read** response, the broker validates in this exact order:
 
 1. Missing or nonstring data gives E_MALFORMED.
 2. Encoded length above 4 * ceil(1 MiB / 3) gives E_OVERSIZE, before regex or decoding.
@@ -87,5 +120,12 @@ transport frames and complete only after receiving the Read reply. They cover
 excerpt metadata with no duplicate base64, callback settlement, and near-1 MiB
 U+0001 and quote/backslash bodies clipped and delivered below the 4 MiB frame cap.
 
-The lead owns repository gates and commits. Runtime missing dependencies must be
+The source-bound Linux regression builds the helper from the same source tree,
+then drives the real client and broker for a distinct middle excerpt, unchanged
+unranged denial, the production 64 MiB boundary and a following request. Non-Linux
+may skip it; Linux must build and run. Root, child and cross-check tests exercise
+large ranged output through their emitted replies, including escaping, fencing,
+activity ranges and callback settlement.
+
+The lead owns repository gates, base/candidate red-green proof and commits. Runtime missing dependencies must be
 reported as blocked checks, never as passing behavioral evidence.

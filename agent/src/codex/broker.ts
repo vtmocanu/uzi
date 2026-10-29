@@ -70,7 +70,7 @@ export const LONG_COMMAND_WALL_MS = 7_200_000;
 // reaches the model so a large effect cannot balloon a callback result. HYGIENE bound,
 // not a redaction guarantee — the screener already denies a secret READ, so an ALLOWED
 // effect's output is the model's own legitimate result. File reads retain the helper's
-// 1 MiB body bound; text excerpts also have a 64 KiB UTF-8 bound to fit nested JSON
+// 1 MiB legacy body bound; explicit ranges may scan 64 MiB with a 64 KiB excerpt to fit nested JSON
 // replies. Binary base64 is forwarded intact, never sliced (see dispatchFileRead).
 const MAX_SHELL_OUTPUT_BYTES = 64 * 1024;
 // A tool/role/skill name echoed into a diagnostic is bounded so a long name cannot
@@ -252,8 +252,10 @@ export type CallbackResult =
  *  within the pinned parent directory.
  *  The `id` correlation is the production client's job, not the broker's. */
 export interface FileopRequest {
-  readonly op: "stat" | "read" | "write" | "apply" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
+  readonly op: "stat" | "read_text_range" | "read" | "write" | "apply" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
   readonly path: string;
+  readonly offset?: number;
+  readonly limit?: number;
   readonly newPath?: string;
   readonly data?: string;
   readonly old?: string;
@@ -263,6 +265,10 @@ export interface FileopRequest {
  *  fixed vocabulary (E_ESCAPE/E_SYMLINK/E_DENIED/E_NOT_FILE/E_OVERSIZE/…), never a
  *  raw errno/path/content. */
 export interface FileopResponse {
+  readonly kind?: "text" | "binary";
+  readonly offset?: number;
+  readonly linesReturned?: number;
+  readonly partialLastLine?: boolean;
   readonly ok: boolean;
   readonly code?: string;
   readonly size?: number;
@@ -976,6 +982,10 @@ export class CodexCallbackBroker {
     if ("ok" in screened) return screened;
 
     const res = await this.fileop.op({ op: "read", path: screened.rel });
+    if (res.ok === false && res.code === "E_OVERSIZE" && explicitRange) {
+      const ranged = await this.fileop.op({ op: "read_text_range", path: screened.rel, offset, limit });
+      return this.validateTextRange(ranged, offset, limit);
+    }
     if (!res.ok) return this.mapFileopError(res);
     const maxReadBytes = 1024 * 1024;
     const malformed = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_MALFORMED" });
@@ -1007,7 +1017,7 @@ export class CodexCallbackBroker {
     }
 
     // LF ends a logical line, including its delimiter. Scan at most the validated 1 MiB
-    // body; there is no phantom line after a final LF. A range never changes the helper read.
+    // body; there is no phantom line after a final LF.
     const lineEnds: number[] = [];
     for (let i = 0; i < bytes.length; i++) {
       if (bytes[i] === 10) lineEnds.push(i + 1);
@@ -1036,6 +1046,49 @@ export class CodexCallbackBroker {
         truncated: res.truncated === true || end < bytes.length,
       },
     };
+  }
+
+  private validateTextRange(res: FileopResponse, offset: number, limit: number): CallbackResult {
+    if (!res.ok) {
+      if (res.code === "E_OVERSIZE") return {
+        ok: false, code: "fileop_denied", fileopCode: "E_OVERSIZE",
+        message: "file operation denied (E_OVERSIZE): text scan exceeds the 64 MiB budget",
+      };
+      return this.mapFileopError(res);
+    }
+    const malformed = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_MALFORMED" });
+    const allowed = res.kind === "binary" ? ["ok", "kind"] :
+      ["ok", "kind", "data", "size", "offset", "linesReturned", "partialLastLine", "truncated"];
+    if (Object.keys(res).some((key) => !allowed.includes(key))) return malformed();
+    if (res.kind === "binary") {
+      return deny("bad_args", "line ranges require a text file");
+    }
+    if (res.kind !== "text" || typeof res.data !== "string") return malformed();
+    if (res.data.length > 4 * Math.ceil(65536 / 3)) return this.mapFileopError({ ok: false, code: "E_OVERSIZE" });
+    if (res.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(res.data)) return malformed();
+    const bytes = Buffer.from(res.data, "base64");
+    if (bytes.toString("base64") !== res.data) return malformed();
+    if (bytes.length > 65536) return this.mapFileopError({ ok: false, code: "E_OVERSIZE" });
+    if (typeof res.size !== "number" || !Number.isSafeInteger(res.size) || res.size < bytes.length || res.size > 64 * 1024 * 1024 ||
+        res.offset !== offset || !Number.isSafeInteger(res.offset) ||
+        typeof res.linesReturned !== "number" || !Number.isSafeInteger(res.linesReturned) || res.linesReturned < 0 || res.linesReturned > limit ||
+        typeof res.partialLastLine !== "boolean" || typeof res.truncated !== "boolean") return malformed();
+    let content: string;
+    try { content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); } catch { return malformed(); }
+    if (content.includes("\u0000")) return malformed();
+    const lf = bytes.reduce((count, byte) => count + (byte === 10 ? 1 : 0), 0);
+    const represented = lf + (bytes.length > 0 && bytes.at(-1) !== 10 ? 1 : 0);
+    if (res.linesReturned !== represented ||
+        (res.partialLastLine && (!res.truncated || bytes.length === 0 || bytes.at(-1) === 10)) ||
+        (bytes.length === 0 && (res.truncated || res.partialLastLine)) ||
+        (res.truncated && res.size <= bytes.length) ||
+        (res.truncated && res.linesReturned < limit && !res.partialLastLine && bytes.length < 65533) ||
+        (res.partialLastLine && bytes.length < 65533) ||
+        (res.truncated && !res.partialLastLine && bytes.at(-1) !== 10) ||
+        (bytes.length > 0 && offset - 1 > res.size - bytes.length) ||
+        (offset === 1 && !res.truncated && res.size !== bytes.length)) return malformed();
+    return { ok: true, output: { size: res.size, content, offset, linesReturned: res.linesReturned,
+      partialLastLine: res.partialLastLine, truncated: res.truncated } };
   }
 
   /** Search only through fileop list/stat/read. Every traversal and returned byte has

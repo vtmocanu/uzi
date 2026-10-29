@@ -1049,3 +1049,34 @@ it("activity: a throwing recorder never fails the check", async () => {
  assert.equal(await r.run(), verdict);
  assert.ok(sent);
 });
+
+
+it("large ranged Read remains fenced and records accurate activity ranges", async () => {
+ const events: Record<string, unknown>[] = [];
+ const recorder = new CheckActivityRecorder((p) => { events.push(structuredClone(p)); }, { generation: 7 });
+ recorder.attach("/checkout", "/owned");
+ const content = '\u0001"\\'.repeat(100) + "\r\nsecond\n";
+ const r = rig({ activity: recorder,
+  fileopReply: (op) => op.op === "read" ? { ok: false, code: "E_OVERSIZE" } : op.op === "read_text_range" ? {
+   ok: true, kind: "text", data: Buffer.from(content).toString("base64"), size: 2 * 1024 * 1024,
+   offset: 300, linesReturned: 2, partialLastLine: false, truncated: true,
+  } : undefined,
+  notes: (emit) => emit({ id: 90, method: "item/tool/call", params: {
+   threadId: "thread", turnId: "turn", callId: "large-read", tool: "Read", arguments: { path: "large.ts", offset: 300, limit: 2 },
+  } }),
+  onToolReply: (frame, emit) => {
+   assert.equal(frame.result.success, true);
+   assert.ok(Buffer.byteLength(JSON.stringify(frame)) < 4 * 1024 * 1024);
+   const match = /^<(repository_excerpt_[a-f0-9]{32})>\n([\s\S]*)\n<\/\1>$/.exec(frame.result.contentItems[0].text);
+   assert.ok(match);
+   assert.deepEqual(JSON.parse(match[2]!), { size: 2 * 1024 * 1024, content, offset: 300,
+    linesReturned: 2, partialLastLine: false, truncated: true });
+   r.terminal(emit);
+  },
+ });
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(r.ops, ["stat", "read", "read_text_range"]);
+ assert.deepEqual(events.filter((e) => e["event"] === "check_activity"), [
+  { event: "check_activity", op: "read", outcome: "ok", path: "large.ts", lines: [300, 301] },
+ ]);
+});

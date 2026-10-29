@@ -28,7 +28,7 @@ terse and tag each AI edit `(AI-synced YYYY-MM-DD)`.
 
 ## Codex bounded Read (#296)
 
-- Text Read accepts path/file_path and optional one-based positive safe integer offset (default 1), limit 1–2000 (default 200); excerpts preserve UTF-8/BOM and LF/CRLF, cap at 64 KiB, and report size/content/offset/linesReturned/partialLastLine/truncated without duplicate base64 or a cursor. Strict helper validation retains the 1 MiB file ceiling and neutral errors. Invalid UTF-8 or NUL returns exact base64 only without explicit ranges; ranged binary is refused. Root and child replies must fit the existing 4 MiB transport cap. Full contract: [ADR 0296](../adr/0296-codex-bounded-text-reads.md). (AI-synced 2026-10-05)
+- Text Read accepts path/file_path and optional one-based positive safe integer offset (default 1), limit 1–2000 (default 200); excerpts preserve UTF-8/BOM and LF/CRLF, cap at 64 KiB, and report size/content/offset/linesReturned/partialLastLine/truncated without duplicate base64 or a cursor. Strict helper validation retains the 1 MiB unranged ceiling and neutral errors. Only an explicit offset or limit (including supplied defaults) permits fallback after a legacy helper E_OVERSIZE to a bounded text scan: at most 64 MiB observed input including growth, at most 64 KiB retained excerpt, whole-input UTF-8/NUL validation and actual scanned size; no snapshot guarantee. Omitted defaults do not opt in. Search remains on legacy raw reads. Invalid UTF-8 or NUL returns exact base64 only without explicit ranges; ranged binary is refused. Root and child replies must fit the existing 4 MiB transport cap. Full contract: [ADR 0296](../adr/0296-codex-bounded-text-reads.md). (AI-synced 2026-10-29)
 
 ## Claude SDK spill Read (#2332)
 

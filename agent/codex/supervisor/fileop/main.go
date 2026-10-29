@@ -17,6 +17,7 @@
 //
 //	{"id":<int>,"op":"stat","path":"rel"}
 //	{"id":<int>,"op":"read","path":"rel"}
+//	{"id":<int>,"op":"read_text_range","path":"rel","offset":1,"limit":200}
 //	{"id":<int>,"op":"write","path":"rel","data":"<base64>"}
 //	{"id":<int>,"op":"apply","path":"rel","old":"<base64>","data":"<base64>"}
 //	{"id":<int>,"op":"mkdir","path":"rel"}
