@@ -496,8 +496,9 @@ func TestVaultBrowserRestoreLockRaceLiveDB(t *testing.T) {
 }
 
 // bsPublicationRace pauses only the first successful commit, after its DB
-// fences are released. Sibling transactions remain free to complete. All waits
-// use request deadlines; cleanup cancels, releases publication, and joins work.
+// fences are released. Sibling transactions remain free to complete. Operation
+// waits and cleanup joins are bounded separately; cleanup cancels and releases
+// publication before joining work.
 type bsPublicationRace struct {
 	ctx     context.Context
 	entered chan struct{}
@@ -517,7 +518,18 @@ func bsNewPublicationRace(t *testing.T, f bsFixture) (*vault.Vault, *bsPublicati
 	t.Cleanup(func() {
 		cancel()
 		r.resume()
-		r.work.Wait()
+		joined := make(chan struct{})
+		go func() {
+			r.work.Wait()
+			close(joined)
+		}()
+		timer := time.NewTimer(10 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-joined:
+		case <-timer.C:
+			t.Error("publication race cleanup join deadline")
+		}
 	})
 	var paused atomic.Bool
 	v := bsWrappedAfterCommit(f, func(q vault.BrowserStore) vault.BrowserStore { return q }, false,
