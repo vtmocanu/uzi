@@ -158,7 +158,14 @@ export class ActiveRunRegistry {
   /** Bind an asynchronous ownership observation to the exact projection/execution it saw.
    * A later claim or observation invalidates it, including the initially unknown case. */
   beginPolicyOwnershipObservation(runId: string): (generation: number | null) => boolean {
-    const proof = this.policyOwnership.get(runId);
+    const pending = this.pendingOutcomes();
+    this.projection(pending);
+    if (!this.runs.get(runId)?.policyPendingOnly &&
+        !pending.some(p => p.run_id === runId && this.isPolicy(p))) return () => false;
+    // Allocate an identity even for unknown evidence. Clearing/pruning a later
+    // proof must never recreate the identity an earlier HTTP request captured.
+    const proof = this.policyOwnership.get(runId) ?? { generation: undefined };
+    this.policyOwnership.set(runId, proof);
     const execution = this.runs.get(runId);
     return generation => {
       if (this.policyOwnership.get(runId) !== proof || this.runs.get(runId) !== execution) return false;
@@ -169,7 +176,7 @@ export class ActiveRunRegistry {
   /** Forget only the matching proof. Remaining unsettled sources become unknown/conservative. */
   clearPolicyOwnership(runId: string, expectedGeneration: number): boolean {
     if (this.policyOwnership.get(runId)?.generation !== expectedGeneration) return false;
-    this.policyOwnership.delete(runId);
+    this.policyOwnership.set(runId, { generation: undefined });
     return true;
   }
 

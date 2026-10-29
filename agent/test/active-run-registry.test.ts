@@ -347,6 +347,31 @@ describe("policy pending snapshot projection", () => {
     assert.strictEqual(reg.build().active[0]!.claim_generation, 5);
   });
 
+  it("a cleared newer proof cannot revive an initially unknown observation", () => {
+    const reg = new ActiveRunRegistry(() => [policy(RUN_A, 1)], () => 8);
+    const late = reg.beginPolicyOwnershipObservation(RUN_A);
+    reg.notePolicyOwnership(RUN_A, 4);
+    reg.clearPolicyOwnership(RUN_A, 4);
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), true);
+    assert.strictEqual(late(3), false);
+    assert.deepStrictEqual(reg.build().active, []);
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), true);
+  });
+
+  it("pruning a settled source cannot revive an observation on its replacement", () => {
+    let sources = [policy(RUN_A, 1)];
+    const reg = new ActiveRunRegistry(() => sources, () => 8);
+    const late = reg.beginPolicyOwnershipObservation(RUN_A);
+    sources = [{ ...sources[0]!, server_settled: true }];
+    reg.build();
+    sources = [policy(RUN_A, 2)];
+    assert.strictEqual(late(3), false);
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), true);
+    const fresh = reg.beginPolicyOwnershipObservation(RUN_A);
+    assert.strictEqual(fresh(4), true);
+    assert.strictEqual(reg.build().active[0]!.claim_generation, 4);
+  });
+
   it("G1 alone projects G3 without changing the register source identity", () => {
     const reg = new ActiveRunRegistry(() => [policy(RUN_A, 1)], () => 8);
     reg.notePolicyOwnership(RUN_A, 3);
