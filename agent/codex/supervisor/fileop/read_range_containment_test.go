@@ -70,7 +70,21 @@ func TestReadRangeContainment(t *testing.T) {
 
 func TestReadRangeSocket(t *testing.T) {
 	s, root, reads, closes := rangeFixture(t, []byte("inside"))
-	listener, err := net.Listen("unix", filepath.Join(root, "socket"))
+	absoluteSocket := filepath.Join(root, "socket")
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := filepath.Rel(cwd, absoluteSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// AF_UNIX bounds the address length. Avoid a long absolute workspace prefix
+	// without changing the working directory or the confined fixture pathname.
+	if len(absoluteSocket) < len(address) {
+		address = absoluteSocket
+	}
+	listener, err := net.Listen("unix", address)
 	if err != nil {
 		t.Fatal(err)
 	}
