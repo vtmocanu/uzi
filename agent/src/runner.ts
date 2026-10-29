@@ -20,7 +20,7 @@ import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
 import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE } from "./protocol.js";
-import { PublicationContextLatch } from "./publication-context.js";
+import { PublicationContextLatch, publicationContextReason } from "./publication-context.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CREDENTIAL_SWITCH_HOLD_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
@@ -1011,9 +1011,12 @@ class ClosingCommitRefusedSignal extends PublicationRefusedSignal {
 
 /** A refresh has no affirmative, stable source authority for this exact candidate. */
 class PublicationContextRefusedSignal extends PublicationRefusedSignal {
-  constructor(readonly head: string | null) {
+  /** Closed-set refusal reason from the api; undefined for transport, malformed or latch failures. */
+  readonly reason: string | undefined;
+  constructor(readonly head: string | null, reason?: unknown) {
     super("refresh publication context refused");
     this.name = "PublicationContextRefusedSignal";
+    this.reason = publicationContextReason(reason);
   }
 }
 
@@ -8666,9 +8669,11 @@ export class RunRunner {
         const context = await this.client.publicationContext(runId, {
           claim_generation: flight.claimGeneration!, branch: result.branch, candidate_head: head,
         }, boundarySignal);
+        if (context.status === "unknown") throw new PublicationContextRefusedSignal(head, context.reason);
         closingGateIid = publicationContextLatch.observe(context);
       } catch (error) {
         rethrowWorkflowAbort(error);
+        if (error instanceof PublicationContextRefusedSignal) throw error;
         throw new PublicationContextRefusedSignal(head);
       }
     };
@@ -8686,7 +8691,7 @@ export class RunRunner {
       return commits.filter(c => closingDirectiveFor(c.message, closingGateIid!, closingRepoPath)).map(c => c.sha);
     };
     let prepushReported = false;
-    const refusePrepush = async (kind: "closing" | "unknown" | "context", head: string | null, evidence: string[] | null = null): Promise<void> => {
+    const refusePrepush = async (kind: "closing" | "unknown" | "context", head: string | null, evidence: string[] | null = null, contextReason?: string): Promise<void> => {
       if (prepushReported) return;
       prepushReported = true;
       // Never place unvalidated evidence or commit text in the feed or terminal journal.
@@ -8694,8 +8699,9 @@ export class RunRunner {
       const shown = (shas ?? []).slice(0, 5).join(", ");
       const more = (shas?.length ?? 0) > 5 ? ` and ${shas!.length - 5} more` : "";
       const refusedCandidate = head && /^[a-fA-F0-9]{40}$/.test(head) ? head : "unavailable";
+      const shownReason = publicationContextReason(contextReason);
       const refusalReason = kind === "context"
-        ? `refresh publication refused: source context could not be confirmed for candidate ${refusedCandidate}; publication stopped`
+        ? `refresh publication refused: source context could not be confirmed${shownReason ? ` (${shownReason})` : ""} for candidate ${refusedCandidate}; publication stopped`
         : kind === "unknown" ? COMPLETION_INTERLOCK_UNHELD_REASON : shas === null
         ? "non-closing delivery refused: could not read the commit messages to publish; publication stopped"
         : `non-closing delivery refused: commit message(s) close issue #${closingGateIid} (${shown}${more}); publication stopped; correcting them needs a history rewrite, left to the owner`;
@@ -8958,7 +8964,7 @@ export class RunRunner {
       await refreshPublicationContext(publicationOriginalHead);
     } catch (error) {
       if (!(error instanceof PublicationContextRefusedSignal)) throw error;
-      await refusePrepush("context", error.head);
+      await refusePrepush("context", error.head, null, error.reason);
       return;
     }
 
@@ -9771,7 +9777,7 @@ export class RunRunner {
       rethrowWorkflowAbort(e);
       if (e instanceof PublicationRefusedSignal) {
         if (e instanceof ClosingCommitRefusedSignal) await refusePrepush("closing", e.head, e.shas);
-        if (e instanceof PublicationContextRefusedSignal) await refusePrepush("context", e.head);
+        if (e instanceof PublicationContextRefusedSignal) await refusePrepush("context", e.head, null, e.reason);
         return;
       }
       if (e instanceof ScratchPublicationError) throw e;
@@ -9854,7 +9860,7 @@ export class RunRunner {
         rethrowWorkflowAbort(e);
         if (e instanceof PublicationRefusedSignal) {
           if (e instanceof ClosingCommitRefusedSignal) await refusePrepush("closing", e.head, e.shas);
-          if (e instanceof PublicationContextRefusedSignal) await refusePrepush("context", e.head);
+          if (e instanceof PublicationContextRefusedSignal) await refusePrepush("context", e.head, null, e.reason);
           return;
         }
         if (e instanceof RunResidueBlockedError) throw e;
