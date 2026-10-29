@@ -204,7 +204,11 @@ park of that cause retries itself and keeps polling. An integrity refusal,
 local work and custody are preserved, with no automatic retry. Back up available
 work, then ask the owner to Resume or Cancel; Resume requests a bounded attempt,
 not assured success, and another adoption failure holds again. Other
-`recovery_wait` causes keep polling under their existing rules. `uzi-lander` uses this same poller for its
+`recovery_wait` causes keep polling under their existing rules. For `worker_memory_pressure`,
+poll only with an object `memory_hold` whose `remaining` is a positive integer JSON number;
+zero or missing/malformed budget evidence stops with `STOP=recovery_wait:worker_memory_pressure`
+(exit 0). Back up available work first, then ask the owner to Resume or Cancel.
+`uzi-lander` uses this same poller for its
 blind watch to terminal.
 
 **Watching for a REVISED plan (after `uzi run revise`) uses the plan-seq form.** The

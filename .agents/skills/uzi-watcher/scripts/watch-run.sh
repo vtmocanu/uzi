@@ -14,7 +14,7 @@
 # Usage: watch-run.sh <run-id> [stop-csv] [interval-secs] [max-polls] [min-plan-seq] [min-question-seq]
 #   stop-csv (default) covers a plan gate, a question park, and every terminal
 #   state: completed,failed,cancelled,awaiting_approval,awaiting_input
-#   (`paused`, recovery_wait/worker_requeue_exhausted and recovery_wait/retained_recovery_adoption_failed always stop; retained_recovery_exhausted stops only when owner-held; see below)
+#   (`paused`, recovery_wait/worker_requeue_exhausted and recovery_wait/retained_recovery_adoption_failed always stop; retained_recovery_exhausted and worker_memory_pressure stop when owner-held; see below)
 #   For "watch to the end only" (after you have approved), pass:
 #     watch-run.sh <id> completed,failed,cancelled 60
 #
@@ -70,6 +70,10 @@
 # RESULT=stop:recovery_wait, exit 0. So does an owner-held `retained_recovery_exhausted` park (#3495:
 # recovery_retry_not_before present and explicitly null = retries capped):
 # STOP=recovery_wait:retained_recovery_exhausted. A stamped, omitted or malformed exhaustion stamp keeps polling.
+# A worker_memory_pressure park keeps polling only when memory_hold is an object with a positive
+# integer remaining budget. Zero, missing or malformed budget evidence stops conservatively:
+# STOP=recovery_wait:worker_memory_pressure, RESULT=stop:recovery_wait, exit 0. Back up available
+# work first, then ask the owner to Resume or Cancel. used/max do not establish retry authority.
 # A retained_recovery_adoption_failed park always stops as an owner decision regardless of retry stamp:
 # integrity checks refused adoption; local work and custody are preserved, with no automatic retry.
 # Other recovery_wait causes keep polling unless the stop set names
@@ -173,6 +177,14 @@ while [ "$i" -lt "$MAX" ]; do
     if [ "$rc_cause" = worker_requeue_exhausted ]; then
       printf 'STOP=recovery_wait:worker_requeue_exhausted\n'
       printf 'NOTE owner decision: automatic worker recovery stopped; back up the work, then uzi run resume or cancel\n'
+      printf 'RESULT=stop:recovery_wait\n'
+      exit 0
+    fi
+    if [ "$rc_cause" = worker_memory_pressure ] &&
+       ! printf '%s' "$rj" | jq -e '.memory_hold | type == "object" and
+         (.remaining | type == "number" and isfinite and . > 0 and . == floor)' >/dev/null 2>&1; then
+      printf 'STOP=recovery_wait:worker_memory_pressure\n'
+      printf 'NOTE back up available work first; owner decision: memory-pressure retry budget is exhausted or unverified; only owner uzi run resume or cancel\n'
       printf 'RESULT=stop:recovery_wait\n'
       exit 0
     fi
