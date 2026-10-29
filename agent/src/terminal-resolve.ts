@@ -102,9 +102,12 @@ export function makeTerminalOutboxDeps(
   client: TerminalOutboxDeps["client"],
   opts: { gapFillMax: number; terminalMaxBytes: number; log: Logger; retainDisabledPolicy?: boolean },
 ): TerminalOutboxDeps | undefined {
-  // Policy callers must opt in and journalPolicyHold even on a disabled store: its memory
-  // projection preserves snapshot membership, while the resolver requires authenticated disk evidence.
-  if (!outbox || (outbox.isDisabled() && !opts.retainDisabledPolicy)) return undefined;
+  if (!outbox) return undefined;
+  // New policy producers opt in before selection. Once a policy/unknown winner
+  // exists, legacy callers must retain arbitration too rather than send directly.
+  // The resolver still requires authenticated disk evidence before any policy send.
+  if (outbox.isDisabled() && !opts.retainDisabledPolicy &&
+      !outbox.listPendingTerminals().some(p => p.outcome_kind === "policy_hold" || p.outcome_kind === "unknown")) return undefined;
   return { outbox, client, gapFillMax: opts.gapFillMax, terminalMaxBytes: opts.terminalMaxBytes, log: opts.log };
 }
 

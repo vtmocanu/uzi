@@ -405,7 +405,11 @@ for (const kind of ["policy_hold", "unknown"] as const) {
     const before = outbox.listPendingTerminals();
     assert.equal(before[0]?.outcome_kind, kind);
     let sends = 0;
-    await journalAndResolveTerminal(deps(outbox, async () => { throw new Error("no durable policy send"); }), {
+    const ordinaryDeps = makeTerminalOutboxDeps(outbox,
+      deps(outbox, async () => { throw new Error("no durable policy send"); }).client,
+      { terminalMaxBytes: 1024, gapFillMax: 1, log: nullLogger() });
+    assert.ok(ordinaryDeps, "legacy callers must still see retained policy/unknown arbitration");
+    await journalAndResolveTerminal(ordinaryDeps, {
       ...args, phase: "implementation", messagesThroughSeq: 0, body: { status: "failed" },
       send: async () => { sends++; return { applied: true, status: "failed" }; },
     });
