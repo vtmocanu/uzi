@@ -901,7 +901,7 @@ The original follow-ups are recorded below with their later disposition where kn
   capacity pressure confer no deletion authority. Refs #2852.
 - **Follow-up 5 — a per-attempt cgroup v2 boundary.** Proper per-run process
   ownership would resolve the remaining concurrent-claim and single-uid
-  lockout. This direction is parked in #1862.
+  lockout. This direction was closed as not planned in #1862 (2026-09-28).
 
 **Accepted risks:**
 
