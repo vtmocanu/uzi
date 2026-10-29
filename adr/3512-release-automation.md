@@ -115,11 +115,15 @@ complete. Pre-cut CI retries already record steps, attempt and result.
 Publication/verification timestamps are recorded without claiming deployment
 health. Runner-slot and critical-path impact remain unmeasured until live use.
 
-An otherwise eligible tip that contains a recognized skip instruction and lacks
-required exact main-push proof refuses promptly with `skip-ci-tip`, rather than
-waiting for a run that will not be created. Scheduled planning no-ops keep
-priority. No parent proof, older cut point, CI dispatch or repair commit is used;
-a newer normally CI-bearing main tip must pass before retrying the cut.
+An otherwise eligible manual cut whose tip contains a recognized skip
+instruction and lacks exact main-push proof refuses promptly with `skip-ci-tip`.
+The cutter's tip precondition is also an immediate point check. Scheduled
+attempts stay unheld and keep polling/reselecting main within their existing
+budget, logging `skip_ci_tip=true` while that condition holds. A newer green
+CI-bearing tip can proceed in the same operation. If the budget expires while
+the selected tip is still skip-marked and lacks proof, the scheduled attempt
+defers with `skip-ci-tip`. Planning no-ops keep priority. No parent proof, older
+cut point, CI dispatch or repair commit is substituted.
 Non-shipping documentation does not imply unchanged checked inputs: PRDs and
 ADRs are read by doc validation. A 30-day first-parent audit found 38 skip-marked
 tips among 1030 main commits, all touching checked PRD text. The parent bridge

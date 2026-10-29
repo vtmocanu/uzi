@@ -949,7 +949,46 @@ class Nightly(unittest.TestCase):
         self.assertEqual((status, data['reason'], data['parent'], data['stage']), (1, 'skip-ci-tip', H, 'tip-wait'))
         self.assertIn('skip-ci-tip', note)
         self.assertNotIn('digest', data)
+        self.assertEqual((data['outcome'], fixture.now), ('defer', 10800))
         self.assertFalse(any(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls))
+
+    def test_scheduled_skip_tip_follows_new_ci_bearing_tip_in_same_operation(self):
+        release, fixture, api = self.release(heads=[H, NEW], now='2026-10-27T10:49:30Z')
+        fixture.messages[H] = '[' + 'skip ci' + ']'
+        api.run.side_effect = lambda workflow, sha, branch: None if sha == H else run()
+        with contextlib.redirect_stdout(io.StringIO()) as progress:
+            try:
+                selected, _ = release.tip(interval=5)
+            except auto.Stop as error:
+                self.fail('scheduled attempt lost its recoverable window: ' + error.reason)
+        self.assertEqual((selected, fixture.now), (NEW, 5))
+        events = [json.loads(line.removeprefix('release-auto: ')) for line in progress.getvalue().splitlines()]
+        self.assertEqual([event.get('skip_ci_tip') for event in events], [True, False])
+
+    def test_scheduled_skip_tip_names_refusal_only_at_deadline(self):
+        for overshoot in (False, True):
+            with self.subTest(overshoot=overshoot):
+                release, fixture, api = self.release(now='2026-10-27T10:49:30Z')
+                fixture.messages[H] = '[' + 'skip ci' + ']'
+                api.run.return_value = None
+                if overshoot:
+                    release.sleep = lambda delay: fixture.sleep(delay + 1)
+                with contextlib.redirect_stdout(io.StringIO()) as progress, self.assertRaisesRegex(auto.Stop, 'skip-ci-tip') as stopped:
+                    release.tip(interval=7)
+                self.assertEqual((stopped.exception.outcome, fixture.now), ('defer', 31 if overshoot else 30))
+                event = json.loads(progress.getvalue().splitlines()[0].removeprefix('release-auto: '))
+                self.assertIs(event.get('skip_ci_tip'), True)
+                self.assertFalse(any(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls))
+
+    def test_scheduled_move_to_unmarked_missing_tip_restores_normal_deadline_reason(self):
+        release, fixture, api = self.release(heads=[H, NEW], now='2026-10-27T10:49:30Z')
+        fixture.messages[H] = '[' + 'skip ci' + ']'
+        api.run.return_value = None
+        with contextlib.redirect_stdout(io.StringIO()) as progress, self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-cutoff'):
+            release.tip(interval=5)
+        self.assertEqual(fixture.now, 30)
+        events = [json.loads(line.removeprefix('release-auto: ')) for line in progress.getvalue().splitlines()]
+        self.assertEqual([event.get('skip_ci_tip') for event in events], [True, False])
 
     def test_manual_noop_respin_and_morning_independent_budget_remain(self):
         release, fixture, api = self.release(plan(OP='noop', SHIPPING_COUNT='0'))

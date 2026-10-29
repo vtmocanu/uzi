@@ -155,13 +155,17 @@ An unconfirmed push receipt stops watch before publication recovery and
 verification, so automatic publication retries do not run in that branch.
 Inspect remote refs, then use local watch/verify against the same tag/SHA.
 
-Keep a tip intended for release eligible for CI. If a recognized skip instruction
-leaves required exact main-push proof absent, prepare refuses immediately with
-`skip-ci-tip`; the local cutter's tip check gives the same diagnostic. A newer
-CI-bearing main tip, once green, unblocks the cut. There is no parent-proof
-exemption for docs or PRDs: their changed text has not passed its own checks.
-Automation does not dispatch CI, create a repair commit or select an older tip.
-Scheduled planning no-ops still complete without waiting or cutting.
+Keep a tip intended for release eligible for CI. When a recognized skip
+instruction leaves exact main-push proof absent, manual preparation and the
+local cutter's point check refuse immediately with `skip-ci-tip`. Scheduled
+attempts stay unheld and keep waiting for a newer tip within the existing
+budget; progress logs show `skip_ci_tip=true`. A newer green CI-bearing tip
+can be cut in that same operation. If the budget expires while the selected
+tip still lacks proof because of a skip instruction, the scheduled attempt
+defers with `skip-ci-tip`. Planning no-ops retain priority. There is no
+parent-proof exemption for docs or PRDs: their changed text has not passed its
+own checks. Automation does not dispatch CI, create a repair commit or select
+an older tip.
 
 Nightly attempts are scheduled for 04:47 Europe/Bucharest using GitHub's native
 timezone support, after the local maintenance window, aiming to cut near 05:00
