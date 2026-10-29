@@ -525,7 +525,8 @@ func (q *Queries) MaintenanceSnapshotNow(ctx context.Context) (pgtype.Timestampt
 
 const runAdmittableForEphemeralProvision = `-- name: RunAdmittableForEphemeralProvision :one
 SELECT ((NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
-        AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true))::boolean AS admittable
+        AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
+        AND fn_forge_origin_provision_allowed(r, now()))::boolean AS admittable
 FROM runs r
 WHERE r.id = $1
 `

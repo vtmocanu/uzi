@@ -1169,6 +1169,7 @@ type Run struct {
 	HintedCapabilities          []string           `json:"hinted_capabilities"`
 	CapabilityInferenceEvidence []byte             `json:"capability_inference_evidence"`
 	IdleStallParkCount          int32              `json:"idle_stall_park_count"`
+	ForgeAdmission              []byte             `json:"forge_admission"`
 }
 
 type RunCompletionAttempt struct {

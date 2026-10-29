@@ -111,13 +111,14 @@ const (
 // recomputes elapsed from health_since, so a stored duration would go stale). The
 // owner sees these; non-owners never see the reason at all (owner-gated in M3).
 const (
-	reasonStalled       = "the agent stopped sending updates"
-	reasonLooping       = "the agent keeps repeating the same action"
-	reasonNearTimeout   = "this run is close to its wall-clock timeout and will be stopped when it reaches it"
-	reasonApprovalIdle  = "waiting for the plan to be approved"
-	reasonVaultLocked   = "your vault is locked, so this run can't start"
-	reasonNoWorker      = "no worker is online to pick up this run"
-	reasonWaitingWorker = "waiting for a worker to pick up this run"
+	reasonStalled         = "the agent stopped sending updates"
+	reasonLooping         = "the agent keeps repeating the same action"
+	reasonNearTimeout     = "this run is close to its wall-clock timeout and will be stopped when it reaches it"
+	reasonApprovalIdle    = "waiting for the plan to be approved"
+	reasonVaultLocked     = "your vault is locked, so this run can't start"
+	reasonNoWorker        = "no worker is online to pick up this run"
+	reasonWaitingWorker   = "waiting for a worker to pick up this run"
+	reasonForgeOriginWait = "waiting for worker forge-origin cooldown or recovery trial; heartbeat online does not prove forge reachability"
 	// reasonHandoffSetup (PRD #400 Decision 6 / issue #1367) is the honest queued reason
 	// for an UNDISPATCHED task (handoff) run — one whose uzi/task/<id> branch push or
 	// dispatch has not yet landed, so dispatched_at is still NULL. ClaimRun never offers
@@ -1316,6 +1317,9 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 	}
 	if early {
 		return ""
+	}
+	if eligibilityErr == nil && eligibility.ForgeBlocked > 0 && eligibility.Claimable == 0 {
+		return reasonForgeOriginWait
 	}
 	if r.Kind == "cross_check" {
 		if eligibilityErr != nil {
