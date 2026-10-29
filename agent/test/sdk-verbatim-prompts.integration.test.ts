@@ -366,12 +366,13 @@ describe("streamed prompts are not preprocessed by the CLI (issue #1563)", () =>
     }
   });
 
-  it("slash text embedded in a generated prompt is never dispatched", { timeout: 120_000 }, async () => {
-    const control = await drive(COMMAND, { verbatimPrompts: false });
-    assert.ok(firstSent(control, CMD_MARKER), "control: the command fixture is not dispatchable, so this probe proves nothing");
-    for (const override of [{ verbatimPrompts: false }, {}]) {
+  // One test per option state, so no test runs more than two drives against its 120 s cap.
+  for (const override of [{ verbatimPrompts: false }, {}]) {
+    it(`slash text embedded in a generated prompt is never dispatched (${JSON.stringify(override)})`, { timeout: 120_000 }, async () => {
+      const control = await drive(COMMAND, { verbatimPrompts: false });
+      assert.ok(firstSent(control, CMD_MARKER), "control: the command fixture is not dispatchable, so this probe proves nothing");
       const d = await drive(`Context line\nplease run ${COMMAND} later`, override);
       assert.ok(!sent(d, CMD_MARKER), `embedded slash text was dispatched (${JSON.stringify(override)})`);
-    }
-  });
+    });
+  }
 });
