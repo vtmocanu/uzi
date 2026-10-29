@@ -579,7 +579,7 @@ func providerBoardLine(r apitypes.RunDTO) string {
 // boardShowSecondLine reserves the selected row's activity or typed park/hold
 // guidance. It has no milestone precondition; window math and rendering share it.
 func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
-	return (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
+	return isForgePark(r.RunDTO) || r.ForgeOriginCooldown != nil || (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
 		codexAccountActionLine(r.RunDTO) != "" || vaultParkLine(r.RunDTO) != "" ||
 		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != "" || credentialSwitchHoldLine(r.RunDTO) != "" || isOwnerRequiredWorkerHold(r.RunDTO) || isRecoveryDecisionPark(r.RunDTO) ||
 		isProviderUnavailableHold(r.RunDTO) || providerParkLine(r.RunDTO) != ""
@@ -603,6 +603,14 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	// bands into NEEDS YOU via runBandOf; its line keeps the wait ink). The line carries
 	// the owner's alias label (user-authored), folded through cellText by
 	// codexAccountActionLine and through renderer.Plain here (D7).
+	if isForgeOwnerHold(r.RunDTO) {
+		out := prefix + paintSeg(m.pal.amber, bg, false, "Owner-held · Resume/Cancel · detail: enter")
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
+	if lines := forgeRunLines(r.RunDTO); len(lines) > 0 {
+		out := prefix + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(strings.Join(lines, " · "), 400))
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
 	if line := providerBoardLine(r.RunDTO); line != "" {
 		ink := m.pal.wait
 		if isProviderUnavailableHold(r.RunDTO) {

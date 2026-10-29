@@ -86,8 +86,8 @@ func recoveryDecisionTUILines(r apitypes.RunDTO) []string {
 // even when status and cause have not changed.
 func workerHoldNoticeKey(r apitypes.RunDTO) string {
 	key := r.Status + "/" + strOr(r.HoldReason, "") + "/" + strOr(r.RecoveryWaitCause, "")
-	if isRecoveryDecisionPark(r) {
-		if isRecoveryDecisionHold(r) {
+	if isRecoveryDecisionPark(r) || isForgePark(r) {
+		if isRecoveryDecisionHold(r) || isForgeOwnerHold(r) {
 			return key + "/held"
 		}
 		if r.RecoveryRetryNotBefore == nil {

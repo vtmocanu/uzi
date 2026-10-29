@@ -440,6 +440,9 @@ func tuiRejectedRun(r apitypes.RunDTO) bool {
 // runStateToken gives typed provider, Codex relogin and credential holds their
 // own tokens; other runs use stateToken. Provider markers require matching status.
 func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
+	if isForgeOwnerHold(r) {
+		return runToken{glyph: "!", word: "forge held", color: p.amber}
+	}
 	if isRecoveryDecisionPark(r) {
 		if isRecoveryDecisionHold(r) {
 			return runToken{glyph: "!", word: recoveryDecisionWord(r), color: p.amber}

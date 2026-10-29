@@ -261,6 +261,9 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 		lines = append(lines, header, "  "+m.pal.faint.Render(heartbeat))
 	}
 	lines = append(lines, m.manualCordonLines(r, width)...)
+	for _, line := range workerForgeLines(w) {
+		lines = append(lines, "  "+m.renderer.Plain(line, max(0, width-2)))
+	}
 	lines = append(lines, "", m.pal.title.Render("attention"))
 	attention := workerAttention(r, now)
 	if len(attention) == 0 {

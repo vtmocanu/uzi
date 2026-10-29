@@ -975,7 +975,7 @@ func TestForgeParkLine(t *testing.T) {
 	// No retry stamp ⇒ the retry clause is dropped, the count stays.
 	noStamp := base
 	noStamp.RecoveryRetryNotBefore = nil
-	if got := forgeParkLine(noStamp); got != "waiting for the forge (2 of 5)" || strings.Contains(got, "retry at") {
+	if got := forgeParkLine(noStamp); got != "waiting for the forge (2 of 5); retry timing unknown" || strings.Contains(got, "retry at") {
 		t.Errorf("forgeParkLine(no stamp) = %q, want no retry clause", got)
 	}
 

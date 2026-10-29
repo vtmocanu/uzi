@@ -77,6 +77,11 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 		}
 		consecutiveUnreachable = 0
 		cause := strOr(run.RecoveryWaitCause, "")
+		if isForgePark(run) && workerHoldNoticeKey(run) != lastWorkerHoldKey {
+			for _, line := range forgeRunLines(run) {
+				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), line)
+			}
+		}
 		workerKey := workerHoldNoticeKey(run)
 		if (isOwnerRequiredWorkerHold(run) || isRecoveryDecisionPark(run)) && workerKey != lastWorkerHoldKey {
 			_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", runID, workerExhaustionLine(run))
@@ -145,7 +150,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				runID, cellText(run.Status))
 		}
 
-		if targets[run.Status] || (defaultUntil && (isOwnerRequiredWorkerHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run))) {
+		if targets[run.Status] || (defaultUntil && (isForgeOwnerHold(run) || isOwnerRequiredWorkerHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run))) {
 			// PRD #603: `--min-plan-seq N` (N >= 0) gates ONLY the awaiting_approval
 			// stop so a wait after `run revise` returns on the REVISED plan, not the
 			// stale gate left by the pre-revise plan. Every other target — terminals,
@@ -243,7 +248,7 @@ func newRunWaitCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Block until a run reaches a chosen state",
 		Long: "Poll a run until its status enters the `--until` set, then exit 0 (PRD #264).\n\n" +
 			"With no `--until`, it stops on any state that needs you or ends the run: " +
-			strings.Join(defaultWaitStates, ", ") + ", or worker recovery exhausted / worker memory pressure / owner-held retained recovery exhausted / owner-held Codex idle stall (recovery_wait; owner Resume or Cancel), " +
+			strings.Join(defaultWaitStates, ", ") + ", or forge automatic retries exhausted / worker recovery exhausted / worker memory pressure / owner-held retained recovery exhausted / owner-held Codex idle stall (recovery_wait; owner Resume or Cancel), " +
 			"or a --require-base run held because its kept work is not attested against the planned base (paused, " +
 			"base_attestation_missing; recover its kept work with the run recovery or run export commands). " +
 			"Explicit --until uses only the named statuses. Ordinary transient recovery_wait keeps polling. It does NOT stop " +

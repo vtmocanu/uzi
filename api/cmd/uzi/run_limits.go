@@ -95,11 +95,15 @@ func newRunResumeNowCmd(env Env, gf *globalFlags) *cobra.Command {
 func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 	resume := &cobra.Command{
 		Use:   "resume <run-id>",
-		Short: "Resume a paused or worker recovery exhausted run",
+		Short: "Request another attempt for a paused or owner-held recovery run",
 		Long: "Resume ONE run the owner paused (`paused`, PRD #1190): it flips the hold back to `queued`, " +
 			"keeps the worker pin, and banks the parked time so the remaining budget is what it was — the " +
 			"clock stopped while paused. The claim then continues the SDK session on the same worker if it " +
 			"is still alive, or recovers the branch from the checkpoint on another worker if it is gone.\n\n" +
+			"For a finite-cap forge-unreachable hold with an explicit NULL retry time, automatic retries are exhausted. " +
+			"Resume requests one ordinary bounded attempt; counters, cooldown, custody and grants are preserved. " +
+			"Admission can still block, including limit 1 or saturation. Timed retries remain automatic; omitted retry timing is unknown. " +
+			"Cancel is terminal. Resume does not change source authority or verify source/archive availability or latest local edits.\n\n" +
 			"For retained recovery exhausted (recovery_wait), Resume now requests another attempt; success is not assured. " +
 			"A finite retry stamp means timed retry, even after it is due; NULL means owner-held with no automatic resume. " +
 			"Cancel is terminal. Resume does not reset the retained recovery cap or promise a fresh archive or latest edits.\n\n" +

@@ -325,6 +325,11 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 	w, t := r.w, workerTextOf(r)
 	renderer := &tuiRenderer{}
 	var items []attnItem
+	for i := range w.ForgeOriginCooldowns {
+		cooldown := &w.ForgeOriginCooldowns[i]
+		lines := forgeOriginLines(cooldown)
+		items = append(items, attnItem{1, "forge: " + renderer.Plain(cooldown.Origin, 200) + " · " + lines[1], strings.Join(lines, " · ")})
+	}
 	add := func(sev int, short, detail string) { items = append(items, attnItem{sev, short, detail}) }
 	if workerRollFailure(w.UpgradeStatus) {
 		label := workerRollLabel(w.UpgradeStatus)
@@ -956,10 +961,13 @@ func (m tuiModel) workerReadout(r workerRow, width int) []string {
 	if remaining := width - visualWidth(selected); remaining >= minimumMetadata {
 		selected += clampVisual(metadata, remaining)
 	}
-	if inline {
+	if inline && len(r.w.ForgeOriginCooldowns) == 0 {
 		return []string{selected}
 	}
 	lines := []string{selected}
+	for _, line := range workerForgeLines(r.w) {
+		lines = append(lines, clampVisual("  "+m.renderer.Plain(line, max(0, width-2)), width))
+	}
 	lines = append(lines, m.manualCordonLines(r, width)...)
 	for _, item := range items {
 		lines = append(lines, clampVisual("  "+paintSeg(m.workerAttentionColor(item), nil, false, m.renderer.Plain(item.attnShort, max(0, width-2))), width))

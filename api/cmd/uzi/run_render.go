@@ -123,6 +123,9 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	rows = append(rows, planCrossCheckRows(r)...)
 	rows = append(rows, codeCrossCheckRows(r)...)
 	rows = append(rows, workerExhaustionRows(r)...)
+	for _, line := range forgeRunLines(r) {
+		rows = append(rows, []string{"FORGE", line})
+	}
 	// DEADLINE (PRD #1170): the run's wall-clock stop time and countdown, emitted only when
 	// the server set a deadline (a running issue run) — right after HEALTH, and emit-only-
 	// when-set like HEALTH_REASON below, so a chat/judge/non-running run prints no new row.
@@ -2408,6 +2411,12 @@ func runStatusCell(r apitypes.RunListItemDTO) string {
 
 func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.FailOrigin, ""))
+	if isForgePark(r.RunDTO) {
+		s += " (" + forgeParkLine(r.RunDTO) + ")"
+	}
+	if r.ForgeOriginCooldown != nil {
+		s += " (" + strings.Join(forgeOriginLines(r.ForgeOriginCooldown), "; ") + ")"
+	}
 	if isOwnerRequiredWorkerHold(r.RunDTO) || isRecoveryDecisionPark(r.RunDTO) {
 		return workerExhaustionLine(r.RunDTO)
 	}
@@ -2539,7 +2548,10 @@ func forgeParkLine(r apitypes.RunDTO) string {
 	if r.RecoveryRetryNotBefore != nil {
 		return "waiting for the forge, retry at " + r.RecoveryRetryNotBefore.Local().Format("15:04") + " (" + count + ")"
 	}
-	return "waiting for the forge (" + count + ")"
+	if isForgeOwnerHold(r) {
+		return "forge automatic retries exhausted; owner-held; no automatic resume (" + count + "); owner Resume or Cancel"
+	}
+	return "waiting for the forge (" + count + "); retry timing unknown"
 }
 
 // limitWaitLine is the ONE sentence every CLI surface renders for a parked run
