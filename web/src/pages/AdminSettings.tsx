@@ -148,6 +148,8 @@ export function AdminSettings() {
   // Vault migration progress (PRD #32): stored secrets still using pre-vault
   // (master-key) encryption. Fetched separately so a failure never blocks the
   // settings form; null = unknown/not-yet-loaded, rendered only when > 0.
+  const [reunlockDays, setReunlockDays] = useState("7");
+  const [reunlockError, setReunlockError] = useState("");
   const [vaultPolicy, setVaultPolicy] = useState("required");
   const [unprotectedUsers, setUnprotectedUsers] = useState<number | null>(null);
   const [masterSealed, setMasterSealed] = useState<number | null>(null);
@@ -159,6 +161,7 @@ export function AdminSettings() {
     const { settings, secrets: sec, sources: src } = resp;
     setSaved(settings);
     setVaultPolicy(settings.vault_policy ?? "required");
+    setReunlockDays(settings.vault_reunlock_days ?? "7");
     setUnprotectedUsers(resp.unprotected_users ?? null);
     setSecrets(sec ?? {});
     setSources(src ?? {});
@@ -351,7 +354,25 @@ export function AdminSettings() {
 
       <Card id="vault-policy" className="space-y-4">
         <SectionTitle>Credential protection</SectionTitle>
-        <p className="text-sm text-muted">TL;DR: Password encryption protects personal credentials against theft of the database together with the server key. A compromised running server can still read credentials while unlocked. Each release or server restart costs an unlock before new runs can start. Off uses server-key encryption, like forge bot tokens. <a href="/docs/vault-threat-model">Learn more</a>.</p>
+        <p className="text-sm text-muted">TL;DR: Password encryption protects personal credentials against theft of the database together with the server key. A compromised running server can still read credentials while unlocked. After a release or server restart, an eligible foreground request can re-unlock with a live browser grant. New runs still wait until the user opens or focuses uzi; expired grants require a password unlock. Off uses server-key encryption, like forge bot tokens. <a href="/docs/vault-threat-model">Learn more</a>.</p>
+        <form className="space-y-2" onSubmit={async e => {
+          e.preventDefault();
+          if (loading || busy || !saved || !/^(?:[1-9]|[12][0-9]|30)$/.test(reunlockDays)) return;
+          setBusy(true); setReunlockError("");
+          try {
+            const resp = await api.updateSettings({ vault_reunlock_days: reunlockDays });
+            const days = resp.settings.vault_reunlock_days ?? "7";
+            setSaved(current => current ? { ...current, vault_reunlock_days: days } : current);
+            setReunlockDays(days);
+          } catch (err) { setReunlockError(errorMessage(err, "Failed to save browser grant lifetime")); }
+          finally { setBusy(false); }
+        }}>
+          <label>Browser grant lifetime (days)<Input aria-label="Browser grant lifetime (days)" inputMode="numeric" value={reunlockDays} disabled={loading || busy} onChange={e => setReunlockDays(e.target.value)} /></label>
+          {!/^(?:[1-9]|[12][0-9]|30)$/.test(reunlockDays) && <p>Enter a canonical integer from 1 to 30.</p>}
+          {reunlockError && <Alert message={reunlockError} />}
+          <p className="text-xs text-muted">Default: 7 days. New browser grants have an absolute expiry capped by this lifetime and the session expiry at creation. Session refresh never extends them. Changing this cap affects new grants only; existing grants keep their original expiry.</p>
+          <Button type="submit" disabled={loading || busy || !saved || !/^(?:[1-9]|[12][0-9]|30)$/.test(reunlockDays) || reunlockDays === (saved.vault_reunlock_days ?? "7")}>Save browser grant lifetime</Button>
+        </form>
         <p>Optional lets each user turn protection on or off; new users start with protection off. Required prompts off users to enroll and prevents protected users from switching off.</p>
         <p>Unprotected users: {unprotectedUsers ?? "unknown (older server or unavailable)"}</p>
         <div className="space-y-3">

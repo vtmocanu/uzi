@@ -1814,3 +1814,38 @@ describe("vault policy", () => {
     await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ vault_policy: "required" })));
   });
 });
+
+describe("browser grant lifetime", () => {
+  it.each(["1", "30"])("saves canonical %s days and defaults to 7", async days => {
+    mockApi.updateSettings.mockResolvedValueOnce(response({ vault_reunlock_days: days }));
+    render(<MemoryRouter><AdminSettings /></MemoryRouter>);
+    const input = await screen.findByLabelText("Browser grant lifetime (days)") as HTMLInputElement;
+    await waitFor(() => expect(input.disabled).toBe(false));
+    expect(input.value).toBe("7");
+    fireEvent.change(input, { target: { value: days } });
+    fireEvent.click(screen.getByRole("button", { name: "Save browser grant lifetime" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ vault_reunlock_days: days }));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Save browser grant lifetime" }) as HTMLButtonElement).disabled).toBe(true));
+    expect(screen.getByText(/existing grants keep their original expiry/)).toBeTruthy();
+  });
+  it.each(["0", "31", "1.5", "01", " 7"])("rejects noncanonical %s", async days => {
+    render(<MemoryRouter><AdminSettings /></MemoryRouter>);
+    const input = await screen.findByLabelText("Browser grant lifetime (days)") as HTMLInputElement;
+    await waitFor(() => expect(input.disabled).toBe(false));
+    fireEvent.change(input, { target: { value: days } });
+    expect((screen.getByRole("button", { name: "Save browser grant lifetime" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText("Enter a canonical integer from 1 to 30.")).toBeTruthy();
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+  });
+  it("retains the saved lifetime when saving fails", async () => {
+    mockApi.updateSettings.mockRejectedValueOnce(new ApiError(500, "lifetime failed"));
+    render(<MemoryRouter><AdminSettings /></MemoryRouter>);
+    const input = await screen.findByLabelText("Browser grant lifetime (days)") as HTMLInputElement;
+    await waitFor(() => expect(input.disabled).toBe(false));
+    fireEvent.change(input, { target: { value: "30" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save browser grant lifetime" }));
+    expect(await screen.findByText("lifetime failed")).toBeTruthy();
+    fireEvent.change(input, { target: { value: "7" } });
+    expect((screen.getByRole("button", { name: "Save browser grant lifetime" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});

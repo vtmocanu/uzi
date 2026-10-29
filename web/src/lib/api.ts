@@ -1,6 +1,6 @@
 // Thin API client. All requests are same-origin (nginx proxies /api) and rely
-// on the HttpOnly auth cookie, so we always send credentials. State-changing
-// requests echo the readable CSRF cookie back in the X-CSRF-Token header.
+// on the HttpOnly auth cookie, so we always send credentials. Requests echo the
+// readable CSRF cookie in X-CSRF-Token, including reads that can restore a vault.
 //
 // MOCK MODE: when built with VITE_UZI_MOCK=1 the exported `api` object and the
 // run socket factory are swapped for fully in-browser implementations
@@ -225,10 +225,18 @@ export function runArchiveDownloadUrl(runId: string, captureId: string): string 
 export { ApiError } from "./apiError";
 
 function readCookie(name: string): string | null {
+  if (typeof document === "undefined") return null;
   const match = document.cookie.match(
     new RegExp("(?:^|; )" + name + "=([^;]*)"),
   );
-  return match ? decodeURIComponent(match[1]) : null;
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    // A malformed readable cookie cannot authorize restoration. Safe reads
+    // still reach the API and retain its ordinary authentication behavior.
+    return null;
+  }
 }
 
 // ── Global 401 handling ─────────────────────────────────────────────────────
@@ -356,13 +364,12 @@ async function request<T>(
   if (body !== undefined) {
     headers["Content-Type"] = "application/json";
   }
-  if (method !== "GET" && method !== "HEAD") {
-    const csrf = readCookie("uzi_csrf");
-    if (csrf) headers["X-CSRF-Token"] = csrf;
-  }
-  // Append-only extra headers (e.g. the passive-poll marker, #331). Merged last so a
-  // caller can override, but callers pass only additive keys, not Content-Type/CSRF.
   if (extraHeaders) Object.assign(headers, extraHeaders);
+  // Re-read the JWT-bound readable cookie at dispatch, including foreground reads.
+  const csrf = readCookie("uzi_csrf");
+  if (csrf) headers["X-CSRF-Token"] = csrf;
+  // Hidden traffic must never restore a vault, regardless of caller headers.
+  if (typeof document !== "undefined" && document.hidden) headers["X-Uzi-Passive"] = "1";
 
   const res = await fetch(`/api${path}`, {
     method,
@@ -407,6 +414,7 @@ async function uploadBrandingLogo(slot: string, file: File): Promise<void> {
   const headers: Record<string, string> = { "Content-Type": file.type };
   const csrf = readCookie("uzi_csrf");
   if (csrf) headers["X-CSRF-Token"] = csrf;
+  if (typeof document !== "undefined" && document.hidden) headers["X-Uzi-Passive"] = "1";
   const res = await fetch(`/api/admin/branding/logo/${slot}`, {
     method: "PUT",
     headers,
@@ -512,6 +520,7 @@ const realApi = {
     request<{ attention: number; target_release: string }>(
       "GET",
       "/me/workers/upgrade-summary",
+      undefined, { "X-Uzi-Passive": "1" },
     ),
   logout: () => request<{ status: string }>("POST", "/auth/logout"),
   me: () => request<SessionResponse>("GET", "/auth/me", undefined, undefined, false),
@@ -800,7 +809,7 @@ const realApi = {
   testMySlackDM: () => request<{ status: string }>("POST", "/me/slack/test-dm"),
   // Just the live Slack socket state, for the admin chip's poll (PRD #25 M3).
   getSlackStatus: () =>
-    request<{ slack_status: string }>("GET", "/admin/slack/status"),
+    request<{ slack_status: string }>("GET", "/admin/slack/status", undefined, { "X-Uzi-Passive": "1" }),
   listAgentTemplates: () =>
     request<{ templates: AgentTemplate[] }>("GET", "/agent-templates"),
   getTemplateAllocations: () =>
@@ -1231,8 +1240,8 @@ const realApi = {
   createCIFixRun: (repoId: string, ref: string) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/ci-fix-runs`, { ref }),
   listRuns,
-  getRun: (id: string, reconciliationBeforeGateRevision?: number) =>
-    request<{ run: Run }>("GET", `/runs/${id}${reconciliationBeforeGateRevision === undefined ? "" : `?reconciliation_before_gate_revision=${reconciliationBeforeGateRevision}`}`),
+  getRun: (id: string, reconciliationBeforeGateRevision?: number, passive = false) =>
+    request<{ run: Run }>("GET", `/runs/${id}${reconciliationBeforeGateRevision === undefined ? "" : `?reconciliation_before_gate_revision=${reconciliationBeforeGateRevision}`}`, undefined, passive ? { "X-Uzi-Passive": "1" } : undefined),
   /** The caller's own token/cost usage (PRD #40): lifetime + last-7-days + run count. */
   getUsage: () => request<SelfUsage>("GET", "/usage"),
   /** Factory-wide usage + per-user breakdown (PRD #40). Admin-only — a non-admin 403s. */
@@ -1254,17 +1263,18 @@ const realApi = {
    *  The Codex sibling of getAdminRateLimits. */
   getAdminCodexRateLimits: () =>
     request<AdminCodexRateLimits>("GET", "/admin/codex-rate-limits"),
-  getRunMessages: (id: string, afterSeq = 0) =>
+  getRunMessages: (id: string, afterSeq = 0, passive = false) =>
     request<{ messages: RunMessage[] }>(
       "GET",
       afterSeq > 0
         ? `/runs/${id}/messages?after=${afterSeq}`
         : `/runs/${id}/messages`,
+      undefined, passive ? { "X-Uzi-Passive": "1" } : undefined,
     ),
   // The run's follow_up steer queue with delivery status (PRD #95). Owner-only: a
   // non-owner (incl. admin_ro) gets 404, which the caller treats as "no queue".
-  getRunInputs: (id: string) =>
-    request<{ inputs: SteerInput[] }>("GET", `/runs/${id}/inputs`),
+  getRunInputs: (id: string, passive = false) =>
+    request<{ inputs: SteerInput[] }>("GET", `/runs/${id}/inputs`, undefined, passive ? { "X-Uzi-Passive": "1" } : undefined),
   // Durable run recovery (PRD #1296 M5, D6/D7): the owner-scoped recovery aggregate for
   // a run — supported/legacy, the open-hold pending signal, per-state counts, and every
   // retained capture's metadata (never raw bytes). Owner-only, like getRunInputs above:
