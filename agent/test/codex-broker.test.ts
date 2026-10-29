@@ -1017,9 +1017,29 @@ describe("CodexCallbackBroker: helper-origin range fallback", () => {
 
   it("retains range defaults and uses the screened path with the second operation", async () => {
     for (const [args, offset, limit] of [[{ offset: 2 }, 2, 200], [{ limit: 1 }, 1, 1]] as const) {
-      const fileop = new FileopSpy([oversize, range("b\n", { offset })]);
+      const fileop = new FileopSpy([oversize, range("b\n", { offset, truncated: limit === 1 })]);
       assert.equal((await call(makeBroker({ fileop }), { path: WORKTREE + "/src/x.ts", ...args })).ok, true);
       assert.deepEqual(fileop.calls[1], { op: "read_range", path: "src/x.ts", offset, limit });
+    }
+  });
+
+  it("rejects completed ranges stopped before any allowed endpoint", async () => {
+    for (const content of ["a\n", "a"]) {
+      const fileop = new FileopSpy([oversize, range(content, {
+        offset: 1, size: 100, scannedBytes: 100,
+        partialLastLine: !content.endsWith("\n"),
+      })]);
+      const result = await call(makeBroker({ fileop }), { path: "x", offset: 1, limit: 2 });
+      assertDenied(result, "fileop_denied");
+      assert.equal(result.fileopCode, "E_MALFORMED");
+      assert.equal(fileop.calls.length, 2);
+    }
+    for (const unused of [0, 1, 2, 3]) {
+      const content = "x".repeat(65536 - unused);
+      // Prefetch must include the complete excerpt and the crossing character.
+      assert.equal((await call(makeBroker({ fileop: new FileopSpy([oversize,
+        range(content, { offset: 1, partialLastLine: true, scannedBytes: 98304 })]) }),
+        { path: "x", offset: 1, limit: 2 })).ok, true);
     }
   });
 

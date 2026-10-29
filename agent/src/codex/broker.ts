@@ -1087,6 +1087,9 @@ export class CodexCallbackBroker {
       (bytes.length === 0 && (res.linesReturned !== 0 || res.partialLastLine || (!res.incomplete && res.truncated))) ||
       // Exhausting the budget below the opening extent cannot establish completed EOF.
       (!res.incomplete && !res.truncated && res.scannedBytes === scanCap && res.size > scanCap) ||
+      // A completed excerpt must stop at the line limit, EOF, or the UTF-8 output ceiling.
+      // A four-byte codepoint may leave up to three unused output bytes.
+      (!res.incomplete && res.truncated && res.linesReturned < limit && bytes.length < cap - 3) ||
       (res.partialLastLine && (!res.truncated || bytes.length === 0 || bytes.at(-1) === 10))
     ) return malformed();
     let content: string;
