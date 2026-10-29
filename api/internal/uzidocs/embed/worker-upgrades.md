@@ -71,15 +71,16 @@ successful pushed SHA, including on legacy non-interlocked runs. The API stores
 an immutable `runs.source_publication_intent` stamp in the same transaction
 as successful issue completion, independently of recovery inventory or permit
 negotiation. It does not stamp before push. A rejected or rolled-back initial
-completion creates no stamp; without other affirmative evidence, a later
-refresh is unknown. A lost commit acknowledgement can leave completion and the stamp
+completion creates no stamp and leaves the source non-completed, so a later
+refresh refuses. A lost commit acknowledgement can leave completion and the stamp
 durable; exact terminal replay validates that paired outcome.
 
 MR rework and pipeline-branch-adopting CI fix on new workers require the
-negotiated feature and authenticated resolver; absence or unknown authority
-refuses publication. Closing needs the terminal stamp. Historical affirmative
-non-closing evidence can restrict without one, but historical publications
-receive no backfill. Old workers retain their earlier publication behavior;
+negotiated feature and an authenticated resolver; a worker without the feature,
+or a resolver that answers unknown, refuses publication. Closing needs the
+terminal stamp. Historical affirmative non-closing evidence can restrict
+without one, and a completed issue source without a stamp refreshes as
+non-closing (#3420); historical publications receive no backfill. Old workers retain their earlier publication behavior;
 new workers against old APIs refuse affected refreshes. Source-issue runs
 retain their earlier compatibility behavior until both components are upgraded.
 Neither release badges nor an API-only upgrade prove these refresh pushes are guarded. Pull/merge request text grants no authority.
@@ -95,6 +96,16 @@ On application rollback, preserve the nullable evidence column and its
 recorded values. Migration 349 Down drops the column and loses the evidence;
 re-applying Up cannot reconstruct closing proof. Migration 350 Down retains
 the validated constraint. Old binaries can leave the column unused.
+
+After upgrading, pull requests from completed issue runs without a stamp
+rework as non-closing, including sources completed by an old worker during the
+rollout. The API logs `publication_context_unstamped_fallback` (run and source
+run IDs) at Info when it uses this fallback. A refusal shows its reason, for
+example `(publication_unproven)`, in `refresh publication refused: source
+context could not be confirmed (<reason>)`. A pull request whose branch commits
+close the issue is still refused: the owner must remediate those commits
+outside the worker. A refresh does not edit a `Closes #N` in the pull request
+body outside uzi's region, so merging can still close the issue.
 See [Completion holds](run-completion-hold.md#refreshing-an-existing-publication-3120)
 for refusal, recovery and Forgejo/Gitea boundaries. This rollout does not
 activate semantic completion or establish live deployment acceptance.

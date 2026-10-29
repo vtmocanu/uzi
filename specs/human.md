@@ -965,7 +965,7 @@ in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#addendum
   The report carries the exact frozen successful push SHA, independently of
   recovery inventory or completion-permit negotiation, including legacy issue
   runs. There is no pre-push writer. A rejected or rolled-back initial completion
-  creates no stamp and, absent other affirmative evidence, refresh authority is unknown.
+  creates no stamp and leaves the source non-completed, so its refresh refuses.
   A lost commit acknowledgement can leave completion and the stamp durable;
   exact terminal replay validates that paired outcome. Historical
   affirmative non-closing evidence can restrict without a stamp; historical
@@ -984,6 +984,17 @@ in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#addendum
   retain their earlier compatibility behavior until both components are upgraded.
   Application rollback preserves the nullable evidence column: migration 349
   Down loses proof and re-up cannot reconstruct it. (AI-synced 2026-10-22)
+- #3420 changes the #3120 compatibility policy: missing proof still never
+  establishes closing authority, but a completed issue source with validated
+  identity and contract authority, no stamp and no restriction refreshes as
+  non-closing (`source_publication` null), including sources completed by an
+  old worker during a mixed rollout; age is never inferred from a null stamp.
+  Unrestricted non-completed sources and unresolved or invalid authority still
+  refuse. Old PRs whose branch history closes the source issue still refuse and
+  need owner remediation; a refresh neither adds nor strips a `Closes #N` in
+  body text outside uzi's region. No backfill or retroactive proof. Fallback use
+  logs `publication_context_unstamped_fallback`; worker refusals name the
+  validated reason. (AI-synced 2026-10-29)
 - Forgejo/Gitea any-branch closure remains a boundary under #3120: no
   every-branch scan or settings change covers other unguarded pushes, legacy
   scope-capped issue delivery, earlier published history or old workers.
