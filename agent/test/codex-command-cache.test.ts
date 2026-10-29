@@ -378,8 +378,23 @@ describe("removeCommandCache", () => {
 
   it("is bounded: a silent remover is pending (never killed)", async () => {
     const f = fakeSpawn();
-    assert.deepEqual(await removeCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 20 }), { state: "pending", reason: "" });
+    const pending = await removeCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 20 });
+    assert.equal(pending.state, "pending");
+    assert.equal(pending.reason, "");
     assert.equal(f.procs[0]!.killed, 0);
+    // #3404: the bounded answer is delivery only; the actual remover's outcome stays joinable.
+    assert.ok(pending.settlement, "pending carries the remover's own settlement");
+    f.procs[0]!.line(JSON.stringify({ event: "cache_cleanup", state: "removed", reason: "" }));
+    f.procs[0]!.finish(0);
+    assert.deepEqual(await pending.settlement, { state: "removed", reason: "" });
+  });
+
+  it("3404 a remover that closes without a verdict settles as a protocol error, not a removal", async () => {
+    const f = fakeSpawn();
+    const pending = await removeCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 20 });
+    assert.equal(pending.state, "pending");
+    f.procs[0]!.finish(0);
+    assert.deepEqual(await pending.settlement, { state: "error", reason: "protocol" });
   });
 });
 
@@ -428,12 +443,15 @@ describe("startCommandCacheHolder", () => {
     const f = fakeSpawn((p) => p.line(ready));
     const holder = await startCommandCacheHolder(TOKEN, readyDeps(f));
     const p = f.procs[0]!;
-    assert.deepEqual(await holder.release(true, 20), { state: "pending", reason: "" });
+    const pending = await holder.release(true, 20);
+    assert.equal(pending.state, "pending");
+    assert.equal(pending.reason, "");
     assert.equal(p.killed, 0, "the holder keeps running and settles on its own");
-    // A late answer is harmless.
+    // A late answer is harmless, and the original release's settlement observes it (#3404).
     p.line(JSON.stringify({ event: "cache_cleanup", state: "removed", reason: "" }));
     p.finish(0);
     await closed(p);
+    assert.deepEqual(await pending.settlement, { state: "removed", reason: "" });
   });
 
   it("a holder that exits mid-run is not alive, and release reports it without writing", async () => {

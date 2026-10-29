@@ -321,6 +321,18 @@ unset UZI_REPO_JSON UZI_RUN_LIST_FAIL MERGE_STATE
 export PR_FILES_JSON='[{"filename":"api/internal/store/migrations/00099_new.sql","status":"added"}]' BASE_MIG_JSON='[{"name":"00099_old.sql"}]'
 snap head_clean noreq-collision
 has noreq-collision 'MIGRATION_COLLISION='; has noreq-collision 'NEXT=migration_collision'; has_line noreq-collision 'CI_UNKNOWN=1'
+export PR_FILES_JSON='[{"filename":"api/internal/store/migrations/00098_new.sql","status":"added"}]'
+snap noreq below-head
+has below-head 'NEXT=migration_collision'
+# Exact filename equality is still a collision for an added migration.
+export PR_FILES_JSON='[{"filename":"api/internal/store/migrations/00099_old.sql","status":"added"}]'
+snap noreq same-filename
+has same-filename 'NEXT=migration_collision'
+for status in renamed copied; do
+  export PR_FILES_JSON="[{\"filename\":\"api/internal/store/migrations/00098_new.sql\",\"status\":\"$status\",\"previous_filename\":\"api/internal/store/migrations/00999_old.sql\"}]"
+  snap noreq "${status}-below-head"
+  has "${status}-below-head" 'NEXT=migration_collision'
+done
 unset PR_FILES_JSON BASE_MIG_JSON CHECKS_JSON
 
 export CLASSIC_HTTP=200 CLASSIC_RC=0 CLASSIC_BODY='{"contexts":["ci","slow"],"checks":[]}'

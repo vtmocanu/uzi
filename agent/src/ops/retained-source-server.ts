@@ -27,6 +27,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 import { ATTEMPT_ID_RE } from "../attempt-path.js";
+import type { AuthorityRuntime, AuthorityScope } from "../authority-runtime.js";
 import type { DindPruneGate } from "../dind-prune.js";
 import type {
   GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedInspectResult, RetainedLifecycleSnapshot, RetainedSourceSelector,
@@ -47,6 +48,8 @@ const SOCKET_PATH_MAX_BYTES = 107;
 const RUN_ID_RE = /^[A-Za-z0-9_-]{1,160}$/;
 const CONFIRM_RE = /^[0-9a-f]{64}$/;
 const DRAIN_BUDGET_MS = 5_000;
+/** The discard waits at most this long for the authority transaction: the claim gate is closed meanwhile. */
+const DISCARD_AUTHORITY_WAIT_MS = 30_000;
 const DRAIN_POLL_MS = 50;
 const REQUEST_READ_TIMEOUT_MS = 10_000;
 /** Absolute cap from connect to the request newline; the idle timer alone is reset by every byte. */
@@ -82,6 +85,14 @@ export interface RetainedSourceServerDeps {
   isIdle: () => boolean;
   runner: RetainedSourceRunnerPort;
   log: Logger;
+  /** issue #3404 M2: when set, the discard runs inside an authority transaction opened BEFORE the run
+   *  reservation (lock order A -> S), so the Git discard hooks borrow it. Absent: legacy behaviour.
+   *  `endSourceUse` (the production AuthorityRuntime has it) ends the source use the discard's admissions
+   *  opened once the discard finished, so a later worker incarnation is not refused by a slot left active. */
+  authority?: AuthorityScope & Partial<Pick<AuthorityRuntime, "endSourceUse">>;
+  /** How long the discard waits for A before refusing. The claim gate is closed meanwhile, so this must
+   *  stay short (default 30 s); a shutdown still ends the wait at once. */
+  authorityWaitMs?: number;
   /** Test seams: the drain clock/poll and the timeouts. */
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -483,27 +494,38 @@ export class RetainedSourceServer {
       // A client that left before anything destructive began must not get a deletion it never saw.
       if (clientGone()) return this.refusal("client_disconnected");
       // 5. Reserve the run through the disposal.
-      const boundary = await this.deps.runner.withRetainedSourceBoundary(sel.runId, clonePaths, async (ctx) => {
-        // 6. The holds read, inside the reservation and before GitCache takes the bare lock.
-        const [holds, lifecycle] = await Promise.all([this.readHolds(sel.runId), this.readLifecycle(sel.runId)]);
-        if (holds.state === "unknown") return this.refusal("holds_unknown");
-        if (clientGone()) return this.refusal("client_disconnected");
-        const opts = {
-          selector: sel, confirm: req.confirm, holds, lifecycle, isLivePath: ctx.isLivePath, quiesce: ctx.quiesce,
-          barePath: ev.barePath, signal: this.shutdown.signal,
-          ...(this.deps.deadlineMs === undefined ? {} : { deadlineMs: this.deps.deadlineMs }),
-        };
-        // 7. One bare-lock section inside GitCache.
-        let result: RetainedDiscardResult;
-        try {
-          result = req.protectedSource
-            ? await this.deps.git.discardProtectedSource(opts)
-            : await this.deps.git.discardStoppedSource(opts);
-        } catch (err) {
-          this.deps.log.warn("retained-source: discard ended with an error; whatever is not proven gone stays", { error: errMessage(err) });
-          result = { kind: "unknown", sources: [], metadata: "kept" };
-        }
-        return { ok: result.kind === "done", op: "discard" as const, result };
+      // The authority transaction (A) is taken before the reservation (S) and spans the discard.
+      const inAuthority = <T>(fn: () => Promise<T>): Promise<T> =>
+        this.deps.authority
+          ? this.deps.authority.withTransaction(fn, { signal: this.shutdown.signal, timeoutMs: this.deps.authorityWaitMs ?? DISCARD_AUTHORITY_WAIT_MS })
+          : fn();
+      const boundary = await inAuthority(async () => {
+        const entered = await this.deps.runner.withRetainedSourceBoundary(sel.runId, clonePaths, async (ctx) => {
+          // 6. The holds read, inside the reservation and before GitCache takes the bare lock.
+          const [holds, lifecycle] = await Promise.all([this.readHolds(sel.runId), this.readLifecycle(sel.runId)]);
+          if (holds.state === "unknown") return this.refusal("holds_unknown");
+          if (clientGone()) return this.refusal("client_disconnected");
+          const opts = {
+            selector: sel, confirm: req.confirm, holds, lifecycle, isLivePath: ctx.isLivePath, quiesce: ctx.quiesce,
+            barePath: ev.barePath, signal: this.shutdown.signal,
+            ...(this.deps.deadlineMs === undefined ? {} : { deadlineMs: this.deps.deadlineMs }),
+          };
+          // 7. One bare-lock section inside GitCache.
+          let result: RetainedDiscardResult;
+          try {
+            result = req.protectedSource
+              ? await this.deps.git.discardProtectedSource(opts)
+              : await this.deps.git.discardStoppedSource(opts);
+          } catch (err) {
+            this.deps.log.warn("retained-source: discard ended with an error; whatever is not proven gone stays", { error: errMessage(err) });
+            result = { kind: "unknown", sources: [], metadata: "kept" };
+          }
+          return { ok: result.kind === "done", op: "discard" as const, result };
+        });
+        // END SOURCE USE of the paths the discard admitted (still under the same A): a slot with an
+        // unresolved record stays active (fail closed); a deleted source's slot leaves active.
+        if (entered.entered) await this.deps.authority?.endSourceUse?.(clonePaths);
+        return entered;
       });
       if (!boundary.entered) return this.refusal("run_reserved");
       return boundary.value;

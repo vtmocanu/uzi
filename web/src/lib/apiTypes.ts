@@ -145,7 +145,7 @@ export interface CrossCheckPinDTO {
   resolved_model: string | null;
   resolved_effort: string;
   model_source: "pin" | "worker default";
-  effort_source: "pin" | "worker default";
+  effort_source: "pin" | "worker default" | "cross-check default";
   active: boolean;
 }
 
@@ -876,6 +876,9 @@ export interface LatestRun {
   // Eligibility includes the per-run spread and is not a promised start time.
   codex_admission_class?: CodexAdmissionClass | null;
   codex_admission_eligible_at?: string | null;
+  /** Owner-only active account cooldown; eligibility includes server spread, not dispatch time. */
+  account_cooldown_class?: CodexAdmissionClass | null;
+  account_cooldown_eligible_at?: string | null;
   // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
@@ -1673,6 +1676,8 @@ export interface HealthCheck {
   group: string;
   title: string;
   severity: string;
+  // Presentation-only opt-in; does not affect severity, counts, blocking or episodes.
+  attention_banner?: boolean;
   summary: string;
   // When the check first went non-ok, where the source has one, else null.
   since: string | null;
@@ -1689,6 +1694,8 @@ export interface HealthCheck {
 export interface HealthEvidence {
   label: string;
   value: string;
+  run_id?: string;
+  owner_id?: string;
 }
 
 // ── CLI tokens (PRD #64) ──────────────────────────────────────────────────
@@ -2822,7 +2829,7 @@ export type StopKind =
 export type JudgeVerdict = "ideal" | "ok" | "issues";
 
 export type RunHealth =
-  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle";
+  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle" | "waiting_account_cooldown";
 
 // FixVerdict is a ci_fix run's outcome (PRD #6): verified/fix_failed are stamped
 // server-side from the post-fix pipeline; not_code is the agent's "not a code
@@ -3246,6 +3253,9 @@ export interface Run {
   // Eligibility includes the per-run spread and is not a promised start time.
   codex_admission_class?: CodexAdmissionClass | null;
   codex_admission_eligible_at?: string | null;
+  /** Owner-only active account cooldown; eligibility includes server spread, not dispatch time. */
+  account_cooldown_class?: CodexAdmissionClass | null;
+  account_cooldown_eligible_at?: string | null;
   /** PRD #320 D8: the run's queue-priority CLASS, computed server-side (see RunPriority).
    *  Only a QUEUED run is ever non-"normal"; a running/terminal run renders no pill. It
    *  rides the shared run embed (RunListItemDTO embeds RunDTO), so it is present on BOTH
@@ -3948,7 +3958,7 @@ export interface PlanCrossCheckSummary {
   checker_model: string | null;
   checker_effort: string | null;
   checker_model_source: "pin" | "worker default" | null;
-  checker_effort_source: "pin" | "worker default" | null;
+  checker_effort_source: "pin" | "worker default" | "cross-check default" | null;
   usage: RunUsage | null;
   historical: boolean;
 }

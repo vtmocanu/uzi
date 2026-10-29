@@ -860,9 +860,15 @@ request without normal/free safety-queue reacquisition.
 Current-process completion sources bind exact executor/facade in memory before
 durable bind. KnownCodex missing/non-disposed/swapped proof retains before
 inventory and never falls back to legacy inspection. KnownClaude is unchanged.
-Owner decision 2026-10-24 narrows R1857-02(e): **persisted completion sources without reliable provenance**
-keep today's behavior for both harnesses, without prior-process topology proof or
-durable format changes. C strengthens registered processes; unregistered/sibling
+Owner decision 2026-10-24 narrowed R1857-02(e) so that persisted completion sources
+without reliable provenance kept the pre-C behavior. **Superseded by #3404 (2026-10-27):**
+after a restart a persisted completion source is released only when the worker's
+durable, authenticated publication proves it (`forgetCompletedGeneration` and
+`verifyDurableRetirement` in `agent/src/recovery.ts`); legacy, unauthenticated, mixed,
+partial, corrupt, unproven and crashed-`active` sources are retained until a guarded
+operator discard, with no TTL, cap or disk-pressure reclaim. See the
+[#3404 amendment](../adr/1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement).
+C strengthens registered processes; unregistered/sibling
 writers, Docker accepted-but-invisible creates (#1860) and Claude terminal residuals
 remain. Per-attempt cgroups (#1862) remain unshipped, automatic reclaim stays
 disabled (#1858), and custody SETTLE remains separate from physical CLEANUP

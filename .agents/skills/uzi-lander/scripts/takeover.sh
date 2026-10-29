@@ -26,7 +26,7 @@
 #                         DIRTY (wins over a CI-only unknown) — rebase with land-prep.sh.
 #                         GitHub may never run pull_request CI on a DIRTY PR, so empty checks
 #                         are expected there
-#   migration_collision   PR adds a migration whose number already exists on main — rebase + renumber
+#   migration_collision   PR adds/renames/copies a migration at or below the base head: rebase + renumber
 #                         (wins over a CI-only unknown)
 #   ci_red | ci_pending   required checks
 #   mr_rework_active      defer to uzi's rework
@@ -85,6 +85,8 @@ fi
 . "$HERE/lib/net-retry.sh"
 # shellcheck source=lib/ci-fix.sh
 . "$HERE/lib/ci-fix.sh"
+# shellcheck source=lib/migrations.sh
+. "$HERE/lib/migrations.sh"
 net_retry_install
 TARGET=""; REPO=""; CLAIM=1
 while [ $# -gt 0 ]; do
@@ -424,34 +426,24 @@ echo "MR_REWORK_ACTIVE=$mrw"
 echo "CI_FIX_ACTIVE=$CI_FIX_ACTIVE"
 echo "CI_FIX_RECENT=$CI_FIX_RECENT"
 
-# Workflow files and migrations in the PR diff (added files), vs the base's migration set.
+# Workflow files and migration destinations (added/renamed/copied), vs the base set.
 # An unreadable files list or base listing is UNKNOWN: a missed migration collision
 # bricks boot, so it must never read as "no collision".
-files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" 2>/dev/null | jq -s 'add // []' 2>/dev/null || echo 'x')
-if ! printf '%s' "$files" | jq -e 'type=="array"' >/dev/null 2>&1; then UNKNOWN=1; echo "PR_FILES=unreadable"; files='[]'; fi
+files=$(migration_pr_files "$REPO" "$PR") || { UNKNOWN=1; echo "PR_FILES=unreadable"; files='[]'; }
 wf=$(printf '%s' "$files" | jq '[.[]|select(.filename|startswith(".github/workflows/"))]|length' 2>/dev/null || echo 0)
 echo "WORKFLOW_FILES_IN_DIFF=$wf"
-added_mig=$(printf '%s' "$files" | jq -r '.[]|select(.status=="added" and (.filename|startswith("api/internal/store/migrations/")))|.filename|split("/")|last' 2>/dev/null || true)
-main_mig_raw=$(gh api "repos/$REPO/contents/api/internal/store/migrations?ref=$base" 2>/dev/null || echo 'x')
-if printf '%s' "$main_mig_raw" | jq -e 'type=="array"' >/dev/null 2>&1; then
-  main_mig=$(printf '%s' "$main_mig_raw" | jq -r '.[].name')
-else
-  UNKNOWN=1; echo "BASE_MIGRATIONS=unreadable"; main_mig=""
-fi
-main_head=$(printf '%s\n' "$main_mig" | grep -oE '^[0-9]+' | sort -n | tail -1 || true)
-echo "MIGRATION_HEAD_ON_BASE=${main_head:-}"
+main_mig_raw=$(gh api "repos/$REPO/contents/api/internal/store/migrations?ref=$base" 2>/dev/null) || main_mig_raw='null'
 collision=""
-if [ -n "$added_mig" ]; then
-  echo "MIGRATIONS_ADDED=$(printf '%s' "$added_mig" | tr '\n' ' ')"
-  while IFS= read -r m; do
-    [ -z "$m" ] && continue
-    pfx=$(printf '%s' "$m" | grep -oE '^[0-9]+')
-    if printf '%s\n' "$main_mig" | grep -qE "^${pfx}_" && ! printf '%s\n' "$main_mig" | grep -qxF "$m"; then
-      collision="$collision $m"
-    fi
-  done <<< "$added_mig"
+if migration_info=$(migration_report "$files" "$main_mig_raw"); then
+  main_head=$(printf '%s' "$migration_info" | jq -r .head)
+  added_mig=$(printf '%s' "$migration_info" | jq -r '.added[]')
+  collision=$(printf '%s' "$migration_info" | jq -r '.collisions | join(" ")')
+  echo "MIGRATION_HEAD_ON_BASE=$main_head"
+  [ -z "$added_mig" ] || echo "MIGRATIONS_ADDED=$(printf '%s' "$added_mig" | tr '\n' ' ')"
+  [ -z "$collision" ] || echo "MIGRATION_COLLISION=$collision (renumber above $main_head: task migration:renumber)"
+else
+  UNKNOWN=1; echo "BASE_MIGRATIONS=unreadable"
 fi
-[ -n "$collision" ] && echo "MIGRATION_COLLISION=$collision (renumber above $main_head: task migration:renumber)"
 n_files=$(printf '%s' "$files" | jq 'length' 2>/dev/null || echo 0)
 n_lines=$(printf '%s' "$files" | jq '[.[]|.additions+.deletions]|add // 0' 2>/dev/null || echo 0)
 echo "SIZE_FILES=$n_files"; echo "SIZE_LINES=$n_lines"

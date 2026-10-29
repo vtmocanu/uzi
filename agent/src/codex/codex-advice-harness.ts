@@ -135,7 +135,12 @@ export type LaunchAdviceRootSeam = (spec: CodexAdviceLaunchSpec) => Promise<Code
  *  agents, NO tools, NO broker, NO registry, NO run worktree, NO handler registry. The
  *  app-server authentication is a PRIVATE, narrow transport seam for the selected
  *  credential, not a general callback registry. */
+interface AdviceOperation {
+  prepare(signal: AbortSignal, check: () => void): Promise<() => boolean | void>;
+  close(): void;
+}
 export interface CodexAdviceHarnessOptions {
+  readonly operationScope?: () => AdviceOperation;
   readonly admissionReporter?: import("./admission-signal.js").CodexAdmissionReporter;
   readonly launchRoot: LaunchAdviceRootSeam;
   readonly provider: CodexProviderConfig;
@@ -233,7 +238,10 @@ export class CodexAdviceHarness implements AdviceHarness {
   private readonly now: () => Date;
   private readonly log: Logger;
 
+  private readonly operationScope?: () => AdviceOperation;
+
   constructor(opts: CodexAdviceHarnessOptions) {
+    this.operationScope = opts.operationScope;
     this.admissionReporter = opts.admissionReporter;
     this.authMode = opts.authMode;
     this.now = opts.now ?? (() => new Date());
@@ -251,6 +259,12 @@ export class CodexAdviceHarness implements AdviceHarness {
   }
 
   async run(request: AdviceRequest, policy: AdviceResultPolicy): Promise<AdviceResult> {
+    const operation = this.operationScope?.();
+    try { return await this.runCall(request, policy, operation); }
+    finally { operation?.close(); }
+  }
+
+  private async runCall(request: AdviceRequest, policy: AdviceResultPolicy, operation?: AdviceOperation): Promise<AdviceResult> {
     // 1. Render (pure). renderCodexAdvice ENFORCES the advice ceiling at runtime: a
     //    request carrying agents/tools/toolServers/cwd throws here — a programming error,
     //    not a silently-ignored field.
@@ -322,7 +336,7 @@ export class CodexAdviceHarness implements AdviceHarness {
       });
       disposeSeam = launched.dispose;
       transportSeam = launched.transport;
-      return this.consume(launched.transport, launched.cwd, rendered, model, policy, internalAbort.signal, request.usageObserver);
+      return this.consume(launched.transport, launched.cwd, rendered, model, policy, internalAbort.signal, request.usageObserver, operation);
     })();
 
     // Late-disposal owner: a launch that resolves AFTER the finally already ran (a slow
@@ -404,6 +418,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     policy: AdviceResultPolicy,
     signal: AbortSignal,
     usageObserver?: AdviceRequest["usageObserver"],
+    operation?: AdviceOperation,
   ): Promise<AdviceResult> {
     // Authentication is setup, so it completes before any thread/model work.
     await this.appServerAuth?.authenticate(transport, signal);
@@ -413,7 +428,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     // gate) and nothing carries over from another call.
     const accountant = new CodexUsageAccountant();
     accountant.registerThread(threadId, model ?? this.provider.model, false);
-    const turnId = await this.startTurnRpc(transport, threadId, rendered, model, signal);
+    const turnId = await this.startTurnRpc(transport, threadId, rendered, model, signal, operation);
 
     // Single-consumer: obtain the notifications iterator exactly once.
     const notes = transport.notifications();
@@ -626,6 +641,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     rendered: RenderedCodexAdvice,
     model: string | undefined,
     signal: AbortSignal,
+    operation?: AdviceOperation,
   ): Promise<string> {
     const params: Record<string, unknown> = {
       threadId,
@@ -633,8 +649,12 @@ export class CodexAdviceHarness implements AdviceHarness {
     };
     if (model !== undefined) params.model = model;
     if (rendered.modelReasoningEffort !== undefined) params.effort = rendered.modelReasoningEffort;
-    // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
-    assertResidueQuarantineOpen("provider_turn");
+    const check = (): void => { signal.throwIfAborted(); assertResidueQuarantineOpen("provider_turn"); };
+    let permit: (() => boolean | void) | undefined;
+    do {
+      permit = await operation?.prepare(signal, check);
+      check();
+    } while (permit?.() === false);
     this.admissionAttempt = this.admissionReporter?.begin(threadId);
     const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
     const id = res?.turn?.id;

@@ -84,8 +84,8 @@ func TestCodeCrossCheckAbsentPinNoPlanInheritanceLiveDB(t *testing.T) {
 		t.Fatal("default code checker not delivered")
 	}
 	cc, err := f.env.q.GetCodeCrossCheck(f.env.ctx, f.lead)
-	if err != nil || cc.CheckerModel.String != "sonnet" || cc.CheckerEffort.String != "medium" ||
-		cc.CheckerModelSource.String != "worker default" || cc.CheckerEffortSource.String != "worker default" {
+	if err != nil || cc.CheckerModel.String != "sonnet" || cc.CheckerEffort.String != "high" ||
+		cc.CheckerModelSource.String != "worker default" || cc.CheckerEffortSource.String != "cross-check default" {
 		t.Fatalf("plan inheritance: %+v %v", cc, err)
 	}
 }

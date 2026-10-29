@@ -1,4 +1,8 @@
 import { codexRig } from "./runner-codex-sinks-fixture.js";
+import { acquireWorkerLifetime } from "../src/authority-lock.js";
+import { AuthorityRuntime } from "../src/authority-runtime.js";
+import { openAuthorityStore } from "../src/completion-authority.js";
+import { testLockOptions } from "./authority-test-support.js";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -1765,5 +1769,67 @@ describe("issue #1783: a planted fresh-attempt path fails typed worker_residue_b
     assert.ok(err instanceof Error, "the seed is refused");
     assert.equal(failOriginForReason(err.message), "worker_residue_blocked", `classified from: ${err.message}`);
     assert.equal(treeHash(planted), before, "the planted path is left exactly as found");
+  });
+});
+
+// ─── issue #3404 M2 U3: the pre-start predecessor capture is gated by source-use admission ─────────
+
+describe("issue #3404 M2 U3: a retained predecessor is admitted before its capture's first effect", { skip: !HAS_PROCFS }, () => {
+  const TOKEN = "unit-join-" + randomUUID();
+
+  async function runtimes() {
+    const dataDir = fs.realpathSync(fx.dataDir);
+    assert.equal(dataDir, fx.dataDir);
+    const lifetime = await acquireWorkerLifetime(dataDir, testLockOptions());
+    const mk = () => new AuthorityRuntime({ lifetime, workerToken: TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000 });
+    return { previous: mk(), current: mk() };
+  }
+  async function slotOf(rt: AuthorityRuntime, p: string) {
+    return rt.withTransaction(async (tx) => {
+      const store = await openAuthorityStore(tx, { workerToken: TOKEN });
+      return store.readSlot(tx, await store.slotKey(tx, p));
+    });
+  }
+
+  it("a predecessor still active under another worker incarnation refuses the capture: no proof, no capture, nothing moved", async () => {
+    const iid = 2901;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const before = treeHash(pred.clonePath);
+    const { previous, current } = await runtimes();
+    await previous.bindSource(pred.clonePath); // the dead worker's unfinished source use
+    const { factory, started } = transientFactory();
+    const { calls, quiesceRun } = recorded(fastQuiesce);
+    const { runner } = restartedWorker(factory, { quiesceRun, authority: current });
+    await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
+    assert.deepEqual(calls, [], "the refusal precedes the capture's first proof");
+    assert.equal(started(), 0);
+    assert.match(failureOf(runId), /Retained recovery blocked: preservation failed.*local work and custody retained/);
+    assert.equal(treeHash(pred.clonePath), before);
+    assert.equal(trackingHas(iid, "ONLY_COPY.txt"), false, "no fetch-back ran");
+    assert.equal((await slotOf(previous, pred.clonePath))?.state, "active", "the foreign epoch is untouched");
+  });
+
+  it("a predecessor whose previous use ended is admitted with a fresh epoch before the first proof", async () => {
+    const iid = 2902;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const { previous, current } = await runtimes();
+    await previous.bindSource(pred.clonePath);
+    await previous.endSourceUse([pred.clonePath]);
+    const { factory } = transientFactory();
+    const seen: Array<{ site: string; state?: string; worker?: string }> = [];
+    const probe = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
+      if (req.site === "predecessor_capture") {
+        const slot = await slotOf(current, pred.clonePath);
+        seen.push({ site: req.site, state: slot?.state, worker: slot?.owner.worker });
+      }
+      return fastQuiesce(req);
+    };
+    const { runner } = restartedWorker(factory, { quiesceRun: probe, authority: current });
+    await boundedExecute(runner, gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
+    assert.equal(seen[0]?.state, "active", "the epoch was admitted before the first capture proof");
+    assert.notEqual(seen[0]?.worker, undefined);
+    assert.equal(trackingHas(iid, "ONLY_COPY.txt"), true, "the capture ran");
   });
 });

@@ -149,3 +149,17 @@ it.each([["rate_limit", "a rate limit"], ["overload", "overload"]] as const)("Co
   } });
   expect(screen.getByText(`waiting: provider reported ${words}; account admission eligible after ${at}`)).toBeTruthy();
 });
+
+
+it.each([true, false])("active account wait card respects owner metadata (mine=%s)", is_mine => {
+  const at = new Date(Date.now() + 60_037).toISOString();
+  const r = { id: "same-run", status: "claimed", health: "waiting_account_cooldown", health_since: null, health_reason: null,
+    ...(is_mine ? { account_cooldown_class: "overload", account_cooldown_eligible_at: at } : {}),
+    created_at: new Date().toISOString(), updated_at: new Date().toISOString(), mr_iid: null, mr_web_url: null, mr_state: null,
+    failure_reason: null, stop_kind: null, stop_reason: null, fail_origin: null, owner_name: "Demo", worker_name: null, is_mine, run_count: 1 } as NonNullable<Card["latest_run"]>;
+  const { container } = renderCard({ latest_run: r });
+  expect(container.textContent).toContain(is_mine ? `waiting for account cooldown · overload · earliest eligibility ${at}` : "claimed");
+  expect(container.textContent).not.toMatch(/⚠|stuck|provider reported/);
+  if (!is_mine) expect(container.textContent).not.toContain("waiting for account cooldown");
+  expect(r.id).toBe("same-run");
+});

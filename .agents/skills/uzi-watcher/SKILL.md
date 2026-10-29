@@ -179,6 +179,8 @@ before the run reaches its park cap by freeing the worker's `/data`); `0` disabl
 same turn, investigate, then launch the printed `REARM=` line in the background. It acks that
 health episode, so a run that stays stalled in it (a long test suite) stops only on a park,
 a terminal state, a new episode or a stale heartbeat. A missed re-arm is how a question parks unseen.
+For exit 4 with `health_reason` "your vault is locked", hand the owner `! uzi vault unlock`
+(requires their password); only they can unlock it. After unlock, launch the printed `REARM=` in the background.
 
 The thirteen run statuses and which are terminal are in the `uzi-cli` skill. A run at
 `awaiting_input` asked a question: read it from `uzi run logs RUN --json` (a `question`

@@ -583,9 +583,11 @@ type RunDTO struct {
 	// when the reset is observed sooner.
 	ReserveExemptUntil *time.Time `json:"reserve_exempt_until,omitempty"`
 	// Read-time account admission details; absent when unrestricted.
-	CodexAdmissionClass      *string    `json:"codex_admission_class,omitempty"`
-	CodexAdmissionEligibleAt *time.Time `json:"codex_admission_eligible_at,omitempty"`
-	PlanMd                   *string    `json:"plan_md"`
+	AccountCooldownClass      *AccountCooldownClass `json:"account_cooldown_class,omitempty"`
+	AccountCooldownEligibleAt *time.Time            `json:"account_cooldown_eligible_at,omitempty"`
+	CodexAdmissionClass       *string               `json:"codex_admission_class,omitempty"`
+	CodexAdmissionEligibleAt  *time.Time            `json:"codex_admission_eligible_at,omitempty"`
+	PlanMd                    *string               `json:"plan_md"`
 	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
 	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
 	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB
@@ -1455,8 +1457,10 @@ type RunSummaryItemDTO struct {
 	// when the reset is observed sooner.
 	ReserveExemptUntil *time.Time `json:"reserve_exempt_until,omitempty"`
 	// Read-time account admission details; absent when unrestricted.
-	CodexAdmissionClass      *string    `json:"codex_admission_class,omitempty"`
-	CodexAdmissionEligibleAt *time.Time `json:"codex_admission_eligible_at,omitempty"`
+	AccountCooldownClass      *AccountCooldownClass `json:"account_cooldown_class,omitempty"`
+	AccountCooldownEligibleAt *time.Time            `json:"account_cooldown_eligible_at,omitempty"`
+	CodexAdmissionClass       *string               `json:"codex_admission_class,omitempty"`
+	CodexAdmissionEligibleAt  *time.Time            `json:"codex_admission_eligible_at,omitempty"`
 	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
 	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
 	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB
@@ -2073,6 +2077,8 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		IsRevising:                    item.IsRevising,
 		CodeCrossCheckRequired:        item.CodeCrossCheckRequired,
 		CodeCrossCheckSummary:         item.CodeCrossCheckSummary,
+		AccountCooldownClass:          item.AccountCooldownClass,
+		AccountCooldownEligibleAt:     item.AccountCooldownEligibleAt,
 	}
 }
 
@@ -2241,6 +2247,8 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			IsRevising:                    s.IsRevising,
 			CodeCrossCheckRequired:        s.CodeCrossCheckRequired,
 			CodeCrossCheckSummary:         s.CodeCrossCheckSummary,
+			AccountCooldownClass:          s.AccountCooldownClass,
+			AccountCooldownEligibleAt:     s.AccountCooldownEligibleAt,
 		},
 		RepoPath:       s.RepoPath,
 		WorkerName:     s.WorkerName,

@@ -1733,7 +1733,7 @@ func (q *Queries) MarkCaptureFailed(ctx context.Context, arg MarkCaptureFailedPa
 const markCaptureReady = `-- name: MarkCaptureReady :one
 UPDATE recovery_captures
 SET state = 'available', expires_at = $1, updated_at = now()
-WHERE id = $2 AND manifest_bound = true
+WHERE id = $2 AND manifest_bound = true AND state = 'uploading'
 RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds, redundancy_proof, redundancy_refused_at, redundancy_refusal
 `
 

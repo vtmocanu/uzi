@@ -183,10 +183,11 @@ type FinalizeResumeEntry struct {
 // in; terminal_pending is true while the attempt's outcome is journaled on the worker but not
 // yet accepted by the api (#1391).
 type ActiveRunEntry struct {
-	RunID           string `json:"run_id"`
-	ClaimGeneration int64  `json:"claim_generation"`
-	Phase           string `json:"phase"`
-	TerminalPending bool   `json:"terminal_pending"`
+	RunID           string          `json:"run_id"`
+	ClaimGeneration int64           `json:"claim_generation"`
+	Phase           string          `json:"phase"`
+	TerminalPending bool            `json:"terminal_pending"`
+	AccountCooldown json.RawMessage `json:"account_cooldown,omitempty"`
 }
 
 // snapshotPhases is the closed set an ActiveRunEntry.Phase must belong to — the run lane's four
@@ -238,6 +239,7 @@ type validatedEntry struct {
 	claimGeneration int64
 	phase           string
 	terminalPending bool
+	cooldown        *CodexOperationIdentity
 }
 
 // validatedFinalizeResume is the shape-validated form of ActiveSnapshot.FinalizeResume: two
@@ -340,6 +342,7 @@ func normalizeActiveSnapshot(p Params, wkr store.Worker, snap *ActiveSnapshot, m
 			claimGeneration: e.ClaimGeneration,
 			phase:           e.Phase,
 			terminalPending: e.TerminalPending,
+			cooldown:        parseActiveCooldown(e.AccountCooldown),
 		})
 	}
 
@@ -385,8 +388,8 @@ func (s *Service) validatedActiveSnapshot(wkr store.Worker, snap *ActiveSnapshot
 //
 // Returns (applied, err): applied reports whether rows/leases were written. In heartbeat and
 // register mode an invalid snapshot returns (false, nil) with a warning and touches nothing; in
-// claim mode it returns (false, ErrActiveSnapshotInvalid). A real DB error is returned verbatim
-// (a 500), never swallowed.
+// claim mode it returns (false, ErrActiveSnapshotInvalid). Custody DB errors propagate;
+// recoverable optional cooldown projection errors roll back only their savepoint.
 // ReplaceWorkerActiveRuns is the compatibility entrypoint for a provided transaction.
 // It acquires the worker row itself and uses the same frozen ledger as production callers.
 func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Queries, wkr store.Worker, snap *ActiveSnapshot, mode snapshotMode) (bool, error) {
@@ -495,6 +498,13 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 		})
 		if err != nil {
 			return false, err
+		}
+		if rows > 0 && e.cooldown != nil && e.claimGeneration > 0 && !e.terminalPending {
+			if err := qtx.WithWorkerActiveCooldownSavepoint(ctx, func(q *store.Queries) error {
+				return applyActiveCooldown(ctx, q, wkr, e)
+			}); err != nil {
+				return false, err
+			}
 		}
 		if rows == 0 {
 			// UpsertFrozenWorkerActiveRun rejected ownership or frozen identity drift.

@@ -104,7 +104,7 @@ function MilestoneNowStrip({
 // Frozen milestone rows for the unified run progress card. Keep the existing attribution
 // precedence: live lanes, uniquely matched declared owners, then the activity fallback.
 // Every display field is untrusted plain text. Completion is reported, not verified.
-export function MilestoneRows({ run, activity = null, activeContent }: { run: Pick<Run, "status" | "milestones" | "milestones_completed" | "milestones_in_progress" | "milestones_agents" | "milestones_live" | "progress">; activity?: RunActivity | null; activeContent?: ReactNode }) {
+export function MilestoneRows({ run, activity = null, activeContent }: { run: Pick<Run, "status" | "milestones" | "milestones_completed" | "milestones_in_progress" | "milestones_agents" | "milestones_live" | "progress"> & Partial<Pick<Run, "health">>; activity?: RunActivity | null; activeContent?: ReactNode }) {
   // useNow ages the "now" line's client-side elapsed token; called before the early
   // return so the hook order is stable (rules of hooks). A slow cadence is enough — the
   // strip shows a coarse "40s"/"6m" token, not a live countdown.
@@ -112,7 +112,8 @@ export function MilestoneRows({ run, activity = null, activeContent }: { run: Pi
   const milestones = run.milestones ?? [];
   if (milestones.length === 0) return null;
   const terminal = ["completed", "failed", "cancelled"].includes(run.status);
-  if (terminal || run.status === "paused") activity = null;
+  const accountWait = run.health === "waiting_account_cooldown";
+  if (terminal || run.status === "paused" || accountWait) activity = null;
   const completed = new Set(run.milestones_completed ?? []);
   const inProgress = new Set(run.milestones_in_progress ?? []);
   // Fallback activity attaches to the first in-progress milestone in frozen order.
@@ -135,7 +136,7 @@ export function MilestoneRows({ run, activity = null, activeContent }: { run: Pi
   // strip renders per lane, keyed by agent_instance so distinct subagents (reviewer×2) show
   // as distinct lines. We branch on PRESENCE of a lane (D5 back-compat), never on a nil test —
   // null / [] / all-empty-lanes ALL fall through to the pre-#1353 render below, byte-for-byte.
-  const lanes = terminal || run.status === "paused" ? [] : run.milestones_live ?? [];
+  const lanes = terminal || run.status === "paused" || accountWait ? [] : run.milestones_live ?? [];
   const milestonesLiveById = new Map(lanes.map((e) => [e.milestone_id, e.lanes]));
   const hasLanes = lanes.some((e) => inProgress.has(e.milestone_id) && !completed.has(e.milestone_id) && e.lanes.length > 0);
   return (

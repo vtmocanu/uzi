@@ -18,12 +18,15 @@
       "scope": "x",
       "title": "x",
       "severity": "x",
+      "attention_banner": true,
       "summary": "x",
       "since": "x",
       "evidence": [
         {
           "label": "x",
-          "value": "x"
+          "value": "x",
+          "run_id": "x",
+          "owner_id": "x"
         }
       ],
       "action": "x",

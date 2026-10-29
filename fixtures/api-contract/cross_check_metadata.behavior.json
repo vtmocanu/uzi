@@ -26,9 +26,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -38,9 +38,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -50,9 +50,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -62,9 +62,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ],
@@ -76,9 +76,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": "sonnet",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -88,9 +88,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6-astra",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -100,9 +100,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -112,9 +112,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ]
@@ -146,9 +146,9 @@
         "effort": null,
         "worker_default_model": "haiku",
         "resolved_model": "haiku",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -158,9 +158,9 @@
         "effort": null,
         "worker_default_model": "gpt-6-sol",
         "resolved_model": "gpt-6-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -170,9 +170,9 @@
         "effort": null,
         "worker_default_model": "haiku",
         "resolved_model": "haiku",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -182,9 +182,9 @@
         "effort": null,
         "worker_default_model": "gpt-6-sol",
         "resolved_model": "gpt-6-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ],
@@ -196,9 +196,9 @@
         "effort": null,
         "worker_default_model": "haiku",
         "resolved_model": "sonnet",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -208,9 +208,9 @@
         "effort": null,
         "worker_default_model": "gpt-6-sol",
         "resolved_model": "gpt-6-astra",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -220,9 +220,9 @@
         "effort": null,
         "worker_default_model": "haiku",
         "resolved_model": "haiku",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -232,9 +232,9 @@
         "effort": null,
         "worker_default_model": "gpt-6-sol",
         "resolved_model": "gpt-6-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ]
@@ -274,9 +274,9 @@
         "effort": null,
         "worker_default_model": "haiku",
         "resolved_model": "haiku",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -286,9 +286,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -298,9 +298,9 @@
         "effort": null,
         "worker_default_model": "haiku",
         "resolved_model": "haiku",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -310,9 +310,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ],
@@ -324,9 +324,9 @@
         "effort": null,
         "worker_default_model": "haiku",
         "resolved_model": "sonnet",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -336,9 +336,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6-astra",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -348,9 +348,9 @@
         "effort": null,
         "worker_default_model": "haiku",
         "resolved_model": "haiku",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -360,9 +360,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ]
@@ -409,9 +409,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -421,9 +421,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -433,9 +433,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -445,9 +445,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ],
@@ -459,9 +459,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": "sonnet",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -471,9 +471,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6-astra",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -483,9 +483,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -495,9 +495,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ]
@@ -537,9 +537,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -549,9 +549,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -561,9 +561,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -573,9 +573,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ],
@@ -587,9 +587,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": "sonnet",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -599,9 +599,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6-astra",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -611,9 +611,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -623,9 +623,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ]
@@ -665,9 +665,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -677,9 +677,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -689,9 +689,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -701,9 +701,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ],
@@ -715,9 +715,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": "sonnet",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -727,9 +727,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6-astra",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -739,9 +739,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -751,9 +751,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ]
@@ -800,9 +800,9 @@
         "effort": null,
         "worker_default_model": "opus",
         "resolved_model": "opus",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -812,9 +812,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -824,9 +824,9 @@
         "effort": null,
         "worker_default_model": "opus",
         "resolved_model": "opus",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -836,9 +836,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ],
@@ -850,9 +850,9 @@
         "effort": null,
         "worker_default_model": "opus",
         "resolved_model": "sonnet",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -862,9 +862,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6-astra",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -874,9 +874,9 @@
         "effort": null,
         "worker_default_model": "opus",
         "resolved_model": "opus",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -886,9 +886,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ]
@@ -935,9 +935,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -947,9 +947,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -959,9 +959,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -971,9 +971,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ],
@@ -985,9 +985,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": "sonnet",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -997,9 +997,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6-astra",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "pin",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -1009,9 +1009,9 @@
         "effort": null,
         "worker_default_model": null,
         "resolved_model": null,
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       },
       {
@@ -1021,9 +1021,9 @@
         "effort": null,
         "worker_default_model": "gpt-6.1-sol",
         "resolved_model": "gpt-6.1-sol",
-        "resolved_effort": "medium",
+        "resolved_effort": "high",
         "model_source": "worker default",
-        "effort_source": "worker default",
+        "effort_source": "cross-check default",
         "active": true
       }
     ]

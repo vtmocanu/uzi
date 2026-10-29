@@ -200,6 +200,11 @@ type ReconcileFlight = AnnounceFlight & {
 const reconcile = (RunRunner.prototype as unknown as {
   reconcileConfirmedOwed(flight: ReconcileFlight, bare: string, confirmed: string): Promise<void>;
 }).reconcileConfirmedOwed;
+// Legacy wiring (no authority hooks): the real inAuthority runs the reconciliation directly.
+const legacyAuthority = {
+  inAuthority: (RunRunner.prototype as unknown as { inAuthority: unknown }).inAuthority,
+  authorityWait: () => ({}),
+};
 function announcementProbe() {
   const emitted: unknown[] = [];
   const logs: string[] = [];
@@ -238,7 +243,7 @@ it("real Git partial, divergent and full confirmation resolves only covered anno
   assert.equal((await git.fetchAgentBranch(bare, clone, branch, flight.runId, { context })).kind, "updated");
   announce.call(null, flight, [a]);
   announce.call(null, flight, [b], true);
-  const target = { git, announceOwedHeads: announce };
+  const target = { git, announceOwedHeads: announce, ...legacyAuthority };
   await reconcile.call(target, flight, bare, base);
   assert.equal(resolutionRows(emitted).length, 0, "a divergent confirmation resolves neither root");
   await reconcile.call(target, flight, bare, a);
@@ -263,7 +268,7 @@ it("resolution deduplicates valid announced heads into eight-label rows, excludi
   flight.owedAnnounced.heads.add("invalid");
   const target = {
     git: { reconcileOwedCandidates: async () => ({ removedShas: [...heads, heads[0]!, "invalid"], retainedShas: [] }) },
-    announceOwedHeads: announce,
+    announceOwedHeads: announce, ...legacyAuthority,
   };
   await reconcile.call(target, flight, "unused", sha(20));
   const rows = resolutionRows(emitted);
@@ -290,7 +295,7 @@ for (const closed of [false, true]) {
     };
     const target = {
       git: { reconcileOwedCandidates: async () => ({ removedShas: [sha(1)], retainedShas: [sha(2)] }) },
-      announceOwedHeads: announce,
+      announceOwedHeads: announce, ...legacyAuthority,
     };
     await reconcile.call(target, flight, "unused", sha(20));
     assert.ok(!flight.owedAnnounced.heads.has(sha(1)));
@@ -319,7 +324,7 @@ it("refused resolution and throwing diagnostics do not block later rows or remai
   flight.runLog.info = () => { throw new Error("diagnostic unavailable"); };
   const target = {
     git: { reconcileOwedCandidates: async () => ({ removedShas: heads, retainedShas: [sha(10)] }) },
-    announceOwedHeads: announce,
+    announceOwedHeads: announce, ...legacyAuthority,
   };
   await reconcile.call(target, flight, "unused", sha(20));
   assert.equal(resolutionRows(emitted).length, 1, "the second row is still attempted");

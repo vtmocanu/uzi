@@ -121,11 +121,14 @@ func (m tuiModel) railWaitingLine() string {
 
 func (m tuiModel) railWaitingLineAt(now time.Time) string {
 	run := m.detail.run
-	if run.Status != "queued" {
+	if run.Status != "queued" && accountCooldownLineAt(run, now) == "" {
 		return ""
 	}
 	reason := runHealthReasonAt(run, now)
 	admission := codexAdmissionLineAt(run, now)
+	if cooldown := accountCooldownLineAt(run, now); cooldown != "" {
+		admission = cooldown
+	}
 	var rows []string
 	if run.Health == "waiting_worker" && reason != "" && reason != admission {
 		text := struct{ runHealthReason string }{runHealthReason: reason}

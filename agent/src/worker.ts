@@ -1452,9 +1452,9 @@ export class Worker {
               ? this.jobRunner.execute(claim)
               : this.executeIsolated(claim)
             : claim.review_target_run_id
-            ? this.reviewRunner.execute(claim)
+            ? this.reviewRunner.execute(claim, signal)
             : claim.kind === "judge"
-              ? this.judgeRunner.execute(claim)
+              ? this.judgeRunner.execute(claim, signal)
               : claim.kind === "job" ? this.jobRunner.execute(claim)
               : this.runner.execute(claim);
           } catch (err) {

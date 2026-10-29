@@ -55,6 +55,9 @@ type HealthCheckDTO struct {
 	Scope    string `json:"scope"`
 	Title    string `json:"title"`
 	Severity string `json:"severity"`
+	// AttentionBanner is a presentation-only opt-in; it does not affect severity,
+	// counts, blocking, episodes or notices.
+	AttentionBanner bool `json:"attention_banner,omitempty"`
 	// Summary is the one-line server-authored verdict for this check.
 	Summary string `json:"summary"`
 	// Since is when this check first went non-ok, where the source carries one (RFC3339),
@@ -74,4 +77,8 @@ type HealthCheckDTO struct {
 type HealthEvidenceDTO struct {
 	Label string `json:"label"`
 	Value string `json:"value"`
+	// RunID optionally links a retained waiting run; absent on older producers.
+	RunID string `json:"run_id,omitempty"`
+	// OwnerID disambiguates user-set display names; web copy uses its short form.
+	OwnerID string `json:"owner_id,omitempty"`
 }

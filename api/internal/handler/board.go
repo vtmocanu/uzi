@@ -167,8 +167,10 @@ type latestRunDTO struct {
 	// account reasons.
 	QueueReason *string `json:"queue_reason,omitempty"`
 	// Account admission fields are owner-only, including the account queue reason.
-	CodexAdmissionClass      *string    `json:"codex_admission_class,omitempty"`
-	CodexAdmissionEligibleAt *time.Time `json:"codex_admission_eligible_at,omitempty"`
+	AccountCooldownClass      *apitypes.AccountCooldownClass `json:"account_cooldown_class,omitempty"`
+	AccountCooldownEligibleAt *time.Time                     `json:"account_cooldown_eligible_at,omitempty"`
+	CodexAdmissionClass       *string                        `json:"codex_admission_class,omitempty"`
+	CodexAdmissionEligibleAt  *time.Time                     `json:"codex_admission_eligible_at,omitempty"`
 	// IsPlanning is issue #321's planning-phase display flag on the board card;
 	// non-sensitive, rides the shared card unconditionally like Status. Server-computed
 	// (running, iteration_count 0, no persisted plan yet; chat/judge excluded).
@@ -230,6 +232,7 @@ func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iteratio
 		FirstStartedAt: timePtr(firstStartedAt.Valid, firstStartedAt.Time),
 		FinishedAt:     timePtr(finishedAt.Valid, finishedAt.Time),
 	}
+	dto.Health = withoutAccountCooldownHealth(dto.Health)
 	dto.FailOrigin = textPtrValue(failOrigin.Valid, failOrigin.String)
 	// failure_reason and health_reason are owner-only (Decisions 5 & 6): both can carry
 	// text about the owner (a verbatim reject reason, a raw agent error, "your vault is
@@ -655,6 +658,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 			rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID, globalTimeout, rr.FailOrigin)
 		dto.AutoApproveBlockedReasons = nonNilStrings(rr.AutoApproveBlockedReasons)
 		dto.overlayQueueAdmission(rr.QueueReason, rr.CodexAdmissionClass, rr.CodexAdmissionEligibleAt)
+		dto.overlayAccountCooldown(rr.AccountCooldownClass, rr.AccountCooldownEligibleAt)
 		dto.IsRevising = revising[rr.ID] // nil map ⇒ false (issue #750)
 		latestByIID[rr.IssueIid.Int64] = dto
 	}
@@ -1060,6 +1064,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID, h.cfg.RunTimeout, lr.FailOrigin)
 		card.LatestRun.AutoApproveBlockedReasons = nonNilStrings(lr.AutoApproveBlockedReasons)
 		card.LatestRun.overlayQueueAdmission(lr.QueueReason, lr.CodexAdmissionClass, lr.CodexAdmissionEligibleAt)
+		card.LatestRun.overlayAccountCooldown(lr.AccountCooldownClass, lr.AccountCooldownEligibleAt)
 		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for moved card", "error", err)
@@ -1170,6 +1175,7 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID, h.cfg.RunTimeout, lr.FailOrigin)
 		card.LatestRun.AutoApproveBlockedReasons = nonNilStrings(lr.AutoApproveBlockedReasons)
 		card.LatestRun.overlayQueueAdmission(lr.QueueReason, lr.CodexAdmissionClass, lr.CodexAdmissionEligibleAt)
+		card.LatestRun.overlayAccountCooldown(lr.AccountCooldownClass, lr.AccountCooldownEligibleAt)
 		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for promoted card", "error", err)

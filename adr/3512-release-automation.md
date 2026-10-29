@@ -111,7 +111,7 @@ Publication/verification timestamps are recorded without claiming deployment
 health. Runner-slot and critical-path impact remain unmeasured until live use.
 
 3e-2 adds opt-in scheduling after the proven live RC. Cron `47 4 * * *` uses
-GitHub's native `timezone: Europe/Bucharest`, targeting a cut near 05:00 after
+GitHub's native `timezone: Europe/Bucharest`, targeting a cut near 05:00 when on time, after
 the local maintenance window ([schedule syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onschedule)).
 Only exact `RELEASE_NIGHTLY_ENABLED=true` enables nightly attempts; unset/false
 is a reported no-op. Activation requires the user's decision. Enablement is
@@ -127,29 +127,40 @@ Nightly eligibility comes only from `release-cut.sh --plan`: a non-metadata
 shipping change plus releasable notes. A no-op stops before CI waiting, cutting
 or artifact upload. Blocked plans are not converted into no-ops; manual empty
 respins retain the cutter's rules. The provisional cutoff is strictly before
-08:00 on the original run creation's Bucharest date. Tip waiting ends by 07:50,
+13:00 on the original run creation's Bucharest date. Tip waiting is bounded by
+`min(cutoff - 600 - now, 10800)`: at most three hours, ending by 12:50 and
 reserving a provisional fixed 600 seconds without resetting on tip changes.
 This is the existing cutter timeout, not a measured cut duration; it is an
 approved rollout deviation from D6 until timing evidence supports adjustment.
-The scheduled wait uses all remaining time until 07:50, rather than the manual
-7200-second limit. At a 04:47 start this is 183 minutes of eligible tip polling
-under the account's 20-job cap. The prepare ceiling is 210 minutes: 183 for
-waiting, ten for cutting and 17 for setup/overhead. Manual wait and cut budgets
-remain unchanged; only their job ceiling rises. Push/watch ceilings remain
+An on-time 04:47 start can wait until 07:47; a six-hour-late 10:47 start can wait
+until 12:50 (7380 seconds). Eligible polling still holds a runner under the
+account's 20-job cap. The prepare ceiling stays 210 minutes: 180 for waiting,
+ten for cutting and 20 for setup/overhead. Manual waiting stays 7200 seconds
+and its cutter budget stays 600 seconds. Push/watch ceilings remain
 15/125 minutes. Exact-head CI impact and live contention remain unmeasured.
 The isolated push job independently requires the enable flag and checks the
 window before minting, then recomputes the window immediately before pushing.
 Both inline checks require numeric epochs, a +0200/+0300 Bucharest offset and
 a fail-closed comparison. Original creation time permits at most 60 seconds of
-runner clock skew; the 08:00 cutoff itself has no grace period.
+runner clock skew; the 13:00 cutoff itself has no grace period.
 An expired window records `missed-target` and no attempted push. A queued run
 cannot acquire a new window on the following date. Manual budgets are unchanged.
 After tagging, bounded recovery ignores the cutoff and pause flag. Verification
-recorded after 09:00 is marked late without changing verified success or opening
+recorded after 14:00 is marked late without changing verified success or opening
 an extra incident. No clock-driven recovery cancellation or D10 journal is added.
 All routes share a non-cancelling queue, bounded by GitHub's 100 pending runs. A
 pending stable approval can delay RC work. A run cancelled before starting
 cannot produce its own report; its Actions status remains the evidence.
+
+The later cutoff follows observed scheduler delays of roughly six hours, not a
+guaranteed platform delay. Against the E2E 01:17Z cron, runs were created at
+[06:52:55Z on October 28](https://github.com/vtmocanu/uzi/actions/runs/40646564814)
+and [07:10:07Z on October 29](https://github.com/vtmocanu/uzi/actions/runs/40833689917).
+Against the release 02:47Z cron, the October 28 run was created at
+[08:59:40Z](https://github.com/vtmocanu/uzi/actions/runs/40660797895), past the
+previous 08:00 local cutoff. Delayed attempts may cut during daytime merges;
+exact-tip CI can take longer to settle, but neither tip moves nor retries reset
+the three-hour cap or original-date cutoff.
 
 Before the first live dispatch, the maintainer applies and verifies the five
 rulesets and Environment setup in [deploy/README.md](../deploy/README.md).

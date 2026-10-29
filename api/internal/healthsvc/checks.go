@@ -95,7 +95,7 @@ func sincePtr(t time.Time) *string {
 
 // safe strips control bytes (incl. tabs/newlines) and bounds an untrusted identifier or
 // enum before it renders into an admin surface. CellText folds \t/\n to spaces and strips
-// terminal escapes / bidi overrides; SanitizeBounded then caps the length. The result
+// terminal control bytes / bidi overrides; SanitizeBounded then caps the length. The result
 // carries no control characters and is at most maxEvidenceBytes long.
 func safe(v string) string {
 	clean := termsafe.SanitizeBounded(termsafe.CellText(v), maxEvidenceBytes)
@@ -786,6 +786,7 @@ func (s *Service) checkQueueWaiting(ctx context.Context, now time.Time, health h
 			oldest = r.HealthSince.Time
 		}
 	}
+	s.presentQueue(ctx, &evidence)
 	c.Evidence = evidence.finish()
 	c.Severity = sevOK
 	c.Summary = "No run has been waiting for a worker longer than 10 minutes."
@@ -802,7 +803,7 @@ func (s *Service) checkQueueWaiting(ctx context.Context, now time.Time, health h
 		}
 		c.Summary = fmt.Sprintf("A run has been waiting for a worker for %s.", humanDur(now.Sub(oldest)))
 		c.Since = sincePtr(oldest)
-		c.Action = strPtr("Check fleet.capacity and fleet.roll — a stuck roll or zero capacity is the usual cause.")
+		c.Action = strPtr("Open the waiting run for details, then check Worker capacity and Worker image roll for availability or upgrade problems.")
 	}
 	if unknownAge && c.Severity != sevDanger {
 		c.Severity = sevUnknown

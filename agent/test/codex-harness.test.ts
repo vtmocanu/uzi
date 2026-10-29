@@ -1505,6 +1505,53 @@ describe("CodexHarness: resumed usage evidence", () => {
       });
     }
 
+    it(`${authMode}: M2 final false guard repeats preparation before a single send`, async () => {
+      let preparations = 0, checks = 0;
+      const { harness, transport } = makeHarness({ authMode });
+      transport.push(threadStarted()).push(turnCompleted("completed")).end();
+      try {
+        await collect(harness.startTurn(makeRequest({ rootDispatch: {
+          prepare: async () => {
+            preparations++;
+            assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 0);
+          },
+          check: () => { checks++; return checks > 1; },
+        } })).events);
+        assert.equal(preparations, 2);
+        assert.equal(checks, 2);
+        assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 1);
+      } finally { await harness.close(); }
+    });
+
+    it(`${authMode}: M2 resumed admission abort does not fabricate incomplete usage`, async () => {
+      const accountant = new CodexUsageAccountant();
+      const controller = new AbortController();
+      const entered = deferred<void>();
+      let notices = 0;
+      const { harness, transport } = makeHarness({ authMode, accountant,
+        onTokenUsageIncomplete: () => { notices++; } });
+      const running = collect(harness.startTurn(makeRequest({
+        resumeSessionId: "resumed-1", signal: controller.signal,
+        rootDispatch: {
+          prepare: async () => {
+            entered.resolve();
+            await new Promise<never>((_, reject) => controller.signal.addEventListener("abort",
+              () => reject(controller.signal.reason), { once: true }));
+          },
+          check: () => controller.signal.throwIfAborted(),
+        },
+      })).events);
+      try {
+        await withTimeout(entered.promise, 2000, "resumed admission entered");
+        controller.abort(new Error("M2 admission cancelled"));
+        await assert.rejects(running, /M2 admission cancelled/);
+        assert.equal(transport.requests.some(r => r.method === "thread/resume"), true);
+        assert.equal(transport.requests.some(r => r.method === "turn/start"), false);
+        assert.equal(accountant.usageIncomplete, false);
+        assert.equal(notices, 0);
+      } finally { controller.abort(); await harness.close(); }
+    });
+
     for (const stopKind of ["abort", "stop"] as const) {
       it(`${authMode}: ${stopKind} after thread resume prevents sending turn/start`, async () => {
         const accountant = new CodexUsageAccountant();
@@ -6037,5 +6084,84 @@ describe("M3 Codex producer projection compatibility", () => {
     }
     assert.doesNotMatch(JSON.stringify(sent), /projection-private-value|\\u0000/);
     await harness.close();
+  });
+});
+
+
+describe("3506 retry context lifetime", () => {
+  for (const evidence of ["text", "native tool", "projected tool"] as const) {
+    it(`3506 emitted ${evidence} clears retained retry context`, async () => {
+      let calls = 0;
+      const { harness, transport } = makeHarness({ broker: stubBroker(async () => {
+        calls++;
+        return { ok: true, output: {} };
+      }) });
+      const note: CodexNotification = evidence === "text" ? agentMessage("working")
+        : evidence === "native tool" ? {
+          kind: "activity", method: "item/started",
+          params: { threadId: "th-1", item: { type: "commandExecution" } },
+        } : toolCall(91, "Bash", { command: "true" }, "th-1", "tn-1", "retry-tool");
+      transport.push(threadStarted()).push(codexError("rateLimitExceeded", { willRetry: true }))
+        .push(note).push(turnCompleted("completed")).end();
+      let retained = false, cleared = false;
+      try {
+        for await (const event of harness.startTurn(makeRequest()).events) {
+          if (evidencesModelProcessing(event)) {
+            assert.equal(retained, true, "retry context was present before model evidence");
+            assert.equal(harness.retryClassification, undefined, "cleared before evidence is yielded");
+            cleared = true;
+          } else if (!cleared && harness.retryClassification !== undefined) {
+            assert.equal(harness.retryClassification.classification, "rateLimitExceeded");
+            retained = true;
+          }
+        }
+        assert.equal(cleared, true, "the fixture emitted model evidence");
+        assert.equal(harness.retryClassification, undefined, "context stays cleared at turn end");
+        assert.equal(calls, evidence === "projected tool" ? 1 : 0);
+      } finally { await harness.close(); }
+    });
+  }
+
+
+  it("3506 retry context resets synchronously for a new turn without affecting terminal selection", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(codexError("rateLimitExceeded", { willRetry: true }))
+      .push(turnCompleted("completed"));
+    await collect(harness.startTurn(makeRequest()).events);
+    assert.deepEqual(harness.retryClassification, { classification: "rateLimitExceeded", category: "rate_limit" });
+    const turn = harness.startTurn(makeRequest());
+    assert.equal(harness.retryClassification, undefined);
+    transport.push(codexError("rateLimitExceeded", { willRetry: true })).push(turnCompleted("failed")).end();
+    const events = await collect(turn.events);
+    const terminal = events.find(event => event.kind === "turn_finished");
+    assert.ok(terminal?.kind === "turn_finished");
+    assert.deepEqual(terminal.terminal.errors, ["codex turn ended with status: failed"]);
+    assert.deepEqual(harness.retryClassification, { classification: "rateLimitExceeded", category: "rate_limit" }, "new turn accepts retries again");
+  });
+
+  it("3506 a registered child retry cannot create root context", async () => {
+    const { harness, transport } = makeHarness();
+    const notes: CodexNotification[] = [];
+    harness.registerChildSink("child", { push: note => { notes.push(note); } });
+    transport.push(threadStarted())
+      .push(codexError("rateLimitExceeded", { willRetry: true, threadId: "child" }))
+      .push(turnCompleted("completed")).end();
+    try {
+      await collect(harness.startTurn(makeRequest()).events);
+      assert.equal(notes.length, 1);
+      assert.equal(harness.retryClassification, undefined);
+    } finally { await harness.close(); }
+  });
+
+  it("3506 a registered child retry cannot replace root context", async () => {
+    const { harness, transport } = makeHarness();
+    const notes: CodexNotification[] = [];
+    harness.registerChildSink("child", { push: note => { notes.push(note); } });
+    transport.push(threadStarted()).push(codexError("rateLimitExceeded", { willRetry: true }))
+      .push(codexError("unauthorized", { willRetry: false, threadId: "child" }))
+      .push(turnCompleted("completed")).end();
+    await collect(harness.startTurn(makeRequest()).events);
+    assert.equal(notes.length, 1);
+    assert.equal(harness.retryClassification?.classification, "rateLimitExceeded");
   });
 });

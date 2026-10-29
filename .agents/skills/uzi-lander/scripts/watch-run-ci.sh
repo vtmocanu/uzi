@@ -14,12 +14,14 @@
 # Usage:
 #   watch-run-ci.sh <run-id> [--interval SECS] [--max-ticks N] [--repo OWNER/REPO]
 #   watch-run-ci.sh --branch main [--workflow ci.yml] [--interval SECS] [--max-ticks N]
-#   watch-run-ci.sh --sha <sha> [--branch main] [--interval SECS] [--max-ticks N]
+#   watch-run-ci.sh --sha <sha> [--follow] [--branch main] [--interval SECS] [--max-ticks N]
 #
 #   --interval     seconds between polls (default 120, or 60 with --sha: a release or
 #                  post-merge gate waits on its result, so a 120s tick reports green late).
 #   --max-ticks    give up after N polls (default 40, or 80 with --sha -> ~80 min either way).
 #   --repo         OWNER/REPO (default: inferred by gh from the checkout).
+#   --follow       --sha only: on supersession, watch the current --branch head within
+#                  the original tick budget. Print each SHA switch; return its verdict.
 #
 # Use a verified native callback or consented completion adapter; background execution
 # alone does not establish owner re-entry. Do not block a
@@ -47,7 +49,8 @@
 #      failed job beside cancelled ones (an aggregator needing its cancelled shards) waits
 #      for the run's conclusion: cancelled is superseded (exit 4), anything else exit 1.
 #      `git fetch origin main` and re-watch the CURRENT head, whose run exercises this
-#      change plus the newer one. Not a failure.
+#      change plus the newer one. Not a failure. With --follow, re-resolve the branch
+#      instead; an unchanged head waits another tick, an unreadable head exits 3.
 #
 # Design notes:
 #  - Parses `gh run view --json jobs` with jq, then classifies with awk -F'\t' (this
@@ -69,11 +72,12 @@
 #    cannot go green, so there is nothing to gain by waiting for the rest.
 set -uo pipefail
 
-RUN=""; BRANCH=""; SHA=""; WORKFLOW="ci.yml"; INTERVAL=""; MAX_TICKS=""; REPO=""
+RUN=""; BRANCH=""; SHA=""; WORKFLOW="ci.yml"; INTERVAL=""; MAX_TICKS=""; REPO=""; FOLLOW=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --branch) BRANCH="${2:?}"; shift 2;;
     --sha) SHA="${2:?}"; shift 2;;
+    --follow) FOLLOW=1; shift;;
     --workflow) WORKFLOW="${2:?}"; shift 2;;
     --interval) INTERVAL="${2:?}"; shift 2;;
     --max-ticks) MAX_TICKS="${2:?}"; shift 2;;
@@ -87,10 +91,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 if [ -z "$RUN" ] && [ -z "$BRANCH" ] && [ -z "$SHA" ]; then
-  echo "usage: watch-run-ci.sh <run-id> | --branch <name> [--workflow ci.yml] | --sha <sha> [--branch main]  [--interval S] [--max-ticks N] [--repo OWNER/REPO]" >&2
+  echo "usage: watch-run-ci.sh <run-id> | --branch <name> [--workflow ci.yml] | --sha <sha> [--follow] [--branch main]  [--interval S] [--max-ticks N] [--repo OWNER/REPO]" >&2
   exit 3
 fi
 if [ -n "$SHA" ] && [ -n "$RUN" ]; then echo "--sha and <run-id> are exclusive" >&2; exit 3; fi
+if [ "$FOLLOW" -eq 1 ] && [ -z "$SHA" ]; then echo "--follow requires --sha" >&2; exit 3; fi
 # --sha defaults the branch to main; --branch alone keeps its latest-run semantics.
 SHA_MODE=0
 if [ -n "$SHA" ]; then SHA_MODE=1; BRANCH="${BRANCH:-main}"; fi
@@ -300,6 +305,21 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
     [ "$failed" -eq 1 ] && exit 1
     if [ "$pending" -eq 0 ]; then
       if [ "$superseded" -gt 0 ]; then
+        if [ "$FOLLOW" -eq 1 ]; then
+          branch_ref="$(printf '%s' "$BRANCH" | jq -sRr @uri)"
+          if ! next_sha="$(gh api "repos/${repo_path}/commits/${branch_ref}" --jq '.sha' 2>/dev/null)" ||
+             ! [[ "$next_sha" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+            echo 'watch-run-ci: could not resolve branch head for --follow (exit 3)' >&2
+            exit 3
+          fi
+          if [ "$next_sha" != "$SHA" ]; then
+            printf 'FOLLOW sha=%s -> %s\n' "$SHA" "$next_sha"
+            SHA="$next_sha"; seen_any=0; gh_errs=0
+          else
+            printf '[tick %s] superseded sha=%s is still the branch head; retrying\n' "$tick" "$SHA"
+          fi
+          sleep "$INTERVAL"; tick=$((tick+1)); continue
+        fi
         echo "=== sha ${SHA:0:8}: $superseded run(s) cancelled by concurrency, none failed — superseded; re-watch the current $BRANCH head (exit 4) ==="
         exit 4
       fi

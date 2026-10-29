@@ -1,3 +1,5 @@
+import { decodeCodexOperationDecision, validCodexOperationRequest } from "./codex-operation-admission.js";
+import type { CodexOperationRequest, CodexOperationDecision } from "./protocol.js";
 import { CodexAdmissionReporter } from "./codex/admission-signal.js";
 import { selectCodexBinding } from "./codex/select.js";
 import { createHash } from "node:crypto";
@@ -364,6 +366,13 @@ export class HeldFeatureUnavailableError extends Error {
 export type HeldPublishResult =
   | { ok: true; body: HeldPublicationResponse }
   | { ok: false; httpStatus?: number; reason: string };
+
+export class CodexOperationAdmissionError extends Error {
+  constructor(readonly status: number, readonly reason: "authority_lost" | "stale_source" | "route_uncertain" | "http_error") {
+    super("Codex operation admission refused");
+    this.name = "CodexOperationAdmissionError";
+  }
+}
 
 export class RequestError extends Error {
   constructor(
@@ -1292,6 +1301,19 @@ export class WorkerClient {
    * A stripped rollback success clears it; later ordinary ticks can rediscover it.
    */
   private serverFeatures = new Set<string>();
+  private operationNegotiation = 0;
+  private readonly operationFlights = new Map<string, { generation: number; token: symbol; reportingUnavailable?: boolean }>();
+
+  /** Positive negotiation serial survives feature clearing and worker re-registration. */
+  get codexOperationNegotiation(): number { return this.operationNegotiation; }
+
+  retainCodexOperationFlight(runId: string, generation: number): () => void {
+    const token = Symbol();
+    this.operationFlights.set(runId, { generation, token });
+    return () => {
+      if (this.operationFlights.get(runId)?.token === token) this.operationFlights.delete(runId);
+    };
+  }
   private readonly codexAdmission = new Map<string, { generation: number; reporter: CodexAdmissionReporter }>();
   private readonly codexAdmissionClosed = new Map<string, number>();
   private codexAdmissionEpoch = {};
@@ -1503,7 +1525,9 @@ export class WorkerClient {
   }
 
   private replaceServerFeatures(features: readonly string[]): void {
+    const hadOperationAdmission = this.hasFeature("codex_account_operation_admission_v1");
     this.serverFeatures = new Set(features);
+    if (!hadOperationAdmission && this.hasFeature("codex_account_operation_admission_v1")) this.operationNegotiation++;
     if (!this.hasFeature("codex_account_admission_signal_v1")) {
       this.codexAdmissionEpoch = {};
       for (const owned of this.codexAdmission.values()) owned.reporter.seal();
@@ -1526,6 +1550,54 @@ export class WorkerClient {
     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
     this.codexHTTPTimeoutMs = opts.codexHTTPTimeoutMs ?? 8_000;
     this.interruptedCallsTimeoutMs = opts.interruptedCallsTimeoutMs ?? 2_000;
+  }
+
+  /** One low-level policy read. Feature negotiation and waiting belong to the scheduler. */
+  async checkCodexOperationAdmission(runId: string, request: CodexOperationRequest, signal?: AbortSignal): Promise<CodexOperationDecision> {
+    const body = JSON.stringify(request);
+    if (Buffer.byteLength(body) > 4096) throw new Error("invalid Codex operation admission request");
+    const boundRequest: CodexOperationRequest = JSON.parse(body);
+    if (!validCodexOperationRequest(boundRequest)) throw new Error("invalid Codex operation admission request");
+    const deadline = AbortSignal.any([AbortSignal.timeout(3000), ...(signal ? [signal] : [])]);
+    deadline.throwIfAborted();
+    const res = await (this.transport ?? fetch)(
+      this.baseUrl + WORKER_API_PREFIX + "/runs/" + encodeURIComponent(runId) + "/codex/operation-admission",
+      { method: "POST", headers: { Authorization: "Bearer " + this.token, "Content-Type": "application/json" }, body, signal: deadline },
+    );
+    const bytes = await readBoundedBytes(res, 8192, true, deadline);
+    deadline.throwIfAborted();
+    let wire: unknown;
+    try { wire = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch {
+      if (res.status === 200) throw new Error("invalid Codex operation admission response");
+    }
+    if (res.status !== 200) {
+      const typed = isRecord(wire) && Object.keys(wire).length === 2 && typeof wire.error === "string" ? wire : undefined;
+      const reason = typed && res.status === 404 && typed.reason === "authority_lost" ? "authority_lost" :
+        typed && res.status === 409 && typed.reason === "stale_source" ? "stale_source" :
+        res.status === 404 ? "route_uncertain" : "http_error";
+      throw new CodexOperationAdmissionError(res.status, reason);
+    }
+    return decodeCodexOperationDecision(wire, boundRequest);
+  }
+
+  private diagnoseOperationReporting(snapshot: ActiveSnapshot | undefined): void {
+    if (this.hasFeature("active_run_snapshot") && snapshot !== undefined && this.registerNonce !== undefined) return;
+    // Retained bindings exist only for engaged subscription operation flights.
+    // One fixed diagnostic per flight bounds repeated polls and source churn.
+    for (const flight of this.operationFlights.values()) {
+      if (flight.reportingUnavailable) continue;
+      flight.reportingUnavailable = true;
+      try { this.log.warn("codex_operation_snapshot_unavailable"); } catch { /* Display only. */ }
+    }
+  }
+
+  private snapshotForServer(snapshot: ActiveSnapshot): ActiveSnapshot {
+    return { ...snapshot, active: snapshot.active.map(entry => {
+      const { account_cooldown, ...rest } = entry;
+      return (this.hasFeature("codex_account_operation_admission_v1") ||
+        this.operationFlights.get(entry.run_id)?.generation === entry.claim_generation) && account_cooldown !== undefined
+        ? { ...rest, account_cooldown: structuredClone(account_cooldown) } : rest;
+    }) };
   }
 
   async register(
@@ -1578,7 +1650,7 @@ export class WorkerClient {
     // nonce exists yet), so it is sent verbatim WITHOUT stamping registerNonce — unlike the heartbeat
     // and claim snapshots. Sent only when the boot-replay path built one (a pending terminal journal
     // exists); an ordinary worker passes undefined and the register wire stays byte-identical.
-    if (initialSnapshot !== undefined) body.active_snapshot = initialSnapshot;
+    if (initialSnapshot !== undefined) body.active_snapshot = this.snapshotForServer(initialSnapshot);
     const res = (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
     if (interruptedEpoch !== this.interruptedEpoch) return res;
     this.interruptedIdentity = interruptedRegistration(res.worker_id, res.register_nonce, interruptedEpoch);
@@ -1598,6 +1670,7 @@ export class WorkerClient {
         ? res.protocol_features.filter((f): f is string => typeof f === "string")
         : [],
     );
+    if (this.hasFeature("codex_account_operation_admission_v1")) this.operationNegotiation++;
     if (originalCapabilities !== undefined && originalCapabilities.length <= 256 &&
         originalCapabilities.every((cap) => typeof cap === "string" && Buffer.byteLength(cap, "utf8") <= 64) &&
         typeof maxConcurrentRuns === "number" && Number.isInteger(maxConcurrentRuns) && maxConcurrentRuns >= 1 && maxConcurrentRuns <= 256 &&
@@ -1698,8 +1771,9 @@ export class WorkerClient {
     // `active_run_snapshot` AND the worker built one, stamped with the register nonce so the
     // api can trust its epoch across a restart. Same "byte-identical wire on an old api" shape
     // as `outbox`.
+    this.diagnoseOperationReporting(activeSnapshot);
     const includeSnapshot = this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined && this.registerNonce !== undefined;
-    if (includeSnapshot) body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
+    if (includeSnapshot) body.active_snapshot = { ...this.snapshotForServer(activeSnapshot), register_nonce: this.registerNonce };
     if (this.hasFeature("dind_maintenance_v1") && isDindUUID(this.registerNonce)) {
       const sample = maintenance?.sample;
       if (validDindSample(sample)) {
@@ -1863,8 +1937,9 @@ export class WorkerClient {
       const deadline = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);
       deadline.throwIfAborted();
       const body: ClaimRequest = {};
+      this.diagnoseOperationReporting(activeSnapshot);
       if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined && this.registerNonce !== undefined) {
-        body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
+        body.active_snapshot = { ...this.snapshotForServer(activeSnapshot), register_nonce: this.registerNonce };
       }
       if (!dedicated && this.hasMemoryAuthorityClaimCapability && this.hasFeature("worker_memory_authority_claim_v1")) {
         body.memory_authority = this.memoryIncarnationValue ? "held" : "lost";

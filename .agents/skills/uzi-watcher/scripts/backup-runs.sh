@@ -31,6 +31,10 @@
 # writes the stopped-source marker uzi-stopped.<runId>.entry); that marker, when it
 # names THIS run, branch, key and the key's exact canonical path, makes the canonical
 # dir a retained candidate (never journal-current, and never an attempt dir).
+# A journal (plain or protected descriptor) may carry an optional completionSourceFence
+# {version:1, sourceUseEpoch: UUID, sourceCoreDigest: 64 lowercase hex} (issue #3404): the protected
+# descriptor validator accepts exactly that shape and refuses any other value; the fence grants no
+# attribution of its own.
 # .uzi-residue-* / .uzi-skills-* siblings are never candidates. The host resolves the concrete dir and passes it to the capture.
 #
 # For each run id it resolves worker_id -> pod FRESH each call (so it survives a
@@ -572,13 +576,19 @@ select_clone(){
         and (if .stage == "blocked" then has("blocker") else true end)
         and (if .stage == "captured" or .stage == "adopting" or .stage == "ready-for-model" then has("restoreTip") else true end)
         and (if .stage == "ready-for-model" then has("successor") else true end);
+      def uuid: type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+      def fence:
+        type == "object" and (keys == ["sourceCoreDigest","sourceUseEpoch","version"])
+        and .version == 1 and (.sourceUseEpoch | uuid)
+        and (.sourceCoreDigest | type == "string" and test("^[0-9a-f]{64}$"));
       def journal:
-        . as $j | type == "object" and fields(["runId","clonePath","attemptId","restoreTip","recovery","retainedSources","peeledMarkers"])
+        . as $j | type == "object" and fields(["runId","clonePath","attemptId","restoreTip","recovery","retainedSources","peeledMarkers","completionSourceFence"])
         and ({runId,clonePath} + (if has("attemptId") then {attemptId} else {} end)
           + (if has("restoreTip") then {restoreTip} else {} end) | src)
         and (if has("retainedSources") then (.retainedSources | type) == "array" and all(.retainedSources[]; src) else true end)
         and (if has("peeledMarkers") then (.peeledMarkers | type) == "array" and (.peeledMarkers | length) <= 64
              and all(.peeledMarkers[]; sha) and ((.peeledMarkers | unique | length) == (.peeledMarkers | length)) else true end)
+        and (if has("completionSourceFence") then (.completionSourceFence | fence) else true end)
         and (if has("recovery") then
           (.recovery | progress) and
           (same(.recovery.source) or any((.retainedSources // [])[]; same($j)) or

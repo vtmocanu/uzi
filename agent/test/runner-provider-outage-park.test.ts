@@ -731,3 +731,34 @@ describe("M2 Codex idle typed ACK and custody", () => {
     });
   }
 });
+
+
+describe("3506 dual marker provider wire precedence", () => {
+  for (const scenario of [
+    { name: "timed", features: [...FEATURES, PROGRESS], generation: 3, held: false, turns: 2, typed: true },
+    { name: "held", features: [...FEATURES, HOLD, PROGRESS], generation: 3, held: true, turns: 0, typed: true },
+    { name: "legacy", features: ["claim_generation_fence", PROGRESS], generation: 3, held: false, turns: 2, typed: false },
+    { name: "unfenced", features: ["recovery_cause_provider_outage", PROGRESS], generation: 3, held: false, turns: 0, typed: false },
+    { name: "zero generation", features: [...FEATURES, PROGRESS], generation: 0, held: false, turns: 2, typed: false },
+  ]) it(`3506 blackbox provider wire report: ${scenario.name}`, async () => {
+    await withHome(async home => {
+      client.protocolFeatures = [...scenario.features, "recovery_cause_codex_idle_stall_v1"];
+      const rig = rigFor("codex", { turns: scenario.turns, error: () => new TransientRecoveryError(
+        "silence after a provider-reported rate limit or transport retry",
+        { providerOrigin: true, idleStallKind: "zero_evidence", originalIdle: new Error("codex run idle timeout") },
+      ) }, home);
+      const claim = gitlabClaim(3506, { claim_generation: scenario.generation });
+      if (scenario.held) api.ackTypedParkAs(claim.run_id, "paused", HOLD);
+      await rig.runner.execute(claim);
+      const sent = parks(claim.run_id);
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0]!.recovery_cause, scenario.typed ? "provider_outage" : undefined);
+      assert.equal(sent[0]!.productive_turns, scenario.typed ? scenario.turns : undefined);
+      assert.equal(sent[0]!.provider_progress_turns, undefined, "provider-origin fallback keeps existing progress semantics");
+      const notices = feedTexts(claim.run_id);
+      assert.ok(notices.some(text => text.startsWith("paused following silence after a provider-reported rate limit or transport retry;")));
+      assert.ok(notices.some(text => text.includes(scenario.held ? "waits for its owner to resume it" : "resumes automatically")));
+      if (scenario.held) assert.ok(!notices.some(text => text.includes("resumes automatically")));
+    });
+  });
+});

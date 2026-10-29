@@ -1045,6 +1045,9 @@ func progressRow(r apitypes.RunDTO) []string {
 		}
 		return row("stalled")
 	case runprogress.StateWaiting:
+		if activeAccountCooldown(r) {
+			return row("waiting on account")
+		}
 		switch r.Status {
 		case "awaiting_approval":
 			return row("waits on you · plan gate")
@@ -1084,9 +1087,11 @@ func progressParkWord(status string) string {
 // `<agent> · <agent_label> · <tool> <detail> · <age> ago`. It is the CLI twin of the
 // web run view's now line, the TUI board's second line (boardSecondLine) and the crew
 // rail's `↳` line, and reads RunDTO.CurrentActivity directly — no milestone
-// precondition (D5): any non-terminal run that has an activity gets the row.
+// precondition (D5). A non-terminal run with activity gets the row unless it is
+// waiting on account cooldown.
 //
-// Rendered ONLY when current_activity is present AND the run is non-terminal. The
+// Rendered only when current_activity is present, the run is non-terminal, and
+// activeAccountCooldown is false: a retained tool frame is not live during that wait. The
 // server already returns null for a terminal run and for a run with no tool_use frame,
 // so the nil guard alone matches the wire; the terminal-status guard is the same
 // belt-and-braces the board's boardShowSecondLine carries — a finished run has no
@@ -1109,7 +1114,7 @@ func progressParkWord(status string) string {
 // inherits that exclusion and can never surface a raw command.
 func nowRow(r apitypes.RunDTO) []string {
 	act := r.CurrentActivity
-	if act == nil || terminalRunStatuses[r.Status] {
+	if act == nil || terminalRunStatuses[r.Status] || activeAccountCooldown(r) {
 		return nil
 	}
 	parts := make([]string, 0, 4)
@@ -1171,6 +1176,9 @@ func milestoneNowRows(r apitypes.RunDTO) [][]string {
 		return nil
 	}
 	act := r.CurrentActivity
+	if activeAccountCooldown(r) {
+		act = nil
+	}
 	uniqueID := ""
 	if act != nil {
 		uniqueID = uniqueMilestoneAgentMatch(eff, act.Agent)
@@ -2429,6 +2437,9 @@ func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 		s += " (credential switch unsettled)"
 	}
 	admission := codexAdmissionLineAt(r.RunDTO, now)
+	if cooldown := accountCooldownLineAt(r.RunDTO, now); cooldown != "" {
+		admission = cooldown
+	}
 	if reason := runQueueReason(r.RunDTO); reason != "" {
 		s += " (" + reason + ")"
 	} else if reason := strOr(r.HealthReason, ""); r.Status == "queued" && (reason == "your Codex account is unavailable (quarantined or being re-linked), so this run can't start" || (admission != "" && reason != "" && !apitypes.IsCodexAdmissionReason(reason))) {
@@ -2453,6 +2464,9 @@ func codexAdmissionLineAt(r apitypes.RunDTO, now time.Time) string {
 // runHealthReasonAt discards stale persisted provider reasons, retaining other blockers.
 func runHealthReasonAt(r apitypes.RunDTO, now time.Time) string {
 	reason := strOr(r.HealthReason, "")
+	if reason == apitypes.AccountCooldownReason {
+		return accountCooldownLineAt(r, now)
+	}
 	if apitypes.IsCodexAdmissionReason(reason) {
 		return codexAdmissionLineAt(r, now)
 	}
@@ -2738,4 +2752,17 @@ func queueReasonCell(reason string) string {
 		return "weekly_reserve (held by your weekly usage reserve)"
 	}
 	return sanitizeTTY(reason)
+}
+
+// activeAccountCooldown follows health until a fresh report clears it, even when
+// accountCooldownLineAt has no current typed metadata to display.
+func activeAccountCooldown(r apitypes.RunDTO) bool {
+	return r.Health == "waiting_account_cooldown" && (r.Status == "claimed" || r.Status == "running" || r.Status == "awaiting_approval")
+}
+
+func accountCooldownLineAt(r apitypes.RunDTO, now time.Time) string {
+	if !activeAccountCooldown(r) || r.AccountCooldownClass == nil || r.AccountCooldownEligibleAt == nil || !r.AccountCooldownEligibleAt.After(now) {
+		return ""
+	}
+	return apitypes.AccountCooldownLine(*r.AccountCooldownClass, *r.AccountCooldownEligibleAt)
 }

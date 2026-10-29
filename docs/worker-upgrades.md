@@ -20,7 +20,13 @@ by watching the pod rather than by asking the worker.
 
 For `codex_account_admission_signal_v1`, upgrade the API before workers.
 Older workers obey the server claim gate but provide less pressure evidence;
-missing or refused telemetry does not change run lifecycle behavior.
+missing or refused telemetry does not change run lifecycle behavior. This
+best-effort reporting is distinct from independently negotiated
+`codex_account_operation_admission_v1`: once engaged, loss of the admission
+service blocks the next supported model dispatch, even without a known
+cooldown. Already dispatched turns and preservation continue under existing
+controls and deadlines. Never-negotiated flights keep legacy behavior;
+engaged flights cannot downgrade on feature loss or re-registration.
 Operators: see [upgrade, rollback and reporting limits](installation.md#codex-account-admission-upgrades).
 The [account admission policy](rate-limits.md#temporary-account-admission-waits)
 is shared across aliases and adds no account seat limit.
@@ -44,6 +50,18 @@ The separate permit-scope compatibility rule requires an omitted scope to
 fall back only at exactly the claim revision (default 1). A different
 revision without scope holds closed. Upgrade both components for current
 scope rendering; see [Completion holds](run-completion-hold.md).
+
+## Completion-source authority (#3404)
+
+Cut over with the old workers quiesced. A worker publishing a completed source
+writes a fence into the bare repository's recovery journal, and an older worker
+refuses to attach, recover or discard a journal that carries it. Rolling a worker
+back therefore leaves those sources unreachable until a current worker runs
+again. A worker that predates #3404 takes no data-directory lock, so old workers
+must be quiesced before cutover: of two current workers on one data directory,
+the second one started refuses to start. Changing the worker join token on a reused data volume leaves
+existing authority records unauthenticated, so their sources are retained. See
+[Completed sources after a worker restart](run-recovery.md#completed-sources-after-a-worker-restart).
 
 ## Refresh publication context (#3120)
 

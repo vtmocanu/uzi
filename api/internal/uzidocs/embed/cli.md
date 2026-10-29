@@ -1233,6 +1233,20 @@ A few worth knowing:
   with admission shown independently. Cancel works; there is no admission
   override. See [Temporary account admission waits](rate-limits.md#temporary-account-admission-waits)
   for the shared-account policy and exact waiting messages.
+- **Claimed Codex subscription work can wait in place for account cooldown.**
+  In `claimed`, `running` or `awaiting_approval`, `uzi run get`, list status
+  cells and the TUI detail rail show `waiting for account cooldown` with the
+  class and absolute earliest eligibility. The TUI uses `~` / `account cooldown`.
+  JSON carries health `waiting_account_cooldown`, `account_cooldown_class`
+  (`rate_limit` or `overload`) and `account_cooldown_eligible_at`; these active
+  fields are separate from the queued `codex_admission_*` fields above.
+  Eligibility includes recovery spread and is not promised dispatch. Fresh
+  ownership/generation/binding/source evidence and a 45-second accepted snapshot
+  lease are required; omission/expiry or source/status changes clear the copy
+  on a fresh accepted read. Foreign shared/admin summaries omit class and time.
+  Missing optional snapshots mean visibility is unknown, not disabled enforcement.
+  Independent faults/freshness and wall warnings retain precedence. Existing
+  controls remain effective; Resume does not bypass admission.
 - **`uzi repo remove <id>` deletes a single stale repo** — the surgical
   counterpart to deleting a whole forge connection. It only works on a
   **disabled** repo, so disable it first (`enabled` shows in `uzi repo list`);
@@ -2941,7 +2955,8 @@ JSON returns the decoded account settings DTO, including
 `model`/`effort`, read-only nullable `worker_default_model`, separate
 `resolved_model`/`resolved_effort`, `model_source`/`effort_source` and
 `active`. Null Claude model metadata means SDK/account default. Sources
-display as `pin` or `worker default`; missing or unfamiliar values show
+display as `pin` or `worker default`, and an unpinned effort as
+`cross-check default`; missing or unfamiliar values show
 `unknown` in the human view. See
 [Configuration](./configuration.md#plan-cross-check-model-and-effort-pins)
 for resolution, validation and capability requirements.
@@ -3009,7 +3024,8 @@ this cookie-only consent setting.
 gate reason. Its `PLAN_CHECK_*` rows show the stored candidate's result,
 reason, checker id, recorded model/effort, independent model/effort sources,
 tokens/cost and findings. `PLAN_CHECK_MODEL_SOURCE` and
-`PLAN_CHECK_EFFORT_SOURCE` show `pin` or `worker default`; missing legacy or
+`PLAN_CHECK_EFFORT_SOURCE` show `pin` or `worker default`, and the effort also
+`cross-check default` when unpinned; missing legacy or
 unrecognized sources show `unknown`. JSON summary fields
 `checker_model_source` and `checker_effort_source` remain nullable for legacy
 records. Settings changes do not rewrite this recorded evidence. A human

@@ -83,6 +83,7 @@ type Store interface {
 	ListOwnersWaitingNoCapacity(ctx context.Context, arg store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error)
 	// queue.waiting: every waiting run, including nullable reason and age.
 	ListWaitingWorkerRuns(ctx context.Context) ([]store.ListWaitingWorkerRunsRow, error)
+	GetUserByID(context.Context, uuid.UUID) (store.User, error)
 	// queue.undispatched: oldest undispatched task run's created_at (nullable).
 	OldestUndispatchedTaskRun(ctx context.Context) (pgtype.Timestamptz, error)
 	// schedules.paused: count of users with a pause-all and >= 1 enabled schedule.

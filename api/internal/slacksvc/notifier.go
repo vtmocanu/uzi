@@ -140,6 +140,8 @@ type Notifier struct {
 	// share none of the state path's run/repo rendering.
 	notifyCh chan notifyEvent
 	healthCh chan healthEvent
+	// rootRenders is owned by the serial drain, like chatConvos; bounded by rememberRoot.
+	rootRenders map[uuid.UUID]rootRender
 	// msgCh carries chat run message frames for turn streaming (PRD #191 M3). A
 	// SEPARATE queue from ch: message frames are higher-volume than state transitions
 	// and their consumer is a parallel path (chatpost.go) that never touches the

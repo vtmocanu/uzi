@@ -83,7 +83,7 @@ HTML-comment marker on the line. **Never push non-doc code to `main`.**
 
 ## Post-merge CI, and fixing failures
 
-Poll every run for the merge SHA with **`scripts/watch-run-ci.sh --sha "$MERGE_SHA"`**,
+Poll every run for the merge SHA with **`scripts/watch-run-ci.sh --sha "$MERGE_SHA" --follow`**,
 using the runtime-appropriate verified completion route in *Waiting, uniformly*.
 `MERGE_SHA` is the exact full SHA emitted by `merge.sh`;
 never type or hand-complete a prefix. The watcher resolves it through GitHub before polling
@@ -92,13 +92,15 @@ than waiting for the whole run. Keep the owned callback/log receipt; do not re-a
 a poll loop per merge:
 
 ```
-<this skill's directory>/scripts/watch-run-ci.sh --sha "$MERGE_SHA" --interval 60
+<this skill's directory>/scripts/watch-run-ci.sh --sha "$MERGE_SHA" --follow --interval 60
 ```
 
 It exits **0** when every run that exists for the SHA is green, **1** on a real red
 (`failure`/`timed_out`/`startup_failure`/`action_required`), **2** on timeout, **3** when
-no run ever appeared (or gh failed), and **4** when the runs were only `cancelled`
-(supersession — see below).
+no run ever appeared (or gh failed). On supersession, `--follow` resolves the current branch
+head, prints `FOLLOW sha=OLD -> NEW` for each switch and watches within the original
+`--max-ticks` budget. The final result covers the last watched SHA. Without `--follow`,
+supersession exits **4** (see below).
 
 **Exit 0 means "every run that EXISTS for the SHA is green" — NOT "the full expected
 workflow set ran."** Measured 2026-09-02 (a docs-only fix commit to `main`, `f015f1f`): only

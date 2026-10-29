@@ -37,7 +37,7 @@ VALUES (@capture_id, @chunk_index, @length, @sealed);
 -- rows otherwise).
 UPDATE recovery_captures
 SET state = 'available', expires_at = @expires_at, updated_at = now()
-WHERE id = @id AND manifest_bound = true
+WHERE id = @id AND manifest_bound = true AND state = 'uploading'
 RETURNING *;
 
 -- name: MarkCaptureState :one

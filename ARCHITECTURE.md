@@ -1884,6 +1884,62 @@ subagent's legitimate file/bash needs). Read-only roles (reviewer, tester)
 are constrained per-subagent via their `tools` allowlist instead, since
 subagents inherit the parent's permission mode and cannot loosen it.
 
+### Worker-private completion authority (#3404)
+
+Whether a worker may delete a completed run's retained source (the attempt clone,
+its bare journal, paired skills, bundles and cohort records) after a restart is
+decided by state only the worker can write, never by the api, a process scan or a
+Docker listing. This sits beside the guardrail layers above: it protects
+worker-only work from being retired on a guess. Rationale, write ordering and
+costs are in the
+[#3404 amendment to ADR-1783](adr/1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement);
+this section is the map.
+
+- **Locks** (`agent/src/authority-lock.ts`). The worker takes a lifetime lock W
+  (util-linux `flock` on a private file under `<dataDir>/.uzi-authority`) in
+  `main.ts` before `ensureRunnerTmpdir`, registration, sweeps or admission (with
+  `UZI_EPOCH_LOCK=1` the pod-epoch bootstrap P runs first) and never releases it,
+  so a second current worker on the same volume refuses to start (a pre-#3404
+  worker takes no lock). It refuses non-normalized data-dir spellings and a
+  final-component symlink; the authority store separately refuses an aliased
+  spelling, so such a worker starts but refuses protected source operations. A per-transaction lock A
+  in the same directory serializes authority changes. Order:
+  `P -> W -> A -> C -> S -> J -> B -> O`.
+- **Authenticated slots** (`agent/src/completion-authority.ts`). Each source path
+  has one MAC-authenticated slot under `<dataDir>/.uzi-authority`
+  (`active`, `claude_ready`, `sealed`, `ineligible`, `retiring`, `retired`); the
+  MAC key is derived from the worker join token. Before a source is used, a fresh
+  epoch is installed in an `active` slot, so a successor process cannot adopt a
+  foreign epoch.
+- **Codex lifetime seal** (`agent/src/codex/executor-lifetime.ts`). A Codex
+  executor's admission fence is monotonic and irreversible; Codex eligibility
+  requires `sealed`. A fresh Claude source uses `claude_ready`, which carries no
+  seal.
+- **Publication and the bare-journal fence.** When a flight ends
+  (`endFlightSourceUse` in `agent/src/runner.ts`) the worker certifies the source,
+  writes a fence `{version, sourceUseEpoch, sourceCoreDigest}` as the last key of
+  the completing bare journal, rewrites the cohort records, and publishes the slot
+  transition last. A failure at any step leaves the slot unpublished. A journal
+  carrying the fence is rejected by an older worker's parser (the accepted
+  rollback fence).
+- **Restart retirement** (`forgetCompletedGeneration` and
+  `verifyDurableRetirement` in `agent/src/recovery.ts`). A persisted completed
+  source is released only when the slot is published, the cohort and fence match
+  the certified source, and the existing receipt, custody and liveness checks pass.
+  Destruction is a `retiring` transaction with a manifest in deletion order,
+  ending in a never-collected `retired` tombstone. The guarded operator discard is
+  the only takeover. Legacy, unauthenticated, partial, corrupt, unproven and
+  crashed-`active` sources are retained.
+
+Residuals, none closed here (#2852 is not completed): Docker
+accepted-but-invisible creates (#1860) and unregistered or sibling writers; Claude
+terminal proof (`claude_ready` rests on the existing quiescence checks); the
+custody reclaim and SETTLE/CLEANUP separation (#2746), automatic reclaim (#1858)
+and per-attempt cgroups (#1862); and unbounded retention, since there is no TTL,
+cap or disk-pressure reclaim and capacity cost is unknown. Hosted and
+multi-worker acceptance of the crash behavior is a separate human step and is not
+claimed.
+
 ### Live message stream
 
 Every agent/tool event is **persisted first, broadcast second**:
@@ -2732,12 +2788,29 @@ The health registry supplies each check's `scope` (#2293): `db`,
 the rest are `owner`. `fleet.roll` remains instance infrastructure even for a single owner.
 The server emits `blocking` on every document, true exactly when an instance
 check is danger. Overall status, counts, attention pips, history and CLI exit
-status still cover the full registry. Episodes, admin Slack notices, banner
+status still cover the full registry. Episodes, admin Slack notices, Danger banner
 and snooze follow `blocking`, superseding #2271's overall-episode timing:
 the opening tick sends nothing; the next still-blocking tick claims a notice
 per admin with instance-danger checks. Clearing instance danger closes and
 rearms even if owner danger remains. Owner-only danger opens no episode,
-sends no admin DM and raises no banner; owner run-health routing is unchanged.
+sends no admin DM and raises no Danger banner; owner run-health routing is unchanged.
+
+A separate owner-Warn attention banner (#3589) requires the optional per-check
+`attention_banner: true`, `scope: owner` and `severity: warn`; it preserves server
+order. `recovery.storage` is the sole producer, opting in from its final
+owner/Warn result. False flags are omitted. This metadata
+does not affect severity, counts, status, blocking, episodes, Slack or CLI exits.
+The admin-only `HealthAttentionBanner`, keyed by `user.id`, mounts after Danger
+inside the shared `HealthStatusProvider` (one visible-tab 10-second poll).
+It renders React text in one polite status surface with Open health and per-check
+Dismiss. Dismissals are React state keyed by check ID, independent of episodes,
+navigation, summaries, counts and flags. Missing checks/flags and loading or failed
+polls retain dismissals; the provider keeps the last-good document on failure. An explicitly observed
+`ok`/`unknown`/`danger`/`na` in a successful document clears that ID even without
+a flag. Remount, reload or admin identity changes reset state. No browser storage,
+timer, write or snooze is added; Danger's per-admin, per-episode 1h snooze stays
+unchanged. See [attention banner](docs/admin-health.md#attention-banner) and
+[PRD #1484's decision log](prds/done/1484-admin-health-tab.md#scope-and-decision-log).
 
 Database storage has two signals, both from inside the api (no volume or
 Kubernetes access). A pgx query tracer on the pool

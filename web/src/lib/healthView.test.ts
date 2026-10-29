@@ -43,7 +43,7 @@ describe("healthVerdict", () => {
   });
   it("honors explicit false and keeps every attention item in the owner headline", () => {
     expect(healthVerdict(ownerOnlyDoc())).toMatchObject({
-      blocking: false, title: "3 checks need attention; no instance-wide blocker detected",
+      blocking: false, title: "4 checks need attention; no instance-wide blocker detected",
     });
     const doc = { ...incidentDoc(), blocking: false };
     expect(healthVerdict(doc).blocking).toBe(false);

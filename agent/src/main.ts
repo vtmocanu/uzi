@@ -2,6 +2,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, MAX_CONCURRENT_RUNS_SOFT_CEILING, type ExecutorKind, type Config } from "./config.js";
 import { configureGoConcurrency } from "./go-concurrency.js";
+import { acquireWorkerLifetime } from "./authority-lock.js";
+import { installWorkerLifetime, requireWorkerLifetime } from "./completion-authority.js";
+import { AuthorityRuntime } from "./authority-runtime.js";
 import { createLogger, type Logger } from "./log.js";
 import { maintenanceBootstrapRoots, readMaintenancePosture, recordMaintenanceBootstrap, snapshotMaintenanceBootstrap, terminalMaintenanceProof } from "./run-quiescence.js";
 import { MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
@@ -59,10 +62,15 @@ export function buildWorkerGitCache(
   config: Pick<Config, "dataDir" | "recoveryDecodedLimitBytes">,
   log: Logger,
   terminalRecordProtection: GitCacheOptions["terminalRecordProtection"],
+  /** issue #3404 M2: the production GitCache always asks the completion authority before a hooked
+   *  effect; with no active transaction a hooked effect refuses before it runs. */
+  authority: Pick<AuthorityRuntime, "hooks">,
 ): GitCache {
   return new GitCache(config.dataDir, log, undefined, {
     recoveryDecodedLimitBytes: config.recoveryDecodedLimitBytes,
     terminalRecordProtection,
+    authority: authority.hooks,
+    authorityRequired: true,
   });
 }
 
@@ -397,6 +405,14 @@ async function main(): Promise<void> {
   log.info("terminal maintenance bootstrap posture", { ...readMaintenancePosture(),
     bootstrap: bootstrap === undefined ? "refused" : bootstrap.length });
 
+  // Issue #3404 M1a: take the process-lifetime worker lock W before ensureRunnerTmpdir, any
+  // registration, sweep or admission. A second compatible worker, a missing util-linux flock,
+  // an unsupported filesystem, untrusted lock metadata, or an unavailable descriptor path
+  // (/proc/self/fd, needed to create the lock through a held directory) refuses startup (fatal handler). The
+  // descriptor is retained for the whole process; nothing here can release it.
+  installWorkerLifetime(await acquireWorkerLifetime(config.dataDir, { signal: controller.signal }));
+  log.info("worker lifetime lock acquired");
+
   // Issue #3153: when TMPDIR lives under the (now persistent) `<dataDir>/runner`, confirm it is a
   // real, worker-owned, writable directory BEFORE anything uses a temp path. A symlink or
   // non-directory there refuses startup (fatal handler); nothing is deleted.
@@ -508,7 +524,10 @@ async function main(): Promise<void> {
   const memory = config.memoryGuard?.enabled
     ? new WorkerMemoryRuntime(config.memoryGuard, client, log, { secrets: [config.workerToken] })
     : undefined;
-  const git = buildWorkerGitCache(config, log, (runId) => outbox.hasPhysicalTerminalProtection(runId));
+  // Issue #3404 M2 U3: the authority runtime over the W capability acquired at startup. Every
+  // production path that reaches a hooked GitCache effect opens its transaction through it.
+  const authority = new AuthorityRuntime({ lifetime: requireWorkerLifetime(), workerToken: config.workerToken, log });
+  const git = buildWorkerGitCache(config, log, (runId) => outbox.hasPhysicalTerminalProtection(runId), authority);
 
   // PRD #1809 D6: the data-volume guard. It classifies a failed write as data-volume disk-full
   // (the bare clone/fetch, the fetch-back, the outbox reserve), preflights the volume at claim and
@@ -662,6 +681,7 @@ async function main(): Promise<void> {
     log,
   });
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
+    authority,
     maintenanceExclusion,
     memoryRuntime: memory,
     recoveryLiveTiming: buildRecoveryLiveTiming(config.executor, log),
@@ -926,7 +946,7 @@ async function main(): Promise<void> {
   // issue #1786: the operator retained-source channel (a local 0600 Unix socket, started and closed
   // by Worker.run). Its idle probe reads the worker's own active sets, hence the late-bound `worker`.
   const retainedSource = new RetainedSourceServer({
-    dataDir: config.dataDir, git, client, gate: dindGate, runner, log,
+    dataDir: config.dataDir, git, client, gate: dindGate, runner, log, authority,
     isIdle: () => worker?.isIdle() ?? false,
   });
   notifyRetained = () => { void retainedSource.reportRetained(); };

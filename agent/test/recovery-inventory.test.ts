@@ -825,6 +825,92 @@ it("review G2 V1 rollback replays a lost held FINAL without exact observations o
   } finally { await f.close(); }
 });
 
+for (const representation of ["legacy", "reused", "failed-reuse", "rollback", "abort", "io"] as const) {
+  it(`coverage reuse ${representation}: frozen re-proof preserves FINAL compatibility`, async t => {
+    const f = await fixture();
+    try {
+      const data = path.join(f.root, "data"), bare = path.join(data, "repos", "repo.git");
+      await fs.mkdir(path.dirname(bare), { recursive: true, mode: 0o700 });
+      const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
+        GIT_AUTHOR_NAME: "fixture", GIT_AUTHOR_EMAIL: "fixture@example.test",
+        GIT_COMMITTER_NAME: "fixture", GIT_COMMITTER_EMAIL: "fixture@example.test" };
+      const git = (args: string[], input?: string) => execFileSync("git", ["--git-dir", bare, ...args],
+        { env, input, encoding: "utf8", stdio: "pipe" }).trim();
+      execFileSync("git", ["init", "--bare", bare], { env, stdio: "pipe" });
+      await fs.chmod(bare, 0o700);
+      const blob = git(["hash-object", "-w", "--stdin"], "retained bytes\n");
+      const tree = git(["mktree"], `100644 blob ${blob}\tRETAINED.txt\n`);
+      const head = git(["commit-tree", tree, "-m", "retained work"]);
+      git(["update-ref", "refs/remotes/origin/main", head]);
+      f.context.barePath = bare;
+      f.context.defaultIdentity = { ref: "refs/remotes/origin/main", sha: head };
+      f.state.candidates = [{ sha: head, pinRef: `refs/owed/${head}`, contexts: [structuredClone(f.context)] }];
+      f.state.ancestors = new Set([head]);
+      const cache = new GitCache(data, nullLogger(), undefined, testGitCacheOptions());
+      const first = await cache.buildRecoveryCoverage(bare, { ...f.context, generation: 1 }, [head], head);
+      const build = cache.buildRecoveryCoverage.bind(cache);
+      Object.assign(f.git, { buildRecoveryCoverage: representation === "legacy"
+        ? (...args: Parameters<typeof build>) => build(args[0], args[1], args[2], args[3])
+        : build, readRecoveryCoverageClaim: cache.readRecoveryCoverageClaim.bind(cache) });
+      const record = await f.coordinator.freezeInventory({ context: f.context,
+        currentSha: first.sha, originalSourceSha: first.sha, defaultBranch: "main" });
+      assert.ok(record);
+      Object.assign(f.git, { buildRecoveryCoverage: build });
+      assert.equal(record.sourceSha === first.sha, representation !== "legacy");
+      const source = record.sourceSha, digest = record.coverageDigest!;
+      const pin = `refs/uzi-coverage/${f.context.runId}/${f.context.generation}/${digest}`;
+      for (const ref of git(["for-each-ref", "--format=%(refname)", "refs/uzi-coverage/"]).split("\n"))
+        git(["update-ref", "-d", ref]);
+      if (representation === "abort" || representation === "io") {
+        git(["update-ref", pin, source]);
+        const failure = representation === "abort" ? new DOMException("cancelled", "AbortError") :
+          Object.assign(new Error("object read failed"), { code: "EIO" });
+        t.mock.method(cache as unknown as { readMarkerWrapperGraph(): Promise<unknown> }, "readMarkerWrapperGraph",
+          async () => { throw failure; });
+        await assert.rejects(f.coordinator["frozenCoverageProven"](record), error => error === failure);
+        assert.equal(git(["rev-parse", pin]), source, "operational failures do not mutate the frozen pin");
+        assert.equal(f.finals.length, 0);
+        return;
+      }
+      if (representation === "failed-reuse") {
+        git(["update-ref", pin, source]);
+        t.mock.method(cache as unknown as { reusableRecoveryCoverage(): Promise<boolean> }, "reusableRecoveryCoverage", async () => false);
+        assert.equal(await f.coordinator["frozenCoverageProven"](record), false);
+        assert.equal(git(["rev-parse", pin]), source, "failed required reuse must not overwrite an immutable inventory pin");
+        await f.capture(record);
+        assert.equal(f.finals.length, 0);
+        return;
+      }
+      if (representation === "rollback") {
+        Object.assign(f.git, { buildRecoveryCoverage:
+          (...args: Parameters<typeof build>) => build(args[0], args[1], args[2], args[3]) });
+        assert.equal(await f.coordinator["frozenCoverageProven"](record), false, "old worker cannot falsely prove a reused record");
+        await f.capture(record);
+        assert.equal(f.finals.length, 0);
+        return;
+      }
+      assert.equal(await f.coordinator["frozenCoverageProven"](record), true);
+      assert.equal(git(["rev-parse", pin]), source, "rebuilding after cleanup restores the exact frozen source");
+      await f.capture(record);
+      assert.equal(f.state.uploads, 1);
+      assert.equal(f.finals.length, 1);
+      const stored = (await f.coordinator.inspect(f.context.runId))[0]!;
+      assert.equal(stored.finalAcknowledged, true);
+      assert.equal(stored.sourceSha, source);
+      assert.equal(stored.coverageDigest, digest);
+      if (representation === "reused") {
+        let submissions = 0;
+        Object.assign(f.client, { proveRecoveryArchiveRedundancy: async () => { submissions++; throw new Error("no claim expected"); } });
+        const budget = f.coordinator["startRedundancyBudget"]();
+        const claims = await f.coordinator["buildRedundancyClaims"]([stored], f.context.generation, bare, budget);
+        assert.deepEqual(claims, [], "the optional reader cannot attest an old message with the new inventory digest");
+        await f.coordinator["submitRedundancyClaims"](claims, budget);
+        assert.equal(submissions, 0);
+      }
+    } finally { await f.close(); }
+  });
+}
+
 for (const shape of ["65 heads", "large commit", "non-UTF8 commit"] as const) {
   it(`review G3 archive FINAL accepts producer-valid coverage with ${shape}`, async () => {
     const f = await fixture();

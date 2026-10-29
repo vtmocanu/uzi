@@ -177,9 +177,10 @@ post-disposal source reads are inert and hardened.
 Current-process completion sources bind exact executor/facade in memory before
 durable bind. KnownCodex missing/non-disposed/swapped proof retains before inventory
 and never uses legacy fallback; knownClaude stays unchanged. Owner decision
-2026-10-24 narrows R1857-02(e): **persisted completion sources without reliable provenance**
-keep today's behavior for both harnesses. No prior-process topology proof or
-durable format change is supplied.
+2026-10-24 narrowed R1857-02(e) to current-process sources; since 2026-10-27
+(#3404) a persisted completion source is released after a restart only on
+durable authority and is otherwise retained, for both harnesses (see
+[Completed sources after a worker restart](#completed-sources-after-a-worker-restart)).
 Registered-root capture exclusion does not exclude daemon or sibling writers,
 accepted-but-invisible creates (#1860), or Claude terminal residuals; per-attempt
 cgroup proof (#1862) remains unshipped. Automatic reclaim remains disabled (#1858),
@@ -1130,6 +1131,103 @@ JSON exposes additive `completed_publication_receipt` and
 omit them. See [ADR-1296](../adr/1296-durable-run-recovery.md) and
 [ADR-2417](../adr/2417-guarded-local-retention.md) for the identity and cleanup
 boundaries.
+
+### Completed sources after a worker restart
+
+(Refs #3404, AI-synced 2026-10-27.) After a completed issue, MR-rework or
+self-improvement run is released, the worker cleans up the completing source on
+disk. After a worker **restart** it does so only on durable proof that the worker
+itself recorded when the run ended. Everything else is kept, for both Claude and
+Codex runs.
+
+**Retired automatically after a restart.** A source whose flight ended with its
+worker-owned tails joined and which was **published**: the worker sealed the Codex
+executor (or, for Claude, classified the source) and wrote an authenticated
+record, a fence in the bare repository's recovery journal and a per-source slot
+under `<dataDir>/.uzi-authority`. On restart the worker checks that proof before it
+looks at the clone, and only then removes the clone, the fence, its paired skills
+directory, the bundles and the records, in that order. It writes a `retired` tombstone for the
+path once the removal is confirmed. The existing receipt, custody, quarantine and
+execution checks above still apply.
+
+**Retained until a guarded operator discard:**
+
+- sources written before this change, or with no authenticated record;
+- sources the worker could not publish (a seal or cleanup that did not complete,
+  a changed HEAD or root set, a cohort that no longer matches);
+- mixed or partly rewritten records and a record that fails authentication;
+- a source whose worker crashed before it published, or whose slot is still
+  `active`.
+
+The worker neither guesses at these nor scans for processes to prove them.
+Retained sources keep their metadata and artifacts, with no time limit, size cap
+or disk-pressure reclaim, so retained bytes can grow without bound. Free space on
+the data volume yourself. The only way to remove one is the guarded
+[retained-source discard](#retained-sources-with-no-open-hold-worker-local-inspect-and-discard)
+and its checks. There is no force-clear: a source blocked by anything else
+stays retained until compatible tooling or that discard can address it.
+
+**What an operator must provide.**
+
+1. **One worker per data directory.** The worker takes an exclusive lock on
+   `<dataDir>/.uzi-authority/worker.lock` in `main.ts` before the runner tmpdir is
+   prepared, the worker registers, or any sweep or admission runs (with
+   `UZI_EPOCH_LOCK=1` the pod-epoch bootstrap runs first). A second current
+   worker on the same data directory, a missing util-linux `flock`, a data volume
+   that is not local ext4 or XFS, or a missing procfs descriptor path makes
+   startup fail with an authority refusal. The `UZI_DATA_DIR` path must be
+   absolute and normalized: acquiring the lock refuses a trailing slash, a `.` or
+   `..` segment, and a symlink as the final path component. A symlinked parent
+   directory or a bind mount is not caught there, because it reaches the same
+   lock file. The authority store then refuses any spelling that is not its own
+   canonical real path (and the enrollment's recorded data root), so a worker
+   started through such an alias runs, but every protected source operation
+   (admission, publication, retirement) is refused. Set `UZI_DATA_DIR` to the
+   canonical real path.
+2. **Indefinite blockers.** An operation that was in flight when a worker died
+   (a deletion helper, a shared Git ref update) leaves a record that blocks
+   reuse of its footprint, up to the whole repository's bare, until it is
+   resolved. Neither a worker restart, a missing process nor an elapsed time
+   clears it.
+3. **Durability cost.** Publishing a completed source waits for `N + 7` disk
+   flushes for a cohort of N records (N record files and the run directory, the
+   fence's config file and bare directory, and the slot file and directory plus its
+   head shard file and directory). Retirement writes the slot a fixed number of
+   times whatever the cohort size; in the test fixture (three records with a
+   skills directory) that was 32 slot flushes plus one run-directory flush. Nothing
+   is flushed on ordinary command or model admission.
+4. **Rollback and upgrade.** Cut over with the old workers quiesced. A bare
+   repository whose completing journal carries the new fence is refused by an
+   older worker: it will not attach, recover or discard that journal. Rolling a
+   worker back past this change leaves those runs' sources unreachable until a
+   current worker runs again.
+5. **Join token.** The records are authenticated with a key derived from the
+   worker join token. Changing the token on a reused data volume makes the
+   existing records fail authentication, so they are retained and not trusted.
+   No token-rotation path ships.
+6. **Slow uploads delay other runs' authority waits.** The per-transaction authority
+   lock (`<dataDir>/.uzi-authority/authority.lock`) is
+   held across a recovery capture cycle, including its bundle upload (it must be
+   taken before the per-record capture-cycle lock, so it cannot be released
+   during the upload). One run's slow upload therefore holds up every other
+   operation on the same worker that needs the lock. Those waits are bounded; for
+   example, a flight boundary waits at most its Codex boundary deadline (or the
+   remaining maintenance budget, if shorter), recovery capture cycles wait at most
+   the remaining maintenance budget when one is running (otherwise the lock's
+   default wait of 10 minutes), and the retained-source discard waits at most
+   30 seconds. When the deadline expires the operation does not run and fails
+   with an `authority lock timeout` refusal; a wait ended earlier by its
+   cancel, shutdown or maintenance signal rejects with that abort instead.
+   Nothing guarded runs in either case, and nothing is changed by it. The discard then ends in `internal_error` and its claim gate is
+   reopened; other callers handle the refusal at their own site (for example,
+   owed-head reconciliation logs it and keeps the extra pins). Ensure uploads
+   have enough bandwidth to finish within those bounds.
+
+**Not covered.** Docker containers that bind the clone and other writers the
+worker does not register are outside this proof (the join the worker records does
+not include Docker teardown). Claude runs rely on the existing Claude process and
+quiescence checks, not a terminal proof. Reclaim, custody and the
+process-proof / daemon pending-create residual described above are unchanged.
 
 ### Task checkpoint recovery
 

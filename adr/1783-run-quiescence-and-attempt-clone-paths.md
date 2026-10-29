@@ -528,6 +528,9 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
   binder. KnownClaude is unchanged. Owner decision 2026-10-24 narrows R1857-02(e):
   persisted/unknown-provenance sources retain today's behavior for both harnesses.
   No prior-process topology proof or durable format change is supplied.
+  **Superseded 2026-10-27 (#3404):** persisted completion sources are now retained
+  unless the durable authority proves them; see the
+  [2026-10-27 amendment](#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement).
 
   `CodexExecutor` has no killAgentTree implementation; that optional call is not
   Codex proof. C strengthens registered-process exclusion, not daemon or sibling
@@ -884,9 +887,13 @@ The original follow-ups are recorded below with their later disposition where kn
   Owned summary/setup/auth cleanup remains joined after authority or delivery expiry,
   with independent cleanup faults refusing capture and credential continuation.
   Owner decision 2026-10-24 narrows R1857-02(e) to positively bound current-process
-  Codex completion sources. The residual is **persisted completion sources without reliable provenance**:
-  both harnesses keep today's behavior there, with no prior-process topology proof
-  or durable format change. KnownClaude stays unchanged; knownCodex cannot fall
+  Codex completion sources. At that date the residual was **persisted completion
+  sources without reliable provenance**: both harnesses kept today's behavior
+  there, with no prior-process topology proof or durable format change.
+  **Superseded 2026-10-27 (#3404):** the
+  [2026-10-27 amendment](#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement)
+  closes that provenance residual and leaves the rest of this paragraph's
+  residuals open. KnownClaude stays unchanged; knownCodex cannot fall
   back to legacy inspection when its exact proof fails. C supplies no daemon
   mediation, unregistered/sibling-writer exclusion, Claude terminal proof,
   per-attempt cgroup proof or safe automatic retention reclaim.
@@ -1147,3 +1154,185 @@ Attributed attempts and paired skills may use the existing guarded
 [retained-source discard](../docs/run-recovery.md#retained-sources-with-no-open-hold-worker-local-inspect-and-discard).
 Shared residue and orphaned skills have no supported generic reclaim route.
 Server custody discard alone is not local writer-exclusion proof.
+
+## Amendment 2026-10-27 — #3404: durable completion-source authority, executor lifetime seal and restart retirement
+
+Refs #3404. This amendment resolves one residual only: the **registered-process
+provenance residual** that the 2026-10-24 owner decision left open for persisted
+completion sources (the persisted half of R1857-02(e)). It does not complete #2852.
+
+### Owner decisions, 2026-10-26
+
+1. **Unknown-retain for both historical harnesses.** A completion source that
+   cannot present authenticated, durable provenance is retained until a guarded
+   operator discard, whichever harness produced it. Classification guesses,
+   process scans, receipts, saved outcomes, a restart or the absence of an
+   executor never become proof.
+2. **The rollback fence is accepted.** A completing bare journal that carries the
+   new fence (below) is rejected by an older worker's strict journal parser, so
+   an older worker refuses to attach, recover or discard it. Operators accept
+   this as the cost of a fence an older worker cannot silently clear.
+
+### Supersession
+
+The 2026-10-24 rule, "persisted/unknown-provenance sources keep today's behavior
+for both harnesses" (recorded in Follow-up 4 and the C contract above, and in
+`specs/human.md` Feature #1783), is **superseded** by this amendment. Those
+passages stay as the history of the 2026-10-24 boundary; the current rule is:
+
+- A persisted completion source is released after a restart only when the
+  durable authority below proves it. Legacy, unauthenticated, mixed, partial,
+  corrupt, unproven and crashed-`active` sources are retained, with their
+  associated metadata and artifacts, until guarded operator discard.
+- There is no TTL, cap or disk-pressure reclamation, and no new generic override.
+  Retained bytes are unbounded and recurring; capacity cost and occurrence rates
+  are unknown.
+
+### What was built
+
+- **Worker lifetime lock W** (`agent/src/authority-lock.ts`). Acquired in
+  `main.ts` before `ensureRunnerTmpdir`, with util-linux `flock` on a permanent,
+  private lock file under `<dataDir>/.uzi-authority`, held for the process
+  lifetime with no release. A second compatible worker on the same data
+  directory, a missing util-linux `flock`, a data volume that is not local
+  ext4/XFS, untrusted lock metadata or an unavailable procfs descriptor path
+  (the lock file is created through a held directory descriptor) refuses
+  startup. The pod-epoch shared lock is unrelated to W.
+- **Authority transaction lock A** (same directory). A per-transaction exclusive
+  lock with a bounded wait on a second permanent file, serialized in process by a
+  keyed mutex. Nested callers borrow the opaque active transaction; calling with a
+  lifetime beneath a held A is refused rather than left to deadlock.
+- **Lock order** `P -> W -> A -> C -> S -> J -> B -> O` (pod ownership, worker
+  lifetime, authority transaction, capture cycle, source reservation, journal,
+  bare, outbox), plus one edge outside the chain: the per-hold lock H
+  (`PredecessorSettler.withHoldLock`) is outer to A, so the order there is
+  `H -> A -> C -> S -> J -> B`. Registry and seal joins precede A, and a caller
+  never holds C, S, J or B when it asks for A.
+- **Authenticated storage and source slots** (`agent/src/completion-authority.ts`).
+  An enrollment record binds a storage UUID, the layout and the canonical data
+  root. The MAC key is derived, domain-separated, from the worker join token.
+  Each source path has one slot keyed by its normalized location digest, in state
+  `active`, `claude_ready`, `sealed`, `ineligible`, `retiring` or `retired`, and
+  256 head shards record the latest slot sequence per key so a restored old slot
+  file is refused rather than trusted. Bounded pending footprints (bare mutation
+  or destructive operation, `running` or `settled_failed` with exact residue) ride
+  the epoch under A.
+- **Source-use epoch invalidation before effects.** Before the worker uses a
+  source path (real Git attach, seed, normalize, replace or discard, pre-start
+  predecessor capture, executor launch, binding replacement) it durably installs
+  a fresh random epoch in an `active` slot. A successor process cannot advance an
+  active foreign epoch; only the exact live owner, after its required settlement,
+  or the guarded operator discard can. The dispatch inventory is
+  `agent/src/git-authority-hooks.ts` (`admitSourceUse`, `beginBareMutation`,
+  `assertBareClear`, `beginDestructive`), implemented by
+  `agent/src/authority-runtime.ts`. A call whose footprint the inventory cannot
+  establish is refused rather than turned into a store-wide blocker.
+- **Irreversible executor lifetime seal** (`agent/src/codex/executor-lifetime.ts`).
+  A Codex executor's admission fence is monotonic (open, sealing, sealed). A
+  failed or unproven seal stays in `sealing` and is never re-sealable. It joins
+  the actual producer, observer and cleanup promises, not the enclosing run
+  promise, and is never awaited under a safety, journal or bare lock. Codex
+  eligibility requires `sealed`. A fresh known-Claude source uses the explicit
+  `claude_ready` classification, which is not an executor lease and carries no
+  Codex seal; Claude process and quiescence checks are unchanged.
+- **Versioned source and fence** (`agent/src/completion-source.ts`).
+  `CompletionSourceV2` extends the V1 attempt provenance with storage identity,
+  harness and worker/executor/registry/facade incarnations and the epoch. A
+  certificate is an HMAC over the canonical source-core digest, minted only by the
+  authority store for the exact live lease. The journal fence is exactly
+  `{version:1, sourceUseEpoch, sourceCoreDigest}`.
+- **Fence in the bare journal** (`agent/src/git.ts`). Written as the last key of
+  the completing recovery journal, made durable and read back. A different fence,
+  a protected descriptor, a stopped marker or a clear that would drop the fence
+  refuses (an orphan reclaim, for one, may not clear a fenced journal).
+
+### Publication write ordering
+
+Triggered by `endFlightSourceUse` in `agent/src/runner.ts` after the flight's
+worker-owned source-capable tails were positively joined. It never fails the run
+and never retries model work. A flight that cannot publish ends the path
+`ineligible`.
+
+1. (Codex) seal the executor lifetime, outside every lock.
+2. Under one outer A: re-verify the epoch, owner and live HEAD and roots against
+   the bound core, and certify the core.
+3. Under J then B (inside A): install the fence, sync the Git config and the bare
+   directory, read it back.
+4. Rewrite the N cohort records (MAC, write, file sync, rename), sync the run
+   directory once, read back, and re-enumerate the physical run directory (a
+   malformed, unknown or unattributable entry refuses; an entry that disappeared
+   is a failed proof).
+5. Publish the slot transition (`sealed` or `claude_ready`) **last**, with the
+   authenticated cohort manifest, syncing the slot file and directory and the head
+   shard file and directory.
+
+Any failure leaves the slot unpublished, so certified records never confer
+eligibility on their own. Durability is awaited asynchronously; no `fsyncSync`
+and no fsync on ordinary command, root or callback admission. Cost: **N + 7**
+barriers for a cohort of N (N record syncs and one run-directory sync, two for the
+fence, four for the slot and head shard), asserted by
+`agent/test/completion-publication.test.ts`.
+
+### Restart retirement
+
+`forgetCompletedGeneration` (`agent/src/recovery.ts`) takes the authority first,
+before any source inspection or source-dependent preflight, under the outer A:
+
+- the slot is published (or retiring), the physical run directory's generation
+  members equal the slot's cohort, every member carries the identical certified
+  V2 source, and the completing bare journal carries exactly the source's fence;
+  known Codex additionally needs `sealed` and the exact certificate;
+- unknown, legacy, mixed, corrupt or unattributable records retain without
+  reaching inventory;
+- the in-memory binding of a running process remains a veto, never the authority;
+  the existing receipt, custody, quarantine, live-execution, Docker, cancellation,
+  identity and content safeguards still apply.
+
+Destruction is a **retiring** transaction. Before the first deletion the slot
+enters `retiring` with an authenticated manifest in deletion order (clone, fence,
+paired skills when present, bundles, records, the receipt-bearing record last)
+and the prior publication digest. Progress is recorded from confirmed absence of
+the leading prefix. After a joined partial failure the retiring record alone
+authorizes a residue retry, which refuses additions, changes and unexplained
+absence and never reopens source use. The **retired tombstone** is written only
+after confirmed exact cleanup, a synced deletion of the records and no pending
+binder, and is never garbage collected; fresh use of the path issues a new epoch.
+Retirement writes the slot a fixed number of times regardless of cohort size; in
+`agent/test/completion-retirement.test.ts` (cohort of 3 with a paired skills
+directory) that is eight slot writes (32 barriers) plus one run-directory sync,
+not counting the Git config writes of the fence clear.
+
+### Operator discard
+
+The existing guarded retained-source discard is the only takeover: it installs a
+fresh `retiring` epoch whose manifest is the footprint the discard already
+authorizes, whatever state the slot held (a crashed worker's `active` epoch, an
+`ineligible` slot with settled residue), and refuses only on a `running` pending
+record. No generic force-clear exists.
+
+### Continuing arrivals and costs
+
+- Sources produced before this change, or by a worker that crashed before
+  publication, keep arriving as unknown and are retained; nothing migrates them
+  into proof.
+- An unresolved bare mutator (a pending `update-ref -d`, a detached destructive
+  `rm` after owner death) blocks that repository's seeds and the exact footprint
+  indefinitely. No process scan, PID absence or empty lock holder clears it.
+- A slot left `active` by a crash blocks reuse of its path until discard.
+- Changing the worker join token on a reused data volume makes the stored state
+  fail authentication; the worker retains rather than trusts it. No rotation
+  path ships.
+- Restoring a head shard together with the slots of the keys being read,
+  including a volume snapshot restore, is not detected across a restart.
+
+### Not shipped and residuals that remain
+
+- Docker accepted-but-invisible creates (#1860) and unregistered or sibling
+  writers are unchanged: `sourceTailsJoined` does not include Docker teardown
+  state, and no process scan or Docker listing confers authority.
+- Claude terminal proof is not claimed; `claude_ready` rests on the existing
+  Claude quiescence checks and closed worker-owned admission.
+- Per-attempt cgroups (#1862), automatic reclaim (#1858), and the custody
+  reclaim and SETTLE/CLEANUP separation (#2746) are unchanged.
+- No hosted or multi-worker acceptance of the crash behaviour is claimed here;
+  hosted acceptance remains a separate human step.

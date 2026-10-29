@@ -104,7 +104,7 @@ for (const [index, scenario] of scenarios.entries()) {
           await ctx.checkpoint!({ reap: false });
           before = snapshot();
           if (scenario === "shutdown queued") {
-            await ctx.reportProgress!({ completed: ["predecessor"], in_progress: [] });
+            void ctx.reportProgress!({ completed: ["predecessor"], in_progress: [] }); // enqueue-and-return in production; it now settles with the report
             await predecessorStarted.promise;
           }
           if (scenario === "shutdown barrier") observed!.checkedStateBarrier = barrier.promise;
@@ -116,7 +116,7 @@ for (const [index, scenario] of scenarios.entries()) {
             ).finally(() => { after = snapshot(); checkpointSettled.resolve(); });
           operations.push(checkpoint);
           await checkpoint;
-          if (scenario === "shutdown queued") await ctx.reportProgress!({ completed: ["following"], in_progress: [] });
+          if (scenario === "shutdown queued") void ctx.reportProgress!({ completed: ["following"], in_progress: [] });
           await finish.promise;
           throw new Error("test completed observation");
         } catch (error) { executorFailure = error; throw error; }
