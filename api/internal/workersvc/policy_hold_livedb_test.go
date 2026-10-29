@@ -12,6 +12,41 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+func TestPolicyHoldPendingDispositionLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc, _ := e.providerParkService(t, ppBound)
+	wid := e.seedWorker(t, []string{capability.ProviderPolicyHoldV1})
+	worker, err := e.q.GetWorkerByID(e.ctx, wid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stop := range []string{"cancelled", "stopped", "plan_rejected", "auto_stopped", "scope_capped", "scope_reduced", "branch_moved"} {
+		t.Run(stop, func(t *testing.T) {
+			id := e.fpSeedRunning(t, wid, 1)
+			e.exec(t, "UPDATE runs SET harness='codex',session_id='original-session',stop_kind=$2 WHERE id=$1", id, stop)
+			before, err := e.q.GetRunByIDForUser(e.ctx, store.GetRunByIDForUserParams{ID: id, UserID: e.userID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := svc.ReportPolicyHold(e.ctx, worker, id, policyHoldFixture())
+			if err != nil {
+				t.Fatal(err)
+			}
+			after, err := e.q.GetRunByIDForUser(e.ctx, store.GetRunByIDForUserParams{ID: id, UserID: e.userID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stop == "cancelled" {
+				if got.Disposition != "terminal" || after.Status != "cancelled" || after.FailOrigin.Valid || after.PolicyOutcomeID.Valid || after.SessionID != before.SessionID {
+					t.Fatal("explicit Cancel lost precedence or changed preservation")
+				}
+			} else if got.Disposition != "pending" || got.Reason != "owner_disposition_pending" || !reflect.DeepEqual(before, after) {
+				t.Fatalf("non-Cancel disposition must remain unchanged: disposition=%s reason=%s equal=%v", got.Disposition, got.Reason, reflect.DeepEqual(before, after))
+			}
+		})
+	}
+}
+
 func TestPolicyHoldApplyReplayAndFencesLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc, _ := e.providerParkService(t, ppBound)

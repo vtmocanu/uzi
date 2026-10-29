@@ -1,7 +1,9 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -38,6 +40,45 @@ type PolicyHoldRequest struct {
 	Head                     *string `json:"head,omitempty"`
 	Published                bool    `json:"published"`
 	CheckpointContainsLatest *bool   `json:"checkpoint_contains_latest,omitempty"`
+}
+
+// UnmarshalJSON keeps the worker wire contract closed even for JSON null, which
+// encoding/json otherwise silently maps to zero/nil fields. The handler owns the
+// complete 17 KiB body bound before invoking this decoder.
+func (r *PolicyHoldRequest) UnmarshalJSON(data []byte) error {
+	type wire PolicyHoldRequest
+	var decoded wire
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	// Reuse the existing validated-JSON scanner to detect lossy Unicode/NUL
+	// decoding. Policy identity must be rejected, never rewritten by sanitation.
+	if _, repairs := sanitizePayloadJSON(data); repairs.any() {
+		return fmt.Errorf("%w: invalid policy string encoding", ErrInvalidState)
+	}
+	for key := range fields {
+		switch key {
+		case "outcome_id", "source_generation", "claim_generation", "detail", "continuation_mode", "tag", "phase", "correlation_id", "session_id", "head", "published", "checkpoint_contains_latest":
+		default:
+			return fmt.Errorf("%w: unknown policy field", ErrInvalidState)
+		}
+	}
+	if _, ok := fields["published"]; !ok {
+		return fmt.Errorf("%w: published required", ErrInvalidState)
+	}
+	for _, key := range []string{"published", "tag", "phase", "correlation_id", "session_id", "head", "checkpoint_contains_latest"} {
+		if raw, ok := fields[key]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return fmt.Errorf("%w: null policy field", ErrInvalidState)
+		}
+	}
+	*r = PolicyHoldRequest(decoded)
+	return nil
 }
 
 // PolicyHoldReply uses pending for every unresolved delivery, including unknown
@@ -91,6 +132,9 @@ func (r PolicyHoldRequest) Validate() error {
 	}
 	if r.Head != nil && *r.Head != "" && (!policyHead.MatchString(*r.Head) || (len(*r.Head) != 40 && len(*r.Head) != 64)) {
 		return fmt.Errorf("%w: invalid captured head", ErrInvalidState)
+	}
+	if r.CheckpointContainsLatest != nil && *r.CheckpointContainsLatest && !r.Published {
+		return fmt.Errorf("%w: latest checkpoint requires publication", ErrInvalidState)
 	}
 	if (r.Published || (r.CheckpointContainsLatest != nil && *r.CheckpointContainsLatest)) && (r.Head == nil || *r.Head == "") {
 		return fmt.Errorf("%w: published evidence requires a head", ErrInvalidState)
@@ -181,7 +225,10 @@ func (s *Service) ReportPolicyHold(ctx context.Context, worker store.Worker, run
 	if r.ClaimReleasedAt.Valid || r.ClaimGeneration != req.ClaimGeneration {
 		return pending("stale_claim")
 	}
-	if r.StopKind.Valid && r.StopKind.String != "" {
+	if r.StopKind.Valid && r.StopKind.String != "" && r.StopKind.String != "cancelled" {
+		return pending("owner_disposition_pending")
+	}
+	if r.StopKind.Valid && r.StopKind.String == "cancelled" {
 		n, e := q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{ID: runID, WorkerID: pgconv.UUID(worker.ID)})
 		if e != nil {
 			return reply, e

@@ -81,10 +81,24 @@ func testPolicyHoldWorkerRoute(t *testing.T, name string) {
 	if row.Status != "paused" || !row.PolicyPreserveRequired || row.PolicyRefusalCount != 1 || row.SessionID.String != "original-session" || row.ClaimReleasedAt.Valid {
 		t.Fatal("report/replay changed hold preservation")
 	}
+	var missingPublished map[string]any
+	if err := json.Unmarshal(b, &missingPublished); err != nil {
+		t.Fatal(err)
+	}
+	delete(missingPublished, "published")
+	missingBody, err := json.Marshal(missingPublished)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, bad := range map[string]string{
-		"unknown":  string(b[:len(b)-1]) + ",\"execution\":{}}",
-		"trailing": string(b) + " {}",
-		"overflow": string(b) + strings.Repeat(" ", 17*1024),
+		"unknown":             string(b[:len(b)-1]) + ",\"execution\":{}}",
+		"trailing":            string(b) + " {}",
+		"overflow":            string(b) + strings.Repeat(" ", 17*1024),
+		"missing publication": string(missingBody),
+		"null publication":    strings.TrimSuffix(string(b), "}") + ",\"published\":null}",
+		"null session":        strings.TrimSuffix(string(b), "}") + ",\"session_id\":null}",
+		"null head":           strings.TrimSuffix(string(b), "}") + ",\"head\":null}",
+		"wrong field case":    strings.Replace(string(b), "\"tag\"", "\"Tag\"", 1),
 	} {
 		if r := bearerReqBody(router, http.MethodPost, path, token, bad); r.Code != http.StatusBadRequest {
 			t.Fatalf("%s = %d: %s", name, r.Code, r.Body.String())

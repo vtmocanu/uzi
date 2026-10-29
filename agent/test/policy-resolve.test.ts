@@ -11,6 +11,24 @@ import { journalAndResolveTerminal, makeTerminalOutboxDeps, resolvePendingTermin
 import { validatePolicyHoldRequest, decodePolicyHoldReply, type PolicyHoldRequest, type PolicyHoldReply } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 
+it("shared Go/TypeScript policy wire cases", async () => {
+  const cases = JSON.parse(await fs.readFile(new URL("../../fixtures/policy-hold/requests.json", import.meta.url), "utf8")) as
+    { name: string; valid: boolean; body: unknown }[];
+  assert.ok(cases.length > 0);
+  for (const fixture of cases) {
+    if (fixture.valid) assert.deepEqual(validatePolicyHoldRequest(fixture.body), fixture.body, fixture.name);
+    else assert.throws(() => validatePolicyHoldRequest(fixture.body), fixture.name);
+  }
+});
+
+function assertUnprovenPolicySnapshot(registry: ActiveRunRegistry): void {
+  const snapshot = registry.build();
+  assert.deepEqual(snapshot.active, [], "unknown ownership cannot supply a source-generation lease");
+  assert.equal(snapshot.pending_overflow, true, "conservative protection remains before ownership proof");
+  assert.equal(registry.claimsPausedByPendingOverflow(), true);
+  assert.deepEqual(snapshot.pending_all, [{ run_id: run, claim_generation: 7 }]);
+}
+
 const run = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const original: PolicyHoldRequest = {
   outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", source_generation: 7, claim_generation: 7,
@@ -209,7 +227,9 @@ it("ENOSPC keeps snapshot-visible memory first writer and retries journaling bef
   assert.equal((await outbox.journalPolicyHold(run, original)).journaled, false);
   assert.equal(await outbox.hasPendingPolicyOutcome(run), true);
   const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 4);
-  assert.ok(registry.build().active.some(entry => entry.run_id === run && entry.terminal_pending));
+  assertUnprovenPolicySnapshot(registry);
+  registry.notePolicyOwnership(run, 7);
+  assert.equal(registry.build().active[0]?.terminal_pending, true, "independent current proof supplies the lease");
   let sent = 0;
   const d = deps(outbox, async (_id, body) => { sent++; assert.deepEqual(body, original); return receipt(); });
   await resolvePendingTerminal(d, args);
@@ -222,7 +242,7 @@ it("ENOSPC keeps snapshot-visible memory first writer and retries journaling bef
 });
 
 for (const bad of ["corrupt", "oversized", "MAC", "unknown-kind", "bad-body", "run-cap", "total-cap"] as const) {
-  it("restart retains " + bad + " physical candidates as a leasable execution blocker", async t => {
+  it("restart retains " + bad + " physical candidates as a conservative execution blocker", async t => {
     const f = await fixture(t);
     await f.outbox.journalPolicyHold(run, original);
     if (bad === "corrupt") await fs.writeFile(f.file, "{");
@@ -249,7 +269,9 @@ for (const bad of ["corrupt", "oversized", "MAC", "unknown-kind", "bad-body", "r
     assert.equal(await o.hasPendingPolicyOutcome(run), true);
     assert.equal(o.listPendingTerminals()[0]!.outcome_kind, "unknown");
     const registry = new ActiveRunRegistry(() => o.listPendingTerminals(), () => 4);
-    assert.equal(registry.build().active[0]!.terminal_pending, true);
+    assertUnprovenPolicySnapshot(registry);
+    registry.notePolicyOwnership(run, 7);
+    assertUnprovenPolicySnapshot(registry); // malformed source remains unknown even with a current owner
     let sends = 0;
     await resolvePendingTerminal(deps(o, async () => { sends++; return receipt(); }), args);
     assert.equal(sends, 0);
@@ -355,7 +377,7 @@ it("disabled policy deps retain snapshot membership without an unjournaled send"
   assert.equal((await outbox.journalPolicyHold(run, original)).journaled, false);
   assert.equal(outbox.listPendingTerminals()[0]?.outcome_kind, "policy_hold");
   const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 4);
-  assert.equal(registry.build().active[0]?.terminal_pending, true);
+  assertUnprovenPolicySnapshot(registry);
   await resolvePendingTerminal(retained, args);
   assert.equal(sends, 0);
 });
@@ -416,6 +438,6 @@ for (const kind of ["policy_hold", "unknown"] as const) {
     assert.equal(sends, 0, "an unavailable journal cannot authorize a competing terminal");
     assert.deepEqual(outbox.listPendingTerminals(), before);
     const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 4);
-    assert.equal(registry.build().active[0]?.terminal_pending, true);
+    assertUnprovenPolicySnapshot(registry);
   });
 }

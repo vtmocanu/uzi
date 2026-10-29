@@ -8,13 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/vtmocanu/uzi/api/internal/capability"
 	"log/slog"
 	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -471,6 +471,12 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 			WorkerID:   wkr.ID,
 			KeepRunIds: keep,
 		}); err != nil {
+			return false, err
+		}
+	} else if slices.Contains(wkr.ProtocolCapabilities, capability.ProviderPolicyHoldV1) {
+		// Preserve the already-issued lease if this process no longer has the body.
+		// Exact ownership/generation/status and the original expiry remain SQL fences.
+		if _, err := qtx.DeleteWorkerActiveRunsPreservingPolicyLease(ctx, wkr.ID); err != nil {
 			return false, err
 		}
 	} else if _, err := qtx.DeleteWorkerActiveRuns(ctx, wkr.ID); err != nil {

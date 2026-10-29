@@ -7298,6 +7298,24 @@ RETURNING runs.id;
 -- because it must PRESERVE leased rows across a restart.
 DELETE FROM worker_active_runs WHERE worker_id = @worker_id;
 
+-- name: DeleteWorkerActiveRunsPreservingPolicyLease :execrows
+-- Capable compact workers may restart without their pending body. Preserve only
+-- an already existing exact-current lease until its ORIGINAL expiry: omission
+-- neither creates nor renews authority. No run row is locked or mutated here.
+DELETE FROM worker_active_runs AS a
+WHERE a.worker_id = @worker_id
+  AND NOT (
+    a.terminal_pending AND a.terminal_pending_until > now()
+    AND EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.id=a.run_id AND r.worker_id=a.worker_id
+        AND r.claim_generation=a.claim_generation AND r.claim_released_at IS NULL
+        AND r.status IN ('claimed','running')
+        AND r.kind IN ('issue','task','prompt','self_improve')
+        AND r.harness='codex' AND NOT r.interactive
+    )
+  );
+
 -- name: DeleteOrdinaryWorkerActiveRunsNotIn :execrows
 -- Register-path delete (PRD #1390 M2a): remove only ORDINARY (terminal_pending = false) rows
 -- whose run is not in the register-carried snapshot, PRESERVING every row under a

@@ -1,0 +1,448 @@
+[
+  {
+    "name": "root degraded",
+    "valid": true,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false
+    }
+  },
+  {
+    "name": "published sha256",
+    "valid": true,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": true,
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "checkpoint_contains_latest": true
+    }
+  },
+  {
+    "name": "compatible local sha1",
+    "valid": true,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false,
+      "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "session_id": "saved-session",
+      "checkpoint_contains_latest": false
+    }
+  },
+  {
+    "name": "attempt conversion",
+    "valid": true,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 3,
+      "detail": "resume_rejected",
+      "continuation_mode": "fresh_from_saved_work",
+      "published": false
+    }
+  },
+  {
+    "name": "zero UUID",
+    "valid": false,
+    "body": {
+      "outcome_id": "00000000-0000-0000-0000-000000000000",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false
+    }
+  },
+  {
+    "name": "unsafe generation",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 9007199254740992,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false
+    }
+  },
+  {
+    "name": "source after claim",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 2,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false
+    }
+  },
+  {
+    "name": "unknown mode",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "fresh",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false
+    }
+  },
+  {
+    "name": "published without head",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": true
+    }
+  },
+  {
+    "name": "invalid head",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false,
+      "head": "HEAD"
+    }
+  },
+  {
+    "name": "correlation newline",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1\n",
+      "published": false
+    }
+  },
+  {
+    "name": "counter unsafe",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-9007199254740992",
+      "published": false
+    }
+  },
+  {
+    "name": "unknown field",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false,
+      "provider_text": "untrusted prose"
+    }
+  },
+  {
+    "name": "published null",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": null
+    }
+  },
+  {
+    "name": "session null",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false,
+      "session_id": null
+    }
+  },
+  {
+    "name": "head null",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false,
+      "head": null
+    }
+  },
+  {
+    "name": "latest null",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false,
+      "checkpoint_contains_latest": null
+    }
+  },
+  {
+    "name": "tag null",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": null,
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false
+    }
+  },
+  {
+    "name": "phase null",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": null,
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false
+    }
+  },
+  {
+    "name": "correlation null",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": null,
+      "published": false
+    }
+  },
+  {
+    "name": "UTF8 session overflow",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false,
+      "session_id": "\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9"
+    }
+  },
+  {
+    "name": "published missing",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1"
+    }
+  },
+  {
+    "name": "case-sensitive tag",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "Tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false
+    }
+  },
+  {
+    "name": "conversion null tag",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 3,
+      "detail": "resume_rejected",
+      "continuation_mode": "fresh_from_saved_work",
+      "published": false,
+      "tag": null
+    }
+  },
+  {
+    "name": "latest without publication",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false,
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "checkpoint_contains_latest": true
+    }
+  },
+  {
+    "name": "lone high surrogate",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false,
+      "session_id": "\ud800"
+    }
+  },
+  {
+    "name": "lone low surrogate",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false,
+      "session_id": "\udc00"
+    }
+  },
+  {
+    "name": "paired surrogate session",
+    "valid": true,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false,
+      "session_id": "\ud83d\ude00"
+    }
+  },
+  {
+    "name": "escaped backslash session",
+    "valid": true,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "continuation_mode": "same_conversation",
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1",
+      "published": false,
+      "session_id": "\\ud800"
+    }
+  }
+]

@@ -68,6 +68,7 @@ export function validatePolicyHoldRequest(value: unknown): PolicyHoldRequest {
       Buffer.byteLength(v.session_id) > 1024 || v.session_id.includes("\0") || Buffer.from(v.session_id, "utf8").toString("utf8") !== v.session_id)) return invalid();
   if (v.head !== undefined && (typeof v.head !== "string" || (v.head !== "" && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})(?![\s\S])/.test(v.head)))) return invalid();
   if (v.checkpoint_contains_latest !== undefined && typeof v.checkpoint_contains_latest !== "boolean") return invalid();
+  if (v.checkpoint_contains_latest === true && v.published !== true) return invalid();
   if ((v.published || v.checkpoint_contains_latest) && !v.head) return invalid();
   if (Buffer.byteLength(JSON.stringify(v)) > POLICY_HOLD_MAX_BYTES) return invalid();
   return JSON.parse(JSON.stringify(v)) as PolicyHoldRequest;
