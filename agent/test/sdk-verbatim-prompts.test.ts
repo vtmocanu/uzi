@@ -294,8 +294,11 @@ describe("verbatimPrompts is set by every exported options builder (#1563 M2)", 
 // A future Claude options builder must not silently omit the option. Every builder keeps the
 // literal `settingSources: []` (semgrep/settings-sources-isolation.yml), so each such literal in
 // agent/src, however it is formatted, must sit in an object literal that also sets
-// `verbatimPrompts: true` (issue #1563; a test, not a Semgrep rule, by the issue's choice). A builder
-// that drops `settingSources` altogether is the Semgrep rule's and review's concern, not this test's.
+// `verbatimPrompts: true` (issue #1563; a test, not a Semgrep rule, by the issue's choice). This is a
+// textual heuristic, not an object-property guarantee: it also accepts the option written inside a
+// comment or a nested object. A builder that drops `settingSources` altogether escapes both this
+// scan and the Semgrep rule (which matches only an explicit non-empty value). The strict per-path
+// query tests above are the enforcement for the seven known builders; review covers new ones.
 
 /** The text of the object literal enclosing `index`: from its opening `{` to the matching `}`. */
 function enclosingObject(text: string, index: number): string {
