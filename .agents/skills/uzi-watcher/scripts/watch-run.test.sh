@@ -199,9 +199,9 @@ for v in NULL 2099-01-02T03:04:05Z OMIT FALSE; do
   [ "$(cat "$WORK/poll")" -eq 1 ] || fail "adoption hold polled again"
 done
 
-# Exhausted or unreadable memory-pressure budgets require an owner decision, even
-# when attention checks are disabled and recovery_wait is outside the stop set.
-for memory in '{"used":3,"max":3,"remaining":0}' OMIT null false '"bad"' '[]' '{}' \
+# Every memory-pressure park requires an owner decision, regardless of remaining
+# interventions or DTO shape, attention checks, or whether recovery_wait is in the stop set.
+for memory in '{"used":3,"max":3,"remaining":0}' '{"used":2,"max":3,"remaining":1}' OMIT null false '"bad"' '[]' '{}' \
   '{"remaining":null}' '{"remaining":"1"}' '{"remaining":true}' '{"remaining":-1}' '{"remaining":0.5}'; do
   reset recovery_wait ok "" '[]'
   echo worker_memory_pressure > "$WORK/cause"
@@ -210,14 +210,6 @@ for memory in '{"used":3,"max":3,"remaining":0}' OMIT null false '"bad"' '[]' '{
   [ "$rc" -eq 0 ] || fail "owner-held memory park ($memory): want exit 0, got $rc: $out"
   case "$out" in *"STOP=recovery_wait:worker_memory_pressure"*"back up"*"owner"*"resume or cancel"*"RESULT=stop:recovery_wait") ;; *) fail "memory owner guidance missing ($memory): $out";; esac
 done
-
-# A valid positive remaining budget still retries automatically and keeps polling.
-reset recovery_wait ok "" '[]'
-echo worker_memory_pressure > "$WORK/cause"
-echo '{"used":2,"max":3,"remaining":1}' > "$WORK/memory"
-rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
-[ "$rc" -eq 3 ] || fail "automatic memory park: want exit 3, got $rc: $out"
-case "$out" in *STOP=*) fail "automatic memory park stopped: $out";; esac
 
 # Transition detection and explicit stop sets retain the cause-specific guidance.
 reset "$(printf 'running\nrecovery_wait')" ok "" '[]'
