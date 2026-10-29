@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -87,9 +88,13 @@ func TestBrowserHookGuardsPreserveUnlockBudget(t *testing.T) {
 			if tc.browser != "valid" {
 				claims.BrowserSlotID = tc.browser
 			}
-			h.browserAuthHook(req, user, &claims)
+			out := httptest.NewRecorder()
+			h.browserAuthHook(out, req, user, &claims)
 			if _, ok := h.vaultUnlockLimiter.Reserve(mw.VaultUnlockKey(user.ID)); !ok {
 				t.Fatal("guard consumed unlock budget")
+			}
+			if len(out.Header().Values("Set-Cookie")) != 0 {
+				t.Fatal("guard changed cookies")
 			}
 		})
 	}
@@ -143,8 +148,41 @@ func TestBrowserMalformedSlotConsumesBudget(t *testing.T) {
 		}
 	}
 	req.Header.Add("Cookie", vaultSlotCookieName+"=bad")
-	h.browserAuthHook(req, user, session.claims)
+	out := httptest.NewRecorder()
+	h.browserAuthHook(out, req, user, session.claims)
 	if _, ok := h.vaultUnlockLimiter.Reserve(mw.VaultUnlockKey(user.ID)); ok {
 		t.Fatal("malformed presentation did not consume budget")
+	}
+	if !slotCleared(out) {
+		t.Fatal("malformed presentation kept the slot cookie")
+	}
+}
+
+func TestBrowserTransientRestoreKeepsSlotCookie(t *testing.T) {
+	h := &Handler{vault: testVault(t), cfg: config.Config{CookieSecure: true, JWTSecret: []byte("test-signing-key"), AuthTokenTTL: time.Hour}, vaultUnlockLimiter: mw.NewLimiter(1, time.Hour, nil)}
+	user := store.User{ID: uuid.New()}
+	session, err := h.freshSession(user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	session.emit(rec)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest("GET", "/api/auth/me", nil).WithContext(ctx)
+	for _, cookie := range rec.Result().Cookies() {
+		req.AddCookie(cookie)
+		if cookie.Name == auth.CSRFCookieName {
+			req.Header.Set(auth.CSRFHeaderName, cookie.Value)
+		}
+	}
+	req.Header.Add("Cookie", vaultSlotCookieName+"=v1."+uuid.NewString()+"."+strings.Repeat("A", 43))
+	out := httptest.NewRecorder()
+	h.browserAuthHook(out, req, user, session.claims)
+	if _, ok := h.vaultUnlockLimiter.Reserve(mw.VaultUnlockKey(user.ID)); ok {
+		t.Fatal("restore attempt did not reserve budget")
+	}
+	if slotCleared(out) {
+		t.Fatal("transient restore failure cleared the slot cookie")
 	}
 }

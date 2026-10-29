@@ -78,14 +78,23 @@ func (e *browserSlotLive) restart() {
 type browserSlotCountingStore struct {
 	*store.Queries
 	reads *atomic.Int32
+	fail  error
 }
 
 func (q *browserSlotCountingStore) GetVaultBrowserSlot(ctx context.Context, p store.GetVaultBrowserSlotParams) (store.VaultBrowserSlot, error) {
 	q.reads.Add(1)
+	if q.fail != nil {
+		return store.VaultBrowserSlot{}, q.fail
+	}
 	return q.Queries.GetVaultBrowserSlot(ctx, p)
 }
 
 func (e *browserSlotLive) countRestart() *atomic.Int32 {
+	return e.countRestartFailing(nil)
+}
+
+// countRestartFailing makes every slot read return fail (nil reads normally).
+func (e *browserSlotLive) countRestartFailing(fail error) *atomic.Int32 {
 	reads := new(atomic.Int32)
 	h := e.h
 	h.vault = vault.New(h.box, h.q, func(ctx context.Context, fn func(context.Context, vault.Store) error) error {
@@ -95,7 +104,7 @@ func (e *browserSlotLive) countRestart() *atomic.Int32 {
 		}
 		defer func() { _ = tx.Rollback(context.Background()) }()
 		qtx := store.New(tx)
-		if err := fn(vault.WithStateReader(ctx, qtx), &browserSlotCountingStore{qtx, reads}); err != nil {
+		if err := fn(vault.WithStateReader(ctx, qtx), &browserSlotCountingStore{qtx, reads, fail}); err != nil {
 			return err
 		}
 		return tx.Commit(ctx)
@@ -281,6 +290,94 @@ func TestBrowserSlotHTTPAndRevocationLiveDB(t *testing.T) {
 				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Settings.Enabled {
 					t.Fatal("preference save not confirmed")
 				}
+			}
+		})
+	}
+}
+
+func slotCleared(rec *httptest.ResponseRecorder) bool {
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == vaultSlotCookieName && c.MaxAge < 0 && c.Path == "/api" {
+			return true
+		}
+	}
+	return false
+}
+
+// A grant revoked from another browser must stop reserving the owner's unlock
+// budget: the first rejected restore is charged and clears the cookie, so the
+// browser's following requests reserve nothing and manual unlock stays available.
+func TestBrowserSlotRevokedGrantClearsCookieLiveDB(t *testing.T) {
+	a := browserSlotFixture(t, true)
+	body, _ := json.Marshal(map[string]string{"email": a.user.Email, "password": cliVaultPassword})
+	login := a.request("POST", "/api/auth/login", string(body), "", nil)
+	cliVaultCode(t, login, http.StatusOK)
+	b := &browserSlotLive{h: a.h, router: a.router, user: a.user, cookies: login.Result().Cookies()}
+	for _, c := range b.cookies {
+		if c.Name == auth.CSRFCookieName {
+			b.csrf = c.Value
+		}
+	}
+	cliVaultCode(t, b.request("POST", "/api/vault/lock", "", b.csrf, nil), http.StatusNoContent)
+	if a.slots(t) != 0 {
+		t.Fatal("lock in browser B did not revoke browser A's slot")
+	}
+	reads := a.countRestart()
+	a.h.vaultUnlockLimiter = mw.NewLimiter(2, time.Hour, nil)
+	rec := a.request("GET", "/api/auth/me", "", a.csrf, nil)
+	cliVaultCode(t, rec, http.StatusOK)
+	if a.h.vault.Unlocked(a.user.ID) || reads.Load() != 1 {
+		t.Fatalf("revoked grant restored or was not read: reads=%d", reads.Load())
+	}
+	if !slotCleared(rec) {
+		t.Fatal("definitive rejection kept the revoked slot cookie")
+	}
+	// The browser honours the deletion; later requests present no slot.
+	var kept []*http.Cookie
+	for _, c := range a.cookies {
+		if c.Name != vaultSlotCookieName {
+			kept = append(kept, c)
+		}
+	}
+	a.cookies = kept
+	for range 3 {
+		cliVaultCode(t, a.request("GET", "/api/auth/me", "", a.csrf, nil), http.StatusOK)
+	}
+	if reads.Load() != 1 {
+		t.Fatal("cleared slot was read again")
+	}
+	if _, ok := a.h.vaultUnlockLimiter.Reserve(mw.VaultUnlockKey(a.user.ID)); !ok {
+		t.Fatal("cleared slot kept consuming unlock budget")
+	}
+	if _, ok := a.h.vaultUnlockLimiter.Reserve(mw.VaultUnlockKey(a.user.ID)); ok {
+		t.Fatal("rejected restore was refunded; it must stay charged")
+	}
+}
+
+// Only a definitive rejection clears the cookie. A failed slot read is transient
+// and keeps it; a missing row is definitive.
+func TestBrowserSlotTransientRestoreKeepsCookieLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fail  error
+		clear bool
+	}{
+		{"read failure", errors.New("slot read failed"), false},
+		{"missing row", pgx.ErrNoRows, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := browserSlotFixture(t, true)
+			reads := e.countRestartFailing(tc.fail)
+			rec := e.request("GET", "/api/auth/me", "", e.csrf, nil)
+			cliVaultCode(t, rec, http.StatusOK)
+			if e.h.vault.Unlocked(e.user.ID) || reads.Load() != 1 {
+				t.Fatalf("failed read restored or was not attempted: reads=%d", reads.Load())
+			}
+			if slotCleared(rec) != tc.clear {
+				t.Fatalf("cleared=%t, want %t", slotCleared(rec), tc.clear)
+			}
+			if e.slots(t) != 1 {
+				t.Fatal("rejected restore changed stored slots")
 			}
 		})
 	}

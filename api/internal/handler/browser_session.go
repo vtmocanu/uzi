@@ -94,7 +94,10 @@ func canonicalBrowserID(value string) (uuid.UUID, bool) {
 	return id, err == nil && id != uuid.Nil && id.String() == value
 }
 
-func (h *Handler) browserAuthHook(r *http.Request, user store.User, claims *auth.Claims) {
+// browserAuthHook clears the slot cookie after a definitive rejection so a revoked
+// or unusable grant stops reserving the owner's unlock budget on every request.
+// The rejected attempt stays charged; transient failures keep the cookie.
+func (h *Handler) browserAuthHook(w http.ResponseWriter, r *http.Request, user store.User, claims *auth.Claims) {
 	if h.vault == nil || !h.cfg.CookieSecure || h.vault.Unlocked(user.ID) || !auth.ValidateCSRFToken(r) {
 		return
 	}
@@ -124,16 +127,21 @@ func (h *Handler) browserAuthHook(r *http.Request, user store.User, claims *auth
 	value, _, valid := slotCookie(r)
 	if !valid {
 		slog.Warn("vault restore rejected", "phase", "cookie", "owner", user.ID)
+		clearVaultSlot(w)
 		return
 	}
 	key, err := vault.DecodeBrowserKey(value)
 	if err != nil {
 		slog.Warn("vault restore rejected", "phase", "decode", "owner", user.ID)
+		clearVaultSlot(w)
 		return
 	}
 	defer key.Destroy()
 	if err := h.vault.Restore(r.Context(), vault.VerifiedSession{Auth: vault.Snapshot(user), TokenVersion: claims.TokenVersion, BrowserID: id}, key); err != nil {
 		slog.Warn("vault restore rejected", "phase", "restore", "owner", user.ID)
+		if errors.Is(err, vault.ErrStaleAuth) && !errors.Is(err, vault.ErrUncertainOutcome) {
+			clearVaultSlot(w)
+		}
 		return
 	}
 	reservation.Refund()

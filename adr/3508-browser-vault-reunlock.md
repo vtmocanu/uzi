@@ -62,6 +62,14 @@ limiter reservation, restore or promotion. Validation precedes rolling
 session refresh (`api/internal/middleware/auth.go`,
 `api/internal/handler/browser_session.go`). Eligible failed attempts share
 the owner's manual-unlock limiter; successful restore refunds its reservation.
+A definitive rejection (malformed or duplicate cookie, missing, expired or
+revoked slot, wrong key, stale session, opt-out) also clears the slot cookie
+on that response, so a browser whose grant was revoked elsewhere stops
+spending the owner's unlock budget; the rejected attempt stays charged.
+Transient failures (slot read errors, cancelled requests, uncertain lifecycle
+outcomes) keep the cookie. Requests already in flight with the old cookie can
+each still consume one attempt, and a clear racing a fresh unlock in the same
+browser can drop the new slot, costing one manual unlock after a restart.
 
 The client sends the readable CSRF cookie on foreground reads and marks
 hidden-tab requests passive. Passive requests, WebSocket upgrades and

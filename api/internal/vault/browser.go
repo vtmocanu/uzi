@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
@@ -215,8 +216,12 @@ func (v *Vault) Restore(ctx context.Context, session VerifiedSession, key *Brows
 			return ErrNotConfigured
 		}
 		slot, err := bq.GetVaultBrowserSlot(ctx, store.GetVaultBrowserSlotParams{ID: key.slot, UserID: id})
-		if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrStaleAuth
+		}
+		if err != nil {
+			// A read failure is transient: callers keep the cookie and may retry.
+			return err
 		}
 		if slot.UserID != id || slot.BrowserID != session.BrowserID ||
 			slot.TokenVersion != state.TokenVersion || slot.Generation != state.VaultSlotGeneration ||

@@ -102,7 +102,10 @@ Missing or invalid CSRF leaves normal safe-read behavior unchanged, with
 no slot access, unlock-limiter reservation, restore or promotion
 (`browserAuthHook` in `api/internal/handler/browser_session.go`).
 Eligible attempts share the owner's manual-unlock limiter; failures consume
-budget and successful restore refunds its reservation.
+budget and successful restore refunds its reservation. A definitive rejection
+(malformed cookie, missing, expired or revoked slot, wrong key, stale session)
+also clears the slot cookie, so a grant revoked from another browser stops
+draining that budget; transient failures keep the cookie.
 
 **Re-unlock automatically in this browser** is default-on **account-wide**
 permission, despite its label. Turning it off revokes every browser's slots;

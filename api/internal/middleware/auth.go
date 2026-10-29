@@ -24,11 +24,13 @@ const (
 
 // BrowserAuthHook observes an authenticated cookie request before rolling refresh.
 // It must enforce auth.ValidateCSRFToken before any browser-slot access. It cannot
-// fail authentication or emit a slot-dependent response. Claims are an incoming
+// fail authentication or write a status or body; its only permitted response effect
+// is a Set-Cookie header on w (clearing a credential the server definitively
+// rejected), which every response then carries. Claims are an incoming
 // snapshot; changing them does not change the authenticated context or refresh.
 // Multiple hooks run serially, once each, in registration order; each must bound
 // its own work and handle failures internally so subsequent hooks can proceed.
-type BrowserAuthHook func(*http.Request, store.User, *auth.Claims)
+type BrowserAuthHook func(http.ResponseWriter, *http.Request, store.User, *auth.Claims)
 
 // ClaimsFromContext returns incoming authenticated cookie claims, never refreshed
 // outgoing claims. Bearer authentication does not populate this value.
@@ -160,7 +162,7 @@ func RequireAuth(q SessionStore, cfg config.Config, hooks ...BrowserAuthHook) fu
 			r = r.WithContext(ctx)
 			for _, hook := range hooks {
 				if hook != nil {
-					hook(r, user, copyClaims(claims))
+					hook(w, r, user, copyClaims(claims))
 				}
 			}
 			rollingRefresh(w, r, claims, user.TokenVersion, cfg)

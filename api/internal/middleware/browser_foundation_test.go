@@ -46,7 +46,7 @@ func TestBrowserHookRefreshChain(t *testing.T) {
 				req := browserRequest(t, http.MethodPost, token)
 				rec := httptest.NewRecorder()
 				order := []string{}
-				hook := func(r *http.Request, got store.User, claims *auth.Claims) {
+				hook := func(_ http.ResponseWriter, r *http.Request, got store.User, claims *auth.Claims) {
 					order = append(order, "hook")
 					if got.ID != user.ID || !reflect.DeepEqual(claims, incoming) {
 						t.Fatal("hook lost authenticated input")
@@ -155,7 +155,7 @@ func TestBrowserHookRejectedAndPassiveRequests(t *testing.T) {
 				r.Header.Set(passiveHeader, "1")
 			}
 			called := false
-			rec, reached := run(RequireAuth(fakeAuthStore{user: user}, cfg, func(*http.Request, store.User, *auth.Claims) { called = true }), r)
+			rec, reached := run(RequireAuth(fakeAuthStore{user: user}, cfg, func(http.ResponseWriter, *http.Request, store.User, *auth.Claims) { called = true }), r)
 			if rec.Code != tc.want || called != tc.hook || reached != tc.hook || len(rec.Result().Cookies()) != 0 {
 				t.Fatalf("status=%d hook=%v reached=%v cookies=%d", rec.Code, called, reached, len(rec.Result().Cookies()))
 			}
@@ -170,7 +170,9 @@ func TestRequireUserBearerIgnoresBrowserHook(t *testing.T) {
 	}
 	user := store.User{ID: uuid.New(), IsActive: true}
 	st := fakeAuthStore{user: user, row: store.CliToken{UserID: user.ID, TokenHash: hash, Scope: clitoken.ScopeUser}}
-	mw := RequireUser(st, authTestCfg(), func(*http.Request, store.User, *auth.Claims) { t.Fatal("bearer invoked browser hook") })
+	mw := RequireUser(st, authTestCfg(), func(http.ResponseWriter, *http.Request, store.User, *auth.Claims) {
+		t.Fatal("bearer invoked browser hook")
+	})
 	req := bearerRequest(context.Background(), token)
 	// Both credentials present still dispatch exclusively to Bearer.
 	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: "invalid-cookie", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode})
@@ -203,7 +205,9 @@ func TestBrowserHookRejectsMismatchedIncomingPair(t *testing.T) {
 	staleHeader := browserRequest(t, http.MethodPost, old).Header.Get(auth.CSRFHeaderName)
 	req := browserRequest(t, http.MethodPost, current)
 	req.Header.Set(auth.CSRFHeaderName, staleHeader)
-	rec, reached := run(RequireAuth(fakeAuthStore{user: user}, cfg, func(*http.Request, store.User, *auth.Claims) { t.Fatal("mismatched pair reached hook") }), req)
+	rec, reached := run(RequireAuth(fakeAuthStore{user: user}, cfg, func(http.ResponseWriter, *http.Request, store.User, *auth.Claims) {
+		t.Fatal("mismatched pair reached hook")
+	}), req)
 	if rec.Code != http.StatusForbidden || reached || len(rec.Result().Cookies()) != 0 {
 		t.Fatal("mismatched pair refreshed or authenticated")
 	}
@@ -221,7 +225,7 @@ func TestBrowserHookSafeRequestRequiresStrictAuthorization(t *testing.T) {
 			req := browserRequest(t, method, token)
 			req.Header.Del(auth.CSRFHeaderName)
 			called := false
-			rec, reached := run(RequireUser(fakeAuthStore{user: user}, cfg, func(r *http.Request, _ store.User, _ *auth.Claims) {
+			rec, reached := run(RequireUser(fakeAuthStore{user: user}, cfg, func(_ http.ResponseWriter, r *http.Request, _ store.User, _ *auth.Claims) {
 				called = true
 				if auth.ValidateCSRFToken(r) {
 					t.Fatal("safe method incorrectly authorized slot access")
