@@ -1288,6 +1288,13 @@ before any source inspection or source-dependent preflight, under the outer A:
   the existing receipt, custody, quarantine, live-execution, Docker, cancellation,
   identity and content safeguards still apply.
 
+Besides the boot sweep and the paced live pass, a successor claim on the same
+branch triggers it (amended 2026-10-29, nightly E2E #152): when the seed is
+refused because the journal names a completed owner, the claim drains that
+owner's execution tail (bounded), runs this same certified retirement under its
+own A, and reseeds once; when the proof is missing it keeps the unchanged
+fail-closed orphan reclaim. No check is relaxed and no force-clear is added.
+
 Destruction is a **retiring** transaction. Before the first deletion the slot
 enters `retiring` with an authenticated manifest in deletion order (clone, fence,
 paired skills when present, bundles, records, the receipt-bearing record last)
