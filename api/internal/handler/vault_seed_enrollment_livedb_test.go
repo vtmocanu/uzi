@@ -114,6 +114,7 @@ func TestVaultSeedAdminPolicyLiveDB(t *testing.T) {
 				t.Fatal("original seed password no longer verifies")
 			}
 			v.Lock(user.ID)
+			before = seedEnrollmentSnapshot(t, pool, user.ID)
 			if err := seed.UnlockAdminVault(ctx, q, v, changed); protected && err == nil {
 				t.Fatal("changed password unlocked protected seed")
 			} else if !protected && err != nil {
@@ -218,9 +219,9 @@ func TestVaultSeedAnthropicModesLiveDB(t *testing.T) {
 			if len(meta) != 1 || meta[0].Label != store.LabelDefaultSecret || !meta[0].IsDefault {
 				t.Fatal("seeded token default metadata mismatch")
 			}
-			before := seedEnrollmentSnapshot(t, pool, user.ID)
 			cfg.SeedAnthropicToken = "invalid replacement with spaces"
 			v.Lock(user.ID)
+			before := seedEnrollmentSnapshot(t, pool, user.ID)
 			if err := seed.AnthropicToken(ctx, adapter, nil, cfg); err != nil {
 				t.Fatal(err)
 			}
