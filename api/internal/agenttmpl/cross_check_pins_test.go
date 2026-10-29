@@ -5,22 +5,22 @@ import "testing"
 func TestResolveCrossCheckPins(t *testing.T) {
 	ptr := func(v string) *string { return &v }
 	for _, tc := range []struct {
-		name, harness                                      string
-		model, effort, workerModel, workerEffort, template *string
-		wantModel                                          *string
-		wantEffort, modelSource, effortSource              string
+		name, harness                         string
+		model, effort, workerModel, template  *string
+		wantModel                             *string
+		wantEffort, modelSource, effortSource string
 	}{
-		{"acceptance", "codex", ptr("gpt-6-astra"), ptr("xhigh"), ptr("gpt-6-sol"), ptr("high"), nil, ptr("gpt-6-astra"), "xhigh", "pin", "pin"},
-		{"default", "codex", nil, nil, ptr("gpt-6-sol"), ptr("medium"), nil, ptr("gpt-6-sol"), "high", "worker default", "cross-check default"},
-		{"worker low does not lower checker", "codex", nil, nil, ptr("gpt-6-astra"), ptr("low"), nil, ptr("gpt-6-astra"), "high", "worker default", "cross-check default"},
-		{"product", "codex", nil, nil, nil, nil, ptr("opus"), ptr("gpt-6.1-sol"), "high", "worker default", "cross-check default"},
-		{"independent effort", "codex", nil, ptr("xhigh"), nil, ptr("low"), nil, ptr("gpt-6.1-sol"), "xhigh", "worker default", "pin"},
-		{"codex low pin kept", "codex", nil, ptr("low"), nil, ptr("max"), nil, ptr("gpt-6.1-sol"), "low", "worker default", "pin"},
-		{"claude template", "claude", nil, nil, nil, nil, ptr("sonnet"), ptr("sonnet"), "high", "worker default", "cross-check default"},
-		{"claude sdk", "claude", nil, nil, nil, nil, nil, nil, "high", "worker default", "cross-check default"},
-		{"claude lane", "claude", nil, nil, ptr("haiku"), ptr("max"), ptr("sonnet"), ptr("haiku"), "high", "worker default", "cross-check default"},
-		{"claude medium pin kept", "claude", ptr("opus"), ptr("medium"), ptr("haiku"), ptr("xhigh"), nil, ptr("opus"), "medium", "pin", "pin"},
-		{"claude ignores codex template", "claude", nil, nil, nil, nil, ptr("gpt-6.1-sol"), nil, "high", "worker default", "cross-check default"},
+		{"acceptance", "codex", ptr("gpt-6-astra"), ptr("xhigh"), ptr("gpt-6-sol"), nil, ptr("gpt-6-astra"), "xhigh", "pin", "pin"},
+		{"default", "codex", nil, nil, ptr("gpt-6-sol"), nil, ptr("gpt-6-sol"), "high", "worker default", "cross-check default"},
+		{"worker low does not lower checker", "codex", nil, nil, ptr("gpt-6-astra"), nil, ptr("gpt-6-astra"), "high", "worker default", "cross-check default"},
+		{"product", "codex", nil, nil, nil, ptr("opus"), ptr("gpt-6.1-sol"), "high", "worker default", "cross-check default"},
+		{"independent effort", "codex", nil, ptr("xhigh"), nil, nil, ptr("gpt-6.1-sol"), "xhigh", "worker default", "pin"},
+		{"codex low pin kept", "codex", nil, ptr("low"), nil, nil, ptr("gpt-6.1-sol"), "low", "worker default", "pin"},
+		{"claude template", "claude", nil, nil, nil, ptr("sonnet"), ptr("sonnet"), "high", "worker default", "cross-check default"},
+		{"claude sdk", "claude", nil, nil, nil, nil, nil, "high", "worker default", "cross-check default"},
+		{"claude lane", "claude", nil, nil, ptr("haiku"), ptr("sonnet"), ptr("haiku"), "high", "worker default", "cross-check default"},
+		{"claude medium pin kept", "claude", ptr("opus"), ptr("medium"), ptr("haiku"), nil, ptr("opus"), "medium", "pin", "pin"},
+		{"claude ignores codex template", "claude", nil, nil, nil, ptr("gpt-6.1-sol"), nil, "high", "worker default", "cross-check default"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := ResolveCrossCheck(tc.harness, tc.model, tc.effort, tc.workerModel, tc.template)
