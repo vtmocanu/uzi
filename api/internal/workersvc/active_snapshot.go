@@ -388,8 +388,8 @@ func (s *Service) validatedActiveSnapshot(wkr store.Worker, snap *ActiveSnapshot
 //
 // Returns (applied, err): applied reports whether rows/leases were written. In heartbeat and
 // register mode an invalid snapshot returns (false, nil) with a warning and touches nothing; in
-// claim mode it returns (false, ErrActiveSnapshotInvalid). A real DB error is returned verbatim
-// (a 500), never swallowed.
+// claim mode it returns (false, ErrActiveSnapshotInvalid). Custody DB errors propagate;
+// recoverable optional cooldown projection errors roll back only their savepoint.
 // ReplaceWorkerActiveRuns is the compatibility entrypoint for a provided transaction.
 // It acquires the worker row itself and uses the same frozen ledger as production callers.
 func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Queries, wkr store.Worker, snap *ActiveSnapshot, mode snapshotMode) (bool, error) {
