@@ -20,7 +20,7 @@ it("keeps legacy labels and rejects malformed run IDs before rendering attribute
   expect(screen.getByText("Waiting run")).toBeTruthy();
   expect(screen.queryByRole("link")).toBeNull();
   rerender(
-    <MemoryRouter><HealthEvidenceLabel evidence={{ label: "Waiting run", value: "Diagnostics", run_id: "../admin/‮\n" }} /></MemoryRouter>,
+    <MemoryRouter><HealthEvidenceLabel evidence={{ label: "Waiting run", value: "Diagnostics", run_id: "../admin/" + String.fromCodePoint(0x202e) + "\n" }} /></MemoryRouter>,
   );
   expect(screen.getByText("Waiting run")).toBeTruthy();
   expect(screen.queryByRole("link")).toBeNull();

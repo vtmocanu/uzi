@@ -73,7 +73,7 @@ func TestQueueWaitingOwnerFallbackAndSanitizing(t *testing.T) {
 	}{
 		{name: "missing", want: "Owner name unavailable"},
 		{name: "failed", display: "Wrong name", want: "Owner name unavailable", fail: true},
-		{name: "hostile", display: "Alex\x1b[31m‮\nExample", want: "Owner: Alex[31m Example"},
+		{name: "hostile", display: "Alex\x1b[31m" + string(rune(0x202e)) + "\nExample", want: "Owner: Alex[31m Example"},
 		{name: "long unicode", display: strings.Repeat("😀", 200), want: "Owner: "},
 		{name: "blank", display: "  \n\t", want: "Owner name unavailable"},
 	} {
@@ -90,7 +90,7 @@ func TestQueueWaitingOwnerFallbackAndSanitizing(t *testing.T) {
 			}
 			c := newSvc(f, &fakeSettings{}).checkQueueWaiting(context.Background(), fixedNow, healthDetectorEnabled)
 			value := c.Evidence[0].Value
-			if !strings.Contains(value, tc.want) || strings.Contains(value, "private@example.com") || strings.ContainsAny(value, "\x1b‮\n\t") {
+			if !strings.Contains(value, tc.want) || strings.Contains(value, "private@example.com") || strings.ContainsAny(value, "\x1b"+string(rune(0x202e))+"\n\t") {
 				t.Fatalf("unsafe or missing identity: %q", value)
 			}
 			if !strings.Contains(value, "waited unavailable") || c.Severity != sevUnknown {
