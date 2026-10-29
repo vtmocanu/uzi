@@ -184,9 +184,63 @@ func TestVaultBrowserSlotsLiveDB(t *testing.T) {
 				}
 			})
 		}
+		// Keep the authenticated snapshot current while independently corrupting
+		// persisted metadata, so snapshot rejection cannot mask these guards.
+		for _, tc := range []struct {
+			name, corrupt, reset string
+			original             any
+		}{
+			{"persisted slot version", "UPDATE vault_browser_slots SET token_version=token_version+1 WHERE user_id=$1", "UPDATE vault_browser_slots SET token_version=$2 WHERE user_id=$1", before.TokenVersion},
+			{"persisted slot epoch", "UPDATE vault_browser_slots SET vault_epoch=vault_epoch+1 WHERE user_id=$1", "UPDATE vault_browser_slots SET vault_epoch=$2 WHERE user_id=$1", before.VaultEpoch},
+			{"persisted slot generation", "UPDATE vault_browser_slots SET generation=generation+1 WHERE user_id=$1", "UPDATE vault_browser_slots SET generation=$2 WHERE user_id=$1", before.VaultSlotGeneration},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				current := f.session(t, browser)
+				vlExec(t, pool, tc.corrupt, f.id)
+				t.Cleanup(func() { vlExec(t, pool, tc.reset, f.id, tc.original) })
+				cold := f.cold()
+				if err := cold.Restore(ctx, current, decoded); err == nil || cold.Unlocked(f.id) {
+					t.Fatal("invalid persisted slot metadata published a DEK")
+				}
+			})
+		}
 		vlExec(t, pool, "UPDATE vault_browser_slots SET created_at=now()-interval '2 days',expires_at=now()-interval '1 day' WHERE user_id=$1", f.id)
 		if err := f.cold().Restore(ctx, f.session(t, browser), decoded); err == nil {
 			t.Fatal("expired restore")
+		}
+	})
+	t.Run("admin lifetime and absent setting default", func(t *testing.T) {
+		f := bsSeed(t, pool)
+		for _, tc := range []struct {
+			name, value string
+			days        int
+		}{
+			{"absent setting", "", 7},
+			{"minimum", "1", 1},
+			{"maximum", "30", 30},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Cleanup(func() { vlExec(t, pool, "DELETE FROM app_settings WHERE key='vault_reunlock_days'") })
+				if tc.value == "" {
+					vlExec(t, pool, "DELETE FROM app_settings WHERE key='vault_reunlock_days'")
+				} else {
+					vlExec(t, pool, "INSERT INTO app_settings(key,value) VALUES('vault_reunlock_days',$1) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", tc.value)
+				}
+				browser := uuid.New()
+				key, err := f.v.UnlockAndMint(ctx, vault.Snapshot(f.user(t)), vlLoginPhrase, vault.InteractiveCreate,
+					&vault.BrowserMintRequest{HTTPS: true, BrowserID: browser, SessionExpiresAt: time.Now().Add(45 * 24 * time.Hour)})
+				if err != nil || key == nil {
+					t.Fatalf("admin-bounded mint: %v", err)
+				}
+				t.Cleanup(key.Destroy)
+				var created, expires time.Time
+				if err := pool.QueryRow(ctx, "SELECT created_at,expires_at FROM vault_browser_slots WHERE user_id=$1 AND browser_id=$2", f.id, browser).Scan(&created, &expires); err != nil {
+					t.Fatal(err)
+				}
+				if expires.Sub(created) != time.Duration(tc.days)*24*time.Hour {
+					t.Fatal("admin TTL or absent-setting default did not bound the minted slot")
+				}
+			})
 		}
 	})
 	t.Run("durable lock and stale interactive snapshot", func(t *testing.T) {
@@ -276,6 +330,7 @@ func TestVaultBrowserSlotsLiveDB(t *testing.T) {
 	})
 	t.Run("cap replacement expiry sweep and setting validation", func(t *testing.T) {
 		f := bsSeed(t, pool)
+		t.Cleanup(func() { vlExec(t, pool, "DELETE FROM app_settings WHERE key='vault_reunlock_days'") })
 		vlExec(t, pool, "DELETE FROM app_settings WHERE key='vault_reunlock_days'")
 		browsers := make([]uuid.UUID, 33)
 		for i := range browsers {
@@ -304,11 +359,14 @@ func TestVaultBrowserSlotsLiveDB(t *testing.T) {
 		if err != nil || n != 1 {
 			t.Fatalf("bounded expiry delete: %d %v", n, err)
 		}
+		// The bounded global sweep can choose an earlier user's expired row.
+		// Rejected minting must preserve this owner's population, whatever it is.
+		beforeRejectedMint := f.count(t)
 		for _, value := range []string{"0", "31", "invalid", ""} {
 			vlExec(t, pool, "INSERT INTO app_settings(key,value) VALUES('vault_reunlock_days',$1) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", value)
 			k, err := f.v.UnlockAndMint(ctx, vault.Snapshot(f.user(t)), vlLoginPhrase, vault.InteractiveExisting, &vault.BrowserMintRequest{HTTPS: true, BrowserID: uuid.New(), SessionExpiresAt: time.Now().Add(time.Hour)})
-			if err == nil || k != nil || f.count(t) != 0 {
-				t.Fatalf("invalid DB setting %q minted", value)
+			if err == nil || k != nil || f.count(t) != beforeRejectedMint {
+				t.Fatalf("invalid DB setting %q changed slots", value)
 			}
 		}
 		vlExec(t, pool, "DELETE FROM app_settings WHERE key='vault_reunlock_days'")
