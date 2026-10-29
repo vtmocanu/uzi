@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -569,7 +570,7 @@ func TestBrowserSlotRejectedSessionsLiveDB(t *testing.T) {
 
 func TestBrowserSlotRestorePromotesParkedRunLiveDB(t *testing.T) {
 	e := newRecoveryEnv(t)
-	h, _, _ := vaultRecoveryHandler(t, e, true)
+	h, poker, _ := vaultRecoveryHandler(t, e, true)
 	h.cfg.CookieSecure = true
 	h.cfg.JWTSecret = []byte("browser-slot-test-signing-key")
 	h.cfg.AuthTokenTTL = time.Hour
@@ -597,37 +598,92 @@ func TestBrowserSlotRestorePromotesParkedRunLiveDB(t *testing.T) {
 			b.cookies = append(b.cookies, c)
 		}
 	}
-	run := seedVaultRecoveryRow(t, e, e.user, "recovery_wait", "vault_locked", nil, 77)
-	cliMustExec(t, e.pool, "UPDATE user_vaults SET lock_notified_at=now() WHERE user_id=$1", e.user)
-	before, err := h.q.GetUserVault(e.ctx, e.user)
+	other, err := h.freshSession(user)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b.restart()
-	for _, csrf := range []string{"", "bad", b.csrf + "x"} {
-		cliVaultCode(t, b.request("GET", "/api/auth/me", "", csrf, nil), http.StatusOK)
-		after, err := h.q.GetUserVault(e.ctx, e.user)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var status string
-		if err := e.pool.QueryRow(e.ctx, "SELECT status FROM runs WHERE id=$1", run).Scan(&status); err != nil {
-			t.Fatal(err)
-		}
-		if status != "recovery_wait" || after.LockNotifiedAt != before.LockNotifiedAt || !after.LockNotifiedAt.Valid || h.vault.Unlocked(e.user) {
-			t.Fatal("strict failure changed parked recovery or lock notice")
+	otherRec := httptest.NewRecorder()
+	other.emit(otherRec)
+	var otherCSRF string
+	for _, c := range otherRec.Result().Cookies() {
+		if c.Name == auth.CSRFCookieName {
+			otherCSRF = c.Value
 		}
 	}
+	if otherCSRF == "" || otherCSRF == b.csrf {
+		t.Fatal("other-JWT CSRF negative control missing")
+	}
+	var runs []uuid.UUID
+	for i, tc := range []struct {
+		name, method, csrf string
+		edit               func(*http.Request)
+	}{
+		{"missing GET", "GET", "", nil},
+		{"missing HEAD", "HEAD", "", nil},
+		{"malformed GET", "GET", "bad", nil},
+		{"malformed HEAD", "HEAD", "bad", nil},
+		{"tampered GET", "GET", b.csrf + "x", nil},
+		{"tampered HEAD", "HEAD", b.csrf + "x", nil},
+		{"other JWT GET", "GET", otherCSRF, nil},
+		{"other JWT HEAD", "HEAD", otherCSRF, nil},
+		{"same site sibling GET", "GET", "", func(r *http.Request) {
+			r.Host = "app.example.test"
+			r.Header.Set("Origin", "https://sibling.example.test")
+			r.Header.Set("Sec-Fetch-Site", "same-site")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Give every counterexample fresh parked work and a fresh notice, so
+			// an earlier unsafe promotion cannot contaminate a later assertion.
+			run := seedVaultRecoveryRow(t, e, e.user, "recovery_wait", "vault_locked", nil, 77+i)
+			runs = append(runs, run)
+			cliMustExec(t, e.pool, "UPDATE user_vaults SET lock_notified_at=now() WHERE user_id=$1", e.user)
+			before, err := h.q.GetUserVault(e.ctx, e.user)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeRun := vaultRecoveryRow(t, e, run)
+			beforePokes := poker.count(e.user)
+			reads := b.countRestart()
+			path := "/api/auth/me"
+			if tc.method == "HEAD" {
+				path = "/api/browser-slot-head-probe"
+			}
+			cliVaultCode(t, b.request(tc.method, path, "", tc.csrf, tc.edit), http.StatusOK)
+			after, err := h.q.GetUserVault(e.ctx, e.user)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parkUnchanged := reflect.DeepEqual(beforeRun, vaultRecoveryRow(t, e, run))
+			noticeUnchanged := after.LockNotifiedAt == before.LockNotifiedAt && after.LockNotifiedAt.Valid
+			if !parkUnchanged || !noticeUnchanged {
+				t.Fatalf("ineligible probe changed recovery or notice: parked_unchanged=%t notice_unchanged=%t", parkUnchanged, noticeUnchanged)
+			}
+			if h.vault.Unlocked(e.user) || reads.Load() != 0 || poker.count(e.user) != beforePokes {
+				t.Fatal("ineligible probe restored, accessed a slot, or triggered vault-ready effects")
+			}
+			if _, available := h.vaultUnlockLimiter.Reserve(mw.VaultUnlockKey(e.user)); !available {
+				t.Fatal("ineligible probe reserved unlock budget")
+			}
+		})
+	}
+	reads := b.countRestart()
+	beforePokes := poker.count(e.user)
 	cliVaultCode(t, b.request("GET", "/api/auth/me", "", b.csrf, nil), http.StatusOK)
 	after, err := h.q.GetUserVault(e.ctx, e.user)
 	if err != nil || after.LockNotifiedAt.Valid {
 		t.Fatal("successful restore did not clear notice")
 	}
-	var status string
-	if err := e.pool.QueryRow(e.ctx, "SELECT status FROM runs WHERE id=$1", run).Scan(&status); err != nil {
-		t.Fatal(err)
+	if !h.vault.Unlocked(e.user) || reads.Load() != 1 || poker.count(e.user) <= beforePokes {
+		t.Fatal("authorized foreground probe did not restore and trigger vault-ready effects")
 	}
-	if status != "queued" {
-		t.Fatalf("restored run status=%s", status)
+	for _, run := range runs {
+		var status string
+		if err := e.pool.QueryRow(e.ctx, "SELECT status FROM runs WHERE id=$1", run).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != "queued" {
+			t.Fatalf("restored run status=%s", status)
+		}
 	}
 }
