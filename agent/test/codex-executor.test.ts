@@ -5846,6 +5846,41 @@ describe("CodexExecutor: m1 response usage", () => {
   });
 });
 
+// PRD #3247 preservation: these pass on the pre-change tree and pin that a claim with no
+// default_effort keeps every Codex wire request free of an `effort` key.
+describe("CodexExecutor: no default_effort on the claim leaves the effort key off every wire request (preservation)", () => {
+  it("root thread/start, root turn/start and a delegated child turn/start carry no effort key", async () => {
+    const agents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        c.transport.push(turnCompleted("completed", "th-child", "tn-child"));
+        return { turn: { id: "tn-child" } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
+    const { ctx } = makeCtx({ agents, config: { default_model: "gpt-6.1-sol" } });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply");
+    rig.transport.push(signalDone("th-1", "tn-1")).push(turnCompleted("completed", "th-1", "tn-1")).end();
+    await withTimeout(runP, 3000, "no-effort delegation run");
+
+    const turns = rig.transport.requests.filter((request) => request.method === "turn/start");
+    const threads = rig.transport.requests.filter((request) => request.method === "thread/start");
+    assert.equal(turns.length, 2, "one root turn and one child turn");
+    assert.equal(threads.length, 2, "one root thread and one child thread");
+    for (const request of [...turns, ...threads]) {
+      assert.equal(Object.hasOwn(rec(request.params), "effort"), false, `${request.method} carries no effort key`);
+    }
+  });
+});
+
 describe("CodexExecutor: an api_key run meters the root model end-to-end (executor→harness authMode wiring)", () => {
   it("forwards the claim's medium and explicit effort to the actual turn/start wire field", async () => {
     for (const effort of ["medium", "xhigh"] as const) {

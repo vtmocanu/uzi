@@ -2133,6 +2133,21 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.deepEqual(params.input, [{ type: "text", text: "do the thing" }]);
   });
 
+  // PRD #3247 preservation (passes on the pre-change tree): a request without an effort sends no
+  // `effort` key on either the root thread/start or the root turn/start.
+  it("omits the effort key from thread/start and turn/start when the request has no effort", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).end();
+    const turn = harness.startTurn(makeRequest());
+    await turn.events[Symbol.asyncIterator]().next();
+
+    for (const method of ["thread/start", "turn/start"]) {
+      const sent = transport.requests.find((r) => r.method === method);
+      assert.ok(sent, `${method} was sent`);
+      assert.equal(Object.hasOwn(rec(sent.params), "effort"), false, `${method} carries no effort key`);
+    }
+  });
+
   // PRD #1551 (D4/D5): a validated custom worker-default root model reaches the turn/start +
   // initialized event unchanged (render passes it through on modelSource:"worker_default"),
   // never the provider fallback gpt-6-astra. Discriminating: the passthrough revert would make

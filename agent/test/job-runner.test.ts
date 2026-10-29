@@ -466,6 +466,19 @@ describe("job SDK options: the effective tool surface (PRD #1908 M4)", () => {
     assert.strictEqual(o.cwd, "/data/jobs/run/work");
   });
 
+  // PRD #3247 preservation (passes on the pre-change tree): the runner hands the claim's
+  // default_effort straight to this builder, so an absent one must leave no `effort` key. This
+  // drives the pure builder rather than the full session loop, which needs a live SDK query.
+  it("sets no effort key when no effort is passed, and carries an explicit one", () => {
+    assert.ok(!("effort" in build()), "no default_effort, no effort option");
+    const rs = buildJobResultServer({});
+    const withEffort = buildJobSdkOptions({
+      env: {}, systemPrompt: "s", workDir: "/data/jobs/run/work", log, secretPaths: [],
+      resultServer: rs.server, toolNames: rs.toolNames, effort: "high",
+    });
+    assert.equal(withEffort.effort, "high");
+  });
+
   it("the effective list has no Bash, Web*, forge, memory or subagent tool, and disallows them by name", () => {
     const o = build();
     const effective = (o.tools as string[]).join(" ");

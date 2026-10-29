@@ -52,7 +52,14 @@ export class EpochCleanupUnprovenError extends TrustedExecutionRefusal {
 }
 
 export type HarnessKind = "claude" | "codex";
-export type HarnessEffort = "low" | "medium" | "high" | "xhigh" | "max";
+/** Closed set of effort levels a claim may carry. Keep in lockstep with Go `agenttmpl.EffortLevels`.
+ *  `runtime` is a server-side preference token that is resolved before the claim and never appears
+ *  on one, so it is deliberately absent here. */
+export const HARNESS_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type HarnessEffort = (typeof HARNESS_EFFORTS)[number];
+export function isHarnessEffort(value: unknown): value is HarnessEffort {
+  return typeof value === "string" && (HARNESS_EFFORTS as readonly string[]).includes(value);
+}
 export type SessionPresence = "present" | "absent" | "unknown";
 export type JsonObject = Readonly<Record<string, unknown>>;
 

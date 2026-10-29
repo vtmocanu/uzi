@@ -164,6 +164,19 @@ describe("IsolatedRunner: lifecycle", () => {
     assert.ok(!fs.existsSync(path.join(dataDir, "isolated", "iso-1")), "the per-run dir is removed");
   });
 
+  // PRD #3247 preservation (passes on the pre-change tree): no default_effort, no effort handed on.
+  it("passes no effort to the session when the claim has no default_effort, and passes an explicit one", async () => {
+    for (const [config, want] of [[undefined, undefined], [{ default_model: "sonnet" }, undefined],
+      [{ default_effort: "high" as const }, "high"]] as const) {
+      const { client } = recordingClient();
+      const ran: IsolatedContext[] = [];
+      await runner(client, { ran }).execute(isolatedClaim(config ? { config } : {}));
+      assert.equal(ran.length, 1);
+      assert.equal(Object.hasOwn(ran[0]!, "effort"), want !== undefined);
+      assert.equal((ran[0] as { effort?: string }).effort, want);
+    }
+  });
+
   it("fences captured research fields and omits issue comments", async () => {
     const { client } = recordingClient();
     const ran: IsolatedContext[] = [];
