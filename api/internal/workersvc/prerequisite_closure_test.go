@@ -219,11 +219,13 @@ type prerequisiteHTTP struct {
 	lost        bool
 	refName     string
 	transaction *atomic.Bool
+	requests    atomic.Int32
 	ioInTX      atomic.Bool
 	beforePost  func()
 }
 
 func (f *prerequisiteHTTP) serve(w http.ResponseWriter, r *http.Request) {
+	f.requests.Add(1)
 	if f.transaction != nil && f.transaction.Load() {
 		f.ioInTX.Store(true)
 	}
@@ -423,7 +425,7 @@ func TestPrerequisiteMarkerEligibilityAndLockOrder(t *testing.T) {
 			}
 			prerequisiteRun(t, s, m)
 			if mode == "normal" {
-				if !slices.Equal(m.locks, []string{"run", "hold", "capture", "closure", "capture", "closure"}) {
+				if !slices.Equal(m.locks, []string{"run", "hold", "capture", "closure", "run", "hold", "capture", "closure", "capture", "closure"}) {
 					t.Fatalf("locks=%v", m.locks)
 				}
 			} else {
@@ -433,6 +435,36 @@ func TestPrerequisiteMarkerEligibilityAndLockOrder(t *testing.T) {
 				if mode != "binding-changed" && m.row.Reason != "archive_unavailable" {
 					t.Fatalf("row=%+v", m.row)
 				}
+			}
+		})
+	}
+}
+
+// This regression uses only the original executor and fixture interfaces so it
+// can also run against the implementation before the eligibility preflight.
+func TestPrerequisiteIneligibleBeforeAncestry(t *testing.T) {
+	for _, mode := range []string{"expiredcap", "closedhold", "missingRun"} {
+		t.Run(mode, func(t *testing.T) {
+			s, m, h, b := newPrerequisiteMemory(t, 1)
+			switch mode {
+			case "expiredcap":
+				m.capture.State = "expired"
+			case "closedhold":
+				m.hold.State = "released"
+			case "missingRun":
+				m.missingRun = true
+			}
+			compares := 0
+			b.f = &prerequisiteTestForge{compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
+				compares++
+				return forge.AncestryUnknown, nil
+			}}
+			prerequisiteRun(t, s, m)
+			if m.row.State != "refused" || m.row.Reason != "archive_unavailable" {
+				t.Fatalf("state=%s reason=%s", m.row.State, m.row.Reason)
+			}
+			if b.builds != 0 || compares != 0 || h.sends != 0 || h.requests.Load() != 0 || m.marked != 0 || m.row.LiveRunID.Valid {
+				t.Fatalf("builds=%d compares=%d requests=%d sends=%d markers=%d live=%t", b.builds, compares, h.requests.Load(), h.sends, m.marked, m.row.LiveRunID.Valid)
 			}
 		})
 	}

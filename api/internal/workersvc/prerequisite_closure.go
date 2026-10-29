@@ -79,23 +79,7 @@ func (s *Service) SweepPrerequisiteClosures(parent context.Context) (int64, erro
 	var pages [5][]store.RecoveryPrerequisiteClosure
 	var indices [5]int
 	var errs []error
-	for offset := 0; offset < 5; offset++ {
-		lane := (first + offset) % 5
-		rows, e := s.prerequisitePage(ctx, q, lane, r.cursor[lane], p.end)
-		if e != nil {
-			errs = append(errs, e)
-			continue
-		}
-		if len(rows) == 0 && r.cursor[lane].due.Valid {
-			r.cursor[lane] = prerequisiteCursor{}
-			rows, e = s.prerequisitePage(ctx, q, lane, r.cursor[lane], p.end)
-			if e != nil {
-				errs = append(errs, e)
-				continue
-			}
-		}
-		pages[lane] = rows
-	}
+	var loaded [5]bool
 	seen := map[uuid.UUID]bool{}
 	var changed int64
 	admitted := 0
@@ -105,6 +89,23 @@ func (s *Service) SweepPrerequisiteClosures(parent context.Context) (int64, erro
 				return changed, errors.Join(errs...)
 			}
 			lane := (first + offset) % 5
+			if !loaded[lane] {
+				loaded[lane] = true
+				rows, e := s.prerequisitePage(ctx, q, lane, r.cursor[lane], p.end)
+				if e != nil {
+					errs = append(errs, e)
+					continue
+				}
+				if len(rows) == 0 && r.cursor[lane].due.Valid {
+					r.cursor[lane] = prerequisiteCursor{}
+					rows, e = s.prerequisitePage(ctx, q, lane, r.cursor[lane], p.end)
+					if e != nil {
+						errs = append(errs, e)
+						continue
+					}
+				}
+				pages[lane] = rows
+			}
 			if indices[lane] >= len(pages[lane]) {
 				continue
 			}
@@ -302,6 +303,12 @@ func prerequisiteExternalContext(ctx context.Context, s *Service, end time.Time,
 	return context.WithTimeout(ctx, min(time.Second, max(time.Duration(0), remaining)))
 }
 
+func prerequisitePreparationEligible(row store.RecoveryPrerequisiteClosure, run store.Run, hold store.RecoveryCustodyHold, cap store.RecoveryCapture) bool {
+	return run.UserID == row.UserID && hold.State == "open" && hold.InventoryGuarded && cap.State == "available" &&
+		cap.ManifestBound && cap.Checksum.String == row.Checksum && slices.Equal(cap.PrerequisiteShas, row.PrerequisiteShas) &&
+		hold.RunID == row.RunID && cap.RunID == row.RunID && cap.HoldID == row.HoldID
+}
+
 func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, row store.RecoveryPrerequisiteClosure, p prerequisitePass, end time.Time) (int64, error) {
 	c, cc := context.WithTimeout(ctx, prerequisiteDBTimeout)
 	reserved, err := q.ReservePrerequisitePreparation(c, store.ReservePrerequisitePreparationParams{ID: row.ID, LeaseSeconds: 8})
@@ -322,6 +329,47 @@ func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, 
 		w, wc := prerequisiteOutcomeContext(ctx, p)
 		defer wc()
 		return q.RefusePrerequisitePreparation(w, store.RefusePrerequisitePreparationParams{ID: row.ID, Generation: row.Attempts, Reason: reason})
+	}
+	// Eligibility precedes credentials and all remote work. Recheck at S2 as
+	// well: these short-lived locks do not authorize the later marker.
+	eligible, current := false, false
+	c, cc = context.WithTimeout(ctx, prerequisiteDBTimeout)
+	err = s.prerequisiteTx(c, func(tx PrerequisiteStore) error {
+		run, e := tx.LockPrerequisiteRun(c, row.RunID)
+		if e != nil && !errors.Is(e, pgx.ErrNoRows) {
+			return e
+		}
+		runPresent := e == nil
+		hold, e := tx.LockPrerequisiteHold(c, row.HoldID)
+		if e != nil && !errors.Is(e, pgx.ErrNoRows) {
+			return e
+		}
+		holdPresent := e == nil
+		cap, e := tx.LockPrerequisiteCapture(c, row.CaptureID)
+		if e != nil && !errors.Is(e, pgx.ErrNoRows) {
+			return e
+		}
+		capturePresent := e == nil
+		locked, e := tx.LockPrerequisiteClosure(c, row.ID)
+		if errors.Is(e, pgx.ErrNoRows) {
+			return nil
+		}
+		if e != nil {
+			return e
+		}
+		current = locked.State == "pending" && locked.Attempts == row.Attempts
+		eligible = runPresent && holdPresent && capturePresent && prerequisitePreparationEligible(row, run, hold, cap)
+		return nil
+	})
+	cc()
+	if err != nil {
+		return 0, err
+	}
+	if !current {
+		return 0, nil
+	}
+	if !eligible {
+		return refuse("archive_unavailable")
 	}
 	b, err := s.prerequisiteBinding(ctx, q, row, true)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -421,9 +469,7 @@ func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, 
 		if current.State != "pending" || current.Attempts != row.Attempts {
 			return nil
 		}
-		if run.UserID != row.UserID || hold.State != "open" || !hold.InventoryGuarded || cap.State != "available" ||
-			!cap.ManifestBound || cap.Checksum.String != row.Checksum || !slices.Equal(cap.PrerequisiteShas, row.PrerequisiteShas) ||
-			hold.RunID != row.RunID || cap.RunID != row.RunID || cap.HoldID != row.HoldID {
+		if !prerequisitePreparationEligible(row, run, hold, cap) {
 			unavailable = true
 			return nil
 		}

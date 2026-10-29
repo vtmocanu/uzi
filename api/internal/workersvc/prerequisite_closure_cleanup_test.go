@@ -206,7 +206,11 @@ func TestPrerequisiteAbsenceNeedsTenMinutesDifferentPass(t *testing.T) {
 		t.Fatal("early loss")
 	}
 	m.now = m.now.Add(time.Minute)
-	if _, err := s.prerequisiteOne(context.Background(), m, m.row, p); err != nil {
+	// A fresh test-only budget with the original pass ID isolates the durable
+	// pass fence. Production Sweep never extends a pass deadline.
+	samePass := newPrerequisitePass(m.now)
+	samePass.id = p.id
+	if _, err := s.prerequisiteOne(context.Background(), m, m.row, samePass); err != nil {
 		t.Fatal(err)
 	}
 	if m.row.State != "pinned" {
