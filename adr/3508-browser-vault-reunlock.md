@@ -77,7 +77,7 @@ across waits. Compare owner, browser ID, token version, mode epoch, slot
 generation and actual expiry after waiting; publish the DEK after an
 acknowledged commit. The monotonic `vault_slot_generation` is separate from
 `vault_epoch`: explicit lock revokes without changing the ciphertext-mode
-epoch. Migration 00374's users trigger advances generation and deletes slots
+epoch. Migration 00379's users trigger advances generation and deletes slots
 on relevant auth/mode changes, including storage-level password updates.
 
 Explicit lock durably revokes slots and evicts the cached DEK. Global logout
@@ -123,7 +123,7 @@ certify those checks.
 ## Deployment and rollback
 
 Keep the API singleton with coordinated Recreate replacement; mixed versions
-remain unsupported. Migration **00374** adds constant-default users columns,
+remain unsupported. Migration **00379** adds constant-default users columns,
 immediately validated CHECK constraints, slot storage and the revocation
 trigger. CHECK validation and ACCESS EXCLUSIVE lock duration/availability
 impact are production-dependent and unmeasured. Plan maintenance and backups;
@@ -133,7 +133,7 @@ there is no measured production migration-duration claim here.
 binary.** Such a binary cannot maintain slot revocations during subsequent
 lock/logout/password operations. A compatible re-upgrade must not resurrect
 pre-rollback grants: discard those rows before downgrade, rather than rely
-on the older binary to invalidate them. Migration 00374 Down drops slot
+on the older binary to invalidate them. Migration 00379 Down drops slot
 storage; 00373's independent mode/ciphertext rollback restrictions in
 [ADR-3507](3507-optional-credential-vault.md) still apply.
 
@@ -142,5 +142,5 @@ storage; 00373's independent mode/ciphertext rollback restrictions in
 - `api/internal/vault/browser.go`: mint, owner/slot AAD, snapshot checks and restore.
 - `api/internal/vault/auth_lifecycle.go` and `api/internal/vault/lifecycle.go`: serialized revocation and cache boundaries.
 - `api/internal/handler/browser_session.go`: cookie attributes, CSRF admission and interactive session preparation.
-- `api/internal/store/migrations/00374_vault_browser_slots.sql`: storage and revocation trigger.
+- `api/internal/store/migrations/00379_vault_browser_slots.sql`: storage and revocation trigger.
 - `web/src/lib/api.ts` and `web/src/auth/AuthContext.tsx`: foreground/passive request handling and focus refresh.

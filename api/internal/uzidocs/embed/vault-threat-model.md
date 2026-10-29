@@ -347,7 +347,7 @@ binary is unsafe because it rejects `master_aad`. See
 [ADR-3507](../adr/3507-optional-credential-vault.md) for the protocol and measured
 fixture evidence.
 
-Migration **00374** adds browser-slot storage and the users revocation trigger.
+Migration **00379** adds browser-slot storage and the users revocation trigger.
 Its immediate CHECK validation and ACCESS EXCLUSIVE locks have
 production-dependent, unmeasured duration and availability impact; constant
 defaults do not eliminate those costs. Keep singleton/Recreate deployment.
@@ -356,7 +356,7 @@ defaults do not eliminate those costs. Keep singleton/Recreate deployment.
 slots using the keyslot-aware deployment.** An older binary does not enforce
 these revocations; retained rows could otherwise survive logout/lock there.
 A compatible re-upgrade must not resurrect pre-rollback grants. Migration
-00374 Down drops the slots table; this is separate from 00373's mode and
+00379 Down drops the slots table; this is separate from 00373's mode and
 ciphertext rollback restrictions above. See [ADR-3508](../adr/3508-browser-vault-reunlock.md).
 
 ## Vault-lock Slack notice (PRD #890)

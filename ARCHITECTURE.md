@@ -439,7 +439,7 @@ authentication. Foreground restore best-effort promotes vault-locked parks;
 unattended continuity remains outside this feature.
 [ADR-3508](adr/3508-browser-vault-reunlock.md) records the protocol, security
 analysis and pre-keyslot rollback requirement to delete/invalidate slots
-before downgrade. Migration 00374 CHECK validation and ACCESS EXCLUSIVE
+before downgrade. Migration 00379 CHECK validation and ACCESS EXCLUSIVE
 duration/availability costs are production-dependent and unmeasured.
 Rotating `UZI_SECRET_KEY` invalidates rows still master-sealed across features.
 

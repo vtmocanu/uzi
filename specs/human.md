@@ -346,7 +346,7 @@ Tracked as GitLab issue vtmocanu/uzi#32; PRD at `prds/done/32-user-vault-passwor
 - Runs of a user who keeps the vault still wait after a restart until that user opens or focuses a uzi tab.
 
   The CLI does not get a keyslot here.
-  Unattended continuity is out of scope. See [ADR-3508](../adr/3508-browser-vault-reunlock.md), including mandatory slot invalidation/deletion before pre-keyslot rollback and migration 00374's unmeasured production CHECK/ACCESS EXCLUSIVE availability cost. (AI-synced 2026-10-29)
+  Unattended continuity is out of scope. See [ADR-3508](../adr/3508-browser-vault-reunlock.md), including mandatory slot invalidation/deletion before pre-keyslot rollback and migration 00379's unmeasured production CHECK/ACCESS EXCLUSIVE availability cost. (AI-synced 2026-10-29)
 
 ## Feature #37 — Per-run agent selection: repo `.claude/agents` detection with plan-gate choice
 
