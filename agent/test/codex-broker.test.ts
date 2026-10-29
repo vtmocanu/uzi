@@ -1459,6 +1459,59 @@ describe("U3 D9 live code repair broker", () => {
 describe("CodexCallbackBroker: explicit large text fallback", () => {
   const valid: FileopResponse = { ok: true, kind: "text", data: Buffer.from("body\n").toString("base64"),
     size: 2 * 1024 * 1024, offset: 1, linesReturned: 1, partialLastLine: false, truncated: true };
+  const malformedResult = { ok: false, code: "fileop_denied", fileopCode: "E_MALFORMED",
+    message: "file operation denied (E_MALFORMED)" };
+  async function readFallback(response: unknown): Promise<CallbackResult> {
+    const fileop = new FileopSpy([{ ok: false, code: "E_OVERSIZE" }, response as FileopResponse]);
+    const h = makeBroker({ fileop });
+    const result = await h.broker.handleToolCall(rt(), "Read", { path: "text", limit: 1 }, "root");
+    assert.deepEqual(fileop.calls, [
+      { op: "read", path: "text" }, { op: "read_text_range", path: "text", offset: 1, limit: 1 },
+    ]);
+    assert.equal(h.registry.inFlightCallbackCount(), 0);
+    return result;
+  }
+  for (const variant of [valid, { ok: true, kind: "binary" }]) {
+    for (const ok of ["true", "false", 1, 0, "", null, undefined, false]) {
+      it(`rejects malformed range ${variant.kind} success status ${JSON.stringify(ok) ?? "missing"}`, async () => {
+        const response: Record<string, unknown> = { ...variant, ok };
+        if (ok === undefined) delete response.ok;
+        assert.deepEqual(await readFallback(response), malformedResult);
+      });
+    }
+  }
+  for (const ok of ["true", "false", 1, 0, "", null, undefined]) {
+    it(`rejects malformed range error status ${JSON.stringify(ok) ?? "missing"} before scan-budget mapping`, async () => {
+      const response: Record<string, unknown> = { ok, code: "E_OVERSIZE" };
+      if (ok === undefined) delete response.ok;
+      assert.deepEqual(await readFallback(response), malformedResult);
+    });
+  }
+  for (const code of [undefined, null, false, 7, ["E_OVERSIZE"], { code: "E_OVERSIZE" }]) {
+    it(`rejects malformed range error code ${JSON.stringify(code) ?? "missing"}`, async () => {
+      const response: Record<string, unknown> = { ok: false, code };
+      if (code === undefined) delete response.code;
+      assert.deepEqual(await readFallback(response), malformedResult);
+    });
+  }
+  it("rejects range errors with success fields before scan-budget mapping", async () => {
+    for (const variant of [valid, { ok: true, kind: "binary" }]) {
+      assert.deepEqual(await readFallback({ ...variant, ok: false, code: "E_OVERSIZE" }), malformedResult);
+    }
+  });
+  it("settles valid boolean range success and error controls", async () => {
+    assert.deepEqual(await readFallback(valid), { ok: true, output: {
+      size: valid.size, content: "body\n", offset: 1, linesReturned: 1, partialLastLine: false, truncated: true,
+    } });
+    assertDenied(await readFallback({ ok: true, kind: "binary" }), "bad_args");
+    assert.deepEqual(await readFallback({ ok: false, code: "E_OVERSIZE" }), {
+      ok: false, code: "fileop_denied", fileopCode: "E_OVERSIZE",
+      message: "file operation denied (E_OVERSIZE): text scan exceeds the 64 MiB budget",
+    });
+    assert.deepEqual(await readFallback({ ok: false, code: "E_IO" }), {
+      ok: false, code: "fileop_denied", fileopCode: "E_IO", message: "file operation denied (E_IO)",
+    });
+  });
   it("requires raw boolean false on the wire to authorize oversized read fallback", async () => {
     for (const ok of [undefined, null, "false", "true", 0, 1, false]) {
       const inbound = new PassThrough();

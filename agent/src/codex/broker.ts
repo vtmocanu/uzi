@@ -1049,17 +1049,19 @@ export class CodexCallbackBroker {
   }
 
   private validateTextRange(res: FileopResponse, offset: number, limit: number): CallbackResult {
-    if (!res.ok) {
+    const malformed = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_MALFORMED" });
+    if (typeof res.ok !== "boolean") return malformed();
+    const allowed = res.ok === false ? ["ok", "code"] : res.kind === "binary" ? ["ok", "kind"] :
+      ["ok", "kind", "data", "size", "offset", "linesReturned", "partialLastLine", "truncated"];
+    if (Object.keys(res).some((key) => !allowed.includes(key))) return malformed();
+    if (res.ok === false) {
+      if (typeof res.code !== "string") return malformed();
       if (res.code === "E_OVERSIZE") return {
         ok: false, code: "fileop_denied", fileopCode: "E_OVERSIZE",
         message: "file operation denied (E_OVERSIZE): text scan exceeds the 64 MiB budget",
       };
       return this.mapFileopError(res);
     }
-    const malformed = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_MALFORMED" });
-    const allowed = res.kind === "binary" ? ["ok", "kind"] :
-      ["ok", "kind", "data", "size", "offset", "linesReturned", "partialLastLine", "truncated"];
-    if (Object.keys(res).some((key) => !allowed.includes(key))) return malformed();
     if (res.kind === "binary") {
       return deny("bad_args", "line ranges require a text file");
     }
