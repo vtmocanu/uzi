@@ -12,7 +12,8 @@
     "policy_tag": "x",
     "phase": "x",
     "correlation_id": "x",
-    "published": true
+    "published": true,
+    "captured_head": "x"
   },
   "worker_recovery": {
     "episode": 1,
