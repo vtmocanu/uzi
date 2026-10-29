@@ -3542,7 +3542,8 @@ export class RunRunner {
       return "unpublished";
     };
     if (!authority || !lease) return "unpublished";
-    // A source another flight's sink still owns is not this flight's to publish.
+    // A source another flight's sink still owns is not this flight's to publish. Read before A is taken: a stale
+    // answer only declines (fails closed), and the key cannot become foreign while this sink owns it.
     if (authority.heldByOtherSink(bound.clonePath, flight.sourceUsePaths)) return unpublished("another flight owns this source");
     try {
       const executor = flight.executor;
@@ -11732,6 +11733,27 @@ export class RunRunner {
       attemptSeed = this.attemptSeedOptions(claim, flight);
     };
     const reseed = this.canonicalReseedOptions(flight);
+    // A SourceUseHeldRefusal (an earlier flight's unended source use of the canonical path) is nonterminal:
+    // custody retained, no terminal report, no model work; the requeue cap bounds it.
+    const stopOnHeldSource = (err: SourceUseHeldRefusal): never => {
+      this.retainedLifecycleGuard(flight);
+      flight.runLog.warn("clone path held by an earlier flight's unended source use; stopping claim for retry", {
+        error: errMessage(err), claim_generation: flight.claimGeneration });
+      throw new RetainedRecoveryStop({ cause: err });
+    };
+    // The re-seed after a reclaimed terminal orphan runs outside the loop's try, so it maps the refusal itself.
+    const reseedAfterReclaim = async (): Promise<void> => {
+      try {
+        await refreshAttemptSeed();
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence, flight));
+        flight.worktreePath = runnerClone.path;
+        flight.branch = runnerClone.branch;
+        await this.bindFlightSource(flight, runnerClone.path);
+      } catch (err) {
+        if (err instanceof SourceUseHeldRefusal) stopOnHeldSource(err);
+        throw err;
+      }
+    };
     // issue #1786: a canonical seed refused because the key now has a kept stopped canonical source
     // (or recovered attempt mode) is retried ONCE on a fresh attempt path when the re-read mode says
     // so: the mode can land between the read above and the seed under the bare lock.
@@ -11773,29 +11795,17 @@ export class RunRunner {
           // else fail closed. Replaces the old worker-scoped getRunOwnership probe, which
           // 404'd on a worker move (Gap 2).
           await this.reclaimTerminalOrphan(barePath, claim, flight, err.clonePath, err.branch, err.ownerRunId, err);
-          await refreshAttemptSeed();
-          const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence, flight));
-          flight.worktreePath = runnerClone.path;
-          flight.branch = runnerClone.branch;
-          await this.bindFlightSource(flight, runnerClone.path);
+          await reseedAfterReclaim();
         } else if (err instanceof CapturePathMismatchError) {
           // issue #1319 Case A: a claimant-relative clone-path mismatch (the cross-kind slug
           // divergence, e.g. an issue owner's `issue-N` vs this mr_rework's `agent-issue-N`).
           // The SAME owner-derived validation decides; any unmet predicate fails closed.
           await this.reclaimTerminalOrphan(barePath, claim, flight, err.journaledPath, err.branch, err.ownerRunId, err);
-          await refreshAttemptSeed();
-          const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence, flight));
-          flight.worktreePath = runnerClone.path;
-          flight.branch = runnerClone.branch;
-          await this.bindFlightSource(flight, runnerClone.path);
+          await reseedAfterReclaim();
         } else if (err instanceof SourceUseHeldRefusal) {
           // The canonical clone path is shared by every run of the issue on this worker, so an earlier flight of
-          // this process can still hold it with no confirmed end (held_unended). Same nonterminal outcome as
-          // retained recovery: custody retained, no terminal report, no model work; the requeue cap bounds it.
-          this.retainedLifecycleGuard(flight);
-          flight.runLog.warn("clone path held by an earlier flight's unended source use; stopping claim for retry", {
-            error: errMessage(err), claim_generation: flight.claimGeneration });
-          throw new RetainedRecoveryStop({ cause: err });
+          // this process can still hold it with no confirmed end (held_unended).
+          stopOnHeldSource(err);
         } else {
           throw err;
         }

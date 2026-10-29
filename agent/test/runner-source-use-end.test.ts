@@ -334,7 +334,23 @@ describe("sink retirement and ownership at a flight's teardown", () => {
     let started = 0;
     const claim = gitlabClaim(iid, { run_id: randomUUID() });
     const runner = runnerWith(stopAfterSeed(() => { started++; }), rawFakeGitlab({}).gitlab, undefined, undefined, { authority: r.rt });
+    // The production seed admission: this runner's GitCache carries the authority hooks and requires them, so the
+    // refusal is raised by the seed's own admission of the canonical path (not scripted around it).
+    const hooked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+      authority: r.rt.hooks, authorityRequired: true, gitleaksBin: defaultGitleaksShim(),
+    }));
+    (runner as unknown as { git: GitCache }).git = hooked;
+    let tornDown: { preserveRecoveryClone?: boolean; preserveSession?: boolean; retainedLocalCustody?: boolean; keepGuardedInventoryOpen?: boolean } | undefined;
+    const internals = runner as unknown as { endFlightSourceUse(flight: object, log: unknown): Promise<void> };
+    const endFlight = internals.endFlightSourceUse.bind(runner);
+    internals.endFlightSourceUse = async (flight, log) => { tornDown = flight; return endFlight(flight, log); };
+    assert.equal(fs.existsSync(canonical), false, "the canonical clone does not exist before the run");
     await runner.execute(claim);
+    assert.equal(fs.existsSync(canonical), false, "the refused seed created no canonical clone");
+    assert.equal(tornDown?.preserveRecoveryClone, true, "custody: the recovery clone is preserved");
+    assert.equal(tornDown?.preserveSession, true, "custody: the session is preserved");
+    assert.equal(tornDown?.retainedLocalCustody, true, "custody: local custody is retained");
+    assert.equal(tornDown?.keepGuardedInventoryOpen, true, "custody: the guarded inventory stays open");
     assert.equal(started, 0, "no model work");
     assert.equal(api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"), false, "no failed report");
     assert.equal(api.states.some((s) => s.runId === claim.run_id && (s.body.status === "completed")), false);

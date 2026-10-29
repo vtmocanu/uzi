@@ -397,13 +397,20 @@ export class AuthorityRuntime implements AuthorityScope {
    * Runs under its own A (borrowing the active one) and releases it before returning.
    */
   async endSourceUse(
-    paths: Iterable<string>, options: AuthorityWait & { sink?: Set<string> } = {},
+    paths: Iterable<string>, options: AuthorityWait & { sink?: Set<string>; skipFlightOwned?: boolean } = {},
   ): Promise<{ ended: string[]; kept: string[]; endedSlots: Array<EndedSlotReceipt & { path: string }> }> {
     const keys = [...new Set([...paths].map((p) => path.resolve(p)))];
     const ended: string[] = [];
     const kept: string[] = [];
     // A key another unreleased sink owns is not this caller's to end: reported kept, never queued, never released.
-    const foreign = new Set(options.sink === undefined ? [] : keys.filter((key) => this.heldByOtherSink(key, options.sink)));
+    // Computed before A is taken: a stale answer only keeps a key (fails closed), and a key cannot become foreign
+    // during the wait because another sink's admission of it is refused while its current owner holds it.
+    // `skipFlightOwned` (a caller that is no flight, e.g. a retained-source discard that may have been refused before
+    // admitting anything) keeps every key with a recorded flight owner, except one whose current lease IS that
+    // caller's own discard lease (the operator discard of an unjoined key): that one still ends.
+    const foreign = new Set(keys.filter((key) => options.skipFlightOwned === true && this.#owners.has(key) &&
+        this.#discards.get(key) !== this.#leases.get(key) ||
+      options.sink !== undefined && this.heldByOtherSink(key, options.sink)));
     if (foreign.size > 0) this.#options.log?.warn("source use left active: another flight owns it", { sources: foreign.size });
     // The durable identity of each slot this call moved to `ineligible` itself: the only positive end evidence.
     const endedSlots: Array<EndedSlotReceipt & { path: string }> = [];

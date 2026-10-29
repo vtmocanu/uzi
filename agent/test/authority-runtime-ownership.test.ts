@@ -253,7 +253,7 @@ describe("per-key ownership", () => {
   });
 
   it("an end named by a different sink leaves the owner's slot active, queues nothing and releases nothing", async (t) => {
-    const r = await rig(t);
+    const r = await rig(t, { retryMs: 20 });
     const a = new Set<string>();
     const b = new Set<string>();
     const lease = await bindIn(r.rt, a, r.clone);
@@ -318,6 +318,52 @@ describe("per-key ownership", () => {
     assert.deepEqual(outcome.endedSlots, [], "a discard's end is not a cooperative end receipt");
     assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), false);
     await bindIn(r.rt, new Set(), r.clone);
+  });
+
+  it("issue #3638 skipFlightOwned keeps a flight-owned key active and owned, but still ends the discard's own lease", async (t) => {
+    const r = await rig(t);
+    const a = new Set<string>();
+    await bindIn(r.rt, a, r.clone);
+    const kept = await r.rt.endSourceUse([r.clone], { skipFlightOwned: true });
+    assert.deepEqual(kept.ended, []);
+    assert.deepEqual(kept.kept, [r.clone]);
+    assert.equal((await slotOf(r.rt, r.clone))?.state, "active", "the slot stays active");
+    assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), true, "A remains the owner");
+    // Not queued either: a drain must not end it behind the flight's back.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal((await slotOf(r.rt, r.clone))?.state, "active");
+    // An unowned key (the discard's own lease) still ends.
+    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.other, "discard"));
+    const own = await r.rt.endSourceUse([r.other], { skipFlightOwned: true });
+    assert.deepEqual(own.ended, [r.other]);
+    // And the discard of an owned, unjoined key still ends its own discard lease.
+    r.rt.retireSink(a);
+    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "discard"));
+    const discarded = await r.rt.endSourceUse([r.clone], { skipFlightOwned: true });
+    assert.deepEqual(discarded.ended, [r.clone]);
+    assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), false);
+  });
+
+  it("issue #3638 a timed-out end by another sink does not queue the foreign key for a later drain", async (t) => {
+    const r = await rig(t, { retryMs: 20 });
+    const a = new Set<string>();
+    const b = new Set<string>();
+    await bindIn(r.rt, a, r.clone);
+    const { withAuthorityTransaction } = await import("../src/authority-lock.js");
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const inside = new Promise<void>((resolve) => { entered = resolve; });
+    const holder = withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async () => { entered(); await held; });
+    await inside;
+    const outcome = await r.rt.endSourceUse([r.clone], { sink: b, timeoutMs: 50 });
+    assert.deepEqual(outcome.ended, []);
+    release();
+    await holder;
+    // Give any (wrongly) queued end time to drain.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal((await slotOf(r.rt, r.clone))?.state, "active", "A's slot was not ended by B's timed-out call");
+    assert.equal(r.rt.heldByOtherSink(r.clone, b), true, "A remains the owner");
   });
 
   it("a destructive record is unguarded and never creates an owner", async (t) => {
