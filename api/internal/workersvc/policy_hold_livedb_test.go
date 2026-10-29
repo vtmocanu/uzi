@@ -104,6 +104,11 @@ func TestPolicyHoldAdmissionAndConversionLiveDB(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			id := e.fpSeedRunning(t, wid, 3)
+			if tc.kind == "ci_fix" {
+				// Seed the real excluded lane shape before changing kind, so the
+				// report admission is tested rather than a fixture constraint failure.
+				e.exec(t, "UPDATE runs SET pipeline_id=1,pipeline_ref=$2 WHERE id=$1", id, id.String())
+			}
 			e.exec(t, "UPDATE runs SET status=$2,kind=$3,harness=$4,interactive=$5 WHERE id=$1", id, tc.status, tc.kind, tc.harness, tc.interactive)
 			r := policyHoldFixture()
 			r.SourceGeneration = 3
