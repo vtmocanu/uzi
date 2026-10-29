@@ -1525,6 +1525,14 @@ export class BareCacheShallowError extends Error {
   }
 }
 
+/** A bounded graph is too large to classify, never an operational read failure. */
+class MarkerWrapperGraphLimitError extends Error {}
+
+/** A frozen reused source cannot be reconstructed by wrapping a different object. */
+export class RecoveryCoverageReuseRefused extends Error {
+  constructor() { super("recovery coverage reuse proof unavailable"); }
+}
+
 /** A supervised retained-readiness effect has no positive cleanup proof. */
 export class RetainedReadinessCleanupUnconfirmedError extends Error {
   constructor() { super("retained_readiness_cleanup"); }
@@ -7843,8 +7851,9 @@ export class GitCache {
     // source (freezeInventory appends it to the roots) and the current source (buildRecoveryCoverage
     // adds it), and the two extras can be distinct.
     const MAX_LEAVES = MAX_OWED_CANDIDATES_PER_RUN + 2, MAX_AGGREGATES = 8, MAX_OBJECT_BYTES = 64 * 1024;
-    const fail = (reason?: string): never => {
-      const error = new Error("successor recovery verification failed");
+    const fail = (reason?: string, limit = false): never => {
+      const error = limit ? new MarkerWrapperGraphLimitError("successor recovery verification failed")
+        : new Error("successor recovery verification failed");
       if (reason !== undefined) annotateRetainedSuccessorError(error, reason);
       throw error;
     };
@@ -7877,7 +7886,7 @@ export class GitCache {
       const sha = queue.shift()!;
       if (seen.has(sha)) continue;
       seen.add(sha);
-      if (seen.size > MAX_AGGREGATES + MAX_LEAVES) return fail("wrapper_walk_bound");
+      if (seen.size > MAX_AGGREGATES + MAX_LEAVES) return fail("wrapper_walk_bound", true);
       let commit;
       try { commit = await this.readBoundedCommit(barePath, sha, MAX_OBJECT_BYTES); } catch (err) {
         const abort = this.boundaryAbortError(err);
@@ -7885,8 +7894,8 @@ export class GitCache {
         return fail(err instanceof Error ? "wrapper_commit_read" : undefined);
       }
       if (!commit) {
-        if (sha === tip) return fail("wrapper_tip_bound");
-        if ((await subjectOf(sha, "wrapper_leaf_subject")).startsWith("uzi recovery coverage ")) return fail("wrapper_coverage_leaf_bound");
+        if (sha === tip) return fail("wrapper_tip_bound", true);
+        if ((await subjectOf(sha, "wrapper_leaf_subject")).startsWith("uzi recovery coverage ")) return fail("wrapper_coverage_leaf_bound", true);
         leaves.add(sha);
         continue;
       }
@@ -7897,7 +7906,7 @@ export class GitCache {
         // marker involvement refuses below (defence in depth: the fingerprint/pin checks would too).
         if (commit.message.startsWith("uzi recovery coverage ")) {
           lookalike = true;
-          if (++lookalikes > MAX_AGGREGATES) return fail("wrapper_lookalike_bound");
+          if (++lookalikes > MAX_AGGREGATES) return fail("wrapper_lookalike_bound", true);
           queue.push(...commit.parents);
           continue;
         }
@@ -7905,10 +7914,10 @@ export class GitCache {
         continue;
       }
       aggregates.push({ fp: m[1]!, tree: commit.tree, author: commit.author, committer: commit.committer });
-      if (aggregates.length > MAX_AGGREGATES) return fail("wrapper_aggregate_bound");
+      if (aggregates.length > MAX_AGGREGATES) return fail("wrapper_aggregate_bound", true);
       queue.push(...commit.parents);
     }
-    if (leaves.size > MAX_LEAVES) return fail("wrapper_leaf_bound");
+    if (leaves.size > MAX_LEAVES) return fail("wrapper_leaf_bound", true);
     const markerLeaves = new Set<string>();
     for (const leaf of leaves) if ((await subjectOf(leaf, "wrapper_leaf_subject")).startsWith(WIP_PARK_COMMIT_PREFIX)) markerLeaves.add(leaf);
     return { aggregates, leaves, markerLeaves, srcMarker, lookalike, fail };
@@ -19189,9 +19198,8 @@ try {
       const graph = await this.readMarkerWrapperGraph(barePath, currentSha, undefined);
       return graph !== undefined && !graph.srcMarker && graph.markerLeaves.size === 0;
     } catch (error) {
-      const abort = this.boundaryAbortError(error);
-      if (abort) throw abort;
-      return false;
+      if (error instanceof MarkerWrapperGraphLimitError) return false;
+      throw error;
     }
   }
 
@@ -19222,7 +19230,7 @@ try {
         if (relation !== "ancestor") { reuseCurrent = false; break; }
       }
       if (opts.reuseCoveredCurrent === "required" && !reuseCurrent)
-        throw new Error("recovery coverage reuse proof unavailable");
+        throw new RecoveryCoverageReuseRefused();
       let sha = currentSha;
       if (!reuseCurrent) {
         let parents = [...new Set([...roots, currentSha])].sort();

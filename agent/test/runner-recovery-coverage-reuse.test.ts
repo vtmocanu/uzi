@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { after, before, describe, test } from "node:test";
+import { after, afterEach, before, describe, test } from "node:test";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { GitCache, formatRetainedRecoveryDiagnostic, type PositiveOwedCandidateContext } from "../src/git.js";
 import { RunRunner } from "../src/runner.js";
@@ -29,6 +29,7 @@ for (const legacy of [false, true]) describe(legacy ? "legacy ninth-wrapper owne
   let execute: () => Promise<any>, cleanup: () => Promise<void>, enableReuse: () => void;
   let claim: ReturnType<typeof makeClaim>, bare: string, physicalHead: string;
   let models = 0, healthy = false;
+  let activeRunner: RunRunner | undefined, activeExecution: Promise<void> | undefined;
   const reports: any[] = [], diagnostics: any[] = [], captureSources: string[] = [];
   before(async () => {
     const token = "outage-local-fixture-token";
@@ -117,7 +118,10 @@ for (const legacy of [false, true]) describe(legacy ? "legacy ninth-wrapper owne
       }), log, 20, undefined, { pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, prDescriptionHeadLagMs: 0,
         gitlab: fakeGitlab().gitlab, teardownTestDeps: portableTeardownTestDeps, recovery: coord, recoveryRetryMs: 1,
         checkpointTestHooks: { retryBackoffMs: [0, 0] } });
-      await runner.execute(claim);
+      activeRunner = runner;
+      activeExecution = runner.execute(claim);
+      try { await activeExecution; }
+      finally { activeRunner = undefined; activeExecution = undefined; }
       const states = reports.slice(offset);
       const last = states.filter(r => ["recovery_wait", "failed", "paused", "completed"].includes(r.status)).at(-1);
       if (!healthy) {
@@ -130,18 +134,21 @@ for (const legacy of [false, true]) describe(legacy ? "legacy ninth-wrapper owne
       return { last, states, entries: models - before };
     };
   });
+  afterEach(async () => {
+    const pending = activeExecution;
+    activeRunner?.shutdown();
+    await pending;
+  });
   after(async () => { await cleanup?.(); });
 
   if (!legacy) {
-    for (const [start, end] of [[1, 3], [4, 7], [8, 11]]) test(`generations ${start}-${end} remain adoptable without progress`, async t => {
-      for (let generation = start!; generation <= end!; generation++) {
-        claim.claim_generation = generation;
-        const result = await execute();
-        t.diagnostic(JSON.stringify({ generation, models, cause: result.last?.recovery_cause }));
-        assert.equal(result.last?.status, "recovery_wait");
-        assert.notEqual(result.last?.recovery_cause, "retained_recovery_adoption_failed");
-        if (result.last?.recovery_cause === "retained_recovery_exhausted") claim.worker_recovery_episode!++;
-      }
+    for (let generation = 1; generation <= 11; generation++) test(`generation ${generation} remains adoptable without progress`, async t => {
+      claim.claim_generation = generation;
+      const result = await execute();
+      t.diagnostic(JSON.stringify({ generation, models, cause: result.last?.recovery_cause }));
+      assert.equal(result.last?.status, "recovery_wait");
+      assert.notEqual(result.last?.recovery_cause, "retained_recovery_adoption_failed");
+      if (result.last?.recovery_cause === "retained_recovery_exhausted") claim.worker_recovery_episode!++;
     });
     test("restored provider completes after nine no-progress cycles", async () => {
       assert.equal(models, 9);

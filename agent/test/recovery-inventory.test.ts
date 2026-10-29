@@ -825,7 +825,7 @@ it("review G2 V1 rollback replays a lost held FINAL without exact observations o
   } finally { await f.close(); }
 });
 
-for (const representation of ["legacy", "reused", "failed-reuse", "rollback"] as const) {
+for (const representation of ["legacy", "reused", "failed-reuse", "rollback", "abort", "io"] as const) {
   it(`coverage reuse ${representation}: frozen re-proof preserves FINAL compatibility`, async t => {
     const f = await fixture();
     try {
@@ -861,6 +861,17 @@ for (const representation of ["legacy", "reused", "failed-reuse", "rollback"] as
       const pin = `refs/uzi-coverage/${f.context.runId}/${f.context.generation}/${digest}`;
       for (const ref of git(["for-each-ref", "--format=%(refname)", "refs/uzi-coverage/"]).split("\n"))
         git(["update-ref", "-d", ref]);
+      if (representation === "abort" || representation === "io") {
+        git(["update-ref", pin, source]);
+        const failure = representation === "abort" ? new DOMException("cancelled", "AbortError") :
+          Object.assign(new Error("object read failed"), { code: "EIO" });
+        t.mock.method(cache as unknown as { readMarkerWrapperGraph(): Promise<unknown> }, "readMarkerWrapperGraph",
+          async () => { throw failure; });
+        await assert.rejects(f.coordinator["frozenCoverageProven"](record), error => error === failure);
+        assert.equal(git(["rev-parse", pin]), source, "operational failures do not mutate the frozen pin");
+        assert.equal(f.finals.length, 0);
+        return;
+      }
       if (representation === "failed-reuse") {
         git(["update-ref", pin, source]);
         t.mock.method(cache as unknown as { reusableRecoveryCoverage(): Promise<boolean> }, "reusableRecoveryCoverage", async () => false);

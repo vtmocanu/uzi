@@ -59,7 +59,7 @@ import type {
   RecoveryUploadManifest,
   RunKind,
 } from "./protocol.js";
-import { readRecoveryBundleHeader, RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidate, type RecoveryCoverage, type RecoveryCoverageClaim, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
+import { readRecoveryBundleHeader, RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, RecoveryCoverageReuseRefused, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidate, type RecoveryCoverage, type RecoveryCoverageClaim, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
 
 /** Ephemeral execution metadata only; never custody or production admission authority. */
 export type ClosedSourceObservation = Readonly<{
@@ -2100,17 +2100,17 @@ export class RecoveryCoordinator {
       const roots = [...new Set([...frozenRoots.map(c => c.sha), record.originalSourceSha])].sort();
       // Use the producer's full proof. Optional archive-redundancy claims impose
       // smaller head/body/encoding limits that cannot become FINAL eligibility limits.
-      // The old producer always added a parented object. Equality identifies a reused
-      // source without a new journal field; legacy records must rebuild byte-for-byte.
-      const reused = record.sourceSha === record.inventoryCurrentSha;
+      // Nonempty legacy coverage always added a parented object. Equality identifies
+      // reuse, excluding settled-empty records, without changing the journal schema.
+      const reused = record.coverageDigest !== EMPTY_INVENTORY_DIGEST && record.sourceSha === record.inventoryCurrentSha;
       let coverage: RecoveryCoverage;
       try {
         coverage = await ownedRecoveryIO(() => this.git.buildRecoveryCoverage!(record.coverageContext!.barePath, record.coverageContext!,
           roots, record.inventoryCurrentSha!, reused ? { reuseCoveredCurrent: "required" } : {}));
       } catch (error) {
         MaintenanceBudget.current()?.check();
-        if (!reused) throw error;
-        return false;
+        if (reused && error instanceof RecoveryCoverageReuseRefused) return false;
+        throw error;
       }
       if (coverage.sha !== record.sourceSha || coverage.fingerprint !== record.coverageDigest) return false;
     }
