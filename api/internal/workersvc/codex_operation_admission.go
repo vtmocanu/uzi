@@ -182,6 +182,11 @@ func parseActiveCooldown(raw json.RawMessage) *CodexOperationIdentity {
 	return &operation
 }
 
+// applyActiveCooldown is optional display projection after custody validation.
+// applyWorkerActiveSnapshot holds the accepted run locks and isolates this read
+// and write in WithWorkerActiveCooldownSavepoint: projection failure cannot abort
+// valid custody except on savepoint management failure, when the outer tx may
+// be unusable.
 func applyActiveCooldown(ctx context.Context, q *store.Queries, worker store.Worker, e validatedEntry) error {
 	params := store.SetWorkerActiveCooldownParams{WorkerID: worker.ID, RunID: e.runID}
 	if e.cooldown != nil && e.claimGeneration > 0 && !e.terminalPending {

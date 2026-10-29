@@ -499,8 +499,10 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 		if err != nil {
 			return false, err
 		}
-		if rows > 0 {
-			if err := applyActiveCooldown(ctx, qtx, wkr, e); err != nil {
+		if rows > 0 && e.cooldown != nil && e.claimGeneration > 0 && !e.terminalPending {
+			if err := qtx.WithWorkerActiveCooldownSavepoint(ctx, func(q *store.Queries) error {
+				return applyActiveCooldown(ctx, q, wkr, e)
+			}); err != nil {
 				return false, err
 			}
 		}
