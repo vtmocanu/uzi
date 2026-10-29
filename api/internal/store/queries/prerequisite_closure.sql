@@ -62,7 +62,6 @@ ORDER BY next_attempt_at,id LIMIT @lim::int;
 SELECT * FROM recovery_prerequisite_closures
 WHERE state='pinned' AND next_attempt_at<= @due_at::timestamptz
     AND (next_attempt_at,id) > (@after_due_at::timestamptz,@after_id::uuid)
-AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id=capture_id AND c.state IN ('expired','discarded'))
 ORDER BY next_attempt_at,id LIMIT @lim::int;
 
 -- name: ListPrerequisiteAuditDue :many
@@ -274,12 +273,15 @@ WHERE p.id = @id AND p.state='pinned' AND p.cleanup_attempts = @generation::int
 -- Failed/positive listing without a delete (including exhausted rows): bounded
 -- backoff, without resetting or spending a delete attempt.
 UPDATE recovery_prerequisite_closures p
-SET next_attempt_at=now()+make_interval(secs => LEAST(3600,30*(1<<cleanup_attempts))),
+SET next_attempt_at=CASE WHEN EXISTS (SELECT 1 FROM recovery_captures c
+        WHERE c.id=p.capture_id AND c.state IN ('expired','discarded'))
+        THEN now()+make_interval(secs => LEAST(3600,30*(1<<cleanup_attempts))) ELSE p.next_attempt_at END,
+    audit_next_at=CASE WHEN p.absent_since IS NOT NULL THEN now()+interval '10 minutes'
+        ELSE p.audit_next_at END,
     last_error=left(@last_error::text,512),updated_at=now()
 WHERE p.id = @id AND p.state='pinned' AND p.cleanup_attempts = @generation::int
-    AND p.last_audit_pass_id = @pass_id AND p.next_attempt_at<=now()
-    AND (p.cleanup_deadline IS NULL OR p.cleanup_deadline<=now())
-    AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id=p.capture_id AND c.state IN ('expired','discarded'));
+    AND p.last_audit_pass_id = @pass_id
+    AND (p.cleanup_deadline IS NULL OR p.cleanup_deadline<=now());
 
 -- name: DeferPrerequisitePreparation :execrows
 -- Before S1 only: no slot/full-item budget means no attempt and no terminal refusal.

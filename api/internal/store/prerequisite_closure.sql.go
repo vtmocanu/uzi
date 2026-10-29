@@ -142,12 +142,15 @@ func (q *Queries) CountLivePrerequisiteClosuresForRun(ctx context.Context, arg C
 
 const deferPrerequisiteCleanupListing = `-- name: DeferPrerequisiteCleanupListing :execrows
 UPDATE recovery_prerequisite_closures p
-SET next_attempt_at=now()+make_interval(secs => LEAST(3600,30*(1<<cleanup_attempts))),
+SET next_attempt_at=CASE WHEN EXISTS (SELECT 1 FROM recovery_captures c
+        WHERE c.id=p.capture_id AND c.state IN ('expired','discarded'))
+        THEN now()+make_interval(secs => LEAST(3600,30*(1<<cleanup_attempts))) ELSE p.next_attempt_at END,
+    audit_next_at=CASE WHEN p.absent_since IS NOT NULL THEN now()+interval '10 minutes'
+        ELSE p.audit_next_at END,
     last_error=left($1::text,512),updated_at=now()
 WHERE p.id = $2 AND p.state='pinned' AND p.cleanup_attempts = $3::int
-    AND p.last_audit_pass_id = $4 AND p.next_attempt_at<=now()
+    AND p.last_audit_pass_id = $4
     AND (p.cleanup_deadline IS NULL OR p.cleanup_deadline<=now())
-    AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id=p.capture_id AND c.state IN ('expired','discarded'))
 `
 
 type DeferPrerequisiteCleanupListingParams struct {
@@ -459,7 +462,6 @@ const listPrerequisiteCleanupDue = `-- name: ListPrerequisiteCleanupDue :many
 SELECT id, capture_id, hold_id, run_id, user_id, repo_id, live_run_id, checksum, prerequisite_shas, pin_ref, state, reason, last_error, attempts, reconciliation_attempts, next_attempt_at, attempt_deadline, invoked_at, invoked_deadline, pin_tip, connection_id, forge_kind, normalized_base_url, project_id, default_branch, cleanup_attempts, cleanup_deadline, cleanup_exhausted_at, absent_since, absence_pass_id, audit_next_at, last_audit_pass_id, created_at, updated_at FROM recovery_prerequisite_closures
 WHERE state='pinned' AND next_attempt_at<= $1::timestamptz
     AND (next_attempt_at,id) > ($2::timestamptz,$3::uuid)
-AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id=capture_id AND c.state IN ('expired','discarded'))
 ORDER BY next_attempt_at,id LIMIT $4::int
 `
 

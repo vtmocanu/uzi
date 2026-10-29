@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
@@ -65,7 +66,7 @@ var ErrPrereqCreateUnknown = errors.New("pushbroker: prerequisite create outcome
 // PreparePrereqCreate observes default D and target absence in ONE bounded advertisement.
 // It sends nothing. A preexisting target is an error even when it already points at D.
 func PreparePrereqCreate(ctx context.Context, o PrereqCreateOptions) (*PreparedPrereqCreate, error) {
-	ctx, cancel := context.WithTimeout(ctx, maxCreateRefDuration)
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 	ref := PrereqRef(o.CaptureID)
 	source := "refs/heads/" + o.DefaultBranch
@@ -100,13 +101,18 @@ func SendPrereqCreate(ctx context.Context, p *PreparedPrereqCreate) (PrereqCreat
 	defer cancel()
 	auth := authFor(Options{Username: p.o.Username, PAT: p.o.PAT})
 	raw := &rawReport{ref: p.ref}
-	sess, ar, err := openPrereqReceive(ctx, p.o.CloneURL, auth, raw)
+	sendCtx, sendCancel := context.WithTimeout(ctx, time.Second)
+	defer sendCancel()
+	sess, ar, err := openPrereqReceive(sendCtx, p.o.CloneURL, auth, raw)
 	if err != nil {
 		return PrereqCreateUnknown, err
 	}
-	res, pushErr := receiveObservedPack(ctx, sess, createRefRequest(ar.Capabilities, plumbing.ReferenceName(p.ref), p.tip, emptyPack()), raw)
+	res, pushErr := receiveObservedPack(sendCtx, sess, createRefRequest(ar.Capabilities, plumbing.ReferenceName(p.ref), p.tip, emptyPack()), raw)
 	pushErr = errors.Join(pushErr, sess.Close())
-	tips, listErr := boundedRefTips(ctx, p.o.CloneURL, auth, map[plumbing.ReferenceName]bool{plumbing.ReferenceName(p.ref): true})
+	sendCancel()
+	readCtx, readCancel := context.WithTimeout(ctx, time.Second)
+	defer readCancel()
+	tips, listErr := boundedRefTips(readCtx, p.o.CloneURL, auth, map[plumbing.ReferenceName]bool{plumbing.ReferenceName(p.ref): true})
 	if listErr != nil {
 		return PrereqCreateUnknown, errors.Join(ErrPrereqCreateUnknown, pushErr, listErr)
 	}
@@ -180,7 +186,9 @@ func deletePrereq(ctx context.Context, o DeleteOptions) error {
 	}
 	auth := authFor(Options{Username: o.Username, PAT: o.PAT})
 	want := map[plumbing.ReferenceName]bool{plumbing.ReferenceName(o.Ref): true}
-	tips, err := boundedRefTips(ctx, o.CloneURL, auth, want)
+	listCtx, listCancel := context.WithTimeout(ctx, time.Second)
+	tips, err := boundedRefTips(listCtx, o.CloneURL, auth, want)
+	listCancel()
 	if err != nil {
 		return err
 	}
@@ -191,15 +199,21 @@ func deletePrereq(ctx context.Context, o DeleteOptions) error {
 		return nil
 	}
 	raw := &rawReport{ref: o.Ref}
-	sess, ar, err := openPrereqReceive(ctx, o.CloneURL, auth, raw)
+	receiveCtx, receiveCancel := context.WithTimeout(ctx, time.Second)
+	sess, ar, err := openPrereqReceive(receiveCtx, o.CloneURL, auth, raw)
+	receiveCancel()
 	if err != nil {
 		return err
 	}
 	req := packp.NewReferenceUpdateRequestFromCapabilities(ar.Capabilities)
 	req.Commands = []*packp.Command{{Name: plumbing.ReferenceName(o.Ref), Old: plumbing.NewHash(o.ExpectedOldTip), New: plumbing.ZeroHash}}
-	_, pushErr := receiveObservedPack(ctx, sess, req, raw)
+	sendCtx, sendCancel := context.WithTimeout(ctx, time.Second)
+	_, pushErr := receiveObservedPack(sendCtx, sess, req, raw)
+	sendCancel()
 	pushErr = errors.Join(pushErr, sess.Close())
-	tips, err = boundedRefTips(ctx, o.CloneURL, auth, want)
+	readCtx, readCancel := context.WithTimeout(ctx, time.Second)
+	tips, err = boundedRefTips(readCtx, o.CloneURL, auth, want)
+	readCancel()
 	if err != nil {
 		return errors.Join(pushErr, err)
 	}
