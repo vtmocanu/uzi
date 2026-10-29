@@ -7,7 +7,7 @@ import { startSweepWorker, sweepClient, pollUntil } from "./worker-sweep-rig.js"
 import { WorkerClient } from "../src/client.js";
 import { Outbox, type RawWriteSeam } from "../src/outbox.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
-import { makeTerminalOutboxDeps, resolvePendingTerminal, type TerminalOutboxDeps } from "../src/terminal-resolve.js";
+import { journalAndResolveTerminal, makeTerminalOutboxDeps, resolvePendingTerminal, type TerminalOutboxDeps } from "../src/terminal-resolve.js";
 import { validatePolicyHoldRequest, decodePolicyHoldReply, type PolicyHoldRequest, type PolicyHoldReply } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 
@@ -392,3 +392,26 @@ it("physical decoding cannot bypass aggregate run/total budgets on journals adde
     assert.equal(await o.hasPendingPolicyOutcome(run), true, scope + " aggregate budget must retain uncertainty");
   }
 });
+
+for (const kind of ["policy_hold", "unknown"] as const) {
+  it("disabled store cannot send an ordinary terminal over a retained " + kind + " winner", async t => {
+    const f = await fixture(t);
+    await fs.writeFile(path.join(f.root, ".key"), "invalid");
+    const outbox = new Outbox({ root: f.root, log: nullLogger(),
+      runMaxBytes: kind === "unknown" ? 1 : 1e6, maxBytes: kind === "unknown" ? 1 : 4e6, retentionMs: 86400000 });
+    await outbox.init();
+    assert.equal(outbox.isDisabled(), true);
+    assert.equal((await outbox.journalPolicyHold(run, original)).journaled, false);
+    const before = outbox.listPendingTerminals();
+    assert.equal(before[0]?.outcome_kind, kind);
+    let sends = 0;
+    await journalAndResolveTerminal(deps(outbox, async () => { throw new Error("no durable policy send"); }), {
+      ...args, phase: "implementation", messagesThroughSeq: 0, body: { status: "failed" },
+      send: async () => { sends++; return { applied: true, status: "failed" }; },
+    });
+    assert.equal(sends, 0, "an unavailable journal cannot authorize a competing terminal");
+    assert.deepEqual(outbox.listPendingTerminals(), before);
+    const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 4);
+    assert.equal(registry.build().active[0]?.terminal_pending, true);
+  });
+}

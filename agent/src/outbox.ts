@@ -1455,13 +1455,16 @@ export class Outbox {
       if (policy.source_generation !== claimGeneration || policy.claim_generation !== claimGeneration) throw new Error("policy source generation mismatch");
       canonicalBody = policy as unknown as Record<string, unknown>;
     }
-    if (this.disabled && outcomeKind !== "policy_hold") {
-      this.writable();
-      return { journaled: false, reason: "reserve_exhausted" };
-    }
     return this.withRunLock(runId, async () => {
       if (!this.validRunId(runId) || !Number.isSafeInteger(claimGeneration) || claimGeneration < 0) return { journaled: false, reason: "reserve_exhausted" };
       const selected = this.runs.get(runId)?.terminals.get(claimGeneration);
+      if (this.disabled && outcomeKind !== "policy_hold") {
+        // Arbitrate under the same run lock before legacy unjournaled fallback.
+        // An unreadable first writer or exhausted policy inventory is not absence.
+        if (selected || this.policyMetadataExhausted) return { journaled: false, reason: "winner_unavailable" };
+        this.writable();
+        return { journaled: false, reason: "reserve_exhausted" };
+      }
       if (selected?.unpersistedPolicy && outcomeKind === "policy_hold") canonicalBody = selected.unpersistedPolicy as unknown as Record<string, unknown>;
       if (outcomeKind === "policy_hold" && !selected) {
         const bytes = Buffer.byteLength(JSON.stringify(canonicalBody));
