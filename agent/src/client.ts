@@ -2077,7 +2077,10 @@ export class WorkerClient {
     if (!isRecord(claim) || !isRecord(claim.config) || !Object.hasOwn(claim.config, "default_effort")) return;
     if (isHarnessEffort(claim.config.default_effort)) return;
     delete claim.config.default_effort;
-    this.log.warn("claim default_effort outside the closed effort set; dropped", {});
+    this.log.warn("claim default_effort outside the closed effort set; dropped", {
+      run_id: claim.run_id,
+      kind: claim.kind,
+    });
   }
 
   /**

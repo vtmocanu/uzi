@@ -182,12 +182,12 @@ func TestSettingsGetCodexEffortRuntimeDefaultRow(t *testing.T) {
 }
 
 func TestSettingsGetEffortRowsHostile(t *testing.T) {
-	hostile := "evil\x1b]8;;https://evil.example\x07link\x1b]8;;\x07‮" + strings.Repeat("x", 10000)
+	hostile := "evil\x1b]8;;https://evil.example\x07link\x1b]8;;\x07\u202e" + strings.Repeat("x", 10000)
 	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{EffortSettings: []apitypes.EffortSettingCellDTO{
 		{Harness: hostile, Effort: &hostile, DefaultEffort: hostile, ResolvedEffort: &hostile, Source: "from_the_future", Mode: hostile},
 	}}}
 	out, _, code := runCLI(t, fakeEnv(fc), "settings", "get")
-	if code != 0 || strings.ContainsAny(out, "\x1b\x07‮") || strings.Contains(out, strings.Repeat("x", 201)) ||
+	if code != 0 || strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Contains(out, strings.Repeat("x", 201)) ||
 		!strings.Contains(out, "unknown") {
 		t.Fatalf("unsafe or unlabelled output: exit %d %q", code, out)
 	}

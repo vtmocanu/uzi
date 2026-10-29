@@ -60,12 +60,14 @@ func effortSettingRows(cells []apitypes.EffortSettingCellDTO) []settingRow {
 	for _, c := range cells[:min(len(cells), 2)] {
 		resolved := ""
 		switch {
+		case c.Mode == "runtime_default" && c.Harness == "claude":
+			resolved = "runtime default (value not reported)"
+		case c.Mode == "runtime_default":
+			resolved = "runtime default"
 		case c.ResolvedEffort != nil:
 			resolved = *c.ResolvedEffort
-		case c.Harness == "claude":
-			resolved = "runtime default (value not reported)"
 		default:
-			resolved = "runtime default"
+			resolved = "unknown"
 		}
 		rows = append(rows, settingRow{
 			Setting: "effort", Harness: c.Harness, Stored: c.Effort,

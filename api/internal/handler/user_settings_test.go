@@ -884,7 +884,7 @@ func decodeEffort(t *testing.T, body []byte) *string {
 // PRD #617 M2: the per-user default_effort mirrors default_model — set, clear
 // (blank ⇒ NULL/inherit, and literal null ⇒ NULL/inherit), reject an off-enum
 // value, and GET reflects the stored value. Validation goes through the
-// closed-enum validateEffort, so only the five SDK levels are accepted.
+// closed-enum validateDefaultEffort, so only the five SDK levels or `runtime` are accepted.
 
 func TestPutMySettingsEffortRoundTrip(t *testing.T) {
 	db := &fakeSettingsDB{}

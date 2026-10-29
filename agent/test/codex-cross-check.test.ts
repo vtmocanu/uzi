@@ -450,6 +450,12 @@ for (const effort of ["", "minimal", "XHIGH", " xhigh", "xhigh ", "unknown"]) {
   assert.equal(r.releases, 0); assert.equal(r.specs.length, 0); assert.equal(r.requests.length, 0);
  });
 }
+it("refuses a pinned claim whose default_effort is absent (dropped at decode)", async () => {
+ const c = pinnedClaim(); delete c.config!.default_effort;
+ const r = rig({ claim: c });
+ await assert.rejects(r.run(), CrossCheckCheckerUnavailableError);
+ assert.equal(r.releases, 0); assert.equal(r.specs.length, 0); assert.equal(r.requests.length, 0);
+});
 for (const effort of ["low", "medium", "high", "xhigh", "max"] as const) {
  it("passes pinned effort unchanged: " + effort, async () => {
   const c = pinnedClaim(); c.config!.default_effort = effort;

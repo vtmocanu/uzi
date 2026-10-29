@@ -64,10 +64,35 @@ func readEffortDefaults(t *testing.T) effortDefaultsFixture {
 	return f
 }
 
+// markCase records a fixture case ID as exercised and fails on an empty or duplicate ID.
+func markCase(t *testing.T, seen map[string]bool, id string) {
+	t.Helper()
+	if id == "" || seen[id] {
+		t.Fatalf("fixture case ID %q is empty or duplicated", id)
+	}
+	seen[id] = true
+}
+
+// assertExercised fails unless the exercised IDs are exactly the fixture's IDs.
+func assertExercised(t *testing.T, want []string, seen map[string]bool) {
+	t.Helper()
+	for _, id := range want {
+		if !seen[id] {
+			t.Errorf("fixture case %q was not exercised", id)
+		}
+	}
+	if len(seen) != len(want) {
+		t.Errorf("exercised %d case IDs, fixture has %d", len(seen), len(want))
+	}
+}
+
 func TestEffortDefaultsFixtureOrdinary(t *testing.T) {
 	f := readEffortDefaults(t)
-	ran := 0
+	seen := map[string]bool{}
+	var ids []string
 	for _, c := range f.Ordinary {
+		markCase(t, seen, c.ID)
+		ids = append(ids, c.ID)
 		r := agenttmpl.ResolveHarnessEffort(c.Harness, c.Stored)
 		if r.Mode != c.Expect.Mode || r.Source != c.Expect.Source {
 			t.Errorf("%s: resolution = %+v, want mode %s source %s", c.ID, r, c.Expect.Mode, c.Expect.Source)
@@ -94,17 +119,17 @@ func TestEffortDefaultsFixtureOrdinary(t *testing.T) {
 			!reflect.DeepEqual(cell.ResolvedEffort, c.Expect.ResolvedEffort) || !reflect.DeepEqual(cell.Effort, c.Stored) {
 			t.Errorf("%s: cell = %+v", c.ID, cell)
 		}
-		ran++
 	}
-	if ran != len(f.Ordinary) {
-		t.Fatalf("ran %d of %d ordinary cases", ran, len(f.Ordinary))
-	}
+	assertExercised(t, ids, seen)
 }
 
 func TestEffortDefaultsFixtureValidators(t *testing.T) {
 	f := readEffortDefaults(t)
-	ran := 0
+	seen := map[string]bool{}
+	var ids []string
 	for _, c := range f.Validators {
+		markCase(t, seen, c.ID)
+		ids = append(ids, c.ID)
 		input := c.Input
 		got, err := validateDefaultEffort(&input)
 		if c.Accepted != (err == nil) {
@@ -119,19 +144,19 @@ func TestEffortDefaultsFixtureValidators(t *testing.T) {
 				t.Errorf("%s: stored = %+v, want %+v", c.ID, got, want)
 			}
 		}
-		ran++
 	}
-	if ran != len(f.Validators) {
-		t.Fatalf("ran %d of %d validator cases", ran, len(f.Validators))
-	}
+	assertExercised(t, ids, seen)
 }
 
 // The checker cases document that ordinary effort is not an input of the checker
 // resolver: ResolveCrossCheck takes only the pin.
 func TestEffortDefaultsFixtureChecker(t *testing.T) {
 	f := readEffortDefaults(t)
-	ran := 0
+	seen := map[string]bool{}
+	var ids []string
 	for _, c := range f.Checker {
+		markCase(t, seen, c.ID)
+		ids = append(ids, c.ID)
 		r := agenttmpl.ResolveCrossCheck(c.Family, nil, c.Pin, nil, nil)
 		if r.Effort != c.Expect.Effort || r.EffortSource != c.Expect.Source {
 			t.Errorf("%s: checker = %q/%q, want %q/%q", c.ID, r.Effort, r.EffortSource, c.Expect.Effort, c.Expect.Source)
@@ -139,11 +164,8 @@ func TestEffortDefaultsFixtureChecker(t *testing.T) {
 		if c.Pin == nil && r.EffortSource != agenttmpl.CrossCheckDefaultSource {
 			t.Errorf("%s: unpinned source = %q", c.ID, r.EffortSource)
 		}
-		ran++
 	}
-	if ran != len(f.Checker) {
-		t.Fatalf("ran %d of %d checker cases", ran, len(f.Checker))
-	}
+	assertExercised(t, ids, seen)
 }
 
 func TestSettingsRuntimeEffortRoundTrip(t *testing.T) {

@@ -12,9 +12,16 @@ import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 // Type-only (erased at runtime): the sanitized-fields class lives beside the decoders that mint it.
 import type { SanitizedPrDescriptionFields } from "./client.js";
 import type { SemanticGateAck } from "./semantic-gate-wire.js";
+import type { HarnessEffort } from "./harness.js";
 
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
+
+/** Compile-time two-way tie between the SDK's EffortLevel and HARNESS_EFFORTS: resolves to
+ *  EffortLevel while the sets are equal, and to `never` (breaking every use) when either side drifts. */
+type SdkAlignedEffort = [EffortLevel] extends [HarnessEffort]
+  ? [HarnessEffort] extends [EffortLevel] ? EffortLevel : never
+  : never;
 
 /** Fresh, worker-only authority for one refresh candidate. */
 export interface PublicationContextRequest {
@@ -1003,7 +1010,7 @@ export interface ClaimConfig {
    *  the SDK's own EffortLevel so the worker tracks the SDK's closed set (mirror of the
    *  Go `agenttmpl.EffortLevels` and the web EffortSelect list — no shared source, keep
    *  in lockstep). */
-  default_effort?: EffortLevel;
+  default_effort?: SdkAlignedEffort;
   /** The run owner's AI-attribution opt-out (issue #916), read live per claim. When
    *  false, the worker suppresses the Agent SDK's Co-Authored-By: Claude commit trailer
    *  for this run. Always sent by an upgraded server (NOT null); absent on an older
@@ -1970,7 +1977,7 @@ export interface ChatClaimConfig {
   /** The owner's per-user default reasoning effort (PRD #617); the API populates it
    *  with the owner's choice or the uzi default `medium` (issue #1157), and it is
    *  optional only for an un-upgraded API. */
-  default_effort?: EffortLevel;
+  default_effort?: SdkAlignedEffort;
 }
 
 // ── Chat agent read surface (PRD #39 M3, Decision 7) ─────────────────────────

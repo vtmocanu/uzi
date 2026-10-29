@@ -113,7 +113,7 @@ func TestCheckerEffortIndependentOfOrdinaryPreferenceLiveDB(t *testing.T) {
 		name          string
 		claude, codex any
 	}
-	prefs := []pref{{"runtime", "runtime", "runtime"}, {"null", nil, nil}, {"low", "low", "low"}}
+	prefs := []pref{{"runtime", "runtime", "runtime"}, {"null", nil, nil}, {"low", "low", "low"}, {"corrupt", "ultra", "ultra"}}
 	pins := []struct {
 		name   string
 		effort any

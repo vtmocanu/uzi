@@ -472,6 +472,11 @@ describe("job SDK options: the effective tool surface (PRD #1908 M4)", () => {
   it("sets no effort key when no effort is passed, and carries an explicit one", () => {
     assert.ok(!("effort" in build()), "no default_effort, no effort option");
     const rs = buildJobResultServer({});
+    const explicitUndefined = buildJobSdkOptions({
+      env: {}, systemPrompt: "s", workDir: "/data/jobs/run/work", log, secretPaths: [],
+      resultServer: rs.server, toolNames: rs.toolNames, effort: undefined,
+    });
+    assert.ok(!Object.hasOwn(explicitUndefined, "effort"), "an explicit undefined effort sets no own effort key");
     const withEffort = buildJobSdkOptions({
       env: {}, systemPrompt: "s", workDir: "/data/jobs/run/work", log, secretPaths: [],
       resultServer: rs.server, toolNames: rs.toolNames, effort: "high",
