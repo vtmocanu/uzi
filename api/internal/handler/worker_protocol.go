@@ -770,12 +770,14 @@ func parseWorkerOutbox(raw json.RawMessage, workerID uuid.UUID) []workersvc.Outb
 	out := make([]workersvc.OutboxEntry, 0, len(rawItems))
 	for _, rawItem := range rawItems {
 		var it struct {
-			RunID           string       `json:"run_id"`
-			PendingMessages *json.Number `json:"pending_messages"`
-			PendingTerminal *json.Number `json:"pending_terminal"`
-			StaleRetired    *json.Number `json:"stale_retired"`
-			BlockedReason   string       `json:"blocked_reason"`
-			Since           *json.Number `json:"since"`
+			RunID                         string          `json:"run_id"`
+			PendingMessages               *json.Number    `json:"pending_messages"`
+			PendingTerminal               *json.Number    `json:"pending_terminal"`
+			StaleRetired                  *json.Number    `json:"stale_retired"`
+			BlockedReason                 string          `json:"blocked_reason"`
+			Since                         *json.Number    `json:"since"`
+			PolicyPendingOutcomeID        json.RawMessage `json:"policy_pending_outcome_id"`
+			PolicyPendingSourceGeneration json.RawMessage `json:"policy_pending_source_generation"`
 		}
 		if err := json.Unmarshal(rawItem, &it); err != nil {
 			continue // wrong-typed entry → drop only this entry
@@ -800,7 +802,22 @@ func parseWorkerOutbox(raw json.RawMessage, workerID uuid.UUID) []workersvc.Outb
 		if !ok {
 			continue
 		}
+		// Bad optional evidence drops only those facts, never the ordinary depth.
+		var policyID string
+		var policyGeneration int64
+		var policyUUID uuid.UUID
+		if json.Unmarshal(it.PolicyPendingOutcomeID, &policyID) == nil &&
+			json.Unmarshal(it.PolicyPendingSourceGeneration, &policyGeneration) == nil &&
+			policyGeneration > 0 && policyGeneration <= (1<<53)-1 {
+			if parsed, err := uuid.Parse(policyID); err == nil && parsed != uuid.Nil && parsed.String() == policyID {
+				policyUUID = parsed
+			}
+		}
+		if policyUUID == uuid.Nil {
+			policyGeneration = 0
+		}
 		out = append(out, workersvc.OutboxEntry{
+			PolicyPendingOutcomeID: policyUUID, PolicyPendingSourceGeneration: policyGeneration,
 			RunID:           id,
 			PendingMessages: pm,
 			PendingTerminal: pt,

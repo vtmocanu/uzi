@@ -2,6 +2,9 @@ package apitypes
 
 import "time"
 
+// OutcomePendingPolicyHold is server-classified delivery telemetry, never a stored hold reason.
+const OutcomePendingPolicyHold = "codex_policy_hold_pending"
+
 // PolicyHoldDTO describes the row-local preserving constraint and the latest
 // applied episode. Published is worker-reported provenance, not server capture
 // verification. Capture identity/durability remain the existing run fields.
@@ -19,4 +22,6 @@ type PolicyHoldDTO struct {
 	Phase              *string    `json:"phase"`
 	CorrelationID      *string    `json:"correlation_id"`
 	Published          *bool      `json:"published"`
+	// Current unresolved hold only; later ordinary capture cannot rewrite policy history.
+	CapturedHead *string `json:"captured_head"`
 }

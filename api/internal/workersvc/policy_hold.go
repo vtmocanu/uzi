@@ -142,6 +142,27 @@ func (r PolicyHoldRequest) Validate() error {
 	return nil
 }
 
+// RunPolicyOutcomePending is display-only worker telemetry. A stale/foreign
+// reporter or a positively applied/newer episode cannot turn history into a hold.
+func (s *Service) RunPolicyOutcomePending(r store.Run) bool {
+	if slices.Contains([]string{"completed", "failed", "cancelled"}, r.Status) {
+		return false
+	}
+	entry, reporter, found := s.outbox.runDepth(r.ID)
+	if !found || !r.WorkerID.Valid || uuid.UUID(r.WorkerID.Bytes) != reporter ||
+		entry.PolicyPendingOutcomeID == uuid.Nil || entry.PolicyPendingSourceGeneration <= 0 {
+		return false
+	}
+	if r.PolicyOutcomeID.Valid && uuid.UUID(r.PolicyOutcomeID.Bytes) == entry.PolicyPendingOutcomeID &&
+		r.PolicySourceGeneration.Valid && r.PolicySourceGeneration.Int64 == entry.PolicyPendingSourceGeneration {
+		return false
+	}
+	if r.PolicyApplyingGeneration.Valid && r.PolicyApplyingGeneration.Int64 > entry.PolicyPendingSourceGeneration {
+		return false
+	}
+	return true
+}
+
 func activePolicyHold(r store.Run) bool {
 	return r.PolicyPreserveRequired || r.PolicyPendingFresh ||
 		(r.PolicyOutcomeID.Valid && !r.PolicyResolvedAt.Valid)

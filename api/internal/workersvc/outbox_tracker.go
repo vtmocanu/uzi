@@ -47,7 +47,10 @@ type OutboxEntry struct {
 	// re-claim forced this worker to retire locally (D11).
 	PendingMessages int
 	PendingTerminal int
-	StaleRetired    int
+	// Optional, bounded presentation evidence; never claim, health or consent authority.
+	PolicyPendingOutcomeID        uuid.UUID
+	PolicyPendingSourceGeneration int64
+	StaleRetired                  int
 	// BlockedReason is the oldest permanent-refusal reason on this run's outbox, or
 	// "" when nothing is blocked (never set in Run A; forward-compat for Run B's
 	// blocked terminal journals).
