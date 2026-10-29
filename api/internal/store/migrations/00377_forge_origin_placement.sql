@@ -101,7 +101,9 @@ $$;
 
 -- A forge-failing custodian keeps its ordinary pin unless the complete guarded
 -- history proves cold placement safe. Unknown origin or legacy history never
--- creates a new affinity exemption.
+-- creates a new affinity exemption. Expiry permits a trial, not renewed exclusive
+-- affinity: a still-present cooldown remains unverified until positive clearing.
+-- evaluated_at retains the shared placement-helper signature; time cannot prove health.
 -- +goose StatementBegin
 CREATE FUNCTION fn_forge_origin_owner_pins(w workers, r runs, evaluated_at timestamptz)
 RETURNS boolean LANGUAGE sql STABLE AS $$
@@ -109,7 +111,6 @@ SELECT NOT (
     EXISTS (SELECT 1 FROM authorized_forge_origins a JOIN forge_origin_cooldowns c
             ON c.user_id = a.user_id AND c.origin = a.origin AND c.worker_id = w.id
             WHERE a.repo_id = r.repo_id AND a.user_id = r.user_id)
-    AND NOT fn_forge_origin_eligible(w,r,evaluated_at)
     AND fn_forge_source_history_safe(r)
 )
 $$;
