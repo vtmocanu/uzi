@@ -343,7 +343,7 @@ Additional verification: actual initializer execution under a held EX must log n
 - `containerd-runc` (M0): containerd 2.3.4, runc 1.5.1, kubelet 1.37.1 read.
 - `crio-crun` (CRI-O audit):
   - CRI-O **1.36.2** with `runtime_type` `oci` (classic conmon) and crun as the default handler;
-  - **crun 1.30.1** (namespace creation and state output were read only at that tag);
+  - **crun 1.28 or 1.30.1** (namespace creation and state output were read at both tags; intervening versions are not included);
   - conmon v2.1.10 to v2.2.1;
   - kubelet 1.35.3 read;
   - no namespace-adjusting NRI plugin (an unsupported configuration).
@@ -435,7 +435,8 @@ A linked `acceptance` issue, owned by the user, covers:
 | 2026-10-24 | Handoff on S's pod annotation only; no PVC persist. | A second PVC writer conflicts with `mirrorRoll`'s resourceVersion-guarded `annotationRoll`; the pod annotation is durable enough. | Persisting on the PVC. |
 | 2026-10-24 | A single-session watch, stream-ordered, counting claim-mounting pods, with ReplicaSet ancestry and a DinD-recycle binding. | Closes A→B→C, stale replay and foreign pods; M0's Binding rules. | Counting by labels only; comparing resourceVersions. |
 | 2026-10-24 | The runtime declaration is a pod-template env var; defer immediately when it is absent. | Gives the worker an input the evidence document does not supply, and means default-off costs no wait. | Comparing the document only against itself. |
-| 2026-10-24 | crun 1.30.1 only; storage restricted to ext4/xfs with attach enforcement. | Namespace creation was read only at 1.30.1. A lock fences nothing on shared filesystems. | Accepting the range 1.26-1.30.1; accepting any RWO claim. |
+| 2026-10-24 | Initially crun 1.30.1 only (extended by the 2026-10-29 decision below); storage restricted to ext4/xfs with attach enforcement. | Namespace creation was then read only at 1.30.1. A lock fences nothing on shared filesystems. | Accepting the range 1.26-1.30.1; accepting any RWO claim. |
+| 2026-10-29 | Extend the crio-crun declaration to crun 1.28 or 1.30.1, with all other prerequisites unchanged. | The namespace-creation and state-output paths were re-read at upstream 1.28; the matching el10 SRPM has no patches and its relevant sources are byte-identical to that tag. | An unexamined continuous version range; changing nodes to satisfy the original bound. |
 | 2026-10-24 | Refuse exit codes below 0, 137 and 255; exact status-name sets; defer on ephemeral containers; fix `dind-meter` first (#3421). | M0's dead-shim follow-up; the CRI-O dead-conmon -1 case; a count alone can hide a missing entry. | A node agent; a threat-model amendment. |
 | 2026-10-24 | Support `crio-crun` beside `containerd-runc`. | Source audit, and the maintainers' cluster runs CRI-O 1.36.2 with crun. | containerd only. |
 | 2026-10-24 | Stopped containers are not removed. | M0 Q3; #3387. | Removing bound containers. |

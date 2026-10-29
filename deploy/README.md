@@ -944,7 +944,7 @@ storage prerequisites below; it does not verify versions or storage itself.
 | Declaration | Audited stack |
 |---|---|
 | `containerd-runc` | containerd **2.3.4**, runc **1.5.1**, kubelet **1.37.1** |
-| `crio-crun` | CRI-O **1.36.2**, classic conmon with `runtime_type: oci` (unset resolves to `oci`), default crun **1.30.1**, conmon **2.1.10–2.2.1**, kubelet **1.35.3**; no namespace-adjusting NRI plugin |
+| `crio-crun` | CRI-O **1.36.2**, classic conmon with `runtime_type: oci` (unset resolves to `oci`), default crun **1.28 or 1.30.1**, conmon **2.1.10–2.2.1**, kubelet **1.35.3**; no namespace-adjusting NRI plugin |
 
 Leave the value unset for unaudited versions, other runtime handlers or any
 `runtimeClassName`. CRI-O conmon-rs, runtimeVM and runc handlers are unsupported.

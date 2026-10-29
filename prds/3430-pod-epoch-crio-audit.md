@@ -3,6 +3,8 @@
 Supporting evidence for `prds/3430-pod-epoch-lock-shadow.md` (runtime gate value `crio-crun`) and a follow-up to PRD #1860 M0 Q1. Read 2026-10-24 by a source-reading agent; reviewed by the lead and buddy. Claims carry READ / INFERRED / NOT READ markings.
 
 
+Extended 2026-10-29 with a source audit of crun 1.28 and its CentOS Stream 10 source RPM.
+
 Read-only source audit. Markings: **READ** = read in source at the pinned tag; **INFERRED** = reasoned from read code or general kernel/libc knowledge, not traced line by line; **NOT READ** = not examined.
 
 ## Scope and pinned sources
@@ -11,7 +13,7 @@ Read-only source audit. Markings: **READ** = read in source at the pinned tag; *
 |---|---|---|
 | CRI-O | `v1.36.2` (commit `7ec673a2519ec5531073b9e9acc63cc5399c664a`) | incl. vendored `github.com/opencontainers/runtime-tools v0.9.1-0.20251205004911-5e639034dcdc` and `github.com/containerd/nri` |
 | conmon | `v2.2.1` primary; function-level comparison `v2.1.0`, `v2.1.8`, `v2.1.10`, `v2.1.12`, `v2.1.13`, `v2.2.0` | |
-| crun | `1.30.1` primary; function-level comparison `1.26`, `1.27`, `1.28`, `1.29.1` | |
+| crun | `1.30.1` primary; `1.28` namespace/state-output re-read; function-level comparison `1.26`, `1.27`, `1.28`, `1.29.1` | 1.28 commit `54f16ffbefcd022bf032af768b5c5ce075c18bfc`; 1.30.1 commit `079ff6a7a16d029460af882f9ea44674e6a510b6` |
 | kubelet | `k8s.io/kubernetes v1.35.3` (`pkg/kubelet`, `pkg/features`) | |
 | Linux | upstream `v6.12`: `kernel/exit.c`, `kernel/pid_namespace.c`, `fs/proc/base.c`, `fs/proc/array.c`, `fs/seq_file.c` | the el10 `6.12.0-*` backport tree was NOT READ |
 | CentOS Stream 10 dist-git | `gitlab.com/redhat/centos-stream/rpms/crun` branch `c10s` (head `5471d4c`, 2026-09-25); `.../rpms/conmon` branch `c10s` (head `37f945c`, 2026-05-29) | |
@@ -82,7 +84,7 @@ Read-only source audit. Markings: **READ** = read in source at the pinned tag; *
    - `ConfigureGeneratorGivenNamespacePaths(sb.NamespacePaths(), ...)` only maps `IPCNS`, `NETNS`, `UTSNS`, `USERNS` (its `typeToSpec` map). `internal/lib/sandbox/namespaces.go:NamespacePaths` likewise returns only ipc, net, uts and user. The pid entry is untouched.
    - `switch sc.GetNamespaceOptions().GetPid()` has cases only for `NODE` (remove the pid ns), `POD` (set the infra's pidns path) and `TARGET` (set the target container's pidns path). **`CONTAINER` falls through, so the default pathless `pid` entry stays.**
    - No other non-vendor, non-test CRI-O code writes the pid namespace (`rg PIDNamespace` hits only these lines, `sandbox_run_linux.go:957` for the infra, and the `nodeLevelPIDNamespace` reader).
-5. **crun 1.30.1** `src/libcrun/linux.c` (around line 5513): a namespace with `path == NULL` is added to `namespaces_to_unshare` ("Unsharing namespace"). Around lines 6560-6570, `CLONE_NEWPID` is always created by the final fork (`must_fork`), so the container init is PID 1 of a new pid namespace. crun's `has_new_pid_namespace` (`container.c`) uses the same `path == NULL` test.
+5. **crun 1.28 and 1.30.1** `src/libcrun/linux.c`: `configure_init_status` (1.28:4194; 1.30.1:5482) adds a namespace with `path == NULL` to `namespaces_to_unshare` ("Unsharing namespace"). The ordinary no-user-namespace path creates `CLONE_NEWPID` in the first clone. If user/time namespace ordering requires a later fork, `libcrun_run_linux_container` (1.28:5114; 1.30.1:6447) retains `CLONE_NEWPID` for unshare and sets `must_fork`; `init_container` (1.28:4854; 1.30.1:6177) forks into that namespace. In either path, init is PID 1 of a new pid namespace. `has_new_pid_namespace` (`container.c`, 1.28:1818; 1.30.1:1532) uses the same `path == NULL` test.
 
 **Residual: an NRI plugin.**
 - NRI is enabled by default in CRI-O 1.36.2 (`internal/config/nri/nri.go:New`, `Enabled: true`).
@@ -132,7 +134,7 @@ Exhaustive search of non-vendor, non-test CRI-O for `Status = ContainerStateStop
 
 **Key fact** (READ):
 - On the OCI path, a non-negative `ExitCode` for a pod container can come only from `updateContainerStatusFromExitFile` (route E is unreachable via CRI, and 255 is the synthetic value).
-- `crun state` never supplies an exit code: crun 1.30.1 `container.c` (around 3258-3300) emits only `ociVersion`, `id`, `pid`, `status`, `bundle`, `rootfs`, `created`, `systemd-scope`, `owner` and `annotations`. CRI-O decodes that into `ContainerState`, whose `exitCode` key it never contains.
+- `crun state` never supplies an exit code: `src/libcrun/container.c:libcrun_container_state` (1.28:3499; 1.30.1:3230) emits only `ociVersion`, `id`, `pid`, `status`, `bundle`, `rootfs`, `created`, `systemd-scope`, `owner` and `annotations`. CRI-O decodes that into `ContainerState`, whose `exitCode` key it never contains.
 - So for every accepted status (code >= 0, not 255), the guarantee rests on **exit-file provenance**. The runtime-state evidence only decides *when* EXITED is reported.
 
 | Route | Runtime-state evidence | Exit-file provenance | Init exit |
@@ -248,8 +250,30 @@ On CRI-O, the stop path for each container is `StopLoopForContainer`: the stop s
 | `container_delete_internal` | 1 line differs | = | = | = | 1.26: a `libcrun_cgroup_killall` failure is ignored (`return 0`), on the no-private-pidns branch only; irrelevant here |
 | `libcrun_cgroup_is_container_paused` | differs | differs | differs | differs | ≤1.29.1 also treat an empty cgroup path as "no cgroup"; 1.30.1 normalizes it earlier (commit titles, INFERRED equivalent) |
 
-- `linux.c` namespace setup (item 1) was read at 1.30.1 only (NOT compared across versions).
-- The state-output keys were read at 1.30.1 only.
+### crun 1.28 extension (2026-10-29, READ)
+
+The remaining namespace-creation and state-output paths were compared at upstream
+1.28 (`54f16ffbefcd022bf032af768b5c5ce075c18bfc`) and 1.30.1
+(`079ff6a7a16d029460af882f9ea44674e6a510b6`). This extends the complete audited
+crun bound to **1.28 or 1.30.1**, not every intervening version.
+
+- **Namespace creation:** [1.28 linux.c:4194](https://github.com/containers/crun/blob/54f16ffbefcd022bf032af768b5c5ce075c18bfc/src/libcrun/linux.c#L4194), `configure_init_status`, is byte-identical to 1.30.1. [linux.c:5114](https://github.com/containers/crun/blob/54f16ffbefcd022bf032af768b5c5ce075c18bfc/src/libcrun/linux.c#L5114), `libcrun_run_linux_container`, and `init_container` at linux.c:4854 preserve both PID-namespace creation routes described in item 1. The differences delay mount-namespace creation, adjust mount preparation and add a null mount-type guard on an existing-namespace join path; they do not turn a pathless PID namespace into a join or omit its creation.
+- **State output:** [1.28 container.c:3499](https://github.com/containers/crun/blob/54f16ffbefcd022bf032af768b5c5ce075c18bfc/src/libcrun/container.c#L3499), `libcrun_container_state`, emits the same top-level keys as 1.30.1, with no exit code. 1.30.1 factors config loading and annotation generation into helpers and checks individual JSON writes. These differences do not supply CRI-O an exit code; accepted nonnegative codes still depend on conmon's exit-file provenance.
+- **Supporting paths:** `container.c:3439` state classification, `container.c:1818` private-PID detection, `container.c:1834` force-delete, `container.c:1945` kill, `linux.c:6028/6056` kill helpers, `status.c:177/775/795` proc/PID checks, `status.c:406` status loading and `utils.c:951` fd reading are byte-identical between the two tags. The earlier table's cgroup-path normalization inference remains marked INFERRED.
+- **Distribution source:** the [crun-1.28-1.el10 SRPM](https://kojihub.stream.centos.org/kojifiles/packages/crun/1.28/1.el10/src/crun-1.28-1.el10.src.rpm) contains only the upstream release archive and its spec. The spec declares Version 1.28, Release 1, no patches, `%autosetup -Sgit`, and the ordinary autogen/configure/make build. It matches [CentOS c10s packaging commit 60ddb496](https://gitlab.com/redhat/centos-stream/rpms/crun/-/blob/60ddb496436a0d21c8f2a5e5fe3a942ea14b352f/crun.spec).
+- **Archive identity:** the SRPM SHA-256 is `77e90ce4c8621a11c336916151f2b92051a0d06ec09016be3e1d4c0ed1896459`; its source archive SHA-512 is `9a2ee5c53169e166f415bcd7713b03e0ce8ec007a6ec6409aa72a1339881efa0155338c1147dcf39fbce100888f3217cb6bab51f45d5a2656f7eef34dc4d1eef`, matching the historical dist-git sources manifest.
+
+The actual SRPM archive's relevant files are byte-identical to upstream 1.28:
+
+| File under src/libcrun | SHA-256 |
+|---|---|
+| linux.c | `76bf4648d05d988a16f597009d2df4800790a632c5d54612ee56ed762fbaa706` |
+| container.c | `100b530310e68b4f906384173e266d72d0e9ca37b23f22423bf3a795c4b3c137` |
+| status.c | `9e02df5b502a800484761fbb1230fb3bac4d5347283c3effdccefeba1b04d3b8` |
+| utils.c | `be1b7daf2f537a3d357c7df8a8e4dbfdb4d0b206a59b9d8322c37823ea08a6b2` |
+
+This is source equivalence for the audited properties, not a reproducible binary
+build, an el10 kernel-backport audit, or target-cluster storage acceptance.
 
 **conmon** (READ):
 - `src/ctr_exit.c` is byte-identical v2.1.10 to v2.1.13 (`git diff --stat` empty). From v2.1.8, the only difference is `reset_oom_adjust()` in `do_exit_command`, not on the cited path.
@@ -261,11 +285,11 @@ On CRI-O, the stop path for each container is `StopLoopForContainer`: the stop s
 **CentOS Stream 10 dist-git** (READ):
 - `crun.spec` is `Version: 1.30.1`, `Release: 1`, with `Source0` the upstream release tarball, **zero `Patch` lines**, and `%autosetup -Sgit`.
 - `conmon.spec` is `Version: 2.2.1`, `Release: 4`, with `Source0` the upstream tag archive and **zero `Patch` lines**. The changelog for -2 to -4 covers spec macros, hardening flags and TMT tests only.
-- That the release tarball equals the git tag for the cited files is INFERRED.
+- For the 1.30.1 and conmon release archives, equality to the git tag for the cited files is INFERRED. The four relevant 1.28 SRPM source files were compared directly above (READ).
 
 **The conclusion holds for:**
 - **conmon v2.1.10 to v2.2.1** (ctr_exit.c also from v2.1.8). Under v2.1.x the ECHILD path yields -1 rather than the v2.2.x ESRCH 0; both are handled by refusing negatives.
-- **crun 1.26 to 1.30.1**.
+- **crun 1.28 or 1.30.1** for the complete namespace/state-output proof. The broader function comparisons above do not extend the declared bound to other versions.
 - **CRI-O v1.36.2 only**: other CRI-O versions are NOT READ.
 - The OKD 4.22 image's actual RPMs must fall inside these ranges (NOT verified).
 
@@ -294,13 +318,13 @@ This holds even when `crun state` misreports a live init as stopped (item 3), be
 - Keep 137 refused for containerd parity; CRI-O alone does not need it.
 - CRI-O reasons are only `Completed`, `Error`, `OOMKilled` and `seccomp killed`, so allowing only Completed/Error is correct.
 - Add the `ephemeralContainerStatuses` check.
-- Gate on a declared runtime of "CRI-O 1.36.x, `runtime_type` oci (conmon v2.1.10 to v2.2.1), crun 1.26 to 1.30.1 default handler, no `runtimeClassName`, no NRI plugin that adjusts namespaces".
+- Gate on a declared runtime of "CRI-O 1.36.2, `runtime_type` oci (conmon v2.1.10 to v2.2.1), crun 1.28 or 1.30.1 default handler, kubelet 1.35.3, no `runtimeClassName`, no NRI plugin that adjusts namespaces".
 
 ## Not read / not determined
 - The exact conmon, crun and cri-o RPMs in the OKD 4.22 SCOS node image, and the node `/proc` mount options (hidepid).
 - The el10 kernel source (only upstream v6.12 was read). Kernel cgroup v2 rmdir and `release_task` pid freeing were not re-read.
 - The glibc `WIF*` decode of -1.
-- crun `linux.c` and the state output across versions other than 1.30.1.
+- crun namespace creation and state output at versions other than 1.28 and 1.30.1.
 - conmon `conmon.c` before v2.1.10 beyond the exit section, and the v2.1.0 subreaper call.
 - conmon-rs, the CRI-O runtimeVM path, runc behind CRI-O, and any installed NRI plugins.
 - No live-node verification was performed.
