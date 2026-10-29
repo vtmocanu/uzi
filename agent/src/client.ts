@@ -1496,6 +1496,12 @@ export class WorkerClient {
    *  capability-aware degradation for a pre-clone forge-unreachable park. Backed by
    *  `serverFeatures` so the two views never diverge and a rollback clear empties both. The
    *  setter routes through the same set (a test that skips register can seed it directly). */
+  /** Both sides must have negotiated the compact contract; this does not advertise readiness. */
+  get supportsPolicyHold(): boolean {
+    return this.hasFeature("provider_policy_hold_v1") &&
+      this.registrationReport?.protocol_capabilities.includes("provider_policy_hold_v1") === true;
+  }
+
   get protocolFeatures(): string[] {
     return [...this.serverFeatures];
   }

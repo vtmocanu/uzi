@@ -59,6 +59,9 @@ import {
 import { WorkerClient, RequestError, CodexRequestFailure } from "../src/client.js";
 import { ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
 import { RunRunner } from "../src/runner.js";
+import { Outbox } from "../src/outbox.js";
+import { ActiveRunRegistry } from "../src/active-run-registry.js";
+import type { PolicyHoldRequest } from "../src/protocol.js";
 import { resolveRunKind } from "../src/run-kind.js";
 import { GitCache, assertCaptureLaunch } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
@@ -3654,6 +3657,158 @@ describe("approved actual CodexExecutor policy flow (#2321)", () => {
 });
 
 // ================================================================================
+
+describe("compact policy hold production producer", () => {
+  const cases = [
+    ...(["plan", "implement"] as const).flatMap(phase =>
+      (["cyberPolicy", "misalignmentPolicyViolation"] as const).map(tag => ({ phase, tag, mode: "verified", kind: "issue" }))),
+    ...["degraded", "lost_ack", "journal_failure", "cancel", "worker_off", "server_off", "no_outbox", "no_snapshot", "long_session", "interactive", "invalid_generation", "metadata_failure"].map(mode =>
+      ({ phase: "implement" as const, tag: "cyberPolicy" as const, mode, kind: "issue" })),
+    ...["task", "prompt", "self_improve"].map(kind =>
+      ({ phase: "plan" as const, tag: "cyberPolicy" as const, mode: "verified", kind })),
+  ];
+  for (const { phase, tag, mode, kind } of cases) {
+    it(`holds genuine root ${kind} ${phase} ${tag}: ${mode}`, async () => {
+      const api = new FakeApi("compact-policy-worker");
+      const url = await api.listen();
+      const fx = makeFixture();
+      let worktree = "";
+      let lifecycle: AbortSignal | undefined;
+      let context: RunContext | undefined;
+      const captureLog = recordingLogger();
+      const rootThread = mode === "long_session" ? "x".repeat(1025) : "th-1";
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: rootThread } };
+        if (c.method === "turn/start") {
+          c.transport.push({ ...turnCompleted("failed", rootThread), params: {
+            threadId: rootThread, turn: { id: "tn-1", status: "failed",
+              error: { codexErrorInfo: tag, message: "PRIVATE-PROVIDER-TEXT" } },
+          } });
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      } });
+      const launch = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+        launchEffectRoot: async (spec, deadline) =>
+          forwardCredentialFreeGitRoot(spec, deadline, await launch(spec, deadline)) };
+      const client = new WorkerClient(url, "compact-policy-worker", "test", noopLog);
+      api.setRegisterProtocolFeatures(mode === "server_off" ? ["claim_generation_fence"] :
+        ["provider_policy_hold_v1", "claim_generation_fence"]);
+      await client.register("compact-test", "base", 1, [], mode === "worker_off" ? [] :
+        ["provider_policy_hold_v1"], undefined, 0);
+      const outbox = new Outbox({ root: path.join(fx.dataDir, "policy-outbox"), log: noopLog,
+        runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000,
+        rawWrite: async (write, context) => {
+          if (mode === "journal_failure" && context.kind === "terminal")
+            throw Object.assign(new Error("fixture ENOSPC"), { code: "ENOSPC" });
+          await write();
+        } });
+      await outbox.init();
+      const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 10);
+      const packets: PolicyHoldRequest[] = [];
+      client.reportPolicyHold = async (runId, body) => {
+        const journal = await outbox.readTerminalJournal(runId, body.source_generation);
+        assert.equal(journal?.outcome_kind, "policy_hold", "journal exists before policy HTTP");
+        assert.deepEqual(journal?.body, body);
+        const statesBefore = api.states.length;
+        assert.ok(context?.onSessionId, "production session callback is installed");
+        context.onSessionId("late-session-must-not-report");
+        await Promise.resolve();
+        assert.equal(api.states.length, statesBefore, "late ordinary session report is suppressed");
+        packets.push(body);
+        if (mode === "lost_ack") throw new Error("fixture lost ACK");
+        return { disposition: "applied", outcome_id: body.outcome_id, source_generation: body.source_generation,
+          observed_status: "paused", observed_generation: 7, hold_reason: "codex_policy_hold" };
+      };
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const run = executor.run.bind(executor);
+      executor.run = async ctx => {
+        worktree = ctx.worktreePath;
+        lifecycle = ctx.signal;
+        context = ctx;
+        await fs.writeFile(path.join(worktree, "POLICY-WORK.txt"), "retained work\n");
+        return run(ctx);
+      };
+      if (mode === "metadata_failure") outbox.journalPolicyHold = async () => { throw new Error("fixture metadata unavailable"); };
+      const claim = makeClaim({ claim_generation: mode === "invalid_generation" ? 0 : 7,
+        interactive: mode === "interactive", kind: kind as ClaimResponse["kind"],
+        ...(kind === "task" ? { branch: "uzi/task/policy-fixture", issue_iid: null } : {}),
+        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+        ...(phase === "implement" ? { plan_approved: true, plan_source: "seeded", plan_md: "approved work" } : {}),
+      });
+      if (kind === "task") {
+        const seeded = spawnSync("git", ["-C", fx.originPath, "branch", claim.branch!], { env: gitEnv(), encoding: "utf8" });
+        assert.equal(seeded.status, 0, seeded.stderr);
+      }
+      try {
+        await new RunRunner(client, new GitCache(fx.dataDir, captureLog.logger, undefined, testGitCacheOptions()),
+          () => ({ executor }), captureLog.logger, 20, undefined, { pollMs: 5, outbox: mode === "no_outbox" ? undefined : outbox, activeRuns: mode === "no_snapshot" ? undefined : registry,
+            quiesceRun: async request => {
+              if (mode === "cancel" && request.site === "completion_hold") {
+                api.appendInputs(claim.run_id, [{ id: 1, kind: "cancel", body: null }]);
+                await waitFor(() => lifecycle?.aborted === true, "owner Cancel applied");
+              }
+              return { process: { state: mode === "degraded" && request.site === "completion_hold" ? "unverified" : "quiescent",
+                processes: [], killed: [], detail: "fixture proof" },
+                docker: { state: "not_wired", removed: [], detail: "not wired" } };
+            },
+          }).execute(claim);
+        const supported = !["worker_off", "server_off", "no_outbox", "no_snapshot", "interactive", "invalid_generation"].includes(mode);
+        assert.equal(packets.length, supported && !["journal_failure", "cancel", "metadata_failure"].includes(mode) ? 1 : 0,
+          String(rec(captureLog.lines.filter(line => rec(line).level === "error").at(-1)).error ?? "no terminal diagnostic").slice(0, 240));
+        assert.equal(rig.transport.turnStartCount, 1);
+        assert.equal(await fs.readFile(path.join(worktree, "POLICY-WORK.txt"), "utf8"), "retained work\n");
+        if (!supported) {
+          assert.equal(api.states.find(s => s.body.status === "failed")?.body.fail_origin, "provider_policy_refusal");
+          return;
+        }
+        assert.ok(!api.states.some(s => ["failed", "completed"].includes(s.body.status ?? "")));
+        if (mode === "metadata_failure") {
+          assert.equal(registry.size, 1, "failed metadata admission retains original active snapshot");
+          assert.equal(registry.has(claim.run_id), true);
+          return;
+        }
+        if (mode === "journal_failure" || mode === "cancel") {
+          assert.ok(outbox.hasPendingTerminal(claim.run_id, 7));
+          assert.equal(outbox.listPendingTerminals()[0]?.server_settled, undefined);
+          assert.equal(registry.size, 0, "outbox metadata takes over before active snapshot removal");
+          return;
+        }
+        if (mode === "degraded") {
+          assert.equal(packets[0]!.head, undefined);
+          assert.equal(packets[0]!.published, false);
+          assert.equal(packets[0]!.checkpoint_contains_latest, false);
+          return;
+        }
+        assert.match(packets[0]!.head ?? "", /^[0-9a-f]{40}$/, JSON.stringify(captureLog.lines.filter(line => rec(line).level === "warn")));
+        assert.deepEqual(packets[0], {
+          outcome_id: packets[0]!.outcome_id, source_generation: 7, claim_generation: 7, detail: "refused",
+          continuation_mode: "same_conversation", tag, phase: phase === "plan" ? "planning" : "implementation",
+          correlation_id: packets[0]!.correlation_id,
+          ...(mode === "long_session" ? {} : { session_id: "th-1" }),
+          head: packets[0]!.head, published: false, checkpoint_contains_latest: false,
+        });
+        assert.match(packets[0]!.head ?? "", /^[0-9a-f]{40}$/);
+        assert.match(packets[0]!.outcome_id, /^[0-9a-f-]{36}$/);
+        assert.equal(rig.transport.turnStartCount, 1);
+        assert.ok(!api.states.some(s => ["failed", "completed"].includes(s.body.status ?? "")));
+        assert.equal(await fs.readFile(path.join(worktree, "POLICY-WORK.txt"), "utf8"), "retained work\n");
+        assert.ok(!JSON.stringify(packets).includes("PRIVATE-PROVIDER-TEXT"));
+        assert.equal(outbox.listPendingTerminals()[0]?.server_settled, mode === "lost_ack" ? undefined : true,
+          "only a validated ACK settles delivery; source remains");
+        if (mode === "lost_ack") {
+          const original = await outbox.readTerminalJournal(claim.run_id, 7);
+          assert.deepEqual(original?.body, packets[0], "lost ACK retains exact immutable outcome");
+        }
+      } finally {
+        await api.close();
+        fx.cleanup();
+      }
+    });
+  }
+});
+
 describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
   for (const control of ["cancel", "pause", "wall"] as const) it(`policy refusal (#2321) retains ${control} precedence during awaited root emission`, async () => {
     const rig = makeRig();
