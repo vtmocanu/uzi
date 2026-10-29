@@ -722,3 +722,35 @@ Reuse preserves the current tree and all frozen roots, recomputes the inventory 
 The producer defaults to legacy aggregate construction. New inventories opt into reuse; authenticated nonempty coverage records with `sourceSha === inventoryCurrentSha` require reuse during re-proof, without a fallback that could overwrite their pin with a different aggregate. Records whose source differs retain byte-identical legacy reconstruction. No journal field, database counter or protocol feature is added. A pre-fix worker cannot re-prove a reused record: rollback or mixed-version replay retains it fail-closed, and a new-code worker is needed to settle it.
 
 An owner Resume of the affected ninth-wrapper hold can reuse the last successfully adopted eight-deep physical source when it still covers every root. An already-overbound physical source is not bypassed. Marker-involved recovery keeps legacy wrapping, and recoveries with intervening committed progress can still grow wrapper history; this amendment does not claim to solve those distinct shapes.
+
+
+## Amendment 2026-10-29: fair ordinary inventory reconstruction (#3614)
+
+The #2381 discovery FIFO is separate from the #1995 direct-replay selection above.
+It rotates raw contexts (default cap four) before execution/hold checks; retained
+metadata with no eligible hold can therefore consume turns. Empty candidate lists
+alone do not make a context disposable.
+
+Guarded live materialization, but not boot, reserves at most one turn for an ordinary
+invalidated inventory. Complete checked records, canonical context equality and both
+execution predicates determine this scheduling hint. Every frozen guarded sibling in
+the generation must be replaceable; a non-replaceable successor, saved FINAL, ACK or
+receipt ends priority. Selected contexts rotate behind survivors without changing
+queue membership/multiplicity. Remaining turns stay FIFO; no hint or cap below two
+retains the original FIFO. A failed fresh recheck wastes that already-rotated priority
+turn, leaving cap-1 FIFO turns. The hint grants no authority: all fresh custody,
+source, ancestry, immutable-request, quota, lifecycle and retirement proofs remain.
+
+For P continuously eligible contexts with complete readable hints, priority progresses
+within P completed materializing passes; normal survivors within ceil(N/(cap-1)).
+A permanent refusal may keep the reserved turn; these are pass bounds, not a wall-clock
+settlement SLA. Removed/re-added entries are new arrivals. Hint I/O failure warns and
+falls back to FIFO; budget exhaustion and cancellation still end the pass. Hint reads
+check cancellation between runs and do not run on non-materializing/blocked passes.
+
+The local checked view is read once per candidate run immediately before live
+materialization. #3446 D-U5-5's evidence-first order, once landed, stays first; the hint
+moves with materialization in either landing order. Producer admission, #3577 retirement
+proof and journal/API formats are unchanged. Pruning remains #2823's carried #2414 work
+with independent fail-closed authority. Measurements and regression evidence belong in
+the implementing PR.

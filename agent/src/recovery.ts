@@ -59,7 +59,7 @@ import type {
   RecoveryUploadManifest,
   RunKind,
 } from "./protocol.js";
-import { readRecoveryBundleHeader, RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, RecoveryCoverageReuseRefused, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidate, type RecoveryCoverage, type RecoveryCoverageClaim, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
+import { readRecoveryBundleHeader, RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, RecoveryCoverageReuseRefused, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidateContext, type HistoricalOwedContext, type OwedCandidate, type RecoveryCoverage, type RecoveryCoverageClaim, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
 
 /** Ephemeral execution metadata only; never custody or production admission authority. */
 export type ClosedSourceObservation = Readonly<{
@@ -786,6 +786,12 @@ function hasJournaledBundle(record: RecoveryRecord): record is JournaledBundleRe
   );
 }
 
+/** Shared ordinary pre-FINAL replacement classification; never effect authority. */
+function isReplaceableInventoryRecord(record: RecoveryRecord): boolean {
+  return classifyRecoveryOrigin(record.captureId) === "ordinary" &&
+    record.reason === "inventory_snapshot_changed" && !record.finalRequest && !record.finalAcknowledged && !record.completionReceipt;
+}
+
 /** Guarded FINAL retries may include uploaded records.
  *  Legacy records need a journaled bundle that is bundled or needs_action for a
  *  transient/credential reason; pinned, bundle-less and permanent legacy records are skipped. */
@@ -1477,11 +1483,9 @@ export class RecoveryCoordinator {
             r.inventoryCurrentSha === input.currentSha && r.originalSourceSha === originalSourceSha &&
             canonicalJson(r.coverageContext) === canonicalJson(context) &&
             canonicalJson(r.originalRoots) === canonicalJson(roots));
-          const replaceable = (r: RecoveryRecord): boolean => classifyRecoveryOrigin(r.captureId) === "ordinary" &&
-            r.reason === "inventory_snapshot_changed" && !r.finalRequest && !r.finalAcknowledged && !r.completionReceipt;
-          let matching = matches.find(r => !replaceable(r));
+          let matching = matches.find(r => !isReplaceableInventoryRecord(r));
           if (!matching) {
-            const invalidated = matches.find(replaceable);
+            const invalidated = matches.find(isReplaceableInventoryRecord);
             // Clone/journal heads are not part of the fingerprint. A persistent
             // uncovered head must retain this identity, not create one upload per pass.
             if (invalidated && await this.frozenSourceAncestry(invalidated, candidates) !== "verified") matching = invalidated;
@@ -2780,16 +2784,47 @@ export class RecoveryCoordinator {
     this.bootOwed = [...entries.values()];
   }
 
-  async materializeBootInventory(signal?: AbortSignal, isExecuting = this.isExecuting, attempts?: Map<string, MaintenanceBudget>): Promise<RecoveryRecord[]> {
+  /** A local scheduling hint only; every effect still re-derives its authority. */
+  private isInventoryPriorityContext(context: OwedCandidateContext | HistoricalOwedContext,
+    records: readonly RecoveryRecord[], isExecuting: (runId: string) => boolean): boolean {
+    if (context.generation === null || this.isExecuting(context.runId) || isExecuting(context.runId)) return false;
+    const generation = records.filter(r => r.generation === context.generation);
+    if (generation.some(r => r.finalRequest || r.finalAcknowledged || r.completionReceipt)) return false;
+    const frozen = generation.filter(r => r.inventoryGuarded && r.coverageDigest);
+    return frozen.length > 0 && frozen.every(isReplaceableInventoryRecord) &&
+      frozen.some(r => canonicalJson(r.coverageContext) === canonicalJson(context));
+  }
+
+  private async inventoryPriorityContexts(isExecuting: (runId: string) => boolean, signal?: AbortSignal): Promise<ReadonlySet<string>> {
+    const views = new Map<string, RecoveryRecord[] | undefined>();
+    const priority = new Set<string>();
+    for (const { context } of this.bootOwed) {
+      signal?.throwIfAborted();
+      if (context.generation === null) continue;
+      if (!views.has(context.runId)) views.set(context.runId, await this.newReconstructionRecords(context.runId));
+      const records = views.get(context.runId);
+      if (records && this.isInventoryPriorityContext(context, records, isExecuting)) priority.add(canonicalJson(context));
+    }
+    signal?.throwIfAborted();
+    return priority;
+  }
+
+  async materializeBootInventory(signal?: AbortSignal, isExecuting = this.isExecuting, attempts?: Map<string, MaintenanceBudget>,
+    priority?: ReadonlySet<string>): Promise<RecoveryRecord[]> {
     return this.inventoryDiagnosticPath.run(this.inventoryDiagnosticPath.getStore() ?? "boot",
-      () => this.materializeInventory(signal, isExecuting, attempts));
+      () => this.materializeInventory(signal, isExecuting, attempts, priority));
   }
 
   private async materializeInventory(signal: AbortSignal | undefined, isExecuting: (runId: string) => boolean,
-    attempts?: Map<string, MaintenanceBudget>): Promise<RecoveryRecord[]> {
+    attempts?: Map<string, MaintenanceBudget>, priority?: ReadonlySet<string>): Promise<RecoveryRecord[]> {
     const records: RecoveryRecord[] = [];
-    // Each discovered context is visited once; a failure keeps its pins and allows siblings.
-    const batch = this.bootOwed.splice(0, this.liveMaxPerPass);
+    // Reserve one opportunity, preserving FIFO progress and the full queue for
+    // preferred-context derivation. Boot/cap-one calls keep their original order.
+    const index = this.liveMaxPerPass >= 2 && priority?.size
+      ? this.bootOwed.findIndex(entry => priority.has(canonicalJson(entry.context))) : -1;
+    const priorityEntry = index >= 0 ? this.bootOwed.splice(index, 1)[0] : undefined;
+    const batch = this.bootOwed.splice(0, this.liveMaxPerPass - (priorityEntry ? 1 : 0));
+    if (priorityEntry) batch.unshift(priorityEntry);
     this.bootOwed.push(...batch); // rotate retained discoveries behind siblings; no internal retries
     for (const entry of batch) {
       if (signal?.aborted) break;
@@ -2807,6 +2842,9 @@ export class RecoveryCoordinator {
         if (!this.client.getRunOwnership) { note("ownership_unsupported"); continue; }
         const existing = await this.newReconstructionRecords(ctx.runId, ctx.generation);
         if (!existing) { note("provenance_unavailable"); continue; }
+        // A stale hint has already consumed its reserved opportunity and rotated;
+        // leave the cap-1 FIFO entries to progress without granting new authority.
+        if (entry === priorityEntry && !this.isInventoryPriorityContext(ctx, existing, isExecuting)) continue;
         identity.captureId = existing.find(r => r.generation === ctx.generation && r.coverageDigest)?.captureId ??
           existing.find(r => r.generation === ctx.generation)?.captureId ?? "";
         const probe = existing.find(r => r.generation === ctx.generation && r.exactHoldBinding) ??
@@ -4362,7 +4400,16 @@ export class RecoveryCoordinator {
           transient = true;
           this.log.warn("recovery: live inventory discovery failed; retained", { error: errText(err) });
         }
-        await this.materializeBootInventory(opts.signal, opts.isExecuting, attempts);
+        let priority: ReadonlySet<string> | undefined;
+        if (this.liveMaxPerPass >= 2) {
+          try { priority = await this.inventoryPriorityContexts(opts.isExecuting, opts.signal); }
+          catch (err) {
+            MaintenanceBudget.current()?.check();
+            if (opts.signal?.aborted) throw err;
+            this.log.warn("recovery: inventory priority hint unavailable; FIFO", { error: errText(err) });
+          }
+        }
+        await this.materializeBootInventory(opts.signal, opts.isExecuting, attempts, priority);
       }
       const all = await this.snapshotBootRecords();
       this.pruneFinalRetries(all);

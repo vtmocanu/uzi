@@ -5975,7 +5975,6 @@ for (const route of ["terminal settlement", "retained capture"] as const) {
 
 
 // #3614: actual queue/capture paths, with interface facts and an event-driven clock.
-type Issue3614Fixture = Awaited<ReturnType<typeof fixture>>;
 function issue3614Gate() {
   let resolve!: () => void;
   const promise = new Promise<void>(r => { resolve = r; });
@@ -6151,15 +6150,17 @@ async function issue3614Queue(priorityCount = 1, normalCount = 40, cap = 4) {
     }
   } });
   const visit = async () => {
+    const priorBatches = batches.length;
     f.state.now += 5000;
     await c.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: run => passExecuting(run) });
     const ids = ((c as any).bootOwed as Array<{ context: PositiveOwedCandidateContext }>).map(e => canonicalJson(e.context));
     assert.deepEqual([...ids].sort(), rows.map(r => canonicalJson(r.context)).sort(), "selection must preserve queue membership and multiplicity for preferred-context derivation");
+    if (batches.length === priorBatches) return [];
     assert.ok(requests.at(-1)! <= cap, "materialization request opportunities stay within the context cap");
     assert.equal(new Set(batches.at(-1)).size, batches.at(-1)!.length, "selected context appears once per pass");
     return batches.at(-1)!;
   };
-  return { f, c, rows, normal, priority, batches, requests, visit,
+  return { f, c, rows, normal, priority, batches, requests, visit, inMaterialization: () => inMaterialize,
     executing: (which: "coordinator" | "pass", predicate: (run: string) => boolean) => {
       if (which === "coordinator") coordinatorExecuting = predicate; else passExecuting = predicate;
     } };
@@ -6178,19 +6179,24 @@ it("#3614 priority and FIFO opportunities remain bounded with five refusing targ
   } finally { await q.f.close(); }
 });
 
-for (const excluded of ["none", "successor", "quota successor", "saved FINAL", "FINAL ACK", "receipt", "producer", "coordinator execution", "pass execution", "unreadable sibling"] as const) {
+for (const excluded of ["none", "successor", "quota successor", "saved FINAL", "FINAL ACK", "receipt", "producer", "canonical context", "coordinator execution", "pass execution", "unreadable sibling"] as const) {
   it(`#3614 priority ordering qualification: ${excluded}`, async () => {
     const q = await issue3614Queue();
     try {
       const hot = q.priority[0]!, record = hot.record!;
       if (excluded === "successor" || excluded === "quota successor") {
+        // Keep R2 stalled before a new coverage decision; a real invalidation of
+        // R2 would legitimately make the whole generation replaceable again.
+        q.f.state.sourceRefused = true;
         await issue3561Sibling(q.f, record, { reason: excluded === "quota successor" ? "storage_quota_exceeded" : undefined,
           state: excluded === "quota successor" ? "needs_action" : "pinned" });
         q.f.state.candidates.push({ sha: H2, pinRef: "refs/owed/later", contexts: [hot.context] });
       }
       if (excluded === "saved FINAL") await patchAuthenticated(q.f, record, { finalRequest: { disposition: {
         kind: "archive", capture_id: record.serverCaptureId!, source_sha: record.sourceSha, coverage_digest: record.coverageDigest! } } });
-      if (excluded === "FINAL ACK") await patchAuthenticated(q.f, record, { finalAcknowledged: true });
+      if (excluded === "FINAL ACK") await patchAuthenticated(q.f, record, { finalAcknowledged: true,
+        finalRequest: { disposition: { kind: "archive", capture_id: record.serverCaptureId!,
+          source_sha: record.sourceSha, coverage_digest: record.coverageDigest! } } });
       if (excluded === "receipt") {
         // Receipt alone must exclude priority, without relying on an ACK flag.
         const receipt = JSON.parse(await fs.readFile(new URL("../../fixtures/completed-publication/state-ack.json", import.meta.url), "utf8")).ack.completed_publication_receipt;
@@ -6201,12 +6207,20 @@ for (const excluded of ["none", "successor", "quota successor", "saved FINAL", "
         const producer = await issue3561Sibling(q.f, record, { captureId: "maintenance-v1-00000000-0000-4000-8000-000000003614" });
         await fs.unlink(issue3561File(q.f, record)); hot.record = producer;
       }
+      if (excluded === "canonical context") await patchAuthenticated(q.f, record, {
+        branch: "other3614", coverageContext: { ...hot.context, branch: "other3614" },
+      });
       if (excluded === "coordinator execution" || excluded === "pass execution") q.executing(excluded === "coordinator execution" ? "coordinator" : "pass", run => run === hot.context.runId);
       if (excluded === "unreadable sibling") {
         const sibling = await issue3561Sibling(q.f, record, { reason: undefined });
         const file = issue3561File(q.f, sibling), raw = JSON.parse(await fs.readFile(file, "utf8"));
         await fs.writeFile(file, JSON.stringify({ ...raw, mac: "0".repeat(64) }));
       }
+      const validated = (await q.f.coordinator.inspect(hot.context.runId)).find(r => r.captureId === hot.record!.captureId);
+      assert.ok(validated, "the ordering control itself must pass the authenticated shape reader");
+      if (excluded === "FINAL ACK") assert.equal(validated.finalAcknowledged, true);
+      if (excluded === "saved FINAL" || excluded === "FINAL ACK") assert.ok(validated.finalRequest);
+      if (excluded === "receipt") assert.ok(validated.completionReceipt);
       const run = () => q.visit();
       const batch = excluded === "producer"
         ? await (q.c as any).producerPermit.run({ captureIds: new Set([hot.record!.captureId]), live: () => true }, run)
@@ -6235,3 +6249,124 @@ it("#3614 cap one and appended survivors keep normal FIFO order", async () => {
     assert.equal(new Set(seen).size, q.rows.length);
   } finally { await q.f.close(); }
 });
+
+it("#3614 ordinary contexts without an invalidated target retain cap-four FIFO", async () => {
+  const q = await issue3614Queue(1, 12);
+  try {
+    await patchAuthenticated(q.f, q.priority[0]!.record!, { reason: undefined });
+    q.f.state.sourceRefused = true;
+    for (let pass = 0; pass < 3; pass++) assert.deepEqual(await q.visit(), q.normal.slice(pass * 4, pass * 4 + 4).map(r => r.context.runId));
+  } finally { await q.f.close(); }
+});
+
+for (const blocked of ["credentials", "feature", "discovery", "boot", "cap one", "throwing hint"] as const) {
+  it(`#3614 hint read guard and FIFO fallback: ${blocked}`, async () => {
+    const q = await issue3614Queue(1, 8, blocked === "cap one" ? 1 : 4);
+    try {
+      await q.c.snapshotOwedInventory(); // blocked passes must retain an existing queue
+      let reads = 0;
+      const warnings: string[] = [], warn = q.f.log.warn;
+      q.f.log.warn = (message, fields) => { warnings.push(message); warn.call(q.f.log, message, fields); };
+      const c = q.c as any, read = c.newReconstructionRecords.bind(c);
+      c.newReconstructionRecords = async (...args: any[]) => {
+        if (!q.inMaterialization()) {
+          reads++;
+          if (blocked === "throwing hint") throw new Error("hint I/O unavailable");
+        }
+        return read(...args);
+      };
+      if (blocked === "credentials") c.credentialBlockedAt = q.f.state.now + 1_000_000;
+      if (blocked === "feature") q.f.state.feature = false;
+      if (blocked === "discovery") delete (q.f.git as any).discoverOwedCandidates;
+      if (blocked === "boot") {
+        await q.c.snapshotOwedInventory();
+        await q.c.resumePending(undefined, await q.c.snapshotBootRecords(), true);
+      } else await q.visit();
+      assert.equal(reads, blocked === "throwing hint" ? 1 : 0, "only a guarded materializing live pass may sample hints");
+      if (blocked === "throwing hint") {
+        assert.equal(warnings.filter(m => m === "recovery: inventory priority hint unavailable; FIFO").length, 1, "one observable fallback warning per pass");
+        assert.deepEqual(q.batches[0], q.normal.slice(0, 4).map(r => r.context.runId), "hint failure still materializes the plain FIFO batch");
+        assert.equal(c.nextPassAt, q.f.state.now + 1000, "hint failure alone does not grow production retry delay");
+      }
+    } finally { await q.f.close(); }
+  });
+}
+
+it("#3614 hint reuses one complete view across contexts of a run", async () => {
+  const q = await issue3614Queue(1, 6);
+  try {
+    q.rows.push({ context: { ...q.priority[0]!.context, branch: "other3614" } });
+    const c = q.c as any, read = c.newReconstructionRecords.bind(c);
+    const counts = new Map<string, number>();
+    c.newReconstructionRecords = async (...args: any[]) => {
+      if (!q.inMaterialization()) counts.set(args[0], (counts.get(args[0]) ?? 0) + 1);
+      return read(...args);
+    };
+    await q.visit();
+    assert.equal(counts.size, 7);
+    assert.ok([...counts.values()].every(n => n === 1), "duplicate discovered contexts reuse a run's complete hint view");
+  } finally { await q.f.close(); }
+});
+
+for (const change of ["successor", "saved FINAL", "execution"] as const) {
+  it(`#3614 fresh materialization rechecks a stale priority hint: ${change}`, async () => {
+    const q = await issue3614Queue(1, 8);
+    try {
+      const hot = q.priority[0]!, old = hot.record!;
+      const materialize = q.c.materializeBootInventory.bind(q.c);
+      let injected = false;
+      Object.assign(q.c, { materializeBootInventory: async (...args: Parameters<typeof materialize>) => {
+        assert.equal(injected, false); injected = true;
+        // The hint was sampled, but ordinary state changes before the entry's
+        // existing checked reader. No source/effect guard is replaced here.
+        if (change === "successor") await issue3561Sibling(q.f, old, { reason: "inventory_quiescence_breach" });
+        if (change === "saved FINAL") await patchAuthenticated(q.f, old, { finalRequest: { disposition: {
+          kind: "archive", capture_id: old.serverCaptureId!, source_sha: old.sourceSha, coverage_digest: old.coverageDigest! } } });
+        if (change === "execution") q.executing("pass", run => run === hot.context.runId);
+        return materialize(...args);
+      } });
+      const before = q.f.aggregates.length;
+      const selected = await q.visit();
+      assert.equal(injected, true);
+      assert.equal(selected[0], hot.context.runId, "a stale sampled hint may waste its one scheduling opportunity");
+      assert.deepEqual(selected.slice(1), q.normal.slice(0, 3).map(r => r.context.runId), "a stale recheck leaves exactly cap-1 FIFO contexts to progress");
+      assert.equal(q.f.aggregates.length, before, "fresh entry state must stop priority-only coverage construction");
+      assert.equal(q.f.state.produced, 1); assert.equal(q.f.state.uploads, 1);
+    } finally { await q.f.close(); }
+  });
+}
+
+it("#3614 two continuously refusing priority contexts alternate", async () => {
+  const q = await issue3614Queue(2, 20);
+  try {
+    assert.equal((await q.visit())[0], q.priority[0]!.context.runId);
+    assert.equal((await q.visit())[0], q.priority[1]!.context.runId);
+  } finally { await q.f.close(); }
+});
+
+for (const reason of ["budget", "abort"] as const) {
+  it(`#3614 revoked hint ${reason} ends the pass before materialization`, async () => {
+    const q = await issue3614Queue(1, 8);
+    const controller = new AbortController();
+    let mono = 0;
+    const budget = new MaintenanceBudget(1000, () => mono);
+    try {
+      let reads = 0;
+      const warnings: string[] = [], warn = q.f.log.warn;
+      q.f.log.warn = (message, fields) => { warnings.push(message); warn.call(q.f.log, message, fields); };
+      const c = q.c as any, read = c.newReconstructionRecords.bind(c);
+      c.newReconstructionRecords = async (...args: any[]) => {
+        reads++;
+        if (reason === "budget") { mono = 1000; throw new Error("hint read failed after budget expiry"); }
+        const records = await read(...args);
+        controller.abort(new Error("hint owner stopped"));
+        return records;
+      };
+      if (reason === "budget") await assert.rejects(MaintenanceBudget.run(budget, () => q.visit()), /maintenance deadline exhausted/);
+      else await q.c.resumeLive({ authenticatedAtMs: q.f.state.now, isExecuting: () => false, signal: controller.signal });
+      assert.equal(reads, 1, "revocation stops scanning further candidate runs");
+      assert.equal(q.batches.length, 0, "a revoked hint cannot fall back into a materialization batch");
+      assert.ok(!warnings.includes("recovery: inventory priority hint unavailable; FIFO"), "revocation is not an I/O fallback");
+    } finally { budget.dispose(); await q.f.close(); }
+  });
+}
