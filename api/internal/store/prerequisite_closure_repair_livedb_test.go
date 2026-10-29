@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,14 +109,15 @@ func TestPrerequisiteMarkerPredicateFencesLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			_, markerErr := q.MarkPrerequisiteInvoked(ctx, args)
-			if err = tx.Rollback(ctx); err != nil {
-				t.Fatal(err)
-			}
 			if !errors.Is(markerErr, pgx.ErrNoRows) {
 				t.Fatalf("%s marker: want pgx.ErrNoRows, got %v", scenario, markerErr)
 			}
-			if after := prerequisiteRead(t, ctx, f); !reflect.DeepEqual(before, after) {
-				t.Fatalf("%s rejected marker changed pending evidence", scenario)
+			after, readErr := q.GetPrerequisiteClosure(ctx, store.GetPrerequisiteClosureParams{CaptureID: f.capture, UserID: f.user})
+			if readErr != nil || !reflect.DeepEqual(before, after) {
+				t.Fatalf("%s rejected marker changed transactional pending evidence: %v", scenario, readErr)
+			}
+			if err = tx.Rollback(ctx); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
@@ -138,7 +140,18 @@ func TestPrerequisiteAbsenceTenMinuteFenceLiveDB(t *testing.T) {
 	if after := prerequisiteRead(t, ctx, f); !reflect.DeepEqual(before, after) {
 		t.Fatal("early absence confirmation changed evidence")
 	}
+	// Exercise the trigger independently of the query's zero-row time predicate.
+	assertRawLossRefused := func(pass pgtype.UUID, label string) {
+		t.Helper()
+		_, rawErr := pool.Exec(ctx, "UPDATE recovery_prerequisite_closures SET state='lost',live_run_id=NULL,reason='pin_lost',absent_since=NULL,absence_pass_id=NULL,last_audit_pass_id=$2 WHERE id=$1", f.closure.ID, pass)
+		var pgErr *pgconn.PgError
+		if !errors.As(rawErr, &pgErr) || pgErr.Code != "55000" || !strings.Contains(rawErr.Error(), "later confirming pass after ten minutes") {
+			t.Fatalf("%s loss bypassed absence trigger: %v", label, rawErr)
+		}
+	}
+	assertRawLossRefused(early, "early")
 	prerequisiteAdvance(t, ctx, pool, time.Minute)
+	assertRawLossRefused(first, "same-pass")
 	boundary := prerequisiteAudit(t, ctx, f)
 	n, err = q.ConfirmPrerequisiteLost(ctx, store.ConfirmPrerequisiteLostParams{ID: f.closure.ID, Generation: 0, PassID: boundary})
 	prerequisiteRows(t, 1, n, err)
