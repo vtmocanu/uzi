@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -80,6 +81,32 @@ func testPolicyHoldWorkerRoute(t *testing.T, name string) {
 	}
 	if row.Status != "paused" || !row.PolicyPreserveRequired || row.PolicyRefusalCount != 1 || row.SessionID.String != "original-session" || row.ClaimReleasedAt.Valid {
 		t.Fatal("report/replay changed hold preservation")
+	}
+	if name == "application" {
+		// M1 has no owner continuation yet. Even an authenticated owner cannot
+		// bypass the compact transaction through today's bodyless Resume route.
+		jwt := cliMintJWT(t, pool, owner)
+		var beforeInputs string
+		if err := pool.QueryRow(ctx, "SELECT COALESCE(jsonb_agg(to_jsonb(i) ORDER BY id), '[]'::jsonb)::text FROM run_user_inputs i WHERE run_id=$1", run).Scan(&beforeInputs); err != nil {
+			t.Fatal(err)
+		}
+		for _, body := range []string{"", `{"mode":"fresh","guidance":"owner guidance"}`} {
+			r := cookieReq(t, router, http.MethodPost, "/api/runs/"+run.String()+"/resume-now", jwt, body)
+			if r.Code != http.StatusConflict {
+				t.Fatalf("generic owner Resume = %d: %s", r.Code, r.Body.String())
+			}
+			after, err := h.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: run, UserID: owner})
+			if err != nil || !reflect.DeepEqual(row, after) {
+				t.Fatalf("refused Resume mutated episode, session, constraint or queue: %v", err)
+			}
+			var afterInputs string
+			if err := pool.QueryRow(ctx, "SELECT COALESCE(jsonb_agg(to_jsonb(i) ORDER BY id), '[]'::jsonb)::text FROM run_user_inputs i WHERE run_id=$1", run).Scan(&afterInputs); err != nil {
+				t.Fatal(err)
+			}
+			if beforeInputs != afterInputs {
+				t.Fatal("refused Resume added guidance or audit")
+			}
+		}
 	}
 	var missingPublished map[string]any
 	if err := json.Unmarshal(b, &missingPublished); err != nil {
