@@ -10,7 +10,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 )
 
-// prereqBundleFixture is a native Git artifact seam; M3 runtime integration is pending.
+// prereqBundleFixture is a broker-only native Git seam; production lane coverage lives in workersvc/prerequisite_closure_native_test.go.
 // Source is a merge
 // requiring P1 and P2; single-prerequisite fixtures simply omit the second parent.
 // All artifacts are generated at runtime, and consumers clone with --no-local.
