@@ -325,11 +325,6 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 	w, t := r.w, workerTextOf(r)
 	renderer := &tuiRenderer{}
 	var items []attnItem
-	for i := range w.ForgeOriginCooldowns {
-		cooldown := &w.ForgeOriginCooldowns[i]
-		lines := forgeOriginLines(cooldown)
-		items = append(items, attnItem{1, "forge: " + renderer.Plain(cooldown.Origin, 200) + " · " + lines[1], strings.Join(lines, " · ")})
-	}
 	add := func(sev int, short, detail string) { items = append(items, attnItem{sev, short, detail}) }
 	if workerRollFailure(w.UpgradeStatus) {
 		label := workerRollLabel(w.UpgradeStatus)
@@ -450,6 +445,11 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 	}
 	if w.Busy && w.ActiveRuns == 0 && w.ActiveCrossChecks == 0 {
 		add(2, "· chat active", "· chat active (run lane occupancy is zero)")
+	}
+	if n := len(w.ForgeOriginCooldowns); n > 0 {
+		// Keep the fleet readout bounded; full origin observations are in detail.
+		text := fmt.Sprintf("forge: %s · %d reported origins unverified · details: enter", renderer.Plain(w.ForgeOriginCooldowns[0].Origin, 60), n)
+		add(1, text, text)
 	}
 	slices.SortStableFunc(items, func(a, b attnItem) int { return a.severity - b.severity })
 	return items
@@ -961,13 +961,10 @@ func (m tuiModel) workerReadout(r workerRow, width int) []string {
 	if remaining := width - visualWidth(selected); remaining >= minimumMetadata {
 		selected += clampVisual(metadata, remaining)
 	}
-	if inline && len(r.w.ForgeOriginCooldowns) == 0 {
+	if inline {
 		return []string{selected}
 	}
 	lines := []string{selected}
-	for _, line := range workerForgeLines(r.w) {
-		lines = append(lines, clampVisual("  "+m.renderer.Plain(line, max(0, width-2)), width))
-	}
 	lines = append(lines, m.manualCordonLines(r, width)...)
 	for _, item := range items {
 		lines = append(lines, clampVisual("  "+paintSeg(m.workerAttentionColor(item), nil, false, m.renderer.Plain(item.attnShort, max(0, width-2))), width))

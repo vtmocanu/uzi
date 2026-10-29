@@ -144,7 +144,7 @@ func TestForgeResumeUsesOrdinaryEndpoint(t *testing.T) {
 }
 
 func TestForgeCooldownStatesAndHostileRenderers(t *testing.T) {
-	const hostile = "\x1b[2J\x1b]0;bad\x07\x01\u202e\u2066\n\r\t"
+	const hostile = "\x1b[2J\x1b]0;bad\x07\x01\u202e\u2066\nFORGED\r\t"
 	until := time.Date(2000, 1, 2, 3, 4, 5, 0, time.UTC)
 	id := "exact-half-open-run" + hostile
 	for _, state := range []string{"cooling", "half_open", "retry_eligible_unverified", "legacy_serialized_until_upgrade", "reserved_unverified"} {
@@ -160,6 +160,7 @@ func TestForgeCooldownStatesAndHostileRenderers(t *testing.T) {
 					t.Fatalf("%v exit %d: %s", args, code, stderr)
 				}
 				assertNoRawControls(t, strings.Join(args, " "), out)
+				requireWorkerCopy(t, out, "FORGED")
 				requireWorkerCopy(t, out, "https://forge.example", "2000-01-02T03:04:05Z", "exact-half-open-run", "advisory-detail", "recovery unverified", "does not verify forge reachability")
 				if strings.Contains(out, "\nFORGED") {
 					t.Fatal("injected row")
@@ -173,19 +174,14 @@ func TestForgeCooldownStatesAndHostileRenderers(t *testing.T) {
 			m.workerDetail = workerDetailState{workerID: w.ID}
 			lines, _ := m.workerDetailLines(time.Now())
 			for name, out := range map[string]string{
-				"attention": strings.Join(func() []string {
-					var s []string
-					for _, a := range workerAttention(row, time.Now()) {
-						s = append(s, a.attnDetail)
-					}
-					return s
-				}(), "\n"),
-				"readout": strings.Join(m.workerReadout(row, 200), "\n"),
-				"detail":  strings.Join(lines, "\n"),
+				"detail": strings.Join(lines, "\n"),
 			} {
 				assertNoRawControls(t, name, out)
 				requireWorkerCopy(t, stripANSI(out), "https://forge.example", "2000-01-02T03:04:05Z", "exact-half-open-run", "advisory-detail", "recovery unverified")
 			}
+			readout := strings.Join(m.workerReadout(row, 200), "\n")
+			assertNoRawControls(t, "worker readout", readout)
+			requireWorkerCopy(t, stripANSI(readout), "https://forge.example", "unverified")
 			rowOut := m.workerRowLine(row, true, 200, m.workerTableWidths([]workerRow{row}, 200), time.Now())
 			assertNoRawControls(t, "worker row", rowOut)
 			requireWorkerCopy(t, stripANSI(rowOut), "forge:", "https://forge.example")
@@ -197,5 +193,54 @@ func TestForgeCooldownStatesAndHostileRenderers(t *testing.T) {
 			assertNoRawControls(t, "run detail", out)
 			requireWorkerCopy(t, stripANSI(out), "2000-01-02T03:04:05Z", "exact-half-open-run", "advisory-detail")
 		})
+	}
+}
+
+func TestForgeAdvicePreservesActionableBoardGuidance(t *testing.T) {
+	for _, tc := range []struct{ name, status, cause, hold string }{
+		{"retained adoption", "recovery_wait", "retained_recovery_adoption_failed", ""},
+		{"retained exhaustion", "recovery_wait", "retained_recovery_exhausted", ""},
+		{"memory", "recovery_wait", "worker_memory_pressure", ""},
+		{"provider", "recovery_wait", "provider_outage", ""},
+		{"vault", "recovery_wait", "vault_locked", ""},
+		{"credential", "paused", "", "credential_disabled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := apitypes.RunDTO{Status: tc.status, RecoveryWaitCause: &tc.cause, HoldReason: &tc.hold, RecoveryRetryNotBeforePresent: true}
+			m := workerRenderModel(false)
+			m.width = 200
+			row := apitypes.RunListItemDTO{RunDTO: r}
+			want := stripANSI(m.boardSecondLine(row))
+			if strings.TrimSpace(want) == "" {
+				t.Fatal("fixture has no actionable guidance")
+			}
+			row.ForgeOriginCooldown = &apitypes.ForgeOriginCooldownDTO{Origin: "https://forge.example", State: "cooling"}
+			if got := stripANSI(m.boardSecondLine(row)); got != want {
+				t.Fatalf("cooldown replaced actionable guidance: got %q want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestForgeWorkerListSummaryPreservesDiagnostics(t *testing.T) {
+	for _, width := range []int{80, 200} {
+		m := workerRenderModel(false)
+		w := apitypes.WorkerDTO{ID: "w1", Name: "diagnostic-worker", Status: "online"}
+		blocked := "outbox diagnostic"
+		w.OutboxBlocked = &blocked
+		base := m.workerReadout(workerRow{w: w}, width)
+		for i := 0; i < 32; i++ {
+			w.ForgeOriginCooldowns = append(w.ForgeOriginCooldowns, apitypes.ForgeOriginCooldownDTO{Origin: "https://forge.example", State: "cooling"})
+		}
+		got := m.workerReadout(workerRow{w: w}, width)
+		if len(got) > len(base)+1 {
+			t.Fatalf("width %d: cooldown expanded list by %d rows", width, len(got)-len(base))
+		}
+		requireWorkerCopy(t, stripANSI(strings.Join(got, "\n")), "outbox blocked")
+		for _, line := range got {
+			if visualWidth(line) > width {
+				t.Fatalf("readout exceeds width %d", width)
+			}
+		}
 	}
 }

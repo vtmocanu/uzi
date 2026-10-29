@@ -607,10 +607,6 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 		out := prefix + paintSeg(m.pal.amber, bg, false, "Owner-held · Resume/Cancel · detail: enter")
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}
-	if lines := forgeRunLines(r.RunDTO); len(lines) > 0 {
-		out := prefix + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(strings.Join(lines, " · "), 400))
-		return padSeg(clampVisual(out, m.width), m.width, bg)
-	}
 	if line := providerBoardLine(r.RunDTO); line != "" {
 		ink := m.pal.wait
 		if isProviderUnavailableHold(r.RunDTO) {
@@ -672,6 +668,11 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	// park above (the two are distinct recovery_wait causes, so at most one draws).
 	if line := fitDiskParkLine(r.RunDTO, m.width-4); line != "" {
 		out := prefix + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 240))
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
+	// Actionable holds take priority over advisory origin reachability.
+	if lines := forgeRunLines(r.RunDTO); len(lines) > 0 {
+		out := prefix + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(strings.Join(lines, " · "), 400))
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}
 	act := r.CurrentActivity
