@@ -189,11 +189,14 @@ describe("the executor-launch gate", () => {
     const claim = gitlabClaim(340405);
     const runner = runnerWith(stopAfterSeed(() => { started++; }), rawFakeGitlab({}).gitlab, undefined, undefined, { authority: r.rt });
     // The flight binds its lease, then another admission of the same clone replaces the epoch before launch.
-    const internals = runner as unknown as { bindFlightSource(flight: { sourceLease?: unknown }, clonePath: string): Promise<void> };
+    const internals = runner as unknown as {
+      bindFlightSource(flight: { sourceLease?: unknown; sourceUsePaths?: Set<string> }, clonePath: string): Promise<void>;
+    };
     const bind = internals.bindFlightSource.bind(runner);
     internals.bindFlightSource = async (flight, clonePath) => {
       await bind(flight, clonePath);
-      await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(clonePath, "seed-canonical"));
+      // The replacement is made inside the flight's own sink: another sink (or none) is refused as a foreign owner.
+      await r.rt.withTransaction(() => r.rt.recordAdmissions(flight.sourceUsePaths!, () => r.rt.hooks.admitSourceUse(clonePath, "seed-canonical")));
     };
     await runner.execute(claim);
     assert.equal(started, 0, "the executor did not start");

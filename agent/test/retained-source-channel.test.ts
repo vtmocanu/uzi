@@ -470,7 +470,7 @@ describe("discard through the real socket", () => {
       endSourceUse: async (paths: Iterable<string>) => {
         holder.events.push("end_source_use");
         holder.ended.push([...paths]);
-        return { ended: [], kept: [] };
+        return { ended: [], kept: [], endedSlots: [] };
       },
     };
     const rig = await rigOf({ server: { authority } });

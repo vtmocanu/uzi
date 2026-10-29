@@ -1810,6 +1810,31 @@ describe("issue #3404 M2 U3: a retained predecessor is admitted before its captu
     assert.equal((await slotOf(previous, pred.clonePath))?.state, "active", "the foreign epoch is untouched");
   });
 
+  it("issue #3638: a predecessor held by an earlier flight of this very process (no confirmed end, no memory provenance) stops nonterminal, not as preservation_failed", async () => {
+    const iid = 2903;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const before = treeHash(pred.clonePath);
+    const { current } = await runtimes();
+    // The earlier flight of the same process admitted the path and never reached a confirmed end.
+    const earlier = new Set<string>();
+    await current.recordAdmissions(earlier, () => current.bindSource(pred.clonePath));
+    current.retireSink(earlier);
+    const epoch = (await slotOf(current, pred.clonePath))?.epoch;
+    const { factory, started } = transientFactory();
+    const { calls, quiesceRun } = recorded(fastQuiesce);
+    const { runner } = restartedWorker(factory, { quiesceRun, authority: current });
+    await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
+    assert.deepEqual(calls, [], "the refusal precedes the capture's first proof");
+    assert.equal(started(), 0);
+    assert.equal(api.states.some((s) => s.runId === runId && s.body.status === "failed"), false, "no failed report");
+    assert.equal(failureOf(runId), "", "no preservation_failed blocker");
+    assert.equal(treeHash(pred.clonePath), before, "custody and the clone are retained untouched");
+    const slot = await slotOf(current, pred.clonePath);
+    assert.equal(slot?.state, "active", "the earlier flight's epoch is untouched");
+    assert.equal(slot?.epoch, epoch);
+  });
+
   it("a predecessor whose previous use ended is admitted with a fresh epoch before the first proof", async () => {
     const iid = 2902;
     const runId = randomUUID();
