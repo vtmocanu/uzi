@@ -440,8 +440,11 @@ uzi version
   timed retries by default followed by an owner hold (NULL retry) — or
   an integrity refusal, `retained_recovery_adoption_failed`, owner Resume/Cancel
   with no automatic retry regardless of retry timing — or
-  because the forge was unreachable at clone — cause `forge_unreachable`, capped by
-  `RUN_FORGE_UNREACHABLE_MAX_PARKS`; the sweep retries it on a capped backoff; cause
+  because the forge was unreachable at clone — cause `forge_unreachable`, with up to
+  `RUN_FORGE_UNREACHABLE_MAX_PARKS` timed parks (`0` means unlimited), followed by an
+  owner Resume/Cancel hold with NULL retry. Resume queues one bounded attempt without
+  resetting lifetime counts or bypassing cooldown/custody admission. Heartbeat online
+  does not prove forge reachability; cooldown expiry remains unverified. Cause
   `codex_account_unavailable` is held on its Codex account until that account is usable
   again: **reconciling** means automatic recovery is pending; unlock the vault or
   enable the credential if needed, and follow a re-login request on the same

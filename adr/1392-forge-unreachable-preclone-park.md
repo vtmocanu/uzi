@@ -1,7 +1,8 @@
 # ADR-1392: pre-clone forge-unreachable park (reuse `recovery_wait`, add a cause)
 
-**Status**: Accepted (PRD #1392 M1-M4 committed on this branch; M5 docs/ADR, M6
-hosted acceptance are the maintainer's, out of band).
+**Status**: Accepted; amended 2026-10-29 for #3585 M1-M4 behavior and M5
+documentation. First delivery is partial and non-closing; no hosted acceptance
+or publication recovery is claimed.
 **Date**: 2026-09-16
 **Issue**: [vtmocanu/uzi#1392](https://github.com/vtmocanu/uzi/issues/1392)
 **PRD**: [prds/done/1392-forge-unreachable-preclone-park.md](../prds/done/1392-forge-unreachable-preclone-park.md) —
@@ -35,7 +36,7 @@ The state already carries the promotion cadence, the owner-cancel path, and the 
 surfaces (run page, TUI, `uzi run get`). A fourth park state would touch the thirteen-value
 status list on every surface for no semantic gain the cause column doesn't already buy.
 `runs.recovery_wait_cause` (nullable text, CHECK'd against `forge_unreachable`,
-`empty_turn`, `provider_outage`) is what makes a forge-only cap and forge-specific wording
+`empty_turn`, `provider_outage` at introduction; later causes are additive) makes a forge-only cap and forge-specific wording
 possible without changing the empty-turn park's own contract (no lifetime cap, unchanged).
 NULL means "untyped/legacy" — mapping an absent cause to `empty_turn` would mislabel the
 existing provider park (PR #1385) that emits untyped today.
@@ -51,24 +52,28 @@ superseded:
   — a fifth release-evidence class, `no_adopted_source`, for a hold whose generation never
   adopted a source.
 
-### D3 — Custody is settled in the same transaction as the park
+### D3 — Original legacy custody settlement is atomic with the park
 
-The worker-side release call is best-effort and blind (it swallows transport and server
-errors and returns nothing), so "release the hold, then ask the server to park" cannot
+At introduction, the worker-side release call was best-effort and blind (it swallowed
+transport and server errors and returned nothing), so "release the hold, then ask the server to park" cannot
 promise zero open holds — a release that silently fails would leave the hold open forever
 with no worker-visible signal. Instead, `SetState` settles both in one locked transaction:
 it requires **exactly one** open hold for the exact `(run, worker, generation)`, releases it
-with evidence `no_adopted_source`, and only then parks (or fails past the cap). Zero holds,
+with evidence `no_adopted_source`, and only then parks. The original terminal-cap
+outcome is superseded by the 2026-10-29 owner-hold amendment below. Zero holds,
 several holds, or any failed step rolls the whole transaction back rather than parking with
 custody unsettled. This is the same atomicity principle ADR-1296 already applies to every
 other release path, extended to a case that ADR didn't anticipate — a generation with no
-source to prove anything against.
+source to prove anything against. This records the original legacy-hold policy;
+inventory-guarded generations now retain the hold until exact settled empty-inventory
+FINAL evidence, as described in [run recovery](../docs/run-recovery.md).
+The 2026-10-29 hold/Resume policy does not weaken that boundary.
 
 ### D5 — Placement and warmth are independent facts, both tested
 
-A promoted run stays `queued` with `worker_id` kept, so the existing affinity rules decide
-**placement**: the owner is preferred while it is live or draining, and a sibling can claim
-after the affinity ceiling or once the owner goes stale. Independently, the bare-repo cache
+A promoted run stays `queued` with `worker_id` kept. Ordinary affinity still applies,
+subject to the guarded immediate-escape policy in the 2026-10-29 amendment below:
+a live heartbeat is not proof of direct Git reachability. Independently, the bare-repo cache
 decides **warmth**: `ensureClone` warm-fetches when a bare already exists and cold-clones
 otherwise, and a failed cold clone removes its own partial bare. The owner is typically warm
 on a fetch failure (the bare survived) and cold after a failed first clone (the partial bare
@@ -96,11 +101,91 @@ degradation on such a fleet is therefore: an untyped, uncapped park exactly like
 today's safe failure — never a leaked hold, and the generation identity itself is never
 allowed to degrade or get inferred.
 
+## Amendment — 2026-10-29: owner hold and evidence-based placement (#3585)
+
+(AI-synced 2026-10-29)
+
+The #3585 incident remains the record of the live-worker/direct-Git failure.
+Heartbeat liveness proves contact with the API, not reachability of the forge.
+The original bounded-failure and ordinary-affinity policies above are amended
+to stop repeated failing placement without sacrificing unverified local work.
+The first delivery is partial and non-closing. Publication-only recovery
+(#1324) follows after the first merge; no probes, new run states or
+credentials are added.
+
+### Cooldown and the ordinary half-open claim
+
+An applied exhausted clone/fetch retry group updates one cooldown keyed by
+authenticated owner, worker and canonical actual Git origin, not the forge API
+host or repository path. Replayed/stale reports cannot count a second failure.
+The hard admission filter excludes that worker/origin before the deadline.
+When due, one ordinary claim reserves the half-open attempt under the existing
+claim locks; expiry alone leaves reachability unverified.
+
+The reservation remains through human/model waits in the same active flight.
+Optional negotiated direct clone/fetch success telemetry can clear the exact
+reservation. Independently, an admitted worker-finalize completion for
+`issue`, `mr_rework` or `self_improve` can clear it when the guarded hold,
+completion identity, current authorized origin and reservation versions match.
+Later broker publication, a receipt alone, a timer or an online heartbeat is
+not this evidence. A newer failure invalidates old success evidence.
+
+Other stopped outcomes release the reservation and leave the origin unverified.
+A worker without direct success reporting therefore serializes that origin
+for the active flight until an upgrade can report success (or qualifying
+guarded completion clears it); a stopped flight does not retain a perpetual
+reservation. See `forge_origin_reservation_lifecycle` in
+[the success migration](../api/internal/store/migrations/00380_forge_origin_success.sql)
+and [the authenticated observation/success queries](../api/internal/store/queries/forge_origin.sql).
+
+### Immediate affinity escape requires the complete history
+
+The ordinary affinity pin can be bypassed immediately for an unverified
+worker/origin only when generations 1..G have complete immutable guarded
+positive FINAL/source dispositions and no open hold in any generation.
+The accepted dispositions and exact identity/source/coverage checks live in
+`fn_forge_source_history_safe` in
+[the placement migration](../api/internal/store/migrations/00377_forge_origin_placement.sql).
+Missing generations, nonguarded evidence, multiple/conflicting sources,
+prerequisite-dependent captures or local-only work do not qualify.
+A bare available capture is not a FINAL disposition. Custody admission and
+source/deletion guards remain independent; safe placement does not settle a
+hold or prove a sibling is warm.
+
+### Finite automatic allowance, explicit owner retry
+
+After up to `RUN_FORGE_UNREACHABLE_MAX_PARKS` timed parks (default 6), the next
+exhausted group remains `recovery_wait` / `forge_unreachable` with a NULL retry.
+It neither fails terminally nor enqueues a judge. The lifetime forge count
+stays saturated at the consumed allowance; the recovery backoff count still
+increments. `0` preserves unlimited timed parks.
+
+Dedicated owner Resume queues one bounded ordinary attempt, preserving
+counts, custody, origin cooldown, unrelated grants and remaining wall budget.
+Hold time is banked after execution has started; spent wall may require an
+extension. Another exhausted group reholds. Cooldown, cordon, custody limits
+(including one or already-saturated custody) and worker capacity can still
+prevent admission: Resume is not an execution promise.
+
+Compatible serving APIs prevent timers, token changes, `set-token` and generic
+promotion from releasing NULL holds. An old API rollback can queue one extra
+attempt via `set-token`, with legacy terminal-cap behavior. Older workers may
+still say “retry after backoff”; current servers distinguish timed and held.
+No new worker ACK protocol is required. See
+[the hold/Resume writers](../api/internal/store/queries/runtime.sql) and
+[owner Resume](../api/internal/handler/resume.go).
+
+Archive export is an option when an archive is available, not a consequence
+of a forge park. Local protected-source admission is unchanged.
+Active [#2506](../prds/2506-prerequisite-closure.md) owns prerequisite closure;
+[#2746](../prds/2746-automatic-hold-settlement.md) owns the automatic-settlement
+programme. This delivery implements neither programme nor publication recovery.
+
 ## Consequences
 
-- A transient forge blip at clone or fetch no longer fails a run outright; it parks, retries
-  on the existing backoff, and resumes on its own. The owner sees "waiting for the forge,
-  retry at HH:MM (N of MAX)" instead of a failed run to re-dispatch by hand.
+- A transient forge blip at clone or fetch parks on timed backoff within the allowance;
+  exhaustion now holds for owner Resume/Cancel, as amended below. A timed retry is
+  distinct from both worker-origin cooldown and an owner-held NULL retry.
 - The forge-only cap (`RUN_FORGE_UNREACHABLE_MAX_PARKS`, default 6, `0` = unlimited) is a
   genuinely new lifetime limit on this one cause; the empty-turn park's "no lifetime cap"
   contract is unchanged, and the two counters (`forge_park_count` vs. the shared backoff

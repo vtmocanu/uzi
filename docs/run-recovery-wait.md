@@ -424,6 +424,34 @@ follow a legacy warm fetch; it does not prove that no local source exists.
 Existing source and custody protections remain in force, without promising
 a new checkpoint or an available recovery archive.
 
+### Worker-origin cooldown and safe placement
+
+An **online** worker is heartbeating to uzi; it may still be unable to reach
+the forge directly. An applied exhausted clone/fetch retry group updates a
+cooldown for that authenticated owner, worker and canonical actual Git
+origin. Repositories sharing that origin share the cooldown on that worker;
+another worker or origin has its own admission decision.
+
+Before the cooldown is due, that worker cannot claim the affected origin.
+When due, one ordinary claim reserves a half-open attempt. Time passing does
+not prove recovery. Human/model waits keep the reservation in the same
+active flight. Negotiated direct clone/fetch success telemetry or an exact
+admitted guarded worker-finalize completion for issue, MR rework or
+self-improvement can clear it. Other stopped outcomes release the
+reservation while leaving reachability unverified. Legacy workers without
+direct success reporting serialize the origin during the active flight;
+a stopped flight does not keep a perpetual reservation.
+
+A sibling can bypass ordinary affinity immediately only with complete
+immutable guarded positive FINAL/source dispositions for generations 1..G
+and no open hold in any generation. Missing or nonguarded history,
+multiple/conflicting sources and local-only work remain protected.
+This placement rule grants no custody release or source deletion.
+See [ADR-1392](../adr/1392-forge-unreachable-preclone-park.md)
+for the evidence boundary.
+
+### Timed retry or owner hold
+
 `RUN_FORGE_UNREACHABLE_MAX_PARKS` (default 6) allows up to that many timed
 forge parks over the run's lifetime. Each follows the capped backoff from
 `RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`. After the allowance
@@ -458,9 +486,12 @@ NULL-retry hold will resume automatically.
 
 A permanent forge error (401/403/404 — bad credentials or a deleted repo)
 still fails the run immediately instead of parking. Cancel ends the run
-`cancelled`, as usual. The original incident is recorded in issue #3585.
+`cancelled`, as usual. Archive export is available when an archive exists;
+a forge park alone does not create one. The original incident remains
+recorded in issue #3585; first delivery is partial and non-closing.
 Publication-only recovery (#1324) is separate follow-up after the first
-merge; this clone/fetch policy does not provide publication recovery.
+merge; this clone/fetch policy does not provide publication recovery or
+add probes, run states or credentials.
 
 ## Codex account unavailable
 

@@ -6220,8 +6220,8 @@ export class RunRunner {
   }
 
   /**
-   * Today's generic terminal FAILED path (extracted verbatim so the pre-clone
-   * forge-unreachable park's `fail` arm can reuse it). failure_reason goes straight to
+   * The generic terminal FAILED path, also used when a forge report is refused.
+   * failure_reason goes straight to
    * reportState, bypassing the batcher's redactor, and the sdk-executor catch-all re-throws raw
    * SDK errors into this path — so scrub it here with the run's own secret set. A plan rejection
    * carries the user's verbatim reason; scrubbing it too is harmless for plain text and a safety

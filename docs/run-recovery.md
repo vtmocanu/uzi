@@ -1005,6 +1005,17 @@ final acknowledgment or the distinct completed-publication cleanup authority. Se
 for the exact checks; the [bad-MAC terminal-record cleanup](#when-a-terminal-record-fails-authentication-after-restart)
 below remains a distinct policy.
 
+Forge clone/fetch cooldown, timed retry and owner hold are separate from
+source custody. An online heartbeat does not establish direct Git
+reachability. Immediate escape from ordinary worker affinity requires
+complete immutable guarded positive FINAL/source dispositions for
+generations 1..G and no open hold in any generation; missing, nonguarded,
+multiple/conflicting-source or local-only evidence remains protected.
+An available archive alone does not establish that complete history.
+Resume preserves custody and cooldown and does not promise execution.
+Export an archive when one is available; a forge park does not promise one.
+See [Forge unreachable at clone](./run-recovery-wait.md#forge-unreachable-at-clone).
+
 A guarded generation that parks (forge unreachable) or fails before its
 repository was ever cloned adopted nothing, yet its hold stays open until a
 final disposition. The worker closes that empty hold itself: after reporting

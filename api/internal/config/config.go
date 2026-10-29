@@ -1256,11 +1256,9 @@ func Load() (Config, error) {
 	cfg.RunRetainedRecoveryMaxParks = parseNonNegInt("RUN_RETAINED_RECOVERY_MAX_PARKS", 3)
 	cfg.RunRecoveryMaxPark = parseDuration("RUN_RECOVERY_MAX_PARK", 30*time.Minute)
 
-	// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2). parseNonNegInt, so
-	// RUN_FORGE_UNREACHABLE_MAX_PARKS=0 is legal and means "unlimited" (never fail on the
-	// count) — the deliberate off switch, matching how RUN_LIMIT_MAX_WAITS=0 means "never
-	// park". Default 6 (≈ an hour of parks at the recovery-park defaults; more once earlier
-	// parks raise the backoff).
+	// Forge-unreachable lifetime timed-park allowance. After the allowance is
+	// consumed, the next exhausted group waits for owner Resume with NULL retry.
+	// RUN_FORGE_UNREACHABLE_MAX_PARKS=0 deliberately permits unlimited timed parks.
 	cfg.RunForgeUnreachableMaxParks = parseNonNegInt("RUN_FORGE_UNREACHABLE_MAX_PARKS", 6)
 	// Plan-gate re-presentation refusal cap (PRD #1795 M1). parseNonNegInt, so
 	// RUN_GATE_REFUSAL_MAX=0 is legal and means "unlimited", the same off switch as

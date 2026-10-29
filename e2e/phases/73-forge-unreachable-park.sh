@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # phase:    forge-unreachable-park
-# title:    PRD #1392: pre-clone forge park — recovery_wait(forge_unreachable), promote+complete, cap-fail no judge, cancel
+# title:    PRD #1392: pre-clone forge park — recovery_wait(forge_unreachable), promote+complete, owner hold/Resume/rehold no judge, cancel
 # critical: no
 # lane:     gitlab
 # executor: stub
@@ -10,7 +10,7 @@
 # mutates:  rewrites the agent gitconfig so the AGENT's clone/fetch URL redirects to an unresolvable .invalid host (a pre-phase copy is saved); forge-fake stays UP the WHOLE phase so the api's claim-time default-branch guardrail + the poller keep reaching it over HTTP; lowers the api forge-park cap to 2 via E2E_FORGE_UNREACHABLE_MAX_PARKS in the env-file (api force-recreated while forge-fake is healthy)
 # restores: gitconfig restored byte-for-byte from the pre-phase copy; the forge-park cap default restored (env line removed, api recreated) — done in-phase on the happy path AND by an EXIT-trap fail-safe (phase 20 / 35 precedent) so the fail-soft driver never continues on a broken stack
 # =============================================================================
-# PRD #1392 M4 — the pre-clone forge-unreachable park, end to end through the LIVE
+# M5 contract update — the pre-clone forge-unreachable park, end to end through the LIVE
 # claim/clone/park/promote loop (the store-level and worker-level halves are proven at
 # cheaper layers: api/internal/workersvc/forgepark_livedb_test.go +
 # forgepark_resume_livedb_test.go, and agent/test/runner-forge-park.test.ts).
@@ -43,19 +43,20 @@
 #   A  transient outage → the run PARKS (recovery_wait, cause forge_unreachable,
 #      forge_park_count=1, retry stamped, exact-generation custody released after the
 #      guarded final receipt (legacy release is atomic), one feed event, NOT failed); the git path is restored, the sweeper
-#      promotes on the retry stamp, the worker re-claims (guard passes) and re-clones against
+#      promotes subject to actual-origin cooldown after the retry stamp, the worker re-claims (guard passes) and re-clones against
 #      the working local bare, and it COMPLETES on approve.
-#   B  the git path stays broken through the cap (lowered to 2): two parks, then the third
-#      forge-unreachable attempt cap-fails the run with fail_origin=forge_unreachable and
-#      NO judge run (forge_unreachable is in neverJudgeFailOrigins; see the note at the
-#      assertion for why the e2e confirms absence and the exclusion gate is proven elsewhere).
+#   B  two timed parks consume the allowance; the next exhausted retry group holds
+#      recovery_wait(forge_unreachable), count=2, retry=NULL, preserving the exact
+#      worker/session/claim and custody (guarded empty settlement after ACK allowed).
+#      Owner Resume queues one ordinary attempt; if admission headroom exists it
+#      exhausts and reholds without resetting the allowance. Cancel cleans up.
 #   C  an owner cancel during the clone retries ends the run cancelled (the park
 #      transaction reads the stamped cancel under its lock and cancels instead of parking).
 #
 # The incident's DNS shape stays a unit case in agent/test/forge-retry.test.ts; this phase
 # asserts the PARK, not the error phrase.
 # =============================================================================
-say "PRD #1392 M4: pre-clone forge-unreachable park — park+promote, cap-fail (no judge), cancel"
+say "PRD #1392 M4: pre-clone forge-unreachable park — park+promote, owner hold/Resume/rehold (no judge), cancel"
 
 GITCONFIG="$RUNROOT/agent-gitconfig/gitconfig"
 GITCONFIG_SAVE="$RUNROOT/agent-gitconfig/gitconfig.pre-73"
@@ -123,6 +124,7 @@ assert_one_park_event() {
 # attempt resolves the `.invalid` host and fails transiently. Sets DISPATCHED_RUN.
 dispatch_run_forge_broken() {
   local title="$1" iid
+  wait_custody_headroom 1
   DISPATCHED_RUN=""
   iid="$(apipost "/api/repos/$REPO_ID/issues" \
     "$(jq -nc --arg t "$title" '{title:$t,description:"implements prds/4-agent-runtime-workers.md"}')" \
@@ -184,46 +186,72 @@ pass "parked generation custody released with the required evidence"
 # Exactly one feed event on the run feed (D4/D10).
 assert_one_park_event "$RUN_A"
 
-# Restore the working clone path: the sweeper promotes on the retry stamp, the worker
+# Restore the working clone path: the sweeper may promote after the run retry stamp;
+# actual-origin cooldown remains a hard claim filter until due, with one half-open
+# reservation. Local-bare insteadOf restores git only, not cooldown health. The worker
 # re-claims (guard passes) and re-clones against the working local bare, reaches the plan
 # gate, and completes on approve.
 restore_git_path
 pass "git clone path restored (working local bare); awaiting promotion + resume"
-wait_status "$RUN_A" awaiting_approval 150
+wait_status "$RUN_A" awaiting_approval 600
 apipost "/api/runs/$RUN_A/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
 wait_status "$RUN_A" completed 150
 pass "Case A: run $RUN_A promoted, re-cloned against the working path, and completed"
 
-# --- Case B: the git path stays broken through the cap → forge_unreachable, no judge -
-say "Case B: the clone stays broken through the cap (2) — the run fails forge_unreachable, no judge"
+# --- Case B: finite timed allowance → owner hold → Resume → rehold ------------
+say "Case B: exhausted forge allowance holds count=2, no terminal failure or judge"
 break_git_path
-dispatch_run_forge_broken "E2E forge park cap-fail"
+dispatch_run_forge_broken "E2E forge owner hold"
 RUN_B="$DISPATCHED_RUN"
-pass "dispatched run $RUN_B; the git path stays broken so every re-clone re-parks toward the cap"
-
-# Two parks (count 1, then 2), then the 3rd forge-unreachable attempt exceeds the cap and
-# fails the run. Each cycle is ~31s of clone retries + the promotion backoff, so allow room.
-wait_status "$RUN_B" failed 360
-FB="$(apiget "/api/runs/$RUN_B")"
-[ "$(echo "$FB" | jq -r '.run.fail_origin')" = forge_unreachable ] \
-  || fail "fail_origin != forge_unreachable (got: $(echo "$FB" | jq -c '.run.fail_origin'))"
-[ "$(echo "$FB" | jq -r '.run.forge_park_count')" = 2 ] \
-  || fail "forge_park_count != 2 after the cap-fail (got: $(echo "$FB" | jq -c '.run.forge_park_count'))"
-# forgepark.go's cap branch calls SetRunFailed, which stamps finished_at. Guarded
-# settlement follows that terminal ACK, so its release must follow finished_at.
-PARK_GENERATION_B="$(db_psql "SELECT claim_generation FROM runs WHERE id='$RUN_B'")"
-wait_forge_park_release "$RUN_B" "$PARK_GENERATION_B" 10 failed
-[ "$(db_psql "SELECT count(*) FROM recovery_custody_holds WHERE run_id='$RUN_B' AND state='open'")" = 0 ] \
-  || fail "the cap-failed run left an open custody hold after its final receipt"
-# Confirm no judge run exists for the cap-fail. NOTE: the judge is globally disabled at this
-# point in the suite (phases 35/39 leave judge_enabled=false), so this checks ABSENCE rather
-# than exercising the exclusion gate itself. The forge_unreachable exclusion (neverJudgeFailOrigins)
-# is proven at the mutation level by TestForgeParkCapExceededResumedRunNoJudgeLiveDB (which
-# enables the judge) and TestNeverJudgeFailOriginsExact. Target column matches phase 35.
+# Capture the third claim WHILE its bounded clone retries are running, so the
+# subsequent hold must preserve its worker/session/current generation and hold ID.
+# The actual-origin backoff can exceed the run retry; do not force it due in SQL.
+wait_eq true 900 "forge third attempt" forge_attempt_ready "$RUN_B"
+BEFORE_B="$(forge_park_posture "$RUN_B")"
+wait_eq true 150 "forge owner hold" forge_owner_hold_ready "$RUN_B"
+FB="$(forge_park_posture "$RUN_B")"
+assert_forge_owner_hold "$BEFORE_B" "$FB"
+PARK_GENERATION_B="$(printf '%s' "$FB" | jq -r '.generation')"
+# Guarded empty inventory may settle AFTER ACK, but legacy custody is preserved.
+# Judge is disabled by earlier phases: this proves absence, not its exclusion gate.
+if [ "$(printf '%s' "$FB" | jq -r '.holds[0].guarded')" = true ]; then
+  wait_forge_park_release "$RUN_B" "$PARK_GENERATION_B"
+fi
 [ -z "$(db_psql "SELECT id FROM runs WHERE kind='judge' AND target_run_id='$RUN_B'")" ] \
-  || fail "a judge run was enqueued for the forge_unreachable failure"
-pass "Case B: run $RUN_B failed forge_unreachable (count=2), no open hold, no judge run"
-# Working path back for later phases; broken again per Case C below.
+  || fail "a judge run was enqueued for the forge owner hold"
+pass "Case B: same claim held, count=2 retry=NULL, no terminal failure or judge"
+
+# Resume queues an ordinary attempt, not a cooldown/custody bypass. The API
+# rereads after the write: if cooldown expired, that response may already show
+# the ordinary claim. No fresh park allowance is granted.
+RESUMED_B="$(apipost "/api/runs/$RUN_B/resume" '{}')"
+printf '%s' "$RESUMED_B" | jq -e '(.run.status=="queued" or .run.status=="claimed" or .run.status=="running")
+  and .run.forge_park_count==2
+  and .run.recovery_wait_cause==null and .run.recovery_retry_not_before==null
+  and .run.fail_origin==null and .run.finished_at==null' >/dev/null \
+  || fail "Resume did not queue one ordinary attempt: $RESUMED_B"
+# Check counted admission, not total open custody. At limit=1 or saturation the
+# retained hold may block the ordinary claim: keep that queued contract valid and
+# leave rehold execution to the hermetic/live-DB tests rather than promising it.
+ADMISSION_B="$(apiget /api/recovery/holds)"
+printf '%s' "$ADMISSION_B" | jq -e '.aggregate | [.admission_counted_holds,.custody_hold_limit]
+  | all(.[]; type=="number" and .>=0 and .==floor)' >/dev/null \
+  || fail "invalid custody admission aggregate: $ADMISSION_B"
+if printf '%s' "$ADMISSION_B" | jq -e '.aggregate | .custody_hold_limit==0
+    or (.custody_hold_limit>1 and .admission_counted_holds+1<=.custody_hold_limit)' >/dev/null; then
+  wait_eq true 900 "forge resumed ordinary attempt" forge_attempt_ready "$RUN_B" "$PARK_GENERATION_B"
+  BEFORE_REHOLD_B="$(forge_park_posture "$RUN_B")"
+  wait_eq true 150 "forge owner rehold" forge_owner_hold_ready "$RUN_B"
+  assert_forge_owner_hold "$BEFORE_REHOLD_B" "$(forge_park_posture "$RUN_B")"
+  pass "Case B: one resumed retry group exhausted and reheld at count=2"
+else
+  pass "Case B: Resume queued; custody limit/saturation prevents an execution guarantee (rehold not exercised)"
+fi
+[ -z "$(db_psql "SELECT id FROM runs WHERE kind='judge' AND target_run_id='$RUN_B'")" ] \
+  || fail "a judge run was enqueued after Resume/rehold"
+apipost "/api/runs/$RUN_B/inputs" '{"kind":"cancel","body":""}' >/dev/null
+wait_status "$RUN_B" cancelled 150
+pass "Case B: owner cancel converged from held/queued posture"
 restore_git_path
 
 # --- Case C: an owner cancel during the retries → cancelled -------------------
@@ -231,6 +259,10 @@ say "Case C: an owner cancel during the clone retries ends the run cancelled"
 break_git_path
 dispatch_run_forge_broken "E2E forge park cancel"
 RUN_C="$DISPATCHED_RUN"
+# An earlier origin observation may still cool this fresh run. Wait for an
+# actual ordinary claim before canceling, rather than canceling a queued run.
+wait_status "$RUN_C" running 600
+PARK_GENERATION_C="$(db_psql "SELECT claim_generation FROM runs WHERE id='$RUN_C'")"
 # Cancel while the worker is still in its clone-retry window (pre-park). The park
 # transaction reads the stamped cancel under its lock and transitions to cancelled instead
 # of parking (D4). Legacy custody releases in that transaction; guarded custody
@@ -239,7 +271,10 @@ RUN_C="$DISPATCHED_RUN"
 apipost "/api/runs/$RUN_C/inputs" '{"kind":"cancel","body":""}' >/dev/null
 pass "dispatched run $RUN_C and queued an owner cancel during the retries"
 wait_status "$RUN_C" cancelled 150
-pass "Case C: run $RUN_C reached cancelled"
+wait_forge_park_release "$RUN_C" "$PARK_GENERATION_C" 10 cancelled
+[ -z "$(db_psql "SELECT id FROM runs WHERE kind='judge' AND target_run_id='$RUN_C'")" ] \
+  || fail "a judge run was enqueued for the cancelled clone"
+pass "Case C: run $RUN_C cancelled with its exact final custody receipt, no judge"
 
 # --- restore (explicit happy path) + drop the fail-safe ----------------------
 say "restore: default clone path, default forge-park cap"

@@ -1176,7 +1176,12 @@ chain in the diagram above, with no intervening `running`.
   **pre-clone forge-unreachable park** (issue #1392): a transient forge
   failure at clone or fetch parks here too, cause `forge_unreachable`, capped
   by `RUN_FORGE_UNREACHABLE_MAX_PARKS` (unlike the empty-turn cause, which has
-  no lifetime cap). See
+  no lifetime cap). Exhaustion holds for owner Resume/Cancel with a NULL retry
+  rather than failing. An owner/worker/actual-Git-origin cooldown filters new
+  claims until due, then serializes one ordinary recovery trial. Expiry is
+  unverified; safe early affinity escape requires complete guarded source
+  disposition evidence. These placement hints grant no execution or custody
+  authority. See
   [adr/1197-transient-recovery-park.md](adr/1197-transient-recovery-park.md),
   [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md) (the
   2026-09-14 PRD #1349 amendment),

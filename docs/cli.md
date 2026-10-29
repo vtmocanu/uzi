@@ -521,8 +521,20 @@ A few worth knowing:
   remaining budget (the clock stopped while paused, so resuming does not
   reset it). The claim then continues the same SDK session if that worker
   is still alive, or recovers the branch from the checkpoint and re-plans
-  the remaining milestones if it's gone. A run that isn't paused is a 409
-  (exit 5). It posts to the same endpoint as `run resume-now` below, which
+  the remaining milestones if it's gone. It also resumes an owner-held
+  `recovery_wait` / `forge_unreachable` run whose retry is explicitly NULL:
+  `uzi run resume <id>` queues one bounded ordinary attempt, preserving the
+  saturated lifetime forge count, custody, cooldown, unrelated grants and
+  remaining wall. Another exhausted clone/fetch group reholds; an exhausted
+  wall may require extension first. Queued does not promise execution past
+  cooldown, cordon, custody limits or capacity. Timed forge parks retry on
+  their schedule; compatible APIs prevent token changes/`set-token` from
+  releasing NULL holds. An old API rollback may queue one extra attempt with
+  legacy terminal-cap behavior; an older worker's “retry after backoff” is
+  not proof of a timer. See
+  [Forge unreachable at clone](./run-recovery-wait.md#forge-unreachable-at-clone).
+  Other unsupported states return 409 (exit 5).
+  It posts to the same endpoint as `run resume-now` below, which
   also resumes an ordinary paused run in addition to a pool-held one.
   A `completion_blocked` hold refuses plain resume; use `run decide` or an
   eligible `run set-token` switch. Resuming a run the

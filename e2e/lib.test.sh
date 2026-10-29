@@ -330,7 +330,7 @@ park_fixture() {
   local step status
   for step in "$@"; do
     status=recovery_wait
-    if [[ "$step" == failed:* ]]; then status=failed; step="${step#failed:}"; fi
+    if [[ "$step" == cancelled:* ]]; then status=cancelled; step="${step#cancelled:}"; fi
     jq -nc --arg step "$step" --arg status "$status" '{state:"open",inventory_guarded:true,generation:1,claim_generation:1,run_status:$status,final_disposition:null,release_evidence:null,after_outcome:null}
       | if $step=="released" then .+{state:"released",final_disposition:"settled",release_evidence:"forge_no_output",after_outcome:true}
         elif $step=="wrong" then .+{state:"released",final_disposition:"no_adopted_source",release_evidence:"no_adopted_source",after_outcome:true}
@@ -365,14 +365,67 @@ park_fixture duplicate
 custody_case "two matching holds cannot mask the open first row" fail "expected exactly one hold" wait_forge_park_release R 1 2
 park_fixture released
 custody_case "null generation cannot reach SQL" fail "invalid generation" wait_forge_park_release R null 2
-park_fixture failed:open failed:released
-custody_case "guarded cap failure waits for its final receipt" pass "" wait_forge_park_release R 1 5 failed
-park_fixture failed:wrong
-custody_case "cap failure refuses wrong final evidence" fail "wrong release evidence" wait_forge_park_release R 1 2 failed
-park_fixture failed:early
-custody_case "cap release predating terminal outcome is refused" fail "wrong release evidence" wait_forge_park_release R 1 2 failed
+park_fixture cancelled:open cancelled:released
+custody_case "guarded cancellation waits for its final receipt" pass "" wait_forge_park_release R 1 5 cancelled
+park_fixture cancelled:wrong
+custody_case "cancellation refuses wrong final evidence" fail "wrong release evidence" wait_forge_park_release R 1 2 cancelled
+park_fixture cancelled:early
+custody_case "cancel release predating terminal outcome is refused" fail "wrong release evidence" wait_forge_park_release R 1 2 cancelled
 park_fixture promoted
-custody_case "cap failure refuses status change" fail "changed run/generation" wait_forge_park_release R 1 2 failed
+custody_case "cancellation refuses status change" fail "changed run/generation" wait_forge_park_release R 1 2 cancelled
+
+# Finite forge allowance: use distinct claim/session/hold identities so folds
+# cannot accidentally compare equal. Exercise the actual assertions with no clock wait.
+eval "$(awk '/^assert_forge_owner_hold\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^forge_attempt_ready\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^forge_owner_hold_ready\(\) \{/,/^\}/' "$LIB")"
+FORGE_BEFORE='{"status":"running","worker_id":"worker-B","session_id":"session-B","generation":3,"claim_released_at":null,"count":2,"holds":[{"id":"hold-B","guarded":true,"state":"open","disposition":null,"evidence":null}]}'
+FORGE_HELD="$(printf '%s' "$FORGE_BEFORE" | jq -c '.+{status:"recovery_wait",cause:"forge_unreachable",retry:null,fail_origin:null,finished_at:null}')"
+custody_case "forge finite allowance holds the same claim" pass '' assert_forge_owner_hold "$FORGE_BEFORE" "$FORGE_HELD"
+FORGE_SETTLED="$(printf '%s' "$FORGE_HELD" | jq -c '.holds[0]+={state:"released",disposition:"settled",evidence:"forge_no_output",after_ack:true}')"
+custody_case "forge held guarded empty receipt after ACK is allowed" pass '' assert_forge_owner_hold "$FORGE_BEFORE" "$FORGE_SETTLED"
+for fold in '.count=3' '.retry="tomorrow"' '.status="failed"' '.cause=null' '.fail_origin="forge_unreachable"' '.finished_at="now"' '.worker_id="worker-A"' '.session_id="session-A"' '.generation=2' '.claim_released_at="now"' '.holds[0].id="hold-A"' '.holds=[]' '.holds += .holds' '.holds[0].guarded=false' '.holds[0].after_ack=false' '.holds[0].evidence="no_adopted_source"'; do
+  mutant="$(printf '%s' "$FORGE_SETTLED" | jq -c "$fold")"
+  custody_case "forge hold refuses $fold" fail 'changed claim/custody or terminalized' assert_forge_owner_hold "$FORGE_BEFORE" "$mutant"
+done
+legacy_before="$(printf '%s' "$FORGE_BEFORE" | jq -c '.holds[0].guarded=false')"
+legacy_held="$(printf '%s' "$FORGE_HELD" | jq -c '.holds[0].guarded=false')"
+custody_case "forge owner hold preserves legacy open custody" pass '' assert_forge_owner_hold "$legacy_before" "$legacy_held"
+legacy_released="$(printf '%s' "$FORGE_SETTLED" | jq -c '.holds[0].guarded=false')"
+custody_case "forge owner hold refuses legacy release" fail 'changed claim/custody' assert_forge_owner_hold "$legacy_before" "$legacy_released"
+forge_park_posture() { printf '%s' "$FORGE_PROBE"; }
+FORGE_PROBE="$FORGE_HELD"
+custody_case "NULL retry owner hold is ready" pass true forge_owner_hold_ready R
+FORGE_PROBE="$(printf '%s' "$FORGE_HELD" | jq -c '.retry="later"')"
+custody_case "timed park is not an owner hold" pass false forge_owner_hold_ready R
+FORGE_PROBE="$FORGE_BEFORE"
+custody_case "Resume new ordinary generation is observable" pass true forge_attempt_ready R 2
+custody_case "Resume cannot reuse old generation" pass false forge_attempt_ready R 3
+FORGE_PROBE="$(printf '%s' "$FORGE_BEFORE" | jq -c '.generation=4')"
+custody_case "Resume cannot skip an extra generation" pass false forge_attempt_ready R 2
+FORGE_PROBE="$(printf '%s' "$FORGE_HELD" | jq -c '.status="queued"')"
+custody_case "cooldown or custody queued Resume is not execution" pass false forge_attempt_ready R 2
+FORGE_PROBE="$(printf '%s' "$FORGE_HELD" | jq -c '.status="failed"')"
+custody_case "terminal outcome aborts owner hold polling" fail 'unexpectedly terminal' forge_owner_hold_ready R
+custody_case "terminal outcome aborts resumed attempt polling" fail 'unexpectedly terminal' forge_attempt_ready R 2
+
+# Replay the shipped Resume response assertion, with the public DTO seam.
+forge_resume_response_contract() {
+  # shellcheck disable=SC2034  # consumed by the extracted phase response assertion
+  local RUN_B=B RESUMED_B
+  apipost() { printf '%s' "$FORGE_RESUME_REPLY"; }
+  eval "$(awk '/^RESUMED_B=/ {active=1} active {print} active && index($0, "Resume did not queue one ordinary attempt") {exit}' "$ROOT/e2e/phases/73-forge-unreachable-park.sh")"
+}
+FORGE_RESUME_REPLY='{"run":{"status":"queued","forge_park_count":2,"recovery_wait_cause":null,"recovery_retry_not_before":null,"fail_origin":null,"finished_at":null}}'
+custody_case "owner Resume queues an ordinary attempt at count=2" pass '' forge_resume_response_contract
+for status in claimed running; do
+  FORGE_RESUME_REPLY="$(printf '%s' '{"run":{"forge_park_count":2}}' | jq -c --arg status "$status" '.run.status=$status')"
+  custody_case "Resume response may already show $status after cooldown expiry" pass '' forge_resume_response_contract
+done
+for fold in '.run.status="failed"' '.run.forge_park_count=0' '.run.recovery_wait_cause="forge_unreachable"' '.run.recovery_retry_not_before="later"' '.run.fail_origin="forge_unreachable"' '.run.finished_at="now"'; do
+  FORGE_RESUME_REPLY="$(printf '%s' '{"run":{"status":"queued","forge_park_count":2}}' | jq -c "$fold")"
+  custody_case "Resume response refuses $fold" fail 'Resume did not queue one ordinary attempt' forge_resume_response_contract
+done
 
 # Drive the real sequential outbox creation seam, not just the admission helper.
 # Each fresh claim must observe a saturated-then-free owner before create_run.
@@ -403,7 +456,9 @@ custody_case "each sequential outbox claim waits for one slot" pass 'two fresh c
 db_psql() {
   case "$1" in
     'SELECT id FROM users'*) echo owner;;
-    'SELECT claim_generation FROM runs'*) echo 1;;
+    'SELECT claim_generation FROM runs'*)
+      [[ "$1" != *\\* ]] || fail 'generation SQL contains literal backslash'
+      echo 1;;
     *"user_id = 'owner'"*) echo 1;;
     *) fail "unexpected owner/generation query: $1";;
   esac
@@ -419,14 +474,13 @@ readoption_owner_queries() {
 custody_case "readoption keeps its later owner-scoped precondition" pass 'owner resolved' readoption_owner_queries
 wait_forge_park_release() {
   [ "$2" = 1 ] || fail 'phase did not use authoritative DB generation'
-  [ "$1" != B ] || [ "${4:-}" = failed ] || fail 'cap call lacks the expected terminal status'
   park_calls=$((park_calls + 1))
 }
 park_phase_call() {
   local park_calls=0
-  local -x RUN_A=R RUN_B=B FA='{"run":{"status":"recovery_wait"}}'
-  eval "$(awk '/^PARK_GENERATION(_B)?=/ || /^wait_forge_park_release /' "$ROOT/e2e/phases/73-forge-unreachable-park.sh")"
-  [ "$park_calls" = 2 ] || fail 'phase did not wait for both park and cap receipts'
+  local -x RUN_A=R RUN_B=B RUN_C=C FB='{"generation":1}' FA='{"run":{"status":"recovery_wait"}}'
+  eval "$(awk '/^PARK_GENERATION(_[BC])?=/ || /^[[:space:]]*wait_forge_park_release /' "$ROOT/e2e/phases/73-forge-unreachable-park.sh")"
+  [ "$park_calls" = 3 ] || fail 'phase did not wait for timed, owner-hold and cancellation receipts'
   echo 'phase used authoritative DB generation'
 }
 custody_case "park phase gets generation absent from run DTO" pass 'phase used authoritative DB generation' park_phase_call
