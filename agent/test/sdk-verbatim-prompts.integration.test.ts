@@ -267,6 +267,14 @@ describe("streamed prompts are not preprocessed by the CLI (issue #1563)", () =>
     const d = await drive(prompt);
     assert.ok(!sent(d, OUTSIDE_MARKER), "the outside-worktree @path file reached the provider");
     assert.ok(lastUserText(d).includes(`@${outside}`), "the outside @path mention was not delivered literally");
+    // The other half of the bypass: the same file read through the tool path is refused by the
+    // guard's worktree confinement, so only the CLI preprocessing could have reached it.
+    readTarget = outside;
+    const direct = await drive("Read the file, please.");
+    const reads = guardedReads(direct);
+    assert.equal(reads.length, 1, `expected one guarded Read: ${JSON.stringify(direct.hooks)}`);
+    assert.ok(isDeny(reads[0]!.decision), "the guard did not deny a Read outside the worktree");
+    assert.ok(!sent(direct, OUTSIDE_MARKER), "the outside file's content reached the provider");
   });
 
   /** A mention pair the way an attacker writes it into untrusted text: one denied in-worktree file, one outside. */
@@ -354,7 +362,7 @@ describe("streamed prompts are not preprocessed by the CLI (issue #1563)", () =>
     }
   });
 
-  it("slash text embedded in a generated prompt is never dispatched",{ timeout: 120_000 }, async () => {
+  it("slash text embedded in a generated prompt is never dispatched", { timeout: 120_000 }, async () => {
     const control = await drive(COMMAND, { verbatimPrompts: false });
     assert.ok(firstSent(control, CMD_MARKER), "control: the command fixture is not dispatchable, so this probe proves nothing");
     for (const override of [{ verbatimPrompts: false }, {}]) {

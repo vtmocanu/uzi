@@ -229,8 +229,9 @@ describe("first-turn compatibility with verbatimPrompts true (issue #1563)", () 
     sameSet(toolNames(main[0]!), surface.tools, "first-request tools must equal lane.surface.tools (no widening)");
   });
 
-  /** Production advice options reach the real CLI through a queryFn that only swaps the credential
-   *  for the fake provider (base URL, dummy key) and the cwd; every other option is production's. */
+  /** Production advice options reach the real CLI through a queryFn that only rewrites `env` (the
+   *  credential for the fake provider's base URL and dummy key, plus TMPDIR and the DISABLE_* flags)
+   *  and `cwd`; every other option, hooks and verbatimPrompts included, is production's. */
   function adviceQuery(flip: boolean): SdkQueryFn {
     return (p) => {
       const e: Record<string, string | undefined> = { ...p.options.env };
