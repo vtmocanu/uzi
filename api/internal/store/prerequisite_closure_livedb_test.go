@@ -1082,7 +1082,9 @@ func TestPrerequisiteClosureDownConcurrentInsertLiveDB(t *testing.T) {
 	defer func() {
 		_ = tx.Rollback(ctx)
 		if !joined {
-			<-done
+			if err := <-done; err != nil {
+				t.Errorf("join Down after rollback: %v", err)
+			}
 		}
 	}()
 	for {

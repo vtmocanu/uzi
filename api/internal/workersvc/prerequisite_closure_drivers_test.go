@@ -185,7 +185,7 @@ func newPrerequisiteDriverFixture(t *testing.T, c prerequisiteDriverCase) *prere
 				f.replies[key] = prerequisiteDriverReply{body: `{"total_commits":1}`}
 			}
 		}
-		if c.kind == "forgejo" && !(last && (c.mode == "a-nonzero" || c.mode == "http-error" || c.mode == "compare-redirect")) {
+		if c.kind == "forgejo" && (!last || c.mode != "a-nonzero" && c.mode != "http-error" && c.mode != "compare-redirect") {
 			key = f.expect(prefix+"/repos/acme/widgets/compare/"+sha+"..."+prerequisiteTestTip, "", `{"total_commits":1}`)
 			if last {
 				switch c.mode {
@@ -238,7 +238,7 @@ func (f *prerequisiteDriverFixture) sweep(t *testing.T, c prerequisiteDriverCase
 		t.Fatalf("driver builds=%d want=%d", f.builder.builds, attempt)
 	}
 	m := f.m
-	if m.row.State != c.state || m.row.Reason != c.reason || m.row.Attempts != int32(attempt) {
+	if m.row.State != c.state || m.row.Reason != c.reason || int64(m.row.Attempts) != int64(attempt) {
 		t.Fatalf("state=%s reason=%s attempts=%d", m.row.State, m.row.Reason, m.row.Attempts)
 	}
 	f.h.mu.Lock()

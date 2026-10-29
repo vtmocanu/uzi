@@ -123,7 +123,7 @@ func prerequisiteNativeBackend(t *testing.T) string {
 		candidates = append(candidates, path)
 	}
 	for _, candidate := range candidates {
-		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0 {
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0 { // #nosec G703 -- Git helper paths come from the trusted test environment or installed Git, never HTTP input.
 			return candidate
 		}
 	}
@@ -172,7 +172,7 @@ func (remote *prerequisiteNativeRemote) serve(t *testing.T, backend, root string
 		}
 		remote.mu.Unlock()
 	}
-	cmd := exec.CommandContext(ctx, backend) //nolint:gosec // G204: located git-http-backend, runtime-owned repository.
+	cmd := exec.CommandContext(ctx, backend)
 	cmd.Env = append(prerequisiteNativeEnv(),
 		"GIT_PROJECT_ROOT="+root, "GIT_HTTP_EXPORT_ALL=1", "REQUEST_METHOD="+r.Method,
 		"PATH_INFO="+r.URL.Path, "QUERY_STRING="+r.URL.RawQuery,

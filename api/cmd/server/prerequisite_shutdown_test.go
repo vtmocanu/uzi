@@ -22,7 +22,7 @@ func TestDrainShutdownWorkConcurrentAndJoined(t *testing.T) {
 				go func() {
 					gotOK, gotErr = drainShutdownWork(func(ctx context.Context) error {
 						deadline, ok := ctx.Deadline()
-						if !ok || deadline.Sub(time.Now()) <= 0 || deadline.Sub(time.Now()) > 5*time.Second {
+						if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > 5*time.Second {
 							t.Errorf("prerequisite deadline = %v, present = %v", deadline, ok)
 						}
 						close(prerequisiteEntered)
@@ -69,7 +69,7 @@ func TestDrainShutdownWorkJoinsEachCallback(t *testing.T) {
 				otherDone := make(chan struct{})
 				returned := make(chan struct{})
 				go func() {
-					drainShutdownWork(func(context.Context) error {
+					generatedOK, err := drainShutdownWork(func(context.Context) error {
 						if blocked == "prerequisite" {
 							<-release
 						} else {
@@ -84,6 +84,9 @@ func TestDrainShutdownWorkJoinsEachCallback(t *testing.T) {
 						}
 						return true
 					})
+					if !generatedOK || err != nil {
+						t.Errorf("results = (%v, %v), want (true, nil)", generatedOK, err)
+					}
 					close(returned)
 				}()
 				synctest.Wait()
@@ -118,7 +121,7 @@ func TestDrainShutdownWorkVirtualBudget(t *testing.T) {
 				t.Error("drain must have a live context after signal cancellation")
 			}
 			deadline, ok := ctx.Deadline()
-			if !ok || deadline.Sub(time.Now()) != 5*time.Second {
+			if !ok || time.Until(deadline) != 5*time.Second {
 				t.Errorf("fresh prerequisite deadline = %v, present = %v", deadline, ok)
 			}
 			<-ctx.Done()

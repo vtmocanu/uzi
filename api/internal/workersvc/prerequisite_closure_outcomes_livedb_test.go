@@ -176,9 +176,6 @@ func TestPrerequisiteFrozenDOutcomeMatrixLiveDB(t *testing.T) {
 				if after.State != "foreign" || after.LiveRunID.Valid || after.CleanupAttempts != 0 || len(commands) != 1 {
 					t.Fatal("foreign tip was touched or retained as owned")
 				}
-				remote.mu.Lock()
-				tip := remote.tip
-				remote.mu.Unlock()
 				terminalFrozen := row
 				terminalFrozen.LiveRunID = after.LiveRunID // Only terminal pointer release is permitted.
 				m3AssertFrozen(t, terminalFrozen, after)
@@ -186,7 +183,7 @@ func TestPrerequisiteFrozenDOutcomeMatrixLiveDB(t *testing.T) {
 				m3Sweep(t, ctx, fresh)
 				_, later := remote.snapshot()
 				remote.mu.Lock()
-				tip = remote.tip
+				tip := remote.tip
 				remote.mu.Unlock()
 				if len(later) != 1 || remote.posts.Load() != 1 || tip != strings.Repeat("c", 40) {
 					t.Fatal("foreign tip changed or terminal row performed a command")

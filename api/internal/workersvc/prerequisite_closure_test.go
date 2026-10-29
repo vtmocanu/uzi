@@ -84,12 +84,13 @@ func (m *prerequisiteMemory) GetPrerequisiteClosure(context.Context, store.GetPr
 }
 func (m *prerequisiteMemory) ReservePrerequisitePreparation(_ context.Context, a store.ReservePrerequisitePreparationParams) (store.RecoveryPrerequisiteClosure, error) {
 	r := &m.row
-	if r.State != "pending" || r.Attempts >= 8 || r.NextAttemptAt.Time.After(m.now) || r.AttemptDeadline.Valid && r.AttemptDeadline.Time.After(m.now) {
+	attempt := r.Attempts
+	if r.State != "pending" || attempt < 0 || attempt >= 8 || r.NextAttemptAt.Time.After(m.now) || r.AttemptDeadline.Valid && r.AttemptDeadline.Time.After(m.now) {
 		return *r, pgx.ErrNoRows
 	}
 	r.Attempts++
 	r.AttemptDeadline = prerequisiteTime(m.now.Add(time.Duration(a.LeaseSeconds * float64(time.Second))))
-	r.NextAttemptAt = prerequisiteTime(r.AttemptDeadline.Time.Add(min(time.Hour, 30*time.Second<<uint(r.Attempts-1))))
+	r.NextAttemptAt = prerequisiteTime(r.AttemptDeadline.Time.Add(min(time.Hour, 30*time.Second<<uint(attempt))))
 	return *r, nil
 }
 func (m *prerequisiteMemory) RecordPrerequisitePreparationRetry(_ context.Context, a store.RecordPrerequisitePreparationRetryParams) (int64, error) {
@@ -253,7 +254,7 @@ func (f *prerequisiteHTTP) serve(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if f.lost {
-			http.Error(w, "unavailable", 503)
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		w.Header().Set("Content-Type", "application/x-git-receive-pack-result")

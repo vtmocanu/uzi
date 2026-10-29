@@ -212,7 +212,10 @@ func cleanupRaceSweepLiveDB(t *testing.T, ctx context.Context, s *Service) <-cha
 	// Each sweep is bounded by ctx and the production five-second outcome tail.
 	t.Cleanup(func() {
 		select {
-		case <-done:
+		case err := <-done:
+			if err != nil {
+				t.Errorf("join sweep: %v", err)
+			}
 		case <-time.After(10 * time.Second):
 			t.Error("sweep did not join after cancellation/release")
 		}

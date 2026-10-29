@@ -91,7 +91,7 @@ func (q *prerequisiteHandoffStore) ListPrerequisiteReconcileDue(ctx context.Cont
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if arg.Lim < int32(len(q.rows)) {
+	if int64(arg.Lim) < int64(len(q.rows)) {
 		q.t.Fatalf("selector limit %d cannot supply four discriminating rows", arg.Lim)
 	}
 	return q.rows, nil
@@ -163,7 +163,7 @@ func (q *prerequisiteHandoffStore) DeferPrerequisiteReconciliation(ctx context.C
 		q.t.Fatalf("unexpected reconciliation: %+v at index %d", arg, index)
 	}
 	deadline, ok := ctx.Deadline()
-	if !ok || deadline.Sub(time.Now()) <= 0 || deadline.Sub(time.Now()) > 5*time.Second {
+	if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > 5*time.Second {
 		q.t.Errorf("outcome deadline = %v, present = %v", deadline, ok)
 	}
 	if index == 2 && q.cancelThird != nil {

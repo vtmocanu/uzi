@@ -273,7 +273,7 @@ func (r *m3Remote) serve(w http.ResponseWriter, req *http.Request) {
 			}
 		}
 		if strings.HasPrefix(r.mode, "ambiguous") {
-			http.Error(w, "ambiguous result", 503)
+			http.Error(w, "ambiguous result", http.StatusServiceUnavailable)
 			return
 		}
 		w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
@@ -288,7 +288,7 @@ func (r *m3Remote) serve(w http.ResponseWriter, req *http.Request) {
 	}
 	if (r.mode == "ambiguous-readback" || r.mode == "refuse-readback") && len(r.commands) > 0 ||
 		r.mode == "ambiguous-cleanup-readback" && len(r.commands) > 1 {
-		http.Error(w, "readback unavailable", 503)
+		http.Error(w, "readback unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	svc := req.URL.Query().Get("service")

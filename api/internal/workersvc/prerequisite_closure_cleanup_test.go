@@ -24,13 +24,14 @@ func (m *prerequisiteMemory) ReservePrerequisiteAudit(_ context.Context, a store
 }
 func (m *prerequisiteMemory) ReservePrerequisiteCleanup(_ context.Context, a store.ReservePrerequisiteCleanupParams) (store.RecoveryPrerequisiteClosure, error) {
 	r := &m.row
-	if r.State != "pinned" || !prerequisiteCleanupEligible(m.capture) || r.CleanupAttempts >= 8 || r.NextAttemptAt.Time.After(m.now) || r.CleanupDeadline.Valid && r.CleanupDeadline.Time.After(m.now) {
+	attempt := r.CleanupAttempts
+	if r.State != "pinned" || !prerequisiteCleanupEligible(m.capture) || attempt < 0 || attempt >= 8 || r.NextAttemptAt.Time.After(m.now) || r.CleanupDeadline.Valid && r.CleanupDeadline.Time.After(m.now) {
 		return *r, pgx.ErrNoRows
 	}
 	r.CleanupAttempts++
 	r.LastAuditPassID = a.PassID
 	r.CleanupDeadline = prerequisiteTime(m.now.Add(8 * time.Second))
-	r.NextAttemptAt = prerequisiteTime(m.now.Add(8*time.Second + min(time.Hour, 30*time.Second<<uint(r.CleanupAttempts-1))))
+	r.NextAttemptAt = prerequisiteTime(m.now.Add(8*time.Second + min(time.Hour, 30*time.Second<<uint(attempt))))
 	return *r, nil
 }
 func (m *prerequisiteMemory) pinnedFence(id uuid.UUID, g int32, p pgtype.UUID) bool {

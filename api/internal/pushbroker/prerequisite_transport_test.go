@@ -48,7 +48,7 @@ func TestPrereqTransportBoundaries(t *testing.T) {
 						stage == "delete-readback" && uploads == 2)
 					if hit {
 						if failure == "redirect" {
-							http.Redirect(w, r, bad.srv.URL+r.URL.Path, http.StatusFound)
+							http.Redirect(w, r, bad.srv.URL+r.URL.Path, http.StatusFound) // #nosec G710 -- Intentional off-origin redirect to a fixture-owned TLS server; the test requires zero target hits.
 							return
 						}
 						w.Header().Set("Content-Type", "application/x-"+svc+"-advertisement")

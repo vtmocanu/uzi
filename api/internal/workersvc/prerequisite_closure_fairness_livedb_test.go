@@ -617,7 +617,7 @@ func TestPrerequisiteHugeExpiredBacklogDoesNotBlockPreparationLiveDB(t *testing.
 		x.h.mu.Unlock()
 		// One actual upload advertisement per successful absence cleanup, with
 		// no receive-pack command: these historical refs were already absent.
-		if delta := x.h.requests.Load() - x.baseline; delta != int32(deleted) || sends != 0 || deletes != 0 {
+		if delta := x.h.requests.Load() - x.baseline; int64(delta) != int64(deleted) || sends != 0 || deletes != 0 {
 			t.Fatalf("owner %d actual request delta=%d absence outcomes=%d sends=%d deletes=%d",
 				owner, delta, deleted, sends, deletes)
 		}
