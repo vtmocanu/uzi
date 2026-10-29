@@ -28,6 +28,15 @@ func crossCheckSource(source *string) string {
 	return "unknown"
 }
 
+// crossCheckEffortSource also accepts the unpinned cross-check default, which only
+// an effort can carry.
+func crossCheckEffortSource(source *string) string {
+	if source != nil && *source == "cross-check default" {
+		return *source
+	}
+	return crossCheckSource(source)
+}
+
 func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 	var rows [][]string
 	if r.Status == "awaiting_approval" && r.PlanCrossCheckRequired && r.PlanCrossCheckGateReason != nil {
@@ -65,7 +74,7 @@ func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 	}
 	rows = append(rows,
 		[]string{label + "_MODEL_SOURCE", crossCheckSource(s.CheckerModelSource)},
-		[]string{label + "_EFFORT_SOURCE", crossCheckSource(s.CheckerEffortSource)})
+		[]string{label + "_EFFORT_SOURCE", crossCheckEffortSource(s.CheckerEffortSource)})
 	cost := "cost unavailable"
 	if s.Usage != nil {
 		cost = costDetailCell(*s.Usage)

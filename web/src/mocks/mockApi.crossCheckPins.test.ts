@@ -68,7 +68,7 @@ describe("mock checker pins", () => {
       ...p, worker_default_model: p.harness === "claude" ? "opus" : "worker-custom",
     })));
     expect(after[2]).toMatchObject({ model: null, effort: "low", resolved_model: "opus", model_source: "worker default", effort_source: "pin" });
-    expect(after[3]).toMatchObject({ model: "code-custom", effort: null, resolved_model: "code-custom", resolved_effort: "medium", model_source: "pin", effort_source: "worker default" });
+    expect(after[3]).toMatchObject({ model: "code-custom", effort: null, resolved_model: "code-custom", resolved_effort: "high", model_source: "pin", effort_source: "cross-check default" });
   });
 
   it("loads a legacy two-plan-cell blob and projects empty code overrides", async () => {
@@ -83,8 +83,8 @@ describe("mock checker pins", () => {
     expect(cells[0]).toMatchObject({ stage: "plan", model: "sonnet" });
     expect(cells[1]).toMatchObject({ stage: "plan", effort: "max" });
     expect(cells.slice(2)).toEqual([
-      expect.objectContaining({ stage: "code", harness: "claude", model: null, effort: null, model_source: "worker default", effort_source: "worker default" }),
-      expect.objectContaining({ stage: "code", harness: "codex", model: null, effort: null, model_source: "worker default", effort_source: "worker default" }),
+      expect.objectContaining({ stage: "code", harness: "claude", model: null, effort: null, model_source: "worker default", effort_source: "cross-check default" }),
+      expect.objectContaining({ stage: "code", harness: "codex", model: null, effort: null, model_source: "worker default", effort_source: "cross-check default" }),
     ]);
   });
 
@@ -93,7 +93,7 @@ describe("mock checker pins", () => {
     let cells = (await api.getMySettings()).settings.cross_check_pins!;
     expect(cells).toHaveLength(4);
     expect(cells.find(p => p.harness === "codex")).toMatchObject({
-      model: null, effort: null, resolved_model: "gpt-6.1-sol", resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: true,
+      model: null, effort: null, resolved_model: "gpt-6.1-sol", resolved_effort: "high", model_source: "worker default", effort_source: "cross-check default", active: true,
     });
     await api.putMySettings({ cross_check_pins: [
       { stage: "plan", harness: "claude", model: " custom-claude ", effort: "max" },
@@ -102,14 +102,14 @@ describe("mock checker pins", () => {
     await api.putMySettings({ default_claude_model: "haiku", default_codex_model: "worker-codex", default_codex_effort: "xhigh" });
     cells = (await api.getMySettings()).settings.cross_check_pins!;
     expect(cells.find(p => p.harness === "claude")).toMatchObject({ model: "custom-claude", effort: "max", worker_default_model: "haiku", resolved_model: "custom-claude", active: true });
-    expect(cells.find(p => p.harness === "codex")).toMatchObject({ worker_default_model: "worker-codex", resolved_model: "custom-codex", resolved_effort: "xhigh", effort_source: "worker default" });
+    expect(cells.find(p => p.harness === "codex")).toMatchObject({ worker_default_model: "worker-codex", resolved_model: "custom-codex", resolved_effort: "high", effort_source: "cross-check default" });
     cells[0].model = "mutated-return";
     expect((await api.getMySettings()).settings.cross_check_pins![0].model).toBe("custom-claude");
     await api.putMySettings({ cross_check_pins: [{ stage: "plan", harness: "codex", model: null, effort: "high" }] });
     api = await fresh();
     expect((await api.getMySettings()).settings.cross_check_pins!.find(p => p.harness === "codex")).toMatchObject({ model: null, effort: "high", worker_default_model: "worker-codex", resolved_model: "worker-codex", model_source: "worker default" });
     await api.putMySettings({ cross_check_pins: [{ stage: "plan", harness: "codex", effort: "  " }] });
-    expect((await api.getMySettings()).settings.cross_check_pins!.find(p => p.harness === "codex")).toMatchObject({ model: null, effort: null, resolved_effort: "xhigh" });
+    expect((await api.getMySettings()).settings.cross_check_pins!.find(p => p.harness === "codex")).toMatchObject({ model: null, effort: null, resolved_effort: "high" });
   });
 
   it("recomputes metadata on GET and PUT despite poisoned persisted metadata", async () => {
@@ -141,7 +141,7 @@ describe("mock checker pins", () => {
     });
     await api.putMySettings({ cross_check_pins: [{ stage: "plan", harness: "codex", effort: null }] });
     expect((await api.getMySettings()).settings.cross_check_pins!.find(p => p.harness === "codex")).toMatchObject({
-      model: "custom-codex", effort: null, resolved_effort: "medium",
+      model: "custom-codex", effort: null, resolved_effort: "high",
     });
     expect((await api.getMySettings()).settings.default_codex_model).toBeNull();
     expect((await api.getMySettings()).settings.default_codex_effort).toBeNull();

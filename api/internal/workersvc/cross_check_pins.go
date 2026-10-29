@@ -57,14 +57,15 @@ func (s *Service) preflightCrossCheckPins(ctx context.Context, worker store.Work
 	if (row.Model.Valid || row.Effort.Valid) && !slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckPinsV1) {
 		return nil, errCrossCheckPinsCapabilityMissing
 	}
-	// The worker defaults are the checker family's own lanes, and the template model is
-	// what Settings shows for the Default cell (PRD #2460).
-	workerModel, workerEffort := row.DefaultClaudeModel, row.DefaultEffort
+	// The worker model default is the checker family's own lane, and the template model is
+	// what Settings shows for the Default cell (PRD #2460). An unpinned effort is the
+	// cross-check default, not the worker effort.
+	workerModel := row.DefaultClaudeModel
 	if row.CheckerHarness.String == "codex" {
-		workerModel, workerEffort = row.DefaultCodexModel, row.DefaultCodexEffort
+		workerModel = row.DefaultCodexModel
 	}
 	resolved := agenttmpl.ResolveCrossCheck(row.CheckerHarness.String, textPtr(row.Model), textPtr(row.Effort),
-		textPtr(workerModel), textPtr(workerEffort), textPtr(row.TemplateModel))
+		textPtr(workerModel), textPtr(row.TemplateModel))
 	// The custom-model capability gates Codex roots only: a Claude model is never a Codex id.
 	if row.CheckerHarness.String == "codex" && resolved.Model != nil && !agenttmpl.CuratedCodexModels[*resolved.Model] &&
 		!slices.Contains(worker.ProtocolCapabilities, capability.CodexCustomModelV1) {

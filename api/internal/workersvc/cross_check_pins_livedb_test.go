@@ -68,10 +68,11 @@ func TestCrossCheckPinsResolutionLiveDB(t *testing.T) {
 		wantModel, wantEffort, modelSource, effortSource string
 	}{
 		{"both", "gpt-6-astra", "xhigh", "gpt-6-sol", "high", "gpt-6-astra", "xhigh", "pin", "pin"},
-		{"model-only", "gpt-6-astra", nil, "gpt-6-sol", "high", "gpt-6-astra", "high", "pin", "worker default"},
+		{"model-only", "gpt-6-astra", nil, "gpt-6-sol", "low", "gpt-6-astra", "high", "pin", "cross-check default"},
 		{"effort-only", nil, "xhigh", "gpt-6-sol", "high", "gpt-6-sol", "xhigh", "worker default", "pin"},
-		{"default-null-model", nil, nil, nil, "high", "gpt-6.1-sol", "high", "worker default", "worker default"},
-		{"default-later-lane-edit", nil, nil, "gpt-6-astra", "low", "gpt-6-astra", "low", "worker default", "worker default"},
+		{"low effort pin kept", nil, "low", "gpt-6-sol", "max", "gpt-6-sol", "low", "worker default", "pin"},
+		{"default-null-model", nil, nil, nil, "medium", "gpt-6.1-sol", "high", "worker default", "cross-check default"},
+		{"default-later-lane-edit", nil, nil, "gpt-6-astra", "low", "gpt-6-astra", "high", "worker default", "cross-check default"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newCrossCheckContentionFixture(t)

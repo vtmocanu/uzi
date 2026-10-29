@@ -1314,7 +1314,7 @@ export interface ClaimPlanCrossCheck {
   semantic_candidate?: ReturnType<typeof import("./semantic-plan.js").parseSemanticCandidate>;
   /** Independent provenance from the captured server snapshot; absent on legacy claims. */
   model_source?: "pin" | "worker default";
-  effort_source?: "pin" | "worker default";
+  effort_source?: "pin" | "worker default" | "cross-check default";
   stage: "plan";
   lead_run_id: string;
   round: number;

@@ -70,6 +70,10 @@ func (f laneRoundsPinsFixture) claim(t *testing.T, lane string) *ClaimPayload {
 
 func (f laneRoundsPinsFixture) claimed(t *testing.T, cc store.CrossCheck, p *ClaimPayload, model, effort, source string) {
 	t.Helper()
+	effortSource := source
+	if source == "worker default" {
+		effortSource = "cross-check default"
+	}
 	childID := uuid.UUID(cc.CheckerRunID.Bytes)
 	if p == nil || p.RunID != childID.String() || p.Kind != "cross_check" ||
 		p.CrossCheck == nil || p.CrossCheck.Round != cc.Round {
@@ -78,7 +82,7 @@ func (f laneRoundsPinsFixture) claimed(t *testing.T, cc store.CrossCheck, p *Cla
 	if p.Config.DefaultModel == nil || *p.Config.DefaultModel != model ||
 		p.Config.DefaultEffort == nil || *p.Config.DefaultEffort != effort ||
 		p.CrossCheck.ModelSource == nil || *p.CrossCheck.ModelSource != source ||
-		p.CrossCheck.EffortSource == nil || *p.CrossCheck.EffortSource != source {
+		p.CrossCheck.EffortSource == nil || *p.CrossCheck.EffortSource != effortSource {
 		t.Fatalf("round %d did not deliver %s/%s from %s", cc.Round, model, effort, source)
 	}
 	child := mustRun(t, f.env, childID)

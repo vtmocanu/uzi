@@ -26,12 +26,13 @@ plans supplied at creation are outside this gate. Turning it off affects
 future runs only.
 
 The **Plan cross-check** row has independent model and effort choices for
-Claude and Codex. Select **Default · value (source)** to follow that family's
-worker default, or choose a hard pin, including a custom model ID. A model
+Claude and Codex. At **Default**, the model follows that family's worker
+default and the effort is the cross-check default, `high`, whatever your worker
+effort is. Or choose a hard pin, including a custom model ID or a lower effort. A model
 pin does not pin effort, and an effort pin does not pin model. Pins do not
 substitute models, clamp effort or retry on a default. The Claude cell
-configures the Claude checker that checks a Codex lead; at Default it follows
-your Claude worker default.
+configures the Claude checker that checks a Codex lead; at Default its model
+follows your Claude worker default.
 
 ## 2. Wait for the checked plan
 
@@ -221,7 +222,8 @@ remaining replay scope.
 Open the run to see distinct rounds in the feed, the current gate reason,
 checked-candidate outcome,
 findings, checker-run link, recorded model/effort, each field's source
-(`pin` or `worker default`) and reported tokens/cost. Missing legacy sources
+(`pin`, `worker default`, or `cross-check default` for an unpinned effort) and
+reported tokens/cost. Missing legacy sources
 stay unknown; later settings changes do not rewrite historical evidence.
 Unknown or inconsistent outcomes show **Outcome unavailable**. Findings use
 hardened Markdown with a display cap of 16,384 source characters and 20 items;

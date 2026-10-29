@@ -145,7 +145,7 @@ export interface CrossCheckPinDTO {
   resolved_model: string | null;
   resolved_effort: string;
   model_source: "pin" | "worker default";
-  effort_source: "pin" | "worker default";
+  effort_source: "pin" | "worker default" | "cross-check default";
   active: boolean;
 }
 
@@ -3950,7 +3950,7 @@ export interface PlanCrossCheckSummary {
   checker_model: string | null;
   checker_effort: string | null;
   checker_model_source: "pin" | "worker default" | null;
-  checker_effort_source: "pin" | "worker default" | null;
+  checker_effort_source: "pin" | "worker default" | "cross-check default" | null;
   usage: RunUsage | null;
   historical: boolean;
 }

@@ -128,6 +128,11 @@ function sourceLabel(source: unknown): string {
   return source === "pin" || source === "worker default" ? source : "unknown";
 }
 
+// Only an effort can carry the unpinned cross-check default.
+function effortSourceLabel(source: unknown): string {
+  return source === "cross-check default" ? source : sourceLabel(source);
+}
+
 export function PlanCrossCheck({ run, presentation = "standalone" }: { run: Run; presentation?: "standalone" | "inset" }) {
   const s = run.plan_cross_check_summary;
   const gate = run.plan_cross_check_gate_reason;
@@ -154,7 +159,7 @@ export function PlanCrossCheck({ run, presentation = "standalone" }: { run: Run;
       <Findings value={s.findings} />
       <p className="flex flex-wrap gap-x-1 break-all text-xs text-muted">
         <span>Model: {plain(s.checker_model) || "Unreported"} ({sourceLabel(s.checker_model_source)})</span>
-        <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Effort: {plain(s.checker_effort) || "Unreported"} ({sourceLabel(s.checker_effort_source)})</span></span>
+        <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Effort: {plain(s.checker_effort) || "Unreported"} ({effortSourceLabel(s.checker_effort_source)})</span></span>
         {usage && <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Checker tokens: {Number.isFinite(usage.input_tokens) && usage.input_tokens >= 0 ? formatTokens(usage.input_tokens) : "Unreported"} in · {Number.isFinite(usage.output_tokens) && usage.output_tokens >= 0 ? formatTokens(usage.output_tokens) : "Unreported"} out</span></span>}
         <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Checker cost: {cost}{usage?.cost_status === "subscription" ? " · no cost estimate recorded" : cost === "Unavailable" ? " · cost unavailable" : " · API-equivalent"}</span></span>
       </p>

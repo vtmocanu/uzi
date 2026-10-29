@@ -2941,7 +2941,8 @@ JSON returns the decoded account settings DTO, including
 `model`/`effort`, read-only nullable `worker_default_model`, separate
 `resolved_model`/`resolved_effort`, `model_source`/`effort_source` and
 `active`. Null Claude model metadata means SDK/account default. Sources
-display as `pin` or `worker default`; missing or unfamiliar values show
+display as `pin` or `worker default`, and an unpinned effort as
+`cross-check default`; missing or unfamiliar values show
 `unknown` in the human view. See
 [Configuration](./configuration.md#plan-cross-check-model-and-effort-pins)
 for resolution, validation and capability requirements.
@@ -3009,7 +3010,8 @@ this cookie-only consent setting.
 gate reason. Its `PLAN_CHECK_*` rows show the stored candidate's result,
 reason, checker id, recorded model/effort, independent model/effort sources,
 tokens/cost and findings. `PLAN_CHECK_MODEL_SOURCE` and
-`PLAN_CHECK_EFFORT_SOURCE` show `pin` or `worker default`; missing legacy or
+`PLAN_CHECK_EFFORT_SOURCE` show `pin` or `worker default`, and the effort also
+`cross-check default` when unpinned; missing legacy or
 unrecognized sources show `unknown`. JSON summary fields
 `checker_model_source` and `checker_effort_source` remain nullable for legacy
 records. Settings changes do not rewrite this recorded evidence. A human

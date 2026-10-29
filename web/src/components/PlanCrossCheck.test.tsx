@@ -248,6 +248,8 @@ describe("planning-diff refusal sub-code", () => {
 describe("recorded checker sources", () => {
   it.each([
     ["pin", "worker default", "pin", "worker default"],
+    ["worker default", "cross-check default", "worker default", "cross-check default"],
+    ["cross-check default", "pin", "unknown", "pin"],
     [null, null, "unknown", "unknown"],
     ["provider-attribute\u202e", "worker_default", "unknown", "unknown"],
   ])("renders only closed recorded labels %s/%s", (modelSource, effortSource, modelLabel, effortLabel) => {
