@@ -11,11 +11,57 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/recovery"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+// prerequisiteUploadCommitDB observes real commits. Admission leaves the target
+// uploading, so only the later successful ready commit can cancel the request.
+// This fixture keeps the server lifecycle context independent of that request.
+type prerequisiteUploadCommitDB struct {
+	recovery.DB
+	capture          uuid.UUID
+	afterReadyCommit func()
+	once             sync.Once
+}
+
+func (d *prerequisiteUploadCommitDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := d.DB.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &prerequisiteUploadCommitTx{Tx: tx, db: d}, nil
+}
+
+func (d *prerequisiteUploadCommitDB) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := d.DB.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &prerequisiteUploadCommitTx{Tx: tx, db: d}, nil
+}
+
+type prerequisiteUploadCommitTx struct {
+	pgx.Tx
+	db *prerequisiteUploadCommitDB
+}
+
+func (tx *prerequisiteUploadCommitTx) Commit(ctx context.Context) error {
+	var ready bool
+	if err := tx.Tx.QueryRow(ctx, "SELECT state='available' FROM recovery_captures WHERE id=$1", tx.db.capture).Scan(&ready); err != nil {
+		return err
+	}
+	if err := tx.Tx.Commit(ctx); err != nil {
+		return err
+	}
+	if ready {
+		tx.db.once.Do(tx.db.afterReadyCommit)
+	}
+	return nil
+}
 
 func TestPrerequisiteUploadKicksBrokerOnceLiveDB(t *testing.T) {
 	for _, name := range []string{"ack", "lost_ack", "request_cancelled"} {
@@ -46,13 +92,17 @@ func TestPrerequisiteUploadKicksBrokerOnceLiveDB(t *testing.T) {
 			})
 			uploadCtx, cancelUpload := context.WithCancel(ctx)
 			defer cancelUpload()
+			if name == "request_cancelled" {
+				// Cancel after the actual ready commit, before stream evaluates any kick guard.
+				pool := &prerequisiteUploadCommitDB{DB: f.env.pool, capture: r.capture, afterReadyCommit: cancelUpload}
+				r.svc = recovery.New(f.env.q, pool, f.s.box, recovery.Limits{
+					MaxBundleBytes: 1 << 20, MaxCapturesPerClaim: 8, MaxCapturesPerOwner: 16,
+					ReadyRetention: time.Hour, RequestDeadline: 10 * time.Second,
+				}, nil)
+			}
 			var kicks, admitted atomic.Int32
 			r.svc.SetPrerequisiteClosure([]string{"github"}, func(user, capture uuid.UUID) {
 				kicks.Add(1)
-				if name == "request_cancelled" {
-					// The upload transaction is committed; losing the request cannot cancel the lane.
-					cancelUpload()
-				}
 				if f.s.KickPrerequisiteClosure(user, capture) {
 					admitted.Add(1)
 				}
