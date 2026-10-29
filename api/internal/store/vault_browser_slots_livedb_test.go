@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -423,6 +424,10 @@ func (b *bsBarrier) GetVaultBrowserSlot(ctx context.Context, arg store.GetVaultB
 	return slot, err
 }
 func bsWrapped(f bsFixture, wrap func(vault.BrowserStore) vault.BrowserStore, commitError bool, opts ...vault.Option) *vault.Vault {
+	return bsWrappedAfterCommit(f, wrap, commitError, nil, opts...)
+}
+
+func bsWrappedAfterCommit(f bsFixture, wrap func(vault.BrowserStore) vault.BrowserStore, commitError bool, afterCommit func(context.Context) error, opts ...vault.Option) *vault.Vault {
 	q := store.New(f.pool)
 	return vault.New(f.master, q, func(ctx context.Context, fn func(context.Context, vault.Store) error) error {
 		tx, err := f.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
@@ -439,6 +444,11 @@ func bsWrapped(f bsFixture, wrap func(vault.BrowserStore) vault.BrowserStore, co
 		}
 		if commitError {
 			return &vault.CommitError{Err: errors.New("injected lost commit acknowledgment")}
+		}
+		if afterCommit != nil {
+			if err := afterCommit(ctx); err != nil {
+				return &vault.CommitError{Err: err}
+			}
 		}
 		return nil
 	}, opts...)
@@ -484,6 +494,181 @@ func TestVaultBrowserRestoreLockRaceLiveDB(t *testing.T) {
 		t.Fatal("stale auth republished after lock")
 	}
 }
+
+// bsPublicationRace pauses only the first successful commit, after its DB
+// fences are released. Sibling transactions remain free to complete. All waits
+// use request deadlines; cleanup cancels, releases publication, and joins work.
+type bsPublicationRace struct {
+	ctx     context.Context
+	entered chan struct{}
+	release chan struct{}
+	waiting chan struct{}
+	unpause sync.Once
+	work    sync.WaitGroup
+}
+
+func bsNewPublicationRace(t *testing.T, f bsFixture) (*vault.Vault, *bsPublicationRace) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	r := &bsPublicationRace{
+		ctx: ctx, entered: make(chan struct{}), release: make(chan struct{}),
+		waiting: make(chan struct{}, 1),
+	}
+	t.Cleanup(func() {
+		cancel()
+		r.resume()
+		r.work.Wait()
+	})
+	var paused atomic.Bool
+	v := bsWrappedAfterCommit(f, func(q vault.BrowserStore) vault.BrowserStore { return q }, false,
+		func(ctx context.Context) error {
+			if !paused.CompareAndSwap(false, true) {
+				return nil
+			}
+			close(r.entered)
+			select {
+			case <-r.release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+		vault.WithLifecycleWaitObserverForTest(func(id uuid.UUID) {
+			if id == f.id {
+				select {
+				case r.waiting <- struct{}{}:
+				default:
+				}
+			}
+		}))
+	return v, r
+}
+
+func (r *bsPublicationRace) resume() { r.unpause.Do(func() { close(r.release) }) }
+
+func (r *bsPublicationRace) start(fn func(context.Context) error) <-chan error {
+	done := make(chan error, 1)
+	r.work.Add(1)
+	go func() {
+		defer r.work.Done()
+		done <- fn(r.ctx)
+	}()
+	return done
+}
+
+func (r *bsPublicationRace) join(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-r.ctx.Done():
+		t.Fatal("publication race join deadline")
+		return r.ctx.Err()
+	}
+}
+
+// overlap accepts completion as well as contention so a missing lifecycle
+// mutex reaches the final state assertions instead of an observer deadline.
+// completed tells the caller whether this consumed the operation's result.
+func (r *bsPublicationRace) overlap(t *testing.T, done <-chan error) (completed bool, err error) {
+	t.Helper()
+	select {
+	case <-r.waiting:
+		return false, nil
+	case err := <-done:
+		return true, err
+	case <-r.ctx.Done():
+		t.Fatal("publication race overlap deadline")
+		return false, r.ctx.Err()
+	}
+}
+
+func TestVaultBrowserRestorePublicationLockRaceLiveDB(t *testing.T) {
+	pool := vlIsolatedPool(t)
+	f := bsSeed(t, pool)
+	browser := uuid.New()
+	key := f.mint(t, browser)
+	session := f.session(t, browser)
+	cold, race := bsNewPublicationRace(t, f)
+	restored := race.start(func(ctx context.Context) error { return cold.Restore(ctx, session, key) })
+	bsWait(t, race.entered)
+	locked := race.start(func(ctx context.Context) error { return cold.LockWithContext(ctx, f.id) })
+	lockCompleted, lockErr := race.overlap(t, locked)
+	race.resume()
+	restoreErr := race.join(t, restored)
+	if !lockCompleted {
+		lockErr = race.join(t, locked)
+	}
+	if restoreErr != nil || lockErr != nil {
+		t.Fatalf("restore/lock: %v / %v", restoreErr, lockErr)
+	}
+	if cold.Unlocked(f.id) {
+		t.Fatal("restore published a cached key after durable lock")
+	}
+	if f.count(t) != 0 {
+		t.Fatal("lock retained browser slots after restore publication")
+	}
+}
+
+func TestVaultBrowserInteractiveUnlockLockRaceLiveDB(t *testing.T) {
+	pool := vlIsolatedPool(t)
+	for _, lockFirst := range []bool{false, true} {
+		name := "unlock-first"
+		if lockFirst {
+			name = "lock-first"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := bsSeed(t, pool)
+			browser := uuid.New()
+			f.mint(t, browser)
+			oldSnapshot := vault.Snapshot(f.user(t))
+			v, race := bsNewPublicationRace(t, f)
+			var minted bool
+			unlock := func(ctx context.Context) error {
+				key, err := v.UnlockAndMint(ctx, oldSnapshot, vlLoginPhrase, vault.InteractiveExisting,
+					&vault.BrowserMintRequest{HTTPS: true, BrowserID: browser, SessionExpiresAt: time.Now().Add(time.Hour)})
+				minted = key != nil
+				key.Destroy()
+				return err
+			}
+			lock := func(ctx context.Context) error { return v.LockWithContext(ctx, f.id) }
+			first, second := unlock, lock
+			if lockFirst {
+				first, second = lock, unlock
+			}
+			firstDone := race.start(first)
+			bsWait(t, race.entered)
+			secondDone := race.start(second)
+			secondCompleted, secondErr := race.overlap(t, secondDone)
+			race.resume()
+			firstErr := race.join(t, firstDone)
+			if !secondCompleted {
+				secondErr = race.join(t, secondDone)
+			}
+			unlockErr, lockErr := firstErr, secondErr
+			if lockFirst {
+				lockErr, unlockErr = firstErr, secondErr
+			}
+			if lockErr != nil {
+				t.Fatalf("lock: %v", lockErr)
+			}
+			if lockFirst {
+				if !errors.Is(unlockErr, vault.ErrStaleAuth) || minted {
+					t.Fatalf("stale interactive snapshot minted after lock: minted=%t err=%v", minted, unlockErr)
+				}
+			} else if unlockErr != nil || !minted {
+				t.Fatalf("unlock before lock: minted=%t err=%v", minted, unlockErr)
+			}
+			if v.Unlocked(f.id) {
+				t.Fatal("interactive unlock left cache unlocked after lock")
+			}
+			if f.count(t) != 0 {
+				t.Fatal("interactive unlock left browser slots after lock")
+			}
+		})
+	}
+}
+
 func TestVaultBrowserAmbiguousCommitLiveDB(t *testing.T) {
 	pool := vlIsolatedPool(t)
 	f := bsSeed(t, pool)
