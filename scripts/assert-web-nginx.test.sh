@@ -17,6 +17,7 @@ set -eu
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 SUT="$ROOT/scripts/assert-web-nginx.sh"
 export TMPDIR="$ROOT/.uzi/scratch"
+mkdir -p "$TMPDIR"
 TMP="$(mktemp -d "$TMPDIR/assert-web-nginx-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 trap 'exit 130' INT
@@ -110,7 +111,7 @@ run() {
   : > "$FAKE_LOG"
   mkdir -p "$TMP/$case_name.tmp"
   rc=0
-  PATH="$TMP/bin:$PATH" TMPDIR="$TMP/$case_name.tmp" bash "$SUT" "$ROOT" > "$TMP/$case_name.out" 2>&1 || rc=$?
+  PATH="$TMP/bin:$PATH" TMPDIR="$TMP/$case_name.tmp" bash "$SUT" "${3:-$ROOT}" > "$TMP/$case_name.out" 2>&1 || rc=$?
   [ "$rc" = 2 ] || fail "$case_name: exit $rc, want 2 ($(cat "$TMP/$case_name.out"))"
   grep -q 'docker create .* failed' "$TMP/$case_name.out" \
     || fail "$case_name: did not stop at the conflicting create ($(cat "$TMP/$case_name.out"))"
@@ -153,6 +154,17 @@ expect_net_rm() {
   [ "$(grep -c '^docker network rm wnginx-[0-9]*-net$' "$TMP/$1.log" || true)" = 1 ] \
     || fail "$1: the created network was not removed exactly once"
 }
+
+# A fresh checkout has no ignored scratch tree. Prove SUT creates it before
+# mktemp and reaches Docker without relying on this harness's scratch parent.
+fresh="$TMP/fresh-checkout"
+mkdir -p "$fresh/web" "$fresh/deploy"
+cp "$ROOT/web/Dockerfile" "$ROOT/web/nginx.conf" "$ROOT/web/nginx.mock.conf" "$fresh/web/"
+cp -R "$ROOT/deploy/chart" "$fresh/deploy/chart"
+[ ! -d "$fresh/.uzi" ] || fail "fresh: fixture already has scratch"
+run fresh '*-up' "$fresh"
+[ -d "$fresh/.uzi/scratch" ] || fail "fresh: scratch parent not created"
+grep -q '^docker create ' "$TMP/fresh.log" || fail "fresh: startup never reached Docker"
 
 # Case 1: the very first create (the stub upstream) conflicts. Nothing was created, so
 # no container is removed at all, least of all the one holding the name.
@@ -227,4 +239,4 @@ if [ "$failed" != 0 ]; then
   done
   exit 1
 fi
-echo "assert-web-nginx.test.sh: PASS (8 cases)"
+echo "assert-web-nginx.test.sh: PASS (9 cases)"

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -34,7 +35,12 @@ type browserSlotLive struct {
 
 func browserSlotRouter(h *Handler) http.Handler {
 	lim := mw.NewLimiter(10000, time.Hour, nil)
-	return h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim)
+	router := h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim).(chi.Router)
+	// Production endpoints currently omit HEAD. Mount a test-only HEAD probe
+	// through the same cookie-auth constructor on the real router, so both the
+	// positive and negative HEAD controls must traverse authentication.
+	router.With(h.requireAuth()).Head("/api/browser-slot-head-probe", h.Me)
+	return router
 }
 func browserSlotFixture(t *testing.T, secure bool) *browserSlotLive {
 	t.Helper()
@@ -174,13 +180,12 @@ func TestBrowserSlotRestoreRoutesLiveDB(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reads := e.countRestart()
-			rec := e.request(tc.method, "/api/auth/me", "", tc.csrf, tc.edit)
-			if tc.method == "GET" {
-				cliVaultCode(t, rec, http.StatusOK)
-			} else {
-				// chi has no HEAD fallback on this route; auth still runs normally.
-				cliVaultCode(t, rec, http.StatusMethodNotAllowed)
+			path := "/api/auth/me"
+			if tc.method == "HEAD" {
+				path = "/api/browser-slot-head-probe"
 			}
+			rec := e.request(tc.method, path, "", tc.csrf, tc.edit)
+			cliVaultCode(t, rec, http.StatusOK)
 			if e.h.vault.Unlocked(e.user.ID) || reads.Load() != 0 {
 				t.Fatalf("ineligible request restored or read slot: reads=%d", reads.Load())
 			}
@@ -190,9 +195,13 @@ func TestBrowserSlotRestoreRoutesLiveDB(t *testing.T) {
 			}
 		})
 	}
-	for _, path := range []string{"/api/auth/me", "/api/me/cli-tokens/"} {
+	for _, path := range []string{"/api/auth/me", "/api/me/cli-tokens/", "/api/browser-slot-head-probe"} {
 		reads := e.countRestart()
-		cliVaultCode(t, e.request("GET", path, "", e.csrf, nil), http.StatusOK)
+		method := "GET"
+		if path == "/api/browser-slot-head-probe" {
+			method = "HEAD"
+		}
+		cliVaultCode(t, e.request(method, path, "", e.csrf, nil), http.StatusOK)
 		if !e.h.vault.Unlocked(e.user.ID) || reads.Load() != 1 {
 			t.Fatalf("%s failed to restore", path)
 		}

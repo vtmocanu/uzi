@@ -58,6 +58,7 @@ for f in web/Dockerfile web/nginx.conf web/nginx.mock.conf deploy/chart/Chart.ya
 done
 
 export TMPDIR="$ROOT/.uzi/scratch"
+mkdir -p "$TMPDIR"
 W=$(mktemp -d "$TMPDIR/assert-web-nginx.XXXXXX")
 COOKIE_SENTINEL="wnginx-request-$$-${W##*.}"
 SET_COOKIE_SENTINEL="wnginx-response-$$-${W##*.}"
