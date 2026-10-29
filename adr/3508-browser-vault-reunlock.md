@@ -130,8 +130,13 @@ impact are production-dependent and unmeasured. Plan maintenance and backups;
 there is no measured production migration-duration claim here.
 
 **Delete or invalidate all browser slots before starting a pre-keyslot
-binary.** Such a binary cannot maintain slot revocations during subsequent
-lock/logout/password operations. A compatible re-upgrade must not resurrect
+binary, in this order:** stop every keyslot-aware API instance and let
+in-flight requests drain, then delete the slots (for example by running
+migration 00379 Down, which drops `vault_browser_slots`), and only then
+start the older binary. While a keyslot-aware API still serves requests, an
+interactive unlock can mint a slot after the deletion. Such a binary cannot
+maintain slot revocations during subsequent lock/logout/password
+operations. A compatible re-upgrade must not resurrect
 pre-rollback grants: discard those rows before downgrade, rather than rely
 on the older binary to invalidate them. Migration 00379 Down drops slot
 storage; 00373's independent mode/ciphertext rollback restrictions in

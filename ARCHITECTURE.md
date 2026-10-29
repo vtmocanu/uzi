@@ -438,8 +438,8 @@ theft plus a matching DB snapshot allows offline DEK recovery without session
 authentication. Foreground restore best-effort promotes vault-locked parks;
 unattended continuity remains outside this feature.
 [ADR-3508](adr/3508-browser-vault-reunlock.md) records the protocol, security
-analysis and pre-keyslot rollback requirement to delete/invalidate slots
-before downgrade. Migration 00379 CHECK validation and ACCESS EXCLUSIVE
+analysis and pre-keyslot rollback requirement: stop the keyslot-aware API
+and drain requests, then delete/invalidate slots, before starting an older binary. Migration 00379 CHECK validation and ACCESS EXCLUSIVE
 duration/availability costs are production-dependent and unmeasured.
 Rotating `UZI_SECRET_KEY` invalidates rows still master-sealed across features.
 

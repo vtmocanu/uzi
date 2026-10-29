@@ -353,7 +353,11 @@ production-dependent, unmeasured duration and availability impact; constant
 defaults do not eliminate those costs. Keep singleton/Recreate deployment.
 
 **Before starting a pre-keyslot binary, delete or invalidate all browser
-slots using the keyslot-aware deployment.** An older binary does not enforce
+slots, in this order:** stop every keyslot-aware API instance and let
+in-flight requests drain, then delete the slots (for example with migration
+00379 Down, which drops `vault_browser_slots`), and only then start the older
+binary. While a keyslot-aware API still serves requests, an interactive unlock
+can mint a slot after the deletion. An older binary does not enforce
 these revocations; retained rows could otherwise survive logout/lock there.
 A compatible re-upgrade must not resurrect pre-rollback grants. Migration
 00379 Down drops the slots table; this is separate from 00373's mode and
