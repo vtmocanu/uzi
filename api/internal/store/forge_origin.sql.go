@@ -98,10 +98,17 @@ func (q *Queries) LockForgeOriginCooldown(ctx context.Context, arg LockForgeOrig
 }
 
 const lockForgeOriginWorker = `-- name: LockForgeOriginWorker :one
-SELECT w.id FROM workers w
-WHERE w.id = $1::uuid AND EXISTS (
-    SELECT 1 FROM runs r WHERE r.id = $2::uuid AND r.worker_id = w.id AND r.user_id = w.user_id)
-FOR UPDATE
+WITH owner_guard AS MATERIALIZED (
+    -- Parent deletion must wait before we hold worker/run rows and need FK protection.
+    SELECT u.id FROM users u
+    JOIN workers w ON w.user_id = u.id AND w.id = $1::uuid
+    JOIN runs r ON r.user_id = u.id AND r.worker_id = w.id
+    WHERE r.id = $2::uuid
+    FOR KEY SHARE OF u
+)
+SELECT w.id FROM workers w JOIN owner_guard u ON u.id = w.user_id
+WHERE w.id = $1::uuid
+FOR UPDATE OF w
 `
 
 type LockForgeOriginWorkerParams struct {
@@ -119,39 +126,47 @@ func (q *Queries) LockForgeOriginWorker(ctx context.Context, arg LockForgeOrigin
 }
 
 const observeParkedForgeOrigin = `-- name: ObserveParkedForgeOrigin :execrows
+WITH mapping AS MATERIALIZED (
+    SELECT m.user_id, m.worker_id, m.origin
+    FROM run_forge_origins m
+    JOIN runs r ON r.id = m.run_id AND r.user_id = m.user_id
+        AND r.worker_id = m.worker_id AND r.claim_generation = m.generation
+    JOIN workers w ON w.id = m.worker_id AND w.user_id = m.user_id
+    JOIN authorized_forge_origins a
+      ON a.repo_id = r.repo_id AND a.connection_id = m.connection_id
+        AND a.user_id = m.user_id AND a.origin = m.origin
+    WHERE r.id = $3::uuid AND r.worker_id = $4::uuid
+      AND r.claim_generation = $5::bigint
+      AND r.status = 'recovery_wait' AND r.recovery_wait_cause = 'forge_unreachable'
+      AND r.claim_released_at IS NULL
+    -- OF the view locks both its repo and connection rows. NOWAIT avoids
+    -- inversion with deletion paths that already hold runs before mappings.
+    -- A lock refusal aborts the whole park, including custody and counters.
+    FOR SHARE OF a NOWAIT
+)
 INSERT INTO forge_origin_cooldowns
     (user_id, worker_id, origin, failure_step, cooled_until, last_reason, observed_at)
 SELECT m.user_id, m.worker_id, m.origin, 0,
        clock_timestamp() + ($1::float8 * interval '1 millisecond'),
        'transient_clone_fetch_exhausted', clock_timestamp()
-FROM run_forge_origins m
-JOIN runs r ON r.id = m.run_id AND r.user_id = m.user_id
-    AND r.worker_id = m.worker_id AND r.claim_generation = m.generation
-JOIN workers w ON w.id = m.worker_id AND w.user_id = m.user_id
-WHERE r.id = $2::uuid AND r.worker_id = $3::uuid
-  AND r.claim_generation = $4::bigint
-  AND r.status = 'recovery_wait' AND r.recovery_wait_cause = 'forge_unreachable'
-  AND r.claim_released_at IS NULL
-  AND EXISTS (SELECT 1 FROM authorized_forge_origins a
-              WHERE a.repo_id = r.repo_id AND a.connection_id = m.connection_id
-                AND a.user_id = m.user_id AND a.origin = m.origin)
+FROM mapping m
 ON CONFLICT (user_id, worker_id, origin) DO UPDATE SET
     failure_step = LEAST(forge_origin_cooldowns.failure_step + 1, 30),
     observation_version = forge_origin_cooldowns.observation_version + 1,
     cooled_until = clock_timestamp() +
         (LEAST($1::float8 * power(2::float8,
             LEAST(forge_origin_cooldowns.failure_step + 1, 30)),
-            $5::float8) * interval '1 millisecond'),
+            $2::float8) * interval '1 millisecond'),
     last_reason = 'transient_clone_fetch_exhausted',
     observed_at = clock_timestamp()
 `
 
 type ObserveParkedForgeOriginParams struct {
 	BaseMs     float64   `json:"base_ms"`
+	CapMs      float64   `json:"cap_ms"`
 	RunID      uuid.UUID `json:"run_id"`
 	WorkerID   uuid.UUID `json:"worker_id"`
 	Generation int64     `json:"generation"`
-	CapMs      float64   `json:"cap_ms"`
 }
 
 // Caller holds the authenticated exact-generation run lock and has applied its
@@ -160,10 +175,10 @@ type ObserveParkedForgeOriginParams struct {
 func (q *Queries) ObserveParkedForgeOrigin(ctx context.Context, arg ObserveParkedForgeOriginParams) (int64, error) {
 	result, err := q.db.Exec(ctx, observeParkedForgeOrigin,
 		arg.BaseMs,
+		arg.CapMs,
 		arg.RunID,
 		arg.WorkerID,
 		arg.Generation,
-		arg.CapMs,
 	)
 	if err != nil {
 		return 0, err

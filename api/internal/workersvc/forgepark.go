@@ -93,6 +93,22 @@ var serverRecoveryWaitCauses = map[string]bool{
 // current, unreleased generation whose exact-hold cardinality or legacy release step cannot
 // settle rolls back as custody_unsettled. A guarded hold stays open through an applied park.
 func (s *Service) parkForgeUnreachable(ctx context.Context, wkr store.Worker, owned store.Run, req StateRequest, sessionID pgtype.Text) (store.Run, int64, error) {
+	// Mapping locks are nonblocking to preserve existing deletion lock order.
+	// A retry starts a completely new transaction: no park/custody/count changes
+	// from a rejected attempt survive. Persistent contention stays retryable.
+	const attempts = 3
+	for attempt := 1; ; attempt++ {
+		run, rows, err := s.parkForgeUnreachableAttempt(ctx, wkr, owned, req, sessionID)
+		if !isLockNotAvailable(err) || attempt >= attempts {
+			return run, rows, err
+		}
+		if err := ctx.Err(); err != nil {
+			return store.Run{}, 0, err
+		}
+	}
+}
+
+func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Worker, owned store.Run, req StateRequest, sessionID pgtype.Text) (store.Run, int64, error) {
 	// A forge park report MUST carry the claim generation it holds — it is the #1247 fence the
 	// stale_claim precedence keys on. Absent is a protocol error (400), not a stale claim: a
 	// stale_claim is a generation MISMATCH, which needs a value to compare.
