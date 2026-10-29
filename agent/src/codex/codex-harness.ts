@@ -88,6 +88,7 @@ import {
   type ProjectionScrub,
 } from "./projection.js";
 
+import { evidencesModelProcessing } from "../harness.js";
 import type { Logger } from "../log.js";
 import type {
   BoundaryRequest,
@@ -613,6 +614,18 @@ export class CodexHarness implements RunHarness {
   // PRD #1534: the classification captured from the active turn's final non-retrying
   // provider method:"error" frame, folded into the terminal at decode. Reset per turn.
   private pendingCodexError?: CodexErrorClassification;
+  private retryCodexError?: CodexErrorClassification;
+  private finalCodexErrorSeen = false;
+
+  /** Closed retry context for the active root turn; never terminal selection. */
+  get retryClassification(): Readonly<CodexErrorClassification> | undefined {
+    return this.retryCodexError;
+  }
+
+  private emitted(event: HarnessEvent): HarnessEvent {
+    if (evidencesModelProcessing(event)) this.retryCodexError = undefined;
+    return event;
+  }
   private rateLimits = new CodexRateLimitObserver();
   // Resolves the current turn's abort race (see runTurn). The owner-aborted signal
   // resolves it via the listener; requestStop()/close() resolve it directly so a turn
@@ -991,6 +1004,8 @@ export class CodexHarness implements RunHarness {
     this.stopRequested = false;
     this.stopTurn = undefined;
     this.pendingCodexError = undefined;
+    this.retryCodexError = undefined;
+    this.finalCodexErrorSeen = false;
     this.rateLimits = new CodexRateLimitObserver();
     this.turnOrdinal += 1;
     this.projectionCounter = 0;
@@ -1131,7 +1146,7 @@ export class CodexHarness implements RunHarness {
 
   /** Yield every queued projected event, including any queued while a yield was pending. */
   private *drainOutbox(): Generator<HarnessEvent> {
-    for (let ev = this.outbox.shift(); ev !== undefined; ev = this.outbox.shift()) yield ev.event;
+    for (let ev = this.outbox.shift(); ev !== undefined; ev = this.outbox.shift()) yield this.emitted(ev.event);
   }
 
   private async *runTurn(request: RunTurnRequest, rendered: RenderedCodexRun): AsyncGenerator<HarnessEvent> {
@@ -1224,7 +1239,7 @@ export class CodexHarness implements RunHarness {
       // pass emitClaimInit=false, and this latch prevents another marker on later turns in epoch 0.
       if (this.emitClaimInit && !this.claimInitEmitted) {
         this.claimInitEmitted = true;
-        yield { kind: "initialized", model: this.currentModel, sessionId: this.threadId };
+        yield this.emitted({ kind: "initialized", model: this.currentModel, sessionId: this.threadId });
       }
 
       // One reader, one serial effect mapping, one Bash-only Read observation, and a bounded FIFO. Readiness is stamped
@@ -1303,7 +1318,7 @@ export class CodexHarness implements RunHarness {
         const observationReady = observation?.ready ?? Infinity;
         const mappedReady = Math.min(effectReady, observationReady);
         if (outboxReady < readReady && outboxReady < mappedReady) {
-          yield this.outbox.shift()!.event;
+          yield this.emitted(this.outbox.shift()!.event);
           continue;
         }
         if (mappedReady < readReady) {
@@ -1344,13 +1359,13 @@ export class CodexHarness implements RunHarness {
             this.closeOpenDispatches(ordinal, DISPATCH_OPEN_AT_TURN_END);
             yield* this.drainOutbox();
             this.pendingChildUsage.clear();
-            yield mapped;
+            yield this.emitted(mapped);
             if (this.pendingToolCalls.size > 0)
               await Promise.race([Promise.allSettled(this.pendingToolCalls), abortPromise]);
             yield* this.drainOutbox();
             return;
           }
-          yield mapped;
+          yield this.emitted(mapped);
           continue;
         }
         if (readReady === Infinity) {
@@ -1411,7 +1426,7 @@ export class CodexHarness implements RunHarness {
             const sink = this.childSinks.get(childId);
             if (sink !== undefined) {
               sink.push(step.value);
-              yield { kind: "activity", sessionId: this.threadId };
+              yield this.emitted({ kind: "activity", sessionId: this.threadId });
               continue;
             }
           }
@@ -1450,7 +1465,7 @@ export class CodexHarness implements RunHarness {
           }
           continue;
         }
-        yield await this.mapNote(transport, step.value, request.signal);
+        yield this.emitted(await this.mapNote(transport, step.value, request.signal));
       }
     } finally {
       refuseDeferred();
@@ -1675,14 +1690,17 @@ export class CodexHarness implements RunHarness {
         // token-usage note never reaches here (the demux routes it to the child sink first).
         return { kind: "activity", sessionId: note.threadId };
       case "codex_error": {
-        // PRD #1534: bind the provider ErrorNotification to the ACTIVE root turn and retain
-        // its classification ONLY on an explicit non-retrying frame (willRetry === false) —
-        // final-non-retrying-wins. A retrying frame is liveness/diagnostic, never the terminal
-        // cause; a stale/foreign/child identity is ignored. Never emits a frame or latches the
-        // terminal; parsing stays in the single-source normalizer (no raw provider text kept).
-        if (note.threadId === this.threadId && note.turnId === this.activeTurnId && note.willRetry === false) {
+        // Final-non-retrying wins even without a known classification. Retry context is
+        // independent of terminal selection and contains no raw provider text.
+        if (note.threadId === this.threadId && note.turnId === this.activeTurnId) {
           const rawInfo = asObject(asObject(note.params)?.error)?.codexErrorInfo;
-          this.pendingCodexError = normalizeCodexErrorInfo(rawInfo);
+          if (note.willRetry === false) {
+            this.finalCodexErrorSeen = true;
+            this.retryCodexError = undefined;
+            this.pendingCodexError = normalizeCodexErrorInfo(rawInfo);
+          } else if (note.willRetry === true && !this.finalCodexErrorSeen) {
+            this.retryCodexError = normalizeCodexErrorInfo(rawInfo);
+          }
         }
         return { kind: "activity", sessionId: note.threadId };
       }

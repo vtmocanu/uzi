@@ -99,5 +99,6 @@ func (s *Service) checkRecoveryStorage(ctx context.Context, now time.Time) apity
 	case t.RefusedCount > 0:
 		c.Action = strPtr("Review currently quota-refused captures with their owners (uzi run recovery). This observes stored state; an admitted retry clears the marker before upload succeeds.")
 	}
+	c.AttentionBanner = c.Scope == "owner" && c.Severity == sevWarn
 	return c
 }

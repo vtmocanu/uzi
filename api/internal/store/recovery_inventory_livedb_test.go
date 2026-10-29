@@ -92,6 +92,9 @@ func TestRecoveryInventoryClaimLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if n, err := q.StampCaptureReservation(ctx, store.StampCaptureReservationParams{ID: cap.ID, ReservedBytes: pgtype.Int8{Int64: 1, Valid: true}}); err != nil || n != 1 {
+				t.Fatalf("StampCaptureReservation: rows=%d err=%v", n, err)
+			}
 			exec("UPDATE recovery_captures SET state='available',expires_at=now()+interval '1 hour' WHERE id=$1", cap.ID)
 			exec("UPDATE runs SET status='completed',branch='agent/issue-1' WHERE id=$1", run)
 			testPrerequisiteSQLGuards(t, ctx, pool, cap, hold, worker, user, run)

@@ -192,11 +192,12 @@ describe("live-flight plan revision recovery", () => {
     assert.deepEqual(observed, [true, false, true, false]);
   });
 
-  it("3466 measured silence shares exactly three re-drives and names the idle cause", async () => {
+  for (const providerOrigin of [false, true]) it(`3506 revision retry and exhaustion providerOrigin=${providerOrigin}`, async () => {
     const f = fixture(3);
     const cause = new TransientRecoveryError("silent revision", {
-      idleStallKind: "zero_evidence", originalIdle: new Error("codex run idle timeout"),
+      providerOrigin, idleStallKind: "zero_evidence", originalIdle: new Error("codex run idle timeout"),
     });
+    const reason = providerOrigin ? "silence after a provider-reported rate limit or transport retry" : "No model output within the idle timeout";
     await f.recovery.beforeTurn();
     for (let attempt = 1; attempt <= 3; attempt++) {
       const slept = f.sleeps.reduce((sum, ms) => sum + ms, 0);
@@ -205,11 +206,11 @@ describe("live-flight plan revision recovery", () => {
       await f.recovery.beforeTurn();
       await f.recovery.beforeTurn();
       assert.equal(f.notices.at(-1),
-        `No model output within the idle timeout during plan revision 101; re-driving the failed turn (${attempt}/3).`);
+        `${reason} during plan revision 101; re-driving the failed turn (${attempt}/3).`);
     }
     assert.equal(f.sleeps.reduce((sum, ms) => sum + ms, 0), 35000);
     await assert.rejects(f.recovery.retry(cause), PlanRejectedError);
-    assert.match(f.notices.at(-1)!, /^No model output within the idle timeout\. Plan revision retry allowance exhausted/);
+    assert.ok(f.notices.at(-1)!.startsWith(`${reason}. Plan revision retry allowance exhausted`));
     assert.match(f.notices.at(-1)!, /Feedback remains pending/);
     assert.ok(f.notices.every(text => !text.includes("Provider transient")));
     assert.deepEqual(f.writes, []);

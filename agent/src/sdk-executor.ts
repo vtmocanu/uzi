@@ -257,11 +257,11 @@ const EMPTY_TURN_BACKOFF_SLICE_MS = 250;
  * runner catch route it to the non-terminal park instead of the generic failure path.
  */
 export class TransientRecoveryError extends Error {
-  /** PRD #1733: true only when the FINAL in-process attempt failed with a transient provider
-   *  error. The runner types the recovery_wait park `provider_outage` from this alone; the
+  /** PRD #1733: true when the final attempt failed with a transient provider error, or
+   *  measured zero-evidence Codex idle retained a transient provider retry. The runner types the recovery_wait park `provider_outage` from this alone; the
    *  empty-turn and gate-recovery throws stay unmarked. */
   public readonly providerOrigin: boolean;
-  /** Measured Codex idle evidence, never provider-outage evidence. */
+  /** Measured Codex idle provenance; may coexist with providerOrigin for revision recovery. */
   public readonly idleStallKind?: "zero_evidence" | "productive";
   /** Original idle trip retained by identity for unsupported revision recovery. */
   public readonly originalIdle?: Error;
