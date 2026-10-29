@@ -127,6 +127,12 @@ func ValidateCSRF(r *http.Request) bool {
 		return true
 	}
 
+	return ValidateCSRFToken(r)
+}
+
+// ValidateCSRFToken checks the JWT-bound CSRF header regardless of HTTP method.
+// Browser hooks must call this before accessing browser session state, including on GET.
+func ValidateCSRFToken(r *http.Request) bool {
 	header := r.Header.Get(CSRFHeaderName)
 	if header == "" {
 		return false
