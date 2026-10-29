@@ -528,6 +528,9 @@ func (h *Handler) recovery() *recovery.Service {
 			h.recoverySvc = recovery.New(h.q, h.pool, h.box, h.recoveryLimits(), h.now)
 			if h.wsvc != nil {
 				h.recoverySvc.SetCustodySettledHook(h.wsvc.SettleRetainedCheckpoint)
+				h.recoverySvc.SetPrerequisiteClosure(h.cfg.PrerequisiteClosureForges, func(userID, captureID uuid.UUID) {
+					h.wsvc.KickPrerequisiteClosure(userID, captureID)
+				})
 				// Issue #2545 step B: the held-ref listing goes through the same SSRF-gated
 				// derivation as step A's push.
 				heldRemote := h.wsvc.HeldRemote()
