@@ -124,7 +124,12 @@ simulate() (
       *"/api/auth/login"*) printf true > "$STATE/user2-unlocked" ;;
       *"/api/vault/status"*) status "$who" ;;
       *"/api/vault/unlock"*) printf true > "$STATE/$who-unlocked"; printf dek > "$STATE/$who-sealed"
-        echo "$who-unlock" >> "$STATE/calls" ;;
+        echo "$who-unlock" >> "$STATE/calls"
+        if [ "$scenario" = http-slot-header ]; then
+          printf 'Set-Cookie: uzi_vault_slot=sentinel; Secure; HttpOnly\r\n'
+        else
+          printf 'Set-Cookie: uzi_vault_slot=; Max-Age=0; Secure\r\n'
+        fi ;;
       *) return 90 ;;
     esac
   }
@@ -170,7 +175,7 @@ if [ "${1:-}" = --simulate ]; then
   simulate "$3"
   exit
 fi
-for scenario in success off-enrolled-at-boot off-claim-fails cleanup-enable-fails http-slot-row http-slot-cookie; do
+for scenario in success off-enrolled-at-boot off-claim-fails cleanup-enable-fails http-slot-row http-slot-cookie http-slot-header; do
   cases=$((cases+1))
   rc=0
   bash "$0" --simulate "$fixture" "$scenario" > "$fixture/$scenario.log" 2>&1 || rc=$?
@@ -181,7 +186,7 @@ for scenario in success off-enrolled-at-boot off-claim-fails cleanup-enable-fail
       && [ "$(cat "$fixture/$scenario/policy")" = required ] \
       && [ "$(cat "$fixture/$scenario/user2-unlocked")" = true ] \
       && grep -qF 'wait off-run completed' "$fixture/$scenario/calls" && valid=true
-  elif [ "$scenario" = http-slot-row ] || [ "$scenario" = http-slot-cookie ]; then
+  elif [ "$scenario" = http-slot-row ] || [ "$scenario" = http-slot-cookie ] || [ "$scenario" = http-slot-header ]; then
     [ "$rc" -eq 7 ] && grep -qF 'HTTP deployment' "$fixture/$scenario.log" && valid=true
   else
     [ "$rc" -eq 7 ] && [ "$(cat "$fixture/$scenario/policy")" = required ] \
@@ -209,4 +214,4 @@ for scenario in success off-enrolled-at-boot off-claim-fails cleanup-enable-fail
   fi
 done
 echo "cases=$cases passed=$passed"
-[ "$cases" -eq 6 ] && [ "$passed" -eq "$cases" ]
+[ "$cases" -eq 7 ] && [ "$passed" -eq "$cases" ]

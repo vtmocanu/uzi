@@ -67,7 +67,7 @@ The client sends the readable CSRF cookie on foreground reads and marks
 hidden-tab requests passive. Passive requests, WebSocket upgrades and
 /api/ws do not restore. Lifecycle endpoints, logout and settings writes
 also bypass restore. A tab opening/focus status read can restore, clear
-the lock-notice episode and best-effort promote that owner's
+the lock-notice episode on a best-effort basis and promote that owner's
 `vault_locked` recovery parks through `vaultReady`; scheduled retry remains
 the fallback and workers use normal claim admission.
 

@@ -134,8 +134,8 @@ the DEK after acknowledged commit.
 
 The web client marks hidden-tab requests passive; passive requests and
 WebSocket connections do not restore. Opening or focusing a tab makes a
-foreground status request eligible to restore, clear the lock-notice episode
-and best-effort promote the owner's `vault_locked` recovery parks.
+foreground status request eligible to restore, attempt to clear the lock-notice
+episode and best-effort promote the owner's `vault_locked` recovery parks.
 Runs of a user who keeps the vault still wait after a restart until that user opens or focuses a uzi tab.
 
 The CLI does not get a keyslot here.

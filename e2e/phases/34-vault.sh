@@ -29,11 +29,17 @@ assert_protected() {
   vault_status_jar "$1" | jq -e --argjson unlocked "$2" '.mode == "protected" and .policy == "required" and .exists == true and .unlocked == $unlocked' >/dev/null \
     || fail "expected protected vault (unlocked=$2)"
 }
+# Consume headers without retaining or printing cookie values. Empty clearing
+# cookies are allowed; any secret-bearing slot cookie is forbidden over HTTP.
+reject_http_slot_header() {
+  awk 'tolower($0) ~ /^set-cookie:[[:space:]]*uzi_vault_slot=[^;[:space:]]+/ {forbidden=1} END {exit forbidden}'
+}
 unlock_user2() {
   local token
   token="$(awk '$6=="uzi_csrf"{print $7}' "$JAR2")"
-  curl -fsS -b "$JAR2" -X POST "$BASE/api/vault/unlock" -H 'Content-Type: application/json' \
-    -H "X-CSRF-Token: $token" -d '{"password":"e2e-user2-password-000000"}' >/dev/null
+  curl -fsS -D - -o /dev/null -b "$JAR2" -X POST "$BASE/api/vault/unlock" -H 'Content-Type: application/json' \
+    -H "X-CSRF-Token: $token" -d '{"password":"e2e-user2-password-000000"}' \
+    | reject_http_slot_header || fail "HTTP deployment emitted a vault browser slot header or unlock failed"
 }
 # Failure recovery: one attempt per independent action, each HTTP request bounded
 # to 15s. A failed sibling never prevents the others; retain the original exit.
@@ -130,8 +136,9 @@ pass "the unlocked run $RUN_V completed (worker freed)"
 # 4) Stage a legacy master-sealed row for a NON-seed user (user2, registered
 # earlier) and confirm the admin migration count sees it. Re-login user2 first so
 # its session + CSRF are fresh enough to survive the api restart below.
-curl -fsS -c "$JAR2" -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' \
-  -d '{"email":"user2@uzi.e2e","password":"e2e-user2-password-000000"}' >/dev/null
+curl -fsS -D - -o /dev/null -c "$JAR2" -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' \
+  -d '{"email":"user2@uzi.e2e","password":"e2e-user2-password-000000"}' \
+  | reject_http_slot_header || fail "HTTP deployment emitted a vault browser slot header or login failed"
 U2ID="$(db_psql "SELECT id FROM users WHERE email = 'user2@uzi.e2e'")"
 [ -n "$U2ID" ] || fail "user2 not found in the db"
 # Seal the legacy row with the api's ACTUAL master key: Compose ranks the
