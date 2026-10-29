@@ -968,6 +968,10 @@ type RunDTO struct {
 	HomeBytes     *int64 `json:"home_bytes,omitempty"`
 	CacheBytes    *int64 `json:"cache_bytes,omitempty"`
 	DiskTruncated bool   `json:"disk_truncated,omitempty"`
+	// LeadConfig is the lead agent's configured and runtime-reported model and effort (PRD #3244).
+	// SINGLE-RUN READ ONLY, best-effort: set by GET /api/runs/{id} for lead-lane runs (leadcfg.LeadLane)
+	// and absent on every list row and on runs that have no lead agent. Display-only.
+	LeadConfig *RunLeadConfigDTO `json:"lead_config,omitempty"`
 	// Model is the model frozen onto the run at fire time by the schedule that created it
 	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
 	// read-only so a scheduled run's model is confirmable.

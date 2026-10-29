@@ -1270,6 +1270,26 @@ type RunHeldPublication struct {
 	RefusalReason   pgtype.Text        `json:"refusal_reason"`
 }
 
+type RunLeadConfig struct {
+	RunID                  uuid.UUID          `json:"run_id"`
+	ClaimGeneration        int64              `json:"claim_generation"`
+	Phase                  string             `json:"phase"`
+	PhaseEntry             int16              `json:"phase_entry"`
+	Seq                    int16              `json:"seq"`
+	Harness                string             `json:"harness"`
+	RequestedModel         pgtype.Text        `json:"requested_model"`
+	RequestedModelSource   string             `json:"requested_model_source"`
+	ObservedModel          pgtype.Text        `json:"observed_model"`
+	ObservedModelEvidence  pgtype.Text        `json:"observed_model_evidence"`
+	RequestedEffort        pgtype.Text        `json:"requested_effort"`
+	RequestedEffortMode    string             `json:"requested_effort_mode"`
+	RequestedEffortSource  string             `json:"requested_effort_source"`
+	ObservedEffort         pgtype.Text        `json:"observed_effort"`
+	ObservedEffortEvidence pgtype.Text        `json:"observed_effort_evidence"`
+	Truncated              bool               `json:"truncated"`
+	ReportedAt             pgtype.Timestamptz `json:"reported_at"`
+}
+
 type RunMessage struct {
 	ID              int64              `json:"id"`
 	RunID           uuid.UUID          `json:"run_id"`

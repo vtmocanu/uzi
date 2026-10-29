@@ -692,6 +692,32 @@
   "home_bytes": 1,
   "cache_bytes": 1,
   "disk_truncated": true,
+  "lead_config": {
+    "applicable": true,
+    "claim_generation": 1,
+    "current": true,
+    "phases": [
+      {
+        "phase": "x",
+        "phase_entry": 1,
+        "seq": 1,
+        "harness": "x",
+        "requested_model": "x",
+        "requested_model_source": "x",
+        "requested_model_fixed_at": "x",
+        "requested_effort": "x",
+        "requested_effort_mode": "x",
+        "requested_effort_source": "x",
+        "requested_effort_fixed_at": "x",
+        "observed_model": "x",
+        "observed_model_evidence": "x",
+        "observed_effort": "x",
+        "observed_effort_evidence": "x",
+        "truncated": true,
+        "reported_at": "2020-01-02T03:04:05Z"
+      }
+    ]
+  },
   "model": "x",
   "override_subagent_model": true,
   "priority": "x",
