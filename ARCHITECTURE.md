@@ -1876,6 +1876,23 @@ Four independent layers, any one of which failing still leaves the others:
    the `disallowedTools` list and the deny-hook above. See the Repo agents docs
    page and `specs/ai.md` "PRD #37".
 
+   **Verbatim prompts (issue #1563).** Every Claude query options object that
+   carries `settingSources: []` also sets `verbatimPrompts: true`, so the bundled
+   CLI delivers each user turn as written. Without it the CLI preprocesses a turn
+   before any tool runs: an `@<path>` mention is expanded by a CLI-synthesized
+   Read that no `PreToolUse` hook sees (so neither the path guard's deny list nor
+   its worktree confinement applies), and a leading `/<command>` is dispatched.
+   uzi assembles prompts from issue text, MR review comments, CI log tails and
+   chat turns, so the mention is attacker-reachable. This closes that one
+   preprocessing step only: it is not a sandbox, it does not change tool
+   guards, and Codex is unaffected. The SDK documents a tradeoff, that a
+   verbatim turn also skips the CLI's turn-start attachment pass (skill and
+   tool listings, nested instruction files, per-turn reminders) until after the
+   first tool call; on the pinned CLI 2.1.302 the skill and tool listings were
+   still observed on the first request. Real-CLI tests against a local fake
+   provider pin both the non-expansion and that first-turn behaviour
+   (`agent/test/sdk-verbatim-prompts*.ts`).
+
 Permission mode is explicitly `bypassPermissions` (allow-by-default) **plus**
 the deny-hook and a `disallowedTools` list — not `default` (which hangs
 headless waiting for an approval that will never come in an unattended

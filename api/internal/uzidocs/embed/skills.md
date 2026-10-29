@@ -195,6 +195,12 @@ Native project loading stays disabled: Claude keeps `settingSources: []`,
 and Codex keeps `project_doc_max_bytes = 0`, an explicitly `untrusted`
 project and native extensions/hooks disabled.
 
+Claude turns are also delivered verbatim (`verbatimPrompts: true`), so an
+`@path` mention or a leading `/command` in issue or chat text is never expanded
+or run. The SDK notes that this can defer the first turn's skill listing until
+after the first tool call; on the currently pinned CLI the listing still
+arrives with the first request, and enabled skills remain invocable.
+
 The lead verifies any tool or path the file names against the worker before
 relying on it — the worker environment genuinely differs
 from a contributor's laptop (a baked toolchain, no host filesystem, no

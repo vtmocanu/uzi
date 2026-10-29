@@ -121,6 +121,11 @@ scan root is explicitly excluded from scanning.
   key's presence would false-positive on every legitimate
   `{ ...baseOptions, ... }` spread site. That gap is a review + test concern,
   not a semgrep one.
+  The sibling invariant `verbatimPrompts: true` (issue #1563: no CLI `@path`
+  expansion or slash-command dispatch of untrusted prompt text) is likewise
+  enforced by tests rather than semgrep: per-site tests assert the option
+  reaches every Claude query, and a structural test requires it in every object
+  literal that carries `settingSources: []` under `agent/src`.
 - **`codex-fixed-constructor.yml`** (DARK Codex, issue #1171) — the Codex run
   lane is composed at exactly two sanctioned construction sites: `main.ts`
   news up the production `CodexExecutor`, and `codex/codex-executor.ts` is the
