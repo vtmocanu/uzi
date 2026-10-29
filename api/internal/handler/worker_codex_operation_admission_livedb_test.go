@@ -103,6 +103,35 @@ func TestWorkerCodexOperationPersistedLiveDB(t *testing.T) {
 			t.Fatalf("admit %d %v", rec.Code, value)
 		}
 	}
+	// A quarantined refresh has ambiguous material, but ownership and the
+	// frozen identity remain valid. The worker must wait, not abandon the flight.
+	for _, status := range []string{"claimed", "running", "awaiting_approval"} {
+		t.Run("quarantine/"+status, func(t *testing.T) {
+			mustExecT(ctx, t, pool, "UPDATE runs SET status=$2 WHERE id=$1", run, status)
+			for _, state := range []string{"idle", "in_progress", "quarantined", "idle"} {
+				mustExecT(ctx, t, pool, "UPDATE codex_provider_account SET coord_state=$2 WHERE id=$1", account.ID, state)
+				var before, after string
+				if err := pool.QueryRow(ctx, "SELECT to_jsonb(r)::text FROM runs r WHERE id=$1", run).Scan(&before); err != nil {
+					t.Fatal(err)
+				}
+				rec := post()
+				value := decode(rec)
+				if state == "quarantined" {
+					if rec.Code != http.StatusServiceUnavailable || len(value) != 1 || value["error"] != "operation admission unavailable" {
+						t.Errorf("quarantine must wait nonterminally: status=%d body=%v", rec.Code, value)
+					}
+				} else if rec.Code != http.StatusOK || value["decision"] != "admit" {
+					t.Errorf("state %s must admit current material: status=%d body=%v", state, rec.Code, value)
+				}
+				if err := pool.QueryRow(ctx, "SELECT to_jsonb(r)::text FROM runs r WHERE id=$1", run).Scan(&after); err != nil {
+					t.Fatal(err)
+				}
+				if before != after {
+					t.Fatal("admission changed lifecycle, generation, wall, progress or owner episode")
+				}
+			}
+		})
+	}
 	mustExecT(ctx, t, pool, "UPDATE runs SET status='running' WHERE id=$1", run)
 	if err := svc.RecordCodexAdmissionSignal(ctx, store.Worker{ID: worker, UserID: owner}, run, workersvc.CodexAdmissionSignal{ClaimGeneration: 1, AttemptID: uuid.NewString(), Class: "rate_limit"}); err != nil {
 		t.Fatal(err)

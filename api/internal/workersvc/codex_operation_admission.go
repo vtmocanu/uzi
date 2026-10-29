@@ -156,6 +156,12 @@ func readCodexOperationAdmission(ctx context.Context, q *store.Queries, worker s
 			return out, ErrStaleRevisionSource
 		}
 	}
+	// Quarantine is temporary ambiguous refresh material, not lost ownership.
+	// The handler maps this existing sentinel to unavailable (503), so the
+	// negotiated flight waits and rechecks without leaving its current state.
+	if auth.CoordState == codexCoordQuarantined {
+		return out, ErrCodexAccountQuarantined
+	}
 	cooldown := auth
 	if cooldown.EligibleAt.Valid && cooldown.EligibleAt.Time.After(cooldown.ServerNow.Time) {
 		if !cooldown.EpisodeID.Valid {
@@ -192,7 +198,7 @@ func applyActiveCooldown(ctx context.Context, q *store.Queries, worker store.Wor
 	if e.cooldown != nil && e.claimGeneration > 0 && !e.terminalPending {
 		req := CodexOperationRequest{ClaimGeneration: e.claimGeneration, CodexOperationIdentity: *e.cooldown}
 		decision, err := readCodexOperationAdmission(ctx, q, worker, e.runID, req)
-		if err != nil && !errors.Is(err, ErrCodexAdmissionRefused) && !errors.Is(err, ErrStaleRevisionSource) {
+		if err != nil && !errors.Is(err, ErrCodexAdmissionRefused) && !errors.Is(err, ErrStaleRevisionSource) && !errors.Is(err, ErrCodexAccountQuarantined) {
 			return err
 		}
 		if err == nil && decision.Decision == "wait" {

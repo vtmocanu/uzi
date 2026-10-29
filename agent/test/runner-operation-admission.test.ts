@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { spawn } from "node:child_process";
 import { PassThrough } from "node:stream";
 import path from "node:path";
-import { CodexOperationAdmissionError } from "../src/client.js";
+import { WorkerClient, CodexOperationAdmissionError } from "../src/client.js";
 import type { RunContext } from "../src/executor.js";
 import { commitInTree, trackedFile } from "./runner-codex-sinks-fixture.js";
 import { it } from "node:test";
@@ -743,4 +743,50 @@ for (const queued of ["root", "child"] as const) it(`M4 production required ${qu
     await done;
     assert.equal(registry.size, 0);
   } finally { releaseRead?.(); r.shutdown(); await done; }
+});
+
+it("quarantine 503 keeps the real flight waiting until reconciliation without productive credit", async t => {
+  enable();
+  const clock = new AdmissionClock();
+  const registry = new ActiveRunRegistry();
+  const fixture = providerFixture("codex", () => ({ plan: "# after reconciliation" }), false, { subscription: true });
+  const claim = freshClaim(7, { worker_recovery_owner_episode: 5,
+    secrets: { forge_pat: "fixture-forge-pat", codex: fixture.credential } });
+  let quarantined = true, reads = 0, settled = 0, ended = false;
+  const wire = new WorkerClient("http://admission.example.test", "fixture", "fixture", nullLogger(), {
+    fetch: async (_url, init) => {
+      reads++;
+      const request = JSON.parse(String(init?.body)) as CodexOperationRequest;
+      return quarantined ? Response.json({ error: "operation admission unavailable" }, { status: 503 })
+        : Response.json({ decision: "admit", operation_id: request.operation_id, claim_generation: request.claim_generation });
+    },
+  });
+  t.mock.method(client, "checkCodexOperationAdmission", wire.checkCodexOperationAdmission.bind(wire));
+  const execute = fixture.executor.run.bind(fixture.executor);
+  t.mock.method(fixture.executor, "run", (ctx: RunContext) => execute({ ...ctx,
+    onModelTurnSettled: async processedEvents => { settled++; await ctx.onModelTurnSettled?.(processedEvents); },
+  }));
+  const r = runner(fixture.executor, fakeGitlab().gitlab, undefined, { activeRuns: registry,
+    codexOperationWaitPolicy: { now: () => clock.now, sleep: clock.sleep } });
+  const done = r.execute(claim).finally(() => { ended = true; });
+  try {
+    assert.ok(await until(() => ended || clock.sleepers.size === 1));
+    assert.equal(ended, false);
+    assert.equal(reads, 1);
+    assert.equal(fixture.starts.length, 0);
+    assert.equal(settled, 0, "quarantine cannot manufacture provider progress");
+    assert.equal(api.states.some(s => s.body.status !== "running"), false, "unavailable admission must not park or fail the run");
+    assert.equal(registry.build().active.find(e => e.run_id === claim.run_id)!.claim_generation, 7);
+    assert.equal(claim.worker_recovery_owner_episode, 5);
+    quarantined = false;
+    clock.advance(14_999);
+    assert.equal(reads, 1);
+    clock.advance(1);
+    assert.ok(await until(() => gates(claim.run_id).length === 1));
+    assert.equal(reads, 2);
+    assert.equal(fixture.starts.length, 1);
+    assert.equal(api.states.some(s => s.body.status === "failed" || s.body.status === "recovery_wait" || s.body.status === "paused"), false);
+    send(claim.run_id, row("cancel"));
+    await done;
+  } finally { r.shutdown(); await done; }
 });

@@ -14,7 +14,7 @@ import (
 
 const getCodexOperationAuthority = `-- name: GetCodexOperationAuthority :one
 WITH authority AS MATERIALIZED (
-SELECT r.id AS run_id, r.user_id, c.provider_account_id, r.gate_revision, r.gate_presentation_id,
+SELECT r.id AS run_id, r.user_id, c.provider_account_id, r.gate_revision, r.gate_presentation_id, a.coord_state,
        EXISTS (SELECT 1 FROM run_user_inputs i
          WHERE i.run_id = r.id AND i.kind = 'revise_plan'
            AND i.gate_binding = 'bound' AND i.gate_revision = r.gate_revision
@@ -37,7 +37,7 @@ WHERE r.id = $1::uuid AND r.user_id = $2::uuid AND r.worker_id = $3::uuid
            THEN r.codex_account_key::jsonb = jsonb_build_array(a.provider_user_id, a.workspace_account_id)
            ELSE false END
 )
-SELECT authority.run_id, authority.user_id, authority.provider_account_id, authority.gate_revision, authority.gate_presentation_id, authority.revision_active, clock_timestamp()::timestamptz AS server_now,
+SELECT authority.run_id, authority.user_id, authority.provider_account_id, authority.gate_revision, authority.gate_presentation_id, authority.coord_state, authority.revision_active, clock_timestamp()::timestamptz AS server_now,
  codex_admission_run_eligible_at(authority.run_id)::timestamptz AS eligible_at, t.episode_id,
  (CASE WHEN t.rate_expiry IS NOT NULL AND
   (t.overload_expiry IS NULL OR t.rate_expiry >= t.overload_expiry)
@@ -59,6 +59,7 @@ type GetCodexOperationAuthorityRow struct {
 	ProviderAccountID  pgtype.UUID        `json:"provider_account_id"`
 	GateRevision       int64              `json:"gate_revision"`
 	GatePresentationID pgtype.UUID        `json:"gate_presentation_id"`
+	CoordState         string             `json:"coord_state"`
 	RevisionActive     bool               `json:"revision_active"`
 	ServerNow          pgtype.Timestamptz `json:"server_now"`
 	EligibleAt         pgtype.Timestamptz `json:"eligible_at"`
@@ -66,7 +67,8 @@ type GetCodexOperationAuthorityRow struct {
 	Class              string             `json:"class"`
 }
 
-// Callers hold the run lock. Eligibility is intentionally read only after this fence.
+// Callers hold the run lock. Carry quarantine in this same snapshot so the caller
+// can wait for reconciliation without classifying a still-owned claim as lost.
 func (q *Queries) GetCodexOperationAuthority(ctx context.Context, arg GetCodexOperationAuthorityParams) (GetCodexOperationAuthorityRow, error) {
 	row := q.db.QueryRow(ctx, getCodexOperationAuthority,
 		arg.RunID,
@@ -81,6 +83,7 @@ func (q *Queries) GetCodexOperationAuthority(ctx context.Context, arg GetCodexOp
 		&i.ProviderAccountID,
 		&i.GateRevision,
 		&i.GatePresentationID,
+		&i.CoordState,
 		&i.RevisionActive,
 		&i.ServerNow,
 		&i.EligibleAt,

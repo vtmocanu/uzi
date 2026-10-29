@@ -1,7 +1,8 @@
 -- name: GetCodexOperationAuthority :one
--- Callers hold the run lock. Eligibility is intentionally read only after this fence.
+-- Callers hold the run lock. Carry quarantine in this same snapshot so the caller
+-- can wait for reconciliation without classifying a still-owned claim as lost.
 WITH authority AS MATERIALIZED (
-SELECT r.id AS run_id, r.user_id, c.provider_account_id, r.gate_revision, r.gate_presentation_id,
+SELECT r.id AS run_id, r.user_id, c.provider_account_id, r.gate_revision, r.gate_presentation_id, a.coord_state,
        EXISTS (SELECT 1 FROM run_user_inputs i
          WHERE i.run_id = r.id AND i.kind = 'revise_plan'
            AND i.gate_binding = 'bound' AND i.gate_revision = r.gate_revision
