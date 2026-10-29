@@ -368,7 +368,8 @@ export interface RecoveryBundleProducer {
   enumerateOwedCandidates?(barePath: string, runId: string): Promise<OwedCandidate[]>;
   discoverOwedCandidates?(): ReturnType<GitCache["discoverOwedCandidates"]>;
   retainCurrentOwedCandidate?(barePath: string, options: FetchAgentBranchOptions): Promise<TrackingUpdateResult>;
-  buildRecoveryCoverage?(barePath: string, context: PositiveOwedCandidateContext, roots: string[], currentSha: string): Promise<RecoveryCoverage>;
+  buildRecoveryCoverage?(barePath: string, context: PositiveOwedCandidateContext, roots: string[], currentSha: string,
+    opts?: { reuseCoveredCurrent?: "if-covered" | "required" }): Promise<RecoveryCoverage>;
   /** Issue #2625: read-only redundancy claim for a previously built coverage aggregate. */
   readRecoveryCoverageClaim?(barePath: string, opts: {
     sourceSha: string; fingerprint: string; roots: string[]; currentSha: string; witnessHead?: string;
@@ -1463,7 +1464,8 @@ export class RecoveryCoordinator {
           digest = EMPTY_INVENTORY_DIGEST;
           sourceSha = input.currentSha;
         } else {
-          const coverage = await ownedRecoveryIO(() => this.git.buildRecoveryCoverage!(context.barePath, context, aggregateRoots, input.currentSha));
+          const coverage = await ownedRecoveryIO(() => this.git.buildRecoveryCoverage!(context.barePath, context, aggregateRoots,
+            input.currentSha, { reuseCoveredCurrent: "if-covered" }));
           sourceSha = coverage.sha;
           digest = coverage.fingerprint;
         }
@@ -2098,8 +2100,18 @@ export class RecoveryCoordinator {
       const roots = [...new Set([...frozenRoots.map(c => c.sha), record.originalSourceSha])].sort();
       // Use the producer's full proof. Optional archive-redundancy claims impose
       // smaller head/body/encoding limits that cannot become FINAL eligibility limits.
-      const coverage = await ownedRecoveryIO(() => this.git.buildRecoveryCoverage!(record.coverageContext!.barePath, record.coverageContext!,
-        roots, record.inventoryCurrentSha!));
+      // The old producer always added a parented object. Equality identifies a reused
+      // source without a new journal field; legacy records must rebuild byte-for-byte.
+      const reused = record.sourceSha === record.inventoryCurrentSha;
+      let coverage: RecoveryCoverage;
+      try {
+        coverage = await ownedRecoveryIO(() => this.git.buildRecoveryCoverage!(record.coverageContext!.barePath, record.coverageContext!,
+          roots, record.inventoryCurrentSha!, reused ? { reuseCoveredCurrent: "required" } : {}));
+      } catch (error) {
+        MaintenanceBudget.current()?.check();
+        if (!reused) throw error;
+        return false;
+      }
       if (coverage.sha !== record.sourceSha || coverage.fingerprint !== record.coverageDigest) return false;
     }
     return true;
