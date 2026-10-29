@@ -1,3 +1,4 @@
+import { validatePolicyHoldRequest, decodePolicyHoldReply, POLICY_HOLD_MAX_BYTES } from "./protocol.js";
 import { CodexAdmissionReporter } from "./codex/admission-signal.js";
 import { selectCodexBinding } from "./codex/select.js";
 import { createHash } from "node:crypto";
@@ -2255,6 +2256,17 @@ export class WorkerClient {
     return ack;
   }
 
+  /** One bounded attempt. No legacy /state fallback or generation downgrade is safe here. */
+  async reportPolicyHold(runId: string, body: import("./protocol.js").PolicyHoldRequest, signal?: AbortSignal): Promise<import("./protocol.js").PolicyHoldReply> {
+    const request = validatePolicyHoldRequest(body);
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/policy-hold`;
+    const res = await this.fetchRaw("POST", path, request, this.httpTimeoutMs, signal);
+    if (res.status !== 200 && res.status !== 409) throw await this.toError("POST", path, res);
+    const reply = decodePolicyHoldReply(JSON.parse(await readBoundedText(res, POLICY_HOLD_MAX_BYTES, true, signal)), request);
+    if ((res.status === 409) !== (reply.disposition === "pending")) throw new Error("invalid policy hold HTTP disposition");
+    return reply;
+  }
+
   /**
    * Report a run state and return what the server made of it. Every report —
    * terminal (completed/failed) and non-terminal (running/awaiting_approval/
@@ -2281,6 +2293,7 @@ export class WorkerClient {
    * so parsing a 409's status back out of the error text would work in tests and
    * fail on real runs.
    */
+
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
     this.sealCodexAdmission(path, body);

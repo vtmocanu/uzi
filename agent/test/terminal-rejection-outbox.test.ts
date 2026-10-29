@@ -106,7 +106,8 @@ test("real computed MAC failure is content free, not trusted or adopted; ACK/sta
   const restarted = new Outbox({ root, log: log.logger, runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1 });
   outboxes.push(restarted);
   await restarted.init();
-  assert.deepEqual(restarted.listPendingTerminals(), []);
+  assert.equal(restarted.listPendingTerminals()[0]?.outcome_kind, "unknown");
+  assert.equal(await restarted.hasPendingPolicyOutcome(run), true);
   assert.equal(await restarted.readTerminalJournal(run, 3), undefined);
   assert.equal((await restarted.observeTerminalAuthentication(run, 3)).kind, "mac_failure");
   assert.equal((await restarted.journalTerminal(run, 3, "implement", 0, { status: "completed" })).journaled, false);

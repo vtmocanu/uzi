@@ -30,6 +30,7 @@
 // serves every terminal producer without importing the runner.
 
 import { isStrict404Body, RequestError, type WorkerClient } from "./client.js";
+import { resolvePolicyOutcome, type CurrentPolicyAuthority } from "./policy-resolve.js";
 import { WORKER_API_PREFIX } from "./protocol.js";
 import type { Logger } from "./log.js";
 import type { Outbox, ReportRetirementContext } from "./outbox.js";
@@ -79,7 +80,7 @@ const TOMBSTONE_CHUNK = 500;
  *  surface. */
 export interface TerminalOutboxDeps {
   outbox: Outbox;
-  client: Pick<WorkerClient, "hasFeature" | "getMessageGaps" | "postMessages">;
+  client: Pick<WorkerClient, "hasFeature" | "getMessageGaps" | "postMessages"> & Partial<Pick<WorkerClient, "reportPolicyHold">>;
   /** config.gapFillMax — the total per-seq tombstone budget before a hole is declared unrecoverable. */
   gapFillMax: number;
   /** config.outboxTerminalMaxBytes — the per-record canonicaliser cap. */
@@ -94,13 +95,16 @@ export type SendTerminalState = (body: StateRequest, signal?: AbortSignal) => Pr
 
 /** Build the terminal-resolve deps for a lane, or undefined when no usable outbox is wired (a test
  *  without spill, or a store that failed closed) — in which case the caller sends un-journaled. One
- *  builder so every lane (run, judge, review, M4 boot) applies the SAME isDisabled() gate. */
+ *  builder so legacy lanes apply the same isDisabled() gate. Policy capture callers explicitly
+ *  opt into retaining disabled dependencies and must use journalPolicyHold, with no send fallback. */
 export function makeTerminalOutboxDeps(
   outbox: Outbox | undefined,
   client: TerminalOutboxDeps["client"],
-  opts: { gapFillMax: number; terminalMaxBytes: number; log: Logger },
+  opts: { gapFillMax: number; terminalMaxBytes: number; log: Logger; retainDisabledPolicy?: boolean },
 ): TerminalOutboxDeps | undefined {
-  if (!outbox || outbox.isDisabled()) return undefined;
+  // Policy callers must opt in and journalPolicyHold even on a disabled store: its memory
+  // projection preserves snapshot membership, while the resolver requires authenticated disk evidence.
+  if (!outbox || (outbox.isDisabled() && !opts.retainDisabledPolicy)) return undefined;
   return { outbox, client, gapFillMax: opts.gapFillMax, terminalMaxBytes: opts.terminalMaxBytes, log: opts.log };
 }
 
@@ -132,6 +136,7 @@ export async function postTerminalState(
 }
 
 interface ResolveArgs {
+  currentPolicyAuthority?: CurrentPolicyAuthority;
   runId: string;
   claimGeneration: number;
   send: SendTerminalState;
@@ -299,6 +304,7 @@ export async function resolvePendingTerminal(deps: TerminalOutboxDeps, args: Res
 async function resolvePendingTerminalOnce(deps: TerminalOutboxDeps, args: ResolveArgs): Promise<void> {
   const { outbox, log } = deps;
   const { runId, claimGeneration, send, signal } = args;
+  await outbox.retryPendingPolicyJournal?.(runId, claimGeneration);
   const captured = typeof outbox.readTerminalJournalForRetirement === "function"
     ? await outbox.readTerminalJournalForRetirement(runId, claimGeneration, {
       ...args.retirementContext, signal: args.retirementContext?.signal ?? signal,
@@ -307,6 +313,10 @@ async function resolvePendingTerminalOnce(deps: TerminalOutboxDeps, args: Resolv
     ? captured?.journal : await outbox.readTerminalJournal(runId, claimGeneration);
   if (captured) args = { ...args, retirementContext: captured.context };
   if (!journal) return; // already retired / never installed / unreadable — nothing to resolve
+  if (journal.outcome_kind === "policy_hold") {
+    await resolvePolicyOutcome(deps, args, journal);
+    return;
+  }
   if (journal.blocked) return; // permanently blocked (D13): owner-resolved, never auto-retried here
   let ack: StateAck;
   try {

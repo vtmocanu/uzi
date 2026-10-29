@@ -52,7 +52,7 @@ function fileVersion(stat: { dev: bigint; ino: bigint; birthtimeNs: bigint; size
 
 function terminalRetirementPayload(record: Record<string, unknown>): string {
   return canonicalJson({ run: record.run_id, generation: record.claim_generation,
-    body: record.body, fence: record.messages_through_seq, phase: record.phase_at_journal });
+    kind: record.outcome_kind ?? "terminal", body: record.body, fence: record.messages_through_seq, phase: record.phase_at_journal });
 }
 
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
@@ -60,6 +60,7 @@ import fs from "node:fs/promises";
 import { constants as fsConstants, type Dir } from "node:fs";
 import path from "node:path";
 
+import { validatePolicyHoldRequest, type PolicyHoldRequest } from "./protocol.js";
 import type { Logger } from "./log.js";
 import type { TerminalRejectionCustodyResponse, OutgoingMessage } from "./protocol.js";
 import type { DiskFullVerdict } from "./disk-full.js";
@@ -203,6 +204,7 @@ export type TerminalJournalResult =
  *  what #1390's snapshot reports after a restart), whether the api has permanently refused it
  *  (`blocked` + `blocked_reason`, D13), and when it was installed. */
 export interface PendingTerminal {
+  outcome_kind?: "terminal" | "policy_hold" | "unknown";
   run_id: string;
   claim_generation: number;
   phase: string;
@@ -219,6 +221,8 @@ export interface PendingTerminal {
  *  blocked state (D13). The M3b `resolvePendingTerminal` send path sends `body` verbatim, adding the
  *  fence only when the api advertises `terminal_fence` (D9). */
 export interface PendingTerminalJournal {
+  server_settled?: boolean;
+  outcome_kind?: "terminal" | "policy_hold";
   body: Record<string, unknown>;
   messagesThroughSeq: number;
   phase: string;
@@ -233,6 +237,7 @@ export interface PendingTerminalJournal {
  *  by {@link Outbox.markTerminalBlocked} once the api permanently refuses (that is a legitimate
  *  owner update, not a competing first-writer). */
 interface TerminalJournalData {
+  outcome_kind?: "terminal" | "policy_hold";
   version: 1;
   run_id: string;
   claim_generation: number;
@@ -249,6 +254,10 @@ interface TerminalJournalData {
 /** In-memory metadata for one pending terminal journal (the file's durable fields minus the body,
  *  which the store never needs to re-read for depth/list/retire). */
 interface TerminalMeta {
+  outcomeKind?: "terminal" | "policy_hold" | "unknown";
+  unpersistedPolicy?: PolicyHoldRequest;
+  policyBytes?: number;
+  materializationBlocked?: boolean;
   fileName: string;
   claimGeneration: number;
   phaseAtJournal: string;
@@ -580,6 +589,7 @@ export class Outbox {
     });
 
     if (!(await this.loadOrMintKey(hasRecords))) {
+      for (const runId of runDirs) await this.loadTerminals(runId);
       this.log.warn("outbox terminal journal load", { outcome: "key_unavailable", authenticated_pending: 0 });
       return;
     }
@@ -710,6 +720,95 @@ export class Outbox {
    *  filename generation (the file names the generation, so a copied journal cannot masquerade
    *  as another generation). A run may carry a terminal journal with NO message manifest, so this
    *  creates the in-memory run entry when loadRun did not. */
+  private terminalLoadBytes = 0;
+  private policyMetadataExhausted = false;
+
+  /** Metadata admission shares configured byte budgets. One minimal sentinel is always
+   * retained; exhaustion also sets a constant-size barrier, so dropping metadata cannot grant work. */
+  private admitPolicyMetadata(runId: string, candidate: TerminalMeta): boolean {
+    const footprint = (meta: TerminalMeta) => Buffer.byteLength(JSON.stringify({
+      ...meta, unpersistedPolicy: undefined,
+    }));
+    const bytes = footprint(candidate);
+    let total = bytes;
+    let perRun = bytes;
+    let count = 0;
+    for (const rs of this.runs.values()) {
+      for (const meta of rs.terminals.values()) {
+        count++;
+        const held = footprint(meta);
+        total += held;
+        if (rs.runId === runId) perRun += held;
+      }
+    }
+    if (count === 0 || (total <= this.maxBytes && perRun <= this.runMaxBytes)) return true;
+    this.policyMetadataExhausted = true;
+    return false;
+  }
+
+  private retainUnknownTerminal(runId: string, generation: number, fileName: string, materializationBlocked = false): void {
+    if (this.runs.get(runId)?.terminals.has(generation)) return;
+    const meta: TerminalMeta = {
+      fileName, claimGeneration: generation, phaseAtJournal: "policy_pending",
+      since: this.now(), blocked: false, outcomeKind: "unknown", materializationBlocked,
+    };
+    if (this.admitPolicyMetadata(runId, meta)) this.ensureInMemoryRun(runId, this.now()).terminals.set(generation, meta);
+  }
+
+  /** Every-claim barrier: memory failures and unknown physical aliases are blockers too.
+   * Absence from an authenticated/rejected list alone never authorizes provider work. */
+  async hasPendingPolicyOutcome(runId?: string): Promise<boolean> {
+    if (this.policyMetadataExhausted) return true;
+    for (const pending of this.listPendingTerminals()) {
+      if (runId !== undefined && pending.run_id.toLowerCase() !== runId.toLowerCase()) continue;
+      if ((pending.outcome_kind === "policy_hold" || pending.outcome_kind === "unknown") && !pending.server_settled) return true;
+    }
+    // Stream to EOF or the first blocker; ordinary entries consume no decoding budget.
+    // A settled policy file is harmless only while its exact authenticated lifetime still matches.
+    let totalReadBytes = 0;
+    const scan = async (physicalRun: string): Promise<boolean> => {
+      let runReadBytes = 0;
+      if (!await this.terminalDirectorySafe(physicalRun)) return true;
+      const dir = await fs.opendir(this.runDir(physicalRun));
+      try {
+        for (;;) {
+          const entry = await dir.read();
+          if (!entry) return false;
+          if (!entry.name.startsWith(TERMINAL_FILE_PREFIX)) continue;
+          const gen = parseTerminalFileName(entry.name);
+          const remaining = Math.min(this.runMaxBytes - runReadBytes, this.maxBytes - totalReadBytes);
+          const size = (await fs.lstat(path.join(this.runDir(physicalRun), entry.name))).size;
+          if (size > remaining) return true;
+          runReadBytes += size;
+          totalReadBytes += size;
+          const result = await this.inspectTerminal(physicalRun, gen, entry.name, undefined, Math.min(size, remaining));
+          if (!result.record || gen === undefined) return true;
+          if (result.record.outcome_kind !== "policy_hold") continue;
+          const meta = this.runs.get(physicalRun)?.terminals.get(gen);
+          const binding = meta && this.terminalRetirementIdentities.get(meta);
+          if (!binding?.serverSettled || binding.lifetime !== this.authenticatedLifetimes.get(result.record) ||
+              binding.payload !== terminalRetirementPayload(result.record)) return true;
+        }
+      } finally { await dir.close(); }
+    };
+    try {
+      const stat = await fs.lstat(this.root);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) return true;
+      const root = await fs.opendir(this.root);
+      try {
+        for (;;) {
+          const entry = await root.read();
+          if (!entry) return false;
+          if (runId !== undefined && entry.name.toLowerCase() !== runId.toLowerCase()) continue;
+          if (!this.validRunId(entry.name)) continue;
+          if (entry.isSymbolicLink()) return true;
+          if (entry.isDirectory()) { if (await scan(entry.name)) return true; }
+          else if (runId !== undefined) return true;
+        }
+      } finally { await root.close(); }
+    } catch { return true; }
+  }
+
   private async loadTerminals(runId: string): Promise<{ authenticated: number; rejected: number }> {
     const result = { authenticated: 0, rejected: 0 };
     if (!this.validRunId(runId)) return result;
@@ -720,21 +819,31 @@ export class Outbox {
     } catch {
       return result;
     }
+    let readBytes = 0;
     for (const name of names) {
       const gen = parseTerminalFileName(name);
       if (gen === undefined) continue;
-      const parsed = await this.readTerminalAuthed(runId, gen, name);
+      // Bound aggregate bytes before any record materialization, in addition to inspectTerminal's cap+1.
+      let bytes = this.terminalReadMaxBytes + 1;
+      try { bytes = (await fs.lstat(path.join(dir, name))).size; } catch { /* unknown stays pending */ }
+      const affordable = bytes <= this.terminalReadMaxBytes && bytes <= this.runMaxBytes - readBytes &&
+        bytes <= this.maxBytes - this.terminalLoadBytes;
+      const parsed = affordable ? (await this.inspectTerminal(runId, gen, name, undefined, bytes)).record : null;
+      if (affordable) { readBytes += bytes; this.terminalLoadBytes += bytes; }
       if (!parsed) {
         result.rejected++;
-        continue; // absent/symlink/unparseable/MAC-bad (readAuthed logged)
+        this.retainUnknownTerminal(runId, gen, name, !affordable);
+        continue; // physical evidence cannot establish absence
       }
       const meta = coerceTerminal(parsed, runId, gen, name);
       if (!meta) {
         this.log.warn("outbox: malformed or misfiled terminal journal; skipping", { ...(terminalRunUUID(runId) ? { run_id: runId.toLowerCase() } : {}), claim_generation: gen, fact: "malformed" });
         result.rejected++;
+        this.retainUnknownTerminal(runId, gen, name);
         continue;
       }
       const rs = this.ensureInMemoryRun(runId, meta.since);
+      meta.policyBytes = bytes;
       rs.terminals.set(meta.claimGeneration, meta);
       result.authenticated++;
     }
@@ -1339,13 +1448,35 @@ export class Outbox {
     phaseAtJournal: string,
     messagesThroughSeq: number,
     canonicalBody: Record<string, unknown>,
+    outcomeKind: "terminal" | "policy_hold" = "terminal",
   ): Promise<TerminalJournalResult> {
-    if (this.disabled) {
+    if (outcomeKind === "policy_hold") {
+      const policy = validatePolicyHoldRequest(canonicalBody);
+      if (policy.source_generation !== claimGeneration || policy.claim_generation !== claimGeneration) throw new Error("policy source generation mismatch");
+      canonicalBody = policy as unknown as Record<string, unknown>;
+    }
+    if (this.disabled && outcomeKind !== "policy_hold") {
       this.writable();
       return { journaled: false, reason: "reserve_exhausted" };
     }
     return this.withRunLock(runId, async () => {
       if (!this.validRunId(runId) || !Number.isSafeInteger(claimGeneration) || claimGeneration < 0) return { journaled: false, reason: "reserve_exhausted" };
+      const selected = this.runs.get(runId)?.terminals.get(claimGeneration);
+      if (selected?.unpersistedPolicy && outcomeKind === "policy_hold") canonicalBody = selected.unpersistedPolicy as unknown as Record<string, unknown>;
+      if (outcomeKind === "policy_hold" && !selected) {
+        const bytes = Buffer.byteLength(JSON.stringify(canonicalBody));
+        // Retained bodies share the configured run/total byte budgets; failures never trigger sends.
+        const heldBytes = [...this.runs.values()].flatMap(rs => [...rs.terminals.values()]).reduce((sum, meta) => sum + (meta.policyBytes ?? 0), 0);
+        const runHeldBytes = [...(this.runs.get(runId)?.terminals.values() ?? [])].reduce((sum, meta) => sum + (meta.policyBytes ?? 0), 0);
+        const fits = bytes <= this.runMaxBytes - runHeldBytes && bytes <= this.maxBytes - heldBytes;
+        const meta: TerminalMeta = {
+          fileName: terminalFileName(claimGeneration), claimGeneration, phaseAtJournal,
+          since: this.now(), blocked: false, outcomeKind: fits ? "policy_hold" : "unknown",
+          ...(fits ? { unpersistedPolicy: canonicalBody as unknown as PolicyHoldRequest, policyBytes: bytes } : {}),
+        };
+        if (!this.admitPolicyMetadata(runId, meta)) return { journaled: false, reason: "reserve_exhausted" };
+        this.ensureInMemoryRun(runId, this.now()).terminals.set(claimGeneration, meta);
+      }
       const dir = this.runDir(runId);
       if (await this.isSymlink(dir)) {
         this.log.warn("outbox: run dir is a symlink; refusing terminal journal (skipped, not followed)", {
@@ -1354,9 +1485,12 @@ export class Outbox {
         return { journaled: false, reason: "reserve_exhausted" };
       }
       const winner = this.runs.get(runId)?.terminals.get(claimGeneration);
-      if (winner) {
+      if (winner?.outcomeKind === "unknown" || (winner?.unpersistedPolicy && outcomeKind !== "policy_hold")) return { journaled: false, reason: "winner_unavailable" };
+      if (winner && !winner.unpersistedPolicy) {
         // Re-authenticate the selected filename before claiming adoption.
+        const policyWinner = winner.outcomeKind === "policy_hold";
         const observed = await this.inspectTerminal(runId, claimGeneration, winner.fileName);
+        if (policyWinner && observed.observation.kind !== "authenticated") return { journaled: false, reason: "winner_unavailable" };
         switch (observed.observation.kind) {
           case "authenticated":
             return { journaled: true, adopted: true };
@@ -1376,8 +1510,9 @@ export class Outbox {
         }
       }
       if (!this.writable()) return { journaled: false, reason: "reserve_exhausted" };
-      const since = this.now();
+      const since = winner?.since ?? this.now();
       const record: TerminalJournalData = {
+        ...(outcomeKind === "policy_hold" ? { outcome_kind: outcomeKind } : {}),
         version: 1,
         run_id: runId,
         claim_generation: claimGeneration,
@@ -1431,14 +1566,16 @@ export class Outbox {
         const meta = existing && coerceTerminal(existing, runId, claimGeneration, this.runs.get(runId)?.terminals.get(claimGeneration)?.fileName);
         if (!meta) return { journaled: false, reason: "reserve_exhausted" };
         const rs = this.ensureInMemoryRun(runId, meta.since);
-        if (!rs.terminals.has(claimGeneration)) rs.terminals.set(claimGeneration, meta);
+        rs.terminals.set(claimGeneration, meta);
       }
       // Track it in memory. On an adopt (a first-writer already installed this generation) keep
       // the winner's metadata if we already loaded it; otherwise record ours (same generation).
       const rs = this.ensureInMemoryRun(runId, since);
-      if (!rs.terminals.has(claimGeneration)) {
+      if (!rs.terminals.has(claimGeneration) || rs.terminals.get(claimGeneration)?.unpersistedPolicy) {
         rs.terminals.set(claimGeneration, {
           fileName: terminalFileName(claimGeneration),
+          outcomeKind,
+          policyBytes: Buffer.byteLength(serialized),
           claimGeneration,
           phaseAtJournal,
           since,
@@ -1455,6 +1592,18 @@ export class Outbox {
     });
   }
 
+  /** Policy capture never uses terminal canonicalization or an unjournaled network fallback. */
+  journalPolicyHold(runId: string, body: PolicyHoldRequest): Promise<TerminalJournalResult> {
+    return this.journalTerminal(runId, body.source_generation, body.phase ?? "policy_pending", 0,
+      body as unknown as Record<string, unknown>, "policy_hold");
+  }
+
+  /** Retry only at an existing resolver invocation, never on a new timer. */
+  async retryPendingPolicyJournal(runId: string, generation: number): Promise<void> {
+    const body = this.runs.get(runId)?.terminals.get(generation)?.unpersistedPolicy;
+    if (body) await this.journalPolicyHold(runId, body);
+  }
+
   /** Every pending (installed, un-retired) terminal journal across all runs, for the heartbeat
    *  outbox report and `uzi admin workers` (M5's `blocked_reason` folds in from here). */
   listPendingTerminals(): PendingTerminal[] {
@@ -1463,6 +1612,7 @@ export class Outbox {
       for (const t of rs.terminals.values()) {
         out.push({
           run_id: rs.runId,
+          ...(t.outcomeKind === "policy_hold" || t.outcomeKind === "unknown" ? { outcome_kind: t.outcomeKind } : {}),
           claim_generation: t.claimGeneration,
           phase: t.phaseAtJournal,
           blocked: t.blocked,
@@ -1490,6 +1640,7 @@ export class Outbox {
       }
       const terminals = this.runs.get(runId)?.terminals;
       const pending = terminals?.get(claimGeneration);
+      if (pending?.outcomeKind === "policy_hold" || pending?.outcomeKind === "unknown") return false;
       const fileName = pending?.fileName ?? terminalFileName(claimGeneration);
       const { observation, record } = await this.inspectTerminal(runId, claimGeneration, fileName);
       if (observation.kind === "absent") {
@@ -1500,6 +1651,7 @@ export class Outbox {
         return true;
       }
       if (!record || observation.kind !== "authenticated") return false;
+      if (record.outcome_kind === "policy_hold") return false; // ACK alone never deletes policy source evidence.
       try {
         await fs.unlink(path.join(this.runDir(runId), fileName));
       } catch (err) {
@@ -1603,8 +1755,10 @@ export class Outbox {
     await this.withRunLock(runId, async () => {
       if (!this.validRunId(runId)) return;
       const rs = this.runs.get(runId);
-      if (!rs || !rs.terminals.has(claimGeneration)) return;
-      if (!await this.readTerminalAuthed(runId, claimGeneration)) return;
+      const meta = rs?.terminals.get(claimGeneration);
+      if (!rs || !meta || meta.outcomeKind === "policy_hold" || meta.outcomeKind === "unknown") return;
+      const record = await this.readTerminalAuthed(runId, claimGeneration);
+      if (!record || record.outcome_kind === "policy_hold") return;
       await fs
         .rm(path.join(this.runDir(runId), rs.terminals.get(claimGeneration)!.fileName), { force: true })
         .catch(() => undefined);
@@ -1629,7 +1783,7 @@ export class Outbox {
       if (!this.validRunId(runId)) return;
       const rs = this.runs.get(runId);
       const meta = rs?.terminals.get(claimGeneration);
-      if (!rs || !meta) return;
+      if (!rs || !meta || meta.outcomeKind === "policy_hold" || meta.outcomeKind === "unknown") return;
       const dst = path.join(this.runDir(runId), meta.fileName);
       const parsed = await this.readTerminalAuthed(runId, claimGeneration);
       if (parsed) {
@@ -1686,6 +1840,7 @@ export class Outbox {
         binding = { identity: Object.freeze({}), payload, lifetime };
         this.terminalRetirementIdentities.set(meta, binding);
       }
+      if (binding.serverSettled) journal.server_settled = true;
       return { journal, context: { ...context, expectedIdentity: binding.identity } };
     }, context.signal);
   }
@@ -2216,6 +2371,7 @@ export class Outbox {
   }
 
   private async readTerminalAuthed(runId: string, generation: number, fileName = this.runs.get(runId)?.terminals.get(generation)?.fileName ?? terminalFileName(generation), budget?: ProofBudget): Promise<Record<string, unknown> | null> {
+    if (this.runs.get(runId)?.terminals.get(generation)?.materializationBlocked) return null;
     const result = await this.inspectTerminal(runId, generation, fileName, budget);
     try { checkProofBudget(budget); } catch { return null; }
     return result.record ?? null;
@@ -2239,10 +2395,11 @@ export class Outbox {
       path.basename(realRun).toLowerCase() === path.basename(expected).toLowerCase());
   }
 
-  private async inspectTerminal(runId: string, generation: number | undefined, fileName: string, budget?: ProofBudget): Promise<{ observation: TerminalAuthenticationObservation; record?: Record<string, unknown> }> {
+  private async inspectTerminal(runId: string, generation: number | undefined, fileName: string, budget?: ProofBudget, readMaxBytes = this.terminalReadMaxBytes): Promise<{ observation: TerminalAuthenticationObservation; record?: Record<string, unknown> }> {
     const observation: TerminalAuthenticationObservation = { runId: terminalRunUUID(runId) ? runId.toLowerCase() : runId, physicalRunId: runId, generation, fileName, kind: "malformed" };
     const result = { observation } as { observation: TerminalAuthenticationObservation; record?: Record<string, unknown> };
     if (!this.validRunId(runId) || generation === undefined || !Number.isSafeInteger(generation) || generation < 0 || parseTerminalFileName(fileName) !== generation) return result;
+    if (this.runs.get(runId)?.terminals.get(generation)?.fileName === fileName && this.runs.get(runId)?.terminals.get(generation)?.materializationBlocked) { observation.kind = "oversized"; return result; }
     let fh: Awaited<ReturnType<typeof fs.open>> | undefined;
     try {
       if (!await this.terminalDirectorySafe(runId, budget)) { observation.kind = "symlink"; return result; }
@@ -2257,7 +2414,9 @@ export class Outbox {
       const stat = await fh.stat({ bigint: true });
       checkProofBudget(budget);
       if (!stat.isFile() || stat.ino !== before.ino || stat.dev !== before.dev) { observation.kind = "unreadable"; return result; }
-      const raw = Buffer.alloc(this.terminalReadMaxBytes + 1);
+      const cap = Math.min(this.terminalReadMaxBytes, this.runMaxBytes, this.maxBytes, readMaxBytes);
+      if (stat.size > BigInt(cap)) { observation.kind = "oversized"; return result; }
+      const raw = Buffer.alloc(cap + 1);
       let length = 0;
       // At most cap+1 bytes and cap+1 nonempty read attempts; EOF ends sooner.
       while (length < raw.length) {
@@ -2267,7 +2426,7 @@ export class Outbox {
         if (!bytesRead) break;
         length += bytesRead;
       }
-      if (length > this.terminalReadMaxBytes) { observation.kind = "oversized"; return result; }
+      if (length > cap) { observation.kind = "oversized"; return result; }
       checkProofBudget(budget);
       const after = await fs.lstat(filePath, { bigint: true });
       checkProofBudget(budget);
@@ -2285,8 +2444,12 @@ export class Outbox {
       delete obj.mac;
       if (!macEqual(mac, this.computeMac(MAC_DOMAIN_TERMINAL, obj))) {
         observation.kind = "mac_failure";
-        // Only the selected authenticated filename loses trust; sibling aliases and unknown reads preserve retry eligibility.
-        if (this.runs.get(runId)?.terminals.get(generation)?.fileName === fileName) this.runs.get(runId)?.terminals.delete(generation);
+        // Keep physical rejected candidates visible; authentication failure supplies no absence proof.
+        const rejected = this.runs.get(runId)?.terminals.get(generation);
+        if (rejected?.fileName === fileName) {
+          if (rejected.outcomeKind === "terminal") this.runs.get(runId)?.terminals.delete(generation);
+          else { rejected.outcomeKind = "unknown"; rejected.blocked = false; rejected.blockedReason = undefined; }
+        }
         if (terminalRunUUID(runId)) this.log.warn("outbox: terminal authentication rejected", { run_id: runId.toLowerCase(), claim_generation: generation, fact: "mac_failure" });
         return result;
       }
@@ -2297,6 +2460,7 @@ export class Outbox {
       this.authenticatedFileVersions.set(obj, fileVersion(stat));
       const meta = this.runs.get(runId)?.terminals.get(generation);
       const binding = meta && this.terminalRetirementIdentities.get(meta);
+      if (meta?.fileName === fileName) meta.outcomeKind = obj.outcome_kind === "policy_hold" ? "policy_hold" : "terminal";
       if (meta?.fileName === fileName && binding && binding.lifetime !== lifetime) this.terminalRetirementIdentities.delete(meta);
       result.record = obj;
       return result;
@@ -2309,6 +2473,11 @@ export class Outbox {
         const meta = this.runs.get(runId)?.terminals.get(generation);
         const binding = meta?.fileName === fileName && this.terminalRetirementIdentities.get(meta);
         if (binding) binding.serverSettled = false;
+        // Transient reads must not change a known ordinary terminal into policy evidence.
+        // Its retirement path still reauthenticates; unknown/policy candidates stay fail-closed.
+        if (meta?.fileName === fileName && meta.outcomeKind !== "terminal" && observation.kind !== "absent") {
+          meta.outcomeKind = "unknown"; meta.blocked = false; meta.blockedReason = undefined;
+        }
       }
       if (fh) await fh.close();
     }
@@ -2928,6 +3097,7 @@ const TERMINAL_BLOCKED_REASONS: ReadonlySet<string> = new Set<TerminalBlockedRea
  *  embedded `claim_generation` to the filename, so a copied/misfiled journal is skipped. Returns
  *  null on any mismatch. */
 function coerceTerminal(obj: Record<string, unknown>, runId: string, fileGen: number, fileName = terminalFileName(fileGen)): TerminalMeta | null {
+  if (!coerceTerminalRecord(obj, runId, fileGen)) return null;
   if (obj.version !== 1) return null;
   if (obj.run_id !== runId) return null;
   if (typeof obj.claim_generation !== "number" || obj.claim_generation !== fileGen) return null;
@@ -2940,6 +3110,7 @@ function coerceTerminal(obj: Record<string, unknown>, runId: string, fileGen: nu
   }
   return {
     fileName,
+    outcomeKind: obj.outcome_kind === "policy_hold" ? "policy_hold" : "terminal",
     claimGeneration: obj.claim_generation,
     phaseAtJournal: obj.phase_at_journal,
     since: obj.since,
@@ -2957,6 +3128,13 @@ function coerceTerminalRecord(
   runId: string,
   fileGen: number,
 ): PendingTerminalJournal | null {
+  if (obj.outcome_kind !== undefined && obj.outcome_kind !== "terminal" && obj.outcome_kind !== "policy_hold") return null;
+  if (obj.outcome_kind === "policy_hold") {
+    try {
+      const policy = validatePolicyHoldRequest(obj.body);
+      if (policy.source_generation !== fileGen || policy.claim_generation !== fileGen) return null;
+    } catch { return null; }
+  }
   if (obj.version !== 1) return null;
   if (obj.run_id !== runId) return null;
   if (typeof obj.claim_generation !== "number" || obj.claim_generation !== fileGen) return null;
@@ -2969,6 +3147,7 @@ function coerceTerminalRecord(
     blockedReason = obj.blocked_reason as TerminalBlockedReason;
   }
   return {
+    ...(obj.outcome_kind === "policy_hold" ? { outcome_kind: "policy_hold" as const } : {}),
     body: obj.body as Record<string, unknown>,
     messagesThroughSeq: obj.messages_through_seq,
     phase: obj.phase_at_journal,
