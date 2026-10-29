@@ -1694,6 +1694,8 @@ export interface HealthCheck {
 export interface HealthEvidence {
   label: string;
   value: string;
+  run_id?: string;
+  owner_id?: string;
 }
 
 // ── CLI tokens (PRD #64) ──────────────────────────────────────────────────

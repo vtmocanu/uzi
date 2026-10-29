@@ -69,6 +69,22 @@ async function renderHealth(doc: HealthDoc, fleet: AdminWorker[] = [], strict = 
   return utils;
 }
 
+it("links a waiting run on the health detail surface", async () => {
+  const doc = ownerOnlyDoc();
+  const queue = doc.checks.find((c) => c.id === "queue.waiting")!;
+  queue.evidence = [Object.assign(
+    { label: "Waiting run", value: "Owner: Alex Example (22930000); waited 48m. This background run is no longer deprioritized, but has not yet been picked up." },
+    { run_id: ownerOnlyWaitingRunId, owner_id: ownerOnlyWaitingOwnerId },
+  )];
+  const { container } = await renderHealth(doc);
+  const item = attentionItem(container, "queue.waiting")!;
+  const link = within(item).getByRole("link", { name: "Run 22930000" });
+  expect(link.getAttribute("href")).toBe(`/runs/${ownerOnlyWaitingRunId}`);
+  expect(link.getAttribute("title")).toBe(`Run ${ownerOnlyWaitingRunId}`);
+  expect(within(item).getByTitle(`Owner ${ownerOnlyWaitingOwnerId}`).textContent).toBe(queue.evidence[0].value);
+  expect(item.textContent).not.toContain(ownerOnlyWaitingRunId);
+});
+
 // An attention item (or null) for a check id (the id has a dot, so an attribute selector).
 function attentionItem(container: HTMLElement, id: string): HTMLElement | null {
   return container.querySelector(`[id="c-${id}"]`);
