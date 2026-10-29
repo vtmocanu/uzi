@@ -382,6 +382,9 @@ export function buildIsolatedSdkOptions(input: {
     env: input.env as unknown as Record<string, string | undefined>,
     // Guardrail invariant #6 (semgrep/settings-sources-isolation.yml): nothing on disk.
     settingSources: [],
+    // Issue #1563: deliver the prompt as written. The CLI otherwise expands `@path`
+    // mentions and dispatches a leading slash command before any PreToolUse hook runs.
+    verbatimPrompts: true,
     settings: { enabledPlugins: BUILTIN_PLUGINS_DISABLED },
     tools: [...RESEARCH_SURFACE.tools],
     disallowedTools: isolatedDisallowedTools(RESEARCH_SURFACE),

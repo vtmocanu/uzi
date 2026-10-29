@@ -231,6 +231,9 @@ export class ClaudeAdviceHarness implements AdviceHarness {
       // would pass semgrep silently and re-open the repo-borne prompt-injection vector.
       // Do NOT extract it to a variable, do NOT spread it in, do NOT delete it.
       settingSources: [],
+      // Issue #1563: deliver the prompt as written. The CLI otherwise expands `@path`
+      // mentions and dispatches a leading slash command before any PreToolUse hook runs.
+      verbatimPrompts: true,
       systemPrompt: request.systemPrompt,
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
