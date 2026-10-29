@@ -3,7 +3,6 @@ package pushbroker
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync/atomic"
 
 	"github.com/go-git/go-git/v5/plumbing"
@@ -36,11 +35,12 @@ type PrereqCreateOptions struct {
 }
 
 // PreparedPrereqCreate is opaque, read-only preparation evidence and a single-use send capability.
+// Value copies share the private consumed flag; copying cannot authorize another send.
 type PreparedPrereqCreate struct {
 	o    PrereqCreateOptions
 	ref  string
 	tip  plumbing.Hash
-	sent atomic.Bool
+	sent *atomic.Bool
 }
 
 func (p *PreparedPrereqCreate) Ref() string { return p.ref }
@@ -87,13 +87,13 @@ func PreparePrereqCreate(ctx context.Context, o PrereqCreateOptions) (*PreparedP
 	if !isObjectID(tip) || plumbing.NewHash(tip).IsZero() {
 		return nil, ErrSourceMissing
 	}
-	return &PreparedPrereqCreate{o: o, ref: ref, tip: plumbing.NewHash(tip)}, nil
+	return &PreparedPrereqCreate{o: o, ref: ref, tip: plumbing.NewHash(tip), sent: new(atomic.Bool)}, nil
 }
 
 // SendPrereqCreate never resends. A bounded readback at the prepared tip establishes
 // Created regardless of the command report, matching S3 and S4 reconciliation.
 func SendPrereqCreate(ctx context.Context, p *PreparedPrereqCreate) (PrereqCreateOutcome, error) {
-	if p == nil || !validPrereqRef(p.ref) || p.tip.IsZero() || !p.sent.CompareAndSwap(false, true) {
+	if p == nil || !validPrereqRef(p.ref) || p.tip.IsZero() || p.sent == nil || !p.sent.CompareAndSwap(false, true) {
 		return PrereqCreateUnknown, ErrInvalidRef
 	}
 	ctx, cancel := context.WithTimeout(ctx, maxCreateRefDuration)
@@ -120,7 +120,7 @@ func SendPrereqCreate(ctx context.Context, p *PreparedPrereqCreate) (PrereqCreat
 	case present:
 		return PrereqCreateCreated, nil
 	case !present && res.ng:
-		return PrereqCreateRefused, fmt.Errorf("%w: %s", ErrPrereqCreateRefused, res.reason)
+		return PrereqCreateRefused, ErrPrereqCreateRefused
 	default:
 		return PrereqCreateUnknown, errors.Join(ErrPrereqCreateUnknown, pushErr)
 	}

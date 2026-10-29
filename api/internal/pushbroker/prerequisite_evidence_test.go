@@ -30,7 +30,7 @@ func TestPrereqOutcomeEvidence(t *testing.T) {
 					}
 					_ = enc.EncodeString("unpack ok\n")
 					if strings.HasPrefix(kind, "ng-") {
-						_ = enc.EncodeString("ng " + ref + " refused\n")
+						_ = enc.EncodeString("ng " + ref + " refused\x1b[2J\u202e\n")
 					} else {
 						_ = enc.EncodeString("ok " + ref + "\n")
 					}
@@ -67,7 +67,7 @@ func TestPrereqOutcomeEvidence(t *testing.T) {
 					t.Fatalf("%v %v", out, err)
 				}
 			case "ng-absent":
-				if out != pushbroker.PrereqCreateRefused || !errors.Is(err, pushbroker.ErrPrereqCreateRefused) {
+				if out != pushbroker.PrereqCreateRefused || !errors.Is(err, pushbroker.ErrPrereqCreateRefused) || err.Error() != pushbroker.ErrPrereqCreateRefused.Error() {
 					t.Fatalf("%v %v", out, err)
 				}
 			case "ng-foreign":
