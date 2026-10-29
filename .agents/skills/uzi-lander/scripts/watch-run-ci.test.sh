@@ -11,7 +11,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 FULL_SHA=3579b4f1869b848a53aaf7c941b86896cc5a9f3a
 SHORT_SHA=${FULL_SHA:0:8}
 BAD_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-export FULL_SHA SHORT_SHA BAD_SHA
+FOLLOW_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+FINAL_SHA=cccccccccccccccccccccccccccccccccccccccc
+export FULL_SHA SHORT_SHA BAD_SHA FOLLOW_SHA FINAL_SHA
 mkdir -p "$WORK/bin"
 cat > "$WORK/bin/sleep" <<'STUB'
 #!/usr/bin/env bash
@@ -35,12 +37,38 @@ if [ "${1:-}" = api ]; then
   fi
   case "${2:-}" in
     "repos/test/repo/commits/$FULL_SHA"|"repos/test/repo/commits/$SHORT_SHA") printf '%s\n' "$FULL_SHA" ;;
+    repos/test/repo/commits/main|repos/test/repo/commits/release%2Fnext)
+      case "$MODE" in
+        follow-head-error) printf '%s\n' "$FOLLOW_SHA"; exit 1 ;;
+        follow-invalid) printf 'not-a-sha\n' ;;
+        follow-same) printf '%s\n' "$FULL_SHA" ;;
+        follow-chain)
+          n=0; [ -f "$API_COUNT" ] && n=$(cat "$API_COUNT")
+          n=$((n+1)); printf '%s' "$n" > "$API_COUNT"
+          if [ "$n" -eq 1 ]; then printf '%s\n' "$FOLLOW_SHA"
+          else printf '%s\n' "$FINAL_SHA"; fi ;;
+        *) printf '%s\n' "$FOLLOW_SHA" ;;
+      esac ;;
     *) exit 1 ;;
   esac
   exit 0
 fi
 if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
   case "$MODE" in
+    follow-*)
+      case " $* " in
+        *" --commit $FULL_SHA "*) printf '201\tcompleted\tcancelled\tCI\n' ;;
+        *" --commit $FOLLOW_SHA "*)
+          case "$MODE" in
+            follow-chain) printf '202\tcompleted\tcancelled\tCI\n' ;;
+            follow-pending) printf '202\tin_progress\t\tCI\n' ;;
+            follow-no-run) : ;;
+            follow-red) printf '202\tcompleted\tfailure\tCI\n' ;;
+            *) printf '202\tcompleted\tsuccess\tCI\n' ;;
+          esac ;;
+        *" --commit $FINAL_SHA "*) printf '203\tcompleted\tsuccess\tCI\n' ;;
+        *) exit 1 ;;
+      esac ;;
     full|resolve-transient)
       case " $* " in
         *" --commit $FULL_SHA "*) printf '101\tcompleted\tsuccess\tCI\n' ;;
@@ -121,7 +149,11 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
   exit 0
 fi
 if [ "${1:-}" = run ] && [ "${2:-}" = view ]; then
-  if [ "$MODE" = failure ]; then
+  if [ "$MODE" = follow-pending ]; then
+    printf 'in_progress\t\tCI\thttps://example.invalid/job/202\t202\n'
+  elif [ "$MODE" = follow-red ]; then
+    printf 'completed\tfailure\tCI\thttps://example.invalid/job/202\t202\n'
+  elif [ "$MODE" = failure ]; then
     escape=$'\x1b'
     printf 'completed\tfailure\tlint%s[31m-repo\thttps://github.com/test/repo/actions/runs/104/job/999\t999\n' "$escape"
   elif [ "$MODE" = transient ] || [ "$MODE" = escape-pending ]; then
@@ -186,6 +218,67 @@ STUB
 chmod +x "$WORK/bin/gh" "$WORK/bin/sleep"
 export PATH="$WORK/bin:$PATH"
 export CALLS="$WORK/calls" LIST_COUNT="$WORK/list-count" VIEW_COUNT="$WORK/view-count" API_COUNT="$WORK/api-count" JOB_COUNT="$WORK/job-count"
+
+# Following supersession watches the current branch head without resetting the budget.
+for m in follow-green follow-chain follow-pending follow-red follow-no-run follow-same follow-head-error follow-invalid; do
+  MODE=$m; export MODE
+  : > "$CALLS"; rm -f "$API_COUNT"
+  set +e
+  bash "$SCRIPT" --sha "$FULL_SHA" --follow --branch release/next --repo test/repo --interval 0 --max-ticks 3 > "$WORK/$m.out" 2>&1
+  rc=$?
+  set -e
+  case "$m" in
+    follow-green|follow-chain) want=0 ;;
+    follow-pending|follow-same) want=2 ;;
+    follow-red) want=1 ;;
+    *) want=3 ;;
+  esac
+  [ "$rc" -eq "$want" ] || fail "$m: want exit $want, rc=$rc: $(cat "$WORK/$m.out")"
+  if [ "$m" = follow-head-error ] || [ "$m" = follow-invalid ]; then
+    if grep -q '^FOLLOW ' "$WORK/$m.out"; then fail "$m: followed an unreadable branch head"; fi
+    continue
+  fi
+  grep -Fq 'api repos/test/repo/commits/release%2Fnext --jq .sha' "$CALLS" || fail "$m: branch ref not resolved safely"
+  if [ "$m" = follow-same ]; then
+    if grep -q '^FOLLOW ' "$WORK/$m.out"; then fail 'same head printed a switch'; fi
+  else
+    grep -Fxq "FOLLOW sha=$FULL_SHA -> $FOLLOW_SHA" "$WORK/$m.out" || fail "$m: missing first switch"
+    grep -Fq -- "--branch release/next --commit $FOLLOW_SHA " "$CALLS" || fail "$m: lost branch/commit scope"
+  fi
+  case "$m" in
+    follow-chain)
+      grep -Fxq "FOLLOW sha=$FOLLOW_SHA -> $FINAL_SHA" "$WORK/$m.out" || fail 'missing second switch'
+      grep -Fq "=== sha ${FINAL_SHA:0:8}: every run terminal" "$WORK/$m.out" || fail 'wrong final SHA verdict' ;;
+    follow-green)
+      grep -Fq "=== sha ${FOLLOW_SHA:0:8}: every run terminal" "$WORK/$m.out" || fail 'old SHA verdict leaked' ;;
+    follow-pending|follow-same|follow-no-run)
+      [ "$(grep -c '^run list ' "$CALLS")" -eq 3 ] || fail "$m: reset the tick budget" ;;
+  esac
+done
+
+# Without --follow, supersession retains exit 4 and never resolves a branch head.
+MODE=follow-green; export MODE
+: > "$CALLS"
+set +e
+bash "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 3 > "$WORK/no-follow.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 4 ] || fail "without --follow: want exit 4, rc=$rc"
+if grep -Fq 'commits/main' "$CALLS"; then fail 'without --follow: resolved branch head'; fi
+
+# --follow is valid only with --sha, never silently applied to a single-run watch.
+for mode in branch run; do
+  : > "$CALLS"
+  set +e
+  if [ "$mode" = branch ]; then
+    bash "$SCRIPT" --branch main --follow --repo test/repo > "$WORK/invalid-follow.out" 2>&1
+  else
+    bash "$SCRIPT" 201 --follow --repo test/repo > "$WORK/invalid-follow.out" 2>&1
+  fi
+  rc=$?
+  set -e
+  [ "$rc" -eq 3 ] && [ ! -s "$CALLS" ] || fail "--follow $mode did not reject before GitHub"
+done
 
 : > "$CALLS"
 MODE=full; export MODE
@@ -442,4 +535,4 @@ set -e
 grep -Fq 'waiting for the run' "$WORK/stale-read.out" \
   || fail "--branch stale-read did not wait for the run: $(cat "$WORK/stale-read.out")"
 
-echo "PASS watch-run-ci: SHA validation/retry/canonicalization, transient empty recovery, pending heartbeat (xpg_echo-safe), default intervals and tick limits, live failed-job logs, cancelled jobs never green, aggregator red beside cancelled shards waits for the run verdict"
+echo "PASS watch-run-ci: bounded SHA following, final-head verdicts, SHA validation/retry/canonicalization, transient empty recovery, pending heartbeat (xpg_echo-safe), default intervals and tick limits, live failed-job logs, cancelled jobs never green, aggregator red beside cancelled shards waits for the run verdict"
