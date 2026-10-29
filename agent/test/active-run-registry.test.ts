@@ -372,6 +372,31 @@ describe("policy pending snapshot projection", () => {
     assert.strictEqual(reg.build().active[0]!.claim_generation, 4);
   });
 
+  it("a policy lease coalesces an older ordinary journal for that same run", () => {
+    const sources = [pt(RUN_A, 1), policy(RUN_A, 2)];
+    const reg = new ActiveRunRegistry(() => sources, () => 1);
+    reg.notePolicyOwnership(RUN_A, 3);
+    const snapshot = reg.build();
+    assert.deepStrictEqual(snapshot.active, [
+      { run_id: RUN_A, claim_generation: 3, phase: "running", terminal_pending: true },
+    ]);
+    assert.strictEqual(snapshot.pending_overflow, false);
+    assert.deepStrictEqual(snapshot.pending_all, [
+      { run_id: RUN_A, claim_generation: 1 }, { run_id: RUN_A, claim_generation: 2 },
+    ]);
+  });
+
+  it("unknown policy protection cannot be invalidated by ordinary duplicates on that run", () => {
+    const sources = [pt(RUN_A, 1), pt(RUN_A, 2), policy(RUN_A, 3)];
+    const reg = new ActiveRunRegistry(() => sources, () => 8);
+    assert.deepStrictEqual(reg.build().active, []);
+    assert.strictEqual(reg.build().pending_overflow, true);
+    reg.notePolicyOwnership(RUN_A, null);
+    assert.deepStrictEqual(reg.build().active.map(e => e.claim_generation), [1, 2],
+      "positive ineligibility retains ordinary-only behavior without creating a policy lease");
+    assert.strictEqual(reg.build().pending_overflow, false);
+  });
+
   it("G1 alone projects G3 without changing the register source identity", () => {
     const reg = new ActiveRunRegistry(() => [policy(RUN_A, 1)], () => 8);
     reg.notePolicyOwnership(RUN_A, 3);

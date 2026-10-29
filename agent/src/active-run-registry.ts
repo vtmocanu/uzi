@@ -262,6 +262,13 @@ export class ActiveRunRegistry {
     for (const [runId, sources] of groups) {
       const generation = this.policyOwnership.get(runId)?.generation;
       if (generation === null) continue;
+      // One policy protection entry covers the current run. Retaining ordinary
+      // source leases for this SAME run would duplicate its ID and invalidate
+      // the entire snapshot (including conservative overflow). Their immutable
+      // identities remain in pending_all; ordinary-only runs are unchanged.
+      for (let i = leases.length - 1; i >= 0; i--) {
+        if (leases[i]!.run_id === runId) leases.splice(i, 1);
+      }
       if (generation === undefined || sources.some(p => p.outcome_kind === "unknown")) {
         unknown = true;
         continue;

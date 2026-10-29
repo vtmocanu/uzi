@@ -5,10 +5,10 @@ import path from "node:path";
 import { Outbox } from "../src/outbox.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { PolicyHoldRequest } from "../src/protocol.js";
-import { client, fx, fakeGitlab, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
+import { client, fx, git, fakeGitlab, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 import { WorkerClient } from "../src/client.js";
 import { FakeApi } from "./fake-api.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, noProofReseed } from "./helpers.js";
 
 describe("compact hold negotiated capability", () => {
   for (const server of [false, true]) for (const worker of [false, true]) {
@@ -86,6 +86,40 @@ describe("policy admission on every production claim", () => {
     assert.equal(states.length, 0, "admission latch suppresses ordinary running and session-drop writes");
     assert.deepEqual((await outbox.readTerminalJournal(claim.run_id, 1))?.body, original);
     assert.equal(outbox.listPendingTerminals()[0]?.server_settled, true);
+  });
+
+  it("an unwired retained source reholds at its actual attempt path before recovery blockers", async () => {
+    const claim = gitlabClaim(3707, { claim_generation: 3, session_id: "original-session" });
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 3707, noProofReseed, claim.run_id);
+    await git.markRecoveryCapture(bare, clone.path, clone.branch, claim.run_id);
+    await fs.writeFile(path.join(clone.path, "retained.txt"), "keep this work");
+    await git.reserveRecoveryIteration(bare, clone.branch, "issue-3707", { runId: claim.run_id, clonePath: clone.path }, 1);
+    await git.blockRecoveryEpisode(bare, clone.branch, "issue-3707", { runId: claim.run_id, clonePath: clone.path }, "decoded_history_limit");
+    const before = await git.discoverRetainedRecovery(fx.originPath, clone.branch, "issue-3707", claim.run_id);
+    const outbox = await pendingOutbox();
+    await outbox.journalPolicyHold(claim.run_id, original);
+    client.getRunOwnership = async () => ({ status: packets.some(p => p.claim_generation === 3) ? "paused" : "running", claim_generation: 3, claim_released: false });
+    const packets: PolicyHoldRequest[] = [];
+    client.reportPolicyHold = async (_id, body) => {
+      packets.push(body);
+      return body.claim_generation === 3
+        ? { disposition: "applied", outcome_id: body.outcome_id, source_generation: 1,
+            observed_status: "paused", observed_generation: 3, hold_reason: "codex_policy_hold" }
+        : { disposition: "pending", outcome_id: body.outcome_id, source_generation: 1 };
+    };
+    let models = 0;
+    await runnerWith(() => ({ executor: { run: async () => { models++; throw new Error("unexpected model"); } } }),
+      fakeGitlab().gitlab, undefined, nullLogger(), { outbox }).execute(claim);
+    assert.equal(models, 0);
+    assert.equal(await fs.readFile(path.join(clone.path, "retained.txt"), "utf8"), "keep this work");
+    assert.deepEqual(packets.at(-1), {
+      outcome_id: original.outcome_id, source_generation: 1, claim_generation: 3,
+      detail: "resume_rejected", continuation_mode: "fresh_from_saved_work", published: false,
+    });
+    assert.deepEqual((await outbox.readTerminalJournal(claim.run_id, 1))?.body, original);
+    const after = await git.discoverRetainedRecovery(fx.originPath, clone.branch, "issue-3707", claim.run_id);
+    assert.deepEqual(after?.journal, before?.journal, "policy reconciliation consumes no recovery reservation or source");
   });
 
   for (const corrupt of [false, true]) it(`first and duplicate claims block unavailable original (corrupt=${corrupt}) before factory`, async () => {

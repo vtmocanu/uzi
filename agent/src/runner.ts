@@ -5428,17 +5428,7 @@ export class RunRunner {
       this.bindWorkerMemory(claim, flight);
       await this.phaseClone(claim, flight);
       executor = flight.executor;
-      if (flight.policyAdmission) {
-        if (!await this.provePolicyClaim(claim)) return;
-        await this.resolveRunPendingTerminals(runId, {
-          claimGeneration: flight.claimGeneration,
-          continuationMode: flight.effectiveAttemptPaths ? "fresh_from_saved_work" : "same_conversation",
-        });
-        // A void resolver return is not settlement proof; authenticate through EOF.
-        if (await this.outbox!.hasPendingPolicyOutcome(runId) || !await this.provePolicyClaim(claim)) return;
-        flight.policyHold = undefined;
-        flight.policyAdmission = false;
-      }
+      if (flight.policyAdmission && !await this.reconcilePolicyAdmission(claim, flight)) return;
       const sessionId = await this.phaseResume(claim, flight);
       // PRD #1349 M2 (D1/D3): after clone/reseed and BEFORE model work, record this run's exact
       // claim generation into the durable journal (the restore point it starts from) and
@@ -6428,6 +6418,20 @@ export class RunRunner {
       const current = await this.outbox.readTerminalJournalForRetirement(runId, body.source_generation);
       return current?.context.expectedIdentity === captured.context.expectedIdentity;
     } catch { return false; }
+  }
+
+  private async reconcilePolicyAdmission(claim: ClaimResponse, flight: RunFlight): Promise<boolean> {
+    if (!flight.policyAdmission) return true;
+    if (!await this.provePolicyClaim(claim)) return false;
+    await this.resolveRunPendingTerminals(flight.runId, {
+      claimGeneration: flight.claimGeneration,
+      continuationMode: flight.effectiveAttemptPaths ? "fresh_from_saved_work" : "same_conversation",
+    });
+    // A void resolver return is not settlement proof; authenticate through EOF.
+    if (await this.outbox!.hasPendingPolicyOutcome(flight.runId) || !await this.provePolicyClaim(claim)) return false;
+    flight.policyHold = undefined;
+    flight.policyAdmission = false;
+    return true;
   }
 
   private async provePolicyClaim(claim: ClaimResponse): Promise<boolean> {
@@ -22480,6 +22484,9 @@ export class RunRunner {
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     flight.keepGuardedInventoryOpen = true;
+    // Retained recovery has now established the actual attempt path. Re-hold
+    // before recovery blockers/reservations can end this claim or consume work.
+    if (flight.policyAdmission && !await this.reconcilePolicyAdmission(claim, flight)) throw new RetainedRecoveryStop();
     const inherited = flight.sourceInherited?.family;
     if (inherited?.observedExecution.runId === flight.runId) {
       flight.sourceFamilyMatched = !!await this.git.matchMaintenanceSourceFamily(bare, branch, key, flight.runId,
