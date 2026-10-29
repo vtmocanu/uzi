@@ -23,6 +23,11 @@ it.each(["half_open", "legacy_serialized_until_upgrade"] as const)("shows the ex
     expect(screen.getByText(/run-exact-123/).textContent).not.toContain("serialized until upgrade");
   }
 });
+it.each(["half_open", "legacy_serialized_until_upgrade", "reserved_unverified", "retry_eligible_unverified"] as const)("keeps the cooldown deadline visible for %s", (state) => {
+  const text = forgeCooldownText({ ...base, state }, Date.parse(base.cooled_until));
+  expect(text).toContain("Cooldown deadline:");
+  expect(text).toContain(new Date(base.cooled_until).toLocaleString());
+});
 it("does not turn a reserved or missing projection into healthy", () => {
   const { container, rerender } = render(<ForgeOriginStatus />);
   expect(container.textContent).toBe("");

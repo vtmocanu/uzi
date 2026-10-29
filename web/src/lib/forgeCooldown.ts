@@ -50,5 +50,7 @@ export function forgeCooldownText(cooldown: ForgeOriginCooldown, nowMs: number):
     default:
       state = "Forge cooldown state unavailable; recovery unverified.";
   }
-  return `${origin}: ${state}${cooldown.detail ? ` Last reported: ${stripDisplayCell(cooldown.detail)}` : ""}`;
+  const deadline = cooldown.state !== "cooling" || (Number.isFinite(until) && until <= nowMs)
+    ? ` Cooldown deadline: ${time}.` : "";
+  return `${origin}: ${state}${deadline}${cooldown.detail ? ` Last reported: ${stripDisplayCell(cooldown.detail)}` : ""}`;
 }
