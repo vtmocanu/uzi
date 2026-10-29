@@ -441,6 +441,7 @@ func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, 
 	budgetShortfall := false
 	unavailable := false
 	c, cc = context.WithTimeout(ctx, prerequisiteDBTimeout)
+	defer cc()
 	err = s.prerequisiteTx(c, func(tx PrerequisiteStore) error {
 		run, e := tx.LockPrerequisiteRun(c, row.RunID)
 		if errors.Is(e, pgx.ErrNoRows) {
@@ -481,7 +482,7 @@ func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, 
 			return nil
 		}
 		// Recheck after the last binding read, immediately before the durable marker.
-		// Four seconds cover the 500ms transaction, 1s send, 1s readback and 1.5s outcome.
+		// Four seconds cover the shared 500ms transaction/binding recheck, 1s send, 1s readback and 1.5s outcome.
 		if end.Sub(s.now()) < prerequisiteMarkerReserve || c.Err() != nil {
 			budgetShortfall = true
 			return nil
@@ -498,7 +499,6 @@ func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, 
 		marked = e == nil
 		return e
 	})
-	cc()
 	if err != nil {
 		return 0, err
 	}
@@ -510,7 +510,8 @@ func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, 
 	}
 	// Commit precedes forge I/O. A deleted or rebound connection after the marker
 	// leaves invoked durable; the stale lane later converts it to listing-only unknown.
-	fresh, err = s.prerequisiteBinding(ctx, q, row, false)
+	fresh, err = s.prerequisiteBinding(c, q, row, false)
+	cc()
 	if err != nil || !b.same(fresh) || ctx.Err() != nil || end.Sub(s.now()) < 3500*time.Millisecond {
 		return 1, nil
 	}
