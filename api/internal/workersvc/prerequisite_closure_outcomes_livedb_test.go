@@ -58,20 +58,33 @@ func TestPrerequisiteStoppedAfterMarkerNeverResendsLiveDB(t *testing.T) {
 	previousRequests, _ := remote.snapshot()
 	// A bounded set of fake-clock jumps includes far more than every lease and
 	// absence confirmation interval; no timeout grants permission to resend.
-	for i := 0; i < 12; i++ {
+	listings := 0
+	// A same-pass deduplication can advance the cursor past this row. Allow
+	// bounded empty wrap turns; count actual listings rather than demanding
+	// that every public pass process this candidate.
+	for pass := 0; pass < 24 && listings < 12; pass++ {
 		f.advanceLiveDB(t, 30*24*time.Hour)
 		m3Sweep(t, ctx, fresh)
 		r := f.readLiveDB(t)
 		m3AssertFrozen(t, marked, r)
-		if r.State != "create_unknown" || !r.NextAttemptAt.Time.After(f.m.now) ||
-			r.ReconciliationAttempts != int32(min(i+1, 7)) || r.CleanupAttempts != 0 {
-			t.Fatalf("absence pass %d: state=%s reconciliation=%d", i, r.State, r.ReconciliationAttempts)
-		}
 		requests, cmd := remote.snapshot()
-		if requests != previousRequests+1 || remote.posts.Load() != 0 || len(cmd) != 0 {
-			t.Fatalf("absence pass %d: requests=%d commands=%d", i, requests, len(cmd))
+		delta := requests - previousRequests
+		if r.State != "create_unknown" || r.CleanupAttempts != 0 || remote.posts.Load() != 0 || len(cmd) != 0 || delta < 0 || delta > 1 {
+			t.Fatalf("absence pass %d: state=%s cleanup=%d request delta=%d commands=%d", pass, r.State, r.CleanupAttempts, delta, len(cmd))
+		}
+		if delta == 1 {
+			listings++
+			if !r.NextAttemptAt.Time.After(f.m.now) {
+				t.Fatalf("listing %d did not schedule positive backoff", listings)
+			}
+		}
+		if r.ReconciliationAttempts != int32(min(listings, 7)) {
+			t.Fatalf("absence pass %d: listings=%d reconciliation=%d", pass, listings, r.ReconciliationAttempts)
 		}
 		previousRequests = requests
+	}
+	if listings != 12 {
+		t.Fatalf("listing-only recovery made %d actual listings in 24 passes, want 12", listings)
 	}
 }
 

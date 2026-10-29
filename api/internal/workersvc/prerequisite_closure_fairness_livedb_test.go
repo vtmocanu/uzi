@@ -291,7 +291,10 @@ func TestPrerequisiteMixedBacklogPublicSweepProgressLiveDB(t *testing.T) {
 	retry, retryHTTP := f.siblingLiveDB(t)
 	pin(retry)
 	unknown, unknownHTTP := f.siblingLiveDB(t)
-	prerequisiteBudgetUnknownLiveDB(t, f, unknown.row)
+	// This sibling owns a different repository and connection; the marker
+	// fixture must freeze that binding, not the primary preparation's binding.
+	unknownFixture := &prerequisiteExecutorLiveDB{env: f.env, s: f.s, m: unknown}
+	prerequisiteBudgetUnknownLiveDB(t, unknownFixture, unknown.row)
 	stale, staleHTTP := f.siblingLiveDB(t)
 	// Stop this row at the genuine marker without a broker send.
 	q := &m3StoppedLookup{PrerequisiteStore: f.env.q}
