@@ -232,7 +232,7 @@ assert.call(release_auto.fetch('on').fetch('schedule'), [{'cron' => '47 4 * * *'
 assert.call(release_auto.fetch('permissions'), {}, 'automation token defaults to no permissions')
 assert.call(release_auto.fetch('concurrency'), {'group' => 'release-auto', 'cancel-in-progress' => false, 'queue' => 'max'}, 'all release routes queue without cancellation')
 auto_jobs = release_auto.fetch('jobs')
-assert.call(auto_jobs.fetch('prepare').fetch('timeout-minutes'), 210, 'prepare permits 183 minute wait, 10 minute cut and 17 minute overhead')
+assert.call(auto_jobs.fetch('prepare').fetch('timeout-minutes'), 210, 'prepare permits 180 minute wait, 10 minute cut and 20 minute overhead')
 # Execute each actual failure-handler prologue in the shell contexts ERR inherits.
 # Keep a fast slice for guard-removal probes without repeating Git fixture setup.
 exercise_release_traps = lambda do
@@ -578,14 +578,14 @@ Dir.mktmpdir('release-auto-contract') do |dir|
     exercise.call({'TEST_REMOTE' => faulty_remote, 'RUN_CREATED_AT' => '2026-10-27T02:47:00Z'}, true, false, bundle,
                   {'GITHUB_EVENT_NAME' => 'schedule', 'TEST_NOW' => Time.utc(2026, 10, 27, 3).to_i.to_s}.merge(faults), 'invalid-nightly-window')
   end
-  [['winter-at', '2026-10-27T02:47:00Z', '2026-10-27T06:00:00Z', false],
-   ['winter-before', '2026-10-27T02:47:00Z', '2026-10-27T05:59:59Z', true],
-   ['winter-after', '2026-10-27T02:47:00Z', '2026-10-27T06:01:00Z', false],
+  [['winter-at', '2026-10-27T02:47:00Z', '2026-10-27T11:00:00Z', false],
+   ['winter-before', '2026-10-27T02:47:00Z', '2026-10-27T10:59:59Z', true],
+   ['winter-after', '2026-10-27T02:47:00Z', '2026-10-27T11:01:00Z', false],
    ['queued-next-day', '2026-10-27T02:47:00Z', '2026-10-28T02:00:00Z', false],
-   ['summer-at', '2026-07-15T01:47:00Z', '2026-07-15T05:00:00Z', false],
-   ['summer-before', '2026-07-15T01:47:00Z', '2026-07-15T04:59:59Z', true],
-   ['spring-at', '2026-03-29T01:47:00Z', '2026-03-29T05:00:00Z', false],
-   ['autumn-at', '2026-10-25T02:47:00Z', '2026-10-25T06:00:00Z', false],
+   ['summer-at', '2026-07-15T01:47:00Z', '2026-07-15T10:00:00Z', false],
+   ['summer-before', '2026-07-15T01:47:00Z', '2026-07-15T09:59:59Z', true],
+   ['spring-at', '2026-03-29T01:47:00Z', '2026-03-29T10:00:00Z', false],
+   ['autumn-at', '2026-10-25T02:47:00Z', '2026-10-25T11:00:00Z', false],
    ['future-run', '2026-10-27T02:47:00Z', '2026-10-27T02:40:00Z', false, 'invalid-nightly-window'],
    ['noncanonical-time', '2026-10-27 02:47:00+00:00', '2026-10-27T03:00:00Z', false, 'invalid-nightly-window']].each do |label, created, now, allowed, reason|
     scheduled_remote = File.join(dir, 'scheduled-' + label + '.git')
@@ -595,8 +595,8 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   end
   schedule_env = {'GITHUB_EVENT_NAME' => 'schedule', 'RELEASE_NIGHTLY_ENABLED' => 'true',
                   'RUN_CREATED_AT' => '2026-10-27T02:47:00Z', 'TEST_NOW' => Time.utc(2026, 10, 27, 3).to_i.to_s}
-  exercise.call(schedule_env.merge('TEST_NOW' => Time.utc(2026, 10, 27, 5, 59, 59).to_i.to_s), true)
-  exercise.call(schedule_env.merge('TEST_NOW' => Time.utc(2026, 10, 27, 6).to_i.to_s), false, nil, bundle, {}, nil, 'missed-target')
+  exercise.call(schedule_env.merge('TEST_NOW' => Time.utc(2026, 10, 27, 10, 59, 59).to_i.to_s), true)
+  exercise.call(schedule_env.merge('TEST_NOW' => Time.utc(2026, 10, 27, 11).to_i.to_s), false, nil, bundle, {}, nil, 'missed-target')
   [{'TEST_BAD_CUTOFF' => 'empty'}, {'TEST_BAD_CUTOFF' => 'garbage'}, {'TEST_BAD_NOW' => 'empty'},
    {'TEST_BAD_NOW' => 'garbage'}, {'TEST_OFFSET' => '+0000'}].each do |faults|
     exercise.call(schedule_env.merge(faults), false, nil, bundle, {}, nil, 'invalid-nightly-window')
@@ -878,11 +878,11 @@ Dir.mktmpdir('release-report') do |dir|
     assert.call(text.include?('Nightly RC'), true, "#{reason}: human-readable nightly result")
     assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, "#{reason}: expected no-op never files an incident")
   end
-  [['2026-10-27T02:47:00Z', '2026-10-27T07:00:00Z', false],
-   ['2026-10-27T02:47:00Z', '2026-10-27T07:00:01Z', true],
-   ['2026-07-15T01:47:00Z', '2026-07-15T06:00:00Z', false],
-   ['2026-07-15T01:47:00Z', '2026-07-15T06:00:01Z', true],
-   ['2026-10-26T22:30:00Z', '2026-10-27T06:59:59Z', false]].each do |created, verified, late|
+  [['2026-10-27T02:47:00Z', '2026-10-27T12:00:00Z', false],
+   ['2026-10-27T02:47:00Z', '2026-10-27T12:00:01Z', true],
+   ['2026-07-15T01:47:00Z', '2026-07-15T11:00:00Z', false],
+   ['2026-07-15T01:47:00Z', '2026-07-15T11:00:01Z', true],
+   ['2026-10-26T22:30:00Z', '2026-10-27T11:59:59Z', false]].each do |created, verified, late|
     completed = Marshal.load(Marshal.dump(normal))
     completed['watch']['outputs'].merge!('verified_at' => verified, 'published_at' => verified)
     File.write(environment.fetch('GITHUB_STEP_SUMMARY'), '')
@@ -894,7 +894,7 @@ Dir.mktmpdir('release-report') do |dir|
     assert.call(text.include?('"outcome": "published-and-verified"'), true, 'late success is still verified')
     assert.call(text.include?('"late_finish": ' + late.to_json), true, 'late finish uses the original local-date target')
     assert.call(stdout.include?('::warning::'), late, 'only late verified completion produces a warning')
-    assert.call(text.include?('09:00 Europe/Bucharest target.'), late, 'late warning names the current local target')
+    assert.call(text.include?('14:00 Europe/Bucharest target.'), late, 'late warning names the current local target')
     assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, 'late success does not file an extra incident')
   end
   ['credential-sentinel', '2026-10-27 05:00:00+00:00'].each do |invalid|
@@ -916,7 +916,7 @@ Dir.mktmpdir('release-report') do |dir|
                                       'RUN_CREATED_AT' => '2026-10-27T02:47:00Z'), 'bash', '-e', '-c', report_script)
   assert.call(status.success?, true, "manual late-day verification has no morning target: #{err}")
   assert.call(File.read(environment.fetch('GITHUB_STEP_SUMMARY')).include?('"late_finish": null'), true, 'manual verification has no late flag')
-  assert.call(stdout.include?('::warning::'), false, 'manual completion after 09:00 does not warn')
+  assert.call(stdout.include?('::warning::'), false, 'manual completion after 14:00 does not warn')
   assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, 'manual verified completion is not an incident')
   missed = Marshal.load(Marshal.dump(normal))
   missed['push'] = {'result' => 'failure', 'outputs' => {'reason' => 'missed-target', 'attempted' => 'false'}}

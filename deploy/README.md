@@ -155,8 +155,9 @@ An unconfirmed push receipt stops watch before publication recovery and
 verification, so automatic publication retries do not run in that branch.
 Inspect remote refs, then use local watch/verify against the same tag/SHA.
 
-Nightly attempts start at 04:47 Europe/Bucharest using GitHub's native timezone
-schedule, after the local maintenance window, aiming to cut near 05:00. They are
+Nightly attempts are scheduled for 04:47 Europe/Bucharest using GitHub's native
+timezone support, after the local maintenance window, aiming to cut near 05:00
+when on time. They are
 off until the user decides to activate and the maintainer sets
 `RELEASE_NIGHTLY_ENABLED=true`. Unset it or set it to `false` to pause nightly
 attempts; manual dispatch still works. Enablement is rechecked at job boundaries,
@@ -172,25 +173,31 @@ reported no-ops; they do not wait for CI or create a bundle. Failed previous
 publication and other blocked plans still refuse. Manual RC respins preserve
 the cutter's existing empty-delta behavior.
 
-The provisional push cutoff is strictly before 08:00 on the original run's
+The provisional push cutoff is strictly before 13:00 on the original run's
 Bucharest calendar date. A queued run does not gain a fresh window tomorrow.
-Tip waiting ends by 07:50, reserving a provisional 600 seconds from the existing
-cutter timeout, not a measured cut duration. Scheduled waiting uses the full
-remaining window, about three hours from 04:47, under the 20-job concurrency cap.
-The prepare job ceiling is 210 minutes (183 waiting, ten cutting, 17 overhead).
+Scheduled tip waiting uses the lesser of three hours and the remaining time
+until 12:50, reserving a provisional 600 seconds from the existing cutter timeout,
+not a measured cut duration. An on-time 04:47 attempt can wait until 07:47; a late
+10:47 attempt can wait until 12:50. Waiting holds a runner under the 20-job cap.
+The prepare ceiling stays 210 minutes (180 waiting, ten cutting, 20 overhead).
 Manual waits remain 7200 seconds and their cutter timeout remains 600 seconds;
-only the job ceiling rises. Push/watch ceilings remain 15/125 minutes.
+the job ceiling stays 210 minutes. Push/watch ceilings remain 15/125 minutes.
 The key job checks the window before
 minting and independently again immediately before the atomic update, validating
 numeric epochs and the Bucharest offset. Creation timestamps tolerate 60 seconds
-of clock skew; the 08:00 push cutoff has no grace period. A missed window stops
+of clock skew; the 13:00 push cutoff has no grace period. A missed window stops
 with `missed-target` and no push; a tip not green in its budget is reported
 separately. Main races never cause automatic rebasing or an older-tip fallback.
 Expected no-ops stay in the summary; misses and failures update the tracking
 issue. Once a tag is pushed, recovery ignores the cutoff and pause flag.
-Verification recorded after the 09:00 local target produces a late warning,
+Verification recorded after the 14:00 local target produces a late warning,
 retaining verified success without opening an extra incident. These times are
 best-effort targets, subject to Actions delays and the shared non-cancelling queue.
+
+The wider window accommodates observed schedule delays of roughly six hours;
+[ADR-3512](../adr/3512-release-automation.md) cites the public E2E and release
+run timestamps. This is not a guaranteed delay. Late attempts may run during
+daytime merges, so exact-tip CI may take longer to settle within the same cap.
 
 Manual tip selection is bounded at 120 minutes plus 10 minutes for cutting.
 Publication watching retains its 60-minute bound within the 120-minute recovery
