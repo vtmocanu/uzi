@@ -1206,7 +1206,7 @@ The owner projection carries `account_cooldown_class` (`rate_limit` or
 `waiting for account cooldown` and health `waiting_account_cooldown`.
 Eligibility is earliest eligibility, not a promised dispatch. This is expected
 wait health, not lifecycle or `waiting_worker`. The
-[projection boundary](../api/internal/store/migrations/00370_account_cooldown_projection.sql)
+[projection boundary](../api/internal/store/migrations/00378_account_cooldown_projection.sql)
 requires blocked required work, current positive generation, ownership,
 credential binding and revision source plus a 45-second accepted snapshot lease.
 Optional background advice cannot label a working root blocked.
