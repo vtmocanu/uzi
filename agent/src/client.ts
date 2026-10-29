@@ -2378,6 +2378,8 @@ export class WorkerClient {
       try {
         return await this.reportStateOnce(runId, path, outbound, signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
       } catch (error) {
+        if (!evidence.ambiguous && evidence.refusals > 0 && error instanceof StateDecodeRefusalError)
+          throw new StateReportUnappliedError(runId, error);
         if (evidence.refusedAfterAmbiguity) throw new Error("Codex idle park outcome uncertain", { cause: error });
         throw error;
       }
