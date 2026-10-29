@@ -237,6 +237,7 @@ CROSS JOIN LATERAL (
 ) c
 WHERE w.user_id = $1::uuid AND w.id = ANY($2::uuid[])
 ORDER BY w.id, c.cooled_until, c.origin
+LIMIT 1024
 `
 
 type ListOwnerWorkerForgeOriginCooldownsParams struct {
@@ -254,7 +255,8 @@ type ListOwnerWorkerForgeOriginCooldownsRow struct {
 }
 
 // Display only, no locks or reservations. One batch for response worker IDs;
-// at most 32 origins per worker, soonest deadline then canonical origin.
+// at most 32 origins per worker and 1024 total, soonest deadline then canonical
+// origin. A truncated batch omits advisory fields rather than claiming health.
 func (q *Queries) ListOwnerWorkerForgeOriginCooldowns(ctx context.Context, arg ListOwnerWorkerForgeOriginCooldownsParams) ([]ListOwnerWorkerForgeOriginCooldownsRow, error) {
 	rows, err := q.db.Query(ctx, listOwnerWorkerForgeOriginCooldowns, arg.UserID, arg.WorkerIds)
 	if err != nil {

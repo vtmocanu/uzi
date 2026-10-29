@@ -122,7 +122,8 @@ SELECT COALESCE(canonical_forge_origin(@raw::text), '')::text AS origin;
 
 -- name: ListOwnerWorkerForgeOriginCooldowns :many
 -- Display only, no locks or reservations. One batch for response worker IDs;
--- at most 32 origins per worker, soonest deadline then canonical origin.
+-- at most 32 origins per worker and 1024 total, soonest deadline then canonical
+-- origin. A truncated batch omits advisory fields rather than claiming health.
 SELECT w.id AS worker_id, c.origin, c.cooled_until,
        ('forge_clone_success_v1' = ANY(w.protocol_capabilities))::boolean AS success_reporting,
        (c.reservation_run_id IS NOT NULL)::boolean AS reserved,
@@ -147,7 +148,8 @@ CROSS JOIN LATERAL (
     ORDER BY fc.cooled_until, fc.origin LIMIT 32
 ) c
 WHERE w.user_id = @user_id::uuid AND w.id = ANY(@worker_ids::uuid[])
-ORDER BY w.id, c.cooled_until, c.origin;
+ORDER BY w.id, c.cooled_until, c.origin
+LIMIT 1024;
 
 -- name: ListOwnerRunForgeOriginCooldowns :many
 -- At most one row per requested owner run. Current authorized identity only;

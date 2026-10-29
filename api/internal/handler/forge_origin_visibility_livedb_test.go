@@ -150,6 +150,28 @@ func TestForgeOriginVisibilityRoutesLiveDB(t *testing.T) {
 	if len(bounded) != 32 || bounded[0].Origin != "https://forge.example" || bounded[31].Origin != "https://extra-30.example" {
 		t.Fatal("worker origins are not bounded in deterministic deadline/origin order")
 	}
+	// The owner worker list is unbounded. Bound the additional advisory rows
+	// across the entire response, not just within each worker.
+	workerIDs := []uuid.UUID{worker}
+	for range 32 {
+		extraWorker := uuid.New()
+		workerIDs = append(workerIDs, extraWorker)
+		cliMustExec(t, pool, "INSERT INTO workers(id,user_id,name,token_hash,status) VALUES($1,$2,'batch-bound',$3,'online')", extraWorker, owner, []byte(uuid.NewString()))
+		cliMustExec(t, pool, `INSERT INTO forge_origin_cooldowns(user_id,worker_id,origin,cooled_until,last_reason,observed_at)
+			SELECT user_id,$2,origin,cooled_until,last_reason,observed_at FROM forge_origin_cooldowns WHERE worker_id=$1`, worker, extraWorker)
+	}
+	batch := h.workerForgeOriginCooldowns(ownerCtx, workerIDs)
+	count := 0
+	for _, origins := range batch {
+		if len(origins) > 32 {
+			t.Fatal("per-worker origin bound exceeded")
+		}
+		count += len(origins)
+	}
+	if count != 1024 {
+		t.Fatalf("owner-wide advisory row bound: got %d want 1024", count)
+	}
+	cliMustExec(t, pool, "DELETE FROM workers WHERE id=ANY($1) AND user_id=$2", workerIDs[1:], owner)
 	cliMustExec(t, pool, "DELETE FROM forge_origin_cooldowns WHERE worker_id=$1 AND origin <> 'https://forge.example'", worker)
 	// Canonical-origin changes prune the old key; no stale origin survives.
 	cliMustExec(t, pool, "UPDATE repos SET web_url='https://replacement.example/repo' WHERE id=$1", repo)
