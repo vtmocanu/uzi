@@ -26,7 +26,8 @@ import { FakeAnthropicApi, type MessagesRequest, type ScriptedTurn } from "./fak
 // the provider-bound request bodies. Nothing leaves 127.0.0.1, the key is a placeholder, and all
 // paths are disposable mkdtemp roots removed afterwards.
 
-const DRIVE_BUDGET_MS = 50_000;
+// Measured drives take well under 1 s in CI; 30 s keeps a two-drive test at most half the 120 s cap.
+const DRIVE_BUDGET_MS = 30_000;
 const SKILL_NAME = "probe-skill";
 const SKILL_DESC_MARKER = "CANARY-SKILLDESC-1563-f2b6";
 const SKILL_BODY_MARKER = "CANARY-SKILLBODY-1563-91ac";
