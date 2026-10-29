@@ -1887,9 +1887,10 @@ Four independent layers, any one of which failing still leaves the others:
    preprocessing step only: it is not a sandbox, it does not change tool
    guards, and Codex is unaffected. The SDK documents a tradeoff, that a
    verbatim turn also skips the CLI's turn-start attachment pass (skill and
-   tool listings, nested instruction files, per-turn reminders) until after the
-   first tool call; on the pinned CLI 2.1.302 the skill and tool listings were
-   still observed on the first request. Real-CLI tests against a local fake
+   tool listings, nested instruction files, per-turn reminders), with most of
+   that context arriving after the first tool call; on the pinned CLI 2.1.302
+   the skill listing and the granted tools were still present on the first
+   request. Real-CLI tests against a local fake
    provider pin both the non-expansion and that first-turn behaviour
    (`agent/test/sdk-verbatim-prompts*.ts`).
 
