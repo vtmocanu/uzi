@@ -3520,7 +3520,7 @@ export class RunRunner {
       if (await this.publishFlightSource(flight, bound, runLog) !== "unpublished") paths.delete(resolvePath(bound.clonePath));
     }
     if (paths.size === 0) return;
-    const outcome = await authority.endSourceUse(paths, { timeoutMs: this.sourceUseEndWaitMs });
+    const outcome = await authority.endSourceUse(paths, { timeoutMs: this.sourceUseEndWaitMs, sink });
     if (outcome.kept.length > 0) runLog.warn("source use left active for some paths", { kept: outcome.kept.length });
   }
 
@@ -3542,6 +3542,8 @@ export class RunRunner {
       return "unpublished";
     };
     if (!authority || !lease) return "unpublished";
+    // A source another flight's sink still owns is not this flight's to publish.
+    if (authority.heldByOtherSink(bound.clonePath, flight.sourceUsePaths)) return unpublished("another flight owns this source");
     try {
       const executor = flight.executor;
       const codex = leaseHarness(lease) === "codex";
@@ -11786,6 +11788,14 @@ export class RunRunner {
           flight.worktreePath = runnerClone.path;
           flight.branch = runnerClone.branch;
           await this.bindFlightSource(flight, runnerClone.path);
+        } else if (err instanceof SourceUseHeldRefusal) {
+          // The canonical clone path is shared by every run of the issue on this worker, so an earlier flight of
+          // this process can still hold it with no confirmed end (held_unended). Same nonterminal outcome as
+          // retained recovery: custody retained, no terminal report, no model work; the requeue cap bounds it.
+          this.retainedLifecycleGuard(flight);
+          flight.runLog.warn("clone path held by an earlier flight's unended source use; stopping claim for retry", {
+            error: errMessage(err), claim_generation: flight.claimGeneration });
+          throw new RetainedRecoveryStop({ cause: err });
         } else {
           throw err;
         }

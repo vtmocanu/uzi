@@ -397,11 +397,14 @@ export class AuthorityRuntime implements AuthorityScope {
    * Runs under its own A (borrowing the active one) and releases it before returning.
    */
   async endSourceUse(
-    paths: Iterable<string>, options: AuthorityWait = {},
+    paths: Iterable<string>, options: AuthorityWait & { sink?: Set<string> } = {},
   ): Promise<{ ended: string[]; kept: string[]; endedSlots: Array<EndedSlotReceipt & { path: string }> }> {
     const keys = [...new Set([...paths].map((p) => path.resolve(p)))];
     const ended: string[] = [];
     const kept: string[] = [];
+    // A key another unreleased sink owns is not this caller's to end: reported kept, never queued, never released.
+    const foreign = new Set(options.sink === undefined ? [] : keys.filter((key) => this.heldByOtherSink(key, options.sink)));
+    if (foreign.size > 0) this.#options.log?.warn("source use left active: another flight owns it", { sources: foreign.size });
     // The durable identity of each slot this call moved to `ineligible` itself: the only positive end evidence.
     const endedSlots: Array<EndedSlotReceipt & { path: string }> = [];
     if (keys.length === 0) return { ended, kept, endedSlots };
@@ -417,6 +420,7 @@ export class AuthorityRuntime implements AuthorityScope {
       await this.withTransaction(async (tx) => {
         const store = await this.#storeFor(tx);
         for (const key of keys) {
+          if (foreign.has(key)) { kept.push(key); continue; }
           const lease = captured.get(key);
           if (!lease) { kept.push(key); await this.#recheckOwner(tx, store, key); continue; }
           try {
@@ -432,7 +436,7 @@ export class AuthorityRuntime implements AuthorityScope {
       }, options);
     } catch (error) {
       warn("source use left active: the authority transaction was unavailable", { error: error instanceof Error ? error.message : String(error) });
-      for (const key of keys) if (!ended.includes(key)) queue(key);
+      for (const key of keys) if (!ended.includes(key) && !foreign.has(key)) queue(key);
       this.#scheduleDrain();
       return { ended, kept: keys.filter((key) => !ended.includes(key)), endedSlots };
     }
@@ -741,6 +745,8 @@ export class AuthorityRuntime implements AuthorityScope {
       ...(this.#options.workerIncarnation === undefined ? {} : { workerIncarnation: this.#options.workerIncarnation }),
       ...(this.#options.ops === undefined ? {} : { ops: this.#options.ops }),
     });
+    // Per-key ownership is cleared only here, on a storageId change. openAuthorityStore refuses a storage
+    // identity change after enrollment (completion-authority.ts), so ownership is never released mid-life.
     if (this.#store && this.#store.storageId === opened.storageId) return this.#store;
     this.#store = opened;
     this.#leases.clear();

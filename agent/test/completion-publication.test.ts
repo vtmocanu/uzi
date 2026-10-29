@@ -347,7 +347,7 @@ describe("durable publication at the end of source use", () => {
     const before = snapshotFiles(r);
     const stale = r.flight.sourceLease;
     // Another admission of the same clone mints a fresh epoch; the flight still holds the old lease.
-    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    await r.rt.withTransaction(() => r.rt.recordAdmissions((r.flight.sourceUsePaths as Set<string>), () => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical")));
     const fresh = (await slotOf(r))!.epoch;
     r.flight.sourceLease = stale;
     await r.end();
@@ -613,7 +613,7 @@ describe("a stale fence never wedges a clone", () => {
   // A published source is not resumed in production: git.ts throws PendingRecoveryCaptureError for a journal
   // that carries a fence before any seed can consume it, so only a never-completed publication's fence is replaced.
   for (const [label, disturb, discard] of [
-    ["the slot was replaced by a fresh active epoch", (r: Rig) => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical")), false],
+    ["the slot was replaced by a fresh active epoch", (r: Rig) => r.rt.withTransaction(() => r.rt.recordAdmissions((r.flight.sourceUsePaths as Set<string>), () => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"))), false],
     ["the slot is retiring under an operator discard", (r: Rig) => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "discard")), true],
   ] as const) {
     it(`a stale fence is not replaced when ${label}`, async t => {
@@ -724,7 +724,7 @@ describe("publication preconditions", () => {
     const r = await rig(t, { codex: false, cohort: 2 });
     const odd = `${path.dirname(r.clone)}/./${path.basename(r.clone)}`;
     assert.notEqual(odd, r.clone);
-    r.flight.sourceUsePaths = new Set();
+    (r.flight.sourceUsePaths as Set<string>).clear();
     r.flight.worktreePath = odd;
     r.flight.runnerClone = { ...(r.flight.runnerClone as object), path: `${odd}/` };
     await r.end();
@@ -768,7 +768,7 @@ describe("lease identity at publication", () => {
     await refused(r, Object.create(r.flight.sourceLease as SourceUseLease) as SourceUseLease);
     // A stale lease: the clone was re-admitted since.
     const stale = r.flight.sourceLease as SourceUseLease;
-    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    await r.rt.withTransaction(() => r.rt.recordAdmissions((r.flight.sourceUsePaths as Set<string>), () => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical")));
     const before = snapshotFiles(r);
     const outcome = await r.rt.publishSource(r.clone, stale, { timeoutMs: 2000 }, async () => { throw new Error("must not run"); });
     assert.equal(outcome.published, false);

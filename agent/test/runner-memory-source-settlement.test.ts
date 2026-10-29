@@ -193,3 +193,61 @@ describe("a settled memory park ends the flight's source use (issue #3638)", () 
       /active under another worker incarnation/);
   });
 });
+
+// Each conjunct of the settlement predicate is independently necessary: the park really happened (a witness exists,
+// so a "no witness" trap would pass for the wrong reason), then ONE fact is falsified at the instant teardown asks.
+describe("a settled memory park ends the source use only when every fact of the witness holds (issue #3638)", () => {
+  type Hold = { context: Record<string, unknown>; origin: Record<string, unknown> } & Record<string, unknown>;
+  type Memory = { hold?: Hold; parkWitness?: { origin: unknown; binding: Record<string, unknown> } & Record<string, unknown>;
+    ownershipRejected?: boolean };
+  type Flight = { workerMemory?: Memory; parked?: boolean; claimGeneration: number };
+  const cases: Array<[string, (flight: Flight, memory: Memory) => void]> = [
+    ["the executor that wrote the hold is no longer the tearing-down executor", (_flight, memory) => {
+      const origin = Object.freeze({ ...memory.hold!.origin, executor: { run: async () => { throw new Error("substitute"); } } });
+      memory.hold = Object.freeze({ ...memory.hold!, origin }) as Hold;
+      memory.parkWitness = Object.freeze({ ...memory.parkWitness!, origin });
+    }],
+    ["the flight is not parked", (flight) => { flight.parked = false; }],
+    ["the ownership probe was rejected", (_flight, memory) => { memory.ownershipRejected = true; }],
+    ["the accepted binding is for another claim generation", (_flight, memory) => {
+      memory.hold = Object.freeze({ ...memory.hold!, context: Object.freeze({ ...memory.hold!.context, claim_generation: 99 }) }) as Hold;
+      memory.parkWitness = Object.freeze({ ...memory.parkWitness!, binding: Object.freeze({ ...memory.parkWitness!.binding, claim_generation: 99 }) });
+    }],
+  ];
+  for (const [name, tamper] of cases) {
+    it(`no settlement when ${name}`, async () => {
+      const f = await setup(2);
+      const r = await authorityRig();
+      fs.writeFileSync(homeDir + "/session-proof", "original session");
+      git.worktreeStatus = async () => [];
+      const executor: Executor = {
+        run: async ctx => {
+          api.setOwnershipStatus(f.claim.run_id, "running", 7);
+          assert.throws(() => ctx.capturedMemory!(), /retained recovery/i);
+          throw new Error("fixture stops original model execution");
+        },
+      };
+      const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
+        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, authority: r.rt });
+      const internals = runner as unknown as { memoryHoldSettled(flight: Flight, executor: Executor): boolean };
+      const settled = internals.memoryHoldSettled.bind(runner);
+      let tampered = false;
+      let verdict: boolean | undefined;
+      internals.memoryHoldSettled = (flight, ex) => {
+        const memory = flight.workerMemory!;
+        assert.ok(memory.parkWitness, "the park produced its witness before the fact is falsified");
+        assert.equal(flight.parked, true);
+        tamper(flight, memory);
+        tampered = true;
+        return verdict = settled(flight, ex);
+      };
+      try { await runner.execute(f.claim); } finally { await f.memory.stop(); }
+
+      assert.equal(tampered, true, "the predicate was consulted with a witness in hand");
+      assert.equal(verdict, false);
+      const clone = worktreeDirFor(IID);
+      assert.equal((await slotOf(r.rt, clone))?.state, "active", "fail closed");
+      assert.deepEqual(r.outcomes.flatMap(o => o.endedSlots), []);
+    });
+  }
+});

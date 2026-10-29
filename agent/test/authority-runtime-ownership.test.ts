@@ -229,20 +229,68 @@ describe("per-key ownership", () => {
     assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), false, "no wedge: the recorded epoch is provably gone");
   });
 
-  it("a key this sink holds no lease for is rechecked, so a recorded owner cannot wedge the path", async (t) => {
+  it("a slot that left active behind the runtime's back is rechecked at the end, so a recorded owner cannot wedge the path", async (t) => {
     const r = await rig(t);
     const first = new Set<string>();
     await bindIn(r.rt, first, r.clone);
-    // The slot leaves active behind the runtime's back (an out-of-band end of this very epoch).
+    r.rt.retireSink(first);
+    assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), true, "owned before the out-of-band end");
+    // An independent store of this very worker replaces the epoch and ends it: the slot is no longer `active`,
+    // and the runtime's own lease and owner record were never told.
     await r.rt.withTransaction(async (tx) => {
       const store = await openAuthorityStore(tx, { workerToken: TOKEN });
-      const slot = (await store.readSlot(tx, await store.slotKey(tx, r.clone)))!;
-      assert.equal(slot.state, "active");
+      const lease = await store.admitSourceUse(tx, r.clone);
+      await store.transition(tx, lease, "ineligible");
     });
-    const other = await r.rt.endSourceUse([r.clone, r.other]);
-    assert.equal(other.endedSlots.length, 1, "the owned key ended");
-    assert.deepEqual(other.kept, [r.other], "a key nobody holds is only reported");
-    assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), false);
+    assert.equal((await slotOf(r.rt, r.clone))?.state, "ineligible");
+    assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), true, "nothing released the owner yet");
+    const outcome = await r.rt.endSourceUse([r.clone, r.other]);
+    assert.deepEqual(outcome.endedSlots, [], "an end this call did not write is not a confirmed end");
+    assert.deepEqual(outcome.ended, []);
+    assert.deepEqual(outcome.kept, [r.other], "a key nobody holds is only reported");
+    assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), false, "the recheck saw the slot gone and released the owner");
+    await bindIn(r.rt, new Set(), r.clone);
+  });
+
+  it("an end named by a different sink leaves the owner's slot active, queues nothing and releases nothing", async (t) => {
+    const r = await rig(t);
+    const a = new Set<string>();
+    const b = new Set<string>();
+    const lease = await bindIn(r.rt, a, r.clone);
+    r.rt.retireSink(a);
+    const before = authorityBytes(r.root);
+    const outcome = await r.rt.endSourceUse([r.clone], { sink: b });
+    assert.deepEqual(outcome.endedSlots, [], "no end receipt for a key B does not own");
+    assert.deepEqual(outcome.ended, []);
+    assert.deepEqual(outcome.kept, [r.clone]);
+    await r.rt.withTransaction(async () => undefined); // a queued end would be applied by acquiring A
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(authorityBytes(r.root), before, "nothing was written");
+    const slot = await slotOf(r.rt, r.clone);
+    assert.equal(slot?.state, "active");
+    assert.equal(slot?.epoch, leaseEpoch(lease));
+    assert.equal(r.rt.heldByOtherSink(r.clone, b), true, "A is still the owner");
+    assert.equal(r.rt.heldByOtherSink(r.clone, a), false);
+    // A's own end still works afterwards.
+    const own = await r.rt.endSourceUse([r.clone], { sink: a });
+    assert.equal(own.endedSlots.length, 1);
+    assert.equal((await slotOf(r.rt, r.clone))?.state, "ineligible");
+  });
+
+  it("a multi-path end reports only the paths this call ended; a kept sibling has no receipt", async (t) => {
+    const r = await rig(t);
+    const sink = new Set<string>();
+    await bindIn(r.rt, sink, r.clone);
+    await bindIn(r.rt, sink, r.other);
+    r.rt.retireSink(sink);
+    // A running destructive record on `other` keeps its end pending.
+    const settlement = await r.rt.withTransaction(() => r.rt.hooks.beginDestructive([r.other], "runner-uid-delete"));
+    const outcome = await r.rt.endSourceUse([r.clone, r.other], { sink });
+    assert.deepEqual(outcome.ended, [r.clone]);
+    assert.deepEqual(outcome.kept, [r.other]);
+    assert.deepEqual(outcome.endedSlots.map((e) => e.path), [r.clone], "only the ended path has a receipt");
+    assert.equal((await slotOf(r.rt, r.other))?.state, "active");
+    await r.rt.withTransaction(() => settlement.settle({ ok: true }));
   });
 
   it("a refused admission (a pending footprint) records no owner", async (t) => {

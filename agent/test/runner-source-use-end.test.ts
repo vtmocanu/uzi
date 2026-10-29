@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { acquireWorkerLifetime, AuthorityRefusal } from "../src/authority-lock.js";
+import { acquireWorkerLifetime, AuthorityRefusal, SourceUseHeldRefusal } from "../src/authority-lock.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { openAuthorityStore, type SlotSnapshot } from "../src/completion-authority.js";
 import { StubExecutor, type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
@@ -222,5 +222,125 @@ describe("the executor-launch gate", () => {
     const claim = gitlabClaim(340407);
     await runnerWith(stopAfterSeed(() => { started++; }), rawFakeGitlab({}).gitlab).execute(claim);
     assert.equal(started, 1);
+  });
+});
+
+// issue #3638 D2 — a flight's teardown retires its sink and latches, whichever way it returns, and only ever ends
+// the keys its own sink admitted. Driven through the runner's own endFlightSourceUse / publishFlightSource with a
+// scripted flight record, over the production AuthorityRuntime.
+describe("sink retirement and ownership at a flight's teardown", () => {
+  type Flight = {
+    worktreePath?: string; sourceUsePaths?: Set<string>; sourceTailsJoined?: boolean; sourceAdmissionRetired?: boolean;
+    sourceLease?: unknown; completionSourceBound?: unknown;
+  };
+  const internalsOf = (runner: unknown) => runner as {
+    endFlightSourceUse(flight: Flight, log: unknown): Promise<void>;
+    publishFlightSource(flight: Flight, bound: unknown, log: unknown): Promise<string>;
+    inFlightAuthority<T>(flight: Flight, fn: () => Promise<T>): Promise<T>;
+    bindFlightSource(flight: Flight, clonePath: string): Promise<void>;
+    admitPredecessorSource(flight: Flight, clonePath: string, wait: object): Promise<void>;
+  };
+  const isHeld = (e: unknown): boolean => e instanceof SourceUseHeldRefusal;
+
+  async function setup(iid: number) {
+    const r = await rig();
+    const bare = await git.ensureClone(fx.originPath);
+    const canonical = git.runnerClonePath(bare, `issue-${iid}`);
+    fs.mkdirSync(path.dirname(canonical), { recursive: true });
+    const runner = runnerWith(stopAfterSeed(), rawFakeGitlab({}).gitlab, undefined, undefined, { authority: r.rt });
+    return { r, canonical, internals: internalsOf(runner), log: nullLogger() };
+  }
+
+  for (const [name, flightOf] of [
+    ["not positively joined", (canonical: string, sink: Set<string>): Flight => ({ worktreePath: canonical, sourceUsePaths: sink, sourceTailsJoined: false })],
+    ["no path to end", (_canonical: string, sink: Set<string>): Flight => ({ sourceUsePaths: sink })],
+    ["joined", (canonical: string, sink: Set<string>): Flight => ({ worktreePath: canonical, sourceUsePaths: sink, sourceTailsJoined: true })],
+  ] as const) {
+    it(`teardown (${name}) retires the flight's sink and latches: a leftover callback is refused before any effect`, async () => {
+      const { r, canonical, internals, log } = await setup(364001);
+      const sink = new Set<string>();
+      const other = path.join(path.dirname(canonical), "issue-364002");
+      fs.mkdirSync(other, { recursive: true });
+      if (name !== "no path to end") await r.rt.recordAdmissions(sink, () => r.rt.bindSource(canonical));
+      const flight = flightOf(canonical, sink);
+      await internals.endFlightSourceUse(flight, log);
+      assert.equal(flight.sourceAdmissionRetired, true, "the latch is set on this return path");
+
+      const before = JSON.stringify(await slotOf(r.rt, canonical));
+      // The runtime-level callback a late git hook would make inside the flight's own sink.
+      await assert.rejects(r.rt.recordAdmissions(sink, () => r.rt.bindSource(other)), isHeld, "a late bind");
+      await assert.rejects(r.rt.recordAdmissions(sink, () => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(other, "seed-canonical"))), isHeld, "a late seed hook");
+      assert.equal(await slotOf(r.rt, other), null, "the other path was never admitted");
+      assert.equal(JSON.stringify(await slotOf(r.rt, canonical)), before, "the flight's own slot is untouched by the refusals");
+    });
+
+    it(`teardown (${name}) latches the flight: the runner's own admission seams refuse before running anything`, async () => {
+      const { r, canonical, internals, log } = await setup(364003);
+      const sink = new Set<string>();
+      const flight = flightOf(canonical, sink);
+      await internals.endFlightSourceUse(flight, log);
+      let ran = false;
+      await assert.rejects(async () => internals.inFlightAuthority(flight, async () => { ran = true; }), isHeld);
+      assert.equal(ran, false, "the wrapped operation never ran");
+      await assert.rejects(internals.bindFlightSource(flight, canonical), isHeld);
+      await assert.rejects(internals.admitPredecessorSource(flight, canonical, {}), isHeld);
+      assert.equal(await slotOf(r.rt, canonical), null, "nothing was admitted");
+    });
+  }
+
+  it("a flight that was refused a path another flight still owns cannot end or publish it", async () => {
+    const { r, canonical, internals, log } = await setup(364004);
+    const sinkA = new Set<string>();
+    const sinkB = new Set<string>();
+    const leaseA = await r.rt.recordAdmissions(sinkA, () => r.rt.bindSource(canonical));
+    r.rt.retireSink(sinkA);
+    const epoch = (await slotOf(r.rt, canonical))?.epoch;
+    // B (a retained-recovery flight refused with SourceUseHeldRefusal) still names the path as its worktree and
+    // its tails were joined, but its sink never admitted it.
+    const warnings: string[] = [];
+    const spy = Object.assign(nullLogger(), { warn: (message: string, fields?: Record<string, unknown>) => { warnings.push(message + " " + JSON.stringify(fields ?? {})); } });
+    const flightB: Flight = { worktreePath: canonical, sourceUsePaths: sinkB, sourceTailsJoined: true };
+    await internals.endFlightSourceUse(flightB, spy);
+    const slot = await slotOf(r.rt, canonical);
+    assert.equal(slot?.state, "active", "B's teardown did not end A's epoch");
+    assert.equal(slot?.epoch, epoch);
+    assert.equal(r.rt.heldByOtherSink(canonical, sinkB), true, "A is still the owner");
+    assert.equal(r.rt.heldByOtherSink(canonical, sinkA), false);
+
+    // Nor does B publish it, even with A's lease in hand.
+    const reasons: string[] = [];
+    const logger = Object.assign(nullLogger(), { warn: (_m: string, fields?: { reason?: string }) => { if (fields?.reason) reasons.push(fields.reason); } });
+    const outcome = await internals.publishFlightSource({ ...flightB, sourceLease: leaseA }, { clonePath: canonical }, logger);
+    assert.equal(outcome, "unpublished");
+    assert.deepEqual(reasons, ["another flight owns this source"]);
+    assert.equal((await slotOf(r.rt, canonical))?.state, "active");
+
+    // A's own teardown still ends it.
+    await internals.endFlightSourceUse({ worktreePath: canonical, sourceUsePaths: sinkA, sourceTailsJoined: true }, log);
+    assert.equal((await slotOf(r.rt, canonical))?.state, "ineligible");
+  });
+
+  it("a later run of the same issue whose canonical path an earlier unjoined flight still owns stops quietly", async () => {
+    const r = await rig();
+    const iid = 364005;
+    const bare = await git.ensureClone(fx.originPath);
+    const canonical = git.runnerClonePath(bare, `issue-${iid}`);
+    fs.mkdirSync(path.dirname(canonical), { recursive: true });
+    // Flight A of this issue (another run) ended with its tails unjoined: its sink is retired, the key stays owned.
+    const sinkA = new Set<string>();
+    await r.rt.recordAdmissions(sinkA, () => r.rt.bindSource(canonical));
+    r.rt.retireSink(sinkA);
+    const epoch = (await slotOf(r.rt, canonical))?.epoch;
+    let started = 0;
+    const claim = gitlabClaim(iid, { run_id: randomUUID() });
+    const runner = runnerWith(stopAfterSeed(() => { started++; }), rawFakeGitlab({}).gitlab, undefined, undefined, { authority: r.rt });
+    await runner.execute(claim);
+    assert.equal(started, 0, "no model work");
+    assert.equal(api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"), false, "no failed report");
+    assert.equal(api.states.some((s) => s.runId === claim.run_id && (s.body.status === "completed")), false);
+    const slot = await slotOf(r.rt, canonical);
+    assert.equal(slot?.state, "active", "A's epoch is untouched");
+    assert.equal(slot?.epoch, epoch);
+    assert.equal(r.rt.heldByOtherSink(canonical, new Set()), true, "A still owns the key");
   });
 });
