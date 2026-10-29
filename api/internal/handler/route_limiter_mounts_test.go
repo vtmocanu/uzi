@@ -922,6 +922,9 @@ var wantRouteMounts = []routeMount{
 	// PRD #1909 M4: the worker output-file upload, worker-authenticated and unlimited like the download above (bounded by the upload slots).
 	{"POST", "/api/worker/runs/{id}/files", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
+	// Bounded local lifecycle report, no forge/provider I/O; both actual router
+	// chains are also pinned by TestPolicyHoldRouteHasNoRateLimiter.
+	{"POST", "/api/worker/runs/{id}/policy-hold", noLimiter},
 	// Semantic planning uses worker authentication and claim-generation fences.
 	// Writes ride proposalLimiter.PerWorkerMiddleware; this per-USER table reads
 	// them as noLimiter. TestSemanticWorkerWritesUseWorkerLimiter proves their worker buckets.

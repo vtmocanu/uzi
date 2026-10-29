@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
+
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/capability"
@@ -16,7 +20,16 @@ import (
 // The real application router and worker middleware must reach the transaction.
 // Owner consent remains unavailable in this deliberately non-ready M1 slice.
 func TestPolicyHoldWorkerRouteLiveDB(t *testing.T) {
+	for _, name := range []string{"application", "worker"} {
+		t.Run(name, func(t *testing.T) { testPolicyHoldWorkerRoute(t, name) })
+	}
+}
+
+func testPolicyHoldWorkerRoute(t *testing.T, name string) {
 	h, router, pool := cliLiveDB(t)
+	if name == "worker" {
+		router = h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))
+	}
 	h.wsvc.SetTxBeginner(pool)
 	ctx := context.Background()
 	owner := cliSeedUser(t, pool, false)
@@ -68,9 +81,14 @@ func TestPolicyHoldWorkerRouteLiveDB(t *testing.T) {
 	if row.Status != "paused" || !row.PolicyPreserveRequired || row.PolicyRefusalCount != 1 || row.SessionID.String != "original-session" || row.ClaimReleasedAt.Valid {
 		t.Fatal("report/replay changed hold preservation")
 	}
-	bad := string(b[:len(b)-1]) + ",\"execution\":{}}"
-	if r := bearerReqBody(router, http.MethodPost, path, token, bad); r.Code != http.StatusBadRequest {
-		t.Fatalf("unknown field = %d", r.Code)
+	for name, bad := range map[string]string{
+		"unknown":  string(b[:len(b)-1]) + ",\"execution\":{}}",
+		"trailing": string(b) + " {}",
+		"overflow": string(b) + strings.Repeat(" ", 17*1024),
+	} {
+		if r := bearerReqBody(router, http.MethodPost, path, token, bad); r.Code != http.StatusBadRequest {
+			t.Fatalf("%s = %d: %s", name, r.Code, r.Body.String())
+		}
 	}
 	other := cliSeedUser(t, pool, false)
 	t.Cleanup(func() {

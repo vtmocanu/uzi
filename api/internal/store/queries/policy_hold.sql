@@ -6,7 +6,13 @@ WITH held AS (
             WHEN status IN ('awaiting_approval','awaiting_input')
             THEN GREATEST(0,EXTRACT(EPOCH FROM (now()-status_since))::int) ELSE 0 END,
         hold_reason='codex_policy_hold',
-        session_id=COALESCE(sqlc.narg('session_id')::text,session_id),
+        -- An existing constrained conversation can only be cleared by owner consent.
+        -- Empty/omitted preservation evidence never replaces an established identity.
+        session_id=COALESCE(
+            CASE WHEN policy_preserve_required OR policy_pending_fresh
+                OR (policy_outcome_id IS NOT NULL AND policy_resolved_at IS NULL)
+                THEN NULLIF(session_id,'') END,
+            NULLIF(sqlc.narg('session_id')::text,''),session_id),
         hold_captured_head=sqlc.narg('head')::text,
         checkpoint_contains_latest=sqlc.narg('checkpoint_contains_latest')::boolean,
         policy_hold_published= @published::boolean,

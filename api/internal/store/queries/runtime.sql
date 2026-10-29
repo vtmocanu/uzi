@@ -7831,8 +7831,6 @@ WITH candidates AS MATERIALIZED (
                                   AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL)) AND NOT cc.wait_credited), 0))))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
                   WHERE a.worker_id = @worker_id AND a.run_id = runs.id
-  AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
-  AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
                   WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
@@ -7910,8 +7908,6 @@ WITH candidates AS MATERIALIZED (
                                   AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL)) AND NOT cc.wait_credited), 0))))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
                   WHERE a.worker_id = @worker_id AND a.run_id = runs.id
-  AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
-  AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
                   WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id
@@ -7952,8 +7948,6 @@ WHERE runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
                                   AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL)) AND NOT cc.wait_credited), 0))))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
                   WHERE a.worker_id = @worker_id AND a.run_id = runs.id
-  AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
-  AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
                     AND a.claim_generation = runs.claim_generation)
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- D11 terminal-pending lease (worker-scoped, defense-in-depth)
                   WHERE a.worker_id = runs.worker_id AND a.run_id = runs.id

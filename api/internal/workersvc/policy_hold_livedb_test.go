@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/google/uuid"
@@ -136,5 +137,24 @@ func TestPolicyHoldAdmissionAndConversionLiveDB(t *testing.T) {
 	}
 	if row.PolicyRefusalCount != 0 || row.PolicyRefusalTag.Valid || row.PolicySourceGeneration.Int64 != 1 || row.PolicyApplyingGeneration.Int64 != 3 {
 		t.Fatalf("conversion fabricated refusal: %+v", row)
+	}
+	// A lost conversion ACK leaves the immutable generation-1 refused journal.
+	// Even after reassignment its applying worker may receive a receipt, without
+	// reopening the episode or changing the new worker's session/claim.
+	replacement := e.seedWorker(t, []string{capability.ProviderPolicyHoldV1})
+	e.exec(t, "UPDATE runs SET worker_id=$2,status='running',hold_reason=NULL,claim_generation=4,policy_resolved_at=now(),policy_preserve_required=false,session_id='replacement-session' WHERE id=$1", id, replacement)
+	before, err := e.q.GetRunByID(e.ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := policyHoldFixture()
+	original.OutcomeID = req.OutcomeID
+	got, err = svc.ReportPolicyHold(e.ctx, worker, id, original)
+	if err != nil || got.Disposition != "already_applied" || got.ObservedStatus != "running" || got.ObservedGeneration != 4 {
+		t.Fatalf("immutable journal after converted reassignment: %+v %v", got, err)
+	}
+	after, err := e.q.GetRunByID(e.ctx, id)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("receipt changed reassigned run: %v", err)
 	}
 }

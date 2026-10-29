@@ -142,8 +142,12 @@ func (s *Service) ReportPolicyHold(ctx context.Context, worker store.Worker, run
 	}
 	id, _ := uuid.Parse(req.OutcomeID)
 	currentOwned := r.WorkerID.Valid && uuid.UUID(r.WorkerID.Bytes) == worker.ID
+	// Conversion records the applying generation without rewriting the original
+	// journal. Either envelope may reconcile this exact outcome; only currentOwned
+	// can reach the mutation fences below.
 	recordedOwned := r.PolicyApplyingWorkerID.Valid && uuid.UUID(r.PolicyApplyingWorkerID.Bytes) == worker.ID &&
-		r.PolicyApplyingGeneration.Valid && r.PolicyApplyingGeneration.Int64 == req.ClaimGeneration &&
+		r.PolicyApplyingGeneration.Valid &&
+		(r.PolicyApplyingGeneration.Int64 == req.ClaimGeneration || req.ClaimGeneration == req.SourceGeneration) &&
 		r.PolicyOutcomeID.Valid && uuid.UUID(r.PolicyOutcomeID.Bytes) == id &&
 		r.PolicySourceGeneration.Valid && r.PolicySourceGeneration.Int64 == req.SourceGeneration
 	if !currentOwned && !recordedOwned {
