@@ -2,6 +2,21 @@ import { decodePolicyHoldReply, validatePolicyHoldRequest, type PolicyHoldReques
 import type { TerminalOutboxDeps } from "./terminal-resolve.js";
 import type { PendingTerminalJournal, ReportRetirementContext } from "./outbox.js";
 
+/** Closed DB status domain; malformed or incomplete reads never revoke conservative protection. */
+export function policyOwnershipGeneration(value: unknown): number | null | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) return undefined;
+  const proof = value as Record<string, unknown>;
+  if (!["status", "claim_generation", "claim_released"].every(key => Object.hasOwn(proof, key)) ||
+      !Number.isSafeInteger(proof.claim_generation) || (proof.claim_generation as number) <= 0 ||
+      typeof proof.claim_released !== "boolean" || typeof proof.status !== "string" ||
+      !["queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup",
+        "limit_wait", "pool_wait", "paused", "recovery_wait", "completed", "failed", "cancelled"].includes(proof.status))
+    return undefined;
+  return proof.claim_released === false && (proof.status === "claimed" || proof.status === "running")
+    ? proof.claim_generation as number : null;
+}
+
 /** Supplied only by a caller that independently verified this run's current claimed/running flight.
  * Boot/drain/sweep omit it. It grants no authority beyond the server's ownership fences. */
 export interface CurrentPolicyAuthority {

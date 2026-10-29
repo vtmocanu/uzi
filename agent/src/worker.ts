@@ -1,3 +1,4 @@
+import { policyOwnershipGeneration } from "./policy-resolve.js";
 import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates.js";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
@@ -643,6 +644,7 @@ export class Worker {
     if (typeof this.runner.protectRecoveryTerminalDeps === "function") deps = this.runner.protectRecoveryTerminalDeps(deps);
     for (const entry of outbox.listPendingTerminals()) {
       if (signal.aborted) return;
+      await this.observePolicyOwnership(entry);
       const gen = entry.claim_generation;
       const finalizes = this.captureFinalizes(entry.run_id, gen);
       try {
@@ -740,6 +742,7 @@ export class Worker {
     if (this.sweepingTerminals) return; // single-flight
     this.sweepingTerminals = true;
     try {
+      await this.runner.retryPolicyHandoffs?.();
       let deps = makeTerminalOutboxDeps(outbox, this.client, {
         gapFillMax: this.config.gapFillMax,
         terminalMaxBytes: this.config.outboxTerminalMaxBytes,
@@ -775,12 +778,13 @@ export class Worker {
   private async resolveLiveTerminal(
     outbox: Outbox,
     deps: NonNullable<ReturnType<typeof makeTerminalOutboxDeps>>,
-    entry: { run_id: string; claim_generation: number; blocked: boolean },
+    entry: { run_id: string; claim_generation: number; blocked: boolean; outcome_kind?: string },
     via: "sweep" | "drain",
     signal?: AbortSignal,
   ): Promise<void> {
     const runId = entry.run_id;
     const gen = entry.claim_generation;
+    await this.observePolicyOwnership(entry);
     if (entry.blocked) return;
     if (via === "sweep" && outbox.hasUndrainedMessages(runId)) return;
     if (outbox.isTerminalResolveHeld(runId, gen)) {
@@ -815,6 +819,16 @@ export class Worker {
         error: errMessage(err),
       });
     }
+  }
+
+  /** Lease evidence only: bind before HTTP so a late response cannot replace a newer claim. */
+  private async observePolicyOwnership(entry: { run_id: string; outcome_kind?: string }): Promise<void> {
+    if (entry.outcome_kind !== "policy_hold" && entry.outcome_kind !== "unknown") return;
+    const observe = this.activeRuns?.beginPolicyOwnershipObservation(entry.run_id);
+    try {
+      const generation = policyOwnershipGeneration(await this.client.getRunOwnership(entry.run_id));
+      if (generation !== undefined) observe?.(generation);
+    } catch { /* Unknown ownership keeps the conservative projection. */ }
   }
 
   /** Whether this process is executing `runId` (the registry when wired, else the runner's own

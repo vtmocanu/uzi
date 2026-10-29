@@ -1,3 +1,5 @@
+import { policyOwnershipGeneration, type CurrentPolicyAuthority } from "./policy-resolve.js";
+import { validatePolicyHoldRequest } from "./protocol.js";
 import { checkpointCoordinatesForClaim, type CheckpointCoordinates } from "./checkpoint-coordinates.js";
 import { prepareCIEvidence, validateCIRepairClaim, type PreparedCIEvidence } from "./ci-evidence.js";
 import { acceptsHeldCaptureCleanup, acceptsJoinedCaptureCleanup, settleHeldCaptureCleanup } from "./codex/safety.js";
@@ -1909,6 +1911,8 @@ export type ExecutorFactory = (runId: string, codex?: ClaimCodexSecrets) => RunE
  *    what routes a run to the fetch-back-and-requeue branch instead of today's failure.
  */
 interface ActiveRun {
+  readonly claimGeneration: number;
+  policyHandoff?: Readonly<import("./protocol.js").PolicyHoldRequest>;
   cancel: AbortController;
   steering: SteeringChannel;
   shuttingDown: boolean;
@@ -2148,6 +2152,7 @@ type ClaimCheckpointEvidence = Readonly<{ tip?: string; attestedSource?: string;
 interface RunFlight {
   /** Irrevocable local selection, independent of delivery ACK or source cleanup proof. */
   policyHold?: { readonly outcomeId: string; body?: Readonly<import("./protocol.js").PolicyHoldRequest> };
+  policyAdmission?: boolean;
   initialPlanningEligible?: boolean;
   readonly checkpointCoordinates?: CheckpointCoordinates;
   readonly checkpointClaimEvidence: ClaimCheckpointEvidence;
@@ -4284,7 +4289,9 @@ export class RunRunner {
     //     here instead (no report, no executeClaim): the run keeps its authoritative status, leased/listed
     //     for a later resolve or owner action. Only fall through to the probe once the drain actually
     //     cleared the pending terminal.
-    if (claimGen !== undefined && this.outbox && this.outbox.hasPendingTerminal(runId, claimGen)) {
+    if (claimGen !== undefined && this.outbox && this.outbox.hasPendingTerminal(runId, claimGen) &&
+        !this.outbox.listPendingTerminals().some(p => p.run_id === runId && p.claim_generation === claimGen &&
+          (p.outcome_kind === "policy_hold" || p.outcome_kind === "unknown"))) {
       this.log.info(QUEUED_DUPLICATE_END_LOG, {
         run_id: runId,
         reason: "a pending terminal outcome remains after the drain",
@@ -4365,9 +4372,9 @@ export class RunRunner {
    * local-retired, D11), letting a completion the previous attempt journaled land before the ownership
    * probe reads the run's status. No-op when no usable outbox is wired.
    */
-  private async resolveRunPendingTerminals(runId: string): Promise<void> {
+  private async resolveRunPendingTerminals(runId: string, currentPolicyAuthority?: CurrentPolicyAuthority): Promise<void> {
     const outbox = this.outbox;
-    if (!outbox || outbox.isDisabled()) return;
+    if (!outbox) return;
     const deps = this.terminalDeps();
     if (!deps) return;
     for (const entry of outbox.listPendingTerminals()) {
@@ -4376,6 +4383,7 @@ export class RunRunner {
       await resolvePendingTerminal(deps, {
         runId,
         claimGeneration: gen,
+        currentPolicyAuthority,
         // issue #1582 M2: the replayed ACK is applied to the settlement journal BEFORE the resolve
         // retires the outbox entry.
         send: async (body, sig) => {
@@ -4497,6 +4505,8 @@ export class RunRunner {
   private async executeClaimInAttempt(claim: ClaimResponse, onFlight: (flight: RunFlight) => void,
     ownMemory: (operation: Promise<void>) => void): Promise<void> {
     const runId = claim.run_id;
+    const admission = await this.preparePolicyAdmission(claim);
+    if (admission === false) return;
     // PRD #1171 M3 (redactor canary hoist): register the Codex access-token + capability
     // canaries with the logger BEFORE makeExecutor, so a construction error inside the
     // Codex executor factory can never log an unredacted token. Both are secrets; absent on
@@ -4542,6 +4552,13 @@ export class RunRunner {
       gitBasic,
       runScopedSecrets,
     );
+    if (admission) {
+      flight.policyAdmission = true;
+      flight.policyHold = { outcomeId: admission.outcome_id, body: admission };
+      flight.preserveRecoveryClone = true;
+      flight.preserveSession = true;
+      flight.keepGuardedInventoryOpen = true;
+    }
     onFlight(flight);
     const { runLog, batcher, reportState, steering } = flight;
     // PRD #1390 M2a: register this run in the active-run snapshot registry at `running`,
@@ -4609,6 +4626,10 @@ export class RunRunner {
       }
     };
     const dispatchFailure = async (failure: unknown, allowDiskDeferral = false): Promise<void> => {
+      if (flight.policyAdmission) {
+        await batcher.close().catch(() => undefined);
+        return;
+      }
       // Catch selection is not a stopped-source denial. Only supported routes below
       // can discharge this default; retainStoppedSource's denial is never cleared.
       const priorSourceExitDenied = flight.sourceExitDenied || flight.sourceDispatchDenied;
@@ -5407,6 +5428,17 @@ export class RunRunner {
       this.bindWorkerMemory(claim, flight);
       await this.phaseClone(claim, flight);
       executor = flight.executor;
+      if (flight.policyAdmission) {
+        if (!await this.provePolicyClaim(claim)) return;
+        await this.resolveRunPendingTerminals(runId, {
+          claimGeneration: flight.claimGeneration,
+          continuationMode: flight.effectiveAttemptPaths ? "fresh_from_saved_work" : "same_conversation",
+        });
+        // A void resolver return is not settlement proof; authenticate through EOF.
+        if (await this.outbox!.hasPendingPolicyOutcome(runId) || !await this.provePolicyClaim(claim)) return;
+        flight.policyHold = undefined;
+        flight.policyAdmission = false;
+      }
       const sessionId = await this.phaseResume(claim, flight);
       // PRD #1349 M2 (D1/D3): after clone/reseed and BEFORE model work, record this run's exact
       // claim generation into the durable journal (the restore point it starts from) and
@@ -5510,6 +5542,12 @@ export class RunRunner {
     } catch (err) {
       await dispatchFailure(err, true);
     } finally {
+      if (flight.policyHold) {
+        flight.preserveRecoveryClone = true;
+        flight.preserveSession = true;
+        flight.keepGuardedInventoryOpen = true;
+        this.snapshotRegistry?.markPolicyPendingOnly(runId, flight.claimGeneration);
+      }
       await flight.ciEvidence?.dispose().catch(() => runLog.warn("CI evidence reader disposal failed"));
       flight.ciEvidence = undefined;
       // #1539: AWAIT the permanent-failure hook's settlement BEFORE the Codex registry disposal
@@ -5596,9 +5634,12 @@ export class RunRunner {
       // PRD #218 M1: drop the shutdown-registry entry. A terminal run (or a parked one)
       // must not stay abortable — shutdown() iterating a stale entry would abort a
       // controller nobody is watching, and the map would leak an entry per run.
-      const policyHandoff = !flight.policyHold || this.outbox?.listPendingTerminals().some(p =>
-        p.run_id === runId && p.claim_generation === flight.claimGeneration) === true;
-      if (policyHandoff) this.activeRuns.delete(runId);
+      const selectedBody = flight.policyHold?.body;
+      const represented = selectedBody && await this.policyHandoffRepresented(runId, selectedBody);
+      const policyHandoff = !flight.policyHold || represented === true;
+      if (flight.policyHold && !policyHandoff && selectedBody && flight.active)
+        flight.active.policyHandoff = selectedBody;
+      if (policyHandoff && this.activeRuns.get(runId) === flight.active) this.activeRuns.delete(runId);
       // issue #3181: a flight whose retained credential switch could not prove its run processes
       // stopped joins the operations its executor still owns BEFORE the snapshot entry and the
       // execution tail release (the successor claim must not start next to them), and a confirmed
@@ -5609,7 +5650,7 @@ export class RunRunner {
       // no longer executing on this worker, so it must stop being listed in the snapshot. A
       // run parked at a gate (awaiting_approval/awaiting_input/awaiting_followup) never reaches
       // here (its execute promise stays live), so it stays listed in its held phase.
-      if (policyHandoff) this.snapshotRegistry?.remove(runId);
+      if (policyHandoff) this.snapshotRegistry?.remove(runId, flight.claimGeneration);
       // PRD #1391 M2: drop this run's re-arm registration. The batcher is closed by the
       // time we reach here, so a later drainer retire never needs to re-arm it; any
       // still-pending segments are drained and simply not re-armed (a no-op).
@@ -5940,7 +5981,9 @@ export class RunRunner {
         // reading disk pressure needs to connect the held dir to the shutdown interrupt
         // (a same-worker resume) rather than to a leak.
         runLog.info(
-          flight.completionHoldOutcome === "unresolved"
+          flight.policyHold
+            ? "policy outcome retained; preserving plugin dir and HOME independently of delivery"
+            : flight.completionHoldOutcome === "unresolved"
             ? "completion hold unresolved; preserving plugin dir and HOME for owner action"
             : flight.recoveryRetentionCause
               ? `${flight.recoveryRetentionCause}; preserving plugin dir and HOME for a same-worker resume`
@@ -6329,9 +6372,6 @@ export class RunRunner {
     await flight.batcher.close().catch(() => undefined);
     try {
       const installed = await deps.outbox.journalPolicyHold(flight.runId, body);
-      if (flight.steering.isCancelled()) {
-        await this.disposeCredentialFreeOwnerCancel(claim, flight);
-      }
       interrupted ||= flight.steering.claimFence() !== undefined || flight.steering.isCancelled() ||
         flight.cancel.signal.aborted || flight.steering.terminalLifecycleSignal().aborted ||
         flight.active?.shuttingDown === true || this.shuttingDownGlobal;
@@ -6347,11 +6387,85 @@ export class RunRunner {
     } catch {
       flight.runLog.warn("Policy hold delivery pending; work retained on this worker.");
     } finally {
+      if (flight.steering.isCancelled()) {
+        const disposition = await this.disposeCredentialFreeOwnerCancel(claim, flight);
+        flight.runLog.info("policy owner cancel custody disposition", { disposition });
+      }
       flight.preserveRecoveryClone = true;
       flight.preserveSession = true;
       flight.keepGuardedInventoryOpen = true;
     }
 
+  }
+
+  /** One retry per retained ActiveRun per existing sweep/claim invocation.
+   * Sibling failures are independent; only the exact original request transfers the pointer. */
+  async retryPolicyHandoffs(): Promise<void> {
+    if (!this.outbox) return;
+    for (const [runId, active] of this.activeRuns) {
+      const body = active.policyHandoff;
+      if (!body) continue;
+      try {
+        await this.outbox.journalPolicyHold(runId, body);
+        if (await this.policyHandoffRepresented(runId, body) &&
+            this.activeRuns.get(runId) === active && active.policyHandoff === body) {
+          this.activeRuns.delete(runId);
+          this.snapshotRegistry?.remove(runId, active.claimGeneration);
+        }
+      } catch { /* Retain the immutable pointer for the next existing sweep. */ }
+    }
+  }
+
+  private async policyHandoffRepresented(runId: string,
+    body: Readonly<import("./protocol.js").PolicyHoldRequest>): Promise<boolean> {
+    if (!this.outbox) return false;
+    try {
+      const captured = await this.outbox.readTerminalJournalForRetirement(runId, body.source_generation);
+      if (captured?.journal.outcome_kind !== "policy_hold") return false;
+      const original = validatePolicyHoldRequest(captured.journal.body);
+      if (Object.keys(original).length !== Object.keys(body).length ||
+          Object.entries(original).some(([key, value]) => body[key as keyof typeof body] !== value)) return false;
+      const current = await this.outbox.readTerminalJournalForRetirement(runId, body.source_generation);
+      return current?.context.expectedIdentity === captured.context.expectedIdentity;
+    } catch { return false; }
+  }
+
+  private async provePolicyClaim(claim: ClaimResponse): Promise<boolean> {
+    const observe = this.snapshotRegistry?.beginPolicyOwnershipObservation(claim.run_id);
+    try {
+      const generation = policyOwnershipGeneration(await this.client.getRunOwnership(claim.run_id));
+      if (generation !== undefined) observe?.(generation);
+      return generation !== null && generation !== undefined && generation === claim.claim_generation;
+    } catch { return false; }
+  }
+
+  private async preparePolicyAdmission(claim: ClaimResponse):
+    Promise<Readonly<import("./protocol.js").PolicyHoldRequest> | false | undefined> {
+    await this.retryPolicyHandoffs();
+    if (this.activeRuns.get(claim.run_id)?.policyHandoff) return false;
+    const outbox = this.outbox;
+    if (!outbox) return;
+    const hadPolicy = outbox.listPendingTerminals().some(p => p.run_id === claim.run_id && !p.server_settled &&
+      (p.outcome_kind === "policy_hold" || p.outcome_kind === "unknown"));
+    // Resolved history alone must not add an admission constraint to ordinary claims.
+    if (!await outbox.hasPendingPolicyOutcome(claim.run_id)) return;
+    await this.resolveRunPendingTerminals(claim.run_id);
+    if (!await outbox.hasPendingPolicyOutcome(claim.run_id))
+      return hadPolicy && await this.provePolicyClaim(claim) ? undefined : false;
+    let selected: Readonly<import("./protocol.js").PolicyHoldRequest> | undefined;
+    for (const entry of outbox.listPendingTerminals()) {
+      if (entry.run_id !== claim.run_id || entry.server_settled) continue;
+      if (entry.outcome_kind === "unknown") return false;
+      if (entry.outcome_kind !== "policy_hold") continue;
+      const journal = await outbox.readTerminalJournal(claim.run_id, entry.claim_generation);
+      if (journal?.outcome_kind !== "policy_hold") return false;
+      try {
+        const original = Object.freeze(validatePolicyHoldRequest(journal.body));
+        selected ??= original;
+      }
+      catch { return false; }
+    }
+    return selected ?? false;
   }
 
   private terminalDeps(): TerminalOutboxDeps | undefined {
@@ -11562,7 +11676,7 @@ export class RunRunner {
   private async phaseClone(claim: ClaimResponse, flight: RunFlight): Promise<void> {
     const { runLog, reportState, steering, batcher, cancel } = flight;
     const runId = claim.run_id;
-    const active: ActiveRun = (flight.active = { cancel, steering, shuttingDown: false, retainedLocalCustody: () => flight.retainedLocalCustody === true });
+    const active: ActiveRun = (flight.active = { claimGeneration: flight.claimGeneration, cancel, steering, shuttingDown: false, retainedLocalCustody: () => flight.retainedLocalCustody === true });
     this.activeRuns.set(runId, active);
     if (this.shuttingDownGlobal) {
       active.shuttingDown = true;

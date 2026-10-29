@@ -59,6 +59,8 @@ import {
 import { WorkerClient, RequestError, CodexRequestFailure } from "../src/client.js";
 import { ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
 import { RunRunner } from "../src/runner.js";
+import { Worker } from "../src/worker.js";
+import type { Config } from "../src/config.js";
 import { Outbox } from "../src/outbox.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { PolicyHoldRequest } from "../src/protocol.js";
@@ -3662,7 +3664,7 @@ describe("compact policy hold production producer", () => {
   const cases = [
     ...(["plan", "implement"] as const).flatMap(phase =>
       (["cyberPolicy", "misalignmentPolicyViolation"] as const).map(tag => ({ phase, tag, mode: "verified", kind: "issue" }))),
-    ...["degraded", "lost_ack", "journal_failure", "cancel", "worker_off", "server_off", "no_outbox", "no_snapshot", "long_session", "interactive", "invalid_generation", "metadata_failure"].map(mode =>
+    ...["degraded", "lost_ack", "journal_failure", "cancel", "worker_off", "server_off", "no_outbox", "no_snapshot", "long_session", "interactive", "invalid_generation", "metadata_failure", "metadata_cancel", "guarded_cancel", "home_retention"].map(mode =>
       ({ phase: "implement" as const, tag: "cyberPolicy" as const, mode, kind: "issue" })),
     ...["task", "prompt", "self_improve"].map(kind =>
       ({ phase: "plan" as const, tag: "cyberPolicy" as const, mode: "verified", kind })),
@@ -3694,28 +3696,35 @@ describe("compact policy hold production producer", () => {
           forwardCredentialFreeGitRoot(spec, deadline, await launch(spec, deadline)) };
       const client = new WorkerClient(url, "compact-policy-worker", "test", noopLog);
       api.setRegisterProtocolFeatures(mode === "server_off" ? ["claim_generation_fence"] :
-        ["provider_policy_hold_v1", "claim_generation_fence"]);
+        ["provider_policy_hold_v1", "claim_generation_fence",
+          ...(mode === "guarded_cancel" ? ["recovery_held_publication_v2"] : [])]);
       await client.register("compact-test", "base", 1, [], mode === "worker_off" ? [] :
-        ["provider_policy_hold_v1"], undefined, 0);
+        ["provider_policy_hold_v1", ...(mode === "guarded_cancel" ? ["recovery_held_publication_v2"] : [])], undefined, 0);
+      let ownerCancelInspections = 0;
+      let failJournal = mode === "journal_failure";
+      let failMetadata = mode === "metadata_failure" || mode === "metadata_cancel";
       const outbox = new Outbox({ root: path.join(fx.dataDir, "policy-outbox"), log: noopLog,
         runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000,
         rawWrite: async (write, context) => {
-          if (mode === "journal_failure" && context.kind === "terminal")
+          if (failJournal && context.kind === "terminal")
             throw Object.assign(new Error("fixture ENOSPC"), { code: "ENOSPC" });
           await write();
         } });
       await outbox.init();
       const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 10);
       const packets: PolicyHoldRequest[] = [];
+      let lateSessionReports = 0;
+      const reportState = client.reportState.bind(client);
+      client.reportState = async (...args) => {
+        if (args[1].session_id === "late-session-must-not-report") lateSessionReports++;
+        return reportState(...args);
+      };
       client.reportPolicyHold = async (runId, body) => {
         const journal = await outbox.readTerminalJournal(runId, body.source_generation);
         assert.equal(journal?.outcome_kind, "policy_hold", "journal exists before policy HTTP");
         assert.deepEqual(journal?.body, body);
-        const statesBefore = api.states.length;
         assert.ok(context?.onSessionId, "production session callback is installed");
         context.onSessionId("late-session-must-not-report");
-        await Promise.resolve();
-        assert.equal(api.states.length, statesBefore, "late ordinary session report is suppressed");
         packets.push(body);
         if (mode === "lost_ack") throw new Error("fixture lost ACK");
         return { disposition: "applied", outcome_id: body.outcome_id, source_generation: body.source_generation,
@@ -3730,9 +3739,17 @@ describe("compact policy hold production producer", () => {
         await fs.writeFile(path.join(worktree, "POLICY-WORK.txt"), "retained work\n");
         return run(ctx);
       };
-      if (mode === "metadata_failure") outbox.journalPolicyHold = async () => { throw new Error("fixture metadata unavailable"); };
+      const journalPolicy = outbox.journalPolicyHold.bind(outbox);
+      let selectedBody: PolicyHoldRequest | undefined;
+      outbox.journalPolicyHold = async (id, body) => {
+        selectedBody ??= structuredClone(body);
+        assert.deepEqual(body, selectedBody, "handoff retry keeps original UUID and content");
+        if (failMetadata) throw new Error("fixture metadata unavailable");
+        return journalPolicy(id, body);
+      };
       const claim = makeClaim({ claim_generation: mode === "invalid_generation" ? 0 : 7,
         interactive: mode === "interactive", kind: kind as ClaimResponse["kind"],
+        ...(mode === "guarded_cancel" ? { inventory_guarded: true } : {}),
         ...(kind === "task" ? { branch: "uzi/task/policy-fixture", issue_iid: null } : {}),
         repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
         ...(phase === "implement" ? { plan_approved: true, plan_source: "seeded", plan_md: "approved work" } : {}),
@@ -3741,11 +3758,17 @@ describe("compact policy hold production producer", () => {
         const seeded = spawnSync("git", ["-C", fx.originPath, "branch", claim.branch!], { env: gitEnv(), encoding: "utf8" });
         assert.equal(seeded.status, 0, seeded.stderr);
       }
+      const homeDir = mode === "home_retention" ? path.join(fx.dataDir, "policy-private-home") : undefined;
+      if (homeDir) {
+        await fs.mkdir(homeDir, { recursive: true });
+        await fs.writeFile(path.join(homeDir, "retained-session-evidence"), "session kept");
+      }
       try {
-        await new RunRunner(client, new GitCache(fx.dataDir, captureLog.logger, undefined, testGitCacheOptions()),
-          () => ({ executor }), captureLog.logger, 20, undefined, { pollMs: 5, outbox: mode === "no_outbox" ? undefined : outbox, activeRuns: mode === "no_snapshot" ? undefined : registry,
+        const runner = new RunRunner(client, new GitCache(fx.dataDir, captureLog.logger, undefined, testGitCacheOptions()),
+          () => ({ executor, ...(homeDir ? { homeDir } : {}) }), captureLog.logger, 20, undefined, { pollMs: 5, outbox: mode === "no_outbox" ? undefined : outbox, activeRuns: mode === "no_snapshot" ? undefined : registry,
             quiesceRun: async request => {
-              if (mode === "cancel" && request.site === "completion_hold") {
+              if (request.site === "owner_cancel_after_inspection") ownerCancelInspections++;
+              if (["cancel", "metadata_cancel", "guarded_cancel"].includes(mode) && request.site === "completion_hold") {
                 api.appendInputs(claim.run_id, [{ id: 1, kind: "cancel", body: null }]);
                 await waitFor(() => lifecycle?.aborted === true, "owner Cancel applied");
               }
@@ -3753,26 +3776,49 @@ describe("compact policy hold production producer", () => {
                 processes: [], killed: [], detail: "fixture proof" },
                 docker: { state: "not_wired", removed: [], detail: "not wired" } };
             },
-          }).execute(claim);
+          });
+        await runner.execute(claim);
+        assert.equal(lateSessionReports, 0, "late session callback never reaches client reportState boundary");
         const supported = !["worker_off", "server_off", "no_outbox", "no_snapshot", "interactive", "invalid_generation"].includes(mode);
-        assert.equal(packets.length, supported && !["journal_failure", "cancel", "metadata_failure"].includes(mode) ? 1 : 0,
+        assert.equal(packets.length, supported && !["journal_failure", "cancel", "metadata_failure", "metadata_cancel", "guarded_cancel"].includes(mode) ? 1 : 0,
           String(rec(captureLog.lines.filter(line => rec(line).level === "error").at(-1)).error ?? "no terminal diagnostic").slice(0, 240));
         assert.equal(rig.transport.turnStartCount, 1);
         assert.equal(await fs.readFile(path.join(worktree, "POLICY-WORK.txt"), "utf8"), "retained work\n");
+        if (homeDir) assert.equal(await fs.readFile(path.join(homeDir, "retained-session-evidence"), "utf8"), "session kept");
         if (!supported) {
           assert.equal(api.states.find(s => s.body.status === "failed")?.body.fail_origin, "provider_policy_refusal");
           return;
         }
         assert.ok(!api.states.some(s => ["failed", "completed"].includes(s.body.status ?? "")));
-        if (mode === "metadata_failure") {
-          assert.equal(registry.size, 1, "failed metadata admission retains original active snapshot");
-          assert.equal(registry.has(claim.run_id), true);
+        if (["cancel", "metadata_cancel", "guarded_cancel"].includes(mode)) {
+          const disposition = captureLog.lines.map(rec).find(line => line.msg === "policy owner cancel custody disposition");
+          assert.equal(disposition?.disposition, "retained", "independent cancellation custody decision retains source");
+        }
+        if (["metadata_failure", "metadata_cancel", "journal_failure"].includes(mode)) {
+          assert.equal(registry.has(claim.run_id), false, "closed execution never remains abortable");
+          assert.equal(registry.size, 1, "unpersisted original retains pending-only fallback");
+          assert.equal(registry.build().pending_overflow, true);
+          failMetadata = false;
+          failJournal = false;
+          // Use the production singleflight sweep: it must install the pointer before enumerating.
+          const worker = new Worker({ gapFillMax: 100, outboxTerminalMaxBytes: 1 << 20 } as Config,
+            client, runner, {} as never, {} as never, {} as never, captureLog.logger,
+            () => ({ ok: true, missing: [] }), outbox, new Map(), registry);
+          await (worker as unknown as { sweepPendingTerminals(): Promise<void> }).sweepPendingTerminals();
+          assert.equal(registry.size, 0, "exact durable original takes over the fallback");
+          assert.deepEqual((await outbox.readTerminalJournal(claim.run_id, 7))?.body, selectedBody);
+          assert.equal(packets.length, 1, "existing worker sweep delivers the original after install");
+          assert.equal(lateSessionReports, 0);
           return;
         }
-        if (mode === "journal_failure" || mode === "cancel") {
+        if (mode === "cancel" || mode === "guarded_cancel") {
+          if (mode === "guarded_cancel") {
+            assert.equal(client.hasHeldPublicationV2(), true);
+            assert.equal(ownerCancelInspections, 1, "guarded cancellation independently transfers and inspects source");
+          }
           assert.ok(outbox.hasPendingTerminal(claim.run_id, 7));
           assert.equal(outbox.listPendingTerminals()[0]?.server_settled, undefined);
-          assert.equal(registry.size, 0, "outbox metadata takes over before active snapshot removal");
+          assert.equal(registry.size, 0, "durable original takes over the fallback");
           return;
         }
         if (mode === "degraded") {
@@ -3794,6 +3840,7 @@ describe("compact policy hold production producer", () => {
         assert.equal(rig.transport.turnStartCount, 1);
         assert.ok(!api.states.some(s => ["failed", "completed"].includes(s.body.status ?? "")));
         assert.equal(await fs.readFile(path.join(worktree, "POLICY-WORK.txt"), "utf8"), "retained work\n");
+        if (homeDir) assert.equal(await fs.readFile(path.join(homeDir, "retained-session-evidence"), "utf8"), "session kept");
         assert.ok(!JSON.stringify(packets).includes("PRIVATE-PROVIDER-TEXT"));
         assert.equal(outbox.listPendingTerminals()[0]?.server_settled, mode === "lost_ack" ? undefined : true,
           "only a validated ACK settles delivery; source remains");

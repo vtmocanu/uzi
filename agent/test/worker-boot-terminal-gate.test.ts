@@ -7,6 +7,7 @@ import path from "node:path";
 
 import { Worker } from "../src/worker.js";
 import { Outbox } from "../src/outbox.js";
+import type { PolicyHoldRequest } from "../src/protocol.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { Config } from "../src/config.js";
 import type { WorkerClient } from "../src/client.js";
@@ -502,5 +503,80 @@ describe("Worker boot: the ancestry-settlement sweep starts only after the boot 
     const after = sweeps;
     await sleep(60);
     assert.equal(sweeps, after, "the sweep loop stops on abort");
+  });
+});
+
+describe("Worker policy ownership reconciliation", () => {
+  const body: PolicyHoldRequest = {
+    outcome_id: "11111111-1111-4111-8111-111111111111", source_generation: 1, claim_generation: 1,
+    detail: "refused", continuation_mode: "same_conversation", published: false,
+    tag: "cyberPolicy", phase: "implementation", correlation_id: "pr-" + "a".repeat(32) + "-1",
+  };
+  type Driver = {
+    resolveBootTerminals(signal: AbortSignal): Promise<void>;
+    resolveRunTerminal(runId: string): Promise<void>;
+    sweepPendingTerminals(): Promise<void>;
+  };
+  for (const via of ["boot", "drain", "sweep"] as const) {
+    for (const proof of [
+      { status: "running", claim_generation: 3, claim_released: false },
+      { status: "running", claim_generation: 3, claim_released: true },
+      { status: "paused", claim_generation: 3, claim_released: false },
+      { status: "running", claim_generation: 3 },
+      { status: "surprise", claim_generation: 3, claim_released: false },
+      { status: "running", claim_generation: 0, claim_released: false },
+      null,
+    ]) it(`${via} projects only positive unreleased ownership: ${JSON.stringify(proof)}`, async () => {
+      const outbox = await mkOutbox();
+      await outbox.journalPolicyHold(RUN, body);
+      const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 10);
+      registry.add(RUN, 1);
+      registry.markPolicyPendingOnly(RUN, 1);
+      let reports = 0;
+      const client = fakeClient();
+      client.getRunOwnership = async () => proof as never;
+      client.reportPolicyHold = async (_runId, request) => {
+        reports++;
+        assert.deepEqual(request, body, "worker never guesses current mode or converts original");
+        return { disposition: "pending", outcome_id: body.outcome_id, source_generation: 1 };
+      };
+      const worker = new Worker(fakeConfig(), client, idleRunner, idleChat, noJudge, noReview,
+        nullLogger(), okPreflight, outbox, new Map(), registry) as unknown as Driver;
+      if (via === "boot") await worker.resolveBootTerminals(new AbortController().signal);
+      else if (via === "drain") await worker.resolveRunTerminal(RUN);
+      else await worker.sweepPendingTerminals();
+      assert.equal(reports, 1, "pending-only execution must remain replayable");
+      const snapshot = registry.build();
+      const valid = proof?.status === "running" && proof.claim_generation === 3 && proof.claim_released === false;
+      const negative = proof?.claim_generation === 3 &&
+        (proof.claim_released === true || proof.status === "paused");
+      assert.deepEqual(snapshot.active.map(e => e.claim_generation), valid ? [3] : []);
+      assert.equal(snapshot.pending_overflow, !valid && !negative);
+      assert.deepEqual(snapshot.pending_all, [{ run_id: RUN, claim_generation: 1 }]);
+      assert.deepEqual((await outbox.readTerminalJournal(RUN, 1))?.body, body);
+    });
+  }
+
+  it("late G3 response cannot remove the G4 lease during a sweep", async () => {
+    const outbox = await mkOutbox();
+    await outbox.journalPolicyHold(RUN, body);
+    const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 10);
+    let entered!: () => void;
+    let finish!: (proof: unknown) => void;
+    const started = new Promise<void>(r => { entered = r; });
+    const response = new Promise<unknown>(r => { finish = r; });
+    const client = fakeClient();
+    client.getRunOwnership = async () => { entered(); return await response as never; };
+    client.reportPolicyHold = async () => ({ disposition: "pending", outcome_id: body.outcome_id, source_generation: 1 });
+    const worker = new Worker(fakeConfig(), client, idleRunner, idleChat, noJudge, noReview,
+      nullLogger(), okPreflight, outbox, new Map(), registry) as unknown as Driver;
+    const sweeping = worker.sweepPendingTerminals();
+    await started;
+    registry.add(RUN, 4);
+    registry.markPolicyPendingOnly(RUN, 4);
+    registry.notePolicyOwnership(RUN, 4);
+    finish({ status: "paused", claim_generation: 3, claim_released: true });
+    await sweeping;
+    assert.deepEqual(registry.build().active.map(e => e.claim_generation), [4]);
   });
 });
