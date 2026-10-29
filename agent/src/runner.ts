@@ -13421,9 +13421,9 @@ export class RunRunner {
             throw new StaleClaimError();
           if (flight.active?.shuttingDown || this.shuttingDownGlobal)
             throw new Error("worker shutdown during Codex operation admission");
-          try { revisionRecovery?.assertDispatchSource(source); }
+          try { revisionRecovery?.assertDispatchSource(source, kind === "root"); }
           catch (error) {
-            // assertDispatchSource can consume a replacement verdict. Preserve
+            // A lead check can consume a replacement verdict. Preserve
             // that control outcome when the admission catch rechecks currency.
             control.abort(error);
             throw error;
@@ -13437,7 +13437,7 @@ export class RunRunner {
         try {
           permit = await flight.operationAdmission.admit({ operation_id: randomUUID(), kind,
             ...(source ? { source } : {}) }, operationSignal, check,
-          async () => { await revisionRecovery?.proveDispatchSource(source, check); check(); });
+          async () => { await revisionRecovery?.proveDispatchSource(source, check, kind === "root"); check(); });
         } catch (error) {
           check();
           if (error instanceof CodexOperationAdmissionError) {

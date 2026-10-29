@@ -1170,7 +1170,10 @@ Elapsed waiting is charged once to the existing wall or whole-call deadline.
 The idle watchdog is disarmed before dispatch; waiting fabricates no model
 processing, progress or productivity and consumes/creates no owner recovery
 grant. Cancel, reject, replacement revision, pause, wall, vault and ownership
-routes remain effective; Resume grants no bypass. Capture/checkpoint, refresh
+routes remain effective; Resume grants no bypass. Only the lead consumes revision
+feedback and reject verdicts: child/advice source checks observe supersession
+without taking those controls, and the lead rechecks its source before accepting
+a completed turn's candidate. Capture/checkpoint, refresh
 needed for preservation, tool settlement, persistence and teardown are not
 gated. Children independently wait within deadlines including existing setup;
 there is no exemption, extension or parent-held permit. Notification reading

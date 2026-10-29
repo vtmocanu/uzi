@@ -111,14 +111,17 @@ export class PlanRevisionRecovery {
       revision_input_id: a.id } : undefined;
   }
 
-  assertDispatchSource(expected: CodexOperationSource | undefined): void {
+  // Non-lead callers may fail locally and swallow their exception. They must
+  // leave the verdict and active revision for the lead to consume.
+  assertDispatchSource(expected: CodexOperationSource | undefined, lead = true): void {
     const a = this.active;
     if (a) {
       this.deps.checkControl();
-      const verdict = this.deps.steering.takeRevisionRecoveryEvent(a.source.revision, a.id);
+      const verdict = this.deps.steering.takeRevisionRecoveryEvent(a.source.revision, a.id, lead);
       if (verdict?.kind === "cancel") throw new Error("run cancelled");
       if (verdict?.kind === "reject") throw new PlanRejectedError(verdict.reason, a.source.revision);
       if (verdict?.kind === "revise" && !verdict.automatic) {
+        if (!lead) throw new PlanRevisionRecoveryStoppedError("plan revision dispatch source changed");
         this.predecessors.push(a.id);
         this.accept(verdict);
         throw new PlanRevisionReplacedError(verdict);
@@ -129,12 +132,12 @@ export class PlanRevisionRecovery {
       throw new PlanRevisionRecoveryStoppedError("plan revision dispatch source changed");
   }
 
-  async proveDispatchSource(expected: CodexOperationSource | undefined, check: () => void): Promise<void> {
-    this.assertDispatchSource(expected);
+  async proveDispatchSource(expected: CodexOperationSource | undefined, check: () => void, lead = true): Promise<void> {
+    this.assertDispatchSource(expected, lead);
     const a = this.active;
     if (a) await this.confirmSource(a, false, () => { check(); return Infinity; }, true);
     check();
-    this.assertDispatchSource(expected);
+    this.assertDispatchSource(expected, lead);
   }
 
   /** Called before human revision turns and at fresh epoch admission fences.
@@ -323,7 +326,8 @@ export class PlanRevisionRecovery {
   private control(a: Active, dispatchProof = false): void {
     this.deps.checkControl(); // sticky cancel wins even over support loss or a queued reject
     if (!dispatchProof) this.deps.checkRecoverySupport?.();
-    const control = this.deps.steering.takeRevisionRecoveryControl(a.source.revision);
+    // Dispatch proofs only observe control; the lead assertion owns consumption.
+    const control = this.deps.steering.takeRevisionRecoveryControl(a.source.revision, !dispatchProof);
     if (control?.kind === "cancel") throw new Error("run cancelled");
     if (control?.kind === "reject") throw new PlanRejectedError(control.reason, a.source.revision);
   }

@@ -5741,6 +5741,10 @@ export class CodexExecutor implements Executor {
           : { original: new Error("codex run failed: unknown") };
         throw thrown.original;
       }
+      // A child/advice admission failure cannot carry owner feedback to this
+      // stack. Recheck the lead-owned source before accepting its candidate.
+      // Ignore permit expiry here: it gates the next send, not completed work.
+      sourceGuard?.();
       // (d) clean terminal / exhausted.
       const end: TurnStreamEnd = sawTerminal && terminal ? { kind: "terminal", terminal } : { kind: "exhausted" };
       result = reducer.finish(end).result;

@@ -1,3 +1,5 @@
+import { CodexDelegationRunner } from "../src/codex/delegation.js";
+import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
@@ -788,5 +790,87 @@ it("quarantine 503 keeps the real flight waiting until reconciliation without pr
     assert.equal(api.states.some(s => s.body.status === "failed" || s.body.status === "recovery_wait" || s.body.status === "paused"), false);
     send(claim.run_id, row("cancel"));
     await done;
+  } finally { r.shutdown(); await done; }
+});
+
+for (const kind of ["child", "advice"] as const) it(`replacement feedback remains lead-owned after ${kind} admission fails`, async t => {
+  enable();
+  const clock = new AdmissionClock();
+  const reads: CodexOperationRequest[] = [];
+  let ctx!: RunContext;
+  let publicationError: unknown;
+  let nonLeadResult: string | undefined;
+  let childStarts = 0;
+  const delegate = new CodexDelegationRunner({
+    registry: new ExecutionRegistry(newLocalExecutionEpoch(1)),
+    roles: new Map([["coder", { systemPrompt: "read-only child", grants: {
+      role: "coder", phase: "plan", isRoot: false, allowedTools: new Set<string>(), allowedSkills: new Set<string>(),
+    } }]]),
+    startChildTurn: async spec => {
+      const permit = await ctx.prepareCodexRootDispatch!(spec.signal, () => {}, "child");
+      permit(); childStarts++;
+      throw new Error("obsolete child must not dispatch");
+    },
+    spawnCommand: async () => { throw new Error("no command expected"); },
+    fileop: { op: async () => { throw new Error("no file operation expected"); } },
+    worktreePath: "/fixture", childTurnDeadlineMs: 10_000,
+  });
+  const fixture = providerFixture("codex", n => {
+    if (n === 2) {
+      const waitFor = kind === "child"
+        ? delegate.run({ tool: "spawn_agent", role: "coder", args: { prompt: "review" },
+          parent: { threadId: "th-revision", turnId: "tn-revision", callId: "revision-child" } })
+          .then(result => { nonLeadResult = result.code; })
+        : ctx.prepareCodexRootDispatch!(new AbortController().signal, () => {}, "advice")
+          .then(() => { nonLeadResult = "unexpected admit"; }, () => { nonLeadResult = "advice failed"; });
+      return { plan: "# obsolete revision", waitFor };
+    }
+    return { plan: n === 1 ? "# source" : "# latest revision" };
+  }, false, { subscription: true });
+  const execute = fixture.executor.run.bind(fixture.executor);
+  t.mock.method(fixture.executor, "run", (context: RunContext) => {
+    assert.ok(context.gatePlan);
+    const publish = context.gatePlan.bind(context);
+    ctx = { ...context, gatePlan: async (...args) => {
+      try { return await publish(...args); }
+      catch (error) { publicationError = error; throw error; }
+    } };
+    return execute(ctx);
+  });
+  t.mock.method(client, "checkCodexOperationAdmission", async (_id: string, request: CodexOperationRequest) => {
+    reads.push(structuredClone(request));
+    return request.kind !== "root" ? { ...request, decision: "wait", class: "overload",
+      episode_id: "00000000-0000-4000-8000-000000000091", server_now: new Date(0).toISOString(), eligible_at: new Date(1000).toISOString() }
+      : { decision: "admit", operation_id: request.operation_id, claim_generation: request.claim_generation };
+  });
+  const claim = freshClaim(7, { config: { plan_max_revisions: 2 },
+    secrets: { forge_pat: "fixture-forge-pat", codex: fixture.credential } });
+  const r = runner(fixture.executor, fakeGitlab().gitlab, undefined,
+    { codexOperationWaitPolicy: { now: () => clock.now, sleep: clock.sleep } });
+  let ended = false;
+  const done = r.execute(claim).finally(() => { ended = true; });
+  try {
+    assert.ok(await until(() => gates(claim.run_id).length === 1), JSON.stringify({ ended, starts: fixture.starts, states: api.states, messages: api.messages(claim.run_id).slice(-3) }));
+    const [old] = send(claim.run_id, row("revise_plan", "original revision feedback"));
+    assert.ok(await until(() => clock.sleepers.size === 1));
+    assert.equal(fixture.starts.length, 2, "lead is already running when the non-lead waits");
+    const [replacement] = send(claim.run_id, row("revise_plan", "replacement feedback unique"));
+    assert.ok(await until(() => nonLeadResult !== undefined));
+    assert.equal(nonLeadResult, kind === "child" ? "child_failed" : "advice failed");
+    assert.equal(childStarts, 0);
+    assert.ok(await until(() => ended || clock.sleepers.size === 1));
+    assert.equal(ended, false, `a swallowed non-lead error must not stop the lead revision: ${publicationError instanceof Error ? publicationError.message : "no publication error"}`);
+    clock.advance(15_000);
+    assert.ok(await until(() => ended || gates(claim.run_id).length === 2));
+    assert.equal(ended, false);
+    assert.equal(api.states.some(s => s.body.status === "failed"), false);
+    assert.equal(fixture.starts.length, 3);
+    assert.match(fixture.starts[2]!.prompt, /replacement feedback unique/);
+    assert.equal(gates(claim.run_id)[1]!.plan_md, "# latest revision");
+    assert.equal(gates(claim.run_id)[1]!.revision_input_id, replacement!.id);
+    assert.deepEqual(gates(claim.run_id)[1]!.superseded_revision_input_ids, [old!.id]);
+    assert.equal(api.isApplied(claim.run_id, replacement!.id), true);
+    assert.equal(reads.at(-1)!.source?.revision_input_id, replacement!.id);
+    send(claim.run_id, row("cancel")); await done;
   } finally { r.shutdown(); await done; }
 });

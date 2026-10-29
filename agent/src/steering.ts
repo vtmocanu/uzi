@@ -2230,7 +2230,8 @@ export class SteeringChannel {
       ? { ...verdict, sourceGateRevision: b.revision } : verdict;
   }
 
-  takeRevisionRecoveryEvent(sourceRevision: number, afterInputId: number): PlanVerdict | undefined {
+  /** Non-lead admission checks peek; only the lead consumes its verdict. */
+  takeRevisionRecoveryEvent(sourceRevision: number, afterInputId: number, consume = true): PlanVerdict | undefined {
     if (this.cancelled) return { kind: "cancel" };
     const index = this.reviseQueue.findIndex((r) => {
       const b = this.effectiveBinding(r.binding);
@@ -2238,11 +2239,14 @@ export class SteeringChannel {
         r.id !== undefined && Number.isSafeInteger(r.id) && r.id > afterInputId && !!r.feedback.trim();
     });
     if (index >= 0) {
-      const r = this.reviseQueue.splice(index, 1)[0]!;
-      this.confirmedGateRevision = undefined;
+      const r = this.reviseQueue[index]!;
+      if (consume) {
+        this.reviseQueue.splice(index, 1);
+        this.confirmedGateRevision = undefined;
+      }
       return { kind: "revise", feedback: r.feedback, inputId: r.id, sourceGateRevision: sourceRevision };
     }
-    return this.takeRevisionRecoveryControl(sourceRevision);
+    return this.takeRevisionRecoveryControl(sourceRevision, consume);
   }
 
   private readonly revisionDispatchObservers = new Set<() => void>();
@@ -2253,14 +2257,14 @@ export class SteeringChannel {
     return () => this.revisionDispatchObservers.delete(check);
   }
 
-  /** Backoff observes cancel/reject without taking a replacement before expiry. */
-  takeRevisionRecoveryControl(sourceRevision: number): PlanVerdict | undefined {
+  /** Backoff takes cancel/reject without a replacement; dispatch proofs only peek. */
+  takeRevisionRecoveryControl(sourceRevision: number, consume = true): PlanVerdict | undefined {
     if (this.cancelled) return { kind: "cancel" };
     const buffered = this.bufferedVerdict;
     if (buffered?.verdict.kind === "reject") {
       const b = this.effectiveBinding(buffered.binding);
       if (b.kind === "bound" && b.revision === sourceRevision) {
-        this.bufferedVerdict = undefined;
+        if (consume) this.bufferedVerdict = undefined;
         return { ...buffered.verdict, sourceGateRevision: sourceRevision };
       }
     }
