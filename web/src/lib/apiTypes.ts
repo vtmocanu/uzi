@@ -3064,6 +3064,21 @@ export interface SemanticDriftDTO {
 }
 
 export interface Run {
+  policy_hold?: {
+    preserve_required: boolean;
+    pending_fresh: boolean;
+    outcome_id: string;
+    continuation_mode: "same_conversation" | "fresh_from_saved_work";
+    resolved_at: string | null;
+    applying_worker_id: string | null;
+    applying_generation: number;
+    source_generation: number;
+    refusal_count: number;
+    policy_tag: "cyberPolicy" | "misalignmentPolicyViolation" | null;
+    phase: "planning" | "implementation" | null;
+    correlation_id: string | null;
+    published: boolean | null;
+  };
   capability_provenance?: {
     hints_known: boolean;
     inference_known: boolean;

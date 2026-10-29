@@ -4,7 +4,9 @@
 
 **Decision authority:** Owner-approved compact scope and attempt-path product choice, 2026-10-29. This replaces #3068's grant/delivery implementation, D15-D19 Stop override and former complete hold-v1 contract. For effective-attempt-path lanes, the owner chose consent once per refusal episode: after confirmed fresh-from-saved-work Resume, later claims behave as today until another refusal. For session-compatible lanes, the applied-refusal preserving constraint remains until terminal unless the run later enters an attempt path and the owner explicitly resolves that new fresh-from-saved-work episode. That resolution ends the earlier constraint for the remaining run until another refusal. It does not claim that an unapplied refusal is globally visible. Existing preservation, custody and unrelated security guarantees remain; ADR-2149 is unchanged.
 
-**Review status:** P0 is resolved by the owner decision above. Both independent architecture reviews requested revisions, with no BLOCK; their findings and the product decision are folded here. Final reviewer and lead/buddy approval are still required before filing/dispatch.
+**Review status:** P0 is resolved by the owner decision above. Both independent architecture reviews requested revisions, with no BLOCK; their findings and the product decision are folded here. Final architecture and lead/buddy reviews are complete; the implementation plan was approved at the run gate.
+
+**Implementation checkpoint:** Server-side foundation in progress; the complete worker capture/reconciliation and owner continuation contract is not delivered. The capability is not advertised as ready. Policy Stop and awaiting_approval revise-turn admission are explicitly omitted under the approved keep-or-drop decisions. Natural-refusal acceptance is tracked in [#3608](https://github.com/vtmocanu/uzi/issues/3608), and same-conversation Docker compatibility in [#3609](https://github.com/vtmocanu/uzi/issues/3609); neither is newly created by this run.
 
 ## Problem
 

@@ -324,6 +324,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// PRD #1809 M5: the disk-only lifetime counter of counted data_volume_full parks.
 		DiskParkCount: int(r.DiskParkCount),
 		// PRD #1733: the open provider-park streak (count, and when it began; null when none).
+		PolicyHold:                  policyHoldDTO(r),
 		ProviderParkCount:           int(r.ProviderParkCount),
 		ProviderParkStreakStartedAt: timePtr(r.ProviderParkStreakStartedAt.Valid, r.ProviderParkStreakStartedAt.Time),
 		// PRD #1809 M6 (D8): the latest park's checkpoint-durability report (absent = not reported).

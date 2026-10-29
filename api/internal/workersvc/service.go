@@ -4447,6 +4447,11 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err != nil {
 		return store.Run{}, false, err
 	}
+	// Compact policy episodes have no generic continuation authority. Cancel remains
+	// the ordinary terminal action; the dedicated report reconciles its own replay.
+	if activePolicyHold(owned) && req.State != "cancelled" {
+		return owned, false, nil
+	}
 	if err := validateCappedReportOnly(owned, req); err != nil {
 		return owned, false, err
 	}

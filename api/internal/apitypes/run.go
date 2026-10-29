@@ -205,6 +205,7 @@ type MemoryHoldDTO struct {
 
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
+	PolicyHold *PolicyHoldDTO `json:"policy_hold,omitempty"`
 	// Detail-only detector provenance; never approval authority or summary polling data.
 	CapabilityProvenance                           *CapabilityProvenance `json:"capability_provenance,omitempty"`
 	CompletionPending                              *CompletionPendingDTO `json:"completion_pending,omitempty"`
@@ -1099,6 +1100,7 @@ type CredentialEpochDTO struct {
 // RunDTO / RunListItemDTO source fields exactly; the nested value types are reused. There is
 // exactly one worker_name here, the list-level one (RunListItemDTO.WorkerName).
 type RunSummaryItemDTO struct {
+	PolicyHold     *PolicyHoldDTO     `json:"policy_hold,omitempty"`
 	WorkerRecovery *WorkerRecoveryDTO `json:"worker_recovery,omitempty"`
 	MemoryHold     *MemoryHoldDTO     `json:"memory_hold,omitempty"`
 
@@ -1909,6 +1911,7 @@ type RunSummaryItemDTO struct {
 // key-set test in run_summary_test.go fails until the field is placed here on purpose.
 func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 	return RunSummaryItemDTO{
+		PolicyHold:                    item.PolicyHold,
 		WorkerRecovery:                item.WorkerRecovery,
 		MemoryHold:                    item.MemoryHold,
 		ID:                            item.ID,
@@ -2082,6 +2085,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 	return RunListItemDTO{
 		RunDTO: RunDTO{
+			PolicyHold:                    s.PolicyHold,
 			WorkerRecovery:                s.WorkerRecovery,
 			MemoryHold:                    s.MemoryHold,
 			ID:                            s.ID,

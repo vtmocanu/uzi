@@ -1,4 +1,19 @@
 {
+  "policy_hold": {
+    "preserve_required": true,
+    "pending_fresh": true,
+    "outcome_id": "x",
+    "continuation_mode": "x",
+    "resolved_at": "2020-01-02T03:04:05Z",
+    "applying_worker_id": "x",
+    "applying_generation": 1,
+    "source_generation": 1,
+    "refusal_count": 1,
+    "policy_tag": "x",
+    "phase": "x",
+    "correlation_id": "x",
+    "published": true
+  },
   "capability_provenance": {
     "hints_known": true,
     "inference_known": true,
