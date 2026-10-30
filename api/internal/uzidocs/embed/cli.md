@@ -3244,8 +3244,8 @@ schedule pinned the model; a claimed run with nothing recorded reads `not
 recorded`. `--json` carries the full `lead_config` object. The values are
 worker-attested and display only; see [See which model a run
 used](./worker-model.md#see-which-model-a-run-used). The human view prints no
-`MODEL` or `EFFORT` row (`LEAD` and `LEAD_SOURCE` show a schedule-frozen model
-as "fixed by schedule"): read the model a schedule froze with `--field model`.
+`MODEL` or `EFFORT` row (`LEAD` shows a schedule-frozen model itself and
+`LEAD_SOURCE` labels it "fixed by schedule"): read the model a schedule froze with `--field model`.
 
 ### Lead model and effort history: `uzi run lead-config`
 
