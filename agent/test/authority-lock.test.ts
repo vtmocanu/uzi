@@ -7,7 +7,7 @@ import path from "node:path";
 import { mock, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import {
-  acquireWorkerLifetime, AuthorityRefusal, AuthorityTransaction, mkdirPrivate, WorkerLifetime, withAuthorityTransaction,
+  acquireWorkerLifetime, AuthorityLockBusy, AuthorityRefusal, AuthorityTransaction, mkdirPrivate, WorkerLifetime, withAuthorityTransaction,
 } from "../src/authority-lock.js";
 import { makeTmp, spawnWorkerLockHolder, testLockOptions, utilLinux } from "./authority-test-support.js";
 
@@ -201,6 +201,12 @@ test("A: aborting a queued caller frees its slot without disturbing the holder",
   assert.equal(await after, "after");
 });
 
+/** The typed acquisition timeout: still an AuthorityRefusal with the original message and name, so no log line changes. */
+function isBusy(error: unknown): boolean {
+  return error instanceof AuthorityLockBusy && error instanceof AuthorityRefusal &&
+    error.message === "authority lock timeout" && error.name === "AuthorityRefusal";
+}
+
 test("A: a second caller behind a stuck in-process holder fails at its own deadline and the queue stays usable", { timeout: 30_000 }, async (t) => {
   const { lifetime } = await lifetimeFor(t);
   let release!: () => void;
@@ -210,11 +216,23 @@ test("A: a second caller behind a stuck in-process holder fails at its own deadl
   const holder = withAuthorityTransaction(lifetime, {}, async () => { started(); await gate; return "held"; });
   await running;
   const began = performance.now();
-  await assert.rejects(withAuthorityTransaction(lifetime, { timeoutMs: 150 }, async () => "never"), /timeout/);
+  await assert.rejects(withAuthorityTransaction(lifetime, { timeoutMs: 150 }, async () => "never"), isBusy);
   assert.ok(performance.now() - began < 10_000, "failed at the deadline, not after the holder");
   release();
   assert.equal(await holder, "held");
   assert.equal(await withAuthorityTransaction(lifetime, { timeoutMs: 2000 }, async () => "after"), "after");
+});
+
+test("A: only the two timeout sites are AuthorityLockBusy; a corrupt lock inode and an abort are not", async (t) => {
+  const { root, lifetime } = await lifetimeFor(t);
+  fs.renameSync(lockFile(root), lockFile(root) + ".old");
+  fs.writeFileSync(lockFile(root), "", { mode: 0o600 });
+  await assert.rejects(withAuthorityTransaction(lifetime, {}, async () => undefined),
+    (error: unknown) => error instanceof AuthorityRefusal && !(error instanceof AuthorityLockBusy));
+  const controller = new AbortController();
+  controller.abort(new Error("cancelled"));
+  await assert.rejects(withAuthorityTransaction(lifetime, { signal: controller.signal }, async () => undefined),
+    (error: unknown) => !(error instanceof AuthorityLockBusy));
 });
 
 test("W: a worker.lock name that no longer matches the held inode refuses new transactions", async (t) => {
@@ -332,7 +350,7 @@ test("A: another process holding the authority lock blocks until a finite deadli
     external.once("error", reject);
     external.once("close", () => reject(new Error("locker exited early")));
   });
-  await assert.rejects(withAuthorityTransaction(lifetime, { timeoutMs: 250 }, async () => "no"), /timeout/);
+  await assert.rejects(withAuthorityTransaction(lifetime, { timeoutMs: 250 }, async () => "no"), isBusy);
   const blocked = withAuthorityTransaction(lifetime, { timeoutMs: 10_000 }, async () => "got it");
   external.stdin.end("go\n");
   assert.equal(await blocked, "got it");

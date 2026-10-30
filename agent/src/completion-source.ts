@@ -270,7 +270,7 @@ export function sourceFenceOf(source: CompletionSourceV2): CompletionSourceFence
 export function verifyCertifiedSource(tx: AuthorityTransaction, store: AuthorityStore, value: unknown): CompletionSourceV2 {
   const source = parseCompletionSourceV2(value, { dataDir: store.dataDir, storageId: store.storageId, layout: store.layout });
   if (!store.verifySourceCertificate(tx, sourceCoreDigest(source), source.certificate)) {
-    throw new AuthorityRefusal("completion source certificate does not verify");
+    throw new AuthorityRefusal("completion source certificate does not verify", "certificate_invalid");
   }
   return source;
 }

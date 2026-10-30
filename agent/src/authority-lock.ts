@@ -17,10 +17,30 @@ import { setTimeout as delay } from "node:timers/promises";
 // in-process by a keyed async mutex. The pod-epoch shared lock is unrelated to W.
 // st_dev/st_ino are compared in memory within one live acquisition and never persisted.
 
+/**
+ * A closed, typed reason some refusals carry so a caller never parses the message: the completion source's
+ * certificate does not verify, no authority slot covers it, the retiring slot is not this source's retirement,
+ * or an operation on the retiring source is unresolved.
+ */
+export type AuthorityRefusalKind = "certificate_invalid" | "no_slot" | "slot_mismatch" | "operation_unresolved";
+
 export class AuthorityRefusal extends Error {
-  constructor(message: string) {
+  readonly kind: AuthorityRefusalKind | undefined;
+  constructor(message: string, kind?: AuthorityRefusalKind) {
     super(message);
     this.name = "AuthorityRefusal";
+    this.kind = kind;
+  }
+}
+
+/**
+ * Acquiring A (in the in-process queue or on the cross-process flock) ran out its bounded wait. Still an
+ * {@link AuthorityRefusal} with the unchanged message and name, so every existing handler and log line is
+ * unaffected; it exists only so a caller can tell a busy A from a corrupt or unsupported one without parsing text.
+ */
+export class AuthorityLockBusy extends AuthorityRefusal {
+  constructor() {
+    super("authority lock timeout");
   }
 }
 
@@ -306,7 +326,7 @@ async function flockExclusive(ctx: Context, handle: fsp.FileHandle, timeoutMs: n
     if (wait <= 0) break;
     await delay(wait, undefined, { signal });
   }
-  throw new AuthorityRefusal("authority lock timeout");
+  throw new AuthorityLockBusy();
 }
 
 // ---- W: process-lifetime ownership ----------------------------------------------------
@@ -484,7 +504,7 @@ function waitFor(promise: Promise<void>, signal: AbortSignal | undefined, timeou
     if (signal?.aborted) { reject(signal.reason ?? new Error("aborted")); return; }
     const cleanup = (): void => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); };
     const onAbort = (): void => { cleanup(); reject(signal?.reason ?? new Error("aborted")); };
-    const timer = setTimeout(() => { cleanup(); reject(new AuthorityRefusal("authority lock timeout")); }, Math.max(1, timeoutMs));
+    const timer = setTimeout(() => { cleanup(); reject(new AuthorityLockBusy()); }, Math.max(1, timeoutMs));
     signal?.addEventListener("abort", onAbort, { once: true });
     void promise.then(() => { cleanup(); resolve(); });
   });

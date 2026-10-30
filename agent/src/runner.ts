@@ -121,7 +121,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type DurableCompletionRetirement, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
+import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type DurableCompletionRetirement, type RetainedBoundaryReason, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
@@ -196,6 +196,7 @@ import {
   type OrphanReason,
   CHECKPOINT_SCAN_TIMEOUT_MS,
   CapturePathMismatchError,
+  isCompletionSourceFenceError,
   CloneResidueBlockedError,
   ForeignCaptureBlockedError,
   PendingRecoveryCaptureError,
@@ -3821,7 +3822,13 @@ export class RunRunner {
       return classification.binding !== undefined && this.completionSourceProof(source, classification.binding);
     };
     // A known Codex source never falls through to legacy inspection without the live disposal witness.
-    if (!proof() || this.executionTails.has(ctx.runId) || process.platform !== "linux") return "retained";
+    // The observer only classifies a refusal for the coordinator; it grants nothing and its errors are swallowed.
+    const retain = (reason: RetainedBoundaryReason): "retained" => {
+      try { durable?.noteRetained?.(reason); } catch { /* deny-only observer */ }
+      return "retained";
+    };
+    if (process.platform !== "linux") return retain("unsupported_platform");
+    if (!proof() || this.executionTails.has(ctx.runId)) return retain("vetoed");
     let release!: () => void;
     const tail = new Promise<void>(resolve => { release = resolve; });
     this.executionTails.set(ctx.runId, tail);
@@ -3846,7 +3853,7 @@ export class RunRunner {
     };
     try {
       const inventory = await this.git.readInventoryCloneHeads(ctx.barePath, ctx.runId);
-      if (inventory.kind !== "verified" || !open()) return "retained";
+      if (inventory.kind !== "verified" || !open()) return retain("vetoed");
       const clone = inventory.clones.find(c => c.clonePath === source.clonePath);
       if (!clone) {
         // A resumed retirement's authenticated retiring record replaces the attempt-ledger/fence proof: the
@@ -3864,32 +3871,35 @@ export class RunRunner {
               durable.expectedFence, { ...processOpts, retiring: true })) ||
           (durable?.resumed === true && open() &&
             await this.git.completionSourceJournalAbsent(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId));
-        if (!retired || !open()) return "retained";
+        if (!retired || !open()) return retain("vetoed");
         await action(open, quiesceSkills);
         return "passed";
       }
-      if (clone.branch !== ctx.branch || clone.runId !== ctx.runId) return "retained";
+      if (clone.branch !== ctx.branch || clone.runId !== ctx.runId) return retain("identity_changed");
       const request = { mode: "capture" as const, attempt: undefined,
         cloneKey: cloneKeyOf(source.clonePath).cloneKey, targetPaths: [source.clonePath],
         processes: true, dockerHost: this.dockerHost, registry: this.liveAttempts,
         otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== ctx.runId),
         site: "completion_source" };
       const before = await this.quiesceImpl(request);
-      if (before.process?.state !== "quiescent" || !open()) return "retained";
-      if (await this.git.worktreeHead(source.clonePath) !== source.expectedHead || !open()) return "retained";
+      if (before.process?.state !== "quiescent") return retain("not_quiescent");
+      if (!open()) return retain("vetoed");
+      if (await this.git.worktreeHead(source.clonePath) !== source.expectedHead) return retain("identity_changed");
+      if (!open()) return retain("vetoed");
       const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "completion_source:after_git" });
-      if (after.process?.state !== "quiescent" || !open()) return "retained";
+      if (after.process?.state !== "quiescent") return retain("not_quiescent");
+      if (!open()) return retain("vetoed");
       await this.git.retireRunnerClone(ctx.barePath, source.clonePath, ctx.branch, ctx.runId, {
         discard: true, attemptId: source.attemptId, completionSource: { expectedHead: source.expectedHead, canDelete: open,
           ...(durable ? { expectedFence: durable.expectedFence, beforeDestroy: durable.enter } : {}) },
         ...(classification.kind === "knownCodex" ? { processProof: open } : {}),
       });
-      if (!open()) return "retained";
+      if (!open()) return retain("vetoed");
       await action(open, quiesceSkills);
       return "passed";
     } catch (err) {
       this.log.warn("recovery: completion source retained", { run_id: ctx.runId, error: errMessage(err) });
-      return "retained";
+      return retain(err instanceof CapturePathMismatchError || isCompletionSourceFenceError(err) ? "identity_changed" : "error");
     } finally {
       this.inventoryReservations.delete(ctx.runId);
       if (this.executionTails.get(ctx.runId) === tail) this.executionTails.delete(ctx.runId);
