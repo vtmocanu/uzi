@@ -7690,16 +7690,16 @@ export class RunRunner {
     }
   }
 
-  /** Single entry for a publication hop that stayed transiently unreachable after its retry schedule. Today
-   *  it rethrows, so the run fails as before but with the typed, stable `publication_forge_unreachable`
-   *  reason; a later change replaces the body with a park. Callers invoke it before any fallback arm. */
   /** Test seam: replaces the real backoff wait at the publication push and MR-create retries. */
   private forgeRetrySleep: ((ms: number) => Promise<void>) | undefined;
 
-  private async onPublicationForgeUnreachable(err: PublicationForgeUnreachableError): Promise<never> {
+  /** Single entry for a publication hop that stayed transiently unreachable after its retry schedule. Today
+   *  it rethrows, so the run fails as before but with the typed, stable `publication_forge_unreachable`
+   *  reason; a later change replaces the body with a park. Callers invoke it before any fallback arm. */
+  private async onPublicationForgeUnreachable(runId: string, err: PublicationForgeUnreachableError): Promise<never> {
     // rawDetail was already redacted and sanitized by publicationForgeUnreachable; never log other cause text.
     this.log.warn("publication forge unreachable after retries", {
-      surface: err.surface, step: err.step, raw_detail: err.rawDetail,
+      run_id: runId, surface: err.surface, step: err.step, raw_detail: err.rawDetail,
     });
     throw err;
   }
@@ -9939,7 +9939,7 @@ export class RunRunner {
         if (e instanceof PublicationContextRefusedSignal) await refusePrepush("context", e.head, null, e.reason);
         return;
       }
-      if (e instanceof PublicationForgeUnreachableError) await this.onPublicationForgeUnreachable(e);
+      if (e instanceof PublicationForgeUnreachableError) await this.onPublicationForgeUnreachable(claim.run_id, e);
       if (e instanceof ScratchPublicationError) throw e;
       // PRD #1416 M4 (SC3): a bridge that could not be built/validated at a finalize push site was
       // thrown as HistoryRewrittenError; type it history_rewritten — never the generic catch
@@ -10024,7 +10024,7 @@ export class RunRunner {
           return;
         }
         if (e instanceof RunResidueBlockedError) throw e;
-        if (e instanceof PublicationForgeUnreachableError) await this.onPublicationForgeUnreachable(e);
+        if (e instanceof PublicationForgeUnreachableError) await this.onPublicationForgeUnreachable(claim.run_id, e);
         if (await reportMovedBranchIfVerified(e)) return;
         if (e instanceof ScratchPublicationError) throw e;
         // PRD #974 M2 backstop: a GitHub Push Protection (GH013) rejection here means a secret
@@ -10396,7 +10396,7 @@ export class RunRunner {
       // Exhausted transient API failure only; a permanent rejection (401, 422, ...) rethrows unchanged.
       // A deadline/cancel abort surfaces as a transient-classified ForgeError(0) but stays permanent.
       if (!boundarySignal?.aborted && classifyForgeError(error) === "transient") {
-        await this.onPublicationForgeUnreachable(publicationForgeUnreachable(redactText, "api", "mr_create", error));
+        await this.onPublicationForgeUnreachable(claim.run_id, publicationForgeUnreachable(redactText, "api", "mr_create", error));
       }
       throw error;
     }

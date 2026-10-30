@@ -6,7 +6,8 @@ import assert from "node:assert/strict";
 import { StubExecutor, type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import { FORGE_RETRY_SCHEDULE, PublicationForgeUnreachableError } from "../src/forge-retry.js";
 import { RunRunner } from "../src/runner.js";
-import { api, client, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import type { Logger } from "../src/log.js";
+import { api, client, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith } from "./runner-harness.js";
 import { nullLogger } from "./helpers.js";
 
 // A transient forge outage that outlasts the whole retry schedule at a finalize publication hop must
@@ -25,11 +26,11 @@ function instantRetries(r: RunRunner): void {
 
 function hookRecorder(t: { mock: { method: (o: object, n: string, f: (...a: never[]) => unknown) => unknown } }, r: RunRunner): Hooked[] {
   const seen: Hooked[] = [];
-  const proto = Object.getPrototypeOf(r) as { onPublicationForgeUnreachable: (e: PublicationForgeUnreachableError) => Promise<never> };
+  const proto = Object.getPrototypeOf(r) as { onPublicationForgeUnreachable: (runId: string, e: PublicationForgeUnreachableError) => Promise<never> };
   const original = proto.onPublicationForgeUnreachable;
-  t.mock.method(r, "onPublicationForgeUnreachable", (async (e: PublicationForgeUnreachableError) => {
+  t.mock.method(r, "onPublicationForgeUnreachable", (async (runId: string, e: PublicationForgeUnreachableError) => {
     seen.push({ surface: e.surface, step: e.step, message: e.message, raw: e.rawDetail, code: e.code });
-    return original.call(r, e);
+    return original.call(r, runId, e);
   }) as never);
   return seen;
 }
@@ -161,6 +162,63 @@ it("a deadline abort during the last MR create attempt stays permanent and is no
   assert.ok(abort.signal.aborted);
   assert.equal(seen.length, 0, "an aborted publication is never typed as an outage");
   assert.doesNotMatch(failedReason(claim.run_id), /publication_forge_unreachable/);
+});
+
+it("a deadline abort during the last push attempt stays permanent and is not typed", async t => {
+  const claim = gitlabClaim(4108);
+  const abort = new AbortController();
+  const seam = git as unknown as Seam;
+  const real = seam.runGit.bind(git);
+  let pushes = 0;
+  seam.runGit = async (cwd, args, ...rest) => {
+    if (args[0] === "push") {
+      pushes++;
+      if (pushes === ATTEMPTS) abort.abort();
+      throw new Error("git push failed: fatal: unable to access: connection reset by peer");
+    }
+    return real(cwd, args, ...rest);
+  };
+  const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
+  instantRetries(r);
+  const original = (Object.getPrototypeOf(r) as { phasePublish: (...a: unknown[]) => Promise<void> }).phasePublish;
+  const mockMethod = t.mock.method.bind(t.mock) as unknown as (o: object, n: string, f: (...a: never[]) => unknown) => unknown;
+  mockMethod(r, "phasePublish", (async (c: unknown, f: unknown, _signal: unknown, ...rest: unknown[]) =>
+    original.call(r, c, f, abort.signal, ...rest)) as never);
+  const seen = hookRecorder(t, r);
+  await r.execute(claim);
+  assert.equal(pushes, ATTEMPTS);
+  assert.ok(abort.signal.aborted);
+  assert.equal(seen.length, 0, "an aborted push is never typed as an outage");
+  assert.doesNotMatch(failedReason(claim.run_id), /publication_forge_unreachable/);
+});
+
+it("the hook logs one warn carrying run id, surface, step and a redacted raw detail", async () => {
+  const claim = gitlabClaim(4109);
+  const secret = claim.secrets.forge_pat;
+  const seam = git as unknown as Seam;
+  const real = seam.runGit.bind(git);
+  seam.runGit = async (cwd, args, ...rest) => {
+    if (args[0] === "push") throw new Error(`git push failed: fatal: unable to access https://oauth2:${secret}@forge.test/x.git: connection reset by peer`);
+    return real(cwd, args, ...rest);
+  };
+  const warns: Array<{ msg: string; fields: Record<string, unknown> | undefined }> = [];
+  const base = nullLogger();
+  const log: Logger = {
+    ...base,
+    warn(msg: string, fields?: Record<string, unknown>) { warns.push({ msg, fields }); },
+    child() { return log; },
+  };
+  const r = runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), fakeGitlab().gitlab, undefined, log);
+  instantRetries(r);
+  await r.execute(claim);
+  const hits = warns.filter(w => w.msg === "publication forge unreachable after retries");
+  assert.equal(hits.length, 1);
+  const f = hits[0]!.fields!;
+  assert.equal(f.run_id, claim.run_id);
+  assert.equal(f.surface, "git");
+  assert.equal(f.step, "push");
+  assert.equal(typeof f.raw_detail, "string");
+  assert.ok(!String(f.raw_detail).includes(secret), "raw detail is redacted");
 });
 
 it("a permanent MR create rejection (401) is not retried and not typed", async t => {
