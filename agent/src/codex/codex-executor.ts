@@ -6817,8 +6817,6 @@ const DEFAULT_CACHE_MEASURE_MIN_INTERVAL_MS = 30 * 1000;
 /** One cache directory with its holder and the accounting of what still uses it. */
 interface CacheGeneration {
   readonly holder: CommandCacheHolder;
-  /** The adopted holder's ACTUAL close. Diagnostic only: it carries no cleanup judgment. */
-  holderClose?: Promise<CacheCleanupResult>;
   /** Reservations taken and neither launched nor cancelled. */
   reservations: number;
   openRoots: number;
@@ -6843,7 +6841,6 @@ interface CacheGeneration {
 /** The single replacement start in flight (or its latched failure). */
 interface StartupRecord {
   readonly token: string;
-  phase: "starting" | "adopted" | "abandoned" | "failed";
   /** The replacement helper's ACTUAL settlement, from `onSpawned`. */
   settlement?: Promise<CacheCleanupResult>;
 }
@@ -6883,8 +6880,9 @@ async function settlesWithinMs(p: Promise<unknown>, ms: number): Promise<boolean
  * its roots are disposed; an over-budget or unknown measurement marks it rotation-pending and a
  * replacement holder is started. The pending generation keeps admitting until the replacement
  * is READY and adopted, so a failed replacement never changes what commands see. The replaced
- * generation then retires finitely (release or remove) once its last reservation, root and
- * measurement helper are gone; if it cannot be proven drained it is left for the terminal settle.
+ * generation then retires (release or remove) once its last reservation, root and
+ * measurement helper are gone. A generation that stalls (release retained) or cannot be proven
+ * drained is not removed mid-run: it is deferred to the terminal settle.
  */
 export class HeldRunCommandCache implements RunCommandCache {
   private current: CacheGeneration;
@@ -6904,10 +6902,9 @@ export class HeldRunCommandCache implements RunCommandCache {
     this.current = this.newGeneration(holder);
   }
 
-  private newGeneration(holder: CommandCacheHolder, holderClose?: Promise<CacheCleanupResult>): CacheGeneration {
+  private newGeneration(holder: CommandCacheHolder): CacheGeneration {
     return {
       holder,
-      ...(holderClose === undefined ? {} : { holderClose }),
       reservations: 0,
       openRoots: 0,
       unclean: false,
@@ -7105,6 +7102,9 @@ export class HeldRunCommandCache implements RunCommandCache {
   /** Apply a result to the generation that was measured, and only while it still admits. */
   private measured(generation: CacheGeneration, result: CacheMeasureResult): void {
     const options = this.measuring;
+    // Defensive: one measurement is in flight per generation and a rotation-pending generation
+    // starts no new one, so a result can only reach the generation it measured; adoption also
+    // aborts the replaced generation's queued measurement. `admitting` still pins it to `current`.
     if (options === undefined || !this.admitting(generation)) return;
     if (result.state === "cancelled") return;
     const cache = generation.holder.token;
@@ -7134,18 +7134,24 @@ export class HeldRunCommandCache implements RunCommandCache {
     const generation = this.current;
     if (options === undefined || !generation.rotationPending || !this.admitting(generation)) return;
     if (!generation.holder.alive() || this.retiring !== undefined || this.startup !== undefined || this.replacementBlocked) return;
-    try { options.admitCapture(); } catch { return; }
-    const start = (): Promise<void> => this.startReplacement(generation, options);
+    // A refusal before anything was spawned clears the latch, so a later root disposal
+    // re-measures and retries. (A failed start that did spawn keeps `rotationPending`.)
+    try { options.admitCapture(); } catch { generation.rotationPending = false; return; }
+    let invoked = false;
+    const start = (): Promise<void> => {
+      invoked = true;
+      return this.startReplacement(generation, options);
+    };
     if (this.lifetime === undefined) {
       void start();
       return;
     }
     // Admitted work: a lifetime that has closed refuses without invoking, so nothing spawns.
-    this.lifetime.admit(start).catch(() => undefined);
+    this.lifetime.admit(start).catch(() => { if (!invoked) generation.rotationPending = false; });
   }
 
   private async startReplacement(generation: CacheGeneration, options: CacheRotationOptions): Promise<void> {
-    const record: StartupRecord = { token: randomUUID(), phase: "starting" };
+    const record: StartupRecord = { token: randomUUID() };
     this.startup = record;
     let holder: CommandCacheHolder;
     try {
@@ -7157,7 +7163,9 @@ export class HeldRunCommandCache implements RunCommandCache {
         },
       });
     } catch (error) {
-      record.phase = "failed";
+      // Latch the failed start. Defensive: `rotationPending` also stays set for this generation,
+      // so nothing re-calls `tryRotate` for it; the latch only guards a later generation or a
+      // future caller from starting a second replacement after a spawned failure.
       this.replacementBlocked = true;
       this.startup = undefined;
       const settlement = record.settlement ?? (error instanceof CommandCacheStartError ? error.settlement : undefined);
@@ -7170,10 +7178,9 @@ export class HeldRunCommandCache implements RunCommandCache {
     // Adoption is one synchronous decision over the state as it is NOW.
     if (!this.terminal && this.settling === undefined && (this.lifetime?.isOpen() ?? true)
       && this.current === generation && !generation.closed && generation.holder.alive()) {
-      const next = this.newGeneration(holder, record.settlement);
+      const next = this.newGeneration(holder);
       generation.closed = true;
       generation.queuedAbort?.abort();
-      record.phase = "adopted";
       this.current = next;
       this.retiring = generation;
       this.startup = undefined;
@@ -7182,7 +7189,6 @@ export class HeldRunCommandCache implements RunCommandCache {
       return;
     }
     // Ready too late to be used: release the never-used holder and judge ITS cleanup.
-    record.phase = "abandoned";
     options.log.warn("codex command cache replacement abandoned", { cache: generation.holder.token, replacement: record.token });
     let released: CacheCleanupResult;
     try {
@@ -7314,8 +7320,9 @@ export class HeldRunCommandCache implements RunCommandCache {
       const measurement = generation.inFlight;
       if (measurement !== undefined && !await settlesWithinMs(measurement, waits.releaseMs)) {
         log.warn("codex command cache measurement helper unresolved at settle; cleanup chained after its close", { cache: token });
-        // Chained after the helper's actual close and owned by the lifetime (no deadline).
-        this.lifetime?.retain(measurement.then(() => this.settleGeneration(generation, log, remove, waits)));
+        // Chained after the helper's actual close; owned by the lifetime (no deadline) when there is one.
+        const chained = measurement.then(() => this.settleGeneration(generation, log, remove, waits));
+        this.lifetime?.retain(chained);
         return;
       }
       // Compute BEFORE anything else can change the picture: no launch can start past this point.

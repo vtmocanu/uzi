@@ -428,12 +428,10 @@ export interface TmpCleanupEvidence {
  *  non-empty words Go `safetree.Reason` returns (a test holds the two sets
  *  equal). "deadline" is a removal that ran out of the drain's deadline (the
  *  dispose's op deadline, or the abnormal drain's default) and kept its partial
- *  progress. A removed tmp always reports "". "entries", "depth" and "bytes" are the
- *  bounded-walk limits of the read-only `--measure-cache` walk (issue #3675), which share
- *  `safetree.Reason`; no cleanup walk reports them, but the set stays equal to Go's. */
-export const TMP_RETAINED_REASONS: ReadonlySet<string> = new Set([
-  "mismatch", "owner", "deadline", "io", "absent", "name", "entries", "depth", "bytes",
-]);
+ *  progress. A removed tmp always reports "". The measure-only words "entries", "depth"
+ *  and "bytes" (the bounded-walk limits of `--measure-cache`, issue #3675) are deliberately
+ *  absent: no cleanup walk reports them, so the cleanup, hold and remove parsers reject them. */
+export const TMP_RETAINED_REASONS: ReadonlySet<string> = new Set(["mismatch", "owner", "deadline", "io", "absent", "name"]);
 
 /** Strict meaning check for the optional `tmpCleanup` evidence field: an object
  *  with exactly `state` and `reason`, where `removed` pairs only with reason ""
@@ -2651,7 +2649,9 @@ export async function startCommandCacheHolder(token: string, deps: StartHolderDe
     endStdin();
     notify();
     // No pid: the process never started, so no `close` will come and nothing is running.
-    if (child.pid === undefined) settleHolder({ state: "error", reason: "spawn" });
+    // Nothing was created, so the settlement is `absent` (a cleanup the lifetime does not
+    // distrust), like an initial-start spawn failure.
+    if (child.pid === undefined) settleHolder({ state: "absent", reason: "" });
   });
   child.once("exit", () => {
     exitedFlag = true;
@@ -2757,7 +2757,7 @@ export type CacheMeasureResult =
   | { readonly state: "unknown"; readonly reason: string; readonly settlement?: Promise<void> }
   | { readonly state: "cancelled" };
 
-/** The measurement gets its own delivery bound; the helper is never killed past it. */
+/** The measurement gets its own delivery bound; a helper past it is killed as the command uid. */
 const DEFAULT_MEASURE_TIMEOUT_MS = 30 * 1000;
 const MEASURE_INCOMPLETE_REASONS: ReadonlySet<string> = new Set([
   "absent", "entries", "depth", "deadline", "mismatch", "owner", "io", "bytes",
@@ -2841,8 +2841,11 @@ function parseMeasureLine(line: string, code: number | null): CacheMeasureResult
  * Measure one run's command cache, read-only, as the command uid (`--measure-cache`).
  *
  * Requests queue FIFO on a worker-wide concurrency-1 limiter and the slot is held from the
- * spawn until the helper's ACTUAL close, not the delivery timeout: a helper that never closes
- * holds the slot (no further measurement) rather than being killed. An abort while queued is
+ * spawn until the helper's ACTUAL close, not the delivery timeout. A same-uid model command can
+ * SIGSTOP the helper, so at the delivery timeout (or an abort after the spawn) the helper is
+ * SIGKILLed as the command uid (`killAsCommandUid`, as the reaper is); SIGKILL works on a stopped
+ * process, so its close follows and only then is the slot freed. A kill that is not delivered
+ * leaves the slot held (reason `timeout_unkilled` / `aborted_unkilled`). An abort while queued is
  * `cancelled` and spawns nothing; a delivery timeout or an abort after the spawn is `unknown`
  * carrying a `settlement` that resolves at the helper's close. Only an exact complete line with
  * exit 0 is `complete`; everything else is `unknown`. Never throws.
@@ -2861,10 +2864,17 @@ export async function measureCommandCache(token: string, deps: MeasureDeps = {})
     if (run.kind === "timeout" || run.kind === "aborted") {
       // Aborted with nothing spawned (no completion): a clean cancel.
       if (run.kind === "aborted" && run.completion === undefined) return { state: "cancelled" };
-      // The helper may still run: keep the slot until it closes.
+      // The helper may still run (or be stopped): kill it as the command uid, and keep the
+      // slot until it actually closes.
       held = false;
       const settlement = run.closed.then(release, release);
-      return { state: "unknown", reason: run.kind === "timeout" ? "timeout" : "aborted", settlement };
+      let killed = false;
+      if (run.pid !== undefined) {
+        const kill = deps.killAsCommandUid ?? ((pid: number) => defaultKillAsCommandUid(pid, deps.runKill ?? defaultRunKill));
+        try { killed = kill(run.pid) === true; } catch { killed = false; }
+      }
+      const base = run.kind === "timeout" ? "timeout" : "aborted";
+      return { state: "unknown", reason: killed ? base : `${base}_unkilled`, settlement };
     }
     if (run.breach !== undefined || run.line === undefined) return { state: "unknown", reason: "protocol" };
     return parseMeasureLine(run.line, run.code);

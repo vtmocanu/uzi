@@ -6,6 +6,7 @@ import { PassThrough } from "node:stream";
 
 import {
   HeldRunCommandCache,
+  boundaryProcessSpawnerForTest,
   makeDefaultSpawnCommand,
   type CacheRotationOptions,
 } from "../src/codex/codex-executor.js";
@@ -119,13 +120,12 @@ interface StartCall {
 
 function rig(config: {
   budget?: number;
-  withLifetime?: boolean;
   minIntervalMs?: number;
   holderResult?: () => Promise<CacheCleanupResult> | CacheCleanupResult;
   registry?: ExecutionRegistry;
 } = {}) {
   const g1 = fakeHolder(config.holderResult);
-  const lifetime = config.withLifetime === false ? undefined : new ExecutorLifetime();
+  const lifetime = new ExecutorLifetime();
   const measures: MeasureCall[] = [];
   const starts: StartCall[] = [];
   const removals: string[] = [];
@@ -166,7 +166,7 @@ function rig(config: {
     warn: (msg: string) => { lines.push(`warn:${msg}`); },
   };
   const settle = (): Promise<void> => cache.settle(settleLog, async (token) => { removals.push(token); return REMOVED; }, WAITS);
-  const seal = () => lifetime!.seal({}, settle, () => true);
+  const seal = () => lifetime.seal({}, settle, () => true);
   return { cache, g1, lifetime, measures, starts, removals, lines, clock, capture, options, settle, seal };
 }
 
@@ -341,12 +341,67 @@ describe("command cache rotation (issue #3675)", () => {
       await flushMany();
       assert.equal(r.starts.length, 2, "G2's close is still unresolved and does not block G3");
       const g3 = fakeHolder();
-      r.starts[1]!.ready(g3, deferred<CacheCleanupResult>().promise);
+      r.starts[1]!.ready(g3, Promise.resolve(REMOVED));
       await flushMany();
       assert.equal(await runRoot(r.cache), g3.dir);
-      // Resolve G2's close with a verdict that WOULD distrust if it were judged: it is not.
+      // Resolve G2's close with a verdict that WOULD distrust if it were judged: it is only joined.
       g2Close.resolve({ state: "retained", reason: "unattested" });
+      await flushMany();
       assert.deepEqual(g2.releases, [true]);
+      assert.equal((await r.seal()).kind, "sealed", "a joined (not judged) adopted close does not distrust the seal");
+    });
+
+    it("a capture-admission refusal before any start clears the latch: a later root disposal re-measures and rotates", async () => {
+      const r = rig();
+      await runRoot(r.cache);
+      r.capture.closed = true;
+      r.measures[0]!.resolve(OVER);
+      await flushMany();
+      assert.equal(r.starts.length, 0, "admission refused before anything was spawned");
+      r.capture.closed = false;
+      assert.equal(await runRoot(r.cache), r.g1.dir, "the pending generation still admits");
+      assert.equal(r.measures.length, 2, "the next root disposal measures again");
+      r.measures[1]!.resolve(OVER);
+      await flushMany();
+      assert.equal(r.starts.length, 1);
+      const g2 = fakeHolder();
+      r.starts[0]!.ready(g2, Promise.resolve(REMOVED));
+      await flushMany();
+      assert.equal(await runRoot(r.cache), g2.dir, "the replacement was adopted");
+      assert.deepEqual(r.g1.releases, [true]);
+    });
+
+    it("a failed replacement start that created no process keeps the seal provable and the latch", async () => {
+      const r = rig();
+      await runRoot(r.cache);
+      r.measures[0]!.resolve(OVER);
+      await flushMany();
+      // The holder never spawned: the launcher settles that as `absent`.
+      const none = Promise.resolve<CacheCleanupResult>({ state: "absent", reason: "" });
+      r.starts[0]!.opts.onSpawned(none);
+      r.starts[0]!.fail(new CommandCacheStartError("spawn", none));
+      await flushMany();
+      assert.ok(r.lines.includes("warn:codex command cache replacement failed; rotation blocked"));
+      assert.equal(await runRoot(r.cache), r.g1.dir);
+      r.measures.at(-1)!.resolve(OVER);
+      await flushMany();
+      assert.equal(r.starts.length, 1, "the failed start is not retried");
+      assert.equal((await r.seal()).kind, "sealed");
+    });
+
+    it("settling with no executor lifetime still chains the release after an unresolved measurement helper's close", async () => {
+      const r = rig();
+      const cache = new HeldRunCommandCache(r.g1.holder, undefined, undefined, r.options);
+      await runRoot(cache);
+      const helperClose = deferred<void>();
+      r.measures[0]!.resolve({ state: "unknown", reason: "timeout", settlement: helperClose.promise });
+      await flushMany();
+      r.starts[0]!.fail(new CommandCacheStartError("timeout"));
+      await cache.settle({ info: () => undefined, warn: () => undefined }, async () => REMOVED, WAITS);
+      assert.deepEqual(r.g1.releases, [], "nothing is released while the helper may still read the directory");
+      helperClose.resolve();
+      await until(() => r.g1.releases.length === 1, "the chained release");
+      assert.deepEqual(r.g1.releases, [true]);
     });
 
     it("a replacement that is ready after the run began settling is abandoned, released and judged by its own close", async () => {
@@ -567,6 +622,20 @@ describe("command cache rotation (issue #3675)", () => {
       assert.equal(cache.drained(), true, "the reservation was cancelled, nothing became unclean");
       await cache.settle({ info() {}, warn() {} }, async () => REMOVED, WAITS);
       assert.deepEqual(g.releases, [true]);
+    });
+
+    it("a command-identity boundary spawn whose spec fails to build before the launch releases its reservation", async () => {
+      const r = rig();
+      const env: NodeJS.ProcessEnv = {};
+      Object.defineProperty(env, "UZI_UNREADABLE", { enumerable: true, get: () => { throw new Error("env unreadable"); } });
+      let launched = 0;
+      const spawner = boundaryProcessSpawnerForTest("required", async () => { launched++; throw new Error("unused"); }, undefined, r.cache);
+      await assert.rejects(
+        spawner({ argv: ["/usr/bin/git", "status"], cwd: "/data/runner/x", env, identity: "command" }, 1000),
+        /env unreadable/,
+      );
+      assert.equal(launched, 0, "the real launch was never invoked");
+      assert.equal(r.cache.drained(), true, "the reservation was cancelled, so the generation is not pinned");
     });
 
     it("launch is usable once; cancel is idempotent, releases, and is a no-op after the launch ran", async () => {

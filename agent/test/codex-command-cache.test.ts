@@ -733,7 +733,7 @@ describe("startCommandCacheHolder settlement (issue #3675)", () => {
       .then(() => undefined, (e: unknown) => e);
     assert.ok(error instanceof CommandCacheStartError);
     assert.equal(error.reason, "spawn");
-    assert.deepEqual(await error.settlement, { state: "error", reason: "spawn" });
+    assert.deepEqual(await error.settlement, { state: "absent", reason: "" }, "nothing was created: absent, which the lifetime does not distrust");
   });
 
   it("a spawn that throws announces nothing and carries no settlement", async () => {
@@ -827,23 +827,32 @@ describe("measureCommandCache (issue #3675)", () => {
     assert.equal((await measureCommandCache(TOKEN, { spawn: ok.spawn, limiter })).state, "complete");
   });
 
-  it("a delivery timeout is unknown with a settlement that resolves only at the helper's close; never killed", async () => {
+  /** A kill that is recorded; `deliver` false simulates a kill that was not delivered. */
+  const killRecorder = (deliver = true): { kill: (pid: number) => boolean; pids: number[] } => {
+    const pids: number[] = [];
+    return { pids, kill: (pid) => { pids.push(pid); return deliver; } };
+  };
+
+  it("a delivery timeout kills the helper as the command uid; the settlement still resolves only at its close", async () => {
     const f = fakeSpawn();
-    const result = await measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 15, limiter: createMeasureLimiter() });
+    const k = killRecorder();
+    const result = await measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 15, limiter: createMeasureLimiter(), killAsCommandUid: k.kill });
     assert.equal(result.state, "unknown");
     if (result.state !== "unknown") return;
     assert.equal(result.reason, "timeout");
+    assert.deepEqual(k.pids, [f.procs[0]!.pid]);
     assert.ok(result.settlement);
-    assert.equal(await stillPending(result.settlement), true);
-    assert.equal(f.procs[0]!.killed, 0);
+    assert.equal(await stillPending(result.settlement), true, "a stopped helper has not closed yet");
+    assert.equal(f.procs[0]!.killed, 0, "the kill goes through the command-uid reaper path, not ChildProcess.kill");
     f.procs[0]!.finish(0);
     await result.settlement;
   });
 
-  it("an abort after the spawn is unknown(aborted) with the helper's settlement", async () => {
+  it("an abort after the spawn kills the helper and is unknown(aborted) with the helper's settlement", async () => {
     const f = fakeSpawn();
+    const k = killRecorder();
     const abort = new AbortController();
-    const pending = measureCommandCache(TOKEN, { spawn: f.spawn, signal: abort.signal, limiter: createMeasureLimiter() });
+    const pending = measureCommandCache(TOKEN, { spawn: f.spawn, signal: abort.signal, limiter: createMeasureLimiter(), killAsCommandUid: k.kill });
     await tick();
     assert.equal(f.calls.length, 1);
     abort.abort();
@@ -851,26 +860,50 @@ describe("measureCommandCache (issue #3675)", () => {
     assert.equal(result.state, "unknown");
     if (result.state !== "unknown") return;
     assert.equal(result.reason, "aborted");
+    assert.deepEqual(k.pids, [f.procs[0]!.pid]);
     assert.equal(await stillPending(result.settlement!), true);
     f.procs[0]!.finish(0);
     await result.settlement;
   });
 
-  it("the worker-wide slot is held until the helper's ACTUAL close, past the first delivery timeout (FIFO)", async () => {
+  it("a timed-out helper is killed, and after its close the slot frees and a queued second request spawns", async () => {
     const limiter = createMeasureLimiter();
     const f = fakeSpawn();
-    const first = await measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 15, limiter });
-    assert.equal(first.state, "unknown");
-    const second = measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 1000, limiter });
+    const k = killRecorder();
+    const first = measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 15, limiter, killAsCommandUid: k.kill });
+    const second = measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 1000, limiter, killAsCommandUid: k.kill });
+    const firstResult = await first;
+    assert.equal(firstResult.state, "unknown");
+    assert.deepEqual(k.pids, [f.procs[0]!.pid]);
     await tick(); await tick();
-    assert.equal(f.calls.length, 1, "the second request waits: the first helper has not closed");
+    assert.equal(f.calls.length, 1, "the kill alone does not free the slot: only the actual close does");
     f.procs[0]!.finish(0);
-    if (first.state === "unknown") await first.settlement;
+    if (firstResult.state === "unknown") await firstResult.settlement;
     await tick();
-    assert.equal(f.calls.length, 2, "the second spawns only after the first's close");
+    assert.equal(f.calls.length, 2, "the second spawns after the killed helper's close");
     f.procs[1]!.line(measureLine());
     f.procs[1]!.finish(0);
     assert.deepEqual(await second, { state: "complete", bytes: 1234 });
+  });
+
+  it("a kill that is not delivered (false or thrown) leaves the slot held and reports timeout_unkilled", async () => {
+    for (const kill of [(): boolean => false, (): boolean => { throw new Error("no kill"); }]) {
+      const limiter = createMeasureLimiter();
+      const f = fakeSpawn();
+      const first = await measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 15, limiter, killAsCommandUid: kill });
+      assert.equal(first.state, "unknown");
+      if (first.state !== "unknown") return;
+      assert.equal(first.reason, "timeout_unkilled");
+      const second = measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 1000, limiter });
+      await tick(); await tick();
+      assert.equal(f.calls.length, 1, "the slot stays held while the helper is unkilled");
+      f.procs[0]!.finish(0);
+      await first.settlement;
+      await tick();
+      f.procs[1]!.line(measureLine());
+      f.procs[1]!.finish(0);
+      assert.equal((await second).state, "complete");
+    }
   });
 
   it("queued requests run FIFO", async () => {
