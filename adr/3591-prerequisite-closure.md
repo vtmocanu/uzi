@@ -183,8 +183,17 @@ four top-level PASS, zero SKIP/race and focused build/vet (EXIT 0).
 Broker evidence records zero new skips; two inherited bridge skips are not
 claimed as new proof.
 
-Remaining: final M5 required checks/review and exact-head hosted API/repo/store-it
-PASS with zero SKIP, affected-job and critical-path timing with queue/cache/reruns
-separated, plus lead-owned embed sync. M6 live/operator acceptance is a separate
+M5 documentation/embeds and focused local checks are recorded in the
+[PRD execution evidence](../prds/2506-prerequisite-closure.md#c1b-m5-local-validation-and-remaining-hosted-acceptance).
+The fresh-database repair isolates new immutable-closure fixtures without
+weakening old guards; three database-identity mutations fail and restore green.
+Pinned uncapped lint is clean through `60a94c89`. Earlier failed checks remain
+recorded, rather than being represented as aggregate success.
+
+Remaining: exact-head hosted API/repo/store-it PASS with zero SKIP, and
+affected-job/critical-path timing with queue/cache/reruns separated. The added
+per-fixture migration cost remains unmeasured in CI; local command times are
+not a comparative CI delta. The latest pipeline read returned an upstream
+forge error. No hosted verdict or dependency-scan PASS is inferred. M6 live/operator acceptance is a separate
 informative milestone, not performed here. C2/C3, E5/E6, release and hosted
 acceptance remain open; no source-disposal or parent-completion claim follows.

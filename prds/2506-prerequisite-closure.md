@@ -1,7 +1,7 @@
 # PRD #2506 (option A): a pinned prerequisite closure lets a thin guarded capture release custody
 
 **Issue:** #2506 (option A only). Delivery under this PRD is **non-closing**: every PR uses `Refs #2506` and closes only its own child issue. #2506 stays open until the whole acceptance below is met. Option D shipped separately (ADR-2506) and does not complete this.
-**Current execution:** C1b child #3591 is implemented locally through M4 at `db652da5ffb7139ce421dae88eb6c6f3a2d3437f`; M5 documentation/validation is in progress, hosted exact-head gates and comparative timing are not collected. No thin FINAL release, feature advertisement or agent change. C2/C3, release, E6 and parent acceptance remain open. See [current execution and checkbox disposition](#c1b-current-execution-2026-10-29-child-3591). The design status below is historical, not a claim that implementation has not started.
+**Current execution:** C1b child #3591 is implemented locally through M4 at `db652da5ffb7139ce421dae88eb6c6f3a2d3437f`; M5 documentation and focused local checks are recorded below through `60a94c89`; hosted exact-head gates and comparative timing are not collected, so M5 remains in progress. No thin FINAL release, feature advertisement or agent change. C2/C3, release, E6 and parent acceptance remain open. See [current execution and checkbox disposition](#c1b-current-execution-2026-10-29-child-3591). The design status below is historical, not a claim that implementation has not started.
 
 **Historical design status:** DRAFT, revision 18 (2026-10-28), approved C1a/C1b split and review folds, pending exact-text final review. C1a and C1b are API-only; no filing or dispatch follows from this draft. Based on the exact revision-11 artifact (SHA256 `2205e1146950263b2aa90f35863cadec3f3debfbd350590b9e65bd560a9640ec`, whose header still said revision 10). The earlier paired architecture reviews and owner decisions remain the design history; this new evidence fold requires recov6 review and is not filing, dispatch or implementation approval. **E2 ran on GitHub on 2026-10-27 and returned FINDING (one measured workflow-scope refusal, zero probe malfunctions), conclusive for the tested production credential class.** The anchor strategy is feasible in that tested case; other forges and protected/ruleset configurations remain unverified. Existing source line anchors are historical at `91647464c02bd12ae30d4fce6aa656f2245e88e1`, not refreshed line numbers for current main. The new E2 section states the exact observed scope and remaining gates.
 **Priority:** High (inherits #2506). The independent architecture review CLAUDE.md requires for priority::high applies to this PRD and to each child before dispatch; no waiver. M0 is evidence-only and is never auto-dispatched.
@@ -589,7 +589,8 @@ claim of C1b shipment. Parent #2506 remains active and non-closing.
 - [x] C1b M2: bounded broker prepare/send/list/expected-tip CAS, shared one-send authority and native positive/negative restore fixtures checked locally.
 - [x] C1b M3: bounded lane, shutdown, removal guards, frozen-binding/unknown/cleanup/audit lifecycle and real-driver/LiveDB/native integration checked locally.
 - [x] C1b M4: atomic S0, original authenticated registration snapshot, no-backfill receipts, postcommit kick, knob normalization/admission and optional status mapping checked locally.
-- [ ] C1b M5: documentation and final validation/acceptance; hosted gates/timing are not yet collected. Lead-owned embed sync and remaining required checks/review are still due.
+- [x] C1b M5 local evidence: documentation/mirrors, tracked E2E audit, E2E library/fake tests, focused build/vet/race checks, SQLC/migration/static/security checks and committed repair reviews recorded below.
+- [ ] C1b M5 overall acceptance: exact-head hosted gates and comparative timing are not yet collected. Local results do not complete this milestone.
 - [ ] C1b final exact-head hosted acceptance: every API constituent, repo gate and named store-it tests PASS with zero SKIP; affected-job/critical-path timing with queue/cache/reruns separated.
 - [ ] C2 thin FINAL release, feature/worker advertisement, permission/replay/reconciliation and real freeze-path authority acceptance.
 - [ ] C3 owner/web/CLI pin visibility and E5 restore-time acceptance.
@@ -644,9 +645,61 @@ and has local negatives, but parent release-evidence acceptance awaits C2;
 FINAL still excluded. The three checked C1a implementation/proof/review items
 remain checked on their recorded evidence. Its one hosted exact-head item
 remains open; local C1b regression runs do not substitute for it. The four
-new C1b M1–M4 boxes above are ticked on direct local evidence only. M5, C1b
-hosted gates/timing, C2, C3/E5, E6 and parent release remain unchecked.
+new C1b M1–M4 boxes and the M5 local-evidence box above are ticked on direct
+local evidence only. M5 overall acceptance, C1b hosted gates/timing, C2,
+C3/E5, E6 and parent release remain unchecked.
 No other Markdown checkbox existed in the pre-edit PRD.
+
+#### C1b M5 local validation and remaining hosted acceptance
+
+Documentation and embeds were committed at `5bfd4668`; fixture/static-check
+repairs were committed and reviewed through `60a94c89`. The parent remains
+active. The E4 row and C1a execution block are unchanged.
+
+- `task docs:sync` and `task check-docs:web` passed (`gate-log.WCneXt`);
+  the embedded-docs race test also passed. Long-page warnings are not errors.
+- A tracked audit covered 63 E2E files and 71 old/new literals. No shipped
+  deterministic phase forces the oversized guarded thin fallback; the fake's
+  existing native Git CGI bridge already carries advertisement/receive-pack.
+  No E2E source change was required. `task test:e2e-lib` passed (including
+  352/352 library cases); `task test:forge-fake` passed 10/10 with zero skips.
+  Compose phases were not run: notably 06, 42, 45, 50, 51, 52, 70, 71, 72
+  and 73; optional live SDK output remains unmeasured.
+- Format, SQLC drift, migration numbering/additivity, token literals,
+  changelog entry, no-binary-text and spec numbering checks passed at
+  `5bfd4668`. Secrets and required Semgrep scans detected their canaries and
+  reported zero tracked/tree findings; repeated scans at `e10e2323` were also
+  clean. Dead-code analysis passed at `5bfd4668`; hosted current-head coverage
+  of that constituent remains required. No in-worker aggregate API gate ran.
+- Initial lint found 19 fixture diagnostics. The uncapped rerun exposed one
+  additional unused suppression. Test-only repairs preserved assertions and
+  were reviewed; the pinned repository wrapper's uncapped ratcheted lint at
+  `60a94c89` reported zero issues (`gate-log.4CGELT`).
+- The broader race run at `e1c2a260` (`gate-log.RcaS5I`, EXIT 1, 925 seconds)
+  retained two failures: an instance-wide expiry count on the reused database
+  and inherited capture deletion blocked by new fixture tombstones. Passing
+  package results in that failed run are not an aggregate PASS. New upload
+  fixtures now use disposable databases; no production guard or old C1a/SFEnv
+  fixture was weakened. Fresh comparison reproduces the FK failure before
+  isolation and passes afterward (`gate-log.7o8FXB` / `gate-log.BVc7E4`);
+  the inherited store lifecycle passes at both revisions on fresh databases.
+- Fresh focused tests at `e10e2323` passed 25 top-level tests, including 22
+  LiveDB tests with zero skips/race warnings, then focused ten-package build
+  and vet (`gate-log.bXaRYs`). Three fixture-isolation regressions fail at
+  actual database-identity assertions when only the isolation calls are removed,
+  and pass on restore (`gate-log.H82sDL` / `gate-log.YWC2Ty`). The later
+  `60a94c89` change removes only an unused comment. All these commits received
+  their scoped read-only reviews; no final implementation commit is unreviewed.
+
+These are local observations, not exact-head hosted acceptance. The last
+pipeline read returned an upstream forge error; no CI verdict is inferred.
+Every API constituent, repo gate, and named store-it PASS/zero-SKIP result at
+the published head remains required. `govulncheck` was unavailable on PATH;
+no dependency-scan PASS is claimed. Added per-fixture migrations have an
+unmeasured CI cost. Affected-job and critical-path before/after timing,
+separating queue/cache/reruns, remains outstanding; local fixture/compile
+seconds are not a substitute. M6 maintainer/operator acceptance, E6, C2/C3
+and parent completion remain separate and unperformed.
 
 ### C2: "Release a guarded hold on a pinned prerequisite closure"
 
