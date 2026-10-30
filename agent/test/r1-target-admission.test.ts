@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Outbox } from "../src/outbox.js";
+import { Worker } from "../src/worker.js";
 import { makeScratchRoot } from "./fixture-repo.js";
 import { nullLogger } from "./helpers.js";
 
@@ -286,5 +287,61 @@ it("R1 opaque scopes remain pending in generation-free depth and fallback reader
   assert.equal(depth?.policyPendingOutcomeId, undefined);
   assert.equal(depth?.blockedReason, undefined);
   assert.equal(outbox.listPendingTerminals().length, 0, "an unknown source generation is never fabricated as a wire tuple");
+  assert.equal(outbox.policyInventoryCoverageAvailable(), false);
+});
+
+it("R1 demand byte allowance spans mutation retries", async t => {
+  const { outbox, root } = await fixture(t);
+  for (const generation of [1, 2])
+    assert.equal((await outbox.journalTerminal(run, generation, "running", 0,
+      { status: "completed", error_message: "x".repeat(1024) })).journaled, true);
+  const directory = path.join(root, run);
+  let totalBytes = 0;
+  for (const generation of [1, 2]) {
+    const file = path.join(directory, `terminal-${generation}.json`);
+    totalBytes += (await fs.stat(file)).size;
+    await fs.rename(file, path.join(directory, `parked-${generation}`));
+  }
+  const quota = totalBytes - 1;
+  const reader = new Outbox({ root, log: nullLogger(), maxBytes: quota, runMaxBytes: quota, retentionMs: 1 });
+  await reader.init();
+  assert.equal(reader.listPendingTerminals().length, 0);
+  await fs.rename(path.join(directory, "parked-1"), path.join(directory, "terminal-1.json"));
+  const open = fs.opendir.bind(fs);
+  let mutated = false;
+  t.mock.method(fs, "opendir", async (file: Parameters<typeof fs.opendir>[0]) => {
+    const opened = await open(file);
+    return new Proxy(opened, { get(target, key) {
+      if (key === "close") return async () => {
+        await target.close();
+        if (String(file) === directory && !mutated) {
+          mutated = true;
+          await fs.rename(path.join(directory, "parked-2"), path.join(directory, "terminal-2.json"));
+        }
+      };
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+  });
+  assert.equal(await reader.hasPendingPolicyOutcome(run), true,
+    "a mutation retry must not authenticate two bodies exceeding one demand's byte quota");
+  assert.equal(mutated, true);
+  assert.equal(reader.listPendingTerminals().find(source => source.claim_generation === 2)?.outcome_kind, "unknown");
+  assert.equal((await reader.readTerminalJournal(run, 2))?.body.status, "completed",
+    "the deferred ordinary candidate remains resolvable with a fresh bounded budget");
+  assert.equal(await reader.hasPendingPolicyOutcome(run), false);
+});
+
+it("R1 heartbeat includes generation-free scope depth without inventing source authority", async t => {
+  const { outbox, root } = await fixture(t);
+  await fs.mkdir(path.join(root, run));
+  await fs.writeFile(path.join(root, run, "terminal-unsafe.json"), "unknown");
+  assert.equal(await outbox.hasPendingPolicyOutcome(run), true);
+  const worker = Object.assign(Object.create(Worker.prototype), { outbox }) as Worker;
+  const entries = (worker as unknown as { outboxEntries(): Record<string, unknown>[] | undefined }).outboxEntries();
+  assert.equal(entries?.find(entry => entry.run_id === run)?.pending_terminal, 1);
+  assert.equal(entries?.[0]?.policy_pending_source_generation, undefined);
+  assert.equal(entries?.[0]?.policy_pending_outcome_id, undefined);
+  assert.equal(outbox.listPendingTerminals().length, 0);
   assert.equal(outbox.policyInventoryCoverageAvailable(), false);
 });

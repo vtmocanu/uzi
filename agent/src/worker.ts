@@ -1201,6 +1201,7 @@ export class Worker {
     const entries: OutboxHeartbeatEntry[] = [];
     const runIds = new Set(this.outbox.runsWithPending());
     for (const t of this.outbox.listPendingTerminals()) runIds.add(t.run_id);
+    for (const runId of this.outbox.unclassifiedPolicyRunIds()) runIds.add(runId);
     for (const runId of runIds) {
       const d = this.outbox.depthFor(runId);
       if (!d) continue;

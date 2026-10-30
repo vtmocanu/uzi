@@ -82,7 +82,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       isDisabled: () => false,
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
-      runsWithPending: () => ["r1"],
+      unclassifiedPolicyRunIds: () => [], runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
         drainCalls += 1;
@@ -131,7 +131,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       isDisabled: () => false,
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
-      runsWithPending: () => (retired ? [] : ["r1"]),
+      unclassifiedPolicyRunIds: () => [], runsWithPending: () => (retired ? [] : ["r1"]),
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
         retired = true;
@@ -189,7 +189,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // this drainer-focused fake keeps the sweep out of the way.
       hasUndrainedMessages: () => true,
       listPendingFinalizes: () => [],
-      runsWithPending: () => (retired ? [] : ["r1"]),
+      unclassifiedPolicyRunIds: () => [], runsWithPending: () => (retired ? [] : ["r1"]),
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
         await gate; // hold the ONE (boot) drain open so boot-resolve sees an empty pending list
@@ -281,7 +281,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // this drainer-focused fake keeps the sweep out of the way.
       hasUndrainedMessages: () => true,
       listPendingFinalizes: () => [],
-      runsWithPending: () => (retired ? [] : ["r1"]),
+      unclassifiedPolicyRunIds: () => [], runsWithPending: () => (retired ? [] : ["r1"]),
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
         await gate;
@@ -355,7 +355,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       isDisabled: () => false,
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
-      runsWithPending: () => ["r1"],
+      unclassifiedPolicyRunIds: () => [], runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
         drainStarted += 1;
@@ -405,7 +405,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       isDisabled: () => false,
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
-      runsWithPending: () => ["r1"],
+      unclassifiedPolicyRunIds: () => [], runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
         drainCalls += 1;

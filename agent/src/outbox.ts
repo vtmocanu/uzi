@@ -882,6 +882,9 @@ export class Outbox {
    * limits remain aggregate across the entire demand. Errors stop this demand,
    * while root/alias mutation permits at most one fresh pass. No sibling queue. */
   private async scanTargetPolicy(runId: string): Promise<boolean> {
+    let bytes = 0;
+    // At most two passes of 64 aliases: counters remain bounded across retries.
+    const readByRun = new Map<string, number>();
     for (let attempt = 0; attempt < 2; attempt++) {
       let visits = 0;
       let budget = { deadline: Date.now() + TARGET_POLICY_SLICE_MS };
@@ -918,7 +921,6 @@ export class Outbox {
       if (rootStat.isFile()) return false;
       if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return true;
       const aliases: { id: string; version: string }[] = [];
-      let bytes = 0;
       let changed = false;
       const root = await fs.opendir(this.root);
       try {
@@ -945,7 +947,7 @@ export class Outbox {
           const directory = this.runDir(entry.name);
           const version = fileVersion(await fs.lstat(directory, { bigint: true }));
           aliases.push({ id: entry.name, version });
-          let runBytes = 0;
+          let runBytes = readByRun.get(entry.name) ?? 0;
           const dir = await fs.opendir(directory);
           try {
             for (;;) {
@@ -1002,6 +1004,7 @@ export class Outbox {
                 if (size > remaining) return true;
                 bytes += size;
                 runBytes += size;
+                readByRun.set(entry.name, runBytes);
                 checkProofBudget(budget);
                 const result = await this.inspectTerminal(entry.name, generation, source.name, budget, size);
                 if (!result.record) return true;
@@ -1654,6 +1657,11 @@ export class Outbox {
       if (rs.manifest.records.some((r) => r.lastSeq > rs.manifest.cursor)) out.push(runId);
     }
     return out;
+  }
+
+  /** Generation-free diagnostic scope IDs, never source tuples or leases. */
+  unclassifiedPolicyRunIds(): string[] {
+    return [...new Set([...this.policyInspections.values()].filter(scope => scope.held).map(scope => scope.runId))];
   }
 
   /** PRD #1391 Run B M3b (N3): does this run still hold UNDRAINED message segments (locally-held
