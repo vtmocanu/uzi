@@ -86,9 +86,8 @@ func TestCrossRunDiscardBaselineLiveDB(t *testing.T) {
 		e, _ := newCrossRunDiscardEnv(t)
 		e.svc.ReconcileMergedPredecessors(e.ctx, []uuid.UUID{e.repo})
 
-		// Observed-gap control; the future policy assertion can require discarded.
-		if got := e.state(e.hold); got != "open" {
-			t.Fatalf("cross-run target hold = %s, want open", got)
+		if got := e.state(e.hold); got != "discarded" {
+			t.Fatalf("target hold should be discarded: got %s", got)
 		}
 	})
 }

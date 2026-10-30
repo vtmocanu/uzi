@@ -199,22 +199,123 @@ func (q *Queries) ListCrossRunFinalCaptures(ctx context.Context, runID uuid.UUID
 	return items, nil
 }
 
+const listCrossRunTargets = `-- name: ListCrossRunTargets :many
+SELECT a.id AS run_id, a.user_id AS owner_id, a.repo_id, a.kind, a.status,
+    a.claim_generation AS generation, a.issue_iid, a.finished_at, a.created_at
+FROM runs a
+WHERE a.repo_id = $1 AND a.user_id = $2
+    AND a.issue_iid = $3 AND a.issue_iid > 0 AND a.kind = 'issue'
+    AND a.id <> $4
+    AND a.status IN ('failed', 'cancelled') AND a.claim_generation > 0
+    AND a.mr_iid IS NULL AND a.fail_origin IS DISTINCT FROM 'run_timeout'
+    AND isfinite(a.finished_at) AND a.finished_at < $5::timestamptz
+    AND NOT EXISTS (SELECT 1 FROM worker_active_runs w WHERE w.run_id = a.id)
+    AND EXISTS (
+        SELECT 1 FROM recovery_custody_holds h
+        WHERE h.run_id = a.id AND h.user_id = a.user_id AND h.repo_id = a.repo_id
+            AND h.state = 'open'
+    )
+    AND ($6::timestamptz IS NULL
+        OR (a.created_at, a.id) < ($6::timestamptz, $7::uuid))
+ORDER BY a.created_at DESC, a.id DESC LIMIT 1
+`
+
+type ListCrossRunTargetsParams struct {
+	RepoID           pgtype.UUID        `json:"repo_id"`
+	OwnerID          uuid.UUID          `json:"owner_id"`
+	IssueIid         pgtype.Int8        `json:"issue_iid"`
+	WitnessRunID     uuid.UUID          `json:"witness_run_id"`
+	WitnessCreatedAt pgtype.Timestamptz `json:"witness_created_at"`
+	AfterCreatedAt   pgtype.Timestamptz `json:"after_created_at"`
+	AfterRunID       uuid.UUID          `json:"after_run_id"`
+}
+
+type ListCrossRunTargetsRow struct {
+	RunID      uuid.UUID          `json:"run_id"`
+	OwnerID    uuid.UUID          `json:"owner_id"`
+	RepoID     pgtype.UUID        `json:"repo_id"`
+	Kind       string             `json:"kind"`
+	Status     string             `json:"status"`
+	Generation int64              `json:"generation"`
+	IssueIid   pgtype.Int8        `json:"issue_iid"`
+	FinishedAt pgtype.Timestamptz `json:"finished_at"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
+// The issue history index supplies descending creation order; UUID breaks ties.
+// Only immutable keys drive continuation, never a mutable completion timestamp.
+func (q *Queries) ListCrossRunTargets(ctx context.Context, arg ListCrossRunTargetsParams) ([]ListCrossRunTargetsRow, error) {
+	rows, err := q.db.Query(ctx, listCrossRunTargets,
+		arg.RepoID,
+		arg.OwnerID,
+		arg.IssueIid,
+		arg.WitnessRunID,
+		arg.WitnessCreatedAt,
+		arg.AfterCreatedAt,
+		arg.AfterRunID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCrossRunTargetsRow{}
+	for rows.Next() {
+		var i ListCrossRunTargetsRow
+		if err := rows.Scan(
+			&i.RunID,
+			&i.OwnerID,
+			&i.RepoID,
+			&i.Kind,
+			&i.Status,
+			&i.Generation,
+			&i.IssueIid,
+			&i.FinishedAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listMergedPredecessorCandidates = `-- name: ListMergedPredecessorCandidates :many
 SELECT r.id AS run_id, r.user_id AS owner_id, p.id AS repo_id,
     p.connection_id, p.forge_project_id AS project_id, r.mr_iid::bigint AS mr_iid,
     r.claim_generation AS completed_generation, c.forge_type, c.base_url,
-    c.token_ciphertext
+    c.token_ciphertext, r.kind, r.issue_iid, r.created_at,
+    (EXISTS (
+        SELECT 1 FROM recovery_custody_holds h
+        WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.repo_id = p.id
+            AND h.state = 'open' AND h.generation < r.claim_generation
+    ))::boolean AS original_branch
 FROM runs r
 JOIN repos p ON p.id = r.repo_id
 JOIN forge_connections c ON c.id = p.connection_id AND c.user_id = r.user_id
 WHERE p.id = $1 AND p.enabled
     AND r.status = 'completed' AND r.mr_iid > 0 AND r.claim_generation > 0
     AND r.id > $2
-    AND EXISTS (
+    AND (EXISTS (
         SELECT 1 FROM recovery_custody_holds h
         WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.repo_id = p.id
             AND h.state = 'open' AND h.generation < r.claim_generation
-    )
+    ) OR (r.kind = 'issue' AND r.issue_iid > 0
+        AND isfinite(r.created_at) AND EXISTS (
+        SELECT 1 FROM runs a WHERE a.user_id = r.user_id AND a.repo_id = p.id AND a.issue_iid = r.issue_iid
+            AND a.kind = 'issue' AND a.issue_iid > 0
+            AND a.status IN ('failed', 'cancelled') AND a.claim_generation > 0
+            AND a.mr_iid IS NULL AND a.fail_origin IS DISTINCT FROM 'run_timeout'
+            AND isfinite(a.finished_at) AND a.finished_at < r.created_at
+            AND NOT EXISTS (SELECT 1 FROM worker_active_runs w WHERE w.run_id = a.id)
+            AND EXISTS (
+                SELECT 1 FROM recovery_custody_holds h
+                WHERE h.run_id = a.id AND h.user_id = a.user_id AND h.repo_id = a.repo_id
+                    AND h.state = 'open'
+            )
+    )))
 ORDER BY r.id LIMIT 1
 `
 
@@ -224,16 +325,20 @@ type ListMergedPredecessorCandidatesParams struct {
 }
 
 type ListMergedPredecessorCandidatesRow struct {
-	RunID               uuid.UUID `json:"run_id"`
-	OwnerID             uuid.UUID `json:"owner_id"`
-	RepoID              uuid.UUID `json:"repo_id"`
-	ConnectionID        uuid.UUID `json:"connection_id"`
-	ProjectID           int64     `json:"project_id"`
-	MrIid               int64     `json:"mr_iid"`
-	CompletedGeneration int64     `json:"completed_generation"`
-	ForgeType           string    `json:"forge_type"`
-	BaseUrl             string    `json:"base_url"`
-	TokenCiphertext     []byte    `json:"token_ciphertext"`
+	RunID               uuid.UUID          `json:"run_id"`
+	OwnerID             uuid.UUID          `json:"owner_id"`
+	RepoID              uuid.UUID          `json:"repo_id"`
+	ConnectionID        uuid.UUID          `json:"connection_id"`
+	ProjectID           int64              `json:"project_id"`
+	MrIid               int64              `json:"mr_iid"`
+	CompletedGeneration int64              `json:"completed_generation"`
+	ForgeType           string             `json:"forge_type"`
+	BaseUrl             string             `json:"base_url"`
+	TokenCiphertext     []byte             `json:"token_ciphertext"`
+	Kind                string             `json:"kind"`
+	IssueIid            pgtype.Int8        `json:"issue_iid"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	OriginalBranch      bool               `json:"original_branch"`
 }
 
 // OPEN exact-identity predecessor holds are the durable workset, including
@@ -258,6 +363,10 @@ func (q *Queries) ListMergedPredecessorCandidates(ctx context.Context, arg ListM
 			&i.ForgeType,
 			&i.BaseUrl,
 			&i.TokenCiphertext,
+			&i.Kind,
+			&i.IssueIid,
+			&i.CreatedAt,
+			&i.OriginalBranch,
 		); err != nil {
 			return nil, err
 		}
