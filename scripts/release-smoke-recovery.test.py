@@ -136,6 +136,62 @@ class Classification(unittest.TestCase):
 
 
 class Recovery(unittest.TestCase):
+    def test_owned_publication_attempt_jump_exits_policy_refused_without_assertion_post(self):
+        for seen in (False, True):
+            with self.subTest(seen=seen):
+                engine = self.fixture()
+                self.green_smoke()
+                engine.max_ticks = 1
+                engine.requested['release.yml'] = (20, 1)
+                if seen:
+                    engine.recovery_seen['release.yml'] = (20, 1)
+                self.release_run = dict(self.release_run, run_attempt=3)
+                engine.resolve = lambda workflow: '20' if workflow == 'release.yml' else ''
+                engine.dump = lambda _: (0, 'completed\tfailure\tassert-tag-smoke\thttps://example.invalid/job')
+                self.assertEqual(engine.run(), 1)
+                self.assertEqual(engine.stop_reason, 'tag-smoke-recovery-refused')
+                engine.gh.assert_not_called()
+                self.assertEqual(engine.requested['release.yml'], (20, 1))
+                self.assertEqual(engine.assert_remaining, 1)
+
+    def test_first_publication_observation_pins_epoch_before_smoke_recovers(self):
+        engine = self.fixture()
+        engine.observe('release.yml', '20')
+        self.release_run = dict(self.release_run, run_attempt=2)
+        self.green_smoke()
+        engine.max_ticks = 1
+        engine.resolve = lambda workflow: '20' if workflow == 'release.yml' else ''
+        engine.dump = lambda _: (0, 'completed\tfailure\tassert-tag-smoke\thttps://example.invalid/job')
+        self.assertEqual(engine.run(), 1)
+        self.assertEqual(engine.stop_reason, 'tag-smoke-recovery-refused')
+        engine.gh.assert_not_called()
+
+    def test_publication_identity_read_can_recover_on_next_tick_with_fresh_proof(self):
+        engine = self.fixture()
+        self.publication_poll(engine)
+        engine.max_ticks = 3
+        engine.resolve = lambda workflow: '20' if workflow == 'release.yml' else '30'
+        publication_dump = engine.dump
+        engine.dump = lambda identity: (0, 'completed\tsuccess\tpublish-formula\thttps://example.invalid/job') if identity == '30' else publication_dump(identity)
+        engine.wait_requeued = Mock()
+        engine.validate_identity.side_effect = [watch.RecoveryReadUnavailable('temporary read failure'), None]
+        def posted(*args):
+            self.release_run = dict(self.release_run, conclusion='success', run_attempt=2)
+            self.release_jobs = [dict(item, conclusion='success') for item in self.release_jobs]
+            return 0, '', ''
+        engine.gh.side_effect = posted
+        self.assertEqual(engine.poll(), 0)
+        self.assertEqual(engine.validate_identity.call_count, 2)
+        self.assertEqual(engine.gh.call_count, 1)
+        self.assertEqual(engine.remaining['release.yml'], 1)
+
+    def test_unavailable_new_class_write_identity_is_instrument_exit_three(self):
+        engine = self.fixture()
+        engine.validate_identity.side_effect = watch.RecoveryReadUnavailable('unavailable refs')
+        self.assertEqual(engine.run(), 3)
+        engine.gh.assert_not_called()
+        self.assertEqual(engine.smoke_remaining, 2)
+
     def test_both_assertion_workflow_contracts_are_checked(self):
         for workflow in ['release.yml', 'kind-smoke.yml']:
             engine = self.fixture()

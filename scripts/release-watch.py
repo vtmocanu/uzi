@@ -169,7 +169,6 @@ class Watcher:
         self.recovery_uncertain = False
         self.tag_oid = None
         self.refs_policy = None
-        self.refused_publication_writes = set()
 
     def enable_recovery(self, tag_oid):
         if (self.journal is None or not isinstance(tag_oid, str) or not re.fullmatch(r'[0-9a-f]{40}', tag_oid)
@@ -471,6 +470,11 @@ class Watcher:
         run, jobs = self.snapshot(workflow, run_id, fresh=fresh)
         self.journal.observe(workflow, run, jobs)
         requested = self.requested.get(workflow)
+        if (self.recovering and requested and run['status'] == 'completed'
+                and (run['id'] != requested[0] or run['run_attempt'] not in (requested[1], requested[1] + 1))):
+            raise RecoveryRefusal('external publication retry attempt intervention')
+        if self.recovering:
+            self.recovery_seen.setdefault(workflow, (run['id'], run['run_attempt']))
         if (requested and run['id'] == requested[0] and run['run_attempt'] > requested[1]
                 and run['status'] == 'completed' and run['conclusion'] not in (None, '') and terminal_jobs(jobs)):
             passed = (run['conclusion'] == 'success' and bool(jobs)
@@ -486,6 +490,8 @@ class Watcher:
     def observe(self, workflow, run_id, required=False):
         try:
             return self.record(workflow, run_id, fresh=required)
+        except RecoveryRefusal:
+            raise
         except (ValueError, KeyError, TypeError, AttributeError, OSError, subprocess.TimeoutExpired):
             if self.journal is not None:
                 try:
@@ -624,13 +630,9 @@ class Watcher:
                             or sorted(current) != sorted(failures)):
                         raise ValueError('publication failure changed before retry')
                 if self.recovering:
-                    write_key = workflow, int(run), snapshot['run_attempt']
-                    if write_key in self.refused_publication_writes:
-                        continue
                     try:
                         allowed = self.can_write()
                     except RecoveryReadUnavailable:
-                        self.refused_publication_writes.add(write_key)
                         print('release-watch: publication identity unavailable; observing without retry', file=sys.stderr)
                         continue
                     if not allowed:
