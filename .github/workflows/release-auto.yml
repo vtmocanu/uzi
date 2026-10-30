@@ -1,7 +1,8 @@
 # Protected manual releases and opt-in nightly RCs (#3512, stage 3e-2).
 # App/environment/ruleset setup and the first live dispatch belong to the maintainer.
 # D10 is partial: one eligible pre-cut CI rerun and existing non-gate publication
-# retries. Tagged smoke, post-cut CI and targeted assertion recovery follow in 3e-3.
+# retries. Tagged smoke and targeted assertions follow in 3e-3; post-cut main CI
+# will be report-only, with automatic reruns deliberately excluded.
 name: Release automation
 
 "on":
@@ -545,7 +546,7 @@ jobs:
           result['outcome'] = 'blocked' if problem else (watched.get('outcome') or prepared.get('outcome') or 'no-op')
           result['reason'] = next((needs[name].get('outputs', {}).get('reason') or name + '-failed' for name in failed),
                                   'partial-publication' if problem else prepared.get('reason') or authorized.get('reason') or 'complete')
-          if os.environ.get('GITHUB_EVENT_NAME') == 'schedule' and result['reason'] in ('missed-target', 'tip-not-green-by-cutoff'):
+          if os.environ.get('GITHUB_EVENT_NAME') == 'schedule' and result['reason'] in ('missed-target', 'tip-not-green-by-cutoff', 'skip-ci-tip'):
               result['outcome'] = 'defer'
           if problem and push_outcome == 'receipt-unknown':
               result['outcome'], result['reason'] = 'partial-publication', 'push-receipt-unknown'
@@ -559,12 +560,16 @@ jobs:
               day = utc_stamp(os.environ.get('RUN_CREATED_AT')).astimezone(zone).date()
               target = dt.datetime.combine(day, dt.time(14), zone)
               result['late_finish'] = utc_stamp(watched['verified_at']) > target
+          skip_ci_text = ('Scheduled preparation exhausted its wait budget while the selected skip-ci tip lacked exact proof; use a newer CI-bearing main tip.'
+                          if os.environ.get('GITHUB_EVENT_NAME') == 'schedule' else
+                          'Manual preparation refused immediately: this skip-ci tip lacks exact proof; use a newer CI-bearing main tip.')
           explanation = {'changelog-coverage-refused': 'Release preparation refused: the assembled changelog failed its coverage check.',
                          'changelog-coverage-error': 'Release preparation could not establish changelog coverage.',
                          'push-rejected': 'Release push was rejected without updating refs.',
                          'nightly-disabled': 'Nightly RC paused: RELEASE_NIGHTLY_ENABLED is not true.',
                          'no-new-shipping-change': 'Nightly RC skipped: no new non-metadata shipping changes.',
                          'no-releasable-notes': 'Nightly RC skipped: no releasable notes.',
+                         'skip-ci-tip': skip_ci_text,
                          'missed-target': 'Nightly RC stopped because its remaining pre-push cutoff budget was exhausted.',
                          'tip-not-green-by-cutoff': 'Nightly RC found no exact green tip within its pre-cut budget.',
                          'push-receipt-unconfirmed': 'Release recovery could not confirm that main contains the RC.'}.get(
