@@ -209,8 +209,8 @@ STUBCONF
 # Only the expected request cookie receives the successful upstream response.
 cat > "$STUB/cookie-proof.conf" <<STUBCOOKIE
 location = /api/cookie-proof {
-    if (\$http_cookie != "uzi_vault_slot=$COOKIE_SENTINEL") { return 400; }
-    add_header Set-Cookie "uzi_vault_slot=$SET_COOKIE_SENTINEL; Path=/; HttpOnly; SameSite=Strict" always;
+    if (\$http_cookie != "__Host-uzi_vault_slot=$COOKIE_SENTINEL") { return 400; }
+    add_header Set-Cookie "__Host-uzi_vault_slot=$SET_COOKIE_SENTINEL; Path=/; HttpOnly; SameSite=Strict" always;
     return 200 'COOKIE-UPSTREAM-REACHED';
 }
 STUBCOOKIE
@@ -326,7 +326,7 @@ cc_not_immutable() { ! hhas "$1" cache-control immutable; }
 
 cookie_response() {
   [ "$(hcount "$1" set-cookie)" = 1 ] &&
-    [ "$(hvals "$1" set-cookie)" = "uzi_vault_slot=$SET_COOKIE_SENTINEL; Path=/; HttpOnly; SameSite=Strict" ]
+    [ "$(hvals "$1" set-cookie)" = "__Host-uzi_vault_slot=$SET_COOKIE_SENTINEL; Path=/; HttpOnly; SameSite=Strict" ]
 }
 
 # Stop before collecting so nginx flushes pending access-log buffers. docker logs combines
@@ -416,7 +416,7 @@ for v in $VARIANTS; do
     fetch "$v-api" "$port" /api/identity -H 'Accept-Encoding: gzip'
     check "/api/identity: 404 (got $STATUS)" has_status 404
   else
-    fetch "$v-cookie" "$port" /api/cookie-proof -H "Cookie: uzi_vault_slot=$COOKIE_SENTINEL"
+    fetch "$v-cookie" "$port" /api/cookie-proof -H "Cookie: __Host-uzi_vault_slot=$COOKIE_SENTINEL"
     check "cookie proof: upstream accepted request cookie" has_status 200
     check "cookie proof: upstream body received" raw_eq "$v-cookie" "$STUB/cookie-proof.body"
     check "cookie proof: upstream HttpOnly Set-Cookie received" cookie_response "$v-cookie"

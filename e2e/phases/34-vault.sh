@@ -32,7 +32,7 @@ assert_protected() {
 # Consume headers without retaining or printing cookie values. Empty clearing
 # cookies are allowed; any secret-bearing slot cookie is forbidden over HTTP.
 reject_http_slot_header() {
-  awk 'tolower($0) ~ /^set-cookie:[[:space:]]*uzi_vault_slot=[^;[:space:]]+/ {forbidden=1} END {exit forbidden}'
+  awk 'tolower($0) ~ /^set-cookie:[[:space:]]*__host-uzi_vault_slot=[^;[:space:]]+/ {forbidden=1} END {exit forbidden}'
 }
 unlock_user2() {
   local token
@@ -100,7 +100,7 @@ assert_protected "$JAR2" true
 assert_no_http_slots() {
   [ "$(db_psql 'SELECT count(*) FROM vault_browser_slots')" = 0 ] \
     || fail "HTTP deployment minted a vault browser slot"
-  [ "$(awk '$6=="uzi_vault_slot" {found++} END {print found+0}' "$JAR" "$JAR2")" = 0 ] \
+  [ "$(awk '$6=="__Host-uzi_vault_slot" {found++} END {print found+0}' "$JAR" "$JAR2")" = 0 ] \
     || fail "HTTP deployment has a vault browser slot cookie or unreadable jar"
 }
 assert_no_http_slots

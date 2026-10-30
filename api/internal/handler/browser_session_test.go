@@ -126,7 +126,7 @@ func TestPreparedBrowserSessionExpiryAndHTTP(t *testing.T) {
 	clearVaultSlot(clearRec)
 	cookies := clearRec.Result().Cookies()
 	clear := cookies[len(cookies)-1]
-	if clear.Name != vaultSlotCookieName || clear.Domain != "" || clear.Path != "/api" || !clear.Secure || !clear.HttpOnly || clear.SameSite != http.SameSiteStrictMode || clear.MaxAge != -1 {
+	if clear.Name != vaultSlotCookieName || clear.Domain != "" || clear.Path != "/" || !clear.Secure || !clear.HttpOnly || clear.SameSite != http.SameSiteStrictMode || clear.MaxAge != -1 {
 		t.Fatal("incorrect slot deletion")
 	}
 }
@@ -155,6 +155,36 @@ func TestBrowserMalformedSlotConsumesBudget(t *testing.T) {
 	}
 	if !slotCleared(out) {
 		t.Fatal("malformed presentation kept the slot cookie")
+	}
+}
+
+// A cookie under any other name, such as the unprefixed one a same-site sibling
+// origin can plant with a Domain attribute, is never read, charged or cleared.
+func TestBrowserUnprefixedSlotCookieIgnored(t *testing.T) {
+	h := &Handler{vault: testVault(t), cfg: config.Config{CookieSecure: true, JWTSecret: []byte("test-signing-key"), AuthTokenTTL: time.Hour}, vaultUnlockLimiter: mw.NewLimiter(1, time.Hour, nil)}
+	user := store.User{ID: uuid.New()}
+	session, err := h.freshSession(user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	session.emit(rec)
+	req := httptest.NewRequest("GET", "/api/auth/me", nil)
+	for _, cookie := range rec.Result().Cookies() {
+		req.AddCookie(cookie)
+		if cookie.Name == auth.CSRFCookieName {
+			req.Header.Set(auth.CSRFHeaderName, cookie.Value)
+		}
+	}
+	planted := "v1." + uuid.NewString() + "." + strings.Repeat("A", 43)
+	req.Header.Add("Cookie", "uzi_vault_slot="+planted+"; uzi_vault_slot=bad")
+	out := httptest.NewRecorder()
+	h.browserAuthHook(out, req, user, session.claims)
+	if _, ok := h.vaultUnlockLimiter.Reserve(mw.VaultUnlockKey(user.ID)); !ok {
+		t.Fatal("unprefixed cookie consumed unlock budget")
+	}
+	if len(out.Header().Values("Set-Cookie")) != 0 {
+		t.Fatal("unprefixed cookie changed cookies")
 	}
 }
 

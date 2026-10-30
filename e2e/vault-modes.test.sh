@@ -39,7 +39,7 @@ simulate() (
   JAR="$STATE/admin.jar" JAR2="$STATE/user2.jar" BASE=http://fake REPO_ID=repo DUMMY_ANTHROPIC=dummy
   : > "$JAR"
   if [ "$scenario" = http-slot-cookie ]; then
-    printf 'fake fake fake fake fake uzi_vault_slot sentinel\n' > "$JAR"
+    printf 'fake fake fake fake fake __Host-uzi_vault_slot sentinel\n' > "$JAR"
   fi
   COMPLETE_TIMEOUT_DEFAULT=1
   COMPOSE=(fake_compose)
@@ -126,9 +126,9 @@ simulate() (
       *"/api/vault/unlock"*) printf true > "$STATE/$who-unlocked"; printf dek > "$STATE/$who-sealed"
         echo "$who-unlock" >> "$STATE/calls"
         if [ "$scenario" = http-slot-header ]; then
-          printf 'Set-Cookie: uzi_vault_slot=sentinel; Secure; HttpOnly\r\n'
+          printf 'Set-Cookie: __Host-uzi_vault_slot=sentinel; Secure; HttpOnly\r\n'
         else
-          printf 'Set-Cookie: uzi_vault_slot=; Max-Age=0; Secure\r\n'
+          printf 'Set-Cookie: __Host-uzi_vault_slot=; Max-Age=0; Secure\r\n'
         fi ;;
       *) return 90 ;;
     esac

@@ -146,7 +146,7 @@ func TestBrowserSlotRestoreRoutesLiveDB(t *testing.T) {
 	var originalExpiry time.Time
 	for _, c := range e.cookies {
 		if c.Name == vaultSlotCookieName {
-			if !c.Secure || !c.HttpOnly || c.Path != "/api" || c.Domain != "" || c.SameSite != http.SameSiteStrictMode || c.MaxAge <= 0 {
+			if !c.Secure || !c.HttpOnly || c.Path != "/" || c.Domain != "" || c.SameSite != http.SameSiteStrictMode || c.MaxAge <= 0 {
 				t.Fatal("slot attributes")
 			}
 			originalExpiry = c.Expires
@@ -297,7 +297,7 @@ func TestBrowserSlotHTTPAndRevocationLiveDB(t *testing.T) {
 
 func slotCleared(rec *httptest.ResponseRecorder) bool {
 	for _, c := range rec.Result().Cookies() {
-		if c.Name == vaultSlotCookieName && c.MaxAge < 0 && c.Path == "/api" {
+		if c.Name == vaultSlotCookieName && c.MaxAge < 0 && c.Path == "/" {
 			return true
 		}
 	}

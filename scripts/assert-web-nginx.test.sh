@@ -34,7 +34,7 @@ cat > "$TMP/bin/docker" <<'EOF'
 #!/bin/sh
 echo "docker $*" >> "$FAKE_LOG"
 leak_cookie() {
-  awk '/^curl / { for (i = 1; i <= NF; i++) if ($i ~ /^uzi_vault_slot=/) { print $i; exit } }' "$FAKE_LOG"
+  awk '/^curl / { for (i = 1; i <= NF; i++) if ($i ~ /^__Host-uzi_vault_slot=/) { print $i; exit } }' "$FAKE_LOG"
 }
 case "$1" in
   info|start|exec|rm|stop) exit 0 ;;

@@ -15,7 +15,9 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
-const vaultSlotCookieName = "uzi_vault_slot"
+// The __Host- prefix makes browsers refuse a Domain or non-root Path for this name,
+// so a same-site sibling origin cannot plant or shadow the grant (ADR-3508).
+const vaultSlotCookieName = "__Host-uzi_vault_slot"
 
 func (h *Handler) requireAuth() func(http.Handler) http.Handler {
 	return mw.RequireAuth(h.q, h.cfg, h.browserAuthHook)
@@ -25,7 +27,7 @@ func (h *Handler) requireUser() func(http.Handler) http.Handler {
 }
 
 func clearVaultSlot(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{Name: vaultSlotCookieName, Path: "/api", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1, Expires: time.Unix(0, 0)})
+	http.SetCookie(w, &http.Cookie{Name: vaultSlotCookieName, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1, Expires: time.Unix(0, 0)})
 }
 
 func (h *Handler) emitVaultSlot(w http.ResponseWriter, key *vault.BrowserKey) {
@@ -46,7 +48,7 @@ func (h *Handler) emitVaultSlot(w http.ResponseWriter, key *vault.BrowserKey) {
 		clearVaultSlot(w)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: vaultSlotCookieName, Value: value, Path: "/api", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: age})
+	http.SetCookie(w, &http.Cookie{Name: vaultSlotCookieName, Value: value, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: age})
 }
 
 // slotCookie scans at most the HTTP server's bounded header bytes without allocating

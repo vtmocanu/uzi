@@ -23,9 +23,13 @@ OIDC callback itself neither unlocks nor mints.
 Persist a second DEK wrapper in `vault_browser_slots`. Generate a random
 256-bit wrapping key per mint, with AES-GCM AAD binding the owner and slot ID
 (`browserAAD` in `api/internal/vault/browser.go`). Send the key and slot ID
-in `uzi_vault_slot`, a Secure, HttpOnly, SameSite=Strict, host-only cookie
-(no Domain), Path=/api. The DB stores the wrapped DEK and metadata, not the
-cookie key. No server-at-rest material, including `UZI_SECRET_KEY` or the
+in `__Host-uzi_vault_slot`, a Secure, HttpOnly, SameSite=Strict, host-only
+cookie (no Domain), Path=/. The `__Host-` prefix makes browsers reject the
+name with a Domain or a non-root Path, so a same-site sibling origin cannot
+plant one that persists beside the grant and drains the shared unlock budget;
+the server reads no other name. `Path=/` is the prefix's requirement; nginx
+logs no requests (`access_log off`), so static paths do not expose it. The
+DB stores the wrapped DEK and metadata, not the cookie key. No server-at-rest material, including `UZI_SECRET_KEY` or the
 JWT signing secret, opens this wrapper without the cookie key.
 
 Mint after verified interactive password login, unlock or enrollment for an
@@ -106,7 +110,8 @@ cannot invalidate copied key material.
 
 Online authentication, expiry, revocation and limiter checks cannot protect
 a stolen snapshot against that offline attack. Strict protects across sites,
-not sibling origins on the same site. HttpOnly prevents ordinary script
+not sibling origins on the same site; the `__Host-` prefix only stops those
+origins from setting this cookie. HttpOnly prevents ordinary script
 reads of the cookie but cannot stop an active same-origin script from
 issuing authenticated requests. Live-server compromise, cached-DEK memory
 dumps, password cracking and retained master-sealed backups remain residuals.
