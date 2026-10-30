@@ -164,11 +164,17 @@ milestone; any runtime amendment needs a separate gate. The matrix recommends a 
 
 ### Command matrix and source boundary
 
-| Frozen argv (literal) | Evidence and recommendation |
-| --- | --- |
-| `builder prune -f` | Credible candidate for a separately reviewed builder-only amendment: native BuildKit protects acquired cache references. Unused cache, future reuse, cache mounts, intermediates and inputs no longer available elsewhere may be lost under D7. This is not permission to prune while custody is held. |
-| `image prune -f` | Existing container references survived the tests. No held-custody exception proposed: the pinned containerd implementation deletes pull-labelled leases; an image inventory does not enumerate future dependencies. |
-| `image prune -a -f --filter until=24h` | Same refusal. Positive aged-image deletion was demonstrated. `Created` is build time, not pull or last-use time. |
+| Frozen argv (literal) | Resource set | Decision | Evidence and recommendation |
+| --- | --- | --- | --- |
+| `builder prune -f` | Unused/dangling build cache; without `--all`, the pinned BuildKit source excludes internal, frontend and shared records. | **DEFER** | Credible candidate for a separately reviewed builder-only amendment, not a universal no-go: native BuildKit protects acquired cache references. Future reuse of unused cache, cache mounts, intermediates and unavailable inputs remains at risk under D7. No held-custody exception is authorized. |
+| `image prune -f` | Dangling images unreferenced by containers. | **DEFER** | Existing container references survived the tests. No held-custody exception proposed: the pinned containerd implementation deletes pull-labelled leases; an image inventory does not enumerate future dependencies. |
+| `image prune -a -f --filter until=24h` | Unused images unreferenced by containers whose `Created` timestamp is older than 24h. | **DEFER** | Same refusal. Positive aged-image deletion was demonstrated. `Created` is build time, not pull or last-use time. |
+
+Current true or unknown custody refuses **all three commands**. Future intended
+reuse by image ID or tag is not a container reference. Pruning can lose an image
+needed later when its registry or source image is unavailable; D7 treats that as
+scratch dependency loss, not protected-source loss. A future amendment must
+explicitly accept this dependency-loss boundary.
 
 The lead inspected Moby module v2.0.0-beta.23 origin
 `3ce5872b7950c63ba2ffbc5123101019ff3e6682`, matching Docker 29.8;
@@ -220,6 +226,26 @@ daemon-wide exclusion:
   line 482, refuses terminal maintenance before joining the gate; it does not
   make the gate a mutex among owners. [Terminal maintenance](../agent/src/maintenance-exclusion.ts),
   line 49 onward, pins sole ownership and generation.
+
+Cache outcomes do not settle custody: [dind-prune.ts](../agent/src/dind-prune.ts),
+`attempt()` at line 490 onward, releases only `gate.open()` in `finally`
+(the default owner is `cache`, lines 227-235). Its options and execution path
+have no custody-settlement callback or API call. [worker.ts](../agent/src/worker.ts),
+line 1119 onward, feeds heartbeat custody independently to cache prune and
+maintenance. [dind-maintenance.ts](../agent/src/dind-maintenance.ts), `safe()`
+at line 132 and `acknowledgement()` at line 159 onward, require maintenance's
+own matching fenced operation/registration identity, fresh false custody after
+activity, and a matching disposition for ACK, rather than a cache outcome.
+Its `tick()` at line 180 excludes an active cache owner before actuation.
+
+Existing [dind-maintenance.test.ts](../agent/test/dind-maintenance.test.ts),
+line 266 onward, checks unknown/null/malformed/stale binding and custody fail
+closed; line 323 onward checks cache running-container refusal, failure and
+backoff are not maintenance prerequisites: independently eligible maintenance
+is allowed. The precise regression gap is the absence of a single end-to-end
+API-custody persistence test across cache refusal/failure. The code boundary
+and focused controller tests are evidence, not whole-#2257 acceptance or an
+exclusion fix.
 
 These are execution-authorization gaps, not demonstrated cache-driven source
 loss. A proposed next plan needs serialization of conflicting local operations
@@ -290,8 +316,35 @@ and `run-quiescence.test.ts` suites under agent/test; the selected
 late-create coverage. No positive-exception red/green, runtime change or full
 suite result is claimed. An E2E literal sweep found no matching prune
 outcome/flag hits in e2e/phases, e2e/lib.sh, e2e/lib.test.sh or e2e/forge-fake;
-no runtime contract changed and no E2E phases ran. At the M1 checkpoint,
-broader static/component checks remained pending M2.
+no runtime contract changed and no E2E phases ran. Subsequent existing logs
+record agent dependency/lint/dead-code/type checks passing in 18s, the Go
+`api/internal/uzidocs` check passing in 14s wall time, docs validation passing
+for 80 pages with 48 existing style warnings, and changelog validation passing.
+These are the original recorded results; repair validation is reported separately.
+No positive held-custody exception red/green was performed because no
+runtime fix or exception was implemented.
+
+### Evidence inventory
+
+Durable code/test evidence is the linked custody/heartbeat/gate paths above,
+[prune tests](../agent/test/dind-prune.test.ts),
+[maintenance tests](../agent/test/dind-maintenance.test.ts), and
+[quiescence tests](../agent/test/run-quiescence.test.ts); pinned public upstream
+links are in the source boundary above. Local reports and logs below are
+**ephemeral, nonpublished evidence**, not durable links or published raw scratch.
+Paths identify this run's evidence only and may disappear with the worker.
+
+| Local evidence path (under `.uzi/scratch/`) | Recorded scope/result |
+| --- | --- |
+| `m1-report.md` | First isolated positive deletion/protection proof and its limits. |
+| `m1-race-recovery-report.md`, `m1-race-recovery-verification.log` | Recovered race evidence and offline consistency verification, exit 0; failed attempts remain failed. |
+| `gate-log.aCIiZf` | 71 + 4 focused tests, exit 0, coarse combined wall 2s. |
+| `gate-log.UMup34` | Agent static/dependency checks, exit 0, 18s. |
+| `gate-log.ogTDqU` | Go docs check, exit 0, 14s wall time. |
+| `gate-log.bss262` | Docs: 80 pages, 48 existing style warnings, exit 0. |
+| `gate-log.lWV4HO` | Changelog check, exit 0; recorded branch exemption, not a new fragment. |
+
+### Separate nonclosing gate
 
 The architect judged a candidate next-gate invariant, not approved policy:
 exclude tracked executions/in-flight claims, require fresh known custody after
@@ -301,6 +354,8 @@ can disappear before future acquisition. An explicit owner decision must accept
 that narrower invariant before a builder-only amendment; D7 alone is not approval.
 The proposed next plan continues refusing unknown, stale, missing, future or
 straddling custody. Current code has not been changed to implement that plan.
+Any runtime amendment remains a separate, nonclosing gate; this checkpoint
+leaves #3653 open and does not establish whole-#2257 acceptance.
 #2257 terminal/custody/volume/PVC authority remains unchanged. No threshold tuning
 is proposed; the historical 85-versus-90 cause is unknown. This checkpoint promises
 neither busy-worker reclaim nor hosted reclaimed bytes.
