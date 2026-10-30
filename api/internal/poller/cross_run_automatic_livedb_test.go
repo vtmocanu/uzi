@@ -86,15 +86,16 @@ func TestCrossRunDiscardAutomaticPollingLiveDB(t *testing.T) {
 				e.exec("UPDATE runs SET mr_state='merged' WHERE id=$1", witness)
 			}
 			if mode == "foreign_connection" {
-				other := newMergedPollEnv(t)
-				e.exec("UPDATE forge_connections SET user_id=$2 WHERE id=$1", e.conn, other.worker.UserID)
+				otherOwner := uuid.New()
+				e.exec("INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", otherOwner, otherOwner.String()+"@cross-run.test")
+				e.exec("UPDATE forge_connections SET user_id=$2 WHERE id=$1", e.conn, otherOwner)
 			}
 			if mode == "direct_consumer" || mode == "continued_consumer" {
 				consumer := uuid.New()
 				if mode == "direct_consumer" {
 					e.exec("INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,status) VALUES($1,$2,$3,'issue',101,'consumer','d','queued')", consumer, e.worker.UserID, e.repo)
 				} else {
-					e.exec("INSERT INTO runs(id,user_id,repo_id,kind,continued_issue_iid,issue_title,issue_description,status) VALUES($1,$2,$3,'task',101,'consumer','d','queued')", consumer, e.worker.UserID, e.repo)
+					e.exec("INSERT INTO runs(id,user_id,repo_id,kind,continued_issue_iid,issue_title,issue_description,status,branch) VALUES($1,$2,$3,'task',101,'consumer','d','queued','task/consumer')", consumer, e.worker.UserID, e.repo)
 				}
 			}
 			if mode == "parent_deadline" {
