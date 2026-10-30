@@ -5983,6 +5983,24 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
     });
   }
 
+  it("a recreated later epoch in the same run sends no second model/list", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "checkpoint")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    rig.deps = { ...rig.deps, catalogProbeTimeoutMs: 10 };
+    const { ctx } = makeCtx({ config: { default_effort: "max" as never }, checkpoint: async () => undefined });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "two-epoch run");
+    assert.equal(rig.providerLaunches(), 2, "a second epoch was really built");
+    const listed = rig.epochs.map((e) => e.transport.requests.filter((r) => r.method === "model/list").length);
+    assert.deepEqual(listed, [1, 0]);
+    assert.ok(rig.epochs[1]!.transport.requests.some((r) => r.method === "turn/start"));
+  });
+
   it("a resume rejection fallback probes at most once and sends one root turn/start", async () => {
     const { rig, error } = await run({
       effort: "max", list: () => catalog("gpt-6-astra", ["high"]), sessionId: "claimed-thread", rejectResume: true,

@@ -5020,11 +5020,10 @@ export class CodexExecutor implements Executor {
 
   /** PRD #3247 M2 policy: when the catalog lists the model but not the claim's level, emit one
    *  `effort_not_in_catalog` status. Never changes, retries or downgrades the level. */
-  private catalogProbeFor(ctx: RunContext, model: string, level: string) {
+  private catalogProbeFor(ctx: RunContext, level: string) {
     return {
-      model,
       timeoutMs: this.deps.catalogProbeTimeoutMs ?? CODEX_CATALOG_PROBE_TIMEOUT_MS,
-      onEntry: (entry: CodexCatalogEntry | undefined): void => {
+      onEntry: (entry: CodexCatalogEntry | undefined, model: string): void => {
         if (entry === undefined || entry.supportedEfforts.includes(level)) return;
         ctx.emit({ kind: "status", agent: "worker", payload: {
           event: "effort_not_in_catalog",
@@ -5044,6 +5043,7 @@ export class CodexExecutor implements Executor {
     revision: number,
     setupRegistries: Set<ExecutionRegistry>,
   ): Promise<ProviderEpoch> {
+    const level = codexEffort(ctx);
     // Snapshot the runner contract once for all effect surfaces in this epoch.
     // Legacy direct callers may still bind through the static executor option.
     const captureMemory = ctx.capturedMemory;
@@ -5362,9 +5362,7 @@ export class CodexExecutor implements Executor {
         // PRD #3247 M2: advisory catalog probe, only on the claim's first root epoch and only for an
         // explicit level (Runtime default carries none). The note is emitted from onEntry, which the
         // harness calls before the first turn/start; the level itself is always sent unchanged.
-        ...(epochIndex === 0 && codexEffort(ctx) !== undefined
-          ? { catalogProbe: this.catalogProbeFor(ctx, ctx.config?.default_model ?? provider.model, codexEffort(ctx) as string) }
-          : {}),
+        ...(epochIndex === 0 && level !== undefined ? { catalogProbe: this.catalogProbeFor(ctx, level) } : {}),
       });
 
       const epochHarness = harness;

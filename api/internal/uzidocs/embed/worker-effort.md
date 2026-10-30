@@ -40,7 +40,7 @@ a level at another value. Before the first turn of an ordinary Codex lead
 claim that carries an explicit level (Runtime default sends none), the worker
 reads the Codex runtime's own catalog with one read-only `model/list` request
 (limit 200, hidden models included, 2000 ms timeout). If the matched model's
-entry does not list the chosen level, the run feed shows one warning: "Codex
+entry does not list the chosen level, the run feed shows one warning per claim, before that claim's first turn: "Codex
 does not list reasoning effort `<level>` for `<model>`. uzi sends it
 unchanged; the provider may reject it. Choose a listed level or Runtime
 default." The level is still sent unchanged, and a provider rejection fails the

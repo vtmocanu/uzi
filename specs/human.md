@@ -198,7 +198,7 @@ Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/done/17-lead-template-and-
 - The Codex worker fallback is `gpt-6.1-sol`, included in the curated picker; explicit model choices remain authoritative. (AI-synced 2026-10-01)
 - Claude and Codex keep independent reasoning-effort preferences, both inheriting medium. Splitting preserves every existing explicit preference in both lanes; queued and resumed runs resolve preferences at claim time. (AI-synced 2026-10-01)
 - Each effort preference can also be Runtime default, which sends no effort level to the harness (Claude gets no `--effort`, Codex requests carry none); the level actually used is not reported, and a resumed session may keep the level it last used. Unset still means explicit medium, and cross-check checker defaults are unaffected. (AI-synced 2026-10-30)
-- When the Codex catalog does not list the chosen explicit effort for the model, the run feed warns once before the first turn; uzi never changes the level, and the warning is advisory (the catalog is per-account and can be wrong either way). (AI-synced 2026-10-30)
+- When the Codex catalog does not list the chosen explicit effort for the model, the run feed warns once per claim, before its first turn (a re-claimed run can warn again); uzi never changes the level, and the warning is advisory (the catalog is per-account and can be wrong either way). (AI-synced 2026-10-30)
 - Codex runs wait for a worker with the current runtime/catalog and correct effort handling; an older worker must not silently substitute a model or ignore the requested effort. (AI-synced 2026-10-01)
 
 ## Feature #18 — Worker templates, per-repo tools & agent scopes

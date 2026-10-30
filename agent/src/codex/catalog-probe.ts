@@ -11,10 +11,10 @@ export interface CodexCatalogEntry {
 /** Request params for the single, unpaginated probe call. */
 export const CATALOG_PROBE_LIMIT = 200;
 /** A `data` array longer than this is treated as malformed (no pagination, no partial scan). */
-export const CATALOG_MAX_ENTRIES = 200;
-export const CATALOG_MAX_MODEL_BYTES = 100;
-export const CATALOG_MAX_EFFORTS = 16;
-export const CATALOG_MAX_EFFORT_BYTES = 16;
+const CATALOG_MAX_ENTRIES = 200;
+const CATALOG_MAX_MODEL_BYTES = 100;
+const CATALOG_MAX_EFFORTS = 16;
+const CATALOG_MAX_EFFORT_BYTES = 16;
 
 function boundedString(v: unknown, maxBytes: number): string | undefined {
   return typeof v === "string" && Buffer.byteLength(v, "utf8") <= maxBytes ? v : undefined;

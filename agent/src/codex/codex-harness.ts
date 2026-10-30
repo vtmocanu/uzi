@@ -256,12 +256,11 @@ export interface CodexHarnessOptions {
   readonly idNonce?: string;
   /** PRD #3247 M2: opt-in, once-per-instance `model/list` probe. Runs after the root thread is
    *  started/resumed and before the first `turn/start`; `onEntry` is called synchronously with the
-   *  matching catalog entry, or `undefined` on any timeout/error/malformed/absent result. It never
+   *  matching catalog entry (and the model it was matched for), or `undefined` on any timeout/error/malformed/absent result. It never
    *  throws into the turn. */
   readonly catalogProbe?: {
-    readonly model: string;
     readonly timeoutMs: number;
-    readonly onEntry: (entry: CodexCatalogEntry | undefined) => void;
+    readonly onEntry: (entry: CodexCatalogEntry | undefined, model: string) => void;
   };
 }
 
@@ -645,31 +644,38 @@ export class CodexHarness implements RunHarness {
 
   /** PRD #3247 M2: one bounded `model/list` call; the result (or undefined) goes to `onEntry`.
    *  Consumed on first use so a recreated turn or a resume fallback never probes twice. */
-  private async runCatalogProbe(signal: AbortSignal): Promise<void> {
+  private async runCatalogProbe(abort: Promise<"aborted">): Promise<void> {
     const probe = this.catalogProbe;
     if (!probe) return;
     this.catalogProbe = undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let entry: CodexCatalogEntry | undefined;
+    // The exact model thread/start sends (currentModel is set in runTurn before this runs).
+    const model = this.currentModel ?? this.provider.model;
     try {
+      // No transport signal/deadline: either deletes the pending entry, so a late reply would
+      // surface as an unmatched response id and the root loop would answer an id the server never
+      // sent. The pending entry stays and absorbs a late reply; the race below bounds the wait.
       const call = this.requestOnTransport<unknown>(
         "model/list",
         { limit: CATALOG_PROBE_LIMIT, includeHidden: true },
-        { signal, deadlineMs: probe.timeoutMs },
       );
       const timeout = new Promise<undefined>((resolve) => {
         timer = setTimeout(() => resolve(undefined), probe.timeoutMs);
       });
       // A late rejection after the timeout wins must not become an unhandled rejection.
       call.catch(() => undefined);
-      entry = parseCatalogEntry(await Promise.race([call, timeout]), probe.model);
+      const result = await Promise.race([call, timeout, abort]);
+      // A stop/abort ends the wait without a note; the caller's abort check then skips turn/start.
+      if (result === "aborted") return;
+      entry = parseCatalogEntry(result, model);
     } catch {
       entry = undefined;
     } finally {
       if (timer) clearTimeout(timer);
     }
     try {
-      probe.onEntry(entry);
+      probe.onEntry(entry, model);
     } catch {
       /* the note is advisory; a callback fault never reaches the turn */
     }
@@ -1284,7 +1290,7 @@ export class CodexHarness implements RunHarness {
       }
 
       // PRD #3247 M2: advisory catalog probe, before the abort check so a stop during it is honoured.
-      await this.runCatalogProbe(request.signal);
+      await this.runCatalogProbe(abortPromise);
 
       // 3. Stop before sending model work if cancellation arrived during thread setup.
       if (request.signal.aborted || this.stopRequested) {

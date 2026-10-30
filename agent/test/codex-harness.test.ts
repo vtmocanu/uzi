@@ -6198,7 +6198,7 @@ describe("#3247 catalog probe", () => {
     const transport = new FakeTransport((method, params) => { order.push(method); return responder(method, params); });
     const { harness } = makeHarness({
       transport,
-      catalogProbe: { model: "gpt-6-astra", timeoutMs, onEntry: (e) => { order.push("onEntry"); entries.push(e); } },
+      catalogProbe: { timeoutMs, onEntry: (e) => { order.push("onEntry"); entries.push(e); } },
     });
     transport.push(turnCompletedWithError("serverOverloaded")).end();
     try {
@@ -6243,10 +6243,70 @@ describe("#3247 catalog probe", () => {
 
   it("a throwing onEntry never reaches the turn", async () => {
     const transport = new FakeTransport((m) => (m === "model/list" ? listing("gpt-6-astra", ["low"]) : defaultResponder(m)));
-    const { harness } = makeHarness({ transport, catalogProbe: { model: "gpt-6-astra", timeoutMs: 1000, onEntry: () => { throw new Error("x"); } } });
+    const { harness } = makeHarness({ transport, catalogProbe: { timeoutMs: 1000, onEntry: () => { throw new Error("x"); } } });
     transport.push(turnCompletedWithError("serverOverloaded")).end();
     try { await collect(harness.startTurn(makeRequest()).events); } finally { await harness.close(); }
     assert.ok(transport.requests.some(r => r.method === "turn/start"));
+  });
+
+  it("a stop or abort during an unanswered model/list ends the turn promptly with no turn/start", async () => {
+    for (const how of ["requestStop", "abort"] as const) {
+      const transport = new FakeTransport((m) => (m === "model/list" ? new Promise(() => undefined) : defaultResponder(m)));
+      const { harness } = makeHarness({
+        transport, catalogProbe: { timeoutMs: 60_000, onEntry: () => { throw new Error("no note after a stop"); } },
+      });
+      const ac = new AbortController();
+      const turn = harness.startTurn(makeRequest({ signal: ac.signal }));
+      const done = collect(turn.events);
+      const deadline = Date.now() + 3000;
+      while (!transport.requests.some(r => r.method === "model/list") && Date.now() < deadline) await tick();
+      assert.ok(transport.requests.some(r => r.method === "model/list"), "probe in flight");
+      if (how === "requestStop") turn.requestStop("cancel"); else ac.abort();
+      try { await withTimeout(done, 2000, how); } finally { await harness.close(); }
+      assert.ok(!transport.requests.some(r => r.method === "turn/start"), `${how}: no turn/start`);
+    }
+  });
+
+  it("a model/list reply that arrives after the harness timeout is absorbed: no response frame, no unmatched note", async () => {
+    const inbound = new PassThrough();
+    const outbound = new PassThrough();
+    const transport = createCodexTransport({ inbound, outbound });
+    const entries: unknown[] = [];
+    const { harness } = makeHarness({
+      launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }),
+      catalogProbe: { timeoutMs: 20, onEntry: (e) => { entries.push(e); } },
+    });
+    const written: Record<string, unknown>[] = [];
+    let buffered = "";
+    let listId: unknown;
+    outbound.setEncoding("utf8");
+    outbound.on("data", (chunk: string) => {
+      buffered += chunk;
+      let end: number;
+      while ((end = buffered.indexOf("\n")) !== -1) {
+        const frame = rec(JSON.parse(buffered.slice(0, end)));
+        buffered = buffered.slice(end + 1);
+        written.push(frame);
+        if (frame.id === undefined || typeof frame.method !== "string") continue;
+        if (frame.method === "model/list") { listId = frame.id; continue; }
+        inbound.write(JSON.stringify({ id: frame.id, result: defaultResponder(frame.method) }) + "\n");
+        if (frame.method === "turn/start") {
+          // The harness timer has fired by now; the late reply and the turn end follow it.
+          setTimeout(() => {
+            inbound.write(JSON.stringify({ id: listId, result: { data: [] } }) + "\n");
+            const n = turnCompleted("completed");
+            inbound.write(JSON.stringify({ method: n.method, params: n.params }) + "\n");
+          }, 30);
+        }
+      }
+    });
+    try {
+      await withTimeout(collect(harness.startTurn(makeRequest()).events), 5000, "late model/list");
+    } finally { await harness.close(); inbound.destroy(); outbound.destroy(); }
+    assert.deepEqual(entries, [undefined]);
+    assert.ok(listId !== undefined, "model/list was sent");
+    assert.equal(written.filter(f => f.method === undefined && (f.result !== undefined || f.error !== undefined)).length, 0,
+      "the worker wrote no JSON-RPC response frame for the late model/list id");
   });
 
   describe("parseCatalogEntry bounds", () => {
