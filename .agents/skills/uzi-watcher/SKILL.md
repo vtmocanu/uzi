@@ -208,6 +208,9 @@ not assured success, and another adoption failure holds again. Other
 park stops with `STOP=recovery_wait:worker_memory_pressure` (exit 0), regardless of `memory_hold`:
 remaining interventions do not authorize automatic retries. Back up available work first,
 then ask the owner to Resume or Cancel.
+An unsettled memory continuation (the predecessor's source use was never positively ended)
+re-parks at the same hold on Resume until #3639, so Cancel or an operator discard is the exit.
+`backup-runs.sh` accepts the v1 `memoryPark` journal field.
 `uzi-lander` uses this same poller for its
 blind watch to terminal.
 

@@ -85,6 +85,25 @@ from recovery after an actual OOM kills a worker.
    prove retained work has been archived or authorize deleting uncertain
    local source.
 
+After a memory park, the parking worker ends its own source use only on
+positive evidence. If it did, Resume lets a fresh worker continue normally from
+the retained work. If it did not (the park was not confirmed, or the source end
+was not durably recorded), a fresh worker re-parks the run at the same
+`worker_memory_pressure` hold instead of failing it. Until the companion
+issue #3639 lands, Resume of such an unsettled continuation re-parks
+immediately, so **Cancel** or an operator discard of the retained source is the
+exit; when the unended source belongs to a worker process that is still running,
+that lasts until the process restarts. The fresh worker logs
+`predecessor cooperative settlement verified` or `unverified` for diagnosis only;
+neither releases custody. A crash after the park was accepted but before the
+worker finished tearing down leaves no record and follows the existing
+terminal path.
+
+Workers built before this change reject the new `memoryPark` journal record and
+fail closed on it: they refuse to attach, recover or discard that source. Roll
+workers back only after memory-parked runs are resolved. See the
+[ADR-2396 amendment](../adr/2396-worker-memory-guard.md#amendment-2026-10-30-cooperative-memory-source-settlement-issue-3638).
+
 Credential changes, Codex account changes, budget extension, approval,
 follow-up and pause do not release a held memory episode. Extending a timed
 run can supply budget for a subsequent owner Resume, but does not itself
