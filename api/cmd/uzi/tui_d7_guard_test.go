@@ -91,6 +91,7 @@ import (
 // added here — that is this guard's standing weakness, and it is why the render tests
 // remain the primary defence rather than this.
 var d7UntrustedFields = []string{
+	"Origin", "HalfOpenRunID", // Forge cooldown text; Detail is also guarded below.
 	// Session answer drafts and delivery outcomes (tui_answer.go).
 	"answerText",
 	"answerNotice",

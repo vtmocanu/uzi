@@ -142,8 +142,8 @@ func (s *Service) parkDataVolumeFull(ctx context.Context, wkr store.Worker, owne
 			SessionID:  sessionID,
 			ID:         run.ID,
 			WorkerID:   workerID,
-			// Already fenced by the FOR UPDATE lock plus the generation check above, as in
-			// parkForgeUnreachable's cap-fail: explicit nil.
+			// Already fenced by the FOR UPDATE lock plus the generation check above;
+			// no additional claim-generation predicate is needed here.
 			ClaimGeneration: pgtype.Int8{},
 		})
 		if ferr != nil {

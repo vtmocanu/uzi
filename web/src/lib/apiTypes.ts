@@ -162,6 +162,21 @@ export interface ModelSettingCell {
   source: string;
 }
 
+/** One harness's cell of the ordinary reasoning-effort setting (PRD #3247), parallel to
+ *  ModelSettingCell. `effort` is the stored token (null = Default, a level, or
+ *  "runtime"); `resolved_effort` is the level a claim sends, null exactly when `mode`
+ *  is "runtime_default". `source` is user_default | builtin; labelled by
+ *  fixtures/model-settings/contract.json. */
+export interface EffortSettingCell {
+  harness: Harness;
+  effort: string | null;
+  default_effort: string;
+  default_source: string;
+  resolved_effort: string | null;
+  source: string;
+  mode: "explicit" | "runtime_default";
+}
+
 export interface UserSettings {
   vault_auto_reunlock?: boolean;
   cross_check_pins?: CrossCheckPinDTO[];
@@ -196,6 +211,9 @@ export interface UserSettings {
   /** Read-only resolved view of both judge lanes (PRD #3245), claude then codex.
    *  Never sent on a PUT. Optional for older servers. */
   judge_models?: ModelSettingCell[];
+  /** Read-only resolved view of both ordinary effort preferences (PRD #3247), claude
+   *  then codex. Never sent on a PUT. Optional for older servers. */
+  effort_settings?: EffortSettingCell[];
   /** Per-user run-summary model override (PRD #362 M2); null means inherit the
    *  instance summary_model (which itself falls back to haiku). Written through
    *  PUT /me/settings alongside judge_model, validated by the same model rules. */
@@ -2467,7 +2485,17 @@ export interface WorkerRollPacing {
   retained_version?: string;
 }
 
+/** Advisory owner-only snapshot; expiry never verifies forge recovery or grants authority. */
+export interface ForgeOriginCooldown {
+  origin: string;
+  cooled_until: string;
+  half_open_run_id: string | null;
+  state: "cooling" | "half_open" | "retry_eligible_unverified" | "legacy_serialized_until_upgrade" | "reserved_unverified";
+  detail: string;
+}
+
 export interface Worker {
+  forge_origin_cooldowns?: ForgeOriginCooldown[];
   // Optional for compatibility with APIs predating manual owner cordons.
   manual_cordoned_at?: string | null;
   manual_cordoned_by?: string | null;
@@ -3123,6 +3151,7 @@ export interface RunLeadConfig {
 }
 
 export interface Run {
+  forge_origin_cooldown?: ForgeOriginCooldown;
   capability_provenance?: {
     hints_known: boolean;
     inference_known: boolean;
@@ -3636,12 +3665,12 @@ export interface Run {
    *  the next retry a `vault_locked` park resumes at once the vault is unlocked. The
    *  recovery-park analog of retry_not_before (the usage-limit park's stamp) and a SEPARATE
    *  field: a run parks on at most one of the two at a time. Null for a run that has never
-   *  recovery-parked. For retained_recovery_exhausted, explicit null means owner-held;
+   *  recovery-parked. For forge_unreachable and retained_recovery_exhausted, explicit null means owner-held;
    *  a valid timestamp means timed retry (including when already due). Missing or invalid
    *  timing is unknown. For retained_recovery_adoption_failed this is always null and must
    *  never produce a retry countdown, even if a malformed response supplies a timestamp.
    *  ISO-8601 string, like every other timestamp on this type. */
-  recovery_retry_not_before: string | null;
+  recovery_retry_not_before?: string | null;
   /** PRD #1392 M1: how many times this run has forge-parked in its lifetime — the
    *  FORGE-ONLY counter the cap decides on. 0 for a run that has never forge-parked
    *  (including every empty-turn park, which never touches it). Rendered as the "N" in

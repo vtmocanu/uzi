@@ -69,7 +69,8 @@ func testRetainedRecoveryOwnerResumeLiveDB(t *testing.T, cause string) {
 				t.Fatalf("duplicate Resume status=%d", rec.Code)
 			}
 			// Other timed parks must not become owner-resumable through this endpoint.
-			if _, err := fx.pool.Exec(fx.ctx, "UPDATE runs SET status='recovery_wait', recovery_wait_cause='forge_unreachable' WHERE id=$1", id); err != nil {
+			// A NULL retry stamp is the forge owner hold, which its own Resume accepts.
+			if _, err := fx.pool.Exec(fx.ctx, "UPDATE runs SET status='recovery_wait', recovery_wait_cause='forge_unreachable', recovery_retry_not_before=now()+interval '1 hour' WHERE id=$1", id); err != nil {
 				t.Fatal(err)
 			}
 			if rec := recoveryResumeRequest(h, id, fx.userID); rec.Code != http.StatusConflict {

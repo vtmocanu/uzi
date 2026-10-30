@@ -1004,16 +1004,30 @@ FROM runs WHERE id = @id AND user_id = @user_id AND repo_id = @repo_id;
 -- PRD #1296 M1 (D2/D3): the claim now runs as leading CTEs before the UPDATE so the hold
 -- is opened atomically in the SAME statement. `target` selects + LOCKS the single claimable
 -- run ONCE (carrying the columns the hold needs); `hold` opens the H-free custody hold for a
--- recovery-capable worker on a code-publishing profile, reading FROM target so it inserts
--- iff a run was actually claimable; then the UPDATE claims that same target row. The final
+-- recovery-capable worker on a code-publishing profile, reading FROM forge_admitted so it inserts
+-- iff a run passed origin reservation; then the UPDATE claims that same target row. The final
 -- statement is `UPDATE runs ... RETURNING *`, so the :one result is still store.Run — the
 -- hold is a side effect. target and hold share target's single snapshot/lock, so the hold's
 -- t.claim_generation + 1 equals the UPDATE's own increment.
 WITH claimant AS MATERIALIZED (
     SELECT * FROM workers WHERE id = @worker_id FOR UPDATE
 ), target AS (
-    SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id FROM runs r
+    SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id,
+           fo.connection_id AS forge_connection_id, fo.origin AS forge_origin, fc.incarnation AS forge_incarnation,
+           fc.observation_version AS forge_observation_version
+    FROM runs r
+    LEFT JOIN authorized_forge_origins fo
+      ON fo.repo_id = r.repo_id AND fo.user_id = r.user_id
+        AND r.egress_profile_id IS NULL
+        -- A code checker never contacts the forge, so it takes no origin reservation.
+        AND NOT (r.kind = 'cross_check' AND EXISTS (
+            SELECT 1 FROM cross_checks cc
+            WHERE cc.lead_run_id = r.target_run_id AND cc.stage = 'code' AND cc.checker_run_id = r.id))
+    LEFT JOIN forge_origin_cooldowns fc
+      ON fc.user_id = r.user_id AND fc.worker_id = @worker_id AND fc.origin = fo.origin
     WHERE r.user_id = @user_id
+      -- Hard admission even for a lone worker, an old run, or its own resume.
+      AND EXISTS (SELECT 1 FROM claimant c WHERE fn_forge_origin_eligible(c, r, now()))
       -- Admission is a snapshot read, before generation advances or custody opens.
       -- NULL is unrestricted; the deadline includes the account's recovery spread.
       AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
@@ -1074,9 +1088,12 @@ WITH claimant AS MATERIALIZED (
            -- exceeds the 45s @heartbeat_cutoff, so a heartbeat-gated hold would wrongly
            -- fall open mid-swap (accepted tradeoff D7: a draining+dead owner then holds
            -- until the @affinity_cutoff ceiling).
+           -- Forge failure releases this pin early only with complete guarded
+           -- source-history proof; an empty current hold is not absence proof.
            OR NOT EXISTS (
                SELECT 1 FROM workers ow
                WHERE ow.id = r.worker_id
+                 AND fn_forge_origin_owner_pins(ow, r, now())
                  AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced
                       OR (ow.last_heartbeat_at IS NOT NULL
                           AND ow.last_heartbeat_at >= @heartbeat_cutoff)
@@ -1453,6 +1470,7 @@ WITH claimant AS MATERIALIZED (
                 -- A draining peer claims nothing (PRD #422 Decision 7), so never DEFER a
                 -- run to it — it would never pick the run up.
                 AND fn_worker_accepts_new_intake(p)
+                AND fn_forge_origin_eligible(p, r, now())
                 -- PRD #529 Decision 4: an ephemeral peer claims ONLY its own bound run
                 -- (ClaimRun's claimant clause above), so it would never pick up a
                 -- FOREIGN run — same failure mode as the draining-peer guard. Deferring
@@ -1700,15 +1718,38 @@ WITH claimant AS MATERIALIZED (
              (r.reserve_hold_reason IS NOT NULL) ASC,
              fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC,
              r.created_at ASC
-    FOR UPDATE SKIP LOCKED
+    FOR UPDATE OF r SKIP LOCKED
     LIMIT 1
+),
+forge_reservation AS (
+    -- One conditional write, no retry. The existing row is locked only after
+    -- claimant and target. A stale snapshot loses here without opening custody
+    -- or advancing G. A concurrent first observation on the no-row path remains
+    -- advisory: do not serialize insertion of a new origin row.
+    UPDATE forge_origin_cooldowns c SET
+        reservation_run_id = t.id,
+        reservation_generation = t.claim_generation + 1,
+        reservation_incarnation = c.incarnation,
+        reservation_version = c.observation_version,
+        reservation_observation_version = c.observation_version
+    FROM target t
+    WHERE c.user_id = t.user_id AND c.worker_id = @worker_id AND c.origin = t.forge_origin
+      AND c.incarnation = t.forge_incarnation
+      AND c.observation_version = t.forge_observation_version
+      AND c.cooled_until <= now() AND c.reservation_run_id IS NULL
+    RETURNING c.reservation_run_id AS run_id
+),
+forge_admitted AS MATERIALIZED (
+    SELECT t.* FROM target t
+    WHERE t.forge_incarnation IS NULL
+       OR EXISTS (SELECT 1 FROM forge_reservation fr WHERE fr.run_id = t.id)
 ),
 hold AS (
     -- PRD #1296 M1 (D2/D3): open the H-free custody hold atomically with the claim, for a
     -- RECOVERY-CAPABLE worker (@recovery_capable, derived from the worker's advertised
     -- recovery_archive_v1, recovery_archive_v2 or recovery_inventory_v1 protocol capability) on one of the six code-publishing profiles.
-    -- Reads FROM `target`, so it inserts exactly one hold iff a run was actually claimable
-    -- (an admission-gated or idle claim produces no `target` row and thus no hold). Both live
+    -- Reads FROM forge_admitted, so a failed reservation cannot open a hold.
+    -- An admission-gated or idle claim also produces no hold. Both live
     -- FKs point at the claimed run + claiming worker (ON DELETE RESTRICT while open), and the
     -- immutable provenance columns record the taking worker's identity for a later
     -- AAD-authenticated post-terminal recovery retry. t.claim_generation + 1 is the SAME
@@ -1720,7 +1761,7 @@ hold AS (
     SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
            @worker_id, @worker_identity::text, @worker_id, t.id, now(), now(),
            ('recovery_inventory_v1' = ANY(@worker_protocol_caps::text[]))
-    FROM target t
+    FROM forge_admitted t
     WHERE @recovery_capable::boolean
       AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
       -- PRD #1906 M5: a profile-bound run publishes no code (no repo, no forge credential, no
@@ -1729,6 +1770,8 @@ hold AS (
     RETURNING 1
 )
 UPDATE runs SET
+    forge_admission = jsonb_build_object('generation', runs.claim_generation + 1, 'worker_id', @worker_id::uuid,
+        'connection_id', (SELECT forge_connection_id FROM forge_admitted), 'origin', (SELECT forge_origin FROM forge_admitted)),
     cross_check_lane = COALESCE(@lane::text = 'cross_check', false),
     status     = 'claimed',
     status_since = now(),
@@ -1773,9 +1816,9 @@ UPDATE runs SET
     -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
     -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
     health = 'ok', health_reason = NULL, health_since = NULL
-WHERE runs.id = (SELECT id FROM target)
+WHERE runs.id = (SELECT id FROM forge_admitted)
   AND runs.status = 'queued'
-  AND runs.claim_generation = (SELECT claim_generation FROM target)
+  AND runs.claim_generation = (SELECT claim_generation FROM forge_admitted)
 RETURNING runs.*;
 
 -- name: GetCustodyAdmissionForRun :one
@@ -1869,7 +1912,20 @@ SELECT r.checkpoint_tip,
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
-WHERE r.id = @run_id;
+WHERE r.id = @run_id
+  -- Claims predating this migration have no snapshot: preserve their existing
+  -- authorization. New claims stamp a row even when normalization is unknown.
+  -- Noncloning isolated research still uses the owner-scoped context for its
+  -- fetch credential; Git placement metadata never grants or denies that lane.
+  -- Never reauthorize a cloning generation against a changed or unknown mapping.
+  AND (r.status <> 'claimed' OR r.egress_profile_id IS NOT NULL OR NOT EXISTS (
+      SELECT 1 FROM run_forge_origins m
+      WHERE m.run_id = r.id AND m.worker_id = r.worker_id AND m.generation = r.claim_generation)
+    OR EXISTS (
+      SELECT 1 FROM run_forge_origins m
+      JOIN authorized_forge_origins a ON a.repo_id = r.repo_id AND a.user_id = r.user_id
+      WHERE m.run_id = r.id AND m.worker_id = r.worker_id AND m.generation = r.claim_generation
+        AND m.connection_id = c.id AND m.origin = a.origin));
 
 -- name: SetRunAnthropicSecret :execrows
 -- Record WHICH Anthropic credential this claim spends (PRD #111 M1). Written by
@@ -3324,6 +3380,45 @@ WHERE id = @id AND worker_id = @worker_id
   AND kind NOT IN ('judge', 'job', 'cross_check')
 RETURNING *;
 
+-- name: HoldRunForgeUnreachable :one
+-- The exhausted finite forge allowance holds for an explicit owner Resume.
+-- Preserve lifetime counts, custody, worker/session affinity and claim posture.
+-- The service holds the exact-generation run and custody locks before this write.
+UPDATE runs SET
+    status = 'recovery_wait', status_since = now(),
+    recovery_wait_cause = 'forge_unreachable', recovery_retry_not_before = NULL,
+    recovery_wait_count = recovery_wait_count + 1,
+    session_id = COALESCE(sqlc.narg('session_id'), session_id),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status = 'running' AND claim_generation = @claim_generation::bigint
+  AND claim_released_at IS NULL AND COALESCE(stop_kind, '') = ''
+  AND kind NOT IN ('judge', 'job', 'cross_check')
+RETURNING *;
+
+-- name: ResumeForgeUnreachableHold :one
+-- One ordinary queued attempt, without a new allowance, grant or episode.
+-- Keep cooldown and custody independent: Resume is not evidence of forge health.
+-- Preserve started_at and bank the hold only after execution started, as in ResumeWorkerRecoveryEpisode.
+UPDATE runs SET
+    status = 'queued', status_since = now(),
+    recovery_wait_cause = NULL, recovery_retry_not_before = NULL,
+    budget_paused_seconds = runs.budget_paused_seconds
+        + CASE WHEN runs.started_at IS NOT NULL
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
+               ELSE 0 END,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
+  AND recovery_wait_cause = 'forge_unreachable' AND recovery_retry_not_before IS NULL
+  AND COALESCE(stop_kind, '') = ''
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
+       OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+          - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
+RETURNING *;
+
 -- name: ParkRunDataVolumeFull :one
 -- PRD #1809 M5 (D6): the DATA-VOLUME-FULL park writer, the typed sibling of
 -- ParkRunForgeUnreachable — same 'recovery_wait' transition, same backoff-shaping
@@ -3611,6 +3706,7 @@ WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
   AND (runs.recovery_wait_cause IS DISTINCT FROM 'codex_idle_stall' OR runs.recovery_retry_not_before IS NOT NULL)
+  AND (runs.recovery_wait_cause IS DISTINCT FROM 'forge_unreachable' OR runs.recovery_retry_not_before IS NOT NULL)
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
@@ -3667,6 +3763,7 @@ UPDATE runs SET
     updated_at = now()
 WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
   AND (runs.recovery_wait_cause IS DISTINCT FROM 'codex_idle_stall' OR runs.recovery_retry_not_before IS NOT NULL)
+  AND (runs.recovery_wait_cause IS DISTINCT FROM 'forge_unreachable' OR runs.recovery_retry_not_before IS NOT NULL)
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
@@ -9886,12 +9983,12 @@ SELECT id, runs.user_id, status, auto_approve,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
                 AND runs.worker_id IS NOT NULL
                 AND runs.stale_requeue_generation = runs.claim_generation
-                AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id), false)::boolean AS stale_requeue_pinnable,
+                AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id AND fn_forge_origin_owner_pins(ow, runs, now())), false)::boolean AS stale_requeue_pinnable,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
                 AND runs.worker_id IS NOT NULL
-                AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id
+                AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id AND fn_forge_origin_owner_pins(ow, runs, now())
                             AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)::boolean AS owner_hold_pinnable,
-       COALESCE((SELECT ow.name FROM workers ow WHERE ow.id = runs.worker_id), '')::text AS stale_requeue_worker_name,
+       COALESCE((SELECT ow.name FROM workers ow WHERE ow.id = runs.worker_id AND fn_forge_origin_owner_pins(ow, runs, now())), '')::text AS stale_requeue_worker_name,
        (runs.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL)))::boolean AS cross_check_pin_required,
        (SELECT MIN(evidence.since) FROM (
            SELECT a.terminal_pending_since AS since FROM worker_active_runs a
@@ -10089,6 +10186,10 @@ WHERE w.user_id = @user_id
 -- would turn "weekly reserve" into a bogus "no worker can claim" reading.
 WITH candidates AS (
 SELECT w.id,
+       fn_forge_origin_eligible(w,run,@cross_check_evaluated_at::timestamptz)::boolean AS forge_eligible,
+       EXISTS (SELECT 1 FROM authorized_forge_origins a JOIN forge_origin_cooldowns c
+               ON c.user_id = a.user_id AND c.origin = a.origin AND c.worker_id = w.id
+               WHERE a.repo_id = run.repo_id AND a.user_id = run.user_id)::boolean AS has_cooldown,
        COALESCE(codex_admission_run_eligible_at(run.id) <= now(), true)::boolean AS admission_eligible,
        (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))::boolean AS strict_candidate,
        fn_worker_accepts_new_intake(w)::boolean AS accepts_intake,
@@ -10114,6 +10215,11 @@ SELECT w.id,
        (w.status = 'online') AS online,
        (CASE WHEN run.kind = 'cross_check' THEN fn_cross_check_child_eligible(w, run, true, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz)
              ELSE w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs END) AS free_slot,
+       -- Counterfactual capacity for diagnostics only; free_slot retains admission filtering.
+       (CASE WHEN run.kind = 'cross_check' AND w.max_cross_check_slots IS NOT NULL THEN
+             (SELECT count(*) FROM runs active WHERE active.worker_id = w.id AND active.cross_check_lane
+              AND active.status IN ('claimed','running','awaiting_approval','awaiting_input','awaiting_followup')) < w.max_cross_check_slots
+             ELSE w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs END) AS capacity_free,
        (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, NOT fn_worker_accepts_new_intake(w),
               @ephemeral_lease::interval, now(),
@@ -10141,6 +10247,7 @@ SELECT w.id,
        (NOT w.ephemeral) AS persistent,
        (run.kind = 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
+                       AND fn_forge_origin_owner_pins(ow, run, @cross_check_evaluated_at::timestamptz)
                        AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
                             (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= @heartbeat_cutoff)
                             -- #2705 pin P, mirroring ClaimRun's stale-requeue grace arm.
@@ -10241,14 +10348,16 @@ WHERE run.id = @run_id
        OR run.released_worker_nonce IS DISTINCT FROM w.snapshot_register_nonce)
 )
 SELECT COALESCE(bool_or(own_worker AND automatic_hold), false)::boolean AS automatic_owner_hold,
-       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND affinity AND strict_binding)::bigint AS strict_eligible,
+       count(*) FILTER (WHERE admission_eligible AND forge_eligible AND strict_candidate AND heartbeat_recent AND online AND affinity AND strict_binding)::bigint AS strict_eligible,
+       count(*) FILTER (WHERE admission_eligible AND NOT forge_eligible AND has_cooldown AND strict_candidate AND heartbeat_recent AND online
+                             AND NOT hard_fenced AND (accepts_intake OR own_worker) AND affinity AND strict_binding AND capacity_free)::bigint AS forge_blocked,
        -- Legacy advisory availability deliberately ignores status and affinity.
-       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND NOT hard_fenced AND (accepts_intake OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
-       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND NOT hard_fenced AND own_worker AND affinity AND free_slot AND advisory_binding)::bigint AS assigned_claimable,
-       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
-       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
-       count(*) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
-       max(draining_since) FILTER (WHERE admission_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
+       count(*) FILTER (WHERE admission_eligible AND forge_eligible AND strict_candidate AND heartbeat_recent AND NOT hard_fenced AND (accepts_intake OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
+       count(*) FILTER (WHERE admission_eligible AND forge_eligible AND strict_candidate AND heartbeat_recent AND online AND NOT hard_fenced AND own_worker AND affinity AND free_slot AND advisory_binding)::bigint AS assigned_claimable,
+       count(*) FILTER (WHERE admission_eligible AND forge_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
+       count(*) FILTER (WHERE admission_eligible AND forge_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
+       count(*) FILTER (WHERE admission_eligible AND forge_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
+       max(draining_since) FILTER (WHERE admission_eligible AND forge_eligible AND strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
        , count(*) FILTER (WHERE strict_candidate AND diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding)::bigint AS diagnostic_suitable
        , count(*) FILTER (WHERE strict_candidate AND diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll)::bigint AS diagnostic_rolling
        , count(*) FILTER (WHERE strict_candidate AND diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll
@@ -10569,6 +10678,7 @@ JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
   -- Filter admission before LIMIT so held accounts cannot crowd out demand.
   AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
+  AND fn_forge_origin_provision_allowed(r, now())
   AND r.kind <> 'chat'
   AND NOT EXISTS (SELECT 1 FROM cross_checks code_check
                   WHERE code_check.checker_run_id = r.id AND code_check.stage = 'code')
@@ -10582,6 +10692,7 @@ WHERE r.status = 'queued'
         r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
     AND r.updated_at >= @affinity_cutoff::timestamptz
     AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
+                AND fn_forge_origin_owner_pins(ow, r, now())
                 AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)
   -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
   -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
@@ -10601,7 +10712,8 @@ WHERE r.status = 'queued'
     AND r.stale_requeue_generation = r.claim_generation
     AND r.status_since > sqlc.narg('stale_requeue_cutoff')::timestamptz
     AND r.updated_at >= @affinity_cutoff::timestamptz
-    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id), false)
+    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
+                AND fn_forge_origin_owner_pins(ow, r, now())), false)
   -- PRD #1908 (D-A): the non-job placement predicate stays separate from jobs.
   -- The OR lets a repo-less 'job' (whose required_capabilities is
   -- always '{}', so the first conjunct is false for it) is decided by the job arm instead. AND
@@ -10797,6 +10909,7 @@ JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
   -- Filter admission before LIMIT so held accounts cannot crowd out demand.
   AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
+  AND fn_forge_origin_provision_allowed(r, now())
   AND r.kind <> 'chat'
   AND NOT EXISTS (SELECT 1 FROM cross_checks code_check
                   WHERE code_check.checker_run_id = r.id AND code_check.stage = 'code')
@@ -10810,6 +10923,7 @@ WHERE r.status = 'queued'
         r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
     AND r.updated_at >= @affinity_cutoff::timestamptz
     AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
+                AND fn_forge_origin_owner_pins(ow, r, now())
                 AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)
   -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
   -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
@@ -10829,7 +10943,8 @@ WHERE r.status = 'queued'
     AND r.stale_requeue_generation = r.claim_generation
     AND r.status_since > sqlc.narg('stale_requeue_cutoff')::timestamptz
     AND r.updated_at >= @affinity_cutoff::timestamptz
-    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id), false)
+    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
+                AND fn_forge_origin_owner_pins(ow, r, now())), false)
   AND now() - r.status_since > @saturation_delay::interval
   AND EXISTS (
       SELECT 1 FROM workers w
@@ -10916,6 +11031,7 @@ WHERE r.status = 'queued'
         AND ((fn_worker_accepts_new_intake(w))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
         AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = r.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
+        AND fn_forge_origin_eligible(w, r, now())
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
              -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not

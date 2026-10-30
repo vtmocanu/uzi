@@ -114,6 +114,16 @@ describe("checker defaults", () => {
     expect(mocked.listAgentTemplates).not.toHaveBeenCalled();
   });
 
+  // PRD #3247: the ordinary worker preference may be the preference-only "runtime" token;
+  // the checker's Default stays the cross-check default and no runtime option is offered.
+  it("keeps the checker Default at high when the ordinary preference is runtime", () => {
+    render(<CrossCheckDefaults settings={settings({ default_effort: "runtime", default_codex_effort: "runtime" })} />);
+    for (const family of ["Claude", "Codex"]) {
+      expect(within(effort(family)).getByRole("option", { name: "Default · high (cross-check default)" })).toBeTruthy();
+      expect(Array.from(effort(family).options).map((o) => o.value)).toEqual(["", "low", "medium", "high", "xhigh", "max"]);
+    }
+  });
+
   it("saves both changed cells atomically, retains failed drafts, and commits response normalization", async () => {
     const onSaved = vi.fn();
     render(<CrossCheckDefaults settings={settings()} onSaved={onSaved} />);

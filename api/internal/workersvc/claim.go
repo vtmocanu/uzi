@@ -24,6 +24,7 @@ import (
 // structured templates (PRD #3 provides several subagents that map to
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
+	ForgeOriginReservation *ForgeOriginReservation `json:"forge_origin_reservation,omitempty"`
 	// CheckpointWriteUnresolved is admission-time evidence for validated enrolled tasks;
 	// nil leaves recovery status unknown for legacy claims.
 	CheckpointWriteUnresolved *bool                        `json:"checkpoint_write_unresolved,omitempty"`
@@ -639,13 +640,13 @@ type ClaimConfig struct {
 	// DefaultEffort is the SDK effort level the worker applies to the lead/main
 	// thread: the owner's explicit per-user reasoning effort (PRD #617), or the uzi
 	// default `medium` (issue #1157) when the owner has not chosen (NULL). It is
-	// populated for every issue-lane claim assembled through resolveEffortPtr; the
-	// judge lane (issue #1157) now ALSO populates it best-effort through the same
-	// resolveEffortPtr, inheriting the owner's per-user default_effort (uzi default
-	// `medium` when NULL) just like the run/chat lanes, so judge runs carry the owner's
-	// effort rather than riding the SDK's own fallback. omitempty is retained. Unlike
-	// DefaultModel there is no per-run/per-schedule freeze; the owner's per-user value
-	// is the only source.
+	// populated for every ordinary claim assembled through resolveHarnessEffortPtr /
+	// resolveEffortPtr (the judge lane included, best-effort) EXCEPT when the owner
+	// chose Runtime default (stored `runtime`, PRD #3247): then it is nil and omitempty
+	// drops the key so the runtime picks. A claim never carries the string `runtime`.
+	// Unlike DefaultModel there is no per-run/per-schedule freeze; the owner's
+	// per-user value is the only source (a checker child carries its frozen
+	// cross-check effort instead).
 	DefaultEffort *string `json:"default_effort,omitempty"`
 	// DefaultModelSource says who decided DefaultModel (a leadcfg.ModelSource token:
 	// schedule_pin or user_default today). PRD #3244: set only on a lead-lane claim

@@ -43,7 +43,8 @@ SELECT * FROM instance_intake_pause_events ORDER BY at DESC, id DESC LIMIT @row_
 -- intake is paused for this run or its Codex account admission deadline is still ahead;
 -- no row means the run is gone. The deadline includes recovery spread.
 SELECT ((NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
-        AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true))::boolean AS admittable
+        AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
+        AND fn_forge_origin_provision_allowed(r, now()))::boolean AS admittable
 FROM runs r
 WHERE r.id = @run_id;
 

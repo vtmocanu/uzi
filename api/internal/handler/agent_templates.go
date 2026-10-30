@@ -783,17 +783,18 @@ func validateModel(raw *string) (pgtype.Text, error) {
 	return pgtype.Text{String: m, Valid: true}, nil
 }
 
-// validateEffort is the thin HTTP-facing wrapper over agenttmpl.ValidateEffort
-// (the single source of the closed-enum effort rules, PRD #617), used by the
-// per-user default-effort endpoint. A nil pointer or a blank value becomes NULL
-// (inherit — stored as NULL; resolved to the uzi default `medium` at claim
-// assembly, issue #1157); a valid level becomes a set pgtype.Text; anything else
-// is an error (mapped to 400 by the caller).
-func validateEffort(raw *string) (pgtype.Text, error) {
+// validateDefaultEffort is the thin HTTP-facing wrapper over
+// agenttmpl.ValidateDefaultEffort (the single source of the per-user effort
+// preference rules, PRD #617 and #3247), used by the settings PUT. A nil pointer
+// or a blank value becomes NULL (inherit — stored as NULL; resolved to the uzi
+// default `medium` at claim assembly, issue #1157); a valid level or the
+// Runtime default token `runtime` becomes a set pgtype.Text; anything else is an
+// error (mapped to 400 by the caller).
+func validateDefaultEffort(raw *string) (pgtype.Text, error) {
 	if raw == nil {
 		return pgtype.Text{}, nil
 	}
-	e, err := agenttmpl.ValidateEffort(*raw)
+	e, err := agenttmpl.ValidateDefaultEffort(*raw)
 	if err != nil {
 		return pgtype.Text{}, err
 	}

@@ -31,7 +31,7 @@ import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
 import { checkerModelWarning, normalizeCheckerValue } from "../../lib/crossCheckSettings";
-import type { CrossCheckPinDTO, Harness } from "../../lib/apiTypes";
+import type { CrossCheckPinDTO, EffortSettingCell, Harness } from "../../lib/apiTypes";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
 import { mockDefaultClaudeModel } from "./agents";
@@ -512,6 +512,35 @@ function effectiveLegacyLane(harness: UserSettings["default_harness"]): "claude"
   return codexUsable && !claudeUsable ? "codex" : "claude";
 }
 
+// PRD #3247: the user effort preference validator, mirroring Go validateDefaultEffort:
+// blank/whitespace clears to null; otherwise one of the five levels or the
+// preference-only "runtime" token, stored trimmed and case-sensitive.
+function mockDefaultEffort(raw: string | null | undefined): string | null {
+  const trimmed = raw?.trim() ?? "";
+  if (trimmed === "") return null;
+  if (!["low", "medium", "high", "xhigh", "max", "runtime"].includes(trimmed)) {
+    throw new ApiError(400, "effort must be one of low, medium, high, xhigh, max or runtime");
+  }
+  return trimmed;
+}
+
+// PRD #3247: one harness's ordinary reasoning-effort cell, mirroring Go
+// effortSettingCell/agenttmpl.ResolveHarnessEffort (pinned by
+// fixtures/effort-defaults/cases.json). The stored token is "runtime", a level, or
+// null; a blank/whitespace value reads as null and any other (corrupt) value resolves
+// to the medium builtin, so the cell keeps the stored value but never trusts it.
+function mockEffortCell(harness: Harness, stored: string | null | undefined): EffortSettingCell {
+  const token = (stored ?? "").trim();
+  const base = { harness, effort: stored ?? null, default_effort: "medium", default_source: "builtin" };
+  if (token === "runtime") {
+    return { ...base, resolved_effort: null, source: "user_default", mode: "runtime_default" };
+  }
+  if (["low", "medium", "high", "xhigh", "max"].includes(token)) {
+    return { ...base, resolved_effort: token, source: "user_default", mode: "explicit" };
+  }
+  return { ...base, resolved_effort: "medium", source: "builtin", mode: "explicit" };
+}
+
 // mySettingsResponse projects the deprecated default_model from the effective-harness
 // lane so a stale client still reads a coherent single model, while the two explicit
 // lanes remain the stored source of truth.
@@ -535,13 +564,17 @@ function mySettingsResponse(): { settings: UserSettings } {
     { claude: userSettings.judge_model, codex: userSettings.codex_judge_model },
     { claude: appSettings.judge_model, codex: appSettings.codex_judge_model },
   );
+  const effort_settings = [
+    mockEffortCell("claude", userSettings.default_effort),
+    mockEffortCell("codex", userSettings.default_codex_effort),
+  ];
   // PRD #3522: the reserve lives on the user row (written by setUsageReserve), and the
   // server's GET /me/settings reads it from there, so project it from the session user.
   const me = state.session;
   const reserve = me
     ? { weekly_reserve_pct: me.weekly_reserve_pct ?? null, weekly_reserve_pause_running: me.weekly_reserve_pause_running ?? true }
     : {};
-  return { settings: { ...userSettings, ...reserve, cross_check_pins, judge_models, default_model: projected ?? null } };
+  return { settings: { ...userSettings, ...reserve, cross_check_pins, judge_models, effort_settings, default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
@@ -1392,22 +1425,10 @@ export const settingsApi = {
       next = { ...next, default_codex_model: val };
     }
     if (patch.default_effort !== undefined) {
-      // Closed enum (PRD #617 M5): blank clears to inherit; any other value must be one
-      // of the five SDK levels, mirroring the server's ValidateEffort.
-      const trimmed = patch.default_effort?.trim() ?? "";
-      if (trimmed !== "" && !["low", "medium", "high", "xhigh", "max"].includes(trimmed)) {
-        throw new ApiError(400, "effort must be one of low, medium, high, xhigh, max");
-      }
-      next = { ...next, default_effort: trimmed === "" ? null : trimmed };
+      next = { ...next, default_effort: mockDefaultEffort(patch.default_effort) };
     }
     if (patch.default_codex_effort !== undefined) {
-      // Closed enum (PRD #617 M5): blank clears to inherit; any other value must be one
-      // of the five SDK levels, mirroring the server's ValidateEffort.
-      const trimmed = patch.default_codex_effort?.trim() ?? "";
-      if (trimmed !== "" && !["low", "medium", "high", "xhigh", "max"].includes(trimmed)) {
-        throw new ApiError(400, "effort must be one of low, medium, high, xhigh, max");
-      }
-      next = { ...next, default_codex_effort: trimmed === "" ? null : trimmed };
+      next = { ...next, default_codex_effort: mockDefaultEffort(patch.default_codex_effort) };
     }
     if (patch.judge_model !== undefined) {
       // Same rules as default_model (PRD #69 M2): blank clears to inherit, a value with

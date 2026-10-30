@@ -119,3 +119,46 @@ func TestCodeCrossCheckWorkerVersionRefusalLiveDB(t *testing.T) {
 		})
 	}
 }
+
+// The lead's worker may hold a cooled origin and the lead's own half-open
+// reservation; the code child reads the local snapshot only, so it is claimed
+// without touching that cooldown or freezing an origin mapping.
+func TestCodeCrossCheckClaimUnderLeadOriginReservationLiveDB(t *testing.T) {
+	f := codeFixture(t)
+	w := wkrRow(t, f.env, f.workerID)
+	f.env.exec(`INSERT INTO forge_origin_cooldowns(user_id,worker_id,origin,cooled_until,last_reason,observed_at)
+ SELECT r.user_id,$2,a.origin,now()+interval '1 hour','transient_clone_fetch_exhausted',now()
+ FROM runs r JOIN authorized_forge_origins a ON a.repo_id=r.repo_id AND a.user_id=r.user_id
+ WHERE r.id=$1 AND a.origin IS NOT NULL`, f.lead, f.workerID)
+	f.env.exec(`UPDATE forge_origin_cooldowns SET reservation_run_id=$2,reservation_generation=1,reservation_incarnation=incarnation,
+ reservation_version=observation_version,reservation_observation_version=observation_version WHERE worker_id=$1`, f.workerID, f.lead)
+	cooldown := func() (rows int, state string) {
+		if err := f.env.pool.QueryRow(f.env.ctx, `SELECT count(*), COALESCE(string_agg(
+ concat_ws('/',reservation_run_id,reservation_generation,observation_version,cooled_until > now()),','),'')
+ FROM forge_origin_cooldowns WHERE worker_id=$1`, f.workerID).Scan(&rows, &state); err != nil {
+			t.Fatal(err)
+		}
+		return rows, state
+	}
+	rows, before := cooldown()
+	if rows != 1 {
+		t.Fatalf("fixture cooldown rows = %d", rows)
+	}
+	cc, err := f.svc.SubmitCodeCrossCheck(f.env.ctx, w, f.lead, 1, strings.Repeat("a", 40), strings.Repeat("b", 40))
+	if err != nil || !cc.CheckerRunID.Valid {
+		t.Fatalf("submit: %+v %v", cc, err)
+	}
+	child := uuid.UUID(cc.CheckerRunID.Bytes)
+	f.runID = child
+	p := laneClaim(t, f, "cross_check", nil)
+	if p == nil || p.RunID != child.String() || p.CrossCheck == nil || p.CrossCheck.Stage != "code" {
+		t.Fatalf("code child stranded by the lead's origin reservation: %+v", p)
+	}
+	if _, after := cooldown(); after != before {
+		t.Fatalf("code child changed the cooldown: %s -> %s", before, after)
+	}
+	var mapped int
+	if err := f.env.pool.QueryRow(f.env.ctx, "SELECT count(*) FROM run_forge_origins WHERE run_id=$1", child).Scan(&mapped); err != nil || mapped != 0 {
+		t.Fatalf("code child froze an origin mapping: %d %v", mapped, err)
+	}
+}

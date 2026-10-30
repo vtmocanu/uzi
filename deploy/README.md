@@ -213,14 +213,40 @@ daytime merges, so exact-tip CI may take longer to settle within the same cap.
 
 Manual tip selection is bounded at 120 minutes plus 10 minutes for cutting.
 Publication watching retains its 60-minute bound within the 120-minute recovery
-allowance. **D10 is partial until 3e-3:** only the single eligible pre-cut main-CI
-infrastructure rerun and existing non-gate publication retries are automated.
-Tagged-KinD and targeted assertion recovery remain fail-closed follow-up work.
-The release commit's own main CI will be classified in the planned journal and
-report without automatic reruns. This is deliberate: publication uses strict
-inherited coverage and the next RC needs a newer CI-bearing tip; isolating old
-reruns would change cancellation behavior for every main rerun. ci.yml stays
-unchanged. First-week contention measurements remain a rollout check.
+allowance. One publication watcher owns the existing per-workflow retry budgets
+and records a bounded attempt journal, including failing jobs/steps and retry
+reservations/results. The first failed job's detail is retained. The journal
+keeps every observed attempt and explicitly counts omitted detail when it reaches
+32,768 source bytes; unavailable evidence is not proof of recovery.
+Release-commit main CI is report-only, with one observation and no automatic reruns. Automatic
+recovery was deliberately excluded: publication uses strict inherited coverage,
+the next RC needs a newer CI-bearing tip, and rerun isolation would change main
+cancellation behavior. Protected CI opts into two infrastructure-only tagged
+KinD retries and one targeted `assert-tag-smoke` rerun after real smoke succeeds.
+Build/install/readiness/product checks, mixed/unknown failures and cancellation
+are not retried. Existing publication budgets stay separate and never reset.
+First-week contention measurements remain a rollout check.
+Read-only journal lookup failures do not stop publication observation; retries
+still require fresh complete evidence. Incident audits are capped at 64 rows and
+8,192 encoded bytes with explicit counts, while the prepare summary stays full.
+Main-CI observation errors cannot replace the publication result, but an in-flight
+API request can still consume the existing watcher job ceiling; no new timeout
+or transport isolation is added.
+Terminal journal write failures preserve the publication result and label any
+surviving attempt records incomplete. Retry requests still require a saved reservation.
+KinD retries require matching tagged/controller KinD workflow definitions;
+assertion recovery requires both KinD and release definitions to match.
+Older candidates after workflow updates, or RC tips whose workflow changed during
+the wait, need manual exceptional recovery; normal watching and verification stay
+available. All writes in recovery mode, including ordinary publication retries,
+require unchanged remote tag identity and no superseding stable. A watcher-start
+monotonic 120-minute backstop forbids new writes only,
+with no remote cancellation or extra wait window. The shared 60-tick publication
+window and 125-minute job ceiling remain; transport hangs use that job ceiling.
+For deliberate local same-tag exceptional recovery, opt in with
+`--recover-tag-smoke` plus `--journal`, `--operation`, `--repository`, `--sha`,
+`--kind` and the exact remote `--tag-oid`. Finish or stop the CI operation first.
+The default local watcher remains publication-only. No recovery path cuts a tag.
 The procedures below are the local path.
 
 **Releases are cut RC-first** (ADR-1265, PRD #1265). `release-cut X.Y.Z`

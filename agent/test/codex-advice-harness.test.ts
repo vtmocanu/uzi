@@ -594,6 +594,17 @@ describe("CodexAdviceHarness: kind + a text advice pass", () => {
     assert.equal(params.effort, "high");
     assert.equal(params.modelReasoningEffort, undefined, "only the actual app-server wire key is sent");
   });
+
+  // PRD #3247 preservation (passes on the pre-change tree): no effort on the request, no wire key.
+  it("turn/start omits the effort key when the request has no effort", async () => {
+    const bits = makeHarness();
+    bits.transport.push(threadStarted()).push(turnCompleted("completed")).end();
+    await bits.harness.run(makeAdviceRequest(), noThrowPolicy);
+
+    const start = bits.transport.requests.find((r) => r.method === "turn/start");
+    assert.ok(start);
+    assert.equal(Object.hasOwn(start.params as Record<string, unknown>, "effort"), false);
+  });
 });
 
 describe("CodexAdviceHarness: policy timing", () => {
