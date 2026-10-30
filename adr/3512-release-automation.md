@@ -100,18 +100,45 @@ applies to dispatch. A single allowlisted infrastructure rerun of pre-cut main
 CI cannot replenish when main moves. Unknown steps and test/assertion failures
 stop. Existing non-gate publication retries retain their two-rerun budget when watch runs.
 
-**D10 is partial until 3e-3.** Infrastructure-only tagged KinD retries and
-targeted `assert-tag-smoke` recovery are deferred to that separate follow-up.
-Automatic reruns of the release commit's own main CI are deliberately not
-implemented. Publication relies on strict inherited coverage, and the next RC
-needs a newer CI-bearing tip. Isolating old-run retries would change cancellation
-for every main rerun; that CI behavior change was declined. Its result will be
-classified for reporting when the journal is added, without automatic recovery.
-The existing watcher stays fail-closed on the deferred gates.
-Its role-based retry/run/job URLs and budget are appended to the summary with a
-32,768-source-byte limit and an explicit truncation marker. The full per-attempt
-publication failing-step journal is also open work for 3e-3; D10 reporting is not
-complete. Pre-cut CI retries already record steps, attempt and result.
+**3e-3 separates observation from new recovery policy.** One Python engine and
+the existing shell entry point retain publication's per-workflow retry budgets,
+CLI exit meanings, polling and stale-read behavior. It also restores the first
+failed job's detail row, omitted by the old awk's uninitialized array index.
+The operation-local journal records observed attempts, failed steps, retry
+reservations and outcomes, plus original and latest status.
+Snapshots describe observed effective jobs; carried-forward successes are not
+labeled as re-executed. The journal is atomically
+written before retry requests and bounded to 32,768 source bytes. Detail
+truncation records omission counts; every observed attempt and retry decision
+is retained or capacity exhaustion stops recovery. Complete API evidence is
+validated before truncation and before a write. Missing or malformed journal
+data is unavailable, never a recovery certificate.
+Read-only journal lookup failures are counted without changing the legacy
+publication polling or gate refusal. A retry still requires complete fresh
+evidence and a saved reservation. Piped progress is line-buffered. Incident
+audits retain at most 64 changes and 8,192 encoded bytes, with full counts and
+explicit truncation; the prepare summary remains complete. Journal byte
+accounting includes JSON escaping for backticks used in public code fences.
+
+The release commit's own main CI is classified in the journal and report only,
+without success polling or automatic reruns. D10(a) automatic recovery is deliberately
+excluded: publication already requires strict inherited coverage, the next RC
+needs a newer CI-bearing tip, and isolating reruns would change cancellation
+for every main rerun. `ci.yml` is unchanged. Tagged KinD infrastructure retries
+and targeted `assert-tag-smoke` recovery remain a separate PR; these gates
+still require manual recovery. Controller code is pinned to the original trusted
+workflow SHA, independently of the released tag, so older promoted candidates
+need not contain the current controller. Pre-cut CI retries already record steps,
+attempt and result.
+The primary publication journal is finalized before the best-effort main-CI
+observation. Observation/schema/storage errors cannot override that result.
+If the terminal journal write fails, the chosen publication result is retained,
+main-CI observation is skipped and surviving attempt records are marked partial.
+This does not relax the required saved reservation before a retry request.
+This is not transport isolation: synchronous API requests can still occupy the
+existing watch job ceiling if a transport hangs. No new timeout or cancellation
+policy is introduced. The journal uses atomic replacement with file fsync;
+directory fsync and crash-resumable operation storage are not provided.
 Publication/verification timestamps are recorded without claiming deployment
 health. Runner-slot and critical-path impact remain unmeasured until live use.
 
@@ -166,7 +193,8 @@ An expired window records `missed-target` and no attempted push. A queued run
 cannot acquire a new window on the following date. Manual budgets are unchanged.
 After tagging, bounded recovery ignores the cutoff and pause flag. Verification
 recorded after 14:00 is marked late without changing verified success or opening
-an extra incident. No clock-driven recovery cancellation or D10 journal is added.
+an extra incident. Scheduling adds no clock-driven recovery cancellation. The
+later 3e-3 stage adds the bounded D10 journal described above.
 All routes share a non-cancelling queue, bounded by GitHub's 100 pending runs. A
 pending stable approval can delay RC work. A run cancelled before starting
 cannot produce its own report; its Actions status remains the evidence.
