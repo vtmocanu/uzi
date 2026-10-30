@@ -108,6 +108,7 @@ export class ActiveRunRegistry {
   constructor(
     private readonly pendingLister?: PendingTerminalLister,
     private readonly capGetter?: OutboxCapGetter,
+    private readonly coverageGetter?: () => boolean,
   ) {}
 
   /** Register a run as executing at `running`, at the generation it was claimed at.
@@ -245,9 +246,14 @@ export class ActiveRunRegistry {
    * unknown policy evidence always blocks; otherwise projected lease count must exceed the cap.
    * An undefined/0 cap is the cap-independent floor for leasable pending outcomes.
    */
-  claimsPausedByPendingOverflow(): boolean {
-    const projection = this.projection(this.pendingOutcomes());
-    return projection.unknown || projection.leases.length > this.effectiveCap();
+  claimsPausedByPendingOverflow(scoped = false): boolean {
+    const pending = this.pendingOutcomes();
+    const projection = this.projection(pending);
+    if (!scoped) return projection.unknown || projection.leases.length > this.effectiveCap();
+    if (this.coverageGetter?.() === false) return true;
+    const groups = new Set(pending.filter(p => this.isPolicy(p)).map(p => p.run_id.toLowerCase()));
+    const ordinary = this.leasable(pending).filter(p => !groups.has(p.run_id.toLowerCase()));
+    return groups.size + ordinary.length > this.effectiveCap();
   }
 
   /** Issue #2950: the pending terminals a snapshot can usefully lease. A `run_not_owned` journal is
@@ -324,7 +330,14 @@ export class ActiveRunRegistry {
   }
 
   private pendingOutcomes(): PendingTerminal[] {
-    return this.pendingLister?.().filter(entry => entry.server_settled !== true) ?? [];
+    const seen = new Set<string>();
+    return (this.pendingLister?.() ?? []).filter(entry => {
+      if (entry.server_settled === true) return false;
+      const key = entry.run_id.toLowerCase() + "/" + entry.claim_generation;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).map(entry => ({ ...entry, run_id: entry.run_id.toLowerCase() }));
   }
 
   /**
@@ -348,7 +361,7 @@ export class ActiveRunRegistry {
       active: [],
       pending_overflow: projection.unknown || projection.leases.length > 0 ||
         pending.some(p => !this.isPolicy(p)),
-      pending_all: pending.map((p) => ({ run_id: p.run_id, claim_generation: p.claim_generation })),
+      ...(this.coverageGetter?.() !== false ? { pending_all: pending.map((p) => ({ run_id: p.run_id, claim_generation: p.claim_generation })) } : {}),
       // Issue #1742: the finalize-pending set the caller captured for this register. The key is
       // omitted when empty, and build() (heartbeat/claim) never carries it.
       ...(finalizeResume.length > 0
@@ -363,7 +376,7 @@ export class ActiveRunRegistry {
    * The `register_nonce` is NOT stamped here — the client stamps it on send from the nonce it
    * captured at register (worker.ts/client.ts).
    */
-  build(): ActiveSnapshot {
+  build(scoped = false): ActiveSnapshot {
     this.epoch += 1;
     const projection = this.projection(this.pendingOutcomes());
     const pending = projection.leases;
@@ -404,7 +417,12 @@ export class ActiveRunRegistry {
       snapshot_epoch: this.epoch,
       active,
       pending_overflow: projection.unknown || pending.length > this.effectiveCap(),
-      pending_all: projection.sources.map((p) => ({ run_id: p.run_id, claim_generation: p.claim_generation })),
+      ...(this.coverageGetter?.() !== false ? { pending_all: projection.sources.map((p) => ({ run_id: p.run_id, claim_generation: p.claim_generation })) } : {}),
+      ...(scoped && this.coverageGetter?.() !== false ? { pending_policy_protection: [...new Set(projection.sources.filter(p => this.isPolicy(p)).map(p => p.run_id))]
+        .flatMap(run_id => {
+          const owner_generation = this.policyOwnership.get(run_id)?.generation;
+          return typeof owner_generation === "number" && owner_generation > 0 ? [{ run_id, owner_generation }] : [];
+        }) } : {}),
     };
   }
 

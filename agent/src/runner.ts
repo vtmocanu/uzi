@@ -2199,6 +2199,7 @@ interface RunFlight {
   policyHold?: { readonly outcomeId: string; body?: Readonly<import("./protocol.js").PolicyHoldRequest> };
   policyAdmission?: boolean;
   initialPlanningEligible?: boolean;
+  policyReservation?: symbol;
   forgeCloneSuccess?: AbortController;
   operationAdmission?: CodexOperationController;
   operationScope?: ReturnType<typeof acquireCodexOperationScope>;
@@ -4609,6 +4610,20 @@ export class RunRunner {
 
   private async executeClaimInAttempt(claim: ClaimResponse, onFlight: (flight: RunFlight) => void,
     ownMemory: (operation: Promise<void>) => void): Promise<void> {
+    const eligible = this.client.supportsPolicyHold && !!this.outbox && !!this.snapshotRegistry &&
+      !!claim.secrets.codex && claim.interactive !== true &&
+      ["issue", "task", "prompt", "self_improve"].includes(claim.kind ?? "issue");
+    const reservation = eligible ? this.outbox!.reservePolicyFlight(claim.run_id, claim.claim_generation ?? 0) : undefined;
+    if (eligible && !reservation) return;
+    try {
+      await this.executeReservedPolicyClaim(claim, onFlight, ownMemory, reservation);
+    } finally {
+      if (reservation) this.outbox!.releasePolicyFlight(reservation);
+    }
+  }
+
+  private async executeReservedPolicyClaim(claim: ClaimResponse, onFlight: (flight: RunFlight) => void,
+    ownMemory: (operation: Promise<void>) => void, reservation?: symbol): Promise<void> {
     const runId = claim.run_id;
     const admission = await this.preparePolicyAdmission(claim);
     if (admission === false) return;
@@ -4657,6 +4672,7 @@ export class RunRunner {
       gitBasic,
       runScopedSecrets,
     );
+    flight.policyReservation = reservation;
     if (admission) {
       flight.policyAdmission = true;
       flight.policyHold = { outcomeId: admission.outcome_id, body: admission };
@@ -6410,7 +6426,7 @@ export class RunRunner {
   }
 
   private policyHoldEligible(claim: ClaimResponse, flight: RunFlight, error: unknown): boolean {
-    if (!(error instanceof ProviderPolicyRefusal) || !this.outbox || !this.snapshotRegistry || !this.client.supportsPolicyHold ||
+    if (!(error instanceof ProviderPolicyRefusal) || !this.outbox || !this.snapshotRegistry || !flight.policyReservation ||
         !flight.initiallyCodex || claim.interactive === true ||
         !["issue", "task", "prompt", "self_improve"].includes(flight.runKind) ||
         !Number.isSafeInteger(flight.claimGeneration) || flight.claimGeneration <= 0 ||
@@ -6428,7 +6444,9 @@ export class RunRunner {
   /** This producer selects once. Delivery and source retention have independent lifetimes. */
   private async enterPolicyHold(claim: ClaimResponse, flight: RunFlight, error: ProviderPolicyRefusal): Promise<void> {
     const refusal = validatePolicyRefusal(error.policyRefusal)!;
-    const selected = flight.policyHold = { outcomeId: randomUUID() } as NonNullable<RunFlight["policyHold"]>;
+    const outcomeId = randomUUID();
+    if (!flight.policyReservation || !this.outbox?.selectPolicyFlight(flight.policyReservation, outcomeId)) return;
+    const selected = flight.policyHold = { outcomeId } as NonNullable<RunFlight["policyHold"]>;
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     flight.keepGuardedInventoryOpen = true;

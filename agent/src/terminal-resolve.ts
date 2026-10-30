@@ -93,21 +93,15 @@ export interface TerminalOutboxDeps {
  *  Returns the ack the resolve path classifies. */
 export type SendTerminalState = (body: StateRequest, signal?: AbortSignal) => Promise<StateAck>;
 
-/** Build the terminal-resolve deps for a lane, or undefined when no usable outbox is wired (a test
- *  without spill, or a store that failed closed) — in which case the caller sends un-journaled. One
- *  builder so legacy lanes apply the same isDisabled() gate. Policy capture callers explicitly
- *  opt into retaining disabled dependencies and must use journalPolicyHold, with no send fallback. */
+/** Keep the shared store in every lane, including cached dependencies while disabled.
+ * Arbitration belongs to journalTerminal, where an exact run's first writer is checked.
+ * retainDisabledPolicy records capture purpose; policy capture has no send fallback. */
 export function makeTerminalOutboxDeps(
   outbox: Outbox | undefined,
   client: TerminalOutboxDeps["client"],
   opts: { gapFillMax: number; terminalMaxBytes: number; log: Logger; retainDisabledPolicy?: boolean },
 ): TerminalOutboxDeps | undefined {
   if (!outbox) return undefined;
-  // New policy producers opt in before selection. Once a policy/unknown winner
-  // exists, legacy callers must retain arbitration too rather than send directly.
-  // The resolver still requires authenticated disk evidence before any policy send.
-  if (outbox.isDisabled() && !opts.retainDisabledPolicy &&
-      !outbox.listPendingTerminals().some(p => p.outcome_kind === "policy_hold" || p.outcome_kind === "unknown")) return undefined;
   return { outbox, client, gapFillMax: opts.gapFillMax, terminalMaxBytes: opts.terminalMaxBytes, log: opts.log };
 }
 

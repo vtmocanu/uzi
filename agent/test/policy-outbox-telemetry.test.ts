@@ -1,4 +1,6 @@
 import { it, type TestContext } from "node:test";
+import os from "node:os";
+import { makeScratchRoot } from "./fixture-repo.js";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -16,7 +18,7 @@ const body: PolicyHoldRequest = {
 };
 
 async function fixture(t: TestContext, options: Partial<OutboxOptions> = {}) {
-  const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/policy-telemetry-"));
+  const dir = makeScratchRoot("policy-telemetry-", await fs.realpath(os.tmpdir()));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const root = path.join(dir, "outbox");
   const make = (extra: Partial<OutboxOptions> = {}) => new Outbox({

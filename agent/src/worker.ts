@@ -1016,6 +1016,7 @@ export class Worker {
           protocolCapabilities.push("cross_check_lane_v1");
           if (this.crossCheckRunner && this.config.codexHarness?.advertise) protocolCapabilities.push("cross_check_code_v1");
         }
+        protocolCapabilities.push("pending_outcome_scoped_claim_v1");
         if (this.dindMaintenance) protocolCapabilities.push("dind_maintenance_v1");
         const res = await this.client.register(
           this.config.workerName,
@@ -1230,7 +1231,7 @@ export class Worker {
   private buildActiveSnapshot(): ActiveSnapshot | undefined {
     if (!this.activeRuns) return undefined;
     if (!this.client.hasFeature("active_run_snapshot")) return undefined;
-    return this.activeRuns.build();
+    return this.activeRuns.build(this.client.supportsScopedPendingClaim);
   }
 
   /**
@@ -1357,7 +1358,7 @@ export class Worker {
       // features are currently negotiated, so a strict-decode rollback that clears the feature set can
       // never reopen the loop while a terminal journal is still unresolved. A no-op when no outbox /
       // registry is wired (the concurrency unit tests) or nothing is pending.
-      if (this.activeRuns?.claimsPausedByPendingOverflow()) {
+      if (this.activeRuns?.claimsPausedByPendingOverflow(this.client.supportsScopedPendingClaim)) {
         await sleep(this.config.pollIntervalMs, signal);
         continue;
       }
@@ -1411,7 +1412,8 @@ export class Worker {
         // issue #2213: a latch landing while the admission await was pending must still stop this claim;
         // nothing is awaited between this recheck and claimRun. The finally releases admission and the
         // next iteration's top-of-loop gate logs and sleeps.
-        if (residueQuarantine() !== undefined) continue;
+        if (residueQuarantine() !== undefined ||
+            this.activeRuns?.claimsPausedByPendingOverflow(this.client.supportsScopedPendingClaim)) continue;
         // PRD #1390 M2a: carry the active-run snapshot on the claim (built from the SAME
         // monotonic epoch counter the heartbeat draws from) so the api's pre-claim dedupe
         // sees this worker's live runs even before the first post-outage heartbeat lands.

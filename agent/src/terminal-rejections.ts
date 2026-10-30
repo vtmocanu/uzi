@@ -76,7 +76,7 @@ export class TerminalRejectionCoordinator {
       while (!signal.aborted) {
         let passComplete = true;
         try {
-          if (this.supported() && workerId) {
+          {
             const page = await this.outbox.scanTerminalObservationsPage();
             passComplete = page.passComplete;
             // The scanner bounds the whole page to 256 observations; filesystem filename
@@ -92,7 +92,7 @@ export class TerminalRejectionCoordinator {
               for (let i = pending.length - 1; i >= 0; i--) {
                 if (group.includes(pending[i]!)) pending.splice(i, 1);
               }
-              if (!this.supported()) break;
+              if (!this.supported() || !workerId) break;
               try {
                 await this.client.reportTerminalRejections({ rejections: [{
                   run_id: first.runId, claim_generation: first.generation!, reason: "mac_failure",

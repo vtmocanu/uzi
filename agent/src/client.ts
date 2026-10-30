@@ -1520,6 +1520,11 @@ export class WorkerClient {
    *  `serverFeatures` so the two views never diverge and a rollback clear empties both. The
    *  setter routes through the same set (a test that skips register can seed it directly). */
   /** Both sides must have negotiated the compact contract; this does not advertise readiness. */
+  get supportsScopedPendingClaim(): boolean {
+    return this.hasFeature("pending_outcome_scoped_claim_v1") &&
+      this.registrationReport?.protocol_capabilities.includes("pending_outcome_scoped_claim_v1") === true;
+  }
+
   get supportsPolicyHold(): boolean {
     return this.hasFeature("provider_policy_hold_v1") &&
       this.registrationReport?.protocol_capabilities.includes("provider_policy_hold_v1") === true;
@@ -1645,7 +1650,10 @@ export class WorkerClient {
   }
 
   private snapshotForServer(snapshot: ActiveSnapshot): ActiveSnapshot {
-    return { ...snapshot, active: snapshot.active.map(entry => {
+    const { pending_policy_protection, ...legacy } = snapshot;
+    return { ...legacy,
+      ...(this.supportsScopedPendingClaim && pending_policy_protection !== undefined ? { pending_policy_protection } : {}),
+      active: snapshot.active.map(entry => {
       const { account_cooldown, ...rest } = entry;
       return (this.hasFeature("codex_account_operation_admission_v1") ||
         this.operationFlights.get(entry.run_id)?.generation === entry.claim_generation) && account_cooldown !== undefined

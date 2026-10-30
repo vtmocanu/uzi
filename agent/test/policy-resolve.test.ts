@@ -1,4 +1,6 @@
 import { it } from "node:test";
+import os from "node:os";
+import { makeScratchRoot } from "./fixture-repo.js";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -51,7 +53,7 @@ const receipt = (disposition: PolicyHoldReply["disposition"] = "applied"): Polic
   observed_status: "paused", observed_generation: 7, hold_reason: "codex_policy_hold",
 });
 async function fixture(t: { after(fn: () => Promise<void>): void }, over: { rawWrite?: RawWriteSeam; runMaxBytes?: number; maxBytes?: number; terminalMaxBytes?: number } = {}) {
-  const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/policy-test-"));
+  const dir = makeScratchRoot("policy-test-", await fs.realpath(os.tmpdir()));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const root = path.join(dir, "outbox");
   const make = () => new Outbox({ root, log: nullLogger(), runMaxBytes: 1e6, maxBytes: 4e6, retentionMs: 86400000, ...over });
@@ -447,7 +449,7 @@ it("disabled policy deps retain snapshot membership without an unjournaled send"
   let sends = 0;
   const d = deps(outbox, async () => { sends++; return receipt(); });
   const opts = { gapFillMax: 1, terminalMaxBytes: 1024, log: nullLogger() };
-  assert.equal(makeTerminalOutboxDeps(outbox, d.client, opts), undefined);
+  assert.equal(makeTerminalOutboxDeps(outbox, d.client, opts)?.outbox, outbox);
   const retained = makeTerminalOutboxDeps(outbox, d.client, { ...opts, retainDisabledPolicy: true })!;
   assert.equal((await outbox.journalPolicyHold(run, original)).journaled, false);
   assert.equal(outbox.listPendingTerminals()[0]?.outcome_kind, "policy_hold");

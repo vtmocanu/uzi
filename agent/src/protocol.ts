@@ -749,6 +749,8 @@ export interface ActiveSnapshot {
    *  The worker sends the full list even over the API identity-count limit; the API drops the
    *  entire pending_all list when over that limit, never truncates it. No lifecycle authority. */
   pending_all?: { run_id: string; claim_generation: number }[];
+  /** Negotiated separately from policy production; current fenced ownership only. */
+  pending_policy_protection?: { run_id: string; owner_generation: number }[];
   /** Issue #1742: carried ONLY on the register snapshot — each run whose executor finished at the
    *  named exact claim generation and whose authenticated finalize-pending record survived a
    *  process restart with no journaled terminal outcome. Never an outcome and never a lease: the
