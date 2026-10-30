@@ -180,7 +180,7 @@ func (r *tailReader) excerpt(tail int64) ([]byte, int, bool, bool, error) {
 			// discarding its continuation bytes from the returned suffix.
 			out[2] = b
 			count := 1
-			for count < 3 && r.pos > 0 {
+			for count < 3 && r.pos > 0 && !utf8.RuneStart(out[3-count]) {
 				c, e := r.previous()
 				if errors.Is(e, errScanBudget) {
 					start = completed

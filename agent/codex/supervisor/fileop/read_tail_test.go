@@ -89,12 +89,22 @@ func TestReadTailLinesAndProtocol(t *testing.T) {
 	}
 }
 
+func TestReadTailCapPrecedesBudget(t *testing.T) {
+	s, _, reads, closes := tailFixture(t, []byte(strings.Repeat("x", rangeOutputBytes+10)))
+	s.rangeChunk = 1
+	s.tailBudget = rangeOutputBytes + 1
+	got := checkTail(t, s, 1, strings.Repeat("x", rangeOutputBytes), 1, true, true, false)
+	if *reads != rangeOutputBytes+1 || got["scannedBytes"] != int64(rangeOutputBytes+1) || *closes != 1 {
+		t.Fatalf("reads=%d closes=%d metadata=%v", *reads, *closes, withoutData(got))
+	}
+}
+
 func TestReadTailCapsAndBudget(t *testing.T) {
 	for _, chunk := range []int{1, 7, rangeReadChunk} {
 		s, _, reads, _ := tailFixture(t, []byte(strings.Repeat("x", rangeOutputBytes+100)))
 		s.rangeChunk = chunk
 		got := checkTail(t, s, 2, strings.Repeat("x", rangeOutputBytes), 1, true, true, false)
-		if got["scannedBytes"] != int64(*reads) || *reads > rangeScanBytes || (chunk == 1 && *reads != rangeOutputBytes+3) {
+		if got["scannedBytes"] != int64(*reads) || *reads > rangeScanBytes || (chunk == 1 && *reads != rangeOutputBytes+1) {
 			t.Fatal("scan accounting")
 		}
 		s, _, _, _ = tailFixture(t, []byte(strings.Repeat("x", rangeOutputBytes)+"\nok\n"))
