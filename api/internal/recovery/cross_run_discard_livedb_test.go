@@ -65,6 +65,110 @@ func crossRunRetained(t *testing.T, e *inventoryEnv, a CrossRunTargetBinding, s 
 }
 
 func TestCrossRunDiscardPolicyAndArchiveLiveDB(t *testing.T) {
+	for _, mode := range []string{
+		"foreign_owner", "foreign_repo", "future_generation", "zero_generation", "negative_generation", "duplicate_generation",
+		"foreign_owner_closed", "foreign_repo_closed", "future_generation_closed", "zero_generation_closed", "negative_generation_closed", "duplicate_generation_closed",
+		"open_live_run_other", "open_live_worker_other", "ancestry_missing_successor", "ancestry_future_successor", "ancestry_wrong_worker", "ancestry_missing_worker_identity",
+	} {
+		t.Run("full_inventory/"+mode, func(t *testing.T) {
+			e, w, b := newCrossRunBindingEnv(t, 3, 1)
+			a, s := crossRunInputs(t, e, w, b)
+			unrelated := newInventoryEnv(t)
+			unrelatedBefore := mergedWorkSnapshot(t, unrelated)
+			var foreignRepo uuid.UUID
+			if err := unrelated.pool.QueryRow(unrelated.ctx, "SELECT repo_id FROM runs WHERE id=$1", unrelated.run).Scan(&foreignRepo); err != nil {
+				t.Fatal(err)
+			}
+			// Keep eligible custody, ready bytes and partial chunks in the batch. The
+			// malformed sibling is historical and unguarded; no trigger is disabled.
+			ready := e.reserve("inventory-ready")
+			e.upload(ready)
+			partial := e.reserve("inventory-partial")
+			e.exec("INSERT INTO recovery_capture_chunks(capture_id,chunk_index,length,sealed) VALUES($1,0,7,$2)", partial, []byte("partial"))
+			sibling := uuid.New()
+			gen := int64(2)
+			owner, repo := a.OwnerID, a.RepoID
+			switch strings.TrimSuffix(mode, "_closed") {
+			case "foreign_owner":
+				owner = unrelated.w.UserID
+			case "foreign_repo":
+				repo = foreignRepo
+			case "future_generation":
+				gen = 4
+			case "zero_generation":
+				gen = 0
+			case "negative_generation":
+				gen = -1
+			case "duplicate_generation":
+				gen = 1
+			}
+			insertMergedHold(e, sibling, owner, repo, e.run, e.w.ID, gen, false)
+			if strings.HasSuffix(mode, "_closed") {
+				e.exec("UPDATE recovery_custody_holds SET state='discarded',live_worker_id=NULL,live_run_id=NULL,release_evidence='owner_discard' WHERE id=$1", sibling)
+			}
+			switch mode {
+			case "open_live_run_other":
+				e.exec("UPDATE recovery_custody_holds SET live_run_id=$2 WHERE id=$1", sibling, unrelated.run)
+			case "open_live_worker_other":
+				e.exec("UPDATE recovery_custody_holds SET live_worker_id=$2 WHERE id=$1", sibling, unrelated.w.ID)
+			case "ancestry_missing_successor", "ancestry_future_successor", "ancestry_wrong_worker", "ancestry_missing_worker_identity":
+				successorGen := int64(3)
+				if mode == "ancestry_future_successor" {
+					successorGen = 4
+				}
+				if mode == "ancestry_wrong_worker" {
+					insertMergedHold(e, uuid.New(), a.OwnerID, a.RepoID, e.run, unrelated.w.ID, 3, false)
+				}
+				if mode == "ancestry_missing_worker_identity" {
+					successor := uuid.New()
+					insertMergedHold(e, successor, a.OwnerID, a.RepoID, e.run, e.w.ID, 3, false)
+					e.exec("UPDATE recovery_custody_holds SET original_worker_identity='' WHERE id=$1", successor)
+				}
+				// SQL CHECKs require a complete ancestry shape but do not prove that a
+				// successor exists or belongs to the original worker.
+				e.exec(`UPDATE recovery_custody_holds SET state='released',live_worker_id=NULL,live_run_id=NULL,
+ release_evidence='live_ancestry',released_at=now(),release_successor_generation=$2,
+ release_branch='agent/cross-run',release_target='branch',release_pushed_sha=$3,
+ release_source_sha=$3,release_adopted_sha=$3,release_final_head_sha=$3 WHERE id=$1`, sibling, successorGen, heldTestTip)
+			}
+			// A guard can refuse an UPDATE without an SQL error. Verify the
+			// intended anomaly actually exists before asking policy to reject it.
+			var actualOwner, actualRepo uuid.UUID
+			var actualGen int64
+			var state string
+			var liveRun, liveWorker pgtype.UUID
+			if err := e.pool.QueryRow(e.ctx, "SELECT user_id,repo_id,generation,state,live_run_id,live_worker_id FROM recovery_custody_holds WHERE id=$1", sibling).
+				Scan(&actualOwner, &actualRepo, &actualGen, &state, &liveRun, &liveWorker); err != nil {
+				t.Fatal(err)
+			}
+			wantState := "open"
+			if strings.HasSuffix(mode, "_closed") {
+				wantState = "discarded"
+			}
+			if strings.HasPrefix(mode, "ancestry_") {
+				wantState = "released"
+			}
+			if actualOwner != owner || actualRepo != repo || actualGen != gen || state != wantState {
+				t.Fatal("inventory anomaly setup was not admitted")
+			}
+			if mode == "open_live_run_other" && liveRun != pgconv.UUID(unrelated.run) {
+				t.Fatal("foreign live run setup was not admitted")
+			}
+			if mode == "open_live_worker_other" && liveWorker != pgconv.UUID(unrelated.w.ID) {
+				t.Fatal("foreign live worker setup was not admitted")
+			}
+			if mode == "ancestry_missing_worker_identity" {
+				var identity string
+				if err := e.pool.QueryRow(e.ctx, "SELECT original_worker_identity FROM recovery_custody_holds WHERE run_id=$1 AND generation=3", e.run).Scan(&identity); err != nil || identity != "" {
+					t.Fatalf("missing identity setup err=%v", err)
+				}
+			}
+			crossRunRetained(t, e, a, s, "full inventory "+mode)
+			if !bytes.Equal(unrelatedBefore, mergedWorkSnapshot(t, unrelated)) {
+				t.Fatal("inventory refusal changed unrelated custody")
+			}
+		})
+	}
 	t.Run("historical_legacy_writer", func(t *testing.T) {
 		e, legacy := newMergedPredecessorEnv(t)
 		if n, err := e.svc.DiscardMergedPredecessorHolds(e.ctx, legacy); err != nil || n != 1 {

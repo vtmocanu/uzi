@@ -146,7 +146,7 @@ func TestCrossRunDiscardRollbackRoundTripLiveDB(t *testing.T) {
 
 // Down must wait for the exact writer backend, then see its newly committed audit.
 // Every goroutine is joined before pool closure, including failure paths.
-func TestCrossRunDiscardConcurrentDownLiveDB(t *testing.T) {
+func TestCrossRunDiscardRollbackRefusesWitnessLiveDB(t *testing.T) {
 	ctx, dsn, pool := heldMigratedPool(t, "witness_down_race_")
 	f, _, binding := witnessRollbackFixture(t, ctx, pool)
 	bounded, cancel := context.WithTimeout(ctx, 12*time.Second)

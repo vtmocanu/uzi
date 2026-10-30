@@ -231,6 +231,7 @@ func crossRunWantRefusal(t *testing.T, ch <-chan reconcileOperation[int64]) {
 }
 
 func TestCrossRunDiscardConcurrencyLiveDB(t *testing.T) {
+	crossRunExtraGroups(t)
 	for _, first := range []bool{true, false} {
 		order := map[bool]string{true: "writer_first", false: "discard_first"}[first]
 		for _, kind := range []string{"upload", "reserve", "owner"} {
