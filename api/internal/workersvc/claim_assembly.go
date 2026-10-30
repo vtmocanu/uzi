@@ -475,8 +475,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// below still comes from resolveHarnessEffortPtr, which this value equals.
 	var defaultModelSource, defaultEffortSource *string
 	if leadResolved && leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
-		leadSettings.Effort = resolveHarnessEffortPtr(harness, defaultEffort)
-		leadSettings.EffortSource = leadEffortSource(harness, defaultEffort)
+		leadSettings.Effort, leadSettings.EffortSource = resolveLeadEffort(harness, defaultEffort)
 		es := string(leadSettings.EffortSource)
 		defaultEffortSource = &es
 		if leadSettings.Model.Valid {

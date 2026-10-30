@@ -65,9 +65,22 @@ func resolveLeadSettings(in LeadSettingsInput) LeadSettings {
 	if !model.Valid {
 		out.ModelSource = ""
 	}
-	out.Effort = resolveHarnessEffortPtr(in.Harness, in.UserEffort)
-	out.EffortSource = leadEffortSource(in.Harness, in.UserEffort)
+	out.Effort, out.EffortSource = resolveLeadEffort(in.Harness, in.UserEffort)
 	return out
+}
+
+// resolveLeadEffort is the single home of the lead effort value and its source. assembleClaim
+// reads the effort column after the model block (statement order is deliberate), so it calls this
+// again with the late read instead of repeating the two expressions; resolveLeadSettings calls it
+// for LeadSettingsInput.UserEffort.
+//
+// Behavior is today's (pre child B #3247): the value is whatever resolveHarnessEffortPtr returns
+// (a trimmed non-blank column verbatim, valid or not; else the harness built-in) and the source is
+// user_default exactly when the column is non-blank after trimming. Child B, landing second, must
+// consume agenttmpl.ResolveHarnessEffort's EffortResolution here (value, source and the
+// runtime_default mode) and delete leadEffortSource: one resolver, never two.
+func resolveLeadEffort(harness Harness, userEffort pgtype.Text) (effort *string, source leadcfg.EffortSource) {
+	return resolveHarnessEffortPtr(harness, userEffort), leadEffortSource(harness, userEffort)
 }
 
 // leadEffortSource says whether the effort the claim ships came from the owner's column

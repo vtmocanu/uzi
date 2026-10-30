@@ -91,6 +91,40 @@ func TestResolveLeadSettingsBlankPinKeepsScheduleSource(t *testing.T) {
 	}
 }
 
+// TestResolveLeadEffortPreB pins resolveLeadEffort's PRE-child-B behavior (#3247 not landed): a
+// trimmed non-blank column is carried verbatim, valid or not, with source user_default; NULL or
+// blank gives the built-in medium. `runtime` and a corrupt value are NOT treated specially yet;
+// child B changes these rows when it consumes EffortResolution, and must update this test.
+func TestResolveLeadEffortPreB(t *testing.T) {
+	cases := []struct {
+		name   string
+		effort pgtype.Text
+		value  string
+		source leadcfg.EffortSource
+	}{
+		{"null", pgtype.Text{}, "medium", leadcfg.EffortSourceBuiltin},
+		{"empty", txt(""), "medium", leadcfg.EffortSourceBuiltin},
+		{"whitespace", txt(" \t "), "medium", leadcfg.EffortSourceBuiltin},
+		{"explicit level", txt("high"), "high", leadcfg.EffortSourceUserDefault},
+		{"explicit padded", txt(" xhigh "), "xhigh", leadcfg.EffortSourceUserDefault},
+		{"runtime", txt("runtime"), "runtime", leadcfg.EffortSourceUserDefault},
+		{"corrupt", txt("HI gh"), "HI gh", leadcfg.EffortSourceUserDefault},
+	}
+	for _, h := range []Harness{HarnessClaude, HarnessCodex} {
+		for _, c := range cases {
+			t.Run(string(h)+"/"+c.name, func(t *testing.T) {
+				got, src := resolveLeadEffort(h, c.effort)
+				if got == nil || *got != c.value {
+					t.Errorf("effort = %v, want %q", got, c.value)
+				}
+				if src != c.source {
+					t.Errorf("source = %q, want %q", src, c.source)
+				}
+			})
+		}
+	}
+}
+
 func TestLeadEffortSourceAndResolution(t *testing.T) {
 	for _, h := range []Harness{HarnessClaude, HarnessCodex} {
 		for _, c := range []struct {

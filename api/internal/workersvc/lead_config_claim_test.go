@@ -170,11 +170,6 @@ func TestClaimLeadSourceKeysAgreeWithLeadLane(t *testing.T) {
 			// mint); TestIsolatedClaimCarriesNoLeadSourcesLiveDB covers it on the real path.
 			continue
 		}
-		if lc.Kind == "self_improve" || lc.Kind == "mr_rework" || lc.Kind == "prompt" {
-			// These kinds' claim assembly needs more than the fake store models; the SQL fence
-			// and the overlay are matrix-tested for them, and LeadLane above is the single predicate.
-			continue
-		}
 		name := fmt.Sprintf("%s/review=%v/egress=%v", lc.Kind, lc.ReviewTarget, lc.EgressBound)
 		t.Run(name, func(t *testing.T) {
 			fs := leadClaimFake(t, lc.Kind, func(r *store.Run) {
