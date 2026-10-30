@@ -6013,6 +6013,12 @@ export function validCompletionSource(value: unknown): value is CompletionSource
  * the captured base parser rejects that descriptor's journal for the unknown fence key (pinned by
  * test/git-completion-fence.test.ts), so a worker built before the fence still refuses it. Every other journal
  * rewrite spreads the existing journal and so carries the fence along.
+ *
+ * Wider boundary (issue #3638): the cooperative memory-park record is a second strict journal key, `memoryPark`.
+ * A worker built before it rejects that key the same way, so for a journal carrying one it fails closed on attach,
+ * recover AND discard until a supporting worker handles it. That reaches further than the fence above, which only
+ * guards a published source; it is an accepted operational consequence (resolve memory-parked runs before rolling
+ * back, or accept owner-held retention), and no rollback path strips the field to make it succeed.
  */
 function decodePersistedCompletionSource(value: unknown): CompletionSource | CompletionSourceV2 | undefined {
   if (value && typeof value === "object" && !Array.isArray(value) && (value as { version?: unknown }).version !== undefined) {

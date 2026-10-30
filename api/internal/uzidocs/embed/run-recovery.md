@@ -85,6 +85,44 @@ from recovery after an actual OOM kills a worker.
    prove retained work has been archived or authorize deleting uncertain
    local source.
 
+After a memory park, the parking worker ends its own source use only on
+positive evidence. If it did, Resume lets a fresh worker continue normally from
+the retained work. If it did not (the park was not confirmed, or the source end
+was not durably recorded) and the journal records the park (a `memoryPark`
+record in the active journal, with the successor running the memory guard and
+`worker_memory_pressure_v1`), a fresh worker re-parks the run at the same
+`worker_memory_pressure` hold instead of failing it. Until the companion
+issue #3639 lands, Resume of such an unsettled continuation re-parks
+immediately, so **Cancel** or an operator discard of the retained source is the
+exit. A worker restart does not release it: the slot stays active under the old
+incarnation, so the continuation is still refused and Resume keeps re-parking.
+The no-record case matters only for an unsettled park (a confirmed source end
+leaves the slot ineligible, so the run continues normally on Resume). The
+record may be missing because of an unknown authority incarnation or source
+epoch, a stopped or protected source, a write failure, or a timeout whose write
+did not land (a write already holding the bare lock may still land, and Resume
+then re-parks). Without a record, on a different worker process (for example
+after a restart, when the slot is foreign-active), or when the successor lacks
+the memory guard, the existing flow runs and the run fails as
+`preservation_failed`, as before. Without a record on the same worker process
+(the earlier flight's source end unconfirmed), the claim stops without failing
+("held by an earlier flight's unended source use") and retries until the requeue
+cap, then ends in `worker_requeue_exhausted` or `failed` per the existing
+exhaustion rule; this is new with #3638, not as before.
+On a continuation whose record carries a settlement (not on the re-park path),
+the fresh worker logs `predecessor cooperative settlement verified` or
+`unverified` for diagnosis only; neither releases custody. A new run of the same
+issue on that worker, meeting another flight's unconfirmed source end, now stops
+without failing until the requeue cap, then ends in `worker_requeue_exhausted`
+(or `failed` per the existing exhaustion rule). A crash after the park was
+accepted but before the worker finished tearing down leaves no record and
+follows the existing terminal path.
+
+Workers built before this change reject the new `memoryPark` journal record and
+fail closed on it: they refuse to attach, recover or discard that source. Roll
+workers back only after memory-parked runs are resolved. See the
+[ADR-2396 amendment](../adr/2396-worker-memory-guard.md#amendment-2026-10-30-cooperative-memory-source-settlement-issue-3638).
+
 Credential changes, Codex account changes, budget extension, approval,
 follow-up and pause do not release a held memory episode. Extending a timed
 run can supply budget for a subsequent owner Resume, but does not itself

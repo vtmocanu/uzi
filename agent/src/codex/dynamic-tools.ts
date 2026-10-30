@@ -71,15 +71,17 @@ function definition(name: string, grants: RunGrants): Omit<CodexDynamicToolSpec,
       };
     case "Read":
       return {
-        description: "Read text lines through the worker-owned no-symlink boundary inside the current worktree (offset defaults to 1, limit to 200; at most 64 KiB). Unranged binary reads return exact base64. Ordinary reads are capped at 1 MiB. An explicit offset or limit allows one fallback after a helper oversize refusal: scan at most 64 MiB and return at most 64 KiB, with incomplete:true and reason:scan_budget if the scan budget is exhausted. Only this fallback validates the skipped/selected prefix rather than the whole body. Reads may run while a shell command is pending and are not a snapshot of concurrent changes.",
+        description: "Read text lines through the worker-owned no-symlink boundary inside the current worktree (offset defaults to 1, limit to 200; at most 64 KiB). Binary reads return exact base64 only when tail, offset and limit are absent. Ordinary reads are capped at 1 MiB. An explicit offset or limit allows one fallback after a helper oversize refusal: scan at most 64 MiB and return at most 64 KiB, with incomplete:true and reason:scan_budget if the scan budget is exhausted. Only this fallback validates the skipped/selected prefix rather than the whole body. Optional text-only tail (1..2000) selects the most recent whole lines, excluding offset and limit; successful ordinary reads classify the whole body, including bytes before the suffix; only an oversized final line returns a UTF-8 suffix with partialFirstLine:true. Only helper oversize permits one tail fallback, which validates the suffix frontier under the shared range scan budget and reports incomplete:true with reason:scan_budget on exhaustion; output-cap stops are completed. Tail output has fromEnd:true, without absolute line coordinates. Tail fallback has a cooperative 5-second helper deadline; sequential helper requests each have a 30-second client allowance (up to 60 seconds plus overhead), with no absolute callback or storage completion guarantee. Reads may run while a shell command is pending and are not a snapshot of concurrent changes.",
         inputSchema: {
           ...objectSchema({
             path: STRING,
             file_path: STRING,
+            tail: { type: "integer", minimum: 1, maximum: 2000 },
             offset: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER, default: 1 },
             limit: { type: "integer", minimum: 1, maximum: 2000, default: 200 },
           }, [], false),
           anyOf: [{ required: ["path"] }, { required: ["file_path"] }],
+          not: { required: ["tail"], anyOf: [{ required: ["offset"] }, { required: ["limit"] }] },
         },
       };
     case "Search":

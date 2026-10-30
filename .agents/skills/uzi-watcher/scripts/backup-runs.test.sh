@@ -683,6 +683,90 @@ for kind in protected ordinary; do
       echo "PASS protected completionSourceFence refused: ${fence:0:40}"
     done
   fi
+  if [ "$kind" = protected ]; then
+    # issue #3638: the journal carries an optional memoryPark (the cooperative memory-park record, exact v1 shape).
+    # The valid record is a confirmed park with a settlement of one ended source; every mutation below must refuse.
+    mp_binding="$(jq -cn --arg rid "$rid" '{runId:$rid,claimGeneration:7,workerId:"worker-1",registerNonce:"nonce-1",memoryEpisode:3}')"
+    mp_valid="$(jq -cn --argjson b "$mp_binding" --arg path "$predecessor" '
+      {version:1,binding:$b,ack:"confirmed",
+       origin:{flightId:"11111111-1111-4111-8111-111111111111",attemptId:null,executorIncarnation:null,
+               authorityIncarnation:"22222222-2222-4222-8222-222222222222",
+               sourceEpoch:"33333333-3333-4333-8333-333333333333"},
+       settlement:{version:1,confirmed:true,
+         sources:[{path:$path,authorityKey:("c" * 64),attemptId:null,epoch:"33333333-3333-4333-8333-333333333333",seq:4}],
+         evidence:{parkAck:$b,interventionIds:[],processJoin:"executor",commands:"not_required",steering:"joined",
+                   auxiliaries:"none",feedback:"drained",sinkReceipts:"joined",parkReap:"complete"}}}')"
+    value="$(printf '%s' "$progress_journal" | jq --argjson m "$mp_valid" '.memoryPark=$m | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+    git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+    rc="$(backup_rc "$dest" "$rid")"
+    [ "$rc" -eq 0 ] || fail "memoryPark: valid protected descriptor rejected (exit $rc); log: $(cat "$dest/latest-attempt/backup.log")"
+    tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+claim-generation-dirty' \
+      || fail "memoryPark: retained dirty bytes missing"
+    echo "PASS protected memoryPark accepted"
+    mp_unsettled="$(printf '%s' "$mp_valid" | jq -c 'del(.settlement) | .ack="sent_unconfirmed"')"
+    value="$(printf '%s' "$progress_journal" | jq --argjson m "$mp_unsettled" '.memoryPark=$m | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+    git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+    rc="$(backup_rc "$dest" "$rid")"
+    [ "$rc" -eq 0 ] || fail "memoryPark sent_unconfirmed: valid protected descriptor rejected (exit $rc)"
+    echo "PASS protected memoryPark without settlement accepted"
+    mp_sixteen="$(printf '%s' "$mp_valid" | jq -c '.settlement.sources = [range(16) | (tostring | ("0" * (2 - length)) + .) as $id | {path:("/p/" + $id),authorityKey:($id * 32),attemptId:null,epoch:"33333333-3333-4333-8333-333333333333",seq:1}]')"
+    value="$(printf '%s' "$progress_journal" | jq --argjson m "$mp_sixteen" '.memoryPark=$m | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+    git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+    rc="$(backup_rc "$dest" "$rid")"
+    [ "$rc" -eq 0 ] || fail "memoryPark 16 sources: valid protected descriptor rejected (exit $rc)"
+    echo "PASS protected memoryPark 16 sorted unique sources accepted"
+    mp_bad_cases=(
+      'null' '"x"' '[]'
+      "$(printf '%s' "$mp_valid" | jq -c '.version=2')"
+      "$(printf '%s' "$mp_valid" | jq -c '.extra=1')"
+      "$(printf '%s' "$mp_valid" | jq -c '.ack="maybe"')"
+      "$(printf '%s' "$mp_valid" | jq -c '.ack="sent_unconfirmed"')"
+      "$(printf '%s' "$mp_valid" | jq -c 'del(.origin)')"
+      "$(printf '%s' "$mp_valid" | jq -c '.binding.runId="run-other"')"
+      "$(printf '%s' "$mp_valid" | jq -c '.binding.claimGeneration=0')"
+      "$(printf '%s' "$mp_valid" | jq -c '.binding.memoryEpisode=-1')"
+      "$(printf '%s' "$mp_valid" | jq -c '.binding.extra=1')"
+      "$(printf '%s' "$mp_valid" | jq -c '.origin.flightId="not-a-uuid"')"
+      "$(printf '%s' "$mp_valid" | jq -c '.origin.authorityIncarnation="nope"')"
+      "$(printf '%s' "$mp_valid" | jq -c '.origin.sourceEpoch="nope"')"
+      "$(printf '%s' "$mp_valid" | jq -c 'del(.origin.sourceEpoch)')"
+      "$(printf '%s' "$mp_valid" | jq -c '.origin.executorIncarnation="bad incarnation"')"
+      "$(printf '%s' "$mp_valid" | jq -c '.origin.attemptId="not-an-attempt"')"
+      "$(printf '%s' "$mp_valid" | jq -c '.origin.extra=1')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.version=2')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.confirmed="yes"')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.extra=1')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.sources=[]')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.sources[0].authorityKey="abc"')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.sources[0].epoch="nope"')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.sources[0].seq=0')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.sources[0].path="relative/path"')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.sources[0].path="/a/../b"')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.sources += [.settlement.sources[0]]')"
+      "$(printf '%s' "$mp_sixteen" | jq -c '.settlement.sources += [{path:"/p/16",authorityKey:("16" * 32),attemptId:null,epoch:"33333333-3333-4333-8333-333333333333",seq:1}]')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.evidence.parkAck.memoryEpisode=9')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.evidence.processJoin="neither"')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.evidence.steering="pending"')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.evidence.interventionIds=[range(65) | tostring]')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.evidence.interventionIds=["a","a"]')"
+      "$(printf '%s' "$mp_valid" | jq -c '.settlement.evidence.extra=1')"
+    )
+    for mp in "${mp_bad_cases[@]}"; do
+      value="$(printf '%s' "$progress_journal" | jq --argjson m "$mp" '.memoryPark=$m | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+      git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+      rc="$(backup_rc "$dest" "$rid")"
+      [ "$rc" -ne 0 ] || fail "memoryPark ${mp:0:60}: malformed record accepted"
+      [ ! -e "$dest/latest-attempt/issue-4242.tgz" ] || fail "memoryPark ${mp:0:60}: invalid descriptor attributed source"
+      echo "PASS protected memoryPark refused: ${mp:0:60}"
+    done
+    # An unsorted pair of sources is refused too (sorted ascending by path).
+    mp="$(printf '%s' "$mp_valid" | jq -c '.settlement.sources = [{path:"/z/b",authorityKey:("d" * 64),attemptId:null,epoch:"33333333-3333-4333-8333-333333333333",seq:1}, {path:"/a/b",authorityKey:("e" * 64),attemptId:null,epoch:"33333333-3333-4333-8333-333333333333",seq:1}]')"
+    value="$(printf '%s' "$progress_journal" | jq --argjson m "$mp" '.memoryPark=$m | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+    git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+    rc="$(backup_rc "$dest" "$rid")"
+    [ "$rc" -ne 0 ] || fail "memoryPark unsorted sources accepted"
+    echo "PASS protected memoryPark refused: unsorted sources"
+  fi
   if [ "$kind" = ordinary ]; then
     # issue #3404: installCompletionSourceFence writes the PLAIN completing journal, {runId, clonePath,
     # completionSourceFence} with the fence as the last key and no recovery episode. The plain-journal

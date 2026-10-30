@@ -255,7 +255,7 @@ test("proof 1 control: a normally joined, fully accounted delete lets the succes
     branch: BR_A, key: "issue-5101", runId: RUN_A });
   assert.equal(await worker.line(), "W");
   const finished = await worker.line();
-  assert.match(finished, /^DONE:\{"ended":\["[^"]*issue-5101"\],"kept":\[\]\}$/);
+  assert.match(finished, /^DONE:\{"ended":\["[^"]*issue-5101"\],"kept":\[\],"endedSlots":\[\{[^\]]*"path":"[^"]*issue-5101"\}\]\}$/);
   await worker.kill();
   const { rt, git } = await successor(dataDir);
   const slot = await slotOf(rt, a);

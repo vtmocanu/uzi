@@ -1,3 +1,4 @@
+import { rangeScanBytes } from "../src/codex/broker.js";
 import { m3ReduceAndPersist } from "./m3-projection-fixture.js";
 import { describe, it } from "node:test";
 import { RunRunner } from "../src/runner.js";
@@ -44,6 +45,18 @@ import {
 // transport and scripted app-server frames (NO real Codex process). Every external
 // dependency is an injected seam; the ExecutionRegistry is the REAL one (pure logic) so
 // launch reservation / callback admission are exercised end to end.
+
+function assertContentEqual(actual: unknown, expected: string): void {
+  assert.equal(typeof actual, "string");
+  const content = actual as string;
+  const length = Math.max(content.length, expected.length);
+  for (let index = 0; index < length; index++) {
+    if (content[index] !== expected[index]) {
+      const start = Math.max(0, index - 16), end = index + 17;
+      assert.fail(`content mismatch at index ${index} (lengths ${content.length}/${expected.length}): actual ${JSON.stringify(content.slice(start, end))}, expected ${JSON.stringify(expected.slice(start, end))}`);
+    }
+  }
+}
 
 const WORKSPACE = "/work/repo";
 
@@ -2521,7 +2534,10 @@ describe("CodexHarness: notifications are bound to the active (thread, turn)", (
 });
 
 describe("CodexHarness: bounded Read transport serialization (#296)", () => {
-  for (const { name, raw, args, expected, offset, lines, partial, truncated, fallback = false, incomplete = false, openingSize = Buffer.byteLength(raw) } of [
+  for (const { name, raw, args, expected, offset, lines, partial, truncated, fallback = false, incomplete = false, openingSize = Buffer.byteLength(raw), tailMode = false } of [
+    { name: "ordinary tail escaping-heavy", raw: "\u0001".repeat(1024 * 1024 - 2), args: { path: "src/x.ts", tail: 2 }, expected: "\u0001".repeat(64 * 1024), offset: 1, lines: 1, partial: true, truncated: true, tailMode: true },
+    { name: "tail fallback escaping-heavy", raw: "\u0001".repeat(2 * 1024 * 1024), args: { path: "src/x.ts", tail: 2 }, expected: "\u0001".repeat(64 * 1024), offset: 1, lines: 1, partial: true, truncated: true, fallback: true, tailMode: true },
+    { name: "tail incomplete fallback", raw: "", openingSize: rangeScanBytes + 1, args: { path: "src/x.ts", tail: 2 }, expected: "last\n", offset: 1, lines: 1, partial: false, truncated: true, fallback: true, incomplete: true, tailMode: true },
     { name: "oversize fallback escaping-heavy text", raw: "\u0001".repeat(2 * 1024 * 1024), args: { path: "src/x.ts", limit: 1 }, expected: "\u0001".repeat(64 * 1024), offset: 1, lines: 1, partial: true, truncated: true, fallback: true },
     { name: "incomplete fallback", raw: "", openingSize: 65 * 1024 * 1024, args: { path: "src/x.ts", offset: 1 }, expected: "prefix", offset: 1, lines: 1, partial: true, truncated: true, fallback: true, incomplete: true },
     { name: "middle excerpt", raw: "a\nb\nc\n", args: { file_path: "src/x.ts", offset: 2, limit: 1 }, expected: "b\n", offset: 2, lines: 1, partial: false, truncated: true },
@@ -2542,10 +2558,11 @@ describe("CodexHarness: bounded Read transport serialization (#296)", () => {
           calls++;
           if (!fallback) return { ok: true, size: openingSize, data: Buffer.from(raw).toString("base64") };
           if (req.op === "read") return { ok: false, code: "E_OVERSIZE", origin: "helper" };
-          assert.equal(req.op, "read_range");
+          assert.equal(req.op, tailMode ? "read_tail" : "read_range");
+          if (tailMode) assert.deepEqual(req, { op: "read_tail", path: "src/x.ts", tail: 2 });
           return { ok: true, size: openingSize, data: Buffer.from(expected).toString("base64"),
-            offset, linesReturned: lines, partialLastLine: partial, truncated, incomplete,
-            scannedBytes: incomplete ? 64 * 1024 * 1024 : 65537, ...(incomplete ? { reason: "scan_budget" } : {}) };
+            ...(tailMode ? { tail: 2, fromEnd: true, partialFirstLine: partial } : { offset, partialLastLine: partial }), linesReturned: lines, truncated, incomplete,
+            scannedBytes: incomplete ? rangeScanBytes : 65537, ...(incomplete ? { reason: "scan_budget" } : {}) };
         } },
         worktreePath: WORKSPACE,
         grants: renderCodexRun(request).leadGrants,
@@ -2569,10 +2586,14 @@ describe("CodexHarness: bounded Read transport serialization (#296)", () => {
               write({ method: "thread/started", params: { thread: { id: "th-1" } } });
               write({ id: 296, method: "item/tool/call", params: { threadId: "th-1", turnId: "tn-1", callId: "read-296", tool: "uzi_read", arguments: args } });
             }
-          } else if (frame.id === 296) {
+          } else if (frame.id === 296 || frame.id === 297) {
             replies.push({ frame, bytes: Buffer.byteLength(line) + 1 });
-            // Complete only once the real response has arrived at the peer.
-            write({ method: "turn/completed", params: { threadId: "th-1", turn: { id: "tn-1", status: "completed" } } });
+            if (tailMode && frame.id === 296) {
+              write({ id: 297, method: "item/tool/call", params: { threadId: "th-1", turnId: "tn-1", callId: "read-296", tool: "uzi_read", arguments: args } });
+            } else {
+              // Complete only once the real response has arrived at the peer.
+              write({ method: "turn/completed", params: { threadId: "th-1", turn: { id: "tn-1", status: "completed" } } });
+            }
           }
           nl = buffered.indexOf("\n");
         }
@@ -2584,17 +2605,25 @@ describe("CodexHarness: bounded Read transport serialization (#296)", () => {
       try {
         const events = await withTimeout(collect(harness.startTurn(request).events), 5000, "Read response delivery");
         assert.ok(events.some(e => e.kind === "turn_finished"));
-        assert.equal(replies.length, 1);
+        assert.equal(replies.length, tailMode ? 2 : 1);
         assert.ok(replies[0]!.bytes < 4 * 1024 * 1024);
         const reply = rec(replies[0]!.frame.result);
         assert.equal(reply.success, true);
         const items = reply.contentItems as { type: string; text: string }[];
         assert.equal(items.length, 1);
         assert.equal(items[0]!.type, "inputText");
-        assert.deepEqual(JSON.parse(items[0]!.text), {
-          size: openingSize, content: expected, offset, linesReturned: lines, partialLastLine: partial, truncated,
-          ...(incomplete ? { incomplete: true, reason: "scan_budget", scannedBytes: 64 * 1024 * 1024 } : {}),
+        const { content, ...metadata } = JSON.parse(items[0]!.text);
+        assertContentEqual(content, expected);
+        assert.deepEqual(metadata, {
+          size: openingSize,
+          ...(tailMode ? { tail: 2, fromEnd: true, partialFirstLine: partial } : { offset, partialLastLine: partial }), linesReturned: lines, truncated,
+          ...(incomplete ? { incomplete: true, reason: "scan_budget", scannedBytes: rangeScanBytes } : {}),
         });
+        if (tailMode) {
+          const replay = rec(replies[1]!.frame.result);
+          assert.equal(replay.success, true);
+          assert.deepEqual(JSON.parse((replay.contentItems as { text: string }[])[0]!.text), { replay: true });
+        }
         assert.equal(calls, fallback ? 2 : 1);
         assert.equal(registry.inFlightCallbackCount(), 0);
         assert.equal(registry.isPoisoned(), false);

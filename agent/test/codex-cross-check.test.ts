@@ -1,3 +1,4 @@
+import { rangeScanBytes } from "../src/codex/broker.js";
 import type { CodexOperationRequest, CodexOperationDecision } from "../src/protocol.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
@@ -796,7 +797,8 @@ it("aborts a pending helper readiness call before provider launch", async () => 
  assert.deepEqual(r.disposed, ["fileop"]);
 });
 
-it("REQ-crosscheck-abort: abort after helper E_OVERSIZE prevents a read_range frame", async () => {
+for (const mode of ["read_range", "read_tail"] as const) {
+it("REQ-crosscheck-abort: abort after helper E_OVERSIZE prevents " + mode, async () => {
  const controller = new AbortController();
  const events: Record<string, unknown>[] = [];
  const recorder = new CheckActivityRecorder(p => { events.push(structuredClone(p)); }, { generation: 7 });
@@ -816,7 +818,7 @@ it("REQ-crosscheck-abort: abort after helper E_OVERSIZE prevents a read_range fr
   notes(emit) {
    providerEmit = emit;
    emit({ id: 90, method: "item/tool/call", params: { threadId: "thread", turnId: "turn",
-    callId: "read", tool: "Read", arguments: { path: "large.ts", limit: 2 } } });
+    callId: "read", tool: "Read", arguments: { path: "large.ts", ...(mode === "read_tail" ? { tail: 2 } : { limit: 2 }) } } });
   },
   onFileopRequest(op, emit) {
    if (op.op !== "read") return false;
@@ -851,7 +853,7 @@ it("REQ-crosscheck-abort: abort after helper E_OVERSIZE prevents a read_range fr
 });
 
 for (const stop of ["abort", "root failure"] as const) {
- it("REQ-crosscheck-abort: pending read_range settles on " + stop + " and ignores a late reply", async t => {
+ it("REQ-crosscheck-abort: pending " + mode + " settles on " + stop + " and ignores a late reply", async t => {
   const controller = new AbortController();
   const events: Record<string, unknown>[] = [];
   const recorder = new CheckActivityRecorder(p => { events.push(structuredClone(p)); }, { generation: 7 });
@@ -869,7 +871,7 @@ for (const stop of ["abort", "root failure"] as const) {
     const op = real.client.op.bind(real.client);
     t.mock.method(real.client, "op", (request: FileopRequest) => {
      const pending = op(request);
-     if (request.op === "read_range") void pending.then(result => { rangeResult = result; });
+     if (request.op === mode) void pending.then(result => { rangeResult = result; });
      return pending;
     });
     return { client: real.client, dispose: () => { disposals++; return real.dispose(); } };
@@ -877,13 +879,13 @@ for (const stop of ["abort", "root failure"] as const) {
    notes(emit) {
     providerEmit = emit;
     emit({ id: 90, method: "item/tool/call", params: { threadId: "thread", turnId: "turn",
-     callId: "read", tool: "Read", arguments: { path: "large.ts", limit: 2 } } });
+     callId: "read", tool: "Read", arguments: { path: "large.ts", ...(mode === "read_tail" ? { tail: 2 } : { limit: 2 }) } } });
    },
    onFileopRequest(op, emit) {
     if (op.op === "read") { emit({ id: op.id, ok: false, code: "E_OVERSIZE" }); return true; }
-    if (op.op !== "read_range") return false;
+    if (op.op !== mode) return false;
     lateReply = () => emit({ id: op.id, ok: true, data: Buffer.from("late excerpt\n").toString("base64"),
-     size: 13, offset: 1, linesReturned: 1, partialLastLine: false, truncated: false,
+     size: 13, ...(mode === "read_tail" ? { tail: 2, fromEnd: true, partialFirstLine: false } : { offset: 1, partialLastLine: false }), linesReturned: 1, truncated: false,
      incomplete: false, scannedBytes: 13 });
     return true;
    },
@@ -893,7 +895,7 @@ for (const stop of ["abort", "root failure"] as const) {
   try {
    // One event-loop turn drains startup and broker microtasks without a wall-clock wait.
    await new Promise<void>(resolve => setImmediate(resolve));
-   assert.deepEqual(r.ops, ["stat", "read", "read_range"]);
+   assert.deepEqual(r.ops, ["stat", "read", mode]);
    assert.ok(lateReply);
    assert.equal(rangeResult, undefined);
    assert.equal(disposals, 0);
@@ -916,7 +918,7 @@ for (const stop of ["abort", "root failure"] as const) {
    assert.deepEqual(rangeResult, { ok: false, code: "E_IO" });
    assert.equal((await outcome).ok, false);
    assert.deepEqual(r.disposed, ["provider", "fileop"]);
-   assert.deepEqual(r.ops, ["stat", "read", "read_range"]);
+   assert.deepEqual(r.ops, ["stat", "read", mode]);
    assert.equal(r.specs.length, 2, "no replacement roots or retry");
    assert.equal(r.requests.some(f => f.id === 90 && !f.method && f.result?.success === true), false);
    assert.equal(events.some(e => e.event === "check_activity" && e.outcome === "ok"), false);
@@ -928,6 +930,8 @@ for (const stop of ["abort", "root failure"] as const) {
    await outcome;
   }
  });
+}
+
 }
 
 it("cleanup failure fails the check, disposes sibling and marks usage error", async () => {
@@ -1119,6 +1123,30 @@ const activityReply = (op: { op: string; path: string }): Record<string, unknown
  }
  return undefined;
 };
+
+it("activity: completed tail has no absolute lines and incomplete tail is limit", async () => {
+ const { r, events, recorder } = activityRig([
+  { tool: "Read", arguments: { path: "small-tail.ts", tail: 1 } },
+  { tool: "Read", arguments: { path: "tail.ts", tail: 1 } },
+  { tool: "Read", arguments: { path: "budget-tail.ts", tail: 2 } },
+ ], op => {
+  if (op.op === "stat") return undefined;
+  if (op.path === "small-tail.ts") return { ok: true, data: Buffer.from("a\nlast\n").toString("base64"), size: 7 };
+  if (op.op === "read") return { ok: false, code: "E_OVERSIZE" };
+  if (op.op !== "read_tail") return undefined;
+  const incomplete = op.path === "budget-tail.ts";
+  return { ok: true, data: Buffer.from("last\n").toString("base64"), size: rangeScanBytes + 1,
+   tail: incomplete ? 2 : 1, fromEnd: true, linesReturned: 1, partialFirstLine: false, truncated: true,
+   incomplete, scannedBytes: incomplete ? rangeScanBytes : 32768, ...(incomplete ? { reason: "scan_budget" } : {}) };
+ });
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events.filter(e => e.event === "check_activity"), [
+  { event: "check_activity", op: "read", outcome: "ok", path: "small-tail.ts" },
+  { event: "check_activity", op: "read", outcome: "ok", path: "tail.ts" },
+  { event: "check_activity", op: "read", outcome: "limit", path: "budget-tail.ts" },
+ ]);
+ assert.equal(recorder.coverageEvidence().reads.has("budget-tail.ts"), false);
+});
 
 it("activity: scan exhaustion records limit without a successful read, EOF stays ok, binary stays error", async () => {
  const { r, events, recorder } = activityRig([

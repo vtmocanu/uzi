@@ -807,6 +807,48 @@ describe("Repos — enable guardrail 422 violations (PRD #345)", () => {
     await waitFor(() => expect(screen.queryByText("reason one")).toBeNull());
     expect(screen.queryByText("reason two")).toBeNull();
   });
+
+  // The refusal renders above the repo list; clicking Enable on a row far down a long
+  // list left it off-screen, so the click read as "nothing happens". It must scroll in,
+  // smoothly unless the user asked for reduced motion.
+  it.each([
+    { reduce: false, behavior: "smooth" },
+    { reduce: true, behavior: "auto" },
+  ])("scrolls the refusal into view when an enable is refused (reduced motion: $reduce)", async ({ reduce, behavior }) => {
+    const scrolled: { el: Element; opts?: ScrollIntoViewOptions }[] = [];
+    const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
+    const originalMatchMedia = window.matchMedia;
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value(this: HTMLElement, opts?: ScrollIntoViewOptions) {
+        scrolled.push({ el: this, opts });
+      },
+    });
+    window.matchMedia = ((query: string) => ({
+      matches: reduce && query.includes("prefers-reduced-motion: reduce"),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia;
+    try {
+      mockApi.setRepoEnabled.mockRejectedValue(
+        new ApiError(422, "this repo was not enabled", { violations: ["reason one"] }),
+      );
+      renderPage();
+      await screen.findByText("example/website");
+      fireEvent.click(within(rowFor("example/website")).getByRole("button", { name: /^Enable$/ }));
+
+      await screen.findByText("reason one");
+      await waitFor(() => {
+        const hit = scrolled.find((s) => s.el.contains(screen.getByText("reason one")));
+        expect(hit?.opts).toEqual({ block: "nearest", behavior });
+      });
+    } finally {
+      window.matchMedia = originalMatchMedia;
+      if (original) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", original);
+      else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+    }
+  });
 });
 
 describe("Repos — member override request (issue #1432)", () => {

@@ -388,13 +388,16 @@ describe("runner.ts: which sites use the cleanup wait", () => {
     assert.equal(deletions.filter(s => s.includes("record.sourceSha")).length, 1);
   });
 
-  it("the owed reconcile, bind, launch and seed waits still use authorityWait", () => {
+  it("the owed reconcile, bind, launch, seed and memory classification waits use authorityWait", () => {
     const reconcile = starts("this.inAuthority(() => this.git.reconcileOwedCandidates(").map(statement);
     assert.equal(reconcile.length, 1);
     assert.ok(reconcile[0]!.includes("this.authorityWait(flight)"));
     assert.ok(statement(source.indexOf("this.authority!.bindSource(")).includes("this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)"));
     assert.ok(statement(source.indexOf("this.authority.assertLaunchable(")).includes("this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)"));
     assert.ok(statement(source.indexOf("const seedInAuthority =")).includes("this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)"));
-    assert.equal(starts("this.authorityWait(").length, 4, "no other authorityWait caller");
+    const classification = starts("authority.classifySourceAdmission(").map(statement);
+    assert.equal(classification.length, 1);
+    assert.ok(classification[0]!.includes("this.authorityWait(flight)"), "memory classification uses the flight lifecycle wait");
+    assert.equal(starts("this.authorityWait(").length, 5, "no other authorityWait caller");
   });
 });
