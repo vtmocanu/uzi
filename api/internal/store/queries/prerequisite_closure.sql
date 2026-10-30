@@ -60,7 +60,10 @@ ORDER BY next_attempt_at,id LIMIT @lim::int;
 
 -- name: ListPrerequisiteCleanupDue :many
 SELECT * FROM recovery_prerequisite_closures
-WHERE state='pinned' AND next_attempt_at<= @due_at::timestamptz
+WHERE state='pinned' AND EXISTS (
+    SELECT 1 FROM recovery_captures c
+    WHERE c.id=recovery_prerequisite_closures.capture_id AND c.state IN ('expired','discarded')
+) AND next_attempt_at<= @due_at::timestamptz
     AND (next_attempt_at,id) > (@after_due_at::timestamptz,@after_id::uuid)
 ORDER BY next_attempt_at,id LIMIT @lim::int;
 

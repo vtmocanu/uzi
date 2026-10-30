@@ -71,6 +71,11 @@ func (s *Service) prerequisitePinned(ctx context.Context, q PrerequisiteStore, r
 		if p.cleanupOnly && !cleanup {
 			return pgx.ErrNoRows
 		}
+		// Locks may spend the admission transaction budget; preserve binding,
+		// listing and outcome time before changing any scheduling facts.
+		if c.Err() != nil || end.Sub(s.now()) < prerequisiteListingReserve-prerequisiteDBTimeout {
+			return pgx.ErrNoRows
+		}
 		if current.CleanupAttempts == 8 && current.CleanupDeadline.Valid && !current.CleanupDeadline.Time.After(s.now()) && !current.CleanupExhaustedAt.Valid {
 			_, e = tx.ExpirePrerequisiteCleanup(c, store.ExpirePrerequisiteCleanupParams{ID: row.ID, Generation: 8, PassID: current.LastAuditPassID})
 			if e != nil {

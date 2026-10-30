@@ -20,11 +20,13 @@ const (
 	prerequisitePassBudget    = 10 * time.Second
 	prerequisiteItemBudget    = 8 * time.Second
 	prerequisiteProofBudget   = 5 * time.Second
-	prerequisiteMarkerReserve = 4 * time.Second
-	prerequisiteDBTimeout     = 500 * time.Millisecond
-	prerequisiteOutcomeBudget = 5 * time.Second
-	prerequisiteMaxItems      = 5
-	prerequisiteScanLimit     = 10
+	prerequisiteMarkerReserve = 4500 * time.Millisecond
+	// Reservation/lock transaction, binding read, 1s listing and 1.5s outcome.
+	prerequisiteListingReserve = 3500 * time.Millisecond
+	prerequisiteDBTimeout      = 500 * time.Millisecond
+	prerequisiteOutcomeBudget  = 5 * time.Second
+	prerequisiteMaxItems       = 5
+	prerequisiteScanLimit      = 10
 )
 
 type prerequisitePass struct {
@@ -138,6 +140,10 @@ func (s *Service) SweepPrerequisiteClosures(parent context.Context) (int64, erro
 				<-r.slot
 				continue // no reservation, no attempt and no item selection consumed
 			}
+			if !prerequisiteListingAdmissible(ctx, row, p.end.Sub(s.now())) {
+				<-r.slot
+				continue
+			}
 			admitted++
 			itemPass := p
 			itemPass.cleanupOnly = lane == 3 || lane == 4
@@ -223,6 +229,14 @@ func prerequisiteOutcomeContext(ctx context.Context, p prerequisitePass) (contex
 	return context.WithDeadline(context.WithoutCancel(ctx), end)
 }
 
+func prerequisiteListingAdmissible(ctx context.Context, row store.RecoveryPrerequisiteClosure, remaining time.Duration) bool {
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining = min(remaining, time.Until(deadline))
+	}
+	return (row.State != "create_unknown" && row.State != "pinned") ||
+		(ctx.Err() == nil && remaining >= prerequisiteListingReserve)
+}
+
 func (s *Service) prerequisiteOne(ctx context.Context, q PrerequisiteStore, row store.RecoveryPrerequisiteClosure, p prerequisitePass) (int64, error) {
 	end := s.now().Add(prerequisiteItemBudget)
 	if p.end.Before(end) {
@@ -230,6 +244,9 @@ func (s *Service) prerequisiteOne(ctx context.Context, q PrerequisiteStore, row 
 	}
 	ctx, cancel := context.WithTimeout(ctx, max(time.Duration(0), end.Sub(s.now())))
 	defer cancel()
+	if !prerequisiteListingAdmissible(ctx, row, end.Sub(s.now())) {
+		return 0, nil
+	}
 	switch row.State {
 	case "pending":
 		if row.Attempts == 8 {
@@ -441,7 +458,6 @@ func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, 
 	budgetShortfall := false
 	unavailable := false
 	c, cc = context.WithTimeout(ctx, prerequisiteDBTimeout)
-	defer cc()
 	err = s.prerequisiteTx(c, func(tx PrerequisiteStore) error {
 		run, e := tx.LockPrerequisiteRun(c, row.RunID)
 		if errors.Is(e, pgx.ErrNoRows) {
@@ -482,7 +498,8 @@ func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, 
 			return nil
 		}
 		// Recheck after the last binding read, immediately before the durable marker.
-		// Four seconds cover the shared 500ms transaction/binding recheck, 1s send, 1s readback and 1.5s outcome.
+		// Reserve 500ms for commit, 500ms for post-commit binding, 1s send,
+		// 1s readback and 1.5s outcome.
 		if end.Sub(s.now()) < prerequisiteMarkerReserve || c.Err() != nil {
 			budgetShortfall = true
 			return nil
@@ -499,6 +516,7 @@ func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, 
 		marked = e == nil
 		return e
 	})
+	cc()
 	if err != nil {
 		return 0, err
 	}
@@ -510,8 +528,7 @@ func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, 
 	}
 	// Commit precedes forge I/O. A deleted or rebound connection after the marker
 	// leaves invoked durable; the stale lane later converts it to listing-only unknown.
-	fresh, err = s.prerequisiteBinding(c, q, row, false)
-	cc()
+	fresh, err = s.prerequisiteBinding(ctx, q, row, false)
 	if err != nil || !b.same(fresh) || ctx.Err() != nil || end.Sub(s.now()) < 3500*time.Millisecond {
 		return 1, nil
 	}

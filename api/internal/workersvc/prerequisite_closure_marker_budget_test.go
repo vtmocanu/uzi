@@ -29,20 +29,20 @@ func (q *prerequisiteMarkerBudgetStore) GetRepoForUser(ctx context.Context, a st
 		if !ok {
 			q.t.Fatal("post-marker binding has no deadline")
 		}
-		if extra := bindingDeadline.Sub(markerDeadline); extra > 0 {
-			q.t.Fatalf("post-marker binding extends marker DB budget by %s", extra)
+		if !bindingDeadline.After(markerDeadline) {
+			q.t.Fatal("post-marker binding reused spent transaction deadline")
 		}
 		if err := ctx.Err(); err != nil {
 			q.t.Fatalf("post-marker binding context already canceled: %v", err)
 		}
-		if err := q.markerContext.Err(); err != nil {
-			q.t.Fatalf("marker context canceled before post-marker binding: %v", err)
+		if err := q.markerContext.Err(); err != context.Canceled {
+			q.t.Fatalf("marker context was not canceled at commit: %v", err)
 		}
 	}
 	return q.prerequisiteMemory.GetRepoForUser(ctx, a)
 }
 
-func TestPrerequisiteMarkerAndPostCommitBindingShareDBBudget(t *testing.T) {
+func TestPrerequisitePostCommitBindingSurvivesCanceledMarkerContext(t *testing.T) {
 	s, m, h, _ := newPrerequisiteMemory(t, 1)
 	q := &prerequisiteMarkerBudgetStore{prerequisiteMemory: m, t: t}
 	txCalls := 0
@@ -51,6 +51,9 @@ func TestPrerequisiteMarkerAndPostCommitBindingShareDBBudget(t *testing.T) {
 		// The first transaction is eligibility preflight; the second writes the marker.
 		marker := txCalls == 2
 		if marker {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithCancel(ctx)
+			defer cancel()
 			q.markerContext = ctx
 		}
 		err := m.transaction(ctx, func(PrerequisiteStore) error {

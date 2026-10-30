@@ -76,7 +76,7 @@ func prerequisiteNativeEnv() []string {
 func prerequisiteNativeCommand(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	argv := []string{"-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com"}
 	argv = append(argv, args...)
-	cmd := exec.CommandContext(ctx, "git", argv...)
+	cmd := exec.CommandContext(ctx, "git", argv...) //nolint:gosec // G702: literal Git subcommands and runtime-owned fixture arguments; no shell.
 	cmd.Dir = dir
 	cmd.Env = prerequisiteNativeEnv()
 	return cmd.CombinedOutput()

@@ -701,6 +701,46 @@ separating queue/cache/reruns, remains outstanding; local fixture/compile
 seconds are not a substitute. M6 maintainer/operator acceptance, E6, C2/C3
 and parent completion remain separate and unperformed.
 
+#### C1b cross-check repair (2026-10-30)
+
+Four reported lifecycle defects were repaired within the existing executor and
+upload transaction. The post-marker binding read has its own 500 ms context;
+a 4.5-second pre-marker reserve covers commit, binding, send/read-back and
+outcome persistence. Read errors still prevent sending. Cleanup selection
+excludes available captures and retains the locked expiry/discard recheck.
+Listing admission requires 3.5 seconds, including the caller's remaining
+deadline, before consuming an item or changing audit/retry scheduling.
+Upload status is decorated inside the ready transaction and returned after
+commit without another request-context database read.
+
+The first serial race run (`gate-log.Wbpmhv`, EXIT 1) passed the functional
+regressions but failed cleanup query-plan assertions: the filtered selector
+used the capture-ID index instead of the formerly required cleanup-due index.
+The repaired test accepts either indexed access path, retaining full eligible
+row/order/page checks and the executed Limit bound. The affected rerun
+(`gate-log.2Vw4ap`, EXIT 0) passed both custom/generic plan tests and the
+marker/direct-listing/sweep-admission regressions, with zero SKIP.
+
+Lead-owned disposable exports independently restored each faulty behavior:
+reuse the spent marker context; remove the capture-state selector predicate;
+remove listing admission; restore the post-commit status read. Each failed at
+its intended behavioral assertion (four mutation logs under crosscheck-mutation-*).
+The script `crosscheck-mutations.py` completed EXIT 0 (`gate-log.1iQMi6`);
+the fresh unmutated export then passed cleanup selection, marker context,
+late direct/sweep admission and upload cancellation/ACK tests with race,
+count=1, serial packages and zero SKIP (`crosscheck-restored-green.log`).
+No mutant was copied into the candidate; the export was removed.
+
+The initial focused static check passed format/docs validation but lint reported
+G702 on the existing native fixture Git launcher (gate-log.34zKTd, EXIT 1).
+Its literal executable/subcommands and runtime-owned test arguments use no
+shell; the launcher now documents that narrow false-positive suppression.
+
+Exact-head hosted API/repo/store-it acceptance, named LiveDB PASS/zero SKIP,
+paired CI timing and M6 operator/maintainer actions remain outstanding.
+The latest forge-reader attempt still returned an upstream error. These local
+repairs and checks do not tick the overall M5 or parent acceptance boxes.
+
 ### C2: "Release a guarded hold on a pinned prerequisite closure"
 
 - **Depends on:** C1b.

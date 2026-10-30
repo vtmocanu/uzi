@@ -3,6 +3,7 @@ package store_test
 import (
 	"bytes"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -70,13 +71,22 @@ func TestPrerequisiteCleanupRawPagesAndPlansLiveDB(t *testing.T) {
 	tag, err := pool.Exec(ctx, "UPDATE recovery_captures SET state='expired' WHERE id=ANY($1::uuid[])", captures[total-expiredTail:])
 	prerequisiteRows(t, expiredTail, tag.RowsAffected(), err)
 
+	// A crashed delete retry remains eligible alongside initial cleanup.
+	qSeed := store.New(pool)
+	if _, err := qSeed.ReservePrerequisiteCleanup(ctx, store.ReservePrerequisiteCleanupParams{
+		ID: want[total-1], PassID: prerequisiteUUID(uuid.New()), LeaseSeconds: 8,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prerequisiteAdvance(t, ctx, pool, 38*time.Second)
+	mustExec(ctx, t, pool, "UPDATE recovery_prerequisite_closures SET next_attempt_at=now()")
 	// Check the entire skew and its correspondence, with bounded diagnostics.
 	var available, expired, shaped int
 	err = pool.QueryRow(ctx, `SELECT
 		count(*) FILTER (WHERE c.state='available'),
 		count(*) FILTER (WHERE c.state='expired'),
 		count(*) FILTER (WHERE p.state='pinned' AND p.next_attempt_at=now()
-			AND p.audit_next_at=now()+interval '24 hours')
+			AND p.audit_next_at>now())
 		FROM recovery_prerequisite_closures p JOIN recovery_captures c ON c.id=p.capture_id`).Scan(&available, &expired, &shaped)
 	if err != nil || available != total-expiredTail || expired != expiredTail || shaped != total {
 		t.Fatalf("fixture available=%d expired=%d pinned/due/audit=%d err=%v", available, expired, shaped, err)
@@ -85,6 +95,8 @@ func TestPrerequisiteCleanupRawPagesAndPlansLiveDB(t *testing.T) {
 		mustExec(ctx, t, pool, "ANALYZE "+table)
 	}
 
+	want = want[total-expiredTail:]
+	captures = captures[total-expiredTail:]
 	planDB := &prerequisitePlanDB{DBTX: pool}
 	q := store.New(planDB)
 	args := store.ListPrerequisiteCleanupDueParams{
@@ -107,12 +119,12 @@ func TestPrerequisiteCleanupRawPagesAndPlansLiveDB(t *testing.T) {
 		if err := pool.QueryRow(ctx, "SELECT state FROM recovery_captures WHERE id=$1", c.CaptureID).Scan(&state); err != nil {
 			t.Fatal(err)
 		}
-		if c.CaptureID != captures[i] || state != "available" {
+		if c.CaptureID != captures[i] || state != "expired" {
 			t.Fatalf("first raw cleanup page capture at %d: id=%s want=%s state=%s", i, c.CaptureID, captures[i], state)
 		}
 	}
 	t.Run("initial_cursor", func(t *testing.T) {
-		prerequisiteExplain(t, ctx, pool, planDB.sql, planDB.args, "prerequisite_closure_cleanup_due", true)
+		prerequisiteExplain(t, ctx, pool, planDB.sql, planDB.args, "prerequisite_closure_cleanup_due", true, "recovery_prerequisite_closures_capture_id_key")
 	})
 
 	seen := make(map[uuid.UUID]bool, total)
@@ -133,13 +145,16 @@ func TestPrerequisiteCleanupRawPagesAndPlansLiveDB(t *testing.T) {
 			break
 		}
 		nonemptyPages++
-		// Page 408 starts at offset 4080, immediately before the expired tail.
-		if offset == total-expiredTail {
+		// The second page starts within the eligible tail after the available prefix.
+		if offset == pageSize {
 			lateExplained = t.Run("late_cursor", func(t *testing.T) {
-				prerequisiteExplain(t, ctx, pool, planDB.sql, planDB.args, "prerequisite_closure_cleanup_due", true)
+				prerequisiteExplain(t, ctx, pool, planDB.sql, planDB.args, "prerequisite_closure_cleanup_due", true, "recovery_prerequisite_closures_capture_id_key")
 			})
 		}
 		for _, c := range rows {
+			if c.ID == want[len(want)-1] && c.CleanupAttempts != 1 {
+				t.Fatal("cleanup retry was not selected")
+			}
 			if offset >= len(want) {
 				t.Fatalf("raw cursor returned extra row at %d: %s", offset, c.ID)
 			}
@@ -154,17 +169,15 @@ func TestPrerequisiteCleanupRawPagesAndPlansLiveDB(t *testing.T) {
 				t.Fatalf("raw cursor due timestamp mismatch at %d: %s", offset, c.NextAttemptAt.Time)
 			}
 			seen[c.ID] = true
-			if offset >= total-expiredTail {
-				reachedExpired++
-			}
+			reachedExpired++
 			offset++
 			args.AfterDueAt = c.NextAttemptAt
 			args.AfterID = c.ID
 		}
 	}
-	if !ended || offset != total || len(seen) != total || reachedExpired != expiredTail {
+	if !ended || offset != expiredTail || len(seen) != expiredTail || reachedExpired != expiredTail {
 		t.Fatalf("raw cursor ended=%t rows=%d distinct=%d expired tail=%d want=%d/%d",
-			ended, offset, len(seen), reachedExpired, total, expiredTail)
+			ended, offset, len(seen), reachedExpired, expiredTail, expiredTail)
 	}
 	if !lateExplained {
 		t.Fatal("late cursor plan contract was not verified")
@@ -172,6 +185,6 @@ func TestPrerequisiteCleanupRawPagesAndPlansLiveDB(t *testing.T) {
 	if t.Failed() {
 		return
 	}
-	t.Logf("raw cleanup: available prefix=%d expired tail=%d rows=%d pages=%d limit=%d; initial/late custom+generic plans use prerequisite_closure_cleanup_due with top Limit actual rows <=10",
+	t.Logf("raw cleanup: available prefix=%d expired tail=%d rows=%d pages=%d limit=%d; initial/late custom+generic plans use a cleanup-due or capture-ID index with top Limit actual rows <=10",
 		available, reachedExpired, offset, nonemptyPages, pageSize)
 }

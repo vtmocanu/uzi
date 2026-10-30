@@ -943,7 +943,7 @@ func prerequisitePlanLiteral(t *testing.T, v interface{}) string {
 	}
 }
 
-func prerequisiteExplain(t *testing.T, ctx context.Context, pool *pgxpool.Pool, sql string, args []interface{}, index string, limited bool) {
+func prerequisiteExplain(t *testing.T, ctx context.Context, pool *pgxpool.Pool, sql string, args []interface{}, index string, limited bool, alternatives ...string) {
 	t.Helper()
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
@@ -977,8 +977,12 @@ func prerequisiteExplain(t *testing.T, ctx context.Context, pool *pgxpool.Pool, 
 			found := false
 			var visit func(map[string]interface{})
 			visit = func(node map[string]interface{}) {
-				if name, ok := node["Index Name"].(string); ok && name == index {
-					found = true
+				if name, ok := node["Index Name"].(string); ok {
+					for _, expected := range append([]string{index}, alternatives...) {
+						if name == expected {
+							found = true
+						}
+					}
 				}
 				if children, ok := node["Plans"].([]interface{}); ok {
 					for _, child := range children {

@@ -134,7 +134,13 @@ bound leaked pins, unknowns or tombstones. O10 accepts unbounded accumulation.
 
 Processing is bounded, not total inventory: one process-wide forge-work slot;
 ten-second pass, five items, raw scan limit ten per class; eight-second item,
-five-second proof phase, four-second marker/send/read-back/outcome reserve.
+five-second proof phase, 4.5-second marker/send/read-back/outcome reserve.
+The reserve includes separate 500 ms budgets for the marker transaction and
+post-commit binding check, then one second each for send/read-back and 1.5
+seconds for outcome persistence. A binding-read error still prevents send.
+Listing admission requires 3.5 seconds before scheduling an audit or retry;
+cleanup selection excludes available captures and rechecks expiry/discard under
+capture locks.
 Before-S1 full-budget deferral spends no attempt; admitted late-positive proof
 spends one and backs off, eventually prerequisite_prepare_budget_exhausted.
 Incomplete ancestry remains prerequisite_ancestry_unknown. The in-flight

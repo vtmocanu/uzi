@@ -475,6 +475,10 @@ func (s *Service) stream(ctx context.Context, wkr store.Worker, runID, captureID
 	if err != nil {
 		return apitypes.RecoveryCaptureStatusResponse{}, err
 	}
+	status, err := withPrerequisiteStatus(ctx, qtx, wkr.UserID, captureID, captureToStatus(ready))
+	if err != nil {
+		return apitypes.RecoveryCaptureStatusResponse{}, err
+	}
 	if s.prerequisitePreCommit != nil {
 		if err := s.prerequisitePreCommit(tx); err != nil {
 			return apitypes.RecoveryCaptureStatusResponse{}, err
@@ -486,7 +490,7 @@ func (s *Service) stream(ctx context.Context, wkr store.Worker, runID, captureID
 	if inserted && s.prerequisiteKick != nil {
 		s.prerequisiteKick(wkr.UserID, captureID)
 	}
-	return withPrerequisiteStatus(ctx, store.New(s.pool), wkr.UserID, captureID, captureToStatus(ready))
+	return status, nil
 }
 
 // reclaimForBudget runs in the stream transaction AFTER the upload's size and checksum verified,

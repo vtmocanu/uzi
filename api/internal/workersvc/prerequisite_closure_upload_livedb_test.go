@@ -109,15 +109,16 @@ func TestPrerequisiteUploadKicksBrokerOnceLiveDB(t *testing.T) {
 			})
 			// Discard the first receipt as a worker that lost the upload ACK would.
 			up, err := r.upload(uploadCtx, f, bytes.NewReader(r.body))
-			if name == "request_cancelled" {
-				if !errors.Is(err, context.Canceled) {
-					t.Fatalf("cancelled upload receipt: %v", err)
-				}
-			} else {
-				if err != nil {
-					t.Fatal(err)
-				}
-				m3UploadAssert(t, r, up)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m3UploadAssert(t, r, up)
+			if c := up.PrerequisiteClosure; c == nil || c.State != "pending" || c.Reason != "" ||
+				c.Checksum != r.manifest.Checksum || !reflect.DeepEqual(c.PrerequisiteShas, r.manifest.PrerequisiteShas) {
+				t.Fatalf("committed upload closure receipt: %+v", c)
+			}
+			if name == "request_cancelled" && uploadCtx.Err() != context.Canceled {
+				t.Fatal("ready commit did not cancel request")
 			}
 			joined := make(chan struct{})
 			go func() { f.s.prerequisite.wg.Wait(); close(joined) }()

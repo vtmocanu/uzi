@@ -460,7 +460,10 @@ func (q *Queries) ListPrerequisiteAuditDue(ctx context.Context, arg ListPrerequi
 
 const listPrerequisiteCleanupDue = `-- name: ListPrerequisiteCleanupDue :many
 SELECT id, capture_id, hold_id, run_id, user_id, repo_id, live_run_id, checksum, prerequisite_shas, pin_ref, state, reason, last_error, attempts, reconciliation_attempts, next_attempt_at, attempt_deadline, invoked_at, invoked_deadline, pin_tip, connection_id, forge_kind, normalized_base_url, project_id, default_branch, cleanup_attempts, cleanup_deadline, cleanup_exhausted_at, absent_since, absence_pass_id, audit_next_at, last_audit_pass_id, created_at, updated_at FROM recovery_prerequisite_closures
-WHERE state='pinned' AND next_attempt_at<= $1::timestamptz
+WHERE state='pinned' AND EXISTS (
+    SELECT 1 FROM recovery_captures c
+    WHERE c.id=recovery_prerequisite_closures.capture_id AND c.state IN ('expired','discarded')
+) AND next_attempt_at<= $1::timestamptz
     AND (next_attempt_at,id) > ($2::timestamptz,$3::uuid)
 ORDER BY next_attempt_at,id LIMIT $4::int
 `
