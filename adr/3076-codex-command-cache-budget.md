@@ -1,6 +1,6 @@
 # ADR-3076: Codex command-cache calibration — incomplete
 
-**Status**: M0 incomplete; implementation remains gated. No scanner limits selected.
+**Status**: Evidence/documentation partial; M0 incomplete. No scanner limits selected or production code changed. M1–M5 are proposed for deferral to follow-up work, subject to the run's formal owner partial decision.
 **Date**: 2026-10-30
 **Related**: issue #3076; [ADR-1598](1598-codex-command-storage.md); [ADR-1809](1809-per-run-cache-bounds.md).
 
@@ -13,6 +13,12 @@ M0's first-scan/warm work was authorized while cold evidence remained unavailabl
 **cold populated-tree scan: pending, needs a qualifying environment (VM or privileged host)**
 
 A container restart does not clear kernel caches; replacing an emptyDir-backed pod loses the populated cache. Neither supplies the missing evidence. Cold latency and cold-induced refusal frequency are unvalidated. A future exceeded bound must yield unknown and a recoverable `codex_command_cache_budget` refusal: that protects safety, not availability. This behavior is proposed, not implemented here.
+
+## Evidence-only delivery and recovery provenance
+
+The maintainer's 2026-10-30 steering requests an evidence/documentation partial, with no further experiment or production changes. This record preserves the measurements obtained so far and their unmet criteria; it does not complete M0. The requested follow-up covers M1–M5 and must be designed from these results. That steering does not itself change the server's frozen completion contract: formal partial disposition remains required for non-closing delivery, including disposition of M0's unmet criteria.
+
+The recovered history contains the measurement report in commit `19a5b7e8` and the prerequisite/tooling follow-up in `033a0b54`. Comparing the recovered HEAD `ba2144a9` with task baseline `3de7d05d` shows only this ADR added. The recovery coverage commits have no file changes. In this session the scratch directory was empty; the scanner, driver, raw series, timing logs and safety logs described below were unavailable. Numerical results, exits and cleanup claims below are therefore **inherited reports**, not newly executed or independently verified measurements. Source hashes identify historical artifacts but cannot reconstruct them or prove their contents. No new representative experiment was attempted for this delivery.
 
 ## Corpus and method
 
@@ -109,6 +115,23 @@ Cold evidence is **not** M0's only unmet requirement. Still unvalidated:
 - cold populated-tree latency and resulting refusal frequency.
 
 M0 remains incomplete. No entry/depth/wall constants have been selected. M1–M4 remain gated, M5 hosted acceptance remains unperformed, and delivery remains non-closing. A new calibration approach or acceptance change needs the owner decision required by the run; this timeout is not permission to enlarge the bound, weaken coverage, reuse a successful sample for later admissions, or implement policy.
+
+## Unmet acceptance criteria at evidence-only delivery
+
+| M0 criterion | Evidence and limitation |
+| --- | --- |
+| Representative inventory | One authentic 2.105 GiB generation was reported with an independent inventory match. No raw oracle output survives recovery; the full occupancy matrix was not obtained. |
+| Cold populated-tree latency | Unmeasured. No qualifying reproducible isolated cold preparation was established. Warm results cannot replace it. |
+| Warm latency and five-second admission answer | One-cache prototype response p95 was 371.424 ms and maximum 471.703 ms; its 100 warm scans completed. This is below five seconds for that sample, but no production admission transaction, queue, cold, multi-cache or contention deadline proof exists. The prototype's ten-second diagnostic cap is not compliant production deadline evidence. |
+| Sequence overhead ≤5% | Not met by the recorded 40-pair prefix: 8.530% added elapsed time. The full requested 100 pairs did not finish. Exemption/disposal policy overhead was not measured. |
+| Completeness under normal concurrency | Only 88 normal-sequence scans were reported, all complete, below the minimum 100 per concurrency layout. Two-/three-run layouts, retained/unregistered overlap and cleanup-during-scan are unmeasured. |
+| Whole-experiment deadline | Deadline stop/drain was reported at 1,140.044 s, with final logging within 20 minutes. Calibration exited 2, incomplete; the interrupted command's individual exit was lost. |
+| Headroom and pressure-stop safety | Historical minimum available bytes were 20,258,443,264 with maximum observed used fraction 0.562854; the later single prerequisite reading was 21,513,170,944 available bytes. The configured stop floor was 0.80 and reserve 4 GiB. These sampled observations are neither continuous guarantees nor current headroom. |
+| Bounded own-producer allocations | Not established. Opaque Go build/vet processes can write beyond reservations between samples and during shutdown. The earlier attempt's monitoring did not satisfy admission before each bounded allocation; the rebuilt driver was left disabled. |
+| Complete reproducible timing evidence | Startup/queue distributions, final paired aggregate, raw logs and an interrupted-leg exit are missing. Historical safety test results do not prove full-driver integration. |
+| Production bound selection and parity | Not performed. No entry/depth/time limits meet the prescribed selection rule without the missing matrix and cold evidence; no production scanner exists to compare. |
+
+No M0 criterion is waived by this table. No production budget, rotation, recoverable model refusal, trusted-operation exemption or hosted acceptance is delivered. M0 must remain incomplete; the proposed non-closing partial leaves the remaining measurement/design and M1–M5 work for a formally scoped follow-up. Issues #1598 and #2013 remain outside this delivery's completion claims.
 
 ## Recovery follow-up: tools rebuilt, fresh experiment not started
 
