@@ -279,7 +279,7 @@ therefore transport types, not picker authority.
 
 **Amendment (2026-10-30, #3247).** A Runtime default preference omits the effort
 level entirely. For an explicit level, uzi reads the runtime's `model/list`
-catalog read-only (one bounded request before the first turn) and, when the
+catalog read-only (one bounded request per claim, before its first turn) and, when the
 matched model does not list the chosen level, shows one advisory warning in the
 run feed. uzi never rewrites, clamps or retries a level at another value; the
 level is sent unchanged and a provider rejection fails the turn normally. The

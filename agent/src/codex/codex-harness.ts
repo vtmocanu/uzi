@@ -256,8 +256,8 @@ export interface CodexHarnessOptions {
   readonly idNonce?: string;
   /** PRD #3247 M2: opt-in, once-per-instance `model/list` probe. Runs after the root thread is
    *  started/resumed and before the first `turn/start`; `onEntry` is called synchronously with the
-   *  matching catalog entry (and the model it was matched for), or `undefined` on any timeout/error/malformed/absent result. It never
-   *  throws into the turn. */
+   *  matching catalog entry (and the model it was matched for), or `undefined` on any timeout/error/malformed/absent result. It is not called when the turn is
+   *  stopped or aborted during the probe, and it never throws into the turn. */
   readonly catalogProbe?: {
     readonly timeoutMs: number;
     readonly onEntry: (entry: CodexCatalogEntry | undefined, model: string) => void;
