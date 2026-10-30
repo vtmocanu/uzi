@@ -1183,11 +1183,35 @@ describe("a successor claim on a completed owner whose journal retains sources",
     assert.equal(diagnostic(s, "orphan_reclaim_refused", "completion_retirement_pending")?.["retirement_subreason"], "completion_pending");
   });
 
-  it("no record and no slot names the fence: not_completion falls through to the unchanged detach", async t => {
+  it("a worker without authority detaches a fence-carrying retained journal when classification and re-read both say unfenced", async t => {
     const s = await scene(t, caseA);
+    rewriteJournal(s.r.bare, withRetainedSource);
+    Object.assign(git, { authorityRequired: false });
+    const detach = t.mock.method(git, "detachTerminalRetained");
+    await s.runner.execute(s.claim);
+    assert.equal(s.handoffs.length, 0, "the unfenced baseline never reaches the coordinator");
+    assert.equal(detach.mock.callCount(), 1, "the baseline detach ran");
+    assert.equal(String(failure(s)), STOPPED);
+    assert.notEqual(s.started, undefined, "the claimant is seeded");
+    assert.equal(diagnostic(s, "orphan_reclaim_succeeded", "retained-in-place")?.["stage"], "complete");
+  });
+
+  it("no record and no slot names the fence, and the re-read throws: a retained stop, never detached", async t => {
+    const s = await scene(t, caseA);
+    await plantOtherFencedRetained(t, s);
+    failSecondRead(t);
+    const before = durable(s);
+    const detach = t.mock.method(git, "detachTerminalRetained");
+    await s.runner.execute(s.claim);
+    assert.deepEqual(s.handoffs[0]!.outcome, { kind: "not_completion" });
+    assert.equal(detach.mock.callCount(), 0);
+    await expectStop(s, before, "published_source_retained");
+  });
+
+  /** A fenced, source-retaining journal for another completed run at the claimant's own canonical path, unknown to
+   *  the authority store (so the coordinator answers not_completion). */
+  const plantOtherFencedRetained = async (_t: TestContext, s: Awaited<ReturnType<typeof scene>>): Promise<string> => {
     const other = randomUUID();
-    // The owner's journal is replaced by one for another completed run at the claimant's own canonical path, fenced
-    // and retaining a source, but unknown to the authority store: the baseline detach applies.
     const fence = fenceOf(s.r);
     execFileSync("git", ["-C", s.r.bare, "config", "--local", `uzi-recovery.${BRANCH}.clone`, ""], { env: ENV, stdio: "pipe" });
     // Seeded and journaled without the authority hooks: the authority store has never heard of this clone.
@@ -1203,6 +1227,12 @@ describe("a successor claim on a completed owner whose journal retains sources",
     Object.assign(wiring, hooks);
     rewriteJournal(s.r.bare, j => ({ ...withRetainedSource(j), completionSourceFence: fence }));
     api.setOrphanClassification(other, { status: "completed", repo_id: "r1", kind: "mr_rework", issue_iid: 3404, branch: null, pipeline_ref: BRANCH, pipeline_id: null });
+    return planted;
+  };
+
+  it("no record and no slot names the fence: not_completion falls through to the unchanged detach", async t => {
+    const s = await scene(t, caseA);
+    const planted = await plantOtherFencedRetained(t, s);
     const detach = t.mock.method(git, "detachTerminalRetained");
     await s.runner.execute(s.claim);
     assert.equal(s.handoffs[0]!.input.mode, "classify");

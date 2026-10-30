@@ -11417,7 +11417,8 @@ export class RunRunner {
       if (reread?.state === "changed") readmit();
       if (retainedSource) {
         // A found published source is never detached. Only a positive "no record, no slot" answer falls through,
-        // and only when the re-read confirmed the classified journal (an unreadable journal is uncertain).
+        // and it proceeds only when the re-read succeeded and did not report a change (a failed re-read is
+        // uncertain); the snapshot fence guard below catches a different fence.
         if (outcome.kind !== "not_completion") stopRetained(outcome.kind === "invalid" ? "completion_unverified" : "published_source_retained");
         if (reread === undefined) stopRetained("published_source_retained");
       } else {
@@ -11451,11 +11452,14 @@ export class RunRunner {
         let again: Awaited<ReturnType<GitCache["readOrphanJournalFence"]>> | undefined;
         try { again = await this.git.readOrphanJournalFence(barePath, branch, ownerRunId, journaledPath); } catch { again = undefined; }
         if (again?.state === "changed") readmit();
-        // A worker without authority classifies a fence-carrying journal as unfenced and keeps the baseline detach.
+        // The unfenced/unfenced exemption serves workers without authority: they classify a fence-carrying journal as
+        // unfenced and keep the baseline detach. On an authority worker, an ABA race (unfenced, then a fenced snapshot,
+        // then an unfenced re-read) fails closed at detachTerminalRetained's under-lock equality check; that race is
+        // accepted.
         if (!(fenceState.state === "unfenced" && again?.state === "unfenced")) stopRetained("completion_pending");
       }
     }
-    if (retained ||(flight.effectiveAttemptPaths ?? this.attemptPaths)) {
+    if (retained || (flight.effectiveAttemptPaths ?? this.attemptPaths)) {
       // The same predecessor-scoped capture-mode proof the C′ capture runs, and the same blocking
       // rule: survivors or unverified leave journal, ledger and path untouched.
       let proof: { outcome: QuiesceRunOutcome; blocked: boolean };
