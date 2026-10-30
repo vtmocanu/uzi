@@ -127,8 +127,9 @@ Tick **"Apply model also to agents"** (or pass `uzi schedule create
 subagent too, not just the lead. This is useful for a cheap recurring bot
 whose subagents would otherwise run on their own pinned (and pricier) models.
 Whether a given run applied the model fleet-wide is readable with `uzi run
-get <id> --field override_subagent_model` (or `uzi run get <id> --json`);
-neither the run page nor the human `uzi run get` view shows it.
+get <id> --field override_subagent_model` (or `uzi run get <id> --json`).
+The run page shows a "model on all agents" badge when it is set; the human
+`uzi run get` view has no row for it.
 
 ## See which model a run used
 
@@ -148,17 +149,19 @@ For each phase the record holds:
 
 - **Requested** model and effort, with their **source**: *fixed by schedule*,
   *your Claude default* or *your Codex default*, *lead template*, or
-  *built-in* (for Claude with no model sent, the Claude SDK default). An
-  effort left on its runtime default reads *runtime default*.
+  *built-in*. A Claude row that sent no model reads *Claude SDK default*. A
+  *runtime default* effort reading arrives with child B
+  ([#3247](https://github.com/vtmocanu/uzi/issues/3247)); today the server
+  always sends an effort.
 - **Runtime-reported** model and effort, with the evidence behind them
   (*Claude SDK init*, *Claude SDK settings*, *Codex thread config* or *sent to
   Codex*).
 
 Where the runtime reports a different effort than requested, the display shows
-both, for example `high (requested xhigh)`. Values the runtime has not
-reported read *not reported yet* while the attempt is current and *not
-reported by the runtime* once it is over; an effort Claude reports as not sent
-reads *not sent*. See [Reasoning effort](./worker-effort.md#read-requested-and-effective-effort)
+both, for example `high (requested xhigh)`. A value not yet observed
+reads *not reported yet*, whatever the attempt or run status, including on a
+finished run. *Not reported by the runtime* means the runtime was asked and did
+not say. An effort Claude reports as not sent reads *not sent*. See [Reasoning effort](./worker-effort.md#read-requested-and-effective-effort)
 for how to read the effort side.
 
 These rows are attested by the worker and are for display only. They never
@@ -174,7 +177,8 @@ run that ended before its first lead turn) reads `lead: not recorded`.
 Where to see it:
 
 - **Run page.** A `lead: <model> · <effort>` chip beside the harness badge.
-  Hover, focus or tap it for the sources and runtime lines. If the plan and
+  Hover it for the sources and runtime lines (a native tooltip); screen
+  readers read them on focus. If the plan and
   implement phases differ, it reads `lead: plan <model> · <effort> →
   implement <model> · <effort>`.
 - **`uzi run get <id>`.** `LEAD` and `LEAD_SOURCE` rows, shown only for runs

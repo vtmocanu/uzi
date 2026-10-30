@@ -3239,11 +3239,13 @@ isolated-lane runs): `LEAD` is the run-page chip text without its `lead: `
 prefix (for example `opus · high (requested xhigh)`), and `LEAD_SOURCE` joins
 the chip's tooltip lines with `; ` (where each value came from and what the
 runtime reported). Before a worker claims the run, `LEAD` reads `model and
-effort resolve at claim`; a claimed run with nothing recorded reads `not
+effort resolve at claim`, or `<model> · effort resolves at claim` when a
+schedule pinned the model; a claimed run with nothing recorded reads `not
 recorded`. `--json` carries the full `lead_config` object. The values are
 worker-attested and display only; see [See which model a run
 used](./worker-model.md#see-which-model-a-run-used). The human view prints no
-`MODEL` or `EFFORT` row: read the model a schedule froze with `--field model`.
+`MODEL` or `EFFORT` row (`LEAD` and `LEAD_SOURCE` show a schedule-frozen model
+as "fixed by schedule"): read the model a schedule froze with `--field model`.
 
 ### Lead model and effort history: `uzi run lead-config`
 
@@ -3251,8 +3253,9 @@ used](./worker-model.md#see-which-model-a-run-used). The human view prints no
 uzi run lead-config <run-id> [--json]
 ```
 
-Lists every recorded lead configuration of a run, one row per phase entry
-across all claim attempts, newest attempt first and `plan` before `implement`
+Lists every recorded lead configuration of a run, one row per recorded
+snapshot (`SEQ`) across all claim attempts, so one phase entry usually has
+several rows, newest attempt first and `plan` before `implement`
 within an attempt. Columns: `GEN` (the claim attempt), `PHASE`, `ENTRY` (the
 phase entry within the attempt), `SEQ` (the row within the entry), `REQUESTED`
 and `SOURCE` (the model and effort uzi asked for, and where each came from),
@@ -3261,7 +3264,7 @@ and `SOURCE` (the model and effort uzi asked for, and where each came from),
 worker hit its per-phase row limit). A run with no lead agent, or whose worker
 recorded nothing, prints `run <id> has no recorded lead config`.
 
-- **Capped at 256 rows.** A longer history lists the first 256 and prints
+- **Capped at 256 rows.** A longer history lists the first 256 rows and prints
   `showing the first 256 entries (newest attempt first); the rest are not
   listed`.
 - **`--json`** prints the server response, `{"entries": [...], "truncated":

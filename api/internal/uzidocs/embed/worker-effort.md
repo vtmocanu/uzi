@@ -18,9 +18,9 @@ effort freeze. Other users and the shared lead template are unaffected.
 
 When upgrading from the shared setting, every existing explicit value is
 copied into the Codex setting and retained for Claude. An unset or blank
-preference inherits medium. Changing or clearing one harness's setting does
-not change the other. Schema rollback retains the original Claude/shared
-value but loses independently edited Codex preferences.
+preference inherits medium. Changing one harness's setting does not change the
+other. Schema rollback keeps the Claude/shared value but loses independently
+edited Codex preferences.
 
 ## Set an override
 
@@ -28,9 +28,8 @@ value but loses independently edited Codex preferences.
 2. Pick the **Claude effort** or **Codex effort** level, or **Inherit**.
 3. Click **Save Claude effort** or **Save Codex effort**.
 
-The controls currently offer five levels. Codex's additional `ultra` catalog
-level is deliberately not offered. Lower levels favor speed and lower cost;
-higher levels spend more reasoning time and can produce deeper answers.
+The controls offer five levels; Codex's `ultra` catalog level is deliberately
+not offered. Lower levels favor speed and cost; higher levels reason longer.
 
 Claude models that do not support a selected level can be silently
 downgraded by their SDK. Codex passes the selected level directly to its
@@ -43,8 +42,9 @@ behavior; their built-in Codex model remains `gpt-6-sol`.
 
 There is no CLI settings command or effort setter today. Use the web controls;
 the CLI's settings decode mirrors still carry both fields. A separate
-**Runtime default** effort choice remains planned follow-up work (child B of
-[PRD #3244](https://github.com/vtmocanu/uzi/issues/3244)); it is not available yet.
+**Runtime default** effort choice remains planned follow-up work (child B,
+[#3247](https://github.com/vtmocanu/uzi/issues/3247), of [PRD
+#3244](https://github.com/vtmocanu/uzi/issues/3244)); it is not available yet.
 
 ## Read requested and effective effort
 
@@ -65,7 +65,8 @@ used](./worker-model.md#see-which-model-a-run-used).
   parameter for the turn.
 - **Codex** reports the configuration of the thread: *sent to Codex* when uzi
   passed an effort on the turn, otherwise *Codex thread config* (the thread's
-  configured effort, including one kept on a resumed thread). This is the
+  configured effort, including one kept on a resumed thread). With no effort
+  sent and none reported, it reads *not reported by the runtime*. This is the
   thread's configuration, not proof of what every provider turn used.
 - An effort level uzi does not recognize reads *an unrecognized level*.
 
