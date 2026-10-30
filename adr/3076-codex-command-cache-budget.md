@@ -1,0 +1,111 @@
+# ADR-3076: Codex command-cache calibration — incomplete
+
+**Status**: M0 incomplete; implementation remains gated. No scanner limits selected.
+**Date**: 2026-10-30
+**Related**: issue #3076; [ADR-1598](1598-codex-command-storage.md); [ADR-1809](1809-per-run-cache-bounds.md).
+
+## Decision state
+
+This is an interim measurement record, not a shipped cache governor. The approved proposal is an admission/disposal soft byte budget, without interrupting a running command. M1–M4 have not started. ADR-1598's current lifecycle and ADR-1809's separate Claude-cache policy remain unchanged.
+
+M0's first-scan/warm work was authorized while cold evidence remained unavailable. That continuation did not waive cold evidence or complete M0. Production or provisional entry, depth and wall limits cannot be selected from this incomplete matrix.
+
+**cold populated-tree scan: pending, needs a qualifying environment (VM or privileged host)**
+
+A container restart does not clear kernel caches; replacing an emptyDir-backed pod loses the populated cache. Neither supplies the missing evidence. Cold latency and cold-induced refusal frequency are unvalidated. A future exceeded bound must yield unknown and a recoverable `codex_command_cache_budget` refusal: that protects safety, not availability. This behavior is proposed, not implemented here.
+
+## Corpus and method
+
+The experiment ran as the real/effective command uid on Linux amd64, using Go 1.27.3. The filesystem reported `ext2/ext3` through `stat -f -c %T`. The experiment filesystem and the worker data volume were the same device; this is not hosted node-wide storage evidence.
+
+Go build/module caches, HOME, GOPATH and temporary output were private to the owned calibration directory. Preparation used `GOMAXPROCS=2`, `GOTOOLCHAIN=local`, and `GOFLAGS="-p=2 -buildvcs=false"`, with these successful producer steps:
+
+| Step | Duration | Resulting aggregate charged bytes |
+| --- | ---: | ---: |
+| API `go build ./...` | 126.646 s | 924,479,488 |
+| API `go vet ./...` | 188.465 s | 1,658,134,528 |
+| Controller `go build ./...` | 71.857 s | 2,259,877,888 |
+
+Each producer exited 0. This is authentic build-derived output, without padding, another run's caches, or hosted/model workloads. Module directory modes remained those produced by Go; the measurement walks did not chmod them. No directory-mode histogram was retained.
+
+The measured active cache was approximately **2.105 GiB**:
+
+| Inventory | Apparent bytes | Allocated/charged bytes | Files | Directories |
+| --- | ---: | ---: | ---: | ---: |
+| Build cache, excluding its root inode | 1,698,059,815 | 1,726,070,784 | 7,837 | 256 |
+| Module cache, excluding its root inode | 472,414,030 | 533,794,816 | 22,927 | 3,034 |
+| Whole generation, including directory overhead | 2,170,486,133 | 2,259,877,888 | 30,764 | 3,293 |
+
+There were **34,057 examined non-dot entries**, maximum depth **12**, and no symlinks in this corpus. Three directory inodes account for the difference between component and whole-generation totals. The aggregate cache-root inode is excluded consistently.
+
+This corpus is substantially smaller than the approved plan's historical 10.1/13.7/10.0 GiB run-cache samples. Those samples are not peaks and have no comparable file/entry inventory in this evidence; byte ratios do not establish comparable metadata distributions or scan latency.
+
+An earlier preparation attempt additionally ran controller vet, producing 2,458,677,248 charged bytes (35,258 entries). Four uniform trees of that size would exceed the 8 GiB corpus cap, so that attempt performed no timing matrix. A mixed cohort of three approximately 2.105 GiB active caches and an approximately 1.544 GiB retained cache would arithmetically fit at about 7.86 GiB. That mixed layout was proposed for preparation, **not populated or measured**.
+
+The scratch Go prototype used fd-relative, no-follow traversal with owner/device/identity checks, bounded getdents buffers/descriptors, nondumpable confirmation and fixed-shape output. Charges were the sum of `max(st_size, st_blocks * 512)`, including directories and symlink inodes, counting hardlinks per entry. A separate Python fd/scandir inventory matched the complete one-cache result and byte categories. Fixture checks covered exact charging, sparse/allocated files, hardlinks and symlinks.
+
+The finite diagnostic caps were 2,000,000 entries, depth 96, 97 directory descriptors, 10 seconds and 10,000,000 directory reads. These protected the prototype experiment; **they are not production or provisional defaults**. Observed peak directory descriptors were 12. A complete live scan is a non-atomic observation, not cleanup proof or a strict byte ceiling.
+
+The executed scanner source SHA-256 was `58b456be06456840048f88f85460db4014d350c6ce2a17ac067c63b8e6a4d838`. The final driver source SHA-256 was `53c614842887e5b2c8942d445c9db8ae2423882281a59a4f167faedb34beaf00`. Scratch sources/logs are run-local evidence, not published implementation.
+
+## One-cache scan measurements
+
+Preparation, copying and inventorying warm metadata. The initial observation is labelled exactly **first scan after preparation**, not cold: its response was **290.169 ms**, with traversal **282.879 ms**. Launch-to-main was **2.333 ms** and launch-to-traversal **2.618 ms**.
+
+After an explicit warm-up, all **100/100 warm scans completed**, with zero incomplete reasons and exact inventory agreement:
+
+| Metric | Median / nearest-rank p50 | p95 | Maximum |
+| --- | ---: | ---: | ---: |
+| Prototype invocation response | 286.384 ms | 371.424 ms | 471.703 ms |
+| Traversal | 273.110 ms | 347.217 ms | 426.566 ms |
+| Setup within helper after main entry | 0.128 ms | 0.297 ms | 0.460 ms |
+| Process CPU, user + system | 223.312 ms | 231.666 ms | 267.289 ms |
+| Reported process peak RSS | 32,112 KiB | 32,112 KiB | 32,112 KiB |
+
+Response p99 was 426.981 ms. Response includes owned helper launch/settlement and bounded logging; it is not a production broker/admission measurement. RSS is process-level evidence under this launcher, not an isolated Go heap measurement. The full warm-series external launch/startup distribution was not retained; the setup row excludes runtime startup before main.
+
+This one quiet occupancy case meets the one-second response target. It supplies no aggregate-layout, contention, cold, or fleet probability guarantee. It cannot establish the mandated margins for production scan limits.
+
+## Partial command-sequence comparison
+
+The proxy repeated cached API `go build ./...` against its own generation, comparing equivalent baseline and scanned commands. Scanned commands took a fresh sample before launch and after actual process-group drainage. Baseline/scanned order alternated. No future byte-budget policy or cache rotation was present, and rebuild/download costs of that policy are not included.
+
+The driver requested 100 command pairs, yielding 200 normal scan observations if finished. M0 requires at least 100 normal scan observations per concurrency layout; that driver choice was more work than the minimum. Preparation plus this sequence did not fit the bounded experiment.
+
+The last fully recorded timing prefix contained **40 command pairs**:
+
+| Baseline | With pre/post scans | Added elapsed time |
+| ---: | ---: | ---: |
+| 313.610 s | 340.363 s | 26.752 s / **8.530%** |
+
+This partial sequence is above the proposed 5% overhead criterion; it is not a completed-series or CI timing result. Additional commands ran before the stop, but their final paired timing aggregate was not retained. **88/88 normal-sequence scan observations completed**, with zero incomplete reasons; this remains below the required 100. Only concurrency one was attempted, so no concurrent-writer completeness conclusion follows.
+
+## Safety and shutdown evidence
+
+The experiment used the supplied deployment-specific pressure configuration. Fresh projected headroom checks covered both filesystems and cumulative remaining reservations. An independent monitor targeted 250 ms sampling, with fail-closed unknown readings and a latched stop. Opaque Go build/vet invocations were supervised producer steps in their own process groups.
+
+Monitoring reduces risk; it guarantees neither the reserve nor absence of ENOSPC. Writes can continue during sampling/scheduling delay, the five-second SIGTERM grace, and kill/drain latency. Writer throughput is unbounded, so there is no numerical overshoot bound. The planned artifact reservations are not kernel quotas or proof of instantaneous spare node capacity.
+
+For the final attempt, the monitor recorded:
+
+- 4,528 samples, maximum observed gap **306.523 ms**;
+- minimum available bytes **20,258,443,264** and maximum observed used fraction **0.562854**;
+- no pressure/free-space or unknown-reading stop; the **experiment deadline** latched the stop;
+- supervised execution through drainage **1,140.044 s**, reserving the last minute of the 20-minute bound for shutdown/cleanup; the final log write was at 10:20:08 UTC after a 10:01:06 UTC start.
+
+No new producer or scan leg started after the latch. Owned groups were terminated/joined as needed; group disappearance and final ECHILD were confirmed before cleanup. No kill escalation was recorded in the final drainage records. The corpus/temporary trees were removed (34,071 owned entries); final enumeration found no remaining directories in the owned experiment root. Bounded logs and the prototype binary remain. The runner exited **2**, meaning incomplete calibration, not a passing gate. The interrupted Go command's individual exit status was not retained; success must not be inferred from drainage.
+
+Guard validation: 25 deterministic/tiny-filesystem tests passed without skips, including headroom loss between allocations, mid-scan stop, data pressure, unknown readings, cumulative reservations, irreversible stop, TERM/KILL timing and join-before-cleanup. Process-control assertions in those tests were injected; the actual experiment separately exercised healthy and deadline drainage. The scratch scanner Go tests passed after correcting newly created fixture modes: a setgid scratch parent had caused `mkdir(0700)` to inherit mode `02700`. Clearing inherited bits on our new private roots preserved the scanner's exact `0700` check.
+
+## Remaining M0 work and gate
+
+Cold evidence is **not** M0's only unmet requirement. Still unvalidated:
+
+- two/three independently populated active-cache layouts and retained/unregistered overlap layouts, each with its required warm series and inventory;
+- at least 100 normal observations for each concurrency layout, concurrent writer/admission activity, queue effects and cleanup completing during scanning;
+- the full comparable sequence overhead requirement and per-operation observation/logging overhead;
+- complete retained startup/queue timing evidence and the interrupted-leg exit record;
+- selection and verification of entry/depth/time margins against the complete matrix, followed later by matching the production scanner to the calibrated implementation;
+- cold populated-tree latency and resulting refusal frequency.
+
+M0 remains incomplete. No entry/depth/wall constants have been selected. M1–M4 remain gated, M5 hosted acceptance remains unperformed, and delivery remains non-closing. A new calibration approach or acceptance change needs the owner decision required by the run; this timeout is not permission to enlarge the bound, weaken coverage, reuse a successful sample for later admissions, or implement policy.
