@@ -1,6 +1,6 @@
 # ADR-3076: Codex command-cache calibration — incomplete
 
-**Status**: Evidence/documentation partial; M0 incomplete. No scanner limits selected or production code changed. M1–M5 are proposed for deferral to follow-up work, subject to the run's formal owner partial decision.
+**Status**: Evidence/documentation partial; M0 incomplete. No scanner limits selected or production code changed. M1–M5 are deferred to follow-up work by the recorded owner partial decision.
 **Date**: 2026-10-30
 **Related**: issue #3076; [ADR-1598](1598-codex-command-storage.md); [ADR-1809](1809-per-run-cache-bounds.md).
 
@@ -16,7 +16,7 @@ A container restart does not clear kernel caches; replacing an emptyDir-backed p
 
 ## Evidence-only delivery and recovery provenance
 
-The maintainer's 2026-10-30 steering requests an evidence/documentation partial, with no further experiment or production changes. This record preserves the measurements obtained so far and their unmet criteria; it does not complete M0. The requested follow-up covers M1–M5 and must be designed from these results. That steering does not itself change the server's frozen completion contract: formal partial disposition remains required for non-closing delivery, including disposition of M0's unmet criteria.
+The maintainer's 2026-10-30 steering requests an evidence/documentation partial, with no further experiment or production changes. This record preserves the measurements obtained so far and their unmet criteria; it does not complete M0. The requested follow-up covers M1–M5 and must be designed from these results. The formal disposition is recorded in the run's frozen completion contract: revision 2 kept M0 and deferred M1–M5, and revision 3 accepted the unmet criterion `M0.c1` as-is for evidence/documentation-only, non-closing delivery. M0 remains incomplete.
 
 The recovered history contains the measurement report in commit `19a5b7e8` and the prerequisite/tooling follow-up in `033a0b54`. Comparing the recovered HEAD `ba2144a9` with task baseline `3de7d05d` shows only this ADR added. The recovery coverage commits have no file changes. In this session the scratch directory was empty; the scanner, driver, raw series, timing logs and safety logs described below were unavailable. Numerical results, exits and cleanup claims below are therefore **inherited reports**, not newly executed or independently verified measurements. Source hashes identify historical artifacts but cannot reconstruct them or prove their contents. No new representative experiment was attempted for this delivery.
 
@@ -131,7 +131,7 @@ M0 remains incomplete. No entry/depth/wall constants have been selected. M1–M4
 | Complete reproducible timing evidence | Startup/queue distributions, final paired aggregate, raw logs and an interrupted-leg exit are missing. Historical safety test results do not prove full-driver integration. |
 | Production bound selection and parity | Not performed. No entry/depth/time limits meet the prescribed selection rule without the missing matrix and cold evidence; no production scanner exists to compare. |
 
-No M0 criterion is waived by this table. No production budget, rotation, recoverable model refusal, trusted-operation exemption or hosted acceptance is delivered. M0 must remain incomplete; the proposed non-closing partial leaves the remaining measurement/design and M1–M5 work for a formally scoped follow-up. Issues #1598 and #2013 remain outside this delivery's completion claims.
+No M0 criterion is waived by this table. No production budget, rotation, recoverable model refusal, trusted-operation exemption or hosted acceptance is delivered. M0 must remain incomplete; the recorded non-closing partial leaves the remaining measurement/design and M1–M5 work for a formally scoped follow-up. Issues #1598 and #2013 remain outside this delivery's completion claims.
 
 ## Recovery follow-up: tools rebuilt, fresh experiment not started
 
