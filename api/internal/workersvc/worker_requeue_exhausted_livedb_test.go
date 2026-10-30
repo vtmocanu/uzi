@@ -148,6 +148,18 @@ func TestWorkerRequeueExhaustedDispositionLiveDB(t *testing.T) {
 					if wantStatus == "recovery_wait" && (!released || !capRevoked || !retryCleared) {
 						t.Fatalf("park fences: released=%v revoked=%v retry cleared=%v", released, capRevoked, retryCleared)
 					}
+					// Issue #3639: a parking writer stamps its release cause with claim_released_at; a failing one leaves it NULL.
+					var releasedCause string
+					var causeStamped bool
+					if err := env.pool.QueryRow(env.ctx, "SELECT COALESCE(released_worker_cause,''),released_worker_cause_at IS NOT DISTINCT FROM claim_released_at AND released_worker_cause_at IS NOT NULL FROM runs WHERE id=$1", run).Scan(&releasedCause, &causeStamped); err != nil {
+						t.Fatal(err)
+					}
+					if wantStatus == "recovery_wait" && (releasedCause != "worker_requeue_exhausted" || !causeStamped) {
+						t.Fatalf("released cause=%q stamped=%v, want worker_requeue_exhausted stamped with claim_released_at", releasedCause, causeStamped)
+					}
+					if wantStatus == "failed" && releasedCause != "" {
+						t.Fatalf("failed exhaustion recorded released cause %q", releasedCause)
+					}
 					if observed.Unknown != (evidence == "sql_read_error" || evidence == "invalid_checkpoint" || evidence == "unknown_capture") {
 						t.Fatalf("unknown evidence=%v for %s", observed.Unknown, evidence)
 					}

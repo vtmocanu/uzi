@@ -3,7 +3,8 @@
 -- queued reason for a memory-pressure park differently from a wall park.
 --   released_worker_cause     'wall' | 'worker_memory_pressure' | 'worker_requeue_exhausted';
 --                             NULL = legacy or unknown (no backfill)
---   released_worker_cause_at  written by the same statement now() as claim_released_at
+--   released_worker_cause_at  written by the same statement as claim_released_at, both from the
+--                             transaction's now()
 -- Readers trust the cause only when released_worker_cause_at equals claim_released_at. A writer
 -- that predates these columns (a rollback) moves or clears claim_released_at without touching
 -- the stamp, which makes the cause stale, and readers then fall back to the generic wording.

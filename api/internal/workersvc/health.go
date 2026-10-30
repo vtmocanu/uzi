@@ -1661,7 +1661,8 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 	// to the generic reasons below. The per-run counts sit behind the queued-threshold guard in
 	// healthTargetFor, so they run for ~0 runs/tick (+ the early docker-allowlist probe).
 	// The pair is recorded by a wall park, a memory-pressure park or a requeue-exhaustion park; the
-	// wording follows the stamped cause (releasedWorkerReason).
+	// reason names a memory-pressure park only on a fresh memory stamp, otherwise it keeps the
+	// time-limit wording (releasedWorkerReason).
 	if r.ReleasedWorkerID.Valid {
 		allowlist := []uuid.UUID{}
 		if s.dockerAllowlist != nil {
@@ -2132,7 +2133,8 @@ func activeAccountCooldown(now time.Time, r store.ListActiveRunsForHealthRow) bo
 }
 
 // releasedWorkerReason words the released-worker rung. It names a memory-pressure park only when
-// released_worker_cause_at equals claim_released_at (both come from one statement now()); a writer
+// released_worker_cause_at equals claim_released_at (both written by one statement with the
+// transaction's now(); no later statement in a parking transaction re-stamps claim_released_at); a writer
 // that predates the cause columns moves claim_released_at alone, which makes the stamp stale, and
 // every other case keeps the time-limit wording.
 func releasedWorkerReason(r store.ListActiveRunsForHealthRow, workerName string) string {
