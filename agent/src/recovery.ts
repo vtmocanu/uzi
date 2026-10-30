@@ -4658,7 +4658,7 @@ export class RecoveryCoordinator {
    * `authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)`, so the A-queue or flock wait is bounded by that timeout and
    * ended by the claimant's lifecycle abort).
    * An acquisition of A that runs out its wait (a typed {@link AuthorityLockBusy}) is `pending`/`authority_busy`; an
-   * AuthorityLockBusy raised once A is held propagates, as does any other typed AuthorityRefusal, a lifecycle abort
+   * AuthorityLockBusy raised once A is held propagates, as does any AuthorityRefusal, a lifecycle abort
    * (`wait.signal`, an AbortError) and a spent maintenance budget. Any other throw once A is held (selection, the
    * cycle, the retirement preparation) is `uncertain`: a failed journal read in selection is `unreadable_record`,
    * the rest `preparation_error`, so no raw I/O error text reaches the caller. The background sweep is unchanged.
@@ -4698,7 +4698,7 @@ export class RecoveryCoordinator {
           return cycle.ran ? cycle.value : { kind: "pending", why: "cycle_busy" };
         } catch (err) {
           // A preparation I/O error is "not proven", never a raw throw carrying a path into a public failure reason.
-          // Typed authority refusals, lifecycle aborts and a spent maintenance budget keep propagating.
+          // Any AuthorityRefusal, lifecycle abort and a spent maintenance budget keep propagating.
           if (err instanceof AuthorityRefusal || input.wait.signal?.aborted ||
               (err instanceof Error && err.name === "AbortError")) throw err;
           MaintenanceBudget.current()?.check();

@@ -12007,7 +12007,9 @@ export class RunRunner {
     // A seed (a fresh claim or one after a handoff re-admission) that meets a slot still `retiring` is a not-ready
     // retirement: a retained stop, bounded by the requeue cap, never a terminal report. After a re-admission the
     // diagnostic carries the owner's ids; a fresh claim knows no owner, so its owner id and path digest are the fixed
-    // placeholders (no path or error text leaves). The untyped operator-discard refusal stays terminal.
+    // placeholders (no path or error text leaves). Any `retiring` slot is a retained stop, including one left by an
+    // interrupted operator discard. The untyped operator-discard refusal is raised only inside the discard itself, so a
+    // seed never sees it.
     const stopOnRetiringSlot = (err: unknown): void => {
       if (!(err instanceof AuthorityRefusal) || err.kind !== "retiring") return;
       this.retainedLifecycleGuard(flight);

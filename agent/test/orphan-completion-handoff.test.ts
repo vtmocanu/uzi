@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { AuthorityLockBusy, AuthorityRefusal } from "../src/authority-lock.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { parseCompletionSourceV2, type CompletionSourceFence, type CompletionSourceV2 } from "../src/completion-source.js";
 import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { nullLogger } from "./helpers.js";
@@ -322,6 +323,18 @@ describe("retireCompletedSourceForHandoff: retire", linux, () => {
     named.name = "AbortError";
     Object.assign(c.p.recovery, { testHooks: { afterHandoffSelect: async () => { throw named; } } });
     await assert.rejects(c.handoff(), err => err === named);
+  });
+
+  it("a spent maintenance budget inside the preparation propagates instead of reading as preparation_error", async t => {
+    const r = await published(t);
+    const c = claimant(r);
+    // The budget's abort reason is a plain Error, not an AbortError, and the wait carries no signal: only the
+    // budget check in the preparation catch can tell this throw from an ordinary I/O error.
+    // The budget is live on entry and runs out (injected clock) while the preparation is failing.
+    let now = 0;
+    const budget = new MaintenanceBudget(10_000, () => now);
+    Object.assign(c.p.recovery, { testHooks: { afterHandoffSelect: async () => { now += 20_000; throw new Error("EIO: during the spent budget"); } } });
+    await assert.rejects(MaintenanceBudget.run(budget, () => c.handoff()), /maintenance deadline exhausted/);
   });
 });
 

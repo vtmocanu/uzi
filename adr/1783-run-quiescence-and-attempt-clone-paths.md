@@ -1419,12 +1419,16 @@ not-ready retirement and a retained stop. This applies to a fresh claim as well 
 after a re-admission: a retirement interrupted before the claim arrived leaves the
 same slot. It fails safe, because a retained stop is nonterminal and bounded by the
 requeue cap; the diagnostic names no owner or path when none is known. The untyped
-operator-discard refusal stays terminal.
+operator-discard refusal is raised only inside the discard itself, so a seed never
+sees it. Any `retiring` slot is a retained stop, including one left by an
+interrupted operator discard. A retiring slot whose destructive record settled
+failed raises the untyped "unresolved pending footprint" refusal at seed, which
+stays terminal; it is outside this change and recorded as a residual.
 
 An error thrown while the entry prepares the retirement once A is held (an I/O
 error on a bundle or skills `lstat`, the completion-check cleanup, the redundancy
 claims) is `uncertain`/`preparation_error`, never a raw throw that would reach a
-failure reason. Typed authority refusals, lifecycle aborts and a spent maintenance
+failure reason. Any AuthorityRefusal, lifecycle aborts and a spent maintenance
 budget still propagate, and the background sweep is unchanged. In classify mode a
 coordinator that is disabled or has no authority scope answers
 `uncertain`/`classify_unavailable` (a retained stop), not `not_completion`: it
