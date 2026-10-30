@@ -88,16 +88,26 @@ from recovery after an actual OOM kills a worker.
 After a memory park, the parking worker ends its own source use only on
 positive evidence. If it did, Resume lets a fresh worker continue normally from
 the retained work. If it did not (the park was not confirmed, or the source end
-was not durably recorded), a fresh worker re-parks the run at the same
+was not durably recorded) and the journal records the park (a `memoryPark`
+record in the active journal, with the successor running the memory guard and
+`worker_memory_pressure_v1`), a fresh worker re-parks the run at the same
 `worker_memory_pressure` hold instead of failing it. Until the companion
 issue #3639 lands, Resume of such an unsettled continuation re-parks
 immediately, so **Cancel** or an operator discard of the retained source is the
-exit; when the unended source belongs to a worker process that is still running,
-that lasts until the process restarts. The fresh worker logs
-`predecessor cooperative settlement verified` or `unverified` for diagnosis only;
-neither releases custody. A crash after the park was accepted but before the
-worker finished tearing down leaves no record and follows the existing
-terminal path.
+exit. A worker restart does not release it: the slot stays active under the old
+incarnation, so the continuation is still refused and Resume keeps re-parking
+(or, with no record, the run fails as before). When the record could not be
+written (unknown authority incarnation or source epoch, a stopped or protected
+source, a write timeout or failure), or the successor lacks the memory guard,
+the existing flow runs and the run fails as `preservation_failed`, as before.
+On a continuation whose record carries a settlement (not on the re-park path),
+the fresh worker logs `predecessor cooperative settlement verified` or
+`unverified` for diagnosis only; neither releases custody. A new run of the same
+issue on that worker, meeting another flight's unconfirmed source end, now stops
+without failing until the requeue cap, then ends in `worker_requeue_exhausted`
+(or `failed` per the existing exhaustion rule). A crash after the park was
+accepted but before the worker finished tearing down leaves no record and
+follows the existing terminal path.
 
 Workers built before this change reject the new `memoryPark` journal record and
 fail closed on it: they refuse to attach, recover or discard that source. Roll

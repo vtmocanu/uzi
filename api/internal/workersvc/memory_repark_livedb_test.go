@@ -74,8 +74,8 @@ func TestMemoryReparkFromFreshClaimAfterResumeLiveDB(t *testing.T) {
 		}
 		// Exact replay is refused and changes nothing.
 		_, applied, err = f.s.SetState(f.e.ctx, w, f.b.RunID, req(nonce, fresh.ClaimGeneration, fresh.MemoryEpisode))
-		if applied {
-			t.Fatalf("replay applied=%v err=%v", applied, err)
+		if err != nil || applied {
+			t.Fatalf("exact replay must be a no-op, not a refusal: applied=%v err=%v", applied, err)
 		}
 		if got := f.run(t); got.MemoryEpisode != 1 || got.MemoryInterventionCount != 0 || got.Status != "recovery_wait" {
 			t.Fatalf("replay changed row=%+v", got)
