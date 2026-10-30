@@ -45,5 +45,7 @@
     "fail_origins": null
   },
   "subscription_run_count": 0,
-  "unreported_run_count": 0
+  "unreported_run_count": 0,
+  "pr_count": 0,
+  "last7_pr_count": 0
 }

@@ -474,3 +474,101 @@ func TestGetRunAttachesUsageWhenPresent(t *testing.T) {
 		t.Fatalf("a run with no usage rows must omit usage, got %+v", body2.Run.Usage)
 	}
 }
+
+// Issue #3686: the SelfUsage card carries the user's PR counts in both windows.
+func TestSelfUsageCarriesPRCounts(t *testing.T) {
+	st := &runsStore{selfPRCounts: store.SelfPRCountsRow{LifetimePrCount: 7, Last7PrCount: 3}}
+	h := newRunsHandler(t, st)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/usage", nil)
+	h.SelfUsage(rec, req.WithContext(mw.ContextWithUser(req.Context(), store.User{ID: uuid.New()})))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("SelfUsage = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		LifetimePRCount int64 `json:"lifetime_pr_count"`
+		Last7PRCount    int64 `json:"last7_pr_count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.LifetimePRCount != 7 || body.Last7PRCount != 3 {
+		t.Fatalf("pr counts = %+v, want 7/3", body)
+	}
+}
+
+// Issue #3686: AdminUsage merges PR counts into a usage row, into an outcomes-only row,
+// and appends a PR-only owner (no usage, no outcomes) as a zero-usage row.
+func TestAdminUsageMergesPRCounts(t *testing.T) {
+	usageID, outcomeID, prOnlyID := uuid.New(), uuid.New(), uuid.New()
+	st := &runsStore{
+		adminPerUser: []store.AdminUsagePerUserRow{{UserID: usageID, Email: "usage@x", RunCount: 2}},
+		adminRunOutcomesPerUser: []store.AdminRunOutcomesPerUserRow{
+			{UserID: usageID, Email: "usage@x", Finished: 2},
+			{UserID: outcomeID, Email: "outcome@x", Finished: 1, Failed: 1},
+		},
+		factoryPRCounts: store.FactoryPRCountsRow{LifetimePrCount: 9, Last7PrCount: 5},
+		prCountsPerUser: []store.PRCountsPerUserRow{
+			{UserID: usageID, Email: "usage@x", LifetimePrCount: 4, Last7PrCount: 2},
+			{UserID: outcomeID, Email: "outcome@x", LifetimePrCount: 3, Last7PrCount: 2},
+			{UserID: prOnlyID, Email: "pronly@x", LifetimePrCount: 2, Last7PrCount: 1},
+		},
+	}
+	h := newRunsHandler(t, st)
+	rec := httptest.NewRecorder()
+	h.AdminUsage(rec, httptest.NewRequest(http.MethodGet, "/api/admin/usage", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("AdminUsage = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Factory struct {
+			LifetimePRCount int64 `json:"lifetime_pr_count"`
+			Last7PRCount    int64 `json:"last7_pr_count"`
+		} `json:"factory"`
+		Users []struct {
+			Email        string                       `json:"email"`
+			RunCount     int64                        `json:"run_count"`
+			PRCount      int64                        `json:"pr_count"`
+			Last7PRCount int64                        `json:"last7_pr_count"`
+			Last7Days    *struct{ InputTokens int64 } `json:"last_7_days"`
+			Outcomes     struct {
+				Finished    int64            `json:"finished"`
+				FailOrigins map[string]int64 `json:"fail_origins"`
+			} `json:"outcomes"`
+			Last7Outcomes struct {
+				FailOrigins map[string]int64 `json:"fail_origins"`
+			} `json:"last7_outcomes"`
+		} `json:"users"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Factory.LifetimePRCount != 9 || body.Factory.Last7PRCount != 5 {
+		t.Fatalf("factory pr counts = %d/%d, want 9/5", body.Factory.LifetimePRCount, body.Factory.Last7PRCount)
+	}
+	if len(body.Users) != 3 {
+		t.Fatalf("want 3 rows (usage, outcomes-only, pr-only), got %d: %s", len(body.Users), rec.Body.String())
+	}
+	want := []struct {
+		email         string
+		runCount      int64
+		pr, last7, fi int64
+	}{
+		{"usage@x", 2, 4, 2, 2},
+		{"outcome@x", 0, 3, 2, 1},
+		{"pronly@x", 0, 2, 1, 0},
+	}
+	for i, w := range want {
+		u := body.Users[i]
+		if u.Email != w.email || u.RunCount != w.runCount || u.PRCount != w.pr || u.Last7PRCount != w.last7 || u.Outcomes.Finished != w.fi {
+			t.Errorf("row %d = %+v, want %+v", i, u, w)
+		}
+	}
+	pronly := body.Users[2]
+	if pronly.Last7Days == nil {
+		t.Error("PR-only row last_7_days must be non-null")
+	}
+	if pronly.Outcomes.FailOrigins == nil || pronly.Last7Outcomes.FailOrigins == nil {
+		t.Errorf("PR-only row fail_origins must marshal as {}, got %s", rec.Body.String())
+	}
+}

@@ -136,6 +136,12 @@ type SelfUsageDTO struct {
 	LifetimeUnreportedRunCount   int64 `json:"lifetime_unreported_run_count"`
 	Last7SubscriptionRunCount    int64 `json:"last7_subscription_run_count"`
 	Last7UnreportedRunCount      int64 `json:"last7_unreported_run_count"`
+	// LifetimePRCount and Last7PRCount are the PRs uzi runs opened for this scope (issue
+	// #3686): distinct (repo, PR number) over non-chat runs, owned by the earliest run's user
+	// and windowed on its creation time. The definition and caveat live on the SelfPRCounts
+	// query. On the admin Factory they are factory-wide.
+	LifetimePRCount int64 `json:"lifetime_pr_count"`
+	Last7PRCount    int64 `json:"last7_pr_count"`
 }
 
 // AdminUserUsageDTO is one user's lifetime and seven-day consumption row on the admin factory
@@ -162,6 +168,11 @@ type AdminUserUsageDTO struct {
 	// Copied from AdminUsagePerUser, which computes both windows per user.
 	SubscriptionRunCount int64 `json:"subscription_run_count"`
 	UnreportedRunCount   int64 `json:"unreported_run_count"`
+	// PRCount (lifetime) and Last7PRCount are the PRs uzi runs opened that this user owns
+	// (issue #3686; definition on the SelfPRCounts query). Present even when the user has no
+	// usage row.
+	PRCount      int64 `json:"pr_count"`
+	Last7PRCount int64 `json:"last7_pr_count"`
 }
 
 // AdminUsageDTO is the admin factory view: the factory-wide totals plus the

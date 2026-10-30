@@ -8503,6 +8503,73 @@ WHERE r.kind <> 'chat'
 GROUP BY u.id, u.email
 ORDER BY cost_usd DESC, output_tokens DESC, u.id;
 
+-- name: SelfPRCounts :one
+-- PRs uzi runs opened, for one user (issue #3686), lifetime and last 7 days.
+-- A PR is a distinct (runs.repo_id, runs.mr_iid) over non-chat runs with a non-NULL
+-- mr_iid. Dedup is factory-wide and happens FIRST: DISTINCT ON picks the earliest run
+-- per (repo_id, mr_iid) by (created_at, id). That run's user_id owns the PR and its
+-- created_at places the PR in a window (same predicate as SelfUsage), so a PR is
+-- counted once, for one user, even when a later mr_rework or ci_fix run by another
+-- user reuses it. The id tie-break makes equal created_at deterministic.
+-- The user filter sits OUTSIDE the CTE on purpose: a qual on user_id, which is not a
+-- DISTINCT ON column, is never pushed into the CTE, and filtering inside would let a
+-- later run by this user claim a PR that an earlier run by someone else owns.
+-- Chat runs are excluded. mr_state is NOT read: the MR watcher polls only part of the
+-- run set, so open, merged and closed PRs all count. The count does not join
+-- run_usage_totals, so a PR-bearing run with no usage row still counts.
+-- At one snapshot the PRCountsPerUser rows sum to FactoryPRCounts in both windows;
+-- separate handler reads may observe concurrent changes.
+-- Cost: every call scans all PR-bearing runs; there is no general (repo_id, mr_iid)
+-- index, and a partial index would need a migration.
+-- Caveat: mr_iid records the PR associated with a run's branch, not proof uzi created
+-- it. agent/src/forge.ts HttpForgeClient.createMergeRequest can adopt an already-existing
+-- PR on the branch after a duplicate response without checking its author. On uzi's own
+-- run branches that PR is almost always uzi's, so the card calls these "PRs uzi runs
+-- opened".
+WITH prs AS (
+    SELECT DISTINCT ON (r.repo_id, r.mr_iid) r.user_id, r.created_at
+    FROM runs r
+    WHERE r.kind <> 'chat' AND r.mr_iid IS NOT NULL
+    ORDER BY r.repo_id, r.mr_iid, r.created_at, r.id
+)
+SELECT
+    count(*)::bigint AS lifetime_pr_count,
+    count(*) FILTER (WHERE created_at >= now() - interval '7 days')::bigint AS last7_pr_count
+FROM prs
+WHERE user_id = @user_id;
+
+-- name: FactoryPRCounts :one
+-- Factory-wide PR counts, both windows (issue #3686). Same definition and dedup as
+-- SelfPRCounts (see its comment) without the user filter.
+WITH prs AS (
+    SELECT DISTINCT ON (r.repo_id, r.mr_iid) r.user_id, r.created_at
+    FROM runs r
+    WHERE r.kind <> 'chat' AND r.mr_iid IS NOT NULL
+    ORDER BY r.repo_id, r.mr_iid, r.created_at, r.id
+)
+SELECT
+    count(*)::bigint AS lifetime_pr_count,
+    count(*) FILTER (WHERE created_at >= now() - interval '7 days')::bigint AS last7_pr_count
+FROM prs;
+
+-- name: PRCountsPerUser :many
+-- Per-user PR counts, both windows (issue #3686). Same definition and dedup as
+-- SelfPRCounts (see its comment); only users that own at least one PR appear, ordered
+-- by user id. At one snapshot each window sums to FactoryPRCounts.
+WITH prs AS (
+    SELECT DISTINCT ON (r.repo_id, r.mr_iid) r.user_id, r.created_at
+    FROM runs r
+    WHERE r.kind <> 'chat' AND r.mr_iid IS NOT NULL
+    ORDER BY r.repo_id, r.mr_iid, r.created_at, r.id
+)
+SELECT u.id AS user_id, u.email,
+    count(*)::bigint AS lifetime_pr_count,
+    count(*) FILTER (WHERE p.created_at >= now() - interval '7 days')::bigint AS last7_pr_count
+FROM prs p
+JOIN users u ON u.id = p.user_id
+GROUP BY u.id, u.email
+ORDER BY u.id;
+
 -- Failed-run rate outcome aggregates (PRD #1293 M1) -------------------------
 -- These count over `runs` DIRECTLY, NOT run_usage_totals (D1): a run that fails at
 -- provisioning / credential lookup / guardrail has no usage row, so a rate computed
