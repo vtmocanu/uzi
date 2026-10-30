@@ -147,6 +147,12 @@ spec:
             - name: UZI_WORKER_STORAGE_CLASS
               value: {{ . | quote }}
             {{- end }}
+            # The worker pods' nodeSelector, as a JSON object. `with`-gated: a cleared
+            # selector (null) renders no env, which the controller reads as none.
+            {{- with .Values.workers.nodeSelector }}
+            - name: UZI_WORKER_NODE_SELECTOR
+              value: {{ toJson . | quote }}
+            {{- end }}
             # The default worker PriorityClass name (issue #1341). Gated on the bool, not
             # `with`: when enabled the class name always has a chart default, and the
             # controller renders priorityClassName onto every worker pod so a busy worker

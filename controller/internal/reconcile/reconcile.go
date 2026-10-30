@@ -66,6 +66,11 @@ type ObservedWorker struct {
 	// from its own config, so the generation never moves for it). "" when
 	// HasDeployment is false.
 	SpecHash string
+	// DeploymentNodeSelector is the live pod template's nodeSelector. The roll's merge
+	// patch needs it to send a null for every key the desired selector dropped: a
+	// merge patch leaves an absent key alone, so without the nulls a removed key would
+	// stay on the worker forever while its spec-hash annotation reported converged.
+	DeploymentNodeSelector map[string]string
 	// HasDataPVC / HasNixPVC / HasDinDDataPVC let a partially-created worker (a
 	// crashed reconcile between calls) converge without a read of anything sensitive.
 	//

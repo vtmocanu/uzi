@@ -640,6 +640,21 @@ workers:
   # own CNPG already runs on standard here, so this is a default worth thinking about,
   # not a blocker.
   storageClass: ""
+  # nodeSelector for every hosted worker pod, all three tiers (plain, docker, isolated).
+  # The default keeps workers on amd64 nodes because the published agent images
+  # (workers.image.repository) are amd64 only; on an arm64 node of a mixed-arch cluster
+  # they would crash-loop. The api, web and controller images are multi-arch and are
+  # not affected by this value.
+  #
+  # Running your own arm64-capable worker image? Override the value
+  # (`kubernetes.io/arch: arm64`) or clear the selector with `nodeSelector: null`.
+  # `{}` does NOT clear it: Helm deep-merges maps into the default, so `{}` keeps
+  # `kubernetes.io/arch: amd64`. Removing one key takes `<key>: null`.
+  #
+  # Changing it re-hashes the worker pod template, so existing workers go through the
+  # normal paced drain-and-roll.
+  nodeSelector:
+    kubernetes.io/arch: amd64
   # A cluster-scoped PriorityClass for hosted worker pods (issue #1341). When enabled,
   # the chart creates the PriorityClass AND the controller stamps its name onto every
   # worker pod's priorityClassName, so a busy worker outranks lower-priority pods for
