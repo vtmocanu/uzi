@@ -11,7 +11,7 @@ const MAX_OBSERVED_MODEL_BYTES = 100;
 
 /** Control (Cc), format (Cf: bidi overrides, zero-width), replacement and whitespace characters,
  *  the same rejection set as the API's `agenttmpl.ValidateModel`. */
-const MODEL_REJECT_RE = /[\p{Cc}\p{Cf}�\s]/u;
+const MODEL_REJECT_RE = /[\p{Cc}\p{Cf}\p{Cs}�\s]/u;
 
 const KNOWN_LEVELS: ReadonlySet<string> = new Set([
   "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
@@ -33,11 +33,10 @@ export function mapObservedEffort(raw: unknown): ObservedEffort | undefined {
   return KNOWN_LEVELS.has(raw) ? (raw as ObservedEffort) : "other";
 }
 
-/** Claude reports only the five levels uzi can request; anything else is a shape mismatch. */
+/** Claude effort: a known level maps to itself, any other non-empty string to `other` (the value is
+ *  never echoed); non-strings are a shape mismatch. */
 export function decodeClaudeEffort(raw: unknown): ObservedEffort | undefined {
-  return raw === "low" || raw === "medium" || raw === "high" || raw === "xhigh" || raw === "max"
-    ? raw
-    : undefined;
+  return mapObservedEffort(raw);
 }
 
 /** The reporter's wire form of an observation. `effort: null` with real evidence is "not sent". */

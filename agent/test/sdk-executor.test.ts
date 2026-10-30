@@ -3167,6 +3167,22 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
     assert.equal(posts[1]!.observed_effort, "high", "the row came from the first turn, not the re-drive");
   });
 
+  it("a turn that yields no init does not spend the entry's observation: the retry's init posts one row", async () => {
+    const { posts, make, rows } = reporterRig();
+    const { queryFn } = observedTurns([
+      [resultSuccess()],
+      [initFrame({ effort: "high" }), signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config: ACTIVE_CONFIG, leadConfig: make(ACTIVE_CONFIG),
+      planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 2);
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"]);
+    assert.equal(posts[1]!.observed_effort, "high");
+  });
+
   it("posts nothing when the claim carries no default_effort_source", async () => {
     const { posts, make } = reporterRig();
     const config = { default_model: "sonnet", default_effort: "low" as const };

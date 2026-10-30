@@ -86,13 +86,23 @@ test("init with effort null reports not sent, with real evidence", async () => {
   assert.deepEqual(obs, [{ model: "claude-opus-4-8", modelEvidence: "claude_init", effort: null, effortEvidence: "claude_init" }]);
 });
 
-test("init with an unrecognized effort value reports unknown", async () => {
-  for (const effort of ["turbo", 7, {}]) {
+test("init with a custom effort string reports other; a non-string shape reports unknown", async () => {
+  const custom = await run({ frames: [init({ effort: "turbo" }), result] });
+  assert.equal(custom.obs.length, 1);
+  assert.equal(custom.obs[0]!.effort, "other");
+  assert.equal(custom.obs[0]!.effortEvidence, "claude_init");
+  for (const effort of [7, {}, ""]) {
     const { obs } = await run({ frames: [init({ effort }), result] });
     assert.equal(obs.length, 1);
     assert.equal(obs[0]!.effort, undefined);
     assert.equal(obs[0]!.effortEvidence, "unknown");
   }
+});
+
+test("getSettings reporting a custom effort string maps to other", async () => {
+  const { obs } = await run({ frames: [init(), result], getSettings: async () => ({ applied: { effort: "turbo" } }) });
+  assert.equal(obs[0]!.effort, "other");
+  assert.equal(obs[0]!.effortEvidence, "claude_get_settings");
 });
 
 test("absent effort key: getSettings answering supplies applied.effort as claude_get_settings", async () => {
@@ -133,7 +143,7 @@ test("a getSettings that never answers times out through the injected timer", as
 });
 
 test("a malformed getSettings response gives unknown effort", async () => {
-  for (const response of [undefined, null, "str", {}, { applied: null }, { applied: {} }, { applied: { effort: "turbo" } }, { applied: { effort: 3 } }, { effective: { effort: "high" } }]) {
+  for (const response of [undefined, null, "str", {}, { applied: null }, { applied: {} }, { applied: { effort: 3 } }, { effective: { effort: "high" } }]) {
     const { obs } = await run({ frames: [init(), result], getSettings: async () => response });
     assert.equal(obs.length, 1, JSON.stringify(response));
     assert.equal(obs[0]!.effort, undefined, JSON.stringify(response));
@@ -170,10 +180,12 @@ test("the probe never blocks the event stream: events finish while getSettings i
 });
 
 test("a model failing the stored-model rules is reported unknown", async () => {
-  const { obs } = await run({ frames: [init({ model: "bad model", effort: "low" }), result] });
-  assert.equal(obs[0]!.model, undefined);
-  assert.equal(obs[0]!.modelEvidence, "unknown");
-  assert.equal(obs[0]!.effort, "low");
+  for (const model of ["bad model", "claude\uD800x", "claude\uDC00", "claude�x"]) {
+    const { obs } = await run({ frames: [init({ model, effort: "low" }), result] });
+    assert.equal(obs[0]!.model, undefined, JSON.stringify(model));
+    assert.equal(obs[0]!.modelEvidence, "unknown");
+    assert.equal(obs[0]!.effort, "low");
+  }
 });
 
 test("at most once per turn, and a subagent init is ignored", async () => {

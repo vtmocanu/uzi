@@ -29,6 +29,14 @@ test("the lead-config reporter and observation helpers import no usage or token-
   }
 });
 
+test("the scan and FORBIDDEN patterns match known-bad import strings and pass a known-good one", () => {
+  const flagged = (src: string) => specifiers(src).filter((s) => FORBIDDEN.some((re) => re.test(s)));
+  assert.deepEqual(flagged('import { x } from "./usage-recorder.js";\n'), ["./usage-recorder.js"]);
+  assert.deepEqual(flagged('import { y } from "./codex/token-accounting.js";\n'), ["./codex/token-accounting.js"]);
+  assert.deepEqual(flagged('const m = await import("./usage-recorder.js");\n'), ["./usage-recorder.js"]);
+  assert.deepEqual(flagged('import { z } from "./harness.js";\n'), []);
+});
+
 test("the forbidden module names exist, so the scan is guarding something real", () => {
   assert.ok(fs.existsSync(path.join(SRC, "usage-recorder.ts")));
   assert.ok(fs.existsSync(path.join(SRC, "codex", "token-accounting.ts")));

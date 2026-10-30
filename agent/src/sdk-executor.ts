@@ -4921,8 +4921,10 @@ export class SdkExecutor implements Executor {
       const key = `${entry.phase}:${entry.entry}`;
       const seen = (state.observedEntries ??= new Set<string>());
       if (!seen.has(key)) {
-        seen.add(key);
+        // The key is spent when the harness actually delivers (an init arrived), not when the
+        // callback is handed over: a turn that yields no init and is retried keeps its chance.
         onRuntimeConfig = (obs) => {
+          seen.add(key);
           try {
             reporter.observe(entry, toLeadObservation(obs));
           } catch {
