@@ -149,10 +149,9 @@ For each phase the record holds:
 
 - **Requested** model and effort, with their **source**: *fixed by schedule*,
   *your Claude default* or *your Codex default*, *lead template*, or
-  *built-in*. A Claude row that sent no model reads *Claude SDK default*. A
-  *runtime default* effort reading arrives with child B
-  ([#3247](https://github.com/vtmocanu/uzi/issues/3247)); today the server
-  always sends an effort.
+  *built-in*. A Claude row that sent no model reads *Claude SDK default*. When
+  you chose [Runtime default](./worker-effort.md#runtime-default) effort, uzi
+  sends no level and the requested effort reads *runtime default*.
 - **Runtime-reported** model and effort, with the evidence behind them
   (*Claude SDK init*, *Claude SDK settings*, *Codex thread config* or *sent to
   Codex*).
