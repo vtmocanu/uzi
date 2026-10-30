@@ -862,7 +862,8 @@ describe("measureCommandCache (issue #3675)", () => {
       return p as unknown as StandaloneModeProcess;
     };
     const k = killRecorder();
-    const result = await measureCommandCache(TOKEN, { spawn, timeoutMs: 1000, limiter, killAsCommandUid: k.kill });
+    // A drain far longer than the test: only the close listener can settle it.
+    const result = await measureCommandCache(TOKEN, { spawn, timeoutMs: 1000, drainMs: 60_000, limiter, killAsCommandUid: k.kill });
     assert.equal(result.state, "unknown");
     if (result.state !== "unknown") return;
     assert.equal(result.reason, "spawn");
@@ -874,8 +875,35 @@ describe("measureCommandCache (issue #3675)", () => {
     assert.equal(next.calls.length, 0, "the slot is held until the helper closes");
     procs[0]!.emit("exit", 0, null);
     procs[0]!.emit("close", 0, null);
-    await result.settlement;
+    assert.equal(await stillPending(result.settlement), false, "the close itself settles it, not the drain");
     assert.equal((await second).state, "complete");
+  });
+
+  it("a child error with no process (no pid) gives the slot back at once with no settlement", async () => {
+    const limiter = createMeasureLimiter();
+    const f = fakeSpawn((p) => p.emit("error", new Error("ENOENT")));
+    const spawn: SpawnStandaloneMode = (command, args, options) => {
+      const p = f.spawn(command, args, options) as unknown as FakeModeProcess;
+      Object.defineProperty(p, "pid", { value: undefined });
+      return p as unknown as StandaloneModeProcess;
+    };
+    const k = killRecorder();
+    assert.deepEqual(await measureCommandCache(TOKEN, { spawn, timeoutMs: 1000, limiter, killAsCommandUid: k.kill }), unknown("spawn"));
+    assert.deepEqual(k.pids, [], "nothing to kill");
+    const next = fakeSpawn(oneShot([measureLine()], 0));
+    assert.equal((await measureCommandCache(TOKEN, { spawn: next.spawn, timeoutMs: 1000, limiter })).state, "complete");
+  });
+
+  it("a child error on a live helper whose kill is not delivered is spawn_unkilled and still holds the slot", async () => {
+    const f = fakeSpawn((p) => p.emit("error", new Error("EPIPE")));
+    const result = await measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 1000, limiter: createMeasureLimiter(), killAsCommandUid: () => false });
+    assert.equal(result.state, "unknown");
+    if (result.state !== "unknown") return;
+    assert.equal(result.reason, "spawn_unkilled");
+    assert.ok(result.settlement);
+    assert.equal(await stillPending(result.settlement), true);
+    f.procs[0]!.finish(0);
+    await result.settlement;
   });
 
   it("a delivery timeout kills the helper as the command uid; the settlement still resolves only at its close", async () => {

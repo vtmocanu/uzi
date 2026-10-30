@@ -2889,8 +2889,8 @@ function parseMeasureLine(line: string, code: number | null): CacheMeasureResult
  *
  * Requests queue FIFO on a worker-wide concurrency-1 limiter and the slot is held from the
  * spawn until the helper has actually ended, not the delivery timeout. A same-uid model command can
- * SIGSTOP the helper, so at the delivery timeout (or an abort after the spawn) a still-unreaped
- * helper is SIGKILLed as the command uid (`killAsCommandUid`, as the reaper is); SIGKILL works on
+ * SIGSTOP the helper, so at the delivery timeout, an abort after the spawn, or a child error / missing
+ * stdout once the process exists, a still-unreaped helper is SIGKILLed as the command uid (`killAsCommandUid`, as the reaper is); SIGKILL works on
  * a stopped process. No kill is issued once its `exit` was observed (the pid may be reused). A
  * kill that is not delivered leaves the slot held until the helper ends on its own (reason
  * `timeout_unkilled` / `aborted_unkilled`). "Ended" is the first of: Node `close`, or `exit`
@@ -2936,7 +2936,7 @@ export async function measureCommandCache(token: string, deps: MeasureDeps = {})
       }
       return { state: "unknown", reason: killed ? run.kind : `${run.kind}_unkilled`, settlement };
     }
-    if (run.kind !== "done") return { state: "unknown", reason: "protocol" };
+    if (run.kind !== "done") return { state: "unknown", reason: "protocol" }; // unreachable: narrows the type
     if (run.breach !== undefined || run.line === undefined) return { state: "unknown", reason: "protocol" };
     return parseMeasureLine(run.line, run.code);
   } catch {
