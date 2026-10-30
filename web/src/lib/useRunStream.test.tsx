@@ -1147,6 +1147,15 @@ describe("passive run metadata reads", () => {
     expect(get.mock.calls.every(call => call[2] === true)).toBe(true);
   });
 
+  it("reads passively through refreshRunPassive", async () => {
+    const get = vi.spyOn(api, "getRun").mockResolvedValue({ run: fakeRun() });
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await flush();
+    get.mockClear();
+    await act(async () => result.current.refreshRunPassive());
+    expect(get.mock.calls).toEqual([passive]);
+  });
+
   it("keeps an explicit refreshRun in the foreground", async () => {
     const get = vi.spyOn(api, "getRun").mockResolvedValue({ run: fakeRun() });
     const { result } = renderHook(() => useRunStream("run-1"));

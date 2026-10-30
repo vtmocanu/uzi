@@ -124,6 +124,8 @@ export function useRunStream(runId: string) {
   }, [runId, publishReadiness]);
 
   const refreshRun = useCallback(() => readRun(false), [readRun]);
+  // For socket-driven consumers: passive, so it never restores a browser vault keyslot (ADR-3508).
+  const refreshRunPassive = useCallback(() => readRun(false, true), [readRun]);
 
   // Eligibility and source leases can change without a reason-changing WS frame.
   // Reuse the visible-view cadence for metadata only, one outstanding quiet read;
@@ -414,5 +416,5 @@ export function useRunStream(runId: string) {
   // for a non-owner viewer (Decision 8/N2).
   const confirmedOwner = ownerProof?.runId === runId && ownerProof.generation === genRef.current;
   const pauseOriginReady = readyProof?.runId === runId && readyProof.generation === genRef.current;
-  return { pauseOriginReady, run, messages, connected, error, submit, refreshRun, inputs, refreshInputs, canSteer, confirmedOwner };
+  return { pauseOriginReady, run, messages, connected, error, submit, refreshRun, refreshRunPassive, inputs, refreshInputs, canSteer, confirmedOwner };
 }

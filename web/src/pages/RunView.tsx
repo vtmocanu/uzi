@@ -1831,7 +1831,7 @@ export function RunView() {
   const { id = "" } = useParams();
   const currentRunIdRef = useRef(id);
   currentRunIdRef.current = id;
-  const { run, messages, connected, error, submit, refreshRun, inputs, canSteer: optimisticCanSteer, confirmedOwner, pauseOriginReady } = useRunStream(id);
+  const { run, messages, connected, error, submit, refreshRun, refreshRunPassive, inputs, canSteer: optimisticCanSteer, confirmedOwner, pauseOriginReady } = useRunStream(id);
   const repoPath = maskRepoPath(stripUnsafeChars(run?.repo_path ?? ""), demo);
   const workerExhausted = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_requeue_exhausted";
   // All page control surfaces share this gate, including the existing top Stop.
@@ -1868,10 +1868,11 @@ export function RunView() {
     state.busy = true;
     const active = state;
     // Requests are bounded by newly observed sequence numbers, with no retries;
-    // updates during a request share one follow-up. refreshRun retains its own
-    // request lifecycle and generation fence. Navigation cancels queued follow-ups.
+    // updates during a request share one follow-up. The read is passive (socket-driven,
+    // so it never restores a vault keyslot) and retains refreshRun's request lifecycle
+    // and generation fence. Navigation cancels queued follow-ups.
     const refresh = async () => {
-      try { await refreshRun(); } catch {
+      try { await refreshRunPassive(); } catch {
         // Best effort, as in useRunStream.refreshRun; a later new event can refresh.
       } finally {
         active.busy = false;
@@ -1883,7 +1884,7 @@ export function RunView() {
       }
     };
     void refresh();
-  }, [id, run?.id, messages, refreshRun]);
+  }, [id, run?.id, messages, refreshRunPassive]);
   const [incidentalSummary, setIncidentalSummary] = useState<{ runId: string; count: number } | null>(null);
   const findingsRunId = run?.id;
   const findingsTerminal = !!run && isTerminalRun(run.status);
