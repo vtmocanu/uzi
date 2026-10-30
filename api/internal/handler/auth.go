@@ -163,25 +163,7 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create + unlock a protected user's vault with the registration password.
-	// Optional-policy enrollment starts off and creates no wrapped DEK.
-	// Deliberately AFTER the transaction commits: registration holds a
-	// pg_advisory_xact_lock, and the vault's Argon2 KEK derivation inside that lock
-	// would serialize all registrations. The vault row is created in its own
-	// statement here; a crash between user-create and vault-create is self-healing
-	// (the next login's first-unlock creates it). A failure is non-fatal, same as
-	// login — the account exists and the SPA will show the unlock banner.
-	if h.vault != nil && user.VaultMode == store.VaultModeProtected {
-		if err := h.vault.Unlock(r.Context(), user.ID, req.Password); err != nil {
-			slog.Error("vault unlock at register", "user", user.ID, "error", err)
-		} else if h.codexUsagePoker != nil {
-			// A successful unlock lets the Codex poller read this user's linked accounts;
-			// poke so their account meters refresh within seconds (PRD #1209). Best-effort.
-			h.codexUsagePoker.Poke(user.ID)
-		}
-	}
-
-	if !h.issueSession(w, user) {
+	if !h.passwordSession(w, r, user, vault.Snapshot(user), req.Password) {
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, h.sessionPayload(r.Context(), user))
@@ -295,6 +277,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	snapshot := vault.Snapshot(user)
 	ok, err := auth.VerifyPassword(req.Password, user.PasswordHash.String)
 	if err != nil {
 		slog.Error("verify password", "error", err)
@@ -314,23 +297,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("set last login", "error", err)
 	}
 
-	// Unlock the vault with the just-verified password so the user's agents can
-	// work this session — including overnight, since the DEK lives in the API, not
-	// the browser (PRD #32). First-ever unlock creates the vault. A failure here
-	// must NOT block login (the session is valid); it can only be a corrupted row,
-	// so log loudly and return the session with the vault left locked (the SPA then
-	// shows the unlock banner). The error never carries the password or a secret.
-	if h.vault != nil && user.VaultMode == store.VaultModeProtected {
-		if err := h.vault.Unlock(r.Context(), user.ID, req.Password); err != nil {
-			slog.Error("vault unlock at login", "user", user.ID, "error", err)
-		} else if h.codexUsagePoker != nil {
-			// A successful unlock lets the Codex poller read this user's linked accounts;
-			// poke so their account meters refresh within seconds (PRD #1209). Best-effort.
-			h.codexUsagePoker.Poke(user.ID)
-		}
-	}
-
-	if !h.issueSession(w, user) {
+	if !h.passwordSession(w, r, user, snapshot, req.Password) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, h.sessionPayload(r.Context(), user))
@@ -344,10 +311,19 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	if _, err := h.q.BumpTokenVersion(r.Context(), user.ID); err != nil {
-		slog.Error("bump token version", "error", err)
+	var err error
+	if h.vault != nil {
+		_, err = h.vault.Logout(r.Context(), user.ID)
+	} else {
+		_, err = h.q.BumpTokenVersion(r.Context(), user.ID)
 	}
 	auth.ClearAuthCookies(w, h.cfg.CookieSecure)
+	clearVaultSlot(w)
+	if err != nil {
+		slog.Warn("logout failed", "phase", "revoke", "owner", user.ID)
+		httpx.Error(w, http.StatusServiceUnavailable, "logout could not be confirmed; retry")
+		return
+	}
 	httpx.JSON(w, http.StatusOK, map[string]string{"status": "logged out"})
 }
 
@@ -531,30 +507,13 @@ func (h *Handler) AuthConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// issueSessionCookies mints the JWT and sets the auth + CSRF cookies. It logs and
-// returns an error WITHOUT writing a response body, so callers choose how to
-// surface failure: a JSON 500 for the password endpoints (issueSession), a
-// redirect for the OIDC callback (review NB3).
+// issueSessionCookies prepares and emits a browser identity and session cookie
+// pair without unlocking the vault. The OIDC callback owns its error response.
 func (h *Handler) issueSessionCookies(w http.ResponseWriter, user store.User) error {
-	token, err := auth.IssueToken(h.cfg.JWTSecret, user.ID.String(), user.TokenVersion, h.cfg.AuthTokenTTL)
+	session, err := h.freshSession(user)
 	if err != nil {
-		slog.Error("issue token", "error", err)
 		return err
 	}
-	if err := auth.SetAuthCookies(w, token, auth.CookieOptions{Secure: h.cfg.CookieSecure, TTL: h.cfg.AuthTokenTTL}); err != nil {
-		slog.Error("set auth cookies", "error", err)
-		return err
-	}
+	session.emit(w)
 	return nil
-}
-
-// issueSession mints a JWT at the user's current token_version and sets the
-// auth + CSRF cookies. It writes an error response and returns false on
-// failure.
-func (h *Handler) issueSession(w http.ResponseWriter, user store.User) bool {
-	if err := h.issueSessionCookies(w, user); err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return false
-	}
-	return true
 }

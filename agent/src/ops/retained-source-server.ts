@@ -523,8 +523,9 @@ export class RetainedSourceServer {
           return { ok: result.kind === "done", op: "discard" as const, result };
         });
         // END SOURCE USE of the paths the discard admitted (still under the same A): a slot with an
-        // unresolved record stays active (fail closed); a deleted source's slot leaves active.
-        if (entered.entered) await this.deps.authority?.endSourceUse?.(clonePaths);
+        // unresolved record stays active (fail closed); a deleted source's slot leaves active. A key a live
+        // flight owns is never ended here (a refusal before the takeover admitted nothing): skipFlightOwned.
+        if (entered.entered) await this.deps.authority?.endSourceUse?.(clonePaths, { skipFlightOwned: true });
         return entered;
       });
       if (!boundary.entered) return this.refusal("run_reserved");

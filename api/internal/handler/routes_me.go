@@ -24,7 +24,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 		// ids, default flags, never a value — so it is safe to reach from a CLI
 		// token (`uzi token list`), which grants no credential the caller lacks.
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Use(h.requireUser())
 			r.Get("/", h.ListMySecrets)
 			r.Post("/{kind}/{id}/test", h.TestMySecret)
 			// Credential Test (issue #1988) is a bounded, owner-scoped exception to
@@ -55,7 +55,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 		// Bearer-reachable mint would let a stolen uzc_ replace a user's tokens, the
 		// same reason POST /workers is cookie-only.
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Use(h.requireAuth())
 			// PRD #104 M2 id-keyed CRUD. POST creates a named token, PATCH
 			// renames/set-defaults/rotates one, DELETE /{id} removes one (D5/D6).
 			r.Patch("/{kind}/{id}/enabled", h.PatchSecretEnabled)
@@ -92,7 +92,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// matched ahead of /{id}. Since PRD #1907 M5 (D8) it revokes the caller's CLI
 	// tokens AND product tokens in one transaction, so the button leaves nothing live.
 	r.Route("/me/cli-tokens", func(r chi.Router) {
-		r.Use(mw.RequireAuth(h.q, h.cfg))
+		r.Use(h.requireAuth())
 		r.Get("/", h.ListCLITokens)
 		r.Post("/", h.CreateCLIToken)
 		r.Post("/revoke-all", h.RevokeAllCLITokens)
@@ -106,7 +106,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// authLimiter per user, like the other credential surfaces; the per-product cap
 	// (D15) is the handler's. /products is the mint picker (enabled, live products).
 	r.Route("/me/product-tokens", func(r chi.Router) {
-		r.Use(mw.RequireAuth(h.q, h.cfg))
+		r.Use(h.requireAuth())
 		r.Get("/", h.ListMyProductTokens)
 		r.Get("/products", h.ListMintableProducts)
 		r.With(authLimiter.PerUserMiddleware).Post("/", h.MintProductToken)
@@ -120,7 +120,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// by RequireAuth, owner-scoped in the handler, no limiter (a local write, like the DELETE
 	// of /me/product-tokens/{id}).
 	r.Route("/me/oauth-connections", func(r chi.Router) {
-		r.Use(mw.RequireAuth(h.q, h.cfg))
+		r.Use(h.requireAuth())
 		r.Get("/", h.ListMyOAuthConnections)
 		r.Post("/{id}/revoke", h.RevokeMyOAuthConnection)
 	})
@@ -131,7 +131,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// not a secret-minting surface like cli-tokens. Scoped to the caller: the list
 	// is user_id-filtered and the delete is owner-scoped (a foreign id 404s).
 	r.Route("/me/memory", func(r chi.Router) {
-		r.Use(mw.RequireUser(h.q, h.cfg))
+		r.Use(h.requireUser())
 		r.Get("/", h.ListMyMemory)
 		r.Delete("/{id}", h.DeleteMyMemory)
 	})
@@ -142,28 +142,28 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// absent exactly when the operator is not on that page — the only situation a
 	// nav badge exists for. RequireUser mirrors /me/judge/stats.
 	r.Route("/me/workers", func(r chi.Router) {
-		r.Use(mw.RequireUser(h.q, h.cfg))
+		r.Use(h.requireUser())
 		r.Get("/upgrade-summary", h.WorkerUpgradeSummary)
 	})
 
 	// Instance maintenance notice (PRD #3454): the public pause state for any authenticated
 	// user (session or CLI token); no attribution, no readout.
 	r.Route("/maintenance", func(r chi.Router) {
-		r.Use(mw.RequireUser(h.q, h.cfg))
+		r.Use(h.requireUser())
 		r.Get("/", h.GetMaintenance)
 	})
 
 	// Runs-in-progress count for the Runs nav badge (PRD #239). Its own endpoint +
 	// AppShell poll, mirroring /me/workers/upgrade-summary and /me/judge/stats.
 	r.Route("/me/runs", func(r chi.Router) {
-		r.Use(mw.RequireUser(h.q, h.cfg))
+		r.Use(h.requireUser())
 		r.Get("/in-progress-count", h.RunsInProgressCount)
 	})
 
 	// The caller's scheduled runs (PRD #241 M4). RequireUser so `uzi schedule
 	// list` works from a CLI token; owner-scoped by the query's user_id filter.
 	r.Route("/me/schedules", func(r chi.Router) {
-		r.Use(mw.RequireUser(h.q, h.cfg))
+		r.Use(h.requireUser())
 		r.Get("/", h.ListMySchedules)
 	})
 
@@ -174,7 +174,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// spend the caller's credentials unattended, which is not something a stolen
 	// CLI token should be able to turn on.
 	r.Group(func(r chi.Router) {
-		r.Use(mw.RequireAuth(h.q, h.cfg))
+		r.Use(h.requireAuth())
 		r.Put("/me/autopilot", h.SetAutopilotEnabled)
 		r.Put("/me/cross-check", h.SetCrossCheck)
 		// Current-user run-judge opt-in (PRD #46): per-user consent to spend the
@@ -214,7 +214,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// reserve is a self-limit on spend, not a theft control: a token that can already create
 	// runs through Bearer-reachable routes can also turn the reserve off. Identity is the
 	// session user, never the body.
-	r.With(mw.RequireUser(h.q, h.cfg)).Put("/me/usage-reserve", h.SetUsageReserve)
+	r.With(h.requireUser()).Put("/me/usage-reserve", h.SetUsageReserve)
 
 	// Current-user Claude rate-limit meters (PRD #53): the caller's own 5h/7d
 	// windows. Self-scoped; admins use /api/admin/rate-limits for everyone.
@@ -244,7 +244,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// the CURRENT route table, not of this endpoint. If /api/runs's usage fields or
 	// CreateRun ever return to cookie-only, this decision needs revisiting.
 	r.Group(func(r chi.Router) {
-		r.Use(mw.RequireUser(h.q, h.cfg))
+		r.Use(h.requireUser())
 		r.Get("/me/rate-limits", h.SelfRateLimits)
 		// Current-user Codex account rate-limit meters (PRD #1209 M3): the caller's own
 		// per-account 5h/weekly buckets, the Codex sibling of /me/rate-limits. RequireUser
@@ -261,7 +261,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// cookie-only (RequireAuth). No admin path either way. Kept as one Route so
 	// both verbs stay on the same `/me/settings/` pattern.
 	r.Route("/me/settings", func(r chi.Router) {
-		r.With(mw.RequireUser(h.q, h.cfg)).Get("/", h.GetMySettings)
-		r.With(mw.RequireAuth(h.q, h.cfg)).Put("/", h.PutMySettings)
+		r.With(h.requireUser()).Get("/", h.GetMySettings)
+		r.With(h.requireAuth()).Put("/", h.PutMySettings)
 	})
 }

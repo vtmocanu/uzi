@@ -20,6 +20,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/theme"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -33,7 +34,8 @@ import (
 // tokens whose rate meters the user surfaced on the sidebar rail — the default
 // token always shows and is never listed; empty means default-only.
 type userSettingsDTO struct {
-	CrossCheckPins []crossCheckPinDTO `json:"cross_check_pins"`
+	VaultAutoReunlock bool               `json:"vault_auto_reunlock"`
+	CrossCheckPins    []crossCheckPinDTO `json:"cross_check_pins"`
 	// DefaultModel is DEPRECATED (PRD #1551 D2/D3): the retained model defaults now live
 	// in the two per-harness lanes below. On GET/PUT this legacy field is a PROJECTION of
 	// the lane for the effective harness (ResolveSettingsHarness), kept one release as a
@@ -153,6 +155,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	// needed (PRD #362 M2).
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"settings": userSettingsDTO{
+			VaultAutoReunlock:         settingsAutoReunlock(r),
 			CrossCheckPins:            pins,
 			DefaultModel:              textPtrValue(legacyModel.Valid, legacyModel.String),
 			DefaultClaudeModel:        textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
@@ -233,8 +236,9 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	// RawMessage distinguishes an absent field (nil) from a present null (the
 	// bytes `null`); a plain *string cannot, and absent must mean "unchanged".
 	var req struct {
-		CrossCheckPins json.RawMessage `json:"cross_check_pins"`
-		DefaultModel   json.RawMessage `json:"default_model"`
+		VaultAutoReunlock *bool           `json:"vault_auto_reunlock"`
+		CrossCheckPins    json.RawMessage `json:"cross_check_pins"`
+		DefaultModel      json.RawMessage `json:"default_model"`
 		// The two per-harness lanes (PRD #1551 M1 / D2), same absent/null/value tri-state
 		// as default_model: absent ⇒ lane unchanged, null ⇒ clear to inherit, a validated
 		// value ⇒ set. Cross-vocabulary rejection uses closed lists only (D3).
@@ -603,6 +607,23 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	// single-column statement (PATCH semantics); the four appearance columns go in
 	// ONE atomic conditional UPDATE (no read-merge-write, so two concurrent saves
 	// of different fields cannot clobber each other).
+
+	if req.VaultAutoReunlock != nil {
+		if h.vault == nil {
+			httpx.Error(w, http.StatusServiceUnavailable, "vault not configured")
+			return
+		}
+		if !*req.VaultAutoReunlock {
+			clearVaultSlot(w)
+		}
+		if err := h.vault.SetAutoReunlock(r.Context(), vault.Snapshot(user), *req.VaultAutoReunlock); err != nil {
+			slog.Warn("vault preference failed", "phase", "set preference", "owner", user.ID)
+			httpx.Error(w, http.StatusServiceUnavailable, "vault preference could not be confirmed; retry")
+			return
+		}
+		user.VaultAutoReunlock = *req.VaultAutoReunlock
+		r = r.WithContext(mw.ContextWithUser(r.Context(), user))
+	}
 
 	if err := h.saveCrossCheckPins(r.Context(), pinPatches); err != nil {
 		slog.Error("save cross-check pins", "error", err)
@@ -1259,4 +1280,11 @@ func validateTypeface(v string) error {
 		return fmt.Errorf("typeface: must be one of %s, %s", theme.TypefaceSystem, theme.TypefacePlex)
 	}
 	return nil
+}
+
+// The authenticated users row carries this preference; GetUserSettings projects
+// model and appearance columns only. PUT updates the context after core confirms.
+func settingsAutoReunlock(r *http.Request) bool {
+	user, _ := mw.UserFromContext(r.Context())
+	return user.VaultAutoReunlock
 }

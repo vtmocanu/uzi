@@ -43,7 +43,7 @@ func SetAuthCookies(w http.ResponseWriter, token string, opts CookieOptions) err
 	expires := time.Now().Add(opts.TTL)
 	maxAge := int(opts.TTL.Seconds())
 
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // G124: session Secure follows the configured deployment HTTPS setting (legacy HTTP login is supported).
 		Name:     AuthCookieName,
 		Value:    token,
 		Path:     "/",
@@ -53,7 +53,7 @@ func SetAuthCookies(w http.ResponseWriter, token string, opts CookieOptions) err
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // G124: CSRF is deliberately JS-readable; Secure follows deployment HTTPS, matching the session cookie.
 		Name:     CSRFCookieName,
 		Value:    csrf,
 		Path:     "/",
@@ -71,7 +71,7 @@ func SetAuthCookies(w http.ResponseWriter, token string, opts CookieOptions) err
 // SameSite=Strict; Secure follows the caller-supplied flag.
 func ClearAuthCookies(w http.ResponseWriter, secure bool) {
 	expired := time.Unix(0, 0)
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // G124: empty deletion cookie follows the deployment Secure flag; carries no authority.
 		Name:     AuthCookieName,
 		Value:    "",
 		Path:     "/",
@@ -81,7 +81,7 @@ func ClearAuthCookies(w http.ResponseWriter, secure bool) {
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // G124: delete the readable CSRF cookie with its original deployment flags.
 		Name:     CSRFCookieName,
 		Value:    "",
 		Path:     "/",
@@ -127,6 +127,12 @@ func ValidateCSRF(r *http.Request) bool {
 		return true
 	}
 
+	return ValidateCSRFToken(r)
+}
+
+// ValidateCSRFToken checks the JWT-bound CSRF header regardless of HTTP method.
+// Browser hooks must call this before accessing browser session state, including on GET.
+func ValidateCSRFToken(r *http.Request) bool {
 	header := r.Header.Get(CSRFHeaderName)
 	if header == "" {
 		return false

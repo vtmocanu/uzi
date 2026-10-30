@@ -24,6 +24,18 @@ export class AuthorityRefusal extends Error {
   }
 }
 
+/**
+ * A refusal because THIS process still holds the source: a retired flight sink is no longer allowed to admit
+ * anything, and a key whose owning flight has no confirmed durable end cannot be admitted by another sink.
+ * Nothing was written when it is thrown.
+ */
+export class SourceUseHeldRefusal extends AuthorityRefusal {
+  constructor(message: string) {
+    super(message);
+    this.name = "SourceUseHeldRefusal";
+  }
+}
+
 export interface FlockResult { code: number; output: string }
 
 /** Narrow injection points. Production callers pass nothing. */

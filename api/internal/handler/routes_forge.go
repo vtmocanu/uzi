@@ -17,7 +17,7 @@ func (h *Handler) mountForgeRoutes(r chi.Router, forgeLimiter *mw.Limiter) {
 	// connection's user_id. POST /forge/connections writes a forge bot PAT, so no
 	// v1 CLI verb reaches this tree; it stays cookie-only.
 	r.Group(func(r chi.Router) {
-		r.Use(mw.RequireAuth(h.q, h.cfg))
+		r.Use(h.requireAuth())
 
 		r.Get("/forge/config", h.ForgeConfig)
 

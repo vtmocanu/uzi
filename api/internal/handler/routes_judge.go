@@ -17,7 +17,7 @@ func (h *Handler) mountJudgeRoutes(r chi.Router, forgeLimiter *mw.Limiter) {
 	// CLI token; owner-scoped by the query's user_id filter, bucketed by the shared
 	// Go ladder so it agrees with the per-review bar.
 	r.Route("/me/judge", func(r chi.Router) {
-		r.Use(mw.RequireUser(h.q, h.cfg))
+		r.Use(h.requireUser())
 		r.Get("/stats", h.JudgeStats)
 		// Per-category GROUP counts for the Judge filter chips (PRD #244): a
 		// SEPARATE endpoint + DTO from /stats so the nav badge (which reads only
@@ -47,7 +47,7 @@ func (h *Handler) mountJudgeRoutes(r chi.Router, forgeLimiter *mw.Limiter) {
 	// dismiss is a LOCAL write (no forge call, no spend, no forge blast radius) and carries
 	// no limiter. Mints/reveals/consent routes stay cookie-only RequireAuth.
 	r.Route("/findings", func(r chi.Router) {
-		r.Use(mw.RequireUser(h.q, h.cfg))
+		r.Use(h.requireUser())
 		// Reads: owner-scoped by the query's user_id filter, no forge write, no spend.
 		r.Get("/", h.ListFindings)
 		// The per-status tally (PRD #1183 M3): the finding twin of /me/judge/stats, reusing

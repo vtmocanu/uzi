@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 )
@@ -86,6 +87,62 @@ func (l *Limiter) allow(key string) bool {
 // guard. Compose the key exactly as the middleware does — the route pattern, "|",
 // then the user id — to share a bucket with that route's mount.
 func (l *Limiter) Allow(key string) bool { return l.allow(key) }
+
+// VaultUnlockKey is shared by implicit browser unlock and POST /api/vault/unlock.
+func VaultUnlockKey(owner uuid.UUID) string { return "/api/vault/unlock|" + owner.String() }
+
+// Reservation is a charged attempt in one bucket generation. Retain the charge
+// on failure; call Refund only after successful work. Do not defer Refund.
+// Copies of a handle still share the same once-only refund state.
+type Reservation struct {
+	state *reservationState
+}
+
+type reservationState struct {
+	limiter  *Limiter
+	key      string
+	bucket   *bucket
+	refunded bool
+}
+
+// Reserve charges in-flight work before it starts. Denied work receives no
+// handle and must not start. Denial leaves accounting unchanged.
+func (l *Limiter) Reserve(key string) (*Reservation, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	b := l.buckets[key]
+	if b == nil || !now.Before(b.resetAt) {
+		b = &bucket{resetAt: now.Add(l.window)}
+		l.buckets[key] = b
+	}
+	if b.count >= l.max {
+		return nil, false
+	}
+	b.count++
+	return &Reservation{state: &reservationState{limiter: l, key: key, bucket: b}}, true
+}
+
+// Refund returns true only for the first refund of a live reservation. Expired,
+// swept, or replaced buckets cannot be credited by an old reservation.
+func (r *Reservation) Refund() bool {
+	if r == nil || r.state == nil {
+		return false
+	}
+	s := r.state
+	l := s.limiter
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if s.refunded {
+		return false
+	}
+	s.refunded = true
+	if l.buckets[s.key] != s.bucket || !time.Now().Before(s.bucket.resetAt) {
+		return false
+	}
+	s.bucket.count--
+	return true
+}
 
 // Window is the fixed window every key's budget resets over: the longest a refused caller can
 // have to wait, which is what a Retry-After header advertises.

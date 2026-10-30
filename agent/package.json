@@ -18,8 +18,8 @@
     "audit": "npm audit --audit-level=high --include=dev"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.302",
-    "agent-browser": "0.38.2",
+    "@anthropic-ai/claude-agent-sdk": "0.3.309",
+    "agent-browser": "0.39.2",
     "smol-toml": "1.9.1",
     "tsx": "^4.19.2",
     "zod": "4.6.7"
@@ -27,7 +27,7 @@
   "devDependencies": {
     "@types/node": "^24.13.3",
     "knip": "6.41.0",
-    "oxlint": "1.88.0",
+    "oxlint": "1.89.0",
     "typescript": "^7.0.0"
   },
   "overrides": {

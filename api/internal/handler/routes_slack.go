@@ -16,7 +16,7 @@ func (h *Handler) mountSlackRoutes(r chi.Router, slackDMLimiter *mw.Limiter) {
 	// a collision with another user's id), and a self-test DM. All own-user
 	// only via UserFromContext; no user can touch another's mapping.
 	r.Route("/me/slack", func(r chi.Router) {
-		r.Use(mw.RequireAuth(h.q, h.cfg))
+		r.Use(h.requireAuth())
 		r.Get("/", h.GetMySlack)
 		r.Put("/notify", h.PutMySlackNotify)
 		// override + test-dm each trigger an outbound Slack DM to a user-supplied

@@ -54,25 +54,29 @@ export function Settings() {
   const [sidebarCodexAccountIds, setSidebarCodexAccountIds] = useState<string[]>([]);
 
   const { data, loading, error: loadError, reload } = useAsyncData(
-    async () => {
+    async ({ isCurrent }) => {
       const [{ secrets: rows }, { settings }] = await Promise.all([
         api.listSecrets(),
         api.getMySettings(),
       ]);
-      setSidebarTokenIds(settings.sidebar_token_ids ?? []);
-      setSidebarCodexAccountIds(settings.sidebar_codex_account_ids ?? []);
+      if (isCurrent()) {
+        setSidebarTokenIds(settings.sidebar_token_ids ?? []);
+        setSidebarCodexAccountIds(settings.sidebar_codex_account_ids ?? []);
+      }
       // ONE listSecrets() call feeds both cards: the Anthropic slice is unchanged,
       // and the Codex slice is the union of the two Codex kinds (they share one
       // card and one default across both).
       return {
+        settings,
+        userId: user?.id,
         secrets: rows.filter((s) => s.kind === "anthropic_token"),
         codexSecrets: rows.filter(
           (s) => s.kind === "codex_auth" || s.kind === "openai_api_key",
         ),
       };
     },
-    [],
-    { fallback: "Failed to load settings" },
+    [user?.id],
+    { fallback: "Failed to load settings", skeleton: "deps" },
   );
   const secrets = useMemo(() => data?.secrets ?? [], [data]);
   const codexSecrets = useMemo(() => data?.codexSecrets ?? [], [data]);
@@ -179,7 +183,7 @@ export function Settings() {
           set, greyed on "unavailable", live meters once a reading lands. */}
       <RateLimitCard allDisabled={secrets.length > 0 && secrets.every((s) => s.enabled === false)} />
 
-      <VaultSettings onChanged={reload} />
+      <VaultSettings key={`vault-${user?.id}`} onChanged={reload} settings={data?.userId === user?.id ? data?.settings : undefined} settingsLoading={loading} settingsError={loadError} />
 
       <SlackNotifications />
 

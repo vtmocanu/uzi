@@ -155,6 +155,9 @@ export function buildClaudeCrossCheckOptions(input: {
     // Guardrail invariant #6 (semgrep/settings-sources-isolation.yml): nothing from disk, so a
     // cloned repo's .claude/ can grant the checker nothing. Keep this a LITERAL.
     settingSources: [],
+    // Issue #1563: deliver the prompt as written. The CLI otherwise expands `@path`
+    // mentions and dispatches a leading slash command before any PreToolUse hook runs.
+    verbatimPrompts: true,
     settings: { enabledPlugins: BUILTIN_PLUGINS_DISABLED },
     tools: [...CHECKER_SURFACE.tools],
     disallowedTools: isolatedDisallowedTools(CHECKER_SURFACE),

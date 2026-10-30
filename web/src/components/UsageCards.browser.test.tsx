@@ -63,10 +63,10 @@ it("switches the per-user table and retains its scrollable nine-column layout", 
   expect(scroll.scrollWidth).toBeGreaterThan(scroll.clientWidth);
   const names = () => users.getAllByRole("row").slice(1, -1).map((row) => row.querySelector("td")!.textContent);
   expect(names()).toEqual([
-    "maria@example.com", "a.very.long.owner.name.that.must.truncate@example.com", "andrei@example.com", "dana@example.com",
+    "a.very.long.owner.name.that.must.truncate@example.com", "maria@example.com", "andrei@example.com", "dana@example.com",
   ]);
   const firstUserRuns = () => users.getAllByRole("row")[1].querySelectorAll("td")[1].textContent;
-  expect(firstUserRuns()).toBe("7");
+  expect(firstUserRuns()).toBe("6");
   fireEvent.click(screen.getByRole("button", { name: "All time" }));
   expect(screen.getByRole("heading", { name: "Per user · all time" })).toBeTruthy();
   expect(users.getByRole("table").textContent).not.toBe(recent);
@@ -77,7 +77,7 @@ it("switches the per-user table and retains its scrollable nine-column layout", 
   expect(users.getAllByRole("columnheader")).toHaveLength(9);
   fireEvent.click(screen.getByRole("button", { name: "Last 7 days" }));
   expect(users.getByRole("table").textContent).toBe(recent);
-  expect(firstUserRuns()).toBe("7");
+  expect(firstUserRuns()).toBe("6");
   expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(375);
 });
 

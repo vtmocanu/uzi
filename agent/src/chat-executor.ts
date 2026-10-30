@@ -271,6 +271,9 @@ export function buildChatSdkOptions(input: {
     // Repo-borne prompt-injection defence: nothing from a directory's .claude/
     // can grant the agent permissions (same as runs; the baked source ships none).
     settingSources: [],
+    // Issue #1563: deliver the prompt as written. The CLI otherwise expands `@path`
+    // mentions and dispatches a leading slash command before any PreToolUse hook runs.
+    verbatimPrompts: true,
     // The load-bearing base-set restriction (Decision 6): read-only investigation
     // tools + the M3 uzi MCP tool names, and NOTHING else — this holds under
     // bypassPermissions where allowedTools would not.

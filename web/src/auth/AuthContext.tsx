@@ -290,11 +290,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // Refresh vault status when the tab regains focus: the DEK cache is per-process,
   // so a restart while the tab was backgrounded flips the vault to locked without
   // any request from this tab. There is no global socket to push it (PRD #32); a
-  // focus refresh is the cheap catch-up. Only while signed in.
+  // A fresh foreground probe also supersedes a pending hidden probe before the
+  // initial identity is known. Its generation fence drops the older response.
   useEffect(() => {
-    if (!user) return;
     const onFocus = () => {
-      void refresh();
+      if (!document.hidden) void refresh(true);
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);

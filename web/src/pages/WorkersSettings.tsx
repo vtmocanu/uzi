@@ -823,8 +823,12 @@ export function WorkersSettings() {
                           {/* Server-authoritative capability set (PRD #84 M1), rendered as
                               small read-only chips beside the template/drift badge. The set is
                               Filter-ed server-side to the {docker, jvm} vocabulary, so a name
-                              here is always known; empty/absent renders nothing. */}
-                          {w.capabilities?.map((cap) => (
+                              here is always known; empty/absent renders nothing. A hosted
+                              worker whose docker badge rendered above already says "docker",
+                              so its docker capability is skipped here: one chip per fact. */}
+                          {w.capabilities
+                            ?.filter((cap) => !(cap === "docker" && w.kind === "hosted" && w.docker === true))
+                            .map((cap) => (
                             <Badge key={cap} title={`Worker capability: ${cap}`}>
                               {cap}
                             </Badge>

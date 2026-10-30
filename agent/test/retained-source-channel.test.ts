@@ -459,18 +459,20 @@ describe("discard through the real socket", () => {
 
   it("issue #3404 bounds the discard's wait for A and ends the discarded paths' source use under the same A", { skip: LINUX_ONLY }, async () => {
     const a = await retainedAttempt("run-authority-wait", 1);
-    const holder: { events: string[]; options: Array<{ signal?: AbortSignal; timeoutMs?: number } | undefined>; ended: string[][] } =
-      { events: [], options: [], ended: [] };
+    const holder: { events: string[]; options: Array<{ signal?: AbortSignal; timeoutMs?: number } | undefined>; ended: string[][];
+      endOptions: Array<{ skipFlightOwned?: boolean } | undefined> } =
+      { events: [], options: [], ended: [], endOptions: [] };
     const authority = {
       withTransaction: async <T,>(fn: (tx: never) => Promise<T>, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<T> => {
         holder.events.push("authority_enter");
         holder.options.push(options);
         try { return await fn(undefined as never); } finally { holder.events.push("authority_exit"); }
       },
-      endSourceUse: async (paths: Iterable<string>) => {
+      endSourceUse: async (paths: Iterable<string>, endOptions?: { skipFlightOwned?: boolean }) => {
         holder.events.push("end_source_use");
         holder.ended.push([...paths]);
-        return { ended: [], kept: [] };
+        holder.endOptions.push(endOptions);
+        return { ended: [], kept: [], endedSlots: [] };
       },
     };
     const rig = await rigOf({ server: { authority } });
@@ -484,6 +486,7 @@ describe("discard through the real socket", () => {
     assert.ok(typeof options?.timeoutMs === "number" && options.timeoutMs > 0 && options.timeoutMs <= 60_000,
       `an explicit short deadline, not the 600 s default: ${options?.timeoutMs}`);
     assert.deepEqual(holder.ended, [[a.path]], "the discarded clone's source use is ended");
+    assert.deepEqual(holder.endOptions, [{ skipFlightOwned: true }], "a key a live flight owns is never ended by the discard");
     const ix = (name: string): number => rig.events.indexOf(name);
     assert.ok(ix("reservation_released") < ix("end_source_use") && ix("end_source_use") < ix("authority_exit"), rig.events.join(","));
   });
@@ -517,6 +520,28 @@ describe("discard through the real socket", () => {
     assert.equal(r.result.reason, "not_quiescent");
     assert.equal(fs.existsSync(a.path), true);
     assert.equal(rig.gate.claimsClosed(), false);
+  });
+
+  it("issue #3638 a refused discard passes skipFlightOwned to its source-use end", async () => {
+    const a = await retainedAttempt("run-refused-owned", 1);
+    const ended: Array<{ paths: string[]; options: { skipFlightOwned?: boolean } | undefined }> = [];
+    const authority = {
+      withTransaction: async <T,>(fn: (tx: never) => Promise<T>): Promise<T> => fn(undefined as never),
+      endSourceUse: async (paths: Iterable<string>, options?: { skipFlightOwned?: boolean }) => {
+        ended.push({ paths: [...paths], options });
+        return { ended: [], kept: [], endedSlots: [] };
+      },
+    };
+    const rig = await rigOf({
+      server: { authority },
+      quiesce: async () => ({ process: { state: "unverified" }, docker: { state: "not_wired" } }) as unknown as QuiesceRunOutcome,
+    });
+    const ev = await inspectOne(rig, a);
+    const r = await send(rig.sock, { op: "discard", run: a.runId, generation: 1, attempt: a.attemptId, confirm: ev.descriptor });
+    assert.equal(r.result.reason, "not_quiescent");
+    assert.equal(fs.existsSync(a.path), true);
+    assert.ok(ended.length > 0 && ended.every((e) => e.options?.skipFlightOwned === true),
+      `every end the refused discard asks for skips flight-owned keys: ${JSON.stringify(ended)}`);
   });
 
   it("a Docker-wired discard is refused when the Docker teardown errored, and proceeds when it is merely unconfirmed", { skip: LINUX_ONLY }, async () => {

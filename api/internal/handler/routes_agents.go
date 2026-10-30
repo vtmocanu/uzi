@@ -19,7 +19,7 @@ func (h *Handler) mountAgentRoutes(r chi.Router) {
 	// user templates; global/builtin management stays admin-only (per-row scope
 	// authz). Still closes bottega's hole where any user rewrites shared prompts.
 	r.Route("/agent-templates", func(r chi.Router) {
-		r.Use(mw.RequireAuth(h.q, h.cfg))
+		r.Use(h.requireAuth())
 		r.Get("/", h.ListAgentTemplates)
 
 		// Template allocations (PRD #18 M7): which templates ride the caller's
@@ -61,7 +61,7 @@ func (h *Handler) mountAgentRoutes(r chi.Router) {
 	// scope-based authz is per-row inside the handlers (not a blanket admin
 	// gate), so all routes share one authenticated group.
 	r.Route("/skills", func(r chi.Router) {
-		r.Use(mw.RequireAuth(h.q, h.cfg))
+		r.Use(h.requireAuth())
 		r.Get("/", h.ListSkills)
 		r.Post("/", h.CreateSkill)
 		r.Get("/{id}", h.GetSkill)
@@ -74,7 +74,7 @@ func (h *Handler) mountAgentRoutes(r chi.Router) {
 	// package picker needs the selectable set); only admins write. Same
 	// read-all / write-admin split as agent-templates.
 	r.Route("/tool-allowlist", func(r chi.Router) {
-		r.Use(mw.RequireAuth(h.q, h.cfg))
+		r.Use(h.requireAuth())
 		r.Get("/", h.ListToolAllowlist)
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireAdmin)

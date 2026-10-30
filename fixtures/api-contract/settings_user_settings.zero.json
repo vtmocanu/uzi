@@ -1,4 +1,5 @@
 {
+  "vault_auto_reunlock": false,
   "cross_check_pins": null,
   "default_model": null,
   "default_claude_model": null,

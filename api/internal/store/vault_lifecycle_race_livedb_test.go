@@ -108,6 +108,7 @@ func TestVaultLostCommitACKWaitsForOriginalResolutionLiveDB(t *testing.T) {
 		t.Run(map[bool]string{true: "commit", false: "rollback"}[commit], func(t *testing.T) {
 			f := vlSeed(t, pool, true, true)
 			before, metadata := f.snapshot(t, false), f.snapshot(t, true)
+			f.slotGeneration(t, 0, "before uncertain unlock")
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			resolve := make(chan struct{})
@@ -197,6 +198,7 @@ func TestVaultLostCommitACKWaitsForOriginalResolutionLiveDB(t *testing.T) {
 			}
 			// MVCC still exposes the unchanged pre-transaction durable state.
 			vlEqual(t, before, f.snapshot(t, false), "pending original durable state")
+			f.slotGeneration(t, 0, "pending original")
 			release()
 			err := <-originalDone
 			originalJoined = true
@@ -218,13 +220,16 @@ func TestVaultLostCommitACKWaitsForOriginalResolutionLiveDB(t *testing.T) {
 			cold := vault.NewPostgres(f.master, pool)
 			if commit {
 				f.state(t, cold, store.VaultModeProtected, 1, false, true)
+				f.slotGeneration(t, 1, "committed uncertain unlock")
 				if err := cold.UnlockExisting(ctx, f.owner, vlLoginPhrase); err != nil {
 					t.Fatal(err)
 				}
 				f.readable(t, cold, store.SealedWithDEK)
 				vlEqual(t, metadata, f.snapshot(t, true), "committed uncertain metadata")
+				f.slotGeneration(t, 1, "existing unlock after uncertain commit")
 			} else {
 				vlEqual(t, before, f.snapshot(t, false), "rolled-back uncertain state")
+				f.slotGeneration(t, 0, "rolled-back uncertain unlock")
 				f.state(t, cold, store.VaultModeProtected, 0, false, false)
 			}
 		})
@@ -460,6 +465,7 @@ func TestVaultProtectedLazyRewrapRacesLiveDB(t *testing.T) {
 					vlExec(t, pool, "UPDATE codex_provider_account SET sealed_login=$2,sealed_with='master',recovery_sealed=$3,recovery_sealed_with='master' WHERE user_id=$1 AND provider_user_id=$4", f.owner, live, recovery, fmt.Sprintf("principal-%d", i))
 				}
 				metadata := f.snapshot(t, true)
+				f.slotGeneration(t, 1, "before lazy race")
 				entered, release := make(chan struct{}), make(chan struct{})
 				var once sync.Once
 				unblock := func() { once.Do(func() { close(release) }) }
@@ -566,6 +572,11 @@ func TestVaultProtectedLazyRewrapRacesLiveDB(t *testing.T) {
 					f.state(t, lazy, store.VaultModeProtected, 1, true, true)
 				}
 				vlEqual(t, metadata, f.snapshot(t, true), "lazy race complete metadata")
+				if writer == "disable" {
+					f.slotGeneration(t, 2, "lazy race disable")
+				} else {
+					f.slotGeneration(t, 1, "same-epoch lazy race")
+				}
 			})
 		}
 	}

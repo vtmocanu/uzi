@@ -90,7 +90,7 @@ binary classification and excerpt contract above; unranged oversize reads remain
 denied.
 
 The fallback independently reopens through the helper's confinement and returns
-the second descriptor's data and metadata. Its 8 MiB actual-read budget and 64 KiB
+the second descriptor's data and metadata. Its 64 MiB actual-read budget and 64 KiB
 output cap permit text prefixes from larger files. UTF-8/NUL validation covers
 skipped and selected bytes through a deterministic prefix frontier, excluding the
 unread tail; this exception applies to fallback alone. Incomplete results add

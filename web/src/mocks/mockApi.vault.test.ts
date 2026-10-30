@@ -287,3 +287,31 @@ it.each(["optional", "required"])("new mock registrations follow %s policy witho
     : { mode: "protected", policy: "required", exists: true, unlocked: true });
   expect((await mockApi.getSettings()).unprotected_users).toBe(policy === "optional" ? 1 : 0);
 });
+
+describe("mock browser grant settings", () => {
+  it("defaults permission on and persists changes without unlocking protected or Off vaults", async () => {
+    expect((await mockApi.getMySettings()).settings.vault_auto_reunlock).toBe(true);
+    try {
+      for (const mode of ["protected", "unprotected"] as const) {
+        state.vaultMode = mode;
+        state.vaultUnlocked = false;
+        const before = await mockApi.vaultStatus();
+        for (const enabled of [false, true]) {
+          expect((await mockApi.putMySettings({ vault_auto_reunlock: enabled })).settings.vault_auto_reunlock).toBe(enabled);
+          expect((await mockApi.getMySettings()).settings.vault_auto_reunlock).toBe(enabled);
+          expect(await mockApi.vaultStatus()).toEqual(before);
+          expect(localStorage.getItem("uzi.mock.v4")).toContain(`"vault_auto_reunlock":${enabled}`);
+        }
+      }
+    } finally { await mockApi.putMySettings({ vault_auto_reunlock: true }); }
+  });
+  it.each(["1", "7", "30"])("accepts canonical TTL %s", async days => {
+    expect((await mockApi.updateSettings({ vault_reunlock_days: days })).settings.vault_reunlock_days).toBe(days);
+    expect((await mockApi.getSettings()).settings.vault_reunlock_days).toBe(days);
+  });
+  it.each(["0", "31", "1.5", "01", " 7"])("rejects invalid TTL %s without persistence", async days => {
+    const before = (await mockApi.getSettings()).settings.vault_reunlock_days;
+    await expect(mockApi.updateSettings({ vault_reunlock_days: days })).rejects.toMatchObject({ status: 400 });
+    expect((await mockApi.getSettings()).settings.vault_reunlock_days).toBe(before);
+  });
+});

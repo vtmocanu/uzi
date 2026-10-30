@@ -163,6 +163,7 @@ export interface ModelSettingCell {
 }
 
 export interface UserSettings {
+  vault_auto_reunlock?: boolean;
   cross_check_pins?: CrossCheckPinDTO[];
   /** @deprecated PRD #1551 D2: superseded by the explicit per-harness lanes below.
    *  Kept for one compatibility release as a server-projected legacy field — the
@@ -241,6 +242,7 @@ export interface UserSettings {
 // is applied (null clears it), a field absent is left unchanged — so the model
 // card and the Appearance picker save independently over the one endpoint.
 export interface UserSettingsPatch {
+  vault_auto_reunlock?: boolean;
   cross_check_pins?: { stage: "plan" | "code"; harness: Harness; model?: string | null; effort?: string | null }[];
   /** @deprecated PRD #1551 D3: the legacy single-model field. New clients (the grouped
    *  Run Defaults card) send default_claude_model / default_codex_model instead and never
@@ -1018,6 +1020,7 @@ export interface ForgeConfig {
 // every field is always present. default_theme is the instance-default UI theme
 // (PRD #21).
 export interface AppSettings {
+  vault_reunlock_days?: string;
   // Settings are a string map; callers accept only optional, otherwise required.
   // Missing on older APIs must also be treated as required.
   vault_policy?: string;
