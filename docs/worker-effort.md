@@ -8,8 +8,9 @@ audience: user
 
 Choose reasoning effort independently for your Claude and Codex runs in
 **Settings → Run defaults → Reasoning effort**. Both product defaults are
-**medium**. Leave a control on **Inherit** to use that product default, or
-choose `low`, `medium`, `high`, `xhigh` or `max` for that harness.
+**medium**. Leave a control on **Inherit** to use that product default,
+choose `low`, `medium`, `high`, `xhigh` or `max` for that harness, or choose
+**Runtime default** to send no level.
 
 Your explicit preference overrides the product default for the lead and its
 subagents. The setting is resolved when a worker claims the run, including a
@@ -25,7 +26,7 @@ value but loses independently edited Codex preferences.
 ## Set an override
 
 1. Open **Settings → Run defaults → Reasoning effort**.
-2. Pick the **Claude effort** or **Codex effort** level, or **Inherit**.
+2. Pick the **Claude effort** or **Codex effort** level, **Runtime default**, or **Inherit**.
 3. Click **Save Claude effort** or **Save Codex effort**.
 
 The controls currently offer five levels. Codex's additional `ultra` catalog

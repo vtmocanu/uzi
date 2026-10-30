@@ -67,12 +67,14 @@ describe("mock effort defaults vs fixtures/effort-defaults/cases.json", () => {
           const { settings } = await api.putMySettings({ [field]: c.input });
           expect(settings[field], `${c.id} ${field}`).toBe(c.stored);
         } else {
+          // Seed a known non-null value so "unchanged" cannot pass on leftover state.
+          await api.putMySettings({ [field]: "low" });
           await expect(api.putMySettings({ [field]: c.input }), `${c.id} ${field}`).rejects.toMatchObject({
             status: 400,
             message: "effort must be one of low, medium, high, xhigh, max or runtime",
           });
           const { settings } = await api.getMySettings();
-          expect(settings[field], `${c.id} ${field} unchanged`).toBeNull();
+          expect(settings[field], `${c.id} ${field} unchanged`).toBe("low");
         }
       }
       got.add(c.id);
