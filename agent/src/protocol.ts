@@ -746,8 +746,9 @@ export interface ActiveSnapshot {
    *  Only run_id/claim_generation; excludes finalize-pending records. Empty means complete empty
    *  coverage; omission means unavailable on older workers. Requires an accepted enclosing
    *  snapshot: duplicate active run IDs still reject it and provide no pending_all coverage.
-   *  The worker sends the full list even over the API identity-count limit; the API drops the
-   *  entire pending_all list when over that limit, never truncates it. No lifecycle authority. */
+   *  With no returned identity-count ceiling, workers omit coverage above the established
+   *  256-entry default. The API also rejects coverage above its configured ceiling, never
+   *  truncates it. No lifecycle authority. */
   pending_all?: { run_id: string; claim_generation: number }[];
   /** Negotiated separately from policy production; current fenced ownership only. */
   pending_policy_protection?: { run_id: string; owner_generation: number }[];

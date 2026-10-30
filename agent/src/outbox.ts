@@ -744,7 +744,12 @@ export class Outbox {
         recordBytes.set(rec.file, 0); // referenced file missing/gone; accounts as 0
       }
     }
-    this.runs.set(runId, { runId, manifest, recordBytes, terminals: new Map(), finalizes: new Map() });
+    const published = this.runs.get(runId);
+    if (published) {
+      // Boot manifest adoption must retain synchronous terminal selection too.
+      published.manifest = manifest;
+      published.recordBytes = recordBytes;
+    } else this.runs.set(runId, { runId, manifest, recordBytes, terminals: new Map(), finalizes: new Map() });
     if (manifest.spilledUnclean) this.uncleanAtInit.push(runId);
   }
 
@@ -756,10 +761,12 @@ export class Outbox {
   private terminalLoadBytes = 0;
   private readonly policyCatalogLimit = 1024;
   private readonly policyFlights = new Map<symbol, { runId: string; generation: number }>();
+  /** Only active subtree deletions; cleared after physical I/O settles, including failures. */
+  private readonly deletingRuns = new Set<string>();
 
   /** Reserve before entering a provider flight. Reservations are not pending outcomes. */
   reservePolicyFlight(runId: string, generation: number): symbol | undefined {
-    if (!this.validRunId(runId) || !Number.isSafeInteger(generation) || generation <= 0) return;
+    if (!this.validRunId(runId) || !Number.isSafeInteger(generation) || generation <= 0 || this.deletingRuns.has(runId.toLowerCase())) return;
     const candidate: TerminalMeta = { fileName: terminalFileName(generation), claimGeneration: generation,
       phaseAtJournal: "policy_pending", since: this.now(), blocked: false, outcomeKind: "unknown" };
     if (!this.admitPolicyMetadata(runId, candidate, false)) return;
@@ -775,7 +782,7 @@ export class Outbox {
   /** Publish protection synchronously, before capture or persistence can yield. */
   selectPolicyFlight(token: symbol, outcomeId: string): boolean {
     const flight = this.policyFlights.get(token);
-    if (!flight || !terminalRunUUID(outcomeId)) return false;
+    if (!flight || !terminalRunUUID(outcomeId) || this.deletingRuns.has(flight.runId.toLowerCase())) return false;
     const rs = this.ensureInMemoryRun(flight.runId, this.now());
     if (rs.terminals.has(flight.generation)) return false;
     rs.terminals.set(flight.generation, { fileName: terminalFileName(flight.generation),
@@ -789,6 +796,13 @@ export class Outbox {
    * Ordinary terminal metadata consumes no policy identity slots. */
   private admitPolicyMetadata(runId: string, candidate: TerminalMeta, existingAllowed = true): boolean {
     if (Buffer.byteLength(candidate.fileName) > 255 || Buffer.byteLength(candidate.phaseAtJournal) > 128 || Buffer.byteLength(runId) > 128) return false;
+    // Compact protection slot only: bodies have their own byte budget, symbols are
+    // process identities, and filesystem versions are observation bindings. This
+    // bounds encoded catalog data, not JavaScript object/Map heap overhead.
+    if (Buffer.byteLength(JSON.stringify([runId, candidate.fileName, candidate.claimGeneration,
+      candidate.phaseAtJournal, candidate.since, candidate.blocked, candidate.outcomeKind,
+      candidate.policyOutcomeId, candidate.selectedPayloadHash, candidate.blockedReason,
+      candidate.policyBytes, !!candidate.capturePending, !!candidate.budgetDeferred])) > 1024) return false;
     if (existingAllowed && this.runs.get(runId)?.terminals.has(candidate.claimGeneration)) return true;
     let count = this.policyFlights.size;
     for (const rs of this.runs.values()) {
@@ -1401,10 +1415,23 @@ export class Outbox {
     // separator/NUL) would escape the root, so refuse it here — the last line of
     // defense before `fs.rm(..., { recursive: true })` (H1).
     if (!this.validRunId(runId)) return;
-    if ([...(this.runs.get(runId)?.terminals.values() ?? [])].some(meta => meta.outcomeKind === "policy_hold" || meta.outcomeKind === "unknown")) return;
-    if (await this.hasPhysicalTerminalProtection(runId)) return;
-    await fs.rm(this.runDir(runId), { recursive: true, force: true }).catch(() => undefined);
-    this.runs.delete(runId);
+    const key = runId.toLowerCase();
+    // Reservations must survive until selection or explicit release. No await separates
+    // this check from publishing the deletion fence; reservation/selection are synchronous.
+    if (this.deletingRuns.size >= this.policyCatalogLimit || this.deletingRuns.has(key) ||
+        [...this.policyFlights.values()].some(flight => flight.runId.toLowerCase() === key)) return;
+    if ([...this.runs.values()].some(rs => rs.runId.toLowerCase() === key &&
+        [...rs.terminals.values()].some(meta => meta.outcomeKind === "policy_hold" || meta.outcomeKind === "unknown"))) return;
+    this.deletingRuns.add(key);
+    try {
+      if (await this.hasPhysicalTerminalProtection(runId)) return;
+      await fs.rm(this.runDir(runId), { recursive: true, force: true });
+      this.runs.delete(runId);
+    } catch {
+      // Failed or ambiguous removal retains memory evidence. The next caller may retry.
+    } finally {
+      this.deletingRuns.delete(key);
+    }
   }
 
   // ── read surfaces ──────────────────────────────────────────────────────────────
@@ -1620,6 +1647,9 @@ export class Outbox {
           since: selected?.since ?? this.now(), blocked: false, outcomeKind: fits ? "policy_hold" : "unknown",
           selectionToken: selected?.selectionToken,
           policyOutcomeId: (canonicalBody as unknown as PolicyHoldRequest).outcome_id,
+          selectedPayloadHash: createHash("sha256").update(terminalRetirementPayload({ run_id: runId,
+            claim_generation: claimGeneration, outcome_kind: outcomeKind, body: canonicalBody,
+            messages_through_seq: messagesThroughSeq, phase_at_journal: phaseAtJournal })).digest("hex"),
           ...(fits ? { unpersistedPolicy: Object.freeze({ ...canonicalBody }) as unknown as PolicyHoldRequest, policyBytes: bytes } : {}),
         };
         if (!this.admitPolicyMetadata(runId, meta)) return { journaled: false, reason: "reserve_exhausted" };
@@ -2437,6 +2467,10 @@ export class Outbox {
       since: t,
       updatedAt: t,
     };
+    // Selection can publish an in-memory run while mkdir/fsync is pending.
+    // Reuse that exact state rather than overwriting its protected terminals.
+    const published = this.runs.get(runId);
+    if (published) return published;
     const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map(), finalizes: new Map() };
     this.runs.set(runId, rs);
     return rs;
@@ -2774,7 +2808,14 @@ export class Outbox {
             let bytes = this.terminalReadMaxBytes;
             try { bytes = (await fs.lstat(path.join(this.runDir(this.terminalScanRun.id), entry.name))).size; } catch { /* inspection records uncertainty */ }
             checkProofBudget(budget);
-            const cap = Math.min(remaining, this.terminalReadMaxBytes, runRemaining, bytes);
+            const individualCap = Math.min(this.terminalReadMaxBytes, this.runMaxBytes, this.maxBytes);
+            if (bytes <= individualCap && (bytes > remaining || bytes > runRemaining)) {
+              // This valid-sized record belongs to the next page, not the oversized
+              // rejection class. Retain its exact frontier and deferred evidence.
+              this.terminalScanFrontier = entry.name;
+              break;
+            }
+            const cap = Math.min(remaining, individualCap, runRemaining, bytes);
             const result = await this.inspectTerminal(this.terminalScanRun.id, parseTerminalFileName(entry.name), entry.name, budget, cap);
             remaining -= cap;
             runRemaining -= cap;
@@ -2789,8 +2830,9 @@ export class Outbox {
             this.terminalScanRoot = undefined;
             const version = fileVersion(await fs.lstat(this.root, { bigint: true }));
             if (version !== this.terminalScanRootVersion) this.terminalScanIncomplete = true;
-            page.passComplete = !this.terminalScanIncomplete;
-            this.terminalInventoryComplete = page.passComplete;
+            // EOF controls scheduling; it cannot certify coverage of skipped or unsafe scope.
+            page.passComplete = true;
+            this.terminalInventoryComplete = !this.terminalScanIncomplete;
             this.terminalScanIncomplete = false;
             break;
           }

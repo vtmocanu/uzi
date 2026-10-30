@@ -173,6 +173,7 @@ test("unsafe generations stay unknown, leading-zero aliases preserve exact names
   const unsafe = all.find(o => o.fileName === "terminal-9007199254740993.json")!;
   assert.equal(unsafe.generation, undefined);
   assert.equal(unsafe.kind, "malformed");
+  assert.equal(box.policyInventoryCoverageAvailable(), false, "EOF does not certify unsafe source coverage");
   assert.ok((await box.scanTerminalObservationsPage()).observations.length > 0);
   await box.retireRun(run);
   assert.ok(await fs.stat(path.join(root, run, unsafe.fileName)));

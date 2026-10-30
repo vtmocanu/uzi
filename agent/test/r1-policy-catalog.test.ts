@@ -88,6 +88,9 @@ it("same-config boot budget deferral allows fresh demand reads of every signed o
   const restarted = make();
   await restarted.init();
   assert.ok(restarted.listPendingTerminals().some(p => p.outcome_kind === "unknown"));
+  const page = await restarted.scanTerminalObservationsPage();
+  assert.equal(page.observations.some(o => o.kind === "oversized"), false);
+  await restarted.closeTerminalObservationScan();
   for (let generation = 1; generation <= 8; generation++)
     assert.equal((await restarted.readTerminalJournal(run, generation))?.body.status, "failed");
   assert.equal(await restarted.hasPendingPolicyOutcome(other), false);

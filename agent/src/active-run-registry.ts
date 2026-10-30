@@ -249,10 +249,13 @@ export class ActiveRunRegistry {
   claimsPausedByPendingOverflow(scoped = false): boolean {
     const pending = this.pendingOutcomes();
     const projection = this.projection(pending);
-    if (!scoped) return projection.unknown || projection.leases.length > this.effectiveCap();
-    if (this.coverageGetter?.() === false) return true;
-    const groups = new Set(pending.filter(p => this.isPolicy(p)).map(p => p.run_id.toLowerCase()));
-    const ordinary = this.leasable(pending).filter(p => !groups.has(p.run_id.toLowerCase()));
+    if (!scoped) return this.coverageGetter?.() === false || projection.unknown ||
+      projection.leases.length > this.effectiveCap();
+    if (this.pendingWire(projection.sources).pending_all === undefined) return true;
+    const groups = new Set(pending.filter(p => this.isPolicy(p) &&
+      this.policyOwnership.get(p.run_id)?.generation !== null).map(p => p.run_id.toLowerCase()));
+    const ordinary = this.leasable(pending.filter(p => !this.isPolicy(p)))
+      .filter(p => !groups.has(p.run_id.toLowerCase()));
     return groups.size + ordinary.length > this.effectiveCap();
   }
 
@@ -264,7 +267,13 @@ export class ActiveRunRegistry {
    *  cap 0. Physical protection and custody still keep it via the outbox's listPendingTerminals /
    *  hasPendingTerminal, which are unchanged. */
   private leasable(pending: PendingTerminal[]): PendingTerminal[] {
-    return pending.filter((p) => p.blocked_reason !== "run_not_owned");
+    const tuples = new Set<string>();
+    return pending.filter(p => {
+      const key = p.run_id + "/" + p.claim_generation;
+      if (tuples.has(key)) return false;
+      tuples.add(key);
+      return p.blocked_reason !== "run_not_owned";
+    });
   }
 
   private isPolicy(p: PendingTerminal): boolean {
@@ -330,14 +339,25 @@ export class ActiveRunRegistry {
   }
 
   private pendingOutcomes(): PendingTerminal[] {
-    const seen = new Set<string>();
-    return (this.pendingLister?.() ?? []).filter(entry => {
-      if (entry.server_settled === true) return false;
-      const key = entry.run_id.toLowerCase() + "/" + entry.claim_generation;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    }).map(entry => ({ ...entry, run_id: entry.run_id.toLowerCase() }));
+    // Preserve every source of protection. Case aliases can have the same wire
+    // tuple but different authenticated/unknown evidence. Ordinary leases retain
+    // their legacy first-source rule; pending_all deduplicates only on the wire.
+    return (this.pendingLister?.() ?? []).filter(entry => entry.server_settled !== true)
+      .map(entry => ({ ...entry, run_id: entry.run_id.toLowerCase() }));
+  }
+
+  /** No ceiling is returned by the API. Use its established 256-entry default
+   * independently of the pending lease cap; custom smaller server limits still reject
+   * coverage conservatively. Omission never asserts a complete inventory. */
+  private pendingWire(sources: PendingTerminal[]): Pick<ActiveSnapshot, "pending_all"> {
+    if (this.coverageGetter?.() === false) return {};
+    const tuples = new Map<string, { run_id: string; claim_generation: number }>();
+    for (const p of sources) {
+      tuples.set(p.run_id + "/" + p.claim_generation,
+        { run_id: p.run_id, claim_generation: p.claim_generation });
+      if (tuples.size > 256) return {};
+    }
+    return { pending_all: [...tuples.values()] };
   }
 
   /**
@@ -359,9 +379,9 @@ export class ActiveRunRegistry {
     return {
       snapshot_epoch: this.epoch,
       active: [],
-      pending_overflow: projection.unknown || projection.leases.length > 0 ||
+      pending_overflow: this.coverageGetter?.() === false || projection.unknown || projection.leases.length > 0 ||
         pending.some(p => !this.isPolicy(p)),
-      ...(this.coverageGetter?.() !== false ? { pending_all: pending.map((p) => ({ run_id: p.run_id, claim_generation: p.claim_generation })) } : {}),
+      ...this.pendingWire(pending),
       // Issue #1742: the finalize-pending set the caller captured for this register. The key is
       // omitted when empty, and build() (heartbeat/claim) never carries it.
       ...(finalizeResume.length > 0
@@ -401,7 +421,8 @@ export class ActiveRunRegistry {
 
     // Pending-terminal entries, deterministically selected so the `active` array never lists more
     // than `cap` of them (the api rejects an over-cap snapshot whole).
-    for (const p of this.selectPendingForBuild(pending)) {
+    const wireRoom = Math.max(0, 256 - active.length);
+    for (const p of this.selectPendingForBuild(pending, wireRoom)) {
       active.push({
         run_id: p.run_id,
         claim_generation: p.claim_generation,
@@ -416,9 +437,10 @@ export class ActiveRunRegistry {
     return {
       snapshot_epoch: this.epoch,
       active,
-      pending_overflow: projection.unknown || pending.length > this.effectiveCap(),
-      ...(this.coverageGetter?.() !== false ? { pending_all: projection.sources.map((p) => ({ run_id: p.run_id, claim_generation: p.claim_generation })) } : {}),
-      ...(scoped && this.coverageGetter?.() !== false ? { pending_policy_protection: [...new Set(projection.sources.filter(p => this.isPolicy(p)).map(p => p.run_id))]
+      pending_overflow: this.coverageGetter?.() === false || projection.unknown ||
+        pending.length > Math.min(this.effectiveCap(), wireRoom),
+      ...this.pendingWire(projection.sources),
+      ...(scoped && this.pendingWire(projection.sources).pending_all !== undefined ? { pending_policy_protection: [...new Set(projection.sources.filter(p => this.isPolicy(p)).map(p => p.run_id))]
         .flatMap(run_id => {
           const owner_generation = this.policyOwnership.get(run_id)?.generation;
           return typeof owner_generation === "number" && owner_generation > 0 ? [{ run_id, owner_generation }] : [];
@@ -434,10 +456,10 @@ export class ActiveRunRegistry {
    * `omitted + 1` snapshots and no more than `cap` are ever listed. A 0/undefined cap lists NONE (the
    * cap-independent floor: the empty subset + overflow protects them all via #1390's exclusion).
    */
-  private selectPendingForBuild(pending: PendingTerminal[]): PendingTerminal[] {
+  private selectPendingForBuild(pending: PendingTerminal[], wireRoom = 256): PendingTerminal[] {
     const count = pending.length;
     if (count === 0) return [];
-    const cap = this.effectiveCap();
+    const cap = Math.min(this.effectiveCap(), wireRoom);
     if (cap === 0) return []; // overflow-only protection; nothing may be listed
     if (count <= cap) return [...pending].sort(blockedFirstOldest);
 
