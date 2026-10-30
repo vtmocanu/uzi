@@ -10177,6 +10177,14 @@ describe("production session-seed cleanup (#2324)", () => {
     let adopted = 0;
     const deps: CodexExecutorDeps = {
       ...rig.deps,
+      // Issue #3642: the idle and wall timers are armed before the harness lazily
+      // launches the provider root, so this real-filesystem seeding (4,400 sequential
+      // writes) and the production seed teardown run inside the turn. A trip does not
+      // interrupt the seam; it replaces the launcher sentinel's error, so makeRig's
+      // incidental 5 s budgets could mask the result on a slow filesystem. Test-only:
+      // production defaults are unchanged and the 120 s per-test timeout still bounds this.
+      idleMs: 60_000,
+      wallMs: 60_000,
       launchProviderRoot: async () => { throw launchSentinel; },
       provisionRunTools: async () => ({ toolEnv: {} }),
       spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls),
