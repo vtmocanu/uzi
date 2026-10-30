@@ -1,9 +1,12 @@
 package workersvc
 
 import (
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -128,7 +131,7 @@ func (c *claimantExhaustion) claimAndRun(t *testing.T, wkr store.Worker, run uui
 	if _, applied, err := c.svc.SetState(c.env.ctx, wkr, run, StateRequest{State: "running", ClaimGeneration: &gen}); err != nil || !applied {
 		t.Fatalf("running report gen %d: applied=%v err=%v", wantGen, applied, err)
 	}
-	c.env.exec(`UPDATE runs SET status_since=now()-interval '3 hours', budget_wall_seconds=86400 WHERE id=$1`, run)
+	c.env.exec(`UPDATE runs SET status_since=now()-interval '3 hours' WHERE id=$1`, run)
 }
 
 // omitHeartbeat is the real Heartbeat carrying a valid, empty active-run snapshot.
@@ -145,17 +148,35 @@ func (c *claimantExhaustion) omitHeartbeat(t *testing.T, workerID uuid.UUID) {
 type runFacts struct {
 	status, cause string
 	released      bool
-	requeues      int32
+	requeues      int64
+	evidence      []byte // runs.worker_recovery_evidence as JSON text; nil when NULL
 }
 
 func (c *claimantExhaustion) facts(t *testing.T, run uuid.UUID) runFacts {
 	t.Helper()
 	var f runFacts
-	if err := c.env.pool.QueryRow(c.env.ctx, `SELECT status,COALESCE(recovery_wait_cause,''),claim_released_at IS NOT NULL,requeue_count
-	  FROM runs WHERE id=$1`, run).Scan(&f.status, &f.cause, &f.released, &f.requeues); err != nil {
+	if err := c.env.pool.QueryRow(c.env.ctx, `SELECT status,COALESCE(recovery_wait_cause,''),claim_released_at IS NOT NULL,requeue_count,
+	  worker_recovery_evidence::text
+	  FROM runs WHERE id=$1`, run).Scan(&f.status, &f.cause, &f.released, &f.requeues, &f.evidence); err != nil {
 		t.Fatalf("read run: %v", err)
 	}
 	return f
+}
+
+// requireCustodyUncertainEvidence proves the exhaustion classifier read the evidence successfully
+// and saw only the open custody hold: a failed evidence read parks with Unknown instead.
+func requireCustodyUncertainEvidence(t *testing.T, f runFacts) {
+	t.Helper()
+	if f.evidence == nil {
+		t.Fatalf("worker_recovery_evidence is NULL at exhaustion: %+v", f)
+	}
+	var ev store.WorkerRecoveryEvidence
+	if err := json.Unmarshal(f.evidence, &ev); err != nil {
+		t.Fatalf("decode worker_recovery_evidence %s: %v", f.evidence, err)
+	}
+	if !ev.CustodyUncertain || ev.Unknown || ev.AvailableCapture || ev.CaptureUncertain || ev.PublicationUncertain || ev.CheckpointTip != nil {
+		t.Fatalf("worker_recovery_evidence = %s, want custody_uncertain=true and every other signal false/null", f.evidence)
+	}
 }
 
 func (c *claimantExhaustion) requireAllHoldsOpen(t *testing.T, run uuid.UUID, want int) {
@@ -181,7 +202,7 @@ func claimantHandoffMatrix(t *testing.T, env codexTestEnv) {
 	}{{"guarded", true}, {"legacy_api_only", false}} {
 		for _, kind := range []string{"issue", "mr_rework"} {
 			for _, maxRequeues := range []int{0, 3} {
-				name := claimKind.name + "/" + kind + "/max" + string(rune('0'+maxRequeues))
+				name := claimKind.name + "/" + kind + fmt.Sprintf("/max%d", maxRequeues)
 				t.Run(name, func(t *testing.T) {
 					c := newClaimantExhaustion(t, env, claimKind.guarded, maxRequeues)
 					run := c.seedKind(t, kind)
@@ -191,7 +212,7 @@ func claimantHandoffMatrix(t *testing.T, env codexTestEnv) {
 						c.omitHeartbeat(t, c.workerID)
 						f := c.facts(t, run)
 						if gen <= int64(maxRequeues) {
-							if f.status != "queued" || f.requeues != int32(gen) || f.released { //nolint:gosec // G115: gen is bounded by the matrix (<= 3)
+							if f.status != "queued" || f.requeues != gen || f.released {
 								t.Fatalf("after omission %d: %+v, want queued with requeue_count %d", gen, f, gen)
 							}
 							c.requireAllHoldsOpen(t, run, int(gen))
@@ -200,6 +221,7 @@ func claimantHandoffMatrix(t *testing.T, env codexTestEnv) {
 						if f.status != "recovery_wait" || f.cause != "worker_requeue_exhausted" || !f.released {
 							t.Fatalf("at the cap: %+v, want recovery_wait/worker_requeue_exhausted with the claim released", f)
 						}
+						requireCustodyUncertainEvidence(t, f)
 						c.requireAllHoldsOpen(t, run, int(gen))
 						return
 					}
@@ -212,28 +234,38 @@ func claimantHandoffMatrix(t *testing.T, env codexTestEnv) {
 // (a) An owner Cancel stamped between requeues ends cancelled, and the cancel does not release
 // custody: every generation's hold stays open.
 func claimantHandoffOwnerCancel(t *testing.T, env codexTestEnv) {
+	// maxRequeues 3: the cancel lands mid-budget. maxRequeues 1: generation 2's omission is the
+	// exhausting cycle, so the stamped cancel must win over worker_requeue_exhausted.
 	for _, guarded := range []bool{true, false} {
-		name := "guarded"
-		if !guarded {
-			name = "legacy_api_only"
+		for _, maxRequeues := range []int{3, 1} {
+			name := "guarded"
+			if !guarded {
+				name = "legacy_api_only"
+			}
+			name += fmt.Sprintf("/max%d", maxRequeues)
+			t.Run(name, func(t *testing.T) {
+				c := newClaimantExhaustion(t, env, guarded, maxRequeues)
+				run := c.seedKind(t, "issue")
+				c.claimAndRun(t, c.wkr, run, 1, guarded)
+				c.omitHeartbeat(t, c.workerID)
+				if f := c.facts(t, run); f.status != "queued" || f.requeues != 1 {
+					t.Fatalf("first omission: %+v, want queued", f)
+				}
+				c.claimAndRun(t, c.wkr, run, 2, guarded)
+				// The owner's Cancel verdict stamps runs.stop_kind while the run is still running.
+				if _, err := c.env.q.CreateStopVerdictInput(c.env.ctx, store.CreateStopVerdictInputParams{
+					RunID: run, Kind: "cancel", StopKind: pgtype.Text{String: "cancelled", Valid: true},
+				}); err != nil {
+					t.Fatalf("CreateStopVerdictInput(cancel): %v", err)
+				}
+				c.omitHeartbeat(t, c.workerID)
+				f := c.facts(t, run)
+				if f.status != "cancelled" {
+					t.Fatalf("after owner cancel and omission: %+v, want cancelled", f)
+				}
+				c.requireAllHoldsOpen(t, run, 2)
+			})
 		}
-		t.Run(name, func(t *testing.T) {
-			c := newClaimantExhaustion(t, env, guarded, 3)
-			run := c.seedKind(t, "issue")
-			c.claimAndRun(t, c.wkr, run, 1, guarded)
-			c.omitHeartbeat(t, c.workerID)
-			if f := c.facts(t, run); f.status != "queued" || f.requeues != 1 {
-				t.Fatalf("first omission: %+v, want queued", f)
-			}
-			c.claimAndRun(t, c.wkr, run, 2, guarded)
-			c.env.exec(`UPDATE runs SET stop_kind='cancelled' WHERE id=$1`, run)
-			c.omitHeartbeat(t, c.workerID)
-			f := c.facts(t, run)
-			if f.status != "cancelled" {
-				t.Fatalf("after owner cancel and omission: %+v, want cancelled", f)
-			}
-			c.requireAllHoldsOpen(t, run, 2)
-		})
 	}
 }
 
@@ -272,6 +304,7 @@ func claimantHandoffOwnershipChange(t *testing.T, env codexTestEnv) {
 			if f.status != "recovery_wait" || f.cause != "worker_requeue_exhausted" || !f.released {
 				t.Fatalf("exhaustion on the new owner: %+v, want recovery_wait/worker_requeue_exhausted", f)
 			}
+			requireCustodyUncertainEvidence(t, f)
 			c.requireAllHoldsOpen(t, run, 2)
 		})
 	}
