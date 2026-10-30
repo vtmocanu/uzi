@@ -31,7 +31,7 @@ function breakdown(u: RunUsage): { fresh: number; cached: number; out: number; t
 // non-positive factory total to all zeros; forcing 100 is correct only because the
 // rows partition the factory total (AdminUsagePerUser and AdminUsageTotals sum the
 // same non-chat runs).
-function tokenShares(totals: number[], factoryTotal: number): number[] {
+function costShares(totals: number[], factoryTotal: number): number[] {
   if (factoryTotal <= 0) return totals.map(() => 0);
   const scaled = totals.map((t) => t * 100);
   const floors = scaled.map((s) => Math.floor(s / factoryTotal));
@@ -265,9 +265,10 @@ export function UsageCard({ self, admin, window, onWindowChange }: {
   );
 }
 
-function Th({ children, left }: { children: ReactNode; left?: boolean }) {
+function Th({ children, left, title }: { children: ReactNode; left?: boolean; title?: string }) {
   return (
     <th
+      title={title}
       className={
         "border-b border-edge px-2.5 py-1.5 text-[10.5px] font-semibold uppercase tracking-[0.06em] text-faint " +
         (left ? "text-left" : "text-right")
@@ -322,9 +323,12 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
     selectedOutcomes: recent ? u.last7_outcomes! : u.outcomes,
     subscription: recent ? u.last7_subscription_run_count! : u.subscription_run_count,
     unreported: recent ? u.last7_unreported_run_count! : u.unreported_run_count,
-  })).sort((a, b) => b.b.total - a.b.total || b.b.cost - a.b.cost || b.b.out - a.b.out ||
+  })).sort((a, b) => b.b.cost - a.b.cost || b.b.total - a.b.total || b.b.out - a.b.out ||
     (a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0));
-  const shares = tokenShares(rows.map((r) => r.b.total), factory.total);
+  const factoryMicroUSD = Math.round(factory.cost * 1e6);
+  const shares = factoryMicroUSD > 0
+    ? costShares(rows.map((r) => Math.round(r.b.cost * 1e6)), factoryMicroUSD)
+    : undefined;
   const factoryRuns = recent ? rows.reduce((sum, u) => sum + u.selectedRuns, 0) : admin.factory.run_count;
   const factoryDisclosure = aggregateDisclosure(
     recent ? admin.factory.last7_subscription_run_count : admin.factory.lifetime_subscription_run_count,
@@ -347,14 +351,14 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
                 <Th>Tokens</Th>
                 <Th>Out</Th>
                 <Th>Cost</Th>
-                <Th>Share</Th>
+                <Th title="Share of recorded API-equivalent cost in the selected period">Cost share</Th>
               </tr>
             </thead>
             <tbody>
               {rows.map((u, i) => {
-                // Rank and Share both use total tokens, including subscription runs.
-                // Largest-remainder rounding (see tokenShares) so the column sums to 100%.
-                const pct = shares[i];
+                // Rank uses unrounded recorded cost; shares use integer microdollars.
+                // Largest-remainder rounding (see costShares) makes shares sum to 100%.
+                const pct = shares?.[i];
                 // This user's selected cost_usd includes recorded partial costs —
                 // disclose their own subscription/unreported counts beside it rather than
                 // let the dollar figure read as their complete total.
@@ -377,16 +381,20 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
                       )}
                     </Td>
                     <Td>
-                      <span className="inline-flex items-center justify-end gap-2 whitespace-nowrap">
-                        {pct}%
-                        <span
-                          className="inline-block h-1 w-16 overflow-hidden rounded bg-edge align-middle"
-                          role="img"
-                          aria-label={`${pct} percent of factory tokens`}
-                        >
-                          <span className="block h-full bg-brand" style={{ width: `${pct}%` }} />
+                      {pct === undefined ? (
+                        <span title="Cost share unavailable: no recorded factory cost in the selected period">—</span>
+                      ) : (
+                        <span className="inline-flex items-center justify-end gap-2 whitespace-nowrap">
+                          {pct}%
+                          <span
+                            className="inline-block h-1 w-16 overflow-hidden rounded bg-edge align-middle"
+                            role="img"
+                            aria-label={`${pct} percent of recorded factory cost`}
+                          >
+                            <span className="block h-full bg-brand" style={{ width: `${pct}%` }} />
+                          </span>
                         </span>
-                      </span>
+                      )}
                     </Td>
                   </tr>
                 );

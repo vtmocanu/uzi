@@ -18,7 +18,7 @@ func (h *Handler) mountSchedulesRoutes(r chi.Router, forgeLimiter *mw.Limiter) {
 	// (it fires through the seam), so only it carries the per-user forge limiter,
 	// matching CreateRun's posture; create/get/patch/delete/preview do not.
 	r.Route("/schedules", func(r chi.Router) {
-		r.Use(mw.RequireUser(h.q, h.cfg))
+		r.Use(h.requireUser())
 		r.Post("/preview", h.PreviewSchedule)
 		// The user-level pause-all singleton (PRD #1093 D7): a dedicated resource under
 		// this RequireUser group so a uzc_ CLI token reaches it (PUT /me/settings is
@@ -55,5 +55,5 @@ func (h *Handler) mountSchedulesRoutes(r chi.Router, forgeLimiter *mw.Limiter) {
 	// The builtin default-schedule catalog (PRD #589 M2): the 6 shipped default jobs plus
 	// the caller's per-repo enablement state. RequireUser (session OR CLI token), no repo
 	// in the path — enablement is owner-scoped by the query's user_id.
-	r.With(mw.RequireUser(h.q, h.cfg)).Get("/schedule-catalog", h.ScheduleCatalog)
+	r.With(h.requireUser()).Get("/schedule-catalog", h.ScheduleCatalog)
 }

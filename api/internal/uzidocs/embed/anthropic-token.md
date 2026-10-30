@@ -500,9 +500,11 @@ whether personal credentials use password protection. The same choice covers
   to open those credentials, subject to password strength and retained
   master-sealed copies. A compromised running server can still read them
   while unlocked. Password login unlocks the vault; its key stays in server
-  memory until **Lock vault** or a server restart. After a restart, unlock
-  before new runs can start. Forgotten passwords leave protected contents
-  unrecoverable; you must re-enter credentials.
+  memory until **Lock vault** or a server restart. After a restart, an
+  eligible foreground browser request can re-unlock with a live browser
+  grant; otherwise unlock with your password or vault passphrase. Losing
+  both that secret and remaining usable key material makes protected
+  contents unrecoverable; there is no recovery workflow.
 - **Off (unprotected)** still encrypts credentials at rest, using the server
   key like forge bot tokens. Theft of both the database and server key exposes
   them. There is no vault wrapper, unlock step or lock notice; runs and usage
@@ -515,6 +517,45 @@ to a password account retains its mode and password-based vault semantics.
 To turn Off, first unlock your protected vault; your administrator must allow
 optional protection. Login, seed startup and ordinary unlock do not turn
 protection On for an Off account.
+
+### Re-unlock after a restart
+
+**Re-unlock automatically in this browser** in Settings is on by default.
+Despite the label, this is **account-wide permission**: turning it off revokes
+every browser's grants. Turning it on alone creates no grant; verify your
+password/passphrase through interactive unlock, password login or enrollment.
+An SSO callback does not mint a grant.
+
+On HTTPS, the browser receives a Secure, HttpOnly, SameSite=Strict, host-only
+cookie scoped to /api. With a valid session and its CSRF header, an eligible
+foreground request can restore your vault after restart. Hidden-tab polling,
+passive requests and WebSocket connections do not restore it. On HTTP there
+is no secret browser cookie; unlock manually after restart.
+
+Runs of a user who keeps the vault still wait after a restart until that user opens or focuses a uzi tab.
+
+The CLI does not get a keyslot here.
+This does not provide unattended continuity. You can still use
+[`uzi vault unlock`](./cli.md#vault-check-status-and-unlock) manually.
+
+The administrator's browser grant lifetime defaults to **7 days**, adjustable
+from **1 to 30 days**. A grant expires at the earlier of that lifetime and the
+session expiry at mint time; session refresh does not extend it. Lowering the
+setting affects new grants. Expiry does not lock an already unlocked vault.
+Up to **32 browser grants** are retained per account; newer grants can displace
+the oldest. Browser identity survives session refresh; fresh login gets a new
+identity.
+
+**Lock vault** revokes browser grants and locks the vault. Global logout
+revokes sessions and grants but leaves an already cached vault key available
+to runs. Turning off automatic re-unlock revokes grants without locking an
+already unlocked vault. Password changes, turning protection Off, vault
+recreation and account deactivation also revoke grants. A usable browser grant
+or cached key can preserve access after a forgotten password, but this adds
+no password-reset or passphrase-recovery feature. See the
+[threat model](./vault-threat-model.md#browser-re-unlock) for cookie-theft risks.
+
+### Enrollment and conversion
 
 New users start Off on an optional-policy instance and protected on a
 required-policy instance. If your administrator later requires protection,

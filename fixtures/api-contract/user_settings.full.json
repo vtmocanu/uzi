@@ -1,4 +1,5 @@
 {
+  "vault_auto_reunlock": true,
   "cross_check_pins": [
     {
       "stage": "x",

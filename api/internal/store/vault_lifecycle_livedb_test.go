@@ -151,8 +151,9 @@ func vlSeed(t *testing.T, pool *pgxpool.Pool, explicit, mixed bool) vlFixture {
 }
 
 // JSONB captures every column, including timestamps and future metadata. Full
-// snapshots include user mode/epoch/hash and wrappers; metadata excludes only
-// the four account crypto columns and the two personal-secret crypto columns.
+// snapshots include all user columns and wrappers. Metadata excludes lifecycle
+// mode/epoch/slot generation (asserted separately), the four account crypto
+// columns and the two personal-secret crypto columns.
 func (f vlFixture) snapshot(t *testing.T, metadata bool) []byte {
 	t.Helper()
 	personalSQL, accountSQL := "to_jsonb(s)", "to_jsonb(a)"
@@ -162,7 +163,7 @@ func (f vlFixture) snapshot(t *testing.T, metadata bool) []byte {
 	}
 	query := "SELECT jsonb_build_object('secrets',coalesce((SELECT jsonb_agg(" + personalSQL + " ORDER BY s.id) FROM user_secrets s WHERE user_id=$1),'[]'::jsonb),'accounts',coalesce((SELECT jsonb_agg(" + accountSQL + " ORDER BY a.id) FROM codex_provider_account a WHERE user_id=$1),'[]'::jsonb)"
 	if metadata {
-		query += ",'user_metadata',(SELECT to_jsonb(u)-ARRAY['vault_mode','vault_epoch'] FROM users u WHERE id=$1)"
+		query += ",'user_metadata',(SELECT to_jsonb(u)-ARRAY['vault_mode','vault_epoch','vault_slot_generation'] FROM users u WHERE id=$1)"
 	} else {
 		query += ",'user',(SELECT to_jsonb(u) FROM users u WHERE id=$1),'wrapper',(SELECT to_jsonb(v) FROM user_vaults v WHERE user_id=$1)"
 	}
@@ -172,6 +173,18 @@ func (f vlFixture) snapshot(t *testing.T, metadata bool) []byte {
 		t.Fatal(err)
 	}
 	return out
+}
+
+// Slot generation is mutable lifecycle data, not unrelated user metadata.
+func (f vlFixture) slotGeneration(t *testing.T, want int64, what string) {
+	t.Helper()
+	user, err := store.New(f.pool).GetUserByID(context.Background(), f.owner)
+	if err != nil {
+		t.Fatal("read slot generation failed")
+	}
+	if user.VaultSlotGeneration != want {
+		t.Fatalf("%s slot generation = %d; want %d", what, user.VaultSlotGeneration, want)
+	}
 }
 
 func vlEqual(t *testing.T, before, after []byte, what string) {
@@ -288,6 +301,7 @@ func TestVaultLifecycleRoundTripLiveDB(t *testing.T) {
 				ctx := context.Background()
 				f := vlSeed(t, pool, explicit, mixed)
 				metadata := f.snapshot(t, true)
+				f.slotGeneration(t, 0, "initial")
 				v := vault.NewPostgres(f.master, pool)
 				if !v.RequiresUnlock(ctx, f.owner) {
 					t.Fatal("initial protected owner did not require unlock")
@@ -298,11 +312,13 @@ func TestVaultLifecycleRoundTripLiveDB(t *testing.T) {
 				f.state(t, v, store.VaultModeProtected, 1, true, true)
 				f.readable(t, v, store.SealedWithDEK)
 				vlEqual(t, metadata, f.snapshot(t, true), "unlock metadata")
+				f.slotGeneration(t, 1, "initial unlock")
 				// Existing-wrapper unlock exercises both the no-work fast path and
 				// locked, current-material rewrap of personal and BOTH account slots.
 				if err := v.UnlockExisting(ctx, f.owner, vlLoginPhrase); err != nil {
 					t.Fatal(err)
 				}
+				f.slotGeneration(t, 1, "no-work existing unlock")
 				legacy := func(value string) []byte {
 					t.Helper()
 					ct, err := f.master.Seal([]byte(value))
@@ -314,18 +330,21 @@ func TestVaultLifecycleRoundTripLiveDB(t *testing.T) {
 				vlExec(t, pool, "UPDATE user_secrets SET ciphertext=$2,sealed_with='master' WHERE user_id=$1 AND kind='anthropic_token'", f.owner, legacy("secret-anthropic_token"))
 				vlExec(t, pool, "UPDATE codex_provider_account SET sealed_login=$2,sealed_with='master',recovery_sealed=$3,recovery_sealed_with='master' WHERE user_id=$1 AND provider_user_id='principal-0'", f.owner, legacy("live-0"), legacy("recovery-0"))
 				v.Lock(f.owner)
+				f.slotGeneration(t, 2, "explicit lock revocation")
 				if err := v.UnlockExisting(ctx, f.owner, vlLoginPhrase); err != nil {
 					t.Fatal(err)
 				}
 				f.state(t, v, store.VaultModeProtected, 1, true, true)
 				f.readable(t, v, store.SealedWithDEK)
 				vlEqual(t, metadata, f.snapshot(t, true), "existing unlock metadata")
+				f.slotGeneration(t, 2, "same-epoch existing unlock")
 				if err := v.Disable(ctx, f.owner); err != nil {
 					t.Fatal(err)
 				}
 				f.state(t, v, store.VaultModeUnprotected, 2, false, false)
 				f.readable(t, v, store.SealedWithMasterAAD)
 				vlEqual(t, metadata, f.snapshot(t, true), "disable metadata")
+				f.slotGeneration(t, 3, "disable")
 
 				restarted := vault.NewPostgres(f.master, pool)
 				if restarted.RequiresUnlock(ctx, f.owner) {
@@ -341,11 +360,13 @@ func TestVaultLifecycleRoundTripLiveDB(t *testing.T) {
 					t.Fatal(err)
 				}
 				vlEqual(t, before, f.snapshot(t, false), "off unlock durable snapshot")
+				f.slotGeneration(t, 3, "off unlock")
 				f.state(t, restarted, store.VaultModeUnprotected, 2, false, false)
 				if err := restarted.Enable(ctx, f.owner, "wrong-current-password"); !errors.Is(err, vault.ErrWrongPassword) {
 					t.Fatalf("wrong password: %v", err)
 				}
 				vlEqual(t, before, f.snapshot(t, false), "wrong-password enable snapshot")
+				f.slotGeneration(t, 3, "wrong-password enable")
 				f.state(t, restarted, store.VaultModeUnprotected, 2, false, false)
 				if err := restarted.Enable(ctx, f.owner, vlLoginPhrase); err != nil {
 					t.Fatal(err)
@@ -353,6 +374,7 @@ func TestVaultLifecycleRoundTripLiveDB(t *testing.T) {
 				f.state(t, restarted, store.VaultModeProtected, 3, true, true)
 				f.readable(t, restarted, store.SealedWithDEK)
 				vlEqual(t, metadata, f.snapshot(t, true), "enable metadata")
+				f.slotGeneration(t, 4, "enable")
 				cold := vault.NewPostgres(f.master, pool)
 				if !cold.RequiresUnlock(ctx, f.owner) || cold.Unlocked(f.owner) {
 					t.Fatal("protected restart retained private key")

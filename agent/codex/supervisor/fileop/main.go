@@ -39,7 +39,7 @@
 // lines and are neither partial nor truncated. LF belongs to its source line;
 // BOM/CRLF are preserved and terminal LF creates no phantom line.
 //
-// read_range reads at most 8 MiB (including prefetch/lookahead), in chunks at most
+// read_range reads at most 64 MiB (including prefetch/lookahead), in chunks at most
 // 32 KiB, and returns at most 64 KiB, retreating to a UTF-8 boundary. It validates
 // skipped and selected text through the requested LF or the output ceiling,
 // completing only a codepoint crossing that ceiling. Raw one-byte lookahead proves

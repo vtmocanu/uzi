@@ -799,6 +799,14 @@ func run() error {
 
 	sweep := sweeper.New(wsvc, cfg.SweepInterval,
 		sweeper.Pass{
+			Name: "vault_browser_slots_expired",
+			Run: func(ctx context.Context) (int64, error) {
+				return q.DeleteExpiredVaultBrowserSlots(ctx, store.DeleteExpiredVaultBrowserSlotsParams{
+					ObservedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, BatchSize: 256,
+				})
+			},
+		},
+		sweeper.Pass{
 			Name: "hosted_tokens_expired",
 			Run: func(ctx context.Context) (int64, error) {
 				return hostedsvc.ExpirePendingTokens(ctx, q, cfg.HostedTokenTTL)

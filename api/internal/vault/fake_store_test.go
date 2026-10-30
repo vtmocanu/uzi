@@ -141,4 +141,13 @@ func (f *fakeVaultStore) ClaimVaultLockNotice(_ context.Context, id uuid.UUID) (
 	return id, nil
 }
 
+func (f *fakeVaultStore) RevokeVaultBrowserSlots(ctx context.Context, id uuid.UUID) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := f.state(id)
+	s.VaultSlotGeneration++
+	f.states[id] = s
+	return s.VaultSlotGeneration, ctx.Err()
+}
+
 var _ Store = (*fakeVaultStore)(nil)

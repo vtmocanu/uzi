@@ -6,7 +6,9 @@ SELECT vault_mode, vault_epoch FROM users WHERE id = $1 FOR UPDATE;
 
 -- name: LockVaultAuthState :one
 -- Lifecycle operations lock the durable mode/epoch and current login hash together.
-SELECT vault_mode, vault_epoch, password_hash FROM users WHERE id = $1 FOR UPDATE;
+SELECT vault_mode, vault_epoch, password_hash, token_version, is_active,
+       vault_auto_reunlock, vault_slot_generation
+FROM users WHERE id = $1 FOR UPDATE;
 
 -- name: LockUserVault :one
 SELECT * FROM user_vaults WHERE user_id = $1 FOR UPDATE;

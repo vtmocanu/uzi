@@ -77,7 +77,7 @@ func withoutData(got map[string]any) map[string]any {
 }
 
 // First open grows after Fstat: the unchanged ordinary bound consumes exactly
-// 1 MiB+1. The independent range open sees its own size and consumes 8 MiB.
+// 1 MiB+1. The independent range open sees its own size and consumes 64 MiB.
 // This establishes the helper seam; broker sequencing is M2.
 func TestReadThenRangeGrowthByteBound(t *testing.T) {
 	s, root, reads, closes := rangeFixture(t, []byte("x"))
@@ -110,7 +110,7 @@ func TestReadThenRangeGrowthByteBound(t *testing.T) {
 	// Ordinary ReadAll may request >32 KiB, but never did on this bound.
 	before := *reads
 	got := checkRange(t, s, rangeRequest(9007199254740991, 1), "", 0, false, true, true)
-	if *reads-before != rangeScanBytes || *reads != 9*1024*1024+1 || *closes != 2 || calls != 2 {
+	if *reads-before != rangeScanBytes || *reads != maxReadBytes+1+rangeScanBytes || *closes != 2 || calls != 2 {
 		t.Fatalf("reads=%d closes=%d fstats=%d", *reads, *closes, calls)
 	}
 	if got["size"] != int64(rangeScanBytes+11) || got["scannedBytes"] != int64(rangeScanBytes) {
@@ -221,6 +221,30 @@ func TestReadRangeValidationFrontier(t *testing.T) {
 	// Invalid continuation of a codepoint crossing the ceiling is examined.
 	s, _, _, _ := rangeFixture(t, []byte(strings.Repeat("a", rangeOutputBytes-1)+"\xe2\x00"))
 	wantErr(t, s.handle(rangeRequest(1, 1)), codeNotText)
+}
+
+func TestReadRangeFullExactly64MiBScanProductionContext(t *testing.T) {
+	const size = 64 * 1024 * 1024
+	if rangeScanBytes != size {
+		t.Fatalf("production scan cap = %d, want %d", rangeScanBytes, size)
+	}
+	s, _, reads, _ := rangeFixture(t, bytes.Repeat([]byte("a"), size))
+	req := rangeRequest(2, 1)
+	start := time.Now()
+	got := s.handle(req)
+	elapsed := time.Since(start)
+	t.Logf("exactly 64 MiB scan operation elapsed: %s", elapsed)
+	wantOK(t, got)
+	if got["scannedBytes"] != int64(size) || *reads != size {
+		t.Fatalf("scannedBytes=%v actual reads=%d, want %d", got["scannedBytes"], *reads, size)
+	}
+	if len(respData(t, got)) != 0 || got["size"] != int64(size) || got["offset"] != int64(2) ||
+		got["linesReturned"] != 0 || got["partialLastLine"] != false || got["truncated"] != false || got["incomplete"] != false {
+		t.Fatalf("metadata mismatch: %v", withoutData(got))
+	}
+	if _, ok := got["reason"]; ok {
+		t.Fatal("reason on completed scan")
+	}
 }
 
 func TestReadRangeScanFrontiers(t *testing.T) {

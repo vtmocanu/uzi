@@ -16,7 +16,9 @@ set -eu
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 SUT="$ROOT/scripts/assert-web-nginx.sh"
-TMP="$(mktemp -d)"
+export TMPDIR="$ROOT/.uzi/scratch"
+mkdir -p "$TMPDIR"
+TMP="$(mktemp -d "$TMPDIR/assert-web-nginx-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -31,8 +33,25 @@ mkdir -p "$TMP/bin"
 cat > "$TMP/bin/docker" <<'EOF'
 #!/bin/sh
 echo "docker $*" >> "$FAKE_LOG"
+leak_cookie() {
+  awk '/^curl / { for (i = 1; i <= NF; i++) if ($i ~ /^__Host-uzi_vault_slot=/) { print $i; exit } }' "$FAKE_LOG"
+}
 case "$1" in
-  info|cp|start|exec|logs|rm) exit 0 ;;
+  info|start|exec|rm|stop) exit 0 ;;
+  logs)
+    case "${FAKE_LEAK_SOURCE:-}" in
+      stdout) leak_cookie ;;
+      stderr) leak_cookie >&2 ;;
+    esac
+    exit 0 ;;
+  cp)
+    case "$2" in
+      *:/var/log/nginx/.)
+        if [ "${FAKE_LEAK_SOURCE:-}" = file ]; then
+          leak_cookie > "$3/access.log"
+        fi ;;
+    esac
+    exit 0 ;;
   image) [ "$2" = inspect ] && { [ "${FAKE_INSPECT_MISS:-}" = 1 ] && exit 1; exit 0; } ;;
   pull)
     case "$2" in
@@ -92,7 +111,7 @@ run() {
   : > "$FAKE_LOG"
   mkdir -p "$TMP/$case_name.tmp"
   rc=0
-  PATH="$TMP/bin:$PATH" TMPDIR="$TMP/$case_name.tmp" bash "$SUT" "$ROOT" > "$TMP/$case_name.out" 2>&1 || rc=$?
+  PATH="$TMP/bin:$PATH" TMPDIR="$TMP/$case_name.tmp" bash "$SUT" "${3:-$ROOT}" > "$TMP/$case_name.out" 2>&1 || rc=$?
   [ "$rc" = 2 ] || fail "$case_name: exit $rc, want 2 ($(cat "$TMP/$case_name.out"))"
   grep -q 'docker create .* failed' "$TMP/$case_name.out" \
     || fail "$case_name: did not stop at the conflicting create ($(cat "$TMP/$case_name.out"))"
@@ -135,6 +154,17 @@ expect_net_rm() {
   [ "$(grep -c '^docker network rm wnginx-[0-9]*-net$' "$TMP/$1.log" || true)" = 1 ] \
     || fail "$1: the created network was not removed exactly once"
 }
+
+# A fresh checkout has no ignored scratch tree. Prove SUT creates it before
+# mktemp and reaches Docker without relying on this harness's scratch parent.
+fresh="$TMP/fresh-checkout"
+mkdir -p "$fresh/web" "$fresh/deploy"
+cp "$ROOT/web/Dockerfile" "$ROOT/web/nginx.conf" "$ROOT/web/nginx.mock.conf" "$fresh/web/"
+cp -R "$ROOT/deploy/chart" "$fresh/deploy/chart"
+[ ! -d "$fresh/.uzi" ] || fail "fresh: fixture already has scratch"
+run fresh '*-up' "$fresh"
+[ -d "$fresh/.uzi/scratch" ] || fail "fresh: scratch parent not created"
+grep -q '^docker create ' "$TMP/fresh.log" || fail "fresh: startup never reached Docker"
 
 # Case 1: the very first create (the stub upstream) conflicts. Nothing was created, so
 # no container is removed at all, least of all the one holding the name.
@@ -182,6 +212,26 @@ grep -qF "$MIRROR_REF" "$TMP/none.out" || fail "none: output does not name $MIRR
 grep -qF "$HUB_REF" "$TMP/none.out" || fail "none: output does not name $HUB_REF"
 [ "$(grep -c 'fake pull refused' "$TMP/none.out" || true)" = 2 ] || fail "none: want both pull errors in the output"
 
+# The fake HTTP responses intentionally fail the existing response assertions.
+# These cases isolate log collection: no Docker and no deliberate nginx mutation.
+for source in stdout stderr file; do
+  FAKE_LEAK_SOURCE=$source
+  export FAKE_LEAK_SOURCE
+  run_pull "leak-$source" 'mirror.gcr.io/*'
+  [ "$pull_rc" = 1 ] || fail "leak-$source: want property failure"
+  grep -qF 'FAIL: compose: cookie proof: sentinels absent from web logs' "$TMP/leak-$source.out" \
+    || fail "leak-$source: cookie log assertion did not detect leak"
+  grep -qF 'FAIL: chart: cookie proof: sentinels absent from web logs' "$TMP/leak-$source.out" \
+    || fail "leak-$source: chart cookie log assertion did not detect leak"
+  ! grep -qF 'wnginx-request-' "$TMP/leak-$source.out" \
+    || fail "leak-$source: sentinel printed in script output"
+  [ "$(rms "leak-$source" | wc -l | tr -d ' ')" = 4 ] \
+    || fail "leak-$source: owned containers not cleaned"
+done
+unset FAKE_LEAK_SOURCE
+grep -qF 'OK: compose: cookie proof: sentinels absent from web logs' "$TMP/mirror.out" \
+  || fail "mirror: clean log assertion did not pass"
+
 if [ "$failed" != 0 ]; then
   for c in first later mirror hub none; do
     echo "--- $c docker calls:" >&2
@@ -189,4 +239,4 @@ if [ "$failed" != 0 ]; then
   done
   exit 1
 fi
-echo "assert-web-nginx.test.sh: PASS (5 cases)"
+echo "assert-web-nginx.test.sh: PASS (9 cases)"

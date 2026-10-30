@@ -88,7 +88,9 @@ export function useRunStream(runId: string) {
     publishReadiness();
   }, [publishReadiness]);
 
-  const readRun = useCallback(async (quiet: boolean) => {
+  // quiet: a background read that surfaces no error. passive: sends X-Uzi-Passive so the
+  // read never counts as foreground activity; it defaults to quiet.
+  const readRun = useCallback(async (quiet: boolean, passive = quiet) => {
     if (runId !== activeRunIdRef.current) return;
     const gen = genRef.current;
     const ticket = ++runReadTicketRef.current;
@@ -96,7 +98,7 @@ export function useRunStream(runId: string) {
     evidenceRef.current.metadata = false;
     publishReadiness();
     try {
-      const { run } = await api.getRun(runId);
+      const { run } = await (passive ? api.getRun(runId, undefined, true) : api.getRun(runId));
       if (gen !== genRef.current) return;
       if (ticket !== runReadTicketRef.current) return;
       setRun(run);
@@ -122,6 +124,8 @@ export function useRunStream(runId: string) {
   }, [runId, publishReadiness]);
 
   const refreshRun = useCallback(() => readRun(false), [readRun]);
+  // For socket-driven consumers: passive, so it never restores a browser vault keyslot (ADR-3508).
+  const refreshRunPassive = useCallback(() => readRun(false, true), [readRun]);
 
   // Eligibility and source leases can change without a reason-changing WS frame.
   // Reuse the visible-view cadence for metadata only, one outstanding quiet read;
@@ -139,7 +143,7 @@ export function useRunStream(runId: string) {
 
   // refreshOnKinds is set only by the debounced catch-up: the mount and onopen paths
   // already re-read the run themselves, so they skip it rather than fetch it twice.
-  const replay = useCallback(async (refreshOnKinds = false) => {
+  const replay = useCallback(async (refreshOnKinds = false, passive = false) => {
     if (runId !== activeRunIdRef.current) return;
     const gen = genRef.current;
     const epoch = evidenceRef.current.epoch;
@@ -147,7 +151,7 @@ export function useRunStream(runId: string) {
     evidenceRef.current.replay = false;
     publishReadiness();
     try {
-      const { messages: batch } = await api.getRunMessages(runId, streamRef.current.lastSeq);
+      const { messages: batch } = await (passive ? api.getRunMessages(runId, streamRef.current.lastSeq, true) : api.getRunMessages(runId, streamRef.current.lastSeq));
       if (gen !== genRef.current) return;
       const merged = ingestMany(streamRef.current, batch).state;
       const current = epoch === evidenceRef.current.epoch && ticket === replayTicketRef.current;
@@ -163,7 +167,7 @@ export function useRunStream(runId: string) {
       // A replayed plan/plan_revising/progress_note never arrived as a live frame, so
       // nothing else re-reads the run for it (a revise changes no status, hence no state
       // frame follows): apply the same refresh a live frame of that kind would (issue #2760).
-      if (refreshOnKinds && hasRefreshKind(batch)) void refreshRun();
+      if (refreshOnKinds && hasRefreshKind(batch)) void readRun(false, passive);
     } catch {
       if (gen === genRef.current && epoch === evidenceRef.current.epoch && ticket === replayTicketRef.current) {
         evidenceRef.current.replay = false;
@@ -172,18 +176,18 @@ export function useRunStream(runId: string) {
       // Transient; the next frame or reconnect retries. The log is durable, so a
       // failed catch-up only delays rendering, never loses a message.
     }
-  }, [runId, commit, refreshRun, publishReadiness]);
+  }, [runId, commit, readRun, publishReadiness]);
 
   // refreshInputs re-reads the steer queue (PRD #95). Best-effort and SILENT on error:
   // a non-owner viewer (an admin on someone else's run) 404s here, which Decision 8/N2
   // says to treat as "no queue to show" — never a run-level error banner. M1 calls it
   // once on mount; M3 adds the onopen / state / health / `input`-frame triggers so a
   // dropped frame self-heals.
-  const refreshInputs = useCallback(async () => {
+  const refreshInputs = useCallback(async (passive = false) => {
     if (runId !== activeRunIdRef.current) return;
     const gen = genRef.current;
     try {
-      const { inputs } = await api.getRunInputs(runId);
+      const { inputs } = await (passive ? api.getRunInputs(runId, true) : api.getRunInputs(runId));
       if (gen !== genRef.current) return;
       setInputs(inputs);
       // A 200 (even empty) proves this viewer owns the run → allow steering.
@@ -239,7 +243,7 @@ export function useRunStream(runId: string) {
       if (catchup != null) return;
       catchup = window.setTimeout(() => {
         catchup = null;
-        void replay(true);
+        void replay(true, true);
       }, CATCHUP_DEBOUNCE_MS);
     };
 
@@ -254,15 +258,15 @@ export function useRunStream(runId: string) {
         if (!isActive()) return;
         invalidateEvidence();
         setConnected(true);
-        void replay();
+        void replay(false, true);
         // A reconnect may have missed a plan/plan_revising frame, and a revise changes
         // no status, so re-read the run here too (issue #2760).
-        void refreshRun();
+        void readRun(false, true);
         // Reconcile the steer queue on every (re)connect, alongside the message
         // replay (PRD #95 S1): the `input` frame is droppable, so a follow-up
         // consumed while we were disconnected would otherwise strand at Queued —
         // this refetch is the source of truth that self-heals it.
-        void refreshInputs();
+        void refreshInputs(true);
       };
       socket.onmessage = (ev) => {
         if (!isActive()) return;
@@ -285,13 +289,13 @@ export function useRunStream(runId: string) {
           publishReadiness();
           scheduleCatchup();
         }
-        if (effects.refreshRun) void refreshRun();
+        if (effects.refreshRun) void readRun(false, true);
         // Refetch the steer queue on the data-less `input` frame (the fast path) AND
         // on any state/health-driven refresh (PRD #95 S1): consuming a follow-up flips
         // the run to running from awaiting_approval too, so state/health frames co-fire
         // with the input frame — refetching on both keeps the queue live even if the
         // hub dropped the input frame for a slow subscriber.
-        if (frame.type === "input" || effects.refreshRun) void refreshInputs();
+        if (frame.type === "input" || effects.refreshRun) void refreshInputs(true);
       };
       socket.onclose = () => {
         if (!isActive()) return;
@@ -329,7 +333,7 @@ export function useRunStream(runId: string) {
         }
       }
     };
-  }, [runId, replay, refreshRun, refreshInputs, commit, invalidateEvidence, publishReadiness]);
+  }, [runId, replay, refreshRun, readRun, refreshInputs, commit, invalidateEvidence, publishReadiness]);
 
   const submit = useCallback(
     async (
@@ -412,5 +416,5 @@ export function useRunStream(runId: string) {
   // for a non-owner viewer (Decision 8/N2).
   const confirmedOwner = ownerProof?.runId === runId && ownerProof.generation === genRef.current;
   const pauseOriginReady = readyProof?.runId === runId && readyProof.generation === genRef.current;
-  return { pauseOriginReady, run, messages, connected, error, submit, refreshRun, inputs, refreshInputs, canSteer, confirmedOwner };
+  return { pauseOriginReady, run, messages, connected, error, submit, refreshRun, refreshRunPassive, inputs, refreshInputs, canSteer, confirmedOwner };
 }

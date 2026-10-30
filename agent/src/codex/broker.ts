@@ -1074,7 +1074,7 @@ export class CodexCallbackBroker {
   private validateRangeRead(res: FileopResponse, offset: number, limit: number): CallbackResult {
     const malformed = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_MALFORMED" });
     const cap = 64 * 1024;
-    const scanCap = 8 * 1024 * 1024;
+    const scanCap = 64 * 1024 * 1024;
     // Bound the encoded input before either regex or decoding.
     if (typeof res.data !== "string") return malformed();
     if (res.data.length > 4 * Math.ceil(cap / 3)) return malformed();

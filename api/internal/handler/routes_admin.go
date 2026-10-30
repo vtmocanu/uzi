@@ -28,7 +28,7 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 		// place. admin-ness resolves live from the row, so demoting the owner instantly
 		// kills a uza_ token's admin reads with no revocation step.
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Use(h.requireUser())
 			r.Use(mw.RequireAdminRO)
 			r.Get("/users", h.ListUsers)
 			// Instance settings (PRD #19): the configurable forge labels today.
@@ -150,7 +150,7 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 		})
 		// WRITES: cookie-only (RequireAuth + RequireAdmin), unchanged.
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Use(h.requireAuth())
 			r.Use(mw.RequireAdmin)
 			r.Patch("/users/{id}", h.PatchUser)
 			// Admin per-user run-judge toggle (PRD #46 Decision 7): actor authorized by
