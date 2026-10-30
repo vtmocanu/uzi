@@ -1,7 +1,8 @@
 # Protected manual releases and opt-in nightly RCs (#3512, stage 3e-2).
 # App/environment/ruleset setup and the first live dispatch belong to the maintainer.
 # D10 is partial: one eligible pre-cut CI rerun and existing non-gate publication
-# retries. Tagged smoke, post-cut CI and targeted assertion recovery follow in 3e-3.
+# retries. Tagged smoke and targeted assertions follow in 3e-3; post-cut main CI
+# will be report-only, with automatic reruns deliberately excluded.
 name: Release automation
 
 "on":
@@ -287,8 +288,8 @@ jobs:
             [[ "$RUN_CREATED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
             requested="$(date -u -d "$RUN_CREATED_AT" +%s)"
             attempt_date="$(TZ=Europe/Bucharest date -d "$RUN_CREATED_AT" +%F)"
-            cutoff="$(TZ=Europe/Bucharest date -d "$attempt_date 08:00:00" +%s)"
-            offset="$(TZ=Europe/Bucharest date -d "$attempt_date 08:00:00" +%z)"
+            cutoff="$(TZ=Europe/Bucharest date -d "$attempt_date 13:00:00" +%s)"
+            offset="$(TZ=Europe/Bucharest date -d "$attempt_date 13:00:00" +%z)"
             now="$(date -u +%s)"
             [[ "$now" =~ ^[0-9]+$ ]]
             [[ "$cutoff" =~ ^[0-9]+$ ]]
@@ -374,8 +375,8 @@ jobs:
             [[ "$RUN_CREATED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
             requested="$(date -u -d "$RUN_CREATED_AT" +%s)"
             attempt_date="$(TZ=Europe/Bucharest date -d "$RUN_CREATED_AT" +%F)"
-            cutoff="$(TZ=Europe/Bucharest date -d "$attempt_date 08:00:00" +%s)"
-            offset="$(TZ=Europe/Bucharest date -d "$attempt_date 08:00:00" +%z)"
+            cutoff="$(TZ=Europe/Bucharest date -d "$attempt_date 13:00:00" +%s)"
+            offset="$(TZ=Europe/Bucharest date -d "$attempt_date 13:00:00" +%z)"
             now="$(date -u +%s)"
             [[ "$now" =~ ^[0-9]+$ ]]
             [[ "$cutoff" =~ ^[0-9]+$ ]]
@@ -545,7 +546,7 @@ jobs:
           result['outcome'] = 'blocked' if problem else (watched.get('outcome') or prepared.get('outcome') or 'no-op')
           result['reason'] = next((needs[name].get('outputs', {}).get('reason') or name + '-failed' for name in failed),
                                   'partial-publication' if problem else prepared.get('reason') or authorized.get('reason') or 'complete')
-          if os.environ.get('GITHUB_EVENT_NAME') == 'schedule' and result['reason'] in ('missed-target', 'tip-not-green-by-cutoff'):
+          if os.environ.get('GITHUB_EVENT_NAME') == 'schedule' and result['reason'] in ('missed-target', 'tip-not-green-by-cutoff', 'skip-ci-tip'):
               result['outcome'] = 'defer'
           if problem and push_outcome == 'receipt-unknown':
               result['outcome'], result['reason'] = 'partial-publication', 'push-receipt-unknown'
@@ -557,14 +558,18 @@ jobs:
                   return dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
               zone = ZoneInfo('Europe/Bucharest')
               day = utc_stamp(os.environ.get('RUN_CREATED_AT')).astimezone(zone).date()
-              target = dt.datetime.combine(day, dt.time(9), zone)
+              target = dt.datetime.combine(day, dt.time(14), zone)
               result['late_finish'] = utc_stamp(watched['verified_at']) > target
+          skip_ci_text = ('Scheduled preparation exhausted its wait budget while the selected skip-ci tip lacked exact proof; use a newer CI-bearing main tip.'
+                          if os.environ.get('GITHUB_EVENT_NAME') == 'schedule' else
+                          'Manual preparation refused immediately: this skip-ci tip lacks exact proof; use a newer CI-bearing main tip.')
           explanation = {'changelog-coverage-refused': 'Release preparation refused: the assembled changelog failed its coverage check.',
                          'changelog-coverage-error': 'Release preparation could not establish changelog coverage.',
                          'push-rejected': 'Release push was rejected without updating refs.',
                          'nightly-disabled': 'Nightly RC paused: RELEASE_NIGHTLY_ENABLED is not true.',
                          'no-new-shipping-change': 'Nightly RC skipped: no new non-metadata shipping changes.',
                          'no-releasable-notes': 'Nightly RC skipped: no releasable notes.',
+                         'skip-ci-tip': skip_ci_text,
                          'missed-target': 'Nightly RC stopped because its remaining pre-push cutoff budget was exhausted.',
                          'tip-not-green-by-cutoff': 'Nightly RC found no exact green tip within its pre-cut budget.',
                          'push-receipt-unconfirmed': 'Release recovery could not confirm that main contains the RC.'}.get(
@@ -573,7 +578,7 @@ jobs:
           elif problem and attempted is None: explanation += ' Push attempt status is unavailable; inspect remote refs.'
           body = explanation + '\n\n```json\n' + json.dumps(result, indent=2, sort_keys=True) + '\n```\n'
           if result['late_finish']:
-              warning = 'Nightly release verified after the 09:00 Europe/Bucharest target.'
+              warning = 'Nightly release verified after the 14:00 Europe/Bucharest target.'
               body += '\n**Late completion:** ' + warning + '\n'
               print('::warning::' + warning)
           for row in uncited or []:
