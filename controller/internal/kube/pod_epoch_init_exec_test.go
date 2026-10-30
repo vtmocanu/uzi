@@ -283,7 +283,7 @@ func TestPodEpochInitExecMissingAfterPrepareDiagnosesEarlyExit(t *testing.T) {
 					go func() {
 						seen := false
 						for !seen && ctx.Err() == nil {
-							b, _ := os.ReadFile(filepath.Join(h.data, "events")) //nolint:gosec // G304: test-owned path.
+							b, _ := os.ReadFile(filepath.Join(h.data, "events"))
 							if seen = strings.Contains(string(b), "prepare-stalled\n"); !seen {
 								time.Sleep(10 * time.Millisecond)
 							}
