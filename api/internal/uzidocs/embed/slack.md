@@ -259,9 +259,10 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   don't get noise like "judge run completed" for a run you never see on the
   board.
 - **Cross-check runs**: a plan or code cross-check run gets no DM of its
-  own, neither for its state changes nor for a health flag. Its result
-  appears only as the cross-check reason on the parent run's plan-gate
-  message.
+  own, neither for its state changes nor for a health flag. A plan
+  cross-check's reason can appear on the parent run's plan-gate message;
+  code cross-check findings go to the merge request's Code cross-check
+  section (see [Cross-check](./cross-check.md)).
 - **Run health nudges**: if a run you own gets flagged (stalled, looping,
   near timeout, waiting for a worker, or stuck too long awaiting approval —
   see [Run health](./run-health.md)), the root DM's `context` block picks up
