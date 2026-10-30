@@ -93,6 +93,7 @@ function coerceResponse(value: unknown): FileopResponse {
     type: typeof o.type === "string" ? o.type : undefined,
     entries,
     truncated: typeof o.truncated === "boolean" ? o.truncated : undefined,
+    ...(Object.hasOwn(o, "truncated") && typeof o.truncated !== "boolean" ? { truncatedInvalid: true as const } : {}),
   };
 }
 

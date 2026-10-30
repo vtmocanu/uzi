@@ -107,6 +107,28 @@ describe("FileopHelperClient: range protocol provenance", () => {
     } finally { h.client.close(); }
   });
 
+  it("derives invalid truncated metadata only from the wire field type", async () => {
+    const h = makeClient();
+    try {
+      for (const truncated of [null, "true", 1, {}, []]) {
+        const pending = h.client.op({ op: "read", path: "x" });
+        const req = await h.requests.next();
+        h.respond({ id: req.id, ok: true, truncated, truncatedInvalid: false });
+        const res = await pending;
+        assert.equal(res.truncated, undefined);
+        assert.equal(res.truncatedInvalid, true);
+      }
+      for (const fields of [{}, { truncated: false }, { truncated: true }]) {
+        const pending = h.client.op({ op: "read", path: "x" });
+        const req = await h.requests.next();
+        h.respond({ id: req.id, ok: true, ...fields, truncatedInvalid: true });
+        const res = await pending;
+        assert.equal(res.truncated, fields.truncated);
+        assert.equal(Object.hasOwn(res, "truncatedInvalid"), false);
+      }
+    } finally { h.client.close(); }
+  });
+
   it("mints origin only on exact false with a string code, ignoring wire origin", async () => {
     const h = makeClient();
     try {

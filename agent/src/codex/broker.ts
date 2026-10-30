@@ -291,6 +291,8 @@ export interface FileopResponse {
   readonly type?: string;
   readonly entries?: ReadonlyArray<{ readonly name: string; readonly type: string }>;
   readonly truncated?: boolean;
+  /** Client-derived invalid wire type; used only to reject ordinary tail bodies. */
+  readonly truncatedInvalid?: true;
 }
 
 /** The injected openat2 fileop client. Production talks to the fileop helper over a
@@ -1068,7 +1070,7 @@ export class CodexCallbackBroker {
     if (bytes.length > 0 && lineEnds.at(-1) !== bytes.length) lineEnds.push(bytes.length);
     if (hasTail) {
       // A prefix, even a valid text prefix, cannot prove the opening EOF suffix.
-      if (res.truncated !== undefined && res.truncated !== false) return malformed();
+      if (res.truncatedInvalid || (res.truncated !== undefined && res.truncated !== false)) return malformed();
       const cap = 64 * 1024;
       let first = Math.max(0, lineEnds.length - (tail as number));
       let start = first === 0 ? 0 : lineEnds[first - 1]!;

@@ -111,6 +111,40 @@ describe("tail Read ordinary and independent descriptor validation", () => {
     }
   });
 
+  it("rejects invalid optional truncated types through the client while preserving forward reads", async () => {
+    for (const fields of [
+      ...[null, "true", 1, {}, []].map(truncated => ({ truncated })),
+      {}, { truncated: false }, { truncatedInvalid: true }, { truncated: false, truncatedInvalid: true },
+    ]) {
+      const inbound = new PassThrough(), outbound = new PassThrough();
+      const client = new FileopHelperClient({ inbound, outbound });
+      outbound.on("data", chunk => {
+        const request = JSON.parse(String(chunk));
+        inbound.write(JSON.stringify({ id: request.id, ...body("a\n"), ...fields }) + "\n");
+      });
+      const h = rig(r => client.op(r));
+      try {
+        const result = await h.read();
+        if (Object.hasOwn(fields, "truncated") && fields.truncated !== false) {
+          assert.deepEqual(result, {
+            ok: false, code: "fileop_denied", message: "file operation denied (E_MALFORMED)", fileopCode: "E_MALFORMED",
+          });
+        } else {
+          assertTailResult(result, expected("a\n", 2, 1, 1));
+        }
+        assert.deepEqual(h.calls, [{ op: "read", path: "x" }]);
+        for (const args of [{ path: "x" }, { path: "x", offset: 1, limit: 200 }]) {
+          assert.deepEqual(await h.broker.handleToolCall(
+            { threadId: "t", turnId: "u", callId: JSON.stringify(args) }, "uzi_read", args, "root",
+          ), {
+            ok: true, output: { size: 2, content: "a\n", offset: 1, linesReturned: 1, partialLastLine: false, truncated: false },
+          });
+        }
+        assert.deepEqual(h.calls, Array.from({ length: 3 }, () => ({ op: "read", path: "x" })));
+      } finally { client.close(); inbound.destroy(); outbound.destroy(); }
+    }
+  });
+
   it("falls back exactly once on helper-origin oversize, using only the second descriptor", async () => {
     const h = scripted([oversize, suffix({ offset: 99, partialLastLine: true })]);
     assertTailResult(await h.read(), expected("last\n", 2 * 1024 * 1024, 1, 1, true));
