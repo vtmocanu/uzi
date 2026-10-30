@@ -1000,6 +1000,57 @@ func TestLoadParsesTheUIDSplit(t *testing.T) {
 	})
 }
 
+// UZI_CODEX_COMMAND_CACHE_RUN_BYTES stays "" when unset, keeps a valid plain decimal (trimmed),
+// and refuses anything else at boot.
+func TestLoadParsesTheCommandCacheRunBytes(t *testing.T) {
+	load := func(t *testing.T, val string, set bool) (Config, error) {
+		t.Helper()
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		if set {
+			t.Setenv("UZI_CODEX_COMMAND_CACHE_RUN_BYTES", val)
+		}
+		return Load()
+	}
+
+	t.Run("unset stays empty", func(t *testing.T) {
+		cfg, err := load(t, "", false)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerCommandCacheRunBytes != "" {
+			t.Errorf("WorkerCommandCacheRunBytes = %q, want empty", cfg.WorkerCommandCacheRunBytes)
+		}
+	})
+
+	for in, want := range map[string]string{
+		"0":                "0",
+		"4294967296":       "4294967296",
+		"  4294967296\n":   "4294967296",
+		"9007199254740991": "9007199254740991",
+		"   ":              "",
+	} {
+		t.Run("accepts "+in, func(t *testing.T) {
+			cfg, err := load(t, in, true)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.WorkerCommandCacheRunBytes != want {
+				t.Errorf("WorkerCommandCacheRunBytes = %q, want %q", cfg.WorkerCommandCacheRunBytes, want)
+			}
+		})
+	}
+
+	for _, bad := range []string{"-1", "1.5", "4GiB", "0x10", "01", "+1", "9007199254740992", "99999999999999999999999"} {
+		t.Run("rejects "+bad, func(t *testing.T) {
+			if _, err := load(t, bad, true); err == nil || !strings.Contains(err.Error(), "UZI_CODEX_COMMAND_CACHE_RUN_BYTES") {
+				t.Fatalf("err = %v, want a boot refusal naming UZI_CODEX_COMMAND_CACHE_RUN_BYTES", err)
+			}
+		})
+	}
+}
+
 // UZI_CODEX_COMMAND_SANDBOX defaults to "off", accepts "required" and "best-effort", and rejects any
 // other value at boot (strict allow-list). An empty/unset value takes the default rather than
 // erroring — the same "fail at boot, not at the far end" rule its neighbours follow.

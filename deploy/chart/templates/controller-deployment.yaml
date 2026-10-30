@@ -301,6 +301,10 @@ spec:
             - name: UZI_CODEX_COMMAND_SANDBOX
               value: {{ .Values.workers.codex.commandSandbox | quote }}
             {{- end }}
+            {{- with .Values.workers.codex.commandCacheRunBytes }}
+            - name: UZI_CODEX_COMMAND_CACHE_RUN_BYTES
+              value: {{ . | quote }}
+            {{- end }}
             {{- if .Values.workers.docker.enabled }}
             # The docker tier (PRD #83 M3, PRD #89). Namespace + image are required
             # together — the controller refuses to boot with one set and not the other —

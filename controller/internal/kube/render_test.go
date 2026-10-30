@@ -2113,6 +2113,45 @@ func TestCommandSandboxEnvOnlyWhenNotOff(t *testing.T) {
 	}
 }
 
+// UZI_CODEX_COMMAND_CACHE_RUN_BYTES renders on the worker container only, only when set, and an
+// unset value leaves the pod spec hash identical to a zero-value config.
+func TestCommandCacheRunBytesEnvOnlyWhenSet(t *testing.T) {
+	const name = "UZI_CODEX_COMMAND_CACHE_RUN_BYTES"
+	render := func(cfg RenderConfig) corev1.PodSpec {
+		return RenderDeployment(cfg, desired("abc"), testSpec(t, "base", "m")).Spec.Template.Spec
+	}
+	lookup := func(c corev1.Container) (string, bool) {
+		for _, e := range c.Env {
+			if e.Name == name {
+				return e.Value, true
+			}
+		}
+		return "", false
+	}
+
+	for _, want := range []string{"4294967296", "0"} {
+		cfg := testConfig()
+		cfg.CommandCacheRunBytes = want
+		pod := render(cfg)
+		if v, ok := lookup(containerByName(t, pod.Containers, workerContainerName)); !ok || v != want {
+			t.Errorf("CommandCacheRunBytes=%q must render %s=%q on the worker, got %q/%v", want, name, want, v, ok)
+		}
+		for _, c := range append(append([]corev1.Container{}, pod.InitContainers...), pod.Containers...) {
+			if c.Name == workerContainerName {
+				continue
+			}
+			if _, ok := lookup(c); ok {
+				t.Errorf("container %q carries %s; it belongs on the worker container only", c.Name, name)
+			}
+		}
+	}
+
+	unset := render(testConfig())
+	if v, ok := lookup(containerByName(t, unset.Containers, workerContainerName)); ok {
+		t.Errorf("an unset CommandCacheRunBytes must emit NO %s env, got %q", name, v)
+	}
+}
+
 // --- non-rootless posture (PRD #89) ----------------------------------------
 
 // THE loopback-bind invariant (PRD #89 M1, mitigation #1). This is a POSITIVE
