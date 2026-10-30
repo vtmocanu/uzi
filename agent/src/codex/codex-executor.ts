@@ -5044,7 +5044,8 @@ export class CodexExecutor implements Executor {
     revision: number,
     setupRegistries: Set<ExecutionRegistry>,
   ): Promise<ProviderEpoch> {
-    const level = codexEffort(ctx);
+    // The claim's effort, as resolveLeadRequest reads it for the turn (PRD #3244); absent for Runtime default.
+    const level = ctx.config?.default_effort;
     // Snapshot the runner contract once for all effect surfaces in this epoch.
     // Legacy direct callers may still bind through the static executor option.
     const captureMemory = ctx.capturedMemory;
