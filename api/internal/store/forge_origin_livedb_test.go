@@ -12,7 +12,7 @@ import (
 
 func TestForgeOriginSchemaLifecycleLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "forge_origin_")
-	if err := store.MigrateTo(ctx, dsn, 374); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 378); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)

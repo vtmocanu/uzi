@@ -121,6 +121,11 @@ host or repository path. Replayed/stale reports cannot count a second failure.
 The hard admission filter excludes that worker/origin before the deadline.
 When due, one ordinary claim reserves the half-open attempt under the existing
 claim locks; expiry alone leaves reachability unverified.
+Runs that never contact the forge are outside this filter: repo-less, chat and
+egress-profile runs, and code cross-check children, which read only the lead's
+local snapshot and take no reservation. A repository whose web URL has no
+canonical https origin is not filtered either; its claim snapshot check refuses
+it visibly instead of leaving it queued on every worker.
 
 The reservation remains through human/model waits in the same active flight.
 Optional negotiated direct clone/fetch success telemetry can clear the exact

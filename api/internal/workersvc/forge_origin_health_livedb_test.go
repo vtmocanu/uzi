@@ -23,6 +23,15 @@ func TestForgeOriginUnknownMappingNotNetworkEvidenceLiveDB(t *testing.T) {
 	if e.originCount(t, worker) != 0 || counts.ForgeBlocked != 0 {
 		t.Fatalf("unknown authorized origin invented network evidence: %+v", counts)
 	}
+	// An unmappable origin must not hide the run from every worker: it is
+	// claimed, and the claim-time snapshot check then refuses it visibly.
+	if counts.Claimable != 1 {
+		t.Fatalf("unknown authorized origin left the run unclaimable: %+v", counts)
+	}
+	got, err := e.q.ClaimRun(e.ctx, e.fpRecoveryClaimParams(worker, at.Add(-45*time.Second)))
+	if err != nil || got.ID != id {
+		t.Fatalf("unknown origin claim: %s, %v", got.ID, err)
+	}
 }
 
 // Read the real per-run projection: online heartbeat and static capabilities

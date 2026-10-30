@@ -17,6 +17,10 @@ func assertForgeCheckerAdmission(t *testing.T, ctx context.Context, pool *pgxpoo
             COALESCE(fn_cross_check_child_eligible(w,r,false,'any',$3,now(),now()-interval '1 day'),false),
             COALESCE(fn_cross_check_child_eligible(w,r,true,'any',$3,now(),now()-interval '1 day'),false)
             FROM workers w CROSS JOIN runs r WHERE w.id=$1 AND r.id=$2`, worker, child, stage).Scan(&static, &available)
+		// A code checker never contacts the forge, so origin admission never gates it.
+		if stage == "code" {
+			want = true
+		}
 		if err != nil || !static || available != want {
 			t.Fatalf("%s static=%v available=%v want=%v err=%v", stage, static, available, want, err)
 		}

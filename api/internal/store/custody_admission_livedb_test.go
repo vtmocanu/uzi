@@ -296,6 +296,8 @@ func TestCustodyAdmissionMirrorsLiveDB(t *testing.T) {
 			id := f.holds[0]
 			if len(tc.sql) >= 14 && tc.sql[:14] == "UPDATE workers" {
 				id = f.worker
+				// The claim stamp's (user_id, worker_id) mapping would block the owner rewrite.
+				f.exec("DELETE FROM run_forge_origins WHERE worker_id=$1", id)
 			}
 			if len(tc.sql) >= 11 && tc.sql[:11] == "UPDATE runs" {
 				id = f.runs[0]

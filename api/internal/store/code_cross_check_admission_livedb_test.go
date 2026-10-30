@@ -56,6 +56,43 @@ func TestCodeCrossCheckLocalLaneEligibilityLiveDB(t *testing.T) {
 	}
 }
 
+// A code checker reads the lead's local snapshot and never contacts the forge, so a
+// cooled origin or the lead's own half-open reservation must not strand it.
+func TestCodeCrossCheckIgnoresForgeOriginAdmissionLiveDB(t *testing.T) {
+	ctx := context.Background()
+	fx := codeCrossCheckFixture(t)
+	f := fx.f
+	if err := insertCodeFixture(t, fx, codeFixtureHead, codeFixtureBase, "pending", nil); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(ctx, t, f.pool, `INSERT INTO forge_origin_cooldowns(user_id,worker_id,origin,cooled_until,last_reason,observed_at)
+ SELECT r.user_id,$2,a.origin,now()+interval '1 hour','transient_clone_fetch_exhausted',now()
+ FROM runs r JOIN authorized_forge_origins a ON a.repo_id=r.repo_id AND a.user_id=r.user_id
+ WHERE r.id=$1 AND a.origin IS NOT NULL`, fx.checkerID, f.workerID)
+	for _, tc := range []struct{ name, sql string }{
+		{"cooled origin", ""},
+		{"lead reservation", `UPDATE forge_origin_cooldowns SET cooled_until=now()-interval '1 hour',
+ reservation_run_id=$2,reservation_generation=1,reservation_incarnation=incarnation,
+ reservation_version=observation_version,reservation_observation_version=observation_version WHERE worker_id=$1`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.sql != "" {
+				mustExec(ctx, t, f.pool, tc.sql, f.workerID, f.runID)
+			}
+			var rows int
+			var eligible bool
+			if err := f.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM forge_origin_cooldowns WHERE worker_id=$1),
+  COALESCE(fn_cross_check_child_eligible(w,r,true,'cross_check','code',now(),now()+interval '1 day'),false)
+  FROM workers w,runs r WHERE w.id=$1 AND r.id=$2`, f.workerID, fx.checkerID).Scan(&rows, &eligible); err != nil {
+				t.Fatal(err)
+			}
+			if rows != 1 || !eligible {
+				t.Fatalf("code checker stranded by forge origin admission: rows=%d eligible=%v", rows, eligible)
+			}
+		})
+	}
+}
+
 func TestCodeCrossCheckUnsupportedCompletionLiveDB(t *testing.T) {
 	for _, tc := range []struct {
 		name                                        string

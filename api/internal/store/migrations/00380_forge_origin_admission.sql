@@ -7,15 +7,19 @@ CREATE FUNCTION fn_forge_origin_eligible(w workers, r runs, evaluated_at timesta
 RETURNS boolean LANGUAGE sql STABLE AS $$
     SELECT w.user_id = r.user_id AND (
         r.repo_id IS NULL OR r.kind = 'chat' OR r.egress_profile_id IS NOT NULL
+        -- A code checker reads the lead's local snapshot and never contacts the forge.
+        OR (r.kind = 'cross_check' AND EXISTS (
+            SELECT 1 FROM cross_checks cc
+            WHERE cc.lead_run_id = r.target_run_id AND cc.stage = 'code' AND cc.checker_run_id = r.id))
         OR EXISTS (
             SELECT 1 FROM authorized_forge_origins a
             WHERE a.repo_id = r.repo_id AND a.user_id = r.user_id
-              AND a.origin IS NOT NULL
-              AND NOT EXISTS (
+              -- An unmappable origin stays claimable; the claim snapshot check refuses it visibly.
+              AND (a.origin IS NULL OR NOT EXISTS (
                   SELECT 1 FROM forge_origin_cooldowns c
                   WHERE c.user_id = a.user_id AND c.worker_id = w.id AND c.origin = a.origin
                     AND (c.cooled_until > COALESCE(evaluated_at, statement_timestamp()) OR c.reservation_run_id IS NOT NULL)
-              )
+              ))
         )
     )
 $$;

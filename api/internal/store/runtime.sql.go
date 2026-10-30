@@ -932,6 +932,10 @@ WITH claimant AS MATERIALIZED (
     LEFT JOIN authorized_forge_origins fo
       ON fo.repo_id = r.repo_id AND fo.user_id = r.user_id
         AND r.egress_profile_id IS NULL
+        -- A code checker never contacts the forge, so it takes no origin reservation.
+        AND NOT (r.kind = 'cross_check' AND EXISTS (
+            SELECT 1 FROM cross_checks cc
+            WHERE cc.lead_run_id = r.target_run_id AND cc.stage = 'code' AND cc.checker_run_id = r.id))
     LEFT JOIN forge_origin_cooldowns fc
       ON fc.user_id = r.user_id AND fc.worker_id = $1 AND fc.origin = fo.origin
     WHERE r.user_id = $3
