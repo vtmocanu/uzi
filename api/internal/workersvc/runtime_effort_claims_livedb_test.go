@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -85,6 +86,63 @@ func TestRuntimeEffortClaudeIssueAndIsolatedClaimsLiveDB(t *testing.T) {
 			t.Fatalf("NULL preference: DefaultEffort = %v, want medium", p.Config.DefaultEffort)
 		}
 	})
+}
+
+// The Claude judge and chat lanes read the stored preference through the real
+// GetUserDefaultEffort: `runtime` omits the key, an explicit level rides through.
+func TestRuntimeEffortClaudeJudgeAndChatClaimsLiveDB(t *testing.T) {
+	cases := []struct {
+		name, stored string
+		want         string // "" means the key must be absent
+	}{
+		{"runtime", "runtime", ""},
+		{"explicit low", "low", "low"},
+	}
+	check := func(t *testing.T, lane string, cfg any, got *string, want string) {
+		t.Helper()
+		if want == "" {
+			if got != nil {
+				t.Fatalf("%s: DefaultEffort = %q, want nil", lane, *got)
+			}
+			requireNoDefaultEffortKey(t, lane, cfg)
+			return
+		}
+		if got == nil || *got != want {
+			t.Fatalf("%s: DefaultEffort = %v, want %q", lane, got, want)
+		}
+	}
+	for _, tc := range cases {
+		t.Run("judge/"+tc.name, func(t *testing.T) {
+			env := setupCodexLiveDB(t)
+			userID, workerID, repoID := env.seedCodexInfra(t)
+			env.exec(`UPDATE users SET judge_anthropic_bind_mode = 'default', default_effort = $2, default_codex_effort = 'max' WHERE id = $1`, userID, tc.stored)
+			env.seedAnthropicSecret(t, userID, "anthropic-"+uuid.NewString(), true)
+			targetID, judgeID := uuid.New(), uuid.New()
+			env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status)
+			          VALUES ($1, $2, $3, 'issue', 910, 't', 'd', 'completed')`, targetID, userID, repoID)
+			env.exec(`INSERT INTO runs (id, user_id, kind, issue_title, issue_description, status, target_run_id)
+			          VALUES ($1, $2, 'judge', 't', 'd', 'queued', $3)`, judgeID, userID, targetID)
+			svc := New(env.q, env.box, testParams())
+			svc.SetVault(env.vlt)
+			svc.SetTxBeginner(env.pool)
+			svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
+			p, err := svc.Claim(env.ctx, store.Worker{ID: workerID, UserID: userID, Name: "worker-judge", Status: "online"}, nil)
+			if err != nil || p == nil || p.RunID != judgeID.String() || p.Kind != runkind.Judge {
+				t.Fatalf("Claim = %+v, %v; want the judge run", p, err)
+			}
+			check(t, "claude judge", p.Config, p.Config.DefaultEffort, tc.want)
+		})
+		t.Run("chat/"+tc.name, func(t *testing.T) {
+			fx := newCDFix(t)
+			fx.env.exec(`UPDATE users SET default_effort = $2, default_codex_effort = 'max' WHERE id = $1`, fx.userID, tc.stored)
+			chat := fx.chatRun(t)
+			p, err := fx.svc.ClaimChat(fx.env.ctx, fx.worker(t))
+			if err != nil || p == nil || p.RunID != chat.String() {
+				t.Fatalf("ClaimChat = %+v, %v; want the chat run", p, err)
+			}
+			check(t, "claude chat", p.Config, p.Config.DefaultEffort, tc.want)
+		})
+	}
 }
 
 func TestRuntimeEffortJobClaimLiveDB(t *testing.T) {

@@ -1,6 +1,9 @@
 package agenttmpl
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestValidateEffort(t *testing.T) {
 	// Blank / whitespace-only means inherit: no error, empty result.
@@ -93,8 +96,18 @@ func TestValidateDefaultEffort(t *testing.T) {
 			t.Errorf("ValidateDefaultEffort(%q) accepted", in)
 		}
 	}
-	// The pin validator still refuses the preference-only token.
-	if _, err := ValidateEffort("runtime"); err == nil {
-		t.Error("ValidateEffort accepted runtime")
+	_, err := ValidateDefaultEffort("ultra")
+	const wantMsg = "effort must be one of low, medium, high, xhigh, max or runtime"
+	if err == nil || err.Error() != wantMsg {
+		t.Errorf("ValidateDefaultEffort(ultra) error = %v, want %q", err, wantMsg)
+	}
+	// The pin validator still refuses the preference-only token, and its message
+	// does not advertise it.
+	_, err = ValidateEffort("runtime")
+	if err == nil {
+		t.Fatal("ValidateEffort accepted runtime")
+	}
+	if strings.Contains(err.Error(), "or runtime") {
+		t.Errorf("ValidateEffort error advertises runtime: %q", err)
 	}
 }

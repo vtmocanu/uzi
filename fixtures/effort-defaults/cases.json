@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared cases for PRD #3247. ordinary: the stored per-harness preference to its resolution and settings cell. validators: ValidateDefaultEffort inputs and the NULL/token stored. checker: Plan/Code checker effort is independent of the ordinary preference (ordinary_stored is documentation: ResolveCrossCheck takes no worker-effort input). Go reads this in api/internal/handler; the Vitest mock consumer is added with the web change.",
+  "_comment": "Shared cases for PRD #3247. ordinary: the stored per-harness preference to its resolution and settings cell. validators: ValidateDefaultEffort inputs and the NULL/token stored. checker: Plan/Code checker effort is independent of the ordinary preference (ordinary_stored is documentation: ResolveCrossCheck takes no worker-effort input). Go reads this in api/internal/handler; the Vitest mock consumer is web/src/mocks/mockApi.effortDefaults.test.ts.",
   "ordinary": [
     {
       "id": "claude-null",

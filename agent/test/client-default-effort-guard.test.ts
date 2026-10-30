@@ -58,10 +58,21 @@ for (const [label, kind, claim] of LANES) {
           && l.msg.includes("default_effort"));
         assert.equal(warns.length, 1);
         assert.match(JSON.stringify(warns[0]), new RegExp(`"run_id":"${String((body as { run_id?: unknown }).run_id)}"`));
-        assert.match(JSON.stringify(warns[0]), new RegExp(`"kind":"${kind}"`));
+        assert.doesNotMatch(JSON.stringify(warns[0]), /"kind"/);
         if (typeof bad === "string" && bad !== "") assert.ok(!JSON.stringify(lines).includes(bad));
       });
     }
+    // The cross-check lane rejects a kind that disagrees with its marker before this guard runs.
+    it("does not echo a hostile claim kind", { skip: kind === "cross_check" }, async () => {
+      await client.register("effort-worker");
+      const hostile = "hostile-" + "K".repeat(500);
+      setBody(kind, { default_effort: "ultra" });
+      body.kind = hostile;
+      const decoded = await claim();
+      assert.ok(decoded);
+      assert.equal(Object.hasOwn(cfg(decoded), "default_effort"), false);
+      assert.ok(!JSON.stringify(lines).includes("hostile-"));
+    });
     for (const ok of HARNESS_EFFORTS) {
       it(`keeps default_effort ${ok}`, async () => {
         await client.register("effort-worker");
