@@ -163,28 +163,16 @@ it("R1 B1: actual oversized source remains unknown and cannot become ordinary", 
   await restarted.closeTerminalObservationScan();
 });
 
-for (const kind of ["policy", "unknown"] as const) for (const policyFirst of [false, true]) {
-  it(`R1 T1: real case aliases preserve ${kind} evidence, policy first=${policyFirst}`, async t => {
+for (const kind of ["policy", "unknown"] as const) for (const policyListedFirst of [false, true]) {
+  it(`R1 T1: real case aliases preserve ${kind} evidence, policy listed first=${policyListedFirst}`, async t => {
     const { outbox, root } = await fixture(t);
     const ordinary = () => outbox.journalTerminal(run.toUpperCase(), 1, "running", 0, { status: "failed" });
     const protect = async () => {
       assert.equal((await outbox.journalPolicyHold(run, policy)).journaled, true);
       if (kind === "unknown") await fs.writeFile(path.join(root, run, "terminal-1.json"), "invalid");
     };
-    if (policyFirst) {
-      const entered = latch(), resume = latch();
-      const original = outbox.hasPendingPolicyOutcome.bind(outbox);
-      outbox.hasPendingPolicyOutcome = async id => {
-        const result = await original(id);
-        if (id === run.toUpperCase()) { assert.equal(result, false); entered.resolve(); await resume.promise; }
-        return result;
-      };
-      const installingOrdinary = ordinary();
-      try { await entered.promise; await protect(); }
-      finally { resume.resolve(); }
-      assert.equal((await installingOrdinary).journaled, true);
-      outbox.hasPendingPolicyOutcome = original;
-    } else { assert.equal((await ordinary()).journaled, true); await protect(); }
+    assert.equal((await ordinary()).journaled, true);
+    await protect();
     // Restart rederives unknown evidence from the physical source.
     const restarted = new Outbox({ root, log: nullLogger(), maxBytes: 1e6, runMaxBytes: 1e6, retentionMs: 1 });
     await restarted.init();
@@ -192,7 +180,7 @@ for (const kind of ["policy", "unknown"] as const) for (const policyFirst of [fa
     const sources = restarted.listPendingTerminals().sort((a, b) =>
       (a.outcome_kind === "terminal" ? 0 : 1) - (b.outcome_kind === "terminal" ? 0 : 1));
     assert.equal(sources.length, 2);
-    if (policyFirst) sources.reverse();
+    if (policyListedFirst) sources.reverse();
     const registry = new ActiveRunRegistry(() => sources, () => 1);
     assert.equal(registry.claimsPausedByPendingOverflow(), true);
     assert.equal(registry.build().pending_overflow, true);

@@ -463,10 +463,20 @@ for (const [site, budget, count] of [
         return typeof value === "function" ? value.bind(target) : value;
       } });
     });
-    assert.equal(await outbox.hasPendingPolicyOutcome(run), true, "inventory exhaustion cannot prove absence");
-    assert.ok(targetEntries > 0, "the target directory was actually examined");
-    assert.ok(targetEntries <= Math.min(4096, budget), "ignored entries consume the directory item budget");
-    assert.ok(entries <= Math.min(4096, totalBudget), "all directories share the aggregate item budget");
+    let previous = 0, largestSlice = 0, yields = 0;
+    const schedule = setImmediate;
+    t.mock.method(globalThis, "setImmediate", (callback: () => void) => {
+      yields++;
+      largestSlice = Math.max(largestSlice, entries - previous);
+      previous = entries;
+      return schedule(callback);
+    });
+    assert.equal(await outbox.hasPendingPolicyOutcome(run), false, "bounded slices eventually prove absence");
+    largestSlice = Math.max(largestSlice, entries - previous);
+    assert.ok(largestSlice <= 256, "ignored entries consume the per-slice visit budget");
+    assert.ok(yields >= Math.floor(count / 256), "continuation explicitly yields between bounded slices");
+    assert.ok(targetEntries >= count, "every ignored physical entry was visited");
+    assert.ok(entries >= count, "all directories share the slice visit budget");
   });
 }
 

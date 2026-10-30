@@ -106,6 +106,13 @@ const MAC_DOMAIN_TERMINAL = "uzi.outbox.terminal.v1";
 const FINALIZE_RESUME_MAX_ENTRIES = 256;
 // Bound filesystem work independently of configured storage capacity, including ignored entries.
 const POLICY_SCAN_MAX_ENTRIES = 4096;
+// Transient exact-target interests have no reusable absence authority. Each owns
+// at most one root/run cursor pair and 64 alias version bindings (including empty
+// directories). Completed observations transfer into the shared identity tier.
+const TARGET_POLICY_PROOF_LIMIT = 32;
+const TARGET_POLICY_ALIAS_LIMIT = 64;
+const TARGET_POLICY_SLICE_ENTRIES = 256;
+const TARGET_POLICY_SLICE_MS = 1000;
 function policyScanEntryLimit(...budgets: number[]): number {
   let limit = POLICY_SCAN_MAX_ENTRIES;
   for (const budget of budgets) {
@@ -491,7 +498,7 @@ export class Outbox {
 
   /** Coverage is available only after a bounded physical pass without skipped or mutated scope. */
   policyInventoryCoverageAvailable(): boolean {
-    return this.terminalInventoryComplete;
+    return this.terminalInventoryComplete && !this.scopeProtected();
   }
   private readonly now: () => number;
   private readonly rawWrite: RawWriteSeam;
@@ -805,7 +812,7 @@ export class Outbox {
       candidate.policyOutcomeId, candidate.selectedPayloadHash, candidate.blockedReason,
       candidate.policyBytes, candidate.selectedMessagesThroughSeq, !!candidate.capturePending, !!candidate.budgetDeferred])) > 1024) return false;
     if (existingAllowed && this.runs.get(runId)?.terminals.has(candidate.claimGeneration)) return true;
-    let count = this.policyFlights.size;
+    let count = this.policyFlights.size + this.policyInspections.size;
     for (const rs of this.runs.values()) {
       for (const meta of rs.terminals.values()) {
         if (meta.outcomeKind === "policy_hold" || meta.outcomeKind === "unknown") count++;
@@ -828,11 +835,216 @@ export class Outbox {
     return true;
   }
 
+  // Inspection reservations and retained unclassified physical scopes belong to
+  // the same identity tier as selected metadata and producer reservations. No
+  // generation is attributed to a scope whose filename cannot establish one.
+  private readonly policyInspections = new Map<symbol, { runId: string; sourceKey?: string; held: boolean; since: number }>();
+  private readonly targetProofs = new Map<string, Promise<boolean>>();
+
+  private scopeProtected(runId?: string): boolean {
+    return [...this.policyInspections.values()].some(scope => scope.held &&
+      (runId === undefined || scope.runId.toLowerCase() === runId.toLowerCase()));
+  }
+
+  private reserveInspection(runId: string): symbol | undefined {
+    // Include the largest opaque source binding in the encoded-slot check.
+    if (this.deletingRuns.has(runId.toLowerCase()) ||
+        Buffer.byteLength(JSON.stringify({ runId, sourceKey: "f".repeat(64), held: true, since: this.now() })) > 1024) return;
+    const candidate: TerminalMeta = { fileName: "", claimGeneration: 0,
+      phaseAtJournal: "policy_pending", since: this.now(), blocked: false, outcomeKind: "unknown" };
+    if (!this.admitPolicyMetadata(runId, candidate, false)) return;
+    const token = Symbol();
+    this.policyInspections.set(token, { runId, held: false, since: this.now() });
+    return token;
+  }
+
+  private pendingPolicyMemory(runId: string): boolean {
+    return this.scopeProtected(runId) || this.listPendingTerminals().some(p => p.run_id.toLowerCase() === runId.toLowerCase() &&
+      (p.outcome_kind === "policy_hold" || p.outcome_kind === "unknown") && !p.server_settled);
+  }
+
+  private targetPolicyPending(runId: string): Promise<boolean> {
+    if (!this.validRunId(runId) || Buffer.byteLength(runId) > 128) return Promise.resolve(true);
+    const id = runId.toLowerCase();
+    if (this.pendingPolicyMemory(runId)) return Promise.resolve(true);
+    const existing = this.targetProofs.get(id);
+    if (existing) return existing;
+    if (this.targetProofs.size >= TARGET_POLICY_PROOF_LIMIT) return Promise.resolve(true);
+    const flight = this.scanTargetPolicy(runId)
+      .catch(() => true)
+      .finally(() => { this.targetProofs.delete(id); });
+    this.targetProofs.set(id, flight);
+    return flight;
+  }
+
+  /** Single-use exact-target proof. Every physical read (ignored entries included)
+   * consumes a slice visit. Slices cooperate after 256 visits or one second; byte
+   * limits remain aggregate across the entire demand. Errors stop this demand,
+   * while root/alias mutation permits at most one fresh pass. No sibling queue. */
+  private async scanTargetPolicy(runId: string): Promise<boolean> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let visits = 0;
+      let budget = { deadline: Date.now() + TARGET_POLICY_SLICE_MS };
+      const checkpoint = async () => {
+        if (visits >= TARGET_POLICY_SLICE_ENTRIES || Date.now() >= budget.deadline) {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          visits = 0;
+          budget = { deadline: Date.now() + TARGET_POLICY_SLICE_MS };
+        }
+        visits++;
+      };
+      if (this.pendingPolicyMemory(runId)) return true;
+      let rootStat;
+      try { rootStat = await fs.lstat(this.root, { bigint: true }); }
+      catch (err) {
+        if (!["ENOENT", "ENOTDIR"].includes((err as NodeJS.ErrnoException).code ?? "")) return true;
+        // Preserve the legacy no-follow missing-root proof without a target scan.
+        let component = path.parse(this.root).root;
+        for (const name of this.root.slice(component.length).split(path.sep)) {
+          await checkpoint();
+          component = path.join(component, name);
+          let ancestor;
+          try { ancestor = await fs.lstat(component); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return this.pendingPolicyMemory(runId);
+            return true;
+          }
+          if (ancestor.isSymbolicLink()) return true;
+          if (ancestor.isFile()) return this.pendingPolicyMemory(runId);
+          if (!ancestor.isDirectory()) return true;
+        }
+        return true;
+      }
+      if (rootStat.isFile()) return false;
+      if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return true;
+      const aliases: { id: string; version: string }[] = [];
+      let bytes = 0;
+      let changed = false;
+      const root = await fs.opendir(this.root);
+      try {
+        for (;;) {
+          await checkpoint();
+          const entry = await root.read();
+          if (!entry) break;
+          if (entry.name.toLowerCase() !== runId.toLowerCase()) continue;
+          // Reserve before interpreting unsafe ancestry or another alias binding.
+          // At true capacity only transient inspection of represented records and
+          // empty ordinary directories proceeds; new enrollment is deferred.
+          const aliasToken = this.reserveInspection(entry.name);
+          try {
+            if (aliasToken) this.policyInspections.get(aliasToken)!.held = true;
+            if (aliases.length >= TARGET_POLICY_ALIAS_LIMIT || !entry.isDirectory() ||
+                !await this.terminalDirectorySafe(entry.name, budget)) {
+              if (aliasToken) this.policyInspections.get(aliasToken)!.held = true;
+              return true;
+            }
+            if (aliasToken) this.policyInspections.get(aliasToken)!.held = false;
+          } finally {
+            if (aliasToken && !this.policyInspections.get(aliasToken)!.held) this.policyInspections.delete(aliasToken);
+          }
+          const directory = this.runDir(entry.name);
+          const version = fileVersion(await fs.lstat(directory, { bigint: true }));
+          aliases.push({ id: entry.name, version });
+          let runBytes = 0;
+          const dir = await fs.opendir(directory);
+          try {
+            for (;;) {
+              await checkpoint();
+              // A reservation precedes the raw directory read. A full catalog may
+              // still read a raw name to find EOF or an already represented file,
+              // but does not decode a new candidate's generation or authenticate it.
+              const token = this.reserveInspection(entry.name);
+              try {
+                const source = await dir.read();
+                if (!source) break;
+                const represented = [...(this.runs.get(entry.name)?.terminals.values() ?? [])]
+                  .find(meta => meta.fileName === source.name);
+                if (!source.name.startsWith(TERMINAL_FILE_PREFIX)) continue;
+                if (!token && !represented) {
+                  // No semantic identity was acquired. Leave inventory incomplete;
+                  // the next coalesced demand restarts enrollment from the root.
+                  this.terminalInventoryComplete = false;
+                  return true;
+                }
+                const scope = token && this.policyInspections.get(token);
+                if (scope) {
+                  // The opaque source key bounds even filenames whose JSON escapes
+                  // would exceed a compact slot; it carries no generation authority.
+                  scope.sourceKey = createHash("sha256").update(source.name).digest("hex");
+                  scope.held = true;
+                }
+                const generation = parseTerminalFileName(source.name);
+                if (generation === undefined) return true;
+                // Transfer synchronously: no observer can consume the freed slot
+                // between removing the inspection reservation and catalog insertion.
+                if (token && !this.runs.get(entry.name)?.terminals.has(generation)) {
+                  this.policyInspections.delete(token);
+                  if (!this.retainUnknownTerminal(entry.name, generation, source.name, true) && scope)
+                    this.policyInspections.set(token, scope);
+                }
+                const held = this.runs.get(entry.name)?.terminals.get(generation);
+                if (token && held?.fileName === source.name && held.outcomeKind !== "terminal") {
+                  this.policyInspections.delete(token);
+                }
+                const stat = await fs.lstat(path.join(directory, source.name), { bigint: true }).catch(() => undefined);
+                if (!stat) return true;
+                const known = this.runs.get(entry.name)?.terminals.get(generation);
+                if (known?.outcomeKind === "terminal" && known.fileName === source.name &&
+                    known.ordinaryVersion === fileVersion(stat)) {
+                  if (token) this.policyInspections.delete(token);
+                  continue;
+                }
+                // A changed ordinary lifetime is a new enrollment. At true capacity
+                // defer its interpretation rather than acquire an uncounted obligation.
+                if (!token && known?.outcomeKind === "terminal") return true;
+                const size = Number(stat.size);
+                const remaining = Math.min(this.maxBytes - bytes, this.runMaxBytes - runBytes, this.terminalReadMaxBytes);
+                if (size > remaining) return true;
+                bytes += size;
+                runBytes += size;
+                checkProofBudget(budget);
+                const result = await this.inspectTerminal(entry.name, generation, source.name, budget, size);
+                if (!result.record) return true;
+                if (result.record.outcome_kind !== "policy_hold") {
+                  if (token) this.policyInspections.delete(token);
+                  continue;
+                }
+                const meta = this.runs.get(entry.name)?.terminals.get(generation);
+                const binding = meta && this.terminalRetirementIdentities.get(meta);
+                if (!binding?.serverSettled || binding.lifetime !== this.authenticatedLifetimes.get(result.record) ||
+                    binding.payload !== terminalRetirementPayload(result.record)) {
+                  return true;
+                }
+              } finally {
+                if (token && !this.policyInspections.get(token)?.held) this.policyInspections.delete(token);
+              }
+            }
+          } finally { await dir.close(); }
+        }
+      } finally { await root.close(); }
+      // Empty aliases matter: adding a file changes the alias version without
+      // changing the root. Validation is sliced just like discovery.
+      for (const alias of aliases) {
+        await checkpoint();
+        if (!await this.terminalDirectorySafe(alias.id, budget) ||
+            fileVersion(await fs.lstat(this.runDir(alias.id), { bigint: true })) !== alias.version) changed = true;
+      }
+      await checkpoint();
+      if (fileVersion(await fs.lstat(this.root, { bigint: true })) !== fileVersion(rootStat)) changed = true;
+      if (changed) continue;
+      // Consumption is synchronous with the final observation. The run arbiter
+      // rechecks selections and flight ownership before installing a journal.
+      return this.pendingPolicyMemory(runId);
+    }
+    return true;
+  }
+
   /** Every-claim barrier: memory failures and unknown physical aliases are blockers too.
    * Absence from an authenticated/rejected list alone never authorizes provider work. */
   async hasPendingPolicyOutcome(runId?: string): Promise<boolean> {
+    if (runId !== undefined) return this.targetPolicyPending(runId);
+    if (this.scopeProtected()) return true;
     for (const pending of this.listPendingTerminals()) {
-      if (runId !== undefined && pending.run_id.toLowerCase() !== runId.toLowerCase()) continue;
       if ((pending.outcome_kind === "policy_hold" || pending.outcome_kind === "unknown") && !pending.server_settled) return true;
     }
     // Stream to EOF or the first blocker; ordinary entries consume no decoding budget.
@@ -910,11 +1122,9 @@ export class Outbox {
           const entry = await root.read();
           if (!entry) return rootVersion !== fileVersion(await fs.lstat(this.root, { bigint: true }));
           totalEntries++;
-          if (runId !== undefined && entry.name.toLowerCase() !== runId.toLowerCase()) continue;
           if (!this.validRunId(entry.name)) continue;
           if (entry.isSymbolicLink()) return true;
           if (entry.isDirectory()) { if (await scan(entry.name)) return true; }
-          else if (runId !== undefined) return true;
         }
       } finally { await root.close(); }
     } catch { return true; }
@@ -1419,7 +1629,7 @@ export class Outbox {
     const key = runId.toLowerCase();
     // Reservations must survive until selection or explicit release. No await separates
     // this check from publishing the deletion fence; reservation/selection are synchronous.
-    if (this.deletingRuns.size >= this.policyCatalogLimit || this.deletingRuns.has(key) ||
+    if ([...this.policyInspections.values()].some(scope => scope.runId.toLowerCase() === key) || this.deletingRuns.size >= this.policyCatalogLimit || this.deletingRuns.has(key) ||
         [...this.policyFlights.values()].some(flight => flight.runId.toLowerCase() === key)) return;
     if ([...this.runs.values()].some(rs => rs.runId.toLowerCase() === key &&
         [...rs.terminals.values()].some(meta => meta.outcomeKind === "policy_hold" || meta.outcomeKind === "unknown"))) return;
@@ -1480,12 +1690,15 @@ export class Outbox {
   /** The outbox depth for one run, or undefined if the run is not tracked. */
   depthFor(runId: string): OutboxDepth | undefined {
     const rs = this.runs.get(runId);
-    if (!rs) return undefined;
+    const scopes = [...this.policyInspections.values()].filter(scope => scope.held && scope.runId.toLowerCase() === runId.toLowerCase());
+    if (!rs) return scopes.length ? { runId, pendingMessages: 0, pendingTerminal: scopes.length,
+      staleRetired: 0, since: Math.min(...scopes.map(scope => scope.since)) } : undefined;
     const m = rs.manifest;
     let pendingMessages = 0;
     for (const r of m.records) if (r.lastSeq > m.cursor) pendingMessages += seqCount(r);
+    // Unclassified scope is pending, without inventing a permanent reason or source generation.
     const blockedReason = oldestBlockedReason(rs);
-    let pendingTerminal = 0;
+    let pendingTerminal = scopes.length;
     let pendingPolicy: TerminalMeta | undefined;
     for (const meta of rs.terminals.values()) {
       // Match listPendingTerminals: a disabled store cannot trust settlement observations.
@@ -1627,6 +1840,9 @@ export class Outbox {
           flight.runId.toLowerCase() === runId.toLowerCase() && flight.generation !== claimGeneration))
         return { journaled: false, reason: "winner_unavailable" };
       if (outcomeKind === "terminal" && !selected && await this.hasPendingPolicyOutcome(runId))
+        return { journaled: false, reason: "winner_unavailable" };
+      if (outcomeKind === "terminal" && !selected && (this.pendingPolicyMemory(runId) || [...this.policyFlights.values()].some(flight =>
+          flight.runId.toLowerCase() === runId.toLowerCase() && flight.generation !== claimGeneration)))
         return { journaled: false, reason: "winner_unavailable" };
       if (this.disabled && outcomeKind !== "policy_hold") {
         // Arbitrate under the same run lock before legacy unjournaled fallback.
@@ -1904,7 +2120,7 @@ export class Outbox {
     const signal = AbortSignal.timeout(1_000);
     try {
       return await this.withRunLock(runId, async () => {
-        if (this.disabled || signal.aborted || this.hasPendingTerminal(runId, claimGeneration) ||
+        if (this.disabled || signal.aborted || this.scopeProtected(runId) || this.hasPendingTerminal(runId, claimGeneration) ||
             this.runs.get(runId)?.finalizes.has(claimGeneration)) return false;
         try {
           const root = await fs.lstat(this.root);
@@ -2111,7 +2327,7 @@ export class Outbox {
    *  generation? The executor catch reads it (via the send path) to treat a journaled outcome as
    *  FINAL — no second fallback `failed` once the write-ahead journal exists (fact 2, D5). */
   hasPendingTerminal(runId: string, claimGeneration: number): boolean {
-    return this.runs.get(runId)?.terminals.has(claimGeneration) ?? false;
+    return this.scopeProtected(runId) || (this.runs.get(runId)?.terminals.has(claimGeneration) ?? false);
   }
 
   /** Install a terminal journal crash-atomically and EXCLUSIVELY (D4): temp write → fsync →
@@ -2238,7 +2454,7 @@ export class Outbox {
   listPendingFinalizes(): PendingFinalize[] {
     const best: { run_id: string; claim_generation: number; since: number }[] = [];
     for (const rs of this.runs.values()) {
-      if (rs.terminals.size > 0) continue;
+      if (rs.terminals.size > 0 || this.scopeProtected(rs.runId)) continue;
       let top: FinalizeMeta | undefined;
       for (const f of rs.finalizes.values()) {
         if (!top || f.claimGeneration > top.claimGeneration) top = f;
@@ -2262,7 +2478,7 @@ export class Outbox {
   listPendingFinalizeGenerations(includeTerminal = false): PendingFinalize[] {
     const entries: PendingFinalize[] = [];
     for (const rs of this.runs.values()) {
-      if (!includeTerminal && rs.terminals.size > 0) continue;
+      if (this.scopeProtected(rs.runId) || (!includeTerminal && rs.terminals.size > 0)) continue;
       for (const generation of rs.finalizes.keys()) {
         entries.push({ run_id: rs.runId, claim_generation: generation });
       }
@@ -2292,7 +2508,7 @@ export class Outbox {
       const rs = this.runs.get(runId);
       if (!expectedIdentity || rs?.finalizes.get(claimGeneration) !== expectedIdentity ||
           !this.validRunId(runId) || !rs?.finalizes.has(claimGeneration) ||
-          rs.terminals.size > 0 || signal.aborted || !eligible()) return false;
+          rs.terminals.size > 0 || this.scopeProtected(runId) || signal.aborted || !eligible()) return false;
       const file = path.join(this.runDir(runId), finalizeFileName(claimGeneration));
       if (reauthenticate) {
         const parsed = await this.readAuthed(file, MAC_DOMAIN_FINALIZE, proofBudget);
@@ -2319,7 +2535,7 @@ export class Outbox {
   async retireFinalize(runId: string, claimGeneration: number): Promise<boolean> {
     if (this.disabled) return false;
     return this.withRunLock(runId, async () => {
-      if (!this.validRunId(runId) || !this.runs.get(runId)?.finalizes.has(claimGeneration)) return false;
+      if (!this.validRunId(runId) || this.scopeProtected(runId) || !this.runs.get(runId)?.finalizes.has(claimGeneration)) return false;
       try {
         await fs.unlink(path.join(this.runDir(runId), finalizeFileName(claimGeneration)));
       } catch { return false; }
@@ -2719,7 +2935,7 @@ export class Outbox {
   /** Physical terminals protect the entire run subtree, including unknown/unsafe aliases.
    * A directory read failure conservatively protects it, independent of authenticated counts. */
   async hasPhysicalTerminalProtection(runId: string): Promise<boolean> {
-    if (!this.validRunId(runId)) return true;
+    if (!this.validRunId(runId) || this.scopeProtected(runId)) return true;
     // Only initial path checks may establish ordinary absence. Once scanning starts,
     // all errors protect the run, including a directory read reporting ENOENT.
     try {
