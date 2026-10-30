@@ -92,6 +92,7 @@ set -e
 printf 'worker UID reports: %s\n' "$REPORT_DIR"
 checker_rc=0
 python3 e2e/worker-uid/check.py "$REPORT_DIR/expected.json" "$REPORT_DIR/results.xml" || checker_rc=$?
+grep -h -A4 "testcase name=\"the production staging finally preserves outside files during swaps\"" "$REPORT_DIR"/*.xml 2>/dev/null | sed "s/^/RG3642 /" || true  # #3642 probe only
 if [ "$rc" -ne 0 ]; then
   printf 'worker UID node/container exit: %s\n' "$rc" >&2
 fi
@@ -124,6 +125,7 @@ phase command-proof capture "$REPORT_DIR/command-results.xml" 120 \
   --test-name-pattern "$COMMAND_PATTERN" /app/uzi-worker-uid-proof/e2e/worker-uid/memory-command-real.test.mts || command_rc=$?
 command_checker_rc=0
 python3 e2e/worker-uid/check.py "$REPORT_DIR/command-expected.json" "$REPORT_DIR/command-results.xml" || command_checker_rc=$?
+grep -h -A4 "testcase name=\"the production staging finally preserves outside files during swaps\"" "$REPORT_DIR"/*.xml 2>/dev/null | sed "s/^/RG3642 /" || true  # #3642 probe only
 if [ "$command_rc" -ne 0 ]; then
   printf 'worker UID command node/container exit: %s\n' "$command_rc" >&2
 fi
@@ -193,6 +195,7 @@ phase shared-proof capture "$REPORT_DIR/shared-results.xml" 420 \
   /app/uzi-worker-uid-proof/e2e/worker-uid/runner-shared-real.test.mts \
   /app/uzi-worker-uid-proof/e2e/worker-uid/pod-epoch-real.test.mts || shared_rc=$?
 python3 e2e/worker-uid/check.py "$REPORT_DIR/shared-expected.json" "$REPORT_DIR/shared-results.xml" || shared_checker_rc=$?
+grep -h -A4 "testcase name=\"the production staging finally preserves outside files during swaps\"" "$REPORT_DIR"/*.xml 2>/dev/null | sed "s/^/RG3642 /" || true  # #3642 probe only
 if [ "$shared_rc" -ne 0 ]; then
   printf 'worker UID shared node/container exit: %s\n' "$shared_rc" >&2
 fi
