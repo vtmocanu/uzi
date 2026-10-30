@@ -23,7 +23,7 @@ import { setTimeout as delay } from "node:timers/promises";
  * or an operation on the retiring source is unresolved, or the stored source is malformed or is not the
  * published source (`source_mismatch`).
  */
-export type AuthorityRefusalKind = "certificate_invalid" | "no_slot" | "slot_mismatch" | "operation_unresolved" | "source_mismatch";
+export type AuthorityRefusalKind = "certificate_invalid" | "no_slot" | "slot_mismatch" | "operation_unresolved" | "source_mismatch" | "retiring";
 
 export class AuthorityRefusal extends Error {
   readonly kind: AuthorityRefusalKind | undefined;

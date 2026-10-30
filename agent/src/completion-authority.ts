@@ -988,7 +988,7 @@ export class AuthorityStore {
     const harness: LeaseHarness = options.executor !== undefined ? "codex" : "claude";
     if (old) {
       if (blocksNewOperation(old.pending)) throw new AuthorityRefusal("source has an unresolved pending footprint");
-      if (old.state === "retiring") throw new AuthorityRefusal("source is being retired");
+      if (old.state === "retiring") throw new AuthorityRefusal("source is being retired", "retiring");
       if (old.state === "active" && old.owner.worker !== this.#init.incarnation) {
         throw new AuthorityRefusal("source is active under another worker incarnation");
       }
@@ -1127,7 +1127,7 @@ export class AuthorityStore {
     const old = await this.#load(dir, key);
     if (old) {
       if (blocksNewOperation(old.pending)) throw new AuthorityRefusal("source has an unresolved pending footprint");
-      if (old.state === "retiring") throw new AuthorityRefusal("source is being retired");
+      if (old.state === "retiring") throw new AuthorityRefusal("source is being retired", "retiring");
       if (old.state === "active" && old.owner.worker !== this.#init.incarnation) {
         throw new AuthorityRefusal("source is active under another worker incarnation");
       }
