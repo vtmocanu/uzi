@@ -12008,8 +12008,9 @@ export class RunRunner {
     // retirement: a retained stop, bounded by the requeue cap, never a terminal report. After a re-admission the
     // diagnostic carries the owner's ids; a fresh claim knows no owner, so its owner id and path digest are the fixed
     // placeholders (no path or error text leaves). A `retiring` slot with no blocking pending record is a retained stop;
-    // a slot with a running or settled-failed pending record (e.g. an interrupted operator discard) raises the untyped
-    // "source has an unresolved pending footprint" refusal first and stays terminal (a recorded residual).
+    // a slot whose pending record is still running, or whose destructive record settled failed (blocksNewOperation),
+    // raises the untyped "source has an unresolved pending footprint" refusal first and stays terminal (a recorded
+    // residual).
     const stopOnRetiringSlot = (err: unknown): void => {
       if (!(err instanceof AuthorityRefusal) || err.kind !== "retiring") return;
       this.retainedLifecycleGuard(flight);

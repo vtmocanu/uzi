@@ -1421,8 +1421,8 @@ same slot. It fails safe, because a retained stop is nonterminal and bounded by 
 requeue cap; the diagnostic names no owner or path when none is known. The untyped
 operator-discard refusal is raised only inside the discard itself, so a seed never
 sees it. A `retiring` slot with no blocking pending record is a retained stop. A
-retiring slot whose pending record is still running or settled failed (as an
-interrupted operator discard can leave it) raises the untyped "source has an
+retiring slot whose pending record is still running, or whose destructive record
+settled failed (as an interrupted operator discard can leave it) raises the untyped "source has an
 unresolved pending footprint" refusal at seed first, which stays terminal; it is
 outside this change and recorded as a residual.
 
