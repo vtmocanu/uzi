@@ -6,7 +6,80 @@
 
 **Review status:** P0 is resolved by the owner decision above. Both independent architecture reviews requested revisions, with no BLOCK; their findings and the product decision are folded here. Final architecture and lead/buddy reviews are complete; the implementation plan was approved at the run gate.
 
-**Implementation checkpoint (2026-10-29, M1 in progress):** The server transition, typed worker capture, durable reconciliation, claim-entry barrier, and basic CLI/web display are committed locally and have completed scoped review. Focused fake-provider tests exercise both refusal tags and initial-planning/implementation phases, capture degradation, journal failure, lost acknowledgement, cancellation and retained-source reconciliation. Canonical focused LiveDB tests have exercised report/replay admission, migration Up/Down, recovery writers and bounded pending-lease behavior. The excluded-revision producer regressions are now committed and reviewed: initial planning remains eligible, while awaiting_approval, persisted unapproved plans, stale/unknown gate evidence and an actual owner revision retain terminal policy-refusal behavior and saved work. The affected agent selection passed 1,861 tests; Codex M4 passed 189 tests and its required completeness matrix. A sequential local producer comparison measured 42 seconds for the prior 22 cases and 49 seconds for all 27; this single sample does not measure CI critical-path impact or isolate cache effects; CI queue/rerun costs were not measured. The required API gate is unfinished: its format/vet/build/sqlc/lint phases passed, but worker memory pressure interrupted dead-code analysis. An isolated retry with lower Go concurrency and more frequent garbage collection was also interrupted. No API-gate success, M1 completion, or check waiver is claimed. Issue-history and shared status labels now identify the applied hold consistently; focused UI regression and mutation checks passed. M1 remains in progress pending required validation and an owner continuation decision for that resource block. Owner continuation (M2) and contract-wide regression/documentation closure (M3) are not delivered. The capability is not advertised as ready. Policy Stop and awaiting_approval revise-turn admission are explicitly omitted under the approved keep-or-drop decisions. Natural-refusal acceptance is tracked in [#3608](https://github.com/vtmocanu/uzi/issues/3608), and same-conversation Docker compatibility in [#3609](https://github.com/vtmocanu/uzi/issues/3609); neither is newly created by this run.
+**Implementation checkpoint (2026-10-30, M1 incomplete):** M1 source is committed and review-clean through c7e987eb. The fixed M1-only repair window ends at 11:28 UTC. M1 is not complete: the required repository gate has no successful closing result. M2, M3 and I1 remain unstarted; no formal partial-delivery decision or criterion waiver is claimed. The capability is not advertised as ready. Policy Resume and Stop remain unavailable. This is a non-closing checkpoint, not a complete policy-hold rollout; #3068 remains open.
+
+The eighteen reported agent-shard failures were diagnosed separately: fifteen fixture assumptions expected quarantined evidence to disappear; one diagnostic counted unknown records as authenticated; ordinary terminal readback omitted the identity-bound process-local `server_settled` fact; and a positively empty disabled outbox suppressed the existing named `transport permanently failed (outbox_unavailable)` disposition. Fixtures changed only for the intended pending-evidence contract. The ordinary failure now occurs before clone or provider work. Unknown policy evidence still blocks admission and remains visible, without acquiring authenticated settlement or lease authority. Guarded disposal retains independent policy evidence and source attribution. An audit finding also led to bounded policy directory enumeration: ignored entries count toward the hard 4,096-entry ceiling and lower configured limits; exhaustion retains a blocker. A subsequent full-selection test failure compared a readback view with the stored journal; its repair separately checks exact stored bytes, canonical body and authenticated settlement state.
+
+### M1 executed evidence inventory
+
+All results below were executed in this repair window; historical CI is not substituted for them. API, shared fixtures, gate scripts and web inputs are unchanged by the later agent-only repairs. Code reviews cover the immutable feature range from 029502e9 plus each committed repair, including reviewer and auditor review through c7e987eb; their final reports have no open findings or deferred notes.
+
+| Required check | Observed result |
+| --- | --- |
+| `env -u UZI_TEST_DATABASE_URL task gate:api` | Passed, including dead-code analysis and ordinary no-DSN tests; API inputs unchanged since that run. |
+| `./e2e/run-store-it.sh` | Passed the complete seven-package LiveDB lane: 10,575 RUN/PASS cases and subcases, zero skips/failures; 4,312 seconds. |
+| `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent` | Passed again on c7e987eb, including lint, dead-code and type checks. |
+| Affected agent selection, Node `--test-concurrency=2 --test-timeout=120000` | All 70 selected files completed: 3,388 passed, zero failures/cancellations/skips; 1,927 seconds. Includes all seven reported shard-failure files. |
+| `task test:codex-m4` | 189 passed, zero skips/cancellations; completeness passed all required matrix cells, 37 catalogued clauses and 64 executed results; 131 seconds. |
+| `task gate:web` | Passed: 8,114 tests across 375 files and 30 browser tests across nine files; 580 seconds. Initial browser launch failed because an absolute temporary path exceeded the Unix socket limit; the narrowed browser lane and full gate passed using the supported Chromium override with a scratch-only relative temporary path. |
+| `task vulncheck:api` | Passed its called-vulnerability contract: zero called vulnerabilities. The report also lists three uncalled package/module findings; it is not a claim of zero dependency advisories. |
+| `task vulncheck:web`, `task vulncheck:agent` | Both passed, zero reported vulnerabilities. |
+| `task scan:secrets` | Passed, zero tracked findings; both canaries detected. |
+| `task sast:semgrep` | Passed: tree results/errors zero; canary detected. |
+| Tracked E2E literal/identifier sweep, then `task test:e2e-lib` and `task test:forge-fake` | Sweep found no stale expectation or new fake-route requirement. Both complete targets passed within the repository attempt before its later timeout. |
+| `task gate:repo` | Incomplete: the 600-second command bound interrupted `test:worker-uid-harness` during `calibration_run_test.py`. Its preceding five Python harness files passed; the 26-case runner file alone took 300.9 seconds. No failing assertion or baseline failure was established. The full gate is not passed. |
+
+Named M1 LiveDB obligations all have RUN/PASS with no skips in that closing lane: `TestPolicyHoldWorkerRouteLiveDB`, `TestPolicyHoldPendingDispositionLiveDB`, `TestPolicyHoldApplyReplayAndFencesLiveDB`, `TestPolicyHoldAdmissionAndConversionLiveDB`, `TestPolicyHoldSessionIdentityLiveDB`, `TestPolicyPendingLeaseSurvivesOmissionLiveDB`, and `TestCompactPolicyHoldMigrationLiveDB`. These cover the real application/worker routers and transaction, apply/replay and admission fences, pending ownership dispositions, session identity, pending-lease omission and actual migration Up/Down. They do not replace M2's positive owner Resume authentication/transaction regression.
+
+Lead-owned exact-candidate scratch proofs observed green regressions and expected failures when restoring the pre-repair behavior or bypassing enumeration, provider-start and authenticated-settlement guards. The repaired feature-loss test fails if the ordinary authenticated settlement readback is removed. One additional compound mutation command did not terminate within its bound and remains unvalidated; it is excluded from the passing evidence. Mutations never touched the shared candidate. The workflow subtree is unchanged from 029502e9. A shipping UUID-v4 changelog fragment is committed. Local timings are not controlled before/after measurements; CI critical-path, queue and cache impact remain unmeasured.
+
+### M1 verification still required
+
+A complete successful `task gate:repo` remains required. Its interrupted calibration file was not completed in that attempt. The following subsequent targets were not reached by that attempt and have no independent completed result in this window:
+
+- `test:store-it-cleanup`
+- `test:reset-recovery-tables`
+- `test:codex-git-trust-wrapper`
+- `test:uzi-watcher-backups`
+- `test:uzi-lander`
+- `test:ci-safe-paths`
+- `test:fmt-check-toolchain`
+- `test:govulncheck-toolchain`
+- `test:devbox-update`
+- `test:brew-tap-guard`
+- `check:spec-numbering`
+- `check:migration-additive`
+- `check:migration-numbering`
+- `check:e2e-registry-doc`
+- `check:no-binary-text`
+- `check:mktemp-portability`
+- `check:postgres-pin-parity`
+- `check:skill-size`
+- `check:guidance-size`
+- `check:api-v1-compat`
+- `test:changelog-fragments`
+- `test:changelog-entry`
+- `check:changelog-entry`
+- `test:changelog-rc-bullets`
+- `check:changelog-rc-bullets`
+- `test:hermetic-git-config`
+- `test:livedb-skip-guard`
+- `test:semgrep-parity`
+- `check:semgrep-parity`
+- `test:actions-tool-parity`
+- `check:actions-tool-parity`
+- `test:semgrep-gate`
+- `test:pricing-freshness`
+- `test:pricing-freshness-issue`
+- `check:token-literals`
+- `test:migration-renumber`
+- `test:refresh-role-manifest`
+- `test:agent-runtime-key`
+- `test:codex-supervisor`
+
+The two other targets after that interruption, `scan:secrets` and `sast:semgrep`, were independently executed successfully as recorded above. Their success does not turn the interrupted composed gate into a pass. No missing check is waived or transferred to natural-refusal acceptance.
+
+Owner continuation and its named `TestCompactPolicyResumeAuthMountLiveDB` regression remain deferred with M2. The cross-issue regression map, broader requirements/ADR/operator documentation and rollout closure remain deferred with M3; this checkpoint updates only actual M1 evidence. Policy Stop and awaiting_approval revise-turn admission remain the approved explicit omissions. Informative milestone I1 is not claimed complete. The lander still owns **full agent suite: exact-head PR CI** after publication; no local full agent suite or current-head PR CI pass is claimed. Natural-refusal acceptance remains in existing [#3608](https://github.com/vtmocanu/uzi/issues/3608), and same-conversation Docker compatibility remains in existing [#3609](https://github.com/vtmocanu/uzi/issues/3609). Neither tracker was recreated and no deliberate real refusal was induced.
 
 ## Problem
 
