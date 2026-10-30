@@ -3,12 +3,12 @@ import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import path from "node:path";
 import {
-  AuthorityRefusal, activeAuthorityTransaction, withAuthorityTransaction,
+  AuthorityRefusal, SourceUseHeldRefusal, activeAuthorityTransaction, withAuthorityTransaction,
   type AuthorityTransaction, type WorkerLifetime,
 } from "./authority-lock.js";
 import {
-  leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot,
-  type AuthorityFsOps, type AuthorityStore, type SlotCohort, type SlotSnapshot, type SourceUseLease,
+  leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot, processWorkerIncarnation,
+  type AuthorityFsOps, type AuthorityStore, type EndedSlotReceipt, type SlotCohort, type SlotSnapshot, type SourceUseLease,
 } from "./completion-authority.js";
 import {
   sourceCoreDigest, sourceFenceOf, verifyCertifiedSource, verifyPublishedSource,
@@ -176,6 +176,14 @@ export class AuthorityRuntime implements AuthorityScope {
   #retryTimer: NodeJS.Timeout | undefined;
   /** Collects the normalized slot paths this runtime admits inside {@link recordAdmissions}. */
   readonly #collector = new AsyncLocalStorage<Set<string>>();
+  /** Sinks whose flight finished its source use: any guarded admission made inside one is refused, permanently. */
+  readonly #retiredSinks = new WeakSet<Set<string>>();
+  /**
+   * Which sink admitted each normalized slot path, with the epoch it minted. Recorded only after a guarded
+   * admission inside a sink actually wrote the slot and set the lease; released only when the end of that
+   * epoch is confirmed (see {@link #releaseOwner}). A different sink (or none) cannot admit an owned key.
+   */
+  readonly #owners = new Map<string, { sink: Set<string>; epoch: string }>();
   /** The operator-discard lease per normalized slot path: an end of that source use tombstones or releases it. */
   readonly #discards = new Map<string, SourceUseLease>();
   /** The footprint items that existed when the operator discard took the slot over, per normalized slot path. */
@@ -323,6 +331,177 @@ export class AuthorityRuntime implements AuthorityScope {
   }
 
   /**
+   * Permanently refuse every guarded admission made inside `sink` (see {@link recordAdmissions}). The flight calls
+   * this when its source use ends, so a callback it left behind (a late git hook, a timer) cannot admit again.
+   * It is separate from per-key ownership: the keys the sink admitted stay owned until their end is confirmed.
+   */
+  retireSink(sink: Set<string>): void {
+    this.#retiredSinks.add(sink);
+  }
+
+  /**
+   * Barrier after {@link retireSink}: every admission runs under A, so taking A once (without the pre-callback drain
+   * and without opening the store) proves that an admission which passed its entry check before the retirement has
+   * finished and added its path to the sink; one that starts later is refused. Resolves true when A was taken (or this
+   * context already holds it, where no other admission can be running); false when A could not be taken within the
+   * wait (or the lock could not be verified), in which case the caller may rely only on the paths already named: an
+   * admission still running is either before its lease (a later end keeps its key, never queuing or ending it) or after
+   * it (ended only if that end gets A after the admission finished, else queued); a key without an end receipt blocks
+   * any settlement, so no settlement can cover an incomplete set.
+   */
+  async awaitSinkQuiescent(wait: AuthorityWait = {}): Promise<boolean> {
+    if (this.active()) return true;
+    try {
+      await withAuthorityTransaction(this.#options.lifetime, {
+        ...(wait.signal ? { signal: wait.signal } : {}),
+        timeoutMs: wait.timeoutMs ?? this.#options.timeoutMs ?? DEFAULT_WAIT_MS,
+      }, async () => undefined);
+      return true;
+    } catch { return false; }
+  }
+
+  /**
+   * The worker incarnation this runtime's slots are written under, once its store has been opened by any
+   * transaction (every admission opens it); undefined before that. Never acquires A. A memory-park record names it
+   * as the slot owner (issue #3638).
+   */
+  authorityIncarnation(): string | undefined {
+    return this.#store?.workerIncarnation ?? this.#options.workerIncarnation;
+  }
+
+  /**
+   * The epoch `sink`'s flight minted for `clonePath` and has not yet confirmed ended, else undefined. Read-only; a
+   * memory-park record binds it as `origin.sourceEpoch` (issue #3638).
+   */
+  ownedSourceEpoch(clonePath: string, sink: Set<string> | undefined): string | undefined {
+    const owner = this.#owners.get(path.resolve(clonePath));
+    return owner !== undefined && owner.sink === sink ? owner.epoch : undefined;
+  }
+
+  /**
+   * issue #3638 D3 - read-only verification of previously recorded ended slots. A is held through the same lock
+   * primitive as {@link withTransaction}, but the pre-callback drain of queued late settlements and ends is NOT run and
+   * the store is not opened for writing: each slot is read by its `path` through {@link peekAuthoritySlot}, its `authorityKey` is compared with the recorded one, and it must be
+   * `ineligible` with exactly the recorded epoch and seq, owned by `worker`. Any difference (a successor epoch, a changed
+   * seq, another owner, a missing slot) or any uncertainty (a lock timeout, an unreadable store or slot, a slot one ahead of
+   * its head) answers false. It writes nothing, authorizes nothing, and is used only to log whether a predecessor's
+   * cooperative settlement still holds.
+   */
+  async verifyEndedSlots(
+    sources: ReadonlyArray<{ path: string; authorityKey: string; epoch: string; seq: number }>, worker: string,
+    options: AuthorityWait = {},
+  ): Promise<boolean> {
+    if (sources.length === 0) return false;
+    const read = async (): Promise<boolean> => {
+      for (const source of sources) {
+        const slot = await peekAuthoritySlot({ dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken },
+          path.resolve(source.path));
+        if (!slot || slot.key !== source.authorityKey || slot.state !== "ineligible" || slot.epoch !== source.epoch ||
+            slot.seq !== source.seq || slot.owner.worker !== worker) return false;
+      }
+      return true;
+    };
+    try {
+      if (this.active()) return await read();
+      return await withAuthorityTransaction(this.#options.lifetime, {
+        ...(options.signal ? { signal: options.signal } : {}),
+        timeoutMs: options.timeoutMs ?? LATE_WAIT_MS,
+      }, read);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * issue #3638 D4 - classify, WITHOUT writing or repairing anything, what an admission of `clonePath` made by the flight
+   * owning `sink` would meet. A is held through the same lock primitive as {@link withTransaction}, but the pre-callback
+   * drain of queued late settlements and ends is NOT run, no idle drain is scheduled and the store is not (re)opened for
+   * writing: the slot is read only through {@link peekAuthoritySlot}, which never completes a slot that is one ahead of
+   * its head. Every uncertainty (that refusal, a lock timeout, an unreadable slot or store) is `other`, never eligibility.
+   *
+   * - `foreign_active`: the slot is `active` under another worker incarnation (the refusal bindSource would raise);
+   * - `held_unended`: this process's earlier flight (another sink) still owns the key with no confirmed end;
+   * - `admissible`: an admission would proceed (no slot, `ineligible`, or this incarnation's own active epoch);
+   * - `other`: a pending footprint, retiring, published or retired slot, or anything uncertain.
+   * `owner` names the slot's owner incarnation and epoch whenever it was read.
+   */
+  async classifySourceAdmission(
+    clonePath: string, sink: Set<string> | undefined, wait: AuthorityWait = {},
+  ): Promise<{ kind: "foreign_active" | "held_unended" | "admissible" | "other"; owner?: { worker: string; epoch: string } }> {
+    const key = path.resolve(clonePath);
+    const read = async (): Promise<{ kind: "foreign_active" | "held_unended" | "admissible" | "other"; owner?: { worker: string; epoch: string } }> => {
+      const slot = await peekAuthoritySlot({ dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken }, key);
+      const held = this.heldByOtherSink(key, sink);
+      if (!slot) return { kind: held ? "other" : "admissible" };
+      const owner = { worker: slot.owner.worker, epoch: slot.epoch };
+      if (slot.pending !== null || slot.state === "retiring" || slot.state === "retired" ||
+          slot.state === "sealed" || slot.state === "claude_ready") return { kind: "other", owner };
+      const incarnation = this.authorityIncarnation() ?? processWorkerIncarnation();
+      if (slot.state === "active") {
+        if (slot.owner.worker !== incarnation) return { kind: "foreign_active", owner };
+        return { kind: held ? "held_unended" : "admissible", owner };
+      }
+      return { kind: held ? "other" : "admissible", owner };
+    };
+    try {
+      if (this.active()) return await read();
+      return await withAuthorityTransaction(this.#options.lifetime, {
+        ...(wait.signal ? { signal: wait.signal } : {}),
+        timeoutMs: wait.timeoutMs ?? this.#options.timeoutMs ?? DEFAULT_WAIT_MS,
+      }, read);
+    } catch {
+      return { kind: "other" };
+    }
+  }
+
+  /** Whether `clonePath` is owned by a sink other than `sink` whose end has not been confirmed. Read-only. */
+  heldByOtherSink(clonePath: string, sink: Set<string> | undefined): boolean {
+    const owner = this.#owners.get(path.resolve(clonePath));
+    return owner !== undefined && owner.sink !== sink;
+  }
+
+  /** Refuse, before any effect, an admission made inside a retired sink. */
+  #assertSinkLive(): void {
+    const sink = this.#collector.getStore();
+    if (sink && this.#retiredSinks.has(sink)) {
+      throw new SourceUseHeldRefusal("source use refused: the flight that made this admission already ended its source use");
+    }
+  }
+
+  /** Refuse, before any effect, an admission of a key another sink (or this one's predecessor) still owns. */
+  #assertNotOwnedByOther(key: string): void {
+    const owner = this.#owners.get(key);
+    if (owner && owner.sink !== this.#collector.getStore()) {
+      throw new SourceUseHeldRefusal("source use refused: an earlier flight's source use of this clone has no confirmed end");
+    }
+  }
+
+  #recordOwner(key: string, lease: SourceUseLease): void {
+    const sink = this.#collector.getStore();
+    if (sink) this.#owners.set(key, { sink, epoch: leaseEpoch(lease) });
+  }
+
+  /** The end of `key`'s recorded epoch is confirmed (or the slot is provably no longer that epoch): ownership ends. */
+  #releaseOwner(key: string): void {
+    this.#owners.delete(key);
+  }
+
+  /**
+   * Release `key`'s ownership when the slot is provably no longer this worker's active epoch of the recorded
+   * owner. Anything uncertain (an unreadable slot) leaves the owner in place.
+   */
+  async #recheckOwner(tx: AuthorityTransaction, store: AuthorityStore, key: string, known?: SlotSnapshot | null): Promise<void> {
+    const owner = this.#owners.get(key);
+    if (!owner) return;
+    let slot: SlotSnapshot | null;
+    try { slot = known !== undefined ? known : await this.#slotOf(tx, store, key); }
+    catch { return; }
+    if (!slot || slot.state !== "active" || slot.owner.worker !== store.workerIncarnation || slot.epoch !== owner.epoch) {
+      this.#releaseOwner(key);
+    }
+  }
+
+  /**
    * End this process's source use of `paths`: each slot this worker still holds `active` under the lease it
    * minted moves to `ineligible`, so a later worker incarnation may use the path again. The CALLER must have
    * ended the source use and positively joined every worker-owned source-capable tail first; this method
@@ -333,12 +512,27 @@ export class AuthorityRuntime implements AuthorityScope {
    * Runs under its own A (borrowing the active one) and releases it before returning.
    */
   async endSourceUse(
-    paths: Iterable<string>, options: AuthorityWait = {},
-  ): Promise<{ ended: string[]; kept: string[] }> {
+    paths: Iterable<string>, options: AuthorityWait & { sink?: Set<string>; skipFlightOwned?: boolean } = {},
+  ): Promise<{ ended: string[]; kept: string[]; endedSlots: Array<EndedSlotReceipt & { path: string }> }> {
     const keys = [...new Set([...paths].map((p) => path.resolve(p)))];
     const ended: string[] = [];
     const kept: string[] = [];
-    if (keys.length === 0) return { ended, kept };
+    // A key another unreleased sink owns is not this caller's to end: reported kept, never queued, never released.
+    // Computed before A is taken: a stale answer only keeps a key (fails closed). The `foreign` answer is stable
+    // for a key that is already owned when it is computed, because another sink's admission of an owned key is
+    // refused while its current owner holds it; a key that was unowned when computed and is admitted meanwhile is
+    // not in `foreign`, and the captured-lease check below drops it (this call holds no lease for it).
+    // `skipFlightOwned` (a caller that is no flight, e.g. a retained-source discard that may have been refused before
+    // admitting anything) keeps every owned key that has a captured lease unless that lease is the key's current
+    // discard lease (the operator discard of an unjoined key), which still ends. An owned key with no current lease
+    // is kept and rechecked, and its owner is released only when the recheck proves there is no epoch to end.
+    const foreign = new Set(keys.filter((key) => options.skipFlightOwned === true && this.#owners.has(key) &&
+        this.#discards.get(key) !== this.#leases.get(key) ||
+      options.sink !== undefined && this.heldByOtherSink(key, options.sink)));
+    if (foreign.size > 0) this.#options.log?.warn("source use left active: another flight owns it", { sources: foreign.size });
+    // The durable identity of each slot this call moved to `ineligible` itself: the only positive end evidence.
+    const endedSlots: Array<EndedSlotReceipt & { path: string }> = [];
+    if (keys.length === 0) return { ended, kept, endedSlots };
     const warn = (message: string, fields: Record<string, unknown>): void => this.#options.log?.warn(message, fields);
     // The leases are captured now: a later end applies only to exactly the epoch this call was asked to end.
     const captured = new Map<string, SourceUseLease>();
@@ -351,10 +545,11 @@ export class AuthorityRuntime implements AuthorityScope {
       await this.withTransaction(async (tx) => {
         const store = await this.#storeFor(tx);
         for (const key of keys) {
+          if (foreign.has(key)) { kept.push(key); continue; }
           const lease = captured.get(key);
-          if (!lease) { kept.push(key); continue; }
+          if (!lease) { kept.push(key); await this.#recheckOwner(tx, store, key); continue; }
           try {
-            const result = await this.#endOne(tx, store, key, lease);
+            const result = await this.#endOne(tx, store, key, lease, (receipt) => endedSlots.push({ ...receipt, path: key }));
             if (result === "ended") ended.push(key);
             else if (result === "kept") { kept.push(key); queue(key); }
           } catch (error) {
@@ -366,30 +561,39 @@ export class AuthorityRuntime implements AuthorityScope {
       }, options);
     } catch (error) {
       warn("source use left active: the authority transaction was unavailable", { error: error instanceof Error ? error.message : String(error) });
-      for (const key of keys) if (!ended.includes(key)) queue(key);
+      for (const key of keys) if (!ended.includes(key) && !foreign.has(key)) queue(key);
       this.#scheduleDrain();
-      return { ended, kept: keys.filter((key) => !ended.includes(key)) };
+      return { ended, kept: keys.filter((key) => !ended.includes(key)), endedSlots };
     }
-    return { ended, kept };
+    return { ended, kept, endedSlots };
   }
 
-  /** One slot's end under A: "ended", "dropped" (this process holds nothing here to end) or "kept" (retry later). */
-  async #endOne(tx: AuthorityTransaction, store: AuthorityStore, key: string, lease: SourceUseLease): Promise<"ended" | "dropped" | "kept"> {
-    if (this.#leases.get(key) !== lease) return "dropped";
+  /**
+   * One slot's end under A: "ended" (`onEnded` gets the saved slot identity when this call wrote the end),
+   * "dropped" (this process holds nothing here to end) or "kept" (retry later).
+   */
+  async #endOne(
+    tx: AuthorityTransaction, store: AuthorityStore, key: string, lease: SourceUseLease,
+    onEnded?: (receipt: EndedSlotReceipt) => void,
+  ): Promise<"ended" | "dropped" | "kept"> {
+    if (this.#leases.get(key) !== lease) { await this.#recheckOwner(tx, store, key); return "dropped"; }
     const slot = await this.#slotOf(tx, store, key);
     if (!slot || slot.epoch !== leaseEpoch(lease) || slot.owner.worker !== store.workerIncarnation) {
       // Someone else's epoch now: this process holds nothing here to end.
       this.#leases.delete(key);
+      await this.#recheckOwner(tx, store, key, slot);
       return "dropped";
     }
     if (slot.state === "retiring" && this.#discards.get(key) === lease) return this.#endDiscard(tx, store, key, lease, slot);
-    if (slot.state !== "active") { this.#leases.delete(key); return "dropped"; }
+    if (slot.state !== "active") { this.#leases.delete(key); await this.#recheckOwner(tx, store, key, slot); return "dropped"; }
     if (slot.pending?.status === "running") {
       this.#options.log?.warn("source use left active: an operation on it is unresolved", { source: key, operation: slot.pending.operation });
       return "kept";
     }
-    await store.transition(tx, lease, "ineligible");
+    const receipt = await store.transition(tx, lease, "ineligible");
     this.#leases.delete(key);
+    this.#releaseOwner(key);
+    onEnded?.(receipt);
     return "ended";
   }
 
@@ -421,6 +625,7 @@ export class AuthorityRuntime implements AuthorityScope {
     }
     await store.endOperatorDiscard(tx, lease, { allGone, nothingDeleted });
     this.#leases.delete(key);
+    this.#releaseOwner(key);
     this.#discards.delete(key);
     this.#discardPresent.delete(key);
     return "ended";
@@ -553,12 +758,14 @@ export class AuthorityRuntime implements AuthorityScope {
         try {
           await work({ tx, store });
           this.#leases.delete(key);
+          this.#releaseOwner(key);
           return { published: true };
         } catch (error) {
           let ended = false;
           try {
             await store.transition(tx, lease, "ineligible");
             this.#leases.delete(key);
+            this.#releaseOwner(key);
             ended = true;
           } catch (demote) {
             this.#options.log?.warn("a failed publication left its source active", { error: reasonOf(demote) });
@@ -622,7 +829,11 @@ export class AuthorityRuntime implements AuthorityScope {
    * (admitting the clone when none exists).
    */
   async bindSource(clonePath: string, executorIncarnation?: string, wait: AuthorityWait = {}): Promise<SourceUseLease> {
+    this.#assertSinkLive();
     return this.withTransaction(async (tx) => {
+      // Before the store is opened and before the path is named: a refusal leaves no trace.
+      this.#assertSinkLive();
+      this.#assertNotOwnedByOther(path.resolve(clonePath));
       const store = await this.#storeFor(tx);
       const key = path.resolve(clonePath);
       this.#note(key);
@@ -634,8 +845,11 @@ export class AuthorityRuntime implements AuthorityScope {
       if (held && slot && this.#ends.get(key) !== held && this.#ownedActive(store, slot, held) &&
           (executorIncarnation === undefined ? leaseHarness(held) === "claude" : slot.owner.executor === executorIncarnation)) return held;
       if (executorIncarnation === undefined) return this.#mint(tx, store, key);
+      // Re-checked inside A after the store and slot I/O above: the sink may have been retired meanwhile.
+      this.#assertSinkLive();
       const lease = await store.admitSourceUse(tx, key, { executor: executorIncarnation });
       this.#leases.set(key, lease);
+      this.#recordOwner(key, lease);
       return lease;
     }, wait);
   }
@@ -658,9 +872,12 @@ export class AuthorityRuntime implements AuthorityScope {
       ...(this.#options.workerIncarnation === undefined ? {} : { workerIncarnation: this.#options.workerIncarnation }),
       ...(this.#options.ops === undefined ? {} : { ops: this.#options.ops }),
     });
+    // Per-key ownership is cleared only here, on a storageId change. openAuthorityStore refuses a storage
+    // identity change after enrollment (completion-authority.ts), so ownership is never released mid-life.
     if (this.#store && this.#store.storageId === opened.storageId) return this.#store;
     this.#store = opened;
     this.#leases.clear();
+    this.#owners.clear();
     this.#discards.clear();
     this.#discardPresent.clear();
     return opened;
@@ -679,17 +896,27 @@ export class AuthorityRuntime implements AuthorityScope {
     tx: AuthorityTransaction, store: AuthorityStore, key: string,
     purpose: { destructive?: boolean; consumePublication?: boolean } = {},
   ): Promise<SourceUseLease> {
+    // Re-checked inside A, after the caller's store and slot I/O and before the write (a destructive record is not a flight's use).
+    if (purpose.destructive !== true) this.#assertSinkLive();
     // Recorded before the admission so a path whose admission wrote the slot and then failed is still named.
     this.#note(key);
     const lease = await store.admitSourceUse(tx, key, purpose);
     this.#leases.set(key, lease);
+    // A destructive record's lease is not a flight's source use: only a non-destructive mint is owned.
+    if (purpose.destructive !== true) this.#recordOwner(key, lease);
     return lease;
   }
 
   async #admit(clonePath: string, op: string): Promise<void> {
     const tx = this.#requireActive(op);
-    const store = await this.#storeFor(tx);
     const key = path.resolve(clonePath);
+    // Guarded before the store is opened, the seed parent is created or anything is named. The operator
+    // discard is unguarded by design: it proves its writers gone itself (opts.quiesce).
+    if (op !== "discard") {
+      this.#assertSinkLive();
+      this.#assertNotOwnedByOther(key);
+    }
+    const store = await this.#storeFor(tx);
     // A seed's parent (`<runnerRoot>/<repoDir>`) does not exist before a repo's first clone, and the store
     // keys a path only when every ancestor exists. Create it exactly as the seed itself would right after.
     if (SEED_OPS.has(op)) await fsp.mkdir(path.dirname(key), { recursive: true });
@@ -719,6 +946,7 @@ export class AuthorityRuntime implements AuthorityScope {
       const held = this.#leases.get(key);
       const slot = held ? await this.#slotOf(tx, store, key) : null;
       if (held && slot && this.#ends.get(key) !== held && this.#ownedActive(store, slot, held)) {
+        this.#assertSinkLive();
         this.#note(key);
         await store.admitSourceUse(tx, key, { lease: held });
         return;

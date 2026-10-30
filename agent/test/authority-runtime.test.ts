@@ -547,6 +547,9 @@ describe("assertBareClear needs no transaction", () => {
   });
 });
 
+/** The end outcome without the additive receipts, whose epochs are random. */
+const endKept = (o: { ended: string[]; kept: string[] }): { ended: string[]; kept: string[] } => ({ ended: o.ended, kept: o.kept });
+
 describe("ending a source use", () => {
   it("moves the slots this worker admitted to ineligible, so another incarnation can use the path", async (t) => {
     const r = await rig(t);
@@ -558,12 +561,14 @@ describe("ending a source use", () => {
       /active under another worker incarnation/);
 
     const outcome = await r.rt.endSourceUse([r.clone, r.clone]);
-    assert.deepEqual(outcome, { ended: [r.clone], kept: [] });
+    assert.deepEqual(endKept(outcome), { ended: [r.clone], kept: [] });
+    assert.equal(outcome.endedSlots.length, 1, "the confirmed end names the slot it wrote");
+    assert.equal(outcome.endedSlots[0]!.path, r.clone);
     assert.equal((await slotOf(r.rt, r.clone))?.state, "ineligible");
     assert.equal(r.rt.leaseFor(r.clone), undefined, "the lease is dropped");
     await successor.withTransaction(() => successor.hooks.admitSourceUse(r.clone, "seed-canonical"));
     assert.equal((await slotOf(r.rt, r.clone))?.state, "active");
-    assert.deepEqual(await r.rt.endSourceUse([r.clone]), { ended: [], kept: [r.clone] }, "nothing is held here any more: nothing to end");
+    assert.deepEqual(endKept(await r.rt.endSourceUse([r.clone])), { ended: [], kept: [r.clone] }, "nothing is held here any more: nothing to end");
     assert.equal((await slotOf(r.rt, r.clone))?.state, "active", "the successor's epoch is untouched");
   });
 
@@ -576,7 +581,7 @@ describe("ending a source use", () => {
     });
     await rt.withTransaction(() => rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
     await rt.withTransaction(() => rt.hooks.beginDestructive([r.clone], "runner-uid-delete"));
-    assert.deepEqual(await rt.endSourceUse([r.clone]), { ended: [], kept: [r.clone] });
+    assert.deepEqual(endKept(await rt.endSourceUse([r.clone])), { ended: [], kept: [r.clone] });
     assert.equal((await slotOf(rt, r.clone))?.state, "active");
     assert.match(warnings.join("\n"), /unresolved/);
   });
@@ -593,7 +598,8 @@ describe("ending a source use", () => {
     const outcome = await r.rt.endSourceUse([r.clone], { timeoutMs: 200 });
     release();
     await holder;
-    assert.deepEqual(outcome, { ended: [], kept: [r.clone] });
+    assert.deepEqual(endKept(outcome), { ended: [], kept: [r.clone] });
+    assert.deepEqual(outcome.endedSlots, [], "a kept slot has no confirmed end");
     // Kept, not forgotten: the end is queued and the drain applies it once A is free (see "an end that could not
     // be applied is retried by the drain"), so the slot is never left active forever by a slow A.
     let slot = await slotOf(successorOf(r), r.clone);
@@ -605,7 +611,7 @@ describe("ending a source use", () => {
     const r = await rig(t);
     const l1 = await r.rt.bindSource(r.clone);
     const settlement = await r.rt.withTransaction(() => r.rt.hooks.beginDestructive([r.clone], "runner-uid-delete"));
-    assert.deepEqual(await r.rt.endSourceUse([r.clone]), { ended: [], kept: [r.clone] }, "flight 1's end is queued behind the running record");
+    assert.deepEqual(endKept(await r.rt.endSourceUse([r.clone])), { ended: [], kept: [r.clone] }, "flight 1's end is queued behind the running record");
     // Flight 2 binds the same clone while flight 1's end is still queued behind the running record: it must not
     // be handed flight 1's lease (whose queued end would later retire flight 2's slot).
     await assert.rejects(r.rt.bindSource(r.clone), /unresolved pending footprint/);
@@ -632,6 +638,8 @@ describe("ending a source use", () => {
       /active under another worker incarnation/);
     assert.deepEqual([...refused], [r.clone]);
     const outside = new Set<string>();
+    // The owning sink's end is confirmed first: an admission outside any sink is otherwise refused (see the ownership tests).
+    await r.rt.endSourceUse([r.clone]);
     await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
     assert.equal(outside.size, 0, "nothing is recorded outside a recordAdmissions scope");
   });
@@ -925,7 +933,8 @@ describe("an end that could not be applied is retried by the drain", () => {
     const holder = withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async () => { acquired(); await held; });
     await holding;
     const outcome = await rt.endSourceUse([r.clone], { timeoutMs: 100 });
-    assert.deepEqual(outcome, { ended: [], kept: [r.clone] });
+    assert.deepEqual(endKept(outcome), { ended: [], kept: [r.clone] });
+    assert.deepEqual(outcome.endedSlots, [], "a kept slot has no confirmed end");
     release();
     await holder;
     let slot = await slotOf(successorOf(r), r.clone);
@@ -939,7 +948,7 @@ describe("an end that could not be applied is retried by the drain", () => {
     const rt = new AuthorityRuntime({ lifetime: r.lifetime, workerToken: TOKEN, timeoutMs: 5000, retryMs: 30 });
     await rt.withTransaction(() => rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
     const settlement = await rt.withTransaction(() => rt.hooks.beginDestructive([r.clone], "runner-uid-delete"));
-    assert.deepEqual(await rt.endSourceUse([r.clone]), { ended: [], kept: [r.clone] });
+    assert.deepEqual(endKept(await rt.endSourceUse([r.clone])), { ended: [], kept: [r.clone] });
     await new Promise((resolve) => setTimeout(resolve, 200));
     assert.equal((await slotOf(successorOf(r), r.clone))?.state, "active", "several drains ran; the running record held the end back");
     await rt.withTransaction(() => settlement.settle({ ok: true }));

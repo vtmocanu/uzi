@@ -53,8 +53,9 @@ func codexRaceFixture(t *testing.T, e codexTestEnv) (refreshFixture, *codexRaceP
 }
 
 // Compare all metadata, including the in-progress lease that already exists
-// inside Refresh. Only the four account crypto fields and two alias crypto
-// fields may change. Full worker/run rows pin capabilities and binding fences.
+// inside Refresh. Exclude lifecycle mode/epoch/slot generation, asserted separately
+// by codexRaceToggle, plus the four account crypto fields and two alias crypto
+// fields. Full worker/run rows pin capabilities and binding fences.
 func codexRaceMetadata(t *testing.T, e codexTestEnv, owner uuid.UUID) string {
 	t.Helper()
 	var snapshot string
@@ -64,7 +65,7 @@ func codexRaceMetadata(t *testing.T, e codexTestEnv, owner uuid.UUID) string {
 		'states', (SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY c.user_secret_id), '[]'::jsonb) FROM codex_credential_state c JOIN user_secrets s ON s.id=c.user_secret_id WHERE s.user_id=$1),
 		'workers', (SELECT coalesce(jsonb_agg(to_jsonb(w) ORDER BY w.id), '[]'::jsonb) FROM workers w WHERE w.user_id=$1),
 		'runs', (SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY r.id), '[]'::jsonb) FROM runs r WHERE r.user_id=$1),
-		'user', (SELECT to_jsonb(u) - ARRAY['vault_mode','vault_epoch'] FROM users u WHERE u.id=$1)
+		'user', (SELECT to_jsonb(u) - ARRAY['vault_mode','vault_epoch','vault_slot_generation'] FROM users u WHERE u.id=$1)
 	)::text`, owner).Scan(&snapshot)
 	if err != nil {
 		t.Fatal(err)
@@ -75,6 +76,10 @@ func codexRaceMetadata(t *testing.T, e codexTestEnv, owner uuid.UUID) string {
 func codexRaceToggle(t *testing.T, e codexTestEnv, f refreshFixture, enable bool) {
 	t.Helper()
 	before := codexRaceMetadata(t, e, f.userID)
+	userBefore, err := e.q.GetUserByID(e.ctx, f.userID)
+	if err != nil {
+		t.Fatal("read slot generation before conversion failed")
+	}
 	state, err := f.svc.vlt.State(e.ctx, f.userID)
 	if err != nil {
 		t.Fatal(err)
@@ -86,6 +91,13 @@ func codexRaceToggle(t *testing.T, e codexTestEnv, f refreshFixture, enable bool
 	}
 	if err != nil {
 		t.Fatal(err)
+	}
+	userAfter, err := e.q.GetUserByID(e.ctx, f.userID)
+	if err != nil {
+		t.Fatal("read slot generation after conversion failed")
+	}
+	if userAfter.VaultSlotGeneration != userBefore.VaultSlotGeneration+1 {
+		t.Fatalf("conversion slot generation before=%d after=%d; want %d", userBefore.VaultSlotGeneration, userAfter.VaultSlotGeneration, userBefore.VaultSlotGeneration+1)
 	}
 	if after := codexRaceMetadata(t, e, f.userID); after != before {
 		t.Fatal("crypto-only conversion changed credential, lease, revision, default, capability or binding metadata")

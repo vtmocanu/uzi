@@ -46,8 +46,8 @@ type CLIUserStore interface {
 // under /api/admin/*. Admin-ness is always resolved live from the row (loaded fresh
 // per request), never from the credential, so demoting the owner instantly neuters
 // a uza_ token with no revocation step.
-func RequireUser(q CLIUserStore, cfg config.Config) func(http.Handler) http.Handler {
-	cookieAuth := RequireAuth(q, cfg)
+func RequireUser(q CLIUserStore, cfg config.Config, hooks ...BrowserAuthHook) func(http.Handler) http.Handler {
+	cookieAuth := RequireAuth(q, cfg, hooks...)
 	return func(next http.Handler) http.Handler {
 		// The cookie path is the UNMODIFIED RequireAuth chain, pre-wrapped once.
 		cookiePath := cookieAuth(next)

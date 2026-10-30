@@ -80,6 +80,12 @@ see [Named contexts](#named-contexts) below.
 
 ## Vault: check status and unlock
 
+The CLI does not get a keyslot here.
+After an API restart, use explicit `uzi vault unlock` or open/focus an
+eligible HTTPS browser tab holding a live grant. Browser restoration does
+not provide unattended CLI continuity and CLI unlock does not mint a browser
+grant. See [Browser re-unlock](vault-threat-model.md#browser-re-unlock).
+
 After authenticating, run `uzi vault status` to print `locked` or `unlocked`
 for the active user. A server supporting optional vaults reports `off` for
 unprotected users. `--json` includes `unlocked` and, when the server provides
@@ -105,6 +111,10 @@ Empty input or input over 1 MiB is rejected. Non-terminal stdin without
 There is no password-valued flag, positional argument, environment setting,
 or persisted re-unlock key. Agents must ask the owner to unlock, never
 solicit or read the owner's password or passphrase.
+
+A successful explicit unlock or eligible browser restore best-effort queues
+that owner's `vault_locked` recovery parks promptly; scheduled retry remains
+the fallback and workers start through the normal claim path.
 
 On success, unlock prints `Vault unlocked.` unless `--quiet` is set.
 `--json` returns `{"unlocked":true}`, including with `--quiet`; the terminal
@@ -3261,9 +3271,9 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   [Retained recovery adoption failed](#retained-recovery-adoption-failed). A Codex credential
   refresh or release that found the owner's vault locked also parks here
   (cause `vault_locked`); it takes the same capped backoff and no lifetime
-  cap. The owner's explicit successful vault unlock best-effort queues an
-  already parked run promptly; the scheduled retry remains the fallback,
-  and a worker starts it through the normal claim path — see
+  cap. The owner's successful explicit vault unlock or eligible foreground
+  browser restore best-effort queues an already parked run promptly; the
+  scheduled retry remains the fallback, and a worker starts it through the normal claim path — see
   [Vault locked](run-recovery-wait.md#vault-locked). A Codex subscription
   run can also park here because its account is quarantined or needs a fresh
   login (cause `codex_account_unavailable`); unlike the transient park it has

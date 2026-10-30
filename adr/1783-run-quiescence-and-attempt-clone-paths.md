@@ -1319,6 +1319,12 @@ record. No generic force-clear exists.
   `rm` after owner death) blocks that repository's seeds and the exact footprint
   indefinitely. No process scan, PID absence or empty lock holder clears it.
 - A slot left `active` by a crash blocks reuse of its path until discard.
+- Issue #3638 (see the [ADR-2396 amendment](2396-worker-memory-guard.md#amendment-2026-10-30-cooperative-memory-source-settlement-issue-3638))
+  leaves this crashed-active boundary unchanged. A memory-parked flight's
+  teardown ends its source use cooperatively, and only on positive evidence (a
+  park witness and a confirmed durable `ineligible` end); anything less keeps the
+  slot active as above. A crash after the park ACK and before teardown still
+  leaves the slot active.
 - Changing the worker join token on a reused data volume makes the stored state
   fail authentication; the worker retains rather than trusts it. No rotation
   path ships.

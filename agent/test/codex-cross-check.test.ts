@@ -1134,9 +1134,9 @@ it("activity: scan exhaustion records limit without a successful read, EOF stays
   const incomplete = op.path !== "empty.ts";
   const partial = op.path === "partial-budget.ts";
   const data = op.path === "budget.ts" ? bodyOf(1) : partial ? Buffer.from("part").toString("base64") : "";
-  return { ok: true, data, size: 9 * 1024 * 1024,
+  return { ok: true, data, size: 65 * 1024 * 1024,
    offset: 1, linesReturned: data ? 1 : 0, partialLastLine: partial, truncated: incomplete,
-   incomplete, scannedBytes: incomplete ? 8 * 1024 * 1024 : 0, ...(incomplete ? { reason: "scan_budget" } : {}) };
+   incomplete, scannedBytes: incomplete ? 64 * 1024 * 1024 : 0, ...(incomplete ? { reason: "scan_budget" } : {}) };
  });
  assert.equal(await r.run(), verdict);
  recorder.summary("codex", "plan", true);

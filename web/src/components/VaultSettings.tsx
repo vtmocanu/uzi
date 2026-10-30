@@ -1,6 +1,6 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError } from "../lib/api";
+import { api, ApiError, type UserSettings } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { emitSidebarTokensChanged } from "../lib/sidebarTokens";
 import { prefs } from "../lib/prefs";
@@ -11,7 +11,7 @@ export function CredentialStorageHint() {
   const { vaultMode, hasPassword } = useAuth();
   return <p className="text-xs text-faint">{vaultMode === "unprotected"
     ? "Encrypted with the server key, like forge bot tokens. Your login password does not protect these credentials."
-    : `Encrypted with your ${hasPassword === false ? "vault passphrase" : "login password"}. If you forget it, these credentials cannot be recovered and must be re-entered.`}</p>;
+    : `Encrypted with your ${hasPassword === false ? "vault passphrase" : "login password"}. If you lose it and all remaining usable key material, these credentials cannot be recovered and must be re-entered.`}</p>;
 }
 
 export function VaultIntroduction() {
@@ -26,8 +26,8 @@ export function VaultIntroduction() {
   </Card>;
 }
 
-export function VaultSettings({ onChanged }: { onChanged: () => Promise<void> }) {
-  const { vaultMode, vaultPolicy, vaultUnlocked, hasPassword, refresh, beginVaultChange, vaultMetadataPending } = useAuth();
+export function VaultSettings({ onChanged, settings, settingsLoading = true, settingsError = "" }: { onChanged: () => Promise<void>; settings?: UserSettings; settingsLoading?: boolean; settingsError?: string }) {
+  const { user, vaultMode, vaultPolicy, vaultUnlocked, hasPassword, refresh, beginVaultChange, vaultMetadataPending } = useAuth();
   const off = vaultMode === "unprotected";
   const required = vaultPolicy !== "optional";
   const [enrolling, setEnrolling] = useState(false);
@@ -78,11 +78,12 @@ export function VaultSettings({ onChanged }: { onChanged: () => Promise<void> })
   );
   return <Card className="space-y-4">
     <SectionTitle>Protect my credentials with my password (vault)</SectionTitle>
-    <p className="text-sm text-muted">TL;DR: On encrypts your Claude, OpenAI and Codex credentials with your login password (or a dedicated passphrase for SSO). It protects against theft of the database together with the server key. It cannot protect against a compromised running server while unlocked. On costs an unlock after each server release or restart; new runs wait until you unlock. Off uses the server key, just like forge bot tokens: theft of the database and server key exposes the credentials. <a href="/docs/anthropic-token#vault-choice">Learn more</a>.</p>
+    <p className="text-sm text-muted">TL;DR: On encrypts your Claude, OpenAI and Codex credentials with your login password (or a dedicated passphrase for SSO). It protects against theft of the database together with the server key. It cannot protect against a compromised running server while unlocked. After a server release or restart, an eligible foreground request can re-unlock with a live browser grant. New runs still wait until you open or focus uzi; an expired grant requires your password. Off uses the server key, just like forge bot tokens: theft of the database and server key exposes the credentials. <a href="/docs/anthropic-token#vault-choice">Learn more</a>.</p>
     {off && required && <Alert tone="warning" message="Your administrator requires credential protection. Enable your vault to enroll; protection is still off until you do." />}
     {error && <Alert message={error} />}
     {notice && <Alert tone="info" message={notice} />}
     <VaultBadge />
+    <AutoReunlockPreference key={user?.id} settings={settings} loading={settingsLoading} loadError={settingsError} onSaved={onChanged} />
     {vaultMetadataPending && <Alert tone="warning" message="Protection mode is confirmed. Vault lock and session metadata are unknown until a successful refresh." />}
     {off ? <Button disabled={busy || enrolling} onClick={() => setEnrolling(true)}>Enable protection</Button> : <>
       {vaultUnlocked ? <Button variant="secondary" disabled={busy || locking} onClick={() => void lock().catch(err => setError(errorMessage(err, "Failed to lock vault.")))}>Lock vault</Button> : <p>Unlock your vault from the banner above before disabling protection.</p>}
@@ -98,4 +99,40 @@ export function VaultSettings({ onChanged }: { onChanged: () => Promise<void> })
       <Button variant="secondary" disabled={busy} onClick={() => { setEnrolling(false); setPassword(""); setConfirm(""); }}>Cancel</Button>
     </form>}
   </Card>;
+}
+
+function AutoReunlockPreference({ settings, loading, loadError, onSaved }: { settings?: UserSettings; loading: boolean; loadError: string; onSaved: () => Promise<void> }) {
+  const [confirmed, setConfirmed] = useState<boolean | undefined>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const generation = useRef(0);
+  useEffect(() => {
+    setConfirmed(settings ? settings.vault_auto_reunlock ?? true : undefined);
+  }, [settings]);
+  useEffect(() => () => { generation.current += 1; }, []);
+  const save = async (enabled: boolean) => {
+    const gen = generation.current;
+    setBusy(true); setError("");
+    try {
+      const { settings: saved } = await api.putMySettings({ vault_auto_reunlock: enabled });
+      if (gen !== generation.current) return;
+      setConfirmed(saved.vault_auto_reunlock ?? true);
+      // Start a newer settings read after the write commits. The parent's
+      // request fence then discards any pre-save reload still in flight.
+      try {
+        await onSaved();
+      } catch {
+        if (gen === generation.current) setError("Automatic re-unlock was saved, but settings could not be refreshed.");
+      }
+    } catch (err) {
+      if (gen === generation.current) setError(errorMessage(err, "Failed to save automatic re-unlock preference."));
+    } finally { if (gen === generation.current) setBusy(false); }
+  };
+  return <div className="space-y-2">
+    <label><input type="checkbox" checked={confirmed ?? false} disabled={loading || !!loadError || confirmed === undefined || busy} onChange={e => void save(e.target.checked)} /> Re-unlock automatically in this browser</label>
+    {(loading || confirmed === undefined || loadError) && <p>Automatic re-unlock preference is not yet confirmed.</p>}
+    {error && <Alert message={error} />}
+    <p className="text-xs text-muted">This account-wide preference applies to all browsers. Turning it off revokes grants in all browsers. Turning it on does not unlock or create a grant: use an interactive password unlock or password login with protection on. Protection Off and an SSO callback alone create no grant.</p>
+    <p className="text-xs text-muted">Requires HTTPS and a live browser grant held in an HttpOnly cookie, inaccessible to JavaScript. Grants expire at an absolute time capped by the administrator and the session expiry at creation; session refresh never extends them. After expiry, unlock with your password. You can always lock manually.</p>
+  </div>;
 }

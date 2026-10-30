@@ -1,8 +1,11 @@
 package handler
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -55,9 +58,21 @@ func (h *Handler) PatchUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := h.q.SetUserActive(r.Context(), store.SetUserActiveParams{ID: id, IsActive: req.IsActive})
+	arg := store.SetUserActiveParams{ID: id, IsActive: req.IsActive}
+	var user store.User
+	var err error
+	if h.vault != nil {
+		user, err = h.vault.SetUserActive(r.Context(), arg)
+	} else {
+		user, err = h.q.SetUserActive(r.Context(), arg)
+	}
 	if err != nil {
-		httpx.Error(w, http.StatusNotFound, "user not found")
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "user not found")
+		} else {
+			slog.Warn("activation failed", "phase", "set active", "owner", id)
+			httpx.Error(w, http.StatusServiceUnavailable, "account change could not be confirmed; retry")
+		}
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"user": toDTO(user)})

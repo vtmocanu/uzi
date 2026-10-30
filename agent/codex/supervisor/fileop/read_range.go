@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	rangeScanBytes   = 8 * 1024 * 1024
+	rangeScanBytes   = 64 * 1024 * 1024
 	rangeOutputBytes = 64 * 1024
 	rangeReadChunk   = 32 * 1024
 	codeNotText      = "E_NOT_TEXT"

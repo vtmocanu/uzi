@@ -1,6 +1,6 @@
 # ADR-2396: Proactive worker memory guard
 
-**Status**: Accepted (guard core, Codex adapter, owner-only memory holds and the Claude adapter, D8; memory-authority claim gate added by the 2026-10-21 amendment, issue #3142; the broader dispatch-only-to-capable-workers gate remains deferred; working-set metric and optional PSI added by the 2026-10-24 amendment, issue #3384)
+**Status**: Accepted (guard core, Codex adapter, owner-only memory holds and the Claude adapter, D8; memory-authority claim gate added by the 2026-10-21 amendment, issue #3142; the broader dispatch-only-to-capable-workers gate remains deferred; working-set metric and optional PSI added by the 2026-10-24 amendment, issue #3384; cooperative memory source settlement added by the 2026-10-30 amendment, issue #3638)
 **Date**: 2026-10-15
 **Issue**: [vtmocanu/uzi#2396](https://github.com/vtmocanu/uzi/issues/2396)
 
@@ -126,3 +126,97 @@ Measured, in local runs only: the M4 calibration figures in the off-CI evidence 
 - **Logs.** One `warn` ("worker memory guard: cgroup memory PSI unavailable; early intervention disabled, hard intervention continues on valid core accounting", field `reason`) on initial absence or loss; one `info` ("worker memory guard: cgroup memory PSI restored; early intervention resumes after consecutive PSI samples") on restoration. Repeats are silent and unavailable samples do not log.
 - **Calibration.** The Node diagnostic guarded leg no longer synthesizes zero PSI; its report field `psiSynthesized` is replaced by `psiAvailable` (`e2e/worker-uid/calibration-claude-guard.mts`, which the diagnostic spreads into its report).
 - **Known limits.** The working set is an estimate, not guaranteed non-reclaimable memory and not an OOM predictor. Inactive file pages can be dirty, under writeback or slow to reclaim, so the subtraction can underestimate pressure; dirty/writeback validation is deferred. Allocation bursts, stalled sampling, slow reclaim, node pressure and Docker-in-Docker memory remain outside. Production thresholds remain unmeasured.
+
+## Amendment 2026-10-30: cooperative memory source settlement (issue #3638)
+
+**Decision.** A memory park used to leave the parked flight's source use `active` under its worker incarnation, because the memory hold is never cleared and teardown required it to be absent before ending source use. A fresh incarnation that claimed the resumed run was then refused ("source is active under another worker incarnation") and the run failed. This amendment lets the producing flight end its own source use on positive evidence, so a fresh worker continues after Resume, and holds the run for its owner when that evidence is missing but the journal records the park; where an unsettled park's record could not be written, a different worker process fails the run as before and the same worker process stops the claim without failing until the requeue cap (see Residuals). It adds no server, status, cause or blocker: the owner hold reuses the existing `recovery_wait` / `worker_memory_pressure` park. Consuming the settlement as authority is the companion issue #3639, not built here.
+
+### Positive-settlement contract, as built
+
+- **Witness bound to the hold origin.** Both hold writers capture an `origin` (executor, executor incarnation, `flightId`, attempt id, claim generation) synchronously, before any async work. The park witness is written only after the server's accepted-park binding is checked and the observed-empty result is confirmed, and never on a throw. Teardown treats the hold as settled (`memoryHoldSettled`) only for that witness, the same executor and flight, a settled operation, no ownership rejection and `flight.parked`. The hold itself stays as the owner-policy and custody record. A failed or swallowed preservation leaves no witness, so the slot stays active as before.
+- **Confirmed durable source end.** The authority's `endSourceUse` reports `endedSlots`, filled only when the slot transition to `ineligible` was saved (the existing tmp, fsync, rename, directory fsync, readback and head write). Kept, dropped, queued, timed-out, pending-footprint and failed-head-write outcomes add nothing.
+- **Sink retirement.** `endFlightSourceUse` retires the flight's admission sink on entry. Every guarded admission (`bindSource`, each `#admit` hook operation except `discard`, non-destructive mint) refuses with `SourceUseHeldRefusal` from a retired sink before any effect, so an old callback cannot re-admit after teardown or after a successor's admission. An admission that already passed its last in-lock check when the sink was retired still completes; teardown therefore takes the authority lock once as a barrier (no drain) before it snapshots the flight's paths, which can add up to the source-use end wait to teardown. If the barrier times out, an admission still running is either before its lease (the end keeps its key and never queues or ends it) or after it (ended only if the end gets the lock after the admission finished, otherwise queued); either way a key without an end receipt blocks the settlement, so no settlement covers an incomplete set.
+- **Same-process per-key ownership.** A key is recorded as owned by a sink (with its epoch) only after an admission in that sink succeeds. An admission from another sink, or from outside any sink, is refused while the owner has no confirmed end. Ownership is released only on a positively confirmed end: an `endedSlots` entry, a queued end the drain later applies as ended, a publication that moved the slot out of `active`, an operator discard's own end, or a re-check showing the slot is no longer `active` under the recorded incarnation and epoch. A refused admission or a dropped end records or leaves no owner, so nothing wedges. Kept, timed-out, unjoined and lost queued ends stay owned, and a later same-process flight is refused.
+- **A refused flight never ends another flight's key.** `endFlightSourceUse` ends and publishes only keys its own sink owns, and a refused retained-source discard passes `skipFlightOwned` so it skips keys a live flight owns.
+
+### The `memoryPark` v1 record
+
+A strict-parsed field of the recovery journal (`RecoveryJournalEntry.memoryPark`, [git.ts](../agent/src/git.ts)), emitted immediately before `completionSourceFence`:
+
+```
+{ version: 1,
+  binding: { runId, claimGeneration, workerId, registerNonce, memoryEpisode },
+  ack: "confirmed" | "sent_unconfirmed" | "not_sent",
+  origin: { flightId, attemptId|null, executorIncarnation|null, authorityIncarnation, sourceEpoch },
+  settlement?: {                       // only when ack === "confirmed"
+    version: 1, confirmed: boolean,
+    sources: [{ path, authorityKey, attemptId|null, epoch, seq }],    // 1..16, sorted, unique
+    evidence: { parkAck, interventionIds, processJoin: "executor"|"codex_disposal",
+      commands: "confirmed"|"not_required", steering: "joined", auxiliaries: "joined"|"none",
+      feedback: "drained", sinkReceipts: "joined", parkReap: "complete"|"not_applicable" } } }
+```
+
+- `ack` is `confirmed` iff a park witness exists, `sent_unconfirmed` iff a park body was actually sent (a latch set immediately before the report), else `not_sent`. `origin.sourceEpoch` is the epoch of the parked flight's own slot for its clone path; the producer writes no record when it cannot be determined.
+- `settlement` is written only when every source path the flight used has an `endedSlots` entry and nothing was published, dropped or kept. An incomplete set, or more than 16 paths, writes no settlement (it logs) and is never truncated. `interventionIds` holds the triggering intervention for a pressure hold (captured synchronously from the pressure result when the hold is written) and is empty for an exhausted-allowance hold.
+- **Metadata only.** It is not a completion certificate, a publication fence or a custody release.
+- **Two-phase durability under one lock.** `GitCache.recordMemoryPark` runs each phase's write, config fsync, directory fsync and readback under one hold of the bare lock (the lock `installCompletionSourceFence` takes). Phase 1 writes `settlement.confirmed: false`. Only after it fully succeeds does phase 2 rewrite with `confirmed: true`. A phase-1 failure never qualifies; a phase-2 failure makes a best-effort compare-and-swap revert to `confirmed: false` and reports `unconfirmed`. A strictly greater `claimGeneration` replaces a record; within one generation only an identical replay or an upgrade (`not_sent`, `sent_unconfirmed`, `confirmed`, then adding a settlement) is allowed, and a settled record is never replaced by an unsettled one.
+- **Reader-side confirmation.** `GitCache.readConfirmedMemoryPark` holds the same bare lock across read, config fsync, directory fsync and readback, and returns the record only when every step succeeds and both reads are canonically equal to the expected record. The recovering worker uses it, with the read-only `verifyEndedSlots` check of the authority, only on a continuation whose record carries a settlement (not on the re-park path), to log `predecessor cooperative settlement verified` or `unverified`. Neither authorizes anything.
+- **Not independent of the journal.** The reader's expected record is the journal itself. A phase-2 failure whose revert also fails (or a Linux fsync error that loses dirty pages) can leave a readable `confirmed: true` that the reader re-confirms. An authoritative consumer (#3639) must bind `expected` to an independent server reference and treat a phase-2 or fsync failure as disqualifying.
+
+### Rollback and older-parser behaviour
+
+A worker built before this change parses the journal with a strict allowlist and rejects the unknown `memoryPark` key, so it treats the whole journal as invalid. Attach, recover and discard then fail closed for that source until a supporting worker handles it. This is an accepted operational consequence: roll back only after memory-parked runs are resolved, or accept owner-held retention. It reaches further than the completion-fence precedent (ADR-1783's 2026-10-27 amendment), which only a completing journal triggers; a journal carrying `memoryPark` can belong to any memory-parked run. Nothing strips the field to make a rollback succeed.
+
+### Rule for future journal fields
+
+A new recovery-journal field must be versioned and strict-parsed (exact keys, bounded values); added to the parser allowlist, the rebuilt return, the fixed JSON order and the watcher backup validator (`backup-runs.sh`); never stripped for a rollback; written durably, with an explicit confirmation phase when a consumer relies on it; one field per producer purpose; and not backed by a second proof registry. The restart follow-up (#3644) builds on this rule.
+
+### Owner-hold semantics (D4)
+
+When a retained continuation meets a predecessor whose source use was never positively ended but whose journal proves a memory park of this run, the claimant re-parks for the owner instead of failing. `memoryReparkOwner` is read-only and runs after the custody latches, before the recovery-stage renewal and before any recovery charge. It authorizes only this re-park, never source use, capture or settlement. All four must hold:
+
+1. `classifySourceAdmission` returns `foreign_active` or `held_unended`. It takes the authority lock without the pre-callback drain and reads the slot only through the read-only inspection, so it repairs nothing; any uncertainty (a slot ahead of its head, a lock timeout, an unreadable slot) classifies as `other`.
+2. The active-key journal carries a `memoryPark` of this run from an earlier claim generation, and the episodes agree (E is the record's, C the claim's): `confirmed` needs C = E + 1; `sent_unconfirmed` needs C = E (the server never applied the park) or C = E + 1 (it applied it, every ACK was lost, and the owner Resumed); `not_sent` needs C = E.
+3. The slot's owner incarnation and epoch equal the record's `origin.authorityIncarnation` and `origin.sourceEpoch`. This excludes a post-Resume successor that minted its own epoch and crashed, and any unrelated writer.
+4. Worker memory is bound for the flight and `worker_memory_pressure_v1` is negotiated.
+
+Otherwise the existing flow is unchanged, including the `preservation_failed` mapping. `parkMemoryContinuationRefused` then reports `recovery_wait` / `worker_memory_pressure` at the claim's own episode (only an owner Resume increments it), through the existing park body. Nothing is written before the ACK: no capture, admission, recovery-episode charge, model turn or publication, and it sets no `memory.hold`. At most two park report calls (each call may retry transient HTTP failures) and no terminal report are made per claim. An exact accepted binding (a 409 replay counts) marks the flight parked and stops the claim nonterminally. A credential switch is handed to the retained switch protocol. Every other outcome (a stale claim or checker-parent change, a wall-parked response, pause, cancel, claim fence, the deadline, a transport failure, a crash between report and ACK) stops nonterminally with custody retained and nothing marked `failed`; the teardown producer then records the attempt as `sent_unconfirmed`, or `confirmed` for an accepted one, preserving the slot owner and epoch.
+
+**Until #3639, Resume of an unsettled continuation re-parks immediately**, using one episode per Resume. Cancel or an operator discard of the retained source is the exit until #3639 lands. A worker restart does not release it: the slot stays active under the old incarnation (the crashed-active boundary is unchanged), so the claim classifies as `foreign_active` and Resume keeps re-parking while the record exists, or fails as before without one.
+
+### Ordering with the restart follow-up (#3644)
+
+Today D4's owner-held re-park takes precedence over a later pin-based restore. This is an ordering rule, not a ban: #3644 may build on it, and its pin restore applies only where D4 is ineligible.
+
+### Discovery and disposition
+
+- **One discovery surface.** D4 reads `memoryPark` only from the active journal key, through `discoverRetainedRecovery`. The protected descriptor (`uzi-retained.<runId>.journal`) preserves the record byte-identically but nothing consumes it; continuation from a descriptor is a separate follow-up.
+- **Stopped-marker rule.** A stopped marker (`uzi-stopped.<runId>.entry`) never carries `memoryPark`. Its absence, or the absence of a record anywhere, is never settlement, source-use, publication, Resume eligibility or custody-release authority.
+- **Per-site disposition.** Every writer keeps the retirement and rollback behaviour it had; `writeRecovery` still never reads the prior journal.
+
+| Site | Disposition |
+|---|---|
+| `recordMemoryPark` (phase 1, phase 2, single write, phase-2 revert) | writer of the field |
+| `markRecoveryCapture`, `installCompletionSourceFence`, `recoveryClockCurrent`, `reserveRecoveryIteration`, `recordRecoveryCapture`, `blockRecoveryEpisode`, `prepareRecoverySuccessor` (intermediate write), `completeRecoveryEpisode`, `releaseAttemptInPlace` (spread branch) | carry (spread of the parsed journal) |
+| `retireRunnerCloneImpl` retained rollback (raw restore, ledger-repair spread, interrupted rollback) | carry |
+| `prepareRecoverySuccessor` adopt successor (fresh object) | fresh object; same-run predecessor replacement: the predecessor's record retires with its journal, reached only after predecessor admission succeeds |
+| `retireRunnerCloneImpl` `anchored` (fresh object) | fresh object; same-run replacement of the completed successor's journal, terminal-run path only, so a memory park is never involved |
+| `detachTerminalRetained` | preserve in the protected descriptor, not consumed |
+| `releaseAttemptInPlace` clear branch, `healBoundStoppedJournal`, `retainStoppedAttempt`, `markStoppedCanonical`, `completionSourceAlreadyRetired`, `clearRetiredCompletionJournal`, `retireRunnerCloneImpl` journal clear and completion `finishMetadata` clear | active-key clear (not source disposal) |
+| `discardRetainedRecoveryUnderLock`, `discardRetainedSource`, certified retirement with a matching `expectedFence` | retained-source disposal, unchanged |
+
+`reclaimTerminalOrphan` branch by branch (behaviour unchanged): the refusal branches (classification failure, malformed identity, nonterminal owner, repo/branch/path mismatch, path-probe error, `terminalRetainedSnapshot` error, quiescence error or block) throw with journal, ledger and path untouched; `retained` is `detachTerminalRetained`; the attempt shape is `releaseAttemptInPlace(..., "reclaimed")` (fence refusal first, then carry or clear); the canonical shape is `retireRunnerClone(..., { discard: false })` (rollback carries, a successful move clears the active key); a retirement error is a refusal. `refuseFenceDrop` in `releaseAttemptInPlace` still runs first, and `memoryPark` never clears a journal or bypasses it. The restart follow-up (#3644) must keep the adopt-successor payload, `memoryPark` included, byte-identical.
+
+### Material change from the approved plan
+
+The canonical clone path `issue-N` is shared across runs of the same issue, so the same-process ownership refusal reaches a same-issue re-claim, not only a same-run one. When such a claim meets another flight's unconfirmed end in `phaseClone` or reseed (and in retained recovery without memory provenance), it stops nonterminal: `RetainedRecoveryStop`, custody retained, no `failed` report. It is bounded by the server requeue cap, which ends in a `worker_requeue_exhausted` owner hold or `failed` according to the exhaustion evidence. `keepGuardedInventoryOpen` on that path may pin re-dispatch to the worker until the cap.
+
+### Residuals and not shipped
+
+- Docker and other unregistered writers are unchanged (#3404, ADR-1783).
+- A crash after the park ACK and before teardown writes no record, so today's terminal path remains. This is the crashed-active boundary of [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement); the hard-kill companion owns it.
+- The re-park of an unsettled park (a confirmed source end leaves the slot ineligible, so that run continues normally) needs a `memoryPark` record in the active journal. The record can be missing for an unknown authority incarnation or source epoch, a stopped or protected source, a write failure, or a timeout whose write did not land (a write already holding the bare lock may still land, and Resume then re-parks). On a different worker process (for example after a restart, slot foreign-active) the run then fails as `preservation_failed`, as before. On the same worker process (the earlier flight's source end unconfirmed) the claim stops without failing ("held by an earlier flight's unended source use") and retries until the requeue cap, then ends in `worker_requeue_exhausted` or `failed` per the existing exhaustion rule; this is new with #3638, not "as before".
+- A successor without the memory guard or `worker_memory_pressure_v1` behaves as before. Descriptor-only sources are not continued.
+- The `sent` latch is set before `reportState`, so it can over-claim `sent_unconfirmed` if the call throws before sending; that only widens eligibility of the owner-held re-park.
+- A refused retained-source discard can still end an unowned active lease, and a quiescence-proven discard ends a key whose owner sink is live. This is accepted ("live owner").
+- Receipt consumption and server delivery (#3639), generic terminal reconciliation (#2494, #3031) and the restart follow-up (#3644) are not built. No hosted or compose acceptance of a memory park followed by a pod roll is claimed; it remains a human step.

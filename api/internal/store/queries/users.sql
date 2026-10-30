@@ -393,6 +393,7 @@ UPDATE users SET token_version = token_version + 1 WHERE id = $1
 RETURNING token_version;
 
 -- name: UpdatePassword :exec
+-- users_vault_browser_fence atomically revokes browser slots and advances generation.
 UPDATE users
 SET password_hash = $2, token_version = token_version + 1
 WHERE id = $1;

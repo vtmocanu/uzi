@@ -19,6 +19,7 @@ type StateReader interface {
 // crypto-only test fixtures. Tests do not obtain a nontransactional default.
 type Store interface {
 	StateReader
+	RevokeVaultBrowserSlots(context.Context, uuid.UUID) (int64, error)
 	LockSettingsAdmission(context.Context) error
 	LockSecretMutation(context.Context, uuid.UUID) error
 	LockVaultAuthState(context.Context, uuid.UUID) (store.LockVaultAuthStateRow, error)

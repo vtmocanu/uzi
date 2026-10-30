@@ -57,7 +57,11 @@ for f in web/Dockerfile web/nginx.conf web/nginx.mock.conf deploy/chart/Chart.ya
   [ -f "$ROOT/$f" ] || broken "missing $ROOT/$f"
 done
 
-W=$(mktemp -d "${TMPDIR:-/tmp}/assert-web-nginx.XXXXXX")
+export TMPDIR="$ROOT/.uzi/scratch"
+mkdir -p "$TMPDIR"
+W=$(mktemp -d "$TMPDIR/assert-web-nginx.XXXXXX")
+COOKIE_SENTINEL="wnginx-request-$$-${W##*.}"
+SET_COOKIE_SENTINEL="wnginx-response-$$-${W##*.}"
 NET="wnginx-$$-net"
 CONTAINERS=() # IDs printed by a successful docker create, nothing else
 NET_MADE=0
@@ -184,6 +188,7 @@ server {
         client_max_body_size 18m;
         return 200 '{"input":"STUB-SEMANTIC-INPUT"}';
     }
+    include /usr/share/nginx/stub/cookie-proof.conf;
     location = /api/identity {
         default_type application/json;
         alias /usr/share/nginx/stub/identity.json;
@@ -200,6 +205,16 @@ server {
     }
 }
 STUBCONF
+# This endpoint proves both cookie directions without echoing either header to output.
+# Only the expected request cookie receives the successful upstream response.
+cat > "$STUB/cookie-proof.conf" <<STUBCOOKIE
+location = /api/cookie-proof {
+    if (\$http_cookie != "__Host-uzi_vault_slot=$COOKIE_SENTINEL") { return 400; }
+    add_header Set-Cookie "__Host-uzi_vault_slot=$SET_COOKIE_SENTINEL; Path=/; HttpOnly; SameSite=Strict" always;
+    return 200 'COOKIE-UPSTREAM-REACHED';
+}
+STUBCOOKIE
+printf 'COOKIE-UPSTREAM-REACHED' > "$STUB/cookie-proof.body"
 # nginx runs as uid 101 inside the image: everything copied in must be world-readable.
 # Exercise the exact owner-input proxy ceiling and its first rejected byte.
 dd if=/dev/zero of="$W/approval-exact.bin" bs=1048576 count=17 2>/dev/null
@@ -309,6 +324,44 @@ no_ce() { [ "$(hcount "$1" content-encoding)" = 0 ]; }
 not_index() { ! grep -q INDEX-MARKER "$W/$1.b"; }
 cc_not_immutable() { ! hhas "$1" cache-control immutable; }
 
+cookie_response() {
+  [ "$(hcount "$1" set-cookie)" = 1 ] &&
+    [ "$(hvals "$1" set-cookie)" = "__Host-uzi_vault_slot=$SET_COOKIE_SENTINEL; Path=/; HttpOnly; SameSite=Strict" ]
+}
+
+# Stop before collecting so nginx flushes pending access-log buffers. docker logs combines
+# stdout/stderr, including the image's access.log/error.log symlinks to those streams.
+# docker cp preserves symlinks; only regular files are read, never stream links or FIFOs.
+cookie_logs_absent() {
+  local variant="$1" logs="$W/$1.logs" dir="$W/$1.logfiles" rc
+  docker stop "wnginx-$$-$variant" >"$W/$variant.stop" 2>&1 ||
+    broken "cookie proof: cannot stop web container"
+  docker logs "wnginx-$$-$variant" >"$logs" 2>&1 ||
+    broken "cookie proof: cannot collect docker output"
+  mkdir -p "$dir"
+  docker cp "wnginx-$$-$variant:/var/log/nginx/." "$dir" >"$W/$variant.cp" 2>&1 ||
+    broken "cookie proof: cannot collect image log directory"
+  find "$dir" -type f -exec cat {} + >>"$logs" 2>"$W/$variant.read.err" ||
+    broken "cookie proof: cannot read image log files"
+  rc=0
+  grep -qF -e "$COOKIE_SENTINEL" -e "$SET_COOKIE_SENTINEL" "$logs" || rc=$?
+  case "$rc" in
+    0) return 1 ;;
+    1) return 0 ;;
+    *) broken "cookie proof: cannot inspect collected logs" ;;
+  esac
+}
+
+# M5 mutation recipe (disposable candidate export only; not run here):
+# Prepend an http-scope log_format cookie_probe '$http_cookie $sent_http_set_cookie';
+# to compose nginx.conf (before server), replace its server access_log off with
+# access_log /var/log/nginx/access.log cookie_probe; then run this script on that export.
+# Repeat with /var/log/nginx/error.log to exercise stderr, and with
+# /var/log/nginx/cookie-probe.log for a regular file. Each run must exit 1 with
+# "cookie proof: sentinels absent from web logs" failing, while the three positive
+# cookie proof assertions pass. Repeat in the chart default.conf block for Helm.
+# Never print the collected logs or headers: assertion names alone are sufficient.
+
 # --- assertions --------------------------------------------------------------------------
 for v in $VARIANTS; do
   V=$v
@@ -363,6 +416,10 @@ for v in $VARIANTS; do
     fetch "$v-api" "$port" /api/identity -H 'Accept-Encoding: gzip'
     check "/api/identity: 404 (got $STATUS)" has_status 404
   else
+    fetch "$v-cookie" "$port" /api/cookie-proof -H "Cookie: __Host-uzi_vault_slot=$COOKIE_SENTINEL"
+    check "cookie proof: upstream accepted request cookie" has_status 200
+    check "cookie proof: upstream body received" raw_eq "$v-cookie" "$STUB/cookie-proof.body"
+    check "cookie proof: upstream HttpOnly Set-Cookie received" cookie_response "$v-cookie"
     fetch "$v-api" "$port" /api/identity -H 'Accept-Encoding: gzip'
     check "/api/identity: status 200 (got $STATUS)" has_status 200
     check "/api/identity: not compressed by web" no_ce "$v-api"
@@ -385,6 +442,7 @@ for v in $VARIANTS; do
     check "ordinary API: 1 MiB plus one byte rejected (got $STATUS)" has_status 413
     fetch "$v-worker-over" "$port" "/api/worker/runs/12345678-1234-4123-8123-123456789012/inputs" -X POST --data-binary "@$W/ordinary-over.bin"
     check "worker inputs: larger owner limit is not inherited (got $STATUS)" has_status 413
+    check "cookie proof: sentinels absent from web logs" cookie_logs_absent "$v"
   fi
 done
 

@@ -76,6 +76,7 @@ const FETCH_CAP_BOUNDS: Record<string, [number, number]> = {
   fetch_max_run_attempts: [1, 100000],
 };
 const SEED_USER_SETTINGS: UserSettings = {
+  vault_auto_reunlock: true,
   cross_check_pins: [],
   default_model: null,
   // PRD #1551 M1/D2: the two explicit per-harness worker-model lanes; null = inherit.
@@ -124,6 +125,7 @@ if (mockScenario() === "cross-check-dormant-claude") {
 
 const SEED_APP_SETTINGS: AppSettings = {
   vault_policy: "required",
+  vault_reunlock_days: "7",
   autopilot_label: "autopilot",
   // PRD #764: the single run-eligibility label.
   uzi_label: "uzi",
@@ -253,6 +255,7 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
           (pin.effort === null || (typeof pin.effort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(pin.effort)));
       }));
   const okUser = validPins &&
+    (u.vault_auto_reunlock === undefined || typeof u.vault_auto_reunlock === "boolean") &&
     (u.default_model === null || typeof u.default_model === "string") &&
     // PRD #1551 M1: optional so a pre-split blob stays valid; absent/null reads as
     // inherit (treated as null), and the SEED fills them going forward — the same
@@ -293,6 +296,7 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
       (Array.isArray(u.sidebar_codex_account_ids) &&
         u.sidebar_codex_account_ids.every((id) => typeof id === "string")));
   const okApp =
+    (a.vault_reunlock_days === undefined || (typeof a.vault_reunlock_days === "string" && /^(?:[1-9]|[12][0-9]|30)$/.test(a.vault_reunlock_days))) &&
     (a.vault_policy === undefined || a.vault_policy === "optional" || a.vault_policy === "required") &&
     typeof a.autopilot_label === "string" &&
     // PRD #764: accept legacy blobs that predate this field (undefined) — it is filled
@@ -767,6 +771,11 @@ export const settingsApi = {
     const nonSecret: Partial<AppSettings> = {};
     for (const [key, raw] of Object.entries(updates)) {
       const value = raw ?? "";
+      if (key === "vault_reunlock_days") {
+        if (!/^(?:[1-9]|[12][0-9]|30)$/.test(value)) throw new ApiError(400, "vault_reunlock_days must be a canonical integer from 1 to 30");
+        nonSecret.vault_reunlock_days = value;
+        continue;
+      }
       if (key === "vault_policy") {
         if (value !== "optional" && value !== "required") {
           throw new ApiError(400, "vault_policy must be optional or required");
@@ -1295,6 +1304,10 @@ export const settingsApi = {
     // + light_theme:"ember") returns 400 without half-applying — matching the real
     // handler's validate-all-then-write ordering.
     let next = { ...userSettings };
+    if ("vault_auto_reunlock" in patch) {
+      if (typeof patch.vault_auto_reunlock !== "boolean") throw new ApiError(400, "vault_auto_reunlock must be boolean");
+      next.vault_auto_reunlock = patch.vault_auto_reunlock;
+    }
     if ("cross_check_pins" in patch) {
       const list: unknown = patch.cross_check_pins;
       if (!Array.isArray(list) || list.length > 4) throw new ApiError(400, "cross_check_pins: expected at most four cells");

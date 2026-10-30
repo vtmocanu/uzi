@@ -146,6 +146,15 @@ func (m *memVaultStore) ClaimVaultLockNotice(_ context.Context, id uuid.UUID) (u
 	return id, nil
 }
 
+func (m *memVaultStore) RevokeVaultBrowserSlots(ctx context.Context, id uuid.UUID) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.state(id)
+	s.VaultSlotGeneration++
+	m.states[id] = s
+	return s.VaultSlotGeneration, ctx.Err()
+}
+
 var _ vault.Store = (*memVaultStore)(nil)
 
 func (m *memVaultStore) ClearVaultLockNotice(context.Context, uuid.UUID) error { return nil }

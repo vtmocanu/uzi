@@ -113,6 +113,10 @@ func (v *Vault) Enable(ctx context.Context, id uuid.UUID, password string) error
 }
 
 func (v *Vault) unlock(ctx context.Context, id uuid.UUID, password string, create, enable bool) error {
+	return v.unlockInteractive(ctx, id, password, create, enable, nil)
+}
+
+func (v *Vault) unlockInteractive(ctx context.Context, id uuid.UUID, password string, create, enable bool, interactive *interactiveUnlock) error {
 	if err := v.lifecycleContext(ctx); err != nil {
 		return err
 	}
@@ -128,6 +132,9 @@ func (v *Vault) unlock(ctx context.Context, id uuid.UUID, password string, creat
 		state, wrapper, exists, _, err := lockLifecycleState(ctx, q, id, create)
 		if err != nil {
 			return err
+		}
+		if interactive != nil && !interactive.auth.matches(id, state) {
+			return ErrStaleAuth
 		}
 		// Login and interactive unlock are harmless while protection is off.
 		if !enable && state.VaultMode == store.VaultModeUnprotected {
@@ -174,6 +181,21 @@ func (v *Vault) unlock(ctx context.Context, id uuid.UUID, password string, creat
 				return err
 			}
 		}
+		if interactive != nil && interactive.request != nil && state.VaultAutoReunlock {
+			// Creation advanced both epoch and slot generation in the users trigger.
+			current, err := q.LockVaultAuthState(ctx, id)
+			if err != nil {
+				return err
+			}
+			bq, ok := q.(BrowserStore)
+			if !ok {
+				return ErrNotConfigured
+			}
+			interactive.key, err = mintBrowserKey(ctx, bq, id, current, dek, *interactive.request)
+			if err != nil {
+				return err
+			}
+		}
 		publish = true
 		return nil
 	})
@@ -181,6 +203,10 @@ func (v *Vault) unlock(ctx context.Context, id uuid.UUID, password string, creat
 		// Discard the unpublished key before any ambiguous-commit reconciliation.
 		wipe(dek)
 		dek = nil
+		if interactive != nil {
+			interactive.key.Destroy()
+			interactive.key = nil
+		}
 	}
 	if err := v.finishLifecycle(id, err); err != nil {
 		return err
@@ -226,6 +252,10 @@ func (v *Vault) unlock(ctx context.Context, id uuid.UUID, password string, creat
 			if errors.As(err, &commit) {
 				wipe(dek)
 				dek = nil
+				if interactive != nil {
+					interactive.key.Destroy()
+					interactive.key = nil
+				}
 				return v.finishLifecycle(id, err)
 			}
 			if stale {
@@ -336,7 +366,8 @@ func (v *Vault) Disable(ctx context.Context, id uuid.UUID) error {
 			if exists {
 				return ErrInvalidState
 			}
-			return nil
+			_, err := q.RevokeVaultBrowserSlots(ctx, id)
+			return err
 		}
 		if !exists {
 			return ErrNoVault
@@ -370,20 +401,29 @@ func (v *Vault) Disable(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-// Lock serializes eviction with lifecycle commits, publication and notice clears.
+// Lock is the legacy test/boot adapter. Production callers must use
+// LockAndAcknowledge or LockWithContext and handle durable revocation errors.
 func (v *Vault) Lock(id uuid.UUID) {
-	if v == nil {
-		return
+	if v != nil {
+		if err := v.LockWithContext(context.Background(), id); err != nil {
+			slog.Error("vault: lock failed", "user", id)
+		}
 	}
-	release := v.acquireLifecycle(id)
-	defer release()
-	v.evict(id)
 }
 
-// LockAndAcknowledge keeps a deliberate lock's notice claim inside the same
-// serialization boundary as unlock's notice clear. Notice failures are logged;
-// eviction succeeds regardless, matching the manual lock handler's behavior.
+// LockWithContext durably revokes all slots without changing the vault epoch.
+// Cache eviction also occurs on failure; only acknowledged revocation succeeds.
+func (v *Vault) LockWithContext(ctx context.Context, id uuid.UUID) error {
+	return v.lockAndRevoke(ctx, id, false)
+}
+
+// LockAndAcknowledge durably revokes browser slots and evicts the cache.
+// Notice acknowledgment is best effort within the same lifecycle boundary.
 func (v *Vault) LockAndAcknowledge(ctx context.Context, id uuid.UUID) error {
+	return v.lockAndRevoke(ctx, id, true)
+}
+
+func (v *Vault) lockAndRevoke(ctx context.Context, id uuid.UUID, notice bool) error {
 	if err := v.lifecycleContext(ctx); err != nil {
 		return err
 	}
@@ -394,8 +434,20 @@ func (v *Vault) LockAndAcknowledge(ctx context.Context, id uuid.UUID) error {
 	release := v.acquireLifecycle(id)
 	defer release()
 	defer v.evict(id)
-	if _, err := v.q.ClaimVaultLockNotice(ctx, id); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		slog.Error("vault lock: pre-ack lock-notice", "user", id, "error", err)
+	err := v.transact(ctx, func(ctx context.Context, q Store) error {
+		if _, _, _, _, err := lockLifecycleState(ctx, q, id, false); err != nil {
+			return err
+		}
+		_, err := q.RevokeVaultBrowserSlots(ctx, id)
+		return err
+	})
+	if err := v.finishLifecycle(id, err); err != nil {
+		return err
+	}
+	if notice {
+		if _, err := v.q.ClaimVaultLockNotice(ctx, id); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error("vault lock: pre-ack lock-notice", "user", id)
+		}
 	}
 	return nil
 }
