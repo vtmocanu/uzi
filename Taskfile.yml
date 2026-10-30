@@ -341,6 +341,7 @@ tasks:
       - task: test:renovate-go-toolchain
       - task: test:renovate-codex-runtime
       - task: test:renovate-postgres
+      - task: test:renovate-schedule-groups
       - task: test:forge-fake
       - task: test:forge-fake-contract
       # Hermetic bot-provisioning regressions (issues #2010 and #2016): fake glab,
@@ -1122,6 +1123,11 @@ tasks:
     desc: hermetic CI Postgres pin extraction, digest updates and grouping
     cmds:
       - node ./scripts/renovate-postgres.test.mjs
+
+  test:renovate-schedule-groups:
+    desc: hermetic weekly Renovate window and oasdiff / npm lint-tooling grouping
+    cmds:
+      - node ./scripts/renovate-schedule-groups.test.mjs
 
   test:renovate-codex-runtime:
     desc: hermetic Codex pin extraction, grouping and partial-update rejection

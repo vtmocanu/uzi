@@ -93,6 +93,8 @@ const ruleMatches = (rule, dep, updateType) => {
   if (rule.matchDepNames && !matchesAny(dep.depName, rule.matchDepNames)) return false;
   if (rule.matchPackageNames && !matchesAny(dep.packageName, rule.matchPackageNames)) return false;
   if (rule.matchUpdateTypes && !rule.matchUpdateTypes.includes(updateType)) return false;
+  if (rule.matchManagers && !rule.matchManagers.includes(dep.manager)) return false;
+  if (rule.matchDatasources && !rule.matchDatasources.includes(dep.datasource)) return false;
   return true;
 };
 const resolved = (dep, updateType) => {
@@ -108,9 +110,9 @@ const resolved = (dep, updateType) => {
 };
 
 const goSurfaces = [
-  { depName: "go", packageName: "go" },
-  { depName: "go", packageName: "actions/go-versions" },
-  { depName: "golang", packageName: "golang" },
+  { depName: "go", packageName: "go", manager: "gomod", datasource: "golang-version" },
+  { depName: "go", packageName: "actions/go-versions", manager: "github-actions", datasource: "golang-version" },
+  { depName: "golang", packageName: "golang", manager: "dockerfile", datasource: "docker" },
 ];
 for (const dep of [...goSurfaces, ...linterDeps]) {
   const result = resolved(dep, "minor");
@@ -140,6 +142,17 @@ for (const dep of vulnDeps) {
 }
 assertEqual(resolved(goSurfaces[0], "patch").groupName, undefined, "Go patch grouping");
 assertEqual(resolved(goSurfaces[2], "digest").groupName, undefined, "golang digest grouping");
+
+// Go module dependencies get one non-major group per module; the go/toolchain directives
+// (golang-version datasource, also extracted by gomod) must stay out of it.
+const goModule = { depName: "golang.org/x/net", packageName: "golang.org/x/net", manager: "gomod", datasource: "go" };
+for (const updateType of ["patch", "minor"]) {
+  assertEqual(resolved(goModule, updateType).groupName, "Go modules (non-major)", `Go module ${updateType} group`);
+}
+assertEqual(resolved(goModule, "major").groupName, undefined, "Go module majors stay separate");
+const moduleRule = config.packageRules.find((rule) => rule.groupName === "Go modules (non-major)");
+assertEqual(moduleRule.additionalBranchPrefix, "{{parentDir}}-", "Go module group is per module");
+assertEqual(resolved(goSurfaces[0], "minor").groupName, "Go toolchain", "go directive stays in the toolchain group");
 
 // sqlc's CI pin and per-platform wrapper archives must advance together.
 const sqlcWrapperDeps = extract(
@@ -195,7 +208,7 @@ for (const file of ["agent/devbox-global/devbox.json", "agent/devbox-global/tool
 assertEqual(new Set(digests).size, 1, "manifest, seed and guard Go revisions agree");
 const manual = config.packageRules.find(rule => rule.matchDepNames?.includes("worker-go-nixpkgs"));
 assertEqual(manual.automerge, false, "worker Go digest needs maintainer lock/image review");
-assertEqual(JSON.stringify(manual.schedule), JSON.stringify(["* 0-5 1 * *"]), "worker Go digest updates are monthly");
+assertEqual(JSON.stringify(manual.schedule), JSON.stringify(["* 0-5 1-7 * 6"]), "worker Go digest updates are monthly, on the first weekly window");
 assertEqual(manual.minimumReleaseAgeBehaviour, "timestamp-optional", "git-refs has no release timestamp");
 assert(manual.prBodyNotes.some(note => note.includes("lock")), "worker Go PR must explain lock work");
 
