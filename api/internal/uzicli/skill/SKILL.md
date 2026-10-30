@@ -952,8 +952,8 @@ uzi version
 - `uzi run lead-config <run-id> [--json]` — the lead agent's model and effort history for a run, one
   row per recorded phase entry across every claim attempt (columns `GEN PHASE ENTRY SEQ REQUESTED
   SOURCE OBSERVED EVIDENCE REPORTED`), newest attempt first and plan before implement: what was
-  requested and where each value came from, and what the runtime reported. At most 256 entries; a
-  note says when older ones are left out. A run without a lead agent prints "no recorded lead
+  requested and where each value came from, and what the runtime reported. At most 256 entries (the
+  first 256 in that order); a note says when the rest are left out. A run without a lead agent prints "no recorded lead
   config". `--json` prints `{entries, truncated}`. Owner or admin (a foreign run is a 404, exit 4).
 - `uzi run fetches <run-id> [--json]` — the source log of a run bound to a site list
   (official-sources research): every web fetch it attempted, allowed or refused, with the

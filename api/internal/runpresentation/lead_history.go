@@ -17,7 +17,9 @@ type LeadHistoryCells struct {
 }
 
 // LeadHistoryRowCells renders one recorded row with the same labels and rules as the run header
-// (modelText, rowLines): the requested side never mixes in the observed side, which gets its own cells.
+// (modelText, rowLines): the observed model and effort get their own cells.
+// The one place the requested cell reads the observation is modelText: a builtin model source with
+// no requested model shows the observed model there (PRD section 8 rule 4).
 func LeadHistoryRowCells(p apitypes.LeadPhaseConfigDTO) LeadHistoryCells {
 	runtimeDefault := leadcfg.SourceLabel("effort", string(leadcfg.EffortModeRuntimeDefault), p.Harness)
 

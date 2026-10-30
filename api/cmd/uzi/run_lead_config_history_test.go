@@ -65,7 +65,7 @@ func TestRunLeadConfigTable(t *testing.T) {
 	if strings.Index(out, "sonnet") > strings.Index(out, "opus") {
 		t.Errorf("gen 2 must be listed before gen 1:\n%s", out)
 	}
-	if strings.Contains(out, "256 newest") {
+	if strings.Contains(out, "first 256 entries") {
 		t.Errorf("an untruncated list must not print the truncation note:\n%s", out)
 	}
 }
@@ -75,7 +75,7 @@ func TestRunLeadConfigTruncationNoteAndJSON(t *testing.T) {
 	fc := &uzicli.FakeClient{LeadConfigHistoryByID: map[string]apitypes.LeadConfigHistoryDTO{"run1": h}}
 
 	out, _, code := runCLI(t, fakeEnv(fc), "run", "lead-config", "run1")
-	if code != uzicli.ExitOK || !strings.Contains(out, "showing the 256 newest entries; older entries are not listed") {
+	if code != uzicli.ExitOK || !strings.Contains(out, "showing the first 256 entries (newest attempt first); the rest are not listed") {
 		t.Fatalf("table = %d, want the truncation note:\n%s", code, out)
 	}
 

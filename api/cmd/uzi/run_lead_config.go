@@ -17,11 +17,12 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
-// leadConfigTruncatedNote is the visible truncation line, and the per-row suffix wording matches the
-// run header tooltip ("later changes not recorded").
+// leadConfigListTruncatedNote is the visible truncation line (the server keeps the first 256 rows of the
+// newest-attempt-first order and drops the tail), and leadConfigRowTruncatedSuffix matches the run
+// header tooltip ("later changes not recorded").
 const (
 	leadConfigRowTruncatedSuffix = " (later changes not recorded)"
-	leadConfigListTruncatedNote  = "showing the 256 newest entries; older entries are not listed"
+	leadConfigListTruncatedNote  = "showing the first 256 entries (newest attempt first); the rest are not listed"
 )
 
 func newRunLeadConfigCmd(env Env, gf *globalFlags) *cobra.Command {
@@ -32,7 +33,7 @@ func newRunLeadConfigCmd(env Env, gf *globalFlags) *cobra.Command {
 			"and where each came from, and what the runtime reported, per claim attempt (GEN), phase and phase " +
 			"entry. The newest attempt is listed first, plan before implement.\n\n" +
 			"A run without a lead agent, or an attempt whose worker did not record, has no rows. " +
-			"At most 256 entries are listed; a note says when older ones were left out. --json prints " +
+			"At most 256 entries are listed; a note says when the rest were left out. --json prints " +
 			"the server response ({entries, truncated}).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
