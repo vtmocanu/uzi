@@ -8,6 +8,7 @@ import (
 	"io"
 	"regexp"
 	"slices"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 
@@ -23,7 +24,9 @@ import (
 // PublicationResumeFeature negotiates the write-ahead publication intent (issue #1324).
 const PublicationResumeFeature = capability.PublicationResumeV1
 
-// MaxPublicationIntentBytes bounds the opaque intent body (matches the table CHECK).
+// MaxPublicationIntentBytes bounds the opaque intent body. The intent column is json, which stores
+// the posted bytes verbatim, so the table CHECK (octet_length(intent::text) <= 65536) is the same
+// bound.
 const MaxPublicationIntentBytes = 64 * 1024
 
 var (
@@ -33,6 +36,9 @@ var (
 	ErrPublicationIntentMismatch = errors.New("publication_intent_mismatch")
 	// ErrPublicationEnrollmentRetired refuses a write against a non-active enrollment (409).
 	ErrPublicationEnrollmentRetired = errors.New("publication_enrollment_retired")
+	// ErrPublicationEnrollmentChanged is a state write that found the run enrolled only after it
+	// took the run lock, without the worker lock the enrolled lock order needs. Retryable.
+	ErrPublicationEnrollmentChanged = errors.New("publication_enrollment_changed")
 )
 
 var gitOIDHexRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -93,6 +99,120 @@ func strictObjectMembers(raw []byte, allowed map[string]struct{}) (map[string]js
 		return nil, ErrInvalidState
 	}
 	return out, nil
+}
+
+const (
+	// maxIntentNumberLiteral bounds one number literal in the intent. The store keeps the posted
+	// text verbatim (json column), but no legitimate member needs more than this many characters.
+	maxIntentNumberLiteral = 64
+	// maxIntentDepth bounds nesting so a deeply nested body cannot exhaust a parser's stack.
+	maxIntentDepth = 32
+)
+
+// checkIntentDocument walks the whole intent once: it refuses an over-long number literal (a
+// 1e131071 literal is tiny on the wire and large once a numeric type expands it), nesting past
+// maxIntentDepth, invalid UTF-8, and a \u escape that is NUL or a lone surrogate (PostgreSQL's
+// json functions refuse the first and the Go decoder silently rewrites the second).
+func checkIntentDocument(raw []byte) error {
+	if !utf8.Valid(raw) {
+		return ErrInvalidState
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	depth := 0
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return ErrInvalidState
+		}
+		switch v := tok.(type) {
+		case json.Delim:
+			if v == '{' || v == '[' {
+				if depth++; depth > maxIntentDepth {
+					return ErrInvalidState
+				}
+			} else {
+				depth--
+			}
+		case json.Number:
+			if len(v) > maxIntentNumberLiteral {
+				return ErrInvalidState
+			}
+		}
+	}
+	return checkIntentEscapes(raw)
+}
+
+// checkIntentEscapes refuses \u0000 and an unpaired surrogate escape. raw is already known to be
+// well-formed JSON, so a backslash only occurs inside a string and always starts an escape.
+func checkIntentEscapes(raw []byte) error {
+	hex4 := func(i int) (rune, bool) {
+		if i+4 > len(raw) {
+			return 0, false
+		}
+		var r rune
+		for _, c := range raw[i : i+4] {
+			switch {
+			case c >= '0' && c <= '9':
+				r = r<<4 | rune(c-'0')
+			case c >= 'a' && c <= 'f':
+				r = r<<4 | rune(c-'a'+10)
+			case c >= 'A' && c <= 'F':
+				r = r<<4 | rune(c-'A'+10)
+			default:
+				return 0, false
+			}
+		}
+		return r, true
+	}
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' {
+			continue
+		}
+		if i+1 >= len(raw) {
+			return ErrInvalidState
+		}
+		if raw[i+1] != 'u' {
+			i++ // skip the escaped character, so an escaped backslash is not an escape start
+			continue
+		}
+		r, ok := hex4(i + 2)
+		if !ok || r == 0 {
+			return ErrInvalidState
+		}
+		i += 5
+		switch {
+		case r >= 0xDC00 && r <= 0xDFFF:
+			return ErrInvalidState
+		case r >= 0xD800 && r <= 0xDBFF:
+			if i+2 >= len(raw) || raw[i+1] != '\\' || raw[i+2] != 'u' {
+				return ErrInvalidState
+			}
+			lo, ok := hex4(i + 3)
+			if !ok || lo < 0xDC00 || lo > 0xDFFF {
+				return ErrInvalidState
+			}
+			i += 6
+		}
+	}
+	return nil
+}
+
+// canonicalUUID parses a lowercase, hyphenated, 36-character UUID string and nothing else, so the
+// Go identity is byte-equal to the text the database compares (run_id::text).
+func canonicalUUID(raw json.RawMessage) (uuid.UUID, bool) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil || len(s) != 36 || s != strings.ToLower(s) {
+		return uuid.Nil, false
+	}
+	id, err := uuid.Parse(s)
+	if err != nil || id == uuid.Nil || id.String() != s {
+		return uuid.Nil, false
+	}
+	return id, true
 }
 
 // validBranchName refuses empty, over-long, invalid UTF-8 and control or format (ANSI, bidi,
@@ -159,9 +279,12 @@ func parsePublicationIntent(raw json.RawMessage) (publicationIntentBody, error) 
 		return b, ErrInvalidState
 	}
 	// Only exact, unique, allowlisted top-level keys reach the typed decode below, so the typed
-	// view and the stored jsonb read the same members. The raw bytes are stored unchanged.
+	// view and the stored json read the same members. The raw bytes are stored unchanged.
 	probe, err := strictObjectMembers(raw, publicationIntentKeys)
 	if err != nil {
+		return b, err
+	}
+	if err := checkIntentDocument(raw); err != nil {
 		return b, err
 	}
 	// Required members must be present, not merely zero.
@@ -175,27 +298,34 @@ func parsePublicationIntent(raw json.RawMessage) (publicationIntentBody, error) 
 		return b, err
 	}
 	for field, dst := range map[string]any{
-		"run_id": &b.RunID, "repo_id": &b.RepoID, "branch": &b.Branch, "claim_generation": &b.ClaimGeneration,
+		"branch": &b.Branch, "claim_generation": &b.ClaimGeneration,
 		"original_head": &b.OriginalHead, "candidate": &b.Candidate,
 	} {
 		if err := json.Unmarshal(probe[field], dst); err != nil {
 			return b, ErrInvalidState
 		}
 	}
-	if err := json.Unmarshal(probe["floor"], &b.Floor); err != nil || len(floor) == 0 {
+	var okRun, okRepo bool
+	b.RunID, okRun = canonicalUUID(probe["run_id"])
+	b.RepoID, okRepo = canonicalUUID(probe["repo_id"])
+	if !okRun || !okRepo {
 		return b, ErrInvalidState
 	}
-	if b.RunID == uuid.Nil || b.RepoID == uuid.Nil || !validBranchName(b.Branch) ||
-		b.ClaimGeneration <= 0 || !gitOIDHexRe.MatchString(b.OriginalHead) {
+	if err := json.Unmarshal(probe["floor"], &b.Floor); err != nil {
 		return b, ErrInvalidState
 	}
+	if !validBranchName(b.Branch) || b.ClaimGeneration <= 0 || !gitOIDHexRe.MatchString(b.OriginalHead) {
+		return b, ErrInvalidState
+	}
+	// The floor is exactly {"kind":"absent"} or {"kind":"pinned","oid":"<40 hex>"}: an oid member
+	// on an absent floor (even null) is refused, so the Go identity equals the database's.
 	switch b.Floor.Kind {
 	case "pinned":
-		if b.Floor.Oid == nil || !gitOIDHexRe.MatchString(*b.Floor.Oid) {
+		if len(floor) != 2 || b.Floor.Oid == nil || !gitOIDHexRe.MatchString(*b.Floor.Oid) {
 			return b, ErrInvalidState
 		}
 	case "absent":
-		if b.Floor.Oid != nil {
+		if len(floor) != 1 || b.Floor.Oid != nil {
 			return b, ErrInvalidState
 		}
 	default:
@@ -261,6 +391,25 @@ func publicationEnrolled(ctx context.Context, q publicationEnrollmentReader, run
 		return false, nil
 	}
 	return err == nil, err
+}
+
+// recheckPublicationEnrollment runs after a writer took the run row lock. When the pre-lock read
+// found no enrollment the worker row was not locked; an enrollment committed in between would
+// make this write an authority write taken in the wrong lock order (run before worker), so it
+// is refused with a retryable error and nothing is written. Enrollment holds the run lock until
+// commit, so the read here sees every enrollment that committed before this transaction's lock.
+func recheckPublicationEnrollment(ctx context.Context, q publicationEnrollmentReader, runID uuid.UUID, workerLocked bool) error {
+	if workerLocked {
+		return nil
+	}
+	now, err := publicationEnrolled(ctx, q, runID)
+	if err != nil {
+		return err
+	}
+	if now {
+		return ErrPublicationEnrollmentChanged
+	}
+	return nil
 }
 
 // publicationResumePayload builds the claim member for a capable worker with an active
@@ -365,10 +514,15 @@ func (s *Service) RegisterPublicationIntent(ctx context.Context, w store.Worker,
 	}
 	resp, err := s.applyPublicationIntent(ctx, q, run, req, body)
 	if err != nil {
-		// 23514: a CHECK or guard refused the body; 22P05: jsonb cannot hold a \u0000 escape.
+		// Client errors: 23514 a CHECK or guard refused the body; 22P05 an untranslatable
+		// character; 22P02 malformed json text; 22003 numeric out of range; 22021 invalid byte
+		// sequence for the encoding.
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && (pgErr.Code == "23514" || pgErr.Code == "22P05") {
-			return zero, ErrInvalidState
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "23514", "22P05", "22P02", "22003", "22021":
+				return zero, ErrInvalidState
+			}
 		}
 		return zero, err
 	}

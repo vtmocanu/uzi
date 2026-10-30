@@ -1,11 +1,13 @@
 package workersvc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -166,7 +168,7 @@ func TestPublicationResumeRetireNeedsOptInLiveDB(t *testing.T) {
 	}
 	// Identity is immutable even with the opt-in.
 	sp, _ := tx.Begin(ctx)
-	_, err = sp.Exec(ctx, `UPDATE run_publication_resume SET intent = jsonb_set(intent, '{branch}', '"other"') WHERE run_id=$1`, f.runID)
+	_, err = sp.Exec(ctx, `UPDATE run_publication_resume SET intent = jsonb_set(intent::jsonb, '{branch}', '"other"')::text::json WHERE run_id=$1`, f.runID)
 	requireCoordinateSQLState(t, err, "23514")
 	_ = sp.Rollback(ctx)
 	retired, err := q.RetirePublicationResume(ctx, store.RetirePublicationResumeParams{RunID: f.runID, Reason: "owner_completion_continue"})
@@ -255,6 +257,12 @@ func TestPublicationResumeIntentValidationLiveDB(t *testing.T) {
 		"nested floor casing": json.RawMessage(strings.Replace(string(base("")), `"kind"`, `"Kind"`, 1)),
 		"trailing data":       append(base(""), []byte(` {}`)...),
 		"unicode nul":         base(`,"mr":{"title":"a\u0000b"}`),
+		"lone surrogate":      base(`,"mr":{"title":"a\ud800b"}`),
+		"uppercase run id":    json.RawMessage(strings.Replace(string(base("")), id, strings.ToUpper(id), 1)),
+		"braced repo id":      json.RawMessage(strings.Replace(string(base("")), `"`+repo+`"`, `"{`+repo+`}"`, 1)),
+		"absent floor oid":    json.RawMessage(strings.Replace(string(base("")), `{"kind":"absent"}`, `{"kind":"absent","oid":null}`, 1)),
+		"pinned floor no oid": json.RawMessage(strings.Replace(string(base("")), `{"kind":"absent"}`, `{"kind":"pinned","oid":null}`, 1)),
+		"deep nesting":        base(`,"mr":` + strings.Repeat("[", 64) + strings.Repeat("]", 64)),
 	} {
 		_, err := f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID, PublicationIntentRequest{ClaimGeneration: 1, Intent: raw})
 		if !errors.Is(err, ErrInvalidState) {
@@ -286,49 +294,135 @@ func TestPublicationResumeKindUnsupportedLiveDB(t *testing.T) {
 }
 
 // The state report that re-enters a live status (awaiting_input to running) is an authority write
-// on an enrolled run: it locks the worker first and sets the opt-ins, so it commits on the new API.
+// on an enrolled run: it takes the bound worker's row lock before the run row. Another
+// transaction holding that worker lock must therefore stall the report until it is released.
 func TestPublicationResumeSetStateAuthorityLiveDB(t *testing.T) {
 	f := newPublicationResumeFixture(t)
 	f.enroll(t)
 	f.env.exec(`UPDATE runs SET status='awaiting_input', status_since=now(), open_question_id='q1' WHERE id=$1`, f.runID)
 	f.env.exec(`INSERT INTO run_user_inputs (run_id, kind, body, question_id, applied_at) VALUES ($1, 'answer', 'yes', 'q1', now())`, f.runID)
-	g := int64(1)
-	run, applied, err := f.svc.SetState(f.env.ctx, f.wkr, f.runID, StateRequest{State: "running", ClaimGeneration: &g})
-	if err != nil || !applied || run.Status != "running" {
-		t.Fatalf("awaiting_input to running: run=%q applied=%v err=%v", run.Status, applied, err)
+	holder, err := f.env.pool.Begin(f.env.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback(f.env.ctx) }()
+	var locked uuid.UUID
+	if err = holder.QueryRow(f.env.ctx, `SELECT id FROM workers WHERE id=$1 FOR UPDATE`, f.workerID).Scan(&locked); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		status  string
+		applied bool
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(f.env.ctx, 30*time.Second)
+		defer cancel()
+		g := int64(1)
+		run, applied, err := f.svc.SetState(ctx, f.wkr, f.runID, StateRequest{State: "running", ClaimGeneration: &g})
+		done <- result{run.Status, applied, err}
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("SetState completed while the worker row was locked elsewhere: %+v", r)
+	case <-time.After(750 * time.Millisecond):
+	}
+	if err = holder.Rollback(f.env.ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		if r.err != nil || !r.applied || r.status != "running" {
+			t.Fatalf("awaiting_input to running after the lock was released: %+v", r)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("SetState did not complete after the worker lock was released")
 	}
 }
 
 // A credential_disabled run with a pending pause settles into the owner pause, which reopens the
 // released claim. For an enrolled run whose bound worker is gone or lacks the capability that
-// would raise the run guard on every promoter pass; it must be refused cleanly instead.
+// would raise the run guard on every promoter pass; it must be refused cleanly instead. Each case
+// has its own fixture, so one case's mutation cannot mask or cause another's outcome.
 func TestPublicationResumeCredentialDisabledSettleLiveDB(t *testing.T) {
-	f := newPublicationResumeFixture(t)
-	ctx := f.env.ctx
-	f.enroll(t)
-	f.env.exec(`UPDATE runs SET status='paused', hold_reason='credential_disabled', status_since=now(),
-		claim_released_at=now(), pause_requested_at=now(), pause_mode='milestone' WHERE id=$1`, f.runID)
-	for name, setup := range map[string]string{
-		"worker row without the capability": `UPDATE workers SET protocol_capabilities='{}' WHERE id=$1`,
-		"worker unbound":                    `UPDATE runs SET worker_id=NULL WHERE id=$1`,
-	} {
-		target := f.workerID
-		if name == "worker unbound" {
-			target = f.runID
-		}
-		f.env.exec(setup, target)
-		status, err := f.svc.promoteCredentialDisabledRun(ctx, f.userID, f.runID)
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) {
-			t.Fatalf("%s: promoter raised %s: %v", name, pgErr.Code, err)
-		}
-		if err != nil || status != "" {
-			t.Fatalf("%s: status=%q err=%v, want a clean refusal", name, status, err)
-		}
-		var held string
-		if err := f.env.pool.QueryRow(ctx, `SELECT status||'/'||COALESCE(hold_reason,'') FROM runs WHERE id=$1`, f.runID).Scan(&held); err != nil || held != "paused/credential_disabled" {
-			t.Fatalf("%s: run=%q err=%v, want it left held", name, held, err)
-		}
+	cases := []struct {
+		name  string
+		setup func(f *publicationResumeFixture)
+	}{
+		{"worker row without the capability", func(f *publicationResumeFixture) {
+			f.env.exec(`UPDATE workers SET protocol_capabilities='{}' WHERE id=$1`, f.workerID)
+		}},
+		{"worker unbound", func(f *publicationResumeFixture) {
+			f.env.exec(`UPDATE runs SET worker_id=NULL WHERE id=$1`, f.runID)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newPublicationResumeFixture(t)
+			ctx := f.env.ctx
+			f.enroll(t)
+			f.env.exec(`UPDATE runs SET status='paused', hold_reason='credential_disabled', status_since=now(),
+				claim_released_at=now(), pause_requested_at=now(), pause_mode='milestone' WHERE id=$1`, f.runID)
+			tc.setup(f)
+			status, err := f.svc.promoteCredentialDisabledRun(ctx, f.userID, f.runID)
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) {
+				t.Fatalf("promoter raised %s: %v", pgErr.Code, err)
+			}
+			if err != nil || status != "" {
+				t.Fatalf("status=%q err=%v, want a clean refusal", status, err)
+			}
+			var held string
+			if err := f.env.pool.QueryRow(ctx, `SELECT status||'/'||COALESCE(hold_reason,'') FROM runs WHERE id=$1`, f.runID).Scan(&held); err != nil || held != "paused/credential_disabled" {
+				t.Fatalf("run=%q err=%v, want it left held", held, err)
+			}
+		})
+	}
+}
+
+// Numbers are stored as posted. A near-cap body of 1e131071 literals must not expand in the
+// table CHECK (as jsonb, each literal becomes 131 KB of digits and the cast took Postgres down):
+// it is stored byte for byte, quickly, with no database error. A literal past the length bound
+// is refused as a client error.
+func TestPublicationResumeNumberLiteralLiveDB(t *testing.T) {
+	cases := []struct {
+		name   string
+		extra  string
+		stored bool
+	}{
+		{"exponent flood near the cap", `,"mr":{"n":[` + strings.Repeat("1e131071,", (MaxPublicationIntentBytes-600)/9) + `1]}`, true},
+		{"short literals", `,"mr":{"n":[1e5,1.50,-0.0]}`, true},
+		{"literal past the bound", `,"mr":{"n":` + strings.Repeat("9", 65) + `}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newPublicationResumeFixture(t)
+			ctx := f.env.ctx
+			raw := json.RawMessage(`{"run_id":"` + f.runID.String() + `","repo_id":"` + f.repoID.String() + `","branch":"agent/issue-1","claim_generation":1,` +
+				`"original_head":"` + pubHeadA + `","floor":{"kind":"absent"},"candidate":null` + tc.extra + `}`)
+			if len(raw) > MaxPublicationIntentBytes {
+				t.Fatalf("fixture is %d bytes, past the cap", len(raw))
+			}
+			start := time.Now()
+			_, err := f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID, PublicationIntentRequest{ClaimGeneration: 1, Intent: raw})
+			if d := time.Since(start); d > 5*time.Second {
+				t.Fatalf("took %s", d)
+			}
+			if !tc.stored {
+				if !errors.Is(err, ErrInvalidState) {
+					t.Fatalf("err=%v, want ErrInvalidState", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("register: %v", err)
+			}
+			var got string
+			if err = f.env.pool.QueryRow(ctx, `SELECT intent::text FROM run_publication_resume WHERE run_id=$1`, f.runID).Scan(&got); err != nil || got != string(raw) {
+				t.Fatalf("stored differs from the posted bytes (len %d vs %d) err=%v", len(got), len(raw), err)
+			}
+		})
 	}
 }
 

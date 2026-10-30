@@ -3,14 +3,20 @@
 -- lives in a side table so runs gains a single column (recovery_wait_phase).
 
 -- +goose Up
+-- The first statement: CREATE TABLE ... REFERENCES runs and the ALTER TABLE on runs below both
+-- wait on runs locks, so the bound must cover them. A lock wait past it fails the migration,
+-- which can be rerun.
+SET LOCAL lock_timeout = '5s';
 CREATE TABLE run_publication_resume (
     run_id           uuid        NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     enrollment_seq   int         NOT NULL CHECK (enrollment_seq > 0),
     claim_generation bigint      NOT NULL,
     worker_id        uuid,
-    -- The API bounds the raw body at 64 KiB; jsonb text normalisation can expand it, so the
-    -- table bound leaves headroom (a violation is a 23514 the API maps to a client error).
-    intent           jsonb       NOT NULL CHECK (octet_length(intent::text) <= 131072),
+    -- json, not jsonb: the stored text is the posted bytes verbatim, so this bound equals the
+    -- API's raw 64 KiB bound (MaxPublicationIntentBytes). jsonb would rewrite a number such as
+    -- 1e131071 into 131 KB of digits when the CHECK casts it to text. A violation is a 23514
+    -- the API maps to a client error. json has no equality operator: compare ::text or ->>.
+    intent           json        NOT NULL CHECK (octet_length(intent::text) <= 65536),
     candidate_seq    int         NOT NULL DEFAULT 0 CHECK (candidate_seq >= 0),
     state            text        NOT NULL CHECK (state IN ('active', 'retired', 'completed')),
     retired_reason   text,
@@ -22,17 +28,15 @@ CREATE TABLE run_publication_resume (
         'publication_retry_exhausted', 'publication_model_required',
         'publication_source_unavailable', 'publication_intent_mismatch',
         'publication_custodian_unavailable')),
-    handoff          jsonb,
+    handoff          json,
     created_at       timestamptz NOT NULL DEFAULT now(),
     updated_at       timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, enrollment_seq)
 );
 CREATE UNIQUE INDEX run_publication_resume_active_idx ON run_publication_resume (run_id) WHERE state = 'active';
 
--- runs is hot: never queue behind (and so block) its writers for long. A lock wait past this
--- fails the migration, and the migration can be rerun. The CHECK is added NOT VALID and left that way:
+-- runs is hot (see the lock_timeout above). The CHECK is added NOT VALID and left that way:
 -- validating would scan runs, and the column is NULL on every existing row.
-SET LOCAL lock_timeout = '5s';
 ALTER TABLE runs ADD COLUMN recovery_wait_phase text;
 ALTER TABLE runs ADD CONSTRAINT runs_recovery_wait_phase_check
     CHECK (recovery_wait_phase IS NULL OR recovery_wait_phase = 'publication') NOT VALID;
@@ -126,22 +130,28 @@ BEGIN
             RAISE EXCEPTION 'publication resume state change refused' USING ERRCODE = '23514';
         END IF;
     ELSIF OLD.state <> 'active'
-          AND (NEW.intent IS DISTINCT FROM OLD.intent OR NEW.candidate_seq IS DISTINCT FROM OLD.candidate_seq
+          AND (NEW.intent::text IS DISTINCT FROM OLD.intent::text OR NEW.candidate_seq IS DISTINCT FROM OLD.candidate_seq
                OR NEW.claim_generation IS DISTINCT FROM OLD.claim_generation) THEN
         RAISE EXCEPTION 'inactive publication resume is immutable' USING ERRCODE = '23514';
     END IF;
-    IF NEW.intent IS DISTINCT FROM OLD.intent OR NEW.candidate_seq IS DISTINCT FROM OLD.candidate_seq THEN
+    IF NEW.intent::text IS DISTINCT FROM OLD.intent::text OR NEW.candidate_seq IS DISTINCT FROM OLD.candidate_seq THEN
         IF NOT opted THEN
             RAISE EXCEPTION 'publication candidate update requires updated API' USING ERRCODE = '23514';
         END IF;
         IF NEW.state = OLD.state AND NEW.candidate_seq <= OLD.candidate_seq THEN
             RAISE EXCEPTION 'publication candidate_seq must increase' USING ERRCODE = '23514';
         END IF;
-        FOREACH field IN ARRAY ARRAY['run_id', 'repo_id', 'branch', 'claim_generation', 'original_head', 'floor'] LOOP
-            IF NEW.intent->field IS DISTINCT FROM OLD.intent->field THEN
+        -- Scalar identity members compare as text; the floor object as its kind and oid members.
+        -- Arrays compare NULL elements as equal, so an absent oid matches an absent oid.
+        FOREACH field IN ARRAY ARRAY['run_id', 'repo_id', 'branch', 'claim_generation', 'original_head'] LOOP
+            IF NEW.intent->>field IS DISTINCT FROM OLD.intent->>field THEN
                 RAISE EXCEPTION 'publication intent identity is immutable' USING ERRCODE = '23514';
             END IF;
         END LOOP;
+        IF ARRAY[NEW.intent->'floor'->>'kind', NEW.intent->'floor'->>'oid']
+           IS DISTINCT FROM ARRAY[OLD.intent->'floor'->>'kind', OLD.intent->'floor'->>'oid'] THEN
+            RAISE EXCEPTION 'publication intent identity is immutable' USING ERRCODE = '23514';
+        END IF;
     END IF;
     NEW.updated_at := now();
     RETURN NEW;

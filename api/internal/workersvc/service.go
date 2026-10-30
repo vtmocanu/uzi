@@ -4672,7 +4672,8 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		if perr != nil {
 			return store.Run{}, false, perr
 		}
-		if len(owned.CheckpointCoordinates) > 0 || leaseFence || pubEnrolled || completedPublicationCapable(wkr, req) || req.SourcePublication != nil {
+		workerLocked := len(owned.CheckpointCoordinates) > 0 || leaseFence || pubEnrolled || completedPublicationCapable(wkr, req) || req.SourcePublication != nil
+		if workerLocked {
 			if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 				if errors.Is(werr, pgx.ErrNoRows) {
 					return store.Run{}, false, ErrRunNotOwned // the worker row is gone: the run left it
@@ -4692,6 +4693,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return store.Run{}, false, ErrRunNotOwned
 			}
 			return store.Run{}, false, lerr
+		}
+		if err := recheckPublicationEnrollment(ctx, qtx, runID, workerLocked); err != nil {
+			return store.Run{}, false, err
 		}
 		reconciled, rerr := reconciliationExists(ctx, tx, runID)
 		if rerr != nil {
@@ -4779,7 +4783,8 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		if perr != nil {
 			return store.Run{}, false, perr
 		}
-		if len(owned.CheckpointCoordinates) > 0 || pubEnrolled {
+		workerLocked := len(owned.CheckpointCoordinates) > 0 || pubEnrolled
+		if workerLocked {
 			if _, err := qtx.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
 				return store.Run{}, false, err
 			}
@@ -4793,6 +4798,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return store.Run{}, false, ErrRunNotOwned
 			}
 			return store.Run{}, false, lerr
+		}
+		if err := recheckPublicationEnrollment(ctx, qtx, runID, workerLocked); err != nil {
+			return store.Run{}, false, err
 		}
 		owned = locked
 		q = qtx

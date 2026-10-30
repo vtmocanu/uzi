@@ -22,13 +22,13 @@ SELECT EXISTS (
 -- name: EnrollPublicationResume :one
 -- The caller holds the run row lock, so MAX+1 cannot race; the partial unique index backs it.
 INSERT INTO run_publication_resume (run_id, enrollment_seq, claim_generation, worker_id, intent, state)
-SELECT @run_id::uuid, COALESCE(MAX(p.enrollment_seq), 0) + 1, @claim_generation::bigint, @worker_id::uuid, @intent::jsonb, 'active'
+SELECT @run_id::uuid, COALESCE(MAX(p.enrollment_seq), 0) + 1, @claim_generation::bigint, @worker_id::uuid, @intent::json, 'active'
 FROM run_publication_resume p WHERE p.run_id = @run_id::uuid
 RETURNING *;
 
 -- name: UpdatePublicationCandidate :one
 -- Compare-and-swap on candidate_seq; zero rows means a stale seq or a non-active enrollment.
-UPDATE run_publication_resume SET intent = @intent::jsonb, candidate_seq = @new_candidate_seq::int
+UPDATE run_publication_resume SET intent = @intent::json, candidate_seq = @new_candidate_seq::int
 WHERE run_id = @run_id AND enrollment_seq = @enrollment_seq AND state = 'active'
   AND candidate_seq = @expected_candidate_seq::int
 RETURNING *;

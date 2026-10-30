@@ -31,12 +31,12 @@ func TestWorkerPublicationIntentErrorMapping(t *testing.T) {
 		{"capability missing", workersvc.ErrPublicationResumeUnsupported, http.StatusBadRequest, "publication_resume_unsupported"},
 		{"kind unsupported", workersvc.ErrPublicationKindUnsupported, http.StatusBadRequest, "publication_kind_unsupported"},
 		{"not owned", workersvc.ErrRunNotOwned, http.StatusNotFound, ""},
-		{"stale claim", workersvc.ErrStaleClaim, http.StatusConflict, "stale_claim"},
+		{"stale claim", workersvc.ErrStaleClaim, http.StatusConflict, ""},
 		{"identity mismatch", workersvc.ErrPublicationIntentMismatch, http.StatusConflict, "publication_intent_mismatch"},
 		{"retired", workersvc.ErrPublicationEnrollmentRetired, http.StatusConflict, "publication_enrollment_retired"},
 		{"feature off", workersvc.ErrPublicationResumeDisabled, http.StatusServiceUnavailable, ""},
 		{"store failure", errors.New("boom"), http.StatusServiceUnavailable, ""},
-		{"wrapped", fmt.Errorf("wrap: %w", workersvc.ErrStaleClaim), http.StatusConflict, "stale_claim"},
+		{"wrapped", fmt.Errorf("wrap: %w", workersvc.ErrStaleClaim), http.StatusConflict, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -46,8 +46,18 @@ func TestWorkerPublicationIntentErrorMapping(t *testing.T) {
 				t.Fatalf("status=%d body=%s, want %d", rec.Code, rec.Body.String(), tc.status)
 			}
 			var body map[string]string
-			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["error"] == "" {
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 				t.Fatalf("body=%s err=%v", rec.Body.String(), err)
+			}
+			if errors.Is(tc.err, workersvc.ErrStaleClaim) {
+				// The established stale_claim 409 body is exactly {"disposition":"stale_claim"}.
+				if len(body) != 1 || body["disposition"] != "stale_claim" {
+					t.Fatalf("stale body=%s", rec.Body.String())
+				}
+				return
+			}
+			if body["error"] == "" {
+				t.Fatalf("body=%s", rec.Body.String())
 			}
 			if body["reason"] != tc.reason {
 				t.Fatalf("reason=%q, want %q (body %s)", body["reason"], tc.reason, rec.Body.String())

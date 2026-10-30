@@ -249,7 +249,10 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		}
 	} else if live, ok := q.(pgxClaimFinishTx); ok {
 		// A publication-enrolled run locks its worker before the run row, like a checkpoint run;
-		// any other run needs only the opt-in.
+		// any other run needs only the opt-in. No re-check after the run lock: this runs inside a
+		// claim of a run that is claimed, not running, and enrollment (RegisterPublicationIntent)
+		// requires status running at the live generation, so an enrollment cannot appear between
+		// this read and the run lock.
 		enrolled, err := publicationEnrolled(ctx, live.Queries, run.ID)
 		if err != nil {
 			return nil, "", err

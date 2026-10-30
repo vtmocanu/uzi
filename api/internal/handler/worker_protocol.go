@@ -1465,6 +1465,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// this answers whenever the run's worker_id is not this worker (another worker or
 			// NULL), at any generation; it proves neither a newer claim nor a landed outcome.
 			httpx.ErrorReason(w, http.StatusNotFound, "run not found for this worker", "run_not_owned")
+		case errors.Is(err, workersvc.ErrPublicationEnrollmentChanged):
+			// The run was enrolled while this report waited for its lock; nothing was written.
+			// A retryable 503 (not a 409 no-op ack), so the worker re-sends the report.
+			httpx.ErrorReason(w, http.StatusServiceUnavailable, "publication enrollment changed; retry", "publication_enrollment_changed")
 		case errors.Is(err, workersvc.ErrRunWallExpired):
 			ack, ackErr := h.workerStateAck(w, r, run)
 			if ackErr != nil {

@@ -53,7 +53,9 @@ func writePublicationIntentError(w http.ResponseWriter, err error) {
 	case errors.Is(err, workersvc.ErrRunNotOwned):
 		httpx.Error(w, http.StatusNotFound, "run not owned")
 	case errors.Is(err, workersvc.ErrStaleClaim):
-		httpx.ErrorReason(w, http.StatusConflict, "stale_claim", "stale_claim")
+		// The disposition body WorkerRunUsage and WorkerRunMessages answer, which the worker reads
+		// to stop the flight.
+		httpx.JSON(w, http.StatusConflict, map[string]any{"disposition": "stale_claim"})
 	case errors.Is(err, workersvc.ErrPublicationIntentMismatch):
 		coded(http.StatusConflict, workersvc.ErrPublicationIntentMismatch)
 	case errors.Is(err, workersvc.ErrPublicationEnrollmentRetired):
