@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -122,7 +123,14 @@ func (f *prerequisiteExecutorLiveDB) fixtureForge(t *testing.T, baseURL string, 
 		if selected == nil {
 			return forge.Project{}, fmt.Errorf("unknown fixture project %s/%d", baseURL, id)
 		}
-		return prerequisiteProjectStub(t, selected)(ctx, id)
+		if selected.inTX.Load() {
+			t.Error("project lookup in transaction")
+		}
+		u, err := url.Parse(selected.repo.WebUrl)
+		if err != nil {
+			return forge.Project{}, err
+		}
+		return forge.Project{ForgeProjectID: id, PathWithNamespace: strings.TrimSuffix(strings.TrimPrefix(u.Path, "/"), "/"), WebURL: selected.repo.WebUrl}, ctx.Err()
 	}
 	return &clone, nil
 }
