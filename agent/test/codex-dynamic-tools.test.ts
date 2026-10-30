@@ -133,11 +133,14 @@ describe("buildCodexDynamicTools: worker-owned app-server callback surface", () 
     const spec = buildCodexDynamicTools(grants(["Read"])).find(s => s.name === "uzi_read")!;
     assert.deepEqual(spec.inputSchema.properties, {
       path: { type: "string" }, file_path: { type: "string" },
+      tail: { type: "integer", minimum: 1, maximum: 2000 },
       offset: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER, default: 1 },
       limit: { type: "integer", minimum: 1, maximum: 2000, default: 200 },
     });
     assert.deepEqual(spec.inputSchema.anyOf, [{ required: ["path"] }, { required: ["file_path"] }]);
     assert.equal(spec.inputSchema.required, undefined);
+    assert.deepEqual(spec.inputSchema.not, { required: ["tail"], anyOf: [{ required: ["offset"] }, { required: ["limit"] }] });
+    assert.match(spec.description, /shared range scan budget/);
     assert.match(spec.description, /explicit offset or limit allows one fallback after a helper oversize refusal/);
     assert.match(spec.description, /64 MiB.*64 KiB.*incomplete:true.*scan_budget/);
     assert.match(spec.description, /not a snapshot of concurrent changes/);

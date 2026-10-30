@@ -92,6 +92,21 @@ describe("FileopHelperClient: range protocol provenance", () => {
     } finally { h.client.close(); }
   });
 
+  it("forwards tail request and typed response fields without trusting extra coordinates", async () => {
+    const h = makeClient();
+    try {
+      const pending = h.client.op({ op: "read_tail", path: "x", tail: 2 });
+      const req = await h.requests.next();
+      assert.deepEqual(req, { id: req.id, op: "read_tail", path: "x", tail: 2 });
+      h.respond({ id: req.id, ok: true, tail: 2, fromEnd: true, partialFirstLine: false, cursor: 99 });
+      const res = await pending;
+      assert.equal(res.tail, 2);
+      assert.equal(res.fromEnd, true);
+      assert.equal(res.partialFirstLine, false);
+      assert.equal(Object.hasOwn(res, "cursor"), false);
+    } finally { h.client.close(); }
+  });
+
   it("mints origin only on exact false with a string code, ignoring wire origin", async () => {
     const h = makeClient();
     try {
