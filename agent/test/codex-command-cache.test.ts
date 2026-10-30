@@ -8,9 +8,12 @@ import { COMMAND_UID, setprivArgsForUid } from "../src/runner-uid.js";
 import {
   CODEX_COMMAND_CACHE_ROOT,
   CommandCacheStartError,
+  createMeasureLimiter,
+  measureCommandCache,
   reapCodexCommandOrphans,
   removeCommandCache,
   startCommandCacheHolder,
+  type CacheCleanupResult,
   type SpawnStandaloneMode,
   type StandaloneModeDeps,
   type StandaloneModeProcess,
@@ -587,6 +590,333 @@ describe("startCommandCacheHolder", () => {
   it("rejects an invalid token without spawning", async () => {
     const f = fakeSpawn();
     await assert.rejects(startCommandCacheHolder("NOT-A-UUID", { spawn: f.spawn }), /token/);
+    assert.equal(f.calls.length, 0);
+  });
+});
+
+/** True when `p` has not settled yet (observed after a macrotask, no sleeps). */
+async function stillPending(p: Promise<unknown>): Promise<boolean> {
+  let settled = false;
+  void p.then(() => { settled = true; }, () => { settled = true; });
+  await tick();
+  await tick();
+  return !settled;
+}
+
+describe("startCommandCacheHolder settlement (issue #3675)", () => {
+  const ready = JSON.stringify({ event: "cache_ready", path: CACHE_PATH });
+  const cleanup = (state: string, reason: string): string => JSON.stringify({ event: "cache_cleanup", state, reason });
+  const capture = (): { settlements: Promise<CacheCleanupResult>[]; onSpawned: (s: Promise<CacheCleanupResult>) => void } => {
+    const settlements: Promise<CacheCleanupResult>[] = [];
+    return { settlements, onSpawned: (s) => { settlements.push(s); } };
+  };
+
+  it("announces the settlement synchronously after the spawn, before readiness settles", async () => {
+    const f = fakeSpawn((p) => p.line(ready));
+    const seen = capture();
+    const started = startCommandCacheHolder(TOKEN, { spawn: f.spawn, timeoutMs: 1000, onSpawned: seen.onSpawned });
+    assert.equal(seen.settlements.length, 1, "called before the first await");
+    assert.equal(f.calls.length, 1);
+    const holder = await started;
+    // Ready + release: the settlement is the holder's close outcome.
+    const p = f.procs[0]!;
+    p.stdin.once("finish", () => { p.line(cleanup("removed", "")); p.finish(0); });
+    assert.deepEqual(await holder.release(true, 1000), { state: "removed", reason: "" });
+    assert.deepEqual(await seen.settlements[0], { state: "removed", reason: "" });
+  });
+
+  it("a settlement is not resolved by release delivery timing: only by close", async () => {
+    const f = fakeSpawn((p) => p.line(ready));
+    const seen = capture();
+    const holder = await startCommandCacheHolder(TOKEN, { spawn: f.spawn, timeoutMs: 1000, onSpawned: seen.onSpawned });
+    const pending = await holder.release(true, 5);
+    assert.equal(pending.state, "pending");
+    assert.equal(await stillPending(seen.settlements[0]!), true);
+    f.procs[0]!.line(cleanup("removed", ""));
+    f.procs[0]!.finish(0);
+    assert.deepEqual(await seen.settlements[0], { state: "removed", reason: "" });
+  });
+
+  it("a readiness timeout with a live holder carries a settlement that waits for the real close", async () => {
+    const f = fakeSpawn(); // never ready
+    const seen = capture();
+    const error = await startCommandCacheHolder(TOKEN, { spawn: f.spawn, timeoutMs: 15, onSpawned: seen.onSpawned })
+      .then(() => undefined, (e: unknown) => e);
+    assert.ok(error instanceof CommandCacheStartError);
+    assert.equal(error.reason, "timeout");
+    assert.equal(error.settlement, seen.settlements[0]);
+    assert.equal(await stillPending(error.settlement!), true, "a timer never settles it");
+    assert.equal(f.procs[0]!.killed, 0);
+    // The holder saw EOF without ever being ready and exits with no line: exited.
+    f.procs[0]!.finish(1);
+    assert.deepEqual(await error.settlement, { state: "error", reason: "exited" });
+  });
+
+  it("a late cache_ready after the timeout is never usable and settles as the holder's retained verdict", async () => {
+    const f = fakeSpawn();
+    const seen = capture();
+    const error = await startCommandCacheHolder(TOKEN, { spawn: f.spawn, timeoutMs: 15, onSpawned: seen.onSpawned })
+      .then(() => undefined, (e: unknown) => e);
+    assert.ok(error instanceof CommandCacheStartError);
+    const p = f.procs[0]!;
+    p.line(ready); // too late
+    p.line(cleanup("retained", "unattested")); // the holder saw EOF
+    p.finish(3);
+    assert.deepEqual(await error.settlement, { state: "retained", reason: "unattested" });
+  });
+
+  it("a cache_error before readiness settles with its word at close", async () => {
+    const f = fakeSpawn((p) => { p.line(JSON.stringify({ event: "cache_error", reason: "lock" })); });
+    const seen = capture();
+    const error = await startCommandCacheHolder(TOKEN, { spawn: f.spawn, timeoutMs: 1000, onSpawned: seen.onSpawned })
+      .then(() => undefined, (e: unknown) => e);
+    assert.ok(error instanceof CommandCacheStartError);
+    assert.equal(error.reason, "lock");
+    assert.equal(await stillPending(error.settlement!), true, "rejection precedes the close");
+    f.procs[0]!.finish(2);
+    assert.deepEqual(await error.settlement, { state: "error", reason: "lock" });
+  });
+
+  it("a breach before readiness settles as protocol only at close", async () => {
+    const f = fakeSpawn((p) => p.line("x".repeat(5000)));
+    const seen = capture();
+    const error = await startCommandCacheHolder(TOKEN, { spawn: f.spawn, timeoutMs: 1000, onSpawned: seen.onSpawned })
+      .then(() => undefined, (e: unknown) => e);
+    assert.ok(error instanceof CommandCacheStartError);
+    assert.equal(error.reason, "protocol");
+    assert.equal(await stillPending(error.settlement!), true);
+    f.procs[0]!.finish(0);
+    assert.deepEqual(await error.settlement, { state: "error", reason: "protocol" });
+  });
+
+  it("a breach after readiness settles as protocol only at close", async () => {
+    const f = fakeSpawn((p) => p.line(ready));
+    const seen = capture();
+    const holder = await startCommandCacheHolder(TOKEN, { spawn: f.spawn, timeoutMs: 1000, onSpawned: seen.onSpawned });
+    f.procs[0]!.line("x".repeat(5000));
+    await tick();
+    assert.equal(holder.alive(), false);
+    assert.equal(await stillPending(seen.settlements[0]!), true);
+    f.procs[0]!.finish(0);
+    assert.deepEqual(await seen.settlements[0], { state: "error", reason: "protocol" });
+  });
+
+  it("missing channels throw spawn with a settlement that waits for the close", async () => {
+    const calls: number[] = [];
+    const spawn: SpawnStandaloneMode = () => {
+      const p = new FakeModeProcess();
+      calls.push(p.pid);
+      (p as unknown as { stdout: null }).stdout = null;
+      procs.push(p);
+      return p as unknown as StandaloneModeProcess;
+    };
+    const procs: FakeModeProcess[] = [];
+    const seen = capture();
+    const error = await startCommandCacheHolder(TOKEN, { spawn, timeoutMs: 1000, onSpawned: seen.onSpawned })
+      .then(() => undefined, (e: unknown) => e);
+    assert.ok(error instanceof CommandCacheStartError);
+    assert.equal(error.reason, "spawn");
+    assert.equal(error.settlement, seen.settlements[0]);
+    assert.equal(await stillPending(error.settlement!), true);
+    procs[0]!.emit("exit", 1, null);
+    procs[0]!.emit("close", 1, null);
+    assert.deepEqual(await error.settlement, { state: "error", reason: "exited" });
+  });
+
+  it("an error event for a process that never started settles at once", async () => {
+    const f = fakeSpawn((p) => {
+      Object.defineProperty(p, "pid", { value: undefined });
+      p.emit("error", new Error("spawn ENOENT"));
+    });
+    const seen = capture();
+    const error = await startCommandCacheHolder(TOKEN, { spawn: f.spawn, timeoutMs: 1000, onSpawned: seen.onSpawned })
+      .then(() => undefined, (e: unknown) => e);
+    assert.ok(error instanceof CommandCacheStartError);
+    assert.equal(error.reason, "spawn");
+    assert.deepEqual(await error.settlement, { state: "error", reason: "spawn" });
+  });
+
+  it("a spawn that throws announces nothing and carries no settlement", async () => {
+    const seen = capture();
+    const error = await startCommandCacheHolder(TOKEN, {
+      spawn: () => { throw new Error("EAGAIN"); }, onSpawned: seen.onSpawned,
+    }).then(() => undefined, (e: unknown) => e);
+    assert.ok(error instanceof CommandCacheStartError);
+    assert.equal(error.settlement, undefined);
+    assert.equal(seen.settlements.length, 0);
+  });
+
+  it("an onSpawned observer that throws does not change the start", async () => {
+    const f = fakeSpawn((p) => p.line(ready));
+    const holder = await startCommandCacheHolder(TOKEN, {
+      spawn: f.spawn, timeoutMs: 1000, onSpawned: () => { throw new Error("observer"); },
+    });
+    assert.equal(holder.alive(), true);
+  });
+});
+
+describe("measureCommandCache (issue #3675)", () => {
+  const measureLine = (overrides: Record<string, unknown> = {}): string =>
+    JSON.stringify({ event: "cache_measure", state: "complete", bytes: 1234, entries: 7, reason: "", ...overrides });
+  const measureWithout = (key: string): string => {
+    const o: Record<string, unknown> = JSON.parse(measureLine());
+    delete o[key];
+    return JSON.stringify(o);
+  };
+  const unknown = (reason: string): { state: "unknown"; reason: string } => ({ state: "unknown", reason });
+
+  it("runs the fixed argv with no stdin", async () => {
+    const f = fakeSpawn(oneShot([measureLine()], 0));
+    await measureCommandCache(TOKEN, { spawn: f.spawn, limiter: createMeasureLimiter() });
+    assert.deepEqual(f.calls[0]!.args, [
+      "--measure-cache", "--expect-uid", String(COMMAND_UID), "--cache-root", CODEX_COMMAND_CACHE_ROOT, "--cache-token", TOKEN,
+    ]);
+    assert.deepEqual(f.calls[0]!.stdio, ["ignore", "pipe", "ignore"]);
+  });
+
+  const table: Array<[string, readonly string[], number, unknown]> = [
+    ["complete", [measureLine()], 0, { state: "complete", bytes: 1234 }],
+    ["complete zero", [measureLine({ bytes: 0, entries: 0 })], 0, { state: "complete", bytes: 0 }],
+    ...["absent", "entries", "depth", "deadline", "mismatch", "owner", "io", "bytes"].map((reason): [string, readonly string[], number, unknown] =>
+      [`incomplete ${reason}`, [measureLine({ state: "incomplete", reason })], 3, unknown(reason)]),
+    ["incomplete saturated bytes", ['{"event":"cache_measure","state":"incomplete","bytes":18446744073709551615,"entries":4,"reason":"bytes"}'], 3, unknown("bytes")],
+    ["cache_error dumpable", [JSON.stringify({ event: "cache_error", reason: "dumpable" })], 2, unknown("dumpable")],
+    ["cache_error root", [JSON.stringify({ event: "cache_error", reason: "root" })], 2, unknown("root")],
+    ["cache_error unknown word", [JSON.stringify({ event: "cache_error", reason: "lock" })], 2, unknown("protocol")],
+    ["cache_error wrong exit", [JSON.stringify({ event: "cache_error", reason: "root" })], 3, unknown("protocol")],
+    ["complete with exit 3", [measureLine()], 3, unknown("protocol")],
+    ["complete with exit 0 and a reason", [measureLine({ reason: "io" })], 0, unknown("protocol")],
+    ["complete with saturated bytes", ['{"event":"cache_measure","state":"complete","bytes":18446744073709551615,"entries":4,"reason":""}'], 0, unknown("protocol")],
+    ["complete with fractional bytes", [measureLine({ bytes: 1.5 })], 0, unknown("protocol")],
+    ["complete with negative entries", [measureLine({ entries: -1 })], 0, unknown("protocol")],
+    ["incomplete with exit 0", [measureLine({ state: "incomplete", reason: "io" })], 0, unknown("protocol")],
+    ["incomplete with an empty reason", [measureLine({ state: "incomplete", reason: "" })], 3, unknown("protocol")],
+    ["incomplete with an unknown reason", [measureLine({ state: "incomplete", reason: "weird" })], 3, unknown("protocol")],
+    ["an unknown state", [measureLine({ state: "partial" })], 0, unknown("protocol")],
+    ["an extra key", [measureLine({ x: 1 })], 0, unknown("protocol")],
+    ["a missing bytes", [measureWithout("bytes")], 0, unknown("protocol")],
+    ["a missing reason", [measureWithout("reason")], 0, unknown("protocol")],
+    ["garbage", ["measured"], 0, unknown("protocol")],
+    ["two lines", [measureLine(), measureLine()], 0, unknown("protocol")],
+    ["no line", [], 0, unknown("protocol")],
+    ["an oversized line", [`{"event":"cache_measure","pad":"${"x".repeat(5000)}"}`], 0, unknown("protocol")],
+  ];
+  for (const [label, lines, code, want] of table) {
+    it(`parses ${label}`, async () => {
+      const f = fakeSpawn(oneShot(lines, code));
+      assert.deepEqual(await measureCommandCache(TOKEN, { spawn: f.spawn, limiter: createMeasureLimiter() }), want);
+    });
+  }
+
+  it("rejects a non-lowercase-UUID token without spawning or taking the slot", async () => {
+    const limiter = createMeasureLimiter();
+    for (const bad of [TOKEN.toUpperCase(), "../etc", "", `${TOKEN}/x`]) {
+      const f = fakeSpawn();
+      assert.deepEqual(await measureCommandCache(bad, { spawn: f.spawn, limiter }), unknown("token"));
+      assert.equal(f.calls.length, 0);
+    }
+    const ok = fakeSpawn(oneShot([measureLine()], 0));
+    assert.equal((await measureCommandCache(TOKEN, { spawn: ok.spawn, limiter })).state, "complete");
+  });
+
+  it("a spawn failure is unknown(spawn) and gives the slot back", async () => {
+    const limiter = createMeasureLimiter();
+    const bad = await measureCommandCache(TOKEN, { spawn: () => { throw new Error("EAGAIN"); }, limiter });
+    assert.deepEqual(bad, unknown("spawn"));
+    const ok = fakeSpawn(oneShot([measureLine()], 0));
+    assert.equal((await measureCommandCache(TOKEN, { spawn: ok.spawn, limiter })).state, "complete");
+  });
+
+  it("a delivery timeout is unknown with a settlement that resolves only at the helper's close; never killed", async () => {
+    const f = fakeSpawn();
+    const result = await measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 15, limiter: createMeasureLimiter() });
+    assert.equal(result.state, "unknown");
+    if (result.state !== "unknown") return;
+    assert.equal(result.reason, "timeout");
+    assert.ok(result.settlement);
+    assert.equal(await stillPending(result.settlement), true);
+    assert.equal(f.procs[0]!.killed, 0);
+    f.procs[0]!.finish(0);
+    await result.settlement;
+  });
+
+  it("an abort after the spawn is unknown(aborted) with the helper's settlement", async () => {
+    const f = fakeSpawn();
+    const abort = new AbortController();
+    const pending = measureCommandCache(TOKEN, { spawn: f.spawn, signal: abort.signal, limiter: createMeasureLimiter() });
+    await tick();
+    assert.equal(f.calls.length, 1);
+    abort.abort();
+    const result = await pending;
+    assert.equal(result.state, "unknown");
+    if (result.state !== "unknown") return;
+    assert.equal(result.reason, "aborted");
+    assert.equal(await stillPending(result.settlement!), true);
+    f.procs[0]!.finish(0);
+    await result.settlement;
+  });
+
+  it("the worker-wide slot is held until the helper's ACTUAL close, past the first delivery timeout (FIFO)", async () => {
+    const limiter = createMeasureLimiter();
+    const f = fakeSpawn();
+    const first = await measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 15, limiter });
+    assert.equal(first.state, "unknown");
+    const second = measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 1000, limiter });
+    await tick(); await tick();
+    assert.equal(f.calls.length, 1, "the second request waits: the first helper has not closed");
+    f.procs[0]!.finish(0);
+    if (first.state === "unknown") await first.settlement;
+    await tick();
+    assert.equal(f.calls.length, 2, "the second spawns only after the first's close");
+    f.procs[1]!.line(measureLine());
+    f.procs[1]!.finish(0);
+    assert.deepEqual(await second, { state: "complete", bytes: 1234 });
+  });
+
+  it("queued requests run FIFO", async () => {
+    const limiter = createMeasureLimiter();
+    const f = fakeSpawn();
+    const order: string[] = [];
+    const a = measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 1000, limiter }).then(() => order.push("a"));
+    const b = measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 1000, limiter }).then(() => order.push("b"));
+    const c = measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 1000, limiter }).then(() => order.push("c"));
+    for (let i = 0; i < 3; i++) {
+      await tick();
+      assert.equal(f.calls.length, i + 1);
+      f.procs[i]!.line(measureLine());
+      f.procs[i]!.finish(0);
+      await tick(); await tick();
+    }
+    await Promise.all([a, b, c]);
+    assert.deepEqual(order, ["a", "b", "c"]);
+  });
+
+  it("an abort while queued is cancelled with nothing spawned, and the queue moves on", async () => {
+    const limiter = createMeasureLimiter();
+    const f = fakeSpawn();
+    const first = measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 1000, limiter });
+    const abort = new AbortController();
+    const queued = measureCommandCache(TOKEN, { spawn: f.spawn, signal: abort.signal, limiter });
+    const third = measureCommandCache(TOKEN, { spawn: f.spawn, timeoutMs: 1000, limiter });
+    await tick();
+    abort.abort();
+    assert.deepEqual(await queued, { state: "cancelled" });
+    assert.equal(f.calls.length, 1);
+    f.procs[0]!.line(measureLine());
+    f.procs[0]!.finish(0);
+    await first;
+    await tick();
+    assert.equal(f.calls.length, 2, "the cancelled request is skipped, the third spawns");
+    f.procs[1]!.line(measureLine());
+    f.procs[1]!.finish(0);
+    assert.equal((await third).state, "complete");
+  });
+
+  it("an already-aborted signal is cancelled without spawning", async () => {
+    const f = fakeSpawn();
+    const abort = new AbortController();
+    abort.abort();
+    assert.deepEqual(await measureCommandCache(TOKEN, { spawn: f.spawn, signal: abort.signal, limiter: createMeasureLimiter() }), { state: "cancelled" });
     assert.equal(f.calls.length, 0);
   });
 });

@@ -105,6 +105,7 @@ import { buildReviewCommentsContext, REVIEWED_RESUME_APPROVAL_GUIDANCE, CLAUDE_L
 import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
+import { CommandCacheStartError } from "../src/codex/launcher.js";
 import { isBrokerModelCommand, type CapturedMemoryContext, type SpawnCommandOptions } from "../src/codex/broker.js";
 import { WorkerMemoryCommands } from "../src/worker-memory-commands.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
@@ -12073,20 +12074,361 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     assert.deepEqual(c.holder.releases, [true], "the partial epoch's fileop root was reaped clean before the release");
   });
 
+  // Issue #3675 m2: the run's cache is measured after commands and rotated to a fresh holder once it
+  // reaches the budget. Driven through the PRODUCTION command seam (spawnCommand undefined) with a
+  // DISTINCT fake holder per start, an injected measurement over a byte counter that each cached
+  // command root "writes" to, and gates (never sleeps) for every ordering.
+  describe("command cache rotation (issue #3675)", () => {
+    const PER_COMMAND = 600;
+    const BUDGET = 1000;
+    const REMOVED_RESULT: CacheCleanupResult = { state: "removed", reason: "" };
+    interface Gate<T = void> { promise: Promise<T>; resolve(value: T): void }
+    function gate<T = void>(): Gate<T> {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>((r) => { resolve = r; });
+      return { promise, resolve };
+    }
+    interface RotHolder {
+      holder: CommandCacheHolder;
+      token: string;
+      dir: string;
+      releases: boolean[];
+      close: Gate<CacheCleanupResult>;
+      die(): void;
+    }
+    function rotHolder(token: string, mode: "removed" | "pending", result?: CacheCleanupResult): RotHolder {
+      const dir = `/var/cache/uzi-codex-cmd/${token}`;
+      let alive = true;
+      const releases: boolean[] = [];
+      const close = gate<CacheCleanupResult>();
+      return {
+        token, dir, releases, close,
+        // A dead holder's process has closed without a verdict.
+        die: () => { alive = false; close.resolve({ state: "error", reason: "exited" }); },
+        holder: {
+          token, path: dir, alive: () => alive,
+          release: async (drained) => {
+            releases.push(drained);
+            alive = false;
+            if (mode === "pending") return { state: "pending", reason: "", settlement: close.promise };
+            const outcome = result ?? REMOVED_RESULT;
+            close.resolve(outcome);
+            return outcome;
+          },
+        },
+      };
+    }
+
+    interface RotRig extends CacheRig {
+      holders: RotHolder[];
+      starts: string[];
+      measured: string[];
+      bytes: Map<string, number>;
+      removeAnswers: CacheCleanupResult[];
+      /** Hold back the nth (0-based) start until resolved. */
+      gateStart(n: number): Gate;
+      /** Make the nth start throw this after announcing its helper. */
+      failStart(n: number, error: unknown, close: Gate<CacheCleanupResult>): void;
+      /** Hold back the nth measurement until resolved with the byte count to report. */
+      gateMeasure(n: number): Gate;
+      dirOf(commandIndex: number): string | undefined;
+    }
+    function rotationRig(opts: {
+      holderMode?: "removed" | "pending";
+      unclean?: (index: number, spec: CodexEffectLaunchSpec) => boolean;
+      onLaunch?: (index: number, rig: RotRig) => void;
+      remove?: () => CacheCleanupResult;
+    } = {}): RotRig {
+      const base = cacheRig({ unclean: opts.unclean });
+      const holders: RotHolder[] = [];
+      const starts: string[] = [];
+      const measured: string[] = [];
+      const bytes = new Map<string, number>();
+      const startGates = new Map<number, Gate>();
+      const startFailures = new Map<number, { error: unknown; close: Gate<CacheCleanupResult> }>();
+      const measureGates = new Map<number, Gate>();
+      const removeAnswers: CacheCleanupResult[] = [];
+      const rr: RotRig = {
+        ...base, holders, starts, measured, bytes, removeAnswers,
+        gateStart: (n) => { const g = gate(); startGates.set(n, g); return g; },
+        failStart: (n, error, close) => { startFailures.set(n, { error, close }); },
+        gateMeasure: (n) => { const g = gate(); measureGates.set(n, g); return g; },
+        dirOf: (i) => {
+          const spec = base.specs[i];
+          const at = spec?.args.indexOf("--cache") ?? -1;
+          return spec !== undefined && at >= 0 ? spec.args[at + 1] : undefined;
+        },
+      };
+      const launch = base.rig.deps.launchEffectRoot!;
+      base.rig.deps = {
+        ...base.rig.deps,
+        commandCacheRunBytes: BUDGET,
+        cacheMeasureMinIntervalMs: 0,
+        startCacheHolder: async (token, startOpts) => {
+          const n = starts.length;
+          starts.push(token);
+          const h = rotHolder(token, opts.holderMode ?? "removed");
+          holders.push(h);
+          if (n > 0) startOpts?.onSpawned?.(startFailures.get(n)?.close.promise ?? h.close.promise);
+          await startGates.get(n)?.promise;
+          const failure = startFailures.get(n);
+          if (failure) throw failure.error;
+          return h.holder;
+        },
+        measureCommandCache: async (token) => {
+          const n = measured.length;
+          measured.push(token);
+          await measureGates.get(n)?.promise;
+          return { state: "complete", bytes: bytes.get(`/var/cache/uzi-codex-cmd/${token}`) ?? 0 };
+        },
+        removeCommandCache: async (token) => {
+          base.events.push("remove");
+          base.removals.push(token);
+          const answer = opts.remove?.() ?? REMOVED_RESULT;
+          removeAnswers.push(answer);
+          return answer;
+        },
+        launchEffectRoot: async (spec, ...rest) => {
+          const at = spec.args.indexOf("--cache");
+          if (at >= 0 && !spec.args.includes(ENV_PROBE_SCRIPT)) {
+            const dir = spec.args[at + 1]!;
+            bytes.set(dir, (bytes.get(dir) ?? 0) + PER_COMMAND);
+          }
+          opts.onLaunch?.(base.specs.length, rr);
+          return launch(spec, ...rest);
+        },
+      };
+      return rr;
+    }
+    function driver(c: RotRig) {
+      const t = c.rig.transport;
+      let seq = 0;
+      t.push(threadStarted());
+      return {
+        bash: (command: string): void => { t.push(toolCall(10 + seq, "Bash", { command }, "th-1", "tn-1", `c-rot-${seq}`)); seq++; },
+        finish: (): void => { t.push(signalDone()).push(turnCompleted("completed")).end(); },
+      };
+    }
+    const executorFor = (c: RotRig, log: Logger = noopLog): CodexExecutor => makeExecutor(c.rig, bindingOf(SUBSCRIPTION), log);
+
+    it("REGRESSION 3675: an over-budget cache rotates; later commands carry the new holder's dir, the old one is never reused and is released only once idle", async () => {
+      const c = rotationRig();
+      const d = driver(c);
+      const exec = executorFor(c);
+      const running = exec.run(makeCtx().ctx);
+      d.bash("echo one");
+      d.bash("echo two");
+      await waitFor(() => c.starts.length === 2, "the replacement holder to start");
+      const g1 = c.holders[0]!;
+      const g2 = c.holders[1]!;
+      assert.equal(c.dirOf(1), g1.dir);
+      assert.equal(c.dirOf(2), g1.dir, "the pending generation keeps admitting until the replacement is adopted");
+      await waitFor(() => g1.releases.length === 1, "G1 to retire");
+      assert.deepEqual(g1.releases, [true], "released drained only after its last root was disposed");
+      assert.equal(c.specs.length, 3, "no command was launched meanwhile");
+      d.bash("echo three");
+      await waitFor(() => c.specs.length === 4, "the third command");
+      assert.equal(c.dirOf(3), g2.dir, "later command specs carry G2's dir");
+      d.finish();
+      await withTimeout(running, 3000, "rotation run");
+      assert.deepEqual(c.specs.filter((s) => s.args.includes(g1.dir)).length, 2, "G1 was never reacquired");
+      assert.deepEqual(g1.releases, [true]);
+      assert.deepEqual(g2.releases, [true], "G2 is released at terminal teardown");
+      assert.deepEqual(c.removals, []);
+      assert.equal(c.starts.length, 2);
+    });
+
+    it("G1 to G2 to G3: closes stay unresolved, no concurrent extra replacement, the seal waits for them", async () => {
+      const c = rotationRig({ holderMode: "pending" });
+      const d = driver(c);
+      const exec = executorFor(c);
+      const running = exec.run(makeCtx().ctx);
+      d.bash("echo one");
+      d.bash("echo two");
+      await waitFor(() => c.starts.length === 2, "G2 start");
+      const [g1, g2] = c.holders as [RotHolder, RotHolder];
+      await waitFor(() => g1.releases.length === 1, "G1 retired");
+      // G1's close is its own (pending) settlement; it is fully removed before the second switch.
+      g1.close.resolve(REMOVED_RESULT);
+      await tick();
+      assert.equal(c.starts.length, 2, "exactly one replacement so far");
+      d.bash("echo three");
+      d.bash("echo four");
+      await waitFor(() => c.starts.length === 3, "G3 start");
+      const g3 = c.holders[2]!;
+      await waitFor(() => g2.releases.length === 1, "G2 retired after G3 was adopted");
+      d.bash("echo five");
+      await waitFor(() => c.specs.length === 6, "the fifth command");
+      assert.equal(c.dirOf(5), g3.dir);
+      d.finish();
+      await withTimeout(running, 3000, "G1-G2-G3 run");
+      assert.equal(c.starts.length, 3, "startCacheHolder called exactly 3 times");
+      assert.deepEqual(g2.releases, [true]);
+      assert.deepEqual(g3.releases, [true], "terminal drainage releases G3 exactly once");
+      let sealed = false;
+      const sealing = exec.sealLifetime({}).then((value) => { sealed = true; return value; });
+      await tick(); await tick();
+      assert.equal(sealed, false, "the seal waits for G2's and G3's closes");
+      g2.close.resolve(REMOVED_RESULT);
+      await tick(); await tick();
+      assert.equal(sealed, false, "and for G3's");
+      g3.close.resolve(REMOVED_RESULT);
+      assert.equal((await sealing).kind, "sealed");
+    });
+
+    it("holder loss after a rotation: later commands get no cache; the lost holder is removed by token at the terminal settle", async () => {
+      const c = rotationRig();
+      const d = driver(c);
+      const exec = executorFor(c);
+      const running = exec.run(makeCtx().ctx);
+      d.bash("echo one");
+      d.bash("echo two");
+      await waitFor(() => c.holders.length === 2 && c.holders[0]!.releases.length === 1, "G1 retired");
+      const g2 = c.holders[1]!;
+      d.bash("echo three");
+      await waitFor(() => c.specs.length === 4, "a G2 command");
+      assert.equal(c.dirOf(3), g2.dir);
+      g2.die();
+      d.bash("echo four");
+      await waitFor(() => c.specs.length === 5, "a command after the loss");
+      assert.equal(c.dirOf(4), undefined, "no --cache once the current holder is gone");
+      d.finish();
+      await withTimeout(running, 3000, "holder loss run");
+      assert.deepEqual(c.removals, [g2.token], "terminal settle removes only the lost G2");
+      assert.deepEqual(c.holders[0]!.releases, [true]);
+      assert.deepEqual(g2.releases, []);
+      assert.equal((await exec.sealLifetime({})).kind, "sealed");
+    });
+
+    describe("negative controls", () => {
+      async function lostRun(remove: () => CacheCleanupResult) {
+        const c = rotationRig({ remove });
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        await waitFor(() => c.holders.length === 2 && c.holders[0]!.releases.length === 1, "G1 retired");
+        const g2 = c.holders[1]!;
+        g2.die();
+        d.bash("echo three");
+        await waitFor(() => c.specs.length === 4, "an uncached command");
+        d.finish();
+        await withTimeout(running, 3000, "lost run");
+        return { c, exec, g2 };
+      }
+
+      it("a removal that stays pending forever never seals", async () => {
+        const { exec } = await lostRun(() => ({ state: "pending", reason: "", settlement: new Promise<CacheCleanupResult>(() => undefined) }));
+        let settled = false;
+        void exec.sealLifetime({}).then(() => { settled = true; });
+        await tick(); await tick(); await tick();
+        assert.equal(settled, false, "no seal inside the observed window, and never sealed");
+      });
+
+      it("a retained/live or errored removal is unproven", async () => {
+        for (const answer of [
+          { state: "retained", reason: "live" },
+          { state: "error", reason: "protocol" },
+        ] as const) {
+          const { exec } = await lostRun(() => answer);
+          assert.equal((await exec.sealLifetime({})).kind, "unproven", answer.state);
+        }
+      });
+
+      it("a lost holder with an unclean root is retained without a removal, and unproven", async () => {
+        const c = rotationRig({ unclean: (i) => i === 3 });
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        await waitFor(() => c.holders.length === 2 && c.holders[0]!.releases.length === 1, "G1 retired");
+        d.bash("echo three");
+        await waitFor(() => c.specs.length === 4, "an unclean G2 command");
+        c.holders[1]!.die();
+        d.finish();
+        await withTimeout(running.catch(() => undefined), 3000, "unclean lost run");
+        assert.deepEqual(c.removals, []);
+        assert.deepEqual(c.holders[1]!.releases, []);
+        assert.equal((await exec.sealLifetime({})).kind, "unproven");
+      });
+
+      it("the positive scenario plus an independent distrust is still unproven", async () => {
+        const c = rotationRig();
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        d.finish();
+        await withTimeout(running, 3000, "distrust run");
+        (exec as unknown as { lifetime: { distrust(): void } }).lifetime.distrust();
+        assert.equal((await exec.sealLifetime({})).kind, "unproven");
+      });
+
+      it("a failed replacement start whose helper closes retained is unproven, and seals only after that close", async () => {
+        const c = rotationRig();
+        const close = gate<CacheCleanupResult>();
+        c.failStart(1, new CommandCacheStartError("timeout", close.promise), close);
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        await waitFor(() => c.starts.length === 1 + 1, "the replacement attempt");
+        d.bash("echo three");
+        await waitFor(() => c.specs.length === 4, "a command on the still-current G1");
+        assert.equal(c.dirOf(3), c.holders[0]!.dir, "a failed replacement never changes admission");
+        d.finish();
+        await withTimeout(running, 3000, "failed replacement run");
+        let settled = false;
+        const sealing = exec.sealLifetime({}).then((value) => { settled = true; return value; });
+        await tick(); await tick();
+        assert.equal(settled, false, "the live replacement helper keeps the seal pending");
+        close.resolve({ state: "retained", reason: "unattested" });
+        assert.equal((await sealing).kind, "unproven");
+        assert.equal(c.starts.length, 2, "no second replacement");
+        assert.deepEqual(c.removals, []);
+      });
+
+      it("an abandoned replacement whose release resolves removed is clean", async () => {
+        const c = rotationRig();
+        const hold = c.gateStart(1);
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        await waitFor(() => c.starts.length === 2, "the replacement attempt");
+        d.finish();
+        await withTimeout(running, 3000, "abandoned replacement run");
+        const sealing = exec.sealLifetime({});
+        hold.resolve();
+        assert.equal((await sealing).kind, "sealed");
+        assert.deepEqual(c.holders[1]!.releases, [true], "the late, never-used replacement was released");
+        assert.deepEqual(c.holders[0]!.releases, [true]);
+        assert.deepEqual(c.removals, []);
+      });
+    });
+  });
+
   describe("HeldRunCommandCache", () => {
     const cleanLaunch = async (): Promise<CodexRootHandle> => effectHandle(false);
     const spec = {} as CodexEffectLaunchSpec;
     const WAITS = { releaseMs: 100, removeMs: 100 };
 
-    it("once settle has begun, current() is undefined and a launch gets no cache (even while the holder is alive)", async () => {
+    it("once settle has begun, reserve() is undefined and a launch gets no cache (even while the holder is alive)", async () => {
       let answer!: (r: CacheCleanupResult) => void;
       const releaseAnswer = new Promise<CacheCleanupResult>((r) => { answer = r; });
       const base = fakeHolder([]);
       const cache = new HeldRunCommandCache({ ...base.holder, release: () => releaseAnswer });
-      assert.deepEqual(cache.current(), { dir: CACHE_DIR });
+      const reservation = cache.reserve();
+      assert.equal(reservation?.dir, CACHE_DIR);
+      reservation!.cancel();
       const settling = cache.settle(noopLog, async () => ({ state: "removed", reason: "" }), WAITS);
       assert.equal(base.holder.alive(), true, "the holder has not answered the release yet");
-      assert.equal(cache.current(), undefined, "no cache is handed out once settle has begun");
+      assert.equal(cache.reserve(), undefined, "no cache is handed out once settle has begun");
 
       const launched: CodexEffectLaunchSpec[] = [];
       const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
@@ -12111,7 +12453,7 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     it("drained is true with no roots and with every tracked root disposed clean", async () => {
       const cache = new HeldRunCommandCache(fakeHolder([]).holder);
       assert.equal(cache.drained(), true);
-      const h = await cache.track(cleanLaunch)(spec);
+      const h = await cache.reserve()!.launch(cleanLaunch)(spec);
       assert.equal(cache.drained(), false, "a launched, not yet disposed root is not drained");
       await h.dispose(10);
       assert.equal(cache.drained(), true);
@@ -12119,16 +12461,16 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
 
     it("an unclean dispose, a rejected dispose or a failed launch makes it false (sticky)", async () => {
       const unclean = new HeldRunCommandCache(fakeHolder([]).holder);
-      await (await unclean.track(async () => effectHandle(true))(spec)).dispose(10);
+      await (await unclean.reserve()!.launch(async () => effectHandle(true))(spec)).dispose(10);
       assert.equal(unclean.drained(), false);
 
       const rejected = new HeldRunCommandCache(fakeHolder([]).holder);
-      const h = await rejected.track(async () => ({ ...effectHandle(false), dispose: async () => { throw new Error("boom"); } }))(spec);
+      const h = await rejected.reserve()!.launch(async () => ({ ...effectHandle(false), dispose: async () => { throw new Error("boom"); } }))(spec);
       await assert.rejects(h.dispose(10), /boom/);
       assert.equal(rejected.drained(), false);
 
       const failed = new HeldRunCommandCache(fakeHolder([]).holder);
-      await assert.rejects(failed.track(async () => { throw new Error("launch failed"); })(spec), /launch failed/);
+      await assert.rejects(failed.reserve()!.launch(async () => { throw new Error("launch failed"); })(spec), /launch failed/);
       assert.equal(failed.drained(), false);
     });
 
@@ -12136,7 +12478,7 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
       const cache = new HeldRunCommandCache(fakeHolder([]).holder);
       const registry = new ExecutionRegistry(newLocalExecutionEpoch(9));
       cache.watchRegistry(registry);
-      await (await cache.track(cleanLaunch)(spec)).dispose(10);
+      await (await cache.reserve()!.launch(cleanLaunch)(spec)).dispose(10);
       assert.equal(cache.drained(), true);
       registry.poison({ category: "protocol", message: "poisoned" });
       assert.equal(cache.drained(), false);
@@ -12153,20 +12495,22 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
       await a.settle(rlog.log, remove, WAITS);
       await a.settle(rlog.log, remove, WAITS);
       assert.deepEqual(alive.releases, [true]);
-      assert.equal(a.current(), undefined, "no cache is handed out after settle");
+      assert.equal(a.reserve(), undefined, "no cache is handed out after settle");
       assert.ok(rlog.lines.some((l) => l.includes('"level":"warn"') && l.includes('"reason":"mismatch"')), "a retained release is a warn with its reason");
 
       const dead = fakeHolder(events);
       const d = new HeldRunCommandCache(dead.holder);
-      assert.deepEqual(d.current(), { dir: CACHE_DIR });
+      const held = d.reserve();
+      assert.equal(held?.dir, CACHE_DIR);
+      held!.cancel();
       dead.die();
-      assert.equal(d.current(), undefined, "no cache after holder loss");
+      assert.equal(d.reserve(), undefined, "no cache after holder loss");
       await d.settle(noopLog, remove, WAITS);
       assert.deepEqual(removals, [CACHE_TOKEN]);
 
       const undrained = fakeHolder(events);
       const u = new HeldRunCommandCache(undrained.holder);
-      await (await u.track(async () => effectHandle(true))(spec)).dispose(10);
+      await (await u.reserve()!.launch(async () => effectHandle(true))(spec)).dispose(10);
       undrained.die();
       await u.settle(noopLog, remove, WAITS);
       assert.deepEqual(removals, [CACHE_TOKEN], "not drained: no removal");
