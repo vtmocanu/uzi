@@ -5,10 +5,10 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { AuthorityLockBusy, AuthorityRefusal } from "../src/authority-lock.js";
-import { parseCompletionSourceV2, type CompletionSourceFence } from "../src/completion-source.js";
+import { parseCompletionSourceV2, type CompletionSourceFence, type CompletionSourceV2 } from "../src/completion-source.js";
 import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { nullLogger } from "./helpers.js";
-import type { HandoffRetirement, HandoffRetirementInput } from "../src/recovery.js";
+import { legacyCompletionCore, type HandoffRetirement, type HandoffRetirementInput } from "../src/recovery.js";
 import { api, git, gitlabClaim, installHarness } from "./runner-harness.js";
 import {
   ATTEMPT_ROWS, ROWS, STOPPED, OWNER_FILE, assertUnchanged, diagnostics, durable, failure, holdCycle, reported, scene,
@@ -27,6 +27,20 @@ installHarness();
 
 const linux = { skip: process.platform !== "linux" };
 const cloneAlive = (r: Rig): boolean => fs.existsSync(path.join(r.clone, ".git"));
+
+/** Once the retirement's preparation has built its redundancy claims (past the durable verification), every lstat of a
+ *  bundle file fails with an EIO whose message carries the owner path. */
+function failBundleLstat(t: TestContext, r: Rig, recovery: object): void {
+  let armed = false;
+  const internals = recovery as { buildRedundancyClaims(...a: unknown[]): Promise<unknown> };
+  const build = internals.buildRedundancyClaims.bind(recovery);
+  t.mock.method(internals, "buildRedundancyClaims", (async (...a: unknown[]) => { armed = true; return build(...a); }) as never);
+  const real = fs.promises.lstat.bind(fs.promises) as (p: string, ...rest: unknown[]) => Promise<unknown>;
+  t.mock.method(fs.promises, "lstat", (async (p: string, ...rest: unknown[]) => {
+    if (armed && String(p).endsWith(".bundle")) throw Object.assign(new Error(`EIO: i/o error, lstat '${r.clone}'`), { code: "EIO" });
+    return real(p, ...rest);
+  }) as never);
+}
 
 async function published(t: TestContext, options: { codex?: boolean; cohort?: number } = {}): Promise<Rig> {
   const r = await rig(t, { codex: options.codex ?? false, cohort: options.cohort ?? 2 });
@@ -287,9 +301,42 @@ describe("retireCompletedSourceForHandoff: retire", linux, () => {
     assert.deepEqual(await c.handoff(), { kind: "uncertain", why: "verify_error" });
     await assertUntouched(r, files, journal);
   });
+
+  it("a preparation I/O error (a bundle lstat) is uncertain/preparation_error, never a raw throw", async t => {
+    const r = await published(t);
+    const c = claimant(r);
+    const files = snapshotFiles(r);
+    const journal = journalRaw(r);
+    failBundleLstat(t, r, c.p.recovery);
+    assert.deepEqual(await c.handoff(), { kind: "uncertain", why: "preparation_error" });
+    await assertUntouched(r, files, journal);
+  });
+
+  it("a lifecycle abort inside the preparation still propagates", async t => {
+    const r = await published(t);
+    const c = claimant(r);
+    const controller = new AbortController();
+    Object.assign(c.p.recovery, { testHooks: { afterHandoffSelect: async () => { controller.abort(new Error("cancelled")); throw new Error("EIO: after abort"); } } });
+    await assert.rejects(c.handoff({ wait: { signal: controller.signal, timeoutMs: 5000 } }), /EIO: after abort/);
+    const named = new Error("aborted");
+    named.name = "AbortError";
+    Object.assign(c.p.recovery, { testHooks: { afterHandoffSelect: async () => { throw named; } } });
+    await assert.rejects(c.handoff(), err => err === named);
+  });
 });
 
 describe("retireCompletedSourceForHandoff: classify", linux, () => {
+  it("a disabled-authority coordinator classifies as uncertain/classify_unavailable, not not_completion", async t => {
+    const r = await published(t);
+    const c = claimant(r);
+    Object.assign(c.p.recovery, { authority: undefined });
+    const files = snapshotFiles(r);
+    const journal = journalRaw(r);
+    assert.deepEqual(await c.handoff({ mode: "classify" }), { kind: "uncertain", why: "classify_unavailable" });
+    assert.deepEqual(await c.handoff({ mode: "retire" }), { kind: "not_completion" }, "retire mode keeps the outward refusal");
+    await assertUntouched(r, files, journal);
+  });
+
   it("a valid published source is pending/episode_bearing and nothing is deleted", async t => {
     const r = await published(t);
     const c = claimant(r);
@@ -530,6 +577,10 @@ describe("a successor claim on a completed owner: held, then retired by the cert
       } else {
         assert.notEqual(s.started.worktree, s.r.clone);
         assert.equal(fs.existsSync(s.r.clone), false, "the owner's clone was retired");
+        if (row.ownerCanonical) {
+          assert.equal(path.basename(s.r.clone), "issue-3404", "the owner was at its canonical path");
+          assert.equal(path.basename(s.started.worktree), "agent-issue-3404", "the claimant reseeds at its own canonical path");
+        }
       }
     });
   }
@@ -600,7 +651,7 @@ describe("a successor claim on a completed owner: races", linux, () => {
     });
   }
 
-  it("control: without a prior handoff re-admission, a seed that meets a retiring slot still fails terminally", async t => {
+  it("a fresh claim (no handoff re-admission) that meets a retiring slot is a retained stop; after the finishing sweep it seeds", async t => {
     const s = await scene(t, caseB);
     const real = (git.cleanupRecoveryGeneration as (...a: unknown[]) => Promise<unknown>).bind(git);
     const cleanup = t.mock.method(git, "cleanupRecoveryGeneration", (async (...args: unknown[]) => args[7] === "completion" ? "retained" : real(...args)) as never);
@@ -612,10 +663,26 @@ describe("a successor claim on a completed owner: races", linux, () => {
     });
     cleanup.mock.restore();
     assert.equal(direct.kind, "pending");
+    // Before the finishing sweep: the seed meets the retiring slot of a partially complete retirement.
     await s.runner.execute(s.claim);
-    assert.equal(String(failure(s)), "source is being retired", "unchanged: the ordinary seed refusal");
-    assert.equal(diagnostic(s, "orphan_reclaim_refused", "completion_retirement_pending"), undefined);
+    assert.equal(s.handoffs.length, 1, "only the interrupted retirement above: the claimant never entered a handoff");
+    assert.equal(failure(s), undefined, "not a terminal failure");
+    assert.deepEqual(reported(s).filter(x => TERMINAL.includes(x)), [], "no terminal report");
+    assert.equal(s.started, undefined, "the model never starts");
+    const stop = diagnostic(s, "orphan_reclaim_refused", "completion_retirement_pending");
+    assert.equal(stop?.["stage"], "completion_handoff");
+    assert.equal(stop?.["retirement_subreason"], "completion_pending");
+    assert.equal(stop?.["owner_id"], "invalid", "a fresh claim knows no owner: the fixed placeholder");
+    assert.equal(JSON.stringify(s.lines).includes(s.r.clone), false, "no path leaves in the log");
+    assert.equal(s.registry.has(s.claim.run_id), false);
+    assert.equal(s.settle.mock.callCount(), 0, "the claim hold is not settled");
+    // After the sweep finished the retirement, the re-claim seeds.
+    await sweep(s);
+    assert.equal((await slotVia(s.rt, s.r.clone))?.state, "retired");
+    await s.runner.execute({ ...s.claim, claim_generation: GENERATION + 2 });
+    assert.equal(String(failure(s)), STOPPED);
   });
+
 
   it("a replacement journal for another run installed in the window is left byte-identical and validated afresh", async t => {
     const s = await scene(t, caseB);
@@ -1242,4 +1309,110 @@ describe("a successor claim on a completed owner whose journal retains sources",
     assert.equal(fs.readFileSync(path.join(planted, "OTHER.txt"), "utf8"), "other run bytes\n", "the other run's bytes stay in place");
     assert.equal(diagnostic(s, "orphan_reclaim_succeeded", "retained-in-place")?.["stage"], "complete");
   });
+});
+
+// ---- the typed outcome, end to end: unavailable coordinator, preparation errors, the negative matrix --------------------------
+
+describe("a successor claim on a completed owner: classify unavailable and preparation errors", linux, () => {
+  for (const row of [caseA, caseB]) {
+    it(`${row.name}: a fenced retained journal with an unavailable coordinator is a retained stop, never detached`, async t => {
+      const s = await scene(t, row);
+      const planted = rewriteJournal(s.r.bare, withRetainedSource);
+      Object.assign(s.recovery, { authority: undefined });
+      const before = durable(s);
+      const spies = [t.mock.method(git, "detachTerminalRetained"), t.mock.method(git, "releaseAttemptInPlace"), t.mock.method(git, "retireRunnerClone")];
+      await s.runner.execute(s.claim);
+      assert.equal(s.handoffs[0]!.input.mode, "classify");
+      assert.deepEqual(s.handoffs[0]!.outcome, { kind: "uncertain", why: "classify_unavailable" });
+      assert.deepEqual(spies.map(x => x.mock.callCount()), [0, 0, 0], "no uncertified clear of any kind");
+      await expectStop(s, before, "published_source_retained");
+      assert.equal(journalRaw(s.r), planted, "the journal is byte-identical");
+    });
+
+    it(`${row.name}: a preparation I/O error is a retained stop with no failed report and no path in the reason`, async t => {
+      const s = await scene(t, row);
+      const before = durable(s);
+      failBundleLstat(t, s.r, s.recovery);
+      await s.runner.execute(s.claim);
+      assert.deepEqual(s.handoffs[0]!.outcome, { kind: "uncertain", why: "preparation_error" });
+      assert.equal(failure(s), undefined, "no failed report");
+      assert.equal(JSON.stringify(api.states.filter(x => x.runId === s.claim.run_id)).includes(s.r.clone), false, "no owner path in any report");
+      await expectStop(s, before, "completion_uncertain");
+    });
+  }
+});
+
+describe("a successor claim on a completed owner: the negative matrix through real authority state", linux, () => {
+  for (const row of [caseA, caseB]) {
+    describe(row.name, () => {
+      it("(a) a record whose source epoch differs from the journal fence: not_completion, the outward refusal (fenced_source)", async t => {
+        const s = await scene(t, row);
+        await rewriteSources(s.r, src => ({ ...src, sourceUseEpoch: "99999999-9999-4999-8999-999999999999" }));
+        const before = durable(s);
+        await s.runner.execute(s.claim);
+        assert.deepEqual(s.handoffs[0]!.outcome, { kind: "not_completion" });
+        await expectRefusal(s, before, "fenced_source");
+      });
+
+      it("(b) a V1 (legacy) completion source record: not_completion, the outward refusal (fenced_source)", async t => {
+        const s = await scene(t, row);
+        await rewriteSources(s.r, src => legacyCompletionCore(src as unknown as CompletionSourceV2) as unknown as Record<string, unknown>);
+        const before = durable(s);
+        await s.runner.execute(s.claim);
+        assert.deepEqual(s.handoffs[0]!.outcome, { kind: "not_completion" });
+        await expectRefusal(s, before, "fenced_source");
+      });
+
+      it("(c) an extra capture record in the generation (cohort mismatch): invalid, the outward refusal (completion_unverified)", async t => {
+        const s = await scene(t, row);
+        const [seed] = await s.recovery.inspect(s.r.runId);
+        await (s.recovery as unknown as { writeRecordUnlocked(rec: unknown): Promise<void> })
+          .writeRecordUnlocked({ ...seed, captureId: "00000000-0000-4000-8000-0000000000dd" });
+        const before = durable(s);
+        await s.runner.execute(s.claim);
+        assert.equal(s.handoffs[0]!.outcome?.kind, "invalid");
+        await expectRefusal(s, before, "completion_unverified");
+      });
+
+      it("(c) a missing capture record in the generation (cohort mismatch): invalid, the outward refusal (completion_unverified)", async t => {
+        const s = await scene(t, row, { cohort: 2 });
+        // Drop a member that does not carry the receipt, so the selection still finds the authority record.
+        const bare = readRecords(s.r).find(rec => !rec["completionReceipt"]);
+        assert.ok(bare, "a cohort member without the receipt exists");
+        fs.rmSync(path.join(recordDir(s.r), `${String(bare["captureId"])}.json`));
+        const before = durable(s);
+        await s.runner.execute(s.claim);
+        assert.equal(s.handoffs[0]!.outcome?.kind, "invalid");
+        await expectRefusal(s, before, "completion_unverified");
+      });
+
+      it("(d) an unresolved operation on the owner's slot: pending/unresolved_operation, a retained stop", async t => {
+        // Not constructible through real state on a PUBLISHED slot: the authority refuses a destructive record over a
+        // published source without its retiring lease, and a retiring slot's journal fence is already gone (the claimant
+        // would never reach the coordinator). The narrowest seam: the retirement inspection raises the typed refusal the
+        // real authority raises for a running record (authority-runtime `operation_unresolved`).
+        const s = await scene(t, row);
+        (s.rt.retirement as { inspect: unknown }).inspect = async () => {
+          throw new AuthorityRefusal("an operation on the retiring source is unresolved", "operation_unresolved");
+        };
+        const before = durable(s);
+        await s.runner.execute(s.claim);
+        assert.deepEqual(s.handoffs[0]!.outcome, { kind: "pending", why: "unresolved_operation" });
+        await expectStop(s, before, "completion_pending");
+      });
+
+      it("(e) a failing completion-check cleanup: uncertain/preparation_error, a retained stop", async t => {
+        const s = await scene(t, row);
+        const before = durable(s);
+        const real = (git.cleanupRecoveryGeneration as (...a: unknown[]) => Promise<unknown>).bind(git);
+        t.mock.method(git, "cleanupRecoveryGeneration", (async (...args: unknown[]) => {
+          if (args[7] === "completion-check") throw Object.assign(new Error(`EIO: ${s.r.clone}`), { code: "EIO" });
+          return real(...args);
+        }) as never);
+        await s.runner.execute(s.claim);
+        assert.deepEqual(s.handoffs[0]!.outcome, { kind: "uncertain", why: "preparation_error" });
+        await expectStop(s, before, "completion_uncertain");
+      });
+    });
+  }
 });

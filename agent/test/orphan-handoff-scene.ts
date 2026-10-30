@@ -30,6 +30,8 @@ export interface Row {
   /** The successor's kind; it derives agent-issue-3404 for mr_rework, issue-3404 for issue. */
   successor: "issue" | "mr_rework";
   samePath: boolean;
+  /** Seed the owner at its CANONICAL path regardless of `samePath` (the cross-kind Case A with a canonical owner). Default: `samePath`. */
+  ownerCanonical?: boolean;
   codex: boolean;
   unproven?: boolean;
   restart: boolean;
@@ -44,6 +46,12 @@ for (const restart of [false, true]) {
     successor: "mr_rework", samePath: false, codex: false, restart });
   ROWS.push({ name: `Case B same-path (mr_rework owner, mr_rework successor), ${when}`, owner: { kind: "mr_rework", slug: "agent-issue-3404" },
     successor: "mr_rework", samePath: true, codex: false, restart });
+}
+
+/** Case A with the owner at its canonical path: a canonical `issue-3404` owner, an `mr_rework` claimant at `agent-issue-3404`. */
+for (const restart of [false, true]) {
+  ROWS.push({ name: `Case A cross-path with a canonical owner (issue owner at issue-3404, mr_rework successor), ${restart ? "after restart" : "same incarnation"}`,
+    owner: { kind: "issue", slug: "issue-3404" }, successor: "mr_rework", samePath: false, ownerCanonical: true, codex: false, restart });
 }
 
 /** Attempt shape: the claimant has attempt paths enabled and selects its own distinct attempt path. */
@@ -90,8 +98,8 @@ export interface FlightHandle {
   steering: { markCancelled(): void; claimFence(): string | undefined; endFencedFlight(reason: string): void };
 }
 
-export async function scene(t: TestContext, row: Row, options: { receipt?: boolean; ownerStatus?: string } = {}): Promise<Scene> {
-  const r = await rig(t, { codex: row.codex, unproven: row.unproven, kind: row.owner.kind, slug: row.owner.slug, canonical: row.samePath });
+export async function scene(t: TestContext, row: Row, options: { receipt?: boolean; ownerStatus?: string; cohort?: number } = {}): Promise<Scene> {
+  const r = await rig(t, { codex: row.codex, unproven: row.unproven, kind: row.owner.kind, slug: row.owner.slug, canonical: row.ownerCanonical ?? row.samePath, cohort: options.cohort });
   // The production wiring: the git cache carries the authority hooks and requires them.
   const restore = { authority: (git as unknown as { authority?: unknown }).authority, required: (git as unknown as { authorityRequired?: boolean }).authorityRequired };
   t.after(() => { Object.assign(git, { authority: restore.authority, authorityRequired: restore.required }); });

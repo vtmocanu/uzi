@@ -12004,13 +12004,17 @@ export class RunRunner {
     // retained stop. Returns true when the loop must continue; every other error propagates untouched.
     let handoffReadmits = 0;
     let lastReadmit: OrphanHandoffReadmit | undefined;
-    // After a handoff re-admission, a seed that meets the owner's still-retiring slot is a not-ready retirement: a
-    // retained stop. Without a prior re-admission the refusal is untouched.
-    // Applies after any re-admission (it fails safe: bounded by the requeue cap, never a terminal report).
+    // A seed (a fresh claim or one after a handoff re-admission) that meets a slot still `retiring` is a not-ready
+    // retirement: a retained stop, bounded by the requeue cap, never a terminal report. After a re-admission the
+    // diagnostic carries the owner's ids; a fresh claim knows no owner, so its owner id and path digest are the fixed
+    // placeholders (no path or error text leaves). The untyped operator-discard refusal stays terminal.
     const stopOnRetiringSlot = (err: unknown): void => {
-      if (handoffReadmits === 0 || !lastReadmit || !(err instanceof AuthorityRefusal) || err.kind !== "retiring") return;
+      if (!(err instanceof AuthorityRefusal) || err.kind !== "retiring") return;
       this.retainedLifecycleGuard(flight);
-      emitOrphanDiagnostic(lastReadmit.diagnostics, lastReadmit.journaledPath, "orphan_reclaim_refused", "completion_handoff",
+      const context: OrphanDiagnostics = lastReadmit?.diagnostics ?? {
+        logger: this.log, claimantId: claim.run_id, ownerId: "", repoId: claim.repo.id, pathShape: "unknown",
+      };
+      emitOrphanDiagnostic(context, lastReadmit?.journaledPath ?? "", "orphan_reclaim_refused", "completion_handoff",
         "completion_retirement_pending", undefined, undefined, "completion_pending");
       throw new RetainedRecoveryStop({ cause: err });
     };

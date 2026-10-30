@@ -599,7 +599,8 @@ export type CompletedRetirement =
       "action_failed" }
   | { kind: "invalid"; why: "no_receipt" | "no_authority_record" | "mismatch" | "unverified" | "identity_changed" |
       "multiple_generations" | "path_mismatch" }
-  | { kind: "uncertain"; why: "verify_error" | "boundary_error" | "unreadable_record" | "slot_present" | "classify_unavailable" }
+  | { kind: "uncertain"; why: "verify_error" | "boundary_error" | "unreadable_record" | "slot_present" | "classify_unavailable" |
+      "preparation_error" }
   | { kind: "unsupported"; why: "no_boundary" | "no_cleanup" | "no_retirement_scope" | "platform" };
 
 /** What {@link RecoveryCoordinator.retireCompletedSourceForHandoff} answers: `not_completion` means no record
@@ -4657,9 +4658,12 @@ export class RecoveryCoordinator {
    * `authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)`, so the A-queue or flock wait is bounded by that timeout and
    * ended by the claimant's lifecycle abort).
    * An acquisition of A that runs out its wait (a typed {@link AuthorityLockBusy}) is `pending`/`authority_busy`; an
-   * AuthorityLockBusy raised once A is held propagates. Every other throw propagates unchanged too, except inside
-   * selection, where a failed journal read (`checkedRecords`) is `uncertain`/`unreadable_record` (a maintenance
-   * budget abort still propagates). There is no sleep, retry or owner-tail wait here.
+   * AuthorityLockBusy raised once A is held propagates, as does any other typed AuthorityRefusal, a lifecycle abort
+   * (`wait.signal`, an AbortError) and a spent maintenance budget. Any other throw once A is held (selection, the
+   * cycle, the retirement preparation) is `uncertain`: a failed journal read in selection is `unreadable_record`,
+   * the rest `preparation_error`, so no raw I/O error text reaches the caller. The background sweep is unchanged.
+   * There is no sleep, retry or owner-tail wait here. In `classify` mode a coordinator that is disabled or has no
+   * authority scope answers `uncertain`/`classify_unavailable`; `retire` mode answers `not_completion`.
    *
    * Selection is by FENCE first: any record of the owner whose V2 source carries exactly this fence. A match whose
    * path or attempt differs, or that spans several generations, is `invalid`. No match is `not_completion` (V1, a
@@ -4670,22 +4674,36 @@ export class RecoveryCoordinator {
    * the settlement drain every outer A acquisition already runs.
    */
   async retireCompletedSourceForHandoff(input: HandoffRetirementInput): Promise<HandoffRetirement> {
-    if (!this.enabled || !this.authority) return { kind: "not_completion" };
     const mode = input.mode ?? "retire";
+    if (!this.enabled || !this.authority) {
+      // `classify` guards a retained journal that may be fenced (only an authority-required cache reports one): an
+      // unavailable coordinator cannot rule that out, so it must not read as the positive "no completion" that lets
+      // the caller detach. `retire` keeps `not_completion`: the caller refuses outward and nothing is touched.
+      return mode === "classify" ? { kind: "uncertain", why: "classify_unavailable" } : { kind: "not_completion" };
+    }
     let entered = false;
     try {
       return await this.authority.withTransaction(async (): Promise<HandoffRetirement> => {
         entered = true;
-        const selection = await this.selectHandoffGeneration(input, mode);
-        if (selection.kind !== "selected") return selection;
-        const generation = selection.generation;
-        await this.testHooks?.afterHandoffSelect?.();
-        await this.testHooks?.beforeHandoffCycle?.();
-        const key = await this.cycleKey({ runId: input.runId, captureId: "", generation, inventoryGuarded: true });
-        const cycle = await runCaptureCycle(key, "skip", () => mode === "classify"
-          ? this.classifyHandoffGeneration(input.runId, generation)
-          : this.forgetCompletedGeneration(input.runId, generation, this.isExecuting));
-        return cycle.ran ? cycle.value : { kind: "pending", why: "cycle_busy" };
+        try {
+          const selection = await this.selectHandoffGeneration(input, mode);
+          if (selection.kind !== "selected") return selection;
+          const generation = selection.generation;
+          await this.testHooks?.afterHandoffSelect?.();
+          await this.testHooks?.beforeHandoffCycle?.();
+          const key = await this.cycleKey({ runId: input.runId, captureId: "", generation, inventoryGuarded: true });
+          const cycle = await runCaptureCycle(key, "skip", () => mode === "classify"
+            ? this.classifyHandoffGeneration(input.runId, generation)
+            : this.forgetCompletedGeneration(input.runId, generation, this.isExecuting));
+          return cycle.ran ? cycle.value : { kind: "pending", why: "cycle_busy" };
+        } catch (err) {
+          // A preparation I/O error is "not proven", never a raw throw carrying a path into a public failure reason.
+          // Typed authority refusals, lifecycle aborts and a spent maintenance budget keep propagating.
+          if (err instanceof AuthorityRefusal || input.wait.signal?.aborted ||
+              (err instanceof Error && err.name === "AbortError")) throw err;
+          MaintenanceBudget.current()?.check();
+          return { kind: "uncertain", why: "preparation_error" };
+        }
       }, input.wait);
     } catch (err) {
       // Only the acquisition of A is a busy signal; a timeout raised once the transaction ran is not.

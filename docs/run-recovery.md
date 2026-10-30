@@ -126,6 +126,9 @@ cycle or authority lock, a failed preflight, a live owner tail), uncertain, or t
 journal has retained sources and authority finds the fence's source or a slot for
 the path, the claim stops without a terminal report and the
 owner's source is left intact; the claim is requeued up to `RUN_MAX_REQUEUES`. A
+seed that meets a slot still `retiring` (a retirement interrupted before the claim
+arrived) is the same stop, as is an I/O error while the retirement is prepared or a
+coordinator that cannot classify a journal with retained sources. A
 journal that changes under the call re-admits at most twice per claim, and the
 third is the same stop. The stop leaves the claim's own custody hold open, so at
 the cap the run parks `recovery_wait` with `worker_requeue_exhausted` for an owner
