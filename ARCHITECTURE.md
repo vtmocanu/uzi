@@ -1706,8 +1706,17 @@ chain in the diagram above, with no intervening `running`.
   Available archives keep their existing TTL; this adds no worker authority or
   source/PVC guarantee. Same-run Option D remains unchanged, including issue-less
   completions. See the [ADR-2506 amendment](adr/2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654)
-  for the complete policy, shared bounds and accepted races. Approval records
-  neither implementation nor acceptance; #3031/#2969/#2884 retain their scope.
+  for the complete policy, shared bounds and accepted races. M1–M3 are implemented
+  and reviewed through candidate commit `7d116a44`; merge, deployment and completed
+  M4 acceptance are not established. Recovery locks all-state A inventory in
+  generation/id order with NO KEY UPDATE, then publications, then non-ready
+  captures; only qualifying OPEN holds through A's terminal generation discard.
+  The 1000-row inventories plus overflow probes bound fetched work, not all SQL
+  scans: generic issue-history filtering and shared-FINAL global history scans
+  remain cost boundaries. Migration 00379 extends only the universal binding
+  guard with the 19-field witness audit; the evidence CHECK and current 00340
+  inventory guard stay unchanged. No DTO, route, CLI or worker protocol changes.
+  #3031/#2969/#2884 retain their scope.
   A completed run's guarded archive can expire early as `published_redundant`
   when the API proves through the forge that the run's published branch already
   contains everything it retains (#2625; worker claim, API proof, bytes and

@@ -22,8 +22,9 @@ archives keep bytes, prerequisites and existing TTL; no new retention window,
 source/PVC guarantee or worker deletion authority follows. Same-run Option D,
 including issue-less completions, is unchanged. See the complete
 [ADR-2506 amendment](2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654)
-for eligibility, refusals, accepted races and bounds. This records approval,
-not implementation or acceptance; #3031/#2969/#2884 retain their separate scope.
+for eligibility, refusals, accepted races and bounds. M1–M3 are implemented and
+reviewed through candidate commit `7d116a44`; this does not establish merge,
+deployment or completed M4 acceptance. #3031/#2969/#2884 retain their separate scope.
 
 ## Amendment 2026-10-14 — merged predecessor server discard (#2506)
 

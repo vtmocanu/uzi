@@ -636,10 +636,14 @@ func TestCrossRunDiscardHeldOrphanSelectionLiveDB(t *testing.T) {
 				if state == "create_unknown" {
 					message = "unknown create must veto"
 				}
+				defer func() {
+					if crossRunRow(t, e, "run_held_publications", pub) != before {
+						t.Error("veto must not reclassify publication")
+					} else {
+						t.Logf("publication outcome unchanged: %s", state)
+					}
+				}()
 				crossRunRetained(t, e, a, s, message)
-				if crossRunRow(t, e, "run_held_publications", pub) != before {
-					t.Fatal("veto must not reclassify publication")
-				}
 			})
 		}
 	}
@@ -757,7 +761,14 @@ func TestCrossRunDiscardEligibilityLiveDB(t *testing.T) {
 				id = w
 			}
 			e.exec("UPDATE runs SET "+tc.sql+" WHERE id=$1", id)
-			crossRunRetained(t, e, a, s, tc.name+" must retain target")
+			message := tc.name + " must retain target"
+			if tc.name == "target_finished_equal" {
+				// Supply the actual equal chronology, not a stale pre-drift target.
+				b["target_finished_at"] = b["witness_created_at"]
+				a, s = crossRunInputs(t, e, w, b)
+				message = "equal chronology must retain target"
+			}
+			crossRunRetained(t, e, a, s, message)
 		})
 	}
 	for _, name := range []string{"target_owner", "target_repo", "witness_owner", "witness_repo", "connection", "connection_owner", "project", "forge", "base_url", "war_any_generation"} {

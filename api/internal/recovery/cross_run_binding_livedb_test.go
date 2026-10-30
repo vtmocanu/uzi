@@ -437,6 +437,22 @@ func TestCrossRunBindingTransitionRestrictionsLiveDB(t *testing.T) {
 	}
 }
 
+func TestCrossRunBindingZeroUUIDIdentityLiveDB(t *testing.T) {
+	crossRunRolloutDatabase(t)
+	e, witness, binding := newCrossRunBindingEnv(t, 3, 1)
+	repo := uuid.MustParse(binding["repo_id"].(string))
+	// An actual zero-ID row must not turn equality with the database snapshot
+	// into permission to record an invalid policy identity.
+	insertMergedHold(e, uuid.Nil, e.w.UserID, repo, e.run, e.w.ID, 2, true)
+	binding["hold_id"], binding["generation"] = uuid.Nil.String(), int64(2)
+	tx := crossRunTx(t, e, witness)
+	if _, err := tx.Exec(e.ctx, crossRunTransition, uuid.Nil, crossRunJSON(t, binding)); err == nil {
+		t.Fatal("zero UUID identity must be rejected even when the database row matches")
+	}
+	_ = tx.Rollback(e.ctx)
+	assertMergedHoldState(t, e, uuid.Nil, "open")
+}
+
 func TestCrossRunBindingFailedTargetLiveDB(t *testing.T) {
 	e, w, b := newCrossRunBindingEnv(t, 3, 1)
 	e.exec("UPDATE runs SET status='failed' WHERE id=$1", e.run)

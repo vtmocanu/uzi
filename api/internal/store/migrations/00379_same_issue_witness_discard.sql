@@ -52,6 +52,14 @@ BEGIN
     IF b->>'basis' = 'same_issue_witness' THEN
         -- Fixed-size field lists validate JSON types and lexical integers separately
         -- from jsonb equality, which considers 1.0 equal to 1.
+        FOREACH field IN ARRAY ARRAY['hold_id', 'target_run_id', 'witness_run_id',
+            'owner_id', 'repo_id', 'connection_id'] LOOP
+            IF jsonb_typeof(b->field) IS DISTINCT FROM 'string'
+                OR (b->>field) !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                OR b->>field = '00000000-0000-0000-0000-000000000000' THEN
+                RAISE EXCEPTION 'invalid same issue witness UUID';
+            END IF;
+        END LOOP;
         FOREACH field IN ARRAY ARRAY['generation', 'target_terminal_generation',
             'witness_completed_generation', 'issue_iid', 'project_id', 'witness_mr_iid'] LOOP
             IF jsonb_typeof(b->field) IS DISTINCT FROM 'number'
