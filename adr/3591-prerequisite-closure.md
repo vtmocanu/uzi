@@ -66,7 +66,7 @@ S2 locks run → hold → capture → closure, rechecks eligibility and binding,
 then commits the invocation marker before forge work. The marker freezes
 connection ID, forge kind, normalized base URL, project ID, default branch and
 D; capture/hold/run/user/repo identity, checksum and prerequisites are immutable
-row facts. Migration `00379_prerequisite_closure.sql` guards transitions,
+row facts. Migration `00386_prerequisite_closure.sql` guards transitions,
 reservations and binding immutability; the inherited C1a available-entry guard
 remains separate.
 
