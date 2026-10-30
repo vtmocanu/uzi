@@ -1754,6 +1754,8 @@ UPDATE runs SET
     -- (The excluded incarnation itself never reaches this UPDATE: the target predicate above bars it.)
     released_worker_id = NULL,
     released_worker_nonce = NULL,
+    released_worker_cause = NULL,
+    released_worker_cause_at = NULL,
     -- PRD #1390 M3 (D2 hygiene): clear the stale-requeue provenance on every fresh claim, alongside
     -- the generation bump. The refund in ReadoptRunsFromSnapshot fires only when
     -- stale_requeue_generation = claim_generation, so leaving a stale value here could refund a
@@ -6135,6 +6137,8 @@ parked AS (
         health = 'ok', health_reason = NULL, health_since = NULL,
         -- D19: the incarnation that failed to park, read under the same lock as the classification.
         released_worker_id    = runs.worker_id,
+        released_worker_cause    = 'wall',
+        released_worker_cause_at = now(),
         released_worker_nonce = l.snapshot_register_nonce,
         updated_at            = now()
     FROM locked l
@@ -6446,6 +6450,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
     claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
     released_worker_id = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN runs.worker_id ELSE runs.released_worker_id END,
+    released_worker_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' ELSE runs.released_worker_cause END,
+    released_worker_cause_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.released_worker_cause_at END,
     released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN (SELECT snapshot_register_nonce FROM workers WHERE id = runs.worker_id) ELSE runs.released_worker_nonce END,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
@@ -6760,6 +6766,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
     claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
     released_worker_id = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN runs.worker_id ELSE runs.released_worker_id END,
+    released_worker_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' ELSE runs.released_worker_cause END,
+    released_worker_cause_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.released_worker_cause_at END,
     released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN
         CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'release_nonce_captured')::boolean, false)
              THEN @exhaustion_evidence::jsonb->runs.id::text->>'released_worker_nonce'
@@ -7083,6 +7091,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
     claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
     released_worker_id = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN runs.worker_id ELSE runs.released_worker_id END,
+    released_worker_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' ELSE runs.released_worker_cause END,
+    released_worker_cause_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.released_worker_cause_at END,
     released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN
         CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'release_nonce_captured')::boolean, false)
              THEN @exhaustion_evidence::jsonb->runs.id::text->>'released_worker_nonce'
@@ -7696,6 +7706,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
     claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
     released_worker_id = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN runs.worker_id ELSE runs.released_worker_id END,
+    released_worker_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' ELSE runs.released_worker_cause END,
+    released_worker_cause_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.released_worker_cause_at END,
     released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN (SELECT snapshot_register_nonce FROM workers WHERE id = runs.worker_id) ELSE runs.released_worker_nonce END,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
@@ -9846,6 +9858,8 @@ WHERE id = @id;
 -- PRD #1497 M1: budget_finalize_seconds rides this read so the near-timeout arm measures against
 -- the full three-term effective timeout; released_worker_id rides it so the queued arm can surface
 -- the "restart worker <name>" reason when a server-side wall park barred the only capable incarnation.
+-- Issue #3639: released_worker_cause, released_worker_cause_at and claim_released_at ride it so that reason names
+-- a memory-pressure park only when the cause stamp equals claim_released_at (a stale stamp falls back).
 -- PRD #1551 M4 (D6): codex_custom_root is a SQL-computed boolean projecting ClaimRun's
 -- custom-Codex-model predicate onto each row, so the queued arm can surface a custom-Codex-capability
 -- reason for a run whose EFFECTIVE worker-root model is a CUSTOM (non-curated) id that no online
@@ -9881,6 +9895,7 @@ SELECT id, runs.user_id, status, auto_approve,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
+       released_worker_cause, released_worker_cause_at, claim_released_at,
        egress_profile_id, job_protocol, ci_config_guard,
        EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = runs.id AND af.direction = 'input' AND af.state = 'attached')::boolean AS ci_artifacts_attached,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'

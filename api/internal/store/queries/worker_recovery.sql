@@ -540,6 +540,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
     claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
     released_worker_id = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN runs.worker_id ELSE runs.released_worker_id END,
+    released_worker_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' ELSE runs.released_worker_cause END,
+    released_worker_cause_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.released_worker_cause_at END,
     released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN (SELECT snapshot_register_nonce FROM workers WHERE id = runs.worker_id) ELSE runs.released_worker_nonce END,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
@@ -1042,6 +1044,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
     claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
     released_worker_id = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN runs.worker_id ELSE runs.released_worker_id END,
+    released_worker_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' ELSE runs.released_worker_cause END,
+    released_worker_cause_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.released_worker_cause_at END,
     released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN
         CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'release_nonce_captured')::boolean, false)
              THEN @exhaustion_evidence::jsonb->runs.id::text->>'released_worker_nonce'
@@ -1489,6 +1493,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
     claim_released_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.claim_released_at END,
     released_worker_id = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN runs.worker_id ELSE runs.released_worker_id END,
+    released_worker_cause = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN 'worker_requeue_exhausted' ELSE runs.released_worker_cause END,
+    released_worker_cause_at = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN now() ELSE runs.released_worker_cause_at END,
     released_worker_nonce = CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'park')::boolean, true) THEN
         CASE WHEN COALESCE((@exhaustion_evidence::jsonb->runs.id::text->>'release_nonce_captured')::boolean, false)
              THEN @exhaustion_evidence::jsonb->runs.id::text->>'released_worker_nonce'

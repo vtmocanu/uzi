@@ -1652,7 +1652,7 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 		}
 	}
 	// PRD #1497 M1 (D19): a run whose ONLY worker that could claim it is the incarnation a
-	// server-side wall park RELEASED is unplaceable until that worker restarts (a restart rotates its
+	// server-side park RELEASED is unplaceable until that worker restarts (a restart rotates its
 	// snapshot_register_nonce → a fresh, claimable incarnation) or another worker comes online. When
 	// NO online worker can actually claim THIS run (CountOnlineWorkersClaimableForRun mirrors
 	// ClaimRun's full per-worker conjunction, incl. the released-pair exclusion) AND released_worker_id
@@ -1660,6 +1660,8 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 	// capability/repo rungs so their more-specific reasons keep precedence; a read error falls through
 	// to the generic reasons below. The per-run counts sit behind the queued-threshold guard in
 	// healthTargetFor, so they run for ~0 runs/tick (+ the early docker-allowlist probe).
+	// The pair is recorded by a wall park, a memory-pressure park or a requeue-exhaustion park; the
+	// wording follows the stamped cause (releasedWorkerReason).
 	if r.ReleasedWorkerID.Valid {
 		allowlist := []uuid.UUID{}
 		if s.dockerAllowlist != nil {
@@ -1688,7 +1690,7 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 		} else if claimable.Claimable == 0 {
 			if wkr, werr := s.q.GetWorkerByID(ctx, uuid.UUID(r.ReleasedWorkerID.Bytes)); werr == nil &&
 				wkr.LastHeartbeatAt.Valid && !wkr.LastHeartbeatAt.Time.Before(now.Add(-s.p.WorkerHeartbeatStale)) {
-				return fmt.Sprintf("waiting for another worker, or restart worker %s (its previous process was released at the time limit)", wkr.Name)
+				return releasedWorkerReason(r, wkr.Name)
 			}
 		}
 	}
@@ -2127,4 +2129,17 @@ func toolResultID(payload []byte) string {
 
 func activeAccountCooldown(now time.Time, r store.ListActiveRunsForHealthRow) bool {
 	return r.AccountCooldownClass.Valid && (r.AccountCooldownClass.String == "rate_limit" || r.AccountCooldownClass.String == "overload") && r.AccountCooldownEligibleAt.Valid && r.AccountCooldownEligibleAt.InfinityModifier == pgtype.Finite && r.AccountCooldownEligibleAt.Time.After(now)
+}
+
+// releasedWorkerReason words the released-worker rung. It names a memory-pressure park only when
+// released_worker_cause_at equals claim_released_at (both come from one statement now()); a writer
+// that predates the cause columns moves claim_released_at alone, which makes the stamp stale, and
+// every other case keeps the time-limit wording.
+func releasedWorkerReason(r store.ListActiveRunsForHealthRow, workerName string) string {
+	if r.ReleasedWorkerCause.Valid && r.ReleasedWorkerCause.String == "worker_memory_pressure" &&
+		r.ReleasedWorkerCauseAt.Valid && r.ClaimReleasedAt.Valid &&
+		r.ReleasedWorkerCauseAt.Time.Equal(r.ClaimReleasedAt.Time) {
+		return fmt.Sprintf("waiting for another worker, or restart worker %s (its previous process was released by a memory-pressure park)", workerName)
+	}
+	return fmt.Sprintf("waiting for another worker, or restart worker %s (its previous process was released at the time limit)", workerName)
 }

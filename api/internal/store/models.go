@@ -1152,6 +1152,8 @@ type Run struct {
 	HintedCapabilities          []string           `json:"hinted_capabilities"`
 	CapabilityInferenceEvidence []byte             `json:"capability_inference_evidence"`
 	IdleStallParkCount          int32              `json:"idle_stall_park_count"`
+	ReleasedWorkerCause         pgtype.Text        `json:"released_worker_cause"`
+	ReleasedWorkerCauseAt       pgtype.Timestamptz `json:"released_worker_cause_at"`
 }
 
 type RunCompletionAttempt struct {

@@ -90,6 +90,8 @@ UPDATE runs SET
     claim_released_at = NULL,
     released_worker_id = NULL,
     released_worker_nonce = NULL,
+    released_worker_cause = NULL,
+    released_worker_cause_at = NULL,
     stale_requeue_generation = NULL,
     worker_recovery_evidence = NULL,
     checkpoint_contains_latest = NULL,

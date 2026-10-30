@@ -101,6 +101,7 @@ UPDATE runs SET
     status='recovery_wait', status_since=now(),
     recovery_wait_cause='worker_memory_pressure', recovery_retry_not_before=NULL,
     claim_released_at=now(), released_worker_id=worker_id,
+    released_worker_cause='worker_memory_pressure', released_worker_cause_at=now(),
     released_worker_nonce= @register_nonce,
     codex_cap_hash=NULL, codex_claim_epoch=codex_claim_epoch+1,
     health='ok', health_reason=NULL, health_since=NULL, updated_at=now()
