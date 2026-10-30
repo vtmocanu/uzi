@@ -9,7 +9,7 @@ import { onSidebarTokensChanged } from "../lib/sidebarTokens";
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 vi.mock("../lib/api", async original => {
   const actual = await original<typeof import("../lib/api")>();
-  return { ...actual, api: { ...actual.api, vaultEnable: vi.fn(), vaultDisable: vi.fn(), vaultLock: vi.fn() } };
+  return { ...actual, api: { ...actual.api, vaultEnable: vi.fn(), vaultDisable: vi.fn(), vaultLock: vi.fn(), putMySettings: vi.fn(), vaultUnlock: vi.fn() } };
 });
 const refresh = vi.fn().mockResolvedValue(undefined);
 const reload = vi.fn().mockResolvedValue(undefined);
@@ -108,4 +108,54 @@ it.each([
   auth({ vaultMode, hasPassword });
   render(<CredentialStorageHint />);
   expect(screen.getByText(new RegExp(expected))).toBeTruthy();
+});
+
+it("waits for a confirmed load and falls back to on only for a loaded old response", async () => {
+  const view = render(<VaultSettings onChanged={reload} />);
+  const checkbox = screen.getByRole("checkbox", { name: "Re-unlock automatically in this browser" }) as HTMLInputElement;
+  expect(checkbox.disabled).toBe(true);
+  expect(checkbox.checked).toBe(false);
+  view.rerender(<VaultSettings onChanged={reload} settings={{} as import("../lib/api").UserSettings} settingsLoading={false} />);
+  await waitFor(() => expect(checkbox.checked).toBe(true));
+  expect(checkbox.disabled).toBe(false);
+  view.rerender(<VaultSettings onChanged={reload} settings={{} as import("../lib/api").UserSettings} settingsLoading={false} settingsError="unavailable" />);
+  expect(checkbox.disabled).toBe(true);
+});
+
+it.each([true, false])("saves permission from confirmed response while protection is off (OIDC=%s)", async oidc => {
+  auth({ hasPassword: !oidc });
+  const settings = { vault_auto_reunlock: true } as import("../lib/api").UserSettings;
+  vi.mocked(api.putMySettings).mockResolvedValueOnce({ settings: { ...settings, vault_auto_reunlock: false } });
+  render(<VaultSettings onChanged={reload} settings={settings} settingsLoading={false} />);
+  const checkbox = screen.getByRole("checkbox") as HTMLInputElement;
+  expect(checkbox.checked).toBe(true);
+  fireEvent.click(checkbox);
+  await waitFor(() => expect(checkbox.checked).toBe(false));
+  expect(api.putMySettings).toHaveBeenCalledWith({ vault_auto_reunlock: false });
+  expect(screen.getByText(/Turning it off revokes grants in all browsers/)).toBeTruthy();
+  expect(screen.getByText(/HttpOnly cookie, inaccessible to JavaScript/)).toBeTruthy();
+  vi.mocked(api.putMySettings).mockRejectedValueOnce(new ApiError(500, "save failed"));
+  fireEvent.click(checkbox);
+  expect(await screen.findByText("save failed")).toBeTruthy();
+  expect(checkbox.checked).toBe(false);
+  vi.mocked(api.putMySettings).mockResolvedValueOnce({ settings });
+  fireEvent.click(checkbox);
+  await waitFor(() => expect(checkbox.checked).toBe(true));
+  await waitFor(() => expect(reload).toHaveBeenCalledTimes(2));
+  expect(api.vaultUnlock).not.toHaveBeenCalled();
+  expect(api.vaultEnable).not.toHaveBeenCalled();
+  expect(refresh).not.toHaveBeenCalled();
+});
+
+it("ignores a late permission save after the account changes", async () => {
+  let resolve!: (value: { settings: import("../lib/api").UserSettings }) => void;
+  vi.mocked(api.putMySettings).mockReturnValueOnce(new Promise(r => { resolve = r; }));
+  const settings = { vault_auto_reunlock: true } as import("../lib/api").UserSettings;
+  const view = render(<VaultSettings onChanged={reload} settings={settings} settingsLoading={false} />);
+  fireEvent.click(screen.getByRole("checkbox"));
+  expect((screen.getByRole("checkbox") as HTMLInputElement).disabled).toBe(true);
+  auth({ user: { id: "different-user" } as ReturnType<typeof useAuth>["user"] });
+  view.rerender(<VaultSettings onChanged={reload} settings={settings} settingsLoading={false} />);
+  resolve({ settings: { ...settings, vault_auto_reunlock: false } });
+  await waitFor(() => expect((screen.getByRole("checkbox") as HTMLInputElement).checked).toBe(true));
 });

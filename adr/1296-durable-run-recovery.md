@@ -712,3 +712,45 @@ Leaves other than the source must be the source's ancestors or lineage-proven su
 With #3239 a coverage-wrapper tip that cannot be fully verified (unreadable tip, more than 8 aggregates, more than 66 leaves = 64 owed roots + the original source + the current source, or any failed git read) is refused even over a clean source, rather than adopted as before. A non-tip commit the walk cannot read within bounds (over 64 KiB or not valid UTF-8) is treated as a leaf under the leaf rule, unless its subject claims to be a coverage commit (then it refuses). The walk goes through a readable commit whose message claims the coverage prefix without the exact coverage message; once any such look-alike is walked, the adopt refuses if a marker is involved at all (any marker leaf, or a marker source), and more than 8 look-alikes refuse outright. Because a look-alike's parents are walked, a shape with no marker can also refuse where it used to be adopted (walk bounds or a failed read), always keeping the source. A peeled marker that is itself the restore tip is journaled as lineage too, and the watcher backup script accepts the new `peeledMarkers` journal field.
 
 Limitations: lineage does not survive a retired clone (an earlier marker still owed as a leaf then refuses, custody kept); a checkpoint published before this fix whose tip is a wrapper over a marker and is adopted via the tracking or checkpoint legs is not peeled (rollout boundary); an older worker's strict journal parser rejects the new key (fails closed, journal kept). Marker vetting at capture is in the [ADR-0759 amendment](0759-protect-run-work-usage-limit-park.md#amendment-2026-10-21-issue-3239-the-wip-auto-save-refuses-core-dumps-and-oversized-files-and-vets-its-own-marker).
+
+## Amendment 2026-10-29: reuse covered marker-free recovery sources
+
+Repeated provider retries without model progress must not nest another recovery wrapper merely because a clean successor adopted the preceding aggregate as its HEAD. New guarded inventories may reuse that current aggregate when its bounded commit shape and worker identity match and every original root is positively ancestral to it. The shared bounded wrapper walk must establish the exact marker-free case in which successor adoption does not consult provenance pins. A coverage-looking header is shape, not provenance; marker involvement, divergent roots or unproven eligibility never gain reuse authority. The original successor verifier, including its eight-aggregate bound, remains unchanged.
+
+Reuse preserves the current tree and all frozen roots, recomputes the inventory fingerprint, and writes a separate ref in the existing run/generation/fingerprint namespace. It does not share ref ownership across generations or release any source, archive or custody. Eligibility depends on immutable objects and ancestry, not on whether an earlier generation's coverage pin survives cleanup. A new inventory fingerprint need not equal the reused commit's embedded fingerprint, so the optional archive-redundancy reader may return no claim. Full frozen-source proof and ordinary archive FINAL do not depend on that optimization.
+
+The producer defaults to legacy aggregate construction. New inventories opt into reuse; authenticated nonempty coverage records with `sourceSha === inventoryCurrentSha` require reuse during re-proof, without a fallback that could overwrite their pin with a different aggregate. Records whose source differs retain byte-identical legacy reconstruction. No journal field, database counter or protocol feature is added. A pre-fix worker cannot re-prove a reused record: rollback or mixed-version replay retains it fail-closed, and a new-code worker is needed to settle it.
+
+An owner Resume of the affected ninth-wrapper hold can reuse the last successfully adopted eight-deep physical source when it still covers every root. An already-overbound physical source is not bypassed. Marker-involved recovery keeps legacy wrapping, and recoveries with intervening committed progress can still grow wrapper history; this amendment does not claim to solve those distinct shapes.
+
+
+## Amendment 2026-10-29: fair ordinary inventory reconstruction (#3614)
+
+The #2381 discovery FIFO is separate from the #1995 direct-replay selection above.
+It rotates raw contexts (default cap four) before execution/hold checks; retained
+metadata with no eligible hold can therefore consume turns. Empty candidate lists
+alone do not make a context disposable.
+
+Guarded live materialization, but not boot, reserves at most one turn for an ordinary
+invalidated inventory. Complete checked records, canonical context equality and both
+execution predicates determine this scheduling hint. Every frozen guarded sibling in
+the generation must be replaceable; a non-replaceable successor, saved FINAL, ACK or
+receipt ends priority. Selected contexts rotate behind survivors without changing
+queue membership/multiplicity. Remaining turns stay FIFO; no hint or cap below two
+retains the original FIFO. A failed fresh recheck wastes that already-rotated priority
+turn, leaving cap-1 FIFO turns. The hint grants no authority: all fresh custody,
+source, ancestry, immutable-request, quota, lifecycle and retirement proofs remain.
+
+For P continuously eligible contexts with complete readable hints, priority progresses
+within P completed materializing passes; normal survivors within ceil(N/(cap-1)).
+A permanent refusal may keep the reserved turn; these are pass bounds, not a wall-clock
+settlement SLA. Removed/re-added entries are new arrivals. Hint I/O failure warns and
+falls back to FIFO; budget exhaustion and cancellation still end the pass. Hint reads
+check cancellation between runs and do not run on non-materializing/blocked passes.
+
+The local checked view is read once per candidate run immediately before live
+materialization. #3446 D-U5-5's evidence-first order, once landed, stays first; the hint
+moves with materialization in either landing order. Producer admission, #3577 retirement
+proof and journal/API formats are unchanged. Pruning remains #2823's carried #2414 work
+with independent fail-closed authority. Measurements and regression evidence belong in
+the implementing PR.

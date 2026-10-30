@@ -261,6 +261,27 @@ it("chat list keeps omitted recovery metadata generic", async () => {
 });
 
 it.each([
+  ["overload", "2099-01-01T00:00:37Z", true],
+  [undefined, undefined, false],
+  ["unknown", "2099-01-01T00:00:37Z", false],
+  ["rate_limit", "invalid", false],
+  ["rate_limit", "2020-01-01T00:00:37Z", false],
+] as const)("account cooldown conversation header validates %s/%s", async (cls, at, valid) => {
+  mockApi.listChats.mockResolvedValue(chatList([]));
+  mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ status: "online" })] });
+  const run = { ...mockRuns[0], id: "c1", kind: "chat" as const, status: "running" as const, health: "waiting_account_cooldown" as const,
+    account_cooldown_class: cls, account_cooldown_eligible_at: at };
+  vi.mocked(useRunStream).mockReturnValue({ run, messages: [], connected: true, error: "", refreshRun: vi.fn() } as unknown as ReturnType<typeof useRunStream>);
+  const { container } = render(<MemoryRouter initialEntries={["/chat/c1"]}><Routes>
+    <Route path="/chat/:id" element={<ChatConversation />} />
+  </Routes></MemoryRouter>);
+  await waitFor(() => expect(mockApi.listChats).toHaveBeenCalled());
+  expect(container.querySelector(".animate-pulse")).toBeNull();
+  expect(container.textContent?.includes("waiting for account cooldown")).toBe(valid);
+  expect(screen.getByText("live")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "End chat" }).hasAttribute("disabled")).toBe(false);
+});
+it.each([
   ["2099-01-01T00:00:00Z", "Codex idle stall retrying"],
   ["2020-01-01T00:00:00Z", "Codex idle stall retrying"],
   [null, "Codex idle stall needs decision"],

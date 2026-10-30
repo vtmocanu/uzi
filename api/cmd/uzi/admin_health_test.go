@@ -397,6 +397,27 @@ func codexPricingWarnCheck() apitypes.HealthCheckDTO {
 	}
 }
 
+func TestAdminHealthWaitingRunIdentity(t *testing.T) {
+	const id = "11111111-2222-4333-8444-555555555555"
+	check := apitypes.HealthCheckDTO{
+		ID: "queue.waiting", Scope: "owner", Severity: "danger",
+		Summary: "A run has been waiting for a worker for 48m.",
+		Evidence: []apitypes.HealthEvidenceDTO{{
+			Label: "Waiting run", RunID: id, OwnerID: "22222222-2222-4222-8222-222222222222",
+			Value: "Owner: Alex Example; waited 48m. This background run is no longer deprioritized, but has not yet been picked up.",
+		}},
+	}
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{AdminHealthDoc: healthDoc("danger", check)}), "admin", "health", "--no-color")
+	for _, want := range []string{id, "22222222-2222-4222-8222-222222222222", "Alex Example", "no longer deprioritized", "blocking: false"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q: %s", want, out)
+		}
+	}
+	if code != uzicli.ExitHealthDanger {
+		t.Fatalf("exit = %d", code)
+	}
+}
+
 func TestAdminHealthRecoveryStorageEvidence(t *testing.T) {
 	for _, tc := range []struct {
 		name, summary, refused, maximum, sharedLimit string

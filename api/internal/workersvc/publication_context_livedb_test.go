@@ -1,9 +1,11 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -28,16 +30,28 @@ func (f *contextPublicationForge) GetMergeRequestSummary(_ context.Context, _, _
 
 func TestPublicationContextResolverLiveDB(t *testing.T) {
 	for _, kind := range []string{"mr_rework", "ci_fix"} {
-		for _, scenario := range []string{"closing", "non_closing", "missing", "failed", "failed_restricted", "prompt", "self_improve", "wrong_branch", "foreign_source", "foreign_repo", "cycle", "16_hops", "17_hops", "duplicate_roots", "conflicting_roots", "source_drift", "release", "new_ci_root"} {
+		for _, scenario := range []string{"closing", "non_closing", "missing", "failed", "failed_restricted", "prompt", "self_improve", "wrong_branch", "foreign_source", "foreign_repo", "cycle", "16_hops", "17_hops", "duplicate_roots", "conflicting_roots", "source_drift", "release", "new_ci_root", "completed_unstamped", "completed_unstamped_release", "completed_unstamped_drift", "completed_unstamped_forge_mismatch"} {
 			t.Run(kind+"/"+scenario, func(t *testing.T) {
+				var logs bytes.Buffer
+				oldLogger := slog.Default()
+				slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+				t.Cleanup(func() { slog.SetDefault(oldLogger) })
 				f := seedSourcePublication(t, false)
+				unstamped := strings.HasPrefix(scenario, "completed_unstamped")
 				if scenario == "non_closing" {
 					f.req.SourcePublication.NonClosing = true
+				}
+				if unstamped {
+					// An old worker completes the source without reporting source publication.
+					f.req.SourcePublication = nil
 				}
 				if scenario != "missing" && scenario != "failed" && scenario != "failed_restricted" && scenario != "prompt" && scenario != "self_improve" && scenario != "cycle" {
 					result, err := f.svc.SetStateReportWithReconciliation(f.e.ctx, f.w, f.id, f.req)
 					if err != nil || !result.Applied {
 						t.Fatalf("source completion: %+v %v", result, err)
+					}
+					if _, stamp, _ := f.stored(t); unstamped && len(stamp) != 0 {
+						t.Fatalf("legacy completion must leave the stamp NULL: %s", stamp)
 					}
 				} else {
 					f.e.exec(t, "UPDATE runs SET status='failed',branch=$2,mr_iid=7 WHERE id=$1", f.id, *f.req.Branch)
@@ -98,6 +112,12 @@ func TestPublicationContextResolverLiveDB(t *testing.T) {
 					proof.barrier = func() { f.e.exec(t, "UPDATE runs SET completion_non_closing_reason='partial' WHERE id=$1", f.id) }
 				case "release":
 					proof.barrier = func() { f.e.exec(t, "UPDATE runs SET claim_released_at=now() WHERE id=$1", requestID) }
+				case "completed_unstamped_release":
+					proof.barrier = func() { f.e.exec(t, "UPDATE runs SET claim_released_at=now() WHERE id=$1", requestID) }
+				case "completed_unstamped_drift":
+					proof.barrier = func() { f.e.exec(t, "UPDATE runs SET completion_non_closing_reason='partial' WHERE id=$1", f.id) }
+				case "completed_unstamped_forge_mismatch":
+					proof.summary.State = forge.MRStateClosed
 				case "new_ci_root":
 					proof.barrier = func() {
 						other := f.e.seedLegacyRunningRun(t, f.w.ID)
@@ -105,12 +125,20 @@ func TestPublicationContextResolverLiveDB(t *testing.T) {
 					}
 				}
 				f.svc.SetForges(settleUnitBuilder{f: proof})
+				if scenario == "completed_unstamped" {
+					// The candidate equal to the forge head resolves too.
+					same := f.svc.ResolvePublicationContext(f.e.ctx, f.w, requestID, PublicationContextRequest{ClaimGeneration: 1, Branch: branch, CandidateHead: strings.Repeat("b", 40)})
+					if same.Status != "resolved" || same.Binding == nil || same.Binding.Intent != "non_closing" || same.Binding.SourcePublication != nil ||
+						same.Binding.CandidateHead != strings.Repeat("b", 40) {
+						t.Fatalf("unchanged-head refresh: %+v", same)
+					}
+				}
 				// The outgoing head is NEW and must differ from the forge's current head.
 				req := PublicationContextRequest{ClaimGeneration: 1, Branch: branch, CandidateHead: strings.Repeat("c", 40)}
 				result := f.svc.ResolvePublicationContext(f.e.ctx, f.w, requestID, req)
 				want := "unknown"
 				switch scenario {
-				case "closing", "non_closing", "failed_restricted", "duplicate_roots", "16_hops":
+				case "closing", "non_closing", "failed_restricted", "duplicate_roots", "16_hops", "completed_unstamped":
 					want = "resolved"
 				case "prompt", "self_improve":
 					want = "not_applicable"
@@ -127,13 +155,52 @@ func TestPublicationContextResolverLiveDB(t *testing.T) {
 				}
 				if want == "resolved" {
 					intent := "closing"
-					if scenario == "non_closing" || scenario == "failed_restricted" {
+					if scenario == "non_closing" || scenario == "failed_restricted" || scenario == "completed_unstamped" {
 						intent = "non_closing"
 					}
 					if result.Binding == nil || result.Binding.Intent != intent || result.Binding.SourceRunID != f.id ||
 						result.Binding.CandidateHead != req.CandidateHead || result.Binding.MRIID != 7 {
 						t.Fatalf("binding: %+v", result.Binding)
 					}
+				}
+				if scenario == "completed_unstamped" {
+					var sourceIssue int64
+					if err := f.e.pool.QueryRow(f.e.ctx, "SELECT issue_iid FROM runs WHERE id=$1", f.id).Scan(&sourceIssue); err != nil {
+						t.Fatal(err)
+					}
+					if result.Binding.SourcePublication != nil || result.Binding.IssueIID == nil || *result.Binding.IssueIID != sourceIssue {
+						t.Fatalf("unstamped binding: %+v", result.Binding)
+					}
+					if _, stamp, _ := f.stored(t); len(stamp) != 0 {
+						t.Fatalf("refresh must not write a stamp: %s", stamp)
+					}
+				}
+				wantEvents := 0
+				if scenario == "completed_unstamped" {
+					wantEvents = 2 // once per successful resolve
+				}
+				events := 0
+				for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+					var rec map[string]any
+					if line == "" || json.Unmarshal([]byte(line), &rec) != nil || rec["event"] != "publication_context_unstamped_fallback" {
+						continue
+					}
+					events++
+					if rec["run"] != requestID.String() || rec["source_run"] != f.id.String() || rec["reason"] != "completed_unstamped" {
+						t.Fatalf("fallback event fields: %v", rec)
+					}
+				}
+				if events != wantEvents {
+					t.Fatalf("fallback events want %d got %d: %s", wantEvents, events, logs.String())
+				}
+				if scenario == "completed_unstamped_release" && result.Reason != "claim_changed" {
+					t.Fatalf("unstamped release barrier: %+v", result)
+				}
+				if scenario == "completed_unstamped_drift" && result.Reason != "authority_changed" {
+					t.Fatalf("unstamped drift barrier: %+v", result)
+				}
+				if scenario == "completed_unstamped_forge_mismatch" && result.Reason != "forge_mismatch" {
+					t.Fatalf("unstamped forge mismatch: %+v", result)
 				}
 				if scenario == "source_drift" && result.Reason != "authority_changed" {
 					t.Fatalf("source barrier: %+v", result)

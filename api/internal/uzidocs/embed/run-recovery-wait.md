@@ -532,9 +532,9 @@ credential, then makes a verified capture of the work done so far,
 publishing it credential-free when it can. It keeps custody of your source
 and does not open the merge request while the vault stays locked.
 
-An explicit successful vault unlock (`POST /api/vault/unlock`) makes a
-synchronous, best-effort attempt to queue that owner's already parked
-`recovery_wait` runs with cause `vault_locked`, regardless of their retry
+A successful explicit vault unlock (`POST /api/vault/unlock`) or eligible
+foreground browser restore makes a synchronous, best-effort attempt to queue
+that owner's already parked `recovery_wait` runs with cause `vault_locked`, regardless of their retry
 time or count. Other owners and causes are untouched. This queues the work
 promptly; a worker still starts it through the normal claim path, so unlock
 does not promise an instant resume.
@@ -543,8 +543,12 @@ The scheduled retry remains the fallback: the same capped backoff as an
 empty-turn park (`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`),
 with no lifetime cap. A database failure leaves unlock successful (204) and
 preserves the Codex usage refresh poke; a park reported after the unlock's
-queue update also waits for the timer. Login, startup and passphrase
-creation do not trigger this early promotion.
+queue update also waits for the timer. Successful protected password login,
+passphrase enrollment and explicit enable/disable also use this promotion
+path. Seed startup does not. Browser restore needs a live HTTPS grant,
+valid session and incoming JWT-bound CSRF header; hidden/passive requests
+and WebSockets do not restore. See
+[Browser re-unlock](vault-threat-model.md#browser-re-unlock).
 
 If the vault locks again between the unlocked-cache check and the queue
 update, the run can be queued while locked, just as on the timer path.

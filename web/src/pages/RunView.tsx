@@ -50,6 +50,7 @@ import {
   reserveQueueText,
   RESERVE_RESUME_CONFIRM,
   codexAdmissionText,
+  accountCooldownText,
   displayHealthReason,
   queuedBlockerPrecedesCodexAdmission,
   isStoppedRun,
@@ -343,6 +344,7 @@ export function HealthFlag({ run }: { run: Run }) {
   const reserve = !maintenance && isReserveQueued(run);
   const admission = codexAdmissionText(run, now);
   const primaryAdmission = !maintenance && !reserve && !queuedBlockerPrecedesCodexAdmission(run) ? admission : null;
+  const cooldown = accountCooldownText(run, now);
   const reason = displayHealthReason(run);
   const show = !maintenance && !reserve && !primaryAdmission && shouldShowHealthFlag(run.health, run.status);
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
@@ -369,11 +371,12 @@ export function HealthFlag({ run }: { run: Run }) {
     ? maintenanceQueueText(maintenanceReason)
     : reserve
       ? reserveQueueText(run.reserve_hold_reason)
-      : primaryAdmission ?? (show
+      : cooldown ?? primaryAdmission ?? (show
         ? (healthFlagLabel(run.health) ?? "")
         : "");
   return (
     <>
+      {cooldown && <span className="text-xs text-info">{cooldown}</span>}
       {primaryAdmission && (
         <span data-queue-reason={run.queue_reason} className="text-xs text-info">{primaryAdmission}</span>
       )}
@@ -1858,7 +1861,7 @@ export function RunView() {
   const { id = "" } = useParams();
   const currentRunIdRef = useRef(id);
   currentRunIdRef.current = id;
-  const { run, messages, connected, error, submit, refreshRun, inputs, canSteer: optimisticCanSteer, confirmedOwner, pauseOriginReady } = useRunStream(id);
+  const { run, messages, connected, error, submit, refreshRun, refreshRunPassive, inputs, canSteer: optimisticCanSteer, confirmedOwner, pauseOriginReady } = useRunStream(id);
   const repoPath = maskRepoPath(stripUnsafeChars(run?.repo_path ?? ""), demo);
   const workerExhausted = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_requeue_exhausted";
   // All page control surfaces share this gate, including the existing top Stop.
@@ -1898,10 +1901,11 @@ export function RunView() {
     state.busy = true;
     const active = state;
     // Requests are bounded by newly observed sequence numbers, with no retries;
-    // updates during a request share one follow-up. refreshRun retains its own
-    // request lifecycle and generation fence. Navigation cancels queued follow-ups.
+    // updates during a request share one follow-up. The read is passive (socket-driven,
+    // so it never restores a vault keyslot) and retains refreshRun's request lifecycle
+    // and generation fence. Navigation cancels queued follow-ups.
     const refresh = async () => {
-      try { await refreshRun(); } catch {
+      try { await refreshRunPassive(); } catch {
         // Best effort, as in useRunStream.refreshRun; a later new event can refresh.
       } finally {
         active.busy = false;
@@ -1913,7 +1917,7 @@ export function RunView() {
       }
     };
     void refresh();
-  }, [id, run?.id, messages, refreshRun]);
+  }, [id, run?.id, messages, refreshRunPassive]);
   const [incidentalSummary, setIncidentalSummary] = useState<{ runId: string; count: number } | null>(null);
   const findingsRunId = run?.id;
   const findingsTerminal = !!run && isTerminalRun(run.status);
@@ -1924,7 +1928,9 @@ export function RunView() {
     if (!findingsTerminal || !findingsRunId ||
         summaryContext.current.runId !== findingsRunId || !summaryContext.current.terminal) return;
     const request = ++summaryRequest.current;
-    api.listFindings("to_file", undefined, findingsRunId)
+    // Automatic (status-driven or post-mutation) read: passive, so it never restores
+    // a vault keyslot (ADR-3508).
+    api.listFindings("to_file", undefined, findingsRunId, true)
       .then(({ findings }) => {
         if (summaryRequest.current === request) {
           setIncidentalSummary({ runId: findingsRunId, count: findings.filter((f) => f.status === "open").length });
@@ -2035,7 +2041,8 @@ export function RunView() {
   useEffect(() => {
     if (run?.status !== "awaiting_approval") return;
     api
-      .listWorkers()
+      // Status-driven (often by a socket update): passive, never restores a keyslot.
+      .listWorkers(true)
       .then(({ workers }: { workers: Worker[] }) => setWorkers(workers))
       .catch(() => setWorkers([]));
   }, [run?.status]);
@@ -2047,7 +2054,8 @@ export function RunView() {
   useEffect(() => {
     if (!showMrRework) return;
     api
-      .getMySettings()
+      // Status-driven: passive, never restores a keyslot (ADR-3508).
+      .getMySettings(true)
       .then(({ settings }) => setMrReworkDefault(settings.mr_rework_enabled ?? null))
       .catch(() => setMrReworkDefault(null));
   }, [showMrRework]);
@@ -2510,7 +2518,7 @@ export function RunView() {
               <span ref={statusRef} tabIndex={-1} className="rounded-md focus-visible:ring-2 focus-visible:ring-brand/60 focus:outline-none">
                 {pillStatus === "provider_unavailable" || pillStatus === "provider_outage"
                   ? <Badge tone="warning" dot>{parkLabel(run)}</Badge>
-                  : <StatusPill status={pillStatus} />}
+                  : <StatusPill health={run.health} status={pillStatus} />}
               </span>
               {/* PRD #320 M6: the queue-priority pill + the owner's Expedite/undo action.
                   Both are QUEUED-ONLY (the pill self-hides on any other status; the action

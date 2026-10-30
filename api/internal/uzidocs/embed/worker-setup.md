@@ -488,6 +488,12 @@ An api outage — of any length — no longer costs a run its message feed. The 
 
 ## Surviving an api restart mid-run
 
+For Codex subscription flights that negotiated operation admission, an API
+outage blocks the next supported new model dispatch, even without a known
+cooldown. Already dispatched turns and preservation continue under existing
+controls, budgets and deadlines; the restoration semantics below still apply.
+See [operation-admission upgrades](installation.md#codex-account-admission-upgrades).
+
 The message outbox above keeps a run's message feed intact across an api
 outage; this is about the run's own status. On every heartbeat and claim, a
 worker reports which run-lane attempts it's actually executing and in which

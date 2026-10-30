@@ -1,9 +1,11 @@
 import type {
   ActiveSnapshot,
+  CodexOperationIdentity,
   ActiveSnapshotEntry,
   ActiveSnapshotPhase,
   FinalizeResumeEntry,
 } from "./protocol.js";
+import { validCodexOperation } from "./codex-operation-admission.js";
 import type { PendingTerminal } from "./outbox.js";
 
 /** PRD #1391 Run B M4: the outbox pending-terminal lister the registry reads (a function seam so the
@@ -72,6 +74,8 @@ export class ActiveRunRegistry {
   private readonly runs = new Map<string, {
     phase: ActiveSnapshotPhase;
     claimGeneration: number;
+    registrationToken: symbol;
+    cooldowns?: Map<symbol, CodexOperationIdentity>;
     policyPendingOnly?: boolean;
   }>();
   /** Ephemeral lease evidence only; never journal conversion or retirement authority. */
@@ -109,35 +113,59 @@ export class ActiveRunRegistry {
   /** Register a run as executing at `running`, at the generation it was claimed at.
    *  Idempotent per run id (re-registering, e.g. a promoted re-claim serialised behind an
    *  old park, overwrites the prior entry). */
-  add(runId: string, claimGeneration: number): void {
-    this.runs.set(runId, { phase: "running", claimGeneration });
+  add(runId: string, claimGeneration: number): symbol {
+    const registrationToken = Symbol();
+    this.runs.set(runId, { phase: "running", claimGeneration, registrationToken });
     // A new claim invalidates an in-flight observation even if it later closes
     // before that HTTP response returns (the undefined-entry ABA case).
     if (this.policyOwnership.has(runId) || this.pendingOutcomes().some(p => p.run_id === runId && this.isPolicy(p)))
       this.policyOwnership.set(runId, { generation: undefined });
+    return registrationToken;
   }
 
   /** Update the current phase of a live run (no-op when the run is not registered, so a
    *  late transition after removal never revives an entry). */
   setPhase(runId: string, phase: ActiveSnapshotPhase): void {
     const entry = this.runs.get(runId);
-    if (entry) entry.phase = phase;
+    if (entry && entry.phase !== phase) {
+      entry.phase = phase;
+      delete entry.cooldowns;
+    }
+  }
+
+  /** Display registrations only: select the latest surviving operation, falling back
+   * when it exits. Tokens keep independent waiters and stale clears isolated. */
+  setAccountCooldown(runId: string, generation: number, operation: CodexOperationIdentity, registrationToken: symbol): symbol | undefined {
+    const entry = this.runs.get(runId);
+    if (!entry || entry.policyPendingOnly || entry.registrationToken !== registrationToken || !Number.isSafeInteger(generation) || generation <= 0 ||
+        entry.claimGeneration !== generation || !validCodexOperation(operation)) return undefined;
+    const token = Symbol();
+    (entry.cooldowns ??= new Map()).set(token, structuredClone(operation));
+    return token;
+  }
+
+  clearAccountCooldown(runId: string, generation: number, token: symbol): void {
+    const entry = this.runs.get(runId);
+    if (entry?.claimGeneration === generation) entry.cooldowns?.delete(token);
   }
 
   /** Drop a run once its execution settles (terminal, or parked-and-returned for a
    *  requeue — it is no longer executing). */
-  remove(runId: string, expectedGeneration?: number): void {
+  remove(runId: string, expectedGeneration?: number, expectedRegistrationToken?: symbol): void {
     const entry = this.runs.get(runId);
     if (expectedGeneration !== undefined && entry?.claimGeneration !== expectedGeneration) return;
+    if (expectedRegistrationToken !== undefined && entry?.registrationToken !== expectedRegistrationToken) return;
     this.runs.delete(runId);
   }
 
   /** Close an already registered execution while retaining bounded pending-only fallback.
    * Ownership is supplied independently through notePolicyOwnership. */
-  markPolicyPendingOnly(runId: string, expectedGeneration: number): boolean {
+  markPolicyPendingOnly(runId: string, expectedGeneration: number, expectedRegistrationToken?: symbol): boolean {
     const entry = this.runs.get(runId);
     if (!entry || entry.claimGeneration !== expectedGeneration) return false;
+    if (expectedRegistrationToken !== undefined && entry.registrationToken !== expectedRegistrationToken) return false;
     entry.policyPendingOnly = true;
+    delete entry.cooldowns;
     return true;
   }
 
@@ -354,6 +382,7 @@ export class ActiveRunRegistry {
         claim_generation: entry.claimGeneration,
         phase: entry.phase,
         terminal_pending: false,
+        ...(entry.cooldowns?.size ? { account_cooldown: structuredClone([...entry.cooldowns.values()].at(-1)!) } : {}),
       });
     }
 

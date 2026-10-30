@@ -388,7 +388,13 @@ and then builds, already validated, into one `*secretbox.Box` shared by every
 handler (see [docs/configuration.md](docs/configuration.md)). Personal
 credentials have explicit **protected** and **unprotected** modes. Protected
 users seal with a per-user 256-bit DEK wrapped by a password-derived KEK;
-login/unlock caches that DEK until explicit lock or API restart. Off users
+login/unlock caches that DEK until explicit lock or API restart. Eligible
+HTTPS browsers also hold a cookie wrapping key for a second DEK wrapper in
+`vault_browser_slots`. A valid session plus incoming JWT-bound CSRF header
+can restore the cache on foreground requests after restart, including safe
+reads; missing/invalid CSRF leaves normal safe reads unchanged without slot
+access or unlock-budget consumption. Hidden/passive requests and WebSockets
+do not restore. Off users
 have no wrapper or unlock dependency and seal under the master key using
 `master_aad`. The protected Codex refresh recovery-slot exception also uses
 `master_aad` while locked, then re-seals under the DEK during reconciliation.
@@ -414,6 +420,27 @@ no mixed-version API operation. See
 [ADR-3507](adr/3507-optional-credential-vault.md) for lock order, bounded
 conversion, uncertain commits and rollback restrictions, and
 [the vault threat model](docs/vault-threat-model.md) for residual risks.
+Browser grants use a Secure, HttpOnly, Strict, host-only /api cookie, owner/slot
+AAD, signed browser identity stable across session refresh, and a serialized
+slot-generation fence separate from the mode epoch. Default-on
+**Re-unlock automatically in this browser** is account-wide permission;
+disabling it revokes every browser, and enabling it alone does not mint.
+Verified interactive password login/unlock/enrollment can mint on HTTPS;
+CLI, seed/boot, OIDC callback and restore cannot. HTTP stays manual.
+The admin lifetime defaults to 7 days (1–30), bounded by minting-session
+expiry, with a 32-browser cap. Fixed expiry does not evict a cached DEK;
+lowering the lifetime affects new slots.
+
+Explicit lock revokes slots and evicts the DEK; global logout revokes sessions
+and slots but retains a cached DEK. Password/off/recreate/deactivation changes
+also revoke. The cookie key is absent from server-at-rest material, but cookie
+theft plus a matching DB snapshot allows offline DEK recovery without session
+authentication. Foreground restore best-effort promotes vault-locked parks;
+unattended continuity remains outside this feature.
+[ADR-3508](adr/3508-browser-vault-reunlock.md) records the protocol, security
+analysis and pre-keyslot rollback requirement: stop the keyslot-aware API
+and drain requests, then delete/invalidate slots, before starting an older binary. Migration 00379 CHECK validation and ACCESS EXCLUSIVE
+duration/availability costs are production-dependent and unmeasured.
 Rotating `UZI_SECRET_KEY` invalidates rows still master-sealed across features.
 
 The API around it is deliberately minimal, and **every read is metadata only**:
@@ -1875,6 +1902,24 @@ Four independent layers, any one of which failing still leaves the others:
    hooks/settings/commands never load; and repo subagents are still bound by
    the `disallowedTools` list and the deny-hook above. See the Repo agents docs
    page and `specs/ai.md` "PRD #37".
+
+   **Verbatim prompts (issue #1563).** Every Claude query options object that
+   carries `settingSources: []` also sets `verbatimPrompts: true`, so the bundled
+   CLI delivers each user turn as written. Without it the CLI preprocesses a turn
+   before any tool runs: an `@<path>` mention is expanded by a CLI-synthesized
+   Read that no `PreToolUse` hook sees (so neither the path guard's deny list nor
+   its worktree confinement applies), and a leading `/<command>` is dispatched.
+   uzi assembles prompts from issue text, MR review comments, CI log tails and
+   chat turns, so the mention is attacker-reachable. This closes that one
+   preprocessing step only: it is not a sandbox, it does not change tool
+   guards, and Codex is unaffected. The SDK documents a tradeoff, that a
+   verbatim turn also skips the CLI's turn-start attachment pass (skill and
+   tool listings, nested instruction files, per-turn reminders), with most of
+   that context arriving after the first tool call; on the pinned CLI 2.1.302
+   the skill listing and the granted tools were still present on the first
+   request. Real-CLI tests against a local fake
+   provider pin both the non-expansion and that first-turn behaviour
+   (`agent/test/sdk-verbatim-prompts*.ts`).
 
 Permission mode is explicitly `bypassPermissions` (allow-by-default) **plus**
 the deny-hook and a `disallowedTools` list — not `default` (which hangs

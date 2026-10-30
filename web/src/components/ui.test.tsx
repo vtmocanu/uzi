@@ -427,3 +427,18 @@ it("StatusPill keeps a narrow projection's recovery cause unknown", () => {
   const { container } = render(<StatusPill status="recovery_wait" />);
   expect(container.textContent).toBe("recovery wait");
 });
+
+it.each(["queued", "paused", "completed", "failed", "awaiting_input", "recovery_wait"])("stale cooldown health leaves %s status pill unchanged", status => {
+  const { container, rerender } = render(<StatusPill status={status} health="ok" />);
+  const healthy = container.innerHTML;
+  rerender(<StatusPill status={status} health="waiting_account_cooldown" />);
+  expect(container.innerHTML).toBe(healthy);
+});
+
+it.each(["claimed", "running", "planning", "awaiting_approval", "revising", "completion_checking", "completion_reworking"])("account cooldown health presents %s as waiting without a pulse or stale percentage", status => {
+  const { container } = render(<StatusPill status={status} health="waiting_account_cooldown" progress={{ state: "percent", pct: 70, milestone_done: 2, milestone_total: 3, active_milestone_id: "m3", phase: "implement" }} />);
+  expect(container.textContent).toBe("waiting");
+  expect(container.querySelector(".text-info")).not.toBeNull();
+  expect(container.querySelector(".animate-pulse")).toBeNull();
+  expect(container.querySelector('[role="progressbar"]')).toBeNull();
+});

@@ -94,7 +94,16 @@ ON CONFLICT (worker_id, run_id) DO UPDATE SET
     terminal_pending_until = EXCLUDED.terminal_pending_until,
     terminal_pending_since = EXCLUDED.terminal_pending_since,
     snapshot_epoch         = EXCLUDED.snapshot_epoch,
-    reported_at            = EXCLUDED.reported_at;
+    reported_at            = EXCLUDED.reported_at,
+    -- Clear before the optional projection savepoint so its rollback leaves no
+    -- stale display metadata. Projection failure preserves valid custody except
+    -- on savepoint management failure, when the outer transaction may be unusable.
+    cooldown_operation     = NULL,
+    cooldown_class         = NULL,
+    cooldown_episode_id    = NULL,
+    cooldown_eligible_at   = NULL,
+    cooldown_observed_at   = NULL,
+    cooldown_until         = NULL;
 
 -- Frozen recovery phases ---------------------------------------------------
 -- Internal transaction methods: FrozenTargets and LockedParentIds are mandatory

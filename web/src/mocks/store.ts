@@ -6,7 +6,7 @@
 
 import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, VaultMode, WsEvent } from "../lib/api";
 import { seedUnifiedProgress } from "./data/unifiedProgress";
-import { deriveMockProgress } from "./runProgress";
+import { deriveMockProgress, foreignCooldownRun } from "./runProgress";
 import { mockScenario } from "./mockScenario";
 import {
   mockAdmin,
@@ -183,6 +183,21 @@ function seed(): MockState {
       }
     }
   }
+  // ?mock=account-cooldown: owner wait, foreign redaction and an independent wall warning.
+  if (mockScenario() === "account-cooldown") {
+    for (const id of ["run-live", "run-mira-embed", "run-stalled"]) {
+      const r = runs.get(id);
+      if (!r) continue;
+      r.harness = "codex";
+      r.model = null;
+      r.health = id === "run-stalled" ? "slow" : "waiting_account_cooldown";
+      r.account_cooldown_class = id === "run-live" ? "rate_limit" : "overload";
+      r.account_cooldown_eligible_at = new Date(Date.now() + 300_037).toISOString();
+      r.health_reason = id === "run-stalled" ? "near timeout" : "waiting for account cooldown";
+      if (id === "run-stalled") r.deadline_at = new Date(Date.now() + 60_000).toISOString();
+      r.progress = deriveMockProgress(r);
+    }
+  }
   const proposals = new Map<string, IssueProposal>();
   for (const p of mockProposals) proposals.set(p.id, { ...p });
   const boards = new Map<string, Board>();
@@ -199,6 +214,16 @@ function seed(): MockState {
         } : null,
       })),
     });
+  }
+  if (mockScenario() === "account-cooldown") {
+    for (const board of boards.values()) for (const card of board.cards) {
+      const r = card.latest_run && runs.get(card.latest_run.id);
+      if (!r?.account_cooldown_class || !card.latest_run) continue;
+      const projected = card.latest_run.is_mine ? r : foreignCooldownRun(r);
+      card.latest_run = { ...card.latest_run, health: projected.health, health_reason: null,
+        ...(card.latest_run.is_mine ? { account_cooldown_class: r.account_cooldown_class,
+          account_cooldown_eligible_at: r.account_cooldown_eligible_at } : {}) };
+    }
   }
   // Auth is instant/fake in mock mode: the session starts signed in as admin so
   // the whole app is browsable with zero steps. Logout still works (and any
@@ -306,6 +331,8 @@ const CARD_MIRRORED_FIELDS = [
   "deadline_at",
   // PRD #3454: the maintenance queue reason rides the card so the board badge agrees.
   "queue_reason",
+  "account_cooldown_class",
+  "account_cooldown_eligible_at",
   "codex_admission_class",
   "codex_admission_eligible_at",
   // PRD #1732 D14: the board projection sends hold_reason on every card, so a run parked
@@ -368,6 +395,13 @@ function syncCards(runId: string, patch: Partial<Run>): void {
         if (key in patch) (merged as Record<string, unknown>)[key] = patch[key];
       }
       if (!merged.is_mine) {
+        const run = state.runs.get(runId);
+        if (run) {
+          const projected = foreignCooldownRun(run);
+          merged.health = projected.health;
+        }
+        delete merged.account_cooldown_class;
+        delete merged.account_cooldown_eligible_at;
         delete merged.codex_admission_class;
         delete merged.codex_admission_eligible_at;
         if (merged.queue_reason !== "maintenance") delete merged.queue_reason;

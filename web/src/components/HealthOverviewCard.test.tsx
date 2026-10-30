@@ -35,6 +35,24 @@ function renderCard() {
 }
 
 describe("HealthOverviewCard", () => {
+  it("links a waiting run without dumping its full ID into the alert text", async () => {
+    const doc = ownerOnlyDoc();
+    const queue = doc.checks.find((c) => c.id === "queue.waiting")!;
+    queue.evidence = [Object.assign(
+      { label: "Waiting run", value: "Owner: Alex Example (22930000); waited 48m. This background run is no longer deprioritized, but has not yet been picked up." },
+      { run_id: ownerOnlyWaitingRunId, owner_id: ownerOnlyWaitingOwnerId },
+    )];
+    mockApi.getAdminHealth.mockResolvedValue(doc);
+    renderCard();
+    const card = await screen.findByRole("alert", { name: "System health" });
+    const item = within(card).getAllByRole("listitem").find((el) => el.textContent?.includes(queue.summary))!;
+    const link = within(item).getByRole("link", { name: "Run 22930000" });
+    expect(link.getAttribute("href")).toBe(`/runs/${ownerOnlyWaitingRunId}`);
+    expect(link.getAttribute("title")).toBe(`Run ${ownerOnlyWaitingRunId}`);
+    expect(within(item).getByTitle(`Owner ${ownerOnlyWaitingOwnerId}`).textContent).toBe(queue.evidence[0].value);
+    expect(item.textContent).not.toContain(ownerOnlyWaitingRunId);
+  });
+
   it("shows both Codex pricing reasons and operator docs as a nonblocking warning", async () => {
     const doc = healthySilentDoc();
     expect(doc.checks).toHaveLength(23);

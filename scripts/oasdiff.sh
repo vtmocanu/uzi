@@ -40,14 +40,14 @@ shift
 # Only these three hosts are pinned; any other host fails loudly rather than
 # skipping the check.
 # renovate-tarball: depName=oasdiff-darwin-all packageName=oasdiff/oasdiff
-OASDIFF_DARWIN_ALL_VERSION="v1.33.0"
-OASDIFF_DARWIN_ALL_SHA256="2a479337c15afdcbf0b1e89c0b4d0cf0176472dbc11483358fed1f831d1e46c5"
+OASDIFF_DARWIN_ALL_VERSION="v1.34.1"
+OASDIFF_DARWIN_ALL_SHA256="64948ba30c5555d3d15b95a7f3eda22fa83c15cf37fd4dad1720c0deb0a07cb5"
 # renovate-tarball: depName=oasdiff-linux-amd64 packageName=oasdiff/oasdiff
-OASDIFF_LINUX_AMD64_VERSION="v1.33.0"
-OASDIFF_LINUX_AMD64_SHA256="43a4e328e2d13ba1552d760aa68d2485c75c5621f309f6ff64ae895188345247"
+OASDIFF_LINUX_AMD64_VERSION="v1.34.1"
+OASDIFF_LINUX_AMD64_SHA256="75775f65b0adebd26a8e013af51a799342dfdc6262d89efa9e3b7bdf89657d90"
 # renovate-tarball: depName=oasdiff-linux-arm64 packageName=oasdiff/oasdiff
-OASDIFF_LINUX_ARM64_VERSION="v1.33.0"
-OASDIFF_LINUX_ARM64_SHA256="4ae3c362d6074d919aada2dea82d0ee84366591600384455d0bdc658ddf8f7ae"
+OASDIFF_LINUX_ARM64_VERSION="v1.34.1"
+OASDIFF_LINUX_ARM64_SHA256="e8f99bbf102a4b7f235104da72d0b9d67702e78622d1d4d37169e698ee90a249"
 
 if [ "$OASDIFF_DARWIN_ALL_VERSION" != "$OASDIFF_LINUX_AMD64_VERSION" ] \
   || [ "$OASDIFF_LINUX_AMD64_VERSION" != "$OASDIFF_LINUX_ARM64_VERSION" ]; then

@@ -1,3 +1,5 @@
+import { acquireCodexOperationScope } from "../src/codex-operation-scope.js";
+import { ProviderPolicyRefusal, admitPolicyTurn } from "../src/provider-policy-refusal.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -5,7 +7,7 @@ import path from "node:path";
 import { Outbox } from "../src/outbox.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { PolicyHoldRequest } from "../src/protocol.js";
-import { client, fx, git, fakeGitlab, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
+import { api, client, fx, git, fakeGitlab, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 import { WorkerClient } from "../src/client.js";
 import { FakeApi } from "./fake-api.js";
 import { nullLogger, noProofReseed } from "./helpers.js";
@@ -248,5 +250,76 @@ describe("policy admission on every production claim", () => {
     assert.deepEqual((await outbox.readTerminalJournal(claim.run_id, 1))?.body, original);
     assert.deepEqual((await outbox.readTerminalJournal(claim.run_id, 2))?.body, second);
   });
+
+  for (const delayed of [false, true]) for (const replace of [false, true])
+    it(`R1 ${delayed ? "delayed" : "immediate"} handoff removes only its own fallback (replacement=${replace})`, async t => {
+      api.setRegisterProtocolFeatures(["provider_policy_hold_v1", "claim_generation_fence", "codex_account_operation_admission_v1"]);
+      await client.register("policy-fixture", "base", 1, [], ["provider_policy_hold_v1"], undefined, 0);
+      let admissionLeases = 0;
+      const retain = client.retainCodexOperationFlight.bind(client);
+      t.mock.method(client, "retainCodexOperationFlight", (...args: Parameters<typeof retain>) => {
+        admissionLeases++;
+        const release = retain(...args);
+        return () => { admissionLeases--; release(); };
+      });
+      t.mock.method(client, "checkCodexOperationAdmission", async (...[_id, request]: Parameters<typeof client.checkCodexOperationAdmission>) => ({
+        decision: "admit" as const, operation_id: request.operation_id, claim_generation: request.claim_generation,
+      }));
+      const outbox = await pendingOutbox();
+      const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 10);
+      const claim = gitlabClaim(3710, { claim_generation: 3, plan_approved: true, plan_md: "approved",
+        secrets: { forge_pat: "fixture-pat", codex: { auth_mode: "subscription", access_token: "fixture-access" } } });
+      let fail = delayed;
+      const journal = outbox.journalPolicyHold.bind(outbox);
+      t.mock.method(outbox, "journalPolicyHold", async (...args: Parameters<typeof journal>) => {
+        if (fail) throw new Error("fixture metadata unavailable");
+        return journal(...args);
+      });
+      let replacement: symbol | undefined;
+      const mark = registry.markPolicyPendingOnly.bind(registry);
+      t.mock.method(registry, "markPolicyPendingOnly", (...args: Parameters<typeof mark>) => {
+        assert.ok(registry.setAccountCooldown(claim.run_id, 3,
+          { operation_id: "11111111-1111-4111-8111-111111111111", kind: "root" }, args[2]!));
+        const converted = mark(...args);
+        if (replace && !delayed) replacement = registry.add(claim.run_id, 3);
+        return converted;
+      });
+      let companion: ReturnType<typeof acquireCodexOperationScope> | undefined;
+      let permit: (() => boolean | void) | undefined;
+      client.reportPolicyHold = async (_id, body) => ({ disposition: "applied", outcome_id: body.outcome_id,
+        source_generation: body.source_generation, observed_status: "paused", observed_generation: 3,
+        hold_reason: "codex_policy_hold" });
+      const r = runnerWith(() => ({ executor: { run: async () => {
+        companion = acquireCodexOperationScope(client, claim.run_id, 3);
+        permit = await companion.prepare("root", new AbortController().signal, () => {});
+        assert.equal(permit(), true);
+        assert.equal(admissionLeases, 1, "the negotiated operation acquired a real admission lease");
+        throw new ProviderPolicyRefusal({ ...admitPolicyTurn("implement"), event: "provider_policy_refusal",
+          provider: "codex", category: "policy_refusal", origin: "root", policy_tag: "cyberPolicy" });
+      } } }), fakeGitlab().gitlab, undefined, nullLogger(), { outbox, activeRuns: registry });
+      try {
+        await r.execute(claim);
+        assert.ok(permit, "the flight reached the provider seam");
+        assert.throws(() => permit!(), /scope closed|owner closed/, "teardown closes operation authority even with a fallback");
+        companion!.close();
+        assert.equal(admissionLeases, 0, "a retained policy fallback keeps no admission lease after both operation users close");
+        if (delayed) {
+          assert.equal(registry.has(claim.run_id), false);
+          assert.equal(registry.size, 1);
+          assert.equal(registry.build().active.some(e => !e.terminal_pending || e.account_cooldown), false);
+          assert.equal(registry.build().pending_overflow, true);
+          if (replace) replacement = registry.add(claim.run_id, 3);
+          fail = false;
+          await r.retryPolicyHandoffs();
+          // The existing sweep can now settle the durable original.
+          await r.execute(claim);
+        }
+        assert.equal(outbox.listPendingTerminals()[0]?.server_settled, true);
+        assert.equal(registry.size, replace ? 1 : 0);
+        assert.equal(registry.has(claim.run_id), replace);
+        if (replacement) assert.ok(registry.setAccountCooldown(claim.run_id, 3,
+          { operation_id: "11111111-1111-4111-8111-111111111111", kind: "root" }, replacement));
+      } finally { companion?.close(); }
+    });
 
 });

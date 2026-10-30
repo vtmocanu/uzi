@@ -131,6 +131,10 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
   `.agents/skills/issue-triage/references/on-deck.md` (step 8).
 - **Skill or script PRs you open**: the buddy reviews the final draft, then add the
   `reviewed` label, so the user sees both agents agreed. Same with a local buddy.
+- **Superseded or CI-only PRs**: with the buddy's `APPROVE` of the close comment, close
+  the PR yourself (`gh pr close N --comment …`) and delete branches you created solely
+  for CI evidence, after preserving required CI results and confirming no unique work
+  is lost. Keep a branch whose commits are marked for reuse.
 - The buddy's `APPROVE` is required where this skill says so below. It never
   replaces a user approval.
 
@@ -181,6 +185,8 @@ changes it); trust it over a handover's claim.
 | `ready` | step 6 |
 | `merged` | step 7 |
 
+For `unknown`/exit 9 caused by `uzi run list` reporting "cannot reach", "no such host" or timeout, wait for network reachability in the background, then re-run the snapshot; never merge meanwhile.
+
 ## CI-fix branch ownership
 
 `takeover.sh` and `watch-pr.sh` print `CI_FIX_ACTIVE` and `CI_FIX_RECENT` for the exact
@@ -193,6 +199,7 @@ Before any local fix, push or rebase, refresh the snapshot. With an active ci_fi
 with the buddy: stay off the branch until it finishes, or `uzi run cancel ID -m 'REASON'`
 and wait for authoritative terminal state before fixing locally. Never both. Record
 `ci_fix waiting ID` or `ci_fix cancelled ID` with `S/trail.sh '#PR' 'STATE'`, then re-snapshot.
+For ci_fix triggered solely by a main-side breakage now fixed on main, agree with the buddy to cancel; confirm terminal state, unchanged branch head and no `preserved_patch`, then rebase. Preserve and review any delta instead.
 
 `CI_FIX_RECENT` triggers review of the pushed delta against the last reviewed SHA before
 merge, even with green CI. Require the same exact-head buddy review as a small local fix;
@@ -231,6 +238,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    `uzi-watcher`, check `uzi run recovery RUN` for committed work worth landing instead; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
    keep polling (`limit_wait` and `pool_wait` resume on their own; a `recovery_wait` may need an owner action, so read its cause; a `data_volume_full` park is counted and exits the poller 4), except `recovery_wait` with cause
    `worker_requeue_exhausted`, `retained_recovery_adoption_failed` (regardless of retry timing),
+   `worker_memory_pressure` (regardless of remaining interventions),
    or `retained_recovery_exhausted` with its retry stamp explicitly null: the poller
    stops on it (exit 0) because only the owner can Resume or Cancel; back up first (`uzi-watcher` recovery).
    Adoption failure means an integrity check refused adoption, with local work and custody
@@ -478,12 +486,14 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    writes the merge trail and releases the claim while preserving that trail through the
    post-merge CI watch — exit 9 if it is not merged yet). Do this
    BEFORE `reap`/`release`, or the trail is purged before it was ever written (#1510).
-7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --interval 60` in the background.
+7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --follow --interval 60` in the background.
    Pass the exact SHA from `merge.sh`; never hand-complete a prefix. The poller resolves it
    through GitHub and exits 3 before polling when it is invalid or unknown.
    Exit 0 green (a partial dispatch counts; confirm a gate fix another way), 1 red (use the
    per-job live-log commands it prints, then fix on a branch, never `main`; flake → rerun +
-   file), 3 no run appeared, 4 superseded → re-watch the current `main` head
+   file), 2 budget exhausted, 3 no run appeared or lookup failed. `--follow` prints each
+   `FOLLOW sha=OLD -> NEW` switch to the current branch head without resetting `--max-ticks`;
+   the final verdict covers the last watched SHA. Without it, 4 superseded → re-watch the current `main` head
    (references/merge-mechanics.md). Append the terminal result to the preserved trail
    (`main ci green`, `main ci red`, or `main ci superseded`) and print the whole line. Read
    the poller's own `EXIT=` line before reporting any of them (*Waiting, uniformly*).
@@ -494,6 +504,16 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    trail with `S/claims.sh release '#PR' --purge`, then run
    `S/claims.sh reap --repo OWNER/REPO` (drops merged/closed claims and orphans of dead
    sessions), and hand any still-open item on.
+
+   - Run `uzi run recovery RUN` after merge. An open `decision_needed` hold on a completed
+     run counts toward owner custody admission and pins its worker, including ephemeral workers.
+     When its checkpoint tip equals the merged PR's final reviewed head, or its patch range
+     is identical (`git range-diff` shows only `=`), verify captures and retained source contain
+     no additional work. Export each capture with `uzi run export RUN --capture ID --output FILE`,
+     run `git bundle verify FILE`, and fetch, bundle and verify the checkpoint ref before
+     `uzi run discard RUN --hold ID --yes`. The last hold's discard can delete the forge
+     checkpoint ref. Keep verified backups; hand any unavailable export or unproven source/capture
+     gap to `uzi-watcher` recovery instead of discarding.
 
    **The run's follow-ups.** A run's off-task bugs are uzi incidental findings, not forge
    issues; review notes the lead deferred are the PR description's `deferred` scope notes,

@@ -14,7 +14,8 @@
     "npm": ">=11.3.0"
   },
   "timezone": "Europe/Bucharest",
-  "schedule": ["* 0-6 * * *"],
+  "schedule": ["* 0-6 * * 6"],
+  "automergeSchedule": ["* 0-6 * * 6"],
   "updateNotScheduled": false,
   "prHourlyLimit": 5,
   "minimumReleaseAge": "7 days",
@@ -24,7 +25,8 @@
     "labels": ["dependencies", "renovate", "security"]
   },
   "lockFileMaintenance": {
-    "enabled": true
+    "enabled": true,
+    "schedule": ["* 0-6 * * 6"]
   },
   "devbox": {
     "enabled": false
@@ -116,7 +118,7 @@
     {
       "description": "Worker Go channel digests need matching lock metadata and image validation before merge; keep them independent of major/minor Go toolchain grouping.",
       "matchDepNames": ["worker-go-nixpkgs"],
-      "schedule": ["* 0-5 1 * *"],
+      "schedule": ["* 0-5 1-7 * 6"],
       "automerge": false,
       "minimumReleaseAgeBehaviour": "timestamp-optional",
       "prBodyNotes": ["This channel digest update requires maintainer lock repair: regenerate the Go package key, evaluate the pinned go_1_27 version and Linux store output with Nix, and update the lock metadata. The worker-toolchain repository guard and baked image version assertion deliberately keep this PR red until that work is complete."]
@@ -129,7 +131,27 @@
       "platformAutomerge": false
     },
     {
-      "description": "Agent runtime core: one reviewed Codex runtime upgrade PR, never automerged; every bump gets an adoption read of its release notes (uzi-lander references/renovate.md). Stable release timestamps share the repository's seven-day age and nightly schedule. Runtime probe/launcher parity deliberately blocks a lock-only bump until upgrade work is done.",
+      "description": "Go modules: one non-major PR per module (api, controller, supervisor, e2e stub). The go datasource excludes the go/toolchain directives (golang-version datasource), so the Go toolchain group below keeps its own unprefixed branch. Vulnerability alerts stay ungrouped (Renovate's vulnerabilityAlerts default groupName null). Majors stay separate.",
+      "matchManagers": ["gomod"],
+      "matchDatasources": ["go"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "Go modules (non-major)",
+      "additionalBranchPrefix": "{{parentDir}}-"
+    },
+    {
+      "description": "npm lint tooling: knip and oxlint touch the same agent/web package.json and lockfiles, so separate PRs conflict with each other after the first merge.",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["knip", "oxlint"],
+      "groupName": "npm lint tooling"
+    },
+    {
+      "description": "oasdiff is pinned four times (Taskfile version plus three platform archives in scripts/oasdiff.sh); scripts/oasdiff.test.sh requires them equal, so single-pin PRs can never go green. Distinct depName aliases share packageName oasdiff/oasdiff.",
+      "matchPackageNames": ["oasdiff/oasdiff"],
+      "groupName": "oasdiff",
+      "separateMajorMinor": false
+    },
+    {
+      "description": "Agent runtime core: one reviewed Codex runtime upgrade PR, never automerged; every bump gets an adoption read of its release notes (uzi-lander references/renovate.md). Stable release timestamps share the repository's seven-day age and weekly schedule. Runtime probe/launcher parity deliberately blocks a lock-only bump until upgrade work is done.",
       "matchPackageNames": ["openai/codex"],
       "groupName": "Codex runtime",
       "separateMajorMinor": false,

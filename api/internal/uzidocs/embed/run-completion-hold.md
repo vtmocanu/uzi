@@ -428,12 +428,29 @@ with authoritative scope restrictions and stores `runs.source_publication_intent
 atomically with successful issue completion. This also supports legacy
 (non-interlocked) issue runs; the stamp is independent of recovery inventory
 and completion-permit negotiation. There is no pre-push stamp writer.
-A rejected or rolled-back initial completion creates no stamp: absent
-other affirmative evidence, a later refresh is unknown, even if the push succeeded.
-A lost commit acknowledgement can leave completion and the stamp durable;
-exact terminal replay validates that paired outcome. Historical affirmative
-non-closing evidence can restrict a refresh without a stamp; missing evidence
-cannot establish closing authority. Historical publications are not backfilled.
+A rejected or rolled-back initial completion creates no stamp and leaves the
+source non-completed; absent affirmative restriction evidence its refresh is
+unknown and refuses, even if the push succeeded. A lost commit acknowledgement can leave completion and the stamp
+durable; exact terminal replay validates that paired outcome. Historical
+affirmative non-closing evidence can restrict a refresh without a stamp;
+missing evidence never establishes closing authority. Historical publications
+are not backfilled.
+
+A completed issue source with no stamp and no restriction, whose identity,
+ancestry and contract authority validate, refreshes as non-closing (#3420).
+This covers sources completed before the upgrade, by an old worker during a
+mixed rollout, or by any writer that completes without a stamp; age is never
+inferred from a null stamp. Unrestricted failed, running or cancelled sources,
+and invalid or unresolved authority without affirmative restriction evidence,
+still refuse. The non-closing commit scan
+below still applies, so an old PR whose branch commits close the issue is
+refused even on a no-change rework; the owner must remediate those commits.
+A refresh does not add or strip a `Closes #N` already in pull/merge request
+body text outside uzi's owned region, so merging can still close the issue.
+A refusal reads `refresh publication refused: source context could not be
+confirmed (<reason>) for candidate <sha>; publication stopped`; transport,
+malformed, unrecognized-reason and identity-change failures omit the
+parenthetical.
 
 The worker resolves again for the exact candidate before each push attempt,
 including retries, alignment and bridge candidates. Source identity must

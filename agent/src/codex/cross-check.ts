@@ -1,3 +1,4 @@
+import { acquireCodexOperationScope } from "../codex-operation-scope.js";
 // Dedicated one-turn checker lifecycle. It never enters CodexExecutor's lead loop.
 import { CODE_COVERAGE_LIMITS } from "../code-cross-check-coverage.js";
 import type { ActivityOp, CheckActivityRecorder } from "../cross-check-activity.js";
@@ -22,7 +23,8 @@ import { CodexUsageAccountant } from "./token-accounting.js";
 import { launchCodexRoot, launchCodexEffectRoot, CODEX_BIN, SUPERVISOR_BIN, PROVIDER_CHILD_ARGV, type CodexRootHandle } from "./launcher.js";
 import { prepareCodexRunHome, buildAppServerRefreshBridge } from "./codex-executor.js";
 
-type CrossCheckMalformedSubreason = "invalid_json" | "verdict_schema" | "finding_schema" | "findings_cap" | "code_findings" | "result_cap" | "unknown";
+type CrossCheckMalformedSubreason = "invalid_json" | "verdict_schema" | "finding_schema" | "findings_cap" | "code_findings" | "result_cap" | "unknown"
+ | "foreign_item" | "delta_after_completion" | "invalid_item_identity" | "stream_cap" | "completion_invalid" | "stream_mismatch";
 
 export class CrossCheckMalformedError extends Error {
  constructor(message: string, readonly subreason?: CrossCheckMalformedSubreason) {
@@ -175,6 +177,10 @@ function settleActivity(activity: CheckActivityRecorder, callId: string, kind: A
   if (result.ok) {
    const out = object(result.output);
    if (kind === "read") {
+    if (out?.incomplete === true) {
+     activity.settle(callId, { outcome: "limit" });
+     return;
+    }
     const lines = positiveSafeInt(out?.offset) && positiveSafeInt(out?.linesReturned) && out?.replay !== true
      ? [out.offset, out.offset + out.linesReturned - 1] as const : undefined;
     activity.settle(callId, lines ? { outcome: "ok", lines } : { outcome: "ok" });
@@ -257,7 +263,7 @@ export interface CrossCheckModelDeps {
 }
 
 export class CodexCrossCheck {
- constructor(private readonly client: Pick<WorkerClient, "releaseCodex" | "refreshCodex"> & Partial<Pick<WorkerClient, "codexAdmissionReporter">>, private readonly log: Logger, private readonly deps: CrossCheckModelDeps = {}) {}
+ constructor(private readonly client: Pick<WorkerClient, "releaseCodex" | "refreshCodex"> & Partial<Pick<WorkerClient, "codexAdmissionReporter" | "hasFeature" | "codexOperationNegotiation" | "checkCodexOperationAdmission" | "retainCodexOperationFlight">>, private readonly log: Logger, private readonly deps: CrossCheckModelDeps = {}) {}
 
  async run(claim: ClaimResponse, checkout: string, home: string, signal: AbortSignal,
   postUsage: (payload: Record<string, unknown>) => Promise<void>, confirmNativeCleanup?: () => void,
@@ -292,6 +298,8 @@ export class CodexCrossCheck {
   let succeeded = false;
   let completedText: string | undefined;
   let failure: { error: unknown } | undefined;
+  const operation = binding.authMode === "subscription"
+   ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log) : undefined;
   const failedRoot = new AbortController();
   signal = AbortSignal.any([signal, failedRoot.signal]);
   const stopAdmission = (): void => {
@@ -397,6 +405,11 @@ export class CodexCrossCheck {
    accountant.registerThread(threadId, model, false);
    await postUsage({ event: "init", model, harness: "codex" });
    usageInit = true;
+   let permit: (() => boolean | void) | undefined;
+   do {
+    permit = await operation?.prepare("checker", signal, () => signal.throwIfAborted());
+    signal.throwIfAborted();
+   } while (permit?.() === false);
    startingTurn = true;
    const admissionAttempt = this.client.codexAdmissionReporter?.(claim.run_id, claim.claim_generation)?.begin(threadId);
    const turn = await startupRequest<{ turn?: { id?: string } }>("turn/start", {
@@ -448,29 +461,29 @@ export class CodexCrossCheck {
      }
      throw new Error("cross-check model error");
     } else if (note.method === "item/agentMessage/delta") {
-     if (!bound) throw new CrossCheckMalformedError("cross-check foreign assistant delta");
-     if (verdictText !== undefined) throw new CrossCheckMalformedError("cross-check assistant delta after completion");
+     if (!bound) throw new CrossCheckMalformedError("cross-check foreign assistant delta", "foreign_item");
+     if (verdictText !== undefined) throw new CrossCheckMalformedError("cross-check assistant delta after completion", "delta_after_completion");
      if (typeof params?.itemId !== "string" || !params.itemId
       || (assistantItemId !== undefined && assistantItemId !== params.itemId)) {
-      throw new CrossCheckMalformedError("cross-check requires one assistant item");
+      throw new CrossCheckMalformedError("cross-check requires one assistant item", "invalid_item_identity");
      }
      assistantItemId = params.itemId;
-     if (typeof params?.delta !== "string" || Buffer.byteLength(params.delta) > verdictLimit - textBytes) throw new CrossCheckMalformedError("cross-check verdict text budget exceeded");
+     if (typeof params?.delta !== "string" || Buffer.byteLength(params.delta) > verdictLimit - textBytes) throw new CrossCheckMalformedError("cross-check verdict text budget exceeded", "stream_cap");
      textBytes += Buffer.byteLength(params.delta);
      streamedText += params.delta;
     } else if (note.method === "item/completed") {
      const item = object(params?.item);
      if (item?.type === "agentMessage") {
-      if (!bound) throw new CrossCheckMalformedError("cross-check foreign assistant completion");
+      if (!bound) throw new CrossCheckMalformedError("cross-check foreign assistant completion", "foreign_item");
       if (typeof item.id !== "string" || !item.id
        || (assistantItemId !== undefined && assistantItemId !== item.id)) {
-       throw new CrossCheckMalformedError("cross-check requires one assistant item");
+       throw new CrossCheckMalformedError("cross-check requires one assistant item", "invalid_item_identity");
       }
       assistantItemId = item.id;
       if (typeof item.text !== "string" || Buffer.byteLength(item.text) > verdictLimit || verdictText !== undefined) {
-       throw new CrossCheckMalformedError("cross-check requires one bounded complete verdict");
+       throw new CrossCheckMalformedError("cross-check requires one bounded complete verdict", "completion_invalid");
       }
-      if (streamedText && streamedText !== item.text) throw new CrossCheckMalformedError("cross-check streamed verdict disagrees with completion");
+      if (streamedText && streamedText !== item.text) throw new CrossCheckMalformedError("cross-check streamed verdict disagrees with completion", "stream_mismatch");
       verdictText = item.text;
      }
     } else if (note.kind === "turn_completed") {
@@ -498,6 +511,7 @@ export class CodexCrossCheck {
   } catch (error) {
    failure = { error };
   } finally {
+   operation?.close();
    signal.removeEventListener("abort", stopAdmission);
    auth?.closeAdmissionAndCancel();
    try { await transport?.close(); } catch { cleanupOK = false; }

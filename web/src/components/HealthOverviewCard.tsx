@@ -15,6 +15,7 @@ import { formatAgo } from "../lib/rateLimits";
 import { useHealthStatus } from "../lib/useAdminHealth";
 import { SeverityBadge } from "./healthSeverity";
 import { DocLink } from "./DocLink";
+import { HealthEvidenceLabel, HealthEvidenceValue } from "./HealthEvidenceLabel";
 import { cx } from "./ui";
 
 // "for 38m" from an RFC3339 `since`, or empty when the check carries none. Static (no live
@@ -92,8 +93,8 @@ export function HealthOverviewCard() {
               <span className="text-muted">{c.summary}</span>
               {c.evidence.map((e, i) => (
                 <span key={i} className="block break-words text-xs text-muted">
-                  <span className="font-medium">{e.label}:</span>{" "}
-                  {e.value}
+                  <span className="font-medium"><HealthEvidenceLabel evidence={e} />:</span>{" "}
+                  <HealthEvidenceValue evidence={e} />
                 </span>
               ))}
               {c.doc && (

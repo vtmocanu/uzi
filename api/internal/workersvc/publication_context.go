@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -127,40 +128,43 @@ func (a publicationAuthority) restriction() (bool, error) {
 
 // Each ancestry is at most 16 edges. A bad sibling refuses the complete answer;
 // no newest-row heuristic can hide ambiguity or an unresolved association.
-func resolvePublicationSnapshot(s publicationSnapshot, w store.Worker, id uuid.UUID, req PublicationContextRequest) PublicationContextResponse {
+//
+// The bool reports compatibility-fallback provenance (an unstamped completed source resolved
+// conservatively as non_closing); it is never serialized.
+func resolvePublicationSnapshot(s publicationSnapshot, w store.Worker, id uuid.UUID, req PublicationContextRequest) (PublicationContextResponse, bool) {
 	if !publicationLive(s.Request, w, id, req) {
-		return publicationUnknown("claim_changed")
+		return publicationUnknown("claim_changed"), false
 	}
 	if s.AncestryUnknown {
-		return publicationUnknown("ancestry_unknown")
+		return publicationUnknown("ancestry_unknown"), false
 	}
 	if s.ConnectionID == nil || !publicationSafeID(s.ProjectID) || s.CIMRConflict || s.AssociationUnknown {
-		return publicationUnknown("association_unknown")
+		return publicationUnknown("association_unknown"), false
 	}
 	seeds := map[uuid.UUID]bool{}
 	nodes := map[uuid.UUID]publicationAuthority{}
 	for _, n := range s.Nodes {
 		seeds[n.Seed] = true
 		if n.Cycle || n.Depth >= 16 {
-			return publicationUnknown("ancestry_unknown")
+			return publicationUnknown("ancestry_unknown"), false
 		}
 		a := n.Run
 		if a.UserID != w.UserID || a.RepoID == nil || *a.RepoID != *s.Request.RepoID ||
 			a.MRIID == nil || !publicationSafeID(*a.MRIID) {
-			return publicationUnknown("association_unknown")
+			return publicationUnknown("association_unknown"), false
 		}
 		if a.Kind == "mr_rework" {
 			if a.PipelineRef == nil || *a.PipelineRef != req.Branch || (a.Branch != nil && *a.Branch != req.Branch) ||
 				a.TargetRunID == nil || n.Depth == 15 {
-				return publicationUnknown("ancestry_unknown")
+				return publicationUnknown("ancestry_unknown"), false
 			}
 		} else if a.Branch == nil || *a.Branch != req.Branch {
-			return publicationUnknown("association_unknown")
+			return publicationUnknown("association_unknown"), false
 		}
 		nodes[a.ID] = a
 	}
 	if len(seeds) == 0 {
-		return publicationUnknown("association_unknown")
+		return publicationUnknown("association_unknown"), false
 	}
 	roots := map[uuid.UUID]publicationAuthority{}
 	for seed := range seeds {
@@ -169,7 +173,7 @@ func resolvePublicationSnapshot(s publicationSnapshot, w store.Worker, id uuid.U
 		for hop := 0; ; hop++ {
 			a, ok := nodes[current]
 			if !ok || seen[current] || hop >= 16 {
-				return publicationUnknown("ancestry_unknown")
+				return publicationUnknown("ancestry_unknown"), false
 			}
 			seen[current] = true
 			if a.Kind != "mr_rework" {
@@ -178,20 +182,20 @@ func resolvePublicationSnapshot(s publicationSnapshot, w store.Worker, id uuid.U
 			}
 			child, ok := nodes[*a.TargetRunID]
 			if !ok || *child.MRIID != *a.MRIID {
-				return publicationUnknown("association_unknown")
+				return publicationUnknown("association_unknown"), false
 			}
 			current = *a.TargetRunID
 		}
 	}
 	if len(roots) != 1 {
-		return publicationUnknown("ambiguous_source")
+		return publicationUnknown("ambiguous_source"), false
 	}
 	var source publicationAuthority
 	for _, a := range roots {
 		source = a
 	}
 	if s.Request.MRIID != nil && *s.Request.MRIID != *source.MRIID {
-		return publicationUnknown("association_unknown")
+		return publicationUnknown("association_unknown"), false
 	}
 	binding := &PublicationContextBinding{RunID: id, ClaimGeneration: req.ClaimGeneration, Branch: req.Branch,
 		CandidateHead: req.CandidateHead, MRIID: *source.MRIID, SourceRunID: source.ID, IssueIID: source.IssueIID}
@@ -200,16 +204,17 @@ func resolvePublicationSnapshot(s publicationSnapshot, w store.Worker, id uuid.U
 		// A self-improvement run carries its tracking issue, which it never closes; the wire
 		// contract sends no source issue for a not-applicable source.
 		binding.IssueIID = nil
-		return PublicationContextResponse{Version: 1, Status: "not_applicable", Binding: binding}
+		return PublicationContextResponse{Version: 1, Status: "not_applicable", Binding: binding}, false
 	}
 	if source.Kind != "issue" || source.IssueIID == nil || !publicationSafeID(*source.IssueIID) || source.ReportOnly {
-		return publicationUnknown("source_unknown")
+		return publicationUnknown("source_unknown"), false
 	}
+	fallback := false
 	restricted, err := source.restriction()
 	// Positive restrictions remain evidence on failed/noncompleted historical sources.
 	// Invalid required contract authority never establishes closing.
 	if err != nil && !restricted {
-		return publicationUnknown("authority_unknown")
+		return publicationUnknown("authority_unknown"), false
 	}
 	if len(rawPublicationValue(source.Stamp)) > 0 {
 		var stamp SourcePublicationIntent
@@ -219,23 +224,30 @@ func resolvePublicationSnapshot(s publicationSnapshot, w store.Worker, id uuid.U
 			stamp.Branch != req.Branch || stamp.MRIID != *source.MRIID || !isSettleSHA(stamp.PublishedHead) ||
 			(stamp.Intent != "closing" && stamp.Intent != "non_closing") || (stamp.ReportedNonClosing && stamp.Intent != "non_closing") ||
 			source.Status != "completed" {
-			return publicationUnknown("authority_unknown")
+			return publicationUnknown("authority_unknown"), false
 		}
 		binding.SourcePublication = &stamp
 		if stamp.Intent == "non_closing" {
 			restricted = true
 		}
 		if !restricted && err != nil {
-			return publicationUnknown("authority_unknown")
+			return publicationUnknown("authority_unknown"), false
 		}
 	} else if !restricted {
-		return publicationUnknown("publication_unproven")
+		// Missing proof never establishes closing. A completed source whose identity and
+		// authority validated above refreshes conservatively as non_closing; no age is
+		// inferred from the null stamp. Any other unstamped source stays unproven.
+		if source.Status != "completed" || err != nil {
+			return publicationUnknown("publication_unproven"), false
+		}
+		restricted = true
+		fallback = true
 	}
 	binding.Intent = "closing"
 	if restricted {
 		binding.Intent = "non_closing"
 	}
-	return PublicationContextResponse{Version: 1, Status: "resolved", Binding: binding}
+	return PublicationContextResponse{Version: 1, Status: "resolved", Binding: binding}, fallback
 }
 
 type publicationSnapshotReader interface {
@@ -267,7 +279,7 @@ func (s *Service) ResolvePublicationContext(ctx context.Context, w store.Worker,
 	if json.Unmarshal(before, &snapshot) != nil {
 		return publicationUnknown("authority_unknown")
 	}
-	answer := resolvePublicationSnapshot(snapshot, w, id, req)
+	answer, fallback := resolvePublicationSnapshot(snapshot, w, id, req)
 	if answer.Binding == nil {
 		return answer
 	}
@@ -303,6 +315,10 @@ func (s *Service) ResolvePublicationContext(ctx context.Context, w store.Worker,
 	after, err := qt.PublicationContextSnapshot(txCtx, params)
 	if err != nil || !bytes.Equal(before, after) {
 		return publicationUnknown("authority_changed")
+	}
+	if fallback {
+		slog.Info("publication context: unstamped completed source resolved non-closing", "event", "publication_context_unstamped_fallback",
+			"reason", "completed_unstamped", "run", id.String(), "source_run", answer.Binding.SourceRunID.String())
 	}
 	// This successful read grants no lease; claim loss after this point remains a race.
 	return answer

@@ -17,7 +17,48 @@ import (
 
 type ctxKey int
 
-const userKey ctxKey = iota
+const (
+	userKey ctxKey = iota
+	claimsKey
+)
+
+// BrowserAuthHook observes an authenticated cookie request before rolling refresh.
+// It must enforce auth.ValidateCSRFToken before any browser-slot access. It cannot
+// fail authentication or write a status or body; its only permitted response effect
+// is a Set-Cookie header on w (clearing a credential the server definitively
+// rejected), which every response then carries. Claims are an incoming
+// snapshot; changing them does not change the authenticated context or refresh.
+// Multiple hooks run serially, once each, in registration order; each must bound
+// its own work and handle failures internally so subsequent hooks can proceed.
+type BrowserAuthHook func(http.ResponseWriter, *http.Request, store.User, *auth.Claims)
+
+// ClaimsFromContext returns incoming authenticated cookie claims, never refreshed
+// outgoing claims. Bearer authentication does not populate this value.
+func ClaimsFromContext(ctx context.Context) (*auth.Claims, bool) {
+	claims, ok := ctx.Value(claimsKey).(*auth.Claims)
+	if !ok {
+		return nil, false
+	}
+	return copyClaims(claims), true
+}
+
+func copyClaims(claims *auth.Claims) *auth.Claims {
+	copy := *claims
+	if claims.ExpiresAt != nil {
+		date := *claims.ExpiresAt
+		copy.ExpiresAt = &date
+	}
+	if claims.IssuedAt != nil {
+		date := *claims.IssuedAt
+		copy.IssuedAt = &date
+	}
+	if claims.NotBefore != nil {
+		date := *claims.NotBefore
+		copy.NotBefore = &date
+	}
+	copy.Audience = append(copy.Audience[:0:0], claims.Audience...)
+	return &copy
+}
 
 // passiveHeader marks a request as a passive poll — the hidden-tab favicon poll
 // (#331) — which authenticates normally but must not slide the session forward
@@ -76,7 +117,7 @@ func authLookupFailed(w http.ResponseWriter, r *http.Request, err error, rejectM
 //     never expire mid-use — EXCEPT for passive requests (X-Uzi-Passive: 1),
 //     which authenticate normally but are exempt from the refresh so an idle
 //     backgrounded tab's poll cannot keep the session alive forever.
-func RequireAuth(q SessionStore, cfg config.Config) func(http.Handler) http.Handler {
+func RequireAuth(q SessionStore, cfg config.Config, hooks ...BrowserAuthHook) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cookie, err := r.Cookie(auth.AuthCookieName)
@@ -116,10 +157,16 @@ func RequireAuth(q SessionStore, cfg config.Config) func(http.Handler) http.Hand
 				return
 			}
 
-			rollingRefresh(w, r, claims, user.TokenVersion, cfg)
-
 			ctx := ContextWithUser(r.Context(), user)
-			next.ServeHTTP(w, r.WithContext(ctx))
+			ctx = context.WithValue(ctx, claimsKey, claims)
+			r = r.WithContext(ctx)
+			for _, hook := range hooks {
+				if hook != nil {
+					hook(w, r, user, copyClaims(claims))
+				}
+			}
+			rollingRefresh(w, r, claims, user.TokenVersion, cfg)
+			next.ServeHTTP(w, r)
 		})
 	}
 }
@@ -140,7 +187,7 @@ func rollingRefresh(w http.ResponseWriter, r *http.Request, claims *auth.Claims,
 		return
 	}
 	if shouldRefresh(claims, cfg.AuthTokenTTL) {
-		if token, err := auth.IssueToken(cfg.JWTSecret, claims.UserID, tokenVersion, cfg.AuthTokenTTL); err == nil {
+		if token, _, err := auth.PrepareToken(cfg.JWTSecret, claims.UserID, tokenVersion, cfg.AuthTokenTTL, claims.BrowserSlotID); err == nil {
 			if err := auth.SetAuthCookies(w, token, auth.CookieOptions{Secure: cfg.CookieSecure, TTL: cfg.AuthTokenTTL}); err != nil {
 				slog.Warn("rolling refresh: set cookies", "error", err)
 			}

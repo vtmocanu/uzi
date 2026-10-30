@@ -366,7 +366,7 @@ func crewStateFor(runStatus string, isRevising bool, runHealth, actor, activeAct
 	// limit_wait/pool_wait: a park routinely outlasts the recency window (so the split
 	// below would wrongly read `idle`), and health cannot be revisited on a parked run, so
 	// the active-speaker rung would read a FROZEN flag as `stalled`.
-	if (runStatus == "awaiting_approval" && !isRevising) || runStatus == "awaiting_input" || runStatus == "awaiting_followup" || runStatus == statusLimitWait || runStatus == statusPoolWait || runStatus == statusRecoveryWait || runHealth == "waiting_worker" {
+	if (runStatus == "awaiting_approval" && !isRevising) || runStatus == "awaiting_input" || runStatus == "awaiting_followup" || runStatus == statusLimitWait || runStatus == statusPoolWait || runStatus == statusRecoveryWait || runHealth == "waiting_worker" || runHealth == "waiting_account_cooldown" {
 		return crewWaiting
 	}
 	if activeActor != "" && actor == activeActor {

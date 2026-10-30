@@ -4,12 +4,13 @@
 // table (moved to Settings), which told a new user nothing about what to do
 // next.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, type AdminUsage, type RunSummaryItem, type RunStatus, type SelfUsage, type Worker } from "../lib/api";
 import { hasAnthropicToken } from "../lib/hasToken";
 import {
+  isAccountCooldownWaiting,
   effectiveRunStatus,
   firstInProgressMilestoneId,
   milestoneBadge,
@@ -202,9 +203,15 @@ export function Dashboard() {
   // rarely and stay mount-only. A poll failure keeps the last-good data — unlike
   // the first load, a transient re-poll error must NOT blank the page back to
   // skeletons.
+  const pollAliveRef = useRef(false);
+  useEffect(() => {
+    pollAliveRef.current = true;
+    return () => { pollAliveRef.current = false; };
+  }, []);
   const poll = useCallback(async () => {
     try {
       const [{ runs }, { workers }] = await Promise.all([api.listRuns({ view: "summary" }), api.listWorkers()]);
+      if (!pollAliveRef.current) return;
       setData((prev) =>
         prev
           ? {
@@ -246,7 +253,7 @@ export function Dashboard() {
   const active = data?.runs.filter((r) => !isTerminalRun(r.status)) ?? [];
   const activeCounts = { running: 0, needsYou: 0, queued: 0, waiting: 0 };
   for (const run of active) {
-    const bucket = activeRunBuckets[run.status];
+    const bucket = isAccountCooldownWaiting(run) ? "waiting" : activeRunBuckets[run.status];
     if (bucket) activeCounts[bucket]++;
   }
   // PRD #1349 M6 (D8/D10): recovery_wait_count, derived CLIENT-SIDE from the runs the
@@ -439,6 +446,7 @@ export function Dashboard() {
               // states must not turn that history into a pulsing live-work indicator.
               const showNow =
                 activity != null &&
+                !isAccountCooldownWaiting(r) &&
                 !isTerminalRun(r.status) &&
                 r.status !== "paused" &&
                 r.status !== "limit_wait" &&
@@ -546,7 +554,7 @@ export function Dashboard() {
                     ) : (
                       <RunHealthBadge run={r} nowMs={now} />
                     )}
-                    <StatusPill status={effectiveRunStatus(r)} progress={r.progress} />
+                    <StatusPill health={r.health} status={effectiveRunStatus(r)} progress={r.progress} />
                   </div>
                 </div>
               </li>

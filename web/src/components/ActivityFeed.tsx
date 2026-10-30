@@ -1,3 +1,4 @@
+import { accountCooldownText } from "../lib/runBadge";
 import { isAccountingStatus, isProgressNote, isSummaryUsage } from "../lib/accountingStatus";
 import { planCheckEventText } from "./PlanCrossCheck";
 import type { PlanCrossCheckSummary } from "../lib/apiTypes";
@@ -277,9 +278,11 @@ function crewStateFor(
     // working, and aging them to `idle` would read as a dead run rather than a parked one.
     run.status === "limit_wait" ||
     run.status === "pool_wait" ||
-    run.health === "waiting_worker"
+    run.health === "waiting_worker" ||
+    !!accountCooldownText(run, now)
   )
     return "waiting";
+  if (run.health === "waiting_account_cooldown") return "idle";
   if (actor === activeActor) {
     return STALLED_HEALTH.has(run.health) ? "stalled" : "working";
   }

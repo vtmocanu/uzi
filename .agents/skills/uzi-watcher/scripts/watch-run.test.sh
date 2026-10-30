@@ -29,8 +29,9 @@ case "$*" in
       --arg c "$(cat "$WORK/cause" 2>/dev/null || true)" \
       --arg rn "$(cat "$WORK/retry" 2>/dev/null || true)" \
       --arg hr "$(cat "$WORK/hold" 2>/dev/null || true)" \
+      --arg mh "$(cat "$WORK/memory" 2>/dev/null || echo OMIT)" \
       --arg dp "$(pollfile parks 2>/dev/null || true)" \
-      '{status:"running",hold_reason:(if $hr=="" then null else $hr end),recovery_wait_cause:(if $c=="" then null else $c end),recovery_retry_not_before:(if $rn=="" then null elif $rn=="EMPTY" then "" elif $rn=="FALSE" then false else $rn end),disk_park_count:(if $dp=="" then null else ($dp|tonumber) end),health:$h,health_reason:(if $h=="stalled" then "no progress 20m" else null end),health_since:(if $h=="ok" then null else ($since|if .=="" then null else . end) end),worker_id:(if $w=="" then null else $w end)} | if $rn=="OMIT" then del(.recovery_retry_not_before) else . end'
+      '{status:"running",hold_reason:(if $hr=="" then null else $hr end),recovery_wait_cause:(if $c=="" then null else $c end),recovery_retry_not_before:(if $rn=="" then null elif $rn=="EMPTY" then "" elif $rn=="FALSE" then false else $rn end),disk_park_count:(if $dp=="" then null else ($dp|tonumber) end),health:$h,health_reason:(if $h=="stalled" then "no progress 20m" else null end),health_since:(if $h=="ok" then null else ($since|if .=="" then null else . end) end),worker_id:(if $w=="" then null else $w end)} | (if $rn=="OMIT" then del(.recovery_retry_not_before) else . end) | if $mh=="OMIT" then . else .memory_hold=($mh|fromjson) end'
     mv "$WORK/poll.next" "$WORK/poll" ;;
   "worker list --json") cat "$WORK/workers" ;;
   "run logs "*" --json") [ -f "$WORK/logs" ] || exit 1; cat "$WORK/logs" ;;
@@ -40,7 +41,7 @@ STUB
 chmod +x "$WORK/bin/uzi"
 
 # scenario NAME STATUSES HEALTHS WORKER_ID WORKERS_JSON
-reset() { rm -f "$WORK/since" "$WORK/cause" "$WORK/retry" "$WORK/hold" "$WORK/logs"; : > "$WORK/parks"; printf '%s\n' "$1" > "$WORK/status"; printf '%s\n' "$2" > "$WORK/health"; printf '%s' "$3" > "$WORK/worker_id"; printf '%s\n' "$4" > "$WORK/workers"; rm -f "$WORK/poll" "$WORK/poll.next"; echo 0 > "$WORK/poll"; }
+reset() { rm -f "$WORK/since" "$WORK/cause" "$WORK/retry" "$WORK/hold" "$WORK/logs" "$WORK/memory"; : > "$WORK/parks"; printf '%s\n' "$1" > "$WORK/status"; printf '%s\n' "$2" > "$WORK/health"; printf '%s' "$3" > "$WORK/worker_id"; printf '%s\n' "$4" > "$WORK/workers"; rm -f "$WORK/poll" "$WORK/poll.next"; echo 0 > "$WORK/poll"; }
 run() { PATH="$WORK/bin:$PATH" bash "$SCRIPT" rid completed,failed,cancelled 0 "${1:-6}" 2>/dev/null; }
 fresh=$(date -u +%Y-%m-%dT%H:%M:%S.123456Z)
 old=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-1H +%Y-%m-%dT%H:%M:%SZ)
@@ -197,6 +198,32 @@ for v in NULL 2099-01-02T03:04:05Z OMIT FALSE; do
   case "$out" in *"STOP=recovery_wait:retained_recovery_adoption_failed"*"owner decision"*"integrity check refused adoption"*"local work and custody preserved"*"no automatic retry"*"RESULT=stop:recovery_wait") ;; *) fail "adoption guidance missing: $out";; esac
   [ "$(cat "$WORK/poll")" -eq 1 ] || fail "adoption hold polled again"
 done
+
+# Every memory-pressure park requires an owner decision, regardless of remaining
+# interventions or DTO shape, attention checks, or whether recovery_wait is in the stop set.
+for memory in '{"used":3,"max":3,"remaining":0}' '{"used":2,"max":3,"remaining":1}' OMIT null false '"bad"' '[]' '{}' \
+  '{"remaining":null}' '{"remaining":"1"}' '{"remaining":true}' '{"remaining":-1}' '{"remaining":0.5}'; do
+  reset recovery_wait ok "" '[]'
+  echo worker_memory_pressure > "$WORK/cause"
+  printf '%s\n' "$memory" > "$WORK/memory"
+  rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
+  [ "$rc" -eq 0 ] || fail "owner-held memory park ($memory): want exit 0, got $rc: $out"
+  case "$out" in *"STOP=recovery_wait:worker_memory_pressure"*"back up"*"owner"*"resume or cancel"*"RESULT=stop:recovery_wait") ;; *) fail "memory owner guidance missing ($memory): $out";; esac
+done
+
+# Transition detection and explicit stop sets retain the cause-specific guidance.
+reset "$(printf 'running\nrecovery_wait')" ok "" '[]'
+echo worker_memory_pressure > "$WORK/cause"
+echo '{"used":3,"max":3,"remaining":0}' > "$WORK/memory"
+rc=0; out=$(run) || rc=$?
+[ "$rc" -eq 0 ] || fail "memory park after running: want exit 0, got $rc: $out"
+case "$out" in *"status=recovery_wait"*"STOP=recovery_wait:worker_memory_pressure"*) ;; *) fail "memory transition missing: $out";; esac
+reset recovery_wait ok "" '[]'
+echo worker_memory_pressure > "$WORK/cause"
+echo '{"remaining":0}' > "$WORK/memory"
+rc=0; out=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" rid completed,recovery_wait 0 2) || rc=$?
+[ "$rc" -eq 0 ] || fail "explicit memory stop: want exit 0, got $rc: $out"
+case "$out" in *"STOP=recovery_wait:worker_memory_pressure"*"resume or cancel"*) ;; *) fail "explicit memory stop lost guidance: $out";; esac
 
 # 13. any other recovery_wait cause keeps its existing behaviour: keep polling to ELAPSED
 reset recovery_wait ok "" '[]'

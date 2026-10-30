@@ -1810,6 +1810,56 @@ describe("issue #3404 M2 U3: a retained predecessor is admitted before its captu
     assert.equal((await slotOf(previous, pred.clonePath))?.state, "active", "the foreign epoch is untouched");
   });
 
+  for (const pending of [false, true]) it(`issue #3638: a held predecessor consumes no recovery budget across requeues (pending footprint: ${pending})`, async (t) => {
+    const iid = pending ? 2904 : 2903;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const before = treeHash(pred.clonePath);
+    const { current } = await runtimes();
+    // The earlier flight of the same process admitted the path and never reached a confirmed end.
+    const earlier = new Set<string>();
+    await current.recordAdmissions(earlier, () => current.bindSource(pred.clonePath));
+    current.retireSink(earlier);
+    const epoch = (await slotOf(current, pred.clonePath))?.epoch;
+    let settlePending = async (): Promise<void> => {};
+    if (pending) {
+      const settlement = await current.withTransaction(() => current.hooks.beginDestructive([pred.clonePath], "runner-uid-delete"));
+      settlePending = () => current.withTransaction(() => settlement.settle({ ok: true }));
+    }
+    const journal = readJournal(iid);
+    const ledger = readLedger(iid);
+    const accounting = configGetAll(`uzi-recoveryowner.${runId}.record`);
+    const { factory, started } = transientFactory();
+    const { calls, quiesceRun } = recorded(fastQuiesce);
+    const { logger, lines } = recordingLogger();
+    const { runner, git: runnerGit } = restartedWorker(factory, { quiesceRun, authority: current }, logger);
+    const reserve = t.mock.method(runnerGit, "reserveRecoveryIteration");
+    for (const generation of [2, 3, 4, 5]) {
+      api.setOwnershipStatus(runId, "running", generation);
+      const firstLog = lines.length;
+      await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: generation }));
+      assert.ok(lines.slice(firstLog).some(l => (l as { msg?: string }).msg?.includes("held by an earlier flight")),
+        "the claim reached the held-predecessor refusal");
+      assert.equal(reserve.mock.callCount(), 0, "a held source never charges a recovery iteration");
+      assert.deepEqual(readJournal(iid), journal, "the recovery journal is unchanged");
+      assert.deepEqual(readLedger(iid), ledger, "the attempt ledger is unchanged");
+      assert.deepEqual(configGetAll(`uzi-recoveryowner.${runId}.record`), accounting, "owner accounting is unchanged");
+      assert.deepEqual(calls, [], "the refusal precedes the capture's first proof");
+      assert.equal(started(), 0);
+      assert.equal(api.states.some(s => s.runId === runId && ["failed", "completed"].includes(s.body.status)), false);
+      assert.equal(treeHash(pred.clonePath), before, "custody and the clone are retained untouched");
+      const slot = await slotOf(current, pred.clonePath);
+      assert.equal(slot?.state, "active", "the earlier flight's epoch is untouched");
+      assert.equal(slot?.epoch, epoch);
+    }
+    await settlePending();
+    assert.equal((await current.endSourceUse([pred.clonePath], { sink: earlier })).ended.length, 1);
+    api.setOwnershipStatus(runId, "running", 6);
+    await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: 6 }));
+    assert.ok(reserve.mock.callCount() > 0, "a confirmed source end allows the next claim to reserve");
+    assert.equal(started(), 1, "the release control reaches the successor executor");
+  });
+
   it("a predecessor whose previous use ended is admitted with a fresh epoch before the first proof", async () => {
     const iid = 2902;
     const runId = randomUUID();

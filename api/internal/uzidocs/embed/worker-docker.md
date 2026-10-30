@@ -95,16 +95,34 @@ bytes or inodes across two fresh samples, runs a short, fixed sequence of
 cache prunes against the daemon: `docker image prune -f`, then
 `docker builder prune -f`, and — only if the volume is still over the
 threshold — `docker image prune -a -f --filter until=24h` (any unused image
-built more than a day ago). It only does this once the worker is provably
-idle: no active run, chat, or claim in flight, and the api has confirmed on a
-fresh heartbeat that the worker holds no unpublished work; any doubt skips
-the attempt rather than risking one. Look for `dind-prune-completed`,
+built more than a day ago). Before pruning, it closes claim admission,
+waits for in-flight claims to drain, checks for no tracked run, chat,
+cross-check or active-run registry entry, requires a fresh post-activity
+heartbeat reporting no custody, and checks `docker ps -q` for no running
+containers. These checks do not establish daemon-wide exclusion: accepted
+Docker work may still overlap. Unknown, missing, or stale custody skips the
+attempt. Look for `dind-prune-completed`,
 `dind-prune-failed`, `dind-prune-insufficient`, or `dind-prune-deferred` in
 the worker's logs to see what it did.
 
+Custody is **worker-wide at prune admission**: an open recovery hold keeps a
+new attempt out of this original cache/image-prune sequence, even when other
+runs created the eligible resources. Custody is checked once, before
+`docker ps -q`, and is not re-checked between the prune commands that follow.
+Classifying DinD as scratch does not alone supersede the D5 custody gate.
+The [M1 investigation](../adr/1759-dind-data-metering-and-prune.md#investigation-checkpoint--3653-m1-2026-10-30)
+found that native BuildKit protects acquired cache references, supporting a
+proposal for a narrow builder-only amendment at a new gate. That proposal
+is not activated policy or permission to prune while custody is held.
+
 **Cache prune leaves containers and volumes in place.** It is tried first when
-eligible, but a skip, failure, timeout, or deferral because containers are
-running does not prevent the separate **DinD maintenance** path below.
+eligible, but a skip, failure, timeout, or insufficient relief does not
+authorize maintenance readiness. Separately eligible **DinD maintenance**
+may proceed under its own terminal-run, custody, identity/readiness,
+anonymous-volume and PVC gates (#2257), unchanged below. Busy-worker
+deferral, a pending maintenance drain, and insufficient relief are distinct
+conditions. The investigation measured disposable fixtures; hosted reclaimed
+bytes remain unmeasured. Cache and maintenance thresholds are unchanged.
 
 ### DinD scratch and pressure recycle
 
@@ -115,7 +133,10 @@ can delete the entire `dind-data` PVC, including **named volumes**. That
 DinD maintenance recycle loses DinD state only: the shared run working
 directory (`/data/runner`) is on the `/data` volume and is kept (see
 [Run directory on the data volume](#run-directory-on-the-data-volume)). Keep deliverables in git, published checkpoints, or captured
-work. There is no preservation inventory or migration. An admin can opt out
+work. Authorized scratch cleanup can remove locally cached images that cannot
+be fetched again and state backed by build cache, preventing later image/tag
+reuse. There is no
+preservation inventory or migration. An admin can opt out
 before stop with `UZI_WORKER_DISK_RECYCLE_ENABLED=false`; an operation that
 has already started stopping completes safely even if disabled.
 

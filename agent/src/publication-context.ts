@@ -5,6 +5,10 @@ const reasons = new Set([
   "source_unknown", "authority_unknown", "publication_unproven", "invalid_request",
   "forge_unknown", "forge_mismatch", "authority_changed",
 ]);
+/** Returns the refusal reason only when it is one of the closed set the api may report. */
+export function publicationContextReason(v: unknown): string | undefined {
+  return typeof v === "string" && reasons.has(v) ? v : undefined;
+}
 const positive = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) > 0;
 const sha = (v: unknown): v is string => typeof v === "string" && /^[a-fA-F0-9]{40}$/.test(v);
 const uuid = (v: unknown): v is string => typeof v === "string" &&

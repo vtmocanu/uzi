@@ -427,12 +427,22 @@ for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "
  });
 }
 
+class SentinelXyzError extends Error {}
+class DiagnosticSyntaxError extends SyntaxError {}
+
+const diagnosticRunnerModes = [
+ "typed explicit", "typed unannotated", "plain JSON error", "returned invalid JSON",
+ "exact SyntaxError", "exact TypeError", "exact RangeError", "exact Error",
+ "custom alphabetic class", "built-in subclass", "name spoof", "constructor-name spoof",
+] as const;
+
 for (const stage of ["plan", "code"] as const) {
- for (const mode of ["typed explicit", "typed unannotated", "plain JSON error", "returned invalid JSON"] as const) {
+ for (const mode of diagnosticRunnerModes) {
   it("malformed diagnostic runner " + stage + " " + mode, async () => {
    const root = await fs.mkdtemp(path.join(path.resolve(import.meta.dirname, "../../.uzi/scratch"), "malformed-diagnostic-"));
    const recorded = recordingLogger();
    const sentinel = "SENTINEL-malformed-provider-output-3432";
+   const classSentinel = "SentinelXyzError";
    const states: Record<string, unknown>[] = [];
    const decisions: unknown[] = [];
    const messages: unknown[] = [];
@@ -470,7 +480,24 @@ for (const stage of ["plan", "code"] as const) {
       if (stage === "code") { assert.equal(typeof cleanupConfirmed, "function"); cleanupConfirmed!(); }
       if (mode === "typed explicit") throw new CrossCheckMalformedError(sentinel, "finding_schema");
       if (mode === "typed unannotated") throw new CrossCheckMalformedError(sentinel);
+      const message = "JSON invalid code cross-check " + sentinel;
       if (mode === "plain JSON error") throw new Error("JSON " + sentinel);
+      if (mode === "exact Error") throw new Error(message);
+      if (mode === "exact SyntaxError") throw new SyntaxError(message);
+      if (mode === "exact TypeError") throw new TypeError(message);
+      if (mode === "exact RangeError") throw new RangeError(message);
+      if (mode === "custom alphabetic class") throw new SentinelXyzError(message);
+      if (mode === "built-in subclass") throw new DiagnosticSyntaxError(message);
+      if (mode === "name spoof") {
+       const error = new SentinelXyzError(message);
+       error.name = "SyntaxError";
+       throw error;
+      }
+      if (mode === "constructor-name spoof") {
+       const error = new SentinelXyzError(message);
+       Object.defineProperty(error, "constructor", { value: { name: "SyntaxError" } });
+       throw error;
+      }
       return "{invalid JSON " + sentinel;
      } },
     }).execute(c);
@@ -484,12 +511,22 @@ for (const stage of ["plan", "code"] as const) {
     assert.deepEqual(decisions, [stage === "plan"
      ? { verdict: "failed", reason_class: "malformed", summary: "The cross-check did not complete.", items: [] }
      : { outcome: "failed", reason_class: "malformed", findings: [] }]);
-    assert.equal(JSON.stringify({ logs: recorded.lines, messages, decisions, states }).includes(sentinel), false);
+    const serialized = JSON.stringify({ logs: recorded.lines, messages, decisions, states });
+    for (const forbidden of [sentinel, classSentinel]) {
+     assert.equal(serialized.includes(forbidden), false, "diagnostics must not expose " + forbidden);
+    }
+    const typed = mode === "typed explicit" || mode === "typed unannotated";
+    const codeFindings = mode === "returned invalid JSON" && stage === "code";
+    const errorName = mode === "exact SyntaxError" || (mode === "returned invalid JSON" && stage === "plan") ? "SyntaxError"
+     : mode === "exact TypeError" ? "TypeError"
+     : mode === "exact RangeError" ? "RangeError"
+     : mode === "exact Error" || mode === "plain JSON error" ? "Error" : "unknown";
     const warnings = recorded.lines.filter((line) => (line as { level?: string }).level === "warn");
     assert.deepEqual(warnings, [{
      level: "warn", msg: "cross-check verdict malformed", run_id: "check", stage,
-     subreason: mode === "typed explicit" ? "finding_schema"
-      : mode === "returned invalid JSON" && stage === "code" ? "code_findings" : "unknown",
+     subreason: mode === "typed explicit" ? "finding_schema" : typed ? "unknown"
+      : codeFindings ? "code_findings" : "unclassified_error",
+     ...(!typed && !codeFindings ? { error_name: errorName } : {}),
     }]);
    } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
@@ -824,3 +861,51 @@ it("checker delivery: a tombstone-set overflow alone fails the check model_error
   assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_error", "terminal:failed"]);
  } finally { spy.mock.restore(); }
 });
+
+for (const cancel of [false, true]) {
+ it(`M3 actual checker runner ${cancel ? "cancels" : "admits"} a required subscription wait`, async () => {
+  const fs = await import("node:fs/promises");
+  const { fileURLToPath } = await import("node:url");
+  const { CrossCheckRunner } = await import("../src/cross-check-runner.js");
+  const { ActiveRunRegistry } = await import("../src/active-run-registry.js");
+  const { acquireCodexOperationScope } = await import("../src/codex-operation-scope.js");
+  const { AdmissionClock, flushUntil } = await import("./operation-admission-clock.js");
+  await fs.mkdir(new URL("../../.uzi/scratch/", import.meta.url), { recursive: true });
+  const root = await fs.mkdtemp(fileURLToPath(new URL("../../.uzi/scratch/m3-checker-", import.meta.url)));
+  const clock = new AdmissionClock();
+  const registry = new ActiveRunRegistry();
+  const c = claim(true); c.claim_generation = 7;
+  const owner = new AbortController();
+  const r = rig({ subscription: true });
+  let reads = 0;
+  const client = {
+   hasFeature: () => true, codexOperationNegotiation: 1,
+   checkCodexOperationAdmission: async (_id: string, request: import("../src/protocol.js").CodexOperationRequest) => {
+    reads++;
+    return reads === 1 ? { decision: "wait", ...request, class: "overload",
+     episode_id: "00000000-0000-4000-8000-000000000091",
+     server_now: new Date(0).toISOString(), eligible_at: new Date(1000).toISOString() }
+     : { decision: "admit", operation_id: request.operation_id, claim_generation: request.claim_generation };
+   },
+   releaseCodex: async () => ({ auth_mode: "subscription", access_token: "released-token", generation: 7, chatgpt_account_id: "account", chatgpt_plan_type: null }),
+   reportState: async () => ({ applied: true }), getInputs: async () => ({ inputs: [] }),
+   postMessages: async () => {}, reportCrossCheckVerdict: async () => {},
+  } as unknown as WorkerClient;
+  const scope = acquireCodexOperationScope(client, c.run_id, 7, { now: () => clock.now, sleep: clock.sleep });
+  const git = { ensureClone: async () => "bare", runnerCloneAtCommit: async () => "checkout", removeRunnerClone: async () => {} } as never;
+  const runner = new CrossCheckRunner(client, git, { ...r.log, warn() {}, info() {}, error() {}, debug() {} } as Logger,
+   { homeRoot: root, activeRuns: registry, pollMs: 1000, model: new CodexCrossCheck(client, r.log, r.deps) });
+  const done = runner.execute(c, owner.signal);
+  try {
+   await flushUntil(() => clock.sleepers.size === 1);
+   assert.equal(registry.build().active[0]?.account_cooldown?.kind, "checker");
+   assert.equal(r.requests.some(f => f.method === "turn/start"), false);
+   if (cancel) owner.abort(); else clock.advance(1000);
+   await done;
+   assert.equal(r.requests.filter(f => f.method === "turn/start").length, cancel ? 0 : 1);
+   assert.equal(reads, cancel ? 1 : 2);
+   assert.equal(registry.size, 0);
+   assert.deepEqual(r.disposed.sort(), ["fileop", "provider"]);
+  } finally { owner.abort(); await done; scope.close(); await fs.rm(root, { recursive: true, force: true }); }
+ });
+}

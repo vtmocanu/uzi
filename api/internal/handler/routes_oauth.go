@@ -32,7 +32,7 @@ func (h *Handler) mountOAuthRoutes(r chi.Router, authLimiter, oauthLimiter *mw.L
 		// the client authenticates with Basic inside the handler, per-IP limiter in front.
 		r.With(oauthLimiter.MiddlewareRejecting(oauthRateLimited)).Post("/revoke", h.OAuthRevoke(oauthLimiter))
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Use(h.requireAuth())
 			r.Get("/requests/{id}", h.OAuthGetRequest)
 			r.With(authLimiter.PerUserMiddleware).Post("/requests/{id}/approve", h.OAuthApprove)
 			r.Post("/requests/{id}/deny", h.OAuthDeny)

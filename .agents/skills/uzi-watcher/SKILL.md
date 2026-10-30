@@ -179,6 +179,8 @@ before the run reaches its park cap by freeing the worker's `/data`); `0` disabl
 same turn, investigate, then launch the printed `REARM=` line in the background. It acks that
 health episode, so a run that stays stalled in it (a long test suite) stops only on a park,
 a terminal state, a new episode or a stale heartbeat. A missed re-arm is how a question parks unseen.
+For exit 4 with `health_reason` "your vault is locked", hand the owner `! uzi vault unlock`
+(requires their password); only they can unlock it. After unlock, launch the printed `REARM=` in the background.
 
 The thirteen run statuses and which are terminal are in the `uzi-cli` skill. A run at
 `awaiting_input` asked a question: read it from `uzi run logs RUN --json` (a `question`
@@ -202,7 +204,17 @@ park of that cause retries itself and keeps polling. An integrity refusal,
 local work and custody are preserved, with no automatic retry. Back up available
 work, then ask the owner to Resume or Cancel; Resume requests a bounded attempt,
 not assured success, and another adoption failure holds again. Other
-`recovery_wait` causes keep polling under their existing rules. `uzi-lander` uses this same poller for its
+`recovery_wait` causes keep polling under their existing rules. Every `worker_memory_pressure`
+park stops with `STOP=recovery_wait:worker_memory_pressure` (exit 0), regardless of `memory_hold`:
+remaining interventions do not authorize automatic retries. Back up available work first,
+then ask the owner to Resume or Cancel.
+An unsettled memory continuation (the predecessor's source use was never positively ended,
+and the journal records the park) re-parks at the same hold on Resume until #3639, so Cancel
+or an operator discard is the exit; a worker restart does not release it. Without a recorded
+park, a different worker process fails the run (`preservation_failed`); the same process
+retries until the requeue cap (`worker_requeue_exhausted` or `failed`).
+`backup-runs.sh` accepts the v1 `memoryPark` journal field.
+`uzi-lander` uses this same poller for its
 blind watch to terminal.
 
 **Watching for a REVISED plan (after `uzi run revise`) uses the plan-seq form.** The

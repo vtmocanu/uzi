@@ -634,3 +634,39 @@ describe("issue 2009 — complete pending_all wire coverage regressions", () => 
     ]), "issue 2009: rotation/cap must not rotate or truncate pending_all");
   });
 });
+
+
+describe("R1 policy fallback registration identity", () => {
+  const operation = { operation_id: "11111111-1111-4111-8111-111111111111", kind: "root" as const };
+  it("conversion clears cooldowns and rejects late live display even with its immutable token", () => {
+    const reg = new ActiveRunRegistry(() => [], () => 1);
+    const token = reg.add(RUN_A, 3);
+    assert.ok(reg.setAccountCooldown(RUN_A, 3, operation, token));
+    assert.ok(reg.build().active[0]?.account_cooldown);
+    assert.equal(reg.markPolicyPendingOnly(RUN_A, 3, token), true);
+    assert.equal(reg.setAccountCooldown(RUN_A, 3, operation, token), undefined);
+    reg.notePolicyOwnership(RUN_A, 3);
+    assert.equal(reg.has(RUN_A), false);
+    assert.deepEqual(reg.build().active, [
+      { run_id: RUN_A, claim_generation: 3, phase: "running", terminal_pending: true },
+    ]);
+    reg.remove(RUN_A, 3, token);
+    assert.equal(reg.size, 0, "the unchanged token still cleans up its fallback");
+  });
+  for (const generation of [3, 4]) it(`stale conversion and cleanup cannot touch replacement G${generation}`, () => {
+    const reg = new ActiveRunRegistry(() => [], () => 1);
+    const old = reg.add(RUN_A, 3);
+    const current = reg.add(RUN_A, generation);
+    assert.equal(reg.markPolicyPendingOnly(RUN_A, 3, old), false);
+    reg.remove(RUN_A, 3, old);
+    assert.equal(reg.has(RUN_A), true);
+    assert.ok(reg.setAccountCooldown(RUN_A, generation, operation, current));
+    assert.equal(reg.markPolicyPendingOnly(RUN_A, generation, current), true);
+    reg.remove(RUN_A, generation, old);
+    assert.equal(reg.size, 1);
+    reg.remove(RUN_A, 3 === generation ? 4 : 3, current);
+    assert.equal(reg.size, 1, "both identity fences must agree");
+    reg.remove(RUN_A, generation, current);
+    assert.equal(reg.size, 0);
+  });
+});

@@ -436,6 +436,8 @@ uzi version
   to the pool and it resumes), `recovery_wait` (parked after an empty model turn, or
   because automatic worker-death recovery exhausted — cause
   `worker_requeue_exhausted`, owner Resume/Cancel only, no timer — or
+  a memory-pressure hold, `worker_memory_pressure`, owner Resume/Cancel only
+  regardless of remaining interventions; back up available work first; or
   retained-source budget exhaustion, `retained_recovery_exhausted`, with three
   timed retries by default followed by an owner hold (NULL retry) — or
   an integrity refusal, `retained_recovery_adoption_failed`, owner Resume/Cancel

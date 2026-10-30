@@ -146,7 +146,8 @@ const (
 	KeyCustodyHoldLimit = "custody_hold_limit"
 
 	// KeyVaultPolicy is DB-only; admission uses store.GetVaultPolicy under its lock.
-	KeyVaultPolicy = "vault_policy"
+	KeyVaultPolicy       = "vault_policy"
+	KeyVaultReunlockDays = "vault_reunlock_days"
 	// Docker-worker repo allowlist (PRD #89 M-allow): the set of repos a
 	// docker-enabled worker is permitted to CLAIM runs for. Stored as a
 	// comma-separated list of repo UUIDs. This is the accepted-risk likelihood
@@ -400,8 +401,9 @@ const (
 	// #3150: the per-owner custody admission limit, formerly a compile-time constant in
 	// the workers service; every custody-admission consumer reads it through
 	// Cache.CustodyHoldLimit.
-	DefaultCustodyHoldLimit = "8"
-	DefaultVaultPolicy      = "required"
+	DefaultCustodyHoldLimit  = "8"
+	DefaultVaultPolicy       = "required"
+	DefaultVaultReunlockDays = "7"
 	// PRD #89 M-allow: the docker repo allowlist is EMPTY by default, which the claim
 	// gate reads as fail-closed — a docker worker claims no repo-bearing run until an
 	// admin lists the trusted repos. Empty is the safe default precisely because this
@@ -550,8 +552,9 @@ var Defaults = map[string]string{
 	// PRD #1908 per-user active job cap. Same no-seeded-row pattern as the quota above.
 	KeyJobMaxActivePerUser: DefaultJobMaxActivePerUser,
 	// #3150 per-owner custody admission limit. Same no-seeded-row pattern: unset reads as 8.
-	KeyCustodyHoldLimit: DefaultCustodyHoldLimit,
-	KeyVaultPolicy:      DefaultVaultPolicy,
+	KeyCustodyHoldLimit:  DefaultCustodyHoldLimit,
+	KeyVaultPolicy:       DefaultVaultPolicy,
+	KeyVaultReunlockDays: DefaultVaultReunlockDays,
 	// PRD #89 M-allow docker repo allowlist. Same no-seeded-row pattern: an absent
 	// row synthesizes to the empty (fail-closed) default, so All/AdminView surface it
 	// to the settings page on every instance and no migration seeds it.

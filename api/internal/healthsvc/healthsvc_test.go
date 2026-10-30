@@ -33,6 +33,7 @@ import (
 // ---- fakes -----------------------------------------------------------------
 
 type fakeStore struct {
+	userLookup             func(context.Context, uuid.UUID) (store.User, error)
 	blockerRows            []store.ListWorkerUpgradeBlockersRow
 	blockerErr             error
 	blockerQueries         [][]uuid.UUID
@@ -83,6 +84,13 @@ func (f *fakeStore) RecoveryStorageHealth(ctx context.Context, p store.RecoveryS
 		return []store.RecoveryStorageHealthRow{{}}, nil
 	}
 	return f.storageRows, f.storageErr
+}
+
+func (f *fakeStore) GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error) {
+	if f.userLookup != nil {
+		return f.userLookup(ctx, id)
+	}
+	return store.User{}, pgx.ErrNoRows
 }
 
 func (f *fakeStore) ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error) {

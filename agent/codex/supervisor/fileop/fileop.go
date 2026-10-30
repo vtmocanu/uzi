@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -38,15 +40,16 @@ const (
 
 // Operation names carried on the request channel (stdin).
 const (
-	opStat   = "stat"
-	opRead   = "read"
-	opWrite  = "write"
-	opApply  = "apply"
-	opMkdir  = "mkdir"
-	opRename = "rename"
-	opUnlink = "unlink"
-	opRmdir  = "rmdir"
-	opList   = "list"
+	opStat      = "stat"
+	opRead      = "read"
+	opReadRange = "read_range"
+	opWrite     = "write"
+	opApply     = "apply"
+	opMkdir     = "mkdir"
+	opRename    = "rename"
+	opUnlink    = "unlink"
+	opRmdir     = "rmdir"
+	opList      = "list"
 )
 
 // Stable, bounded error-code vocabulary. A response NEVER carries a raw errno
@@ -86,20 +89,29 @@ var (
 // request is one parsed, validated operation frame. NewPath is meaningful only for
 // rename; Data is base64-encoded bytes for write (and the REPLACEMENT text for apply);
 // Old is base64-encoded bytes of the text apply must find-and-replace.
+// Offset and Limit are independently validated only by read_range.
 type request struct {
-	ID      int    `json:"id"`
-	Op      string `json:"op"`
-	Path    string `json:"path"`
-	NewPath string `json:"newPath"`
-	Data    string `json:"data"`
-	Old     string `json:"old"`
+	ID      int             `json:"id"`
+	Op      string          `json:"op"`
+	Path    string          `json:"path"`
+	NewPath string          `json:"newPath"`
+	Data    string          `json:"data"`
+	Old     string          `json:"old"`
+	Offset  json.RawMessage `json:"offset"`
+	Limit   json.RawMessage `json:"limit"`
 }
 
 // server holds the worktree-root dirfd opened ONCE (O_DIRECTORY|O_PATH), the per-op
-// bounds, and narrow staging syscall seams. Fields let tests drive production paths
+// bounds, and narrow I/O/context seams. Fields let tests drive production paths
 // with small caps and deterministic failures; newServer wires every production value.
 type server struct {
 	rootFD          int
+	fileRead        func(*os.File, []byte) (int, error)
+	fileClose       func(*os.File) error
+	fstat           func(int, *unix.Stat_t) error
+	nonblock        func(int, bool) error
+	rangeContext    func() (context.Context, context.CancelFunc)
+	rangeChunk      int
 	maxRead         int
 	maxWrite        int
 	lineMax         int
@@ -112,7 +124,15 @@ type server struct {
 // newServer builds a server anchored at rootFD with the production bounds.
 func newServer(rootFD int) *server {
 	return &server{
-		rootFD:          rootFD,
+		rootFD:    rootFD,
+		fileRead:  func(f *os.File, p []byte) (int, error) { return f.Read(p) },
+		fileClose: (*os.File).Close,
+		fstat:     unix.Fstat,
+		nonblock:  unix.SetNonblock,
+		rangeContext: func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), 5*time.Second)
+		},
+		rangeChunk:      rangeReadChunk,
 		maxRead:         maxReadBytes,
 		maxWrite:        maxWriteBytes,
 		lineMax:         maxRequestLine,
@@ -216,6 +236,8 @@ func (s *server) handle(req request) map[string]any {
 		return s.doStat(req)
 	case opRead:
 		return s.doRead(req)
+	case opReadRange:
+		return s.doReadRange(req)
 	case opWrite:
 		return s.doWrite(req)
 	case opApply:
@@ -321,7 +343,7 @@ func (s *server) doRead(req request) map[string]any {
 		return errResp(req.ID, classify(err))
 	}
 	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
+	if err := s.fstat(fd, &st); err != nil {
 		unix.Close(fd)
 		return errResp(req.ID, classify(err))
 	}
@@ -341,11 +363,11 @@ func (s *server) doRead(req request) map[string]any {
 		unix.Close(fd)
 		return errResp(req.ID, codeIO)
 	}
-	defer f.Close()
+	defer s.fileClose(f)
 	if st.Size > int64(s.maxRead) {
 		return errResp(req.ID, codeOversize)
 	}
-	data, err := io.ReadAll(io.LimitReader(f, int64(s.maxRead)+1))
+	data, err := io.ReadAll(io.LimitReader(fileReader{s, f}, int64(s.maxRead)+1))
 	if err != nil {
 		return errResp(req.ID, codeIO)
 	}

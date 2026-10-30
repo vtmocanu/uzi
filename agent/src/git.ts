@@ -1525,6 +1525,14 @@ export class BareCacheShallowError extends Error {
   }
 }
 
+/** A bounded graph is too large to classify, never an operational read failure. */
+class MarkerWrapperGraphLimitError extends Error {}
+
+/** A frozen reused source cannot be reconstructed by wrapping a different object. */
+export class RecoveryCoverageReuseRefused extends Error {
+  constructor() { super("recovery coverage reuse proof unavailable"); }
+}
+
 /** A supervised retained-readiness effect has no positive cleanup proof. */
 export class RetainedReadinessCleanupUnconfirmedError extends Error {
   constructor() { super("retained_readiness_cleanup"); }
@@ -1554,6 +1562,47 @@ export interface RecoveryJournalEntry extends RecoverySource {
    *  fence equality. Workers built before this field existed reject the unknown key (their strict
    *  allowlist), which is the accepted rollback fence: they refuse to attach, recover or discard it. */
   completionSourceFence?: CompletionSourceFence;
+  /** issue #3638: the versioned cooperative memory-park record written by the producing flight's teardown (see
+   *  {@link MemoryParkRecord}). Metadata only: never a completion certificate, a publication fence or a custody
+   *  release. Always emitted immediately before `completionSourceFence` (see recoveryJournalJson). Workers built
+   *  before this field existed reject the unknown key (their strict allowlist), the same accepted rollback fence. */
+  memoryPark?: MemoryParkRecord;
+}
+
+/** The server-accepted (or attempted) park binding a record is about. */
+export interface MemoryParkBinding {
+  runId: string; claimGeneration: number; workerId: string; registerNonce: string; memoryEpisode: number;
+}
+
+/** One source slot the producing flight positively ended (`ineligible`), by its saved durable identity. */
+export interface MemoryParkSettlementSource {
+  path: string; authorityKey: string; attemptId: string | null; epoch: string; seq: number;
+}
+
+export interface MemoryParkSettlement {
+  version: 1;
+  /** Written `false` by phase 1 and `true` only by phase 2 of {@link GitCache.recordMemoryPark}. */
+  confirmed: boolean;
+  sources: MemoryParkSettlementSource[];
+  evidence: {
+    parkAck: MemoryParkBinding; interventionIds: string[];
+    processJoin: "executor" | "codex_disposal"; commands: "confirmed" | "not_required";
+    steering: "joined"; auxiliaries: "joined" | "none"; feedback: "drained"; sinkReceipts: "joined";
+    parkReap: "complete" | "not_applicable";
+  };
+}
+
+export type MemoryParkAck = "confirmed" | "sent_unconfirmed" | "not_sent";
+
+export interface MemoryParkRecord {
+  version: 1;
+  binding: MemoryParkBinding;
+  ack: MemoryParkAck;
+  origin: { flightId: string; attemptId: string | null; executorIncarnation: string | null; authorityIncarnation: string;
+    /** The epoch of the parked flight's own source-use slot for its clone path; a D4 re-park is eligible only against exactly it. */
+    sourceEpoch: string };
+  /** Present only when `ack === "confirmed"`. */
+  settlement?: MemoryParkSettlement;
 }
 
 /** issue #3239: at most this many peeled markers are journaled (SHA-40, unique). */
@@ -1599,6 +1648,145 @@ export interface AttemptLedgerEntry {
   state: AttemptLedgerState;
 }
 
+// ---- issue #3638: the cooperative memory-park record (strict v1 parser) ---------------------------------------
+
+const MEMORY_PARK_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const MEMORY_PARK_HEX64_RE = /^[0-9a-f]{64}$/;
+const MEMORY_PARK_INCARNATION_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+const MAX_MEMORY_PARK_SOURCES = 16;
+const MAX_MEMORY_PARK_INTERVENTIONS = 64;
+
+function memoryParkFail(): never { throw new Error("invalid memory park record"); }
+function memoryParkKeys(value: unknown, required: string[], optional: string[] = []): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+      Object.getPrototypeOf(value) !== Object.prototype) return memoryParkFail();
+  const o = value as Record<string, unknown>;
+  const keys = Object.keys(o);
+  if (required.some(k => !keys.includes(k)) || keys.some(k => !required.includes(k) && !optional.includes(k)) ||
+      keys.some(k => o[k] === undefined)) return memoryParkFail();
+  return o;
+}
+function memoryParkString(value: unknown, max: number): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > max || value.includes("\0")) return memoryParkFail();
+  return value;
+}
+function memoryParkMatch(value: unknown, re: RegExp): string {
+  if (typeof value !== "string" || !re.test(value)) return memoryParkFail();
+  return value;
+}
+function memoryParkInt(value: unknown, min: number): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min) return memoryParkFail();
+  return value;
+}
+function memoryParkOneOf<T extends string>(value: unknown, allowed: readonly T[]): T {
+  if (typeof value !== "string" || !(allowed as readonly string[]).includes(value)) return memoryParkFail();
+  return value as T;
+}
+function memoryParkBinding(value: unknown): MemoryParkBinding {
+  const b = memoryParkKeys(value, ["runId", "claimGeneration", "workerId", "registerNonce", "memoryEpisode"]);
+  return { runId: memoryParkString(b.runId, 128), claimGeneration: memoryParkInt(b.claimGeneration, 1),
+    workerId: memoryParkString(b.workerId, 128), registerNonce: memoryParkString(b.registerNonce, 256),
+    memoryEpisode: memoryParkInt(b.memoryEpisode, 0) };
+}
+function sameMemoryParkBinding(a: MemoryParkBinding, b: MemoryParkBinding): boolean {
+  return a.runId === b.runId && a.claimGeneration === b.claimGeneration && a.workerId === b.workerId &&
+    a.registerNonce === b.registerNonce && a.memoryEpisode === b.memoryEpisode;
+}
+
+/**
+ * Strict v1 decode of a persisted or about-to-be-persisted memory-park record: the exact key set at every level,
+ * bounded strings, UUID and hex shapes, 1..16 sources sorted ascending by path (unique by path and authority
+ * key), at most 64 intervention ids, and `settlement` only for a confirmed ack whose `parkAck` copy equals the
+ * binding. Throws on anything else. Returns a fresh object whose key order is the persisted order, so its
+ * JSON.stringify is the canonical spelling.
+ */
+function parseMemoryPark(value: unknown): MemoryParkRecord {
+  const o = memoryParkKeys(value, ["version", "binding", "ack", "origin"], ["settlement"]);
+  if (o.version !== 1) return memoryParkFail();
+  const binding = memoryParkBinding(o.binding);
+  const ack = memoryParkOneOf(o.ack, ["confirmed", "sent_unconfirmed", "not_sent"] as const);
+  const origin = memoryParkKeys(o.origin, ["flightId", "attemptId", "executorIncarnation", "authorityIncarnation", "sourceEpoch"]);
+  const record: MemoryParkRecord = {
+    version: 1, binding, ack,
+    origin: { flightId: memoryParkMatch(origin.flightId, MEMORY_PARK_UUID_RE),
+      attemptId: origin.attemptId === null ? null : memoryParkMatch(origin.attemptId, ATTEMPT_ID_RE),
+      executorIncarnation: origin.executorIncarnation === null ? null
+        : memoryParkMatch(origin.executorIncarnation, MEMORY_PARK_INCARNATION_RE),
+      authorityIncarnation: memoryParkMatch(origin.authorityIncarnation, MEMORY_PARK_UUID_RE),
+      sourceEpoch: memoryParkMatch(origin.sourceEpoch, MEMORY_PARK_UUID_RE) },
+  };
+  if (o.settlement === undefined) return record;
+  if (ack !== "confirmed") return memoryParkFail();
+  const s = memoryParkKeys(o.settlement, ["version", "confirmed", "sources", "evidence"]);
+  if (s.version !== 1 || typeof s.confirmed !== "boolean") return memoryParkFail();
+  if (!Array.isArray(s.sources) || s.sources.length < 1 || s.sources.length > MAX_MEMORY_PARK_SOURCES) return memoryParkFail();
+  const sources = s.sources.map((raw): MemoryParkSettlementSource => {
+    const e = memoryParkKeys(raw, ["path", "authorityKey", "attemptId", "epoch", "seq"]);
+    const p = memoryParkString(e.path, 4096);
+    if (!path.isAbsolute(p) || path.resolve(p) !== p) return memoryParkFail();
+    return { path: p, authorityKey: memoryParkMatch(e.authorityKey, MEMORY_PARK_HEX64_RE),
+      attemptId: e.attemptId === null ? null : memoryParkMatch(e.attemptId, ATTEMPT_ID_RE),
+      epoch: memoryParkMatch(e.epoch, MEMORY_PARK_UUID_RE), seq: memoryParkInt(e.seq, 1) };
+  });
+  for (let i = 1; i < sources.length; i++) if (!(sources[i - 1]!.path < sources[i]!.path)) return memoryParkFail();
+  if (new Set(sources.map(x => x.authorityKey)).size !== sources.length) return memoryParkFail();
+  const ev = memoryParkKeys(s.evidence, ["parkAck", "interventionIds", "processJoin", "commands", "steering",
+    "auxiliaries", "feedback", "sinkReceipts", "parkReap"]);
+  const parkAck = memoryParkBinding(ev.parkAck);
+  if (!sameMemoryParkBinding(parkAck, binding)) return memoryParkFail();
+  if (!Array.isArray(ev.interventionIds) || ev.interventionIds.length > MAX_MEMORY_PARK_INTERVENTIONS) return memoryParkFail();
+  const interventionIds = ev.interventionIds.map(id => memoryParkString(id, 128));
+  if (new Set(interventionIds).size !== interventionIds.length) return memoryParkFail();
+  return { ...record, settlement: { version: 1, confirmed: s.confirmed, sources, evidence: {
+    parkAck, interventionIds,
+    processJoin: memoryParkOneOf(ev.processJoin, ["executor", "codex_disposal"] as const),
+    commands: memoryParkOneOf(ev.commands, ["confirmed", "not_required"] as const),
+    steering: memoryParkOneOf(ev.steering, ["joined"] as const),
+    auxiliaries: memoryParkOneOf(ev.auxiliaries, ["joined", "none"] as const),
+    feedback: memoryParkOneOf(ev.feedback, ["drained"] as const),
+    sinkReceipts: memoryParkOneOf(ev.sinkReceipts, ["joined"] as const),
+    parkReap: memoryParkOneOf(ev.parkReap, ["complete", "not_applicable"] as const) } } };
+}
+
+/** The persisted spelling of a record: re-parsed, fixed field order. */
+function serializeMemoryPark(record: MemoryParkRecord): string {
+  return JSON.stringify(parseMemoryPark(record));
+}
+
+/** Test seams of the memory-park writer and reader: the per-handle fsync, and the journal read-back. */
+export interface MemoryParkDurability {
+  sync?: (handle: { sync(): Promise<void> }, what: "config" | "directory") => Promise<void>;
+  readback?: (read: () => Promise<string | undefined>) => Promise<string | undefined>;
+  /** Forfeits pending writer lock holds (not yet granted) and a phase 2 that has not started; never the failed-phase-2 revert. */
+  signal?: AbortSignal;
+}
+
+/** Thrown inside a bare-lock hold of {@link GitCache.recordMemoryPark} when the source is marked stopped or protected. */
+class MemoryParkRefusal extends Error {}
+
+const MEMORY_PARK_ACK_RANK: Record<MemoryParkAck, number> = { not_sent: 0, sent_unconfirmed: 1, confirmed: 2 };
+
+/**
+ * May `incoming` be written over the `existing` record of the same journal? A strictly greater claimGeneration
+ * replaces; a lower one refuses. Within one claimGeneration the binding and origin must be identical and the ack may
+ * only stay or upgrade; a record that carries a settlement is never replaced by one without, and two settlements
+ * must describe the same sources and evidence (only `confirmed` may differ).
+ */
+function memoryParkRelation(existing: MemoryParkRecord | undefined, incoming: MemoryParkRecord): "write" | "refuse" {
+  if (existing === undefined) return "write";
+  if (incoming.binding.claimGeneration > existing.binding.claimGeneration) return "write";
+  if (incoming.binding.claimGeneration < existing.binding.claimGeneration) return "refuse";
+  if (!sameMemoryParkBinding(existing.binding, incoming.binding) ||
+      JSON.stringify(existing.origin) !== JSON.stringify(incoming.origin)) return "refuse";
+  if (MEMORY_PARK_ACK_RANK[incoming.ack] < MEMORY_PARK_ACK_RANK[existing.ack]) return "refuse";
+  if (existing.settlement) {
+    if (!incoming.settlement) return "refuse";
+    const body = (s: MemoryParkSettlement): string => JSON.stringify({ sources: s.sources, evidence: s.evidence });
+    if (body(existing.settlement) !== body(incoming.settlement)) return "refuse";
+  }
+  return "write";
+}
+
 function parseRecoveryJournal(value: string): RecoveryJournalEntry {
   const parsed: unknown = JSON.parse(value);
   if (typeof parsed !== "object" || parsed === null || !("runId" in parsed) || !("clonePath" in parsed)
@@ -1610,7 +1798,7 @@ function parseRecoveryJournal(value: string): RecoveryJournalEntry {
     throw new Error("invalid retained recovery clone journal");
   }
   const o = parsed as Record<string, unknown>;
-  if (Object.keys(o).some(k => !["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources", "peeledMarkers", "completionSourceFence"].includes(k))) {
+  if (Object.keys(o).some(k => !["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources", "peeledMarkers", "memoryPark", "completionSourceFence"].includes(k))) {
     throw new Error("invalid retained recovery clone journal");
   }
   // Legacy callers classify a mismatched attempt id as CapturePathMismatchError.
@@ -1649,18 +1837,29 @@ function parseRecoveryJournal(value: string): RecoveryJournalEntry {
     try { completionSourceFence = parseSourceFence(o.completionSourceFence); }
     catch { throw new Error("invalid completion source fence"); }
   }
+  // issue #3638: an unknown version, unknown key or out-of-bound value invalidates the whole journal (the existing
+  // fail-closed path), and a record always describes this journal's own run.
+  let memoryPark: MemoryParkRecord | undefined;
+  if (o.memoryPark !== undefined) {
+    memoryPark = parseMemoryPark(o.memoryPark);
+    if (memoryPark.binding.runId !== source.runId) throw new Error("memory park run identity mismatch");
+  }
   return { ...source, ...(recovery ? { recovery } : {}), ...(retainedSources ? { retainedSources } : {}),
     ...(peeledMarkers?.length ? { peeledMarkers } : {}),
+    ...(memoryPark ? { memoryPark } : {}),
     ...(completionSourceFence ? { completionSourceFence } : {}) };
 }
 
-/** The journal's persisted spelling: identical to JSON.stringify except that a completion-source
- *  fence, when present, is re-parsed and always emitted as the LAST key in its fixed field order,
- *  wherever the spread that built the object happened to put it. */
+/** The journal's persisted spelling: identical to JSON.stringify except that a memory-park record (issue #3638)
+ *  and a completion-source fence, when present, are re-parsed and emitted in their fixed field orders as the last
+ *  two keys (the fence LAST), wherever the spread that built the object happened to put them. */
 function recoveryJournalJson(journal: RecoveryJournalEntry): string {
-  const { completionSourceFence, ...rest } = journal;
-  if (completionSourceFence === undefined) return JSON.stringify(rest);
-  return JSON.stringify({ ...rest, completionSourceFence: parseSourceFence(completionSourceFence) });
+  const { completionSourceFence, memoryPark, ...rest } = journal;
+  // issue #3638: the memory-park record, when present, is re-parsed and emitted in its fixed field order at a fixed
+  // position: after every other key, immediately before the fence (which stays the LAST key).
+  const withPark = memoryPark === undefined ? rest : { ...rest, memoryPark: parseMemoryPark(memoryPark) };
+  if (completionSourceFence === undefined) return JSON.stringify(withPark);
+  return JSON.stringify({ ...withPark, completionSourceFence: parseSourceFence(completionSourceFence) });
 }
 
 function parseAttemptLedgerEntry(value: string): AttemptLedgerEntry | undefined {
@@ -6718,6 +6917,173 @@ export class GitCache {
     });
   }
 
+  /** fsync `<bare>/config`, fsync the bare directory, then require the journal's raw value to read back as exactly `want`. */
+  private async syncJournalAndReadBack(barePath: string, branch: string, want: string, opts: MemoryParkDurability): Promise<void> {
+    const sync = opts.sync ?? (async (h: { sync(): Promise<void> }) => { await h.sync(); });
+    const config = await fs.open(path.join(barePath, "config"), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try { await sync(config, "config"); } finally { await config.close(); }
+    const dir = await fs.open(barePath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    try { await sync(dir, "directory"); } finally { await dir.close(); }
+    const read = () => this.readRecoveryCaptureRaw(barePath, branch);
+    const back = opts.readback ? await opts.readback(read) : await read();
+    if (back !== want) throw new Error("memory park read-back differs");
+  }
+
+  /**
+   * issue #3638 D3 - durably record the cooperative memory-park record `record` on the ACTIVE journal key of exactly
+   * `expected` (run, clone path and attempt id; absent for canonical). Metadata only: it is not a completion
+   * certificate, a publication fence or a custody release.
+   *
+   * Every write -> fsync(`<bare>/config`) -> fsync(bare dir) -> read-back-equality sequence runs under ONE hold of the
+   * bare lock (the lock installCompletionSourceFence takes). A record with a settlement is written in two phases, each
+   * its own lock hold: phase 1 writes `settlement.confirmed: false`; only after phase 1 fully succeeded does phase 2
+   * (compare-and-swap on the phase-1 value) rewrite `confirmed: true`. A phase-1 failure throws and leaves nothing a
+   * reader would trust (a readable `confirmed: false` never qualifies). A phase-2 failure makes a best-effort revert
+   * to `confirmed: false` and returns `unconfirmed`. Even a readable `confirmed: true` needs
+   * {@link GitCache.readConfirmedMemoryPark}. A record without a settlement is one write+fsync+read-back
+   * ("recorded"). An identical replay repeats the sync and read-back work; it never short-circuits.
+   *
+   * Conflicts (refused, nothing written): a strictly greater claimGeneration (same run) replaces the stored record;
+   * within one claimGeneration only an identical replay or an upgrade (`not_sent` -> `sent_unconfirmed` ->
+   * `confirmed`, then adding the settlement) is allowed, never with a different binding or origin, and a record that
+   * carries a settlement is never replaced by one that does not.
+   * `settlement.confirmed` on the input is ignored: the writer owns that flag.
+   *
+   * A journal bound by a stopped marker (even one whose clear failed) or shadowed by a protected descriptor is never
+   * rewritten: nothing is written, the refusal is logged and `unconfirmed` is returned. `opts.signal` forfeits a
+   * phase-1 or phase-2 lock hold not yet granted and stops phase 2 from starting once aborted (a phase-1 draft stays
+   * `confirmed: false`); the best-effort revert hold is never forfeited by `opts.signal` (an ambient scope signal or a marker re-check can still stop it).
+   */
+  async recordMemoryPark(
+    barePath: string, branch: string, expected: { runId: string; clonePath: string; attemptId?: string },
+    record: MemoryParkRecord, opts: MemoryParkDurability = {},
+  ): Promise<"recorded" | "settled" | "unconfirmed"> {
+    const incoming = parseMemoryPark(record);
+    if (incoming.binding.runId !== expected.runId) throw new Error("memory park record names another run");
+    const withFlag = (confirmed: boolean): MemoryParkRecord => incoming.settlement
+      ? { ...incoming, settlement: { ...incoming.settlement, confirmed } } : incoming;
+    const draft = withFlag(false);
+    const final = withFlag(true);
+    const section = <T>(fn: (stored: { journal: RecoveryJournalEntry; raw: string }) => Promise<T>, signal: AbortSignal | null = opts.signal ?? null): Promise<T> =>
+      this.withLock(barePath, async () => {
+        await this.assertRecoveryBare(barePath);
+        const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
+        if (!stored || stored.journal.runId !== expected.runId || stored.journal.clonePath !== expected.clonePath ||
+            stored.journal.attemptId !== expected.attemptId) {
+          throw new Error("memory park journal does not name this source");
+        }
+        // Mirrors installCompletionSourceFence: a journal bound by a stopped marker (whose clear may have failed) or
+        // shadowed by a protected descriptor is never rewritten, so the marker's digest keeps matching its raw bytes.
+        try {
+          await this.assertNoStoppedMarker(barePath, stored.journal.clonePath, stored.journal);
+        } catch (error) {
+          if (error instanceof RetainedStoppedSourceError) throw new MemoryParkRefusal("memory park source is marked stopped");
+          throw error;
+        }
+        if ((await this.protectedRecoveries(barePath, stored.journal.runId)).length) {
+          throw new MemoryParkRefusal("memory park source has a protected descriptor");
+        }
+        return fn(stored);
+      }, signal ?? undefined);
+    /** Write `target` unless the stored bytes already are exactly it, then ALWAYS sync and read back. */
+    const commit = async (stored: { journal: RecoveryJournalEntry; raw: string }, target: MemoryParkRecord): Promise<void> => {
+      const wanted = recoveryJournalJson({ ...stored.journal, memoryPark: target });
+      if (stored.raw !== wanted) await this.writeRecovery(barePath, branch, { ...stored.journal, memoryPark: target });
+      await this.syncJournalAndReadBack(barePath, branch, wanted, opts);
+    };
+    const refused = (error: unknown): "unconfirmed" => {
+      this.log.warn("memory park not recorded: the source is stopped or protected", { error: gitErrorMessage(error) });
+      return "unconfirmed";
+    };
+    if (incoming.settlement === undefined) {
+      try {
+        return await section(async stored => {
+          if (memoryParkRelation(stored.journal.memoryPark, incoming) === "refuse") throw new Error("memory park record conflicts with the journal's");
+          await commit(stored, incoming);
+          return "recorded" as const;
+        });
+      } catch (error) {
+        if (error instanceof MemoryParkRefusal) return refused(error);
+        throw error;
+      }
+    }
+    // Phase 1.
+    let alreadyFinal: boolean;
+    try {
+      alreadyFinal = await section(async stored => {
+        if (memoryParkRelation(stored.journal.memoryPark, final) === "refuse") throw new Error("memory park record conflicts with the journal's");
+        if (stored.journal.memoryPark !== undefined && serializeMemoryPark(stored.journal.memoryPark) === serializeMemoryPark(final)) {
+          // An identical settled replay: never downgraded to confirmed:false; the sync and read-back are repeated.
+          await commit(stored, final);
+          return true;
+        }
+        await commit(stored, draft);
+        return false;
+      });
+    } catch (error) {
+      if (error instanceof MemoryParkRefusal) return refused(error);
+      throw error;
+    }
+    if (alreadyFinal) return "settled";
+    // Phase 2: only after phase 1 fully succeeded, and never once the caller gave up.
+    if (opts.signal?.aborted) return "unconfirmed";
+    try {
+      await section(async stored => {
+        if (stored.journal.memoryPark === undefined || serializeMemoryPark(stored.journal.memoryPark) !== serializeMemoryPark(draft)) {
+          throw new Error("memory park record changed between phases");
+        }
+        await commit(stored, final);
+      });
+      return "settled";
+    } catch (error) {
+      this.log.warn("memory park settlement could not be confirmed; reverting to unconfirmed", { error: gitErrorMessage(error) });
+      try {
+        await section(async stored => {
+          if (stored.journal.memoryPark !== undefined && serializeMemoryPark(stored.journal.memoryPark) === serializeMemoryPark(final)) {
+            await this.writeRecovery(barePath, branch, { ...stored.journal, memoryPark: draft });
+          }
+        }, null); // the revert never takes the caller's signal: an aborted producer must not leave confirmed:true readable
+      } catch { /* best effort: a readable confirmed:true still needs readConfirmedMemoryPark */ }
+      return "unconfirmed";
+    }
+  }
+
+  /**
+   * issue #3638 D3 - the reader confirmation. Holds the same bare lock across the whole read -> fsync(config) ->
+   * fsync(bare dir) -> read-back sequence and returns the stored record ONLY when every step succeeds, the first raw
+   * read canonically equals the expected record (it is parsed and re-serialized, and must match the serialized
+   * `expected.record`, with run, clone path and attempt id; a settlement, when present, must be `confirmed`), and the
+   * read-back is byte-identical to that first raw read. Any other outcome, including any thrown error or an aborted
+   * `opts.signal` before the lock is granted, is `undefined`. Read-only otherwise; it takes no new lock and keeps no
+   * registry.
+   *
+   * Confirmation here re-syncs and re-reads, but it is not independent of the journal: it proves only that the
+   * journal's own bytes are durable and stable. An authoritative consumer (#3639) must bind `expected` to a reference
+   * obtained independently of this journal (for example the server's accepted park binding).
+   */
+  async readConfirmedMemoryPark(
+    barePath: string, branch: string, expected: { runId: string; clonePath: string; attemptId?: string; record: MemoryParkRecord },
+    opts: MemoryParkDurability = {},
+  ): Promise<MemoryParkRecord | undefined> {
+    try {
+      const want = serializeMemoryPark(expected.record);
+      if (expected.record.settlement?.confirmed === false) return undefined;
+      return await this.withLock(barePath, async () => {
+        await this.assertRecoveryBare(barePath);
+        const first = await this.readRecoveryCaptureRaw(barePath, branch);
+        if (first === undefined) return undefined;
+        const journal = parseRecoveryJournal(first);
+        if (journal.runId !== expected.runId || journal.clonePath !== expected.clonePath ||
+            journal.attemptId !== expected.attemptId || journal.memoryPark === undefined ||
+            serializeMemoryPark(journal.memoryPark) !== want) return undefined;
+        await this.syncJournalAndReadBack(barePath, branch, first, opts);
+        return journal.memoryPark;
+      }, opts.signal);
+    } catch {
+      return undefined;
+    }
+  }
+
   /**
    * Bounded metadata-only qualification. This never repairs attribution, reads Git
    * objects, proves quiescence, or grants maintenance admission. Uncertainty in any
@@ -7836,37 +8202,16 @@ export class GitCache {
     });
   }
 
-  /**
-   * issue #3239: decide what a retained-recovery successor may adopt when the episode restore tip is a
-   * recovery-coverage wrapper that may carry a `wip(park):` marker. Returns undefined for the
-   * unchanged shapes (the tip itself is a marker, or neither the source nor any wrapper leaf is one),
-   * which keep the plain adoption of the tip. Otherwise the wrapper must be provably the worker's own
-   * coverage of the journaled source, and the successor adopts the SOURCE (a marker is then peeled by
-   * the seed's `reset --soft`, so neither marker nor wrapper enters history); any failed proof throws
-   * `successor recovery verification failed`, before a ledger entry or clone exists.
-   *
-   * Fail closed: once the tip is a coverage commit (or the source is a marker), any inability to verify
-   * refuses: an unreadable tip, more than 8 aggregates, or more than MAX_OWED_CANDIDATES_PER_RUN + 2
-   * leaves, or ANY failed read. Only a non-tip commit for which {@link readBoundedCommit} RETURNS
-   * undefined (over 64 KiB, or a body that does not survive the UTF-8 round trip) is demoted to a leaf
-   * and meets the leaf rule, which classifies it by subject and never needs that read; a demoted leaf
-   * whose subject is a coverage subject is refused (genuine aggregates are small ASCII). A read that
-   * THROWS (timeout, git failure, missing object) refuses, as does a failed subject read of the tip,
-   * the source or a leaf: a transient error never classifies a commit as a non-marker. The source and
-   * a marker leaf are compared by plumbing for the same reason.
-   *
-   * The caller holds the bare lock: this helper must never take it (the lock is not reentrant), which is
-   * why it reads aggregates through {@link readBoundedCommit} and not {@link readRecoveryCoverageClaim}.
-   */
-  private async resolveMarkerWrapperAdoption(
-    barePath: string, journal: RecoveryJournalEntry, tip: string, src: string | undefined,
-  ): Promise<{ seedTip: string; expectedHead: string; expectedTree: string; peeledMarkers: string[] } | undefined> {
+  /** Bounded, read-only shape classification under the caller's bare lock.
+   * Shared with clean-source reuse; its marker-free result grants no provenance. */
+  private async readMarkerWrapperGraph(barePath: string, tip: string, src: string | undefined) {
     // The producer's parent set is the owed roots (at most MAX_OWED_CANDIDATES_PER_RUN), the original
     // source (freezeInventory appends it to the roots) and the current source (buildRecoveryCoverage
     // adds it), and the two extras can be distinct.
     const MAX_LEAVES = MAX_OWED_CANDIDATES_PER_RUN + 2, MAX_AGGREGATES = 8, MAX_OBJECT_BYTES = 64 * 1024;
-    const fail = (reason?: string): never => {
-      const error = new Error("successor recovery verification failed");
+    const fail = (reason?: string, limit = false): never => {
+      const error = limit ? new MarkerWrapperGraphLimitError("successor recovery verification failed")
+        : new Error("successor recovery verification failed");
       if (reason !== undefined) annotateRetainedSuccessorError(error, reason);
       throw error;
     };
@@ -7899,7 +8244,7 @@ export class GitCache {
       const sha = queue.shift()!;
       if (seen.has(sha)) continue;
       seen.add(sha);
-      if (seen.size > MAX_AGGREGATES + MAX_LEAVES) return fail("wrapper_walk_bound");
+      if (seen.size > MAX_AGGREGATES + MAX_LEAVES) return fail("wrapper_walk_bound", true);
       let commit;
       try { commit = await this.readBoundedCommit(barePath, sha, MAX_OBJECT_BYTES); } catch (err) {
         const abort = this.boundaryAbortError(err);
@@ -7907,8 +8252,8 @@ export class GitCache {
         return fail(err instanceof Error ? "wrapper_commit_read" : undefined);
       }
       if (!commit) {
-        if (sha === tip) return fail("wrapper_tip_bound");
-        if ((await subjectOf(sha, "wrapper_leaf_subject")).startsWith("uzi recovery coverage ")) return fail("wrapper_coverage_leaf_bound");
+        if (sha === tip) return fail("wrapper_tip_bound", true);
+        if ((await subjectOf(sha, "wrapper_leaf_subject")).startsWith("uzi recovery coverage ")) return fail("wrapper_coverage_leaf_bound", true);
         leaves.add(sha);
         continue;
       }
@@ -7919,7 +8264,7 @@ export class GitCache {
         // marker involvement refuses below (defence in depth: the fingerprint/pin checks would too).
         if (commit.message.startsWith("uzi recovery coverage ")) {
           lookalike = true;
-          if (++lookalikes > MAX_AGGREGATES) return fail("wrapper_lookalike_bound");
+          if (++lookalikes > MAX_AGGREGATES) return fail("wrapper_lookalike_bound", true);
           queue.push(...commit.parents);
           continue;
         }
@@ -7927,12 +8272,43 @@ export class GitCache {
         continue;
       }
       aggregates.push({ fp: m[1]!, tree: commit.tree, author: commit.author, committer: commit.committer });
-      if (aggregates.length > MAX_AGGREGATES) return fail("wrapper_aggregate_bound");
+      if (aggregates.length > MAX_AGGREGATES) return fail("wrapper_aggregate_bound", true);
       queue.push(...commit.parents);
     }
-    if (leaves.size > MAX_LEAVES) return fail("wrapper_leaf_bound");
+    if (leaves.size > MAX_LEAVES) return fail("wrapper_leaf_bound", true);
     const markerLeaves = new Set<string>();
     for (const leaf of leaves) if ((await subjectOf(leaf, "wrapper_leaf_subject")).startsWith(WIP_PARK_COMMIT_PREFIX)) markerLeaves.add(leaf);
+    return { aggregates, leaves, markerLeaves, srcMarker, lookalike, fail };
+  }
+
+  /**
+   * issue #3239: decide what a retained-recovery successor may adopt when the episode restore tip is a
+   * recovery-coverage wrapper that may carry a `wip(park):` marker. Returns undefined for the
+   * unchanged shapes (the tip itself is a marker, or neither the source nor any wrapper leaf is one),
+   * which keep the plain adoption of the tip. Otherwise the wrapper must be provably the worker's own
+   * coverage of the journaled source, and the successor adopts the SOURCE (a marker is then peeled by
+   * the seed's `reset --soft`, so neither marker nor wrapper enters history); any failed proof throws
+   * `successor recovery verification failed`, before a ledger entry or clone exists.
+   *
+   * Fail closed: once the tip is a coverage commit (or the source is a marker), any inability to verify
+   * refuses: an unreadable tip, more than 8 aggregates, or more than MAX_OWED_CANDIDATES_PER_RUN + 2
+   * leaves, or ANY failed read. Only a non-tip commit for which {@link readBoundedCommit} RETURNS
+   * undefined (over 64 KiB, or a body that does not survive the UTF-8 round trip) is demoted to a leaf
+   * and meets the leaf rule, which classifies it by subject and never needs that read; a demoted leaf
+   * whose subject is a coverage subject is refused (genuine aggregates are small ASCII). A read that
+   * THROWS (timeout, git failure, missing object) refuses, as does a failed subject read of the tip,
+   * the source or a leaf: a transient error never classifies a commit as a non-marker. The source and
+   * a marker leaf are compared by plumbing for the same reason.
+   *
+   * The caller holds the bare lock: this helper must never take it (the lock is not reentrant), which is
+   * why it reads aggregates through {@link readBoundedCommit} and not {@link readRecoveryCoverageClaim}.
+   */
+  private async resolveMarkerWrapperAdoption(
+    barePath: string, journal: RecoveryJournalEntry, tip: string, src: string | undefined,
+  ): Promise<{ seedTip: string; expectedHead: string; expectedTree: string; peeledMarkers: string[] } | undefined> {
+    const graph = await this.readMarkerWrapperGraph(barePath, tip, src);
+    if (!graph) return undefined;
+    const { aggregates, leaves, markerLeaves, srcMarker, lookalike, fail } = graph;
     if (!srcMarker && markerLeaves.size === 0) return undefined;
     if (lookalike) return fail("wrapper_lookalike");
 
@@ -19168,11 +19544,28 @@ try {
     });
   }
 
-  /** Recovery-only aggregate, never a tracking/checkpoint/publication ref.
-   * Parent batches have at most 32 roots; every round reduces the count, with no retries.
-   * A failed construction/proof stops the aggregate, retaining all original owed pins. */
+  /** Coverage shape is not provenance. Only the resolver's bounded marker-free
+   * branch is pin-independent, so marker involvement must keep legacy wrapping. */
+  private async reusableRecoveryCoverage(barePath: string, currentSha: string, tree: string): Promise<boolean> {
+    const commit = await this.readBoundedCommit(barePath, currentSha, 64 * 1024);
+    const identity = (kind: string) => `${kind} ${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
+    if (!commit || commit.tree !== tree ||
+        !/^uzi recovery coverage [0-9a-f]{64} round (0|[1-9][0-9]*) batch (0|[1-9][0-9]*)\n$/.test(commit.message) ||
+        commit.author !== identity("author") || commit.committer !== identity("committer")) return false;
+    try {
+      const graph = await this.readMarkerWrapperGraph(barePath, currentSha, undefined);
+      return graph !== undefined && !graph.srcMarker && graph.markerLeaves.size === 0;
+    } catch (error) {
+      if (error instanceof MarkerWrapperGraphLimitError) return false;
+      throw error;
+    }
+  }
+
+  /** Recovery-only coverage source, never a tracking/checkpoint/publication ref.
+   * New inventories may reuse a covered marker-free aggregate; legacy reconstruction
+   * keeps its exact synthetic object. Failed proofs retain all original owed pins. */
   async buildRecoveryCoverage(barePath: string, context: PositiveOwedCandidateContext, originalShas: string[],
-    currentSha: string): Promise<RecoveryCoverage> {
+    currentSha: string, opts: { reuseCoveredCurrent?: "if-covered" | "required" } = {}): Promise<RecoveryCoverage> {
     context = this.snapshotOwedOptions({ context }).context as PositiveOwedCandidateContext;
     if (!Number.isSafeInteger(context.generation) || context.generation <= 0 ||
         "legacy" in context || "origin" in context) throw new Error("recovery coverage requires positive claim context");
@@ -19187,26 +19580,38 @@ try {
         throw new Error("recovery current tree unavailable");
       }
       const fingerprint = createHash("sha256").update(JSON.stringify({ roots, currentSha, tree })).digest("hex");
-      let parents = [...new Set([...roots, currentSha])].sort();
-      let round = 0;
-      do {
-        const next: string[] = [];
-        for (let start = 0; start < parents.length; start += 32) {
-          const args = ["--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", tree];
-          for (const parent of parents.slice(start, start + 32)) args.push("-p", parent);
-          args.push("-m", `uzi recovery coverage ${fingerprint} round ${round} batch ${start / 32}`);
-          const sha = (await this.runSynthesisGit(barePath, args, {
-            GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
-            GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
-            GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
-          })).trim();
-          await this.requireOwedCommit(barePath, sha);
-          next.push(sha);
-        }
-        parents = next;
-        round++;
-      } while (parents.length > 1);
-      const sha = parents[0]!;
+      let reuseCurrent = (opts.reuseCoveredCurrent === "if-covered" || opts.reuseCoveredCurrent === "required") &&
+        await this.reusableRecoveryCoverage(barePath, currentSha, tree);
+      if (reuseCurrent) for (const root of roots) {
+        const relation = await this.ancestry(barePath, root, currentSha);
+        if (relation === "unknown") throw new Error("recovery coverage ancestry proof unavailable");
+        if (relation !== "ancestor") { reuseCurrent = false; break; }
+      }
+      if (opts.reuseCoveredCurrent === "required" && !reuseCurrent)
+        throw new RecoveryCoverageReuseRefused();
+      let sha = currentSha;
+      if (!reuseCurrent) {
+        let parents = [...new Set([...roots, currentSha])].sort();
+        let round = 0;
+        do {
+          const next: string[] = [];
+          for (let start = 0; start < parents.length; start += 32) {
+            const args = ["--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", tree];
+            for (const parent of parents.slice(start, start + 32)) args.push("-p", parent);
+            args.push("-m", `uzi recovery coverage ${fingerprint} round ${round} batch ${start / 32}`);
+            const aggregate = (await this.runSynthesisGit(barePath, args, {
+              GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
+              GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
+              GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+            })).trim();
+            await this.requireOwedCommit(barePath, aggregate);
+            next.push(aggregate);
+          }
+          parents = next;
+          round++;
+        } while (parents.length > 1);
+        sha = parents[0]!;
+      }
       for (const root of [...roots, currentSha]) {
         if (await this.ancestry(barePath, root, sha) !== "ancestor") throw new Error("recovery coverage proof failed");
       }

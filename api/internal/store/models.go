@@ -237,6 +237,13 @@ type CodexAccountRateLimit struct {
 	EnablementSig              pgtype.Text        `json:"enablement_sig"`
 }
 
+type CodexActiveRunCooldown struct {
+	RunID                     uuid.UUID          `json:"run_id"`
+	UserID                    uuid.UUID          `json:"user_id"`
+	AccountCooldownClass      string             `json:"account_cooldown_class"`
+	AccountCooldownEligibleAt pgtype.Timestamptz `json:"account_cooldown_eligible_at"`
+}
+
 type CodexCredentialState struct {
 	UserSecretID      uuid.UUID          `json:"user_secret_id"`
 	UserID            uuid.UUID          `json:"user_id"`
@@ -1617,6 +1624,8 @@ type User struct {
 	WeeklyReservePauseRunning bool               `json:"weekly_reserve_pause_running"`
 	VaultMode                 string             `json:"vault_mode"`
 	VaultEpoch                int64              `json:"vault_epoch"`
+	VaultAutoReunlock         bool               `json:"vault_auto_reunlock"`
+	VaultSlotGeneration       int64              `json:"vault_slot_generation"`
 }
 
 type UserCrossCheckPin struct {
@@ -1651,6 +1660,18 @@ type UserVault struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	LockNotifiedAt pgtype.Timestamptz `json:"lock_notified_at"`
+}
+
+type VaultBrowserSlot struct {
+	ID           uuid.UUID          `json:"id"`
+	UserID       uuid.UUID          `json:"user_id"`
+	BrowserID    uuid.UUID          `json:"browser_id"`
+	WrappedDek   []byte             `json:"wrapped_dek"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
+	TokenVersion int32              `json:"token_version"`
+	VaultEpoch   int64              `json:"vault_epoch"`
+	Generation   int64              `json:"generation"`
 }
 
 type Worker struct {
@@ -1740,6 +1761,12 @@ type WorkerActiveRun struct {
 	SnapshotEpoch        int64              `json:"snapshot_epoch"`
 	ReportedAt           pgtype.Timestamptz `json:"reported_at"`
 	TerminalPendingSince pgtype.Timestamptz `json:"terminal_pending_since"`
+	CooldownOperation    []byte             `json:"cooldown_operation"`
+	CooldownClass        pgtype.Text        `json:"cooldown_class"`
+	CooldownEpisodeID    pgtype.UUID        `json:"cooldown_episode_id"`
+	CooldownEligibleAt   pgtype.Timestamptz `json:"cooldown_eligible_at"`
+	CooldownObservedAt   pgtype.Timestamptz `json:"cooldown_observed_at"`
+	CooldownUntil        pgtype.Timestamptz `json:"cooldown_until"`
 }
 
 type WorkerCordonEvent struct {

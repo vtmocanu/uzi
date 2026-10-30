@@ -21,7 +21,7 @@
 // (a newer server's enum member) renders nothing, so the row reads exactly as before.
 import type { Run, RunProgress } from "../lib/apiTypes";
 import { formatLocalTime } from "../lib/budget";
-import { codexAdmissionText, formatElapsed, isMaintenanceQueued, isReserveQueued, parkLabel, queuedBlockerPrecedesCodexAdmission } from "../lib/runBadge";
+import { accountCooldownText, codexAdmissionText, formatElapsed, isMaintenanceQueued, isReserveQueued, parkLabel, queuedBlockerPrecedesCodexAdmission } from "../lib/runBadge";
 import { stripUnsafeChars } from "../lib/safeText";
 import { Badge } from "./ui";
 
@@ -29,14 +29,14 @@ import { Badge } from "./ui";
 // (the stalled flag's wording), and whatever parkLabel folds through effectiveRunStatus
 // to name a park.
 type ProgressRun = Pick<Run, "progress" | "status_since" | "health_since"> &
-  Partial<Pick<Run, "health" | "health_reason" | "queue_reason" | "codex_admission_class" | "codex_admission_eligible_at">> &
+  Partial<Pick<Run, "health" | "health_reason" | "queue_reason" | "codex_admission_class" | "codex_admission_eligible_at" | "account_cooldown_class" | "account_cooldown_eligible_at">> &
   Parameters<typeof parkLabel>[0];
 
 // progressShowsStall reports whether the cell shows the stalled flag. A row whose cell is
 // visible suppresses its RunHealthBadge then, so one stall is not drawn twice (`◼ stalled`
 // beside `⚠ stalled · Nm`); the cell's tooltip and accessible name keep the health word.
-export function progressShowsStall(run: { progress?: RunProgress | null }): boolean {
-  return run.progress?.state === "stalled";
+export function progressShowsStall(run: { progress?: RunProgress | null; health?: string }): boolean {
+  return run.progress?.state === "stalled" && run.health !== "waiting_account_cooldown";
 }
 
 // The waiting reason, named from the raw status the server derived `waiting` from.
@@ -101,6 +101,9 @@ export function RunProgressCell({ run, now }: { run: ProgressRun; now?: number }
   const p = run.progress;
   if (!p) return null;
   const clock = now ?? Date.now();
+  if (run.health === "waiting_account_cooldown") {
+    return <Quiet state="waiting" word={accountCooldownText(run, clock) ?? "no estimate"} />;
+  }
   switch (p.state) {
     case "percent":
       // Running rows render the estimate inside StatusPill instead of a second bar.

@@ -1,10 +1,13 @@
-import { describe, it } from "node:test";
+import { describe, it, type TestContext } from "node:test";
+import { MessageBatcher } from "../src/batcher.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Executor, ExecutorResult, RunContext } from "../src/executor.js";
 import type { ExecutorFactory, RunRunner } from "../src/runner.js";
+import { StateReportUnappliedError, WorkerClient } from "../src/client.js";
 import { DiskParkSignal } from "../src/cache-cap.js";
 import { acceptsHeldCaptureCleanup, CodexBoundaryError } from "../src/codex/safety.js";
 import type { BoundaryPermit } from "../src/harness.js";
@@ -12,7 +15,7 @@ import { quiesceRunAttempt } from "../src/run-quiescence.js";
 import { SdkExecutor, TransientRecoveryError } from "../src/sdk-executor.js";
 import { followSuccessfulPush } from "./publication-fixture.js";
 import { nullLogger } from "./helpers.js";
-import { api, client, fakeGitlab, git, gitlabClaim, installHarness, runnerWith, worktreeDirFor } from "./runner-harness.js";
+import { api, baseUrl, client, fakeGitlab, git, gitlabClaim, installHarness, runnerWith, TOKEN, worktreeDirFor } from "./runner-harness.js";
 import {
   FakeCodexExecutor,
   codexRig,
@@ -21,6 +24,7 @@ import {
   feedTexts,
   installRecoveryRootCleanup,
   spyCustodySettle,
+  virtualBoundaryClock,
 } from "./runner-codex-sinks-fixture.js";
 
 installHarness();
@@ -48,6 +52,9 @@ interface Scenario {
   error?: () => Error;
   /** Make the pre-report provider reap fail. */
   failReap?: boolean;
+  clock?: ReturnType<typeof virtualBoundaryClock>;
+  afterIdleReport?: () => Promise<void>;
+  wrapIdleRefusal?: boolean;
 }
 
 interface Rig {
@@ -84,7 +91,18 @@ function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
     factory = (runId) => {
       runHome = path.join(homeRoot, runId);
       // Replacement executors own fresh provider roots, safety and capture authority.
-      const rig = codexRig();
+      const rig = codexRig({ now: scenario.clock?.now, armDeadline: scenario.clock?.armDeadline });
+      if (scenario.afterIdleReport) {
+        const boundary = rig.safety.withBoundary.bind(rig.safety);
+        rig.safety.withBoundary = (req, action) => boundary(req, async permit => {
+          try { return await action(permit); }
+          catch (error) {
+            if (scenario.wrapIdleRefusal && modelThrown) throw new CodexBoundaryError("action", [], error);
+            throw error;
+          }
+          finally { if (modelThrown) await scenario.afterIdleReport!(); }
+        });
+      }
       let modelThrown = false;
       codexOwner = rig;
       const instanceBehavior = async (ctx: RunContext): Promise<ExecutorResult> => {
@@ -701,13 +719,13 @@ describe("M2 Codex idle typed ACK and custody", () => {
         });
         try {
           const executing = rig.runner.execute(claim);
-          if (ack === "held") await executing;
+          if (ack === "held" || ack === "strict refusal") await executing;
           else await assert.rejects(executing, { name: "AbortError" });
         } finally { rig.runner.shutdown(); t.mock.restoreAll(); }
-        assert.equal(reports, refusal ? 2 : 1);
-        assert.equal(waits, ack === "held" ? 0 : refusal ? 2 : 1);
+        assert.equal(reports, ack === "strict refusal" ? 1 : refusal ? 2 : 1);
+        assert.equal(waits, ack === "held" || ack === "strict refusal" ? 0 : refusal ? 2 : 1);
         if (refusal) {
-          assert.equal(refusedBodies.length, 2, "both retries reached the actual HTTP refusal hook");
+          assert.equal(refusedBodies.length, ack === "strict refusal" ? 1 : 2, "actual HTTP refusal count");
           for (const body of [...reportBodies, ...refusedBodies]) {
             assert.equal(body.recovery_cause, "codex_idle_stall", "no untyped fallback, including internal client resends");
             assert.equal(body.claim_generation, 3);
@@ -732,6 +750,521 @@ describe("M2 Codex idle typed ACK and custody", () => {
   }
 });
 
+
+const IDLE_UNCONFIRMED = "idle recovery park outcome unconfirmed; the source and session are retained; the accepted cause and whether recovery is held or timed are unknown";
+const IDLE_REFUSED = "idle recovery park report refused without application; the source and session are retained";
+
+function rawIdleNotices(t: TestContext): string[] {
+  const raw: string[] = [];
+  const emit = MessageBatcher.prototype.emit;
+  t.mock.method(MessageBatcher.prototype, "emit", function(this: MessageBatcher, msg: Parameters<typeof emit>[0]) {
+    if (msg.kind === "status" && typeof msg.payload.text === "string") raw.push(msg.payload.text);
+    return emit.call(this, msg);
+  });
+  return raw;
+}
+
+describe("3617 idle park delivery evidence", () => {
+  const feature = "recovery_cause_codex_idle_stall_v1";
+  for (const kind of ["zero_evidence", "productive"] as const) {
+    for (const generation of [3, 4, undefined]) for (const held of [false, true]) {
+      it(`3617 ${kind} lost ACK ownership generation=${generation} held=${held}`, async t => {
+        await withHome(async home => {
+          client.protocolFeatures = ["claim_generation_fence", feature];
+          const clock = virtualBoundaryClock();
+          t.mock.method(Date, "now", clock.now);
+          const rig = rigFor("codex", { clock, turns: 2,
+            error: () => new TransientRecoveryError("idle", { idleStallKind: kind }) }, home);
+          const claim = gitlabClaim(36171, { claim_generation: 3 });
+          const raw = rawIdleNotices(t);
+          let posts = 0;
+          const stop = api.dropStatesWhen(claim.run_id, body => {
+            if (body.recovery_cause !== "codex_idle_stall") return false;
+            return ++posts > 1;
+          });
+          api.onState(claim.run_id, body => {
+            if (body.recovery_cause !== "codex_idle_stall") return;
+            api.ownershipWire.set(claim.run_id, response => {
+              response.writeHead(200, { "Content-Type": "application/json" });
+              response.end(JSON.stringify({
+                status: "recovery_wait", claim_generation: generation, inventory_guarded: true,
+                ...(held ? {} : { recovery_retry_not_before: "2026-10-28T00:00:00Z" }),
+              }));
+            });
+          });
+          api.afterPersistState(claim.run_id, body => body.recovery_cause === "codex_idle_stall", "drop");
+          let waits = 0;
+          t.mock.method(rig.runner as unknown as { waitRecoveryRetry: () => Promise<void> }, "waitRecoveryRetry",
+            async () => { waits++; clock.advance(5); });
+          try { await rig.runner.execute(claim); } finally { stop(); }
+          assert.equal(posts, 3, "all bounded client attempts retain the typed body");
+          assert.equal(waits, 1, "the runner's bounded retry remains in use");
+          assert.equal(parks(claim.run_id).length, 1, "first report applied, later requests dropped before application");
+          assert.equal(parks(claim.run_id)[0]?.claim_generation, 3);
+          assert.equal(feedTexts(claim.run_id).filter(text => text === IDLE_UNCONFIRMED).length, generation === 3 ? 1 : 0);
+          assert.equal(raw.filter(text => text === IDLE_UNCONFIRMED).length, generation === 3 ? 1 : 0);
+          assert.ok(!feedTexts(claim.run_id).includes(IDLE_REFUSED));
+          assert.ok(!feedTexts(claim.run_id).some(text => /resumes automatically|waits for its owner/.test(text)));
+          assert.equal(rig.custody(), 0);
+          assert.deepEqual(rig.archive.releaseCalls, []);
+          assert.equal(fs.readFileSync(path.join(worktreeDirFor(36171), "WORK.txt"), "utf8"), "work before the outage\n");
+          assert.equal(fs.readFileSync(path.join(rig.homePath(), "session"), "utf8"), "transcript");
+          assert.ok(!api.states.some(s => s.runId === claim.run_id && ["failed", "completed"].includes(s.body.status ?? "")));
+        });
+      });
+    }
+
+    it(`3617 ${kind} lost ACK exact-cause replay remains accepted`, async () => {
+      await withHome(async home => {
+        client.protocolFeatures = ["claim_generation_fence", feature];
+        const rig = rigFor("codex", {
+          error: () => new TransientRecoveryError("idle", { idleStallKind: kind }) }, home);
+        const claim = gitlabClaim(36175, { claim_generation: 3 });
+        api.afterPersistState(claim.run_id, body => body.recovery_cause === "codex_idle_stall", "drop");
+        api.stateAckWire = (body, run) => body.recovery_cause === "codex_idle_stall"
+          ? { status: 200, body: { run: { ...run, recovery_wait_cause: "codex_idle_stall",
+              recovery_retry_not_before: "2026-10-28T00:00:00Z" } } } : undefined;
+        await rig.runner.execute(claim);
+        assert.equal(parks(claim.run_id).length, 2, "the actual applied POST is replayed after losing its ACK");
+        assert.equal(rig.custody(), 1);
+        assert.ok(!feedTexts(claim.run_id).includes(IDLE_UNCONFIRMED));
+        assert.ok(!feedTexts(claim.run_id).includes(IDLE_REFUSED));
+        assert.ok(feedTexts(claim.run_id).some(text => /resumes automatically/.test(text)));
+      });
+    });
+
+    it(`3617 ${kind} complete refusal joins before notice and stops promptly`, async t => {
+      await withHome(async home => {
+        client.protocolFeatures = ["claim_generation_fence", feature];
+        const clock = virtualBoundaryClock();
+        t.mock.method(Date, "now", clock.now);
+        let release!: () => void, entered!: () => void;
+        const held = new Promise<void>(resolve => { release = resolve; });
+        const joining = new Promise<void>(resolve => { entered = resolve; });
+        let refused = false, done = false, posts = 0, publicErrors = 0, retryWaits = 0;
+        const rig = rigFor("codex", { clock, turns: 2,
+          error: () => new TransientRecoveryError("idle", { idleStallKind: kind }),
+          afterIdleReport: async () => { if (refused) { entered(); await held; } },
+          wrapIdleRefusal: true,
+        }, home);
+        const claim = gitlabClaim(36172, { claim_generation: 3 });
+        const raw = rawIdleNotices(t);
+        api.failStateWhen(claim.run_id, body => {
+          if (body.recovery_cause !== "codex_idle_stall") return false;
+          posts++;
+          refused = true;
+          return true;
+        }, { httpStatus: 400, error: "invalid request body" });
+        t.mock.method(rig.runner as unknown as { waitRecoveryRetry: () => Promise<void> }, "waitRecoveryRetry",
+          async () => { retryWaits++; throw new Error("definitive refusal must not enter the recovery retry wait"); });
+        const report = client.reportState.bind(client);
+        t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
+          try { return await report(...args); }
+          catch (error) {
+            if (error instanceof StateReportUnappliedError) {
+              assert.equal(error.runId, claim.run_id);
+              publicErrors++; refused = true;
+            }
+            throw error;
+          }
+        });
+        const started = clock.now();
+        const operation = rig.runner.execute(claim).finally(() => { done = true; });
+        try {
+          await Promise.race([joining, operation.then(() => { throw new Error("execute returned before join barrier"); })]);
+          assert.equal(done, false);
+          assert.equal(publicErrors, 1, "public error comes from the actual authenticated client");
+          assert.ok(!feedTexts(claim.run_id).includes(IDLE_REFUSED), "no joined notice inside held cleanup");
+          assert.ok(!raw.includes(IDLE_REFUSED), "no notice emitted before join");
+          clock.advance(1000);
+        } finally { release(); await operation; }
+        assert.ok(clock.now() - started < 120_000, "retained stop precedes both original deadlines");
+        assert.equal(retryWaits, 0, "a definitive refusal never enters the retry wait");
+        assert.equal(posts, 1);
+        assert.equal(parks(claim.run_id).length, 0);
+        assert.equal(feedTexts(claim.run_id).filter(text => text === IDLE_REFUSED).length, 1);
+        assert.equal(raw.filter(text => text === IDLE_REFUSED).length, 1);
+        assert.ok(!feedTexts(claim.run_id).includes(IDLE_UNCONFIRMED));
+        const baseline = { states: api.states.length, custody: rig.custody(), releases: rig.archive.releaseCalls.length,
+          source: fs.readFileSync(path.join(worktreeDirFor(36172), "WORK.txt"), "utf8"),
+          session: fs.readFileSync(path.join(rig.homePath(), "session"), "utf8") };
+        clock.advance(240_000);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.deepEqual({ states: api.states.length, custody: rig.custody(), releases: rig.archive.releaseCalls.length,
+          source: fs.readFileSync(path.join(worktreeDirFor(36172), "WORK.txt"), "utf8"),
+          session: fs.readFileSync(path.join(rig.homePath(), "session"), "utf8") }, baseline);
+        assert.equal(posts, 1, "no later refused POST after the retained stop");
+        assert.equal(baseline.source, "work before the outage\n");
+        assert.equal(baseline.session, "transcript");
+        assert.equal(baseline.custody, 0);
+        assert.equal(baseline.releases, 0);
+        assert.ok(!api.states.some(s => s.runId === claim.run_id && ["failed", "completed"].includes(s.body.status ?? "")));
+      });
+    });
+
+    for (const control of ["shutdown", "shutdown fractional budget", "cancel", "fence"] as const) {
+      it(`3617 ${kind} refusal join closes its batcher after ${control}`, async t => {
+        await withHome(async home => {
+          client.protocolFeatures = ["claim_generation_fence", feature];
+          api.strictReceiptGenerations = true;
+          const clock = virtualBoundaryClock();
+          t.mock.method(Date, "now", clock.now);
+          let release!: () => void, entered!: () => void;
+          const held = new Promise<void>(resolve => { release = resolve; });
+          const joining = new Promise<void>(resolve => { entered = resolve; });
+          let refused = false, joined = false, done = false, posts = 0, closes = 0, closedBeforeJoin = false;
+          const rig = rigFor("codex", { clock, turns: 2,
+            error: () => new TransientRecoveryError("idle", { idleStallKind: kind }),
+            afterIdleReport: async () => { if (refused) { entered(); await held; joined = true; } },
+            wrapIdleRefusal: true,
+          }, home);
+          const claim = gitlabClaim(36178, { claim_generation: 3 });
+          api.setInputClaimGeneration(claim.run_id, 3);
+          const recovery = rig.runner["handleRecoveryExhausted"].bind(rig.runner);
+          let flight: Parameters<typeof recovery>[2] | undefined;
+          let ownerBatcher: MessageBatcher | undefined;
+          rig.runner["handleRecoveryExhausted"] = async (...args: Parameters<typeof recovery>) => {
+            flight = args[2]; ownerBatcher = args[4];
+            return recovery(...args);
+          };
+          const closeSignals: Array<AbortSignal | undefined> = [];
+          const close = MessageBatcher.prototype.close;
+          t.mock.method(MessageBatcher.prototype, "close", async function(this: MessageBatcher, ...args: Parameters<typeof close>) {
+            if (this === ownerBatcher) {
+              closedBeforeJoin ||= !joined;
+              closes++; closeSignals.push(args[0]);
+            }
+            return close.apply(this, args);
+          });
+          api.failStateWhen(claim.run_id, body => {
+            if (body.recovery_cause !== "codex_idle_stall") return false;
+            posts++; refused = true; return true;
+          }, { httpStatus: 400, error: "invalid request body" });
+          let budgetNow = 0.25;
+          const budget = control === "shutdown fractional budget" ? new MaintenanceBudget(600_000, () => budgetNow) : undefined;
+          const operation = (budget ? MaintenanceBudget.run(budget, () => rig.runner.execute(claim)) : rig.runner.execute(claim))
+            .finally(() => { done = true; budget?.dispose(); });
+          // Attach the rejection observer before delivering shutdown.
+          const outcome = operation.then(() => undefined, error => error);
+          try {
+            await Promise.race([joining, operation.then(() => { throw new Error("execute returned before join barrier"); })]);
+            assert.equal(done, false);
+            assert.equal(closes, 0);
+            assert.equal(posts, 1);
+            assert.ok(flight);
+            if (control.startsWith("shutdown")) rig.runner.shutdown();
+            else {
+              const delivered = flight.steering.terminalLifecycleSignal();
+              const observed = new Promise<void>((resolve, reject) => {
+                const timer = setTimeout(() => {
+                  delivered.removeEventListener("abort", finish);
+                  reject(new Error("control was not delivered"));
+                }, 2000);
+                const finish = (): void => { clearTimeout(timer); resolve(); };
+                if (delivered.aborted) finish();
+                else delivered.addEventListener("abort", finish, { once: true });
+              });
+              if (control === "fence") {
+                api.setInputClaimGeneration(claim.run_id, 4);
+                api.setInputFenceReason(claim.run_id, "released");
+              }
+              api.setInputs(claim.run_id, [{ id: 1, kind: control === "cancel" ? "cancel" : "follow_up" }]);
+              await observed;
+              assert.equal(control === "cancel" ? flight.steering.isCancelled() : flight.steering.claimFence() !== undefined, true);
+            }
+            // Exhaust the old capture and shutdown grace while cleanup is held.
+            if (budget) budgetNow += 599_999.5;
+            else clock.advance(240_000);
+            assert.equal(done, false);
+            assert.equal(closes, 0);
+          } finally { release(); await outcome; }
+          const error: unknown = await outcome;
+          if (control.startsWith("shutdown")) assert.ok(error instanceof Error && error.name === "AbortError", String(error));
+          else assert.equal(error, undefined);
+          assert.equal(closedBeforeJoin, false, "never close inside held cleanup before join");
+          assert.equal(closes, 1, "one post-join close, including control exits bypassing the refusal notice");
+          if (control.startsWith("shutdown")) {
+            assert.ok(closeSignals[0], "shutdown cleanup has an explicit bounded close signal");
+            assert.equal(closeSignals[0].aborted, true, "expired grace or less than one remaining millisecond grants no fresh flush allowance");
+          }
+          assert.equal(posts, 1);
+          assert.equal(parks(claim.run_id).length, 0);
+          assert.equal(rig.custody(), 0);
+          assert.deepEqual(rig.archive.releaseCalls, []);
+          assert.equal(fs.readFileSync(path.join(worktreeDirFor(36178), "WORK.txt"), "utf8"), "work before the outage\n");
+          assert.equal(fs.readFileSync(path.join(rig.homePath(), "session"), "utf8"), "transcript");
+          if (control === "cancel") assert.ok(api.states.some(s => s.runId === claim.run_id && s.body.failure_reason === "run cancelled"));
+          else assert.ok(!api.states.some(s => s.runId === claim.run_id && ["failed", "completed"].includes(s.body.status ?? "")));
+        });
+      });
+    }
+
+    it(`3617 ${kind} disposition-only free fallback refuses after capture join and closes its batcher`, async t => {
+      await withHome(async home => {
+        client.protocolFeatures = ["claim_generation_fence", feature];
+        const clock = virtualBoundaryClock();
+        t.mock.method(Date, "now", clock.now);
+        let release!: () => void, entered!: () => void;
+        const held = new Promise<void>(resolve => { release = resolve; });
+        const joining = new Promise<void>(resolve => { entered = resolve; });
+        let captures = 0, joined = false, posts = 0, publicErrors = 0, closes = 0, waits = 0;
+        const rig = rigFor("codex", { clock, turns: 2,
+          error: () => new TransientRecoveryError("idle", { idleStallKind: kind }),
+          afterIdleReport: async () => {
+            if (captures === 1 && !joined) { entered(); await held; joined = true; }
+          },
+        }, home);
+        const claim = gitlabClaim(36177, { claim_generation: 3 });
+        const raw = rawIdleNotices(t);
+        const capture = rig.runner["captureRecoveryRestorePoint"].bind(rig.runner);
+        rig.runner["captureRecoveryRestorePoint"] = async (...args: Parameters<typeof capture>) => {
+          const result = await capture(...args);
+          assert.equal(result.verified, true, "real capture supplies the joined local evidence");
+          captures++;
+          // Refuse the authenticated continuation AFTER local capture, BEFORE any POST.
+          // This enters the actual joined disposition, rather than wrapping a refusal.
+          throw new CodexBoundaryError("action", [], new Error("post-capture action unavailable"));
+        };
+        const recovery = rig.runner["handleRecoveryExhausted"].bind(rig.runner);
+        let dispositionBatcher: MessageBatcher | undefined;
+        let dispositions = 0;
+        rig.runner["handleRecoveryExhausted"] = async (...args: Parameters<typeof recovery>) => {
+          const options = args[8];
+          if (options?.dispositionOnly) {
+            dispositions++;
+            assert.equal(joined, true);
+            assert.equal(options.freeFallback, true);
+            assert.equal(options.heldAuthenticated, undefined);
+            assert.equal(options.heldCapture, undefined);
+            dispositionBatcher = args[4];
+          }
+          return recovery(...args);
+        };
+        const close = MessageBatcher.prototype.close;
+        t.mock.method(MessageBatcher.prototype, "close", async function (this: MessageBatcher, ...args: Parameters<typeof close>) {
+          if (this === dispositionBatcher) closes++;
+          return close.apply(this, args);
+        });
+        rig.runner["waitRecoveryRetry"] = async () => {
+          waits++;
+          throw new Error("definitive refusal must not retry");
+        };
+        api.failStateWhen(claim.run_id, body => {
+          if (body.recovery_cause !== "codex_idle_stall") return false;
+          posts++;
+          assert.equal(joined, true, "no report before authenticated capture joins");
+          assert.equal(dispositions, 1, "real HTTP refusal occurs in the disposition-only continuation");
+          assert.equal(body.provider_progress_turns, 2);
+          assert.equal(body.claim_generation, 3);
+          return true;
+        }, { httpStatus: 400, error: "invalid request body" });
+        const report = client.reportState.bind(client);
+        t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
+          try { return await report(...args); }
+          catch (error) {
+            if (error instanceof StateReportUnappliedError) {
+              assert.equal(error.runId, claim.run_id);
+              publicErrors++;
+            }
+            throw error;
+          }
+        });
+        const started = clock.now();
+        const operation = rig.runner.execute(claim);
+        try {
+          await Promise.race([joining, operation.then(() => { throw new Error("execute returned before capture join"); })]);
+          assert.equal(posts, 0);
+          assert.ok(!raw.includes(IDLE_REFUSED));
+          clock.advance(1000);
+        } finally { release(); await operation; }
+        assert.equal(captures, 1, "joined disposition consumes local evidence without recapture");
+        assert.equal(dispositions, 1);
+        assert.equal(publicErrors, 1, "actual client proves the report was unapplied");
+        assert.equal(closes, 1, "existing retained stop closes the disposition batcher");
+        assert.equal(waits, 0);
+        assert.equal(posts, 1);
+        assert.ok(clock.now() - started < 120_000);
+        assert.equal(parks(claim.run_id).length, 0);
+        assert.equal(raw.filter(text => text === IDLE_REFUSED).length, 1);
+        assert.equal(feedTexts(claim.run_id).filter(text => text === IDLE_REFUSED).length, 1);
+        assert.ok(!feedTexts(claim.run_id).includes(IDLE_UNCONFIRMED));
+        assert.equal(rig.custody(), 0);
+        assert.deepEqual(rig.archive.releaseCalls, []);
+        assert.equal(fs.readFileSync(path.join(worktreeDirFor(36177), "WORK.txt"), "utf8"), "work before the outage\n");
+        assert.equal(fs.readFileSync(path.join(rig.homePath(), "session"), "utf8"), "transcript");
+        clock.advance(240_000);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(posts, 1);
+        assert.equal(closes, 1);
+        assert.equal(captures, 1);
+        assert.ok(!api.states.some(s => s.runId === claim.run_id && ["failed", "completed"].includes(s.body.status ?? "")));
+      });
+    });
+
+    for (const initial of ["client retry", "statusless", "wrong cause", "runner retry"] as const) {
+      it(`3617 ${kind} ambiguity before refusal across ${initial}`, async t => {
+        await withHome(async home => {
+          client.protocolFeatures = ["claim_generation_fence", feature];
+          const clock = virtualBoundaryClock();
+          t.mock.method(Date, "now", clock.now);
+          const rig = rigFor("codex", { clock,
+            error: () => new TransientRecoveryError("idle", { idleStallKind: kind }) }, home);
+          const claim = gitlabClaim(36173, { claim_generation: 3 });
+          let posts = 0, waits = 0, publicErrors = 0;
+          const refusedBodies: unknown[] = [];
+          const refuse = () => api.failStateWhen(claim.run_id, body => {
+            if (body.recovery_cause !== "codex_idle_stall") return false;
+            refusedBodies.push(structuredClone(body));
+            return true;
+          }, { httpStatus: 400, error: "invalid request body" });
+          const stop = api.dropStatesWhen(claim.run_id, body => {
+            if (body.recovery_cause !== "codex_idle_stall") return false;
+            posts++;
+            if (initial === "client retry" && posts === 1) { refuse(); return true; }
+            return initial === "runner retry" && waits === 0;
+          });
+          api.stateAckWire = (body, run) => body.recovery_cause === "codex_idle_stall"
+            ? { status: 200, body: { run: { ...run, status: initial === "statusless" ? undefined : "recovery_wait",
+                recovery_wait_cause: "provider_outage" } } } : undefined;
+          // Keep ownership running after the uncertain ACK so the next runner call is exercised.
+          api.onState(claim.run_id, body => {
+            if (body.recovery_cause === "codex_idle_stall") api.setOwnershipStatus(claim.run_id, "running", 3);
+          });
+          const report = client.reportState.bind(client);
+          t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
+            try { return await report(...args); }
+            catch (error) { if (error instanceof StateReportUnappliedError) publicErrors++; throw error; }
+          });
+          t.mock.method(rig.runner as unknown as { waitRecoveryRetry: () => Promise<void> }, "waitRecoveryRetry", async () => {
+            waits++; clock.advance(5);
+            assert.ok(!feedTexts(claim.run_id).includes(IDLE_REFUSED));
+            if (waits === 1) { refuse(); return; }
+            api.setOwnershipStatus(claim.run_id, "recovery_wait", 3);
+          });
+          try { await rig.runner.execute(claim); } finally { stop(); }
+          assert.equal(waits, 2, "refusal after ambiguity still uses bounded typed retry");
+          assert.equal(publicErrors, 1, "fresh runner call may be definitely unapplied by itself");
+          assert.equal(refusedBodies.length, initial === "client retry" ? 2 : 1);
+          for (const body of refusedBodies) {
+            assert.equal((body as { recovery_cause: string }).recovery_cause, "codex_idle_stall");
+            assert.equal((body as { claim_generation: number }).claim_generation, 3);
+          }
+          assert.equal(feedTexts(claim.run_id).filter(text => text === IDLE_UNCONFIRMED).length, 1);
+          assert.ok(!feedTexts(claim.run_id).includes(IDLE_REFUSED));
+          assert.equal(rig.custody(), 0);
+          assert.deepEqual(rig.archive.releaseCalls, []);
+          assert.ok(fs.existsSync(worktreeDirFor(36173)));
+          assert.ok(fs.existsSync(path.join(rig.homePath(), "session")));
+        });
+      });
+    }
+
+    for (const control of ["cancel", "fence", "shutdown"] as const) {
+      it(`3617 ${kind} ambiguous retry wait is interrupted by ${control}`, async t => {
+        await withHome(async home => {
+          client.protocolFeatures = ["claim_generation_fence", feature];
+          const rig = rigFor("codex", {
+            error: () => new TransientRecoveryError("idle", { idleStallKind: kind }),
+          }, home);
+          const claim = gitlabClaim(36176, { claim_generation: 3 });
+          api.strictReceiptGenerations = true;
+          api.setInputClaimGeneration(claim.run_id, 3);
+          let posts = 0, waits = 0, interrupted = false, waitExpired = false;
+          const stop = api.dropStatesWhen(claim.run_id, body => {
+            if (body.recovery_cause !== "codex_idle_stall") return false;
+            posts++;
+            return true;
+          });
+          const wait = rig.runner["waitRecoveryRetry"].bind(rig.runner);
+          t.mock.method(rig.runner as unknown as { waitRecoveryRetry: typeof wait }, "waitRecoveryRetry",
+            async (...args: Parameters<typeof wait>) => {
+              waits++;
+              // Keep the real interruptible wait. A separate fail-fast signal prevents
+              // a broken control path from spending its full ten seconds in this test.
+              const watchdog = new AbortController();
+              const timer = setTimeout(() => {
+                waitExpired = true;
+                watchdog.abort(new Error("control did not interrupt recovery wait"));
+              }, 2000);
+              const signal = args[3] ? AbortSignal.any([args[3], watchdog.signal]) : watchdog.signal;
+              const pending = wait(args[0], args[1], 10_000, signal);
+              if (control === "shutdown") rig.runner.shutdown();
+              else {
+                if (control === "fence") {
+                  api.setInputClaimGeneration(claim.run_id, 4);
+                  api.setInputFenceReason(claim.run_id, "released");
+                }
+                api.setInputs(claim.run_id, [{ id: 1, kind: control === "cancel" ? "cancel" : "follow_up" }]);
+              }
+              try { await pending; }
+              finally {
+                clearTimeout(timer);
+                interrupted = control === "cancel" ? args[0].steering.isCancelled()
+                  : control === "fence" ? args[0].steering.claimFence() !== undefined
+                  : args[3]?.aborted === true;
+              }
+            });
+          try {
+            const operation = rig.runner.execute(claim);
+            if (control === "shutdown") await assert.rejects(operation, { name: "AbortError" });
+            else await operation;
+          } finally { stop(); rig.runner.shutdown(); }
+          assert.equal(waits, 1);
+          assert.equal(waitExpired, false, "the control interrupts before the fail-fast deadline");
+          assert.equal(interrupted, true, "the wait observes the delivered control");
+          assert.equal(posts, 3, "no idle resend after the control interrupts the client-exhausted attempt");
+          assert.ok(!feedTexts(claim.run_id).includes(IDLE_REFUSED));
+          if (control === "cancel")
+            assert.ok(api.states.some(s => s.runId === claim.run_id && s.body.failure_reason === "run cancelled"));
+          else assert.ok(!api.states.some(s => s.runId === claim.run_id && ["failed", "completed"].includes(s.body.status ?? "")));
+        });
+      });
+    }
+
+    for (const wire of ["timeout", "unreadable", "truncated", "oversized", "malformed", "unknown validation"] as const) {
+      it(`3617 ${kind} ${wire} is ambiguous and stays frozen`, async () => {
+        const claim = gitlabClaim(36174, { claim_generation: 3 });
+        const requests: string[] = [];
+        let truncatedPrefixRead = false;
+        const transport: typeof fetch = async (url, init) => {
+          requests.push(String(init?.body));
+          api.failStateWhen(claim.run_id, () => true, { httpStatus: 400, error: "invalid request body" });
+          const response = await fetch(url, init);
+          assert.equal(response.status, 400);
+          await response.text();
+          if (wire === "timeout") throw new DOMException("request timed out", "TimeoutError");
+          if (wire === "unreadable") return new Response(new ReadableStream({
+            start(controller) { controller.error(new Error("unreadable response")); },
+          }), { status: 400 });
+          if (wire === "truncated") {
+            let sent = false;
+            return new Response(new ReadableStream({
+              pull(controller) {
+                if (!sent) { sent = true; controller.enqueue(new TextEncoder().encode('{"error":"invalid request body"}')); }
+                else { truncatedPrefixRead = true; controller.error(new Error("stream failed before EOF")); }
+              },
+            }), { status: 400 });
+          }
+          return new Response(wire === "oversized" ? JSON.stringify({ error: "invalid request body" }) + " ".repeat(8192)
+            : wire === "malformed" ? '{"error":"invalid request body"'
+            : JSON.stringify({ error: "invalid progress" }), { status: 400 });
+        };
+        const real = new WorkerClient(baseUrl, TOKEN, "test", nullLogger(), {
+          fetch: transport, sleep: async () => {}, terminalRetrySchedule: [1, 1],
+        });
+        real.protocolFeatures = ["claim_generation_fence", feature];
+        const body = { status: "recovery_wait" as const, claim_generation: 3,
+          recovery_cause: "codex_idle_stall" as const, provider_progress_turns: 2 };
+        await assert.rejects(real.reportState(claim.run_id, body), error => !(error instanceof StateReportUnappliedError));
+        assert.ok(requests.length > 0 && requests.length <= 3);
+        if (wire === "truncated") assert.equal(truncatedPrefixRead, true, "complete-looking JSON was read before EOF failed");
+        for (const request of requests) assert.deepEqual(JSON.parse(request), body);
+        assert.equal(parks(claim.run_id).length, 0);
+        assert.equal(real.hasFeature(feature), true);
+      });
+    }
+  }
+});
 
 describe("3506 dual marker provider wire precedence", () => {
   for (const scenario of [

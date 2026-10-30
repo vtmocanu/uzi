@@ -1529,6 +1529,21 @@ including when the full worker ACK has no retry timestamp (held).
 Without negotiation, zero-evidence idle keeps legacy untyped recovery and
 productive idle keeps terminal failure. An advertised feature followed by HTTP
 400 or feature loss must not cause an untyped resend; source stays kept.
+
+Issue #3617 clarifies two unconfirmed outcomes (2026-10-29). After a possibly
+applied typed idle report, same-generation ownership `recovery_wait` alone emits
+`idle recovery park outcome unconfirmed`; it establishes neither accepted cause
+nor held/timed status. The existing source, session and custody disposition stays.
+A complete authenticated exact decoder refusal with no earlier ambiguous send is
+definitively unapplied: stop identical POSTs, join the capture region, emit one
+refusal notice and immediately take the existing retained stop. This neither
+acknowledges a park nor permits custody settlement or a terminal failure. Unknown,
+incomplete or ambiguous responses retain the existing bounded typed handling,
+including when an exact refusal follows a possibly applied send. No episode is
+renewed, and no post-unwind supervision or budget/control channel is added. The
+retained stop can leave a same-generation row `running`; that existing behavior
+is tracked separately in #3630 and is not corrected here.
+
 See [the runner](../agent/src/runner.ts) and [client](../agent/src/client.ts).
 
 ### Park-observed accounting and owner controls

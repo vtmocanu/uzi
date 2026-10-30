@@ -568,9 +568,9 @@ type GetRunCodexAuthContextRow struct {
 //
 //	current_coord_state — the account's live coordination state (NULL for an api_key
 //	alias, which has no account behind the LEFT JOIN). The release predicate must NOT
-//	hand a run authority over an account parked in 'quarantined'/'in_progress'; without
-//	this column the release decision could not see the quarantine and could release a
-//	possibly-ambiguous account.
+//	hand a run authority over an account parked in 'quarantined'. An 'in_progress'
+//	refresh lease alone does not forbid release; its contention is handled by the
+//	refresh CAS. Without this column release could not detect ambiguous material.
 //	bound_kind — the alias's own user_secrets.kind, joined owner-scoped (us.user_id =
 //	r.user_id) so it can never read a foreign secret's kind. The bind-time kind↔auth-mode
 //	check needs the actual kind to reject a binding whose auth_mode contradicts the

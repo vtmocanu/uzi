@@ -16,9 +16,12 @@ export function sourcePublicationContext(
     mrIid: number;
     issueIid: number | null;
     intent: "closing" | "non_closing" | "not_applicable";
+    /** A completed source with no stored stamp; only meaningful as conservative non_closing. */
+    unstamped?: boolean;
   },
 ): PublicationContextResponse {
   assert.notEqual(source.runId, runId);
+  if (source.unstamped) assert.equal(source.intent, "non_closing", "an unstamped source can only be non_closing");
   assert.notEqual(source.publishedHead, request.candidate_head);
   assert.equal(source.issueIid === null, source.intent === "not_applicable");
   return {
@@ -29,7 +32,7 @@ export function sourcePublicationContext(
       ...request,
       mr_iid: source.mrIid,
       source_run_id: source.runId,
-      source_publication: source.intent === "not_applicable" ? null : {
+      source_publication: source.intent === "not_applicable" || source.unstamped ? null : {
         version: 1,
         claim_generation: 1,
         branch: request.branch,

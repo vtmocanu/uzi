@@ -163,6 +163,7 @@ export interface ModelSettingCell {
 }
 
 export interface UserSettings {
+  vault_auto_reunlock?: boolean;
   cross_check_pins?: CrossCheckPinDTO[];
   /** @deprecated PRD #1551 D2: superseded by the explicit per-harness lanes below.
    *  Kept for one compatibility release as a server-projected legacy field — the
@@ -241,6 +242,7 @@ export interface UserSettings {
 // is applied (null clears it), a field absent is left unchanged — so the model
 // card and the Appearance picker save independently over the one endpoint.
 export interface UserSettingsPatch {
+  vault_auto_reunlock?: boolean;
   cross_check_pins?: { stage: "plan" | "code"; harness: Harness; model?: string | null; effort?: string | null }[];
   /** @deprecated PRD #1551 D3: the legacy single-model field. New clients (the grouped
    *  Run Defaults card) send default_claude_model / default_codex_model instead and never
@@ -876,6 +878,9 @@ export interface LatestRun {
   // Eligibility includes the per-run spread and is not a promised start time.
   codex_admission_class?: CodexAdmissionClass | null;
   codex_admission_eligible_at?: string | null;
+  /** Owner-only active account cooldown; eligibility includes server spread, not dispatch time. */
+  account_cooldown_class?: CodexAdmissionClass | null;
+  account_cooldown_eligible_at?: string | null;
   // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
@@ -1015,6 +1020,7 @@ export interface ForgeConfig {
 // every field is always present. default_theme is the instance-default UI theme
 // (PRD #21).
 export interface AppSettings {
+  vault_reunlock_days?: string;
   // Settings are a string map; callers accept only optional, otherwise required.
   // Missing on older APIs must also be treated as required.
   vault_policy?: string;
@@ -1691,6 +1697,8 @@ export interface HealthCheck {
 export interface HealthEvidence {
   label: string;
   value: string;
+  run_id?: string;
+  owner_id?: string;
 }
 
 // ── CLI tokens (PRD #64) ──────────────────────────────────────────────────
@@ -2824,7 +2832,7 @@ export type StopKind =
 export type JudgeVerdict = "ideal" | "ok" | "issues";
 
 export type RunHealth =
-  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle";
+  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle" | "waiting_account_cooldown";
 
 // FixVerdict is a ci_fix run's outcome (PRD #6): verified/fix_failed are stamped
 // server-side from the post-fix pipeline; not_code is the agent's "not a code
@@ -3264,6 +3272,9 @@ export interface Run {
   // Eligibility includes the per-run spread and is not a promised start time.
   codex_admission_class?: CodexAdmissionClass | null;
   codex_admission_eligible_at?: string | null;
+  /** Owner-only active account cooldown; eligibility includes server spread, not dispatch time. */
+  account_cooldown_class?: CodexAdmissionClass | null;
+  account_cooldown_eligible_at?: string | null;
   /** PRD #320 D8: the run's queue-priority CLASS, computed server-side (see RunPriority).
    *  Only a QUEUED run is ever non-"normal"; a running/terminal run renders no pill. It
    *  rides the shared run embed (RunListItemDTO embeds RunDTO), so it is present on BOTH

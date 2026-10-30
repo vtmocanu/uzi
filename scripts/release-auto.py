@@ -317,9 +317,10 @@ class Release:
         deadline_utc = dt.datetime.fromtimestamp(self.wall_time() + seconds, dt.timezone.utc).isoformat(timespec='seconds')
         last_progress = None
         selected, plan = None, None
+        skip_tip = False
         while True:
             if self.clock() > deadline:
-                raise Stop(deadline_reason, 'defer')
+                raise Stop('skip-ci-tip' if skip_tip else deadline_reason, 'defer')
             self.git('fetch', '--prune', '--tags', 'origin')
             sha = self.git('rev-parse', 'refs/remotes/origin/main')
             self.evidence['parent'] = sha
@@ -339,10 +340,11 @@ class Release:
             if pending_retry and ci and ci['id'] == pending_retry[0] and ci['run_attempt'] <= pending_retry[1]:
                 require(self.clock() < pending_retry[2], 'tip-ci-retry-not-started')
                 ci_state = 'pending'
+            skip_tip = (ci is None or smoke is None) and policy.skips_ci(self.git('show', '-s', '--format=%B', sha))
             self.evidence['stage'] = 'tip-wait'
             progress = (sha, plan['TAG'], ci_state, (ci or {}).get('id'), (ci or {}).get('run_attempt'),
                         (ci or {}).get('status'), (ci or {}).get('conclusion'),
-                        smoke_state, (smoke or {}).get('id'), (smoke or {}).get('run_attempt'),
+                        smoke_state, skip_tip, (smoke or {}).get('id'), (smoke or {}).get('run_attempt'),
                         (smoke or {}).get('status'), (smoke or {}).get('conclusion'))
             if progress != last_progress:
                 print('release-auto: ' + json.dumps(dict(phase='prepare', stage='tip-wait', parent=sha,
@@ -352,10 +354,15 @@ class Release:
                       smoke_run=(smoke or {}).get('id'), smoke_attempt=(smoke or {}).get('run_attempt'),
                       smoke_status=(smoke or {}).get('status'), smoke_conclusion=(smoke or {}).get('conclusion'),
                       elapsed_seconds=round(self.clock() - started, 1), deadline_utc=deadline_utc,
+                      skip_ci_tip=skip_tip,
                       remaining_seconds=round(max(0, deadline - self.clock()), 1)), sort_keys=True), flush=True)
                 last_progress = progress
             if smoke_state == 'failed':
                 raise Stop('tip-smoke-failed')
+            if skip_tip:
+                require(ci_state != 'failed', 'tip-ci-not-retryable')
+                if not self.config['scheduled']:
+                    raise Stop('skip-ci-tip')
             if ci_state == 'failed':
                 marker = ci['id'], ci['run_attempt']
                 if not retried:
@@ -395,7 +402,7 @@ class Release:
                     raise Stop(deadline_reason, 'defer')
                 return sha, plan
             if self.clock() >= deadline:
-                raise Stop(deadline_reason, 'defer')
+                raise Stop('skip-ci-tip' if skip_tip else deadline_reason, 'defer')
             self.sleep(min(interval, max(0, deadline - self.clock())))
 
     def chart(self, ref, tag):

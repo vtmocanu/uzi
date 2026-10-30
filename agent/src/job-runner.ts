@@ -447,6 +447,9 @@ export function buildJobSdkOptions(input: {
     env: input.env,
     // 🔴 ISOLATION: the literal `settingSources: []` (semgrep/settings-sources-isolation.yml).
     settingSources: [],
+    // Issue #1563: deliver the prompt as written. The CLI otherwise expands `@path`
+    // mentions and dispatches a leading slash command before any PreToolUse hook runs.
+    verbatimPrompts: true,
     // A product skill body is admin-approved but repo-authored text, and the plugin's skills would
     // otherwise run their inline shell (`!cmd` blocks) under bypassPermissions, past the closed tool
     // set. Always off for a job, skills or not (SDK Settings.disableSkillShellExecution).
@@ -493,6 +496,9 @@ function buildLaneJobSdkOptions(
     env: input.env,
     // 🔴 ISOLATION: the literal `settingSources: []` (semgrep/settings-sources-isolation.yml).
     settingSources: [],
+    // Issue #1563: deliver the prompt as written. The CLI otherwise expands `@path`
+    // mentions and dispatches a leading slash command before any PreToolUse hook runs.
+    verbatimPrompts: true,
     settings: { enabledPlugins: BUILTIN_PLUGINS_DISABLED, disableSkillShellExecution: true },
     tools: [...lane.surface.tools],
     skills: [...lane.surface.skills],
