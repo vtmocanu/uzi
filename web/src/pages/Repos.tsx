@@ -49,7 +49,7 @@ export function Repos() {
   // list would otherwise fail off-screen and read as "nothing happened".
   const bannerRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    if (error || enableRefusal) bannerRef.current?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+    if (error || enableRefusal) bannerRef.current?.scrollIntoView?.({ block: "nearest", behavior: reducedMotion() ? "auto" : "smooth" });
   }, [error, enableRefusal]);
   // The repo whose "Trusted repo" panel is currently expanded. The panel groups a
   // master control over two independently-revocable capabilities — Repo skills and
@@ -2330,6 +2330,15 @@ export function Repos() {
       )}
     </div>
   );
+}
+
+// Smooth scrolling unless the user asked for reduced motion (same rule as AdminHealth).
+function reducedMotion(): boolean {
+  try {
+    return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  } catch {
+    return false;
+  }
 }
 
 // The code cross-check guidance cap, in UTF-8 bytes (PatchRepo, PRD #2170 M3).
