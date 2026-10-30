@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -97,6 +98,141 @@ func TestResumeRunNowDispatchLiveDB(t *testing.T) {
 		return msg
 	}
 
+	t.Run("forge hold owner resume races and preserves grants and lifetime history", func(t *testing.T) {
+		id := newRun("running")
+		worker := uuid.New()
+		exec(`INSERT INTO workers(id,user_id,name,token_hash) VALUES ($1,$2,'forge-resume',$3)`, worker, owner.ID, worker[:])
+		exec(`UPDATE runs SET worker_id=$2,claim_generation=7,forge_park_count=6,recovery_wait_count=9,
+   session_id='forge-session',iteration_count=4,budget_wall_seconds=86400,budget_paused_seconds=37,budget_extension_seconds=123,budget_finalize_seconds=321,worker_recovery_episode=3,requeue_count=9,requeue_episode_baseline=5,memory_episode=2,reserve_exempt_granted_at=now(),reserve_exempt_until=now()+interval '1 day',
+   provider_park_count=3,provider_park_streak_started_at=now() WHERE id=$1`, id, worker)
+		if _, err := h.q.HoldRunForgeUnreachable(ctx, store.HoldRunForgeUnreachableParams{ID: id, WorkerID: pgtype.UUID{Bytes: worker, Valid: true}, ClaimGeneration: 7}); err != nil {
+			t.Fatal(err)
+		}
+		// Use stored times to check banking without sleeping or depending on request timing.
+		exec(`UPDATE runs SET status_since=started_at+interval '1 hour' WHERE id=$1`, id)
+		var heldSince time.Time
+		if err := pool.QueryRow(ctx, `SELECT status_since FROM runs WHERE id=$1`, id).Scan(&heldSince); err != nil {
+			t.Fatal(err)
+		}
+		// Compare every field outside the dedicated Resume's ordinary transition set.
+		snapshot := func() string {
+			var v string
+			if err := pool.QueryRow(ctx, `SELECT (to_jsonb(r)-ARRAY['status','status_since',
+    'budget_paused_seconds','recovery_wait_cause','recovery_retry_not_before','codex_cap_hash',
+    'codex_claim_epoch','health','health_reason','health_since','updated_at'])::text FROM runs r WHERE id=$1`, id).Scan(&v); err != nil {
+				t.Fatal(err)
+			}
+			return v
+		}
+		before := snapshot()
+		if rec := call(id, store.User{ID: uuid.New()}); rec.Code != http.StatusNotFound {
+			t.Fatalf("foreign=%d", rec.Code)
+		}
+		// The start barrier creates two requests; the SQL owner/status/cause/stamp
+		// fence selects one winner, whether the loser reads before or after it commits.
+		start := make(chan struct{})
+		results := make(chan int, 2)
+		for range 2 {
+			go func() {
+				<-start
+				req := httptest.NewRequest(http.MethodPost, "/api/runs/"+id.String()+"/resume-now", nil)
+				rctx := chi.NewRouteContext()
+				rctx.URLParams.Add("id", id.String())
+				callCtx, cancel := context.WithTimeout(mw.ContextWithUser(req.Context(), owner), 10*time.Second)
+				defer cancel()
+				req = req.WithContext(context.WithValue(callCtx, chi.RouteCtxKey, rctx))
+				rec := httptest.NewRecorder()
+				h.ResumeRunNow(rec, req)
+				results <- rec.Code
+			}()
+		}
+		close(start)
+		a, b := <-results, <-results
+		if a > b {
+			a, b = b, a
+		}
+		if a != http.StatusOK || b != http.StatusConflict {
+			t.Fatalf("resume race=%d/%d", a, b)
+		}
+		if statusOf(id) != "queued" || snapshot() != before {
+			t.Fatal("Resume changed unrelated state")
+		}
+		var banked bool
+		if err := pool.QueryRow(ctx, `SELECT budget_paused_seconds = 37 + GREATEST(0, EXTRACT(EPOCH FROM (status_since - $2::timestamptz))::int) FROM runs WHERE id=$1`, id, heldSince).Scan(&banked); err != nil || !banked {
+			t.Fatalf("held interval not banked: %v/%v", banked, err)
+		}
+		var audits int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='resume'`, id).Scan(&audits); err != nil || audits != 1 {
+			t.Fatalf("audit=%d/%v", audits, err)
+		}
+	})
+
+	t.Run("forge hold respects remaining wall budget and never-started accounting", func(t *testing.T) {
+		oldTimeout := h.cfg.RunTimeout
+		h.cfg.RunTimeout = time.Hour
+		defer func() { h.cfg.RunTimeout = oldTimeout }()
+		for _, tc := range []struct {
+			name    string
+			started bool
+			wall    any
+			want    int
+		}{
+			{"explicit exhausted budget", true, 100, http.StatusConflict},
+			{"global timeout exhausted", true, nil, http.StatusConflict},
+			{"never started", false, 100, http.StatusOK},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				id := newRun("recovery_wait")
+				exec(`UPDATE runs SET recovery_wait_cause='forge_unreachable',recovery_retry_not_before=NULL,
+    started_at=CASE WHEN $2::boolean THEN now()-interval '3 hours' ELSE NULL END,
+    status_since=now()-interval '1 hour',budget_paused_seconds=37,budget_wall_seconds=$3 WHERE id=$1`, id, tc.started, tc.wall)
+				snapshot := func() string {
+					t.Helper()
+					var v string
+					if err := pool.QueryRow(ctx, `SELECT to_jsonb(r)::text FROM runs r WHERE id=$1`, id).Scan(&v); err != nil {
+						t.Fatal(err)
+					}
+					return v
+				}
+				before := snapshot()
+				rec := call(id, owner)
+				if rec.Code != tc.want {
+					t.Fatalf("resume=%d body=%s, want %d", rec.Code, rec.Body.String(), tc.want)
+				}
+				if tc.want == http.StatusConflict {
+					if errBody(rec) != "run cannot resume: hold changed or no remaining budget" || snapshot() != before {
+						t.Fatal("exhausted hold changed or returned unexpected error")
+					}
+					var audits int
+					if err := pool.QueryRow(ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='resume'`, id).Scan(&audits); err != nil || audits != 0 {
+						t.Fatalf("refused resume audit=%d/%v", audits, err)
+					}
+				} else {
+					var preserved bool
+					if err := pool.QueryRow(ctx, `SELECT started_at IS NULL AND budget_paused_seconds=37 AND status='queued' FROM runs WHERE id=$1`, id).Scan(&preserved); err != nil || !preserved {
+						t.Fatalf("never-started budget changed: %v/%v", preserved, err)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("forge timed park and changed cause cannot use dedicated Resume", func(t *testing.T) {
+		for _, cause := range []string{"forge_unreachable", "provider_outage"} {
+			id := newRun("recovery_wait")
+			exec(`UPDATE runs SET recovery_wait_cause=$2,recovery_retry_not_before=now()+interval '1 day' WHERE id=$1`, id, cause)
+			if rec := call(id, owner); rec.Code != http.StatusConflict || statusOf(id) != "recovery_wait" {
+				t.Fatalf("timed %s resume=%d", cause, rec.Code)
+			}
+			if cause != "forge_unreachable" {
+				exec(`UPDATE runs SET recovery_retry_not_before=NULL WHERE id=$1`, id)
+				if _, err := h.q.ResumeForgeUnreachableHold(ctx, store.ResumeForgeUnreachableHoldParams{ID: id, UserID: owner.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds())}); err == nil {
+					t.Fatal("dedicated query released unrelated cause")
+				}
+			}
+		}
+	})
+
 	t.Run("paused resumes to queued and writes a resume audit row", func(t *testing.T) {
 		id := newRun("paused")
 		rec := call(id, owner)
@@ -160,7 +296,7 @@ func TestResumeRunNowDispatchLiveDB(t *testing.T) {
 
 	t.Run("ordinary recovery_wait still refuses generic owner resume", func(t *testing.T) {
 		id := newRun("recovery_wait")
-		exec("UPDATE runs SET recovery_wait_cause='forge_unreachable' WHERE id=$1", id)
+		// An untyped empty-turn park remains automatic; forge NULL holds have their own Resume.
 		rec := call(id, owner)
 		if rec.Code != http.StatusConflict || errBody(rec) != "run is recovery_wait" || statusOf(id) != "recovery_wait" {
 			t.Fatalf("ordinary recovery hold resume code=%d body=%s status=%s, want 409/unchanged", rec.Code, rec.Body.String(), statusOf(id))

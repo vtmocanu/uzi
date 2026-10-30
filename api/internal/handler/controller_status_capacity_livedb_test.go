@@ -87,7 +87,14 @@ func (f *capacityLiveHarness) postReported(t *testing.T, kind string, row map[st
 // response size. Raw per-worker keys additionally distinguish null from omission.
 func capacityDecode(t *testing.T, rec *httptest.ResponseRecorder, out any) {
 	t.Helper()
-	if rec.Code != http.StatusOK || rec.Body.Len() > 1<<20 {
+	capacityDecodeBounded(t, rec, out, 1<<20)
+}
+
+// The admin listing covers the whole shared LiveDB fleet that other packages leave
+// behind (about 1.9 KB per worker), so it gets a wider bound than one owner's view.
+func capacityDecodeBounded(t *testing.T, rec *httptest.ResponseRecorder, out any, limit int) {
+	t.Helper()
+	if rec.Code != http.StatusOK || rec.Body.Len() > limit {
 		t.Fatalf("GET status=%d bytes=%d", rec.Code, rec.Body.Len())
 	}
 	dec := json.NewDecoder(bytes.NewReader(rec.Body.Bytes()))
@@ -114,7 +121,7 @@ func (f *capacityLiveHarness) dto(t *testing.T, id uuid.UUID, admin bool) apityp
 		var body struct {
 			Workers []apitypes.AdminWorkerDTO `json:"workers"`
 		}
-		capacityDecode(t, rec, &body)
+		capacityDecodeBounded(t, rec, &body, 4<<20)
 		for _, w := range body.Workers {
 			if w.ID == id.String() {
 				dto, found = w.WorkerDTO, true

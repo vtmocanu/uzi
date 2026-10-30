@@ -770,3 +770,8 @@ stale consumers but do not prove native execution or probe capability. Distingui
 infrastructure failures from runtime RED, and record evidence on exact source
 heads. The [0.160.0 ADR amendment](../adr/1106-codex-harness.md#amendment-coordinated-runtime-01600-2026-10-10)
 records the compatibility audit and the observed upgrade comparison.
+
+Also re-check, in the target runtime's source, the `model/list` fields uzi
+consumes for the effort warning: `Model.id` / `model`, `supportedReasoningEfforts`
+and `defaultReasoningEffort` (see [worker effort](./worker-effort.md)). A rename
+or shape change silently disables the warning rather than failing a run.

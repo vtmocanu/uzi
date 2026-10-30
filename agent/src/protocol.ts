@@ -12,6 +12,7 @@ import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 // Type-only (erased at runtime): the sanitized-fields class lives beside the decoders that mint it.
 import type { SanitizedPrDescriptionFields } from "./client.js";
 import type { SemanticGateAck } from "./semantic-gate-wire.js";
+import type { HarnessEffort } from "./harness.js";
 
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
@@ -92,6 +93,13 @@ export function decodePolicyHoldReply(value: unknown, request: PolicyHoldRequest
   if (v.disposition === "terminal" && !["completed", "failed", "cancelled"].includes(v.observed_status as string)) return invalid();
   return v as unknown as PolicyHoldReply;
 }
+
+/** Compile-time two-way tie between the SDK's EffortLevel and HARNESS_EFFORTS: this line fails
+ *  to typecheck when either side drifts. */
+const effortSetsAligned: [EffortLevel] extends [HarnessEffort]
+  ? [HarnessEffort] extends [EffortLevel] ? true : never
+  : never = true;
+void effortSetsAligned;
 
 /** Fresh, worker-only authority for one refresh candidate. */
 export interface PublicationContextRequest {
@@ -1076,9 +1084,9 @@ export interface ClaimConfig {
   /** The run owner's per-user default reasoning effort (PRD #617). When present it
    *  is applied to the SDK's top-level `Options.effort` for the main thread and
    *  inherited by the implement-turn/subagent options via the baseOptions spread. The
-   *  API now populates this for every issue/chat claim — the owner's explicit choice,
+   *  API populates this on issue/chat claims with the owner's explicit choice,
    *  or the uzi default `medium` for an owner who never chose (issue #1157); it is
-   *  absent only from an un-upgraded API, in which case the worker omits the key and
+   *  absent for a Runtime default preference (#3247) and from an un-upgraded API, in which case the worker omits the key and
    *  the SDK applies its own fallback (the worker adds no default of its own). Typed as
    *  the SDK's own EffortLevel so the worker tracks the SDK's closed set (mirror of the
    *  Go `agenttmpl.EffortLevels` and the web EffortSelect list — no shared source, keep
@@ -1524,7 +1532,15 @@ export interface ClaimMemoryState {
   memory_policy?: MemoryPolicy | null;
 }
 
+export interface ForgeOriginReservation {
+  incarnation: string;
+  version: number;
+  observation_version: number;
+}
+
 export interface ClaimResponse extends ClaimMemoryState {
+  /** Optional negotiated telemetry token; grants no execution or custody authority. */
+  forge_origin_reservation?: ForgeOriginReservation;
   /** Server row only; no production enrollment writer in M2. */
   semantic_planning?: import("./semantic-plan.js").SemanticPlanning;
   /** Guarded prompt repair inputs; metadata is untrusted. */
@@ -2048,8 +2064,8 @@ export interface ChatClaimConfig {
   /** The owner's per-user default model (PRD #17); omitted when unset. */
   default_model?: string;
   /** The owner's per-user default reasoning effort (PRD #617); the API populates it
-   *  with the owner's choice or the uzi default `medium` (issue #1157), and it is
-   *  optional only for an un-upgraded API. */
+   *  with the owner's choice or the uzi default `medium` (issue #1157); it is
+   *  absent for a Runtime default preference (#3247) and from an un-upgraded API. */
   default_effort?: EffortLevel;
 }
 
@@ -3169,8 +3185,8 @@ export interface StateAck {
   /** PRD #1392 M2 (D10): the retry-not-before stamp the api returns on a `recovery_wait` ack —
    *  a field ON the RunDTO (`run.recovery_retry_not_before`), NOT top-level — so the pre-clone
    *  forge-park feed event can quote when the run resumes. An RFC3339 string as the api marshals
-   *  it; absent (older server, no stamp, unparseable body) ⇒ the feed event says "after backoff". */
-  recoveryRetryNotBefore?: string;
+   *  it; NULL means automatic forge retries exhausted; waiting for owner Resume or Cancel; absent retains historical backoff copy. */
+  recoveryRetryNotBefore?: string | null;
   /** PRD #1247 M5b: the worker-facing held-state credential-switch signal, read TOP-LEVEL off the
    *  /state ack body (beside `run`, on both the 200 ack and the ordinary not-applied 409). Present
    *  when a switch is pending for the claim the worker still holds; the `generation` is the one the
@@ -3267,9 +3283,8 @@ export interface RunOwnershipResponse {
   /** PRD #1392 M2 (D10): the run's `recovery_retry_not_before` stamp, added to the ownership
    *  probe so a forge park reconciled through the probe (a transport failure lost the report
    *  ack) can still quote when it resumes. An RFC3339 string when the run is parked with a
-   *  stamp; absent otherwise (an older api, or a non-parked run) ⇒ the feed event falls back
-   *  to "retry after backoff". */
-  recovery_retry_not_before?: string;
+   *  stamp; NULL means automatic forge retries exhausted; waiting for owner Resume or Cancel. An absent stamp retains historical backoff copy. */
+  recovery_retry_not_before?: string | null;
 }
 
 /** PRD #1391 Run B M3 (D3): one missing seq range in a run's message trace, as the message-gaps

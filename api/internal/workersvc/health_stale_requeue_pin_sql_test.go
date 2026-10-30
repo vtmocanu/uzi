@@ -65,6 +65,10 @@ func TestOwnerHoldSQLMirrorsClaimRun(t *testing.T) {
 	if !strings.Contains(claim, "ORr.updated_at<@affinity_cutoff)") {
 		t.Fatal("ClaimRun affinity predicate lacks strict ceiling")
 	}
+	forgeGuard := "ANDfn_forge_origin_owner_pins(ow,r,now())"
+	if !strings.Contains(claim, "ow.id=r.worker_id"+forgeGuard+"AND(") {
+		t.Fatal("ClaimRun owner pin lacks its positive-source forge guard")
+	}
 	start := strings.Index(claim, "(ow.draining_sinceISNOTNULLOR")
 	if start < 0 {
 		t.Fatal("ClaimRun owner predicate missing")
@@ -78,9 +82,9 @@ func TestOwnerHoldSQLMirrorsClaimRun(t *testing.T) {
 	for _, name := range []string{"ListUnplaceableQueuedRunsForEphemeral", "ListSaturationQueuedRunsForEphemeral", "ListActiveRunsForHealth"} {
 		t.Run(name, func(t *testing.T) {
 			block := executableSQL(queryBlock(t, sql, name))
-			want := "ANDNOTCOALESCE(r.worker_idISNOTNULLANDr.kind<>'cross_check'ANDr.updated_at>=@affinity_cutoff::timestamptzANDEXISTS(SELECT1FROMworkersowWHEREow.id=r.worker_idAND(" + owner + ")),false)"
+			want := "ANDNOTCOALESCE(r.worker_idISNOTNULLANDr.kind<>'cross_check'ANDr.updated_at>=@affinity_cutoff::timestamptzANDEXISTS(SELECT1FROMworkersowWHEREow.id=r.worker_id" + forgeGuard + "AND(" + owner + ")),false)"
 			if name == "ListActiveRunsForHealth" {
-				want = "COALESCE(runs.status='queued'ANDruns.kind<>'cross_check'ANDruns.worker_idISNOTNULLANDEXISTS(SELECT1FROMworkersowWHEREow.id=runs.worker_idAND(" + owner + ")),false)::booleanASowner_hold_pinnable"
+				want = "COALESCE(runs.status='queued'ANDruns.kind<>'cross_check'ANDruns.worker_idISNOTNULLANDEXISTS(SELECT1FROMworkersowWHEREow.id=runs.worker_id" + strings.ReplaceAll(forgeGuard, ",r,", ",runs,") + "AND(" + owner + ")),false)::booleanASowner_hold_pinnable"
 			}
 			if !strings.Contains(block, want) {
 				t.Fatalf("%s lacks complete owner hold predicate matching executable ClaimRun: %s", name, want)

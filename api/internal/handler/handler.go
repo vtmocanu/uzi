@@ -1186,6 +1186,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// Bounded local lifecycle outcome, like /state and memory outcomes: no rate
 		// limiter or upstream I/O. Strict 17 KiB decoding and worker/run fences apply.
 		r.Post("/runs/{id}/policy-hold", h.WorkerRunPolicyHold)
+		r.Post("/runs/{id}/forge-clone-success", h.WorkerForgeCloneSuccess)
 		r.Post("/runs/{id}/memory/reserve", h.WorkerMemoryReserve)
 		r.Post("/runs/{id}/memory/outcome", h.WorkerMemoryOutcome)
 		// Bound semantic body-decoding work per worker, including while production enrollment is off.

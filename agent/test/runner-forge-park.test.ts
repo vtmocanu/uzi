@@ -145,6 +145,32 @@ const parkReport = (client: ForgeParkClient): StateRequest | undefined =>
   client.reported.find((b) => b.status === "recovery_wait");
 
 describe("RunRunner — pre-clone forge-unreachable park (PRD #1392 M2)", () => {
+  for (const lostAck of [false, true]) {
+    for (const retry of [undefined, null, "2026-10-29T12:00:00Z"]) {
+      it(`terminates ${lostAck ? "lost" : "direct"} park ACK with retry ${retry}`, async () => {
+        const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-forgepark-null-"));
+        try {
+          const client = new ForgeParkClient(["recovery_park_cause", "recovery_release_exact_echo"], {
+            onParkReport: () => {
+              if (lostAck) throw new Error("lost ACK");
+              return { applied: true, status: "recovery_wait", recoveryRetryNotBefore: retry };
+            },
+            onOwnership: () => ({ status: "recovery_wait", recovery_retry_not_before: retry }),
+          });
+          const { factory } = parkFactory(homeRoot);
+          git.ensureClone = async () => { throw A_TRANSIENT(); };
+          const claim = gitlabClaim(799, { claim_generation: 9 });
+          await makeRunner(client, factory).execute(claim);
+          assert.deepEqual(reportedStatuses(client), ["running", "recovery_wait"]);
+          assert.equal(client.ownershipCalls, lostAck ? 1 : 0);
+          const text = statusTexts(claim.run_id).find(t => t.startsWith("forge unreachable at clone; parked"));
+          assert.equal(text, "forge unreachable at clone; parked, " + (retry === null
+            ? "automatic forge retries exhausted; waiting for owner Resume or Cancel" : retry ? `retry at ${retry}` : "retry after backoff"));
+        } finally { fs.rmSync(homeRoot, { recursive: true, force: true }); }
+      });
+    }
+  }
+
   it("permanent verdict (401/403/404 shape): fails immediately, never parks", async () => {
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-forgepark-perm-"));
     try {

@@ -36,6 +36,13 @@
     "max": 1,
     "remaining": 1
   },
+  "forge_origin_cooldown": {
+    "origin": "x",
+    "cooled_until": "2020-01-02T03:04:05Z",
+    "half_open_run_id": "x",
+    "state": "x",
+    "detail": "x"
+  },
   "id": "x",
   "repo_id": "x",
   "forge_type": "x",

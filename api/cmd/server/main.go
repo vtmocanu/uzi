@@ -372,9 +372,9 @@ func run() error {
 		RunCodexIdleStallMaxParks: cfg.RunCodexIdleStallMaxParks,
 		RunRecoveryParkBase:       cfg.RunRecoveryParkBase,
 		RunRecoveryMaxPark:        cfg.RunRecoveryMaxPark,
-		// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2): past this many forge parks
-		// the run fails with fail_origin='forge_unreachable' instead of parking again. 0 =
-		// unlimited. Counted separately from the recovery-park backoff (recovery_wait_count).
+		// Forge-unreachable timed-park allowance: the next exhausted group enters
+		// an owner-held NULL-retry recovery wait. Zero deliberately means unlimited.
+		// Counted separately from the recovery-park backoff (recovery_wait_count).
 		RunForgeUnreachableMaxParks: cfg.RunForgeUnreachableMaxParks,
 		RunGateRefusalMax:           cfg.RunGateRefusalMax,
 		// Data-volume-full park cap (PRD #1809 M5, D6): past this many COUNTED disk parks the run

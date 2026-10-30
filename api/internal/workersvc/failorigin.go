@@ -57,13 +57,10 @@ var failOrigins = []string{
 	// detected secret; the committed work stays recoverable from the run branch/PVC) instead
 	// of a raw `remote rejected` (worker-reportable — see workerReportableFailOrigins).
 	"push_secret_blocked",
-	// PRD #1392 M1: a run whose forge stayed unreachable at CLONE past
-	// RUN_FORGE_UNREACHABLE_MAX_PARKS parks. SERVER-DERIVED, NOT worker-reportable (it is
-	// stamped directly inside SetState's forge-park transaction, so it is deliberately absent
-	// from workerReportableFailOrigins) — a worker reporting it is a forgery CoerceFailOrigin
-	// drops. Excluded from the judge (neverJudgeFailOrigins, judge_enqueue.go) REGARDLESS of
-	// iteration_count: a forge cap-fail is server-derived, never a real agent defect, and on a
-	// resumed run it carries iteration_count > 0, so the skip cannot be gated on == 0 (SC3).
+	// Legacy server-derived forge cap failure, retained for stored outcomes and
+	// mixed-API rollback compatibility. Current finite exhaustion holds for owner
+	// Resume instead. Never worker-reportable: CoerceFailOrigin drops a forged
+	// report. Legacy outcomes skip the judge regardless of iteration_count.
 	"forge_unreachable",
 	// PRD #1416 M4: a run on a PUBLISHED branch whose history was rewritten below the
 	// published floor P, where the ancestry bridge B (tree == H, P and H both ancestors)

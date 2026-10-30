@@ -145,8 +145,8 @@ type ChatClaimConfig struct {
 	MaxTurns           int     `json:"max_turns"`
 	DefaultModel       *string `json:"default_model,omitempty"`
 	// DefaultEffort carries the owner's per-user reasoning effort (PRD #617), or the
-	// uzi default `medium` when the owner has not chosen (NULL, issue #1157) — so it is
-	// populated on every chat claim now.
+	// uzi default `medium` when the owner has not chosen (NULL, issue #1157). It is nil
+	// (key omitted) when the owner's preference is Runtime default: no level is sent.
 	DefaultEffort *string `json:"default_effort,omitempty"`
 }
 

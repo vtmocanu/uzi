@@ -184,6 +184,9 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			for _, w := range workers {
 				printWorkerManualDetail(p, w)
 				printWorkerDrainDetail(p, w)
+				for _, line := range workerForgeLines(w) {
+					p.Printf("Worker %s: %s\n", cellText(w.ID), line)
+				}
 			}
 			return nil
 		},
@@ -404,7 +407,41 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			return printWorkerManualResult(env, gf, w)
 		},
 	}
-	cmd.AddCommand(list, rm, setToken, cordon, uncordon)
+	get := &cobra.Command{
+		Use:   "get <worker-id>",
+		Short: "Show a worker and its advisory forge cooldowns",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			workers, err := c.ListWorkers(cmd.Context())
+			if err != nil {
+				return err
+			}
+			for _, w := range workers {
+				if w.ID != args[0] {
+					continue
+				}
+				p := env.printer(gf)
+				if p.Format == uzicli.FormatJSON {
+					return p.JSON(w)
+				}
+				if err := p.Table([]string{"ID", "NAME", "STATUS"}, [][]string{{cellText(w.ID), cellText(w.Name), statusCell(w)}}); err != nil {
+					return err
+				}
+				printWorkerManualDetail(p, w)
+				printWorkerDrainDetail(p, w)
+				for _, line := range workerForgeLines(w) {
+					p.Printf("%s\n", line)
+				}
+				return nil
+			}
+			return uzicli.Exitf(uzicli.ExitNotFound, "worker not in your list")
+		},
+	}
+	cmd.AddCommand(list, get, rm, setToken, cordon, uncordon)
 	return cmd
 }
 

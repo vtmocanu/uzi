@@ -151,6 +151,18 @@ function renderPage(initialEntries?: string[]) {
   );
 }
 
+it.each([undefined, [], Array.from({ length: 32 }, (_, i) => ({
+  origin: `https://forge-${i}.example`, cooled_until: "2099-01-01T00:00:00Z",
+  half_open_run_id: null, state: "cooling" as const, detail: "",
+}))])("keeps heartbeat separate from reachability with bounded or missing advice", async (advice) => {
+  mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ forge_origin_cooldowns: advice })] });
+  renderPage();
+  expect(await screen.findByText("online")).toBeTruthy();
+  expect(screen.getByText("online").getAttribute("title")).toBe("Worker heartbeat status; does not verify forge reachability.");
+  expect(screen.getByText(/missing origins do not prove health/)).toBeTruthy();
+  expect(screen.queryByText(/additional origins may be omitted/) !== null).toBe(advice?.length === 32);
+});
+
 // The add-panel content (join-token card, HostedWorkers, register form) lives behind a
 // tab. When the fleet is non-empty the page lands on Your workers (D11), so reaching an
 // add-panel control BY ROLE means clicking the "Add a worker" tab first — the inactive

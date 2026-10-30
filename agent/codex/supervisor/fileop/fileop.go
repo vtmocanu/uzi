@@ -43,6 +43,7 @@ const (
 	opStat      = "stat"
 	opRead      = "read"
 	opReadRange = "read_range"
+	opReadTail  = "read_tail"
 	opWrite     = "write"
 	opApply     = "apply"
 	opMkdir     = "mkdir"
@@ -89,7 +90,8 @@ var (
 // request is one parsed, validated operation frame. NewPath is meaningful only for
 // rename; Data is base64-encoded bytes for write (and the REPLACEMENT text for apply);
 // Old is base64-encoded bytes of the text apply must find-and-replace.
-// Offset and Limit are independently validated only by read_range.
+// Offset and Limit are validated by read_range and rejected by read_tail.
+// Tail is independently validated only by read_tail.
 type request struct {
 	ID      int             `json:"id"`
 	Op      string          `json:"op"`
@@ -99,6 +101,7 @@ type request struct {
 	Old     string          `json:"old"`
 	Offset  json.RawMessage `json:"offset"`
 	Limit   json.RawMessage `json:"limit"`
+	Tail    json.RawMessage `json:"tail"`
 }
 
 // server holds the worktree-root dirfd opened ONCE (O_DIRECTORY|O_PATH), the per-op
@@ -112,6 +115,8 @@ type server struct {
 	nonblock        func(int, bool) error
 	rangeContext    func() (context.Context, context.CancelFunc)
 	rangeChunk      int
+	fileReadAt      func(*os.File, []byte, int64) (int, error)
+	tailBudget      int64
 	maxRead         int
 	maxWrite        int
 	lineMax         int
@@ -124,11 +129,12 @@ type server struct {
 // newServer builds a server anchored at rootFD with the production bounds.
 func newServer(rootFD int) *server {
 	return &server{
-		rootFD:    rootFD,
-		fileRead:  func(f *os.File, p []byte) (int, error) { return f.Read(p) },
-		fileClose: (*os.File).Close,
-		fstat:     unix.Fstat,
-		nonblock:  unix.SetNonblock,
+		rootFD:     rootFD,
+		fileRead:   func(f *os.File, p []byte) (int, error) { return f.Read(p) },
+		fileClose:  (*os.File).Close,
+		fileReadAt: func(f *os.File, p []byte, off int64) (int, error) { return f.ReadAt(p, off) },
+		fstat:      unix.Fstat,
+		nonblock:   unix.SetNonblock,
 		rangeContext: func() (context.Context, context.CancelFunc) {
 			return context.WithTimeout(context.Background(), 5*time.Second)
 		},
@@ -238,6 +244,8 @@ func (s *server) handle(req request) map[string]any {
 		return s.doRead(req)
 	case opReadRange:
 		return s.doReadRange(req)
+	case opReadTail:
+		return s.doReadTail(req)
 	case opWrite:
 		return s.doWrite(req)
 	case opApply:

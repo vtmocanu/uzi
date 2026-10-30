@@ -160,6 +160,7 @@ import { bindCaptureLaunch, isCaptureRequest } from "../git.js";
 import {
   CodexHarness,
   CodexResumeError,
+  type CodexCatalogEntry,
   type CodexChildSink,
   type CodexLaunchRootResult,
   type CodexLaunchRootSpec,
@@ -186,7 +187,7 @@ import {
 } from "./delegation.js";
 import { CODE_DISPOSITIONS_TOOL, reportCodeDispositions, type CodeCrossCheckToolAccess } from "../code-cross-check-tools.js";
 import { buildCodexRunPlan } from "./run-builder.js";
-import { codexSubagentWriteCapabilities } from "./render.js";
+import { codexSubagentWriteCapabilities, sanitizeName } from "./render.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
 import { CodexSessionStore } from "./session-state.js";
 import { wireFileopHelper, type FileopHelperHandle } from "./fileop-client.js";
@@ -1907,6 +1908,9 @@ export interface CodexExecutorDeps {
   /** Issue #1866 M2: the run-start environment probe's bound; defaults to
    *  CODEX_ENV_PROBE_TIMEOUT_MS. Tests lower it to drive the timeout path fast. */
   readonly envProbeTimeoutMs?: number;
+  /** PRD #3247 M2: the Codex `model/list` catalog probe's bound; defaults to
+   *  CODEX_CATALOG_PROBE_TIMEOUT_MS. Tests lower it to drive the timeout path fast. */
+  readonly catalogProbeTimeoutMs?: number;
   /** Issue #1600: the refused-park race allowance; defaults to REDRIVE_RACE_ALLOWANCE_MS. */
   readonly redriveAllowanceMs?: number;
   /** Issue #2099: in-process same-thread retries of a transient provider failure before the
@@ -5014,6 +5018,21 @@ export class CodexExecutor implements Executor {
     }, registries);
   }
 
+  /** PRD #3247 M2 policy: when the catalog lists the model but not the claim's level, emit one
+   *  `effort_not_in_catalog` status. Never changes, retries or downgrades the level. */
+  private catalogProbeFor(ctx: RunContext, level: string) {
+    return {
+      timeoutMs: this.deps.catalogProbeTimeoutMs ?? CODEX_CATALOG_PROBE_TIMEOUT_MS,
+      onEntry: (entry: CodexCatalogEntry | undefined, model: string): void => {
+        if (entry === undefined || entry.supportedEfforts.includes(level)) return;
+        ctx.emit({ kind: "status", agent: "worker", payload: {
+          event: "effort_not_in_catalog",
+          text: `Codex does not list reasoning effort ${level} for ${sanitizeName(model)}. uzi sends it unchanged; the provider may reject it. Choose a listed level or Runtime default.`,
+        } });
+      },
+    };
+  }
+
   private async buildProviderEpoch(
     ctx: RunContext,
     shared: EpochSharedContext,
@@ -5024,6 +5043,7 @@ export class CodexExecutor implements Executor {
     revision: number,
     setupRegistries: Set<ExecutionRegistry>,
   ): Promise<ProviderEpoch> {
+    const level = codexEffort(ctx);
     // Snapshot the runner contract once for all effect surfaces in this epoch.
     // Legacy direct callers may still bind through the static executor option.
     const captureMemory = ctx.capturedMemory;
@@ -5339,6 +5359,10 @@ export class CodexExecutor implements Executor {
         emitClaimInit: epochIndex === 0,
         // Issue #1583: projected tool frames are scrubbed of runtime-released Codex tokens.
         scrubProjected,
+        // PRD #3247 M2: advisory catalog probe, only on the claim's first root epoch and only for an
+        // explicit level (Runtime default carries none). The note is emitted from onEntry, which the
+        // harness calls before the first turn/start; the level itself is always sent unchanged.
+        ...(epochIndex === 0 && level !== undefined ? { catalogProbe: this.catalogProbeFor(ctx, level) } : {}),
       });
 
       const epochHarness = harness;
@@ -6643,6 +6667,7 @@ const COMMAND_ROOT_UNREAPED = "command supervisor root did not reap cleanly";
 /** Issue #1866 M2: the Codex probe's bound. Longer than runEnvProbe's 2s default because the
  *  probe starts a registered, sandboxed command supervisor root, not a bare process. */
 const CODEX_ENV_PROBE_TIMEOUT_MS = 10_000;
+const CODEX_CATALOG_PROBE_TIMEOUT_MS = 2_000;
 
 async function assertCommandWorktreePosture(worktreePath: string): Promise<void> {
   const stat = await fs.stat(worktreePath);

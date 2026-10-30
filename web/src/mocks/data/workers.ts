@@ -15,6 +15,7 @@ export const mockWorkers: Worker[] = [
     // Fresh aggregate evidence without snapshot identities: do not invent run rows.
     pending_outcome_count: 1,
     pending_overflow: true,
+    forge_origin_cooldowns: [{ origin: "https://forge.example", cooled_until: minsAhead(5), half_open_run_id: null, state: "cooling", detail: "Retries for this origin are cooling down; recovery is unverified." }],
     id: "w-laptop",
     name: "laptop",
     status: "online",

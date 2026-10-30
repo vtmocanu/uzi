@@ -516,10 +516,10 @@ type Config struct {
 	// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2). A transient forge failure at
 	// clone parks the run in 'recovery_wait' with recovery_wait_cause='forge_unreachable';
 	// forge_park_count is its FORGE-ONLY lifetime counter (distinct from the backoff-shaping
-	// recovery_wait_count), and this is the cap the park-or-fail decision consults inside
-	// SetState. Past the cap the run fails with fail_origin='forge_unreachable'. UNLIKE the
-	// recovery-park cadence knobs above, this CAN fail a run — it is the forge park's lifetime
-	// bound. 0 = unlimited (never fail on the count), the deliberate off switch; the default
+	// recovery_wait_count). After this many timed parks, the next exhausted group holds
+	// in recovery_wait with a NULL retry stamp until owner Resume. Resume preserves the
+	// lifetime allowance, so another exhausted group holds again. Zero means unlimited
+	// automatic retry, the deliberate off switch; the default
 	// (6 parks ≈ an hour at the recovery-park defaults) lives in Load. Counted separately from
 	// recovery_wait_count so the empty-turn park keeps its no-lifetime-cap contract (fact 7).
 	RunForgeUnreachableMaxParks int
@@ -1256,11 +1256,9 @@ func Load() (Config, error) {
 	cfg.RunRetainedRecoveryMaxParks = parseNonNegInt("RUN_RETAINED_RECOVERY_MAX_PARKS", 3)
 	cfg.RunRecoveryMaxPark = parseDuration("RUN_RECOVERY_MAX_PARK", 30*time.Minute)
 
-	// Forge-unreachable pre-clone park cap (PRD #1392 M1, D2). parseNonNegInt, so
-	// RUN_FORGE_UNREACHABLE_MAX_PARKS=0 is legal and means "unlimited" (never fail on the
-	// count) — the deliberate off switch, matching how RUN_LIMIT_MAX_WAITS=0 means "never
-	// park". Default 6 (≈ an hour of parks at the recovery-park defaults; more once earlier
-	// parks raise the backoff).
+	// Forge-unreachable lifetime timed-park allowance. After the allowance is
+	// consumed, the next exhausted group waits for owner Resume with NULL retry.
+	// RUN_FORGE_UNREACHABLE_MAX_PARKS=0 deliberately permits unlimited timed parks.
 	cfg.RunForgeUnreachableMaxParks = parseNonNegInt("RUN_FORGE_UNREACHABLE_MAX_PARKS", 6)
 	// Plan-gate re-presentation refusal cap (PRD #1795 M1). parseNonNegInt, so
 	// RUN_GATE_REFUSAL_MAX=0 is legal and means "unlimited", the same off switch as

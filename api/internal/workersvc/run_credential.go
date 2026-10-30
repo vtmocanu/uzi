@@ -44,6 +44,7 @@ var (
 	ErrCredentialSwitchNoLiveWorker    = errors.New("credential switch: run has no live worker")
 	ErrCredentialSwitchClaimAssembling = errors.New("credential switch: claim being assembled")
 	ErrCredentialSwitchRunTerminal     = errors.New("credential switch: run has finished")
+	ErrForgeUnreachableHeld            = errors.New("forge_unreachable held: use Resume before switching its token")
 	ErrCodexIdleStallHeld              = errors.New("codex_idle_stall held: use Resume before switching its token")
 	ErrCredentialSwitchRaced           = errors.New("credential switch: run state changed, retry")
 )
@@ -317,6 +318,9 @@ func (s *Service) setCredentialAndPromote(ctx context.Context, observed store.Ru
 				return ErrCredentialSwitchRaced
 			}
 			return fmt.Errorf("lock run for credential switch: %w", err)
+		}
+		if locked.Status == "recovery_wait" && locked.RecoveryWaitCause.Valid && locked.RecoveryWaitCause.String == "forge_unreachable" && !locked.RecoveryRetryNotBefore.Valid {
+			return ErrForgeUnreachableHeld
 		}
 		if locked.Status == "recovery_wait" && locked.RecoveryWaitCause.String == recoveryCauseCodexIdleStall && locked.RecoveryWaitCause.Valid && !locked.RecoveryRetryNotBefore.Valid {
 			return ErrCodexIdleStallHeld

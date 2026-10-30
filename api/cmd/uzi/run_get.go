@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -200,6 +201,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 			// seconds for the hours one lasts. It is a key (status plus hold reason),
 			// not a bool, so a direct hold-to-hold transition is announced too.
 			parkedIn := ""
+			lastForgeSnapshot := ""
 			for {
 				if err := drain(); err != nil {
 					return err
@@ -216,6 +218,11 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				snapshot := strings.Join(forgeOriginLines(run.ForgeOriginCooldown), "\n")
+				if snapshot != "" && snapshot != lastForgeSnapshot {
+					_, _ = fmt.Fprintln(env.Stderr, snapshot)
+				}
+				lastForgeSnapshot = snapshot
 				if terminalRunStatuses[run.Status] {
 					return drain()
 				}
@@ -227,6 +234,12 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 				// NDJSON there for an agent to parse line by line (renderMessage). A
 				// human-readable notice on that stream would corrupt the contract. This
 				// is the same split cobra's deprecation notice already uses here.
+				if isForgeOwnerHold(run) {
+					for _, line := range append([]string{forgeParkLine(run)}, forgeHoldLines(run)...) {
+						_, _ = fmt.Fprintln(env.Stderr, line)
+					}
+					return drain()
+				}
 				holdKey := workerHoldNoticeKey(run)
 				if run.Status == statusLimitWait || run.Status == statusPoolWait || run.Status == statusRecoveryWait ||
 					isCredentialDisabledHold(run) || isProviderUnavailableHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run) {
@@ -278,8 +291,8 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 								_, _ = fmt.Fprintf(env.Stderr, "run %s %s; still following\n", cellText(args[0]), line)
 							} else if isForgePark(run) {
 								_, _ = fmt.Fprintf(env.Stderr,
-									"run %s %s — still following; it resumes on its own\n",
-									args[0], forgeParkLine(run))
+									"run %s %s; still following\n",
+									cellText(args[0]), forgeParkLine(run))
 							} else if line := vaultParkLine(run); line != "" {
 								// Issue #1766: a Codex credential refresh or release found the
 								// run owner's vault locked. Explicit unlock queues it promptly;

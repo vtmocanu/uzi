@@ -10,6 +10,23 @@ A **worker** is the `uzi-agent` container: it connects to your uzi server, claim
 
 On a k8s deployment where an admin has turned hosting on, you can skip this whole page: provision a worker from **Settings → Workers** instead, on the **Add a worker** tab, and the cluster runs the container for you. See [Hosted workers](./hosted-workers.md).
 
+## Online does not mean forge-reachable
+
+**Online** reports heartbeat contact with the uzi API. A worker can be online
+while its direct Git clone/fetch path is unavailable. The owner/worker/Git-origin
+cooldown blocks claims before due, then permits one reserved ordinary attempt;
+a timer is not a success signal. Human/model waits retain that reservation,
+while stopped flights release it without marking the origin healthy.
+Legacy workers without direct success telemetry can serialize that origin
+for the active flight; upgrading enables earlier verified clearing.
+
+Distinguish this cooldown from a run's timed `recovery_wait` retry, its
+NULL-retry owner hold, and source custody. Local-only or unverified work still
+needs protection; moving to a sibling requires the complete guarded history
+check. Owner Resume queues an attempt and can still be blocked by admission.
+See [Forge unreachable at clone](./run-recovery-wait.md#forge-unreachable-at-clone)
+for the cap, safe placement and mixed-version behavior.
+
 ## 1. Generate a join token
 
 In uzi, open **Settings → Workers**, then the **Add a worker** tab, and use the **Register your own worker** card to register a worker (give it a name, e.g. `laptop`). The join token is shown **once**: copy it now, since only its hash is stored server-side (register a new worker if you lose it).

@@ -106,9 +106,8 @@ describe("readRunAck", () => {
 
   // PRD #1392 M2 (D10) — the forge-unreachable park ack rides a {run, reason?} body: the
   // disposition `reason` is TOP-LEVEL (stale_claim / custody_unsettled on a 409), while the
-  // retry-not-before stamp is a FIELD ON the RunDTO (run.recovery_retry_not_before). Both
-  // string-only; a missing / wrong-typed value leaves them ABSENT so the dispatch reads its safe
-  // defaults ("no reason" / "retry after backoff").
+  // retry stamp is a RunDTO field. Explicit NULL is an origin hold;
+  // absent or malformed values retain historical backoff copy.
   it("reads the disposition reason off the TOP LEVEL, not from run", async () => {
     const out = await readRunAck(
       jsonResponse({ reason: "stale_claim", run: { status: "queued" } }),
@@ -130,6 +129,11 @@ describe("readRunAck", () => {
       "2026-09-15T16:00:00Z",
       "the retry stamp is parsed from the RunDTO",
     );
+  });
+
+  it("keeps an explicit NULL recovery retry distinct from historical absence", async () => {
+    const out = await readRunAck(jsonResponse({ run: { status: "recovery_wait", recovery_retry_not_before: null } }));
+    assert.equal(out.recoveryRetryNotBefore, null);
   });
 
   it("does NOT read recovery_retry_not_before from the top level (it is a run field)", async () => {

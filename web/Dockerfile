@@ -67,6 +67,8 @@ COPY fixtures/run-progress/ /app/fixtures/run-progress/
 # codexModels/modelSettings tests and the judge-model mock parity test import these (#3245).
 COPY fixtures/codex-models/ /app/fixtures/codex-models/
 COPY fixtures/model-settings/ /app/fixtures/model-settings/
+# mockApi.effortDefaults.test.ts imports the effort-defaults parity fixture (#3247).
+COPY fixtures/effort-defaults/ /app/fixtures/effort-defaults/
 RUN npm run build
 
 # --- runtime stage ---

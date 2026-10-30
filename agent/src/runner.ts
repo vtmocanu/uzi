@@ -2199,6 +2199,7 @@ interface RunFlight {
   policyHold?: { readonly outcomeId: string; body?: Readonly<import("./protocol.js").PolicyHoldRequest> };
   policyAdmission?: boolean;
   initialPlanningEligible?: boolean;
+  forgeCloneSuccess?: AbortController;
   operationAdmission?: CodexOperationController;
   operationScope?: ReturnType<typeof acquireCodexOperationScope>;
   releaseOperationAdmission?: () => void;
@@ -5661,6 +5662,7 @@ export class RunRunner {
     } catch (err) {
       await dispatchFailure(err, true);
     } finally {
+      flight.forgeCloneSuccess?.abort();
       if (flight.policyHold) {
         flight.preserveRecoveryClone = true;
         flight.preserveSession = true;
@@ -6922,8 +6924,8 @@ export class RunRunner {
   }
 
   /**
-   * Today's generic terminal FAILED path (extracted verbatim so the pre-clone
-   * forge-unreachable park's `fail` arm can reuse it). failure_reason goes straight to
+   * The generic terminal FAILED path, also used when a forge report is refused.
+   * failure_reason goes straight to
    * reportState, bypassing the batcher's redactor, and the sdk-executor catch-all re-throws raw
    * SDK errors into this path — so scrub it here with the run's own secret set. A plan rejection
    * carries the user's verbatim reason; scrubbing it too is harmless for plain text and a safety
@@ -7812,7 +7814,7 @@ export class RunRunner {
    * finally treats it as a park (no terminal report) whose resume artifacts follow preserveSession.
    */
   private async finishForgePark(
-    retryAt: string | undefined,
+    retryAt: string | null | undefined,
     claim: ClaimResponse,
     flight: RunFlight,
     runLog: Logger,
@@ -7820,7 +7822,9 @@ export class RunRunner {
     copy: PreCloneParkCopy = FORGE_PARK_COPY,
   ): Promise<void> {
     const { batcher } = flight;
-    const when = retryAt ? `retry at ${retryAt}` : "retry after backoff";
+    const when = retryAt === null && copy === FORGE_PARK_COPY
+      ? "automatic forge retries exhausted; waiting for owner Resume or Cancel"
+      : retryAt ? `retry at ${retryAt}` : "retry after backoff";
     batcher.emit({
       kind: "status",
       agent: "worker",
@@ -12047,6 +12051,14 @@ export class RunRunner {
             claim.secrets.forge_pat,
             claim.secrets.forge_username,
             flight.runKind === "task" ? flight.checkpointCoordinates?.checkpoint_key : undefined,
+            () => {
+              // Exactly one report per ordinary clone flight; never join model execution.
+              if (flight.forgeCloneSuccess) return;
+              flight.forgeCloneSuccess = new AbortController();
+              this.client.reportForgeCloneSuccess(claim, AbortSignal.any([
+                flight.forgeCloneSuccess.signal, flight.cancel.signal, this.shutdownSignal.signal,
+              ]));
+            },
           ),
       );
     } catch (err) {
@@ -19650,7 +19662,7 @@ export class RunRunner {
               return true;
             }
             markParkKeep();
-            const idleHeld = idleTyped && ack.recoveryRetryNotBefore === undefined;
+            const idleHeld = idleTyped && (ack.recoveryRetryNotBefore === undefined || ack.recoveryRetryNotBefore === null);
             const idleOpening = err instanceof TransientRecoveryError && err.idleStallKind === "zero_evidence" ? "provider sent no model output" : "model output stalled";
             const idleCheckpoint = capture.published ? "published" : "saved on this worker";
             runLog.info(idleHeld ? "run held for Codex idle recovery" : "run parked for transient recovery", { detail: err.message });

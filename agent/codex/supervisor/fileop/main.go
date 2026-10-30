@@ -18,6 +18,7 @@
 //	{"id":<int>,"op":"stat","path":"rel"}
 //	{"id":<int>,"op":"read","path":"rel"}
 //	{"id":<int>,"op":"read_range","path":"rel","offset":<integer>,"limit":<integer>}
+//	{"id":<int>,"op":"read_tail","path":"rel","tail":<integer>}
 //	{"id":<int>,"op":"write","path":"rel","data":"<base64>"}
 //	{"id":<int>,"op":"apply","path":"rel","old":"<base64>","data":"<base64>"}
 //	{"id":<int>,"op":"mkdir","path":"rel"}
@@ -32,9 +33,10 @@
 //	{"id":<int>,"ok":false,"code":"E_ESCAPE|E_SYMLINK|E_DENIED|E_OVERSIZE|..."}
 //
 // read_range requires both one-based offset (1..9007199254740991) and limit
-// (1..2000), validated independently before opening. Other operations ignore these
-// fields. Its success fields are canonical base64 data, opening fstat size, offset,
-// linesReturned, partialLastLine, truncated, incomplete and scannedBytes. Only an
+// (1..2000), validated independently before opening. read_tail rejects either
+// field, including null; other operations ignore these fields. read_range success
+// fields are canonical base64 data, opening fstat size, offset, linesReturned,
+// partialLastLine, truncated, incomplete and scannedBytes. Only an
 // incomplete success includes reason:"scan_budget". Empty/past-EOF ranges have no
 // lines and are neither partial nor truncated. LF belongs to its source line;
 // BOM/CRLF are preserved and terminal LF creates no phantom line.
@@ -50,8 +52,24 @@
 // remain after the excerpt. Skipping alone is not truncation. Scan exhaustion
 // before offset is an empty, truncated, incomplete success, never fake EOF.
 //
-// The descriptor and opening size pin each range operation: later appends are
-// ignored, replacement cannot redirect it, and early EOF accepts shrinkage.
+// read_tail is an independent operation requiring tail (1..2000), validated before
+// opening; other operations ignore tail. It returns the last requested LF-defined
+// lines from the opening extent, preserving BOM/CRLF and avoiding a phantom line
+// after terminal LF. Success fields are canonical base64 data, opening fstat size,
+// tail, fromEnd:true, linesReturned, partialFirstLine, truncated, incomplete and
+// scannedBytes. Only incomplete success includes reason:"scan_budget". It shares
+// the rangeScanBytes scan budget (including unused prefetch) and range output/chunk
+// caps. Only the selected suffix and a scalar crossing its raw output boundary are
+// text-validated. Whole older lines are dropped at either cap; a final line alone
+// exceeding the output cap returns a UTF-8-aligned suffix with partialFirstLine.
+// truncated means the excerpt omits opening bytes; empty files are not truncated.
+// Scan exhaustion discards any unfinished older line and sets incomplete.
+//
+// The descriptor and opening size pin each range/tail operation: later appends are
+// ignored and replacement cannot redirect it. read_range accepts early EOF as
+// shrinkage; read_tail requires full positioned reads or returns E_IO, including
+// short reads with EOF. Only zero-byte EINTR is retried, under the same context,
+// charging no scan bytes; nonzero reads charge their actual bytes.
 // A five-second monotonic context checks open/read/processing boundaries and
 // returns E_TIMEOUT on cancellation/deadline. This is cooperative: a regular-file
 // filesystem syscall may stall beyond it. Ordinary read retains its 1 MiB cap.

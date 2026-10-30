@@ -11,10 +11,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #1399: the forge pre-clone park's TERMINAL transitions (cap-fail, stamped-cancel, and
+// Issue #1399: the forge pre-clone park's TERMINAL transitions (stamped-cancel and
 // the nil-txBeginner failForgeUnsettleable fail-safe) settle the run's pending #634 scope audit
 // row 'declined', exactly as SetState's `failed` arm does for a scope-directed run that ends
-// abnormally. A NORMAL forge park is not terminal, so its scope row stays pending. These drive
+// abnormally. A forge park, including a cap hold, is not terminal, so its scope row stays pending. These drive
 // the real Service against a REAL Postgres (real *store.Queries + the pool as the tx beginner,
 // except the degraded case, which deliberately wires none).
 //
@@ -44,9 +44,8 @@ func fpForgeParkReport() StateRequest {
 	return StateRequest{State: "recovery_wait", RecoveryCause: strPtr("forge_unreachable"), ClaimGeneration: i64Ptr(1)}
 }
 
-// TestForgeParkCapFailSettlesScopeDeclinedLiveDB: the (cap+1)th forge park fails the run, and
-// the terminal fail settles the pending scope row 'declined'.
-func TestForgeParkCapFailSettlesScopeDeclinedLiveDB(t *testing.T) {
+// The cap hold leaves the pending scope directive available for the resumed attempt.
+func TestForgeParkCapHoldLeavesScopePendingLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.forgeParkService(t, 2) // cap 2
 
@@ -60,11 +59,11 @@ func TestForgeParkCapFailSettlesScopeDeclinedLiveDB(t *testing.T) {
 	if err != nil || !applied {
 		t.Fatalf("SetState(forge park past cap): applied=%v err=%v", applied, err)
 	}
-	if run.Status != "failed" {
-		t.Fatalf("run status = %q, want failed (past the forge cap)", run.Status)
+	if run.Status != "recovery_wait" {
+		t.Fatalf("run status = %q, want recovery_wait (past the forge cap)", run.Status)
 	}
-	if disp, settled := e.scopeDisposition(t, runID); !settled || disp != "declined" {
-		t.Fatalf("scope disposition = %q (settled=%v), want declined on the terminal cap-fail", disp, settled)
+	if disp, settled := e.scopeDisposition(t, runID); settled {
+		t.Fatalf("scope disposition = %q (settled=%v), want pending on cap hold", disp, settled)
 	}
 }
 
@@ -86,10 +85,8 @@ func (b *fpDirectiveOnBegin) Begin(ctx context.Context) (pgx.Tx, error) {
 	return b.e.pool.Begin(ctx)
 }
 
-// TestForgeParkScopeDirectiveDuringParkSettlesDeclinedLiveDB: a scope directive that commits
-// between SetState's unlocked read and the forge park's FOR UPDATE reread is still settled
-// 'declined' by the terminal cap-fail (the settle reads the post-transition row, not `owned`).
-func TestForgeParkScopeDirectiveDuringParkSettlesDeclinedLiveDB(t *testing.T) {
+// A directive committed between the unlocked read and the park lock stays pending.
+func TestForgeParkScopeDirectiveDuringCapHoldStaysPendingLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.forgeParkService(t, 2) // cap 2
 
@@ -107,11 +104,11 @@ func TestForgeParkScopeDirectiveDuringParkSettlesDeclinedLiveDB(t *testing.T) {
 	if !hook.fired {
 		t.Fatal("Begin hook never fired: the scope directive was not injected mid-park")
 	}
-	if run.Status != "failed" {
-		t.Fatalf("run status = %q, want failed (past the forge cap)", run.Status)
+	if run.Status != "recovery_wait" {
+		t.Fatalf("run status = %q, want recovery_wait (past the forge cap)", run.Status)
 	}
-	if disp, settled := e.scopeDisposition(t, runID); !settled || disp != "declined" {
-		t.Fatalf("scope disposition = %q (settled=%v), want declined for a directive committed mid-park", disp, settled)
+	if disp, settled := e.scopeDisposition(t, runID); settled {
+		t.Fatalf("scope disposition = %q (settled=%v), want pending for a directive committed mid-park", disp, settled)
 	}
 }
 

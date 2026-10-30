@@ -1180,6 +1180,8 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"now_summary_enabled",
 		// PRD #3245: the Codex judge lane and the read-only resolved judge cells.
 		"codex_judge_model", "judge_models",
+		// PRD #3247: the read-only resolved ordinary effort cells.
+		"effort_settings",
 		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).
 		"weekly_reserve_pct", "weekly_reserve_pause_running")
 }
@@ -1187,6 +1189,11 @@ func TestUserSettingsDTOTags(t *testing.T) {
 func TestModelSettingCellDTOTags(t *testing.T) {
 	assertTags(t, "ModelSettingCellDTO", ModelSettingCellDTO{},
 		"harness", "model", "default_model", "default_source", "resolved_model", "source")
+}
+
+func TestEffortSettingCellDTOTags(t *testing.T) {
+	assertTags(t, "EffortSettingCellDTO", EffortSettingCellDTO{},
+		"harness", "effort", "default_effort", "default_source", "resolved_effort", "source", "mode")
 }
 
 func TestCrossCheckPinDTOTags(t *testing.T) {
