@@ -1839,6 +1839,37 @@ describe("RunView header — the lead chip (PRD #3244 rules 2 and 3; PRD #300 sc
     expect(chip.getAttribute("title")).toContain("opus: lead template");
   });
 
+  // PRD #3244 M2: the runtime reported a level that differs from the request.
+  it("claimed run whose runtime reported 'high' against a requested 'xhigh': chip 'high (requested xhigh)'", async () => {
+    renderPage({
+      status: "running",
+      harness: "claude",
+      model: null,
+      lead_config: {
+        applicable: true,
+        claim_generation: 1,
+        current: true,
+        phases: [
+          phase({
+            harness: "claude",
+            requested_model: "opus",
+            requested_model_source: "user_default",
+            requested_effort: "xhigh",
+            requested_effort_source: "user_default",
+            observed_model: "claude-opus-5",
+            observed_model_evidence: "claude_init",
+            observed_effort: "high",
+            observed_effort_evidence: "claude_init",
+          }),
+        ],
+      },
+    } as Partial<Run>);
+    const chip = await screen.findByText("lead: opus · high (requested xhigh)");
+    expect(chip.getAttribute("title")).toContain("runtime: claude-opus-5 (Claude SDK init)");
+    expect(chip.getAttribute("title")).toContain("effort: high (Claude SDK init)");
+    expect(chip.classList.contains("text-neutral-fg")).toBe(true);
+  });
+
   // PRD #305: the frozen "apply model also to agents" flag, shown on every status.
   const OVERRIDE_BADGE_TITLE =
     "This run's model was applied to every subagent, overriding their own model pins";

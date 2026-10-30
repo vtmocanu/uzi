@@ -60,6 +60,33 @@ const LEAD_CONFIG_OPUS_MEDIUM: RunLeadConfig = {
   ],
 };
 
+const LEAD_CONFIG_CODEX_OBSERVED: RunLeadConfig = {
+  applicable: true,
+  claim_generation: 1,
+  current: true,
+  phases: [
+    {
+      phase: "implement",
+      phase_entry: 1,
+      seq: 2,
+      harness: "codex",
+      requested_model: "gpt-6-astra",
+      requested_model_source: "user_default",
+      requested_model_fixed_at: "claim",
+      requested_effort: null,
+      requested_effort_mode: "runtime_default",
+      requested_effort_source: "builtin",
+      requested_effort_fixed_at: "claim",
+      observed_model: "gpt-6-astra",
+      observed_model_evidence: "codex_thread_response",
+      observed_effort: "high",
+      observed_effort_evidence: "codex_runtime_default",
+      truncated: false,
+      reported_at: minsAgo(200),
+    },
+  ],
+};
+
 export const mockRuns: Run[] = [
   {
     // run-queued is parked in the queue, not yet claimed by a worker: it renders
@@ -1186,6 +1213,9 @@ export const mockRuns: Run[] = [
     worker_id: "w-laptop",
     branch: "agent/issue-61",
     model: null,
+    // PRD #3244 rule 4, observed side: Codex was sent no effort ("runtime default") and reported
+    // its thread's configured effort, so the chip reads "runtime default: high".
+    lead_config: LEAD_CONFIG_CODEX_OBSERVED,
     override_subagent_model: false,
     forge_type: "gitlab",
     mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/61",

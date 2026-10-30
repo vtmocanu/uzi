@@ -106,67 +106,11 @@ describe("leadConfigView display_cases (fixtures/lead-config/contract.json)", ()
   });
 });
 
-describe("leadConfigView observed-side branches (rule 4, M2 cases not yet in the fixture)", () => {
-  function withObserved(over: Record<string, unknown>): LeadConfigViewInput {
-    const base = otherLevelInput();
-    const row = { ...base.leadConfig!.phases[0], requested_effort: "xhigh", requested_effort_mode: "explicit" as const, ...over };
-    return { ...base, leadConfig: { ...base.leadConfig!, phases: [row as never] } };
-  }
-
-  it.each(["claude_init", "claude_get_settings", "codex_runtime_default"])(
-    "renders 'high (requested xhigh)' for a differing %s report",
-    (evidence) => {
-      const v = leadConfigView(withObserved({ observed_effort: "high", observed_effort_evidence: evidence }));
-      expect(v.chip).toBe("lead: gpt-6-astra · high (requested xhigh)");
-    },
-  );
-
-  it("keeps the requested level when the evidence is sent-by-us (codex_sent)", () => {
-    const v = leadConfigView(withObserved({ observed_effort: "high", observed_effort_evidence: "codex_sent" }));
-    expect(v.chip).toBe("lead: gpt-6-astra · xhigh");
-  });
-
-  it("keeps the requested level when the observation matches", () => {
-    const v = leadConfigView(withObserved({ observed_effort: "xhigh", observed_effort_evidence: "claude_init" }));
-    expect(v.chip).toBe("lead: gpt-6-astra · xhigh");
-  });
-
-  it("renders 'runtime default: <observed>' and never an 'other' level", () => {
-    const seen = leadConfigView({
-      ...otherLevelInput(),
-      leadConfig: {
-        ...otherLevelInput().leadConfig!,
-        phases: [{ ...otherLevelInput().leadConfig!.phases[0], observed_effort: "high" }],
-      },
-    });
-    expect(seen.chip).toBe("lead: gpt-6-astra · runtime default: high");
-    const other = leadConfigView(otherLevelInput());
-    expect(other.chip).toBe("lead: gpt-6-astra · runtime default");
-    expect(other.chip).not.toContain("other");
-  });
-
-  it("renders 'not sent' for a Claude run whose init carried a null effort", () => {
-    const v = leadConfigView(
-      withObserved({ observed_effort: null, observed_effort_evidence: "claude_init", harness: "claude" }),
-    );
-    expect(v.lines).toContain("effort: not sent");
-  });
-
-  it("uses the observed model when the request had none and was built-in", () => {
-    const v = leadConfigView(
-      withObserved({
-        requested_model: null,
-        requested_model_source: "builtin",
-        observed_model: "claude-opus-5",
-        observed_model_evidence: "claude_init",
-        observed_effort: null,
-      }),
-    );
-    expect(v.chip.startsWith("lead: claude-opus-5 · ")).toBe(true);
-  });
-
+describe("leadConfigView model sanitising", () => {
   it("strips format characters from model strings", () => {
-    const v = leadConfigView(withObserved({ requested_model: `cl${String.fromCodePoint(0x202e)}aude` }));
+    const base = otherLevelInput();
+    const row = { ...base.leadConfig!.phases[0], requested_model: `cl${String.fromCodePoint(0x202e)}aude` };
+    const v = leadConfigView({ ...base, leadConfig: { ...base.leadConfig!, phases: [row] } });
     expect(v.chip).toContain("claude");
     expect(v.chip + v.lines.join("")).not.toMatch(/[\p{Cf}]/u);
   });

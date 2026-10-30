@@ -1294,6 +1294,650 @@
           "This is the lead agent; subagents with their own pin may differ."
         ]
       }
+    },
+    {
+      "id": "dc4m-claude-init-mismatch-high-requested-xhigh",
+      "input": {
+        "status": "running",
+        "harness": "claude",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": "opus",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "xhigh",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "user_default",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": "claude-opus-5",
+              "observed_model_evidence": "claude_init",
+              "observed_effort": "high",
+              "observed_effort_evidence": "claude_init",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: opus · high (requested xhigh)",
+        "lines": [
+          "opus: your Claude default",
+          "xhigh: your Claude effort",
+          "runtime: claude-opus-5 (Claude SDK init)",
+          "effort: high (Claude SDK init)",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dc4m-claude-settings-mismatch-high-requested-xhigh",
+      "input": {
+        "status": "running",
+        "harness": "claude",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": "opus",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "xhigh",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "user_default",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": null,
+              "observed_model_evidence": "unknown",
+              "observed_effort": "high",
+              "observed_effort_evidence": "claude_get_settings",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: opus · high (requested xhigh)",
+        "lines": [
+          "opus: your Claude default",
+          "xhigh: your Claude effort",
+          "runtime: not reported by the runtime",
+          "effort: high (Claude SDK settings)",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dc4m-claude-same-level-no-suffix",
+      "input": {
+        "status": "running",
+        "harness": "claude",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": "opus",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "xhigh",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "user_default",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": "claude-opus-5",
+              "observed_model_evidence": "claude_init",
+              "observed_effort": "xhigh",
+              "observed_effort_evidence": "claude_init",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: opus · xhigh",
+        "lines": [
+          "opus: your Claude default",
+          "xhigh: your Claude effort",
+          "runtime: claude-opus-5 (Claude SDK init)",
+          "effort: xhigh (Claude SDK init)",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dc4m-codex-sent-mismatch-renders-requested",
+      "input": {
+        "status": "running",
+        "harness": "codex",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "codex",
+              "requested_model": "gpt-6-astra",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "xhigh",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "user_default",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": "gpt-6-astra",
+              "observed_model_evidence": "codex_thread_response",
+              "observed_effort": "high",
+              "observed_effort_evidence": "codex_sent",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: gpt-6-astra · xhigh",
+        "lines": [
+          "gpt-6-astra: your Codex default",
+          "xhigh: your Codex effort",
+          "runtime: gpt-6-astra (Codex thread config)",
+          "effort: high (sent to Codex)",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dc4m-claude-effort-not-sent",
+      "input": {
+        "status": "running",
+        "harness": "claude",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": "opus",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "medium",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "builtin",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": "claude-opus-5",
+              "observed_model_evidence": "claude_init",
+              "observed_effort": null,
+              "observed_effort_evidence": "claude_init",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: opus · medium",
+        "lines": [
+          "opus: your Claude default",
+          "medium: built-in",
+          "runtime: claude-opus-5 (Claude SDK init)",
+          "effort: not sent",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dc4m-codex-observed-other",
+      "input": {
+        "status": "running",
+        "harness": "codex",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "codex",
+              "requested_model": "gpt-6-astra",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": null,
+              "requested_effort_mode": "runtime_default",
+              "requested_effort_source": "builtin",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": "gpt-6-astra",
+              "observed_model_evidence": "codex_thread_response",
+              "observed_effort": "other",
+              "observed_effort_evidence": "codex_runtime_default",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: gpt-6-astra · runtime default",
+        "lines": [
+          "gpt-6-astra: your Codex default",
+          "runtime default",
+          "runtime: gpt-6-astra (Codex thread config)",
+          "effort: an unrecognized level (Codex thread config)",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dc4m-claude-evidence-unknown",
+      "input": {
+        "status": "running",
+        "harness": "claude",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": "opus",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "medium",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "builtin",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": null,
+              "observed_model_evidence": "unknown",
+              "observed_effort": null,
+              "observed_effort_evidence": "unknown",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: opus · medium",
+        "lines": [
+          "opus: your Claude default",
+          "medium: built-in",
+          "runtime: not reported by the runtime",
+          "effort: not reported by the runtime",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dc4m-codex-runtime-default-with-observation",
+      "input": {
+        "status": "running",
+        "harness": "codex",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "codex",
+              "requested_model": "gpt-6-astra",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": null,
+              "requested_effort_mode": "runtime_default",
+              "requested_effort_source": "builtin",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": "gpt-6-astra",
+              "observed_model_evidence": "codex_thread_response",
+              "observed_effort": "high",
+              "observed_effort_evidence": "codex_runtime_default",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: gpt-6-astra · runtime default: high",
+        "lines": [
+          "gpt-6-astra: your Codex default",
+          "runtime default",
+          "runtime: gpt-6-astra (Codex thread config)",
+          "effort: high (Codex thread config)",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dc4m-codex-runtime-default-without-observation",
+      "input": {
+        "status": "running",
+        "harness": "codex",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "codex",
+              "requested_model": "gpt-6-astra",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": null,
+              "requested_effort_mode": "runtime_default",
+              "requested_effort_source": "builtin",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": "gpt-6-astra",
+              "observed_model_evidence": "codex_thread_response",
+              "observed_effort": null,
+              "observed_effort_evidence": "unknown",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: gpt-6-astra · runtime default",
+        "lines": [
+          "gpt-6-astra: your Codex default",
+          "runtime default",
+          "runtime: gpt-6-astra (Codex thread config)",
+          "effort: not reported by the runtime",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dc4m-claude-builtin-no-model-shows-observed",
+      "input": {
+        "status": "running",
+        "harness": "claude",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": null,
+              "requested_model_source": "builtin",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "medium",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "builtin",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": "claude-opus-5",
+              "observed_model_evidence": "claude_init",
+              "observed_effort": null,
+              "observed_effort_evidence": "claude_init",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: claude-opus-5 · medium",
+        "lines": [
+          "claude-opus-5: Claude SDK default",
+          "medium: built-in",
+          "runtime: claude-opus-5 (Claude SDK init)",
+          "effort: not sent",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dc4m-example1-claude-effort-not-reported",
+      "input": {
+        "status": "running",
+        "harness": "claude",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": "opus",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "medium",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "builtin",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": "claude-opus-5",
+              "observed_model_evidence": "claude_init",
+              "observed_effort": null,
+              "observed_effort_evidence": "unknown",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: opus · medium",
+        "lines": [
+          "opus: your Claude default",
+          "medium: built-in",
+          "runtime: claude-opus-5 (Claude SDK init)",
+          "effort: not reported by the runtime",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dc4m-example1-claude-probe-answered-high",
+      "input": {
+        "status": "running",
+        "harness": "claude",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": "opus",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "medium",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "builtin",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": "claude-opus-5",
+              "observed_model_evidence": "claude_init",
+              "observed_effort": "high",
+              "observed_effort_evidence": "claude_get_settings",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: opus · high (requested medium)",
+        "lines": [
+          "opus: your Claude default",
+          "medium: built-in",
+          "runtime: claude-opus-5 (Claude SDK init)",
+          "effort: high (Claude SDK settings)",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dc4m-example2-codex-schedule-pin-after-claim",
+      "input": {
+        "status": "running",
+        "harness": "codex",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "codex",
+              "requested_model": "gpt-6-astra",
+              "requested_model_source": "schedule_pin",
+              "requested_model_fixed_at": "create",
+              "requested_effort": "high",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "user_default",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": "gpt-6-astra",
+              "observed_model_evidence": "codex_thread_response",
+              "observed_effort": "high",
+              "observed_effort_evidence": "codex_sent",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: gpt-6-astra · high",
+        "lines": [
+          "gpt-6-astra: fixed by schedule",
+          "high: your Codex effort",
+          "runtime: gpt-6-astra (Codex thread config)",
+          "effort: high (sent to Codex)",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dc4m-claude-explicit-observed-other-keeps-requested",
+      "input": {
+        "status": "running",
+        "harness": "claude",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": "opus",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "xhigh",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "user_default",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": "claude-opus-5",
+              "observed_model_evidence": "claude_init",
+              "observed_effort": "other",
+              "observed_effort_evidence": "claude_init",
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: opus · xhigh",
+        "lines": [
+          "opus: your Claude default",
+          "xhigh: your Claude effort",
+          "runtime: claude-opus-5 (Claude SDK init)",
+          "effort: an unrecognized level (Claude SDK init)",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
     }
   ]
 }
