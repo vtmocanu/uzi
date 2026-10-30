@@ -63,7 +63,8 @@ async function rig() {
   await fs.writeFile(file, physical, { mode: 0o600 });
   const outbox = open();
   await outbox.init();
-  assert.deepEqual(outbox.listPendingTerminals(), []);
+  assert.equal(outbox.listPendingTerminals()[0]?.outcome_kind, "unknown");
+  assert.equal(await outbox.hasPendingPolicyOutcome(run), true);
   assert.deepEqual(outbox.listPendingFinalizes(), []);
   assert.equal(await outbox.readTerminalJournal(run, 3), undefined);
   const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 256);
@@ -101,12 +102,16 @@ function recorded(body: string) {
   const request = JSON.parse(body);
   return { dispositions: request.rejections.map((entry: object) => ({ ...entry, disposition: "recorded" })) };
 }
-function assertNoAuthority(r: Awaited<ReturnType<typeof rig>>) {
-  assert.deepEqual(r.outbox.listPendingTerminals(), []);
+async function assertNoAuthority(r: Awaited<ReturnType<typeof rig>>) {
+  assert.ok(r.outbox.listPendingTerminals().every(p => p.outcome_kind === "unknown"));
+  assert.equal(r.outbox.listPendingTerminals().length, 1);
   assert.deepEqual(r.outbox.listPendingFinalizes(), []);
   const snapshot = r.registry.build();
   assert.deepEqual(snapshot.active, [], "diagnostics create no active or terminal-pending lease");
-  assert.equal(snapshot.pending_overflow, false);
+  assert.equal(snapshot.pending_overflow, true, "unknown policy admission retains conservative protection");
+  assert.deepEqual(snapshot.pending_all, [{ run_id: run, claim_generation: 3 }]);
+  assert.equal(await r.outbox.hasPendingPolicyOutcome(run), true);
+  assert.equal(await r.outbox.readTerminalJournal(run, 3), undefined);
   assert.equal(r.registry.size, 0);
 }
 
@@ -125,6 +130,7 @@ test("M3 restart sends actual MAC rejection wire without terminal authority; ope
       protocol_features: [feature, "active_run_snapshot", "heartbeat_outbox"], register_nonce: "acceptance" });
     if (route.endsWith("/heartbeat")) { heartbeats++; return Response.json({}); }
     if (route.includes("/claim")) return new Response(null, { status: 204 });
+    if (route.endsWith("/ownership")) return new Response(null, { status: 404 });
     if (route.endsWith("/terminal-rejections")) {
       posts++;
       await acknowledge.promise;
@@ -139,7 +145,9 @@ test("M3 restart sends actual MAC rejection wire without terminal authority; ope
     assert.equal(gets, 0, "custody awaits the diagnostic ACK");
     assert.equal(await fs.readFile(r.file, "utf8"), r.physical);
     const register = JSON.parse(calls.find(call => call.route.endsWith("/register"))!.body);
-    assert.equal(register.active_snapshot, undefined);
+    assert.deepEqual(register.active_snapshot.active, []);
+    assert.equal(register.active_snapshot.pending_overflow, true);
+    assert.deepEqual(register.active_snapshot.pending_all, [{ run_id: run, claim_generation: 3 }]);
     assert.equal(register.pending_terminal, undefined);
     assert.equal(register.finalize_resume, undefined);
     const post = calls.find(call => call.route.endsWith("/terminal-rejections"))!;
@@ -151,14 +159,18 @@ test("M3 restart sends actual MAC rejection wire without terminal authority; ope
       ["claim_generation", "reason", "run_id"]);
     acknowledge.resolve();
     await until(() => gets >= 1 && heartbeats >= 4);
-    assertNoAuthority(r);
+    await assertNoAuthority(r);
     assert.equal(await fs.readFile(r.file, "utf8"), r.physical, "recorded report and open custody cannot delete");
     for (const call of calls.filter(call => call.route.endsWith("/heartbeat") || call.route.includes("/claim"))) {
       const wire = JSON.parse(call.body);
-      assert.equal(wire.outbox, undefined, "rejection is not a pending outbox lease");
+      if (wire.outbox) {
+        assert.deepEqual(wire.outbox, [{ run_id: run, pending_messages: 0, pending_terminal: 1,
+          stale_retired: 0, since: r.outbox.depthFor(run)!.since }], "unknown evidence retains admission telemetry only");
+      }
       if (wire.active_snapshot) {
         assert.deepEqual(wire.active_snapshot.active, []);
-        assert.equal(wire.active_snapshot.pending_overflow, false);
+        assert.equal(wire.active_snapshot.pending_overflow, true);
+        assert.deepEqual(wire.active_snapshot.pending_all, [{ run_id: run, claim_generation: 3 }]);
         assert.equal(wire.active_snapshot.finalize_resume, undefined);
       }
     }
@@ -184,6 +196,7 @@ for (const advertisement of [undefined, [], feature, { [feature]: true }]) {
       if (route.endsWith("/register")) return Response.json({ worker_id: workerId, protocol_features: advertisement });
       if (route.endsWith("/heartbeat")) { heartbeats++; return Response.json({}); }
       if (route.includes("/claim")) return new Response(null, { status: 204 });
+      if (route.endsWith("/ownership")) return new Response(null, { status: 404 });
       diagnostics++;
       assert.fail("unsupported API must receive no diagnostic POST or GET");
     };
@@ -200,7 +213,7 @@ for (const advertisement of [undefined, [], feature, { [feature]: true }]) {
       assert.equal(unsupported.length, 1);
       for (const entry of unsupported) assert.equal(entry.fields, undefined);
       assert.equal(await fs.readFile(r.file, "utf8"), r.physical);
-      assertNoAuthority(r);
+      await assertNoAuthority(r);
     } finally {
       r.controller.abort();
       await running;
@@ -260,7 +273,7 @@ test("M3 strict-decode heartbeat fallback stops queued and later diagnostics; re
     assert.equal(c.hasFeature(feature), true);
     coordinator.queueReconciliation();
     await until(() => posts >= 2 && gets >= 1);
-    assertNoAuthority(r);
+    await assertNoAuthority(r);
     assert.equal(await fs.readFile(r.file, "utf8"), r.physical);
   } finally {
     acknowledge.resolve();

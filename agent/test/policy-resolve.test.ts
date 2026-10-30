@@ -373,6 +373,35 @@ it("ordinary root/run entries never invent a policy blocker; late corrupt aliase
   assert.equal(await outbox.hasPendingPolicyOutcome(run), true);
 });
 
+it("policy admission distinguishes proven empty impossible roots from unreadable or symlink ancestry", async t => {
+  const f = await fixture(t);
+  const blocked = path.join(f.root, "regular-file");
+  await fs.writeFile(blocked, "not a directory");
+  const make = (root: string) => new Outbox({ root, log: nullLogger(), runMaxBytes: 1e6, maxBytes: 4e6, retentionMs: 86400000 });
+  const impossible = make(path.join(blocked, "outbox"));
+  await impossible.init();
+  assert.equal(impossible.isDisabled(), true);
+  assert.equal(await impossible.hasPendingPolicyOutcome(run), false);
+  // Retained validated memory remains authoritative even when the disk root cannot exist.
+  await impossible.journalPolicyHold(run, original);
+  assert.equal(await impossible.hasPendingPolicyOutcome(run), true);
+  const link = path.join(f.root, "alias");
+  await fs.symlink(blocked, link);
+  assert.equal(await make(path.join(link, "outbox")).hasPendingPolicyOutcome(run), true);
+  const directoryAlias = path.join(f.root, "directory-alias");
+  await fs.symlink(f.root, directoryAlias);
+  const ordinary = make(path.join(directoryAlias, "ordinary-outbox"));
+  await ordinary.init();
+  assert.equal(ordinary.isDisabled(), false);
+  assert.equal(await ordinary.hasPendingPolicyOutcome(run), false, "existing safe directory roots retain ordinary admission");
+  const lstat = fs.lstat.bind(fs);
+  t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
+    if (String(args[0]) === f.root) throw Object.assign(new Error("unreadable"), { code: "EACCES" });
+    return lstat(...args);
+  });
+  assert.equal(await f.outbox.hasPendingPolicyOutcome(run), true);
+});
+
 it("disabled policy deps retain snapshot membership without an unjournaled send", async t => {
   const { root } = await fixture(t);
   await fs.writeFile(path.join(root, ".key"), "invalid");

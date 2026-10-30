@@ -849,7 +849,7 @@ export class Worker {
     // false, `finalize_resume` set). Built ONCE before the retry loop so a re-register re-sends the
     // same snapshot. Undefined for an ordinary worker with neither (or no registry) ⇒ the register
     // wire stays byte-identical.
-    const pending = this.outbox?.listPendingTerminals() ?? [];
+    const pending = this.outbox?.listPendingTerminals().filter(p => p.outcome_kind !== "unknown") ?? [];
     // Issue #1742: the finalize-pending records offered on this register, captured ONCE with the
     // snapshot. Freeze each original identity before the request, including existing lower records.
     // Only exact offered identities gain lifetime handoff; captured lower originals gain batch-only authority.

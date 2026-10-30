@@ -5425,6 +5425,15 @@ export class RunRunner {
       }
     };
     try {
+      // Policy admission above retains uncertain/selected outcomes without a
+      // competing report. A positively empty but unavailable store is an ordinary
+      // preparation failure, before cloning or starting the root provider.
+      if (this.outbox?.isDisabled()) {
+        flight.preserveRecoveryClone = true;
+        flight.preserveSession = true;
+        flight.keepGuardedInventoryOpen = true;
+        throw new Error("transport permanently failed (outbox_unavailable)");
+      }
       this.bindWorkerMemory(claim, flight);
       await this.phaseClone(claim, flight);
       executor = flight.executor;

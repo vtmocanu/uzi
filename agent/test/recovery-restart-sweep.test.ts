@@ -164,7 +164,8 @@ async function rejectedTerminal(root: string): Promise<{ outbox: Outbox; file: s
   const outbox = await reopenOutbox();
   assert.equal((await outbox.observeTerminalAuthentication(TRUST_RUN, 7)).kind, "mac_failure");
   assert.equal(await outbox.readTerminalJournal(TRUST_RUN, 7), undefined);
-  assert.deepEqual(outbox.listPendingTerminals(), []);
+  assert.equal(outbox.listPendingTerminals()[0]?.outcome_kind, "unknown");
+  assert.equal(await outbox.hasPendingPolicyOutcome(TRUST_RUN), true);
   assert.deepEqual(outbox.listPendingFinalizes(), []);
   return { outbox, file, physical };
 }
@@ -311,7 +312,8 @@ describe("RecoveryCoordinator.resumePending — pinned records after restart (is
       assert.equal(await fsp.readFile(file, "utf8"), physical, "capture preserves the rejected terminal byte for byte");
       assert.equal((await outbox.observeTerminalAuthentication(TRUST_RUN, 7)).kind, "mac_failure");
       assert.equal(await outbox.readTerminalJournal(TRUST_RUN, 7), undefined);
-      assert.deepEqual(outbox.listPendingTerminals(), []);
+      assert.equal(outbox.listPendingTerminals()[0]?.outcome_kind, "unknown");
+      assert.equal(await outbox.hasPendingPolicyOutcome(TRUST_RUN), true);
       assert.deepEqual(outbox.listPendingFinalizes(), []);
     } finally {
       await fsp.rm(root, { recursive: true, force: true });
@@ -350,7 +352,8 @@ describe("RecoveryCoordinator.resumePending — pinned records after restart (is
       assert.equal(await fsp.readFile(file, "utf8"), physical);
       assert.equal((await outbox.observeTerminalAuthentication(TRUST_RUN, 7)).kind, "mac_failure");
       assert.equal(await outbox.readTerminalJournal(TRUST_RUN, 7), undefined);
-      assert.deepEqual(outbox.listPendingTerminals(), []);
+      assert.equal(outbox.listPendingTerminals()[0]?.outcome_kind, "unknown");
+      assert.equal(await outbox.hasPendingPolicyOutcome(TRUST_RUN), true);
       assert.deepEqual(outbox.listPendingFinalizes(), []);
     } finally {
       await fsp.rm(root, { recursive: true, force: true });

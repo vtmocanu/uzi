@@ -71,6 +71,37 @@ it("known pending facts survive authenticated restart and adoption; ACK preserve
   assert.deepEqual(facts(again), pending);
 });
 
+for (const kind of ["terminal", "policy_hold"] as const) {
+  it("ordinary readback exposes only matching " + kind + " settlement across replacement and restart", async t => {
+    const f = await fixture(t);
+    if (kind === "policy_hold") await f.outbox.journalPolicyHold(run, body);
+    else await f.outbox.journalTerminal(run, 7, "running", 0, { status: "completed" });
+    await settle(f.outbox, 7);
+    assert.equal((await f.outbox.readTerminalJournal(run, 7))?.server_settled, true);
+    const restarted = f.make();
+    await restarted.init();
+    assert.equal((await restarted.readTerminalJournal(run, 7))?.server_settled, undefined);
+    // Identical authenticated bytes in another physical lifetime cannot borrow the ACK.
+    await fs.copyFile(f.file, f.file + ".replacement");
+    await fs.rename(f.file + ".replacement", f.file);
+    assert.equal((await f.outbox.readTerminalJournal(run, 7))?.server_settled, undefined);
+    await settle(f.outbox, 7);
+    assert.equal((await f.outbox.readTerminalJournal(run, 7))?.server_settled, true);
+    // An authenticated payload change in the same inode cannot borrow it either.
+    const data = JSON.parse(await fs.readFile(f.file, "utf8"));
+    if (kind === "policy_hold") data.body.detail = "changed refusal";
+    else data.body.status = "failed";
+    delete data.mac;
+    const canonical = (v: unknown): string => v !== null && typeof v === "object" ?
+      "{" + Object.entries(v).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+        .map(([k, value]) => JSON.stringify(k) + ":" + canonical(value)).join(",") + "}" : JSON.stringify(v);
+    data.mac = createHmac("sha256", await fs.readFile(path.join(f.root, ".key")))
+      .update("uzi.outbox.terminal.v1").update(canonical(data)).digest("hex");
+    await fs.writeFile(f.file, JSON.stringify(data));
+    assert.equal((await f.outbox.readTerminalJournal(run, 7))?.server_settled, undefined);
+  });
+}
+
 it("authenticated exclusive-install adoption retains the first writer UUID", async t => {
   const f = await fixture(t);
   const competitor = f.make();

@@ -742,12 +742,14 @@ describe("U2 real runner checked gate", () => {
       runMaxBytes: 1024, maxBytes: 4096, retentionMs: 86_400_000 });
     await outbox.init();
     assert.ok(outbox.isDisabled());
-    const { exec, verdicts } = checkedExec();
+    let providerStarts = 0;
+    const { exec, verdicts } = checkedExec(async () => { providerStarts++; });
     const forge = fakeGitlab();
     const run = runner(exec, forge.gitlab, undefined, { outbox, planCrossCheckTiming: timing });
     try {
       await run.execute(c);
       terminal(c.run_id, "transport permanently failed (outbox_unavailable)");
+      assert.equal(providerStarts, 0, "unavailable transport fails preparation before the root provider");
       assert.equal(api.crossCheckRequests.length, 0);
       assert.equal(gates(c.run_id).length, 0);
       assert.equal(verdicts.length, 0);

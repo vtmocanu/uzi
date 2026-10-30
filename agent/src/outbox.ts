@@ -615,7 +615,7 @@ export class Outbox {
 
     this.log.info("outbox terminal journal load", {
       outcome: "complete",
-      authenticated_pending: this.listPendingTerminals().length,
+      authenticated_pending: this.listPendingTerminals().filter(p => p.outcome_kind !== "unknown").length,
       authenticated_files: authenticated,
       rejected_files: rejected,
       physical_files: physicalJournals,
@@ -798,7 +798,31 @@ export class Outbox {
       } finally { await dir.close(); }
     };
     try {
-      const stat = await fs.lstat(this.root);
+      let stat;
+      try { stat = await fs.lstat(this.root); }
+      catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+        // An unavailable root is not policy evidence when a no-follow walk
+        // positively proves it cannot contain journals. Uncertain ancestry blocks.
+        // Existing directory roots retain their original directory-safety checks.
+        const absoluteRoot = path.resolve(this.root);
+        let component = path.parse(absoluteRoot).root;
+        for (const name of absoluteRoot.slice(component.length).split(path.sep)) {
+          component = path.join(component, name);
+          let ancestor;
+          try { ancestor = await fs.lstat(component); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+            throw error;
+          }
+          if (ancestor.isSymbolicLink()) return true;
+          if (ancestor.isFile()) return false;
+          if (!ancestor.isDirectory()) return true;
+        }
+        return true;
+      }
+      if (stat.isFile()) return false;
       if (!stat.isDirectory() || stat.isSymbolicLink()) return true;
       const root = await fs.opendir(this.root);
       try {
@@ -1925,7 +1949,12 @@ export class Outbox {
       if (!this.validRunId(runId)) return undefined;
       const parsed = await this.readTerminalAuthed(runId, claimGeneration);
       if (!parsed) return undefined;
-      return coerceTerminalRecord(parsed, runId, claimGeneration) ?? undefined;
+      const journal = coerceTerminalRecord(parsed, runId, claimGeneration) ?? undefined;
+      const meta = this.runs.get(runId)?.terminals.get(claimGeneration);
+      const binding = meta && this.terminalRetirementIdentities.get(meta);
+      if (journal && binding?.serverSettled && binding.lifetime === this.authenticatedLifetimes.get(parsed) &&
+          binding.payload === terminalRetirementPayload(parsed)) journal.server_settled = true;
+      return journal;
     });
   }
 
@@ -2669,6 +2698,20 @@ export class Outbox {
         if (!same(observed, await this.observeTerminalAuthentication(physicalRunId, generation, observed.fileName))) return removed;
         if (!canDelete()) return removed;
         await fs.unlink(path.join(this.runDir(physicalRunId), observed.fileName));
+        // Only this physical rejection was disposed. Keep independent validated
+        // memory evidence, and keep a surviving alias visible to snapshot admission.
+        const terminals = this.runs.get(physicalRunId)?.terminals;
+        const meta = terminals?.get(generation);
+        if (meta?.outcomeKind === "unknown" && meta.fileName === observed.fileName) {
+          if (meta.unpersistedPolicy) meta.outcomeKind = "policy_hold";
+          else {
+            const alias = (await fs.readdir(this.runDir(physicalRunId)))
+              .find(name => parseTerminalFileName(name) === generation);
+            this.terminalRetirementIdentities.delete(meta);
+            terminals?.delete(generation);
+            if (alias !== undefined) this.retainUnknownTerminal(physicalRunId, generation, alias);
+          }
+        }
         await this.fsyncDir(this.runDir(physicalRunId), true);
         removed++;
       }

@@ -48,7 +48,11 @@ it("reports physical terminals separately from authenticated terminals without f
     assert.equal(inventory?.symlink_entries, 1);
     assert.equal(load?.authenticated_pending, 0);
     assert.equal(load?.rejected_files, 2);
-    assert.deepEqual(restarted.listPendingTerminals(), []);
+    assert.deepEqual(restarted.listPendingTerminals().map(p => [p.claim_generation, p.outcome_kind]),
+      [[5, "unknown"], [6, "unknown"]]);
+    assert.equal(await restarted.hasPendingPolicyOutcome(runId), true);
+    assert.equal(await restarted.readTerminalJournal(runId, 5), undefined);
+    assert.equal(await restarted.readTerminalJournal(runId, 6), undefined);
     assert.equal(await fs.readlink(symlinkPath), validTarget);
     assert.equal(JSON.stringify([inventory, load]).includes(runId), false);
   } finally {
@@ -61,7 +65,7 @@ it("logs a bounded authenticated register summary with the snapshot epoch", asyn
   const root = path.join(parent, "outbox");
   try {
     const capture = recordingLogger();
-    const outbox = new Outbox({ root, log: capture.logger, runMaxBytes: 64 * 1024 * 1024,
+    let outbox = new Outbox({ root, log: capture.logger, runMaxBytes: 64 * 1024 * 1024,
       maxBytes: 512 * 1024 * 1024, retentionMs: 86_400_000 });
     await outbox.init();
     for (let generation = 1; generation <= 10; generation++) {
@@ -69,6 +73,13 @@ it("logs a bounded authenticated register summary with the snapshot epoch", asyn
       assert.equal((await outbox.journalTerminal(runId, generation, "running", 0,
         { status: "completed" })).journaled, true);
     }
+    const unknownRun = "00000011-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    await fs.mkdir(path.join(root, unknownRun));
+    await fs.writeFile(path.join(root, unknownRun, "terminal-11.json"), "{");
+    outbox = new Outbox({ root, log: capture.logger, runMaxBytes: 64 * 1024 * 1024,
+      maxBytes: 512 * 1024 * 1024, retentionMs: 86_400_000 });
+    await outbox.init();
+    assert.equal(await outbox.hasPendingPolicyOutcome(unknownRun), true);
     const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 0);
     let sent: ActiveSnapshot | undefined;
     const client = { register: async (_name: string, _template?: string, _max?: number, _caps?: string[],
@@ -88,6 +99,7 @@ it("logs a bounded authenticated register summary with the snapshot epoch", asyn
     assert.equal(summary?.claim_generations_omitted, 2);
     assert.equal(summary?.snapshot_epoch, sent?.snapshot_epoch);
     assert.equal(summary?.pending_overflow, true);
+    assert.equal(sent?.pending_all?.length, 11, "unknown admission identity remains snapshot-visible");
     assert.equal(JSON.stringify(summary).includes("aaaaaaaa"), false);
   } finally {
     await fs.rm(parent, { recursive: true, force: true });

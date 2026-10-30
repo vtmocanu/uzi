@@ -42,7 +42,10 @@ async function rig(generations = [3], physical = run, generationWidth = 0) {
   // Restart inventory must not lease, finalize or register these unauthenticated records.
   const outbox = new Outbox(opts);
   await outbox.init();
-  assert.equal(outbox.listPendingTerminals().length, 0);
+  assert.ok(outbox.listPendingTerminals().length > 0);
+  assert.ok(outbox.listPendingTerminals().every(p => p.outcome_kind === "unknown"));
+  assert.equal(await outbox.readTerminalJournal(run, generations[0]!), undefined);
+  assert.equal(await outbox.hasPendingPolicyOutcome(run), true);
   assert.equal(outbox.listPendingFinalizes().length, 0);
   const client = new WorkerClient("http://scheduler.invalid", "join-token", "test", nullLogger(), { httpTimeoutMs: 100 });
   client.protocolFeatures = ["terminal_rejection_report"];
@@ -103,7 +106,69 @@ test("long aliases exceeding page metadata budget report all 310 generations des
     await waitForTestEvent(deletionReady, "all long-alias terminals removed");
     assert.equal((await fs.readdir(path.dirname(r.file()))).length, 0);
     assert.equal(await r.outbox.hasPhysicalTerminalProtection(run), false);
+    assert.equal(await r.outbox.hasPendingPolicyOutcome(run), false, "authorized cleanup leaves no ghost admission blocker");
+    assert.deepEqual(r.outbox.listPendingTerminals(), []);
   } finally { await r.clean(loop); }
+});
+
+test("authorized rejection cleanup clears the physical sentinel but preserves independent memory policy evidence", async () => {
+  for (const memory of [false, true]) {
+    const root = await fs.mkdtemp(path.join(scratch, "terminal-cleanup-memory-"));
+    let full = true;
+    const outbox = new Outbox({ root, log: nullLogger(), runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1,
+      rawWrite: async (write, ctx) => {
+        if (full && ctx.kind === "terminal") throw Object.assign(new Error("full"), { code: "ENOSPC" });
+        await write();
+      } });
+    try {
+      await outbox.init();
+      if (memory) await outbox.journalPolicyHold(run, {
+        outcome_id: hold, source_generation: 3, claim_generation: 3, detail: "refused",
+        continuation_mode: "same_conversation", published: false,
+        tag: "cyberPolicy", phase: "implementation", correlation_id: "pr-" + "a".repeat(32) + "-1",
+      });
+      await fs.mkdir(path.join(root, run), { recursive: true });
+      await fs.writeFile(path.join(root, run, "terminal-3.json"), badRecord());
+      // Load physical-only unknown metadata, or retain the failed write's memory body.
+      const candidate = memory ? outbox : new Outbox({ root, log: nullLogger(),
+        runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1 });
+      if (!memory) await candidate.init();
+      const observed = await candidate.observeTerminalAuthentication(run, 3);
+      assert.equal(observed.kind, "mac_failure");
+      assert.equal(await candidate.hasPendingPolicyOutcome(run), true);
+      assert.equal(await candidate.cleanupRejectedTerminalFiles(run, 3, worker, [observed], async () => custody(3)), 1);
+      assert.equal(await candidate.hasPhysicalTerminalProtection(run), false);
+      assert.equal(await candidate.hasPendingPolicyOutcome(run), memory);
+      assert.equal(candidate.listPendingTerminals().length, memory ? 1 : 0);
+      assert.equal(await candidate.readTerminalJournal(run, 3), undefined);
+      if (memory) {
+        full = false;
+        await candidate.retryPendingPolicyJournal(run, 3);
+        assert.equal((await candidate.readTerminalJournal(run, 3))?.body.outcome_id, hold,
+          "guarded rejection cleanup keeps the original memory outcome retryable");
+      }
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  }
+});
+
+test("rejection cleanup keeps sibling alias snapshot protection until its own guarded disposal", async () => {
+  const r = await rig();
+  const alias = path.join(path.dirname(r.file()), "terminal-03.json");
+  try {
+    await fs.writeFile(alias, badRecord());
+    const first = await r.outbox.observeTerminalAuthentication(run, 3);
+    assert.equal(await r.outbox.cleanupRejectedTerminalFiles(run, 3, worker, [first], async () => custody(3)), 1);
+    assert.equal(await fs.readFile(alias, "utf8"), badRecord());
+    assert.equal(await r.outbox.hasPendingPolicyOutcome(run), true);
+    const { ActiveRunRegistry } = await import("../src/active-run-registry.js");
+    const registry = new ActiveRunRegistry(() => r.outbox.listPendingTerminals(), () => 256);
+    assert.equal(registry.claimsPausedByPendingOverflow(), true, "surviving alias keeps conservative snapshot exclusion");
+    assert.deepEqual(registry.build().pending_all, [{ run_id: run, claim_generation: 3 }]);
+    const remaining = await r.outbox.observeTerminalAuthentication(run, 3, "terminal-03.json");
+    assert.equal(await r.outbox.cleanupRejectedTerminalFiles(run, 3, worker, [remaining], async () => custody(3)), 1);
+    assert.equal(await r.outbox.hasPendingPolicyOutcome(run), false);
+    assert.equal(registry.claimsPausedByPendingOverflow(), false);
+  } finally { r.controller.abort(); await fs.rm(r.root, { recursive: true, force: true }); }
 });
 
 test("no feature makes zero POST/GET, logs once per episode and rollback stops queued retries", async () => {
@@ -159,6 +224,7 @@ test("exact settled fresh GET removes uppercase physical alias; open sibling ret
     coordinator.queueReconciliation(run, 3);
     await until(async () => !(await fs.stat(r.file()).catch(() => undefined)));
     assert.equal(await r.outbox.hasPhysicalTerminalProtection(run), false);
+    assert.equal(await r.outbox.hasPendingPolicyOutcome(run), false, "uppercase cleanup drops its exact unknown sentinel");
   } finally { await r.clean(loop); }
 });
 
