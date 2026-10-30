@@ -86,7 +86,7 @@ export interface RetirementHandle {
 }
 
 export interface RetirementScope {
-  /** Never writes. Throws AuthorityRefusal for a source that is not published or retiring under this store. */
+  /** Never mutates a slot (reading may create the private slots directory). Throws AuthorityRefusal for a source that is not published or retiring under this store. */
   inspect(value: unknown): Promise<RetirementView>;
   /**
    * Writes no slot or record (it may create the private slots directory, like `inspect`). Whether ANY authority slot (in any state) covers `clonePath`, read under the active transaction A.
