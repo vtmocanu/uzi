@@ -150,6 +150,13 @@ export interface SlotSnapshot {
   /** Sticky: set once the slot was admitted with an executor (codex); never cleared, even by retire. */
   codexMarked: boolean;
 }
+/** The durably saved identity of a slot `transition(..., "ineligible")` just ended. */
+export interface EndedSlotReceipt {
+  key: string;
+  epoch: string;
+  seq: number;
+  worker: string;
+}
 /** What `readPublication` returns for retirement verification. */
 export interface SlotPublicationRead extends SlotPublication {
   state: SlotState;
@@ -634,6 +641,9 @@ export async function openAuthorityStore(tx: AuthorityTransaction, options: Auth
   });
 }
 
+/** The worker incarnation a store opened without an explicit `workerIncarnation` writes its slots under. */
+export function processWorkerIncarnation(): string { return PROCESS_INCARNATION; }
+
 /**
  * Read one slot with NO authority transaction and no write (see {@link AuthorityStore.peekSlot}). An
  * unenrolled store reads as "nothing recorded" (null) only when it has no slots and no heads either; a
@@ -1037,20 +1047,22 @@ export class AuthorityStore {
    * generation from the source, so a caller cannot supply a digest or a foreign cohort. The
    * publication is written in the same step and kept until retirement.
    */
-  async transition(tx: AuthorityTransaction, lease: SourceUseLease, to: "ineligible"): Promise<void>;
+  async transition(tx: AuthorityTransaction, lease: SourceUseLease, to: "ineligible"): Promise<EndedSlotReceipt>;
   async transition(
     tx: AuthorityTransaction, lease: SourceUseLease, to: "claude_ready" | "sealed", input: { source: unknown; captureIds: readonly string[] },
   ): Promise<void>;
   async transition(
     tx: AuthorityTransaction, lease: SourceUseLease, to: "claude_ready" | "sealed" | "ineligible",
     input?: { source: unknown; captureIds: readonly string[] },
-  ): Promise<void> {
+  ): Promise<EndedSlotReceipt | void> {
     const { dir, body, held } = await this.#owned(tx, lease);
     if (!NEXT_STATES[to].includes(body.state)) throw new AuthorityRefusal(`illegal transition ${body.state} -> ${to}`);
     if (to === "ineligible") {
       if (input !== undefined) throw new AuthorityRefusal("ineligible carries no publication");
-      await this.#save(dir, { ...body, state: to, seq: body.seq + 1 });
-      return;
+      const seq = body.seq + 1;
+      // #save returns only after tmp -> fsync -> rename -> dir fsync -> readback -> head, so this is a durable end.
+      await this.#save(dir, { ...body, state: to, seq });
+      return { key: body.key, epoch: body.epoch, seq, worker: body.owner.worker };
     }
     if (body.pending !== null) throw new AuthorityRefusal("unresolved pending footprint");
     if (input === undefined) throw new AuthorityRefusal("publication data required");

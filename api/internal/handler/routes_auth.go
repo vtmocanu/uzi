@@ -35,7 +35,7 @@ func (h *Handler) mountAuthRoutes(r chi.Router, authLimiter, cliPollLimiter *mw.
 		r.With(authLimiter.Middleware).Post("/cli/start", h.CLIAuthStart)
 		r.With(cliPollLimiter.Middleware).Post("/cli/poll", h.CLIAuthPoll)
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Use(h.requireAuth())
 			r.Get("/cli/request/{id}", h.CLIAuthGetRequest)
 			// approve makes the human TYPE the user_code, turning this into a
 			// credential-checking endpoint — so it rides the per-user auth limiter,
@@ -51,11 +51,11 @@ func (h *Handler) mountAuthRoutes(r chi.Router, authLimiter, cliPollLimiter *mw.
 		// whoami` works — and over a uzc_ it honestly reports is_admin:false (the
 		// masking), over a uza_ true. They must therefore be split into two groups.
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Use(h.requireAuth())
 			r.Post("/logout", h.Logout)
 		})
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Use(h.requireUser())
 			r.Get("/me", h.Me)
 		})
 	})

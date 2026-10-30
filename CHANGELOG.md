@@ -33,6 +33,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 ### Changed
 
+- **Routine dependency updates ([#3537](https://github.com/vtmocanu/uzi/pull/3537), [#3581](https://github.com/vtmocanu/uzi/pull/3581), [#3490](https://github.com/vtmocanu/uzi/pull/3490)).**
+  Dependency manifest and image bumps that carry no entry of their own.
+
 - **Routine dependency updates ([#3578](https://github.com/vtmocanu/uzi/pull/3578)).**
   Dependency manifest and image bumps that carry no entry of their own.
 
@@ -339,6 +342,24 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Completed sources are retired after a worker restart only on durable, authenticated proof ([#3404](https://github.com/vtmocanu/uzi/pull/3404), [#3577](https://github.com/vtmocanu/uzi/pull/3577)).**
   A worker now holds an exclusive lifetime lock on its data directory, records each source use and its completion proof in authenticated storage, and after a restart retires a completed clone only when that proof, the recovery records and the bare-journal fence all match; legacy or unproven sources are kept for guarded operator discard, and the worker refuses to start without util-linux flock, an ext4/XFS data volume or a normalized absolute data path; a data path reached through a symlinked parent or alias starts but refuses every protected source operation until it is the canonical real path.
+
+- **Codex subscription runs check account cooldown before each supported new model dispatch ([#3531](https://github.com/vtmocanu/uzi/pull/3531), [#3606](https://github.com/vtmocanu/uzi/pull/3606)).**
+  Runs wait in place with owner-only cooldown health and existing controls/deadlines; after operation negotiation, admission-service outages block the next dispatch even without a known cooldown, while already dispatched turns and preservation continue. Quarantined accounts wait for reconciliation without failing or abandoning their live runs. Replacement revision feedback stays with the lead when a child or optional summary is blocked.
+
+- **Re-unlock protected vaults when an authorized browser returns after an API restart ([#3508](https://github.com/vtmocanu/uzi/pull/3508), [#3634](https://github.com/vtmocanu/uzi/pull/3634)).**
+  HTTPS browsers can opt out of automatic re-unlock; grants expire, require an authenticated foreground request with CSRF authorization, and are revoked by explicit lock. A stolen grant plus its database snapshot permits offline recovery; the CLI still unlocks manually.
+
+- **Include crun 1.28 in the audited pod-epoch runtime bounds ([#3430](https://github.com/vtmocanu/uzi/pull/3430)).**
+  The CRI-O declaration now covers crun 1.28 or 1.30.1 after source comparison; all other runtime and storage prerequisites remain required.
+
+- **Claude runs use Claude Agent SDK 0.3.309, with its bundled Claude Code 2.1.309 ([#3479](https://github.com/vtmocanu/uzi/pull/3479), [#3661](https://github.com/vtmocanu/uzi/pull/3661)).**
+  The guarded-command proof (M0) passes on the new CLI. Upstream fixes include PreToolUse deny reasons no longer replaced by a timeout from another hook on the same call, and SDK MCP servers no longer missing their latest tools at turn start.
+
+- **Document the exact el10 kernel evidence for pod-epoch acceptance ([#3430](https://github.com/vtmocanu/uzi/pull/3430), [#3621](https://github.com/vtmocanu/uzi/pull/3621)).**
+  The audit compares kernel 6.12.0-243.el10 with upstream v6.12 and records preserved termination guarantees, PID-release and cgroup limits; operator verification of the running build remains required.
+
+- **Admin usage ranks users by recorded API-equivalent cost ([#3658](https://github.com/vtmocanu/uzi/pull/3658)).**
+  Cost share follows the selected period's recorded cost, retains incomplete-cost disclosures, and is unavailable when no factory cost is recorded.
 
 ### Added
 
@@ -1306,6 +1327,33 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Worker-wait alerts identify owners and explain background priority ([#3610](https://github.com/vtmocanu/uzi/pull/3610), [#3611](https://github.com/vtmocanu/uzi/pull/3611)).**
   Admin health shows readable owner names with disambiguating short IDs, linked runs, and clear queue context while preserving wait clocks, severity, and diagnostic identities.
 
+- **Codex Read reaches later lines in large logs ([#3656](https://github.com/vtmocanu/uzi/pull/3656), [#3662](https://github.com/vtmocanu/uzi/pull/3662)).**
+  Explicit ranged reads can scan up to 64 MiB while retaining the existing output cap, text frontier and five-second cooperative deadline; scans that exhaust the allowance still return incomplete results.
+
+- **Owner-held memory-pressure parks stop unattended watches ([#3631](https://github.com/vtmocanu/uzi/pull/3631)).**
+  Every memory-pressure hold surfaces backup-first Resume/Cancel guidance regardless of remaining interventions, and CLI guidance explains that these holds never retry automatically.
+
+- **Repeated marker-free outage recovery preserves adoptable work ([#3615](https://github.com/vtmocanu/uzi/pull/3615)).**
+  No-progress retries reuse an already-covered recovery source instead of nesting redundant wrappers; affected owner Resume attempts can recover from the last valid physical source while retaining the existing integrity checks.
+
+- **Reworking pull requests opened before the source-publication upgrade no longer fails ([#3420](https://github.com/vtmocanu/uzi/pull/3420), [#3632](https://github.com/vtmocanu/uzi/pull/3632)).**
+  Completed issue sources without a stamp now refresh as non-closing, refusals name the validated reason, and branch commits that close the issue still refuse.
+
+- **Codex Read returns readable excerpts from larger text files ([#3073](https://github.com/vtmocanu/uzi/pull/3073), [#3612](https://github.com/vtmocanu/uzi/pull/3612)).**
+  Explicit ranges can retry helper-reported oversize reads within a 64 MiB scan budget; exhausted scans report incomplete results instead of successful cross-check read evidence.
+
+- **Cross-check failures provide safe diagnostic categories ([#3629](https://github.com/vtmocanu/uzi/pull/3629), [#3636](https://github.com/vtmocanu/uzi/pull/3636)).**
+  Malformed verdict warnings distinguish stream validation failures and identify only allowlisted built-in error types without exposing exception messages or rejected verdict text.
+
+- **Docker-capable hosted workers show one docker chip ([#3627](https://github.com/vtmocanu/uzi/pull/3627), [#3640](https://github.com/vtmocanu/uzi/pull/3640)).**
+  Settings → Workers no longer repeats the docker capability beside the hosted docker badge.
+
+- **Codex idle recovery distinguishes unconfirmed outcomes and refused reports ([#3617](https://github.com/vtmocanu/uzi/pull/3617), [#3635](https://github.com/vtmocanu/uzi/pull/3635)).**
+  Lost acknowledgements get an explicit unconfirmed notice; definitive unapplied reports stop retrying and retain source and session after capture joins, without claiming a confirmed park.
+
+- **Invalidated recovery inventories get a fair reconstruction opportunity ([#3614](https://github.com/vtmocanu/uzi/pull/3614), [#3616](https://github.com/vtmocanu/uzi/pull/3616)).**
+  Live recovery revisits an ordinary inventory awaiting replacement without waiting behind every retained discovery context, while preserving FIFO progress, existing pass limits and all custody proofs.
+
 ### Security
 
 - **Go toolchain 1.27.2 and golang.org/x/net 0.60.0 ([#2543](https://github.com/vtmocanu/uzi/pull/2543), supersedes #2536, #2537, #2465).**
@@ -1322,6 +1370,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Workers keep the Nix store writable by its owner only (99a20753c).**
   The worker images and every root-started worker boot now drop group write on `/nix/store`, so only the provisioning identity can add store entries.
+
+- **Claude runs no longer expand `@path` mentions or run slash commands from issue, review, CI-log or chat text ([#1563](https://github.com/vtmocanu/uzi/pull/1563), [#3624](https://github.com/vtmocanu/uzi/pull/3624)).**
+  Every Claude query now delivers its prompt verbatim, so the CLI cannot read a file the path guard would deny before any tool runs.
+
+- **The api and controller now build with golang.org/x/net v0.62.0, which fixes CVE-2026-78661 and CVE-2026-97045 ([#3579](https://github.com/vtmocanu/uzi/pull/3579), [#3651](https://github.com/vtmocanu/uzi/pull/3651)).**
+  The generated public-suffix ancestor table records the new module version; its suffix data is unchanged.
 
 ## [0.85.2] - 2026-10-05
 

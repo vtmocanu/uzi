@@ -218,7 +218,7 @@ function VaultPassphraseCreate() {
           <p className="mt-0.5 text-sm text-muted">
             You sign in with SSO, so there is no login password to protect your stored secrets
             (like your Anthropic token). Choose a vault passphrase — at least {VAULT_PASSPHRASE_MIN}{" "}
-            characters — to encrypt them. You will enter it to unlock your vault after a restart. It
+            characters — to encrypt them. Keep it for manual unlocks when no live browser grant is available after a restart. It
             cannot be recovered if lost, so store it somewhere safe.
           </p>
         </div>

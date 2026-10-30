@@ -273,19 +273,33 @@ func (q *Queries) LockUserVaultState(ctx context.Context, id uuid.UUID) (LockUse
 }
 
 const lockVaultAuthState = `-- name: LockVaultAuthState :one
-SELECT vault_mode, vault_epoch, password_hash FROM users WHERE id = $1 FOR UPDATE
+SELECT vault_mode, vault_epoch, password_hash, token_version, is_active,
+       vault_auto_reunlock, vault_slot_generation
+FROM users WHERE id = $1 FOR UPDATE
 `
 
 type LockVaultAuthStateRow struct {
-	VaultMode    string      `json:"vault_mode"`
-	VaultEpoch   int64       `json:"vault_epoch"`
-	PasswordHash pgtype.Text `json:"password_hash"`
+	VaultMode           string      `json:"vault_mode"`
+	VaultEpoch          int64       `json:"vault_epoch"`
+	PasswordHash        pgtype.Text `json:"password_hash"`
+	TokenVersion        int32       `json:"token_version"`
+	IsActive            bool        `json:"is_active"`
+	VaultAutoReunlock   bool        `json:"vault_auto_reunlock"`
+	VaultSlotGeneration int64       `json:"vault_slot_generation"`
 }
 
 // Lifecycle operations lock the durable mode/epoch and current login hash together.
 func (q *Queries) LockVaultAuthState(ctx context.Context, id uuid.UUID) (LockVaultAuthStateRow, error) {
 	row := q.db.QueryRow(ctx, lockVaultAuthState, id)
 	var i LockVaultAuthStateRow
-	err := row.Scan(&i.VaultMode, &i.VaultEpoch, &i.PasswordHash)
+	err := row.Scan(
+		&i.VaultMode,
+		&i.VaultEpoch,
+		&i.PasswordHash,
+		&i.TokenVersion,
+		&i.IsActive,
+		&i.VaultAutoReunlock,
+		&i.VaultSlotGeneration,
+	)
 	return i, err
 }

@@ -82,7 +82,7 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     expect(view.getByText("+ 1 unreported run").getAttribute("title")).toBe("Unreported runs: cost incomplete; recorded partial costs included");
     expect(view.getByRole("heading", { name: "Cost (API-equivalent)" })).toBeTruthy();
   });
-  it("ranks subscription users by total tokens before metered cost in both windows", () => {
+  it("ranks users by recorded cost before tokens in both windows and retains incomplete-cost disclosures", () => {
     const f = fixture();
     f.admin.users[0].usage = f.admin.users[0].last_7_days = bundle(900, 0, 100, 0);
     f.admin.users[1].usage = f.admin.users[1].last_7_days = bundle(0, 0, 100, 50);
@@ -92,22 +92,39 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
       fireEvent.click(view.getByRole("button", { name: period }));
       const rows = columns(view).users.getAllByRole("row").slice(1, -1);
       expect(rows.map((row) => row.querySelector("td")?.textContent)).toEqual([
-        "owner.person@example.com", "other.person@example.com",
+        "other.person@example.com", "owner.person@example.com",
       ]);
-      expect(within(rows[0]).getByRole("img").getAttribute("aria-label")).toBe("91 percent of factory tokens");
+      expect(within(rows[0]).getByRole("img").getAttribute("aria-label")).toBe("100 percent of recorded factory cost");
+      expect(within(rows[1]).getByRole("img").getAttribute("aria-label")).toBe("0 percent of recorded factory cost");
+      if (period === "All time") {
+        expect(rows[1].textContent).toContain("+ 4 runs without a cost estimate and 1 unreported run");
+      }
+      expect(columns(view).users.getByRole("columnheader", { name: "Cost share" }).title)
+        .toBe("Share of recorded API-equivalent cost in the selected period");
     }
   });
-  it("breaks equal token totals by cost, output and user ID", () => {
+  it("breaks equal costs by tokens, output and user ID", () => {
     const f = fixture();
     f.admin.users = ["d", "c", "b", "a"].map((id, i) => ({
       ...f.admin.users[0], user_id: id, email: `${id}@example.com`,
-      last_7_days: bundle([80, 90, 80, 80][i], 0, [20, 10, 20, 20][i], [0, 2, 2, 2][i]),
+      last_7_days: bundle([79, 90, 80, 80][i], 0, [20, 10, 20, 20][i], 2),
     }));
-    f.admin.factory.last_7_days = bundle(330, 0, 70, 6);
+    f.admin.factory.last_7_days = bundle(329, 0, 70, 8);
     const rows = columns(mount(f)).users.getAllByRole("row").slice(1, -1);
     expect(rows.map((row) => row.querySelector("td")?.textContent)).toEqual([
       "a@example.com", "b@example.com", "c@example.com", "d@example.com",
     ]);
+  });
+  it("orders costs before display rounding even when both render the same dollars", () => {
+    const f = fixture();
+    f.admin.users[0].last_7_days = bundle(1000, 0, 0, 1.000001);
+    f.admin.users[1].last_7_days = bundle(1, 0, 0, 1.000002);
+    f.admin.factory.last_7_days = bundle(1001, 0, 0, 2.000003);
+    const rows = columns(mount(f)).users.getAllByRole("row").slice(1, -1);
+    expect(rows.map((row) => row.querySelector("td")?.textContent)).toEqual([
+      "other.person@example.com", "owner.person@example.com",
+    ]);
+    for (const row of rows) expect(within(row).getByText("$1.00")).toBeTruthy();
   });
   it("switches both scopes with one accessible toggle and the embedded table follows the window", () => {
     const view = mount(fixture());
@@ -278,27 +295,29 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
   });
   it("retains all-time table shares, disclosure and failure-denominator attributes", () => {
     const view = mount({ ...fixture(), initial: "lifetime" }); const { users } = columns(view);
-    expect(users.getAllByRole("img").map((bar) => bar.getAttribute("aria-label"))).toEqual(["50 percent of factory tokens", "50 percent of factory tokens"]);
+    expect(users.getAllByRole("img").map((bar) => bar.getAttribute("aria-label"))).toEqual(["50 percent of recorded factory cost", "50 percent of recorded factory cost"]);
     const row = users.getByText("owner.person@example.com").closest("tr")!;
     expect(row.querySelectorAll("td")[3].getAttribute("title")).toBe("10 of 100 finished runs");
     expect(row.textContent).toContain("+ 4 runs without a cost estimate and 1 unreported run");
   });
-  it("rounds per-user token shares to exactly 100% with largest remainders", () => {
+  it("rounds per-user microdollar cost shares to exactly 100% with largest remainders", () => {
     const f = fixture();
-    f.admin.factory.lifetime = bundle(1000, 0, 0, 0);
-    f.admin.users = [905, 85, 10].map((tokens, i) => ({
+    f.admin.factory.lifetime = bundle(1000, 0, 0, 0.001);
+    f.admin.users = [905, 85, 10].map((microUSD, i) => ({
       ...f.admin.users[0], user_id: `share-${i}`, email: `share-${i}@example.com`,
-      usage: bundle(tokens, 0, 0, 0),
+      usage: bundle(1, 0, 0, microUSD / 1e6),
     }));
     const view = mount({ ...f, initial: "lifetime" });
     const users = within(view.getByRole("region", { name: /^Per-user usage,/ }));
     expect(users.getAllByRole("img").map((bar) => bar.getAttribute("aria-label"))).toEqual([
-      "91 percent of factory tokens", "8 percent of factory tokens", "1 percent of factory tokens",
+      "91 percent of recorded factory cost", "8 percent of recorded factory cost", "1 percent of recorded factory cost",
     ]);
     expect((users.getAllByRole("img")[0].firstElementChild as HTMLElement).style.width).toBe("91%");
+    expect(users.getAllByRole("img").reduce((sum, bar) =>
+      sum + Number.parseInt(bar.getAttribute("aria-label")!, 10), 0)).toBe(100);
   });
 
-  it("selects metrics before sorting by tokens, cost, output and user ID in both directions", () => {
+  it("selects metrics before sorting by cost, tokens, output and user ID in both directions", () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-07T12:00:00Z"));
     const f = fixture();
     f.admin.users = ["b", "a", "c", "d", "e"].map((id, i) => ({
@@ -323,16 +342,16 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     const rowCells = () => users.getAllByRole("row").slice(1).map((row) =>
       Array.from(row.querySelectorAll("td")).map((cell) => cell.textContent));
     const recent = rowCells();
-    expect(recent.map((r) => r[0])).toEqual(["c@example.com", "a@example.com", "b@example.com", "d@example.com", "e@example.com", "uzi total"]);
-    expect(recent[0]).toEqual(["c@example.com", "2", "0", "—", "6h", "20", "20", "$1.00+ 1 run without a cost estimate", "67%"]);
-    expect(recent[1][7]).toBe("$2.00+ 1 unreported run");
+    expect(recent.map((r) => r[0])).toEqual(["a@example.com", "c@example.com", "b@example.com", "d@example.com", "e@example.com", "uzi total"]);
+    expect(recent[1]).toEqual(["c@example.com", "2", "0", "—", "6h", "20", "20", "$1.00+ 1 run without a cost estimate", "33%"]);
+    expect(recent[0][7]).toBe("$2.00+ 1 unreported run");
     expect(recent[2].slice(1, 8)).toEqual(["0", "0", "—", "6h", "0", "0", "$0.00"]);
     expect(recent[4].slice(1, 4)).toEqual(["0", "1", "50.0%"]);
     expect(recent[5].slice(1, 4)).toEqual(["3", "1", "50.0%"]);
     expect(recent[5].slice(5, 8)).toEqual(["30", "30", "$3.00+ 1 run without a cost estimate and 1 unreported run"]);
     expect(users.getAllByRole("img").map((bar) => bar.getAttribute("aria-label"))).toEqual([
-      "67 percent of factory tokens", "33 percent of factory tokens", "0 percent of factory tokens",
-      "0 percent of factory tokens", "0 percent of factory tokens",
+      "67 percent of recorded factory cost", "33 percent of recorded factory cost", "0 percent of recorded factory cost",
+      "0 percent of recorded factory cost", "0 percent of recorded factory cost",
     ]);
     expect(users.getAllByRole("row")[5].querySelectorAll("td")[3].title).toBe("1 of 2 finished runs");
     const totalRecency = recent[5][4];
@@ -345,8 +364,8 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     expect(lifetime[5].slice(5, 8)).toEqual(["70", "70", "$6.00+ 2 runs without a cost estimate and 1 unreported run"]);
     expect(lifetime[5][4]).toBe(totalRecency);
     expect(users.getAllByRole("img").map((bar) => bar.getAttribute("aria-label"))).toEqual([
-      "43 percent of factory tokens", "29 percent of factory tokens", "28 percent of factory tokens",
-      "0 percent of factory tokens", "0 percent of factory tokens",
+      "34 percent of recorded factory cost", "33 percent of recorded factory cost", "33 percent of recorded factory cost",
+      "0 percent of recorded factory cost", "0 percent of recorded factory cost",
     ]);
     fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
     expect(rowCells()).toEqual(recent);
@@ -365,14 +384,21 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     },
   );
 
-  it("accepts empty users in both windows and renders zero shares for a zero factory", () => {
-    const f = fixture(); f.admin.factory.last_7_days = bundle(0, 0, 0, 0);
-    for (const u of f.admin.users) u.last_7_days = bundle(0, 0, 0, 0);
+  it("renders unavailable cost shares for zero factory cost even with recorded tokens", () => {
+    const f = fixture();
+    f.admin.factory.lifetime = f.admin.factory.last_7_days = bundle(2000, 0, 0, 0);
+    for (const u of f.admin.users) u.usage = u.last_7_days = bundle(1000, 0, 0, 0);
     const view = mount(f); const users = columns(view).users;
-    expect(users.getAllByRole("img").map((bar) => bar.getAttribute("aria-label"))).toEqual([
-      "0 percent of factory tokens", "0 percent of factory tokens",
-    ]);
-    cleanup(); f.admin.users = []; const empty = mount(f);
+    for (const period of ["Last 7 days", "All time"]) {
+      fireEvent.click(view.getByRole("button", { name: period }));
+      expect(users.queryAllByRole("img")).toHaveLength(0);
+      expect(users.getAllByTitle("Cost share unavailable: no recorded factory cost in the selected period")
+        .map((share) => share.textContent)).toEqual(["—", "—"]);
+    }
+  });
+
+  it("accepts empty users in both windows", () => {
+    const f = fixture(); f.admin.users = []; const empty = mount(f);
     for (const period of ["Last 7 days", "All time"]) {
       fireEvent.click(empty.getByRole("button", { name: period }));
       expect(empty.getByText("No usage across the factory yet.")).toBeTruthy();

@@ -131,6 +131,10 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
   `.agents/skills/issue-triage/references/on-deck.md` (step 8).
 - **Skill or script PRs you open**: the buddy reviews the final draft, then add the
   `reviewed` label, so the user sees both agents agreed. Same with a local buddy.
+- **Superseded or CI-only PRs**: with the buddy's `APPROVE` of the close comment, close
+  the PR yourself (`gh pr close N --comment …`) and delete branches you created solely
+  for CI evidence, after preserving required CI results and confirming no unique work
+  is lost. Keep a branch whose commits are marked for reuse.
 - The buddy's `APPROVE` is required where this skill says so below. It never
   replaces a user approval.
 

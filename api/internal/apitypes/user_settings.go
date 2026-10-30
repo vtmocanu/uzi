@@ -22,7 +22,9 @@ type CrossCheckPinDTO struct {
 // decoding-tolerant mirror — the handler owning its own type is intentional; the
 // TUI only reads SidebarTokenIds today, the rest are carried for fidelity.
 type UserSettingsDTO struct {
-	CrossCheckPins []CrossCheckPinDTO `json:"cross_check_pins"`
+	// Browser re-unlock permission is decoded for fidelity; the CLI never holds a slot.
+	VaultAutoReunlock bool               `json:"vault_auto_reunlock"`
+	CrossCheckPins    []CrossCheckPinDTO `json:"cross_check_pins"`
 	// DefaultModel is DEPRECATED (PRD #1551 D2/D3): a legacy compatibility projection of the
 	// effective harness's lane, kept one release. New clients read the two lanes below.
 	DefaultModel *string `json:"default_model"`

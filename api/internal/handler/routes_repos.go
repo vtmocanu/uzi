@@ -23,7 +23,7 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 	// keeps one registration site per path+method.
 	r.Route("/repos", func(r chi.Router) {
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Use(h.requireUser())
 			r.Get("/", h.ListRepos)
 			// Queue an agent run from a card (PRD #4). forgeLimiter runs AFTER
 			// RequireUser: PerUserMiddleware keys on the userKey RequireUser populates
@@ -93,7 +93,7 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 			r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/ci-fix-runs", h.CreateCIFixRun)
 		})
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Use(h.requireAuth())
 			r.Put("/{id}", h.SetRepoEnabled)
 			// Member "request an override" (PRD #1432): a web-only member action
 			// mirroring SetRepoEnabled's cookie-only posture. forgeLimiter because it

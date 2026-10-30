@@ -1611,6 +1611,8 @@ type User struct {
 	WeeklyReservePauseRunning bool               `json:"weekly_reserve_pause_running"`
 	VaultMode                 string             `json:"vault_mode"`
 	VaultEpoch                int64              `json:"vault_epoch"`
+	VaultAutoReunlock         bool               `json:"vault_auto_reunlock"`
+	VaultSlotGeneration       int64              `json:"vault_slot_generation"`
 }
 
 type UserCrossCheckPin struct {
@@ -1645,6 +1647,18 @@ type UserVault struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	LockNotifiedAt pgtype.Timestamptz `json:"lock_notified_at"`
+}
+
+type VaultBrowserSlot struct {
+	ID           uuid.UUID          `json:"id"`
+	UserID       uuid.UUID          `json:"user_id"`
+	BrowserID    uuid.UUID          `json:"browser_id"`
+	WrappedDek   []byte             `json:"wrapped_dek"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
+	TokenVersion int32              `json:"token_version"`
+	VaultEpoch   int64              `json:"vault_epoch"`
+	Generation   int64              `json:"generation"`
 }
 
 type Worker struct {

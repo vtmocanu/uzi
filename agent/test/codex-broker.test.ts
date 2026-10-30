@@ -1095,8 +1095,8 @@ describe("CodexCallbackBroker: helper-origin range fallback", () => {
     for (const [content, metadata] of [
       ["\ufeffx", { size: 4, scannedBytes: 4, truncated: false }],
       ["", { size: 0, scannedBytes: 0, linesReturned: 0, truncated: false }],
-      ["", { size: 9 * 1024 * 1024, scannedBytes: 8 * 1024 * 1024, linesReturned: 0, incomplete: true, reason: "scan_budget" }],
-      ["prefix", { size: 9 * 1024 * 1024, scannedBytes: 8 * 1024 * 1024, partialLastLine: true, incomplete: true, reason: "scan_budget" }],
+      ["", { size: 65 * 1024 * 1024, scannedBytes: 64 * 1024 * 1024, linesReturned: 0, incomplete: true, reason: "scan_budget" }],
+      ["prefix", { size: 65 * 1024 * 1024, scannedBytes: 64 * 1024 * 1024, partialLastLine: true, incomplete: true, reason: "scan_budget" }],
     ] as const) {
       const response = range(content, metadata);
       const result = await call(makeBroker({ fileop: new FileopSpy([oversize, response]) }));
@@ -1140,7 +1140,7 @@ describe("CodexCallbackBroker: helper-origin range fallback", () => {
       ...["size", "offset", "linesReturned", "scannedBytes", "partialLastLine", "truncated", "incomplete"].map(key => ({ [key]: "wrong type" })),
       ...[-1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity].map(size => ({ size })),
       { offset: 1 }, { offset: 2.5 }, { linesReturned: -1 }, { linesReturned: 1.5 }, { linesReturned: 2 },
-      { scannedBytes: -1 }, { scannedBytes: 1.5 }, { scannedBytes: 1 }, { scannedBytes: 8 * 1024 * 1024 + 1 },
+      { scannedBytes: -1 }, { scannedBytes: 1.5 }, { scannedBytes: 1 }, { size: 65 * 1024 * 1024, scannedBytes: 64 * 1024 * 1024 + 1 },
       { size: 100, scannedBytes: 101 }, { partialLastLine: true },
       { reason: undefined }, { reason: null }, { reason: 7 }, { reason: "scan_budget" },
       { incomplete: true }, { incomplete: true, reason: "scan_budget", truncated: false },
@@ -1148,9 +1148,9 @@ describe("CodexCallbackBroker: helper-origin range fallback", () => {
       ...["a", "Ygo", "Ygo==", "Ygp=", "====", "!".repeat(87385), Buffer.alloc(65537, 97).toString("base64")].map(data => ({ data })),
       { data: "", linesReturned: 1 }, { data: "", linesReturned: 0, partialLastLine: true },
       { data: "", linesReturned: 0, truncated: true },
-      { data: "", linesReturned: 0, truncated: false, size: 9 * 1024 * 1024, scannedBytes: 8 * 1024 * 1024 },
+      { data: "", linesReturned: 0, truncated: false, size: 65 * 1024 * 1024, scannedBytes: 64 * 1024 * 1024 },
       ...["a\n", "a"].map(content => ({ data: Buffer.from(content).toString("base64"),
-        linesReturned: 1, truncated: false, size: 9 * 1024 * 1024, scannedBytes: 8 * 1024 * 1024 })),
+        linesReturned: 1, truncated: false, size: 65 * 1024 * 1024, scannedBytes: 64 * 1024 * 1024 })),
       { data: Buffer.from("x").toString("base64") },
     ];
     for (const metadata of cases) {
@@ -1174,14 +1174,28 @@ describe("CodexCallbackBroker: helper-origin range fallback", () => {
     }
   });
 
+  it("accepts completed ranges below and at 64 MiB and rejects 64 MiB plus one", async () => {
+    for (const scannedBytes of [64 * 1024 * 1024 - 1, 64 * 1024 * 1024, 64 * 1024 * 1024 + 1]) {
+      const fileop = new FileopSpy([oversize, range("b\n", { size: 65 * 1024 * 1024, scannedBytes })]);
+      const result = await call(makeBroker({ fileop }));
+      if (scannedBytes <= 64 * 1024 * 1024) {
+        assert.equal(result.ok, true);
+      } else {
+        assertDenied(result, "fileop_denied");
+        assert.equal(result.fileopCode, "E_MALFORMED");
+      }
+      assert.equal(fileop.calls.length, 2);
+    }
+  });
+
   it("accepts a completed truncated range with full-budget prefetch", async () => {
     const fileop = new FileopSpy([oversize, range("b\n", {
-      size: 9 * 1024 * 1024, scannedBytes: 8 * 1024 * 1024,
+      size: 65 * 1024 * 1024, scannedBytes: 64 * 1024 * 1024,
     })]);
     const result = await call(makeBroker({ fileop }));
     assert.equal(result.ok, true);
     if (result.ok) assert.deepEqual(result.output, {
-      size: 9 * 1024 * 1024, content: "b\n", offset: 2,
+      size: 65 * 1024 * 1024, content: "b\n", offset: 2,
       linesReturned: 1, partialLastLine: false, truncated: true,
     });
     assert.equal(fileop.calls.length, 2);

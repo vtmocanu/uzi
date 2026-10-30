@@ -4,6 +4,7 @@ package handler
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -47,11 +48,15 @@ import (
 
 // Handler bundles the dependencies shared by every HTTP handler.
 type Handler struct {
-	secretTestOnce    sync.Once
-	secretTestClients *secretTestClients
-	pool              *pgxpool.Pool
-	q                 *store.Queries
-	cfg               config.Config
+	// browserSessionRandom is a per-handler entropy seam for session preparation tests.
+	// Nil uses crypto/rand; it never changes the process-wide random source.
+	browserSessionRandom io.Reader
+	vaultUnlockLimiter   *mw.Limiter
+	secretTestOnce       sync.Once
+	secretTestClients    *secretTestClients
+	pool                 *pgxpool.Pool
+	q                    *store.Queries
+	cfg                  config.Config
 	// secretTestProbeContext is a test-only deadline arm; nil retains the real probe budget.
 	secretTestProbeContext func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 	// oauthBeginTx, when non-nil, replaces h.pool.Begin as the transaction source of the OAuth
@@ -891,6 +896,7 @@ const ChatCreateRoutePattern = "/api/chats/"
 // per-IP budget on the OAuth token and revoke endpoints (PRD #1910 D7), which also keys a per-client
 // budget inside the handlers once the client has authenticated.
 func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter, v1Limiter, oauthLimiter *mw.Limiter) http.Handler {
+	h.vaultUnlockLimiter = authLimiter
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -940,7 +946,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// point.
 		r.Route("/runs", func(r chi.Router) {
 			r.Group(func(r chi.Router) {
-				r.Use(mw.RequireUser(h.q, h.cfg))
+				r.Use(h.requireUser())
 				// gzip-compress the run list and the message history: both are large,
 				// key-repetitive JSON that compresses dramatically (a 200-row list was
 				// 5.0 MB plain vs 1.4 MB gzipped, and the TUI board and web Runs list poll
@@ -1066,7 +1072,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Post("/{id}/held-publications/expire", h.ExpireRunHeldPublications)
 			})
 			r.Group(func(r chi.Router) {
-				r.Use(mw.RequireAuth(h.q, h.cfg))
+				r.Use(h.requireAuth())
 				// Re-run judge (Decision 8/21): enqueue a fresh judge for a terminal run —
 				// cookie-only, since it mints a token-spending run. Owner-only spend
 				// (service-enforced, audit H3); behind a DEDICATED per-user judge spend
@@ -1092,7 +1098,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// per-run authz are enforced in ServeWS — read its docstring for why the one
 		// unchanged same-origin rule covers both credential paths.
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Use(h.requireUser())
 			r.Get("/ws", h.ServeWS)
 		})
 
@@ -1102,7 +1108,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// gate ownership. Owner-scoped in SQL by the caller's user id — NO run scope (this is
 		// the owner-wide list; the exact-hold DISCARD is the DELETE under /runs above).
 		r.Group(func(r chi.Router) {
-			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Use(h.requireUser())
 			r.Get("/recovery/holds", h.ListRecoveryHolds)
 		})
 

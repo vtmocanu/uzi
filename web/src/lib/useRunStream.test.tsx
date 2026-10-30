@@ -1113,3 +1113,55 @@ describe("quiet account cooldown metadata", () => {
     expect(get).toHaveBeenCalledTimes(count);
   });
 });
+
+// Background run reads send X-Uzi-Passive so they never count as foreground
+// activity for browser vault re-unlock; explicit refreshes stay foreground.
+describe("passive run metadata reads", () => {
+  const flush = () => act(async () => { await Promise.resolve(); });
+  const passive = ["run-1", undefined, true];
+  beforeEach(() => {
+    vi.useFakeTimers();
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
+    vi.stubGlobal("WebSocket", LiveSocket as unknown as typeof WebSocket);
+    vi.spyOn(api, "getRunMessages").mockResolvedValue({ messages: [] });
+    vi.spyOn(api, "getRunInputs").mockResolvedValue({ inputs: [] });
+  });
+  afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  it("reads passively on the visible poll, socket open and state frames", async () => {
+    const get = vi.spyOn(api, "getRun").mockResolvedValue({ run: fakeRun() });
+    renderHook(() => useRunStream("run-1"));
+    await flush();
+    expect(get.mock.calls).toEqual([["run-1"]]);
+    get.mockClear();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(get.mock.calls).toEqual([passive]);
+    get.mockClear();
+    act(() => LiveSocket.last!.open());
+    await flush();
+    expect(get.mock.calls).toEqual([passive]);
+    get.mockClear();
+    act(() => LiveSocket.last!.deliver({ type: "state", status: "running" }));
+    await flush();
+    expect(get.mock.calls[0]).toEqual(passive);
+    expect(get.mock.calls.every(call => call[2] === true)).toBe(true);
+  });
+
+  it("reads passively through refreshRunPassive", async () => {
+    const get = vi.spyOn(api, "getRun").mockResolvedValue({ run: fakeRun() });
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await flush();
+    get.mockClear();
+    await act(async () => result.current.refreshRunPassive());
+    expect(get.mock.calls).toEqual([passive]);
+  });
+
+  it("keeps an explicit refreshRun in the foreground", async () => {
+    const get = vi.spyOn(api, "getRun").mockResolvedValue({ run: fakeRun() });
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await flush();
+    get.mockClear();
+    await act(async () => result.current.refreshRun());
+    expect(get.mock.calls).toEqual([["run-1"]]);
+  });
+});

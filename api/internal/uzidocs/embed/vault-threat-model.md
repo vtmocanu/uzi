@@ -22,7 +22,8 @@ Design rationale lives in the PRD
 ([../prds/done/32-user-vault-password-wrapped-secrets.md](../prds/done/32-user-vault-password-wrapped-secrets.md));
 this page is the as-built residual-risk list and the operator hardening steps.
 [ADR-3507](../adr/3507-optional-credential-vault.md) records optional protection,
-conversion and compatibility boundaries; users should start at
+conversion and compatibility boundaries; [ADR-3508](../adr/3508-browser-vault-reunlock.md)
+records browser re-unlock and its rollback boundary. Users should start at
 [Vault choice](./anthropic-token.md#vault-choice).
 
 ## What the vault protects — and what it does not
@@ -32,12 +33,14 @@ conversion and compatibility boundaries; users should start at
   default slot per user, separate from the Anthropic token's own default) —
   plus the per-account Codex login material in `codex_provider_account`. They
   are sealed with a per-user 256-bit DEK under normal operation. The DEK is
-  stored only wrapped: `secretbox(KEK, DEK)` where `KEK = Argon2id(login
-  password, per-user salt)`. The KEK is derived at unlock, used once, and
-  discarded; the plaintext DEK lives only in the API process's memory while
-  the vault is unlocked, and is gone on lock or restart. Neither the KEK nor
-  the plaintext DEK is ever written anywhere. **One narrow exception**: a
-  Codex account's *recovery* slot (a successful provider result retained while
+  stored wrapped under the password KEK: `secretbox(KEK, DEK)` where
+  `KEK = Argon2id(login password, per-user salt)`. Eligible HTTPS browsers
+  also receive a second, cookie-keyed DEK wrapper in `vault_browser_slots`
+  (see [Browser re-unlock](#browser-re-unlock)). The KEK is derived at
+  interactive unlock and discarded; the plaintext DEK lives in API process
+  memory while unlocked and is gone on lock or restart. Persistent vault
+  storage contains neither the KEK nor the plaintext DEK. **One narrow
+  exception**: a Codex account's *recovery* slot (a successful provider result retained while
   its live commit cannot finish) is sealed under `UZI_SECRET_KEY` with the
   owner/kind-bound `master_aad` marker instead, but only when the owner's vault
   is locked at the exact moment a refresh needs to protect newly-rotated material — never the live,
@@ -73,6 +76,89 @@ this fits into the OIDC login flow. Off users need no passphrase or wrapper.
 Linking SSO to an existing password account retains its mode and password
 semantics.
 
+## Browser re-unlock
+
+A verified interactive password login, vault unlock or enrollment can mint a
+browser keyslot for a protected user on HTTPS. It adds a second DEK wrapper;
+the password wrapper remains. The random 256-bit wrapping key travels in
+`__Host-uzi_vault_slot`, a **Secure, HttpOnly, SameSite=Strict, host-only**
+cookie (no Domain) with **Path=/**. The `__Host-` prefix stops a same-site
+sibling origin from planting a cookie of that name to drain the unlock budget;
+the web server logs no requests. Cookies are not isolated by port: any other
+HTTPS service on the same hostname receives this cookie (as it does the
+session cookie) and can replace it, so deployments must not run untrusted
+services on uzi's hostname, on any port. The database stores the wrapped DEK, owner,
+slot/browser IDs, expiry, token version, vault epoch and slot generation.
+Neither `UZI_SECRET_KEY`, the JWT secret nor other server-at-rest material
+opens that wrapper without the cookie key. AES-GCM AAD binds it to the
+owner and slot ID (`browserAAD` in `api/internal/vault/browser.go`).
+
+**Residual:** a stolen keyslot cookie plus a database snapshot containing its wrapped DEK permits offline DEK recovery, without a valid session.
+This is a new bearer unlock capability: theft of the keyslot and a valid
+session also permits online restoration while authorized, with that session's
+CSRF token. Server-side expiry and revocation prevent future online restores
+but cannot invalidate copied key material.
+
+Online restore additionally requires a valid session and the existing
+incoming JWT-bound **X-CSRF-Token**, including on **GET/HEAD**. Strict
+protects across sites, not sibling origins on the same site; HttpOnly does
+not prevent an active same-origin script from issuing authenticated requests.
+Missing or invalid CSRF leaves normal safe-read behavior unchanged, with
+no slot access, unlock-limiter reservation, restore or promotion
+(`browserAuthHook` in `api/internal/handler/browser_session.go`).
+Eligible attempts share the owner's manual-unlock limiter; failures consume
+budget and successful restore refunds its reservation. A definitive rejection
+(malformed cookie, missing, expired or revoked slot, wrong key, stale session)
+also clears the slot cookie, so a grant revoked from another browser stops
+draining that budget; transient failures keep the cookie.
+
+**Re-unlock automatically in this browser** is default-on **account-wide**
+permission, despite its label. Turning it off revokes every browser's slots;
+turning it on alone mints nothing. Minting waits for a verified interactive
+unlock, password login or enrollment. Seed/boot unlock, the OIDC callback,
+restore and CLI authentication cannot mint. HTTP deployments never mint or
+emit a secret keyslot cookie and require manual unlock after restart.
+
+Browser identity is signed into the session JWT, stable across rolling
+refresh; a fresh login gets a new ID. Legacy JWTs remain compatible with
+normal authentication; an interactive HTTPS unlock can add an ID without
+extending their expiry. At most **32 browser slots per user** are retained;
+minting replaces that browser's slot, removes expired rows and trims oldest
+other slots. The admin setting `vault_reunlock_days` defaults to **7** and
+accepts **1–30** days. Expiry is fixed at mint time to the earlier of that
+lifetime and the minting session's expiry. Refresh and restore do not extend
+it; lowering the setting affects new slots. Slot expiry does not evict a
+DEK already cached in API memory.
+
+Explicit **Lock vault** durably revokes the owner's slots and evicts the
+cached DEK. Global logout revokes sessions and slots but retains an already
+cached DEK on acknowledged success. Password changes, disabling automatic
+re-unlock, switching protection Off, vault recreation and deactivation revoke
+slots. Revocation uses a monotonic slot generation separate from the
+ciphertext-mode epoch; mint, restore and lifecycle changes serialize under
+the owner lifecycle mutex and transactional owner fences. Restore checks
+the original authentication snapshot and expiry after waiting, then publishes
+the DEK after acknowledged commit.
+
+The web client marks hidden-tab requests passive; passive requests and
+WebSocket connections do not restore. Opening or focusing a tab makes a
+foreground status request eligible to restore, attempt to clear the lock-notice
+episode and best-effort promote the owner's `vault_locked` recovery parks.
+Runs of a user who keeps the vault still wait after a restart until that user opens or focuses a uzi tab.
+
+The CLI does not get a keyslot here.
+Unattended continuity is outside this feature's scope.
+
+Losing a password/passphrase does not imply immediate loss while usable key
+material remains (for example a cached DEK or usable browser grant). Losing
+both the password/passphrase and remaining usable key material makes protected
+contents unrecoverable; this feature adds no password-reset, passphrase-change
+or recovery workflow.
+
+This threat-model review records the bearer capability and accepted residuals.
+Executed checks and independent security review evidence belong in the
+implementation PR; this analysis does not certify those checks.
+
 ## CLI unlock: authenticated guessing and key custody
 
 `GET /api/vault/status` and `POST /api/vault/unlock` accept either a session
@@ -96,9 +182,9 @@ return HTTP 403 with `incorrect password` (CLI exit 3), so the unlock
 response does not disclose whether a vault exists. The no-vault path
 performs the same-cost derivation burn used for timing equalization.
 
-This adds no new key custody: the existing KEK/DEK hierarchy and API memory
-cache remain unchanged. The CLI accepts the owner's secret through hidden
-terminal input or explicit non-terminal `--password-stdin`, with a 1 MiB
+CLI unlock adds no CLI key custody or browser slot; it uses the password
+wrapper and existing API memory cache. The CLI accepts the owner's secret
+through hidden terminal input or explicit non-terminal `--password-stdin`, with a 1 MiB
 input bound; it has no password-valued flags, arguments, environment
 setting, or persisted re-unlock key. Terminal input fails closed on cleanup
 failure and no password is submitted. Agents must direct the owner to
@@ -225,13 +311,13 @@ For the seed admin, after first boot:
 3. Once the account and credentials are self-sufficient, remove `UZI_SEED_*`
    (including `UZI_SEED_PASSWORD` and `UZI_SEED_ANTHROPIC_TOKEN`) from the
    deployed environment. This stops seed boot-unlock; a protected account
-   then needs an interactive unlock after a restart.
+   then needs an eligible browser restore or interactive unlock after a restart.
 
 ## Rollout note
 
 The original PRD #32 rollout required existing users to unlock before work
-could claim. Optional protection preserves that behavior for protected users;
-Off users need no unlock after restart and receive no vault-lock notice.
+could claim. Protected users now need an eligible browser restore or
+interactive unlock after restart. Off users need no unlock after restart and receive no vault-lock notice.
 
 Migration 00373 sets existing users to protected, including wrapperless users,
 without migrating ciphertext. If any users exist, it seeds Required policy;
@@ -269,16 +355,34 @@ binary is unsafe because it rejects `master_aad`. See
 [ADR-3507](../adr/3507-optional-credential-vault.md) for the protocol and measured
 fixture evidence.
 
+Migration **00379** adds browser-slot storage and the users revocation trigger.
+Its immediate CHECK validation and ACCESS EXCLUSIVE locks have
+production-dependent, unmeasured duration and availability impact; constant
+defaults do not eliminate those costs. Keep singleton/Recreate deployment.
+
+**Before starting a pre-keyslot binary, delete or invalidate all browser
+slots, in this order:** stop every keyslot-aware API instance and let
+in-flight requests drain, then delete the slots (for example with migration
+00379 Down, which drops `vault_browser_slots`), and only then start the older
+binary. While a keyslot-aware API still serves requests, an interactive unlock
+can mint a slot after the deletion. An older binary does not enforce
+these revocations; retained rows could otherwise survive logout/lock there.
+A compatible re-upgrade must not resurrect pre-rollback grants. Migration
+00379 Down drops the slots table; this is separate from 00373's mode and
+ciphertext rollback restrictions above. See [ADR-3508](../adr/3508-browser-vault-reunlock.md).
+
 ## Vault-lock Slack notice (PRD #890)
 
 A restart drops protected users' cached DEKs (see residual #7), causing the
-stall this section describes — not just
-the one-time first-vault-rollout, but any later restart too. A boot
+stall this section describes until browser restore or interactive unlock.
+This applies after later restarts as well as the first vault rollout.
+Browser grants do not unlock at boot. A boot
 reconciler now closes the "nothing tells the user" gap directly: for each
 protected, vault-having, Slack-linked user whose locked vault is blocking `queued`/
 `awaiting_approval`/`awaiting_input` work or a due schedule, it DMs them to
 unlock, once per lock-episode — deduped on `user_vaults.lock_notified_at`
-(atomic across replicas) and cleared on their next successful unlock. It is
+(atomic across replicas) and cleared on successful interactive unlock or
+browser restore. A notice may already have been sent before a tab restores the vault. It is
 gated by `UZI_VAULT_LOCK_NOTICE_ENABLED` (default on) and the same per-user
 `slack_notify` gate every other DM uses.
 

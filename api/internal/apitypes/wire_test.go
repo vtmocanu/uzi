@@ -1163,6 +1163,7 @@ func TestCodexAdminRateLimitRowDTOTags(t *testing.T) {
 // set fails here rather than silently dropping a field on decode.
 func TestUserSettingsDTOTags(t *testing.T) {
 	assertTags(t, "UserSettingsDTO", UserSettingsDTO{},
+		"vault_auto_reunlock",
 		"cross_check_pins", "default_model", "default_effort", "default_codex_effort", "judge_model", "summary_model", "theme", "sidebar_token_ids",
 		// PRD #700 M5: the per-user MR-review-watcher opt-in (default ON; null clears to default).
 		"mr_rework_enabled",
