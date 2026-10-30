@@ -6,13 +6,13 @@
 
 **Review status:** P0 is resolved by the owner decision above. Both independent architecture reviews requested revisions, with no BLOCK; their findings and the product decision are folded here. Final architecture and lead/buddy reviews are complete; the implementation plan was approved at the run gate.
 
-**Implementation checkpoint (2026-10-30, M1 incomplete):** M1 source is committed and review-clean through c7e987eb. The fixed M1-only repair window ends at 11:28 UTC. M1 is not complete: the required repository gate has no successful closing result. M2, M3 and I1 remain unstarted; no formal partial-delivery decision or criterion waiver is claimed. The capability is not advertised as ready. Policy Resume and Stop remain unavailable. This is a non-closing checkpoint, not a complete policy-hold rollout; #3068 remains open.
+**Implementation checkpoint (2026-10-30, M1 met):** M1 source is committed and review-clean through c7e987eb, with its evidence inventory committed at 563a7d3b. The recovered checkpoint has the identical tree. Completion revision 2 recorded the owner's formal partial-delivery decision: retain M1 and defer M2, M3 and I1 for a non-closing PR. The owner's finalization correction authorizes only this documentation update; no repairs or further milestones are started. The successful candidate-bound CI below closes the previously interrupted repository-gate obligation. No criterion waiver or deadline extension is claimed. The capability is not advertised as ready. Policy Resume and Stop remain unavailable. This is an M1 checkpoint, not a complete policy-hold rollout; #3607 and #3068 remain open.
 
 The eighteen reported agent-shard failures were diagnosed separately: fifteen fixture assumptions expected quarantined evidence to disappear; one diagnostic counted unknown records as authenticated; ordinary terminal readback omitted the identity-bound process-local `server_settled` fact; and a positively empty disabled outbox suppressed the existing named `transport permanently failed (outbox_unavailable)` disposition. Fixtures changed only for the intended pending-evidence contract. The ordinary failure now occurs before clone or provider work. Unknown policy evidence still blocks admission and remains visible, without acquiring authenticated settlement or lease authority. Guarded disposal retains independent policy evidence and source attribution. An audit finding also led to bounded policy directory enumeration: ignored entries count toward the hard 4,096-entry ceiling and lower configured limits; exhaustion retains a blocker. A subsequent full-selection test failure compared a readback view with the stored journal; its repair separately checks exact stored bytes, canonical body and authenticated settlement state.
 
 ### M1 executed evidence inventory
 
-All results below were executed in this repair window; historical CI is not substituted for them. API, shared fixtures, gate scripts and web inputs are unchanged by the later agent-only repairs. Code reviews cover the immutable feature range from 029502e9 plus each committed repair, including reviewer and auditor review through c7e987eb; their final reports have no open findings or deferred notes.
+The local results below were executed in the repair window. The separate candidate-bound CI inventory records the subsequent closing evidence without relabelling the interrupted local run as successful. API, shared fixtures, gate scripts and web inputs are unchanged by the later agent-only repairs. Code reviews cover the immutable feature range from 029502e9 plus each committed repair, including reviewer and auditor review through c7e987eb; their final reports have no open findings or deferred notes.
 
 | Required check | Observed result |
 | --- | --- |
@@ -27,59 +27,24 @@ All results below were executed in this repair window; historical CI is not subs
 | `task scan:secrets` | Passed, zero tracked findings; both canaries detected. |
 | `task sast:semgrep` | Passed: tree results/errors zero; canary detected. |
 | Tracked E2E literal/identifier sweep, then `task test:e2e-lib` and `task test:forge-fake` | Sweep found no stale expectation or new fake-route requirement. Both complete targets passed within the repository attempt before its later timeout. |
-| `task gate:repo` | Incomplete: the 600-second command bound interrupted `test:worker-uid-harness` during `calibration_run_test.py`. Its preceding five Python harness files passed; the 26-case runner file alone took 300.9 seconds. No failing assertion or baseline failure was established. The full gate is not passed. |
+| `task gate:repo` | Incomplete: the 600-second command bound interrupted `test:worker-uid-harness` during `calibration_run_test.py`. Its preceding five Python harness files passed; the 26-case runner file alone took 300.9 seconds. No failing assertion or baseline failure was established. That local full-gate attempt did not pass; subsequent candidate-bound CI completion is recorded below. |
 
 Named M1 LiveDB obligations all have RUN/PASS with no skips in that closing lane: `TestPolicyHoldWorkerRouteLiveDB`, `TestPolicyHoldPendingDispositionLiveDB`, `TestPolicyHoldApplyReplayAndFencesLiveDB`, `TestPolicyHoldAdmissionAndConversionLiveDB`, `TestPolicyHoldSessionIdentityLiveDB`, `TestPolicyPendingLeaseSurvivesOmissionLiveDB`, and `TestCompactPolicyHoldMigrationLiveDB`. These cover the real application/worker routers and transaction, apply/replay and admission fences, pending ownership dispositions, session identity, pending-lease omission and actual migration Up/Down. They do not replace M2's positive owner Resume authentication/transaction regression.
 
 Lead-owned exact-candidate scratch proofs observed green regressions and expected failures when restoring the pre-repair behavior or bypassing enumeration, provider-start and authenticated-settlement guards. The repaired feature-loss test fails if the ordinary authenticated settlement readback is removed. One additional compound mutation command did not terminate within its bound and remains unvalidated; it is excluded from the passing evidence. Mutations never touched the shared candidate. The workflow subtree is unchanged from 029502e9. A shipping UUID-v4 changelog fragment is committed. Local timings are not controlled before/after measurements; CI critical-path, queue and cache impact remain unmeasured.
 
-### M1 verification still required
+### M1 closing candidate-bound CI evidence
 
-A complete successful `task gate:repo` remains required. Its interrupted calibration file was not completed in that attempt. The following subsequent targets were not reached by that attempt and have no independent completed result in this window:
+Draft CI-only PR [#3669](https://github.com/vtmocanu/uzi/pull/3669) used head 563a7d3b764dff12a2f2ce8e347b9033b0712b13 and temporary base 029502e9. The owner reports tested pull-request merge checkout 9cf05f2392fe56d176265444aec347242d6f10c0 with tree 748213e6cf1b0ea632f388b46cb612750dfc1e15. Local Git verifies that both 563a7d3b and recovered HEAD 6add27ec have that tree and no intervening file changes. The tested merge object is unavailable locally; its checkout/tree identity and detailed job-log results below are owner-supplied evidence, distinguished from the forge job statuses independently read during finalization.
 
-- `test:store-it-cleanup`
-- `test:reset-recovery-tables`
-- `test:codex-git-trust-wrapper`
-- `test:uzi-watcher-backups`
-- `test:uzi-lander`
-- `test:ci-safe-paths`
-- `test:fmt-check-toolchain`
-- `test:govulncheck-toolchain`
-- `test:devbox-update`
-- `test:brew-tap-guard`
-- `check:spec-numbering`
-- `check:migration-additive`
-- `check:migration-numbering`
-- `check:e2e-registry-doc`
-- `check:no-binary-text`
-- `check:mktemp-portability`
-- `check:postgres-pin-parity`
-- `check:skill-size`
-- `check:guidance-size`
-- `check:api-v1-compat`
-- `test:changelog-fragments`
-- `test:changelog-entry`
-- `check:changelog-entry`
-- `test:changelog-rc-bullets`
-- `check:changelog-rc-bullets`
-- `test:hermetic-git-config`
-- `test:livedb-skip-guard`
-- `test:semgrep-parity`
-- `check:semgrep-parity`
-- `test:actions-tool-parity`
-- `check:actions-tool-parity`
-- `test:semgrep-gate`
-- `test:pricing-freshness`
-- `test:pricing-freshness-issue`
-- `check:token-literals`
-- `test:migration-renumber`
-- `test:refresh-role-manifest`
-- `test:agent-runtime-key`
-- `test:codex-supervisor`
+- [CI run 41048738063](https://github.com/vtmocanu/uzi/actions/runs/41048738063): the forge lists 24 successful jobs, zero failed and two skipped (`test-web-nginx`, `build-controller`). Required M1 jobs succeeded, including validate-api 124039996156, lint-api 124039996221, test-api 124039996238, test-api-store-it 124039996162, validate-web 124039996299, test-web 124039996247 and test-web-browser 124039996377.
+- [lint-repo job 124039232685](https://github.com/vtmocanu/uzi/actions/runs/41048738063/job/124039232685) succeeded. The owner verified its complete `task gate:repo` log: `test:worker-uid-harness` completed, including calibration_check_test.py (37 OK) and calibration_run_test.py (26 OK); all subsequent targets completed through scan:secrets, sast:semgrep and test:pricing-freshness-issue. This supplies the completed repository gate missing from the local attempt, including its previously unreached targets. No missing check is waived or transferred to natural-refusal acceptance.
+- **full agent suite: exact-head PR CI** succeeded for that candidate tree: validate-agent 124039996261, test-agent-shard (1/2) 124039996334, test-agent-shard (2/2) 124039996269, test-agent aggregation 124074899054 and test-agent-worker-uid 124044653833. The forge confirms each job's success. These results supplement the local affected-file and codex-m4 results; they do not claim a local full-suite run.
+- [KinD Smoke workflow 41048738088](https://github.com/vtmocanu/uzi/actions/runs/41048738088) has a successful gate job 124039453509; the forge reports the actual kind-smoke job 124039455696 skipped. [Codex packaged proof workflow 41048738129](https://github.com/vtmocanu/uzi/actions/runs/41048738129) likewise has successful gate job 124039641953, with packaged execution jobs skipped. Workflow success is not evidence that these skipped executions ran, and neither is substituted for the mandatory M1 checks above.
 
-The two other targets after that interruption, `scan:secrets` and `sast:semgrep`, were independently executed successfully as recorded above. Their success does not turn the interrupted composed gate into a pass. No missing check is waived or transferred to natural-refusal acceptance.
+M1 is met on the recorded local checks, named LiveDB RUN/PASS evidence, clean source reviews and closing candidate-bound CI. This finalization changes only this PRD's evidence/status text. The lander must re-run required checks on the landing PR's own head against current main before merge; the older tree's CI does not certify the new documentation commit or a later integration tree.
 
-Owner continuation and its named `TestCompactPolicyResumeAuthMountLiveDB` regression remain deferred with M2. The cross-issue regression map, broader requirements/ADR/operator documentation and rollout closure remain deferred with M3; this checkpoint updates only actual M1 evidence. Policy Stop and awaiting_approval revise-turn admission remain the approved explicit omissions. Informative milestone I1 is not claimed complete. The lander still owns **full agent suite: exact-head PR CI** after publication; no local full agent suite or current-head PR CI pass is claimed. Natural-refusal acceptance remains in existing [#3608](https://github.com/vtmocanu/uzi/issues/3608), and same-conversation Docker compatibility remains in existing [#3609](https://github.com/vtmocanu/uzi/issues/3609). Neither tracker was recreated and no deliberate real refusal was induced.
+Owner continuation and its named `TestCompactPolicyResumeAuthMountLiveDB` regression remain deferred with M2. The cross-issue regression map, broader requirements/ADR/operator documentation and rollout closure remain deferred with M3. Policy Stop and awaiting_approval revise-turn admission remain the approved explicit omissions. Informative milestone I1 remains deferred and is not claimed complete. Natural-refusal acceptance remains in existing [#3608](https://github.com/vtmocanu/uzi/issues/3608), and same-conversation Docker compatibility remains in existing [#3609](https://github.com/vtmocanu/uzi/issues/3609). Neither tracker was recreated and no deliberate real refusal was induced. The PRD remains active because the compact contract is only partly delivered.
 
 ## Problem
 
