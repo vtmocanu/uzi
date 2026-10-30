@@ -175,6 +175,12 @@ func (r *tailReader) excerpt(tail int64) ([]byte, int, bool, bool, error) {
 				start = completed
 				return finish(false, false)
 			}
+			// A rune start at the raw boundary needs no lookbehind; older bytes
+			// are outside the text frontier even if they resemble a crossing lead.
+			if utf8.RuneStart(out[3]) {
+				lines = 1
+				return finish(true, false)
+			}
 			// The final line alone exceeds the cap. Inspect at most three bytes
 			// before the RAW boundary, validating any scalar that crosses it before
 			// discarding its continuation bytes from the returned suffix.

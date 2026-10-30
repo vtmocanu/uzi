@@ -144,7 +144,7 @@ func TestReadTailTextFrontier(t *testing.T) {
 			prefix string
 			bad    bool
 		}{
-			{"😀", false}, {"\xf0\x80\x80\x80", true}, {"\xf4\x90\x80\x80", true}, {"\xf0\x90\x80x", true}, {"\xff\x80\x80\x80", true},
+			{"😀", false}, {"\xf0\x80\x80\x80", true}, {"\xf4\x90\x80\x80", true}, {"\xff\x80\x80\x80", true},
 		} {
 			tailControl(t)
 			s, _, reads, _ := tailFixture(t, []byte(tc.prefix+strings.Repeat("x", 65535)))
@@ -161,6 +161,64 @@ func TestReadTailTextFrontier(t *testing.T) {
 		s, _, _, _ := tailFixture(t, []byte("old\n😀aé\n"))
 		s.rangeChunk = chunk
 		checkTail(t, s, 1, "😀aé\n", 1, false, true, false)
+	}
+}
+
+// Pair each outside prefix with a clean prefix of the same length. In particular,
+// the truncated four-byte scalar followed by x used to be rejected despite the
+// entire malformed prefix preceding the raw output boundary.
+func TestReadTailRuneStartFrontier(t *testing.T) {
+	for _, chunk := range []int{1, 3, rangeReadChunk} {
+		for _, boundary := range []string{"x", "é", "😀"} {
+			for _, prefix := range []string{"\xff\x80\x80", "\xf0\x90\x80", "\x00\x80\x80"} {
+				t.Run(fmt.Sprintf("%d-%x-%x", chunk, boundary, prefix), func(t *testing.T) {
+					want := boundary + strings.Repeat("x", rangeOutputBytes-len(boundary))
+					for _, older := range []string{"old", prefix} {
+						s, _, reads, closes := tailFixture(t, []byte(older+want))
+						s.rangeChunk = chunk
+						got := checkTail(t, s, 1, want, 1, true, true, false)
+						if got["scannedBytes"] != int64(*reads) || *reads < rangeOutputBytes+1 ||
+							*reads > min(len(older+want), rangeOutputBytes+chunk) || *closes != 1 {
+							t.Fatalf("reads=%d closes=%d metadata=%v", *reads, *closes, withoutData(got))
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestReadTailBudgetDuringLookbehind(t *testing.T) {
+	for _, chunk := range []int{1, 3, rangeReadChunk} {
+		for _, scalar := range []string{"😀", "\xf4\x90\x80\x80"} {
+			for extra := 1; extra <= 3; extra++ {
+				t.Run(fmt.Sprintf("%d-%x-%d", chunk, scalar, extra), func(t *testing.T) {
+					// The raw boundary is the scalar's last continuation byte.
+					// Its lead requires all three lookbehind bytes to be read.
+					want := strings.Repeat("x", rangeOutputBytes-1)
+					s, _, reads, closes := tailFixture(t, []byte("older"+scalar+want))
+					s.rangeChunk = chunk
+					budget := int64(rangeOutputBytes + extra)
+					s.tailBudget = budget
+					if extra < 3 {
+						got := checkTail(t, s, 1, "", 0, false, true, true)
+						if got["scannedBytes"] != int64(*reads) {
+							t.Fatal("lookbehind uncounted")
+						}
+					} else if scalar == "😀" {
+						got := checkTail(t, s, 1, want, 1, true, true, false)
+						if got["scannedBytes"] != int64(*reads) {
+							t.Fatal("lookbehind uncounted")
+						}
+					} else {
+						wantErr(t, s.handle(tailRequest(1)), codeNotText)
+					}
+					if int64(*reads) != budget || *closes != 1 {
+						t.Fatalf("reads=%d budget=%d closes=%d", *reads, budget, *closes)
+					}
+				})
+			}
+		}
 	}
 }
 
