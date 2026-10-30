@@ -114,7 +114,7 @@ func TestCrossRunBindingAcceptedLiveDB(t *testing.T) {
 	}
 }
 
-func TestCrossRunBindingShapeLiveDB(t *testing.T) {
+func TestCrossRunDiscardBindingGuardLiveDB(t *testing.T) {
 	e, w, original := newCrossRunBindingEnv(t, 3, 1)
 	cases := []struct {
 		name, key string
@@ -176,6 +176,9 @@ func TestCrossRunBindingShapeLiveDB(t *testing.T) {
 			}
 			tx := crossRunTx(t, e, w)
 			if _, err := tx.Exec(e.ctx, crossRunTransition, e.hold, crossRunJSON(t, b)); err == nil {
+				if tc.key == "extra" {
+					t.Fatal("extra binding key must be rejected")
+				}
 				t.Fatal("invalid binding accepted")
 			}
 			_ = tx.Rollback(e.ctx)

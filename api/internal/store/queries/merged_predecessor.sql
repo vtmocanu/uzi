@@ -50,3 +50,74 @@ UPDATE recovery_custody_holds SET
 WHERE id = @hold_id AND run_id = @run_id AND user_id = @owner_id AND repo_id = @repo_id
     AND generation = @generation AND generation < @completed_generation AND state = 'open'
     AND merged_predecessor_discard_binding IS NULL;
+
+-- name: LockCrossRunTarget :one
+-- The caller orders target/witness run locks by ascending UUID.
+SELECT id, user_id, repo_id, kind, status, claim_generation, issue_iid, mr_iid,
+    fail_origin, finished_at, created_at
+FROM runs WHERE id = @run_id FOR UPDATE;
+
+-- name: LockCrossRunWitness :one
+SELECT id, user_id, repo_id, kind, status, claim_generation, issue_iid, mr_iid,
+    fail_origin, finished_at, created_at
+FROM runs WHERE id = @run_id FOR SHARE;
+
+-- name: HasCrossRunLiveClaim :one
+SELECT EXISTS (SELECT 1 FROM worker_active_runs WHERE run_id = @run_id);
+
+-- name: HasCrossRunLiveConsumer :one
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE user_id = @owner_id AND repo_id = @repo_id
+        AND status NOT IN ('completed', 'failed', 'cancelled')
+        AND (issue_iid = @issue_iid OR continued_issue_iid = @issue_iid)
+);
+
+-- name: LockCrossRunInventory :many
+-- Include every state and identity: closed or anomalous siblings must be classified
+-- under the same disposer lock as open holds, before locking publications/captures.
+SELECT * FROM recovery_custody_holds WHERE run_id = @run_id
+ORDER BY generation, id LIMIT 1001 FOR NO KEY UPDATE;
+
+-- name: LockCrossRunPublications :many
+SELECT pub.* FROM run_held_publications pub
+WHERE pub.run_id = @run_id OR pub.hold_id IN (
+    SELECT id FROM recovery_custody_holds WHERE run_id = @run_id
+) OR pub.id IN (
+    SELECT final_publication_id FROM recovery_custody_holds WHERE run_id = @run_id
+)
+ORDER BY pub.generation, pub.id LIMIT 1001 FOR NO KEY UPDATE;
+
+-- name: ListCrossRunFinalCaptures :many
+-- Identity only: historical FINALs do not depend on current archive availability.
+SELECT c.* FROM recovery_captures c
+WHERE c.id IN (SELECT h.final_capture_id FROM recovery_custody_holds h WHERE h.run_id = @run_id)
+ORDER BY c.id LIMIT 1001;
+
+-- name: HasCrossRunSharedFinal :one
+SELECT EXISTS (
+    SELECT 1 FROM recovery_custody_holds other
+    WHERE other.run_id <> @run_id AND (
+        other.live_run_id = @run_id
+        OR other.final_capture_id IN (
+            SELECT c.id FROM recovery_captures c
+            JOIN recovery_custody_holds own ON own.id = c.hold_id
+            WHERE own.run_id = @run_id)
+        OR other.final_capture_id IN (
+            SELECT final_capture_id FROM recovery_custody_holds WHERE run_id = @run_id)
+        OR other.final_publication_id IN (
+            SELECT pub.id FROM run_held_publications pub
+            WHERE pub.run_id = @run_id OR pub.hold_id IN (
+                SELECT id FROM recovery_custody_holds WHERE run_id = @run_id)
+                OR pub.id IN (
+                    SELECT final_publication_id FROM recovery_custody_holds WHERE run_id = @run_id)))
+);
+
+-- name: DiscardCrossRunHold :execrows
+UPDATE recovery_custody_holds SET
+    state = 'discarded', live_worker_id = NULL, live_run_id = NULL,
+    release_evidence = 'merged_predecessor_discard',
+    merged_predecessor_discard_binding = @binding::jsonb, updated_at = now()
+WHERE id = @hold_id AND run_id = @run_id AND user_id = @owner_id AND repo_id = @repo_id
+    AND generation = @generation AND generation > 0 AND generation <= @terminal_generation
+    AND state = 'open' AND merged_predecessor_discard_binding IS NULL;
