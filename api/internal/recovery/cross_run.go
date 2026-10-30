@@ -466,6 +466,6 @@ func crossRunHistoricalBinding(h store.RecoveryCustodyHold) bool {
 			positive("witness_completed_generation") > 0 && positive("witness_mr_iid") > 0 &&
 			!finished.IsZero() && !created.IsZero() && finished.Before(created)
 	}
-	return len(b) == 13 && matches("run_id", h.RunID) &&
+	return len(b) == 12 && matches("run_id", h.RunID) &&
 		positive("completed_generation") > h.Generation && positive("mr_iid") > 0
 }

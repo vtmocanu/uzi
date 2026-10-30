@@ -65,6 +65,96 @@ func crossRunRetained(t *testing.T, e *inventoryEnv, a CrossRunTargetBinding, s 
 }
 
 func TestCrossRunDiscardPolicyAndArchiveLiveDB(t *testing.T) {
+	t.Run("historical_legacy_writer", func(t *testing.T) {
+		e, legacy := newMergedPredecessorEnv(t)
+		if n, err := e.svc.DiscardMergedPredecessorHolds(e.ctx, legacy); err != nil || n != 1 {
+			t.Fatalf("actual legacy writer: changed=%d err=%v", n, err)
+		}
+		assertMergedHoldState(t, e, e.hold, "discarded")
+		prior := crossRunRow(t, e, "recovery_custody_holds", e.hold)
+		// Keep the writer's immutable Hgen1 audit verbatim. Only the run's
+		// current terminal identity changes; the new witness is a distinct run.
+		e.exec("UPDATE runs SET status='cancelled',kind='issue',issue_iid=101,claim_generation=4,mr_iid=NULL,fail_origin=NULL,finished_at='2025-01-02T03:04:05.123456Z' WHERE id=$1", e.run)
+		witness := uuid.New()
+		binding := legacy.binding
+		e.exec(`INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,status,claim_generation,mr_iid,created_at)
+ VALUES($1,$2,$3,'issue',101,'witness','body','completed',1,7,'2025-01-02T03:04:06.654321Z')`, witness, binding.OwnerID, binding.RepoID)
+		// These are service inputs, not a fabricated historical audit.
+		b := map[string]any{
+			"repo_id": binding.RepoID.String(), "connection_id": binding.ConnectionID.String(),
+			"project_id": binding.ProjectID, "forge_type": binding.ForgeType, "base_url": binding.BaseURL,
+			"target_terminal_generation": int64(4), "witness_completed_generation": int64(1),
+			"target_finished_at": "2025-01-02T03:04:05.123456Z", "witness_created_at": "2025-01-02T03:04:06.654321Z",
+			"verified_at": time.Now().UTC().Add(-time.Second).Format(time.RFC3339Nano),
+		}
+		a, s := crossRunInputs(t, e, witness, b)
+		open := uuid.New()
+		insertMergedHold(e, open, a.OwnerID, a.RepoID, e.run, e.w.ID, 4, true)
+		calls := 0
+		e.svc.SetCustodySettledHook(func(uuid.UUID) { calls++ })
+		n, err := e.svc.DiscardCrossRunHolds(e.ctx, a, s)
+		if prior != crossRunRow(t, e, "recovery_custody_holds", e.hold) {
+			t.Fatal("historical writer's closed hold and immutable audit changed")
+		}
+		if err != nil || n != 1 || calls != 1 {
+			t.Fatalf("eligible target should discard: changed=%d err=%v hooks=%d", n, err, calls)
+		}
+		assertMergedHoldState(t, e, open, "discarded")
+	})
+	for _, count := range []int{1000, 1001} {
+		t.Run(fmt.Sprintf("mixed_closed_open_inventory_%d", count), func(t *testing.T) {
+			e, w, b := newCrossRunBindingEnv(t, 1001, 1)
+			a, s := crossRunInputs(t, e, w, b)
+			// Normal owner-discard closure, followed by equivalent earlier
+			// generations. No guard or constraint is disabled.
+			e.exec("UPDATE recovery_custody_holds SET state='discarded',live_worker_id=NULL,live_run_id=NULL,release_evidence='owner_discard' WHERE id=$1", e.hold)
+			e.exec(`INSERT INTO recovery_custody_holds
+ SELECT (jsonb_populate_record(NULL::recovery_custody_holds,to_jsonb(h)||
+ jsonb_build_object('id',gen_random_uuid(),'generation',g))).*
+ FROM recovery_custody_holds h CROSS JOIN generate_series(2,$2::bigint) g WHERE h.id=$1`, e.hold, count-1)
+			closedRows := func() string {
+				var rows string
+				if err := e.pool.QueryRow(e.ctx, `SELECT jsonb_agg(to_jsonb(h) ORDER BY generation,id)::text
+ FROM recovery_custody_holds h WHERE run_id=$1 AND generation<1001 AND state='discarded'`, e.run).Scan(&rows); err != nil {
+					t.Fatal(err)
+				}
+				return rows
+			}
+			closed := closedRows()
+			open := uuid.New()
+			insertMergedHold(e, open, a.OwnerID, a.RepoID, e.run, e.w.ID, 1001, true)
+			before := mergedWorkSnapshot(t, e)
+			calls := 0
+			e.svc.SetCustodySettledHook(func(uuid.UUID) { calls++ })
+			n, err := e.svc.DiscardCrossRunHolds(e.ctx, a, s)
+			if closed != closedRows() {
+				t.Fatal("closed inventory rows changed")
+			}
+			if count == 1001 {
+				if !bytes.Equal(before, mergedWorkSnapshot(t, e)) {
+					t.Fatal("all-state inventory overflow must roll back the entire batch")
+				}
+				if n != 0 || !errors.Is(err, ErrMergedPredecessorWorkLimit) || calls != 0 {
+					t.Fatalf("mixed inventory overflow: changed=%d err=%v hooks=%d", n, err, calls)
+				}
+			} else {
+				if err != nil || n != 1 || calls != 1 {
+					t.Fatalf("mixed inventory exact limit: changed=%d err=%v hooks=%d", n, err, calls)
+				}
+				assertMergedHoldState(t, e, open, "discarded")
+			}
+		})
+	}
+	t.Run("malformed_closed_sibling", func(t *testing.T) {
+		e, w, b := newCrossRunBindingEnv(t, 3, 1)
+		a, s := crossRunInputs(t, e, w, b)
+		sibling := uuid.New()
+		insertMergedHold(e, sibling, a.OwnerID, a.RepoID, e.run, e.w.ID, 2, false)
+		// An unguarded legacy row may be closed while retaining a live pointer.
+		// The service must inspect it as well as the otherwise eligible OPEN row.
+		e.exec("UPDATE recovery_custody_holds SET state='discarded',release_evidence='owner_discard' WHERE id=$1", sibling)
+		crossRunRetained(t, e, a, s, "malformed closed sibling must refuse the entire batch")
+	})
 	for _, generation := range []int64{1, 3} {
 		t.Run(fmt.Sprintf("A%d_B1_policy_control", generation), func(t *testing.T) {
 			e, w, b := newCrossRunBindingEnv(t, generation, 1)
@@ -551,6 +641,7 @@ func TestCrossRunDiscardEligibilityLiveDB(t *testing.T) {
 		{"witness_issue", "issue_iid=102", true}, {"witness_missing_issue", "kind='prompt',issue_iid=NULL", true},
 		{"witness_zero_issue", "issue_iid=0", true}, {"witness_negative_issue", "issue_iid=-1", true},
 		{"witness_created", "created_at='2024-01-01T00:00:00Z'", true},
+		{"witness_created_infinite", "created_at='infinity'", true},
 		{"witness_pr", "mr_iid=8", true}, {"witness_null_pr", "mr_iid=NULL", true}, {"witness_zero_pr", "mr_iid=0", true},
 	}
 	for _, tc := range cases {
@@ -584,9 +675,16 @@ func TestCrossRunDiscardEligibilityLiveDB(t *testing.T) {
 			case "witness_repo":
 				e.exec("UPDATE runs SET repo_id=$2 WHERE id=$1", w, repo)
 			case "connection":
-				e.exec("UPDATE repos SET connection_id=$2,forge_project_id=2 WHERE id=$1", a.RepoID, conn)
+				// UNIQUE(user_id,forge_type,base_url) prevents an equivalent
+				// replacement connection. Change only the frozen connection ID
+				// to exercise the locked comparison with all DB identity intact.
+				b["connection_id"] = uuid.New().String()
+				a, s = crossRunInputs(t, e, w, b)
 			case "connection_owner":
-				e.exec("UPDATE forge_connections SET user_id=$2,base_url='https://drift.example.com' WHERE id=$1", s.binding.ConnectionID, other.w.UserID)
+				// Free the destination owner's equivalent URL first; drift
+				// only user_id on the original, snapshot-bound connection.
+				e.exec("UPDATE forge_connections SET base_url='https://other.example.com' WHERE id=$1", conn)
+				e.exec("UPDATE forge_connections SET user_id=$2 WHERE id=$1", s.binding.ConnectionID, other.w.UserID)
 			case "project":
 				e.exec("UPDATE repos SET forge_project_id=2 WHERE id=$1", a.RepoID)
 			case "forge":
