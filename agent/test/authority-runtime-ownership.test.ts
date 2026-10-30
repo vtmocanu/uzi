@@ -391,3 +391,86 @@ describe("per-key ownership", () => {
     assert.equal(next.heldByOtherSink(r.clone, new Set()), false);
   });
 });
+
+describe("classifySourceAdmission is genuinely read-only (issue #3638 D4)", () => {
+  const foreign = (r: Rig) => new AuthorityRuntime({ lifetime: r.lifetime, workerToken: TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000 });
+
+  it("names what an admission would meet and the slot owner and epoch", async (t) => {
+    const r = await rig(t);
+    const sinkA = new Set<string>();
+    const sinkB = new Set<string>();
+    assert.deepEqual(await r.rt.classifySourceAdmission(r.clone, sinkB), { kind: "admissible" }, "no slot");
+
+    const lease = await bindIn(r.rt, sinkA, r.clone);
+    const owner = { worker: r.rt.authorityIncarnation()!, epoch: leaseEpoch(lease) };
+    assert.deepEqual(await r.rt.classifySourceAdmission(r.clone, sinkA), { kind: "admissible", owner }, "the owning sink itself");
+    assert.deepEqual(await r.rt.classifySourceAdmission(r.clone, sinkB), { kind: "held_unended", owner }, "another sink of this process");
+    assert.deepEqual(await foreign(r).classifySourceAdmission(r.clone, sinkB), { kind: "foreign_active", owner },
+      "another worker incarnation's active epoch");
+
+    await r.rt.endSourceUse([r.clone], { sink: sinkA });
+    const ended = await r.rt.classifySourceAdmission(r.clone, sinkB);
+    assert.equal(ended.kind, "admissible", "a confirmed end");
+    assert.equal(await foreign(r).classifySourceAdmission(r.clone, sinkB).then((c) => c.kind), "admissible", "an ineligible slot is admissible for another incarnation");
+  });
+
+  it("a pending footprint, a retiring slot and a failed lock wait are all `other`", async (t) => {
+    const r = await rig(t);
+    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
+    const settlement = await r.rt.withTransaction(() => r.rt.hooks.beginDestructive([r.clone], "runner-uid-delete"));
+    const before = authorityBytes(r.root);
+    assert.equal((await foreign(r).classifySourceAdmission(r.clone, new Set())).kind, "other", "a running pending footprint");
+    assert.equal(authorityBytes(r.root), before);
+    await r.rt.withTransaction(() => settlement.settle({ ok: true }));
+
+    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.other, "discard"));
+    assert.equal((await foreign(r).classifySourceAdmission(r.other, new Set())).kind, "other", "a retiring slot");
+
+    // A lock that cannot be had in time is uncertainty, never eligibility.
+    const { withAuthorityTransaction } = await import("../src/authority-lock.js");
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const inside = new Promise<void>((resolve) => { entered = resolve; });
+    const holder = withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async () => { entered(); await held; });
+    await inside;
+    assert.equal((await foreign(r).classifySourceAdmission(r.clone, new Set(), { timeoutMs: 50 })).kind, "other");
+    release();
+    await holder;
+  });
+
+  it("with a queued end pending over a slot one ahead of its head: the slot and head bytes are equal, nothing is drained or repaired, and it classifies as `other`", async (t) => {
+    const flags = { head: false };
+    const r = await rig(t, {
+      ops: {
+        syncFile: (h) => h.sync(), syncDir: (h) => h.sync(),
+        rename: async (a, b) => {
+          if (flags.head && path.basename(path.dirname(b)) === "heads") throw new Error("injected head failure");
+          fs.renameSync(a, b);
+        },
+      },
+      retryMs: 3_600_000,
+    });
+    const first = new Set<string>();
+    await bindIn(r.rt, first, r.clone);
+    r.rt.retireSink(first);
+    flags.head = true;
+    const outcome = await r.rt.endSourceUse([r.clone]);
+    assert.deepEqual(outcome.endedSlots, [], "the end failed after the slot rename: queued, not confirmed");
+    await new Promise((resolve) => setTimeout(resolve, 100)); // the idle drain's own (failing) attempt
+    flags.head = false;
+
+    const before = authorityBytes(r.root);
+    assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), true, "the end is queued and the key still owned");
+    const observer = foreign(r);
+    assert.equal((await observer.classifySourceAdmission(r.clone, new Set())).kind, "other", "slot ahead of head is uncertain");
+    assert.equal((await r.rt.classifySourceAdmission(r.clone, new Set())).kind, "other");
+    assert.equal(authorityBytes(r.root), before, "slot and head files are byte-equal: no repair, no write");
+    assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), true, "the queued end was not drained by the classification");
+
+    // The control: an ordinary transaction DOES drain the queued end and repair the head, so the equality above is meaningful.
+    await r.rt.withTransaction(async () => undefined);
+    assert.notEqual(authorityBytes(r.root), before, "a transaction completes the crash window");
+    assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), false, "and applies the queued end");
+  });
+});

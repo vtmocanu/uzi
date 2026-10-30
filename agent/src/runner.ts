@@ -2192,6 +2192,16 @@ interface RunFlight {
   /** issue #3404 M2 U3: every source slot path this flight's authority admissions touched (its clone, a
    *  predecessor it captured or normalized, a successor), for {@link RunRunner.endFlightSourceUse}. */
   sourceUsePaths?: Set<string>;
+  /**
+   * issue #3638 D4: set by a retained claim whose memory continuation was refused and re-parked (see
+   * {@link RunRunner.parkMemoryContinuationRefused}). `sent` is latched immediately BEFORE the park report (so a lost ACK
+   * still leaves it); `confirmed` only on the server's exact accepted binding. The teardown producer records them as
+   * provenance (never a settlement), keeping `authorityIncarnation`, the slot owner the predecessor's record named.
+   */
+  memoryRepark?: {
+    readonly authorityIncarnation: string; readonly attemptId: string | null;
+    sent?: MemoryParkWitness["binding"]; confirmed?: MemoryParkWitness["binding"];
+  };
   /** issue #3638: set (permanently) when {@link RunRunner.endFlightSourceUse} began; the flight admits no source again. */
   sourceAdmissionRetired?: boolean;
   /** issue #3638: a per-flight identity minted once at creation and never reassigned. */
@@ -21469,51 +21479,71 @@ export class RunRunner {
   ): Promise<void> {
     const memory = flight.workerMemory;
     const hold = memory?.hold;
-    if (!memory || !hold) return;
+    const repark = flight.memoryRepark;
+    if (!memory || (!hold && !repark)) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const authority = this.authority;
       const bare = flight.barePath, branch = flight.branch, clonePath = flight.worktreePath;
       if (!authority || !bare || !branch || !clonePath) return;
-      const authorityIncarnation = authority.authorityIncarnation();
-      if (authorityIncarnation === undefined) {
-        runLog.warn("memory park not recorded: the authority incarnation is unknown");
-        return;
+      let record: MemoryParkRecord;
+      let attemptId: string | undefined;
+      if (!hold) {
+        // D4: the retained continuation was refused and re-parked. Provenance only (never a settlement): the new binding,
+        // PRESERVING the slot owner the predecessor's record named, so the next Resume can re-park again. A re-park that
+        // sent nothing leaves the older record, which stays valid for the same episode.
+        const wire = repark!.confirmed ?? repark!.sent;
+        if (!wire) return;
+        record = {
+          version: 1,
+          binding: { runId: wire.run_id, claimGeneration: wire.claim_generation, workerId: wire.worker_id,
+            registerNonce: wire.register_nonce, memoryEpisode: wire.memory_episode },
+          ack: repark!.confirmed ? "confirmed" : "sent_unconfirmed",
+          origin: { flightId: flight.flightId, attemptId: repark!.attemptId,
+            executorIncarnation: flight.executor.executorIncarnation ?? null, authorityIncarnation: repark!.authorityIncarnation },
+        };
+        attemptId = repark!.attemptId ?? undefined;
+      } else {
+        const authorityIncarnation = authority.authorityIncarnation();
+        if (authorityIncarnation === undefined) {
+          runLog.warn("memory park not recorded: the authority incarnation is unknown");
+          return;
+        }
+        const witness = memory.parkWitness;
+        const wire = witness?.binding ?? memory.parkSent ?? {
+          run_id: hold.context.run_id, worker_id: hold.context.worker_id, register_nonce: hold.context.register_nonce,
+          claim_generation: hold.context.claim_generation, memory_episode: hold.context.memory_episode };
+        const binding = { runId: wire.run_id, claimGeneration: wire.claim_generation, workerId: wire.worker_id,
+          registerNonce: wire.register_nonce, memoryEpisode: wire.memory_episode };
+        record = {
+          version: 1, binding, ack: witness ? "confirmed" : memory.parkSent ? "sent_unconfirmed" : "not_sent",
+          origin: { flightId: hold.origin.flightId, attemptId: hold.origin.attemptId,
+            executorIncarnation: hold.origin.executorIncarnation, authorityIncarnation },
+        };
+        const executor = flight.executor;
+        const complete = end.paths.length >= 1 && end.paths.length <= 16 && !end.published &&
+          end.paths.every(p => end.endedSlots.some(e => e.path === p)) &&
+          end.endedSlots.every(e => e.worker === authorityIncarnation);
+        if (witness && observed.steeringJoined && flight.sourceTailsJoined === true &&
+            this.memoryHoldSettled(flight, executor) && complete) {
+          const sources = [...end.endedSlots].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0).map(e => {
+            const at = e.path.lastIndexOf(ATTEMPT_SEPARATOR);
+            const id = at < 0 ? undefined : e.path.slice(at + ATTEMPT_SEPARATOR.length);
+            return { path: e.path, authorityKey: e.key, attemptId: id !== undefined && ATTEMPT_ID_RE.test(id) ? id : null,
+              epoch: e.epoch, seq: e.seq };
+          });
+          record.settlement = { version: 1, confirmed: false, sources, evidence: {
+            parkAck: binding, interventionIds: [...witness.interventionIds],
+            processJoin: executor.safety ? "codex_disposal" : "executor",
+            commands: executor.settleWorkerCommands ? "confirmed" : "not_required",
+            steering: "joined", auxiliaries: flight.evidenceAuxiliaries === "joined" ? "joined" : "none",
+            feedback: "drained", sinkReceipts: "joined", parkReap: observed.parkReap } };
+        } else if (witness) {
+          runLog.warn("memory park recorded without a settlement: the source use end is not positively complete", {
+            sources: end.paths.length, ended: end.endedSlots.length });
+        }
+        attemptId = flight.runnerClone?.attemptId;
       }
-      const witness = memory.parkWitness;
-      const wire = witness?.binding ?? memory.parkSent ?? {
-        run_id: hold.context.run_id, worker_id: hold.context.worker_id, register_nonce: hold.context.register_nonce,
-        claim_generation: hold.context.claim_generation, memory_episode: hold.context.memory_episode };
-      const binding = { runId: wire.run_id, claimGeneration: wire.claim_generation, workerId: wire.worker_id,
-        registerNonce: wire.register_nonce, memoryEpisode: wire.memory_episode };
-      const record: MemoryParkRecord = {
-        version: 1, binding, ack: witness ? "confirmed" : memory.parkSent ? "sent_unconfirmed" : "not_sent",
-        origin: { flightId: hold.origin.flightId, attemptId: hold.origin.attemptId,
-          executorIncarnation: hold.origin.executorIncarnation, authorityIncarnation },
-      };
-      const executor = flight.executor;
-      const complete = end.paths.length >= 1 && end.paths.length <= 16 && !end.published &&
-        end.paths.every(p => end.endedSlots.some(e => e.path === p)) &&
-        end.endedSlots.every(e => e.worker === authorityIncarnation);
-      if (witness && observed.steeringJoined && flight.sourceTailsJoined === true &&
-          this.memoryHoldSettled(flight, executor) && complete) {
-        const sources = [...end.endedSlots].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0).map(e => {
-          const at = e.path.lastIndexOf(ATTEMPT_SEPARATOR);
-          const id = at < 0 ? undefined : e.path.slice(at + ATTEMPT_SEPARATOR.length);
-          return { path: e.path, authorityKey: e.key, attemptId: id !== undefined && ATTEMPT_ID_RE.test(id) ? id : null,
-            epoch: e.epoch, seq: e.seq };
-        });
-        record.settlement = { version: 1, confirmed: false, sources, evidence: {
-          parkAck: binding, interventionIds: [...witness.interventionIds],
-          processJoin: executor.safety ? "codex_disposal" : "executor",
-          commands: executor.settleWorkerCommands ? "confirmed" : "not_required",
-          steering: "joined", auxiliaries: flight.evidenceAuxiliaries === "joined" ? "joined" : "none",
-          feedback: "drained", sinkReceipts: "joined", parkReap: observed.parkReap } };
-      } else if (witness) {
-        runLog.warn("memory park recorded without a settlement: the source use end is not positively complete", {
-          sources: end.paths.length, ended: end.endedSlots.length });
-      }
-      const attemptId = flight.runnerClone?.attemptId;
       // The timeout also aborts the writer, so a timed-out producer forfeits pending lock holds and starts no phase 2.
       const give = new AbortController();
       const written = await Promise.race([
@@ -21521,8 +21551,9 @@ export class RunRunner {
           { signal: give.signal }),
         new Promise<"timeout">(resolve => { timer = setTimeout(() => { give.abort(); resolve("timeout"); }, this.codexBoundaryDeadlineMs); }),
       ]);
-      if (written === "timeout") runLog.warn("memory park record write timed out and the producer was aborted; the park stays unqualified");
-      else if (written === "unconfirmed") {
+      if (written === "timeout") {
+        runLog.warn("memory park record write timed out and the producer was aborted; a write already holding the bare lock may still land, and a reader trusts a record only after its own lock-held confirmation");
+      } else if (written === "unconfirmed") {
         runLog.warn(record.settlement
           ? "memory park settlement could not be confirmed; the park stays unqualified"
           : "memory park record not confirmed; the park stays unqualified");
@@ -22478,6 +22509,117 @@ export class RunRunner {
   }
 
   /**
+   * issue #3638 D4 - may this retained claim re-park at `worker_memory_pressure` instead of continuing a predecessor whose
+   * source use was never positively ended? READ-ONLY: it writes nothing (journal, authority, server) and authorizes ONLY
+   * an owner-held re-park, never source use, capture, publication or settlement. Every rule must hold:
+   * 1. the slot classification is `foreign_active` (a dead incarnation's active epoch) or `held_unended` (this process's
+   *    earlier flight, no confirmed end);
+   * 2. the active-key journal entry carries a `memoryPark` of this run, from an EARLIER claim generation, whose ack and
+   *    episode agree with this claim's episode (E = the record's, C = the claim's): `confirmed` C === E + 1;
+   *    `sent_unconfirmed` C === E (the server never applied it) or C === E + 1 (it applied it, every ACK was lost, and
+   *    the owner Resumed); `not_sent` C === E only;
+   * 3. the slot's owner is the incarnation the record names and, for a settled record, its epoch is a recorded source
+   *    epoch (so a successor that minted its own epoch and crashed, and an unrelated writer, are excluded);
+   * 4. worker memory is bound for this flight and `worker_memory_pressure_v1` is negotiated.
+   * Returns the slot owner to preserve in the next record, else undefined (the existing flow is unchanged).
+   */
+  private async memoryReparkOwner(claim: ClaimResponse, flight: RunFlight, source: RecoveryJournalEntry): Promise<string | undefined> {
+    const record = source.memoryPark;
+    const memory = flight.workerMemory;
+    const authority = this.authority;
+    if (!record || !memory || !authority) return undefined;
+    const incarnation = this.client.memoryIncarnation;
+    if (!incarnation || memory.incarnation !== incarnation || !this.client.hasFeature("worker_memory_pressure_v1")) return undefined;
+    const episode = claim.memory_episode;
+    if (record.binding.runId !== claim.run_id || !Number.isSafeInteger(flight.claimGeneration) || flight.claimGeneration < 1 ||
+        record.binding.claimGeneration >= flight.claimGeneration || episode === undefined || !Number.isSafeInteger(episode)) return undefined;
+    const recorded = record.binding.memoryEpisode;
+    const episodeAgrees = record.ack === "confirmed" ? episode === recorded + 1
+      : record.ack === "sent_unconfirmed" ? episode === recorded || episode === recorded + 1
+      : episode === recorded;
+    if (!episodeAgrees) return undefined;
+    const classified = await authority.classifySourceAdmission(source.clonePath, flight.sourceUsePaths ??= new Set(),
+      this.authorityWait(flight));
+    this.retainedLifecycleGuard(flight);
+    if ((classified.kind !== "foreign_active" && classified.kind !== "held_unended") || !classified.owner ||
+        classified.owner.worker !== record.origin.authorityIncarnation) return undefined;
+    if (record.settlement && !record.settlement.sources.some(s => s.path === resolvePath(source.clonePath) &&
+        s.epoch === classified.owner!.epoch)) return undefined;
+    return record.origin.authorityIncarnation;
+  }
+
+  /**
+   * issue #3638 D4 - the owner-held outcome of a refused memory continuation: re-park at `recovery_wait` /
+   * `worker_memory_pressure` at the claim's OWN episode (only an owner Resume increments it), through the existing park
+   * body. Modelled on {@link parkRetainedRecoveryExhausted}: at most two reports under one boundary deadline, the lifecycle
+   * guard on every step. It sets no `memory.hold` (that would re-enter preservation) and performs no capture, admission,
+   * recovery-episode charge, model turn or publication. ALWAYS throws: an exact accepted binding (a 409 exact replay is
+   * mapped to accepted by the client) marks the flight parked, every other outcome (a stale claim or checker-parent change,
+   * a wall-parked ACK, a credential switch, pause, cancel or claim fence, the deadline, a transport failure, no binding)
+   * stops the claim nonterminally with custody retained and no `failed` report. The teardown producer records what was
+   * sent or confirmed (`flight.memoryRepark`).
+   */
+  private async parkMemoryContinuationRefused(claim: ClaimResponse, flight: RunFlight, source: RecoveryJournalEntry,
+    authorityIncarnation: string): Promise<never> {
+    const incarnation = this.client.memoryIncarnation!;
+    const wire: MemoryParkWitness["binding"] = Object.freeze({ run_id: flight.runId, worker_id: incarnation.worker_id,
+      register_nonce: incarnation.register_nonce, claim_generation: flight.claimGeneration, memory_episode: claim.memory_episode! });
+    const repark: NonNullable<RunFlight["memoryRepark"]> = { authorityIncarnation, attemptId: source.attemptId ?? null };
+    flight.memoryRepark = repark;
+    this.retainWorkerMemoryCustody(flight);
+    const deadline = Date.now() + this.codexBoundaryDeadlineMs;
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(new Error("memory continuation park deadline exhausted")),
+      Math.max(1, deadline - Date.now()));
+    const signal = AbortSignal.any([this.retainedLifecycleSignal(flight), timeout.signal]);
+    const body: StateRequest = { status: "recovery_wait", recovery_cause: "worker_memory_pressure",
+      register_nonce: wire.register_nonce, claim_generation: wire.claim_generation, memory_episode: wire.memory_episode };
+    flight.runLog.warn("retained predecessor's memory continuation is unproven; re-parking for the owner instead of failing", {
+      claim_generation: flight.claimGeneration, memory_episode: wire.memory_episode });
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        this.retainedLifecycleGuard(flight);
+        signal.throwIfAborted();
+        try {
+          // Latched immediately before the report: a lost ACK still leaves evidence that a park may have landed.
+          repark.sent = wire;
+          const ack = await flight.reportState(body, signal);
+          this.retainedLifecycleGuard(flight);
+          const accepted = ack.memoryParkAccepted;
+          if (accepted && accepted.run_id === wire.run_id && accepted.worker_id === wire.worker_id &&
+              accepted.register_nonce === wire.register_nonce && accepted.claim_generation === wire.claim_generation &&
+              accepted.memory_episode === wire.memory_episode) {
+            repark.confirmed = wire;
+            flight.parked = true;
+            throw new RetainedRecoveryStop();
+          }
+        } catch (error) {
+          this.retainedLifecycleGuard(flight);
+          if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal ||
+              error instanceof StaleClaimError || error instanceof ServerWallParkedError ||
+              isRunOwnershipLost(error, flight.runId)) throw error;
+          // A refusal of the park is final for this claim; only a transport-level failure earns the second report.
+          if (error instanceof RequestError && error.status >= 400 && error.status < 500) throw new RetainedRecoveryStop({ cause: error });
+          flight.runLog.warn("retained memory continuation park report unconfirmed", {
+            attempt, ...formatRetainedRecoveryDiagnostic(error, flight.redactText),
+          });
+        }
+        // A lost ACK or a status-only 2xx is not proof. A same-generation ownership read permits one duplicate report,
+        // including when the park already landed (the replay is then accepted by its exact binding).
+        const own = await this.getObservedRunOwnership(flight, { signal, deadline });
+        this.retainedLifecycleGuard(flight);
+        if (own.claim_generation !== flight.claimGeneration ||
+            (own.status !== "running" && own.status !== "recovery_wait")) throw new RetainedRecoveryStop();
+      }
+      throw new RetainedRecoveryStop();
+    } catch (error) {
+      // Even a cancellation must not enter the legacy dispatcher's RetainedRecoveryCancelled terminal fallback.
+      if (error instanceof CredentialSwitchSignal) throw error;
+      throw new RetainedRecoveryStop({ cause: error });
+    } finally { clearTimeout(timer); }
+  }
+
+  /**
    * issue #3638 D3 - diagnostics only: when the predecessor's journal carries a memory-park settlement, log whether
    * the lock-confirmed record AND the authority's ended slots still agree with it. The answer authorizes nothing here
    * (no admission, capture, publication, custody release or Resume); server delivery and consumption are #3639.
@@ -22520,6 +22662,10 @@ export class RunRunner {
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     flight.keepGuardedInventoryOpen = true;
+    // issue #3638 D4: BEFORE the recovery stage, any reservation or any other write. A predecessor whose source use was
+    // never positively ended but whose journal proves a memory park of this run is not ours to continue: re-park for the owner.
+    const reparkOwner = await this.memoryReparkOwner(claim, flight, source);
+    if (reparkOwner !== undefined) await this.parkMemoryContinuationRefused(claim, flight, source, reparkOwner);
     await this.logPredecessorMemorySettlement(flight, bare, branch, source);
     const inherited = flight.sourceInherited?.family;
     if (inherited?.observedExecution.runId === flight.runId) {

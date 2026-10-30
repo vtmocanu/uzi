@@ -7,7 +7,7 @@ import {
   type AuthorityTransaction, type WorkerLifetime,
 } from "./authority-lock.js";
 import {
-  leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot,
+  leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot, processWorkerIncarnation,
   type AuthorityFsOps, type AuthorityStore, type EndedSlotReceipt, type SlotCohort, type SlotSnapshot, type SourceUseLease,
 } from "./completion-authority.js";
 import {
@@ -371,6 +371,48 @@ export class AuthorityRuntime implements AuthorityScope {
       }, { timeoutMs: LATE_WAIT_MS, ...options });
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * issue #3638 D4 - classify, WITHOUT writing or repairing anything, what an admission of `clonePath` made by the flight
+   * owning `sink` would meet. A is held through the same lock primitive as {@link withTransaction}, but the pre-callback
+   * drain of queued late settlements and ends is NOT run, no idle drain is scheduled and the store is not (re)opened for
+   * writing: the slot is read only through {@link peekAuthoritySlot}, which never completes a slot that is one ahead of
+   * its head. Every uncertainty (that refusal, a lock timeout, an unreadable slot or store) is `other`, never eligibility.
+   *
+   * - `foreign_active`: the slot is `active` under another worker incarnation (the refusal bindSource would raise);
+   * - `held_unended`: this process's earlier flight (another sink) still owns the key with no confirmed end;
+   * - `admissible`: an admission would proceed (no slot, `ineligible`, or this incarnation's own active epoch);
+   * - `other`: a pending footprint, retiring, published or retired slot, or anything uncertain.
+   * `owner` names the slot's owner incarnation and epoch whenever it was read.
+   */
+  async classifySourceAdmission(
+    clonePath: string, sink: Set<string> | undefined, wait: AuthorityWait = {},
+  ): Promise<{ kind: "foreign_active" | "held_unended" | "admissible" | "other"; owner?: { worker: string; epoch: string } }> {
+    const key = path.resolve(clonePath);
+    const read = async (): Promise<{ kind: "foreign_active" | "held_unended" | "admissible" | "other"; owner?: { worker: string; epoch: string } }> => {
+      const slot = await peekAuthoritySlot({ dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken }, key);
+      const held = this.heldByOtherSink(key, sink);
+      if (!slot) return { kind: held ? "other" : "admissible" };
+      const owner = { worker: slot.owner.worker, epoch: slot.epoch };
+      if (slot.pending !== null || slot.state === "retiring" || slot.state === "retired" ||
+          slot.state === "sealed" || slot.state === "claude_ready") return { kind: "other", owner };
+      const incarnation = this.authorityIncarnation() ?? processWorkerIncarnation();
+      if (slot.state === "active") {
+        if (slot.owner.worker !== incarnation) return { kind: "foreign_active", owner };
+        return { kind: held ? "held_unended" : "admissible", owner };
+      }
+      return { kind: held ? "other" : "admissible", owner };
+    };
+    try {
+      if (this.active()) return await read();
+      return await withAuthorityTransaction(this.#options.lifetime, {
+        ...(wait.signal ? { signal: wait.signal } : {}),
+        timeoutMs: wait.timeoutMs ?? this.#options.timeoutMs ?? DEFAULT_WAIT_MS,
+      }, read);
+    } catch {
+      return { kind: "other" };
     }
   }
 

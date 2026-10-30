@@ -641,6 +641,9 @@ export async function openAuthorityStore(tx: AuthorityTransaction, options: Auth
   });
 }
 
+/** The worker incarnation a store opened without an explicit `workerIncarnation` writes its slots under. */
+export function processWorkerIncarnation(): string { return PROCESS_INCARNATION; }
+
 /**
  * Read one slot with NO authority transaction and no write (see {@link AuthorityStore.peekSlot}). An
  * unenrolled store reads as "nothing recorded" (null) only when it has no slots and no heads either; a

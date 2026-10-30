@@ -6949,7 +6949,7 @@ export class GitCache {
    * A journal bound by a stopped marker (even one whose clear failed) or shadowed by a protected descriptor is never
    * rewritten: nothing is written, the refusal is logged and `unconfirmed` is returned. `opts.signal` forfeits a
    * phase-1 or phase-2 lock hold not yet granted and stops phase 2 from starting once aborted (a phase-1 draft stays
-   * `confirmed: false`); it never applies to the best-effort revert hold, which always runs.
+   * `confirmed: false`); the best-effort revert hold is never forfeited by `opts.signal` (an ambient scope signal or a marker re-check can still stop it).
    */
   async recordMemoryPark(
     barePath: string, branch: string, expected: { runId: string; clonePath: string; attemptId?: string },
