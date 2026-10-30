@@ -542,6 +542,68 @@
       }
     },
     {
+      "id": "dc2-requeued-previous-attempt-phases-differ",
+      "input": {
+        "status": "queued",
+        "harness": "claude",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": true,
+          "phases": [
+            {
+              "phase": "plan",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": "opus",
+              "requested_model_source": "user_planning_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "high",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "user_planning_default",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": null,
+              "observed_model_evidence": null,
+              "observed_effort": null,
+              "observed_effort_evidence": null,
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            },
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": "sonnet",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "medium",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "builtin",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": null,
+              "observed_model_evidence": null,
+              "observed_effort": null,
+              "observed_effort_evidence": null,
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: model and effort resolve at claim",
+        "lines": [
+          "previous attempt: plan opus · high → implement sonnet · medium",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
       "id": "dc3-terminal-no-rows",
       "input": {
         "status": "failed",
@@ -1290,6 +1352,54 @@
           "medium: built-in",
           "runtime: not reported yet",
           "effort: not reported yet",
+          "(later changes not recorded)",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dc7-truncated-not-current",
+      "input": {
+        "status": "running",
+        "harness": "claude",
+        "preClaim": {
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 1,
+          "current": false,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": "opus",
+              "requested_model_source": "user_default",
+              "requested_model_fixed_at": "claim",
+              "requested_effort": "medium",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "builtin",
+              "requested_effort_fixed_at": "claim",
+              "observed_model": null,
+              "observed_model_evidence": null,
+              "observed_effort": null,
+              "observed_effort_evidence": null,
+              "truncated": true,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: opus · medium",
+        "lines": [
+          "opus: your Claude default",
+          "medium: built-in",
+          "runtime: not reported yet",
+          "effort: not reported yet",
+          "recorded by an earlier attempt; this attempt has not recorded yet",
           "(later changes not recorded)",
           "This is the lead agent; subagents with their own pin may differ."
         ]

@@ -83,7 +83,8 @@ func queuedLeadView(input LeadConfigViewInput) LeadConfigViewResult {
 	}
 	lines := preClaimLines(input)
 	if phases := input.LeadConfig.Phases; len(phases) > 0 {
-		lines = append(lines, "previous attempt: "+rowText(phases[len(phases)-1]))
+		_, chips := shownRows(phases)
+		lines = append(lines, "previous attempt: "+strings.Join(chips, " → "))
 	}
 	return LeadConfigViewResult{Chip: chip, Lines: append(lines, leadSubagentNote)}
 }
@@ -98,32 +99,46 @@ func preClaimLines(input LeadConfigViewInput) []string {
 
 func rowsLeadView(input LeadConfigViewInput) LeadConfigViewResult {
 	lc := input.LeadConfig
-	rows := lc.Phases
-	if len(rows) > 1 && allSameText(rows) {
-		rows = rows[len(rows)-1:]
-	}
+	rows, chips := shownRows(lc.Phases)
 	prefixed := len(rows) > 1
 
-	var chips, lines []string
+	var lines []string
 	truncated := false
 	for _, p := range rows {
 		prefix := ""
 		if prefixed {
 			prefix = p.Phase + " "
 		}
-		chips = append(chips, prefix+rowText(p))
 		for _, l := range rowLines(p, input.Harness) {
 			lines = append(lines, prefix+l)
 		}
 		truncated = truncated || p.Truncated
 	}
-	if truncated {
-		lines = append(lines, leadTruncatedNote)
-	}
 	if !lc.Current {
 		lines = append(lines, leadEarlierAttemptNote)
 	}
+	if truncated {
+		lines = append(lines, leadTruncatedNote)
+	}
 	return LeadConfigViewResult{Chip: "lead: " + strings.Join(chips, " → "), Lines: append(lines, leadSubagentNote)}
+}
+
+// shownRows collapses identical rows to the last one and returns the rows shown with their chip segments
+// (phase-prefixed only when more than one row is shown); the chip and the queued "previous attempt" line share it.
+func shownRows(phases []apitypes.LeadPhaseConfigDTO) ([]apitypes.LeadPhaseConfigDTO, []string) {
+	rows := phases
+	if len(rows) > 1 && allSameText(rows) {
+		rows = rows[len(rows)-1:]
+	}
+	chips := make([]string, 0, len(rows))
+	for _, p := range rows {
+		prefix := ""
+		if len(rows) > 1 {
+			prefix = p.Phase + " "
+		}
+		chips = append(chips, prefix+rowText(p))
+	}
+	return rows, chips
 }
 
 func allSameText(rows []apitypes.LeadPhaseConfigDTO) bool {
