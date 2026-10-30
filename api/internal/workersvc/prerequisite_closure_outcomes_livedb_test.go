@@ -110,7 +110,7 @@ func TestPrerequisiteFrozenDOutcomeMatrixLiveDB(t *testing.T) {
 				remote.mu.Unlock()
 			}
 			proofs := 0
-			f.builder.f = &prerequisiteTestForge{compare: func(_ context.Context, _ int64, head, _ string) (forge.Ancestry, error) {
+			f.builder.f = &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, f.m), compare: func(_ context.Context, _ int64, head, _ string) (forge.Ancestry, error) {
 				if head != prerequisiteTestTip || tx.committed.Load() || tx.active.Load() {
 					return forge.AncestryUnknown, errors.New("proof did not precede marker outside transaction at original D")
 				}

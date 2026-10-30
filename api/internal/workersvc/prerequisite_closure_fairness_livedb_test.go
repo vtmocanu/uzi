@@ -36,7 +36,7 @@ func TestPrerequisiteSameServiceBusyKickRecoveredBySweepLiveDB(t *testing.T) {
 				return nil, ctx.Err()
 			}
 		}
-		return &prerequisiteTestForge{compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
+		return &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, f.m), compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
 			return forge.AncestryAncestor, nil
 		}}, nil
 	}})
@@ -262,7 +262,7 @@ func TestPrerequisiteMixedBacklogPublicSweepProgressLiveDB(t *testing.T) {
 	if err != nil || n != 1 {
 		t.Fatal("could not schedule preparation behind failing head")
 	}
-	f.builder.f = &prerequisiteTestForge{compare: func(_ context.Context, _ int64, _, sha string) (forge.Ancestry, error) {
+	f.builder.f = &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, f.m), compare: func(_ context.Context, _ int64, _, sha string) (forge.Ancestry, error) {
 		if sha == strings.Repeat("e", 40) {
 			return forge.AncestryUnknown, errors.New("synthetic failing head proof")
 		}

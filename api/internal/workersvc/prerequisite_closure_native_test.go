@@ -76,7 +76,7 @@ func prerequisiteNativeEnv() []string {
 func prerequisiteNativeCommand(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	argv := []string{"-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com"}
 	argv = append(argv, args...)
-	cmd := exec.CommandContext(ctx, "git", argv...) //nolint:gosec // G702: literal Git subcommands and runtime-owned fixture arguments; no shell.
+	cmd := exec.CommandContext(ctx, "git", argv...) // #nosec G702 -- Literal Git subcommands and runtime-owned fixture arguments; no shell.
 	cmd.Dir = dir
 	cmd.Env = prerequisiteNativeEnv()
 	return cmd.CombinedOutput()
@@ -295,7 +295,7 @@ func newPrerequisiteNativeFixture(t *testing.T, two bool) *prerequisiteNativeFix
 	m.repo.WebUrl, m.conn.BaseUrl = server.URL+"/forge", server.URL
 	s.SetForgeBaseURLAllowed(func(base string) bool { return base == server.URL })
 	s.SetPrerequisiteStore(&prerequisiteNativeStore{m}, m.transaction)
-	builder.f = &prerequisiteTestForge{compare: func(ctx context.Context, _ int64, head, sha string) (forge.Ancestry, error) {
+	builder.f = &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, m), compare: func(ctx context.Context, _ int64, head, sha string) (forge.Ancestry, error) {
 		x.compares++
 		if m.inTX.Load() {
 			t.Error("native ancestry proof inside transaction")

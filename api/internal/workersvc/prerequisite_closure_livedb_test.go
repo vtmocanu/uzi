@@ -110,7 +110,7 @@ func (f *prerequisiteExecutorLiveDB) expireCaptureLiveDB(t *testing.T) {
 func TestPrerequisiteRepeatedPrepareBudgetExhaustionLiveDB(t *testing.T) {
 	f := newPrerequisiteExecutorLiveDB(t, 6)
 	proofs := 0
-	f.builder.f = &prerequisiteTestForge{compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
+	f.builder.f = &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, f.m), compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
 		proofs++
 		f.advanceLiveDB(t, 750*time.Millisecond)
 		return forge.AncestryAncestor, nil
@@ -154,7 +154,7 @@ func TestPrerequisiteNoBudgetNoAttemptThenFullTurnLiveDB(t *testing.T) {
 
 func TestPrerequisiteReservationRaceAtSevenLiveDB(t *testing.T) {
 	f := newPrerequisiteExecutorLiveDB(t, 1)
-	f.builder.f = &prerequisiteTestForge{compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
+	f.builder.f = &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, f.m), compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
 		return forge.AncestryUnknown, nil
 	}}
 	for i := 0; i < 7; i++ {
@@ -168,7 +168,7 @@ func TestPrerequisiteReservationRaceAtSevenLiveDB(t *testing.T) {
 		bounded bool
 	}
 	stale := make(chan staleResult, 2)
-	f.builder.f = &prerequisiteTestForge{compare: func(ctx context.Context, _ int64, _, _ string) (forge.Ancestry, error) {
+	f.builder.f = &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, f.m), compare: func(ctx context.Context, _ int64, _, _ string) (forge.Ancestry, error) {
 		deadline, ok := ctx.Deadline()
 		result := staleResult{bounded: ok && time.Until(deadline) <= time.Second}
 		result.row, result.err = f.env.q.GetPrerequisiteClosure(ctx, store.GetPrerequisiteClosureParams{
@@ -241,7 +241,7 @@ func TestPrerequisiteTwoProcessesOneMarkerLiveDB(t *testing.T) {
 	other.SetForgeBaseURLAllowed(func(string) bool { return true })
 	// A shared builder is protected because two executors can prepare concurrently.
 	var builds atomic.Int32
-	builder := &prerequisiteConcurrentBuilder{f: &prerequisiteTestForge{compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
+	builder := &prerequisiteConcurrentBuilder{f: &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, f.m), compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
 		builds.Add(1)
 		return forge.AncestryAncestor, nil
 	}}}

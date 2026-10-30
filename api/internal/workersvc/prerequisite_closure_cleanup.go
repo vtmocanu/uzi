@@ -6,17 +6,24 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-func (s *Service) prerequisiteList(ctx context.Context, b prerequisiteBinding, row store.RecoveryPrerequisiteClosure, end time.Time) (string, bool, error) {
+func (s *Service) prerequisiteList(ctx context.Context, b prerequisiteBinding, driver forge.Forge, row store.RecoveryPrerequisiteClosure, end time.Time) (string, bool, error) {
 	if ctx.Err() != nil || end.Sub(s.now()) <= 1500*time.Millisecond {
 		return "", false, context.DeadlineExceeded
 	}
-	c, cc := prerequisiteExternalContext(ctx, s, end, 1500*time.Millisecond)
+	c, cc := prerequisiteExternalContext(pushbroker.WithoutRedirects(ctx), s, end, 1500*time.Millisecond)
 	defer cc()
+	if err := b.validate(c, driver); err != nil {
+		return "", false, err
+	}
 	tips, err := pushbroker.ListRefTips(c, pushbroker.ListRefsOptions{CloneURL: b.clone, Username: b.connection.BotUsername, PAT: b.pat}, row.PinRef)
+	if identityErr := b.validate(c, driver); identityErr != nil {
+		return "", false, identityErr
+	}
 	tip, ok := tips[row.PinRef]
 	return tip, ok, err
 }
@@ -28,7 +35,12 @@ func (s *Service) prerequisiteReconcile(ctx context.Context, q PrerequisiteStore
 	var tip string
 	var present bool
 	if err == nil && b.frozen(row) {
-		tip, present, err = s.prerequisiteList(ctx, b, row, end)
+		driver, buildErr := s.prerequisiteDriver(b)
+		if buildErr != nil {
+			err = buildErr
+		} else {
+			tip, present, err = s.prerequisiteList(ctx, b, driver, row, end)
+		}
 	} else {
 		err = errors.New("prerequisite: frozen binding unavailable")
 	}
@@ -96,7 +108,11 @@ func (s *Service) prerequisitePinned(ctx context.Context, q PrerequisiteStore, r
 	if err != nil || !b.frozen(row) {
 		return s.prerequisitePinnedRetry(ctx, row, p, false)
 	}
-	tip, present, err := s.prerequisiteList(ctx, b, row, end)
+	driver, err := s.prerequisiteDriver(b)
+	if err != nil {
+		return s.prerequisitePinnedRetry(ctx, row, p, false)
+	}
+	tip, present, err := s.prerequisiteList(ctx, b, driver, row, end)
 	if err != nil {
 		return s.prerequisitePinnedRetry(ctx, row, p, false)
 	}
@@ -164,11 +180,23 @@ func (s *Service) prerequisitePinned(ctx context.Context, q PrerequisiteStore, r
 		return 0, err
 	}
 	row = reserved
-	d, dc := context.WithTimeout(ctx, max(time.Duration(0), end.Sub(s.now())-2500*time.Millisecond))
+	fresh, e = s.prerequisiteBinding(ctx, q, row, false)
+	if e != nil || !b.same(fresh) {
+		return s.prerequisitePinnedRetry(ctx, row, p, true)
+	}
+	d, dc := context.WithTimeout(pushbroker.WithoutRedirects(ctx), max(time.Duration(0), end.Sub(s.now())-2500*time.Millisecond))
+	if err := b.validate(d, driver); err != nil {
+		dc()
+		return s.prerequisitePinnedRetry(ctx, row, p, true)
+	}
 	_ = pushbroker.Delete(d, pushbroker.DeleteOptions{CloneURL: b.clone, Username: b.connection.BotUsername, PAT: b.pat, Ref: row.PinRef, ExpectedOldTip: row.PinTip.String})
+	identityErr := b.validate(d, driver)
 	dc()
+	if identityErr != nil {
+		return s.prerequisitePinnedRetry(ctx, row, p, true)
+	}
 	// Delete returning nil is not absence (a moved tip deliberately returns nil).
-	tip, present, err = s.prerequisiteList(ctx, b, row, end)
+	tip, present, err = s.prerequisiteList(ctx, b, driver, row, end)
 	if err == nil && !present {
 		return s.prerequisiteDeleted(ctx, row, p, true)
 	}

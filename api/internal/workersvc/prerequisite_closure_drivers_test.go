@@ -137,22 +137,25 @@ func newPrerequisiteDriverFixture(t *testing.T, c prerequisiteDriverCase) *prere
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	upload := prerequisiteDriverEntry("GET", "/acme/widgets.git/info/refs", "service=git-upload-pack")
-	f.want = append(f.want, upload)
 	prefix := "/api/v3"
 	if c.kind == "forgejo" {
 		prefix = "/api/v1"
 	}
-	if c.kind != "gitlab" {
-		lookup := f.expect(prefix+"/repositories/1", "", `{"name":"widgets","owner":{"login":"acme"}}`)
-		switch c.mode {
-		case "lookup-error":
-			f.replies[lookup] = prerequisiteDriverReply{status: http.StatusNotFound, body: `{}`}
-			return f
-		case "lookup-redirect":
-			f.replies[lookup] = prerequisiteDriverReply{status: http.StatusFound, location: server.URL + "/lookup-target"}
-			f.expect("/lookup-target", "", `{"name":"widgets","owner":{"login":"acme"}}`)
-		}
+	lookupPath := prefix + "/repositories/1"
+	metadata := fmt.Sprintf(`{"id":1,"name":"widgets","full_name":"acme/widgets","path":"widgets","path_with_namespace":"acme/widgets","web_url":%q,"html_url":%q,"namespace":{"full_path":"acme"},"owner":{"login":"acme"}}`, m.repo.WebUrl, m.repo.WebUrl)
+	if c.kind == "gitlab" {
+		lookupPath = "/api/v4/projects/1"
 	}
+	lookup := f.expect(lookupPath, "", metadata)
+	switch c.mode {
+	case "lookup-error":
+		f.replies[lookup] = prerequisiteDriverReply{status: http.StatusNotFound, body: `{}`}
+		return f
+	case "lookup-redirect":
+		f.replies[lookup] = prerequisiteDriverReply{status: http.StatusFound, location: server.URL + "/lookup-target"}
+		f.replies["GET /lookup-target"] = prerequisiteDriverReply{body: metadata}
+	}
+	f.want = append(f.want, upload, lookup)
 	for i, sha := range m.row.PrerequisiteShas {
 		var key string
 		switch c.kind {
@@ -198,11 +201,22 @@ func newPrerequisiteDriverFixture(t *testing.T, c prerequisiteDriverCase) *prere
 				}
 			}
 		}
+		f.want = append(f.want, lookup)
 	}
 	if c.state == "pinned" {
-		f.want = append(f.want,
+		f.want = append(f.want, lookup,
 			prerequisiteDriverEntry("GET", "/acme/widgets.git/info/refs", "service=git-receive-pack"),
-			"POST /acme/widgets.git/git-receive-pack", upload)
+			"POST /acme/widgets.git/git-receive-pack", upload, lookup)
+	}
+	if c.mode == "lookup-redirect" {
+		expanded := make([]string, 0, len(f.want)*2)
+		for _, key := range f.want {
+			expanded = append(expanded, key)
+			if key == lookup {
+				expanded = append(expanded, "GET /lookup-target")
+			}
+		}
+		f.want = expanded
 	}
 	return f
 }
@@ -219,8 +233,8 @@ func (f *prerequisiteDriverFixture) sweep(t *testing.T, c prerequisiteDriverCase
 	got := append([]string(nil), f.entries...)
 	f.mu.Unlock()
 	// Traffic is the primary cache/reuse instrument, before factory call counts.
-	if len(got) != c.count*attempt {
-		t.Fatalf("HTTP requests=%d want=%d (attempt %d)", len(got), c.count*attempt, attempt)
+	if len(got) != len(f.want)*attempt {
+		t.Fatalf("HTTP requests=%d want=%d (attempt %d); got %v", len(got), len(f.want)*attempt, attempt, got)
 	}
 	want := make([]string, 0, len(f.want)*attempt)
 	for i := 0; i < attempt; i++ {
@@ -312,8 +326,8 @@ func TestPrerequisiteRealDriverDiscriminatingTail(t *testing.T) {
 func TestPrerequisiteRealDriverRedirectsAndLookupErrors(t *testing.T) {
 	const unknown = "prerequisite_ancestry_unknown"
 	cases := []prerequisiteDriverCase{
-		{kind: "github", n: 1, mode: "lookup-redirect", count: 7, state: "pinned"},
-		{kind: "forgejo", n: 1, mode: "lookup-redirect", count: 8, state: "pinned"},
+		{kind: "github", n: 1, mode: "lookup-redirect", count: 15, state: "pinned"},
+		{kind: "forgejo", n: 1, mode: "lookup-redirect", count: 15, state: "pinned"},
 		{kind: "github", n: 1, mode: "lookup-error", count: 2, state: "pending", reason: unknown},
 		{kind: "forgejo", n: 1, mode: "lookup-error", count: 2, state: "pending", reason: unknown},
 		{kind: "github", n: 1, mode: "compare-redirect", count: 3, state: "pending", reason: unknown},

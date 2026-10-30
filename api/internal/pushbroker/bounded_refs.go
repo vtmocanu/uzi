@@ -108,6 +108,7 @@ func boundedRefTips(ctx context.Context, url string, auth transport.AuthMethod, 
 		// NewEndpoint(URL) cannot set TLS/proxy options requiring go-git's
 		// concrete *http.Transport assertion. Retain the broker pool and policy.
 		copied := *brokerHTTPClient
+		copied.CheckRedirect = func(req *http.Request, via []*http.Request) error { return checkRedirect(ctx, req, via) }
 		copied.Transport = refAdvertisementTransport{original: brokerHTTPClient.Transport}
 		c = githttp.NewClient(&copied)
 	} else {

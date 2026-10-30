@@ -44,7 +44,7 @@ func TestPrerequisiteIneligibleBeforeAncestryLiveDB(t *testing.T) {
 				}
 			}
 			compares := 0
-			f.builder.f = &prerequisiteTestForge{compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
+			f.builder.f = &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, f.m), compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
 				compares++
 				return forge.AncestryUnknown, nil
 			}}

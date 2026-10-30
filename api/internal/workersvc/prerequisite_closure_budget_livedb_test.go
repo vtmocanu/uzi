@@ -48,7 +48,7 @@ func TestPrerequisiteEarlierItemsDeferLatePreparationLiveDB(t *testing.T) {
 	}
 	proofs := 0
 	perSHA := map[string]int{}
-	f.builder.f = &prerequisiteTestForge{compare: func(_ context.Context, _ int64, _, sha string) (forge.Ancestry, error) {
+	f.builder.f = &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, f.m), compare: func(_ context.Context, _ int64, _, sha string) (forge.Ancestry, error) {
 		proofs++
 		perSHA[sha]++
 		if slices.Contains(earlySHAs, sha) {

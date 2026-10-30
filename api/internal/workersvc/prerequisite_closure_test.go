@@ -27,7 +27,29 @@ const prerequisiteTestTip = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 type prerequisiteTestForge struct {
 	forgetest.BaseFake
-	compare func(context.Context, int64, string, string) (forge.Ancestry, error)
+	getProject func(context.Context, int64) (forge.Project, error)
+	compare    func(context.Context, int64, string, string) (forge.Ancestry, error)
+}
+
+func (f *prerequisiteTestForge) GetProject(ctx context.Context, id int64) (forge.Project, error) {
+	if f.getProject == nil {
+		return f.BaseFake.GetProject(ctx, id)
+	}
+	return f.getProject(ctx, id)
+}
+
+func prerequisiteProjectStub(t *testing.T, m *prerequisiteMemory) func(context.Context, int64) (forge.Project, error) {
+	t.Helper()
+	return func(ctx context.Context, id int64) (forge.Project, error) {
+		if m.inTX.Load() {
+			t.Error("project lookup in transaction")
+		}
+		if id != m.repo.ForgeProjectID {
+			t.Errorf("lookup ID=%d want=%d", id, m.repo.ForgeProjectID)
+		}
+		u := strings.TrimPrefix(strings.TrimPrefix(m.repo.WebUrl, m.conn.BaseUrl), "/")
+		return forge.Project{ForgeProjectID: id, PathWithNamespace: strings.TrimSuffix(u, "/"), WebURL: m.repo.WebUrl}, ctx.Err()
+	}
 }
 
 func (f *prerequisiteTestForge) CompareAncestry(c context.Context, p int64, h, s string) (forge.Ancestry, error) {
@@ -305,7 +327,7 @@ func newPrerequisiteMemory(t *testing.T, n int) (*Service, *prerequisiteMemory, 
 	s.SetPrerequisiteStore(m, m.transaction)
 	s.SetClock(func() time.Time { return m.now })
 	s.SetForgeBaseURLAllowed(func(string) bool { return true })
-	b := &prerequisiteTestBuilder{f: &prerequisiteTestForge{compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
+	b := &prerequisiteTestBuilder{f: &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, m), compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
 		return forge.AncestryAncestor, nil
 	}}}
 	s.SetForges(b)
@@ -325,7 +347,7 @@ func TestPrerequisiteEveryDeclaredAncestor(t *testing.T) {
 			t.Run(fmt.Sprintf("%d/%s", n, tail), func(t *testing.T) {
 				s, m, h, b := newPrerequisiteMemory(t, n)
 				var got []string
-				b.f = &prerequisiteTestForge{compare: func(ctx context.Context, _ int64, head, sha string) (forge.Ancestry, error) {
+				b.f = &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, m), compare: func(ctx context.Context, _ int64, head, sha string) (forge.Ancestry, error) {
 					if m.inTX.Load() {
 						t.Error("proof in transaction")
 					}
@@ -368,7 +390,7 @@ func TestPrerequisiteEveryDeclaredAncestor(t *testing.T) {
 
 func TestPrerequisiteRepeatedPrepareBudgetExhaustion(t *testing.T) {
 	s, m, h, b := newPrerequisiteMemory(t, 6)
-	b.f = &prerequisiteTestForge{compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
+	b.f = &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, m), compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
 		m.now = m.now.Add(750 * time.Millisecond)
 		return forge.AncestryAncestor, nil
 	}}
@@ -419,7 +441,7 @@ func TestPrerequisiteMarkerEligibilityAndLockOrder(t *testing.T) {
 				m.hold.State = "released"
 			}
 			if mode == "binding-changed" {
-				b.f = &prerequisiteTestForge{compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
+				b.f = &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, m), compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
 					m.repo.DefaultBranch = prerequisiteText("other")
 					return forge.AncestryAncestor, nil
 				}}
@@ -456,7 +478,7 @@ func TestPrerequisiteIneligibleBeforeAncestry(t *testing.T) {
 				m.missingRun = true
 			}
 			compares := 0
-			b.f = &prerequisiteTestForge{compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
+			b.f = &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, m), compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
 				compares++
 				return forge.AncestryUnknown, nil
 			}}

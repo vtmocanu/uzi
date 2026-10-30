@@ -255,7 +255,7 @@ func TestPrerequisiteInterruptedEighthAttemptDoesNotProveAgain(t *testing.T) {
 func TestPrerequisiteKickSlotAndDrain(t *testing.T) {
 	s, m, _, b := newPrerequisiteMemory(t, 1)
 	entered := make(chan struct{})
-	b.f = &prerequisiteTestForge{compare: func(ctx context.Context, _ int64, _, _ string) (forge.Ancestry, error) {
+	b.f = &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, m), compare: func(ctx context.Context, _ int64, _, _ string) (forge.Ancestry, error) {
 		close(entered)
 		<-ctx.Done()
 		return forge.AncestryUnknown, ctx.Err()

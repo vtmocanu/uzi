@@ -55,7 +55,6 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/httptransport"
 	"github.com/vtmocanu/uzi/api/internal/packbudget"
-	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
 
 // Options carries everything a publish needs. Every field is derived by the caller
@@ -1285,7 +1284,7 @@ var brokerHTTPClient = &http.Client{
 	// Explicit, not nil: go-git type-asserts *http.Transport when an endpoint carries
 	// TLS or proxy options.
 	Transport:     httptransport.New(http.DefaultTransport),
-	CheckRedirect: redirectguard.SameOrigin,
+	CheckRedirect: CheckRedirect,
 }
 
 // httpTransport is the go-git smart-HTTP transport every broker operation uses.

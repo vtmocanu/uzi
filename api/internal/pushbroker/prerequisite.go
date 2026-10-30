@@ -3,6 +3,7 @@ package pushbroker
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync/atomic"
 	"time"
 
@@ -140,9 +141,10 @@ func openPrereqReceive(ctx context.Context, url string, auth transport.AuthMetho
 		return nil, nil, err
 	}
 	var c transport.Transport
-	http := ep.Protocol == "http" || ep.Protocol == "https"
-	if http {
+	isHTTP := ep.Protocol == "http" || ep.Protocol == "https"
+	if isHTTP {
 		copied := *brokerHTTPClient
+		copied.CheckRedirect = func(req *http.Request, via []*http.Request) error { return checkRedirect(ctx, req, via) }
 		copied.Transport = &rawReportRoundTripper{original: refAdvertisementTransport{original: brokerHTTPClient.Transport}, report: raw}
 		c = githttp.NewClient(&copied)
 	} else {
@@ -158,7 +160,7 @@ func openPrereqReceive(ctx context.Context, url string, auth transport.AuthMetho
 	fail := func(err error) (transport.ReceivePackSession, *packp.AdvRefs, error) {
 		return nil, nil, errors.Join(err, sess.Close())
 	}
-	if !http {
+	if !isHTTP {
 		if err := boundRefStdout(sess); err != nil {
 			return fail(err)
 		}
@@ -167,7 +169,7 @@ func openPrereqReceive(ctx context.Context, url string, auth transport.AuthMetho
 	if err != nil {
 		return fail(err)
 	}
-	if !http {
+	if !isHTTP {
 		if err := attachRawStdout(sess, raw); err != nil {
 			return fail(err)
 		}

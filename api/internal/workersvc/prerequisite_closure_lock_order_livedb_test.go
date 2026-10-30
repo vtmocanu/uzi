@@ -126,7 +126,7 @@ func m3StageBuilder(t *testing.T, ctx context.Context, f *prerequisiteExecutorLi
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
-		return &prerequisiteTestForge{compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
+		return &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, f.m), compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
 			if tx.active.Load() {
 				return forge.AncestryUnknown, io.ErrUnexpectedEOF
 			}

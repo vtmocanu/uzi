@@ -173,9 +173,13 @@ func (q *prerequisiteHandoffStore) DeferPrerequisiteReconciliation(ctx context.C
 		q.t.Errorf("detached outcome already canceled: %v", err)
 		return 0, err
 	}
-	// Four candidates make a widened admission budget observable. Each admitted
-	// outcome consumes 4.999 virtual seconds while honoring its real context.
-	timer := time.NewTimer(4999 * time.Millisecond)
+	// Four candidates make a widened admission budget observable. The first two
+	// outcomes cost 3.2s each, and the third costs 4.999s, honoring real contexts.
+	cost := 4999 * time.Millisecond
+	if index < 2 {
+		cost = 3200 * time.Millisecond
+	}
+	timer := time.NewTimer(cost)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -259,7 +263,7 @@ func TestPrerequisiteClosureRealServiceHandoff(t *testing.T) {
 					if !slices.Equal(q.captureLocks, wantCaptures) {
 						t.Fatalf("capture locks = %v, want %v", q.captureLocks, wantCaptures)
 					}
-					for i, want := range []time.Duration{4999 * time.Millisecond, 9998 * time.Millisecond, 14997 * time.Millisecond} {
+					for i, want := range []time.Duration{3200 * time.Millisecond, 6400 * time.Millisecond, 11399 * time.Millisecond} {
 						if got := q.finished[i].Sub(start.Add(2 * time.Second)); got != want {
 							t.Errorf("outcome %d finished at %v after prior pass, want %v", i, got, want)
 						}
@@ -268,8 +272,8 @@ func TestPrerequisiteClosureRealServiceHandoff(t *testing.T) {
 						t.Fatalf("liveness calls: mark = %d, wall = %d", liveness.markCalls, liveness.wallCalls)
 					}
 					afterPrior := liveness.handoff.Sub(start.Add(2 * time.Second))
-					if afterPrior != 14997*time.Millisecond || afterPrior > 15*time.Second {
-						t.Errorf("run-liveness handoff after prior pass = %v, want 14.997s and <=15s", afterPrior)
+					if afterPrior != 11399*time.Millisecond || afterPrior > 15*time.Second {
+						t.Errorf("run-liveness handoff after prior pass = %v, want 11.399s and <=15s", afterPrior)
 					}
 					if mode == "outcome_error" && q.returnedErrors != 3 {
 						t.Errorf("controlled outcome errors returned = %d, want 3", q.returnedErrors)

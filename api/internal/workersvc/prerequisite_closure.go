@@ -3,7 +3,6 @@ package workersvc
 import (
 	"context"
 	"errors"
-	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -298,9 +297,12 @@ func (s *Service) prerequisiteBinding(ctx context.Context, q PrerequisiteStore, 
 	if err != nil {
 		return prerequisiteBinding{}, err
 	}
-	b := prerequisiteBinding{repo: repo, connection: conn, clone: repo.WebUrl + ".git"}
-	cloneURL, err := url.Parse(b.clone)
-	if err != nil || cloneURL.Host == "" || (cloneURL.Scheme != "https" && cloneURL.Scheme != "http") || s.forgeBaseURLAllowed == nil || !s.forgeBaseURLAllowed(conn.BaseUrl) || !s.forgeBaseURLAllowed(cloneURL.Scheme+"://"+cloneURL.Host) {
+	b := prerequisiteBinding{repo: repo, connection: conn, clone: strings.TrimSuffix(repo.WebUrl, "/") + ".git"}
+	repoURL, err := prerequisiteURL(repo.WebUrl)
+	_, baseErr := prerequisiteURL(conn.BaseUrl)
+	if err != nil || baseErr != nil || repo.ForgeProjectID <= 0 || repoURL.Path == "" || repoURL.Path == "/" ||
+		s.forgeBaseURLAllowed == nil || !s.forgeBaseURLAllowed(conn.BaseUrl) ||
+		!s.forgeBaseURLAllowed(repoURL.Scheme+"://"+repoURL.Host) {
 		return prerequisiteBinding{}, errors.New("prerequisite: forge URL not allowed")
 	}
 	if decrypt {
@@ -400,7 +402,7 @@ func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, 
 	}
 	// The actual ForgeBuilder interface decrypts the sealed connection. The URL
 	// gate above must precede both that builder and the broker credential decrypt.
-	driver, err := s.forges.ForgeForConnection(b.connection.ForgeType, b.connection.BaseUrl, b.connection.TokenCiphertext)
+	driver, err := s.prerequisiteDriver(b)
 	if err != nil {
 		return retry(false)
 	}
@@ -410,11 +412,19 @@ func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, 
 	}
 	proof, pc := context.WithTimeout(ctx, max(time.Duration(0), proofEnd.Sub(s.now())))
 	defer pc()
-	op, oc := prerequisiteExternalContext(proof, s, proofEnd, 0)
+	op, oc := prerequisiteExternalContext(pushbroker.WithoutRedirects(proof), s, proofEnd, 0)
+	if err := b.validate(op, driver); err != nil {
+		oc()
+		return retry(false)
+	}
 	prepared, err := pushbroker.PreparePrereqCreate(op, pushbroker.PrereqCreateOptions{
 		CloneURL: b.clone, Username: b.connection.BotUsername, PAT: b.pat, DefaultBranch: b.repo.DefaultBranch.String, CaptureID: row.CaptureID,
 	})
+	identityErr := b.validate(op, driver)
 	oc()
+	if identityErr != nil {
+		return retry(false)
+	}
 	if errors.Is(err, pushbroker.ErrRefExists) {
 		return refuse("pin_foreign")
 	}
@@ -431,7 +441,11 @@ func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, 
 		}
 		op, oc := prerequisiteExternalContext(proof, s, proofEnd, 0)
 		a, e := driver.CompareAncestry(op, b.repo.ForgeProjectID, prepared.Tip(), sha)
+		identityErr := b.validate(op, driver)
 		oc()
+		if identityErr != nil {
+			return retry(false)
+		}
 		if e != nil || a == forge.AncestryUnknown {
 			return retry(false)
 		}
@@ -532,8 +546,15 @@ func (s *Service) prerequisitePrepare(ctx context.Context, q PrerequisiteStore, 
 	if err != nil || !b.same(fresh) || ctx.Err() != nil || end.Sub(s.now()) < 3500*time.Millisecond {
 		return 1, nil
 	}
-	send, sc := context.WithTimeout(ctx, max(time.Duration(0), end.Sub(s.now())-1500*time.Millisecond))
+	send, sc := context.WithTimeout(pushbroker.WithoutRedirects(ctx), max(time.Duration(0), end.Sub(s.now())-1500*time.Millisecond))
+	if err := b.validate(send, driver); err != nil {
+		sc()
+		return 1, nil
+	}
 	outcome, _ := pushbroker.SendPrereqCreate(send, prepared)
+	if err := b.validate(send, driver); err != nil {
+		outcome = pushbroker.PrereqCreateUnknown
+	}
 	sc()
 	return s.prerequisiteOutcome(ctx, row, p, func(w context.Context, tx PrerequisiteStore) (int64, error) {
 		switch outcome {
