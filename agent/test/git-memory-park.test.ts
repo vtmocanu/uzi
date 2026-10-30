@@ -249,6 +249,23 @@ describe("recordMemoryPark durability: two phases, each under the bare lock", ()
     assert.equal(await confirmedRead(), undefined);
   });
 
+  it("a signal aborted during phase 2 whose phase 2 then fails still reverts: unconfirmed and confirmed:false is stored", async () => {
+    const abort = new AbortController();
+    let syncs = 0;
+    const out = await cache.recordMemoryPark(bare, BRANCH, expected(), settled(), {
+      signal: abort.signal,
+      sync: async (h, what) => {
+        // Sync calls 1-2 are phase 1 (config, directory); call 3 is phase 2's config fsync.
+        if (++syncs === 3 && what === "config") { abort.abort(); throw new Error("injected phase 2 sync failure"); }
+        await h.sync();
+      },
+    });
+    assert.equal(out, "unconfirmed");
+    assert.equal(syncs, 3, "phase 2 got its lock and failed at its config fsync");
+    assert.equal(stored().settlement?.confirmed, false, "the revert ran although the signal was already aborted");
+    assert.equal(await confirmedRead(), undefined);
+  });
+
   it("an already aborted signal forfeits the lock hold: nothing is written", async () => {
     const before = configBytes();
     await assert.rejects(cache.recordMemoryPark(bare, BRANCH, expected(), settled(), { signal: AbortSignal.abort() }));
@@ -460,6 +477,18 @@ describe("memoryPark carry and retire inventory", () => {
     assert.equal(JSON.stringify(descriptor.journal.memoryPark), original());
     // D4 discovery reads only the active key: the descriptor is preserved, not consumed.
     assert.equal(await cache.discoverRetainedRecovery(fx.originPath, BRANCH, KEY, RUN), undefined);
+  });
+
+  it("an active journal equal to its protected descriptor is never rewritten by the producer", async () => {
+    await cache.reserveRecoveryIteration(bare, BRANCH, KEY, sourceOf());
+    const raw = rawJournal();
+    gitIn(bare, ["config", `uzi-retained.${RUN}.journal`, JSON.stringify({ version: 1, branch: BRANCH, key: KEY, journal: journal() })]);
+    const before = configBytes();
+    for (const record of [unsettled(), settled()]) {
+      assert.equal(await cache.recordMemoryPark(bare, BRANCH, expected(), record), "unconfirmed");
+      assert.deepEqual(configBytes(), before, "nothing was written");
+      assert.equal(rawJournal(), raw);
+    }
   });
 
   it("a stopped canonical marker never acquires the record, and its absence authorizes nothing", async () => {

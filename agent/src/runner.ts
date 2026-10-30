@@ -21521,8 +21521,12 @@ export class RunRunner {
           { signal: give.signal }),
         new Promise<"timeout">(resolve => { timer = setTimeout(() => { give.abort(); resolve("timeout"); }, this.codexBoundaryDeadlineMs); }),
       ]);
-      if (written === "timeout") runLog.warn("memory park record is still being written; the park stays unqualified until it lands");
-      else if (written === "unconfirmed") runLog.warn("memory park settlement could not be confirmed; the park stays unqualified");
+      if (written === "timeout") runLog.warn("memory park record write timed out and the producer was aborted; the park stays unqualified");
+      else if (written === "unconfirmed") {
+        runLog.warn(record.settlement
+          ? "memory park settlement could not be confirmed; the park stays unqualified"
+          : "memory park record not confirmed; the park stays unqualified");
+      }
     } catch (error) {
       runLog.warn("memory park record not written; the park stays unqualified", { error: errMessage(error) });
     } finally {

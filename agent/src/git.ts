@@ -1754,7 +1754,7 @@ function serializeMemoryPark(record: MemoryParkRecord): string {
 export interface MemoryParkDurability {
   sync?: (handle: { sync(): Promise<void> }, what: "config" | "directory") => Promise<void>;
   readback?: (read: () => Promise<string | undefined>) => Promise<string | undefined>;
-  /** Forfeits a bare-lock wait that has not been granted yet, and (for the writer) a phase that has not started. */
+  /** Forfeits pending writer lock holds (not yet granted) and a phase 2 that has not started; never the failed-phase-2 revert. */
   signal?: AbortSignal;
 }
 
@@ -6947,8 +6947,9 @@ export class GitCache {
    * `settlement.confirmed` on the input is ignored: the writer owns that flag.
    *
    * A journal bound by a stopped marker (even one whose clear failed) or shadowed by a protected descriptor is never
-   * rewritten: nothing is written, the refusal is logged and `unconfirmed` is returned. `opts.signal` forfeits a lock
-   * hold not yet granted and stops phase 2 from starting once aborted (a phase-1 draft stays `confirmed: false`).
+   * rewritten: nothing is written, the refusal is logged and `unconfirmed` is returned. `opts.signal` forfeits a
+   * phase-1 or phase-2 lock hold not yet granted and stops phase 2 from starting once aborted (a phase-1 draft stays
+   * `confirmed: false`); it never applies to the best-effort revert hold, which always runs.
    */
   async recordMemoryPark(
     barePath: string, branch: string, expected: { runId: string; clonePath: string; attemptId?: string },
@@ -6960,7 +6961,7 @@ export class GitCache {
       ? { ...incoming, settlement: { ...incoming.settlement, confirmed } } : incoming;
     const draft = withFlag(false);
     const final = withFlag(true);
-    const section = <T>(fn: (stored: { journal: RecoveryJournalEntry; raw: string }) => Promise<T>): Promise<T> =>
+    const section = <T>(fn: (stored: { journal: RecoveryJournalEntry; raw: string }) => Promise<T>, signal: AbortSignal | null = opts.signal ?? null): Promise<T> =>
       this.withLock(barePath, async () => {
         await this.assertRecoveryBare(barePath);
         const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
@@ -6980,7 +6981,7 @@ export class GitCache {
           throw new MemoryParkRefusal("memory park source has a protected descriptor");
         }
         return fn(stored);
-      }, opts.signal);
+      }, signal ?? undefined);
     /** Write `target` unless the stored bytes already are exactly it, then ALWAYS sync and read back. */
     const commit = async (stored: { journal: RecoveryJournalEntry; raw: string }, target: MemoryParkRecord): Promise<void> => {
       const wanted = recoveryJournalJson({ ...stored.journal, memoryPark: target });
@@ -7038,7 +7039,7 @@ export class GitCache {
           if (stored.journal.memoryPark !== undefined && serializeMemoryPark(stored.journal.memoryPark) === serializeMemoryPark(final)) {
             await this.writeRecovery(barePath, branch, { ...stored.journal, memoryPark: draft });
           }
-        });
+        }, null); // the revert never takes the caller's signal: an aborted producer must not leave confirmed:true readable
       } catch { /* best effort: a readable confirmed:true still needs readConfirmedMemoryPark */ }
       return "unconfirmed";
     }
