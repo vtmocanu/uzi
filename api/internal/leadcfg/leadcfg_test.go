@@ -274,7 +274,7 @@ func TestValidateReportShapes(t *testing.T) {
 		"empty model":              {func(r *apitypes.LeadConfigReportRequest) { r.RequestedModel = s("  ") }, "requested_model"},
 		"101 byte model":           {func(r *apitypes.LeadConfigReportRequest) { r.RequestedModel = s(strings.Repeat("m", 101)) }, "requested_model"},
 		"control char model":       {func(r *apitypes.LeadConfigReportRequest) { r.RequestedModel = s("op\nus") }, "requested_model"},
-		"bidi model":               {func(r *apitypes.LeadConfigReportRequest) { r.RequestedModel = s("op‮us") }, "requested_model"},
+		"bidi model":               {func(r *apitypes.LeadConfigReportRequest) { r.RequestedModel = s("op\u202eus") }, "requested_model"},
 		"spaced model":             {func(r *apitypes.LeadConfigReportRequest) { r.RequestedModel = s("op us") }, "requested_model"},
 		"null model not builtin":   {func(r *apitypes.LeadConfigReportRequest) { r.RequestedModel = nil }, "requested_model"},
 		"bad model source":         {func(r *apitypes.LeadConfigReportRequest) { r.RequestedModelSource = "instance_default" }, "requested_model_source"},

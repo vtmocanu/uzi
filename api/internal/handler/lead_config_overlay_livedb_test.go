@@ -155,8 +155,6 @@ func (e *leadOverlayEnv) seedTry(t *testing.T, o overlayRun) (uuid.UUID, error) 
 	return id, err
 }
 
-func sref(s string) *string { return &s }
-
 // post records one row through the worker route (the real handler, fence and refresh path).
 func (e *leadOverlayEnv) post(t *testing.T, run uuid.UUID, body string) *httptest.ResponseRecorder {
 	t.Helper()

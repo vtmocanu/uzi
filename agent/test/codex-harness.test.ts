@@ -6231,7 +6231,7 @@ describe("CodexHarness runtime config observation (PRD #3244 M2)", () => {
   });
 
   it("maps a model failing the stored-model rules to unknown", async () => {
-    const bad = ["has space", "tab\there", "bidi‮flip", "zero​width", "x".repeat(101), "", 42, null];
+    const bad = ["has space", "tab\there", "bidi\u202eflip", "zero\u200bwidth", "x".repeat(101), "", 42, null];
     for (const model of bad) {
       const { obs } = await observe({ model, reasoningEffort: "high" });
       assert.equal(obs[0]!.model, undefined, JSON.stringify(model));
