@@ -1288,12 +1288,13 @@ before any source inspection or source-dependent preflight, under the outer A:
   the existing receipt, custody, quarantine, live-execution, Docker, cancellation,
   identity and content safeguards still apply.
 
-Besides the boot sweep and the paced live pass, a successor claim on the same
-branch triggers it (amended 2026-10-29, nightly E2E #152): when the seed is
-refused because the journal names a completed owner, the claim drains that
-owner's execution tail (bounded), runs this same certified retirement under its
-own A, and reseeds once; when the proof is missing it keeps the unchanged
-fail-closed orphan reclaim. No check is relaxed and no force-clear is added.
+Besides the worker's boot sweep and paced live recovery passes
+(`RecoveryCoordinator`), a successor claim on the same branch triggers it
+(#3404 follow-up, 2026-10-29): when the seed is refused because the journal names
+a completed owner, the claim waits (bounded) for that owner's execution tail, runs
+this same certified retirement under its own A, and reseeds once; when the proof
+is missing it keeps the unchanged owner-derived orphan reclaim, which refuses a
+fenced source. No check is relaxed and no force-clear is added.
 
 Destruction is a **retiring** transaction. Before the first deletion the slot
 enters `retiring` with an authenticated manifest in deletion order (clone, fence,
