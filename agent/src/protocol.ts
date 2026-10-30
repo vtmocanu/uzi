@@ -954,6 +954,34 @@ export interface ClaimSecrets {
   codex?: ClaimCodexSecrets;
 }
 
+/** PRD #3244: provenance tokens of a lead agent's requested model / effort. Closed sets, pinned to
+ *  `vocabulary.model_sources` / `effort_sources` in fixtures/lead-config/contract.json (the Go
+ *  `leadcfg` package is the server twin). */
+export type LeadModelSource =
+  | "run_override" | "schedule_pin" | "user_planning_default" | "user_default" | "template" | "builtin";
+export type LeadEffortSource =
+  | "run_override" | "user_planning_default" | "user_default" | "template" | "builtin";
+
+/** PRD #3244: the body of POST /api/worker/runs/{id}/lead-config (api/internal/apitypes
+ *  LeadConfigReportRequest). The server schema is closed (unknown fields are a 400) and the four
+ *  observed fields are always sent, null until observed. */
+export interface LeadConfigReportBody {
+  claim_generation: number;
+  phase: "plan" | "implement";
+  phase_entry: number;
+  seq: number;
+  truncated: boolean;
+  requested_model: string | null;
+  requested_model_source: LeadModelSource;
+  requested_effort: string | null;
+  requested_effort_mode: "explicit" | "runtime_default";
+  requested_effort_source: LeadEffortSource;
+  observed_model: string | null;
+  observed_model_evidence: string | null;
+  observed_effort: string | null;
+  observed_effort_evidence: string | null;
+}
+
 /** Per-run caps the server may push down (PRD §Configuration). Advisory in M2.
  *  Field names + units match M1's claim.go: timeouts are in *seconds*; any
  *  future ms consumer converts at the use site. */
@@ -1004,6 +1032,12 @@ export interface ClaimConfig {
    *  Go `agenttmpl.EffortLevels` and the web EffortSelect list — no shared source, keep
    *  in lockstep). */
   default_effort?: EffortLevel;
+  /** PRD #3244: where `default_model` came from. Present only when `default_model` shipped on a
+   *  lead-lane claim; closed set pinned to fixtures/lead-config/contract.json. */
+  default_model_source?: LeadModelSource;
+  /** PRD #3244: where `default_effort` (or its absence) came from. Always present on a lead-lane
+   *  claim of an upgraded API, which makes it the worker's lead-config reporting activation signal. */
+  default_effort_source?: LeadEffortSource;
   /** The run owner's AI-attribution opt-out (issue #916), read live per claim. When
    *  false, the worker suppresses the Agent SDK's Co-Authored-By: Claude commit trailer
    *  for this run. Always sent by an upgraded server (NOT null); absent on an older

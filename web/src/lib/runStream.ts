@@ -124,11 +124,11 @@ export function applyFrame(
   if (frame.type === "state") {
     return { state, effects: { replay: true, refreshRun: true } };
   }
-  if (frame.type === "health") {
-    // A run-health flag changed (PRD #47). Like "state" it carries no authoritative
-    // data — re-read the run to pick up the (owner-gated) health fields. No replay:
-    // a health flip does not imply a dropped tail message, so unlike "state" it need
-    // not backfill the stream.
+  if (frame.type === "health" || frame.type === "refresh") {
+    // A run-health flag changed (PRD #47), or a lead-config row was stored (PRD #3244
+    // "refresh"). Like "state" it carries no authoritative data — re-read the run to pick up
+    // the (owner-gated) health fields or Run.lead_config. No replay: neither implies a
+    // dropped tail message, so unlike "state" it need not backfill the stream.
     return { state, effects: { replay: false, refreshRun: true } };
   }
   return { state, effects: { replay: false, refreshRun: false } };

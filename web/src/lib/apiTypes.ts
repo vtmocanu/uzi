@@ -5037,7 +5037,8 @@ export interface AgentSelectionInput {
 // reconciles by REST refetch (mount/reconnect/state/health), so a dropped frame
 // self-heals — its handling lands in M3.
 export interface WsEvent {
-  type: "message" | "state" | "health" | "input";
+  // "refresh" (PRD #3244) is data-less like "health": a stored lead-config row changed, so re-read.
+  type: "message" | "state" | "health" | "input" | "refresh";
   seq?: number;
   kind?: string;
   agent?: string | null;

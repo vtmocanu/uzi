@@ -1640,12 +1640,13 @@ describe("RunCompletedLine — the declared PRD-completion move (issue #150)", (
   });
 });
 
-// PRD #300: the frozen per-schedule model is shown in the STATUS-INDEPENDENT header
-// metadata row (a Badge), not in the completed-hero line — a wrong/typo'd model must be
-// visible on a FAILED or stopped run too (Risks / SC6). These render the whole page
-// (useRunStream mocked) so the header badge is exercised where it actually lives.
-describe("RunView header — the frozen per-schedule model badge (PRD #300)", () => {
-  const MODEL_BADGE_TITLE = "Model this run was fired with (frozen by its schedule)";
+// PRD #300 / PRD #3244: the lead chip (the schedule-frozen model, now rules 2 and 3 of the lead
+// display) sits in the STATUS-INDEPENDENT header metadata row, not in the completed-hero line —
+// a wrong/typo'd model must be visible on a FAILED or stopped run too (Risks / SC6). These render
+// the whole page (useRunStream mocked) so the header chip is exercised where it actually lives.
+describe("RunView header — the lead chip (PRD #3244 rules 2 and 3; PRD #300 schedule model)", () => {
+  const FOOTER = "This is the lead agent; subagents with their own pin may differ.";
+  const NO_ROWS = { applicable: true, claim_generation: 0, current: true, phases: [] };
 
   function renderPage(over: Partial<Run>) {
     mockUseRunStream.mockReturnValue({
@@ -1666,38 +1667,91 @@ describe("RunView header — the frozen per-schedule model badge (PRD #300)", ()
     );
   }
 
-  it("shows the model badge on a COMPLETED run", async () => {
-    const { container } = renderPage({
-      status: "completed",
-      model: "fable",
-      branch: "agent/issue-87",
-      mr_iid: 42,
-      mr_state: "merged",
-    });
-    expect(await screen.findByTitle(MODEL_BADGE_TITLE)).toBeTruthy();
-    expect(container.textContent).toContain("model fable");
+  // Rule 2: queued with a schedule pin.
+  it("shows the schedule-pinned model on a QUEUED run, labelled 'fixed by schedule'", async () => {
+    const { container } = renderPage({ status: "queued", harness: "codex", model: "gpt-6-astra", lead_config: NO_ROWS });
+    const chip = await screen.findByText("lead: gpt-6-astra · effort resolves at claim");
+    expect(chip.getAttribute("title")).toBe(`gpt-6-astra: fixed by schedule\n${FOOTER}`);
+    expect(chip.getAttribute("aria-label")).toContain("lead: gpt-6-astra · effort resolves at claim");
+    expect(chip.getAttribute("aria-label")).toContain("gpt-6-astra: fixed by schedule");
+    expect(chip.getAttribute("tabindex")).toBe("0");
     // The old completed-hero "Model <code>…</code>." clause is gone — no double render.
-    expect(container.textContent).not.toContain("Model fable");
+    expect(container.textContent).not.toContain("Model gpt-6-astra");
   });
 
-  it("shows the model badge on a FAILED run — the whole point of the header placement (SC6)", async () => {
-    const { container } = renderPage({ status: "failed", model: "fable", failure_reason: "boom" });
-    expect(await screen.findByTitle(MODEL_BADGE_TITLE)).toBeTruthy();
-    expect(container.textContent).toContain("model fable");
+  // Rule 3: claimed, lead lane, no rows — still shows the create-time value (PRD #300 SC6).
+  it("shows 'lead: not recorded' plus the create-time model on a FAILED claimed run (SC6)", async () => {
+    const { container } = renderPage({
+      status: "failed",
+      harness: "codex",
+      model: "gpt-6-astra",
+      failure_reason: "boom",
+      lead_config: NO_ROWS,
+    });
+    const chip = await screen.findByText("lead: not recorded");
+    expect(chip.getAttribute("title")).toContain("gpt-6-astra: fixed by schedule");
+    expect(chip.getAttribute("title")).toContain("the worker did not record it");
+    expect(container.textContent).not.toContain("gpt-6-astra · ");
   });
 
   it("strips format characters from the model value, like the other header metadata", async () => {
     const injected = `cl${String.fromCodePoint(0x202e)}aude`;
-    const { container } = renderPage({ status: "failed", model: injected });
-    expect(await screen.findByTitle(MODEL_BADGE_TITLE)).toBeTruthy();
+    const { container } = renderPage({ status: "queued", model: injected, lead_config: NO_ROWS });
+    const chip = await screen.findByText("lead: claude · effort resolves at claim");
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(chip.getAttribute("title") ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(chip.getAttribute("aria-label") ?? "").not.toMatch(/[\p{Cf}]/u);
   });
 
-  it("shows no model badge when the run inherited (model null)", async () => {
-    renderPage({ status: "failed", model: null });
-    // Wait for the page to settle (RunHeading renders the issue title synchronously).
+  it("shows the unresolved form on a queued run that inherited (model null)", async () => {
+    renderPage({ status: "queued", model: null, lead_config: NO_ROWS });
+    expect(await screen.findByText("lead: model and effort resolve at claim")).toBeTruthy();
+  });
+
+  // Rule 1: no lead_config (not a lead-lane run) — no chip, header unchanged.
+  it("shows no chip for a run without lead_config", async () => {
+    const { container } = renderPage({ status: "failed", model: "fable", lead_config: undefined });
     await screen.findByText("Add rate limiting");
-    expect(screen.queryByTitle(MODEL_BADGE_TITLE)).toBeNull();
+    expect(container.textContent).not.toContain("lead:");
+  });
+
+  // Bug-shaped regression (PRD #3244): a default-model Claude run has run.model = null, so the
+  // old badge (keyed off run.model) rendered nothing even though the claim fixed opus / medium.
+  it("regression: a claimed default-model Claude run shows the 'lead: opus · medium' chip", async () => {
+    renderPage({
+      status: "running",
+      harness: "claude",
+      model: null,
+      lead_config: {
+        applicable: true,
+        claim_generation: 1,
+        current: true,
+        phases: [
+          {
+            phase: "implement",
+            phase_entry: 1,
+            seq: 1,
+            harness: "claude",
+            requested_model: "opus",
+            requested_model_source: "user_default",
+            requested_model_fixed_at: "claim",
+            requested_effort: "medium",
+            requested_effort_mode: "explicit",
+            requested_effort_source: "builtin",
+            requested_effort_fixed_at: "claim",
+            observed_model: null,
+            observed_model_evidence: null,
+            observed_effort: null,
+            observed_effort_evidence: null,
+            truncated: false,
+            reported_at: "2026-10-29T10:00:00Z",
+          },
+        ],
+      },
+    });
+    const chip = await screen.findByText("lead: opus · medium");
+    expect(chip.getAttribute("title")).toContain("opus: your Claude default");
+    expect(chip.getAttribute("title")).toContain("medium: built-in");
   });
 
   // PRD #305: the frozen "apply model also to agents" flag, shown on every status.

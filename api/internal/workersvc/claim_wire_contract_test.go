@@ -202,11 +202,15 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 			QuestionMax:            5,
 			QuestionTimeoutSeconds: 86400,
 			DefaultModel:           strptr("sonnet"),
-			AttributionEnabled:     true, // issue #916: always-present bool, default true
-			SkillMaxBytes:          65536,
-			SkillsMaxPerRun:        32,
-			ToolPackages:           []string{"kubectl@1.31", "jq"}, // PRD #18 M3 tier-1 list
-			RepoDevboxOptIn:        false,                          // M5 wires the toggle; false until then
+			// PRD #3244: the lead provenance keys, NON-DEFAULT on purpose (a schedule pin and an
+			// owner-chosen effort source) so "wired" differs from "present and always builtin".
+			DefaultModelSource:  strptr("schedule_pin"),
+			DefaultEffortSource: strptr("user_default"),
+			AttributionEnabled:  true, // issue #916: always-present bool, default true
+			SkillMaxBytes:       65536,
+			SkillsMaxPerRun:     32,
+			ToolPackages:        []string{"kubectl@1.31", "jq"}, // PRD #18 M3 tier-1 list
+			RepoDevboxOptIn:     false,                          // M5 wires the toggle; false until then
 			// PRD #123 M1b: the Decision 6 denylist base names ride the claim so the worker
 			// filters tier-2 (repo devbox.json) packages by base name. A small NON-EMPTY
 			// subset here (the real list is the full denylist) pins the wire key + shape

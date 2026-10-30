@@ -32,6 +32,7 @@ import { ExtendTimePopover } from "../components/ExtendTimePopover";
 import { canReworkNow, canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
 import { repoAgentFolder } from "../lib/repoAgentFolder";
 import { stripUnsafeChars } from "../lib/safeText";
+import { leadConfigView, leadConfigViewInput } from "../lib/leadConfig";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
@@ -202,6 +203,25 @@ function RunBudgetElapsed({ run }: { run: Run }) {
       className="cursor-help text-xs tabular-nums text-faint underline decoration-dotted decoration-faint underline-offset-2 outline-hidden focus-visible:text-fg focus-visible:outline-2 focus-visible:outline-brand focus-visible:outline-offset-2"
     >
       {formatBudgetDuration(view.usedSec)} <span className="text-faint">/ {budgetRightLabel(view)}</span>
+    </span>
+  );
+}
+
+// PRD #3244: the lead agent's configuration chip. Focusable so the sources open on focus/tap, not
+// only hover; the explicit aria-label restores the visible chip text that a bare `title` would
+// swallow from the accessible name (the RunBudgetElapsed pattern). Renders nothing for a run
+// outside the lead lane.
+function LeadConfigChip({ run }: { run: Run }) {
+  const view = leadConfigView(leadConfigViewInput(run));
+  if (!view.chip) return null;
+  return (
+    <span
+      tabIndex={0}
+      title={view.lines.join("\n")}
+      aria-label={`${view.chip}. ${view.lines.join(". ")}`}
+      className="inline-flex cursor-help items-center whitespace-nowrap rounded-md border border-neutral-border bg-neutral-surface px-1.5 py-0.5 text-[11px] font-medium text-neutral-fg outline-hidden focus-visible:outline-2 focus-visible:outline-brand focus-visible:outline-offset-2"
+    >
+      {view.chip}
     </span>
   );
 }
@@ -2700,6 +2720,10 @@ export function RunView() {
                   logo chip as the run list, on every run. Placed ahead of the model badge —
                   which harness executed the run is more fundamental than which model within it. */}
               <HarnessBadge harness={run.harness} />
+              {/* PRD #3244: the lead agent's model and effort on every status, replacing the
+                  PRD #300 schedule-model badge; pre-claim, claimed and unrecorded forms are
+                  all produced by leadConfigView. */}
+              <LeadConfigChip run={run} />
               {/* Which Anthropic credential this run spent (PRD #111 M1). Here in
                   the header rather than beside the usage panel because it must show
                   for every claimed run, and the usage panel only appears once a run
@@ -2709,15 +2733,6 @@ export function RunView() {
                   stored choice and applied history live in Run settings. */}
               {(run.credential_switch === "requested" || run.credential_switch === "released") && (
                 <RunCredentialOverride run={run} />
-              )}
-              {/* PRD #300: the per-schedule model this run froze at fire time, shown on
-                  EVERY status (not just completed) so a wrong/typo'd model is visible on a
-                  FAILED or stopped run too (Risks / SC6). null = inherited the owner's
-                  per-user Worker default. */}
-              {run.model && (
-                <Badge tone="neutral" title="Model this run was fired with (frozen by its schedule)">
-                  model {stripUnsafeChars(run.model)}
-                </Badge>
               )}
               {settingsStates.map(state => <Badge key={state} tone="neutral">{state}</Badge>)}
               {/* PRD #305: the frozen "apply model also to agents" flag, shown on EVERY

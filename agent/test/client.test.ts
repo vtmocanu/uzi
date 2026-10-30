@@ -409,6 +409,15 @@ describe("Codex credential bridge", () => {
     assert.deepStrictEqual(timeouts, [10_000, 10_000]);
   });
 
+  it("recordLeadConfig classifies a refusal by the body's reason code, not its prose error", async () => {
+    const client = newClient();
+    const body = { claim_generation: 1 } as unknown as Parameters<WorkerClient["recordLeadConfig"]>[1];
+    api.leadConfig.queue.push({ status: 204 }, { status: 409, reason: "claim_not_current" }, { status: 404 });
+    assert.deepStrictEqual(await client.recordLeadConfig("run-1", body), { kind: "ok" });
+    assert.deepStrictEqual(await client.recordLeadConfig("run-1", body), { kind: "http", status: 409, error: "claim_not_current" });
+    assert.deepStrictEqual(await client.recordLeadConfig("run-1", body), { kind: "http", status: 404 });
+  });
+
   it("combines caller cancellation with the fixed Codex deadline", async () => {
     api.delayCodexResponses(100);
     const client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {

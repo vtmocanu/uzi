@@ -77,6 +77,7 @@ import { constants as FS } from "node:fs";
 import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
+import { resolveLeadRequest, type LeadRequest } from "../lead-config-report.js";
 import { CodexRequestFailure, RequestError, codexDeferralReason, codexRefreshFailure, isTransientStatus, type PlanCrossCheckFindings, type WorkerClient } from "../client.js";
 import { TransientRecoveryError } from "../sdk-executor.js";
 import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
@@ -122,7 +123,6 @@ import {
   type CodexExecutionSafety,
   type HarnessAgent,
   type HarnessContextHook,
-  type HarnessEffort,
   type HarnessError,
   type CredentialFreeCaptureContext,
   type CompletedCredentialFreeCapture,
@@ -5663,6 +5663,13 @@ export class CodexExecutor implements Executor {
           return true;
         },
       };
+      // PRD #3244: record the lead's requested config for this phase before the turn starts. A new
+      // entry only on a phase change (a re-driven turn, replacement turn or recreated epoch of the
+      // same phase is a no-op); bounded to 3 s inside the reporter, which never throws.
+      if (ctx.leadConfig) {
+        await ctx.leadConfig.enterPhase(phase, this.leadRequestFor(ctx, phase));
+        if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
+      }
       const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
       request.rootDispatch = dispatch;
       let turn = harness.startTurn(request);
@@ -6371,6 +6378,18 @@ export class CodexExecutor implements Executor {
   }
 
   // ─── request + prompt construction ────────────────────────────────────────────
+  /** PRD #3244: the lead's requested model/effort for a phase, from the one worker resolver. Pure in
+   *  (ctx.config, provider model), so the request built per turn and the row reported at the phase
+   *  entry cannot differ. */
+  private leadRequestFor(ctx: RunContext, phase: "plan" | "implement"): LeadRequest {
+    return resolveLeadRequest({
+      harness: "codex",
+      phase,
+      config: ctx.config,
+      providerDefaultModel: this.opts.provider.model,
+    });
+  }
+
   private buildRunRequest(
     ctx: RunContext,
     phase: "plan" | "implement",
@@ -6440,7 +6459,9 @@ export class CodexExecutor implements Executor {
       seeded: phase === "implement" && isSeededOwnerPlan(ctx),
     }).append;
     const leadSkills = (ctx.skills ?? []).map((s) => s.name);
-    const effort = codexEffort(ctx);
+    // PRD #3244: the model and effort sent below are the same LeadRequest the lead-config row reports.
+    const leadRequest = this.leadRequestFor(ctx, phase);
+    const effort = leadRequest.effort;
     if (parkRunEnabled(ctx, phase)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
     // Lead wiring must carry this worker-owned access into root-thread registration and the broker.
     // Presence is consent: runner only supplies the gate/hooks for strictly opted-in publishing runs.
@@ -6464,7 +6485,7 @@ export class CodexExecutor implements Executor {
       // the claim; fall back to the fixed provider default when the claim carries none. render.ts's
       // resolveModel re-validates request.model downstream and codex-harness.ts's
       // `rendered.lead.model ?? this.provider.model` supplies the same default for an out-of-set value.
-      model: ctx.config?.default_model ?? this.opts.provider.model,
+      model: leadRequest.model!,
       // PRD #1551 (D4/D5): mark the ROOT model's provenance ONLY when it came from the
       // server worker default (a present, non-empty `default_model`). This is the sole
       // source render.ts's resolveModel lets carry a validated CUSTOM (non-curated) ID
@@ -7423,7 +7444,3 @@ async function defaultLaunchProviderRoot(
   return { root, transport, supervisorPid: handle.supervisorPid ?? -1 };
 }
 
-/** The server-resolved per-harness effort travels on the existing claim field. */
-function codexEffort(ctx: RunContext): HarnessEffort | undefined {
-  return ctx.config?.default_effort;
-}

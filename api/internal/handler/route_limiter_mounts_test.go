@@ -66,7 +66,7 @@ var limiterNames = [...]string{
 	limOAuth,
 }
 
-// The limiter names, as constants so a typo in the 146-row table below is a compile
+// The limiter names, as constants so a typo in the 388-row table below is a compile
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
@@ -215,6 +215,8 @@ var limiterNames = [...]string{
 // /api/admin/guardrail-impact, 142 until PRD #122 M8 added POST
 // /api/worker/runs/{id}/publish, and 141 until `c309e8a0` added GET
 // /api/admin/cli-tokens.
+// PRD #3244 M1 added POST /api/worker/runs/{id}/lead-config (noLimiter, like decisions-memo);
+// the table had 388 rows after it. The earlier history figures above were not re-tallied.
 // THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
 // which lines a mount-adder owns.
 //
@@ -905,6 +907,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/inputs/discarded", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},
 	{"POST", "/api/worker/runs/{id}/decisions-memo", noLimiter},
+	{"POST", "/api/worker/runs/{id}/lead-config", noLimiter},
 	{"POST", "/api/worker/runs/{id}/messages", noLimiter},
 	{"POST", "/api/worker/runs/{id}/usage", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},

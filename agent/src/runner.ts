@@ -100,6 +100,7 @@ import { captureFailureOf, EpochCleanupUnprovenError, type CodexExecutionSafety 
 import { CodexTurnFailedError } from "./codex/terminal-normalize.js";
 import { describeLimit, LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
+import { LeadConfigReporter, leadConfigActive } from "./lead-config-report.js";
 import type {
   ActiveSnapshotPhase,
   AgentSelection,
@@ -13155,6 +13156,15 @@ export class RunRunner {
       } : {}),
       runId,
       claimGeneration: claim.claim_generation,
+      // PRD #3244: the one lead-config reporter of this claim. Executors, harnesses and epochs only
+      // call it; inactive unless the claim carries default_effort_source.
+      leadConfig: new LeadConfigReporter({
+        client: this.client,
+        runId,
+        claimGeneration: claim.claim_generation ?? 0,
+        active: leadConfigActive(claim.config),
+        logger: runLog,
+      }),
       codexIdleStallRecovery: this.client.hasFeature("recovery_cause_codex_idle_stall_v1") &&
         Number.isSafeInteger(claim.claim_generation) && (claim.claim_generation ?? 0) > 0 &&
         this.client.stampsClaimGeneration(claim.claim_generation),

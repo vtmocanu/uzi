@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { decodeCodeCoverage, type CodeCoverage } from "./code-cross-check-coverage.js";
 import { decodePublicationContext, validatePublicationContextRequest } from "./publication-context.js";
 import type { PublicationContextRequest, PublicationContextResponse } from "./protocol.js";
+import type { LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
@@ -373,6 +374,13 @@ export class CodexOperationAdmissionError extends Error {
     this.name = "CodexOperationAdmissionError";
   }
 }
+
+/** The result of one lead-config POST (PRD #3244): accepted (204), refused by the server with a
+ *  status (and its `error` code when the body carried one), or never answered. */
+export type LeadConfigPostOutcome =
+  | { kind: "ok" }
+  | { kind: "http"; status: number; error?: string }
+  | { kind: "transport"; error: unknown };
 
 export class RequestError extends Error {
   constructor(
@@ -4358,6 +4366,35 @@ export class WorkerClient {
       { claim_generation: claimGeneration, body },
       timeoutMs,
     );
+  }
+
+  // ── Lead config report (PRD #3244) ─────────────────────────────────────────
+  /** POST /worker/runs/:id/lead-config (204, no body). Never throws: the caller is a
+   *  fire-and-forget reporter that must branch on the outcome, so a refusal is data
+   *  (`http` with the server's `reason` code when its body carried one) and a network failure
+   *  or timeout is `transport`. */
+  async recordLeadConfig(
+    runId: string,
+    body: LeadConfigReportBody,
+    timeoutMs = 5_000,
+  ): Promise<LeadConfigPostOutcome> {
+    try {
+      await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/lead-config`, body, timeoutMs);
+      return { kind: "ok" };
+    } catch (err) {
+      if (err instanceof RequestError) {
+        let code: string | undefined;
+        try {
+          // The server's typed code is the body's `reason` (httpx.ErrorReason); `error` is prose.
+          const parsed = JSON.parse(err.body) as { reason?: unknown };
+          if (typeof parsed.reason === "string") code = parsed.reason;
+        } catch {
+          // a non-JSON body (proxy page): the status alone classifies it
+        }
+        return { kind: "http", status: err.status, ...(code !== undefined ? { error: code } : {}) };
+      }
+      return { kind: "transport", error: err };
+    }
   }
 
   // ── Forge read surface (PRD #158) ──────────────────────────────────────────

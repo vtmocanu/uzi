@@ -161,6 +161,13 @@ describe("applyFrame", () => {
     expect(seqs(r.state.messages)).toEqual([1, 2]);
   });
 
+  it("a refresh frame re-reads the run but does not replay (PRD #3244)", () => {
+    const s = ingestMany(emptyStream(), [msg(1), msg(2)]).state;
+    const r = applyFrame(s, { type: "refresh" });
+    expect(r.effects).toEqual({ replay: false, refreshRun: true });
+    expect(r.state).toBe(s);
+  });
+
   it("ignores an unknown frame type", () => {
     const s = ingestMany(emptyStream(), [msg(1)]).state;
     const r = applyFrame(s, { type: "bogus" as unknown as "state" });

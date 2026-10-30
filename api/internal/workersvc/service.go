@@ -665,6 +665,9 @@ type Store interface {
 	// push whose outcome the api never learned.
 	RecordCheckpointPublishAttempt(ctx context.Context, arg store.RecordCheckpointPublishAttemptParams) (uuid.UUID, error)
 	RecordLiveCheckpointPublishAttempt(ctx context.Context, arg store.RecordLiveCheckpointPublishAttemptParams) (uuid.UUID, error)
+	// PRD #3244: the claim-fenced lead-config row write (run_lead_configs, two statements in one
+	// READ COMMITTED transaction) and the GetRun overlay read.
+	RecordRunLeadConfig(ctx context.Context, arg store.RecordRunLeadConfigParams) (store.RecordRunLeadConfigResult, error)
 	MarkCheckpointPublishAttemptReady(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (int64, error)
 	GetCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (store.CheckpointPublishAttempt, error)

@@ -20,6 +20,8 @@ import { LimitReachedError } from "../src/limit.js";
 import { EnvProbeCleanupError } from "../src/env-probe.js";
 import { PlanRejectedError, PlanRevisionReplacedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import { PauseNowSignal, CredentialSwitchSignal, type PlanVerdict } from "../src/steering.js";
+import { LeadConfigReporter, leadConfigActive, type LeadConfigClient } from "../src/lead-config-report.js";
+import type { ClaimConfig, LeadConfigReportBody } from "../src/protocol.js";
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { mrCompletionBlock } from "../src/runner.js";
@@ -2924,6 +2926,107 @@ describe("SdkExecutor reasoning effort on baseOptions (PRD #617)", () => {
     );
     assert.strictEqual(turns[0]!.options.effort, "max", "plan turn: value passes through");
     assert.strictEqual(turns[1]!.options.effort, "max", "implement turn: value passes through");
+  });
+});
+
+describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
+  const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+  const revise: PlanVerdict = { kind: "revise", feedback: "tighten it" };
+  const ACTIVE_CONFIG = {
+    default_model: "sonnet", default_model_source: "user_default" as const,
+    default_effort: "high" as const, default_effort_source: "user_default" as const,
+  };
+
+  /** A real reporter over a recording client: the rows the executor makes it post. */
+  function reporterRig() {
+    const posts: LeadConfigReportBody[] = [];
+    const client: LeadConfigClient = {
+      async recordLeadConfig(_runId, body) {
+        posts.push(body);
+        return { kind: "ok" };
+      },
+    };
+    const make = (config: ClaimConfig | null) => new LeadConfigReporter({
+      client, runId: "r1", claimGeneration: 4, active: leadConfigActive(config), logger: nullLogger(),
+    });
+    const rows = () => posts.map((p) => `${p.phase}#${p.phase_entry}/${p.seq}`);
+    return { posts, make, rows };
+  }
+
+  it("plan then approve then implement: one requested-side row per phase, matching what the SDK is sent", async () => {
+    const { posts, make, rows } = reporterRig();
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({ agents: [lead, coder], config: ACTIVE_CONFIG, leadConfig: make(ACTIVE_CONFIG) }, approveWith("own"));
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.deepEqual(rows(), ["plan#1/1", "implement#1/1"]);
+    for (const p of posts) {
+      assert.equal(p.claim_generation, 4);
+      assert.equal(p.requested_model, "sonnet");
+      assert.equal(p.requested_model_source, "user_default");
+      assert.equal(p.requested_effort, "high");
+      assert.equal(p.requested_effort_mode, "explicit");
+      assert.equal(p.requested_effort_source, "user_default");
+      assert.equal(p.observed_model, null);
+    }
+    // What was reported is what was sent.
+    for (const t of turns) {
+      assert.equal(t.options.model, "sonnet");
+      assert.equal(t.options.effort, "high");
+    }
+  });
+
+  it("a revise round re-drives the plan turn without a new entry", async () => {
+    const { make, rows } = reporterRig();
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("v1"), resultSuccess()],
+      [submitPlan("v2"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({ agents: [lead, coder], config: ACTIVE_CONFIG, leadConfig: make(ACTIVE_CONFIG) }, [revise, approve]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(turns.length, 3);
+    assert.deepEqual(rows(), ["plan#1/1", "implement#1/1"]);
+  });
+
+  it("a pre-approved resume records only the implement phase", async () => {
+    const { make, rows } = reporterRig();
+    const { queryFn } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config: ACTIVE_CONFIG, leadConfig: make(ACTIVE_CONFIG),
+      planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.deepEqual(rows(), ["implement#1/1"]);
+  });
+
+  it("reports the lead template model as `template` and an absent effort as runtime default", async () => {
+    const config = { default_effort_source: "builtin" as const };
+    const { posts, make } = reporterRig();
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config, leadConfig: make(config),
+      planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0]!.requested_model, "fable");
+    assert.equal(posts[0]!.requested_model_source, "template");
+    assert.equal(posts[0]!.requested_effort, null);
+    assert.equal(posts[0]!.requested_effort_mode, "runtime_default");
+    assert.equal(turns[0]!.options.model, "fable");
+    assert.ok(!("effort" in turns[0]!.options));
+  });
+
+  it("posts nothing when the claim carries no default_effort_source", async () => {
+    const { posts, make } = reporterRig();
+    const config = { default_model: "sonnet", default_effort: "low" as const };
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({ agents: [lead, coder], config, leadConfig: make(config) }, approveWith("own"));
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(posts.length, 0);
   });
 });
 

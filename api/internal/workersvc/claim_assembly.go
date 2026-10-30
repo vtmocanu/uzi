@@ -21,6 +21,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
+	"github.com/vtmocanu/uzi/api/internal/leadcfg"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
@@ -402,35 +403,36 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 	}
 	var defaultModel pgtype.Text
+	var leadSettings LeadSettings
+	leadResolved := false
 	if checkerResolution == nil && (harness != HarnessCodex || !isReviewRun) {
 		lanes, lerr := s.q.GetUserHarnessModelDefaults(ctx, run.UserID)
 		if lerr != nil {
 			return nil, fmt.Errorf("harness model defaults lookup: %w", lerr)
 		}
+		laneModel := lanes.DefaultClaudeModel
 		if harness == HarnessCodex {
-			defaultModel = lanes.DefaultCodexModel
-		} else {
-			defaultModel = lanes.DefaultClaudeModel
-			if defaultModel.Valid && agenttmpl.CodexRoleModels[strings.TrimSpace(defaultModel.String)] {
-				dropped := strings.TrimSpace(defaultModel.String)
-				defaultModel = pgtype.Text{}
-				recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, dropped)
-			}
+			laneModel = lanes.DefaultCodexModel
 		}
-		// PRD #300 / PRD #1551 D4: a schedule can freeze a per-run model onto the run
-		// (runs.model). It wins over the owner's lane ONLY when it is compatible with the run
-		// harness; delivered on the SAME default_model claim field, so the worker is unchanged
-		// (Decision 7) and a subagent template's own model: pin still wins. An INCOMPATIBLE
-		// frozen model records the existing visible fallback note and falls back to the owner's
-		// lane for that harness, or the harness default when that lane is unset or dropped.
-		// Lane values use the shared Codex role set above to discard stale Claude-lane ids;
-		// harnessModelCompatible screens only frozen run.model values.
-		if run.Model.Valid {
-			if harnessModelCompatible(harness, run.Model.String) {
-				defaultModel = run.Model
-			} else {
-				recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, run.Model.String)
-			}
+		// PRD #300 / PRD #1551 D4 / #3245 / #3244: resolveLeadSettings owns the lead precedence.
+		// A Claude lane holding a Codex role token is cleared (note below); a schedule's frozen
+		// runs.model wins over the owner's lane ONLY when compatible with the run harness,
+		// delivered on the SAME default_model claim field so the worker is unchanged (Decision 7)
+		// and a subagent template's own model: pin still wins. An INCOMPATIBLE frozen model
+		// records the existing visible fallback note and falls back to the lane, or the harness
+		// default when that lane is unset or dropped.
+		leadSettings = resolveLeadSettings(LeadSettingsInput{
+			Harness:   harness,
+			RunModel:  run.Model,
+			LaneModel: laneModel,
+		})
+		leadResolved = true
+		defaultModel = leadSettings.Model
+		if leadSettings.DroppedLaneModel.Valid {
+			recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, leadSettings.DroppedLaneModel.String)
+		}
+		if leadSettings.DroppedRunModel.Valid {
+			recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, leadSettings.DroppedRunModel.String)
 		}
 	}
 
@@ -467,6 +469,20 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	if err != nil {
 		return nil, fmt.Errorf("default effort lookup: %w", err)
+	}
+	// PRD #3244: the effort column is read here, after the model block and its notes (statement
+	// order unchanged), so the effort half of the lead settings is completed now. DefaultEffort
+	// below still comes from resolveHarnessEffortPtr, which this value equals.
+	var defaultModelSource, defaultEffortSource *string
+	if leadResolved && leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
+		leadSettings.Effort = resolveHarnessEffortPtr(harness, defaultEffort)
+		leadSettings.EffortSource = leadEffortSource(harness, defaultEffort)
+		es := string(leadSettings.EffortSource)
+		defaultEffortSource = &es
+		if leadSettings.Model.Valid {
+			ms := string(leadSettings.ModelSource)
+			defaultModelSource = &ms
+		}
 	}
 
 	// The run owner's AI-attribution opt-out (issue #916), read live per claim so a
@@ -912,6 +928,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			CompletionHoldWindowSeconds: s.p.CompletionHoldWindowSeconds,
 			DefaultModel:                textPtr(defaultModel),
 			DefaultEffort:               resolveHarnessEffortPtr(Harness(run.Harness), defaultEffort),
+			DefaultModelSource:          defaultModelSource,
+			DefaultEffortSource:         defaultEffortSource,
 			AttributionEnabled:          attributionEnabled,
 			// PRD #305 M3: deliver the flag frozen onto the run at fire time (M1). Read
 			// straight off the run row — not re-derived from the schedule. false for every

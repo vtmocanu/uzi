@@ -1286,6 +1286,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// lineage. Both are gated by the decisions_memo_enabled admin setting, failing closed.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/decisions-memo", h.WorkerSaveDecisionsMemo)
 		r.With(h.refuseJobRuns).Get("/runs/{id}/decisions-memo", h.WorkerGetDecisionsMemo)
+
+		// Lead-config record (PRD #3244): the worker reports what its lead agent was configured
+		// to use and what the runtime reported, one claim-fenced row per report.
+		r.With(h.refuseJobRuns).Post("/runs/{id}/lead-config", h.WorkerRecordLeadConfig)
 		r.With(interruptedCallsDeadline, h.refuseJobRuns).Get("/runs/{id}/interrupted-calls", h.WorkerInterruptedCalls)
 
 		// Forge read surface (PRD #158 M1): worker-authenticated, run-scoped, READ

@@ -112,7 +112,8 @@ import type { ClaimResponse, MemoryReservationRequest, StateAck } from "../src/p
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
 import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
-import type { AgentTemplate, MilestoneProgress } from "../src/protocol.js";
+import type { AgentTemplate, ClaimConfig, LeadConfigReportBody, MilestoneProgress } from "../src/protocol.js";
+import { LeadConfigReporter, leadConfigActive } from "../src/lead-config-report.js";
 import { EpochCleanupUnprovenError, type BoundaryRequest, type BoundaryPermit } from "../src/harness.js";
 import type { CodexExecutionSafetyImpl } from "../src/codex/safety.js";
 import type {
@@ -26952,5 +26953,123 @@ describe("3404 terminal executor lifetime", () => {
     const executor = makeExecutor(rig, bindingOf(API_KEY));
     await executor.run(makeCtx().ctx);
     assert.equal((await executor.sealLifetime("run-1" as never)).kind, "unproven");
+  });
+});
+
+// ================================================================================
+describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
+  const ACTIVE = {
+    default_model: "gpt-6-astra", default_model_source: "user_default" as const,
+    default_effort: "high" as const, default_effort_source: "user_default" as const,
+  };
+  const approve = { kind: "approve", selection: { status: "absent" } } as never;
+
+  /** A real reporter over a recording client: the rows the executor makes it post. */
+  const reporterRig = (config: ClaimConfig | null) => {
+    const posts: LeadConfigReportBody[] = [];
+    const reporter = new LeadConfigReporter({
+      client: { async recordLeadConfig(_runId, body) { posts.push(body); return { kind: "ok" }; } },
+      runId: "run-1", claimGeneration: 5, active: leadConfigActive(config), logger: noopLog,
+    });
+    return { posts, reporter, rows: () => posts.map((p) => `${p.phase}#${p.phase_entry}/${p.seq}`) };
+  };
+  const doneFrames = (t: FakeTransport, th: string, tn: string) => {
+    t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+  };
+
+  it("a pre-approved run records one implement row that matches the model and effort sent", async () => {
+    const { posts, reporter, rows } = reporterRig(ACTIVE);
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ config: ACTIVE, leadConfig: reporter });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "pre-approved lead-config run");
+    assert.deepEqual(rows(), ["implement#1/1"]);
+    const sent = rig.transport.requests.find((r) => r.method === "turn/start");
+    assert.equal(rec(sent?.params).model, posts[0]!.requested_model);
+    assert.equal(rec(sent?.params).effort, posts[0]!.requested_effort);
+    assert.equal(posts[0]!.requested_model_source, "user_default");
+    assert.equal(posts[0]!.requested_effort_source, "user_default");
+    assert.equal(posts[0]!.requested_effort_mode, "explicit");
+    assert.equal(posts[0]!.claim_generation, 5);
+  });
+
+  it("falls back to the provider default as `builtin`, effort runtime default", async () => {
+    const config = { default_effort_source: "builtin" as const };
+    const { posts, reporter } = reporterRig(config);
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ config, leadConfig: reporter });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "provider-default lead-config run");
+    assert.equal(posts[0]!.requested_model, provider.model);
+    assert.equal(posts[0]!.requested_model_source, "builtin");
+    assert.equal(posts[0]!.requested_effort, null);
+    assert.equal(posts[0]!.requested_effort_mode, "runtime_default");
+  });
+
+  it("plan, revise, approve, implement: one plan entry (revise re-drives it) then one implement entry", async () => {
+    const { reporter, rows } = reporterRig(ACTIVE);
+    const planEpoch: Responder = (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+      if (c.method === "turn/start") {
+        const tn = `tn-plan-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("th-plan"));
+        c.transport
+          .push(toolCall(c.turnStartCount, "submit_plan", { plan_md: `PLAN ${c.turnStartCount}` }, "th-plan", tn, `c-plan-${c.turnStartCount}`))
+          .push(turnCompleted("completed", "th-plan", tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([planEpoch, resumedEpochResponder("th-plan", "tn-impl", doneFrames)]);
+    let gates = 0;
+    const { ctx } = makeCtx({
+      config: { ...ACTIVE, plan_max_revisions: 2 }, leadConfig: reporter,
+      planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => (++gates === 1 ? { kind: "revise", feedback: "tighten it" } : approve),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "gated lead-config run");
+    assert.equal(gates, 2);
+    assert.deepEqual(rows(), ["plan#1/1", "implement#1/1"]);
+  });
+
+  it("a recreated epoch after a refused wall park does not post again: the same reporter continues the phase (issue #1782 path)", async () => {
+    const { reporter, rows } = reporterRig(ACTIVE);
+    const controller = new AbortController();
+    const quiet: Responder = (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") { c.transport.push(threadStarted("th-1")); return { turn: { id: "tn-1" } }; }
+      return {};
+    };
+    const rig = makeMultiEpochRig([quiet, resumedEpochResponder("th-1", "tn-2", doneFrames)]);
+    let exec!: CodexExecutor;
+    let mode: "wall" | null = null;
+    const { ctx } = makeCtx({
+      config: ACTIVE, leadConfig: reporter, signal: controller.signal,
+      pauseModeRequested: () => mode,
+      clearWallMode: () => { mode = null; },
+      parkForWall: async () => {
+        await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+        return "refused";
+      },
+    });
+    exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const running = exec.run(ctx);
+    await waitFor(() => rig.epochs[0]?.transport.turnStartCount === 1, "implement turn started");
+    mode = "wall";
+    controller.abort(new PauseNowSignal());
+    await withTimeout(running, 5000, "lead-config recreated epoch");
+    assert.equal(rig.providerLaunches(), 2, "the epoch was recreated");
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "the re-drive ran on the fresh epoch");
+    assert.deepEqual(rows(), ["implement#1/1"], "one row: a re-drive or a new epoch is not a phase change");
+  });
+
+  it("posts nothing without the activation signal", async () => {
+    const config = { default_model: "gpt-6-astra", default_effort: "high" as const };
+    const { posts, reporter } = reporterRig(config);
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ config, leadConfig: reporter });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "inactive lead-config run");
+    assert.equal(posts.length, 0);
   });
 });
