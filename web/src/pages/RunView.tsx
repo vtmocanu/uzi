@@ -1895,7 +1895,9 @@ export function RunView() {
     if (!findingsTerminal || !findingsRunId ||
         summaryContext.current.runId !== findingsRunId || !summaryContext.current.terminal) return;
     const request = ++summaryRequest.current;
-    api.listFindings("to_file", undefined, findingsRunId)
+    // Automatic (status-driven or post-mutation) read: passive, so it never restores
+    // a vault keyslot (ADR-3508).
+    api.listFindings("to_file", undefined, findingsRunId, true)
       .then(({ findings }) => {
         if (summaryRequest.current === request) {
           setIncidentalSummary({ runId: findingsRunId, count: findings.filter((f) => f.status === "open").length });
@@ -2006,7 +2008,8 @@ export function RunView() {
   useEffect(() => {
     if (run?.status !== "awaiting_approval") return;
     api
-      .listWorkers()
+      // Status-driven (often by a socket update): passive, never restores a keyslot.
+      .listWorkers(true)
       .then(({ workers }: { workers: Worker[] }) => setWorkers(workers))
       .catch(() => setWorkers([]));
   }, [run?.status]);
@@ -2018,7 +2021,8 @@ export function RunView() {
   useEffect(() => {
     if (!showMrRework) return;
     api
-      .getMySettings()
+      // Status-driven: passive, never restores a keyslot (ADR-3508).
+      .getMySettings(true)
       .then(({ settings }) => setMrReworkDefault(settings.mr_rework_enabled ?? null))
       .catch(() => setMrReworkDefault(null));
   }, [showMrRework]);

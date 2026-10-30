@@ -2813,7 +2813,7 @@ describe("RunView incidental findings summary", () => {
     show({ id: "r/1 &", status: "completed", report_only: true, report_md: "Report result" });
     render(<MemoryRouter initialEntries={["/runs/r%2F1%20%26"]}><RunView /></MemoryRouter>);
     expect(await screen.findByText("Incidental findings: 2 open")).toBeTruthy();
-    expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r/1 &");
+    expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r/1 &", true);
     expect(screen.getByRole("link", { name: "View findings" }).getAttribute("href")).toBe("/findings?run=r%2F1%20%26");
     expect(screen.getByText("Report result")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Findings" })).toBeTruthy();
@@ -2823,7 +2823,7 @@ describe("RunView incidental findings summary", () => {
     mockApi.listFindings.mockResolvedValue(backlog([], "r1", 9));
     show({ status: "completed" });
     const view = render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
-    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r1"));
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r1", true));
     expect(screen.queryByText(/Incidental findings:/)).toBeNull();
     show({ status: "running" });
     view.rerender(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
@@ -2831,7 +2831,7 @@ describe("RunView incidental findings summary", () => {
     mockApi.listFindings.mockRejectedValue(new Error("offline"));
     show({ id: "r2", status: "failed" });
     view.rerender(<MemoryRouter initialEntries={["/runs/r2"]}><RunView /></MemoryRouter>);
-    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r2"));
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r2", true));
     expect(screen.queryByText(/Incidental findings:/)).toBeNull();
   });
 
@@ -2868,10 +2868,10 @@ describe("RunView incidental findings summary", () => {
       : Promise.resolve(backlog([], "r2")));
     show({ id: "r1", status: "completed" });
     const view = render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
-    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r1"));
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r1", true));
     show({ id: "r2", status: "completed" });
     view.rerender(<MemoryRouter initialEntries={["/runs/r2"]}><RunView /></MemoryRouter>);
-    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r2"));
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r2", true));
     await act(async () => resolveOld(backlog(["open"], "r1")));
     expect(screen.queryByText(/Incidental findings:/)).toBeNull();
   });
@@ -7609,6 +7609,37 @@ describe("M1 plan cross-check detail refresh", () => {
     await act(async () => { await r.router.navigate("/runs/r1"); });
     await r.update([message(4)]);
     expect(r.refreshRunPassive).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("ADR-3508 status-driven reads stay passive", () => {
+  const extra = mockApi as unknown as Record<string, unknown>;
+  afterEach(() => { delete extra.listWorkers; });
+  it("a socket-driven status change fetches workers, settings and findings passively", async () => {
+    const listWorkers = vi.fn().mockResolvedValue({ workers: [] });
+    extra.listWorkers = listWorkers;
+    let current = run({ kind: "issue", status: "running" });
+    const refreshRun = vi.fn();
+    mockUseRunStream.mockImplementation(() => ({ run: current, messages: [], connected: true, error: "",
+      submit: vi.fn(), refreshRun, refreshRunPassive: vi.fn(), inputs: [], canSteer: true } as unknown as ReturnType<typeof useRunStream>));
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    mockApi.getMySettings.mockClear();
+    mockApi.listFindings.mockClear();
+    const router = createMemoryRouter([{ path: "/runs/:id", element: <RunView /> }], { initialEntries: ["/runs/r1"] });
+    render(<RouterProvider router={router} />);
+    expect(listWorkers).not.toHaveBeenCalled();
+    // A state frame moves the run to its plan gate, then to completed with an open MR.
+    current = { ...current, status: "awaiting_approval" };
+    await act(async () => { await router.navigate("/runs/r1"); });
+    await waitFor(() => expect(listWorkers).toHaveBeenCalled());
+    current = { ...current, status: "completed", mr_iid: 42, mr_state: "opened" };
+    await act(async () => { await router.navigate("/runs/r1"); });
+    await waitFor(() => expect(mockApi.getMySettings).toHaveBeenCalled());
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalled());
+    expect(listWorkers.mock.calls.every(call => call[0] === true)).toBe(true);
+    expect(mockApi.getMySettings.mock.calls.every(call => call[0] === true)).toBe(true);
+    expect(mockApi.listFindings.mock.calls.every(call => call[3] === true)).toBe(true);
+    expect(refreshRun).not.toHaveBeenCalled();
   });
 });
 

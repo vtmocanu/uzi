@@ -795,8 +795,8 @@ const realApi = {
   vaultEnable: (password: string) =>
     request<VaultEnableResponse>("POST", "/vault/enable", { password }),
   vaultDisable: () => request<VaultDisableResponse>("POST", "/vault/disable"),
-  getMySettings: () =>
-    request<{ settings: UserSettings }>("GET", "/me/settings"),
+  getMySettings: (passive = false) =>
+    request<{ settings: UserSettings }>("GET", "/me/settings", undefined, passive ? { "X-Uzi-Passive": "1" } : undefined),
   putMySettings: (patch: UserSettingsPatch) =>
     request<{ settings: UserSettings }>("PUT", "/me/settings", patch),
   // Slack linking (PRD #25 M3), own-user only. member_id null clears the override
@@ -1155,7 +1155,8 @@ const realApi = {
     request<BoardPrefs>("PUT", `/repos/${repoId}/board/prefs`, prefs),
 
   // Agent runtime (PRD #4).
-  listWorkers: () => request<{ workers: Worker[] }>("GET", "/workers"),
+  listWorkers: (passive = false) =>
+    request<{ workers: Worker[] }>("GET", "/workers", undefined, passive ? { "X-Uzi-Passive": "1" } : undefined),
   createWorker: (name: string, template?: string) =>
     request<{ worker: Worker; token: string }>("POST", "/workers", {
       name,
@@ -1782,13 +1783,14 @@ const realApi = {
   // bucket filters by disposition status (default to_file server-side); repo/run narrow by
   // coordinate repo and by a run semi-join (the notification deep-link anchor). `open_count`
   // in the response meta feeds the nav badge — render it, never re-derive from `findings`.
-  listFindings: (bucket?: IncidentalFindingBucket, repo?: string, run?: string) => {
+  listFindings: (bucket?: IncidentalFindingBucket, repo?: string, run?: string, passive = false) => {
     const qs = new URLSearchParams();
     if (bucket) qs.set("bucket", bucket);
     if (repo) qs.set("repo", repo);
     if (run) qs.set("run", run);
     const suffix = qs.toString();
-    return request<IncidentalFindingBacklog>("GET", `/findings${suffix ? `?${suffix}` : ""}`);
+    return request<IncidentalFindingBacklog>("GET", `/findings${suffix ? `?${suffix}` : ""}`, undefined,
+      passive ? { "X-Uzi-Passive": "1" } : undefined);
   },
   // findingIssueDraft reads the deterministic, human-editable filing draft for one finding
   // (D4). Every field is already sanitised server-side; the Edit-and-file panel seeds from it.
