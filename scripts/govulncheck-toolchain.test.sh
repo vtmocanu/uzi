@@ -80,7 +80,7 @@ case "$*" in
     # Record that child's inherited toolchain separately from the install.
     printf '%s\n' "toolchain=${GOTOOLCHAIN:-unset}" \
       "os=${GOOS:-darwin}" "arch=${GOARCH:-arm64}" \
-      "cgo=${CGO_ENABLED:-1}" > "$CASE_DIR/child"
+      "cgo=${CGO_ENABLED:-1}" >> "$CASE_DIR/child"
     ;;
   *) echo "fake older go: unexpected arguments: $*" >&2; exit 97 ;;
 esac
@@ -93,7 +93,7 @@ pwd > "$CASE_DIR/analysis"
 printf '[%s]\n' "$@" > "$CASE_DIR/analysis-args"
 printf '%s\n' "toolchain=${GOTOOLCHAIN:-unset}" \
   "os=${GOOS:-darwin}" "arch=${GOARCH:-arm64}" \
-  "cgo=${CGO_ENABLED:-1}" "goflags=${GOFLAGS:-}" > "$CASE_DIR/analysis-env"
+  "cgo=${CGO_ENABLED:-1}" "goflags=${GOFLAGS:-}" >> "$CASE_DIR/analysis-env"
 go list ./...
 echo analysis-stdout
 echo analysis-stderr >&2
@@ -175,6 +175,8 @@ expect() {
                 check "$stage toolchain" contains "$dir/$stage" "toolchain=$selected"
                 check "$stage target OS" contains "$dir/$stage" os=linux
                 check "$stage target architecture" contains "$dir/$stage" arch=amd64
+                # A clean gate must analyse every published arch, not stop after the first.
+                [ "$mode" != clean ] || check "$stage arm64 target architecture" contains "$dir/$stage" arch=arm64
                 check "$stage cgo" contains "$dir/$stage" cgo=0
               done
               check 'analysis GOFLAGS preserved' contains "$dir/analysis-env" "goflags=$goflags"

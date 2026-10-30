@@ -1124,7 +1124,7 @@ jobs:
           context: api
           file: api/Dockerfile
           push: false
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           tags: uzi-api:pr
 
   # Context is the repo ROOT: web/Dockerfile COPYs both web/ and docs/.
@@ -1149,7 +1149,7 @@ jobs:
           context: .
           file: web/Dockerfile
           push: false
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           tags: uzi-web:pr
 
   # The backend-free demo/mock SPA image (web/Dockerfile.mock, PRD #311 M1). Same
@@ -1199,7 +1199,7 @@ jobs:
           context: controller
           file: controller/Dockerfile
           push: false
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           tags: uzi-controller:pr
 
   # One job per template (base, jvm). Context is the repo ROOT (the image bakes uzi's
