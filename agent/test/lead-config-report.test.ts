@@ -64,11 +64,9 @@ describe("lead request matrix (fixtures/lead-config/contract.json request_cases)
         ...(c.providerDefaultModel !== undefined ? { providerDefaultModel: c.providerDefaultModel } : {}),
       };
       assert.deepEqual(resolveLeadRequest(input), c.expect, `resolveLeadRequest ${c.id}`);
-      if (c.harness === "claude") {
-        // What the SdkExecutor sends for each claude case (model and effort in the SDK query
-        // options) is asserted by driving the real executor in sdk-executor.test.ts, which
-        // iterates this same request_cases list.
-      } else {
+      // Claude cases: what the SdkExecutor sends (model and effort in the SDK query options) is
+      // asserted by driving the real executor in sdk-executor.test.ts over this same list.
+      if (c.harness !== "claude") {
         const exec = codexExecutorFor(c.providerDefaultModel!);
         const ctx = { runId: "r", config: c.config, agents: [] } as unknown as RunContext;
         const selection = c.phase === "plan" ? undefined : { source: "own" as const, exclusions: [] };

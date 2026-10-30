@@ -19,6 +19,10 @@ export interface LeadConfigViewInput {
 export interface LeadConfigView {
   chip: string;
   lines: string[];
+  /** True for rule 2 (the run is queued, nothing claimed yet): the one place the pre-claim fact
+   *  is decided, so the header can mute the chip without re-deriving it. Web-only: the
+   *  contract fixture pins `chip` and `lines`. */
+  preClaim: boolean;
 }
 
 const MODEL_LABELS: Record<string, string> = {
@@ -151,7 +155,7 @@ function preClaimLines(input: LeadConfigViewInput): string[] {
 /** Rules 1-7 of PRD #3244 section 8. An empty chip means no chip. */
 export function leadConfigView(input: LeadConfigViewInput): LeadConfigView {
   const lc = input.leadConfig;
-  if (!lc || !lc.applicable) return { chip: "", lines: [] };
+  if (!lc || !lc.applicable) return { chip: "", lines: [], preClaim: false };
 
   const phases = lc.phases ?? [];
   const plan = phases.find((p) => p.phase === "plan");
@@ -174,12 +178,12 @@ export function leadConfigView(input: LeadConfigViewInput): LeadConfigView {
     const lines = preClaimLines(input);
     if (summary) lines.push(`previous attempt: ${summary}`);
     lines.push(FOOTER);
-    return { chip, lines };
+    return { chip, lines, preClaim: true };
   }
 
   // Rule 3: claimed, lead lane, no rows.
   if (shown.length === 0) {
-    return { chip: "lead: not recorded", lines: [NOT_RECORDED_NOTE, ...preClaimLines(input), FOOTER] };
+    return { chip: "lead: not recorded", lines: [NOT_RECORDED_NOTE, ...preClaimLines(input), FOOTER], preClaim: false };
   }
 
   // Rules 4-7.
@@ -190,7 +194,7 @@ export function leadConfigView(input: LeadConfigViewInput): LeadConfigView {
   if (!lc.current) lines.push(EARLIER_ATTEMPT_NOTE);
   if (shown.some((p) => p.truncated)) lines.push(TRUNCATED_NOTE);
   lines.push(FOOTER);
-  return { chip: `lead: ${summary}`, lines };
+  return { chip: `lead: ${summary}`, lines, preClaim: false };
 }
 
 /** H's adapter: runs.model_source does not exist yet, so the pre-claim model is run.model, whose

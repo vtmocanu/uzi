@@ -215,7 +215,7 @@ function LeadConfigChip({ run }: { run: Run }) {
   const view = leadConfigView(leadConfigViewInput(run));
   if (!view.chip) return null;
   // The pre-claim form is muted, as in the mockup: nothing is resolved until a worker claims it.
-  const preClaim = run.status === "queued";
+  const { preClaim } = view;
   return (
     <span
       tabIndex={0}
@@ -2722,8 +2722,9 @@ export function RunView() {
                   when resumed") ahead of it when the run carries a wall budget. */}
               {["paused", "limit_wait", "pool_wait", "recovery_wait"].includes(run.status) && run.started_at && <ParkedElapsed run={run} />}
               {/* PRD #1429 M4a / #1653 D-W5: the run's actual harness, the same round
-                  logo chip as the run list, on every run. Placed ahead of the model badge —
-                  which harness executed the run is more fundamental than which model within it. */}
+                  logo chip as the run list, on every run. Placed ahead of the
+                  lead-config chip, since which harness executed the run is more fundamental
+                  than which model and effort within it. */}
               <HarnessBadge harness={run.harness} />
               {/* PRD #3244: the lead agent's model and effort on every status, replacing the
                   PRD #300 schedule-model badge; pre-claim, claimed and unrecorded forms are

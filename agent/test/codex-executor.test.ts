@@ -27068,6 +27068,12 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
     }
     assert.equal(posts.length, 1);
     assert.equal(posts[0]!.seq, 1);
+    // The reporter the executor used survived the recreate: a further report through that same
+    // instance continues the seq (2), it does not restart at 1.
+    reporter.observe({ phase: "implement", entry: 1 }, { model: "m-obs", modelEvidence: "e-m", effort: null, effortEvidence: null });
+    await waitFor(() => posts.length === 2, "a second row through the same reporter");
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"]);
+    assert.equal(posts[1]!.observed_model, "m-obs");
   });
 
   it("posts nothing without the activation signal", async () => {

@@ -3021,7 +3021,10 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       );
       await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
       assert.ok(turns.length >= 1, `${c.id}: a turn ran`);
-      for (const t of turns) {
+      // Only the turns of the case's own phase: the first turn is the plan turn, the rest implement.
+      const phaseTurns = planPhase ? turns.slice(0, 1) : turns;
+      assert.ok(phaseTurns.length >= 1, `${c.id}: a ${c.phase}-phase turn ran`);
+      for (const t of phaseTurns) {
         if (c.expect.model === undefined) assert.ok(!("model" in t.options), `${c.id}: no model key`);
         else assert.equal(t.options.model, c.expect.model, `${c.id}: sent model`);
         if (c.expect.effort === undefined) assert.ok(!("effort" in t.options), `${c.id}: no effort key`);
@@ -3043,6 +3046,12 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
     assert.ok(turns.length >= 2, "the implement turn was re-driven");
     assert.deepEqual(rows(), ["implement#1/1"]);
     assert.equal(posts[0]!.claim_generation, 4);
+    // The one reporter outlived the re-drive: a further report through the same instance
+    // continues the seq (2) on the same entry, it does not restart at 1.
+    ctx.leadConfig!.observe({ phase: "implement", entry: 1 }, { model: "m-obs", modelEvidence: "e-m", effort: null, effortEvidence: null });
+    for (let i = 0; i < 50 && posts.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"]);
+    assert.equal(posts[1]!.observed_model, "m-obs");
   });
 
   it("posts nothing when the claim carries no default_effort_source", async () => {

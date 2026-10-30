@@ -96,7 +96,9 @@ describe("leadConfigView display_cases (fixtures/lead-config/contract.json)", ()
     const visited: string[] = [];
     for (const c of contract.display_cases) {
       const got = leadConfigView(c.input as unknown as LeadConfigViewInput);
-      expect(got, c.id).toEqual(c.expect);
+      // The fixture pins chip and lines; preClaim is the web-only flag, asserted below.
+      expect({ chip: got.chip, lines: got.lines }, c.id).toEqual(c.expect);
+      expect(got.preClaim, c.id).toBe(c.input.status === "queued" && c.expect.chip !== "");
       visited.push(c.id);
     }
     expect(visited).toEqual(contract.display_cases.map((c) => c.id));

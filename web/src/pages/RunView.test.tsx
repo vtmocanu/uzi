@@ -1679,6 +1679,20 @@ describe("RunView header — the lead chip (PRD #3244 rules 2 and 3; PRD #300 sc
     expect(container.textContent).not.toContain("Model gpt-6-astra");
   });
 
+  // The pre-claim chip is muted; a claimed run's chip carries the normal foreground.
+  it("mutes the lead chip while queued and not once claimed", async () => {
+    const queued = renderPage({ status: "queued", model: "gpt-6-astra", lead_config: NO_ROWS });
+    const preChip = await screen.findByText("lead: gpt-6-astra · effort resolves at claim");
+    expect(preChip.classList.contains("text-faint")).toBe(true);
+    expect(preChip.classList.contains("text-neutral-fg")).toBe(false);
+    queued.unmount();
+
+    renderPage({ status: "failed", model: "gpt-6-astra", failure_reason: "boom", lead_config: NO_ROWS });
+    const claimedChip = await screen.findByText("lead: not recorded");
+    expect(claimedChip.classList.contains("text-neutral-fg")).toBe(true);
+    expect(claimedChip.classList.contains("text-faint")).toBe(false);
+  });
+
   // Rule 3: claimed, lead lane, no rows — still shows the create-time value (PRD #300 SC6).
   it("shows 'lead: not recorded' plus the create-time model on a FAILED claimed run (SC6)", async () => {
     const { container } = renderPage({
