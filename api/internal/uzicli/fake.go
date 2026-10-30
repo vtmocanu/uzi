@@ -44,27 +44,30 @@ type FakeClient struct {
 	VaultUnlockCalls     int
 	VaultUnlockPasswords []string
 
-	Runs                 []apitypes.RunListItemDTO
-	RunByID              map[string]apitypes.RunDTO
-	LogsByID             map[string][]apitypes.MessageDTO
-	InputsByID           map[string][]apitypes.SteerInputDTO
-	Reviews              map[string]*apitypes.ReviewDTO
-	PendingJudges        map[string]*apitypes.PendingJudgeDTO
-	Workers              []apitypes.WorkerDTO
-	CordonWorkerResult   apitypes.WorkerDTO
-	UncordonWorkerResult apitypes.WorkerDTO
-	CordonWorkerCalls    int
-	UncordonWorkerCalls  int
-	LastCordonWorkerID   string
-	LastCordonReason     string
-	LastUncordonWorkerID string
-	Repos                []apitypes.RepoDTO
-	AdminUsers           []apitypes.UserDTO
-	AdminRuns            []apitypes.RunListItemDTO
-	AdminWorkers         []apitypes.AdminWorkerDTO
-	AdminHealthDoc       apitypes.HealthDocDTO
-	AdminCLITokens       []apitypes.AdminCLITokenDTO
-	AdminProducts        []apitypes.ProductDTO
+	Runs       []apitypes.RunListItemDTO
+	RunByID    map[string]apitypes.RunDTO
+	LogsByID   map[string][]apitypes.MessageDTO
+	InputsByID map[string][]apitypes.SteerInputDTO
+	// LeadConfigHistoryByID is RunLeadConfigHistory's canned reply per run id (PRD #3244 M3); an
+	// absent id models a non-owner / unknown run (404).
+	LeadConfigHistoryByID map[string]apitypes.LeadConfigHistoryDTO
+	Reviews               map[string]*apitypes.ReviewDTO
+	PendingJudges         map[string]*apitypes.PendingJudgeDTO
+	Workers               []apitypes.WorkerDTO
+	CordonWorkerResult    apitypes.WorkerDTO
+	UncordonWorkerResult  apitypes.WorkerDTO
+	CordonWorkerCalls     int
+	UncordonWorkerCalls   int
+	LastCordonWorkerID    string
+	LastCordonReason      string
+	LastUncordonWorkerID  string
+	Repos                 []apitypes.RepoDTO
+	AdminUsers            []apitypes.UserDTO
+	AdminRuns             []apitypes.RunListItemDTO
+	AdminWorkers          []apitypes.AdminWorkerDTO
+	AdminHealthDoc        apitypes.HealthDocDTO
+	AdminCLITokens        []apitypes.AdminCLITokenDTO
+	AdminProducts         []apitypes.ProductDTO
 
 	// Repo-less jobs (uzi job, PRD #1908 M7).
 	JobCreated    apitypes.V1JobDTO

@@ -157,6 +157,58 @@ func (q *Queries) ListLatestRunLeadConfig(ctx context.Context, runID uuid.UUID) 
 	return items, nil
 }
 
+const listRunLeadConfigHistory = `-- name: ListRunLeadConfigHistory :many
+SELECT c.run_id, c.claim_generation, c.phase, c.phase_entry, c.seq, c.harness,
+       c.requested_model, c.requested_model_source, c.observed_model, c.observed_model_evidence,
+       c.requested_effort, c.requested_effort_mode, c.requested_effort_source,
+       c.observed_effort, c.observed_effort_evidence, c.truncated, c.reported_at
+  FROM run_lead_configs c
+ WHERE c.run_id = $1::uuid
+ ORDER BY c.claim_generation DESC, CASE c.phase WHEN 'plan' THEN 0 ELSE 1 END, c.seq
+ LIMIT 257
+`
+
+// Every lead-config row of a run, newest claim generation first, plan before implement within a
+// generation, then seq (PRD #3244 section 5, M3). LIMIT 257: the handler returns at most 256 rows
+// and sets truncated when the 257th came back.
+func (q *Queries) ListRunLeadConfigHistory(ctx context.Context, runID uuid.UUID) ([]RunLeadConfig, error) {
+	rows, err := q.db.Query(ctx, listRunLeadConfigHistory, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RunLeadConfig{}
+	for rows.Next() {
+		var i RunLeadConfig
+		if err := rows.Scan(
+			&i.RunID,
+			&i.ClaimGeneration,
+			&i.Phase,
+			&i.PhaseEntry,
+			&i.Seq,
+			&i.Harness,
+			&i.RequestedModel,
+			&i.RequestedModelSource,
+			&i.ObservedModel,
+			&i.ObservedModelEvidence,
+			&i.RequestedEffort,
+			&i.RequestedEffortMode,
+			&i.RequestedEffortSource,
+			&i.ObservedEffort,
+			&i.ObservedEffortEvidence,
+			&i.Truncated,
+			&i.ReportedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const runLeadConfigSameBody = `-- name: RunLeadConfigSameBody :one
 SELECT COALESCE(
            c.phase_entry = $1::smallint

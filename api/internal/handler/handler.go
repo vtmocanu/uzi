@@ -966,6 +966,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// GetRunReviewPanel → GetRunForViewer-scoped, capped by the same
 				// RequireUser masking as GetRun.
 				r.Get("/{id}/review", h.GetRunReview)
+				// Lead-config history (PRD #3244 M3): every recorded lead model/effort row of the
+				// run across claim generations, for `uzi run lead-config`. Owner-or-admin via
+				// GetRunForViewer (404 otherwise); read-only, no token spend, so RequireUser.
+				r.Get("/{id}/lead-config", h.GetRunLeadConfigHistory)
 				// Task diff-review read (PRD #400 M4a): the handoff task's structured
 				// findings as JSON, for `uzi handoff review <id>`. Owner-or-admin, same
 				// GetRunForViewer scoping as the review read; no forge write, no token spend.

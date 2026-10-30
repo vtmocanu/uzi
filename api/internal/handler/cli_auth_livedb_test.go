@@ -403,6 +403,7 @@ func TestCLICeilingTrioCrossUser404LiveDB(t *testing.T) {
 		"/api/runs/" + runID.String(),
 		"/api/runs/" + runID.String() + "/messages",
 		"/api/runs/" + runID.String() + "/review",
+		"/api/runs/" + runID.String() + "/lead-config", // PRD #3244 M3
 	}
 	for _, p := range paths {
 		// The ceiling: admin's uzc_ is owner-only ⇒ another user's run is 404.

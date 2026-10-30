@@ -51,6 +51,22 @@ type LeadPhaseConfigDTO struct {
 	ReportedAt             time.Time `json:"reported_at"`
 }
 
+// LeadConfigHistoryEntryDTO is one row of GET /api/runs/{id}/lead-config (PRD #3244 section 5, M3):
+// the same shape as a LeadPhaseConfigDTO (flattened in JSON) plus the claim generation it belongs to.
+type LeadConfigHistoryEntryDTO struct {
+	ClaimGeneration int64 `json:"claim_generation"`
+	LeadPhaseConfigDTO
+}
+
+// LeadConfigHistoryDTO is the body of GET /api/runs/{id}/lead-config: every recorded row, newest
+// claim generation first, plan before implement within a generation, then seq. Truncated is true
+// when more than the 256-row cap existed (only the first 256 are returned). A run with no lead agent,
+// or no recorded rows, yields an empty Entries (never null).
+type LeadConfigHistoryDTO struct {
+	Entries   []LeadConfigHistoryEntryDTO `json:"entries"`
+	Truncated bool                        `json:"truncated"`
+}
+
 // RunLeadConfigDTO is RunDTO.LeadConfig: present iff the run is a lead-lane run. Applicable is always
 // true when present. ClaimGeneration is the highest generation that has rows (0 when none), Current
 // says it equals the run's own claim_generation, and Phases holds the highest-seq row per phase of

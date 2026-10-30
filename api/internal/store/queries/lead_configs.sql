@@ -80,3 +80,16 @@ SELECT latest.run_id, latest.claim_generation, latest.phase, latest.phase_entry,
      ORDER BY c.phase, c.seq DESC
   ) latest
  ORDER BY CASE latest.phase WHEN 'plan' THEN 0 ELSE 1 END;
+
+-- name: ListRunLeadConfigHistory :many
+-- Every lead-config row of a run, newest claim generation first, plan before implement within a
+-- generation, then seq (PRD #3244 section 5, M3). LIMIT 257: the handler returns at most 256 rows
+-- and sets truncated when the 257th came back.
+SELECT c.run_id, c.claim_generation, c.phase, c.phase_entry, c.seq, c.harness,
+       c.requested_model, c.requested_model_source, c.observed_model, c.observed_model_evidence,
+       c.requested_effort, c.requested_effort_mode, c.requested_effort_source,
+       c.observed_effort, c.observed_effort_evidence, c.truncated, c.reported_at
+  FROM run_lead_configs c
+ WHERE c.run_id = @run_id::uuid
+ ORDER BY c.claim_generation DESC, CASE c.phase WHEN 'plan' THEN 0 ELSE 1 END, c.seq
+ LIMIT 257;
