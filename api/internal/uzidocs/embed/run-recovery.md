@@ -1378,6 +1378,34 @@ available-archive disposal previously promised by Option D remains **deferred**
 to #2823 and #1373. This is partial, nonclosing #2506; see
 [ADR-2506](../adr/2506-merged-predecessor-discard.md) for polling and rollout limits.
 
+### Approved policy amendment: later same-issue merged run (2026-10-30)
+
+The approved #3654 policy adds a narrow exception for failed/cancelled issue runs with a
+positive own issue number, no recorded PR/MR and no executing worker claim at
+any generation; timeout failures do not qualify. A distinct completed issue run
+of the same owner/repository/own issue, created strictly after the target finished,
+may serve as witness when its exact recorded PR/MR is freshly verified merged.
+Any eligible witness suffices; cached MR state does not.
+
+Locked rechecks refuse identity drift, a nonterminal run matching that issue
+(including continuations, pool-wait and task runs), uncertain/shared dependencies,
+or a prepared, invoked or unknown-outcome publication on any target hold.
+A valid released ancestry transfer within the terminal target stays unchanged
+and does not veto discard. Eligible OPEN holds through the target's terminal
+generation may be discarded, intentionally losing unique nonancestor, untracked
+or sibling work; this is not proof of preservation.
+
+Available archives keep bytes, prerequisites and their existing expiry, without
+a fresh retention window. A created, unacknowledged orphan with no receipt
+reference may be deleted through existing cleanup once no OPEN hold remains;
+acknowledged publications keep their existing TTL, and receipt-referenced publications keep their existing cleanup protection.
+There is no new worker deletion authority or source/PVC guarantee. Same-run
+Option D above, including issue-less runs, is unchanged. This is approved policy,
+not a claim of implementation or acceptance. See the
+[ADR-2506 amendment](../adr/2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654)
+for complete eligibility, conservative residuals, accepted races and bounded
+polling; immediate backlog convergence is not promised.
+
 ## Automatic settlement of an older held generation
 
 The ancestry settlement below applies to legacy, unguarded holds. Outside the

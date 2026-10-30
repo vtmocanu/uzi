@@ -1698,6 +1698,16 @@ chain in the diagram above, with no intervening `running`.
   nonclosing. See [ADR-2506](adr/2506-merged-predecessor-discard.md) for cursors,
   accepted tick coalescing, inherited response-byte risk, migration CHECK scans
   under ACCESS EXCLUSIVE and rollback refusal to erase audit evidence.
+  The approved 2026-10-30 #3654 policy adds cross-run `basis = same_issue_witness`
+  using that same evidence and phase. Eligible failed/cancelled issue custody
+  without a recorded MR may be discarded using a distinct later same-owner/repo/
+  own-issue completed run's freshly verified merged MR. Locked live-run,
+  dependency and publication vetoes apply; unique work may be lost intentionally.
+  Available archives keep their existing TTL; this adds no worker authority or
+  source/PVC guarantee. Same-run Option D remains unchanged, including issue-less
+  completions. See the [ADR-2506 amendment](adr/2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654)
+  for the complete policy, shared bounds and accepted races. Approval records
+  neither implementation nor acceptance; #3031/#2969/#2884 retain their scope.
   A completed run's guarded archive can expire early as `published_redundant`
   when the API proves through the forge that the run's published branch already
   contains everything it retains (#2625; worker claim, API proof, bytes and

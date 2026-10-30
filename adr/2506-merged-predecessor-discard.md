@@ -4,6 +4,38 @@
 **Date**: 2026-10-14
 **Issue**: [#2506](https://github.com/vtmocanu/uzi/issues/2506)
 
+## Amendment 2026-10-30 — same-issue merged witness (#3654)
+
+**Status**: Approved policy amendment; implementation and acceptance are not established by this documentation change. The implemented same-run Option D below remains unchanged, including issue-less completed runs. This amendment adds the narrow cross-run basis `same_issue_witness` to existing `merged_predecessor_discard` evidence; it is intentional abandonment, not preservation proof.
+
+### Eligible target and witness
+
+Target A must be a failed or cancelled `kind = 'issue'` run with its own positive `issue_iid`, `mr_iid IS NULL` (SQL NULL, not zero), no `worker_active_runs` row at any generation, and `fail_origin IS DISTINCT FROM 'run_timeout'`. Its `finished_at` must be finite and strictly before the `created_at` of a distinct completed issue run B. A and B must have the same owner, repository and positive **own** `issue_iid`; a continued issue alone does not qualify either run. Task and other run kinds cannot be A or B. Generations belong to their own runs: do not compare A's generation with B's or copy one into the other's identity.
+
+Any eligible merged witness suffices; neither the latest witness nor agreement from every witness is required. Before locking, the server freshly observes B's exact recorded PR/MR using the exact owner-scoped forge, connection, base URL, project and PR/MR IID. The returned IID must match and its normalized state must be merged. Cached application MR state supplies no authority. Missing, mismatched, unreadable, unmerged or timed-out evidence refuses that attempt. The transaction rechecks the complete snapshot, A/B eligibility and dependencies under locks before discard.
+
+A nonterminal run in the same owner/repository matching the issue through either `issue_iid` **or** `continued_issue_iid` vetoes discard, including `pool_wait` runs and task runs. This is broader than A/B eligibility. Dependency audit covers A's hold rows in every state. A valid already-released `live_ancestry` transfer wholly within terminal A remains byte-identical and is **not** a veto. Unknown or shared dependencies, inconsistent transfers and future #2969 transfer evidence refuse; the witness is not authority to abandon another run's custody.
+
+### Publication, loss and retention boundary
+
+A publication in `prepared`, `invoked` or `create_unknown` state for any A hold, at any generation, vetoes discard, including an indefinitely stalled prepared publication. A created, unacknowledged, receipt-unreferenced orphan may subsequently be deleted through existing cleanup once A has no OPEN hold: this is an accepted abandonment consequence. Acknowledged publications retain their existing TTL; receipt-referenced publications retain their existing cleanup protection.
+
+This policy intentionally permits loss of unique nonancestor, untracked or sibling work within A's discarded custody. A merged issue witness does not prove that work survived. OPEN holds through A's terminal generation are discarded together, with atomic cleanup of non-ready captures and partial chunks. Available capture bytes, archives, prerequisites, existing TTL and export eligibility remain unchanged; settlement starts no fresh retention window. Existing owner-discard teardown consequences remain. This adds no source/PVC retention guarantee, deletion endpoint or worker deletion authority. Option D physical disposal remains deferred to #2823/#1373.
+
+A late `ReconcileRunMR` after commit and a newly inserted live run after the locked recheck are accepted races; either condition observed before that recheck refuses discard. `run_timeout` targets and indefinitely stalled prepared publications remain conservative residuals with no shortcut. Model-free preservation, live predecessor transfer and final plan rejection remain owned by #3031, #2969 and #2884 respectively. This amendment neither closes those issues nor ticks unrelated [PRD #2746](../prds/2746-automatic-hold-settlement.md) acceptance.
+
+### Transaction and polling boundary
+
+Reuse the single existing post-polling phase and original parent context: 30 seconds, at most 100 repository visits and a **shared** 100 transaction attempts across same-run and cross-run work. Observe a witness freshly at most once per phase, with a five-second observation timeout and the existing client timeout; do not reuse that observation in a later phase. Refusal advances keyset progress, and a later phase may reobserve. There is no immediate or eventual convergence guarantee.
+
+Each target uses one transaction without internal retry. Bound the target workset to 1000 holds and 1000 non-ready captures, with dependency/publication work separately bounded to 1000; overflow or refusal rolls back the entire target. Audit of closed holds and publications must stay within those bounds rather than escaping through an unbounded dependency sweep. Oversized worksets remain protected and cursor progress continues.
+
+Acquire A/B run locks in sorted UUID order, B in SHARE mode and A in UPDATE mode, then repository/connection locks. Lock A's OPEN holds in generation/id order through its terminal generation **inclusive**, then publications in NO KEY UPDATE mode, then captures. Recheck the snapshot and vetoes before mutation. After commit invoke the existing custody-settled hook for **A**, not B.
+
+### Binding and rollout boundary
+
+Reuse `merged_predecessor_discard_binding` with the explicit `basis = same_issue_witness`. Bind the exact target hold/generation, A's terminal identity, B's distinct completed identity, shared owner/repository/positive own issue IID, exact connection/forge/base URL/project/PR IID and fresh verification time. Require strict immutable audit and a Down migration that refuses to lose new bindings. The additive migration changes only the universal binding guard; it must not replace migration 00340's inventory guard or change the evidence CHECK. Existing same-run bindings and Option D semantics remain valid unchanged. These are requirements for the implementation, not a claim that a new migration has shipped.
+
 ## Decision
 
 The maintainer selected automatic **server hold discard** after a fresh observation that a completed run's own exact recorded PR/MR is merged. This is a policy decision to stop retaining predecessor custody, including a prior recovery aggregate that is not an ancestor of the merged work. It is not proof that the earlier source was published, archived or preserved elsewhere.
