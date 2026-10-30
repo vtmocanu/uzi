@@ -654,6 +654,40 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_codex_effort: null }));
     expect(claude.value).toBe("max");
   });
+  // PRD #3247: the ordinary worker cards offer the preference-only Runtime default.
+  describe("Runtime default (PRD #3247)", () => {
+    const base = { default_harness: null, default_model: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null };
+    const codexSecret = { id: "codex-rt", kind: "openai_api_key", label: "Codex fixture", is_default: true, enabled: true, disabled_at: null, auto_eligible: false, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+    const optionList = (el: HTMLElement) => Array.from((el as HTMLSelectElement).options).map((o) => [o.value, o.text]);
+
+    it("offers Runtime default with each harness's label and the card copy", async () => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [codexSecret] });
+      mockApi.getMySettings.mockResolvedValue({ settings: { ...base, default_effort: null, default_codex_effort: null } });
+      render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+      const claude = await screen.findByLabelText("Claude effort");
+      const codex = await screen.findByLabelText("Codex effort");
+      expect(optionList(claude)[1]).toEqual(["runtime", "Runtime default · value not reported"]);
+      expect(optionList(codex)[1]).toEqual(["runtime", "Runtime default · Codex decides"]);
+      expect(screen.getByText(/Runtime default sends no level, so Claude Code or Codex decides; a resumed session may keep the level it last used\./)).toBeTruthy();
+    });
+
+    it("saving runtime sends the token and announces Runtime default, never 'runtime'", async () => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [codexSecret] });
+      mockApi.getMySettings.mockResolvedValue({ settings: { ...base, default_effort: null, default_codex_effort: null } });
+      mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...base, default_effort: "runtime", default_codex_effort: null } });
+      render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+      fireEvent.change(await screen.findByLabelText("Claude effort"), { target: { value: "runtime" } });
+      fireEvent.click(screen.getByText("Save Claude effort"));
+      await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_effort: "runtime" }));
+      await screen.findByText("Claude reasoning effort set to Runtime default. Claude Code decides at your next run.");
+      mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...base, default_effort: "runtime", default_codex_effort: "runtime" } });
+      fireEvent.change(screen.getByLabelText("Codex effort"), { target: { value: "runtime" } });
+      fireEvent.click(screen.getByText("Save Codex effort"));
+      await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_codex_effort: "runtime" }));
+      await screen.findByText("Codex reasoning effort set to Runtime default. Codex decides at the next claim.");
+    });
+  });
+
   it("loads and shows the saved effort", async () => {
     mockApi.getMySettings.mockResolvedValue({
       settings: { default_harness: null, default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
@@ -1854,6 +1888,21 @@ describe("B1 independent settings responses", () => {
     });
   }
   }
+});
+
+describe("checker effort selects stay free of the preference-only runtime token (PRD #3247)", () => {
+  it("offers runtime on the worker select but not on the checker select", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: { default_harness: null, default_model: null, default_effort: "runtime",
+      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
+      cross_check_pins: [
+        { stage: "plan" as const, harness: "claude" as const, model: null, effort: null, worker_default_model: "opus", resolved_model: "opus", resolved_effort: "high", model_source: "worker default" as const, effort_source: "cross-check default" as const, active: false },
+      ] } });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    const checker = await screen.findByLabelText("Claude checker effort") as HTMLSelectElement;
+    expect(Array.from(checker.options).map((o) => o.value)).not.toContain("runtime");
+    expect(Array.from((screen.getByLabelText("Claude effort") as HTMLSelectElement).options).map((o) => o.value)).toContain("runtime");
+    expect(within(checker).getByRole("option", { name: "Default · high (cross-check default)" })).toBeTruthy();
+  });
 });
 
 describe("checker defaults follow committed worker settings", () => {

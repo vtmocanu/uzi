@@ -25,10 +25,10 @@ On every `vX.Y.Z` tag, `.github/workflows/release.yml` signs, by digest, after p
 | agent runtime bases (build inputs, signed when built) | `ghcr.io/vtmocanu/uzi/agent-runtime-base`, `ghcr.io/vtmocanu/uzi/agent-runtime-jvm` |
 | Helm chart (OCI) | `ghcr.io/vtmocanu/uzi/uzi` |
 
-A cosign signature is a separate OCI artifact (cosign 3.x attaches it through the OCI
-referrers API rather than a `sha256-<digest>.sig` tag), so signing does not change the
-image manifest and stays compatible with
-the pipeline's `provenance: false` builds. Signing happens by digest, so the one
+A cosign signature is a separate OCI artifact (the release pipeline's cosign attaches
+it through the OCI referrers API rather than a `sha256-<digest>.sig` tag), so signing
+does not change the image manifest and stays compatible with the pipeline's
+`provenance: false` builds. Signing happens by digest, so the one
 signature covers both tags a release pushes (`:X.Y.Z` and `:<short-sha>`).
 
 The agent runtime bases are rebuilt only when their inputs change, so a release signs
@@ -39,8 +39,7 @@ base it was built on in its `io.github.vtmocanu.uzi.runtime-base` label.
 ## Verifying manually
 
 Use a current cosign to verify (v3.1.3 or newer is recommended; it carries the fix for
-the verification-bypass advisory GHSA-fx35-mq7g-6g98). A v3 cosign verifies uzi's
-signatures even though the release pipeline currently signs with cosign 2.x.
+the verification-bypass advisory GHSA-fx35-mq7g-6g98).
 
 Verification pins two things: who signed (the release workflow) and which OIDC issuer
 minted its token (GitHub Actions). For an image:

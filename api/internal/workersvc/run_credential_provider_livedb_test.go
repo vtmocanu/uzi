@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -155,5 +156,37 @@ func TestSetRunCredentialRacedKeepsNewerStreakLiveDB(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// Both an observed hold and a timed park that becomes held before the locked
+// reread refuse set-token without writing an override, audit or provider reset.
+func TestSetRunCredentialForgeHoldRefusesLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	for i, race := range []bool{false, true} {
+		t.Run(fmt.Sprint(race), func(t *testing.T) {
+			svc := New(env.q, env.box, testParams())
+			svc.SetTxBeginner(env.pool)
+			id := seedRunInStatus(t, env, o, int64(4980+i), "recovery_wait", time.Now().UTC())
+			env.exec(`UPDATE runs SET recovery_wait_cause='forge_unreachable',forge_park_count=6,recovery_retry_not_before=NULL WHERE id=$1`, id)
+			ppSeedStreak(env, id)
+			before := ppRead(t, env, id)
+			if race {
+				env.exec(`UPDATE runs SET recovery_retry_not_before=now()+interval '1 day' WHERE id=$1`, id)
+				svc.beforeCredentialSwitchTx = func() { env.exec(`UPDATE runs SET recovery_retry_not_before=NULL WHERE id=$1`, id) }
+			}
+			_, err := svc.SetRunCredential(env.ctx, o.userID, id, CredentialOverrideModePinned, &o.altTok)
+			if !errors.Is(err, ErrForgeUnreachableHeld) {
+				t.Fatalf("set-token=%v", err)
+			}
+			if after := ppRead(t, env, id); after != before {
+				t.Fatalf("hold switch changed state: %+v -> %+v", before, after)
+			}
+			var audits int
+			if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='resume'`, id).Scan(&audits); err != nil || audits != 0 {
+				t.Fatalf("audits=%d/%v", audits, err)
+			}
+		})
 	}
 }

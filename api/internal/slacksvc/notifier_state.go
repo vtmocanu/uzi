@@ -25,6 +25,13 @@ import (
 // The run-state DM seam (PRDs #25/#122/#268): handle turns a run-state transition
 // into the root/gate/question/milestone renderers and the thread blocks.
 
+// isCrossCheckChild: a cross_check child never gets a standalone run-state or health DM
+// (#3628); a plan check's gate reason, when present, is shown on the parent's gate card
+// (PRD #2149 D10), and a code check reports on the merge request (PRD #2170). Both
+// handle and handleHealth return on it before resolving delivery, so a child creates
+// no root, edits no root and threads no reply.
+func isCrossCheckChild(rc store.GetSlackRunContextRow) bool { return rc.Kind == runkind.CrossCheck }
+
 // handle processes one transition: resolve the owner's delivery target, then
 // post the root DM (first time) or edit it and thread the outcome. Every failure
 // path logs redacted and returns — a run is never affected.
@@ -48,6 +55,9 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 			return
 		}
 		n.logf("load run context", err)
+		return
+	}
+	if isCrossCheckChild(rc) {
 		return
 	}
 	// PRD #46 Decision 6: a judge or self_improve run's OWN state transitions are not

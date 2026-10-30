@@ -88,6 +88,9 @@ type userSettingsDTO struct {
 	// JudgeModels is the read-only resolved view of both judge lanes (PRD #3245), ordered
 	// claude then codex. It is never accepted on a PUT.
 	JudgeModels []apitypes.ModelSettingCellDTO `json:"judge_models"`
+	// EffortSettings is the read-only resolved view of both ordinary effort preferences
+	// (PRD #3247), ordered claude then codex. It is never accepted on a PUT.
+	EffortSettings []apitypes.EffortSettingCellDTO `json:"effort_settings"`
 	// WeeklyReservePct and WeeklyReservePauseRunning are the weekly usage reserve (PRD
 	// #3522), read-only here: PUT /api/me/usage-reserve owns the write. null = off.
 	WeeklyReservePct          *int `json:"weekly_reserve_pct"`
@@ -155,27 +158,30 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	// needed (PRD #362 M2).
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"settings": userSettingsDTO{
-			VaultAutoReunlock:         settingsAutoReunlock(r),
-			CrossCheckPins:            pins,
-			DefaultModel:              textPtrValue(legacyModel.Valid, legacyModel.String),
-			DefaultClaudeModel:        textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
-			DefaultCodexModel:         textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
-			DefaultEffort:             textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
-			DefaultCodexEffort:        textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
-			JudgeModel:                judgeLane,
-			CodexJudgeModel:           codexJudgeLane,
-			SummaryModel:              textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String),
-			Theme:                     textPtrValue(s.Theme.Valid, s.Theme.String),
-			MrReworkEnabled:           boolPtrValue(s.MrReworkEnabled),
-			NowSummaryEnabled:         boolPtrValue(s.NowSummaryEnabled),
-			SidebarTokenIds:           uuidStrings(s.SidebarTokenIds),
-			SidebarCodexAccountIds:    uuidStrings(sidebarCodexIDs),
-			AppearanceMode:            textPtrValue(s.AppearanceMode.Valid, s.AppearanceMode.String),
-			LightTheme:                textPtrValue(s.LightTheme.Valid, s.LightTheme.String),
-			DarkTheme:                 textPtrValue(s.DarkTheme.Valid, s.DarkTheme.String),
-			Typeface:                  textPtrValue(s.Typeface.Valid, s.Typeface.String),
-			DefaultHarness:            textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
-			JudgeModels:               judgeModelCells(judgeLane, codexJudgeLane, instance),
+			VaultAutoReunlock:      settingsAutoReunlock(r),
+			CrossCheckPins:         pins,
+			DefaultModel:           textPtrValue(legacyModel.Valid, legacyModel.String),
+			DefaultClaudeModel:     textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
+			DefaultCodexModel:      textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
+			DefaultEffort:          textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
+			DefaultCodexEffort:     textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
+			JudgeModel:             judgeLane,
+			CodexJudgeModel:        codexJudgeLane,
+			SummaryModel:           textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String),
+			Theme:                  textPtrValue(s.Theme.Valid, s.Theme.String),
+			MrReworkEnabled:        boolPtrValue(s.MrReworkEnabled),
+			NowSummaryEnabled:      boolPtrValue(s.NowSummaryEnabled),
+			SidebarTokenIds:        uuidStrings(s.SidebarTokenIds),
+			SidebarCodexAccountIds: uuidStrings(sidebarCodexIDs),
+			AppearanceMode:         textPtrValue(s.AppearanceMode.Valid, s.AppearanceMode.String),
+			LightTheme:             textPtrValue(s.LightTheme.Valid, s.LightTheme.String),
+			DarkTheme:              textPtrValue(s.DarkTheme.Valid, s.DarkTheme.String),
+			Typeface:               textPtrValue(s.Typeface.Valid, s.Typeface.String),
+			DefaultHarness:         textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
+			JudgeModels:            judgeModelCells(judgeLane, codexJudgeLane, instance),
+			EffortSettings: effortSettingCells(
+				textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
+				textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String)),
 			WeeklyReservePct:          intPtrFromInt2(s.WeeklyReservePct),
 			WeeklyReservePauseRunning: s.WeeklyReservePauseRunning,
 		},
@@ -218,7 +224,7 @@ func (h *Handler) GetMySettings(w http.ResponseWriter, r *http.Request) {
 // card and the Appearance theme picker save independently over the one endpoint
 // without clobbering each other. default_model is validated by the same
 // validateModel used for agent templates (PRD #17); default_effort by the
-// closed-enum validateEffort (PRD #617); theme by the same theme registry the
+// closed-enum validateDefaultEffort (PRD #617, #3247); theme by the same theme registry the
 // admin default surface uses (PRD #21), so no pair of write paths can drift.
 //
 // The handler runs in two phases: it DECODES + VALIDATES every present field
@@ -348,7 +354,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, "invalid default_effort")
 			return
 		}
-		v, err := validateEffort(raw)
+		v, err := validateDefaultEffort(raw)
 		if err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
@@ -364,7 +370,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, "invalid default_codex_effort")
 			return
 		}
-		v, err := validateEffort(raw)
+		v, err := validateDefaultEffort(raw)
 		if err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return

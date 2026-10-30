@@ -245,6 +245,9 @@ export type CallbackResult =
   | { readonly ok: true; readonly output: unknown }
   | { readonly ok: false; readonly code: string; readonly message: string; readonly fileopCode?: string; readonly policyRefusal?: PolicyRefusalPayload; readonly memoryPressure?: WorkerMemoryPressureResult };
 
+// JS mirror of the Go helper's rangeScanBytes, shared by forward and tail validators.
+export const rangeScanBytes = 64 * 1024 * 1024;
+
 /** One fileop request, mapped to the NDJSON op protocol
  *  (agent/codex/supervisor/fileop). `path`/`newPath` are worktree-RELATIVE (the
  *  helper anchors them at the root dirfd and rejects an absolute/`..`/`.git`
@@ -254,10 +257,11 @@ export type CallbackResult =
  *  within the pinned parent directory.
  *  The `id` correlation is the production client's job, not the broker's. */
 export interface FileopRequest {
-  readonly op: "stat" | "read" | "read_range" | "write" | "apply" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
+  readonly op: "stat" | "read" | "read_range" | "read_tail" | "write" | "apply" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
   readonly path: string;
   readonly offset?: number;
   readonly limit?: number;
+  readonly tail?: number;
   readonly newPath?: string;
   readonly data?: string;
   readonly old?: string;
@@ -271,10 +275,13 @@ export interface FileopResponse {
   /** Minted only by the client for a correlated, well-formed helper error. */
   readonly origin?: "helper";
   readonly offset?: number;
+  readonly tail?: number;
+  readonly fromEnd?: boolean;
+  readonly partialFirstLine?: boolean;
   readonly linesReturned?: number;
   readonly partialLastLine?: boolean;
   readonly incomplete?: boolean;
-  /** Preserve presence and invalid wire types so range validation can fail closed. */
+  /** Preserve presence and invalid wire types so excerpt validation can fail closed. */
   readonly reason?: unknown;
   readonly scannedBytes?: number;
   readonly code?: string;
@@ -284,6 +291,8 @@ export interface FileopResponse {
   readonly type?: string;
   readonly entries?: ReadonlyArray<{ readonly name: string; readonly type: string }>;
   readonly truncated?: boolean;
+  /** Client-derived invalid wire type; used only to reject ordinary tail bodies. */
+  readonly truncatedInvalid?: true;
 }
 
 /** The injected openat2 fileop client. Production talks to the fileop helper over a
@@ -985,6 +994,11 @@ export class CodexCallbackBroker {
 
     const fields = asObject(args)!;
     const explicitRange = Object.hasOwn(fields, "offset") || Object.hasOwn(fields, "limit");
+    const hasTail = Object.hasOwn(fields, "tail");
+    const tail = fields.tail;
+    if (hasTail && (explicitRange || typeof tail !== "number" || !Number.isSafeInteger(tail) || tail < 1 || tail > 2000)) {
+      return deny("bad_args", "tail requires an integer from 1 to 2000 and excludes offset and limit");
+    }
     const offset = Object.hasOwn(fields, "offset") ? fields.offset : 1;
     const limit = Object.hasOwn(fields, "limit") ? fields.limit : 200;
     if (
@@ -999,6 +1013,15 @@ export class CodexCallbackBroker {
 
     const res = await this.fileop.op({ op: "read", path: screened.rel });
     if (!res.ok) {
+      if (hasTail && res.code === "E_NOT_TEXT") return deny("bad_args", "tail reads require a text file");
+      if (hasTail && res.origin === "helper" && res.code === "E_OVERSIZE") {
+        const result = await this.fileop.op({ op: "read_tail", path: screened.rel, tail: tail as number });
+        if (!result.ok) {
+          if (result.code === "E_NOT_TEXT") return deny("bad_args", "tail reads require a text file");
+          return this.mapFileopError(result);
+        }
+        return this.validateTailRead(result, tail as number);
+      }
       if (explicitRange && res.origin === "helper" && res.code === "E_OVERSIZE") {
         const range = await this.fileop.op({ op: "read_range", path: screened.rel, offset, limit });
         if (!range.ok) {
@@ -1034,7 +1057,7 @@ export class CodexCallbackBroker {
       // Invalid UTF-8 is binary, just like a NUL-containing valid UTF-8 body.
     }
     if (text === undefined || text.includes("\u0000")) {
-      if (explicitRange) return deny("bad_args", "line ranges require a text file");
+      if (explicitRange || hasTail) return deny("bad_args", "line ranges require a text file");
       return { ok: true, output: { size: res.size, contentBase64: res.data, truncated: res.truncated === true } };
     }
 
@@ -1045,6 +1068,29 @@ export class CodexCallbackBroker {
       if (bytes[i] === 10) lineEnds.push(i + 1);
     }
     if (bytes.length > 0 && lineEnds.at(-1) !== bytes.length) lineEnds.push(bytes.length);
+    if (hasTail) {
+      // A prefix, even a valid text prefix, cannot prove the opening EOF suffix.
+      if (res.truncatedInvalid || (res.truncated !== undefined && res.truncated !== false)) return malformed();
+      const cap = 64 * 1024;
+      let first = Math.max(0, lineEnds.length - (tail as number));
+      let start = first === 0 ? 0 : lineEnds[first - 1]!;
+      let partialFirstLine = false;
+      if (bytes.length - start > cap) {
+        // Discard an older unfit line; retain as many recent whole lines as fit.
+        while (first < lineEnds.length - 1 && bytes.length - start > cap) {
+          start = lineEnds[first++]!;
+        }
+        if (bytes.length - start > cap) {
+          start = bytes.length - cap;
+          while ((bytes[start]! & 0xc0) === 0x80) start++;
+          partialFirstLine = true;
+        }
+      }
+      return { ok: true, output: {
+        size: res.size, content: decoder.decode(bytes.subarray(start)), tail, fromEnd: true,
+        linesReturned: lineEnds.length - first, partialFirstLine, truncated: start > 0,
+      } };
+    }
     const first = offset - 1;
     const start = first < lineEnds.length ? (first === 0 ? 0 : lineEnds[first - 1]!) : bytes.length;
     const selectedEnd = first < lineEnds.length ? lineEnds[Math.min(first + limit, lineEnds.length) - 1]! : start;
@@ -1070,11 +1116,59 @@ export class CodexCallbackBroker {
     };
   }
 
+  /** Validate the independent EOF descriptor without inventing absolute coordinates. */
+  private validateTailRead(res: FileopResponse, tail: number): CallbackResult {
+    const malformed = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_MALFORMED" });
+    const cap = 64 * 1024;
+    // Bound encoded input before regex or allocation, then require canonical encoding.
+    if (typeof res.data !== "string" || res.data.length > 4 * Math.ceil(cap / 3) ||
+      res.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(res.data)) return malformed();
+    const bytes = Buffer.from(res.data, "base64");
+    if (bytes.length > cap || bytes.toString("base64") !== res.data) return malformed();
+    if (
+      typeof res.size !== "number" || !Number.isSafeInteger(res.size) || res.size < bytes.length ||
+      res.tail !== tail || res.fromEnd !== true ||
+      typeof res.linesReturned !== "number" || !Number.isSafeInteger(res.linesReturned) ||
+      res.linesReturned < 0 || res.linesReturned > tail ||
+      typeof res.partialFirstLine !== "boolean" || typeof res.truncated !== "boolean" ||
+      typeof res.incomplete !== "boolean" ||
+      typeof res.scannedBytes !== "number" || !Number.isSafeInteger(res.scannedBytes) ||
+      res.scannedBytes < bytes.length || res.scannedBytes > res.size || res.scannedBytes > rangeScanBytes ||
+      res.truncated !== (res.size > bytes.length) ||
+      (res.incomplete
+        ? res.reason !== "scan_budget" || !res.truncated || res.partialFirstLine ||
+          res.linesReturned >= tail || bytes.length >= cap || res.scannedBytes !== rangeScanBytes || res.size <= rangeScanBytes
+        : Object.hasOwn(res, "reason")) ||
+      (bytes.length === 0 && (res.linesReturned !== 0 || res.partialFirstLine || (!res.incomplete && res.size !== 0))) ||
+      // A whole suffix needs its preceding LF as proof; a partial suffix needs the raw cap frontier.
+      (res.truncated && res.scannedBytes <= bytes.length) ||
+      (res.partialFirstLine && (res.incomplete || !res.truncated || res.linesReturned !== 1 ||
+        bytes.length < cap - 3 || res.scannedBytes < cap + 1 || res.size <= cap)) ||
+      // Below N lines, a completed truncated result must have encountered the output cap.
+      (!res.incomplete && res.truncated && res.linesReturned < tail && res.scannedBytes < cap + 1)
+    ) return malformed();
+    let content: string;
+    try {
+      content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    } catch {
+      return deny("bad_args", "tail reads require a text file");
+    }
+    if (content.includes("\u0000")) return deny("bad_args", "tail reads require a text file");
+    let lines = bytes.length > 0 && bytes.at(-1) !== 10 ? 1 : 0;
+    for (const byte of bytes) if (byte === 10) lines++;
+    if (lines !== res.linesReturned) return malformed();
+    return { ok: true, output: {
+      size: res.size, content, tail, fromEnd: true, linesReturned: lines,
+      partialFirstLine: res.partialFirstLine, truncated: res.truncated,
+      ...(res.incomplete ? { incomplete: true, reason: "scan_budget", scannedBytes: res.scannedBytes } : {}),
+    } };
+  }
+
   /** Validate the independent range descriptor's response before exposing any text. */
   private validateRangeRead(res: FileopResponse, offset: number, limit: number): CallbackResult {
     const malformed = (): CallbackResult => this.mapFileopError({ ok: false, code: "E_MALFORMED" });
     const cap = 64 * 1024;
-    const scanCap = 64 * 1024 * 1024;
+    const scanCap = rangeScanBytes;
     // Bound the encoded input before either regex or decoding.
     if (typeof res.data !== "string") return malformed();
     if (res.data.length > 4 * Math.ceil(cap / 3)) return malformed();

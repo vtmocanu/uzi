@@ -184,6 +184,10 @@ func completionNonClosingClaim(run store.Run) *CompletionNonClosing {
 	return &CompletionNonClosing{Reason: run.CompletionNonClosingReason.String}
 }
 
+// errForgeOriginClaimRefused uses existing exact-generation assembly cleanup without
+// attributing missing normalization or an edited mapping to foreign ownership.
+var errForgeOriginClaimRefused = errors.New("forge origin snapshot is unknown or repository mapping changed after claim")
+
 // assembleClaim builds the claim payload for an already-claimed run. It takes the
 // CLAIMING worker, not just the run, because since PRD #104 M3 the credential a
 // run spends can depend on which worker picked it up.
@@ -266,11 +270,25 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return payload, nil
 	}
 
+	// GetRunClaimContext rechecks the separately loaded repo/connection against the
+	// exact-generation run_forge_origins snapshot before any URL or PAT is delivered.
 	rc, err := s.q.GetRunClaimContext(ctx, run.ID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// No rows is two different things. A repo or connection delete cascades to the
-			// run, and every kind that reaches here has a repo, so a run row that still
+			if q, ok := s.q.(interface {
+				RunForgeOriginClaimRefused(context.Context, uuid.UUID) (bool, error)
+			}); ok {
+				refused, refusalErr := q.RunForgeOriginClaimRefused(ctx, run.ID)
+				if refusalErr != nil {
+					return nil, fmt.Errorf("claim origin context: %w", refusalErr)
+				}
+				if refused {
+					// Use the existing fenced assembly failure/custody cleanup.
+					return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, errForgeOriginClaimRefused)
+				}
+			}
+			// After excluding an origin refusal, distinguish deletion from ownership.
+			// A repo or connection delete cascades to the run, and every kind that reaches here has a repo, so a run row that still
 			// exists means the owner predicate (#1688) refused it: the run's repo belongs
 			// to another user. Failing that terminally (#1691) beats the silent drop,
 			// which left the run cycling claimed -> queued.
@@ -454,11 +472,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 
 	// The run owner's per-user default reasoning effort (PRD #617). NULL now
-	// resolves to the uzi default `medium` at this sink (via resolveEffortPtr /
-	// agenttmpl.ResolveDefaultEffort, issue #1157); an explicit choice is carried
-	// verbatim. Unlike DefaultModel there is no per-schedule freeze — the owner's
-	// per-user value is the only source, except for a checker child, which carries
-	// its frozen cross-check resolution (an unpinned checker is CrossCheckDefaultEffort).
+	// resolves to the uzi default `medium` at this sink (via resolveHarnessEffortPtr /
+	// agenttmpl.ResolveHarnessEffort, issue #1157); an explicit level is carried and
+	// the owner's `runtime` choice (PRD #3247) yields no default_effort at all. Unlike
+	// DefaultModel there is no per-schedule freeze — the owner's per-user value is the
+	// only source, except for a checker child, which carries its frozen cross-check
+	// resolution (an unpinned checker is CrossCheckDefaultEffort). That checker effort
+	// is always a canonical level (validated pin or high), never `runtime`, so it
+	// passes through resolveHarnessEffortPtr unchanged and the worker's ordinary
+	// preference cannot omit it.
 	var defaultEffort pgtype.Text
 	if checkerResolution != nil {
 		defaultEffort = pgconv.TextOrNull(checkerResolution.Effort)
@@ -1053,6 +1075,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 				payload.IssueDescription = run.IssueDescription
 			}
 		}
+	}
+	if !isolated {
+		payload.ForgeOriginReservation = s.forgeOriginReservation(ctx, wkr, run)
 	}
 	return payload, nil
 }

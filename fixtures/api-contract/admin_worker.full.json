@@ -1,4 +1,13 @@
 {
+  "forge_origin_cooldowns": [
+    {
+      "origin": "x",
+      "cooled_until": "2020-01-02T03:04:05Z",
+      "half_open_run_id": "x",
+      "state": "x",
+      "detail": "x"
+    }
+  ],
   "manual_cordoned_at": "2020-01-02T03:04:05Z",
   "manual_cordoned_by": "x",
   "manual_cordoned_by_label": "x",

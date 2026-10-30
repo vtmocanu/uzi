@@ -2106,6 +2106,29 @@ mockRuns.push(
     recovery_wait_cause: "provider_outage", provider_park_count: 3,
     provider_park_streak_started_at: minsAgo(90), recovery_retry_not_before: minsAhead(5) },
 );
+// Forge recovery: NULL is an owner hold; omitted timing is older-API uncertainty.
+for (const [id, status, retry] of [
+  ["run-forge-hold", "recovery_wait", null],
+  ["run-forge-timed", "recovery_wait", minsAhead(5)],
+  ["run-forge-overdue", "recovery_wait", minsAgo(5)],
+  ["run-forge-unknown", "recovery_wait", undefined],
+  ["run-forge-queued", "queued", null],
+] as const) {
+  mockRuns.push({
+    ...pausedBase, id, status, hold_reason: null,
+    issue_title: "Recover forge access without losing retained work",
+    recovery_wait_cause: status === "queued" ? null : "forge_unreachable",
+    recovery_retry_not_before: retry,
+    forge_park_count: 5, forge_park_max: 5,
+    health: "ok",
+    health_reason: status === "queued" ? "Origin cooldown: waiting for a bounded forge attempt; recovery unverified." : null,
+    forge_origin_cooldown: id === "run-forge-unknown" ? undefined : {
+      origin: "https://forge.example", cooled_until: minsAgo(1),
+      half_open_run_id: "run-forge-queued", state: "legacy_serialized_until_upgrade",
+      detail: "One active flight is checking this origin; recovery is unverified.",
+    },
+  });
+}
 // Issue #3181: the token-switch holds. The owner switched each run to console-key; its
 // processes could not be proven stopped. Open /runs/run-cred-switch-settling (the worker is
 // still finishing its own operations for the run, the live-worker case: Resume and Switch token

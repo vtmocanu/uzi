@@ -446,6 +446,11 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 	if w.Busy && w.ActiveRuns == 0 && w.ActiveCrossChecks == 0 {
 		add(2, "· chat active", "· chat active (run lane occupancy is zero)")
 	}
+	if n := len(w.ForgeOriginCooldowns); n > 0 {
+		// Keep the fleet readout bounded; full origin observations are in detail.
+		text := fmt.Sprintf("forge: %s · %d reported origins unverified · details: enter", renderer.Plain(w.ForgeOriginCooldowns[0].Origin, 60), n)
+		add(1, text, text)
+	}
 	slices.SortStableFunc(items, func(a, b attnItem) int { return a.severity - b.severity })
 	return items
 }

@@ -10,6 +10,23 @@ A **worker** is the `uzi-agent` container: it connects to your uzi server, claim
 
 On a k8s deployment where an admin has turned hosting on, you can skip this whole page: provision a worker from **Settings → Workers** instead, on the **Add a worker** tab, and the cluster runs the container for you. See [Hosted workers](./hosted-workers.md).
 
+## Online does not mean forge-reachable
+
+**Online** reports heartbeat contact with the uzi API. A worker can be online
+while its direct Git clone/fetch path is unavailable. The owner/worker/Git-origin
+cooldown blocks claims before due, then permits one reserved ordinary attempt;
+a timer is not a success signal. Human/model waits retain that reservation,
+while stopped flights release it without marking the origin healthy.
+Legacy workers without direct success telemetry can serialize that origin
+for the active flight; upgrading enables earlier verified clearing.
+
+Distinguish this cooldown from a run's timed `recovery_wait` retry, its
+NULL-retry owner hold, and source custody. Local-only or unverified work still
+needs protection; moving to a sibling requires the complete guarded history
+check. Owner Resume queues an attempt and can still be blocked by admission.
+See [Forge unreachable at clone](./run-recovery-wait.md#forge-unreachable-at-clone)
+for the cap, safe placement and mixed-version behavior.
+
 ## 1. Generate a join token
 
 In uzi, open **Settings → Workers**, then the **Add a worker** tab, and use the **Register your own worker** card to register a worker (give it a name, e.g. `laptop`). The join token is shown **once**: copy it now, since only its hash is stored server-side (register a new worker if you lose it).
@@ -131,7 +148,7 @@ resources:
 
 **A [docker sidecar](#docker-sidecar) costs more** on top of either number above: budget roughly an extra **1-2 GiB memory / 1 CPU** for the `dind` daemon itself, plus its own storage for pulled images and build cache — a compose `dinddata` volume, or its k8s equivalent. Under compose, `dinddata` only grows: reclaim it the same way as `agentnix` (`docker compose down -v`, or `docker volume rm <project>_dinddata`) once you don't need what's cached. On a hosted k8s worker the equivalent is a persistent per-worker PVC (`dind-data`), and a `dind-meter` sidecar samples its fill level and supports automatic cache pruning and, under a stricter terminal-run maintenance gate, DinD PVC recycling under sustained pressure — see [Docker inside a worker](./worker-docker.md#dind-data-metering-and-automatic-pruning) for what that covers and what it doesn't. Expect a real workload — uzi's own e2e suite pulls `postgres:17` and builds `api`/`web`/`agent` through the sidecar — to land in the **5-20 GiB** range.
 
-**On a hosted k8s worker, a per-pod Codex command cache draws on the pod's ephemeral storage, separately from the dind budget above**: it exists only under the uid split. A worker-only emptyDir (`codex-cmd-cache`) holds one directory per run with that run's Codex command build cache (`GOMODCACHE`/`GOCACHE`/npm). It is removed at the end of any run whose command roots have all drained, and via `--remove-cache` after a cache-holder loss; otherwise it is kept on disk until the startup orphan reaper sweeps it. It counts toward `workers.ephemeralRequest`/`workers.docker.ephemeralRequest`, the docker tier's 5Gi default adds provisional headroom for it (issue #1757), unmeasured; the plain tier's 512Mi does not yet, pending a hosted measurement of a Go-heavy Codex run's peak usage.
+**On a hosted k8s worker, a per-pod Codex command cache draws on the pod's ephemeral storage, separately from the dind budget above**: it exists only under the uid split. A worker-only emptyDir (`codex-cmd-cache`) holds one directory per run with that run's Codex command build cache (`GOMODCACHE`/`GOCACHE`/npm). It is removed at the end of a run only when its command roots have all drained, its cache reservations have settled and no measurement is still running, and via `--remove-cache` after a cache-holder loss under the same conditions; otherwise it is kept on disk until the startup orphan reaper sweeps it. While a run is live, its cache is measured after commands and rotated to a fresh generation when a complete measurement reaches or exceeds the per-run budget, or when the measurement is unknown (incomplete, failed or timed out) (`UZI_CODEX_COMMAND_CACHE_RUN_BYTES`, default 4 GiB, `0` turns it off; see [Configuration](./configuration.md)). Rotation is best-effort with no hard size bound, and a command is never refused for cache size. It counts toward `workers.ephemeralRequest`/`workers.docker.ephemeralRequest`, the docker tier's 5Gi default adds provisional headroom for it (issue #1757), unmeasured; the plain tier's 512Mi does not yet, pending a hosted measurement of a Go-heavy Codex run's peak usage.
 
 What the gauges mean:
 

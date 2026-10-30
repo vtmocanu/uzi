@@ -580,6 +580,11 @@ type RenderConfig struct {
 	// predates "off" never receives it (that image keeps its own "required" default). Worker container
 	// only — the mode never comes off the wire and never touches the seed/dind containers.
 	CommandSandbox string
+	// CommandCacheRunBytes is the per-run Codex command-cache byte budget as a validated
+	// plain-decimal string. Rendered onto the worker container as
+	// UZI_CODEX_COMMAND_CACHE_RUN_BYTES ONLY when non-empty; empty emits no env key, so a
+	// default install's pod stays byte-identical.
+	CommandCacheRunBytes string
 	// SecretMountPath is where the worker's join-token Secret (worker_token + ca.crt)
 	// mounts, and so what UZI_WORKER_TOKEN_FILE and NODE_EXTRA_CA_CERTS point at (issue
 	// #1761). Empty means defaultSecretMountPath (/run/secrets), and then the rendered
@@ -1165,6 +1170,9 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	}
 	if mode != "off" {
 		env = append(env, corev1.EnvVar{Name: "UZI_CODEX_COMMAND_SANDBOX", Value: mode})
+	}
+	if cfg.CommandCacheRunBytes != "" {
+		env = append(env, corev1.EnvVar{Name: "UZI_CODEX_COMMAND_CACHE_RUN_BYTES", Value: cfg.CommandCacheRunBytes})
 	}
 
 	containerSecurity := &corev1.SecurityContext{

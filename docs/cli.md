@@ -531,8 +531,20 @@ A few worth knowing:
   remaining budget (the clock stopped while paused, so resuming does not
   reset it). The claim then continues the same SDK session if that worker
   is still alive, or recovers the branch from the checkpoint and re-plans
-  the remaining milestones if it's gone. A run that isn't paused is a 409
-  (exit 5). It posts to the same endpoint as `run resume-now` below, which
+  the remaining milestones if it's gone. It also resumes an owner-held
+  `recovery_wait` / `forge_unreachable` run whose retry is explicitly NULL:
+  `uzi run resume <id>` queues one bounded ordinary attempt, preserving the
+  saturated lifetime forge count, custody, cooldown, unrelated grants and
+  remaining wall. Another exhausted clone/fetch group reholds; an exhausted
+  wall may require extension first. Queued does not promise execution past
+  cooldown, cordon, custody limits or capacity. Timed forge parks retry on
+  their schedule; compatible APIs prevent token changes/`set-token` from
+  releasing NULL holds. An old API rollback may queue one extra attempt with
+  legacy terminal-cap behavior; an older worker's “retry after backoff” is
+  not proof of a timer. See
+  [Forge unreachable at clone](./run-recovery-wait.md#forge-unreachable-at-clone).
+  Other unsupported states return 409 (exit 5).
+  It posts to the same endpoint as `run resume-now` below, which
   also resumes an ordinary paused run in addition to a pool-held one.
   A `completion_blocked` hold refuses plain resume; use `run decide` or an
   eligible `run set-token` switch. Resuming a run the
@@ -2973,12 +2985,28 @@ for resolution, validation and capability requirements.
 
 After the cross-check table, the human output prints a **Model settings**
 table with the columns `SETTING  HARNESS  STORED  DEFAULT  RESOLVED  SOURCE`,
-with judge rows for `claude` and `codex`. `SOURCE` is `your choice`,
-`instance default` or `built-in`. `--json` carries the same cells as
-`judge_models` (ordered claude, codex: `harness`, `model`, `default_model`,
-`default_source`, `resolved_model`, `source`; read-only) and the stored Codex
-lane as `codex_judge_model`. See
+with judge rows for `claude` and `codex` and two `effort` rows (one per
+harness) for your ordinary [reasoning effort](./worker-effort.md). `SOURCE` is
+`your choice`, `instance default` or `built-in`. `--json` carries the same
+cells as `judge_models` (ordered claude, codex: `harness`, `model`,
+`default_model`, `default_source`, `resolved_model`, `source`; read-only) and
+the stored Codex lane as `codex_judge_model`. See
 [Run judge](./judge.md#which-model-it-runs-on).
+
+An effort row whose preference is **Runtime default** shows `runtime default`
+in `STORED` and in `RESOLVED` (Claude: `runtime default (value not reported)`),
+for example:
+
+```text
+effort  claude  runtime default  medium  runtime default (value not reported)  your choice
+```
+
+`--json` carries the effort rows as the read-only `effort_settings` (ordered
+claude, codex: `harness`, `effort`, `default_effort`, `default_source`,
+`resolved_effort`, `source`, `mode`). `resolved_effort` is `null` exactly when
+`mode` is `runtime_default`. The CLI cannot set effort: the write endpoint is
+cookie-only, so use **Settings → Run defaults → Reasoning effort**. See
+[Reasoning effort](./worker-effort.md#runtime-default).
 
 The human output ends with a `Now summary: on (default)`, `on` or `off` line:
 your own switch for the model-written [Now summary](./run-activity.md#now-summary)

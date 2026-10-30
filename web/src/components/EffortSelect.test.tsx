@@ -47,6 +47,24 @@ describe("EffortSelect", () => {
     ]);
   });
 
+  // PRD #3247: the preference-only runtime token is offered ONLY when the caller passes
+  // runtimeLabel (the ordinary worker cards); it sits right after Inherit.
+  it("offers the Runtime default option only when runtimeLabel is passed, after Inherit", () => {
+    const { unmount } = render(<EffortSelect value="" onChange={() => {}} />);
+    expect(Array.from(combo().options).map((o) => o.value)).not.toContain("runtime");
+    unmount();
+    render(<EffortSelect value="" onChange={() => {}} runtimeLabel="Runtime default · Codex decides" />);
+    expect(Array.from(combo().options).map((o) => [o.value, o.text])).toEqual([
+      ["", "Inherit (uzi default: medium)"],
+      ["runtime", "Runtime default · Codex decides"],
+      ["low", "low"],
+      ["medium", "medium (uzi default)"],
+      ["high", "high"],
+      ["xhigh", "xhigh"],
+      ["max", "max"],
+    ]);
+  });
+
   it("selecting a level fires onChange with that level", () => {
     render(<Harness initial="" />);
     fireEvent.change(combo(), { target: { value: "low" } });

@@ -1,4 +1,11 @@
 {
+  "forge_origin_cooldown": {
+    "origin": "x",
+    "cooled_until": "2020-01-02T03:04:05Z",
+    "half_open_run_id": "x",
+    "state": "x",
+    "detail": "x"
+  },
   "capability_provenance": {
     "hints_known": true,
     "inference_known": true,

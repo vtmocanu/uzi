@@ -428,7 +428,9 @@ export interface TmpCleanupEvidence {
  *  non-empty words Go `safetree.Reason` returns (a test holds the two sets
  *  equal). "deadline" is a removal that ran out of the drain's deadline (the
  *  dispose's op deadline, or the abnormal drain's default) and kept its partial
- *  progress. A removed tmp always reports "". */
+ *  progress. A removed tmp always reports "". The measure-only words "entries", "depth"
+ *  and "bytes" (the bounded-walk limits of `--measure-cache`, issue #3675) are deliberately
+ *  absent: no cleanup walk reports them, so the cleanup, hold and remove parsers reject them. */
 export const TMP_RETAINED_REASONS: ReadonlySet<string> = new Set(["mismatch", "owner", "deadline", "io", "absent", "name"]);
 
 /** Strict meaning check for the optional `tmpCleanup` evidence field: an object
@@ -2115,11 +2117,11 @@ export interface StandaloneModeDeps {
   readonly spawn?: SpawnStandaloneMode;
   /** Overrides the mode's default bound (ms). */
   readonly timeoutMs?: number;
-  /** Reaper only: signal a reaper still running at its deadline (or on abort). The worker
+  /** Reaper and measure: signal a helper still running at its deadline (or on abort). The worker
    *  lacks CAP_KILL over uid 10003, so the default forks a `kill -KILL` as the command uid.
    *  Returns whether the kill was delivered (a thrown error counts as not delivered). */
   readonly killAsCommandUid?: (pid: number) => boolean;
-  /** Reaper only: the synchronous runner of the default kill (production: spawnSync). */
+  /** Reaper and measure: the synchronous runner of the default kill (production: spawnSync). */
   readonly runKill?: (command: string, args: readonly string[]) => { readonly status: number | null; readonly error?: Error };
   /** Reaper only: how long to wait for a killed reaper's `close` (default 10 s). */
   readonly killWaitMs?: number;
@@ -2144,7 +2146,7 @@ const defaultRunKill: NonNullable<StandaloneModeDeps["runKill"]> = (command, arg
   spawnSync(command, [...args], { env: workerSpawnEnv(STANDALONE_MODE_ENV), stdio: "ignore", timeout: 10_000 });
 
 function spawnStandaloneMode(
-  mode: "--reap-orphans" | "--hold-cache" | "--remove-cache",
+  mode: "--reap-orphans" | "--hold-cache" | "--remove-cache" | "--measure-cache",
   token: string | undefined,
   stdin: "pipe" | "ignore",
   deps: StandaloneModeDeps,
@@ -2273,17 +2275,28 @@ function validToken(token: string): boolean {
 type OneLineRun =
   | { readonly kind: "done"; readonly line: string | undefined; readonly code: number | null; readonly breach?: string }
   | StillRunningMode
-  | { readonly kind: "spawn"; readonly message: string };
+  | { readonly kind: "spawn"; readonly message: string; readonly live?: StillRunningBase };
 type CompletedOneLineRun = Extract<OneLineRun, { kind: "done" }>;
+/** `exited` resolves at the child's `exit` (the process is reaped; its stdout may still be held
+ *  open by another writer, so `closed` may never follow); `hasExited` is the same fact read
+ *  synchronously; `destroyStdout` abandons the stdout stream. */
+interface StillRunningBase {
+  readonly pid?: number;
+  readonly closed: Promise<void>;
+  readonly exited: Promise<void>;
+  readonly hasExited: () => boolean;
+  readonly destroyStdout: () => void;
+  readonly completion?: Promise<CompletedOneLineRun>;
+}
 type StillRunningMode =
-  | { readonly kind: "timeout"; readonly pid?: number; readonly closed: Promise<void>; readonly completion?: Promise<CompletedOneLineRun> }
-  | { readonly kind: "aborted"; readonly pid?: number; readonly closed: Promise<void>; readonly completion?: Promise<CompletedOneLineRun> };
+  | ({ readonly kind: "timeout" } & StillRunningBase)
+  | ({ readonly kind: "aborted" } & StillRunningBase);
 
 /** One run of a one-line mode: spawn, read at most two lines (a second is a breach),
  *  and settle at `close`, the deadline, or an abort of `signal`. An already-aborted
  *  signal spawns nothing. Never throws. */
 function runOneLineMode(
-  mode: "--reap-orphans" | "--remove-cache",
+  mode: "--reap-orphans" | "--remove-cache" | "--measure-cache",
   token: string | undefined,
   timeoutMs: number,
   deps: StandaloneModeDeps,
@@ -2291,7 +2304,7 @@ function runOneLineMode(
 ): Promise<OneLineRun> {
   return new Promise((resolve) => {
     if (signal?.aborted) {
-      resolve({ kind: "aborted", closed: Promise.resolve() });
+      resolve({ kind: "aborted", closed: Promise.resolve(), exited: Promise.resolve(), hasExited: () => true, destroyStdout: () => {} });
       return;
     }
     let settled = false;
@@ -2302,7 +2315,15 @@ function runOneLineMode(
     const closed = new Promise<void>((r) => { markClosed = r; });
     let complete!: (outcome: CompletedOneLineRun) => void;
     const completion = new Promise<CompletedOneLineRun>(resolve => { complete = resolve; });
-    const onAbort = (): void => settle({ kind: "aborted", pid: child?.pid, closed, completion });
+    let exitSeen = false;
+    let markExited!: () => void;
+    const exited = new Promise<void>((r) => { markExited = r; });
+    const running = (): StillRunningBase => ({
+      pid: child?.pid, closed, completion, exited,
+      hasExited: () => exitSeen,
+      destroyStdout: () => { try { child?.stdout?.destroy(); } catch { /* already gone */ } },
+    });
+    const onAbort = (): void => settle({ kind: "aborted", ...running() });
     const settle = (value: OneLineRun): void => {
       if (settled) return;
       settled = true;
@@ -2310,7 +2331,7 @@ function runOneLineMode(
       signal?.removeEventListener("abort", onAbort);
       resolve(value);
     };
-    const timer = setTimeout(() => settle({ kind: "timeout", pid: child?.pid, closed, completion }), timeoutMs);
+    const timer = setTimeout(() => settle({ kind: "timeout", ...running() }), timeoutMs);
     if (typeof timer.unref === "function") timer.unref();
     signal?.addEventListener("abort", onAbort, { once: true });
     try {
@@ -2319,18 +2340,25 @@ function runOneLineMode(
       settle({ kind: "spawn", message: error instanceof Error ? error.message : String(error) });
       return;
     }
-    child.on("error", (err: Error) => settle({ kind: "spawn", message: err.message }));
-    if (!child.stdout) {
-      settle({ kind: "spawn", message: "no stdout channel" });
-      return;
-    }
-    readModeLines(child.stdout, 1, (line) => lines.push(line), (why) => { breach = why; });
-    child.once("close", (code: number | null) => {
+    // A failure after a process exists (it has a pid) carries `live`, so a caller that owns the
+    // helper's lifetime can still wait for its actual end.
+    const failed = (message: string): OneLineRun =>
+      child?.pid !== undefined ? { kind: "spawn", message, live: running() } : { kind: "spawn", message };
+    child.on("error", (err: Error) => settle(failed(err.message)));
+    child.once("exit", () => { exitSeen = true; markExited(); });
+    const onClose = (code: number | null): void => {
       markClosed();
       const outcome: CompletedOneLineRun = { kind: "done", line: lines.length === 1 ? lines[0] : undefined, code, ...(breach ? { breach } : {}) };
       complete(outcome);
       settle(outcome);
-    });
+    };
+    if (!child.stdout) {
+      child.once("close", onClose);
+      settle(failed("no stdout channel"));
+      return;
+    }
+    readModeLines(child.stdout, 1, (line) => lines.push(line), (why) => { breach = why; });
+    child.once("close", onClose);
   });
 }
 
@@ -2513,11 +2541,24 @@ export async function removeCommandCache(token: string, deps: StandaloneModeDeps
  *  cache_error word or one of "token", "spawn", "timeout", "protocol", "exited". */
 export class CommandCacheStartError extends Error {
   readonly reason: string;
-  constructor(reason: string) {
+  /** Present when a holder process was spawned before the failure: it resolves ONLY at that
+   *  process's actual `close` (never on a timer), so a caller can own its cleanup judgment. */
+  readonly settlement?: Promise<CacheCleanupResult>;
+  constructor(reason: string, settlement?: Promise<CacheCleanupResult>) {
     super(`codex command cache holder did not start (${reason})`);
     this.name = "CommandCacheStartError";
     this.reason = reason;
+    if (settlement !== undefined) this.settlement = settlement;
   }
+}
+
+/** {@link startCommandCacheHolder}'s deps. */
+export interface StartHolderDeps extends StandaloneModeDeps {
+  /** Called SYNCHRONOUSLY right after the holder process was spawned (before any listener or
+   *  await) with its ACTUAL settlement: it resolves only at the process's `close` (or at an
+   *  `error` event for a process that never started), never by a timer. Covers every path,
+   *  including a readiness timeout, a late `cache_ready`, a breach and missing channels. */
+  readonly onSpawned?: (settlement: Promise<CacheCleanupResult>) => void;
 }
 
 /** A live per-run command cache held by a `--hold-cache` process for the whole run. */
@@ -2549,7 +2590,7 @@ export interface CommandCacheHolder {
  * that did get ready sees EOF without a release and retains the directory as
  * "unattested" for the startup reaper; nothing is killed.
  */
-export async function startCommandCacheHolder(token: string, deps: StandaloneModeDeps = {}): Promise<CommandCacheHolder> {
+export async function startCommandCacheHolder(token: string, deps: StartHolderDeps = {}): Promise<CommandCacheHolder> {
   if (!validToken(token)) throw new CommandCacheStartError("token");
   const path = `${CODEX_COMMAND_CACHE_ROOT}/${token}`;
   let child: StandaloneModeProcess;
@@ -2558,6 +2599,12 @@ export async function startCommandCacheHolder(token: string, deps: StandaloneMod
   } catch {
     throw new CommandCacheStartError("spawn");
   }
+  // The holder's ACTUAL settlement: resolved only at `close` (or an `error` for a process
+  // that never started). Announced before anything else can fail or await.
+  let settleHolder!: (outcome: CacheCleanupResult) => void;
+  const settlement = new Promise<CacheCleanupResult>((resolve) => { settleHolder = resolve; });
+  try { deps.onSpawned?.(settlement); } catch { /* the observer's failure is its own */ }
+  const fail = (reason: string): CommandCacheStartError => new CommandCacheStartError(reason, settlement);
   const stdin = child.stdin;
   // An EPIPE on a dead holder's stdin must never become an unhandled 'error'.
   stdin?.on("error", () => undefined);
@@ -2573,9 +2620,20 @@ export async function startCommandCacheHolder(token: string, deps: StandaloneMod
   let closeCode: number | null = null;
   let breach: string | undefined;
   let afterReady: string | undefined;
+  // The first non-ready line seen BEFORE readiness (a cache_error, say): part of the settlement.
+  let preReadyLine: string | undefined;
   let released = false;
   const waiters = new Set<() => void>();
   const notify = (): void => { for (const w of waiters) w(); };
+
+  // The final outcome at the process's actual close: the cleanup line (before or after
+  // readiness) checked against the exit code, else protocol (garbage) or exited (no line).
+  const closedOutcome = (): CacheCleanupResult => {
+    if (breach !== undefined) return { state: "error", reason: "protocol" };
+    const line = afterReady ?? preReadyLine;
+    if (line === undefined) return { state: "error", reason: "exited" };
+    return parseCacheOutcome(line, closeCode, "hold") ?? { state: "error", reason: "protocol" };
+  };
 
   let resolveReady!: () => void;
   let rejectReady!: (e: CommandCacheStartError) => void;
@@ -2585,7 +2643,7 @@ export async function startCommandCacheHolder(token: string, deps: StandaloneMod
 
   const onBreach = (why: string): void => {
     breach = why;
-    if (!ready) rejectReady(new CommandCacheStartError("protocol"));
+    if (!ready) rejectReady(fail("protocol"));
     // Fail closed: an unreadable holder gets EOF with no release and retains.
     endStdin();
     notify();
@@ -2599,8 +2657,9 @@ export async function startCommandCacheHolder(token: string, deps: StandaloneMod
         onBreach("bad ready line");
         return;
       }
+      preReadyLine ??= line;
       const outcome = parseCacheOutcome(line, undefined, "hold");
-      rejectReady(new CommandCacheStartError(outcome?.state === "error" ? outcome.reason : "protocol"));
+      rejectReady(fail(outcome?.state === "error" ? outcome.reason : "protocol"));
       endStdin();
       return;
     }
@@ -2612,13 +2671,17 @@ export async function startCommandCacheHolder(token: string, deps: StandaloneMod
   };
 
   child.on("error", () => {
-    if (!ready) rejectReady(new CommandCacheStartError("spawn"));
+    if (!ready) rejectReady(fail("spawn"));
     endStdin();
     notify();
+    // No pid: the process never started, so no `close` will come and nothing is running.
+    // Nothing was created, so the settlement is `absent` (a cleanup the lifetime does not
+    // distrust), like an initial-start spawn failure.
+    if (child.pid === undefined) settleHolder({ state: "absent", reason: "" });
   });
   child.once("exit", () => {
     exitedFlag = true;
-    if (!ready) rejectReady(new CommandCacheStartError("exited"));
+    if (!ready) rejectReady(fail("exited"));
     endStdin();
     notify();
   });
@@ -2626,12 +2689,13 @@ export async function startCommandCacheHolder(token: string, deps: StandaloneMod
     exitedFlag = true;
     closed = true;
     closeCode = code;
-    if (!ready) rejectReady(new CommandCacheStartError("exited"));
+    if (!ready) rejectReady(fail("exited"));
     notify();
+    settleHolder(closedOutcome());
   });
   if (!child.stdout || !stdin) {
     endStdin();
-    throw new CommandCacheStartError("spawn");
+    throw fail("spawn");
   }
   readModeLines(child.stdout, 2, onLine, onBreach);
 
@@ -2641,13 +2705,13 @@ export async function startCommandCacheHolder(token: string, deps: StandaloneMod
     await Promise.race([
       readyPromise,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new CommandCacheStartError("timeout")), timeoutMs);
+        timer = setTimeout(() => reject(fail("timeout")), timeoutMs);
         if (typeof timer.unref === "function") timer.unref();
       }),
     ]);
   } catch (error) {
     endStdin();
-    throw error instanceof CommandCacheStartError ? error : new CommandCacheStartError("protocol");
+    throw error instanceof CommandCacheStartError ? error : fail("protocol");
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -2706,4 +2770,180 @@ export async function startCommandCacheHolder(token: string, deps: StandaloneMod
       return releasePromise;
     },
   };
+}
+
+// ─── Issue #3675: the non-mutating per-run cache measurement ───────────────────────
+
+/** The measurement's result. `unknown` is any outcome that is not an exact, complete
+ *  count: a bounded-walk word, a setup error, garbage, a delivery timeout, a spawn failure.
+ *  `settlement` is present when a helper may still be running: it resolves when the helper
+ *  has ended ({@link helperEnded}: its `close`, or its observed `exit` plus
+ *  {@link MEASURE_STDOUT_DRAIN_MS}), never on the delivery timeout alone. `cancelled` means
+ *  nothing was spawned. */
+export type CacheMeasureResult =
+  | { readonly state: "complete"; readonly bytes: number }
+  | { readonly state: "unknown"; readonly reason: string; readonly settlement?: Promise<void> }
+  | { readonly state: "cancelled" };
+
+/** The measurement gets its own delivery bound; a helper past it is killed as the command uid. */
+const DEFAULT_MEASURE_TIMEOUT_MS = 30 * 1000;
+const MEASURE_INCOMPLETE_REASONS: ReadonlySet<string> = new Set([
+  "absent", "entries", "depth", "deadline", "mismatch", "owner", "io", "bytes",
+]);
+const MEASURE_ERROR_REASONS: ReadonlySet<string> = new Set(["dumpable", "fd_hygiene", "args", "uid", "root"]);
+
+/** A FIFO concurrency-1 gate for measurement helpers. */
+export interface MeasureLimiter {
+  /** Resolves with the slot's release once granted, or undefined when `signal` aborted
+   *  while queued (nothing was granted). The caller owns releasing exactly once. */
+  acquire(signal?: AbortSignal): Promise<(() => void) | undefined>;
+}
+
+export function createMeasureLimiter(): MeasureLimiter {
+  let busy = false;
+  const queue: Array<() => void> = [];
+  const handOver = (): void => {
+    const next = queue.shift();
+    if (next) next();
+    else busy = false;
+  };
+  const releaser = (): (() => void) => {
+    let done = false;
+    return () => { if (!done) { done = true; handOver(); } };
+  };
+  return {
+    acquire(signal) {
+      if (signal?.aborted) return Promise.resolve(undefined);
+      if (!busy) { busy = true; return Promise.resolve(releaser()); }
+      return new Promise((resolve) => {
+        const grant = (): void => { signal?.removeEventListener("abort", onAbort); resolve(releaser()); };
+        const onAbort = (): void => {
+          const at = queue.indexOf(grant);
+          if (at >= 0) queue.splice(at, 1);
+          resolve(undefined);
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+        queue.push(grant);
+      });
+    },
+  };
+}
+
+/** The worker-wide gate: one measurement helper at a time, across every run. */
+const workerMeasureLimiter = createMeasureLimiter();
+
+export interface MeasureDeps extends StandaloneModeDeps {
+  /** Tests only: replaces the worker-wide limiter. */
+  readonly limiter?: MeasureLimiter;
+  /** Tests only: replaces {@link MEASURE_STDOUT_DRAIN_MS}. */
+  readonly drainMs?: number;
+}
+
+/** How long stdout may stay open after the helper's `exit` before the helper counts as ended. */
+const MEASURE_STDOUT_DRAIN_MS = 2000;
+
+/** Resolves at the helper's `close`, or MEASURE_STDOUT_DRAIN_MS-bounded after its `exit`
+ *  (destroying stdout). Never rejects. */
+function helperEnded(run: StillRunningBase, drainMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    let done = false;
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (): void => { if (!done) { done = true; clearTimeout(timer); resolve(); } };
+    void run.closed.then(finish);
+    void run.exited.then(() => {
+      if (done) return;
+      timer = setTimeout(() => { run.destroyStdout(); finish(); }, drainMs);
+      if (typeof timer.unref === "function") timer.unref();
+    });
+  });
+}
+
+function parseMeasureLine(line: string, code: number | null): CacheMeasureResult {
+  const protocol: CacheMeasureResult = { state: "unknown", reason: "protocol" };
+  const event = eventOf(line);
+  if (event === "cache_measure") {
+    const r = parseExactObject(line, ["event", "state", "bytes", "entries", "reason"]);
+    if (!r || typeof r.reason !== "string") return protocol;
+    if (r.state === "complete") {
+      return r.reason === "" && code === 0 && isCount(r.bytes) && isCount(r.entries)
+        ? { state: "complete", bytes: r.bytes } : protocol;
+    }
+    if (r.state === "incomplete") {
+      // bytes may be the saturated 2^64-1, which JSON.parse rounds: the figure is not used,
+      // an incomplete measurement is unknown whatever it says.
+      const finite = (v: unknown): boolean => typeof v === "number" && Number.isFinite(v) && v >= 0;
+      return MEASURE_INCOMPLETE_REASONS.has(r.reason) && code === 3 && finite(r.bytes) && finite(r.entries)
+        ? { state: "unknown", reason: r.reason } : protocol;
+    }
+    return protocol;
+  }
+  if (event === "cache_error") {
+    const r = parseExactObject(line, ["event", "reason"]);
+    if (r && typeof r.reason === "string" && MEASURE_ERROR_REASONS.has(r.reason) && code === 2) {
+      return { state: "unknown", reason: r.reason };
+    }
+  }
+  return protocol;
+}
+
+/**
+ * Measure one run's command cache, read-only, as the command uid (`--measure-cache`).
+ *
+ * Requests queue FIFO on a worker-wide concurrency-1 limiter and the slot is held from the
+ * spawn until the helper has actually ended, not the delivery timeout. A same-uid model command can
+ * SIGSTOP the helper, so at the delivery timeout, an abort after the spawn, or a child error / missing
+ * stdout once the process exists, a still-unreaped helper is SIGKILLed as the command uid (`killAsCommandUid`, as the reaper is); SIGKILL works on
+ * a stopped process. No kill is issued once its `exit` was observed (the pid may be reused). A
+ * kill that is not delivered leaves the slot held until the helper ends on its own (reason
+ * `timeout_unkilled` / `aborted_unkilled`). "Ended" is the first of: Node `close`, or `exit`
+ * followed by {@link MEASURE_STDOUT_DRAIN_MS} (stdout is then destroyed). `close` alone is not
+ * enough: it waits for every stdout writer, and a same-uid peer holding a duplicate of the write
+ * end (possible before the helper's PR_SET_DUMPABLE) would hold the slot forever. A reaped helper
+ * can no longer read the cache. Residual: that peer may keep the pipe open after the settlement.
+ * An abort while queued is `cancelled` and spawns nothing; a delivery timeout, an abort after
+ * the spawn, or a child `error` / missing stdout once a process exists is `unknown` carrying that
+ * `settlement` (reason `spawn` / `spawn_unkilled` for the last two). Only a spawn that created no
+ * process is `unknown(spawn)` with the slot given back at once. Only an exact complete line with exit 0 is
+ * `complete`; everything else is `unknown`. Never throws.
+ */
+export async function measureCommandCache(token: string, deps: MeasureDeps = {}): Promise<CacheMeasureResult> {
+  if (!validToken(token)) return { state: "unknown", reason: "token" };
+  const limiter = deps.limiter ?? workerMeasureLimiter;
+  const release = await limiter.acquire(deps.signal);
+  if (release === undefined) return { state: "cancelled" };
+  let held = true;
+  const giveBack = (): void => { if (held) { held = false; release(); } };
+  try {
+    if (deps.signal?.aborted) return { state: "cancelled" };
+    const run = await runOneLineMode("--measure-cache", token, deps.timeoutMs ?? DEFAULT_MEASURE_TIMEOUT_MS, deps, deps.signal);
+    // Only a failure that created no process gives the slot back at once.
+    if (run.kind === "spawn" && run.live === undefined) return { state: "unknown", reason: "spawn" };
+    // Aborted with nothing spawned (no completion): a clean cancel.
+    if (run.kind === "aborted" && run.completion === undefined) return { state: "cancelled" };
+    const live = run.kind === "spawn" ? run.live : run.kind === "timeout" || run.kind === "aborted" ? run : undefined;
+    if (live !== undefined) {
+      // The helper may still run (or be stopped): kill it as the command uid, and keep the
+      // slot until it actually closes.
+      held = false;
+      const settlement = helperEnded(live, deps.drainMs ?? MEASURE_STDOUT_DRAIN_MS).then(release, release);
+      // Kill only while no `exit` has been observed, in this one synchronous section: after
+      // `exit` the pid may belong to a live command. libuv can reap a child a few microtasks
+      // before its `exit` is emitted, so a kill in that window may reach a free pid (reported
+      // *_unkilled); reuse would need the pid space to wrap in between. An already-exited
+      // helper counts as ended.
+      let killed = live.hasExited();
+      if (!killed && live.pid !== undefined) {
+        const kill = deps.killAsCommandUid ?? ((pid: number) => defaultKillAsCommandUid(pid, deps.runKill ?? defaultRunKill));
+        try { killed = kill(live.pid) === true; } catch { killed = false; }
+      }
+      return { state: "unknown", reason: killed ? run.kind : `${run.kind}_unkilled`, settlement };
+    }
+    if (run.kind !== "done") return { state: "unknown", reason: "protocol" }; // unreachable: narrows the type
+    if (run.breach !== undefined || run.line === undefined) return { state: "unknown", reason: "protocol" };
+    return parseMeasureLine(run.line, run.code);
+  } catch {
+    return { state: "unknown", reason: "protocol" };
+  } finally {
+    giveBack();
+  }
 }

@@ -301,6 +301,31 @@ spec:
             - name: UZI_CODEX_COMMAND_SANDBOX
               value: {{ .Values.workers.codex.commandSandbox | quote }}
             {{- end }}
+            {{- /* Not `with`: a numeric 0 is falsy there and would silently render the
+            4 GiB default instead of disabling rotation. A string is quoted as-is (the
+            controller validates it at boot). A number goes through int64 | toString, because
+            an integer from a values file or --set-json arrives as a float64 (--set gives an
+            int64) and a bare quote would render 4294967296 as "4.294967296e+09", which the
+            controller refuses at boot. int64 casts silently (true to 1, 1.5 to 1), so the
+            guards below fail anything that is not a non-negative whole int/int64/float64
+            instead of letting it become a tiny budget. */}}
+            {{- $cacheRunBytes := .Values.workers.codex.commandCacheRunBytes }}
+            {{- if and (not (kindIs "invalid" $cacheRunBytes)) (ne (toString $cacheRunBytes) "") }}
+            {{- if not (kindIs "string" $cacheRunBytes) }}
+            {{- if not (has (kindOf $cacheRunBytes) (list "int" "int64" "float64")) }}
+            {{- fail (printf "workers.codex.commandCacheRunBytes must be a string or a whole number, got %s" (kindOf $cacheRunBytes)) }}
+            {{- end }}
+            {{- if or (lt ($cacheRunBytes | float64) (0 | float64)) (ne ($cacheRunBytes | int64 | float64) ($cacheRunBytes | float64)) }}
+            {{- fail (printf "workers.codex.commandCacheRunBytes must be a non-negative whole number, got %v" $cacheRunBytes) }}
+            {{- end }}
+            {{- end }}
+            - name: UZI_CODEX_COMMAND_CACHE_RUN_BYTES
+              {{- if kindIs "string" $cacheRunBytes }}
+              value: {{ $cacheRunBytes | quote }}
+              {{- else }}
+              value: {{ $cacheRunBytes | int64 | toString | quote }}
+              {{- end }}
+            {{- end }}
             {{- if .Values.workers.docker.enabled }}
             # The docker tier (PRD #83 M3, PRD #89). Namespace + image are required
             # together — the controller refuses to boot with one set and not the other —

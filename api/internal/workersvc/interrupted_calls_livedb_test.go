@@ -434,6 +434,8 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 			t.Fatalf("run owner fence: %v", err)
 		}
 		e.exec(t, "UPDATE runs SET user_id=$2 WHERE id=$1", run, e.userID)
+		// The claim stamp's (user_id, worker_id) mapping would block the owner rewrite.
+		e.exec(t, "DELETE FROM run_forge_origins WHERE worker_id=$1", wid)
 		e.exec(t, "UPDATE workers SET user_id=$2 WHERE id=$1", wid, otherOwner)
 		if _, err := svc.InterruptedCalls(e.ctx, w, run, "nonce", 4); !errors.Is(err, ErrRunNotOwned) {
 			t.Fatalf("current worker owner fence: %v", err)

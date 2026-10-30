@@ -27,7 +27,7 @@ import (
 // not agent_failure (judgeable). The members are a strict subset of failorigin.go's
 // vocabulary. TestPreStartInfraFailOriginsExact pins the exact set.
 //
-// forge_unreachable is DELIBERATELY NOT a member: a forge cap-fail is NOT an
+// forge_unreachable is DELIBERATELY NOT a member: a legacy forge cap-fail is NOT an
 // iteration_count == 0 condition. iteration_count is only ever advanced (SetRunRunning uses
 // GREATEST) and never reset across park/promote/claim/fail, so a RESUMED run that did work
 // (iteration_count = N > 0), then hit a forge outage and forge-parked to the cap, cap-fails
@@ -42,15 +42,15 @@ var preStartInfraFailOrigins = map[string]bool{
 // neverJudgeFailOrigins is the fail_origin set that skips the judge REGARDLESS of
 // iteration_count (PRD #1392 M1, SC3). Its members are origins that are never a real agent
 // defect, so there is nothing to retrospect however far the run got. All but three are
-// SERVER-DERIVED. forge_unreachable is stamped ONLY inside SetState's
-// forge-park transaction (a forge that stayed unreachable at clone past the park cap), never by
+// SERVER-DERIVED. forge_unreachable is retained for legacy server-derived cap
+// outcomes; current finite forge exhaustion holds for the owner instead. It is never set by
 // a worker report (workerReportableFailOrigins excludes it, and CoerceFailOrigin drops a worker
 // forging it), so an untrusted report can never steer its skip. worker_residue_blocked (issue
 // #1783), skills_plugin_load_failed (issue #1888), and base_diverged are the WORKER-REPORTABLE
 // members. The agent can induce worker_residue_blocked (see its entry below); skipping
 // the judge for any of these three is a spend/accuracy trade-off, not a security boundary.
 // Unlike preStartInfraFailOrigins it is NOT gated on iteration_count == 0, because a
-// resumed run's forge cap-fail carries iteration_count > 0 (see preStartInfraFailOrigins). A
+// resumed run's legacy forge cap-fail carries iteration_count > 0 (see preStartInfraFailOrigins). A
 // strict subset of failorigin.go's vocabulary. TestNeverJudgeFailOriginsExact pins the exact set.
 var neverJudgeFailOrigins = map[string]bool{
 	// A divergent base is a worker refusal regardless of the number of agent iterations.
@@ -214,7 +214,7 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// the skip is gated on iteration_count:
 	//   - neverJudgeFailOrigins (forge_unreachable/task_undispatched/gate_presentation_refused/
 	//     data_volume_full/worker_residue_blocked/skills_plugin_load_failed/base_diverged):
-	//     never a real agent defect, so it skips REGARDLESS of iteration_count. A forge cap-fail on
+	//     never a real agent defect, so it skips REGARDLESS of iteration_count. A legacy forge cap-fail on
 	//     a RESUMED run carries iteration_count > 0 (iteration_count is only ever advanced, never
 	//     reset), so gating it on == 0 would wrongly judge it — SC3 requires "no judge run"
 	//     unconditionally. worker_residue_blocked (issue #1783) is worker-reportable and

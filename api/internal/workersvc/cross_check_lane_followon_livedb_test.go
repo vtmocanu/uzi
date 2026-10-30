@@ -67,7 +67,7 @@ func TestCrossCheckLaneServiceSnapshotBudgetLiveDB(t *testing.T) {
 }
 
 func TestCrossCheckLaneHealthRungsLiveDB(t *testing.T) {
-	for _, name := range []string{"unsupported", "full", "free", "cordoned-own", "ephemeral-own"} {
+	for _, name := range []string{"unsupported", "full", "free", "cordoned-own", "ephemeral-own", "forge-cooled", "forge-cooled-legacy", "forge-reserved"} {
 		t.Run(name, func(t *testing.T) {
 			f := laneFixture(t)
 			f.env.exec("UPDATE runs SET worker_id=$2 WHERE id=$1", f.lead, f.workerID)
@@ -85,6 +85,22 @@ func TestCrossCheckLaneHealthRungsLiveDB(t *testing.T) {
 				f.env.exec("UPDATE workers SET draining_since=now() WHERE id=$1", f.workerID)
 			case "ephemeral-own":
 				f.env.exec("UPDATE workers SET ephemeral=true,ephemeral_run_id=$2 WHERE id=$1", f.workerID, f.lead)
+			case "forge-cooled", "forge-cooled-legacy", "forge-reserved":
+				if name == "forge-cooled-legacy" {
+					f.env.exec(`UPDATE workers SET max_cross_check_slots=NULL,max_concurrent_runs=2,
+						protocol_capabilities=array_remove(protocol_capabilities,'cross_check_lane_v1') WHERE id=$1`, f.workerID)
+				}
+				f.env.exec(`INSERT INTO forge_origin_cooldowns(user_id,worker_id,origin,cooled_until,last_reason,observed_at)
+					SELECT r.user_id,$1,a.origin,now()+interval '1 day','transient_clone_fetch_exhausted',now()
+					FROM runs r JOIN authorized_forge_origins a ON a.repo_id=r.repo_id AND a.user_id=r.user_id
+					WHERE r.id=$2`, f.workerID, f.runID)
+				if name == "forge-reserved" {
+					f.env.exec(`UPDATE forge_origin_cooldowns SET cooled_until=now()-interval '1 day',
+						reservation_run_id=$2,reservation_generation=1,reservation_incarnation=incarnation,
+						reservation_version=observation_version,reservation_observation_version=observation_version
+						WHERE worker_id=$1`, f.workerID, f.lead)
+				}
+				strict, claimable, reason = 0, 0, reasonForgeOriginWait
 			}
 			now := time.Now()
 			counts, err := f.svc.WorkerEligibilityForHealth(f.env.ctx, now, f.runID)

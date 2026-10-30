@@ -484,7 +484,9 @@ export function RunDefaults() {
       setNotice(
         eff === ""
           ? "Claude reasoning effort cleared. Your Claude runs use the uzi default (medium)."
-          : `Reasoning effort set to ${eff}. It applies to your next run.`,
+          : eff === "runtime"
+            ? "Claude reasoning effort set to Runtime default. Claude Code decides at your next run."
+            : `Reasoning effort set to ${eff}. It applies to your next run.`,
       );
     } catch (err) {
       setError(errorMessage(err, "Failed to save reasoning effort"));
@@ -506,7 +508,9 @@ export function RunDefaults() {
       setSavedCodexEffort(eff);
       setNotice(eff === ""
         ? "Codex reasoning effort cleared. Your Codex runs use the uzi default (medium)."
-        : `Codex reasoning effort set to ${eff}. It applies at the next claim.`);
+        : eff === "runtime"
+          ? "Codex reasoning effort set to Runtime default. Codex decides at the next claim."
+          : `Codex reasoning effort set to ${eff}. It applies at the next claim.`);
     } catch (err) {
       setError(errorMessage(err, "Failed to save Codex reasoning effort"));
     } finally {
@@ -1243,6 +1247,9 @@ export function RunDefaults() {
             its model does not support; Codex receives the selected level directly. It applies to your
             own runs only; other users are unaffected.
           </p>
+          <p className="mt-2 text-sm text-muted">
+            Runtime default sends no level, so Claude Code or Codex decides; a resumed session may keep the level it last used.
+          </p>
         </div>
 
         {loading ? (
@@ -1250,7 +1257,7 @@ export function RunDefaults() {
         ) : (
           <div className="space-y-3">
             <Field label="Claude effort" htmlFor="worker-effort">
-              <EffortSelect id="worker-effort" value={defaultEffort} onChange={setDefaultEffort} />
+              <EffortSelect id="worker-effort" value={defaultEffort} onChange={setDefaultEffort} runtimeLabel="Runtime default · value not reported" />
             </Field>
             <Button type="button" disabled={effortBusy || !effortDirty} onClick={saveEffort}>
               Save Claude effort
@@ -1258,7 +1265,7 @@ export function RunDefaults() {
             {showCodexLane && (
               <>
                 <Field label="Codex effort" htmlFor="codex-effort">
-                  <EffortSelect id="codex-effort" value={defaultCodexEffort} onChange={setDefaultCodexEffort} />
+                  <EffortSelect id="codex-effort" value={defaultCodexEffort} onChange={setDefaultCodexEffort} runtimeLabel="Runtime default · Codex decides" />
                 </Field>
                 <Button type="button" disabled={codexEffortBusy || !codexEffortDirty} onClick={saveCodexEffort}>
                   Save Codex effort

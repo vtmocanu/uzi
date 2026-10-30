@@ -575,6 +575,11 @@ workers:
     # kernel lacks Landlock. `best-effort` applies Landlock where the kernel offers it and
     # runs the command unconfined otherwise. No mode relaxes the uid split.
     commandSandbox: "off"
+    # Per-run Codex command-cache byte budget (max 9007199254740991). An unquoted integer
+    # (including 0) works; a string must be a plain decimal. A bool, a negative or a
+    # fractional number fails the render. Empty (the default) leaves the worker default
+    # of 4 GiB; 0 disables live rotation. Forwarded to the controller only when non-empty.
+    commandCacheRunBytes: ""
 
   # PRD #837 M4 disk-pressure recycle (self-healing worker disk). When a hosted worker
   # reports disk pressure (a volume at used/total >= the api's diskPressureThreshold

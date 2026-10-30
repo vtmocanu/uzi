@@ -5450,7 +5450,7 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
         })}
       />,
     );
-    expect(container.textContent).toContain("Waiting for the forge");
+    expect(container.textContent).toContain("Forge retry scheduled");
     expect(container.textContent).toContain("2 of 5");
     // The retry time renders as a wall-clock HH:MM (locale/tz-formatted, so match loosely).
     expect(container.textContent).toMatch(/Retry at \d{1,2}:\d{2}/);
@@ -5478,7 +5478,7 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
       <RecoveryWaitPanel run={run({ status: "recovery_wait", recovery_wait_cause: null })} />,
     );
     expect(container.textContent).toContain("transient interruption");
-    expect(container.textContent).not.toContain("Waiting for the forge");
+    expect(container.textContent).not.toContain("Forge retry scheduled");
   });
 
   // Issue #1766: a vault_locked park (a Codex credential refresh or release found the run
@@ -5516,7 +5516,7 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     );
     expect(container.textContent).toContain("The run saved its work before parking");
     expect(container.textContent).not.toContain("transient interruption");
-    expect(container.textContent).not.toContain("Waiting for the forge");
+    expect(container.textContent).not.toContain("Forge retry scheduled");
     expect(container.textContent).not.toContain("2 of 5");
     // Unlock lives on the global banner: the panel offers no control of its own.
     expect(container.querySelector("button")).toBeNull();
@@ -5589,7 +5589,7 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     );
     expect(container.textContent).not.toContain("uzi freed");
     expect(container.textContent).not.toContain("transient interruption");
-    expect(container.textContent).not.toContain("Waiting for the forge");
+    expect(container.textContent).not.toContain("Forge retry scheduled");
     expect(container.textContent).not.toContain("4 of 5");
     expect(container.textContent).not.toMatch(/vault/i);
     expect(container.querySelector("button")).toBeNull();
@@ -5660,7 +5660,7 @@ describe("RecoveryWaitPanel: codex_account_unavailable (PRD #1590)", () => {
     // Only relogin_required sends the owner to Settings.
     expect(container.querySelector('a[href="/settings"]')).toBeNull();
     expect(container.textContent).not.toContain("transient interruption");
-    expect(container.textContent).not.toContain("Waiting for the forge");
+    expect(container.textContent).not.toContain("Forge retry scheduled");
   });
 
   it("renders relogin_required with the run's label and a link to the Codex credentials settings", () => {

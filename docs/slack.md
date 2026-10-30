@@ -258,6 +258,11 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   their own — only the review-ready / cycle-skipped messages above, so you
   don't get noise like "judge run completed" for a run you never see on the
   board.
+- **Cross-check runs**: a plan or code cross-check run gets no DM of its
+  own, neither for its state changes nor for a health flag. A plan
+  cross-check's reason can appear on the parent run's plan-gate message;
+  code cross-check findings go to the merge request's Code cross-check
+  section (see [Cross-check](./cross-check.md)).
 - **Run health nudges**: if a run you own gets flagged (stalled, looping,
   near timeout, waiting for a worker, or stuck too long awaiting approval —
   see [Run health](./run-health.md)), the root DM's `context` block picks up
@@ -269,6 +274,7 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   the existing plan-gate message, right next to its action buttons.
   When the run recovers, the `⚠️ <flag>` context element drops off on its own
   and nudging stops — no action needed.
+  A cross-check run is never nudged (see above).
 - **Vault-locked nudge**: Off users receive no vault-lock notice. If your
   protected vault is locked (e.g. after a deploy
   restarts the api) and it's blocking work that needs the vault — a run that is

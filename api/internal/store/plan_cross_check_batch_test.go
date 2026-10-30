@@ -42,6 +42,8 @@ func TestPlanCrossCheckChildBeforeParentBatchLiveDB(t *testing.T) {
 			f.runID[0] = 255
 			fx.checkerID = uuid.New()
 			fx.checkerID[0] = 0
+			// The claim stamp's run mapping would block the primary-key rewrite.
+			mustExec(ctx, t, f.pool, "DELETE FROM run_forge_origins WHERE run_id=$1", old)
 			mustExec(ctx, t, f.pool, "UPDATE runs SET id=$2 WHERE id=$1", old, f.runID)
 			insertPlanCrossCheckDeletionRows(ctx, t, fx)
 			mustExec(ctx, t, f.pool, `UPDATE runs SET status='running',worker_id=$3,claim_generation=1,

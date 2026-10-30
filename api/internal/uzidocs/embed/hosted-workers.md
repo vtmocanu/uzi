@@ -335,6 +335,8 @@ advice alike. Four things can hold a worker back:
 The [operator knobs](./configuration.md#controller) that control the first two
 are `UZI_WORKER_UID_SPLIT` and `UZI_CODEX_COMMAND_SANDBOX`.
 
+A related knob does not hold a worker back: the controller also forwards `UZI_CODEX_COMMAND_CACHE_RUN_BYTES` (chart value `workers.codex.commandCacheRunBytes`) to the worker container, only when it is set. It is the per-run budget past which a running Codex run's command cache is rotated to a fresh generation (default 4 GiB, `0` disables; best-effort, no hard size bound). Setting or changing it changes the pod spec and rolls the fleet once. See [Configuration](./configuration.md#controller).
+
 ## My Codex run says "no worker supporting custom Codex models is online"
 
 This is a narrower version of the message above, and only shows up when the
@@ -557,7 +559,8 @@ gauges, same [concurrency](./worker-setup.md#concurrent-runs) rules.
 The current Codex worker uses runtime 0.163.0 and defaults to `gpt-6.1-sol`
 when no worker-model override is set. Explicit model preferences remain
 unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
-keep separate overrides. See [Reasoning effort](worker-effort.md).
+keep separate overrides, and each can instead be set to **Runtime default**,
+which sends no effort level. See [Reasoning effort](worker-effort.md).
 
 Every Codex claim requires `codex_runtime_v2`, so an older worker cannot
 silently use the old model/catalog or ignore the requested effort. Codex runs

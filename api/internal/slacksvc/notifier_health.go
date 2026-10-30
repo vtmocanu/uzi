@@ -33,6 +33,9 @@ func (n *Notifier) handleHealth(ctx context.Context, ev healthEvent) {
 		}
 		return
 	}
+	if isCrossCheckChild(rc) {
+		return
+	}
 	if isTerminalStatus(rc.Status) {
 		defer func() { delete(n.rootRenders, rc.ID) }()
 	}

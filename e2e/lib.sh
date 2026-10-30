@@ -776,11 +776,11 @@ wait_completed_custody_receipt() {
 wait_forge_park_release() {
   local run="$1" generation="$2" timeout="${3:-10}" want="${4:-recovery_wait}" start=$SECONDS snapshot
   [[ "$generation" =~ ^[1-9][0-9]*$ ]] || fail "forge park invalid generation: $generation"
-  case "$want" in recovery_wait|failed) ;; *) fail "forge park invalid expected status: $want";; esac
+  case "$want" in recovery_wait|cancelled) ;; *) fail "forge park invalid expected status: $want";; esac
   while :; do
     snapshot="$(db_psql "SELECT COALESCE(json_agg(json_build_object('state',h.state,'inventory_guarded',h.inventory_guarded,
       'generation',h.generation,'final_disposition',h.final_disposition,'release_evidence',h.release_evidence,
-      'after_outcome',h.released_at >= CASE WHEN r.status='failed' THEN r.finished_at ELSE r.status_since END,
+      'after_outcome',h.released_at >= CASE WHEN r.status='cancelled' THEN r.finished_at ELSE r.status_since END,
       'run_status',r.status,'claim_generation',r.claim_generation)), '[]'::json)::text
       FROM recovery_custody_holds h JOIN runs r ON r.id=h.run_id
       WHERE h.run_id='$run' AND h.generation=$generation")"
@@ -805,6 +805,58 @@ wait_forge_park_release() {
     [ $((SECONDS - start)) -lt "$timeout" ] || fail "guarded forge park release timeout after ${timeout}s: $snapshot"
     sleep 2
   done
+}
+
+# Exact pre-clone claim/custody posture; one snapshot avoids mixing generations.
+forge_park_posture() {
+  db_psql "SELECT json_build_object('worker_id',r.worker_id,'session_id',r.session_id,
+    'generation',r.claim_generation,'claim_released_at',r.claim_released_at,
+    'status',r.status,'cause',r.recovery_wait_cause,'retry',r.recovery_retry_not_before,
+    'count',r.forge_park_count,'fail_origin',r.fail_origin,'finished_at',r.finished_at,
+    'holds',COALESCE((SELECT json_agg(json_build_object('id',h.id,'state',h.state,
+      'guarded',h.inventory_guarded,'disposition',h.final_disposition,'evidence',h.release_evidence,
+      'after_ack',h.released_at >= r.status_since))
+      FROM recovery_custody_holds h WHERE h.run_id=r.id AND h.generation=r.claim_generation), '[]'::json))
+    FROM runs r WHERE r.id='$1'"
+}
+
+# Assert the exhausted allowance holds the SAME claim. An exact guarded empty
+# final receipt after ACK may settle it; a legacy hold must remain open.
+assert_forge_owner_hold() {
+  local before="$1" after="$2"
+  printf '%s' "$after" | jq -e --argjson before "$before" '
+    .status=="recovery_wait" and .cause=="forge_unreachable" and .retry==null
+    and .count==2 and .fail_origin==null and .finished_at==null
+    and .worker_id!=null and .worker_id==$before.worker_id
+    and .session_id==$before.session_id and .generation==$before.generation
+    and .claim_released_at==null and $before.claim_released_at==null
+    and $before.status=="running" and $before.count==2
+    and (.holds|length)==1 and ($before.holds|length)==1
+    and .holds[0].id==$before.holds[0].id
+    and .holds[0].guarded==$before.holds[0].guarded
+    and $before.holds[0].state=="open"
+    and (.holds[0] | (.state=="open" and .disposition==null and .evidence==null)
+      or (.guarded==true and .state=="released" and .disposition=="settled"
+        and .evidence=="forge_no_output" and .after_ack==true))' >/dev/null \
+    || fail "forge owner hold changed claim/custody or terminalized: $after"
+}
+
+# Poll through the existing wait_eq seam; no promise that cooldown/custody admits
+# a queued attempt. Call only after checking the fixture's admission headroom.
+forge_attempt_ready() {
+  local view
+  view="$(forge_park_posture "$1")"
+  printf '%s' "$view" | jq -e '.status=="failed" or .status=="cancelled"' >/dev/null \
+    && fail "forge attempt unexpectedly terminal: $view"
+  printf '%s' "$view" | jq -r --argjson previous "${2:-2}" \
+    '.status=="running" and .count==2 and .generation==($previous+1)'
+}
+forge_owner_hold_ready() {
+  local view
+  view="$(forge_park_posture "$1")"
+  printf '%s' "$view" | jq -e '.status=="failed" or .status=="cancelled"' >/dev/null \
+    && fail "forge hold unexpectedly terminal: $view"
+  printf '%s' "$view" | jq -r '.status=="recovery_wait" and .cause=="forge_unreachable" and .retry==null'
 }
 
 # wait_status RUN WANT [TIMEOUT] — poll a run until it reaches WANT; abort early

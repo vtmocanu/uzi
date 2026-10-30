@@ -85,12 +85,17 @@ func (e interlockLiveDB) fpHoldCountByState(t *testing.T, runID uuid.UUID, state
 	return n
 }
 
-// fpPromoteDue forces recovery_retry_not_before into the past and runs the promotion pass,
+// fpPromoteDue advances both independent forge retry clocks into the past and runs the promotion pass,
 // returning true iff the run was promoted (recovery_wait -> queued). PromoteRecoveryWaitRuns is
 // UNCHANGED by #1392: it flips a due recovery_wait run to queued and keeps worker_id for affinity.
 func (e interlockLiveDB) fpPromoteDue(t *testing.T, runID uuid.UUID) bool {
 	t.Helper()
 	e.exec(t, `UPDATE runs SET recovery_retry_not_before = now() - interval '1 minute' WHERE id = $1`, runID)
+	// #3585: promotion alone does not bypass worker/origin admission. These
+	// lifecycle tests model both clocks due without a real-time wait.
+	e.exec(t, `UPDATE forge_origin_cooldowns c SET cooled_until = now() - interval '1 minute'
+		FROM run_forge_origins m WHERE m.run_id=$1 AND c.user_id=m.user_id
+		AND c.worker_id=m.worker_id AND c.origin=m.origin`, runID)
 	promoted, err := e.q.PromoteRecoveryWaitRuns(e.ctx, pgconv.Time(time.Now()))
 	if err != nil {
 		t.Fatalf("PromoteRecoveryWaitRuns: %v", err)
