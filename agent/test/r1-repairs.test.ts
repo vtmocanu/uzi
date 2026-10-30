@@ -114,6 +114,20 @@ it("R1 A2: deletion proof fences new reservations through actual rm settlement a
   assert.equal((await outbox.readTerminalJournal(run, 1))?.body.detail, policy.detail);
 });
 
+it("R1 selected capture gap never exposes a competing journal before its payload is owned", async t => {
+  const { outbox, make } = await fixture(t);
+  const writer = make();
+  await writer.init();
+  const token = outbox.reservePolicyFlight(run, 1)!;
+  assert.equal(outbox.selectPolicyFlight(token, policy.outcome_id), true);
+  assert.equal((await writer.journalPolicyHold(run, policy)).journaled, true);
+  assert.equal(await outbox.readTerminalJournal(run, 1), undefined);
+  assert.equal(await outbox.readTerminalJournalForRetirement(run, 1), undefined);
+  assert.equal(await outbox.hasPendingPolicyOutcome(run), true);
+  assert.equal((await outbox.journalPolicyHold(run, policy)).journaled, true);
+  assert.deepEqual((await outbox.readTerminalJournalForRetirement(run, 1))?.journal.body, policy);
+});
+
 it("R1 B2: authenticated same-ID different-body collision cannot replace selected original", async t => {
   const { outbox, make, root } = await fixture(t);
   const competing = make();
@@ -127,9 +141,12 @@ it("R1 B2: authenticated same-ID different-body collision cannot replace selecte
   // File disappearance grants no retirement. Retrying after removal preserves the original body/id.
   await fs.unlink(path.join(root, run, "terminal-1.json"));
   assert.equal(outbox.listPendingTerminals()[0]?.outcome_kind, "policy_hold");
-  assert.equal((await outbox.journalPolicyHold(run, { ...policy, tag: "misalignmentPolicyViolation" })).journaled, true);
+  assert.equal((await outbox.journalTerminal(run, 1, "planning", 17,
+    { ...policy, tag: "misalignmentPolicyViolation", phase: "planning" }, "policy_hold")).journaled, true);
   const retained = await outbox.readTerminalJournal(run, 1);
   assert.deepEqual(retained?.body, policy);
+  assert.equal(retained?.phase, policy.phase);
+  assert.equal(retained?.messagesThroughSeq, 0);
 });
 
 it("R1 B1: actual oversized source remains unknown and cannot become ordinary", async t => {

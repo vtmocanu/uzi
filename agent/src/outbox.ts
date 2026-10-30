@@ -272,6 +272,7 @@ interface TerminalMeta {
   budgetDeferred?: boolean;
   selectionToken?: symbol;
   selectedPayloadHash?: string;
+  selectedMessagesThroughSeq?: number;
   selectedLifetime?: string;
   ordinaryVersion?: string;
   capturePending?: boolean;
@@ -802,7 +803,7 @@ export class Outbox {
     if (Buffer.byteLength(JSON.stringify([runId, candidate.fileName, candidate.claimGeneration,
       candidate.phaseAtJournal, candidate.since, candidate.blocked, candidate.outcomeKind,
       candidate.policyOutcomeId, candidate.selectedPayloadHash, candidate.blockedReason,
-      candidate.policyBytes, !!candidate.capturePending, !!candidate.budgetDeferred])) > 1024) return false;
+      candidate.policyBytes, candidate.selectedMessagesThroughSeq, !!candidate.capturePending, !!candidate.budgetDeferred])) > 1024) return false;
     if (existingAllowed && this.runs.get(runId)?.terminals.has(candidate.claimGeneration)) return true;
     let count = this.policyFlights.size;
     for (const rs of this.runs.values()) {
@@ -1634,7 +1635,11 @@ export class Outbox {
         this.writable();
         return { journaled: false, reason: "reserve_exhausted" };
       }
-      if (selected?.unpersistedPolicy && outcomeKind === "policy_hold") canonicalBody = selected.unpersistedPolicy as unknown as Record<string, unknown>;
+      if (selected?.unpersistedPolicy && outcomeKind === "policy_hold") {
+        canonicalBody = selected.unpersistedPolicy as unknown as Record<string, unknown>;
+        phaseAtJournal = selected.phaseAtJournal;
+        messagesThroughSeq = selected.selectedMessagesThroughSeq ?? 0;
+      }
       if (outcomeKind === "policy_hold" && (!selected || (selected.capturePending && selected.selectionToken &&
           selected.policyOutcomeId === (canonicalBody as unknown as PolicyHoldRequest).outcome_id && !selected.unpersistedPolicy))) {
         const bytes = Buffer.byteLength(JSON.stringify(canonicalBody));
@@ -1646,6 +1651,7 @@ export class Outbox {
           fileName: terminalFileName(claimGeneration), claimGeneration, phaseAtJournal,
           since: selected?.since ?? this.now(), blocked: false, outcomeKind: fits ? "policy_hold" : "unknown",
           selectionToken: selected?.selectionToken,
+          selectedMessagesThroughSeq: messagesThroughSeq,
           policyOutcomeId: (canonicalBody as unknown as PolicyHoldRequest).outcome_id,
           selectedPayloadHash: createHash("sha256").update(terminalRetirementPayload({ run_id: runId,
             claim_generation: claimGeneration, outcome_kind: outcomeKind, body: canonicalBody,
@@ -1701,6 +1707,9 @@ export class Outbox {
         state: "installed",
         blocked: false,
       };
+      if (outcomeKind === "policy_hold" && winner?.selectedPayloadHash &&
+          winner.selectedPayloadHash !== createHash("sha256").update(terminalRetirementPayload(record as unknown as Record<string, unknown>)).digest("hex"))
+        return { journaled: false, reason: "winner_unavailable" };
       const serialized = this.seal(MAC_DOMAIN_TERMINAL, record);
       // Reserve the largest closed-vocabulary blocked-state update, so every accepted
       // new journal remains readable after any legitimate blocked-state rewrite.
@@ -1754,7 +1763,10 @@ export class Outbox {
           fileName: terminalFileName(claimGeneration),
           outcomeKind,
           selectionToken: winner?.selectionToken,
-          ...(outcomeKind === "policy_hold" ? { selectedPayloadHash: createHash("sha256").update(terminalRetirementPayload(record as unknown as Record<string, unknown>)).digest("hex") } : {}),
+          ...(outcomeKind === "policy_hold" ? {
+            selectedPayloadHash: winner?.selectedPayloadHash ?? createHash("sha256").update(terminalRetirementPayload(record as unknown as Record<string, unknown>)).digest("hex"),
+            selectedMessagesThroughSeq: messagesThroughSeq,
+          } : {}),
           ...(outcomeKind === "policy_hold" ? { policyOutcomeId: (canonicalBody as unknown as PolicyHoldRequest).outcome_id } : {}),
           policyBytes: Buffer.byteLength(serialized),
           claimGeneration,
@@ -2649,6 +2661,11 @@ export class Outbox {
       }
       if (!coerceTerminalRecord(obj, runId, generation)) return result;
       const candidate = this.runs.get(runId)?.terminals.get(generation);
+      if (candidate?.fileName === fileName && candidate.capturePending) {
+        // The identity is selected, but its owned payload has not been captured yet.
+        observation.kind = "unreadable";
+        return result;
+      }
       if (candidate?.fileName === fileName && candidate.outcomeKind === "unknown" && !candidate.capturePending &&
           (!candidate.budgetDeferred || (candidate.deferredVersion && candidate.deferredVersion !== fileVersion(stat)))) {
         observation.kind = "unreadable";
