@@ -2776,8 +2776,10 @@ export async function startCommandCacheHolder(token: string, deps: StartHolderDe
 
 /** The measurement's result. `unknown` is any outcome that is not an exact, complete
  *  count: a bounded-walk word, a setup error, garbage, a delivery timeout, a spawn failure.
- *  `settlement` is present when a helper may still be running: it resolves only at the
- *  helper's ACTUAL close, never by a timer. `cancelled` means nothing was spawned. */
+ *  `settlement` is present when a helper may still be running: it resolves when the helper
+ *  has ended ({@link helperEnded}: its `close`, or its observed `exit` plus
+ *  {@link MEASURE_STDOUT_DRAIN_MS}), never on the delivery timeout alone. `cancelled` means
+ *  nothing was spawned. */
 export type CacheMeasureResult =
   | { readonly state: "complete"; readonly bytes: number }
   | { readonly state: "unknown"; readonly reason: string; readonly settlement?: Promise<void> }
