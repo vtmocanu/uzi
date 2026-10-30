@@ -1690,6 +1690,10 @@ type Params struct {
 	// It gates step A only (held_publish.go). The zero value is off; the default-on lives in
 	// config.go where the env is read.
 	HeldPublication bool
+
+	// PublicationResume (issue #1324, RUN_PUBLICATION_RESUME_ENABLED) carries
+	// config.Config.PublicationResume. It gates NEW enrollment only; the zero value refuses it.
+	PublicationResume bool
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -2933,7 +2937,7 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 			return store.Worker{}, err
 		}
 		maxRequeues := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
-		if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+		if err := optInRunFences(ctx, qtx, updated.ID, true); err != nil {
 			return store.Worker{}, err
 		}
 		readopted, err = qtx.FrozenReadoptRunsFromSnapshot(ctx, store.FrozenReadoptRunsFromSnapshotParams{WorkerID: updated.ID, FrozenTargets: frozen, LockedParentIds: parents})
@@ -3494,6 +3498,9 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		if s.txBeginner != nil {
 			return s.claimRunLeasedNoSnapshot(ctx, wkr, params, report)
 		}
+		// This claim runs outside a transaction and cannot set the publication-resume opt-in
+		// guard_publication_resume requires, so it never selects a run with an active intent.
+		params.SkipPublicationResume = true
 		run, err := s.q.ClaimRun(ctx, params)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -4667,10 +4674,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return store.Run{}, false, werr
 			}
 		}
-		if len(owned.CheckpointCoordinates) > 0 {
-			if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
-				return store.Run{}, false, err
-			}
+		// The worker lock above is conditional; the opt-ins are not (a publication-enrolled run needs them).
+		if err := optInRunFences(ctx, qtx, wkr.ID, true); err != nil {
+			return store.Run{}, false, err
 		}
 		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 		if lerr != nil {
@@ -4768,10 +4774,8 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return store.Run{}, false, err
 			}
 		}
-		if len(owned.CheckpointCoordinates) > 0 {
-			if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
-				return store.Run{}, false, err
-			}
+		if err := optInRunFences(ctx, qtx, wkr.ID, true); err != nil {
+			return store.Run{}, false, err
 		}
 		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 		if lerr != nil {

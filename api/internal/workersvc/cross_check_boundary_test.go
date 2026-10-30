@@ -190,6 +190,11 @@ func (tx *crossCheckBoundaryTx) Exec(_ context.Context, sql string, args ...any)
 	if sql == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED" {
 		return pgconn.NewCommandTag("SET"), nil
 	}
+	// The fenced state write opts into the run-row fences unconditionally (issue #1324); it is a
+	// transaction-local setting, not a run write.
+	if strings.HasPrefix(sql, "-- name: OptInRunFences") {
+		return pgconn.NewCommandTag("SELECT 1"), nil
+	}
 	if tx.exec != nil {
 		return tx.exec(sql, args)
 	}

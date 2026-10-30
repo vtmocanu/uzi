@@ -357,7 +357,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"worker_id":         updated.ID.String(),
 		"worker":            dto,
-		"protocol_features": protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication),
+		"protocol_features": protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication, h.cfg.PublicationResume),
 		"register_nonce":    registerNonce,
 		// worker_outbox_max_pending (PRD #1391 Run B M3c): the server's terminal_pending outbox cap,
 		// returned at register so the worker can size its own pending-outcome quota to match the
@@ -400,7 +400,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // activeSnapshotEnabled (= !cfg.ActiveSnapshotDisabled). When the api is started with
 // UZI_ACTIVE_SNAPSHOT_DISABLED set (the D7 rollback simulation) the token is omitted and the
 // worker never sends the snapshot — the same shape an old worker sees.
-func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []string {
+func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publicationResumeEnabled bool) []string {
 	groups := [][]string{
 		{workersvc.ForgeCloneSuccessFeature},
 		{workersvc.CapabilityEvidenceFeature},
@@ -466,6 +466,11 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		// with disposition "held" / "hold_settled". Advertised UNCONDITIONALLY: a worker sends
 		// the two reports ONLY after seeing this token, because an older api 400s the unknown states.
 		{"credential_switch_hold"},
+	}
+	if publicationResumeEnabled {
+		// Issue #1324: this api accepts POST /api/worker/runs/{id}/publication-intent and sends
+		// publication_resume on the claim. Omitted when RUN_PUBLICATION_RESUME_ENABLED is off.
+		groups = append(groups, []string{workersvc.PublicationResumeFeature})
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a
@@ -624,7 +629,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	response := map[string]any{
 		"worker":                    dto,
-		"protocol_features":         protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication),
+		"protocol_features":         protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication, h.cfg.PublicationResume),
 		"worker_outbox_max_pending": h.cfg.WorkerOutboxMaxPending,
 	}
 	if slices.Contains(updated.ProtocolCapabilities, capability.DindMaintenanceV1) {

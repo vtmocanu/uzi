@@ -420,13 +420,10 @@ func (s *Service) recordRunCredentialTx(ctx context.Context, run store.Run, cred
 	// A no-op after a successful Commit; on every early return it undoes the lock and any write.
 	defer func() { _ = tx.Rollback(ctx) }()
 	qtx := store.New(tx)
-	if len(run.CheckpointCoordinates) > 0 {
-		if _, err := qtx.GetWorkerForUpdate(ctx, uuid.UUID(run.WorkerID.Bytes)); err != nil {
-			return 0, err
-		}
-		if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
-			return 0, err
-		}
+	// The worker lock is only for an enrolled checkpoint run; the opt-ins are unconditional so a
+	// publication-enrolled run is also covered.
+	if err := optInRunFences(ctx, qtx, uuid.UUID(run.WorkerID.Bytes), len(run.CheckpointCoordinates) == 0); err != nil {
+		return 0, err
 	}
 
 	// Step 1: lock the run row and re-read the fence columns (generation, released, last_seq).

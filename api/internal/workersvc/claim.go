@@ -24,7 +24,11 @@ import (
 // structured templates (PRD #3 provides several subagents that map to
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
-	ForgeOriginReservation *ForgeOriginReservation `json:"forge_origin_reservation,omitempty"`
+	// PublicationResume (issue #1324) is the active write-ahead publication intent, sent only to
+	// a publication_resume_v1 worker while an enrollment is active. Claim assembly is otherwise
+	// unchanged, including credentials.
+	PublicationResume      *PublicationResumePayload `json:"publication_resume,omitempty"`
+	ForgeOriginReservation *ForgeOriginReservation   `json:"forge_origin_reservation,omitempty"`
 	// CheckpointWriteUnresolved is admission-time evidence for validated enrolled tasks;
 	// nil leaves recovery status unknown for legacy claims.
 	CheckpointWriteUnresolved *bool                        `json:"checkpoint_write_unresolved,omitempty"`

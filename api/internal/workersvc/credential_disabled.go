@@ -323,6 +323,12 @@ func lockCredentialDisabledCheckpointRun(ctx context.Context, q interface {
 			return empty, err
 		}
 	}
+	// A publication-enrolled run needs the opt-in whether or not it is checkpoint-enrolled.
+	if pr, ok := q.(interface{ OptInPublicationResume(context.Context) error }); ok {
+		if err := pr.OptInPublicationResume(ctx); err != nil {
+			return empty, err
+		}
+	}
 	return run, nil
 }
 

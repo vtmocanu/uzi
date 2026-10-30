@@ -827,6 +827,12 @@ type Config struct {
 	// workersvc.Params.HeldPublication (step A admission); the handler reads it from Config for the
 	// advertised protocol feature and step B.
 	HeldPublication bool
+
+	// PublicationResume (issue #1324, RUN_PUBLICATION_RESUME_ENABLED) is the write-ahead
+	// publication intent switch. Unset or empty means on; parsed like UZI_HELD_PUBLICATION.
+	// Off stops advertising publication_resume_v1 and refuses NEW enrollment only: existing
+	// intents keep their meaning and stay guarded.
+	PublicationResume bool
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -1465,6 +1471,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.HeldPublication = heldPublication
+
+	publicationResume, err := parseOnOff("RUN_PUBLICATION_RESUME_ENABLED", true)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.PublicationResume = publicationResume
 
 	// Must run after Addr and TLSAddr are set (it rejects the two colliding).
 	if err := loadTLS(&cfg); err != nil {

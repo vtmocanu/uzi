@@ -1177,6 +1177,7 @@ type Run struct {
 	CapabilityInferenceEvidence []byte             `json:"capability_inference_evidence"`
 	IdleStallParkCount          int32              `json:"idle_stall_park_count"`
 	ForgeAdmission              []byte             `json:"forge_admission"`
+	RecoveryWaitPhase           pgtype.Text        `json:"recovery_wait_phase"`
 }
 
 type RunCompletionAttempt struct {
@@ -1336,6 +1337,25 @@ type RunMilestoneReconciliation struct {
 	AppliedInputID   int64              `json:"applied_input_id"`
 	StopCutoff       int64              `json:"stop_cutoff"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunPublicationResume struct {
+	RunID           uuid.UUID          `json:"run_id"`
+	EnrollmentSeq   int32              `json:"enrollment_seq"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	WorkerID        pgtype.UUID        `json:"worker_id"`
+	Intent          []byte             `json:"intent"`
+	CandidateSeq    int32              `json:"candidate_seq"`
+	State           string             `json:"state"`
+	RetiredReason   pgtype.Text        `json:"retired_reason"`
+	WaitStartedAt   pgtype.Timestamptz `json:"wait_started_at"`
+	FirstWaitAt     pgtype.Timestamptz `json:"first_wait_at"`
+	ParkTotal       int32              `json:"park_total"`
+	Episode         int32              `json:"episode"`
+	HoldReason      pgtype.Text        `json:"hold_reason"`
+	Handoff         []byte             `json:"handoff"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
 type RunReview struct {

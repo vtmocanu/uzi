@@ -244,10 +244,12 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		if !ok {
 			return nil, "", errClaimRecoveryNoTx
 		}
-		if _, err := live.GetWorkerForUpdate(ctx, identity.workerID); err != nil {
+		if err := optInRunFences(ctx, live, identity.workerID, false); err != nil {
 			return nil, "", err
 		}
-		if err := live.OptInCheckpointCoordinates(ctx); err != nil {
+	} else if live, ok := q.(pgxClaimFinishTx); ok {
+		// A publication-enrolled run needs only the opt-in; no worker lock is added for it.
+		if err := live.OptInRunFences(ctx); err != nil {
 			return nil, "", err
 		}
 	}
