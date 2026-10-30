@@ -1013,7 +1013,8 @@ with that DSN.
 The current Codex worker uses runtime 0.163.0 and defaults to `gpt-6.1-sol`
 when no worker-model override is set. Explicit model preferences remain
 unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
-keep separate overrides. See [Reasoning effort](worker-effort.md).
+keep separate overrides, and each can instead be set to **Runtime default**,
+which sends no effort level. See [Reasoning effort](worker-effort.md).
 
 Every Codex claim requires `codex_runtime_v2`, so an older worker cannot
 silently use the old model/catalog or ignore the requested effort. Codex runs

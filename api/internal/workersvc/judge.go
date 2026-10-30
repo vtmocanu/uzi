@@ -1248,13 +1248,14 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 
 	// The owner's per-user default reasoning effort (issue #1157): resolve it to the level
 	// the judge SDK call uses — the owner's explicit choice, or the uzi default medium when
-	// NULL/blank. Best-effort to preserve the judge's no-spurious-fail design (audit H2): on a
-	// read error, log and fall back to medium (resolveEffortPtr on the zero pgtype.Text yields it),
+	// NULL/blank (or no level at all for the owner's Runtime default, PRD #3247).
+	// Best-effort to preserve the judge's no-spurious-fail design (audit H2): on a
+	// read error, log and fall back to medium (resolveHarnessEffortPtr on the zero pgtype.Text yields it),
 	// exactly as the judge-model read above falls back rather than failing the claim.
 	defaultEffort, err := s.readUserDefaultEffort(ctx, run.UserID, Harness(run.Harness))
 	if err != nil {
 		slog.Warn("judge claim: read user default effort", "user", run.UserID.String(), "error", err)
-		// defaultEffort is the zero pgtype.Text (invalid) here → resolveEffortPtr → medium
+		// defaultEffort is the zero pgtype.Text (invalid) here → resolveHarnessEffortPtr → medium
 	}
 
 	frozenMemoryPolicy, policyErr := optionalMemoryPolicy(run.MemoryPolicy)

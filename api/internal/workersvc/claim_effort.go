@@ -18,10 +18,13 @@ func (s *Service) readUserDefaultEffort(ctx context.Context, userID uuid.UUID, h
 	return s.q.GetUserDefaultEffort(ctx, userID)
 }
 
+// resolveHarnessEffortPtr resolves the ordinary per-harness effort preference to
+// the claim's default_effort: nil (key omitted) exactly when the owner chose
+// Runtime default, else the resolved level.
 func resolveHarnessEffortPtr(harness Harness, value pgtype.Text) *string {
-	if harness == HarnessCodex {
-		effort := agenttmpl.ResolveDefaultCodexEffort(textPtr(value))
-		return &effort
+	r := agenttmpl.ResolveHarnessEffort(string(harness), textPtr(value))
+	if r.Mode == agenttmpl.EffortModeRuntimeDefault {
+		return nil
 	}
-	return resolveEffortPtr(value)
+	return &r.Level
 }

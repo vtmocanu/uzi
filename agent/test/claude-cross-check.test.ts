@@ -366,6 +366,12 @@ describe("ClaudeCrossCheck.run", () => {
       const claim = claudeClaim({ config: { default_model: "sonnet", default_effort: "extreme" as never } }, { effort_source: "pin" });
       await assert.rejects(rig([initFrame(), resultFrame(APPROVE)], { claim }).run(), CrossCheckCheckerUnavailableError);
     });
+
+    it("raises CrossCheckCheckerUnavailableError for a pinned claim whose default_effort is absent (dropped at decode)", async () => {
+      const claim = claudeClaim({ config: { default_model: "sonnet" } }, { effort_source: "pin" });
+      assert.ok(!Object.hasOwn(claim.config ?? {}, "default_effort"));
+      await assert.rejects(rig([initFrame(), resultFrame(APPROVE)], { claim }).run(), CrossCheckCheckerUnavailableError);
+    });
   });
 
   describe("pinned-model rejection (the SDK's typed model_not_found classification)", () => {

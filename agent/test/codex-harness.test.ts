@@ -667,6 +667,7 @@ function makeHarness(
     idNonce?: string;
     nowMs?: () => number;
     log?: Logger;
+    catalogProbe?: import("../src/codex/codex-harness.js").CodexHarnessOptions["catalogProbe"];
   } = {},
 ): HarnessBits {
   const transport = opts.transport ?? new FakeTransport();
@@ -691,6 +692,7 @@ function makeHarness(
     scrubProjected: opts.scrubProjected,
     idNonce: opts.idNonce,
     nowMs: opts.nowMs,
+    catalogProbe: opts.catalogProbe,
   });
   return { harness, transport, registry };
 }
@@ -2144,6 +2146,21 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.equal(params.effort, "high");
     assert.equal(params.modelReasoningEffort, undefined, "only the actual app-server wire key is sent");
     assert.deepEqual(params.input, [{ type: "text", text: "do the thing" }]);
+  });
+
+  // PRD #3247 preservation (passes on the pre-change tree): a request without an effort sends no
+  // `effort` key on either the root thread/start or the root turn/start.
+  it("omits the effort key from thread/start and turn/start when the request has no effort", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).end();
+    const turn = harness.startTurn(makeRequest());
+    await turn.events[Symbol.asyncIterator]().next();
+
+    for (const method of ["thread/start", "turn/start"]) {
+      const sent = transport.requests.find((r) => r.method === method);
+      assert.ok(sent, `${method} was sent`);
+      assert.equal(Object.hasOwn(rec(sent.params), "effort"), false, `${method} carries no effort key`);
+    }
   });
 
   // PRD #1551 (D4/D5): a validated custom worker-default root model reaches the turn/start +
@@ -6192,5 +6209,158 @@ describe("3506 retry context lifetime", () => {
     await collect(harness.startTurn(makeRequest()).events);
     assert.equal(notes.length, 1);
     assert.equal(harness.retryClassification?.classification, "rateLimitExceeded");
+  });
+});
+
+// PRD #3247 M2: the opt-in Codex catalog probe (`model/list`) and its bounded parser.
+describe("#3247 catalog probe", () => {
+  const opt = (reasoningEffort: string) => ({ reasoningEffort, description: "d" });
+  const listing = (model: string, efforts: unknown, extra: Record<string, unknown> = {}) =>
+    ({ data: [{ id: model, model, supportedReasoningEfforts: efforts, ...extra }] });
+
+  async function probeRun(
+    responder: (method: string, params: unknown) => unknown,
+    timeoutMs = 1000,
+  ): Promise<{ entries: unknown[]; order: string[]; transport: FakeTransport }> {
+    const entries: unknown[] = [];
+    const order: string[] = [];
+    const transport = new FakeTransport((method, params) => { order.push(method); return responder(method, params); });
+    const { harness } = makeHarness({
+      transport,
+      catalogProbe: { timeoutMs, onEntry: (e) => { order.push("onEntry"); entries.push(e); } },
+    });
+    transport.push(turnCompletedWithError("serverOverloaded")).end();
+    try {
+      await collect(harness.startTurn(makeRequest()).events);
+      transport.end();
+      await collect(harness.startTurn(makeRequest()).events).catch(() => undefined);
+    } finally { await harness.close(); }
+    return { entries, order, transport };
+  }
+
+  it("sends one bounded model/list after the thread starts and before turn/start, once per instance", async () => {
+    const { entries, order, transport } = await probeRun((method) =>
+      method === "model/list" ? listing("gpt-6-astra", [opt("low"), opt("high")], { defaultReasoningEffort: "low" }) : defaultResponder(method));
+    assert.deepEqual(entries[0], { defaultEffort: "low", supportedEfforts: ["low", "high"] });
+    assert.equal(entries.length, 1);
+    assert.equal(order.filter(m => m === "model/list").length, 1);
+    assert.ok(order.indexOf("thread/start") < order.indexOf("model/list"));
+    assert.ok(order.indexOf("onEntry") < order.indexOf("turn/start"));
+    const req = transport.requests.find(r => r.method === "model/list");
+    assert.deepEqual(req?.params, { limit: 200, includeHidden: true });
+  });
+
+  it("delivers undefined on an unknown-method {} reply, a rejection and a timeout, and the turn still starts", async () => {
+    for (const responder of [
+      (m: string) => defaultResponder(m),
+      (m: string) => (m === "model/list" ? Promise.reject(new Error("boom")) : defaultResponder(m)),
+      (m: string) => (m === "model/list" ? new Promise(() => undefined) : defaultResponder(m)),
+    ]) {
+      const { entries, order } = await probeRun(responder, 10);
+      assert.deepEqual(entries, [undefined]);
+      assert.ok(order.includes("turn/start"));
+    }
+  });
+
+  it("is not called without the option", async () => {
+    const transport = new FakeTransport();
+    const { harness } = makeHarness({ transport });
+    transport.push(turnCompletedWithError("serverOverloaded")).end();
+    try { await collect(harness.startTurn(makeRequest()).events); } finally { await harness.close(); }
+    assert.ok(!transport.requests.some(r => r.method === "model/list"));
+  });
+
+  it("a throwing onEntry never reaches the turn", async () => {
+    const transport = new FakeTransport((m) => (m === "model/list" ? listing("gpt-6-astra", ["low"]) : defaultResponder(m)));
+    const { harness } = makeHarness({ transport, catalogProbe: { timeoutMs: 1000, onEntry: () => { throw new Error("x"); } } });
+    transport.push(turnCompletedWithError("serverOverloaded")).end();
+    try { await collect(harness.startTurn(makeRequest()).events); } finally { await harness.close(); }
+    assert.ok(transport.requests.some(r => r.method === "turn/start"));
+  });
+
+  it("a stop or abort during an unanswered model/list ends the turn promptly with no turn/start", async () => {
+    for (const how of ["requestStop", "abort"] as const) {
+      const transport = new FakeTransport((m) => (m === "model/list" ? new Promise(() => undefined) : defaultResponder(m)));
+      const { harness } = makeHarness({
+        transport, catalogProbe: { timeoutMs: 60_000, onEntry: () => { throw new Error("no note after a stop"); } },
+      });
+      const ac = new AbortController();
+      const turn = harness.startTurn(makeRequest({ signal: ac.signal }));
+      const done = collect(turn.events);
+      const deadline = Date.now() + 3000;
+      while (!transport.requests.some(r => r.method === "model/list") && Date.now() < deadline) await tick();
+      assert.ok(transport.requests.some(r => r.method === "model/list"), "probe in flight");
+      if (how === "requestStop") turn.requestStop("cancel"); else ac.abort();
+      try { await withTimeout(done, 2000, how); } finally { await harness.close(); }
+      assert.ok(!transport.requests.some(r => r.method === "turn/start"), `${how}: no turn/start`);
+    }
+  });
+
+  it("a model/list reply that arrives after the harness timeout is absorbed: no response frame, no unmatched note", async () => {
+    const inbound = new PassThrough();
+    const outbound = new PassThrough();
+    const transport = createCodexTransport({ inbound, outbound });
+    const entries: unknown[] = [];
+    const { harness } = makeHarness({
+      launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }),
+      catalogProbe: { timeoutMs: 20, onEntry: (e) => { entries.push(e); } },
+    });
+    const written: Record<string, unknown>[] = [];
+    let buffered = "";
+    let listId: unknown;
+    outbound.setEncoding("utf8");
+    outbound.on("data", (chunk: string) => {
+      buffered += chunk;
+      let end: number;
+      while ((end = buffered.indexOf("\n")) !== -1) {
+        const frame = rec(JSON.parse(buffered.slice(0, end)));
+        buffered = buffered.slice(end + 1);
+        written.push(frame);
+        if (frame.id === undefined || typeof frame.method !== "string") continue;
+        if (frame.method === "model/list") { listId = frame.id; continue; }
+        inbound.write(JSON.stringify({ id: frame.id, result: defaultResponder(frame.method) }) + "\n");
+        if (frame.method === "turn/start") {
+          // The harness timer has fired by now; the late reply and the turn end follow it.
+          setTimeout(() => {
+            inbound.write(JSON.stringify({ id: listId, result: { data: [] } }) + "\n");
+            const n = turnCompleted("completed");
+            inbound.write(JSON.stringify({ method: n.method, params: n.params }) + "\n");
+          }, 30);
+        }
+      }
+    });
+    try {
+      await withTimeout(collect(harness.startTurn(makeRequest()).events), 5000, "late model/list");
+    } finally { await harness.close(); inbound.destroy(); outbound.destroy(); }
+    assert.deepEqual(entries, [undefined]);
+    assert.ok(listId !== undefined, "model/list was sent");
+    assert.equal(written.filter(f => f.method === undefined && (f.result !== undefined || f.error !== undefined)).length, 0,
+      "the worker wrote no JSON-RPC response frame for the late model/list id");
+  });
+
+  describe("parseCatalogEntry bounds", () => {
+    it("accepts object and bare-string efforts and matches by model or id", async () => {
+      const { parseCatalogEntry } = await import("../src/codex/catalog-probe.js");
+      assert.deepEqual(parseCatalogEntry({ data: [{ id: "a", model: "m", supportedReasoningEfforts: ["low", opt("max")] }] }, "a"),
+        { supportedEfforts: ["low", "max"] });
+      assert.deepEqual(parseCatalogEntry({ data: [{ id: "a", model: "m", supportedReasoningEfforts: [] }] }, "m"), { supportedEfforts: [] });
+    });
+
+    it("rejects malformed, oversized and unmatched responses", async () => {
+      const { parseCatalogEntry } = await import("../src/codex/catalog-probe.js");
+      const sup = (v: unknown, extra: Record<string, unknown> = {}) => ({ data: [{ id: "m", model: "m", supportedReasoningEfforts: v, ...extra }] });
+      const cases: unknown[] = [
+        undefined, null, [], "x", {}, { data: "x" },
+        { data: Array.from({ length: 201 }, () => ({ id: "m", model: "m", supportedReasoningEfforts: [] })) },
+        { data: [{ id: "other", model: "other", supportedReasoningEfforts: [] }] },
+        { data: [{ id: "m".repeat(101), model: "m".repeat(101), supportedReasoningEfforts: [] }] },
+        sup("low"), sup(undefined), sup(Array.from({ length: 17 }, () => "low")),
+        sup(["x".repeat(17)]), sup([1]), sup([{ reasoningEffort: 3 }]),
+        sup(["low"], { defaultReasoningEffort: "x".repeat(17) }), sup(["low"], { defaultReasoningEffort: 7 }),
+      ];
+      for (const c of cases) assert.equal(parseCatalogEntry(c, "m"), undefined, JSON.stringify(c)?.slice(0, 60));
+      assert.ok(parseCatalogEntry({ data: Array.from({ length: 200 }, () => ({ id: "m", model: "m", supportedReasoningEfforts: [] })) }, "m"));
+      assert.ok(parseCatalogEntry(sup(Array.from({ length: 16 }, () => "x".repeat(16))), "m"));
+    });
   });
 });

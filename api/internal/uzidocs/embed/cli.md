@@ -2985,12 +2985,28 @@ for resolution, validation and capability requirements.
 
 After the cross-check table, the human output prints a **Model settings**
 table with the columns `SETTING  HARNESS  STORED  DEFAULT  RESOLVED  SOURCE`,
-with judge rows for `claude` and `codex`. `SOURCE` is `your choice`,
-`instance default` or `built-in`. `--json` carries the same cells as
-`judge_models` (ordered claude, codex: `harness`, `model`, `default_model`,
-`default_source`, `resolved_model`, `source`; read-only) and the stored Codex
-lane as `codex_judge_model`. See
+with judge rows for `claude` and `codex` and two `effort` rows (one per
+harness) for your ordinary [reasoning effort](./worker-effort.md). `SOURCE` is
+`your choice`, `instance default` or `built-in`. `--json` carries the same
+cells as `judge_models` (ordered claude, codex: `harness`, `model`,
+`default_model`, `default_source`, `resolved_model`, `source`; read-only) and
+the stored Codex lane as `codex_judge_model`. See
 [Run judge](./judge.md#which-model-it-runs-on).
+
+An effort row whose preference is **Runtime default** shows `runtime default`
+in `STORED` and in `RESOLVED` (Claude: `runtime default (value not reported)`),
+for example:
+
+```text
+effort  claude  runtime default  medium  runtime default (value not reported)  your choice
+```
+
+`--json` carries the effort rows as the read-only `effort_settings` (ordered
+claude, codex: `harness`, `effort`, `default_effort`, `default_source`,
+`resolved_effort`, `source`, `mode`). `resolved_effort` is `null` exactly when
+`mode` is `runtime_default`. The CLI cannot set effort: the write endpoint is
+cookie-only, so use **Settings → Run defaults → Reasoning effort**. See
+[Reasoning effort](./worker-effort.md#runtime-default).
 
 The human output ends with a `Now summary: on (default)`, `on` or `off` line:
 your own switch for the model-written [Now summary](./run-activity.md#now-summary)

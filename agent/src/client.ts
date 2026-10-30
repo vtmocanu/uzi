@@ -15,6 +15,7 @@ import { MaintenanceResources } from "./recovery-maintenance.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
 import type { DindMeterSample } from "./dind-meter.js";
+import { isHarnessEffort } from "./harness.js";
 import type { Logger } from "./log.js";
 import type { ResidueQuarantineState } from "./residue-quarantine.js";
 import type { UsageWireRequest } from "./usage-recorder.js";
@@ -2027,6 +2028,7 @@ export class WorkerClient {
       }
       deadline.throwIfAborted();
       validateClaimMemory(claim);
+      this.dropUnknownDefaultEffort(claim);
       if (isRecord(claim) && claim.inventory_guarded !== undefined &&
           (typeof claim.inventory_guarded !== "boolean" ||
            (claim.inventory_guarded === true &&
@@ -2111,7 +2113,20 @@ export class WorkerClient {
     if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_owner_episode) ||
         (claim.worker_recovery_owner_episode as number) < 0)) delete claim.worker_recovery_owner_episode;
     validateClaimMemory(claim);
+    this.dropUnknownDefaultEffort(claim);
     return claim;
+  }
+
+  /** Claim guard (PRD #3247): a `config.default_effort` outside the closed HARNESS_EFFORTS set
+   *  (the server-side `runtime` token, an unknown level, "" or a non-string) is deleted so the
+   *  harness falls back to its own default. The warning never echoes the untrusted value. */
+  private dropUnknownDefaultEffort(claim: unknown): void {
+    if (!isRecord(claim) || !isRecord(claim.config) || !Object.hasOwn(claim.config, "default_effort")) return;
+    if (isHarnessEffort(claim.config.default_effort)) return;
+    delete claim.config.default_effort;
+    this.log.warn("claim default_effort outside the closed effort set; dropped", {
+      run_id: claim.run_id,
+    });
   }
 
   /**

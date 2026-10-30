@@ -277,6 +277,15 @@ sanitized error could not distinguish unsupported effort from a narrower server
 or entitlement failure. The SDK's open model string and wider effort union are
 therefore transport types, not picker authority.
 
+**Amendment (2026-10-30, #3247).** A Runtime default preference omits the effort
+level entirely. For an explicit level, uzi reads the runtime's `model/list`
+catalog read-only (one bounded request per claim, before its first turn) and, when the
+matched model does not list the chosen level, shows one advisory warning in the
+run feed. uzi never rewrites, clamps or retries a level at another value; the
+level is sent unchanged and a provider rejection fails the turn normally. The
+closed product vocabulary above is unchanged. Rationale:
+[PRD #3247](../prds/3247-runtime-default-effort.md).
+
 **Amendment (2026-09-23, Codex 0.156.1 pin).** The picker adds `gpt-6-sol`. Its bundled
 0.156.1 catalog entry requires client `>= 0.155.0`, lists `low` through `ultra` (so uzi's
 `low | medium | high | xhigh | max` contract still maps one-to-one), and differs from the two
