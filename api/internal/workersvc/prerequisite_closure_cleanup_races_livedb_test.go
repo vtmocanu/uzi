@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing/format/pktline"
 	"github.com/google/uuid"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -126,6 +127,9 @@ func newCleanupRaceLiveDB(t *testing.T, prior int) (*prerequisiteExecutorLiveDB,
 	other := New(f.env.q, f.s.box, testParams())
 	other.SetTxBeginner(f.env.pool)
 	other.SetClock(clock.nowLiveDB)
+	other.SetForges(&m3Builder{build: func(baseURL string) (forge.Forge, error) {
+		return f.fixtureForge(t, baseURL, f.builder.f)
+	}})
 	other.SetForgeBaseURLAllowed(func(string) bool { return true })
 	// Start in the cleanup retry class: the first audit is also due after
 	// capture expiry, and an audit-only item would deduplicate cleanup.

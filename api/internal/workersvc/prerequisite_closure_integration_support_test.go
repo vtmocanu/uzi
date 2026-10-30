@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -89,9 +90,42 @@ func (o *m3Transactions) transaction(ctx context.Context, fn func(PrerequisiteSt
 	return nil
 }
 
-type m3Builder struct{ build func() (forge.Forge, error) }
+type m3Builder struct {
+	build func(string) (forge.Forge, error)
+}
 
-func (b *m3Builder) ForgeForConnection(string, string, []byte) (forge.Forge, error) { return b.build() }
+func (b *m3Builder) ForgeForConnection(_ string, baseURL string, _ []byte) (forge.Forge, error) {
+	return b.build(baseURL)
+}
+
+// Only seeded fixture objects supply metadata. Keep pointers so explicit remote
+// rebinding before execution is reflected, while preserving custom ancestry stubs.
+func (f *prerequisiteExecutorLiveDB) fixtureForge(t *testing.T, baseURL string, driver forge.Forge) (forge.Forge, error) {
+	t.Helper()
+	original, ok := driver.(*prerequisiteTestForge)
+	if !ok {
+		return nil, fmt.Errorf("unsupported LiveDB fixture forge %T", driver)
+	}
+	clone := *original
+	clone.getProject = func(ctx context.Context, id int64) (forge.Project, error) {
+		f.fixturesMu.RLock()
+		defer f.fixturesMu.RUnlock()
+		var selected *prerequisiteMemory
+		for _, m := range f.fixtures {
+			if m.conn.BaseUrl == baseURL && m.repo.ForgeProjectID == id {
+				if selected != nil {
+					return forge.Project{}, fmt.Errorf("ambiguous fixture project %s/%d", baseURL, id)
+				}
+				selected = m
+			}
+		}
+		if selected == nil {
+			return forge.Project{}, fmt.Errorf("unknown fixture project %s/%d", baseURL, id)
+		}
+		return prerequisiteProjectStub(t, selected)(ctx, id)
+	}
+	return &clone, nil
+}
 
 func m3Context(t *testing.T) context.Context {
 	t.Helper()

@@ -16,11 +16,13 @@ import (
 // Each test owns a disposable, fully migrated database. Production triggers stay
 // installed. The explicit search_path makes now() use only this database's clock.
 type prerequisiteExecutorLiveDB struct {
-	env     codexTestEnv
-	s       *Service
-	m       *prerequisiteMemory
-	h       *prerequisiteHTTP
-	builder *prerequisiteTestBuilder
+	env        codexTestEnv
+	s          *Service
+	m          *prerequisiteMemory
+	h          *prerequisiteHTTP
+	builder    *prerequisiteTestBuilder
+	fixturesMu sync.RWMutex
+	fixtures   []*prerequisiteMemory
 }
 
 func newPrerequisiteExecutorLiveDB(t *testing.T, n int) *prerequisiteExecutorLiveDB {
@@ -50,6 +52,10 @@ func newPrerequisiteExecutorLiveDB(t *testing.T, n int) *prerequisiteExecutorLiv
 	s.SetTxBeginner(pool)
 	f := &prerequisiteExecutorLiveDB{env: env, s: s, m: m, h: h, builder: b}
 	f.seedLiveDB(t, m)
+	s.SetForges(&m3Builder{build: func(baseURL string) (forge.Forge, error) {
+		b.builds++
+		return f.fixtureForge(t, baseURL, b.f)
+	}})
 	return f
 }
 func (f *prerequisiteExecutorLiveDB) seedLiveDB(t *testing.T, m *prerequisiteMemory) {
@@ -72,6 +78,9 @@ func (f *prerequisiteExecutorLiveDB) seedLiveDB(t *testing.T, m *prerequisiteMem
 		t.Fatal(err)
 	}
 	m.row = row
+	f.fixturesMu.Lock()
+	f.fixtures = append(f.fixtures, m)
+	f.fixturesMu.Unlock()
 }
 func (f *prerequisiteExecutorLiveDB) readLiveDB(t *testing.T) store.RecoveryPrerequisiteClosure {
 	t.Helper()

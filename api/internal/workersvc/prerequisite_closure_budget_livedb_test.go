@@ -58,6 +58,8 @@ func TestPrerequisiteEarlierItemsDeferLatePreparationLiveDB(t *testing.T) {
 		}
 		return forge.AncestryAncestor, nil
 	}}
+	// The listing lane constructs one metadata driver, independently of the
+	// four preparation drivers counted alongside the ancestry proofs below.
 	for pass := 1; pass <= 4; pass++ {
 		if _, e := f.s.SweepPrerequisiteClosures(f.env.ctx); e != nil {
 			t.Fatal(e)
@@ -67,11 +69,11 @@ func TestPrerequisiteEarlierItemsDeferLatePreparationLiveDB(t *testing.T) {
 			if late.State != "pending" || late.Attempts != 0 || late.InvokedAt.Valid || late.LiveRunID.Valid || f.h.sends != 0 {
 				t.Fatalf("pass=%d late state=%s attempts=%d marker=%t live=%t sends=%d", pass, late.State, late.Attempts, late.InvokedAt.Valid, late.LiveRunID.Valid, f.h.sends)
 			}
-			if proofs != pass*6 || f.builder.builds != pass {
+			if proofs != pass*6 || f.builder.builds != pass+1 {
 				t.Fatalf("pass=%d proofs=%d builds=%d", pass, proofs, f.builder.builds)
 			}
 		} else {
-			if late.State != "pinned" || late.Attempts != 1 || !late.InvokedAt.Valid || !late.LiveRunID.Valid || f.h.sends != 1 || proofs != 19 || f.builder.builds != 4 {
+			if late.State != "pinned" || late.Attempts != 1 || !late.InvokedAt.Valid || !late.LiveRunID.Valid || f.h.sends != 1 || proofs != 19 || f.builder.builds != 5 {
 				t.Fatalf("full turn: state=%s attempts=%d marker=%t live=%t sends=%d proofs=%d builds=%d", late.State, late.Attempts, late.InvokedAt.Valid, late.LiveRunID.Valid, f.h.sends, proofs, f.builder.builds)
 			}
 		}

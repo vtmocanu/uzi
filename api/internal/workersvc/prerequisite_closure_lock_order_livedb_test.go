@@ -119,19 +119,26 @@ func m3StageBuilder(t *testing.T, ctx context.Context, f *prerequisiteExecutorLi
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
 	t.Cleanup(unblock)
-	f.s.SetForges(&m3Builder{build: func() (forge.Forge, error) {
-		close(entered)
-		select {
-		case <-release:
-		case <-ctx.Done():
-			return nil, ctx.Err()
+	var preparation sync.Once
+	f.s.SetForges(&m3Builder{build: func(baseURL string) (forge.Forge, error) {
+		var err error
+		preparation.Do(func() {
+			close(entered)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				err = ctx.Err()
+			}
+		})
+		if err != nil {
+			return nil, err
 		}
-		return &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, f.m), compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
+		return f.fixtureForge(t, baseURL, &prerequisiteTestForge{compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
 			if tx.active.Load() {
 				return forge.AncestryUnknown, io.ErrUnexpectedEOF
 			}
 			return forge.AncestryAncestor, nil
-		}}, nil
+		}})
 	}})
 	return entered, unblock
 }

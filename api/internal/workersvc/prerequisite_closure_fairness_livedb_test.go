@@ -27,7 +27,7 @@ func TestPrerequisiteSameServiceBusyKickRecoveredBySweepLiveDB(t *testing.T) {
 	unblock := func() { once.Do(func() { close(release) }) }
 	defer unblock()
 	var builds atomic.Int32
-	f.s.SetForges(&m3Builder{build: func() (forge.Forge, error) {
+	f.s.SetForges(&m3Builder{build: func(baseURL string) (forge.Forge, error) {
 		if builds.Add(1) == 1 {
 			close(entered)
 			select {
@@ -36,9 +36,9 @@ func TestPrerequisiteSameServiceBusyKickRecoveredBySweepLiveDB(t *testing.T) {
 				return nil, ctx.Err()
 			}
 		}
-		return &prerequisiteTestForge{getProject: prerequisiteProjectStub(t, f.m), compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
+		return f.fixtureForge(t, baseURL, &prerequisiteTestForge{compare: func(context.Context, int64, string, string) (forge.Ancestry, error) {
 			return forge.AncestryAncestor, nil
-		}}, nil
+		}})
 	}})
 	f.s.StartPrerequisiteClosures(ctx)
 	t.Cleanup(func() {
