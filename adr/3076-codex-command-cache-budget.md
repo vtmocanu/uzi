@@ -109,3 +109,44 @@ Cold evidence is **not** M0's only unmet requirement. Still unvalidated:
 - cold populated-tree latency and resulting refusal frequency.
 
 M0 remains incomplete. No entry/depth/wall constants have been selected. M1–M4 remain gated, M5 hosted acceptance remains unperformed, and delivery remains non-closing. A new calibration approach or acceptance change needs the owner decision required by the run; this timeout is not permission to enlarge the bound, weaken coverage, reuse a successful sample for later admissions, or implement policy.
+
+## Recovery follow-up: tools rebuilt, fresh experiment not started
+
+The recovered branch contained this historical report but no scratch sources, binary, corpus or raw logs from that experiment. The results above are inherited records, not measurements repeated or independently revalidated in this session. New scratch tooling was built on 2026-10-30; none of its tests constitutes the requested fresh Go calibration attempt.
+
+The configuration inputs supplied for the follow-up are an API pressure threshold of 0.90 and the default soft margin of 0.10, giving an experiment pressure stop floor of 0.80. The default hard margin is 0.03; its 0.87 threshold does not replace that earlier experiment stop. Pressure uses the higher valid byte/inode used fraction. Byte usage is `(blocks - bfree) / blocks`; allocation headroom separately uses `bavail * frsize`.
+
+At **2026-10-30 11:46:49 UTC**, the experiment filesystem and data filesystem each reported **52,521,566,208 total bytes**, **21,513,170,944 available bytes**, **0.538965 byte used fraction** and **0.130256 inode used fraction**. This is one prerequisite observation, not continuous monitoring or a reservation.
+
+The new tooling remains scratch-only and is not production implementation:
+
+| Building block | Executed check | Observed result |
+| --- | --- | --- |
+| Go fd-relative scanner | Focused Go tests; format check; build; tiny CLI fixtures | Final commands exited 0; 10 top-level Go test cases passed. No representative throughput result. |
+| Python guard and independent inventory | AST syntax checks, 25 unit tests, eight isolated mutation probes | Exit 0; no skips; all eight mutations failed their intended assertions. Cleanup authorization and monitor-gap tests use injected conditions. |
+| Linux owned-process backend | Nine actual subprocess tests | Exit 0; 4.313 s for this tiny suite. Cases include adopted descendants, cancellation, TERM/KILL, bounded capture, multiple roots, and withheld cleanup proof for an escaped child. |
+
+The backend uses a dedicated child owner and Linux subreaper. Cleanup proof requires actual waits, output closure, no pending children, and an observed ECHILD. An escaped-child fixture first returned uncertainty without cleanup permission; the test subsequently released and joined its own child. Its retention marker remains. These tests do not establish full-driver monitor integration, producer write bounds or experiment performance.
+
+For identifying these run-local artifacts, the new source SHA-256 values are:
+
+| Source | SHA-256 |
+| --- | --- |
+| Scanner | `ba693e57d78173fffd3257221fb9be0ec464bdd7d5efd875b5917a089498eecf` |
+| Guard and inventory | `e0955560a198a59a2ea1844acbd41150c629e06546de217a9ad31a5f1fe2585b` |
+| Disabled protocol manifest driver | `afb88e4c35a9a4d4acee07085a9761248ab13d2be6f6a52df2ceebbc08b40ffc` |
+| Owned-process backend | `d2fdc0d649b7ed867a2b72b30f2402f0c0d2992c6caef0ba698be99542bc71f9` |
+
+The scanner binary SHA-256 is `1278fce9107b4ff11c101b299c379a3ef3ea3784709bbb030cc064240fcaffa3`. New logs record their exits in the owned scratch directories. Scratch artifacts are not a published or durable test harness.
+
+### Own-producer allocation conflict
+
+The approved experiment requires “at most four approximately 2 GiB cache trees / 8 GiB corpus allocation” and fresh admission “before each allocation”, including the cumulative remaining planned allocation and the 4 GiB reserve. The authorized Go build/vet commands produce authentic caches, but an opaque command's finite runtime, reservation and periodic monitoring do not establish a bound on its writes.
+
+For example, with outstanding reservations R and R + 4 GiB available, own producers can write R + ε before the next sample. Later cancellation and actual descendant joins cannot undo that reserve breach. The approved warning about other runs consuming the reserve does not resolve this own-producer case. A hard kernel quota is not prescribed, but an enforceable own-allocation bound is still needed. It must cover cache writes, module downloads/extraction, build temporary output, bounded logs and writes during shutdown.
+
+Independent safety review identified this conflict before enabling any producer. Read-only capability checks did not establish a suitable existing bounded-write facility or cold environment. FUSE/KVM devices and the checked quota/VM tools were absent; the available Docker overlayfs driver alone does not demonstrate an enforceable per-experiment storage bound. No new infrastructure, privilege or producer was provisioned.
+
+The full scheduler, live monitor synchronization and complete observation matrix remain worker implementation obligations. The current manifest driver is deliberately disabled; its refusal is not a measured calibration result. Before an actual attempt, the producer boundary needs either an available bounded-write environment or an explicit owner amendment permitting sampled own-producer overshoot. No such amendment is assumed.
+
+**Follow-up outcome:** zero new representative scans, zero Go command pairs and no corpus allocation. No experiment producer or representative scan leg was launched; no producer cleanup was necessary. The small tooling tests completed; no live test child was left outstanding by those tests. Cold validation, full layout coverage, overhead/completeness targets and scanner-limit selection remain unperformed. M0 is incomplete and M1–M4 remain gated.
