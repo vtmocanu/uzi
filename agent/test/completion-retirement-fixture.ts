@@ -88,7 +88,9 @@ export async function rig(_t: TestContext, options: { codex: boolean; cohort?: n
   /** Explicit capture ids for the extra cohort members (default randomUUID()). */
   memberIds?: string[];
   /** The owner's run kind (default "issue") and clone slug (default "u5-source"); a slug the claimant would derive puts the owner at its real canonical path. */
-  kind?: "issue" | "mr_rework"; slug?: string }): Promise<Rig> {
+  kind?: "issue" | "mr_rework"; slug?: string;
+  /** Seed the owner at the CANONICAL clone path for its slug (no attempt id), as a legacy/unwired worker does. */
+  canonical?: boolean }): Promise<Rig> {
   const dataDir = fs.realpathSync(fx.dataDir);
   const lifetime = await acquireWorkerLifetime(dataDir, testLockOptions());
   const rt = new AuthorityRuntime({ lifetime, workerToken: TOKEN, timeoutMs: 5000 });
@@ -107,10 +109,10 @@ export async function rig(_t: TestContext, options: { codex: boolean; cohort?: n
   fs.chmodSync(path.dirname(bare), 0o700);
   fs.chmodSync(bare, 0o700);
   fs.chmodSync(path.join(bare, "config"), 0o600);
-  const attemptId = mintAttemptId(GENERATION);
+  const attemptId = options.canonical ? undefined : mintAttemptId(GENERATION);
   const cloneInfo = await git.runnerCloneForBranch(bare, BRANCH, options.slug ?? "u5-source", {
     isLive: () => false, beforeFree: async () => { throw new Error("unexpected incumbent"); },
-  }, claim.run_id, false, undefined, {
+  }, claim.run_id, false, undefined, attemptId === undefined ? undefined : {
     attemptId, isLive: () => false, beforeSeed: async paths => assert.deepEqual(paths, []),
   });
   await git.markRecoveryCapture(bare, cloneInfo.path, BRANCH, claim.run_id, attemptId);

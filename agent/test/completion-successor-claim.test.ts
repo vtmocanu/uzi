@@ -9,7 +9,7 @@ import type { SlotSnapshot } from "../src/completion-authority.js";
 import { nullLogger } from "./helpers.js";
 import { api, git, gitlabClaim, installHarness, plantAfterFetch } from "./runner-harness.js";
 import {
-  BRANCH, fenceOf, journalRaw, recordNames, rig, slotVia, snapshotFiles,
+  BRANCH, GENERATION, fenceOf, journalRaw, recordNames, rig, slotVia, snapshotFiles,
   type PrivateRunner, type Rig,
 } from "./completion-retirement-fixture.js";
 import type { AuthorityRuntime } from "../src/authority-runtime.js";
@@ -57,11 +57,13 @@ interface Scene {
   started?: { worktree: string; slot: SlotSnapshot | null };
   /** retireCompletedOwner outcomes, with the durable state observed the moment each returned. */
   retirements: Array<{ ok: boolean; slot: SlotSnapshot | null; fence: unknown; cloneExists: boolean }>;
+  /** Errors thrown by the successor's runnerCloneForBranch seed attempts. */
+  foreign: Error[];
   claim: ReturnType<typeof gitlabClaim>;
 }
 
 async function scene(t: TestContext, row: Row, options: { receipt?: boolean } = {}): Promise<Scene> {
-  const r = await rig(t, { codex: row.codex, unproven: row.unproven, kind: row.owner.kind, slug: row.owner.slug });
+  const r = await rig(t, { codex: row.codex, unproven: row.unproven, kind: row.owner.kind, slug: row.owner.slug, canonical: row.samePath });
   // The production wiring: the git cache carries the authority hooks and requires them.
   const restore = { authority: (git as unknown as { authority?: unknown }).authority, required: (git as unknown as { authorityRequired?: boolean }).authorityRequired };
   t.after(() => { Object.assign(git, { authority: restore.authority, authorityRequired: restore.required }); });
@@ -78,12 +80,21 @@ async function scene(t: TestContext, row: Row, options: { receipt?: boolean } = 
     Object.assign(git, { authority: rt.hooks, authorityRequired: true });
   }
   const ownerSlot = await slotVia(rt, r.clone);
-  const claim = gitlabClaim(3404, { run_id: randomUUID(), kind: row.successor, ...(row.successor === "mr_rework" ? { branch: BRANCH } : {}) });
+  const claim = gitlabClaim(3404, {
+    run_id: randomUUID(), kind: row.successor, claim_generation: GENERATION + 1, inventory_guarded: true,
+    ...(row.successor === "mr_rework" ? { branch: BRANCH } : {}),
+  });
   api.setOrphanClassification(r.runId, {
     status: "completed", repo_id: "r1", kind: row.owner.kind, issue_iid: 3404,
     branch: null, pipeline_ref: row.owner.kind === "mr_rework" ? BRANCH : null, pipeline_id: null,
   });
-  const s: Scene = { r, runner, rt, ownerSlot, retirements: [], claim };
+  const s: Scene = { r, runner, rt, ownerSlot, retirements: [], foreign: [], claim };
+  // Observe the refusals the successor's canonical seed raises (the real method still runs).
+  const realSeed = git.runnerCloneForBranch.bind(git);
+  git.runnerCloneForBranch = (async (...args: Parameters<typeof realSeed>) => {
+    try { return await realSeed(...args); } catch (err) { if (err instanceof Error) s.foreign.push(err); throw err; }
+  }) as typeof git.runnerCloneForBranch;
+  t.after(() => { delete (git as unknown as Record<string, unknown>).runnerCloneForBranch; });
   const recovery = (runner as unknown as PrivateRunner).recovery;
   if (typeof recovery.retireCompletedOwner === "function") {
     const real = recovery.retireCompletedOwner.bind(recovery);
@@ -149,9 +160,13 @@ describe("a successor claim on a just-completed owner's branch", () => {
         assert.notEqual(s.started.worktree, s.r.clone);
         assert.equal((await slotVia(s.rt, s.r.clone))?.state, "retired", "the owner's slot stays retired");
       } else {
-        // The owner's rig clone is an attempt path under the shared canonical slug (`<slug>.attempt-...`); the
-        // successor seeds at the canonical slug itself. No final `retired` slot is asserted for the shared slug.
-        assert.ok(s.r.clone.startsWith(s.started.worktree), "the successor seeds at the owner's canonical slug");
+        // The owner sits at the canonical clone path (no attempt id) and the successor computes EXACTLY that path.
+        assert.equal(path.basename(s.r.clone), "agent-issue-3404", "the owner is at the canonical path, not an attempt path");
+        assert.equal(s.started.worktree, s.r.clone, "the successor seeds at the owner's former path");
+        assert.equal(s.foreign.length, 1, "the first canonical seed was refused");
+        assert.equal(s.foreign[0]!.name, "ForeignCaptureBlockedError");
+        assert.match(s.foreign[0]!.message, /refusing to replace a retained clone owned by another run/);
+        assert.equal((s.foreign[0] as unknown as { ownerRunId: string }).ownerRunId, s.r.runId);
       }
     });
   }
