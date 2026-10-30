@@ -55,7 +55,7 @@ BEGIN
 END $$;
 -- +goose StatementEnd
 UPDATE runs SET plan_cross_check_gate_reason=NULL,status='failed',status_since=now(),finished_at=now(),updated_at=now(),
-    fail_origin='agent_failure',failure_reason='Policy hold ended by schema rollback (00377)',
+    fail_origin='agent_failure',failure_reason='Policy hold ended by schema rollback (00380)',
     move_pending_since=CASE WHEN issue_iid IS NOT NULL THEN now() END,
     milestones_in_progress=NULL,milestones_agents=NULL,
     pause_requested_at=NULL,pause_mode=NULL,pause_after_count=NULL,

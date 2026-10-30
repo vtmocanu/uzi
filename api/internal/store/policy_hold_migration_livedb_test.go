@@ -9,7 +9,7 @@ import (
 
 func TestCompactPolicyHoldMigrationLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "compact_policy_hold_")
-	if err := store.MigrateTo(ctx, dsn, 376); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 379); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -31,7 +31,7 @@ func TestCompactPolicyHoldMigrationLiveDB(t *testing.T) {
 		return id
 	}
 	ordinary := seed("running")
-	if err := store.MigrateTo(ctx, dsn, 377); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 380); err != nil {
 		t.Fatal(err)
 	}
 	var preserve, pending bool
@@ -62,14 +62,14 @@ func TestCompactPolicyHoldMigrationLiveDB(t *testing.T) {
 		return s
 	}
 	before := snapshot()
-	if err := store.MigrateDownTo(ctx, dsn, 376); err == nil {
+	if err := store.MigrateDownTo(ctx, dsn, 379); err == nil {
 		t.Fatal("Down dropped a live preserving constraint")
 	}
 	if snapshot() != before {
 		t.Fatal("refused Down partially converted rows or history")
 	}
 	mustExec(ctx, t, pool, "UPDATE runs SET status='queued' WHERE id=$1", live)
-	if err := store.MigrateDownTo(ctx, dsn, 376); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 379); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range []uuid.UUID{held, queued, live} {
@@ -90,7 +90,7 @@ func TestCompactPolicyHoldMigrationLiveDB(t *testing.T) {
 			t.Fatal("Down converted an ordinary or resolved-attempt row")
 		}
 	}
-	if err := store.MigrateTo(ctx, dsn, 377); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 380); err != nil {
 		t.Fatal(err)
 	}
 }
