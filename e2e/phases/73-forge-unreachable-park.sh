@@ -224,7 +224,7 @@ pass "Case B: same claim held, count=2 retry=NULL, no terminal failure or judge"
 # Resume queues an ordinary attempt, not a cooldown/custody bypass. The API
 # rereads after the write: if cooldown expired, that response may already show
 # the ordinary claim. No fresh park allowance is granted.
-RESUMED_B="$(apipost "/api/runs/$RUN_B/resume" '{}')"
+RESUMED_B="$(apipost "/api/runs/$RUN_B/resume-now" '')"
 printf '%s' "$RESUMED_B" | jq -e '(.run.status=="queued" or .run.status=="claimed" or .run.status=="running")
   and .run.forge_park_count==2
   and .run.recovery_wait_cause==null and .run.recovery_retry_not_before==null

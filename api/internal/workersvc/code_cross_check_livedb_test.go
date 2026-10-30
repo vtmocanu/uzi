@@ -158,7 +158,7 @@ func TestCodeCrossCheckClaimUnderLeadOriginReservationLiveDB(t *testing.T) {
 		t.Fatalf("code child changed the cooldown: %s -> %s", before, after)
 	}
 	var mapped int
-	if err := f.env.pool.QueryRow(f.env.ctx, "SELECT count(*) FROM run_forge_origins WHERE run_id=$1 AND origin IS NOT NULL", child).Scan(&mapped); err != nil || mapped != 0 {
+	if err := f.env.pool.QueryRow(f.env.ctx, "SELECT count(*) FROM run_forge_origins WHERE run_id=$1", child).Scan(&mapped); err != nil || mapped != 0 {
 		t.Fatalf("code child froze an origin mapping: %d %v", mapped, err)
 	}
 }
