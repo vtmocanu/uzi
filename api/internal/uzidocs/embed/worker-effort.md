@@ -42,8 +42,35 @@ and internal PR-description passes retain their existing SDK/catalog effort
 behavior; their built-in Codex model remains `gpt-6-sol`.
 
 There is no CLI settings command or effort setter today. Use the web controls;
-the CLI's settings decode mirrors still carry both fields. A separate runtime
-default choice and effective effort reporting are planned follow-up work.
+the CLI's settings decode mirrors still carry both fields. A separate
+**Runtime default** effort choice remains planned follow-up work (child B of
+[PRD #3244](https://github.com/vtmocanu/uzi/issues/3244)); it is not available yet.
+
+## Read requested and effective effort
+
+A run with a lead agent shows the effort it was **requested** to use and where
+that came from, and what the runtime **reported** it applied. Both appear in
+the run page's `lead:` chip, in the `LEAD` and `LEAD_SOURCE` rows of `uzi run
+get`, and per attempt in `uzi run lead-config`; see [See which model a run
+used](./worker-model.md#see-which-model-a-run-used).
+
+- **Requested** is what uzi sent: your Claude or Codex effort override
+  (*your Claude effort*, *your Codex effort*), or *built-in* when you left it on
+  Inherit.
+- **Effective** is what the runtime said it applied. When it differs from the
+  request, the chip shows both, for example `high (requested xhigh)`.
+- **Claude** reports its effort when the SDK exposes it. On the pinned SDK it
+  may read *not reported by the runtime*, which means the runtime did not say,
+  not that the request was ignored. *not sent* means Claude reported no effort
+  parameter for the turn.
+- **Codex** reports the configuration of the thread: *sent to Codex* when uzi
+  passed an effort on the turn, otherwise *Codex thread config* (the thread's
+  configured effort, including one kept on a resumed thread). This is the
+  thread's configuration, not proof of what every provider turn used.
+- An effort level uzi does not recognize reads *an unrecognized level*.
+
+The record is attested by the worker and is display only: it never affects
+billing, authorization or scheduling.
 
 ## Worker rollout
 

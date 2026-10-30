@@ -196,6 +196,7 @@ Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/done/17-lead-template-and-
 - Switching the default harness never clears either saved worker-model choice. [PRD #1551] (AI-synced 2026-09-23)
 - Task review uses its own built-in model (Codex: `gpt-6-sol`) independent of these saved defaults; there is no setting to choose the task-review model in this release. [PRD #1551] (AI-synced 2026-09-23)
 - The Codex worker fallback is `gpt-6.1-sol`, included in the curated picker; explicit model choices remain authoritative. (AI-synced 2026-10-01)
+- Lead-lane runs show the lead's requested and runtime-reported model and effort per claim attempt and phase (run page chip, `uzi run get`, `uzi run lead-config`); rows are worker-attested and display-only, never used for billing, authorization or scheduling. [PRD #3244] (AI-synced 2026-10-30)
 - Claude and Codex keep independent reasoning-effort preferences, both inheriting medium. Splitting preserves every existing explicit preference in both lanes; queued and resumed runs resolve preferences at claim time. (AI-synced 2026-10-01)
 - Codex runs wait for a worker with the current runtime/catalog and correct effort handling; an older worker must not silently substitute a model or ignore the requested effort. (AI-synced 2026-10-01)
 
