@@ -339,6 +339,41 @@ export class AuthorityRuntime implements AuthorityScope {
     this.#retiredSinks.add(sink);
   }
 
+  /**
+   * The worker incarnation this runtime's slots are written under, once its store has been opened by any
+   * transaction (every admission opens it); undefined before that. Never acquires A. A memory-park record names it
+   * as the slot owner (issue #3638).
+   */
+  authorityIncarnation(): string | undefined {
+    return this.#store?.workerIncarnation ?? this.#options.workerIncarnation;
+  }
+
+  /**
+   * issue #3638 D3 - read-only verification of previously recorded ended slots. Under A, by `authorityKey`: every
+   * slot must be `ineligible` with exactly the recorded epoch and seq and be owned by `worker`. Any difference (a
+   * successor epoch, a changed seq, another owner, a missing slot) or any failure to read answers false. It writes
+   * nothing, authorizes nothing, and is used only to log whether a predecessor's cooperative settlement still holds.
+   */
+  async verifyEndedSlots(
+    sources: ReadonlyArray<{ authorityKey: string; epoch: string; seq: number }>, worker: string,
+    options: AuthorityWait = {},
+  ): Promise<boolean> {
+    if (sources.length === 0) return false;
+    try {
+      return await this.withTransaction(async (tx) => {
+        const store = await this.#storeFor(tx);
+        for (const source of sources) {
+          const slot = await store.readSlot(tx, source.authorityKey);
+          if (!slot || slot.key !== source.authorityKey || slot.state !== "ineligible" || slot.epoch !== source.epoch ||
+              slot.seq !== source.seq || slot.owner.worker !== worker) return false;
+        }
+        return true;
+      }, { timeoutMs: LATE_WAIT_MS, ...options });
+    } catch {
+      return false;
+    }
+  }
+
   /** Whether `clonePath` is owned by a sink other than `sink` whose end has not been confirmed. Read-only. */
   heldByOtherSink(clonePath: string, sink: Set<string> | undefined): boolean {
     const owner = this.#owners.get(path.resolve(clonePath));

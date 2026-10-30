@@ -6,7 +6,10 @@ import { performance } from "node:perf_hooks";
 import { acquireWorkerLifetime } from "../src/authority-lock.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { openAuthorityStore, type SlotSnapshot } from "../src/completion-authority.js";
+import type { MemoryParkRecord } from "../src/git.js";
+import { execFileSync } from "node:child_process";
 import type { Executor, RunContext } from "../src/executor.js";
+import type { Logger } from "../src/log.js";
 import type { ClaimResponse, MemoryReservationRequest } from "../src/protocol.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
 import { testLockOptions } from "./authority-test-support.js";
@@ -61,7 +64,8 @@ async function setup(count = 0) {
           full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } } };
     } },
   });
-  return { memory, claim, pressure: (bytes: number) => { usage = bytes; } };
+  const workerId = client.memoryIncarnation!.worker_id;
+  return { memory, claim, workerId, pressure: (bytes: number) => { usage = bytes; } };
 }
 
 async function authorityRig() {
@@ -84,6 +88,19 @@ async function slotOf(rt: AuthorityRuntime, p: string): Promise<SlotSnapshot | n
   });
 }
 
+/** The ACTIVE recovery-journal key of this run's branch, read straight from the worker bare. */
+const BRANCH = `agent/issue-${IID}`;
+function activeJournal(): { runId: string; clonePath: string; memoryPark?: MemoryParkRecord } | undefined {
+  const bare = git.barePathFor(fx.originPath);
+  const env: NodeJS.ProcessEnv = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", PATH: process.env.PATH };
+  let raw = "";
+  try {
+    raw = execFileSync("git", ["-C", bare, "config", "--local", "--get", `uzi-recovery.${BRANCH}.clone`],
+      { env, encoding: "utf8", stdio: "pipe" }).trim();
+  } catch { return undefined; }
+  return raw ? JSON.parse(raw) as { runId: string; clonePath: string; memoryPark?: MemoryParkRecord } : undefined;
+}
+
 const parks = () => api.states.filter(s => s.body.recovery_cause === "worker_memory_pressure");
 const enroll = (ctx: RunContext) => {
   const captured = ctx.capturedMemory!()!;
@@ -100,6 +117,27 @@ const enroll = (ctx: RunContext) => {
   });
   return { captured, entry };
 };
+
+/** T1: the confirmed, settled cooperative record on the active key, durable and verifiable. */
+async function assertSettledRecord(claim: ClaimResponse, workerId: string, rt: AuthorityRuntime, clone: string, slot: SlotSnapshot): Promise<void> {
+  const journal = activeJournal();
+  assert.ok(journal, "the clone's active journal key survives the park");
+  const park = journal.memoryPark;
+  assert.ok(park, "the producer recorded the cooperative memory park on the active key");
+  assert.equal(park.version, 1);
+  assert.equal(park.ack, "confirmed");
+  assert.deepEqual(park.binding, { runId: claim.run_id, claimGeneration: 7,
+    workerId, registerNonce: "original-memory-registration", memoryEpisode: 3 });
+  assert.equal(park.origin.authorityIncarnation, rt.authorityIncarnation());
+  assert.equal(park.settlement?.confirmed, true, "phase 2 confirmed the settlement");
+  assert.deepEqual(park.settlement?.sources, [{ path: clone, authorityKey: slot.key, attemptId: null, epoch: slot.epoch, seq: slot.seq }]);
+  assert.deepEqual(park.settlement?.evidence.parkAck, park.binding);
+  assert.deepEqual(await git.readConfirmedMemoryPark(git.barePathFor(fx.originPath), BRANCH,
+    { runId: claim.run_id, clonePath: journal.clonePath, record: park }), park, "the lock-held reader confirms it");
+  assert.equal(await rt.verifyEndedSlots(park.settlement!.sources, park.origin.authorityIncarnation), true,
+    "the authority still shows exactly the recorded ended slot");
+  assert.equal(await rt.verifyEndedSlots(park.settlement!.sources, randomUUID()), false, "another incarnation does not verify");
+}
 
 describe("a settled memory park ends the flight's source use (issue #3638)", () => {
   it("pressure path: an accepted park moves the slot to ineligible and a fresh incarnation admits the path", async () => {
@@ -133,9 +171,14 @@ describe("a settled memory park ends the flight's source use (issue #3638)", () 
     assert.deepEqual([ended[0]!.epoch, ended[0]!.seq, ended[0]!.key], [slot?.epoch, slot?.seq, slot?.key],
       "the receipt is the saved identity of the ended slot");
 
+    await assertSettledRecord(f.claim, f.workerId, r.rt, clone, slot!);
+
     const next = r.successor();
+    const sources = activeJournal()!.memoryPark!.settlement!.sources;
     await next.withTransaction(() => next.hooks.admitSourceUse(clone, "seed-canonical"));
     assert.equal((await slotOf(next, clone))?.state, "active", "the successor admitted the path");
+    assert.equal(await r.rt.verifyEndedSlots(sources, activeJournal()!.memoryPark!.origin.authorityIncarnation), false,
+      "once a successor minted its own epoch the recorded end no longer verifies");
   });
 
   it("exhausted allowance path: an accepted park ends the source use as well", async () => {
@@ -160,6 +203,7 @@ describe("a settled memory park ends the flight's source use (issue #3638)", () 
     const clone = worktreeDirFor(IID);
     assert.equal((await slotOf(r.rt, clone))?.state, "ineligible");
     assert.equal(r.outcomes.flatMap(o => o.endedSlots).filter(e => e.path === clone).length, 1);
+    await assertSettledRecord(f.claim, f.workerId, r.rt, clone, (await slotOf(r.rt, clone))!);
     const next = r.successor();
     await next.withTransaction(() => next.hooks.admitSourceUse(clone, "seed-canonical"));
     assert.equal((await slotOf(next, clone))?.state, "active");
@@ -188,6 +232,10 @@ describe("a settled memory park ends the flight's source use (issue #3638)", () 
     const clone = worktreeDirFor(IID);
     assert.equal((await slotOf(r.rt, clone))?.state, "active", "no witness: fail closed");
     assert.deepEqual(r.outcomes.flatMap(o => o.endedSlots), [], "no confirmed end was produced");
+    const park = activeJournal()?.memoryPark;
+    assert.equal(park?.ack, "sent_unconfirmed", "a park body was sent but never confirmed: recorded as such");
+    assert.equal(park?.settlement, undefined);
+    assert.equal(park?.binding.claimGeneration, 7);
     const next = r.successor();
     await assert.rejects(next.withTransaction(() => next.hooks.admitSourceUse(clone, "seed-canonical")),
       /active under another worker incarnation/);
@@ -204,6 +252,11 @@ describe("a settled memory park ends the source use only when every fact of the 
   const cases: Array<[string, (flight: Flight, memory: Memory) => void]> = [
     ["the executor that wrote the hold is no longer the tearing-down executor", (_flight, memory) => {
       const origin = Object.freeze({ ...memory.hold!.origin, executor: { run: async () => { throw new Error("substitute"); } } });
+      memory.hold = Object.freeze({ ...memory.hold!, origin }) as Hold;
+      memory.parkWitness = Object.freeze({ ...memory.parkWitness!, origin });
+    }],
+    ["the hold was written by another flight (wrong cohort)", (_flight, memory) => {
+      const origin = Object.freeze({ ...memory.hold!.origin, flightId: randomUUID() });
       memory.hold = Object.freeze({ ...memory.hold!, origin }) as Hold;
       memory.parkWitness = Object.freeze({ ...memory.parkWitness!, origin });
     }],
@@ -234,6 +287,8 @@ describe("a settled memory park ends the source use only when every fact of the 
       let tampered = false;
       let verdict: boolean | undefined;
       internals.memoryHoldSettled = (flight, ex) => {
+        // Only the first consultation (the teardown's predicate) is tampered; the producer's later one sees the same flight.
+        if (tampered) return settled(flight, ex);
         const memory = flight.workerMemory!;
         assert.ok(memory.parkWitness, "the park produced its witness before the fact is falsified");
         assert.equal(flight.parked, true);
@@ -248,6 +303,205 @@ describe("a settled memory park ends the source use only when every fact of the 
       const clone = worktreeDirFor(IID);
       assert.equal((await slotOf(r.rt, clone))?.state, "active", "fail closed");
       assert.deepEqual(r.outcomes.flatMap(o => o.endedSlots), []);
+      const park = activeJournal()?.memoryPark;
+      assert.ok(park, "the park is still recorded");
+      assert.equal(park.settlement, undefined, "but no settlement is written for a fact that does not hold");
+    });
+  }
+});
+
+// issue #3638 D3 - the producer. The record is complete or it is absent: a settlement is written only when the
+// flight's every source path has a confirmed end and the hold is settled by the flight and executor that wrote it.
+describe("the cooperative memory-park record is complete or absent (issue #3638)", () => {
+  /** Park through the exhausted-allowance path with an optional tweak of the rig before the run. */
+  async function exhaustedPark(tweak: (r: Awaited<ReturnType<typeof authorityRig>>, runner: unknown) => void = () => {},
+    log = nullLogger()) {
+    const f = await setup(2);
+    const r = await authorityRig();
+    fs.writeFileSync(homeDir + "/session-proof", "original session");
+    git.worktreeStatus = async () => [];
+    const executor: Executor = {
+      run: async ctx => {
+        api.setOwnershipStatus(f.claim.run_id, "running", 7);
+        assert.throws(() => ctx.capturedMemory!(), /retained recovery/i);
+        throw new Error("fixture stops original model execution");
+      },
+    };
+    const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, log,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, authority: r.rt });
+    tweak(r, runner);
+    try { await runner.execute(f.claim); } finally { await f.memory.stop(); }
+    return { f, r, clone: worktreeDirFor(IID) };
+  }
+  const fakeReceipt = (rt: AuthorityRuntime, n: number) => ({
+    path: `${fx.dataDir}/fake-source-${String(n).padStart(2, "0")}`, key: n.toString(16).padStart(64, "e"),
+    epoch: randomUUID(), seq: 1, worker: rt.authorityIncarnation()! });
+
+  it("a confirmed end the authority did not report for a source path writes no settlement (omitted source)", async () => {
+    const { r } = await exhaustedPark(rig => {
+      const inner = rig.rt.endSourceUse.bind(rig.rt);
+      rig.rt.endSourceUse = async (...args) => ({ ...(await inner(...args)), endedSlots: [] });
+    });
+    const park = activeJournal()?.memoryPark;
+    assert.equal(park?.ack, "confirmed", "the park itself is still recorded");
+    assert.equal(park?.settlement, undefined, "no receipt for the clone: no settlement");
+    assert.equal(r.outcomes.length > 0, true);
+  });
+
+  /** A park with `extra` additional source paths, each with a (fabricated) confirmed end, besides the clone. */
+  const withExtraSources = (extra: number) => exhaustedPark((rig, runner) => {
+    const internals = runner as { memoryHoldSettled(flight: { sourceUsePaths?: Set<string> }, executor: Executor): boolean };
+    const settled = internals.memoryHoldSettled.bind(runner);
+    internals.memoryHoldSettled = (flight, executor) => {
+      for (let n = 0; n < extra; n++) flight.sourceUsePaths!.add(fakeReceipt(rig.rt, n).path);
+      return settled(flight, executor);
+    };
+    const inner = rig.rt.endSourceUse.bind(rig.rt);
+    rig.rt.endSourceUse = async (...args) => {
+      const out = await inner(...args);
+      return { ...out, endedSlots: [...out.endedSlots, ...Array.from({ length: extra }, (_, n) => fakeReceipt(rig.rt, n))] };
+    };
+  });
+
+  it("the producer re-checks the hold's own flight and executor after the end: a substitute writes no settlement", async () => {
+    // The teardown's own consultation passes and the source use really ends; only the producer's later consultation
+    // sees a hold that no longer belongs to this flight (a different cohort).
+    const { r, clone } = await exhaustedPark((_rig, runner) => {
+      const internals = runner as { memoryHoldSettled(flight: { workerMemory?: { hold?: { origin: object } } }, executor: Executor): boolean };
+      const settled = internals.memoryHoldSettled.bind(runner);
+      let calls = 0;
+      internals.memoryHoldSettled = (flight, executor) => {
+        if (++calls === 2) {
+          const memory = flight.workerMemory as unknown as { hold: { origin: object }; parkWitness: { origin: object } };
+          const origin = Object.freeze({ ...memory.hold.origin, flightId: randomUUID() });
+          memory.hold = Object.freeze({ ...memory.hold, origin });
+          memory.parkWitness = Object.freeze({ ...memory.parkWitness, origin });
+        }
+        return settled(flight, executor);
+      };
+    });
+    assert.equal((await slotOf(r.rt, clone))?.state, "ineligible", "the teardown's predicate passed and the end happened");
+    const park = activeJournal()?.memoryPark;
+    assert.equal(park?.ack, "confirmed");
+    assert.equal(park?.settlement, undefined, "the producer's own check refuses a substituted cohort");
+  });
+
+  it("sixteen sources is the last settled set", async () => {
+    await withExtraSources(15);
+    const park = activeJournal()?.memoryPark;
+    assert.equal(park?.ack, "confirmed");
+    assert.equal(park?.settlement?.sources.length, 16, "exactly sixteen is accepted");
+    const paths = park!.settlement!.sources.map(s => s.path);
+    assert.deepEqual(paths, [...paths].sort(), "sorted ascending by path");
+  });
+
+  it("seventeen sources is never truncated: no settlement", async () => {
+    await withExtraSources(16);
+    const park = activeJournal()?.memoryPark;
+    assert.equal(park?.ack, "confirmed");
+    assert.equal(park?.settlement, undefined);
+  });
+
+  it("a preservation that stopped before sending the park body records not_sent from the hold context", async () => {
+    const f = await setup(2);
+    const r = await authorityRig();
+    git.worktreeStatus = async () => [];
+    // The run is no longer owned as `running` when the park is about to be sent: the preservation stops quietly.
+    const executor: Executor = {
+      run: async ctx => {
+        api.setOwnershipStatus(f.claim.run_id, "paused", 7);
+        assert.throws(() => ctx.capturedMemory!(), /retained recovery/i);
+        throw new Error("fixture stops original model execution");
+      },
+    };
+    try {
+      await runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
+        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, authority: r.rt }).execute(f.claim);
+    } finally { await f.memory.stop(); }
+    assert.equal(parks().length, 0, "no park body reached the server");
+    const park = activeJournal()?.memoryPark;
+    assert.equal(park?.ack, "not_sent");
+    assert.equal(park?.settlement, undefined);
+    assert.deepEqual(park?.binding, { runId: f.claim.run_id, claimGeneration: 7, workerId: f.workerId,
+      registerNonce: "original-memory-registration", memoryEpisode: 3 });
+    assert.equal((await slotOf(r.rt, worktreeDirFor(IID)))?.state, "active");
+  });
+
+  it("a failing record write never fails the park, its source use end or the teardown", async () => {
+    const messages: string[] = [];
+    const log = { ...nullLogger(), warn: (m: string) => { messages.push(m); } };
+    log.child = () => log;
+    git.recordMemoryPark = async () => { throw new Error("injected record failure"); };
+    const { r, clone } = await exhaustedPark(undefined, log);
+    assert.equal(api.states.some(s => s.body.status === "failed"), false);
+    assert.equal(parks().length, 1);
+    assert.equal(activeJournal()?.memoryPark, undefined, "nothing was recorded");
+    assert.equal((await slotOf(r.rt, clone))?.state, "ineligible", "the source use end is independent of the record");
+    assert.ok(messages.includes("memory park record not written; the park stays unqualified"), messages.join("; "));
+  });
+
+  it("the read-only verifier answers false for every difference from the recorded ended slots", async () => {
+    const { r } = await exhaustedPark();
+    const park = activeJournal()!.memoryPark!;
+    const sources = park.settlement!.sources;
+    const worker = park.origin.authorityIncarnation;
+    assert.equal(await r.rt.verifyEndedSlots(sources, worker), true, "the unchanged record verifies");
+    assert.equal(await r.rt.verifyEndedSlots(sources, randomUUID()), false, "another incarnation owns nothing here");
+    assert.equal(await r.rt.verifyEndedSlots(sources.map(x => ({ ...x, epoch: randomUUID() })), worker), false, "a changed epoch");
+    assert.equal(await r.rt.verifyEndedSlots(sources.map(x => ({ ...x, seq: x.seq + 1 })), worker), false, "a changed seq");
+    assert.equal(await r.rt.verifyEndedSlots(sources.map(x => ({ ...x, authorityKey: "0".repeat(64) })), worker), false, "an absent slot");
+    assert.equal(await r.rt.verifyEndedSlots([], worker), false, "no sources verify nothing");
+    // A dropped lease: another epoch took the slot over.
+    const next = r.successor();
+    await next.withTransaction(() => next.hooks.admitSourceUse(worktreeDirFor(IID), "seed-canonical"));
+    assert.equal(await r.rt.verifyEndedSlots(sources, worker), false, "a successor epoch");
+  });
+
+  it("a slot that is still active never verifies as an ended slot", async () => {
+    const f = await setup(2);
+    const r = await authorityRig();
+    git.worktreeStatus = async () => [];
+    api.overrideStateStatus(f.claim.run_id, "running");
+    const executor: Executor = {
+      run: async ctx => {
+        api.setOwnershipStatus(f.claim.run_id, "running", 7);
+        assert.throws(() => ctx.capturedMemory!(), /retained recovery/i);
+        throw new Error("fixture stops original model execution");
+      },
+    };
+    try {
+      await runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
+        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, authority: r.rt }).execute(f.claim);
+    } finally { await f.memory.stop(); }
+    const slot = (await slotOf(r.rt, worktreeDirFor(IID)))!;
+    assert.equal(slot.state, "active");
+    assert.equal(await r.rt.verifyEndedSlots([{ authorityKey: slot.key, epoch: slot.epoch, seq: slot.seq }], slot.owner.worker), false);
+  });
+
+  // The predecessor's record is read once by the next claim of the run, only to say whether it still verifies.
+  for (const disturbed of [false, true]) {
+    it(`a retained claim logs 'predecessor cooperative settlement ${disturbed ? "unverified" : "verified"}' when the next claim recovers the predecessor`, async () => {
+      const first = await exhaustedPark();
+      const record = activeJournal()!.memoryPark!;
+      assert.equal(record.settlement?.confirmed, true);
+      const clone = first.clone;
+      const next = first.r.successor();
+      if (disturbed) {
+        // Another incarnation takes the slot over before the recovering claim reads the record.
+        const other = first.r.successor();
+        await other.withTransaction(() => other.hooks.admitSourceUse(clone, "seed-canonical"));
+      }
+      const messages: string[] = [];
+      const log: Logger = { ...nullLogger(), info: (m: string) => { messages.push(m); } };
+      log.child = () => log;
+      const claim: ClaimResponse = { ...first.f.claim, claim_generation: 8, memory_episode: 4, memory_policy: undefined,
+        memory_intervention_count: 0 };
+      api.memoryRegisterNonce = "resumed-memory-registration";
+      api.setOwnershipStatus(claim.run_id, "running", 8);
+      const executor: Executor = { run: async () => { throw new Error("the recovering claim stops here"); } };
+      await runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, log, { authority: next })
+        .execute(claim).catch(() => {});
+      assert.ok(messages.includes(`predecessor cooperative settlement ${disturbed ? "unverified" : "verified"}`), messages.join("; "));
     });
   }
 });

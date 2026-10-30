@@ -29,7 +29,7 @@ import { AuthorityRefusal, SourceUseHeldRefusal } from "./authority-lock.js";
 import type { AuthorityRuntime, AuthorityWait } from "./authority-runtime.js";
 import { leaseEpoch, leaseHarness, type SourceUseLease } from "./completion-authority.js";
 import { buildClaudeSourceCore, buildCodexSourceCore, serializeSourceFence, sourceFenceOf } from "./completion-source.js";
-import type { WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
+import type { MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
   RecoveryChargeInterruptedError,
@@ -72,7 +72,7 @@ import type { BoundedCoverageTestTransport } from "./plan-contract-review.js";
 import type { PlanCrossCheckStateRequest, PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, CredentialFreeCaptureContext, GracefulShutdownCheckpoint, SafeBoundary } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
-import { cloneKeyOf } from "./attempt-path.js";
+import { ATTEMPT_ID_RE, ATTEMPT_SEPARATOR, cloneKeyOf } from "./attempt-path.js";
 import type { LeftReason, RunProcessReap } from "./run-procs.js";
 import {
   LiveAttemptRegistry,
@@ -2098,6 +2098,12 @@ type MemoryParkWitness = Readonly<{
   binding: Readonly<{ run_id: string; worker_id: string; register_nonce: string; claim_generation: number; memory_episode: number }>;
   interventionIds: readonly string[];
 }>;
+/** What {@link RunRunner.endFlightSourceUse} ended: the source paths of the flight and the confirmed ends among them. */
+type FlightSourceEnd = Readonly<{
+  paths: readonly string[];
+  endedSlots: ReadonlyArray<Readonly<{ path: string; key: string; epoch: string; seq: number; worker: string }>>;
+  published: boolean;
+}>;
 type MemoryFlight = {
   readonly incarnation: MemoryIncarnation;
   readonly claim: ClaimResponse;
@@ -2115,6 +2121,9 @@ type MemoryFlight = {
   hold?: Readonly<{ context: MemoryContext; deadline: number; humanRevision: boolean; origin: MemoryHoldOrigin }>;
   /** Written only by a preservation that observed the server's accepted park binding; never cleared by anything else. */
   parkWitness?: MemoryParkWitness;
+  /** issue #3638: the exact binding of a park body this flight actually sent, latched immediately BEFORE `reportState`
+   *  (so a lost ACK still leaves it). Evidence that a park may have reached the server; never settlement. */
+  parkSent?: MemoryParkWitness["binding"];
   operation?: Promise<void>;
   settled?: boolean;
   /** Original Codex run/finally stays owned after a bounded memory observation. */
@@ -3493,10 +3502,15 @@ export class RunRunner {
    * `sourceTailsJoined`. quiesceRun logs a docker_error but sets no join flag, so a Docker container (or any
    * writer the worker does not register) that outlives the flight is not accounted here. That stays a
    * documented residual of #3404, not a claim of this method.
+   *
+   * Returns what the flight ended: every path its source use named (`paths`), the durable identity of each slot this
+   * call itself moved to `ineligible` (`endedSlots`, the only positive end evidence) and whether a publication
+   * handled the bound source (`published`, true also for a publication that only ended it).
    */
-  private async endFlightSourceUse(flight: RunFlight, runLog: Logger): Promise<void> {
+  private async endFlightSourceUse(flight: RunFlight, runLog: Logger): Promise<FlightSourceEnd> {
     const authority = this.authority;
-    if (!authority) return;
+    const none: FlightSourceEnd = { paths: [], endedSlots: [], published: false };
+    if (!authority) return none;
     // Retired at the very entry, before any early return: a callback this flight left behind (a late git hook)
     // can no longer admit, whatever happens to the end below. Keys it admitted stay owned until a confirmed end.
     const sink = flight.sourceUsePaths ??= new Set();
@@ -3505,23 +3519,27 @@ export class RunRunner {
     const paths = new Set(flight.sourceUsePaths ?? []);
     // Normalized like the authority's own keys (sourceUsePaths), so the publication check below compares like with like.
     for (const clone of [flight.worktreePath, flight.runnerClone?.path]) if (clone) paths.add(resolvePath(clone));
-    if (paths.size === 0) return;
+    if (paths.size === 0) return none;
+    const allPaths = [...paths];
     if (flight.sourceTailsJoined !== true) {
       runLog.warn("source use left active: this flight's source-capable tails were not positively joined", {
         sources: paths.size });
-      return;
+      return { paths: allPaths, endedSlots: [], published: false };
     }
     // U4: a flight whose completing source the journal durably bound publishes it (Codex: sealed; Claude:
     // claude_ready) instead of ending it. Publication moves the slot out of `active` itself and returns its
     // lease, so only the paths that did NOT publish still need the ineligible step below.
     const bound = flight.completionSourceBound;
+    let published = false;
     if (bound && paths.has(resolvePath(bound.clonePath))) {
       // "ended": a failed publication already moved the slot to ineligible under its own A.
-      if (await this.publishFlightSource(flight, bound, runLog) !== "unpublished") paths.delete(resolvePath(bound.clonePath));
+      const outcome = await this.publishFlightSource(flight, bound, runLog);
+      if (outcome !== "unpublished") { paths.delete(resolvePath(bound.clonePath)); published = true; }
     }
-    if (paths.size === 0) return;
+    if (paths.size === 0) return { paths: allPaths, endedSlots: [], published };
     const outcome = await authority.endSourceUse(paths, { timeoutMs: this.sourceUseEndWaitMs, sink });
     if (outcome.kept.length > 0) runLog.warn("source use left active for some paths", { kept: outcome.kept.length });
+    return { paths: allPaths, endedSlots: outcome.endedSlots, published };
   }
 
   /**
@@ -5910,6 +5928,8 @@ export class RunRunner {
       let sourceHomeRemoved = false;
       // The park reap below could not be completed or was cut short: an attributed process may remain.
       let parkReapIncomplete = false;
+      // The park/cache reap below applied to this teardown (observed evidence for the memory-park record).
+      let parkReapApplied = false;
       const removeSkills = !terminalDisposeUnproven && (!terminalCodex || !flight.stoppedSourceKept) && (flight.predecessorCapture ? false : ownAttemptRetired || !preserveResumeArtifacts);
       if (!this.cancellationExpired(flight) && flight.worktreePath && removeSkills) {
         await this.runCancellationMaintenance(flight, () => rmTeardownTree(skillsPluginDir(flight.worktreePath!), this.teardownTestDeps, terminalCodex ? beforeDestroy : undefined))
@@ -5941,6 +5961,7 @@ export class RunRunner {
       // runs only (no `executor.safety`): a Codex run's caches sit on its own per-run volume
       // (PRD #1809, Codex caches). Never throws: dropRunCaches logs and swallows its failures.
       if (runHome && preserveResumeArtifacts && flight.parked && !executor.safety && !flight.providerParkUnproven) {
+        parkReapApplied = true;
         // "Only a park that ended the run's processes drops": the park's process-group reap misses
         // what the agent backgrounded (the pinned CLI runs each Bash command detached, in its own
         // session and group), so a detached `go test &` could still be writing the caches this
@@ -6034,7 +6055,10 @@ export class RunRunner {
         !batcher.isTripped() && !batcher.isSpilled() && batcher.bufferedCount() === 0;
       // issue #3404 M2 U3 - END SOURCE USE, the last teardown step: every worker-owned tail above is joined or
       // known not to be, and this is the single seam where the flight's source slots leave `active`.
-      await this.endFlightSourceUse(flight, runLog);
+      const sourceEnd = await this.endFlightSourceUse(flight, runLog);
+      // issue #3638 D3: the cooperative memory-park record, after the source use ended. Never throws.
+      await this.recordMemoryParkOutcome(flight, runLog, sourceEnd, {
+        steeringJoined, parkReap: parkReapApplied ? "complete" : "not_applicable" });
     }
   }
 
@@ -21423,6 +21447,83 @@ export class RunRunner {
       flight.parked === true;
   }
 
+  /**
+   * issue #3638 D3 - the producer of the cooperative memory-park record. Runs at the very end of teardown, after
+   * {@link endFlightSourceUse}, for a flight whose worker-memory runtime wrote a hold. It records on the ACTIVE
+   * recovery-journal key (the one phaseClone created for this clone) what is positively known, and never throws:
+   * a failure is logged and the park stays unqualified.
+   *
+   * `ack` is `confirmed` iff the preservation produced a park witness (the server's accepted binding), else
+   * `sent_unconfirmed` iff a park body was actually sent (the `parkSent` latch), else `not_sent` with the binding
+   * taken from the hold context. A `settlement` is added only for a confirmed park whose hold is settled by the very
+   * flight and executor that wrote it, whose source tails were positively joined, and whose every source path (at
+   * most 16, none published) has an `endedSlots` receipt for THIS authority incarnation; an incomplete set is never
+   * truncated. The record is metadata: it grants no completion, publication, custody release or Resume eligibility.
+   */
+  private async recordMemoryParkOutcome(
+    flight: RunFlight, runLog: Logger, end: FlightSourceEnd,
+    observed: { steeringJoined: boolean; parkReap: "complete" | "not_applicable" },
+  ): Promise<void> {
+    const memory = flight.workerMemory;
+    const hold = memory?.hold;
+    if (!memory || !hold) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const authority = this.authority;
+      const bare = flight.barePath, branch = flight.branch, clonePath = flight.worktreePath;
+      if (!authority || !bare || !branch || !clonePath) return;
+      const authorityIncarnation = authority.authorityIncarnation();
+      if (authorityIncarnation === undefined) {
+        runLog.warn("memory park not recorded: the authority incarnation is unknown");
+        return;
+      }
+      const witness = memory.parkWitness;
+      const wire = witness?.binding ?? memory.parkSent ?? {
+        run_id: hold.context.run_id, worker_id: hold.context.worker_id, register_nonce: hold.context.register_nonce,
+        claim_generation: hold.context.claim_generation, memory_episode: hold.context.memory_episode };
+      const binding = { runId: wire.run_id, claimGeneration: wire.claim_generation, workerId: wire.worker_id,
+        registerNonce: wire.register_nonce, memoryEpisode: wire.memory_episode };
+      const record: MemoryParkRecord = {
+        version: 1, binding, ack: witness ? "confirmed" : memory.parkSent ? "sent_unconfirmed" : "not_sent",
+        origin: { flightId: hold.origin.flightId, attemptId: hold.origin.attemptId,
+          executorIncarnation: hold.origin.executorIncarnation, authorityIncarnation },
+      };
+      const executor = flight.executor;
+      const complete = end.paths.length >= 1 && end.paths.length <= 16 && !end.published &&
+        end.paths.every(p => end.endedSlots.some(e => e.path === p)) &&
+        end.endedSlots.every(e => e.worker === authorityIncarnation);
+      if (witness && observed.steeringJoined && flight.sourceTailsJoined === true &&
+          this.memoryHoldSettled(flight, executor) && complete) {
+        const sources = [...end.endedSlots].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0).map(e => {
+          const at = e.path.lastIndexOf(ATTEMPT_SEPARATOR);
+          const id = at < 0 ? undefined : e.path.slice(at + ATTEMPT_SEPARATOR.length);
+          return { path: e.path, authorityKey: e.key, attemptId: id !== undefined && ATTEMPT_ID_RE.test(id) ? id : null,
+            epoch: e.epoch, seq: e.seq };
+        });
+        record.settlement = { version: 1, confirmed: false, sources, evidence: {
+          parkAck: binding, interventionIds: [...witness.interventionIds],
+          processJoin: executor.safety ? "codex_disposal" : "executor",
+          commands: executor.settleWorkerCommands ? "confirmed" : "not_required",
+          steering: "joined", auxiliaries: flight.evidenceAuxiliaries === "joined" ? "joined" : "none",
+          feedback: "drained", sinkReceipts: "joined", parkReap: observed.parkReap } };
+      } else if (witness) {
+        runLog.warn("memory park recorded without a settlement: the source use end is not positively complete", {
+          sources: end.paths.length, ended: end.endedSlots.length });
+      }
+      const attemptId = flight.runnerClone?.attemptId;
+      const written = await Promise.race([
+        this.git.recordMemoryPark(bare, branch, { runId: flight.runId, clonePath, ...(attemptId ? { attemptId } : {}) }, record),
+        new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), this.codexBoundaryDeadlineMs); }),
+      ]);
+      if (written === "timeout") runLog.warn("memory park record is still being written; the park stays unqualified until it lands");
+      else if (written === "unconfirmed") runLog.warn("memory park settlement could not be confirmed; the park stays unqualified");
+    } catch (error) {
+      runLog.warn("memory park record not written; the park stays unqualified", { error: errMessage(error) });
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   private retainWorkerMemoryCustody(flight: RunFlight): void {
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
@@ -21544,6 +21645,9 @@ export class RunRunner {
           if (!delivered || flight.batcher.isTripped() || flight.batcher.bufferedCount() !== 0 ||
               flight.batcher.isSpilled() || this.outbox?.hasUndrainedMessages(flight.runId) ||
               memory.feedback.size !== 0) throw new RetainedRecoveryStop();
+          memory.parkSent = Object.freeze({ run_id: context.run_id, worker_id: context.worker_id,
+            register_nonce: context.register_nonce, claim_generation: context.claim_generation,
+            memory_episode: context.memory_episode });
           const ack = await flight.reportState({
             status: "recovery_wait", recovery_cause: "worker_memory_pressure",
             register_nonce: context.register_nonce, claim_generation: context.claim_generation,
@@ -22367,6 +22471,27 @@ export class RunRunner {
    * A newer episode with a fresh owned claim can renew budget exhaustion. Adoption failure
    * needs an unconsumed raw owner grant and a newer owned claim; other blockers persist.
    * Each failed capture blocks only this run; waits are bounded by the persisted episode clock. */
+  /**
+   * issue #3638 D3 - diagnostics only: when the predecessor's journal carries a memory-park settlement, log whether
+   * the lock-confirmed record AND the authority's ended slots still agree with it. The answer authorizes nothing here
+   * (no admission, capture, publication, custody release or Resume); server delivery and consumption are #3639.
+   * Never throws.
+   */
+  private async logPredecessorMemorySettlement(flight: RunFlight, bare: string, branch: string, source: RecoveryJournalEntry): Promise<void> {
+    const record = source.memoryPark;
+    if (!record?.settlement) return;
+    let verified = false;
+    try {
+      const confirmed = typeof this.git.readConfirmedMemoryPark === "function" && await this.git.readConfirmedMemoryPark(
+        bare, branch, { runId: source.runId, clonePath: source.clonePath,
+          ...(source.attemptId === undefined ? {} : { attemptId: source.attemptId }), record }) !== undefined;
+      verified = confirmed && this.authority !== undefined &&
+        await this.authority.verifyEndedSlots(record.settlement.sources, record.origin.authorityIncarnation);
+    } catch { verified = false; }
+    flight.runLog.info(`predecessor cooperative settlement ${verified ? "verified" : "unverified"}`, {
+      sources: record.settlement.sources.length, claim_generation: record.binding.claimGeneration });
+  }
+
   private async recoverRetainedClaim(
     claim: ClaimResponse, flight: RunFlight, key: string, source: RecoveryJournalEntry,
   ): Promise<void> {
@@ -22382,6 +22507,7 @@ export class RunRunner {
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     flight.keepGuardedInventoryOpen = true;
+    await this.logPredecessorMemorySettlement(flight, bare, branch, source);
     const inherited = flight.sourceInherited?.family;
     if (inherited?.observedExecution.runId === flight.runId) {
       flight.sourceFamilyMatched = !!await this.git.matchMaintenanceSourceFamily(bare, branch, key, flight.runId,
