@@ -471,11 +471,13 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, fmt.Errorf("default effort lookup: %w", err)
 	}
 	// PRD #3244: the effort column is read here, after the model block and its notes (statement
-	// order unchanged), so the effort half of the lead settings is completed now. DefaultEffort
-	// below still comes from resolveHarnessEffortPtr, which this value equals.
+	// order unchanged), so the effort half of the lead settings is completed now. A lead-lane claim
+	// ships resolveLeadEffort's value as DefaultEffort, so the value and its source share one home.
 	var defaultModelSource, defaultEffortSource *string
+	shippedEffort := resolveHarnessEffortPtr(harness, defaultEffort)
 	if leadResolved && leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
 		leadSettings.Effort, leadSettings.EffortSource = resolveLeadEffort(harness, defaultEffort)
+		shippedEffort = leadSettings.Effort
 		es := string(leadSettings.EffortSource)
 		defaultEffortSource = &es
 		if leadSettings.Model.Valid {
@@ -926,7 +928,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// completion-blocked run. Configured server-side, shipped like the question bounds above.
 			CompletionHoldWindowSeconds: s.p.CompletionHoldWindowSeconds,
 			DefaultModel:                textPtr(defaultModel),
-			DefaultEffort:               resolveHarnessEffortPtr(Harness(run.Harness), defaultEffort),
+			DefaultEffort:               shippedEffort,
 			DefaultModelSource:          defaultModelSource,
 			DefaultEffortSource:         defaultEffortSource,
 			AttributionEnabled:          attributionEnabled,

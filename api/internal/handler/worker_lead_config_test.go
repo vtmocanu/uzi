@@ -140,7 +140,7 @@ func TestLeadConfigValidationRejections(t *testing.T) {
 		{name: "4097-byte body", body: valid + strings.Repeat(" ", 4097-len(valid)), status: 400, reason: "invalid_lead_config"},
 		{name: "malformed json", body: `{"claim_generation":`, status: 400, reason: "invalid_lead_config"},
 		{name: "model with control char", body: bad(map[string]any{"requested_model": "op\x1bus-leak"}), status: 400, reason: "invalid_lead_config", field: "requested_model", secret: "us-leak"},
-		{name: "model with bidi char", body: bad(map[string]any{"requested_model": "op‮us-leak"}), status: 400, reason: "invalid_lead_config", field: "requested_model", secret: "us-leak"},
+		{name: "model with bidi char", body: bad(map[string]any{"requested_model": "op\u202eus-leak"}), status: 400, reason: "invalid_lead_config", field: "requested_model", secret: "us-leak"},
 		{name: "101-byte model", body: bad(map[string]any{"requested_model": strings.Repeat("m", 101)}), status: 400, reason: "invalid_lead_config", field: "requested_model", secret: "mmmmmmmm"},
 		{name: "bad phase enum", body: bad(map[string]any{"phase": "review-leak"}), status: 400, reason: "invalid_lead_config", field: "phase", secret: "review-leak"},
 		{name: "bad source enum", body: bad(map[string]any{"requested_model_source": "wat-leak"}), status: 400, reason: "invalid_lead_config", field: "requested_model_source", secret: "wat-leak"},

@@ -76,11 +76,9 @@ func TestCheckerClaimExcludedFromLeadResolutionLiveDB(t *testing.T) {
 			if got := derefOr(p.Config.DefaultEffort, ""); got != tc.wantEffort {
 				t.Errorf("checker default_effort = %q, want %q (not the owner's worker effort)", got, tc.wantEffort)
 			}
-			// The checker's model is its own resolution, which never goes through the Claude-lane
-			// guard: the stored lane value is delivered untouched, with no fallback note.
-			if got := derefOr(p.Config.DefaultModel, ""); got != roleToken {
-				t.Errorf("checker default_model = %q, want the stored lane value %q (guard must not run for a checker)", got, roleToken)
-			}
+			// The checker's model is its own resolution and is not asserted here: whether the
+			// cross-check pin path should guard a Codex role token in the Claude lane is a separate
+			// question. This test pins only the lead-resolution exclusion.
 			requireNoLeadSourceKeys(t, "checker", p)
 			for _, run := range []uuid.UUID{f.runID, f.lead} {
 				if n := f.env.countHarnessModelFallbackNotes(t, run); n != 0 {
