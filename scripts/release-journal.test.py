@@ -19,6 +19,16 @@ def module():
 
 
 class Journal(unittest.TestCase):
+    def test_audit_wire_preserves_count_and_truncation_across_hops(self):
+        journal = module()
+        rows = [dict(sha='a' * 40, pr=number + 1, shipping=True) for number in range(1000)]
+        kept, count, truncated = journal.audit(json.dumps(rows))
+        self.assertEqual((len(kept), count, truncated), (64, 1000, True))
+        wire = journal.encoded(kept).decode('ascii')
+        self.assertEqual(journal.audit(wire, json.dumps(count), json.dumps(truncated)), (kept, count, truncated))
+        for total, marker in [('63', 'true'), ('1000', 'false'), ('true', 'true')]:
+            self.assertEqual(journal.audit(wire, total, marker), (None, None, None))
+
     def test_terminal_instrument_error_is_explicit_not_empty_success(self):
         journal = module()
         with tempfile.TemporaryDirectory() as directory:

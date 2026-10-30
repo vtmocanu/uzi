@@ -218,11 +218,17 @@ and records a bounded attempt journal, including failing jobs/steps and retry
 reservations/results. The first failed job's detail is retained. The journal
 keeps every observed attempt and explicitly counts omitted detail when it reaches
 32,768 source bytes; unavailable evidence is not proof of recovery.
-Release-commit main CI is report-only, without waiting or rerunning. Automatic
+Release-commit main CI is report-only, with one observation and no automatic reruns. Automatic
 recovery was deliberately excluded: publication uses strict inherited coverage,
 the next RC needs a newer CI-bearing tip, and rerun isolation would change main
 cancellation behavior. Tagged-KinD and targeted assertion recovery remain
 fail-closed follow-up work. First-week contention measurements remain a rollout check.
+Read-only journal lookup failures do not stop publication observation; retries
+still require fresh complete evidence. Incident audits are capped at 64 rows and
+8,192 encoded bytes with explicit counts, while the prepare summary stays full.
+Main-CI observation errors cannot replace the publication result, but an in-flight
+API request can still consume the existing watcher job ceiling; no new timeout
+or transport isolation is added.
 The procedures below are the local path.
 
 **Releases are cut RC-first** (ADR-1265, PRD #1265). `release-cut X.Y.Z`

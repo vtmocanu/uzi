@@ -1,8 +1,7 @@
-# Protected manual releases and opt-in nightly RCs (#3512, stage 3e-2).
+# Protected manual releases, opt-in nightly RCs and publication journals (#3512).
 # App/environment/ruleset setup and the first live dispatch belong to the maintainer.
-# D10 is partial: one eligible pre-cut CI rerun and existing non-gate publication
-# retries. Tagged smoke and targeted assertions follow in 3e-3; post-cut main CI
-# will be report-only, with automatic reruns deliberately excluded.
+# D10 retains pre-cut CI and publication-role retries with a bounded journal.
+# Own-main CI is report-only; tagged-smoke and targeted assertion recovery follow separately.
 name: Release automation
 
 "on":
@@ -522,7 +521,7 @@ jobs:
 
           MAIN_STATES = {'not-applicable', 'unavailable', 'absent', 'pending', 'passed', 'failed', 'cancelled'}
 
-          FIELDS = {'schema', 'operation', 'repository', 'tag', 'sha', 'main_ci', 'attempts', 'decisions', 'truncated', 'state', 'reason'}
+          FIELDS = {'schema', 'operation', 'repository', 'tag', 'sha', 'main_ci', 'attempts', 'decisions', 'truncated', 'state', 'reason', 'publication_read_errors'}
 
           def integer(value, minimum=1):
               if type(value) is not int or not minimum <= value < 2**53:
@@ -611,7 +610,42 @@ jobs:
                          'pending-timeout': {'publication-timeout'}, 'instrument-error': {'evidence-unavailable'}}
               if not isinstance(data['state'], str) or data['state'] not in reasons or data['reason'] not in reasons[data['state']]:
                   raise ValueError('invalid journal operation result')
+              errors = data['publication_read_errors']
+              if not isinstance(errors, dict) or errors.keys() != {'release.yml', 'brew.yml'}:
+                  raise ValueError('invalid publication read counters')
+              for count in errors.values():
+                  integer(count, 0)
               return data
+
+          def encoded(data):
+              return json.dumps(data, ensure_ascii=True, separators=(',', ':'), sort_keys=True).replace('`', '\\u0060').encode('ascii')
+
+          def audit(raw, total_raw=None, truncated_raw=None):
+              try:
+                  rows = json.loads(raw or 'null')
+                  total = json.loads(total_raw or 'null')
+                  truncated = json.loads(truncated_raw or 'null')
+              except (ValueError, TypeError):
+                  return None, None, None
+              if not isinstance(rows, list):
+                  return None, None, None
+              for row in rows:
+                  if (not isinstance(row, dict) or row.keys() != {'sha', 'pr', 'shipping'}
+                          or not isinstance(row['sha'], str) or not re.fullmatch('[0-9a-f]{40}', row['sha'])
+                          or type(row['shipping']) is not bool
+                          or (row['pr'] is not None and (type(row['pr']) is not int or not 0 < row['pr'] < 2**53))):
+                      return None, None, None
+              if total is None and truncated is None:
+                  total = len(rows)
+              elif (type(total) is not int or not len(rows) <= total < 2**53 or type(truncated) is not bool
+                    or truncated != (total > len(rows))):
+                  return None, None, None
+              kept = []
+              for row in rows[:64]:
+                  if len(encoded(kept + [row])) > 8192:
+                      break
+                  kept.append(row)
+              return kept, total, len(kept) < total
 
           def decode(raw):
               if isinstance(raw, str):
@@ -651,6 +685,7 @@ jobs:
           elif (type(uncited_count) is not int or not len(uncited) <= uncited_count < 2**53
                 or type(uncited_truncated) is not bool or uncited_truncated != (uncited_count > len(uncited))):
               raise ValueError('invalid public identity count')
+          changes, changes_count, changes_truncated = audit(prepared.get('changes'), prepared.get('changes_count'), prepared.get('changes_truncated'))
           attempted = {'true': True, 'false': False}.get(pushed.get('attempted'))
           # The recovery marker is false after a definitive rejection, despite
           # Git having attempted that push. Keep the public statement literal.
@@ -666,7 +701,7 @@ jobs:
                     'audit_head': prepared.get('audit_head') or None, 'push_attempted': attempted,
                     'push_outcome': push_outcome or None,
                     'published_at': watched.get('published_at') or None, 'verified_at': watched.get('verified_at') or None,
-                    'changes': json.loads(prepared.get('changes') or 'null'), 'uncited': uncited,
+                    'changes': changes, 'changes_count': changes_count, 'changes_truncated': changes_truncated, 'uncited': uncited,
                     'uncited_count': uncited_count, 'uncited_truncated': uncited_truncated,
                     'retries': json.loads(prepared.get('retry_log') or '[]'), 'journal': recovery_journal}
           problem = bool(failed) or watched.get('receipt') == 'unconfirmed'
@@ -705,7 +740,9 @@ jobs:
           elif problem and attempted is None: explanation += ' Push attempt status is unavailable; inspect remote refs.'
           # Keep the bounded journal compact in incident bodies; indentation can
           # multiply its source size. The job summary renders it separately.
-          body = explanation + '\n\n```json\n' + json.dumps(result, separators=(',', ':'), sort_keys=True) + '\n```\n'
+          body = explanation + '\n\n```json\n' + encoded(result).decode('ascii') + '\n```\n'
+          if changes_truncated:
+              body += '\nShowing ' + str(len(changes)) + ' of ' + str(changes_count) + ' audited changes; see the full prepare summary.\n'
           if needs['watch']['result'] != 'skipped' and recovery_journal is None:
               body += '\nRecovery attempt journal unavailable; inspect the watch log. This is not a recovery certificate.\n'
           if result['late_finish']:

@@ -113,9 +113,15 @@ truncation records omission counts; every observed attempt and retry decision
 is retained or capacity exhaustion stops recovery. Complete API evidence is
 validated before truncation and before a write. Missing or malformed journal
 data is unavailable, never a recovery certificate.
+Read-only journal lookup failures are counted without changing the legacy
+publication polling or gate refusal. A retry still requires complete fresh
+evidence and a saved reservation. Piped progress is line-buffered. Incident
+audits retain at most 64 changes and 8,192 encoded bytes, with full counts and
+explicit truncation; the prepare summary remains complete. Journal byte
+accounting includes JSON escaping for backticks used in public code fences.
 
 The release commit's own main CI is classified in the journal and report only,
-without waiting or automatic reruns. D10(a) automatic recovery is deliberately
+without success polling or automatic reruns. D10(a) automatic recovery is deliberately
 excluded: publication already requires strict inherited coverage, the next RC
 needs a newer CI-bearing tip, and isolating reruns would change cancellation
 for every main rerun. `ci.yml` is unchanged. Tagged KinD infrastructure retries
@@ -124,6 +130,12 @@ still require manual recovery. Controller code is pinned to the original trusted
 workflow SHA, independently of the released tag, so older promoted candidates
 need not contain the current controller. Pre-cut CI retries already record steps,
 attempt and result.
+The primary publication journal is finalized before the best-effort main-CI
+observation. Observation/schema/storage errors cannot override that result.
+This is not transport isolation: synchronous API requests can still occupy the
+existing watch job ceiling if a transport hangs. No new timeout or cancellation
+policy is introduced. The journal uses atomic replacement with file fsync;
+directory fsync and crash-resumable operation storage are not provided.
 Publication/verification timestamps are recorded without claiming deployment
 health. Runner-slot and critical-path impact remain unmeasured until live use.
 

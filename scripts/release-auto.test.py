@@ -28,6 +28,22 @@ def cut_result(path, tag, reason='ready', uncited=None):
 
 
 class RecoveryJournal(unittest.TestCase):
+    def test_prepare_audit_wire_is_bounded_without_mutating_full_summary(self):
+        rows = [dict(sha='a' * 40, pr=number + 1, shipping=True) for number in range(1000)]
+        values = {'changes': json.dumps(rows)}
+        with tempfile.TemporaryDirectory() as directory:
+            output, summary = Path(directory) / 'outputs', Path(directory) / 'summary'
+            with patch.dict(os.environ, GITHUB_OUTPUT=str(output), GITHUB_STEP_SUMMARY=str(summary)):
+                auto.outputs(values)
+                auto.summary(values)
+            wire = dict(line.split('=', 1) for line in output.read_text().splitlines())
+            self.assertLessEqual(len(wire['changes'].encode()), 8192)
+            self.assertEqual(len(json.loads(wire['changes'])), 64)
+            self.assertEqual(json.loads(wire['changes_count']), 1000)
+            self.assertTrue(json.loads(wire['changes_truncated']))
+            self.assertEqual(json.loads(values['changes']), rows)
+            self.assertIn('PR #1000', summary.read_text())
+
     def test_journal_summary_escapes_job_labels(self):
         with tempfile.TemporaryDirectory() as directory:
             source, target = Path(directory) / 'journal.json', Path(directory) / 'summary.md'

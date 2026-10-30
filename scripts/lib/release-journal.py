@@ -14,7 +14,7 @@ STATES = {'queued', 'in_progress', 'completed', 'waiting', 'pending', 'requested
 CONCLUSIONS = {'success', 'failure', 'cancelled', 'timed_out', 'action_required',
                'startup_failure', 'neutral', 'skipped', 'stale', None, ''}
 MAIN_STATES = {'not-applicable', 'unavailable', 'absent', 'pending', 'passed', 'failed', 'cancelled'}
-FIELDS = {'schema', 'operation', 'repository', 'tag', 'sha', 'main_ci', 'attempts', 'decisions', 'truncated', 'state', 'reason'}
+FIELDS = {'schema', 'operation', 'repository', 'tag', 'sha', 'main_ci', 'attempts', 'decisions', 'truncated', 'state', 'reason', 'publication_read_errors'}
 
 
 def integer(value, minimum=1):
@@ -111,11 +111,44 @@ def validate(data):
                'pending-timeout': {'publication-timeout'}, 'instrument-error': {'evidence-unavailable'}}
     if not isinstance(data['state'], str) or data['state'] not in reasons or data['reason'] not in reasons[data['state']]:
         raise ValueError('invalid journal operation result')
+    errors = data['publication_read_errors']
+    if not isinstance(errors, dict) or errors.keys() != {'release.yml', 'brew.yml'}:
+        raise ValueError('invalid publication read counters')
+    for count in errors.values():
+        integer(count, 0)
     return data
 
 
 def encoded(data):
-    return json.dumps(data, ensure_ascii=True, separators=(',', ':'), sort_keys=True).encode('ascii')
+    return json.dumps(data, ensure_ascii=True, separators=(',', ':'), sort_keys=True).replace('`', '\\u0060').encode('ascii')
+
+
+def audit(raw, total_raw=None, truncated_raw=None):
+    try:
+        rows = json.loads(raw or 'null')
+        total = json.loads(total_raw or 'null')
+        truncated = json.loads(truncated_raw or 'null')
+    except (ValueError, TypeError):
+        return None, None, None
+    if not isinstance(rows, list):
+        return None, None, None
+    for row in rows:
+        if (not isinstance(row, dict) or row.keys() != {'sha', 'pr', 'shipping'}
+                or not isinstance(row['sha'], str) or not re.fullmatch('[0-9a-f]{40}', row['sha'])
+                or type(row['shipping']) is not bool
+                or (row['pr'] is not None and (type(row['pr']) is not int or not 0 < row['pr'] < 2**53))):
+            return None, None, None
+    if total is None and truncated is None:
+        total = len(rows)
+    elif (type(total) is not int or not len(rows) <= total < 2**53 or type(truncated) is not bool
+          or truncated != (total > len(rows))):
+        return None, None, None
+    kept = []
+    for row in rows[:64]:
+        if len(encoded(kept + [row])) > 8192:
+            break
+        kept.append(row)
+    return kept, total, len(kept) < total
 
 
 def decode(raw):
@@ -143,11 +176,16 @@ class Journal:
         self.path = Path(path)
         self.data = dict(schema=1, operation=operation, repository=repository, tag=tag, sha=sha,
                          main_ci={'policy': 'report-only', 'state': 'unavailable'},
-                         attempts=[], decisions=[], truncated=False, state='watching', reason='publication-pending')
+                         attempts=[], decisions=[], truncated=False, state='watching', reason='publication-pending',
+                         publication_read_errors={'release.yml': 0, 'brew.yml': 0})
         self.save()
 
     def finish(self, state, reason):
         self.data.update(state=state, reason=reason)
+        self.save()
+
+    def read_unavailable(self, workflow):
+        self.data['publication_read_errors'][workflow] += 1
         self.save()
 
     def save(self):

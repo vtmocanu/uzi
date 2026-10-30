@@ -166,10 +166,15 @@ def command(*args, timeout=60, raw=False, live=False):
 
 
 def outputs(values):
+    wire = dict(values)
+    if 'changes' in wire:
+        rows, count, truncated = journals.audit(wire['changes'])
+        wire.update(changes=journals.encoded(rows).decode('ascii'), changes_count=json.dumps(count),
+                    changes_truncated=json.dumps(truncated))
     target = os.environ.get('GITHUB_OUTPUT')
     if target:
         with open(target, 'a') as stream:
-            for key, value in values.items():
+            for key, value in wire.items():
                 value = str(value)
                 require('\n' not in value and '\r' not in value, 'invalid-output')
                 stream.write(f'{key}={value}\n')

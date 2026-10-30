@@ -38,7 +38,8 @@ def row(name='publish-api', conclusion='success', status='completed'):
 
 
 class Parity(unittest.TestCase):
-    def run_case(self, calls, ticks=1, reruns=2, restored=(), wrapper=False):
+    def run_case(self, calls, ticks=1, reruns=2, restored=(), wrapper=False, combined=False,
+                 journal_calls=None, journal_warnings=()):
         results = []
         runner = ('import importlib.util,subprocess,sys; '
                   'spec=importlib.util.spec_from_file_location("watch_fixture",sys.argv[1]); '
@@ -49,10 +50,11 @@ class Parity(unittest.TestCase):
         commands = [['bash', str(LEGACY)], [sys.executable, '-I', '-c', runner, str(ENGINE)]]
         if wrapper:
             commands.append(['bash', str(ROOT / '.agents/skills/uzi-release/scripts/release-watch.sh')])
-        for command in commands:
+        for index, command in enumerate(commands):
             with tempfile.TemporaryDirectory(prefix='release-watch-parity-') as directory:
                 directory = Path(directory)
-                (directory / 'calls.json').write_text(json.dumps(calls))
+                expected_calls = journal_calls if index and journal_calls is not None else calls
+                (directory / 'calls.json').write_text(json.dumps(expected_calls))
                 gh = directory / 'gh'
                 gh.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, sys
@@ -72,17 +74,36 @@ sys.exit(calls[index][2])
                 sleep = directory / 'sleep'
                 sleep.write_text('#!/bin/sh\nprintf "sleep %s\\n" "$1" >> "$WATCH_FIXTURE/transcript"\n')
                 sleep.chmod(0o700)
-                env = dict(os.environ, WATCH_FIXTURE=str(directory), GIT_CONFIG_GLOBAL='/dev/null',
+                env = dict(os.environ, WATCH_FIXTURE=str(directory), GITHUB_ACTIONS='false', GIT_CONFIG_GLOBAL='/dev/null',
                            GIT_CONFIG_SYSTEM='/dev/null', PATH=str(directory) + os.pathsep + os.environ['PATH'])
-                result = subprocess.run(command + ['0.2.0', '--max-ticks', str(ticks), '--interval', '0',
-                                                   '--max-reruns', str(reruns)], cwd=ROOT, env=env,
-                                        text=True, capture_output=True, timeout=30)
-                self.assertFalse((directory / 'mismatch').exists(), result.stdout + result.stderr)
+                args = ['0.2.0', '--max-ticks', str(ticks), '--interval', '0', '--max-reruns', str(reruns)]
+                if index and journal_calls is not None:
+                    args += ['--journal', str(directory / 'journal.json'), '--operation', 'fixture',
+                             '--repository', 'vtmocanu/uzi', '--sha', 'a' * 40, '--kind', 'stable']
+                result = subprocess.run(command + args, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT if combined else subprocess.PIPE, timeout=30)
+                error = result.stderr or ''
+                self.assertFalse((directory / 'mismatch').exists(), result.stdout + error)
+                consumed = int((directory / 'index').read_text()) if (directory / 'index').exists() else 0
+                self.assertEqual(consumed, len(expected_calls), result.stdout + error)
                 transcript = (directory / 'transcript').read_text() if (directory / 'transcript').exists() else ''
-                results.append((result.returncode, result.stdout, result.stderr, transcript))
+                results.append((result.returncode, result.stdout, error, transcript))
+                if index and journal_calls is not None:
+                    self.journal_result = json.loads((directory / 'journal.json').read_text())
         # Explicitly restore only the known omitted first row. Everything else,
         # including later detail rows, remains byte-for-byte transcript parity.
         status, output, error, transcript = results[1]
+        if journal_calls is not None:
+            actual_api = [line for line in transcript.splitlines() if line.startswith('api ')]
+            self.assertEqual(actual_api, [call[0] for call in journal_calls if call[0].startswith('api ')])
+            transcript = ''.join(line + '\n' for line in transcript.splitlines() if not line.startswith('api '))
+            for warning in journal_warnings:
+                target = output if combined else error
+                self.assertIn(warning + '\n', target)
+                if combined:
+                    output = output.replace(warning + '\n', '', 1)
+                else:
+                    error = error.replace(warning + '\n', '', 1)
         for name, retry in restored:
             line = f'  {"rerun <-" if retry else "FAIL "} {name:<28} https://example.invalid/job\n'
             self.assertIn(line, output)
@@ -97,6 +118,52 @@ sys.exit(calls[index][2])
         result = self.run_case([resolve('release.yml', 101), jobs(101, row()),
                                 resolve('brew.yml', 202), jobs(202, row('publish-formula'))])
         self.assertEqual(result[0], 0)
+
+    def test_combined_stream_keeps_banner_before_stderr_progress(self):
+        result = self.run_case([resolve('release.yml', 101), jobs(101, 'unavailable', 1),
+                                resolve('brew.yml', 202), jobs(202, row())], combined=True)
+        self.assertTrue(result[1].startswith('release-watch:'))
+
+    def api_run(self, workflow, run, status='completed', conclusion='success', error=False):
+        data = dict(id=run, run_attempt=1, head_sha='a' * 40, head_branch='v0.2.0', event='push',
+                    path=f'.github/workflows/{workflow}', status=status, conclusion=conclusion,
+                    repository={'full_name': 'vtmocanu/uzi'}, head_repository={'full_name': 'vtmocanu/uzi'})
+        return [f'api repos/vtmocanu/uzi/actions/runs/{run}', 'HTTP 502' if error else json.dumps(data), int(error)]
+
+    def api_jobs(self, run, name='publish-api', conclusion='success', error=False):
+        data = [dict(total_count=1, jobs=[dict(id=run + 1000, run_id=run, name=name, status='completed',
+                    conclusion=conclusion, html_url=f'https://github.com/vtmocanu/uzi/actions/runs/{run}/job/{run + 1000}', steps=[])])]
+        return [f'api --paginate --slurp repos/vtmocanu/uzi/actions/runs/{run}/attempts/1/jobs?per_page=100',
+                'HTTP 502' if error else json.dumps(data), int(error)]
+
+    def test_journal_transient_read_preserves_legacy_wait_and_success(self):
+        warning = 'release-watch: release.yml journal evidence unavailable; continuing publication observation'
+        for endpoint in ('run', 'jobs'):
+            with self.subTest(endpoint=endpoint):
+                first = [resolve('release.yml', 101), jobs(101, row(status='in_progress', conclusion=''))]
+                brew = [resolve('brew.yml', 202), jobs(202, row('publish-formula'))]
+                second = [resolve('release.yml', 101), jobs(101, row())]
+                calls = first + brew + second + brew
+                details = [self.api_run('release.yml', 101, status='in_progress', conclusion=None, error=endpoint == 'run')]
+                if endpoint == 'jobs':
+                    details += [self.api_jobs(101, error=True)]
+                enriched = (first + details + brew + [self.api_run('brew.yml', 202), self.api_jobs(202, 'publish-formula')]
+                            + second + [self.api_run('release.yml', 101), self.api_jobs(101)]
+                            + brew + [self.api_run('brew.yml', 202)])
+                self.assertEqual(self.run_case(calls, ticks=2, journal_calls=enriched, journal_warnings=[warning])[0], 0)
+                self.assertEqual(self.journal_result['publication_read_errors']['release.yml'], 1)
+                self.assertEqual(self.journal_result['state'], 'workflows-green')
+
+    def test_journal_read_miss_cannot_hide_gate_rows_or_change_refusal(self):
+        calls = [resolve('release.yml', 101), jobs(101, row('assert-version', 'failure')),
+                 jobs(101, row('assert-version', 'failure'))]
+        enriched = calls[:2] + [self.api_run('release.yml', 101, error=True)] + calls[2:] + [self.api_run('release.yml', 101, error=True)]
+        warning = 'release-watch: release.yml journal evidence unavailable; continuing publication observation'
+        result = self.run_case(calls, journal_calls=enriched, journal_warnings=[warning, warning],
+                               restored=[('assert-version', False)])
+        self.assertEqual(result[0], 1)
+        self.assertIn('  FAIL  assert-version', self.engine_result[1])
+        self.assertEqual(self.journal_result['reason'], 'gate-refused')
 
     def test_pending_has_priority_over_failed_gate(self):
         result = self.run_case([resolve('release.yml', 101), jobs(101, row('assert-version', 'failure') + row(status='in_progress')),
@@ -221,6 +288,92 @@ sys.exit(calls[index][2])
 
 
 class JournalAdmission(unittest.TestCase):
+    def run_main_with_observer_fault(self, primary, field=None, value=None, storage_error=None):
+        module = engine()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'journal.json'
+            watch = module.Watcher('0.2.0-rc.1', sleep=lambda _: None)
+            watch.poll = Mock(return_value=primary)
+            main_api = Mock()
+            observed_states = []
+            def observe_main(*_):
+                observed_states.append(module.journals.read(path)['state'])
+                return None if storage_error else {'id': 101}
+            main_api.run.side_effect = observe_main
+            metadata = dict(self.valid_run(), head_branch='main', path='.github/workflows/ci.yml')
+            if field is not None:
+                metadata[field] = value
+            watch.gh = Mock(return_value=(0, json.dumps(metadata), ''))
+            args = ['release-watch.py', '0.2.0-rc.1', '--journal', str(path), '--operation', 'fixture',
+                    '--repository', 'vtmocanu/uzi', '--sha', 'a' * 40, '--kind', 'rc']
+            original_save = module.journals.Journal.save
+            def save(record):
+                if storage_error and record.data['main_ci']['state'] != 'unavailable':
+                    raise storage_error('fixture observation save failure')
+                return original_save(record)
+            with (patch.object(module.sys, 'argv', args), patch.object(module, 'Watcher', return_value=watch),
+                  patch.object(module.evidence, 'GitHub', return_value=main_api),
+                  patch.object(module.subprocess, 'run', return_value=Mock(returncode=0)),
+                  patch.object(module.journals.Journal, 'save', save),
+                  contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
+                try:
+                    actual = module.main()
+                except Exception as error:
+                    self.fail(f'report-only observation escaped: {type(error).__name__}')
+            self.assertEqual(actual, primary)
+            self.assertEqual(observed_states, ['workflows-green' if primary == 0 else 'blocked'])
+            data = module.journals.read(path)
+            self.assertEqual(data['state'], 'workflows-green' if primary == 0 else 'blocked')
+            self.assertEqual(data['reason'], 'publication-workflows-green' if primary == 0 else 'publication-refused')
+            self.assertEqual(data['main_ci'], {'policy': 'report-only', 'state': 'unavailable'})
+            main_api.rerun.assert_not_called()
+
+    def test_malformed_main_ci_never_overrides_publication_or_finalization(self):
+        for primary in (0, 1):
+            for field, value in [('path', None), ('repository', None), ('head_repository', [])]:
+                with self.subTest(primary=primary, field=field):
+                    self.run_main_with_observer_fault(primary, field, value)
+
+    def test_main_ci_storage_failure_never_overrides_publication_or_finalization(self):
+        for primary in (0, 1):
+            for error in (OSError, ValueError):
+                with self.subTest(primary=primary, storage_error=error):
+                    self.run_main_with_observer_fault(primary, storage_error=error)
+
+    def test_gh_call_has_no_new_timeout(self):
+        module = engine()
+        with patch.object(module.subprocess, 'run', return_value=Mock(returncode=0, stdout='', stderr='')) as invoke:
+            module.Watcher('0.2.0').gh('run', 'list')
+        self.assertNotIn('timeout', invoke.call_args.kwargs)
+
+    def test_incomplete_retry_snapshot_keeps_latch_until_one_conclusive_result(self):
+        for missing in ('empty', 'in_progress', 'unknown_conclusion'):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                module = engine()
+                watch = module.Watcher('0.2.0', sleep=lambda _: None)
+                watch.repository, watch.sha = 'vtmocanu/uzi', 'a' * 40
+                path = Path(directory) / 'journal.json'
+                watch.journal = module.journals.Journal(path, 'fixture', watch.repository, watch.tag, watch.sha)
+                watch.requested['release.yml'], watch.remaining['release.yml'] = (101, 1), 1
+                run = dict(self.valid_run(), conclusion='success')
+                complete = dict(self.valid_job(), conclusion='success', steps=[])
+                incomplete = [] if missing == 'empty' else [dict(complete,
+                    status='in_progress' if missing == 'in_progress' else 'completed', conclusion=None)]
+                metadata = (0, json.dumps(run), '')
+                watch.gh = Mock(side_effect=[metadata, (0, json.dumps([dict(total_count=len(incomplete), jobs=incomplete)]), ''),
+                                             metadata, (0, json.dumps([dict(total_count=1, jobs=[complete])]), ''), metadata])
+                watch.record('release.yml', '101')
+                self.assertIn('release.yml', watch.requested)
+                self.assertEqual(module.journals.read(path)['decisions'], [])
+                watch.record('release.yml', '101')
+                self.assertNotIn('release.yml', watch.requested)
+                self.assertEqual([row['state'] for row in module.journals.read(path)['decisions']], ['passed-on-retry'])
+                self.assertEqual(watch.remaining['release.yml'], 1)
+                watch.record('release.yml', '101')
+                self.assertEqual([row['state'] for row in module.journals.read(path)['decisions']], ['passed-on-retry'])
+                self.assertEqual(watch.gh.call_count, 5)
+                self.assertTrue(all(call.args[0] == 'api' for call in watch.gh.call_args_list))
+
     def valid_run(self):
         return dict(id=101, run_attempt=2, head_sha='a' * 40, head_branch='v0.2.0', event='push',
                     path='.github/workflows/release.yml', status='completed', conclusion='failure',
@@ -257,6 +410,15 @@ class JournalAdmission(unittest.TestCase):
         watch.gh.assert_not_called()
         self.assertEqual(watch.remaining['release.yml'], 2)
         self.assertEqual(watch.record.call_args.kwargs, {'fresh': True})
+
+    def test_unknown_gate_conclusion_is_incomplete_prewrite_evidence(self):
+        watch = self.failure_watcher()
+        unknown = dict(self.valid_job(304), name='assert-version', conclusion=None, steps=[])
+        watch.record.return_value = self.valid_run(), [self.valid_job(), unknown]
+        result = watch.run()
+        watch.gh.assert_not_called()
+        self.assertEqual(result, 3)
+        self.assertEqual(watch.remaining['release.yml'], 2)
 
     def test_reservation_is_durable_before_request_and_uncertain_is_not_refunded(self):
         watch = self.failure_watcher()
@@ -397,6 +559,18 @@ class JournalAdmission(unittest.TestCase):
 
 
 class CommandSafety(unittest.TestCase):
+    def test_cli_rejects_abbreviations_and_retains_legacy_missing_value_status(self):
+        cases = [(['0.2.0', '--int', '5'], 3), (['0.2.0', '--max-reruns'], 1),
+                 (['0.2.0', '--interval'], 1), (['0.2.0', '--max-ticks'], 1)]
+        for args, expected in cases:
+            with self.subTest(args=args):
+                module = engine()
+                with (patch.object(module.sys, 'argv', ['release-watch.py', *args]),
+                      patch.object(module.Watcher, 'run', return_value=0),
+                      patch.object(module.subprocess, 'run', return_value=Mock(returncode=0)),
+                      contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
+                    self.assertEqual(module.main(), expected)
+
     def test_stream_commands_are_disabled_and_resumed_on_success_and_failure(self):
         for broken in (False, True):
             with self.subTest(broken=broken), tempfile.TemporaryDirectory() as directory:

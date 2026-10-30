@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
-"""Watch publication with one per-workflow retry ledger and the legacy CLI."""
+"""Watch publication with one per-workflow retry ledger and the legacy CLI.
+
+Publication retries are signature-independent and bounded per workflow.
+assert-* and prep gates require manual recovery; their failures never gain a
+publication retry merely because an infrastructure step failed.
+"""
 import argparse
+import copy
 import importlib.util
 import json
 import os
@@ -46,6 +52,11 @@ def gate(failures):
     return any(name.startswith('assert') or name == 'prep' for name, _ in failures)
 
 
+def terminal_jobs(jobs):
+    # Journal/cache readiness only, independent of legacy publication policy.
+    return bool(jobs) and all(job['status'] == 'completed' and job['conclusion'] not in (None, '') for job in jobs)
+
+
 class Watcher:
     def __init__(self, version, max_reruns=2, interval=60, max_ticks=60, sleep=time.sleep):
         self.version = version.removeprefix('v')
@@ -61,12 +72,16 @@ class Watcher:
         self.main_api = None
         self.requested = {}
         self.completed_jobs = {}
+        self.stop_reason = 'publication-refused'
 
     def snapshot(self, workflow, run_id, branch=None, fresh=False):
         code, raw, _ = self.gh('api', f'repos/{self.repository}/actions/runs/{run_id}')
         if code:
             raise ValueError('journal run unavailable')
         run = json.loads(raw)
+        if (not isinstance(run, dict) or not isinstance(run.get('path'), str)
+                or not isinstance(run.get('repository'), dict) or not isinstance(run.get('head_repository'), dict)):
+            raise ValueError('malformed journal run metadata')
         allowed_events = {'push', 'workflow_dispatch'} if workflow == 'brew.yml' else {'push'}
         if (str(journals.integer(run['id'])) != str(run_id) or run['head_sha'] != self.sha
                 or run['head_branch'] != (self.tag if branch is None else branch) or run['event'] not in allowed_events
@@ -105,14 +120,25 @@ class Watcher:
             if len(set(step_numbers)) != len(step_numbers):
                 raise ValueError('duplicate journal steps')
             for step in job['steps']:
-                journals.integer(step['number'])
                 journals.label(step['name'])
                 journals.status(step['status'], step['conclusion'])
-        if run['status'] == 'completed' and jobs and all(job['status'] == 'completed' for job in jobs):
+        if run['status'] == 'completed' and terminal_jobs(jobs):
             self.completed_jobs[key] = jobs
         return run, jobs
 
     def classify_main(self):
+        before = None
+        try:
+            before = copy.deepcopy(self.journal.data)
+            self.observe_main()
+        except Exception:
+            # This entire lane is observational, including its journal writes.
+            # Publication was finalized first; retain that result and last file.
+            if before is not None:
+                self.journal.data = before
+            print('release-watch: main CI observation unavailable', file=sys.stderr)
+
+    def observe_main(self):
         if self.kind != 'rc':
             self.journal.main_ci('not-applicable')
             return
@@ -131,7 +157,7 @@ class Watcher:
                 state = 'cancelled'
             else:
                 state = 'failed'
-        except (evidence.Refusal, ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired):
+        except (evidence.Refusal, ValueError, KeyError, TypeError, AttributeError, OSError, subprocess.TimeoutExpired):
             state = 'unavailable'
         self.journal.main_ci(state)
 
@@ -142,7 +168,7 @@ class Watcher:
         self.journal.observe(workflow, run, jobs)
         requested = self.requested.get(workflow)
         if (requested and run['id'] == requested[0] and run['run_attempt'] > requested[1]
-                and run['status'] == 'completed'):
+                and run['status'] == 'completed' and terminal_jobs(jobs)):
             passed = (run['conclusion'] == 'success' and bool(jobs)
                       and all(job['status'] == 'completed' and job['conclusion'] in ('success', 'skipped', 'neutral') for job in jobs))
             state = 'passed-on-retry' if passed else 'failed-on-retry'
@@ -151,9 +177,25 @@ class Watcher:
             del self.requested[workflow]
         return run, jobs
 
-    def gh(self, *args):
-        result = subprocess.run(['gh', *map(str, args)], capture_output=True, text=True, check=False, timeout=120)
-        return result.returncode, result.stdout, result.stderr
+    def observe(self, workflow, run_id, required=False):
+        try:
+            return self.record(workflow, run_id, fresh=required)
+        except (ValueError, KeyError, TypeError, AttributeError, OSError, subprocess.TimeoutExpired):
+            if self.journal is not None:
+                try:
+                    self.journal.read_unavailable(workflow)
+                except (ValueError, KeyError, TypeError, OSError):
+                    pass
+            if required:
+                raise
+            print(f'release-watch: {workflow} journal evidence unavailable; continuing publication observation', file=sys.stderr)
+            return None
+
+    def gh(self, *args, combine_errors=False):
+        result = subprocess.run(['gh', *map(str, args)], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT if combine_errors else subprocess.PIPE,
+                                text=True, check=False)
+        return result.returncode, result.stdout, result.stderr or ''
 
     def resolve(self, workflow):
         _, output, _ = self.gh('run', 'list', '--workflow', workflow, '--branch', self.tag,
@@ -161,7 +203,7 @@ class Watcher:
         return output.rstrip('\n')
 
     def dump(self, run):
-        status, output, error = self.gh('run', 'view', run, '--json', 'jobs', '--jq', JOBS_QUERY)
+        status, output, error = self.gh('run', 'view', run, '--json', 'jobs', '--jq', JOBS_QUERY, combine_errors=True)
         return status, (output + error).rstrip('\n')
 
     def wait_requeued(self, run):
@@ -173,15 +215,20 @@ class Watcher:
 
     def run(self):
         try:
-            return self.poll()
-        except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired):
+            result = self.poll()
+        except (ValueError, KeyError, TypeError, AttributeError, OSError, subprocess.TimeoutExpired):
             if self.journal is None:
                 raise
             print('release-watch: journal evidence unavailable; no further automatic recovery', file=sys.stderr)
-            return 3
-        finally:
-            if self.journal is not None:
-                self.classify_main()
+            result = 3
+        if self.journal is not None:
+            state, reason = {0: ('workflows-green', 'publication-workflows-green'),
+                             1: ('blocked', self.stop_reason),
+                             2: ('pending-timeout', 'publication-timeout'),
+                             3: ('instrument-error', 'evidence-unavailable')}[result]
+            self.journal.finish(state, reason)
+            self.classify_main()
+        return result
 
     def poll(self):
         mode = 'rc' if '-' in self.version else 'stable'
@@ -204,7 +251,7 @@ class Watcher:
                         return 3
                     continue
                 self.gh_errors = 0
-                self.record(workflow, run)
+                self.observe(workflow, run)
                 if not rows:
                     all_green = False
                     print(f'[tick {tick}] {workflow} run {run}: no jobs yet; waiting')
@@ -224,11 +271,7 @@ class Watcher:
                 gate_failure = gate(failures)
                 remaining = self.remaining[workflow]
                 if gate_failure or remaining <= 0:
-                    if self.journal is not None:
-                        snapshot, _ = self.record(workflow, run)
-                        self.journal.decision(workflow, int(run), snapshot['run_attempt'],
-                                              'gate-refused' if gate_failure else 'budget-exhausted',
-                                              remaining, remaining, 'blocked')
+                    self.stop_reason = 'gate-refused' if gate_failure else 'budget-exhausted'
                     reason = 'publication gate failure; manual recovery required'
                     if workflow == 'brew.yml' and gate_failure:
                         print(f"After the same tag's release.yml succeeds: gh run rerun {run} --failed", file=sys.stderr)
@@ -237,16 +280,24 @@ class Watcher:
                     print(f'=== {workflow} run {run}: FAILED ({reason}) — react now (gh run view --job <id> --log-failed) ===')
                     for name, url in failures:
                         print(f'  FAIL  {name:<28} {url}')
+                    observed = self.observe(workflow, run)
+                    if observed is not None:
+                        snapshot, _ = observed
+                        try:
+                            self.journal.decision(workflow, int(run), snapshot['run_attempt'],
+                                                  self.stop_reason, remaining, remaining, 'blocked')
+                        except (ValueError, KeyError, TypeError, OSError):
+                            pass
                     return 1
                 print(f'=== {workflow} run {run}: transient failure, auto-rerunning ({remaining} rerun(s) left for {workflow}) ===')
                 for name, url in failures:
                     print(f'  rerun <- {name:<28} {url}')
                 snapshot = None
                 if self.journal is not None:
-                    snapshot, current_jobs = self.record(workflow, run, fresh=True)
+                    snapshot, current_jobs = self.observe(workflow, run, required=True)
                     current = [(job['name'], job['html_url']) for job in current_jobs
                                if job['status'] == 'completed' and job['conclusion'] in FAILURES]
-                    if (snapshot['status'] != 'completed' or any(job['status'] != 'completed' for job in current_jobs)
+                    if (snapshot['status'] != 'completed' or not terminal_jobs(current_jobs)
                             or sorted(current) != sorted(failures)):
                         raise ValueError('publication failure changed before retry')
                 # Reserve the sole ledger before a possible remote side effect.
@@ -261,6 +312,7 @@ class Watcher:
                                           self.remaining[workflow], self.remaining[workflow],
                                           'uncertain' if status else 'requested')
                 if status:
+                    self.stop_reason = 'retry-request-unconfirmed'
                     print(f"=== {workflow} run {run}: 'gh run rerun --failed' itself failed; surfacing ===")
                     return 1
                 if snapshot:
@@ -276,7 +328,9 @@ class Watcher:
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(line_buffering=True)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('version')
     parser.add_argument('--max-reruns', type=int, default=2)
     parser.add_argument('--interval', type=int, default=60)
@@ -289,7 +343,7 @@ def main():
     try:
         args = parser.parse_args()
     except SystemExit:
-        return 3
+        return 1 if sys.argv and sys.argv[-1] in ('--max-reruns', '--interval', '--max-ticks') else 3
     root = subprocess.run(['git', '-c', 'core.fsmonitor=false', 'rev-parse', '--show-toplevel'], capture_output=True, check=False)
     if root.returncode:
         print('release-watch: not in a git checkout', file=sys.stderr)
@@ -309,18 +363,8 @@ def main():
     if token:
         print(f'::stop-commands::{token}', flush=True)
     try:
-        result = watch.run()
-        if watch.journal is not None:
-            state, reason = {0: ('workflows-green', 'publication-workflows-green'),
-                             1: ('blocked', 'publication-refused'),
-                             2: ('pending-timeout', 'publication-timeout'),
-                             3: ('instrument-error', 'evidence-unavailable')}[result]
-            if result == 1 and watch.journal.data['decisions']:
-                last = watch.journal.data['decisions'][-1]
-                reason = 'retry-request-unconfirmed' if last['state'] == 'uncertain' else last['reason']
-            watch.journal.finish(state, reason)
-        return result
-    except (ValueError, TypeError, OSError):
+        return watch.run()
+    except (ValueError, TypeError, AttributeError, OSError):
         print('release-watch: journal unavailable', file=sys.stderr)
         return 3
     finally:

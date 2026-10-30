@@ -844,6 +844,7 @@ Dir.mktmpdir('release-report') do |dir|
       puts({'number' => 42, 'state' => 'open'}.to_json)
     elsif ARGV.any? { |arg| arg.end_with?('/comments') }
       abort 'unsafe issue body' if input.fetch('body').include?('credential-sentinel')
+      abort 'issue body exceeds 65536 characters' if input.fetch('body').length > 65_536
       File.write(ENV.fetch('REPORT_BODY'), input.fetch('body'))
       puts({'id' => 1}.to_json)
     else
@@ -862,6 +863,46 @@ Dir.mktmpdir('release-report') do |dir|
   _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => normal.to_json), 'bash', '-e', '-c', report_script)
   assert.call(status.success?, true, "healthy publication reporting: #{err}")
   assert.call(File.exist?(File.join(dir, 'calls')), false, 'healthy publication never opens or comments on an issue')
+  journal_program = <<~'PY'
+    import importlib.util, sys
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location('journal', sys.argv[1])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    record = module.Journal(sys.argv[2], 'fixture', 'vtmocanu/uzi', 'v0.2.0', 'a' * 40)
+    record.observe('release.yml', dict(id=101, run_attempt=1, status='completed', conclusion='failure'),
+                   [dict(id=i + 1, name='`' * 160, status='completed', conclusion='failure',
+                         steps=[dict(number=1, name='`' * 160, status='completed', conclusion='failure')])
+                    for i in range(24)])
+    record.finish('blocked', 'gate-refused')
+    print(Path(sys.argv[2]).read_text(), end='')
+  PY
+  journal_json, err, status = Open3.capture3('python3', '-I', '-B', '-c', journal_program,
+                                            File.join(root, 'scripts/lib/release-journal.py'), File.join(dir, 'journal.json'))
+  assert.call(status.success?, true, "bounded journal fixture: #{err}")
+  assert.call(journal_json.bytesize <= 32_768, true, 'journal byte budget includes fence escaping')
+  assert.call(journal_json.include?('`'), false, 'journal encoding contains no raw backticks')
+  long_range = Marshal.load(Marshal.dump(normal))
+  long_range['prepare']['outputs']['changes'] = Array.new(1000) { |i| {'sha' => '1' * 40, 'pr' => i + 1, 'shipping' => true} }.to_json
+  long_range['watch'] = {'result' => 'failure', 'outputs' => {'reason' => 'publication-unconfirmed', 'journal' => journal_json}}
+  _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => long_range.to_json), 'bash', '-e', '-c', report_script)
+  assert.call(status.success?, true, "long stable audit cannot drop the incident: #{err}")
+  long_body = File.read(environment.fetch('REPORT_BODY'))
+  long_payload = report_payload.call(long_body)
+  assert.call(long_body.length <= 65_536, true, 'incident fits GitHub issue body bound')
+  assert.call(long_payload.fetch('changes').length, 64, 'incident audit rows are bounded')
+  assert.call(long_payload['changes_count'], 1000, 'full audit count remains visible')
+  assert.call(long_payload['changes_truncated'], true, 'audit truncation is explicit')
+  assert.call(long_body.count('`'), 6, 'only the opening and closing JSON fence contain backticks')
+  assert.call(long_payload.fetch('journal').fetch('attempts').first.fetch('jobs').first.fetch('name'), '`' * 160, 'escaped job label survives JSON round trip')
+  long_range['prepare']['outputs'].merge!('changes' => JSON.parse(long_range['prepare']['outputs']['changes']).first(64).to_json,
+                                        'changes_count' => '1000', 'changes_truncated' => 'true')
+  _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => long_range.to_json), 'bash', '-e', '-c', report_script)
+  assert.call(status.success?, true, "bounded prepare wire still delivers full audit counts: #{err}")
+  wire_payload = report_payload.call(File.read(environment.fetch('REPORT_BODY')))
+  assert.call(wire_payload['changes_count'], 1000, 'report retains the original prepare audit count')
+  assert.call(wire_payload['changes_truncated'], true, 'report retains upstream truncation')
+  FileUtils.rm_f(environment.fetch('REPORT_CALLS'))
   [['authorize', 'nightly-disabled'], ['prepare', 'no-new-shipping-change'], ['prepare', 'no-releasable-notes']].each do |phase, reason|
     noop = Marshal.load(Marshal.dump(normal))
     noop[phase] = {'result' => 'success', 'outputs' => {'outcome' => 'no-op', 'reason' => reason}}
