@@ -135,7 +135,7 @@ A worker without direct success reporting therefore serializes that origin
 for the active flight until an upgrade can report success (or qualifying
 guarded completion clears it); a stopped flight does not retain a perpetual
 reservation. See `forge_origin_reservation_lifecycle` in
-[the success migration](../api/internal/store/migrations/00380_forge_origin_success.sql)
+[the success migration](../api/internal/store/migrations/00384_forge_origin_success.sql)
 and [the authenticated observation/success queries](../api/internal/store/queries/forge_origin.sql).
 
 ### Immediate affinity escape requires the complete history
@@ -145,7 +145,7 @@ worker/origin only when generations 1..G have complete immutable guarded
 positive FINAL/source dispositions and no open hold in any generation.
 The accepted dispositions and exact identity/source/coverage checks live in
 `fn_forge_source_history_safe` in
-[the placement migration](../api/internal/store/migrations/00377_forge_origin_placement.sql).
+[the placement migration](../api/internal/store/migrations/00381_forge_origin_placement.sql).
 Missing generations, nonguarded evidence, multiple/conflicting sources,
 prerequisite-dependent captures or local-only work do not qualify.
 A bare available capture is not a FINAL disposition. Custody admission and
