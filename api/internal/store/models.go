@@ -1176,6 +1176,7 @@ type Run struct {
 	HintedCapabilities          []string           `json:"hinted_capabilities"`
 	CapabilityInferenceEvidence []byte             `json:"capability_inference_evidence"`
 	IdleStallParkCount          int32              `json:"idle_stall_park_count"`
+	ForgeAdmission              []byte             `json:"forge_admission"`
 	PolicyPreserveRequired      bool               `json:"policy_preserve_required"`
 	PolicyPendingFresh          bool               `json:"policy_pending_fresh"`
 	PolicyOutcomeID             pgtype.UUID        `json:"policy_outcome_id"`
@@ -1189,7 +1190,6 @@ type Run struct {
 	PolicyRefusalPhase          pgtype.Text        `json:"policy_refusal_phase"`
 	PolicyRefusalCorrelationID  pgtype.Text        `json:"policy_refusal_correlation_id"`
 	PolicyHoldPublished         pgtype.Bool        `json:"policy_hold_published"`
-	ForgeAdmission              []byte             `json:"forge_admission"`
 }
 
 type RunCompletionAttempt struct {
