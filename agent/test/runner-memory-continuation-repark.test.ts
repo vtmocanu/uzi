@@ -207,6 +207,7 @@ function assertRecord(p: Predecessor, expected: { generation: number; episode: n
   assert.equal(park.ack, expected.ack);
   assert.equal(park.settlement, undefined, "provenance only: a re-park settles nothing");
   assert.equal(park.origin.authorityIncarnation, p.r.rt.authorityIncarnation(), "the slot owner of the predecessor is preserved");
+  assert.equal(park.origin.sourceEpoch, p.slot.epoch, "the predecessor's source epoch is preserved");
 }
 
 function assertNothingDone(c: Counters): void {
@@ -369,9 +370,22 @@ describe("a refused memory continuation re-parks for the owner instead of failin
     const c = await resume(p, { arm: () => api.armStateAckCredentialSwitchOnce(p.f.claim.run_id, 8, "recovery_wait") });
     assert.equal(c.counters.reports, 1, "the park report went out once");
     assert.equal(api.states.some(s => s.body.status === "failed"), false);
+    const switches = api.states.filter(s => s.body.status === "credential_switch" || s.body.status === "credential_switch_failed");
+    assert.equal(switches.length, 1, "the existing retained credential-switch protocol reported the switch");
+    assert.equal(api.states.at(-1)!.body.status, switches[0]!.body.status, "and nothing else followed it");
     assertNothingDone(c.counters);
     await assertUntouched(p);
   });
+
+  for (const [name, status, generation] of [["owner pause", "paused", 8], ["a newer claim fence", "running", 9]] as const) {
+    it(`${name} before the re-park report is nonterminal with no failed report`, async () => {
+      const p = await predecessor("sent_unconfirmed");
+      const c = await resume(p, { arm: () => api.setOwnershipStatus(p.f.claim.run_id, status, generation) });
+      assert.equal(terminals().length, 0);
+      assertNothingDone(c.counters);
+      await assertUntouched(p);
+    });
+  }
 
   it("the boundary deadline stops a park whose answer never arrives, nonterminal and recorded sent_unconfirmed", async () => {
     const p = await predecessor("sent_unconfirmed");
@@ -448,6 +462,29 @@ describe("every other refused continuation keeps today's behaviour (issue #3638 
   it("a classification other than foreign_active or held_unended", async () => {
     const p = await predecessor("sent_unconfirmed");
     assertToday(await resume(p, { wrap: rt => { rt.classifySourceAdmission = async () => ({ kind: "other" }); } }));
+  });
+
+  it("auditor scenario: an unsettled park whose slot the same incarnation ended and re-admitted under a new epoch, then Resumed on another process, is not a re-park", async () => {
+    const p = await predecessor("sent_unconfirmed");
+    const parked = activeJournal()!.memoryPark!;
+    assert.equal(parked.origin.sourceEpoch, p.slot.epoch, "the record binds the flight's own epoch");
+    // A later flight of the same process ended the slot and admitted the clone again: same owner, a fresh epoch.
+    const ended = await p.r.rt.endSourceUse([p.clone]);
+    assert.equal(ended.ended.length, 1, "the earlier flight's source use ended");
+    await p.r.rt.recordAdmissions(new Set(), () => p.r.rt.bindSource(p.clone));
+    const slot = (await slotOf(p.r.rt, p.clone))!;
+    assert.equal(slot.state, "active");
+    assert.equal(slot.owner.worker, parked.origin.authorityIncarnation, "the same incarnation owns it");
+    assert.notEqual(slot.epoch, parked.origin.sourceEpoch, "under a new epoch");
+    // The record is carried by the later flight's writers, unchanged. The process then dies before adoption.
+    assertToday(await resume({ ...p, slot }));
+  });
+
+  it("worker_memory_pressure_v1 not negotiated on the successor: today's path", async () => {
+    const p = await predecessor("sent_unconfirmed");
+    const hasFeature = client.hasFeature.bind(client);
+    client.hasFeature = (feature: string) => feature !== "worker_memory_pressure_v1" && hasFeature(feature);
+    try { assertToday(await resume(p)); } finally { client.hasFeature = hasFeature; }
   });
 
   it("the memory guard is absent on the successor", async () => {

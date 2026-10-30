@@ -349,26 +349,43 @@ export class AuthorityRuntime implements AuthorityScope {
   }
 
   /**
-   * issue #3638 D3 - read-only verification of previously recorded ended slots. Under A, by `authorityKey`: every
-   * slot must be `ineligible` with exactly the recorded epoch and seq and be owned by `worker`. Any difference (a
-   * successor epoch, a changed seq, another owner, a missing slot) or any failure to read answers false. It writes
-   * nothing, authorizes nothing, and is used only to log whether a predecessor's cooperative settlement still holds.
+   * The epoch `sink`'s flight minted for `clonePath` and has not yet confirmed ended, else undefined. Read-only; a
+   * memory-park record binds it as `origin.sourceEpoch` (issue #3638).
+   */
+  ownedSourceEpoch(clonePath: string, sink: Set<string> | undefined): string | undefined {
+    const owner = this.#owners.get(path.resolve(clonePath));
+    return owner !== undefined && owner.sink === sink ? owner.epoch : undefined;
+  }
+
+  /**
+   * issue #3638 D3 - read-only verification of previously recorded ended slots. A is held through the same lock
+   * primitive as {@link withTransaction}, but the pre-callback drain of queued late settlements and ends is NOT run and
+   * the store is not opened for writing: each slot is read by `authorityKey` through {@link peekAuthoritySlot}, and must be
+   * `ineligible` with exactly the recorded epoch and seq, owned by `worker`. Any difference (a successor epoch, a changed
+   * seq, another owner, a missing slot) or any uncertainty (a lock timeout, an unreadable store or slot, a slot one ahead of
+   * its head) answers false. It writes nothing, authorizes nothing, and is used only to log whether a predecessor's
+   * cooperative settlement still holds.
    */
   async verifyEndedSlots(
-    sources: ReadonlyArray<{ authorityKey: string; epoch: string; seq: number }>, worker: string,
+    sources: ReadonlyArray<{ path: string; authorityKey: string; epoch: string; seq: number }>, worker: string,
     options: AuthorityWait = {},
   ): Promise<boolean> {
     if (sources.length === 0) return false;
+    const read = async (): Promise<boolean> => {
+      for (const source of sources) {
+        const slot = await peekAuthoritySlot({ dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken },
+          path.resolve(source.path));
+        if (!slot || slot.key !== source.authorityKey || slot.state !== "ineligible" || slot.epoch !== source.epoch ||
+            slot.seq !== source.seq || slot.owner.worker !== worker) return false;
+      }
+      return true;
+    };
     try {
-      return await this.withTransaction(async (tx) => {
-        const store = await this.#storeFor(tx);
-        for (const source of sources) {
-          const slot = await store.readSlot(tx, source.authorityKey);
-          if (!slot || slot.key !== source.authorityKey || slot.state !== "ineligible" || slot.epoch !== source.epoch ||
-              slot.seq !== source.seq || slot.owner.worker !== worker) return false;
-        }
-        return true;
-      }, { timeoutMs: LATE_WAIT_MS, ...options });
+      if (this.active()) return await read();
+      return await withAuthorityTransaction(this.#options.lifetime, {
+        ...(options.signal ? { signal: options.signal } : {}),
+        timeoutMs: options.timeoutMs ?? LATE_WAIT_MS,
+      }, read);
     } catch {
       return false;
     }

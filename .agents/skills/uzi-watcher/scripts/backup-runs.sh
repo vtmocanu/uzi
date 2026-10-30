@@ -38,7 +38,7 @@
 # A journal may also carry an optional memoryPark record (issue #3638), the worker's cooperative memory-park
 # record: exactly {version:1, binding:{runId,claimGeneration,workerId,registerNonce,memoryEpisode},
 # ack:"confirmed"|"sent_unconfirmed"|"not_sent", origin:{flightId,attemptId|null,executorIncarnation|null,
-# authorityIncarnation}, settlement?:{version:1,confirmed,sources:[1..16 sorted unique {path,authorityKey,
+# authorityIncarnation,sourceEpoch}, settlement?:{version:1,confirmed,sources:[1..16 sorted unique {path,authorityKey,
 # attemptId|null,epoch,seq}],evidence:{parkAck (= binding),interventionIds (<=64),processJoin,commands,steering,
 # auxiliaries,feedback,sinkReceipts,parkReap}}} (settlement only with ack "confirmed"). The protected descriptor
 # validator accepts exactly that v1 shape and refuses anything else; the record grants no attribution of its own.
@@ -620,10 +620,10 @@ select_clone(){
         and .version == 1 and (.binding | mpbinding) and .binding.runId == $rid
         and (.ack | IN("confirmed","sent_unconfirmed","not_sent"))
         and (.origin | type == "object"
-             and (keys == ["attemptId","authorityIncarnation","executorIncarnation","flightId"])
+             and (keys == ["attemptId","authorityIncarnation","executorIncarnation","flightId","sourceEpoch"])
              and (.flightId | uuid) and (.attemptId == null or (.attemptId | aid))
              and (.executorIncarnation == null or (.executorIncarnation | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$")))
-             and (.authorityIncarnation | uuid))
+             and (.authorityIncarnation | uuid) and (.sourceEpoch | uuid))
         and (if has("settlement") then .ack == "confirmed" and (.settlement | mpsettlement($m.binding)) else true end);
       def journal:
         . as $j | type == "object" and fields(["runId","clonePath","attemptId","restoreTip","recovery","retainedSources","peeledMarkers","memoryPark","completionSourceFence"])

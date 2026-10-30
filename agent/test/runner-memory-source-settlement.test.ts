@@ -504,7 +504,7 @@ describe("the cooperative memory-park record is complete or absent (issue #3638)
     } finally { await f.memory.stop(); }
     const slot = (await slotOf(r.rt, worktreeDirFor(IID)))!;
     assert.equal(slot.state, "active");
-    assert.equal(await r.rt.verifyEndedSlots([{ authorityKey: slot.key, epoch: slot.epoch, seq: slot.seq }], slot.owner.worker), false);
+    assert.equal(await r.rt.verifyEndedSlots([{ path: worktreeDirFor(IID), authorityKey: slot.key, epoch: slot.epoch, seq: slot.seq }], slot.owner.worker), false);
   });
 
   // The predecessor's record is read once by the next claim of the run, only to say whether it still verifies.

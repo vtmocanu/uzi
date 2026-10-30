@@ -474,3 +474,41 @@ describe("classifySourceAdmission is genuinely read-only (issue #3638 D4)", () =
     assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), false, "and applies the queued end");
   });
 });
+
+describe("verifyEndedSlots is genuinely read-only (issue #3638 D3)", () => {
+  it("with a queued end pending: the slot and head bytes are equal, nothing is drained or repaired, and the answer is false", async (t) => {
+    const flags = { head: false };
+    const r = await rig(t, {
+      ops: {
+        syncFile: (h) => h.sync(), syncDir: (h) => h.sync(),
+        rename: async (a, b) => {
+          if (flags.head && path.basename(path.dirname(b)) === "heads") throw new Error("injected head failure");
+          fs.renameSync(a, b);
+        },
+      },
+      retryMs: 3_600_000,
+    });
+    const first = new Set<string>();
+    await bindIn(r.rt, first, r.clone);
+    r.rt.retireSink(first);
+    const live = (await slotOf(r.rt, r.clone))!;
+    flags.head = true;
+    await r.rt.endSourceUse([r.clone]);
+    await new Promise((resolve) => setTimeout(resolve, 100)); // the idle drain's own (failing) attempt
+    flags.head = false;
+
+    const before = authorityBytes(r.root);
+    assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), true, "the end is queued and the key still owned");
+    const sources = [{ path: r.clone, authorityKey: live.key, epoch: live.epoch, seq: live.seq + 1 }];
+    assert.equal(await r.rt.verifyEndedSlots(sources, r.rt.authorityIncarnation()!), false, "a slot one ahead of its head is uncertain");
+    assert.equal(authorityBytes(r.root), before, "slot and head files are byte-equal: no repair, no write");
+    assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), true, "the queued end was not drained by the verification");
+
+    // The control: an ordinary transaction DOES drain the queued end, so the equality above is meaningful.
+    await r.rt.withTransaction(async () => undefined);
+    assert.notEqual(authorityBytes(r.root), before);
+    const ended = (await slotOf(r.rt, r.clone))!;
+    assert.equal(await r.rt.verifyEndedSlots([{ path: r.clone, authorityKey: ended.key, epoch: ended.epoch, seq: ended.seq }],
+      r.rt.authorityIncarnation()!), true, "once ended the same call verifies");
+  });
+});

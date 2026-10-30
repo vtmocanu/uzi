@@ -47,7 +47,7 @@ const configBytes = (): Buffer => fs.readFileSync(path.join(bare, "config"));
 const expected = () => ({ runId: RUN, clonePath });
 
 const BINDING = { runId: RUN, claimGeneration: 7, workerId: "worker-1", registerNonce: "nonce-1", memoryEpisode: 3 };
-const ORIGIN = { flightId: UUID_A, attemptId: null, executorIncarnation: null, authorityIncarnation: UUID_B };
+const ORIGIN = { flightId: UUID_A, attemptId: null, executorIncarnation: null, authorityIncarnation: UUID_B, sourceEpoch: UUID_C };
 const evidence = (binding = BINDING) => ({
   parkAck: { ...binding }, interventionIds: [] as string[], processJoin: "executor" as const, commands: "not_required" as const,
   steering: "joined" as const, auxiliaries: "none" as const, feedback: "drained" as const, sinkReceipts: "joined" as const,
@@ -93,7 +93,7 @@ describe("memoryPark strict v1 parse", () => {
     const park = journal().memoryPark as Record<string, unknown>;
     assert.deepEqual(Object.keys(park), ["version", "binding", "ack", "origin", "settlement"]);
     assert.deepEqual(Object.keys(park.binding as object), ["runId", "claimGeneration", "workerId", "registerNonce", "memoryEpisode"]);
-    assert.deepEqual(Object.keys(park.origin as object), ["flightId", "attemptId", "executorIncarnation", "authorityIncarnation"]);
+    assert.deepEqual(Object.keys(park.origin as object), ["flightId", "attemptId", "executorIncarnation", "authorityIncarnation", "sourceEpoch"]);
     const settlement = park.settlement as Record<string, unknown>;
     assert.deepEqual(Object.keys(settlement), ["version", "confirmed", "sources", "evidence"]);
     assert.equal(settlement.confirmed, true);
@@ -118,6 +118,8 @@ describe("memoryPark strict v1 parse", () => {
     ["a negative memory episode", r => { r.binding.memoryEpisode = -1; r.settlement.evidence.parkAck.memoryEpisode = -1; }],
     ["a non-uuid flight id", r => { r.origin.flightId = "not-a-uuid"; }],
     ["a non-uuid authority incarnation", r => { r.origin.authorityIncarnation = "nope"; }],
+    ["a non-uuid source epoch", r => { r.origin.sourceEpoch = "nope"; }],
+    ["a missing source epoch", r => { delete r.origin.sourceEpoch; }],
     ["a malformed executor incarnation", r => { r.origin.executorIncarnation = "has space"; }],
     ["a malformed attempt id", r => { r.origin.attemptId = "attempt"; }],
     ["no sources", r => { r.settlement.sources = []; }],
@@ -377,6 +379,7 @@ describe("recordMemoryPark conflicts and replay", () => {
 
   const conflicts: Array<[string, () => MemoryParkRecord]> = [
     ["a different memory episode in the same claim generation", () => settled({ binding: { ...BINDING, memoryEpisode: 4 }, settlement: { ...settled().settlement!, evidence: evidence({ ...BINDING, memoryEpisode: 4 }) } })],
+    ["a different source epoch in the same claim generation", () => settled({ origin: { ...ORIGIN, sourceEpoch: UUID_A } })],
     ["a different flight in the same claim generation", () => settled({ origin: { ...ORIGIN, flightId: UUID_C } })],
     ["a lower claim generation", () => settled({ binding: { ...BINDING, claimGeneration: 6 }, settlement: { ...settled().settlement!, evidence: evidence({ ...BINDING, claimGeneration: 6 }) } })],
     ["different sources in the same claim generation", () => settled({}, [source(clonePath, 2)])],

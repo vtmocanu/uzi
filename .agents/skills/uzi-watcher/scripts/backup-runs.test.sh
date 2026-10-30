@@ -690,7 +690,8 @@ for kind in protected ordinary; do
     mp_valid="$(jq -cn --argjson b "$mp_binding" --arg path "$predecessor" '
       {version:1,binding:$b,ack:"confirmed",
        origin:{flightId:"11111111-1111-4111-8111-111111111111",attemptId:null,executorIncarnation:null,
-               authorityIncarnation:"22222222-2222-4222-8222-222222222222"},
+               authorityIncarnation:"22222222-2222-4222-8222-222222222222",
+               sourceEpoch:"33333333-3333-4333-8333-333333333333"},
        settlement:{version:1,confirmed:true,
          sources:[{path:$path,authorityKey:("c" * 64),attemptId:null,epoch:"33333333-3333-4333-8333-333333333333",seq:4}],
          evidence:{parkAck:$b,interventionIds:[],processJoin:"executor",commands:"not_required",steering:"joined",
@@ -721,6 +722,8 @@ for kind in protected ordinary; do
       "$(printf '%s' "$mp_valid" | jq -c '.binding.extra=1')"
       "$(printf '%s' "$mp_valid" | jq -c '.origin.flightId="not-a-uuid"')"
       "$(printf '%s' "$mp_valid" | jq -c '.origin.authorityIncarnation="nope"')"
+      "$(printf '%s' "$mp_valid" | jq -c '.origin.sourceEpoch="nope"')"
+      "$(printf '%s' "$mp_valid" | jq -c 'del(.origin.sourceEpoch)')"
       "$(printf '%s' "$mp_valid" | jq -c '.origin.executorIncarnation="bad incarnation"')"
       "$(printf '%s' "$mp_valid" | jq -c '.origin.attemptId="not-an-attempt"')"
       "$(printf '%s' "$mp_valid" | jq -c '.origin.extra=1')"

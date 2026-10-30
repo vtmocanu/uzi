@@ -2106,6 +2106,8 @@ type FlightSourceEnd = Readonly<{
   paths: readonly string[];
   endedSlots: ReadonlyArray<Readonly<{ path: string; key: string; epoch: string; seq: number; worker: string }>>;
   published: boolean;
+  /** The epoch this flight's sink owned for each path when the end began (before any end released the owner). */
+  ownedEpochs: Readonly<Record<string, string>>;
 }>;
 type MemoryFlight = {
   readonly incarnation: MemoryIncarnation;
@@ -2196,10 +2198,10 @@ interface RunFlight {
    * issue #3638 D4: set by a retained claim whose memory continuation was refused and re-parked (see
    * {@link RunRunner.parkMemoryContinuationRefused}). `sent` is latched immediately BEFORE the park report (so a lost ACK
    * still leaves it); `confirmed` only on the server's exact accepted binding. The teardown producer records them as
-   * provenance (never a settlement), keeping `authorityIncarnation`, the slot owner the predecessor's record named.
+   * provenance (never a settlement), keeping `authorityIncarnation` and `sourceEpoch`, the slot owner and epoch the predecessor's record named.
    */
   memoryRepark?: {
-    readonly authorityIncarnation: string; readonly attemptId: string | null;
+    readonly authorityIncarnation: string; readonly sourceEpoch: string; readonly attemptId: string | null;
     sent?: MemoryParkWitness["binding"]; confirmed?: MemoryParkWitness["binding"];
   };
   /** issue #3638: set (permanently) when {@link RunRunner.endFlightSourceUse} began; the flight admits no source again. */
@@ -3522,7 +3524,7 @@ export class RunRunner {
    */
   private async endFlightSourceUse(flight: RunFlight, runLog: Logger): Promise<FlightSourceEnd> {
     const authority = this.authority;
-    const none: FlightSourceEnd = { paths: [], endedSlots: [], published: false };
+    const none: FlightSourceEnd = { paths: [], endedSlots: [], published: false, ownedEpochs: {} };
     if (!authority) return none;
     // Retired at the very entry, before any early return: a callback this flight left behind (a late git hook)
     // can no longer admit, whatever happens to the end below. Keys it admitted stay owned until a confirmed end.
@@ -3534,10 +3536,12 @@ export class RunRunner {
     for (const clone of [flight.worktreePath, flight.runnerClone?.path]) if (clone) paths.add(resolvePath(clone));
     if (paths.size === 0) return none;
     const allPaths = [...paths];
+    const ownedEpochs: Record<string, string> = {};
+    for (const p of allPaths) { const epoch = authority.ownedSourceEpoch(p, sink); if (epoch !== undefined) ownedEpochs[p] = epoch; }
     if (flight.sourceTailsJoined !== true) {
       runLog.warn("source use left active: this flight's source-capable tails were not positively joined", {
         sources: paths.size });
-      return { paths: allPaths, endedSlots: [], published: false };
+      return { paths: allPaths, endedSlots: [], published: false, ownedEpochs };
     }
     // U4: a flight whose completing source the journal durably bound publishes it (Codex: sealed; Claude:
     // claude_ready) instead of ending it. Publication moves the slot out of `active` itself and returns its
@@ -3549,10 +3553,10 @@ export class RunRunner {
       const outcome = await this.publishFlightSource(flight, bound, runLog);
       if (outcome !== "unpublished") { paths.delete(resolvePath(bound.clonePath)); published = true; }
     }
-    if (paths.size === 0) return { paths: allPaths, endedSlots: [], published };
+    if (paths.size === 0) return { paths: allPaths, endedSlots: [], published, ownedEpochs };
     const outcome = await authority.endSourceUse(paths, { timeoutMs: this.sourceUseEndWaitMs, sink });
     if (outcome.kept.length > 0) runLog.warn("source use left active for some paths", { kept: outcome.kept.length });
-    return { paths: allPaths, endedSlots: outcome.endedSlots, published };
+    return { paths: allPaths, endedSlots: outcome.endedSlots, published, ownedEpochs };
   }
 
   /**
@@ -21500,13 +21504,22 @@ export class RunRunner {
             registerNonce: wire.register_nonce, memoryEpisode: wire.memory_episode },
           ack: repark!.confirmed ? "confirmed" : "sent_unconfirmed",
           origin: { flightId: flight.flightId, attemptId: repark!.attemptId,
-            executorIncarnation: flight.executor.executorIncarnation ?? null, authorityIncarnation: repark!.authorityIncarnation },
+            executorIncarnation: flight.executor.executorIncarnation ?? null, authorityIncarnation: repark!.authorityIncarnation,
+            sourceEpoch: repark!.sourceEpoch },
         };
         attemptId = repark!.attemptId ?? undefined;
       } else {
         const authorityIncarnation = authority.authorityIncarnation();
         if (authorityIncarnation === undefined) {
           runLog.warn("memory park not recorded: the authority incarnation is unknown");
+          return;
+        }
+        // The epoch of this flight's own slot for its clone, captured before the end released the owner (the end receipt
+        // names the same epoch). Not determinable means no record.
+        const sourceKey = resolvePath(clonePath);
+        const sourceEpoch = end.ownedEpochs[sourceKey] ?? end.endedSlots.find(e => e.path === sourceKey)?.epoch;
+        if (sourceEpoch === undefined) {
+          runLog.warn("memory park not recorded: the flight's source epoch is unknown");
           return;
         }
         const witness = memory.parkWitness;
@@ -21518,7 +21531,7 @@ export class RunRunner {
         record = {
           version: 1, binding, ack: witness ? "confirmed" : memory.parkSent ? "sent_unconfirmed" : "not_sent",
           origin: { flightId: hold.origin.flightId, attemptId: hold.origin.attemptId,
-            executorIncarnation: hold.origin.executorIncarnation, authorityIncarnation },
+            executorIncarnation: hold.origin.executorIncarnation, authorityIncarnation, sourceEpoch },
         };
         const executor = flight.executor;
         const complete = end.paths.length >= 1 && end.paths.length <= 16 && !end.published &&
@@ -22518,12 +22531,13 @@ export class RunRunner {
    *    episode agree with this claim's episode (E = the record's, C = the claim's): `confirmed` C === E + 1;
    *    `sent_unconfirmed` C === E (the server never applied it) or C === E + 1 (it applied it, every ACK was lost, and
    *    the owner Resumed); `not_sent` C === E only;
-   * 3. the slot's owner is the incarnation the record names and, for a settled record, its epoch is a recorded source
-   *    epoch (so a successor that minted its own epoch and crashed, and an unrelated writer, are excluded);
+   * 3. the slot's owner is the incarnation the record names AND its epoch is exactly the record's `origin.sourceEpoch`
+   *    (the parked flight's own epoch), settled or not, so a later flight that minted its own epoch, a successor that
+   *    crashed, and an unrelated writer are all excluded;
    * 4. worker memory is bound for this flight and `worker_memory_pressure_v1` is negotiated.
    * Returns the slot owner to preserve in the next record, else undefined (the existing flow is unchanged).
    */
-  private async memoryReparkOwner(claim: ClaimResponse, flight: RunFlight, source: RecoveryJournalEntry): Promise<string | undefined> {
+  private async memoryReparkOwner(claim: ClaimResponse, flight: RunFlight, source: RecoveryJournalEntry): Promise<{ authorityIncarnation: string; sourceEpoch: string } | undefined> {
     const record = source.memoryPark;
     const memory = flight.workerMemory;
     const authority = this.authority;
@@ -22542,10 +22556,9 @@ export class RunRunner {
       this.authorityWait(flight));
     this.retainedLifecycleGuard(flight);
     if ((classified.kind !== "foreign_active" && classified.kind !== "held_unended") || !classified.owner ||
-        classified.owner.worker !== record.origin.authorityIncarnation) return undefined;
-    if (record.settlement && !record.settlement.sources.some(s => s.path === resolvePath(source.clonePath) &&
-        s.epoch === classified.owner!.epoch)) return undefined;
-    return record.origin.authorityIncarnation;
+        classified.owner.worker !== record.origin.authorityIncarnation ||
+        classified.owner.epoch !== record.origin.sourceEpoch) return undefined;
+    return { authorityIncarnation: record.origin.authorityIncarnation, sourceEpoch: record.origin.sourceEpoch };
   }
 
   /**
@@ -22554,17 +22567,18 @@ export class RunRunner {
    * body. Modelled on {@link parkRetainedRecoveryExhausted}: at most two reports under one boundary deadline, the lifecycle
    * guard on every step. It sets no `memory.hold` (that would re-enter preservation) and performs no capture, admission,
    * recovery-episode charge, model turn or publication. ALWAYS throws: an exact accepted binding (a 409 exact replay is
-   * mapped to accepted by the client) marks the flight parked, every other outcome (a stale claim or checker-parent change,
-   * a wall-parked ACK, a credential switch, pause, cancel or claim fence, the deadline, a transport failure, no binding)
+   * mapped to accepted by the client) marks the flight parked, a CredentialSwitchSignal is rethrown to the existing retained
+   * credential-switch protocol (which reports its own switch state, never `failed`); every other outcome (a stale claim or
+   * checker-parent change, a wall-parked ACK, pause, cancel or claim fence, the deadline, a transport failure, no binding)
    * stops the claim nonterminally with custody retained and no `failed` report. The teardown producer records what was
    * sent or confirmed (`flight.memoryRepark`).
    */
   private async parkMemoryContinuationRefused(claim: ClaimResponse, flight: RunFlight, source: RecoveryJournalEntry,
-    authorityIncarnation: string): Promise<never> {
+    owner: { authorityIncarnation: string; sourceEpoch: string }): Promise<never> {
     const incarnation = this.client.memoryIncarnation!;
     const wire: MemoryParkWitness["binding"] = Object.freeze({ run_id: flight.runId, worker_id: incarnation.worker_id,
       register_nonce: incarnation.register_nonce, claim_generation: flight.claimGeneration, memory_episode: claim.memory_episode! });
-    const repark: NonNullable<RunFlight["memoryRepark"]> = { authorityIncarnation, attemptId: source.attemptId ?? null };
+    const repark: NonNullable<RunFlight["memoryRepark"]> = { ...owner, attemptId: source.attemptId ?? null };
     flight.memoryRepark = repark;
     this.retainWorkerMemoryCustody(flight);
     const deadline = Date.now() + this.codexBoundaryDeadlineMs;

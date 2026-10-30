@@ -1598,7 +1598,9 @@ export interface MemoryParkRecord {
   version: 1;
   binding: MemoryParkBinding;
   ack: MemoryParkAck;
-  origin: { flightId: string; attemptId: string | null; executorIncarnation: string | null; authorityIncarnation: string };
+  origin: { flightId: string; attemptId: string | null; executorIncarnation: string | null; authorityIncarnation: string;
+    /** The epoch of the parked flight's own source-use slot for its clone path; a D4 re-park is eligible only against exactly it. */
+    sourceEpoch: string };
   /** Present only when `ack === "confirmed"`. */
   settlement?: MemoryParkSettlement;
 }
@@ -1703,14 +1705,15 @@ function parseMemoryPark(value: unknown): MemoryParkRecord {
   if (o.version !== 1) return memoryParkFail();
   const binding = memoryParkBinding(o.binding);
   const ack = memoryParkOneOf(o.ack, ["confirmed", "sent_unconfirmed", "not_sent"] as const);
-  const origin = memoryParkKeys(o.origin, ["flightId", "attemptId", "executorIncarnation", "authorityIncarnation"]);
+  const origin = memoryParkKeys(o.origin, ["flightId", "attemptId", "executorIncarnation", "authorityIncarnation", "sourceEpoch"]);
   const record: MemoryParkRecord = {
     version: 1, binding, ack,
     origin: { flightId: memoryParkMatch(origin.flightId, MEMORY_PARK_UUID_RE),
       attemptId: origin.attemptId === null ? null : memoryParkMatch(origin.attemptId, ATTEMPT_ID_RE),
       executorIncarnation: origin.executorIncarnation === null ? null
         : memoryParkMatch(origin.executorIncarnation, MEMORY_PARK_INCARNATION_RE),
-      authorityIncarnation: memoryParkMatch(origin.authorityIncarnation, MEMORY_PARK_UUID_RE) },
+      authorityIncarnation: memoryParkMatch(origin.authorityIncarnation, MEMORY_PARK_UUID_RE),
+      sourceEpoch: memoryParkMatch(origin.sourceEpoch, MEMORY_PARK_UUID_RE) },
   };
   if (o.settlement === undefined) return record;
   if (ack !== "confirmed") return memoryParkFail();
