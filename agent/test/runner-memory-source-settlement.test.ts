@@ -223,11 +223,14 @@ describe("a settled memory park ends the flight's source use (issue #3638)", () 
         throw new Error("fixture stops original model execution");
       },
     };
+    // A deadline far above any plausible load: the park body must reach the server before preservation can stop on time.
     try {
       await runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
-        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, authority: r.rt }).execute(f.claim);
+        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 120_000, authority: r.rt }).execute(f.claim);
     } finally { await f.memory.stop(); }
 
+    // Gate every expectation on the premise: exactly one park body was sent (and never confirmed).
+    assert.equal(parks().length, 1, "exactly one park body was sent to the server");
     assert.equal(api.states.some(s => s.body.status === "failed"), false, "a quiet retained stop");
     const clone = worktreeDirFor(IID);
     assert.equal((await slotOf(r.rt, clone))?.state, "active", "no witness: fail closed");
@@ -346,6 +349,32 @@ describe("the cooperative memory-park record is complete or absent (issue #3638)
     assert.equal(park?.ack, "confirmed", "the park itself is still recorded");
     assert.equal(park?.settlement, undefined, "no receipt for the clone: no settlement");
     assert.equal(r.outcomes.length > 0, true);
+  });
+
+  it("a published end writes no settlement even though the park is confirmed and the slot ended", async () => {
+    const { r } = await exhaustedPark((_rig, runner) => {
+      const internals = runner as { endFlightSourceUse(...args: unknown[]): Promise<Record<string, unknown>> };
+      const inner = internals.endFlightSourceUse.bind(runner);
+      internals.endFlightSourceUse = async (...args) => ({ ...(await inner(...args)), published: true });
+    });
+    const park = activeJournal()?.memoryPark;
+    assert.equal(park?.ack, "confirmed", "the park itself is still recorded");
+    assert.equal(park?.settlement, undefined, "a published end is not a settlement");
+    assert.equal(r.outcomes.flatMap(o => o.endedSlots).length, 1, "the source use did end, so only the published conjunct refused");
+  });
+
+  it("an ended slot owned by another authority incarnation writes no settlement", async () => {
+    const { r } = await exhaustedPark(rig => {
+      const inner = rig.rt.endSourceUse.bind(rig.rt);
+      rig.rt.endSourceUse = async (...args) => {
+        const out = await inner(...args);
+        return { ...out, endedSlots: out.endedSlots.map(e => ({ ...e, worker: randomUUID() })) };
+      };
+    });
+    const park = activeJournal()?.memoryPark;
+    assert.equal(park?.ack, "confirmed");
+    assert.equal(park?.settlement, undefined, "a receipt of another incarnation is no witness for this one");
+    assert.equal(r.outcomes.flatMap(o => o.endedSlots).length, 1);
   });
 
   /** A park with `extra` additional source paths, each with a (fabricated) confirmed end, besides the clone. */

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -235,6 +236,25 @@ describe("recordMemoryPark durability: two phases, each under the bare lock", ()
     });
   }
 
+  it("an aborted signal stops phase 2 from starting: the phase-1 draft stays unconfirmed and nothing qualifies", async () => {
+    const abort = new AbortController();
+    let pairs = 0;
+    const out = await cache.recordMemoryPark(bare, BRANCH, expected(), settled(), {
+      signal: abort.signal,
+      sync: async (h, what) => { await h.sync(); if (what === "directory" && ++pairs === 1) abort.abort(); },
+    });
+    assert.equal(out, "unconfirmed");
+    assert.equal(pairs, 1, "no phase-2 sync pair ran");
+    assert.equal(stored().settlement?.confirmed, false, "phase 2 never wrote confirmed:true");
+    assert.equal(await confirmedRead(), undefined);
+  });
+
+  it("an already aborted signal forfeits the lock hold: nothing is written", async () => {
+    const before = configBytes();
+    await assert.rejects(cache.recordMemoryPark(bare, BRANCH, expected(), settled(), { signal: AbortSignal.abort() }));
+    assert.deepEqual(configBytes(), before);
+  });
+
   it("a replay after a failed phase 2 completes both phases", async () => {
     assert.equal(await cache.recordMemoryPark(bare, BRANCH, expected(), settled(), { sync: syncFailing(3, "config") }), "unconfirmed");
     assert.equal(await cache.recordMemoryPark(bare, BRANCH, expected(), settled()), "settled");
@@ -452,6 +472,23 @@ describe("memoryPark carry and retire inventory", () => {
     await assert.rejects(cache.recordMemoryPark(bare, BRANCH, expected(), unsettled({ binding: { ...BINDING, claimGeneration: 9 } })), /does not name this source/);
     assert.equal(await cache.readConfirmedMemoryPark(bare, BRANCH, { ...expected(), record: settled() }), undefined);
     assert.doesNotMatch(gitIn(bare, ["config", "--get-all", `uzi-stopped.${RUN}.entry`]), /memoryPark/);
+  });
+
+  it("a journal bound by a stopped marker whose clear failed is never rewritten by the producer, and still heals", async () => {
+    const markerKey = `uzi-stopped.${RUN}.entry`;
+    const raw = rawJournal();
+    gitIn(bare, ["config", "--add", markerKey, JSON.stringify({ version: 1, runId: RUN, generation: null, branch: BRANCH, key: KEY, clonePath,
+      journalDigest: createHash("sha256").update(raw).digest("hex"), reason: "test", at: "2026-10-27T00:00:00.000Z" })]);
+    const before = configBytes();
+    for (const record of [unsettled(), settled()]) {
+      assert.equal(await cache.recordMemoryPark(bare, BRANCH, expected(), record), "unconfirmed", "a non-qualifying outcome");
+      assert.deepEqual(configBytes(), before, "nothing was written");
+      assert.equal(rawJournal(), raw, "the raw journal bytes are unchanged, so the marker digest still matches");
+    }
+    assert.equal(parkJson(), original(), "the record the journal already carried is untouched");
+    // The marker's own heal still clears the bound journal.
+    assert.equal(await cache.discoverRetainedRecovery(fx.originPath, BRANCH, KEY, RUN), undefined);
+    assert.equal(gitIn(bare, ["config", "--get", journalKey()]), "");
   });
 
   it("a stopped attempt retention carries no record into the ledger either", async () => {

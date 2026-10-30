@@ -254,6 +254,9 @@ import {
   parseDecisionsMemoResponse,
 } from "./decisions-memo.js";
 
+/** Bound for the log-only predecessor memory-settlement verification during retained recovery. */
+const MEMORY_SETTLEMENT_LOG_BUDGET_MS = 2000;
+
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
@@ -21511,9 +21514,12 @@ export class RunRunner {
           sources: end.paths.length, ended: end.endedSlots.length });
       }
       const attemptId = flight.runnerClone?.attemptId;
+      // The timeout also aborts the writer, so a timed-out producer forfeits pending lock holds and starts no phase 2.
+      const give = new AbortController();
       const written = await Promise.race([
-        this.git.recordMemoryPark(bare, branch, { runId: flight.runId, clonePath, ...(attemptId ? { attemptId } : {}) }, record),
-        new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), this.codexBoundaryDeadlineMs); }),
+        this.git.recordMemoryPark(bare, branch, { runId: flight.runId, clonePath, ...(attemptId ? { attemptId } : {}) }, record,
+          { signal: give.signal }),
+        new Promise<"timeout">(resolve => { timer = setTimeout(() => { give.abort(); resolve("timeout"); }, this.codexBoundaryDeadlineMs); }),
       ]);
       if (written === "timeout") runLog.warn("memory park record is still being written; the park stays unqualified until it lands");
       else if (written === "unconfirmed") runLog.warn("memory park settlement could not be confirmed; the park stays unqualified");
@@ -22467,10 +22473,6 @@ export class RunRunner {
     } finally { clearTimeout(timer); }
   }
 
-  /** At most three durably precharged iterations per server recovery episode.
-   * A newer episode with a fresh owned claim can renew budget exhaustion. Adoption failure
-   * needs an unconsumed raw owner grant and a newer owned claim; other blockers persist.
-   * Each failed capture blocks only this run; waits are bounded by the persisted episode clock. */
   /**
    * issue #3638 D3 - diagnostics only: when the predecessor's journal carries a memory-park settlement, log whether
    * the lock-confirmed record AND the authority's ended slots still agree with it. The answer authorizes nothing here
@@ -22482,16 +22484,23 @@ export class RunRunner {
     if (!record?.settlement) return;
     let verified = false;
     try {
-      const confirmed = typeof this.git.readConfirmedMemoryPark === "function" && await this.git.readConfirmedMemoryPark(
+      // Log-only: neither the lock wait nor the authority read may delay recovery beyond a short bound or its lifecycle.
+      const signal = AbortSignal.any([this.retainedLifecycleSignal(flight), AbortSignal.timeout(MEMORY_SETTLEMENT_LOG_BUDGET_MS)]);
+      const confirmed = await this.git.readConfirmedMemoryPark(
         bare, branch, { runId: source.runId, clonePath: source.clonePath,
-          ...(source.attemptId === undefined ? {} : { attemptId: source.attemptId }), record }) !== undefined;
+          ...(source.attemptId === undefined ? {} : { attemptId: source.attemptId }), record }, { signal }) !== undefined;
       verified = confirmed && this.authority !== undefined &&
-        await this.authority.verifyEndedSlots(record.settlement.sources, record.origin.authorityIncarnation);
+        await this.authority.verifyEndedSlots(record.settlement.sources, record.origin.authorityIncarnation,
+          { signal, timeoutMs: MEMORY_SETTLEMENT_LOG_BUDGET_MS });
     } catch { verified = false; }
     flight.runLog.info(`predecessor cooperative settlement ${verified ? "verified" : "unverified"}`, {
       sources: record.settlement.sources.length, claim_generation: record.binding.claimGeneration });
   }
 
+  /** At most three durably precharged iterations per server recovery episode.
+   * A newer episode with a fresh owned claim can renew budget exhaustion. Adoption failure
+   * needs an unconsumed raw owner grant and a newer owned claim; other blockers persist.
+   * Each failed capture blocks only this run; waits are bounded by the persisted episode clock. */
   private async recoverRetainedClaim(
     claim: ClaimResponse, flight: RunFlight, key: string, source: RecoveryJournalEntry,
   ): Promise<void> {

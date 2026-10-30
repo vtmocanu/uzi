@@ -1754,7 +1754,12 @@ function serializeMemoryPark(record: MemoryParkRecord): string {
 export interface MemoryParkDurability {
   sync?: (handle: { sync(): Promise<void> }, what: "config" | "directory") => Promise<void>;
   readback?: (read: () => Promise<string | undefined>) => Promise<string | undefined>;
+  /** Forfeits a bare-lock wait that has not been granted yet, and (for the writer) a phase that has not started. */
+  signal?: AbortSignal;
 }
+
+/** Thrown inside a bare-lock hold of {@link GitCache.recordMemoryPark} when the source is marked stopped or protected. */
+class MemoryParkRefusal extends Error {}
 
 const MEMORY_PARK_ACK_RANK: Record<MemoryParkAck, number> = { not_sent: 0, sent_unconfirmed: 1, confirmed: 2 };
 
@@ -6940,6 +6945,10 @@ export class GitCache {
    * `confirmed`, then adding the settlement) is allowed, never with a different binding or origin, and a record that
    * carries a settlement is never replaced by one that does not.
    * `settlement.confirmed` on the input is ignored: the writer owns that flag.
+   *
+   * A journal bound by a stopped marker (even one whose clear failed) or shadowed by a protected descriptor is never
+   * rewritten: nothing is written, the refusal is logged and `unconfirmed` is returned. `opts.signal` forfeits a lock
+   * hold not yet granted and stops phase 2 from starting once aborted (a phase-1 draft stays `confirmed: false`).
    */
   async recordMemoryPark(
     barePath: string, branch: string, expected: { runId: string; clonePath: string; attemptId?: string },
@@ -6959,34 +6968,61 @@ export class GitCache {
             stored.journal.attemptId !== expected.attemptId) {
           throw new Error("memory park journal does not name this source");
         }
+        // Mirrors installCompletionSourceFence: a journal bound by a stopped marker (whose clear may have failed) or
+        // shadowed by a protected descriptor is never rewritten, so the marker's digest keeps matching its raw bytes.
+        try {
+          await this.assertNoStoppedMarker(barePath, stored.journal.clonePath, stored.journal);
+        } catch (error) {
+          if (error instanceof RetainedStoppedSourceError) throw new MemoryParkRefusal("memory park source is marked stopped");
+          throw error;
+        }
+        if ((await this.protectedRecoveries(barePath, stored.journal.runId)).length) {
+          throw new MemoryParkRefusal("memory park source has a protected descriptor");
+        }
         return fn(stored);
-      });
+      }, opts.signal);
     /** Write `target` unless the stored bytes already are exactly it, then ALWAYS sync and read back. */
     const commit = async (stored: { journal: RecoveryJournalEntry; raw: string }, target: MemoryParkRecord): Promise<void> => {
       const wanted = recoveryJournalJson({ ...stored.journal, memoryPark: target });
       if (stored.raw !== wanted) await this.writeRecovery(barePath, branch, { ...stored.journal, memoryPark: target });
       await this.syncJournalAndReadBack(barePath, branch, wanted, opts);
     };
+    const refused = (error: unknown): "unconfirmed" => {
+      this.log.warn("memory park not recorded: the source is stopped or protected", { error: gitErrorMessage(error) });
+      return "unconfirmed";
+    };
     if (incoming.settlement === undefined) {
-      return section(async stored => {
-        if (memoryParkRelation(stored.journal.memoryPark, incoming) === "refuse") throw new Error("memory park record conflicts with the journal's");
-        await commit(stored, incoming);
-        return "recorded" as const;
-      });
+      try {
+        return await section(async stored => {
+          if (memoryParkRelation(stored.journal.memoryPark, incoming) === "refuse") throw new Error("memory park record conflicts with the journal's");
+          await commit(stored, incoming);
+          return "recorded" as const;
+        });
+      } catch (error) {
+        if (error instanceof MemoryParkRefusal) return refused(error);
+        throw error;
+      }
     }
     // Phase 1.
-    const alreadyFinal = await section(async stored => {
-      if (memoryParkRelation(stored.journal.memoryPark, final) === "refuse") throw new Error("memory park record conflicts with the journal's");
-      if (stored.journal.memoryPark !== undefined && serializeMemoryPark(stored.journal.memoryPark) === serializeMemoryPark(final)) {
-        // An identical settled replay: never downgraded to confirmed:false; the sync and read-back are repeated.
-        await commit(stored, final);
-        return true;
-      }
-      await commit(stored, draft);
-      return false;
-    });
+    let alreadyFinal: boolean;
+    try {
+      alreadyFinal = await section(async stored => {
+        if (memoryParkRelation(stored.journal.memoryPark, final) === "refuse") throw new Error("memory park record conflicts with the journal's");
+        if (stored.journal.memoryPark !== undefined && serializeMemoryPark(stored.journal.memoryPark) === serializeMemoryPark(final)) {
+          // An identical settled replay: never downgraded to confirmed:false; the sync and read-back are repeated.
+          await commit(stored, final);
+          return true;
+        }
+        await commit(stored, draft);
+        return false;
+      });
+    } catch (error) {
+      if (error instanceof MemoryParkRefusal) return refused(error);
+      throw error;
+    }
     if (alreadyFinal) return "settled";
-    // Phase 2: only after phase 1 fully succeeded.
+    // Phase 2: only after phase 1 fully succeeded, and never once the caller gave up.
+    if (opts.signal?.aborted) return "unconfirmed";
     try {
       await section(async stored => {
         if (stored.journal.memoryPark === undefined || serializeMemoryPark(stored.journal.memoryPark) !== serializeMemoryPark(draft)) {
@@ -7010,10 +7046,16 @@ export class GitCache {
 
   /**
    * issue #3638 D3 - the reader confirmation. Holds the same bare lock across the whole read -> fsync(config) ->
-   * fsync(bare dir) -> read-back sequence and returns the stored record ONLY when every step succeeds and both the
-   * first read and the read-back are byte-identical to the exact expected record (run, clone path, attempt id and the
-   * serialized record, whose settlement, when present, must be `confirmed`). Any other outcome, including any thrown
-   * error, is `undefined`. Read-only otherwise; it takes no new lock and keeps no registry.
+   * fsync(bare dir) -> read-back sequence and returns the stored record ONLY when every step succeeds, the first raw
+   * read canonically equals the expected record (it is parsed and re-serialized, and must match the serialized
+   * `expected.record`, with run, clone path and attempt id; a settlement, when present, must be `confirmed`), and the
+   * read-back is byte-identical to that first raw read. Any other outcome, including any thrown error or an aborted
+   * `opts.signal` before the lock is granted, is `undefined`. Read-only otherwise; it takes no new lock and keeps no
+   * registry.
+   *
+   * Confirmation here re-syncs and re-reads, but it is not independent of the journal: it proves only that the
+   * journal's own bytes are durable and stable. An authoritative consumer (#3639) must bind `expected` to a reference
+   * obtained independently of this journal (for example the server's accepted park binding).
    */
   async readConfirmedMemoryPark(
     barePath: string, branch: string, expected: { runId: string; clonePath: string; attemptId?: string; record: MemoryParkRecord },
@@ -7032,7 +7074,7 @@ export class GitCache {
             serializeMemoryPark(journal.memoryPark) !== want) return undefined;
         await this.syncJournalAndReadBack(barePath, branch, first, opts);
         return journal.memoryPark;
-      });
+      }, opts.signal);
     } catch {
       return undefined;
     }
