@@ -374,6 +374,7 @@ describe("CodexDelegationRunner: bounded Read transport serialization (#296)", (
         fileop.calls.push(req);
         if (req.op === "read") return { ok: false, code: "E_OVERSIZE", origin: "helper" };
         assert.equal(req.op, tailMode ? "read_tail" : "read_range");
+        if (tailMode) assert.deepEqual(req, { op: "read_tail", path: "src/x.ts", tail: 2 });
         return { ok: true, size: openingSize, data: Buffer.from(expected).toString("base64"),
           ...(tailMode ? { tail: 2, fromEnd: true, partialFirstLine: partial } : { offset, partialLastLine: partial }), linesReturned: lines, truncated, incomplete,
           scannedBytes: incomplete ? rangeScanBytes : 65537, ...(incomplete ? { reason: "scan_budget" } : {}) };
