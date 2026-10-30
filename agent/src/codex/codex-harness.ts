@@ -1289,7 +1289,7 @@ export class CodexHarness implements RunHarness {
         // known. The model is the immutable configured root model (currentModel); a resumed
         // thread baselines at its pre-resume cumulative rather than zero.
         this.accountant.registerThread(this.threadId, this.currentModel ?? this.provider.model, resumed);
-        this.reportRuntimeConfig(request, rendered);
+        this.runtimeConfigPending = true;
       }
 
       // PRD #3247 M2: advisory catalog probe, before the abort check so a stop during it is honoured.
@@ -1302,6 +1302,12 @@ export class CodexHarness implements RunHarness {
       }
       this.activeTurnId = await this.startTurnRpc(transport, this.threadId, rendered, request.signal, request.rootDispatch,
         () => { if (this.resumedRoot) attemptedResumedRoot = this.threadId; });
+      // PRD #3244: report only once turn/start was accepted, so `codex_sent` never describes a turn
+      // that was cancelled or refused before dispatch.
+      if (this.runtimeConfigPending) {
+        this.runtimeConfigPending = false;
+        this.reportRuntimeConfig(request, rendered);
+      }
       if (request.signal.aborted || this.stopRequested) {
         // A stop during launch/thread/turn setup could not name a turn earlier. Now
         // that activeTurnId exists, issue the best-effort interrupt and end cleanly.
@@ -1667,6 +1673,9 @@ export class CodexHarness implements RunHarness {
   /** The raw `model` / `reasoningEffort` of the last thread/start or thread/resume response; every
    *  other field is ignored. Read once by reportRuntimeConfig. */
   private threadResponse: { model?: unknown; reasoningEffort?: unknown } | undefined;
+  /** Set when a thread is established; cleared when its runtime config is reported after the first
+   *  accepted turn/start on it. */
+  private runtimeConfigPending = false;
 
   /** PRD #3244 M2: report the thread's resolved model and effort to the owner. Effort is the value
    *  sent on turn/start when there is one (`codex_sent`), else the thread's configured effort

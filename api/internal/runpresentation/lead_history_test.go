@@ -51,7 +51,7 @@ func TestLeadHistoryRowCells(t *testing.T) {
 			row: apitypes.LeadPhaseConfigDTO{
 				Harness:        "claude",
 				RequestedModel: sp("opus"), RequestedModelSource: "user_default",
-				RequestedEffortMode: "runtime_default", RequestedEffortSource: "runtime_default",
+				RequestedEffortMode: "runtime_default", RequestedEffortSource: "user_default",
 				ObservedModel: sp("claude-opus-4"), ObservedModelEvidence: sp("claude_init"),
 				ObservedEffortEvidence: sp("claude_init"),
 			},

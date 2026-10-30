@@ -6301,6 +6301,26 @@ describe("CodexHarness runtime config observation (PRD #3244 M2)", () => {
     assert.equal(obs.length, 1);
   });
 
+  it("a dispatch refused after thread setup records no observation (no codex_sent without turn/start)", async () => {
+    const transport = new FakeTransport((method) => {
+      if (method === "thread/start") return { thread: { id: "th-1" }, model: "gpt-6-astra", reasoningEffort: "low" };
+      return defaultResponder(method);
+    });
+    const { harness } = makeHarness({ transport });
+    const obs: unknown[] = [];
+    transport.push(threadStarted()).push(turnCompleted("completed")).end();
+    try {
+      await assert.rejects(collect(harness.startTurn(makeRequest({
+        effort: "xhigh",
+        onRuntimeConfig: (o) => { obs.push(o); },
+        rootDispatch: { prepare: async () => { throw new Error("dispatch refused"); }, check: () => true },
+      })).events), /dispatch refused/);
+    } finally { await harness.close(); }
+    assert.ok(transport.requests.some((r) => r.method === "thread/start"));
+    assert.ok(!transport.requests.some((r) => r.method === "turn/start"));
+    assert.deepEqual(obs, []);
+  });
+
   it("without a callback nothing is read or required", async () => {
     const transport = new FakeTransport();
     const { harness } = makeHarness({ transport });

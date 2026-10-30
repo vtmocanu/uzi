@@ -119,8 +119,9 @@ used](./worker-model.md#see-which-model-a-run-used).
 - **Requested** is what uzi sent: your Claude or Codex effort override
   (*your Claude effort*, *your Codex effort*), or *built-in* when you left it on
   Inherit. With [Runtime default](#runtime-default) uzi sends no level, so the
-  request reads *runtime default* (source *your Claude effort* or *your Codex
-  effort*), for example `lead: opus · runtime default`.
+  request reads *runtime default*, for example `lead: opus · runtime default`.
+  The display shows that mode in place of a source; the stored record keeps the
+  source (`user_default`), which `uzi run lead-config --json` returns.
 - **Effective** is what the runtime said it applied. When it differs from the
   request, the chip shows both, for example `high (requested xhigh)`.
 - **Claude** reports its effort when the SDK exposes it. On the pinned SDK it
