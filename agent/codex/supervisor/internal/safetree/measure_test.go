@@ -454,6 +454,28 @@ func TestMeasureByteTotalOverflowIsIncomplete(t *testing.T) {
 	}
 }
 
+func TestMeasureBlocksProductOverflowIsIncomplete(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	root := newMeasureTree(t, f)
+	for _, n := range []string{"a", "b", "c"} {
+		writeSized(t, filepath.Join(root, n), 1, 0o600)
+	}
+	withFstatat(t, func(dirfd int, p string, st *unix.Stat_t, flags int) error {
+		err := unix.Fstatat(dirfd, p, st, flags)
+		if err == nil && !isDir(st) {
+			st.Size, st.Blocks = 0, 1<<55
+		}
+		return err
+	})
+	got, err := measureTree(t, f, wideLimits)
+	if !errors.Is(err, ErrByteLimit) || got.Bytes != math.MaxUint64 || got.Entries != 1 {
+		t.Fatalf("got %+v, %v; want ErrByteLimit at the first wrapped entry", got, err)
+	}
+}
+
 func TestMeasureSkipsEntryGoneBeforeFstatat(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
 		return

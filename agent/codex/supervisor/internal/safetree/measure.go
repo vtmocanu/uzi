@@ -141,7 +141,8 @@ func (m *measurer) entry(dirfd int, name string, depth int) error {
 	}
 	m.use.Entries++
 	c := charge(&st)
-	if c > math.MaxUint64-m.use.Bytes {
+	// >= so a total that reaches the saturated value is never reported complete.
+	if c >= math.MaxUint64-m.use.Bytes {
 		m.use.Bytes = math.MaxUint64
 		return ErrByteLimit
 	}
@@ -170,7 +171,11 @@ func (m *measurer) entry(dirfd int, name string, depth int) error {
 // charge is max(st_size, st_blocks*512): a sparse file costs its apparent
 // size and a fully allocated one its blocks. Over-reporting is the safe
 // direction: it can only trigger rotation, never hide growth.
+// The blocks product saturates rather than wrap.
 func charge(st *unix.Stat_t) uint64 {
-	size, blocks := uint64(max(st.Size, 0)), uint64(max(st.Blocks, 0))*512
-	return max(size, blocks)
+	size, blocks := uint64(max(st.Size, 0)), uint64(max(st.Blocks, 0))
+	if blocks > math.MaxUint64/512 {
+		return math.MaxUint64
+	}
+	return max(size, blocks*512)
 }
