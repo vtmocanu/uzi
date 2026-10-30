@@ -10184,7 +10184,6 @@ describe("production session-seed cleanup (#2324)", () => {
         ...rig.deps.sessionStore!,
         adopt: async (_store, dest) => {
           adopted += 1;
-          await new Promise((r) => setTimeout(r, 6_000)); // #3642 red/green mutation, never merged
           await seedRacedTree(dest, victim);
           racer = await startSwapRacer(dest, victim, root);
           return { files: 0 };
