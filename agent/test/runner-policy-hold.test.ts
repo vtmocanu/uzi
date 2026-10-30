@@ -1,6 +1,6 @@
 import { acquireCodexOperationScope } from "../src/codex-operation-scope.js";
 import { ProviderPolicyRefusal, admitPolicyTurn } from "../src/provider-policy-refusal.js";
-import { describe, it } from "node:test";
+import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -38,6 +38,10 @@ describe("compact hold negotiated capability", () => {
 
 describe("policy admission on every production claim", () => {
   installHarness();
+  beforeEach(async () => {
+    api.setRegisterProtocolFeatures(["provider_policy_hold_v1"]);
+    await client.register("policy-admission-test", "base", 1, [], ["provider_policy_hold_v1"], undefined, 0);
+  });
   const original: PolicyHoldRequest = {
     outcome_id: "22222222-2222-4222-8222-222222222222", source_generation: 1, claim_generation: 1,
     detail: "refused", continuation_mode: "same_conversation", published: false,
@@ -322,4 +326,232 @@ describe("policy admission on every production claim", () => {
       } finally { companion?.close(); }
     });
 
+});
+
+
+import { randomUUID } from "node:crypto";
+
+describe("R1 producer flight envelope lifecycle", () => {
+  installHarness();
+  async function store() {
+    const outbox = new Outbox({ root: path.join(fx.dataDir, "r1-producer-lifecycle"), log: nullLogger(),
+      runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 86400000 });
+    await outbox.init();
+    return outbox;
+  }
+  async function negotiate(enabled: boolean) {
+    api.setRegisterProtocolFeatures(enabled ? ["provider_policy_hold_v1"] : []);
+    await client.register("r1-producer", "base", 1, [], ["provider_policy_hold_v1"], undefined, 0);
+    assert.equal(client.supportsPolicyHold, enabled);
+  }
+  function refusal(phase: "plan" | "implement") {
+    return new ProviderPolicyRefusal({ ...admitPolicyTurn(phase), event: "provider_policy_refusal",
+      provider: "codex", category: "policy_refusal", origin: "root", policy_tag: "cyberPolicy" });
+  }
+  function claimFor(phase: "plan" | "implement") {
+    return gitlabClaim(3801, { run_id: randomUUID(), claim_generation: 8,
+      ...(phase === "implement" ? { plan_approved: true, plan_md: "approved" } : {}),
+      secrets: { forge_pat: "fixture-pat", codex: { auth_mode: "api_key", access_token: "fixture-access" } } });
+  }
+
+  for (const phase of ["plan", "implement"] as const) {
+    for (const transition of ["gain-at-factory", "gain-at-model", "loss-at-factory", "loss-at-model", "stable"] as const) {
+      it("R1 producer " + phase + " freezes eligibility across " + transition, async () => {
+        const initiallyEligible = !transition.startsWith("gain");
+        await negotiate(initiallyEligible);
+        const outbox = await store();
+        const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 32);
+        const claim = claimFor(phase);
+        const policies: PolicyHoldRequest[] = [];
+        let ordinary = 0, models = 0, factories = 0;
+        client.reportPolicyHold = async (_id, body) => {
+          policies.push(structuredClone(body));
+          return { disposition: "applied", outcome_id: body.outcome_id, source_generation: body.source_generation,
+            observed_status: "paused", observed_generation: 8, hold_reason: "codex_policy_hold" };
+        };
+        const report = client.reportState.bind(client);
+        client.reportState = async (...args) => {
+          if (args[1].status === "failed" || args[1].status === "completed") ordinary++;
+          return report(...args);
+        };
+        const actual = runnerWith(() => {
+          factories++;
+          if (transition.endsWith("factory")) client.protocolFeatures = initiallyEligible ? [] : ["provider_policy_hold_v1"];
+          return { executor: { run: async () => {
+            models++;
+            assert.equal(outbox.listPendingTerminals().length, 0, "an unused producer reservation is not a terminal");
+            if (transition.endsWith("model")) client.protocolFeatures = initiallyEligible ? [] : ["provider_policy_hold_v1"];
+            throw refusal(phase);
+          } } };
+        }, fakeGitlab().gitlab, undefined, nullLogger(), { outbox, activeRuns: registry });
+        await actual.execute(claim);
+        assert.equal(models, 1, "the actual production executor seam was reached");
+        assert.equal(factories, 1);
+        if (!initiallyEligible) {
+          assert.equal(policies.length, 0, "a feature appearing after entry cannot promote this flight");
+          assert.equal(ordinary, 1);
+          assert.equal(outbox.listPendingTerminals().some(p => p.outcome_kind === "policy_hold" || p.outcome_kind === "unknown"), false);
+        } else {
+          assert.equal(ordinary, 0);
+          const first = await outbox.readTerminalJournal(claim.run_id, 8);
+          assert.equal(first?.outcome_kind, "policy_hold");
+          assert.equal(first?.body.phase, phase === "plan" ? "planning" : "implementation");
+          if (transition.startsWith("loss")) {
+            assert.equal(policies.length, 0, "feature loss suspends delivery");
+            assert.notEqual(outbox.listPendingTerminals()[0]?.server_settled, true);
+            client.protocolFeatures = ["provider_policy_hold_v1"];
+            client.getRunOwnership = async () => ({ status: policies.length ? "paused" : "running",
+              claim_generation: 8, claim_released: policies.length > 0 });
+            await actual.execute(claim);
+            assert.equal(factories, 1, "recovery delivers the selected original before a new factory");
+            assert.deepEqual((await outbox.readTerminalJournal(claim.run_id, 8))?.body, first?.body);
+          }
+          assert.equal(policies.length, 1);
+          assert.equal(policies[0]?.outcome_id, first?.body.outcome_id);
+        }
+      });
+    }
+  }
+
+
+  for (const initiallyEligible of [false, true]) {
+    it("R1 producer planning gate to implementation preserves entry envelope eligible=" + initiallyEligible, async () => {
+      await negotiate(initiallyEligible);
+      const outbox = await store();
+      const claim = { ...claimFor("plan"), auto_approve: true };
+      let approved = false, policies = 0, ordinary = 0;
+      client.reportPolicyHold = async (_id, body) => {
+        policies++;
+        return { disposition: "pending", outcome_id: body.outcome_id, source_generation: body.source_generation };
+      };
+      const report = client.reportState.bind(client);
+      client.reportState = async (...args) => {
+        if (args[1].status === "failed" || args[1].status === "completed") ordinary++;
+        return report(...args);
+      };
+      const actual = runnerWith(() => ({ executor: { run: async ctx => {
+        assert.ok(ctx.gatePlan);
+        const verdict = await ctx.gatePlan("Implement the approved fixture change.");
+        assert.equal(verdict.kind, "approve");
+        approved = true;
+        client.protocolFeatures = initiallyEligible ? [] : ["provider_policy_hold_v1"];
+        throw refusal("implement");
+      } } }), fakeGitlab().gitlab, undefined, nullLogger(), {
+        outbox, activeRuns: new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 32),
+      });
+      await actual.execute(claim);
+      assert.equal(approved, true, "the actual planning gate crossed into implementation");
+      assert.equal(ordinary, initiallyEligible ? 0 : 1);
+      assert.equal((await outbox.readTerminalJournal(claim.run_id, 8))?.outcome_kind,
+        initiallyEligible ? "policy_hold" : undefined);
+      assert.equal(policies, 0, "late gain cannot select; late loss cannot deliver");
+    });
+  }
+
+  it("R1 producer full catalog backpressures eligible factory but permits never-negotiated ordinary model", async () => {
+    await negotiate(true);
+    const outbox = await store();
+    const tokens: symbol[] = [];
+    for (let i = 0; i < 1024; i++) {
+      const token = outbox.reservePolicyFlight(randomUUID(), 1);
+      assert.ok(token);
+      tokens.push(token);
+    }
+    assert.equal(outbox.reservePolicyFlight(randomUUID(), 1), undefined);
+    let factories = 0, models = 0, terminals = 0;
+    const report = client.reportState.bind(client);
+    client.reportState = async (...args) => {
+      if (args[1].status === "failed" || args[1].status === "completed") terminals++;
+      return report(...args);
+    };
+    const actual = runnerWith(() => {
+      factories++;
+      return { executor: { run: async () => { models++; throw new Error("ordinary provider failure"); } } };
+    }, fakeGitlab().gitlab, undefined, nullLogger(), {
+      outbox, activeRuns: new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 32),
+    });
+    try {
+      await actual.execute(claimFor("implement"));
+      assert.equal(factories, 0);
+      assert.equal(models, 0);
+      await negotiate(false);
+      await actual.execute(claimFor("implement"));
+      assert.equal(factories, 1);
+      assert.equal(models, 1);
+      assert.equal(terminals, 1, "unrelated ordinary provider execution retains its fallback");
+    } finally { for (const token of tokens) outbox.releasePolicyFlight(token); }
+  });
+
+  for (const failure of ["factory", "executor"] as const) {
+    it("R1 producer unused reservation released after " + failure + " failure", async () => {
+      await negotiate(true);
+      const outbox = await store();
+      const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 32);
+      let models = 0;
+      const actual = runnerWith(() => {
+        if (failure === "factory") throw new Error("construction failed before provider");
+        return { executor: { run: async () => {
+          models++;
+          assert.deepEqual(outbox.listPendingTerminals(), [], "reservation cannot veto its ordinary flight");
+          throw new Error("ordinary provider failure");
+        } } };
+      }, fakeGitlab().gitlab, undefined, nullLogger(), { outbox, activeRuns: registry });
+      if (failure === "factory") await assert.rejects(actual.execute(claimFor("implement")), /construction failed before provider/);
+      else await actual.execute(claimFor("implement"));
+      assert.equal(models, failure === "factory" ? 0 : 1);
+      assert.equal(outbox.listPendingTerminals().some(p => p.outcome_kind === "policy_hold" || p.outcome_kind === "unknown"), false);
+      const tokens: symbol[] = [];
+      try {
+        for (let i = 0; i < 1024; i++) {
+          const token = outbox.reservePolicyFlight(randomUUID(), 1);
+          assert.ok(token, "the unused flight slot is reusable after execute joins");
+          tokens.push(token);
+        }
+        assert.equal(outbox.reservePolicyFlight(randomUUID(), 1), undefined);
+      } finally { for (const token of tokens) outbox.releasePolicyFlight(token); }
+    });
+  }
+
+  it("R1 producer selected first writer survives feature loss while capture region joins", async t => {
+    await negotiate(true);
+    const outbox = await store();
+    const claim = claimFor("implement");
+    let entered!: () => void, release!: () => void;
+    const captureEntered = new Promise<void>(r => { entered = r; });
+    const captureReleased = new Promise<void>(r => { release = r; });
+    let policies = 0;
+    client.reportPolicyHold = async (_id, body) => {
+      policies++;
+      return { disposition: "pending", outcome_id: body.outcome_id, source_generation: body.source_generation };
+    };
+    const actual = runnerWith(() => ({ executor: { run: async () => { throw refusal("implement"); } } }),
+      fakeGitlab().gitlab, undefined, nullLogger(), { outbox,
+        activeRuns: new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 32) });
+    // Wrap RunRunner.runCaptureRegion: its caller has selected the first writer.
+    // The original region still performs its own quiescence and capture proofs.
+    const capture = actual as unknown as { runCaptureRegion: (...args: any[]) => Promise<any> };
+    const original = capture.runCaptureRegion.bind(actual);
+    let firstCapture = true;
+    t.mock.method(capture, "runCaptureRegion", async (...args: any[]) => {
+      if (firstCapture) {
+        firstCapture = false;
+        entered();
+        await captureReleased;
+      }
+      return original(...args);
+    });
+    const execution = actual.execute(claim);
+    try {
+      await captureEntered;
+      assert.equal(outbox.listPendingTerminals()[0]?.outcome_kind, "unknown", "selection precedes capture completion");
+      client.protocolFeatures = [];
+      const competing = await outbox.journalTerminal(claim.run_id, 8, "running", 0, { status: "failed" });
+      assert.equal(competing.journaled, false);
+      assert.equal(policies, 0);
+    } finally { release(); await execution; }
+    const first = await outbox.readTerminalJournal(claim.run_id, 8);
+    assert.equal(first?.outcome_kind, "policy_hold");
+    assert.equal(first?.body.detail, "refused");
+    assert.equal(policies, 0, "selected evidence remains while feature loss suspends delivery");
+  });
 });

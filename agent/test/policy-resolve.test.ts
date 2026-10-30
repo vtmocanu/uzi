@@ -64,12 +64,41 @@ async function fixture(t: { after(fn: () => Promise<void>): void }, over: { rawW
 function deps(outbox: Outbox, report: NonNullable<TerminalOutboxDeps["client"]["reportPolicyHold"]>): TerminalOutboxDeps {
   return { outbox, terminalMaxBytes: 1024, gapFillMax: 1, log: nullLogger(), client: {
     hasFeature: () => false,
+    supportsPolicyHold: true,
     getMessageGaps: async () => { throw new Error("policy must not gap-fill"); },
     postMessages: async () => { throw new Error("policy must not tombstone"); },
     reportPolicyHold: report,
   } };
 }
 const args = { runId: run, claimGeneration: 7, send: async () => { throw new Error("policy must never use /state"); } };
+
+it("policy dispatch requires live negotiated support and retains first writers while unsupported", async t => {
+  const { outbox, file } = await fixture(t);
+  await outbox.journalPolicyHold(run, original);
+  const bytes = await fs.readFile(file, "utf8");
+  let supported: boolean | undefined;
+  let calls = 0;
+  const d = deps(outbox, async (_id, body) => {
+    calls++;
+    assert.deepEqual(body, original);
+    return receipt();
+  });
+  Object.defineProperty(d.client, "supportsPolicyHold", { get: () => supported });
+  for (supported of [undefined, false]) {
+    await resolvePendingTerminal(d, args);
+    assert.equal(calls, 0);
+    assert.equal(await outbox.hasPendingPolicyOutcome(run), true);
+    assert.equal(outbox.listPendingTerminals()[0]?.server_settled, undefined);
+    assert.deepEqual(await outbox.journalTerminal(run, 8, "running", 0, { status: "failed" }),
+      { journaled: false, reason: "winner_unavailable" });
+    assert.equal(await fs.readFile(file, "utf8"), bytes);
+  }
+  supported = true;
+  await resolvePendingTerminal(d, args);
+  assert.equal(calls, 1);
+  assert.equal(outbox.listPendingTerminals()[0]?.server_settled, true);
+  assert.equal(await fs.readFile(file, "utf8"), bytes);
+});
 
 it("closed request validation matches the server fields and rejects invalid/oversized evidence", () => {
   assert.deepEqual(validatePolicyHoldRequest(original), original);
@@ -304,6 +333,7 @@ it("real Worker awaits boot policy replay before claims, and its existing drain/
     postMessages: async () => { messageCalls++; },
   });
   client.claimRun = async () => { claims++; return null; };
+  Object.defineProperty(client, "supportsPolicyHold", { get: () => true });
   client.reportPolicyHold = async (_id, body) => {
     calls++;
     assert.deepEqual(body, original, "boot/drain never fabricate current authority");

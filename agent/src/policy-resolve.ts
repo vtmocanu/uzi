@@ -30,7 +30,9 @@ export async function resolvePolicyOutcome(
     retirementContext?: ReportRetirementContext; currentPolicyAuthority?: CurrentPolicyAuthority },
   journal: PendingTerminalJournal,
 ): Promise<void> {
-  if (journal.server_settled || !deps.client.reportPolicyHold) return;
+  // Read the live two-sided negotiation at dispatch, after authentication/capture awaits.
+  // Retained evidence remains a first writer while delivery is unsupported.
+  if (journal.server_settled || !deps.client.reportPolicyHold || deps.client.supportsPolicyHold !== true) return;
   try {
     const original = validatePolicyHoldRequest(journal.body);
     let request = original;

@@ -80,7 +80,7 @@ const TOMBSTONE_CHUNK = 500;
  *  surface. */
 export interface TerminalOutboxDeps {
   outbox: Outbox;
-  client: Pick<WorkerClient, "hasFeature" | "getMessageGaps" | "postMessages"> & Partial<Pick<WorkerClient, "reportPolicyHold">>;
+  client: Pick<WorkerClient, "hasFeature" | "getMessageGaps" | "postMessages"> & Partial<Pick<WorkerClient, "reportPolicyHold" | "supportsPolicyHold">>;
   /** config.gapFillMax — the total per-seq tombstone budget before a hole is declared unrecoverable. */
   gapFillMax: number;
   /** config.outboxTerminalMaxBytes — the per-record canonicaliser cap. */

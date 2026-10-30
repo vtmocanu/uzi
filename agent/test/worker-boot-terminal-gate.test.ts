@@ -602,3 +602,107 @@ describe("Worker policy ownership reconciliation", () => {
     assert.deepEqual(registry.build().active.map(e => e.claim_generation), [4]);
   });
 });
+
+
+import * as r1fs from "node:fs/promises";
+import * as r1os from "node:os";
+import * as r1path from "node:path";
+import { makeScratchRoot } from "./fixture-repo.js";
+
+const r1Modes = ["empty", "other-policy", "other-unknown", "same-policy", "same-unknown"] as const;
+async function r1DisabledStore(mode: typeof r1Modes[number]) {
+  const root = makeScratchRoot("r1-producer-", await r1fs.realpath(r1os.tmpdir()));
+  const storeRoot = r1path.join(root, "outbox");
+  const options = { root: storeRoot, log: nullLogger(), runMaxBytes: mode.endsWith("unknown") ? 1 : 1e6,
+    maxBytes: mode.endsWith("unknown") ? 1 : 1e6, retentionMs: 86400000 };
+  await new Outbox(options).init();
+  await r1fs.writeFile(r1path.join(storeRoot, ".key"), "invalid");
+  const outbox = new Outbox(options);
+  await outbox.init();
+  assert.equal(outbox.isDisabled(), true);
+  assert.deepEqual(outbox.listPendingTerminals(), [], "construct the runner with an empty disabled store");
+  return { root, outbox };
+}
+async function r1LateEvidence(outbox: Outbox, mode: typeof r1Modes[number], current: string) {
+  if (mode === "empty") return;
+  const result = await outbox.journalPolicyHold(mode.startsWith("same") ? current : "cccccccc-cccc-4ccc-8ccc-cccccccccccc", {
+    outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", source_generation: 1, claim_generation: 1,
+    detail: "refused", continuation_mode: "same_conversation", published: false,
+    tag: "cyberPolicy", phase: "implementation", correlation_id: "pr-" + "a".repeat(32) + "-1",
+  });
+  assert.equal(result.journaled, false);
+  assert.equal(outbox.listPendingTerminals()[0]?.outcome_kind, mode.endsWith("unknown") ? "unknown" : "policy_hold");
+}
+
+type R1ReplayDriver = {
+  resolveBootTerminals(signal: AbortSignal): Promise<void>;
+  resolveRunTerminal(runId: string, signal?: AbortSignal): Promise<void>;
+  sweepPendingTerminals(signal?: AbortSignal): Promise<void>;
+};
+for (const method of ["boot", "run", "sweep"] as const) {
+  for (const mode of r1Modes.filter(m => !m.startsWith("same"))) {
+    it("R1 replay " + method + " disabled " + mode + " invents no ordinary outcome", async () => {
+      const { root, outbox } = await r1DisabledStore(mode);
+      try {
+        let sends = 0;
+        const client = fakeClient({ reportState: async () => { sends++; return { applied: true }; } });
+        const driver = new Worker(fakeConfig(), client, idleRunner, idleChat, noJudge, noReview,
+          nullLogger(), okPreflight, outbox) as unknown as R1ReplayDriver;
+        await r1LateEvidence(outbox, mode, RUN2);
+        if (method === "boot") await driver.resolveBootTerminals(new AbortController().signal);
+        else if (method === "run") await driver.resolveRunTerminal(RUN2);
+        else await driver.sweepPendingTerminals();
+        assert.equal(sends, 0, "a replay needs an existing readable ordinary journal");
+      } finally { await r1fs.rm(root, { recursive: true, force: true }); }
+    });
+  }
+
+  for (const source of ["policy", "unknown", "unreadable-target"] as const) {
+    it("R1 replay " + method + " healthy B with retained A " + source, async () => {
+      const root = makeScratchRoot("r1-replay-", await r1fs.realpath(r1os.tmpdir()));
+      try {
+        const options = { root: r1path.join(root, "outbox"), log: nullLogger(), runMaxBytes: 4096,
+          maxBytes: 16384, retentionMs: 86400000 };
+        let outbox = new Outbox(options);
+        await outbox.init();
+        assert.equal((await outbox.journalTerminal(RUN2, 8, "running", 0, { status: "completed" })).journaled, true);
+        if (source === "unreadable-target") {
+          await r1fs.writeFile(r1path.join(options.root, ".key"), "invalid");
+          outbox = new Outbox(options);
+          await outbox.init();
+          assert.equal(outbox.isDisabled(), true);
+        } else {
+          if (source === "unknown") {
+            // A malformed physical source is unknown; B keeps its healthy body/read budget.
+            await r1fs.mkdir(r1path.join(options.root, RUN), { recursive: true });
+            await r1fs.writeFile(r1path.join(options.root, RUN, "terminal-1.json"), "{}");
+            outbox = new Outbox(options);
+            await outbox.init();
+          } else {
+            await outbox.journalPolicyHold(RUN, { outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+              source_generation: 1, claim_generation: 1, detail: "refused",
+              continuation_mode: "same_conversation", published: false, tag: "cyberPolicy",
+              phase: "implementation", correlation_id: "pr-" + "a".repeat(32) + "-1" });
+          }
+          assert.equal(outbox.listPendingTerminals().find(p => p.run_id === RUN)?.outcome_kind,
+            source === "unknown" ? "unknown" : "policy_hold");
+        }
+        const bodies: StateRequest[] = [];
+        const client = fakeClient({ reportState: async (id, body) => {
+          assert.equal(id, RUN2);
+          bodies.push(body);
+          return { applied: true, status: "completed" };
+        } });
+        const driver = new Worker(fakeConfig(), client, idleRunner, idleChat, noJudge, noReview,
+          nullLogger(), okPreflight, outbox) as unknown as R1ReplayDriver;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (method === "boot") await driver.resolveBootTerminals(new AbortController().signal);
+          else if (method === "run") await driver.resolveRunTerminal(RUN2);
+          else await driver.sweepPendingTerminals();
+        }
+        assert.equal(bodies.length, source === "unreadable-target" ? 0 : 1);
+        if (bodies.length) assert.equal(bodies[0]!.claim_generation, 8);
+      } finally { await r1fs.rm(root, { recursive: true, force: true }); }
+    });
+  }
+}
