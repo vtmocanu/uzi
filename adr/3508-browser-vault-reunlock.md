@@ -111,7 +111,9 @@ cannot invalidate copied key material.
 Online authentication, expiry, revocation and limiter checks cannot protect
 a stolen snapshot against that offline attack. Strict protects across sites,
 not sibling origins on the same site; the `__Host-` prefix only stops those
-origins from setting this cookie. HttpOnly prevents ordinary script
+origins from setting this cookie. Cookies are not isolated by port, so another
+HTTPS service on the same hostname receives and can replace it; deployments
+must not run untrusted services on uzi's hostname. HttpOnly prevents ordinary script
 reads of the cookie but cannot stop an active same-origin script from
 issuing authenticated requests. Live-server compromise, cached-DEK memory
 dumps, password cracking and retained master-sealed backups remain residuals.

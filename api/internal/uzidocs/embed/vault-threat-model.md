@@ -84,7 +84,10 @@ the password wrapper remains. The random 256-bit wrapping key travels in
 `__Host-uzi_vault_slot`, a **Secure, HttpOnly, SameSite=Strict, host-only**
 cookie (no Domain) with **Path=/**. The `__Host-` prefix stops a same-site
 sibling origin from planting a cookie of that name to drain the unlock budget;
-the web server logs no requests. The database stores the wrapped DEK, owner,
+the web server logs no requests. Cookies are not isolated by port: any other
+HTTPS service on the same hostname receives this cookie (as it does the
+session cookie) and can replace it, so deployments must not run untrusted
+services on uzi's hostname, on any port. The database stores the wrapped DEK, owner,
 slot/browser IDs, expiry, token version, vault epoch and slot generation.
 Neither `UZI_SECRET_KEY`, the JWT secret nor other server-at-rest material
 opens that wrapper without the cookie key. AES-GCM AAD binds it to the
