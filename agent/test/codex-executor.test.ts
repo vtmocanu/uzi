@@ -26977,13 +26977,29 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
     t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
   };
 
-  it("a pre-approved run records one implement row that matches the model and effort sent", async () => {
+  /** Add the thread's resolved model / reasoning effort to every thread/start and thread/resume answer. */
+  const reporting = (responder: Responder, fields: () => Record<string, unknown>): Responder => (c) => {
+    const out = responder(c);
+    return c.method === "thread/start" || c.method === "thread/resume" ? { ...rec(out), ...fields() } : out;
+  };
+  const reported = (model: string, reasoningEffort: unknown) => () => ({ model, reasoningEffort, cwd: "/ignored" });
+  const observed = (p: LeadConfigReportBody) =>
+    [p.observed_model, p.observed_model_evidence, p.observed_effort, p.observed_effort_evidence];
+  const idle: Responder = (c) => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+    if (c.method === "turn/start") { c.transport.push(threadStarted("th-1")); return { turn: { id: "tn-1" } }; }
+    return {};
+  };
+  const waitForRows = (posts: unknown[], n: number) => waitFor(() => posts.length >= n, `${n} lead-config rows`);
+
+  it("a pre-approved run records the requested row, then the runtime row, matching what was sent", async () => {
     const { posts, reporter, rows } = reporterRig(ACTIVE);
-    const rig = makeRig();
+    const rig = makeRig({ responder: reporting(defaultResponder, reported("gpt-6-astra", "low")) });
     rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
     const { ctx } = makeCtx({ config: ACTIVE, leadConfig: reporter });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "pre-approved lead-config run");
-    assert.deepEqual(rows(), ["implement#1/1"]);
+    await waitForRows(posts, 2);
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"]);
     const sent = rig.transport.requests.find((r) => r.method === "turn/start");
     assert.equal(rec(sent?.params).model, posts[0]!.requested_model);
     assert.equal(rec(sent?.params).effort, posts[0]!.requested_effort);
@@ -26991,23 +27007,47 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
     assert.equal(posts[0]!.requested_effort_source, "user_default");
     assert.equal(posts[0]!.requested_effort_mode, "explicit");
     assert.equal(posts[0]!.claim_generation, 5);
+    assert.deepEqual(observed(posts[0]!), [null, null, null, null]);
+    // Effort was sent on turn/start, so the thread's own "low" is not what is reported.
+    assert.deepEqual(observed(posts[1]!), ["gpt-6-astra", "codex_thread_response", "high", "codex_sent"]);
   });
 
-  it("falls back to the provider default as `builtin`, effort runtime default", async () => {
+  it("acceptance example 2 (Codex schedule pin, user effort high): requested and runtime lines on the posted rows", async () => {
+    const config = {
+      default_model: "gpt-6-astra", default_model_source: "schedule_pin" as const,
+      default_effort: "high" as const, default_effort_source: "user_default" as const,
+    };
+    const { posts, reporter } = reporterRig(config);
+    const rig = makeRig({ responder: reporting(defaultResponder, reported("gpt-6-astra", "high")) });
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ config, leadConfig: reporter });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "schedule-pin lead-config run");
+    await waitForRows(posts, 2);
+    const last = posts[posts.length - 1]!;
+    assert.equal(last.requested_model, "gpt-6-astra");
+    assert.equal(last.requested_model_source, "schedule_pin");
+    assert.equal(last.requested_effort, "high");
+    assert.equal(last.requested_effort_source, "user_default");
+    assert.deepEqual(observed(last), ["gpt-6-astra", "codex_thread_response", "high", "codex_sent"]);
+  });
+
+  it("a runtime-default effort run reports the thread's configured effort as codex_runtime_default", async () => {
     const config = { default_effort_source: "builtin" as const };
     const { posts, reporter } = reporterRig(config);
-    const rig = makeRig();
+    const rig = makeRig({ responder: reporting(defaultResponder, reported(provider.model, "persistent")) });
     rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
     const { ctx } = makeCtx({ config, leadConfig: reporter });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "provider-default lead-config run");
+    await waitForRows(posts, 2);
     assert.equal(posts[0]!.requested_model, provider.model);
     assert.equal(posts[0]!.requested_model_source, "builtin");
     assert.equal(posts[0]!.requested_effort, null);
     assert.equal(posts[0]!.requested_effort_mode, "runtime_default");
+    assert.deepEqual(observed(posts[1]!), [provider.model, "codex_thread_response", "other", "codex_runtime_default"]);
   });
 
-  it("plan, revise, approve, implement: one plan entry (revise re-drives it) then one implement entry", async () => {
-    const { reporter, rows } = reporterRig(ACTIVE);
+  it("plan, revise, approve, implement: one plan entry (revise re-drives it) then one implement entry, each with its own runtime row", async () => {
+    const { posts, reporter, rows } = reporterRig(ACTIVE);
     const planEpoch: Responder = (c) => {
       if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
       if (c.method === "turn/start") {
@@ -27020,7 +27060,11 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
       }
       return {};
     };
-    const rig = makeMultiEpochRig([planEpoch, resumedEpochResponder("th-plan", "tn-impl", doneFrames)]);
+    const fields = reported("gpt-6-astra", "high");
+    const rig = makeMultiEpochRig([
+      reporting(planEpoch, fields),
+      reporting(resumedEpochResponder("th-plan", "tn-impl", doneFrames), fields),
+    ]);
     let gates = 0;
     const { ctx } = makeCtx({
       config: { ...ACTIVE, plan_max_revisions: 2 }, leadConfig: reporter,
@@ -27028,23 +27072,25 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
       gatePlan: async () => (++gates === 1 ? { kind: "revise", feedback: "tighten it" } : approve),
     });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "gated lead-config run");
+    await waitForRows(posts, 4);
     assert.equal(gates, 2);
-    assert.deepEqual(rows(), ["plan#1/1", "implement#1/1"]);
+    assert.deepEqual(rows(), ["plan#1/1", "plan#1/2", "implement#1/1", "implement#1/2"]);
+    assert.equal(posts[1]!.observed_model_evidence, "codex_thread_response");
+    assert.equal(posts[3]!.observed_effort_evidence, "codex_sent");
   });
 
-  it("a recreated epoch after a refused wall park does not post again: the same reporter continues the phase (issue #1782 path)", async () => {
-    const { posts, reporter, rows } = reporterRig(ACTIVE);
+  /** One implement entry, interrupted into a recreated epoch (the issue #1782 refused-wall-park path). */
+  async function recreatedEpoch(config: ClaimConfig, first: () => Record<string, unknown>, second: () => Record<string, unknown>) {
+    const { posts, reporter, rows } = reporterRig(config);
     const controller = new AbortController();
-    const quiet: Responder = (c) => {
-      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
-      if (c.method === "turn/start") { c.transport.push(threadStarted("th-1")); return { turn: { id: "tn-1" } }; }
-      return {};
-    };
-    const rig = makeMultiEpochRig([quiet, resumedEpochResponder("th-1", "tn-2", doneFrames)]);
+    const rig = makeMultiEpochRig([
+      reporting(idle, first),
+      reporting(resumedEpochResponder("th-1", "tn-2", doneFrames), second),
+    ]);
     let exec!: CodexExecutor;
     let mode: "wall" | null = null;
     const { ctx } = makeCtx({
-      config: ACTIVE, leadConfig: reporter, signal: controller.signal,
+      config, leadConfig: reporter, signal: controller.signal,
       pauseModeRequested: () => mode,
       clearWallMode: () => { mode = null; },
       parkForWall: async () => {
@@ -27060,20 +27106,47 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
     await withTimeout(running, 5000, "lead-config recreated epoch");
     assert.equal(rig.providerLaunches(), 2, "the epoch was recreated");
     assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "the re-drive ran on the fresh epoch");
-    assert.deepEqual(rows(), ["implement#1/1"], "one row: a re-drive or a new epoch is not a phase change");
-    const sentByEpoch = rig.epochs.map((e) => e.transport.requests.find((r) => r.method === "turn/start"));
-    for (const sent of sentByEpoch) {
-      assert.equal(rec(sent?.params).model, posts[0]!.requested_model, "each epoch sends the reported model");
-      assert.equal(rec(sent?.params).effort, posts[0]!.requested_effort, "each epoch sends the reported effort");
+    return { posts, rows, rig };
+  }
+
+  it("a recreated epoch reporting a changed configured effort posts one more row on the same entry (issue #1782 path)", async () => {
+    const config = { default_model: "gpt-6-astra", default_model_source: "user_default" as const, default_effort_source: "builtin" as const };
+    let calls = 0;
+    const { posts, rows, rig } = await recreatedEpoch(config, () => {
+      calls++;
+      return { model: "gpt-6-astra", reasoningEffort: "medium" };
+    }, () => ({ model: "gpt-6-astra", reasoningEffort: "high" }));
+    await waitForRows(posts, 3);
+    assert.equal(calls, 1);
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2", "implement#1/3"], "one reporter, one entry, seq continuing across the recreate");
+    assert.deepEqual(observed(posts[1]!), ["gpt-6-astra", "codex_thread_response", "medium", "codex_runtime_default"]);
+    assert.deepEqual(observed(posts[2]!), ["gpt-6-astra", "codex_thread_response", "high", "codex_runtime_default"]);
+    // What each epoch actually sent is what the requested side says.
+    for (const e of rig.epochs) {
+      const sent = e.transport.requests.find((r) => r.method === "turn/start");
+      assert.equal(rec(sent?.params).model, posts[0]!.requested_model);
+      assert.equal(rec(sent?.params).effort, undefined, "runtime default sends no effort");
     }
-    assert.equal(posts.length, 1);
-    assert.equal(posts[0]!.seq, 1);
-    // The reporter the executor used survived the recreate: a further report through that same
-    // instance continues the seq (2), it does not restart at 1.
-    reporter.observe({ phase: "implement", entry: 1 }, { model: "m-obs", modelEvidence: "e-m", effort: null, effortEvidence: null });
-    await waitFor(() => posts.length === 2, "a second row through the same reporter");
+  });
+
+  it("a recreated epoch reporting the same thing posts nothing more (per-entry dedupe)", async () => {
+    const same = () => ({ model: "gpt-6-astra", reasoningEffort: "high" });
+    const { posts, rows } = await recreatedEpoch(ACTIVE, same, same);
+    await waitForRows(posts, 2);
+    for (let i = 0; i < 5; i++) await tick();
     assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"]);
-    assert.equal(posts[1]!.observed_model, "m-obs");
+  });
+
+  it("a recreated epoch whose thread effort changed posts nothing when the sent effort is the evidence on both", async () => {
+    const { posts, rows } = await recreatedEpoch(
+      ACTIVE,
+      () => ({ model: "gpt-6-astra", reasoningEffort: "high" }),
+      () => ({ model: "gpt-6-astra", reasoningEffort: "low" }),
+    );
+    await waitForRows(posts, 2);
+    for (let i = 0; i < 5; i++) await tick();
+    // The sent effort is the evidence on both epochs, so a changed thread effort is not a change.
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"]);
   });
 
   it("posts nothing without the activation signal", async () => {

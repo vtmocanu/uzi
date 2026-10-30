@@ -78,6 +78,7 @@ import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
 import { resolveLeadRequest, type LeadRequest } from "../lead-config-report.js";
+import { toLeadObservation } from "../runtime-observation.js";
 import { CodexRequestFailure, RequestError, codexDeferralReason, codexRefreshFailure, isTransientStatus, type PlanCrossCheckFindings, type WorkerClient } from "../client.js";
 import { TransientRecoveryError } from "../sdk-executor.js";
 import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
@@ -5666,12 +5667,24 @@ export class CodexExecutor implements Executor {
       // PRD #3244: record the lead's requested config for this phase before the turn starts. A new
       // entry only on a phase change (a re-driven turn, replacement turn or recreated epoch of the
       // same phase is a no-op); bounded to 3 s inside the reporter, which never throws.
+      // PRD #3244 M2: every root thread/start and thread/resume reports the thread's resolved config
+      // against the entry bound here; the reporter dedupes an unchanged reading per entry.
+      let onRuntimeConfig: RunTurnRequest["onRuntimeConfig"];
       if (ctx.leadConfig) {
-        await ctx.leadConfig.enterPhase(phase, this.leadRequestFor(ctx, phase));
+        const reporter = ctx.leadConfig;
+        const entry = await reporter.enterPhase(phase, this.leadRequestFor(ctx, phase));
+        onRuntimeConfig = (obs) => {
+          try {
+            reporter.observe(entry, toLeadObservation(obs));
+          } catch {
+            /* an observation is best-effort and never reaches the turn */
+          }
+        };
         if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
       }
       const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
       request.rootDispatch = dispatch;
+      if (onRuntimeConfig) request.onRuntimeConfig = onRuntimeConfig;
       let turn = harness.startTurn(request);
       let events = turn.events[Symbol.asyncIterator]();
       let first = await (async () => {
@@ -5688,6 +5701,7 @@ export class CodexExecutor implements Executor {
           } });
           const fallback = this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
           fallback.rootDispatch = dispatch;
+          if (onRuntimeConfig) fallback.onRuntimeConfig = onRuntimeConfig;
           turn = harness.startTurn(fallback);
           events = turn.events[Symbol.asyncIterator]();
           return events.next();

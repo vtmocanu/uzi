@@ -2914,6 +2914,10 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
     default_effort: "high" as const, default_effort_source: "user_default" as const,
   };
 
+  async function waitForPosts(posts: unknown[], n: number): Promise<void> {
+    for (let i = 0; i < 100 && posts.length < n; i++) await new Promise((r) => setTimeout(r, 10));
+  }
+
   /** A real reporter over a recording client: the rows the executor makes it post. */
   function reporterRig() {
     const posts: LeadConfigReportBody[] = [];
@@ -3035,23 +3039,132 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
     assert.deepEqual(visited, cases.map((c) => c.id));
   });
 
-  it("a re-driven implement turn (no signal_done yet) keeps one reporter and one implement row", async () => {
+  /** fakeTurns plus init frames carrying `effort`, and an optional getSettings on each instance. */
+  function observedTurns(
+    scripts: SDKMessage[][],
+    getSettings?: () => Promise<unknown>,
+  ): { queryFn: SdkQueryFn; settingsCalls: () => number } {
+    let i = 0;
+    let settingsCalls = 0;
+    const queryFn: SdkQueryFn = (params) => {
+      const script = scripts[Math.min(i, scripts.length - 1)]!;
+      i++;
+      const gen = (async function* () {
+        for await (const _ of params.prompt) { /* consume the prompt */ }
+        for (const m of script) yield m;
+      })();
+      if (getSettings) {
+        (gen as unknown as Record<string, unknown>)["getSettings"] = () => { settingsCalls++; return getSettings(); };
+      }
+      return gen;
+    };
+    return { queryFn, settingsCalls: () => settingsCalls };
+  }
+  const initFrame = (extra: Record<string, unknown> = {}): SDKMessage =>
+    ({ type: "system", subtype: "init", session_id: "sess-1", model: "claude-opus-4-8", ...extra }) as unknown as SDKMessage;
+  const observed = (p: LeadConfigReportBody) =>
+    [p.observed_model, p.observed_model_evidence, p.observed_effort, p.observed_effort_evidence];
+  const DEFAULT_CASE = {
+    default_model: "opus", default_model_source: "user_default" as const,
+    default_effort: "medium" as const, default_effort_source: "builtin" as const,
+  };
+
+  it("acceptance example 1 (Claude default case): requested opus/medium, runtime model from init, effort from the settings probe", async () => {
     const { posts, make, rows } = reporterRig();
-    const { queryFn, turns } = fakeTurns([[resultSuccess()], [signalDone(), resultSuccess()]]);
+    const { queryFn, settingsCalls } = observedTurns(
+      [[initFrame(), submitPlan("plan"), resultSuccess()], [initFrame({ effort: "medium" }), signalDone(), resultSuccess()]],
+      async () => ({ applied: { effort: "high" } }),
+    );
+    const { ctx } = makeCtx({ agents: [lead, coder], config: DEFAULT_CASE, leadConfig: make(DEFAULT_CASE) }, approveWith("own"));
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 4);
+    assert.deepEqual(rows(), ["plan#1/1", "plan#1/2", "implement#1/1", "implement#1/2"]);
+    for (const p of posts) {
+      assert.equal(p.requested_model, "opus");
+      assert.equal(p.requested_model_source, "user_default");
+      assert.equal(p.requested_effort, "medium");
+      assert.equal(p.requested_effort_source, "builtin");
+    }
+    assert.deepEqual(observed(posts[0]!), [null, null, null, null]);
+    assert.deepEqual(observed(posts[1]!), ["claude-opus-4-8", "claude_init", "high", "claude_get_settings"]);
+    assert.deepEqual(observed(posts[2]!), [null, null, null, null]);
+    assert.deepEqual(observed(posts[3]!), ["claude-opus-4-8", "claude_init", "medium", "claude_init"]);
+    assert.equal(settingsCalls(), 1, "only the plan init lacked an effort key, so the probe ran once");
+  });
+
+  it("an init without effort and no getSettings reports the model and an unknown effort", async () => {
+    const { posts, make } = reporterRig();
+    const { queryFn } = observedTurns([[initFrame(), signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config: DEFAULT_CASE, leadConfig: make(DEFAULT_CASE),
+      planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 2);
+    assert.deepEqual(posts.map((p) => `${p.phase}#${p.phase_entry}/${p.seq}`), ["implement#1/1", "implement#1/2"]);
+    assert.deepEqual(observed(posts[1]!), ["claude-opus-4-8", "claude_init", null, "unknown"]);
+  });
+
+  it("an init effort null is recorded as not sent, with claude_init evidence", async () => {
+    const { posts, make } = reporterRig();
+    const { queryFn } = observedTurns([[initFrame({ effort: null }), signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config: DEFAULT_CASE, leadConfig: make(DEFAULT_CASE),
+      planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 2);
+    assert.deepEqual(observed(posts[1]!), ["claude-opus-4-8", "claude_init", null, "claude_init"]);
+  });
+
+  it("an init reporting high while xhigh was requested records both sides", async () => {
+    const config = { ...DEFAULT_CASE, default_effort: "xhigh" as const };
+    const { posts, make } = reporterRig();
+    const { queryFn } = observedTurns([[initFrame({ effort: "high" }), signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config, leadConfig: make(config),
+      planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 2);
+    assert.equal(posts[1]!.requested_effort, "xhigh");
+    assert.equal(posts[1]!.observed_effort, "high");
+  });
+
+  it("only the first turn of an entry carries the callback: a revise round neither re-reports nor re-probes", async () => {
+    const { posts, make, rows } = reporterRig();
+    const { queryFn, settingsCalls } = observedTurns(
+      [
+        [initFrame(), submitPlan("v1"), resultSuccess()],
+        [initFrame(), submitPlan("v2"), resultSuccess()],
+        [initFrame({ effort: "low" }), signalDone(), resultSuccess()],
+      ],
+      async () => ({ applied: { effort: "high" } }),
+    );
+    const { ctx } = makeCtx({ agents: [lead, coder], config: DEFAULT_CASE, leadConfig: make(DEFAULT_CASE) }, [revise, approve]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 4);
+    assert.deepEqual(rows(), ["plan#1/1", "plan#1/2", "implement#1/1", "implement#1/2"]);
+    assert.equal(settingsCalls(), 1, "the revise turn's init did not probe");
+    assert.equal(posts[1]!.observed_effort, "high");
+  });
+
+  it("a re-driven implement turn keeps one reporter: the first turn's observation is row 2 and the re-drive adds none", async () => {
+    const { posts, make, rows } = reporterRig();
+    const { queryFn } = observedTurns([
+      [initFrame({ effort: "high" }), resultSuccess()],
+      [initFrame({ effort: "low" }), signalDone(), resultSuccess()],
+    ]);
     const { ctx } = makeCtx({
       agents: [lead, coder], config: ACTIVE_CONFIG, leadConfig: make(ACTIVE_CONFIG),
       planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
     });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
-    assert.ok(turns.length >= 2, "the implement turn was re-driven");
-    assert.deepEqual(rows(), ["implement#1/1"]);
+    await waitForPosts(posts, 2);
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"], "seq continues on one entry; the re-drive's init posted nothing");
     assert.equal(posts[0]!.claim_generation, 4);
-    // The one reporter outlived the re-drive: a further report through the same instance
-    // continues the seq (2) on the same entry, it does not restart at 1.
-    ctx.leadConfig!.observe({ phase: "implement", entry: 1 }, { model: "m-obs", modelEvidence: "e-m", effort: null, effortEvidence: null });
-    for (let i = 0; i < 50 && posts.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
-    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"]);
-    assert.equal(posts[1]!.observed_model, "m-obs");
+    assert.equal(posts[1]!.observed_effort, "high", "the row came from the first turn, not the re-drive");
   });
 
   it("posts nothing when the claim carries no default_effort_source", async () => {

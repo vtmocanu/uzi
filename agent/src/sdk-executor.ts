@@ -42,7 +42,8 @@ import type {
 import { buildCIEvidenceServer, CI_EVIDENCE_SERVER, ciEvidencePrompt, withCIEvidenceAgents } from "./ci-evidence-tools.js";
 import type { Executor, ExecutorResult, RunContext, WallParkOutcome } from "./executor.js";
 import type { Logger } from "./log.js";
-import { resolveLeadRequest, type LeadRequest } from "./lead-config-report.js";
+import { resolveLeadRequest, type LeadRequest, type PhaseEntry } from "./lead-config-report.js";
+import { toLeadObservation } from "./runtime-observation.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { startDepsInstall, reportDepsInstall, safeDirLabel } from "./js-deps-provision.js";
 import { makeProgressObserver } from "./milestone-progress-observer.js";
@@ -783,6 +784,9 @@ interface RunDrive {
   /** PRD #3244: the lead's requested model/effort, the same value the SDK options were built from;
    *  reported through ctx.leadConfig at each lead phase entry. */
   leadRequest: LeadRequest;
+  /** PRD #3244 M2: the phase entries whose first turn already carried the runtime-config callback
+   *  ("phase:entry"); a later turn of the same entry (revise round, re-drive) does not get one. */
+  observedEntries?: Set<string>;
   refreshCodeCrossCheckTools?: () => Promise<void>;
   tripReason?: string;
   /** Issue #2471: the exact error a memory-authority trip carries (the runner's stop, or an
@@ -4908,8 +4912,24 @@ export class SdkExecutor implements Executor {
     // PRD #3244: record the lead's requested config for this phase before the turn starts. A new
     // entry only on a phase change (a re-driven turn of the same phase is a no-op); bounded to 3 s
     // inside the reporter, which never throws. A trip that landed meanwhile still wins below.
+    let onRuntimeConfig: RunTurnRequest["onRuntimeConfig"];
     if (ctx.leadConfig) {
-      await ctx.leadConfig.enterPhase(phase, state.leadRequest);
+      const reporter = ctx.leadConfig;
+      const entry: PhaseEntry = await reporter.enterPhase(phase, state.leadRequest);
+      // PRD #3244 M2: only the first turn of a phase entry asks the runtime for its config, so the
+      // single settings probe runs at most once per entry. The callback never throws into the turn.
+      const key = `${entry.phase}:${entry.entry}`;
+      const seen = (state.observedEntries ??= new Set<string>());
+      if (!seen.has(key)) {
+        seen.add(key);
+        onRuntimeConfig = (obs) => {
+          try {
+            reporter.observe(entry, toLeadObservation(obs));
+          } catch {
+            /* an observation is best-effort and never reaches the turn */
+          }
+        };
+      }
       if (state.tripReason) throw this.tripError(state);
     }
     this.armWall(state);
@@ -4962,6 +4982,7 @@ export class SdkExecutor implements Executor {
         phase,
         agents: {},
         leadSkills: [],
+        ...(onRuntimeConfig ? { onRuntimeConfig } : {}),
       };
       const turn = this.harness.startTurn(request);
       for await (const event of turn.events) {
