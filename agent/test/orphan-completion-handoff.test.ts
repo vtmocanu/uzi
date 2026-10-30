@@ -798,8 +798,8 @@ describe("completion boundary: the handoff claimant is the only tail left out of
     const second = r.restart();
     const p = second.p as unknown as Internals;
     const requests: QuiesceRequest[] = [];
-    let onQuiesce: (() => void) | undefined;
-    p.quiesceImpl = async (req: QuiesceRequest) => { requests.push(req); onQuiesce?.(); return quiescent; };
+    let onQuiesce: ((req: QuiesceRequest) => void) | undefined;
+    p.quiesceImpl = async (req: QuiesceRequest) => { requests.push(req); onQuiesce?.(req); return quiescent; };
     const claim = gitlabClaim(3404, { run_id: claimantId, claim_generation: GENERATION + 1, inventory_guarded: true });
     const flight = p.buildFlight(claim, claimantId, r.executor, undefined, "", []) as Record<string, any> & {
       steering: { endFencedFlight(r: string): void; markCancelled(): void } };
@@ -811,7 +811,7 @@ describe("completion boundary: the handoff claimant is the only tail left out of
     const attemptId = sourceOf(readRecords(r)[0]!).attemptId;
     const fence = fenceOf(r) as CompletionSourceFence;
     return {
-      r, p, flight, requests, tail, onQuiesce: (fn: () => void) => { onQuiesce = fn; },
+      r, p, flight, requests, tail, deregister, onQuiesce: (fn: (req: QuiesceRequest) => void) => { onQuiesce = fn; },
       handoff: () => second.p.recovery.retireCompletedSourceForHandoff({
         runId: r.runId, clonePath: r.clone, attemptId, fence, ownerCompleted: true, wait: { timeoutMs: 5000 },
       }),
@@ -877,6 +877,24 @@ describe("completion boundary: the handoff claimant is the only tail left out of
     await assertUntouched(b.r, files, journal);
   });
 
+  it("the exclusion flipping during the after_git quiescence retains the source", async t => {
+    const b = await boundary(t);
+    const files = snapshotFiles(b.r);
+    const journal = journalRaw(b.r);
+    b.onQuiesce(req => { if (req.site === "completion_source:after_git") b.flight["worktreePath"] = "/seeded"; });
+    assert.deepEqual(await b.handoff(), { kind: "pending", why: "not_quiescent" });
+    assert.deepEqual(b.requests.map(q => q.site), ["completion_source", "completion_source:after_git"]);
+    await assertUntouched(b.r, files, journal);
+  });
+
+  it("the exclusion flipping during the skills quiescence leaves the skills dir", async t => {
+    const b = await boundary(t);
+    b.onQuiesce(req => { if (req.site === "completion_source:skills") b.flight["worktreePath"] = "/seeded"; });
+    await b.handoff();
+    assert.ok(b.requests.some(q => q.site === "completion_source:skills"), "the skills quiescence ran");
+    assert.ok(fs.existsSync(b.r.skills), "the skills dir is not removed");
+  });
+
   it("a live owner execution tail still refuses, with the claimant registered", async t => {
     const b = await boundary(t);
     const files = snapshotFiles(b.r);
@@ -891,6 +909,14 @@ describe("completion boundary: the handoff claimant is the only tail left out of
     const b = await boundary(t);
     assert.equal(b.p.handoffClaimants.has(b.r.runId), true);
     assert.equal(b.p.registerHandoffClaimant(b.r.runId, b.flight), undefined, "a second claimant for the same owner is not registered");
+    b.deregister!();
+    assert.equal(b.p.handoffClaimants.has(b.r.runId), false, "the returned function removes the entry");
+    const newer = b.p.registerHandoffClaimant(b.r.runId, b.flight);
+    assert.equal(typeof newer, "function");
+    b.deregister!();
+    assert.equal(b.p.handoffClaimants.has(b.r.runId), true, "a stale deregister never deletes the newer entry");
+    newer!();
+    assert.equal(b.p.handoffClaimants.has(b.r.runId), false);
   });
 });
 
@@ -1098,6 +1124,64 @@ describe("a successor claim on a completed owner whose journal retains sources",
       await expectStop(s, before, "completion_unverified");
     });
   }
+
+  /** The second readOrphanJournalFence call (the re-read after the coordinator's outcome) throws. */
+  const failSecondRead = (t: TestContext): void => {
+    const real = git.readOrphanJournalFence.bind(git);
+    let calls = 0;
+    t.mock.method(git, "readOrphanJournalFence", (async (...args: Parameters<typeof real>) => {
+      if (++calls === 2) throw new Error("EIO: injected");
+      return real(...args);
+    }) as never);
+  };
+
+  it("a re-read that throws after a pending outcome keeps the retained stop", async t => {
+    const s = await scene(t, caseA, { receipt: false });
+    failSecondRead(t);
+    const before = durable(s);
+    await s.runner.execute(s.claim);
+    assert.deepEqual(s.handoffs[0]!.outcome, { kind: "pending", why: "no_receipt" });
+    await expectStop(s, before, "completion_pending");
+  });
+
+  it("a re-read that throws after a found retained source keeps the retained stop", async t => {
+    const s = await scene(t, caseA);
+    rewriteJournal(s.r.bare, withRetainedSource);
+    failSecondRead(t);
+    const before = durable(s);
+    const detach = t.mock.method(git, "detachTerminalRetained");
+    await s.runner.execute(s.claim);
+    assert.deepEqual(s.handoffs[0]!.outcome, { kind: "pending", why: "episode_bearing" });
+    assert.equal(detach.mock.callCount(), 0);
+    await expectStop(s, before, "published_source_retained");
+  });
+
+  it("a re-read that throws after an invalid outcome refuses with the original outward error", async t => {
+    const s = await scene(t, caseA);
+    await rewriteSources(s.r, src => ({ ...src, certificate: flip(src.certificate as string) }));
+    failSecondRead(t);
+    const before = durable(s);
+    await s.runner.execute(s.claim);
+    assert.deepEqual(s.handoffs[0]!.outcome, { kind: "invalid", why: "unverified" });
+    await expectRefusal(s, before, "completion_unverified");
+  });
+
+  it("a fence that appears between the classification and the snapshot is never detached", async t => {
+    const s = await scene(t, caseA);
+    const fence = fenceOf(s.r);
+    // Classified unfenced and retaining a source: the baseline detach would apply.
+    rewriteJournal(s.r.bare, j => { const { completionSourceFence: _drop, ...rest } = withRetainedSource(j); return rest; });
+    const real = git.terminalRetainedSnapshot.bind(git);
+    t.mock.method(git, "terminalRetainedSnapshot", (async (...args: Parameters<typeof real>) => {
+      rewriteJournal(s.r.bare, j => ({ ...j, completionSourceFence: fence }));
+      return real(...args);
+    }) as never);
+    const detach = t.mock.method(git, "detachTerminalRetained");
+    await s.runner.execute(s.claim);
+    assert.equal(detach.mock.callCount(), 0);
+    assert.deepEqual(reported(s).filter(x => TERMINAL.includes(x)), [], "no terminal report");
+    assert.equal(diagnostic(s, "orphan_reclaim_refused", "completion_retirement_pending")?.["retirement_subreason"], "completion_pending");
+  });
 
   it("no record and no slot names the fence: not_completion falls through to the unchanged detach", async t => {
     const s = await scene(t, caseA);

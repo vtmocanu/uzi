@@ -11410,10 +11410,16 @@ export class RunRunner {
         throw new OrphanHandoffReadmit(diagnostics, journaledPath);
       }
       // Any other outcome: the pair may have been retired or replaced meanwhile (a sweep racing the selection).
-      if ((await readFence()).state === "changed") readmit();
+      // A failing re-read must not replace the outcome's own disposition (readFence refuses with the original
+      // error): it only withholds the "changed" proof, so each outcome below keeps its own stop.
+      let reread: Awaited<ReturnType<GitCache["readOrphanJournalFence"]>> | undefined;
+      try { reread = await this.git.readOrphanJournalFence(barePath, branch, ownerRunId, journaledPath); } catch { reread = undefined; }
+      if (reread?.state === "changed") readmit();
       if (retainedSource) {
-        // A found published source is never detached. Only a positive "no record, no slot" answer falls through.
+        // A found published source is never detached. Only a positive "no record, no slot" answer falls through,
+        // and only when the re-read confirmed the classified journal (an unreadable journal is uncertain).
         if (outcome.kind !== "not_completion") stopRetained(outcome.kind === "invalid" ? "completion_unverified" : "published_source_retained");
+        if (reread === undefined) stopRetained("published_source_retained");
       } else {
         switch (outcome.kind) {
           case "pending":
@@ -11436,7 +11442,20 @@ export class RunRunner {
     } catch (error) {
       return refuseAfterReread("path", "path_error", error);
     }
-    if (retained || (flight.effectiveAttemptPaths ?? this.attemptPaths)) {
+    if (retained) {
+      // The detach below must act on the journal that was classified: a fence that appeared (or changed) between the
+      // classification and the snapshot is never detached on the strength of the earlier answer.
+      const snapshotFence = retained.journal.completionSourceFence;
+      const classified = fenceState.state === "fenced" ? serializeSourceFence(fenceState.fence) : undefined;
+      if ((snapshotFence === undefined ? undefined : serializeSourceFence(snapshotFence)) !== classified) {
+        let again: Awaited<ReturnType<GitCache["readOrphanJournalFence"]>> | undefined;
+        try { again = await this.git.readOrphanJournalFence(barePath, branch, ownerRunId, journaledPath); } catch { again = undefined; }
+        if (again?.state === "changed") readmit();
+        // A worker without authority classifies a fence-carrying journal as unfenced and keeps the baseline detach.
+        if (!(fenceState.state === "unfenced" && again?.state === "unfenced")) stopRetained("completion_pending");
+      }
+    }
+    if (retained ||(flight.effectiveAttemptPaths ?? this.attemptPaths)) {
       // The same predecessor-scoped capture-mode proof the C′ capture runs, and the same blocking
       // rule: survivors or unverified leave journal, ledger and path untouched.
       let proof: { outcome: QuiesceRunOutcome; blocked: boolean };
@@ -11983,6 +12002,7 @@ export class RunRunner {
     let lastReadmit: OrphanHandoffReadmit | undefined;
     // After a handoff re-admission, a seed that meets the owner's still-retiring slot is a not-ready retirement: a
     // retained stop. Without a prior re-admission the refusal is untouched.
+    // Applies after any re-admission (it fails safe: bounded by the requeue cap, never a terminal report).
     const stopOnRetiringSlot = (err: unknown): void => {
       if (handoffReadmits === 0 || !lastReadmit || !(err instanceof AuthorityRefusal) || err.kind !== "retiring") return;
       this.retainedLifecycleGuard(flight);
