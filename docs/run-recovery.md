@@ -123,15 +123,22 @@ A successor that meets a terminal owner whose completed source is not yet retire
 completion-source fence, so the worker retires it through the certified completion
 chain rather than clearing it. When that retirement is pending (a busy capture
 cycle or authority lock, a failed preflight, a live owner tail), uncertain, or the
-journal has retained sources, the claim stops without a terminal report and the
+journal has retained sources and authority finds the fence's source or a slot for
+the path, the claim stops without a terminal report and the
 owner's source is left intact; the claim is requeued up to `RUN_MAX_REQUEUES`. A
 journal that changes under the call re-admits at most twice per claim, and the
 third is the same stop. The stop leaves the claim's own custody hold open, so at
 the cap the run parks `recovery_wait` with `worker_requeue_exhausted` for an owner
-Resume or Cancel. Each stop adds one open hold per requeue, which counts toward
-the owner's custody admission count; at the default cap of 3 the default limits
-are not reached. A source that is positively invalid or unsupported keeps the
-outward refusal. A same-process Codex owner without a live disposal witness, a
+Resume or Cancel. Each requeued claim opens its own custody hold and the stop leaves it open, so at
+the default cap of 3 one run accrues at most 4 open holds, below the default
+`custody_hold_limit` of 8; those holds share the owner's admission count with the
+owner's other runs, so several exhausted runs can hold the owner's new claims
+queued until an owner Resume or Cancel settles them. A retained-sources journal
+where authority finds neither a record carrying the fence nor a slot for the path
+(a classify `not_completion`) still takes the unchanged detach. In retire mode, a
+source that is positively invalid or unsupported keeps the outward refusal; for a
+journal with retained sources those outcomes are retained stops instead
+(`completion_unverified` / `published_source_retained`). A same-process Codex owner without a live disposal witness, a
 permanently failing preflight, or a valid fenced source with retained sources
 stays retained until exhaustion, then owner-held. See
 [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md) for the lock
@@ -1617,7 +1624,7 @@ These worker events identify the failed guard or completed disposition:
 | `quiescence` | `quiescence_blocked` or `quiescence_error`: the scoped capture check blocked or failed. |
 | `attempt_ledger` / `attempt_journal` | `attempt_release_failure`: recording retained attempt state or clearing its journal failed. |
 | `retirement` | `canonical_retirement_failure`, or `attempt_release_failure` when attempt validation falls through to this generic stage. |
-| `completion_handoff` | The owner's journal carried a completion-source fence. `completion_retirement_pending`: the certified retirement is not ready, so the successor stops without failing (see the retained stop above). `completion_retirement_refused`: the outward refusal for an invalid or unsupported fenced source, or a journal that changed under the call (`pair_changed`, the successor re-admits). |
+| `completion_handoff` | The owner's journal carried a completion-source fence. `completion_retirement_pending`: the certified retirement is not ready, so the successor stops without failing (see the retained stop above). `completion_retirement_refused`: the outward refusal for an invalid or unsupported fenced source in retire mode (a retire-mode `not_completion` carries subreason `fenced_source`), or a journal that changed under the call (`pair_changed`, the successor re-admits). |
 
 Inner retirement stages are `journal_read`, `journal_validation`, `containment`,
 `holding_parent`, `rename`, `retained_copy`, `intra_device_rename`, and

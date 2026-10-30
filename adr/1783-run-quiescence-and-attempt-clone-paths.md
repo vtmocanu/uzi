@@ -1371,7 +1371,8 @@ missing is a route that retires the source through the certified chain.
   `retireRunnerClone` with `expectedFence`. The owner's receipt only selects the
   generation; it is never a certificate. Every certificate, cohort, epoch, source,
   fence, artifact and pending-operation check is redone, and nothing is synthesized.
-- `refuseFenceDrop` stays at both of its sites. The #3404 sentence "an orphan
+- `refuseFenceDrop` stays at every call site, including the two the orphan path
+  reaches (`retireRunnerClone`, `releaseAttemptInPlace`). The #3404 sentence "an orphan
   reclaim, for one, may not clear a fenced journal" stays true: the handoff
   retires through the certified chain, it does not clear a fence from the
   orphan path.
@@ -1391,7 +1392,8 @@ The timeout is the typed `AuthorityLockBusy`, a subclass of `AuthorityRefusal`
 with the unchanged message `authority lock timeout`, thrown at the two timeout
 sites in `agent/src/authority-lock.ts`. Every existing `AuthorityRefusal` handler
 still matches it. Only a timeout while acquiring A is `authority_busy`; every
-other refusal and every abort propagates unchanged.
+other refusal and every abort propagates unchanged, except a failed journal read
+during selection, which is `uncertain`.
 
 ### Outcomes and the claimant disposition
 
@@ -1403,8 +1405,8 @@ when no record of the owner carries the fence.
 | `retired` | Re-admit through ordinary admission. |
 | `pending` (including `authority_busy`, `preflight`, `cycle_busy`, `action_failed`) | Retained stop: `RetainedRecoveryStop`, no terminal report, nonterminal, bounded by `RUN_MAX_REQUEUES`. |
 | `uncertain` | Retained stop. |
-| `invalid` | The unchanged outward refusal. |
-| `unsupported` | The unchanged outward refusal. |
+| `invalid` (retire mode) | The unchanged outward refusal. |
+| `unsupported` (retire mode) | The unchanged outward refusal. |
 | `not_completion` (retire mode) | The unchanged outward refusal. |
 
 After every non-`retired` outcome the journal is re-read. `changed` re-admits (the
@@ -1454,9 +1456,12 @@ the requeue cap (including 0) the run parks `recovery_wait` with cause
 `worker_requeue_exhausted` for an owner Resume or Cancel. Every claimant that can
 reach this path has the hold: profile-bound runs are routed to the isolated runner
 and never reach `RunRunner`, the other kinds have their own runners, and current
-images advertise the recovery capabilities the hold requires. Each stop adds an
-open hold per requeue, which counts toward the owner's custody admission count
-(the accrual `stopOnHeldSource` already has). This is proven by
+images advertise the recovery capabilities the hold requires. Each requeued claim opens its
+own hold and the stop leaves it open, so at the default cap of 3 one run accrues
+at most 4 open holds, below the default `custody_hold_limit` of 8; those holds
+share the owner's admission count with the owner's other runs, so several
+exhausted runs can hold the owner's new claims queued until an owner Resume or
+Cancel settles them (the accrual `stopOnHeldSource` already has). This is proven by
 `TestClaimantHandoffExhaustionLiveDB`.
 
 ### Diagnostics
