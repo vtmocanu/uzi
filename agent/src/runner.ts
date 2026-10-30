@@ -168,7 +168,10 @@ import {
   type PlanVerdict,
 } from "./steering.js";
 import { GitLabClient, ForgeError, ForgejoClient, GitHubClient, type ForgeClient } from "./forge.js";
-import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
+import {
+  classifyForgeError, PublicationForgeUnreachableError, withForgeRetry,
+  type PublicationForgeStep, type PublicationForgeSurface,
+} from "./forge-retry.js";
 import {
   archiveFailureReasonSuffix,
   archiveQuarantinedSource,
@@ -2015,6 +2018,24 @@ function checkpointErrorDiagnostic(
     error: root,
     cause: parts.length ? sanitizeForLog(parts.join(" <- "), 597) : undefined,
   };
+}
+
+/** Build the typed exhaustion error for a transiently unreachable publication hop. The public message is
+ *  fixed; only the redacted, sanitized cause text goes into `rawDetail`. */
+function publicationForgeUnreachable(
+  redactText: ((text: string) => string) | undefined,
+  surface: PublicationForgeSurface,
+  step: PublicationForgeStep,
+  cause: unknown,
+): PublicationForgeUnreachableError {
+  let raw: string | undefined;
+  if (typeof redactText === "function") {
+    const source = cause instanceof ScratchPublicationError
+      ? (cause.rawDetail ?? cause.detail ?? "")
+      : cause instanceof Error ? cause.message : String(cause);
+    try { raw = redactThenSanitize(redactText, source); } catch { /* omit free text when redaction fails */ }
+  }
+  return new PublicationForgeUnreachableError(surface, step, cause, raw);
 }
 
 /** The DETAIL path: bound the unsplit raw text (omitting it when oversized), redact it whole (the redactor matches across CR and
@@ -7669,6 +7690,13 @@ export class RunRunner {
     }
   }
 
+  /** Single entry for a publication hop that stayed transiently unreachable after its retry schedule. Today
+   *  it rethrows, so the run fails as before but with the typed, stable `publication_forge_unreachable`
+   *  reason; a later change replaces the body with a park. Callers invoke it before any fallback arm. */
+  private async onPublicationForgeUnreachable(err: PublicationForgeUnreachableError): Promise<never> {
+    throw err;
+  }
+
   private async phasePublish(
     claim: ClaimResponse,
     flight: RunFlight,
@@ -9163,8 +9191,13 @@ export class RunRunner {
         originalHead: publicationOriginalHead,
         candidate,
       });
-      return withForgeRetry(
+      // Set only around the direct pushBranch call so an exhausted raw transient error is typed `push`
+      // only when it came from the push itself, not from a local guard earlier in the attempt.
+      let atPush = false;
+      try {
+        return await withForgeRetry(
         async () => {
+          atPush = false;
           const sourceSha = await this.requireTrackingOwned(flight, finalizeBarePath, result.branch, publication.candidate);
           if (claim.repo.forge_type === "github" && !workflowUnavailable) {
             let hits: string[] | null = null;
@@ -9199,6 +9232,7 @@ export class RunRunner {
           if (ciConfigGuarded && await refuseOnCIConfigGuard(finalizeBarePath, sourceSha)) {
             throw new CIConfigGuardRefusedSignal();
           }
+          atPush = true;
           await this.git.pushBranch(
             finalizeBarePath,
             result.branch,
@@ -9212,9 +9246,23 @@ export class RunRunner {
         {
           log: runLog,
           signal: boundarySignal,
-          classify: (error) => (error instanceof ScratchPublicationError || error instanceof PublicationRefusedSignal) ? "permanent" : classifyForgeError(error),
+          // Only a floor refresh that could not reach the remote is retryable among the typed refusals;
+          // every other scratch publication refusal and refusal signal stays permanent.
+          classify: (error) => error instanceof ScratchPublicationError
+            ? (error.kind === "floor_unreachable" ? "transient" : "permanent")
+            : error instanceof PublicationRefusedSignal ? "permanent" : classifyForgeError(error),
         },
-      );
+        );
+      } catch (error) {
+        if (error instanceof ScratchPublicationError && error.kind === "floor_unreachable") {
+          throw publicationForgeUnreachable(flight.redactText, "git", "floor_refresh", error);
+        }
+        if (atPush && !(error instanceof ScratchPublicationError) && !(error instanceof PublicationRefusedSignal)
+          && classifyForgeError(error) === "transient") {
+          throw publicationForgeUnreachable(flight.redactText, "git", "push", error);
+        }
+        throw error;
+      }
     };
 
     // PRD #1416 (MR-rework, finding 1): a bridge NEWLY makes a rewritten branch pushable (a plain
@@ -9655,6 +9703,7 @@ export class RunRunner {
                 rethrowWorkflowAbort(e);
                 if (e instanceof PublicationRefusedSignal) throw e;
                 if (e instanceof RunResidueBlockedError) throw e;
+                if (e instanceof PublicationForgeUnreachableError) await this.onPublicationForgeUnreachable(e);
                 if (await reportMovedBranchIfVerified(e)) return true;
                 if (e instanceof ScratchPublicationError) throw e;
                 // PRD #974 M2: an aligned push rejected by GitHub Push Protection (GH013) is a
@@ -9772,6 +9821,7 @@ export class RunRunner {
                   rethrowWorkflowAbort(e);
                   if (e instanceof PublicationRefusedSignal) throw e;
                   if (e instanceof RunResidueBlockedError) throw e;
+                  if (e instanceof PublicationForgeUnreachableError) await this.onPublicationForgeUnreachable(e);
                   // PRD #974 M2: an overlay push rejected by GitHub Push Protection (GH013) is a
                   // secret gitleaks missed — typed push_secret_blocked fail (NO preserved diff:
                   // it may carry the secret), not a fall-back to merge/rebase (which cannot clear
@@ -9808,6 +9858,7 @@ export class RunRunner {
                   rethrowWorkflowAbort(e);
                   if (e instanceof PublicationRefusedSignal) throw e;
                   if (e instanceof RunResidueBlockedError) throw e;
+                  if (e instanceof PublicationForgeUnreachableError) await this.onPublicationForgeUnreachable(e);
                   // PRD #974 M2: a merge push rejected by GitHub Push Protection (GH013) is a secret
                   // gitleaks missed — typed push_secret_blocked fail (NO preserved diff: it may
                   // carry the secret), not the rebase fallback (which cannot clear a secret) nor
@@ -9880,6 +9931,7 @@ export class RunRunner {
         if (e instanceof PublicationContextRefusedSignal) await refusePrepush("context", e.head, null, e.reason);
         return;
       }
+      if (e instanceof PublicationForgeUnreachableError) await this.onPublicationForgeUnreachable(e);
       if (e instanceof ScratchPublicationError) throw e;
       // PRD #1416 M4 (SC3): a bridge that could not be built/validated at a finalize push site was
       // thrown as HistoryRewrittenError; type it history_rewritten — never the generic catch
@@ -9964,6 +10016,7 @@ export class RunRunner {
           return;
         }
         if (e instanceof RunResidueBlockedError) throw e;
+        if (e instanceof PublicationForgeUnreachableError) await this.onPublicationForgeUnreachable(e);
         if (await reportMovedBranchIfVerified(e)) return;
         if (e instanceof ScratchPublicationError) throw e;
         // PRD #974 M2 backstop: a GitHub Push Protection (GH013) rejection here means a secret
@@ -10317,18 +10370,27 @@ export class RunRunner {
       const title = mrTitle(claim, result.scopeCapped, completionScope);
       return nonClosingTitleDelivery ? nonClosingTitle(title, scanIid!, repoPath) : title;
     };
-    const mr = await withForgeRetry(
-      () =>
-        forge.createMergeRequest({
-          repoUrl: claim.repo.url,
-          pat: claim.secrets.forge_pat,
-          sourceBranch: result.branch,
-          targetBranch,
-          title: titleFor(),
-          description: description.initialBody(completionFor(renderCloses)),
-        }, boundarySignal),
-      { log: runLog, signal: boundarySignal, classify: classifyForgeError },
-    );
+    let mr: Awaited<ReturnType<typeof forge.createMergeRequest>>;
+    try {
+      mr = await withForgeRetry(
+        () =>
+          forge.createMergeRequest({
+            repoUrl: claim.repo.url,
+            pat: claim.secrets.forge_pat,
+            sourceBranch: result.branch,
+            targetBranch,
+            title: titleFor(),
+            description: description.initialBody(completionFor(renderCloses)),
+          }, boundarySignal),
+        { log: runLog, signal: boundarySignal, classify: classifyForgeError },
+      );
+    } catch (error) {
+      // Exhausted transient API failure only; a permanent rejection (401, 422, ...) rethrows unchanged.
+      if (classifyForgeError(error) === "transient") {
+        await this.onPublicationForgeUnreachable(publicationForgeUnreachable(redactText, "api", "mr_create", error));
+      }
+      throw error;
+    }
     batcher.emit({
       kind: "status",
       agent: "worker",

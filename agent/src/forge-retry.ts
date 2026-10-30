@@ -46,6 +46,30 @@ export const FORGE_RETRY_SCHEDULE = [1_000, 2_000, 4_000, 8_000, 16_000];
  */
 export const DEVBOX_RETRY_SCHEDULE = [1_000, 4_000, 10_000];
 
+export type PublicationForgeSurface = "git" | "api";
+export type PublicationForgeStep = "floor_refresh" | "push" | "mr_create";
+
+/**
+ * A finalize publication hop (floor refresh, push or MR create) stayed transiently unreachable after
+ * the whole retry schedule. The message is fixed and public (`publication_forge_unreachable: <step>`);
+ * remote text lives only in `rawDetail`, which the thrower redacts and bounds before attaching it.
+ * Permanent failures never become this error.
+ */
+export class PublicationForgeUnreachableError extends Error {
+  readonly code = "publication_forge_unreachable";
+  readonly surface: PublicationForgeSurface;
+  readonly step: PublicationForgeStep;
+  /** Redacted, bounded cause text for logs only; never part of the message. */
+  readonly rawDetail?: string;
+  constructor(surface: PublicationForgeSurface, step: PublicationForgeStep, cause?: unknown, rawDetail?: string) {
+    super(`publication_forge_unreachable: ${step}`, { cause });
+    this.name = "PublicationForgeUnreachableError";
+    this.surface = surface;
+    this.step = step;
+    if (rawDetail !== undefined) this.rawDetail = rawDetail;
+  }
+}
+
 /**
  * PERMANENT stderr/message patterns, checked FIRST — a hit means "fail fast, never
  * retry" (D9). Case-insensitive. Note git's generic `Could not read from remote

@@ -27,7 +27,7 @@ import { validateCaptureGitRequest } from "./credential-free-capture.js";
 import { RUNNER_UID, WORKER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { rmRunnerTeardownTree } from "./rmtree.js";
-import { withForgeRetry } from "./forge-retry.js";
+import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import {
   ATTEMPT_ID_RE,
@@ -411,7 +411,9 @@ export type ScratchPublicationKind =
   | "tip_unavailable" | "shallow_history" | "missing_objects" | "object_walk_failed"
   | "exec_failed" | "scratch_present" | "floor_unverified" | "checkpoint_range"
   | "remote_changed_during_refresh" | "remote_candidate_diverged"
-  | "new_remote_candidate_diverged" | "remote_branch_advanced";
+  | "new_remote_candidate_diverged" | "remote_branch_advanced"
+  /** The remote was transiently unreachable at ls-remote/fetch; nothing about the floor is proven either way. */
+  | "floor_unreachable";
 /** The check that refused. */
 export type ScratchPublicationStep =
   | "resolve_tip" | "shallow_check" | "object_walk" | "scratch_walk" | "floor_refresh" | "checkpoint_floor";
@@ -3501,8 +3503,23 @@ export class GitCache {
         kind, step: "floor_refresh",
       });
     };
+    // Only the two direct remote operations (ls-remote, fetch) may produce `floor_unreachable`, and only
+    // when that direct error classifies transient. Local git, residue, abort and auth errors keep
+    // flowing to the catch-all as `floor_unverified`; no cause chain is walked.
+    const remote = async (args: string[]): Promise<string> => {
+      try {
+        return await this.runGit(barePath, args, pat, scope, username);
+      } catch (cause) {
+        if (cause instanceof RunResidueBlockedError || isAbortLike(cause) || this.boundaryAbortError(cause)) throw cause;
+        if (classifyForgeError(cause) !== "transient") throw cause;
+        throw new ScratchPublicationError("cannot reach remote to verify floor", cause, {
+          kind: "floor_unreachable", step: "floor_refresh", detail: "remote unreachable during floor refresh",
+          rawDetail: execDetail(classifyExecFailure(cause)).rawDetail,
+        });
+      }
+    };
     const observe = async (): Promise<string | null> => {
-      const listed = (await this.runGit(barePath, ["ls-remote", "--", "origin", remoteRef], pat, scope, username)).trim();
+      const listed = (await remote(["ls-remote", "--", "origin", remoteRef])).trim();
       if (!listed) return null;
       const oid = listed.slice(0, 40);
       if (!SHA40_RE.test(oid) || listed !== `${oid}\t${remoteRef}`) refuse("floor_unverified");
@@ -3521,7 +3538,7 @@ export class GitCache {
         if (await observe() !== null) refuse("remote_changed_during_refresh");
         return;
       }
-      await this.runGit(barePath, ["fetch", "--refmap=", "--", "origin", `+${remoteRef}:${scratchRef}`], pat, scope, username);
+      await remote(["fetch", "--refmap=", "--", "origin", `+${remoteRef}:${scratchRef}`]);
       const fetched = await this.resolveCommitStrict(barePath, scratchRef).catch((error: unknown) => {
         if (error instanceof RunResidueBlockedError || isAbortLike(error)) throw error;
         throw new ScratchPublicationError("cannot verify fresh remote floor", error, {
