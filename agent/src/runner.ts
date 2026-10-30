@@ -21501,6 +21501,7 @@ export class RunRunner {
     const repark = flight.memoryRepark;
     if (!memory || (!hold && !repark)) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let onShutdown: (() => void) | undefined;
     try {
       const authority = this.authority;
       const bare = flight.barePath, branch = flight.branch, clonePath = flight.worktreePath;
@@ -21574,10 +21575,20 @@ export class RunRunner {
       }
       // The timeout also aborts the writer, so a timed-out producer forfeits pending lock holds and starts no phase 2.
       const give = new AbortController();
+      const writeDeadline = Date.now() + this.codexBoundaryDeadlineMs;
       const written = await Promise.race([
         this.git.recordMemoryPark(bare, branch, { runId: flight.runId, clonePath, ...(attemptId ? { attemptId } : {}) }, record,
           { signal: give.signal }),
-        new Promise<"timeout">(resolve => { timer = setTimeout(() => { give.abort(); resolve("timeout"); }, this.codexBoundaryDeadlineMs); }),
+        new Promise<"timeout">(resolve => {
+          const arm = () => {
+            if (timer) clearTimeout(timer);
+            const deadline = Math.min(writeDeadline, this.shutdownDeadlineAt ?? Infinity);
+            timer = setTimeout(() => { give.abort(); resolve("timeout"); }, Math.max(0, deadline - Date.now()));
+          };
+          onShutdown = arm;
+          this.shutdownSignal.signal.addEventListener("abort", onShutdown, { once: true });
+          arm();
+        }),
       ]);
       if (written === "timeout") {
         runLog.warn("memory park record write timed out and the producer was aborted; a write already holding the bare lock may still land, and a reader trusts a record only after its own lock-held confirmation");
@@ -21589,6 +21600,7 @@ export class RunRunner {
     } catch (error) {
       runLog.warn("memory park record not written; the park stays unqualified", { error: errMessage(error) });
     } finally {
+      if (onShutdown) this.shutdownSignal.signal.removeEventListener("abort", onShutdown);
       if (timer) clearTimeout(timer);
     }
   }
@@ -22695,6 +22707,15 @@ export class RunRunner {
     // never positively ended but whose journal proves a memory park of this run is not ours to continue: re-park for the owner.
     const reparkOwner = await this.memoryReparkOwner(claim, flight, source);
     if (reparkOwner !== undefined) await this.parkMemoryContinuationRefused(claim, flight, source, reparkOwner);
+    // A known held source is not a recovery attempt. Check the ownership map before stage renewal or
+    // reservation, including a held slot with a pending footprint (which classifies as "other"). Admission
+    // below remains the authoritative backstop if another flight acquires the source after this read.
+    if (this.authority?.heldByOtherSink(source.clonePath, flight.sourceUsePaths ??= new Set())) {
+      this.retainedLifecycleGuard(flight);
+      flight.runLog.warn("retained predecessor held by an earlier flight's unended source use; stopping claim for retry", {
+        claim_generation: flight.claimGeneration });
+      throw new RetainedRecoveryStop();
+    }
     await this.logPredecessorMemorySettlement(flight, bare, branch, source);
     const inherited = flight.sourceInherited?.family;
     if (inherited?.observedExecution.runId === flight.runId) {

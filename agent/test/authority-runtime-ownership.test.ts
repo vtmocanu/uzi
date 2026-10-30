@@ -469,6 +469,7 @@ describe("classifySourceAdmission is genuinely read-only (issue #3638 D4)", () =
     assert.equal(await r.rt.awaitSinkQuiescent({ timeoutMs: 5000 }), true);
     const before = authorityBytes(r.root);
     const attempts = flags.headWriteAttempts;
+    assert.ok(attempts > 0, "the injected head failure ran before the read-only baseline");
     assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), true, "the end is queued and the key still owned");
     const observer = foreign(r);
     assert.equal((await observer.classifySourceAdmission(r.clone, new Set())).kind, "other", "slot ahead of head is uncertain");
@@ -607,6 +608,7 @@ describe("verifyEndedSlots is genuinely read-only (issue #3638 D3)", () => {
     assert.equal(await r.rt.awaitSinkQuiescent({ timeoutMs: 5000 }), true);
     const before = authorityBytes(r.root);
     const attempts = flags.headWriteAttempts;
+    assert.ok(attempts > 0, "the injected head failure ran before the read-only baseline");
     assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), true, "the end is queued and the key still owned");
     const sources = [{ path: r.clone, authorityKey: live.key, epoch: live.epoch, seq: live.seq + 1 }];
     assert.equal(await r.rt.verifyEndedSlots(sources, r.rt.authorityIncarnation()!), false, "a slot one ahead of its head is uncertain");

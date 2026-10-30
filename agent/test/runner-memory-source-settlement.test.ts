@@ -503,6 +503,48 @@ describe("a settled memory park ends the source use only when every fact of the 
 // issue #3638 D3 - the producer. The record is complete or it is absent: a settlement is written only when the
 // flight's every source path has a confirmed end and the hold is settled by the flight and executor that wrote it.
 describe("the cooperative memory-park record is complete or absent (issue #3638)", () => {
+  for (const scenario of ["shutdown pending", "shutdown during write", "original deadline first"] as const) {
+    it(`memory-park write respects the earliest deadline: ${scenario}`, async t => {
+      const r = await authorityRig();
+      const runner = runnerWith(() => ({ executor: { run: async () => { throw new Error("unused"); } }, homeDir }),
+        fakeGitlab().gitlab, undefined, undefined,
+        { authority: r.rt, codexBoundaryDeadlineMs: 1000, shutdownPublishTimeoutMs: 100 });
+      const wire = { run_id: randomUUID(), worker_id: randomUUID(), register_nonce: "nonce", claim_generation: 7, memory_episode: 3 };
+      const flight = { runId: wire.run_id, claimGeneration: 7, flightId: randomUUID(), workerMemory: {}, executor: {},
+        barePath: "bare", branch: "agent/issue-2396", worktreePath: "/clone",
+        memoryRepark: { authorityIncarnation: randomUUID(), sourceEpoch: randomUUID(), attemptId: null, sent: wire } };
+      let writerSignal: AbortSignal | undefined;
+      t.mock.method(git, "recordMemoryPark", async (...args: Parameters<typeof git.recordMemoryPark>) => {
+        writerSignal = args[4]?.signal;
+        await new Promise<void>(resolve => writerSignal!.addEventListener("abort", () => resolve(), { once: true }));
+        return "unconfirmed" as const;
+      });
+      const internal = runner as unknown as { recordMemoryParkOutcome(...args: unknown[]): Promise<void> };
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+      if (scenario === "shutdown pending") runner.shutdown();
+      let finished = false;
+      const writing = internal.recordMemoryParkOutcome(flight, nullLogger(), {}, {}).then(() => { finished = true; });
+      try {
+        assert.ok(writerSignal, "the producer started the pending writer");
+        if (scenario !== "shutdown pending") {
+          t.mock.timers.tick(scenario === "original deadline first" ? 950 : 50);
+          runner.shutdown();
+        }
+        const remaining = scenario === "original deadline first" ? 50 : 100;
+        t.mock.timers.tick(remaining - 1);
+        assert.equal(writerSignal.aborted, false, "shutdown never cuts off the remaining grace early");
+        assert.equal(finished, false);
+        t.mock.timers.tick(1);
+        assert.equal(writerSignal.aborted, true, "the pending writer is aborted at the earliest deadline");
+        await writing;
+        assert.equal(finished, true);
+      } finally {
+        t.mock.timers.tick(5000);
+        await writing;
+      }
+    });
+  }
+
   /** Park through the exhausted-allowance path with an optional tweak of the rig before the run. */
   async function exhaustedPark(tweak: (r: Awaited<ReturnType<typeof authorityRig>>, runner: unknown) => void = () => {},
     log = nullLogger()) {

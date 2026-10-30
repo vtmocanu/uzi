@@ -709,6 +709,12 @@ for kind in protected ordinary; do
     rc="$(backup_rc "$dest" "$rid")"
     [ "$rc" -eq 0 ] || fail "memoryPark sent_unconfirmed: valid protected descriptor rejected (exit $rc)"
     echo "PASS protected memoryPark without settlement accepted"
+    mp_sixteen="$(printf '%s' "$mp_valid" | jq -c '.settlement.sources = [range(16) | (tostring | ("0" * (2 - length)) + .) as $id | {path:("/p/" + $id),authorityKey:($id * 32),attemptId:null,epoch:"33333333-3333-4333-8333-333333333333",seq:1}]')"
+    value="$(printf '%s' "$progress_journal" | jq --argjson m "$mp_sixteen" '.memoryPark=$m | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+    git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+    rc="$(backup_rc "$dest" "$rid")"
+    [ "$rc" -eq 0 ] || fail "memoryPark 16 sources: valid protected descriptor rejected (exit $rc)"
+    echo "PASS protected memoryPark 16 sorted unique sources accepted"
     mp_bad_cases=(
       'null' '"x"' '[]'
       "$(printf '%s' "$mp_valid" | jq -c '.version=2')"
@@ -737,7 +743,7 @@ for kind in protected ordinary; do
       "$(printf '%s' "$mp_valid" | jq -c '.settlement.sources[0].path="relative/path"')"
       "$(printf '%s' "$mp_valid" | jq -c '.settlement.sources[0].path="/a/../b"')"
       "$(printf '%s' "$mp_valid" | jq -c '.settlement.sources += [.settlement.sources[0]]')"
-      "$(printf '%s' "$mp_valid" | jq -c '.settlement.sources = [range(17) | {path:("/p" + tostring),authorityKey:((. | tostring) * 64 | .[0:64] | gsub("[^0-9a-f]";"a")),attemptId:null,epoch:"33333333-3333-4333-8333-333333333333",seq:1}]')"
+      "$(printf '%s' "$mp_sixteen" | jq -c '.settlement.sources += [{path:"/p/16",authorityKey:("16" * 32),attemptId:null,epoch:"33333333-3333-4333-8333-333333333333",seq:1}]')"
       "$(printf '%s' "$mp_valid" | jq -c '.settlement.evidence.parkAck.memoryEpisode=9')"
       "$(printf '%s' "$mp_valid" | jq -c '.settlement.evidence.processJoin="neither"')"
       "$(printf '%s' "$mp_valid" | jq -c '.settlement.evidence.steering="pending"')"

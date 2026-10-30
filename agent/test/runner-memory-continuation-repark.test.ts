@@ -383,6 +383,7 @@ describe("a refused memory continuation re-parks for the owner instead of failin
     it(`${name} seen during the re-park is nonterminal with no failed report`, async () => {
       const p = await predecessor("sent_unconfirmed");
       const c = await resume(p, { arm: () => api.setOwnershipStatus(p.f.claim.run_id, status, generation) });
+      assert.equal(c.counters.reports, 1, "the park report was sent before the ownership change was seen");
       assert.equal(terminals().length, 0);
       assertNothingDone(c.counters);
       await assertUntouched(p);
