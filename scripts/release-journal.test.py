@@ -65,14 +65,25 @@ class Journal(unittest.TestCase):
         workflow = (root / '.github/workflows/release-auto.yml').read_text()
         codec = textwrap.dedent(workflow.split('# BEGIN JOURNAL CODEC:', 1)[1].split('\n', 1)[1]
                                .split('          # END JOURNAL CODEC', 1)[0])
-        namespace = {'json': json, 're': __import__('re')}
-        exec(codec, namespace)
         source_tree = ast.parse((root / 'scripts/lib/release-journal.py').read_text())
         target_tree = ast.parse(codec)
-        target_functions = {node.name: ast.dump(node) for node in target_tree.body if isinstance(node, ast.FunctionDef)}
-        for node in source_tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name in target_functions:
-                self.assertEqual(ast.dump(node), target_functions[node.name], node.name)
+        def declarations(tree):
+            named = {}
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef):
+                    named[node.name] = ast.dump(node)
+                elif (isinstance(node, ast.Assign) and len(node.targets) == 1
+                      and isinstance(node.targets[0], ast.Name)):
+                    named[node.targets[0].id] = ast.dump(node)
+            return named
+        source, embedded = declarations(source_tree), declarations(target_tree)
+        # The library also owns local file/clock helpers; the embedded codec is
+        # deliberately a subset, with no additional or differing declarations.
+        self.assertLessEqual(embedded.keys(), source.keys())
+        for name, declaration in embedded.items():
+            self.assertEqual(declaration, source[name], name)
+        namespace = {'json': json, 're': __import__('re')}
+        exec(codec, namespace)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'journal.json'
             journal.Journal(path, 'fixture-operation', 'vtmocanu/uzi', 'v0.2.0', 'a' * 40)
