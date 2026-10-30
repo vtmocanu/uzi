@@ -117,11 +117,19 @@ function alive(pid: number): boolean {
 
 /** The helper has reported its status, so its `sh` is about to exit; wait for the kernel to say so. The helper
  * is an orphan of the SIGKILLed worker (reparented to init), so there is no exit event to subscribe to; this
- * polls the kernel's view against a generous wall-clock deadline (not an iteration count, not an ordering sleep). */
-async function gone(pid: number): Promise<void> {
-  const deadline = Date.now() + 60_000;
-  while (alive(pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
-  assert.equal(alive(pid), false, "the helper process is gone");
+ * polls the kernel's view against a generous wall-clock deadline (not an iteration count, not an ordering sleep).
+ * The assertion is on the loop's own last observation, never a fresh /proc read: a later read (a reused pid, a
+ * transient /proc result) must not contradict the observation that ended the loop (issue #3625). Accepted limit:
+ * alive() reads any /proc error as gone, so one spurious "not alive" reading passes; pid identity binding is
+ * deliberately out of scope unless that recurs. */
+async function gone(pid: number, observe: (pid: number) => boolean = alive, budgetMs = 60_000): Promise<void> {
+  const deadline = Date.now() + budgetMs;
+  let live = observe(pid);
+  while (live && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    live = observe(pid);
+  }
+  assert.equal(live, false, "the helper process is gone");
 }
 
 /** Unblock a helper a failed test left parked on its FIFO, by the exact pid the helper wrote. */
@@ -188,6 +196,17 @@ async function twoClones(t: TestContext): Promise<{ dataDir: string; origin: str
 
 const reseedA = (git: GitCache, bare: string) => git.runnerCloneForBranch(bare, BR_A, "issue-5101", noProofReseed, RUN_A);
 const reseedB = (git: GitCache, bare: string) => git.runnerCloneForBranch(bare, BR_B, "issue-5102", noProofReseed, RUN_B);
+
+test("gone() asserts its last observation, not a fresh /proc read", async () => {
+  // The loop exits on "not alive"; every later observation says alive, as a reused pid would (issue #3625).
+  let calls = 0;
+  await gone(1, () => calls++ > 0);
+  assert.equal(calls, 1, "the observation that ended the loop is the one asserted");
+});
+
+test("gone() still fails when the pid stays alive until its deadline", async () => {
+  await assert.rejects(gone(1, () => true, 50), /the helper process is gone/);
+});
 
 test("proof 1: a detached runner-uid delete outlives its SIGKILLed owner; the successor refuses its footprint until an owner settlement", { timeout: 120_000 }, async (t) => {
   const { dataDir, bare, a, b } = await twoClones(t);
