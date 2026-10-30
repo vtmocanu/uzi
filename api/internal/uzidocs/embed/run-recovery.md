@@ -128,9 +128,9 @@ the path, the claim stops without a terminal report and the
 owner's source is left intact; the claim is requeued up to `RUN_MAX_REQUEUES`. A
 seed that meets a slot still `retiring` (a retirement interrupted before the claim
 arrived) is the same stop, as is an I/O error while the retirement is prepared or a
-coordinator that cannot classify a journal with retained sources. Any
-AuthorityRefusal, lifecycle abort or spent maintenance budget raised during that
-preparation propagates instead. A
+coordinator that cannot classify a journal with retained sources. An authority
+refusal, a cancel or shutdown, or a spent maintenance budget during that
+preparation is not this stop: it ends the claim as it did before. A
 journal that changes under the call re-admits at most twice per claim, and the
 third is the same stop. The stop leaves the claim's own custody hold open, so at
 the cap the run parks `recovery_wait` with `worker_requeue_exhausted` for an owner
