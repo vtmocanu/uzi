@@ -899,6 +899,130 @@ func TestCrossRunTargetEnumerationCancellationRetainsTuple(t *testing.T) {
 	}
 }
 
+// A witness whose target enumeration keeps failing or running out of phase
+// budget must not pin the repository cursor before it: a later legacy candidate
+// is reached within a bounded number of phases, and B is rediscovered after the
+// cursor wraps with an empty key and a fresh failure count.
+func TestCrossRunPersistentEnumerationFailureYieldsWitness(t *testing.T) {
+	for _, mode := range []string{"error", "deadline_before_query", "deadline_during_query"} {
+		t.Run(mode, func(t *testing.T) {
+			var reads []int64
+			var phase *mergeDeadlineContext
+			expire := func() {
+				expired, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Hour))
+				t.Cleanup(stop)
+				phase.Context = expired
+			}
+			s, token := mergeTestService(t, &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+				reads = append(reads, iid)
+				if mode == "deadline_before_query" && iid == 100 {
+					expire()
+				}
+				return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+			}})
+			repo := mergeID(1)
+			witness := crossRunRow(repo, 100, token)
+			q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{repo: {witness, mergeRow(repo, 200, token)}}}
+			enumerations := 0
+			q.targets = func(_ context.Context, p store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
+				enumerations++
+				if p.AfterRunID != uuid.Nil || p.AfterCreatedAt.Valid {
+					t.Fatal("failed enumeration advanced the target key")
+				}
+				if mode == "deadline_during_query" {
+					expire()
+					return []store.ListCrossRunTargetsRow{crossRunTarget(witness, 90)}, nil
+				}
+				return nil, errors.New("enumeration failed")
+			}
+			crossCalls := 0
+			sink := &mergeSink{cross: func(context.Context, recovery.CrossRunTargetBinding, recovery.VerifiedCrossRunWitnessSnapshot) (int64, error) {
+				crossCalls++
+				return 0, nil
+			}}
+			s.SetMergedPredecessorRecovery(q, sink)
+			s.merged.withTimeout = func(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+				if d == 30*time.Second {
+					phase = &mergeDeadlineContext{Context: ctx}
+					return phase, func() {}
+				}
+				// Observations stay independent so only the phase budget expires.
+				return context.WithTimeout(context.Background(), d)
+			}
+			// A fixed bound, not the constant: the limit itself is under test.
+			phases := 0
+			for phases < 4 && sink.calls == 0 {
+				phases++
+				s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+			}
+			if sink.calls != 1 || !slices.Contains(reads, 200) {
+				t.Fatalf("later legacy candidate starved behind failing witness: phases=%d enumerations=%d reads=%v", phases, enumerations, reads)
+			}
+			// A pre-query deadline exit fails before any enumeration is issued.
+			perFailure := 1
+			if mode == "deadline_before_query" {
+				perFailure = 0
+			}
+			if enumerations != perFailure*crossRunEnumerationFailureLimit || crossCalls != 0 {
+				t.Fatalf("enumerations=%d cross=%d; want %d and no settlement", enumerations, crossCalls, perFailure*crossRunEnumerationFailureLimit)
+			}
+			if _, pending := s.merged.targets[repo]; pending {
+				t.Fatal("yielded witness retained its continuation")
+			}
+			// The phase that reached the later candidate also wrapped the cursor,
+			// so the next phase rediscovers B.
+			s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+			if continuation := s.merged.targets[repo]; enumerations != perFailure*(crossRunEnumerationFailureLimit+1) ||
+				continuation.witness != witness.RunID || continuation.failures != 1 {
+				t.Fatalf("witness not rediscovered with a fresh count after wrap: enumerations=%d continuation=%+v", enumerations, continuation)
+			}
+		})
+	}
+}
+
+// Transient failures keep the tuple, and a successful enumeration resets the
+// consecutive-failure count, so interleaved failures never yield the witness.
+func TestCrossRunEnumerationSuccessResetsFailureCount(t *testing.T) {
+	s, token := mergeTestService(t, &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+		return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+	}})
+	repo := mergeID(1)
+	witness := crossRunRow(repo, 100, token)
+	first, second := crossRunTarget(witness, 90), crossRunTarget(witness, 80)
+	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{repo: {witness, mergeRow(repo, 200, token)}}}
+	results := []string{"fail", "fail", "first", "fail", "fail", "second"}
+	enumerations := 0
+	q.targets = func(_ context.Context, p store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
+		if enumerations >= len(results) {
+			t.Fatal("unexpected enumeration")
+		}
+		result := results[enumerations]
+		enumerations++
+		switch result {
+		case "first":
+			return []store.ListCrossRunTargetsRow{first}, nil
+		case "second":
+			if p.AfterRunID != first.RunID || p.AfterCreatedAt != first.CreatedAt {
+				t.Fatal("transient failure lost the target tuple")
+			}
+			return []store.ListCrossRunTargetsRow{second}, nil
+		}
+		return nil, errors.New("enumeration failed")
+	}
+	crossCalls := 0
+	sink := &mergeSink{cross: func(context.Context, recovery.CrossRunTargetBinding, recovery.VerifiedCrossRunWitnessSnapshot) (int64, error) {
+		crossCalls++
+		return 0, nil
+	}}
+	s.SetMergedPredecessorRecovery(q, sink)
+	for range results {
+		s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+	}
+	if crossCalls != 2 || sink.calls != 0 || s.merged.targets[repo].runID != second.RunID || s.merged.cursors[repo] != uuid.Nil {
+		t.Fatalf("interleaved transient failures yielded the witness: cross=%d legacy=%d continuation=%+v", crossCalls, sink.calls, s.merged.targets[repo])
+	}
+}
+
 func TestCrossRunRestartAndWitnessSnapshot(t *testing.T) {
 	var q *mergeCandidates
 	reads := 0

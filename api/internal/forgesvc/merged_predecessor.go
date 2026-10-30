@@ -28,7 +28,15 @@ type crossRunContinuation struct {
 	witness   uuid.UUID
 	createdAt pgtype.Timestamptz
 	runID     uuid.UUID
+	// Consecutive target-enumeration failures or phase-deadline exits for this
+	// witness. Reset by a successful enumeration or a different witness.
+	failures int
 }
+
+// After this many consecutive failures the witness cursor moves past B so later
+// candidates in the repository, legacy same-run discards included, progress.
+// B and its targets are rediscovered from an empty key after the cursor wraps.
+const crossRunEnumerationFailureLimit = 3
 
 type mergedPredecessorReconciler struct {
 	mu       sync.Mutex
@@ -57,7 +65,8 @@ func (s *Service) SetMergedPredecessorRecovery(q MergedPredecessorStore, r Merge
 // At most 100 repository visits and attempts share 30 seconds; each observation
 // gets at most five seconds and the client's existing timeout. Failures advance
 // attempted run cursors without blocking siblings. Cross-run targets retain the
-// witness cursor until exhausted; enumeration failures retain their continuation.
+// witness cursor until exhausted; enumeration failures retain their continuation
+// until crossRunEnumerationFailureLimit consecutive failures yield past the witness.
 // Exhaustion wraps only for a later phase, preventing repeats.
 func (s *Service) ReconcileMergedPredecessors(parent context.Context, repoIDs []uuid.UUID) {
 	m := &s.merged
@@ -218,6 +227,7 @@ func (s *Service) verifyMergedPredecessor(ctx context.Context, row store.ListMer
 		return
 	}
 	if ctx.Err() != nil {
+		m.crossRunEnumerationFailed(row, continuation)
 		return
 	}
 	targets, err := m.q.ListCrossRunTargets(ctx, store.ListCrossRunTargetsParams{
@@ -226,10 +236,12 @@ func (s *Service) verifyMergedPredecessor(ctx context.Context, row store.ListMer
 		AfterCreatedAt: continuation.createdAt, AfterRunID: continuation.runID,
 	})
 	if ctx.Err() != nil {
+		m.crossRunEnumerationFailed(row, continuation)
 		return
 	}
 	if err != nil {
 		slog.Warn("merged predecessor reconciliation refused", "run_id", row.RunID, "reason", "target_enumeration_failed")
+		m.crossRunEnumerationFailed(row, continuation)
 		return
 	}
 	if len(targets) == 0 {
@@ -251,4 +263,18 @@ func (s *Service) verifyMergedPredecessor(ctx context.Context, row store.ListMer
 	}, witness); err != nil {
 		slog.Warn("merged predecessor reconciliation refused", "run_id", row.RunID, "reason", "cross_run_settlement_refused")
 	}
+}
+
+// crossRunEnumerationFailed keeps the continuation for a transient failure and
+// yields the witness cursor past B once the consecutive-failure limit is reached.
+// The attempt-cap deferral is not a failure and never calls this.
+func (m *mergedPredecessorReconciler) crossRunEnumerationFailed(row store.ListMergedPredecessorCandidatesRow, continuation crossRunContinuation) {
+	continuation.failures++
+	if continuation.failures >= crossRunEnumerationFailureLimit {
+		slog.Warn("merged predecessor reconciliation refused", "run_id", row.RunID, "reason", "target_enumeration_yielded")
+		delete(m.targets, row.RepoID)
+		m.cursors[row.RepoID] = row.RunID
+		return
+	}
+	m.targets[row.RepoID] = continuation
 }
