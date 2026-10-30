@@ -4913,6 +4913,7 @@ export class SdkExecutor implements Executor {
     // entry only on a phase change (a re-driven turn of the same phase is a no-op); bounded to 3 s
     // inside the reporter, which never throws. A trip that landed meanwhile still wins below.
     let onRuntimeConfig: RunTurnRequest["onRuntimeConfig"];
+    let markObserved: (() => void) | undefined;
     if (ctx.leadConfig) {
       const reporter = ctx.leadConfig;
       const entry: PhaseEntry = await reporter.enterPhase(phase, state.leadRequest);
@@ -4921,8 +4922,10 @@ export class SdkExecutor implements Executor {
       const key = `${entry.phase}:${entry.entry}`;
       const seen = (state.observedEntries ??= new Set<string>());
       if (!seen.has(key)) {
-        // The key is spent when the harness actually delivers (an init arrived), not when the
-        // callback is handed over: a turn that yields no init and is retried keeps its chance.
+        // The key is spent when the lead init arrives (below), not when the callback is handed over:
+        // a turn that yields no init and is retried keeps its chance, and a later turn of the entry
+        // cannot start a second probe while the first turn's probe is still settling.
+        markObserved = () => seen.add(key);
         onRuntimeConfig = (obs) => {
           seen.add(key);
           try {
@@ -5011,6 +5014,7 @@ export class SdkExecutor implements Executor {
         }
         armIdle(); // any event is liveness when no tool is outstanding
         if (event.kind === "initialized") {
+          markObserved?.();
           if (event.sessionId) initSessionId = event.sessionId;
           if (event.freshSession === true) freshInit = true;
         } else if (event.sessionId && !(event.kind === "frame" && event.origin.kind === "subagent")) {

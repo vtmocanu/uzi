@@ -3149,6 +3149,26 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
     assert.equal(posts[1]!.observed_effort, "high");
   });
 
+  it("a slow settings probe does not let a later turn of the same entry probe again", async () => {
+    const { posts, make, rows } = reporterRig();
+    const { queryFn, settingsCalls } = observedTurns(
+      [
+        [initFrame(), submitPlan("v1"), resultSuccess()],
+        [initFrame(), submitPlan("v2"), resultSuccess()],
+        [initFrame({ effort: "low" }), signalDone(), resultSuccess()],
+      ],
+      () => new Promise((r) => setTimeout(() => r({ applied: { effort: "high" } }), 300)),
+    );
+    const { ctx } = makeCtx({ agents: [lead, coder], config: DEFAULT_CASE, leadConfig: make(DEFAULT_CASE) }, [revise, approve]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 4);
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(settingsCalls(), 1, "probe ran once per phase entry");
+    // The slow plan observation may land after implement began; it still attaches to plan entry 1.
+    assert.deepEqual([...rows()].sort(), ["implement#1/1", "implement#1/2", "plan#1/1", "plan#1/2"]);
+    assert.equal(posts.find((p) => p.phase === "plan" && p.seq === 2)!.observed_effort, "high");
+  });
+
   it("a re-driven implement turn keeps one reporter: the first turn's observation is row 2 and the re-drive adds none", async () => {
     const { posts, make, rows } = reporterRig();
     const { queryFn } = observedTurns([

@@ -11,7 +11,7 @@ const MAX_OBSERVED_MODEL_BYTES = 100;
 
 /** Control (Cc), format (Cf: bidi overrides, zero-width), replacement and whitespace characters,
  *  the same rejection set as the API's `agenttmpl.ValidateModel`. */
-const MODEL_REJECT_RE = /[\p{Cc}\p{Cf}\p{Cs}�\s]/u;
+const MODEL_REJECT_RE = /[\p{Cc}\p{Cf}\p{Cs}\uFFFD\s]/u;
 
 const KNOWN_LEVELS: ReadonlySet<string> = new Set([
   "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",

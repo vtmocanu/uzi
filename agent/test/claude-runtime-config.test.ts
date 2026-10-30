@@ -180,7 +180,7 @@ test("the probe never blocks the event stream: events finish while getSettings i
 });
 
 test("a model failing the stored-model rules is reported unknown", async () => {
-  for (const model of ["bad model", "claude\uD800x", "claude\uDC00", "claude�x"]) {
+  for (const model of ["bad model", "claude\uD800x", "claude\uDC00", "claude\uFFFDx"]) {
     const { obs } = await run({ frames: [init({ model, effort: "low" }), result] });
     assert.equal(obs[0]!.model, undefined, JSON.stringify(model));
     assert.equal(obs[0]!.modelEvidence, "unknown");
