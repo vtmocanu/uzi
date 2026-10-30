@@ -3545,9 +3545,10 @@ export class RunRunner {
     const ownedEpochs: Record<string, string> = {};
     for (const p of allPaths) { const epoch = authority.ownedSourceEpoch(p, sink); if (epoch !== undefined) ownedEpochs[p] = epoch; }
     if (!quiescent) {
-      // Not fatal: every admission names its path before it writes, so the snapshot still covers it and the end below takes A
-      // itself (a timed-out end is queued). Only the owned epochs may be short, which leaves the park record unwritten.
-      runLog.warn("source use end: an admission still held the authority lock at the barrier", { sources: paths.size });
+      // Not fatal, and fail closed: every admission names its path before it writes, so the snapshot still covers it. An
+      // admission still running here has no lease captured by the end below, so its key is kept (owned, never queued or
+      // ended) and no settlement can be written; the owned epochs may also be short, which leaves the park record unwritten.
+      runLog.warn("source use end: the admission barrier could not take the authority lock", { sources: paths.size });
     }
     if (flight.sourceTailsJoined !== true) {
       runLog.warn("source use left active: this flight's source-capable tails were not positively joined", {

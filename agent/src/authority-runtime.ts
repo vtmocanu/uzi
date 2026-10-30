@@ -344,7 +344,8 @@ export class AuthorityRuntime implements AuthorityScope {
    * and without opening the store) proves that an admission which passed its entry check before the retirement has
    * finished and added its path to the sink; one that starts later is refused. Resolves true when A was taken (or this
    * context already holds it, where no other admission can be running); false when A could not be taken within the
-   * wait, in which case the sink may still gain a path and the caller must not treat its snapshot as complete.
+   * wait (or the lock could not be verified), in which case the caller may rely only on the paths already named: an
+   * admission still running keeps its key owned and unended, so no settlement can cover an incomplete set.
    */
   async awaitSinkQuiescent(wait: AuthorityWait = {}): Promise<boolean> {
     if (this.active()) return true;
