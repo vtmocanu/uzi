@@ -148,16 +148,18 @@ This is not transport isolation: synchronous API requests can still occupy the
 existing watch job ceiling if a transport hangs. No new timeout or cancellation
 policy is introduced. The journal uses atomic replacement with file fsync;
 directory fsync and crash-resumable operation storage are not provided.
-New recovery writes require unchanged remote tag object/peeled SHA and, for a
+All writes in recovery mode, including ordinary publication retries, require
+unchanged remote tag object/peeled SHA and, for a
 stable, no newer stable. A 120-minute monotonic backstop starts with the watcher
 and forbids new writes only; it neither limits observation nor cancels remote
 runs. The existing shared 60-tick publication loop and 125-minute job ceiling
 remain; no subprocess timeout is introduced. A hung transport is bounded only
 by that enclosing job ceiling.
 
-The two new exceptions require the tagged workflow blob to equal the trusted
-controller's corresponding workflow blob, binding step meaning and dependent
-scope without a runtime YAML parser. A metadata-only RC normally matches, but
+KinD retries require the tagged KinD workflow blob to equal the trusted
+controller's KinD blob. Assertion recovery requires both KinD and release blobs
+to match, binding step meaning and dependent scope without a runtime YAML parser.
+A metadata-only RC normally matches, but
 workflow changes during tip reselection can also produce a mismatch. An older
 candidate promoted after workflow/digest changes likewise needs manual recovery
 for these exceptions. Watching/verification and ordinary publication-role retries

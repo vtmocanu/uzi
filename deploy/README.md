@@ -234,10 +234,13 @@ API request can still consume the existing watcher job ceiling; no new timeout
 or transport isolation is added.
 Terminal journal write failures preserve the publication result and label any
 surviving attempt records incomplete. Retry requests still require a saved reservation.
-The new exceptions require matching tagged/controller workflow definitions.
+KinD retries require matching tagged/controller KinD workflow definitions;
+assertion recovery requires both KinD and release definitions to match.
 Older candidates after workflow updates, or RC tips whose workflow changed during
 the wait, need manual exceptional recovery; normal watching and verification stay
-available. A watcher-start monotonic 120-minute backstop forbids new writes only,
+available. All writes in recovery mode, including ordinary publication retries,
+require unchanged remote tag identity and no superseding stable. A watcher-start
+monotonic 120-minute backstop forbids new writes only,
 with no remote cancellation or extra wait window. The shared 60-tick publication
 window and 125-minute job ceiling remain; transport hangs use that job ceiling.
 For deliberate local same-tag exceptional recovery, opt in with

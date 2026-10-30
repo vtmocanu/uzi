@@ -117,7 +117,7 @@ def validate(data):
     if not isinstance(data['state'], str) or data['state'] not in reasons or data['reason'] not in reasons[data['state']]:
         raise ValueError('invalid journal operation result')
     errors = data['publication_read_errors']
-    if not isinstance(errors, dict) or errors.keys() != {'release.yml', 'brew.yml'}:
+    if not isinstance(errors, dict) or errors.keys() != {'release.yml', 'brew.yml', 'kind-smoke.yml'}:
         raise ValueError('invalid publication read counters')
     for count in errors.values():
         integer(count, 0)
@@ -182,7 +182,7 @@ class Journal:
         self.data = dict(schema=2, operation=operation, repository=repository, tag=tag, sha=sha,
                          main_ci={'policy': 'report-only', 'state': 'unavailable'},
                          attempts=[], decisions=[], truncated=False, state='watching', reason='publication-pending',
-                         publication_read_errors={'release.yml': 0, 'brew.yml': 0})
+                         publication_read_errors={'release.yml': 0, 'brew.yml': 0, 'kind-smoke.yml': 0})
         self.save()
 
     def finish(self, state, reason):

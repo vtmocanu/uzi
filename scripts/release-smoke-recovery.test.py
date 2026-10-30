@@ -36,6 +36,31 @@ def smoke_jobs(failing_step='Create KinD cluster'):
 
 
 class Classification(unittest.TestCase):
+    def test_release_roles_match_current_workflow_and_matrix(self):
+        path = Path(__file__).parent.parent / '.github/workflows/release.yml'
+        program = 'puts YAML.safe_load(File.read(ARGV[0]), aliases: true).fetch("jobs").to_json'
+        graph = json.loads(subprocess.check_output(['ruby', '-ryaml', '-rjson', '-e', program, str(path)], text=True, timeout=60))
+        roles = set(graph) - {'publish-agent'}
+        templates = graph['publish-agent']['strategy']['matrix']['template']
+        self.assertEqual(set(templates), {'base', 'jvm'})
+        roles.update('publish-agent (' + template + ')' for template in templates)
+        self.assertEqual(roles, watch.RELEASE_SUCCESS_ROLES | watch.RELEASE_SKIPPED_ROLES | {'assert-tag-smoke'})
+        self.assertIn('assert-tag-smoke', graph['publish-chart']['needs'])
+        self.assertIn('publish-chart', graph['publish-release']['needs'])
+
+    def test_unknown_and_cancelled_step_conclusions_refuse_independently(self):
+        for conclusion in ['cancelled', 'neutral', 'unknown', None]:
+            jobs = smoke_jobs()
+            jobs[1]['steps'].append(step('Create KinD cluster', conclusion))
+            with self.subTest(conclusion=conclusion), self.assertRaises(watch.RecoveryRefusal):
+                watch.smoke_retry_job(run(), jobs)
+
+    def test_path_filter_and_real_failure_results_are_required(self):
+        for role, conclusion in [('changes', 'success'), ('kind-smoke', 'success'), ('kind-smoke', 'neutral'), ('kind-smoke', 'skipped')]:
+            jobs = [dict(item, conclusion=conclusion) if item['name'] == role else item for item in smoke_jobs()]
+            with self.subTest(role=role, conclusion=conclusion), self.assertRaises(watch.RecoveryRefusal):
+                watch.smoke_retry_job(run(), jobs)
+
     def test_targeted_scope_matches_current_transitive_dependents(self):
         root = Path(__file__).parent.parent
         program = 'puts YAML.safe_load(File.read(ARGV[0]), aliases: true).fetch("jobs").transform_values { |job| Array(job["needs"]) }.to_json'
@@ -111,6 +136,91 @@ class Classification(unittest.TestCase):
 
 
 class Recovery(unittest.TestCase):
+    def test_both_assertion_workflow_contracts_are_checked(self):
+        for workflow in ['release.yml', 'kind-smoke.yml']:
+            engine = self.fixture()
+            self.green_smoke()
+            def contract(name):
+                if name == workflow:
+                    raise watch.RecoveryRefusal('changed contract')
+            engine.require_contract.side_effect = contract
+            with self.subTest(workflow=workflow), self.assertRaises(watch.RecoveryRefusal):
+                engine.recover_assertion('20')
+            engine.gh.assert_not_called()
+
+    def test_job_only_cancellation_stops_owned_recovery(self):
+        engine = self.fixture()
+        engine.recovery_tick()
+        self.smoke_run = run(attempt=2)
+        self.smoke_jobs[1]['conclusion'] = 'cancelled'
+        with self.assertRaises(watch.RecoveryRefusal):
+            engine.track_recovery('kind-infra', self.smoke_run, self.smoke_jobs)
+        self.assertEqual(engine.gh.call_count, 1)
+        self.assertEqual(engine.smoke_remaining, 1)
+
+    def test_external_attempt_guards_are_independent(self):
+        engine = self.fixture()
+        engine.recovery_tick()
+        self.smoke_run = run(attempt=3)
+        with self.assertRaises(watch.RecoveryRefusal):
+            engine.track_recovery('kind-infra', self.smoke_run, self.smoke_jobs)
+        with self.assertRaises(watch.RecoveryRefusal):
+            engine.recovery_snapshot('kind-smoke.yml')
+        self.assertEqual(engine.gh.call_count, 1)
+
+    def test_human_rerun_after_completed_recovery_is_external(self):
+        engine = self.fixture()
+        engine.recovery_tick()
+        self.green_smoke()
+        self.smoke_run['run_attempt'] = 2
+        self.assertEqual(engine.recovery_tick(), 'green')
+        self.assertEqual(engine.recovery_requests, {})
+        self.smoke_run['run_attempt'] = 3
+        with self.assertRaises(watch.RecoveryRefusal):
+            engine.recovery_snapshot('kind-smoke.yml')
+        self.assertEqual(engine.gh.call_count, 1)
+
+    def test_own_publication_completion_updates_seen_epoch(self):
+        engine = self.fixture()
+        engine.recovery_seen['release.yml'] = (20, 1)
+        engine.requested['release.yml'] = (20, 1)
+        self.release_run = dict(self.release_run, run_attempt=2, conclusion='success')
+        self.release_jobs = [dict(item, conclusion='success', steps=[]) for item in self.release_jobs]
+        engine.record('release.yml', '20')
+        self.assertNotIn('release.yml', engine.requested)
+        self.assertEqual(engine.recovery_snapshot('release.yml')[0]['run_attempt'], 2)
+
+    def publication_poll(self, engine):
+        self.green_smoke()
+        engine.max_ticks = 2
+        self.release_jobs = [dict(item, conclusion='failure' if item['name'] == 'publish-api' else 'success', steps=[]) for item in self.release_jobs]
+        engine.resolve = lambda workflow: '20' if workflow == 'release.yml' else ''
+        engine.dump = lambda _identity: (0, '\n'.join(f"{item['status']}\t{item['conclusion']}\t{item['name']}\t{item['html_url']}" for item in self.release_jobs))
+
+    def test_publication_identity_read_failure_refuses_write_and_observes_success(self):
+        engine = self.fixture()
+        self.publication_poll(engine)
+        def unavailable():
+            self.release_jobs = [dict(item, conclusion='success') for item in self.release_jobs]
+            raise watch.RecoveryReadUnavailable('read unavailable')
+        engine.validate_identity.side_effect = unavailable
+        engine.resolve = lambda workflow: '20'
+        self.assertEqual(engine.poll(), 0)
+        engine.gh.assert_not_called()
+        self.assertEqual(engine.remaining['release.yml'], 2)
+
+    def test_other_assertion_name_never_enters_exception_route(self):
+        engine = self.fixture()
+        self.green_smoke()
+        engine.max_ticks = 1
+        self.release_jobs[-1]['name'] = 'assert-tag-smoke-other'
+        engine.resolve = lambda workflow: '20'
+        engine.dump = lambda _: (0, 'completed\tfailure\tassert-tag-smoke-other\thttps://example.invalid/job')
+        engine.recover_assertion = Mock(return_value=True)
+        self.assertEqual(engine.poll(), 1)
+        engine.recover_assertion.assert_not_called()
+        engine.gh.assert_not_called()
+
     def fixture(self):
         self.now = 0
         engine = watch.Watcher('0.2.0', sleep=lambda _: None, clock=lambda: self.now)
@@ -123,7 +233,10 @@ class Recovery(unittest.TestCase):
         self.release_run = dict(run('failure'), id=20)
         self.release_jobs = [job(name, 'success', identity=200 + i, steps=[])
                              for i, name in enumerate(['prep', 'assert-version', 'assert-changelog', 'assert-ci-coverage',
-                                                        'assert-release-metadata', 'assert-worker-pin', 'assert-agent-version'])]
+                                                        'assert-release-metadata', 'assert-worker-pin', 'assert-agent-version',
+                                                        'publish-api', 'publish-web', 'publish-controller',
+                                                        'publish-agent (base)', 'publish-agent (jvm)'])]
+        self.release_jobs += [job('publish-chart', 'skipped', 297, []), job('publish-release', 'skipped', 298, [])]
         self.release_jobs += [job('assert-tag-smoke', identity=299, steps=[step('Require the real tagged KinD smoke job')])]
         engine.main_api.run.side_effect = lambda workflow, *_: self.smoke_run if workflow == 'kind-smoke.yml' else self.release_run
         engine.snapshot = Mock(side_effect=lambda workflow, *_args, **_kwargs:
@@ -287,7 +400,7 @@ class Recovery(unittest.TestCase):
         self.assertEqual(engine.recovery_tick(), 'green')
         engine.recover_assertion('20')
         self.release_run = dict(self.release_run, run_attempt=2, conclusion='success')
-        self.release_jobs[-1] = dict(self.release_jobs[-1], conclusion='success', steps=[])
+        self.release_jobs = [dict(item, conclusion='success', steps=[]) for item in self.release_jobs]
         engine.track_recovery('tag-smoke-assertion', self.release_run, self.release_jobs)
         self.assertEqual((engine.smoke_remaining, engine.assert_remaining), (1, 0))
         self.assertEqual(engine.remaining, {'release.yml': 2, 'brew.yml': 2})
@@ -317,7 +430,7 @@ class Recovery(unittest.TestCase):
                 self.smoke_run['run_attempt'] = 2
             elif '/299/' in endpoint:
                 self.release_run = dict(self.release_run, run_attempt=2, conclusion='success')
-                self.release_jobs[-1] = dict(self.release_jobs[-1], conclusion='success', steps=[])
+                self.release_jobs = [dict(item, conclusion='success', steps=[]) for item in self.release_jobs]
             else:
                 self.fail(f'non-targeted recovery request: {args}')
             return 0, '', ''
@@ -401,12 +514,56 @@ class Recovery(unittest.TestCase):
         engine.gh.assert_not_called()
         self.assertEqual(engine.smoke_remaining, 2)
 
-    def test_unreadable_run_selection_is_instrument_failure_without_remote_write(self):
+    def test_unreadable_observation_is_pending_and_counted_without_remote_write(self):
         engine = self.fixture()
         engine.main_api.run.side_effect = watch.evidence.Refusal('fixture unavailable')
-        self.assertEqual(engine.run(), 3)
+        self.assertEqual(engine.recovery_tick(), 'pending')
+        engine.journal.read_unavailable.assert_called_once_with('kind-smoke.yml')
         engine.gh.assert_not_called()
         self.assertEqual(engine.smoke_remaining, 2)
+
+    def test_assertion_requires_full_supported_role_multiset_and_results(self):
+        for changed in ('missing', 'unknown', 'duplicate', 'skipped', 'neutral', 'dependent-success', 'dependent-neutral'):
+            with self.subTest(changed=changed):
+                engine = self.fixture()
+                self.green_smoke()
+                if changed == 'missing':
+                    self.release_jobs = [item for item in self.release_jobs if item['name'] != 'publish-api']
+                elif changed == 'unknown':
+                    self.release_jobs += [job('surprise-role', 'success', 999, [])]
+                elif changed == 'duplicate':
+                    self.release_jobs += [job('publish-api', 'success', 999, [])]
+                elif changed.startswith('dependent-'):
+                    self.release_jobs = [dict(item, conclusion=changed.split('-', 1)[1]) if item['name'] == 'publish-chart' else item for item in self.release_jobs]
+                else:
+                    self.release_jobs = [dict(item, conclusion=changed) if item['name'] == 'publish-api' else item for item in self.release_jobs]
+                with self.assertRaises(watch.RecoveryRefusal):
+                    engine.recover_assertion('20')
+                engine.gh.assert_not_called()
+
+    def test_publication_expiry_during_reservation_keeps_observing_without_post(self):
+        engine = self.fixture()
+        self.green_smoke()
+        self.now, engine.max_ticks = 7199, 2
+        self.release_jobs[-1] = dict(self.release_jobs[-1], conclusion='success', steps=[])
+        self.release_jobs = [dict(item, conclusion='failure') if item['name'] == 'publish-api' else item for item in self.release_jobs]
+        engine.resolve = lambda workflow: '20' if workflow == 'release.yml' else '30'
+        engine.wait_requeued = Mock()
+        def dump(identity):
+            if identity == '30':
+                return 0, 'completed\tsuccess\tpublish-formula\thttps://example.invalid/job'
+            return 0, '\n'.join(f"{item['status']}\t{item['conclusion']}\t{item['name']}\t{item['html_url']}" for item in self.release_jobs)
+        engine.dump = dump
+        def saved(*args, **_kwargs):
+            if args[-1] == 'reserved':
+                self.now = 7201
+            if args[-1] == 'blocked':
+                self.release_run = dict(self.release_run, conclusion='success')
+                self.release_jobs = [dict(item, conclusion='success', steps=[]) for item in self.release_jobs]
+        engine.journal.decision.side_effect = saved
+        self.assertEqual(engine.poll(), 0)
+        engine.gh.assert_not_called()
+        self.assertEqual(engine.remaining['release.yml'], 1)
 
     def test_deadline_also_fences_ordinary_publication_retry(self):
         engine = self.fixture()

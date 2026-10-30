@@ -26,10 +26,19 @@ SMOKE_INFRA_STEPS = {'Set up job', 'Create KinD cluster', 'Load images into kind
 ASSERT_SMOKE_STEPS = {'Set up job', 'Require the real tagged KinD smoke job'}
 SMOKE_AFFECTED_JOBS = ['kind-smoke', 'kind-smoke-gate']
 ASSERT_AFFECTED_JOBS = ['assert-tag-smoke', 'publish-chart', 'publish-release']
+RELEASE_SUCCESS_ROLES = {'prep', 'assert-version', 'assert-changelog', 'assert-ci-coverage',
+                         'assert-release-metadata', 'assert-worker-pin', 'assert-agent-version',
+                         'publish-api', 'publish-web', 'publish-controller',
+                         'publish-agent (base)', 'publish-agent (jvm)'}
+RELEASE_SKIPPED_ROLES = {'publish-chart', 'publish-release'}
 
 
 class RecoveryRefusal(ValueError):
     """New recovery proof is absent, ambiguous, cancelled or outside its policy."""
+
+
+class RecoveryReadUnavailable(ValueError):
+    """A read did not establish identity; never permission to send a write."""
 
 
 def failed_steps(job, allowed, allow_checkout=True):
@@ -156,9 +165,11 @@ class Watcher:
         self.smoke_remaining, self.assert_remaining = 2, 1
         self.recovery_requests = {}
         self.recovery_seen = {}
+        # CLI exits on an uncertain POST; this also fences in-process reuse.
         self.recovery_uncertain = False
         self.tag_oid = None
         self.refs_policy = None
+        self.refused_publication_writes = set()
 
     def enable_recovery(self, tag_oid):
         if (self.journal is None or not isinstance(tag_oid, str) or not re.fullmatch(r'[0-9a-f]{40}', tag_oid)
@@ -169,7 +180,7 @@ class Watcher:
     def git(self, *args):
         result = subprocess.run(['git', '-c', 'core.fsmonitor=false', *args], capture_output=True, text=True, check=False)
         if result.returncode:
-            raise RecoveryRefusal('cannot validate recovery refs or workflow')
+            raise RecoveryReadUnavailable('cannot read recovery refs or workflow')
         return result.stdout.strip()
 
     def validate_identity(self):
@@ -178,7 +189,7 @@ class Watcher:
         try:
             refs = self.refs_policy.inventory(self.git('ls-remote', '--heads', '--tags', 'origin'))
         except (self.refs_policy.Stop, ValueError, KeyError, TypeError) as error:
-            raise RecoveryRefusal('recovery refs unavailable') from error
+            raise RecoveryReadUnavailable('recovery refs unavailable') from error
         if refs['tags'].get(self.tag) != self.sha or refs['tag_oids'].get(self.tag) != self.tag_oid:
             raise RecoveryRefusal('recovery tag identity changed')
         if self.kind == 'stable' and refs['previous_stable'] != self.tag:
@@ -295,7 +306,17 @@ class Watcher:
     def recovery_tick(self):
         if self.recovery_uncertain:
             raise RecoveryRefusal('previous recovery POST unconfirmed')
-        observed = self.recovery_snapshot('kind-smoke.yml')
+        try:
+            observed = self.recovery_snapshot('kind-smoke.yml')
+        except RecoveryRefusal:
+            raise
+        except (ValueError, KeyError, TypeError, AttributeError, OSError):
+            try:
+                self.journal.read_unavailable('kind-smoke.yml')
+            except (ValueError, KeyError, TypeError, OSError):
+                pass
+            print('release-watch: tagged smoke observation unavailable; waiting', file=sys.stderr)
+            return 'pending'
         if observed is None:
             return 'pending'
         run, jobs = observed
@@ -321,12 +342,15 @@ class Watcher:
 
     def assertion_candidate(self, run, jobs):
         target = assertion_retry_job(run, jobs)
-        required = {'prep', 'assert-version', 'assert-changelog', 'assert-ci-coverage',
-                    'assert-release-metadata', 'assert-worker-pin', 'assert-agent-version'}
-        for name in required:
-            matches = [job for job in jobs if job['name'] == name]
-            if len(matches) != 1 or matches[0]['conclusion'] != 'success':
+        roles = {job['name']: job for job in jobs}
+        expected = RELEASE_SUCCESS_ROLES | RELEASE_SKIPPED_ROLES | {'assert-tag-smoke'}
+        if len(roles) != len(jobs) or roles.keys() != expected:
+            raise RecoveryRefusal('unsupported or incomplete release role set')
+        for name in RELEASE_SUCCESS_ROLES:
+            if roles[name]['conclusion'] != 'success':
                 raise RecoveryRefusal('independent publication prerequisite not successful')
+        if any(roles[name]['conclusion'] != 'skipped' for name in RELEASE_SKIPPED_ROLES):
+            raise RecoveryRefusal('unexpected downstream release result')
         return target
 
     def recover_assertion(self, run_id):
@@ -455,6 +479,8 @@ class Watcher:
             self.journal.decision(workflow, run['id'], run['run_attempt'], 'publication-role',
                                   self.remaining[workflow], self.remaining[workflow], state)
             del self.requested[workflow]
+            if self.recovering:
+                self.recovery_seen[workflow] = run['id'], run['run_attempt']
         return run, jobs
 
     def observe(self, workflow, run_id, required=False):
@@ -597,8 +623,18 @@ class Watcher:
                     if (snapshot['status'] != 'completed' or not terminal_jobs(current_jobs)
                             or sorted(current) != sorted(failures)):
                         raise ValueError('publication failure changed before retry')
-                if self.recovering and not self.can_write():
-                    continue
+                if self.recovering:
+                    write_key = workflow, int(run), snapshot['run_attempt']
+                    if write_key in self.refused_publication_writes:
+                        continue
+                    try:
+                        allowed = self.can_write()
+                    except RecoveryReadUnavailable:
+                        self.refused_publication_writes.add(write_key)
+                        print('release-watch: publication identity unavailable; observing without retry', file=sys.stderr)
+                        continue
+                    if not allowed:
+                        continue
                 print(f'=== {workflow} run {run}: transient failure, auto-rerunning ({remaining} rerun(s) left for {workflow}) ===')
                 for name, url in failures:
                     print(f'  rerun <- {name:<28} {url}')
@@ -608,6 +644,10 @@ class Watcher:
                 if snapshot:
                     self.journal.decision(workflow, int(run), snapshot['run_attempt'], 'publication-role',
                                           remaining, self.remaining[workflow], 'reserved')
+                if self.recovering and self.clock() - self.started >= 7200:
+                    self.journal.decision(workflow, int(run), snapshot['run_attempt'], 'publication-role',
+                                          self.remaining[workflow], self.remaining[workflow], 'blocked')
+                    continue
                 status, _, _ = self.gh('run', 'rerun', run, '--failed')
                 if snapshot:
                     self.journal.decision(workflow, int(run), snapshot['run_attempt'], 'publication-role',
