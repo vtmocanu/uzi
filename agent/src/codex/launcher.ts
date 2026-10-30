@@ -2275,7 +2275,7 @@ function validToken(token: string): boolean {
 type OneLineRun =
   | { readonly kind: "done"; readonly line: string | undefined; readonly code: number | null; readonly breach?: string }
   | StillRunningMode
-  | { readonly kind: "spawn"; readonly message: string };
+  | { readonly kind: "spawn"; readonly message: string; readonly live?: StillRunningBase };
 type CompletedOneLineRun = Extract<OneLineRun, { kind: "done" }>;
 /** `exited` resolves at the child's `exit` (the process is reaped; its stdout may still be held
  *  open by another writer, so `closed` may never follow); `hasExited` is the same fact read
@@ -2340,19 +2340,25 @@ function runOneLineMode(
       settle({ kind: "spawn", message: error instanceof Error ? error.message : String(error) });
       return;
     }
-    child.on("error", (err: Error) => settle({ kind: "spawn", message: err.message }));
+    // A failure after a process exists (it has a pid) carries `live`, so a caller that owns the
+    // helper's lifetime can still wait for its actual end.
+    const failed = (message: string): OneLineRun =>
+      child?.pid !== undefined ? { kind: "spawn", message, live: running() } : { kind: "spawn", message };
+    child.on("error", (err: Error) => settle(failed(err.message)));
     child.once("exit", () => { exitSeen = true; markExited(); });
-    if (!child.stdout) {
-      settle({ kind: "spawn", message: "no stdout channel" });
-      return;
-    }
-    readModeLines(child.stdout, 1, (line) => lines.push(line), (why) => { breach = why; });
-    child.once("close", (code: number | null) => {
+    const onClose = (code: number | null): void => {
       markClosed();
       const outcome: CompletedOneLineRun = { kind: "done", line: lines.length === 1 ? lines[0] : undefined, code, ...(breach ? { breach } : {}) };
       complete(outcome);
       settle(outcome);
-    });
+    };
+    if (!child.stdout) {
+      child.once("close", onClose);
+      settle(failed("no stdout channel"));
+      return;
+    }
+    readModeLines(child.stdout, 1, (line) => lines.push(line), (why) => { breach = why; });
+    child.once("close", onClose);
   });
 }
 
@@ -2836,7 +2842,7 @@ const MEASURE_STDOUT_DRAIN_MS = 2000;
 
 /** Resolves at the helper's `close`, or MEASURE_STDOUT_DRAIN_MS-bounded after its `exit`
  *  (destroying stdout). Never rejects. */
-function helperEnded(run: StillRunningMode, drainMs: number): Promise<void> {
+function helperEnded(run: StillRunningBase, drainMs: number): Promise<void> {
   return new Promise((resolve) => {
     let done = false;
     let timer: NodeJS.Timeout | undefined;
@@ -2892,8 +2898,10 @@ function parseMeasureLine(line: string, code: number | null): CacheMeasureResult
  * enough: it waits for every stdout writer, and a same-uid peer holding a duplicate of the write
  * end (possible before the helper's PR_SET_DUMPABLE) would hold the slot forever. A reaped helper
  * can no longer read the cache. Residual: that peer may keep the pipe open after the settlement.
- * An abort while queued is `cancelled` and spawns nothing; a delivery timeout or an abort after
- * the spawn is `unknown` carrying that `settlement`. Only an exact complete line with exit 0 is
+ * An abort while queued is `cancelled` and spawns nothing; a delivery timeout, an abort after
+ * the spawn, or a child `error` / missing stdout once a process exists is `unknown` carrying that
+ * `settlement` (reason `spawn` / `spawn_unkilled` for the last two). Only a spawn that created no
+ * process is `unknown(spawn)` with the slot given back at once. Only an exact complete line with exit 0 is
  * `complete`; everything else is `unknown`. Never throws.
  */
 export async function measureCommandCache(token: string, deps: MeasureDeps = {}): Promise<CacheMeasureResult> {
@@ -2906,27 +2914,29 @@ export async function measureCommandCache(token: string, deps: MeasureDeps = {})
   try {
     if (deps.signal?.aborted) return { state: "cancelled" };
     const run = await runOneLineMode("--measure-cache", token, deps.timeoutMs ?? DEFAULT_MEASURE_TIMEOUT_MS, deps, deps.signal);
-    if (run.kind === "spawn") return { state: "unknown", reason: "spawn" };
-    if (run.kind === "timeout" || run.kind === "aborted") {
-      // Aborted with nothing spawned (no completion): a clean cancel.
-      if (run.kind === "aborted" && run.completion === undefined) return { state: "cancelled" };
+    // Only a failure that created no process gives the slot back at once.
+    if (run.kind === "spawn" && run.live === undefined) return { state: "unknown", reason: "spawn" };
+    // Aborted with nothing spawned (no completion): a clean cancel.
+    if (run.kind === "aborted" && run.completion === undefined) return { state: "cancelled" };
+    const live = run.kind === "spawn" ? run.live : run.kind === "timeout" || run.kind === "aborted" ? run : undefined;
+    if (live !== undefined) {
       // The helper may still run (or be stopped): kill it as the command uid, and keep the
       // slot until it actually closes.
       held = false;
-      const settlement = helperEnded(run, deps.drainMs ?? MEASURE_STDOUT_DRAIN_MS).then(release, release);
+      const settlement = helperEnded(live, deps.drainMs ?? MEASURE_STDOUT_DRAIN_MS).then(release, release);
       // Kill only while no `exit` has been observed, in this one synchronous section: after
       // `exit` the pid may belong to a live command. libuv can reap a child a few microtasks
       // before its `exit` is emitted, so a kill in that window may reach a free pid (reported
       // *_unkilled); reuse would need the pid space to wrap in between. An already-exited
       // helper counts as ended.
-      let killed = run.hasExited();
-      if (!killed && run.pid !== undefined) {
+      let killed = live.hasExited();
+      if (!killed && live.pid !== undefined) {
         const kill = deps.killAsCommandUid ?? ((pid: number) => defaultKillAsCommandUid(pid, deps.runKill ?? defaultRunKill));
-        try { killed = kill(run.pid) === true; } catch { killed = false; }
+        try { killed = kill(live.pid) === true; } catch { killed = false; }
       }
-      const base = run.kind === "timeout" ? "timeout" : "aborted";
-      return { state: "unknown", reason: killed ? base : `${base}_unkilled`, settlement };
+      return { state: "unknown", reason: killed ? run.kind : `${run.kind}_unkilled`, settlement };
     }
+    if (run.kind !== "done") return { state: "unknown", reason: "protocol" };
     if (run.breach !== undefined || run.line === undefined) return { state: "unknown", reason: "protocol" };
     return parseMeasureLine(run.line, run.code);
   } catch {

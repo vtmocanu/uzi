@@ -32,6 +32,8 @@ import {
 const BUDGET = 1000;
 const WAITS = { releaseMs: 25, removeMs: 25 };
 const REMOVED: CacheCleanupResult = { state: "removed", reason: "" };
+/** A lost holder's actual close: the helper exited without a cleanup line. */
+const EXITED: CacheCleanupResult = { state: "error", reason: "exited" };
 const flush = (): Promise<void> => new Promise<void>((r) => setImmediate(r));
 const flushMany = async (n = 4): Promise<void> => { for (let i = 0; i < n; i++) await flush(); };
 
@@ -587,6 +589,51 @@ describe("command cache rotation (issue #3675)", () => {
       assert.deepEqual(g2.releases, [false]);
     });
 
+    it("a lost G2 holding an unproven poisoned registry is retained without a removal; the seal is unproven", async () => {
+      const r = rig();
+      await runRoot(r.cache);
+      const g2 = fakeHolder();
+      const g2Close = deferred<CacheCleanupResult>();
+      r.measures.at(-1)!.resolve(OVER);
+      await flushMany();
+      r.starts[0]!.ready(g2, g2Close.promise);
+      await flushMany();
+      assert.deepEqual(r.g1.releases, [true], "G1 retired cleanly before the poison");
+      const late = new ExecutionRegistry(newLocalExecutionEpoch(3678));
+      r.cache.watchRegistry(late);
+      late.poison({ category: "protocol", message: "poisoned after rotation" });
+      g2.die();
+      g2Close.resolve(EXITED);
+      assert.equal(r.cache.reserve(), undefined, "holder loss is the uncached fallback");
+      assert.equal((await r.seal()).kind, "unproven", "lost and not drained: retained and distrusted, as today");
+      assert.deepEqual(r.removals, [], "a generation without accepted proof is never removed");
+      assert.deepEqual(g2.releases, []);
+    });
+
+    it("after G2 holder loss, a verified removal seals clean, but an independent distrust before terminal cleanup still wins", async () => {
+      for (const distrust of [false, true]) {
+        const r = rig();
+        await runRoot(r.cache);
+        const g2 = fakeHolder();
+        const g2Close = deferred<CacheCleanupResult>();
+        r.measures.at(-1)!.resolve(OVER);
+        await flushMany();
+        r.starts[0]!.ready(g2, g2Close.promise);
+        await flushMany();
+        assert.deepEqual(r.g1.releases, [true]);
+        assert.equal(await runRoot(r.cache), g2.dir);
+        r.measures.at(-1)!.resolve(UNDER);
+        await flushMany();
+        g2.die();
+        g2Close.resolve(EXITED);
+        assert.equal(r.cache.reserve(), undefined, "commands after the loss run uncached");
+        if (distrust) r.lifetime.distrust();
+        const sealed = await r.seal();
+        assert.deepEqual(r.removals, [g2.token], `distrust=${String(distrust)}: the drained lost generation is removed by token`);
+        assert.equal(sealed.kind, distrust ? "unproven" : "sealed", "a successful removal never clears an independent distrust");
+      }
+    });
+
     it("G1 to G2 to G3: each is retired once, only own tokens are touched", async () => {
       const r = rig();
       await runRoot(r.cache);
@@ -814,12 +861,15 @@ describe("command cache rotation with the real measurement helper (issue #3675)"
     const h = helpers();
     const deliveries: Promise<CacheMeasureResult>[] = [];
     const limiter = createMeasureLimiter();
+    // Record kills instead of the production command-uid kill: the fake pid is not ours.
+    const kills: number[] = [];
+    const killAsCommandUid = (pid: number): boolean => { kills.push(pid); return true; };
     const make = () => {
       const base = rig();
       const options: CacheRotationOptions = {
         ...base.options,
         measure: (token, signal) => {
-          const delivery = measureCommandCache(token, { spawn: h.spawn, signal, limiter, timeoutMs });
+          const delivery = measureCommandCache(token, { spawn: h.spawn, signal, limiter, timeoutMs, killAsCommandUid });
           deliveries.push(delivery);
           return delivery;
         },
@@ -831,11 +881,11 @@ describe("command cache rotation with the real measurement helper (issue #3675)"
         async (t) => { base.removals.push(t); return REMOVED; }, WAITS);
       return { ...base, cache, lifetime, options, settle, seal: () => lifetime.seal({}, settle, () => true) };
     };
-    return { h, a: make(), b: make(), deliveries };
+    return { h, a: make(), b: make(), deliveries, kills };
   }
 
   it("a measurement delivery timeout holds the worker slot and pins its generation until the helper really closes", async () => {
-    const { h, a, b, deliveries } = twoCaches();
+    const { h, a, b, deliveries, kills } = twoCaches();
     await runRoot(a.cache);
     await runRoot(b.cache);
     await flushMany();
@@ -845,6 +895,7 @@ describe("command cache rotation with the real measurement helper (issue #3675)"
     await flushMany();
     assert.equal(a.starts.length, 1, "unknown rotates");
     assert.equal(h.procs.length, 1, "the slot is held past the delivery timeout");
+    assert.deepEqual(kills, [h.procs[0]!.pid], "the timed-out helper is killed through the injected command-uid kill");
     const g2 = fakeHolder();
     a.starts[0]!.ready(g2, deferred<CacheCleanupResult>().promise);
     await flushMany();
@@ -861,7 +912,7 @@ describe("command cache rotation with the real measurement helper (issue #3675)"
   });
 
   it("a measurement timeout followed by terminal teardown chains the release after the close; the seal stays pending until then", async () => {
-    const { h, a, deliveries } = twoCaches();
+    const { h, a, deliveries, kills } = twoCaches();
     await runRoot(a.cache);
     assert.equal((await deliveries[0]!).state, "unknown");
     await flushMany();
@@ -872,7 +923,8 @@ describe("command cache rotation with the real measurement helper (issue #3675)"
     assert.deepEqual(a.g1.releases, [], "nothing is deleted before the helper closes");
     assert.deepEqual(a.removals, []);
     assert.equal(await pending(sealing), true);
-    assert.equal(h.procs[0]!.killed, 0, "the helper is never killed");
+    assert.deepEqual(kills, [h.procs[0]!.pid], "the kill goes only through the injected command-uid kill");
+    assert.equal(h.procs[0]!.killed, 0, "never through ChildProcess.kill");
     a.starts[0]!.fail(new CommandCacheStartError("timeout"));
     h.procs[0]!.finish(0);
     assert.equal((await sealing).kind, "sealed");
