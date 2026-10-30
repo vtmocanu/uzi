@@ -1,6 +1,7 @@
 package recovery
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -39,11 +40,29 @@ func crossRunExtraGroups(t *testing.T) {
 }
 
 // The witness has no custody or other dependants. Choose its ordering before
-// taking the verified snapshot, never rewrite a frozen binding.
+// taking the verified snapshot, never rewrite a frozen binding. The ID sorts
+// immediately below (low) or above the target in byte order: it copies the
+// target's prefix, steps the first adjustable byte and keeps a fresh random
+// suffix, so it is unique per test in the shared store-IT database.
 func crossRunOrderWitness(e *inventoryEnv, witness uuid.UUID, b map[string]any, low bool) uuid.UUID {
-	id := uuid.MustParse("ffffffff-ffff-ffff-ffff-ffffffffffff")
-	if low {
-		id = uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	id := uuid.New()
+	adjusted := false
+	for i := range e.run {
+		if low && e.run[i] > 0x00 {
+			copy(id[:i], e.run[:i])
+			id[i] = e.run[i] - 1
+			adjusted = true
+			break
+		}
+		if !low && e.run[i] < 0xff {
+			copy(id[:i], e.run[:i])
+			id[i] = e.run[i] + 1
+			adjusted = true
+			break
+		}
+	}
+	if !adjusted || (bytes.Compare(id[:], e.run[:]) < 0) != low {
+		e.t.Fatalf("cannot order witness %s against target %s (low=%t)", id, e.run, low)
 	}
 	e.exec("UPDATE runs SET id=$2 WHERE id=$1", witness, id)
 	e.t.Cleanup(func() {
