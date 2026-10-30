@@ -89,7 +89,7 @@ export interface RetirementScope {
   /** Never writes. Throws AuthorityRefusal for a source that is not published or retiring under this store. */
   inspect(value: unknown): Promise<RetirementView>;
   /**
-   * Never writes. Whether ANY authority slot (in any state) covers `clonePath`, read under the active transaction A.
+   * Writes no slot or record (it may create the private slots directory, like `inspect`). Whether ANY authority slot (in any state) covers `clonePath`, read under the active transaction A.
    * Optional so a unit-test double need not carry it; a caller that needs the answer treats its absence as unknown.
    */
   slotExists?(clonePath: string): Promise<boolean>;

@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import type { CompletionSourceFence } from "../src/completion-source.js";
+import { AuthorityLockBusy, AuthorityRefusal } from "../src/authority-lock.js";
+import { parseCompletionSourceV2, type CompletionSourceFence } from "../src/completion-source.js";
+import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
+import { nullLogger } from "./helpers.js";
 import type { HandoffRetirement, HandoffRetirementInput } from "../src/recovery.js";
 import { git, installHarness } from "./runner-harness.js";
 import {
@@ -374,5 +377,92 @@ describe("retireCompletedSourceForHandoff: seams", linux, () => {
     assert.equal(fs.existsSync(r.clone), false);
     assert.deepEqual(result, { kind: "invalid", why: "no_authority_record" });
     assert.equal(journalRaw(r), "");
+  });
+
+  it("an AuthorityLockBusy raised once A is held propagates: it is not the acquisition's authority_busy", async t => {
+    const r = await published(t);
+    const c = claimant(r);
+    const files = snapshotFiles(r);
+    const journal = journalRaw(r);
+    Object.assign(c.p.recovery, { testHooks: { afterHandoffSelect: async () => { throw new AuthorityLockBusy(); } } });
+    await assert.rejects(c.handoff(), err => err instanceof AuthorityLockBusy);
+    await assertUntouched(r, files, journal);
+  });
+});
+
+describe("retireCompletedSourceForHandoff: refusal and guard classification", linux, () => {
+  const refusals: Array<[string, () => Error, HandoffRetirement]> = [
+    ["a source that is not the published source", () => new AuthorityRefusal("completion source is not the published source", "source_mismatch"),
+      { kind: "invalid", why: "unverified" }],
+    ["a malformed source", () => new AuthorityRefusal("malformed completion source", "source_mismatch"), { kind: "invalid", why: "unverified" }],
+    ["no authority slot", () => new AuthorityRefusal("no authority slot covers the source", "no_slot"), { kind: "invalid", why: "unverified" }],
+    ["an unresolved operation on the retiring source", () => new AuthorityRefusal("an operation on the retiring source is unresolved", "operation_unresolved"),
+      { kind: "pending", why: "unresolved_operation" }],
+    ["an untyped failure", () => new Error("EIO: injected"), { kind: "uncertain", why: "verify_error" }],
+  ];
+  for (const mode of ["retire", "classify"] as const) {
+    for (const [name, make, expected] of refusals) {
+      it(`${mode}: ${name} is ${expected.kind} and nothing changes`, async t => {
+        const r = await published(t);
+        const c = claimant(r);
+        const files = snapshotFiles(r);
+        const journal = journalRaw(r);
+        const slot = await slotVia(c.rt, r.clone);
+        (c.rt.retirement as { inspect: unknown }).inspect = async () => { throw make(); };
+        assert.deepEqual(await c.handoff({ mode }), expected);
+        await assertUntouched(r, files, journal);
+        assert.deepEqual(await slotVia(c.rt, r.clone), slot, "the slot is untouched");
+      });
+    }
+  }
+
+  it("the typed kind is carried by the real parser for a malformed source", () => {
+    assert.throws(() => parseCompletionSourceV2({}, { dataDir: "/x", storageId: "s", layout: "l" } as never),
+      err => err instanceof AuthorityRefusal && err.kind === "source_mismatch");
+  });
+
+  it("a preflight that does not verify is pending/preflight and nothing changes", async t => {
+    const r = await published(t);
+    const c = claimant(r);
+    const files = snapshotFiles(r);
+    const journal = journalRaw(r);
+    const real = (git.cleanupRecoveryGeneration as (...a: unknown[]) => Promise<unknown>).bind(git);
+    t.mock.method(git, "cleanupRecoveryGeneration", (async (...args: unknown[]) => args[7] === "completion-check" ? "retained" : real(...args)) as never);
+    assert.deepEqual(await c.handoff(), { kind: "pending", why: "preflight" });
+    await assertUntouched(r, files, journal);
+  });
+
+  it("the worker residue quarantine is pending/quarantine and nothing changes", async t => {
+    const r = await published(t);
+    const c = claimant(r);
+    const files = snapshotFiles(r);
+    const journal = journalRaw(r);
+    t.after(() => resetResidueQuarantineForTests());
+    latchResidueQuarantine({ cause: "handoff fixture", site: "terminal_drive", runId: r.runId }, nullLogger());
+    assert.deepEqual(await c.handoff(), { kind: "pending", why: "quarantine" });
+    await assertUntouched(r, files, journal);
+  });
+
+  for (const mode of ["retire", "classify"] as const) {
+    it(`${mode}: a coordinator that cannot read the journal fence is unsupported/no_retirement_scope`, async t => {
+      const r = await published(t);
+      const c = claimant(r);
+      const files = snapshotFiles(r);
+      const journal = journalRaw(r);
+      const original = git.readCompletionSourceFence;
+      t.after(() => { Object.assign(git, { readCompletionSourceFence: original }); });
+      Object.assign(git, { readCompletionSourceFence: undefined });
+      assert.deepEqual(await c.handoff({ mode }), { kind: "unsupported", why: "no_retirement_scope" });
+      await assertUntouched(r, files, journal);
+    });
+  }
+
+  it("a throw inside the boundary action is pending/action_failed, not uncertain/boundary_error", async t => {
+    const r = await published(t);
+    const c = claimant(r);
+    // The binder check runs inside the action after the records are gone; its throw is the action's own.
+    Object.assign(c.p.recovery, { completionBinderPending: () => true });
+    assert.deepEqual(await c.handoff(), { kind: "pending", why: "action_failed" });
+    assert.equal((await slotVia(c.rt, r.clone))?.state, "retiring", "the retirement stays resumable");
   });
 });

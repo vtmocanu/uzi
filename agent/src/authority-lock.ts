@@ -20,9 +20,10 @@ import { setTimeout as delay } from "node:timers/promises";
 /**
  * A closed, typed reason some refusals carry so a caller never parses the message: the completion source's
  * certificate does not verify, no authority slot covers it, the retiring slot is not this source's retirement,
- * or an operation on the retiring source is unresolved.
+ * or an operation on the retiring source is unresolved, or the stored source is malformed or is not the
+ * published source (`source_mismatch`).
  */
-export type AuthorityRefusalKind = "certificate_invalid" | "no_slot" | "slot_mismatch" | "operation_unresolved";
+export type AuthorityRefusalKind = "certificate_invalid" | "no_slot" | "slot_mismatch" | "operation_unresolved" | "source_mismatch";
 
 export class AuthorityRefusal extends Error {
   readonly kind: AuthorityRefusalKind | undefined;

@@ -595,11 +595,12 @@ export type RetainedBoundaryReason = "vetoed" | "not_quiescent" | "identity_chan
 export type CompletedRetirement =
   | { kind: "retired" }
   | { kind: "pending"; why: "executing" | "quarantine" | "unresolved_operation" | "preflight" | "not_removed" | "vetoed" |
-      "not_quiescent" | "no_receipt" | "episode_bearing" | "cycle_busy" | "authority_busy" }
+      "not_quiescent" | "no_receipt" | "episode_bearing" | "cycle_busy" | "authority_busy" |
+      "action_failed" }
   | { kind: "invalid"; why: "no_receipt" | "no_authority_record" | "mismatch" | "unverified" | "identity_changed" |
       "multiple_generations" | "path_mismatch" }
   | { kind: "uncertain"; why: "verify_error" | "boundary_error" | "unreadable_record" | "slot_present" | "classify_unavailable" }
-  | { kind: "unsupported"; why: "no_boundary" | "no_cleanup" | "platform" };
+  | { kind: "unsupported"; why: "no_boundary" | "no_cleanup" | "no_retirement_scope" | "platform" };
 
 /** What {@link RecoveryCoordinator.retireCompletedSourceForHandoff} answers: `not_completion` means no record
  *  of the owner is this fence's completion source (and, when classifying, no authority slot covers the path). */
@@ -4650,12 +4651,15 @@ export class RecoveryCoordinator {
    * only SELECTS a generation, and every certificate, cohort, epoch, source, fence, artifact and pending-operation
    * check is redone by {@link forgetCompletedGeneration} (`retire`) or {@link verifyDurableRetirement} (`classify`).
    *
-   * Lock order A -> C -> J (-> B inside the boundary). It is entered holding NONE of them: A is acquired here
-   * with the caller's `wait` (the claimant passes `authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)`, so the A-queue
-   * or flock wait is bounded by that timeout and ended by the claimant's lifecycle abort), C is tried in `skip`
-   * mode (a busy cycle is `pending`/`cycle_busy`, never queued behind), and J is taken only inside the cycle.
-   * An acquisition that runs out its wait (a typed {@link AuthorityLockBusy}) is `pending`/`authority_busy`; every other
-   * refusal and every abort propagates unchanged. There is no sleep, retry or owner-tail wait here.
+   * Actual lock order: A -> J (selection only, released) -> C (tried in `skip` mode: a busy cycle is
+   * `pending`/`cycle_busy`, never queued behind) -> J (inside the cycle) -> B (inside the boundary); order-safe. It is
+   * entered holding NONE of them: A is acquired here with the caller's `wait` (the claimant passes
+   * `authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)`, so the A-queue or flock wait is bounded by that timeout and
+   * ended by the claimant's lifecycle abort).
+   * An acquisition of A that runs out its wait (a typed {@link AuthorityLockBusy}) is `pending`/`authority_busy`; an
+   * AuthorityLockBusy raised once A is held propagates. Every other throw propagates unchanged too, except inside
+   * selection, where a failed journal read (`checkedRecords`) is `uncertain`/`unreadable_record` (a maintenance
+   * budget abort still propagates). There is no sleep, retry or owner-tail wait here.
    *
    * Selection is by FENCE first: any record of the owner whose V2 source carries exactly this fence. A match whose
    * path or attempt differs, or that spans several generations, is `invalid`. No match is `not_completion` (V1, a
@@ -4844,7 +4848,10 @@ export class RecoveryCoordinator {
         noteRetained: (reason) => { retainedWhy ??= reason; },
       } : undefined;
       let forgotten = false;
-      const boundary = await this.withCompletionSourceBoundary!(source, async (canDelete, quiesceSkills) => {
+      // A throw inside the action is rethrown unchanged for the boundary to retain; this flag only lets the
+      // classification below tell it from a throw of the boundary's own checks.
+      let actionThrew = false;
+      const boundary = await this.withCompletionSourceBoundary!(source, async (canDelete, quiesceSkills) => { try {
         // Idempotent: normally the clone move already entered it; a source that is already gone enters here,
         // before the first ref, bundle or record is destroyed.
         await durable?.enter();
@@ -4912,14 +4919,16 @@ export class RecoveryCoordinator {
           await handle.finish();
         }
         forgotten = true;
-      }, durable);
+      } catch (err) { actionThrew = true; throw err; } }, durable);
       // A pass whose action returned early, or any partial failure, keeps provenance.
       if (boundary === "passed" && forgotten) {
         this.onCompletionSourceForgotten?.(source);
         return { kind: "retired" };
       }
       if (boundary === "passed") return { kind: "pending", why: "not_removed" };
-      switch (retainedWhy as RetainedBoundaryReason | undefined) {
+      const why = retainedWhy as RetainedBoundaryReason | undefined;
+      if (actionThrew && (why === undefined || why === "error")) return { kind: "pending", why: "action_failed" };
+      switch (why) {
         case "vetoed": return { kind: "pending", why: "vetoed" };
         case "not_quiescent": return { kind: "pending", why: "not_quiescent" };
         case "identity_changed": return { kind: "invalid", why: "identity_changed" };
@@ -4933,7 +4942,7 @@ export class RecoveryCoordinator {
 
   private verdictOutcome(kind: "invalid" | "pending" | "uncertain" | "unsupported"): CompletedRetirement {
     switch (kind) {
-      case "unsupported": return { kind: "unsupported", why: "no_cleanup" };
+      case "unsupported": return { kind: "unsupported", why: "no_retirement_scope" };
       case "invalid": return { kind: "invalid", why: "unverified" };
       case "pending": return { kind: "pending", why: "unresolved_operation" };
       case "uncertain": return { kind: "uncertain", why: "verify_error" };
