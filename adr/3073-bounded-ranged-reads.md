@@ -56,10 +56,10 @@ second file follows the fallback's prefix validation rules.
 ## Bounds and text frontier
 
 Actual bytes read by read_range, including prefetch and raw lookahead, are capped
-at 8 MiB.
+at 64 MiB.
 Read chunks are at most 32 KiB and returned decoded bytes at most 64 KiB.
 The first ordinary read can consume up to 1 MiB+1 if the file grows after Fstat;
-combined with the fallback, this is at most 9,437,185 actual bytes (9 MiB+1).
+combined with the fallback, this is at most 68,157,441 actual bytes (65 MiB+1).
 The scanner uses fixed read/output buffers and a four-byte UTF-8 carry, with no
 allocation proportional to source line length or count. Processing makes bounded
 validation passes with cooperative context checks. A giant line cannot force a
@@ -105,7 +105,7 @@ helper context guarantees absolute callback or storage completion.
 The broker bounds encoded input before decoding and validates canonical base64
 by round-trip, then validates size, echoed offset, scannedBytes, line counts,
 partial/truncated/incomplete flags and reason. It rejects contradictory metadata,
-including completed EOF at the 8 MiB scan cap when opening size is larger, for
+including completed EOF at the 64 MiB scan cap when opening size is larger, for
 empty or nonempty output. Returned
 text must be valid UTF-8 without NUL, with line counts matching the excerpt.
 
@@ -128,8 +128,8 @@ NDJSON entrypoint. Byte and close instrumentation covers early large-file prefix
 scan/output/chunk frontiers, skipped and selected UTF-8, surplus binary data,
 opening growth/shrink/replacement and deterministic syscall/context failures.
 One test grows an ordinary read after Fstat and measures exactly 1 MiB+1 bytes
-before E_OVERSIZE, then independently opens a distant range and measures 8 MiB:
-9 MiB+1 combined, without combining the operations' states.
+before E_OVERSIZE, then independently opens a distant range and measures 64 MiB:
+65 MiB+1 combined, without combining the operations' states.
 
 M2 adds focused broker/client tests for read-first sequencing, exactly one
 helper-origin oversize fallback, local-error and forged-origin exclusion, range
