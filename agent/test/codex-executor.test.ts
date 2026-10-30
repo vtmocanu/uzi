@@ -27033,7 +27033,7 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
   });
 
   it("a recreated epoch after a refused wall park does not post again: the same reporter continues the phase (issue #1782 path)", async () => {
-    const { reporter, rows } = reporterRig(ACTIVE);
+    const { posts, reporter, rows } = reporterRig(ACTIVE);
     const controller = new AbortController();
     const quiet: Responder = (c) => {
       if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
@@ -27061,6 +27061,13 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
     assert.equal(rig.providerLaunches(), 2, "the epoch was recreated");
     assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "the re-drive ran on the fresh epoch");
     assert.deepEqual(rows(), ["implement#1/1"], "one row: a re-drive or a new epoch is not a phase change");
+    const sentByEpoch = rig.epochs.map((e) => e.transport.requests.find((r) => r.method === "turn/start"));
+    for (const sent of sentByEpoch) {
+      assert.equal(rec(sent?.params).model, posts[0]!.requested_model, "each epoch sends the reported model");
+      assert.equal(rec(sent?.params).effort, posts[0]!.requested_effort, "each epoch sends the reported effort");
+    }
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0]!.seq, 1);
   });
 
   it("posts nothing without the activation signal", async () => {

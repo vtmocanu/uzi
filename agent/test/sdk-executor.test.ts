@@ -13,7 +13,7 @@ import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWal
 
 const HAS_PROCFS = process.platform === "linux";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError, ProviderTransientError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
+import { SdkExecutor, embedSeededPlan, TransientRecoveryError, ProviderTransientError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
 import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { LimitReachedError } from "../src/limit.js";
@@ -2733,29 +2733,6 @@ describe("SdkExecutor failure + watchdog paths", () => {
   });
 });
 
-describe("resolveLeadModel (PRD #17 precedence)", () => {
-  it("prefers the run owner's per-user default over the lead template model", () => {
-    assert.strictEqual(resolveLeadModel("sonnet", "fable"), "sonnet");
-  });
-  it("falls back to the lead template model when there is no per-user default", () => {
-    assert.strictEqual(resolveLeadModel(undefined, "fable"), "fable");
-  });
-  it("uses the per-user default when the lead template has no model", () => {
-    assert.strictEqual(resolveLeadModel("sonnet", undefined), "sonnet");
-  });
-  it("falls back to the template when the config model is a blank string (|| not ??)", () => {
-    // The server sends NULL (omitted) for an unset default, never "", but the
-    // resolver must be correct in isolation: an empty config must not blank out
-    // the template model.
-    assert.strictEqual(resolveLeadModel("", "fable"), "fable");
-  });
-  it("returns undefined (omit the key) when neither is set", () => {
-    assert.strictEqual(resolveLeadModel(undefined, undefined), undefined);
-    assert.strictEqual(resolveLeadModel("", ""), undefined);
-    assert.strictEqual(resolveLeadModel("", undefined), undefined);
-  });
-});
-
 describe("SdkExecutor model precedence on baseOptions", () => {
   // The resolved model must land on options.model exactly per precedence, and an
   // unset model must OMIT the key (never `model: undefined`) so the SDK/account
@@ -3018,6 +2995,54 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
     assert.equal(posts[0]!.requested_effort_mode, "runtime_default");
     assert.equal(turns[0]!.options.model, "fable");
     assert.ok(!("effort" in turns[0]!.options));
+  });
+
+  it("every claude request_case of the shared matrix is what the executor actually sends to the SDK", async () => {
+    const contract = JSON.parse(
+      fs.readFileSync(path.join(import.meta.dirname, "..", "..", "fixtures", "lead-config", "contract.json"), "utf8"),
+    ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; expect: { model?: string; effort?: string } }> };
+    const cases = contract.request_cases.filter((c) => c.harness === "claude");
+    assert.ok(cases.length >= 5, "the claude matrix is loaded, not empty");
+    const visited: string[] = [];
+    for (const c of cases) {
+      const { model: _drop, ...leadNoModel } = lead;
+      const leadT: AgentTemplate = c.templateModel !== undefined ? { ...leadNoModel, model: c.templateModel } : leadNoModel;
+      const planPhase = c.phase === "plan";
+      const { queryFn, turns } = fakeTurns(
+        planPhase
+          ? [[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]
+          : [[signalDone(), resultSuccess()]],
+      );
+      const { ctx } = makeCtx(
+        planPhase
+          ? { agents: [leadT, coder], config: c.config }
+          : { agents: [leadT, coder], config: c.config, planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved" },
+        approveWith("own"),
+      );
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+      assert.ok(turns.length >= 1, `${c.id}: a turn ran`);
+      for (const t of turns) {
+        if (c.expect.model === undefined) assert.ok(!("model" in t.options), `${c.id}: no model key`);
+        else assert.equal(t.options.model, c.expect.model, `${c.id}: sent model`);
+        if (c.expect.effort === undefined) assert.ok(!("effort" in t.options), `${c.id}: no effort key`);
+        else assert.equal(t.options.effort, c.expect.effort, `${c.id}: sent effort`);
+      }
+      visited.push(c.id);
+    }
+    assert.deepEqual(visited, cases.map((c) => c.id));
+  });
+
+  it("a re-driven implement turn (no signal_done yet) keeps one reporter and one implement row", async () => {
+    const { posts, make, rows } = reporterRig();
+    const { queryFn, turns } = fakeTurns([[resultSuccess()], [signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config: ACTIVE_CONFIG, leadConfig: make(ACTIVE_CONFIG),
+      planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.ok(turns.length >= 2, "the implement turn was re-driven");
+    assert.deepEqual(rows(), ["implement#1/1"]);
+    assert.equal(posts[0]!.claim_generation, 4);
   });
 
   it("posts nothing when the claim carries no default_effort_source", async () => {

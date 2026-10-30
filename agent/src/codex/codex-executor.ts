@@ -7443,4 +7443,3 @@ async function defaultLaunchProviderRoot(
   const root = registeredRoot(handle, "provider");
   return { root, transport, supervisorPid: handle.supervisorPid ?? -1 };
 }
-

@@ -22,7 +22,6 @@ import type { ClaimConfig, LeadConfigReportBody } from "../src/protocol.js";
 import { CodexExecutor } from "../src/codex/codex-executor.js";
 import { selectCodexBinding } from "../src/codex/select.js";
 import type { CodexProviderConfig } from "../src/codex/codex-harness.js";
-import { resolveLeadModel } from "../src/sdk-executor.js";
 import type { RunContext } from "../src/executor.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 
@@ -66,8 +65,9 @@ describe("lead request matrix (fixtures/lead-config/contract.json request_cases)
       };
       assert.deepEqual(resolveLeadRequest(input), c.expect, `resolveLeadRequest ${c.id}`);
       if (c.harness === "claude") {
-        // The Claude executor sends resolveLeadModel(...) as options.model.
-        assert.equal(resolveLeadModel(c.config.default_model, c.templateModel), c.expect.model, `claude sent model ${c.id}`);
+        // What the SdkExecutor sends for each claude case (model and effort in the SDK query
+        // options) is asserted by driving the real executor in sdk-executor.test.ts, which
+        // iterates this same request_cases list.
       } else {
         const exec = codexExecutorFor(c.providerDefaultModel!);
         const ctx = { runId: "r", config: c.config, agents: [] } as unknown as RunContext;
@@ -82,6 +82,12 @@ describe("lead request matrix (fixtures/lead-config/contract.json request_cases)
     }
     assert.deepEqual([...visited].sort(), LEAD_REQUEST_CASES.map((c) => c.id).sort());
     assert.ok(visited.size >= 10, "the matrix is loaded, not empty");
+  });
+
+  it("a blank claim model falls back to the template (|| not ??), and nothing resolves to no model", () => {
+    const base = { harness: "claude" as const, phase: "implement" as const };
+    assert.equal(resolveLeadRequest({ ...base, config: { default_model: "" }, templateModel: "fable" }).model, "fable");
+    assert.equal(resolveLeadRequest({ ...base, config: { default_model: "" } }).model, undefined);
   });
 
   it("activation follows default_effort_source only", () => {

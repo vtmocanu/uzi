@@ -5718,28 +5718,6 @@ function planMaxRevisionsOf(config: ClaimConfig | null | undefined): number {
 }
 
 /**
- * Resolve the model for the lead/main thread (PRD #17 Decision 6): the run
- * owner's per-user default (`config.default_model`) wins over the lead template's
- * model. A blank config model falls back to the template (|| not ??), so a
- * defensively empty string can't blank out the template's model — in practice
- * the server sends NULL (omitted), never "". Returns undefined when nothing
- * resolves, so the caller omits the SDK `model` key entirely rather than sending
- * an explicit empty override (an unset model falls back to the SDK/account
- * default). Null-model subagents follow the main thread, so this governs them too.
- */
-export function resolveLeadModel(
-  configModel?: string,
-  templateModel?: string,
-): string | undefined {
-  return resolveLeadRequest({
-    harness: "claude",
-    phase: "implement",
-    config: configModel === undefined ? undefined : { default_model: configModel },
-    ...(templateModel !== undefined ? { templateModel } : {}),
-  }).model;
-}
-
-/**
  * PRD #209 (M2 validation): whether to embed the seeded plan BODY in the FIRST implement
  * prompt. True only for a session-less seeded pre-approved run — the row-2 cold start, and
  * a requeued seeded run whose transcript was dropped — which has no planning turn and no
