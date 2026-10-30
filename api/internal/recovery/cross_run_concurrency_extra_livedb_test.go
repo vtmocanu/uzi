@@ -39,31 +39,39 @@ func crossRunExtraGroups(t *testing.T) {
 	}
 }
 
-// The witness has no custody or other dependants. Choose its ordering before
-// taking the verified snapshot, never rewrite a frozen binding. The ID sorts
-// immediately below (low) or above the target in byte order: it copies the
-// target's prefix, steps the first adjustable byte and keeps a fresh random
-// suffix, so it is unique per test in the shared store-IT database.
-func crossRunOrderWitness(e *inventoryEnv, witness uuid.UUID, b map[string]any, low bool) uuid.UUID {
+// crossRunOrderedID returns a fresh ID strictly below (below=true) or above ref
+// in byte order: it copies ref's prefix, steps the first adjustable byte and keeps
+// a fresh random suffix, so it is unique per test in the shared store-IT database.
+// Its order against unrelated runs is not fixed.
+func crossRunOrderedID(t *testing.T, ref uuid.UUID, below bool) uuid.UUID {
+	t.Helper()
 	id := uuid.New()
 	adjusted := false
-	for i := range e.run {
-		if low && e.run[i] > 0x00 {
-			copy(id[:i], e.run[:i])
-			id[i] = e.run[i] - 1
+	for i := range ref {
+		if below && ref[i] > 0x00 {
+			copy(id[:i], ref[:i])
+			id[i] = ref[i] - 1
 			adjusted = true
 			break
 		}
-		if !low && e.run[i] < 0xff {
-			copy(id[:i], e.run[:i])
-			id[i] = e.run[i] + 1
+		if !below && ref[i] < 0xff {
+			copy(id[:i], ref[:i])
+			id[i] = ref[i] + 1
 			adjusted = true
 			break
 		}
 	}
-	if !adjusted || (bytes.Compare(id[:], e.run[:]) < 0) != low {
-		e.t.Fatalf("cannot order witness %s against target %s (low=%t)", id, e.run, low)
+	if !adjusted || (bytes.Compare(id[:], ref[:]) < 0) != below {
+		t.Fatalf("cannot order %s against %s (below=%t)", id, ref, below)
 	}
+	return id
+}
+
+// The witness has no custody or other dependants. Choose its ordering before
+// taking the verified snapshot, never rewrite a frozen binding. The witness sorts
+// strictly below (low) or above the target.
+func crossRunOrderWitness(e *inventoryEnv, witness uuid.UUID, b map[string]any, low bool) uuid.UUID {
+	id := crossRunOrderedID(e.t, e.run, low)
 	e.exec("UPDATE runs SET id=$2 WHERE id=$1", witness, id)
 	e.t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -334,7 +342,12 @@ func crossRunSharedWitnessRace(t *testing.T, low bool) {
 	e, w, b := newCrossRunBindingEnv(t, 3, 1)
 	w = crossRunOrderWitness(e, w, b, low)
 	a, s := crossRunInputs(t, e, w, b)
-	second, hold := uuid.New(), uuid.New()
+	// The second target sits on the same side of B as the first, so B sorts
+	// strictly below (low) or above both targets.
+	second, hold := crossRunOrderedID(t, w, !low), uuid.New()
+	if (bytes.Compare(w[:], e.run[:]) < 0) != low || (bytes.Compare(w[:], second[:]) < 0) != low {
+		t.Fatalf("witness %s not ordered against targets %s and %s (low=%t)", w, e.run, second, low)
+	}
 	e.exec("INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,status,claim_generation,finished_at) VALUES($1,$2,$3,'issue',101,'second target','body','cancelled',4,$4)", second, a.OwnerID, a.RepoID, a.FinishedAt)
 	insertMergedHold(e, hold, a.OwnerID, a.RepoID, second, e.w.ID, 2, true)
 	a2 := a
