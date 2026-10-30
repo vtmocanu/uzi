@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -34,13 +35,18 @@ func newPublicationResumeFixture(t *testing.T) *publicationResumeFixture {
 	f.wkr.ProtocolCapabilities = []string{capability.RecoveryArchiveV1, capability.PublicationResumeV1}
 	env.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", f.workerID, f.wkr.ProtocolCapabilities)
 	id := f.seedRun("running", 1)
-	env.exec("UPDATE runs SET worker_id=$2, started_at=now() WHERE id=$1", id, f.workerID)
+	env.exec("UPDATE runs SET worker_id=$2, started_at=now(), branch='agent/issue-1' WHERE id=$1", id, f.workerID)
 	return &publicationResumeFixture{custodyContinuationFixture: f, runID: id}
 }
 
 func (f *publicationResumeFixture) intent(branch, head string, candidate *string) json.RawMessage {
+	return f.intentAt(1, branch, head, candidate)
+}
+
+// intentAt is an intent whose claim_generation (the enrollment generation) is gen.
+func (f *publicationResumeFixture) intentAt(gen int64, branch, head string, candidate *string) json.RawMessage {
 	body := map[string]any{
-		"run_id": f.runID, "repo_id": f.repoID, "branch": branch, "claim_generation": 1,
+		"run_id": f.runID, "repo_id": f.repoID, "branch": branch, "claim_generation": gen,
 		"original_head": head, "floor": map[string]any{"kind": "absent"}, "candidate": candidate,
 	}
 	raw, err := json.Marshal(body)
@@ -52,12 +58,36 @@ func (f *publicationResumeFixture) intent(branch, head string, candidate *string
 
 func (f *publicationResumeFixture) enroll(t *testing.T) PublicationIntentResponse {
 	t.Helper()
+	return f.enrollAt(t, 1)
+}
+
+func (f *publicationResumeFixture) enrollAt(t *testing.T, gen int64) PublicationIntentResponse {
+	t.Helper()
 	resp, err := f.svc.RegisterPublicationIntent(f.env.ctx, f.wkr, f.runID,
-		PublicationIntentRequest{ClaimGeneration: 1, Intent: f.intent("agent/issue-1", pubHeadA, nil)})
+		PublicationIntentRequest{ClaimGeneration: gen, Intent: f.intentAt(gen, "agent/issue-1", pubHeadA, nil)})
 	if err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
 	return resp
+}
+
+// reclaim moves the run to generation gen the way a claim does: with the run-fence opt-ins.
+func (f *publicationResumeFixture) reclaim(t *testing.T, gen int64) {
+	t.Helper()
+	tx, err := f.env.pool.Begin(f.env.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(f.env.ctx) }()
+	if err = store.New(tx).OptInRunFences(f.env.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(f.env.ctx, `UPDATE runs SET claim_generation=$2 WHERE id=$1`, f.runID, gen); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(f.env.ctx); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func seq(n int32) *int32 { return &n }
@@ -115,11 +145,16 @@ func TestPublicationResumeRetireNeedsOptInLiveDB(t *testing.T) {
 	f.enroll(t)
 	_, err := f.env.pool.Exec(ctx, `UPDATE run_publication_resume SET state='retired', retired_reason='x' WHERE run_id=$1`, f.runID)
 	requireCoordinateSQLState(t, err, "23514")
+	// A valid intent, so the refusal is the missing opt-in and not a shape or key problem.
 	_, err = f.env.pool.Exec(ctx, `INSERT INTO run_publication_resume (run_id, enrollment_seq, claim_generation, intent, state)
-		VALUES ($1, 2, 1, '{}', 'active')`, f.runID)
-	if err == nil {
-		t.Fatal("insert without opt-in succeeded")
+		VALUES ($1, 2, 1, $2, 'active')`, f.runID, f.intent("agent/issue-1", pubHeadA, nil))
+	requireCoordinateSQLState(t, err, "23514")
+	if err == nil || !strings.Contains(err.Error(), "enrollment requires updated API") {
+		t.Fatalf("insert without opt-in err=%v, want the enrollment opt-in refusal", err)
 	}
+	// A direct delete needs the opt-in too.
+	_, err = f.env.pool.Exec(ctx, `DELETE FROM run_publication_resume WHERE run_id=$1`, f.runID)
+	requireCoordinateSQLState(t, err, "23514")
 	tx, err := f.env.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -153,9 +188,158 @@ func TestPublicationResumeRetireNeedsOptInLiveDB(t *testing.T) {
 	if !errors.Is(err, ErrPublicationEnrollmentRetired) {
 		t.Fatalf("retired write err=%v", err)
 	}
-	next := f.enroll(t)
+	// No resurrection: a fresh enrollment at the retired generation is refused, and so is one at a
+	// lower generation than the retired row.
+	_, err = f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID,
+		PublicationIntentRequest{ClaimGeneration: 1, Intent: f.intent("agent/issue-1", pubHeadA, nil)})
+	if !errors.Is(err, ErrPublicationEnrollmentRetired) {
+		t.Fatalf("re-enroll at the retired generation err=%v", err)
+	}
+	// A later claim generation may enrol afresh and gets the next sequence.
+	f.reclaim(t, 2)
+	next := f.enrollAt(t, 2)
 	if next.EnrollmentSeq != 2 || next.State != "active" {
 		t.Fatalf("re-enroll=%+v", next)
+	}
+}
+
+// The stored intent's claim_generation is the ENROLLMENT generation. A candidate update after a
+// re-claim at a higher generation succeeds under the live fence (request generation == run
+// generation); the stale generation is refused and identity stays immutable.
+func TestPublicationResumeCandidateAfterReclaimLiveDB(t *testing.T) {
+	f := newPublicationResumeFixture(t)
+	ctx := f.env.ctx
+	f.enroll(t)
+	f.reclaim(t, 2)
+	c := pubHeadC
+	upd, err := f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID,
+		PublicationIntentRequest{ClaimGeneration: 2, EnrollmentSeq: seq(1), CandidateSeq: seq(1), Intent: f.intentAt(1, "agent/issue-1", pubHeadA, &c)})
+	if err != nil || upd.CandidateSeq != 1 || upd.EnrollmentSeq != 1 {
+		t.Fatalf("update at generation 2 = %+v err=%v", upd, err)
+	}
+	var stored int64
+	if err = f.env.pool.QueryRow(ctx, `SELECT (intent->>'claim_generation')::bigint FROM run_publication_resume WHERE run_id=$1`, f.runID).Scan(&stored); err != nil || stored != 1 {
+		t.Fatalf("stored enrollment generation=%d err=%v", stored, err)
+	}
+	// The stale request generation is refused at the live fence.
+	_, err = f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID,
+		PublicationIntentRequest{ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(2), Intent: f.intentAt(1, "agent/issue-1", pubHeadA, &c)})
+	if !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("stale generation err=%v, want ErrStaleClaim", err)
+	}
+	// Rewriting the enrollment generation to the live one is an identity change.
+	_, err = f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID,
+		PublicationIntentRequest{ClaimGeneration: 2, EnrollmentSeq: seq(1), CandidateSeq: seq(2), Intent: f.intentAt(2, "agent/issue-1", pubHeadA, &c)})
+	if !errors.Is(err, ErrPublicationIntentMismatch) {
+		t.Fatalf("identity rewrite err=%v, want mismatch", err)
+	}
+}
+
+// The intent is validated from exact, unique, allowlisted keys and bound to the run's own branch.
+func TestPublicationResumeIntentValidationLiveDB(t *testing.T) {
+	f := newPublicationResumeFixture(t)
+	ctx := f.env.ctx
+	id := f.runID.String()
+	repo := f.repoID.String()
+	base := func(extra string) json.RawMessage {
+		return json.RawMessage(`{"run_id":"` + id + `","repo_id":"` + repo + `","branch":"agent/issue-1","claim_generation":1,` +
+			`"original_head":"` + pubHeadA + `","floor":{"kind":"absent"},"candidate":null` + extra + `}`)
+	}
+	for name, raw := range map[string]json.RawMessage{
+		"unknown member":      base(`,"extra":1`),
+		"case variant":        base(`,"Branch":"x"`),
+		"duplicate key":       base(`,"branch":"agent/issue-1"`),
+		"branch not the run":  json.RawMessage(strings.Replace(string(base("")), "agent/issue-1", "agent/other", 1)),
+		"ansi in branch":      json.RawMessage(strings.Replace(string(base("")), "agent/issue-1", `agent/\u001b[31m`, 1)),
+		"bidi in branch":      json.RawMessage(strings.Replace(string(base("")), "agent/issue-1", "agent/\\u202e", 1)),
+		"nested floor casing": json.RawMessage(strings.Replace(string(base("")), `"kind"`, `"Kind"`, 1)),
+		"trailing data":       append(base(""), []byte(` {}`)...),
+		"unicode nul":         base(`,"mr":{"title":"a\u0000b"}`),
+	} {
+		_, err := f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID, PublicationIntentRequest{ClaimGeneration: 1, Intent: raw})
+		if !errors.Is(err, ErrInvalidState) {
+			t.Errorf("%s: err=%v, want ErrInvalidState", name, err)
+		}
+	}
+	// Allowlisted opaque members are accepted.
+	if _, err := f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID,
+		PublicationIntentRequest{ClaimGeneration: 1, Intent: base(`,"v":1,"mr":{"title":"t"},"guard":{},"mac":"m"`)}); err != nil {
+		t.Fatalf("allowlisted members: %v", err)
+	}
+	// Body bounds: the raw intent is capped at 64 KiB in Go.
+	big := base(`,"mr":{"pad":"` + strings.Repeat("x", MaxPublicationIntentBytes) + `"}`)
+	if _, err := f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID, PublicationIntentRequest{ClaimGeneration: 1, Intent: big}); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("oversize err=%v", err)
+	}
+}
+
+func TestPublicationResumeKindUnsupportedLiveDB(t *testing.T) {
+	f := newPublicationResumeFixture(t)
+	// A repo-backed kind that never publishes code: a report-only cross-check child of the run.
+	f.env.exec(`UPDATE runs SET kind='cross_check', issue_iid=NULL, target_run_id=$1, harness='codex',
+		report_only=true, budget_wall_seconds=3600 WHERE id=$1`, f.runID)
+	_, err := f.svc.RegisterPublicationIntent(f.env.ctx, f.wkr, f.runID,
+		PublicationIntentRequest{ClaimGeneration: 1, Intent: f.intent("agent/issue-1", pubHeadA, nil)})
+	if !errors.Is(err, ErrPublicationKindUnsupported) {
+		t.Fatalf("err=%v, want ErrPublicationKindUnsupported", err)
+	}
+}
+
+// The state report that re-enters a live status (awaiting_input to running) is an authority write
+// on an enrolled run: it locks the worker first and sets the opt-ins, so it commits on the new API.
+func TestPublicationResumeSetStateAuthorityLiveDB(t *testing.T) {
+	f := newPublicationResumeFixture(t)
+	f.enroll(t)
+	f.env.exec(`UPDATE runs SET status='awaiting_input', status_since=now(), open_question_id='q1' WHERE id=$1`, f.runID)
+	f.env.exec(`INSERT INTO run_user_inputs (run_id, kind, body, question_id, applied_at) VALUES ($1, 'answer', 'yes', 'q1', now())`, f.runID)
+	g := int64(1)
+	run, applied, err := f.svc.SetState(f.env.ctx, f.wkr, f.runID, StateRequest{State: "running", ClaimGeneration: &g})
+	if err != nil || !applied || run.Status != "running" {
+		t.Fatalf("awaiting_input to running: run=%q applied=%v err=%v", run.Status, applied, err)
+	}
+}
+
+// A credential_disabled run with a pending pause settles into the owner pause, which reopens the
+// released claim. For an enrolled run whose bound worker is gone or lacks the capability that
+// would raise the run guard on every promoter pass; it must be refused cleanly instead.
+func TestPublicationResumeCredentialDisabledSettleLiveDB(t *testing.T) {
+	f := newPublicationResumeFixture(t)
+	ctx := f.env.ctx
+	f.enroll(t)
+	f.env.exec(`UPDATE runs SET status='paused', hold_reason='credential_disabled', status_since=now(),
+		claim_released_at=now(), pause_requested_at=now(), pause_mode='milestone' WHERE id=$1`, f.runID)
+	for name, setup := range map[string]string{
+		"worker row without the capability": `UPDATE workers SET protocol_capabilities='{}' WHERE id=$1`,
+		"worker unbound":                    `UPDATE runs SET worker_id=NULL WHERE id=$1`,
+	} {
+		target := f.workerID
+		if name == "worker unbound" {
+			target = f.runID
+		}
+		f.env.exec(setup, target)
+		status, err := f.svc.promoteCredentialDisabledRun(ctx, f.userID, f.runID)
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			t.Fatalf("%s: promoter raised %s: %v", name, pgErr.Code, err)
+		}
+		if err != nil || status != "" {
+			t.Fatalf("%s: status=%q err=%v, want a clean refusal", name, status, err)
+		}
+		var held string
+		if err := f.env.pool.QueryRow(ctx, `SELECT status||'/'||COALESCE(hold_reason,'') FROM runs WHERE id=$1`, f.runID).Scan(&held); err != nil || held != "paused/credential_disabled" {
+			t.Fatalf("%s: run=%q err=%v, want it left held", name, held, err)
+		}
+	}
+}
+
+// Deleting a run cascades its enrollment without the opt-in, while a direct delete is refused.
+func TestPublicationResumeRunDeleteCascadesLiveDB(t *testing.T) {
+	f := newPublicationResumeFixture(t)
+	f.enroll(t)
+	f.env.exec(`DELETE FROM runs WHERE id=$1`, f.runID)
+	var n int
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT count(*) FROM run_publication_resume WHERE run_id=$1`, f.runID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("rows after run delete=%d err=%v", n, err)
 	}
 }
 
@@ -175,7 +359,7 @@ func TestPublicationResumeFeatureOffRefusesNewEnrollmentLiveDB(t *testing.T) {
 	}
 	// A run with no active enrollment is refused.
 	other := f.seedRun("running", 1)
-	f.env.exec("UPDATE runs SET worker_id=$2 WHERE id=$1", other, f.workerID)
+	f.env.exec("UPDATE runs SET worker_id=$2, branch='agent/issue-2' WHERE id=$1", other, f.workerID)
 	body, _ := json.Marshal(map[string]any{"run_id": other, "repo_id": f.repoID, "branch": "agent/issue-2", "claim_generation": 1,
 		"original_head": pubHeadA, "floor": map[string]any{"kind": "absent"}, "candidate": nil})
 	_, err := f.svc.RegisterPublicationIntent(ctx, f.wkr, other, PublicationIntentRequest{ClaimGeneration: 1, Intent: body})
@@ -193,15 +377,20 @@ func TestPublicationResumeIncapableWorkerRefusedLiveDB(t *testing.T) {
 	f.env.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", f.workerID, []string{capability.RecoveryArchiveV1})
 	_, err := f.svc.RegisterPublicationIntent(f.env.ctx, f.wkr, f.runID,
 		PublicationIntentRequest{ClaimGeneration: 1, Intent: f.intent("agent/issue-1", pubHeadA, nil)})
-	if !errors.Is(err, ErrInvalidState) {
-		t.Fatalf("err=%v", err)
+	if !errors.Is(err, ErrPublicationResumeUnsupported) {
+		t.Fatalf("incapable worker err=%v, want ErrPublicationResumeUnsupported", err)
 	}
-	// A stale claim generation is not this worker's run.
+	// A request generation the run is not at is stale. The body is consistent (generation 2 in both),
+	// so only the live fence against runs.claim_generation can refuse it.
 	f.env.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", f.workerID, f.wkr.ProtocolCapabilities)
-	body := f.intent("agent/issue-1", pubHeadA, nil)
-	_, err = f.svc.RegisterPublicationIntent(f.env.ctx, f.wkr, f.runID, PublicationIntentRequest{ClaimGeneration: 2, Intent: body})
-	if !errors.Is(err, ErrInvalidState) {
-		t.Fatalf("generation mismatch err=%v", err)
+	_, err = f.svc.RegisterPublicationIntent(f.env.ctx, f.wkr, f.runID,
+		PublicationIntentRequest{ClaimGeneration: 2, Intent: f.intentAt(2, "agent/issue-1", pubHeadA, nil)})
+	if !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("generation mismatch err=%v, want ErrStaleClaim", err)
+	}
+	var rows int
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT count(*) FROM run_publication_resume WHERE run_id=$1`, f.runID).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("rows=%d err=%v", rows, err)
 	}
 }
 

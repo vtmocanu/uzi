@@ -11,6 +11,14 @@ SELECT * FROM run_publication_resume p WHERE p.run_id = @run_id AND p.state = 'a
 -- name: GetPublicationResume :one
 SELECT * FROM run_publication_resume p WHERE p.run_id = @run_id AND p.enrollment_seq = @enrollment_seq;
 
+-- name: HasInactivePublicationResumeAtGeneration :one
+-- True when a retired or completed enrollment of the run exists at or above the generation. A
+-- fresh enrollment at such a generation would resurrect a closed one (no resurrection).
+SELECT EXISTS (
+    SELECT 1 FROM run_publication_resume p
+    WHERE p.run_id = @run_id AND p.state <> 'active' AND p.claim_generation >= @claim_generation::bigint
+)::boolean AS retired;
+
 -- name: EnrollPublicationResume :one
 -- The caller holds the run row lock, so MAX+1 cannot race; the partial unique index backs it.
 INSERT INTO run_publication_resume (run_id, enrollment_seq, claim_generation, worker_id, intent, state)

@@ -4666,7 +4666,13 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// Completed publication and ephemeral leasing serialize on the worker before the run.
 		// Keep leasing conditional on an ephemeral terminal report with the lease enabled.
 		leaseFence = req.ClaimGeneration != nil && s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed")
-		if len(owned.CheckpointCoordinates) > 0 || leaseFence || completedPublicationCapable(wkr, req) || req.SourcePublication != nil {
+		// A publication-enrolled run's authority writes (owner, generation, claim) need the
+		// worker locked before the run row; the enrollment is read before the run lock.
+		pubEnrolled, perr := publicationEnrolled(ctx, qtx, runID)
+		if perr != nil {
+			return store.Run{}, false, perr
+		}
+		if len(owned.CheckpointCoordinates) > 0 || leaseFence || pubEnrolled || completedPublicationCapable(wkr, req) || req.SourcePublication != nil {
 			if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 				if errors.Is(werr, pgx.ErrNoRows) {
 					return store.Run{}, false, ErrRunNotOwned // the worker row is gone: the run left it
@@ -4769,7 +4775,11 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		fenceTx = tx
 		qtx := store.New(tx)
-		if len(owned.CheckpointCoordinates) > 0 {
+		pubEnrolled, perr := publicationEnrolled(ctx, qtx, runID)
+		if perr != nil {
+			return store.Run{}, false, perr
+		}
+		if len(owned.CheckpointCoordinates) > 0 || pubEnrolled {
 			if _, err := qtx.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
 				return store.Run{}, false, err
 			}

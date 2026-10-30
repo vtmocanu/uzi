@@ -396,6 +396,9 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // `recovery_held_publication_v1` and `recovery_held_publication_v2` are appended last, in its own group, only while
 // heldPublicationEnabled (= cfg.HeldPublication, UZI_HELD_PUBLICATION).
 //
+// `publication_resume_v1` (issue #1324) is appended in its own group only while
+// publicationResumeEnabled (= cfg.PublicationResume, RUN_PUBLICATION_RESUME_ENABLED).
+//
 // `active_run_snapshot` (PRD #1390 M2a) is appended in its own group, gated on
 // activeSnapshotEnabled (= !cfg.ActiveSnapshotDisabled). When the api is started with
 // UZI_ACTIVE_SNAPSHOT_DISABLED set (the D7 rollback simulation) the token is omitted and the
@@ -468,8 +471,10 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		{"credential_switch_hold"},
 	}
 	if publicationResumeEnabled {
-		// Issue #1324: this api accepts POST /api/worker/runs/{id}/publication-intent and sends
-		// publication_resume on the claim. Omitted when RUN_PUBLICATION_RESUME_ENABLED is off.
+		// Issue #1324: this api accepts NEW publication intents. Omitted when
+		// RUN_PUBLICATION_RESUME_ENABLED is off, which refuses new enrollment only: an existing
+		// enrollment keeps its candidate updates, and publication_resume still rides the claim of
+		// a capable worker.
 		groups = append(groups, []string{workersvc.PublicationResumeFeature})
 	}
 	if activeSnapshotEnabled {

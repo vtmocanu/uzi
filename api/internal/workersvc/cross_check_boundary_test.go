@@ -179,6 +179,9 @@ func (tx *crossCheckBoundaryTx) QueryRow(_ context.Context, sql string, args ...
 		// Default boundary fixtures are structural. Semantic fixtures retain
 		// their explicit query override above; no missing query is generalized.
 		return crossCheckBoundaryRow{err: pgx.ErrNoRows}
+	case strings.HasPrefix(sql, "-- name: GetActivePublicationResume"):
+		// The boundary fixtures are not publication-enrolled.
+		return crossCheckBoundaryRow{err: pgx.ErrNoRows}
 	case strings.HasPrefix(sql, "-- name: GetPlanCrossCheck"):
 		return crossCheckBoundaryRow{value: tx.check, err: tx.checkErr}
 	default:

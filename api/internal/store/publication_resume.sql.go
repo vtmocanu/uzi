@@ -146,6 +146,27 @@ func (q *Queries) GetPublicationResume(ctx context.Context, arg GetPublicationRe
 	return i, err
 }
 
+const hasInactivePublicationResumeAtGeneration = `-- name: HasInactivePublicationResumeAtGeneration :one
+SELECT EXISTS (
+    SELECT 1 FROM run_publication_resume p
+    WHERE p.run_id = $1 AND p.state <> 'active' AND p.claim_generation >= $2::bigint
+)::boolean AS retired
+`
+
+type HasInactivePublicationResumeAtGenerationParams struct {
+	RunID           uuid.UUID `json:"run_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+// True when a retired or completed enrollment of the run exists at or above the generation. A
+// fresh enrollment at such a generation would resurrect a closed one (no resurrection).
+func (q *Queries) HasInactivePublicationResumeAtGeneration(ctx context.Context, arg HasInactivePublicationResumeAtGenerationParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasInactivePublicationResumeAtGeneration, arg.RunID, arg.ClaimGeneration)
+	var retired bool
+	err := row.Scan(&retired)
+	return retired, err
+}
+
 const optInPublicationResume = `-- name: OptInPublicationResume :exec
 
 SELECT set_config('uzi.publication_resume_api', 'v1', true)

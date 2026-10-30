@@ -287,9 +287,16 @@ func lockCredentialDisabledCheckpointRun(ctx context.Context, q interface {
 	if prior.UserID != userID {
 		return empty, pgx.ErrNoRows
 	}
+	// Enrollment is read before the run lock so the bound worker is locked first.
+	var pubEnrolled bool
+	if pr, ok := q.(publicationEnrollmentReader); ok {
+		if pubEnrolled, err = publicationEnrolled(ctx, pr, runID); err != nil {
+			return empty, err
+		}
+	}
 	var admission credentialCheckpointAdmission
-	var capable bool
-	if len(prior.CheckpointCoordinates) > 0 && prior.WorkerID.Valid {
+	var capable, pubCapable bool
+	if (len(prior.CheckpointCoordinates) > 0 || pubEnrolled) && prior.WorkerID.Valid {
 		var ok bool
 		admission, ok = q.(credentialCheckpointAdmission)
 		if !ok {
@@ -302,7 +309,8 @@ func lockCredentialDisabledCheckpointRun(ctx context.Context, q interface {
 		if worker.UserID != userID {
 			return empty, pgx.ErrNoRows
 		}
-		capable = slices.Contains(worker.ProtocolCapabilities, capability.TaskCheckpointCoordinatesV1)
+		capable = len(prior.CheckpointCoordinates) > 0 && slices.Contains(worker.ProtocolCapabilities, capability.TaskCheckpointCoordinatesV1)
+		pubCapable = pubEnrolled && slices.Contains(worker.ProtocolCapabilities, PublicationResumeFeature)
 	}
 	run, err := q.LockCredentialDisabledRunForPromotion(ctx, store.LockCredentialDisabledRunForPromotionParams{
 		ID: runID, UserID: userID, GlobalTimeoutSeconds: globalTimeoutSeconds,
@@ -317,6 +325,22 @@ func lockCredentialDisabledCheckpointRun(ctx context.Context, q interface {
 	// and still requires the bound worker's capability and API opt-in.
 	if len(run.CheckpointCoordinates) > 0 && !capable && !run.CanQueue {
 		return empty, pgx.ErrNoRows
+	}
+	// A publication enrollment that appeared, or a binding that moved, after the unlocked read
+	// is refused like a checkpoint one: the worker was not locked first.
+	if pr, ok := q.(publicationEnrollmentReader); ok {
+		now, err := publicationEnrolled(ctx, pr, runID)
+		if err != nil {
+			return empty, err
+		}
+		if now && (!pubEnrolled || prior.WorkerID != run.WorkerID) {
+			return empty, pgx.ErrNoRows
+		}
+		// Same rule for the bound worker without publication_resume_v1, or none: only the
+		// queue arm leaves the released claim alone; settlement would raise the guard every pass.
+		if now && !pubCapable && !run.CanQueue {
+			return empty, pgx.ErrNoRows
+		}
 	}
 	if capable {
 		if err := admission.OptInCheckpointCoordinates(ctx); err != nil {

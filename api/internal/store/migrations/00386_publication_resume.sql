@@ -8,7 +8,9 @@ CREATE TABLE run_publication_resume (
     enrollment_seq   int         NOT NULL CHECK (enrollment_seq > 0),
     claim_generation bigint      NOT NULL,
     worker_id        uuid,
-    intent           jsonb       NOT NULL CHECK (octet_length(intent::text) <= 65536),
+    -- The API bounds the raw body at 64 KiB; jsonb text normalisation can expand it, so the
+    -- table bound leaves headroom (a violation is a 23514 the API maps to a client error).
+    intent           jsonb       NOT NULL CHECK (octet_length(intent::text) <= 131072),
     candidate_seq    int         NOT NULL DEFAULT 0 CHECK (candidate_seq >= 0),
     state            text        NOT NULL CHECK (state IN ('active', 'retired', 'completed')),
     retired_reason   text,
@@ -27,25 +29,21 @@ CREATE TABLE run_publication_resume (
 );
 CREATE UNIQUE INDEX run_publication_resume_active_idx ON run_publication_resume (run_id) WHERE state = 'active';
 
+-- runs is hot: never queue behind (and so block) its writers for long. A lock wait past this
+-- fails the migration, and the migration can be rerun. The CHECK is added NOT VALID and left that way:
+-- validating would scan runs, and the column is NULL on every existing row.
+SET LOCAL lock_timeout = '5s';
 ALTER TABLE runs ADD COLUMN recovery_wait_phase text;
 ALTER TABLE runs ADD CONSTRAINT runs_recovery_wait_phase_check
     CHECK (recovery_wait_phase IS NULL OR recovery_wait_phase = 'publication') NOT VALID;
-ALTER TABLE runs VALIDATE CONSTRAINT runs_recovery_wait_phase_check;
 
 -- Authority mirrors guard_checkpoint_coordinates (minus its enrollment leg): a run with an
 -- active intent may change owner, generation or claim state only with BOTH the persisted worker
 -- capability and the updated-API opt-in. The exception rolls back the surrounding savepoint.
+-- The trigger's WHEN carries the authority legs, so ordinary run writes (heartbeats) skip plpgsql.
 -- +goose StatementBegin
 CREATE FUNCTION guard_publication_resume() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE
-    authority boolean;
 BEGIN
-    IF TG_OP = 'INSERT' THEN RETURN NEW; END IF;
-    authority := (NEW.worker_id IS NOT NULL AND NEW.worker_id IS DISTINCT FROM OLD.worker_id)
-        OR NEW.claim_generation IS DISTINCT FROM OLD.claim_generation
-        OR (OLD.claim_released_at IS NOT NULL AND NEW.claim_released_at IS NULL)
-        OR (NEW.status IS DISTINCT FROM OLD.status AND OLD.status NOT IN ('claimed','running') AND NEW.status IN ('claimed','running','awaiting_approval','awaiting_input','awaiting_followup'));
-    IF NOT authority THEN RETURN NEW; END IF;
     IF NOT EXISTS (SELECT 1 FROM run_publication_resume p WHERE p.run_id = NEW.id AND p.state = 'active') THEN
         RETURN NEW;
     END IF;
@@ -58,8 +56,15 @@ BEGIN
     RETURN NEW;
 END;
 $$;
-CREATE TRIGGER guard_publication_resume_trg BEFORE INSERT OR UPDATE ON runs
-FOR EACH ROW EXECUTE FUNCTION guard_publication_resume();
+CREATE TRIGGER guard_publication_resume_trg BEFORE UPDATE ON runs
+FOR EACH ROW WHEN (
+    (NEW.worker_id IS NOT NULL AND NEW.worker_id IS DISTINCT FROM OLD.worker_id)
+    OR NEW.claim_generation IS DISTINCT FROM OLD.claim_generation
+    OR (OLD.claim_released_at IS NOT NULL AND NEW.claim_released_at IS NULL)
+    OR (NEW.status IS DISTINCT FROM OLD.status AND OLD.status NOT IN ('claimed', 'running')
+        AND NEW.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup'))
+)
+EXECUTE FUNCTION guard_publication_resume();
 -- +goose StatementEnd
 
 -- Persisted meaning of the phase and hold reason is bounded by the park they describe. These
@@ -86,7 +91,8 @@ END;
 $$;
 CREATE TRIGGER clear_publication_hold_reason_trg AFTER UPDATE ON runs
 FOR EACH ROW
-WHEN (NEW.status <> 'recovery_wait' OR NEW.recovery_wait_cause IS DISTINCT FROM 'forge_unreachable')
+WHEN (OLD.status = 'recovery_wait' AND OLD.recovery_wait_cause = 'forge_unreachable'
+      AND (NEW.status <> 'recovery_wait' OR NEW.recovery_wait_cause IS DISTINCT FROM 'forge_unreachable'))
 EXECUTE FUNCTION clear_publication_hold_reason();
 -- +goose StatementEnd
 
@@ -143,9 +149,25 @@ END;
 $$;
 CREATE TRIGGER guard_publication_resume_row_trg BEFORE INSERT OR UPDATE ON run_publication_resume
 FOR EACH ROW EXECUTE FUNCTION guard_publication_resume_row();
+
+-- A row is deleted only with the API opt-in, or when its run is already gone (the ON DELETE
+-- CASCADE from runs: the parent delete is visible by the time the referential action runs).
+CREATE FUNCTION guard_publication_resume_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('uzi.publication_resume_api', true) IS DISTINCT FROM 'v1'
+       AND EXISTS (SELECT 1 FROM runs r WHERE r.id = OLD.run_id)
+    THEN
+        RAISE EXCEPTION 'publication resume delete requires updated API' USING ERRCODE = '23514';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+CREATE TRIGGER guard_publication_resume_delete_trg BEFORE DELETE ON run_publication_resume
+FOR EACH ROW EXECUTE FUNCTION guard_publication_resume_delete();
 -- +goose StatementEnd
 
 -- +goose Down
+SET LOCAL lock_timeout = '5s';
 -- Exclude concurrent enrollment before checking for enrolled runs. The next statement takes a
 -- fresh READ COMMITTED snapshot after this lock is acquired.
 LOCK TABLE runs IN ACCESS EXCLUSIVE MODE;
@@ -169,5 +191,6 @@ DROP FUNCTION normalize_recovery_wait_phase();
 DROP FUNCTION guard_publication_resume();
 DROP TABLE run_publication_resume;
 DROP FUNCTION guard_publication_resume_row();
+DROP FUNCTION guard_publication_resume_delete();
 ALTER TABLE runs DROP CONSTRAINT runs_recovery_wait_phase_check;
 ALTER TABLE runs DROP COLUMN recovery_wait_phase;

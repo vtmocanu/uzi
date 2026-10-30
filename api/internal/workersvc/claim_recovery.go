@@ -248,8 +248,13 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			return nil, "", err
 		}
 	} else if live, ok := q.(pgxClaimFinishTx); ok {
-		// A publication-enrolled run needs only the opt-in; no worker lock is added for it.
-		if err := live.OptInRunFences(ctx); err != nil {
+		// A publication-enrolled run locks its worker before the run row, like a checkpoint run;
+		// any other run needs only the opt-in.
+		enrolled, err := publicationEnrolled(ctx, live.Queries, run.ID)
+		if err != nil {
+			return nil, "", err
+		}
+		if err := optInRunFences(ctx, live, identity.workerID, !enrolled); err != nil {
 			return nil, "", err
 		}
 	}

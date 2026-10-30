@@ -218,7 +218,8 @@ func (b *sourceOverlapBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
 	}
 }
 func (tx sourceOverlapTx) Exec(ctx context.Context, query string, args ...any) (pgconn.CommandTag, error) {
-	if !strings.HasPrefix(query, "SET TRANSACTION") {
+	// The transaction-local run-fence opt-in (issue #1324) is a setting, not a run write.
+	if !strings.HasPrefix(query, "SET TRANSACTION") && !strings.HasPrefix(query, "-- name: OptInRunFences") {
 		tx.owner.writes.Add(1)
 	}
 	return tx.Tx.Exec(ctx, query, args...)
