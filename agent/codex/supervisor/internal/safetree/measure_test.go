@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -274,6 +275,183 @@ func withFstatat(t *testing.T, g func(dirfd int, path string, st *unix.Stat_t, f
 	prev := fstatat
 	fstatat = g
 	t.Cleanup(func() { fstatat = prev })
+}
+
+// withFstatatFor wraps the real fstatat and lets edit alter the result for the
+// named entry (the root is never named by Measure's fstatat).
+func withFstatatFor(t *testing.T, name string, edit func(dirfd int, st *unix.Stat_t)) {
+	t.Helper()
+	withFstatat(t, func(dirfd int, p string, st *unix.Stat_t, flags int) error {
+		err := unix.Fstatat(dirfd, p, st, flags)
+		if err == nil && p == name {
+			edit(dirfd, st)
+		}
+		return err
+	})
+}
+
+func TestMeasureChildEntryChecks(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	setup := func(t *testing.T) (*fixture, string) {
+		f := newFixture(t)
+		root := newMeasureTree(t, f)
+		writeSized(t, filepath.Join(root, "x"), 10, 0o600)
+		return f, root
+	}
+	t.Run("foreign_owner_child", func(t *testing.T) {
+		f, _ := setup(t)
+		withFstatatFor(t, "x", func(_ int, st *unix.Stat_t) { st.Uid++ })
+		if _, err := measureTree(t, f, wideLimits); !errors.Is(err, ErrOwner) || Reason(err) != "owner" {
+			t.Fatalf("err = %v, want ErrOwner", err)
+		}
+	})
+	t.Run("other_device_child", func(t *testing.T) {
+		f, _ := setup(t)
+		withFstatatFor(t, "x", func(_ int, st *unix.Stat_t) { st.Dev++ })
+		if _, err := measureTree(t, f, wideLimits); !errors.Is(err, ErrMismatch) || Reason(err) != "mismatch" {
+			t.Fatalf("err = %v, want ErrMismatch", err)
+		}
+	})
+	t.Run("fstatat_eio_is_not_skipped", func(t *testing.T) {
+		f, _ := setup(t)
+		withFstatat(t, func(dirfd int, p string, st *unix.Stat_t, flags int) error {
+			if p == "x" {
+				return unix.EIO
+			}
+			return unix.Fstatat(dirfd, p, st, flags)
+		})
+		got, err := measureTree(t, f, wideLimits)
+		if !errors.Is(err, ErrIO) || Reason(err) != "io" || got.Entries != 0 {
+			t.Fatalf("got %+v, %v; want ErrIO with nothing counted", got, err)
+		}
+	})
+}
+
+// A directory replaced by a different directory is ErrMismatch and its
+// content is not measured, whichever of the two opens it lands between.
+func TestMeasureChildDirectorySwapIsMismatch(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	for _, tc := range []string{"between_fstatat_and_path_open", "between_the_two_opens"} {
+		t.Run(tc, func(t *testing.T) {
+			f := newFixture(t)
+			root := newMeasureTree(t, f)
+			orig := filepath.Join(root, "d")
+			mkdirMode(t, orig, 0o700)
+			repl := root + "-repl"
+			mkdirMode(t, repl, 0o700)
+			writeSized(t, filepath.Join(repl, "inner"), 10, 0o600)
+			swapped := false
+			swap := func() {
+				if swapped {
+					return
+				}
+				swapped = true
+				if err := os.Rename(orig, orig+".old"); err != nil {
+					t.Error(err)
+				}
+				if err := os.Rename(repl, orig); err != nil {
+					t.Error(err)
+				}
+			}
+			if tc == "between_the_two_opens" {
+				prev := hookBetweenPathAndReadOpen
+				hookBetweenPathAndReadOpen = func(_ int, name string) {
+					if name == "d" {
+						swap()
+					}
+				}
+				t.Cleanup(func() { hookBetweenPathAndReadOpen = prev })
+			} else {
+				withFstatatFor(t, "d", func(int, *unix.Stat_t) { swap() })
+			}
+			got, err := measureTree(t, f, wideLimits)
+			if !swapped || !errors.Is(err, ErrMismatch) || Reason(err) != "mismatch" {
+				t.Fatalf("got %+v, %v (swapped=%v); want ErrMismatch", got, err, swapped)
+			}
+			if got.Entries != 1 {
+				t.Fatalf("Entries = %d: the swapped-in directory was measured", got.Entries)
+			}
+		})
+	}
+}
+
+// A child directory that fails to open for a reason other than ENOENT is an
+// error, never a skipped vanish.
+func TestMeasureChildDirectoryOpenFailureIsError(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	newTree := func(t *testing.T) *fixture {
+		f := newFixture(t)
+		root := newMeasureTree(t, f)
+		mkdirMode(t, filepath.Join(root, "d"), 0o700)
+		writeSized(t, filepath.Join(root, "d", "inner"), 10, 0o600)
+		return f
+	}
+	t.Run("reopen_eacces", func(t *testing.T) {
+		f := newTree(t)
+		prev := hookBetweenPathAndReadOpen
+		hookBetweenPathAndReadOpen = func(_ int, name string) {
+			if name == "d" {
+				mustChmod(t, filepath.Join(f.root(), "d"), 0o000)
+			}
+		}
+		t.Cleanup(func() {
+			hookBetweenPathAndReadOpen = prev
+			mustChmod(t, filepath.Join(f.root(), "d"), 0o700)
+		})
+		got, err := measureTree(t, f, wideLimits)
+		if err == nil || !errors.Is(err, ErrIO) || errors.Is(err, unix.ENOENT) {
+			t.Fatalf("got %+v, %v; want ErrIO", got, err)
+		}
+	})
+	t.Run("path_fstat_eio", func(t *testing.T) {
+		f := newTree(t)
+		calls := 0
+		prev := fstat
+		// Root openDir: the O_PATH fstat and the reopen fstat; the third call
+		// is the child's O_PATH fstat.
+		fstat = func(fd int, st *unix.Stat_t) error {
+			calls++
+			if calls == 3 {
+				return unix.EIO
+			}
+			return unix.Fstat(fd, st)
+		}
+		t.Cleanup(func() { fstat = prev })
+		got, err := measureTree(t, f, wideLimits)
+		if !errors.Is(err, ErrIO) || Reason(err) != "io" || calls < 3 {
+			t.Fatalf("got %+v, %v (fstat calls=%d); want ErrIO", got, err, calls)
+		}
+	})
+}
+
+// Sparse files with huge apparent sizes must not wrap the byte total to a
+// small number: the walk stops, incomplete "bytes", saturated at MaxUint64.
+func TestMeasureByteTotalOverflowIsIncomplete(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	f := newFixture(t)
+	root := newMeasureTree(t, f)
+	for _, n := range []string{"a", "b", "c"} {
+		writeSized(t, filepath.Join(root, n), 1, 0o600)
+	}
+	withFstatat(t, func(dirfd int, p string, st *unix.Stat_t, flags int) error {
+		err := unix.Fstatat(dirfd, p, st, flags)
+		if err == nil {
+			st.Size = math.MaxInt64
+		}
+		return err
+	})
+	got, err := measureTree(t, f, wideLimits)
+	if !errors.Is(err, ErrByteLimit) || Reason(err) != "bytes" || got.Bytes != math.MaxUint64 {
+		t.Fatalf("got %+v, %v; want ErrByteLimit with saturated bytes", got, err)
+	}
 }
 
 func TestMeasureSkipsEntryGoneBeforeFstatat(t *testing.T) {

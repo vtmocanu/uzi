@@ -43,7 +43,7 @@ func measureCache(rootFd int, token string, uid int, out io.Writer, now func() t
 func measureCacheLimits(rootFd int, token string, uid int, out io.Writer, lim safetree.Limits) int {
 	use, err := safetree.Measure(rootFd, token, uid, lim)
 	line := cacheMeasureLine{Event: "cache_measure", State: "complete", Bytes: use.Bytes, Entries: use.Entries}
-	code := cacheExitRemoved
+	code := cacheExitComplete
 	if err != nil {
 		line.State, line.Reason, code = "incomplete", safetree.Reason(err), cacheExitIncomplete
 	}

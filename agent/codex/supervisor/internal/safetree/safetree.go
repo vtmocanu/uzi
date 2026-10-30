@@ -230,6 +230,8 @@ func Reason(err error) string {
 		return "entries"
 	case errors.Is(err, ErrDepthLimit):
 		return "depth"
+	case errors.Is(err, ErrByteLimit):
+		return "bytes"
 	default:
 		return "io"
 	}

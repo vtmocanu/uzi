@@ -3,24 +3,31 @@ package safetree
 import (
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-// Measure's limit failures. Their Reason words are "entries" and "depth"; an
-// expired deadline is ErrDeadline.
+// Measure's limit failures. Their Reason words are "entries", "depth" and
+// "bytes"; an expired deadline is ErrDeadline.
 var (
 	// ErrEntryLimit: the tree holds more entries than Limits.MaxEntries.
 	ErrEntryLimit = errors.New("safetree: entry limit")
 	// ErrDepthLimit: the tree is deeper than Limits.MaxDepth.
 	ErrDepthLimit = errors.New("safetree: depth limit")
+	// ErrByteLimit: the byte total would overflow uint64 (a peer can make
+	// sparse files with huge apparent sizes). Usage.Bytes is then saturated at
+	// math.MaxUint64, never a wrapped small value.
+	ErrByteLimit = errors.New("safetree: byte limit")
 )
 
 // Limits bounds one Measure. MaxEntries counts every entry below the root
 // (files, symlinks, directories); MaxDepth is the deepest directory level
 // below the root that is entered (the root's children are level 1); a zero
-// Deadline means none.
+// Deadline means none. A MaxEntries of zero or less means unlimited entries;
+// a MaxDepth of zero or less forbids any subdirectory (ErrDepthLimit at the
+// first one).
 type Limits struct {
 	MaxEntries int
 	MaxDepth   int
@@ -46,9 +53,12 @@ type Usage struct {
 // itself is not charged and not counted. Entries must sit on the root's
 // filesystem (ErrMismatch) and be owned by uid (ErrOwner).
 //
-// An entry that vanished after getdents listed it, or a directory that
-// vanished before it was opened, is skipped, so a tree with concurrent writers
-// can be undercounted. A missing root is ErrNotExist. The walk is depth-first
+// An entry that vanished before its fstatat, and a directory that vanished
+// before its first open or between its two opens (including one renamed
+// away), is skipped, so a tree with concurrent writers can be undercounted.
+// A directory swapped for a different object between those opens is
+// ErrMismatch, not skipped. A byte total that would overflow uint64 stops the
+// walk with ErrByteLimit and Usage.Bytes saturated at math.MaxUint64. A missing root is ErrNotExist. The walk is depth-first
 // and fd-relative with a single forward getdents pass per directory; it holds
 // at most MaxDepth+2 fds at once. It stops at the first error, returning the
 // partial Usage.
@@ -130,7 +140,12 @@ func (m *measurer) entry(dirfd int, name string, depth int) error {
 		return ErrEntryLimit
 	}
 	m.use.Entries++
-	m.use.Bytes += charge(&st)
+	c := charge(&st)
+	if c > math.MaxUint64-m.use.Bytes {
+		m.use.Bytes = math.MaxUint64
+		return ErrByteLimit
+	}
+	m.use.Bytes += c
 	if !isDir(&st) {
 		return nil
 	}
@@ -140,8 +155,10 @@ func (m *measurer) entry(dirfd int, name string, depth int) error {
 	}
 	child, _, err := openDir(dirfd, name, ident{dev: uint64(st.Dev), ino: st.Ino, set: true}, m.uid, readOnlyOpen, "measure open")
 	if err != nil {
+		// Relies on openDir keeping the errno wrapped: ENOENT of the O_PATH
+		// open sits inside ErrIO, and ENOENT of the reopen inside ErrMismatch.
 		if errors.Is(err, unix.ENOENT) {
-			return nil // the directory vanished before it was opened
+			return nil // the directory vanished before or between its opens
 		}
 		return err
 	}
@@ -150,8 +167,9 @@ func (m *measurer) entry(dirfd int, name string, depth int) error {
 	return err
 }
 
-// charge is max(st_size, st_blocks*512): a sparse file costs its allocated
-// blocks, a file with inline or compressed data its apparent size.
+// charge is max(st_size, st_blocks*512): a sparse file costs its apparent
+// size and a fully allocated one its blocks. Over-reporting is the safe
+// direction: it can only trigger rotation, never hide growth.
 func charge(st *unix.Stat_t) uint64 {
 	size, blocks := uint64(max(st.Size, 0)), uint64(max(st.Blocks, 0))*512
 	return max(size, blocks)

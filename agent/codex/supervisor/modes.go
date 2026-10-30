@@ -125,9 +125,9 @@ type reapErrorLine struct {
 	Reason string `json:"reason"`
 }
 
-// runMode runs the standalone mode args[0] names: for --hold-cache the
-// nondumpable step first (--hold-cache and --measure-cache), then fd hygiene, then the strict argv, then the uid
-// check (real and effective uid must both be --expect-uid), then the mode. It
+// runMode runs the standalone mode args[0] names. Order: for --hold-cache and
+// --measure-cache only, the nondumpable step first; then fd hygiene, the
+// strict argv, then the uid check (real and effective uid must both be --expect-uid), then the mode. It
 // returns the exit code.
 func runMode(args []string, env modeEnv) int {
 	fail := func(reason string) int {

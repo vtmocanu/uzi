@@ -264,6 +264,12 @@ func TestMeasureCacheModeIsNonMutating(t *testing.T) {
 	}
 }
 
+func TestMeasureCacheCompiledInLimits(t *testing.T) {
+	if measureMaxEntries != 500_000 || measureMaxDepth != 64 || measureWall != 5*time.Second {
+		t.Fatalf("limits = %d, %d, %v; doc.go states 500000, 64, 5s", measureMaxEntries, measureMaxDepth, measureWall)
+	}
+}
+
 func TestMeasureCacheLimitsAndDeadline(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
 		return

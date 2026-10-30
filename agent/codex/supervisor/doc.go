@@ -244,14 +244,18 @@
 // directory's filesystem ("mismatch") and owned by --expect-uid ("owner"). It
 // is charged max(st_size, st_blocks*512); a symlink is charged for its own
 // inode only and is never followed, and only directories are opened. The token
-// directory's own inode is not charged or counted. An entry (or a directory)
-// that vanished during the walk is skipped, so a tree under concurrent writers
-// may be UNDERCOUNTED; the figure is an estimate, not a bound. Compiled-in
-// bounds: 500000 entries, depth 64, 5 s of wall time; past any of them the
-// answer is incomplete with the partial counts. A missing token directory is
+// directory's own inode is not charged or counted. An entry that vanished
+// before its lstat, and a directory that vanished before its first open or
+// between its two opens (including a rename-away), is skipped, so a tree under
+// concurrent writers may be UNDERCOUNTED; the figure is an estimate, not a
+// bound. A directory replaced by a different object between the opens is
+// "mismatch". Compiled-in bounds: 500000 entries, depth 64, 5 s of wall time;
+// past any of them the answer is incomplete with the partial counts. A byte
+// total that would overflow uint64 is incomplete "bytes" with bytes saturated
+// at 18446744073709551615. A missing token directory is
 // incomplete "absent". Its one line always carries all five keys:
 //
 //	{"event":"cache_measure","state":"complete","bytes":<n>,"entries":<n>,"reason":""}                                       // exit 0
-//	{"event":"cache_measure","state":"incomplete","bytes":<n>,"entries":<n>,"reason":"absent"|"entries"|"depth"|"deadline"|"mismatch"|"owner"|"io"}  // exit 3
+//	{"event":"cache_measure","state":"incomplete","bytes":<n>,"entries":<n>,"reason":"absent"|"entries"|"depth"|"bytes"|"deadline"|"mismatch"|"owner"|"io"}  // exit 3
 //	{"event":"cache_error","reason":"dumpable"|"fd_hygiene"|"args"|"uid"|"root"}                                              // exit 2
 package main
