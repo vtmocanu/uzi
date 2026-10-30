@@ -159,8 +159,8 @@ No new kind/SDK production E2E or paused-recycled-resumed result is claimed.
 
 **Outcome:** retain the existing custody checks. This records M1 investigation,
 not a runtime amendment. D4/D5 and D7-D9 remain operational policy verbatim.
-M2 worker documentation/mirror work remains the next milestone; any runtime
-amendment needs a separate gate. The matrix recommends a next plan, not authorization.
+At the M1 checkpoint, M2 worker documentation/mirror work remained the next
+milestone; any runtime amendment needs a separate gate. The matrix recommends a next plan, not authorization.
 
 ### Command matrix and source boundary
 
@@ -290,8 +290,8 @@ and `run-quiescence.test.ts` suites under agent/test; the selected
 late-create coverage. No positive-exception red/green, runtime change or full
 suite result is claimed. An E2E literal sweep found no matching prune
 outcome/flag hits in e2e/phases, e2e/lib.sh, e2e/lib.test.sh or e2e/forge-fake;
-no runtime contract changed and no E2E phases ran. Broader static/component
-checks remain pending M2.
+no runtime contract changed and no E2E phases ran. At the M1 checkpoint,
+broader static/component checks remained pending M2.
 
 The architect judged a candidate next-gate invariant, not approved policy:
 exclude tracked executions/in-flight claims, require fresh known custody after
