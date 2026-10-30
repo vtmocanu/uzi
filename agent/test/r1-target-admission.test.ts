@@ -345,3 +345,47 @@ it("R1 heartbeat includes generation-free scope depth without inventing source a
   assert.equal(outbox.listPendingTerminals().length, 0);
   assert.equal(outbox.policyInventoryCoverageAvailable(), false);
 });
+
+it("R1 local reconciliation returns an incomplete continuation within 256 visited entries", async t => {
+  const { outbox, root } = await fixture(t);
+  await fs.mkdir(path.join(root, run));
+  for (let i = 0; i < 600; i++) await fs.writeFile(path.join(root, run, `ignored-${i}`), "");
+  for (let i = 0; i < 300; i++) await fs.writeFile(path.join(root, `ignored-${i}`), "");
+  const open = fs.opendir.bind(fs);
+  let visited = 0;
+  t.mock.method(fs, "opendir", async (file: Parameters<typeof fs.opendir>[0]) => {
+    const directory = await open(file);
+    return new Proxy(directory, { get(target, key) {
+      if (key === "read") return async () => {
+        const entry = await target.read();
+        if (entry) visited++;
+        return entry;
+      };
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+  });
+  const resolver = outbox as unknown as {
+    scanTargetPolicyPages?: (id: string) => AsyncGenerator<void, boolean, void>;
+    scanTargetPolicy(id: string): Promise<boolean>;
+  };
+  // Old code has a single unbounded invocation; keep its behavioral assertion
+  // reachable rather than treating a missing post-fix helper as a red.
+  const pages = resolver.scanTargetPolicyPages?.(run) ?? {
+    next: async () => ({ done: true as const, value: await resolver.scanTargetPolicy(run) }),
+    return: async (value: boolean) => ({ done: true as const, value }),
+  };
+  let previous = 0, steps = 0;
+  try {
+    for (;;) {
+      const result = await pages.next();
+      steps++;
+      assert.ok(visited - previous <= 256, `one invocation visited ${visited - previous} entries`);
+      previous = visited;
+      if (result.done) { assert.equal(result.value, false); break; }
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  } finally { await pages.return(true); }
+  assert.ok(steps >= 4);
+  assert.ok(visited >= 901, "all ignored root/run entries are eventually covered without losing the demand");
+});

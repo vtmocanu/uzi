@@ -882,20 +882,25 @@ export class Outbox {
    * limits remain aggregate across the entire demand. Errors stop this demand,
    * while root/alias mutation permits at most one fresh pass. No sibling queue. */
   private async scanTargetPolicy(runId: string): Promise<boolean> {
+    const pages = this.scanTargetPolicyPages(runId);
+    try {
+      for (;;) {
+        const page = await pages.next();
+        if (page.done) return page.value;
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+    } finally { await pages.return(true); }
+  }
+
+  /** One next() is one bounded reconciliation invocation. The coalesced demand
+   * owns this cursor, its byte counters and at most 64 alias bindings across pages. */
+  private async *scanTargetPolicyPages(runId: string): AsyncGenerator<void, boolean, void> {
     let bytes = 0;
     // At most two passes of 64 aliases: counters remain bounded across retries.
     const readByRun = new Map<string, number>();
+    let visits = 0;
+    let budget = { deadline: Date.now() + TARGET_POLICY_SLICE_MS };
     for (let attempt = 0; attempt < 2; attempt++) {
-      let visits = 0;
-      let budget = { deadline: Date.now() + TARGET_POLICY_SLICE_MS };
-      const checkpoint = async () => {
-        if (visits >= TARGET_POLICY_SLICE_ENTRIES || Date.now() >= budget.deadline) {
-          await new Promise<void>(resolve => setImmediate(resolve));
-          visits = 0;
-          budget = { deadline: Date.now() + TARGET_POLICY_SLICE_MS };
-        }
-        visits++;
-      };
       if (this.pendingPolicyMemory(runId)) return true;
       let rootStat;
       try { rootStat = await fs.lstat(this.root, { bigint: true }); }
@@ -904,7 +909,12 @@ export class Outbox {
         // Preserve the legacy no-follow missing-root proof without a target scan.
         let component = path.parse(this.root).root;
         for (const name of this.root.slice(component.length).split(path.sep)) {
-          await checkpoint();
+          if (visits >= TARGET_POLICY_SLICE_ENTRIES || Date.now() >= budget.deadline) {
+            yield;
+            visits = 0;
+            budget = { deadline: Date.now() + TARGET_POLICY_SLICE_MS };
+          }
+          visits++;
           component = path.join(component, name);
           let ancestor;
           try { ancestor = await fs.lstat(component); }
@@ -925,7 +935,12 @@ export class Outbox {
       const root = await fs.opendir(this.root);
       try {
         for (;;) {
-          await checkpoint();
+          if (visits >= TARGET_POLICY_SLICE_ENTRIES || Date.now() >= budget.deadline) {
+            yield;
+            visits = 0;
+            budget = { deadline: Date.now() + TARGET_POLICY_SLICE_MS };
+          }
+          visits++;
           const entry = await root.read();
           if (!entry) break;
           if (entry.name.toLowerCase() !== runId.toLowerCase()) continue;
@@ -951,7 +966,12 @@ export class Outbox {
           const dir = await fs.opendir(directory);
           try {
             for (;;) {
-              await checkpoint();
+              if (visits >= TARGET_POLICY_SLICE_ENTRIES || Date.now() >= budget.deadline) {
+                yield;
+                visits = 0;
+                budget = { deadline: Date.now() + TARGET_POLICY_SLICE_MS };
+              }
+              visits++;
               // A reservation precedes the raw directory read. A full catalog may
               // still read a raw name to find EOF or an already represented file,
               // but does not decode a new candidate's generation or authenticate it.
@@ -1028,11 +1048,21 @@ export class Outbox {
       // Empty aliases matter: adding a file changes the alias version without
       // changing the root. Validation is sliced just like discovery.
       for (const alias of aliases) {
-        await checkpoint();
+        if (visits >= TARGET_POLICY_SLICE_ENTRIES || Date.now() >= budget.deadline) {
+          yield;
+          visits = 0;
+          budget = { deadline: Date.now() + TARGET_POLICY_SLICE_MS };
+        }
+        visits++;
         if (!await this.terminalDirectorySafe(alias.id, budget) ||
             fileVersion(await fs.lstat(this.runDir(alias.id), { bigint: true })) !== alias.version) changed = true;
       }
-      await checkpoint();
+      if (visits >= TARGET_POLICY_SLICE_ENTRIES || Date.now() >= budget.deadline) {
+        yield;
+        visits = 0;
+        budget = { deadline: Date.now() + TARGET_POLICY_SLICE_MS };
+      }
+      visits++;
       if (fileVersion(await fs.lstat(this.root, { bigint: true })) !== fileVersion(rootStat)) changed = true;
       if (changed) continue;
       // Consumption is synchronous with the final observation. The run arbiter
