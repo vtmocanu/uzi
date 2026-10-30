@@ -191,7 +191,9 @@ describe("buildRunExecutor: command cache rotation budget (issue #3675)", () => 
   it("main() threads config.codexCommandCacheRunBytes into buildRunExecutor", () => {
     // main() starts the worker and cannot be called here, so its wiring is pinned in the source.
     const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
-    assert.match(source, /codexCommandCacheRunBytes:\s*config\.codexCommandCacheRunBytes\b/);
+    // Anchored on the buildRunExecutor( call's argument object so a comment or an unrelated
+    // literal elsewhere cannot satisfy it.
+    assert.match(source, /buildRunExecutor\(runId, codex, \{[^}]*\bcodexCommandCacheRunBytes:\s*config\.codexCommandCacheRunBytes\b/);
   });
 });
 

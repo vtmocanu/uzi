@@ -371,7 +371,7 @@ describe("command cache rotation (issue #3675)", () => {
       assert.deepEqual(r.g1.releases, [true]);
     });
 
-    it("a failed replacement start that created no process keeps the seal provable and the latch", async () => {
+    it("a failed replacement start that created no process keeps the seal provable", async () => {
       const r = rig();
       await runRoot(r.cache);
       r.measures[0]!.resolve(OVER);

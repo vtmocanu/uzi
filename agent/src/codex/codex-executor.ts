@@ -7147,6 +7147,8 @@ export class HeldRunCommandCache implements RunCommandCache {
       return;
     }
     // Admitted work: a lifetime that has closed refuses without invoking, so nothing spawns.
+    // Defensive: the catch is unreachable today (admitCapture already asserted the lifetime
+    // open above), kept so a future refusal here cannot leave rotationPending stuck.
     this.lifetime.admit(start).catch(() => { if (!invoked) generation.rotationPending = false; });
   }
 

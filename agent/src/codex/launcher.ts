@@ -2117,11 +2117,11 @@ export interface StandaloneModeDeps {
   readonly spawn?: SpawnStandaloneMode;
   /** Overrides the mode's default bound (ms). */
   readonly timeoutMs?: number;
-  /** Reaper only: signal a reaper still running at its deadline (or on abort). The worker
+  /** Reaper and measure: signal a helper still running at its deadline (or on abort). The worker
    *  lacks CAP_KILL over uid 10003, so the default forks a `kill -KILL` as the command uid.
    *  Returns whether the kill was delivered (a thrown error counts as not delivered). */
   readonly killAsCommandUid?: (pid: number) => boolean;
-  /** Reaper only: the synchronous runner of the default kill (production: spawnSync). */
+  /** Reaper and measure: the synchronous runner of the default kill (production: spawnSync). */
   readonly runKill?: (command: string, args: readonly string[]) => { readonly status: number | null; readonly error?: Error };
   /** Reaper only: how long to wait for a killed reaper's `close` (default 10 s). */
   readonly killWaitMs?: number;
@@ -2277,9 +2277,20 @@ type OneLineRun =
   | StillRunningMode
   | { readonly kind: "spawn"; readonly message: string };
 type CompletedOneLineRun = Extract<OneLineRun, { kind: "done" }>;
+/** `exited` resolves at the child's `exit` (the process is reaped; its stdout may still be held
+ *  open by another writer, so `closed` may never follow); `hasExited` is the same fact read
+ *  synchronously; `destroyStdout` abandons the stdout stream. */
+interface StillRunningBase {
+  readonly pid?: number;
+  readonly closed: Promise<void>;
+  readonly exited: Promise<void>;
+  readonly hasExited: () => boolean;
+  readonly destroyStdout: () => void;
+  readonly completion?: Promise<CompletedOneLineRun>;
+}
 type StillRunningMode =
-  | { readonly kind: "timeout"; readonly pid?: number; readonly closed: Promise<void>; readonly completion?: Promise<CompletedOneLineRun> }
-  | { readonly kind: "aborted"; readonly pid?: number; readonly closed: Promise<void>; readonly completion?: Promise<CompletedOneLineRun> };
+  | ({ readonly kind: "timeout" } & StillRunningBase)
+  | ({ readonly kind: "aborted" } & StillRunningBase);
 
 /** One run of a one-line mode: spawn, read at most two lines (a second is a breach),
  *  and settle at `close`, the deadline, or an abort of `signal`. An already-aborted
@@ -2293,7 +2304,7 @@ function runOneLineMode(
 ): Promise<OneLineRun> {
   return new Promise((resolve) => {
     if (signal?.aborted) {
-      resolve({ kind: "aborted", closed: Promise.resolve() });
+      resolve({ kind: "aborted", closed: Promise.resolve(), exited: Promise.resolve(), hasExited: () => true, destroyStdout: () => {} });
       return;
     }
     let settled = false;
@@ -2304,7 +2315,15 @@ function runOneLineMode(
     const closed = new Promise<void>((r) => { markClosed = r; });
     let complete!: (outcome: CompletedOneLineRun) => void;
     const completion = new Promise<CompletedOneLineRun>(resolve => { complete = resolve; });
-    const onAbort = (): void => settle({ kind: "aborted", pid: child?.pid, closed, completion });
+    let exitSeen = false;
+    let markExited!: () => void;
+    const exited = new Promise<void>((r) => { markExited = r; });
+    const running = (): StillRunningBase => ({
+      pid: child?.pid, closed, completion, exited,
+      hasExited: () => exitSeen,
+      destroyStdout: () => { try { child?.stdout?.destroy(); } catch { /* already gone */ } },
+    });
+    const onAbort = (): void => settle({ kind: "aborted", ...running() });
     const settle = (value: OneLineRun): void => {
       if (settled) return;
       settled = true;
@@ -2312,7 +2331,7 @@ function runOneLineMode(
       signal?.removeEventListener("abort", onAbort);
       resolve(value);
     };
-    const timer = setTimeout(() => settle({ kind: "timeout", pid: child?.pid, closed, completion }), timeoutMs);
+    const timer = setTimeout(() => settle({ kind: "timeout", ...running() }), timeoutMs);
     if (typeof timer.unref === "function") timer.unref();
     signal?.addEventListener("abort", onAbort, { once: true });
     try {
@@ -2322,6 +2341,7 @@ function runOneLineMode(
       return;
     }
     child.on("error", (err: Error) => settle({ kind: "spawn", message: err.message }));
+    child.once("exit", () => { exitSeen = true; markExited(); });
     if (!child.stdout) {
       settle({ kind: "spawn", message: "no stdout channel" });
       return;
@@ -2807,6 +2827,27 @@ const workerMeasureLimiter = createMeasureLimiter();
 export interface MeasureDeps extends StandaloneModeDeps {
   /** Tests only: replaces the worker-wide limiter. */
   readonly limiter?: MeasureLimiter;
+  /** Tests only: replaces {@link MEASURE_STDOUT_DRAIN_MS}. */
+  readonly drainMs?: number;
+}
+
+/** How long stdout may stay open after the helper's `exit` before the helper counts as ended. */
+const MEASURE_STDOUT_DRAIN_MS = 2000;
+
+/** Resolves at the helper's `close`, or MEASURE_STDOUT_DRAIN_MS-bounded after its `exit`
+ *  (destroying stdout). Never rejects. */
+function helperEnded(run: StillRunningMode, drainMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    let done = false;
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (): void => { if (!done) { done = true; clearTimeout(timer); resolve(); } };
+    void run.closed.then(finish);
+    void run.exited.then(() => {
+      if (done) return;
+      timer = setTimeout(() => { run.destroyStdout(); finish(); }, drainMs);
+      if (typeof timer.unref === "function") timer.unref();
+    });
+  });
 }
 
 function parseMeasureLine(line: string, code: number | null): CacheMeasureResult {
@@ -2841,14 +2882,19 @@ function parseMeasureLine(line: string, code: number | null): CacheMeasureResult
  * Measure one run's command cache, read-only, as the command uid (`--measure-cache`).
  *
  * Requests queue FIFO on a worker-wide concurrency-1 limiter and the slot is held from the
- * spawn until the helper's ACTUAL close, not the delivery timeout. A same-uid model command can
- * SIGSTOP the helper, so at the delivery timeout (or an abort after the spawn) the helper is
- * SIGKILLed as the command uid (`killAsCommandUid`, as the reaper is); SIGKILL works on a stopped
- * process, so its close follows and only then is the slot freed. A kill that is not delivered
- * leaves the slot held (reason `timeout_unkilled` / `aborted_unkilled`). An abort while queued is
- * `cancelled` and spawns nothing; a delivery timeout or an abort after the spawn is `unknown`
- * carrying a `settlement` that resolves at the helper's close. Only an exact complete line with
- * exit 0 is `complete`; everything else is `unknown`. Never throws.
+ * spawn until the helper has actually ended, not the delivery timeout. A same-uid model command can
+ * SIGSTOP the helper, so at the delivery timeout (or an abort after the spawn) a still-unreaped
+ * helper is SIGKILLed as the command uid (`killAsCommandUid`, as the reaper is); SIGKILL works on
+ * a stopped process. No kill is issued once its `exit` was observed (the pid may be reused). A
+ * kill that is not delivered leaves the slot held until the helper ends on its own (reason
+ * `timeout_unkilled` / `aborted_unkilled`). "Ended" is the first of: Node `close`, or `exit`
+ * followed by {@link MEASURE_STDOUT_DRAIN_MS} (stdout is then destroyed). `close` alone is not
+ * enough: it waits for every stdout writer, and a same-uid peer holding a duplicate of the write
+ * end (possible before the helper's PR_SET_DUMPABLE) would hold the slot forever. A reaped helper
+ * can no longer read the cache. Residual: that peer may keep the pipe open after the settlement.
+ * An abort while queued is `cancelled` and spawns nothing; a delivery timeout or an abort after
+ * the spawn is `unknown` carrying that `settlement`. Only an exact complete line with exit 0 is
+ * `complete`; everything else is `unknown`. Never throws.
  */
 export async function measureCommandCache(token: string, deps: MeasureDeps = {}): Promise<CacheMeasureResult> {
   if (!validToken(token)) return { state: "unknown", reason: "token" };
@@ -2867,9 +2913,11 @@ export async function measureCommandCache(token: string, deps: MeasureDeps = {})
       // The helper may still run (or be stopped): kill it as the command uid, and keep the
       // slot until it actually closes.
       held = false;
-      const settlement = run.closed.then(release, release);
-      let killed = false;
-      if (run.pid !== undefined) {
+      const settlement = helperEnded(run, deps.drainMs ?? MEASURE_STDOUT_DRAIN_MS).then(release, release);
+      // Kill only while the child is unreaped, in this one synchronous section: after `exit`
+      // the pid may belong to a live command. An already-exited helper counts as ended.
+      let killed = run.hasExited();
+      if (!killed && run.pid !== undefined) {
         const kill = deps.killAsCommandUid ?? ((pid: number) => defaultKillAsCommandUid(pid, deps.runKill ?? defaultRunKill));
         try { killed = kill(run.pid) === true; } catch { killed = false; }
       }
