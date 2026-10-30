@@ -139,7 +139,7 @@ async function readLeadContext(
 
 type SdkQueryInstance = AsyncIterable<SDKMessage> & {
   getContextUsage?(opts?: { detail?: "summary" | "full" }): Promise<ContextUsageReading>;
-  /** Feature-detected only: the pinned SDK's Query has no such method, a newer CLI may. */
+  /** Feature-detected only: the pinned SDK implements it at runtime but its d.ts does not type it. */
   getSettings?(): Promise<unknown>;
 };
 
