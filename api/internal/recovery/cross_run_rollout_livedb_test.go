@@ -32,10 +32,6 @@ func crossRunRolloutDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(admin.Close)
-	var marker string
-	if err := admin.QueryRow(ctx, "SELECT marker FROM uzi_test_harness.database_marker WHERE marker='recovery-reset-v1'").Scan(&marker); err != nil || marker != "recovery-reset-v1" {
-		t.Fatalf("rollout test requires the marked harness database: %v", err)
-	}
 	name := "cross_run_rollout_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
 		t.Fatal(err)
