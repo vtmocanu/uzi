@@ -280,7 +280,7 @@ it("R1 opaque scopes remain pending in generation-free depth and fallback reader
   await fs.writeFile(path.join(root, run, "terminal-unsafe.json"), "unknown");
   assert.equal(outbox.depthFor(run), undefined);
   assert.equal(await outbox.hasPendingPolicyOutcome(run), true);
-  assert.equal(outbox.hasPendingTerminal(run, 123), true);
+  assert.equal(outbox.hasPendingTerminal(run, 123), false);
   const depth = outbox.depthFor(run);
   assert.equal(depth?.pendingTerminal, 1);
   assert.equal(depth?.policyPendingSourceGeneration, undefined);
@@ -288,6 +288,10 @@ it("R1 opaque scopes remain pending in generation-free depth and fallback reader
   assert.equal(depth?.blockedReason, undefined);
   assert.equal(outbox.listPendingTerminals().length, 0, "an unknown source generation is never fabricated as a wire tuple");
   assert.equal(outbox.policyInventoryCoverageAvailable(), false);
+  await fs.unlink(path.join(root, run, "terminal-unsafe.json"));
+  assert.deepEqual(await outbox.journalTerminal(run, 123, "running", 0, { status: "completed" }),
+    { journaled: false, reason: "winner_unavailable" });
+  assert.equal(outbox.hasPendingTerminal(run, 123), false);
 });
 
 it("R1 demand byte allowance spans mutation retries", async t => {
@@ -344,6 +348,178 @@ it("R1 heartbeat includes generation-free scope depth without inventing source a
   assert.equal(entries?.[0]?.policy_pending_outcome_id, undefined);
   assert.equal(outbox.listPendingTerminals().length, 0);
   assert.equal(outbox.policyInventoryCoverageAvailable(), false);
+});
+
+for (const seam of ["global", "observe", "read"] as const) {
+  it("R1 B1 " + seam + " defers unrepresented authentication at full capacity without acquiring disappearance authority", async t => {
+    const { outbox, root } = await fixture(t);
+    const other = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const tokens = Array.from({ length: 1024 }, (_, i) => outbox.reservePolicyFlight(other, i + 1));
+    assert.ok(tokens.every(token => token !== undefined));
+    await fs.mkdir(path.join(root, run));
+    const source = path.join(root, run, "terminal-7.json");
+    await fs.writeFile(source, "{invalid");
+    const open = fs.open.bind(fs);
+    let bodyOpens = 0;
+    t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+      if (String(args[0]) === source) bodyOpens++;
+      return open(...args);
+    });
+    if (seam === "global") assert.equal(await outbox.hasPendingPolicyOutcome(), true);
+    else if (seam === "observe") assert.equal((await outbox.observeTerminalAuthentication(run, 7)).kind, "unreadable");
+    else assert.equal(await outbox.readTerminalJournal(run, 7), undefined);
+    assert.equal(bodyOpens, 0);
+    await fs.unlink(source);
+    assert.equal(await outbox.hasPendingPolicyOutcome(run), false,
+      "disappearance before enrollment leaves no observed semantic obligation");
+    assert.equal((await outbox.journalTerminal(run, 7, "running", 0, { status: "completed" })).journaled, true);
+  });
+}
+
+it("R1 B1 unsafe ancestry retains an opaque scope without a guessed generation", async t => {
+  const { outbox, root } = await fixture(t);
+  const actual = path.join(root, "actual");
+  await fs.mkdir(actual);
+  await fs.symlink(actual, path.join(root, run));
+  assert.equal((await outbox.journalTerminal(run, 7, "running", 0, { status: "completed" })).journaled, false);
+  assert.deepEqual(outbox.listPendingTerminals(), []);
+  await fs.unlink(path.join(root, run));
+  assert.equal(await outbox.hasPendingPolicyOutcome(run), true);
+});
+
+for (const sourceKind of ["malformed", "signed policy"] as const) {
+  it("R1 B1 direct intake reserves before interpreting " + sourceKind + " at full capacity", async t => {
+    const { outbox, root } = await fixture(t);
+    const writer = new Outbox({ root, log: nullLogger(), maxBytes: 1e6, runMaxBytes: 1e6, retentionMs: 1 });
+    await writer.init();
+    const ordinary = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    assert.equal((await outbox.journalTerminal(ordinary, 1, "running", 0, { status: "completed" })).journaled, true);
+    const other = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const tokens = Array.from({ length: 1024 }, (_, i) => outbox.reservePolicyFlight(other, i + 1));
+    assert.ok(tokens.every(token => token !== undefined));
+    const source = path.join(root, run, "terminal-7.json");
+    if (sourceKind === "signed policy") {
+      assert.equal((await writer.journalPolicyHold(run, {
+        outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", source_generation: 7, claim_generation: 7,
+        detail: "refused", continuation_mode: "same_conversation", tag: "cyberPolicy", phase: "implementation",
+        correlation_id: "pr-" + "a".repeat(32) + "-1", session_id: "session", head: "a".repeat(40),
+        published: true, checkpoint_contains_latest: true,
+      })).journaled, true);
+    } else {
+      await fs.mkdir(path.dirname(source), { recursive: true });
+      await fs.writeFile(source, "{invalid");
+    }
+    const open = fs.open.bind(fs);
+    let bodyOpens = 0;
+    t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+      if (String(args[0]) === source) bodyOpens++;
+      return open(...args);
+    });
+    assert.deepEqual(await outbox.journalTerminal(run, 7, "running", 0, { status: "completed" }),
+      { journaled: false, reason: "winner_unavailable" });
+    assert.equal(bodyOpens, 0, "an unrepresented source must not be opened for authentication without a counted slot");
+    assert.equal((await outbox.readTerminalJournal(ordinary, 1))?.body.status, "completed");
+    const empty = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    await fs.mkdir(path.join(root, empty));
+    await fs.writeFile(path.join(root, empty, "manifest.json"), "{}");
+    assert.equal((await outbox.journalTerminal(empty, 1, "running", 0, { status: "completed" })).journaled, true);
+    outbox.releasePolicyFlight(tokens[0]!);
+    const enrolled = await outbox.journalTerminal(run, 7, "running", 0, { status: "completed" });
+    assert.equal(enrolled.journaled, sourceKind === "signed policy");
+    assert.ok(bodyOpens > 0, "the available shared slot permits authentication");
+    assert.equal(outbox.reservePolicyFlight(other, 2000), undefined, "inspection transfers into counted evidence");
+    await fs.unlink(source);
+    assert.equal(await outbox.hasPendingPolicyOutcome(run), true, "enrolled evidence survives source removal");
+    assert.deepEqual(await outbox.journalTerminal(run, 8, "running", 0, { status: "completed" }),
+      { journaled: false, reason: "winner_unavailable" });
+  });
+}
+
+for (const seam of ["global", "observe", "read", "retire"] as const) {
+  it("R1 B1 " + seam + " retains newly observed malformed evidence", async t => {
+    const { outbox, root } = await fixture(t);
+    await fs.mkdir(path.join(root, run));
+    const source = path.join(root, run, "terminal-7.json");
+    await fs.writeFile(source, "{invalid");
+    if (seam === "global") assert.equal(await outbox.hasPendingPolicyOutcome(), true);
+    else if (seam === "observe") assert.equal((await outbox.observeTerminalAuthentication(run, 7)).kind, "malformed");
+    else if (seam === "read") assert.equal(await outbox.readTerminalJournal(run, 7), undefined);
+    else assert.equal(await outbox.retireTerminal(run, 7), false);
+    await fs.unlink(source);
+    assert.equal(await outbox.hasPendingPolicyOutcome(run), true);
+  });
+}
+
+it("R1 B1 a newly authenticated alias cannot replace an independent selected filename", async t => {
+  const { outbox, root } = await fixture(t);
+  const writer = new Outbox({ root, log: nullLogger(), maxBytes: 1e6, runMaxBytes: 1e6, retentionMs: 1 });
+  await writer.init();
+  assert.equal((await outbox.journalTerminal(run, 7, "running", 0, { status: "completed" })).journaled, true);
+  const source = path.join(root, run, "terminal-7.json");
+  const parked = path.join(root, run, "parked-ordinary");
+  await fs.rename(source, parked);
+  assert.equal((await writer.journalPolicyHold(run, {
+    outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", source_generation: 7, claim_generation: 7,
+    detail: "refused", continuation_mode: "same_conversation", tag: "cyberPolicy", phase: "implementation",
+    correlation_id: "pr-" + "a".repeat(32) + "-1", session_id: "session", head: "a".repeat(40),
+    published: true, checkpoint_contains_latest: true,
+  })).journaled, true);
+  const alias = path.join(root, run, "terminal-07.json");
+  await fs.rename(source, alias);
+  await fs.rename(parked, source);
+  assert.equal((await outbox.observeTerminalAuthentication(run, 7, "terminal-07.json")).kind, "unreadable");
+  const selected = outbox.listPendingTerminals().find(p => p.claim_generation === 7);
+  assert.ok(selected);
+  assert.equal(selected.outcome_kind, undefined, "ordinary metadata omits the policy discriminator");
+  assert.equal(selected.phase, "running", "the original selected phase remains immutable");
+  await fs.unlink(alias);
+  assert.equal(await outbox.hasPendingPolicyOutcome(run), true);
+  assert.equal((await outbox.readTerminalJournal(run, 7))?.body.status, "completed");
+});
+
+it("R1 B1 live policy selection during intake authentication keeps its original identity", async t => {
+  const { outbox, root } = await fixture(t);
+  const writer = new Outbox({ root, log: nullLogger(), maxBytes: 1e6, runMaxBytes: 1e6, retentionMs: 1 });
+  await writer.init();
+  assert.equal((await writer.journalTerminal(run, 7, "running", 0, { status: "completed" })).journaled, true);
+  const token = outbox.reservePolicyFlight(run, 7)!;
+  const id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const source = path.join(root, run, "terminal-7.json");
+  const open = fs.open.bind(fs);
+  let selected = false;
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const handle = await open(...args);
+    if (String(args[0]) !== source) return handle;
+    return new Proxy(handle, { get(target, key) {
+      if (key === "close") return async () => {
+        await target.close();
+        if (!selected) {
+          selected = true;
+          assert.equal(outbox.selectPolicyFlight(token, id), true);
+        }
+      };
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+  });
+  assert.deepEqual(await outbox.journalTerminal(run, 7, "running", 0, { status: "completed" }),
+    { journaled: false, reason: "winner_unavailable" });
+  assert.equal(selected, true);
+  assert.equal(outbox.listPendingTerminals().find(p => p.claim_generation === 7)?.outcome_kind, "unknown");
+  await fs.unlink(source);
+  const policy = {
+    outcome_id: id, source_generation: 7, claim_generation: 7,
+    detail: "refused" as const, continuation_mode: "same_conversation" as const,
+    tag: "cyberPolicy" as const, phase: "implementation" as const,
+    correlation_id: "pr-" + "a".repeat(32) + "-1", session_id: "session", head: "a".repeat(40),
+    published: true, checkpoint_contains_latest: true,
+  };
+  assert.equal((await outbox.journalPolicyHold(run, { ...policy,
+    outcome_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" })).journaled, false,
+    "a competitor cannot replace the selected identity");
+  assert.equal((await outbox.journalPolicyHold(run, policy)).journaled, true);
+  assert.equal(outbox.depthFor(run)?.policyPendingOutcomeId, id);
+  assert.equal((await outbox.readTerminalJournal(run, 7))?.body.outcome_id, id);
 });
 
 it("R1 local reconciliation returns an incomplete continuation within 256 visited entries", async t => {

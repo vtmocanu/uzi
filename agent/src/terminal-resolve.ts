@@ -213,7 +213,7 @@ export async function installTerminalWriteAhead(
   const canonical = canonicalizeTerminalBody(body as unknown as Record<string, unknown>, terminalMaxBytes);
   const result = await outbox.journalTerminal(runId, claimGeneration, phase, messagesThroughSeq, canonical);
   if (!result.journaled) {
-    if (result.reason === "winner_unavailable") {
+    if (result.reason === "winner_unavailable" || await outbox.hasPendingPolicyOutcome(runId)) {
       log.info("outbox: selected terminal winner unavailable; deferring outcome", {});
       return { journaled: false, deferred: true };
     }

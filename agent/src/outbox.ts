@@ -268,6 +268,25 @@ interface TerminalJournalData {
   blocked_reason?: TerminalBlockedReason;
 }
 
+/** Immutable physical rejection evidence; never a policy outcome identity. */
+interface TerminalMACBinding {
+  readonly generation: number;
+  readonly physicalRunId: string;
+  readonly fileName: string;
+  readonly dev: string;
+  readonly ino: string;
+  readonly sha256: string;
+}
+
+interface TerminalInspectionScope {
+  runId: string;
+  sourceKey?: string;
+  held: boolean;
+  since: number;
+  provisional?: boolean;
+  macBinding?: Readonly<TerminalMACBinding>;
+}
+
 /** In-memory metadata for one pending terminal journal (the file's durable fields minus the body,
  *  which the store never needs to re-read for depth/list/retire). */
 interface TerminalMeta {
@@ -838,7 +857,7 @@ export class Outbox {
   // Inspection reservations and retained unclassified physical scopes belong to
   // the same identity tier as selected metadata and producer reservations. No
   // generation is attributed to a scope whose filename cannot establish one.
-  private readonly policyInspections = new Map<symbol, { runId: string; sourceKey?: string; held: boolean; since: number }>();
+  private readonly policyInspections = new Map<symbol, TerminalInspectionScope>();
   private readonly targetProofs = new Map<string, Promise<boolean>>();
 
   private scopeProtected(runId?: string): boolean {
@@ -856,6 +875,21 @@ export class Outbox {
     const token = Symbol();
     this.policyInspections.set(token, { runId, held: false, since: this.now() });
     return token;
+  }
+
+  /** Copy only actual rejection evidence; callers never retain a mutable observation. */
+  private copyMACBinding(observation: TerminalAuthenticationObservation): Readonly<TerminalMACBinding> | undefined {
+    const { generation, fileName, fingerprint } = observation;
+    const physicalRunId = observation.physicalRunId ?? observation.runId;
+    if (observation.kind !== "mac_failure" || generation === undefined || !Number.isSafeInteger(generation) || generation < 0 ||
+        !fingerprint || !terminalRunUUID(physicalRunId) || Buffer.byteLength(physicalRunId) > 128 ||
+        Buffer.byteLength(fileName) > 255 || parseTerminalFileName(fileName) !== generation ||
+        !/^[0-9]{1,40}$/.test(fingerprint.dev) || !/^[0-9]{1,40}$/.test(fingerprint.ino) ||
+        !/^[0-9a-f]{64}$/.test(fingerprint.sha256)) return;
+    const binding = { generation, physicalRunId, fileName, dev: fingerprint.dev, ino: fingerprint.ino, sha256: fingerprint.sha256 };
+    if (Buffer.byteLength(JSON.stringify({ runId: physicalRunId, sourceKey: "f".repeat(64), held: true,
+      since: this.now(), provisional: false, macBinding: binding })) > 1024) return;
+    return Object.freeze(binding);
   }
 
   private pendingPolicyMemory(runId: string): boolean {
@@ -981,7 +1015,8 @@ export class Outbox {
                 if (!source) break;
                 const represented = [...(this.runs.get(entry.name)?.terminals.values() ?? [])]
                   .find(meta => meta.fileName === source.name);
-                if (!source.name.startsWith(TERMINAL_FILE_PREFIX)) continue;
+                if (!source.name.startsWith(TERMINAL_FILE_PREFIX) ||
+                    (source.isFile() && isTerminalInstallTempName(source.name))) continue;
                 if (!token && !represented) {
                   // No semantic identity was acquired. Leave inventory incomplete;
                   // the next coalesced demand restarts enrollment from the root.
@@ -1100,23 +1135,52 @@ export class Outbox {
           if (!entry) return before !== fileVersion(await fs.lstat(this.runDir(physicalRun), { bigint: true }));
           runEntries++;
           totalEntries++;
-          if (!entry.name.startsWith(TERMINAL_FILE_PREFIX)) continue;
-          const gen = parseTerminalFileName(entry.name);
-          const remaining = Math.min(this.runMaxBytes - runReadBytes, this.maxBytes - totalReadBytes);
-          const stat = await fs.lstat(path.join(this.runDir(physicalRun), entry.name), { bigint: true });
-          const known = gen === undefined ? undefined : this.runs.get(physicalRun)?.terminals.get(gen);
-          if (known?.outcomeKind === "terminal" && known.fileName === entry.name && known.ordinaryVersion === fileVersion(stat)) continue;
-          const size = Number(stat.size);
-          if (size > remaining) return true;
-          runReadBytes += size;
-          totalReadBytes += size;
-          const result = await this.inspectTerminal(physicalRun, gen, entry.name, budget, Math.min(size, remaining));
-          if (!result.record || gen === undefined) return true;
-          if (result.record.outcome_kind !== "policy_hold") continue;
-          const meta = this.runs.get(physicalRun)?.terminals.get(gen);
-          const binding = meta && this.terminalRetirementIdentities.get(meta);
-          if (!binding?.serverSettled || binding.lifetime !== this.authenticatedLifetimes.get(result.record) ||
-              binding.payload !== terminalRetirementPayload(result.record)) return true;
+          if (!entry.name.startsWith(TERMINAL_FILE_PREFIX) ||
+              (entry.isFile() && isTerminalInstallTempName(entry.name))) continue;
+          const token = this.reserveInspection(physicalRun);
+          try {
+            const represented = [...(this.runs.get(physicalRun)?.terminals.values() ?? [])]
+              .find(meta => meta.fileName === entry.name);
+            if (!token && !represented) {
+              this.terminalInventoryComplete = false;
+              return true;
+            }
+            const scope = token && this.policyInspections.get(token);
+            if (scope) {
+              scope.sourceKey = createHash("sha256").update(entry.name).digest("hex");
+              scope.held = true;
+            }
+            const gen = parseTerminalFileName(entry.name);
+            if (token && gen !== undefined && !this.runs.get(physicalRun)?.terminals.has(gen)) {
+              this.policyInspections.delete(token);
+              if (!this.retainUnknownTerminal(physicalRun, gen, entry.name, true) && scope)
+                this.policyInspections.set(token, scope);
+            }
+            const remaining = Math.min(this.runMaxBytes - runReadBytes, this.maxBytes - totalReadBytes);
+            const stat = await fs.lstat(path.join(this.runDir(physicalRun), entry.name), { bigint: true });
+            const known = gen === undefined ? undefined : this.runs.get(physicalRun)?.terminals.get(gen);
+            if (known?.outcomeKind === "terminal" && known.fileName === entry.name && known.ordinaryVersion === fileVersion(stat)) {
+              if (token) this.policyInspections.delete(token);
+              continue;
+            }
+            if (!token && known?.outcomeKind === "terminal") return true;
+            const size = Number(stat.size);
+            if (size > remaining) return true;
+            runReadBytes += size;
+            totalReadBytes += size;
+            const result = await this.inspectTerminal(physicalRun, gen, entry.name, budget, Math.min(size, remaining));
+            if (!result.record || gen === undefined) return true;
+            if (result.record.outcome_kind !== "policy_hold") {
+              if (token) this.policyInspections.delete(token);
+              continue;
+            }
+            const meta = this.runs.get(physicalRun)?.terminals.get(gen);
+            const binding = meta && this.terminalRetirementIdentities.get(meta);
+            if (!binding?.serverSettled || binding.lifetime !== this.authenticatedLifetimes.get(result.record) ||
+                binding.payload !== terminalRetirementPayload(result.record)) return true;
+          } finally {
+            if (token && !this.policyInspections.get(token)?.held) this.policyInspections.delete(token);
+          }
         }
       } finally { await dir.close(); }
     };
@@ -1202,6 +1266,7 @@ export class Outbox {
         continue;
       }
       const rs = this.ensureInMemoryRun(runId, meta.since);
+      if (rs.terminals.get(gen)?.fileName !== name) continue;
       meta.policyBytes = bytes;
       if (meta.outcomeKind === "terminal") meta.ordinaryVersion = this.authenticatedFileVersions.get(parsed);
       if (meta.outcomeKind === "policy_hold") meta.selectedLifetime = this.authenticatedLifetimes.get(parsed);
@@ -1860,17 +1925,20 @@ export class Outbox {
       let selected = this.runs.get(runId)?.terminals.get(claimGeneration);
       if (!selected && !this.disabled) {
         const physical = await this.inspectTerminal(runId, claimGeneration, terminalFileName(claimGeneration));
-        if (physical.record) {
+        selected = this.runs.get(runId)?.terminals.get(claimGeneration);
+        if (selected && (!physical.record || selected.outcomeKind === "unknown"))
+          return { journaled: false, reason: "winner_unavailable" };
+        if (physical.record && !selected) {
           const adopted = coerceTerminal(physical.record, runId, claimGeneration);
           if (adopted) {
             if (adopted.outcomeKind === "policy_hold" && !this.admitPolicyMetadata(runId, adopted))
               return { journaled: false, reason: "winner_unavailable" };
             if (adopted.outcomeKind === "policy_hold") adopted.selectedLifetime = this.authenticatedLifetimes.get(physical.record);
+            else adopted.ordinaryVersion = this.authenticatedFileVersions.get(physical.record);
             this.ensureInMemoryRun(runId, adopted.since).terminals.set(claimGeneration, adopted);
             selected = adopted;
           }
-        } else if (physical.observation.kind !== "absent") {
-          this.retainUnknownTerminal(runId, claimGeneration, terminalFileName(claimGeneration));
+        } else if (!physical.record && physical.observation.kind !== "absent") {
           return { journaled: false, reason: "winner_unavailable" };
         }
       }
@@ -1904,7 +1972,7 @@ export class Outbox {
         const meta: TerminalMeta = {
           fileName: terminalFileName(claimGeneration), claimGeneration, phaseAtJournal,
           since: selected?.since ?? this.now(), blocked: false, outcomeKind: fits ? "policy_hold" : "unknown",
-          selectionToken: selected?.selectionToken,
+          selectionToken: selected?.selectionToken ?? Symbol(),
           selectedMessagesThroughSeq: messagesThroughSeq,
           policyOutcomeId: (canonicalBody as unknown as PolicyHoldRequest).outcome_id,
           selectedPayloadHash: createHash("sha256").update(terminalRetirementPayload({ run_id: runId,
@@ -1928,6 +1996,9 @@ export class Outbox {
         // Re-authenticate the selected filename before claiming adoption.
         const policyWinner = winner.outcomeKind === "policy_hold";
         const observed = await this.inspectTerminal(runId, claimGeneration, winner.fileName);
+        if (this.runs.get(runId)?.terminals.get(claimGeneration) !== winner &&
+            !(observed.invalidatedOrdinary === winner && !this.runs.get(runId)?.terminals.has(claimGeneration)))
+          return { journaled: false, reason: "winner_unavailable" };
         if (policyWinner && observed.observation.kind !== "authenticated") return { journaled: false, reason: "winner_unavailable" };
         switch (observed.observation.kind) {
           case "authenticated":
@@ -2365,7 +2436,7 @@ export class Outbox {
    *  generation? The executor catch reads it (via the send path) to treat a journaled outcome as
    *  FINAL — no second fallback `failed` once the write-ahead journal exists (fact 2, D5). */
   hasPendingTerminal(runId: string, claimGeneration: number): boolean {
-    return this.scopeProtected(runId) || (this.runs.get(runId)?.terminals.has(claimGeneration) ?? false);
+    return this.runs.get(runId)?.terminals.has(claimGeneration) ?? false;
   }
 
   /** Install a terminal journal crash-atomically and EXCLUSIVELY (D4): temp write → fsync →
@@ -2857,10 +2928,120 @@ export class Outbox {
       path.basename(realRun).toLowerCase() === path.basename(expected).toLowerCase());
   }
 
-  private async inspectTerminal(runId: string, generation: number | undefined, fileName: string, budget?: ProofBudget, readMaxBytes = this.terminalReadMaxBytes): Promise<{ observation: TerminalAuthenticationObservation; record?: Record<string, unknown> }> {
+  /** All intake seams share the catalog reservation boundary. Exact selected
+   * records may be read transiently; a new physical source must own custody
+   * before authentication, including public observations and retirement reads. */
+  private async inspectTerminal(runId: string, generation: number | undefined, fileName: string, budget?: ProofBudget, readMaxBytes = this.terminalReadMaxBytes): Promise<{ observation: TerminalAuthenticationObservation; record?: Record<string, unknown>; invalidatedOrdinary?: TerminalMeta }> {
+    const deferred = { observation: { runId: terminalRunUUID(runId) ? runId.toLowerCase() : runId, physicalRunId: runId, generation, fileName,
+      kind: "unreadable" as const } };
+    if (!this.validRunId(runId)) return deferred;
+    // An unpublished installation is not a journal send source. Keep unsafe
+    // lookalikes conservative; this predicate grants no unlink authority.
+    if (isTerminalInstallTempName(fileName)) {
+      try {
+        if (await this.terminalDirectorySafe(runId, budget) &&
+            (await fs.lstat(path.join(this.runDir(runId), fileName))).isFile()) {
+          checkProofBudget(budget);
+          return { observation: { ...deferred.observation, kind: "malformed" } };
+        }
+      } catch { /* Unknown ancestry or file type still requires protection. */ }
+    }
+    const initial = generation === undefined ? undefined : this.runs.get(runId)?.terminals.get(generation);
+    const sourceKey = createHash("sha256").update(fileName).digest("hex");
+    const ownedScope = [...this.policyInspections.values()].some(scope =>
+      scope.held && !scope.provisional && scope.runId === runId && scope.sourceKey === sourceKey);
+    let represented = initial?.fileName === fileName;
+    if (represented && initial?.outcomeKind === "terminal") {
+      try {
+        const stat = await fs.lstat(path.join(this.runDir(runId), fileName), { bigint: true });
+        represented = !stat.isFile() || initial.ordinaryVersion === fileVersion(stat);
+      } catch (err) {
+        // A missing represented ordinary source remains a transient read.
+        represented = (err as NodeJS.ErrnoException).code === "ENOENT";
+      }
+    }
+    if (represented || ownedScope) {
+      const result = await this.inspectTerminalOwned(runId, generation, fileName, budget, readMaxBytes,
+        represented && initial?.outcomeKind === "terminal" ? initial.ordinaryVersion : undefined);
+      if (generation !== undefined && this.runs.get(runId)?.terminals.get(generation) !== initial &&
+          !(result.invalidatedOrdinary === initial && initial && !this.runs.get(runId)?.terminals.has(generation))) return deferred;
+      if (result.observation.kind === "mac_failure" && !ownedScope &&
+          !(initial?.outcomeKind === "unknown" && !initial.selectionToken)) {
+        const binding = this.copyMACBinding(result.observation);
+        const token = binding && this.reserveInspection(runId);
+        if (token) {
+          const scope = this.policyInspections.get(token)!;
+          scope.held = true;
+          scope.sourceKey = sourceKey;
+          scope.macBinding = binding;
+        }
+      }
+      return result;
+    }
+    const token = this.reserveInspection(runId);
+    if (!token) {
+      this.terminalInventoryComplete = false;
+      // The bounded exact-target proof permits empty/ignored siblings at true
+      // capacity. It stops at an unrepresented raw candidate before decoding.
+      if (!await this.targetPolicyPending(runId)) return { observation: {
+        runId: terminalRunUUID(runId) ? runId.toLowerCase() : runId, physicalRunId: runId, generation, fileName, kind: "absent",
+      } };
+      return deferred;
+    }
+    const scope = this.policyInspections.get(token)!;
+    scope.sourceKey = sourceKey;
+    scope.held = true;
+    scope.provisional = true;
+    const result = await this.inspectTerminalOwned(runId, generation, fileName, budget, readMaxBytes);
+    const live = generation === undefined ? undefined : this.runs.get(runId)?.terminals.get(generation);
+    // Synchronous selection may occur during authentication or handle close.
+    // Its kind, outcome identity and epoch always outrank this stale read.
+    if (live !== initial && !(initial && result.invalidatedOrdinary === initial && !live)) {
+      if (live?.fileName === fileName && live.outcomeKind !== "terminal") this.policyInspections.delete(token);
+      scope.provisional = false;
+      return deferred;
+    }
+    if (result.record) {
+      const meta = generation === undefined ? undefined : coerceTerminal(result.record, runId, generation, fileName);
+      if (meta) {
+        if (meta.outcomeKind === "policy_hold" && initial) { scope.provisional = false; return deferred; }
+        this.policyInspections.delete(token);
+        if (meta.outcomeKind === "policy_hold") {
+          meta.selectedLifetime = this.authenticatedLifetimes.get(result.record);
+          if (!this.admitPolicyMetadata(runId, meta, false)) {
+            scope.provisional = false;
+            this.policyInspections.set(token, scope);
+            return deferred;
+          }
+          this.ensureInMemoryRun(runId, meta.since).terminals.set(meta.claimGeneration, meta);
+        }
+        return result;
+      }
+    }
+    if (result.observation.kind === "absent" && await this.terminalPositivelyAbsent(runId, fileName)) {
+      this.policyInspections.delete(token);
+      if (generation !== undefined && this.runs.get(runId)?.terminals.get(generation) !== initial) return deferred;
+      return result;
+    }
+    scope.provisional = false;
+    if (result.observation.kind === "mac_failure") {
+      scope.macBinding = this.copyMACBinding(result.observation);
+      return result;
+    }
+    // Transfer without yielding. A different filename in the selected slot is
+    // independent evidence, so keep the opaque scope instead of overwriting it.
+    if (result.observation.fingerprint && generation !== undefined && parseTerminalFileName(fileName) === generation && !live) {
+      this.policyInspections.delete(token);
+      if (!this.retainUnknownTerminal(runId, generation, fileName)) this.policyInspections.set(token, scope);
+    }
+    return result;
+  }
+
+  private async inspectTerminalOwned(runId: string, generation: number | undefined, fileName: string, budget?: ProofBudget, readMaxBytes = this.terminalReadMaxBytes, ordinaryVersion?: string): Promise<{ observation: TerminalAuthenticationObservation; record?: Record<string, unknown>; invalidatedOrdinary?: TerminalMeta }> {
     const observation: TerminalAuthenticationObservation = { runId: terminalRunUUID(runId) ? runId.toLowerCase() : runId, physicalRunId: runId, generation, fileName, kind: "malformed" };
-    const result = { observation } as { observation: TerminalAuthenticationObservation; record?: Record<string, unknown> };
+    const result = { observation } as { observation: TerminalAuthenticationObservation; record?: Record<string, unknown>; invalidatedOrdinary?: TerminalMeta };
     if (!this.validRunId(runId) || generation === undefined || !Number.isSafeInteger(generation) || generation < 0 || parseTerminalFileName(fileName) !== generation) return result;
+    const initial = this.runs.get(runId)?.terminals.get(generation);
     let fh: Awaited<ReturnType<typeof fs.open>> | undefined;
     try {
       if (!await this.terminalDirectorySafe(runId, budget)) { observation.kind = "symlink"; return result; }
@@ -2875,6 +3056,7 @@ export class Outbox {
       const stat = await fh.stat({ bigint: true });
       checkProofBudget(budget);
       if (!stat.isFile() || stat.ino !== before.ino || stat.dev !== before.dev) { observation.kind = "unreadable"; return result; }
+      if (ordinaryVersion !== undefined && ordinaryVersion !== fileVersion(stat)) { observation.kind = "unreadable"; return result; }
       const cap = Math.min(this.terminalReadMaxBytes, this.runMaxBytes, this.maxBytes, readMaxBytes);
       if (stat.size > BigInt(cap)) { observation.kind = "oversized"; return result; }
       const raw = Buffer.alloc(cap + 1);
@@ -2893,7 +3075,7 @@ export class Outbox {
       checkProofBudget(budget);
       const final = await fh.stat({ bigint: true });
       checkProofBudget(budget);
-      if (after.ino !== stat.ino || after.dev !== stat.dev || final.size !== stat.size || final.mtimeNs !== stat.mtimeNs || final.ctimeNs !== stat.ctimeNs || !await this.terminalDirectorySafe(runId, budget)) { observation.kind = "unreadable"; return result; }
+      if ((ordinaryVersion !== undefined && (fileVersion(after) !== ordinaryVersion || fileVersion(final) !== ordinaryVersion)) || after.ino !== stat.ino || after.dev !== stat.dev || final.size !== stat.size || final.mtimeNs !== stat.mtimeNs || final.ctimeNs !== stat.ctimeNs || !await this.terminalDirectorySafe(runId, budget)) { observation.kind = "unreadable"; return result; }
       observation.fingerprint = { dev: String(stat.dev), ino: String(stat.ino), sha256: createHash("sha256").update(raw.subarray(0, length)).digest("hex") };
       if (!this.key) { observation.kind = "key_unavailable"; return result; }
       let parsed: unknown;
@@ -2906,9 +3088,12 @@ export class Outbox {
       if (!macEqual(mac, this.computeMac(MAC_DOMAIN_TERMINAL, obj))) {
         observation.kind = "mac_failure";
         // Keep physical rejected candidates visible; authentication failure supplies no absence proof.
-        const rejected = this.runs.get(runId)?.terminals.get(generation);
+        const rejected = initial;
         if (rejected?.fileName === fileName) {
-          if (rejected.outcomeKind === "terminal") this.runs.get(runId)?.terminals.delete(generation);
+          if (rejected.outcomeKind === "terminal" && this.runs.get(runId)?.terminals.get(generation) === rejected) {
+            this.runs.get(runId)?.terminals.delete(generation);
+            result.invalidatedOrdinary = rejected;
+          }
         }
         if (terminalRunUUID(runId)) this.log.warn("outbox: terminal authentication rejected", { run_id: runId.toLowerCase(), claim_generation: generation, fact: "mac_failure" });
         return result;
@@ -3069,6 +3254,13 @@ export class Outbox {
             continue;
           }
           if (entry.name.startsWith(TERMINAL_FILE_PREFIX)) {
+            if (isTerminalInstallTempName(entry.name)) {
+              checkProofBudget(budget);
+              const regular = "isFile" in entry ? entry.isFile() :
+                (await fs.lstat(path.join(this.runDir(this.terminalScanRun.id), entry.name))).isFile();
+              checkProofBudget(budget);
+              if (regular) { this.terminalScanFrontier = undefined; continue; }
+            }
             const generation = parseTerminalFileName(entry.name);
             if (generation === undefined) this.terminalScanIncomplete = true;
             else if (!this.retainUnknownTerminal(this.terminalScanRun.id, generation, entry.name, true)) {
@@ -3145,6 +3337,10 @@ export class Outbox {
     if (!terminalRunUUID(runId) || !terminalRunUUID(workerId) || !Number.isSafeInteger(generation) || generation < 0 || observations.length === 0 || observations.length > 256) return 0;
     runId = runId.toLowerCase();
     workerId = workerId.toLowerCase();
+    // Custody callbacks cannot retarget the evidence captured for this cleanup.
+    observations = observations.map(o => ({ runId: o.runId, physicalRunId: o.physicalRunId, generation: o.generation,
+      fileName: o.fileName, kind: o.kind, fingerprint: o.fingerprint &&
+        { dev: o.fingerprint.dev, ino: o.fingerprint.ino, sha256: o.fingerprint.sha256 } }));
     const physicalRunId = observations[0]!.physicalRunId ?? runId;
     if (!terminalRunUUID(physicalRunId) || physicalRunId.toLowerCase() !== runId || observations.some(o => (o.physicalRunId ?? runId) !== physicalRunId)) return 0;
     // Do not hold admission while queued behind an unrelated outbox write. Busy runs
@@ -3164,6 +3360,15 @@ export class Outbox {
         names.add(observed.fileName);
       }
       if (!canDelete()) return 0;
+      // Capture exact owners before custody yields. A later path rejection never
+      // supplies a binding for an older opaque scope.
+      const capturedScopes = [...this.policyInspections.entries()].filter(([, scope]) => {
+        const binding = scope.macBinding;
+        return binding && binding.physicalRunId === physicalRunId && binding.generation === generation &&
+          observations.some(observed => observed.fileName === binding.fileName && observed.fingerprint?.dev === binding.dev &&
+            observed.fingerprint?.ino === binding.ino && observed.fingerprint?.sha256 === binding.sha256);
+      }).map(([token, scope]) => ({ token, scope, binding: scope.macBinding! }));
+      const capturedMeta = this.runs.get(physicalRunId)?.terminals.get(generation);
       const custody = await freshCustody();
       if (!canDelete()) return 0;
       if (!custody || custody.run_id !== runId || custody.worker_id !== workerId || custody.generation !== generation ||
@@ -3176,11 +3381,17 @@ export class Outbox {
         if (!same(observed, await this.observeTerminalAuthentication(physicalRunId, generation, observed.fileName))) return removed;
         if (!canDelete()) return removed;
         await fs.unlink(path.join(this.runDir(physicalRunId), observed.fileName));
+        await this.fsyncDir(this.runDir(physicalRunId), true);
+        for (const captured of capturedScopes) {
+          if (captured.binding.fileName === observed.fileName && this.policyInspections.get(captured.token) === captured.scope &&
+              captured.scope.macBinding === captured.binding) this.policyInspections.delete(captured.token);
+        }
         // Only this physical rejection was disposed. Keep independent validated
         // memory evidence, and keep a surviving alias visible to snapshot admission.
         const terminals = this.runs.get(physicalRunId)?.terminals;
         const meta = terminals?.get(generation);
-        if (meta?.outcomeKind === "unknown" && !meta.selectionToken && meta.fileName === observed.fileName) {
+        if (meta === capturedMeta && meta?.outcomeKind === "unknown" && !meta.selectionToken && meta.fileName === observed.fileName &&
+            capturedScopes.some(captured => captured.binding.fileName === observed.fileName)) {
           if (meta.unpersistedPolicy) meta.outcomeKind = "policy_hold";
           else {
             const directory = await fs.opendir(this.runDir(physicalRunId));
@@ -3195,14 +3406,13 @@ export class Outbox {
               }
             } finally { await directory.close(); }
             // Exhaustion is uncertainty: retain the sentinel, never infer absence.
-            if (complete || alias !== undefined) {
+            if ((complete || alias !== undefined) && terminals?.get(generation) === meta && !meta.selectionToken) {
               this.terminalRetirementIdentities.delete(meta);
               terminals?.delete(generation);
               if (alias !== undefined) this.retainUnknownTerminal(physicalRunId, generation, alias);
             }
           }
         }
-        await this.fsyncDir(this.runDir(physicalRunId), true);
         removed++;
       }
       return removed;
@@ -3612,6 +3822,15 @@ function terminalFileName(claimGeneration: number): string {
  *  terminal journal or its generation is not a non-negative integer. The FILENAME is the source of
  *  truth for the generation, so a journal copied under a different name cannot masquerade as another
  *  generation (loadTerminals cross-checks the embedded field against this). */
+/** Same canonical temporary-name recognition as boot cleanup, without granting
+ * deletion authority. A regular install temp has not won the journal link. */
+function isTerminalInstallTempName(name: string): boolean {
+  const match = /^(terminal-\d+\.json)\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/.exec(name);
+  if (!match?.[1]) return false;
+  const generation = parseTerminalFileName(match[1]);
+  return generation !== undefined && match[1] === terminalFileName(generation);
+}
+
 function parseTerminalFileName(name: string): number | undefined {
   if (!name.startsWith(TERMINAL_FILE_PREFIX) || !name.endsWith(TERMINAL_FILE_SUFFIX)) return undefined;
   const mid = name.slice(TERMINAL_FILE_PREFIX.length, name.length - TERMINAL_FILE_SUFFIX.length);
