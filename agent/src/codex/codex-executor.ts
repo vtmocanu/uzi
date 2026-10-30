@@ -7083,8 +7083,9 @@ export class HeldRunCommandCache implements RunCommandCache {
       this.measured(generation, result);
       if (result.state === "unknown" && result.settlement !== undefined) {
         options.log.warn("codex command cache measurement helper unresolved", { cache: token, reason: result.reason });
-        // The helper's ACTUAL close, never the delivery: this generation is not retired or
-        // removed while it may still be reading the directory.
+        // The helper's actual end (close, or exit plus a bounded stdout drain), never the
+        // delivery: this generation is not retired or removed while it may still be reading
+        // the directory.
         await result.settlement.catch(() => undefined);
       }
     })();

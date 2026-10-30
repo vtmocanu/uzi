@@ -306,9 +306,9 @@ spec:
             controller validates it at boot). A number goes through int64 | toString, because
             an integer from a values file or --set-json arrives as a float64 (--set gives an
             int64) and a bare quote would render 4294967296 as "4.294967296e+09", which the
-            controller refuses at boot. int64 is a cast, so anything that is not a
-            non-negative whole int/int64/float64 (a bool, 1.5) fails the render instead of
-            silently becoming a tiny budget. */}}
+            controller refuses at boot. int64 casts silently (true to 1, 1.5 to 1), so the
+            guards below fail anything that is not a non-negative whole int/int64/float64
+            instead of letting it become a tiny budget. */}}
             {{- $cacheRunBytes := .Values.workers.codex.commandCacheRunBytes }}
             {{- if and (not (kindIs "invalid" $cacheRunBytes)) (ne (toString $cacheRunBytes) "") }}
             {{- if not (kindIs "string" $cacheRunBytes) }}

@@ -2914,8 +2914,11 @@ export async function measureCommandCache(token: string, deps: MeasureDeps = {})
       // slot until it actually closes.
       held = false;
       const settlement = helperEnded(run, deps.drainMs ?? MEASURE_STDOUT_DRAIN_MS).then(release, release);
-      // Kill only while the child is unreaped, in this one synchronous section: after `exit`
-      // the pid may belong to a live command. An already-exited helper counts as ended.
+      // Kill only while no `exit` has been observed, in this one synchronous section: after
+      // `exit` the pid may belong to a live command. libuv can reap a child a few microtasks
+      // before its `exit` is emitted, so a kill in that window may reach a free pid (reported
+      // *_unkilled); reuse would need the pid space to wrap in between. An already-exited
+      // helper counts as ended.
       let killed = run.hasExited();
       if (!killed && run.pid !== undefined) {
         const kill = deps.killAsCommandUid ?? ((pid: number) => defaultKillAsCommandUid(pid, deps.runKill ?? defaultRunKill));
