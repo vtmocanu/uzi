@@ -100,15 +100,34 @@ applies to dispatch. A single allowlisted infrastructure rerun of pre-cut main
 CI cannot replenish when main moves. Unknown steps and test/assertion failures
 stop. Existing non-gate publication retries retain their two-rerun budget when watch runs.
 
-**D10 is partial until 3e-3.** Post-cut main CI recovery, infrastructure-only
-tagged KinD retries and targeted `assert-tag-smoke` recovery are deferred to that
-separate follow-up. The existing watcher stays fail-closed on these gates.
+**D10 is partial until 3e-3.** Infrastructure-only tagged KinD retries and
+targeted `assert-tag-smoke` recovery are deferred to that separate follow-up.
+Automatic reruns of the release commit's own main CI are deliberately not
+implemented. Publication relies on strict inherited coverage, and the next RC
+needs a newer CI-bearing tip. Isolating old-run retries would change cancellation
+for every main rerun; that CI behavior change was declined. Its result will be
+classified for reporting when the journal is added, without automatic recovery.
+The existing watcher stays fail-closed on the deferred gates.
 Its role-based retry/run/job URLs and budget are appended to the summary with a
 32,768-source-byte limit and an explicit truncation marker. The full per-attempt
 publication failing-step journal is also open work for 3e-3; D10 reporting is not
 complete. Pre-cut CI retries already record steps, attempt and result.
 Publication/verification timestamps are recorded without claiming deployment
 health. Runner-slot and critical-path impact remain unmeasured until live use.
+
+An otherwise eligible manual cut whose tip contains a recognized skip
+instruction and lacks exact main-push proof refuses promptly with `skip-ci-tip`.
+The cutter's tip precondition is also an immediate point check. Scheduled
+attempts stay unheld and keep polling/reselecting main within their existing
+budget, logging `skip_ci_tip=true` while that condition holds. A newer green
+CI-bearing tip can proceed in the same operation. If the budget expires while
+the selected tip is still skip-marked and lacks proof, the scheduled attempt
+defers with `skip-ci-tip`. Planning no-ops keep priority. No parent proof, older
+cut point, CI dispatch or repair commit is substituted.
+Non-shipping documentation does not imply unchanged checked inputs: PRDs and
+ADRs are read by doc validation. A 30-day first-parent audit found 38 skip-marked
+tips among 1030 main commits, all touching checked PRD text. The parent bridge
+is parked; existing exact-tip and 1/2 metadata-hop policies remain unchanged.
 
 3e-2 adds opt-in scheduling after the proven live RC. Cron `47 4 * * *` uses
 GitHub's native `timezone: Europe/Bucharest`, targeting a cut near 05:00 when on time, after

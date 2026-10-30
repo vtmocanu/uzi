@@ -650,9 +650,16 @@ interface CaptureProgress {
   provisionalCancel?: { held: HeldAuthenticatedCapture; error: Error };
   dispositionStarted: boolean;
   parkAcknowledged: boolean;
+  idleParkPossiblyApplied: boolean;
+  idleParkRefusal?: StateReportUnappliedError;
+  idleParkNotices: Set<string>;
   holdOutcome?: boolean;
   wallOutcome?: WallParkOutcome;
 }
+
+// Marker only: the episode's private progress carries the refusal evidence.
+const IDLE_PARK_REFUSAL_UNWIND = Object.freeze({});
+
 interface FinalizeCaptureContinuation {
   pending?: () => Promise<void>;
   readonly unwind: object;
@@ -15865,7 +15872,10 @@ export class RunRunner {
       deadlineAt: Math.min(started + 180_000, parentDeadline),
       healthyDeadlineAt: Math.min(started + 120_000, parentDeadline),
     });
-    this.captureProgress.set(episode, { flight, dispositionStarted: false, parkAcknowledged: false });
+    this.captureProgress.set(episode, {
+      flight, dispositionStarted: false, parkAcknowledged: false,
+      idleParkPossiblyApplied: false, idleParkNotices: new Set(),
+    });
     return episode;
   }
 
@@ -18445,6 +18455,14 @@ export class RunRunner {
           }
           if (settled.dispositionStarted) {
             if (settled.parkAcknowledged) return true;
+            if (settled.idleParkRefusal && !settled.idleParkPossiblyApplied) {
+              this.captureAuthority(flight, Infinity);
+              const text = "idle recovery park report refused without application; the source and session are retained";
+              if (!settled.idleParkNotices.has(text)) {
+                settled.idleParkNotices.add(text);
+                batcher.emit({ kind: "status", agent: "worker", payload: { text } });
+              }
+            }
             await batcher.close().catch(() => undefined);
             return false; // Unknown ACK is a retained stop, never a second capture/report.
           }
@@ -18464,7 +18482,19 @@ export class RunRunner {
               { kind: codexDeferralOf(error)! },
               // Carry policy context, never the joined episode or expired held capabilities.
               { terminalDisk: opts.terminalDisk, diskCause: disk,
-                credentialDeadlineAt: captureEpisode.deadlineAt, dispositionSignal: signal })));
+                credentialDeadlineAt: captureEpisode.deadlineAt, dispositionSignal: signal }))).catch(async error => {
+        // The region has joined. Cancel/fence retain their existing report-before-close
+        // ordering in recoveryDisposition; every other refusal unwind must close here.
+        if (this.captureProgressFor(flight, captureEpisode).idleParkRefusal &&
+            flight.steering.claimFence() === undefined && !flight.steering.isCancelled()) {
+          const budget = MaintenanceBudget.current();
+          const remaining = Math.max(0, Math.floor(Math.min(this.codexBoundaryDeadlineMs,
+            (this.shutdownDeadlineAt ?? Infinity) - Date.now(), budget?.remainingMs() ?? Infinity)));
+          const expiry = remaining > 0 ? AbortSignal.timeout(remaining) : AbortSignal.abort();
+          await batcher.close(budget ? AbortSignal.any([expiry, budget.signal]) : expiry).catch(() => undefined);
+        }
+        throw error;
+      });
     }
     const report = reportState;
     reportState = async (body, signal = captureSignal) => {
@@ -18542,7 +18572,7 @@ export class RunRunner {
     // Issue #1766: credential-deferral park progress. A transient park starts with both latched.
     let confirmedRunning = !credentialDeferred;
     let retries = 0;
-    const shown = new Set<string>();
+    const shown = idleTyped && progress ? progress.idleParkNotices : new Set<string>();
     const note = async (text: string): Promise<void> => {
       if (shown.has(text)) return;
       shown.add(text);
@@ -18739,11 +18769,14 @@ export class RunRunner {
         // ownership or a real terminal state changes underneath it.
         let status: string;
         let holdReason: string | undefined;
+        let samePositiveGeneration = false;
         try {
           const own = await this.getObservedRunOwnership(flight, captureSignal);
           captureSignal?.throwIfAborted();
           status = own.status;
           holdReason = own.hold_reason ?? undefined;
+          samePositiveGeneration = Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 &&
+            own.claim_generation === flight.claimGeneration;
           if (status === "cancelled" && own.claim_generation === flight.claimGeneration && own.claim_released !== true) this.observeCancellation(flight);
           if ((credentialDeferred || opts.terminalDisk || this.isCredentialFreeOwnerCancel(claim, flight)) &&
               own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration) {
@@ -18815,6 +18848,9 @@ export class RunRunner {
             if (cancelReap) await this.settleRecoveryGeneration(claim, flight, runLog);
           }
           if (!terminal.has(status)) markParkKeep();
+          if (idleTyped && progress?.idleParkPossiblyApplied && status === "recovery_wait" && samePositiveGeneration) {
+            await note("idle recovery park outcome unconfirmed; the source and session are retained; the accepted cause and whether recovery is held or timed are unknown");
+          }
           return !idleTyped && status === "recovery_wait";
         }
         if (flight.steering.isCancelled()) {
@@ -19131,7 +19167,18 @@ export class RunRunner {
           // The flight reporter validates stale claims before returning. Preserve its received
           // ACK before a scoped expiry can interrupt disposition; the joined continuation
           // consumes this evidence without another POST or source settlement.
-          const ack = await report(parkBody, captureSignal);
+          let ack: StateAck;
+          try {
+            ack = await report(parkBody, captureSignal);
+            if (idleTyped && progress) progress.idleParkPossiblyApplied = true;
+          } catch (error) {
+            if (idleTyped && progress) {
+              if (error instanceof StateReportUnappliedError && error.runId === flight.runId) {
+                if (!progress.idleParkPossiblyApplied) progress.idleParkRefusal = error;
+              } else progress.idleParkPossiblyApplied = true;
+            }
+            throw error;
+          }
           const idleAccepted = ack.status === "recovery_wait" && ack.recoveryCause === "codex_idle_stall";
           if (progress && ((!idleTyped && ack.status === "recovery_wait") || (idleTyped && idleAccepted) ||
               (providerTyped && ack.status === "paused" && ack.holdReason === PROVIDER_HOLD_REASON)))
@@ -19265,6 +19312,9 @@ export class RunRunner {
           // ownership: returning while it is still running would strand the row
           // because this healthy worker's heartbeats prevent stale-worker requeue.
         } catch (reportError) {
+          // Only this episode's actual typed report can issue refusal provenance.
+          // Unwind before retrying; the capture owner consumes it after safety joins.
+          if (idleTyped && progress?.idleParkRefusal && !progress.idleParkPossiblyApplied) throw IDLE_PARK_REFUSAL_UNWIND;
           // A refused held cleanup checkpoint cannot be retried inside its own poisoned
           // callback. Join the parent before any free proof or retained disposition.
           if (opts.heldAuthenticated && (reportError instanceof CheckpointUnsafeCleanupError ||
@@ -19319,7 +19369,8 @@ export class RunRunner {
       else if (!propagating) await settleCloneRelease();
       // The outer B wrapper still owns a continuation before any park request.
       // Its next credential-free/local-only disposition needs the same open batcher.
-      if (!credentialRedispatch && !progress?.failure && !progress?.control && !(opts.heldAuthenticated && !progress?.dispositionStarted))
+      if (!credentialRedispatch && !progress?.failure && !progress?.control && !progress?.idleParkRefusal &&
+          !(opts.heldAuthenticated && !progress?.dispositionStarted))
         await batcher.close().catch(() => undefined);
     }
   }

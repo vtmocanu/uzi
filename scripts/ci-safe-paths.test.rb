@@ -918,6 +918,22 @@ Dir.mktmpdir('release-report') do |dir|
   assert.call(File.read(environment.fetch('GITHUB_STEP_SUMMARY')).include?('"late_finish": null'), true, 'manual verification has no late flag')
   assert.call(stdout.include?('::warning::'), false, 'manual completion after 14:00 does not warn')
   assert.call(File.exist?(environment.fetch('REPORT_CALLS')), false, 'manual verified completion is not an incident')
+  skipped_tip = Marshal.load(Marshal.dump(normal))
+  skipped_tip['prepare'] = {'result' => 'failure', 'outputs' => {'reason' => 'skip-ci-tip', 'parent' => '1' * 40}}
+  skipped_tip['push'] = {'result' => 'skipped', 'outputs' => {}}
+  skipped_tip['watch'] = {'result' => 'skipped', 'outputs' => {}}
+  _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => skipped_tip.to_json, 'GITHUB_EVENT_NAME' => 'workflow_dispatch'), 'bash', '-e', '-c', report_script)
+  assert.call(status.success?, true, "skip-ci tip incident delivery succeeds: #{err}")
+  skipped_body = File.read(environment.fetch('REPORT_BODY'))
+  assert.call(skipped_body.include?('"reason": "skip-ci-tip"'), true, 'skip-ci refusal preserves its typed reason')
+  assert.call(skipped_body.include?('newer CI-bearing main tip'), true, 'skip-ci refusal explains how to unblock the cut')
+  assert.call(skipped_body.include?('"push_attempted": false'), true, 'skip-ci refusal never attempted a push')
+  assert.call(skipped_body.include?('Manual preparation refused immediately'), true, 'manual skip-ci refusal timing is explicit')
+  _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => skipped_tip.to_json, 'GITHUB_EVENT_NAME' => 'schedule'), 'bash', '-e', '-c', report_script)
+  assert.call(status.success?, true, "scheduled skip-ci deadline is reported: #{err}")
+  skipped_body = File.read(environment.fetch('REPORT_BODY'))
+  assert.call(skipped_body.include?('"outcome": "defer"'), true, 'scheduled skip-ci deadline is a deferral')
+  assert.call(skipped_body.include?('exhausted its wait budget'), true, 'scheduled skip-ci refusal follows bounded waiting')
   missed = Marshal.load(Marshal.dump(normal))
   missed['push'] = {'result' => 'failure', 'outputs' => {'reason' => 'missed-target', 'attempted' => 'false'}}
   missed['watch'] = {'result' => 'skipped', 'outputs' => {}}

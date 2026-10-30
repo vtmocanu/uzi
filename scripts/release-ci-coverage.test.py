@@ -68,6 +68,60 @@ class RepoFixture:
 
 
 
+class SkipInstructions(unittest.TestCase):
+    def test_documented_markers_in_subject_or_body(self):
+        for command in ('skip ci', 'ci skip', 'no ci', 'skip actions', 'actions skip'):
+            marker = '[' + command + ']'
+            for message in ('docs: plan ' + marker, 'docs: plan\n\nquoted ' + marker + ' in body\n'):
+                with self.subTest(message=message):
+                    self.assertTrue(policy.skips_ci(message))
+
+    def test_valid_and_invalid_skip_check_trailers(self):
+        for tail in ('skip-checks:true', 'skip-checks: true', 'Reviewed-by: Fixture\nskip-checks: true'):
+            with self.subTest(tail=tail):
+                self.assertTrue(policy.skips_ci('docs: plan\n\n\n' + tail + '\n'))
+        self.assertTrue(policy.skips_ci('docs: plan\r\n\r\n\r\nskip-checks: true\r\n'))
+        for message in ('docs: skip-ci', 'docs: skip-checks: true', 'docs: plan\n\nskip-checks: true',
+                        'docs: plan\n\n\nskip-checks: false', 'docs: plan\n\n\nskip-checks: true\nReviewed-by: Fixture',
+                        'docs: plan\n\n\nnot a trailer\nskip-checks: true'):
+            with self.subTest(message=message):
+                self.assertFalse(policy.skips_ci(message))
+
+
+class SkipTipCLI(RepoFixture, unittest.TestCase):
+    def test_real_tip_cli_refuses_skip_before_polling(self):
+        self.git('commit', '--allow-empty', '--cleanup=verbatim', '-qm', 'docs: PRD\n\n[' + 'skip ci' + ']')
+        self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        api = unittest.mock.Mock()
+        api.run.return_value = None
+        with patch.object(policy.sys, 'argv', ['policy', 'tip', 'HEAD', '--repo', 'example/uzi', '--wait', '10']), \
+             patch.object(policy, 'GitHub', return_value=api), \
+             patch.object(policy.time, 'sleep', side_effect=AssertionError('skip-ci tip must not poll')):
+            with self.assertRaisesRegex(policy.Refusal, 'skip-ci-tip'):
+                policy.main()
+
+    def test_present_cancelled_or_pending_runs_are_not_missing_skip_proof(self):
+        self.git('commit', '--allow-empty', '-qm', 'docs: skipped tip [' + 'skip ci' + ']')
+        self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        for status, conclusion in (('completed', 'cancelled'), ('completed', 'skipped'), ('queued', None)):
+            with self.subTest(status=status, conclusion=conclusion):
+                api = unittest.mock.Mock()
+                api.run.return_value = run(status=status, conclusion=conclusion)
+                with patch.object(policy.sys, 'argv', ['policy', 'tip', 'HEAD', '--repo', 'example/uzi', '--wait', '0']), \
+                     patch.object(policy, 'GitHub', return_value=api):
+                    with self.assertRaises(policy.Refusal) as error:
+                        policy.main()
+                self.assertNotIn('skip-ci-tip', str(error.exception))
+
+    def test_present_green_tip_proof_is_not_rejected_by_message(self):
+        self.git('commit', '--allow-empty', '-qm', 'docs: skipped tip [' + 'skip ci' + ']')
+        api = unittest.mock.Mock()
+        api.run.return_value = run()
+        with patch.object(policy.sys, 'argv', ['policy', 'tip', 'HEAD', '--repo', 'example/uzi', '--wait', '0']), \
+             patch.object(policy, 'GitHub', return_value=api), contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(policy.main())
+
+
 class Metadata(RepoFixture, unittest.TestCase):
     def test_release_metadata(self):
         for path, text in self.files.items():
@@ -367,6 +421,23 @@ class Cutter(RepoFixture, unittest.TestCase):
     def test_cut_still_checks_exact_main(self):
         calls = self.cut('0.2.0')
         self.assertEqual(calls, 'tip HEAD --wait 0\n')
+
+    def test_real_cutter_exposes_skip_ci_tip_without_mutation(self):
+        self.write('scripts/release-ci-coverage.py', SOURCE.read_text())
+        self.git('add', '-A')
+        self.git('commit', '--cleanup=verbatim', '-qm', 'docs: skipped tip [' + 'skip ci' + ']')
+        before = (self.git('rev-parse', 'HEAD'), self.git('tag', '--list'), self.git('status', '--porcelain', '--untracked-files=all'))
+        directory = Path('.git/fixture-bin')
+        directory.mkdir()
+        gh = directory / 'gh'
+        gh.write_text('#!/bin/sh\nprintf \'[{"total_count":0,"workflow_runs":[]}]\\n\'\n')
+        gh.chmod(0o700)
+        env = dict(os.environ, GITHUB_REPOSITORY='example/uzi', PATH=str(directory.resolve()) + os.pathsep + os.environ['PATH'])
+        env.pop('UZI_RELEASE_OFFLINE_FIXTURE', None)
+        result = subprocess.run(['bash', str(self.cutter), '0.2.0'], env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn('skip-ci-tip', result.stderr)
+        self.assertEqual((self.git('rev-parse', 'HEAD'), self.git('tag', '--list'), self.git('status', '--porcelain', '--untracked-files=all')), before)
 
 
 class Hotfix(RepoFixture, unittest.TestCase):
@@ -670,6 +741,16 @@ class Decision(unittest.TestCase):
              patch.object(policy.time, 'sleep', side_effect=AssertionError('tip must refuse before push')):
             with self.assertRaisesRegex(policy.Refusal, 'queued'):
                 policy.main()
+
+    def test_skip_diagnostic_does_not_change_publication_inheritance(self):
+        self.api.run.side_effect = lambda w, sha, b: None if sha == 'head' else run(w, sha)
+        with patch.object(policy.sys, 'argv', ['policy', 'coverage', 'head', '--repo', 'example/uzi', '--wait', '0']), \
+             patch.object(policy, 'git', return_value='head'), \
+             patch.object(policy, 'metadata_chain', return_value=['head', 'parent']), \
+             patch.object(policy, 'GitHub', return_value=self.api), \
+             patch.object(policy, 'skips_ci', side_effect=AssertionError('publication must not apply the tip-only diagnostic')):
+            policy.main()
+        self.assertIn('coverage SHA parent', self.output.getvalue())
 
     def test_poll(self):
         self.api.run.side_effect = [run(status='queued', conclusion=None), run('kind-smoke.yml', status='queued', conclusion=None), run(), run('kind-smoke.yml')]

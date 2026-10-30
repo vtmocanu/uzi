@@ -155,6 +155,18 @@ An unconfirmed push receipt stops watch before publication recovery and
 verification, so automatic publication retries do not run in that branch.
 Inspect remote refs, then use local watch/verify against the same tag/SHA.
 
+Keep a tip intended for release eligible for CI. When a recognized skip
+instruction leaves exact main-push proof absent, manual preparation and the
+local cutter's point check refuse immediately with `skip-ci-tip`. Scheduled
+attempts stay unheld and keep waiting for a newer tip within the existing
+budget; progress logs show `skip_ci_tip=true`. A newer green CI-bearing tip
+can be cut in that same operation. If the budget expires while the selected
+tip still lacks proof because of a skip instruction, the scheduled attempt
+defers with `skip-ci-tip`. Planning no-ops retain priority. There is no
+parent-proof exemption for docs or PRDs: their changed text has not passed its
+own checks. Automation does not dispatch CI, create a repair commit or select
+an older tip.
+
 Nightly attempts are scheduled for 04:47 Europe/Bucharest using GitHub's native
 timezone support, after the local maintenance window, aiming to cut near 05:00
 when on time. They are
@@ -203,8 +215,12 @@ Manual tip selection is bounded at 120 minutes plus 10 minutes for cutting.
 Publication watching retains its 60-minute bound within the 120-minute recovery
 allowance. **D10 is partial until 3e-3:** only the single eligible pre-cut main-CI
 infrastructure rerun and existing non-gate publication retries are automated.
-Tagged-KinD, release-commit CI and targeted assertion recovery remain fail-closed
-follow-up work. First-week contention measurements remain a rollout check.
+Tagged-KinD and targeted assertion recovery remain fail-closed follow-up work.
+The release commit's own main CI will be classified in the planned journal and
+report without automatic reruns. This is deliberate: publication uses strict
+inherited coverage and the next RC needs a newer CI-bearing tip; isolating old
+reruns would change cancellation behavior for every main rerun. ci.yml stays
+unchanged. First-week contention measurements remain a rollout check.
 The procedures below are the local path.
 
 **Releases are cut RC-first** (ADR-1265, PRD #1265). `release-cut X.Y.Z`
