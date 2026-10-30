@@ -1754,6 +1754,77 @@ describe("RunView header — the lead chip (PRD #3244 rules 2 and 3; PRD #300 sc
     expect(chip.getAttribute("title")).toContain("medium: built-in");
   });
 
+  function phase(over: Record<string, unknown>) {
+    return {
+      phase: "implement",
+      phase_entry: 1,
+      seq: 1,
+      harness: "codex",
+      requested_model: null,
+      requested_model_source: "builtin",
+      requested_model_fixed_at: "claim",
+      requested_effort: null,
+      requested_effort_mode: "explicit",
+      requested_effort_source: "builtin",
+      requested_effort_fixed_at: "claim",
+      observed_model: null,
+      observed_model_evidence: null,
+      observed_effort: null,
+      observed_effort_evidence: null,
+      truncated: false,
+      reported_at: "2026-10-29T10:00:00Z",
+      ...over,
+    };
+  }
+
+  it("claimed schedule-pinned Codex run: chip 'lead: gpt-6-astra · high' with schedule and user effort sources", async () => {
+    renderPage({
+      status: "running",
+      harness: "codex",
+      model: "gpt-6-astra",
+      lead_config: {
+        applicable: true,
+        claim_generation: 1,
+        current: true,
+        phases: [
+          phase({
+            requested_model: "gpt-6-astra",
+            requested_model_source: "schedule_pin",
+            requested_effort: "high",
+            requested_effort_source: "user_default",
+          }),
+        ],
+      },
+    } as Partial<Run>);
+    const chip = await screen.findByText("lead: gpt-6-astra · high");
+    expect(chip.getAttribute("title")).toContain("gpt-6-astra: fixed by schedule");
+    expect(chip.getAttribute("title")).toContain("high: your Codex effort");
+  });
+
+  it("claimed template-fallback Claude run: tooltip says 'opus: lead template'", async () => {
+    renderPage({
+      status: "running",
+      harness: "claude",
+      model: null,
+      lead_config: {
+        applicable: true,
+        claim_generation: 1,
+        current: true,
+        phases: [
+          phase({
+            harness: "claude",
+            requested_model: "opus",
+            requested_model_source: "template",
+            requested_effort: "medium",
+            requested_effort_source: "builtin",
+          }),
+        ],
+      },
+    } as Partial<Run>);
+    const chip = await screen.findByText("lead: opus · medium");
+    expect(chip.getAttribute("title")).toContain("opus: lead template");
+  });
+
   // PRD #305: the frozen "apply model also to agents" flag, shown on every status.
   const OVERRIDE_BADGE_TITLE =
     "This run's model was applied to every subagent, overriding their own model pins";

@@ -214,12 +214,17 @@ function RunBudgetElapsed({ run }: { run: Run }) {
 function LeadConfigChip({ run }: { run: Run }) {
   const view = leadConfigView(leadConfigViewInput(run));
   if (!view.chip) return null;
+  // The pre-claim form is muted, as in the mockup: nothing is resolved until a worker claims it.
+  const preClaim = run.status === "queued";
   return (
     <span
       tabIndex={0}
       title={view.lines.join("\n")}
       aria-label={`${view.chip}. ${view.lines.join(". ")}`}
-      className="inline-flex cursor-help items-center whitespace-nowrap rounded-md border border-neutral-border bg-neutral-surface px-1.5 py-0.5 text-[11px] font-medium text-neutral-fg outline-hidden focus-visible:outline-2 focus-visible:outline-brand focus-visible:outline-offset-2"
+      className={cx(
+        "inline-flex cursor-help items-center whitespace-nowrap rounded-md border border-neutral-border bg-neutral-surface px-1.5 py-0.5 text-[11px] font-medium outline-hidden focus-visible:outline-2 focus-visible:outline-brand focus-visible:outline-offset-2",
+        preClaim ? "text-faint" : "text-neutral-fg",
+      )}
     >
       {view.chip}
     </span>
@@ -2736,7 +2741,7 @@ export function RunView() {
               )}
               {settingsStates.map(state => <Badge key={state} tone="neutral">{state}</Badge>)}
               {/* PRD #305: the frozen "apply model also to agents" flag, shown on EVERY
-                  status like the model badge (SC6) so a user can confirm a run applied its
+                  status (like the lead chip above) so a user can confirm a run applied its
                   model fleet-wide. Absent = pins won (today's default). */}
               {run.override_subagent_model && (
                 <Badge
