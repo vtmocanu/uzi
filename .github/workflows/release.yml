@@ -224,9 +224,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------- images ----
-  # buildx builds on the runner and pushes to GHCR. provenance:false keeps the pushed
-  # tag a single plain image manifest (no attestation index), matching the chart's
-  # simple {repo}:{tag} image references. platforms: linux/amd64 -- amd64-only for now.
+  # buildx builds on the runner and pushes to GHCR. provenance:false keeps attestation
+  # manifests out of the pushed tag, matching the chart's simple {repo}:{tag} image
+  # references. api, web and controller publish linux/amd64,linux/arm64 (one index per
+  # tag; their Dockerfiles cross-compile on $BUILDPLATFORM, so no QEMU). The agent
+  # images stay linux/amd64 only.
   #
   # SIGNING (cosign keyless / Sigstore). Every image is signed BY DIGEST after push,
   # using the job's GitHub OIDC identity (id-token: write) -- no long-lived key to
@@ -277,7 +279,7 @@ jobs:
           context: api
           file: api/Dockerfile
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           provenance: false
           # Registry layer cache: a warm build reuses the `go mod download` layer instead
           # of re-fetching from proxy.golang.org, shrinking the per-release network window
@@ -343,7 +345,7 @@ jobs:
           context: .
           file: web/Dockerfile
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           provenance: false
           # Registry layer cache: a warm build reuses the `npm ci` layer instead of
           # re-fetching from the npm registry, shrinking the per-release network window
@@ -397,7 +399,7 @@ jobs:
           context: controller
           file: controller/Dockerfile
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           provenance: false
           # Registry layer cache: a warm build reuses the `go mod download` layer instead
           # of re-fetching from proxy.golang.org, shrinking the per-release network window

@@ -66,8 +66,9 @@ var publicationIntentKeys = map[string]struct{}{
 }
 
 // strictObjectMembers splits a JSON object into its members. It refuses a duplicate key, a key
-// outside allowed (so a case variant of a known field is refused: Go's struct decoding and
-// PostgreSQL's jsonb disagree about case), and anything but one object.
+// outside allowed (so a case variant of a known field is refused: Go's struct decoding matches
+// member names case-insensitively, while a consumer reading the stored json text matches exactly),
+// and anything but one object.
 func strictObjectMembers(raw []byte, allowed map[string]struct{}) (map[string]json.RawMessage, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
