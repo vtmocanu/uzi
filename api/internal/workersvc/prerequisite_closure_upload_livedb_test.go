@@ -72,6 +72,7 @@ func TestPrerequisiteUploadKicksBrokerOnceLiveDB(t *testing.T) {
 			// The forge and smart-HTTP server are synthetic evidence, never a GitHub probe.
 			// The production broker derives its local clone URL from repo.web_url + ".git".
 			f.env.exec("UPDATE forge_connections SET base_url='https://github.com' WHERE id=$1", f.m.conn.ID)
+			f.m.conn.BaseUrl = "https://github.com"
 			r := m3RecoveryFixture(t, f, 16)
 			f.env.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", r.worker.ID, []string{capability.RecoveryArchiveV1, capability.RecoveryInventoryV1, capability.RecoveryPrerequisiteClosureV1})
 			var err error
