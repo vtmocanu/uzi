@@ -215,6 +215,8 @@ def append_watch_journal(source, target):
         if data is None:
             stream.write('Journal unavailable. This is not evidence of successful recovery.\n')
         else:
+            if data['state'] == 'watching':
+                stream.write('**Incomplete journal:** terminal status was not saved; attempt records are partial.\n\n')
             stream.write('<pre>' + html.escape(json.dumps(data, indent=2, sort_keys=True)) + '</pre>\n')
     return data
 

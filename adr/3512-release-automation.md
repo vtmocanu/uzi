@@ -132,6 +132,9 @@ need not contain the current controller. Pre-cut CI retries already record steps
 attempt and result.
 The primary publication journal is finalized before the best-effort main-CI
 observation. Observation/schema/storage errors cannot override that result.
+If the terminal journal write fails, the chosen publication result is retained,
+main-CI observation is skipped and surviving attempt records are marked partial.
+This does not relax the required saved reservation before a retry request.
 This is not transport isolation: synchronous API requests can still occupy the
 existing watch job ceiling if a transport hangs. No new timeout or cancellation
 policy is introduced. The journal uses atomic replacement with file fsync;

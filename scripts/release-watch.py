@@ -168,7 +168,7 @@ class Watcher:
         self.journal.observe(workflow, run, jobs)
         requested = self.requested.get(workflow)
         if (requested and run['id'] == requested[0] and run['run_attempt'] > requested[1]
-                and run['status'] == 'completed' and terminal_jobs(jobs)):
+                and run['status'] == 'completed' and run['conclusion'] not in (None, '') and terminal_jobs(jobs)):
             passed = (run['conclusion'] == 'success' and bool(jobs)
                       and all(job['status'] == 'completed' and job['conclusion'] in ('success', 'skipped', 'neutral') for job in jobs))
             state = 'passed-on-retry' if passed else 'failed-on-retry'
@@ -226,7 +226,11 @@ class Watcher:
                              1: ('blocked', self.stop_reason),
                              2: ('pending-timeout', 'publication-timeout'),
                              3: ('instrument-error', 'evidence-unavailable')}[result]
-            self.journal.finish(state, reason)
+            try:
+                self.journal.finish(state, reason)
+            except Exception:
+                print('release-watch: terminal journal unavailable', file=sys.stderr)
+                return result
             self.classify_main()
         return result
 

@@ -92,6 +92,9 @@ jobs:
       previous_stable: ${{ steps.prepare.outputs.previous_stable }}
       previous_stable_sha: ${{ steps.prepare.outputs.previous_stable_sha }}
       changes: ${{ steps.prepare.outputs.changes }}
+      changes_count: ${{ steps.prepare.outputs.changes_count }}
+      changes_truncated: ${{ steps.prepare.outputs.changes_truncated }}
+      phase: ${{ steps.prepare.outputs.phase }}
       audit_head: ${{ steps.prepare.outputs.audit_head }}
       retry_log: ${{ steps.prepare.outputs.retry_log }}
       stage: ${{ steps.prepare.outputs.stage }}
@@ -745,6 +748,8 @@ jobs:
               body += '\nShowing ' + str(len(changes)) + ' of ' + str(changes_count) + ' audited changes; see the full prepare summary.\n'
           if needs['watch']['result'] != 'skipped' and recovery_journal is None:
               body += '\nRecovery attempt journal unavailable; inspect the watch log. This is not a recovery certificate.\n'
+          elif recovery_journal is not None and recovery_journal['state'] == 'watching':
+              body += '\nRecovery journal is incomplete; terminal status was not saved. Attempt records are partial.\n'
           if result['late_finish']:
               warning = 'Nightly release verified after the 14:00 Europe/Bucharest target.'
               body += '\n**Late completion:** ' + warning + '\n'

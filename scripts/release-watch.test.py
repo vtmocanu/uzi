@@ -288,6 +288,48 @@ sys.exit(calls[index][2])
 
 
 class JournalAdmission(unittest.TestCase):
+    def test_terminal_journal_failure_preserves_primary_result(self):
+        for primary in (0, 1):
+            with self.subTest(primary=primary):
+                module = engine()
+                watch = module.Watcher('0.2.0', sleep=lambda _: None)
+                watch.poll = Mock(return_value=primary)
+                watch.journal = Mock()
+                watch.journal.finish.side_effect = OSError('fixture finish failure')
+                watch.classify_main = Mock()
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    try:
+                        result = watch.run()
+                    except OSError:
+                        self.fail('terminal journal write replaced the primary publication result')
+                self.assertEqual(result, primary)
+                self.assertEqual(errors.getvalue().splitlines(), ['release-watch: terminal journal unavailable'])
+                watch.classify_main.assert_not_called()
+
+    def test_unknown_run_conclusion_preserves_latch_until_known_result(self):
+        for conclusion in (None, ''):
+            with self.subTest(conclusion=conclusion), tempfile.TemporaryDirectory() as directory:
+                module = engine()
+                watch = module.Watcher('0.2.0', sleep=lambda _: None)
+                watch.repository, watch.sha = 'vtmocanu/uzi', 'a' * 40
+                path = Path(directory) / 'journal.json'
+                watch.journal = module.journals.Journal(path, 'fixture', watch.repository, watch.tag, watch.sha)
+                watch.requested['release.yml'], watch.remaining['release.yml'] = (101, 1), 1
+                run = dict(self.valid_run(), conclusion=conclusion)
+                job = dict(self.valid_job(), conclusion='success', steps=[])
+                success = (0, json.dumps(dict(run, conclusion='success')), '')
+                watch.gh = Mock(side_effect=[(0, json.dumps(run), ''),
+                                             (0, json.dumps([dict(total_count=1, jobs=[job])]), ''), success, success])
+                watch.record('release.yml', '101')
+                self.assertIn('release.yml', watch.requested)
+                self.assertEqual(module.journals.read(path)['decisions'], [])
+                watch.record('release.yml', '101')
+                watch.record('release.yml', '101')
+                self.assertEqual([row['state'] for row in module.journals.read(path)['decisions']], ['passed-on-retry'])
+                self.assertEqual(watch.remaining['release.yml'], 1)
+                self.assertNotIn('release.yml', watch.requested)
+
     def run_main_with_observer_fault(self, primary, field=None, value=None, storage_error=None):
         module = engine()
         with tempfile.TemporaryDirectory() as directory:

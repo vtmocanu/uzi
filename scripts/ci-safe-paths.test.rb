@@ -227,6 +227,28 @@ Dir.mktmpdir('brew-watch-proof') do |dir|
   assert.call(stderr.include?("After the same tag's release.yml succeeds: gh run rerun 202 --failed"), true, 'watcher names guarded recovery command')
 end
 release_auto = YAML.safe_load(File.read(File.join(root, '.github/workflows/release-auto.yml')), aliases: true)
+prepare_keys_program = <<~'PY'
+  import contextlib, importlib.util, io, json, os, sys, tempfile
+  from pathlib import Path
+  spec = importlib.util.spec_from_file_location('fixtures', sys.argv[1])
+  fixtures = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(fixtures)
+  keys = set()
+  with tempfile.TemporaryDirectory() as directory:
+      for kind, abandon in [('rc', False), ('stable', False), ('rc', True)]:
+          target = Path(directory) / 'outputs'
+          target.write_text('')
+          os.environ['GITHUB_OUTPUT'] = str(target)
+          with contextlib.redirect_stdout(io.StringIO()):
+              result = fixtures.PrepareFixture(kind=kind, abandon=abandon).prepare()
+              fixtures.auto.outputs(result)
+          keys.update(line.split('=', 1)[0] for line in target.read_text().splitlines())
+  print(json.dumps(sorted(keys)))
+PY
+emitted, err, status = Open3.capture3('python3', '-I', '-B', '-c', prepare_keys_program, File.join(root, 'scripts/release-auto.test.py'))
+assert.call(status.success?, true, "actual prepare output fixture: #{err}")
+missing_prepare_outputs = JSON.parse(emitted) - release_auto.fetch('jobs').fetch('prepare').fetch('outputs').keys
+assert.call(missing_prepare_outputs, [], 'prepare forwards every emitted step output to needs')
 assert.call(release_auto.fetch('on').keys.sort, %w[schedule workflow_dispatch], 'manual and nightly routes are explicit')
 assert.call(release_auto.fetch('on').fetch('schedule'), [{'cron' => '47 4 * * *', 'timezone' => 'Europe/Bucharest'}], 'nightly uses local time after the sweep window')
 assert.call(release_auto.fetch('permissions'), {}, 'automation token defaults to no permissions')
@@ -895,8 +917,13 @@ Dir.mktmpdir('release-report') do |dir|
   assert.call(long_payload['changes_truncated'], true, 'audit truncation is explicit')
   assert.call(long_body.count('`'), 6, 'only the opening and closing JSON fence contain backticks')
   assert.call(long_payload.fetch('journal').fetch('attempts').first.fetch('jobs').first.fetch('name'), '`' * 160, 'escaped job label survives JSON round trip')
-  long_range['prepare']['outputs'].merge!('changes' => JSON.parse(long_range['prepare']['outputs']['changes']).first(64).to_json,
-                                        'changes_count' => '1000', 'changes_truncated' => 'true')
+  step_audit_outputs = {'changes' => JSON.parse(long_range['prepare']['outputs']['changes']).first(64).to_json,
+                        'changes_count' => '1000', 'changes_truncated' => 'true'}
+  step_audit_outputs.each do |key, value|
+    long_range['prepare']['outputs'].delete(key)
+    expression = release_auto.fetch('jobs').fetch('prepare').fetch('outputs')[key]
+    long_range['prepare']['outputs'][key] = value if expression == '${{ steps.prepare.outputs.' + key + ' }}'
+  end
   _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => long_range.to_json), 'bash', '-e', '-c', report_script)
   assert.call(status.success?, true, "bounded prepare wire still delivers full audit counts: #{err}")
   wire_payload = report_payload.call(File.read(environment.fetch('REPORT_BODY')))
@@ -1009,6 +1036,14 @@ Dir.mktmpdir('release-report') do |dir|
   receipt_body = File.read(environment.fetch('REPORT_BODY'))
   assert.call(receipt_body.include?('could not confirm that main contains the RC'), true, 'receipt failure has an actionable explanation')
   assert.call(report_payload.call(receipt_body)['phase'], 'watch', 'receipt uncertainty is owned by watch')
+  partial = Marshal.load(Marshal.dump(unconfirmed))
+  partial_data = JSON.parse(journal_json).merge('state' => 'watching', 'reason' => 'publication-pending')
+  partial['watch']['outputs']['journal'] = partial_data.to_json
+  _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => partial.to_json), 'bash', '-e', '-c', report_script)
+  assert.call(status.success?, true, "partial journal still delivers the incident: #{err}")
+  partial_body = File.read(environment.fetch('REPORT_BODY'))
+  assert.call(partial_body.include?('Recovery journal is incomplete'), true, 'partial journal is explicitly marked')
+  assert.call(report_payload.call(partial_body).fetch('journal').fetch('attempts').empty?, false, 'partial attempt evidence is retained')
   ['credential-sentinel', '{"schema":1}', 'null'].each do |invalid_journal|
     malformed_journal = Marshal.load(Marshal.dump(unconfirmed))
     malformed_journal['watch']['outputs']['journal'] = invalid_journal

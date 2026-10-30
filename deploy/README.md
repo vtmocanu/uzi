@@ -229,6 +229,8 @@ still require fresh complete evidence. Incident audits are capped at 64 rows and
 Main-CI observation errors cannot replace the publication result, but an in-flight
 API request can still consume the existing watcher job ceiling; no new timeout
 or transport isolation is added.
+Terminal journal write failures preserve the publication result and label any
+surviving attempt records incomplete. Retry requests still require a saved reservation.
 The procedures below are the local path.
 
 **Releases are cut RC-first** (ADR-1265, PRD #1265). `release-cut X.Y.Z`

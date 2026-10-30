@@ -54,6 +54,7 @@ class RecoveryJournal(unittest.TestCase):
             self.assertEqual(data['attempts'][0]['jobs'][0]['id'], 303)
             self.assertIn('&lt;script&gt;fixture&lt;/script&gt;', target.read_text())
             self.assertNotIn('<script>', target.read_text())
+            self.assertIn('Incomplete journal', target.read_text())
 
     def test_missing_or_malformed_journal_is_unavailable(self):
         with tempfile.TemporaryDirectory() as directory:
