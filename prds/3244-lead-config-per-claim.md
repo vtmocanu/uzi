@@ -2,7 +2,22 @@
 
 **Issue:** #3244
 **Sibling issues (children of #1703):** A #3255, B #3247, B2 #3251, C #3245, D #3248, E #3257, F #3254, G #3249, H #3244, I #3263, J1 #3256, J2 #3260, K #3261, L #3262, M #3259, N #3258, O #3264, P #3250, Q-spike #3246, Q-claude #3252, Q-codex #3253.  
-**Status:** Draft r4 2026-10-29, dispatch refresh against origin/main `1fd055502574073acd1fe950451f7d4dad55062a` (child H of epic #1703). The lead-config feature is still unimplemented. Child C (#3245) landed through PR #3288; its Claude-lane Codex-role guard and shared settings label/renderer seams are part of the baseline and must be preserved. The migration head is `00378_account_cooldown_projection.sql`.
+**Status:** Implemented 2026-10-30 on branch `agent/issue-3244` (M1, M2, M3), integrated with origin/main `c6453c2d8cefe2b756d59dd5e65e715e74db3d2d`; the migration landed as `00380_run_lead_configs.sql` (00379 is taken by the vault browser slots). In-run evidence:
+- **Gates:** `task gate:api`, `task gate:web` (all slices) and `task gate:repo` pass, as do `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent`, `task test:codex-m4`, the focused agent tests, `task test:e2e-lib` and `task test:forge-fake`.
+- **LiveDB:** every LiveDB package (store, handler, forgesvc, schedsvc, workersvc, recovery, poller) ran with zero skips, including the 22 named lead-config tests, though as separate package runs: the single `./e2e/run-store-it.sh` invocation exceeded the 60-minute command cap.
+- **Regression and mutations:** the RunView regression test fails on the dispatch base and passes here, and the seven storage/fence mutations each turn their test red.
+
+The merge moved the Claude SDK pin from 0.3.302 to 0.3.309. The feature-detected init and `getSettings` adapters still pass their tests against it.
+
+Remaining before merge, owned by the landing session:
+- exact-head `validate-agent`, both `test-agent` shards with shard checks, `test-agent-worker-uid` and `test-api-store-it` (full agent suite: exact-head PR CI);
+- the compose E2E phases that drive lead-lane claims and the live stream, left unrun;
+- the B/H check below, against live main;
+- a migration renumber if main moves.
+
+**B/H handover:** child B (#3247) was not on main at `c6453c2d` (`git grep "EffortResolution\|func ResolveHarnessEffort"` was empty at both checks). The lead effort rule is therefore unchanged, and B, landing second, must consume `agenttmpl.ResolveHarnessEffort`'s `EffortResolution` through `resolveLeadEffort` and delete `leadEffortSource`.
+
+*Earlier status (r4, 2026-10-29, dispatch refresh against origin/main `1fd055502574073acd1fe950451f7d4dad55062a`, child H of epic #1703):* the lead-config feature was unimplemented then. Child C (#3245) landed through PR #3288; its Claude-lane Codex-role guard and shared settings label/renderer seams are part of the baseline and must be preserved. The migration head is `00378_account_cooldown_projection.sql`.
 **Priority:** Normal.
 **Parent:** #1703. **Blocks:** child #3250, child #3252, child #3253, child #3249 (all consume section 9). Child #3251 no longer depends on #3244 (user decision 2026-10-21: Codex-only catalog defaults in #3251's own table). **Blocked by:** none. **Extended later by:** child #3254 (its resolver extends `resolveLeadSettings` instead of extracting a second copy), child #3258 (template effort source).
 **Related:** PRD #300 (schedule model freeze, `runs.model`), PRD #1551 (per-harness lanes), #2060 (per-harness effort), issue #2083 (claim-fenced worker write precedent), PRD #362 (summary persist refreshes the run page). Shared design v4.1 and the round-3 rulings (H owns lead precedence and provenance, the run-level lead label table and the one lead request matrix `request_cases`; settings surfaces use child C's label table; observed effort set in v4.1 item 4). Deliberate differences from shared design v3 are recorded as D-entries: D9 (`codex_thread_response`), D10 (observed effort set and Claude "not sent"), D17 (`fixed_at` derived, not stored), D18 (`reported_at` instead of `observed_at`).
@@ -289,7 +304,7 @@ Every consumer extends these, adds no second lead resolver, run-level lead label
 
 - **API first** (normal on k8s: the app tier follows the chart, the worker fleet is pinned by `workers.image.tag`): old workers ignore the two claim fields and never post; lead-lane runs show rule 3. No error path.
 - **Worker first** (possible on compose): the claim lacks `default_effort_source`, so the reporter is inactive. If the API is rolled back after rows exist, the table is inert; a re-upgrade keeps them.
-- **Delayed write after the actor finishes:** a post after terminal status, claim release or reclaim fails the fence (409), including a retry of a row that was stored before the reclaim; the reporter disables itself. Accepted: that attempt's record simply ends. A crash between `enterPhase` and `observe` leaves a requested-only row ("not reported yet" while current, "not reported by the runtime" once terminal).
+- **Delayed write after the actor finishes:** a post after terminal status, claim release or reclaim fails the fence (409), including a retry of a row that was stored before the reclaim; the reporter disables itself. Accepted: that attempt's record simply ends. A crash between `enterPhase` and `observe` leaves a requested-only row. It reads "not reported yet" (D27).
 - **Late requested row:** if the 3 s bound elapses, the first model turn starts before the row lands. Accepted, display-only.
 - **Late observation:** attached to its own phase entry or dropped (section 6); never attached to a newer entry.
 - **Refresh frame ordering:** the `refresh` frame carries no status, so a frame published after a concurrent status change only triggers a re-read.
@@ -384,3 +399,5 @@ Acceptance:
 - **D24. Per-entry observation cap drops, it does not truncate the phase (review G).** One chatty entry no longer hides later entries; the `truncated` row is reserved for `seq` exhaustion or a 9th entry, so a truncated record is still explicit.
 - **D25. Two label domains (round-3 ruling).** H's table labels run-level lead sources; settings surfaces use C's (field, token) table. Rejected: one table for both (the same token needs different words on a settings cell and in a run header).
 - **D26. Dispatch refresh (2026-10-29).** Preserve #3245's landed lane guard and both fallback notes during the behavior-preserving resolver extraction; reuse its settings labels and renderer. Allocate migrations from the current head. The run is auto-approved on Claude; agent integration is focused, full units are exact-head CI, and unavailable LiveDB execution remains a named landing obligation. Runtime evidence is pinned to SDK 0.3.302 and Codex 0.163.0; observation remains feature-detected and unknown when unsupported.
+- **D27. Unobserved values read "not reported yet" regardless of status (implementation, 2026-10-30).** The section 8 label table maps evidence alone: NULL is "not reported yet", `unknown` is "not reported by the runtime". Section 10's earlier wording ("not reported by the runtime" once terminal) would have needed status-dependent relabelling in both display twins; the shipped twins and the `dc5-earlier-attempt-not-current` display case follow the table. Rejected: rewriting NULL to `unknown` on terminal runs (an inference the runtime never made).
+- **D28. Go and web display twins agree on the requeued "previous attempt" summary and note order (implementation, 2026-10-30).** The queued line uses the same `plan … → implement …` summary as the chip; the earlier-attempt note precedes the truncation note. Pinned by display cases `dc2-requeued-previous-attempt-phases-differ` and `dc7-truncated-not-current`.
