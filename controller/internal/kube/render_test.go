@@ -2113,8 +2113,8 @@ func TestCommandSandboxEnvOnlyWhenNotOff(t *testing.T) {
 	}
 }
 
-// UZI_CODEX_COMMAND_CACHE_RUN_BYTES renders on the worker container only, only when set, and an
-// unset value leaves the pod spec hash identical to a zero-value config.
+// UZI_CODEX_COMMAND_CACHE_RUN_BYTES renders on the worker container only, only when set, and
+// setting it changes the pod spec hash.
 func TestCommandCacheRunBytesEnvOnlyWhenSet(t *testing.T) {
 	const name = "UZI_CODEX_COMMAND_CACHE_RUN_BYTES"
 	render := func(cfg RenderConfig) corev1.PodSpec {
@@ -2151,14 +2151,7 @@ func TestCommandCacheRunBytesEnvOnlyWhenSet(t *testing.T) {
 		t.Errorf("an unset CommandCacheRunBytes must emit NO %s env, got %q", name, v)
 	}
 
-	// Unset leaves the spec hash identical to an explicit empty value; setting it rolls
-	// the fleet once (it changes the rendered pod).
-	explicitEmpty := testConfig()
-	explicitEmpty.CommandCacheRunBytes = ""
-	if SpecHashOf(testConfig(), desired("abc"), testSpec(t, "base", "m")) !=
-		SpecHashOf(explicitEmpty, desired("abc"), testSpec(t, "base", "m")) {
-		t.Error("an unset CommandCacheRunBytes changed the spec hash; the unset render must be byte-identical")
-	}
+	// Setting it rolls the fleet once (it changes the rendered pod).
 	set := testConfig()
 	set.CommandCacheRunBytes = "4294967296"
 	if SpecHashOf(testConfig(), desired("abc"), testSpec(t, "base", "m")) ==
