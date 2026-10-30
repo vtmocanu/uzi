@@ -306,13 +306,16 @@ jobs:
             ./internal/recovery/...
             ./internal/poller/...
           )
-          # Match the local runner's bounded per-package timeouts. The workersvc
-          # race-enabled sweep exceeded 15 minutes after reconciliation coverage.
+          # Match the local runner's bounded per-package timeouts (rationale in
+          # e2e/run-store-it.sh). workersvc took 680-852s on main and hit a 20m
+          # budget on contended PR runners (#3664).
           : > livedb.log
           for p in "${PKGS[@]}"; do
             timeout=10m
-            if [ "$p" = ./internal/workersvc/... ]; then
+            if [ "$p" = "./internal/store/..." ] || [ "$p" = "./internal/handler/..." ]; then
               timeout=20m
+            elif [ "$p" = "./internal/workersvc/..." ]; then
+              timeout=45m
             fi
             go test -count=1 -v -race -p 1 -timeout "$timeout" -run 'LiveDB$' "$p" 2>&1 | tee -a livedb.log
           done
