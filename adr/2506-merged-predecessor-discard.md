@@ -6,7 +6,7 @@
 
 ## Amendment 2026-10-30 — same-issue merged witness (#3654)
 
-**Status**: Implemented on the candidate branch through reviewed M1–M3 commit `7d116a44`; not a claim of merge, deployment or completed M4 acceptance. The implemented same-run Option D below remains unchanged, including issue-less completed runs. This amendment adds the narrow cross-run basis `same_issue_witness` to existing `merged_predecessor_discard` evidence; it is intentional abandonment, not preservation proof.
+**Status**: Implemented narrow cross-run server policy. The implemented same-run Option D below remains unchanged, including issue-less completed runs. This amendment adds the narrow cross-run basis `same_issue_witness` to existing `merged_predecessor_discard` evidence; it is intentional abandonment, not preservation proof.
 
 ### Eligible target and witness
 
@@ -26,7 +26,7 @@ A late `ReconcileRunMR` after commit and a newly inserted live run after the loc
 
 ### Transaction and polling boundary
 
-The implementation reuses the single existing post-polling phase and original parent context: 30 seconds, at most 100 repository visits and a **shared** 100 transaction attempts across same-run and cross-run work. Observe each witness B freshly at most once per phase, with a five-second GET timeout and the existing client timeout; no observation survives into a later phase. One in-memory continuation tuple per repository retains B and the target creation-time/UUID keyset, not merge authority. At most one cross-run target is visited for B per phase. Refusal advances keyset progress; enumeration failure retains continuation. A repository whose target is deferred at the shared attempt cap resumes first with a fresh phase budget (M3 fix). There is no immediate or eventual convergence guarantee.
+The implementation reuses the single existing post-polling phase and original parent context: 30 seconds, at most 100 repository visits and a **shared** 100 transaction attempts across same-run and cross-run work. Observe each witness B freshly at most once per phase, with a five-second GET timeout and the existing client timeout; no observation survives into a later phase. One in-memory continuation tuple per repository retains B and the target creation-time/UUID keyset, not merge authority. At most one cross-run target is visited for B per phase. Refusal advances keyset progress; enumeration failure retains continuation. A repository whose target is deferred at the shared attempt cap resumes first with a fresh phase budget. There is no immediate or eventual convergence guarantee.
 
 Each target uses one transaction without internal retry. The fetched inventories are capped at 1000 holds across **all states**, 1000 publications and 1000 referenced FINAL captures, each with a 1001st-row overflow probe; non-ready captures share a separate 1000-row budget across selected OPEN siblings, also with a probe. Overflow or refusal rolls back the entire target. Oversized worksets remain protected and cursor progress continues. These bound fetched inventories and target transaction work, not all rows scanned by SQL.
 
@@ -38,13 +38,13 @@ Reuse `merged_predecessor_discard_binding` with the explicit `basis = same_issue
 
 Source boundaries: [cross-run recovery and dependency classification](../api/internal/recovery/cross_run.go), [candidate/target selection and ordered inventory locks](../api/internal/store/queries/merged_predecessor.sql), [shared-phase reconciliation and continuation](../api/internal/forgesvc/merged_predecessor.go), and [additive binding guard and rollback refusal](../api/internal/store/migrations/00379_same_issue_witness_discard.sql).
 
-### Implementation evidence and remaining acceptance
+### Coverage and rollout boundaries
 
-M1–M3 are committed and reviewed through `7d116a44`. The lead's real-candidate LiveDB run passed 13 top-level tests / 52 cases with zero skips. The new-path integration uses the real reconciler and LiveDB with a Go fake forge; it is not the Compose HTTPS fake. The inherited fake's weak project-scope lookup is a coverage boundary, not evidence of project-isolation acceptance.
+The cross-run integration uses the real reconciler and LiveDB with a Go fake forge; it is not the Compose HTTPS fake. The inherited fake's weak project-scope lookup is a coverage boundary, not evidence of project-isolation acceptance. This integration does not establish Compose coverage, including phases 27/38/72.
 
-The source-only E2E audit found 37 hits in six tracked files and required no contract updates. Receipt-preservation helpers remain exact: policy discard is not a preservation receipt. Compose phases 27/38/72 and all other Compose phases remain unrun for this candidate. CLI, worker and API readers, DTOs and routes are unchanged; the evidence value remains `merged_predecessor_discard`. No programme completion, merge, deployment or completed M4 acceptance follows from this record.
+Receipt-preservation helpers remain exact: policy discard is not a preservation receipt. CLI, worker and API readers, DTOs and routes are unchanged; the evidence value remains `merged_predecessor_discard`. Run-specific validation results belong in the worker PR summary; they do not establish programme completion or operator rollout.
 
-Measured database plans are not constant-cost: target lookup uses the existing issue-history index, while generic plans can filter deep history and `HasCrossRunSharedFinal` can scan global hold history. Finite fetched worksets and phase deadlines do not bound all scanned rows, establish production cost or bound forge response bytes. Representative production cost and hosted/live rollout remain unverified; keep these separate from the passing LiveDB functional evidence.
+Database plans are not constant-cost: target lookup uses the existing issue-history index, while generic plans can filter deep history and `HasCrossRunSharedFinal` can scan global hold history. Finite fetched worksets and phase deadlines do not bound all scanned rows, establish production cost or bound forge response bytes. Representative production cost and hosted/live rollout remain unverified; functional integration coverage does not establish either.
 
 ## Decision
 

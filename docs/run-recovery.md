@@ -1401,9 +1401,8 @@ a fresh retention window. A created, unacknowledged orphan with no receipt
 reference may be deleted through existing cleanup once no OPEN hold remains;
 acknowledged publications keep their existing TTL, and receipt-referenced publications keep their existing cleanup protection.
 There is no new worker deletion authority or source/PVC guarantee. Same-run
-Option D above, including issue-less runs, is unchanged. M1–M3 are implemented
-and reviewed through candidate commit `7d116a44`; merge, deployment and completed
-M4 acceptance are not established. Generations are independent across runs:
+Option D above, including issue-less runs, is unchanged.
+Generations are independent across runs:
 target A1 or A3 can qualify with witness B1. Non-ready capture settlement and
 partial-chunk cleanup commit atomically with discard. See the
 [ADR-2506 amendment](../adr/2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654)

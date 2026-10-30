@@ -30,11 +30,14 @@ func TestCrossRunDiscardETagRevalidationLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() {
+			t.Cleanup(func() {
 				if err := requests.Close(); err != nil {
 					t.Error(err)
 				}
-			}()
+				if err := os.Remove(requests.Name()); err != nil {
+					t.Error(err)
+				}
+			})
 			role := fmt.Sprintf("m3-cross-run-etag pid=%d", os.Getpid())
 			t.Logf("owned HTTP instrument request log=%s", requests.Name())
 			var pulls, confirmations atomic.Int32

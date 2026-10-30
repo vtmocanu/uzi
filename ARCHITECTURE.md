@@ -1706,10 +1706,9 @@ chain in the diagram above, with no intervening `running`.
   Available archives keep their existing TTL; this adds no worker authority or
   source/PVC guarantee. Same-run Option D remains unchanged, including issue-less
   completions. See the [ADR-2506 amendment](adr/2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654)
-  for the complete policy, shared bounds and accepted races. M1–M3 are implemented
-  and reviewed through candidate commit `7d116a44`; merge, deployment and completed
-  M4 acceptance are not established. Recovery locks all-state A inventory in
-  generation/id order with NO KEY UPDATE, then publications, then non-ready
+  for the complete policy, shared bounds and accepted races. Recovery locks
+  all-state A inventory in generation/id order with NO KEY UPDATE, then
+  publications, then non-ready
   captures; only qualifying OPEN holds through A's terminal generation discard.
   The 1000-row inventories plus overflow probes bound fetched work, not all SQL
   scans: generic issue-history filtering and shared-FINAL global history scans
