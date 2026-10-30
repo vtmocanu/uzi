@@ -440,12 +440,18 @@ describe("classifySourceAdmission is genuinely read-only (issue #3638 D4)", () =
   });
 
   it("with a queued end pending over a slot one ahead of its head: the slot and head bytes are equal, nothing is drained or repaired, and it classifies as `other`", async (t) => {
-    const flags = { head: false };
+    const flags = { head: false, headWriteAttempts: 0 };
+    let failedDrain!: () => void;
+    const drainFailed = new Promise<void>(resolve => { failedDrain = resolve; });
     const r = await rig(t, {
+      log: { warn: message => { if (message === "a queued source-use end could not be applied yet") failedDrain(); } },
       ops: {
         syncFile: (h) => h.sync(), syncDir: (h) => h.sync(),
         rename: async (a, b) => {
-          if (flags.head && path.basename(path.dirname(b)) === "heads") throw new Error("injected head failure");
+          if (flags.head && path.basename(path.dirname(b)) === "heads") {
+            flags.headWriteAttempts++;
+            throw new Error("injected head failure");
+          }
           fs.renameSync(a, b);
         },
       },
@@ -457,18 +463,22 @@ describe("classifySourceAdmission is genuinely read-only (issue #3638 D4)", () =
     flags.head = true;
     const outcome = await r.rt.endSourceUse([r.clone]);
     assert.deepEqual(outcome.endedSlots, [], "the end failed after the slot rename: queued, not confirmed");
-    await new Promise((resolve) => setTimeout(resolve, 100)); // the idle drain's own (failing) attempt
-    flags.head = false;
-
+    // Observe the failed idle drain, then join its authority lock without draining anything. Keep the
+    // fault armed through the reads, which still start outside A and must never attempt a head repair.
+    await drainFailed;
+    assert.equal(await r.rt.awaitSinkQuiescent({ timeoutMs: 5000 }), true);
     const before = authorityBytes(r.root);
+    const attempts = flags.headWriteAttempts;
     assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), true, "the end is queued and the key still owned");
     const observer = foreign(r);
     assert.equal((await observer.classifySourceAdmission(r.clone, new Set())).kind, "other", "slot ahead of head is uncertain");
     assert.equal((await r.rt.classifySourceAdmission(r.clone, new Set())).kind, "other");
+    assert.equal(flags.headWriteAttempts, attempts, "classification never attempts a head repair");
     assert.equal(authorityBytes(r.root), before, "slot and head files are byte-equal: no repair, no write");
     assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), true, "the queued end was not drained by the classification");
 
     // The control: an ordinary transaction DOES drain the queued end and repair the head, so the equality above is meaningful.
+    flags.head = false;
     await r.rt.withTransaction(async () => undefined);
     assert.notEqual(authorityBytes(r.root), before, "a transaction completes the crash window");
     assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), false, "and applies the queued end");
@@ -570,12 +580,18 @@ describe("an admission racing the sink retirement (issue #3638)", () => {
 
 describe("verifyEndedSlots is genuinely read-only (issue #3638 D3)", () => {
   it("with a queued end pending: the slot and head bytes are equal, nothing is drained or repaired, and the answer is false", async (t) => {
-    const flags = { head: false };
+    const flags = { head: false, headWriteAttempts: 0 };
+    let failedDrain!: () => void;
+    const drainFailed = new Promise<void>(resolve => { failedDrain = resolve; });
     const r = await rig(t, {
+      log: { warn: message => { if (message === "a queued source-use end could not be applied yet") failedDrain(); } },
       ops: {
         syncFile: (h) => h.sync(), syncDir: (h) => h.sync(),
         rename: async (a, b) => {
-          if (flags.head && path.basename(path.dirname(b)) === "heads") throw new Error("injected head failure");
+          if (flags.head && path.basename(path.dirname(b)) === "heads") {
+            flags.headWriteAttempts++;
+            throw new Error("injected head failure");
+          }
           fs.renameSync(a, b);
         },
       },
@@ -587,17 +603,19 @@ describe("verifyEndedSlots is genuinely read-only (issue #3638 D3)", () => {
     const live = (await slotOf(r.rt, r.clone))!;
     flags.head = true;
     await r.rt.endSourceUse([r.clone]);
-    await new Promise((resolve) => setTimeout(resolve, 100)); // the idle drain's own (failing) attempt
-    flags.head = false;
-
+    await drainFailed;
+    assert.equal(await r.rt.awaitSinkQuiescent({ timeoutMs: 5000 }), true);
     const before = authorityBytes(r.root);
+    const attempts = flags.headWriteAttempts;
     assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), true, "the end is queued and the key still owned");
     const sources = [{ path: r.clone, authorityKey: live.key, epoch: live.epoch, seq: live.seq + 1 }];
     assert.equal(await r.rt.verifyEndedSlots(sources, r.rt.authorityIncarnation()!), false, "a slot one ahead of its head is uncertain");
+    assert.equal(flags.headWriteAttempts, attempts, "verification never attempts a head repair");
     assert.equal(authorityBytes(r.root), before, "slot and head files are byte-equal: no repair, no write");
     assert.equal(r.rt.heldByOtherSink(r.clone, new Set()), true, "the queued end was not drained by the verification");
 
     // The control: an ordinary transaction DOES drain the queued end, so the equality above is meaningful.
+    flags.head = false;
     await r.rt.withTransaction(async () => undefined);
     assert.notEqual(authorityBytes(r.root), before);
     const ended = (await slotOf(r.rt, r.clone))!;
