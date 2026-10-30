@@ -90,7 +90,7 @@ func requireWitnessRollbackRefusal(t *testing.T, err error) {
 
 func TestCrossRunDiscardRollbackRoundTripLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "witness_roundtrip_")
-	if err := store.MigrateTo(ctx, dsn, 378); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 385); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -109,7 +109,7 @@ func TestCrossRunDiscardRollbackRoundTripLiveDB(t *testing.T) {
 	}
 	body := strings.SplitN(strings.SplitN(first[1], "AS $$", 2)[1], "$$;", 2)[0]
 	if original != body {
-		t.Fatal("378 universal guard differs from exact 338 body")
+		t.Fatal("385 universal guard differs from exact 338 body")
 	}
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
@@ -120,7 +120,7 @@ func TestCrossRunDiscardRollbackRoundTripLiveDB(t *testing.T) {
 	if !strings.Contains(witnessGuard(t, ctx, pool), "same_issue_witness") {
 		t.Fatal("new branch missing")
 	}
-	if err := store.MigrateDownTo(ctx, dsn, 378); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 385); err != nil {
 		t.Fatal(err)
 	}
 	if witnessGuard(t, ctx, pool) != original {
@@ -138,7 +138,7 @@ func TestCrossRunDiscardRollbackRoundTripLiveDB(t *testing.T) {
 		t.Fatalf("direct database transition: rows=%d err=%v", tag.RowsAffected(), err)
 	}
 	before := witnessRetained(t, ctx, pool, f.hold)
-	requireWitnessRollbackRefusal(t, store.MigrateDownTo(ctx, dsn, 378))
+	requireWitnessRollbackRefusal(t, store.MigrateDownTo(ctx, dsn, 385))
 	if witnessRetained(t, ctx, pool, f.hold) != before || witnessSchema(t, ctx, pool) != schema {
 		t.Fatal("refused Down changed rows, versions, functions or CHECKs")
 	}
@@ -178,7 +178,7 @@ func TestCrossRunDiscardRollbackRefusesWitnessLiveDB(t *testing.T) {
 		migrationDSN = parsed.String()
 	}
 	result := make(chan error, 1)
-	go func() { result <- store.MigrateDownTo(bounded, migrationDSN, 378) }()
+	go func() { result <- store.MigrateDownTo(bounded, migrationDSN, 385) }()
 	joined := false
 	defer func() {
 		if !joined {

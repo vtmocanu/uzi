@@ -1712,7 +1712,7 @@ chain in the diagram above, with no intervening `running`.
   captures; only qualifying OPEN holds through A's terminal generation discard.
   The 1000-row inventories plus overflow probes bound fetched work, not all SQL
   scans: generic issue-history filtering and shared-FINAL global history scans
-  remain cost boundaries. Migration 00379 extends only the universal binding
+  remain cost boundaries. Migration 00386 extends only the universal binding
   guard with the 19-field witness audit; the evidence CHECK and current 00340
   inventory guard stay unchanged. No DTO, route, CLI or worker protocol changes.
   #3031/#2969/#2884 retain their scope.
