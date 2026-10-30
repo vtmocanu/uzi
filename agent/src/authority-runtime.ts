@@ -360,7 +360,7 @@ export class AuthorityRuntime implements AuthorityScope {
   /**
    * issue #3638 D3 - read-only verification of previously recorded ended slots. A is held through the same lock
    * primitive as {@link withTransaction}, but the pre-callback drain of queued late settlements and ends is NOT run and
-   * the store is not opened for writing: each slot is read by `authorityKey` through {@link peekAuthoritySlot}, and must be
+   * the store is not opened for writing: each slot is read by its `path` through {@link peekAuthoritySlot}, its `authorityKey` is compared with the recorded one, and it must be
    * `ineligible` with exactly the recorded epoch and seq, owned by `worker`. Any difference (a successor epoch, a changed
    * seq, another owner, a missing slot) or any uncertainty (a lock timeout, an unreadable store or slot, a slot one ahead of
    * its head) answers false. It writes nothing, authorizes nothing, and is used only to log whether a predecessor's

@@ -475,6 +475,18 @@ describe("classifySourceAdmission is genuinely read-only (issue #3638 D4)", () =
   });
 });
 
+describe("ownedSourceEpoch (issue #3638)", () => {
+  it("answers only for the sink that owns the key: another sink, or none, gets undefined", async (t) => {
+    const r = await rig(t);
+    const a = new Set<string>();
+    const lease = await bindIn(r.rt, a, r.clone);
+    assert.equal(r.rt.ownedSourceEpoch(r.clone, a), leaseEpoch(lease), "the owning sink reads its own epoch");
+    assert.equal(r.rt.ownedSourceEpoch(r.clone, new Set<string>()), undefined, "another sink does not read the owner's epoch");
+    assert.equal(r.rt.ownedSourceEpoch(r.clone, undefined), undefined, "no sink reads nothing");
+    assert.equal(r.rt.ownedSourceEpoch(r.other, a), undefined, "an unowned path has no epoch");
+  });
+});
+
 describe("verifyEndedSlots is genuinely read-only (issue #3638 D3)", () => {
   it("with a queued end pending: the slot and head bytes are equal, nothing is drained or repaired, and the answer is false", async (t) => {
     const flags = { head: false };

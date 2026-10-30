@@ -378,7 +378,9 @@ describe("a refused memory continuation re-parks for the owner instead of failin
   });
 
   for (const [name, status, generation] of [["owner pause", "paused", 8], ["a newer claim fence", "running", 9]] as const) {
-    it(`${name} before the re-park report is nonterminal with no failed report`, async () => {
+    // The pause/fence is armed before the resume, but the report is still sent: it is seen through the ownership read
+    // after the report. This pins that outcome (nonterminal, no failed report), not a suppressed report.
+    it(`${name} seen during the re-park is nonterminal with no failed report`, async () => {
       const p = await predecessor("sent_unconfirmed");
       const c = await resume(p, { arm: () => api.setOwnershipStatus(p.f.claim.run_id, status, generation) });
       assert.equal(terminals().length, 0);

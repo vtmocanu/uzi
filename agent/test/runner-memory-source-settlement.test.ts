@@ -351,6 +351,20 @@ describe("the cooperative memory-park record is complete or absent (issue #3638)
     assert.equal(r.outcomes.length > 0, true);
   });
 
+  it("a flight that never owned a slot for its clone path records no memory park (source epoch unknown)", async () => {
+    const messages: string[] = [];
+    const log = { ...nullLogger(), warn: (m: string) => { messages.push(m); } };
+    log.child = () => log;
+    await exhaustedPark(rig => {
+      // Neither the owned epoch nor an ended-slot receipt names the clone: the epoch is not determinable.
+      rig.rt.ownedSourceEpoch = () => undefined;
+      const inner = rig.rt.endSourceUse.bind(rig.rt);
+      rig.rt.endSourceUse = async (...args) => ({ ...(await inner(...args)), endedSlots: [] });
+    }, log);
+    assert.equal(activeJournal()?.memoryPark, undefined, "no record without a source epoch");
+    assert.ok(messages.includes("memory park not recorded: the flight's source epoch is unknown"), messages.join("; "));
+  });
+
   it("a published end writes no settlement even though the park is confirmed and the slot ended", async () => {
     const { r } = await exhaustedPark((_rig, runner) => {
       const internals = runner as { endFlightSourceUse(...args: unknown[]): Promise<Record<string, unknown>> };
