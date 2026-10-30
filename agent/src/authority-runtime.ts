@@ -340,6 +340,24 @@ export class AuthorityRuntime implements AuthorityScope {
   }
 
   /**
+   * Barrier after {@link retireSink}: every admission runs under A, so taking A once (without the pre-callback drain
+   * and without opening the store) proves that an admission which passed its entry check before the retirement has
+   * finished and added its path to the sink; one that starts later is refused. Resolves true when A was taken (or this
+   * context already holds it, where no other admission can be running); false when A could not be taken within the
+   * wait, in which case the sink may still gain a path and the caller must not treat its snapshot as complete.
+   */
+  async awaitSinkQuiescent(wait: AuthorityWait = {}): Promise<boolean> {
+    if (this.active()) return true;
+    try {
+      await withAuthorityTransaction(this.#options.lifetime, {
+        ...(wait.signal ? { signal: wait.signal } : {}),
+        timeoutMs: wait.timeoutMs ?? this.#options.timeoutMs ?? DEFAULT_WAIT_MS,
+      }, async () => undefined);
+      return true;
+    } catch { return false; }
+  }
+
+  /**
    * The worker incarnation this runtime's slots are written under, once its store has been opened by any
    * transaction (every admission opens it); undefined before that. Never acquires A. A memory-park record names it
    * as the slot owner (issue #3638).
@@ -824,6 +842,8 @@ export class AuthorityRuntime implements AuthorityScope {
       if (held && slot && this.#ends.get(key) !== held && this.#ownedActive(store, slot, held) &&
           (executorIncarnation === undefined ? leaseHarness(held) === "claude" : slot.owner.executor === executorIncarnation)) return held;
       if (executorIncarnation === undefined) return this.#mint(tx, store, key);
+      // Re-checked inside A after the store and slot I/O above: the sink may have been retired meanwhile.
+      this.#assertSinkLive();
       const lease = await store.admitSourceUse(tx, key, { executor: executorIncarnation });
       this.#leases.set(key, lease);
       this.#recordOwner(key, lease);
@@ -873,6 +893,8 @@ export class AuthorityRuntime implements AuthorityScope {
     tx: AuthorityTransaction, store: AuthorityStore, key: string,
     purpose: { destructive?: boolean; consumePublication?: boolean } = {},
   ): Promise<SourceUseLease> {
+    // Re-checked inside A, after the caller's store and slot I/O and before the write (a destructive record is not a flight's use).
+    if (purpose.destructive !== true) this.#assertSinkLive();
     // Recorded before the admission so a path whose admission wrote the slot and then failed is still named.
     this.#note(key);
     const lease = await store.admitSourceUse(tx, key, purpose);
@@ -921,6 +943,7 @@ export class AuthorityRuntime implements AuthorityScope {
       const held = this.#leases.get(key);
       const slot = held ? await this.#slotOf(tx, store, key) : null;
       if (held && slot && this.#ends.get(key) !== held && this.#ownedActive(store, slot, held)) {
+        this.#assertSinkLive();
         this.#note(key);
         await store.admitSourceUse(tx, key, { lease: held });
         return;

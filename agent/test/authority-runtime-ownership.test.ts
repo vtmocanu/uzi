@@ -487,6 +487,87 @@ describe("ownedSourceEpoch (issue #3638)", () => {
   });
 });
 
+describe("an admission racing the sink retirement (issue #3638)", () => {
+  /** An fs seam that parks the next durable write (a slot or store write) until released. */
+  function pausingOps() {
+    const gate = { armed: false, reached: undefined as undefined | (() => void), release: undefined as undefined | (() => void) };
+    const ops = {
+      syncFile: async (h: { sync(): Promise<void> }) => {
+        if (gate.armed) {
+          gate.armed = false;
+          const waiting = new Promise<void>((resolve) => { gate.release = resolve; });
+          gate.reached?.();
+          await waiting;
+        }
+        await h.sync();
+      },
+      syncDir: (h: { sync(): Promise<void> }) => h.sync(),
+      rename: async (a: string, b: string) => { fs.renameSync(a, b); },
+    };
+    const arm = () => {
+      gate.armed = true;
+      return new Promise<void>((resolve) => { gate.reached = resolve; });
+    };
+    return { ops, arm, release: () => gate.release!() };
+  }
+  const settledWithin = (p: Promise<unknown>, ms: number) =>
+    Promise.race([p.then(() => true, () => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ms))]);
+
+  it("the teardown barrier waits for an admission already inside A, so its path and owned epoch are in the snapshot", async (t) => {
+    const p = pausingOps();
+    const r = await rig(t, { ops: p.ops });
+    await bindIn(r.rt, new Set(), r.other); // opens the store, so the next durable write is the clone's slot
+    const sink = new Set<string>();
+    const reached = p.arm();
+    const admission = bindIn(r.rt, sink, r.clone);
+    await reached; // the admission passed its entry guard and is writing its slot under A
+
+    r.rt.retireSink(sink);
+    const barrier = r.rt.awaitSinkQuiescent({ timeoutMs: 5000 });
+    assert.equal(await settledWithin(barrier, 100), false, "the barrier waits behind the admission that holds A");
+    assert.equal(r.rt.ownedSourceEpoch(r.clone, sink), undefined, "the admission has not finished: its owner is not recorded yet");
+
+    p.release();
+    const lease = await admission;
+    assert.equal(await barrier, true);
+    assert.equal(sink.has(r.clone), true, "the admitted path is in the sink the teardown snapshots");
+    assert.equal(r.rt.ownedSourceEpoch(r.clone, sink), leaseEpoch(lease), "and its owned epoch is readable once the barrier returns");
+    assert.equal((await slotOf(r.rt, r.clone))?.state, "active");
+    const ended = await r.rt.endSourceUse([...sink], { sink });
+    assert.equal(ended.endedSlots.some((e) => e.path === r.clone), true, "so the bounded end covers the admitted path");
+  });
+
+  it("an admission that passed its entry guard but not its write is refused once the sink is retired", async (t) => {
+    const p = pausingOps();
+    const r = await rig(t, { ops: p.ops });
+    const sink = new Set<string>();
+    const reached = p.arm();
+    const admission = bindIn(r.rt, sink, r.clone); // fresh runtime: parks in the store creation, after the entry guard
+    const refused = assert.rejects(admission, isHeld);
+    await reached;
+    r.rt.retireSink(sink);
+    p.release();
+    await refused;
+    assert.equal(await r.rt.awaitSinkQuiescent({ timeoutMs: 5000 }), true);
+    assert.equal(await slotOf(r.rt, r.clone), null, "nothing was admitted for the retired sink");
+  });
+
+  it("the barrier answers false when A cannot be taken in time, and is a no-op inside an active transaction", async (t) => {
+    const r = await rig(t);
+    const { withAuthorityTransaction } = await import("../src/authority-lock.js");
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let acquired!: () => void;
+    const holding = new Promise<void>((resolve) => { acquired = resolve; });
+    const holder = withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async () => { acquired(); await held; });
+    await holding;
+    assert.equal(await r.rt.awaitSinkQuiescent({ timeoutMs: 50 }), false);
+    release();
+    await holder;
+    assert.equal(await r.rt.withTransaction(() => r.rt.awaitSinkQuiescent({ timeoutMs: 50 })), true);
+  });
+});
+
 describe("verifyEndedSlots is genuinely read-only (issue #3638 D3)", () => {
   it("with a queued end pending: the slot and head bytes are equal, nothing is drained or repaired, and the answer is false", async (t) => {
     const flags = { head: false };

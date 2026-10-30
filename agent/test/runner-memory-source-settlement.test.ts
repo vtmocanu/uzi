@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 import { describe, it } from "node:test";
 import { performance } from "node:perf_hooks";
 import { acquireWorkerLifetime } from "../src/authority-lock.js";
@@ -65,7 +66,7 @@ async function setup(count = 0) {
     } },
   });
   const workerId = client.memoryIncarnation!.worker_id;
-  return { memory, claim, workerId, pressure: (bytes: number) => { usage = bytes; } };
+  return { memory, claim, workerId, reservations, pressure: (bytes: number) => { usage = bytes; } };
 }
 
 async function authorityRig() {
@@ -119,7 +120,8 @@ const enroll = (ctx: RunContext) => {
 };
 
 /** T1: the confirmed, settled cooperative record on the active key, durable and verifiable. */
-async function assertSettledRecord(claim: ClaimResponse, workerId: string, rt: AuthorityRuntime, clone: string, slot: SlotSnapshot): Promise<void> {
+async function assertSettledRecord(claim: ClaimResponse, workerId: string, rt: AuthorityRuntime, clone: string, slot: SlotSnapshot,
+  interventionIds: string[] = []): Promise<void> {
   const journal = activeJournal();
   assert.ok(journal, "the clone's active journal key survives the park");
   const park = journal.memoryPark;
@@ -132,6 +134,7 @@ async function assertSettledRecord(claim: ClaimResponse, workerId: string, rt: A
   assert.equal(park.settlement?.confirmed, true, "phase 2 confirmed the settlement");
   assert.deepEqual(park.settlement?.sources, [{ path: clone, authorityKey: slot.key, attemptId: null, epoch: slot.epoch, seq: slot.seq }]);
   assert.deepEqual(park.settlement?.evidence.parkAck, park.binding);
+  assert.deepEqual(park.settlement?.evidence.interventionIds, interventionIds, "the settlement names the intervention that produced the hold");
   assert.deepEqual(await git.readConfirmedMemoryPark(git.barePathFor(fx.originPath), BRANCH,
     { runId: claim.run_id, clonePath: journal.clonePath, record: park }), park, "the lock-held reader confirms it");
   assert.equal(await rt.verifyEndedSlots(park.settlement!.sources, park.origin.authorityIncarnation), true,
@@ -171,7 +174,8 @@ describe("a settled memory park ends the flight's source use (issue #3638)", () 
     assert.deepEqual([ended[0]!.epoch, ended[0]!.seq, ended[0]!.key], [slot?.epoch, slot?.seq, slot?.key],
       "the receipt is the saved identity of the ended slot");
 
-    await assertSettledRecord(f.claim, f.workerId, r.rt, clone, slot!);
+    assert.equal(f.reservations.length, 1, "exactly one pressure intervention was reserved");
+    await assertSettledRecord(f.claim, f.workerId, r.rt, clone, slot!, [f.reservations[0]!.intervention_id]);
 
     const next = r.successor();
     const sources = activeJournal()!.memoryPark!.settlement!.sources;
@@ -242,6 +246,189 @@ describe("a settled memory park ends the flight's source use (issue #3638)", () 
     const next = r.successor();
     await assert.rejects(next.withTransaction(() => next.hooks.admitSourceUse(clone, "seed-canonical")),
       /active under another worker incarnation/);
+  });
+});
+
+// T1: the positive end of the story. After an accepted, settled park the owner's Resume is a SUCCESSOR claim on a fresh
+// authority incarnation: it recovers the retained clone through the real retained recovery, is admitted (the slot is
+// ineligible) and reaches the successor executor, with the predecessor's work still in the worktree it is handed.
+describe("a settled memory park lets the successor claim continue on the retained work (issue #3638)", () => {
+  const MARKER = "predecessor-work.txt";
+  for (const producer of ["pressure", "exhausted allowance"] as const) {
+    it(`${producer}: the successor claim on a fresh incarnation reaches its executor with the predecessor's work preserved`, async () => {
+      const f = await setup(producer === "pressure" ? 1 : 2);
+      const r = await authorityRig();
+      fs.writeFileSync(homeDir + "/session-proof", "original session");
+      git.worktreeStatus = async () => [];
+      const monitoring = producer === "pressure" ? f.memory.run() : Promise.resolve();
+      const executor: Executor = {
+        run: async ctx => {
+          fs.writeFileSync(path.join(ctx.worktreePath, MARKER), "predecessor wrote this");
+          execFileSync("git", ["-C", ctx.worktreePath, "add", MARKER], { stdio: "pipe" });
+          execFileSync("git", ["-C", ctx.worktreePath, "-c", "user.name=predecessor", "-c", "user.email=p@example.test",
+            "commit", "-m", "predecessor work"], { stdio: "pipe" });
+          if (producer === "pressure") {
+            const command = enroll(ctx);
+            f.pressure(950);
+            const result = await command.captured.commands.watchOutcome(command.entry);
+            ctx.emit({ kind: "tool_result", payload: { tool_id: result.tool_id, result } });
+          } else {
+            api.setOwnershipStatus(f.claim.run_id, "running", 7);
+            assert.throws(() => ctx.capturedMemory!(), /retained recovery/i);
+          }
+          throw new Error("model abort is not a test failure");
+        },
+      };
+      try {
+        await runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
+          { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, authority: r.rt }).execute(f.claim);
+      } finally { await f.memory.stop(); await monitoring; }
+      const clone = worktreeDirFor(IID);
+      assert.equal(parks().length, 1, "the predecessor parked");
+      assert.equal(activeJournal()?.memoryPark?.settlement?.confirmed, true, "with a settled record");
+      assert.equal((await slotOf(r.rt, clone))?.state, "ineligible");
+      assert.equal(fs.readFileSync(path.join(clone, MARKER), "utf8"), "predecessor wrote this", "the predecessor's work is retained");
+
+      // The owner's Resume: a later generation and episode, a fresh registration, a fresh authority incarnation.
+      api.memoryRegisterNonce = "resumed-memory-registration";
+      await client.register("memory-fixture", "base");
+      const resumed: ClaimResponse = { ...f.claim, claim_generation: 8, memory_episode: 4, memory_policy: null, memory_intervention_count: 0 };
+      api.setOwnershipStatus(resumed.run_id, "running", 8);
+      const seen: Array<{ worktree: string; marker: string | null }> = [];
+      const successor: Executor = {
+        run: async ctx => {
+          seen.push({ worktree: ctx.worktreePath,
+            marker: fs.existsSync(path.join(ctx.worktreePath, MARKER)) ? fs.readFileSync(path.join(ctx.worktreePath, MARKER), "utf8") : null });
+          throw new Error("the successor stops here");
+        },
+      };
+      const next = r.successor();
+      await runnerWith(() => ({ executor: successor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
+        { codexBoundaryDeadlineMs: 5000, authority: next }).execute(resumed).catch(() => {});
+
+      assert.equal(seen.length, 1, "the successor executor ran: the retained continuation was not refused");
+      assert.equal(seen[0]!.marker, "predecessor wrote this", "and it works on the predecessor's retained work");
+      assert.ok(path.resolve(seen[0]!.worktree).startsWith(`${path.resolve(clone)}.attempt-`),
+        `in a fresh attempt clone restored from the retained one: ${seen[0]!.worktree}`);
+      assert.equal(api.states.filter(s => s.body.status === "failed" && s.body.failure_reason?.includes("preservation")).length,
+        0, "no preservation_failed");
+    });
+  }
+});
+
+// T2: the hold alone is no evidence in either direction. A failed preservation settles its operation (finally) without a
+// witness, and clearing the hold by hand must not let an unresolved join through.
+describe("the memory settlement bookkeeping cannot be tricked into an end (issue #3638)", () => {
+  type Flight = { workerMemory?: { hold?: unknown; settled?: boolean; operation?: unknown; parkWitness?: unknown;
+    feedback: Map<string, unknown> }; parked?: boolean; sourceTailsJoined?: boolean };
+  type Internals = {
+    memoryHoldSettled(flight: Flight, executor: Executor): boolean;
+    runCancellationMaintenance(flight: Flight, fn: () => Promise<unknown>, ...rest: unknown[]): Promise<unknown>;
+    preserveWorkerMemory(...args: unknown[]): Promise<void>;
+  };
+  async function exhausted(tweak: (runner: Internals) => void) {
+    const f = await setup(2);
+    const r = await authorityRig();
+    fs.writeFileSync(homeDir + "/session-proof", "original session");
+    git.worktreeStatus = async () => [];
+    const executor: Executor = {
+      run: async ctx => {
+        api.setOwnershipStatus(f.claim.run_id, "running", 7);
+        assert.throws(() => ctx.capturedMemory!(), /retained recovery/i);
+        throw new Error("fixture stops original model execution");
+      },
+    };
+    const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, authority: r.rt });
+    tweak(runner as unknown as Internals);
+    try { await runner.execute(f.claim); } finally { await f.memory.stop(); }
+    return { f, r, clone: worktreeDirFor(IID) };
+  }
+
+  it("a preservation that throws settles its operation but leaves no witness: the slot stays active and the hold is never settled", async () => {
+    const verdicts: boolean[] = [];
+    let seen: Flight | undefined;
+    const { r, clone } = await exhausted(runner => {
+      runner.preserveWorkerMemory = async () => { throw new Error("injected preservation failure"); };
+      const settled = runner.memoryHoldSettled.bind(runner);
+      runner.memoryHoldSettled = (flight, ex) => { seen = flight; const v = settled(flight, ex); verdicts.push(v); return v; };
+    });
+    assert.ok(seen, "the settlement predicate was consulted for a flight holding a memory hold");
+    assert.equal(seen.workerMemory?.settled, true, "the operation settled through its finally despite the failure");
+    assert.equal(seen.workerMemory?.parkWitness, undefined, "and produced no witness");
+    assert.equal(parks().length, 0, "no park was accepted");
+    assert.equal(verdicts.length > 0 && verdicts.every(v => !v), true, `memoryHoldSettled is false every time: ${verdicts.join(",")}`);
+    assert.equal(seen.sourceTailsJoined, false);
+    assert.equal((await slotOf(r.rt, clone))?.state, "active", "fail closed: the source use did not end");
+    assert.deepEqual(r.outcomes.flatMap(o => o.endedSlots), []);
+    assert.equal(activeJournal()?.memoryPark?.settlement, undefined);
+  });
+
+  it("a park witness with the hold cleared by hand does not end the source use while a required join is unresolved", async () => {
+    let flightSeen: Flight | undefined;
+    let tampered = false;
+    const { r, clone } = await exhausted(runner => {
+      const inner = runner.runCancellationMaintenance.bind(runner);
+      runner.runCancellationMaintenance = (flight, fn, ...rest) => {
+        const memory = flight.workerMemory;
+        if (!tampered && memory?.parkWitness && flight.parked) {
+          tampered = true; flightSeen = flight;
+          memory.hold = undefined; // cleared by hand, as nothing in production does
+          memory.feedback.set("outstanding-feedback", {}); // a required join (undelivered feedback) stays unresolved
+        }
+        return inner(flight, fn, ...rest);
+      };
+    });
+    assert.equal(tampered, true, "the witness existed before the hold was cleared");
+    assert.equal(flightSeen?.workerMemory?.hold, undefined);
+    assert.equal(flightSeen?.sourceTailsJoined, false, "the unresolved join keeps the tails unjoined");
+    assert.equal((await slotOf(r.rt, clone))?.state, "active", "no end");
+    assert.deepEqual(r.outcomes.flatMap(o => o.endedSlots), []);
+    assert.equal(activeJournal()?.memoryPark?.settlement, undefined, "and no settlement");
+  });
+
+  // The crash/companion boundary: the process dies after the park was accepted but before teardown's producer ran, so no
+  // end and no record exist for this attempt. The next claimant's real disposition is today's path.
+  it("crash/companion boundary: a process that died before endFlightSourceUse and the record write leaves today's preservation failure for a foreign-active slot", async () => {
+    const f = await setup(2);
+    const r = await authorityRig();
+    fs.writeFileSync(homeDir + "/session-proof", "original session");
+    git.worktreeStatus = async () => [];
+    const executor: Executor = {
+      run: async ctx => {
+        api.setOwnershipStatus(f.claim.run_id, "running", 7);
+        assert.throws(() => ctx.capturedMemory!(), /retained recovery/i);
+        throw new Error("fixture stops original model execution");
+      },
+    };
+    const first = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, authority: r.rt });
+    // Process death: neither the end nor the record producer ever runs (the old runtime is then discarded).
+    const dead = first as unknown as { endFlightSourceUse(): Promise<unknown>; recordMemoryParkOutcome(): Promise<void> };
+    dead.endFlightSourceUse = async () => ({ paths: [], endedSlots: [], published: false, ownedEpochs: {} });
+    dead.recordMemoryParkOutcome = async () => {};
+    try { await first.execute(f.claim); } finally { await f.memory.stop(); }
+    const clone = worktreeDirFor(IID);
+    assert.equal(parks().length, 1, "premise: the park was accepted by the server");
+    assert.equal((await slotOf(r.rt, clone))?.state, "active", "premise: the slot was never ended");
+    assert.equal(activeJournal()?.memoryPark, undefined, "premise: no record was written for this attempt");
+
+    api.memoryRegisterNonce = "resumed-memory-registration";
+    await client.register("memory-fixture", "base");
+    const resumed: ClaimResponse = { ...f.claim, claim_generation: 8, memory_episode: 4, memory_policy: null, memory_intervention_count: 0 };
+    api.setOwnershipStatus(resumed.run_id, "running", 8);
+    let ran = 0;
+    const successor: Executor = { run: async () => { ran++; throw new Error("a refused continuation runs no model"); } };
+    const before = parks().length;
+    await runnerWith(() => ({ executor: successor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
+      { codexBoundaryDeadlineMs: 5000, authority: r.successor() }).execute(resumed).catch(() => {});
+
+    assert.equal(ran, 0, "the successor executor never ran");
+    assert.equal(parks().length, before, "no re-park without provenance");
+    const failed = api.states.filter(s => s.body.status === "failed");
+    assert.equal(failed.length, 1, "today's path: the run is failed");
+    assert.match(failed[0]!.body.failure_reason ?? "", /Retained recovery blocked: preservation failed/);
+    assert.equal((await slotOf(r.rt, clone))?.state, "active", "the predecessor's slot is untouched");
   });
 });
 
@@ -363,6 +550,18 @@ describe("the cooperative memory-park record is complete or absent (issue #3638)
     }, log);
     assert.equal(activeJournal()?.memoryPark, undefined, "no record without a source epoch");
     assert.ok(messages.includes("memory park not recorded: the flight's source epoch is unknown"), messages.join("; "));
+  });
+
+  it("teardown retires the sink, takes the admission barrier, and only then ends the source use", async () => {
+    const order: string[] = [];
+    await exhaustedPark(rig => {
+      for (const name of ["retireSink", "awaitSinkQuiescent", "endSourceUse"] as const) {
+        const bag = rig.rt as unknown as Record<string, (...args: unknown[]) => unknown>;
+        const inner = bag[name]!.bind(rig.rt);
+        bag[name] = (...args: unknown[]) => { order.push(name); return inner(...args); };
+      }
+    });
+    assert.deepEqual(order, ["retireSink", "awaitSinkQuiescent", "endSourceUse"]);
   });
 
   it("a published end writes no settlement even though the park is confirmed and the slot ended", async () => {

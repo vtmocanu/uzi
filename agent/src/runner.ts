@@ -2123,7 +2123,10 @@ type MemoryFlight = {
   stateSequence: number;
   held: boolean;
   ended: boolean;
-  hold?: Readonly<{ context: MemoryContext; deadline: number; humanRevision: boolean; origin: MemoryHoldOrigin }>;
+  /** `interventionIds`: the pressure intervention that produced the hold, read synchronously from the guard's result
+   *  (empty for an exhausted allowance, which has no new intervention). */
+  hold?: Readonly<{ context: MemoryContext; deadline: number; humanRevision: boolean; origin: MemoryHoldOrigin;
+    interventionIds: readonly string[] }>;
   /** Written only by a preservation that observed the server's accepted park binding; never cleared by anything else. */
   parkWitness?: MemoryParkWitness;
   /** issue #3638: the exact binding of a park body this flight actually sent, latched immediately BEFORE `reportState`
@@ -3531,6 +3534,9 @@ export class RunRunner {
     const sink = flight.sourceUsePaths ??= new Set();
     authority.retireSink(sink);
     flight.sourceAdmissionRetired = true;
+    // Barrier: an admission that passed its entry check before the retirement may still be running under A. Taking A
+    // once proves it finished (its path is in the sink and its owner recorded) before the snapshot below.
+    const quiescent = await authority.awaitSinkQuiescent({ timeoutMs: this.sourceUseEndWaitMs });
     const paths = new Set(flight.sourceUsePaths ?? []);
     // Normalized like the authority's own keys (sourceUsePaths), so the publication check below compares like with like.
     for (const clone of [flight.worktreePath, flight.runnerClone?.path]) if (clone) paths.add(resolvePath(clone));
@@ -3538,6 +3544,11 @@ export class RunRunner {
     const allPaths = [...paths];
     const ownedEpochs: Record<string, string> = {};
     for (const p of allPaths) { const epoch = authority.ownedSourceEpoch(p, sink); if (epoch !== undefined) ownedEpochs[p] = epoch; }
+    if (!quiescent) {
+      // Not fatal: every admission names its path before it writes, so the snapshot still covers it and the end below takes A
+      // itself (a timed-out end is queued). Only the owned epochs may be short, which leaves the park record unwritten.
+      runLog.warn("source use end: an admission still held the authority lock at the barrier", { sources: paths.size });
+    }
     if (flight.sourceTailsJoined !== true) {
       runLog.warn("source use left active: this flight's source-capable tails were not positively joined", {
         sources: paths.size });
@@ -21400,13 +21411,14 @@ export class RunRunner {
         if (delivered && !signal.aborted)
           memory.feedback.delete(_result.intervention_id);
       },
-      preparePreservation: captured => {
+      preparePreservation: (captured, result) => {
         if (captured.flight !== flight || memory.hold) return;
         this.retainWorkerMemoryCustody(flight);
         memory.hold = Object.freeze({ context: captured,
           deadline: Date.now() + this.codexBoundaryDeadlineMs,
           humanRevision: memory.revisionContext === captured,
-          origin: this.memoryHoldOrigin(flight) });
+          origin: this.memoryHoldOrigin(flight),
+          interventionIds: Object.freeze([result.intervention_id]) });
         this.retireWorkerMemory(flight);
       },
       preserve: async (captured, signal, remainingMs) => {
@@ -21423,7 +21435,8 @@ export class RunRunner {
     if (runtime.commands.remaining(context) === 0) {
       this.retainWorkerMemoryCustody(flight);
       memory.hold = Object.freeze({ context, deadline: Date.now() + this.codexBoundaryDeadlineMs,
-        humanRevision: memory.revisionContext === context, origin: this.memoryHoldOrigin(flight) });
+        humanRevision: memory.revisionContext === context, origin: this.memoryHoldOrigin(flight),
+        interventionIds: Object.freeze([]) });
       this.retireWorkerMemory(flight);
       throw new RetainedRecoveryStop();
     }
@@ -21721,8 +21734,8 @@ export class RunRunner {
           this.assertHeldFreeCapture(flight, held);
         }, "cancel", "strict");
         if (result.kind !== "observed_empty") throw new RetainedRecoveryStop();
-        // The only witness writer. The context carries no intervention ids, so the list is empty.
-        if (carried.binding) memory.parkWitness = Object.freeze({ origin: hold.origin, binding: carried.binding, interventionIds: Object.freeze([]) });
+        // The only witness writer. The intervention ids are the ones the hold captured synchronously (empty for an exhausted allowance).
+        if (carried.binding) memory.parkWitness = Object.freeze({ origin: hold.origin, binding: carried.binding, interventionIds: hold.interventionIds });
         flight.parked = true;
       });
     } catch {
