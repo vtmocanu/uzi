@@ -3546,8 +3546,9 @@ export class RunRunner {
     for (const p of allPaths) { const epoch = authority.ownedSourceEpoch(p, sink); if (epoch !== undefined) ownedEpochs[p] = epoch; }
     if (!quiescent) {
       // Not fatal, and fail closed: every admission names its path before it writes, so the snapshot still covers it. An
-      // admission still running here has no lease captured by the end below, so its key is kept (owned, never queued or
-      // ended) and no settlement can be written; the owned epochs may also be short, which leaves the park record unwritten.
+      // admission still running here is either before its lease (the end below keeps its key and never queues or ends it)
+      // or after it (ended only if the end gets A after the admission finished, else queued). Either way a key without an
+      // endedSlots entry blocks the settlement; the owned epochs may also be short, which leaves the park record unwritten.
       runLog.warn("source use end: the admission barrier could not take the authority lock", { sources: paths.size });
     }
     if (flight.sourceTailsJoined !== true) {
