@@ -45,6 +45,12 @@ export function Repos() {
     findings: GuardrailFinding[];
     waivable: boolean;
   } | null>(null);
+  // The error / refusal banner renders above the repo list, so a click far down a long
+  // list would otherwise fail off-screen and read as "nothing happened".
+  const bannerRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (error || enableRefusal) bannerRef.current?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+  }, [error, enableRefusal]);
   // The repo whose "Trusted repo" panel is currently expanded. The panel groups a
   // master control over two independently-revocable capabilities — Repo skills and
   // Repo instructions (PRD #246). It renders OUTSIDE the horizontally-scrolling
@@ -903,6 +909,7 @@ export function Repos() {
         }
       />
 
+      <div ref={bannerRef} className="space-y-6 empty:hidden">
       {error && <Alert message={error} />}
       {enableRefusal && (
         <Card className="border-danger/40 bg-danger/5">
@@ -939,6 +946,7 @@ export function Repos() {
           </div>
         </Card>
       )}
+      </div>
 
       {loading ? (
         <ListSkeleton rows={4} />

@@ -807,6 +807,35 @@ describe("Repos — enable guardrail 422 violations (PRD #345)", () => {
     await waitFor(() => expect(screen.queryByText("reason one")).toBeNull());
     expect(screen.queryByText("reason two")).toBeNull();
   });
+
+  // The refusal renders above the repo list; clicking Enable on a row far down a long
+  // list left it off-screen, so the click read as "nothing happens". It must scroll in.
+  it("scrolls the refusal into view when an enable is refused", async () => {
+    const scrolled: Element[] = [];
+    const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value(this: HTMLElement) {
+        scrolled.push(this);
+      },
+    });
+    try {
+      mockApi.setRepoEnabled.mockRejectedValue(
+        new ApiError(422, "this repo was not enabled", { violations: ["reason one"] }),
+      );
+      renderPage();
+      await screen.findByText("example/website");
+      fireEvent.click(within(rowFor("example/website")).getByRole("button", { name: /^Enable$/ }));
+
+      await screen.findByText("reason one");
+      await waitFor(() =>
+        expect(scrolled.some((el) => el.contains(screen.getByText("reason one")))).toBe(true),
+      );
+    } finally {
+      if (original) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", original);
+      else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+    }
+  });
 });
 
 describe("Repos — member override request (issue #1432)", () => {
