@@ -40,8 +40,8 @@ shift
 # Only these three hosts are pinned; any other host fails loudly rather than
 # skipping the check.
 # renovate-tarball: depName=oasdiff-darwin-all packageName=oasdiff/oasdiff
-OASDIFF_DARWIN_ALL_VERSION="v1.33.0"
-OASDIFF_DARWIN_ALL_SHA256="2a479337c15afdcbf0b1e89c0b4d0cf0176472dbc11483358fed1f831d1e46c5"
+OASDIFF_DARWIN_ALL_VERSION="v1.34.1"
+OASDIFF_DARWIN_ALL_SHA256="64948ba30c5555d3d15b95a7f3eda22fa83c15cf37fd4dad1720c0deb0a07cb5"
 # renovate-tarball: depName=oasdiff-linux-amd64 packageName=oasdiff/oasdiff
 OASDIFF_LINUX_AMD64_VERSION="v1.33.0"
 OASDIFF_LINUX_AMD64_SHA256="43a4e328e2d13ba1552d760aa68d2485c75c5621f309f6ff64ae895188345247"
