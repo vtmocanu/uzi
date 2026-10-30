@@ -105,8 +105,10 @@ attempt. Look for `dind-prune-completed`,
 `dind-prune-failed`, `dind-prune-insufficient`, or `dind-prune-deferred` in
 the worker's logs to see what it did.
 
-Custody is **worker-wide**: an open recovery hold blocks this original
-cache/image-prune sequence even when other runs created eligible resources.
+Custody is **worker-wide at prune admission**: an open recovery hold keeps a
+new attempt out of this original cache/image-prune sequence, even when other
+runs created the eligible resources. Custody is checked once, before
+`docker ps -q`, and is not re-checked between the prune commands that follow.
 Classifying DinD as scratch does not alone supersede the D5 custody gate.
 The [M1 investigation](../adr/1759-dind-data-metering-and-prune.md#investigation-checkpoint--3653-m1-2026-10-30)
 found that native BuildKit protects acquired cache references, supporting a
