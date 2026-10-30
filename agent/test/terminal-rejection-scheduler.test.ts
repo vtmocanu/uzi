@@ -171,6 +171,32 @@ test("rejection cleanup keeps sibling alias snapshot protection until its own gu
   } finally { r.controller.abort(); await fs.rm(r.root, { recursive: true, force: true }); }
 });
 
+test("rejection cleanup bounds ignored alias entries and retains uncertainty on exhaustion", async t => {
+  const r = await rig();
+  try {
+    for (let i = 0; i < 4100; i++) await fs.writeFile(path.join(path.dirname(r.file()), "ignored-" + i), "");
+    const observed = await r.outbox.observeTerminalAuthentication(run, 3);
+    let entries = 0;
+    const open = fs.opendir.bind(fs);
+    t.mock.method(fs, "opendir", async (file: Parameters<typeof fs.opendir>[0]) => {
+      const directory = await open(file);
+      return new Proxy(directory, { get(target, property) {
+        if (property === "read") return async () => {
+          const entry = await target.read();
+          if (entry) entries++;
+          return entry;
+        };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      } });
+    });
+    assert.equal(await r.outbox.cleanupRejectedTerminalFiles(run, 3, worker, [observed], async () => custody(3)), 1);
+    assert.ok(entries <= 4096, "sibling lookup cannot materialize an unbounded directory");
+    assert.equal(await r.outbox.hasPendingPolicyOutcome(run), true, "exhaustion is not absence proof");
+    assert.equal(r.outbox.listPendingTerminals()[0]?.outcome_kind, "unknown");
+  } finally { r.controller.abort(); await fs.rm(r.root, { recursive: true, force: true }); }
+});
+
 test("no feature makes zero POST/GET, logs once per episode and rollback stops queued retries", async () => {
   const r = await rig([3, 4, 5]);
   r.client.clearFeatures();

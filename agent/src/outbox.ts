@@ -104,6 +104,16 @@ const MAC_DOMAIN_TERMINAL = "uzi.outbox.terminal.v1";
 /** Issue #1742: the most finalize_resume entries one register offers: the api's default
  *  ACTIVE_SNAPSHOT_MAX_ENTRIES (it drops the whole list above its cap). */
 const FINALIZE_RESUME_MAX_ENTRIES = 256;
+// Bound filesystem work independently of configured storage capacity, including ignored entries.
+const POLICY_SCAN_MAX_ENTRIES = 4096;
+function policyScanEntryLimit(...budgets: number[]): number {
+  let limit = POLICY_SCAN_MAX_ENTRIES;
+  for (const budget of budgets) {
+    if (!Number.isSafeInteger(budget) || budget <= 0) return 0;
+    limit = Math.min(limit, budget);
+  }
+  return limit;
+}
 
 /** Issue #1742: the finalize-pending record's own domain label, so its MAC can never be replayed as
  *  a terminal journal (or any other kind) under the same worker-local key. */
@@ -772,14 +782,21 @@ export class Outbox {
     // Stream to EOF or the first blocker; ordinary entries consume no decoding budget.
     // A settled policy file is harmless only while its exact authenticated lifetime still matches.
     let totalReadBytes = 0;
+    let totalEntries = 0;
+    const totalEntryLimit = policyScanEntryLimit(this.maxBytes);
+    const runEntryLimit = policyScanEntryLimit(this.runMaxBytes);
     const scan = async (physicalRun: string): Promise<boolean> => {
       let runReadBytes = 0;
+      let runEntries = 0;
       if (!await this.terminalDirectorySafe(physicalRun)) return true;
       const dir = await fs.opendir(this.runDir(physicalRun));
       try {
         for (;;) {
+          if (runEntries >= runEntryLimit || totalEntries >= totalEntryLimit) return true;
           const entry = await dir.read();
           if (!entry) return false;
+          runEntries++;
+          totalEntries++;
           if (!entry.name.startsWith(TERMINAL_FILE_PREFIX)) continue;
           const gen = parseTerminalFileName(entry.name);
           const remaining = Math.min(this.runMaxBytes - runReadBytes, this.maxBytes - totalReadBytes);
@@ -827,8 +844,10 @@ export class Outbox {
       const root = await fs.opendir(this.root);
       try {
         for (;;) {
+          if (totalEntries >= totalEntryLimit) return true;
           const entry = await root.read();
           if (!entry) return false;
+          totalEntries++;
           if (runId !== undefined && entry.name.toLowerCase() !== runId.toLowerCase()) continue;
           if (!this.validRunId(entry.name)) continue;
           if (entry.isSymbolicLink()) return true;
@@ -2705,11 +2724,23 @@ export class Outbox {
         if (meta?.outcomeKind === "unknown" && meta.fileName === observed.fileName) {
           if (meta.unpersistedPolicy) meta.outcomeKind = "policy_hold";
           else {
-            const alias = (await fs.readdir(this.runDir(physicalRunId)))
-              .find(name => parseTerminalFileName(name) === generation);
-            this.terminalRetirementIdentities.delete(meta);
-            terminals?.delete(generation);
-            if (alias !== undefined) this.retainUnknownTerminal(physicalRunId, generation, alias);
+            const directory = await fs.opendir(this.runDir(physicalRunId));
+            const limit = policyScanEntryLimit(this.runMaxBytes, this.maxBytes);
+            let alias: string | undefined;
+            let complete = false;
+            try {
+              for (let visited = 0; visited < limit; visited++) {
+                const entry = await directory.read();
+                if (!entry) { complete = true; break; }
+                if (parseTerminalFileName(entry.name) === generation) { alias = entry.name; break; }
+              }
+            } finally { await directory.close(); }
+            // Exhaustion is uncertainty: retain the sentinel, never infer absence.
+            if (complete || alias !== undefined) {
+              this.terminalRetirementIdentities.delete(meta);
+              terminals?.delete(generation);
+              if (alias !== undefined) this.retainUnknownTerminal(physicalRunId, generation, alias);
+            }
           }
         }
         await this.fsyncDir(this.runDir(physicalRunId), true);

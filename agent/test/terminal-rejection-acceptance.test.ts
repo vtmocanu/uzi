@@ -139,7 +139,12 @@ test("M3 restart sends actual MAC rejection wire without terminal authority; ope
     if (route.includes("/terminal-rejection-custody?generation=3")) { gets++; return Response.json(custody()); }
     assert.fail("unexpected transport: " + route);
   };
-  const running = makeWorker(r, client()).run(r.controller.signal);
+  const c = client();
+  // Unknown admission adds boot/sweep reads under the outbox lock. A busy first
+  // disposal is retried by the existing coordinator; use its test-only interval
+  // so this five-second assertion does not depend on the production 30s cadence.
+  const coordinator = new TerminalRejectionCoordinator(r.outbox, c, nullLogger(), undefined, undefined, 2, 100);
+  const running = makeWorker(r, c, nullLogger(), coordinator).run(r.controller.signal);
   try {
     await until(() => posts === 1 && heartbeats >= 2);
     assert.equal(gets, 0, "custody awaits the diagnostic ACK");

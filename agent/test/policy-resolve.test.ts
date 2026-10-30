@@ -402,6 +402,35 @@ it("policy admission distinguishes proven empty impossible roots from unreadable
   assert.equal(await f.outbox.hasPendingPolicyOutcome(run), true);
 });
 
+for (const [site, budget, count] of [
+  ["root", 64, 80], ["run", 64, 80], ["root", 1e6, 4100],
+] as const) {
+  it("policy admission bounds every ignored " + site + " entry at budget " + budget, async t => {
+    const f = await fixture(t);
+    const directory = site === "root" ? f.root : path.join(f.root, run);
+    await fs.mkdir(directory, { recursive: true });
+    for (let i = 0; i < count; i++) await fs.writeFile(path.join(directory, "ignored-" + i), "");
+    const outbox = new Outbox({ root: f.root, log: nullLogger(), runMaxBytes: budget,
+      maxBytes: budget, retentionMs: 86400000 });
+    let entries = 0;
+    const open = fs.opendir.bind(fs);
+    t.mock.method(fs, "opendir", async (file: Parameters<typeof fs.opendir>[0]) => {
+      const directory = await open(file);
+      return new Proxy(directory, { get(target, property) {
+        if (property === "read") return async () => {
+          const entry = await target.read();
+          if (entry) entries++;
+          return entry;
+        };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      } });
+    });
+    assert.equal(await outbox.hasPendingPolicyOutcome(run), true, "inventory exhaustion cannot prove absence");
+    assert.ok(entries <= Math.min(4096, budget), "ignored entries consume the item budget");
+  });
+}
+
 it("disabled policy deps retain snapshot membership without an unjournaled send", async t => {
   const { root } = await fixture(t);
   await fs.writeFile(path.join(root, ".key"), "invalid");
