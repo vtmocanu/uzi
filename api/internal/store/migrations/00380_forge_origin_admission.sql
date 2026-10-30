@@ -11,15 +11,15 @@ RETURNS boolean LANGUAGE sql STABLE AS $$
         OR (r.kind = 'cross_check' AND EXISTS (
             SELECT 1 FROM cross_checks cc
             WHERE cc.lead_run_id = r.target_run_id AND cc.stage = 'code' AND cc.checker_run_id = r.id))
-        OR EXISTS (
+        -- Only a cooled or reserved authorized origin excludes this worker. A run with
+        -- no usable mapping (unmappable URL, owner mismatch) stays claimable so the
+        -- claim snapshot check refuses it visibly instead of queueing it everywhere.
+        OR NOT EXISTS (
             SELECT 1 FROM authorized_forge_origins a
+            JOIN forge_origin_cooldowns c
+              ON c.user_id = a.user_id AND c.worker_id = w.id AND c.origin = a.origin
             WHERE a.repo_id = r.repo_id AND a.user_id = r.user_id
-              -- An unmappable origin stays claimable; the claim snapshot check refuses it visibly.
-              AND (a.origin IS NULL OR NOT EXISTS (
-                  SELECT 1 FROM forge_origin_cooldowns c
-                  WHERE c.user_id = a.user_id AND c.worker_id = w.id AND c.origin = a.origin
-                    AND (c.cooled_until > COALESCE(evaluated_at, statement_timestamp()) OR c.reservation_run_id IS NOT NULL)
-              ))
+              AND (c.cooled_until > COALESCE(evaluated_at, statement_timestamp()) OR c.reservation_run_id IS NOT NULL)
         )
     )
 $$;
