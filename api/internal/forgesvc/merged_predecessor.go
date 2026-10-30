@@ -211,7 +211,13 @@ func (s *Service) verifyMergedPredecessor(ctx context.Context, row store.ListMer
 	// observes B again and visits at most one target; refusals retry after a wrap.
 	m.targets[row.RepoID] = continuation
 	m.cursors[row.RepoID] = before
-	if ctx.Err() != nil || *attempts >= 100 {
+	if *attempts >= 100 {
+		// A refused legacy transaction can repeatedly consume the final slot.
+		// Resume this repository first so its deferred target gets a fresh budget.
+		m.nextRepo = row.RepoID
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	targets, err := m.q.ListCrossRunTargets(ctx, store.ListCrossRunTargetsParams{

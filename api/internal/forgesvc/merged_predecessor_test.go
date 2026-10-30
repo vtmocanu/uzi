@@ -805,6 +805,7 @@ func TestCrossRunUnmergedObservationsDoNotSpendRecoveryBudget(t *testing.T) {
 
 func TestCrossRunAttemptCapDefersSecondTransaction(t *testing.T) {
 	reads, crossCalls := 0, 0
+	phase, resumed := 1, false
 	s, token := mergeTestService(t, &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
 		reads++
 		return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
@@ -820,7 +821,10 @@ func TestCrossRunAttemptCapDefersSecondTransaction(t *testing.T) {
 	}
 	q.targets = func(_ context.Context, p store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
 		if uuid.UUID(p.RepoID.Bytes) == repos[50] {
-			t.Fatal("cross target visited beyond shared cap")
+			if phase == 1 {
+				t.Fatal("cross target visited beyond shared cap")
+			}
+			resumed = true
 		}
 		return []store.ListCrossRunTargetsRow{crossRunTarget(q.rows[uuid.UUID(p.RepoID.Bytes)][0], 150)}, nil
 	}
@@ -833,6 +837,15 @@ func TestCrossRunAttemptCapDefersSecondTransaction(t *testing.T) {
 	continuation, pending := s.merged.targets[repos[50]]
 	if reads != 51 || sink.calls != 50 || crossCalls != 50 || !pending || continuation.runID != uuid.Nil || s.merged.cursors[repos[50]] != uuid.Nil {
 		t.Fatalf("cap did not retain unvisited cross target: reads=%d legacy=%d cross=%d continuation=%+v", reads, sink.calls, crossCalls, continuation)
+	}
+	// Permanently refused legacy holds continue to select the same witnesses.
+	// Restart rotation at the deferred repository, or its legacy transaction
+	// consumes the last attempt every phase and the cross-run target starves.
+	sink.err = errors.New("legacy disposition refused")
+	phase = 2
+	s.ReconcileMergedPredecessors(context.Background(), repos)
+	if !resumed {
+		t.Fatal("deferred cross-run target starved after phase cap")
 	}
 }
 
