@@ -138,7 +138,8 @@ def inventory(text):
     stable = max((tag for tag in tags if '-rc.' not in tag), key=version, default='')
     tag_lines = sorted(f'{oid}\t{ref}' for ref, oid in refs.items() if ref.startswith('refs/tags/v'))
     tags_digest = hashlib.sha256(('\n'.join(tag_lines) + ('\n' if tag_lines else '')).encode()).hexdigest()
-    return dict(main=refs.get('refs/heads/main', ''), tags=tags, tags_digest=tags_digest, previous_rc=rc,
+    return dict(main=refs.get('refs/heads/main', ''), tags=tags,
+                tag_oids={tag: refs['refs/tags/' + tag] for tag in tags}, tags_digest=tags_digest, previous_rc=rc,
                 previous_rc_sha=tags.get(rc, ''), previous_stable=stable, previous_stable_sha=tags.get(stable, ''))
 
 
