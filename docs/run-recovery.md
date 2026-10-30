@@ -95,11 +95,20 @@ record in the active journal, with the successor running the memory guard and
 issue #3639 lands, Resume of such an unsettled continuation re-parks
 immediately, so **Cancel** or an operator discard of the retained source is the
 exit. A worker restart does not release it: the slot stays active under the old
-incarnation, so the continuation is still refused and Resume keeps re-parking
-(or, with no record, the run fails as before). When the record could not be
-written (unknown authority incarnation or source epoch, a stopped or protected
-source, a write timeout or failure), or the successor lacks the memory guard,
-the existing flow runs and the run fails as `preservation_failed`, as before.
+incarnation, so the continuation is still refused and Resume keeps re-parking.
+The no-record case matters only for an unsettled park (a confirmed source end
+leaves the slot ineligible, so the run continues normally on Resume). The
+record may be missing because of an unknown authority incarnation or source
+epoch, a stopped or protected source, a write failure, or a timeout whose write
+did not land (a write already holding the bare lock may still land, and Resume
+then re-parks). Without a record, on a different worker process (for example
+after a restart, when the slot is foreign-active), or when the successor lacks
+the memory guard, the existing flow runs and the run fails as
+`preservation_failed`, as before. Without a record on the same worker process
+(the earlier flight's source end unconfirmed), the claim stops without failing
+("held by an earlier flight's unended source use") and retries until the requeue
+cap, then ends in `worker_requeue_exhausted` or `failed` per the existing
+exhaustion rule; this is new with #3638, not as before.
 On a continuation whose record carries a settlement (not on the re-park path),
 the fresh worker logs `predecessor cooperative settlement verified` or
 `unverified` for diagnosis only; neither releases custody. A new run of the same

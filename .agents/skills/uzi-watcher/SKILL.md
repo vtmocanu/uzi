@@ -211,7 +211,8 @@ then ask the owner to Resume or Cancel.
 An unsettled memory continuation (the predecessor's source use was never positively ended,
 and the journal records the park) re-parks at the same hold on Resume until #3639, so Cancel
 or an operator discard is the exit; a worker restart does not release it. Without a recorded
-park the run fails as before.
+park, a different worker process fails the run (`preservation_failed`); the same process
+retries until the requeue cap (`worker_requeue_exhausted` or `failed`).
 `backup-runs.sh` accepts the v1 `memoryPark` journal field.
 `uzi-lander` uses this same poller for its
 blind watch to terminal.
