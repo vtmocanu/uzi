@@ -410,16 +410,21 @@ for (const [site, budget, count] of [
     const directory = site === "root" ? f.root : path.join(f.root, run);
     await fs.mkdir(directory, { recursive: true });
     for (let i = 0; i < count; i++) await fs.writeFile(path.join(directory, "ignored-" + i), "");
+    const totalBudget = site === "run" ? budget * 4 : budget;
     const outbox = new Outbox({ root: f.root, log: nullLogger(), runMaxBytes: budget,
-      maxBytes: budget, retentionMs: 86400000 });
+      maxBytes: totalBudget, retentionMs: 86400000 });
     let entries = 0;
+    let targetEntries = 0;
     const open = fs.opendir.bind(fs);
     t.mock.method(fs, "opendir", async (file: Parameters<typeof fs.opendir>[0]) => {
-      const directory = await open(file);
-      return new Proxy(directory, { get(target, property) {
+      const opened = await open(file);
+      return new Proxy(opened, { get(target, property) {
         if (property === "read") return async () => {
           const entry = await target.read();
-          if (entry) entries++;
+          if (entry) {
+            entries++;
+            if (String(file) === directory) targetEntries++;
+          }
           return entry;
         };
         const value = Reflect.get(target, property);
@@ -427,7 +432,9 @@ for (const [site, budget, count] of [
       } });
     });
     assert.equal(await outbox.hasPendingPolicyOutcome(run), true, "inventory exhaustion cannot prove absence");
-    assert.ok(entries <= Math.min(4096, budget), "ignored entries consume the item budget");
+    assert.ok(targetEntries > 0, "the target directory was actually examined");
+    assert.ok(targetEntries <= Math.min(4096, budget), "ignored entries consume the directory item budget");
+    assert.ok(entries <= Math.min(4096, totalBudget), "all directories share the aggregate item budget");
   });
 }
 
