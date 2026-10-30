@@ -217,8 +217,9 @@ class CommandLogs(unittest.TestCase):
 
 
 class TipFixture:
-    def __init__(self, heads):
+    def __init__(self, heads, messages=None):
         self.heads, self.index, self.calls, self.now = heads, -1, [], 0.0
+        self.messages = messages or {}
 
     @property
     def head(self):
@@ -234,6 +235,8 @@ class TipFixture:
                 return self.head
             elif args[0] == 'show-ref':
                 return 'same tags'
+            elif args[0] == 'show':
+                return self.messages.get(args[-1], '')
         elif args[:2] == ('bash', auto.CUTTER):
             return rendered(plan(self.head))
         return ''
@@ -245,6 +248,72 @@ class TipFixture:
 class Tip(unittest.TestCase):
     def release(self, fixture, api):
         return auto.Release(auto.inputs(context()), fixture.command, api, lambda: fixture.now, fixture.sleep)
+
+    def test_skip_ci_tip_refuses_before_wait_cut_or_rerun(self):
+        messages = ['docs: new PRD\n\nquoted [' + command + '] in body' for command in
+                    ('skip ci', 'ci skip', 'no ci', 'skip actions', 'actions skip')]
+        messages += ['docs: new PRD\n\n\nskip-checks:true', 'docs: new PRD\n\n\nskip-checks: true']
+        for missing in ('both', 'ci.yml', 'kind-smoke.yml'):
+            for message in messages:
+                with self.subTest(missing=missing, message=message):
+                    fixture = TipFixture([H], {H: message})
+                    api = Mock()
+                    api.run.side_effect = lambda workflow, sha, branch: None if missing in ('both', workflow) else run()
+                    with self.assertRaisesRegex(auto.Stop, 'skip-ci-tip'):
+                        self.release(fixture, api).tip(seconds=2, interval=1)
+                    self.assertEqual(fixture.now, 0)
+                    self.assertTrue(all(call.args[1:] == (H, 'main') for call in api.run.call_args_list))
+                    self.assertFalse(any(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls))
+                    self.assertFalse(any(call[:2] == ('bash', auto.CUTTER) and '--plan' not in call for call in fixture.calls))
+
+    def test_missing_ci_without_skip_instruction_keeps_bounded_wait(self):
+        fixture, api = TipFixture([H]), Mock()
+        api.run.return_value = None
+        with self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-deadline'):
+            self.release(fixture, api).tip(seconds=2, interval=1)
+        self.assertEqual(fixture.now, 2)
+
+    def test_skip_instruction_never_waives_present_failed_proof(self):
+        fixture = TipFixture([H], {H: '[' + 'skip ci' + ']'})
+        api = Mock()
+        api.run.side_effect = lambda workflow, sha, branch: run(conclusion='failure') if workflow == 'ci.yml' else run()
+        api.pages.return_value = [job('Test API')]
+        with self.assertRaisesRegex(auto.Stop, 'tip-ci-not-retryable'):
+            self.release(fixture, api).tip(seconds=2)
+        self.assertFalse(any(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls))
+
+    def test_missing_sibling_proof_never_retries_a_known_failure(self):
+        for failed, reason in (('ci.yml', 'tip-ci-not-retryable'), ('kind-smoke.yml', 'tip-smoke-failed')):
+            with self.subTest(failed=failed):
+                fixture, api = TipFixture([H], {H: '[' + 'skip ci' + ']'}), Mock()
+                api.run.side_effect = lambda workflow, sha, branch: run(conclusion='failure') if workflow == failed else None
+                with self.assertRaisesRegex(auto.Stop, reason):
+                    self.release(fixture, api).tip(seconds=2)
+                self.assertFalse(any(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls))
+                api.pages.assert_not_called()
+
+    def test_skip_instruction_with_present_pending_or_cancelled_runs_never_borrows(self):
+        for current in (run('queued', None), run(conclusion='cancelled'), run(conclusion='skipped')):
+            with self.subTest(current=current):
+                fixture, api = TipFixture([H], {H: '[' + 'skip ci' + ']'}), Mock()
+                api.run.return_value = current
+                with self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-deadline'):
+                    self.release(fixture, api).tip(seconds=2, interval=1)
+                self.assertEqual(fixture.now, 2)
+                self.assertTrue(all(call.args[1] == H for call in api.run.call_args_list))
+
+    def test_present_green_exact_proof_is_not_rejected_by_message(self):
+        fixture, api = TipFixture([H], {H: '[' + 'skip ci' + ']'}), Mock()
+        api.run.return_value = run()
+        self.assertEqual(self.release(fixture, api).tip()[0], H)
+
+    def test_next_ci_bearing_tip_unblocks_a_new_attempt(self):
+        fixture, api = TipFixture([H, NEW], {H: '[' + 'skip ci' + ']'}), Mock()
+        api.run.side_effect = lambda workflow, sha, branch: None if sha == H else run()
+        release = self.release(fixture, api)
+        with self.assertRaisesRegex(auto.Stop, 'skip-ci-tip'):
+            release.tip(seconds=2)
+        self.assertEqual(release.tip(seconds=2)[0], NEW)
 
     def test_main_reselection_uses_new_exact_tip(self):
         fixture = TipFixture([H, NEW])
@@ -851,6 +920,7 @@ class Nightly(unittest.TestCase):
         for selected in cases:
             with self.subTest(tag=selected['TAG'], reason=selected['REASON']):
                 release, fixture, api = self.release(selected)
+                fixture.messages[H] = '[' + 'skip ci' + ']'
                 with self.assertRaises(auto.Stop) as stopped:
                     release.tip()
                 self.assertEqual((stopped.exception.outcome, stopped.exception.reason), ('no-op', selected['REASON']))
@@ -871,6 +941,55 @@ class Nightly(unittest.TestCase):
         self.assertIn('no-new-shipping-change', note)
         api.run.assert_not_called()
 
+    def test_skip_ci_tip_cli_preserves_named_failure_without_bundle(self):
+        release, fixture, api = self.release()
+        fixture.messages[H] = '[' + 'skip ci' + ']'
+        api.run.return_value = None
+        status, data, note, _ = self.cli(self.env(), 'prepare', release)
+        self.assertEqual((status, data['reason'], data['parent'], data['stage']), (1, 'skip-ci-tip', H, 'tip-wait'))
+        self.assertIn('skip-ci-tip', note)
+        self.assertNotIn('digest', data)
+        self.assertEqual((data['outcome'], fixture.now), ('defer', 10800))
+        self.assertFalse(any(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls))
+
+    def test_scheduled_skip_tip_follows_new_ci_bearing_tip_in_same_operation(self):
+        release, fixture, api = self.release(heads=[H, NEW], now='2026-10-27T10:49:30Z')
+        fixture.messages[H] = '[' + 'skip ci' + ']'
+        api.run.side_effect = lambda workflow, sha, branch: None if sha == H else run()
+        with contextlib.redirect_stdout(io.StringIO()) as progress:
+            try:
+                selected, _ = release.tip(interval=5)
+            except auto.Stop as error:
+                self.fail('scheduled attempt lost its recoverable window: ' + error.reason)
+        self.assertEqual((selected, fixture.now), (NEW, 5))
+        events = [json.loads(line.removeprefix('release-auto: ')) for line in progress.getvalue().splitlines()]
+        self.assertEqual([event.get('skip_ci_tip') for event in events], [True, False])
+
+    def test_scheduled_skip_tip_names_refusal_only_at_deadline(self):
+        for overshoot in (False, True):
+            with self.subTest(overshoot=overshoot):
+                release, fixture, api = self.release(now='2026-10-27T10:49:30Z')
+                fixture.messages[H] = '[' + 'skip ci' + ']'
+                api.run.return_value = None
+                if overshoot:
+                    release.sleep = lambda delay: fixture.sleep(delay + 1)
+                with contextlib.redirect_stdout(io.StringIO()) as progress, self.assertRaisesRegex(auto.Stop, 'skip-ci-tip') as stopped:
+                    release.tip(interval=7)
+                self.assertEqual((stopped.exception.outcome, fixture.now), ('defer', 31 if overshoot else 30))
+                event = json.loads(progress.getvalue().splitlines()[0].removeprefix('release-auto: '))
+                self.assertIs(event.get('skip_ci_tip'), True)
+                self.assertFalse(any(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls))
+
+    def test_scheduled_move_to_unmarked_missing_tip_restores_normal_deadline_reason(self):
+        release, fixture, api = self.release(heads=[H, NEW], now='2026-10-27T10:49:30Z')
+        fixture.messages[H] = '[' + 'skip ci' + ']'
+        api.run.return_value = None
+        with contextlib.redirect_stdout(io.StringIO()) as progress, self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-cutoff'):
+            release.tip(interval=5)
+        self.assertEqual(fixture.now, 30)
+        events = [json.loads(line.removeprefix('release-auto: ')) for line in progress.getvalue().splitlines()]
+        self.assertEqual([event.get('skip_ci_tip') for event in events], [True, False])
+
     def test_manual_noop_respin_and_morning_independent_budget_remain(self):
         release, fixture, api = self.release(plan(OP='noop', SHIPPING_COUNT='0'))
         release.config['scheduled'] = False
@@ -887,11 +1006,11 @@ class Nightly(unittest.TestCase):
         self.assertEqual(fixture.now, 30)
 
     def test_window_uses_bucharest_date_and_dst_offsets(self):
-        cases = [('2026-01-15T02:47:00Z', '2026-01-15T06:00:00Z', '2026-01-15T07:00:00Z'),
-                 ('2026-07-15T01:47:00Z', '2026-07-15T05:00:00Z', '2026-07-15T06:00:00Z'),
-                 ('2026-03-29T01:47:00Z', '2026-03-29T05:00:00Z', '2026-03-29T06:00:00Z'),
-                 ('2026-10-25T02:47:00Z', '2026-10-25T06:00:00Z', '2026-10-25T07:00:00Z'),
-                 ('2026-10-26T22:30:00Z', '2026-10-27T06:00:00Z', '2026-10-27T07:00:00Z')]
+        cases = [('2026-01-15T02:47:00Z', '2026-01-15T11:00:00Z', '2026-01-15T12:00:00Z'),
+                 ('2026-07-15T01:47:00Z', '2026-07-15T10:00:00Z', '2026-07-15T11:00:00Z'),
+                 ('2026-03-29T01:47:00Z', '2026-03-29T10:00:00Z', '2026-03-29T11:00:00Z'),
+                 ('2026-10-25T02:47:00Z', '2026-10-25T11:00:00Z', '2026-10-25T12:00:00Z'),
+                 ('2026-10-26T22:30:00Z', '2026-10-27T11:00:00Z', '2026-10-27T12:00:00Z')]
         for created, cutoff, target in cases:
             with self.subTest(created=created):
                 self.assertEqual(auto.nightly_window(created), (self.epoch(cutoff), self.epoch(target)))
@@ -900,19 +1019,25 @@ class Nightly(unittest.TestCase):
             with self.subTest(created=created), self.assertRaises(auto.Stop):
                 auto.nightly_window(created)
 
-    def test_schedule_uses_full_window_while_manual_keeps_two_hours(self):
-        for scheduled, expected in ((True, 10980), (False, 7200)):
-            with self.subTest(scheduled=scheduled):
-                release, fixture, api = self.release(now=self.created)
-                release.config['scheduled'] = scheduled
+    def test_schedule_caps_wait_and_respects_late_cutoff_while_manual_keeps_two_hours(self):
+        cases = [(True, self.created, 10800, '2026-10-27T05:47:00Z'),
+                 (True, '2026-10-27T08:47:00Z', 7380, '2026-10-27T10:50:00Z'),
+                 (True, '2026-07-15T07:47:00Z', 7380, '2026-07-15T09:50:00Z'),
+                 (False, self.created, 7200, '2026-10-27T04:47:00Z')]
+        for scheduled, created, expected, deadline in cases:
+            with self.subTest(scheduled=scheduled, created=created):
+                release, fixture, api = self.release(now=created)
+                release.config.update(scheduled=scheduled, created_at=created)
                 api.run.return_value = run('queued', None)
                 reason = 'tip-not-green-by-cutoff' if scheduled else 'tip-not-green-by-deadline'
-                with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(auto.Stop, reason):
+                with contextlib.redirect_stdout(io.StringIO()) as progress, self.assertRaisesRegex(auto.Stop, reason):
                     release.tip(interval=60)
                 self.assertEqual(fixture.now, expected)
+                first = json.loads(progress.getvalue().splitlines()[0].removeprefix('release-auto: '))
+                self.assertEqual(self.epoch(first['deadline_utc']), self.epoch(deadline))
 
     def test_tip_deadline_reserves_cut_time_and_does_not_reset_on_main_move(self):
-        release, fixture, api = self.release(heads=[H, NEW], now='2026-10-27T05:49:50Z')
+        release, fixture, api = self.release(heads=[H, NEW], now='2026-10-27T10:49:50Z')
         api.run.return_value = run('queued', None)
         with self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-cutoff'):
             release.tip(seconds=7200, interval=5)
@@ -920,7 +1045,7 @@ class Nightly(unittest.TestCase):
         self.assertGreaterEqual(fixture.index, 1)
 
     def test_green_response_after_cut_start_deadline_does_not_cut(self):
-        release, fixture, api = self.release(now='2026-10-27T05:49:50Z')
+        release, fixture, api = self.release(now='2026-10-27T10:49:50Z')
         def slow_run(*args):
             fixture.now += 20
             return run()
@@ -929,7 +1054,7 @@ class Nightly(unittest.TestCase):
             release.tip()
 
     def test_final_plan_cannot_extend_the_cut_start_deadline(self):
-        release, fixture, _ = self.release(now='2026-10-27T05:49:50Z')
+        release, fixture, _ = self.release(now='2026-10-27T10:49:50Z')
         original, reads = release.run, 0
         def slow_plan(*args, **kwargs):
             nonlocal reads
@@ -952,14 +1077,14 @@ class Nightly(unittest.TestCase):
         self.assertEqual(sum(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls), 1)
 
     def test_cut_is_refused_if_window_expires_after_tip_returns(self):
-        release, fixture, _ = self.release(now='2026-10-27T06:01:00Z')
+        release, fixture, _ = self.release(now='2026-10-27T11:01:00Z')
         release.tip = lambda: (H, plan())
         with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(auto.Stop, 'missed-target'):
             release.prepare(Path(directory))
         self.assertEqual(fixture.calls, [])
 
     def test_expired_or_next_day_preparation_does_not_acquire_a_new_window(self):
-        for now in ('2026-10-27T05:50:01Z', '2026-10-27T06:00:00Z', '2026-10-28T02:00:00Z'):
+        for now in ('2026-10-27T10:50:01Z', '2026-10-27T11:00:00Z', '2026-10-28T02:00:00Z'):
             release, fixture, api = self.release(now=now)
             with self.subTest(now=now), tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(auto.Stop, 'missed-target'):
                 release.prepare(Path(directory))

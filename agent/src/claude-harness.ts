@@ -180,6 +180,9 @@ export function buildSdkOptions(config: ClaudeTurnConfig): SdkOptions {
     // prompt-injection defense, nothing from the cloned repo's .claude can grant the
     // agent permissions.
     settingSources: [],
+    // Issue #1563: deliver the prompt as written. The CLI otherwise expands `@path`
+    // mentions and dispatches a leading slash command before any PreToolUse hook runs.
+    verbatimPrompts: true,
     plugins: [
       { type: "local", path: config.skillsPluginPath, skipMcpDiscovery: true },
     ],

@@ -154,6 +154,25 @@ describe("revision recovery selection", () => {
     assert.deepEqual(receiptIds("applied"), []);
   });
 
+  for (const kind of ["revise_plan", "reject_plan"] as const) {
+    it(`non-lead peeks leave ${kind} for one lead consumption`, async () => {
+      const { ch } = harness();
+      ch.setGateRevision(7);
+      const input = row(kind, bound(7), "owner control");
+      await deliver(input);
+      const expected = kind === "revise_plan"
+        ? { kind: "revise", feedback: "owner control", inputId: input.id, sourceGateRevision: 7 }
+        : { kind: "reject", reason: "owner control", sourceGateRevision: 7 };
+      for (let n = 0; n < 3; n++) {
+        assert.deepEqual(ch.takeRevisionRecoveryEvent(7, 1, false), expected);
+        if (kind === "reject_plan") assert.deepEqual(ch.takeRevisionRecoveryControl(7, false), expected);
+      }
+      assert.deepEqual(ch.takeRevisionRecoveryEvent(7, 1), expected);
+      assert.equal(ch.takeRevisionRecoveryEvent(7, 1), undefined);
+      assert.deepEqual(receiptIds("applied"), [], "observing or taking a control is not plan storage");
+    });
+  }
+
   it("takes exact reject without settling its receipt", async () => {
     const { ch } = harness();
     const rejected = row("reject_plan", bound(7), "stop");

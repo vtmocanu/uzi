@@ -1,3 +1,4 @@
+import { terminalSealMaterial } from "../src/codex/executor-lifetime.js";
 import { summaryOwnership } from "../src/codex/summary-ownership.js";
 import { provisionNative } from "./codex-provision-fixture.js";
 import { provisionRunTools } from "../src/provision-run.js";
@@ -18694,7 +18695,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       const recovery = new PlanRevisionRecovery({ generation: 1,
         ownership: async () => ({ status: "running", claim_generation: 1, gate_revision: 1, claim_released: false }),
         signal: () => new AbortController().signal, checkControl: () => {}, notice: async () => {},
-        steering: { takeRevisionRecoveryControl: () => undefined,
+        steering: { takeRevisionRecoveryEvent: () => undefined, takeRevisionRecoveryControl: () => undefined,
           awaitRevisionRecoveryEvent: async () => { throw new Error("unsupported recovery waited"); },
           retirePersistedRevision: () => {}, setGateRevision: () => {} },
       });
@@ -18834,7 +18835,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
           });
           t.mock.timers.tick(ms);
         } },
-        steering: { takeRevisionRecoveryControl: () => undefined,
+        steering: { takeRevisionRecoveryEvent: () => undefined, takeRevisionRecoveryControl: () => undefined,
           awaitRevisionRecoveryEvent: async () => replacement && ++expirations === 1
             ? { kind: "revise", feedback: "replacement J", inputId: 12, sourceGateRevision: 1 }
             : { kind: "reject", reason: "exhausted", sourceGateRevision: 1 },
@@ -18970,7 +18971,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         if (++waits <= 4) { ownerWait += ms; t.mock.timers.tick(ms); return; }
         return new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
       } },
-      steering: { takeRevisionRecoveryControl: () => undefined,
+      steering: { takeRevisionRecoveryEvent: () => undefined, takeRevisionRecoveryControl: () => undefined,
         awaitRevisionRecoveryEvent: async () => waits >= 4
           ? { kind: "revise", feedback: "J", inputId: 12, sourceGateRevision: 1 }
           : new Promise(() => {}),
@@ -19053,7 +19054,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
           }
           return new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
         } },
-        steering: { takeRevisionRecoveryControl: () => undefined,
+        steering: { takeRevisionRecoveryEvent: () => undefined, takeRevisionRecoveryControl: () => undefined,
           awaitRevisionRecoveryEvent: async (_source, _after, signal) => {
             waits++;
             if (entry === "beforeTurn" && waits === 1)
@@ -26178,5 +26179,778 @@ describe("issue3472 M1 Codex repository instruction snapshot", () => {
       assert.ok(childInstructions.includes(CODEX_REPO_INSTRUCTIONS_APPEND));
       assert.ok(childInput.includes("Do the child work"));
     });
+  });
+});
+
+
+describe("M2 lazy root operation admission", () => {
+  const ready = async (check: () => boolean): Promise<void> => {
+    for (let n = 0; n < 1000; n++) { if (check()) return; await tick(); }
+    assert.fail("M2 event barrier did not settle");
+  };
+
+  for (const fallback of [false, true]) it(`gates after thread setup, idle stays disarmed, fresh fallback=${fallback}`, async t => {
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, idleMs: 10, wallMs: 10000 };
+    if (fallback) rig.transport.requestOverride = c => c.method === "thread/resume"
+      ? Promise.reject(new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" })) : undefined;
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    let release!: () => void;
+    let admissions = 0, evidence = 0;
+    const { ctx } = makeCtx({ sessionId: fallback ? "old-session" : undefined,
+      onModelTurnSettled: async () => { evidence++; },
+      prepareCodexRootDispatch: async (_signal, check) => {
+        admissions++;
+        assert.ok(rig.transport.requests.some(r => r.method === "thread/start"));
+        await new Promise<void>(resolve => { release = resolve; });
+        check();
+        return check;
+      },
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await ready(() => admissions === 1);
+      assert.equal(rig.transport.turnStartCount, 0);
+      t.mock.timers.tick(1000);
+      await tick();
+      assert.equal(rig.transport.turnStartCount, 0);
+      assert.equal(evidence, 0);
+      release();
+      await running;
+      assert.equal(rig.transport.turnStartCount, 1);
+      assert.equal(admissions, 1, "failed resume dispatched no operation; fresh fallback got its own admit");
+      assert.equal(evidence, 1);
+    } finally { release?.(); rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const control of ["cancel", "pause", "wall"] as const)
+    it(`waiting remains owned by ${control} and never looks idle/productive`, async t => {
+      const rig = makeRig();
+      rig.deps = { ...rig.deps, idleMs: 10, wallMs: 1000, timeoutNow: () => Date.now() };
+      const abort = new AbortController();
+      let admission = false, parks = 0, evidence = 0;
+      let mode: "now" | "wall" | null = null;
+      const { ctx, emitted } = makeCtx({ signal: abort.signal,
+        pauseModeRequested: () => mode,
+        parkForPause: async () => { parks++; return true; },
+        parkForWall: async () => { parks++; return "parked"; },
+        onModelTurnSettled: async () => { evidence++; },
+        prepareCodexRootDispatch: async (signal) => {
+          admission = true;
+          await new Promise<never>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+          return () => {};
+        },
+      });
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      let settled = false;
+      const result = running.then(value => { settled = true; return value; },
+        error => { settled = true; return error; });
+      try {
+        await ready(() => admission);
+        t.mock.timers.tick(control === "wall" ? 1000 : 100);
+        if (control !== "wall") {
+          mode = control === "pause" ? "now" : null;
+          abort.abort(control === "pause" ? new PauseNowSignal() : new Error("cancel"));
+          if (control === "cancel") t.mock.timers.tick(1000); // cancel remains first even if wall also expires
+        }
+        await ready(() => settled);
+        const outcome = await result;
+        if (control === "cancel") assert.match(outcome.message, /cancel/);
+        else assert.ok(control === "wall" ? outcome.walled : outcome.pausedAt);
+        assert.equal(parks, control === "cancel" ? 0 : 1);
+        assert.equal(rig.transport.turnStartCount, 0);
+        assert.equal(evidence, 0);
+        assert.equal(emitted.some(m => /idle/i.test(JSON.stringify(m.payload))), false);
+      } finally { abort.abort(); rig.transport.end(); await result; t.mock.timers.reset(); }
+    });
+
+  it("M2 HTTP cooldown and source proof debit the wall exactly once across turns", async t => {
+    const { CodexOperationController } = await import("../src/codex-operation-controller.js");
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "m2-wall" } };
+      if (c.method === "turn/start") {
+        c.transport.push(toolCall(c.turnStartCount, "submit_plan", { plan_md: "wall plan" }, "m2-wall", "tn-wall", "wall-plan"))
+          .push(turnCompleted("completed", "m2-wall", "tn-wall"));
+        return { turn: { id: "tn-wall" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, wallMs: 2000, idleMs: 10, timeoutNow: () => Date.now() };
+    let releaseHTTP!: () => void, releaseProof!: () => void;
+    let reads = 0, proofs = 0, operations = 0, parks = 0, evidence = 0;
+    let sleeping = false;
+    const controller = new CodexOperationController(7, {
+      supported: () => true, negotiation: () => 1, engage: () => {},
+      now: () => Date.now(), waiting: () => () => {},
+      sleep: (ms, signal) => {
+        sleeping = true;
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(resolve, ms);
+          signal.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+        });
+      },
+      read: async request => {
+        if (++reads === 1) {
+          await new Promise<void>(resolve => { releaseHTTP = resolve; });
+          return { ...request, decision: "wait", class: "overload",
+            episode_id: "00000000-0000-4000-8000-000000000092",
+            server_now: new Date(0).toISOString(), eligible_at: new Date(1000).toISOString() };
+        }
+        return { decision: "admit", operation_id: request.operation_id, claim_generation: 7 };
+      },
+    });
+    const abort = new AbortController();
+    const { ctx, emitted } = makeCtx({
+      signal: abort.signal, planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "revise", automatic: true, round: 1, feedback: "continue same wall" }),
+      parkForWall: async () => { parks++; return "parked"; },
+      onModelTurnSettled: async () => { evidence++; },
+      prepareCodexRootDispatch: async (signal, check) => {
+        if (++operations === 1) await controller.admit({
+          kind: "root", operation_id: "00000000-0000-4000-8000-000000000093",
+        }, signal, check, async () => {
+          if (++proofs === 1) await new Promise<void>(resolve => { releaseProof = resolve; });
+          check();
+        });
+        else await new Promise<never>((_, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+        check(); return check;
+      },
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await ready(() => !!releaseHTTP);
+      t.mock.timers.tick(137); releaseHTTP();
+      await ready(() => !!releaseProof);
+      t.mock.timers.tick(89); releaseProof();
+      await ready(() => sleeping);
+      // Source proof is inside the completion-relative cooldown, not added to it.
+      t.mock.timers.tick(910);
+      await tick();
+      assert.equal(reads, 1);
+      assert.equal(rig.transport.turnStartCount, 0);
+      assert.equal(evidence, 0);
+      t.mock.timers.tick(1);
+      await ready(() => operations === 2);
+      assert.equal(Date.now(), 1137);
+      assert.equal(rig.transport.turnStartCount, 1);
+      assert.equal(parks, 0);
+      t.mock.timers.tick(862);
+      await tick();
+      assert.equal(parks, 0, "no double debit: one millisecond still remains at 1999");
+      t.mock.timers.tick(1);
+      assert.ok((await running).walled);
+      assert.equal(parks, 1, "HTTP sleep and proof all spend the original 2000ms wall");
+      assert.equal(rig.transport.turnStartCount, 1);
+      assert.equal(evidence, 1, "held admission creates no model receipt");
+      assert.equal(emitted.some(m => /idle timeout/i.test(JSON.stringify(m.payload))), false);
+    } finally {
+      releaseHTTP?.(); releaseProof?.(); abort.abort(); rig.transport.end();
+      await running.catch(() => undefined); t.mock.timers.reset();
+    }
+  });
+
+  it("automatic revision receives a separate fresh admit without replaying feedback", async () => {
+    const plan: Responder = c => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "m2-plan" } };
+      if (c.method === "turn/start") {
+        const tn = `m2-turn-${c.turnStartCount}`;
+        c.transport.push(toolCall(c.turnStartCount, "submit_plan", { plan_md: "M2 plan" }, "m2-plan", tn, tn))
+          .push(turnCompleted("completed", "m2-plan", tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([plan, epochResponder("m2-implement", "m2-done", (tr, th, tn) =>
+      { tr.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn)); })]);
+    let admissions = 0, gates = 0;
+    let release!: () => void;
+    const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ++gates === 1
+        ? { kind: "revise", automatic: true, round: 1, feedback: "M2 automated feedback" }
+        : { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } },
+      prepareCodexRootDispatch: async (_signal, check) => {
+        if (++admissions === 2) await new Promise<void>(resolve => { release = resolve; });
+        check(); return check;
+      },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await ready(() => admissions === 2);
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+      release(); await running;
+      assert.equal(admissions, 3);
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, 2);
+      assert.equal(emitted.filter(m => m.kind === "plan_feedback").length, 1);
+    } finally { release?.(); for (const epoch of rig.epochs) epoch.transport.end(); }
+  });
+
+  it("capture completes while admission is held; late admit cannot send into the captured epoch", async () => {
+    const rig = makeRig();
+    let entered = false, release!: () => void;
+    const { ctx } = makeCtx({ prepareCodexRootDispatch: async (_signal, check) => {
+      entered = true; await new Promise<void>(resolve => { release = resolve; }); check(); return check;
+    } });
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const running = executor.run(ctx);
+    const stopped = assert.rejects(running, /capture|admission|closed/);
+    try {
+      await ready(() => entered);
+      let action = false;
+      const captured = await executor.withCredentialFreeCapture(1000, async () => { action = true; return "physical capture"; });
+      assert.equal(captured.kind, "observed_empty");
+      assert.equal(action, true);
+      assert.equal(rig.transport.turnStartCount, 0);
+      assert.ok(rig.reaped() > 0);
+      release(); await stopped;
+      assert.equal(rig.transport.turnStartCount, 0);
+    } finally { release?.(); rig.transport.end(); }
+  });
+
+  it("M2 refused wall extension during admission keeps one wall debit and gets fresh admission", async t => {
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, idleMs: 10, wallMs: 1000, redriveAllowanceMs: 1, timeoutNow: () => Date.now() };
+    let admissions = 0, parks = 0, receipts = 0;
+    const { ctx } = makeCtx({
+      parkForWall: async () => ++parks === 1 ? "refused" : "parked",
+      takeWallParkRefresh: () => ({ totalSeconds: 2, usedSeconds: 1 }),
+      onModelTurnSettled: async () => { receipts++; },
+      prepareCodexRootDispatch: async signal => {
+        admissions++;
+        await new Promise<never>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+        return () => {};
+      },
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await ready(() => admissions === 1);
+      t.mock.timers.tick(1000);
+      await ready(() => admissions === 2);
+      assert.equal(parks, 1);
+      assert.equal(rig.transport.turnStartCount, 0);
+      t.mock.timers.tick(999);
+      await tick();
+      assert.equal(parks, 1, "the extension is debited once");
+      t.mock.timers.tick(1);
+      assert.ok((await running).walled);
+      assert.equal(parks, 2);
+      assert.equal(admissions, 2);
+      assert.equal(receipts, 0);
+      assert.equal(rig.transport.turnStartCount, 0);
+    } finally { rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  it("M2 repeated refused pauses rearm admission with the spent shared signal", async () => {
+    const rig = makeRig({ responder: epochResponder("th-1", "tn-1", tr => {
+      tr.push(signalDone()).push(turnCompleted());
+    }) });
+    let admissions = 0, parks = 0, release!: () => void;
+    const abort = new AbortController();
+    let mode: "now" | null = null;
+    let interrupt: (() => void) | undefined;
+    const pause = (): void => {
+      mode = "now";
+      if (!abort.signal.aborted) abort.abort(new PauseNowSignal());
+      interrupt?.();
+    };
+    const { ctx } = makeCtx({
+      signal: abort.signal,
+      pauseModeRequested: () => mode,
+      onPauseNow: cb => { interrupt = cb; },
+      parkForPause: async () => { parks++; return false; },
+      prepareCodexRootDispatch: async (signal, check) => {
+        admissions++;
+        await new Promise<void>((resolve, reject) => {
+          release = resolve;
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+        check(); return check;
+      },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await ready(() => admissions === 1);
+      pause();
+      await ready(() => admissions === 2);
+      pause();
+      await ready(() => admissions === 3);
+      assert.equal(ctx.signal?.aborted, true);
+      assert.equal(parks, 2);
+      assert.equal(rig.transport.turnStartCount, 0);
+      release(); await running;
+      assert.equal(rig.transport.turnStartCount, 1);
+    } finally { release?.(); rig.transport.end(); await running.catch(() => undefined); }
+  });
+
+  it("M2 vault latch during admission uses the credential deferral route without a provider retry", async () => {
+    const rig = makeRig();
+    rig.client.refreshCodex = async () => { throw vaultLocked409("refresh"); };
+    let waiting = false, receipts = 0;
+    const { ctx } = makeCtx({ onModelTurnSettled: async () => { receipts++; },
+      prepareCodexRootDispatch: async signal => {
+        waiting = true;
+        await new Promise<never>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+        return () => {};
+      },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    const stopped = assert.rejects(running, CodexCredentialDeferredError);
+    try {
+      await ready(() => waiting);
+      rig.transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
+        params: { reason: "unauthorized", previousAccountId: null } });
+      await stopped;
+      assert.equal(rig.providerLaunches(), 1);
+      assert.equal(rig.transport.turnStartCount, 0);
+      assert.equal(rig.client.releaseCalls.length, 1);
+      assert.equal(receipts, 0);
+    } finally { rig.transport.end(); await running.catch(() => undefined); }
+  });
+
+  it("M2 capture with unproven reap blocks custody and a late admission cannot launch a fresh root", async () => {
+    const rig = makeRig();
+    rig.root.reap = async () => ({ ok: false, error: { category: "tool", message: "M2 reap unproven" } });
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+    let entered = false, release!: () => void;
+    const { ctx } = makeCtx({ prepareCodexRootDispatch: async (_signal, check) => {
+      entered = true; await new Promise<void>(resolve => { release = resolve; }); check(); return check;
+    } });
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const running = executor.run(ctx);
+    const stopped = assert.rejects(running);
+    try {
+      await ready(() => entered);
+      let custody = false;
+      const outcome = await executor.withCredentialFreeCapture(1000, async () => { custody = true; });
+      assert.equal(outcome.kind, "incomplete");
+      assert.equal(custody, false, "unproven reap supplies no capture custody");
+      release(); await stopped;
+      assert.equal(rig.transport.turnStartCount, 0);
+      assert.equal(rig.providerLaunches(), 1);
+      assert.equal((await executor.settleForCredentialFreeCapture(1000)).kind, "incomplete");
+    } finally { release?.(); rig.transport.end(); await running.catch(() => undefined); }
+  });
+
+  it("M2 an already dispatched stream survives a cooldown update and the next boundary reads fresh", async () => {
+    const { CodexOperationController } = await import("../src/codex-operation-controller.js");
+    const { AdmissionClock, flushUntil } = await import("./operation-admission-clock.js");
+    const clock = new AdmissionClock();
+    const rig = makeMultiEpochRig([
+      c => c.method === "thread/start" ? { thread: { id: "th-live" } }
+        : c.method === "turn/start" ? { turn: { id: "tn-live" } } : {},
+      epochResponder("th-impl", "tn-impl", (tr, th, tn) => { tr.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn)); }),
+    ]);
+    let reads = 0, operations = 0, receipts = 0;
+    const controller = new CodexOperationController(7, {
+      supported: () => true, negotiation: () => 1, engage: () => {}, waiting: () => () => {},
+      now: () => clock.now, sleep: clock.sleep,
+      read: async request => ++reads === 2 ? { ...request, decision: "wait", class: "overload",
+        episode_id: "00000000-0000-4000-8000-000000000096",
+        server_now: new Date(0).toISOString(), eligible_at: new Date(1000).toISOString() }
+        : { decision: "admit", operation_id: request.operation_id, claim_generation: 7 },
+    });
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } }),
+      onModelTurnSettled: async () => { receipts++; },
+      prepareCodexRootDispatch: async (signal, check) => {
+        await controller.admit({ kind: "root", operation_id: `00000000-0000-4000-8000-${String(++operations).padStart(12, "0")}` },
+          signal, check, async () => { check(); });
+        return check;
+      },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    const abort = new AbortController();
+    let sibling: Promise<() => boolean> | undefined;
+    try {
+      await ready(() => rig.epochs[0]!.transport.turnStartCount === 1);
+      sibling = controller.admit({ kind: "root", operation_id: "00000000-0000-4000-8000-000000000099" },
+        abort.signal, () => {}, async () => {});
+      const cancelled = assert.rejects(sibling);
+      await flushUntil(() => clock.sleepers.size === 1);
+      abort.abort(); await cancelled;
+      rig.epochs[0]!.transport.push(toolCall(1, "submit_plan", { plan_md: "live stream continued" }, "th-live", "tn-live", "live-plan"))
+        .push(turnCompleted("completed", "th-live", "tn-live"));
+      await ready(() => operations === 2 && clock.sleepers.size === 1);
+      assert.equal(receipts, 1, "the running stream completed under the changed policy");
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+      assert.equal(reads, 2);
+      clock.advance(999);
+      assert.equal(reads, 2);
+      clock.advance(1);
+      await running;
+      assert.equal(reads, 3);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 1);
+      assert.equal(receipts, 2);
+    } finally {
+      abort.abort(); clock.advance(15000);
+      for (const epoch of rig.epochs) epoch.transport.end();
+      await sibling?.catch(() => undefined); await running.catch(() => undefined);
+    }
+  });
+
+});
+
+it("M3 actual child send retries final permits and leaves the root demux running during its independent wait", async () => {
+  const rig = makeRig({ responder: c => {
+    if (c.method === "turn/start" && c.turnStartCount > 1) {
+      c.transport.push(turnCompleted("completed", "th-child", "tn-child"));
+    }
+    return defaultResponder(c);
+  } });
+  const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+  let release!: () => void;
+  let preparations = 0;
+  const { ctx } = makeCtx({ agents: [
+    { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+    { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+  ], prepareCodexRootDispatch: async (signal, check, kind) => {
+    if (kind !== "child") return () => true;
+    const n = ++preparations;
+    if (n === 1) await new Promise<void>(resolve => { release = resolve; });
+    signal.throwIfAborted(); check();
+    return () => n > 1;
+  } });
+  rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "work" }, "th-1", "tn-1", "m3-delegate"));
+  const done = executor.run(ctx);
+  await waitFor(() => !!release, "child admission wait");
+  assert.equal(rig.transport.requests.filter(r => r.method === "turn/start").length, 1);
+  rig.transport.push(toolCall(2, "uzi_bash", { command: "echo demux" }, "th-1", "tn-1", "m3-root-shell"));
+  await waitFor(() => rig.transport.responses.some(r => r.requestId === 2), "root callback while child waits");
+  release();
+  await waitFor(() => rig.transport.responses.some(r => r.requestId === 1), "child settles");
+  rig.transport.push(signalDone()).push(turnCompleted()).end();
+  await withTimeout(done, 3000, "M3 child dispatch");
+  assert.equal(preparations, 2);
+  assert.equal(rig.transport.requests.filter(r => r.method === "turn/start").length, 2);
+});
+
+for (const stop of ["deadline", "parent terminal", "parent cancel"] as const) {
+  it(`M3 child admission settles on ${stop} without sending its turn`, async () => {
+    const rig = makeRig();
+    const executor = makeExecutor({ ...rig, deps: { ...rig.deps, childTurnDeadlineMs: stop === "deadline" ? 30 : 5000 } }, bindingOf(SUBSCRIPTION));
+    const owner = new AbortController();
+    let waiting = false;
+    const { ctx } = makeCtx({ signal: owner.signal, agents: [
+      { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+      { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+    ], prepareCodexRootDispatch: async (signal, _check, kind) => {
+      if (kind !== "child") return () => true;
+      waiting = true;
+      await new Promise<void>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      throw new Error("unreachable");
+    } });
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "work" }, "th-1", "tn-1", "m3-delegate"));
+    const done = executor.run(ctx);
+    const settled = stop === "parent cancel" ? assert.rejects(done, /run cancelled/) : done;
+    await waitFor(() => waiting, "child waits before send");
+    if (stop === "parent cancel") owner.abort();
+    else if (stop === "parent terminal") rig.transport.push(signalDone()).push(turnCompleted()).end();
+    else {
+      await waitFor(() => rig.transport.responses.some(r => r.requestId === 1), "child deadline reply");
+      rig.transport.push(signalDone()).push(turnCompleted()).end();
+    }
+    await withTimeout(settled.then(() => undefined), 3000, `M3 child ${stop}`);
+    assert.equal(rig.transport.requests.filter(r => r.method === "turn/start").length, 1);
+  });
+}
+describe("3404 terminal executor lifetime", () => {
+  const done = epochResponder("th-1", "tn-1", t => { t.push(signalDone()).push(turnCompleted()); });
+  function barrier() {
+    let resolve!: () => void;
+    const promise = new Promise<void>(r => { resolve = r; });
+    return { promise, resolve };
+  }
+
+  it("3404 seals a real completed provider/provision incarnation and rejects runtime fakes and foreign seals", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    const { ctx } = makeCtx();
+    await executor.run(ctx);
+    assert.ok(rig.providerLaunches() > 0);
+    assert.ok(rig.disposed() > 0);
+    const source = Object.freeze({ runId: ctx.runId });
+    const result = await executor.sealLifetime(source);
+    assert.equal(result.kind, "sealed");
+    if (result.kind !== "sealed") return;
+    assert.equal(executor.acceptsLifetimeSeal(result.seal, source), true);
+    assert.equal(executor.acceptsLifetimeSeal({}, source), false);
+    assert.equal(executor.acceptsLifetimeSeal(JSON.parse(JSON.stringify(result.seal)), source), false);
+    assert.equal(executor.acceptsLifetimeSeal(result.seal, { runId: ctx.runId }), false);
+    const material = terminalSealMaterial(result.seal)!;
+    assert.equal(material.sourceUse, source);
+    assert.ok(material.incarnations.length >= 2, "provision and provider registries are both inventoried");
+    assert.equal(new Set(material.incarnations.map(entry => entry.registry)).size, material.incarnations.length);
+    const foreign = makeExecutor(makeRig(), bindingOf(API_KEY));
+    assert.equal(foreign.acceptsLifetimeSeal(result.seal, source), false);
+    const launches = rig.providerLaunches(), credentials = rig.client.releaseCalls.length;
+    await assert.rejects(executor.run(ctx), /lifetime closed/);
+    await assert.rejects(executor.withCredentialFreeCapture(100, async () => {}), /lifetime closed/);
+    await assert.rejects(executor.settleForCredentialFreeCapture(100), /lifetime closed/);
+    assert.equal(rig.providerLaunches(), launches);
+    assert.equal(rig.client.releaseCalls.length, credentials);
+    assert.equal((await executor.sealLifetime(source)), result);
+  });
+
+  it("3404 closes synchronously and joins a retained progress observer without failing the completed run", async () => {
+    const entered = barrier(), release = barrier();
+    const responder = epochResponder("th-1", "tn-1", t => {
+      t.push(toolCall(11, "report_progress", { in_progress: ["m1"] }, "th-1", "tn-1", "c-p1"))
+        .push(signalDone()).push(turnCompleted());
+    });
+    const rig = makeRig({ responder });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    const { ctx } = makeCtx({ frozenMilestones: [{ id: "m1", title: "one" }],
+      reportProgress: async () => { entered.resolve(); await release.promise; } });
+    const result = await executor.run(ctx);
+    await entered.promise;
+    let sealed = false;
+    const sealing = executor.sealLifetime({}).then(value => { sealed = true; return value; });
+    try {
+      await assert.rejects(executor.run(ctx), /lifetime closed/);
+      await tick();
+      assert.equal(sealed, false, "the discarded reportProgress tail is owned by the lifetime");
+      release.resolve();
+      assert.equal((await sealing).kind, "sealed");
+      assert.equal(result.branch, ctx.branch);
+    } finally { release.resolve(); await sealing; }
+  });
+
+  for (const failure of ["reap", "dispose", "fileop"] as const) {
+    it(`3404 ${failure} cleanup uncertainty never seals or retries model work`, async () => {
+      const rig = makeRig({ responder: done });
+      if (failure === "reap") rig.root.reap = async () => ({ ok: false, error: { category: "tool", message: "no ECHILD" } });
+      if (failure === "dispose") rig.root.dispose = async () => { throw new Error("cleanup unconfirmed"); };
+      if (failure === "fileop") rig.deps = { ...rig.deps, wireFileop: () => ({ client: { op: async () => ({ ok: true }) },
+        dispose: async () => { throw new Error("fileop closure failed"); } }) };
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      const { ctx } = makeCtx();
+      const completed = await executor.run(ctx);
+      const launches = rig.providerLaunches();
+      assert.equal((await executor.sealLifetime({})).kind, "unproven");
+      assert.equal(completed.branch, ctx.branch);
+      assert.equal(rig.providerLaunches(), launches);
+      assert.equal((await executor.sealLifetime({})).kind, "unproven", "permanently unproven, never re-sealed");
+    });
+  }
+
+  it("3404 a delayed provider factory is joined by the seal and a late run is refused before it", async () => {
+    const entered = barrier(), release = barrier();
+    const rig = makeRig({ responder: done });
+    const launch = rig.deps.launchProviderRoot!;
+    let factoryCalls = 0;
+    rig.deps = { ...rig.deps, launchProviderRoot: async (...args) => {
+      factoryCalls++; entered.resolve(); await release.promise; return launch(...args);
+    } };
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    const running = executor.run(makeCtx().ctx).catch(() => undefined);
+    await entered.promise;
+    let settled = false;
+    const sealing = executor.sealLifetime({}).then(value => { settled = true; return value; });
+    try {
+      await tick();
+      assert.equal(settled, false, "the in-flight factory call is an owned producer");
+      release.resolve();
+      await running;
+      assert.equal((await sealing).kind, "unproven", "sealed while a run was active");
+      assert.equal((await executor.sealLifetime({})).kind, "unproven");
+      assert.equal(factoryCalls, 1, "closure after the factory call started never started another");
+    } finally { release.resolve(); await running; await sealing; }
+  });
+
+  it("3404 delayed cache removal keeps original settlement in the lifetime after pending delivery", async () => {
+    const raw = barrier();
+    const rig = makeRig({ responder: done });
+    rig.deps = { ...rig.deps,
+      startCacheHolder: async token => ({ token, path: "/cache", alive: () => false,
+        release: async () => ({ state: "error", reason: "unused" }) }),
+      removeCommandCache: async () => ({ state: "pending", reason: "",
+        settlement: raw.promise.then(() => ({ state: "removed", reason: "" })) }),
+    };
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    let settled = false;
+    const sealing = executor.sealLifetime({}).then(value => { settled = true; return value; });
+    try {
+      await tick(); assert.equal(settled, false);
+      raw.resolve(); assert.equal((await sealing).kind, "sealed");
+    } finally { raw.resolve(); await sealing; }
+  });
+
+  it("3404 a cache removal that settles unclean, or that only reports a bounded pending answer, never seals", async () => {
+    for (const mode of ["unsettled-answer", "retained"] as const) {
+      const rig = makeRig({ responder: done });
+      rig.deps = { ...rig.deps,
+        startCacheHolder: async token => ({ token, path: "/cache", alive: () => false,
+          release: async () => ({ state: "error", reason: "unused" }) }),
+        removeCommandCache: async () => mode === "retained"
+          ? { state: "pending", reason: "", settlement: Promise.resolve({ state: "retained", reason: "busy" }) }
+          : { state: "pending", reason: "" },
+      };
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      await executor.run(makeCtx().ctx);
+      assert.equal((await executor.sealLifetime({})).kind, "unproven", mode);
+    }
+  });
+
+  for (const sealed of [false, true]) {
+    it(`3404 owner abort mid-turn still cancels and interrupts after a lifetime seal (${sealed ? "sealed" : "control"})`, async () => {
+      const controller = new AbortController();
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+        return {};
+      } });
+      rig.transport.push(threadStarted());
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      const running = executor.run(makeCtx({ signal: controller.signal }).ctx);
+      await waitFor(() => rig.transport.requests.some(r => r.method === "turn/start"), "turn started");
+      let sealing: Promise<{ kind: string }> | undefined;
+      if (sealed) sealing = executor.sealLifetime({});
+      controller.abort();
+      await assert.rejects(withTimeout(running, 3000, "cancel after seal"), /run cancelled/);
+      assert.ok(rig.transport.requests.some(r => r.method === "turn/interrupt"), "the stop request was delivered");
+      if (sealing) assert.equal((await sealing).kind, "unproven", "a run that was active at seal time stays unproven");
+    });
+  }
+
+  it("3404 a seal is refused while any epoch registry is still unverified", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    (executor as unknown as { unverifiedEpochRegistries: Set<object> }).unverifiedEpochRegistries.add({});
+    assert.equal((await executor.sealLifetime({})).kind, "unproven");
+  });
+
+  it("3404 after a seal a retained refresh bridge is refused before the real refresh", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    assert.equal((await executor.sealLifetime({})).kind, "sealed");
+    const internals = executor as unknown as {
+      lifetimeBoundRefreshBridge(bridge: { refresh(request: unknown): Promise<unknown> }): { refresh(request: unknown): Promise<unknown> };
+    };
+    let refreshed = 0;
+    const bridge = internals.lifetimeBoundRefreshBridge({ refresh: async () => { refreshed++; return {}; } });
+    await assert.rejects(bridge.refresh({}), /lifetime closed/);
+    assert.equal(refreshed, 0, "refused before the underlying bridge.refresh");
+  });
+
+  describe("deferred final registry (deferRegistryTeardown)", () => {
+    type DeferredInternals = {
+      unverifiedEpochRegistries: Set<{ poison(error: unknown): void }>;
+      deferredFinal?: { registry: { poison(error: unknown): void } };
+    };
+    async function sinkThenDispose(executor: CodexExecutor) {
+      // The runner's durability sinks reap the provider root through a boundary before the dispose.
+      await executor.safety!.withBoundary({ boundary: "finalize", deadlineMs: 2000 }, async () => {});
+      return executor.safety!.dispose({ boundary: "terminal", deadlineMs: 2000 });
+    }
+    async function deferredRun(mutate?: (rig: ReturnType<typeof makeRig>) => void) {
+      const rig = makeRig({ responder: done });
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+      mutate?.(rig);
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      const { ctx } = makeCtx();
+      await executor.run(ctx);
+      return { rig, executor, source: Object.freeze({ runId: ctx.runId }) };
+    }
+
+    it("3404 seals after the runner's terminal safety.dispose proved the deferred final registry", async () => {
+      const { executor, source } = await deferredRun();
+      const disposal = await sinkThenDispose(executor);
+      assert.equal(disposal.kind, "disposed");
+      const result = await executor.sealLifetime(source);
+      assert.equal(result.kind, "sealed");
+      if (result.kind === "sealed") assert.equal(executor.acceptsLifetimeSeal(result.seal, source), true);
+    });
+
+    it("3404 a deferred final registry is unproven before the terminal dispose", async () => {
+      const { executor, source } = await deferredRun();
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a rejected terminal dispose leaves the deferred final registry unproven", async () => {
+      const { executor, source } = await deferredRun(rig => {
+        rig.root.dispose = async () => { throw new Error("cleanup unconfirmed"); };
+      });
+      await sinkThenDispose(executor).catch(() => undefined);
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a throwing terminal hook (installer cleanup proof unavailable) is incomplete and leaves the seal unproven", async () => {
+      // An exhausted terminal deadline: the hook's installState.settle cannot prove the installer
+      // cleanup inside it and throws "installer cleanup proof unavailable".
+      const { executor, source } = await deferredRun();
+      await executor.safety!.withBoundary({ boundary: "finalize", deadlineMs: 2000 }, async () => {});
+      const disposal = await executor.safety!.dispose({ boundary: "terminal", deadlineMs: 0 });
+      assert.equal(disposal.kind, "incomplete");
+      assert.ok(disposal.kind === "incomplete" &&
+        disposal.errors.some(error => /terminal cleanup hook failed/.test(error.message)));
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a disposal that bypasses safety.dispose and its hook leaves the seal unproven", async () => {
+      const { executor, source } = await deferredRun();
+      await executor.safety!.withBoundary({ boundary: "finalize", deadlineMs: 2000 }, async () => {});
+      const registry = (executor as unknown as DeferredInternals).deferredFinal!.registry as unknown as
+        { disposeTools(deadlineMs: number): Promise<{ kind: string }> };
+      assert.equal((await registry.disposeTools(2000)).kind, "disposed");
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 a seal retires only the final registry bookkeeping and repeats identically", async () => {
+      const { executor, source } = await deferredRun();
+      await sinkThenDispose(executor);
+      const internals = executor as unknown as DeferredInternals;
+      const registry = internals.deferredFinal!.registry;
+      assert.equal(internals.unverifiedEpochRegistries.has(registry), true);
+      const first = await executor.sealLifetime(source);
+      assert.equal(first.kind, "sealed");
+      assert.equal(internals.unverifiedEpochRegistries.has(registry), false);
+      assert.equal(await executor.sealLifetime(source), first);
+    });
+
+    it("3404 an unsettled command-cache removal leaves the deferred final registry unproven", async () => {
+      const { executor, source } = await deferredRun(rig => {
+        rig.deps = { ...rig.deps,
+          startCacheHolder: async token => ({ token, path: "/cache", alive: () => false,
+            release: async () => ({ state: "error", reason: "unused" }) }),
+          removeCommandCache: async () => ({ state: "pending", reason: "",
+            settlement: Promise.resolve({ state: "retained", reason: "busy" }) }),
+        };
+      });
+      await sinkThenDispose(executor).catch(() => undefined);
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 poisoning the registry after an accepted terminal dispose revokes the proof", async () => {
+      const { executor, source } = await deferredRun();
+      const disposal = await sinkThenDispose(executor);
+      assert.equal(disposal.kind, "disposed");
+      const registry = (executor as unknown as DeferredInternals).deferredFinal!.registry;
+      registry.poison({ category: "tool", message: "late poison" });
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+
+    it("3404 an unverified prior-epoch registry keeps the deferred final seal unproven", async () => {
+      const { executor, source } = await deferredRun();
+      await sinkThenDispose(executor);
+      (executor as unknown as DeferredInternals).unverifiedEpochRegistries.add({ poison() {} });
+      assert.equal((await executor.sealLifetime(source)).kind, "unproven");
+    });
+  });
+
+  it("3404 structural source strings confer no authority", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    assert.equal((await executor.sealLifetime("run-1" as never)).kind, "unproven");
   });
 });

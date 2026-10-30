@@ -1,5 +1,7 @@
+import { acquireCodexOperationScope } from "../codex-operation-scope.js";
 import type { CodexAdmissionReporter } from "./admission-signal.js";
 import { checkCheckpointStop, cleanCheckpointAdmission, CheckpointSoftDeadlineError } from "../checkpoint-stop.js";
+import { ExecutorLifetime, type ExecutorSealResult, type ExecutorTerminalSeal } from "./executor-lifetime.js";
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production `CodexExecutor` and the
 // claim-aware DARK selection seam's Codex branch.
 //
@@ -219,7 +221,7 @@ import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "./config.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
 import { isSeededOwnerPlan, SEEDED_PLAN_RULES } from "../seeded-plan.js";
-import { CodexAdviceHarness, type LaunchAdviceRootSeam } from "./codex-advice-harness.js";
+import { CodexAdviceHarness, type CodexAdviceHarnessOptions, type LaunchAdviceRootSeam } from "./codex-advice-harness.js";
 import { makePrDescriptionEvalLaunch, type PrDescriptionEvalLaunchTestSeams } from "./pr-description-eval-launch.js";
 import type { AdviceRequest, AdviceResultPolicy } from "../harness.js";
 import {
@@ -1178,6 +1180,7 @@ export async function makeCodexAdviceHarness(
   refresh?: "deny",
   ownership?: SummaryOwnership,
   admissionReporter?: CodexAdmissionReporter,
+  operationScope?: CodexAdviceHarnessOptions["operationScope"],
 ): Promise<CodexAdviceHarness> {
   // Register EVERY advice token — the initial release AND any subscription refresh — with the
   // harness redactor so neither can ride a log line verbatim. The advice lane has no separate
@@ -1193,7 +1196,7 @@ export async function makeCodexAdviceHarness(
   ownership?.guard();
   registerToken(initial);
   const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken, refresh === "deny"));
-  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log, admissionReporter });
+  return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log, admissionReporter, operationScope });
 }
 
 /** One evaluator pass on a caller-provided key. Register CLI signal cleanup before run;
@@ -1442,15 +1445,26 @@ export function makeProductionCodexAdviceHarnessFactory(
   client: WorkerClient,
   log: Logger,
   homeRoot: string,
+  deps: { launchRoot?: LaunchAdviceRootSeam } = {},
 ): CodexAdviceHarnessFactory {
   return async (params: CodexAdviceHarnessBuildParams): Promise<CodexAdviceHarness> => {
     const { runId, binding, signal, refresh } = params;
     const ownership = summaryOwnership.get(params);
     ownership?.guard();
-    const bridge = new CodexAdviceCredentialBridge(runId, client, binding);
-    const launchRoot = makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log, ownership);
-    return makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership,
-      binding.authMode === "subscription" ? client.codexAdmissionReporter?.(runId, params.claimGeneration) : undefined);
+    // Retain the owner's scope before credential release can yield. A delayed advice
+    // launch must still observe root closure, rather than create a fresh unbound scope.
+    const scope = binding.authMode === "subscription"
+      ? acquireCodexOperationScope(client, runId, params.claimGeneration ?? 0, {}, undefined, undefined, log) : undefined;
+    const close = (): void => { signal?.removeEventListener("abort", close); scope?.close(); };
+    signal?.addEventListener("abort", close, { once: true });
+    if (signal?.aborted) close();
+    try {
+      const bridge = new CodexAdviceCredentialBridge(runId, client, binding);
+      const launchRoot = deps.launchRoot ?? makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log, ownership);
+      return await makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership,
+        binding.authMode === "subscription" ? client.codexAdmissionReporter?.(runId, params.claimGeneration) : undefined,
+        scope ? () => ({ prepare: (signal, check) => scope.prepare("advice", signal, () => { ownership?.guard(); check(); }), close }) : undefined);
+    } catch (error) { close(); throw error; }
   };
 }
 
@@ -2123,6 +2137,86 @@ function childInterruptDeadlineMs(boundaryDeadlineMs: number): number {
 }
 
 export class CodexExecutor implements Executor {
+  private readonly lifetime = new ExecutorLifetime();
+
+  /** The lifetime's incarnation; a source-use admission binds it (see Executor.executorIncarnation). */
+  get executorIncarnation(): string { return this.lifetime.executorIncarnation; }
+
+  /**
+   * Irreversibly close this executor's admission and, only when every owned producer, observer and
+   * cleanup tail has actually settled with its original successful disposal facts, issue an opaque
+   * seal bound to `sourceUse`. Call it after the last executor-dependent sink/source tail and safety
+   * disposal, never while holding a safety, journal or bare lock. It never joins run()/execute() or
+   * the runner's execution-tail release (those own this call's caller), and never fails or retries
+   * a completed run: any uncertainty yields `{ kind: "unproven" }` and the executor stays closed.
+   * The runner's publishFlightSource awaits it with no bound (see HeldRunCommandCache.observeCleanup).
+   *
+   * Under deferRegistryTeardown the final epoch's registry stays in the outstanding set until the
+   * runner's terminal safety.dispose; the seal then accepts it only through deferredFinalProven,
+   * evaluated both before and after the joins (so a poison during the joins leaves it unproven).
+   * That predicate is one guard; ExecutorLifetime's own inventory check (proven()) also rejects a
+   * revoked disposal. The set is never edited to earn the seal: only after the lifetime has
+   * resolved "sealed" (past its post-join eligibility re-check) is that one registry retired from
+   * the bookkeeping, and only while the predicate still holds. The result object is returned
+   * unchanged so a repeat call still yields the identical cached result.
+   */
+  sealLifetime(sourceUse: object): Promise<ExecutorSealResult> {
+    const wasRunning = this.runActive;
+    return this.lifetime.seal(sourceUse, async () => {
+      // Admission is already closed. Abort only what cannot be waiting on a live run.
+      if (!wasRunning) {
+        this.summaryLifecycleClosed = true;
+        this.provisionAbort?.abort();
+        this.depsInstall?.abort.abort();
+      }
+      await this.closeAndSettlePlanSummary();
+      // Join the actual setup operations (not the capture queue they must never queue behind).
+      await Promise.allSettled(this.epochSetups.keys());
+      await Promise.allSettled([
+        ...this.planFlights, ...this.retiredIntentFlights,
+        ...(this.intentFlight ? [this.intentFlight] : []),
+      ].map(flight => flight.done));
+    }, () => !this.runActive && this.captureOwners === 0 &&
+      (this.unverifiedEpochRegistries.size === 0 || this.deferredFinalProven()))
+      .then(result => {
+        const final = this.deferredFinal;
+        if (result.kind === "sealed" && final && this.deferredFinalProven()) {
+          this.unverifiedEpochRegistries.delete(final.registry);
+        }
+        return result;
+      });
+  }
+
+  /**
+   * The progress observers discard `reportProgress` (fire and forget). The executor owns that tail:
+   * the derived context refuses after closure and the actual push promise is joined by a seal. Only
+   * reportProgress is overridden; every other property reads through to the runner's context.
+   */
+  private ownedProgressContext(ctx: RunContext): RunContext {
+    const push = ctx.reportProgress;
+    if (!push) return ctx;
+    return Object.create(ctx, {
+      reportProgress: {
+        enumerable: true,
+        value: (progress: MilestoneProgress, frozen?: readonly Milestone[]): Promise<void> =>
+          this.lifetime.admit(async () => { await push.call(ctx, progress, frozen); }),
+      },
+    }) as RunContext;
+  }
+
+  /**
+   * Raw auth refresh is a lifetime producer. The pinned auth owner retains and re-invokes its bridge
+   * after cancellation, so the bridge itself refuses once the lifetime is closed, before any
+   * credential work, and the actual refresh is joined by a seal when it was admitted earlier.
+   */
+  private lifetimeBoundRefreshBridge(bridge: CodexSubscriptionRefreshBridge): CodexSubscriptionRefreshBridge {
+    return { refresh: request => this.lifetime.admit(() => bridge.refresh(request)) };
+  }
+
+  acceptsLifetimeSeal(seal: unknown, sourceUse: object): seal is ExecutorTerminalSeal {
+    return this.lifetime.accepts(seal, sourceUse);
+  }
+
   /** M3/M4 (PRD #1171): the Codex outer safety facade, POPULATED at the top of `run()` (before
    *  any model work) with the per-sink auth-mode reconcile closure. The runner's durability
    *  sinks route through it (m4). Absent means Claude/stub — this executor always sets it, so
@@ -2147,6 +2241,7 @@ export class CodexExecutor implements Executor {
    * `incomplete` rather than trusting an unobserved drain.
    */
   async settleForCredentialFreeCapture(deadlineMs: number, purpose: "capture" | "cancel" = "capture"): Promise<CredentialFreeCaptureSettlement> {
+    this.lifetime.assertOpen();
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
     const budget = MaintenanceBudget.current();
     const remaining = budget?.cap(deadlineMs) ?? (() => Math.max(0, deadlineAt - Date.now()));
@@ -2256,12 +2351,29 @@ export class CodexExecutor implements Executor {
   private unstartedLegClosed = false;
   private executionStarted = false;
   private captureRevision = 0;
+  private readonly rootAdmissionWaits = new Set<AbortController>();
   private captureCleanupRemaining?: () => number;
   private captureTail: Promise<void> = Promise.resolve();
   private provisionAbort?: AbortController;
   private provisionDeadline?: (deadlineAt: number) => void;
   private readonly epochSetups = new Map<Promise<unknown>, Set<ExecutionRegistry> | undefined>();
   private runActive = false;
+  /** Under deferRegistryTeardown: the final epoch's registry and safety, set only when run()'s
+   *  deferred teardown succeeded. Cleared at the start of every run leg. */
+  private deferredFinal?: { readonly registry: ExecutionRegistry; readonly safety: CodexExecutionSafetyImpl };
+
+  /**
+   * True only when the sole outstanding registry is the deferred final epoch and its safety's own
+   * settled terminal disposal is still accepted by the registry (exact witness, unchanged poison
+   * revision and cursors, every root reaped and disposed). Cleared tables or state() never count.
+   */
+  private deferredFinalProven(): boolean {
+    const final = this.deferredFinal;
+    if (!final || this.unverifiedEpochRegistries.size !== 1 || !this.unverifiedEpochRegistries.has(final.registry)) return false;
+    if (this.epochSafeties.get(final.registry) !== final.safety || final.safety !== this.safety) return false;
+    const outcome = final.safety.terminalDisposalOutcome();
+    return outcome !== undefined && outcome.kind === "disposed" && final.safety.acceptsTerminalDisposal(outcome);
+  }
 
   /** Reserve synchronously: a later capture must queue behind the entire operation. */
   private async withCaptureOwnership<T>(action: () => Promise<T>): Promise<T> {
@@ -2284,6 +2396,7 @@ export class CodexExecutor implements Executor {
   private captureReaperAttempt?: Readonly<SdkAttemptEnv>;
 
   private assertCaptureAdmission(revision = this.captureRevision): void {
+    this.lifetime.assertOpen();
     if (this.unstartedLegClosed || this.captureOwners || revision !== this.captureRevision) {
       throw new TrustedExecutionRefusal("codex epoch admission closed for capture");
     }
@@ -2297,6 +2410,7 @@ export class CodexExecutor implements Executor {
       this.assertCaptureAdmission(revision);
       return action();
     });
+    this.lifetime.join(pending);
     this.epochSetups.set(pending, registries);
     try { return await pending; }
     finally { this.epochSetups.delete(pending); }
@@ -2309,6 +2423,8 @@ export class CodexExecutor implements Executor {
     signal?: AbortSignal,
     attempt?: Readonly<SdkAttemptEnv>,
   ): Promise<{ kind: "observed_empty"; value: T } | { kind: "incomplete"; errors: readonly HarnessError[] }> {
+    // Refuse before any state change: a closed lifetime admits no capture.
+    this.lifetime.assertOpen();
     // Each queued caller owns a value snapshot, never a mutable caller reference.
     const captureAttempt = attempt === undefined ? undefined : Object.freeze({
       marker: attempt.marker, cloneKey: attempt.cloneKey, clonePath: attempt.clonePath,
@@ -2322,6 +2438,8 @@ export class CodexExecutor implements Executor {
     }
     this.captureOwners++;
     this.captureRevision++;
+    for (const waiting of this.rootAdmissionWaits)
+      waiting.abort(new TrustedExecutionRefusal("codex root dispatch invalidated by capture"));
     this.summaryLifecycleClosed = true;
     this.depsInstall?.abort.abort();
     const signals = [signal, purpose === "capture" ? this.captureLifecycleSignal : undefined].filter((value): value is AbortSignal => value !== undefined);
@@ -2437,12 +2555,13 @@ export class CodexExecutor implements Executor {
       if (safety === undefined) {
         if (remaining() <= 0) return incomplete("codex capture deadline expired");
         // Use precisely the production boundary adapter, with no reconcile/provider/cache lane.
-        const registry = new ExecutionRegistry(newLocalExecutionEpoch(0));
+        const registry = new ExecutionRegistry(newLocalExecutionEpoch(0), this.lifetime);
         safety = createCodexExecutionSafety(registry,
           async () => { throw new TrustedExecutionRefusal("capture-only root lane"); },
           async () => { throw new TrustedExecutionRefusal("capture-only reconcile lane"); },
           undefined,
-          makeBoundaryProcessSpawner(this.deps.launchEffectRoot ?? productionEffectLaunch,
+          makeBoundaryProcessSpawner(
+            ((...args) => this.lifetime.admit(() => (this.deps.launchEffectRoot ?? productionEffectLaunch)(...args))) as EffectLaunch,
             this.opts.commandSandbox ?? "required", this.log), undefined, undefined,
           { reaperAttempt: () => this.captureReaperAttempt ?? this.reaperAttempt });
         this.unverifiedEpochRegistries.add(registry);
@@ -2679,19 +2798,25 @@ export class CodexExecutor implements Executor {
         ? this.ownSummaryFactory(opts.codexAdviceHarnessFactory) : undefined,
     });
     this.deps = deps;
-    this.sessionStore = deps.sessionStore ?? CodexSessionStore;
+    const sessions = deps.sessionStore ?? CodexSessionStore;
+    this.sessionStore = {
+      adopt: (...args) => this.lifetime.admit(() => sessions.adopt(...args)),
+      inspect: (...args) => this.lifetime.admit(() => sessions.inspect(...args)),
+      remove: (...args) => this.lifetime.admit(() => sessions.remove(...args)),
+      persist: (...args) => this.lifetime.admit(() => sessions.persist(...args)),
+    };
   }
 
   /** Bind only the default intent/plan runner; other advice callers retain their policy. */
   private ownSummaryFactory(build: CodexAdviceHarnessFactory): CodexAdviceHarnessFactory {
-    const factory: CodexAdviceHarnessFactory = async params => {
+    const factory: CodexAdviceHarnessFactory = params => this.lifetime.admit(async () => {
       this.assertCaptureAdmission();
       const revision = this.captureRevision;
       const deadlineAt = summaryCallDeadlines.get(params);
       if (deadlineAt === undefined) throw new TrustedExecutionRefusal("summary call deadline missing");
       const remaining = () => Math.max(0, Math.min(deadlineAt - Date.now(),
         this.captureCleanupRemaining?.() ?? Infinity));
-      const registry = new ExecutionRegistry(newLocalExecutionEpoch(0));
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(0), this.lifetime);
       const reservation = registry.reserveLaunch("provider");
       if (reservation.kind !== "reserved") throw new TrustedExecutionRefusal("summary launch admission closed");
       let launchAttempted = false;
@@ -2772,16 +2897,16 @@ export class CodexExecutor implements Executor {
         const harness = await build(params);
         ownedSummaryHarnesses.set(harness, () => registry.markLaunchCleanupUnconfirmed());
         const run = harness.run.bind(harness);
-        harness.run = async (request, policy) => {
+        harness.run = (request, policy) => this.lifetime.admit(async () => {
           try { return await run(request, policy); }
           finally { await finish(); }
-        };
+        });
         return harness;
       } catch (error) {
         await finish();
         throw error;
       }
-    };
+    });
     ownedSummaryFactories.add(factory);
     return factory;
   }
@@ -2825,8 +2950,16 @@ export class CodexExecutor implements Executor {
     this.assertCaptureAdmission();
     if (this.runActive) throw new TrustedExecutionRefusal("codex run already active");
     this.runActive = true;
+    const operation = this.opts.binding.authMode === "subscription" && !ctx.prepareCodexRootDispatch
+      ? acquireCodexOperationScope(this.opts.client, ctx.runId, ctx.claimGeneration ?? 0, {}, undefined, undefined, this.log) : undefined;
+    operation?.own();
+    if (operation) ctx = { ...ctx,
+      codexRootAdmissionActive: () => operation.controller.active(),
+      prepareCodexRootDispatch: (signal, check, kind = "root") => operation.prepare(kind,
+        AbortSignal.any([signal, ...[ctx.terminalLifecycleSignal].filter((s): s is AbortSignal => !!s)]), check),
+    };
     try { return await this.runLeg(ctx); }
-    finally { this.runActive = false; }
+    finally { operation?.close(); this.runActive = false; }
   }
 
   private async runLeg(ctx: RunContext): Promise<ExecutorResult> {
@@ -2845,6 +2978,7 @@ export class CodexExecutor implements Executor {
     let summaryResult: ExecutorResult | undefined;
     this.depsInstall = undefined;
     this.safety = undefined;
+    this.deferredFinal = undefined;
     // Everything that needs the worktree is built at the TOP of run() (the executor is
     // constructed before the claim's worktree exists).
     const binding = this.opts.binding;
@@ -3014,7 +3148,7 @@ export class CodexExecutor implements Executor {
     lifecycleSignal.addEventListener("abort", intentAbort, { once: true });
     const summaryResultAllowed = (): boolean => !lifecycleSignal.aborted
       && !ctx.cancelRequested?.() && !ctx.claimFenced?.();
-    const summaryAllowed = (): boolean => !this.captureOwners && !summaryState.closed && !this.summaryLifecycleClosed
+    const summaryAllowed = (): boolean => this.lifetime.isOpen() && !this.captureOwners && !summaryState.closed && !this.summaryLifecycleClosed
       && summaryResultAllowed();
     const summaryBinding = {
       auth_mode: binding.authMode, access_token: binding.accessToken, capability: binding.capability,
@@ -3166,7 +3300,7 @@ export class CodexExecutor implements Executor {
       const provisionAbort = new AbortController();
       this.provisionAbort = provisionAbort;
       const provisionSignal = AbortSignal.any([provisionAbort.signal, lifecycleSignal]);
-      const provisionRegistry = new ExecutionRegistry(newLocalExecutionEpoch(0));
+      const provisionRegistry = new ExecutionRegistry(newLocalExecutionEpoch(0), this.lifetime);
       const provisionRegistries = new Set([provisionRegistry]);
       let provisionClean = false;
       let provisionDeadlineAt = Date.now() + 10 * 60_000;
@@ -3303,7 +3437,7 @@ export class CodexExecutor implements Executor {
       let installDeps = this.deps.installDeps;
       if (!installDeps) {
         installerCleanupClean = false;
-        const registry = new ExecutionRegistry(newLocalExecutionEpoch(0));
+        const registry = new ExecutionRegistry(newLocalExecutionEpoch(0), this.lifetime);
         let admissionOpen = true;
         // Discovery and the sequential manager count are bounded by installJsDeps.
         // Every root also spends its original command deadline, never a renewed wait.
@@ -3456,7 +3590,7 @@ export class CodexExecutor implements Executor {
         try {
           this.assertCaptureAdmission(setupRevision);
           runCache = new HeldRunCommandCache(await this.trackEpochSetup(() => startCacheHolder(randomUUID())),
-            registry => this.completedCaptures.get(registry));
+            registry => this.completedCaptures.get(registry), this.lifetime);
         } catch (error) {
           this.log.warn("codex command cache unavailable; commands run without a shared cache", {
             error: errMessage(error),
@@ -3486,13 +3620,15 @@ export class CodexExecutor implements Executor {
       // drives `spawnBoundaryProcess`); it stays a fail-closed reject stub. The reconcile + eviction
       // closures write the SHARED released-token set and committed-generation cell, so credential
       // state is continuous across a recreation.
-      const launchEffectRoot = this.deps.launchEffectRoot ?? productionEffectLaunch;
+      const rawEffectLaunch = this.deps.launchEffectRoot ?? productionEffectLaunch;
+      const launchEffectRoot: EffectLaunch = (...args) => this.lifetime.admit(() => rawEffectLaunch(...args));
       const spawnBoundaryRoot: SpawnRootSeam =
         this.deps.spawnBoundaryRoot ??
         ((): Promise<RegisteredRoot> =>
           Promise.reject(new Error("codex boundary-action spawn seam is not wired (the runner drives spawnBoundaryProcess)")));
       const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot, commandSandbox, this.log, runCache);
       const reconcile: ReconcileBeforeBoundary = async (request, signal) => {
+        this.lifetime.assertOpen();
         const deadlineAt = Date.now() + Math.max(0, request.deadlineMs);
         await this.settleOwnedSummariesBeforeCredentials(request.deadlineMs);
         return installState.reconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - Date.now()) }, signal);
@@ -4364,7 +4500,7 @@ export class CodexExecutor implements Executor {
         for (let round = 0; ; round++) {
           // Issue #1674 (PRD #1064 parity): each report_progress observation pushes at once and emits
           // its started / reported-complete frames exactly once, diffed from the last known progress.
-          const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
+          const onProgress = makeProgressObserver(this.ownedProgressContext(ctx), latestProgress, milestones);
           // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
           const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
           const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, shared.repoInstructions, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, onProgress, round === 0 ? firstEventHandler : undefined, undefined,
@@ -4788,8 +4924,13 @@ export class CodexExecutor implements Executor {
           // reap, so re-persisting would only overwrite that generation with an empty one.
           if (beforeReapPersist) await beforeReapPersist;
           if (!reapedSinceLastPersist) await epoch.persistSession();
-          await this.tearDownEpoch(epoch.registry, epoch.harness, epoch.fileopHandle, boundaryDeadlineMs, !this.deps.deferRegistryTeardown, undefined,
+          const finalClean = await this.tearDownEpoch(epoch.registry, epoch.harness, epoch.fileopHandle, boundaryDeadlineMs, !this.deps.deferRegistryTeardown, undefined,
             epoch.safety instanceof CodexExecutionSafetyImpl ? epoch.safety : undefined);
+          // The deferred final registry stays outstanding until the runner's terminal safety.dispose
+          // proves it (see deferredFinalProven); remember the exact pair that proof must name.
+          if (this.deps.deferRegistryTeardown && finalClean && epoch.safety instanceof CodexExecutionSafetyImpl) {
+            this.deferredFinal = { registry: epoch.registry, safety: epoch.safety };
+          }
         }
         // (C) Evict the DURING-run released tokens (every epoch's provider-root launches + refreshes)
         // from the logger's secret set — AFTER the harness/transport is closed above, so no late log
@@ -4920,7 +5061,7 @@ export class CodexExecutor implements Executor {
     const codexHome = path.join(ownedDataRoot, "codex");
     this.assertCaptureAdmission(revision);
     this.epochAdmission?.();
-    const registry = new ExecutionRegistry(newLocalExecutionEpoch(epochIndex));
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(epochIndex), this.lifetime);
     setupRegistries.add(registry);
     this.unverifiedEpochRegistries.add(registry);
     // Issue #1782: the session subset is adopted into codexHome only when the provider root
@@ -4965,15 +5106,15 @@ export class CodexExecutor implements Executor {
             mode: "subscription",
             initial: { accessToken: initialToken, accountId: binding.chatgptAccountId },
             assertRefreshAdmission: () => this.assertCaptureAdmission(revision),
-            bridge: buildAppServerRefreshBridge(ctx.runId, {
+            bridge: this.lifetimeBoundRefreshBridge(buildAppServerRefreshBridge(ctx.runId, {
               refreshCodex: async (...args) => {
                 await this.settleOwnedSummariesBeforeCredentials();
                 this.assertCaptureAdmission(revision);
-                const result = await this.opts.client.refreshCodex(...args);
+                const result = await this.lifetime.admit(() => this.opts.client.refreshCodex(...args));
                 this.assertCaptureAdmission(revision);
                 return result;
               },
-            }, binding, committedGeneration, registerToken, () => vaultLock.onVaultLocked()),
+            }, binding, committedGeneration, registerToken, () => vaultLock.onVaultLocked())),
           }
         : { mode: "api_key", apiKey: initialToken };
       const appServerAuth = createCodexAppServerAuth(authConfig);
@@ -4993,7 +5134,7 @@ export class CodexExecutor implements Executor {
         LONG_COMMAND_WALL_MS,
         capturedMemory,
       );
-      const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv });
+      const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => this.lifetime.admit(() => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv }));
       // Issue #1598: least privilege: the fileop helper never runs Go or npm, so it gets no
       // `--cache` (and commandEffectSpec strips the cache variables from its env).
       const fileopRoot = await launchRegisteredEffectRoot(
@@ -5027,6 +5168,7 @@ export class CodexExecutor implements Executor {
         this.log,
       );
       try {
+        this.assertCaptureAdmission(revision);
         fileopHandle = (this.deps.wireFileop ?? wireFileopHelper)({
           stdin: fileopRoot.handle.transport.stdin,
           stdout: fileopRoot.handle.transport.stdout,
@@ -5038,7 +5180,8 @@ export class CodexExecutor implements Executor {
       }
       this.assertCaptureAdmission(revision);
       this.epochAdmission?.();
-      const fileop: FileopClient = fileopHandle.client;
+      const rawFileop = fileopHandle.client;
+      const fileop: FileopClient = { op: request => this.lifetime.admit(() => rawFileop.op(request)) };
 
       // (5) The composition cycle (harness → broker → delegation → harness) is resolved by
       // late-binding `harness`: the delegation seam captures it by reference and is only invoked
@@ -5048,7 +5191,7 @@ export class CodexExecutor implements Executor {
       // and the SHARED per-run tool-handler map. The broker enforces the plan-phase file-write ban
       // through `grants.phase`, so it MUST be phase-correct for the turn it serves; the harness
       // re-points it via useBroker before each turn.
-      const providerLaunchRoot = this.deps.launchProviderRoot
+      const rawProviderLaunchRoot = this.deps.launchProviderRoot
         ?? ((spec, authMode) => defaultLaunchProviderRoot(
           spec,
           authMode,
@@ -5058,7 +5201,12 @@ export class CodexExecutor implements Executor {
           scrubProjected,
           this.deps.launchCodexRootForTest,
         ));
+      // Own the factory call itself: a seal that closes admission while it is in flight joins it,
+      // and a call arriving after the seal is refused before the factory is invoked.
+      const providerLaunchRoot: typeof rawProviderLaunchRoot = (spec, authMode) =>
+        this.lifetime.admit(async () => rawProviderLaunchRoot(spec, authMode));
       const buildPhaseBroker = (phase: "plan" | "implement", signal?: AbortSignal): CodexCallbackBroker => {
+        this.assertCaptureAdmission(revision);
         const runPlan = buildCodexRunPlan(
           this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal, selection.current, repoInstructions),
         );
@@ -5072,7 +5220,7 @@ export class CodexExecutor implements Executor {
           registry,
           roles: runPlan.roles,
           startChildTurn: (spec: StartChildTurnSpec) =>
-            this.startChildTurn(harness!, provider, worktreePath, spec, childInterruptDeadlineMs(boundaryDeadlineMs)),
+            this.startChildTurn(harness!, provider, worktreePath, spec, childInterruptDeadlineMs(boundaryDeadlineMs), ctx),
           spawnCommand,
           fileop,
           worktreePath,
@@ -5111,6 +5259,7 @@ export class CodexExecutor implements Executor {
       // command identity out of the dedicated session-reader path. The staging tree is gone before
       // the harness can send initialize or any model-bearing request.
       const providerLaunchSeam: LaunchRootSeam = async (spec) => {
+        this.assertCaptureAdmission(revision);
         if (this.providerLaunchInjected()) {
           // Unit seams own a synthetic filesystem and retain the direct adopt call so
           // their established control-flow timing and session-operation evidence stay
@@ -5317,8 +5466,8 @@ export class CodexExecutor implements Executor {
           registryClean &&= registry.acceptsTerminalDisposal(terminalDisposal);
         } catch { registryClean = false; }
       }
-      try { await harness?.close(); } catch { registryClean = false; }
-      try { await fileopHandle?.dispose(); } catch { registryClean = false; }
+      try { await harness?.close(); } catch { registryClean = false; this.lifetime.distrust(); }
+      try { if (fileopHandle) await this.lifetime.retain(fileopHandle.dispose()); } catch { registryClean = false; }
       // Closing transports can add poison too. Disposal alone never launders it.
       registryClean &&= !disposeRegistry || (registry.state() === "disposed" && (!registry.isPoisoned() || captureClean()));
       registryClean &&= !disposeRegistry || (terminalDisposal !== undefined && registry.acceptsTerminalDisposal(terminalDisposal));
@@ -5431,15 +5580,18 @@ export class CodexExecutor implements Executor {
     // Issue #1789: a mid-turn vault-locked refresh deferral trips THIS turn the same way.
     vaultLock.activeTurnTrip = trip;
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const accountAdmissionActive = (): boolean => ctx.codexRootAdmissionActive?.() ?? !!ctx.prepareCodexRootDispatch;
+    let startupResumed = !accountAdmissionActive();
     let currentTurnCallbacks = registry.inFlightCallbackCountSince(callbackCursor);
     const armIdle = (): void => {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = undefined;
       currentTurnCallbacks = registry.inFlightCallbackCountSince(callbackCursor);
-      if (currentTurnCallbacks > 0) return;
+      if (!startupResumed || currentTurnCallbacks > 0) return;
       idleTimer = setTimeout(() => trip(REASON_IDLE), idleMs);
       idleTimer.unref?.();
     };
+    armIdle();
     const unsubscribeCallbacks = registry.subscribeCallbacks(() => {
       if (registry.inFlightCallbackCountSince(callbackCursor) !== currentTurnCallbacks) armIdle();
     });
@@ -5474,9 +5626,45 @@ export class CodexExecutor implements Executor {
     try {
       harness.useBroker(buildPhaseBroker(phase, AbortSignal.any([turnAbort.signal, effectsAbort.signal])));
       if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
-      armIdle();
       if (beforeDispatch) prompt = beforeDispatch(prompt);
+      const captureRevision = this.captureRevision;
+      let sourceGuard: (() => boolean | void) | undefined;
+      const checkDispatch = (): void => {
+        if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
+        turnAbort.signal.throwIfAborted();
+        if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+        if (accountAdmissionActive() && (ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted))
+          throw new CodexRequestFailure("parent_abort");
+        this.assertCaptureAdmission(captureRevision);
+        if (registry.state() !== "open") throw new CodexRequestFailure("parent_abort");
+        assertResidueQuarantineOpen("provider_turn");
+      };
+      const dispatch = {
+        prepare: async (): Promise<void> => {
+          startupResumed = !accountAdmissionActive();
+          armIdle();
+          sourceGuard = undefined;
+          checkDispatch();
+          const waiting = new AbortController();
+          this.rootAdmissionWaits.add(waiting);
+          try {
+            sourceGuard = await ctx.prepareCodexRootDispatch?.(
+              AbortSignal.any([turnAbort.signal, waiting.signal]), checkDispatch);
+          } finally { this.rootAdmissionWaits.delete(waiting); }
+          sourceGuard?.();
+          checkDispatch();
+        },
+        check: (): boolean => {
+          const valid = sourceGuard?.();
+          checkDispatch();
+          if (valid === false) return false;
+          startupResumed = true;
+          armIdle();
+          return true;
+        },
+      };
       const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
+      request.rootDispatch = dispatch;
       let turn = harness.startTurn(request);
       let events = turn.events[Symbol.asyncIterator]();
       let first = await (async () => {
@@ -5491,7 +5679,9 @@ export class CodexExecutor implements Executor {
             text: "the earlier Codex session was rejected by the provider — continuing WITHOUT its earlier context, so some work may be repeated",
             event: "resume_lineage_break",
           } });
-          turn = harness.startTurn(this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck));
+          const fallback = this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
+          fallback.rootDispatch = dispatch;
+          turn = harness.startTurn(fallback);
           events = turn.events[Symbol.asyncIterator]();
           return events.next();
         }
@@ -5551,6 +5741,10 @@ export class CodexExecutor implements Executor {
           : { original: new Error("codex run failed: unknown") };
         throw thrown.original;
       }
+      // A child/advice admission failure cannot carry owner feedback to this
+      // stack. Recheck the lead-owned source before accepting its candidate.
+      // Ignore permit expiry here: it gates the next send, not completed work.
+      sourceGuard?.();
       // (d) clean terminal / exhausted.
       const end: TurnStreamEnd = sawTerminal && terminal ? { kind: "terminal", terminal } : { kind: "exhausted" };
       result = reducer.finish(end).result;
@@ -5687,7 +5881,7 @@ export class CodexExecutor implements Executor {
     pauseNow: CodexPauseNowState,
     recreateEpoch: () => Promise<ProviderEpoch>,
     completion?: { history: CompletionHistory; attempted: () => boolean },
-    onProgress: (progress: MilestoneProgress) => void = forwardProgress(ctx),
+    onProgress: (progress: MilestoneProgress) => void = forwardProgress(this.ownedProgressContext(ctx)),
     onFirstEvent?: () => void,
     idleOperation?: () => Promise<ReducedTurnResult>,
     beforeDispatch?: (prompt: string) => string,
@@ -6073,6 +6267,7 @@ export class CodexExecutor implements Executor {
     workspace: string,
     spec: StartChildTurnSpec,
     interruptDeadlineMs: number,
+    ctx: RunContext,
   ): Promise<ChildThreadController> {
     return (async (): Promise<ChildThreadController> => {
       // Start a CHILD thread on the SAME app-server transport as the root (same untrusted
@@ -6113,6 +6308,23 @@ export class CodexExecutor implements Executor {
         };
         if (spec.model !== undefined) turnParams.model = spec.model;
         if (spec.effort !== undefined) turnParams.effort = spec.effort;
+        const revision = this.captureRevision;
+        const check = (): void => {
+          spec.signal?.throwIfAborted();
+          if (ctx.cancelRequested?.() || ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted)
+            throw new CodexRequestFailure("parent_abort");
+          this.assertCaptureAdmission(revision);
+          assertResidueQuarantineOpen("provider_turn");
+        };
+        let permit: (() => boolean | void) | undefined;
+        const waiting = new AbortController();
+        this.rootAdmissionWaits.add(waiting);
+        try {
+          do {
+            permit = await ctx.prepareCodexRootDispatch?.(AbortSignal.any([waiting.signal, ...(spec.signal ? [spec.signal] : [])]), check, "child");
+            check();
+          } while (permit?.() === false);
+        } finally { this.rootAdmissionWaits.delete(waiting); }
         admissionAttempt = harness.beginAdmissionAttempt(childThreadId);
         const turnRes = await harness.requestOnTransport<{ turn?: { id?: string } }>("turn/start", turnParams, { signal: spec.signal });
         const id = turnRes?.turn?.id;
@@ -6144,8 +6356,7 @@ export class CodexExecutor implements Executor {
         // is bounded by the transport's own short deadline instead (childInterruptDeadlineMs).
         interrupt: async (): Promise<void> => {
           await harness
-            .requestOnTransport(
-              "turn/interrupt",
+            .interruptOnTransport(
               { threadId: childThreadId, turnId: childTurnId },
               { deadlineMs: interruptDeadlineMs },
             )
@@ -6533,6 +6744,7 @@ export class HeldRunCommandCache implements RunCommandCache {
   constructor(
     holder: CommandCacheHolder,
     private readonly completedCapture?: (registry: ExecutionRegistry) => CompletedCredentialFreeCapture | undefined,
+    private readonly lifetime?: ExecutorLifetime,
   ) {
     this.holder = holder;
   }
@@ -6624,18 +6836,43 @@ export class HeldRunCommandCache implements RunCommandCache {
       try {
         if (alive) {
           const result = await this.holder.release(drained, waits.releaseMs);
+          this.observeCleanup(result);
           logCacheOutcome(log, "codex command cache released", token, drained, result);
         } else if (drained) {
           const result = await remove(token, waits.removeMs);
+          this.observeCleanup(result);
           logCacheOutcome(log, "codex command cache removed after holder loss", token, drained, result);
         } else {
+          this.lifetime?.distrust();
           log.warn("codex command cache retained for the startup reaper", { cache: token, drained, reason: "holder lost" });
         }
       } catch (error) {
+        this.lifetime?.distrust();
         log.warn("codex command cache settle failed; retained for the startup reaper", { cache: token, error: errMessage(error) });
       }
     })();
+    this.lifetime?.retain(this.settling);
     return this.settling;
+  }
+
+  /**
+   * A `pending` result's `settlement` is the helper's ACTUAL settlement and has no deadline: release waits
+   * for the holder channel to close, and remove waits for the helper process, which is never killed. It is
+   * retained deliberately, unbounded: a release/remove timeout never counts as settlement, never permits
+   * source-use demotion, and never enables conflicting reuse while source-capable work is unresolved. The
+   * cost is that a helper that never settles keeps the lifetime seal, and so this execution reservation,
+   * pending indefinitely, which the approved #3404 plan (disclosure 4) accepts for cleanup tails. Bounding
+   * it as unproven delivery needs an owner decision on the source-lease and reservation consequences.
+   */
+  private observeCleanup(result: CacheCleanupResult): void {
+    if (!this.lifetime) return;
+    if (result.state === "pending" && result.settlement) {
+      this.lifetime.retain(result.settlement.then(actual => {
+        if (actual.state !== "removed" && actual.state !== "absent") this.lifetime!.distrust();
+      }, () => this.lifetime!.distrust()));
+    } else if (result.state !== "removed" && result.state !== "absent") {
+      this.lifetime.distrust();
+    }
   }
 }
 

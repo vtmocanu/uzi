@@ -847,6 +847,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/memory/outcome", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/refresh", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/admission-signal", noLimiter},
+	{"POST", "/api/worker/runs/{id}/codex/operation-admission", noLimiter},
 	// Authenticated, run-scoped advisory telemetry: no forge call or token spend.
 	{"POST", "/api/worker/runs/{id}/forge-clone-success", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/release", noLimiter},

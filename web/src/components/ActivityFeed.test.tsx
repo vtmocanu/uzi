@@ -190,13 +190,15 @@ function renderFeed(
     connected?: boolean;
     harness?: Run["harness"];
     is_revising?: boolean;
+    account_cooldown_class?: Run["account_cooldown_class"];
+    account_cooldown_eligible_at?: string;
   } = {},
 ) {
   const { status = "running", health = "ok", connected = true, harness = "claude", is_revising } = opts;
   return render(
     <ActivityFeed
       messages={messages}
-      run={runFixture({ status, health, harness, is_revising })}
+      run={runFixture({ status, health, harness, is_revising, account_cooldown_class: opts.account_cooldown_class, account_cooldown_eligible_at: opts.account_cooldown_eligible_at })}
       runningLive={status === "running"}
       connected={connected}
       terminal={TERMINAL.includes(status)}
@@ -1642,4 +1644,15 @@ describe("m2 cap accounting exclusion", () => {
     expect(r.queryByText("ghost")).toBeNull();
     expect(JSON.stringify(messages)).toBe(source);
   });
+});
+
+
+it("active crew waits calmly for positive account cooldown and does not infer it from advice on a wall warning", () => {
+  const fields = { account_cooldown_class: "overload" as const, account_cooldown_eligible_at: new Date(Date.now() + 60_037).toISOString() };
+  const first = renderFeed([m(1, "text", { text: "last output" }, "lead")], { health: "waiting_account_cooldown", ...fields });
+  expect(first.getByTitle("lead: waiting")).toBeTruthy();
+  expect(first.queryByTitle("lead: working")).toBeNull();
+  first.unmount();
+  const fault = renderFeed([m(1, "text", { text: "last output" }, "lead")], { health: "slow", ...fields });
+  expect(fault.getByTitle("lead: working")).toBeTruthy();
 });

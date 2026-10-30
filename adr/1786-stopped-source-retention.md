@@ -80,9 +80,13 @@ custody, receipts, memory settlement, fencing and cancellation still veto releas
 Current-process completion sources record exact executor/facade in memory before
 durable bind. KnownCodex missing/non-disposed/swapped proof retains before inventory
 and never falls back to legacy inspection. KnownClaude is unchanged. Owner decision
-2026-10-24 narrows R1857-02(e): persisted/unknown-provenance sources keep today's
-behavior for both harnesses, with no prior-process topology proof or durable format
-change. See the [canonical C contract](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+2026-10-24 narrowed R1857-02(e): persisted/unknown-provenance sources kept the
+pre-C behavior for both harnesses. **Superseded by #3404 (2026-10-27):** after a
+restart such a source is released only when durable published authority proves it
+(`forgetCompletedGeneration` / `verifyDurableRetirement` in `agent/src/recovery.ts`);
+legacy and unproven sources are retained until guarded operator discard (see the
+[#3404 amendment](1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement)).
+See the [canonical C contract](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
 C strengthens registered processes; Docker accepted-but-invisible creates (#1860),
 unregistered/daemon/sibling writers and Claude terminal residuals remain.
 Per-attempt cgroups (#1862) are not supplied. #1858 grants no automatic reclaim, and #2746 custody SETTLE remains
@@ -491,8 +495,12 @@ Every case keeps the source. What a later run sees depends on where the failure 
 - **Deferred beyond C:** general writer exclusion that would let a covered stopped
   clone be released again. C adds registered-process terminal proof without
   broadening stopped/park deletion authority. Docker and unregistered/sibling
-  writers, Claude terminal residuals and unknown-provenance completion sources
-  remain outside that strengthening (#2852); safe Docker reclaim is not supplied. Persisting the coverage verdict into inspect
+  writers and Claude terminal residuals remain outside that strengthening (#2852);
+  unknown-provenance completion sources were also outside it when this was written.
+  **Superseded by #3404 (2026-10-27) for the latter:** they are now retained after
+  a restart unless durable published authority proves them (see the
+  [#3404 amendment](1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement));
+  safe Docker reclaim is not supplied. Persisting the coverage verdict into inspect
   output is also not done; today it is in the worker log only. Decision: PRD
   `prds/done/1786-preserve-worker-only-work.md`, Decision 6 (lander and reviewer).
 - **Not shipped:** teardown of attributed containers is not proven by tests or hosted

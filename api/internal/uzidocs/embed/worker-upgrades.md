@@ -20,7 +20,13 @@ by watching the pod rather than by asking the worker.
 
 For `codex_account_admission_signal_v1`, upgrade the API before workers.
 Older workers obey the server claim gate but provide less pressure evidence;
-missing or refused telemetry does not change run lifecycle behavior.
+missing or refused telemetry does not change run lifecycle behavior. This
+best-effort reporting is distinct from independently negotiated
+`codex_account_operation_admission_v1`: once engaged, loss of the admission
+service blocks the next supported model dispatch, even without a known
+cooldown. Already dispatched turns and preservation continue under existing
+controls and deadlines. Never-negotiated flights keep legacy behavior;
+engaged flights cannot downgrade on feature loss or re-registration.
 Operators: see [upgrade, rollback and reporting limits](installation.md#codex-account-admission-upgrades).
 The [account admission policy](rate-limits.md#temporary-account-admission-waits)
 is shared across aliases and adds no account seat limit.
@@ -45,6 +51,18 @@ fall back only at exactly the claim revision (default 1). A different
 revision without scope holds closed. Upgrade both components for current
 scope rendering; see [Completion holds](run-completion-hold.md).
 
+## Completion-source authority (#3404)
+
+Cut over with the old workers quiesced. A worker publishing a completed source
+writes a fence into the bare repository's recovery journal, and an older worker
+refuses to attach, recover or discard a journal that carries it. Rolling a worker
+back therefore leaves those sources unreachable until a current worker runs
+again. A worker that predates #3404 takes no data-directory lock, so old workers
+must be quiesced before cutover: of two current workers on one data directory,
+the second one started refuses to start. Changing the worker join token on a reused data volume leaves
+existing authority records unauthenticated, so their sources are retained. See
+[Completed sources after a worker restart](run-recovery.md#completed-sources-after-a-worker-restart).
+
 ## Refresh publication context (#3120)
 
 Roll the API and workers together for `refresh_publication_context_v1`.
@@ -53,15 +71,16 @@ successful pushed SHA, including on legacy non-interlocked runs. The API stores
 an immutable `runs.source_publication_intent` stamp in the same transaction
 as successful issue completion, independently of recovery inventory or permit
 negotiation. It does not stamp before push. A rejected or rolled-back initial
-completion creates no stamp; without other affirmative evidence, a later
-refresh is unknown. A lost commit acknowledgement can leave completion and the stamp
+completion creates no stamp and leaves the source non-completed; absent
+affirmative restriction evidence a later refresh refuses. A lost commit acknowledgement can leave completion and the stamp
 durable; exact terminal replay validates that paired outcome.
 
 MR rework and pipeline-branch-adopting CI fix on new workers require the
-negotiated feature and authenticated resolver; absence or unknown authority
-refuses publication. Closing needs the terminal stamp. Historical affirmative
-non-closing evidence can restrict without one, but historical publications
-receive no backfill. Old workers retain their earlier publication behavior;
+negotiated feature and an authenticated resolver; a new worker without the
+negotiated feature, or a resolver that answers unknown, refuses publication. Closing needs the
+terminal stamp. Historical affirmative non-closing evidence can restrict
+without one, and a completed issue source without a stamp refreshes as
+non-closing (#3420); historical publications receive no backfill. Old workers retain their earlier publication behavior;
 new workers against old APIs refuse affected refreshes. Source-issue runs
 retain their earlier compatibility behavior until both components are upgraded.
 Neither release badges nor an API-only upgrade prove these refresh pushes are guarded. Pull/merge request text grants no authority.
@@ -77,6 +96,16 @@ On application rollback, preserve the nullable evidence column and its
 recorded values. Migration 349 Down drops the column and loses the evidence;
 re-applying Up cannot reconstruct closing proof. Migration 350 Down retains
 the validated constraint. Old binaries can leave the column unused.
+
+After upgrading, pull requests from completed issue runs without a stamp
+rework as non-closing, including sources completed by an old worker during the
+rollout. The API logs `publication_context_unstamped_fallback` (run and source
+run IDs) at Info when it uses this fallback. A refusal shows its reason, for
+example `(publication_unproven)`, in `refresh publication refused: source
+context could not be confirmed (<reason>)`. A pull request whose branch commits
+close the issue is still refused: the owner must remediate those commits
+outside the worker. A refresh does not edit a `Closes #N` in the pull request
+body outside uzi's region, so merging can still close the issue.
 See [Completion holds](run-completion-hold.md#refreshing-an-existing-publication-3120)
 for refusal, recovery and Forgejo/Gitea boundaries. This rollout does not
 activate semantic completion or establish live deployment acceptance.

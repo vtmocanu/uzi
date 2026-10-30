@@ -253,7 +253,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		FailureReason: textPtrValue(r.FailureReason.Valid, r.FailureReason.String),
 		StopKind:      textPtrValue(r.StopKind.Valid, r.StopKind.String),
 		StopReason:    textPtrValue(r.StopReason.Valid, r.StopReason.String),
-		Health:        r.Health,
+		Health:        withoutAccountCooldownHealth(r.Health),
 		HealthReason:  withoutCodexAdmissionReason(textPtrValue(r.HealthReason.Valid, r.HealthReason.String)),
 		HealthSince:   timePtr(r.HealthSince.Valid, r.HealthSince.Time),
 		// PRD #3522: the weekly-usage-reserve reason, only while the run is queued (the marker
@@ -755,6 +755,7 @@ func queueReasonPtr(s string) *string {
 // One batched read covers the supplied queued runs. A failed read is logged and leaves
 // the projection absent; persisted cooldown reasons have already been stripped.
 func (h *Handler) overlayQueueReasons(ctx context.Context, dtos ...*apitypes.RunDTO) {
+	h.overlayAccountCooldowns(ctx, dtos...)
 	if h.q == nil {
 		return
 	}
@@ -893,7 +894,7 @@ func memoryHoldDTO(r store.Run) *apitypes.MemoryHoldDTO {
 
 // withoutCodexAdmissionReason clears persisted cooldown text even after the projection expires.
 func withoutCodexAdmissionReason(reason *string) *string {
-	if reason != nil && apitypes.IsCodexAdmissionReason(*reason) {
+	if reason != nil && (apitypes.IsCodexAdmissionReason(*reason) || *reason == apitypes.AccountCooldownReason) {
 		return nil
 	}
 	return reason

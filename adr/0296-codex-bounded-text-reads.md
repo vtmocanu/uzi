@@ -30,9 +30,11 @@ numbers are bad_args. Presence of either property is an explicit range, includin
 an explicitly supplied default. An explicitly present undefined is invalid.
 
 Registry admission, grants, replay, secret-path checks and worktree/no-symlink
-guards remain authoritative. Range arguments never reach the helper. It still
-reads the whole allowed file and denies files over 1 MiB; this change is not a
-larger-file reader or a Go protocol change.
+guards remain authoritative. In the original #296 implementation, range arguments
+never reached the helper: it read the whole allowed file and denied files over
+1 MiB. That milestone did not add a larger-file reader or change the Go protocol.
+[ADR 3073](3073-bounded-ranged-reads.md) supersedes this historical restriction
+only for the oversize fallback described below.
 
 ## Helper success validation
 
@@ -77,6 +79,24 @@ remain after the returned excerpt because of line/byte limits. Skipping earlier
 lines alone does not set it. Exact EOF, empty files and past EOF are false unless
 the helper flag is true. No continuation cursor is promised: a partially returned
 line cannot be resumed using a line offset alone.
+
+## Oversize fallback addendum (#3073)
+
+[ADR 3073](3073-bounded-ranged-reads.md) adds one read_range request after an
+explicit range and a helper-origin E_OVERSIZE from the ordinary read. The client
+mints provenance for a correlated helper error; wire origin and local failures
+do not authorize fallback. Ordinary read success retains the whole-body validation,
+binary classification and excerpt contract above; unranged oversize reads remain
+denied.
+
+The fallback independently reopens through the helper's confinement and returns
+the second descriptor's data and metadata. Its 8 MiB actual-read budget and 64 KiB
+output cap permit text prefixes from larger files. UTF-8/NUL validation covers
+skipped and selected bytes through a deterministic prefix frontier, excluding the
+unread tail; this exception applies to fallback alone. Incomplete results add
+scan_budget metadata and count as limit activity rather than successful cross-check
+read evidence. ADR 3073 defines the frontier, budgets, two-open consistency and
+cooperative deadline limits; it does not promise a file snapshot.
 
 ## Validation and scope
 

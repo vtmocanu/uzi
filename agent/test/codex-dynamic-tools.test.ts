@@ -138,6 +138,9 @@ describe("buildCodexDynamicTools: worker-owned app-server callback surface", () 
     });
     assert.deepEqual(spec.inputSchema.anyOf, [{ required: ["path"] }, { required: ["file_path"] }]);
     assert.equal(spec.inputSchema.required, undefined);
+    assert.match(spec.description, /explicit offset or limit allows one fallback after a helper oversize refusal/);
+    assert.match(spec.description, /8 MiB.*64 KiB.*incomplete:true.*scan_budget/);
+    assert.match(spec.description, /not a snapshot of concurrent changes/);
     assert.equal(spec.inputSchema.additionalProperties, false);
   });
 

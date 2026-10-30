@@ -52,6 +52,7 @@ import {
   reserveQueueText,
   RESERVE_RESUME_CONFIRM,
   codexAdmissionText,
+  accountCooldownText,
   displayHealthReason,
   queuedBlockerPrecedesCodexAdmission,
   isStoppedRun,
@@ -345,6 +346,7 @@ export function HealthFlag({ run }: { run: Run }) {
   const reserve = !maintenance && isReserveQueued(run);
   const admission = codexAdmissionText(run, now);
   const primaryAdmission = !maintenance && !reserve && !queuedBlockerPrecedesCodexAdmission(run) ? admission : null;
+  const cooldown = accountCooldownText(run, now);
   const reason = displayHealthReason(run);
   const show = !maintenance && !reserve && !primaryAdmission && shouldShowHealthFlag(run.health, run.status);
   const queueAdvice = !maintenance && !reserve && !primaryAdmission && !show && run.status === "queued" ? reason : null;
@@ -372,12 +374,13 @@ export function HealthFlag({ run }: { run: Run }) {
     ? maintenanceQueueText(maintenanceReason)
     : reserve
       ? reserveQueueText(run.reserve_hold_reason)
-      : primaryAdmission ?? (show
+      : cooldown ?? primaryAdmission ?? (show
         ? (healthFlagLabel(run.health) ?? "")
         : queueAdvice ?? "");
   return (
     <>
       {queueAdvice && <span className="text-xs text-warn">{queueAdvice}</span>}
+      {cooldown && <span className="text-xs text-info">{cooldown}</span>}
       {primaryAdmission && (
         <span data-queue-reason={run.queue_reason} className="text-xs text-info">{primaryAdmission}</span>
       )}
@@ -2501,7 +2504,7 @@ export function RunView() {
               <span ref={statusRef} tabIndex={-1} className="rounded-md focus-visible:ring-2 focus-visible:ring-brand/60 focus:outline-none">
                 {pillStatus === "provider_unavailable" || pillStatus === "provider_outage"
                   ? <Badge tone="warning" dot>{parkLabel(run)}</Badge>
-                  : <StatusPill status={pillStatus} recovery_wait_cause={run.recovery_wait_cause} recovery_retry_not_before={run.recovery_retry_not_before} />}
+                  : <StatusPill health={run.health} status={pillStatus} recovery_wait_cause={run.recovery_wait_cause} recovery_retry_not_before={run.recovery_retry_not_before} />}
               </span>
               {/* PRD #320 M6: the queue-priority pill + the owner's Expedite/undo action.
                   Both are QUEUED-ONLY (the pill self-hides on any other status; the action

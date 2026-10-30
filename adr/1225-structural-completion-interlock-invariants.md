@@ -256,12 +256,14 @@ request IID and published head atomically with successful issue completion.
 Legacy non-interlocked issue runs are supported. This evidence is independent
 of recovery-inventory and completion-permit negotiation, grants no custody
 release, and has no pre-push writer. A rejected or rolled-back initial
-completion creates no stamp. A lost commit acknowledgement can leave completion and the stamp
-durable; exact terminal replay validates that paired outcome.
-Without affirmative restriction evidence, missing proof yields unknown even
-after a successful push. Historical affirmative non-closing evidence can
-restrict without a stamp; absence cannot authorize closing. No historical
-backfill is performed.
+completion creates no stamp and leaves the source non-completed. A lost commit
+acknowledgement can leave completion and the stamp durable; exact terminal
+replay validates that paired outcome.
+Missing proof never establishes closing authority. A non-completed source
+without affirmative restriction evidence yields unknown even after a
+successful push, and refuses. A completed source without a stamp refreshes
+as non-closing (#3420 addendum below). Historical affirmative non-closing
+evidence can restrict without a stamp. No historical backfill is performed.
 
 The worker resolves initially and again at each exact-candidate push attempt,
 including network retries and alignment/bridge candidates. Immutable source
@@ -381,6 +383,44 @@ Another source of a completion attempt joins the lead's `signal_done`, the permi
 **Accepted residuals.** The #281 identical-text detector exists only in the Claude executor; the residual and the "#281 stops route to the hold" bullet apply to Claude only. On an eligible Claude run the older #281 detector (identical-text based; it ignores tool calls) can still reach its streak first and fail the run before any attempt exists when its streak runs ahead of the stall counter, for example a tool-calling turn with identical text followed by two tool-free turns. This addendum does not close that gap. Separately, an in-place restarted (aborted) turn (credential give-up, declined pause, refused wall park) neither counts as a stall turn nor resets the streak; fingerprint equality still bounds it.
 
 User-facing behavior is described in [Completion holds](../docs/run-completion-hold.md).
+
+## Addendum — completed unstamped sources refresh as non-closing (2026-10-29, #3420)
+
+Compatibility-policy change to the #3120 resolver. Missing proof still never
+establishes closing authority, but it no longer always yields unknown. An
+issue source that is completed and not report-only, with validated identity,
+ancestry and contract authority and no stamp or affirmative restriction,
+resolves `non_closing` with `source_publication: null`: the same wire shape as
+an affirmative-restriction non-closing result. Rework and CI fix of such a
+source proceed with the non-closing commit-history scan.
+
+- **Still refused.** Unrestricted non-completed sources (failed, running,
+  cancelled, including rejected or rolled-back completions) and unresolved or
+  invalid authority without independently sufficient affirmative restriction
+  evidence. Existing affirmative restrictions keep their path; valid stamped
+  closing and non-closing results and malformed or inconsistent stamp
+  semantics are unchanged.
+- **Keyed on "completed without a stamp", never on age.** This covers sources
+  completed by an old worker during a mixed rollout and any other writer that
+  completes without a stamp. Age is never inferred from a null stamp.
+- **Commit history still refuses.** An old PR whose branch history
+  (default-branch..candidate, including already-published commits) contains
+  `Closes #N` or an equivalent for the source issue is refused even on a
+  no-change rework. The owner must remediate those directives outside the
+  worker; the guard does not rewrite history.
+- **Body text is a separate boundary.** A refresh neither adds nor strips a
+  pre-existing `Closes #N` in PR body text outside uzi's owned region, so
+  merging such a PR can still close the issue.
+- **No retroactive proof.** No backfill, history rewrite, migration or proof of
+  completion is added, and this does not make every historical PR reworkable.
+- **Observability.** Each successful fallback resolution is logged at Info as
+  `publication_context_unstamped_fallback` (run and source run IDs), after
+  forge verification and the final snapshot recheck. The worker refusal
+  diagnostic now names the validated reason from an allowlisted enum, for
+  example `(publication_unproven)`; transport, malformed, unrecognized-reason
+  and identity-change failures carry no parenthetical.
+- **Negotiation unchanged.** A new worker against an old API still refuses
+  affected refreshes; old workers keep their earlier behavior.
 
 ## Semantic default-on amendment: semantic auditing did not ship (2026-10-17, #1230/#1231; status updated 2026-10-24)
 

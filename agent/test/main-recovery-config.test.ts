@@ -11,7 +11,7 @@ import { nullLogger } from "./helpers.js";
 
 test("startup uses the live worker GitCache factory", () => {
   const main = fs.readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
-  assert.match(main, /const git = buildWorkerGitCache\(config, log, \(runId\) => outbox\.hasPhysicalTerminalProtection\(runId\)\)/);
+  assert.match(main, /const git = buildWorkerGitCache\(config, log, \(runId\) => outbox\.hasPhysicalTerminalProtection\(runId\), authority\)/);
   assert.equal((main.match(/new GitCache\(/g) ?? []).length, 1);
 });
 
@@ -62,7 +62,10 @@ for (const override of [undefined, "4096", "1"]) {
         UZI_DATA_DIR: fx.dataDir, UZI_RECOVERY_DECODED_LIMIT_BYTES: override });
       const protectedRuns: string[] = [];
       const protection = async (runId: string) => { protectedRuns.push(runId); return runId === "protected"; };
-      const cache = buildWorkerGitCache(config, nullLogger(), protection);
+      const refuse = async (): Promise<never> => { throw new Error("hooks are not exercised by this test"); };
+      const cache = buildWorkerGitCache(config, nullLogger(), protection, {
+        hooks: { admitSourceUse: refuse, beginBareMutation: refuse, assertBareClear: refuse, beginDestructive: refuse },
+      });
       const expected = override === undefined ? 8589934592 : Number(override);
       assert.equal(cache.recoveryDecodedLimitBytes, expected, "startup effective cap");
       const internals = cache as any;

@@ -73,7 +73,7 @@ func settingsCrossCheckRows(s apitypes.UserSettingsDTO) [][]string {
 					crossCheckPlain(strOr(cell.WorkerDefaultModel, modelDefault)),
 					crossCheckPlain(strOr(cell.ResolvedModel, modelDefault)),
 					crossCheckSource(&cell.ModelSource), settingsStoredPin(cell.Effort),
-					crossCheckPlain(cell.ResolvedEffort), crossCheckSource(&cell.EffortSource),
+					crossCheckPlain(cell.ResolvedEffort), crossCheckEffortSource(&cell.EffortSource),
 				})
 				break
 			}

@@ -44,17 +44,51 @@ func TestInputReceiptsMigrationDownLiveDB(t *testing.T) {
 	}
 	pending, acked, applied := insert(false, false), insert(true, false), insert(true, true)
 
+	var viewBefore string
+	if err := pool.QueryRow(ctx, `SELECT pg_get_viewdef('codex_active_run_cooldown'::regclass)`).Scan(&viewBefore); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := tx.Rollback(ctx); err != nil {
+			t.Errorf("rollback migration replay: %v", err)
+			return
+		}
+		var viewAfter string
+		if err := pool.QueryRow(ctx, `SELECT pg_get_viewdef('codex_active_run_cooldown'::regclass)`).Scan(&viewAfter); err != nil {
+			t.Error(err)
+		} else if viewAfter != viewBefore {
+			t.Error("rollback did not restore codex_active_run_cooldown definition")
+		}
+		if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM run_user_inputs WHERE id=$1 AND applied_at IS NOT NULL`, applied); n != 1 {
+			t.Error("rollback did not restore the applied input's applied_at")
+		}
+	}()
+	exec := func(stmt string) {
+		t.Helper()
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Undo the modern view dependency before replaying 00254; rollback restores it.
+	exec(`DROP VIEW codex_active_run_cooldown`)
 	for _, stmt := range migrationDownStatements(t, "00254_input_receipts.sql") {
-		mustExec(ctx, t, pool, stmt)
+		exec(stmt)
 	}
 	for id, wantConsumed := range map[int64]bool{pending: false, acked: false, applied: true} {
-		n := scalarInt(ctx, t, pool, `SELECT count(*) FROM run_user_inputs WHERE id=$1 AND consumed_at IS NOT NULL`, id)
+		var n int64
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM run_user_inputs WHERE id=$1 AND consumed_at IS NOT NULL`, id).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
 		if (n == 1) != wantConsumed {
 			t.Errorf("after Down input %d consumed=%v, want %v", id, n == 1, wantConsumed)
 		}
 	}
 	for _, stmt := range migrationUpStatements(t, "00254_input_receipts.sql") {
-		mustExec(ctx, t, pool, stmt)
+		exec(stmt)
 	}
 }
 

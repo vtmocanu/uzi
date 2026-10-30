@@ -334,6 +334,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Code cross-check reviews delivery criteria and environment effects ([#3167](https://github.com/vtmocanu/uzi/pull/3167), [#3569](https://github.com/vtmocanu/uzi/pull/3569)).**
   The advisory checker receives frozen milestones, reports missing or unverifiable criteria after defects, and evaluates validation overrides by their actual effects.
 
+- **Unpinned cross-checkers default to high effort ([#3165](https://github.com/vtmocanu/uzi/pull/3165), [#3602](https://github.com/vtmocanu/uzi/pull/3602)).**
+  Plan and Code checkers of either family use `high` with source `cross-check default` unless a checker effort is pinned; worker effort defaults are unchanged.
+
+- **Completed sources are retired after a worker restart only on durable, authenticated proof ([#3404](https://github.com/vtmocanu/uzi/pull/3404), [#3577](https://github.com/vtmocanu/uzi/pull/3577)).**
+  A worker now holds an exclusive lifetime lock on its data directory, records each source use and its completion proof in authenticated storage, and after a restart retires a completed clone only when that proof, the recovery records and the bare-journal fence all match; legacy or unproven sources are kept for guarded operator discard, and the worker refuses to start without util-linux flock, an ext4/XFS data volume or a normalized absolute data path; a data path reached through a symlinked parent or alias starts but refuses every protected source operation until it is the canonical real path.
+
 ### Added
 
 - **Healthy busy workers no longer show custody attention.**
@@ -497,6 +503,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Weekly usage reserve holds new work and pauses running runs at a per-user 7-day threshold ([#3522](https://github.com/vtmocanu/uzi/pull/3522), [#3568](https://github.com/vtmocanu/uzi/pull/3568)).**
   Set it with `uzi settings reserve` or `PUT /api/me/usage-reserve`; it is best effort, not a cap, and unknown readings (such as console API keys or a disabled usage poller) hold new work, while after a rollback reserve-paused runs need a manual resume.
+
+- **Admins can dismiss recovery-storage attention warnings locally ([#3589](https://github.com/vtmocanu/uzi/pull/3589), [#3598](https://github.com/vtmocanu/uzi/pull/3598)).**
+  Opted-in owner warnings appear beside the existing Danger banner without changing incident notices, snooze or health probe results.
+
+- **Choose password protection for personal credentials ([#3507](https://github.com/vtmocanu/uzi/pull/3507), [#3582](https://github.com/vtmocanu/uzi/pull/3582)).**
+  Settings can enable or disable the vault under instance policy, atomically converting Claude, OpenAI and Codex credentials; Off uses server-key encryption and avoids restart unlocks, while protected users retain password-based protection.
 
 ### Fixed
 
@@ -1272,6 +1284,27 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Release validation refuses unreadable history ([#3551](https://github.com/vtmocanu/uzi/pull/3551)).**
   A failed history lookup can no longer be mistaken for a fully covered release.
+
+- **Retained recovery adoption refusals preserve work for an owner decision ([#3527](https://github.com/vtmocanu/uzi/pull/3527), [#3580](https://github.com/vtmocanu/uzi/pull/3580)).**
+  Resume requests another bounded attempt and Cancel ends the run; integrity refusals keep local work and custody without automatic retry or a guarantee that an earlier archive contains the latest edits. Known temporary local resource errors during a renewal check keep the grant unspent for bounded claim recovery; unverified authorization stays fail-closed.
+
+- **Recovery captures reject transitions into available outside upload ([#3590](https://github.com/vtmocanu/uzi/pull/3590), [#3601](https://github.com/vtmocanu/uzi/pull/3601)).**
+  The ready query requires a bound uploading capture, and the UPDATE guard rejects other source states while retaining guarded same-state available updates.
+
+- **CI repair guidance requires artifact evidence and faithful reproduction ([#3549](https://github.com/vtmocanu/uzi/pull/3549), [#3588](https://github.com/vtmocanu/uzi/pull/3588)).**
+  Read supplied artifact evidence with explicit availability limits and require a faithful reproduction before proposing a repair.
+
+- **Codex silence after a provider retry uses bounded provider recovery ([#3506](https://github.com/vtmocanu/uzi/pull/3506), [#3600](https://github.com/vtmocanu/uzi/pull/3600)).**
+  A qualifying rate-limit or transport retry followed by no model output uses the existing provider recovery duration bound and owner Resume hold; human plan revisions retain bounded retries on a verified fresh root.
+
+- **Hosted DinD containers use DNS defaults that preserve Docker network name resolution ([#3563](https://github.com/vtmocanu/uzi/pull/3563), [#3603](https://github.com/vtmocanu/uzi/pull/3603)).**
+  Rootful startup, including MTU fallback, and rootless startup pass `--dns-search=. --dns-opt=ndots:0`; newly created nested containers lose inherited search-suffix expansion and need full cluster DNS names or explicit workload DNS overrides, while worker/pod DNS stays unchanged. Actual hosted rollout remains pending.
+
+- **Admin Health warns before recovery storage reaches byte budgets ([#3584](https://github.com/vtmocanu/uzi/pull/3584), [#3596](https://github.com/vtmocanu/uzi/pull/3596)).**
+  Recovery storage warns at 80% of any enabled byte budget, including the largest owner outside sampled examples, while retaining independent quota-refusal warnings.
+
+- **Worker-wait alerts identify owners and explain background priority ([#3610](https://github.com/vtmocanu/uzi/pull/3610), [#3611](https://github.com/vtmocanu/uzi/pull/3611)).**
+  Admin health shows readable owner names with disambiguating short IDs, linked runs, and clear queue context while preserving wait clocks, severity, and diagnostic identities.
 
 ### Security
 

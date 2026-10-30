@@ -8,6 +8,8 @@ import { ModelSelect } from "./ModelSelect";
 import { EffortSelect } from "./EffortSelect";
 
 const families = ["claude", "codex"] as const;
+// The server's effort for an unpinned checker (agenttmpl.CrossCheckDefaultEffort).
+const CROSS_CHECK_DEFAULT_EFFORT = "high";
 const stages = ["plan", "code"] as const;
 type Stage = typeof stages[number];
 type Draft = Record<`${Stage}/${Harness}`, { model: string; effort: string }>;
@@ -59,7 +61,6 @@ export function CrossCheckDefaults({ settings, onSaved }: {
           const idPrefix = stage === "plan" ? `checker-${harness}` : `checker-code-${harness}`;
           const labelPrefix = `${stage === "code" ? "Code " : ""}${harness === "claude" ? "Claude" : "Codex"}`;
           const workerModel = settings.cross_check_pins?.find(p => p.stage === stage && p.harness === harness)?.worker_default_model;
-          const workerEffort = (harness === "claude" ? settings.default_effort : settings.default_codex_effort) || "medium";
           const change = (field: "model" | "effort", value: string) => setDraft(d => ({ ...d, [key]: { ...d[key], [field]: value } }));
           return <td key={harness} className="min-w-56 align-top p-2">
             <label htmlFor={`${idPrefix}-model`}>{labelPrefix} checker model</label>
@@ -68,7 +69,7 @@ export function CrossCheckDefaults({ settings, onSaved }: {
               defaultLabel={`Default · ${workerModel === undefined || (workerModel === null && harness === "codex") ? "Unavailable" : workerModel ?? "SDK/account default"} (worker default)`} />
             <label htmlFor={`${idPrefix}-effort`}>{labelPrefix} checker effort</label>
             <EffortSelect id={`${idPrefix}-effort`} value={draft[key].effort} onChange={v => change("effort", v)}
-              defaultLabel={`Default · ${workerEffort} (worker default)`} />
+              defaultLabel={`Default · ${CROSS_CHECK_DEFAULT_EFFORT} (cross-check default)`} />
           </td>;
         })}</tr>)}</tbody>
       </table>

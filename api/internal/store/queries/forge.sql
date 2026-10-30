@@ -637,9 +637,11 @@ SELECT DISTINCT ON (r.issue_iid)
              WHEN admission.codex_admission_class = 'overload' THEN 'codex_overload'
              ELSE '' END)::text AS queue_reason,
        admission.codex_admission_class, admission.codex_admission_eligible_at,
+       cooldown.account_cooldown_class, cooldown.account_cooldown_eligible_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
 FROM runs r
+LEFT JOIN codex_active_run_cooldown cooldown ON cooldown.run_id = r.id
 LEFT JOIN codex_queued_run_admission admission ON admission.run_id = r.id AND admission.user_id = r.user_id
 LEFT JOIN users ru ON ru.id = r.user_id
 LEFT JOIN workers rw ON rw.id = r.worker_id
@@ -680,9 +682,11 @@ SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_
              WHEN admission.codex_admission_class = 'overload' THEN 'codex_overload'
              ELSE '' END)::text AS queue_reason,
        admission.codex_admission_class, admission.codex_admission_eligible_at,
+       cooldown.account_cooldown_class, cooldown.account_cooldown_eligible_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count
 FROM runs r
+LEFT JOIN codex_active_run_cooldown cooldown ON cooldown.run_id = r.id
 LEFT JOIN codex_queued_run_admission admission ON admission.run_id = r.id AND admission.user_id = r.user_id
 LEFT JOIN users ru ON ru.id = r.user_id
 LEFT JOIN workers rw ON rw.id = r.worker_id

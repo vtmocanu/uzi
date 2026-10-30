@@ -314,7 +314,9 @@ function withNotes(controller: FakeController, notes: CodexNotification[]): Fake
 }
 
 describe("CodexDelegationRunner: bounded Read transport serialization (#296)", () => {
-  for (const { name, raw, args, expected, offset, lines, partial, truncated } of [
+  for (const { name, raw, args, expected, offset, lines, partial, truncated, fallback = false, incomplete = false } of [
+    { name: "oversize fallback escaping-heavy text", raw: "\u0001".repeat(2 * 1024 * 1024), args: { path: "src/x.ts", limit: 1 }, expected: "\u0001".repeat(64 * 1024), offset: 1, lines: 1, partial: true, truncated: true, fallback: true },
+    { name: "incomplete fallback", raw: "x".repeat(9 * 1024 * 1024), args: { path: "src/x.ts", offset: 1 }, expected: "prefix", offset: 1, lines: 1, partial: true, truncated: true, fallback: true, incomplete: true },
     { name: "middle excerpt", raw: "a\nb\nc\n", args: { file_path: "src/x.ts", offset: 2, limit: 1 }, expected: "b\n", offset: 2, lines: 1, partial: false, truncated: true },
     { name: "near 1 MiB U+0001", raw: "\u0001".repeat(1024 * 1024 - 2), args: { path: "src/x.ts" }, expected: "\u0001".repeat(64 * 1024), offset: 1, lines: 1, partial: true, truncated: true },
     { name: "near 1 MiB quotes and backslashes", raw: '"\\'.repeat((1024 * 1024 - 2) / 2), args: { path: "src/x.ts" }, expected: '"\\'.repeat(32 * 1024), offset: 1, lines: 1, partial: true, truncated: true },
@@ -348,6 +350,14 @@ describe("CodexDelegationRunner: bounded Read transport serialization (#296)", (
         close: async () => { transport.close(); },
       };
       const fileop = new FileopSpy({ ok: true, size: Buffer.byteLength(raw), data: Buffer.from(raw).toString("base64") });
+      if (fallback) fileop.op = async req => {
+        fileop.calls.push(req);
+        if (req.op === "read") return { ok: false, code: "E_OVERSIZE", origin: "helper" };
+        assert.equal(req.op, "read_range");
+        return { ok: true, size: Buffer.byteLength(raw), data: Buffer.from(expected).toString("base64"),
+          offset, linesReturned: lines, partialLastLine: partial, truncated, incomplete,
+          scannedBytes: incomplete ? 8 * 1024 * 1024 : 65537, ...(incomplete ? { reason: "scan_budget" } : {}) };
+      };
       const b = makeRunner({
         fileop, childTurnDeadlineMs: 5000,
         startImpl: async () => {
@@ -367,8 +377,9 @@ describe("CodexDelegationRunner: bounded Read transport serialization (#296)", (
         assert.equal(reply.contentItems[0]!.type, "inputText");
         assert.deepEqual(JSON.parse(reply.contentItems[0]!.text), {
           size: Buffer.byteLength(raw), content: expected, offset, linesReturned: lines, partialLastLine: partial, truncated,
+          ...(incomplete ? { incomplete: true, reason: "scan_budget", scannedBytes: 8 * 1024 * 1024 } : {}),
         });
-        assert.equal(fileop.calls.length, 1);
+        assert.equal(fileop.calls.length, fallback ? 2 : 1);
         assert.equal(b.registry.inFlightCallbackCount(), 0);
         assert.equal(b.registry.isPoisoned(), false);
       } finally {

@@ -210,9 +210,13 @@ clone, journal, inventory and paired skills with a distinct disposal diagnostic.
 Current-process completion sources bind the executor/facade in memory before
 durable bind; knownCodex without exact disposed proof retains before inventory
 and cannot use legacy fallback. KnownClaude is unchanged. Owner decision
-2026-10-24 narrows R1857-02(e): persisted/unknown-provenance sources keep today's
-behavior for both harnesses, with no prior-process topology proof or durable format
-change. C proves no Docker accepted-invisible-create (#1860) or unregistered/sibling
+2026-10-24 narrowed R1857-02(e): persisted/unknown-provenance sources kept the
+pre-C behavior for both harnesses. **Superseded by #3404 (2026-10-27):** after a
+restart such a source is released only when durable published authority proves it
+(`forgetCompletedGeneration` / `verifyDurableRetirement` in `agent/src/recovery.ts`);
+legacy and unproven sources are retained until guarded operator discard (see
+[ADR-1783's #3404 amendment](1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement)).
+C proves no Docker accepted-invisible-create (#1860) or unregistered/sibling
 writer exclusion and leaves Claude terminal residuals, #1858 no reclaim and
 #2746 SETTLE/CLEANUP separation intact.
 

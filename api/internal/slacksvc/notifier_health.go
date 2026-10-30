@@ -3,9 +3,12 @@ package slacksvc
 import (
 	"context"
 	"errors"
+	"reflect"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/slack-go/slack"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -29,6 +32,9 @@ func (n *Notifier) handleHealth(ctx context.Context, ev healthEvent) {
 			n.logf("load run context (health)", err)
 		}
 		return
+	}
+	if isTerminalStatus(rc.Status) {
+		defer func() { delete(n.rootRenders, rc.ID) }()
 	}
 	target, err := n.store.GetSlackDeliveryForUser(ctx, rc.UserID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -107,6 +113,7 @@ func (n *Notifier) ensureRoot(ctx context.Context, rc store.GetSlackRunContextRo
 			n.logf("post root (health)", perr)
 			return store.SlackRunMessage{}, false
 		}
+		n.rememberRoot(rc, channel, ts, fallback, blocks)
 		saved, uerr := n.store.UpsertSlackRunMessage(ctx, store.UpsertSlackRunMessageParams{
 			RunID: rc.ID, ChannelID: channel, RootTs: ts,
 		})
@@ -119,9 +126,46 @@ func (n *Notifier) ensureRoot(ctx context.Context, rc store.GetSlackRunContextRo
 		n.logf("load anchor (health)", err)
 		return store.SlackRunMessage{}, false
 	default:
-		if uerr := n.poster.UpdateBlocks(ctx, existing.ChannelID, existing.RootTs, fallback, blocks); uerr != nil {
-			n.logf("update root (health)", uerr)
-		}
+		n.updateRoot(ctx, rc, existing, fallback, blocks)
 		return existing, true
 	}
+}
+
+// rootRender records only successfully delivered content, including its Slack identity.
+// An unknown prior root must be edited: it may still contain a fault warning.
+type rootRender struct {
+	channel, ts, health, fallback string
+	blocks                        []slack.Block
+}
+
+func (n *Notifier) rememberRoot(rc store.GetSlackRunContextRow, channel, ts, fallback string, blocks []slack.Block) {
+	const maxRootRenders = 1024
+	if n.rootRenders == nil {
+		n.rootRenders = make(map[uuid.UUID]rootRender)
+	}
+	if _, exists := n.rootRenders[rc.ID]; !exists && len(n.rootRenders) >= maxRootRenders {
+		// At most one eviction per write; eviction only loses an optimization.
+		for id := range n.rootRenders {
+			delete(n.rootRenders, id)
+			break
+		}
+	}
+	n.rootRenders[rc.ID] = rootRender{channel, ts, rc.Health, fallback, blocks}
+}
+
+func (n *Notifier) updateRoot(ctx context.Context, rc store.GetSlackRunContextRow, anchor store.SlackRunMessage, fallback string, blocks []slack.Block) {
+	prior, known := n.rootRenders[rc.ID]
+	cooldown := rc.Health == "waiting_account_cooldown" || prior.health == "waiting_account_cooldown"
+	if known && cooldown && prior.channel == anchor.ChannelID && prior.ts == anchor.RootTs &&
+		prior.fallback == fallback && reflect.DeepEqual(prior.blocks, blocks) {
+		n.rememberRoot(rc, anchor.ChannelID, anchor.RootTs, fallback, blocks)
+		return
+	}
+	if err := n.poster.UpdateBlocks(ctx, anchor.ChannelID, anchor.RootTs, fallback, blocks); err != nil {
+		// An ambiguous failed write cannot prove what Slack currently displays.
+		delete(n.rootRenders, rc.ID)
+		n.logf("update root", err)
+		return
+	}
+	n.rememberRoot(rc, anchor.ChannelID, anchor.RootTs, fallback, blocks)
 }

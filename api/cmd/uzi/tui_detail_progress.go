@@ -105,6 +105,10 @@ func (m tuiModel) renderProgress() string {
 			lines = append(lines, faint("since "+at.UTC().Format("15:04")))
 		}
 	case runprogress.StateWaiting:
+		if activeAccountCooldown(run) {
+			lines = append(lines, head+" "+faint("waiting on account"))
+			break
+		}
 		lines = append(lines, head+" "+paintSeg(m.pal.amber, nil, false, "● waits on you"))
 		kind := ""
 		switch run.Status {

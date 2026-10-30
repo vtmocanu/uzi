@@ -33,6 +33,7 @@ import {
   runListItem,
 } from "../data";
 import { ensureLive, handleInput, startNewRun } from "../engine";
+import { foreignCooldownRun } from "../runProgress";
 import { getRun, nextRunId, patchRun, state } from "../store";
 import { delay, mockScenario, requireSession } from "./shared";
 import { LEAD_NAME_RE, templates } from "./agents";
@@ -310,8 +311,10 @@ function mockAdminListRuns(params?: {
     // row here was stamped with the session email — the demo factory list was
     // 100% "mine", the exact duplication amendment 2 removes.
     .map((r) => {
-      const item = runListItem(r, mockOtherRunOwners[r.id] ?? requireSession().email);
+      const item = runListItem(r.id in mockOtherRunOwners ? foreignCooldownRun(r) : r, mockOtherRunOwners[r.id] ?? requireSession().email);
       if (r.id in mockOtherRunOwners) {
+        delete item.account_cooldown_class;
+        delete item.account_cooldown_eligible_at;
         delete item.codex_admission_class;
         delete item.codex_admission_eligible_at;
         if (item.queue_reason !== "maintenance") delete item.queue_reason;
@@ -702,7 +705,12 @@ export const runsApi = {
     // (a no-op for the default/unknown scenario, and for a run switched this session).
     // PRD #1429 M4a: layered with the harness overlay, so a "codex-only" run also
     // reads harness=codex on the detail page.
-    const decorated = harnessOverlay(credentialOverlay(run));
+    const decorated = { ...harnessOverlay(credentialOverlay(id in mockOtherRunOwners ? foreignCooldownRun(run) : run)) };
+    if (id in mockOtherRunOwners) {
+      delete decorated.account_cooldown_class;
+      delete decorated.account_cooldown_eligible_at;
+      decorated.health_reason = null;
+    }
     const history = (decorated.milestone_reconciliations ?? []).filter(r =>
       reconciliationBeforeGateRevision === undefined || (typeof r.gate_revision === "number" && r.gate_revision < reconciliationBeforeGateRevision));
     const page = history.slice(0, 50);

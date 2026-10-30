@@ -1757,13 +1757,13 @@ describe("B1 independent settings responses", () => {
       patch: { default_harness: null, default_claude_model: null, default_codex_model: "gpt-6.1-sol" },
       response: { default_claude_model: null, cross_check_pins: [{ ...initial.cross_check_pins![0], worker_default_model: null }] }, checker: "Claude checker model", expected: "SDK/account default" },
     { name: "Claude effort reset", label: "Claude effort", value: "", button: "Save Claude effort",
-      patch: { default_effort: null }, response: { default_effort: null }, checker: "Claude checker effort", expected: "medium" },
+      patch: { default_effort: null }, response: { default_effort: null }, checker: "Claude checker effort", expected: "high" },
     { name: "Codex effort", label: "Codex effort", value: "max", button: "Save Codex effort",
-      patch: { default_codex_effort: "max" }, response: { default_codex_effort: "max" }, checker: "Codex checker effort", expected: "max" },
+      patch: { default_codex_effort: "max" }, response: { default_codex_effort: "max" }, checker: "Codex checker effort", expected: "high" },
     { name: "Claude effort", label: "Claude effort", value: "max", button: "Save Claude effort",
-      patch: { default_effort: "max" }, response: { default_effort: "max" }, checker: "Claude checker effort", expected: "max" },
+      patch: { default_effort: "max" }, response: { default_effort: "max" }, checker: "Claude checker effort", expected: "high" },
     { name: "Codex effort reset", label: "Codex effort", value: "", button: "Save Codex effort",
-      patch: { default_codex_effort: null }, response: { default_codex_effort: null }, checker: "Codex checker effort", expected: "medium" },
+      patch: { default_codex_effort: null }, response: { default_codex_effort: null }, checker: "Codex checker effort", expected: "high" },
   ];
   beforeEach(() => {
     mockApi.getMySettings.mockResolvedValue({ settings: initial });
@@ -1774,8 +1774,11 @@ describe("B1 independent settings responses", () => {
       created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
     })) });
   });
+  // A checker effort Default is the cross-check default whatever the worker effort is.
   const label = (checker: string, value: string) =>
-    expect(within(screen.getByLabelText(checker)).getByRole("option", { name: `Default · ${value} (worker default)` })).toBeTruthy();
+    expect(within(screen.getByLabelText(checker)).getByRole("option", {
+      name: `Default · ${value} (${checker.endsWith("effort") ? "cross-check default" : "worker default"})`,
+    })).toBeTruthy();
   const start = (label: string, value: string, button: string) => {
     fireEvent.change(screen.getByLabelText(label), { target: { value } });
     const save = screen.getByRole("button", { name: button }) as HTMLButtonElement;
@@ -1872,10 +1875,11 @@ describe("checker defaults follow committed worker settings", () => {
     expect(checker.value).toBe("sonnet");
     fireEvent.change(screen.getByLabelText("Claude effort"), { target: { value: "max" } });
     const checkerEffort = screen.getByLabelText("Claude checker effort");
-    expect(within(checkerEffort).getByRole("option", { name: "Default · medium (worker default)" })).toBeTruthy();
+    expect(within(checkerEffort).getByRole("option", { name: "Default · high (cross-check default)" })).toBeTruthy();
     mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...initial, default_claude_model: "haiku", default_effort: "max" } });
     fireEvent.click(screen.getByRole("button", { name: "Save Claude effort" }));
-    await waitFor(() => expect(within(checkerEffort).getByRole("option", { name: "Default · max (worker default)" })).toBeTruthy());
+    await waitFor(() => expect((screen.getByRole("button", { name: "Save Claude effort" }) as HTMLButtonElement).disabled).toBe(true));
+    expect(within(checkerEffort).getByRole("option", { name: "Default · high (cross-check default)" })).toBeTruthy();
     expect(checker.value).toBe("sonnet");
     mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...initial, cross_check_pins: [
       { stage: "plan", harness: "claude", model: "sonnet", effort: null, worker_default_model: "haiku", resolved_model: "sonnet",

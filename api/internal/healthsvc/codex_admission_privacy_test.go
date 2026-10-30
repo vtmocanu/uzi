@@ -75,7 +75,7 @@ func TestCodexAdmissionHealthEvidencePrivacy(t *testing.T) {
 				var waiting []string
 				for _, ev := range c.Evidence {
 					if ev.Label == "Waiting run" {
-						waiting = append(waiting, ev.Value)
+						waiting = append(waiting, ev.RunID+" "+ev.OwnerID+" "+ev.Value)
 					}
 					if c.ID == "fleet.capacity" && ev.Label == "Owners affected" && ev.Value != "3" {
 						t.Errorf("affected owner count = %s", ev.Value)

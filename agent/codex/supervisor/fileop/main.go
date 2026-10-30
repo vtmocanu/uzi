@@ -17,6 +17,7 @@
 //
 //	{"id":<int>,"op":"stat","path":"rel"}
 //	{"id":<int>,"op":"read","path":"rel"}
+//	{"id":<int>,"op":"read_range","path":"rel","offset":<integer>,"limit":<integer>}
 //	{"id":<int>,"op":"write","path":"rel","data":"<base64>"}
 //	{"id":<int>,"op":"apply","path":"rel","old":"<base64>","data":"<base64>"}
 //	{"id":<int>,"op":"mkdir","path":"rel"}
@@ -29,6 +30,33 @@
 //
 //	{"id":<int>,"ok":true, ...op-specific fields...}
 //	{"id":<int>,"ok":false,"code":"E_ESCAPE|E_SYMLINK|E_DENIED|E_OVERSIZE|..."}
+//
+// read_range requires both one-based offset (1..9007199254740991) and limit
+// (1..2000), validated independently before opening. Other operations ignore these
+// fields. Its success fields are canonical base64 data, opening fstat size, offset,
+// linesReturned, partialLastLine, truncated, incomplete and scannedBytes. Only an
+// incomplete success includes reason:"scan_budget". Empty/past-EOF ranges have no
+// lines and are neither partial nor truncated. LF belongs to its source line;
+// BOM/CRLF are preserved and terminal LF creates no phantom line.
+//
+// read_range reads at most 8 MiB (including prefetch/lookahead), in chunks at most
+// 32 KiB, and returns at most 64 KiB, retreating to a UTF-8 boundary. It validates
+// skipped and selected text through the requested LF or the output ceiling,
+// completing only a codepoint crossing that ceiling. Raw one-byte lookahead proves
+// continuation; prefetched surplus is not text-validated. Examined NUL/invalid
+// UTF-8 yields E_NOT_TEXT; incomplete UTF-8 at scan exhaustion is incomplete,
+// while incomplete UTF-8 at observed EOF is E_NOT_TEXT. partialLastLine means the
+// excerpt ends inside a continuing source line/delimiter; truncated means bytes
+// remain after the excerpt. Skipping alone is not truncation. Scan exhaustion
+// before offset is an empty, truncated, incomplete success, never fake EOF.
+//
+// The descriptor and opening size pin each range operation: later appends are
+// ignored, replacement cannot redirect it, and early EOF accepts shrinkage.
+// A five-second monotonic context checks open/read/processing boundaries and
+// returns E_TIMEOUT on cancellation/deadline. This is cooperative: a regular-file
+// filesystem syscall may stall beyond it. Ordinary read retains its 1 MiB cap.
+// The broker's read-first, helper-origin oversize-only fallback is separate M2
+// integration; this primitive itself does not invoke or fall back to another op.
 //
 // A malformed or oversized request yields a typed error and the server STAYS
 // HEALTHY. Responses carry only bounded codes: never a raw errno string, a path,

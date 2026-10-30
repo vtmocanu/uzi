@@ -112,7 +112,7 @@ const SEED_USER_SETTINGS: UserSettings = {
 if (mockScenario() === "cross-check-mixed") {
   SEED_USER_SETTINGS.cross_check_pins = [
     { stage: "plan", harness: "codex", model: "gpt-6-sol", effort: null,
-      worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "pin", effort_source: "worker default", active: true },
+      worker_default_model: null, resolved_model: null, resolved_effort: "high", model_source: "pin", effort_source: "cross-check default", active: true },
   ];
 }
 if (mockScenario() === "cross-check-dormant-claude") {
@@ -520,10 +520,10 @@ function mySettingsResponse(): { settings: UserSettings } {
     const model = pin?.model ?? null, effort = pin?.effort ?? null;
     const workerModel = harness === "claude" ? userSettings.default_claude_model ?? mockDefaultClaudeModel()
       : userSettings.default_codex_model ?? "gpt-6.1-sol";
-    const workerEffort = harness === "claude" ? userSettings.default_effort : userSettings.default_codex_effort;
+    // An unpinned checker effort is the server's cross-check default, never the worker effort.
     return { stage, harness, model, effort, worker_default_model: workerModel, resolved_model: model ?? workerModel,
-      resolved_effort: effort ?? workerEffort ?? "medium", model_source: model === null ? "worker default" : "pin",
-      effort_source: effort === null ? "worker default" : "pin", active: true };
+      resolved_effort: effort ?? "high", model_source: model === null ? "worker default" : "pin",
+      effort_source: effort === null ? "cross-check default" : "pin", active: true };
   }));
   // PRD #3245: both judge cells through the one mock resolver (pinned to the server's by
   // fixtures/model-settings/judge.json), from the stored user lanes and instance values.

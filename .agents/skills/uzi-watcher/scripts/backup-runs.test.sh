@@ -653,6 +653,55 @@ for kind in protected ordinary; do
       echo "PASS protected peeledMarkers refused: ${pm:0:30}"
     done
   fi
+  if [ "$kind" = protected ]; then
+    # issue #3404: the journal carries an optional completionSourceFence (exact shape, UUID epoch, 64-hex digest).
+    fence_epoch='0123abcd-0123-4abc-8def-0123456789ab'
+    fence_digest="$(printf 'a%.0s' $(seq 64))"
+    fence="{\"version\":1,\"sourceUseEpoch\":\"$fence_epoch\",\"sourceCoreDigest\":\"$fence_digest\"}"
+    {
+      value="$(printf '%s' "$progress_journal" | jq --argjson f "$fence" '.completionSourceFence=$f | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+      git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+      rc="$(backup_rc "$dest" "$rid")"
+      [ "$rc" -eq 0 ] || fail "completionSourceFence: valid protected descriptor rejected (exit $rc); log: $(cat "$dest/latest-attempt/backup.log")"
+      tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+claim-generation-dirty' \
+        || fail "completionSourceFence: retained dirty bytes missing"
+      echo "PASS protected completionSourceFence accepted"
+    }
+    for fence in 'null' '"x"' '[]' \
+        "{\"version\":2,\"sourceUseEpoch\":\"$fence_epoch\",\"sourceCoreDigest\":\"$fence_digest\"}" \
+        "{\"version\":1,\"sourceUseEpoch\":\"not-a-uuid\",\"sourceCoreDigest\":\"$fence_digest\"}" \
+        "{\"version\":1,\"sourceUseEpoch\":\"0123ABCD-0123-4abc-8def-0123456789ab\",\"sourceCoreDigest\":\"$fence_digest\"}" \
+        "{\"version\":1,\"sourceUseEpoch\":\"$fence_epoch\",\"sourceCoreDigest\":\"abc\"}" \
+        "{\"version\":1,\"sourceUseEpoch\":\"$fence_epoch\",\"sourceCoreDigest\":\"$(printf 'A%.0s' $(seq 64))\"}" \
+        "{\"version\":1,\"sourceUseEpoch\":\"$fence_epoch\"}" \
+        "{\"version\":1,\"sourceUseEpoch\":\"$fence_epoch\",\"sourceCoreDigest\":\"$fence_digest\",\"extra\":1}"; do
+      value="$(printf '%s' "$progress_journal" | jq --argjson f "$fence" '.completionSourceFence=$f | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+      git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+      rc="$(backup_rc "$dest" "$rid")"
+      [ "$rc" -ne 0 ] || fail "completionSourceFence ${fence:0:40}: malformed fence accepted"
+      [ ! -e "$dest/latest-attempt/issue-4242.tgz" ] || fail "completionSourceFence ${fence:0:40}: invalid descriptor attributed source"
+      echo "PASS protected completionSourceFence refused: ${fence:0:40}"
+    done
+  fi
+  if [ "$kind" = ordinary ]; then
+    # issue #3404: installCompletionSourceFence writes the PLAIN completing journal, {runId, clonePath,
+    # completionSourceFence} with the fence as the last key and no recovery episode. The plain-journal
+    # reader is deliberately lenient about unknown keys (only the protected descriptor validator checks the
+    # fence shape), so the fenced journal must still attribute and capture its clone.
+    plain_epoch='0123abcd-0123-4abc-8def-0123456789ab'
+    plain_digest="$(printf 'b%.0s' $(seq 64))"
+    plain="$(jq -cn --arg rid "$rid" --arg pred "$predecessor" '{runId:$rid,clonePath:$pred}')"
+    fence="{\"version\":1,\"sourceUseEpoch\":\"$plain_epoch\",\"sourceCoreDigest\":\"$plain_digest\"}"
+    value="$(printf '%s' "$plain" | jq -c --argjson f "$fence" '.completionSourceFence=$f')"
+    git --git-dir="$BARE" config "$JKEY" "$value"
+    rc="$(backup_rc "$dest" "$rid")"
+    [ "$rc" -eq 0 ] || fail "plain completionSourceFence: valid plain journal rejected (exit $rc); log: $(cat "$dest/latest-attempt/backup.log")"
+    tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.meta.txt | grep -qxF "clone=$predecessor" \
+      || fail "plain completionSourceFence: wrong clone attributed"
+    tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+claim-generation-dirty' \
+      || fail "plain completionSourceFence: retained dirty bytes missing"
+    echo "PASS plain completionSourceFence accepted"
+  fi
   for generation in 0 -1 1.5 9007199254740992 '"1"' null true; do
     value="$(printf '%s' "$progress_journal" | jq --argjson gen "$generation" '.recovery.claimGeneration=$gen')"
     if [ "$kind" = protected ]; then
