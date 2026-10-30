@@ -5,6 +5,7 @@ import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { execFileSync } from "node:child_process";
 import { GitCache, ScratchPublicationError, type PublicationFloor } from "../src/git.js";
+import { RunResidueBlockedError } from "../src/residue-quarantine.js";
 import { makeFixture } from "./fixture-repo.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 
@@ -110,6 +111,40 @@ it("tags a fetch-stage transient failure (ls-remote succeeded) as floor_unreacha
       return original(cwd, args, ...rest);
     };
     await assert.rejects(f.publish(), (e: unknown) => e instanceof ScratchPublicationError && e.kind === "floor_unreachable");
+  } finally { f.fx.cleanup(); }
+});
+
+it("does not type an abort at the remote floor listing as floor_unreachable", async () => {
+  const f = await fixture();
+  try {
+    const seam = f.cache as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
+    const original = seam.runGit.bind(f.cache);
+    seam.runGit = async (cwd, args, ...rest) => {
+      if (args[0] === "ls-remote") {
+        const abort = new Error("git ls-remote failed: connection reset by peer");
+        abort.name = "AbortError";
+        throw abort;
+      }
+      return original(cwd, args, ...rest);
+    };
+    await assert.rejects(f.publish(), (e: unknown) => {
+      assert.ok(!(e instanceof ScratchPublicationError && e.kind === "floor_unreachable"), String(e));
+      assert.ok(e instanceof Error && e.name === "AbortError");
+      return true;
+    });
+  } finally { f.fx.cleanup(); }
+});
+
+it("does not type a run-residue block at the remote floor listing as floor_unreachable", async () => {
+  const f = await fixture();
+  try {
+    const seam = f.cache as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
+    const original = seam.runGit.bind(f.cache);
+    seam.runGit = async (cwd, args, ...rest) => {
+      if (args[0] === "ls-remote") throw new RunResidueBlockedError("connection reset by peer");
+      return original(cwd, args, ...rest);
+    };
+    await assert.rejects(f.publish(), (e: unknown) => e instanceof RunResidueBlockedError);
   } finally { f.fx.cleanup(); }
 });
 
