@@ -7,13 +7,15 @@ import { acquireWorkerLifetime, AuthorityRefusal, SourceUseHeldRefusal } from ".
 import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { openAuthorityStore, type SlotSnapshot } from "../src/completion-authority.js";
 import { StubExecutor, type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
-import { GitCache } from "../src/git.js";
+import { ForeignCaptureBlockedError, GitCache } from "../src/git.js";
+import { RunRunner } from "../src/runner.js";
+import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import { followSuccessfulPush } from "./publication-fixture.js";
 import { testLockOptions } from "./authority-test-support.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 import {
-  api, fakeGitlab as rawFakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith,
+  api, client, fakeGitlab as rawFakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith,
 } from "./runner-harness.js";
 
 installHarness();
@@ -64,6 +66,23 @@ function stopAfterSeed(onRun: () => void = () => {}): (runId: string) => { homeD
     executor: {
       run: async (_ctx: RunContext): Promise<ExecutorResult> => { onRun(); throw new Error("stop after the seed"); },
     },
+  });
+}
+
+/** A runner whose GitCache (carrying the authority hooks, required) is passed through the constructor. */
+function runnerOnHookedGit(r: Rig, makeExecutor: (runId: string) => { homeDir: string; executor: Executor }): RunRunner {
+  const hooked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+    authority: r.rt.hooks, authorityRequired: true, gitleaksBin: defaultGitleaksShim(),
+  }));
+  return new RunRunner(client, hooked, makeExecutor, nullLogger(), 20, undefined, {
+    pollMs: 5,
+    planApprovalTimeoutMs: 0,
+    questionTimeoutMs: 600,
+    prDescriptionHeadLagMs: 0,
+    gitlab: rawFakeGitlab({}).gitlab,
+    teardownTestDeps: portableTeardownTestDeps,
+    authority: r.rt,
+    checkpointTestHooks: { retryBackoffMs: [0, 0] },
   });
 }
 
@@ -333,13 +352,9 @@ describe("sink retirement and ownership at a flight's teardown", () => {
     const epoch = (await slotOf(r.rt, canonical))?.epoch;
     let started = 0;
     const claim = gitlabClaim(iid, { run_id: randomUUID() });
-    const runner = runnerWith(stopAfterSeed(() => { started++; }), rawFakeGitlab({}).gitlab, undefined, undefined, { authority: r.rt });
     // The production seed admission: this runner's GitCache carries the authority hooks and requires them, so the
     // refusal is raised by the seed's own admission of the canonical path (not scripted around it).
-    const hooked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
-      authority: r.rt.hooks, authorityRequired: true, gitleaksBin: defaultGitleaksShim(),
-    }));
-    (runner as unknown as { git: GitCache }).git = hooked;
+    const runner = runnerOnHookedGit(r, stopAfterSeed(() => { started++; }));
     let tornDown: { preserveRecoveryClone?: boolean; preserveSession?: boolean; retainedLocalCustody?: boolean; keepGuardedInventoryOpen?: boolean } | undefined;
     const internals = runner as unknown as { endFlightSourceUse(flight: object, log: unknown): Promise<void> };
     const endFlight = internals.endFlightSourceUse.bind(runner);
@@ -358,5 +373,58 @@ describe("sink retirement and ownership at a flight's teardown", () => {
     assert.equal(slot?.state, "active", "A's epoch is untouched");
     assert.equal(slot?.epoch, epoch);
     assert.equal(r.rt.heldByOtherSink(canonical, new Set()), true, "A still owns the key");
+  });
+
+  it("a canonical re-seed refused after a reclaimed terminal orphan stops quietly and leaves the earlier flight's slot owned", async (t) => {
+    // Stubbed: runnerCloneForClaim throws ForeignCaptureBlockedError on its FIRST call only (the real one runs on
+    // the second, over the hooked GitCache, and is refused by the seed admission); client.getRunOrphanClassification
+    // reports a terminal same-repo issue owner; GitCache.classifyOwnerClonePath / terminalRetainedSnapshot /
+    // retireRunnerClone are stubbed to a canonical-shaped, non-retained, successfully retired orphan. The real
+    // reclaimTerminalOrphan and reseedAfterReclaim run.
+    const r = await rig();
+    const iid = 364006;
+    const bare = await git.ensureClone(fx.originPath);
+    const canonical = git.runnerClonePath(bare, `issue-${iid}`);
+    fs.mkdirSync(path.dirname(canonical), { recursive: true });
+    const sinkA = new Set<string>();
+    await r.rt.recordAdmissions(sinkA, () => r.rt.bindSource(canonical));
+    r.rt.retireSink(sinkA);
+    const epoch = (await slotOf(r.rt, canonical))?.epoch;
+    const claim = gitlabClaim(iid, { run_id: randomUUID() });
+    const ownerRunId = randomUUID();
+    const branch = `agent/issue-${iid}`;
+    let started = 0;
+    const runner = runnerOnHookedGit(r, stopAfterSeed(() => { started++; }));
+    const hooked = (runner as unknown as { git: GitCache }).git;
+    t.mock.method(client, "getRunOrphanClassification", async () => ({
+      status: "completed", repo_id: claim.repo.id, kind: "issue", issue_iid: iid, branch,
+    }));
+    t.mock.method(hooked, "classifyOwnerClonePath", async () => "canonical");
+    t.mock.method(hooked, "terminalRetainedSnapshot", async () => undefined);
+    t.mock.method(hooked, "retireRunnerClone", async () => "quarantined");
+    const internals = runner as unknown as { runnerCloneForClaim(...args: unknown[]): Promise<unknown> };
+    const real = internals.runnerCloneForClaim.bind(runner);
+    let calls = 0;
+    internals.runnerCloneForClaim = async (...args) => {
+      if (++calls === 1) throw new ForeignCaptureBlockedError(canonical, branch, ownerRunId);
+      return real(...args);
+    };
+    let tornDown: { preserveRecoveryClone?: boolean; preserveSession?: boolean; retainedLocalCustody?: boolean; keepGuardedInventoryOpen?: boolean } | undefined;
+    const sealed = runner as unknown as { endFlightSourceUse(flight: object, log: unknown): Promise<void> };
+    const endFlight = sealed.endFlightSourceUse.bind(runner);
+    sealed.endFlightSourceUse = async (flight, log) => { tornDown = flight; return endFlight(flight, log); };
+    await runner.execute(claim);
+    assert.equal(calls, 2, "the re-seed after the reclaim was attempted");
+    assert.equal(started, 0, "no model work");
+    assert.equal(failed(claim.run_id), false, "no failed report");
+    assert.equal(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"), false);
+    assert.equal(tornDown?.preserveRecoveryClone, true);
+    assert.equal(tornDown?.preserveSession, true);
+    assert.equal(tornDown?.retainedLocalCustody, true);
+    assert.equal(tornDown?.keepGuardedInventoryOpen, true);
+    const slot = await slotOf(r.rt, canonical);
+    assert.equal(slot?.state, "active", "the earlier flight's epoch is untouched");
+    assert.equal(slot?.epoch, epoch);
+    assert.equal(r.rt.heldByOtherSink(canonical, new Set()), true, "the earlier flight still owns the key");
   });
 });

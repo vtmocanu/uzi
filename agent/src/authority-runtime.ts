@@ -403,11 +403,14 @@ export class AuthorityRuntime implements AuthorityScope {
     const ended: string[] = [];
     const kept: string[] = [];
     // A key another unreleased sink owns is not this caller's to end: reported kept, never queued, never released.
-    // Computed before A is taken: a stale answer only keeps a key (fails closed), and a key cannot become foreign
-    // during the wait because another sink's admission of it is refused while its current owner holds it.
+    // Computed before A is taken: a stale answer only keeps a key (fails closed). The `foreign` answer is stable
+    // for a key that is already owned when it is computed, because another sink's admission of an owned key is
+    // refused while its current owner holds it; a key that was unowned when computed and is admitted meanwhile is
+    // not in `foreign`, and the captured-lease check below drops it (this call holds no lease for it).
     // `skipFlightOwned` (a caller that is no flight, e.g. a retained-source discard that may have been refused before
-    // admitting anything) keeps every key with a recorded flight owner, except one whose current lease IS that
-    // caller's own discard lease (the operator discard of an unjoined key): that one still ends.
+    // admitting anything) keeps every owned key that has a captured lease unless that lease is the key's current
+    // discard lease (the operator discard of an unjoined key), which still ends. An owned key with no current lease
+    // is kept and rechecked, and its owner is released only when the recheck proves there is no epoch to end.
     const foreign = new Set(keys.filter((key) => options.skipFlightOwned === true && this.#owners.has(key) &&
         this.#discards.get(key) !== this.#leases.get(key) ||
       options.sink !== undefined && this.heldByOtherSink(key, options.sink)));

@@ -522,7 +522,7 @@ describe("discard through the real socket", () => {
     assert.equal(rig.gate.claimsClosed(), false);
   });
 
-  it("issue #3638 a refused discard asks for its source-use end with skipFlightOwned, so a flight's owned slot is not ended", async () => {
+  it("issue #3638 a refused discard passes skipFlightOwned to its source-use end", async () => {
     const a = await retainedAttempt("run-refused-owned", 1);
     const ended: Array<{ paths: string[]; options: { skipFlightOwned?: boolean } | undefined }> = [];
     const authority = {

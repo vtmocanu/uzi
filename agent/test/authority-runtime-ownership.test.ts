@@ -337,7 +337,6 @@ describe("per-key ownership", () => {
     const own = await r.rt.endSourceUse([r.other], { skipFlightOwned: true });
     assert.deepEqual(own.ended, [r.other]);
     // And the discard of an owned, unjoined key still ends its own discard lease.
-    r.rt.retireSink(a);
     await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "discard"));
     const discarded = await r.rt.endSourceUse([r.clone], { skipFlightOwned: true });
     assert.deepEqual(discarded.ended, [r.clone]);

@@ -11741,7 +11741,8 @@ export class RunRunner {
         error: errMessage(err), claim_generation: flight.claimGeneration });
       throw new RetainedRecoveryStop({ cause: err });
     };
-    // The re-seed after a reclaimed terminal orphan runs outside the loop's try, so it maps the refusal itself.
+    // The re-seed after a reclaimed terminal orphan runs inside the loop's catch, which has no handler for a
+    // refusal raised there, so it maps the refusal itself.
     const reseedAfterReclaim = async (): Promise<void> => {
       try {
         await refreshAttemptSeed();

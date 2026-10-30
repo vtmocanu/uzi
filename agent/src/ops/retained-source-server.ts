@@ -524,7 +524,7 @@ export class RetainedSourceServer {
         });
         // END SOURCE USE of the paths the discard admitted (still under the same A): a slot with an
         // unresolved record stays active (fail closed); a deleted source's slot leaves active. A key a live
-        // flight owns is never ended here (a refused discard admitted nothing of its own): skipFlightOwned.
+        // flight owns is never ended here (a refusal before the takeover admitted nothing): skipFlightOwned.
         if (entered.entered) await this.deps.authority?.endSourceUse?.(clonePaths, { skipFlightOwned: true });
         return entered;
       });
