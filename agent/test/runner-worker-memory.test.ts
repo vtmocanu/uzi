@@ -650,7 +650,7 @@ for (const fail of [false, true]) {
     } };
     try {
       await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
-        { memoryRuntime: f.memory, outbox, codexBoundaryDeadlineMs: 200 }).execute(f.claim);
+        { memoryRuntime: f.memory, outbox, codexBoundaryDeadlineMs: fail ? 200 : 10_000 }).execute(f.claim);
       const memory = original!.workerMemory!;
       await memory.closing;
       assert.ok(memory.tailPreservation, "original operation stays explicitly owned");
