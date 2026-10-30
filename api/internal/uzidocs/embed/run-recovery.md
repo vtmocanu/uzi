@@ -129,11 +129,11 @@ owner's source is left intact; the claim is requeued up to `RUN_MAX_REQUEUES`. A
 journal that changes under the call re-admits at most twice per claim, and the
 third is the same stop. The stop leaves the claim's own custody hold open, so at
 the cap the run parks `recovery_wait` with `worker_requeue_exhausted` for an owner
-Resume or Cancel. Each requeued claim opens its own custody hold and the stop leaves it open, so at
-the default cap of 3 one run accrues at most 4 open holds, below the default
+Resume or Cancel. Every claim opens its own custody hold and the stop leaves it open, so at
+the default cap of 3 one run accrues at most 4 open holds per exhaustion episode, below the default
 `custody_hold_limit` of 8; those holds share the owner's admission count with the
 owner's other runs, so several exhausted runs can hold the owner's new claims
-queued until an owner Resume or Cancel settles them. A retained-sources journal
+queued until those holds are discarded or released (Resume and Cancel leave them open). A retained-sources journal
 where authority finds neither a record carrying the fence nor a slot for the path
 (a classify `not_completion`) still takes the unchanged detach. In retire mode, a
 source that is positively invalid or unsupported keeps the outward refusal; for a

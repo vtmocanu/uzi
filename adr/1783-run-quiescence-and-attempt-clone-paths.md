@@ -1456,12 +1456,12 @@ the requeue cap (including 0) the run parks `recovery_wait` with cause
 `worker_requeue_exhausted` for an owner Resume or Cancel. Every claimant that can
 reach this path has the hold: profile-bound runs are routed to the isolated runner
 and never reach `RunRunner`, the other kinds have their own runners, and current
-images advertise the recovery capabilities the hold requires. Each requeued claim opens its
+images advertise the recovery capabilities the hold requires. Every claim opens its
 own hold and the stop leaves it open, so at the default cap of 3 one run accrues
-at most 4 open holds, below the default `custody_hold_limit` of 8; those holds
+at most 4 open holds per exhaustion episode, below the default `custody_hold_limit` of 8; those holds
 share the owner's admission count with the owner's other runs, so several
-exhausted runs can hold the owner's new claims queued until an owner Resume or
-Cancel settles them (the accrual `stopOnHeldSource` already has). This is proven by
+exhausted runs can hold the owner's new claims queued until those holds are discarded or
+released; Resume and Cancel leave them open. This is the accrual `stopOnHeldSource` already has. This is proven by
 `TestClaimantHandoffExhaustionLiveDB`.
 
 ### Diagnostics
