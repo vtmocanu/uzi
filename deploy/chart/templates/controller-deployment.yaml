@@ -301,9 +301,19 @@ spec:
             - name: UZI_CODEX_COMMAND_SANDBOX
               value: {{ .Values.workers.codex.commandSandbox | quote }}
             {{- end }}
-            {{- with .Values.workers.codex.commandCacheRunBytes }}
+            {{- /* Not `with`: a numeric 0 is falsy there and would silently render the
+            4 GiB default instead of disabling rotation. A string is quoted as-is; a number
+            goes through int64 | toString, because a YAML integer arrives as a float64 and a
+            bare quote would render 4294967296 as "4.294967296e+09", which the controller
+            refuses at boot. */}}
+            {{- $cacheRunBytes := .Values.workers.codex.commandCacheRunBytes }}
+            {{- if and (not (kindIs "invalid" $cacheRunBytes)) (ne (toString $cacheRunBytes) "") }}
             - name: UZI_CODEX_COMMAND_CACHE_RUN_BYTES
-              value: {{ . | quote }}
+              {{- if kindIs "string" $cacheRunBytes }}
+              value: {{ $cacheRunBytes | quote }}
+              {{- else }}
+              value: {{ $cacheRunBytes | int64 | toString | quote }}
+              {{- end }}
             {{- end }}
             {{- if .Values.workers.docker.enabled }}
             # The docker tier (PRD #83 M3, PRD #89). Namespace + image are required

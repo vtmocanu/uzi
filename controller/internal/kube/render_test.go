@@ -2150,6 +2150,21 @@ func TestCommandCacheRunBytesEnvOnlyWhenSet(t *testing.T) {
 	if v, ok := lookup(containerByName(t, unset.Containers, workerContainerName)); ok {
 		t.Errorf("an unset CommandCacheRunBytes must emit NO %s env, got %q", name, v)
 	}
+
+	// Unset leaves the spec hash identical to an explicit empty value; setting it rolls
+	// the fleet once (it changes the rendered pod).
+	explicitEmpty := testConfig()
+	explicitEmpty.CommandCacheRunBytes = ""
+	if SpecHashOf(testConfig(), desired("abc"), testSpec(t, "base", "m")) !=
+		SpecHashOf(explicitEmpty, desired("abc"), testSpec(t, "base", "m")) {
+		t.Error("an unset CommandCacheRunBytes changed the spec hash; the unset render must be byte-identical")
+	}
+	set := testConfig()
+	set.CommandCacheRunBytes = "4294967296"
+	if SpecHashOf(testConfig(), desired("abc"), testSpec(t, "base", "m")) ==
+		SpecHashOf(set, desired("abc"), testSpec(t, "base", "m")) {
+		t.Error("setting CommandCacheRunBytes must change the spec hash, or the value never rolls the fleet")
+	}
 }
 
 // --- non-rootless posture (PRD #89) ----------------------------------------
