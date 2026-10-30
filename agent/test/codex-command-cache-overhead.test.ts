@@ -257,12 +257,16 @@ interface MeasureRequest {
 }
 
 /**
- * The ONLY substitution against production: `StandaloneModeDeps.spawn` execs the built binary
- * directly (no setpriv), rewriting `--expect-uid <N>` to this process's uid and `--cache-root` to
- * the owned fixture root. Because the helper then prints `cache_ready` with the fixture path while
+ * In the helper process layer the only substitution against production is the spawn:
+ * `StandaloneModeDeps.spawn` execs the built binary directly (no setpriv), rewriting
+ * `--expect-uid <N>` to this process's uid and `--cache-root` to the owned 0700 fixture root.
+ * Because the helper then prints `cache_ready` with the fixture path while
  * `startCommandCacheHolder` requires `<CODEX_COMMAND_CACHE_ROOT>/<token>`, the --hold-cache stdout
  * has the fixture root text mapped back to the production root (a byte rewrite of the data chunks;
- * the process, its framing and its exit are untouched).
+ * the process, its framing and its exit are untouched). The holder, measure, limiter, remove and
+ * rotation code are production. The scenario also launches fake roots (no real Codex command; the
+ * test writes the files itself) and uses a no-op capture-admission check. Not measured: the
+ * setpriv/uid split, real Go/npm caches, large corpora, cold caches.
  */
 function makeSpawn(binary: string, root: string, helpers: HelperRecord[], requests: Map<string, MeasureRequest>): SpawnStandaloneMode {
   return (_command, args, options) => {
