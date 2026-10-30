@@ -58,6 +58,9 @@
 
 import { randomUUID } from "node:crypto";
 import { renderCodexRun } from "./render.js";
+import { CATALOG_PROBE_LIMIT, parseCatalogEntry, type CodexCatalogEntry } from "./catalog-probe.js";
+
+export type { CodexCatalogEntry } from "./catalog-probe.js";
 import { CodexRateLimitObserver } from "./rate-limits.js";
 import { LimitReachedError } from "../limit.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
@@ -251,6 +254,15 @@ export interface CodexHarnessOptions {
   /** Issue #1583: the 12-hex-char namespace of this harness's projected tool ids. Generated from
    *  `crypto.randomBytes` when absent; injectable so a test can pin the ids. */
   readonly idNonce?: string;
+  /** PRD #3247 M2: opt-in, once-per-instance `model/list` probe. Runs after the root thread is
+   *  started/resumed and before the first `turn/start`; `onEntry` is called synchronously with the
+   *  matching catalog entry, or `undefined` on any timeout/error/malformed/absent result. It never
+   *  throws into the turn. */
+  readonly catalogProbe?: {
+    readonly model: string;
+    readonly timeoutMs: number;
+    readonly onEntry: (entry: CodexCatalogEntry | undefined) => void;
+  };
 }
 
 // --- small pure helpers -------------------------------------------------------
@@ -629,6 +641,39 @@ export class CodexHarness implements RunHarness {
     return event;
   }
   private rateLimits = new CodexRateLimitObserver();
+  private catalogProbe?: CodexHarnessOptions["catalogProbe"];
+
+  /** PRD #3247 M2: one bounded `model/list` call; the result (or undefined) goes to `onEntry`.
+   *  Consumed on first use so a recreated turn or a resume fallback never probes twice. */
+  private async runCatalogProbe(signal: AbortSignal): Promise<void> {
+    const probe = this.catalogProbe;
+    if (!probe) return;
+    this.catalogProbe = undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let entry: CodexCatalogEntry | undefined;
+    try {
+      const call = this.requestOnTransport<unknown>(
+        "model/list",
+        { limit: CATALOG_PROBE_LIMIT, includeHidden: true },
+        { signal, deadlineMs: probe.timeoutMs },
+      );
+      const timeout = new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), probe.timeoutMs);
+      });
+      // A late rejection after the timeout wins must not become an unhandled rejection.
+      call.catch(() => undefined);
+      entry = parseCatalogEntry(await Promise.race([call, timeout]), probe.model);
+    } catch {
+      entry = undefined;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    try {
+      probe.onEntry(entry);
+    } catch {
+      /* the note is advisory; a callback fault never reaches the turn */
+    }
+  }
   // Resolves the current turn's abort race (see runTurn). The owner-aborted signal
   // resolves it via the listener; requestStop()/close() resolve it directly so a turn
   // WEDGED in a pending broker callback (a never-settling model-selected effect) still
@@ -661,6 +706,7 @@ export class CodexHarness implements RunHarness {
     this.emitClaimInit = opts.emitClaimInit ?? true;
     this.scrubProjected = opts.scrubProjected ?? ((s: string): string => s);
     this.idNonce = opts.idNonce ?? newProjectionNonce();
+    this.catalogProbe = opts.catalogProbe;
   }
 
   inspectSession(id: string): Promise<SessionPresence> {
@@ -1236,6 +1282,9 @@ export class CodexHarness implements RunHarness {
         // thread baselines at its pre-resume cumulative rather than zero.
         this.accountant.registerThread(this.threadId, this.currentModel ?? this.provider.model, resumed);
       }
+
+      // PRD #3247 M2: advisory catalog probe, before the abort check so a stop during it is honoured.
+      await this.runCatalogProbe(request.signal);
 
       // 3. Stop before sending model work if cancellation arrived during thread setup.
       if (request.signal.aborted || this.stopRequested) {

@@ -411,7 +411,7 @@ function isUnsafeNameChar(cp: number): boolean {
  *  length. MIRRORS broker.ts `safeId`; pure and allocation-bounded (one code-point pass
  *  + one slice). Only the human `name` is routed through this — never the machine-facing
  *  `kind`/`role` shape or the tool canonicalization. */
-function sanitizeName(s: string): string {
+export function sanitizeName(s: string): string {
   let out = "";
   for (const ch of s) {
     const cp = ch.codePointAt(0) ?? 0;

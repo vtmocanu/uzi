@@ -5881,6 +5881,119 @@ describe("CodexExecutor: no default_effort on the claim leaves the effort key of
   });
 });
 
+// PRD #3247 M2: Codex catalog probe + unsupported-level policy through the executor.
+describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", () => {
+  const opt = (reasoningEffort: string) => ({ reasoningEffort, description: "d" });
+  const catalog = (model: string, levels: string[]) =>
+    ({ data: [{ id: model, model, supportedReasoningEfforts: levels.map(opt), defaultReasoningEffort: "medium" }] });
+  const NOTE_EVENT = "effort_not_in_catalog";
+
+  async function run(opts: {
+    effort?: string; model?: string; list: (c: ResponderCtx) => unknown; timeoutMs?: number;
+    rejectTurn?: boolean; sessionId?: string; providerModel?: string; rejectResume?: boolean;
+  }) {
+    let emittedRef: { kind: string; payload: Record<string, unknown> }[] = [];
+    const log: string[] = [];
+    const rig = makeRig({ responder: (c) => {
+      if (c.method === "model/list") { log.push("model/list"); return opts.list(c); }
+      if (c.method === "turn/start") {
+        log.push(`turn/start:notes=${emittedRef.filter((m) => m.payload.event === NOTE_EVENT).length}`);
+        return { turn: { id: "tn-1" } };
+      }
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      return {};
+    } });
+    if (opts.rejectTurn) {
+      rig.transport.requestOverride = (c) => c.method === "turn/start"
+        ? Promise.reject(new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" }))
+        : undefined;
+    }
+    if (opts.rejectResume) {
+      rig.transport.requestOverride = (c) => c.method === "thread/resume"
+        ? Promise.reject(new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" }))
+        : undefined;
+    }
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx, emitted } = makeCtx({
+      config: { ...(opts.effort !== undefined ? { default_effort: opts.effort as never } : {}), ...(opts.model ? { default_model: opts.model } : {}) },
+      ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+    });
+    emittedRef = emitted as never;
+    const executor = makeExecutor({ ...rig, deps: { ...rig.deps, catalogProbeTimeoutMs: opts.timeoutMs ?? 10 } }, bindingOf(SUBSCRIPTION), noopLog, undefined,
+      opts.providerModel ? { ...provider, model: opts.providerModel } : provider);
+    let error: unknown;
+    try { await withTimeout(executor.run(ctx), 3000, "catalog probe run"); } catch (e) { error = e; }
+    const notes = (emitted as { payload: Record<string, unknown> }[]).filter((m) => m.payload.event === NOTE_EVENT);
+    return { rig, notes, log, error };
+  }
+
+  it("lists low..xhigh, claim effort max: one note before the first turn/start, level sent unchanged", async () => {
+    const { rig, notes, log, error } = await run({
+      effort: "max", model: "example-model", list: () => catalog("example-model", ["low", "medium", "high", "xhigh"]),
+    });
+    assert.equal(error, undefined);
+    assert.equal(notes.length, 1);
+    assert.equal(notes[0]!.payload.text,
+      "Codex does not list reasoning effort max for example-model. uzi sends it unchanged; the provider may reject it. Choose a listed level or Runtime default.");
+    assert.deepEqual(log, ["model/list", "turn/start:notes=1"]);
+    const turns = rig.transport.requests.filter((r) => r.method === "turn/start");
+    assert.equal(turns.length, 1);
+    assert.equal(rec(turns[0]!.params).effort, "max");
+    const list = rig.transport.requests.find((r) => r.method === "model/list");
+    assert.deepEqual(list?.params, { limit: 200, includeHidden: true });
+  });
+
+  it("sanitizes the model id in the note", async () => {
+    const hostile = "evil\u001b[31m\nmodel";
+    const { notes } = await run({ effort: "max", providerModel: hostile, list: () => catalog(hostile, ["low"]) });
+    assert.equal(notes.length, 1);
+    const text = String(notes[0]!.payload.text);
+    assert.ok(!text.includes("\u001b") && !text.includes("\n"), "control characters are replaced");
+  });
+
+  it("a provider rejection of turn/start fails the run through the normal path with exactly one turn/start", async () => {
+    const { rig, notes, error } = await run({
+      effort: "max", list: () => catalog("gpt-6-astra", ["low", "high"]), rejectTurn: true,
+    });
+    assert.ok(error instanceof Error, "the run fails");
+    assert.equal(notes.length, 1);
+    assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 1);
+  });
+
+  const quiet: [string, Parameters<typeof run>[0]][] = [
+    ["a listed level", { effort: "high", list: () => catalog("gpt-6-astra", ["low", "high"]) }],
+    ["Runtime default (no default_effort): the probe is never called", { list: () => { throw new Error("must not be called"); } }],
+    ["no matching entry", { effort: "max", list: () => catalog("other-model", ["low"]) }],
+    ["oversized data", { effort: "max", list: () => ({ data: Array.from({ length: 201 }, () => ({ id: "gpt-6-astra", model: "gpt-6-astra", supportedReasoningEfforts: [opt("low")] })) }) }],
+    ["a malformed entry (efforts not an array)", { effort: "max", list: () => ({ data: [{ id: "gpt-6-astra", model: "gpt-6-astra", supportedReasoningEfforts: "low" }] }) }],
+    ["an overlong effort string", { effort: "max", list: () => ({ data: [{ id: "gpt-6-astra", model: "gpt-6-astra", supportedReasoningEfforts: ["x".repeat(17)] }] }) }],
+    ["an unanswered model/list (10 ms timeout)", { effort: "max", list: () => new Promise(() => undefined) }],
+    ["a rejected model/list", { effort: "max", list: () => Promise.reject(new Error("boom")) }],
+  ];
+  for (const [name, input] of quiet) {
+    it(`emits no note and the turn proceeds: ${name}`, async () => {
+      const { rig, notes, error } = await run(input);
+      assert.equal(error, undefined);
+      assert.equal(notes.length, 0);
+      const turns = rig.transport.requests.filter((r) => r.method === "turn/start");
+      assert.equal(turns.length, 1);
+      assert.equal(rec(turns[0]!.params).effort, input.effort);
+      const listed = rig.transport.requests.filter((r) => r.method === "model/list").length;
+      assert.equal(listed, input.effort === undefined ? 0 : 1);
+    });
+  }
+
+  it("a resume rejection fallback probes at most once and sends one root turn/start", async () => {
+    const { rig, error } = await run({
+      effort: "max", list: () => catalog("gpt-6-astra", ["high"]), sessionId: "claimed-thread", rejectResume: true,
+    });
+    assert.equal(error, undefined);
+    assert.ok(rig.transport.requests.some((r) => r.method === "thread/resume"));
+    assert.equal(rig.transport.requests.filter((r) => r.method === "model/list").length, 1);
+    assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 1);
+  });
+});
+
 describe("CodexExecutor: an api_key run meters the root model end-to-end (executor→harness authMode wiring)", () => {
   it("forwards the claim's medium and explicit effort to the actual turn/start wire field", async () => {
     for (const effort of ["medium", "xhigh"] as const) {

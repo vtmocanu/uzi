@@ -35,8 +35,20 @@ higher levels spend more reasoning time and can produce deeper answers.
 
 Claude models that do not support a selected level can be silently
 downgraded by their SDK. Codex passes the selected level directly to its
-`turn/start` reasoning-effort parameter; an unsupported model/level pair is
-reported as a provider error rather than silently downgraded by uzi.
+`turn/start` reasoning-effort parameter and never rewrites, clamps or retries
+a level at another value. Before the first turn of an ordinary Codex lead
+claim that carries an explicit level (Runtime default sends none), the worker
+reads the Codex runtime's own catalog with one read-only `model/list` request
+(limit 200, hidden models included, 2000 ms timeout). If the matched model's
+entry does not list the chosen level, the run feed shows one warning: "Codex
+does not list reasoning effort `<level>` for `<model>`. uzi sends it
+unchanged; the provider may reject it. Choose a listed level or Runtime
+default." The level is still sent unchanged, and a provider rejection fails the
+turn through the normal failure path (the provider's message is not surfaced,
+so a rejection of a listed level stays opaque). An unknown, unreadable,
+oversized or timed-out catalog, or no matching entry, produces no warning. The
+catalog is per-account and can refresh, so the warning is advisory and can be
+wrong either way.
 
 The [judge](./judge.md) uses the preference for its own harness. Task-review
 and internal PR-description passes retain their existing SDK/catalog effort

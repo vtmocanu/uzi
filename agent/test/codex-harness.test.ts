@@ -654,6 +654,7 @@ function makeHarness(
     idNonce?: string;
     nowMs?: () => number;
     log?: Logger;
+    catalogProbe?: import("../src/codex/codex-harness.js").CodexHarnessOptions["catalogProbe"];
   } = {},
 ): HarnessBits {
   const transport = opts.transport ?? new FakeTransport();
@@ -678,6 +679,7 @@ function makeHarness(
     scrubProjected: opts.scrubProjected,
     idNonce: opts.idNonce,
     nowMs: opts.nowMs,
+    catalogProbe: opts.catalogProbe,
   });
   return { harness, transport, registry };
 }
@@ -6178,5 +6180,98 @@ describe("3506 retry context lifetime", () => {
     await collect(harness.startTurn(makeRequest()).events);
     assert.equal(notes.length, 1);
     assert.equal(harness.retryClassification?.classification, "rateLimitExceeded");
+  });
+});
+
+// PRD #3247 M2: the opt-in Codex catalog probe (`model/list`) and its bounded parser.
+describe("#3247 catalog probe", () => {
+  const opt = (reasoningEffort: string) => ({ reasoningEffort, description: "d" });
+  const listing = (model: string, efforts: unknown, extra: Record<string, unknown> = {}) =>
+    ({ data: [{ id: model, model, supportedReasoningEfforts: efforts, ...extra }] });
+
+  async function probeRun(
+    responder: (method: string, params: unknown) => unknown,
+    timeoutMs = 1000,
+  ): Promise<{ entries: unknown[]; order: string[]; transport: FakeTransport }> {
+    const entries: unknown[] = [];
+    const order: string[] = [];
+    const transport = new FakeTransport((method, params) => { order.push(method); return responder(method, params); });
+    const { harness } = makeHarness({
+      transport,
+      catalogProbe: { model: "gpt-6-astra", timeoutMs, onEntry: (e) => { order.push("onEntry"); entries.push(e); } },
+    });
+    transport.push(turnCompletedWithError("serverOverloaded")).end();
+    try {
+      await collect(harness.startTurn(makeRequest()).events);
+      transport.end();
+      await collect(harness.startTurn(makeRequest()).events).catch(() => undefined);
+    } finally { await harness.close(); }
+    return { entries, order, transport };
+  }
+
+  it("sends one bounded model/list after the thread starts and before turn/start, once per instance", async () => {
+    const { entries, order, transport } = await probeRun((method) =>
+      method === "model/list" ? listing("gpt-6-astra", [opt("low"), opt("high")], { defaultReasoningEffort: "low" }) : defaultResponder(method));
+    assert.deepEqual(entries[0], { defaultEffort: "low", supportedEfforts: ["low", "high"] });
+    assert.equal(entries.length, 1);
+    assert.equal(order.filter(m => m === "model/list").length, 1);
+    assert.ok(order.indexOf("thread/start") < order.indexOf("model/list"));
+    assert.ok(order.indexOf("onEntry") < order.indexOf("turn/start"));
+    const req = transport.requests.find(r => r.method === "model/list");
+    assert.deepEqual(req?.params, { limit: 200, includeHidden: true });
+  });
+
+  it("delivers undefined on an unknown-method {} reply, a rejection and a timeout, and the turn still starts", async () => {
+    for (const responder of [
+      (m: string) => defaultResponder(m),
+      (m: string) => (m === "model/list" ? Promise.reject(new Error("boom")) : defaultResponder(m)),
+      (m: string) => (m === "model/list" ? new Promise(() => undefined) : defaultResponder(m)),
+    ]) {
+      const { entries, order } = await probeRun(responder, 10);
+      assert.deepEqual(entries, [undefined]);
+      assert.ok(order.includes("turn/start"));
+    }
+  });
+
+  it("is not called without the option", async () => {
+    const transport = new FakeTransport();
+    const { harness } = makeHarness({ transport });
+    transport.push(turnCompletedWithError("serverOverloaded")).end();
+    try { await collect(harness.startTurn(makeRequest()).events); } finally { await harness.close(); }
+    assert.ok(!transport.requests.some(r => r.method === "model/list"));
+  });
+
+  it("a throwing onEntry never reaches the turn", async () => {
+    const transport = new FakeTransport((m) => (m === "model/list" ? listing("gpt-6-astra", ["low"]) : defaultResponder(m)));
+    const { harness } = makeHarness({ transport, catalogProbe: { model: "gpt-6-astra", timeoutMs: 1000, onEntry: () => { throw new Error("x"); } } });
+    transport.push(turnCompletedWithError("serverOverloaded")).end();
+    try { await collect(harness.startTurn(makeRequest()).events); } finally { await harness.close(); }
+    assert.ok(transport.requests.some(r => r.method === "turn/start"));
+  });
+
+  describe("parseCatalogEntry bounds", () => {
+    it("accepts object and bare-string efforts and matches by model or id", async () => {
+      const { parseCatalogEntry } = await import("../src/codex/catalog-probe.js");
+      assert.deepEqual(parseCatalogEntry({ data: [{ id: "a", model: "m", supportedReasoningEfforts: ["low", opt("max")] }] }, "a"),
+        { supportedEfforts: ["low", "max"] });
+      assert.deepEqual(parseCatalogEntry({ data: [{ id: "a", model: "m", supportedReasoningEfforts: [] }] }, "m"), { supportedEfforts: [] });
+    });
+
+    it("rejects malformed, oversized and unmatched responses", async () => {
+      const { parseCatalogEntry } = await import("../src/codex/catalog-probe.js");
+      const sup = (v: unknown, extra: Record<string, unknown> = {}) => ({ data: [{ id: "m", model: "m", supportedReasoningEfforts: v, ...extra }] });
+      const cases: unknown[] = [
+        undefined, null, [], "x", {}, { data: "x" },
+        { data: Array.from({ length: 201 }, () => ({ id: "m", model: "m", supportedReasoningEfforts: [] })) },
+        { data: [{ id: "other", model: "other", supportedReasoningEfforts: [] }] },
+        { data: [{ id: "m".repeat(101), model: "m".repeat(101), supportedReasoningEfforts: [] }] },
+        sup("low"), sup(undefined), sup(Array.from({ length: 17 }, () => "low")),
+        sup(["x".repeat(17)]), sup([1]), sup([{ reasoningEffort: 3 }]),
+        sup(["low"], { defaultReasoningEffort: "x".repeat(17) }), sup(["low"], { defaultReasoningEffort: 7 }),
+      ];
+      for (const c of cases) assert.equal(parseCatalogEntry(c, "m"), undefined, JSON.stringify(c)?.slice(0, 60));
+      assert.ok(parseCatalogEntry({ data: Array.from({ length: 200 }, () => ({ id: "m", model: "m", supportedReasoningEfforts: [] })) }, "m"));
+      assert.ok(parseCatalogEntry(sup(Array.from({ length: 16 }, () => "x".repeat(16))), "m"));
+    });
   });
 });
