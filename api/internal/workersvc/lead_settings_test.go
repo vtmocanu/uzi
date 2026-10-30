@@ -91,15 +91,14 @@ func TestResolveLeadSettingsBlankPinKeepsScheduleSource(t *testing.T) {
 	}
 }
 
-// TestResolveLeadEffortPreB pins resolveLeadEffort's PRE-child-B behavior (#3247 not landed): a
-// trimmed non-blank column is carried verbatim, valid or not, with source user_default; NULL or
-// blank gives the built-in medium. `runtime` and a corrupt value are NOT treated specially yet;
-// child B changes these rows when it consumes EffortResolution, and must update this test.
-func TestResolveLeadEffortPreB(t *testing.T) {
+// TestResolveLeadEffort pins the lead resolver to agenttmpl.ResolveHarnessEffort (#3247) for both
+// harnesses: NULL, blank and a corrupt stored value are the explicit built-in level with source
+// builtin; an exact level is user_default; `runtime` ships no effort (nil) with source user_default.
+func TestResolveLeadEffort(t *testing.T) {
 	cases := []struct {
 		name   string
 		effort pgtype.Text
-		value  string
+		value  string // "" = nil (runtime default)
 		source leadcfg.EffortSource
 	}{
 		{"null", pgtype.Text{}, "medium", leadcfg.EffortSourceBuiltin},
@@ -107,48 +106,32 @@ func TestResolveLeadEffortPreB(t *testing.T) {
 		{"whitespace", txt(" \t "), "medium", leadcfg.EffortSourceBuiltin},
 		{"explicit level", txt("high"), "high", leadcfg.EffortSourceUserDefault},
 		{"explicit padded", txt(" xhigh "), "xhigh", leadcfg.EffortSourceUserDefault},
-		{"runtime", txt("runtime"), "runtime", leadcfg.EffortSourceUserDefault},
-		{"corrupt", txt("HI gh"), "HI gh", leadcfg.EffortSourceUserDefault},
+		{"runtime", txt("runtime"), "", leadcfg.EffortSourceUserDefault},
+		{"runtime padded", txt(" runtime "), "", leadcfg.EffortSourceUserDefault},
+		{"corrupt", txt("HI gh"), "medium", leadcfg.EffortSourceBuiltin},
+		{"corrupt unknown level", txt("ultra"), "medium", leadcfg.EffortSourceBuiltin},
 	}
 	for _, h := range []Harness{HarnessClaude, HarnessCodex} {
 		for _, c := range cases {
 			t.Run(string(h)+"/"+c.name, func(t *testing.T) {
 				got, src := resolveLeadEffort(h, c.effort)
-				if got == nil || *got != c.value {
+				if c.value == "" {
+					if got != nil {
+						t.Errorf("effort = %q, want nil (runtime default)", *got)
+					}
+				} else if got == nil || *got != c.value {
 					t.Errorf("effort = %v, want %q", got, c.value)
 				}
 				if src != c.source {
 					t.Errorf("source = %q, want %q", src, c.source)
 				}
-			})
-		}
-	}
-}
-
-func TestLeadEffortSourceAndResolution(t *testing.T) {
-	for _, h := range []Harness{HarnessClaude, HarnessCodex} {
-		for _, c := range []struct {
-			name   string
-			effort pgtype.Text
-			source leadcfg.EffortSource
-		}{
-			{"unset", pgtype.Text{}, leadcfg.EffortSourceBuiltin},
-			{"empty", txt(""), leadcfg.EffortSourceBuiltin},
-			{"whitespace only", txt("  \t"), leadcfg.EffortSourceBuiltin},
-			{"chosen", txt("high"), leadcfg.EffortSourceUserDefault},
-			{"chosen padded", txt(" xhigh "), leadcfg.EffortSourceUserDefault},
-		} {
-			t.Run(string(h)+"/"+c.name, func(t *testing.T) {
-				if got := leadEffortSource(h, c.effort); got != c.source {
-					t.Errorf("leadEffortSource = %q, want %q", got, c.source)
+				// resolveLeadSettings and the ordinary-claim pointer agree with the lead resolver.
+				settings := resolveLeadSettings(LeadSettingsInput{Harness: h, UserEffort: c.effort})
+				if settings.EffortSource != c.source || (settings.Effort == nil) != (got == nil) {
+					t.Errorf("resolveLeadSettings = (%v, %q), want (%v, %q)", settings.Effort, settings.EffortSource, got, c.source)
 				}
-				got := resolveLeadSettings(LeadSettingsInput{Harness: h, UserEffort: c.effort})
-				want := resolveHarnessEffortPtr(h, c.effort)
-				if got.Effort == nil || *got.Effort != *want {
-					t.Errorf("Effort = %v, want %v", got.Effort, *want)
-				}
-				if got.EffortSource != c.source {
-					t.Errorf("EffortSource = %q, want %q", got.EffortSource, c.source)
+				if ptr := resolveHarnessEffortPtr(h, c.effort); (ptr == nil) != (got == nil) || (ptr != nil && *ptr != *got) {
+					t.Errorf("resolveHarnessEffortPtr = %v, lead effort = %v", ptr, got)
 				}
 			})
 		}

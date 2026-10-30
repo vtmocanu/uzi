@@ -214,6 +214,37 @@
       }
     },
     {
+      "id": "claude-owner-runtime-default-effort",
+      "harness": "claude",
+      "phase": "implement",
+      "config": {
+        "default_model": "opus",
+        "default_model_source": "user_default",
+        "default_effort_source": "user_default"
+      },
+      "expect": {
+        "model": "opus",
+        "modelSource": "user_default",
+        "effortMode": "runtime_default",
+        "effortSource": "user_default"
+      }
+    },
+    {
+      "id": "codex-owner-runtime-default-effort",
+      "harness": "codex",
+      "phase": "implement",
+      "config": {
+        "default_effort_source": "user_default"
+      },
+      "providerDefaultModel": "gpt-6.1-sol",
+      "expect": {
+        "model": "gpt-6.1-sol",
+        "modelSource": "builtin",
+        "effortMode": "runtime_default",
+        "effortSource": "user_default"
+      }
+    },
+    {
       "id": "claude-no-claim-fields",
       "harness": "claude",
       "phase": "implement",

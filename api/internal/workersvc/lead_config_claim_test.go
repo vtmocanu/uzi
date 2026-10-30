@@ -80,9 +80,12 @@ func TestClaimCarriesLeadProvenance(t *testing.T) {
 		wantEffort, wantEffortSrc     string
 		wantFallbackNotesAtLeastOne   bool
 		wantNoModelButSourceForEffort bool
+		wantNoEffort                  bool
 	}{
 		{name: "lane and builtin effort", lane: "opus", wantModel: "opus", wantModelSrc: "user_default", wantEffort: "medium", wantEffortSrc: "builtin"},
 		{name: "chosen effort", lane: "opus", effort: "high", wantModel: "opus", wantModelSrc: "user_default", wantEffort: "high", wantEffortSrc: "user_default"},
+		{name: "runtime effort ships none, source user_default", lane: "opus", effort: "runtime", wantModel: "opus", wantModelSrc: "user_default", wantEffort: "", wantEffortSrc: "user_default", wantNoEffort: true},
+		{name: "corrupt effort is builtin medium", lane: "opus", effort: "HI gh", wantModel: "opus", wantModelSrc: "user_default", wantEffort: "medium", wantEffortSrc: "builtin"},
 		{name: "whitespace effort is builtin", lane: "opus", effort: "  ", wantModel: "opus", wantModelSrc: "user_default", wantEffort: "medium", wantEffortSrc: "builtin"},
 		{name: "schedule pin", lane: "opus", runModel: "sonnet", wantModel: "sonnet", wantModelSrc: "schedule_pin", wantEffort: "medium", wantEffortSrc: "builtin"},
 		{name: "no lane ships no model and no model source", wantEffort: "medium", wantEffortSrc: "builtin"},
@@ -106,6 +109,9 @@ func TestClaimCarriesLeadProvenance(t *testing.T) {
 			}
 			if (p.Config.DefaultModel == nil) != (p.Config.DefaultModelSource == nil) {
 				t.Errorf("default_model_source must be present exactly when default_model is shipped")
+			}
+			if c.wantNoEffort && p.Config.DefaultEffort != nil {
+				t.Errorf("default_effort = %q, want the key omitted (runtime default)", *p.Config.DefaultEffort)
 			}
 			if got := derefOr(p.Config.DefaultEffort, ""); got != c.wantEffort {
 				t.Errorf("default_effort = %q, want %q", got, c.wantEffort)

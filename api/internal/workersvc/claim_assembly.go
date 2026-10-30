@@ -494,7 +494,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	// PRD #3244: the effort column is read here, after the model block and its notes (statement
 	// order unchanged), so the effort half of the lead settings is completed now. A lead-lane claim
-	// ships resolveLeadEffort's value as DefaultEffort, so the value and its source share one home.
+	// ships resolveLeadEffort's value as DefaultEffort (nil for the owner's runtime default), so the
+	// value and its source come from one agenttmpl.ResolveHarnessEffort call.
 	var defaultModelSource, defaultEffortSource *string
 	shippedEffort := resolveHarnessEffortPtr(harness, defaultEffort)
 	if leadResolved && leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {

@@ -25,7 +25,8 @@ type LeadSettings struct {
 	Model pgtype.Text
 	// ModelSource is empty exactly when Model is invalid.
 	ModelSource leadcfg.ModelSource
-	// Effort is as resolveHarnessEffortPtr returns it: always non-nil.
+	// Effort is the claim's default_effort; nil means the owner chose the runtime default (no
+	// default_effort is shipped).
 	Effort       *string
 	EffortSource leadcfg.EffortSource
 	// DroppedLaneModel is the trimmed Claude-lane Codex-role token the #3245 guard discarded, for
@@ -74,23 +75,12 @@ func resolveLeadSettings(in LeadSettingsInput) LeadSettings {
 // again with the late read instead of repeating the two expressions; resolveLeadSettings calls it
 // for LeadSettingsInput.UserEffort.
 //
-// Behavior is today's (pre child B #3247): the value is whatever resolveHarnessEffortPtr returns
-// (a trimmed non-blank column verbatim, valid or not; else the harness built-in) and the source is
-// user_default exactly when the column is non-blank after trimming. Child B, landing second, must
-// consume agenttmpl.ResolveHarnessEffort's EffortResolution here (value, source and the
-// runtime_default mode) and delete leadEffortSource: one resolver, never two.
+// It makes one agenttmpl.ResolveHarnessEffort call (#3247) and maps the EffortResolution: the
+// level is the claim's default_effort (nil for the owner's `runtime` choice, so the worker
+// records requested_effort_mode runtime_default), and the resolution's source is the
+// default_effort_source (NULL, blank or a corrupt stored value is builtin; a level or `runtime`
+// is user_default). The value mapping is shared with resolveHarnessEffortPtr.
 func resolveLeadEffort(harness Harness, userEffort pgtype.Text) (effort *string, source leadcfg.EffortSource) {
-	return resolveHarnessEffortPtr(harness, userEffort), leadEffortSource(harness, userEffort)
-}
-
-// leadEffortSource says whether the effort the claim ships came from the owner's column
-// (user_default) or from the uzi default (builtin). The test is the one
-// agenttmpl.ResolveDefaultEffort applies: a valid, non-blank (after trimming) value is the
-// owner's choice. The harness is accepted so the next resolver (per-harness defaults, child B)
-// extends this function rather than adding a second one.
-func leadEffortSource(_ Harness, userEffort pgtype.Text) leadcfg.EffortSource {
-	if userEffort.Valid && strings.TrimSpace(userEffort.String) != "" {
-		return leadcfg.EffortSourceUserDefault
-	}
-	return leadcfg.EffortSourceBuiltin
+	r := agenttmpl.ResolveHarnessEffort(string(harness), textPtr(userEffort))
+	return effortResolutionPtr(r), leadcfg.EffortSource(r.Source)
 }
