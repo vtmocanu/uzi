@@ -25,8 +25,9 @@ import (
 // The run-state DM seam (PRDs #25/#122/#268): handle turns a run-state transition
 // into the root/gate/question/milestone renderers and the thread blocks.
 
-// isCrossCheckChild: a cross_check child's Slack surface is its parent's plan-gate card
-// (PRD #2149 D10, PRD #2170), never a standalone run-state or health DM (#3628). Both
+// isCrossCheckChild: a cross_check child never gets a standalone run-state or health DM
+// (#3628); a plan check's gate reason, when present, is shown on the parent's gate card
+// (PRD #2149 D10), and a code check reports on the merge request (PRD #2170). Both
 // handle and handleHealth return on it before resolving delivery, so a child creates
 // no root, edits no root and threads no reply.
 func isCrossCheckChild(rc store.GetSlackRunContextRow) bool { return rc.Kind == runkind.CrossCheck }
