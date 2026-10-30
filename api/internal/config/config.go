@@ -394,10 +394,11 @@ type Config struct {
 	SeedReleaseCheckInterval      time.Duration
 	SeedReleaseCheckToken         string
 
-	// Agent-runtime (PRD #4) knobs. All have safe defaults; none is a boot guard
-	// (they tune the run queue / worker liveness, not security). RunIdleTimeout
-	// and RunMaxIterations are enforced worker-side and shipped in the claim
-	// payload; the rest drive the server sweeper and claim affinity.
+	// Agent-runtime (PRD #4) knobs tune the run queue / worker liveness.
+	// Defaults and invalid-value handling vary per setting; some malformed values
+	// reject API startup. RunIdleTimeout and RunMaxIterations are enforced
+	// worker-side and shipped in the claim payload; the rest drive the server
+	// sweeper and claim affinity.
 	PlanCrossCheckMaxRevisions int32
 	CodeCrossCheckTimeout      time.Duration // independent code checker wall-clock budget
 	PlanCrossCheckTimeout      time.Duration // bounded checker wall-clock budget

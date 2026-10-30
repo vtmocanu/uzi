@@ -36,6 +36,17 @@ and duplicates, and refuses unknown kinds at boot. Actual admission is narrower:
 after trailing-slash normalization. E2 reviewed one GitHub.com configuration;
 other hosts, forges and protected/ruleset configurations need their own reviewed
 probe. Parser acceptance and synthetic driver coverage are not enablement proof.
+The empty `.env.example` entry documents this default-off control and the
+unknown-kind boot refusal. The bundled Compose API environment passes the value
+through with an empty default, so setting it in `.env` affects incoming admission.
+
+Prerequisite Git transport derives its clone URL from fresh project metadata
+read by stable project ID, requiring the returned ID and WebURL to match the
+stored repository binding and the namespace path to agree with that WebURL.
+The prerequisite lane checks identity before and after Git observations and refuses Git redirects, including
+same-origin path redirects. REST metadata and Git remain separate observations:
+this does not make them atomic against a concurrent forge rename. These checks
+do not widen the reviewed GitHub.com strategy or establish hosted acceptance.
 
 A failed S0 insertion rolls back availability. Available/admit/stream-loser
 receipts and sweeps do not backfill rows. A postcommit kick belongs to the
