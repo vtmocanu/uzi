@@ -720,6 +720,11 @@ disables native `Bash` and `Monitor`. What changes for those runs
   automatic extension. Every call starts at the repository root.
 - At most 8 commands per run may be live; the 9th is refused with a visible
   error.
+- Commands one agent issues together run one after another, not at once (the
+  8-command cap counts all agents on the run), and a command placed after a
+  batch of subagents waits for that batch. To keep the integration gate
+  overlapping the review, the lead delegates the gate to one subagent in the
+  same batch as the reviewers.
 - Inline output is capped at 30000 characters (start and end preview). A
   best-effort spill file under `.uzi/scratch/uzi-cmd/` is capped at 64 MiB and
   truncated beyond that; it is bounded, not a promise of full output.
