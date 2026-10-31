@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { GitCache, MemoryReceiptSourceError, type MemoryParkRecord } from "../src/git.js";
 import { formatAttemptId } from "../src/attempt-path.js";
+import { RetainedStoppedSourceError } from "../src/residue-quarantine.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
 
@@ -80,16 +81,28 @@ async function attemptSource() {
   assert.equal(await cache.recordMemoryPark(bare, BRANCH, source, settled(info.path, attemptId)), "settled");
   return { ...source, memoryPark: parkBytes() };
 }
-const discover = (expected?: { runId: string; clonePath: string; attemptId: string; memoryPark: string }) =>
+const discover = (expected?: { runId: string; clonePath: string; attemptId?: string; memoryPark: string }) =>
   cache.discoverRetainedRecovery(fx.originPath, BRANCH, KEY, RUN, expected);
-async function refused(expected: Parameters<typeof discover>[0], reason: MemoryReceiptSourceError["reason"]) {
+async function refusedWith(expected: Parameters<typeof discover>[0], check: (error: unknown) => boolean) {
   const before = snapshot();
-  await assert.rejects(discover(expected), (error: unknown) => error instanceof MemoryReceiptSourceError && error.reason === reason);
+  await assert.rejects(discover(expected), check);
   const after = snapshot();
   assert.deepEqual(after.config, before.config, "bare config (attempt mode, ledger, markers) unchanged");
   assert.equal(after.journal, before.journal, "journal bytes unchanged");
   assert.equal(after.authority, before.authority, "authority files unchanged");
 }
+const refused = (expected: Parameters<typeof discover>[0], reason: MemoryReceiptSourceError["reason"]) =>
+  refusedWith(expected, (error) => error instanceof MemoryReceiptSourceError && error.reason === reason);
+const stoppedRefusal = (error: unknown) => error instanceof RetainedStoppedSourceError;
+
+/** A canonical (non-attempt) clone whose active journal carries a settled record; its expected binding has no attemptId. */
+async function canonicalSource() {
+  const clonePath = (await cache.createOrAttachRunnerClone(bare, 3639, noProofReseed, RUN)).path;
+  await cache.markRecoveryCapture(bare, clonePath, BRANCH, RUN);
+  assert.equal(await cache.recordMemoryPark(bare, BRANCH, { runId: RUN, clonePath }, settled(clonePath, null)), "settled");
+  return { runId: RUN, clonePath, memoryPark: parkBytes() };
+}
+const malformedMarker = () => gitIn(bare, ["config", "--add", `uzi-stopped.${RUN}.entry`, "not-json"]);
 
 beforeEach(async () => {
   fx = makeFixture();
@@ -111,6 +124,32 @@ describe("discoverRetainedRecovery with an expected memory receipt", () => {
     const after = snapshot();
     assert.deepEqual(after.config, before.config);
     assert.equal(after.authority, before.authority);
+  });
+
+  it("returns a canonical source for an exact match with no attempt id and writes nothing", async () => {
+    const expected = await canonicalSource();
+    const before = snapshot();
+    const found = await discover(expected);
+    assert.equal(found?.barePath, bare);
+    assert.equal(found?.journal.clonePath, expected.clonePath);
+    assert.equal(found?.journal.attemptId, undefined);
+    const after = snapshot();
+    assert.deepEqual(after.config, before.config);
+    assert.equal(after.journal, before.journal);
+    assert.equal(after.authority, before.authority);
+  });
+
+  it("a canonical journal refuses an expected attempt id, and an attempt journal refuses a missing one", async () => {
+    await refused({ ...await canonicalSource(), attemptId: aid(5) }, "changed");
+    gitIn(bare, ["config", "--unset-all", `uzi-recovery.${BRANCH}.clone`]);
+    const { attemptId: _dropped, ...withoutAttempt } = await attemptSource();
+    await refused(withoutAttempt, "changed");
+  });
+
+  it("an exactly matching attempt receipt with a malformed stopped marker of the run is refused, nothing changed", async () => {
+    const expected = await attemptSource();
+    malformedMarker();
+    await refusedWith(expected, stoppedRefusal);
   });
 
   it("a missing bare still answers undefined before any lock", async () => {
@@ -150,17 +189,15 @@ describe("discoverRetainedRecovery with an expected memory receipt", () => {
 
   describe("a stopped journal a plain discovery would heal", () => {
     const stop = async () => {
-      const clonePath = (await cache.createOrAttachRunnerClone(bare, 3639, noProofReseed, RUN)).path;
-      await cache.markRecoveryCapture(bare, clonePath, BRANCH, RUN);
-      assert.equal(await cache.recordMemoryPark(bare, BRANCH, { runId: RUN, clonePath }, settled(clonePath, null)), "settled");
+      const expected = await canonicalSource();
       gitIn(bare, ["config", "--add", `uzi-stopped.${RUN}.entry`, JSON.stringify({ version: 1, runId: RUN, generation: null,
-        branch: BRANCH, key: KEY, clonePath, journalDigest: createHash("sha256").update(rawJournal()).digest("hex"),
+        branch: BRANCH, key: KEY, clonePath: expected.clonePath, journalDigest: createHash("sha256").update(rawJournal()).digest("hex"),
         reason: "test", at: "2026-10-27T00:00:00.000Z" })]);
-      return { runId: RUN, clonePath, attemptId: aid(5), memoryPark: parkBytes() };
+      return expected;
     };
 
-    it("expected mode refuses without healing: journal, marker and attempt mode stay as they were", async () => {
-      await refused(await stop(), "changed");
+    it("expected mode refuses a matching stopped canonical source without healing: journal, marker and attempt mode stay as they were", async () => {
+      await refusedWith(await stop(), stoppedRefusal);
       assert.notEqual(rawJournal(), "", "the bound journal was not cleared");
     });
 

@@ -7116,7 +7116,8 @@ export class GitCache {
    * Confirmation here re-syncs and re-reads, but it is not independent of the journal: it proves only that the
    * journal's own bytes are durable and stable. An authoritative consumer (#3639) must bind `expected` to a reference
    * obtained independently of this journal (for example the server's accepted park binding).
-   * {@link GitCache.discoverRetainedRecovery} with `expected` is the read-only, non-healing form of that comparison.
+   * {@link GitCache.discoverRetainedRecovery} with `expected` is a read-only, non-healing re-check of the same
+   * run, clone path, attempt id (absent for a canonical clone) and record bytes, and additionally refuses a stopped source.
    */
   async readConfirmedMemoryPark(
     barePath: string, branch: string, expected: { runId: string; clonePath: string; attemptId?: string; record: MemoryParkRecord },
@@ -7833,7 +7834,7 @@ export class GitCache {
    * attempted; a journal that needs either throws instead. Without `expected` behaviour is unchanged. */
   async discoverRetainedRecovery(
     repoUrl: string, branch: string, key: string, runId: string,
-    expected?: { runId: string; clonePath: string; attemptId: string; memoryPark: string },
+    expected?: { runId: string; clonePath: string; attemptId?: string; memoryPark: string },
   ): Promise<{ barePath: string; journal: RecoveryJournalEntry } | undefined> {
     const barePath = this.barePathFor(repoUrl);
     if (!await this.pathPresent(barePath)) return undefined;

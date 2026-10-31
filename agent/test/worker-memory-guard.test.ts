@@ -1382,6 +1382,46 @@ test("waitSample is aborted by a signal or a stopped monitor and removes its lis
   assert.equal(await o.monitor.waitSample(0, 1000), "aborted", "a stopped monitor");
 });
 
+test("waitSample releases both its waiter-set entry and its abort-signal listener on every outcome", async () => {
+  const o = await observer((id, time) => sample(id, time));
+  const waiters = () => (o.monitor as unknown as { sampleWaiters: Set<unknown> }).sampleWaiters.size;
+  const fakeSignal = () => {
+    const listeners = new Set<() => void>();
+    let added = 0, removed = 0;
+    const signal = { aborted: false,
+      addEventListener: (_type: string, fn: () => void) => { added++; listeners.add(fn); },
+      removeEventListener: (_type: string, fn: () => void) => { removed++; listeners.delete(fn); } };
+    return { signal: signal as unknown as AbortSignal, counts: () => ({ added, removed, live: listeners.size }),
+      fire: () => { for (const fn of listeners) fn(); } };
+  };
+  const settled = (f: ReturnType<typeof fakeSignal>) => {
+    assert.deepEqual(f.counts(), { added: 1, removed: 1, live: 0 }, "the abort listener was added once and removed");
+    assert.equal(waiters(), 0, "no waiter left registered");
+  };
+  const wake = fakeSignal();
+  const woken = o.monitor.waitSample(0, 1000, wake.signal);
+  assert.equal(waiters(), 1);
+  o.advance(1); o.monitor.tick();
+  assert.equal(await woken, "sample");
+  settled(wake);
+  const expire = fakeSignal();
+  const late = o.monitor.waitSample(1, 16, expire.signal);
+  o.advance(20);
+  assert.equal(await late, "timeout");
+  settled(expire);
+  const abort = fakeSignal();
+  const aborted = o.monitor.waitSample(1, 1000, abort.signal);
+  assert.equal(waiters(), 1);
+  abort.fire();
+  assert.equal(await aborted, "aborted");
+  settled(abort);
+  const stopped = fakeSignal();
+  const pending = o.monitor.waitSample(1, 1000, stopped.signal);
+  await o.monitor.stop();
+  assert.equal(await pending, "aborted");
+  settled(stopped);
+});
+
 test("a disarmed guard rearms only inside evaluate after the ticket resolves and the quiet dwell passes", async () => {
   const f = await fixture({ autoReserve: true });
   try {

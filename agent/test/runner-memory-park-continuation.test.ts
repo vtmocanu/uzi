@@ -424,6 +424,22 @@ describe("the receipt gate and handoff (issue #3639)", () => {
     } finally { await p.done(); }
   });
 
+  it("a canonical-clone receipt names no attempt id: discovery expects none and the gate and handoff pass to CONSUMED", async () => {
+    const p = await parked();
+    try {
+      assert.equal(activeJournal()!.attemptId, undefined, "premise: the parked clone is canonical");
+      assert.equal(entryOf(p)?.attemptId, null);
+      const calls: unknown[][] = [];
+      const discover = git.discoverRetainedRecovery.bind(git);
+      git.discoverRetainedRecovery = async (...args: Parameters<typeof discover>) => { calls.push(args); return discover(...args); };
+      await resume(p);
+      assert.equal("attemptId" in (calls[0]![4] as object), false, "the expected binding carries no attemptId");
+      assert.equal(p.counters.refusals.length, 0);
+      assert.equal(p.counters.ran, 1);
+      assert.equal(entryOf(p)?.state, "consumed");
+    } finally { await p.done(); }
+  });
+
   it("R8: consumed entry: a claim with no reference is ordinary and keeps the entry; repeating the reference is ordinary too", async () => {
     const p = await parked();
     try {
@@ -753,14 +769,13 @@ describe("expected-bound discovery and the handoff (issue #3639)", () => {
     const p = await parked();
     try {
       const calls: unknown[][] = [];
-      const parkedAttempt = activeJournal()!.attemptId as string;
+      assert.equal(activeJournal()!.attemptId, undefined, "premise: the parked clone is canonical, so the binding names no attempt");
       const discover = git.discoverRetainedRecovery.bind(git);
       git.discoverRetainedRecovery = async (...args: Parameters<typeof discover>) => { calls.push(args); return discover(...args); };
       await resume(p);
       assert.equal(calls.length, 1);
-      const expected = calls[0]![4] as { runId: string; clonePath: string; attemptId: string; memoryPark: string };
-      assert.deepEqual(expected, { runId: p.f.claim.run_id, clonePath: p.clone, attemptId: parkedAttempt,
-        memoryPark: p.posts[0]!.bytes });
+      const expected = calls[0]![4] as { runId: string; clonePath: string; attemptId?: string; memoryPark: string };
+      assert.deepEqual(expected, { runId: p.f.claim.run_id, clonePath: p.clone, memoryPark: p.posts[0]!.bytes });
     } finally { await p.done(); }
   });
 

@@ -11898,7 +11898,8 @@ export class RunRunner {
             // issue #3639: bound to the receipt's source, read-only, and no flight coordinate is assigned here.
             if (cachePresent) {
               const retained = await this.git.discoverRetainedRecovery(claim.repo.clone_url, branch, coordinates.key, runId, {
-                runId, clonePath: receipt.entry.clonePath!, attemptId: (receipt.record.origin.attemptId ?? undefined) as string,
+                runId, clonePath: receipt.entry.clonePath!,
+                ...(receipt.record.origin.attemptId === null ? {} : { attemptId: receipt.record.origin.attemptId }),
                 memoryPark: receipt.entry.bytes! });
               if (retained) {
                 receiptBare = retained.barePath;

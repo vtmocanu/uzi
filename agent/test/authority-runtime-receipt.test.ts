@@ -92,4 +92,27 @@ describe("verifyReceiptSlots (issue #3639)", () => {
     assert.equal(slot.pending?.status, "running");
     assert.equal(await r.rt.verifyReceiptSlots([await r.source()], slot.owner.worker, sink), false);
   });
+  it("holds the authority lock: while another holder owns it the answer waits out its AuthorityWait (false), then is true after release", async (t) => {
+    const r = await rig(t);
+    const sink = new Set<string>();
+    await r.rt.recordAdmissions(sink, () => r.rt.bindSource(r.clone));
+    assert.equal((await r.rt.endSourceUse([r.clone])).endedSlots.length, 1);
+    const good = await r.source();
+    const worker = r.rt.authorityIncarnation()!;
+    let entered!: () => void;
+    const inside = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const holder = r.rt.withTransaction(async () => { entered(); await gate; });
+    await inside;
+    try {
+      const started = Date.now();
+      assert.equal(await r.rt.verifyReceiptSlots([good], worker, sink, { timeoutMs: 150 }), false, "the lock is held elsewhere: no answer before release");
+      assert.ok(Date.now() - started >= 100, "it waited for the lock instead of reading around it");
+    } finally {
+      release();
+      await holder;
+    }
+    assert.equal(await r.rt.verifyReceiptSlots([good], worker, sink), true, "after release the same slots verify");
+  });
 });
