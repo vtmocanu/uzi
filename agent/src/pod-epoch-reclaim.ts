@@ -189,6 +189,9 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       }
     } finally { cancelEvidence(); result.evidence_wait_ms = Math.max(0, now() - evidenceStart); }
     if ("handoff" in document) throw new Refusal("no_predecessor_evidence");
+    // A controller-declared contradiction defers; its free-text reason is never echoed.
+    if (document.version === 2 && document.attestation.result !== "consistent")
+      throw new Refusal("attestation_contradicted");
     try { assertPodEpochEvidenceBinding(document, boot.podUid, boot.runtime); }
     catch { throw new Refusal("evidence_binding"); }
     const evidence = document;

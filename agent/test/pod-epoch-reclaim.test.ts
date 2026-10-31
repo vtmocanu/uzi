@@ -229,6 +229,13 @@ test("negative and invalid evidence sanitize arbitrary reasons and binding failu
     assert.ok(JSON.stringify(result).length < 16000);
   }
 });
+test("a v2 contradicted attestation defers before any inventory or daemon request", async () => {
+  const raw = await readFile(new URL("../../fixtures/pod-epoch/v2/valid/contradicted.json", import.meta.url));
+  const { options, calls } = setup(); options.readEvidence = async () => raw;
+  const result = await runPodEpochShadow(options);
+  assert.equal(result!.verdict, "deferred"); assert.equal(result!.reason, "attestation_contradicted");
+  assert.equal(result!.would_delete, 0); assert.equal(result!.examined, 0); assert.equal(calls.handovers, 1);
+});
 test("missing projection polls reopened evidence until the soft stop, joining before handover", async () => {
   const { options, calls } = setup(); const time = clock(options);
   options.readEvidence = async () => { calls.reads++; throw Object.assign(new Error(), { code: "ENOENT" }); };

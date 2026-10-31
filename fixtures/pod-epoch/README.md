@@ -56,8 +56,8 @@ exactly integer 2. Two fields are added, both required at version 2:
 
 Presence rule by `version`: a version-1 document must NOT carry either field, a
 version-2 document must carry both. Version 1 remains the legacy corpus above
-(unchanged fixtures); a new worker treats version-1 evidence as legacy evidence
-that grants no authority, and a released version-1-only worker refuses every
+(unchanged fixtures). A version-2 consumer must treat version-1 evidence as
+legacy evidence that grants no authority. A released version-1-only worker refuses every
 version-2 document (the `version` check fails), so version 2 is safe to publish
 before the fleet drains.
 
@@ -66,8 +66,9 @@ prefixes of the predecessor (X) and successor (S) container IDs against the
 declared `runtime`: `containerd://` for `containerd-runc`, `cri-o://` for
 `crio-crun`. `consistent` means every observed ID carries the declared prefix;
 `contradicted` means at least one does not, with `reason` naming why (for example
-`predecessor_runtime_prefix`). The reason is a diagnostic string. The worker
-re-checks the prefixes itself and does not trust the attestation. A version-2
+`predecessor_runtime_prefix`). The reason is a diagnostic string. A consumer
+must refuse a `contradicted` document and must recompute the prefixes itself
+rather than trusting a `consistent` attestation. A version-2
 document alone still grants no cleanup authority: the worker's own pod UID,
 runtime, claim identity, lock and durable consumption rules all still apply.
 
