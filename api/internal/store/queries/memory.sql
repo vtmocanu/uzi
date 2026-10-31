@@ -216,7 +216,10 @@ ON CONFLICT DO NOTHING
 RETURNING run_id;
 
 -- name: GetMemoryParkReleaseForUpdate :one
-SELECT * FROM memory_park_releases WHERE run_id = @run_id AND claim_generation = @claim_generation
+-- Never selects the settlement bytes (up to 512 KiB): replay compares settlement_sha256.
+SELECT run_id, claim_generation, memory_episode, worker_id, register_nonce, released_at,
+    settlement_sha256, settled_at, lifted_at
+FROM memory_park_releases WHERE run_id = @run_id AND claim_generation = @claim_generation
 FOR UPDATE;
 
 -- name: SettleMemoryParkRelease :execrows
@@ -243,8 +246,11 @@ UPDATE runs SET released_worker_id = NULL, released_worker_nonce = NULL
 WHERE id IN (SELECT run_id FROM lifted);
 
 -- name: GetLatestMemoryParkRelease :one
--- The newest release row of a run (highest claim generation), for the claim reference.
-SELECT * FROM memory_park_releases WHERE run_id = @run_id
+-- The newest release row of a run (highest claim generation), for the claim reference. Never
+-- selects the settlement bytes: the reference needs only settlement_sha256.
+SELECT run_id, claim_generation, memory_episode, worker_id, register_nonce, settlement_sha256,
+    lifted_at, superseded_at
+FROM memory_park_releases WHERE run_id = @run_id
 ORDER BY claim_generation DESC LIMIT 1
 FOR UPDATE;
 

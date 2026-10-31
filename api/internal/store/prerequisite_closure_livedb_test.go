@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -636,9 +638,22 @@ func TestPrerequisiteClosureAttemptEightLiveDB(t *testing.T) {
 	}
 }
 
-// prerequisiteSchemaHead is the newest migration; later migrations (00388 for issue #3639) sit above
-// the prerequisite closure's 00387, and these tests roll down to 386 and back up to this head.
-const prerequisiteSchemaHead = 388
+// prerequisiteSchemaHead is the newest migration, read from the migrations directory so a later
+// migration does not need an edit here; these tests roll down to 386 and back up to this head. The
+// literal 387 below is the prerequisite closure's own migration, which is intentionally fixed.
+var prerequisiteSchemaHead = func() int64 {
+	entries, err := os.ReadDir("migrations")
+	if err != nil {
+		panic(err)
+	}
+	var head int64
+	for _, e := range entries {
+		if n, err := strconv.ParseInt(strings.SplitN(e.Name(), "_", 2)[0], 10, 64); err == nil && n > head {
+			head = n
+		}
+	}
+	return head
+}()
 
 func prerequisiteSchemaVersion(t *testing.T, ctx context.Context, pool *pgxpool.Pool, expected int64) {
 	t.Helper()

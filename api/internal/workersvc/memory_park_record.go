@@ -27,7 +27,11 @@ const (
 	memoryParkMaxDepth         = 16
 	memoryParkMaxSources       = 16
 	memoryParkMaxInterventions = 64
-	maxSafeInteger             = 1<<53 - 1
+	// memoryParkMaxValues bounds the JSON values one record may contain. The largest legitimate record
+	// (16 sources of 5 scalars, 64 intervention ids, the bindings and evidence) holds about 200 values;
+	// 512 leaves headroom while keeping a hostile body's tree small.
+	memoryParkMaxValues = 512
+	maxSafeInteger      = 1<<53 - 1
 	// MaxMemoryParkSettlementBytes caps a receipt body and the stored bytea (migration 00388).
 	MaxMemoryParkSettlementBytes = 524288
 )
@@ -102,8 +106,9 @@ type pjObject struct {
 }
 
 type pjParser struct {
-	b   []byte
-	pos int
+	b      []byte
+	pos    int
+	values int // JSON values entered so far, bounded by memoryParkMaxValues
 }
 
 func (p *pjParser) ws() {
@@ -119,6 +124,12 @@ func (p *pjParser) ws() {
 
 func (p *pjParser) value(depth int) (any, error) {
 	if depth > memoryParkMaxDepth {
+		return nil, errMemoryParkRecord
+	}
+	// Abort before the tree grows: a body of many tiny values (e.g. {"a":[{},{},...]}) would otherwise
+	// allocate far more than its byte length before any schema check runs.
+	p.values++
+	if p.values > memoryParkMaxValues {
 		return nil, errMemoryParkRecord
 	}
 	p.ws()

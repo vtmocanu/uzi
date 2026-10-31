@@ -437,28 +437,38 @@ func (q *Queries) FreezeMemoryPolicy(ctx context.Context, arg FreezeMemoryPolicy
 }
 
 const getLatestMemoryParkRelease = `-- name: GetLatestMemoryParkRelease :one
-SELECT run_id, claim_generation, memory_episode, worker_id, register_nonce, released_at, settlement, settlement_sha256, settled_at, lifted_at, superseded_at, created_at FROM memory_park_releases WHERE run_id = $1
+SELECT run_id, claim_generation, memory_episode, worker_id, register_nonce, settlement_sha256,
+    lifted_at, superseded_at
+FROM memory_park_releases WHERE run_id = $1
 ORDER BY claim_generation DESC LIMIT 1
 FOR UPDATE
 `
 
-// The newest release row of a run (highest claim generation), for the claim reference.
-func (q *Queries) GetLatestMemoryParkRelease(ctx context.Context, runID uuid.UUID) (MemoryParkRelease, error) {
+type GetLatestMemoryParkReleaseRow struct {
+	RunID            uuid.UUID          `json:"run_id"`
+	ClaimGeneration  int64              `json:"claim_generation"`
+	MemoryEpisode    int64              `json:"memory_episode"`
+	WorkerID         uuid.UUID          `json:"worker_id"`
+	RegisterNonce    string             `json:"register_nonce"`
+	SettlementSha256 []byte             `json:"settlement_sha256"`
+	LiftedAt         pgtype.Timestamptz `json:"lifted_at"`
+	SupersededAt     pgtype.Timestamptz `json:"superseded_at"`
+}
+
+// The newest release row of a run (highest claim generation), for the claim reference. Never
+// selects the settlement bytes: the reference needs only settlement_sha256.
+func (q *Queries) GetLatestMemoryParkRelease(ctx context.Context, runID uuid.UUID) (GetLatestMemoryParkReleaseRow, error) {
 	row := q.db.QueryRow(ctx, getLatestMemoryParkRelease, runID)
-	var i MemoryParkRelease
+	var i GetLatestMemoryParkReleaseRow
 	err := row.Scan(
 		&i.RunID,
 		&i.ClaimGeneration,
 		&i.MemoryEpisode,
 		&i.WorkerID,
 		&i.RegisterNonce,
-		&i.ReleasedAt,
-		&i.Settlement,
 		&i.SettlementSha256,
-		&i.SettledAt,
 		&i.LiftedAt,
 		&i.SupersededAt,
-		&i.CreatedAt,
 	)
 	return i, err
 }
@@ -489,7 +499,9 @@ func (q *Queries) GetMemoryIntervention(ctx context.Context, interventionID uuid
 }
 
 const getMemoryParkReleaseForUpdate = `-- name: GetMemoryParkReleaseForUpdate :one
-SELECT run_id, claim_generation, memory_episode, worker_id, register_nonce, released_at, settlement, settlement_sha256, settled_at, lifted_at, superseded_at, created_at FROM memory_park_releases WHERE run_id = $1 AND claim_generation = $2
+SELECT run_id, claim_generation, memory_episode, worker_id, register_nonce, released_at,
+    settlement_sha256, settled_at, lifted_at
+FROM memory_park_releases WHERE run_id = $1 AND claim_generation = $2
 FOR UPDATE
 `
 
@@ -498,9 +510,22 @@ type GetMemoryParkReleaseForUpdateParams struct {
 	ClaimGeneration int64     `json:"claim_generation"`
 }
 
-func (q *Queries) GetMemoryParkReleaseForUpdate(ctx context.Context, arg GetMemoryParkReleaseForUpdateParams) (MemoryParkRelease, error) {
+type GetMemoryParkReleaseForUpdateRow struct {
+	RunID            uuid.UUID          `json:"run_id"`
+	ClaimGeneration  int64              `json:"claim_generation"`
+	MemoryEpisode    int64              `json:"memory_episode"`
+	WorkerID         uuid.UUID          `json:"worker_id"`
+	RegisterNonce    string             `json:"register_nonce"`
+	ReleasedAt       pgtype.Timestamptz `json:"released_at"`
+	SettlementSha256 []byte             `json:"settlement_sha256"`
+	SettledAt        pgtype.Timestamptz `json:"settled_at"`
+	LiftedAt         pgtype.Timestamptz `json:"lifted_at"`
+}
+
+// Never selects the settlement bytes (up to 512 KiB): replay compares settlement_sha256.
+func (q *Queries) GetMemoryParkReleaseForUpdate(ctx context.Context, arg GetMemoryParkReleaseForUpdateParams) (GetMemoryParkReleaseForUpdateRow, error) {
 	row := q.db.QueryRow(ctx, getMemoryParkReleaseForUpdate, arg.RunID, arg.ClaimGeneration)
-	var i MemoryParkRelease
+	var i GetMemoryParkReleaseForUpdateRow
 	err := row.Scan(
 		&i.RunID,
 		&i.ClaimGeneration,
@@ -508,12 +533,9 @@ func (q *Queries) GetMemoryParkReleaseForUpdate(ctx context.Context, arg GetMemo
 		&i.WorkerID,
 		&i.RegisterNonce,
 		&i.ReleasedAt,
-		&i.Settlement,
 		&i.SettlementSha256,
 		&i.SettledAt,
 		&i.LiftedAt,
-		&i.SupersededAt,
-		&i.CreatedAt,
 	)
 	return i, err
 }

@@ -1,4 +1,5 @@
 -- +goose Up
+SET LOCAL lock_timeout = '5s';
 -- Issue #3639: one row per worker_memory_pressure park, written in the park transaction. It
 -- records the released (worker, register nonce) pair, the worker's settlement receipt once one
 -- is accepted, and whether the owner's Resume lifted the D19 released-pair exclusion for that
@@ -23,4 +24,5 @@ CREATE TABLE memory_park_releases (
 );
 
 -- +goose Down
+SET LOCAL lock_timeout = '5s';
 DROP TABLE memory_park_releases;

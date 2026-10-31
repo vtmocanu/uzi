@@ -78,9 +78,19 @@ func (f parkFixture) mustResume(t *testing.T) {
 	}
 }
 
+// latestRelease reads the whole newest release row, settlement bytes included. The production
+// queries deliberately omit those bytes, so the tests that assert on them read the table directly.
+func latestRelease(e codexTestEnv, runID uuid.UUID) (store.MemoryParkRelease, error) {
+	rows, err := e.pool.Query(e.ctx, "SELECT * FROM memory_park_releases WHERE run_id=$1 ORDER BY claim_generation DESC LIMIT 1", runID)
+	if err != nil {
+		return store.MemoryParkRelease{}, err
+	}
+	return pgx.CollectOneRow(rows, pgx.RowToStructByPos[store.MemoryParkRelease])
+}
+
 func (f parkFixture) release(t *testing.T) store.MemoryParkRelease {
 	t.Helper()
-	rel, err := f.e.q.GetLatestMemoryParkRelease(f.e.ctx, f.b.RunID)
+	rel, err := latestRelease(f.e, f.b.RunID)
 	if err != nil {
 		t.Fatalf("release row: %v", err)
 	}
@@ -256,14 +266,14 @@ func TestMemoryParkSettlementReplayCurrencyLiveDB(t *testing.T) {
 				}
 				change(t, f)
 				run := f.run(t)
-				rel, relErr := f.e.q.GetLatestMemoryParkRelease(f.e.ctx, f.b.RunID)
+				rel, relErr := latestRelease(f.e, f.b.RunID)
 				if _, err := f.settle(raw); !errors.Is(err, ErrMemoryStale) {
 					t.Fatalf("stale receipt = %v, want ErrMemoryStale", err)
 				}
 				if !reflect.DeepEqual(run, f.run(t)) {
 					t.Fatal("stale receipt changed the run")
 				}
-				if after, err := f.e.q.GetLatestMemoryParkRelease(f.e.ctx, f.b.RunID); !reflect.DeepEqual(rel, after) || !reflect.DeepEqual(relErr, err) {
+				if after, err := latestRelease(f.e, f.b.RunID); !reflect.DeepEqual(rel, after) || !reflect.DeepEqual(relErr, err) {
 					t.Fatalf("stale receipt changed the release row: %+v -> %+v (%v)", rel, after, err)
 				}
 			})
@@ -463,7 +473,7 @@ func TestMemoryParkLiftZeroMatchCommitsResumeLiveDB(t *testing.T) {
 			if run.Status != "queued" || run.MemoryEpisode != 1 || !run.ReleasedWorkerID.Valid || !run.ReleasedWorkerNonce.Valid {
 				t.Fatalf("zero-match Resume row: %+v", run)
 			}
-			if rel, err := f.e.q.GetLatestMemoryParkRelease(f.e.ctx, f.b.RunID); err == nil && rel.LiftedAt.Valid {
+			if rel, err := latestRelease(f.e, f.b.RunID); err == nil && rel.LiftedAt.Valid {
 				t.Fatalf("zero-match lifted: %+v", rel)
 			}
 			if p := f.claim(t, f.w.ID); p != nil {
@@ -596,6 +606,17 @@ func TestMemoryParkReferenceLiveDB(t *testing.T) {
 			t.Fatalf("second claim generation = %d", second.ClaimGeneration)
 		}
 	})
+	t.Run("a claim carrying an active snapshot gets the reference", func(t *testing.T) {
+		f := settledResumed(t)
+		snap := &ActiveSnapshot{SnapshotEpoch: 1, RegisterNonce: f.b.RegisterNonce, Active: []ActiveRunEntry{}}
+		p, err := f.s.Claim(f.e.ctx, wkrRow(t, f.e, f.w.ID), snap)
+		if err != nil || p == nil || p.MemoryParkReference == nil {
+			t.Fatalf("snapshot claim = %+v, %v", p, err)
+		}
+		if want := wantRef(f.release(t)); *p.MemoryParkReference != want {
+			t.Fatalf("reference = %+v, want %+v", *p.MemoryParkReference, want)
+		}
+	})
 	t.Run("a foreign claim supersedes it for good", func(t *testing.T) {
 		f := settledResumed(t)
 		other := f.otherWorker(t, "foreign", parkCaps)
@@ -706,7 +727,7 @@ func TestMemoryParkLiftLimitsLiveDB(t *testing.T) {
 		}
 	})
 	t.Run("only the memory Resume path lifts", func(t *testing.T) {
-		mutations := map[string]string{
+		mutations := map[string]string{ //nolint:gosec // G101: test SQL statements, not credentials
 			"wall hold":               "UPDATE runs SET status='paused', hold_reason='budget_exhausted' WHERE id=$1",
 			"compact hold":            "UPDATE runs SET status='paused', hold_reason='compact_exhausted' WHERE id=$1",
 			"credential switch":       "UPDATE runs SET status='paused', hold_reason='credential_switch_settling' WHERE id=$1",

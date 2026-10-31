@@ -125,6 +125,7 @@ func TestSemanticWorkerWritesUseWorkerLimiter(t *testing.T) {
 	for _, suffix := range []string{"candidate", "coverage/reserve", "coverage/settle", "coverage/publish"} {
 		want["/api/worker/runs/{id}/semantic/"+suffix] = false
 	}
+	want["/api/worker/runs/{id}/memory/settlement"] = false
 	budget := 0
 	for i, name := range limiterNames {
 		if name == limProposal {

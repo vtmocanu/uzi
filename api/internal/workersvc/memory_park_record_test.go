@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -23,11 +24,11 @@ var (
 
 func readParkFixture(t *testing.T, name string) ([]byte, string) {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join(memoryParkFixtureDir, name+".json"))
+	raw, err := os.ReadFile(filepath.Join(memoryParkFixtureDir, name+".json")) //nolint:gosec // G304: a fixed fixtures/memory-park file named by this test's own literals
 	if err != nil {
 		t.Fatal(err)
 	}
-	sum, err := os.ReadFile(filepath.Join(memoryParkFixtureDir, name+".json.sha256"))
+	sum, err := os.ReadFile(filepath.Join(memoryParkFixtureDir, name+".json.sha256")) //nolint:gosec // G304: a fixed fixtures/memory-park file named by this test's own literals
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,28 +203,31 @@ func TestMemoryParkDecoderRejectsMalformedBytes(t *testing.T) {
 	typical, _ := readParkFixture(t, "settlement-typical")
 	s := string(typical)
 	pathText := "/data/runner/org+repo/issue-3639"
+	idText := "00007007-0000-4000-8000-000000007007"
 	cases := map[string]string{
 		"empty":                "",
 		"trailing value":       s + s,
 		"trailing garbage":     s + "x",
 		"duplicate key":        strings.Replace(s, `"ack":"confirmed"`, `"ack":"confirmed","ack":"confirmed"`, 1),
 		"duplicate nested key": strings.Replace(s, `"seq":7`, `"seq":7,"seq":7`, 1),
-		"lone high surrogate":  strings.Replace(s, pathText+`"`, pathText+`\ud800"`, 1),
-		"lone low surrogate":   strings.Replace(s, pathText+`"`, pathText+`\udc00"`, 1),
-		"high then non-low":    strings.Replace(s, pathText+`"`, pathText+`\ud800A"`, 1),
-		"low then high":        strings.Replace(s, pathText+`"`, pathText+`\udc00\ud800"`, 1),
-		"high at string end":   strings.Replace(s, pathText+`"`, pathText+`\uD83D"`, 1),
-		"escaped NUL":          strings.Replace(s, pathText+`"`, pathText+`\u0000"`, 1),
-		"invalid utf-8":        strings.Replace(s, pathText+`"`, pathText+"\xff\"", 1),
-		"bad escape":           strings.Replace(s, pathText+`"`, pathText+`\x41"`, 1),
-		"raw control char":     strings.Replace(s, pathText+`"`, pathText+"\n\"", 1),
-		"exponent integer":     strings.Replace(s, `"seq":7`, `"seq":7e0`, 1),
-		"fraction integer":     strings.Replace(s, `"seq":7`, `"seq":7.0`, 1),
-		"negative zero":        strings.Replace(s, `"memoryEpisode":1`, `"memoryEpisode":-0`, 1),
-		"leading zero":         strings.Replace(s, `"seq":7`, `"seq":07`, 1),
-		"truncated":            s[:len(s)/2],
-		"array root":           "[" + s + "]",
-		"too deep":             strings.Repeat("[", 40) + strings.Repeat("]", 40),
+		// The surrogate cases target an intervention id, a field with no cross-check in the strict decode,
+		// so only the explicit surrogate rejection in str() can fail them.
+		"lone high surrogate": strings.Replace(s, idText+`"`, idText+`\ud800"`, 1),
+		"lone low surrogate":  strings.Replace(s, idText+`"`, idText+`\udc00"`, 1),
+		"high then non-low":   strings.Replace(s, idText+`"`, idText+`\ud800A"`, 1),
+		"low then high":       strings.Replace(s, idText+`"`, idText+`\udc00\ud800"`, 1),
+		"high at string end":  strings.Replace(s, idText+`"`, idText+`\uD83D"`, 1),
+		"escaped NUL":         strings.Replace(s, pathText+`"`, pathText+`\u0000"`, 1),
+		"invalid utf-8":       strings.Replace(s, pathText+`"`, pathText+"\xff\"", 1),
+		"bad escape":          strings.Replace(s, pathText+`"`, pathText+`\x41"`, 1),
+		"raw control char":    strings.Replace(s, pathText+`"`, pathText+"\n\"", 1),
+		"exponent integer":    strings.Replace(s, `"seq":7`, `"seq":7e0`, 1),
+		"fraction integer":    strings.Replace(s, `"seq":7`, `"seq":7.0`, 1),
+		"negative zero":       strings.Replace(s, `"memoryEpisode":1`, `"memoryEpisode":-0`, 1),
+		"leading zero":        strings.Replace(s, `"seq":7`, `"seq":07`, 1),
+		"truncated":           s[:len(s)/2],
+		"array root":          "[" + s + "]",
+		"too deep":            strings.Repeat("[", 40) + strings.Repeat("]", 40),
 	}
 	for name, in := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -234,6 +238,58 @@ func TestMemoryParkDecoderRejectsMalformedBytes(t *testing.T) {
 				t.Fatalf("accepted %q", in)
 			}
 		})
+	}
+}
+
+// The control for the surrogate cases above: the same field with a well-formed escape decodes, so the
+// surrogate is the only reason those cases fail.
+func TestMemoryParkDecoderAcceptsEscapeInInterventionID(t *testing.T) {
+	typical, _ := readParkFixture(t, "settlement-typical")
+	s := string(typical)
+	idText := "00007007-0000-4000-8000-000000007007"
+	in := strings.Replace(s, idText+`"`, idText+`\u0041"`, 1)
+	if in == s {
+		t.Fatal("mutation did not apply")
+	}
+	if _, err := decodeMemoryParkRecord([]byte(in)); err != nil {
+		t.Fatalf("control rejected: %v", err)
+	}
+}
+
+// Parse amplification: a body of many tiny values must be refused by the value cap before the generic
+// tree is built, not after. The 512 KiB body below allocates tens of MiB without the cap.
+func TestMemoryParkDecoderValueCapBoundsAllocation(t *testing.T) {
+	flat := func(n int) []byte {
+		return []byte(`{"a":[` + strings.TrimSuffix(strings.Repeat("{},", n), ",") + `]}`)
+	}
+	amplifiers := map[string][]byte{
+		"empty objects to the byte cap": flat((MaxMemoryParkSettlementBytes - 8) / 3),
+		"just over the value cap":       flat(memoryParkMaxValues),
+		"empty arrays":                  []byte(`{"a":[` + strings.TrimSuffix(strings.Repeat("[],", 100000), ",") + `]}`),
+	}
+	for name, body := range amplifiers {
+		if len(body) > MaxMemoryParkSettlementBytes {
+			t.Fatalf("%s: body %d exceeds the byte cap, so it would not test the value cap", name, len(body))
+		}
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		_, err := decodeMemoryParkRecord(body)
+		runtime.ReadMemStats(&after)
+		if err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+		if grew := after.TotalAlloc - before.TotalAlloc; grew > 1<<20 {
+			t.Fatalf("%s allocated %d bytes before rejection", name, grew)
+		}
+	}
+	// The cap trips on the value count itself: the walk of exactly the cap succeeds structurally.
+	p := &pjParser{b: flat(memoryParkMaxValues - 2)} // object + array + n elements = cap
+	if _, err := p.value(0); err != nil {
+		t.Fatalf("walk of exactly %d values failed: %v", memoryParkMaxValues, err)
+	}
+	p = &pjParser{b: flat(memoryParkMaxValues - 1)}
+	if _, err := p.value(0); err == nil {
+		t.Fatalf("walk of %d values was not refused", memoryParkMaxValues+1)
 	}
 }
 

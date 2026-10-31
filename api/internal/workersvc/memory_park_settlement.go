@@ -38,6 +38,11 @@ type MemoryParkSettlementResult struct {
 // consistent with the park's binding (a missing row is accepted, a foreign one is a conflict).
 // The first stored receipt is immutable; the same bytes replay as success while the park is current.
 func (s *Service) RecordMemoryParkSettlement(ctx context.Context, w store.Worker, runID uuid.UUID, raw []byte) (MemoryParkSettlementResult, error) {
+	// Only a worker that negotiated the receipt protocol may make the server decode a body at all; the
+	// in-lock check in memoryParkCurrentRelease repeats this against the locked row.
+	if !slices.Contains(w.ProtocolCapabilities, capability.MemoryParkSettlementV1) {
+		return MemoryParkSettlementResult{}, ErrMemoryStale
+	}
 	rec, interventionIDs, err := decodeMemoryParkReceipt(raw, runID, w.ID)
 	if err != nil {
 		return MemoryParkSettlementResult{}, err
@@ -69,7 +74,7 @@ func (s *Service) RecordMemoryParkSettlement(ctx context.Context, w store.Worker
 			return MemoryParkSettlementResult{}, ErrMemoryBinding
 		}
 	}
-	if rel.Settlement != nil {
+	if rel.SettledAt.Valid {
 		if !bytes.Equal(rel.SettlementSha256, sum[:]) {
 			return MemoryParkSettlementResult{}, ErrMemoryBinding
 		}
@@ -93,7 +98,7 @@ func (s *Service) RecordMemoryParkSettlement(ctx context.Context, w store.Worker
 // memoryParkCurrentRelease proves, under the caller's memory lock, that the receipt's binding is the
 // run's CURRENT unlifted worker_memory_pressure park and returns its locked release row. Each failed
 // proof is ErrMemoryStale.
-func (s *Service) memoryParkCurrentRelease(ctx context.Context, q *store.Queries, locked store.Worker, run store.Run, b MemoryBinding) (store.MemoryParkRelease, error) {
+func (s *Service) memoryParkCurrentRelease(ctx context.Context, q *store.Queries, locked store.Worker, run store.Run, b MemoryBinding) (store.GetMemoryParkReleaseForUpdateRow, error) {
 	if !slices.Contains(locked.ProtocolCapabilities, capability.MemoryParkSettlementV1) ||
 		!locked.SnapshotRegisterNonce.Valid || locked.SnapshotRegisterNonce.String != b.RegisterNonce ||
 		run.Status != "recovery_wait" || !run.RecoveryWaitCause.Valid ||
@@ -101,26 +106,26 @@ func (s *Service) memoryParkCurrentRelease(ctx context.Context, q *store.Queries
 		!run.ReleasedWorkerID.Valid || uuid.UUID(run.ReleasedWorkerID.Bytes) != b.WorkerID ||
 		!run.ReleasedWorkerNonce.Valid || run.ReleasedWorkerNonce.String != b.RegisterNonce ||
 		run.ClaimGeneration != b.ClaimGeneration || run.MemoryEpisode != b.MemoryEpisode {
-		return store.MemoryParkRelease{}, ErrMemoryStale
+		return store.GetMemoryParkReleaseForUpdateRow{}, ErrMemoryStale
 	}
 	parent, err := memoryParentCurrent(ctx, q, run)
 	if err != nil {
-		return store.MemoryParkRelease{}, err
+		return store.GetMemoryParkReleaseForUpdateRow{}, err
 	}
 	if !parent {
-		return store.MemoryParkRelease{}, ErrMemoryStale
+		return store.GetMemoryParkReleaseForUpdateRow{}, ErrMemoryStale
 	}
 	rel, err := q.GetMemoryParkReleaseForUpdate(ctx, store.GetMemoryParkReleaseForUpdateParams{
 		RunID: run.ID, ClaimGeneration: b.ClaimGeneration})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return store.MemoryParkRelease{}, ErrMemoryStale // a legacy park has no release row
+		return store.GetMemoryParkReleaseForUpdateRow{}, ErrMemoryStale // a legacy park has no release row
 	}
 	if err != nil {
-		return store.MemoryParkRelease{}, err
+		return store.GetMemoryParkReleaseForUpdateRow{}, err
 	}
 	if rel.WorkerID != b.WorkerID || rel.RegisterNonce != b.RegisterNonce || rel.MemoryEpisode != b.MemoryEpisode ||
 		!rel.ReleasedAt.Valid || !rel.ReleasedAt.Time.Equal(run.ClaimReleasedAt.Time) || rel.LiftedAt.Valid {
-		return store.MemoryParkRelease{}, ErrMemoryStale
+		return store.GetMemoryParkReleaseForUpdateRow{}, ErrMemoryStale
 	}
 	return rel, nil
 }

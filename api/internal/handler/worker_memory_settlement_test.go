@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -30,7 +31,7 @@ func settlementHTTP(h *Handler, worker *store.Worker, id string, body []byte) *h
 // decoder rejects is a 400 without a write.
 func TestWorkerMemoryParkSettlementBodyLimits(t *testing.T) {
 	h := &Handler{}
-	worker := store.Worker{ID: uuid.New()}
+	worker := store.Worker{ID: uuid.New(), ProtocolCapabilities: []string{capability.MemoryParkSettlementV1}}
 	id := uuid.New().String()
 	if r := settlementHTTP(h, nil, id, []byte("{}")); r.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated = %d", r.Code)
@@ -52,5 +53,15 @@ func TestWorkerMemoryParkSettlementBodyLimits(t *testing.T) {
 		if r := settlementHTTP(&Handler{wsvc: svc}, &worker, id, []byte(body)); r.Code != http.StatusBadRequest {
 			t.Fatalf("body %q = %d, want 400", body, r.Code)
 		}
+	}
+}
+
+// A worker that never negotiated the receipt protocol is refused before its body is decoded.
+func TestWorkerMemoryParkSettlementRequiresCapability(t *testing.T) {
+	svc := workersvc.New(nil, nil, workersvc.Params{})
+	worker := store.Worker{ID: uuid.New()}
+	r := settlementHTTP(&Handler{wsvc: svc}, &worker, uuid.New().String(), []byte("not json"))
+	if r.Code != http.StatusConflict {
+		t.Fatalf("no capability = %d, want 409", r.Code)
 	}
 }

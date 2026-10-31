@@ -3500,6 +3500,8 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		if s.txBeginner != nil {
 			return s.claimRunLeasedNoSnapshot(ctx, wkr, params, report)
 		}
+		// Test-only path: production always wires SetTxBeginner. Without a transaction there is no
+		// worker lock to hang the memory-park reference or supersede on, so this path skips both.
 		run, err := s.q.ClaimRun(ctx, params)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
