@@ -253,6 +253,46 @@ describe("Search partial results", () => {
       expectPartial(out, "time");
     });
 
+    it("time, pre-scan recheck: a read settling past the deadline drops that file's matches", async () => {
+      mock.timers.enable({ apis: ["setTimeout", "Date"] });
+      const mem = flat({ "a.txt": "needle\n", "b.txt": "needle b\n" });
+      mem.hook = (req) => {
+        if (req.op === "read" && req.path === "b.txt") {
+          mock.timers.tick(10_001);
+          return { ok: true, size: 9, data: b64("needle b\n") };
+        }
+        return undefined;
+      };
+      const out = outputOf(await call(brokerFor(memFileop(mem)), { query: "needle" }));
+      expectPartial(out, "time");
+      assert.equal(out.matches.length, 1);
+    });
+
+    it("entries boundary: exactly 16384 entries are not capped, 16385 are", async () => {
+      const build = (count: number): Mem => {
+        const mem = flat({ "a.txt": "needle\n" });
+        const entries: MemEntry[] = [{ name: "a.txt", type: "file" }];
+        for (let i = 1; i < count; i++) entries.push({ name: `l${String(i).padStart(5, "0")}`, type: "symlink" });
+        mem.dirs.set(".", { entries });
+        return mem;
+      };
+      const exact = outputOf(await call(brokerFor(memFileop(build(16384))), { query: "needle" }));
+      assert.equal(exact.truncated, false);
+      assert.equal(exact.reason, undefined);
+      const over = outputOf(await call(brokerFor(memFileop(build(16385))), { query: "needle" }));
+      assert.equal(over.truncated, true);
+      assert.equal(over.reason, "entries");
+    });
+
+    it("the first stop reason wins: a truncated listing is not replaced by the matches ceiling", async () => {
+      const mem = flat({ "a.txt": Array.from({ length: 21 }, () => "needle").join("\n") });
+      mem.dirs.get(".")!.truncated = true;
+      const out = outputOf(await call(brokerFor(memFileop(mem)), { query: "needle" }));
+      assert.equal(out.matches.length, 20);
+      assert.equal(out.truncated, true);
+      assert.equal(out.reason, "listing");
+    });
+
     it("file_size: an over-size file is skipped and a later file is still searched", async () => {
       const mem = flat({ "a.txt": "needle\n", "b.bin": "huge", "c.txt": "needle again\n" });
       mem.sizes = new Map([["b.bin", MIB + 1]]);
@@ -333,7 +373,17 @@ describe("Search partial results", () => {
     });
 
     it("does not treat a client-local E_NOT_DIR (no origin) as a file target", async () => {
-      const result = await call(brokerFor({ op: async () => ({ ok: false, code: "E_NOT_DIR" }) }), { query: "needle", path: "a.txt" });
+      const mem = flat({ "a.txt": "needle\n" });
+      mem.hook = (req) => (req.op === "list" ? { ok: false, code: "E_NOT_DIR" } : undefined);
+      const result = await call(brokerFor(memFileop(mem)), { query: "needle", path: "a.txt" });
+      assert.deepEqual(result, { ok: false, code: "fileop_denied", message: "file operation denied (E_NOT_DIR)", fileopCode: "E_NOT_DIR" });
+    });
+
+    it("denies a helper E_NOT_DIR on a subdirectory instead of searching it as a file", async () => {
+      const mem = flat({ "sub": "needle\n" });
+      mem.dirs.get(".")!.entries = [{ name: "sub", type: "dir" }];
+      mem.hook = (req) => (req.op === "list" && req.path === "sub" ? helperErr("E_NOT_DIR") : undefined);
+      const result = await call(brokerFor(memFileop(mem)), { query: "needle" });
       assert.deepEqual(result, { ok: false, code: "fileop_denied", message: "file operation denied (E_NOT_DIR)", fileopCode: "E_NOT_DIR" });
     });
   });

@@ -1306,7 +1306,7 @@ export class CodexCallbackBroker {
         const line = text.slice(lineStart, lineEnd);
         const matchAt = line.indexOf(query);
         if (matchAt >= 0) {
-          if (matches.length === SEARCH_MAX_MATCHES) return { result: partial("matches") };
+          if (matches.length === SEARCH_MAX_MATCHES) return { result: partial(stopReason ?? "matches") };
           const excerptStart = Math.max(0, matchAt - Math.floor((256 - query.length) / 2));
           matches.push({ path: rel, line: index, text: line.slice(excerptStart, excerptStart + 256) });
         }
