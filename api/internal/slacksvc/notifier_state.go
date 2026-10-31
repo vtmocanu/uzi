@@ -474,6 +474,9 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 		} else {
 			if (run.PlanCrossCheckRequired || run.PlanCrossCheckGated) && run.PlanCrossCheckGateReason.Valid {
 				crossCheckReason = run.PlanCrossCheckGateReason.String
+				if run.PlanCrossCheckGated && crossCheckReason == "worker_unsupported" {
+					crossCheckReason = "unavailable, not supported on this worker"
+				}
 				// The sub-code is meaningful only for this reason; gateCrossCheckReason
 				// sanitises the combined text.
 				if crossCheckReason == "planning_diff_refused" && run.PlanCrossCheckDiffRefusal.Valid {

@@ -18,7 +18,7 @@ import type { ClaimResponse, StateRequest } from "../src/protocol.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { PlanCrossCheckStateRequest } from "../src/client.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith } from "./runner-harness.js";
-import { feed, freshClaim, gates, newApi, row, send } from "./gate-revision-harness.js";
+import { feed, freshClaim, gates, newApi, row, send, until } from "./gate-revision-harness.js";
 import { enrollment, proposal, boundedTransport, hash } from "./semantic-coverage-fixture.js";
 import { semanticServer } from "./semantic-server-fixture.js";
 
@@ -511,7 +511,88 @@ describe("gated plan cross-check: never re-checked", () => {
     });
   }
 
-  it("a claim without the gated field never submits and opens the ordinary gate", { skip: LINUX_CAPTURE }, async () => {
+  it("a human revise queued before the first gate opens is not lost and triggers no extra check", { skip: LINUX_CAPTURE }, async () => {
+    const c = gatedClaim();
+    let queuedId = 0;
+    api.crossCheckHandler = ({ runId, body }) => {
+      // The human acts while the check is still pending: the gate has not opened yet.
+      if (queuedId === 0) queuedId = send(c.run_id, row("revise_plan", "early human feedback"))[0]!.id;
+      return { status: 200, body: answer(runId, body, "approve", "approve", { candidate: canonicalOf(body),
+        automatic_revision_limit: 2, automatic_rounds_enabled: true }) };
+    };
+    api.onState(c.run_id, (b) => {
+      if (b.status === "awaiting_approval" && b.plan_md === "# PLAN human revised") send(c.run_id, row("approve_plan", "final"));
+    });
+    const seen: PlanVerdict[] = [];
+    const exec: Executor = { run: async (ctx) => {
+      const first = await ctx.gatePlan!(PLAN);
+      seen.push(first);
+      assert.ok(first.kind === "revise" && !first.automatic, "the early revise is the human's, not automatic");
+      seen.push(await ctx.gatePlan!("# PLAN human revised", undefined, undefined, first.kind === "revise" ? first.inputId : undefined));
+      return { branch: ctx.branch };
+    } };
+    await start(exec, c);
+    assert.ok(queuedId > 0);
+    assert.deepEqual(seen.map((v) => v.kind), ["revise", "approve"], "the early revise was consumed, not lost");
+    assert.equal((seen[0] as { feedback?: string }).feedback, "early human feedback");
+    assert.equal(api.crossCheckRequests.length, 1, "no extra check for the human revise");
+    assert.equal(api.crossCheckLatestRequests.length, 0);
+    assert.equal(gates(c.run_id).length, 2, "the check's gate opened once, then the revised plan");
+    assert.equal(gates(c.run_id)[0]!.candidate_digest, digest);
+    assert.equal(Object.hasOwn(gates(c.run_id)[1]!, "candidate_digest"), false);
+    assert.ok(api.isApplied(c.run_id, queuedId), "the early revise input settled");
+    assertNoCheckedStorage(c.run_id);
+  });
+
+  it("a lost submit ACK: a same-generation retry resubmits the same round and creates no second round", { skip: LINUX_CAPTURE }, async () => {
+    // Generation 2 with no stored plan: the first execution submitted round 1 and its response was lost.
+    const c = gatedClaim(2);
+    api.crossCheckLatestHandler = () => ({ status: 200, body: {
+      result: "latest", round: 1, candidate_generation: 2, automatic_revision_limit: 2,
+      automatic_rounds_enabled: true, next_round: null, next_round_eligible: false, fallback_reason: "" } });
+    api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", {
+      ...proof(runId, 2), candidate: canonicalOf(body), candidate_generation: 2,
+      automatic_revision_limit: 2, automatic_rounds_enabled: true }) });
+    humanApproves(c.run_id);
+    const { exec, verdicts } = gatedExec();
+    await start(exec, c);
+    assert.deepEqual(api.crossCheckLatestRequests, [{ runId: c.run_id, generation: 2 }], "discovery ran once");
+    assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [1], "the same round is resubmitted, never round 2");
+    assert.equal(gates(c.run_id).length, 1);
+    assert.equal(gates(c.run_id)[0]!.candidate_digest, digest);
+    assert.equal(verdicts.length, 1);
+    assert.equal(verdicts[0]!.kind, "approve");
+    assert.notEqual((verdicts[0] as { approval?: string }).approval, "cross_check");
+    assertNoCheckedStorage(c.run_id);
+  });
+
+  it("owner cancellation while the check is pending presents no gate and mints no approval", { skip: LINUX_CAPTURE }, async () => {
+    const c = gatedClaim();
+    let context!: RunContext;
+    api.crossCheckHandler = async ({ runId, body }) => {
+      send(c.run_id, row("cancel"));
+      assert.ok(await until(() => context.cancelRequested!()));
+      return { status: 200, body: answer(runId, body, "approve", "approve", { candidate: canonicalOf(body),
+        automatic_revision_limit: 2, automatic_rounds_enabled: true }) };
+    };
+    humanApproves(c.run_id);
+    const verdicts: PlanVerdict[] = [];
+    const exec: Executor = { run: async (ctx) => {
+      context = ctx;
+      verdicts.push(await ctx.gatePlan!(PLAN));
+      return { branch: ctx.branch };
+    } };
+    await start(exec, c);
+    assert.equal(verdicts.length, 0, "no verdict reaches the executor");
+    assert.equal(gates(c.run_id).length, 0, "no human gate presented");
+    const states = api.states.filter((s) => s.runId === c.run_id).map((s) => s.body);
+    assert.ok(!states.some((s) => s.status === "awaiting_approval"), "never awaiting_approval");
+    assert.ok(!states.some((s) => s.status === "running" && s.plan_md), "no approval minted");
+    assert.ok(!states.some((s) => s.status === "completed" || s.status === "recovery_wait"));
+    assertNoCheckedStorage(c.run_id);
+  });
+
+  it("a claim without the gated field never submits and opens the ordinary gate",{ skip: LINUX_CAPTURE }, async () => {
     const c = freshClaim(1, { kind: "issue", auto_approve: false });
     api.crossCheckHandler = () => { throw new Error("an ungated run is never checked"); };
     humanApproves(c.run_id);

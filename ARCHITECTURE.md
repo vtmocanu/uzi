@@ -825,7 +825,9 @@ returns `gated_pass`, never an approval grant. Approval authority stays with the
 bound human-approval arms of `SetRunRunning`, widened from required to required
 or gated; `SetRunAutopilotPlan` refuses a gated run; and the trigger
 `enforce_gated_plan_approval` refuses `awaiting_approval` to `running` without a
-current bound approve input, under any api binary. `SetRunAwaitingApproval`
+current bound approve input; that edge holds under any api binary, while the
+`claimed` to `running` reclaim path under an older api is closed by the rollback
+drain, not the trigger. `SetRunAwaitingApproval`
 binds a "passed" verdict to the candidate digest and derives `interrupted` on a
 mismatch. The capability `cross_check_gated_v1` gates the mode: a gated claim
 carries `plan_cross_check_gated` only for a worker advertising it, and the

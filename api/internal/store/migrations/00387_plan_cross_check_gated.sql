@@ -35,7 +35,8 @@ ALTER TABLE runs ADD CONSTRAINT runs_plan_cross_check_gate_reason_check CHECK (
     'planning_diff_refused','interrupted','candidate_refused','checker_failed','revisions_exhausted',
     'worker_unsupported')) NOT VALID;
 
--- Fail-closed backstop that works under any api binary: leaving a gated awaiting_approval
+-- Fail-closed backstop that holds, for that one edge, under any api binary (the older-api
+-- claimed-to-running reclaim path is closed by the rollback drain, not by this trigger): leaving a gated awaiting_approval
 -- gate for running needs an applied, bound, non-superseded approve_plan input for the
 -- current gate revision and a stored plan equal to the presented one. This is a strict
 -- subset of the SetRunRunning bound arm and only guards that one edge (the same UPDATE may

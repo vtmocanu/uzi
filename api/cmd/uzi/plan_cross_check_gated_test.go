@@ -46,6 +46,13 @@ func TestRunGetGatedPassedRule(t *testing.T) {
 		{"revise latest", "", nil, "revise", false, "PLAN_CHECK_RESULT", "passed after"},
 		{"no summary, no reason", "", nil, "", false, "plan cross-check: not checked", "passed after"},
 		{"no summary, reason present", "", strp("worker_unsupported"), "", false, "", "not checked"},
+		{"historical approve, no reason", "", nil, "approve", true, "plan cross-check: checked an earlier version of this plan", "passed after"},
+		{"no summary, not yet gated (running)", "running", nil, "", false, "", "not checked"},
+		{"no summary, not yet gated (queued)", "queued", nil, "", false, "", "not checked"},
+		{"no summary, claimed", "claimed", nil, "", false, "", "not checked"},
+		{"no summary, completed", "completed", nil, "", false, "plan cross-check: not checked", ""},
+		{"no summary, failed", "failed", nil, "", false, "plan cross-check: not checked", ""},
+		{"no summary, cancelled", "cancelled", nil, "", false, "plan cross-check: not checked", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			status := tc.status

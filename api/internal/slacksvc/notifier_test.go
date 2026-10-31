@@ -755,6 +755,7 @@ func TestNotifierCrossCheckGateReason(t *testing.T) {
 		{"nil revision", "claude", "", true, pgtype.Text{}},
 		{"cleared revision", "codex", "", true, txt("")},
 		{"ordinary", "claude", "", false, txt("block")},
+		{"required keeps worker unsupported text", "claude", "worker unsupported", true, txt("worker_unsupported")},
 		{"unknown hostile", "codex", "future reason&lt;!channel&gt;", true, txt("future_reason\u202e\x1b\n<!channel>")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -796,7 +797,7 @@ func TestNotifierGatedCrossCheckGateLine(t *testing.T) {
 		reason     pgtype.Text
 	}{
 		{"gated block", "blocked", true, txt("blocked")},
-		{"gated worker unsupported", "worker unsupported", true, txt("worker_unsupported")},
+		{"gated worker unsupported", "unavailable, not supported on this worker", true, txt("worker_unsupported")},
 		{"gated no reason, never checked", "not checked", true, pgtype.Text{}},
 		{"neither mode", "", false, txt("blocked")},
 	} {

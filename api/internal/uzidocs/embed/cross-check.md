@@ -249,8 +249,8 @@ refuses the move from `awaiting_approval` to `running` for a checked-before-
 review run without a current approval bound to the presented plan. You approve,
 request changes or reject exactly as for any plan.
 
-**Outcomes at the gate.** The gate shows one of these results, with any
-findings:
+**Outcomes at the gate.** The gate typically shows one of these results, with
+any findings:
 
 | Result | Meaning |
 |--------|---------|
@@ -263,6 +263,8 @@ findings:
 | Unavailable | The checker could not start, failed, or gave no usable verdict. |
 | Unavailable, not supported on this worker | The lead's worker lacks the capability (see the version matrix below). |
 | Not checked | No check row exists for this plan. |
+| Checked an earlier version of this plan | You requested changes after a check; the check is historical and certifies nothing about the revised plan. |
+| Outcome unavailable | The recorded rows are inconsistent with a pass, so none is claimed. |
 
 A failed check never parks the run: it presents the gate with the reason. Web,
 CLI and Slack apply the same rule for **passed**: the gate carries no reason,
@@ -272,7 +274,8 @@ and does not certify the revised plan; no new check runs (ADR-2149 and PRD
 #2149 D16 are unchanged).
 
 **Every round, not only the last.** The run page and `uzi run get` list up to
-five rounds (the server's per-run cap): each round's verdict and findings,
+five rounds (for any plan cross-check with recorded rounds, auto-approved
+runs included) (the server's per-run cap): each round's verdict and findings,
 with the lead's response beside them. The response is the "Cross-check
 dispositions" section of the **next** round's candidate, capped at 8 KiB, and
 is labelled as the lead's unverified claims: nothing infers that a finding was

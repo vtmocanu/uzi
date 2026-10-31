@@ -1,6 +1,6 @@
 # PRD #3708: Plan cross-check before the human plan gate
 
-**Status**: In progress (2026-10-31). M1 delivered in committed code; M2 in progress (capability advertisement and the Codex-lead path land with unit U5); M3 live acceptance pending. Delivered checklist under Milestones.
+**Status**: In progress (2026-10-31). M1 and M2 delivered in committed code; M3 (live Kubernetes acceptance and rollback rehearsal, owner action) pending. Delivered checklist under Milestones.
 **Umbrella**: #3165 (deeper, observable cross-check).
 **Priority**: Normal
 **Revisits**: PRD #2149's out-of-scope line "Human-gated runs" (deferred there; no Decision Log entry rejected it). It keeps unchanged ADR-2149's and PRD #2149 D16's contract that a human revision triggers no fresh checker pass (ADR-2149, "Consistent with D16, a human revision of the plan triggers no new cross-family checker pass").

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"math"
 	"unicode/utf8"
 
@@ -47,8 +48,11 @@ func (s *Service) PlanCrossCheckSummary(ctx context.Context, userID, leadID uuid
 		Historical:    row.Historical,
 	}
 	dto.Findings = planCrossCheckFindings(row.Verdict, row.ReasonClass.String, row.Findings)
+	// The per-round history is supplementary: losing it must not hide the summary
+	// (clients would otherwise read a checked gated run as "not checked").
 	if err := s.attachPlanCrossCheckRounds(ctx, userID, leadID, dto); err != nil {
-		return nil, err
+		slog.WarnContext(ctx, "plan cross-check rounds unavailable", "lead_run_id", leadID, "err", err)
+		dto.Rounds = nil
 	}
 	if row.HasChild && row.CheckerRunID.Valid {
 		id := uuid.UUID(row.CheckerRunID.Bytes).String()

@@ -62,10 +62,17 @@ func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 	}
 	s := r.PlanCrossCheckSummary
 	if s == nil {
-		if r.PlanCrossCheckGated && r.PlanCrossCheckGateReason == nil {
-			rows = append(rows, []string{"PLAN_CROSS_CHECK", "plan cross-check: not checked"})
+		// Not "not checked" while the gated run is still before its first gate.
+		switch r.Status {
+		case "awaiting_approval", "completed", "failed", "cancelled":
+			if r.PlanCrossCheckGated && r.PlanCrossCheckGateReason == nil {
+				rows = append(rows, []string{"PLAN_CROSS_CHECK", "plan cross-check: not checked"})
+			}
 		}
 		return rows
+	}
+	if r.PlanCrossCheckGated && r.PlanCrossCheckGateReason == nil && s.Historical {
+		rows = append(rows, []string{"PLAN_CROSS_CHECK", "plan cross-check: checked an earlier version of this plan"})
 	}
 	// Shared "passed" rule (any status): a gated run with no gate reason, whose latest
 	// check approved the current plan (not historical), may say it passed.

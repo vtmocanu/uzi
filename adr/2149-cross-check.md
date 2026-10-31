@@ -396,7 +396,9 @@ now goes through the checked-plan loop before its first human gate. Decisions:
   outcome.
 - **Trigger and rollback boundary.** The trigger `enforce_gated_plan_approval` refuses
   `awaiting_approval` to `running` on a gated row without a current bound approve input, so the
-  rule holds under any api binary. A Down guard (also in
+  rule holds for that edge under any api binary. The `claimed` to `running` reclaim edge is not
+  guarded by the trigger; under an older api it is closed by the rollback drain (stopped api plus
+  a terminal drain), which is the admission barrier for that path. A Down guard (also in
   `scripts/gated-cross-check-drain-check.sql`) refuses rollback while any gated run is
   non-terminal; the operator drains first with the upgraded api stopped. The per-owner toggle
   is not an admission barrier.
