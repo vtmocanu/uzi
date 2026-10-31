@@ -98,7 +98,7 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 	//   busy    (1,7) pooled, fresh reading, runs on it across three lanes
 	//   idle    (1)   pooled, fresh reading, no runs at all — the rollup's 0 case
 	//   unread  (2)   pooled, NO gauge row at all — the gauge LEFT JOIN's miss
-	//   halfnul (3)   pooled, a row whose five_hour_pct is NULL — D12
+	//   halfnul (3)   pooled, a row whose seven_day_pct is NULL — D12
 	//   aged    (4)   pooled, a complete reading with an ancient synced_at
 	//   noreset (6)   pooled, complete and fresh, both resets_at NULL — +inf
 	//   unpool  (5)   NOT pooled, a perfect reading — must still be RETURNED
@@ -132,14 +132,15 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 	mkGauge(unpool, owner, 0, 0)
 	mkGauge(foreign, stranger, 0, 0)
 
-	// Case 3 (D12): a row exists and measured only ONE window. This also catches a
+	// Case 3 (D12): a row exists but its 7-day pct is NULL. (A NULL 5-hour pct alone
+	// is a measured plan without a 5-hour window, not this case.) This also catches a
 	// query that COALESCEs a NULL pct to 0, which would silently turn "we know
 	// nothing" into "this token is completely free" — the single worst direction for
 	// this bug, since an unmeasured token would then win every ranking.
 	if _, uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID: halfnul, UserID: owner,
-		FiveHourPct: pgtype.Int2{}, // NULL
-		SevenDayPct: pgtype.Int2{Int16: 30, Valid: true},
+		FiveHourPct: pgtype.Int2{Int16: 30, Valid: true},
+		SevenDayPct: pgtype.Int2{}, // NULL
 		Source:      pgtype.Text{String: "usage_endpoint", Valid: true},
 		SyncedAt:    pgtype.Timestamptz{Time: synced, Valid: true},
 	}); uerr != nil {
@@ -383,7 +384,7 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 		{"busy", busy, autoselect.StatusEligible, "case 1+7: fresh, measurable, with in-flight runs"},
 		{"idle", idle, autoselect.StatusEligible, "case 1: fresh and measurable"},
 		{"unread", unread, autoselect.StatusNoReading, "case 2: no gauge row at all"},
-		{"half-measured", halfnul, autoselect.StatusUnmeasured, "case 3: one window NULL (D12)"},
+		{"half-measured", halfnul, autoselect.StatusUnmeasured, "case 3: 7-day window NULL (D12)"},
 		{"aged", aged, autoselect.StatusStale, "case 4: the reading aged out"},
 		{"no-reset", noreset, autoselect.StatusEligible, "case 6: fresh, measurable, NULL resets"},
 		{"reserved", unpool, autoselect.StatusNotPooled, "case 5: not opted in"},
