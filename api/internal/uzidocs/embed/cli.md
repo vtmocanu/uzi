@@ -1950,9 +1950,9 @@ A newer release is available.
   `worker`; `judge` only on a band where some run has a verdict), shown only
   for visible columns and dropped where one would
   collide with the heading text; the run id, status and admin owner sit under
-  the heading itself. The status cell is as wide as the longest status word
-  on screen (at most 14 columns), so a board of short statuses gives the title
-  the spare room. The list windows to the terminal height so the wordmark and key
+  the heading itself. The status cell fits the longest status word on
+  screen and, where possible, leaves room for the heading's age label, capped
+  at 14 columns; the remaining space goes to the title. The list windows to the terminal height so the wordmark and key
   legend stay on screen however many runs there are, with the visible run
   span (`lo–hi`) and a seven-day cost shown in the top-right summary
   cluster (`⚑ N · ✎ N · ➤ N · ⚿ N · ▲ N · $N 7d · T runs`). On your own
