@@ -148,6 +148,7 @@ import {
   enrollPublicationIntent,
   publicationParkRefusal,
   resendPublicationRecord,
+  boundedPrSummaryJson,
   sliceWellFormed,
   type EnrolledPublicationRecord,
   type PublicationDeps,
@@ -3439,6 +3440,7 @@ export class RunRunner {
         run_id: runId, generation: claimGeneration, reason: ack.completedPublicationReason,
       });
     }
+    await this.discardPublicationRecordsOnTerminalAck(runId, body, ack);
     await this.settler.observeTerminalAck(runId, claimGeneration, body, ack).catch((err) => {
       this.log.warn("recovery settlement: terminal ACK observation failed", { run_id: runId, error: errMessage(err) });
     });
@@ -6499,7 +6501,7 @@ export class RunRunner {
         if (ack.applied && ack.status === body.status &&
             (ack.status === "completed" || ack.status === "failed"))
           await this.releaseUnjournaledCompletion(flight, body, incarnation);
-        if (ack.applied && ack.status === "completed" && body.status === "completed") await this.discardCompletedPublicationRecord(flight);
+        await this.discardPublicationRecordsOnTerminalAck(flight.runId, body, ack);
       } catch (err) {
         await clearFreshUnappliedAttempt(err, attempt);
         throw err;
@@ -6530,7 +6532,7 @@ export class RunRunner {
         if (ack.applied && ack.status === b.status &&
             (ack.status === "completed" || ack.status === "failed"))
           await this.releaseUnjournaledCompletion(flight, b, incarnation);
-        if (ack.applied && ack.status === "completed" && b.status === "completed") await this.discardCompletedPublicationRecord(flight);
+        await this.discardPublicationRecordsOnTerminalAck(flight.runId, b, ack);
         return ack;
       } catch (err) {
         if (err instanceof StaleClaimError) return { applied: false, staleClaim: true };
@@ -7030,9 +7032,10 @@ export class RunRunner {
         publication_step: "floor_refresh",
         claim_generation: gen,
       };
-      const outcome = await this.reportForgeParkAndDispatch(body, claim, flight, reportState, runLog, runHome);
-      if (outcome === "parked") await this.settleUnadoptedGuardedClaim(claim, flight, runLog);
-      return outcome;
+      // No settleUnadoptedGuardedClaim after a parked publication phase: the api refuses that settle while the
+      // run is in a publication phase. A refused-as-not-enrolled park falls back to the legacy park inside
+      // dispatchForgeParkAck, which settles after that one.
+      return await this.reportForgeParkAndDispatch(body, claim, flight, reportState, runLog, runHome);
     }
 
     if (features.includes("recovery_park_cause")) {
@@ -7528,7 +7531,7 @@ export class RunRunner {
       });
       return await this.reconcileForgeParkByProbe(body, claim, flight, reportState, runLog, runHome, copy);
     }
-    return await this.dispatchForgeParkAck(ack, claim, flight, runLog, runHome, copy);
+    return await this.dispatchForgeParkAck(ack, claim, flight, runLog, runHome, copy, body);
   }
 
   /**
@@ -7545,6 +7548,7 @@ export class RunRunner {
     runLog: Logger,
     runHome: string | undefined,
     copy: PreCloneParkCopy = FORGE_PARK_COPY,
+    sent?: StateRequest,
   ): Promise<"parked" | "stop" | "fail"> {
     const { batcher } = flight;
     if (ack.reason === "stale_claim") {
@@ -7554,6 +7558,22 @@ export class RunRunner {
       return "stop";
     }
     const publicationRefusal = publicationParkRefusal(ack);
+    if (publicationRefusal === "publication_not_enrolled" && sent?.recovery_phase === "publication" &&
+        flight.barePath === undefined && flight.worktreePath === undefined && flight.runnerClone === undefined &&
+        this.client.protocolFeatures.includes("recovery_park_cause")) {
+      // Issue #1324: the api holds NO active enrollment for the publication-phase park, and nothing was adopted
+      // (pre-clone), so the claim's enrollment is gone and the legacy typed pre-clone forge park is the right
+      // report. It is sent as that park (and its empty guarded hold settled after it), not a silent stop.
+      runLog.warn(`${copy.log}: publication park refused (publication_not_enrolled) before any clone; sending the legacy typed forge park`, { run_id: flight.runId });
+      const legacy: StateRequest = {
+        status: "recovery_wait",
+        recovery_cause: "forge_unreachable",
+        ...(claim.claim_generation !== undefined ? { claim_generation: claim.claim_generation } : {}),
+      };
+      const outcome = await this.reportForgeParkAndDispatch(legacy, claim, flight, flight.reportState, runLog, runHome, copy);
+      if (outcome === "parked") await this.settleUnadoptedGuardedClaim(claim, flight, runLog);
+      return outcome;
+    }
     if (publicationRefusal) {
       // Issue #1324: a refused publication-phase park never falls back to a source-releasing or failed
       // path. Nothing is reported; the run stays non-terminal for the register reconciliation.
@@ -7734,7 +7754,7 @@ export class RunRunner {
         // The transaction did not land; resend the SAME report (idempotent) and dispatch its ack.
         try {
           const ack = await reportState(body);
-          return await this.dispatchForgeParkAck(ack, claim, flight, runLog, runHome, copy);
+          return await this.dispatchForgeParkAck(ack, claim, flight, runLog, runHome, copy, body);
         } catch (reportErr) {
           if (reportErr instanceof RequestError && reportErr.status === 400) {
             runLog.warn(`${copy.log} reconcile: resend rejected 400; taking the failed path (no park)`, {
@@ -7766,7 +7786,7 @@ export class RunRunner {
   }
 
   private publicationDeps(flight: RunFlight, signal?: AbortSignal): PublicationDeps {
-    return { store: this.outbox!, api: this.client, liveClaimGeneration: flight.claimGeneration, ...(signal ? { signal } : {}), ...this.publicationRetry };
+    return { store: this.outbox!, api: this.client, ownerKind: flight.runKind === "task" ? "task" : "issue", liveClaimGeneration: flight.claimGeneration, ...(signal ? { signal } : {}), ...this.publicationRetry };
   }
 
   /**
@@ -9197,7 +9217,8 @@ export class RunRunner {
     // remote step. Nothing remote has run yet, and nothing below runs when the outcome is unknown.
     {
       const sr = flight.secretRemediation;
-      const finding = (f: SecretFinding) => ({ file: f.file, start_line: f.startLine, commit: f.commit, rule_id: f.ruleId });
+      // No `file`: a committed path can itself be a secret, and the resume guard needs only the commit, rule and line.
+      const finding = (f: SecretFinding) => ({ start_line: f.startLine, commit: f.commit, rule_id: f.ruleId });
       const sha40 = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{40}$/.test(v);
       const publicationStart = await this.enrollPublication(claim, flight, {
         branch: result.branch,
@@ -9207,9 +9228,18 @@ export class RunRunner {
           checkpoint_key: flight.runKind === "task" ? (flight.checkpointCoordinates?.checkpoint_key ?? null) : null,
         },
         mr: {
-          title: sliceWellFormed(mrTitle(claim, result.scopeCapped, completionScope), 1024),
-          summary: result.prSummary === undefined ? "" : sliceWellFormed(JSON.stringify(result.prSummary), 16 * 1024),
-          closing: issuePublication && typeof claim.issue_iid === "number" ? [`#${claim.issue_iid}`] : [],
+          // Redacted exactly like the MR path (buildDeliveryContext / redactText) before it enters the durable intent.
+          title: sliceWellFormed(redactText(mrTitle(claim, result.scopeCapped, completionScope)), 1024),
+          // The structured claim as redacted, well-formed JSON (never a cut one): the publisher's lead_only and
+          // deterministic_only modes (leadFields in pr-description-publisher.ts) are built from exactly this
+          // object, so M5 parses it back with JSON.parse and feeds it to them as the lead claim.
+          summary: boundedPrSummaryJson(result.prSummary, redactText),
+          // The recorded closing set is only what is KNOWN to close at enrollment: a declared, owner-partial or
+          // scope-capped delivery, an interlocked one (Closes is added only after the head is verified) and one
+          // decided later (pendingNonClosing, which the publication ACK supplies) record none. M5 MUST recompute
+          // closing at resume from the live claim and the delivery rules, and never trust this value to close an issue.
+          closing: issuePublication && typeof claim.issue_iid === "number" && !effectiveDeclared && !result.scopeCapped &&
+            (completionScope?.deferred?.length ?? 0) === 0 && !interlocked ? [`#${claim.issue_iid}`] : [],
           contract_revision: claim.config?.completion_contract_version ?? 0,
         },
         guard: {
@@ -9437,13 +9467,15 @@ export class RunRunner {
       // Each deliberate candidate starts a group; network retries keep this exact C/H/P.
       if (!publicationOriginalHead) throw new ScratchPublicationError("original imported head is unavailable", undefined, { kind: "floor_unverified", step: "floor_refresh" });
       const candidate = await this.git.scratchPublicationPreflight(finalizeBarePath, result.branch);
-      // Issue #1324 D2: a transformed candidate C (base align, bridge) is pinned beside H, saved locally
-      // and acknowledged by the api BEFORE the push that uses it. An unconfirmed C throws, so nothing is pushed.
+      // Issue #1324 D2: EVERY transformed candidate C (base align, then bridge) is pinned beside H, saved locally
+      // and acknowledged by the api BEFORE the push that uses it. For an enrolled run a candidate that cannot be
+      // pinned (the pin returned nothing, or did not record this candidate) is never pushed: it is retained like
+      // an unconfirmed candidate, and no failure is reported. An unconfirmed C throws, so nothing is pushed.
       if (flight.publicationRecord && flight.publicationRecord.candidate !== candidate) {
-        if (recoveryRecord) {
-          await this.recovery.pin({
+        if (this.recovery.enabled) {
+          const pinned = await this.recovery.pin({
             runId,
-            sourceSha: recoveryRecord.sourceSha,
+            sourceSha: recoveryRecord?.sourceSha ?? publicationOriginalHead,
             attemptedHeadSha: candidate,
             kind: resolveRunKind(claim.kind),
             branch: result.branch,
@@ -9454,7 +9486,15 @@ export class RunRunner {
             finalizationPin: true,
           }).catch((pinError: unknown) => {
             runLog.warn("recovery: could not pin the transformed publication candidate", { run_id: runId, error: errMessage(pinError) });
+            return undefined;
           });
+          if (!pinned || !(pinned.attemptedHeadShas ?? (pinned.attemptedHeadSha ? [pinned.attemptedHeadSha] : [])).includes(candidate)) {
+            batcher.emit({ kind: "status", agent: "worker", payload: {
+              text: "the transformed publication candidate could not be pinned; nothing was pushed and the work is retained until it is reconciled",
+            } });
+            this.retainForPublicationReconciliation(flight, "candidate_pin_failed");
+            throw new PublicationUnconfirmedSignal();
+          }
         }
         await this.confirmPublicationCandidate(flight, candidate, boundarySignal);
       }
@@ -18048,19 +18088,26 @@ export class RunRunner {
   }
 
   /**
-   * Issue #1324: the api acknowledged this run's completion (applied, status completed), so it retired the
-   * enrollment and the local publication record has nothing left to guard. Removed only for the exact
-   * enrollment_seq it carries; any other outcome keeps it for the register reconciliation.
+   * Issue #1324: the api APPLIED a terminal write for this run (completed, failed or cancelled). The same
+   * transaction closed the run's publication enrollment (migration 00386 `close_publication_resume_trg`), so
+   * no local publication record of ANY generation has anything left to guard, whichever flight or replay
+   * delivered the ACK. Each is removed only for the exact enrollment_seq it carries (a sequence-less record
+   * for none); a record that fails to authenticate or read is kept, and so is every record on an unapplied,
+   * stale or non-terminal answer. A discard failure only logs: the register reconciliation retires it.
    */
-  private async discardCompletedPublicationRecord(flight: RunFlight): Promise<void> {
+  private async discardPublicationRecordsOnTerminalAck(runId: string, body: { status: string }, ack: StateAck): Promise<void> {
     const outbox = this.outbox;
-    if (!outbox || outbox.isDisabled() || !outbox.hasPublicationRecords(flight.runId)) return;
-    try {
-      const loaded = await outbox.loadPublicationRecord(flight.runId, flight.claimGeneration);
-      if (loaded.kind !== "ok" || loaded.record.enrollment_seq === undefined) return;
-      await outbox.discardPublicationRecord(flight.runId, flight.claimGeneration, { enrollment_seq: loaded.record.enrollment_seq });
-    } catch (error) {
-      flight.runLog.warn("publication record discard failed; the register reconciliation retires it", { run_id: flight.runId, error: errMessage(error) });
+    if (ack.applied !== true || (body.status !== "completed" && body.status !== "failed") ||
+        (ack.status !== "completed" && ack.status !== "failed" && ack.status !== "cancelled")) return;
+    if (!outbox || outbox.isDisabled() || !outbox.hasPublicationRecords(runId)) return;
+    for (const entry of outbox.listPublicationRecords().filter((p) => p.run_id === runId)) {
+      try {
+        const loaded = await outbox.loadPublicationRecord(runId, entry.claim_generation);
+        if (loaded.kind !== "ok") continue;
+        await outbox.discardPublicationRecord(runId, entry.claim_generation, { enrollment_seq: loaded.record.enrollment_seq });
+      } catch (error) {
+        this.log.warn("publication record discard failed; the register reconciliation retires it", { run_id: runId, error: errMessage(error) });
+      }
     }
   }
 

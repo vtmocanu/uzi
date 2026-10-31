@@ -14,7 +14,7 @@ import type { ReviewRunner } from "../src/review-runner.js";
 import type { RunRunner } from "../src/runner.js";
 import { Worker } from "../src/worker.js";
 import { nullLogger } from "./helpers.js";
-import { FINALIZE_DOMAIN, RUN, RUN_B, cleanupRoots, forgeRecord, intent, makeOutbox, tmpRoot } from "./publication-intent-fixture.js";
+import { FINALIZE_DOMAIN, RUN, RUN_B, cleanupRoots, forgeRecord, intent, makeOutbox, tmpRoot, stored } from "./publication-intent-fixture.js";
 
 // Issue #1324 D6: the register snapshot's publication_resume list, its exclusion from finalize_resume,
 // and the publication_resume_v1 / forge_api_success_v1 capability advertisement.
@@ -50,7 +50,7 @@ async function register(outbox: Outbox | undefined): Promise<Registered> {
 }
 
 async function ackedRecord(outbox: Outbox, over: Parameters<typeof intent>[0] = {}, seqs: [number, number] = [2, 1]) {
-  const body = intent(over);
+  const body = stored(over);
   assert.equal((await outbox.savePublicationRecord(body)).ok, true);
   assert.equal((await outbox.replacePublicationRecord({ ...body, enrollment_seq: seqs[0], candidate_seq: seqs[1] }, {})).ok, true);
 }
@@ -84,7 +84,7 @@ describe("register snapshot: publication_resume", () => {
     const root = tmpRoot();
     const outbox = makeOutbox(root);
     await outbox.init();
-    assert.equal((await outbox.savePublicationRecord(intent())).ok, true);
+    assert.equal((await outbox.savePublicationRecord(stored())).ok, true);
     await outbox.journalFinalize(RUN, 4);
     const { snapshot } = await register(outbox);
     assert.equal(snapshot, undefined, "no finalize_resume, no publication_resume, nothing pending");
@@ -103,6 +103,17 @@ describe("register snapshot: publication_resume", () => {
     const { snapshot } = await register(restarted);
     assert.deepEqual(snapshot?.finalize_resume, [{ run_id: RUN_B, claim_generation: 6 }]);
     assert.equal(snapshot?.publication_resume, undefined);
+  });
+
+  it("lists the highest ACKNOWLEDGED generation, so a later sequence-less record cannot hide it", async () => {
+    const root = tmpRoot();
+    const outbox = makeOutbox(root);
+    await outbox.init();
+    await ackedRecord(outbox, { claim_generation: 4 }, [9, 3]);
+    assert.equal((await outbox.savePublicationRecord(stored({ claim_generation: 6 }))).ok, true, "a later record that was saved but never ACKed");
+    assert.deepEqual(outbox.listPublicationRegisterEntries(), [{ run_id: RUN, claim_generation: 4, enrollment_seq: 9, candidate_seq: 3 }]);
+    await ackedRecord(outbox, { claim_generation: 5 }, [10, 1]);
+    assert.deepEqual(outbox.listPublicationRegisterEntries(), [{ run_id: RUN, claim_generation: 5, enrollment_seq: 10, candidate_seq: 1 }], "the highest acknowledged one wins");
   });
 
   it("offers nothing for a run with a pending terminal journal, even with an acknowledged record", async () => {

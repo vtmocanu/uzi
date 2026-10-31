@@ -52,9 +52,12 @@ export class PublicationIntentMismatchError extends Error {
 
 export type PublicationFloorRecord = { readonly kind: "absent" } | { readonly kind: "pinned"; readonly oid: string };
 
-/** A secret finding as the remediation guard remembers it (repo-relative file, never a local path). */
+/**
+ * A secret finding as the remediation guard remembers it. It carries NO path: a committed filename can
+ * itself be a secret, and the resume guard only needs the commit (ancestry against the candidate), the
+ * rule id and the line. A resumed run that must render a finding re-derives the path from a fresh scan.
+ */
 export interface PublicationSecretFinding {
-  file: string;
   start_line: number;
   commit: string;
   rule_id: string;
@@ -121,8 +124,18 @@ export interface PublicationIntentBody {
   staged_description?: PublicationStagedDescription;
 }
 
-/** The local record: the intent plus the api-assigned sequence numbers (absent until the api ACKed). */
+/**
+ * Which owner contract a run's intent is validated under: a `task` run (it may carry task checkpoint
+ * evidence bound to its own key) or an `issue`-style run (any other publishing kind; it carries none).
+ * It comes from the CALLER (the run's claim kind), never from the body being validated: a body that
+ * omits the checkpoint keys must not choose the weaker contract. The api's top-level allowlist has no
+ * such member, so it never travels on the wire; the local record carries it in its sealed envelope.
+ */
+export type PublicationOwnerKind = "task" | "issue";
+
+/** The local record: the intent, its owner kind (envelope metadata) and the api-assigned sequence numbers (absent until the api ACKed). */
 export interface PublicationRecord extends PublicationIntentBody {
+  owner_kind: PublicationOwnerKind;
   enrollment_seq?: number;
   candidate_seq?: number;
 }
@@ -145,7 +158,6 @@ const MAX_SUMMARY_CHARS = 16 * 1024;
 const MAX_DESCRIPTION_CHARS = 32 * 1024;
 const MAX_CLOSING = 64;
 const MAX_CLOSING_CHARS = 256;
-const MAX_TEXT_CHARS = 1024;
 
 /** A NUL or a lone surrogate: the api (and PostgreSQL jsonb) refuses both, so the worker refuses them first. */
 const UNPAIRED_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
@@ -161,6 +173,32 @@ function assertStorableStrings(value: unknown, where: string): void {
       assertStorableStrings(v, `${where}.${k}`);
     }
   }
+}
+
+/**
+ * The lead's structured PR summary as the intent records it: every string redacted with `redact`, then
+ * serialized as WELL-FORMED JSON that fits `maxChars`. It is never cut mid-text (a cut leaves unparseable
+ * JSON): when the whole claim is too long, whole members are dropped, least essential first (review
+ * pointers, verification, scope notes, changes, why, what). Absent or non-object input is the empty string.
+ * The publisher's `lead_only` and `deterministic_only` description modes need exactly the structured claim,
+ * so the resume parses this back with `JSON.parse`.
+ */
+export function boundedPrSummaryJson(summary: unknown, redact: (text: string) => string, maxChars: number = MAX_SUMMARY_CHARS): string {
+  if (typeof summary !== "object" || summary === null || Array.isArray(summary)) return "";
+  const scrub = (v: unknown): unknown => typeof v === "string" ? redact(v)
+    : Array.isArray(v) ? v.map(scrub)
+      : typeof v === "object" && v !== null ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, scrub(x)])) : v;
+  const work = scrub(summary) as Record<string, unknown>;
+  const fits = (): string | undefined => {
+    const json = JSON.stringify(work);
+    return json.length <= maxChars ? json : undefined;
+  };
+  for (const member of [undefined, "review_pointers", "verification", "scope_notes", "changes", "why", "what"]) {
+    if (member !== undefined) delete work[member];
+    const json = fits();
+    if (json !== undefined) return Object.keys(work).length === 0 ? "" : json;
+  }
+  return "";
 }
 
 /** `s.slice(0, max)` that never leaves half of a surrogate pair at the cut. */
@@ -220,9 +258,8 @@ function branchName(value: unknown, where: string): string {
 }
 
 function finding(value: unknown, where: string): PublicationSecretFinding {
-  const o = object(value, where, ["file", "start_line", "commit", "rule_id"], ["file", "start_line", "commit", "rule_id"]);
+  const o = object(value, where, ["start_line", "commit", "rule_id"], ["start_line", "commit", "rule_id"]);
   return {
-    file: text(o.file, `${where}.file`, MAX_TEXT_CHARS, true),
     start_line: integer(o.start_line, `${where}.start_line`, 0),
     commit: text(o.commit, `${where}.commit`, 64, true),
     rule_id: text(o.rule_id, `${where}.rule_id`, 256, true),
@@ -319,7 +356,8 @@ function stagedDescription(value: unknown, where: string): PublicationStagedDesc
 const BODY_KEYS = ["v", "run_id", "repo_id", "branch", "claim_generation", "original_head", "floor", "candidate", "source", "mr", "guard", "staged_description"];
 const BODY_REQUIRED = BODY_KEYS.filter((k) => k !== "staged_description");
 
-function parseBody(o: Record<string, unknown>): PublicationIntentBody {
+function parseBody(o: Record<string, unknown>, ownerKind: PublicationOwnerKind): PublicationIntentBody {
+  if (ownerKind !== "task" && ownerKind !== "issue") bad("owner kind is not task or issue");
   if (o.v !== PUBLICATION_INTENT_VERSION) bad(`unsupported version ${JSON.stringify(o.v)}`);
   const source = object(o.source, "source", ["pin_generation", "checkpoint_key"], ["pin_generation", "checkpoint_key"]);
   const checkpointKey = source.checkpoint_key;
@@ -329,8 +367,10 @@ function parseBody(o: Record<string, unknown>): PublicationIntentBody {
   // A task checkpoint key belongs to exactly this run, never merely to its branch.
   if (checkpointKey !== null && checkpointKey !== `uzi/task/${runId}`) bad("source.checkpoint_key is not this run's task checkpoint key");
   const heldKey = (o.guard as { frozen_held?: { checkpointKey?: unknown } } | null | undefined)?.frozen_held?.checkpointKey;
-  // Only a task run carries checkpoint evidence; the owner contract of validFrozenHeldPolicy binds it to this run.
-  const owner = { kind: checkpointKey !== null || heldKey !== undefined ? "task" : "issue", runId };
+  // Only a task run carries checkpoint evidence; the owner contract of validFrozenHeldPolicy binds it to this
+  // run. The kind is the caller's, so omitting both checkpoint keys cannot select the issue contract.
+  if (ownerKind !== "task" && (checkpointKey !== null || heldKey !== undefined)) bad("an issue-style run carries task checkpoint evidence");
+  const owner = { kind: ownerKind, runId };
   const body: PublicationIntentBody = {
     v: 1,
     run_id: runId,
@@ -354,18 +394,26 @@ function parseBody(o: Record<string, unknown>): PublicationIntentBody {
   return body;
 }
 
-/** Strictly parse an intent (a claim's `publication_resume.intent`, or a record body). Throws a mismatch. */
-export function parsePublicationIntent(raw: unknown): PublicationIntentBody {
-  return parseBody(object(raw, "intent", BODY_KEYS, BODY_REQUIRED));
+/**
+ * Strictly parse an intent (a claim's `publication_resume.intent`, or a record body) under the CALLER's
+ * owner kind (the run's claim kind; never inferred from `raw`). Throws a mismatch.
+ */
+export function parsePublicationIntent(raw: unknown, ownerKind: PublicationOwnerKind): PublicationIntentBody {
+  return parseBody(object(raw, "intent", BODY_KEYS, BODY_REQUIRED), ownerKind);
 }
 
-/** Strictly parse a local record: the intent plus both sequence numbers or neither. */
-export function parsePublicationRecord(raw: unknown): PublicationRecord {
-  const o = object(raw, "record", [...BODY_KEYS, "enrollment_seq", "candidate_seq"], BODY_REQUIRED);
-  const body = parseBody(Object.fromEntries(Object.entries(o).filter(([k]) => k !== "enrollment_seq" && k !== "candidate_seq")));
+/**
+ * Strictly parse a local record: the intent plus both sequence numbers or neither. `owner_kind` is the
+ * envelope member; when `raw` carries one it must equal the caller's `ownerKind`.
+ */
+export function parsePublicationRecord(raw: unknown, ownerKind: PublicationOwnerKind): PublicationRecord {
+  const o = object(raw, "record", [...BODY_KEYS, "enrollment_seq", "candidate_seq", "owner_kind"], BODY_REQUIRED);
+  if (o.owner_kind !== undefined && o.owner_kind !== ownerKind) bad("owner_kind does not match the run's kind");
+  const body = parseBody(
+    Object.fromEntries(Object.entries(o).filter(([k]) => k !== "enrollment_seq" && k !== "candidate_seq" && k !== "owner_kind")), ownerKind);
   if ((o.enrollment_seq === undefined) !== (o.candidate_seq === undefined)) bad("enrollment_seq and candidate_seq must be set together");
-  if (o.enrollment_seq === undefined) return body;
-  return { ...body, enrollment_seq: integer(o.enrollment_seq, "enrollment_seq", 1), candidate_seq: integer(o.candidate_seq, "candidate_seq", 1) };
+  if (o.enrollment_seq === undefined) return { ...body, owner_kind: ownerKind };
+  return { ...body, owner_kind: ownerKind, enrollment_seq: integer(o.enrollment_seq, "enrollment_seq", 1), candidate_seq: integer(o.candidate_seq, "candidate_seq", 1) };
 }
 
 /** The claim's `publication_resume` member (api `PublicationResumePayload`). */
@@ -377,15 +425,15 @@ export interface ClaimPublicationResume {
 }
 
 /** Validate a claim's `publication_resume` into a typed record. Throws a mismatch. */
-export function parseClaimPublicationResume(claim: ClaimPublicationResume): EnrolledPublicationRecord {
-  const body = parsePublicationIntent(claim.intent);
-  return { ...body, enrollment_seq: integer(claim.enrollment_seq, "enrollment_seq", 1), candidate_seq: integer(claim.candidate_seq, "candidate_seq", 1) };
+export function parseClaimPublicationResume(claim: ClaimPublicationResume, ownerKind: PublicationOwnerKind): EnrolledPublicationRecord {
+  const body = parsePublicationIntent(claim.intent, ownerKind);
+  return { ...body, owner_kind: ownerKind, enrollment_seq: integer(claim.enrollment_seq, "enrollment_seq", 1), candidate_seq: integer(claim.candidate_seq, "candidate_seq", 1) };
 }
 
-/** The wire intent: the canonical body only. Sequence numbers travel in the request envelope. */
+/** The wire intent: the canonical body only. Sequence numbers travel in the request envelope; the owner kind never does. */
 function wireIntent(record: PublicationRecord): PublicationIntentBody {
-  const { enrollment_seq: _e, candidate_seq: _c, ...body } = record;
-  return parsePublicationIntent(body);
+  const { enrollment_seq: _e, candidate_seq: _c, owner_kind: _k, ...body } = record;
+  return parsePublicationIntent(body, record.owner_kind);
 }
 
 /** Serialized wire intent size in bytes; the api refuses more than {@link MAX_PUBLICATION_INTENT_BYTES}. */
@@ -410,7 +458,8 @@ function canonicalBody(value: unknown): string {
 
 /** Canonical content equality of two intent bodies (sequence numbers are not part of the body). */
 function samePublicationContent(a: PublicationIntentBody, b: PublicationIntentBody): boolean {
-  return canonicalBody(wireIntent(a)) === canonicalBody(wireIntent(b));
+  const body = (x: PublicationIntentBody) => Object.fromEntries(BODY_KEYS.filter((k) => k in x).map((k) => [k, (x as unknown as Record<string, unknown>)[k]]));
+  return canonicalBody(body(a)) === canonicalBody(body(b));
 }
 
 /** How a local record relates to the claim's active enrollment. The claim is the api's single active row. */
@@ -437,7 +486,7 @@ export function relatePublicationToClaim(record: PublicationRecord, active: Clai
   if (!active) return { kind: "no_active_enrollment" };
   let claimBody: PublicationIntentBody;
   try {
-    claimBody = parsePublicationIntent(active.intent);
+    claimBody = parsePublicationIntent(active.intent, record.owner_kind);
   } catch {
     return { kind: "content_mismatch" };
   }
@@ -486,21 +535,47 @@ export interface LiveGuardInputs {
  *   - `ci_fix_human_approved` is true only when BOTH the live claim and the record say so (a recorded true
  *     never grants it; a recorded false is kept);
  *   - a recorded secret `clean_tip` is dropped, and `known`/`everKnown` knowledge is kept only as extra
- *     caution: a claim-supplied clean state never replaces a re-scan, so `clean_tip` is never carried.
+ *     caution: a claim-supplied clean state never replaces a re-scan, so `clean_tip` is never carried;
+ *   - every recorded SCAN FLOOR is DROPPED unless the caller supplies `verifyFloor`, which must prove a
+ *     commit against live worker state (present in the bare, an ancestor of the candidate). A floor
+ *     shortens the range the secret scan walks, so an unverified one is a way to skip scanning commits:
+ *     `confirmedTip`, `extraFloors`, `published_tip`, `published_real_tips` and `last_checkpoint_ref_tip`
+ *     survive only when `verifyFloor(sha)` is true, and `landed_checkpoint` only when some recorded floor
+ *     was verified. With no verifier the floors are dropped, which fails toward re-scanning.
  * Pure; the resume calls it with the claim intent's guard (or the local record's) and the live inputs.
  */
-export function stricterGuard(recorded: PublicationGuardState, live: LiveGuardInputs): PublicationGuardState {
+export function stricterGuard(
+  recorded: PublicationGuardState,
+  live: LiveGuardInputs,
+  verifyFloor?: (sha: string) => boolean,
+): PublicationGuardState {
   const globs = live.ci_config_guard_globs === null && recorded.ci_config_guard_globs === null
     ? null
     : [...new Set([...(live.ci_config_guard_globs ?? []), ...(recorded.ci_config_guard_globs ?? [])])];
   const { clean_tip: _drop, ...remediation } = recorded.secret_remediation;
-  const { cleanTip: _dropHeld, ...held } = recorded.frozen_held;
+  const { cleanTip: _dropHeld, confirmedTip: _dropConfirmed, ...held } = recorded.frozen_held;
+  const { published_tip: _dropPublished, last_checkpoint_ref_tip: _dropRef, ...rest } = recorded;
+  const keep = (sha: string | undefined): sha is string => sha !== undefined && verifyFloor !== undefined && verifyFloor(sha);
+  const confirmedTip = keep(recorded.frozen_held.confirmedTip) ? recorded.frozen_held.confirmedTip : undefined;
+  const extraFloors = recorded.frozen_held.extraFloors.filter(keep);
+  const publishedTip = keep(recorded.published_tip) ? recorded.published_tip : undefined;
+  const publishedRealTips = recorded.published_real_tips.filter(keep);
+  const refTip = keep(recorded.last_checkpoint_ref_tip) ? recorded.last_checkpoint_ref_tip : undefined;
+  const anyVerified = confirmedTip !== undefined || extraFloors.length > 0 || publishedTip !== undefined ||
+    publishedRealTips.length > 0 || refTip !== undefined;
   return {
-    ...recorded,
-    frozen_held: { ...held, ciGlobs: globs === null ? null : [...globs] },
+    ...rest,
+    frozen_held: {
+      ...held, ciGlobs: globs === null ? null : [...globs], extraFloors,
+      ...(confirmedTip !== undefined ? { confirmedTip } : {}),
+    },
     secret_remediation: { ...remediation },
+    ...(publishedTip !== undefined ? { published_tip: publishedTip } : {}),
+    published_real_tips: publishedRealTips,
+    landed_checkpoint: recorded.landed_checkpoint && anyVerified,
     ci_fix_human_approved: live.ci_fix_human_approved && recorded.ci_fix_human_approved,
     ci_config_guard_globs: globs,
+    ...(refTip !== undefined ? { last_checkpoint_ref_tip: refTip } : {}),
   };
 }
 
@@ -585,6 +660,8 @@ export interface PublicationDeps {
   store: PublicationStore;
   api: PublicationApi;
   signal?: AbortSignal;
+  /** The owner kind of the calling run (its claim kind: "task" or any other publishing kind as "issue"). */
+  ownerKind: PublicationOwnerKind;
   /** The LIVE claim generation of the calling flight: the request's fence. The record's own
    *  `claim_generation` is the immutable ENROLLMENT generation and may be older (a later claim of the same
    *  run updates the candidate). Defaults to the record's generation, right only for the enrolling flight. */
@@ -648,7 +725,7 @@ function asEnrolled(record: PublicationRecord, ack: { enrollment_seq: number; ca
 export async function enrollPublicationIntent(deps: PublicationDeps, intent: PublicationIntentBody): Promise<PublicationEnrollOutcome> {
   let record: PublicationRecord;
   try {
-    record = parsePublicationIntent(intent);
+    record = { ...parsePublicationIntent(intent, deps.ownerKind), owner_kind: deps.ownerKind };
     if (publicationIntentBytes(record) > MAX_PUBLICATION_INTENT_BYTES) return notEnrolled("intent_too_large");
   } catch (err) {
     return notEnrolled("intent_invalid", err instanceof Error ? err.message : String(err));
@@ -721,7 +798,7 @@ export async function advancePublicationCandidate(
       ...rest, candidate: update.candidate, candidate_seq: current.candidate_seq + 1,
       ...(update.guard ? { guard: update.guard } : {}), ...(update.mr ? { mr: update.mr } : {}),
       ...(update.staged_description ? { staged_description: update.staged_description } : {}),
-    }) as EnrolledPublicationRecord;
+    }, current.owner_kind) as EnrolledPublicationRecord;
     if (publicationIntentBytes(next) > MAX_PUBLICATION_INTENT_BYTES) return uncertain("candidate_save_failed", current, "intent_too_large");
   } catch (err) {
     return uncertain("candidate_save_failed", current, err instanceof Error ? err.message : String(err));

@@ -469,12 +469,21 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
       }
       return realTimeout(...args);
     }) as typeof setTimeout);
-    git.pushBranch = (async () => {
-      pushes++;
-      commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "default changes during first attempt");
-      skipBackoff = true;
-      throw new Error("connection reset");
-    }) as typeof git.pushBranch;
+    // A real transient push failure comes out of runGit carrying git's retained stderr (the retry verdict is
+    // decided from it, never from the message), so fail the real push's git child instead of faking a bare Error.
+    const seam = git as unknown as { execScoped(cmd: string, args: string[], ...rest: unknown[]): Promise<unknown> };
+    const realExec = seam.execScoped.bind(git);
+    seam.execScoped = async (cmd, args, ...rest) => {
+      if (cmd === "git" && args.includes("push")) {
+        pushes++;
+        commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "default changes during first attempt");
+        skipBackoff = true;
+        throw Object.assign(new Error(`Command failed: git ${args.join(" ")}`), {
+          code: 128, stderr: "fatal: unable to access 'https://github.com/org/repo.git/': connection reset by peer",
+        });
+      }
+      return realExec(cmd, args, ...rest);
+    };
     const claim = githubClaim(1875);
     await githubRunner(github, committingExecutor({ "impl.ts": "retry task\n" })).execute(claim);
     const failed = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed");

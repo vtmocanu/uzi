@@ -10,6 +10,7 @@ import type {
   PublicationIntentBody,
   PublicationIntentRequest,
   PublicationIntentResult,
+  PublicationOwnerKind,
   PublicationRecord,
 } from "../src/publication-intent.js";
 import { nullLogger } from "./helpers.js";
@@ -110,6 +111,11 @@ export async function forgeRecord(root: string, domain: string, body: object): P
 export const PUBLICATION_DOMAIN = "uzi.outbox.publication.v1";
 export const FINALIZE_DOMAIN = "uzi.outbox.finalize.v1";
 
+/** The local record for an intent: the body plus the caller-supplied owner kind ("issue" unless stated). */
+export function stored(over: Partial<PublicationIntentBody> = {}, ownerKind: PublicationOwnerKind = "issue"): PublicationRecord {
+  return { ...intent(over), owner_kind: ownerKind };
+}
+
 export function recordWithSeqs(over: Partial<PublicationRecord> = {}): PublicationRecord {
-  return { ...intent(), enrollment_seq: 1, candidate_seq: 1, ...over };
+  return { ...stored(), enrollment_seq: 1, candidate_seq: 1, ...over };
 }

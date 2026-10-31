@@ -2078,7 +2078,11 @@ export class Outbox {
     const authed = await this.readAuthed(file, MAC_DOMAIN_PUBLICATION);
     if (!authed) return { kind: "unauthenticated" };
     try {
-      const record = parsePublicationRecord(authed);
+      // The owner kind is envelope metadata the writer sealed beside the intent (the api's allowlist has no
+      // such member); a missing or unknown one is not guessed from the body.
+      const ownerKind = authed.owner_kind;
+      if (ownerKind !== "task" && ownerKind !== "issue") return { kind: "mismatch", detail: "record owner_kind is missing or unknown" };
+      const record = parsePublicationRecord(authed, ownerKind);
       if (record.run_id !== runId || record.claim_generation !== claimGeneration) {
         return { kind: "mismatch", detail: "record identity does not match its directory and filename" };
       }
@@ -2160,16 +2164,19 @@ export class Outbox {
   }
 
   /**
-   * The register snapshot's `publication_resume` entries: one per run (the highest generation), only
-   * for a record the api acknowledged (both sequence numbers known) and a run with no pending terminal
+   * The register snapshot's `publication_resume` entries: one per run (its highest ACKNOWLEDGED
+   * generation: a record with both sequence numbers known; a later sequence-less record does not hide it) and a run with no pending terminal
    * journal, oldest first and capped like finalize_resume (the api drops a list above its ceiling).
    */
   listPublicationRegisterEntries(): PublicationResumeRegisterEntry[] {
     const best: (PublicationResumeRegisterEntry & { since: number })[] = [];
     for (const rs of this.runs.values()) {
       if (rs.terminals.size > 0) continue;
+      // The highest ACKNOWLEDGED generation: a later sequence-less record (saved, never ACKed) must not hide
+      // an acknowledged enrollment from the register.
       let top: PublicationMeta | undefined;
       for (const meta of rs.publications.values()) {
+        if (meta.enrollmentSeq === undefined || meta.candidateSeq === undefined) continue;
         if (!top || meta.claimGeneration > top.claimGeneration) top = meta;
       }
       if (top?.enrollmentSeq === undefined || top.candidateSeq === undefined) continue;
@@ -2191,7 +2198,7 @@ export class Outbox {
   /** Validate a record for writing; a failure is the result to return, nothing having been written. */
   private checkPublicationWrite(input: PublicationRecord): { record: PublicationRecord } | PublicationWriteResult {
     try {
-      const record = parsePublicationRecord(input);
+      const record = parsePublicationRecord(input, input.owner_kind);
       if (publicationIntentBytes(record) > MAX_PUBLICATION_INTENT_BYTES) return { ok: false, reason: "intent_too_large", state: "unwritten" };
       if (this.disabled || !this.key) return { ok: false, reason: "outbox_disabled", state: "unwritten" };
       return { record };

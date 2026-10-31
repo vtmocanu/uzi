@@ -8,6 +8,7 @@ import {
   PUBLICATION_RESUME_UNAVAILABLE,
   PublicationIntentMismatchError,
   advancePublicationCandidate,
+  boundedPrSummaryJson,
   attachServerSequence,
   enrollPublicationIntent,
   parseClaimPublicationResume,
@@ -22,11 +23,14 @@ import {
   type PublicationDeps,
   type PublicationIntentResult,
 } from "../src/publication-intent.js";
-import { CAND, CAND2, HEAD, RUN, RUN_B, cleanupRoots, intent, makeOutbox, noSleep, recordWithSeqs, scriptedApi, tmpRoot } from "./publication-intent-fixture.js";
+import { CAND, CAND2, FLOOR, HEAD, RUN, RUN_B, cleanupRoots, intent, makeOutbox, noSleep, recordWithSeqs, scriptedApi, stored, tmpRoot } from "./publication-intent-fixture.js";
 
 // Issue #1324: the intent shape, its strict parser, and the enroll / advance orchestration with its
 // fallback matrix (every failure classifies as exactly one of not_enrolled or uncertain).
 afterEach(cleanupRoots);
+
+const FLOOR_A = FLOOR;
+const FLOOR_B = "5".repeat(40);
 
 // The api's top-level intent allowlist (api/internal/workersvc/publication_resume.go
 // publicationIntentKeys). Hand-copied: the worker must never send a member outside it.
@@ -38,7 +42,7 @@ const unknown: PublicationIntentResult = { kind: "unknown", detail: "socket hang
 
 function deps(root: string, api: ReturnType<typeof scriptedApi>, over: { rawWrite?: RawWriteSeam } = {}) {
   const outbox = makeOutbox(root, over.rawWrite ? { rawWrite: over.rawWrite } : {});
-  const d: PublicationDeps = { store: outbox, api, sleep: noSleep };
+  const d: PublicationDeps = { store: outbox, api, sleep: noSleep, ownerKind: "issue" };
   return { outbox, d };
 }
 
@@ -47,9 +51,9 @@ const file = (root: string) => path.join(root, RUN, "publication-4.json");
 describe("publication intent: strict parser", () => {
   it("round-trips a full intent and a record with sequence numbers", () => {
     const full = intent({ staged_description: { candidate: CAND, target: "main", contract_revision: 3, body: "## Summary" } });
-    assert.deepEqual(parsePublicationIntent(JSON.parse(JSON.stringify(full))), full);
-    assert.deepEqual(parsePublicationRecord({ ...full, enrollment_seq: 2, candidate_seq: 5 }), { ...full, enrollment_seq: 2, candidate_seq: 5 });
-    assert.deepEqual(parsePublicationIntent(intent({ floor: { kind: "absent" }, candidate: null })).floor, { kind: "absent" });
+    assert.deepEqual(parsePublicationIntent(JSON.parse(JSON.stringify(full)), "issue"), full);
+    assert.deepEqual(parsePublicationRecord({ ...full, enrollment_seq: 2, candidate_seq: 5 }, "issue"), { ...full, owner_kind: "issue", enrollment_seq: 2, candidate_seq: 5 });
+    assert.deepEqual(parsePublicationIntent(intent({ floor: { kind: "absent" }, candidate: null }), "issue").floor, { kind: "absent" });
   });
 
   it("only ever emits members the api's intent allowlist knows", () => {
@@ -79,22 +83,22 @@ describe("publication intent: strict parser", () => {
     it(`refuses ${name} with the typed mismatch`, () => {
       const raw = JSON.parse(JSON.stringify(intent())) as Record<string, unknown>;
       mutate(raw);
-      assert.throws(() => parsePublicationIntent(raw), (err: unknown) =>
+      assert.throws(() => parsePublicationIntent(raw, "issue"), (err: unknown) =>
         err instanceof PublicationIntentMismatchError && err.code === "publication_intent_mismatch");
     });
   }
 
   it("requires both sequence numbers or neither", () => {
-    assert.throws(() => parsePublicationRecord({ ...intent(), enrollment_seq: 1 }), PublicationIntentMismatchError);
-    assert.throws(() => parsePublicationRecord({ ...intent(), enrollment_seq: 0, candidate_seq: 1 }), PublicationIntentMismatchError);
+    assert.throws(() => parsePublicationRecord({ ...intent(), enrollment_seq: 1 }, "issue"), PublicationIntentMismatchError);
+    assert.throws(() => parsePublicationRecord({ ...intent(), enrollment_seq: 0, candidate_seq: 1 }, "issue"), PublicationIntentMismatchError);
   });
 
   it("types a claim's publication_resume and refuses an unknown guard state", () => {
     const claim = { enrollment_seq: 3, candidate_seq: 2, intent: JSON.parse(JSON.stringify(intent())) as unknown };
-    assert.deepEqual(parseClaimPublicationResume(claim), { ...intent(), enrollment_seq: 3, candidate_seq: 2 });
+    assert.deepEqual(parseClaimPublicationResume(claim, "issue"), { ...intent(), owner_kind: "issue", enrollment_seq: 3, candidate_seq: 2 });
     const future = JSON.parse(JSON.stringify(intent())) as { guard: Record<string, unknown> };
     future.guard.unknown_guard = {};
-    assert.throws(() => parseClaimPublicationResume({ ...claim, intent: future }), PublicationIntentMismatchError);
+    assert.throws(() => parseClaimPublicationResume({ ...claim, intent: future }, "issue"), PublicationIntentMismatchError);
   });
 
   it("relates a local record to the claim's single active enrollment without resurrecting an old one", () => {
@@ -105,7 +109,7 @@ describe("publication intent: strict parser", () => {
     assert.equal(relatePublicationToClaim(rec, active(2, 2)).kind, "local_ahead");
     assert.equal(relatePublicationToClaim(rec, active(2, 4)).kind, "server_ahead");
     assert.equal(relatePublicationToClaim(rec, active(5, 1)).kind, "superseded");
-    assert.equal(relatePublicationToClaim(intent({ original_head: "9".repeat(40) }), active(2, 3)).kind, "superseded", "a sequence-less record of another identity cannot claim an enrollment");
+    assert.equal(relatePublicationToClaim(stored({ original_head: "9".repeat(40) }), active(2, 3)).kind, "superseded", "a sequence-less record of another identity cannot claim an enrollment");
   });
 
   it("reads the two typed-park refusals off an ack reason", () => {
@@ -141,7 +145,7 @@ describe("publication intent: enrollment", () => {
 
   it("known not enrolled: an outbox that is not usable sends nothing and writes nothing", async () => {
     const api = scriptedApi(acked());
-    const outcome = await enrollPublicationIntent({ store: makeOutbox(tmpRoot()), api, sleep: noSleep }, intent());
+    const outcome = await enrollPublicationIntent({ store: makeOutbox(tmpRoot()), api, sleep: noSleep, ownerKind: "issue" }, intent());
     assert.deepEqual(outcome, { kind: "not_enrolled", reason: "outbox_disabled", diagnostic: PUBLICATION_RESUME_UNAVAILABLE });
     assert.equal(api.calls.length, 0);
   });
@@ -170,7 +174,7 @@ describe("publication intent: enrollment", () => {
     const { outbox, d } = deps(root, api);
     await outbox.init();
     const big = intent();
-    big.guard.secret_remediation.known = Array.from({ length: 200 }, (_, i) => ({ file: "f".repeat(1000), start_line: i, commit: "a".repeat(40), rule_id: "r" }));
+    big.guard.secret_remediation.known = Array.from({ length: 300 }, (_, i) => ({ start_line: i, commit: "a".repeat(40), rule_id: "r".repeat(256) }));
     const tooBig = await enrollPublicationIntent(d, big);
     assert.deepEqual([tooBig.kind, tooBig.kind === "not_enrolled" ? tooBig.reason : ""], ["not_enrolled", "intent_too_large"]);
     const invalid = await enrollPublicationIntent(d, { ...intent(), original_head: "nope" });
@@ -292,7 +296,7 @@ describe("publication intent: enrollment", () => {
     const api = scriptedApi(acked());
     const { outbox, d } = deps(root, api);
     await outbox.init();
-    await outbox.savePublicationRecord(intent({ original_head: "9".repeat(40) }));
+    await outbox.savePublicationRecord(stored({ original_head: "9".repeat(40) }));
     const outcome = await enrollPublicationIntent(d, intent());
     assert.deepEqual([outcome.kind, outcome.kind === "uncertain" ? outcome.reason : ""], ["uncertain", "existing_record_conflict"]);
     assert.equal(api.calls.length, 0);
@@ -302,7 +306,7 @@ describe("publication intent: enrollment", () => {
     const root = tmpRoot();
     const first = deps(root, scriptedApi(acked()));
     await first.outbox.init();
-    await first.outbox.savePublicationRecord(intent());
+    await first.outbox.savePublicationRecord(stored());
     const restarted = deps(root, scriptedApi(acked(6, 2)));
     await restarted.outbox.init();
     const outcome = await enrollPublicationIntent(restarted.d, intent());
@@ -437,7 +441,7 @@ describe("publication intent: relating a record to the claim (M1, B1)", () => {
   });
 
   it("relates a never-ACKed record to the claim's active enrollment by identity, and attaches the server's sequence numbers", async () => {
-    const saved = intent();
+    const saved = stored();
     const match = relatePublicationToClaim(saved, claimOf(intent(), 7, 2));
     assert.deepEqual(match, { kind: "unacked_matches_active", enrollment_seq: 7, candidate_seq: 2 });
     assert.equal(relatePublicationToClaim(saved, claimOf(intent({ original_head: "9".repeat(40) }), 7, 2)).kind, "superseded");
@@ -460,7 +464,7 @@ describe("publication intent: a decline proves absence only if nothing was ever 
     const api = scriptedApi(...script);
     const { outbox, d } = deps(root, api);
     await outbox.init();
-    if (pre) assert.equal((await outbox.savePublicationRecord(intent())).ok, true);
+    if (pre) assert.equal((await outbox.savePublicationRecord(stored())).ok, true);
     const outcome = await enrollPublicationIntent(d, intent());
     return { outcome, api, kept: (await outbox.loadPublicationRecord(RUN, 4)).kind === "ok" };
   }
@@ -498,13 +502,33 @@ describe("publication intent: bound to its run (M2)", () => {
   const reject = (mutate: (o: ReturnType<typeof intent>) => void) => {
     const body = intent();
     mutate(body);
-    assert.throws(() => parsePublicationIntent(JSON.parse(JSON.stringify(body))), PublicationIntentMismatchError);
+    assert.throws(() => parsePublicationIntent(JSON.parse(JSON.stringify(body)), "task"), PublicationIntentMismatchError);
   };
 
   it("accepts this run's own task checkpoint key, in the source and in the frozen held policy", () => {
     const body = intent({ source: { pin_generation: 1, checkpoint_key: KEY } });
     body.guard.frozen_held = { ...body.guard.frozen_held, checkpointKey: KEY, confirmedTip: CAND };
-    assert.deepEqual(parsePublicationIntent(JSON.parse(JSON.stringify(body))), body);
+    assert.deepEqual(parsePublicationIntent(JSON.parse(JSON.stringify(body)), "task"), body);
+  });
+
+  it("takes the owner kind from the caller, never from the body: omitting both checkpoint keys cannot pick the issue contract", () => {
+    // A task run whose body carries a confirmed tip but NEITHER checkpoint key: validFrozenHeldPolicy's task-only
+    // rule (confirmedTip needs checkpointKey) must apply because the CALLER says task.
+    const body = intent();
+    body.guard.frozen_held = { ...body.guard.frozen_held, confirmedTip: CAND };
+    const raw = JSON.parse(JSON.stringify(body)) as unknown;
+    assert.throws(() => parsePublicationIntent(raw, "task"), PublicationIntentMismatchError);
+    assert.equal(parsePublicationIntent(raw, "issue").guard.frozen_held.confirmedTip, CAND, "an issue-style run may carry a confirmed tip");
+    assert.throws(() => parsePublicationRecord(raw, "task"), PublicationIntentMismatchError);
+    assert.throws(() => parseClaimPublicationResume({ enrollment_seq: 1, candidate_seq: 1, intent: raw }, "task"), PublicationIntentMismatchError);
+  });
+
+  it("refuses task checkpoint evidence on an issue-style run, and a record whose envelope kind disagrees with the caller", () => {
+    const keyed = intent({ source: { pin_generation: 1, checkpoint_key: KEY } });
+    assert.throws(() => parsePublicationIntent(JSON.parse(JSON.stringify(keyed)), "issue"), PublicationIntentMismatchError);
+    assert.equal(parsePublicationIntent(JSON.parse(JSON.stringify(keyed)), "task").source.checkpoint_key, KEY);
+    assert.throws(() => parsePublicationRecord({ ...intent(), owner_kind: "task" }, "issue"), PublicationIntentMismatchError);
+    assert.equal(parsePublicationRecord({ ...intent(), owner_kind: "issue" }, "issue").owner_kind, "issue");
   });
 
   it("refuses another run's checkpoint key anywhere", () => {
@@ -541,7 +565,7 @@ describe("publication intent: guards are re-derived from the live claim (M1)", (
   it("never carries a claim-supplied clean tip, which a re-scan must establish", () => {
     const supplied = intent().guard;
     supplied.secret_remediation.clean_tip = CAND2;
-    supplied.secret_remediation.known = [{ file: "a.txt", start_line: 1, commit: HEAD, rule_id: "r" }];
+    supplied.secret_remediation.known = [{ start_line: 1, commit: HEAD, rule_id: "r" }];
     supplied.frozen_held = { ...supplied.frozen_held, cleanTip: CAND2 };
     const out = stricterGuard(supplied, live);
     assert.equal("clean_tip" in out.secret_remediation, false);
@@ -574,7 +598,7 @@ describe("publication intent: what the api cannot store (N3)", () => {
     }
     const paired = intent();
     paired.mr.title = "ok \ud83d\ude00";
-    assert.equal(parsePublicationIntent(JSON.parse(JSON.stringify(paired))).mr.title, paired.mr.title, "a well-formed pair is fine");
+    assert.equal(parsePublicationIntent(JSON.parse(JSON.stringify(paired)), "issue").mr.title, paired.mr.title, "a well-formed pair is fine");
   });
 
   it("truncates without splitting a surrogate pair", () => {
@@ -582,5 +606,72 @@ describe("publication intent: what the api cannot store (N3)", () => {
     assert.equal(sliceWellFormed(text, 10), "a".repeat(9));
     assert.equal(sliceWellFormed(text, 11), "a".repeat(9) + "\ud83d\ude00");
     assert.equal(sliceWellFormed("short", 10), "short");
+  });
+});
+
+describe("publication intent: a recorded finding carries no path", () => {
+  it("refuses a finding that carries a file member and accepts one with only the line, commit and rule", () => {
+    const withFile = JSON.parse(JSON.stringify(intent())) as { guard: { secret_remediation: { known: unknown[] } } };
+    withFile.guard.secret_remediation.known = [{ file: "secret/leaked-name.txt", start_line: 1, commit: HEAD, rule_id: "r" }];
+    assert.throws(() => parsePublicationIntent(withFile, "issue"), PublicationIntentMismatchError);
+    const clean = JSON.parse(JSON.stringify(intent())) as { guard: { secret_remediation: { known: unknown[] } } };
+    clean.guard.secret_remediation.known = [{ start_line: 1, commit: HEAD, rule_id: "r" }];
+    assert.equal(parsePublicationIntent(clean, "issue").guard.secret_remediation.known.length, 1);
+  });
+});
+
+describe("publication intent: recorded scan floors are never trusted unverified", () => {
+  const floored = () => {
+    const g = intent().guard;
+    g.frozen_held = { ...g.frozen_held, confirmedTip: CAND, extraFloors: [FLOOR_A, FLOOR_B] };
+    g.published_tip = FLOOR_A;
+    g.published_real_tips = [FLOOR_A, FLOOR_B];
+    g.last_checkpoint_ref_tip = FLOOR_B;
+    g.landed_checkpoint = true;
+    return g;
+  };
+  const live = { ci_config_guard_globs: null, ci_fix_human_approved: false };
+
+  it("drops every recorded floor when no verifier is supplied (fail toward re-scanning)", () => {
+    const out = stricterGuard(floored(), live);
+    assert.equal(out.frozen_held.confirmedTip, undefined);
+    assert.deepEqual(out.frozen_held.extraFloors, []);
+    assert.equal(out.published_tip, undefined);
+    assert.deepEqual(out.published_real_tips, []);
+    assert.equal(out.last_checkpoint_ref_tip, undefined);
+    assert.equal(out.landed_checkpoint, false);
+  });
+
+  it("keeps only the floors the verifier proves, and landed_checkpoint only when one was proven", () => {
+    const out = stricterGuard(floored(), live, (sha) => sha === FLOOR_A);
+    assert.equal(out.frozen_held.confirmedTip, undefined, "CAND was not proven");
+    assert.deepEqual(out.frozen_held.extraFloors, [FLOOR_A]);
+    assert.equal(out.published_tip, FLOOR_A);
+    assert.deepEqual(out.published_real_tips, [FLOOR_A]);
+    assert.equal(out.last_checkpoint_ref_tip, undefined);
+    assert.equal(out.landed_checkpoint, true);
+    assert.equal(stricterGuard(floored(), live, () => false).landed_checkpoint, false);
+    assert.equal(stricterGuard(floored(), live, () => true).frozen_held.confirmedTip, CAND);
+  });
+});
+
+describe("publication intent: the recorded PR summary is redacted, well-formed JSON", () => {
+  const redact = (t: string) => t.split("tok-secret").join("[redacted]");
+
+  it("redacts every string and serializes the structured claim", () => {
+    const json = boundedPrSummaryJson({ what: "rotates tok-secret", why: "y", changes: ["a tok-secret"], verifiedAtSha: HEAD }, redact);
+    assert.deepEqual(JSON.parse(json), { what: "rotates [redacted]", why: "y", changes: ["a [redacted]"], verifiedAtSha: HEAD });
+    assert.ok(!json.includes("tok-secret"));
+  });
+
+  it("never cuts the JSON: an oversize claim drops whole members and still parses", () => {
+    const big = { what: "w", why: "y", changes: ["c"], review_pointers: Array.from({ length: 50 }, () => "p".repeat(900)), scope_notes: [{ kind: "k", text: "t" }] };
+    const json = boundedPrSummaryJson(big, redact, 2000);
+    assert.ok(json.length <= 2000);
+    const parsed = JSON.parse(json) as Record<string, unknown>;
+    assert.equal(parsed.review_pointers, undefined);
+    assert.equal(parsed.what, "w");
+    assert.equal(boundedPrSummaryJson({ what: "x".repeat(5000) }, redact, 100), "", "nothing fits: no cut text");
+    assert.equal(boundedPrSummaryJson(undefined, redact), "");
   });
 });

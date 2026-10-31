@@ -13,6 +13,8 @@ import type { Logger } from "../src/log.js";
 import type { StateAck, StateRequest } from "../src/protocol.js";
 import { PUBLICATION_RESUME_UNAVAILABLE } from "../src/publication-intent.js";
 import { WorkerClient } from "../src/client.js";
+import { RecoveryCoordinator } from "../src/recovery.js";
+import { FakeRecoveryClient } from "./codex-reap-fixture.js";
 import { api, baseUrl, client, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, TOKEN } from "./runner-harness.js";
 import { nullLogger } from "./helpers.js";
 
@@ -68,12 +70,12 @@ function ackIntents(events: string[], outbox?: Outbox, localAtAck?: boolean[]): 
   };
 }
 
-function build(executor: Executor, forge: { gitlab?: unknown; github?: unknown }, outbox: Outbox | undefined, log = nullLogger()): RunRunner {
+function build(executor: Executor, forge: { gitlab?: unknown; github?: unknown }, outbox: Outbox | undefined, log = nullLogger(), extra: Record<string, unknown> = {}): RunRunner {
   const r = new RunRunner(client, git, () => ({ executor }), log, 20, undefined, {
     pollMs: 5, planApprovalTimeoutMs: 0, prDescriptionHeadLagMs: 0, recoveryRetryMs: 5,
     checkpointTestHooks: { retryBackoffMs: [0, 0] },
     ...(forge.gitlab ? { gitlab: forge.gitlab as never } : {}), ...(forge.github ? { github: forge.github as never } : {}),
-    ...(outbox ? { outbox } : {}),
+    ...(outbox ? { outbox } : {}), ...extra,
   });
   const seams = r as unknown as { forgeRetrySleep: (ms: number) => Promise<void>; publicationRetry: unknown };
   seams.forgeRetrySleep = async () => {};
@@ -521,6 +523,7 @@ it("a surviving record whose enrollment the api retired neither resurrects it no
       const result = await stub.run(ctx);
       const head = gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]);
       const saved = await outbox.savePublicationRecord({
+        owner_kind: "issue",
         v: 1, run_id: claim.run_id, repo_id: REPO_ID, branch: ctx.branch, claim_generation: GEN,
         original_head: head, floor: { kind: "absent" }, candidate: head,
         source: { pin_generation: GEN, checkpoint_key: null },
@@ -546,4 +549,266 @@ it("a surviving record whose enrollment the api retired neither resurrects it no
   assert.equal(fresh.enrollment_seq, undefined, "the fresh enrollment replays nothing of the old sequence");
   assert.equal(failed(claim.run_id).length, 0);
   assert.equal(states(claim.run_id).filter(b => b.status === "completed").length, 1);
+});
+
+// ── review rework: what the intent records ───────────────────────────────────────────────────────────
+
+type IntentBodyOnWire = {
+  intent: {
+    mr: { title: string; summary: string; closing: string[] };
+    guard: { secret_remediation: { known: unknown[]; flagged_findings: unknown[]; blocked: unknown[] } };
+  };
+};
+const PAT = "fixture-forge-pat-000000";
+
+it("records the title and summary redacted, the summary as parseable JSON, and no secret-finding path", async () => {
+  client.protocolFeatures = FEATURES;
+  const outbox = await mkOutbox();
+  ackIntents([]);
+  const kindAtAck: string[] = [];
+  const ackWire = api.publicationIntentWire!;
+  api.publicationIntentWire = async (req) => {
+    const loaded = await outbox.loadPublicationRecord(req.runId, GEN);
+    kindAtAck.push(loaded.kind === "ok" ? loaded.record.owner_kind : loaded.kind);
+    return ackWire(req);
+  };
+  const claim = claimFor(5120, { issue_title: `Rotate ${PAT} now` });
+  const stub = new StubExecutor(nullLogger());
+  const executor: Executor = {
+    run: async (ctx) => ({
+      ...(await stub.run(ctx)),
+      prSummary: { what: `rotates ${PAT}`, why: "because", changes: ["a", `b ${PAT}`] },
+    }),
+  };
+  const r = build(executor, { gitlab: fakeGitlab().gitlab }, outbox);
+  // A flagged finding exists when the intent is written; its path must never reach the record or the wire.
+  const rt = r as unknown as { fetchTracking: (flight: { secretRemediation?: unknown }, ...rest: unknown[]) => Promise<unknown> };
+  const realFetch = rt.fetchTracking.bind(r);
+  rt.fetchTracking = async (flight, ...rest) => {
+    flight.secretRemediation = {
+      attempts: 1, withholdPaths: true,
+      flaggedFindings: [{ file: "secret/leaked-name.txt", startLine: 7, commit: "a".repeat(40), ruleId: "generic-api-key" }],
+    };
+    return realFetch(flight, ...rest);
+  };
+  await r.execute(claim);
+
+  assert.ok(api.publicationIntentRequests.length >= 1);
+  const wire = JSON.stringify(api.publicationIntentRequests[0]!.body);
+  assert.ok(!wire.includes(PAT), "no credential on the wire");
+  assert.ok(!wire.includes("leaked-name"), "no finding path on the wire");
+  const body = api.publicationIntentRequests[0]!.body as IntentBodyOnWire;
+  assert.ok(body.intent.mr.title.startsWith("Rotate ") && body.intent.mr.title.endsWith(" now") && !body.intent.mr.title.includes(PAT), body.intent.mr.title);
+  const summary = JSON.parse(body.intent.mr.summary) as { what: string; why: string; changes: string[] };
+  assert.ok(!summary.what.includes(PAT) && !summary.changes[1]!.includes(PAT));
+  assert.equal(summary.why, "because");
+  assert.deepEqual(body.intent.guard.secret_remediation.flagged_findings, [{ start_line: 7, commit: "a".repeat(40), rule_id: "generic-api-key" }]);
+  assert.deepEqual(kindAtAck, ["issue"], "the local envelope carries the run's kind (the caller's, not the body's)");
+  assert.deepEqual(body.intent.mr.closing, [`#5120`], "a plain full delivery is known closing");
+});
+
+it("records no closing reference for an owner-partial delivery or a scope-capped one", async () => {
+  client.protocolFeatures = FEATURES;
+  ackIntents([]);
+  const partial = claimFor(5121, { config: { completion_scope: { deferred: [{ milestone_id: "m2", title: "later", reason: "owner" }] } } });
+  const r1 = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, await mkOutbox());
+  await r1.execute(partial);
+  assert.deepEqual((api.publicationIntentRequests.find(q => q.runId === partial.run_id)!.body as IntentBodyOnWire).intent.mr.closing, []);
+
+  const capped = claimFor(5122);
+  const stub = new StubExecutor(nullLogger());
+  const executor: Executor = { run: async (ctx) => ({ ...(await stub.run(ctx)), scopeCapped: { completedCount: 1, total: 3 } }) };
+  const r2 = build(executor, { gitlab: fakeGitlab().gitlab }, await mkOutbox());
+  await r2.execute(capped);
+  assert.deepEqual((api.publicationIntentRequests.find(q => q.runId === capped.run_id)!.body as IntentBodyOnWire).intent.mr.closing, []);
+});
+
+// ── review rework: transformed candidates are pinned, and an unpinned one is never pushed ────────────
+
+/** A runner whose recovery coordinator is ENABLED (a worker token), as on a real worker. */
+const recoveryRunner = (executor: Executor, outbox: Outbox): RunRunner =>
+  build(executor, { github: fakeGitHub().github }, outbox, nullLogger(), {
+    recovery: new RecoveryCoordinator({ client: new FakeRecoveryClient(), git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: "publication-intent-worker-fixture" }),
+  });
+
+type PinSpy = { calls: Array<{ attemptedHeadSha?: string }>; results: Array<{ attemptedHeadShas?: string[]; attemptedHeadSha?: string } | undefined> };
+function spyOnPin(r: RunRunner, failCandidates: boolean): PinSpy {
+  const rec = (r as unknown as { recovery: { pin: (input: { attemptedHeadSha?: string }) => Promise<unknown> } }).recovery;
+  const real = rec.pin.bind(rec);
+  const spy: PinSpy = { calls: [], results: [] };
+  rec.pin = async (input) => {
+    spy.calls.push({ ...(input.attemptedHeadSha ? { attemptedHeadSha: input.attemptedHeadSha } : {}) });
+    const out = failCandidates && input.attemptedHeadSha ? undefined : await real(input);
+    spy.results.push(out as PinSpy["results"][number]);
+    return out;
+  };
+  return spy;
+}
+
+it("pins the transformed candidate in the recovery record before the push that uses it", async () => {
+  commitToOriginMain({ ".github/workflows/ci.yml": CI_V1 }, "seed workflows");
+  client.protocolFeatures = FEATURES;
+  const outbox = await mkOutbox();
+  const events: string[] = [];
+  ackIntents(events);
+  observeRemote(events);
+  const claim = githubClaim(5123);
+  const r = recoveryRunner(advancingExecutor(), outbox);
+  const spy = spyOnPin(r, false);
+  await r.execute(claim);
+  const candidate = (api.publicationIntentRequests[1]!.body as { intent: { candidate: string } }).intent.candidate;
+  const pinned = spy.calls.findIndex(c => c.attemptedHeadSha === candidate);
+  assert.ok(pinned >= 0, "the candidate was pinned");
+  assert.ok(spy.results[pinned]?.attemptedHeadShas?.includes(candidate) ?? spy.results[pinned]?.attemptedHeadSha === candidate);
+  assert.equal(states(claim.run_id).filter(b => b.status === "completed").length, 1);
+});
+
+it("a transformed candidate whose pin fails is not pushed, is retained, and reports no failure", async () => {
+  commitToOriginMain({ ".github/workflows/ci.yml": CI_V1 }, "seed workflows");
+  client.protocolFeatures = FEATURES;
+  const outbox = await mkOutbox();
+  const events: string[] = [];
+  ackIntents(events);
+  observeRemote(events);
+  const claim = githubClaim(5124);
+  const r = recoveryRunner(advancingExecutor(), outbox);
+  spyOnPin(r, true);
+  await r.execute(claim);
+  assert.ok(!events.includes("pushBranch"), `no push with an unpinned candidate: ${events.join(",")}`);
+  assert.ok(!events.includes("intent:advance"), "the api was not asked to move to a candidate that could not be pinned");
+  assert.equal(failed(claim.run_id).length, 0);
+  assert.equal(states(claim.run_id).filter(b => b.status === "completed").length, 0);
+  assert.equal((await outbox.loadPublicationRecord(claim.run_id, GEN)).kind, "ok", "the record is kept for the reconciliation");
+});
+
+// ── review rework: the record is discarded on any applied terminal ACK ───────────────────────────────
+
+const seedRecord = async (outbox: Outbox, runId: string, generation: number, enrollmentSeq: number): Promise<void> => {
+  const head = "1".repeat(40);
+  const saved = await outbox.savePublicationRecord({
+    owner_kind: "issue", v: 1, run_id: runId, repo_id: REPO_ID, branch: "agent/issue-9", claim_generation: generation,
+    original_head: head, floor: { kind: "absent" }, candidate: head,
+    source: { pin_generation: generation, checkpoint_key: null },
+    mr: { title: "t", summary: "", closing: [], contract_revision: 0 },
+    guard: {
+      frozen_held: { version: 1, blocked: false, everKnown: false, flaggedCommits: [], ciGlobs: null, extraFloors: [] },
+      secret_remediation: { attempts: 0, known: [], flagged_commits: [], flagged_findings: [], blocked: [], ever_known: false, withhold_paths: false, overflow: false },
+      published_real_tips: [], landed_checkpoint: false, ci_fix_human_approved: false, ci_config_guard_globs: null,
+    },
+  });
+  assert.ok(saved.ok);
+  assert.equal((await outbox.replacePublicationRecord({ ...saved.record, enrollment_seq: enrollmentSeq, candidate_seq: 1 }, {})).ok, true);
+};
+
+it("a failed run's applied terminal ACK discards its publication record", async () => {
+  client.protocolFeatures = FEATURES;
+  const outbox = await mkOutbox();
+  ackIntents([]);
+  failGit("push", "remote: Permission to org/repo denied to bot.", () => {});
+  const claim = claimFor(5125);
+  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+  await r.execute(claim);
+  assert.equal(failed(claim.run_id).length, 1, "the run failed on the permanent push rejection");
+  assert.equal(outbox.hasPublicationRecords(claim.run_id), false, "the failed ACK closed the enrollment, so the record is gone");
+});
+
+it("every applied terminal ACK (completed, failed, cancelled) discards the records of ALL generations, including a replayed one", async () => {
+  const outbox = await mkOutbox();
+  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+  const observe = (r as unknown as { observeSettlementTerminalAck: (runId: string, gen: number, body: StateRequest, ack: StateAck) => Promise<void> })
+    .observeSettlementTerminalAck.bind(r);
+  const cases: Array<[string, StateRequest, StateAck]> = [
+    ["completed", { status: "completed" }, { applied: true, status: "completed" }],
+    ["failed", { status: "failed" }, { applied: true, status: "failed" }],
+    ["cancelled", { status: "failed" }, { applied: true, status: "cancelled" }],
+  ];
+  for (const [name, body, ack] of cases) {
+    const runId = crypto.randomUUID();
+    await seedRecord(outbox, runId, 3, 11);
+    await seedRecord(outbox, runId, 5, 12);
+    await observe(runId, 5, body, ack); // delivered later, e.g. by a terminal-journal replay at the newer generation
+    assert.equal(outbox.hasPublicationRecords(runId), false, `${name}: both generations discarded`);
+  }
+  // Nothing is discarded on an answer that did not apply a terminal write.
+  const kept = crypto.randomUUID();
+  await seedRecord(outbox, kept, 3, 11);
+  await observe(kept, 3, { status: "failed" }, { applied: false, status: "running" });
+  await observe(kept, 3, { status: "failed" }, { applied: true, status: "recovery_wait" });
+  await observe(kept, 3, { status: "running" } as StateRequest, { applied: true, status: "failed" });
+  assert.equal(outbox.hasPublicationRecords(kept), true, "an unapplied or non-terminal ack keeps the record");
+});
+
+// ── review rework: the request carries the LIVE claim generation ─────────────────────────────────────
+
+it("a record enrolled at generation G is advanced from a flight at G+1 with a request that carries G+1", async () => {
+  client.protocolFeatures = FEATURES;
+  const outbox = await mkOutbox();
+  const runId = crypto.randomUUID();
+  await seedRecord(outbox, runId, 4, 7);
+  const loaded = await outbox.loadPublicationRecord(runId, 4);
+  assert.equal(loaded.kind, "ok");
+  const events: string[] = [];
+  ackIntents(events);
+  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+  const flight = {
+    runId, claimGeneration: 5, publicationRecord: loaded.kind === "ok" ? loaded.record : undefined,
+    batcher: { emit() {} }, runLog: nullLogger(), completionHoldOutcome: undefined,
+  };
+  const confirm = (r as unknown as { confirmPublicationCandidate: (f: unknown, candidate: string) => Promise<void> }).confirmPublicationCandidate.bind(r);
+  await confirm(flight, "9".repeat(40));
+  const sent = api.publicationIntentRequests.find(q => q.runId === runId)!.body as { claim_generation: number; enrollment_seq: number; candidate_seq: number; intent: { claim_generation: number } };
+  assert.equal(sent.claim_generation, 5, "the fence is the live claim generation");
+  assert.deepEqual([sent.enrollment_seq, sent.candidate_seq, sent.intent.claim_generation], [7, 2, 4], "the enrollment identity stays at G");
+});
+
+// ── review rework: a refused publication park at pre-clone ───────────────────────────────────────────
+
+class ScriptedClient extends WorkerClient {
+  readonly reported: StateRequest[] = [];
+  constructor(private readonly answer: (body: StateRequest, n: number) => StateAck) {
+    super(baseUrl, TOKEN, "0.1.0-test", nullLogger(), { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+    this.protocolFeatures = FEATURES;
+  }
+  override async reportState(_runId: string, body: StateRequest): Promise<StateAck> {
+    this.reported.push({ ...body });
+    return this.answer(body, this.reported.length);
+  }
+}
+
+async function preClonePark(answer: (body: StateRequest, n: number) => StateAck): Promise<{ rc: ScriptedClient; settles: number }> {
+  const rc = new ScriptedClient(answer);
+  git.ensureClone = async () => { throw new Error("fatal: unable to access 'https://github.com/x/y.git/': Could not resolve host: github.com"); };
+  const claim = claimFor(5130, { publication_resume: { enrollment_seq: 1, candidate_seq: 1, intent: {} } });
+  const r = new RunRunner(rc, git, () => ({ executor: new StubExecutor(nullLogger()) }), nullLogger(), 20, undefined,
+    { pollMs: 5, planApprovalTimeoutMs: 0, recoveryRetryMs: 5, gitlab: fakeGitlab().gitlab });
+  let settles = 0;
+  (r as unknown as { settleUnadoptedGuardedClaim: () => Promise<void> }).settleUnadoptedGuardedClaim = async () => { settles++; };
+  await r.execute(claim);
+  return { rc, settles };
+}
+
+it("a pre-clone publication park refused as not enrolled falls back to the legacy typed forge park, then settles the unadopted hold", async () => {
+  const { rc, settles } = await preClonePark((body) =>
+    body.recovery_phase === "publication" ? { applied: false, status: "running", reason: "publication_not_enrolled" } : { applied: true, status: body.status });
+  const parks = rc.reported.filter(b => b.status === "recovery_wait");
+  assert.equal(parks.length, 2, "the publication park, then the legacy park");
+  assert.equal(parks[0]!.recovery_phase, "publication");
+  assert.equal(parks[1]!.recovery_phase, undefined);
+  assert.equal(parks[1]!.recovery_cause, "forge_unreachable");
+  assert.equal(parks[1]!.claim_generation, GEN);
+  assert.equal(rc.reported.filter(b => b.status === "failed").length, 0);
+  assert.equal(settles, 1, "the legacy park settles the empty guarded hold");
+});
+
+it("a pre-clone publication park refused as ENROLLED is retained: no second park, no failure", async () => {
+  const { rc } = await preClonePark((body) =>
+    body.recovery_phase === "publication" ? { applied: false, status: "running", reason: "publication_enrolled" } : { applied: true, status: body.status });
+  assert.equal(rc.reported.filter(b => b.status === "recovery_wait").length, 1);
+  assert.equal(rc.reported.filter(b => b.status === "failed").length, 0);
+});
+
+it("a successful publication-phase park does not try to settle an unadopted guarded hold", async () => {
+  const { rc, settles } = await preClonePark((body) => ({ applied: true, status: body.status }));
+  assert.equal(rc.reported.filter(b => b.status === "recovery_wait").length, 1);
+  assert.equal(settles, 0, "the api refuses that settle for a publication phase");
 });
