@@ -961,7 +961,7 @@ in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#addendum
     a human; on auto-approved runs the item stays a required milestone (owner
     decision 2026-10-31).
   - A frozen unmet milestone still needs the formal owner partial decision;
-    unfinished worker work still parks at completion. No server change.
+    unfinished worker work still parks at completion. No completion-contract change.
 - Formal owner partial records exact kept/deferred IDs and reason, including
   ordinary coding scope. Answers, non-closing intent and auto-approval waive
   nothing. Pending entries remain unchecked with ID, frozen title, reason

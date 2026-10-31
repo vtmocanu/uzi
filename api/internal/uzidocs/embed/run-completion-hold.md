@@ -128,8 +128,9 @@ with a reason naming them as pending and not verified, and lists each as a
 `deferred` `pr_summary` scope note. The worker always renders that reason as
 "> **Issue remains open.** <reason>" in its completion block. Scope notes
 can be replaced by the generated summary or dropped by the 6 KiB region
-fallback, and at most 8 notes of 200 bytes are published, so the
-reason is the dependable record.
+fallback; at most 8 of the lead's notes of 200 bytes each are published (5
+when the generated summary replaces them), so the reason is the dependable
+record.
 
 Implementation, documentation, tests, mandatory gates, security checks and
 review remain worker work and never move to either section, even if the
@@ -139,8 +140,9 @@ work, such as a failed gate, still parks at completion.
 
 The lead resolves classification from the issue, the repository and prior
 owner instructions. If consequential doubt remains and `ask_user` reaches a
-human, it asks before submitting the plan. On an auto-approved run nothing
-reaches a human, so a consequentially doubtful item stays a required
+human (the plan prompt carries no autopilot note), it asks before submitting
+the plan. On an auto-approved run `ask_user` reaches no human, even when the
+plan is force-gated, so a consequentially doubtful item stays a required
 milestone with the uncertainty recorded in the plan; auto-approval, a checker
 approval and the auto-answer supply no waiver. A dormant semantic run instead
 uses `maintainer` criteria (see [Maintainer outstanding proof on semantic
@@ -154,8 +156,8 @@ milestone IDs and a reason. This applies to ordinary coding work too, not
 just acceptance milestones. An ordinary answer or a non-closing declaration
 grants no waiver.
 
-On a partial delivery of frozen milestones, the pending checklist keeps each deferred entry
-unchecked and includes its ID, frozen title and reason, explicitly marked
+On a partial delivery of frozen milestones, the pending checklist keeps each
+deferred entry unchecked and includes its ID, frozen title and reason, explicitly marked
 **not delivered** or **not verified** before owner closure. Checking a box
 grants no completion authority; a refresh restores it unchecked. Put
 actionable next steps in the ordinary summary outside the worker-owned
