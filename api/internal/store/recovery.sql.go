@@ -658,7 +658,7 @@ func (q *Queries) GetCustodyAggregateForOwner(ctx context.Context, arg GetCustod
 }
 
 const getCustodyHoldForSettle = `-- name: GetCustodyHoldForSettle :one
-SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id, merged_predecessor_discard_binding FROM recovery_custody_holds
+SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id, merged_predecessor_discard_binding, final_closure_id FROM recovery_custody_holds
 WHERE id = $1 AND run_id = $2
 `
 
@@ -708,6 +708,7 @@ func (q *Queries) GetCustodyHoldForSettle(ctx context.Context, arg GetCustodyHol
 		&i.CompletedPublicationReason,
 		&i.FinalPublicationID,
 		&i.MergedPredecessorDiscardBinding,
+		&i.FinalClosureID,
 	)
 	return i, err
 }
@@ -769,7 +770,7 @@ func (q *Queries) GetFinalInventoryCapture(ctx context.Context, arg GetFinalInve
 }
 
 const getFinalInventoryHold = `-- name: GetFinalInventoryHold :one
-SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id, merged_predecessor_discard_binding FROM recovery_custody_holds
+SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id, merged_predecessor_discard_binding, final_closure_id FROM recovery_custody_holds
 WHERE run_id = $1 AND user_id = $2 AND original_worker_id = $3::uuid
   AND generation = $4
 ORDER BY id LIMIT 1 FOR NO KEY UPDATE
@@ -825,6 +826,7 @@ func (q *Queries) GetFinalInventoryHold(ctx context.Context, arg GetFinalInvento
 		&i.CompletedPublicationReason,
 		&i.FinalPublicationID,
 		&i.MergedPredecessorDiscardBinding,
+		&i.FinalClosureID,
 	)
 	return i, err
 }
@@ -1486,7 +1488,7 @@ func (q *Queries) ListOwnersWithClearedCustodyEpisode(ctx context.Context, arg L
 }
 
 const listReleasableCustodyHolds = `-- name: ListReleasableCustodyHolds :many
-SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at, h.release_evidence, h.release_pushed_sha, h.release_source_sha, h.release_adopted_sha, h.release_final_head_sha, h.release_successor_generation, h.release_branch, h.release_target, h.terminal_record_rejection, h.inventory_guarded, h.final_disposition, h.final_capture_id, h.final_source_sha, h.final_coverage_digest, h.completion_identity, h.completed_publication_receipt, h.completed_publication_reason, h.final_publication_id, h.merged_predecessor_discard_binding,
+SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at, h.release_evidence, h.release_pushed_sha, h.release_source_sha, h.release_adopted_sha, h.release_final_head_sha, h.release_successor_generation, h.release_branch, h.release_target, h.terminal_record_rejection, h.inventory_guarded, h.final_disposition, h.final_capture_id, h.final_source_sha, h.final_coverage_digest, h.completion_identity, h.completed_publication_receipt, h.completed_publication_reason, h.final_publication_id, h.merged_predecessor_discard_binding, h.final_closure_id,
     CASE
         WHEN EXISTS (SELECT 1 FROM runs r
                        WHERE r.id = h.run_id
@@ -1547,6 +1549,7 @@ type ListReleasableCustodyHoldsRow struct {
 	CompletedPublicationReason      pgtype.Text        `json:"completed_publication_reason"`
 	FinalPublicationID              pgtype.UUID        `json:"final_publication_id"`
 	MergedPredecessorDiscardBinding []byte             `json:"merged_predecessor_discard_binding"`
+	FinalClosureID                  pgtype.UUID        `json:"final_closure_id"`
 	Reason                          string             `json:"reason"`
 }
 
@@ -1628,6 +1631,7 @@ func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]ListReleasa
 			&i.CompletedPublicationReason,
 			&i.FinalPublicationID,
 			&i.MergedPredecessorDiscardBinding,
+			&i.FinalClosureID,
 			&i.Reason,
 		); err != nil {
 			return nil, err
@@ -1833,6 +1837,48 @@ func (q *Queries) MarkCaptureState(ctx context.Context, arg MarkCaptureStatePara
 	return i, err
 }
 
+const protectFinalClosureCapture = `-- name: ProtectFinalClosureCapture :execrows
+UPDATE recovery_captures c SET local_replica_worker_id = $1::uuid,
+    ready_retention_seconds = $2::bigint, updated_at = now()
+WHERE c.id = $3 AND c.hold_id = $4 AND c.original_worker_id = $1::uuid
+  AND c.source_sha = $5 AND c.coverage_digest = $6
+  AND c.manifest_bound AND c.state = 'available' AND c.expires_at > clock_timestamp()
+  AND cardinality(c.prerequisite_shas) > 0
+  AND EXISTS (SELECT 1 FROM recovery_prerequisite_closures p WHERE p.id = $7
+    AND p.capture_id = c.id AND p.hold_id = c.hold_id AND p.state = 'pinned' AND p.absent_since IS NULL
+    AND p.checksum = c.checksum AND p.prerequisite_shas = c.prerequisite_shas)
+  AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.id = c.hold_id
+    AND h.inventory_guarded AND h.state = 'open' AND h.live_worker_id = $1::uuid)
+`
+
+type ProtectFinalClosureCaptureParams struct {
+	WorkerID         uuid.UUID   `json:"worker_id"`
+	RetentionSeconds int64       `json:"retention_seconds"`
+	ID               uuid.UUID   `json:"id"`
+	HoldID           uuid.UUID   `json:"hold_id"`
+	SourceSha        string      `json:"source_sha"`
+	CoverageDigest   pgtype.Text `json:"coverage_digest"`
+	ClosureID        uuid.UUID   `json:"closure_id"`
+}
+
+// Closure-bearing twin of ProtectFinalInventoryCapture: requires prerequisites and an
+// exact still-pinned closure bound to this capture.
+func (q *Queries) ProtectFinalClosureCapture(ctx context.Context, arg ProtectFinalClosureCaptureParams) (int64, error) {
+	result, err := q.db.Exec(ctx, protectFinalClosureCapture,
+		arg.WorkerID,
+		arg.RetentionSeconds,
+		arg.ID,
+		arg.HoldID,
+		arg.SourceSha,
+		arg.CoverageDigest,
+		arg.ClosureID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const protectFinalInventoryCapture = `-- name: ProtectFinalInventoryCapture :execrows
 UPDATE recovery_captures c SET local_replica_worker_id = $1::uuid,
     ready_retention_seconds = $2::bigint, updated_at = now()
@@ -2022,6 +2068,64 @@ func (q *Queries) ReleaseCustodyHoldExact(ctx context.Context, arg ReleaseCustod
 	result, err := q.db.Exec(ctx, releaseCustodyHoldExact,
 		arg.ReleaseEvidence,
 		arg.RunID,
+		arg.Generation,
+		arg.WorkerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const releaseFinalClosureHold = `-- name: ReleaseFinalClosureHold :execrows
+UPDATE recovery_custody_holds h SET state = 'released', live_worker_id = NULL, live_run_id = NULL,
+    final_disposition = 'archive', final_capture_id = $1::uuid,
+    final_source_sha = $2::text, final_coverage_digest = $3::text,
+    release_evidence = 'prerequisite_closure', final_closure_id = $4::uuid,
+    released_at = now(), updated_at = now()
+WHERE h.id = $5 AND h.run_id = $6 AND h.user_id = $7
+  AND h.generation = $8 AND h.original_worker_id = $9::uuid
+  AND h.live_worker_id = $9::uuid AND h.inventory_guarded AND h.state = 'open'
+  AND EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id AND r.user_id = h.user_id
+    AND (r.claim_generation > h.generation OR (r.claim_generation = h.generation AND
+      (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL)))
+    AND NOT (r.status = 'recovery_wait' AND r.recovery_wait_cause IN ('worker_requeue_exhausted',
+      'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')))
+  AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id = $1::uuid
+    AND c.hold_id = h.id AND c.run_id = h.run_id AND c.user_id = h.user_id
+    AND c.original_worker_id = h.original_worker_id AND c.source_sha = $2::text
+    AND c.coverage_digest = $3::text
+    AND c.manifest_bound AND c.state = 'available' AND c.expires_at > clock_timestamp()
+    AND cardinality(c.prerequisite_shas) > 0
+    AND c.local_replica_worker_id = h.original_worker_id AND c.ready_retention_seconds > 0
+    AND EXISTS (SELECT 1 FROM recovery_prerequisite_closures p WHERE p.id = $4::uuid
+      AND p.capture_id = c.id AND p.hold_id = h.id AND p.state = 'pinned' AND p.absent_since IS NULL
+      AND p.checksum = c.checksum AND p.prerequisite_shas = c.prerequisite_shas))
+`
+
+type ReleaseFinalClosureHoldParams struct {
+	FinalCaptureID      uuid.UUID `json:"final_capture_id"`
+	FinalSourceSha      string    `json:"final_source_sha"`
+	FinalCoverageDigest string    `json:"final_coverage_digest"`
+	ClosureID           uuid.UUID `json:"closure_id"`
+	ID                  uuid.UUID `json:"id"`
+	RunID               uuid.UUID `json:"run_id"`
+	UserID              uuid.UUID `json:"user_id"`
+	Generation          int64     `json:"generation"`
+	WorkerID            uuid.UUID `json:"worker_id"`
+}
+
+// Archive-only release of a hold whose capture carries prerequisites, bound to its pinned closure.
+// Runs parked on an owner-only recovery_wait cause never release this way.
+func (q *Queries) ReleaseFinalClosureHold(ctx context.Context, arg ReleaseFinalClosureHoldParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseFinalClosureHold,
+		arg.FinalCaptureID,
+		arg.FinalSourceSha,
+		arg.FinalCoverageDigest,
+		arg.ClosureID,
+		arg.ID,
+		arg.RunID,
+		arg.UserID,
 		arg.Generation,
 		arg.WorkerID,
 	)

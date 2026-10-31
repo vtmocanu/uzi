@@ -379,7 +379,7 @@ func (q *Queries) ListMergedPredecessorCandidates(ctx context.Context, arg ListM
 }
 
 const lockCrossRunInventory = `-- name: LockCrossRunInventory :many
-SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id, merged_predecessor_discard_binding FROM recovery_custody_holds WHERE run_id = $1
+SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id, merged_predecessor_discard_binding, final_closure_id FROM recovery_custody_holds WHERE run_id = $1
 ORDER BY generation, id LIMIT 1001 FOR NO KEY UPDATE
 `
 
@@ -427,6 +427,7 @@ func (q *Queries) LockCrossRunInventory(ctx context.Context, runID uuid.UUID) ([
 			&i.CompletedPublicationReason,
 			&i.FinalPublicationID,
 			&i.MergedPredecessorDiscardBinding,
+			&i.FinalClosureID,
 		); err != nil {
 			return nil, err
 		}

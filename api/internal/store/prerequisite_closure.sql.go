@@ -317,6 +317,53 @@ func (q *Queries) GetPrerequisiteClosure(ctx context.Context, arg GetPrerequisit
 	return i, err
 }
 
+const getPrerequisiteClosureForCapture = `-- name: GetPrerequisiteClosureForCapture :one
+SELECT id, capture_id, hold_id, run_id, user_id, repo_id, live_run_id, checksum, prerequisite_shas, pin_ref, state, reason, last_error, attempts, reconciliation_attempts, next_attempt_at, attempt_deadline, invoked_at, invoked_deadline, pin_tip, connection_id, forge_kind, normalized_base_url, project_id, default_branch, cleanup_attempts, cleanup_deadline, cleanup_exhausted_at, absent_since, absence_pass_id, audit_next_at, last_audit_pass_id, created_at, updated_at FROM recovery_prerequisite_closures WHERE capture_id = $1
+`
+
+// Unlocked precheck by capture id alone (GetPrerequisiteClosure also requires the user id).
+func (q *Queries) GetPrerequisiteClosureForCapture(ctx context.Context, captureID uuid.UUID) (RecoveryPrerequisiteClosure, error) {
+	row := q.db.QueryRow(ctx, getPrerequisiteClosureForCapture, captureID)
+	var i RecoveryPrerequisiteClosure
+	err := row.Scan(
+		&i.ID,
+		&i.CaptureID,
+		&i.HoldID,
+		&i.RunID,
+		&i.UserID,
+		&i.RepoID,
+		&i.LiveRunID,
+		&i.Checksum,
+		&i.PrerequisiteShas,
+		&i.PinRef,
+		&i.State,
+		&i.Reason,
+		&i.LastError,
+		&i.Attempts,
+		&i.ReconciliationAttempts,
+		&i.NextAttemptAt,
+		&i.AttemptDeadline,
+		&i.InvokedAt,
+		&i.InvokedDeadline,
+		&i.PinTip,
+		&i.ConnectionID,
+		&i.ForgeKind,
+		&i.NormalizedBaseUrl,
+		&i.ProjectID,
+		&i.DefaultBranch,
+		&i.CleanupAttempts,
+		&i.CleanupDeadline,
+		&i.CleanupExhaustedAt,
+		&i.AbsentSince,
+		&i.AbsencePassID,
+		&i.AuditNextAt,
+		&i.LastAuditPassID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const insertPrerequisiteClosure = `-- name: InsertPrerequisiteClosure :one
 
 INSERT INTO recovery_prerequisite_closures
@@ -846,7 +893,7 @@ func (q *Queries) LockPrerequisiteClosure(ctx context.Context, id uuid.UUID) (Re
 }
 
 const lockPrerequisiteHold = `-- name: LockPrerequisiteHold :one
-SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id, merged_predecessor_discard_binding FROM recovery_custody_holds WHERE id = $1 FOR NO KEY UPDATE
+SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id, merged_predecessor_discard_binding, final_closure_id FROM recovery_custody_holds WHERE id = $1 FOR NO KEY UPDATE
 `
 
 func (q *Queries) LockPrerequisiteHold(ctx context.Context, holdID uuid.UUID) (RecoveryCustodyHold, error) {
@@ -885,6 +932,7 @@ func (q *Queries) LockPrerequisiteHold(ctx context.Context, holdID uuid.UUID) (R
 		&i.CompletedPublicationReason,
 		&i.FinalPublicationID,
 		&i.MergedPredecessorDiscardBinding,
+		&i.FinalClosureID,
 	)
 	return i, err
 }
@@ -1493,6 +1541,69 @@ type ReservePrerequisiteCleanupParams struct {
 // Durable generation BEFORE a delete; cleanup exhaustion retains the live pointer for listing only.
 func (q *Queries) ReservePrerequisiteCleanup(ctx context.Context, arg ReservePrerequisiteCleanupParams) (RecoveryPrerequisiteClosure, error) {
 	row := q.db.QueryRow(ctx, reservePrerequisiteCleanup, arg.PassID, arg.LeaseSeconds, arg.ID)
+	var i RecoveryPrerequisiteClosure
+	err := row.Scan(
+		&i.ID,
+		&i.CaptureID,
+		&i.HoldID,
+		&i.RunID,
+		&i.UserID,
+		&i.RepoID,
+		&i.LiveRunID,
+		&i.Checksum,
+		&i.PrerequisiteShas,
+		&i.PinRef,
+		&i.State,
+		&i.Reason,
+		&i.LastError,
+		&i.Attempts,
+		&i.ReconciliationAttempts,
+		&i.NextAttemptAt,
+		&i.AttemptDeadline,
+		&i.InvokedAt,
+		&i.InvokedDeadline,
+		&i.PinTip,
+		&i.ConnectionID,
+		&i.ForgeKind,
+		&i.NormalizedBaseUrl,
+		&i.ProjectID,
+		&i.DefaultBranch,
+		&i.CleanupAttempts,
+		&i.CleanupDeadline,
+		&i.CleanupExhaustedAt,
+		&i.AbsentSince,
+		&i.AbsencePassID,
+		&i.AuditNextAt,
+		&i.LastAuditPassID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const reservePrerequisiteFinalListing = `-- name: ReservePrerequisiteFinalListing :one
+UPDATE recovery_prerequisite_closures p
+SET last_audit_pass_id = $1,updated_at=now()
+WHERE p.id = $2 AND p.state='pinned' AND p.absent_since IS NULL
+    AND (p.cleanup_deadline IS NULL OR p.cleanup_deadline<=now())
+    AND p.cleanup_attempts = $3::int
+    AND p.last_audit_pass_id IS DISTINCT FROM $1
+    AND $1::uuid IS NOT NULL AND $1::uuid <> '00000000-0000-0000-0000-000000000000'::uuid
+    AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id=p.capture_id AND c.state='available'
+        AND c.manifest_bound AND c.expires_at > clock_timestamp())
+RETURNING p.id, p.capture_id, p.hold_id, p.run_id, p.user_id, p.repo_id, p.live_run_id, p.checksum, p.prerequisite_shas, p.pin_ref, p.state, p.reason, p.last_error, p.attempts, p.reconciliation_attempts, p.next_attempt_at, p.attempt_deadline, p.invoked_at, p.invoked_deadline, p.pin_tip, p.connection_id, p.forge_kind, p.normalized_base_url, p.project_id, p.default_branch, p.cleanup_attempts, p.cleanup_deadline, p.cleanup_exhausted_at, p.absent_since, p.absence_pass_id, p.audit_next_at, p.last_audit_pass_id, p.created_at, p.updated_at
+`
+
+type ReservePrerequisiteFinalListingParams struct {
+	PassID     pgtype.UUID `json:"pass_id"`
+	ID         uuid.UUID   `json:"id"`
+	Generation int32       `json:"generation"`
+}
+
+// FINAL's pre-release listing: reserves a pass on a live pinned closure of an available
+// capture, fenced by the cleanup generation. It never authorizes a delete.
+func (q *Queries) ReservePrerequisiteFinalListing(ctx context.Context, arg ReservePrerequisiteFinalListingParams) (RecoveryPrerequisiteClosure, error) {
+	row := q.db.QueryRow(ctx, reservePrerequisiteFinalListing, arg.PassID, arg.ID, arg.Generation)
 	var i RecoveryPrerequisiteClosure
 	err := row.Scan(
 		&i.ID,

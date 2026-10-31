@@ -921,6 +921,7 @@ type RecoveryCustodyHold struct {
 	CompletedPublicationReason      pgtype.Text        `json:"completed_publication_reason"`
 	FinalPublicationID              pgtype.UUID        `json:"final_publication_id"`
 	MergedPredecessorDiscardBinding []byte             `json:"merged_predecessor_discard_binding"`
+	FinalClosureID                  pgtype.UUID        `json:"final_closure_id"`
 }
 
 type RecoveryCustodyHoldFact struct {

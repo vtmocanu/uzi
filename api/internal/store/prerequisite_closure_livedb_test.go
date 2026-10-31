@@ -685,12 +685,14 @@ func TestPrerequisiteClosureMigrationRoundTripLiveDB(t *testing.T) {
 		t.Run(state, func(t *testing.T) {
 			// A fresh database prevents an earlier pending row masking later states.
 			ctx, dsn, pool := prerequisiteMigratedPool(t, "prereq_down_state_")
-			// Isolate 00387: later migrations roll back first and are not this test's subject.
+			// Seed through the head-generated queries, then isolate 00387: later
+			// migrations (which hold no closure-release evidence here) roll back
+			// first and are not this test's subject.
+			f := prerequisiteNew(t, ctx, pool)
+			prerequisiteSetState(t, ctx, f, state)
 			if err := store.MigrateDownTo(ctx, dsn, 387); err != nil {
 				t.Fatal(err)
 			}
-			f := prerequisiteNew(t, ctx, pool)
-			prerequisiteSetState(t, ctx, f, state)
 			prerequisiteSchemaVersion(t, ctx, pool, 387)
 			if err := store.MigrateDownTo(ctx, dsn, 386); err == nil {
 				t.Fatalf("Down forgot %s evidence", state)
