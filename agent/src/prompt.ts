@@ -184,6 +184,7 @@ const COMPLETION_DELIVERY_GUIDANCE = [
   "Resolve classification from the issue, the repository and prior owner instructions; if consequential doubt remains,",
   "use ask_user before the final submit_plan, also on an auto-approved run, never a question in plan prose,",
   "and never silently omit ambiguous work from the milestones.",
+  "The lead owns ask_user, submit_plan and signal_done; a subagent reports classification doubt to the lead.",
   "These sections apply to new, unfrozen plans. A frozen milestone that remains unmet still requires",
   "a formal owner partial decision with exact kept and deferred milestone IDs and a reason.",
   "Plan approval, ordinary answers and non_closing never change frozen scope or supply that decision.",
