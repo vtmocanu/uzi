@@ -253,6 +253,16 @@ type FakeClient struct {
 	LastPoolValue    bool
 	PoolSecret       apitypes.SecretDTO
 
+	// SetCodexAutoEligible and SetCodexAccountMode captures (issue #3719): the resolved
+	// codex_auth alias id and boolean sent, the call counts (zero proves the command
+	// refused before any write), and the mode sent.
+	LastCodexPoolSecretID string
+	LastCodexPoolValue    bool
+	CodexPoolCalls        int
+	CodexPoolSecret       apitypes.SecretDTO
+	LastCodexMode         string
+	CodexModeCalls        int
+
 	// SetRunPriority capture (PRD #320 M5): the run id the command targeted and the
 	// expedite bool it sent (true = `uzi run expedite`, false = `--clear`). PriorityRun
 	// is the canned success reply. SetRunPriorityErr wins over the blanket Err so a test

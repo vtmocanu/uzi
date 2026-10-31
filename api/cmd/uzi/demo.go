@@ -346,7 +346,7 @@ func demoRuns(now time.Time) []apitypes.RunListItemDTO {
 	scheduler.MilestonesCompleted = []string{"m1", "m2"}
 	scheduler.MilestonesInProgress = []string{"m3", "m4"}
 	// A realistic spread of credentials. The TUI board and detail show just the muted LABEL
-	// (meta/personal); the select reason/mode is surfaced only by `uzi run <id>`, not the TUI, so
+	// (meta/personal); the Anthropic select reason/mode is surfaced only by `uzi run <id>`, not the TUI (the Codex reason is drawn beside the alias on the detail rail), so
 	// these reasons are realistic data rather than something the demo draws a dot or colour for.
 	// meta on an auto pick with headroom, the common case.
 	headroom := 27
@@ -386,9 +386,11 @@ func demoRuns(now time.Time) []apitypes.RunListItemDTO {
 	codexLive.Harness = "codex"
 	codexLive.CodexSecretID = sp("sec-codex-main")
 	codexLive.CodexSecretLabel = sp("codex-main")
+	codexLive.CodexSelectReason = sp("best_of_pool") // auto mode, every pooled login under the headroom floor
 	codexPast := mk("c0de0002-1111-2222-3333-444444444444", "issue", "completed", "Archive the old Codex login", "", nil, 0, 4*time.Hour)
 	codexPast.Harness = "codex"
 	codexPast.CodexSecretLabel = sp("former-codex") // deleted alias: snapshot survives
+	codexPast.CodexSelectReason = sp("auto")
 
 	return []apitypes.RunListItemDTO{
 		// The inline planning run carries an issue id but NO web URL — it exercises the

@@ -238,6 +238,7 @@ describe("chatFromRun (create/continue runDTO → unified Chat view)", () => {
       codex_account_action: null,
       codex_secret_id: null,
       codex_secret_label: null,
+      codex_select_reason: null,
       recovery_retry_not_before: null,
       forge_park_count: 0,
       provider_park_count: 0,

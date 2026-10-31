@@ -252,6 +252,10 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[0].(*pgtype.Bool); ok {
 			*p = r.mrRework
 		}
+		// GetUserCodexAccountMode (issue #3719) scans a bare string.
+		if p, ok := dest[0].(*string); ok {
+			*p = "default"
+		}
 	case 4:
 		// SetUserAppearance RETURNING appearance_mode, light_theme, dark_theme,
 		// typeface (PRD #1167 M1). Discarded by the handler, captured here so the

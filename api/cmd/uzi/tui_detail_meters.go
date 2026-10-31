@@ -136,7 +136,16 @@ func (m tuiModel) railRateMeters(now time.Time, usedRows int) string {
 			width -= len(deleted)
 			suffix = deleted
 		}
-		label := m.renderer.Plain(*m.detail.run.CodexSecretLabel, width) + suffix
+		// Issue #3719: the reason beside the label, as a faint tag. The tag is a closed
+		// enum from this binary's own table, but an unrecognised value from a newer server
+		// is untrusted, so it rides renderer.Plain and the label is shortened to keep the
+		// whole entry inside the rail width.
+		tag := ""
+		if t := codexReasonTag(m.detail.run.CodexSelectReason); t != "" {
+			tag = " · " + m.renderer.Plain(t, max(width/2, 1))
+			width = max(width-visualWidth(tag), 1)
+		}
+		label := m.renderer.Plain(*m.detail.run.CodexSecretLabel, width) + tag + suffix
 		if headerRow+1 > budget {
 			return ""
 		}

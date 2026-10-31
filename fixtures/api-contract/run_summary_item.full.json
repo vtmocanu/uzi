@@ -429,6 +429,7 @@
   "codex_account_action": "x",
   "codex_secret_id": "x",
   "codex_secret_label": "x",
+  "codex_select_reason": "x",
   "recovery_retry_not_before": "2020-01-02T03:04:05Z",
   "forge_park_count": 1,
   "forge_park_max": 1,

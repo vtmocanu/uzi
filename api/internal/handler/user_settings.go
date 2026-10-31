@@ -95,6 +95,10 @@ type userSettingsDTO struct {
 	// #3522), read-only here: PUT /api/me/usage-reserve owns the write. null = off.
 	WeeklyReservePct          *int `json:"weekly_reserve_pct"`
 	WeeklyReservePauseRunning bool `json:"weekly_reserve_pause_running"`
+	// CodexAccountMode is the user's Codex account mode (issue #3719): "default" binds the
+	// default alias, "auto" picks among the aliases the user pooled. Read-only here:
+	// PUT /api/me/codex-account-mode owns the write.
+	CodexAccountMode string `json:"codex_account_mode"`
 }
 
 // userSettingsResponse reads the user's settings row (one GetUserSettings query,
@@ -131,6 +135,12 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	effHarness, err := h.resolveSettingsHarness(r.Context(), userID)
 	if err != nil {
 		slog.Error("resolve settings harness", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	codexMode, err := h.q.GetUserCodexAccountMode(r.Context(), userID)
+	if err != nil {
+		slog.Error("get codex account mode", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
@@ -184,6 +194,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 				textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String)),
 			WeeklyReservePct:          intPtrFromInt2(s.WeeklyReservePct),
 			WeeklyReservePauseRunning: s.WeeklyReservePauseRunning,
+			CodexAccountMode:          codexMode,
 		},
 	})
 }

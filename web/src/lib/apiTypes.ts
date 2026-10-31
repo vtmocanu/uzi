@@ -250,6 +250,9 @@ export interface UserSettings {
   weekly_reserve_pct?: number | null;
   /** PRD #3522: also pause running runs at the reserve (default true). */
   weekly_reserve_pause_running?: boolean;
+  /** Issue #3719: how a new Codex run chooses its login. "default" binds the default alias;
+   *  "auto" picks among the pooled aliases. Absent on a server that predates the setting. */
+  codex_account_mode?: CodexAccountMode | string;
   /** Per-user default harness (PRD #1429 M1 / D3); null = "no preference", so implicit run
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */
@@ -3610,6 +3613,10 @@ export interface Run {
    * codex_account_action on owner/admin run reads. User-authored: render as text
    * through sanitizeLabel, never as markup. */
   codex_secret_label: string | null;
+  /** Why the run's Codex alias was chosen (issue #3719); a closed server enum (see
+   *  CodexSelectReason). Null for a run created before auto-selection and for a non-Codex run.
+   *  Render an unrecognised value honestly: the API deploys separately from the web bundle. */
+  codex_select_reason: CodexSelectReason | string | null;
   /** PRD #1392 M1: when the server will promote a `recovery_wait` run back to queued — the
    *  retry stamp the forge-park surface counts down to ("retry at HH:MM"), and (issue #1766)
    *  the next retry a `vault_locked` park resumes at once the vault is unlocked. The
@@ -4249,6 +4256,20 @@ export type MyRateLimits =
  *  reason, and a union that lied about being total would make a renderer's exhaustive
  *  switch look safe while dropping it. The renderer handles the unknown case
  *  explicitly instead. */
+/** Why run creation bound the Codex alias it bound (issue #3719), mirroring
+ *  codexselect.Reason. Closed server-side; the unions that carry it stay open (`| string`)
+ *  so a newer server's reason renders honestly. */
+export type CodexSelectReason =
+  | "default"
+  | "pool_empty"
+  | "auto"
+  | "best_of_pool"
+  | "pool_stale"
+  | "pool_exhausted";
+
+/** The user's Codex account mode (issue #3719). */
+export type CodexAccountMode = "default" | "auto";
+
 export type SelectReason =
   | "default"
   | "pinned"
