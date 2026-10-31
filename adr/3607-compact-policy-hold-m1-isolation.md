@@ -22,11 +22,12 @@ and implementation began at 1846 under auto-approval. That automation and the
 supplied APPROVED plan-tool reports are design history, not owner consent.
 
 On 2026-10-31, lead and buddy accepted the narrow generic protocol capability
-`pending_outcome_scoped_claim_v1` for landing under their delegated decision
-authority. This dated acceptance amends the former absolute prohibition on a
-second capability; it does not invent a prior owner decision or waive validation.
-The lead will disclose the new wire capability and this approval history to the
-owner. It is independent of the single unreleased policy contract
+`pending_outcome_scoped_claim_v1` for landing with the user's consent to their
+recommendation. This dated acceptance amends the former absolute prohibition on
+a second capability; it does not invent a prior owner decision or waive
+validation. The user approved after the lead disclosed the new wire capability
+and its earlier auto-approval history. It is independent of the single unreleased
+policy contract
 `provider_policy_hold_v1`, which remains unadvertised by the API.
 
 A worker-only relaxation cannot supply the server's scoped overflow exception;
@@ -117,7 +118,9 @@ live. A continuously inaccessible root can therefore retain the claimed row
 until storage repair. There is no automatic release or requeue guarantee for
 already-claimed or running targets; these remain operator-held.
 
-When initialization positively finds a symlinked or unreadable outbox root, the
+The user approved this intake change and diagnostic on 2026-10-31 after lead
+and buddy recommended it. When initialization positively finds a symlinked or
+unreadable outbox root, the
 worker stops all new run, cross-check and chat claims in both negotiation modes.
 This intake stop is distinct from healthy but incomplete inventory coverage and
 from key failures on an otherwise readable root. Heartbeats and drains continue.
