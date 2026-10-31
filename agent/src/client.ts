@@ -1537,11 +1537,13 @@ export class WorkerClient {
    * says what is known: `acked` (the api stored it), `refused` (a definite answer that stored nothing, with
    * the machine-readable reason: publication_intent_mismatch, publication_enrollment_retired,
    * publication_resume_disabled, publication_resume_unsupported, publication_kind_unsupported,
-   * stale_claim, ...), `unsupported` (the feature is not negotiated; nothing was sent) or `unknown`
+   * stale_claim, ...), `unsupported` (a NEW enrollment without the negotiated feature; nothing was sent) or `unknown`
    * (transport failure, timeout, a 429/5xx or an unreadable ack: the request may have been applied).
    */
   async registerPublicationIntent(runId: string, request: PublicationIntentRequest, signal?: AbortSignal): Promise<PublicationIntentResult> {
-    if (!this.hasFeature(PUBLICATION_RESUME_FEATURE)) return { kind: "unsupported" };
+    // Only a NEW enrollment needs the advertised feature (the api's switch refuses new enrollment alone):
+    // an existing enrollment keeps its candidate updates and retirement answers whatever the api advertises.
+    if (request.enrollment_seq === undefined && !this.hasFeature(PUBLICATION_RESUME_FEATURE)) return { kind: "unsupported" };
     if (!terminalUUID(runId)) return { kind: "refused", status: 0, reason: "invalid_run_id" };
     let res: Response;
     try {
@@ -2510,13 +2512,15 @@ export class WorkerClient {
       // Issue #1324: the publication-phase forge park. The api refuses an enrolled run's untyped park
       // and a typed park without an enrollment, so this report can neither degrade to an untyped one
       // nor drop its generation fence: it is sent exactly as given, once, or not at all.
-      if (!this.hasFeature(PUBLICATION_RESUME_FEATURE) || body.status !== "recovery_wait" ||
+      // Not gated on the advertised feature: the api accepts a typed publication park whatever its
+      // switch says, and refuses an enrolled run's untyped park, so a park must never be withheld.
+      if (body.status !== "recovery_wait" ||
           body.recovery_cause !== "forge_unreachable" || body.recovery_phase !== "publication" ||
           (body.publication_surface !== "git" && body.publication_surface !== "api") ||
           (body.publication_step !== "floor_refresh" && body.publication_step !== "push" && body.publication_step !== "mr_create") ||
           !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) < 1 ||
           (body.handoff_checkpoint_tip !== undefined && !/^[0-9a-f]{40}$/.test(body.handoff_checkpoint_tip)))
-        throw new Error("publication park requires negotiated support, a forge_unreachable recovery_wait, a surface, a step and a positive generation");
+        throw new Error("publication park requires a forge_unreachable recovery_wait, a surface, a step and a positive generation");
       const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
       try {
         return await this.reportStateOnce(runId, path, Object.freeze({ ...body }), signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);

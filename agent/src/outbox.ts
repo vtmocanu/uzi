@@ -2054,8 +2054,9 @@ export class Outbox {
   // never implies the enrollment was retired; it is removed only through discardPublicationRecord,
   // which the caller invokes after the api positively confirmed that enrollment_seq retired.
 
-  /** Does the run directory hold any `publication-*` entry (a record or a crash-left temp)? */
-  private async hasPublicationFile(runId: string): Promise<boolean> {
+  /** Does the run directory physically hold any `publication-*` entry (a record, a crash-left temp, or a
+   *  record that failed authentication or is a mismatch and so is not tracked in memory)? */
+  async hasPublicationFile(runId: string): Promise<boolean> {
     if (!this.validRunId(runId)) return false;
     try {
       return (await fs.readdir(this.runDir(runId))).some((name) => name.startsWith(PUBLICATION_FILE_PREFIX));
@@ -2284,25 +2285,31 @@ export class Outbox {
         }
         const dir = this.runDir(runId);
         const dst = path.join(dir, publicationFileName(gen));
-        const tmp = `${dst}.${randomUUID()}.tmp`;
         const serialized = this.seal(MAC_DOMAIN_PUBLICATION, next);
         if (Buffer.byteLength(serialized, "utf8") > MAX_PUBLICATION_RECORD_BYTES) return fail("intent_too_large", "unwritten");
         try {
+          // The closure may run twice (the ENOSPC reserve retry), so each run mints and removes its own temp:
+          // reopening one path with O_EXCL would fail with EEXIST.
           await this.withReserveOnEnospc(async () => {
-            await this.rawWrite(async () => {
-              const fh = await fs.open(tmp, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
-              try {
-                await fh.writeFile(serialized, "utf8");
-                await fh.sync();
-              } finally {
-                await fh.close();
-              }
-            }, { path: tmp, kind: "publication" });
-            await fs.rename(tmp, dst);
+            const tmp = `${dst}.${randomUUID()}.tmp`;
+            try {
+              await this.rawWrite(async () => {
+                const fh = await fs.open(tmp, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+                try {
+                  await fh.writeFile(serialized, "utf8");
+                  await fh.sync();
+                } finally {
+                  await fh.close();
+                }
+              }, { path: tmp, kind: "publication" });
+              await fs.rename(tmp, dst);
+            } catch (err) {
+              // Nothing was renamed over the record: the old one is intact.
+              await fs.rm(tmp, { force: true }).catch(() => undefined);
+              throw err;
+            }
           });
         } catch (err) {
-          // Nothing was renamed over the record: the old one is intact.
-          await fs.rm(tmp, { force: true }).catch(() => undefined);
           return fail(isENOSPC(err) ? "enospc" : "io_error", "unwritten", errText(err));
         }
         try {

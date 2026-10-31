@@ -37,6 +37,15 @@ describe("client.registerPublicationIntent", () => {
     assert.equal(sent.length, 0);
   });
 
+  it("gates only a NEW enrollment on the feature: an update for an existing enrollment is sent regardless", async () => {
+    const { client, sent } = clientWith(() => json(200, { enrollment_seq: 5, candidate_seq: 3, state: "active" }), []);
+    assert.deepEqual(await client.registerPublicationIntent(RUN, request()), { kind: "unsupported" });
+    assert.equal(sent.length, 0);
+    const result = await client.registerPublicationIntent(RUN, { claim_generation: 6, enrollment_seq: 5, candidate_seq: 3, intent: intent() });
+    assert.equal(result.kind, "acked");
+    assert.equal(sent.length, 1);
+  });
+
   it("POSTs {claim_generation, enrollment_seq?, candidate_seq?, intent} and reads the ack", async () => {
     const { client, sent } = clientWith(() => json(200, { enrollment_seq: 5, candidate_seq: 2, state: "active" }), ["publication_resume_v1"]);
     const result = await client.registerPublicationIntent(RUN, { claim_generation: 4, enrollment_seq: 5, candidate_seq: 2, intent: intent() });
@@ -98,9 +107,15 @@ describe("client typed publication park", () => {
     });
   });
 
-  it("refuses to send an incomplete or un-negotiated typed park, rather than degrade to an untyped one", async () => {
+  it("sends the typed park whether or not the api advertises the feature", async () => {
+    const { client, sent } = clientWith(ok, []);
+    const ack = await client.reportState(RUN, park());
+    assert.equal(ack.status, "recovery_wait");
+    assert.equal(sent.length, 1);
+  });
+
+  it("refuses to send an incomplete typed park, rather than degrade to an untyped one", async () => {
     const bad: [Partial<StateRequest>, string[]][] = [
-      [{}, []],
       [{ publication_surface: undefined }, ["publication_resume_v1"]],
       [{ publication_step: "commit" as never }, ["publication_resume_v1"]],
       [{ recovery_cause: "empty_turn" }, ["publication_resume_v1"]],

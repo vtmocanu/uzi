@@ -6,7 +6,7 @@ import path from "node:path";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { WorkerClient } from "../src/client.js";
 import type { Config } from "../src/config.js";
-import type { Outbox } from "../src/outbox.js";
+import { canonicalizeTerminalBody, type Outbox } from "../src/outbox.js";
 import type { ActiveSnapshot } from "../src/protocol.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
@@ -14,7 +14,7 @@ import type { ReviewRunner } from "../src/review-runner.js";
 import type { RunRunner } from "../src/runner.js";
 import { Worker } from "../src/worker.js";
 import { nullLogger } from "./helpers.js";
-import { RUN, RUN_B, cleanupRoots, intent, makeOutbox, tmpRoot } from "./publication-intent-fixture.js";
+import { FINALIZE_DOMAIN, RUN, RUN_B, cleanupRoots, forgeRecord, intent, makeOutbox, tmpRoot } from "./publication-intent-fixture.js";
 
 // Issue #1324 D6: the register snapshot's publication_resume list, its exclusion from finalize_resume,
 // and the publication_resume_v1 / forge_api_success_v1 capability advertisement.
@@ -88,6 +88,31 @@ describe("register snapshot: publication_resume", () => {
     await outbox.journalFinalize(RUN, 4);
     const { snapshot } = await register(outbox);
     assert.equal(snapshot, undefined, "no finalize_resume, no publication_resume, nothing pending");
+  });
+
+  it("withholds a run whose record failed authentication from finalize_resume, as the protection still holds", async () => {
+    const root = tmpRoot();
+    const outbox = makeOutbox(root);
+    await outbox.init();
+    await outbox.journalFinalize(RUN, 4);
+    await outbox.journalFinalize(RUN_B, 6);
+    await fsp.writeFile(path.join(root, RUN, "publication-4.json"), await forgeRecord(root, FINALIZE_DOMAIN, intent()));
+    const restarted = makeOutbox(root);
+    await restarted.init();
+    assert.equal(restarted.hasPublicationRecords(RUN), false, "not tracked in memory");
+    const { snapshot } = await register(restarted);
+    assert.deepEqual(snapshot?.finalize_resume, [{ run_id: RUN_B, claim_generation: 6 }]);
+    assert.equal(snapshot?.publication_resume, undefined);
+  });
+
+  it("offers nothing for a run with a pending terminal journal, even with an acknowledged record", async () => {
+    const root = tmpRoot();
+    const outbox = makeOutbox(root);
+    await outbox.init();
+    await ackedRecord(outbox);
+    assert.equal(outbox.listPublicationRegisterEntries().length, 1, "control: offered before the terminal journal");
+    assert.equal((await outbox.journalTerminal(RUN, 4, "reviewing", 0, canonicalizeTerminalBody({ status: "completed", report_md: "done" }, 1 << 20))).journaled, true);
+    assert.deepEqual(outbox.listPublicationRegisterEntries(), []);
   });
 
   it("omits the key for an ordinary worker and survives an outbox restart", async () => {

@@ -844,8 +844,14 @@ export class Worker {
     // one-shot allowance), so any run with a publication record is withheld from the finalize list.
     const outbox = this.outbox;
     const offeredPublications = typeof outbox?.listPublicationRegisterEntries === "function" ? outbox.listPublicationRegisterEntries() : [];
-    const offeredFinalizes = (outbox?.listPendingFinalizes() ?? []).filter((entry) =>
-      !(typeof outbox?.hasPublicationRecords === "function" && outbox.hasPublicationRecords(entry.run_id)));
+    // A record that failed authentication, or is a mismatch, is not tracked in memory but still sits on
+    // disk and still marks the run publication-only, so presence is judged on the directory.
+    const offeredFinalizes: ReturnType<Outbox["listPendingFinalizes"]> = [];
+    for (const entry of outbox?.listPendingFinalizes() ?? []) {
+      const withheld = (typeof outbox?.hasPublicationRecords === "function" && outbox.hasPublicationRecords(entry.run_id)) ||
+        (typeof outbox?.hasPublicationFile === "function" && await outbox.hasPublicationFile(entry.run_id));
+      if (!withheld) offeredFinalizes.push(entry);
+    }
     const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes, offeredPublications);
     const sentFinalizes = initialSnapshot?.finalize_resume ?? [];
     const frozenFinalizes = this.captureFinalizes().filter(({ entry }) =>
@@ -902,8 +908,9 @@ export class Worker {
           "recovery_completed_publication_v1",
           "forge_clone_success_v1",
           // Issue #1324 D9: this image echoes the claim's forge_api_origin_reservation on a successful
-          // direct forge API call (reportForgeApiSuccess). Advertised UNCONDITIONALLY: the api offers
-          // the reservation, and accepts the api-surface success report, only to a worker advertising it.
+          // direct forge API call (reportForgeApiSuccess, called after the merge request is created).
+          // Advertised UNCONDITIONALLY: the api offers the reservation, and accepts the api-surface
+          // success report, only to a worker advertising it.
           "forge_api_success_v1",
           "recovery_held_publication_v1",
           "recovery_held_publication_v2",

@@ -301,3 +301,41 @@ describe("publication record: protection and discovery", () => {
     assert.deepEqual([adopted.ok, adopted.ok ? adopted.adopted : undefined, adopted.ok ? adopted.record.candidate : undefined], [true, true, CAND]);
   });
 });
+
+describe("publication record: replace under a full volume (N1) and physical presence (N4)", () => {
+  it("retries a replace after ENOSPC with a fresh temp file and leaves no temp behind", async () => {
+    const root = tmpRoot();
+    let armed = false;
+    let failures = 0;
+    const rawWrite: RawWriteSeam = async (write, ctx) => {
+      if (armed && ctx.kind === "publication" && ctx.path.endsWith(".tmp")) {
+        await write();
+        if (failures++ === 0) throw Object.assign(new Error("full"), { code: "ENOSPC" });
+        return;
+      }
+      await write();
+    };
+    const outbox = makeOutbox(root, { rawWrite });
+    await outbox.init();
+    assert.equal((await outbox.savePublicationRecord(intent())).ok, true);
+    armed = true;
+    const replaced = await outbox.replacePublicationRecord({ ...intent(), enrollment_seq: 1, candidate_seq: 1 }, {});
+    assert.equal(replaced.ok, true, JSON.stringify(replaced));
+    assert.equal(failures, 2, "the write ran twice");
+    assert.deepEqual((await names(root, RUN)).filter((n) => n.endsWith(".tmp")), []);
+    assert.deepEqual((await outbox.loadPublicationRecord(RUN, 4)).kind, "ok");
+  });
+
+  it("reports a record that fails authentication as physically present although it is not tracked", async () => {
+    const root = tmpRoot();
+    const outbox = makeOutbox(root);
+    await outbox.init();
+    await outbox.journalFinalize(RUN, 4);
+    await fsp.writeFile(file(root, RUN, 4), await forgeRecord(root, FINALIZE_DOMAIN, intent()));
+    const restarted = makeOutbox(root);
+    await restarted.init();
+    assert.equal(restarted.hasPublicationRecords(RUN), false);
+    assert.equal(await restarted.hasPublicationFile(RUN), true);
+    assert.equal(await restarted.hasPublicationFile(RUN_B), false);
+  });
+});

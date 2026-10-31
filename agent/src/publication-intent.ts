@@ -147,6 +147,29 @@ const MAX_CLOSING = 64;
 const MAX_CLOSING_CHARS = 256;
 const MAX_TEXT_CHARS = 1024;
 
+/** A NUL or a lone surrogate: the api (and PostgreSQL jsonb) refuses both, so the worker refuses them first. */
+const UNPAIRED_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+function assertStorableStrings(value: unknown, where: string): void {
+  if (typeof value === "string") {
+    if (value.includes("\0") || UNPAIRED_SURROGATE_RE.test(value)) bad(`${where} has a NUL or an unpaired surrogate`);
+  } else if (Array.isArray(value)) {
+    value.forEach((v, i) => assertStorableStrings(v, `${where}[${i}]`));
+  } else if (typeof value === "object" && value !== null) {
+    for (const [k, v] of Object.entries(value)) {
+      assertStorableStrings(k, `${where}.<key>`);
+      assertStorableStrings(v, `${where}.${k}`);
+    }
+  }
+}
+
+/** `s.slice(0, max)` that never leaves half of a surrogate pair at the cut. */
+export function sliceWellFormed(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const last = s.charCodeAt(max - 1);
+  return s.slice(0, last >= 0xd800 && last <= 0xdbff ? max - 1 : max);
+}
+
 function bad(where: string): never {
   throw new PublicationIntentMismatchError(where);
 }
@@ -224,9 +247,9 @@ function secretRemediation(value: unknown, where: string): PublicationSecretReme
 
 const FROZEN_HELD_KEYS = ["version", "blocked", "everKnown", "cleanTip", "flaggedCommits", "ciGlobs", "confirmedTip", "checkpointKey", "extraFloors"];
 
-function frozenHeld(value: unknown, where: string): FrozenHeldPolicy {
+function frozenHeld(value: unknown, where: string, owner: { kind: string; runId: string }): FrozenHeldPolicy {
   const o = object(value, where, FROZEN_HELD_KEYS, ["version", "blocked", "everKnown", "flaggedCommits", "ciGlobs", "extraFloors"]);
-  if (!validFrozenHeldPolicy(o)) bad(`${where} is not a valid frozen held policy`);
+  if (!validFrozenHeldPolicy(o, owner)) bad(`${where} is not a valid frozen held policy for this run`);
   if (o.extraFloors.length > MAX_SHAS || (o.ciGlobs !== null && (o.ciGlobs.length > MAX_GLOBS || o.ciGlobs.some((g) => g.length > MAX_GLOB_CHARS)))) {
     bad(`${where} exceeds its bounds`);
   }
@@ -242,7 +265,7 @@ function frozenHeld(value: unknown, where: string): FrozenHeldPolicy {
   };
 }
 
-function guardState(value: unknown, where: string): PublicationGuardState {
+function guardState(value: unknown, where: string, owner: { kind: string; runId: string }): PublicationGuardState {
   const keys = ["frozen_held", "secret_remediation", "published_tip", "published_real_tips", "landed_checkpoint",
     "ci_fix_human_approved", "ci_config_guard_globs", "last_checkpoint_ref_tip"];
   const o = object(value, where, keys, ["frozen_held", "secret_remediation", "published_real_tips", "landed_checkpoint",
@@ -250,7 +273,7 @@ function guardState(value: unknown, where: string): PublicationGuardState {
   const globs = o.ci_config_guard_globs === null ? null
     : list(o.ci_config_guard_globs, `${where}.ci_config_guard_globs`, MAX_GLOBS, (g, w) => text(g, w, MAX_GLOB_CHARS));
   return {
-    frozen_held: frozenHeld(o.frozen_held, `${where}.frozen_held`),
+    frozen_held: frozenHeld(o.frozen_held, `${where}.frozen_held`, owner),
     secret_remediation: secretRemediation(o.secret_remediation, `${where}.secret_remediation`),
     ...(o.published_tip !== undefined ? { published_tip: sha(o.published_tip, `${where}.published_tip`) } : {}),
     published_real_tips: list(o.published_real_tips, `${where}.published_real_tips`, MAX_SHAS, sha),
@@ -302,9 +325,15 @@ function parseBody(o: Record<string, unknown>): PublicationIntentBody {
   const checkpointKey = source.checkpoint_key;
   if (checkpointKey !== null && (typeof checkpointKey !== "string" || !TASK_KEY_RE.test(checkpointKey))) bad("source.checkpoint_key is invalid");
   const candidate = o.candidate === null ? null : sha(o.candidate, "candidate");
+  const runId = uuid(o.run_id, "run_id");
+  // A task checkpoint key belongs to exactly this run, never merely to its branch.
+  if (checkpointKey !== null && checkpointKey !== `uzi/task/${runId}`) bad("source.checkpoint_key is not this run's task checkpoint key");
+  const heldKey = (o.guard as { frozen_held?: { checkpointKey?: unknown } } | null | undefined)?.frozen_held?.checkpointKey;
+  // Only a task run carries checkpoint evidence; the owner contract of validFrozenHeldPolicy binds it to this run.
+  const owner = { kind: checkpointKey !== null || heldKey !== undefined ? "task" : "issue", runId };
   const body: PublicationIntentBody = {
     v: 1,
-    run_id: uuid(o.run_id, "run_id"),
+    run_id: runId,
     repo_id: uuid(o.repo_id, "repo_id"),
     branch: branchName(o.branch, "branch"),
     claim_generation: integer(o.claim_generation, "claim_generation", 1),
@@ -313,7 +342,7 @@ function parseBody(o: Record<string, unknown>): PublicationIntentBody {
     candidate,
     source: { pin_generation: integer(source.pin_generation, "source.pin_generation", 0), checkpoint_key: checkpointKey },
     mr: mrMetadata(o.mr, "mr"),
-    guard: guardState(o.guard, "guard"),
+    guard: guardState(o.guard, "guard", owner),
     ...(o.staged_description !== undefined ? { staged_description: stagedDescription(o.staged_description, "staged_description") } : {}),
   };
   // The staged description is valid only for the exact candidate and contract revision it was compiled for.
@@ -321,6 +350,7 @@ function parseBody(o: Record<string, unknown>): PublicationIntentBody {
   if (staged && (body.candidate === null || staged.candidate !== body.candidate || staged.contract_revision !== body.mr.contract_revision)) {
     bad("staged_description is not bound to the recorded candidate and contract revision");
   }
+  assertStorableStrings(body, "intent");
   return body;
 }
 
@@ -370,12 +400,32 @@ export function samePublicationIdentity(a: PublicationIntentBody, b: Publication
     a.floor.kind === b.floor.kind && (a.floor.kind === "pinned" ? a.floor.oid === (b.floor as { oid?: string }).oid : true);
 }
 
+/** Key-sorted JSON, so two bodies compare equal exactly when they carry the same content. */
+function canonicalBody(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalBody).join(",")}]`;
+  const o = value as Record<string, unknown>;
+  return `{${Object.keys(o).sort().filter((k) => o[k] !== undefined).map((k) => `${JSON.stringify(k)}:${canonicalBody(o[k])}`).join(",")}}`;
+}
+
+/** Canonical content equality of two intent bodies (sequence numbers are not part of the body). */
+function samePublicationContent(a: PublicationIntentBody, b: PublicationIntentBody): boolean {
+  return canonicalBody(wireIntent(a)) === canonicalBody(wireIntent(b));
+}
+
 /** How a local record relates to the claim's active enrollment. The claim is the api's single active row. */
 export type PublicationClaimRelation =
   | { kind: "no_active_enrollment" }
+  /** Same enrollment, same candidate_seq AND the same canonical content. */
   | { kind: "in_sync" }
   | { kind: "local_ahead" }
   | { kind: "server_ahead" }
+  /** The same enrollment_seq and candidate_seq, or a sequence-less record of the same identity, but different
+   *  content (a weakened guard, another candidate), or an intent this worker cannot parse. Never trusted. */
+  | { kind: "content_mismatch" }
+  /** A saved-but-never-ACKed record whose identity AND content are the active enrollment's: attach these
+   *  sequence numbers with {@link attachServerSequence}. */
+  | { kind: "unacked_matches_active"; enrollment_seq: number; candidate_seq: number }
   | { kind: "superseded" };
 
 /**
@@ -385,11 +435,73 @@ export type PublicationClaimRelation =
  */
 export function relatePublicationToClaim(record: PublicationRecord, active: ClaimPublicationResume | undefined): PublicationClaimRelation {
   if (!active) return { kind: "no_active_enrollment" };
-  if (record.enrollment_seq === undefined || record.candidate_seq === undefined || active.enrollment_seq !== record.enrollment_seq) {
-    return { kind: "superseded" };
+  let claimBody: PublicationIntentBody;
+  try {
+    claimBody = parsePublicationIntent(active.intent);
+  } catch {
+    return { kind: "content_mismatch" };
   }
-  if (active.candidate_seq === record.candidate_seq) return { kind: "in_sync" };
+  if (record.enrollment_seq === undefined || record.candidate_seq === undefined) {
+    // Never ACKed here (a crash between the local save and the ACK record): relate by identity.
+    if (!samePublicationIdentity(record, claimBody)) return { kind: "superseded" };
+    return samePublicationContent(record, claimBody)
+      ? { kind: "unacked_matches_active", enrollment_seq: active.enrollment_seq, candidate_seq: active.candidate_seq }
+      : { kind: "content_mismatch" };
+  }
+  if (active.enrollment_seq !== record.enrollment_seq) return { kind: "superseded" };
+  if (active.candidate_seq === record.candidate_seq) {
+    return samePublicationContent(record, claimBody) ? { kind: "in_sync" } : { kind: "content_mismatch" };
+  }
   return active.candidate_seq > record.candidate_seq ? { kind: "server_ahead" } : { kind: "local_ahead" };
+}
+
+/** Attach the api's sequence numbers to a sequence-less local record that {@link relatePublicationToClaim}
+ *  found to be the claim's active enrollment. `null` when the save failed (the record is untouched). */
+export async function attachServerSequence(
+  store: Pick<PublicationStore, "replacePublicationRecord">,
+  record: PublicationRecord,
+  match: { enrollment_seq: number; candidate_seq: number },
+): Promise<EnrolledPublicationRecord | null> {
+  if (record.enrollment_seq !== undefined) return null;
+  const next = { ...record, enrollment_seq: match.enrollment_seq, candidate_seq: match.candidate_seq };
+  const written = await store.replacePublicationRecord(next, {});
+  return written.ok ? (written.record as EnrolledPublicationRecord) : null;
+}
+
+/** What the live claim itself says about the guards, independent of any recorded or claim-supplied intent. */
+export interface LiveGuardInputs {
+  /** The live claim's CI config guard globs, null when the guard is off. Derive them exactly as the runner's
+   *  finalize does: `claim.config.ci_config_guard === true` ? [...DEFAULT_CI_CONFIG_PATHS, ...claim.config.ci_config_paths] : null. */
+  ci_config_guard_globs: readonly string[] | null;
+  /** Whether the live claim authorizes a CI-config change (a human-approved CI fix): the runner's
+   *  `flight.ciFixHumanApproved`, which starts as `claim.auto_approve !== true` and is revoked by a later gate. */
+  ci_fix_human_approved: boolean;
+}
+
+/**
+ * The guard state a resumed publication must apply. A guard recorded locally or supplied by a claim
+ * may only TIGHTEN what the live claim says, never relax it:
+ *   - the CI config globs are the union of the live claim's and the recorded ones, and are null only when
+ *     BOTH are null (a null or empty recorded list never switches off a live guard);
+ *   - `ci_fix_human_approved` is true only when BOTH the live claim and the record say so (a recorded true
+ *     never grants it; a recorded false is kept);
+ *   - a recorded secret `clean_tip` is dropped, and `known`/`everKnown` knowledge is kept only as extra
+ *     caution: a claim-supplied clean state never replaces a re-scan, so `clean_tip` is never carried.
+ * Pure; the resume calls it with the claim intent's guard (or the local record's) and the live inputs.
+ */
+export function stricterGuard(recorded: PublicationGuardState, live: LiveGuardInputs): PublicationGuardState {
+  const globs = live.ci_config_guard_globs === null && recorded.ci_config_guard_globs === null
+    ? null
+    : [...new Set([...(live.ci_config_guard_globs ?? []), ...(recorded.ci_config_guard_globs ?? [])])];
+  const { clean_tip: _drop, ...remediation } = recorded.secret_remediation;
+  const { cleanTip: _dropHeld, ...held } = recorded.frozen_held;
+  return {
+    ...recorded,
+    frozen_held: { ...held, ciGlobs: globs === null ? null : [...globs] },
+    secret_remediation: { ...remediation },
+    ci_fix_human_approved: live.ci_fix_human_approved && recorded.ci_fix_human_approved,
+    ci_config_guard_globs: globs,
+  };
 }
 
 // ── the api seam ─────────────────────────────────────────────────────────────
@@ -473,6 +585,10 @@ export interface PublicationDeps {
   store: PublicationStore;
   api: PublicationApi;
   signal?: AbortSignal;
+  /** The LIVE claim generation of the calling flight: the request's fence. The record's own
+   *  `claim_generation` is the immutable ENROLLMENT generation and may be older (a later claim of the same
+   *  run updates the candidate). Defaults to the record's generation, right only for the enrolling flight. */
+  liveClaimGeneration?: number;
   /** Delays before each idempotent attempt; its length is the attempt bound. Default {@link DEFAULT_RETRY_DELAYS_MS}. */
   retryDelaysMs?: readonly number[];
   sleep?: (ms: number) => Promise<void>;
@@ -481,7 +597,7 @@ export interface PublicationDeps {
 /** Three attempts in all: immediately, then after 200 ms and 1 s. Bounded, with no unbounded loop. */
 const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [0, 200, 1000];
 
-const DECLINED_REASONS = new Set(["publication_resume_disabled", "publication_resume_unsupported", "publication_kind_unsupported"]);
+const DEFINITIVE_DECLINES = new Set(["publication_resume_disabled", "publication_kind_unsupported"]);
 
 const notEnrolled = (reason: PublicationNotEnrolledReason, detail?: string): PublicationEnrollOutcome => ({
   kind: "not_enrolled", reason, diagnostic: PUBLICATION_RESUME_UNAVAILABLE, ...(detail !== undefined ? { detail } : {}),
@@ -491,24 +607,29 @@ const uncertain = (reason: PublicationUncertainReason, record?: PublicationRecor
   kind: "uncertain", reason, ...(record ? { record } : {}), ...(detail !== undefined ? { detail } : {}),
 });
 
-/** POST the request up to the attempt bound; each attempt is the identical idempotent request. */
-async function postBounded(deps: PublicationDeps, runId: string, request: PublicationIntentRequest): Promise<PublicationIntentResult> {
+/**
+ * POST the request up to the attempt bound; each attempt is the identical idempotent request. Returns the
+ * final result AND whether any EARLIER attempt may have reached the api, which a later decline cannot undo.
+ */
+async function postBounded(deps: PublicationDeps, runId: string, request: PublicationIntentRequest): Promise<{ result: PublicationIntentResult; earlierSent: boolean }> {
   const delays = deps.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   let last: PublicationIntentResult = { kind: "unknown", detail: "no attempt made" };
+  let earlierSent = false;
   for (const delay of delays) {
-    if (deps.signal?.aborted) return { kind: "unknown", detail: "aborted" };
+    if (deps.signal?.aborted) return { result: { kind: "unknown", detail: "aborted" }, earlierSent };
     if (delay > 0) await sleep(delay);
-    if (deps.signal?.aborted) return { kind: "unknown", detail: "aborted" };
+    if (deps.signal?.aborted) return { result: { kind: "unknown", detail: "aborted" }, earlierSent };
     last = await deps.api.registerPublicationIntent(runId, request, deps.signal);
-    if (last.kind !== "unknown") return last;
+    if (last.kind !== "unknown") return { result: last, earlierSent };
+    earlierSent = true;
   }
-  return last;
+  return { result: last, earlierSent };
 }
 
-function requestFor(record: PublicationRecord, update: boolean): PublicationIntentRequest {
+function requestFor(deps: PublicationDeps, record: PublicationRecord, update: boolean): PublicationIntentRequest {
   return {
-    claim_generation: record.claim_generation,
+    claim_generation: deps.liveClaimGeneration ?? record.claim_generation,
     ...(update ? { enrollment_seq: record.enrollment_seq, candidate_seq: record.candidate_seq } : {}),
     intent: wireIntent(record),
   };
@@ -548,7 +669,7 @@ export async function enrollPublicationIntent(deps: PublicationDeps, intent: Pub
   if (!samePublicationIdentity(held, record)) return uncertain("existing_record_conflict", held);
   if (held.enrollment_seq !== undefined) return uncertain("already_enrolled", held);
 
-  const result = await postBounded(deps, held.run_id, requestFor(held, false));
+  const { result, earlierSent } = await postBounded(deps, held.run_id, requestFor(deps, held, false));
   switch (result.kind) {
     case "acked": {
       const next = asEnrolled(held, result);
@@ -558,10 +679,18 @@ export async function enrollPublicationIntent(deps: PublicationDeps, intent: Pub
     }
     case "unsupported":
     case "refused": {
-      const declined = result.kind === "unsupported" || DECLINED_REASONS.has(result.reason);
-      if (!declined) return uncertain("server_disagrees", held, result.kind === "refused" ? `${result.status} ${result.reason}` : undefined);
-      // The api definitively holds no enrollment for this identity (a new enrollment was declined).
-      // The sequence-less record never reached the api, so removing it retires nothing.
+      // The api checks an existing (active or retired) enrollment BEFORE it checks the feature switch, and
+      // the run kind before anything is stored, so these two answers prove nothing was stored, whatever was
+      // sent before. Any other decline proves absence only if no request for this record was ever sent;
+      // an adopted, never-ACKed record may have been sent by the flight that saved it.
+      const definitive = result.kind === "refused" && DEFINITIVE_DECLINES.has(result.reason);
+      const neverSent = !earlierSent && !saved.adopted;
+      const declined = definitive || (neverSent && (result.kind === "unsupported" || (result.kind === "refused" && result.reason === "publication_resume_unsupported")));
+      if (!declined) {
+        const detail = result.kind === "refused" ? `${result.status} ${result.reason}` : "publication_resume_v1 is not negotiated";
+        return uncertain(result.kind === "unsupported" ? "ack_unknown" : "server_disagrees", held, detail);
+      }
+      // The sequence-less record never reached the api (or the api holds nothing), so removing it retires nothing.
       if (!(await deps.store.discardPublicationRecord(held.run_id, held.claim_generation, {}))) {
         return uncertain("local_write_unverified", held, "declined enrollment left a local record");
       }
@@ -608,7 +737,7 @@ export async function resendPublicationRecord(deps: PublicationDeps, record: Enr
 }
 
 async function sendEnrolled(deps: PublicationDeps, record: EnrolledPublicationRecord): Promise<PublicationAdvanceOutcome> {
-  const result = await postBounded(deps, record.run_id, requestFor(record, true));
+  const { result } = await postBounded(deps, record.run_id, requestFor(deps, record, true));
   switch (result.kind) {
     case "acked":
       if (result.enrollment_seq !== record.enrollment_seq || result.candidate_seq !== record.candidate_seq) {

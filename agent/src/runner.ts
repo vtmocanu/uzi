@@ -148,6 +148,7 @@ import {
   enrollPublicationIntent,
   publicationParkRefusal,
   resendPublicationRecord,
+  sliceWellFormed,
   type EnrolledPublicationRecord,
   type PublicationDeps,
   type PublicationFloorRecord,
@@ -5031,17 +5032,14 @@ export class RunRunner {
       } else if (err instanceof PublicationForgeUnreachableError && flight.publicationRecord) {
         // Issue #1324 D3: an ENROLLED run's publication hop stayed transiently unreachable. Capture first (the
         // handler's quiescence, pin and checkpoint helpers), then the typed publication-phase park. Never the
-        // generic failure and never a source release: without the feature the source is retained as-is.
-        if (this.publicationResumeAvailable()) {
-          flight.parked = await recoveryDisposition(() => this.handleRecoveryExhausted(
-            err, claim, flight, executor, batcher, reportState, runLog,
-            { kind: "publication_forge_unreachable", surface: err.surface, step: err.step },
-          ));
-          if (flight.parked) await this.retireFinalizeRecord(flight, "recovery_park_accepted");
-        } else {
-          this.retainForPublicationReconciliation(flight, "publication_resume_not_advertised");
-          await batcher.close().catch(() => undefined);
-        }
+        // generic failure and never a source release.
+        // Not gated on the advertised feature: an enrolled run's park is typed whatever the api advertises
+        // (the api refuses an untyped park of an enrolled run), so withholding it would strand the run.
+        flight.parked = await recoveryDisposition(() => this.handleRecoveryExhausted(
+          err, claim, flight, executor, batcher, reportState, runLog,
+          { kind: "publication_forge_unreachable", surface: err.surface, step: err.step },
+        ));
+        if (flight.parked) await this.retireFinalizeRecord(flight, "recovery_park_accepted");
       } else if (err instanceof TransientRecoveryError) {
         // Retry capture without abandoning the live claim. Only verified local
         // durability permits automatic promotion; shutdown retains uncaptured work
@@ -7020,7 +7018,7 @@ export class RunRunner {
       protocol_features: features,
     });
 
-    if (claim.publication_resume !== undefined && features.includes("publication_resume_v1") && (gen ?? 0) > 0) {
+    if (claim.publication_resume !== undefined && (gen ?? 0) > 0) {
       // Issue #1324: this claim carries an ACTIVE publication enrollment, so the api refuses the legacy
       // untyped pre-clone park (409 publication_enrolled). The clone failure is the publication phase's
       // first remote hop: send the typed publication-phase park instead.
@@ -7767,8 +7765,8 @@ export class RunRunner {
     return this.outbox !== undefined && !this.outbox.isDisabled() && this.client.hasFeature("publication_resume_v1");
   }
 
-  private publicationDeps(signal?: AbortSignal): PublicationDeps {
-    return { store: this.outbox!, api: this.client, ...(signal ? { signal } : {}), ...this.publicationRetry };
+  private publicationDeps(flight: RunFlight, signal?: AbortSignal): PublicationDeps {
+    return { store: this.outbox!, api: this.client, liveClaimGeneration: flight.claimGeneration, ...(signal ? { signal } : {}), ...this.publicationRetry };
   }
 
   /**
@@ -7821,7 +7819,7 @@ export class RunRunner {
       ...input, v: 1, run_id: claim.run_id, repo_id: claim.repo.id, claim_generation: flight.claimGeneration,
       floor: floorRecord, candidate: input.original_head,
     };
-    const deps = this.publicationDeps(signal);
+    const deps = this.publicationDeps(flight, signal);
     let outcome: Awaited<ReturnType<typeof enrollPublicationIntent>> | Awaited<ReturnType<typeof resendPublicationRecord>> =
       await enrollPublicationIntent(deps, intent);
     if (outcome.kind === "uncertain" && outcome.reason === "already_enrolled" && outcome.record?.enrollment_seq !== undefined &&
@@ -7857,7 +7855,7 @@ export class RunRunner {
   private async confirmPublicationCandidate(flight: RunFlight, candidate: string, signal?: AbortSignal): Promise<void> {
     const record = flight.publicationRecord;
     if (!record || record.candidate === candidate) return;
-    const outcome = await advancePublicationCandidate(this.publicationDeps(signal), record, { candidate });
+    const outcome = await advancePublicationCandidate(this.publicationDeps(flight, signal), record, { candidate });
     if (outcome.kind === "enrolled") {
       flight.publicationRecord = outcome.record;
       return;
@@ -9209,8 +9207,8 @@ export class RunRunner {
           checkpoint_key: flight.runKind === "task" ? (flight.checkpointCoordinates?.checkpoint_key ?? null) : null,
         },
         mr: {
-          title: mrTitle(claim, result.scopeCapped, completionScope).slice(0, 1024),
-          summary: result.prSummary === undefined ? "" : JSON.stringify(result.prSummary).slice(0, 16 * 1024),
+          title: sliceWellFormed(mrTitle(claim, result.scopeCapped, completionScope), 1024),
+          summary: result.prSummary === undefined ? "" : sliceWellFormed(JSON.stringify(result.prSummary), 16 * 1024),
           closing: issuePublication && typeof claim.issue_iid === "number" ? [`#${claim.issue_iid}`] : [],
           contract_revision: claim.config?.completion_contract_version ?? 0,
         },
