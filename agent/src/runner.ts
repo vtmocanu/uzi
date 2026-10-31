@@ -143,6 +143,17 @@ import {
 import { CandidateReservationRefusedError, MessageBatcher } from "./batcher.js";
 import type { Outbox, ReportRetirementContext } from "./outbox.js";
 import {
+  PUBLICATION_RESUME_UNAVAILABLE,
+  advancePublicationCandidate,
+  enrollPublicationIntent,
+  publicationParkRefusal,
+  resendPublicationRecord,
+  type EnrolledPublicationRecord,
+  type PublicationDeps,
+  type PublicationFloorRecord,
+  type PublicationIntentBody,
+} from "./publication-intent.js";
+import {
   installTerminalWriteAhead,
   resolvePendingTerminal,
   sendUnjournaledTerminal,
@@ -617,6 +628,8 @@ const BASE_ATTESTATION_HOLD_ATTEMPTS = 3;
 
 type RecoveryParkCause =
   | { kind: "transient" }
+  /** Issue #1324 D3: an enrolled run's publication hop stayed transiently unreachable. */
+  | { kind: "publication_forge_unreachable"; surface: "git" | "api"; step: "floor_refresh" | "push" | "mr_create" }
   | { kind: "vault_locked" | "refresh_unknown" | "account_unavailable" | "credential_release_unavailable" }
   | { kind: "data_volume_full"; preventive: boolean };
 
@@ -995,6 +1008,16 @@ class PublicationRefusedSignal extends Error {
   constructor(message = "publication refused") {
     super(message);
     this.name = "PublicationRefusedSignal";
+  }
+}
+
+/** Issue #1324: a transformed candidate could not be made durable (locally and at the api), so nothing
+ *  may be pushed with it. The flight is already marked as an unresolved retain; the run neither fails
+ *  nor reruns the executor, and the local record stays for the register reconciliation. */
+class PublicationUnconfirmedSignal extends PublicationRefusedSignal {
+  constructor() {
+    super("publication candidate unconfirmed");
+    this.name = "PublicationUnconfirmedSignal";
   }
 }
 
@@ -2553,6 +2576,9 @@ interface RunFlight {
   publishedTip?: string;
   /** Immutable claim floor; never advanced by a checkpoint or shared fetch. */
   publicationFloor?: PublicationFloor;
+  /** Issue #1324: this finalize's acknowledged publication enrollment. Set only after the api ACKed the
+   *  write-ahead intent; the typed publication-phase park and the candidate advances read it. */
+  publicationRecord?: EnrolledPublicationRecord;
   /** Private, immutable per flight: a published origin tip matching the seeded private HEAD.
    * Never reconstructed from recovery/checkpoint state or persisted across worker restarts. */
   trustedPublishedStart?: string;
@@ -5002,6 +5028,20 @@ export class RunRunner {
         ));
         // Issue #1742 retirement site (c): the api accepted the disk park for this generation.
         if (flight.parked) await this.retireFinalizeRecord(flight, "disk_park_accepted");
+      } else if (err instanceof PublicationForgeUnreachableError && flight.publicationRecord) {
+        // Issue #1324 D3: an ENROLLED run's publication hop stayed transiently unreachable. Capture first (the
+        // handler's quiescence, pin and checkpoint helpers), then the typed publication-phase park. Never the
+        // generic failure and never a source release: without the feature the source is retained as-is.
+        if (this.publicationResumeAvailable()) {
+          flight.parked = await recoveryDisposition(() => this.handleRecoveryExhausted(
+            err, claim, flight, executor, batcher, reportState, runLog,
+            { kind: "publication_forge_unreachable", surface: err.surface, step: err.step },
+          ));
+          if (flight.parked) await this.retireFinalizeRecord(flight, "recovery_park_accepted");
+        } else {
+          this.retainForPublicationReconciliation(flight, "publication_resume_not_advertised");
+          await batcher.close().catch(() => undefined);
+        }
       } else if (err instanceof TransientRecoveryError) {
         // Retry capture without abandoning the live claim. Only verified local
         // durability permits automatic promotion; shutdown retains uncaptured work
@@ -6461,6 +6501,7 @@ export class RunRunner {
         if (ack.applied && ack.status === body.status &&
             (ack.status === "completed" || ack.status === "failed"))
           await this.releaseUnjournaledCompletion(flight, body, incarnation);
+        if (ack.applied && ack.status === "completed" && body.status === "completed") await this.discardCompletedPublicationRecord(flight);
       } catch (err) {
         await clearFreshUnappliedAttempt(err, attempt);
         throw err;
@@ -6491,6 +6532,7 @@ export class RunRunner {
         if (ack.applied && ack.status === b.status &&
             (ack.status === "completed" || ack.status === "failed"))
           await this.releaseUnjournaledCompletion(flight, b, incarnation);
+        if (ack.applied && ack.status === "completed" && b.status === "completed") await this.discardCompletedPublicationRecord(flight);
         return ack;
       } catch (err) {
         if (err instanceof StaleClaimError) return { applied: false, staleClaim: true };
@@ -6977,6 +7019,23 @@ export class RunRunner {
       detail: err.message,
       protocol_features: features,
     });
+
+    if (claim.publication_resume !== undefined && features.includes("publication_resume_v1") && (gen ?? 0) > 0) {
+      // Issue #1324: this claim carries an ACTIVE publication enrollment, so the api refuses the legacy
+      // untyped pre-clone park (409 publication_enrolled). The clone failure is the publication phase's
+      // first remote hop: send the typed publication-phase park instead.
+      const body: StateRequest = {
+        status: "recovery_wait",
+        recovery_cause: "forge_unreachable",
+        recovery_phase: "publication",
+        publication_surface: "git",
+        publication_step: "floor_refresh",
+        claim_generation: gen,
+      };
+      const outcome = await this.reportForgeParkAndDispatch(body, claim, flight, reportState, runLog, runHome);
+      if (outcome === "parked") await this.settleUnadoptedGuardedClaim(claim, flight, runLog);
+      return outcome;
+    }
 
     if (features.includes("recovery_park_cause")) {
       // Full #1392 api: the TYPED report parks (or fails at the cap) atomically. Legacy holds
@@ -7496,6 +7555,15 @@ export class RunRunner {
       await batcher.close().catch(() => undefined);
       return "stop";
     }
+    const publicationRefusal = publicationParkRefusal(ack);
+    if (publicationRefusal) {
+      // Issue #1324: a refused publication-phase park never falls back to a source-releasing or failed
+      // path. Nothing is reported; the run stays non-terminal for the register reconciliation.
+      runLog.warn(`${copy.log}: publication park refused (${publicationRefusal}); retaining without a terminal report`, { run_id: flight.runId });
+      this.retainForPublicationReconciliation(flight, publicationRefusal);
+      await batcher.close().catch(() => undefined);
+      return "stop";
+    }
     if (ack.reason === "custody_unsettled") {
       // Fail-safe: leave the batcher OPEN and take today's failed path.
       runLog.info(`${copy.log}: ack custody_unsettled; taking today's failed path`, { run_id: flight.runId });
@@ -7688,6 +7756,135 @@ export class RunRunner {
       // Any other status (queued, awaiting_*, …): the outcome is not yet known, retain and retry.
       // cancelStopsWait=false so a sticky cancel cannot turn this into a backoff-free retry storm.
       await this.waitRecoveryRetry(flight, false);
+    }
+  }
+
+  /** Test seam: bounds and sleeps of the idempotent publication-intent retries. */
+  private publicationRetry: Pick<PublicationDeps, "retryDelaysMs" | "sleep"> | undefined;
+
+  /** Issue #1324: only enroll when the api advertised publication_resume_v1 AND this worker's outbox is usable. */
+  private publicationResumeAvailable(): boolean {
+    return this.outbox !== undefined && !this.outbox.isDisabled() && this.client.hasFeature("publication_resume_v1");
+  }
+
+  private publicationDeps(signal?: AbortSignal): PublicationDeps {
+    return { store: this.outbox!, api: this.client, ...(signal ? { signal } : {}), ...this.publicationRetry };
+  }
+
+  /**
+   * Issue #1324 D2: retain the flight's source for the register reconciliation without reporting a failure.
+   * This is the API-unreachable posture of an unresolved completion hold: the run stays non-terminal, the
+   * clone, session and finalize record survive, and no terminal or park is sent on a guess.
+   */
+  private retainForPublicationReconciliation(flight: RunFlight, why: string): void {
+    flight.completionHoldOutcome = "unresolved";
+    flight.parked = false;
+    flight.holdOrWallParkConfirmed = false;
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    flight.stoppedSourceKept = true;
+    flight.runLog.warn("publication intent unresolved; retaining the source without a terminal or park", { run_id: flight.runId, why });
+  }
+
+  /**
+   * Issue #1324 D2: write the publication intent ahead of any remote step. Returns "retain" when the
+   * enrollment outcome is unknown (no external attempt may follow, nothing is reported) and "proceed"
+   * otherwise: enrolled (`flight.publicationRecord` is set) or known not enrolled (ordinary finalize,
+   * carrying the `publication_resume_unavailable` diagnostic and no claimed guarantee).
+   */
+  private async enrollPublication(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    input: Omit<PublicationIntentBody, "v" | "run_id" | "repo_id" | "claim_generation" | "floor" | "candidate">,
+    signal?: AbortSignal,
+  ): Promise<"proceed" | "retain"> {
+    const { runLog, batcher } = flight;
+    const unavailable = (reason: string, detail?: string, announce = true): "proceed" => {
+      runLog.warn(PUBLICATION_RESUME_UNAVAILABLE, { run_id: flight.runId, reason, ...(detail ? { detail } : {}) });
+      if (announce) {
+        batcher.emit({ kind: "status", agent: "worker", payload: {
+          text: `${PUBLICATION_RESUME_UNAVAILABLE}: ${reason}; publishing without the resume guarantee`,
+        } });
+      }
+      return "proceed";
+    };
+    if (!isCodePublishingKind(resolveRunKind(claim.kind))) return "proceed";
+    if (!this.publicationResumeAvailable()) {
+      return unavailable(this.outbox === undefined || this.outbox.isDisabled() ? "outbox_unavailable" : "server_feature_unavailable",
+        undefined, false);
+    }
+    const floor = flight.publicationFloor;
+    if (!floor || floor.kind === "unverified") return unavailable("floor_unverified");
+    if (!/^[0-9a-f]{40}$/.test(input.original_head)) return unavailable("original_head_unavailable");
+    const floorRecord: PublicationFloorRecord = floor.kind === "pinned" ? { kind: "pinned", oid: floor.oid } : { kind: "absent" };
+    const intent: PublicationIntentBody = {
+      ...input, v: 1, run_id: claim.run_id, repo_id: claim.repo.id, claim_generation: flight.claimGeneration,
+      floor: floorRecord, candidate: input.original_head,
+    };
+    const deps = this.publicationDeps(signal);
+    let outcome: Awaited<ReturnType<typeof enrollPublicationIntent>> | Awaited<ReturnType<typeof resendPublicationRecord>> =
+      await enrollPublicationIntent(deps, intent);
+    if (outcome.kind === "uncertain" && outcome.reason === "already_enrolled" && outcome.record?.enrollment_seq !== undefined &&
+        outcome.record.candidate_seq !== undefined) {
+      // A record of this run and generation survives (a completion-hold continue, a park). Ask the api
+      // about THAT enrollment: never replay it blindly, never override the active candidate.
+      outcome = await resendPublicationRecord(deps, outcome.record as EnrolledPublicationRecord);
+      if (outcome.kind === "retired" && outcome.discarded) outcome = await enrollPublicationIntent(deps, intent);
+    }
+    switch (outcome.kind) {
+      case "enrolled":
+        flight.publicationRecord = outcome.record;
+        runLog.info("publication intent enrolled", {
+          run_id: flight.runId, enrollment_seq: outcome.record.enrollment_seq, candidate_seq: outcome.record.candidate_seq,
+        });
+        return "proceed";
+      case "not_enrolled":
+        return unavailable(outcome.reason, outcome.detail);
+      default:
+        batcher.emit({ kind: "status", agent: "worker", payload: {
+          text: "the publication intent could not be confirmed; nothing was published and the work is retained until it is reconciled",
+        } });
+        this.retainForPublicationReconciliation(flight, outcome.kind === "uncertain" ? outcome.reason : "enrollment_retired");
+        return "retain";
+    }
+  }
+
+  /**
+   * Issue #1324 D2: before a transformed candidate is pushed, make it durable locally and at the api
+   * (the advance saves locally first). Throws {@link PublicationUnconfirmedSignal} when that is not
+   * confirmed, so the push never runs.
+   */
+  private async confirmPublicationCandidate(flight: RunFlight, candidate: string, signal?: AbortSignal): Promise<void> {
+    const record = flight.publicationRecord;
+    if (!record || record.candidate === candidate) return;
+    const outcome = await advancePublicationCandidate(this.publicationDeps(signal), record, { candidate });
+    if (outcome.kind === "enrolled") {
+      flight.publicationRecord = outcome.record;
+      return;
+    }
+    flight.batcher.emit({ kind: "status", agent: "worker", payload: {
+      text: "the transformed publication candidate could not be confirmed; nothing was pushed and the work is retained until it is reconciled",
+    } });
+    this.retainForPublicationReconciliation(flight, outcome.kind === "uncertain" ? outcome.reason : "enrollment_retired");
+    throw new PublicationUnconfirmedSignal();
+  }
+
+  /**
+   * Issue #1324 D5: the checkpoint tip a peer may claim the run from. Only when the broker confirmed a
+   * checkpoint whose tip IS the candidate C, and the worker attests the original head H and the floor are
+   * both ancestors of C. Anything else yields nothing (custodian-only).
+   */
+  private async publicationHandoffTip(flight: RunFlight): Promise<string | undefined> {
+    const record = flight.publicationRecord;
+    const candidate = record?.candidate;
+    const bare = flight.barePath;
+    if (!record || !candidate || !bare || flight.lastCheckpointRefTip !== candidate) return undefined;
+    try {
+      if (!(await this.git.isAncestorRef(bare, record.original_head, candidate))) return undefined;
+      if (record.floor.kind === "pinned" && !(await this.git.isAncestorRef(bare, record.floor.oid, candidate))) return undefined;
+      return candidate;
+    } catch {
+      return undefined;
     }
   }
 
@@ -8997,6 +9194,54 @@ export class RunRunner {
     // Serves every forge-pushing kind (the failed path is not issue-gated).
     // The precheck compares tip blobs per path; the overlay keeps its separate conservative
     // changedFiles guard below.
+    // Issue #1324 D2: the write-ahead publication intent. Order: the finalization pin above, the local
+    // save with fsync, the acknowledged server enrollment, and only then default_fetch and every later
+    // remote step. Nothing remote has run yet, and nothing below runs when the outcome is unknown.
+    {
+      const sr = flight.secretRemediation;
+      const finding = (f: SecretFinding) => ({ file: f.file, start_line: f.startLine, commit: f.commit, rule_id: f.ruleId });
+      const sha40 = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{40}$/.test(v);
+      const publicationStart = await this.enrollPublication(claim, flight, {
+        branch: result.branch,
+        original_head: publicationOriginalHead ?? "",
+        source: {
+          pin_generation: claim.claim_generation ?? 0,
+          checkpoint_key: flight.runKind === "task" ? (flight.checkpointCoordinates?.checkpoint_key ?? null) : null,
+        },
+        mr: {
+          title: mrTitle(claim, result.scopeCapped, completionScope).slice(0, 1024),
+          summary: result.prSummary === undefined ? "" : JSON.stringify(result.prSummary).slice(0, 16 * 1024),
+          closing: issuePublication && typeof claim.issue_iid === "number" ? [`#${claim.issue_iid}`] : [],
+          contract_revision: claim.config?.completion_contract_version ?? 0,
+        },
+        guard: {
+          frozen_held: this.frozenHeldPolicy(flight),
+          secret_remediation: {
+            attempts: sr?.attempts ?? 0,
+            known: (sr?.known ?? []).map(finding),
+            flagged_commits: (sr?.flaggedCommits ?? []).filter(sha40),
+            flagged_findings: (sr?.flaggedFindings ?? []).map(finding),
+            blocked: (sr?.blocked ?? []).map(finding),
+            ...(sha40(sr?.cleanTip) ? { clean_tip: sr!.cleanTip } : {}),
+            ever_known: sr?.everKnown === true,
+            withhold_paths: sr?.withholdPaths === true,
+            overflow: sr?.overflow === true,
+          },
+          ...(sha40(flight.publishedTip) ? { published_tip: flight.publishedTip } : {}),
+          published_real_tips: (flight.publishedRealTips ?? []).filter(sha40),
+          landed_checkpoint: landedCheckpoint,
+          ci_fix_human_approved: ciFixHumanApproved === true,
+          ci_config_guard_globs: ciConfigGuarded ? [...ciConfigGuardGlobs] : null,
+          ...(sha40(flight.lastCheckpointRefTip) ? { last_checkpoint_ref_tip: flight.lastCheckpointRefTip } : {}),
+        },
+      }, boundarySignal);
+      if (publicationStart === "retain") {
+        executor.killAgentTree?.();
+        await closeBatcher().catch(() => undefined);
+        return;
+      }
+    }
+
     const workflowBarePath = barePath;
     const originalWorkflowTip = await this.git.trackingTip(workflowBarePath, result.branch);
     const rethrowWorkflowAbort = (error: unknown) => {
@@ -9194,6 +9439,27 @@ export class RunRunner {
       // Each deliberate candidate starts a group; network retries keep this exact C/H/P.
       if (!publicationOriginalHead) throw new ScratchPublicationError("original imported head is unavailable", undefined, { kind: "floor_unverified", step: "floor_refresh" });
       const candidate = await this.git.scratchPublicationPreflight(finalizeBarePath, result.branch);
+      // Issue #1324 D2: a transformed candidate C (base align, bridge) is pinned beside H, saved locally
+      // and acknowledged by the api BEFORE the push that uses it. An unconfirmed C throws, so nothing is pushed.
+      if (flight.publicationRecord && flight.publicationRecord.candidate !== candidate) {
+        if (recoveryRecord) {
+          await this.recovery.pin({
+            runId,
+            sourceSha: recoveryRecord.sourceSha,
+            attemptedHeadSha: candidate,
+            kind: resolveRunKind(claim.kind),
+            branch: result.branch,
+            generation: claim.claim_generation,
+            inventoryGuarded: claim.inventory_guarded === true,
+            bareDir: pathBasename(finalizeBarePath),
+            defaultBranch: claim.repo.default_branch?.trim() || (await this.git.defaultBranchName(finalizeBarePath)) || "main",
+            finalizationPin: true,
+          }).catch((pinError: unknown) => {
+            runLog.warn("recovery: could not pin the transformed publication candidate", { run_id: runId, error: errMessage(pinError) });
+          });
+        }
+        await this.confirmPublicationCandidate(flight, candidate, boundarySignal);
+      }
       const publication = Object.freeze({
         floor: flight.publicationFloor ?? { kind: "unverified" as const },
         originalHead: publicationOriginalHead,
@@ -10404,6 +10670,9 @@ export class RunRunner {
       }
       throw error;
     }
+    // Issue #1324 D9: an actual successful direct forge API call. One advisory attempt that echoes the
+    // claim's API-origin reservation; it never fails or delays the run.
+    try { this.client.reportForgeApiSuccess(claim, boundarySignal ?? flight.cancel.signal); } catch { /* advisory */ }
     batcher.emit({
       kind: "status",
       agent: "worker",
@@ -17781,6 +18050,23 @@ export class RunRunner {
   }
 
   /**
+   * Issue #1324: the api acknowledged this run's completion (applied, status completed), so it retired the
+   * enrollment and the local publication record has nothing left to guard. Removed only for the exact
+   * enrollment_seq it carries; any other outcome keeps it for the register reconciliation.
+   */
+  private async discardCompletedPublicationRecord(flight: RunFlight): Promise<void> {
+    const outbox = this.outbox;
+    if (!outbox || outbox.isDisabled() || !outbox.hasPublicationRecords(flight.runId)) return;
+    try {
+      const loaded = await outbox.loadPublicationRecord(flight.runId, flight.claimGeneration);
+      if (loaded.kind !== "ok" || loaded.record.enrollment_seq === undefined) return;
+      await outbox.discardPublicationRecord(flight.runId, flight.claimGeneration, { enrollment_seq: loaded.record.enrollment_seq });
+    } catch (error) {
+      flight.runLog.warn("publication record discard failed; the register reconciliation retires it", { run_id: flight.runId, error: errMessage(error) });
+    }
+  }
+
+  /**
    * issue #1582 M2 — the in-run settle, run AFTER the completed report's terminal outcome resolved
    * (never inside the terminal send). Sends every `pending_settle` record of this run — i.e. only
    * when the reportState choke point observed a completion ACK and promoted it. Aborts with the
@@ -18625,7 +18911,7 @@ export class RunRunner {
       await this.reportGenericFailure(claim, flight, error, options);
     };
     if (this.isCodexCapture(claim, flight) && !opts.dispositionOnly && !opts.heldAuthenticated && !opts.heldCapture &&
-        (cause.kind === "transient" || cause.kind === "data_volume_full")) {
+        (cause.kind === "transient" || cause.kind === "data_volume_full" || cause.kind === "publication_forge_unreachable")) {
       const captureEpisode = episode ?? this.newCaptureEpisode(flight);
       return this.runCaptureRegion(claim, flight, captureEpisode,
         held => this.handleRecoveryExhausted(err, claim, flight, executor, batcher, reportState, runLog, cause,
@@ -18896,6 +19182,16 @@ export class RunRunner {
       await note(feed.held);
       keepClone();
       flight.preserveSession = true;
+      return false;
+    };
+    // Issue #1324: the api refused the publication park (publication_enrolled / publication_not_enrolled).
+    // Never fall back to a source-releasing path and never report a failure on a refusal: log, say so, and
+    // retain the source and the local record for the register reconciliation.
+    const publicationRefused = async (reason: string): Promise<false> => {
+      runLog.warn("publication park refused; retaining the source for reconciliation", { run_id: flight.runId, reason });
+      await note(`the publication park was refused (${reason}); the work and the publication record are retained until it is reconciled`);
+      keepClone();
+      this.retainForPublicationReconciliation(flight, reason);
       return false;
     };
     let propagating = false;
@@ -19329,12 +19625,21 @@ export class RunRunner {
         if (providerTyped && providerReap === undefined) {
           providerReap = await this.reapRecoveryProviderForSettle(claim, flight, runLog, "shutdown", opts.heldAuthenticated).catch(() => false);
         }
+        // Issue #1324 D5: the handoff tip is read after the capture's guarded checkpoint publish and only
+        // when it provably is the candidate C; otherwise the field is omitted (custodian-only).
+        const handoffTip = cause.kind === "publication_forge_unreachable" ? await this.publicationHandoffTip(flight) : undefined;
         try {
           const parkBody: StateRequest = {
             ...(idleTyped
               ? { status: "recovery_wait", recovery_cause: "codex_idle_stall", provider_progress_turns: flight.productiveTurns ?? 0 }
               : providerTyped
               ? { status: "recovery_wait", recovery_cause: "provider_outage", productive_turns: flight.productiveTurns ?? 0 }
+              : cause.kind === "publication_forge_unreachable"
+              ? {
+                status: "recovery_wait", recovery_cause: "forge_unreachable", recovery_phase: "publication",
+                publication_surface: cause.surface, publication_step: cause.step, claim_generation: flight.claimGeneration,
+                ...(handoffTip ? { handoff_checkpoint_tip: handoffTip } : {}),
+              }
               : cause.kind === "vault_locked" && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
               ? { status: "recovery_wait", recovery_cause: "vault_locked" }
               : cause.kind === "account_unavailable" && this.client.protocolFeatures.includes("recovery_cause_codex_account_unavailable")
@@ -19379,6 +19684,26 @@ export class RunRunner {
               (providerTyped && ack.status === "paused" && ack.holdReason === PROVIDER_HOLD_REASON)))
             progress.parkAcknowledged = true;
           captureSignal?.throwIfAborted();
+          if (cause.kind === "publication_forge_unreachable") {
+            const refusal = publicationParkRefusal(ack);
+            if (refusal) return await publicationRefused(refusal);
+            if (ack.status === "recovery_wait") {
+              runLog.info("run parked in the publication phase", {
+                run_id: flight.runId, surface: cause.surface, step: cause.step, handoff: handoffTip !== undefined,
+                published: capture.published,
+              });
+              batcher.emit({
+                kind: "status",
+                agent: "worker",
+                payload: {
+                  text: `the forge was unreachable while publishing (${cause.surface}/${cause.step}); the work is kept and publication resumes automatically`,
+                },
+              });
+              // The api keeps the custody hold and the intent through this park: no settle, no release.
+              markParkKeep();
+              return true;
+            }
+          }
           if (providerTyped && (ack.status === "recovery_wait" || (ack.status === "paused" && ack.holdReason === PROVIDER_HOLD_REASON))) {
             const held = ack.status === "paused";
             runLog.info(held ? "run held after repeated provider outages" : "run parked for a provider outage", {
@@ -19507,6 +19832,11 @@ export class RunRunner {
           // ownership: returning while it is still running would strand the row
           // because this healthy worker's heartbeats prevent stale-worker requeue.
         } catch (reportError) {
+          if (cause.kind === "publication_forge_unreachable" && reportError instanceof RequestError && reportError.status === 409) {
+            let reason: string | undefined;
+            try { reason = publicationParkRefusal(JSON.parse(reportError.body) as { reason?: string }); } catch { /* not a refusal body */ }
+            if (reason) return await publicationRefused(reason);
+          }
           // Only this episode's actual typed report can issue refusal provenance.
           // Unwind before retrying; the capture owner consumes it after safety joins.
           if (idleTyped && progress?.idleParkRefusal && !progress.idleParkPossiblyApplied) throw IDLE_PARK_REFUSAL_UNWIND;

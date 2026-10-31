@@ -49,6 +49,11 @@ export class FakeApi {
     { status: number; body?: unknown; rawBody?: string } |
     Promise<{ status: number; body?: unknown; rawBody?: string }>) | undefined;
   readonly publicationContextRequests: Array<{ runId: string; body: Record<string, unknown> }> = [];
+  /** Issue #1324: scripted reply for POST /publication-intent; unset answers 404, like an api that predates it.
+   *  Return `"drop"` to destroy the connection AFTER the request was recorded (a lost ACK). */
+  publicationIntentWire: ((request: { runId: string; body: Record<string, unknown> }) =>
+    { status: number; body?: unknown } | "drop" | Promise<{ status: number; body?: unknown } | "drop">) | undefined;
+  readonly publicationIntentRequests: Array<{ runId: string; body: Record<string, unknown> }> = [];
 
   // --- control -------------------------------------------------------------
   private readonly claimQueue: ClaimResponse[] = [];
@@ -349,7 +354,7 @@ export class FakeApi {
   /** PRD #1795: one-shot unrecorded answers with a gate revision (see answerStateOnce). */
   private readonly stateAnswerOnce = new Map<
     string,
-    { matches: (body: StateRequest) => boolean; httpStatus: number; runStatus: string; gateRevision: number }
+    { matches: (body: StateRequest) => boolean; httpStatus: number; runStatus: string; gateRevision: number; reason?: string }
   >();
   /** Reports matching a hook are persisted (recorded, revision allocated) and THEN held or dropped:
    *  "drop" destroys the connection after persistence (a lost ACK), a promise holds the ACK until it
@@ -841,7 +846,7 @@ export class FakeApi {
   answerStateOnce(
     runId: string,
     matches: (body: StateRequest) => boolean,
-    answer: { httpStatus: number; runStatus: string; gateRevision: number },
+    answer: { httpStatus: number; runStatus: string; gateRevision: number; reason?: string },
   ): void {
     this.stateAnswerOnce.set(runId, { matches, ...answer });
   }
@@ -1625,6 +1630,19 @@ export class FakeApi {
       return send(res, 200, o.identity);
     }
 
+    const publicationIntentMatch = /^\/api\/worker\/runs\/([^/]+)\/publication-intent$/.exec(p);
+    if (req.method === "POST" && publicationIntentMatch) {
+      const request = { runId: publicationIntentMatch[1]!, body: json };
+      this.publicationIntentRequests.push(request);
+      const reply = await this.publicationIntentWire?.(request);
+      if (reply === "drop") {
+        res.destroy();
+        return;
+      }
+      if (!reply) return send(res, 404, { error: "not found" });
+      return send(res, reply.status, reply.body ?? {});
+    }
+
     const publicationContextMatch = /^\/api\/worker\/runs\/([^/]+)\/publication-context$/.exec(p);
     if (req.method === "POST" && publicationContextMatch) {
       const request = { runId: publicationContextMatch[1]!, body: json };
@@ -1904,7 +1922,10 @@ export class FakeApi {
     const answer = this.stateAnswerOnce.get(runId);
     if (answer && answer.matches(body)) {
       this.stateAnswerOnce.delete(runId);
-      return send(res, answer.httpStatus, { gate_revision: answer.gateRevision, run: { id: runId, status: answer.runStatus } });
+      return send(res, answer.httpStatus, {
+        gate_revision: answer.gateRevision, run: { id: runId, status: answer.runStatus },
+        ...(answer.reason ? { reason: answer.reason } : {}),
+      });
     }
     // m2 (#1197): a per-run predicate can knock out ONE matching report (see
     // failStateWhen). Checked BEFORE recording, so a refused report is not applied —
