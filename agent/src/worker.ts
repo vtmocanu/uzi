@@ -13,7 +13,7 @@ import type { CrossCheckRunner } from "./cross-check-runner.js";
 import type { IsolatedRunner } from "./isolated-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
-import type { ActiveSnapshot, ClaimResponse, OutboxHeartbeatEntry, StateAck, StateRequest, WorkerStats } from "./protocol.js";
+import type { ActiveSnapshot, ClaimResponse, OutboxHeartbeatEntry, PublicationResumeEntry, StateAck, StateRequest, WorkerStats } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { DindPruneController, DindPruneGate } from "./dind-prune.js";
 import type { DindMaintenanceController } from "./dind-maintenance.js";
@@ -839,8 +839,14 @@ export class Worker {
     // Issue #1742: the finalize-pending records offered on this register, captured ONCE with the
     // snapshot. Freeze each original identity before the request, including existing lower records.
     // Only exact offered identities gain lifetime handoff; captured lower originals gain batch-only authority.
-    const offeredFinalizes = this.outbox?.listPendingFinalizes() ?? [];
-    const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes);
+    // Issue #1324 D6: a run holding a publication-intent record resumes publication only. It is attested
+    // under publication_resume and NEVER also under finalize_resume (it must not consume the #1742
+    // one-shot allowance), so any run with a publication record is withheld from the finalize list.
+    const outbox = this.outbox;
+    const offeredPublications = typeof outbox?.listPublicationRegisterEntries === "function" ? outbox.listPublicationRegisterEntries() : [];
+    const offeredFinalizes = (outbox?.listPendingFinalizes() ?? []).filter((entry) =>
+      !(typeof outbox?.hasPublicationRecords === "function" && outbox.hasPublicationRecords(entry.run_id)));
+    const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes, offeredPublications);
     const sentFinalizes = initialSnapshot?.finalize_resume ?? [];
     const frozenFinalizes = this.captureFinalizes().filter(({ entry }) =>
       sentFinalizes.some(offered => offered.run_id === entry.run_id &&
@@ -853,6 +859,9 @@ export class Worker {
         claim_generations_sample: sentFinalizes.slice(0, 8).map((entry) => entry.claim_generation),
         claim_generations_omitted: Math.max(0, sentFinalizes.length - 8),
       });
+    }
+    if (offeredPublications.length > 0) {
+      this.log.info("register publication snapshot", { count: offeredPublications.length });
     }
     this.log.info("register terminal snapshot", {
       authenticated_pending: pending.length,
@@ -892,6 +901,10 @@ export class Worker {
           "recovery_inventory_v1",
           "recovery_completed_publication_v1",
           "forge_clone_success_v1",
+          // Issue #1324 D9: this image echoes the claim's forge_api_origin_reservation on a successful
+          // direct forge API call (reportForgeApiSuccess). Advertised UNCONDITIONALLY: the api offers
+          // the reservation, and accepts the api-surface success report, only to a worker advertising it.
+          "forge_api_success_v1",
           "recovery_held_publication_v1",
           "recovery_held_publication_v2",
           // PRD #1247 M5b (D3/protocol §9): this image implements the held-state credential-switch
@@ -1003,6 +1016,12 @@ export class Worker {
           if (this.crossCheckRunner && this.config.codexHarness?.advertise) protocolCapabilities.push("cross_check_code_v1");
         }
         if (this.dindMaintenance) protocolCapabilities.push("dind_maintenance_v1");
+        // Issue #1324: publication_resume_v1 promises a durable local publication-intent record, so it is
+        // advertised only while the outbox that holds it is usable. Without it the api never enrolls this
+        // worker's runs and an ordinary finalize runs exactly as before.
+        if (typeof this.outbox?.savePublicationRecord === "function" && !this.outbox.isDisabled()) {
+          protocolCapabilities.push("publication_resume_v1");
+        }
         const res = await this.client.register(
           this.config.workerName,
           this.config.workerTemplate,
@@ -1227,13 +1246,15 @@ export class Worker {
    * gate is purely "do we hold a pending outcome or finalize record to protect". Undefined when there
    * is no registry or nothing pending.
    */
-  private buildRegisterSnapshot(finalizes: readonly PendingFinalize[]): ActiveSnapshot | undefined {
+  private buildRegisterSnapshot(finalizes: readonly PendingFinalize[], publications: readonly PublicationResumeEntry[] = []): ActiveSnapshot | undefined {
     if (!this.activeRuns) return undefined;
     if (!this.outbox) return undefined;
     // Issue #1742: a pending finalize record also warrants the register snapshot (it carries
-    // finalize_resume), even with no pending terminal journal.
-    if (this.outbox.listPendingTerminals().length === 0 && finalizes.length === 0) return undefined;
-    return this.activeRuns.buildRegisterSnapshot(finalizes);
+    // finalize_resume), even with no pending terminal journal. Issue #1324: so does an acknowledged
+    // publication-intent record (it carries publication_resume).
+    if (this.outbox.listPendingTerminals().length === 0 && finalizes.length === 0 && publications.length === 0) return undefined;
+    const snapshot = this.activeRuns.buildRegisterSnapshot(finalizes);
+    return publications.length > 0 ? { ...snapshot, publication_resume: publications.map((entry) => ({ ...entry })) } : snapshot;
   }
 
   /**
