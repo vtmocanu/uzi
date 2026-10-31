@@ -729,7 +729,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		run.WorkerID.Valid && uuid.UUID(run.WorkerID.Bytes) == reporter {
 		dto.OutcomePending = &apitypes.OutcomePendingDTO{Reason: reason}
 	}
-	if h.wsvc.RunPolicyOutcomePending(run) {
+	if dto.OutcomePending == nil && h.wsvc.RunPolicyOutcomePending(run) {
 		dto.OutcomePending = &apitypes.OutcomePendingDTO{Reason: apitypes.OutcomePendingPolicyHold}
 	}
 	// PRD #37 M4-fix: resolve the owner's OWN-source roster here, on the detail read,
