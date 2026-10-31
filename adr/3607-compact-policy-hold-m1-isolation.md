@@ -228,10 +228,21 @@ performance inference. The canonical task gate:repo at
 (log .uzi/scratch/gate-log.qJcAkA). Its first 41 top-level targets passed, then
 test:ci-safe-paths failed at scripts/ci-safe-paths.test.rb:225, “failed Brew proof
 remains a gate failure”: expected 1, got 3. The subsequent 35 top-level targets
-have not executed (inventory .uzi/scratch/r3-repo-top-level-targets.txt, lines 43–77).
-The root will run them as separate sequential diagnostics and list exact unfinished
-targets in its receipt; these cannot establish a full canonical gate pass. The final
-gate remains FAILED, not waived.
+were unexecuted in that invocation. A separate serial diagnostic at cf52af62
+attempted all 35: 34 passed and check:changelog-entry failed because the inherited
+fragment was edited without a new entry against the published baseline. Its
+EXIT=1 and 1,092-second elapsed time are recorded in .uzi/scratch/gate-log.Ho3GiD.
+The repair adds changelog.d/47d1a848-2195-4347-8be6-b3a518219524.md alongside the
+required existing fragment to satisfy that coverage rule, with focused validation
+in the run receipt. This is an in-scope release-evidence addition, not a capability
+or readiness change; name it in the MR description. All suffix targets were
+attempted, but separate diagnostics cannot establish a full canonical gate pass.
+The final gate remains FAILED, not waived.
+
+At cf52af62 the actual secret scan passed with zero tracked findings and both
+canaries detected; 182 untracked scratch findings were separately reported as
+non-gating. Semgrep passed with its canary detected and zero tree findings/errors.
+These are candidate-bound results, not proof of future merged or published inputs.
 
 The narrow watcher probe in .uzi/scratch/r3-ci-safe-brew-reproducer.json records
 exit 3 and stderr “release-watch: not in a git checkout”. The direct diagnostic
