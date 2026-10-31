@@ -4233,6 +4233,20 @@ export type MyRateLimits =
   | { status: "no_token" }
   | { status: "unavailable" };
 
+/** Why run creation bound the Codex alias it bound (issue #3719), mirroring
+ *  codexselect.Reason. Closed server-side; the unions that carry it stay open (`| string`)
+ *  so a newer server's reason renders honestly. */
+export type CodexSelectReason =
+  | "default"
+  | "pool_empty"
+  | "auto"
+  | "best_of_pool"
+  | "pool_stale"
+  | "pool_exhausted";
+
+/** The user's Codex account mode (issue #3719). */
+export type CodexAccountMode = "default" | "auto";
+
 // TokenRateLimits is ONE token's meter (PRD #104 M5): the credential's label and
 // default flag — a name, never a value — plus the same status union PRD #53 froze.
 // secret_id keys the row for a rebind or a delete.
@@ -4256,20 +4270,6 @@ export type MyRateLimits =
  *  reason, and a union that lied about being total would make a renderer's exhaustive
  *  switch look safe while dropping it. The renderer handles the unknown case
  *  explicitly instead. */
-/** Why run creation bound the Codex alias it bound (issue #3719), mirroring
- *  codexselect.Reason. Closed server-side; the unions that carry it stay open (`| string`)
- *  so a newer server's reason renders honestly. */
-export type CodexSelectReason =
-  | "default"
-  | "pool_empty"
-  | "auto"
-  | "best_of_pool"
-  | "pool_stale"
-  | "pool_exhausted";
-
-/** The user's Codex account mode (issue #3719). */
-export type CodexAccountMode = "default" | "auto";
-
 export type SelectReason =
   | "default"
   | "pinned"
