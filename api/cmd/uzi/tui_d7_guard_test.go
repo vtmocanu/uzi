@@ -244,6 +244,12 @@ var d7UntrustedFields = []string{
 	"ActiveMilestoneID", "Phase", "MaybeBlockedByRunID",
 	// PRD #2603: the model-written Now summary on the PROGRESS block, drawn through renderer.Plain.
 	"NowNote",
+	// Issue #3719: the run's Codex / Anthropic select reason. A closed enum from this binary's
+	// own table when recognised, but an unrecognised value from a newer server is untrusted
+	// text; the rail draws it only after codexReasonTag, through renderer.Plain
+	// (railRateMeters). The hostile-reason case in TestRailCodexSnapshotShowsReasonTag is the
+	// render-level proof; these entries are the tripwire for a direct draw.
+	"CodexSelectReason", "AnthropicSelectReason",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:

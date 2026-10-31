@@ -136,21 +136,23 @@ func (m tuiModel) railRateMeters(now time.Time, usedRows int) string {
 			width -= len(deleted)
 			suffix = deleted
 		}
-		// Issue #3719: the reason beside the label, as a faint tag. The tag is a closed
-		// enum from this binary's own table, but an unrecognised value from a newer server
-		// is untrusted, so it rides renderer.Plain and the label is shortened to keep the
-		// whole entry inside the rail width.
-		tag := ""
-		if t := codexReasonTag(m.detail.run.CodexSelectReason); t != "" {
-			tag = " · " + m.renderer.Plain(t, max(width/2, 1))
-			width = max(width-visualWidth(tag), 1)
-		}
-		label := m.renderer.Plain(*m.detail.run.CodexSecretLabel, width) + tag + suffix
+		label := m.renderer.Plain(*m.detail.run.CodexSecretLabel, max(width, 1)) + suffix
 		if headerRow+1 > budget {
 			return ""
 		}
-		fitted = append(fitted, lipgloss.NewStyle().Foreground(m.pal.tungsten).Render(label))
-		accumulated++
+		entry := lipgloss.NewStyle().Foreground(m.pal.tungsten).Render(label)
+		rows := 1
+		// Issue #3719: why this alias was chosen, on its own faint line under the label so
+		// neither is shortened by the other. The tag is a closed enum from this binary's own
+		// table, but an unrecognised value from a newer server is untrusted, so it rides
+		// renderer.Plain, capped to the rail width. When only the label row fits the budget the
+		// reason line is dropped, not the label.
+		if t := codexReasonTag(m.detail.run.CodexSelectReason); t != "" && headerRow+2 <= budget {
+			entry += "\n" + m.pal.faint.Render(m.renderer.Plain(t, max(m.railWidth(), 1)))
+			rows++
+		}
+		fitted = append(fitted, entry)
+		accumulated += rows
 	}
 	for _, t := range shown {
 		var lines []string

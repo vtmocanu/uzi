@@ -224,7 +224,7 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 			// web-only action (D12). Opting a disabled credential OUT stays allowed.
 			if on && secretDisabled(target) {
 				return uzicli.Exitf(uzicli.ExitConflict,
-					"token %q is disabled; enable it in Settings before adding it to the pool", cellText(target.Label))
+					"%s %q is disabled; enable it in Settings before adding it to the pool", poolNoun(target.Kind), cellText(target.Label))
 			}
 			var out apitypes.SecretDTO
 			if target.Kind == kindCodexAuth {
@@ -240,10 +240,11 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 				return p.JSON(out)
 			}
 			if !gf.quiet {
+				noun := poolNoun(target.Kind)
 				if on {
-					p.Printf("token %q is now in the auto-selection pool\n", cellText(out.Label))
+					p.Printf("%s %q is now in the auto-selection pool\n", noun, cellText(out.Label))
 				} else {
-					p.Printf("token %q is no longer in the auto-selection pool\n", cellText(out.Label))
+					p.Printf("%s %q is no longer in the auto-selection pool\n", noun, cellText(out.Label))
 				}
 			}
 			return nil
@@ -524,4 +525,13 @@ func findSecretByLabel(secrets []apitypes.SecretDTO, kind, label string) (apityp
 		}
 	}
 	return apitypes.SecretDTO{}, false
+}
+
+// poolNoun is the word `token pool` uses for a credential in its messages: a Codex alias is a
+// login, an Anthropic credential a token.
+func poolNoun(kind string) string {
+	if kind == kindCodexAuth {
+		return "login"
+	}
+	return "token"
 }

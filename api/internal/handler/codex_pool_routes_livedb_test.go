@@ -7,12 +7,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // Issue #3719: the real-router differential-auth proof for the two Codex pool routes,
@@ -130,6 +132,91 @@ func TestCodexAccountModeRouteDifferentialAuthLiveDB(t *testing.T) {
 	// Identity is the session user: the other user's row never moved.
 	if m := storedCodexMode(t, pool, other); m != otherBefore {
 		t.Fatalf("another user's mode changed from %q to %q", otherBefore, m)
+	}
+}
+
+// TestCodexAuthAutoEligibleTakesExclusiveSecretLockLiveDB pins that the pool-consent toggle is
+// written under the EXCLUSIVE secret-mutation lock: run creation reads the pool under the
+// shared lock, so a toggle that skipped the exclusive one could change the pool under a
+// selection that already counted it. A separate transaction holds the shared lock; the PATCH
+// must block behind it (a waiting advisory lock on this user's key) and complete only after
+// the shared holder releases.
+func TestCodexAuthAutoEligibleTakesExclusiveSecretLockLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	ctx := context.Background()
+	user := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
+	alias := seedPoolSecret(t, pool, user, "codex_auth", "locked", false)
+
+	holder, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin shared holder: %v", err)
+	}
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			_ = holder.Rollback(context.Background())
+		}
+	})
+	if err := store.LockSecretMutationShared(ctx, holder, user); err != nil {
+		t.Fatalf("take shared lock: %v", err)
+	}
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- bearerReqBody(router, http.MethodPatch,
+			"/api/me/secrets/codex_auth/"+alias.String()+"/auto-eligible", uzc, `{"auto_eligible":true}`)
+	}()
+
+	// The request must show up as a WAITING advisory lock on this user's key.
+	waiting := func() bool {
+		var n int
+		err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks
+			WHERE locktype = 'advisory' AND NOT granted
+			  AND classid::bigint = $1::bigint
+			  AND objid::bigint = ($2::bigint & 4294967295)`,
+			int64(store.SecretMutationLockClass), int64(store.SecretMutationLockObjID(user))).Scan(&n)
+		if err != nil {
+			t.Fatalf("read pg_locks: %v", err)
+		}
+		return n > 0
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for !waiting() {
+		select {
+		case rec := <-done:
+			t.Fatalf("PATCH completed (%d) while the shared secret lock was held; it must take the exclusive lock", rec.Code)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("PATCH never queued on the secret-mutation lock")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Still blocked after a settle period, and nothing written.
+	select {
+	case rec := <-done:
+		t.Fatalf("PATCH completed (%d) while the shared secret lock was held", rec.Code)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if storedAutoEligible(t, pool, alias) {
+		t.Fatal("alias was pooled while the shared lock was held")
+	}
+
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatalf("release shared lock: %v", err)
+	}
+	released = true
+	select {
+	case rec := <-done:
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PATCH after release = %d, want 200: %s", rec.Code, rec.Body)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("PATCH did not complete after the shared lock was released")
+	}
+	if !storedAutoEligible(t, pool, alias) {
+		t.Fatal("alias was not pooled after the lock was released")
 	}
 }
 

@@ -125,39 +125,80 @@ func TestRailCodexSnapshotShowsReasonTag(t *testing.T) {
 	id := "alias-id"
 	label := "old-login"
 	for _, tc := range []struct {
-		name   string
-		reason *string
-		id     *string
-		want   string
+		name     string
+		reason   *string
+		id       *string
+		wantRows []string
 	}{
-		{"tag beside the label", sptr("best_of_pool"), &id, "old-login · best of pool"},
-		{"tag then deleted marker", sptr("auto"), nil, "old-login · auto (deleted)"},
-		{"no reason draws nothing", nil, &id, "old-login"},
+		{"reason on its own line", sptr("best_of_pool"), &id, []string{"old-login", "best of pool"}},
+		{"deleted marker stays on the label line", sptr("auto"), nil, []string{"old-login (deleted)", "auto"}},
+		{"no reason draws nothing", nil, &id, []string{"old-login"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := tuiTestModel(t, &uzicli.FakeClient{}, "codex-run")
 			m.width, m.height = 100, 40
 			m = applyDetail(m, apitypes.RunDTO{ID: "codex-run", Harness: "codex", Status: "completed",
 				CodexSecretID: tc.id, CodexSecretLabel: &label, CodexSelectReason: tc.reason}, nil)
-			out := stripANSI(m.railRateMeters(time.Now(), 3))
-			if !strings.Contains(out, tc.want) || strings.Count(out, "\n") != 1 {
-				t.Fatalf("rail = %q, want it to contain %q on one entry row", out, tc.want)
+			lines := strings.Split(stripANSI(m.railRateMeters(time.Now(), 3)), "\n")
+			if len(lines) != 1+len(tc.wantRows) || lines[0] != "ACCOUNTS" {
+				t.Fatalf("rail = %q, want ACCOUNTS then %q", lines, tc.wantRows)
+			}
+			for i, want := range tc.wantRows {
+				if got := strings.TrimRight(lines[1+i], " "); got != want {
+					t.Errorf("row %d = %q, want %q", i, got, want)
+				}
 			}
 		})
 	}
-	// A reason from a newer server is untrusted: sanitized, and the entry stays inside the rail.
+
+	// A deleted alias with a long label and the longest tag: the reason is never truncated by the
+	// label, and is styled differently from it (label tungsten, reason faint).
+	long := "formidable-login-with-a-long-alias-name"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "codex-run")
 	m.width, m.height = 100, 40
-	hostile := "evil\x1b[31m\u202e" + strings.Repeat("z", 200)
 	m = applyDetail(m, apitypes.RunDTO{ID: "codex-run", Harness: "codex", Status: "completed",
-		CodexSecretID: &id, CodexSecretLabel: &label, CodexSelectReason: &hostile}, nil)
+		CodexSecretLabel: &long, CodexSelectReason: sptr("pool_exhausted")}, nil)
 	block := m.railRateMeters(time.Now(), 3)
-	for _, line := range strings.Split(stripANSI(block), "\n") {
-		if visualWidth(line) > m.railWidth() {
-			t.Fatalf("rail line %q is wider than the rail (%d)", line, m.railWidth())
-		}
+	plain := stripANSI(block)
+	if !strings.Contains(plain, "\npool exhausted") || strings.Contains(plain, "pool exha"+"…") || strings.Contains(plain, "pool ex…") {
+		t.Fatalf("reason truncated or not on its own line:\n%s", plain)
 	}
-	if strings.Contains(block, "\x1b[31m") || strings.Contains(block, "\u202e") {
-		t.Fatalf("hostile reason reached the rail: %q", block)
+	if !strings.Contains(plain, "(deleted)") {
+		t.Fatalf("deleted marker lost:\n%s", plain)
+	}
+	if want := m.pal.faint.Render("pool exhausted"); !strings.Contains(block, want) {
+		t.Errorf("reason not drawn in the faint style:\n%q", block)
+	}
+	if faintLabel := m.pal.faint.Render(strings.Split(plain, "\n")[1]); strings.Contains(block, faintLabel) {
+		t.Errorf("label is faint; the reason must be the only faint line:\n%q", block)
+	}
+
+	// When only the label row fits the budget, the reason line is dropped, not the label.
+	tight := tuiTestModel(t, &uzicli.FakeClient{}, "codex-run")
+	tight.width, tight.height = 100, 40
+	tight = applyDetail(tight, apitypes.RunDTO{ID: "codex-run", Harness: "codex", Status: "completed",
+		CodexSecretID: &id, CodexSecretLabel: &label, CodexSelectReason: sptr("auto")}, nil)
+	usedRows := tight.transcriptViewport() - 1 - 2 // budget 2: header + label only
+	if got := stripANSI(tight.railRateMeters(time.Now(), usedRows)); got != "ACCOUNTS\nold-login" {
+		t.Errorf("tight budget rail = %q, want the label without the reason", got)
+	}
+
+	// A reason from a newer server is untrusted: sanitized, and every line stays inside the rail
+	// at every width, including degenerate ones.
+	hostile := "evil\x1b[31m\u202e" + strings.Repeat("z", 200)
+	for _, w := range []int{1, 4, 20, 40, 100, 200} {
+		m := tuiTestModel(t, &uzicli.FakeClient{}, "codex-run")
+		m.width, m.height = w, 40
+		m = applyDetail(m, apitypes.RunDTO{ID: "codex-run", Harness: "codex", Status: "completed",
+			CodexSecretLabel: &long, CodexSelectReason: &hostile}, nil)
+		block := m.railRateMeters(time.Now(), 3)
+		for _, line := range strings.Split(stripANSI(block), "\n") {
+			if visualWidth(line) > m.railWidth() {
+				t.Fatalf("width %d: rail line %q is wider than the rail (%d)", w, line, m.railWidth())
+			}
+		}
+		if strings.Contains(block, "\x1b[31m") || strings.Contains(block, "\u202e") {
+			t.Fatalf("width %d: hostile reason reached the rail: %q", w, block)
+		}
 	}
 }
