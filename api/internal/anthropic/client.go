@@ -13,8 +13,10 @@
 // ever contain the token. The token rides only on the Authorization header of the
 // outbound request; errors are built from the response (status + a sanitized body
 // excerpt) or a transport failure, never from the request. Utilization fractions
-// floor+clamp to 0..100 ints; a missing utilization fails the whole reading (fail
-// closed, D5); a missing/unparseable reset is left nil (the DTO allows a null
+// floor+clamp to 0..100 ints; a missing 7-day utilization fails the whole reading
+// (fail closed, D5); the 5-hour window is optional (Anthropic dropped it for some
+// plans, 2026-10-30), but a 5-hour value that is present and unusable still fails
+// the reading; a missing/unparseable reset is left nil (the DTO allows a null
 // resets_at, D7). PRD #50's egress proxy, if it lands, wraps this same client.
 package anthropic
 
@@ -54,9 +56,11 @@ const (
 // cheapest Haiku tier.
 var probeBody = []byte(`{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
 
-// Reading is one poll's result: both account windows plus which path produced it.
+// Reading is one poll's result: the account windows plus which path produced it.
+// FiveHour is nil when the account has no 5-hour window (plans where Anthropic
+// removed it send only 7-day data); SevenDay is always present.
 type Reading struct {
-	FiveHour Window
+	FiveHour *Window
 	SevenDay Window
 	Source   string // SourceUsageEndpoint | SourceHeaderProbe
 }
@@ -214,17 +218,26 @@ func (c *Client) do(ctx context.Context, method, url string, body []byte, token 
 // vtmocanu/cc-statusline, the prior art): {"five_hour":{"utilization":<0..1>,
 // "resets_at":<ISO8601>}, "seven_day":{...}}. A missing utilization fails the
 // whole reading (fail closed); a missing/unparseable resets_at is left nil.
+//
+// seven_day is required. five_hour is optional: an absent key, a JSON null, or an
+// object carrying neither utilization nor resets_at means "no 5-hour window" (nil).
+// An object that carries either field is a claim that the window exists, so a
+// missing or non-finite utilization there still fails the reading.
 func parseUsage(body []byte) (Reading, error) {
 	var u struct {
-		FiveHour usageWindow `json:"five_hour"`
-		SevenDay usageWindow `json:"seven_day"`
+		FiveHour *usageWindow `json:"five_hour"`
+		SevenDay usageWindow  `json:"seven_day"`
 	}
 	if err := json.Unmarshal(body, &u); err != nil {
 		return Reading{}, &Error{Kind: KindMalformed, msg: "anthropic usage: response is not valid JSON"}
 	}
-	fh, err := u.FiveHour.window("five_hour")
-	if err != nil {
-		return Reading{}, err
+	var fh *Window
+	if u.FiveHour != nil && (u.FiveHour.Utilization != nil || u.FiveHour.ResetsAt != nil) {
+		w, err := u.FiveHour.window("five_hour")
+		if err != nil {
+			return Reading{}, err
+		}
+		fh = &w
 	}
 	sd, err := u.SevenDay.window("seven_day")
 	if err != nil {
@@ -257,20 +270,26 @@ func (w usageWindow) window(label string) (Window, error) {
 
 // parseHeaders reads the unified rate-limit headers off a probe response.
 // Utilization is a 0..1 fraction (calibrated: 0.55 == 55%); resets are already
-// epoch seconds. A missing utilization header fails the reading (an account with
+// epoch seconds. A missing 7d utilization header fails the reading (an account with
 // no unified headers — e.g. a Console API key — is out of scope and surfaces as no
-// reading, i.e. `unavailable`).
+// reading, i.e. `unavailable`). The 5h headers are optional: plans without a 5-hour
+// window send only the 7d set, which yields FiveHour nil. A 5h utilization header
+// that is present but not a finite number still fails the reading.
 func parseHeaders(h http.Header) (Reading, error) {
-	fp, ok := headerPct(h, "anthropic-ratelimit-unified-5h-utilization")
-	if !ok {
-		return Reading{}, &Error{Kind: KindMalformed, msg: "anthropic probe: missing 5h utilization header"}
+	var fh *Window
+	if strings.TrimSpace(h.Get("anthropic-ratelimit-unified-5h-utilization")) != "" {
+		fp, ok := headerPct(h, "anthropic-ratelimit-unified-5h-utilization")
+		if !ok {
+			return Reading{}, &Error{Kind: KindMalformed, msg: "anthropic probe: 5h utilization header is not a finite number"}
+		}
+		fh = &Window{Pct: fp, ResetsAt: headerEpoch(h, "anthropic-ratelimit-unified-5h-reset")}
 	}
 	sp, ok := headerPct(h, "anthropic-ratelimit-unified-7d-utilization")
 	if !ok {
 		return Reading{}, &Error{Kind: KindMalformed, msg: "anthropic probe: missing 7d utilization header"}
 	}
 	return Reading{
-		FiveHour: Window{Pct: fp, ResetsAt: headerEpoch(h, "anthropic-ratelimit-unified-5h-reset")},
+		FiveHour: fh,
 		SevenDay: Window{Pct: sp, ResetsAt: headerEpoch(h, "anthropic-ratelimit-unified-7d-reset")},
 		Source:   SourceHeaderProbe,
 	}, nil

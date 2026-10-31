@@ -32,6 +32,18 @@ function okReading(
   };
 }
 
+// A reading for an account with no 5-hour window (plans where Anthropic removed it):
+// only the 7-day meter exists, so five_hour is absent and the UI shows one row.
+function sevenDayOnlyReading(pct7: number, in7: number, syncedMins = 2): MyRateLimits {
+  return {
+    status: "ok",
+    seven_day: { pct: pct7, resets_at: NOW_SECS + in7 },
+    source: "header_probe",
+    synced_at: minsAgo(syncedMins),
+    stale: false,
+  };
+}
+
 // The signed-in demo user's own readings (Settings card + sidebar). Since PRD #104
 // this is ONE READING PER TOKEN: the default matches mockup frame A (8% / 27%,
 // both green under the PRD #115 bands, "Live"), and the console key is busier so
@@ -118,6 +130,16 @@ export const mockMyTokenRateLimits: TokenRateLimits[] = [
     auto_eligible: false,
     auto_status: "not_pooled" as const,
     limits: okReading(100, 35 * MIN, 40, 2 * D + 5 * H, 14, "limit_report"),
+  },
+  {
+    // A 7-day-only account (no 5-hour window): the meter shows a single row.
+    // Non-pooled, matching its mockSecrets row token-for-token.
+    secret_id: "sec-seven-only",
+    label: "ultra-key",
+    is_default: false,
+    auto_eligible: false,
+    auto_status: "not_pooled" as const,
+    limits: sevenDayOnlyReading(31, 4 * D + 2 * H),
   },
 ];
 

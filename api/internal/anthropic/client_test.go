@@ -268,3 +268,86 @@ func TestProbeBodyPinned(t *testing.T) {
 		}
 	}
 }
+
+// The exact header set Anthropic sends for plans without a 5-hour window
+// (observed 2026-10-31): only 7d headers, no 5h headers at all.
+func TestParseHeadersSevenDayOnly(t *testing.T) {
+	h := http.Header{}
+	for k, v := range map[string]string{
+		"anthropic-ratelimit-unified-status":               "allowed",
+		"anthropic-ratelimit-unified-representative-claim": "seven_day",
+		"anthropic-ratelimit-unified-reset":                "1794081600",
+		"anthropic-ratelimit-unified-7d-reset":             "1794081600",
+		"anthropic-ratelimit-unified-7d-status":            "allowed",
+		"anthropic-ratelimit-unified-7d-utilization":       "0.0",
+		"anthropic-ratelimit-unified-fallback-percentage":  "0.5",
+		"anthropic-ratelimit-unified-overage-status":       "rejected",
+	} {
+		h.Set(k, v)
+	}
+	r, err := parseHeaders(h)
+	if err != nil {
+		t.Fatalf("7d-only headers must parse, got %v", err)
+	}
+	if r.FiveHour != nil {
+		t.Errorf("FiveHour = %+v, want nil", r.FiveHour)
+	}
+	want := time.Unix(1794081600, 0).UTC()
+	if r.SevenDay.Pct != 0 || r.SevenDay.ResetsAt == nil || !r.SevenDay.ResetsAt.Equal(want) {
+		t.Errorf("SevenDay = %+v, want pct 0 reset %v", r.SevenDay, want)
+	}
+	if r.Source != SourceHeaderProbe {
+		t.Errorf("source = %q, want %q", r.Source, SourceHeaderProbe)
+	}
+}
+
+func TestParseHeadersSevenDayStillRequired(t *testing.T) {
+	h := http.Header{}
+	h.Set("anthropic-ratelimit-unified-5h-utilization", "0.5")
+	_, err := parseHeaders(h)
+	var ae *Error
+	if !errors.As(err, &ae) || ae.Kind != KindMalformed {
+		t.Fatalf("missing 7d must be KindMalformed, got %v", err)
+	}
+	h2 := http.Header{}
+	h2.Set("anthropic-ratelimit-unified-5h-utilization", "garbage")
+	h2.Set("anthropic-ratelimit-unified-7d-utilization", "0.1")
+	_, err = parseHeaders(h2)
+	if !errors.As(err, &ae) || ae.Kind != KindMalformed {
+		t.Fatalf("present-but-garbage 5h must be KindMalformed, got %v", err)
+	}
+}
+
+func TestParseUsageFiveHourOptional(t *testing.T) {
+	for name, body := range map[string]string{
+		"absent":       `{"seven_day":{"utilization":0.4,"resets_at":"2026-11-01T00:00:00Z"}}`,
+		"null":         `{"five_hour":null,"seven_day":{"utilization":0.4,"resets_at":"2026-11-01T00:00:00Z"}}`,
+		"empty-object": `{"five_hour":{"utilization":null,"resets_at":null},"seven_day":{"utilization":0.4}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, err := parseUsage([]byte(body))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if r.FiveHour != nil || r.SevenDay.Pct != 40 {
+				t.Errorf("reading = %+v, want nil five-hour and 7d 40", r)
+			}
+		})
+	}
+	for name, body := range map[string]string{
+		"7d missing":            `{"five_hour":{"utilization":0.1}}`,
+		"5h reset without util": `{"five_hour":{"resets_at":"2026-11-01T00:00:00Z"},"seven_day":{"utilization":0.4}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseUsage([]byte(body))
+			var ae *Error
+			if !errors.As(err, &ae) || ae.Kind != KindMalformed {
+				t.Fatalf("want KindMalformed, got %v", err)
+			}
+		})
+	}
+	r, err := parseUsage([]byte(`{"five_hour":{"utilization":0.1},"seven_day":{"utilization":0.4}}`))
+	if err != nil || r.FiveHour == nil || r.FiveHour.Pct != 10 {
+		t.Fatalf("both present must be unchanged, got %+v %v", r, err)
+	}
+}
