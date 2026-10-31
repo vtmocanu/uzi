@@ -3,7 +3,7 @@
 -- lives in a side table so runs gains a single column (recovery_wait_phase).
 
 -- +goose Up
--- The first statement: CREATE TABLE ... REFERENCES runs and the ALTER TABLE on runs below both
+-- The first statement: the ALTER TABLE on runs and CREATE TABLE ... REFERENCES runs below both
 -- wait on runs locks, so the bound must cover them. A lock wait past it fails the migration,
 -- which can be rerun.
 SET LOCAL lock_timeout = '5s';

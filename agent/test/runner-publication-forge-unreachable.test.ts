@@ -124,9 +124,23 @@ it("a permanent push stderr is not typed even when the branch name looks like a 
   instantRetries(r);
   const seen = hookRecorder(t, r);
   await r.execute(claim);
-  assert.ok(pushes >= 1);
+  assert.equal(pushes, 1, "the branch name must not make a permanent push retryable");
   assert.equal(seen.length, 0);
   assert.doesNotMatch(failedReason(claim.run_id), /publication_forge_unreachable/);
+});
+
+it("a transient push stderr retries the full schedule even when the branch name looks like a permanent status", async t => {
+  // The branch is agent/issue-404; a real outage on it must still retry before it is typed.
+  const claim = gitlabClaim(404);
+  let pushes = 0;
+  failGit("push", "fatal: unable to access: connection reset by peer", () => { pushes++; });
+  const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
+  instantRetries(r);
+  const seen = hookRecorder(t, r);
+  await r.execute(claim);
+  assert.equal(pushes, ATTEMPTS);
+  assert.deepEqual(seen.map(s => [s.surface, s.step]), [["git", "push"]]);
+  assert.match(failedReason(claim.run_id), /publication_forge_unreachable: push/);
 });
 
 it("MR create exhausting on a transient API failure is a typed api/mr_create error", async t => {
@@ -182,17 +196,11 @@ it("a deadline abort during the last MR create attempt stays permanent and is no
 it("a deadline abort during the last push attempt stays permanent and is not typed", async t => {
   const claim = gitlabClaim(4108);
   const abort = new AbortController();
-  const seam = git as unknown as Seam;
-  const real = seam.runGit.bind(git);
   let pushes = 0;
-  seam.runGit = async (cwd, args, ...rest) => {
-    if (args[0] === "push") {
-      pushes++;
-      if (pushes === ATTEMPTS) abort.abort();
-      throw new Error("git push failed: fatal: unable to access: connection reset by peer");
-    }
-    return real(cwd, args, ...rest);
-  };
+  failGit("push", "fatal: unable to access: connection reset by peer", () => {
+    pushes++;
+    if (pushes === ATTEMPTS) abort.abort();
+  });
   const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
   instantRetries(r);
   const original = (Object.getPrototypeOf(r) as { phasePublish: (...a: unknown[]) => Promise<void> }).phasePublish;

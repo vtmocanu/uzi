@@ -1,6 +1,7 @@
 -- Write-ahead publication intent (issue #1324). The side table is guarded by
--- guard_publication_resume_row: enrollment, candidate updates and retirement require the
--- API opt-in below, set in the same transaction as the writer.
+-- guard_publication_resume_row: enrollment, candidate updates and retirement here require the
+-- API opt-in below, set in the same transaction as the writer. A run reaching a terminal status
+-- also closes its intent through close_publication_resume_trg (00386), without the opt-in.
 
 -- name: OptInPublicationResume :exec
 SELECT set_config('uzi.publication_resume_api', 'v1', true);

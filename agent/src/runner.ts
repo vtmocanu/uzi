@@ -9256,10 +9256,13 @@ export class RunRunner {
           signal: boundarySignal,
           sleep: this.forgeRetrySleep,
           // Only a floor refresh that could not reach the remote is retryable among the typed refusals;
-          // every other scratch publication refusal and refusal signal stays permanent.
+          // every other scratch publication refusal and refusal signal stays permanent. A raw push
+          // failure is classified from git's stderr, as its typing below is: the runGit message
+          // embeds refs/heads/<branch>, which must not decide the retry.
           classify: (error) => error instanceof ScratchPublicationError
             ? (error.kind === "floor_unreachable" ? "transient" : "permanent")
-            : error instanceof PublicationRefusedSignal ? "permanent" : classifyForgeError(error),
+            : error instanceof PublicationRefusedSignal ? "permanent"
+              : atPush ? classifyGitStderr(error) : classifyForgeError(error),
         },
         );
       } catch (error) {
