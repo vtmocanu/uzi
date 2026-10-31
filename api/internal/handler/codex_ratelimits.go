@@ -27,13 +27,13 @@ import (
 // is no per-account value to represent it, and a lone unused const would trip the unused
 // linter; the empty array carries the meaning.
 const (
-	codexRateLimitStatusPending                  = "pending"
-	codexRateLimitStatusNoReading                = "no_reading"
-	codexRateLimitStatusFresh                    = "fresh"
-	codexRateLimitStatusStale                    = "stale"
-	codexRateLimitStatusVaultLocked              = "vault_locked"
-	codexRateLimitStatusCredentialActionRequired = "credential_action_required" //nolint:gosec // G101: a rate-limit status discriminator string, not a credential
-	codexRateLimitStatusPollingDisabled          = "polling_disabled"
+	codexRateLimitStatusPending                  = usagereserve.CodexMeterPending
+	codexRateLimitStatusNoReading                = usagereserve.CodexMeterNoReading
+	codexRateLimitStatusFresh                    = usagereserve.CodexMeterFresh
+	codexRateLimitStatusStale                    = usagereserve.CodexMeterStale
+	codexRateLimitStatusVaultLocked              = usagereserve.CodexMeterVaultLocked
+	codexRateLimitStatusCredentialActionRequired = usagereserve.CodexMeterCredentialActionRequired
+	codexRateLimitStatusPollingDisabled          = usagereserve.CodexMeterPollingDisabled
 )
 
 // codexRateLimitReasonProviderRejected is the only CodexAccountRateLimitDTO.Reason value
@@ -210,21 +210,13 @@ func (h *Handler) codexAccountDTO(accountID uuid.UUID, aliases []string, isDefau
 // A per-account status is NEVER no_subscription — that is the empty-accounts-array shape
 // both store reads already produce for a user with no linked account.
 func codexRateLimitStatus(interval time.Duration, vaultLocked, reauthRequired bool, lastSuccessAt, lastAttemptAt pgtype.Timestamptz, now time.Time) string {
-	switch {
-	case interval <= 0:
-		return codexRateLimitStatusPollingDisabled
-	case vaultLocked:
-		return codexRateLimitStatusVaultLocked
-	case reauthRequired:
-		return codexRateLimitStatusCredentialActionRequired
-	case lastSuccessAt.Valid:
-		if !usagereserve.Stale(lastSuccessAt.Time, true, interval, now) {
-			return codexRateLimitStatusFresh
-		}
-		return codexRateLimitStatusStale
-	case lastAttemptAt.Valid:
-		return codexRateLimitStatusNoReading
-	default:
-		return codexRateLimitStatusPending
+	return usagereserve.CodexMeterStatus(interval, vaultLocked, reauthRequired, tsPtr(lastSuccessAt), tsPtr(lastAttemptAt), now)
+}
+
+// tsPtr adapts a nullable pgtype timestamp to the *time.Time usagereserve takes.
+func tsPtr(t pgtype.Timestamptz) *time.Time {
+	if !t.Valid {
+		return nil
 	}
+	return &t.Time
 }
