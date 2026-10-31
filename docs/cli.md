@@ -2659,6 +2659,11 @@ the same reason the others are not: it mints nothing and reveals nothing, it
 only re-points spend among tokens you already hold. Adding, renaming,
 re-defaulting and deleting stay web-only.
 
+It pools Anthropic tokens and Codex subscription logins (OpenAI API keys have
+no pool). Pass `--kind anthropic|codex` when the same label exists in both
+kinds; without it that is a usage error. See [Codex account
+mode](#codex-account-mode).
+
 `uzi token list` prints two columns about the pool, and they answer different
 questions:
 
@@ -3067,16 +3072,44 @@ login (`PUT /api/me/codex-account-mode`, which accepts a `uzc_` Bearer token).
 `default` binds your default Codex login. `auto` picks, at run creation, the
 pooled Codex login with the most limit headroom; you opt logins into the pool
 per login with `uzi token pool <label> --kind codex --on` (the pool is empty
-until you do, and `auto` then falls back to your default). A label held by both
-an Anthropic token and a Codex login needs `--kind anthropic|codex`; an
+until you do, and `auto` then falls back to your default). Logins are created
+unpooled. `--kind` is required only when the label is held by both an Anthropic
+token and a Codex login: without it that is a usage error. Before Codex pooling
+existed, `uzi token pool <label>` silently picked the Anthropic token in that
+case, so a script that relied on it now needs `--kind anthropic`. An
 `openai_api_key` cannot be pooled. `uzi token list` shows the Codex pool state in
-the `POOL` column. `uzi run get` explains the pick on the `CODEX_ALIAS` row, for
-example `work-codex — auto (most limit headroom)`, or `not recorded` for a run
-created before auto-selection. When `auto` has pooled logins but none can be
-bound, starting a run or an MR rework is refused with a 422 carrying
-`reason: codex_pool_unavailable`; link, re-authenticate or pool a Codex login in
-Settings. `uzi settings get` shows `Codex account mode:` after the reserve line,
-and `--json` carries `codex_account_mode`.
+the `POOL` column; its `ELIGIBLE` column is Anthropic-only and reads `-` for a
+Codex login. The HTTP routes are `PUT /api/me/codex-account-mode` and `PATCH
+/api/me/secrets/codex_auth/{id}/auto-eligible`.
+
+`uzi run get` explains the pick on the `CODEX_ALIAS` row, or `not recorded` for
+a run created before auto-selection:
+
+| Reason | `CODEX_ALIAS` text |
+|---|---|
+| `default` | `work-codex — default` |
+| `pool_empty` | `work-codex — default (auto mode, but no login is pooled)` |
+| `auto` | `work-codex — auto (most limit headroom)` |
+| `best_of_pool` | `work-codex — auto (best of pool; every login was under the headroom floor)` |
+| `pool_stale` | `work-codex — auto (no usage reading yet; first pooled login)` |
+| `pool_exhausted` | `work-codex — auto (every login at capacity; soonest to release)` |
+
+The TUI detail rail shows the short form (`default`, `pool empty`, `auto`,
+`best of pool`, `pool stale`, `pool exhausted`), and `--json` carries the raw
+value as `codex_select_reason`. See [Letting uzi pick the
+account](./codex-credentials.md#letting-uzi-pick-the-account) for how the
+choice is made.
+
+When `auto` has pooled logins but none can be bound, Codex is unusable and the
+selection never falls back to your default login. A run that did not name a
+harness starts on Claude. A run that explicitly asks for Codex, including a
+manual MR rework of a Codex run, is refused with a 422 whose code is
+`no_credential_for_harness` and whose reason is `codex_pool_unavailable`
+(the CLI prints `no pooled Codex account is available (reason:
+codex_pool_unavailable)`); link, re-authenticate or pool a Codex login in Settings. A
+schedule skips (or, once, holds) with the skip reason `codex_pool_unavailable`,
+and an automatic MR rework is skipped. `uzi settings get` shows `Codex account
+mode:` after the reserve line, and `--json` carries `codex_account_mode`.
 
 ### Plan cross-check evidence
 

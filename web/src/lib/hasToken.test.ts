@@ -139,7 +139,7 @@ describe("showsRunAccounts", () => {
   });
 });
 
-// PRD #1429 M4a, D3: Codex usability mirrors the server's D11 rule EXACTLY — a
+// PRD #1429 M4a, D3: Codex usability approximates the server's D11 rule — a
 // subscription default is usable only when linked, an api_key default is usable by
 // existence, and a failed/missing subscription default never falls through to a
 // non-default api key.
@@ -181,6 +181,52 @@ describe("isCodexUsable (D3 Codex availability)", () => {
 
   it("ignores an anthropic token", () => {
     expect(isCodexUsable([secret({ kind: "anthropic_token", is_default: true })])).toBe(false);
+  });
+});
+
+// Issue #3719: the pool rule. The matrix crosses the mode (default / auto / unknown) with
+// the pool's shape (nothing pooled / pooled and eligible / pooled and none eligible) and
+// the default's usability, because the two rules disagree exactly where a pooled login
+// and the default point different ways.
+describe("isCodexUsable with codex_account_mode (issue #3719 pool rule)", () => {
+  const linkedDefault = secret({ id: "d", kind: "codex_auth", is_default: true, codex_status: "linked" });
+  const stagingDefault = secret({ id: "d", kind: "codex_auth", is_default: true, codex_status: "staging" });
+  const keyDefault = secret({ id: "k", kind: "openai_api_key", is_default: true });
+  const pooledLinked = secret({ id: "p1", kind: "codex_auth", is_default: false, auto_eligible: true, codex_status: "linked" });
+  const pooledStaging = secret({ id: "p2", kind: "codex_auth", is_default: false, auto_eligible: true, codex_status: "staging" });
+  const pooledDisabled = secret({
+    id: "p3", kind: "codex_auth", is_default: false, auto_eligible: true, codex_status: "linked", enabled: false,
+  });
+
+  it.each([
+    // [case, secrets, mode, expected]
+    ["default mode ignores the pool: linked default", [linkedDefault, pooledStaging], "default", true],
+    ["default mode ignores the pool: staging default", [stagingDefault, pooledLinked], "default", false],
+    ["unknown mode is the default rule", [stagingDefault, pooledLinked], undefined, false],
+    ["null mode is the default rule", [stagingDefault, pooledLinked], null, false],
+    ["auto, nothing pooled: falls to the default (pool_empty)", [linkedDefault], "auto", true],
+    ["auto, nothing pooled, unusable default", [stagingDefault], "auto", false],
+    ["auto, nothing pooled, api-key default", [keyDefault], "auto", true],
+    ["auto, a pooled linked login wins over an unusable default", [stagingDefault, pooledLinked], "auto", true],
+    ["auto, pooled but none linked: unusable despite a linked default", [linkedDefault, pooledStaging], "auto", false],
+    ["auto, pooled but only disabled: unusable despite a linked default", [linkedDefault, pooledDisabled], "auto", false],
+    ["auto, pooled but only disabled: unusable despite an api-key default", [keyDefault, pooledDisabled], "auto", false],
+    ["auto, one eligible among ineligible pooled logins", [pooledDisabled, pooledStaging, pooledLinked], "auto", true],
+    ["auto, a pooled DEFAULT login counts as pooled", [{ ...linkedDefault, auto_eligible: true }], "auto", true],
+  ] as const)("%s", (_name, rows, mode, expected) => {
+    expect(isCodexUsable([...rows], mode)).toBe(expected);
+  });
+
+  // An openai_api_key row can never be pooled server-side; a stray auto_eligible on one
+  // must not switch the rule (it is not "a pooled codex_auth row").
+  it("does not treat an api key as a pooled login", () => {
+    const strayKey = secret({ id: "k2", kind: "openai_api_key", is_default: true, auto_eligible: true });
+    expect(isCodexUsable([strayKey], "auto")).toBe(true);
+  });
+
+  it("hasUsableCredential threads the mode", () => {
+    expect(hasUsableCredential([linkedDefault, pooledStaging], "default")).toBe(true);
+    expect(hasUsableCredential([linkedDefault, pooledStaging], "auto")).toBe(false);
   });
 });
 

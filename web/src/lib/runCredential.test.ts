@@ -1,7 +1,12 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-import { describeCredential, SELECT_REASONS } from "./runCredential";
+import {
+  CODEX_SELECT_REASONS,
+  describeCodexCredential,
+  describeCredential,
+  SELECT_REASONS,
+} from "./runCredential";
 
 // PRD #111 M5 — the mode rendering, and the guard that keeps three languages in step.
 
@@ -164,5 +169,90 @@ describe("describeCredential", () => {
         .deleted,
     ).toBe(true);
     expect(describeCredential(run({ anthropic_select_reason: "auto" })).deleted).toBe(false);
+  });
+});
+
+// ── Codex (issue #3719) ───────────────────────────────────────────────────────────────
+
+// The Codex edge of the same three-language guard. codexselect.AllReasons in Go is
+// already pinned to migration 00387's runs_codex_select_reason_check; this pins the web's
+// exhaustive phrase map to that CHECK too, so a reason added server-side without a web
+// phrase reddens here instead of rendering the raw wire string. Comments are stripped
+// first, and the match is anchored on the codex_select_reason IN-list, because the file
+// carries other quoted vocabularies (users_codex_account_mode_check's 'default'/'auto').
+function codexReasonsFromMigration(): string[] {
+  const path = "../api/internal/store/migrations/00387_codex_account_autoselect.sql";
+  const stmt = readFileSync(path, "utf8")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+  const inList = stmt.match(/codex_select_reason IN \(([^)]*)\)/);
+  if (!inList) throw new Error("could not find the codex_select_reason IN-list in 00387");
+  return [...inList[1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1]).sort();
+}
+
+function codexRun(reason: string | null, id: string | null = "sec-codex") {
+  return { codex_secret_id: id, codex_select_reason: reason };
+}
+
+describe("the Codex reason vocabulary is one vocabulary", () => {
+  it("matches migration 00387's CHECK", () => {
+    const fromSQL = codexReasonsFromMigration();
+    // Six, so a parser that matched nothing (or the wrong, two-value list) cannot pass.
+    expect(fromSQL).toHaveLength(6);
+    expect(fromSQL).toEqual([...CODEX_SELECT_REASONS].sort());
+  });
+
+  it("gives every Codex reason its own words", () => {
+    const seen = new Map<string, string>();
+    for (const reason of CODEX_SELECT_REASONS) {
+      const { mode, hint } = describeCodexCredential(codexRun(reason));
+      expect(mode, `${reason} has no mode phrase`).not.toBe("");
+      expect(hint, `${reason} has no hint`).not.toBe("");
+      const prev = seen.get(mode);
+      expect(prev, `${reason} and ${prev} share the phrase "${mode}"`).toBeUndefined();
+      seen.set(mode, reason);
+    }
+  });
+});
+
+describe("describeCodexCredential", () => {
+  it("is calm for default and auto, info for the actionable picks, amber where auto could not rank or every login was spent", () => {
+    const byTone: Record<string, string[]> = { neutral: [], info: [], warning: [] };
+    for (const reason of CODEX_SELECT_REASONS) {
+      byTone[describeCodexCredential(codexRun(reason)).tone].push(reason);
+    }
+    expect(byTone.neutral.sort()).toEqual(["auto", "default"]);
+    expect(byTone.info.sort()).toEqual(["best_of_pool", "pool_empty"]);
+    expect(byTone.warning.sort()).toEqual(["pool_exhausted", "pool_stale"]);
+  });
+
+  it("links exactly the non-neutral states", () => {
+    for (const reason of CODEX_SELECT_REASONS) {
+      const got = describeCodexCredential(codexRun(reason));
+      expect(got.linked, `${reason}`).toBe(got.tone !== "neutral");
+    }
+  });
+
+  it("renders no mode for a run that recorded no reason, and says it was not recorded", () => {
+    for (const reason of [null, ""]) {
+      const got = describeCodexCredential(codexRun(reason));
+      expect(got.mode).toBe("");
+      expect(got.hint).toMatch(/not recorded/);
+      expect(got.tone).toBe("neutral");
+      expect(got.linked).toBe(false);
+    }
+  });
+
+  it("shows an unrecognised reason as itself rather than guessing", () => {
+    const got = describeCodexCredential(codexRun("pool_sharded"));
+    expect(got.mode).toBe("pool_sharded");
+    expect(got.hint).toContain("“pool_sharded”");
+    expect(got.tone).toBe("neutral");
+  });
+
+  it("marks a deleted login", () => {
+    expect(describeCodexCredential(codexRun("auto", null)).deleted).toBe(true);
+    expect(describeCodexCredential(codexRun("auto")).deleted).toBe(false);
   });
 });

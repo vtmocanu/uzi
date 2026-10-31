@@ -19,7 +19,8 @@ vi.mock("../lib/api", async (importActual) => {
   return {
     ...actual,
     api: {
-      // ONLY the six Codex wrappers — this card uses no workers/rate-limit/pool APIs.
+      // ONLY the Codex wrappers — this card uses no workers/rate-limit APIs. The last two
+      // are the issue #3719 pool toggle and account-mode write.
       createCodexAuth: vi.fn(),
       testSecret: vi.fn(),
       patchCodexAuth: vi.fn(),
@@ -27,6 +28,8 @@ vi.mock("../lib/api", async (importActual) => {
       createOpenAIApiKey: vi.fn(),
       patchOpenAIApiKey: vi.fn(),
       deleteOpenAIApiKeyById: vi.fn(),
+      setCodexAliasAutoEligible: vi.fn(),
+      setCodexAccountMode: vi.fn(),
     },
   };
 });
@@ -54,7 +57,12 @@ const noop = async () => {};
 function renderCard(
   secrets: SecretMeta[],
   reload = noop,
-  handlers: { onNotice?: (m: string) => void; onError?: (m: string) => void } = {},
+  handlers: {
+    onNotice?: (m: string) => void;
+    onError?: (m: string) => void;
+    accountMode?: string;
+    onAccountModeChange?: (m: "default" | "auto") => void;
+  } = {},
 ) {
   return render(
     <MemoryRouter>
@@ -65,6 +73,8 @@ function renderCard(
         reload={reload}
         onError={handlers.onError ?? (() => {})}
         onNotice={handlers.onNotice ?? (() => {})}
+        accountMode={handlers.accountMode}
+        onAccountModeChange={handlers.onAccountModeChange}
       />
     </MemoryRouter>,
   );
@@ -506,3 +516,184 @@ describe("CodexCredentials", () => {
 });
 
 vi.mock("../auth/AuthContext", () => ({ useAuth: () => ({ vaultMode: "protected", hasPassword: true }) }));
+
+// ── Issue #3719: the Codex auto-selection pool and account mode ─────────────────────
+
+describe("Codex pool checkbox", () => {
+  const linked = (over: Partial<SecretMeta> = {}) =>
+    secret({ codex_status: "linked", ...over });
+
+  it("appears on codex_auth rows only, never on an OpenAI API key", () => {
+    renderCard([
+      linked(),
+      secret({ id: "sec-2", kind: "openai_api_key", label: "console-key", is_default: false, codex_status: "static" }),
+    ]);
+    expect(within(screen.getByTestId("codex-sec-1")).getByRole("checkbox", { name: "Auto-select from default" })).toBeTruthy();
+    // Paired with the positive above: the same query on the key row finds nothing.
+    expect(within(screen.getByTestId("codex-sec-2")).queryByRole("checkbox")).toBeNull();
+  });
+
+  it("pools a login, announces it, and refetches the list rather than trusting the answer", async () => {
+    // The answer omits codex_status (as the server's does); the card must not patch its
+    // cached row from it, so the only way the row can change is the reload.
+    mockApi.setCodexAliasAutoEligible.mockResolvedValue({
+      secret: { ...linked(), auto_eligible: true, codex_status: undefined },
+    });
+    const reload = vi.fn(async () => {});
+    const onNotice = vi.fn();
+    renderCard([linked()], reload, { onNotice });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Auto-select from default" }));
+    await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+    expect(mockApi.setCodexAliasAutoEligible).toHaveBeenCalledWith("sec-1", true);
+    expect(onNotice).toHaveBeenLastCalledWith("“default” is now in the Codex auto-selection pool.");
+  });
+
+  it("un-pools a pooled login", async () => {
+    mockApi.setCodexAliasAutoEligible.mockResolvedValue({ secret: linked({ auto_eligible: false }) });
+    const reload = vi.fn(async () => {});
+    const onNotice = vi.fn();
+    renderCard([linked({ auto_eligible: true })], reload, { onNotice });
+    const box = screen.getByRole("checkbox", { name: "Auto-select from default" }) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    fireEvent.click(box);
+    await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+    expect(mockApi.setCodexAliasAutoEligible).toHaveBeenCalledWith("sec-1", false);
+    expect(onNotice).toHaveBeenLastCalledWith("“default” is no longer in the Codex auto-selection pool.");
+  });
+
+  it("explains a 409 for a login disabled since the list loaded, and still refetches", async () => {
+    const { ApiError } = await import("../lib/apiError");
+    mockApi.setCodexAliasAutoEligible.mockRejectedValue(
+      new ApiError(409, "credential is disabled; enable it in Settings"),
+    );
+    const reload = vi.fn(async () => {});
+    const onError = vi.fn();
+    renderCard([linked({ id: "sec-9", label: "laptop", is_default: false }), linked()], reload, { onError });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Auto-select from laptop" }));
+    await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+    expect(onError).toHaveBeenLastCalledWith("“laptop” is disabled, so it cannot join the pool. Enable it first.");
+  });
+
+  it("says in visible text when a pooled login is not linked, and describes the box with it", () => {
+    renderCard([secret({ auto_eligible: true, codex_status: "staging" })]);
+    const hint = screen.getByText("In the pool, but uzi picks only linked logins.");
+    const box = screen.getByRole("checkbox", { name: "Auto-select from default" });
+    expect(box.getAttribute("aria-describedby")).toBe(hint.id);
+  });
+
+  // The box is disabled while its write runs, which drops a keyboard user's focus to
+  // <body>; the row hands focus back to the box once it is enabled again.
+  it("returns keyboard focus to the box after the write", async () => {
+    let resolve!: (v: { secret: SecretMeta }) => void;
+    mockApi.setCodexAliasAutoEligible.mockReturnValue(new Promise((r) => (resolve = r)));
+    renderCard([linked()]);
+    const box = screen.getByRole("checkbox", { name: "Auto-select from default" }) as HTMLInputElement;
+    fireEvent.click(box);
+    await waitFor(() => expect(box.disabled).toBe(true));
+    // A browser drops focus from a control that becomes disabled; jsdom does not, so the
+    // test starts from that dropped state: focus is on <body> while the write runs.
+    expect(document.activeElement).toBe(document.body);
+    resolve({ secret: linked({ auto_eligible: true }) });
+    await waitFor(() => expect(document.activeElement).toBe(box));
+  });
+
+  it("mentions the pool in the delete confirmation of a pooled login", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderCard([linked(), linked({ id: "sec-9", label: "laptop", is_default: false, auto_eligible: true })]);
+    fireEvent.click(within(screen.getByTestId("codex-sec-9")).getByRole("button", { name: "Delete" }));
+    expect(confirm.mock.calls[0][0]).toMatch(/leaves your Codex auto-selection pool/);
+  });
+});
+
+describe("Codex account mode picker", () => {
+  it("is hidden until the mode is known", () => {
+    renderCard([secret()]);
+    expect(screen.queryByRole("group", { name: "Which login a new Codex run uses" })).toBeNull();
+  });
+
+  it("shows the stored mode as the checked tile", () => {
+    renderCard([secret()], noop, { accountMode: "default" });
+    const group = screen.getByRole("group", { name: "Which login a new Codex run uses" });
+    expect((within(group).getByRole("radio", { name: /Use the default/ }) as HTMLInputElement).checked).toBe(true);
+    expect((within(group).getByRole("radio", { name: /Pick by headroom/ }) as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("switches to auto through the API and reports the saved mode", async () => {
+    mockApi.setCodexAccountMode.mockResolvedValue({ codex_account_mode: "auto" });
+    const onAccountModeChange = vi.fn();
+    const onNotice = vi.fn();
+    renderCard([secret()], noop, { accountMode: "default", onAccountModeChange, onNotice });
+    fireEvent.click(screen.getByRole("radio", { name: /Pick by headroom/ }));
+    await waitFor(() => expect(onAccountModeChange).toHaveBeenCalledWith("auto"));
+    expect(mockApi.setCodexAccountMode).toHaveBeenCalledWith("auto");
+    expect(onNotice).toHaveBeenLastCalledWith(
+      "New Codex runs now pick the pooled login with the most limit headroom.",
+    );
+  });
+
+  // A disabled radio loses keyboard focus, so the group must stay enabled while the write
+  // runs; a second pick in that window is ignored instead.
+  it("keeps the radios enabled while the write is in flight, and ignores a second pick", async () => {
+    let resolve!: (v: { codex_account_mode: "default" | "auto" }) => void;
+    mockApi.setCodexAccountMode.mockReturnValue(new Promise((r) => (resolve = r)));
+    renderCard([secret()], noop, { accountMode: "default" });
+    const auto = screen.getByRole("radio", { name: /Pick by headroom/ }) as HTMLInputElement;
+    fireEvent.click(auto);
+    await waitFor(() => expect(mockApi.setCodexAccountMode).toHaveBeenCalledTimes(1));
+    expect(auto.matches(":disabled")).toBe(false);
+    fireEvent.click(screen.getByRole("radio", { name: /Use the default/ }));
+    expect(mockApi.setCodexAccountMode).toHaveBeenCalledTimes(1);
+    resolve({ codex_account_mode: "auto" });
+  });
+
+  it("keeps the mode and surfaces the error when the write fails", async () => {
+    const { ApiError } = await import("../lib/apiError");
+    mockApi.setCodexAccountMode.mockRejectedValue(new ApiError(500, "internal error"));
+    const onAccountModeChange = vi.fn();
+    const onError = vi.fn();
+    renderCard([secret()], noop, { accountMode: "auto", onAccountModeChange, onError });
+    fireEvent.click(screen.getByRole("radio", { name: /Use the default/ }));
+    await waitFor(() => expect(onError).toHaveBeenLastCalledWith("internal error"));
+    expect(onAccountModeChange).not.toHaveBeenCalled();
+  });
+
+  it("hints that auto uses the default until a login is pooled", () => {
+    renderCard([secret({ codex_status: "linked" })], noop, { accountMode: "auto" });
+    expect(screen.getByText(/runs use your default until you pool one/)).toBeTruthy();
+  });
+
+  it("warns that Codex is unavailable when no pooled login is enabled and linked", () => {
+    renderCard(
+      [
+        secret({ codex_status: "linked" }),
+        secret({ id: "sec-2", label: "laptop", is_default: false, auto_eligible: true, codex_status: "failed" }),
+        secret({
+          id: "sec-3", label: "old", is_default: false, auto_eligible: true, codex_status: "linked",
+          enabled: false, disabled_at: "2026-01-03T00:00:00Z",
+        }),
+      ],
+      noop,
+      { accountMode: "auto" },
+    );
+    expect(screen.getByText(/^Codex unavailable: no pooled login is enabled and linked, so runs fall back to Claude/)).toBeTruthy();
+  });
+
+  it("counts the pickable logins when the pool is usable", () => {
+    renderCard(
+      [
+        secret({ codex_status: "linked", auto_eligible: true }),
+        secret({ id: "sec-2", label: "laptop", is_default: false, auto_eligible: true, codex_status: "staging" }),
+      ],
+      noop,
+      { accountMode: "auto" },
+    );
+    expect(screen.getByText("uzi picks from 1 of 2 logins in the pool; the others are not linked or are disabled.")).toBeTruthy();
+    // Paired with the positive above: a usable pool never shows the unavailable warning.
+    expect(screen.queryByText(/Codex unavailable/)).toBeNull();
+  });
+
+  it("says the pool is idle in default mode", () => {
+    renderCard([secret({ codex_status: "linked", auto_eligible: true })], noop, { accountMode: "default" });
+    expect(screen.getByText("1 login is in the pool. The pool is used only when uzi picks by headroom.")).toBeTruthy();
+  });
+});

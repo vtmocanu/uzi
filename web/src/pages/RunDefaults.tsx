@@ -368,7 +368,7 @@ export function RunDefaults() {
       // PRD #1429 M4a, D3: harness-aware credential facts, computed on ALL secrets
       // (not the anthropic_token-only slice below, which the judge picker uses).
       setClaudeUsable(hasAnthropicToken(rows));
-      setCodexUsable(isCodexUsable(rows));
+      setCodexUsable(isCodexUsable(rows, settings.codex_account_mode));
       const dh = selectionFromHarness(settings.default_harness);
       setDefaultHarness(dh);
       setSavedHarness(dh);

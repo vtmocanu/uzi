@@ -31,7 +31,7 @@ import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
 import { checkerModelWarning, normalizeCheckerValue } from "../../lib/crossCheckSettings";
-import type { CrossCheckPinDTO, EffortSettingCell, Harness } from "../../lib/apiTypes";
+import type { CodexAccountMode, CrossCheckPinDTO, EffortSettingCell, Harness } from "../../lib/apiTypes";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
 import { mockDefaultClaudeModel } from "./agents";
@@ -108,6 +108,10 @@ const SEED_USER_SETTINGS: UserSettings = {
   now_summary_enabled: null,
   // PRD #1429 M1 (D3): per-user default harness; null = no preference (falls through D11).
   default_harness: null,
+  // Issue #3719: how a new Codex run chooses its login. Seeded "auto" so the demo shows the
+  // pool at work (a pooled login sits in mocks/data/secrets.ts); the server's own default is
+  // "default". Tolerantly validated like default_harness, so no storage-key bump.
+  codex_account_mode: "auto",
 };
 // Persisted pins override these fresh-demo seeds on reload.
 if (mockScenario() === "cross-check-mixed") {
@@ -287,6 +291,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // PRD #1429 M1: optional so a pre-feature blob stays valid; absent/null reads as "no
     // preference" and the SEED fills default_harness=null on load (no key bump needed).
     (u.default_harness === undefined || u.default_harness === null || typeof u.default_harness === "string") &&
+    // Issue #3719: optional so a pre-feature blob stays valid; the SEED fills it on load.
+    (u.codex_account_mode === undefined || u.codex_account_mode === "default" || u.codex_account_mode === "auto") &&
     // Optional so a pre-feature blob stays valid; absent reads as default-only.
     (u.sidebar_token_ids === undefined ||
       (Array.isArray(u.sidebar_token_ids) &&
@@ -508,7 +514,7 @@ function effectiveLegacyLane(harness: UserSettings["default_harness"]): "claude"
   if (harness === "codex") return "codex";
   if (harness === "claude") return "claude";
   const claudeUsable = hasAnthropicToken(secrets);
-  const codexUsable = isCodexUsable(secrets);
+  const codexUsable = isCodexUsable(secrets, userSettings.codex_account_mode);
   return codexUsable && !claudeUsable ? "codex" : "claude";
 }
 
@@ -1186,7 +1192,7 @@ export const settingsApi = {
   // ── Plan cross-check consent (PRD #2149 M1) ─────────────────────────────────
   setCodeCrossCheckEnabled: async (code: boolean) => {
     const u = requireSession();
-    if (code && (!hasAnthropicToken(secrets) || !isCodexUsable(secrets))) {
+    if (code && (!hasAnthropicToken(secrets) || !isCodexUsable(secrets, userSettings.codex_account_mode))) {
       throw new ApiError(400, "both Claude and Codex credentials must be usable");
     }
     u.code_cross_check_enabled = code;
@@ -1194,7 +1200,7 @@ export const settingsApi = {
   },
   setPlanCrossCheckEnabled: async (plan: boolean) => {
     const u = requireSession();
-    if (plan && (!hasAnthropicToken(secrets) || !isCodexUsable(secrets))) {
+    if (plan && (!hasAnthropicToken(secrets) || !isCodexUsable(secrets, userSettings.codex_account_mode))) {
       throw new ApiError(409, "both Claude and Codex credentials must be usable");
     }
     u.plan_cross_check_enabled = plan;
@@ -1329,6 +1335,16 @@ export const settingsApi = {
     return delay({ user: { ...u } }, 200);
   },
   getMySettings: async () => delay(mySettingsResponse()),
+  // Issue #3719: PUT /me/codex-account-mode, mirroring handler.SetCodexAccountMode — a
+  // closed two-value vocabulary (400 otherwise) answered with the stored mode alone.
+  setCodexAccountMode: async (mode: CodexAccountMode) => {
+    if (mode !== "default" && mode !== "auto") {
+      throw new ApiError(400, 'codex_account_mode must be "default" or "auto"');
+    }
+    userSettings = { ...userSettings, codex_account_mode: mode };
+    persistSettings();
+    return delay({ codex_account_mode: mode });
+  },
   putMySettings: async (patch: UserSettingsPatch) => {
     // PATCH-like: apply only the fields present in the body, mirroring the real
     // handler so a theme-only save never clears the model and vice versa. Staged

@@ -566,6 +566,16 @@ exceed `max_issues` once backfill walks past a skip), which ones
   within the caps; stored-pin/override rules still apply. Missing credentials
   do not acquire a disable hold. The web shows "pinned credential is disabled";
   `uzi schedule get` prints the same label with a Settings hint.
+- `codex_pool_unavailable` — the schedule needs Codex, your account mode is
+  `auto` and you pooled Codex logins, but none can be bound (each is unlinked,
+  disabled, quarantined or waiting for re-login; see [Letting uzi pick the
+  account](codex-credentials.md#letting-uzi-pick-the-account)). The fire
+  starts nothing and never falls back to your default login or to Claude.
+  Recurring schedules advance and re-fire next cadence. A one-time schedule is
+  **held** like a disabled pin: due, un-advanced, with the skip recorded as its
+  last fire, until the pool is fixed. On an unpinned label-selected sweep it
+  is a per-candidate skip and scanning continues. An unpinned schedule whose
+  harness resolves implicitly starts on Claude instead and records nothing.
 - `config_not_supported` — a removal-enabled schedule's effective target,
   timing or selector no longer supports removal (for example, a catalog
   selector changed to multiple labels). The fire starts nothing; an invalid
@@ -647,8 +657,8 @@ a **parked** schedule (bad repo or config) or a fire that hit a
 transient error (retried next tick, see `fetch_failed` above) leaves
 `last_fire` untouched — it shows whatever fired before, or nothing. The
 one exception is a one-time schedule held on a disabled credential (see
-`credential_disabled` above, including a label-selected single issue,
-but not a per-candidate unpinned sweep skip): it records that skip as its
+`credential_disabled` or `codex_pool_unavailable` above, including a
+label-selected single issue, but not a per-candidate unpinned sweep skip): it records that skip as its
 last fire without advancing, so it can show a `last_fire` while still due. A
 `run-now` fire reports its own outcome in the response without
 touching `last_fire` at all, since a manual fire must not disturb the
@@ -1080,7 +1090,7 @@ cadence. Each is recorded with the workflow it concerns where there is one.
 - `no_default_branch` — the repo has no recorded default branch.
 
 A CI-watch fire can also record the existing `already_running`,
-`credential_disabled`, `no_usable_credential`,
+`credential_disabled`, `codex_pool_unavailable`, `no_usable_credential`,
 `description_too_large` (the instruction and guidance leave no room for even
 the smallest evidence block; the instruction is never shortened to make room)
 and `codex_override_conflict`. Other forge errors are transient: the fire

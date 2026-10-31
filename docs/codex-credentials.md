@@ -261,3 +261,111 @@ A few things are specific to Codex:
   for a new paste (the **Credential action required** state above) if that
   fails. How long an unused login stays valid at OpenAI is outside uzi's
   control.
+
+## Letting uzi pick the account
+
+By default every new Codex run spends your default Codex login. If you hold
+several ChatGPT subscriptions, you can let uzi choose among them when a run is
+created, the way [Anthropic auto-selection](anthropic-token.md#letting-uzi-pick-the-token-auto-selection)
+chooses among tokens. It is opt-in twice: you switch your account to **auto**,
+and you opt each login into the pool.
+
+### Turn it on
+
+1. **Choose the mode.** Your **Codex account mode** is `default` (everyone
+   starts here) or `auto`. Set it with the mode selector on the Codex card in
+   **Settings**, or run `uzi settings codex-mode auto` (`uzi settings codex-mode default` to
+   go back; `uzi settings get` shows the current value). It applies to runs
+   created after the change.
+2. **Pool the logins you are happy to spend.** On each Codex login, tick its
+   pool checkbox in Settings, or run `uzi token pool <label> --kind codex --on`
+   (`--off` takes it out). A login you save is **not pooled** until you do
+   this. Only Codex subscription logins can be pooled; an OpenAI API key
+   cannot, and a disabled login cannot be pooled (un-pooling one is allowed).
+
+`uzi token pool <label>` without `--kind` works only while one pooled-capable
+credential carries that label. If an Anthropic token and a Codex login share a
+label it is a usage error naming `--kind anthropic|codex`; before Codex
+pooling existed, the same command silently chose the Anthropic token.
+
+### How it chooses
+
+The choice is made once, **when the run is created**, and applies to every way
+a run can start: a manual run, a [schedule](scheduling.md), an autopilot run, an
+MR rework and a cross-check child. With mode `auto` and at least one pooled
+login, uzi never spends your default unless it is pooled too.
+
+- **Accounts, not aliases.** Logins that point at the same ChatGPT account
+  count as one candidate; uzi binds the pooled, enabled, linked login of that
+  account with the lowest internal id.
+- **Left out entirely.** A login is never picked while it is not pooled, is
+  [disabled](#disabling-a-credential), or is not `linked`, and neither is an
+  account that is quarantined or needs re-login.
+- **Held back.** An account is used only as a last resort, when nothing else is
+  available, while its main `codex` limit bucket reports the limit reached or
+  not allowed, while it is in a
+  [temporary admission wait](rate-limits.md#temporary-account-admission-waits)
+  (including its recovery spread), or while the [weekly usage
+  reserve](rate-limits.md#weekly-usage-reserve) holds it.
+- **Ranking.** Each remaining account scores `100 − (its fullest window)` from
+  the main `codex` bucket of its [usage meter](#usage-meters); extra feature
+  buckets are ignored. The score is unknown when the reading is stale, from
+  before a reset, when the meter is not fresh, or when your vault is locked.
+  Ranking then works as for Claude tokens: the account with the most headroom
+  wins, accounts within the tie band are decided by whichever resets soonest,
+  and the account key breaks any remaining tie. The headroom floor, tie band
+  and in-flight penalty (`UZI_AUTOSELECT_MIN_HEADROOM`,
+  `UZI_AUTOSELECT_HEADROOM_TIE_PCT`, `UZI_AUTOSELECT_INFLIGHT_PENALTY`, see
+  [Configuration](configuration.md)) are shared with Claude; how old a Codex
+  reading may be follows the Codex poll interval instead.
+- **Spreading runs.** Every unfinished Codex run on an account, a queued one
+  included and whichever saved login it uses, counts slightly against that
+  account, so a burst of runs does not pile onto one subscription.
+
+### What it records
+
+The run keeps the reason it got its login. `uzi run get` shows it on the
+`CODEX_ALIAS` row, the web run view and the TUI detail rail show it too, and a
+run created before auto-selection reads `not recorded`.
+
+| Reason | Meaning |
+|---|---|
+| `default` | Mode is `default`: your default login. |
+| `pool_empty` | Mode is `auto` but no login is pooled: your default login. |
+| `auto` | Picked by headroom, with at least the minimum headroom to spare. |
+| `best_of_pool` | Every measurable account was under the headroom floor; the emptiest was picked. |
+| `pool_stale` | No pooled account had a usable reading; the first by account key was picked. |
+| `pool_exhausted` | Every usable account was held back (limit reached, wait or reserve); the one releasing soonest was picked. |
+
+### When no pooled account can be used
+
+If you pooled logins but none can ever be bound (each is unlinked, disabled,
+quarantined or waiting for re-login), Codex is treated as unusable for you,
+and uzi never falls back to your default login:
+
+- A run that did not name a harness starts on **Claude** when Claude is
+  usable, as when you have no usable Codex credential.
+- A run that explicitly asks for Codex is refused with a `422`, code
+  `no_credential_for_harness` and reason `codex_pool_unavailable`
+  ("link, re-authenticate or pool a Codex account in Settings"). The CLI
+  prints the reason beside the message.
+- A [schedule](scheduling.md#fire-outcomes) that needs Codex starts nothing and
+  records the skip `codex_pool_unavailable`. A recurring one tries again next
+  cadence; a one-time one is held, not used up, until you fix the pool.
+- An automatic MR rework of a Codex run is skipped until a pooled account is
+  usable again.
+
+Accounts that are merely at capacity are not "unusable": a run is still created
+on the one releasing soonest (`pool_exhausted`) and waits as any run does.
+
+### What does not change
+
+- **A run never switches account after creation.** A resume, a usage-limit park
+  or a restart keeps the account it was created on, and the
+  [admission wait](rate-limits.md#temporary-account-admission-waits) and
+  [reserve](rate-limits.md#weekly-usage-reserve) apply to that account. A
+  [disabled](#disabling-a-credential) login still makes its runs wait.
+- **Per-run token choices are unchanged.** Codex runs still have no per-run
+  token switch.
+- **Out of scope:** pooling OpenAI API keys, and Codex chat. Neither is chosen
+  by this mode.

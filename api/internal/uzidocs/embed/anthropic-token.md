@@ -171,6 +171,10 @@ described below; a rejected token cannot. Check them after opting a token in.
 Creation-time mode and claim-time fallback verified against worker creation
 and `autoChoice` on 2026-09-08.
 
+This pool is for Anthropic tokens only. Codex subscription logins have their
+own opt-in pool and per-user mode, see [Letting uzi pick the
+account](codex-credentials.md#letting-uzi-pick-the-account).
+
 ### How it chooses
 
 Headroom is whichever window is fuller: `min(100 − 5-hour %, 100 − 7-day %)`.
