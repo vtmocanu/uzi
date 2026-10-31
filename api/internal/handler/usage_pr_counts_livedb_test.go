@@ -68,6 +68,23 @@ func TestAdminUsagePRCountsNoUsageUserLiveDB(t *testing.T) {
 	if admin.Factory.LifetimePRCount < 1 || admin.Factory.Last7PRCount < 1 {
 		t.Errorf("factory pr counts %d/%d must include the seeded PR", admin.Factory.LifetimePRCount, admin.Factory.Last7PRCount)
 	}
+	// One response: every PR owner gets exactly one row, and the rows' counts sum to the
+	// factory's in both windows (the LiveDB packages run serially, so nothing writes runs
+	// between the handler's reads).
+	var sumLifetime, sumLast7 int64
+	rowsByUser := map[string]int{}
+	for _, u := range admin.Users {
+		sumLifetime += u.PRCount
+		sumLast7 += u.Last7PRCount
+		rowsByUser[u.UserID]++
+		if rowsByUser[u.UserID] > 1 {
+			t.Errorf("user %s has more than one row", u.UserID)
+		}
+	}
+	if sumLifetime != admin.Factory.LifetimePRCount || sumLast7 != admin.Factory.Last7PRCount {
+		t.Errorf("per-user pr counts sum to %d/%d, factory reports %d/%d",
+			sumLifetime, sumLast7, admin.Factory.LifetimePRCount, admin.Factory.Last7PRCount)
+	}
 	var found bool
 	for _, u := range admin.Users {
 		if u.UserID != userID.String() {
