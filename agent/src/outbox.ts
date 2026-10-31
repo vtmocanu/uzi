@@ -915,6 +915,51 @@ export class Outbox {
   private readonly policyInspections = new Map<symbol, TerminalInspectionScope>();
   private readonly targetProofs = new Map<string, Promise<boolean>>();
   private readonly physicalSourceBindings = new WeakMap<TerminalAuthenticationObservation, Readonly<TerminalSourceBinding>>();
+  // Runtime counterpart of the boot rank 1: an enrolled unknown entry whose own file was read
+  // and rejected (MAC failure or malformed). Anything else (oversized, unreadable, never read)
+  // is uncertain and is never displaced by a later authenticated alias.
+  private readonly rejectedUnknownEvidence = new WeakMap<TerminalMeta, { macBinding?: Readonly<TerminalMACBinding>; sourceBinding?: Readonly<TerminalSourceBinding> }>();
+
+  private noteRejectedUnknown(meta: TerminalMeta | undefined, observation: TerminalAuthenticationObservation): void {
+    if (!meta || meta.outcomeKind !== "unknown" || meta.fileName !== observation.fileName ||
+        (observation.kind !== "mac_failure" && observation.kind !== "malformed")) return;
+    this.rejectedUnknownEvidence.set(meta, observation.kind === "mac_failure"
+      ? { macBinding: this.copyMACBinding(observation) }
+      : { sourceBinding: this.physicalSourceBindings.get(observation) });
+  }
+
+  /** Runtime scan only: a rejected unknown entry must not shadow an authenticated alias of the same
+   *  generation. The alias replaces it (as at boot) and the alias's own held scope is re-keyed to the
+   *  rejected file, so that file stays protected with its original evidence. Never displaces an
+   *  uninspected entry, a selected or capture-pending one, or an unpersisted policy hold. */
+  private displaceRejectedUnknown(runId: string, generation: number, record: Record<string, unknown>, fileName: string,
+    bytes: number, token: symbol, scope: TerminalInspectionScope): boolean {
+    const rs = this.runs.get(runId);
+    const current = rs?.terminals.get(generation);
+    const evidence = current && this.rejectedUnknownEvidence.get(current);
+    if (!rs || !current || !evidence || current.outcomeKind !== "unknown" || current.fileName === fileName ||
+        current.selectionToken || current.capturePending || current.unpersistedPolicy ||
+        this.policyInspections.get(token) !== scope) return false;
+    const meta = coerceTerminal(record, runId, generation, fileName);
+    if (!meta) return false;
+    meta.policyBytes = bytes;
+    if (meta.outcomeKind === "terminal") meta.ordinaryVersion = this.authenticatedFileVersions.get(record);
+    if (meta.outcomeKind === "policy_hold") {
+      meta.selectedLifetime = this.authenticatedLifetimes.get(record);
+      if (!this.admitPolicyMetadata(runId, meta)) { this.terminalInventoryComplete = false; return false; }
+    }
+    // No await from here: the rejected entry, its protection and the winner switch together.
+    scope.held = true;
+    scope.sourceKey = createHash("sha256").update(current.fileName).digest("hex");
+    delete scope.macBinding;
+    delete scope.sourceBinding;
+    if (evidence.macBinding) scope.macBinding = evidence.macBinding;
+    else if (evidence.sourceBinding && Buffer.byteLength(JSON.stringify({ ...scope, sourceBinding: evidence.sourceBinding })) <= 1024)
+      scope.sourceBinding = evidence.sourceBinding;
+    this.terminalRetirementIdentities.delete(current);
+    rs.terminals.set(generation, meta);
+    return true;
+  }
 
   private hasCountedPhysicalScope(runId: string, fileName: string): boolean {
     const sourceKey = createHash("sha256").update(fileName).digest("hex");
@@ -1124,6 +1169,7 @@ export class Outbox {
                 readByRun.set(entry.name, runBytes);
                 checkProofBudget(budget);
                 const result = await this.inspectTerminal(entry.name, generation, source.name, budget, size);
+                this.noteRejectedUnknown(this.runs.get(entry.name)?.terminals.get(generation), result.observation);
                 if (!result.record) return true;
                 if (result.record.outcome_kind !== "policy_hold") {
                   if (token) this.policyInspections.delete(token);
@@ -3555,7 +3601,10 @@ export class Outbox {
               runRemaining -= cap;
               const meta = generation === undefined ? undefined : this.runs.get(this.terminalScanRun.id)?.terminals.get(generation);
               if (meta?.outcomeKind === "unknown" && result.observation.kind !== "unreadable" && result.observation.kind !== "key_unavailable") meta.budgetDeferred = false;
-              if (token && result.record && result.record.outcome_kind !== "policy_hold")
+              this.noteRejectedUnknown(meta, result.observation);
+              const displaced = !!(token && scope && generation !== undefined && result.record &&
+                this.displaceRejectedUnknown(runId, generation, result.record, entry.name, bytes, token, scope));
+              if (token && result.record && !displaced && result.record.outcome_kind !== "policy_hold")
                 this.policyInspections.delete(token);
               page.observations.push(result.observation);
             }
