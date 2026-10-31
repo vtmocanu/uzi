@@ -689,6 +689,9 @@ async function main(): Promise<void> {
     authority,
     maintenanceExclusion,
     memoryRuntime: memory,
+    // issue #3639: the guard timing the memory-receipt gate derives its sample wait from.
+    ...(config.memoryGuard?.enabled ? { memoryGuardTiming: { rearmMs: config.memoryGuard.rearmMs,
+      sampleMs: config.memoryGuard.sampleMs, responseBudgetMs: config.memoryGuard.responseBudgetMs } } : {}),
     recoveryLiveTiming: buildRecoveryLiveTiming(config.executor, log),
     pollMs: config.pollIntervalMs,
     onSourceRetained: () => notifyRetained?.(),

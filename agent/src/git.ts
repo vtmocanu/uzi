@@ -1728,7 +1728,7 @@ function sameMemoryParkBinding(a: MemoryParkBinding, b: MemoryParkBinding): bool
  * binding. Throws on anything else. Returns a fresh object whose key order is the persisted order, so its
  * JSON.stringify is the canonical spelling.
  */
-function parseMemoryPark(value: unknown): MemoryParkRecord {
+export function parseMemoryPark(value: unknown): MemoryParkRecord {
   const o = memoryParkKeys(value, ["version", "binding", "ack", "origin"], ["settlement"]);
   if (o.version !== 1) return memoryParkFail();
   const binding = memoryParkBinding(o.binding);
@@ -1777,7 +1777,7 @@ function parseMemoryPark(value: unknown): MemoryParkRecord {
 }
 
 /** The persisted spelling of a record: re-parsed, fixed field order. */
-function serializeMemoryPark(record: MemoryParkRecord): string {
+export function serializeMemoryPark(record: MemoryParkRecord): string {
   return JSON.stringify(parseMemoryPark(record));
 }
 

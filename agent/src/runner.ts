@@ -10,7 +10,7 @@ import { ProviderPolicyRefusal, policyRefusalMessage } from "./provider-policy-r
 import { isParkAnswer } from "./park-run.js";
 import { TrustedExecutionRefusal, legacyTrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { AsyncResource } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import { basename as pathBasename, dirname as pathDirname, join, resolve as resolvePath } from "node:path";
@@ -18,7 +18,7 @@ import type { WorkerClient } from "./client.js";
 import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
-import type { BaseAttestationHoldOutcome, MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
+import type { BaseAttestationHoldOutcome, MemoryIncarnation, MemoryParkReference, WorkerMemoryPressureResult } from "./protocol.js";
 import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE } from "./protocol.js";
 import { PublicationContextLatch, publicationContextReason } from "./publication-context.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CREDENTIAL_SWITCH_HOLD_FEATURE } from "./client.js";
@@ -203,6 +203,9 @@ import {
   PendingRecoveryCaptureError,
   RetainedRecoveryBlockedError,
   ForeignRetainedRecoveryError,
+  MemoryReceiptSourceError,
+  parseMemoryPark,
+  serializeMemoryPark,
   type RecoveryJournalEntry,
   REASON_WORKER_RESIDUE_BLOCKED,
   type AttemptSeedOptions,
@@ -258,6 +261,12 @@ import {
 
 /** Bound for the log-only predecessor memory-settlement verification during retained recovery. */
 const MEMORY_SETTLEMENT_LOG_BUDGET_MS = 2000;
+/** issue #3639: the server's cap on one posted settlement body (bytes). */
+const MEMORY_PARK_SETTLEMENT_MAX_BYTES = 524288;
+/** issue #3639: at most this many own-park entries; a pending entry is never evicted. */
+const OWN_MEMORY_PARKS_MAX = 1024;
+/** issue #3639: the only discovery error text that means "this journal needs a legacy attribution repair". */
+const RECEIPT_REPAIR_NEEDED_MESSAGE = "recovery source does not belong to this key";
 
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
@@ -1233,6 +1242,28 @@ const RETAINED_CORRUPTION_MARKERS = [
 ];
 
 /**
+ * issue #3639: how a receipt flight's discovery failure falls back. `F2` is an identity, reference or corruption failure
+ * (the receipt names no source this worker can prove); `F3` is a source that exists but is not safe to continue now
+ * (changed, stopped, blocked, exhausted retries, a journal that would need a repair). Both end in the same nonterminal
+ * re-park; only the logged reason differs. The reason text is a constant, never the error's own.
+ */
+function receiptDiscoveryFallback(error: unknown): { kind: "F2" | "F3"; reason: string } {
+  if (error instanceof MemoryReceiptSourceError) {
+    return error.reason === "changed"
+      ? { kind: "F3", reason: "the receipt's source journal changed" }
+      : { kind: "F2", reason: `the receipt's source journal is ${error.reason}` };
+  }
+  if (error instanceof ForeignRetainedRecoveryError) return { kind: "F2", reason: "the retained journal belongs to another run" };
+  if (error instanceof RetainedStoppedSourceError) return { kind: "F3", reason: "the receipt's source is a kept stopped source" };
+  if (error instanceof RetainedRecoveryBlockedError) return { kind: "F3", reason: "the receipt's source is missing" };
+  if (error instanceof RetainedDiscoveryExhaustedError) return { kind: "F3", reason: "discovery retries are exhausted" };
+  if (error instanceof Error && error.message === RECEIPT_REPAIR_NEEDED_MESSAGE) {
+    return { kind: "F3", reason: "the receipt's source journal would need a repair" };
+  }
+  return { kind: "F2", reason: "the receipt's source journal is unreadable or corrupt" };
+}
+
+/**
  * Classifies retained read failures for pre-clone discovery and owner eligibility probes.
  * Typed and corruption rejections come first,
  * before any deadline-text match, so a corrupt journal can never be retried as "busy". A deadline
@@ -1241,7 +1272,8 @@ const RETAINED_CORRUPTION_MARKERS = [
  */
 function classifyRetainedDiscoveryError(error: unknown, deadlineElapsed: boolean): "retryable" | "terminal" {
   if (error instanceof RetainedRecoveryBlockedError || error instanceof RetainedRecoveryMissingJournalError ||
-      error instanceof ForeignRetainedRecoveryError || error instanceof RetainedRecoveryStop ||
+      error instanceof ForeignRetainedRecoveryError || error instanceof MemoryReceiptSourceError ||
+      error instanceof RetainedRecoveryStop ||
       error instanceof CredentialSwitchSignal || error instanceof SyntaxError) return "terminal";
   const message = error instanceof Error ? error.message : "";
   const errno = error as { code?: unknown; syscall?: unknown } | null;
@@ -2127,6 +2159,20 @@ type MemoryParkWitness = Readonly<{
   binding: Readonly<{ run_id: string; worker_id: string; register_nonce: string; claim_generation: number; memory_episode: number }>;
   interventionIds: readonly string[];
 }>;
+/**
+ * issue #3639: the run's own settled memory park, as this worker incarnation knows it. `binding` (B) is the server's
+ * accepted park binding. `pending` until a complete receipt handoff consumes it; `consumed` entries are historical and
+ * grant nothing. `bytes`/`sha`/`clonePath`/`attemptId` are stored before the first settlement POST and are the only
+ * source of what a later claim's reference is compared against.
+ */
+type OwnMemoryPark = {
+  state: "pending" | "consumed";
+  readonly binding: MemoryParkWitness["binding"];
+  bytes?: string;
+  sha?: string;
+  clonePath?: string;
+  attemptId?: string | null;
+};
 /** What {@link RunRunner.endFlightSourceUse} ended: the source paths of the flight and the confirmed ends among them. */
 type FlightSourceEnd = Readonly<{
   paths: readonly string[];
@@ -2155,6 +2201,8 @@ type MemoryFlight = {
     interventionIds: readonly string[] }>;
   /** Written only by a preservation that observed the server's accepted park binding; never cleared by anything else. */
   parkWitness?: MemoryParkWitness;
+  /** issue #3639: the own-park entry created together with `parkWitness` (the same accepted binding). */
+  ownPark?: OwnMemoryPark;
   /** issue #3638: the exact binding of a park body this flight actually sent, latched immediately BEFORE `reportState`
    *  (so a lost ACK still leaves it). Evidence that a park may have reached the server; never settlement. */
   parkSent?: MemoryParkWitness["binding"];
@@ -2234,6 +2282,12 @@ interface RunFlight {
     readonly authorityIncarnation: string; readonly sourceEpoch: string; readonly attemptId: string | null;
     sent?: MemoryParkWitness["binding"]; confirmed?: MemoryParkWitness["binding"];
   };
+  /** issue #3639: set when the memory-receipt gate passed; discovery then runs bound to this receipt and the handoff
+   *  checks it before any coordinate is assigned. Never set for an ordinary flight. */
+  memoryReceipt?: { readonly entry: OwnMemoryPark; readonly record: MemoryParkRecord };
+  /** issue #3639: the claim was refused by the receipt gate or handoff (F2/F3); the teardown producer and the owed-candidate
+   *  retention write nothing for it. */
+  memoryGateRefused?: boolean;
   /** issue #3638: set (permanently) when {@link RunRunner.endFlightSourceUse} began; the flight admits no source again. */
   sourceAdmissionRetired?: boolean;
   /** issue #3638: a per-flight identity minted once at creation and never reassigned. */
@@ -2715,6 +2769,9 @@ export interface RunnerOptions {
    *  executor is bound to its clone through it. Absent (unit tests): legacy behaviour. */
   authority?: AuthorityRuntime;
   memoryRuntime?: WorkerMemoryRuntime;
+  /** issue #3639: the memory guard's timing, from which the receipt gate derives its sample wait. Absent: the wait cannot
+   *  prove a fresh sample, so a gated claim falls back to a re-park. */
+  memoryGuardTiming?: Readonly<{ rearmMs: number; sampleMs: number; responseBudgetMs: number }>;
   /** Issue #3031: the claim-gate writer exclusion new terminal production runs inside. */
   maintenanceExclusion?: RecoveryCoordinatorOptions["writerExclusion"];
   /** Test-only factory; production uses one monotonic ten-minute budget. */
@@ -2945,6 +3002,9 @@ export class RunRunner {
    *  registry, the spill trip window and the spill-buffer cap. All threaded into every
    *  run's MessageBatcher; `outbox`/`rearm` undefined ⇒ today's trip behaviour. */
   private readonly memoryRuntime: WorkerMemoryRuntime | undefined;
+  private readonly memoryGuardTiming: RunnerOptions["memoryGuardTiming"];
+  /** issue #3639: runId -> the run's own settled-park entry (see {@link OwnMemoryPark}); a worker-local, in-memory table. */
+  private readonly ownMemoryParks = new Map<string, OwnMemoryPark>();
   private readonly outbox: Outbox | undefined;
   private readonly rearm: Map<string, () => void> | undefined;
   private readonly transientTripMs: number | undefined;
@@ -3113,6 +3173,7 @@ export class RunRunner {
     // issue #3404 M2 U5: the runtime's retired-tombstone finisher must not run while a binder for the path is pending.
     this.authority?.registerBinderPending(clonePath => this.completionBinderPendingAt(clonePath));
     this.memoryRuntime = opts.memoryRuntime;
+    this.memoryGuardTiming = opts.memoryGuardTiming;
     this.cancellationBudgetFactory = opts.cancellationBudgetFactory ?? (() => new MaintenanceBudget());
     this.pollMs = opts.pollMs ?? 3_000;
     this.liveAttempts = opts.liveAttempts ?? new LiveAttemptRegistry();
@@ -5895,7 +5956,7 @@ export class RunRunner {
       if (this.completionReceipts.has(this.completionKey(runId, flight.claimGeneration))) flight.preserveRecoveryClone = true;
       // This credential-free retention reads only the trusted bare, including when the clone
       // must stay in place after a blocked proof. Inventory freeze uses the retire proof below.
-      if (!this.cancellationExpired(flight) && flight.barePath && flight.branch && !terminalDisposeUnproven &&
+      if (!this.cancellationExpired(flight) && flight.barePath && flight.branch && !terminalDisposeUnproven && !flight.memoryGateRefused &&
           !this.completionReceipts.has(this.completionKey(runId, flight.claimGeneration)) &&
           typeof this.git.retainCurrentOwedCandidate === "function") {
         try {
@@ -11780,6 +11841,9 @@ export class RunRunner {
     // follow-ups earlier claims consumed so they keep reaching this claim's subagents.
     await this.rehydrateOperatorConstraints(runId, steering, batcher, runLog);
     steering.start();
+    // issue #3639: before any discovery, source admission, memory context, reservation, capture or model turn, decide
+    // what this claim's memory-park reference (or its absence) means. Returns for an ordinary claim or a passed gate.
+    await this.memoryReceiptGate(claim, flight);
 
     // issue #2213: a quarantined worker starts no credentialed git or provider turn. The claim
     // loop already refuses new claims while latched; this refuses a claim that was in flight (or
@@ -11816,8 +11880,11 @@ export class RunRunner {
     const coordinates = this.cloneCoordinates(claim);
     flight.effectiveAttemptPaths = this.attemptPaths;
     let retainedJournal: RecoveryJournalEntry | undefined;
+    // issue #3639: a receipt flight keeps the bare in this local until the handoff passes.
+    let receiptBare: string | undefined;
     const discoverRetained = async (required = false, branch = coordinates.branch) => {
       retainedJournal = undefined;
+      receiptBare = undefined;
       try {
         this.retainedLifecycleGuard(flight);
         if (required && branch !== coordinates.branch) throw new Error("retained recovery branch mismatch");
@@ -11826,6 +11893,20 @@ export class RunRunner {
             if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
             throw error;
           });
+          const receipt = flight.memoryReceipt;
+          if (receipt) {
+            // issue #3639: bound to the receipt's source, read-only, and no flight coordinate is assigned here.
+            if (cachePresent) {
+              const retained = await this.git.discoverRetainedRecovery(claim.repo.clone_url, branch, coordinates.key, runId, {
+                runId, clonePath: receipt.entry.clonePath!, attemptId: (receipt.record.origin.attemptId ?? undefined) as string,
+                memoryPark: receipt.entry.bytes! });
+              if (retained) {
+                receiptBare = retained.barePath;
+                retainedJournal = retained.journal;
+              }
+            }
+            return;
+          }
           if (cachePresent && typeof this.git.recoveryAttemptMode === "function") {
             flight.effectiveAttemptPaths ||= await this.git.recoveryAttemptMode(claim.repo.clone_url, coordinates.key);
           }
@@ -11880,6 +11961,12 @@ export class RunRunner {
           throw error;
         }
         this.retainedLifecycleGuard(flight);
+        if (flight.memoryReceipt && !(error instanceof RetainedRecoveryStop)) {
+          // issue #3639: every discovery failure of a receipt flight is a receipt fallback: no recovery episode is blocked,
+          // no coordinate is assigned and no generic failure is reported.
+          const fallback = receiptDiscoveryFallback(error);
+          await this.parkMemoryGateRefused(claim, flight, fallback.kind, fallback.reason);
+        }
         if (!(error instanceof ForeignRetainedRecoveryError)) {
           flight.preserveRecoveryClone = true;
           flight.preserveSession = true;
@@ -11919,6 +12006,13 @@ export class RunRunner {
       }
     };
     await discoverRetained();
+    if (flight.memoryReceipt) {
+      // issue #3639: never a fresh clone and never an unchecked continuation.
+      if (!retainedJournal || receiptBare === undefined) {
+        return this.parkMemoryGateRefused(claim, flight, "F2", "the receipt's retained journal is absent");
+      }
+      await this.memoryReceiptHandoff(claim, flight, retainedJournal, receiptBare);
+    }
     if (retainedJournal) {
       await this.recoverRetainedClaim(claim, flight, coordinates.key, retainedJournal);
       return;
@@ -12094,6 +12188,11 @@ export class RunRunner {
             flight.runLog.info("a kept stopped source or recovered attempt mode appeared during admission; seeding a fresh attempt path");
             continue;
           }
+        }
+        if (flight.memoryReceipt && !(err instanceof RetainedRecoveryStop) && !(err instanceof CredentialSwitchSignal)) {
+          // issue #3639: unreachable by construction (a receipt flight never seeds a source); a receipt flight is
+          // never sent to the ordinary retained-recovery path.
+          return this.parkMemoryGateRefused(claim, flight, "F2", "a receipt flight reached source seeding");
         }
         if (err instanceof PendingRecoveryCaptureError) {
           // The git layer stopped BEFORE rm. Capture this same run's retained source
@@ -21774,7 +21873,10 @@ export class RunRunner {
   /**
    * issue #3638: true when this flight's memory hold ended in an ACCEPTED park by the very producer that wrote it,
    * so teardown may treat the hold as settled. Never clears the hold. A failed or swallowed preservation leaves
-   * no witness (the operation's `finally` sets `settled` on failure too), so it never qualifies.
+   * no witness (the operation's `finally` sets `settled` on failure too), so it never qualifies. The same predicate,
+   * together with the end receipts, is what lets the producer add a settlement (and so, once the journal write is
+   * confirmed `settled`, deliver it to the server, issue #3639); `memory.settled` alone, a cleared hold or
+   * `sourceTailsJoined` alone never does.
    */
   private memoryHoldSettled(flight: RunFlight, executor: Executor): boolean {
     const memory = flight.workerMemory;
@@ -21803,6 +21905,9 @@ export class RunRunner {
    * flight and executor that wrote it, whose source tails were positively joined, and whose every source path (at
    * most 16, none published) has an `endedSlots` receipt for THIS authority incarnation; an incomplete set is never
    * truncated. The record is metadata: it grants no completion, publication, custody release or Resume eligibility.
+   * issue #3639: only when the journal write returns `settled` for this very hold does the producer post the confirmed
+   * bytes (see {@link deliverMemoryParkSettlement}); a flight whose settlement was not produced, not confirmed, too large
+   * or not negotiable has its own-park entry removed instead, and a re-park (no hold) never creates or posts one.
    */
   private async recordMemoryParkOutcome(
     flight: RunFlight, runLog: Logger, end: FlightSourceEnd,
@@ -21811,9 +21916,16 @@ export class RunRunner {
     const memory = flight.workerMemory;
     const hold = memory?.hold;
     const repark = flight.memoryRepark;
-    if (!memory || (!hold && !repark)) return;
+    if (!memory || (!hold && !repark) || flight.memoryGateRefused) {
+      // issue #3639: a hold that was cleared before the producer ran leaves nothing to post; its entry is not kept either.
+      const own = memory?.ownPark;
+      if (own && this.ownMemoryParks.get(flight.runId) === own) this.ownMemoryParks.delete(flight.runId);
+      return;
+    }
     let timer: ReturnType<typeof setTimeout> | undefined;
     let onShutdown: (() => void) | undefined;
+    // issue #3639: whether a settlement POST was attempted for this flight's own-park entry. Anything else removes it.
+    let deliveryAttempted = false;
     try {
       const authority = this.authority;
       const bare = flight.barePath, branch = flight.branch, clonePath = flight.worktreePath;
@@ -21902,6 +22014,11 @@ export class RunRunner {
           arm();
         }),
       ]);
+      if (written === "settled" && hold && record.settlement && memory.ownPark) {
+        // issue #3639: the only POST site. The journal holds the confirmed:true form of exactly this record.
+        const confirmed: MemoryParkRecord = { ...record, settlement: { ...record.settlement, confirmed: true } };
+        deliveryAttempted = await this.deliverMemoryParkSettlement(flight, runLog, memory.ownPark, confirmed, clonePath, attemptId);
+      }
       if (written === "timeout") {
         runLog.warn("memory park record write timed out and the producer was aborted; a write already holding the bare lock may still land, and a reader trusts a record only after its own lock-held confirmation");
       } else if (written === "unconfirmed") {
@@ -21914,7 +22031,91 @@ export class RunRunner {
     } finally {
       if (onShutdown) this.shutdownSignal.signal.removeEventListener("abort", onShutdown);
       if (timer) clearTimeout(timer);
+      // issue #3639: a flight's own entry that never reached a POST can never be referenced, so it is not kept.
+      const own = memory.ownPark;
+      if (own && !deliveryAttempted && this.ownMemoryParks.get(flight.runId) === own) this.ownMemoryParks.delete(flight.runId);
     }
+  }
+
+  /**
+   * issue #3639 - deliver the settled park's confirmed:true journal bytes to the server. Called only when
+   * `GitCache.recordMemoryPark` returned `settled` for this flight's own hold, so the record is the one the lock-held
+   * journal confirmation proves. Posts only when the entry is still this run's pending one, the feature is negotiated and
+   * the bytes fit the server cap; the entry stores {bytes, sha256, clonePath, attemptId} BEFORE the first request.
+   * One fresh boundary deadline capped by shutdown, at most two attempts, transient failures only. Never throws, and no
+   * outcome (any status, a lost answer, a timeout) changes the entry: only a later claim's reference may. Returns whether a
+   * request was attempted.
+   */
+  private async deliverMemoryParkSettlement(
+    flight: RunFlight, runLog: Logger, entry: OwnMemoryPark, confirmed: MemoryParkRecord,
+    clonePath: string, attemptId: string | undefined,
+  ): Promise<boolean> {
+    if (entry.state !== "pending" || this.ownMemoryParks.get(flight.runId) !== entry ||
+        !this.client.hasFeature("memory_park_settlement_v1")) return false;
+    let bytes: string;
+    try { bytes = serializeMemoryPark(confirmed); } catch { return false; }
+    if (Buffer.byteLength(bytes, "utf8") > MEMORY_PARK_SETTLEMENT_MAX_BYTES) {
+      runLog.warn("memory park settlement exceeds the server cap; not delivered");
+      return false;
+    }
+    entry.bytes = bytes;
+    entry.sha = createHash("sha256").update(bytes, "utf8").digest("hex");
+    entry.clonePath = clonePath;
+    entry.attemptId = attemptId ?? null;
+    const give = new AbortController();
+    const start = Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const arm = () => {
+      if (timer) clearTimeout(timer);
+      const deadline = Math.min(start + this.codexBoundaryDeadlineMs, this.shutdownDeadlineAt ?? Infinity);
+      timer = setTimeout(() => give.abort(), Math.max(0, deadline - Date.now()));
+    };
+    this.shutdownSignal.signal.addEventListener("abort", arm, { once: true });
+    arm();
+    try {
+      for (let attempt = 0; attempt < 2 && !give.signal.aborted; attempt++) {
+        try {
+          await this.client.reportMemoryParkSettlement(flight.runId, bytes, give.signal);
+          runLog.info("memory park settlement delivered", { claim_generation: confirmed.binding.claimGeneration });
+          return true;
+        } catch (error) {
+          const status = error instanceof RequestError ? error.status : undefined;
+          runLog.warn("memory park settlement not delivered", { attempt, ...(status === undefined ? {} : { status }) });
+          if (!isTransient(error)) return true;
+        }
+      }
+    } catch { /* never throws: delivery is best effort */ }
+    finally {
+      this.shutdownSignal.signal.removeEventListener("abort", arm);
+      if (timer) clearTimeout(timer);
+    }
+    return true;
+  }
+
+  /** issue #3639: drop entries of an older registration nonce: their reference can never come back to this incarnation. */
+  private dropStaleOwnMemoryParks(): void {
+    const nonce = this.client.memoryIncarnation?.register_nonce;
+    for (const [runId, entry] of this.ownMemoryParks) {
+      if (entry.binding.register_nonce !== nonce) this.ownMemoryParks.delete(runId);
+    }
+  }
+
+  /**
+   * issue #3639: the pending entry for a freshly accepted park of `runId`, replacing any older one. At most
+   * {@link OWN_MEMORY_PARKS_MAX} entries: a consumed entry is evicted oldest-first, a pending one never; a table full of
+   * pending entries creates nothing (and so no receipt is ever sent for that park).
+   */
+  private createOwnMemoryPark(runId: string, binding: MemoryParkWitness["binding"]): OwnMemoryPark | undefined {
+    this.dropStaleOwnMemoryParks();
+    this.ownMemoryParks.delete(runId);
+    if (this.ownMemoryParks.size >= OWN_MEMORY_PARKS_MAX) {
+      const victim = [...this.ownMemoryParks].find(([, entry]) => entry.state === "consumed");
+      if (!victim) return undefined;
+      this.ownMemoryParks.delete(victim[0]);
+    }
+    const entry: OwnMemoryPark = { state: "pending", binding };
+    this.ownMemoryParks.set(runId, entry);
+    return entry;
   }
 
   private retainWorkerMemoryCustody(flight: RunFlight): void {
@@ -22061,7 +22262,11 @@ export class RunRunner {
         }, "cancel", "strict");
         if (result.kind !== "observed_empty") throw new RetainedRecoveryStop();
         // The only witness writer. The intervention ids are the ones the hold captured synchronously (empty for an exhausted allowance).
-        if (carried.binding) memory.parkWitness = Object.freeze({ origin: hold.origin, binding: carried.binding, interventionIds: hold.interventionIds });
+        if (carried.binding) {
+          memory.parkWitness = Object.freeze({ origin: hold.origin, binding: carried.binding, interventionIds: hold.interventionIds });
+          // issue #3639: the run's own settled-park entry exists from the witness on, and only for this hold's own origin.
+          if (memory.parkWitness.origin === hold.origin) memory.ownPark = this.createOwnMemoryPark(flight.runId, carried.binding);
+        }
         flight.parked = true;
       });
     } catch {
@@ -22910,16 +23115,53 @@ export class RunRunner {
    * credential-switch protocol (which reports its own switch state, never `failed`); every other outcome (a stale claim or
    * checker-parent change, a wall-parked ACK, pause, cancel or claim fence, the deadline, a transport failure, no binding)
    * stops the claim nonterminally with custody retained and no `failed` report. The teardown producer records what was
-   * sent or confirmed (`flight.memoryRepark`).
+   * sent or confirmed (`flight.memoryRepark`). Also the issue #3639 F1 outcome (the receipt's guard sample never arrived).
    */
   private async parkMemoryContinuationRefused(claim: ClaimResponse, flight: RunFlight, source: RecoveryJournalEntry,
     owner: { authorityIncarnation: string; sourceEpoch: string }): Promise<never> {
-    const incarnation = this.client.memoryIncarnation!;
-    const wire: MemoryParkWitness["binding"] = Object.freeze({ run_id: flight.runId, worker_id: incarnation.worker_id,
-      register_nonce: incarnation.register_nonce, claim_generation: flight.claimGeneration, memory_episode: claim.memory_episode! });
     const repark: NonNullable<RunFlight["memoryRepark"]> = { ...owner, attemptId: source.attemptId ?? null };
     flight.memoryRepark = repark;
     this.retainWorkerMemoryCustody(flight);
+    return this.reportMemoryContinuationPark(claim, flight,
+      "retained predecessor's memory continuation is unproven; re-parking for the owner instead of failing", {
+        sent: wire => { repark.sent = wire; },
+        confirmed: wire => { repark.confirmed = wire; },
+      });
+  }
+
+  /**
+   * issue #3639 F2/F3 - the owner-held outcome of a memory-receipt claim that cannot continue (a reference or entry that
+   * does not match, a receipt source that is absent, foreign, changed, stopped or no longer settled). Same authenticated
+   * park report at the claim's own binding as {@link parkMemoryContinuationRefused}, but with NO `memoryRepark` and no
+   * coordinates: the teardown producer and the owed-candidate retention write nothing, and no journal, bare, authority,
+   * ledger or source write happens. ALWAYS throws. A park the server accepted removes the run's own entry (the newer
+   * park supersedes the receipt); anything else keeps it pending.
+   */
+  private async parkMemoryGateRefused(claim: ClaimResponse, flight: RunFlight, kind: "F2" | "F3", reason: string): Promise<never> {
+    flight.memoryGateRefused = true;
+    this.retainWorkerMemoryCustody(flight);
+    let accepted = false;
+    try {
+      return await this.reportMemoryContinuationPark(claim, flight,
+        `memory receipt continuation refused (${kind}: ${reason}); re-parking for the owner instead of continuing`, {
+          sent: () => {},
+          confirmed: () => { accepted = true; },
+        });
+    } catch (error) {
+      if (!accepted && !(error instanceof CredentialSwitchSignal)) {
+        flight.runLog.warn("memory receipt continuation refused; park report not accepted", { kind });
+      }
+      throw error;
+    }
+  }
+
+  /** The shared park report of {@link parkMemoryContinuationRefused} and {@link parkMemoryGateRefused}. Always throws. */
+  private async reportMemoryContinuationPark(claim: ClaimResponse, flight: RunFlight, message: string,
+    hooks: { sent: (wire: MemoryParkWitness["binding"]) => void; confirmed: (wire: MemoryParkWitness["binding"]) => void }): Promise<never> {
+    const incarnation = this.client.memoryIncarnation;
+    if (!incarnation || !Number.isSafeInteger(claim.memory_episode)) throw new RetainedRecoveryStop();
+    const wire: MemoryParkWitness["binding"] = Object.freeze({ run_id: flight.runId, worker_id: incarnation.worker_id,
+      register_nonce: incarnation.register_nonce, claim_generation: flight.claimGeneration, memory_episode: claim.memory_episode! });
     const deadline = Date.now() + this.codexBoundaryDeadlineMs;
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(new Error("memory continuation park deadline exhausted")),
@@ -22927,22 +23169,23 @@ export class RunRunner {
     const signal = AbortSignal.any([this.retainedLifecycleSignal(flight), timeout.signal]);
     const body: StateRequest = { status: "recovery_wait", recovery_cause: "worker_memory_pressure",
       register_nonce: wire.register_nonce, claim_generation: wire.claim_generation, memory_episode: wire.memory_episode };
-    flight.runLog.warn("retained predecessor's memory continuation is unproven; re-parking for the owner instead of failing", {
-      claim_generation: flight.claimGeneration, memory_episode: wire.memory_episode });
+    flight.runLog.warn(message, { claim_generation: flight.claimGeneration, memory_episode: wire.memory_episode });
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         this.retainedLifecycleGuard(flight);
         signal.throwIfAborted();
         try {
           // Latched immediately before the report: a lost ACK still leaves evidence that a park may have landed.
-          repark.sent = wire;
+          hooks.sent(wire);
           const ack = await flight.reportState(body, signal);
           this.retainedLifecycleGuard(flight);
           const accepted = ack.memoryParkAccepted;
           if (accepted && accepted.run_id === wire.run_id && accepted.worker_id === wire.worker_id &&
               accepted.register_nonce === wire.register_nonce && accepted.claim_generation === wire.claim_generation &&
               accepted.memory_episode === wire.memory_episode) {
-            repark.confirmed = wire;
+            hooks.confirmed(wire);
+            // issue #3639: a park accepted at the claim's own binding supersedes any earlier receipt of this run.
+            this.ownMemoryParks.delete(flight.runId);
             flight.parked = true;
             throw new RetainedRecoveryStop();
           }
@@ -22972,11 +23215,191 @@ export class RunRunner {
     } finally { clearTimeout(timer); }
   }
 
+  private sameOwnMemoryPark(entry: OwnMemoryPark, ref: MemoryParkReference): boolean {
+    return entry.sha !== undefined && ref.settlement_sha256 === entry.sha &&
+      ref.claim_generation === entry.binding.claim_generation && ref.memory_episode === entry.binding.memory_episode &&
+      ref.worker_id === entry.binding.worker_id && ref.register_nonce === entry.binding.register_nonce;
+  }
+
+  /**
+   * issue #3639 - what this claim's memory-park reference (or its absence) means, from this worker's own entry for the
+   * run. Synchronous and read-only apart from dropping entries of an older registration nonce and refreshing a consumed
+   * entry's age.
+   *
+   * | entry    | reference          | outcome                                      |
+   * | pending  | equal (binding+S)  | gate, then handoff                           |
+   * | pending  | different or none  | refuse (F2)                                  |
+   * | consumed | equal or none      | ordinary flow (historical, no new authority) |
+   * | consumed | different          | refuse (F2)                                  |
+   * | none     | present            | refuse (F2)                                  |
+   * | none     | none               | ordinary flow                                |
+   */
+  private memoryReceiptDecision(claim: ClaimResponse):
+    { kind: "ordinary" } | { kind: "gate"; entry: OwnMemoryPark } | { kind: "refuse"; reason: string } {
+    this.dropStaleOwnMemoryParks();
+    const ref = claim.memory_park_reference;
+    const entry = this.ownMemoryParks.get(claim.run_id);
+    if (!entry) return ref ? { kind: "refuse", reason: "the reference names a park this worker has no record of" } : { kind: "ordinary" };
+    if (entry.state === "consumed") {
+      if (!ref) return { kind: "ordinary" };
+      if (!this.sameOwnMemoryPark(entry, ref)) return { kind: "refuse", reason: "the reference differs from the consumed park" };
+      this.ownMemoryParks.delete(claim.run_id);
+      this.ownMemoryParks.set(claim.run_id, entry);
+      return { kind: "ordinary" };
+    }
+    if (!ref) return { kind: "refuse", reason: "the pending park has no reference" };
+    return this.sameOwnMemoryPark(entry, ref) ? { kind: "gate", entry }
+      : { kind: "refuse", reason: "the reference differs from the pending park" };
+  }
+
+  /**
+   * issue #3639 D6 - the receipt gate, run once at the top of {@link phaseClone} (after the `running` report and steering
+   * start, before discovery and so before any source admission, memory context, reservation, capture or model turn). It
+   * never captures worker memory. Returns for an ordinary claim or when (a) through (d) pass, leaving
+   * `flight.memoryReceipt`; every other outcome ends in a nonterminal stop with custody retained (see
+   * {@link parkMemoryGateRefused} and {@link parkMemoryContinuationRefused}). Custody is retained before the first await.
+   *
+   * (a) the reference equals the entry's binding and S, the claim is the parked generation's next episode, the receipt's
+   *     authority incarnation is this one, and the lock-held journal confirmation succeeds;
+   * (b) every settled source slot still verifies (`verifyReceiptSlots`);
+   * (c) the memory guard produced a fresh valid sample after the gate began, armed and with no pending intervention,
+   *     within rearm + 2 * (sample + response budget), capped by shutdown and the flight lifecycle;
+   * (d) (b) again after the wait. A (c) timeout with (a) and (d) intact is F1, a re-park through the existing D4 body.
+   */
+  private async memoryReceiptGate(claim: ClaimResponse, flight: RunFlight): Promise<void> {
+    const decision = this.memoryReceiptDecision(claim);
+    if (decision.kind === "ordinary") return;
+    this.retainWorkerMemoryCustody(flight);
+    if (decision.kind === "refuse") return this.parkMemoryGateRefused(claim, flight, "F2", decision.reason);
+    const entry = decision.entry;
+    const ref = claim.memory_park_reference!;
+    const f2 = (reason: string) => this.parkMemoryGateRefused(claim, flight, "F2", reason);
+    const f3 = (reason: string) => this.parkMemoryGateRefused(claim, flight, "F3", reason);
+    const memory = flight.workerMemory;
+    const runtime = this.memoryRuntime;
+    const authority = this.authority;
+    const incarnation = this.client.memoryIncarnation;
+    if (!memory || !runtime || !authority || !incarnation || memory.incarnation !== incarnation) {
+      return f2("no memory runtime, registration or authority to prove the receipt");
+    }
+    // (a)
+    if (!(ref.claim_generation < flight.claimGeneration) || typeof claim.memory_episode !== "number" ||
+        claim.memory_episode !== ref.memory_episode + 1) return f2("the claim is not the parked generation's next episode");
+    let record: MemoryParkRecord;
+    try {
+      if (entry.bytes === undefined || entry.clonePath === undefined) throw new Error("incomplete entry");
+      record = parseMemoryPark(JSON.parse(entry.bytes));
+      const b = record.binding;
+      if (serializeMemoryPark(record) !== entry.bytes || record.ack !== "confirmed" || record.settlement?.confirmed !== true ||
+          b.runId !== claim.run_id || b.claimGeneration !== entry.binding.claim_generation ||
+          b.workerId !== entry.binding.worker_id || b.registerNonce !== entry.binding.register_nonce ||
+          b.memoryEpisode !== entry.binding.memory_episode) throw new Error("entry does not match its record");
+    } catch { return f2("the stored receipt is not a settled record of this park"); }
+    const settlement = record.settlement!;
+    const authorityIncarnation = authority.authorityIncarnation();
+    if (authorityIncarnation === undefined || record.origin.authorityIncarnation !== authorityIncarnation) {
+      return f2("the receipt was produced by another authority incarnation");
+    }
+    let bare: string, branch: string;
+    try {
+      bare = this.git.barePathFor(claim.repo.clone_url);
+      branch = this.cloneCoordinates(claim).branch;
+    } catch { return f2("the claim names no retained branch"); }
+    const clonePath = entry.clonePath!;
+    const attemptId = record.origin.attemptId ?? undefined;
+    const confirmedRead = await this.git.readConfirmedMemoryPark(bare, branch,
+      { runId: claim.run_id, clonePath, ...(attemptId === undefined ? {} : { attemptId }), record },
+      { signal: AbortSignal.any([this.retainedLifecycleSignal(flight), AbortSignal.timeout(this.codexBoundaryDeadlineMs)]) });
+    this.retainedLifecycleGuard(flight);
+    if (!confirmedRead) return f2("the journal no longer confirms the receipt");
+    // (b)
+    const sink = (flight.sourceUsePaths ??= new Set<string>());
+    const slotsHold = async (): Promise<boolean> => {
+      const held = await authority.verifyReceiptSlots(settlement.sources, record.origin.authorityIncarnation, sink,
+        this.authorityWait(flight));
+      this.retainedLifecycleGuard(flight);
+      return held;
+    };
+    if (!await slotsHold()) return f3("a settled source slot no longer verifies");
+    // (c)
+    let sampled = false;
+    const timing = this.memoryGuardTiming;
+    if (timing) {
+      const lifecycle = this.retainedLifecycleSignal(flight);
+      const start = runtime.guardObservation().seq;
+      let deadline = runtime.now() + timing.rearmMs + 2 * (timing.sampleMs + timing.responseBudgetMs);
+      if (this.shutdownDeadlineAt !== undefined) {
+        deadline = Math.min(deadline, runtime.now() + Math.max(0, this.shutdownDeadlineAt - Date.now()));
+      }
+      for (;;) {
+        const seen = runtime.guardObservation();
+        // The CURRENT sample must be valid (validSeq === seq) and newer than the gate's start.
+        if (seen.validSeq > start && seen.validSeq === seen.seq && seen.armed && !seen.pendingIntervention) { sampled = true; break; }
+        const outcome = await runtime.waitGuardSample(seen.seq, deadline, lifecycle);
+        this.retainedLifecycleGuard(flight);
+        if (outcome === "aborted") throw new RetainedRecoveryStop();
+        if (outcome === "timeout") break;
+      }
+    }
+    // (d)
+    if (!await slotsHold()) return f3("a settled source slot changed while the guard was sampled");
+    if (this.client.memoryIncarnation !== incarnation) return f2("the memory registration changed while the guard was sampled");
+    if (!sampled) {
+      // F1: the receipt is intact but the guard produced no fresh valid sample in time. Re-park through the existing D4 body.
+      flight.barePath = bare;
+      flight.branch = branch;
+      flight.worktreePath = clonePath;
+      flight.attemptId = attemptId;
+      return this.parkMemoryContinuationRefused(claim, flight,
+        { runId: claim.run_id, clonePath, ...(attemptId === undefined ? {} : { attemptId }) } as RecoveryJournalEntry,
+        { authorityIncarnation: record.origin.authorityIncarnation, sourceEpoch: record.origin.sourceEpoch });
+    }
+    flight.memoryReceipt = Object.freeze({ entry, record });
+  }
+
+  /**
+   * issue #3639 D6 - between expected-bound discovery and `recoverRetainedClaim`, before any coordinate is assigned: (e1) the
+   * discovered source is exactly the receipt's, (e2) the settled slots verify afresh, (e3) the clone is admissible and not
+   * held by another sink. Any failure is F3 and leaves the entry pending. Only a full pass assigns the flight's bare and
+   * attempt-path coordinates and consumes the entry.
+   */
+  private async memoryReceiptHandoff(claim: ClaimResponse, flight: RunFlight, source: RecoveryJournalEntry, bare: string): Promise<void> {
+    const { entry, record } = flight.memoryReceipt!;
+    const authority = this.authority;
+    const f3 = (reason: string) => this.parkMemoryGateRefused(claim, flight, "F3", reason);
+    let identical = false;
+    try {
+      identical = source.memoryPark !== undefined && serializeMemoryPark(source.memoryPark) === entry.bytes;
+    } catch { identical = false; }
+    if (!authority || source.runId !== claim.run_id || source.clonePath !== entry.clonePath ||
+        (source.attemptId ?? null) !== record.origin.attemptId || !identical) {
+      return f3("the discovered source is not the receipt's");
+    }
+    const sink = (flight.sourceUsePaths ??= new Set<string>());
+    const held = await authority.verifyReceiptSlots(record.settlement!.sources, record.origin.authorityIncarnation, sink,
+      this.authorityWait(flight));
+    this.retainedLifecycleGuard(flight);
+    if (!held) return f3("a settled source slot no longer verifies at handoff");
+    const admission = await authority.classifySourceAdmission(source.clonePath, sink, this.authorityWait(flight));
+    this.retainedLifecycleGuard(flight);
+    if (admission.kind !== "admissible" || authority.heldByOtherSink(source.clonePath, sink)) {
+      return f3("the receipt's clone is not admissible at handoff");
+    }
+    flight.barePath = bare;
+    flight.effectiveAttemptPaths = true;
+    entry.state = "consumed";
+    if (this.ownMemoryParks.get(claim.run_id) === entry) {
+      this.ownMemoryParks.delete(claim.run_id);
+      this.ownMemoryParks.set(claim.run_id, entry);
+    }
+  }
+
   /**
    * issue #3638 D3 - diagnostics only: when the predecessor's journal carries a memory-park settlement, log whether
    * the lock-confirmed record AND the authority's ended slots still agree with it. The answer authorizes nothing here
-   * (no admission, capture, publication, custody release or Resume); server delivery and consumption are #3639.
-   * Never throws.
+   * (no admission, capture, publication, custody release or Resume). Server delivery and consumption of the settlement
+   * are the receipt gate and handoff (issue #3639, {@link memoryReceiptGate}), which run before this and decide on their
+   * own evidence; this log is neither input nor output of that decision. Never throws.
    */
   private async logPredecessorMemorySettlement(flight: RunFlight, bare: string, branch: string, source: RecoveryJournalEntry): Promise<void> {
     const record = source.memoryPark;

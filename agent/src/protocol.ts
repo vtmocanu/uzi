@@ -1450,6 +1450,20 @@ export interface ClaimMemoryState {
   memory_episode?: number;
   memory_intervention_count?: number;
   memory_policy?: MemoryPolicy | null;
+  /** issue #3639: the server's reference to the settled memory park it stored for this worker incarnation. Keyed by
+   *  the PARKED generation (`claim_generation` names the park, not the current claim); sent on every later claim
+   *  until a foreign claim or a newer park supersedes it. A claim carrying a malformed one has it removed by the
+   *  client decode. The runner compares it against its own park entry; it grants no authority by itself. */
+  memory_park_reference?: MemoryParkReference;
+}
+
+/** issue #3639: `settlement_sha256` is the lowercase hex sha256 of the exact bytes the worker posted. */
+export interface MemoryParkReference {
+  claim_generation: number;
+  memory_episode: number;
+  worker_id: string;
+  register_nonce: string;
+  settlement_sha256: string;
 }
 
 export interface ForgeOriginReservation {

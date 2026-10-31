@@ -375,6 +375,11 @@ export class CodexOperationAdmissionError extends Error {
   }
 }
 
+/** issue #3639: a 2xx settlement answer that does not echo the sha256 of the posted bytes. Definite, never retried. */
+class MemorySettlementResponseError extends Error {
+  constructor() { super("memory park settlement response did not match the posted bytes"); this.name = "MemorySettlementResponseError"; }
+}
+
 export class RequestError extends Error {
   constructor(
     readonly method: string,
@@ -1156,6 +1161,28 @@ function validateClaimMemory(value: unknown): void {
   }
 }
 
+/** issue #3639: the exact bytes of a body that is already serialized; `fetchRaw` sends them unchanged. */
+class RawJsonBody {
+  constructor(readonly text: string) {}
+}
+
+/**
+ * issue #3639: a present, well-formed `memory_park_reference` stays; a malformed one is removed (with a warning that
+ * never echoes the value). Removal is safe for every consumer: an absent reference never creates or consumes a
+ * receipt, and the runner treats a pending own-park entry without a reference as unproven.
+ */
+function dropMalformedMemoryParkReference(claim: unknown, log: Pick<Logger, "warn">): void {
+  if (!isRecord(claim) || !("memory_park_reference" in claim)) return;
+  const r = claim.memory_park_reference;
+  const ok = isRecord(r) && Object.keys(r).length === 5 &&
+    memoryNatural(r.claim_generation) && r.claim_generation > 0 && memoryNatural(r.memory_episode) &&
+    memoryUUID(r.worker_id) && memoryNonce(r.register_nonce) &&
+    typeof r.settlement_sha256 === "string" && /^[0-9a-f]{64}$/.test(r.settlement_sha256);
+  if (ok) return;
+  delete claim.memory_park_reference;
+  log.warn("claim memory_park_reference is malformed; ignoring it", { run_id: claim.run_id });
+}
+
 function memoryOutcome(value: unknown): value is MemoryOutcome {
   return value === "no_signal" || value === "unknown" || value === "confirmed_drained";
 }
@@ -1437,6 +1464,22 @@ export class WorkerClient {
     const binding = memoryBinding(request);
     if (!memoryOutcome(request.outcome)) throw memoryError();
     return this.memoryRequest("outcome", { ...binding, outcome: request.outcome }, signal, timeoutMs);
+  }
+
+  /**
+   * issue #3639: post the exact bytes of a settled memory-park record (`serializeMemoryPark` of the journal form) to
+   * `/memory/settlement`. Resolves only on a 2xx whose `settlement_sha256` equals the sha256 of the posted bytes;
+   * every other outcome throws (a {@link RequestError} for an HTTP refusal, so the caller can tell a transient status
+   * from a definite one). The caller decides retries; this makes exactly one request and keeps no state.
+   */
+  async reportMemoryParkSettlement(runId: string, bytes: string, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<void> {
+    if (!this.hasFeature("memory_park_settlement_v1") || !memoryUUID(runId) || !Number.isInteger(timeoutMs) ||
+        timeoutMs <= 0 || timeoutMs > 2147483647) throw memoryError();
+    const raw = await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/memory/settlement`, new RawJsonBody(bytes),
+      timeoutMs, signal, 4096);
+    if (!isRecord(raw) || raw.settlement_sha256 !== createHash("sha256").update(bytes, "utf8").digest("hex")) {
+      throw new MemorySettlementResponseError();
+    }
   }
 
   private async memoryRequest(kind: "reserve" | "outcome", body: MemoryReservationRequest | MemoryOutcomeRequest, signal: AbortSignal | undefined, timeoutMs: number): Promise<MemoryReservation> {
@@ -2028,6 +2071,7 @@ export class WorkerClient {
       }
       deadline.throwIfAborted();
       validateClaimMemory(claim);
+      dropMalformedMemoryParkReference(claim, this.log);
       this.dropUnknownDefaultEffort(claim);
       if (isRecord(claim) && claim.inventory_guarded !== undefined &&
           (typeof claim.inventory_guarded !== "boolean" ||
@@ -4839,7 +4883,7 @@ export class WorkerClient {
         ? AbortSignal.any([callerSignal, maintenanceSignal(timeoutMs)])
         : maintenanceSignal(timeoutMs),
     };
-    if (body !== undefined) init.body = JSON.stringify(body);
+    if (body !== undefined) init.body = body instanceof RawJsonBody ? body.text : JSON.stringify(body);
     return maintenanceFetch(this.transport ?? fetch, this.baseUrl + path, init);
   }
 
@@ -5499,7 +5543,8 @@ export function isTransientStatus(status: number): boolean {
  *  2xx pr-description response, {@link PrDescriptionMalformedResponse}). */
 export function isTransient(err: unknown): boolean {
   // A malformed 2xx pr-description body: the api answered, so retrying could re-apply a write.
-  if (err instanceof PrDescriptionMalformedResponse || err instanceof ResponseBodyOverflowError) return false;
+  if (err instanceof PrDescriptionMalformedResponse || err instanceof ResponseBodyOverflowError ||
+      err instanceof MemorySettlementResponseError) return false;
   if (err instanceof RequestError) {
     return isTransientStatus(err.status);
   }

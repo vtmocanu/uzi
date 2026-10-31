@@ -997,7 +997,9 @@ export class Worker {
           // gate. The API holds a custom-root Codex run for a worker that lacks it.
           protocolCapabilities.push(CODEX_CUSTOM_MODEL_CAPABILITY);
         }
-        if (this.config.memoryGuard?.enabled) protocolCapabilities.push("worker_memory_pressure_v1", "worker_memory_authority_claim_v1");
+        // issue #3639: the settlement capability rides only with the pressure capability (the same guard), so a worker
+        // that cannot park for memory never offers to deliver a settlement receipt.
+        if (this.config.memoryGuard?.enabled) protocolCapabilities.push("worker_memory_pressure_v1", "worker_memory_authority_claim_v1", "memory_park_settlement_v1");
         if (this.config.crossCheckSlots > 0) {
           protocolCapabilities.push("cross_check_lane_v1");
           if (this.crossCheckRunner && this.config.codexHarness?.advertise) protocolCapabilities.push("cross_check_code_v1");
