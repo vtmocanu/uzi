@@ -1,6 +1,6 @@
 # Automatic hold settlement
 
-Status: programme/design record for epic #2746, 2026-10-15. This umbrella is not one implementation run or one PR. Each child is an independently useful slice; unresolved child design blocks that child, not the whole record.
+Status: ACTIVE programme/design record for epic #2746, 2026-10-15. This umbrella is not one implementation run or one PR. Each child is an independently useful slice; unresolved child design blocks that child, not the whole record.
 
 ## Problem and outcome
 
@@ -19,6 +19,8 @@ Successful and cancelled runs require no routine cleanup. Failed work is preserv
 | 2026-10-15 | S1 adopted by the maintainer: discard only the exact finally rejected run/generation/gate revision; every earlier generation, approved or not, preserves automatically. | Ordinary held publication (#2796), else archive; no approval-history lookup, provenance storage or history-based refusal class. |
 | 2026-10-15 | Unbound first-gate reject: option a adopted; authority exists only at the proven atomic closure of awaiting_approval R > 0 in G with no incoming-transfer veto. | Approve-wins, moved-on, R=0/legacy and transfer-veto cases preserve; no reconstruction from diagnostic stamps. |
 | 2026-10-15 | Completed-without-receipt inventory stays archive-first; held publication only after a thin capture or a typed oversize/quota refusal. Failed and cancelled stay held-first. | Maintainer choice (a) over a uniform held-first order: successful work is not published by default. |
+| 2026-10-30 | The approved #3654 policy adds narrow cross-run `same_issue_witness` merge-discard policy. | Explicit exception to failed/cancelled preservation, not proof of preservation; full eligibility, vetoes and bounds in the [ADR-2506 amendment](../adr/2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654). Approval alone does not establish implementation or acceptance; implementation is recorded separately below. |
+| 2026-10-30 | #3654 implements narrow cross-run policy discard, not preservation. | Integration coverage uses the real reconciler and LiveDB with a Go fake forge, not the Compose HTTPS fake; see the [ADR-2506 coverage and rollout boundaries](../adr/2506-merged-predecessor-discard.md#coverage-and-rollout-boundaries). This does not establish programme completion. #3001/#3031/#2969/#2884 ownership and pending acceptance remain unchanged. |
 
 The maintainer's direction, as recorded by the lead: hold settlement is automatic with no routine manual discard; cancelled work is published to held refs that follow the repository's visibility; rejected plan work is discarded. The earlier scope refinement was subsequently superseded by the maintainer's S1 decision recorded above.
 
@@ -32,7 +34,7 @@ Reuse one reconciliation loop and shipped evidence producers; keep SETTLE and CL
 |---|---|
 | Live / parked / awaiting approval | Protect current work; earlier generations settle only on proven transfer or independent preservation. |
 | Completed | Reconcile all custody-bearing kinds/generations; use valid evidence or preserve then release. Apply #2506-D only within its exact merge-discard scope. |
-| Cancelled / failed | Prefer qualifying held publication; otherwise qualifying archive/verified-empty evidence. Settle only after durable complete-inventory evidence. |
+| Cancelled / failed | Prefer qualifying held publication; otherwise qualifying archive/verified-empty evidence. Require durable complete-inventory evidence except for the approved 2026-10-30 `same_issue_witness` policy exception: eligible issue custody may be intentionally discarded after fresh verification of a later same-issue merged witness and locked veto checks. See [ADR-2506](../adr/2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654); unique work may be lost. |
 | Final plan rejection | Only the exact rejected generation may discard; earlier work preserves. Final-rejection authority must be decided and recorded atomically in the terminal reject transition from its locked pre-transition state (awaiting_approval, gate_revision R > 0, claim generation G), when that transition settles the reject that actually closes that gate; rejected generation is G, never reconstructed later from stop_kind, fail_origin or gate_revision. If any earlier generation was released into the rejected generation's custody (release_evidence='live_ancestry' with release_successor_generation equal to G, or a future transfer-based release under #2969), refuse policy discard and preserve normally; derive this from existing hold rows, not approval history. Maintainer decision (2026-10-15, option a): an unbound first-gate reject is final-rejection authority only when the atomic reject transition proves awaiting_approval at gate_revision R > 0 in generation G, that particular reject closed that gate, and the live-ancestry/transfer veto permits discard; every other case preserves. Source/pin cleanup retains independent guards. |
 | Preservation refusal / uncertainty | Keep protected, reconcile and retry/repair within durable bounds; surface reason and artifact expiry. No timeout discard. |
 
@@ -71,7 +73,7 @@ The order is rollout/review order, not an instruction to implement every child i
 
 ### M0: merged predecessors settle (#2506-D, in flight)
 
-Blocked by: none beyond its existing readiness requirements. Accept exact merged-PR/run/owner/repository binding, strictly earlier generations, idempotent recorded policy discard, and refusal for unrelated/current/later holds. Physical cleanup remains separate.
+Blocked by: none beyond its existing readiness requirements. Existing same-run Option D requires exact merged-PR/run/owner/repository binding, strictly earlier generations, idempotent recorded policy discard, and refusal for unrelated/current/later holds. The approved 2026-10-30 #3654 policy amendment adds a distinct cross-run `same_issue_witness` basis through the target's terminal generation inclusive, without comparing generations across runs; see [ADR-2506](../adr/2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654). The narrow cross-run implementation does not complete the broader M0 acceptance. Programme M1/#3001 remains independent. Physical cleanup remains separate; #3031 preservation, #2969 live transfer and #2884 plan rejection keep their ownership and pending acceptance.
 
 ### M1: orphaned revisions resolve (#3001)
 

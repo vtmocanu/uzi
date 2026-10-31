@@ -10,6 +10,21 @@ the full Decision Log (D1-D9), the milestone breakdown and the verified code anc
 ADR restates the invariants a future edit to a claim clause, a custody-release path or a
 cleanup guard must not silently break.
 
+## Amendment 2026-10-30 — same-issue witness policy
+
+The approved #3654 policy adds the narrow cross-run `basis = same_issue_witness` to existing
+`merged_predecessor_discard` evidence. A failed/cancelled issue run without a
+recorded MR may abandon its OPEN custody after a distinct later completed run
+of the same owner/repository/positive own issue is freshly verified merged,
+subject to locked identity, live-run, dependency and publication vetoes. This is
+intentional loss policy, including unique work, not preservation proof. Available
+archives keep bytes, prerequisites and existing TTL; no new retention window,
+source/PVC guarantee or worker deletion authority follows. Same-run Option D,
+including issue-less completions, is unchanged. See the complete
+[ADR-2506 amendment](2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654)
+for eligibility, refusals, accepted races and bounds.
+#3031/#2969/#2884 retain their separate scope.
+
 ## Amendment 2026-10-14 — merged predecessor server discard (#2506)
 
 The maintainer selected the narrow policy in [ADR-2506](2506-merged-predecessor-discard.md):

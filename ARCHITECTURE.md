@@ -1698,6 +1698,24 @@ chain in the diagram above, with no intervening `running`.
   nonclosing. See [ADR-2506](adr/2506-merged-predecessor-discard.md) for cursors,
   accepted tick coalescing, inherited response-byte risk, migration CHECK scans
   under ACCESS EXCLUSIVE and rollback refusal to erase audit evidence.
+  The approved 2026-10-30 #3654 policy adds cross-run `basis = same_issue_witness`
+  using that same evidence and phase. Eligible failed/cancelled issue custody
+  without a recorded MR may be discarded using a distinct later same-owner/repo/
+  own-issue completed run's freshly verified merged MR. Locked live-run,
+  dependency and publication vetoes apply; unique work may be lost intentionally.
+  Available archives keep their existing TTL; this adds no worker authority or
+  source/PVC guarantee. Same-run Option D remains unchanged, including issue-less
+  completions. See the [ADR-2506 amendment](adr/2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654)
+  for the complete policy, shared bounds and accepted races. Recovery locks
+  all-state A inventory in generation/id order with NO KEY UPDATE, then
+  publications, then non-ready
+  captures; only qualifying OPEN holds through A's terminal generation discard.
+  The 1000-row inventories plus overflow probes bound fetched work, not all SQL
+  scans: generic issue-history filtering and shared-FINAL global history scans
+  remain cost boundaries. Migration 00386 extends only the universal binding
+  guard with the 19-field witness audit; the evidence CHECK and current 00340
+  inventory guard stay unchanged. No DTO, route, CLI or worker protocol changes.
+  #3031/#2969/#2884 retain their scope.
   A completed run's guarded archive can expire early as `published_redundant`
   when the API proves through the forge that the run's published branch already
   contains everything it retains (#2625; worker claim, API proof, bytes and
