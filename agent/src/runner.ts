@@ -1993,6 +1993,11 @@ function checkpointErrorDiagnostic(
         case "ECONNRESET": causeClass = "connection_reset"; break;
         case "ETIMEDOUT": case "UND_ERR_CONNECT_TIMEOUT":
         case "UND_ERR_HEADERS_TIMEOUT": case "UND_ERR_BODY_TIMEOUT": causeClass = "timeout"; break;
+        case "UND_ERR_SOCKET": case "UND_ERR_CLOSED": case "ECONNABORTED": causeClass = "connection_closed"; break;
+        case "EHOSTUNREACH": case "ENETUNREACH": case "EHOSTDOWN": case "ENETDOWN": causeClass = "network_unreachable"; break;
+        case "CERT_HAS_EXPIRED": case "UNABLE_TO_VERIFY_LEAF_SIGNATURE": case "DEPTH_ZERO_SELF_SIGNED_CERT":
+        case "SELF_SIGNED_CERT_IN_CHAIN": case "UNABLE_TO_GET_ISSUER_CERT_LOCALLY":
+        case "ERR_TLS_CERT_ALTNAME_INVALID": causeClass = "tls"; break;
       }
     }
     const message = typeof current === "string" ? current : checkpointErrorField(current, "message");
