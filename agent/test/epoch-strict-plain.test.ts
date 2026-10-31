@@ -5,7 +5,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { GitCache, type RetainedHoldsSnapshot, type RetainedLifecycleSnapshot, type RetainedSourceEvidence } from "../src/git.js";
-import { resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
+import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 
@@ -59,10 +59,13 @@ async function seed(n = 1) {
 function strictJournal(a: { attemptId: string; clonePath: string }): string {
   return JSON.stringify({ runId: RUN, clonePath: a.clonePath, attemptId: a.attemptId });
 }
-async function inspect(a: { attemptId: string }, over: { epoch?: boolean; holds?: RetainedHoldsSnapshot } = {}): Promise<RetainedSourceEvidence | undefined> {
+async function inspect(a: { attemptId: string }, over: { epoch?: boolean; holds?: RetainedHoldsSnapshot;
+  lifecycle?: RetainedLifecycleSnapshot | undefined; beforeTree?: (p: string) => void } = {}): Promise<RetainedSourceEvidence | undefined> {
   const r = await git.inspectRetainedSources({
-    selector: { runId: RUN, generation: 1, attempt: a.attemptId }, holds: over.holds ?? NO_HOLDS, lifecycle: TERMINAL,
+    selector: { runId: RUN, generation: 1, attempt: a.attemptId }, holds: over.holds ?? NO_HOLDS,
+    lifecycle: "lifecycle" in over ? over.lifecycle : TERMINAL,
     isLivePath: () => false, barePath: bare, ...(over.epoch === false ? {} : { epoch: true }),
+    ...(over.beforeTree ? { beforeTree: over.beforeTree } : {}),
   });
   assert.ok(r.sources.length <= 1);
   return r.sources[0];
@@ -159,6 +162,55 @@ describe("strict-plain epoch settlement", () => {
     assert.notEqual(unknown?.disposition.kind, "local_discard");
     const open = await settlementOf(a, { holds: { state: "read", holds: [{ id: "h1", generation: 1 }] } });
     assert.notEqual(open?.disposition.kind, "local_discard");
+  });
+
+  it("requires a positive terminal lifecycle verdict", async () => {
+    const a = await seed();
+    for (const status of ["completed", "failed", "cancelled"] as const) {
+      assert.equal((await settlementOf(a, { lifecycle: { state: "terminal", status } }))?.disposition.kind, "local_discard", status);
+    }
+    const cases: Array<[string, RetainedLifecycleSnapshot | undefined]> = [
+      ["running", { state: "not_terminal", status: "running" }],
+      ["unknown", { state: "unknown" }],
+      ["absent", undefined],
+    ];
+    for (const [name, lifecycle] of cases) assert.equal(await settlementOf(a, { lifecycle }), undefined, name);
+  });
+
+  it("keeps every other hard blocker: a quarantined worker is refused with the blocker named", async () => {
+    const a = await seed();
+    assert.equal((await settlementOf(a))?.disposition.kind, "local_discard");
+    latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
+    const s = await settlementOf(a);
+    assert.equal(s?.disposition.kind, "refused");
+    assert.ok((s!.disposition as { consumers: string[] }).consumers.includes("worker_quarantined"));
+  });
+
+  it("does not settle a reclaimed or abandoned attempt named by its exact plain journal", async () => {
+    const a = await seed();
+    const ledgerKey = `uzi-attempts.${BRANCH}.entry`;
+    const own = JSON.parse(gitIn(bare, ["config", "--local", "--get-all", ledgerKey]).split("\n").filter(l => l.includes(a.attemptId)).pop()!);
+    for (const state of ["reclaimed", "abandoned"]) {
+      gitIn(bare, ["config", "--local", "--add", ledgerKey, JSON.stringify({ ...own, state })]);
+      const ev = await inspect(a);
+      assert.equal(ev?.ledgerState, state, "last ledger entry wins");
+      assert.equal(ev?.epochSettlement, undefined, state);
+    }
+  });
+
+  it("clears the settlement when the tree binding check fails", async () => {
+    const a = await seed();
+    assert.ok(await settlementOf(a));
+    const r = await git.inspectRetainedSources({
+      selector: { runId: RUN, generation: 1, attempt: a.attemptId }, holds: NO_HOLDS, lifecycle: TERMINAL,
+      isLivePath: () => false, barePath: bare, epoch: true, beforeTree: () => { throw new Error("binding"); },
+    });
+    assert.equal(r.partial, true);
+    assert.ok(r.sources.length >= 1);
+    for (const s of r.sources) {
+      assert.equal(s.epochSettlement, undefined);
+      assert.equal(s.disposition, undefined);
+    }
   });
 
   it("operator inspection never sets it and reports exactly what an epoch read reports", async () => {

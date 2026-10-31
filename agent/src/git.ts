@@ -2008,7 +2008,7 @@ export interface RetainedSourceEvidence {
   localRecords: RetainedLocalRecord[];
   holds: { state: "read" | "unknown" | "not_read"; ids: string[] };
   disposition: RetainedDisposition | undefined;
-  /** Epoch inspections only: the disposition under the strict-plain basis (a stale `live` attempt named solely by its exact plain journal, nothing else on the clone key). Never set for operator inspection. */
+  /** Epoch inspections only: the disposition under the strict-plain basis. Defined only when the caller's lifecycle verdict is `terminal`, zero open holds are required for `local_discard` (an open or unknown hold yields another disposition), and a `live` ledger attempt is named solely by an active journal whose raw text equals `JSON.stringify` of its parse (any key order; duplicates and whitespace variants are rejected), with no other non-retired ledger entry on the same clone key. Never set for operator inspection. */
   epochSettlement?: { basis: "strict_plain"; disposition: RetainedDisposition };
 }
 
@@ -9484,10 +9484,13 @@ export class GitCache {
   }
 
   /**
-   * Read-only strict-plain test for an attempt record (epoch evaluation only): the active journal's
-   * raw bytes are exactly the canonical `{runId, clonePath, attemptId}` spelling for this attempt, it
-   * is the path's only namer, and no other non-retired ledger attempt shares the clone key. It
-   * never consults `journalState` or the shared digest.
+   * Read-only strict-plain test for an attempt record (epoch evaluation only): the active journal has
+   * exactly the keys `{runId, clonePath, attemptId}` matching this attempt, its raw text equals
+   * `JSON.stringify` of its parse (rejects duplicate keys and whitespace variants; any key order is
+   * accepted), it is the path's only namer, and no other non-retired ledger entry on the clone key
+   * (this ledger's entries for that key only) exists. It never consults `journalState` or the shared
+   * digest. The caller additionally requires a terminal lifecycle verdict and applies the ordinary
+   * hold rules (open or unknown holds never yield `local_discard`).
    */
   private strictPlainJournal(g: GatheredBare, rec: GatheredRecord): boolean {
     const part = rec.parts[0]!;
@@ -9659,8 +9662,8 @@ export class GitCache {
     };
     const disposition = decide(uniq);
     let epochSettlement: RetainedSourceEvidence["epochSettlement"];
-    if (this.epochRetained.getStore() && rec.kind === "attempt" && ownLedgerLive !== undefined && !pinConsumers &&
-        this.strictPlainJournal(g, rec)) {
+    if (this.epochRetained.getStore() && rec.kind === "attempt" && ctx.lifecycle?.state === "terminal" &&
+        ownLedgerLive !== undefined && !pinConsumers && this.strictPlainJournal(g, rec)) {
       const discounted = new Set([ownLedgerLive, ownNamed]);
       const settled = decide(uniq.filter((b) => !discounted.has(b)));
       if (settled !== undefined) epochSettlement = { basis: "strict_plain", disposition: settled };
