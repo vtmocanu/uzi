@@ -218,8 +218,11 @@ references. Changed runtime, API, SQL and package inputs require renewed validat
 no history rewrite, manual dependency installation or object reconstruction is allowed.
 
 The [PRD validation record](../prds/3607-compact-policy-refusal-hold.md#deferred-scope-and-final-validation)
-keeps local component, repository and unnarrowed LiveDB gates open. The new shared
-claim-route LiveDB test remains unrun, as do final F7 thread actions. Final
+records the successful current-branch strict agent, Codex M4 and complete seven-package
+LiveDB gates at 5b8a14f8, including the shared claim-route fixture. The API component
+inputs remain unchanged from its recorded successful gate. The expanded 125-file
+affected-agent selection, repository gate, default integration and final F7 thread
+actions remain open; changed merge inputs require renewed validation. Final
 published-head agent CI and comparable CI timing are separately pending. This is a
 partial checkpoint, not a completion claim or waiver of R3. Historical successful
 checks remain successful for their tested candidates. The final MR description
