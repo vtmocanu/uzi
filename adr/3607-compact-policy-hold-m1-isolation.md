@@ -208,9 +208,9 @@ it did not execute tests, scanners or independent repository verification. Final
 integration review and the merged rerun are pending. The PRD inventories failures, repairs, review limits and
 historical successes without treating them as final validation.
 
-Current-main integration remains required. Public REST observation on 2026-10-31
+At the worker checkpoint, current-main integration remained required. Public REST observation on 2026-10-31
 at 08:32:14 UTC found main at 01d624859f34c0fff969081fbc9eb50100776416; that commit
-object is absent locally. Its migration prefix 00386 collides with the feature's
+object was absent from that worker checkout. Its migration prefix 00386 collided with the feature's
 compact-policy migration. The worker must supply the fetched current tip and object;
 the agent cannot fetch over network Git. Integrate with git merge, inspect conflicts,
 then use task migration:renumber above the fetched live head and fix reported
@@ -252,11 +252,22 @@ or bypass that denial. Baseline reproduction has not executed; no passing baseli
 or unrelated/pre-existing classification is established.
 
 F7 thread reply 4426391039 and resolution of PRRT_kwDOUGFljs6yEQQM both returned
-success; those thread actions are complete. Default integration remains open:
-the missing live-main object prevents the approved merge, migration 00386 collision
+success; those thread actions are complete. At that worker checkpoint, default integration remained open:
+the missing live-main object prevented the approved merge, migration 00386 collision
 repair and merged-input revalidation. Changed merge inputs require renewed validation.
 VCI remains externally pending; final published-head agent CI and comparable CI
 timing are separately pending. This is a
 partial checkpoint, not a completion claim or waiver of R3. Historical successful
 checks remain successful for their tested candidates. The final MR description
 must preserve F5/m3 and M2/M3/I1 deferrals and report only observed results.
+
+Local integration on 2026-10-31 fetched main at
+6007301a07e67d4733d66558ac8c795e97628ace and merged it into the recovered
+275b2e9671258c205dd4da9bff3f91ab9ad43599 checkpoint as
+14cb165d5618fae37b1cc3e5bfe0f3199e9880c4. The capability vocabulary preserves
+both repair capabilities and main's prerequisite-closure entry. The policy
+migration is renumbered to 00388 above main's 00387, with its migration tests
+updated. The earlier 00386 references above describe the historical collision;
+they are not the current migration number. Renewed validation is still required
+on the integrated inputs; no worker-provisioning or final-head CI result follows
+from this local merge.
