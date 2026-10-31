@@ -3,7 +3,7 @@
 // fixed_at, request validation and the run-level label table. It imports no store or handler package so
 // the server resolver, the write path, the read overlay and the presenters share one definition. The
 // vocabulary is pinned to fixtures/lead-config/contract.json by this package's tests, and the SQL
-// constraints of migration 00387 by a LiveDB test in the store package.
+// constraints of migration 00388 by a LiveDB test in the store package.
 package leadcfg
 
 // Phase is the lead agent's phase a row belongs to.

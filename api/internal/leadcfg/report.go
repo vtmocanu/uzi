@@ -8,7 +8,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
-// MaxPhaseEntry and MaxSeq bound a row's phase_entry and seq (the table CHECKs of migration 00387).
+// MaxPhaseEntry and MaxSeq bound a row's phase_entry and seq (the table CHECKs of migration 00388).
 const (
 	MaxPhaseEntry = 8
 	MaxSeq        = 32
