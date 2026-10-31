@@ -152,7 +152,8 @@ fix, then close its PR.
    approval, then `gh pr comment <n> --body "@coderabbitai review"` overrides the skip
    regardless of title. Otherwise one local reviewer, or CI alone with the decision stated.
    Admin-merge when green.
-4. **Close Renovate's PR yourself once `main` carries its target version or newer.** Verify with
-   `git show origin/main:<file>`, then `gh pr close N --comment "Superseded by #M (merged SHA)."`.
-   Closing makes Renovate ignore only that exact version, which `main` already has; newer
-   releases still get PRs. While `main` is below the target, leave it open.
+4. **Close Renovate's PR once fresh `origin/main` satisfies every update it contains,**
+   coordinated pins included; a digest needs the matching digest, not a "newer" one. Verify
+   each file, then `gh pr close N --comment "Superseded by #M (merged SHA)."`. Leave it open
+   while any update is unsatisfied. Renovate's later ignore or recreate behaviour depends on
+   the PR's branch/title identity and update type (a closed major "to vN" PR can suppress later vN releases).
