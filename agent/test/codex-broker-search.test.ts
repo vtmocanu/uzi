@@ -142,6 +142,28 @@ function fsFileop(root: string): FileopClient {
 
 afterEach(() => { mock.timers.reset(); });
 
+/** A fixture whose root holds a.txt (one early match) plus directories of symlink/other
+ *  entries, totalling exactly `total` listed entries. Every listing is complete and holds at
+ *  most 4096 entries, the real helper's per-listing maximum (fileop.go maxListEntries). */
+function spreadEntries(total: number): Mem {
+  const perDir = 4000;
+  const dirCount = Math.ceil((total - 1) / (perDir + 1));
+  const mem = flat({ "a.txt": "needle\n" });
+  const root: MemEntry[] = [{ name: "a.txt", type: "file" }];
+  let remaining = total - 1 - dirCount;
+  for (let d = 0; d < dirCount; d++) {
+    const name = `d${d}`;
+    root.push({ name, type: "dir" });
+    const n = Math.min(perDir, remaining);
+    remaining -= n;
+    mem.dirs.set(name, { entries: Array.from({ length: n }, (_, i) => ({ name: `l${String(i).padStart(5, "0")}`, type: i % 2 ? "symlink" : "other" })) });
+  }
+  assert.equal(remaining, 0);
+  mem.dirs.set(".", { entries: root });
+  for (const { entries } of mem.dirs.values()) assert.ok(entries.length <= 4096);
+  return mem;
+}
+
 describe("Search partial results", () => {
   it("searches beyond the old ceilings (40 dirs, 300 entries, a 70 KiB file with an early match)", async () => {
     const mem: Mem = { dirs: new Map(), files: new Map() };
@@ -181,13 +203,11 @@ describe("Search partial results", () => {
     });
 
     it("entries", async () => {
-      const mem = flat({ "a.txt": "needle\n" });
-      const entries: MemEntry[] = [{ name: "a.txt", type: "file" }];
-      for (let i = 0; i < 16400; i++) entries.push({ name: `l${String(i).padStart(5, "0")}`, type: i % 2 ? "symlink" : "other" });
-      mem.dirs.set(".", { entries });
+      const mem = spreadEntries(16400);
       const fileop = memFileop(mem);
       expectPartial(outputOf(await call(brokerFor(fileop), { query: "needle" })), "entries");
-      assert.equal(fileop.ops.length, 3, "list, stat, read only: no op for symlink/other entries");
+      assert.equal(fileop.ops.filter((op) => op.op !== "list").length, 2, "stat and read of a.txt only: no op for symlink/other entries");
+      assert.ok(fileop.ops.filter((op) => op.op === "list").length > 4, "entries accumulate across several complete listings");
     });
 
     it("listing", async () => {
@@ -269,13 +289,7 @@ describe("Search partial results", () => {
     });
 
     it("entries boundary: exactly 16384 entries are not capped, 16385 are", async () => {
-      const build = (count: number): Mem => {
-        const mem = flat({ "a.txt": "needle\n" });
-        const entries: MemEntry[] = [{ name: "a.txt", type: "file" }];
-        for (let i = 1; i < count; i++) entries.push({ name: `l${String(i).padStart(5, "0")}`, type: "symlink" });
-        mem.dirs.set(".", { entries });
-        return mem;
-      };
+      const build = spreadEntries;
       const exact = outputOf(await call(brokerFor(memFileop(build(16384))), { query: "needle" }));
       assert.equal(exact.truncated, false);
       assert.equal(exact.reason, undefined);
