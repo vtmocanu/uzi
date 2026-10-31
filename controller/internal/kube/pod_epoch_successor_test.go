@@ -236,6 +236,49 @@ func TestPodEpochSuccessorNeverEmits(t *testing.T) {
 	}
 }
 
+// A successor in a terminal phase never gets positive evidence, even when no
+// audited termination signal is recorded for it.
+func TestPodEpochSuccessorTerminalPhaseWithoutSignalNeverEmits(t *testing.T) {
+	tests := []struct {
+		name string
+		mod  func(p *corev1.Pod)
+	}{
+		{"failed-evicted-no-statuses", func(p *corev1.Pod) {
+			p.Status.Phase = corev1.PodFailed
+			p.Status.Reason = "Evicted"
+		}},
+		{"failed-exit-137", func(p *corev1.Pod) {
+			p.Status.Phase = corev1.PodFailed
+			p.Status.ContainerStatuses[0].State = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137}}
+		}},
+		{"succeeded-incomplete-statuses", func(p *corev1.Pod) {
+			p.Status.Phase = corev1.PodSucceeded
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
+			if h.event(watch.Added, epochPod(epochB)) != nil {
+				t.Fatal("emitted at Added")
+			}
+			p := withRV(epochWithIDs(epochPod(epochB), "containerd://"), "/term")
+			tc.mod(p)
+			if d := h.event(watch.Modified, p); d != nil {
+				t.Fatalf("emitted for terminal successor: %s", d.Document())
+			}
+			if h.session.records[epochB].pending != nil {
+				t.Fatal("pending retained")
+			}
+			if d := h.event(watch.Modified, withRV(epochWithIDs(epochPod(epochB), "containerd://"), "/later")); d != nil {
+				t.Fatalf("emitted after terminal phase: %s", d.Document())
+			}
+			if len(h.patches) != 0 {
+				t.Fatal("request")
+			}
+		})
+	}
+}
+
 func TestPodEpochSuccessorResetDiscardsPending(t *testing.T) {
 	h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
 	h.event(watch.Added, epochPod(epochB))

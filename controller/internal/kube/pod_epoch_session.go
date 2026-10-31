@@ -519,8 +519,13 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 		// The Deleted and r.deleted clauses are defence in depth: a Deleted event
 		// always leaves the record tainted or terminal, so they are not separately
 		// testable. The terminal, tainted and current clauses are pinned by
-		// TestPodEpochSuccessorNeverEmits.
-		if event == watch.Deleted || r.deleted || r.tainted || r.terminal != 0 || s.current[w.ID] != uid {
+		// TestPodEpochSuccessorNeverEmits. A successor in phase Succeeded or
+		// Failed never emits, whether or not podEpochSignal audited a termination
+		// signal (r.terminal): Evicted, incomplete statuses and exit 137 leave
+		// r.terminal zero. Dropping the pending proof makes that permanent.
+		if event == watch.Deleted || r.deleted || r.tainted || r.terminal != 0 ||
+			p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed ||
+			s.current[w.ID] != uid {
 			s.dropPending(r)
 			return nil, nil
 		}
