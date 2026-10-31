@@ -1243,3 +1243,56 @@ remain independent; waiting may occupy a worker slot. API keys, Claude, chat,
 versioned jobs and isolated-lane eligibility retain their prior policy.
 The M5 hosted exact-head acceptance and optional smoke boundaries above remain
 pending; this documentation does not establish them as passed.
+
+## Amendment: Codex account auto-selection at run creation (#3719, 2026-10-31)
+
+The #3530 statement that uzi does so "without automatic rotation" still holds for
+running runs: a run never changes account after it is created, and a resume, a
+usage-limit park or an admission wait keeps the account it froze. What is added
+is an **opt-in, creation-time choice** among accounts the user consented to.
+The user contract is
+[Letting uzi pick the account](../docs/codex-credentials.md#letting-uzi-pick-the-account).
+
+- **Consent is two-part and per user.** `users.codex_account_mode` is `default`
+  (the prior behavior for everyone) or `auto`, and each `codex_auth` alias
+  carries its own pool consent (`auto_eligible`, created false). OpenAI API
+  keys never join the pool. Mode `auto` with no pooled alias binds the default
+  login (reason `pool_empty`).
+- **Selection runs once, in the run-creation transaction, for every origin**
+  (manual, schedule, autopilot, MR rework, cross-check child). Candidates are
+  canonical accounts, not aliases; the bound alias is the lowest pooled,
+  enabled, linked alias of the chosen account.
+  [Structural exclusions](../api/internal/workersvc/harness_resolver.go)
+  (not pooled, disabled, not linked, account quarantined or needing re-login)
+  remove an account. Capacity exclusions (the main `codex` bucket reports the
+  limit reached or not allowed, an
+  admission cooldown including its recovery spread, a weekly-reserve hold)
+  leave it reachable only when nothing else is, as reason `pool_exhausted`.
+  The score is 100 minus the fullest window of the main `codex` bucket, unknown
+  when the reading is stale, pre-reset, the meter is not fresh or the vault is
+  locked. Ranking reuses the Claude [auto-select](../api/internal/autoselect/autoselect.go)
+  ranker through [codexselect](../api/internal/codexselect/select.go), with the
+  in-flight penalty counting every nonterminal Codex run on the account across
+  aliases. The closed reason vocabulary is `default`, `pool_empty`, `auto`,
+  `best_of_pool`, `pool_stale` and `pool_exhausted`, persisted on the run.
+- **Lock order.** The creation transaction takes the user's shared
+  secret-mutation lock before the run INSERT, so no run row is held while the
+  lock is taken; every credential writer takes the exclusive lock, which fences
+  pool consent, enablement and account links. After the INSERT it share-locks
+  the picked alias row and re-reads what the pick relied on (the alias fence),
+  because quarantine and re-login flags are written by the refresher without
+  the shared lock; a failed pick is dropped and the pool re-selected. After the
+  credential freeze it compares the run's frozen account key with the scored
+  account and fails creation on a mismatch. A quarantine or re-login flag
+  committed between the fence and the commit can still bind; claim-time
+  admission backs up quarantine only.
+- **Unusable pool.** With mode `auto` and pooled aliases but none structurally
+  bindable, Codex is unusable: the default login is never used as a fallback.
+  An implicit harness selection falls back to Claude (ADR-1732 D15); an
+  explicit Codex selection is refused with the stable
+  `no_credential_for_harness` code plus the reason `codex_pool_unavailable`,
+  a schedule records the skip of the same name (held for a one-time row), and
+  an automatic MR rework is skipped.
+
+Out of scope: pooling OpenAI API keys, Codex chat, and any change of account
+for a run that already exists.

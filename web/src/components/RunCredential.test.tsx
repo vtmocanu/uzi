@@ -24,12 +24,13 @@ function cred(over: {
   harness?: "claude" | "codex";
   codexId?: string | null;
   codexLabel?: string | null;
+  codexReason?: string | null;
 }) {
   return {
     harness: over.harness ?? "claude",
     codex_secret_id: over.codexId === undefined ? null : over.codexId,
     codex_secret_label: over.codexLabel === undefined ? null : over.codexLabel,
-    codex_select_reason: null,
+    codex_select_reason: over.codexReason ?? null,
     anthropic_secret_id: over.id === undefined ? "sec-1" : over.id,
     anthropic_secret_label: over.label === undefined ? "console-key" : over.label,
     anthropic_select_reason: over.reason ?? null,
@@ -340,6 +341,42 @@ describe("Codex run credential", () => {
     expect(container.textContent).toContain("(deleted)");
     expect(container.textContent).not.toContain("\u202e");
     expect(container.querySelector("[title]")?.getAttribute("title")).not.toContain("\u202e");
+  });
+
+  // Issue #3719: a NULL codex_select_reason is a run created before Codex account
+  // selection. It renders the bare label (like the Anthropic chip's no-mode case) and
+  // the hint says the choice was not recorded rather than guessing "default".
+  it("says the choice was not recorded on a Codex run with no reason", () => {
+    const { container } = render(<RunCredential run={cred({
+      harness: "codex", codexId: "codex-1", codexLabel: "codex-seat",
+    })} />);
+    expect(container.textContent).not.toContain(" — ");
+    expect(container.querySelector("[title]")?.getAttribute("title")).toMatch(/not recorded/);
+  });
+
+  it("names the creation-time reason on a Codex run, and links where there is something to do", () => {
+    const calm = render(<RunCredential run={cred({
+      harness: "codex", codexId: "codex-1", codexLabel: "codex-seat", codexReason: "auto",
+    })} />);
+    expect(calm.container.textContent).toContain("credential “codex-seat” — auto");
+    expect(calm.container.querySelector("a")).toBeNull();
+    calm.unmount();
+
+    const worth = render(<RunCredential run={cred({
+      harness: "codex", codexId: "codex-1", codexLabel: "codex-seat", codexReason: "best_of_pool",
+    })} />);
+    expect(worth.container.textContent).toContain("— auto (best of pool)");
+    expect(worth.container.querySelector("a")?.getAttribute("href")).toBe("/settings");
+    expect(worth.container.querySelector("[title]")?.getAttribute("title")).toMatch(/low on limit headroom/);
+  });
+
+  it("keeps the Codex reason in the compact title, not the row text", () => {
+    const { container } = render(<RunCredential run={cred({
+      harness: "codex", codexId: "codex-1", codexLabel: "codex-seat", codexReason: "pool_exhausted",
+    })} variant="compact" />);
+    expect(container.textContent).not.toContain("every login at its limit");
+    expect(container.querySelector("[title]")?.getAttribute("title")).toContain("auto (every login at its limit)");
+    expect(container.querySelector("a")).toBeNull();
   });
 
   it("does not show a Claude snapshot on an unclaimed Codex run", () => {

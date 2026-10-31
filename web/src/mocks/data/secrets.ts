@@ -91,9 +91,10 @@ export const mockSecrets: SecretMeta[] = [
   // badges — and the legend that explains them — are browsable in the mock: the
   // create path only ever births `staging`/`static`, so `linked` and `failed` are
   // unreachable without fixture rows. This set is independent of the anthropic
-  // rows above: it carries its OWN single default (the linked login), no codex row
-  // is `auto_eligible` (there is no Codex auto-selection pool), and none of these
-  // touch the anthropic-only data.test.ts invariants.
+  // rows above: it carries its OWN single default (the linked login), exactly one
+  // codex row is `auto_eligible` (issue #3719: `team-codex`, a linked login in the Codex
+  // auto-selection pool, so the pool checkbox and the mode hints are browsable), and none
+  // of these touch the anthropic-only data.test.ts invariants.
   {
     id: "sec-codex-linked",
     kind: "codex_auth",
@@ -140,7 +141,7 @@ export const mockSecrets: SecretMeta[] = [
     is_default: false,
     enabled: true,
     disabled_at: null,
-    auto_eligible: false,
+    auto_eligible: true,
     codex_status: "linked",
     created_at: daysAgo(40),
     updated_at: daysAgo(3),

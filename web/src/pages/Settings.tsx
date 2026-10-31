@@ -52,6 +52,9 @@ export function Settings() {
   // ride the sidebar/TUI. Owned here so the "Codex limits" card's checkboxes and the
   // one getMySettings read stay in lockstep.
   const [sidebarCodexAccountIds, setSidebarCodexAccountIds] = useState<string[]>([]);
+  // Issue #3719: how a new Codex run chooses its login, from the same getMySettings read.
+  // Undefined until loaded (and on a server that predates it), which hides the picker.
+  const [codexAccountMode, setCodexAccountMode] = useState<string | undefined>(undefined);
 
   const { data, loading, error: loadError, reload } = useAsyncData(
     async ({ isCurrent }) => {
@@ -62,6 +65,7 @@ export function Settings() {
       if (isCurrent()) {
         setSidebarTokenIds(settings.sidebar_token_ids ?? []);
         setSidebarCodexAccountIds(settings.sidebar_codex_account_ids ?? []);
+        setCodexAccountMode(settings.codex_account_mode);
       }
       // ONE listSecrets() call feeds both cards: the Anthropic slice is unchanged,
       // and the Codex slice is the union of the two Codex kinds (they share one
@@ -147,6 +151,8 @@ export function Settings() {
         reload={reload}
         onError={setError}
         onNotice={setNotice}
+        accountMode={codexAccountMode}
+        onAccountModeChange={setCodexAccountMode}
       />
 
       {/* Codex per-account rate-limit meters (PRD #1209 M3). Self-gates: hidden when

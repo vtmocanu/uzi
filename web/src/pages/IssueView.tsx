@@ -138,7 +138,7 @@ export function IssueView() {
         // PRD #1429 M4a, D3: harness-aware credential facts. claudeUsable/hasToken stay
         // the pre-M4a Anthropic-only check; codexUsable/hasCodexCredential are new.
         hasToken: hasAnthropicToken(secrets),
-        codexUsable: isCodexUsable(secrets),
+        codexUsable: isCodexUsable(secrets, settings.codex_account_mode),
         hasCodexCredential: hasAnyCodexCredential(secrets),
         // Pass the already-loaded tokens to the picker so it need not re-fetch.
         tokens: secrets.filter((s: SecretMeta) => s.kind === "anthropic_token"),

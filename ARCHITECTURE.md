@@ -509,7 +509,9 @@ the TUI render it everywhere the Claude meters already appear. See
 [adr/1209-codex-account-meters.md](adr/1209-codex-account-meters.md) for the
 durable design decisions and
 [docs/rate-limits.md](docs/rate-limits.md#codex-account-limits) for
-user-facing behavior.
+user-facing behavior. For users who opt in (`codex_account_mode = auto`), these
+readings also pick the Codex account at run creation only, never afterwards; see
+the [ADR-1106 amendment](adr/1106-codex-harness.md#amendment-codex-account-auto-selection-at-run-creation-3719-2026-10-31).
 
 A separate survivor path can retry an original non-rejection refresh error once
 when its durable receipt authorizes reuse. Admission consumes the retry under

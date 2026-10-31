@@ -1206,9 +1206,12 @@ export const mockRuns: Run[] = [
     rate_limit_type: null,
     recovery_wait_cause: null,
     codex_account_action: null,
-    codex_secret_id: "sec-codex-linked",
-    codex_secret_label: "chatgpt-plus",
-    codex_select_reason: null,
+    // Issue #3719: created under codex_account_mode "auto" with every pooled login low on
+    // headroom, so it bound the pooled `team-codex` as best of pool. The run page's
+    // credential chip shows the reason, and links to Settings because it is worth reading.
+    codex_secret_id: "sec-codex-team",
+    codex_secret_label: "team-codex",
+    codex_select_reason: "best_of_pool",
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,

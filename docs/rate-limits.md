@@ -213,7 +213,9 @@ a usage-meter GET returning 429 do not trigger this wait.
 
 The wait is shared by your saved aliases of the same verified account,
 including after refresh or re-import. Another authorized account remains
-independent; uzi does not rotate accounts automatically.
+independent; uzi never moves a run to another account. If you opted in to
+[account auto-selection](#account-auto-selection), a wait only steers which
+account a *new* run is created on.
 
 | Evidence | Initial wait | Exponential cap before jitter | Quiet reset |
 |---|---|---|---|
@@ -300,7 +302,29 @@ Queued maintenance and weekly reserve precedence, credential selection and
 worker slots remain independent; waiting can occupy a slot. Usage-window and
 account-unavailability parking, OpenAI API keys, Claude, chat, versioned jobs
 and isolated-lane eligibility keep their existing policy. There is no new
-provider streak, backoff policy, automatic account rotation or Retry-After use.
+provider streak, backoff policy, automatic account rotation of a running run or
+Retry-After use.
+
+### Account auto-selection
+
+These readings also steer which account a **new** run is created on, for users
+who turned on [Codex account auto-selection](codex-credentials.md#letting-uzi-pick-the-account)
+and pooled at least one login. Nothing here applies in the default mode, and a
+run never changes account after it is created.
+
+- **The score** is 100 minus the fullest window of the account's main `codex`
+  bucket; additional feature buckets are ignored. A reading that is stale, from
+  before a reset, from a meter that is not `fresh`, or unreadable because your
+  vault is locked leaves the score unknown.
+- **Held back, not removed:** an account whose main bucket reports the limit
+  reached or not allowed, an account in a temporary admission wait (until its
+  recovery spread ends), and an account held by the
+  [weekly usage reserve](#weekly-usage-reserve) are used only when no other
+  pooled account is available. The run is then created on the one that
+  releases soonest and its reason reads `pool_exhausted`.
+- **Left out:** a login that is not pooled, disabled or unlinked, and an account
+  that is quarantined or needs re-login. If nothing pooled can be bound, Codex
+  is unusable for new runs.
 
 ### Where to look
 
@@ -430,6 +454,12 @@ credential that reads held or unknown:
   credential selection](anthropic-token.md) can start on another pooled token
   that reads below the threshold; it never leaves the pool or its pinning
   rules to do so. It holds only when every pooled token is held or unknown.
+- **Codex account auto-selection treats a held account as last resort.** With
+  [Codex account auto-selection](codex-credentials.md#letting-uzi-pick-the-account)
+  on, an account the reserve would hold (at or above the threshold, or an
+  unknown reading) is used only when no other pooled account is available;
+  the run is then created on it (`pool_exhausted`) and queues under the
+  reserve like any other run.
 
 A previously started run's resume claim is gated only while **Also pause
 running runs** is on. With it off, started runs continue above the threshold

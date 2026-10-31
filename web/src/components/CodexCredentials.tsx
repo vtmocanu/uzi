@@ -11,18 +11,22 @@ import { CredentialStorageHint } from "./VaultSettings";
 // The value is never displayed, never returned by the API, and never re-shown after
 // saving — rotation is a re-paste (a "Replace value" form, not an edit-in-place).
 //
-// What this card deliberately does NOT carry (no Codex analog — see PRD #1147):
-// the auto-selection pool toggle, the sidebar-rail checkbox, the rate-limit chip
+// Issue #3719 added the Codex auto-selection pool: an account-mode picker ("use the
+// default" or "pick by headroom", chosen at run CREATION, not by a worker) and a per-login
+// pool checkbox on codex_auth rows only (an API key has no limit windows to rank on).
+//
+// What this card deliberately does NOT carry (no Codex analog — see PRD #1147): the
+// sidebar-rail checkbox (Codex limits has its own), the per-token auto-status chip
 // machinery, and the judge-lane binding. (A usable Codex default alone, a linked login
 // or an API key, does count as a usable credential: lib/hasToken.ts's
 // hasUsableCredential accepts either harness.)
 
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
-import { api, type SecretMeta, type TestSecretResult } from "../lib/api";
-import { errorMessage } from "../lib/apiError";
+import { api, type CodexAccountMode, type SecretMeta, type TestSecretResult } from "../lib/api";
+import { ApiError, errorMessage } from "../lib/apiError";
 import { isVaultLocked } from "../lib/api";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
-import { Badge, Button, Card, Field, Input, SectionTitle, Skeleton } from "./ui";
+import { Badge, Button, Card, Field, Input, SectionTitle, Skeleton, cx } from "./ui";
 import type { BadgeTone } from "./ui";
 import { DocLink } from "./DocLink";
 import { DOC_CODEX_CREDENTIALS } from "../lib/doclinks";
@@ -176,11 +180,24 @@ export function codexShapeError(raw: string): string | null {
 }
 
 // codexDeleteWarning mirrors the Anthropic D5 delete confirmation, minus the
-// auto-eligible pool clause (no Codex pool) and the worker/judge naming (this card
-// carries no such bindings). The default is reachable here only as the LAST
+// worker/judge naming (this card carries no such bindings). The pool clause (issue
+// #3719) rides on both branches, as on the Anthropic card: deleting a pooled login
+// shrinks the set uzi picks from. The default is reachable here only as the LAST
 // credential (D6 blocks deleting a default while others exist), so that branch is
 // the disconnect-my-account case.
-function codexDeleteWarning(label: string, isDefault: boolean, disabledLeft = 0): string {
+function codexDeleteWarning(
+  label: string,
+  isDefault: boolean,
+  disabledLeft = 0,
+  pooled = false,
+): string {
+  const base = codexDeleteBase(label, isDefault, disabledLeft);
+  return pooled
+    ? `${base} It also leaves your Codex auto-selection pool, so uzi will no longer pick it for new runs.`
+    : base;
+}
+
+function codexDeleteBase(label: string, isDefault: boolean, disabledLeft: number): string {
   if (isDefault) {
     // PRD #1732: disabled credentials that stay behind keep the account on file; deleting
     // the last ENABLED one leaves the shared slot with no default.
@@ -212,6 +229,155 @@ function replacementBadges(s: SecretMeta) {
         </Badge>
       )}
     </>
+  );
+}
+
+// ── Codex account mode and pool (issue #3719) ───────────────────────────────────────
+
+// The two account modes, in the order a user reads them: today's behaviour first.
+const MODE_OPTIONS: { value: CodexAccountMode; title: string; body: string }[] = [
+  {
+    value: "default",
+    title: "Use the default",
+    body: "Every Codex run uses your default Codex credential.",
+  },
+  {
+    value: "auto",
+    title: "Pick by headroom",
+    body: "When a run is created, uzi picks the pooled login with the most limit headroom.",
+  },
+];
+
+// The keyboard-focus ring on a tile: each tile is a <label> around an sr-only radio, so
+// the ring is projected onto the tile with :has(:focus-visible). The same utility the
+// Appearance and agent pickers use, for one focus language.
+const TILE_FOCUS_RING =
+  "has-[:focus-visible]:outline has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-brand has-[:focus-visible]:outline-offset-2";
+
+// poolFacts reads the pool from the rows this card already holds. "Pooled" counts
+// disabled logins too, because the server does: a pool of only disabled or unlinked
+// logins leaves Codex unusable rather than falling back to the default. "Pickable" is
+// the client's view only (enabled and linked); quarantine and re-login-required are
+// server-side facts, so the server can still refuse a login counted here.
+function poolFacts(secrets: SecretMeta[]): { pooled: number; pickable: number } {
+  const pooled = secrets.filter((s) => s.kind === "codex_auth" && s.auto_eligible);
+  return {
+    pooled: pooled.length,
+    pickable: pooled.filter((s) => s.enabled !== false && s.codex_status === "linked").length,
+  };
+}
+
+function logins(n: number): string {
+  return n === 1 ? "1 login" : `${n} logins`;
+}
+
+// poolSummary is the one sentence under the mode picker that says what the CURRENT mode
+// and pool add up to for the next run. Null when there is nothing worth saying.
+function poolSummary(
+  mode: string,
+  { pooled, pickable }: { pooled: number; pickable: number },
+): { tone: "muted" | "info" | "warn"; text: string } | null {
+  if (mode === "auto") {
+    if (pooled === 0) {
+      return {
+        tone: "info",
+        text: "No login is in the pool yet, so runs use your default until you pool one. Tick “Auto-select from this login” on a linked login below.",
+      };
+    }
+    if (pickable === 0) {
+      return {
+        tone: "warn",
+        text: "Codex unavailable: no pooled login is enabled and linked, so runs fall back to Claude, and a run that asks for Codex is refused. Link or enable a pooled login, or pool another one.",
+      };
+    }
+    if (pickable < pooled) {
+      return {
+        tone: "muted",
+        text: `uzi picks from ${pickable} of ${logins(pooled)} in the pool; the others are not linked or are disabled.`,
+      };
+    }
+    return { tone: "muted", text: `uzi picks from ${logins(pooled)} in the pool.` };
+  }
+  if (pooled > 0) {
+    return {
+      tone: "muted",
+      text: `${pooled === 1 ? "1 login is" : `${pooled} logins are`} in the pool. The pool is used only when uzi picks by headroom.`,
+    };
+  }
+  return null;
+}
+
+const SUMMARY_TONE = { muted: "text-muted", info: "text-info", warn: "text-warn" } as const;
+
+// AccountModePicker is the two-tile mode choice plus the pool summary. A fieldset of
+// native radios, so arrow keys move between the tiles and the legend names the group.
+function AccountModePicker({
+  mode,
+  secrets,
+  busy,
+  onPick,
+}: {
+  mode: string;
+  secrets: SecretMeta[];
+  busy: boolean;
+  onPick: (mode: CodexAccountMode) => void;
+}) {
+  const name = useId();
+  const summary = poolSummary(mode, poolFacts(secrets));
+  // Not `disabled` while busy: disabling the fieldset would drop keyboard focus from the
+  // radio the user just arrowed onto to <body>. The card's pickMode ignores a pick while a
+  // write is in flight instead.
+  return (
+    <fieldset className="space-y-2" aria-busy={busy || undefined}>
+      <legend className="text-sm font-medium text-fg">Which login a new Codex run uses</legend>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {MODE_OPTIONS.map((o) => {
+          const active = mode === o.value;
+          return (
+            <label
+              key={o.value}
+              className={cx(
+                "flex flex-col gap-0.5 rounded-lg border px-3 py-2 transition-colors",
+                TILE_FOCUS_RING,
+                active
+                  ? "border-brand bg-raised"
+                  : "border-edge hover:border-edge-strong",
+                busy ? "cursor-progress" : "cursor-pointer",
+              )}
+            >
+              <input
+                type="radio"
+                name={name}
+                value={o.value}
+                checked={active}
+                onChange={() => onPick(o.value)}
+                className="sr-only"
+              />
+              {/* A drawn radio mark, so the choice reads without relying on the border
+                  colour alone (WCAG 1.4.1). Decorative: the sr-only input carries state. */}
+              <span className={cx("flex items-center gap-2 text-sm font-medium", active ? "text-fg" : "text-muted")}>
+                <span
+                  aria-hidden="true"
+                  className={cx(
+                    "flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border",
+                    active ? "border-brand" : "border-edge-strong",
+                  )}
+                >
+                  {active && <span className="h-1.5 w-1.5 rounded-full bg-brand" />}
+                </span>
+                {o.title}
+              </span>
+              <span className="pl-5.5 text-xs text-muted">{o.body}</span>
+            </label>
+          );
+        })}
+      </div>
+      {/* Live, because ticking a pool box below changes this sentence: a screen-reader
+          user hears that the pool now has (or no longer has) a login uzi can pick. */}
+      <p aria-live="polite" className={cx("text-xs", summary ? SUMMARY_TONE[summary.tone] : "")}>
+        {summary?.text ?? ""}
+      </p>
+    </fieldset>
   );
 }
 
@@ -308,6 +474,50 @@ function CredentialRow({
       onError(errText(err, fallback));
     } finally {
       setRowBusy(false);
+    }
+  };
+
+  // The pool toggle (issue #3719). Not `run` above: the list is refetched on success AND
+  // on failure. On success because the PATCH answer omits codex_status, so the cached row
+  // must not be replaced by it; on failure because the likely refusal, a 409 for a login
+  // disabled since this list loaded, means the list is stale.
+  const poolHintId = `codex-pool-${secret.id}`;
+  const pooledButUnpickable = secret.auto_eligible && secret.codex_status !== "linked";
+  const poolBox = useRef<HTMLInputElement>(null);
+  const togglePool = async (next: boolean) => {
+    onError("");
+    onNotice("");
+    setRowBusy(true);
+    const name = sanitizeLabel(secret.label);
+    try {
+      await api.setCodexAliasAutoEligible(secret.id, next);
+      onNotice(
+        next
+          ? `“${name}” is now in the Codex auto-selection pool.`
+          : `“${name}” is no longer in the Codex auto-selection pool.`,
+      );
+    } catch (err) {
+      onError(
+        err instanceof ApiError && err.status === 409
+          ? `“${name}” is disabled, so it cannot join the pool. Enable it first.`
+          : errText(
+              err,
+              next ? "Failed to add the login to the pool" : "Failed to remove the login from the pool",
+            ),
+      );
+    }
+    try {
+      await onChanged();
+    } catch {
+      onError("Could not refresh your credentials. Reload Settings to see the pool's current state.");
+    } finally {
+      setRowBusy(false);
+      // The box was disabled while the write ran, which drops keyboard focus to <body>.
+      // Hand it back once the box is enabled again, unless the user has moved on.
+      requestAnimationFrame(() => {
+        const box = poolBox.current;
+        if (box && box.isConnected && document.activeElement === document.body) box.focus();
+      });
     }
   };
 
@@ -444,7 +654,12 @@ function CredentialRow({
                 if (blockedByD6) return;
                 if (
                   !window.confirm(
-                    codexDeleteWarning(sanitizeLabel(secret.label), secret.is_default, disabledLeft),
+                    codexDeleteWarning(
+                      sanitizeLabel(secret.label),
+                      secret.is_default,
+                      disabledLeft,
+                      secret.kind === "codex_auth" && secret.auto_eligible,
+                    ),
                   )
                 )
                   return;
@@ -468,6 +683,33 @@ function CredentialRow({
       <div role="status" aria-live="polite" className="mt-1 text-xs text-muted">
         {testing ? "Testing connection…" : verdict}
       </div>
+      {/* The Codex pool opt-in (issue #3719), codex_auth only: an OpenAI API key has no
+          subscription limits to rank on and the server refuses to pool one. Same
+          control conventions as the Anthropic card's pool box (h-4 w-4, text-sm, a
+          per-login accessible name). A pooled login that is not linked says so in
+          visible text, not a tooltip: uzi picks only linked logins. */}
+      {secret.kind === "codex_auth" && (
+        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
+          <label className="flex items-center gap-2 text-sm text-muted">
+            <input
+              ref={poolBox}
+              type="checkbox"
+              className="h-4 w-4 accent-brand"
+              checked={secret.auto_eligible}
+              disabled={disabled}
+              aria-label={`Auto-select from ${sanitizeLabel(secret.label)}`}
+              aria-describedby={pooledButUnpickable ? poolHintId : undefined}
+              onChange={(e) => void togglePool(e.target.checked)}
+            />
+            <span aria-hidden="true">Auto-select from this login</span>
+          </label>
+          {pooledButUnpickable && (
+            <span id={poolHintId} className="text-xs text-warn">
+              In the pool, but uzi picks only linked logins.
+            </span>
+          )}
+        </div>
+      )}
       <div className="mt-1 text-xs text-faint">
         updated {new Date(secret.updated_at).toLocaleString()}
       </div>
@@ -680,6 +922,8 @@ export function CodexCredentials({
   reload,
   onError,
   onNotice,
+  accountMode,
+  onAccountModeChange,
 }: {
   secrets: SecretMeta[];
   loading: boolean;
@@ -687,6 +931,10 @@ export function CodexCredentials({
   reload: () => Promise<void>;
   onError: (m: string) => void;
   onNotice: (m: string) => void;
+  // Issue #3719: the user's codex_account_mode from GET /me/settings. Undefined hides the
+  // picker: the settings have not loaded, or the server predates the setting.
+  accountMode?: string;
+  onAccountModeChange?: (mode: CodexAccountMode) => void;
 }) {
   const [rotateFor, setRotateFor] = useState("");
   const [rotateValue, setRotateValue] = useState("");
@@ -697,7 +945,28 @@ export function CodexCredentials({
   const [rotateShapeError, setRotateShapeError] = useState<string | null>(null);
 
   const first = secrets.length === 0;
-  const anyBusy = busy || rotateBusy;
+  const [modeBusy, setModeBusy] = useState(false);
+  const anyBusy = busy || rotateBusy || modeBusy;
+
+  const pickMode = async (mode: CodexAccountMode) => {
+    if (mode === accountMode || modeBusy) return;
+    onError("");
+    onNotice("");
+    setModeBusy(true);
+    try {
+      const { codex_account_mode: saved } = await api.setCodexAccountMode(mode);
+      onAccountModeChange?.(saved);
+      onNotice(
+        saved === "auto"
+          ? "New Codex runs now pick the pooled login with the most limit headroom."
+          : "New Codex runs now use your default Codex credential.",
+      );
+    } catch (err) {
+      onError(errText(err, "Failed to change which login Codex runs use"));
+    } finally {
+      setModeBusy(false);
+    }
+  };
 
   // PRD #1732: live credentials above, suspended ones on the Disabled shelf below. The
   // default is shared across both Codex kinds, so "the slot" is the whole card.
@@ -806,7 +1075,12 @@ export function CodexCredentials({
 
   // A disabled credential is never the default (D4), so its delete is the ordinary one.
   const removeDisabled = async (s: SecretMeta) => {
-    if (!window.confirm(codexDeleteWarning(sanitizeLabel(s.label), false))) return;
+    if (
+      !window.confirm(
+        codexDeleteWarning(sanitizeLabel(s.label), false, 0, s.kind === "codex_auth" && s.auto_eligible),
+      )
+    )
+      return;
     onError("");
     onNotice("");
     setShelfBusy(true);
@@ -873,6 +1147,17 @@ export function CodexCredentials({
             setShelfOpen(true);
             if (disabled[0]) focusLater(enableButtonId(disabled[0].id));
           }}
+        />
+      )}
+
+      {/* Above the list, because the mode decides what the pool boxes on each row mean.
+          Hidden until there is a credential to choose between. */}
+      {!loading && !first && accountMode !== undefined && (
+        <AccountModePicker
+          mode={accountMode}
+          secrets={secrets}
+          busy={anyBusy || shelfBusy}
+          onPick={(m) => void pickMode(m)}
         />
       )}
 
