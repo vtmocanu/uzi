@@ -769,7 +769,7 @@ func (m tuiModel) boardColumnLabels(band int, mc boardMarkerCols, cols boardAcco
 	add("title", pos)
 	workerW := m.boardWorkerWidth()
 	contentW := m.width - workerW
-	if mc.fullW > 0 && !m.board.admin {
+	if mc.fullW > 0 && !m.board.admin { // fullW is zeroed for a band with no verdicts
 		add("judge", contentW-mc.fullW)
 	}
 	if workerW > 0 {

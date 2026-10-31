@@ -703,10 +703,22 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 			}
 		}
 		accountCols := m.boardAccountCols(rendered)
+		// A band's heading names the judge column only when one of its runs carries a verdict:
+		// the judge runs after a run finishes, so active bands would label an empty column.
+		var bandVerdict [numBands]bool
+		for _, r := range rows {
+			if r.JudgeVerdict != nil {
+				bandVerdict[runBandOf(r)] = true
+			}
+		}
 		for i := start; i < end; i++ {
 			switch it := items[i]; it.kind {
 			case biEyebrow:
-				sb.WriteString(m.boardEyebrowLabelled(it, mc, accountCols) + "\n")
+				bmc := mc
+				if !bandVerdict[it.band] {
+					bmc.fullW = 0 // the column stays reserved on rows; only the label is omitted
+				}
+				sb.WriteString(m.boardEyebrowLabelled(it, bmc, accountCols) + "\n")
 			case biRow:
 				r := rows[it.runIdx]
 				sel := it.runIdx == m.board.cursor

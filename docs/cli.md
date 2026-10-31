@@ -1947,7 +1947,8 @@ A newer release is available.
   the TITLE. There is no separate header row or full-width rule: each band
   heading carries faint lowercase column names over its columns (`age`, or
   `ended` and `took` on DONE, then `miles`, `acct`, `cost`, `title`, `judge`,
-  `worker`), shown only for visible columns and dropped where one would
+  `worker`; `judge` only on a band where some run has a verdict), shown only
+  for visible columns and dropped where one would
   collide with the heading text; the run id, status and admin owner sit under
   the heading itself. The status cell is as wide as the longest status word
   on screen (at most 14 columns), so a board of short statuses gives the title

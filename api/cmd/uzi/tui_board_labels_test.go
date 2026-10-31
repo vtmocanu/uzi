@@ -35,7 +35,6 @@ func labelRuns() (done, running apitypes.RunListItemDTO) {
 		r.WorkerName = sp("wk-alpha")
 	}
 	done.JudgeVerdict, done.JudgeTodoCount = sp("issues"), 3
-	running.JudgeVerdict = sp("ok")
 	return done, running
 }
 
@@ -116,7 +115,11 @@ func TestBoardEyebrowLabelsAlignWithCells(t *testing.T) {
 				check("acct", "credential", false)
 				check("cost", "$1234", true)
 				check("title", "title ", false)
-				check("judge", "⚖", false)
+				if band.heading == "DONE" {
+					check("judge", "⚖", false)
+				} else if rowCol(head, "judge") >= 0 {
+					t.Errorf("cred %t w %d %s: judge labelled on a band with no verdicts: %q", cred, w, band.heading, head)
+				}
 				check("worker", "wk-alpha", false)
 				// Labels follow their columns.
 				for label, shown := range map[string]bool{
@@ -129,9 +132,9 @@ func TestBoardEyebrowLabelsAlignWithCells(t *testing.T) {
 				}
 				// Not vacuous: on a wide board every shown column's label is actually present.
 				if w >= 160 {
-					want := []string{band.age, "miles", "cost", "title", "judge", "worker"}
+					want := []string{band.age, "miles", "cost", "title", "worker"}
 					if band.dur != "" {
-						want = append(want, "took")
+						want = append(want, "took", "judge")
 					}
 					if cred {
 						want = append(want, "acct")
@@ -222,6 +225,20 @@ func TestBoardHelpMatchesLabels(t *testing.T) {
 	for _, w := range []string{"ended", "took"} {
 		if !strings.Contains(help, w) {
 			t.Errorf("board help lacks %q:\n%s", w, help)
+		}
+	}
+}
+
+// A verdict on an active run (rare, but possible) labels that band's judge column too.
+func TestBoardEyebrowJudgeLabelFollowsVerdicts(t *testing.T) {
+	done, running := labelRuns()
+	running.JudgeVerdict = sp("ok")
+	m := asciiBoard(t, 200, true, done, running)
+	out := stripANSI(m.View().Content)
+	for _, h := range []string{" ON THE FLOOR ", " DONE "} {
+		head := lineWith(t, out, h)
+		if lc, cc := rowCol(head, "judge"), rowCol(out[strings.Index(out, head):], "⚖"); lc < 0 || cc < 0 {
+			t.Errorf("%s: judge label %d with a verdict on the band: %q", h, lc, head)
 		}
 	}
 }
