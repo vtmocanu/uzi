@@ -759,8 +759,38 @@ test("authority reasons are the verdict reason for other pre-evidence refusals",
   const { result } = await run("invalid");
   assert.deepEqual(result.authority, { result: "unproven", reason: "evidence_invalid" });
   assert.equal(result.evidence_version, null);
-  const binding = await run(await mutate("v2/positive.json", d => { d.successor = d.predecessor; }));
-  assert.equal(binding.result.authority.result, "unproven");
+  const binding = await run(await mutate("v2/positive.json", d => { d.successor = "00000000-0000-4000-8000-000000000009"; }));
+  assert.equal(binding.result.reason, "evidence_binding");
+  assert.equal(binding.result.evidence_version, 2);
+  assert.deepEqual(binding.result.authority, { result: "unproven", reason: "evidence_binding" });
+});
+test("contradicted evidence for another pod is a binding refusal, not a contradiction", async () => {
+  const { result } = await run(await mutate("v2/valid/contradicted.json", d => { d.successor = "00000000-0000-4000-8000-000000000000"; }));
+  assert.equal(result.reason, "evidence_binding");
+  assert.deepEqual(result.authority, { result: "unproven", reason: "evidence_binding" });
+});
+test("an entry mismatch before the daemon is unproven, never attested", async () => {
+  const d = await daemon();
+  try {
+    const { result, calls } = await run(bytes, o => { o.ownership.matchesEntry = () => false; }, d.host);
+    assert.equal(result.reason, "entry_changed");
+    assert.deepEqual(result.authority, { result: "unproven", reason: "entry_changed" });
+    assert.deepEqual(d.requests, []); assert.equal(calls.discovery, 0);
+  } finally { await d.close(); }
+});
+test("a daemon veto is unproven; a daemon transport failure keeps attested with a deferred verdict", async () => {
+  const d = await daemon();
+  try {
+    const { options } = setup(); options.dockerHost = d.host; inventory(options, 1);
+    const inner = options.git.inspectRetainedSources;
+    options.git.inspectRetainedSources = async opts => { d.veto(); await tick(); await tick(); return inner(opts); };
+    const result = (await runPodEpochShadow(options))!;
+    assert.deepEqual(result.authority, { result: "unproven", reason: "daemon_veto" });
+    assert.equal(result.would_delete, 0);
+  } finally { await d.close(); }
+  const down = await run(bytes, undefined, "tcp://127.0.0.1:1");
+  assert.equal(down.result.verdict, "deferred");
+  assert.deepEqual(down.result.authority, { result: "attested", reason: "observations_consistent" });
 });
 
 function candidateSource(path: string, runId: string, tweak: (s: RetainedSourceEvidence) => void): RetainedSourceEvidence {
@@ -769,7 +799,7 @@ function candidateSource(path: string, runId: string, tweak: (s: RetainedSourceE
 test("present and missing candidates, strict-plain basis, and the examined invariant", async () => {
   const d = await daemon();
   try {
-    const { options } = setup(); options.dockerHost = d.host; inventory(options, 7);
+    const { options } = setup(); options.dockerHost = d.host; inventory(options, 9);
     const table: Array<(s: RetainedSourceEvidence) => void> = [
       () => {},
       x => { x.presence = "missing"; x.sources[0]!.presence = "missing"; x.sources[0]!.allocatedBytes = null; },
@@ -779,6 +809,8 @@ test("present and missing candidates, strict-plain basis, and the examined invar
       x => { x.disposition = { kind: "refused", consumers: [] }; x.presence = "missing"; x.sources[0]!.presence = "missing";
         x.sources[0]!.allocatedBytes = null; x.epochSettlement = { basis: "strict_plain", disposition: { kind: "local_discard" } }; },
       x => { x.disposition = { kind: "refused", consumers: [] }; x.epochSettlement = { basis: "strict_plain", disposition: { kind: "refused", consumers: [] } }; },
+      x => { x.sources[0]!.presence = "present"; x.presence = "unsafe"; },
+      x => { x.presence = "missing"; x.sources[0]!.presence = "missing"; x.sources[0]!.allocatedBytes = 4096; },
     ];
     options.git.inspectRetainedSources = async opts => {
       const i = Number(opts.selector!.runId.slice(3)); const path = "/tree/" + i;
@@ -788,15 +820,16 @@ test("present and missing candidates, strict-plain basis, and the examined invar
     const result = (await runPodEpochShadow(options))!;
     assert.equal(result.verdict, "eligible");
     assert.equal(result.would_delete, 2); assert.equal(result.would_delete_bytes, 8192);
-    assert.equal(result.would_settle, 2);
-    assert.deepEqual(result.by_basis, { discard: 2, strict_plain: 2 });
-    assert.equal(result.examined, 7); assert.equal(result.kept, 3);
+    assert.deepEqual(result.by_basis, { discard: 3, strict_plain: 2 });
+    assert.equal(result.examined, 9); assert.equal(result.kept, 4);
     assert.equal(result.examined, result.would_delete + result.would_settle + result.kept);
     assert.deepEqual(result.list.map(e => [e.run_id, e.presence, e.basis, e.bytes]), [
       ["run0", "present", "discard", 4096], ["run2", "present", "strict_plain", 4096],
-      ["run1", "missing", "discard", 0], ["run5", "missing", "strict_plain", 0],
+      ["run1", "missing", "discard", 0], ["run5", "missing", "strict_plain", 0], ["run8", "missing", "discard", 0],
     ]);
-    assert.ok(!result.list.some(e => e.run_id === "run3" || e.run_id === "run4" || e.run_id === "run6"));
+    // Missing with non-null bytes: listed as 0 and excluded from would_delete_bytes.
+    assert.equal(result.would_settle, 3);
+    assert.ok(!result.list.some(e => e.run_id === "run3" || e.run_id === "run4" || e.run_id === "run6" || e.run_id === "run7"));
     assert.ok(d.requests.every(r => r.startsWith("GET ")));
   } finally { await d.close(); }
 });
@@ -826,4 +859,29 @@ test("a run's lifecycle is read before its holds", async () => {
     await runPodEpochShadow(options);
     assert.deepEqual(order, ["lifecycle", "holds"]);
   } finally { await d.close(); }
+});
+test("one path observed twice is never double counted", async () => {
+  const cases: Array<[string, Array<(s: RetainedSourceEvidence) => void>]> = [
+    ["present then missing", [() => {}, x => { x.presence = "missing"; x.sources[0]!.presence = "missing"; x.sources[0]!.allocatedBytes = null; }]],
+    ["candidate then refused", [() => {}, x => { x.disposition = { kind: "refused", consumers: [] }; }]],
+    ["refused then candidate", [x => { x.disposition = { kind: "refused", consumers: [] }; }, () => {}]],
+  ];
+  for (const [label, table] of cases) {
+    const d = await daemon();
+    try {
+      const { options } = setup(); options.dockerHost = d.host;
+      options.git.discoverEpochRetainedSources = async () => ({
+        groups: table.map((_, i) => ({ barePath: "/bare", selector: { runId: "run" + i, generation: 1, attempt: "attempt" }, paths: ["/tree/shared"] })),
+        inventoryComplete: true, physicalPaths: 1, overflow: 0, overflowExact: true, unreadable: 0,
+      });
+      options.git.inspectRetainedSources = async opts => {
+        opts.beforeTree!("/tree/shared");
+        return { sources: [candidateSource("/tree/shared", opts.selector!.runId, table[Number(opts.selector!.runId.slice(3))]!)],
+          partial: false, unreadable: 0, sampledAt: "" };
+      };
+      const result = (await runPodEpochShadow(options))!;
+      assert.equal(result.examined, 1, label); assert.equal(result.would_delete, 0, label);
+      assert.equal(result.would_settle, 0, label); assert.equal(result.kept, 1, label); assert.deepEqual(result.list, [], label);
+    } finally { await d.close(); }
+  }
 });

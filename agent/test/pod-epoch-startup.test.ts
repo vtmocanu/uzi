@@ -125,7 +125,7 @@ test("main uses one runtime, consumes the bootstrap UID and restores TMP before 
   assert.deepEqual(events, [], "nonparticipants do not touch epoch runtime or TMP");
 });
 
-test("an undeclared runtime still acquires SH, consumes the UID and runs the shadow with undeclared authority", async () => {
+test("an undeclared runtime acquires SH, consumes the UID and yields values the shadow reports as undeclared", async () => {
   const events: string[] = [];
   const podUid = "12345678-1234-1234-1234-123456789abc";
   const environment = { UZI_EPOCH_LOCK: "1", UZI_DATA_DIR: "/data", UZI_POD_UID: podUid } as Record<string, string>;
