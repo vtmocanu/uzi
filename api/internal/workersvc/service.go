@@ -2043,6 +2043,7 @@ type Service struct {
 	heldPrepareFn      func(ctx context.Context, o pushbroker.HeldPackOptions) (*pushbroker.PreparedHeldPack, error)
 	heldSendFn         func(ctx context.Context, p *pushbroker.PreparedHeldPack) (pushbroker.HeldCreateOutcome, error)
 	heldListFn         func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
+	prerequisite       *prerequisiteRuntime
 	heldSlots          chan struct{}
 	heldBeforeSendHook func()
 	heldOutcomeHook    func() error
@@ -2391,6 +2392,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		heldListFn:           pushbroker.ListRefTips,
 		heldDeleteFn:         pushbroker.Delete,
 		heldSlots:            make(chan struct{}, heldPublishMaxConcurrent),
+		prerequisite:         newPrerequisiteRuntime(),
 		createRefFn:          pushbroker.CreateRef,
 		listRefTipsFn:        pushbroker.ListRefTips,
 		background:           func(fn func()) { go fn() },

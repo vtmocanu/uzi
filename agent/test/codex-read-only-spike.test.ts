@@ -32,16 +32,17 @@ describe("read-only Codex spike", () => {
     assert.match(config, /trust_level = "untrusted"/);
   });
 
-  it("reports oversized and truncated files as incomplete searches", async () => {
-    for (const [size, truncated, expected] of [
-      [64 * 1024 + 1, false, "Search file size limit reached"],
-      [1, true, "Search file read incomplete"],
-      [1, false, "Search file size limit reached"],
+  it("reports oversized and truncated files as partial file_size searches", async () => {
+    const limit = 1024 * 1024;
+    for (const [size, truncated] of [
+      [limit + 1, false],
+      [1, true],
+      [1, false],
     ] as const) {
       const fileop: FileopClient = { op: async (request) => {
         if (request.op === "list") return { ok: true, entries: [{ name: "sample.txt", type: "file" }] };
         if (request.op === "stat") return { ok: true, size };
-        if (request.op === "read") return { ok: true, data: Buffer.from(size === 1 && !truncated ? "x".repeat(64 * 1024 + 1) : "x").toString("base64"), truncated };
+        if (request.op === "read") return { ok: true, data: Buffer.from(size === 1 && !truncated ? "x".repeat(limit + 1) : "x").toString("base64"), truncated };
         throw new Error(`unexpected operation: ${request.op}`);
       } };
       const broker = new CodexCallbackBroker({
@@ -54,7 +55,10 @@ describe("read-only Codex spike", () => {
       });
       assert.deepEqual(await broker.handleToolCall(
         { threadId: "t", turnId: "turn", callId: "1" }, "uzi_search", { query: "absent" }, "root",
-      ), { ok: false, code: "search_limit", message: expected });
+      ), { ok: true, output: {
+        matches: [], truncated: true, bytes: 0, reason: "file_size", skippedFiles: 1,
+        notice: "Partial search: coverage is incomplete; a missing match does not mean the text is absent.",
+      } });
     }
   });
 
@@ -84,9 +88,14 @@ describe("read-only Codex spike", () => {
       );
       assert.equal(result.ok, true);
       if (!result.ok) continue;
-      const output = result.output as { matches: { text: string }[]; truncated: boolean };
+      const output = result.output as { matches: { text: string }[]; truncated: boolean; reason?: string; skippedFiles?: number; notice?: string };
       assert.equal(output.matches.length, count);
       assert.equal(output.truncated, truncated);
+      if (truncated) {
+        assert.equal(output.reason, "matches");
+        assert.equal(output.skippedFiles, 0);
+        assert.match(output.notice ?? "", /^Partial search: coverage is incomplete/);
+      }
       if (content === lateLine) {
         assert.ok(output.matches[0]?.text.includes("needle"));
         assert.ok((output.matches[0]?.text.length ?? Infinity) <= 256);
@@ -154,7 +163,8 @@ describe("read-only Codex spike", () => {
       }
       for (let i = 0; i < 5; i++) await fs.writeFile(path.join(checkout, `large-${i}.txt`), "z".repeat(60 * 1024));
       const overBytes = await invoke("uzi_search", { query: "absent" });
-      assert.deepEqual(overBytes, { ok: false, code: "search_limit", message: "Search byte limit reached" });
+      assert.equal(overBytes.ok, true);
+      if (overBytes.ok) assert.equal((overBytes.output as { truncated: boolean }).truncated, false);
       const outsideRead = await invoke("uzi_read", { path: outside });
       assert.equal(outsideRead.ok, false);
       const denied = await Promise.all([

@@ -267,7 +267,10 @@ fail the check.
 - A **read** records the checkout-relative path and the inclusive line range
   returned, when known.
 - A **search** records the scope path (`.` for the whole checkout) and a match
-  count. A truncated count shows as `N+`.
+  count. A truncated count shows as `N+`. For the Codex checker this also
+  covers a search that stopped at its time, operation, directory, entry or byte
+  ceiling, or skipped a file over 1 MiB: the matches found so far are kept, the
+  coverage is incomplete, and `0+` is not evidence that the text is absent.
 - Never the search query, glob or pattern, tool arguments or file contents.
 - An attempt outside the checkout is recorded as a category with no path:
   `outside checkout`. `policy` covers a path the recorder refuses to show

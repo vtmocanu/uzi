@@ -111,7 +111,7 @@ func TestCrossRunDiscardRollbackRoundTripLiveDB(t *testing.T) {
 	if original != body {
 		t.Fatal("385 universal guard differs from exact 338 body")
 	}
-	if err := store.Migrate(ctx, dsn); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 386); err != nil {
 		t.Fatal(err)
 	}
 	if witnessSchema(t, ctx, pool) != schema {
@@ -129,7 +129,7 @@ func TestCrossRunDiscardRollbackRoundTripLiveDB(t *testing.T) {
 	if witnessSchema(t, ctx, pool) != schema {
 		t.Fatal("Down changed inventory guard or CHECK definitions")
 	}
-	if err := store.Migrate(ctx, dsn); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 386); err != nil {
 		t.Fatal(err)
 	}
 	f, _, binding := witnessRollbackFixture(t, ctx, pool)
@@ -148,6 +148,10 @@ func TestCrossRunDiscardRollbackRoundTripLiveDB(t *testing.T) {
 // Every goroutine is joined before pool closure, including failure paths.
 func TestCrossRunDiscardRollbackRefusesWitnessLiveDB(t *testing.T) {
 	ctx, dsn, pool := heldMigratedPool(t, "witness_down_race_")
+	// Isolate 00386's Down: later migrations roll back first and take their own locks.
+	if err := store.MigrateDownTo(ctx, dsn, 386); err != nil {
+		t.Fatal(err)
+	}
 	f, _, binding := witnessRollbackFixture(t, ctx, pool)
 	bounded, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()

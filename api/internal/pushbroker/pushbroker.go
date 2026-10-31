@@ -55,7 +55,6 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/httptransport"
 	"github.com/vtmocanu/uzi/api/internal/packbudget"
-	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
 
 // Options carries everything a publish needs. Every field is derived by the caller
@@ -516,6 +515,8 @@ type DeleteOptions struct {
 	// refs/uzi-checkpoints/<CheckpointKey> (Branch for legacy callers). It must lie under refs/uzi-checkpoints/,
 	// refs/uzi-recovery/, refs/uzi-salvage/ (PRD #1867) or refs/uzi-held/ (issue #2545) and
 	// be a well-formed ref name, else Delete returns ErrInvalidRef before any network I/O.
+	// Capture UUID refs under refs/uzi-prereq/ are also accepted, with an exact
+	// nonzero ExpectedOldTip required and bounded discovery and readback.
 	// Empty keeps the key-derived name. A recovery, salvage or held ref is only ever
 	// CAS-deleted: Ref under any of those prefixes with an empty ExpectedOldTip is ErrInvalidRef.
 	Ref string
@@ -576,6 +577,9 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 	ctx, cancel := context.WithTimeout(ctx, maxDeleteDuration)
 	defer cancel()
 
+	if validPrereqRef(o.Ref) {
+		return deletePrereq(ctx, o)
+	}
 	_, checkpointKey := checkpointNames(o.Branch, "", o.CheckpointKey)
 	ref := checkpointRefPrefix + checkpointKey
 	if o.Ref != "" {
@@ -908,7 +912,9 @@ type ListRefsOptions struct {
 // ListRefTips lists origin once and returns the tips of those of refs it advertises
 // (an absent ref has no key; an empty origin yields an empty map). Every ref must lie
 // under refs/uzi-checkpoints/, refs/uzi-recovery/, refs/uzi-salvage/ or refs/uzi-held/, else
-// ErrInvalidRef before any network I/O. A read, never a write: a caller uses it to tell
+// ErrInvalidRef before any network I/O. Capture UUID refs under refs/uzi-prereq/
+// are also accepted without widening CreateRef or pack-base authority.
+// A read, never a write: a caller uses it to tell
 // the reasons CreateRef reported ErrSourceMissing apart, to pick a salvage source, or to
 // confirm a salvage delete (PRD #1867). Discovery is bounded by
 // MaxRefAdvertisementBytes; overflow returns ErrRefAdvertisementTooLarge and no tips.
@@ -917,7 +923,7 @@ func ListRefTips(ctx context.Context, o ListRefsOptions, refs ...string) (map[st
 	defer cancel()
 	want := make(map[plumbing.ReferenceName]bool, len(refs))
 	for _, r := range refs {
-		if !validManagedRef(r) {
+		if !validManagedRef(r) && !validPrereqRef(r) {
 			return nil, ErrInvalidRef
 		}
 		want[plumbing.ReferenceName(r)] = true
@@ -1278,7 +1284,7 @@ var brokerHTTPClient = &http.Client{
 	// Explicit, not nil: go-git type-asserts *http.Transport when an endpoint carries
 	// TLS or proxy options.
 	Transport:     httptransport.New(http.DefaultTransport),
-	CheckRedirect: redirectguard.SameOrigin,
+	CheckRedirect: CheckRedirect,
 }
 
 // httpTransport is the go-git smart-HTTP transport every broker operation uses.

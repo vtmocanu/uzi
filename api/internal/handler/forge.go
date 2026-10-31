@@ -541,6 +541,16 @@ func (h *Handler) DeleteConnection(w http.ResponseWriter, r *http.Request) {
 		h.writeConnectionHeldConflict(r.Context(), w, id, user.ID, held)
 		return
 	}
+	prerequisites, err := h.q.CountLivePrerequisiteClosuresForConnection(r.Context(), store.CountLivePrerequisiteClosuresForConnectionParams{ConnectionID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("count prerequisite closures for connection delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if prerequisites > 0 {
+		writePrerequisiteConflict(w, prerequisites)
+		return
+	}
 	rows, err := h.q.DeleteForgeConnectionForUser(r.Context(), store.DeleteForgeConnectionForUserParams{ID: id, UserID: user.ID})
 	if err != nil {
 		// A sweep recorded a salvage row between the count above and this delete: the
@@ -552,6 +562,14 @@ func (h *Handler) DeleteConnection(w http.ResponseWriter, r *http.Request) {
 		// Same race for a held publication recorded between its count and this delete.
 		if isHeldRestrict(err) {
 			h.writeConnectionHeldConflict(r.Context(), w, id, user.ID, -1)
+			return
+		}
+		if isPrerequisiteRestrict(err) {
+			count, countErr := h.q.CountLivePrerequisiteClosuresForConnection(r.Context(), store.CountLivePrerequisiteClosuresForConnectionParams{ConnectionID: id, UserID: user.ID})
+			if countErr != nil {
+				slog.Error("recount prerequisite closures for connection delete", "error", countErr)
+			}
+			writePrerequisiteConflict(w, count)
 			return
 		}
 		slog.Error("delete connection", "error", err)
@@ -1022,6 +1040,16 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 		h.writeRepoHeldConflict(r.Context(), w, id, user.ID, held)
 		return
 	}
+	prerequisites, err := h.q.CountLivePrerequisiteClosuresForRepo(r.Context(), store.CountLivePrerequisiteClosuresForRepoParams{RepoID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("count prerequisite closures for repo delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if prerequisites > 0 {
+		writePrerequisiteConflict(w, prerequisites)
+		return
+	}
 	// The :execrows return may be 0 if a concurrent enable slipped in between the
 	// fetch above and this delete — that is the D6 `enabled = false` guard working, so
 	// treat 0 rows as an already-gone no-op and still return 204, never 500.
@@ -1036,11 +1064,38 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 			h.writeRepoHeldConflict(r.Context(), w, id, user.ID, -1)
 			return
 		}
+		if isPrerequisiteRestrict(err) {
+			count, countErr := h.q.CountLivePrerequisiteClosuresForRepo(r.Context(), store.CountLivePrerequisiteClosuresForRepoParams{RepoID: id, UserID: user.ID})
+			if countErr != nil {
+				slog.Error("recount prerequisite closures for repo delete", "error", countErr)
+			}
+			writePrerequisiteConflict(w, count)
+			return
+		}
 		slog.Error("delete repo", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+const prerequisiteRestrictConstraint = "recovery_prerequisite_closures_live_run_id_fkey"
+
+func isPrerequisiteRestrict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == prerequisiteRestrictConstraint
+}
+
+// writePrerequisiteConflict also covers a marker committed after the pre-count.
+// The FK proves at least one live pointer even if the recount fails or races cleanup.
+func writePrerequisiteConflict(w http.ResponseWriter, count int64) {
+	if count < 1 {
+		count = 1
+	}
+	httpx.JSON(w, http.StatusConflict, map[string]any{
+		"error":                      "prerequisite pins protect recovery archives; wait for their lifecycle to settle before removing this resource",
+		"prerequisite_closure_count": count,
+	})
 }
 
 // salvageRefListCap bounds how many live salvage rows a removal 409 names; the total row

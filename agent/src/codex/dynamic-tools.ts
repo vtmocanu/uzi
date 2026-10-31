@@ -86,7 +86,10 @@ function definition(name: string, grants: RunGrants): Omit<CodexDynamicToolSpec,
       };
     case "Search":
       return {
-        description: "Search checkout text with fixed directory, entry, byte, and result limits.",
+        description: "Search checkout text for a literal string (not a regex) of at most 256 bytes. path may be a directory or one regular file. " +
+          "Ceilings: 10 s, 2048 operations, 1024 directories, 16384 entries, 16 MiB total, files over 1 MiB skipped, 20 matches. " +
+          "When a ceiling is reached the result returns the matches found so far with truncated:true, reason, skippedFiles and notice. " +
+          "A truncated result is not complete coverage; an empty truncated result never means the text is absent.",
         inputSchema: objectSchema({ query: STRING, path: STRING }, ["query"], false),
       };
     case "Skill":
