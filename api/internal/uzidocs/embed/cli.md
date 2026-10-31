@@ -2144,7 +2144,12 @@ or workflow name.
   every 10s.
 - **`ci`** lists the repo's CI/workflow runs, banded **RUNNING**,
   **FAILED**, and **RECENT**, each row carrying a `▰▱ done/total` jobs
-  micro-bar while it's running. On a forge version with no Actions/CI-runs
+  micro-bar while it's running. Like the board, each band heading carries
+  faint column names over its cells: `event`, `branch`, `status`, then
+  `elapsed` (RUNNING) or `took` (finished bands) for the run time, `title`,
+  and `jobs/age` (RUNNING: the jobs bar, or the age before jobs report) or
+  `age` (time since the run was triggered), following the columns shown at
+  the terminal's width. On a forge version with no Actions/CI-runs
   API it degrades to a one-line notice instead of an empty list. Polls
   every 10s.
 - **PR view** (`enter`/`→` on a `pulls` row) drills into one PR: CHECKS

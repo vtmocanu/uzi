@@ -131,6 +131,7 @@ func helpLines(v tuiView) []string {
 			"tab / shift+tab  floor · workers · pulls · ci",
 			"1 / 2 / 3 / 4  floor / workers / pulls / ci",
 			"R          cycle the scoped repo (when several are enabled)",
+			"elapsed / took  run time so far / in total · age  since the run was triggered",
 		}, common...)
 	case viewPR:
 		return append([]string{
