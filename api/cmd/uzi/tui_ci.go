@@ -398,7 +398,15 @@ func (m tuiModel) renderCIBody(height int, fullScreen bool) string {
 		for i := start; i < end; i++ {
 			switch it := items[i]; it.kind {
 			case biEyebrow:
-				sb.WriteString(clampVisual(m.ciEyebrow(it), m.width) + "\n")
+				head := m.ciEyebrow(it)
+				// Faint column names over the band's cells (#3736), only when a row of the band
+				// is rendered below the heading.
+				if i+1 < end && items[i+1].kind == biRow {
+					if labels := placeBoardLabels(visualWidth(head), m.width, m.ciColumnLabels(it.band)); labels != "" {
+						head += m.pal.faint.Render(labels)
+					}
+				}
+				sb.WriteString(clampVisual(head, m.width) + "\n")
 			case biRow:
 				r := rows[it.runIdx]
 				sel := it.runIdx == m.ci.cursor
@@ -483,6 +491,46 @@ func (m tuiModel) ciEyebrow(it boardItem) string {
 		return " " + lipgloss.NewStyle().Foreground(m.pal.amber).Bold(true).Render(name) + m.pal.faint.Render(" · "+itoa(it.count))
 	}
 	return " " + m.pal.faint.Render(name+" · "+itoa(it.count))
+}
+
+// ciColumnLabels is the column-name set for one CI band heading (#3736), positioned over the
+// cells ciRow draws, following ciColumnsFor's tiers: any change to ciRow's column order or cell
+// widths must move here too (TestCIEyebrowLabelsAlignWithCells pins the two together). The
+// name column carries none: the heading text sits over it. RUNNING's elapsed time is still
+// running and its right cell is a jobs bar or an age (ciRightCell), so it reads `elapsed` and
+// `jobs/age`; finished bands read `took` and `age`.
+func (m tuiModel) ciColumnLabels(band int) []boardColLabel {
+	cols := ciColumnsFor(m.width)
+	var out []boardColLabel
+	add := func(text string, start int) { out = append(out, boardColLabel{text, start}) }
+	pos := 4 + ciNameWidth + 2
+	if cols.event {
+		add("event", pos)
+		pos += ciEventWidth + 2
+	}
+	if cols.branch {
+		add("branch", pos)
+		pos += ciBranchWidth + 2
+	}
+	if cols.statusElapsed {
+		add("status", pos)
+		pos += ciStatusWidth + 2
+		if band == ciBandRunning {
+			add("elapsed", pos)
+		} else {
+			add("took", pos)
+		}
+		pos += ciElapsedWidth + 2
+	}
+	add("title", pos)
+	if cols.right {
+		if band == ciBandRunning {
+			add("jobs/age", m.width-ciRightWidth)
+		} else {
+			add("age", m.width-ciRightWidth)
+		}
+	}
+	return out
 }
 
 // ciRow renders one CI run: the ▌ andon spine + state glyph, `<Name> #<Number>` (an OSC-8 link
