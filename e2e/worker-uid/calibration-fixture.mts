@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import { performance } from "node:perf_hooks";
 import { CodexCallbackBroker, type CapturedMemoryContext, type CodexCallbackBrokerOptions } from "../../agent/src/codex/broker.js";
 import { makeDefaultSpawnCommand } from "../../agent/src/codex/codex-executor.js";
-import { launchCodexEffectRoot, type CodexRootHandle, type SpawnSupervisor } from "../../agent/src/codex/launcher.js";
+import { launchCodexEffectRoot, type CodexRootHandle, type SpawnSupervisor, type SupervisorProcess } from "../../agent/src/codex/launcher.js";
 import { boundedCommandWait } from "../../agent/src/codex/memory-command.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../../agent/src/codex/registry.js";
 import { WorkerMemoryCommands } from "../../agent/src/worker-memory-commands.js";
@@ -109,7 +109,7 @@ export function oomEventEvidence(records: readonly EventRecord[]) {
   const before: Record<string, number | null> = {}, after: Record<string, number | null> = {};
   const delta: Record<string, number | null> = {};
   for (const key of ["oom", "oom_kill", "oom_group_kill"]) {
-    const a = first.events?.[key] ?? null, b = last.events?.[key] ?? null;
+    const a: number | null = first.events?.[key] ?? null, b: number | null = last.events?.[key] ?? null;
     assert.ok([a, b].every((v) => v === null || (Number.isSafeInteger(v) && v >= 0)), "invalid OOM counter");
     before[key] = a; after[key] = b;
     delta[key] = a === null || b === null ? null : b - a;
@@ -385,7 +385,7 @@ export async function fixture(manifestFile: string, fixtureId: string) {
           if (message.op === "dispose") signalWrites.push({ index, startMs, endMs: now() });
           return result;
         }) as typeof control.write;
-        return child;
+        return child as unknown as SupervisorProcess;
       };
       // Same executed M5a capless profile; no claim of a UID transition.
       const handle = await launchCodexEffectRoot({ ...spec, command: "/usr/local/bin/uzi-codex-command-sandbox" }, {
