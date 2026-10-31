@@ -2564,8 +2564,10 @@ describe("lead guidance routing", () => {
       "declare `non_closing` with a reason naming them as pending and not verified",
       "On an auto-approved run `ask_user` reaches no human: keep each consequentially doubtful item as a required milestone",
       "Never silently omit ambiguous work from the milestones", "formal owner partial decision",
+      "when `ask_user` reaches a human (no autopilot note), settle consequential doubt with it",
+      "frozen and still unmet, goes to the formal owner completion decision",
     ]) assert.ok(flat.includes(phrase), phrase);
-    for (const gone of ["informative milestone", "also on an auto-approved run", "Milestones hold only work"]) {
+    for (const gone of ["informative milestone", "also on an auto-approved run", "Milestones hold only work", "on a gated run settle"]) {
       assert.ok(!flat.includes(gone), gone);
     }
   });

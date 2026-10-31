@@ -62,13 +62,12 @@ autopilot note), settle consequential doubt with it before the final
 `submit_plan`, never as a question in plan prose. On an auto-approved run
 `ask_user` reaches no human: keep each consequentially doubtful item as a
 required milestone and record the uncertainty in the plan; auto-approval, a
-checker approval and the auto-answer supply no waiver, and an unmet one goes
-to the formal owner completion decision. Never silently omit ambiguous work
-from the milestones. A frozen milestone
-that remains unmet still needs a formal owner partial decision with exact
-kept/deferred milestone IDs and a reason. Never describe
-unperformed checks as accepted or done. For an approved issue delivery that
-leaves the issue open, re-declare `non_closing` with a reason in every
+checker approval and the auto-answer supply no waiver. Never silently omit
+ambiguous work from the milestones. Any milestone, frozen and still unmet,
+goes to the formal owner completion decision; a formal owner partial decision
+names exact kept/deferred milestone IDs and a reason. Never describe unperformed checks as
+accepted or done. For an approved issue delivery that leaves the issue open,
+re-declare `non_closing` with a reason in every
 `signal_done`, including after an owner answer; it never waives frozen scope.
 
 Before you call `submit_plan`, make the plan carry its own evidence: for every
