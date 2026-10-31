@@ -203,6 +203,8 @@ describe("Search partial results", () => {
     });
 
     it("entries", async () => {
+      // Freeze the clock so the real 10 s deadline cannot preempt this ceiling on a slow runner.
+      mock.timers.enable({ apis: ["setTimeout", "Date"] });
       const mem = spreadEntries(16400);
       const fileop = memFileop(mem);
       expectPartial(outputOf(await call(brokerFor(fileop), { query: "needle" })), "entries");
@@ -289,11 +291,12 @@ describe("Search partial results", () => {
     });
 
     it("entries boundary: exactly 16384 entries are not capped, 16385 are", async () => {
-      const build = spreadEntries;
-      const exact = outputOf(await call(brokerFor(memFileop(build(16384))), { query: "needle" }));
+      // Freeze the clock so the real 10 s deadline cannot preempt this ceiling on a slow runner.
+      mock.timers.enable({ apis: ["setTimeout", "Date"] });
+      const exact = outputOf(await call(brokerFor(memFileop(spreadEntries(16384))), { query: "needle" }));
       assert.equal(exact.truncated, false);
       assert.equal(exact.reason, undefined);
-      const over = outputOf(await call(brokerFor(memFileop(build(16385))), { query: "needle" }));
+      const over = outputOf(await call(brokerFor(memFileop(spreadEntries(16385))), { query: "needle" }));
       assert.equal(over.truncated, true);
       assert.equal(over.reason, "entries");
     });
