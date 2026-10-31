@@ -207,15 +207,32 @@ test("rejection cleanup bounds ignored alias entries and retains uncertainty on 
   } finally { r.controller.abort(); await fs.rm(r.root, { recursive: true, force: true }); }
 });
 
-test("no feature makes zero POST/GET, logs once per episode and rollback stops queued retries", async () => {
+test("no feature makes zero POST/GET, logs once per episode and rollback stops queued retries", async (t) => {
   const r = await rig([3, 4, 5]);
   r.client.clearFeatures();
+  let phase: "initial" | "rollback" = "initial";
+  let falseChecks = 0;
+  let initialObserved!: () => void;
+  const initialReady = new Promise<void>((resolve) => { initialObserved = resolve; });
+  let rollbackObserved!: () => void;
+  const rollbackReady = new Promise<void>((resolve) => { rollbackObserved = resolve; });
+  const hasFeature = r.client.hasFeature.bind(r.client);
+  t.mock.method(r.client, "hasFeature", (feature: string) => {
+    const supported = hasFeature(feature);
+    if (feature === "terminal_rejection_report" && !supported && ++falseChecks >= 2) {
+      if (phase === "initial") initialObserved();
+      else rollbackObserved();
+    }
+    return supported;
+  });
   let calls = 0;
   const lines: string[] = [];
   const log = { ...nullLogger(), info: (message: string) => { lines.push(message); } };
   globalThis.fetch = async (_url, init) => {
     calls++;
     assert.equal(init?.method, "POST");
+    phase = "rollback";
+    falseChecks = 0;
     r.client.clearFeatures();
     const body = JSON.parse(String(init.body));
     return Response.json({ dispositions: body.rejections.map((x: object) => ({ ...x, disposition: "recorded" })) });
@@ -223,42 +240,57 @@ test("no feature makes zero POST/GET, logs once per episode and rollback stops q
   const coordinator = new TerminalRejectionCoordinator(r.outbox, r.client, log, undefined, undefined, 2, 50);
   const loop = coordinator.loop(worker, r.controller.signal);
   try {
-    await sleep(30);
-    assert.equal(calls, 0);
-    assert.equal(lines.length, 1);
-    assert.ok(lines[0]!.length < 160);
-    r.client.protocolFeatures = ["terminal_rejection_report"];
-    coordinator.queueReconciliation();
-    await until(() => calls === 1 && lines.length === 2);
-    await sleep(30);
-    assert.equal(calls, 1);
-    assert.equal(lines.length, 2);
-    assert.equal(await r.outbox.hasPhysicalTerminalProtection(run), true);
+    await waitForTestEvent((async () => {
+      // supported() logs synchronously after hasFeature returns, before this continuation.
+      await initialReady;
+      assert.ok(falseChecks >= 2);
+      assert.equal(calls, 0);
+      assert.equal(lines.length, 1);
+      assert.ok(lines[0]!.length < 160);
+      r.client.protocolFeatures = ["terminal_rejection_report"];
+      coordinator.queueReconciliation();
+      await rollbackReady;
+      assert.ok(falseChecks >= 2);
+      assert.equal(calls, 1);
+      assert.equal(lines.length, 2);
+      assert.ok(lines[1]!.length < 160);
+      assert.equal(await r.outbox.hasPhysicalTerminalProtection(run), true);
+    })(), "two unsupported checks in each feature-disabled episode", 10_000);
   } finally { await r.clean(loop); }
 });
 
-test("exact settled fresh GET removes uppercase physical alias; open sibling retains source protection", async () => {
+test("exact settled fresh GET removes uppercase physical alias; open sibling retains source protection", async (t) => {
   const r = await rig([3], run.toUpperCase());
   let siblingOpen = true;
-  let gets = 0;
+  let openCustodyObserved!: () => void;
+  const openCustodyReady = new Promise<void>((resolve) => { openCustodyObserved = resolve; });
+  let cleanupObserved!: (count: number) => void;
+  const cleanupReady = new Promise<number>((resolve) => { cleanupObserved = resolve; });
+  const cleanup = r.outbox.cleanupRejectedTerminalFiles.bind(r.outbox);
+  t.mock.method(r.outbox, "cleanupRejectedTerminalFiles", async (...args: Parameters<typeof cleanup>) => {
+    const count = await cleanup(...args);
+    if (count > 0) cleanupObserved(count);
+    return count;
+  });
   globalThis.fetch = async (_url, init) => {
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
       return Response.json({ dispositions: body.rejections.map((x: object) => ({ ...x, disposition: "recorded" })) });
     }
-    gets++;
+    if (siblingOpen) openCustodyObserved();
     return Response.json(siblingOpen ? { ...custody(3), sibling_count: 1,
       sibling_holds: [{ id: worker, generation: 4 }], outcome: "unknown" } : custody(3));
   };
   const coordinator = new TerminalRejectionCoordinator(r.outbox, r.client, nullLogger(), undefined, undefined, 2, 50);
   const loop = coordinator.loop(worker, r.controller.signal);
   try {
-    await until(() => gets > 0);
+    await waitForTestEvent(openCustodyReady, "fresh custody with an open sibling", 10_000);
     assert.equal(await r.outbox.hasPhysicalTerminalProtection(run), true);
     assert.equal(await fs.readFile(r.file(), "utf8"), badRecord());
     siblingOpen = false; // An owner discard is only a wake; this subsequent GET supplies authority.
     coordinator.queueReconciliation(run, 3);
-    await until(async () => !(await fs.stat(r.file()).catch(() => undefined)));
+    assert.equal(await waitForTestEvent(cleanupReady, "completed uppercase-alias cleanup", 10_000), 1);
+    await assert.rejects(fs.stat(r.file()), { code: "ENOENT" });
     assert.equal(await r.outbox.hasPhysicalTerminalProtection(run), false);
     assert.equal(await r.outbox.hasPendingPolicyOutcome(run), false, "uppercase cleanup drops its exact unknown sentinel");
   } finally { await r.clean(loop); }

@@ -146,9 +146,35 @@ test("default constructor coordinator handles a real outbox restart without pend
   const heartbeat = deferred<void>();
   const cleaned = deferred<number>();
   const cleanup = r.outbox.cleanupRejectedTerminalFiles.bind(r.outbox);
+  const lockedOutbox = r.outbox as unknown as {
+    withRunLock<T>(runId: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T>;
+  };
+  let attempts = 0;
+  let forcedBusy = false;
+  let custodyGets = 0;
+  let firstCount: number | undefined;
+  let coordinator: TerminalRejectionCoordinator;
   t.mock.method(r.outbox, "cleanupRejectedTerminalFiles", async (...args: Parameters<typeof cleanup>) => {
-    const count = await cleanup(...args);
-    if (count > 0) cleaned.resolve(count);
+    const first = attempts++ === 0;
+    const getsBefore = custodyGets;
+    const count = first
+      ? await lockedOutbox.withRunLock(args[0], () => cleanup(...args))
+      : await cleanup(...args);
+    if (first) {
+      firstCount = count;
+      assert.equal(count, 0, "the real outbox lock makes the first cleanup busy");
+      assert.ok(await fs.stat(r.file), "diagnostic POST cannot authorize deletion");
+      assert.equal(custodyGets, getsBefore, "busy cleanup cannot obtain custody authority");
+      forcedBusy = true;
+    }
+    // Model retry after transient lock contention through the public coalesced wake.
+    // Await the whole withRunLock call before waking; keep the default 30s interval.
+    // The single real watchdog below bounds all attempts, including further busy results.
+    if (count === 0) coordinator.queueReconciliation();
+    if (count > 0) {
+      assert.ok(custodyGets > getsBefore, "successful cleanup obtained fresh custody");
+      cleaned.resolve(count);
+    }
     return count;
   });
   let registerBody: Record<string, unknown> | undefined;
@@ -164,21 +190,31 @@ test("default constructor coordinator handles a real outbox restart without pend
       const body = JSON.parse(String(init.body));
       return Response.json({ dispositions: body.rejections.map((x: object) => ({ ...x, disposition: "recorded" })) });
     }
+    if (route.includes("/terminal-rejection-custody?")) custodyGets++;
     return Response.json(settled());
   };
   const client = new WorkerClient("http://worker.invalid", "join-token", "test", nullLogger());
+  const worker = makeWorker(r, client);
+  coordinator = (worker as unknown as { terminalRejections: TerminalRejectionCoordinator }).terminalRejections;
+  assert.ok(coordinator);
   // Isolate default-constructor wiring from Outbox's cooperative proof clock.
   // The watchdog and AbortSignal HTTP deadlines still use real timers.
   const proofNow = Date.now();
   const clock = t.mock.method(Date, "now", () => proofNow);
-  const running = makeWorker(r, client).run(r.controller.signal);
+  const running = worker.run(r.controller.signal);
   try {
     const [, removed] = await waitForTestEvent(
       Promise.all([heartbeat.promise, cleaned.promise]), "heartbeat and actual rejection cleanup", 5000);
+    assert.equal(firstCount, 0);
+    assert.equal(forcedBusy, true);
+    assert.ok(attempts >= 2);
     assert.equal(removed, 1);
     await assert.rejects(fs.stat(r.file), { code: "ENOENT" });
     assert.equal(registerBody?.active_snapshot, undefined);
     assert.equal(r.registry.size, 0);
+  } catch (error) {
+    t.diagnostic(`cleanup attempts=${attempts}, firstCount=${firstCount}, forcedBusy=${forcedBusy}, custodyGets=${custodyGets}`);
+    throw error;
   } finally {
     r.controller.abort();
     try { await running; } finally { clock.mock.restore(); }
