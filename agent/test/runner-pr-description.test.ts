@@ -1008,6 +1008,8 @@ describe("m2 non-closing delivery", () => {
     const { gitlab, pr } = fakeGitlab();
     const claim = interlockedClaim(3721);
     claim.issue_title = "Fixes #3721"; // a closing issue title must not reach the PR title either
+    // The completion permit is canned (always granted), so the "no completion hold" assert below
+    // guards agent-side holding only, not the server's all-milestones-met decision.
     api.setCompletionPermitResponse(true);
     api.setInputs(claim.run_id, [input("approve_plan")]);
     const reason = "Owner acceptance pending: live dev-cluster rollout check";

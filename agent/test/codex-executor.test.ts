@@ -14013,6 +14013,8 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
         config: { completion_contract_version: 1, contract_revision: 1 },
       });
       m2Runner.api.setPublicationState(claim.run_id, [], 1);
+      // The completion permit is canned (always granted), so the "no completion hold" assert below
+      // guards agent-side holding only, not the server's all-milestones-met decision.
       m2Runner.api.setCompletionPermitResponse(true);
       await m2Runner.runner(delivery, gitlab).execute(claim);
       const states = m2Runner.api.states.filter(s => s.runId === claim.run_id).map(s => s.body.status);
@@ -14026,6 +14028,7 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
       assert.ok(pr.description.includes(`> **Issue remains open.** ${reason}`), pr.description);
       assert.match(pr.description, /- Deferred: Owner acceptance: live dev-cluster rollout check/);
       assert.match(pr.description, /- Deferred: Owner acceptance: dashboard sign-off/);
+      assert.equal(prApi.calls.find(c => c.op === "stage")!.body.source, "lead_only", "the notes came from the lead's claims");
     });
     it("m2 non-closing actual broker callback retitles a closing issue title (issue #2779)", async () => {
       const rig = makeMultiEpochRig([script("th-1", [

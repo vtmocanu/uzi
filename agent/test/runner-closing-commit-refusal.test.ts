@@ -73,7 +73,7 @@ describe("declared non-closing run with a closing commit message (issue #2779)",
     assert.equal(originHasBranch(), false);
   });
 
-  it("issue #3721 all-met interlocked run declaring non_closing for owner acceptance: a `Closes #N` commit is refused before any push or forge call", async () => {
+  it("issue #3721 interlocked run declaring an owner-acceptance non_closing: a `Closes #N` commit is refused before any push or forge call", async () => {
     api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
     await client.register("closing-commit-3721");
     const { gitlab, all } = fakeGitlab();
@@ -84,8 +84,12 @@ describe("declared non-closing run with a closing commit message (issue #2779)",
       config: { completion_contract_version: 1, contract_revision: 1 },
     });
     api.setPublicationState(claim.run_id, [], 1);
+    // The completion permit is canned (always granted): "all milestones met" comes from this stub, so
+    // the single hold below is the agent-side history-correction hold, not a server decision.
     api.setCompletionPermitResponse(true);
-    const executor = committing("Closes #3721", obs, true);
+    const executor = committing("Closes #3721", obs, true, "closing.txt", {
+      nonClosing: { reason: "Owner acceptance pending: live dev-cluster rollout check" },
+    });
     await runner(executor, gitlab).execute(claim);
     assert.ok(obs.sha);
     // An interlocked, hold-eligible run takes the owner-held path instead of failing: the refusal is
