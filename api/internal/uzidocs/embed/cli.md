@@ -1927,8 +1927,9 @@ A newer release is available.
   time from the run's first start to its finish, so approval waits, limit parks
   and pauses count too. It is blank for a run that never started or has no
   finish stamp, and blank on active rows (the cell is reserved so columns line
-  up). It is the lowest-priority column: it appears only at 111 columns or wider
-  (123 with the account column) and is the first to go on a narrowing terminal.
+  up). It is the lowest-priority column: it appears only from 111 columns (123
+  with the account column, wider still when judge badges are shown) and is the
+  first to go on a narrowing terminal. The `?` legend names both numbers.
   `[h]` hides finished runs (completed/failed/cancelled),
   leaving the active and needs-you runs. The rows are grouped into three
   triage bands (NEEDS YOU, then ON THE FLOOR, then DONE) rather than one

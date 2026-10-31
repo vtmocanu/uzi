@@ -82,6 +82,12 @@ type boardState struct {
 	// scroll is the index of the first visible run row: the board windows the run list to
 	// the terminal height so the header and footer stay on screen even with hundreds of runs.
 	scroll int
+
+	// heldVerdictW / heldCountW are markerSlotWidths over every held run, refreshed where runs
+	// are accepted, so boardShowDur can reserve the judge marker's width without re-scanning
+	// the list on every row it renders. Over all held runs (a superset of the filtered view),
+	// so the reservation is conservative and does not move while filtering.
+	heldVerdictW, heldCountW int
 }
 
 func newBoardState() boardState { return boardState{} }
@@ -116,6 +122,7 @@ func (b *boardState) apply(msg boardRunsMsg) {
 		keep = b.selectedID()
 	}
 	b.runs = msg.runs
+	b.heldVerdictW, b.heldCountW = markerSlotWidths(b.runs)
 	// Record the accepted set's provenance. This is the single site runs are accepted (the
 	// error path above leaves runs — and so runsAdmin — untouched), and msg.admin == b.admin
 	// is guaranteed by the early return, so this is exactly the admin-ness of the held runs.
@@ -1030,7 +1037,8 @@ func (m tuiModel) boardShowCost() bool {
 // Run length is the lowest-priority column: it is a retrospective signal, while the milestone
 // micro-bar, percentage and COST describe live work. So it is shown only when the whole row
 // still fits with it: the prefix with run length and COST, the micro-bar plus percentage, the
-// title floor, and the worker column counted unconditionally. Counting the worker column even
+// title floor, the judge marker when any held run has one, and the worker column counted
+// unconditionally. Counting the worker column even
 // below its 120 breakpoint makes the threshold conservative but monotonic, so neither this
 // column nor the percentage flaps on/off across that breakpoint, and the #379 thresholds of
 // the milestone and COST columns are unchanged. Not derived from boardShowMile/boardShowProg
@@ -1041,6 +1049,11 @@ func (m tuiModel) boardShowDur() bool {
 	}
 	need := boardRowPrefixWidth(false, true, m.boardShowCred(), true) +
 		boardMileWidth + 1 + boardProgPctWidth + 2 + boardProgTitleFloor + boardWorkerColumnWidth
+	// The judge marker is flushed right and its width (plus gap) comes off the title, so it is
+	// reserved too: otherwise the column would appear at the threshold and squeeze the title.
+	if mc := m.markerColsFor(m.board.heldVerdictW, m.board.heldCountW); mc.fullW > 0 {
+		need += mc.fullW + 2
+	}
 	return m.width >= need
 }
 

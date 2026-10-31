@@ -157,3 +157,63 @@ func TestBoardRunLengthWidthShedding(t *testing.T) {
 		}
 	}
 }
+
+// With judge markers on screen the gate also reserves the marker's width, so the column never
+// appears at the cost of the title floor (tui-ux review: 123 → 16 visible title chars).
+func TestBoardRunLengthKeepsTitleWithJudgeMarkers(t *testing.T) {
+	done, running := durRuns()
+	const title = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz"
+	done.IssueTitle, running.IssueTitle = title, title
+	done.JudgeVerdict, done.JudgeTodoCount = sp("issues"), 3
+	running.JudgeVerdict = sp("ok")
+	pct := 70
+	running.Progress = &apitypes.RunProgress{State: "percent", Pct: &pct}
+	// Full-width account and cost cells, so measured columns leave no slack below the gate's
+	// fixed reservations.
+	for _, r := range []*apitypes.RunListItemDTO{&done, &running} {
+		r.Harness = "claude"
+		r.AnthropicSecretID, r.AnthropicSecretLabel = sp("fixture-account"), sp("credential")
+		r.Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 1234}
+	}
+	for _, cred := range []bool{false, true} {
+		sawDur := false
+		for w := 60; w <= 220; w++ {
+			m := progBoard(t, w, done, running)
+			if cred {
+				m.tokenCount = 2
+			}
+			if !m.boardShowDur() {
+				continue
+			}
+			sawDur = true
+			for _, line := range viewLines(m) {
+				line = stripANSI(line)
+				i := strings.Index(line, "abcdefghij")
+				if i < 0 {
+					continue
+				}
+				tw := 0
+				for _, r := range line[i:] {
+					if r < '0' || r > 'z' {
+						break
+					}
+					tw++
+				}
+				if tw < 20 {
+					t.Errorf("cred %t width %d: run length shown with only %d title cols: %q", cred, w, tw, line)
+				}
+			}
+		}
+		if !sawDur {
+			t.Errorf("cred %t: run length never shown up to 220 columns", cred)
+		}
+	}
+}
+
+// The bare run-length cell is explained in the board's ? legend (user call: keep the cell
+// unlabelled).
+func TestBoardHelpExplainsRunLength(t *testing.T) {
+	if got := strings.Join(helpLines(viewBoard), "\n"); !strings.Contains(got, "then run length (") {
+		t.Errorf("board help lacks the run-length legend:\n%s", got)
+	}
+}

@@ -479,23 +479,30 @@ func boardRowPrefixWidth(admin, dur, cred, cost bool) int {
 type boardMarkerCols struct{ verdictW, countW, fullW int }
 
 func (m tuiModel) boardMarkerCols(rows []apitypes.RunListItemDTO) boardMarkerCols {
-	var mc boardMarkerCols
 	if m.board.admin {
-		return mc
+		return boardMarkerCols{}
 	}
+	vw, cw := markerSlotWidths(rows)
+	return m.markerColsFor(vw, cw)
+}
+
+// markerSlotWidths is the widest verdict word and "· N" count across rows; 0, 0 when no row
+// carries a verdict. The verdict goes through the same Plain sanitize-and-cap the marker draws.
+func markerSlotWidths(rows []apitypes.RunListItemDTO) (verdictW, countW int) {
 	for _, r := range rows {
 		if r.JudgeVerdict == nil {
 			continue
 		}
-		if w := visualWidth(m.renderer.Plain(*r.JudgeVerdict, 8)); w > mc.verdictW {
-			mc.verdictW = w
-		}
+		verdictW = max(verdictW, visualWidth(capCell(cellText(*r.JudgeVerdict), 8)))
 		if r.JudgeTodoCount > 0 {
-			if w := visualWidth("· " + itoa(r.JudgeTodoCount)); w > mc.countW {
-				mc.countW = w
-			}
+			countW = max(countW, visualWidth("· "+itoa(r.JudgeTodoCount)))
 		}
 	}
+	return verdictW, countW
+}
+
+func (m tuiModel) markerColsFor(verdictW, countW int) boardMarkerCols {
+	mc := boardMarkerCols{verdictW: verdictW, countW: countW}
 	if mc.verdictW > 0 {
 		// The empty-verdict/zero-count marker has the full fixed width, and visualWidth accounts
 		// for the ⚖ glyph's own cell count.
