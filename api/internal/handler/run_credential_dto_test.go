@@ -47,6 +47,25 @@ func TestRunToDTOCodexCredential(t *testing.T) {
 	}
 }
 
+// TestRunToDTOSelectReasons pins that each lane's recorded select reason reaches the run DTO
+// (issue #3719 for Codex), and that an unrecorded reason stays null rather than "".
+func TestRunToDTOSelectReasons(t *testing.T) {
+	dto := runToDTO(store.Run{ID: uuid.New(), Harness: "codex",
+		CodexSelectReason:     pgtype.Text{String: "pool_exhausted", Valid: true},
+		AnthropicSelectReason: pgtype.Text{String: "auto", Valid: true},
+	}, "normal", 0, 0, 0, dtoTestNow, 0)
+	if dto.CodexSelectReason == nil || *dto.CodexSelectReason != "pool_exhausted" {
+		t.Fatalf("codex_select_reason = %v, want pool_exhausted", dto.CodexSelectReason)
+	}
+	if dto.AnthropicSelectReason == nil || *dto.AnthropicSelectReason != "auto" {
+		t.Fatalf("anthropic_select_reason = %v, want auto", dto.AnthropicSelectReason)
+	}
+	none := runToDTO(store.Run{ID: uuid.New()}, "normal", 0, 0, 0, dtoTestNow, 0)
+	if none.CodexSelectReason != nil || none.AnthropicSelectReason != nil {
+		t.Fatalf("unrecorded reasons = %v / %v, want both nil", none.CodexSelectReason, none.AnthropicSelectReason)
+	}
+}
+
 // TestRunToDTOAnthropicCredential pins how runToDTO maps PRD #111 M1's two columns:
 // INDEPENDENTLY, never as a pair.
 //

@@ -3041,6 +3041,19 @@ on)` or `Weekly usage reserve: off`; `--json` returns
 `uzi settings get` ends with the same `Weekly usage reserve:` line (after the
 `Now summary:` line), and its `--json` carries both fields.
 
+On a run the reserve touches, `uzi run get` shows:
+
+- a queued run held at admission: a `RESERVE` row with the reason
+  (`weekly usage reserve: 72% >= 70%`, or `weekly usage reserve: weekly usage
+  unknown`) and a `QUEUE_REASON` row reading `weekly_reserve (held by your
+  weekly usage reserve)`; `--json` adds `reserve_hold_reason` and
+  `queue_reason: "weekly_reserve"`;
+- a run the reserve parked: a `HOLD` row with the label `weekly usage reserve`
+  and the next step (`resumes when usage drops below the threshold; override:
+  uzi run resume <id>`);
+- a pending reserve pause: the `PAUSE_REQUESTED` suffix described under
+  `run pause` above.
+
 ### Codex account mode
 
 ```sh
@@ -3058,25 +3071,12 @@ until you do, and `auto` then falls back to your default). A label held by both
 an Anthropic token and a Codex login needs `--kind anthropic|codex`; an
 `openai_api_key` cannot be pooled. `uzi token list` shows the Codex pool state in
 the `POOL` column. `uzi run get` explains the pick on the `CODEX_ALIAS` row, for
-example `work-codex - auto (most limit headroom)`, or `not recorded` for a run
+example `work-codex — auto (most limit headroom)`, or `not recorded` for a run
 created before auto-selection. When `auto` has pooled logins but none can be
 bound, starting a run or an MR rework is refused with a 422 carrying
 `reason: codex_pool_unavailable`; link, re-authenticate or pool a Codex login in
 Settings. `uzi settings get` shows `Codex account mode:` after the reserve line,
 and `--json` carries `codex_account_mode`.
-
-On a run the reserve touches, `uzi run get` shows:
-
-- a queued run held at admission: a `RESERVE` row with the reason
-  (`weekly usage reserve: 72% >= 70%`, or `weekly usage reserve: weekly usage
-  unknown`) and a `QUEUE_REASON` row reading `weekly_reserve (held by your
-  weekly usage reserve)`; `--json` adds `reserve_hold_reason` and
-  `queue_reason: "weekly_reserve"`;
-- a run the reserve parked: a `HOLD` row with the label `weekly usage reserve`
-  and the next step (`resumes when usage drops below the threshold; override:
-  uzi run resume <id>`);
-- a pending reserve pause: the `PAUSE_REQUESTED` suffix described under
-  `run pause` above.
 
 ### Plan cross-check evidence
 

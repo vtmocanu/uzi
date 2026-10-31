@@ -635,8 +635,8 @@ func TestTokenPoolCodexLabel(t *testing.T) {
 	if fc.LastPoolSecretID != "" {
 		t.Errorf("the Anthropic route was called for %q", fc.LastPoolSecretID)
 	}
-	if !strings.Contains(out, "my-codex") {
-		t.Errorf("output should name the alias: %q", out)
+	if !strings.Contains(out, `login "my-codex" is now in the auto-selection pool`) {
+		t.Errorf("output should call a Codex alias a login and name it: %q", out)
 	}
 }
 
