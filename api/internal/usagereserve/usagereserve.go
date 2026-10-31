@@ -119,10 +119,10 @@ type ClaudeReading struct {
 	SyncedAt         *time.Time
 }
 
-// preReset reports a reading synced before a 7-day reset that has since passed: its
+// PreReset reports a reading synced before a 7-day reset that has since passed: its
 // utilization describes the old window, so it proves nothing about the new one. A reset
 // passing only triggers reconsideration; release waits for a post-reset poll.
-func preReset(resetsAt *time.Time, syncedAt, now time.Time) bool {
+func PreReset(resetsAt *time.Time, syncedAt, now time.Time) bool {
 	return resetsAt != nil && !resetsAt.After(now) && syncedAt.Before(*resetsAt)
 }
 
@@ -147,7 +147,7 @@ func EvaluateClaude(threshold *int16, r ClaudeReading, interval time.Duration, n
 		return Verdict{State: OK}
 	}
 	if !r.Present || r.SevenDayPct == nil || r.SyncedAt == nil ||
-		Stale(*r.SyncedAt, true, interval, now) || preReset(r.SevenDayResetsAt, *r.SyncedAt, now) {
+		Stale(*r.SyncedAt, true, interval, now) || PreReset(r.SevenDayResetsAt, *r.SyncedAt, now) {
 		return unknown()
 	}
 	return decide(*threshold, float64(*r.SevenDayPct), r.SevenDayResetsAt)
@@ -190,7 +190,7 @@ func EvaluateCodex(threshold *int16, r CodexReading, interval time.Duration, now
 			if w.UsedPercent == nil || math.IsNaN(*w.UsedPercent) || math.IsInf(*w.UsedPercent, 0) || *w.UsedPercent < 0 {
 				return unknown()
 			}
-			weekly = append(weekly, WeeklyWindow{ResetsAt: codexWindowReset(w, *r.LastSuccessAt), Pct: clampPercent(*w.UsedPercent)})
+			weekly = append(weekly, WeeklyWindow{ResetsAt: CodexWindowReset(w, *r.LastSuccessAt), Pct: clampPercent(*w.UsedPercent)})
 			if best == nil || clampPercent(*w.UsedPercent) > clampPercent(*best.UsedPercent) {
 				best = w
 			}
@@ -199,8 +199,8 @@ func EvaluateCodex(threshold *int16, r CodexReading, interval time.Duration, now
 	if best == nil {
 		return unknown()
 	}
-	resetsAt := codexWindowReset(best, *r.LastSuccessAt)
-	if preReset(resetsAt, *r.LastSuccessAt, now) {
+	resetsAt := CodexWindowReset(best, *r.LastSuccessAt)
+	if PreReset(resetsAt, *r.LastSuccessAt, now) {
 		return unknown()
 	}
 	v := decide(*threshold, clampPercent(*best.UsedPercent), resetsAt)
@@ -208,9 +208,9 @@ func EvaluateCodex(threshold *int16, r CodexReading, interval time.Duration, now
 	return v
 }
 
-// codexWindowReset is a Codex window's reset: its absolute reset when valid, else the reading time
+// CodexWindowReset is a Codex window's reset: its absolute reset when valid, else the reading time
 // plus its relative reset, else nil.
-func codexWindowReset(w *apitypes.CodexRateLimitWindowDTO, readAt time.Time) *time.Time {
+func CodexWindowReset(w *apitypes.CodexRateLimitWindowDTO, readAt time.Time) *time.Time {
 	switch {
 	case w.ResetAt != nil && validReset(*w.ResetAt):
 		t := time.Unix(*w.ResetAt, 0).UTC()
@@ -300,4 +300,50 @@ func CodexOverrideResetObserved(anchor time.Time, priorPct *float64, weekly []We
 		return allReset
 	}
 	return moved
+}
+
+// The closed set of per-account Codex meter statuses (PRD #1209 M3). One definition shared by
+// the rate-limit surface (handler) and the account auto-selector (issue #3719), which treats
+// only CodexMeterFresh as a usable reading.
+const (
+	CodexMeterPending                  = "pending"
+	CodexMeterNoReading                = "no_reading"
+	CodexMeterFresh                    = "fresh"
+	CodexMeterStale                    = "stale"
+	CodexMeterVaultLocked              = "vault_locked"
+	CodexMeterCredentialActionRequired = "credential_action_required" //nolint:gosec // G101: a rate-limit status discriminator string, not a credential
+	CodexMeterPollingDisabled          = "polling_disabled"
+)
+
+// CodexMeterStatus derives one account's closed-set meter status from the poll interval, the
+// user's live vault-lock state, the account's reauth flag, and the two snapshot timestamps
+// (nil = never). Precedence, highest first:
+//
+//  1. polling_disabled: interval <= 0, so nothing will ever refresh the stored snapshot
+//     (served as-is, but flagged stale).
+//  2. vault_locked: the user's vault DEK is not cached, so the poller cannot read the login.
+//  3. credential_action_required: the account is flagged reauth_required.
+//  4. a reading exists (lastSuccessAt set): fresh when its age <= 3x the interval (the same
+//     staleness window as the Anthropic side), else stale.
+//  5. no reading: no_reading when a poll was attempted (lastAttemptAt set), else pending.
+//
+// A per-account status is NEVER no_subscription: that is the empty-accounts-array shape.
+func CodexMeterStatus(interval time.Duration, vaultLocked, reauthRequired bool, lastSuccessAt, lastAttemptAt *time.Time, now time.Time) string {
+	switch {
+	case interval <= 0:
+		return CodexMeterPollingDisabled
+	case vaultLocked:
+		return CodexMeterVaultLocked
+	case reauthRequired:
+		return CodexMeterCredentialActionRequired
+	case lastSuccessAt != nil:
+		if !Stale(*lastSuccessAt, true, interval, now) {
+			return CodexMeterFresh
+		}
+		return CodexMeterStale
+	case lastAttemptAt != nil:
+		return CodexMeterNoReading
+	default:
+		return CodexMeterPending
+	}
 }

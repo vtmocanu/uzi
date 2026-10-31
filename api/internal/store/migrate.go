@@ -153,6 +153,18 @@ func LockSecretMutation(ctx context.Context, db DBTX, userID uuid.UUID) error {
 	return err
 }
 
+// LockSecretMutationShared takes the per-user secret mutation lock in SHARED mode inside db's
+// transaction: any number of shared holders coexist, but they exclude (and are excluded by)
+// every LockSecretMutation holder, which is every writer of a credential row or its account
+// link. Run creation takes it to read the user's Codex pool and freeze a binding against a
+// pool that cannot change before commit (issue #3719). Same class and objid as
+// LockSecretMutation, so it takes part in the same lock order: it MUST be taken before any
+// run row is held, exactly as LockSecretMutation's contract above says.
+func LockSecretMutationShared(ctx context.Context, db DBTX, userID uuid.UUID) error {
+	_, err := db.Exec(ctx, "SELECT pg_advisory_xact_lock_shared($1, $2)", SecretMutationLockClass, SecretMutationLockObjID(userID))
+	return err
+}
+
 // SettingsMutationLockKey is the fixed key passed to pg_advisory_xact_lock as the
 // first statement of every app_settings write transaction (issue #831). It
 // serializes all settings PUTs globally so the cross-key label invariant
