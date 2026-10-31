@@ -1863,6 +1863,9 @@ type ProtectFinalClosureCaptureParams struct {
 
 // Closure-bearing twin of ProtectFinalInventoryCapture: requires prerequisites and an
 // exact still-pinned closure bound to this capture.
+// Precondition: the caller holds the worker, run, hold and capture rows FOR UPDATE and the
+// closure FOR UPDATE (closure last). The composite foreign key's KEY SHARE lock does not
+// serialize against closure state changes, so this query is only safe under those locks.
 func (q *Queries) ProtectFinalClosureCapture(ctx context.Context, arg ProtectFinalClosureCaptureParams) (int64, error) {
 	result, err := q.db.Exec(ctx, protectFinalClosureCapture,
 		arg.WorkerID,
@@ -2089,7 +2092,8 @@ WHERE h.id = $5 AND h.run_id = $6 AND h.user_id = $7
   AND EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id AND r.user_id = h.user_id
     AND (r.claim_generation > h.generation OR (r.claim_generation = h.generation AND
       (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL)))
-    AND NOT (r.status = 'recovery_wait' AND r.recovery_wait_cause IN ('worker_requeue_exhausted',
+    AND NOT (r.status = 'recovery_wait' AND r.recovery_wait_cause IS NOT NULL
+      AND r.recovery_wait_cause IN ('worker_requeue_exhausted',
       'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')))
   AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id = $1::uuid
     AND c.hold_id = h.id AND c.run_id = h.run_id AND c.user_id = h.user_id
@@ -2117,6 +2121,9 @@ type ReleaseFinalClosureHoldParams struct {
 
 // Archive-only release of a hold whose capture carries prerequisites, bound to its pinned closure.
 // Runs parked on an owner-only recovery_wait cause never release this way.
+// Precondition: the caller holds the worker, run, hold and capture rows FOR UPDATE and the
+// closure FOR UPDATE (closure last). The composite foreign key's KEY SHARE lock does not
+// serialize against closure state changes, so this query is only safe under those locks.
 func (q *Queries) ReleaseFinalClosureHold(ctx context.Context, arg ReleaseFinalClosureHoldParams) (int64, error) {
 	result, err := q.db.Exec(ctx, releaseFinalClosureHold,
 		arg.FinalCaptureID,

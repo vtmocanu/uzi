@@ -175,7 +175,7 @@ func TestPrerequisiteClosureReleaseNegativesLiveDB(t *testing.T) {
 		prerequisitePin(t, ctx, other)
 		check(t, f, other.closure.ID)
 	})
-	for _, state := range []string{"pending", "invoked", "create_unknown", "refused", "foreign", "lost"} {
+	for _, state := range []string{"pending", "invoked", "create_unknown", "refused", "foreign", "lost", "deleted"} {
 		t.Run("closure "+state, func(t *testing.T) {
 			f := prerequisiteNew(t, ctx, pool)
 			prerequisiteSetState(t, ctx, f, state)
@@ -232,6 +232,13 @@ func TestPrerequisiteClosureReleaseNegativesLiveDB(t *testing.T) {
 			check(t, f, f.closure.ID)
 		})
 	}
+	t.Run("recovery_wait with a NULL cause", func(t *testing.T) {
+		// NOT (status = 'recovery_wait' AND NULL IN (...)) is NULL, which must not refuse.
+		f := closureReady(t, ctx, prerequisiteNew(t, ctx, pool))
+		mustExec(ctx, t, pool, "UPDATE runs SET claim_generation=2,worker_id=NULL,status='recovery_wait',recovery_wait_cause=NULL WHERE id=$1", f.run)
+		n, err := q.ReleaseFinalClosureHold(ctx, closureReleaseParams(f, f.closure.ID))
+		prerequisiteRows(t, 1, n, err)
+	})
 	t.Run("plain SQL control", func(t *testing.T) {
 		f := closureReady(t, ctx, prerequisiteNew(t, ctx, pool))
 		n, err := closureRaw(ctx, f, "archive", f.capture, "prerequisite_closure", f.closure.ID)
@@ -410,6 +417,20 @@ func TestPrerequisiteFinalListingReservationLiveDB(t *testing.T) {
 		"not pinned": func(t *testing.T) (prerequisiteFixture, pgtype.UUID, int32) {
 			return prerequisiteNew(t, ctx, pool), prerequisiteUUID(uuid.New()), 0
 		},
+		"cleanup deadline in the future": func(t *testing.T) (prerequisiteFixture, pgtype.UUID, int32) {
+			f := pinned(t)
+			// A cleanup lease can only be reserved while the capture is expired or discarded, and a
+			// capture never becomes available again (SQLSTATE 55000), so the available-capture
+			// predicate refuses this row too. The deadline predicate cannot be isolated from it;
+			// this case pins that a live lease is refused with the generation otherwise matching.
+			mustExec(ctx, t, pool, "UPDATE recovery_captures SET state='expired' WHERE id=$1", f.capture)
+			c, err := q.ReservePrerequisiteCleanup(ctx, store.ReservePrerequisiteCleanupParams{
+				PassID: prerequisiteUUID(uuid.New()), ID: f.closure.ID, LeaseSeconds: 3600})
+			if err != nil || !c.CleanupDeadline.Valid {
+				t.Fatalf("fixture: %v %+v", err, c)
+			}
+			return f, prerequisiteUUID(uuid.New()), c.CleanupAttempts
+		},
 		"capture expired": func(t *testing.T) (prerequisiteFixture, pgtype.UUID, int32) {
 			f := pinned(t)
 			mustExec(ctx, t, pool, "UPDATE recovery_captures SET expires_at=clock_timestamp()-interval '1 minute' WHERE id=$1", f.capture)
@@ -534,4 +555,195 @@ func TestPrerequisiteClosureReleaseDownRefusalLiveDB(t *testing.T) {
 	if c := prerequisiteRead(t, ctx, f); c.State != "pinned" {
 		t.Fatalf("refused Down changed the closure: %s", c.State)
 	}
+}
+
+func closureProtectArgs(f prerequisiteFixture, closure uuid.UUID) store.ProtectFinalClosureCaptureParams {
+	return store.ProtectFinalClosureCaptureParams{WorkerID: f.worker, RetentionSeconds: 3600, ID: f.capture,
+		HoldID: f.hold, SourceSha: closureSource, CoverageDigest: prerequisiteText(closureDigest), ClosureID: closure}
+}
+
+func closureCaptureSnapshot(t *testing.T, ctx context.Context, f prerequisiteFixture) string {
+	t.Helper()
+	var s string
+	if err := f.pool.QueryRow(ctx, "SELECT to_jsonb(c)::text FROM recovery_captures c WHERE id=$1", f.capture).Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestPrerequisiteClosureProtectNegativesLiveDB(t *testing.T) {
+	ctx, _, pool := prerequisiteMigratedPool(t, "closure_protect_neg_")
+	q := store.New(pool)
+	refuse := func(t *testing.T, f prerequisiteFixture, closure uuid.UUID) {
+		t.Helper()
+		before := closureCaptureSnapshot(t, ctx, f)
+		n, err := q.ProtectFinalClosureCapture(ctx, closureProtectArgs(f, closure))
+		prerequisiteRows(t, 0, n, err)
+		if after := closureCaptureSnapshot(t, ctx, f); after != before {
+			t.Fatalf("refused protection changed the capture:\n%s\n%s", before, after)
+		}
+	}
+	t.Run("control", func(t *testing.T) {
+		f := prerequisiteNew(t, ctx, pool)
+		prerequisitePin(t, ctx, f)
+		n, err := q.ProtectFinalClosureCapture(ctx, closureProtectArgs(f, f.closure.ID))
+		prerequisiteRows(t, 1, n, err)
+	})
+	t.Run("zero-prerequisite capture", func(t *testing.T) {
+		f := prerequisiteNew(t, ctx, pool)
+		prerequisitePin(t, ctx, f)
+		mustExec(ctx, t, pool, "UPDATE recovery_captures SET prerequisite_shas=NULL WHERE id=$1", f.capture)
+		refuse(t, f, f.closure.ID)
+	})
+	t.Run("closure not pinned", func(t *testing.T) {
+		refuse(t, prerequisiteNew(t, ctx, pool), uuid.Nil)
+		f := prerequisiteNew(t, ctx, pool)
+		refuse(t, f, f.closure.ID)
+	})
+	t.Run("closure absent_since set", func(t *testing.T) {
+		f := prerequisiteNew(t, ctx, pool)
+		prerequisiteSetState(t, ctx, f, "pinned") // pinned with an absence recorded
+		if c := prerequisiteRead(t, ctx, f); c.State != "pinned" || !c.AbsentSince.Valid {
+			t.Fatalf("fixture: %+v", c)
+		}
+		refuse(t, f, f.closure.ID)
+	})
+	t.Run("wrong closure id", func(t *testing.T) {
+		f := prerequisiteNew(t, ctx, pool)
+		prerequisitePin(t, ctx, f)
+		refuse(t, f, uuid.New())
+	})
+	t.Run("closure of another hold", func(t *testing.T) {
+		f := prerequisiteNew(t, ctx, pool)
+		prerequisitePin(t, ctx, f)
+		g := prerequisiteNew(t, ctx, pool)
+		prerequisitePin(t, ctx, g)
+		refuse(t, f, g.closure.ID)
+	})
+}
+
+// TestPrerequisiteClosureReleaseGuardLayersLiveDB drives raw UPDATEs on an otherwise valid
+// closure release so that only the predicate under test differs. The sqlc query is not used,
+// so the recovery_inventory_hold_guard trigger and the table constraints are what refuse.
+func TestPrerequisiteClosureReleaseGuardLayersLiveDB(t *testing.T) {
+	ctx, _, pool := prerequisiteMigratedPool(t, "closure_release_layers_")
+	// refused demands the guard's silent refusal: 0 rows and no error.
+	refused := func(t *testing.T, f prerequisiteFixture, closure uuid.UUID) {
+		t.Helper()
+		before := closureHoldSnapshot(t, ctx, f)
+		n, err := closureRaw(ctx, f, "archive", f.capture, "prerequisite_closure", closure)
+		if err != nil || n != 0 {
+			t.Fatalf("guard must refuse with 0 rows and no error: rows=%d err=%v", n, err)
+		}
+		if after := closureHoldSnapshot(t, ctx, f); after != before {
+			t.Fatalf("refused write changed the hold:\n%s\n%s", before, after)
+		}
+	}
+	t.Run("control", func(t *testing.T) {
+		f := closureReady(t, ctx, prerequisiteNew(t, ctx, pool))
+		n, err := closureRaw(ctx, f, "archive", f.capture, "prerequisite_closure", f.closure.ID)
+		prerequisiteRows(t, 1, n, err)
+	})
+	// A deleted closure also needs a discarded capture, so the capture predicate refuses it as
+	// well; it is covered by the capture predicate and kept here as the state-level case.
+	for _, state := range []string{"pending", "invoked", "create_unknown", "refused", "foreign", "lost", "deleted"} {
+		t.Run("closure "+state, func(t *testing.T) {
+			f := prerequisiteNew(t, ctx, pool)
+			prerequisiteSetState(t, ctx, f, state)
+			closureStamp(t, ctx, f)
+			refused(t, f, f.closure.ID)
+		})
+	}
+	t.Run("closure absent_since set", func(t *testing.T) {
+		f := prerequisiteNew(t, ctx, pool)
+		prerequisiteSetState(t, ctx, f, "pinned")
+		if c := prerequisiteRead(t, ctx, f); c.State != "pinned" || !c.AbsentSince.Valid {
+			t.Fatalf("fixture: %+v", c)
+		}
+		closureStamp(t, ctx, f)
+		refused(t, f, f.closure.ID)
+	})
+	captureCases := map[string]string{
+		"checksum mismatch":          "checksum=repeat('e',64)",
+		"prerequisite mismatch":      "prerequisite_shas=ARRAY[repeat('b',40)]",
+		"capture not available":      "state='expired'",
+		"capture expired":            "expires_at=clock_timestamp()-interval '1 minute'",
+		"capture not manifest-bound": "manifest_bound=false",
+		"capture replica missing":    "local_replica_worker_id=NULL",
+	}
+	for name, set := range captureCases {
+		t.Run(name, func(t *testing.T) {
+			f := closureReady(t, ctx, prerequisiteNew(t, ctx, pool))
+			mustExec(ctx, t, pool, "UPDATE recovery_captures SET "+set+" WHERE id=$1", f.capture)
+			refused(t, f, f.closure.ID)
+		})
+	}
+	t.Run("capture never protected", func(t *testing.T) {
+		f := prerequisiteNew(t, ctx, pool)
+		prerequisitePin(t, ctx, f)
+		refused(t, f, f.closure.ID)
+	})
+	t.Run("closure of another hold", func(t *testing.T) {
+		f := closureReady(t, ctx, prerequisiteNew(t, ctx, pool))
+		g := closureReady(t, ctx, prerequisiteNew(t, ctx, pool))
+		refused(t, f, g.closure.ID)
+	})
+	t.Run("closure_guarded_check on a non-guarded hold", func(t *testing.T) {
+		// A non-guarded hold skips the guard trigger, so the CHECK is the layer. The hold
+		// carries a capture of its own, satisfying every other CHECK.
+		u := heldNewHoldFixture(ctx, t, pool, false, "failed", nil)
+		f := prerequisiteFixture{heldFixture: u, capture: uuid.New()}
+		mustExec(ctx, t, pool, `INSERT INTO recovery_captures
+            (id,hold_id,run_id,user_id,original_worker_id,original_worker_identity,
+             source_sha,idempotency_key,state,manifest_bound,byte_size,checksum,chunk_count,
+             prerequisite_shas,reserved_bytes,coverage_digest,expires_at)
+            VALUES ($1,$2,$3,$4,$5,'held-worker',repeat('a',40),$1::uuid::text,'available',true,
+                3,repeat('f',64),1,ARRAY[repeat('b',40),repeat('c',40)],3,repeat('a',64),now()+interval '1 day')`,
+			f.capture, f.hold, f.run, f.user, f.worker)
+		// No closure can exist for a non-guarded hold (closure provenance requires a guarded one),
+		// so the id is a fresh uuid. CHECKs are evaluated before the foreign key, so
+		// closure_guarded_check is what answers; without it the key would raise 23503.
+		f.closure.ID = uuid.New()
+		before := closureHoldSnapshot(t, ctx, f)
+		n, err := closureRaw(ctx, f, "archive", f.capture, "prerequisite_closure", f.closure.ID)
+		heldCheckName(t, err, "recovery_custody_holds_closure_guarded_check")
+		var p *pgconn.PgError
+		if !errors.As(err, &p) || p.Code != "23514" || n != 0 {
+			t.Fatalf("want SQLSTATE 23514 and 0 rows: rows=%d err=%v", n, err)
+		}
+		if after := closureHoldSnapshot(t, ctx, f); after != before {
+			t.Fatalf("refused write changed the hold:\n%s\n%s", before, after)
+		}
+	})
+	t.Run("INSERT of a full released closure row", func(t *testing.T) {
+		// BEFORE INSERT runs ahead of the CHECKs and the foreign key. The clone has a new id, which
+		// no closure references, so without recovery_closure_hold_insert_guard the foreign key would
+		// raise 23503; the guard's silent 0 rows with no error is what tells the layers apart.
+		f := closureReady(t, ctx, prerequisiteNew(t, ctx, pool))
+		n, err := closureRaw(ctx, f, "archive", f.capture, "prerequisite_closure", f.closure.ID)
+		prerequisiteRows(t, 1, n, err)
+		tag, err := pool.Exec(ctx, `INSERT INTO recovery_custody_holds
+            SELECT (jsonb_populate_record(NULL::recovery_custody_holds,to_jsonb(h) ||
+                jsonb_build_object('id',gen_random_uuid(),'generation',2))).*
+            FROM recovery_custody_holds h WHERE id=$1`, f.hold)
+		if err != nil || tag.RowsAffected() != 0 {
+			t.Fatalf("insert guard must refuse with 0 rows and no error: rows=%d err=%v", tag.RowsAffected(), err)
+		}
+	})
+	t.Run("composite foreign key is declared on the exact column triple", func(t *testing.T) {
+		// Every raw write that would violate the key is refused earlier (the guard trigger for a
+		// guarded hold, closure_guarded_check for a non-guarded one), and the guards are not
+		// disabled in tests. The key is the static backstop, so assert its catalog definition;
+		// the guard trigger is the runtime refuser, proven by the cases above.
+		var def string
+		err := pool.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint
+            WHERE conname='recovery_custody_holds_final_closure_fkey' AND conrelid='recovery_custody_holds'::regclass`).Scan(&def)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "FOREIGN KEY (final_closure_id, final_capture_id, id) REFERENCES recovery_prerequisite_closures(id, capture_id, hold_id) ON DELETE RESTRICT"
+		if def != want {
+			t.Fatalf("foreign key definition:\n got %s\nwant %s", def, want)
+		}
+	})
 }

@@ -950,6 +950,9 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
 -- name: ProtectFinalClosureCapture :execrows
 -- Closure-bearing twin of ProtectFinalInventoryCapture: requires prerequisites and an
 -- exact still-pinned closure bound to this capture.
+-- Precondition: the caller holds the worker, run, hold and capture rows FOR UPDATE and the
+-- closure FOR UPDATE (closure last). The composite foreign key's KEY SHARE lock does not
+-- serialize against closure state changes, so this query is only safe under those locks.
 UPDATE recovery_captures c SET local_replica_worker_id = @worker_id::uuid,
     ready_retention_seconds = @retention_seconds::bigint, updated_at = now()
 WHERE c.id = @id AND c.hold_id = @hold_id AND c.original_worker_id = @worker_id::uuid
@@ -965,6 +968,9 @@ WHERE c.id = @id AND c.hold_id = @hold_id AND c.original_worker_id = @worker_id:
 -- name: ReleaseFinalClosureHold :execrows
 -- Archive-only release of a hold whose capture carries prerequisites, bound to its pinned closure.
 -- Runs parked on an owner-only recovery_wait cause never release this way.
+-- Precondition: the caller holds the worker, run, hold and capture rows FOR UPDATE and the
+-- closure FOR UPDATE (closure last). The composite foreign key's KEY SHARE lock does not
+-- serialize against closure state changes, so this query is only safe under those locks.
 UPDATE recovery_custody_holds h SET state = 'released', live_worker_id = NULL, live_run_id = NULL,
     final_disposition = 'archive', final_capture_id = @final_capture_id::uuid,
     final_source_sha = @final_source_sha::text, final_coverage_digest = @final_coverage_digest::text,
@@ -976,7 +982,8 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
   AND EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id AND r.user_id = h.user_id
     AND (r.claim_generation > h.generation OR (r.claim_generation = h.generation AND
       (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL)))
-    AND NOT (r.status = 'recovery_wait' AND r.recovery_wait_cause IN ('worker_requeue_exhausted',
+    AND NOT (r.status = 'recovery_wait' AND r.recovery_wait_cause IS NOT NULL
+      AND r.recovery_wait_cause IN ('worker_requeue_exhausted',
       'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')))
   AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id = @final_capture_id::uuid
     AND c.hold_id = h.id AND c.run_id = h.run_id AND c.user_id = h.user_id
