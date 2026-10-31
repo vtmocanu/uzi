@@ -81,6 +81,19 @@ function summaryCost(usd: number): string {
   }).format(value);
 }
 
+// Issue #3686: "N PRs · $X per PR" for one window. null when the server did not
+// report the count (older API): never a fabricated 0. The per-PR cost divides the
+// column's displayed cost, so an incomplete cost reads "at least $X per PR" with the
+// cost disclosure's own title. Wording is "PRs" for every forge (no forgeNoun).
+function prSummary(count: number | undefined, cost: number, disclosure: ReturnType<typeof aggregateDisclosure>): ReactNode {
+  if (count == null) return null;
+  const head = `${count.toLocaleString("en-US")} ${count === 1 ? "PR" : "PRs"}`;
+  if (count === 0) return `${head} · — per PR`;
+  const per = summaryCost(cost / count);
+  if (disclosure.incomplete) return <>{head} · <span title={disclosure.title}>at least {per} per PR</span></>;
+  return `${head} · ${per} per PR`;
+}
+
 // PRD #1293: outcomes use the selected window and failed / finished denominator.
 // Issue #1418: remove the needs_landing hatch because an aggregate cannot know
 // whether recoverable work was landed later. It is a descriptive note, not backlog.
@@ -175,6 +188,8 @@ function UsageColumn({ usage, window, personal, runCountLine, owner, aligned = f
   const subscriptionCount = window === "lifetime" ? usage.lifetime_subscription_run_count : usage.last7_subscription_run_count;
   const unreportedCount = window === "lifetime" ? usage.lifetime_unreported_run_count : usage.last7_unreported_run_count;
   const disclosure = aggregateDisclosure(subscriptionCount, unreportedCount);
+  const prText = prSummary(window === "lifetime" ? usage.lifetime_pr_count : usage.last7_pr_count, selected.cost, disclosure);
+  const showRuns = window === "lifetime";
   const delta = lifetime.finished > 0 && outcomes.finished > 0
     ? (outcomes.failed / outcomes.finished - lifetime.failed / lifetime.finished) * 100 : null;
   const deltaText = delta == null ? "" : `${delta < 0 ? "−" : delta > 0 ? "+" : ""}${Math.abs(delta).toFixed(1)} pp vs all-time ${failRate(lifetime)}`;
@@ -208,7 +223,7 @@ function UsageColumn({ usage, window, personal, runCountLine, owner, aligned = f
       <div><FailedRunsBlock outcomes={outcomes} personal={personal} /></div>
       <div><TopCauses outcomes={outcomes} personal={personal} /></div>
       <div>{outcomes.needs_landing > 0 && <p className="text-[11px] text-muted">{outcomes.needs_landing.toLocaleString("en-US")} failed runs with recoverable work. May include work already landed.</p>}</div>
-      <div>{window === "lifetime" && <p className="text-[11px] text-muted">{runCountLine}</p>}</div>
+      <div>{(showRuns || prText != null) && <p className="text-[11px] text-muted">{showRuns && runCountLine}{showRuns && prText != null && " · "}{prText}</p>}</div>
       <div><SinceLastFailedRun outcomes={lifetime} owner={owner} /></div>
     </section>
   );
@@ -323,8 +338,12 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
     selectedOutcomes: recent ? u.last7_outcomes! : u.outcomes,
     subscription: recent ? u.last7_subscription_run_count! : u.subscription_run_count,
     unreported: recent ? u.last7_unreported_run_count! : u.unreported_run_count,
+    selectedPRs: recent ? u.last7_pr_count : u.pr_count,
   })).sort((a, b) => b.b.cost - a.b.cost || b.b.total - a.b.total || b.b.out - a.b.out ||
     (a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0));
+  // Issue #3686: render the PRs column only when every row reports the selected window's count.
+  const showPRs = rows.every((r) => r.selectedPRs != null);
+  const factoryPRs = rows.reduce((sum, r) => sum + (r.selectedPRs ?? 0), 0);
   const factoryMicroUSD = Math.round(factory.cost * 1e6);
   const shares = factoryMicroUSD > 0
     ? costShares(rows.map((r) => Math.round(r.b.cost * 1e6)), factoryMicroUSD)
@@ -340,11 +359,12 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
         <p className="mt-2 text-sm text-faint">No usage across the factory yet.</p>
       ) : (
         <div className="mt-2 overflow-x-auto">
-          <table className="w-full min-w-[680px] border-collapse text-xs">
+          <table className="w-full min-w-[740px] border-collapse text-xs">
             <thead>
               <tr>
                 <Th left>User</Th>
                 <Th>Runs</Th>
+                {showPRs && <Th>PRs</Th>}
                 <Th>Failed</Th>
                 <Th>Fail rate</Th>
                 <Th>Since last failure</Th>
@@ -367,6 +387,7 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
                   <tr key={u.user_id}>
                     <Td left>{maskEmail(u.email, demo)}</Td>
                     <Td>{u.selectedRuns}</Td>
+                    {showPRs && <Td>{u.selectedPRs}</Td>}
                     <Td>{u.selectedOutcomes.failed}</Td>
                     <Td title={`${u.selectedOutcomes.failed} of ${u.selectedOutcomes.finished} finished runs`}>
                       {failRate(u.selectedOutcomes)}
@@ -402,6 +423,7 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
               <tr>
                 <Td left total>uzi total</Td>
                 <Td total>{factoryRuns}</Td>
+                {showPRs && <Td total>{factoryPRs}</Td>}
                 <Td total>{factoryOutcomes.failed}</Td>
                 <Td
                   total

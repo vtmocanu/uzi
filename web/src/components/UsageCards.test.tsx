@@ -421,6 +421,118 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     expect(mount({ self }).getByText("Latest failure: unavailable")).toBeTruthy();
   });
 
+  describe("PR counts (#3686)", () => {
+    // Cost is complete in these windows unless a test says otherwise.
+    const complete = (f: ReturnType<typeof fixture>) => {
+      for (const s of [f.self, f.admin.factory]) {
+        s.lifetime_subscription_run_count = 0; s.lifetime_unreported_run_count = 0;
+        s.last7_subscription_run_count = 0; s.last7_unreported_run_count = 0;
+      }
+    };
+    const withPRs = () => {
+      const f = fixture(); complete(f);
+      f.self.lifetime_pr_count = 4; f.self.last7_pr_count = 2;
+      f.admin.factory.lifetime_pr_count = 8; f.admin.factory.last7_pr_count = 6;
+      f.admin.users[0].pr_count = 5; f.admin.users[0].last7_pr_count = 2;
+      f.admin.users[1].pr_count = 7; f.admin.users[1].last7_pr_count = 3;
+      return f;
+    };
+    type Scope = ReturnType<typeof columns>["users"];
+    const slot = (scope: Scope) => scope.getByText(/\d+ PRs?\b|runs with token usage/).textContent;
+    const prCells = (users: Scope) => {
+      const headers = users.getAllByRole("columnheader").map((h) => h.textContent);
+      const idx = headers.indexOf("PRs");
+      return { headers, idx, cells: users.getAllByRole("row").slice(1).map((r) => ({
+        name: r.querySelector("td")!.textContent, pr: idx < 0 ? undefined : r.querySelectorAll("td")[idx].textContent })) };
+    };
+
+    it("renders the lifetime row for the personal and factory columns and the PR text alone for 7 days", () => {
+      const view = mount({ ...withPRs(), initial: "lifetime" }); const { you, factory } = columns(view);
+      expect(slot(you)).toBe("23 runs with token usage · 4 PRs · $308.64 per PR");
+      expect(slot(factory)).toMatch(/^46 runs with token usage by 2 users since .*2026 · 8 PRs · \$308\.64 per PR$/);
+      fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+      expect(slot(you)).toBe("2 PRs · $6.17 per PR");
+      expect(slot(factory)).toBe("6 PRs · $6.17 per PR");
+      expect(you.queryByText(/runs with token usage/)).toBeNull();
+    });
+
+    it("uses the singular for exactly one PR", () => {
+      const f = withPRs(); f.self.last7_pr_count = 1;
+      expect(slot(columns(mount(f)).you)).toBe("1 PR · $12.34 per PR");
+    });
+
+    it("renders a dash instead of a per-PR cost for zero PRs", () => {
+      const f = withPRs(); f.self.last7_pr_count = 0;
+      expect(slot(columns(mount(f)).you)).toBe("0 PRs · — per PR");
+    });
+
+    it("groups thousands of PRs with en-US separators", () => {
+      const f = withPRs(); f.self.last7_pr_count = 1310;
+      expect(slot(columns(mount(f)).you)).toBe("1,310 PRs · $0.01 per PR");
+    });
+
+    it("says at least when the cost is incomplete and reuses the cost disclosure title", () => {
+      const f = fixture(); f.self.lifetime_pr_count = 4; f.self.last7_pr_count = 2;
+      const view = mount({ self: f.self, initial: "lifetime" });
+      const row = view.getByText(/runs with token usage/);
+      expect(row.textContent).toBe("23 runs with token usage · 4 PRs · at least $308.64 per PR");
+      const span = view.getByText("at least $308.64 per PR");
+      expect(span.tagName).toBe("SPAN");
+      const costNote = view.getByText(/^\+ 8 runs without a cost estimate/);
+      expect(costNote.getAttribute("title")).toBeTruthy();
+      expect(span.getAttribute("title")).toBe(costNote.getAttribute("title"));
+      fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+      expect(view.getByText("at least $6.17 per PR").getAttribute("title"))
+        .toBe(view.getByText(/^\+ 1 run without a cost estimate/).getAttribute("title"));
+    });
+
+    it("renders no PR text for an incomplete-cost zero count", () => {
+      const f = fixture(); f.self.last7_pr_count = 0;
+      const view = mount({ self: f.self });
+      expect(view.getByText("0 PRs · — per PR")).toBeTruthy();
+      expect(view.queryByText(/at least/)).toBeNull();
+    });
+
+    it("puts a PRs column right after Runs with per-row values and a summed total in both windows", () => {
+      const view = mount(withPRs()); const { users } = columns(view);
+      let t = prCells(users);
+      expect(t.headers.slice(0, 3)).toEqual(["User", "Runs", "PRs"]);
+      expect(Object.fromEntries(t.cells.map((c) => [c.name, c.pr])))
+        .toEqual({ "other.person@example.com": "3", "owner.person@example.com": "2", "uzi total": "5" });
+      fireEvent.click(view.getByRole("button", { name: "All time" }));
+      t = prCells(users);
+      expect(t.headers.slice(0, 3)).toEqual(["User", "Runs", "PRs"]);
+      expect(Object.fromEntries(t.cells.map((c) => [c.name, c.pr]))).toEqual({ "other.person@example.com": "7", "owner.person@example.com": "5", "uzi total": "12" });
+      // Position, not just header text: the PR cell sits directly after the Runs cell.
+      const allRows = users.getAllByRole("row");
+      const total = allRows[allRows.length - 1].querySelectorAll("td");
+      expect(total[1].textContent).toBe("46");
+      expect(total[2].textContent).toBe("12");
+    });
+
+    it("omits the PRs column and all PR text when the server reports no counts", () => {
+      const f = fixture();
+      const view = mount(f); const { you, factory, users } = columns(view);
+      for (const period of ["Last 7 days", "All time"]) {
+        fireEvent.click(view.getByRole("button", { name: period }));
+        expect(view.container.textContent).not.toMatch(/\bPRs?\b/);
+        expect(users.getAllByRole("columnheader").map((h) => h.textContent)).not.toContain("PRs");
+      }
+      fireEvent.click(view.getByRole("button", { name: "All time" }));
+      expect(slot(you)).toBe("23 runs with token usage");
+      expect(factory.getByText(/runs with token usage/).textContent).toMatch(/^46 runs with token usage by 2 users since .*2026$/);
+    });
+
+    it("omits the PRs column when one user lacks the selected window's count", () => {
+      const f = withPRs(); delete f.admin.users[1].last7_pr_count;
+      const view = mount(f); const { users } = columns(view);
+      expect(users.getAllByRole("columnheader").map((h) => h.textContent)).not.toContain("PRs");
+      expect(users.getAllByRole("row").every((r) => r.querySelectorAll("td").length === 0 || r.querySelectorAll("td").length === 9)).toBe(true);
+      fireEvent.click(view.getByRole("button", { name: "All time" }));
+      expect(users.getAllByRole("columnheader").map((h) => h.textContent)).toContain("PRs");
+    });
+  });
+
 });
 
 it.each([undefined, 3])("sums rejected outcomes with base_diverged=%s", (baseDiverged) => {

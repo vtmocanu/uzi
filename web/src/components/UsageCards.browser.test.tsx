@@ -50,13 +50,31 @@ it("aligns all seven column rows at desktop width despite missing optional lines
   expect(link.clientWidth).toBeGreaterThanOrEqual(link.scrollWidth);
 });
 
-it("switches the per-user table and retains its scrollable nine-column layout", async () => {
+it("keeps the PR count row (row 6) aligned across both columns in both windows", async () => {
+  await page.viewport(1000, 900);
+  const { personal, factory } = await mount();
+  const aligned = () => {
+    expect(personal.children).toHaveLength(7);
+    expect(Math.abs(personal.children[5].getBoundingClientRect().top - factory.children[5].getBoundingClientRect().top)).toBeLessThan(1);
+  };
+  // The mock's seven-day cost is incomplete (unreported run), so the per-PR cost is a lower bound.
+  expect(personal.children[5].textContent).toBe("4 PRs · at least $1.29 per PR");
+  expect(factory.children[5].textContent).toBe("14 PRs · at least $1.11 per PR");
+  aligned();
+  fireEvent.click(screen.getByRole("button", { name: "All time" }));
+  expect(personal.children[5].textContent).toContain("23 runs with token usage · 18 PRs");
+  expect(factory.children[5].textContent).toContain("79 runs with token usage by 4 users");
+  expect(factory.children[5].textContent).toContain("61 PRs");
+  aligned();
+});
+
+it("switches the per-user table and retains its scrollable ten-column layout", async () => {
   await page.viewport(375, 900);
   await mount();
   const users = within(screen.getByRole("region", { name: "Per-user usage, last 7 days" }));
   const table = users.getByRole("table");
   const recent = table.textContent;
-  expect(users.getAllByRole("columnheader")).toHaveLength(9);
+  expect(users.getAllByRole("columnheader")).toHaveLength(10);
   const scroll = table.parentElement!;
   expect(getComputedStyle(scroll).overflowX).toBe("auto");
   expect(table.getBoundingClientRect().width).toBeGreaterThanOrEqual(680);
@@ -74,7 +92,7 @@ it("switches the per-user table and retains its scrollable nine-column layout", 
     "maria@example.com", "a.very.long.owner.name.that.must.truncate@example.com", "andrei@example.com", "dana@example.com",
   ]);
   expect(firstUserRuns()).toBe("31");
-  expect(users.getAllByRole("columnheader")).toHaveLength(9);
+  expect(users.getAllByRole("columnheader")).toHaveLength(10);
   fireEvent.click(screen.getByRole("button", { name: "Last 7 days" }));
   expect(users.getByRole("table").textContent).toBe(recent);
   expect(firstUserRuns()).toBe("6");
