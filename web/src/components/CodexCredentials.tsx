@@ -287,7 +287,7 @@ function poolSummary(
     if (pickable === 0) {
       return {
         tone: "warn",
-        text: "Codex unavailable: no pooled login is enabled and linked, so runs fall back to Claude, and a run that asks for Codex is refused. Link or enable a pooled login, or pool another one.",
+        text: "Codex unavailable: no pooled login is enabled and linked, so runs fall back to Claude, and a run that asks for Codex is refused. Link or enable a pooled login, pool another one, or switch to “Use the default”.",
       };
     }
     if (pickable < pooled) {
@@ -325,8 +325,8 @@ function AccountModePicker({
   const name = useId();
   const summary = poolSummary(mode, poolFacts(secrets));
   // Not `disabled` while busy: disabling the fieldset would drop keyboard focus from the
-  // radio the user just arrowed onto to <body>. The card's pickMode ignores a pick while a
-  // write is in flight instead.
+  // radio the user just arrowed onto to <body>. The card's pickMode ignores a second mode pick
+  // while a mode write is in flight instead.
   return (
     <fieldset className="space-y-2" aria-busy={busy || undefined}>
       <legend className="text-sm font-medium text-fg">Which login a new Codex run uses</legend>

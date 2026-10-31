@@ -1,4 +1,5 @@
-// Rendering for WHICH Anthropic credential a run spent and WHY (PRD #111 M5, D20).
+// Rendering for WHICH credential a run spent and WHY: the Anthropic credential
+// (PRD #111 M5, D20) and the Codex credential's select reason (issue #3719).
 //
 // Why this is a module and not three lines in the component: the mode is the answer
 // to a question the label cannot reach. An auto pick and a default fallback can name
@@ -215,12 +216,12 @@ export function describeCredential(
 const CODEX_REASON_PHRASES: Record<CodexSelectReason, Phrase> = {
   default: {
     mode: "default",
-    hint: "Your Codex account mode is Default, so this run used your default Codex credential.",
+    hint: "Your Codex setting is \"Use the default\", so this run used your default Codex credential.",
   },
   pool_empty: {
     // A fallback the user can act on (pool a login), hence info and a link.
     mode: "default (auto: no pooled login)",
-    hint: "Your Codex account mode is Auto, but no Codex login was in the pool, so this run used your default Codex credential. Pool a login on Settings → OpenAI / Codex credentials to let uzi choose.",
+    hint: "Your Codex setting is \"Pick by headroom\", but no Codex login was in the pool, so this run used your default Codex credential. Pool a login on Settings → OpenAI / Codex credentials to let uzi choose.",
     tone: "info",
   },
   auto: {

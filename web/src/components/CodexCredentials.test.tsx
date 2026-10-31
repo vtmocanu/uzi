@@ -581,6 +581,11 @@ describe("Codex pool checkbox", () => {
     expect(box.getAttribute("aria-describedby")).toBe(hint.id);
   });
 
+  it("shows no not-linked hint for a pooled, linked login", () => {
+    renderCard([linked({ auto_eligible: true })]);
+    expect(screen.queryByText("In the pool, but uzi picks only linked logins.")).toBeNull();
+  });
+
   // The box is disabled while its write runs, which drops a keyboard user's focus to
   // <body>; the row hands focus back to the box once it is enabled again.
   it("returns keyboard focus to the box after the write", async () => {
