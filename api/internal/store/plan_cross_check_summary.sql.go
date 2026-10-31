@@ -30,8 +30,12 @@ SELECT cc.round, cc.verdict, cc.reason_class,
      ELSE NOT COALESCE(
         cc.lead_claim_generation = lead.claim_generation
         AND cc.plan_md = lead.plan_md
-        AND cc.milestones = CASE WHEN lead.status = 'awaiting_approval'
-            THEN lead.milestones_candidate ELSE lead.milestones_frozen END
+        -- PRD #3708: a non-issue run never stores milestones (milestonesParam drops them), so a
+        -- gated prompt or ci_fix plan compares equal on a NULL column rather than reading historical.
+        AND (cc.milestones = CASE WHEN lead.status = 'awaiting_approval'
+                THEN lead.milestones_candidate ELSE lead.milestones_frozen END
+             OR (lead.kind <> 'issue' AND CASE WHEN lead.status = 'awaiting_approval'
+                THEN lead.milestones_candidate ELSE lead.milestones_frozen END IS NULL))
         AND cc.required_capabilities <@ lead.required_capabilities
         AND lead.required_capabilities <@ cc.required_capabilities
         AND cc.required_tools <@ lead.required_tools

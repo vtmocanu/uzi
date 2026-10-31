@@ -2574,7 +2574,8 @@ UPDATE runs SET
                           AND cc.checker_harness <> runs.harness
                           AND cc.candidate_digest = sqlc.narg('candidate_digest')::bytea
                           AND cc.plan_md = @plan_md
-                          AND cc.milestones = sqlc.narg('milestones_candidate')::jsonb
+                          AND (cc.milestones = sqlc.narg('milestones_candidate')::jsonb
+                               OR (runs.kind <> 'issue' AND sqlc.narg('milestones_candidate')::jsonb IS NULL))
                           AND cc.required_capabilities <@ sqlc.narg('inferred_capabilities')::text[]
                           AND sqlc.narg('inferred_capabilities')::text[] <@ cc.required_capabilities
                           AND cc.required_tools <@ sqlc.narg('inferred_tools')::text[]

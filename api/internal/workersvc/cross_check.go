@@ -87,6 +87,14 @@ func leadCrossCheckCapable(lead string, caps []string) bool {
 	return lead != string(HarnessCodex) || slices.Contains(caps, capability.CrossCheckCodexLeadV1)
 }
 
+// planCrossCheckLoopEnrolled reports whether lead's checked plan loop may run: a required
+// autopilot lead, or (PRD #3708) a gated lead that stays on the human approval path. The two
+// modes are mutually exclusive on the row (runs_plan_cross_check_mode_check), so this is the
+// same predicate CreatePlanCrossCheckChild enforces in SQL.
+func planCrossCheckLoopEnrolled(lead store.Run) bool {
+	return (lead.PlanCrossCheckRequired && lead.AutoApprove) || (lead.PlanCrossCheckGated && !lead.AutoApprove)
+}
+
 func isCrossCheckLeadHarness(lead string) bool {
 	_, ok := oppositeHarness(lead)
 	return ok
@@ -111,7 +119,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
 	childHarness, leadKnown := oppositeHarness(lead.Harness)
-	if !leadKnown || !lead.PlanCrossCheckRequired || !lead.AutoApprove ||
+	if !leadKnown || !planCrossCheckLoopEnrolled(lead) ||
 		(lead.Status != "claimed" && lead.Status != "running") {
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
@@ -154,7 +162,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 	retryQ := store.New(tx)
 	locked, err := retryQ.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: leadID, WorkerID: pgconv.UUID(worker.ID)})
 	if err != nil || locked.UserID != worker.UserID || locked.ClaimGeneration != generation || locked.ClaimReleasedAt.Valid ||
-		locked.Harness != lead.Harness || !locked.PlanCrossCheckRequired || !locked.AutoApprove ||
+		locked.Harness != lead.Harness || !planCrossCheckLoopEnrolled(locked) ||
 		(locked.Status != "claimed" && locked.Status != "running") ||
 		validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 		return store.CrossCheck{}, ErrCrossCheckRefused
@@ -216,7 +224,7 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			return store.Run{}, ErrCrossCheckRefused
 		}
 		if locked.UserID != worker.UserID || locked.ClaimGeneration != generation || locked.Harness != lead.Harness ||
-			!locked.PlanCrossCheckRequired || !locked.AutoApprove || locked.ClaimReleasedAt.Valid ||
+			!planCrossCheckLoopEnrolled(locked) || locked.ClaimReleasedAt.Valid ||
 			(locked.Status != "claimed" && locked.Status != "running") ||
 			validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 			return store.Run{}, ErrCrossCheckRefused
@@ -308,7 +316,7 @@ func (s *Service) planCrossCheckStatus(ctx context.Context, worker store.Worker,
 	if err != nil {
 		return store.CrossCheck{}, 0, err
 	}
-	if lead.UserID != worker.UserID || !lead.PlanCrossCheckRequired || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid ||
+	if lead.UserID != worker.UserID || !(lead.PlanCrossCheckRequired || lead.PlanCrossCheckGated) || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid ||
 		(lead.Status != "claimed" && lead.Status != "running" && lead.Status != "awaiting_approval") {
 		return store.CrossCheck{}, 0, ErrCrossCheckRefused
 	}
@@ -528,6 +536,12 @@ func (s *Service) preparePlanCrossCheckRound(ctx context.Context, q *store.Queri
 	if lead.Harness == string(HarnessCodex) && !slices.Contains(caps, capability.CrossCheckCodexLeadV1) {
 		return false, 0, ErrCrossCheckRefused
 	}
+	// PRD #3708: the claim field is the only way a worker learns to run a gated check, so a
+	// submit from a worker that does not advertise cross_check_gated_v1 is a stale or forged
+	// caller. Defense in depth: nothing is created for it.
+	if lead.PlanCrossCheckGated && !slices.Contains(caps, capability.CrossCheckGatedV1) {
+		return false, 0, ErrCrossCheckRefused
+	}
 	capable := slices.Contains(caps, capability.CrossCheckRoundsV1)
 	prior, err := q.GetPlanCrossCheck(ctx, lead.ID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -545,6 +559,13 @@ func (s *Service) preparePlanCrossCheckRound(ctx context.Context, q *store.Queri
 	}
 	if err != nil {
 		return false, 0, err
+	}
+	// PRD #3708 (gated recovery policy): only a genuinely decided REVISE allows another round.
+	// Anything else, notably a check that lost custody while pending or an APPROVE that was
+	// never presented, ends the check; it must not reach SupersedeUnstoredPlanApproval, which
+	// would make a stale or forged round-N+1 submit rewrite the recorded evidence.
+	if lead.PlanCrossCheckGated && !eligibleGatedPlanRound(prior) {
+		return false, 0, ErrCrossCheckInterrupted
 	}
 	if prior.AutomaticRoundsEnabled && prior.Verdict == "approve" && prior.LeadClaimGeneration != lead.ClaimGeneration && !lead.PlanMd.Valid && lead.GateRevision == 0 {
 		prior, err = q.SupersedeUnstoredPlanApproval(ctx, lead.ID)
@@ -573,6 +594,42 @@ func eligibleAutomaticPlanRound(cc store.CrossCheck) bool {
 	return false
 }
 
+// eligibleGatedPlanRound is the gated-only recovery policy: unlike a required autopilot
+// lead, a gated lead gets a fresh round only after the checker genuinely decided REVISE.
+func eligibleGatedPlanRound(cc store.CrossCheck) bool {
+	return cc.Verdict == "revise"
+}
+
+// gatedSettledFallback is the narrow gated override of LatestPlanCrossCheck. A gated check
+// that lost custody (a pending or APPROVE row of an older claim generation, or a row the settle
+// trigger closed as superseded/approved_not_stored) ends the check: the second return is true,
+// the round is not eligible, and the first return is the gate reason SetRunAwaitingApproval
+// derives for the same row (timed_out past the deadline rules, otherwise interrupted). Every
+// other row shape keeps today's metadata, including a decided BLOCK or checker failure and a
+// decided REVISE at the limit.
+func gatedSettledFallback(row store.GetPlanCrossCheckMetadataRow, generation int64) (string, bool) {
+	older := row.LeadClaimGeneration != generation
+	decidedInTime := row.DecidedAt.Valid && row.DeadlineAt.Valid && row.DecidedAt.Time.Before(row.DeadlineAt.Time)
+	switch {
+	case row.Verdict == "pending" && older:
+		if row.InterruptedAt.Valid && row.DeadlineAt.Valid && row.InterruptedAt.Time.Before(row.DeadlineAt.Time) {
+			return "interrupted", true
+		}
+		return "timed_out", true
+	case row.Verdict == "approve" && older:
+		if row.AutomaticRoundsEnabled && !decidedInTime {
+			return "timed_out", true
+		}
+		return "interrupted", true
+	case row.Verdict == "failed" && (row.ReasonClass.String == "superseded" || row.ReasonClass.String == "approved_not_stored"):
+		if !decidedInTime {
+			return "timed_out", true
+		}
+		return "interrupted", true
+	}
+	return "", false
+}
+
 // PlanCrossCheckLatestMetadata has no candidate, findings or approval proof.
 type PlanCrossCheckLatestMetadata struct {
 	Result                 string `json:"result"`
@@ -589,7 +646,7 @@ type PlanCrossCheckLatestMetadata struct {
 func (s *Service) LatestPlanCrossCheck(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64) (PlanCrossCheckLatestMetadata, error) {
 	lead, err := s.runOwnedByWorker(ctx, leadID, worker)
 	if err != nil || lead.UserID != worker.UserID || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid ||
-		!lead.PlanCrossCheckRequired || (lead.Status != "claimed" && lead.Status != "running" && lead.Status != "awaiting_approval") {
+		!(lead.PlanCrossCheckRequired || lead.PlanCrossCheckGated) || (lead.Status != "claimed" && lead.Status != "running" && lead.Status != "awaiting_approval") {
 		return PlanCrossCheckLatestMetadata{}, ErrCrossCheckRefused
 	}
 	q, ok := s.q.(interface {
@@ -603,10 +660,12 @@ func (s *Service) LatestPlanCrossCheck(ctx context.Context, worker store.Worker,
 	if err != nil {
 		return PlanCrossCheckLatestMetadata{}, ErrCrossCheckRefused
 	}
+	// A gated lead may only run the loop on a worker that advertises cross_check_gated_v1.
+	gatedCapable := !lead.PlanCrossCheckGated || slices.Contains(caps, capability.CrossCheckGatedV1)
 	row, err := q.GetPlanCrossCheckMetadata(ctx, leadID)
 	result := PlanCrossCheckLatestMetadata{Result: "no_row"}
 	if errors.Is(err, pgx.ErrNoRows) {
-		if lead.AutoApprove && leadCrossCheckCapable(lead.Harness, caps) && lead.Status != "awaiting_approval" && !lead.PlanMd.Valid && lead.GateRevision == 0 {
+		if (lead.AutoApprove || lead.PlanCrossCheckGated) && gatedCapable && leadCrossCheckCapable(lead.Harness, caps) && lead.Status != "awaiting_approval" && !lead.PlanMd.Valid && lead.GateRevision == 0 {
 			next := int32(1)
 			result.NextRound = &next
 			result.NextRoundEligible = true
@@ -643,11 +702,18 @@ func (s *Service) LatestPlanCrossCheck(ctx context.Context, worker store.Worker,
 			result.FallbackReason = "timed_out"
 		}
 	}
+	if lead.PlanCrossCheckGated {
+		if reason, settled := gatedSettledFallback(row, generation); settled {
+			eligible = false
+			result.FallbackReason = reason
+		}
+	}
 	if eligible && row.AutomaticRoundsEnabled && row.Round >= row.AutomaticRevisionLimit+1 {
 		result.FallbackReason = "revisions_exhausted"
 	}
 	if eligible && row.AutomaticRoundsEnabled && row.Round < row.AutomaticRevisionLimit+1 &&
-		slices.Contains(caps, capability.CrossCheckRoundsV1) && lead.AutoApprove && leadCrossCheckCapable(lead.Harness, caps) &&
+		slices.Contains(caps, capability.CrossCheckRoundsV1) && gatedCapable &&
+		(lead.AutoApprove || (lead.PlanCrossCheckGated && row.Verdict == "revise")) && leadCrossCheckCapable(lead.Harness, caps) &&
 		lead.Status != "awaiting_approval" && !lead.PlanMd.Valid && lead.GateRevision == 0 {
 		next := row.Round + 1
 		result.NextRound = &next

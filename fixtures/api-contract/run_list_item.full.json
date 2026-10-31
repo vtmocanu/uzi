@@ -313,6 +313,7 @@
   "issue_input_reason": "x",
   "code_cross_check_required": true,
   "plan_cross_check_required": true,
+  "plan_cross_check_gated": true,
   "plan_cross_check_gate_reason": "x",
   "plan_cross_check_diff_refusal": "x",
   "plan_cross_check_summary": {
@@ -343,7 +344,31 @@
       "cost_usd": 1.5,
       "cost_status": "x"
     },
-    "historical": true
+    "historical": true,
+    "rounds": [
+      {
+        "round": 1,
+        "verdict": "x",
+        "reason_class": "x",
+        "findings": {
+          "summary": "x",
+          "items": [
+            {
+              "file": "x",
+              "severity": "x",
+              "summary": "x",
+              "rationale": "x"
+            }
+          ]
+        },
+        "decided_at": "2020-01-02T03:04:05Z",
+        "response": {
+          "state": "x",
+          "text": "x"
+        }
+      }
+    ],
+    "deadline_at": "2020-01-02T03:04:05Z"
   },
   "code_cross_check_summary": {
     "coverage": {},

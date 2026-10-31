@@ -20674,7 +20674,8 @@ UPDATE runs SET
                           AND cc.checker_harness <> runs.harness
                           AND cc.candidate_digest = $8::bytea
                           AND cc.plan_md = $1
-                          AND cc.milestones = $2::jsonb
+                          AND (cc.milestones = $2::jsonb
+                               OR (runs.kind <> 'issue' AND $2::jsonb IS NULL))
                           AND cc.required_capabilities <@ $3::text[]
                           AND $3::text[] <@ cc.required_capabilities
                           AND cc.required_tools <@ $4::text[]
