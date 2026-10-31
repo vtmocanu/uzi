@@ -6941,9 +6941,11 @@ export class GitCache {
    * the journal. `changed` means no journal names exactly this (run, path) pair; `unfenced` means a worker without
    * authority or a journal with no completion-source fence (the baseline orphan path); `fenced` carries the exact
    * fence and attempt id. `retained` reports an episode or retained sources on the journal.
+   * The optional claimant signal cancels a queued acquisition without advancing past the current bare-lock holder.
    */
   async readOrphanJournalFence(
     barePath: string, branch: string, ownerRunId: string, clonePath: string,
+    signal?: AbortSignal,
   ): Promise<{ state: "changed" } | { state: "unfenced"; retained: boolean } |
     { state: "fenced"; fence: CompletionSourceFence; attemptId?: string; retained: boolean }> {
     return this.withLock(barePath, async () => {
@@ -6956,7 +6958,7 @@ export class GitCache {
         state: "fenced" as const, fence: journal.completionSourceFence, retained,
         ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }),
       };
-    });
+    }, signal);
   }
 
   /** fsync `<bare>/config`, fsync the bare directory, then require the journal's raw value to read back as exactly `want`. */

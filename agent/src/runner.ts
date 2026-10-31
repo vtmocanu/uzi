@@ -11357,9 +11357,32 @@ export class RunRunner {
     // by the uncertified paths below: its source is retired through the coordinator's certified chain (or kept).
     const readFence = async () => {
       try {
-        return await this.git.readOrphanJournalFence(barePath, branch, ownerRunId, journaledPath);
+        const result = await this.git.readOrphanJournalFence(barePath, branch, ownerRunId, journaledPath,
+          this.retainedLifecycleSignal(flight));
+        this.retainedLifecycleGuard(flight);
+        return result;
       } catch (error) {
+        this.retainedLifecycleGuard(flight);
         return refuse("path", "path_error", error);
+      }
+    };
+    let handoffDeadline: number | undefined;
+    // The optional changed-pair proof may spend only the original A allowance, never renew it.
+    // An expired or unreadable reread withholds that proof and preserves the outcome's disposition.
+    const rereadFence = async (): Promise<Awaited<ReturnType<GitCache["readOrphanJournalFence"]>> | undefined> => {
+      this.retainedLifecycleGuard(flight);
+      if (handoffDeadline !== undefined && Date.now() >= handoffDeadline) return undefined;
+      try {
+        const signal = this.retainedLifecycleSignal(flight);
+        const read = (scopeSignal: AbortSignal) =>
+          this.git.readOrphanJournalFence(barePath, branch, ownerRunId, journaledPath, scopeSignal);
+        const result = handoffDeadline === undefined ? await read(signal)
+          : await this.git.withRecoveryOperation(signal, handoffDeadline, read);
+        this.retainedLifecycleGuard(flight);
+        return result;
+      } catch {
+        this.retainedLifecycleGuard(flight);
+        return undefined;
       }
     };
     const readmit = (): never => {
@@ -11379,8 +11402,7 @@ export class RunRunner {
     // The effect branches below refuse on a changed pair or a fence; a journal retired or replaced under us is a
     // re-admission, not a terminal refusal. One re-read decides.
     const refuseAfterReread = async (stage: OrphanStage, reason: OrphanReason, error: unknown): Promise<never> => {
-      let again: Awaited<ReturnType<GitCache["readOrphanJournalFence"]>> | undefined;
-      try { again = await this.git.readOrphanJournalFence(barePath, branch, ownerRunId, journaledPath); } catch { again = undefined; }
+      const again = await rereadFence();
       if (again?.state === "changed") return readmit();
       return refuse(stage, reason, error, undefined,
         isCompletionSourceFenceError(error) ? "fenced_source" : error instanceof CapturePathMismatchError ? "pair_changed" : "unknown");
@@ -11392,6 +11414,7 @@ export class RunRunner {
       // The one bound of the claimant's wait for the authority transaction A, shared by both fenced branches (the
       // unfenced baseline never waits for A here, so it computes none).
       const wait = this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS);
+      handoffDeadline = Date.now() + (wait.timeoutMs ?? CLONE_AUTHORITY_WAIT_MS);
       const retainedSource = fenceState.retained;
       // A retained journal (an episode or retained sources) is only classified: the certified chain cannot retire it.
       const mode = retainedSource ? "classify" : "retire";
@@ -11414,10 +11437,9 @@ export class RunRunner {
         throw new OrphanHandoffReadmit(diagnostics, journaledPath);
       }
       // Any other outcome: the pair may have been retired or replaced meanwhile (a sweep racing the selection).
-      // A failing re-read must not replace the outcome's own disposition (readFence refuses with the original
-      // error): it only withholds the "changed" proof, so each outcome below keeps its own stop.
-      let reread: Awaited<ReturnType<GitCache["readOrphanJournalFence"]>> | undefined;
-      try { reread = await this.git.readOrphanJournalFence(barePath, branch, ownerRunId, journaledPath); } catch { reread = undefined; }
+      // An unreadable or expired reread only withholds the "changed" proof, so each outcome below keeps its own
+      // disposition. Lifecycle stops always propagate instead of becoming a terminal orphan refusal.
+      const reread = await rereadFence();
       if (reread?.state === "changed") readmit();
       if (retainedSource) {
         // A found published source is never detached. Only a positive "no record, no slot" answer falls through,
@@ -11453,8 +11475,7 @@ export class RunRunner {
       const snapshotFence = retained.journal.completionSourceFence;
       const classified = fenceState.state === "fenced" ? serializeSourceFence(fenceState.fence) : undefined;
       if ((snapshotFence === undefined ? undefined : serializeSourceFence(snapshotFence)) !== classified) {
-        let again: Awaited<ReturnType<GitCache["readOrphanJournalFence"]>> | undefined;
-        try { again = await this.git.readOrphanJournalFence(barePath, branch, ownerRunId, journaledPath); } catch { again = undefined; }
+        const again = await rereadFence();
         if (again?.state === "changed") readmit();
         // The unfenced/unfenced exemption serves workers without authority: they classify a fence-carrying journal as
         // unfenced and keep the baseline detach. On an authority worker, an ABA race (unfenced, then a fenced snapshot,

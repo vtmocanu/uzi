@@ -1072,14 +1072,19 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
     });
   }
 
-  // This unwired reclaim path never reads flight; keep the private seam's fixture minimal.
+  // Even an unwired reclaim carries the claimant lifecycle while waiting for a journal read.
   function reclaim(e: ReturnType<typeof execution>, s: Seed, original: Error): Promise<void> {
     const seam = e.runner as unknown as {
-      reclaimTerminalOrphan: (bare: string, claim: ReturnType<typeof gitlabClaim>, flight: Record<string, never>,
+      reclaimTerminalOrphan: (bare: string, claim: ReturnType<typeof gitlabClaim>, flight: object,
         clonePath: string, branch: string, owner: string, original: Error) => Promise<void>;
     };
+    const controller = new AbortController();
+    const flight = { cancel: controller, steering: {
+      lifecycleSignal: () => controller.signal, terminalLifecycleSignal: () => controller.signal,
+      claimFence: () => undefined, isCancelled: () => false,
+    } };
     return seam.reclaimTerminalOrphan(s.bare,
-      gitlabClaim(1810, { run_id: s.claimant, kind: "mr_rework", branch }), {}, s.clonePath, branch, s.owner, original);
+      gitlabClaim(1810, { run_id: s.claimant, kind: "mr_rework", branch }), flight, s.clonePath, branch, s.owner, original);
   }
 
   for (const refusal of ["foreign", "path-mismatch"] as const) {
