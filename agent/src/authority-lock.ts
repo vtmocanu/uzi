@@ -34,6 +34,11 @@ export class AuthorityRefusal extends Error {
   }
 }
 
+/** The flock helper did not answer within the time it was given and was killed (message unchanged). */
+class FlockHelperTimeout extends Error {
+  constructor() { super("flock helper timeout"); }
+}
+
 /**
  * Acquiring A (in the in-process queue or on the cross-process flock) ran out its bounded wait. Still an
  * {@link AuthorityRefusal} with the unchanged message and name, so every existing handler and log line is
@@ -121,7 +126,7 @@ function runFlock(flockPath: string, args: string[], fd: number | undefined,
     // Abort/timeout kills only this finite helper and joins its close event before the
     // caller may close the descriptor it was handed.
     const stop = (error: unknown): void => { failure ??= error; child.kill("SIGKILL"); };
-    const timer = setTimeout(() => stop(new Error("flock helper timeout")), Math.max(1, timeoutMs));
+    const timer = setTimeout(() => stop(new FlockHelperTimeout()), Math.max(1, timeoutMs));
     const onAbort = (): void => stop(signal?.reason ?? new Error("aborted"));
     signal?.addEventListener("abort", onAbort, { once: true });
     const collect = (chunk: Buffer): void => {
@@ -309,7 +314,9 @@ async function requireTrustedFlock(ctx: Context, signal: AbortSignal | undefined
 /**
  * Acquire an exclusive lock on the inherited descriptor. `once` makes one nonblocking
  * attempt (false on contention). Otherwise contention alone retries until the deadline,
- * at most ceil(timeout/POLL)+1 attempts; every other failure aborts.
+ * at most ceil(timeout/POLL)+1 attempts, and the deadline running out is AuthorityLockBusy:
+ * contention, or a helper given only the remaining wait that had not answered when it ended
+ * (busy is not proven then, only that the wait is spent). Every other failure aborts.
  */
 async function flockExclusive(ctx: Context, handle: fsp.FileHandle, timeoutMs: number,
   signal: AbortSignal | undefined, once: boolean): Promise<boolean> {
@@ -319,7 +326,14 @@ async function flockExclusive(ctx: Context, handle: fsp.FileHandle, timeoutMs: n
     signal?.throwIfAborted();
     if (performance.now() >= deadline) break;
     const remaining = Math.min(HELPER_TIMEOUT_MS, deadline - performance.now());
-    const result = await ctx.run(["-x", "-n", "-E", "200", "3"], handle.fd, signal, remaining);
+    let result: FlockResult;
+    try { result = await ctx.run(["-x", "-n", "-E", "200", "3"], handle.fd, signal, remaining); }
+    catch (error) {
+      if (!once && error instanceof FlockHelperTimeout && !signal?.aborted && performance.now() >= deadline) {
+        throw new AuthorityLockBusy();
+      }
+      throw error;
+    }
     if (result.code === 0) return true;
     if (result.code !== 200) throw new AuthorityRefusal(`flock failed: ${result.code}`);
     if (once) return false;

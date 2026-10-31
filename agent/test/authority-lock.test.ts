@@ -339,6 +339,25 @@ test("the real flock helper is SIGKILLed and joined at its deadline", { timeout:
   assert.equal(alive(await readPid(pidFile)), false);
 });
 
+test("A: a flock helper still unanswered when A's deadline runs out is AuthorityLockBusy, joined before rejection", { timeout: 30_000 }, async (t) => {
+  // W's one attempt succeeds; every later attempt (A's) records its pid and hangs.
+  const dir = makeTmp(t, "fake-flock-");
+  const pidFile = path.join(dir, "helper.pid");
+  const wDone = path.join(dir, "w.done");
+  const script = path.join(dir, "flock");
+  fs.writeFileSync(script, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "flock from util-linux 2.41"; exit 0; fi
+if [ ! -e '${wDone}' ]; then : > '${wDone}'; exit 0; fi
+echo $$ > '${pidFile}'
+exec sleep 300
+`, { mode: 0o755 });
+  const lifetime = await acquireWorkerLifetime(makeTmp(t), { supportedFs: async () => true, flockPath: script });
+  let ran = false;
+  await assert.rejects(withAuthorityTransaction(lifetime, { timeoutMs: 300 }, async () => { ran = true; }), isBusy);
+  assert.equal(ran, false);
+  assert.equal(alive(await readPid(pidFile)), false, "the helper had exited by the time A rejected");
+});
+
 test("A: another process holding the authority lock blocks until a finite deadline, then releases", async (t) => {
   const { root, lifetime } = await lifetimeFor(t);
   await withAuthorityTransaction(lifetime, {}, async () => undefined); // creates authority.lock
