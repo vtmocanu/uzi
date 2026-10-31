@@ -674,8 +674,12 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 			}
 			// The consent and link fence: re-validate the pick under a share lock on its alias
 			// row, after the INSERT (users KEY SHARE, then the alias row, then the credential
-			// state: every writer's order). The shared advisory lock above makes a failure
-			// defensive, not expected; on one the alias is dropped and the pool re-selected.
+			// state: every writer's order). The shared lock does not stop the refresher's
+			// quarantine or reauth writes, so a failure here is an expected path for those; the
+			// alias is dropped and the pool re-selected. The fence reads coord_state and reauth
+			// unlocked, so a quarantine or reauth committed between the fence and this commit can
+			// still bind; claim-time admission (codex_operation_admission.go refuses a quarantined
+			// account) is the backstop.
 			pick, err = s.fenceCodexPoolAlias(ctx, qtx, userID, pick)
 			if err != nil {
 				return store.Run{}, resolvedHarness{}, err

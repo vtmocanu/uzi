@@ -1162,6 +1162,37 @@ func TestCodexSelectVaultLockedLiveDB(t *testing.T) {
 	assertBound(t, fx.mustCreate(), lo.alias, codexselect.ReasonPoolStale)
 }
 
+// TestCodexSelectVaultStateReadsOnCreateTxLiveDB: selection reads the vault state on the create
+// transaction. The vault gets its own pool and is enrolled and UNLOCKED; the pool is then closed
+// after the create took its shared lock, so any read through the vault's pool errors and fails
+// closed (locked). The better account still binds with the auto reason only if the read rode the
+// create transaction.
+//
+// MUTATION: in selectCodexPoolAlias, call s.codexVaultUnlocked(ctx, userID) instead of
+// s.codexVaultUnlocked(vault.WithStateReader(ctx, q), userID); the read hits the closed pool,
+// fails closed, every meter is stale and the bind is the lower account with pool_stale.
+func TestCodexSelectVaultStateReadsOnCreateTxLiveDB(t *testing.T) {
+	fx := newPoolFix(t)
+	a, _ := fx.twoPooled()
+	cfg, err := pgxpool.ParseConfig(os.Getenv("UZI_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	vaultPool, err := pgxpool.NewWithConfig(fx.env.ctx, cfg)
+	if err != nil {
+		t.Fatalf("vault pool: %v", err)
+	}
+	t.Cleanup(vaultPool.Close)
+	vlt := vault.NewPostgres(fx.env.box, vaultPool)
+	fx.svc.SetVault(vlt)
+	enrollCodexProtectedVault(t, fx.env, vlt, fx.userID, codexVaultLockedTestPassword)
+	if err := vlt.Unlock(fx.env.ctx, fx.userID, codexVaultLockedTestPassword); err != nil {
+		t.Fatalf("unlock vault: %v", err)
+	}
+	fx.svc.codexSelectLockedHook = func(context.Context) { vaultPool.Close() }
+	assertBound(t, fx.mustCreate(), a.alias, codexselect.ReasonAuto)
+}
+
 // markUnusableBeforeFence runs update on the picked alias's account after the pick and the run
 // INSERT, the way the refresher does: a plain autocommit write that takes no secret-mutation lock.
 func (fx *poolFix) markUnusableBeforeFence(update string) {
@@ -1172,7 +1203,8 @@ func (fx *poolFix) markUnusableBeforeFence(update string) {
 
 // TestCodexSelectFenceDropsUnusableAccountLiveDB: an account that is quarantined or flagged
 // reauth_required between the pick and the fence is dropped; a healthy sibling is bound, or the
-// create is refused with the pool error (and no run) when none remains.
+// create is refused with the pool error (and no run) when none remains. The before-fence hook
+// fires once per create, so it poisons only the first pick; the re-selected sibling is not touched.
 //
 // MUTATION: delete the codexPoolAccountUsable term from codexPoolPickHolds; the unusable pick
 // is bound and every case here fails.
