@@ -1093,7 +1093,8 @@ and authority falls back to `unproven` when the pass is invalidated
   conflicting presence, run, basis or bytes, or also named by a refused group, is
   kept. `journal_extra_fields` counts candidates that are marker-less canonical
   sources whose plain journal carries fields beyond `runId` and `clonePath`; they
-  keep their existing `discard` basis and are listed for hand review before M1b.
+  keep their existing `discard` basis. Only the count is reported (list entries
+  carry no marker), so identify them by reading each candidate's journal before M1b.
 
 The cross-checks have limits. Matching observations never prove the
 unobservable OCI-handler, crun/conmon, NRI, attachment or ownership-walk facts,

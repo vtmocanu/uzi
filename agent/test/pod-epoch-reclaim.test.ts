@@ -886,6 +886,26 @@ test("journal_extra_fields counts only final candidates whose source carried the
   const { result } = await run(bytes);
   assert.equal(result.journal_extra_fields, 0, "defaults to zero");
 });
+test("a flagged candidate later demoted is not counted in journal_extra_fields", async () => {
+  const d = await daemon();
+  try {
+    const { options } = setup(); options.dockerHost = d.host;
+    options.git.discoverEpochRetainedSources = async () => ({
+      groups: ["/bare-a", "/bare-b"].map(barePath => ({ barePath, selector: { runId: "run0", generation: 1, attempt: "attempt" }, paths: ["/tree/shared"] })),
+      inventoryComplete: true, physicalPaths: 1, overflow: 0, overflowExact: true, unreadable: 0,
+    });
+    options.git.inspectRetainedSources = async opts => {
+      opts.beforeTree!("/tree/shared");
+      const s = candidateSource("/tree/shared", "run0", opts.barePath === "/bare-b"
+        ? x => { x.sources[0]!.allocatedBytes = 999; x.allocatedBytes = 999; } : () => {});
+      s.barePath = opts.barePath!; s.epochJournalExtraFields = true;
+      return { sources: [s], partial: false, unreadable: 0, sampledAt: "" };
+    };
+    const result = (await runPodEpochShadow(options))!;
+    assert.equal(result.would_delete, 0); assert.equal(result.kept, 1);
+    assert.equal(result.journal_extra_fields, 0);
+  } finally { await d.close(); }
+});
 test("an invalid pass clears present and missing candidates alike", async () => {
   const d = await daemon();
   try {

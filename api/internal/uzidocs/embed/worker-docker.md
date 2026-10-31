@@ -261,7 +261,7 @@ with sizes, presence (`present` or `missing`) and basis (`discard` or
 `strict_plain`). `would_delete` counts present candidate paths; `would_settle`
 counts missing ones (metadata only, never counted in bytes); `by_basis` splits
 them; `journal_extra_fields` counts candidates whose marker-less plain journal
-carries extra fields, for hand review. Partial or unknown bytes and incomplete inventories are marked explicitly.
+carries extra fields (a count only; list entries carry no marker). Partial or unknown bytes and incomplete inventories are marked explicitly.
 The line also carries `authority` (`undeclared`, `legacy_evidence`,
 `contradicted`, `unproven` or `attested`, with a fixed reason),
 `evidence_version` and, once version-2 binding and prefix checks pass, the node's kernel release.
