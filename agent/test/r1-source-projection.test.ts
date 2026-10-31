@@ -242,4 +242,3 @@ for (const disabled of [false, true]) it("R1 Worker observes scope-only ownershi
   assert.deepEqual(registry.build(true).pending_policy_protection, [{ run_id: run, owner_generation: 9 }]);
   assert.deepEqual(registry.build(true).active, []);
 });
-
