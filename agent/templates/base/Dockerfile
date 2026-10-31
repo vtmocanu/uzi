@@ -9,9 +9,9 @@
 #
 # Unlike the api image (distroless), the worker CANNOT be distroless: M3's Claude
 # Agent SDK spawns a real Bash tool and the git flow needs git + coreutils. This
-# is a minimal Node 24 + git + bash base (digest shared with web/Dockerfile), run
+# is a minimal Node 26 + git + bash base (digest shared with web/Dockerfile), run
 # as a non-root user (PRD §Worker runtime).
-FROM node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf AS runtime
+FROM node:26-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797 AS runtime
 WORKDIR /app
 
 # git for clone/fetch/worktree; bash for the SDK Bash tool (M3); tini as PID 1 so
@@ -238,6 +238,14 @@ RUN SQLC_PIN="$(awk -F '"' '/^SQLC_LINUX_AMD64_VERSION=/{print $2}' /tmp/worker-
 # scan (Taskfile.yml:913 / scripts/scan-secrets.sh). CI-verified: this image build cannot run in
 # the worker itself. MIRRORED in templates/jvm (jvm is NOT `FROM base`) — keep in lockstep.
 RUN GOFLAGS=-buildvcs=false GOBIN=/usr/local/bin go install github.com/zricethezav/gitleaks/v8@v8.30.1 && gitleaks version
+
+# Yarn Classic for repos with a yarn.lock (agent/src/js-deps.ts). node:24-alpine shipped
+# yarn 1.22.22; node:26-alpine ships none, so it is installed here at that exact version
+# with its own lifecycle scripts off, and the version is asserted so a drift fails the
+# BUILD. Repo installs keep YARN_IGNORE_PATH=1 and --ignore-scripts (js-deps.ts).
+# MIRRORED in templates/jvm (jvm is NOT `FROM base`) — keep in lockstep.
+RUN n=0; until npm install --global --ignore-scripts yarn@1.22.22; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "yarn install: giving up after $n attempts" >&2; exit 1; }; echo "yarn install failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
+ && test "$(yarn --version)" = 1.22.22
 
 # Install deps first for layer caching. Only runtime deps (tsx) are needed — the
 # worker runs its TypeScript directly via tsx, matching the bottega reference.

@@ -9808,7 +9808,7 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
               env: { PATH: "/usr/bin:/bin" }, timeout: 10_000, encoding: "utf8",
               input: frames.map(frame => JSON.stringify(frame) + "\n").join(""),
             });
-            assert.equal(result.status, 0, result.stderr || result.error?.message);
+            assert.equal(result.status, 0, result.stderr || result.error?.message || "child failed without stderr or error");
             const replies = result.stdout.trim().split("\n").map(line => JSON.parse(line));
             assert.equal(replies.length, frames.length);
             assert.equal(replies[0].id, 1);
@@ -9829,7 +9829,7 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
             const confined = spawnSync(sandbox.command, sandbox.args, {
               env: { PATH: "/usr/bin:/bin" }, timeout: 10_000, encoding: "utf8",
             });
-            assert.equal(confined.status, 0, confined.stderr || confined.error?.message);
+            assert.equal(confined.status, 0, confined.stderr || confined.error?.message || "child failed without stderr or error");
             assert.equal(confined.stdout, "sandbox-control-ok");
             assert.equal(await fs.readFile(file, "utf8"), bytes.toString());
             assert.equal(await fs.readFile(sentinel, "utf8"), canary);
@@ -10063,6 +10063,7 @@ describe("production advice data teardown (#2324)", () => {
       let swapped = false;
       const pin = mock.method(fs, "stat", async (...args: Parameters<typeof fs.stat>) => {
         const result = await originalStat(...args);
+        assert.ok(result, "fs.stat resolved without stats");
         if (!swapped && String(result.ino) === String(identity.ino) && String(result.dev) === String(identity.dev) && args[1]?.bigint) {
           swapped = true;
           uidScript(runnerCommand, "const fs=require('node:fs');fs.renameSync(process.argv[1],process.argv[1]+'.retained');fs.mkdirSync(process.argv[1]);fs.writeFileSync(process.argv[1]+'/planted','keep')", owned);

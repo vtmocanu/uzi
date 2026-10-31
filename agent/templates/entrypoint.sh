@@ -274,7 +274,7 @@ NIX_OWNER=runner:runner
 # The two persisted volume roots and the join-token mount, as variables (the migration and
 # token logic below reference nothing else), so the shell tests can point them at a sandbox.
 NIX_DIR=/nix
-# busybox is the canonical absolute binary in the pinned node:24-alpine (the same base whose
+# busybox is the canonical absolute binary in the pinned node:26-alpine (the same base whose
 # /bin/{chown,chmod,mkdir} the constants above resolve). Its `stat`/`cat` applets back the
 # read-only-token posture + read checks; invoked via `busybox <applet>` so the exact applet
 # symlink location does not matter.
@@ -416,7 +416,7 @@ for d in runner agent-home provision; do
   # 🔴 SC3067 IS A TRUE PORTABILITY STATEMENT AND A FALSE BUG REPORT AGAINST THIS
   # IMAGE, AND IT STOPS BEING FALSE THE MOMENT THE SHEBANG OR THE BASE IMAGE MOVES.
   # This file is `#!/bin/sh` and both worker Dockerfiles ship it on the same
-  # digest-pinned node:24-alpine with an exec-form ENTRYPOINT
+  # digest-pinned node:26-alpine with an exec-form ENTRYPOINT
   # (controller/internal/kube/render.go sets no `Command:` ON THE WORKER CONTAINER,
   # so k8s uses the image's own ENTRYPOINT. That file has five `Command:` fields on
   # OTHER containers, so the unqualified version of this sentence invited a reader
@@ -667,7 +667,7 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
     # e.g. .claude.json) is re-owned wholesale to runner. A symlink entry is skipped (`[ -L ]`
     # first; a dangling one also fails `[ -e ]`). A symlink NESTED inside a dot dir is not
     # followed by the recursive chown on the current image: its /bin/chown is BusyBox v1.37.0
-    # on the digest-pinned node:24-alpine base (no coreutils), and a BusyBox v1.37.0 `chown -R`
+    # on the digest-pinned node:26-alpine base (no coreutils), and a BusyBox v1.37.0 `chown -R`
     # measured 2026-09-25 re-owned a nested dir- or file-symlink itself and left its target
     # untouched. That is a measurement of this binary, not a claim about chown in general.
     # A top-level HARDLINK (a regular file with nlink > 1, e.g. one planted to a repos/<r>.git

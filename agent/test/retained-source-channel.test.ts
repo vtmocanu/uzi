@@ -259,7 +259,7 @@ function send(sock: string, req: unknown | string): Promise<Json> {
     const chunks: Buffer[] = [];
     conn.on("error", reject);
     conn.on("connect", () => conn.write(typeof req === "string" ? req : `${JSON.stringify(req)}\n`));
-    conn.on("data", (c) => chunks.push(c));
+    conn.on("data", (c) => chunks.push(Buffer.from(c)));
     conn.on("end", () => {
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Json);
@@ -1221,7 +1221,7 @@ describe("the wire", () => {
     await new Promise<void>((resolve, reject) => {
       const c = net.createConnection(rig.sock);
       c.on("connect", () => c.write('{"op":"inspect"}\n'));
-      c.on("data", (d) => chunks.push(d));
+      c.on("data", (d) => chunks.push(Buffer.from(d)));
       c.on("end", () => resolve());
       c.on("error", reject);
     });

@@ -1081,7 +1081,7 @@ describe("issue #1783 final (R3): the clone key alone never puts a process in a 
     const { verdicts, started, failed } = await reseedWith(iid, new LiveAttemptRegistry());
     assert.notEqual(failed?.fail_origin, "worker_residue_blocked", String(failed?.failure_reason));
     assert.equal(started, 1, "the seed went through and the model started");
-    assert.equal(verdicts[0]?.process?.state, "quiescent", verdicts[0]?.process?.detail);
+    assert.equal(verdicts[0]?.process?.state, "quiescent", verdicts[0]?.process?.detail ?? "no process detail reported");
     assert.ok(!verdicts[0]?.process?.processes.some((p) => p.pid === pid), "never reported");
     assert.deepEqual(verdicts[0]?.process?.killed, [], "never signalled");
     assert.equal(alive(pid), true, "the foreign process is alive");

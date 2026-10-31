@@ -70,7 +70,7 @@ describe("hermetic default quiescence view (preloaded)", { skip: SKIP }, () => {
       dockerHost: undefined,
       registry,
     });
-    assert.equal(out.process?.state, "quiescent", out.process?.detail);
+    assert.equal(out.process?.state, "quiescent", out.process?.detail ?? "no process detail reported");
     assert.deepEqual(out.process?.killed, [], "the preloaded empty view lists no process at all");
 
     // The helper path gets the same view forwarded in its request.

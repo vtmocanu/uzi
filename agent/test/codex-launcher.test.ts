@@ -1028,6 +1028,7 @@ describe("M1 controlled advice disposal ordering probe", () => {
             replacement = await originalStat(owned);
             ownerMetadata = t.mock.method(fs, "stat", async (...args: Parameters<typeof fs.stat>) => {
               const stat = await originalStat(...args);
+              assert.ok(stat, "fs.stat resolved without stats");
               if (/^\/proc\/self\/fd\/[0-9]+$/.test(String(args[0])) &&
                 String(stat.dev) === String(replacement!.dev) && String(stat.ino) === String(replacement!.ino)) {
                 if (typeof stat.uid === "bigint") bigintIdentityReads++;

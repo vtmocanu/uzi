@@ -86,7 +86,7 @@ var seedAliases = map[string]string{
 //     so baking it buys nothing and it stays off the toolchain but on the
 //     allowlist.
 //   - nodejs: nodejs is in the 00046 seed but is NOT baked as a devbox package;
-//     the base image's node (node:24-alpine) is not a devbox-provisioned nodejs,
+//     the base image's node (node:26-alpine) is not a devbox-provisioned nodejs,
 //     so the gate would otherwise reject the seeded row on every deployment.
 //
 // These are the only two entries the gate treats as covered without a

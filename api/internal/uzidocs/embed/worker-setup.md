@@ -76,7 +76,7 @@ A worker image is built from a **template**: a curated, code-reviewed Dockerfile
 
 | Template | What it adds | Use it when |
 |---|---|---|
-| `base` (default) | Node 24 + git + bash + make + the `docker` CLI + go + python3 — the minimal worker | Most repos |
+| `base` (default) | Node 26 + git + bash + make + the `docker` CLI + go + python3 — the minimal worker | Most repos |
 | `jvm` | `base` plus a JDK (`java`/`javac`) | Repos that build or test Java |
 
 Every worker also ships the `docker` CLI and a default go/python3/pip toolchain, baked at build time onto both templates' `PATH` — no per-repo provisioning needed for either. The `docker` CLI alone can't run anything until a daemon is wired up: see [Docker inside a worker](./worker-docker.md). go/python3/pip share the nix store's first-run-only warm cache described under [Tool provisioning](#tool-provisioning) below: they refresh only when `/nix` is deleted and the worker reprovisions, not on every worker image upgrade. The baked set also covers a handful of everyday utilities (`ripgrep`, `opentofu`/`tofu`, and others) beyond go/python3/pip — the shared manifest at `agent/devbox-global/devbox.json` is the canonical list, not this page.

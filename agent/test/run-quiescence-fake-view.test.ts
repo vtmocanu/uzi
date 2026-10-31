@@ -77,7 +77,7 @@ function req(extra: Partial<ScanRequest> = {}): ScanRequest {
 }
 
 function assertUnreadableBlocks(r: ProcessQuiescence | undefined): void {
-  assert.equal(r?.state, "unverified", r?.detail);
+  assert.equal(r?.state, "unverified", r?.detail ?? "no process detail reported");
   assert.deepEqual(
     r?.processes.map((p) => [p.pid, p.reason]),
     [[UNREADABLE_PID, "unreadable_unattributed"]],
