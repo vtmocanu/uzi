@@ -679,3 +679,77 @@ func TestPublicationResumeCompleteLiveDB(t *testing.T) {
 		t.Fatalf("active row after completion: %v", err)
 	}
 }
+
+// terminalRow reads the closed enrollment of the fixture run.
+func (f *publicationResumeFixture) terminalRow(t *testing.T) (state string, reason *string) {
+	t.Helper()
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT state, retired_reason FROM run_publication_resume WHERE run_id=$1 AND enrollment_seq=1`, f.runID).Scan(&state, &reason); err != nil {
+		t.Fatal(err)
+	}
+	return state, reason
+}
+
+func TestPublicationResumeIntentClosesOnCompletionLiveDB(t *testing.T) {
+	f := newPublicationResumeFixture(t)
+	f.enroll(t)
+	gen := int64(1)
+	if _, applied, err := f.svc.SetState(f.env.ctx, f.wkr, f.runID, StateRequest{State: "completed", ClaimGeneration: &gen}); err != nil || !applied {
+		t.Fatalf("SetState completed applied=%v err=%v", applied, err)
+	}
+	if state, reason := f.terminalRow(t); state != "completed" || reason != nil {
+		t.Fatalf("after completion state=%q reason=%v, want completed", state, reason)
+	}
+}
+
+func TestPublicationResumeIntentRetiresOnTerminalFailureLiveDB(t *testing.T) {
+	for _, tc := range []struct{ status, reason string }{{"failed", "run_failed"}, {"cancelled", "run_cancelled"}} {
+		t.Run(tc.status, func(t *testing.T) {
+			f := newPublicationResumeFixture(t)
+			f.enroll(t)
+			// A terminal write by any writer, with no opt-in of its own, closes the intent.
+			f.env.exec(`UPDATE runs SET status=$2 WHERE id=$1`, f.runID, tc.status)
+			state, reason := f.terminalRow(t)
+			if state != "retired" || reason == nil || *reason != tc.reason {
+				t.Fatalf("state=%q reason=%v, want retired/%s", state, reason, tc.reason)
+			}
+			// The marker does not leak: a later direct state change is still refused.
+			_, err := f.env.pool.Exec(f.env.ctx, `UPDATE run_publication_resume SET state='completed' WHERE run_id=$1`, f.runID)
+			requireCoordinateSQLState(t, err, "23514")
+		})
+	}
+}
+
+func TestPublicationResumeSideRowStateChangeStillGuardedLiveDB(t *testing.T) {
+	f := newPublicationResumeFixture(t)
+	f.enroll(t)
+	// The run is not terminal and nothing opted in: closing the row directly is refused.
+	_, err := f.env.pool.Exec(f.env.ctx, `UPDATE run_publication_resume SET state='retired', retired_reason='x' WHERE run_id=$1`, f.runID)
+	requireCoordinateSQLState(t, err, "23514")
+}
+
+func TestPublicationResumeDownSucceedsOnceRunsTerminalLiveDB(t *testing.T) {
+	f := newPublicationResumeFixture(t)
+	ctx := f.env.ctx
+	f.enroll(t)
+	f.env.exec(`UPDATE runs SET status='completed' WHERE id=$1`, f.runID)
+	migration, err := os.ReadFile("../store/migrations/00386_publication_resume.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, down, ok := strings.Cut(string(migration), "-- +goose Down\n")
+	if !ok {
+		t.Fatal("missing production Down script")
+	}
+	tx, err := f.env.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// Rows other tests left in the shared database are closed too, inside this rolled-back tx.
+	if _, err = tx.Exec(ctx, `UPDATE runs SET status='cancelled' WHERE status NOT IN ('completed','failed','cancelled')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(ctx, down); err != nil {
+		t.Fatalf("Down with only terminal runs: %v", err)
+	}
+}
