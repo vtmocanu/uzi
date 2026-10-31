@@ -248,6 +248,19 @@ export type CallbackResult =
 // JS mirror of the Go helper's rangeScanBytes, shared by forward and tail validators.
 export const rangeScanBytes = 64 * 1024 * 1024;
 
+// Search ceilings. Reaching one returns an ok partial result (see dispatchFileSearch).
+const SEARCH_DEADLINE_MS = 10_000;
+const SEARCH_MAX_OPERATIONS = 2048;
+const SEARCH_MAX_DIRECTORIES = 1024;
+const SEARCH_MAX_ENTRIES = 16384;
+const SEARCH_MAX_FILE_BYTES = 1024 * 1024;
+const SEARCH_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
+const SEARCH_MAX_MATCHES = 20;
+const SEARCH_PARTIAL_NOTICE = "Partial search: coverage is incomplete; a missing match does not mean the text is absent.";
+/** Ceilings the search operation wrapper itself reports; deliberately not a FileopResponse. */
+type SearchCeiling = "operations" | "time";
+type SearchStopReason = SearchCeiling | "matches" | "directories" | "entries" | "bytes" | "listing" | "file_size";
+
 /** One fileop request, mapped to the NDJSON op protocol
  *  (agent/codex/supervisor/fileop). `path`/`newPath` are worktree-RELATIVE (the
  *  helper anchors them at the root dirfd and rejects an absolute/`..`/`.git`
@@ -1213,8 +1226,19 @@ export class CodexCallbackBroker {
     } };
   }
 
-  /** Search only through fileop list/stat/read. Every traversal and returned byte has
-   * a fixed ceiling; one failed file blocks the search rather than hiding an incomplete result. */
+  /** Search only through fileop list/stat/read. Every traversal and returned byte has a
+   * fixed ceiling, and reaching one returns the matches found so far as an ok partial
+   * result (`truncated: true`, a `reason`, `skippedFiles`, and a fixed `notice`) instead of
+   * denying the search. A partial result is never complete coverage, and an empty one never
+   * means the text is absent. Failures that are not ceilings (denied, escaping, symlink,
+   * I/O, or an unavailable listing, size, or body) still deny the whole search. The walk is
+   * breadth-first with each listing sorted by name, so results are deterministic. The first
+   * stop reason wins: a truncated listing records "listing" and the walk continues, so a later
+   * ceiling does not replace it. `path` may name one regular file, searched through the same
+   * stat, size, read, and scan routine as the walk.
+   *
+   * The deadline bounds broker waiting and admission of new operations, not settlement of an
+   * already-dispatched helper op: the client op is never cancelled and owns its own settlement. */
   private async dispatchFileSearch(args: unknown): Promise<CallbackResult> {
     const query = strField(args, "query");
     if (!query || Buffer.byteLength(query) > 256) return deny("bad_args", "Search requires a query of at most 256 bytes");
@@ -1227,30 +1251,95 @@ export class CodexCallbackBroker {
     let entries = 0;
     let bytes = 0;
     let operations = 0;
-    const deadline = Date.now() + 10_000;
-    const searchOp = async (request: FileopRequest): Promise<FileopResponse> => {
-      if (++operations > 64 || Date.now() >= deadline) return { ok: false, code: "E_TIMEOUT" };
+    let skippedFiles = 0;
+    let stopReason: SearchStopReason | undefined;
+    const deadline = Date.now() + SEARCH_DEADLINE_MS;
+    const expired = (): boolean => Date.now() >= deadline;
+    const partial = (reason: SearchStopReason): CallbackResult => ({
+      ok: true,
+      output: { matches, truncated: true, bytes, reason, skippedFiles, notice: SEARCH_PARTIAL_NOTICE },
+    });
+    const searchOp = async (request: FileopRequest): Promise<FileopResponse | SearchCeiling> => {
+      if (++operations > SEARCH_MAX_OPERATIONS) return "operations";
+      if (expired()) return "time";
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
+        // The race only stops this broker waiting; the client op is not cancelled.
         return await Promise.race([
           this.fileop.op(request),
-          new Promise<FileopResponse>((resolve) => {
-            timer = setTimeout(() => resolve({ ok: false, code: "E_TIMEOUT" }), Math.max(1, deadline - Date.now()));
+          new Promise<SearchCeiling>((resolve) => {
+            timer = setTimeout(() => resolve("time"), Math.max(1, deadline - Date.now()));
           }),
         ]);
       } finally {
         if (timer) clearTimeout(timer);
       }
     };
-    while (pending.length > 0) {
+    // Stat, size-check, read, and scan one file. Undefined means the file was searched or
+    // skipped; otherwise the walk stops with a ceiling or ends with a final result.
+    const searchFile = async (rel: string, direct: boolean): Promise<{ stop: SearchStopReason } | { result: CallbackResult } | undefined> => {
+      const stat = await searchOp({ op: "stat", path: rel });
+      if (typeof stat === "string") return { stop: stat };
+      if (!stat.ok) return { result: this.mapFileopError(stat) };
+      if (typeof stat.size !== "number" || !Number.isSafeInteger(stat.size) || stat.size < 0) return { result: deny("fileop_denied", "Search file size unavailable") };
+      if (direct && stat.type !== "file") return { result: deny("fileop_denied", "Search target is not a regular file") };
+      if (stat.size > SEARCH_MAX_FILE_BYTES) { skippedFiles++; return undefined; }
+      if (bytes + stat.size > SEARCH_MAX_TOTAL_BYTES) return { stop: "bytes" };
+      const read = await searchOp({ op: "read", path: rel });
+      if (typeof read === "string") return { stop: read };
+      if (!read.ok) {
+        if (read.code === "E_OVERSIZE" && read.origin === "helper") { skippedFiles++; return undefined; }
+        return { result: this.mapFileopError(read) };
+      }
+      if (read.truncated) { skippedFiles++; return undefined; }
+      if (typeof read.data !== "string") return { result: deny("fileop_denied", "Search file body unavailable") };
+      const body = Buffer.from(read.data, "base64");
+      if (body.length > SEARCH_MAX_FILE_BYTES) { skippedFiles++; return undefined; }
+      if (bytes + body.length > SEARCH_MAX_TOTAL_BYTES) return { stop: "bytes" };
+      if (expired()) return { stop: "time" };
+      bytes += body.length;
+      const text = body.toString("utf8");
+      let lineStart = 0;
+      for (let index = 1; lineStart <= text.length; index++) {
+        const newline = text.indexOf("\n", lineStart);
+        const lineEnd = newline < 0 ? text.length : newline;
+        const line = text.slice(lineStart, lineEnd);
+        const matchAt = line.indexOf(query);
+        if (matchAt >= 0) {
+          if (matches.length === SEARCH_MAX_MATCHES) return { result: partial(stopReason ?? "matches") };
+          const excerptStart = Math.max(0, matchAt - Math.floor((256 - query.length) / 2));
+          matches.push({ path: rel, line: index, text: line.slice(excerptStart, excerptStart + 256) });
+        }
+        if (newline < 0) break;
+        lineStart = newline + 1;
+      }
+      if (expired()) return { stop: "time" };
+      return undefined;
+    };
+    let first = true;
+    walk: while (pending.length > 0) {
       const dir = pending.shift()!;
-      if (++directories > 32) return deny("search_limit", "Search directory limit reached");
+      if (directories >= SEARCH_MAX_DIRECTORIES) { stopReason ??= "directories"; break; }
+      directories++;
       const listing = await searchOp({ op: "list", path: dir });
-      if (!listing.ok) return this.mapFileopError(listing);
-      if (listing.truncated || !listing.entries) return deny("search_limit", "Search listing incomplete");
-      entries += listing.entries.length;
-      if (entries > 256) return deny("search_limit", "Search entry limit reached");
-      for (const entry of listing.entries) {
+      if (typeof listing === "string") { stopReason ??= listing; break; }
+      if (!listing.ok) {
+        if (first && listing.code === "E_NOT_DIR" && listing.origin === "helper") {
+          const outcome = await searchFile(dir, true);
+          if (outcome && "result" in outcome) return outcome.result;
+          if (outcome) stopReason ??= outcome.stop;
+          break;
+        }
+        return this.mapFileopError(listing);
+      }
+      first = false;
+      if (!Array.isArray(listing.entries)) return deny("fileop_denied", "Search listing unavailable");
+      if (listing.truncated) stopReason ??= "listing";
+      const sorted = [...listing.entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      for (const entry of sorted) {
+        if (expired()) { stopReason ??= "time"; break walk; }
+        if (entries >= SEARCH_MAX_ENTRIES) { stopReason ??= "entries"; break walk; }
+        entries++;
         if (entry.name === ".git" || !entry.name || entry.name === "." || entry.name === ".." || entry.name.includes("/")) continue;
         const rel = dir === "." ? entry.name : path.posix.join(dir, entry.name);
         const screenedEntry = this.screenAndRelativize(rel);
@@ -1260,28 +1349,17 @@ export class CodexCallbackBroker {
           continue;
         }
         if (entry.type !== "file") continue;
-        const stat = await searchOp({ op: "stat", path: rel });
-        if (!stat.ok) return this.mapFileopError(stat);
-        if (typeof stat.size !== "number" || !Number.isSafeInteger(stat.size) || stat.size < 0) return deny("fileop_denied", "Search file size unavailable");
-        if (stat.size > 64 * 1024) return deny("search_limit", "Search file size limit reached");
-        if (bytes + stat.size > 256 * 1024) return deny("search_limit", "Search byte limit reached");
-        const read = await searchOp({ op: "read", path: rel });
-        if (!read.ok) return this.mapFileopError(read);
-        if (read.truncated) return deny("search_limit", "Search file read incomplete");
-        if (typeof read.data !== "string") return deny("fileop_denied", "Search file body unavailable");
-        const body = Buffer.from(read.data, "base64");
-        if (body.length > 64 * 1024) return deny("search_limit", "Search file size limit reached");
-        bytes += body.length;
-        if (bytes > 256 * 1024) return deny("search_limit", "Search byte limit reached");
-        for (const [index, line] of body.toString("utf8").split("\n").entries()) {
-          const matchAt = line.indexOf(query);
-          if (matchAt < 0) continue;
-          if (matches.length === 20) return { ok: true, output: { matches, truncated: true, bytes } };
-          const excerptStart = Math.max(0, matchAt - Math.floor((256 - query.length) / 2));
-          matches.push({ path: rel, line: index + 1, text: line.slice(excerptStart, excerptStart + 256) });
-        }
+        const outcome = await searchFile(rel, false);
+        if (!outcome) continue;
+        if ("result" in outcome) return outcome.result;
+        stopReason ??= outcome.stop;
+        break walk;
       }
     }
+    // An expiry after the final read must not be reported as complete coverage.
+    if (stopReason === undefined && expired()) stopReason = "time";
+    const reason = stopReason ?? (skippedFiles > 0 ? "file_size" : undefined);
+    if (reason !== undefined) return partial(reason);
     return { ok: true, output: { matches, truncated: false, bytes } };
   }
 

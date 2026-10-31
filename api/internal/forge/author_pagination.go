@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// completeAuthorResponse applies only to author evidence reads.
+// completeAuthorResponse requires a complete object response for author or project evidence.
 func completeAuthorResponse(resp *http.Response) bool {
 	return resp != nil && resp.StatusCode == http.StatusOK && len(resp.Header.Values("Content-Range")) == 0
 }

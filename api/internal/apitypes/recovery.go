@@ -108,19 +108,28 @@ type RecoveryUploadManifest struct {
 	PrerequisiteShas []string `json:"prerequisite_shas,omitempty"`
 }
 
+// RecoveryPrerequisiteClosureStatus contains capture-bound pin facts, never raw lane errors.
+type RecoveryPrerequisiteClosureStatus struct {
+	State            string   `json:"state"`
+	Reason           string   `json:"reason,omitempty"`
+	PrerequisiteShas []string `json:"prerequisite_shas,omitempty"`
+	Checksum         string   `json:"checksum,omitempty"`
+}
+
 // RecoveryCaptureStatusResponse is the worker's by-id status poll of a capture (D2: by-ID
 // inspection plus idempotent upload handle lost ACKs). ManifestBound tells the worker
 // whether the byte manifest is already bound (so a restart knows whether to re-bind);
 // ByteSize/Checksum/ExpiresAt surface the bound manifest and ready expiry when present;
 // Reason carries a bounded sanitized needs_action/error reason.
 type RecoveryCaptureStatusResponse struct {
-	CaptureID     string     `json:"capture_id"`
-	State         string     `json:"state"`
-	ManifestBound bool       `json:"manifest_bound"`
-	ByteSize      *int64     `json:"byte_size,omitempty"`
-	Checksum      string     `json:"checksum,omitempty"`
-	Reason        string     `json:"reason,omitempty"`
-	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	PrerequisiteClosure *RecoveryPrerequisiteClosureStatus `json:"prerequisite_closure,omitempty"`
+	CaptureID           string                             `json:"capture_id"`
+	State               string                             `json:"state"`
+	ManifestBound       bool                               `json:"manifest_bound"`
+	ByteSize            *int64                             `json:"byte_size,omitempty"`
+	Checksum            string                             `json:"checksum,omitempty"`
+	Reason              string                             `json:"reason,omitempty"`
+	ExpiresAt           *time.Time                         `json:"expires_at,omitempty"`
 }
 
 // RecoveryReleaseResponse is the release ACK for a run's custody (D3): Released is true

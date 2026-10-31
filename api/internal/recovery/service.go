@@ -346,7 +346,8 @@ func (s *Service) admit(ctx context.Context, wkr store.Worker, runID, captureID 
 	// Lost-ACK idempotency: an already-ready capture returns its existing receipt without
 	// re-uploading, re-charging quota or overwriting bytes.
 	if lc.state == "available" {
-		return statusFromLocked(captureID, lc), true, nil
+		status, err := withPrerequisiteStatus(ctx, store.New(tx), wkr.UserID, captureID, statusFromLocked(captureID, lc))
+		return status, true, err
 	}
 
 	if err := store.LockStoredFiles(ctx, tx, wkr.UserID); err != nil {
@@ -411,7 +412,7 @@ func (s *Service) stream(ctx context.Context, wkr store.Worker, runID, captureID
 		return apitypes.RecoveryCaptureStatusResponse{}, err
 	}
 	if lc.state == "available" {
-		return statusFromLocked(captureID, lc), nil // a concurrent upload of this capture won.
+		return withPrerequisiteStatus(ctx, store.New(tx), wkr.UserID, captureID, statusFromLocked(captureID, lc)) // a concurrent upload won.
 	}
 	if lc.state != "uploading" || !lc.reservedBytes.Valid || lc.reservedBytes.Int64 != manifest.ByteSize {
 		return apitypes.RecoveryCaptureStatusResponse{}, ErrBusy
@@ -470,10 +471,26 @@ func (s *Service) stream(ctx context.Context, wkr store.Worker, runID, captureID
 		}
 		return apitypes.RecoveryCaptureStatusResponse{}, err
 	}
+	inserted, err := s.insertPrerequisiteClosure(ctx, tx, wkr, ready)
+	if err != nil {
+		return apitypes.RecoveryCaptureStatusResponse{}, err
+	}
+	status, err := withPrerequisiteStatus(ctx, qtx, wkr.UserID, captureID, captureToStatus(ready))
+	if err != nil {
+		return apitypes.RecoveryCaptureStatusResponse{}, err
+	}
+	if s.prerequisitePreCommit != nil {
+		if err := s.prerequisitePreCommit(tx); err != nil {
+			return apitypes.RecoveryCaptureStatusResponse{}, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return apitypes.RecoveryCaptureStatusResponse{}, err
 	}
-	return captureToStatus(ready), nil
+	if inserted && s.prerequisiteKick != nil {
+		s.prerequisiteKick(wkr.UserID, captureID)
+	}
+	return status, nil
 }
 
 // reclaimForBudget runs in the stream transaction AFTER the upload's size and checksum verified,
@@ -655,7 +672,11 @@ func (s *Service) Status(ctx context.Context, wkr store.Worker, runID, captureID
 	if !cap.OriginalWorkerID.Valid || uuid.UUID(cap.OriginalWorkerID.Bytes) != wkr.ID {
 		return apitypes.RecoveryCaptureStatusResponse{}, ErrNotAuthorized
 	}
-	return captureToStatus(cap), nil
+	q, ok := s.store.(prerequisiteStatusStore)
+	if !ok {
+		q = store.New(s.pool)
+	}
+	return withPrerequisiteStatus(ctx, q, wkr.UserID, captureID, captureToStatus(cap))
 }
 
 // ListHoldsForWorkerRun returns the caller worker's OWN open custody holds on the run — the

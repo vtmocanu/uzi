@@ -154,7 +154,7 @@ detail page and by `uzi run get`.
 
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.163.0 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.164.0 and defaults to `gpt-6.1-sol`
 when no worker-model override is set. Explicit model preferences remain
 unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
 keep separate overrides, and each can instead be set to **Runtime default**,

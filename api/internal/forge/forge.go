@@ -753,6 +753,11 @@ type Forge interface {
 	// ListProjects returns every project the bot has at least Developer access
 	// to (membership=true).
 	ListProjects(ctx context.Context) ([]Project, error)
+	// GetProject freshly reads bounded metadata by positive numeric ID, without
+	// inventory enumeration or cached identity. It requires complete, coherent
+	// identity and WebURL; DefaultBranch may be empty. Any failure returns zero
+	// Project and invalidates the requested ID's cached slug.
+	GetProject(ctx context.Context, projectID int64) (Project, error)
 	// ListLabels returns all labels defined on a project.
 	ListLabels(ctx context.Context, projectID int64) ([]Label, error)
 	// EnsureLabels creates any of the given labels that do not already exist on

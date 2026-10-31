@@ -138,7 +138,11 @@ type Service struct {
 	// workersvc.SettleRetainedCheckpoint, which deletes the run's retained checkpoint ref once
 	// its last hold is settled. Nil (the default, and every test that does not wire it) is a
 	// no-op; the sweeper's reconciliation pass is the backstop either way.
-	custodySettled func(runID uuid.UUID)
+	custodySettled     func(runID uuid.UUID)
+	prerequisiteForges []string
+	prerequisiteKick   func(userID, captureID uuid.UUID)
+	// Test-only failure seam after ready and S0, before the upload commits.
+	prerequisitePreCommit func(pgx.Tx) error
 	// Held-publication FINAL (issue #2545, held_final.go). heldEnabled is UZI_HELD_PUBLICATION
 	// and heldRemote derives the run's forge connection; both are wired by SetHeldPublication
 	// (unset: step B reports held_publication_unsupported). heldListFn is the broker listing,

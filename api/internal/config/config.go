@@ -394,10 +394,11 @@ type Config struct {
 	SeedReleaseCheckInterval      time.Duration
 	SeedReleaseCheckToken         string
 
-	// Agent-runtime (PRD #4) knobs. All have safe defaults; none is a boot guard
-	// (they tune the run queue / worker liveness, not security). RunIdleTimeout
-	// and RunMaxIterations are enforced worker-side and shipped in the claim
-	// payload; the rest drive the server sweeper and claim affinity.
+	// Agent-runtime (PRD #4) knobs tune the run queue / worker liveness.
+	// Defaults and invalid-value handling vary per setting; some malformed values
+	// reject API startup. RunIdleTimeout and RunMaxIterations are enforced
+	// worker-side and shipped in the claim payload; the rest drive the server
+	// sweeper and claim affinity.
 	PlanCrossCheckMaxRevisions int32
 	CodeCrossCheckTimeout      time.Duration // independent code checker wall-clock budget
 	PlanCrossCheckTimeout      time.Duration // bounded checker wall-clock budget
@@ -820,6 +821,8 @@ type Config struct {
 	// on a forge that left the list is settled 'disabled' (after a CAS delete of any
 	// unrecorded copy), so a rollback can still make forge calls for existing rows.
 	SalvageForges []string
+	// PrerequisiteClosureForges opts new captures into reviewed prerequisite pinning strategies.
+	PrerequisiteClosureForges []string
 
 	// HeldPublication (issue #2545, UZI_HELD_PUBLICATION) is the held-work publication switch.
 	// Unset or empty means on. Accepted values, case-insensitive and trimmed: true, on, 1, yes, t,
@@ -1459,6 +1462,11 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.SalvageForges = salvageForges
+	closureForges, err := parseForgeKinds("UZI_PREREQUISITE_CLOSURE_FORGES", getenv("UZI_PREREQUISITE_CLOSURE_FORGES", ""))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.PrerequisiteClosureForges = closureForges
 
 	heldPublication, err := parseOnOff("UZI_HELD_PUBLICATION", true)
 	if err != nil {
@@ -1481,6 +1489,10 @@ func Load() (Config, error) {
 // kind uzi supports (github, gitlab, forgejo); anything else is an error so a typo refuses
 // to start rather than silently leaving salvage off for that forge. Empty returns nil (off).
 func parseSalvageForges(raw string) ([]string, error) {
+	return parseForgeKinds("UZI_SALVAGE_FORGES", raw)
+}
+
+func parseForgeKinds(name, raw string) ([]string, error) {
 	var out []string
 	for _, part := range strings.Split(raw, ",") {
 		kind := strings.ToLower(strings.TrimSpace(part))
@@ -1490,7 +1502,7 @@ func parseSalvageForges(raw string) ([]string, error) {
 		switch kind {
 		case "github", "gitlab", "forgejo":
 		default:
-			return nil, fmt.Errorf("UZI_SALVAGE_FORGES: unknown forge %q (want a comma list of github, gitlab, forgejo)", kind)
+			return nil, fmt.Errorf("%s: unknown forge %q (want a comma list of github, gitlab, forgejo)", name, kind)
 		}
 		if !slices.Contains(out, kind) {
 			out = append(out, kind)

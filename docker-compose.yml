@@ -188,6 +188,8 @@ services:
       # these lines, setting them in .env is
       # inert and the API falls back to its Go defaults. (WORKER_HEARTBEAT_INTERVAL and
       # WORKER_POLL_INTERVAL are worker cadences consumed by the agent service, not here.)
+      # API prerequisite pin admission (#3591), off by default.
+      UZI_PREREQUISITE_CLOSURE_FORGES: ${UZI_PREREQUISITE_CLOSURE_FORGES:-}
       RUN_TIMEOUT: ${RUN_TIMEOUT:-6h}
       RUN_WALL_CEILING: ${RUN_WALL_CEILING:-}
       RUN_IDLE_TIMEOUT: ${RUN_IDLE_TIMEOUT:-10m}

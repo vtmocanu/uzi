@@ -1752,6 +1752,18 @@ const server = https.createServer(
       const project = resolveProject(proj[1]);
       const rest = proj[2] || "";
 
+      // Stable-ID evidence cannot use the legacy issue/MR fallback to project 1.
+      if (method === "GET" && rest === "") {
+        const selected = PROJECTS.find((p) => String(p.id) === proj[1]);
+        if (!selected) return send(res, 404, { message: "404 Project Not Found" });
+        const parts = selected.path_with_namespace.split("/");
+        return send(res, 200, {
+          ...selected,
+          path: parts.pop(),
+          namespace: { full_path: parts.join("/") },
+        });
+      }
+
       // Custody publication/settlement proofs must read the same bare the worker
       // pushes to, including checkpoint refs and ancestry, rather than synthetic heads.
       const branchGet = rest.match(/^\/repository\/branches\/([^/]+)$/);
