@@ -171,7 +171,10 @@ func TestPublicationResumeRetireNeedsOptInLiveDB(t *testing.T) {
 	_, err = sp.Exec(ctx, `UPDATE run_publication_resume SET intent = jsonb_set(intent::jsonb, '{branch}', '"other"')::text::json WHERE run_id=$1`, f.runID)
 	requireCoordinateSQLState(t, err, "23514")
 	_ = sp.Rollback(ctx)
-	retired, err := q.RetirePublicationResume(ctx, store.RetirePublicationResumeParams{RunID: f.runID, Reason: "owner_completion_continue"})
+	// Any reason except owner_completion_continue (whose live-window retirement keeps the claim and
+	// so allows a fresh enrollment at the same generation; see
+	// TestPublicationLiveContinueAllowsFreshEnrollmentLiveDB).
+	retired, err := q.RetirePublicationResume(ctx, store.RetirePublicationResumeParams{RunID: f.runID, Reason: "superseded_for_test"})
 	if err != nil || retired.State != "retired" {
 		t.Fatalf("retire=%+v err=%v", retired, err)
 	}

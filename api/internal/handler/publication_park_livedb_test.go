@@ -35,6 +35,17 @@ func TestForgeParkRefusalReasonPublicationEnrolled(t *testing.T) {
 	}
 }
 
+func TestForgeParkRefusalReasonPublicationNotEnrolled(t *testing.T) {
+	for _, err := range []error{workersvc.ErrPublicationNotEnrolled, fmt.Errorf("park: %w", workersvc.ErrPublicationNotEnrolled)} {
+		if reason, ok := forgeParkRefusalReason(err); !ok || reason != "publication_not_enrolled" {
+			t.Errorf("forgeParkRefusalReason(%v) = (%q,%v), want (publication_not_enrolled,true)", err, reason, ok)
+		}
+	}
+	if errors.Is(workersvc.ErrPublicationNotEnrolled, workersvc.ErrPublicationEnrolled) {
+		t.Error("the sentinels must be distinct")
+	}
+}
+
 func TestShortObjectID(t *testing.T) {
 	if got := shortObjectID("0123456789abcdef0123"); got != "0123456789ab" {
 		t.Fatalf("long id: %q", got)

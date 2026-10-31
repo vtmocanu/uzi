@@ -1372,6 +1372,10 @@ func forgeParkRefusalReason(err error) (string, bool) {
 		// Issue #1324: a legacy forge park for a run with an active publication intent. Nothing was
 		// mutated; the worker retries with recovery_phase "publication".
 		return "publication_enrolled", true
+	case errors.Is(err, workersvc.ErrPublicationNotEnrolled):
+		// Issue #1324: a typed publication park for a run with no active intent. Nothing was
+		// mutated; the pre-clone path must not absorb it.
+		return "publication_not_enrolled", true
 	default:
 		return "", false
 	}

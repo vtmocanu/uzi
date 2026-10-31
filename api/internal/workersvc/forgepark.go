@@ -174,9 +174,11 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 	// hold into zero between the count and the release.
 	//
 	// Lock order note: the documented order is worker, run, side row, custody, cooldown. This
-	// custody lock precedes the side-row read and write below, but the run row lock taken above
-	// serializes every writer of an enrolled run's side row and custody holds, so no writer can
-	// hold the side row and wait on custody while this one holds custody and waits on the side row.
+	// custody lock precedes the side-row read and write below. The run row lock taken above
+	// serializes the side-row writers (they all take the run lock first); a reconciler custody
+	// release does not take the run lock, but it never takes the side row either, so no writer
+	// can hold the side row and wait on custody while this one holds custody and waits on the
+	// side row.
 	holdIDs, err := qtx.LockOpenCustodyHoldsForRunWorkerGeneration(ctx, store.LockOpenCustodyHoldsForRunWorkerGenerationParams{
 		RunID:      run.ID,
 		Generation: *req.ClaimGeneration,
@@ -203,6 +205,12 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 		return store.Run{}, 0, ierr
 	}
 	stopping := run.StopKind.Valid && run.StopKind.String != ""
+	// A typed publication report for a run with no active intent is refused: dropping the phase
+	// would take the pre-clone path below, releasing custody and counting a forge park. A stamped
+	// stop still cancels through the existing arm. The transaction rolls back; nothing is mutated.
+	if !enrolled && !stopping && req.RecoveryPhase != nil && *req.RecoveryPhase == publicationPhase {
+		return run, 0, ErrPublicationNotEnrolled
+	}
 	if enrolled && !stopping {
 		if err := publicationParkRefusal(wkr, req); err != nil {
 			return run, 0, err
@@ -254,7 +262,9 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 		if err := tx.Commit(ctx); err != nil {
 			return store.Run{}, 0, err
 		}
-		s.SettleRetainedCheckpoint(run.ID) // PRD #1810 D3: the exact hold's release committed
+		// PRD #1810 D3: for a non-enrolled run the exact hold's release committed above; an
+		// enrolled run's stamped stop released nothing, so this only re-reads the retention record.
+		s.SettleRetainedCheckpoint(run.ID)
 		return run, 1, nil
 	}
 

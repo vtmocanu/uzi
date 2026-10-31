@@ -14,10 +14,14 @@ SELECT * FROM run_publication_resume p WHERE p.run_id = @run_id AND p.enrollment
 
 -- name: HasInactivePublicationResumeAtGeneration :one
 -- True when a retired or completed enrollment of the run exists at or above the generation. A
--- fresh enrollment at such a generation would resurrect a closed one (no resurrection).
+-- fresh enrollment at such a generation would resurrect a closed one (no resurrection), except after
+-- an owner_completion_continue retirement (see below).
 SELECT EXISTS (
     SELECT 1 FROM run_publication_resume p
     WHERE p.run_id = @run_id AND p.state <> 'active' AND p.claim_generation >= @claim_generation::bigint
+      -- The owner's live completion continue retires the intent but keeps the claim, so the same
+      -- flight's next finalize enrolls afresh at the same generation (a new, higher enrollment_seq).
+      AND NOT (p.state = 'retired' AND p.retired_reason = 'owner_completion_continue')
 )::boolean AS retired;
 
 -- name: EnrollPublicationResume :one
@@ -147,6 +151,15 @@ WITH candidates AS MATERIALIZED (
                          AND COALESCE(r.status_since > sqlc.narg('stale_requeue_cutoff')::timestamptz, false))
                      OR ((w.draining_since IS NOT NULL OR w.maintenance_phase IN ('requested','ready','stopping','recycling') OR w.maintenance_fenced)
                          AND r.updated_at >= @affinity_cutoff::timestamptz)))
+          -- PRD #1497 D19 mirror: ClaimRun refuses the exact incarnation a wall park or an over-cap
+          -- hold released (released_worker_id plus released_worker_nonce equal to the worker's
+          -- current snapshot_register_nonce, NULLs compared as equal). When that is the custodian,
+          -- no worker can claim the run, so it is held until the custodian re-registers (a new
+          -- nonce) or the owner decides.
+          OR EXISTS (
+              SELECT 1 FROM workers w
+              WHERE w.id = p.worker_id AND r.released_worker_id = w.id
+                AND r.released_worker_nonce IS NOT DISTINCT FROM w.snapshot_register_nonce)
           -- The affinity ceiling is its own conjunct: a draining or fenced custodian past it is
           -- held whatever its heartbeat says, because ClaimRun refuses a fenced claimant.
           OR EXISTS (

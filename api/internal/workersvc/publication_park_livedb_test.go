@@ -532,12 +532,23 @@ func TestPublicationCustodianSweepLiveDB(t *testing.T) {
 func TestPublicationSweepHoldsUnservableRunLiveDB(t *testing.T) {
 	f := newPublicationParkFixture(t, time.Hour)
 	f.env.exec(`UPDATE runs SET status='queued', worker_id=NULL WHERE id=$1`, f.runID)
+	f.env.exec(`UPDATE workers SET last_heartbeat_at=now() WHERE id=$1`, f.workerID)
+	// Control: a healthy custodian (fresh heartbeat, capability) is not held.
 	res, err := f.svc.Sweep(f.env.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.PublicationHeld < 1 || f.run(t).Status != "recovery_wait" || f.side(t).HoldReason.String != "publication_custodian_unavailable" {
-		t.Fatalf("held=%d status=%s side=%+v", res.PublicationHeld, f.run(t).Status, f.side(t))
+	if f.run(t).Status != "queued" {
+		t.Fatalf("a healthy custodian was held: held=%d status=%s", res.PublicationHeld, f.run(t).Status)
+	}
+	// The custodian is the side row's worker_id; a NULL one is held.
+	f.env.exec(`UPDATE run_publication_resume SET worker_id=NULL WHERE run_id=$1 AND state='active'`, f.runID)
+	res, err = f.svc.Sweep(f.env.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.run(t).Status != "recovery_wait" || f.side(t).HoldReason.String != "publication_custodian_unavailable" {
+		t.Fatalf("held=%d status=%s hold=%v", res.PublicationHeld, f.run(t).Status, f.side(t).HoldReason)
 	}
 }
 

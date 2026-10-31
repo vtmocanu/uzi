@@ -28,6 +28,12 @@ import (
 // park is accounted as a publication park (409 reason publication_enrolled; nothing mutated).
 var ErrPublicationEnrolled = errors.New("publication_enrolled")
 
+// ErrPublicationNotEnrolled refuses a typed publication park (recovery_phase "publication") for a
+// run with no active intent: the typed phase must never be dropped into the pre-clone path, which
+// would release custody and count a forge park (409 reason publication_not_enrolled; nothing
+// mutated).
+var ErrPublicationNotEnrolled = errors.New("publication_not_enrolled")
+
 const (
 	publicationPhase = "publication"
 
