@@ -703,6 +703,16 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 			}
 		}
 		accountCols := m.boardAccountCols(rendered)
+		// The status cell never shrinks so far that the band headings in view push their first
+		// label (age / ended) off: it keeps the first label two blanks clear of the widest
+		// heading, within the fixed maximum (tui-ux review of #3732). A labelled heading is one
+		// with at least one of its rows rendered below it.
+		for i := start; i < end; i++ {
+			if items[i].kind == biEyebrow && i+1 < end && items[i+1].kind == biRow {
+				floor := visualWidth(m.boardEyebrow(items[i])) + 2 - boardAgeLabelOffset(m.board.admin)
+				accountCols.statusW = min(boardStatusWordWidth, max(accountCols.statusW, floor))
+			}
+		}
 		// A band's heading names the judge column only when one of its runs carries a verdict:
 		// the judge runs after a run finishes, so active bands would label an empty column.
 		var bandVerdict [numBands]bool
@@ -718,7 +728,12 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 				if !bandVerdict[it.band] {
 					bmc.fullW = 0 // the column stays reserved on rows; only the label is omitted
 				}
-				sb.WriteString(m.boardEyebrowLabelled(it, bmc, accountCols) + "\n")
+				if i+1 < end && items[i+1].kind == biRow {
+					sb.WriteString(m.boardEyebrowLabelled(it, bmc, accountCols) + "\n")
+				} else {
+					// A heading at the window's bottom edge with no rows under it: no labels.
+					sb.WriteString(m.boardEyebrow(it) + "\n")
+				}
 			case biRow:
 				r := rows[it.runIdx]
 				sel := it.runIdx == m.board.cursor

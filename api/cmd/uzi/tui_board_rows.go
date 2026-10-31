@@ -731,13 +731,7 @@ type boardColLabel struct {
 func (m tuiModel) boardColumnLabels(band int, mc boardMarkerCols, cols boardAccountCols) []boardColLabel {
 	var out []boardColLabel
 	add := func(text string, start int) { out = append(out, boardColLabel{text, start}) }
-	pos := 4 + boardIDWidth + 2 // cursor, strip, glyph, space, id, gap
-	if m.board.admin {
-		// No label: the owner cell starts right after the run id, under the heading text
-		// (every heading is wider than the id), like the id and status columns.
-		pos += boardOwnerWidth + 2
-	}
-	pos += cols.statusW + 2
+	pos := boardAgeLabelOffset(m.board.admin) + cols.statusW
 	if band == bandDone {
 		add("ended", pos)
 	} else {
@@ -776,6 +770,17 @@ func (m tuiModel) boardColumnLabels(band int, mc boardMarkerCols, cols boardAcco
 		add("worker", contentW+2)
 	}
 	return out
+}
+
+// boardAgeLabelOffset is the AGE cell's column minus the status width: cursor, strip, glyph,
+// space, id and gap, plus the admin owner cell (no label: it starts right after the run id,
+// under the heading text, like the id and status columns), plus the gap after status.
+func boardAgeLabelOffset(admin bool) int {
+	off := 4 + boardIDWidth + 2 + 2
+	if admin {
+		off += boardOwnerWidth + 2
+	}
+	return off
 }
 
 // placeBoardLabels lays labels after a heading of visual width headW: each one starts exactly

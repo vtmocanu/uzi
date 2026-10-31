@@ -242,3 +242,69 @@ func TestBoardEyebrowJudgeLabelFollowsVerdicts(t *testing.T) {
 		}
 	}
 }
+
+// A long DONE heading (three-digit count, two-digit failures) keeps its `ended` label: the
+// status cell grows just enough (never past the fixed max) instead of dropping the label the
+// two DONE numbers depend on (tui-ux review of #3732).
+func TestBoardDoneHeadingKeepsEndedLabel(t *testing.T) {
+	done, running := labelRuns()
+	runs := []apitypes.RunListItemDTO{running}
+	for i := 0; i < 120; i++ {
+		r := done
+		r.ID = "d" + itoa(1000000+i)
+		if i < 35 {
+			r.Status = "failed"
+		}
+		runs = append(runs, r)
+	}
+	for _, w := range []int{100, 160} {
+		m := asciiBoard(t, w, false, runs...)
+		m.height = 200
+		out := stripANSI(m.View().Content)
+		head := lineWith(t, out, " DONE ")
+		if !strings.Contains(head, "DONE · 120 · 35 failed") {
+			t.Fatalf("fixture heading: %q", head)
+		}
+		lc := rowCol(head, "ended")
+		if lc < 0 {
+			t.Fatalf("w %d: ended dropped from %q", w, head)
+		}
+		row := lineWith(t, out, runs[1].ID)
+		if cc := rowCol(row, "20m"); cc != lc {
+			t.Errorf("w %d: ended at %d, age cell at %d\n%q\n%q", w, lc, cc, head, row)
+		}
+		if got := m.boardAccountCols(m.board.visible()).statusW; got > boardStatusWordWidth {
+			t.Errorf("status width %d past the max", got)
+		}
+	}
+}
+
+// A band heading at the window's bottom edge with none of its rows shown carries no labels.
+// The floor-band size is swept until the DONE heading lands on the last body line.
+func TestBoardOrphanHeadingUnlabelled(t *testing.T) {
+	done, running := labelRuns()
+	found := false
+	for n := 1; n <= 30 && !found; n++ {
+		runs := []apitypes.RunListItemDTO{done}
+		for i := 0; i < n; i++ {
+			r := running
+			r.ID = "r" + itoa(1000000+i)
+			runs = append(runs, r)
+		}
+		m := asciiBoard(t, 160, false, runs...)
+		m.height = 16
+		lines := strings.Split(stripANSI(m.View().Content), "\n")
+		for i, l := range lines {
+			if !strings.HasPrefix(l, " DONE ") || i+1 >= len(lines) || strings.Contains(lines[i+1], "▌") {
+				continue
+			}
+			found = true
+			if boardHeadingText(l) != strings.TrimSpace(l) {
+				t.Errorf("n %d: orphan DONE heading carries labels: %q", n, l)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("fixture: no floor size put the DONE heading on the window's last body line")
+	}
+}
