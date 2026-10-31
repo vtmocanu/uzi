@@ -113,6 +113,7 @@ func TestPodEpochWatchHTTPSerialResumeAnd410(t *testing.T) {
 				emit("MODIFIED", epochTerminal(old))
 				emit("ADDED", next)
 				emit("ADDED", next)
+				emit("MODIFIED", epochWithIDs(next, "containerd://"))
 				return
 			}
 			if n == 2 {
@@ -144,7 +145,7 @@ func TestPodEpochWatchHTTPSerialResumeAnd410(t *testing.T) {
 	close(release)
 	patch := epochAwait(t, patches)
 	metadata := patch["metadata"].(map[string]any)
-	if len(patch) != 1 || len(metadata) != 3 || metadata["uid"] != epochB || metadata["resourceVersion"] != next.ResourceVersion {
+	if len(patch) != 1 || len(metadata) != 3 || metadata["uid"] != epochB || metadata["resourceVersion"] != epochWithIDs(next, "containerd://").ResourceVersion {
 		t.Fatalf("patch=%v", patch)
 	}
 	annotations := metadata["annotations"].(map[string]any)
@@ -155,7 +156,7 @@ func TestPodEpochWatchHTTPSerialResumeAnd410(t *testing.T) {
 	if err != nil || evidence == nil {
 		t.Fatalf("positive evidence absent: %v %v", annotations, err)
 	}
-	if rv := epochAwait(t, watches); rv != next.ResourceVersion {
+	if rv := epochAwait(t, watches); rv != epochWithIDs(next, "containerd://").ResourceVersion {
 		t.Fatalf("resume rv=%q", rv)
 	}
 	if session.CurrentGeneration() != initial {
@@ -303,6 +304,7 @@ func TestPodEpochWatchHTTPStartupTimeoutFence(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"type": "MODIFIED", "object": epochTerminal(unsynced)})
 		_ = json.NewEncoder(w).Encode(map[string]any{"type": "ADDED", "object": next})
+		_ = json.NewEncoder(w).Encode(map[string]any{"type": "MODIFIED", "object": epochWithIDs(next, "containerd://")})
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
 	})

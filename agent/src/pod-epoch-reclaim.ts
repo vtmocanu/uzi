@@ -1,5 +1,6 @@
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
+import { release as osRelease } from "node:os";
 import { basename } from "node:path";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import type { inspectPodEpochBootstrap } from "./pod-epoch-bootstrap.js";
@@ -25,19 +26,38 @@ interface Options {
   schedule?: Schedule;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<unknown>;
   readEvidence?: (path: string, signal: AbortSignal) => Promise<Uint8Array | string>;
+  /** Kernel release observation; defaults to the OS release. Read once, on the v2 path only. */
+  kernelRelease?: () => string;
 }
+type Basis = "discard" | "strict_plain";
+interface Candidate { run_id: string; path: string; bytes: number; presence: "present" | "missing"; basis: Basis }
+// Exact crio-crun kernel releases covered by the PRD #3430 audit. Any other release defers
+// with kernel_unaudited; refreshing this list needs a reviewed PRD #3430 audit addendum.
+const AUDITED_CRIO_KERNELS: readonly string[] = ["6.12.0-243.el10.x86_64", "6.12.0-243.el10.aarch64"];
+const RUNTIME_PREFIX = { "containerd-runc": "containerd://", "crio-crun": "cri-o://" } as const;
 interface Verdict {
   verdict: "eligible" | "deferred" | "partial";
   reason: string;
   examined: number;
   would_delete: number;
+  would_delete_bytes: number;
+  would_settle: number;
+  by_basis: { discard: number; strict_plain: number };
   kept: number;
-  list: Array<{ run_id: string; path: string; bytes: number }>;
+  /** Final discard candidates whose marker-less canonical plain journal carried fields beyond
+   *  runId and clonePath (for example restoreTip). Report-only, so m6 can review them before M1b. */
+  journal_extra_fields: number;
+  list: Candidate[];
   list_overflow: number;
   inventory_overflow: number;
   inventory_overflow_exact: boolean;
   inventory_complete: boolean;
   bytes_state: "measured" | "partial" | "unknown";
+  /** What the evidence proved; reasons are fixed tokens, never controller text. Deletion
+   * authority (M1b) requires BOTH verdict "eligible" AND authority "attested". */
+  authority: { result: "undeclared" | "legacy_evidence" | "contradicted" | "unproven" | "attested"; reason: string };
+  evidence_version: 1 | 2 | null;
+  observations?: { kernel: string };
   evidence_wait_ms: number;
   pass_ms: number;
   settlement_reserve_ms: number;
@@ -104,12 +124,26 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
   let guard: PodEpochDaemonGuard | undefined;
   let detachVeto = () => {};
   const result: Verdict = {
-    verdict: "deferred", reason: "not_evaluated", examined: 0, would_delete: 0, kept: 0,
+    verdict: "deferred", reason: "not_evaluated", examined: 0, would_delete: 0, would_delete_bytes: 0,
+    would_settle: 0, by_basis: { discard: 0, strict_plain: 0 }, kept: 0, journal_extra_fields: 0,
+    authority: { result: "unproven", reason: "not_evaluated" }, evidence_version: null,
     list: [], list_overflow: 0, inventory_overflow: 0, inventory_overflow_exact: false,
     inventory_complete: false, bytes_state: "unknown", evidence_wait_ms: 0, pass_ms: 0,
     settlement_reserve_ms: 5000,
   };
-  const selected = new Map<string, { run_id: string; path: string; bytes: number }>();
+  let decided = false;
+  const decide = (outcome: Verdict["authority"]["result"], reason: string) => {
+    result.authority = { result: outcome, reason }; decided = true;
+  };
+  // One candidate per clone path. A path observed again with a different presence, run, basis or bytes, by any
+  // inspected source in which it is not a candidate, or by a group refused for its run ID, is
+  // demoted to kept and cannot be re-added.
+  const candidates = new Map<string, Candidate>();
+  const refused = new Set<string>();
+  // Paths whose source was a marker-less canonical plain journal carrying extra fields (report-only).
+  const extraFieldPaths = new Set<string>();
+  let invalidReason = "";
+  const invalidate = (reason: string) => { invalid = true; invalidReason ||= reason; };
   const examined = new Set<string>();
   const measured = new Set<string>();
   const stop = (reason: string) => {
@@ -159,8 +193,10 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     controller.signal.throwIfAborted();
     if (ownership.mode === "unsupported") throw new Refusal("unsupported_filesystem");
     if (options.consumption.result === "full") throw new Refusal("consumption_full");
-    if (boot.firstMode !== "exclusive" || !boot.runtime || !boot.evidenceFile)
+    if (boot.firstMode !== "exclusive" || !boot.runtime || !boot.evidenceFile) {
+      if (boot.reason === "runtime_not_declared") decide("undeclared", "runtime_not_declared");
       throw new Refusal(boot.reason ?? "bootstrap_uncertain");
+    }
     if (ownership.mode !== "exclusive") throw new Refusal("lock_busy");
     if (!options.consumption.mayEvaluate) throw new Refusal("consumption_uncertain");
     const evidenceStart = now(), hardEvidence = Math.min(hardPass, evidenceStart + 120_000);
@@ -189,15 +225,38 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       }
     } finally { cancelEvidence(); result.evidence_wait_ms = Math.max(0, now() - evidenceStart); }
     if ("handoff" in document) throw new Refusal("no_predecessor_evidence");
+    result.evidence_version = document.version;
     try { assertPodEpochEvidenceBinding(document, boot.podUid, boot.runtime); }
     catch { throw new Refusal("evidence_binding"); }
+    // A controller-declared contradiction defers; its free-text reason is never echoed.
+    if (document.version === 2 && document.attestation.result !== "consistent") {
+      decide("contradicted", "attestation_contradicted");
+      throw new Refusal("attestation_contradicted");
+    }
+    if (document.version === 1) {
+      decide("legacy_evidence", "legacy_evidence");
+      throw new Refusal("legacy_evidence");
+    }
     const evidence = document;
+    // The worker recomputes the runtime prefixes itself; the controller's attestation is
+    // never trusted alone.
+    const prefix = RUNTIME_PREFIX[boot.runtime];
+    const contradict = (reason: string): never => { decide("contradicted", reason); throw new Refusal(reason); };
+    if (![...evidence.containers, ...evidence.initContainers].every(c => c.containerID.startsWith(prefix)))
+      contradict("predecessor_runtime_prefix");
+    if (!evidence.successorContainers.every(c => c.containerID.startsWith(prefix)))
+      contradict("successor_runtime_prefix");
+    let kernel = "";
+    try { kernel = String((options.kernelRelease ?? osRelease)()); } catch { /* unaudited below for crio-crun */ }
+    result.observations = { kernel: kernel.replace(/[^A-Za-z0-9._+-]/g, "_").slice(0, 64) };
+    if (boot.runtime === "crio-crun" && !AUDITED_CRIO_KERNELS.includes(kernel)) contradict("kernel_unaudited");
     const entry = () => {
       try {
         if (!ownership.matchesEntry(evidence.successor, evidence.predecessor)) throw new Error();
-      } catch { invalid = true; stop("entry_changed"); throw new Refusal("entry_changed"); }
+      } catch { invalidate("entry_changed"); stop("entry_changed"); throw new Refusal("entry_changed"); }
     };
     entry();
+    decide("attested", "observations_consistent");
     guard = await owned(async () => {
       const opened = await openPodEpochDaemonBarrier({ dockerHost: options.dockerHost ?? "", signal: controller.signal,
         deadline: hardPass - 5000, now, schedule });
@@ -206,7 +265,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       guard = opened;
       return opened;
     }, hardPass);
-    const veto = () => { invalid = true; stop("daemon_veto"); };
+    const veto = () => { invalidate("daemon_veto"); stop("daemon_veto"); };
     guard.signal.addEventListener("abort", veto, { once: true });
     detachVeto = () => guard?.signal.removeEventListener("abort", veto);
     if (guard.signal.aborted) veto();
@@ -234,19 +293,21 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       // Keep every path in this group; continue bounded sibling work without retrying it.
       if (typeof group.selector.runId !== "string" || !RUN_ID_RE.test(group.selector.runId)) {
         partial = true;
+        for (const path of group.paths) { candidates.delete(path); refused.add(path); }
         continue;
       }
       let holds: RetainedHoldsSnapshot = { state: "unknown" };
       let lifecycle: RetainedLifecycleSnapshot = { state: "unknown" };
       try {
-        holds = holdsSnapshot(await owned(() => MaintenanceBudget.runOwned(controller.signal,
-          () => options.client.listRecoveryHolds(group.selector.runId, controller.signal)), hardPass), group.selector.runId);
+        // Lifecycle first, so a terminal run's holds read is at least as current.
         const row = await owned(() => MaintenanceBudget.runOwned(controller.signal,
           () => options.client.getRunOwnership(group.selector.runId, {
             signal: controller.signal, deadline: hardPass - 5000,
           })), hardPass);
         if (row && (row.status === "completed" || row.status === "failed" || row.status === "cancelled"))
           lifecycle = { state: "terminal", status: row.status };
+        holds = holdsSnapshot(await owned(() => MaintenanceBudget.runOwned(controller.signal,
+          () => options.client.listRecoveryHolds(group.selector.runId, controller.signal)), hardPass), group.selector.runId);
       } catch (error) { if (fatal || controller.signal.aborted) throw error; partial = true; }
       const expected = new Set(group.paths);
       const inspected = await owned(() => options.git.inspectRetainedSources({
@@ -254,28 +315,42 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
         barePath: group.barePath, selector: group.selector, holds, lifecycle,
         isLivePath: () => false, signal: controller.signal, deadline: hardPass - 5000,
         budgetMs: Math.max(0, hardPass - 5000 - now()), now,
-        beforeTree: path => { check(); entry(); if (!expected.has(path)) { invalid = true; stop("path_set_changed"); throw new Refusal("path_set_changed"); } },
+        beforeTree: path => { check(); entry(); if (!expected.has(path)) { invalidate("path_set_changed"); stop("path_set_changed"); throw new Refusal("path_set_changed"); } },
       }), hardPass);
       check(); entry();
       const actual = new Set(inspected.sources.flatMap(s => s.sources.map(p => p.clonePath)));
       const drift = actual.size !== expected.size || [...actual].some(p => !expected.has(p));
-      if (drift) { invalid = true; throw new Refusal("path_set_changed"); }
+      if (drift) { invalidate("path_set_changed"); throw new Refusal("path_set_changed"); }
       const complete = !inspected.partial && inspected.unreadable === 0;
       partial ||= !complete;
       for (const source of inspected.sources) {
         check(); entry();
-        const allowed = complete && lifecycle.state === "terminal" && holds.state === "read" && holds.holds.length === 0 &&
+        const eligible = complete && lifecycle.state === "terminal" && holds.state === "read" && holds.holds.length === 0 &&
           source.runId === group.selector.runId && source.barePath === group.barePath &&
-          source.presence === "present" && source.descriptor.length > 0 && source.localRecords.length === 0 &&
-          source.holds.state === "read" && source.holds.ids.length === 0 &&
-          (source.disposition?.kind === "local_discard" || source.disposition?.kind === "local_protected_discard");
+          (source.presence === "present" || source.presence === "missing") && source.descriptor.length > 0 && source.localRecords.length === 0 &&
+          source.holds.state === "read" && source.holds.ids.length === 0;
+        const basis: Basis | undefined =
+          source.disposition?.kind === "local_discard" || source.disposition?.kind === "local_protected_discard" ? "discard" :
+          source.epochSettlement?.disposition.kind === "local_discard" ? "strict_plain" : undefined;
         for (const part of source.sources) {
           examined.add(part.clonePath);
           if (part.presence !== "unsafe" && part.allocatedBytes !== null &&
               Number.isSafeInteger(part.allocatedBytes) && part.allocatedBytes >= 0) measured.add(part.clonePath);
-          if (allowed && part.presence === "present" && !part.live && source.bytesState === "measured" &&
-              part.allocatedBytes !== null && Number.isSafeInteger(part.allocatedBytes) && part.allocatedBytes >= 0)
-            selected.set(part.clonePath, { run_id: safe(source.runId), path: safe(basename(part.clonePath)), bytes: part.allocatedBytes });
+          let candidate: Candidate | undefined;
+          if (eligible && basis !== undefined && !part.live) {
+            const entry = { run_id: safe(source.runId), path: safe(basename(part.clonePath)) };
+            if (part.presence === "present" && source.bytesState === "measured" &&
+                part.allocatedBytes !== null && Number.isSafeInteger(part.allocatedBytes) && part.allocatedBytes >= 0)
+              candidate = { ...entry, bytes: part.allocatedBytes, presence: "present", basis };
+            else if (part.presence === "missing")
+              candidate = { ...entry, bytes: 0, presence: "missing", basis };
+          }
+          if (candidate && source.epochJournalExtraFields) extraFieldPaths.add(part.clonePath);
+          const previous = candidates.get(part.clonePath);
+          if (!candidate || refused.has(part.clonePath) || (previous && (previous.presence !== candidate.presence || previous.run_id !== candidate.run_id ||
+              previous.basis !== candidate.basis || previous.bytes !== candidate.bytes))) {
+            candidates.delete(part.clonePath); refused.add(part.clonePath);
+          } else candidates.set(part.clonePath, candidate);
         }
       }
     }
@@ -294,13 +369,14 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     result.inventory_complete = false;
     result.inventory_overflow_exact = false;
     result.bytes_state = examined.size ? "partial" : "unknown";
+    if (!decided) decide("unproven", result.reason);
   } finally {
     try {
       if (!fatal && guard) {
         // Assert once more before detaching intentional daemon_closed notification.
         try { guard.assertHealthy(); }
         catch {
-          invalid = true;
+          invalidate("daemon_veto");
           if (result.verdict === "eligible") { result.verdict = "deferred"; result.reason = "daemon_veto"; }
           result.inventory_complete = false;
         }
@@ -324,11 +400,27 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     result.inventory_overflow_exact = false;
     result.bytes_state = "partial";
   }
-  if (invalid) selected.clear();
+  if (invalid) {
+    candidates.clear();
+    result.authority = { result: "unproven", reason: invalidReason };
+  }
+  const all = [...candidates.values()];
+  const present = all.filter(c => c.presence === "present"), missing = all.filter(c => c.presence === "missing");
   result.examined = examined.size;
-  result.would_delete = selected.size;
-  result.kept = Math.max(0, examined.size - selected.size);
-  result.list = [...selected.values()].slice(0, 32);
-  result.list_overflow = Math.max(0, selected.size - result.list.length);
+  result.would_delete = present.length;
+  result.would_delete_bytes = present.reduce((sum, c) => sum + c.bytes, 0);
+  // would_settle counts missing candidate PATHS: a present source may contribute a missing part.
+  result.would_settle = missing.length;
+  result.by_basis = {
+    discard: all.filter(c => c.basis === "discard").length,
+    strict_plain: all.filter(c => c.basis === "strict_plain").length,
+  };
+  // Final candidates only: a demoted or cleared path is never counted.
+  result.journal_extra_fields = [...candidates.keys()].filter(p => extraFieldPaths.has(p)).length;
+  // Candidates are a subset of examined paths, so the invariant examined = delete + settle + kept
+  // holds without help; the clamp is only a defensive floor.
+  result.kept = Math.max(0, examined.size - all.length);
+  result.list = [...present, ...missing].slice(0, 32);
+  result.list_overflow = Math.max(0, all.length - result.list.length);
   return result;
 }

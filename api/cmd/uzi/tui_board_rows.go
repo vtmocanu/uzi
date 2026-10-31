@@ -304,8 +304,15 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	if terminal {
 		ageAt = doneAnchor(r)
 	}
-	row += paintSeg(stateC, bg, false, padCell(tok.word, boardStatusWordWidth)) + gap +
+	row += paintSeg(stateC, bg, false, padCell(tok.word, cols.statusW)) + gap +
 		paintSeg(m.pal.faintC, bg, false, padCell(relAge(ageAt), boardAgeWidth)) + gap
+	if m.boardShowDur() {
+		dur := ""
+		if terminal {
+			dur = boardDurText(r.RunDTO)
+		}
+		row += paintSeg(m.pal.faintC, bg, false, padLeftVisual(dur, boardDurWidth)) + gap
+	}
 
 	if m.boardShowMile() {
 		row += m.boardProgressCell(r, terminal, bg, tok.word) + gap
@@ -368,13 +375,17 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	return clampVisual(row, m.width)
 }
 
-// boardAccountCols holds capped display widths for one rendered board window.
-// Visibility still reserves the fixed maxima, independently of the window.
-type boardAccountCols struct{ credW, costW int }
+// boardAccountCols holds capped display widths for one rendered board window: the status
+// word, account and cost cells. Visibility still reserves the fixed maxima, independently of
+// the window, so a short-word window gives its spare columns to the title (#3732).
+type boardAccountCols struct{ statusW, credW, costW int }
 
 func (m tuiModel) boardAccountCols(rows []apitypes.RunListItemDTO) boardAccountCols {
 	var cols boardAccountCols
 	for _, r := range rows {
+		// The word boardRow actually draws (health and recovery overrides included), capped.
+		word := m.pal.runStateToken(r.RunDTO, r.IsRevising).word
+		cols.statusW = max(cols.statusW, visualWidth(capCell(word, boardStatusWordWidth)))
 		if m.boardShowRunCred(r) {
 			cols.credW = max(cols.credW, visualWidth(m.boardCredLabel(r)))
 		}
@@ -444,10 +455,13 @@ func boardCostText(r apitypes.RunListItemDTO) string {
 
 // boardRowPrefixWidth measures the fixed prefix without the milestone micro-bar
 // for column visibility thresholds. cursor(1)+strip(1)+glyph(1)+space(1)+id, then two-space gaps around
-// the status-word and AGE cells, the credential cell when
+// the status-word and AGE cells, the DONE run-length cell when shown, the credential cell when
 // shown, the cost cell when shown, plus the admin owner cell.
-func boardRowPrefixWidth(admin, cred, cost bool) int {
+func boardRowPrefixWidth(admin, dur, cred, cost bool) int {
 	w := 4 + boardIDWidth + 2 + boardStatusWordWidth + 2 + boardAgeWidth + 2
+	if dur {
+		w += boardDurWidth + 2
+	}
 	if cred {
 		w += boardCredWidth + 2
 	}
@@ -469,23 +483,30 @@ func boardRowPrefixWidth(admin, cred, cost bool) int {
 type boardMarkerCols struct{ verdictW, countW, fullW int }
 
 func (m tuiModel) boardMarkerCols(rows []apitypes.RunListItemDTO) boardMarkerCols {
-	var mc boardMarkerCols
 	if m.board.admin {
-		return mc
+		return boardMarkerCols{}
 	}
+	vw, cw := markerSlotWidths(rows)
+	return m.markerColsFor(vw, cw)
+}
+
+// markerSlotWidths is the widest verdict word and "· N" count across rows; 0, 0 when no row
+// carries a verdict. The verdict goes through the same Plain sanitize-and-cap the marker draws.
+func markerSlotWidths(rows []apitypes.RunListItemDTO) (verdictW, countW int) {
 	for _, r := range rows {
 		if r.JudgeVerdict == nil {
 			continue
 		}
-		if w := visualWidth(m.renderer.Plain(*r.JudgeVerdict, 8)); w > mc.verdictW {
-			mc.verdictW = w
-		}
+		verdictW = max(verdictW, visualWidth(capCell(cellText(*r.JudgeVerdict), 8)))
 		if r.JudgeTodoCount > 0 {
-			if w := visualWidth("· " + itoa(r.JudgeTodoCount)); w > mc.countW {
-				mc.countW = w
-			}
+			countW = max(countW, visualWidth("· "+itoa(r.JudgeTodoCount)))
 		}
 	}
+	return verdictW, countW
+}
+
+func (m tuiModel) markerColsFor(verdictW, countW int) boardMarkerCols {
+	mc := boardMarkerCols{verdictW: verdictW, countW: countW}
 	if mc.verdictW > 0 {
 		// The empty-verdict/zero-count marker has the full fixed width, and visualWidth accounts
 		// for the ⚖ glyph's own cell count.
@@ -694,4 +715,87 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	}
 	b.WriteString(paintSeg(m.pal.faintC, bg, false, " · "+relAge(act.At)))
 	return padSeg(clampVisual(b.String(), m.width), m.width, bg)
+}
+
+// boardColLabel is one faint column name drawn on a band heading: text placed at start.
+type boardColLabel struct {
+	text  string
+	start int
+}
+
+// boardColumnLabels is the column-name set for one band heading (#3732), positioned over the
+// cells boardRow draws with the same widths: any change to boardRow's column order or cell
+// widths must move here too (TestBoardEyebrowLabelsAlignWithCells pins the two together).
+// Labels follow their columns' visibility; run id, the admin owner and status carry none,
+// since the heading text sits over them.
+func (m tuiModel) boardColumnLabels(band int, mc boardMarkerCols, cols boardAccountCols) []boardColLabel {
+	var out []boardColLabel
+	add := func(text string, start int) { out = append(out, boardColLabel{text, start}) }
+	pos := boardAgeLabelOffset(m.board.admin) + cols.statusW
+	if band == bandDone {
+		add("ended", pos)
+	} else {
+		add("age", pos)
+	}
+	pos += boardAgeWidth + 2
+	if m.boardShowDur() {
+		if band == bandDone {
+			add("took", pos+boardDurWidth-len("took")) // right-aligned like the cell
+		}
+		pos += boardDurWidth + 2
+	}
+	if m.boardShowMile() {
+		add("miles", pos)
+		w := boardMileWidth
+		if m.boardShowProg() {
+			w += 1 + boardProgPctWidth
+		}
+		pos += w + 2
+	}
+	if m.boardShowCred() {
+		add("acct", pos)
+		pos += cols.credW + 2
+	}
+	if m.boardShowCost() {
+		add("cost", pos+cols.costW-len("cost")) // right-aligned like the cell
+		pos += cols.costW + 2
+	}
+	add("title", pos)
+	workerW := m.boardWorkerWidth()
+	contentW := m.width - workerW
+	if mc.fullW > 0 && !m.board.admin { // fullW is zeroed for a band with no verdicts
+		add("judge", contentW-mc.fullW)
+	}
+	if workerW > 0 {
+		add("worker", contentW+2)
+	}
+	return out
+}
+
+// boardAgeLabelOffset is the AGE cell's column minus the status width: cursor, strip, glyph,
+// space, id and gap, plus the admin owner cell (no label: it starts right after the run id,
+// under the heading text, like the id and status columns), plus the gap after status.
+func boardAgeLabelOffset(admin bool) int {
+	off := 4 + boardIDWidth + 2 + 2
+	if admin {
+		off += boardOwnerWidth + 2
+	}
+	return off
+}
+
+// placeBoardLabels lays labels after a heading of visual width headW: each one starts exactly
+// at its column, or is dropped when it would overlap the heading (two blank columns kept),
+// the previous label (one blank column kept) or the right edge. Labels never move a column.
+func placeBoardLabels(headW, width int, labels []boardColLabel) string {
+	var b strings.Builder
+	pos, minStart := headW, headW+2
+	for _, l := range labels {
+		end := l.start + visualWidth(l.text)
+		if l.start < minStart || end > width {
+			continue
+		}
+		b.WriteString(strings.Repeat(" ", l.start-pos) + l.text)
+		pos, minStart = end, end+1
+	}
+	return b.String()
 }

@@ -75,6 +75,11 @@ type Client interface {
 	// including an admin_ro token on another user's run — gets a 404 →
 	// *ExitError{ExitNotFound}, never another user's steer text.
 	RunInputs(ctx context.Context, id string) ([]apitypes.SteerInputDTO, error)
+	// RunLeadConfigHistory returns every recorded lead model/effort row of a run, newest claim
+	// generation first (PRD #3244 M3): GET /api/runs/{id}/lead-config. Owner-or-admin server-side;
+	// another user's run is a 404 -> *ExitError{ExitNotFound}. A run with no lead agent yields an
+	// empty Entries, and Truncated is true when the server capped the list at 256 rows.
+	RunLeadConfigHistory(ctx context.Context, id string) (apitypes.LeadConfigHistoryDTO, error)
 	// StreamRun subscribes to one run's live events over /api/ws (PRD #112 M2),
 	// authenticating with the same Bearer CLI token the REST reads use (M1 opened
 	// that route to it). The returned stream reconnects, replays what a drop

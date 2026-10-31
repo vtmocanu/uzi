@@ -719,6 +719,7 @@ func TestNormalizeRunEventTable(t *testing.T) {
 		{"empty type is unknown", apitypes.RunEventDTO{}, RunEventTypeUnknown, ""},
 		{"health passes through", apitypes.RunEventDTO{Type: "health"}, "health", ""},
 		{"input passes through", apitypes.RunEventDTO{Type: "input"}, "input", ""},
+		{"refresh passes through, not unknown", apitypes.RunEventDTO{Type: "refresh"}, "refresh", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := NormalizeRunEvent(tc.in)

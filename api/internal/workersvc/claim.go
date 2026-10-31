@@ -648,6 +648,15 @@ type ClaimConfig struct {
 	// per-user value is the only source (a checker child carries its frozen
 	// cross-check effort instead).
 	DefaultEffort *string `json:"default_effort,omitempty"`
+	// DefaultModelSource says who decided DefaultModel (a leadcfg.ModelSource token:
+	// schedule_pin or user_default today). PRD #3244: set only on a lead-lane claim
+	// (leadcfg.LeadLane) and only when DefaultModel is shipped; never for cross-check,
+	// review, isolated-lane, judge, chat or job claims.
+	DefaultModelSource *string `json:"default_model_source,omitempty"`
+	// DefaultEffortSource says who decided DefaultEffort (a leadcfg.EffortSource token:
+	// user_default or builtin today). PRD #3244: present on every lead-lane claim, which makes
+	// it the worker's activation signal for the lead-config reporter; absent otherwise.
+	DefaultEffortSource *string `json:"default_effort_source,omitempty"`
 	// AttributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
 	// LIVE from the owner's users row on every claim. When false, the worker suppresses
 	// the Agent SDK's Co-Authored-By: Claude commit trailer for this run (agent-side, a

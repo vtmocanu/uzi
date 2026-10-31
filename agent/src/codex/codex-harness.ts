@@ -92,6 +92,7 @@ import {
 } from "./projection.js";
 
 import { evidencesModelProcessing } from "../harness.js";
+import { decodeObservedModel, mapObservedEffort } from "../runtime-observation.js";
 import type { Logger } from "../log.js";
 import type {
   BoundaryRequest,
@@ -108,6 +109,7 @@ import type {
   ProcessReap,
   RunHarness,
   RunTurnRequest,
+  RuntimeConfigObservation,
   SessionPresence,
   ToolDisposal,
   TurnSignals,
@@ -1287,6 +1289,7 @@ export class CodexHarness implements RunHarness {
         // known. The model is the immutable configured root model (currentModel); a resumed
         // thread baselines at its pre-resume cumulative rather than zero.
         this.accountant.registerThread(this.threadId, this.currentModel ?? this.provider.model, resumed);
+        this.runtimeConfigPending = true;
       }
 
       // PRD #3247 M2: advisory catalog probe, before the abort check so a stop during it is honoured.
@@ -1299,6 +1302,12 @@ export class CodexHarness implements RunHarness {
       }
       this.activeTurnId = await this.startTurnRpc(transport, this.threadId, rendered, request.signal, request.rootDispatch,
         () => { if (this.resumedRoot) attemptedResumedRoot = this.threadId; });
+      // PRD #3244: report only once turn/start was accepted, so `codex_sent` never describes a turn
+      // that was cancelled or refused before dispatch.
+      if (this.runtimeConfigPending) {
+        this.runtimeConfigPending = false;
+        this.reportRuntimeConfig(request, rendered);
+      }
       if (request.signal.aborted || this.stopRequested) {
         // A stop during launch/thread/turn setup could not name a turn earlier. Now
         // that activeTurnId exists, issue the best-effort interrupt and end cleanly.
@@ -1661,6 +1670,39 @@ export class CodexHarness implements RunHarness {
     };
   }
 
+  /** The raw `model` / `reasoningEffort` of the last thread/start or thread/resume response; every
+   *  other field is ignored. Read once by reportRuntimeConfig. */
+  private threadResponse: { model?: unknown; reasoningEffort?: unknown } | undefined;
+  /** Set when a thread is established; cleared when its runtime config is reported after the first
+   *  accepted turn/start on it. */
+  private runtimeConfigPending = false;
+
+  /** PRD #3244 M2: report the thread's resolved model and effort to the owner. Effort is the value
+   *  sent on turn/start when there is one (`codex_sent`), else the thread's configured effort
+   *  (`codex_runtime_default`; absent or null is `unknown`). Never throws into the turn. */
+  private reportRuntimeConfig(request: RunTurnRequest, rendered: RenderedCodexRun): void {
+    const cb = request.onRuntimeConfig;
+    if (!cb) return;
+    try {
+      const response = this.threadResponse;
+      const model = decodeObservedModel(response?.model);
+      const sent = rendered.lead.modelReasoningEffort;
+      const reported = mapObservedEffort(response?.reasoningEffort);
+      const obs: RuntimeConfigObservation = {
+        ...(model !== undefined ? { model } : {}),
+        modelEvidence: model !== undefined ? "codex_thread_response" : "unknown",
+        ...(sent !== undefined
+          ? { effort: mapObservedEffort(sent), effortEvidence: "codex_sent" as const }
+          : reported !== undefined
+            ? { effort: reported, effortEvidence: "codex_runtime_default" as const }
+            : { effortEvidence: "unknown" as const }),
+      };
+      cb(obs);
+    } catch (err) {
+      this.log.warn("runtime config callback failed", { error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
   private async startThread(
     transport: CodexTransport,
     rendered: RenderedCodexRun,
@@ -1668,7 +1710,7 @@ export class CodexHarness implements RunHarness {
   ): Promise<string> {
     // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
     assertResidueQuarantineOpen("provider_turn");
-    const res = await transport.request<{ thread?: { id?: string } }>(
+    const res = await transport.request<{ thread?: { id?: string }; model?: unknown; reasoningEffort?: unknown }>(
       "thread/start",
       {
         model: this.currentModel,
@@ -1690,6 +1732,7 @@ export class CodexHarness implements RunHarness {
     if (typeof id !== "string" || id.length === 0) {
       throw new CodexHarnessError({ category: "protocol", message: "codex thread/start returned no thread id" });
     }
+    this.threadResponse = { model: res.model, reasoningEffort: res.reasoningEffort };
     return id;
   }
 
@@ -1699,11 +1742,11 @@ export class CodexHarness implements RunHarness {
     rendered: RenderedCodexRun,
   ): Promise<string> {
     const resumeId = request.resumeSessionId;
-    let res: { thread?: { id?: string } };
+    let res: { thread?: { id?: string }; model?: unknown; reasoningEffort?: unknown };
     // issue #2213: before the try, so the typed refusal is never read by the resume-remap catch.
     assertResidueQuarantineOpen("provider_turn");
     try {
-      res = await transport.request<{ thread?: { id?: string } }>(
+      res = await transport.request<{ thread?: { id?: string }; model?: unknown; reasoningEffort?: unknown }>(
         "thread/resume",
         {
           threadId: resumeId,
@@ -1727,6 +1770,7 @@ export class CodexHarness implements RunHarness {
     }
     const id = res?.thread?.id;
     if (typeof id !== "string" || id.length === 0) throw new CodexResumeError();
+    this.threadResponse = { model: res.model, reasoningEffort: res.reasoningEffort };
     return id;
   }
 

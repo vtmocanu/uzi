@@ -314,7 +314,10 @@ it.each(["paused", "limit_wait", "pool_wait", "recovery_wait"] as const)("stops 
     model: "test-model", recovery_wait_cause: "transient" });
   const header = headForElapsed(container);
   expect(header.textContent).toContain("clock stopped");
-  expect(header.textContent).toContain("model test-model");
+  // PRD #3244 rule 3: a parked (claimed) lead-lane run with no recorded rows keeps the lead chip,
+  // and its tooltip still carries the create-time pinned model.
+  const chip = within(header).getByText("lead: not recorded");
+  expect(chip.getAttribute("title")).toContain("test-model: fixed by schedule");
   expect(within(header).getByTitle("Runs on Claude")).toBeTruthy();
   expect(header.textContent).toContain(status === "pool_wait" ? "waiting for pool" : status.replace(/_/g, " "));
   expect(within(header).queryByText("Starting up")).toBeNull();

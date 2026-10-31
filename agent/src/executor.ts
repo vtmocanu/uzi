@@ -134,6 +134,9 @@ export interface RunContext {
   runId: string;
   /** Current server claim fence; required to consume a checked plan approval. */
   claimGeneration?: number;
+  /** PRD #3244: the claim's single lead-config reporter, constructed by the runner only. Executors
+   *  call `enterPhase` before a lead turn; absent for stub/test executors and non-lead lanes. */
+  leadConfig?: import("./lead-config-report.js").LeadConfigReporter;
   /** Negotiated before execution/capture; remains binding if registration features shrink. */
   codexIdleStallRecovery?: boolean;
   /** Claim support assertion; absent means false. The runner separately gates root and phase. */

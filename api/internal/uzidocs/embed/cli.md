@@ -167,6 +167,7 @@ uzi run decide <id> (--continue [--guidance <text>] | --partial <ids> --reason <
 uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
+uzi run lead-config <id> [--json]
 uzi run expedite <id> [--clear]
 uzi run rework <id> [-m|--message <text>]
 uzi run export <id> --output <path> [--capture <id>]
@@ -1922,7 +1923,16 @@ A newer release is available.
   `subscription` or unreported run, and a blank cell for no recorded usage;
   it too is hidden on
   a narrow terminal, dropping right after the micro-bar does so the title is
-  never squeezed. `[h]` hides finished runs (completed/failed/cancelled),
+  never squeezed. On your own board, a DONE row also shows its **run length**
+  right after the AGE (which, on a DONE row, is how long ago it finished): wall
+  time from the run's first start to its finish, so approval waits, limit parks
+  and pauses count too. It is blank for a run that never started or has no
+  finish stamp, and blank on active rows (the cell is reserved so columns line
+  up). It is the lowest-priority column: it appears only from 111 columns (123
+  with the account column, wider still when judge badges are shown) and is the
+  first to go on a narrowing terminal. The DONE heading labels the two
+  numbers `ended` and `took`, and the `?` legend explains them.
+  `[h]` hides finished runs (completed/failed/cancelled),
   leaving the active and needs-you runs. The rows are grouped into three
   triage bands (NEEDS YOU, then ON THE FLOOR, then DONE) rather than one
   flat table. Failed and `needs landing` DONE rows use one dimmed red for
@@ -1933,9 +1943,16 @@ A newer release is available.
   `▌` andon strip and
   status glyph, the run id, the status WORD in its own colour (a stalled run
   reads `▲ stalled`, because health folds into the status token rather than
-  a separate column), the AGE, the milestone micro-bar, the COST cell, and
-  the TITLE; there are no STATUS/HEALTH/MILE column headers or full-width
-  rules. The list windows to the terminal height so the wordmark and key
+  a separate column), the AGE, the DONE run length, the milestone micro-bar, the COST cell, and
+  the TITLE. There is no separate header row or full-width rule: each band
+  heading carries faint lowercase column names over its columns (`age`, or
+  `ended` and `took` on DONE, then `miles`, `acct`, `cost`, `title`, `judge`,
+  `worker`; `judge` only on a band where some run has a verdict), shown only
+  for visible columns and dropped where one would
+  collide with the heading text; the run id, status and admin owner sit under
+  the heading itself. The status cell fits the longest status word on
+  screen and, where possible, leaves room for the heading's age label, capped
+  at 14 columns; the remaining space goes to the title. The list windows to the terminal height so the wordmark and key
   legend stay on screen however many runs there are, with the visible run
   span (`lo–hi`) and a seven-day cost shown in the top-right summary
   cluster (`⚑ N · ✎ N · ➤ N · ⚿ N · ▲ N · $N 7d · T runs`). On your own
@@ -3266,6 +3283,50 @@ unavailable history. The detail JSON field
 source flags, triggers and truncation. Unknown legacy provenance remains unknown;
 an empty observed scan is distinct from missing evidence. Evidence stays outside
 approval identity and summary polling.
+
+`run get` also prints the lead agent's model and effort as two rows, emitted
+only for a run with a lead agent (issue, CI-fix, prompt, self-improve,
+MR-rework and non-review task runs; not review, cross-check, chat, job or
+isolated-lane runs): `LEAD` is the run-page chip text without its `lead: `
+prefix (for example `opus · high (requested xhigh)`), and `LEAD_SOURCE` joins
+the chip's tooltip lines with `; ` (where each value came from and what the
+runtime reported). Before a worker claims the run, `LEAD` reads `model and
+effort resolve at claim`, or `<model> · effort resolves at claim` when a
+schedule pinned the model; a claimed run with nothing recorded reads `not
+recorded`. `--json` carries the full `lead_config` object. The values are
+worker-attested and display only; see [See which model a run
+used](./worker-model.md#see-which-model-a-run-used). The human view prints no
+`MODEL` or `EFFORT` row (`LEAD` shows a schedule-frozen model itself and
+`LEAD_SOURCE` labels it "fixed by schedule"): read the model a schedule froze with `--field model`.
+
+### Lead model and effort history: `uzi run lead-config`
+
+```
+uzi run lead-config <run-id> [--json]
+```
+
+Lists every recorded lead configuration of a run, one row per recorded
+snapshot (`SEQ`) across all claim attempts, so one phase entry usually has
+several rows, newest attempt first and `plan` before `implement`
+within an attempt. Columns: `GEN` (the claim attempt), `PHASE`, `ENTRY` (the
+phase entry within the attempt), `SEQ` (the row number within the attempt
+and phase; it keeps counting across that phase's entries), `REQUESTED` and
+`SOURCE` (the model and effort uzi asked for, and where each came from),
+`OBSERVED` and `EVIDENCE` (what the runtime reported, and how), and
+`REPORTED` (an RFC 3339 UTC time, with ` (later changes not recorded)` when the
+worker hit its per-phase row limit). A run with no lead agent, or whose worker
+recorded nothing, prints `run <id> has no recorded lead config`.
+
+- **Capped at 256 rows.** A longer history lists the first 256 rows and prints
+  `showing the first 256 entries (newest attempt first); the rest are not
+  listed`.
+- **`--json`** prints the server response, `{"entries": [...], "truncated":
+  bool}`, with each entry carrying `claim_generation` and the same fields as
+  `lead_config.phases[]` in `run get --json`. `entries` is `[]` when empty.
+- **Access.** Owner or admin, like `run get`; any other user gets a not-found
+  error. It works with a `uzc_` CLI token (`GET /api/runs/{id}/lead-config`).
+- **Display only.** Rows are attested by the worker and never feed billing,
+  authorization or scheduling.
 
 ### Run status, and what `--follow` waits for
 

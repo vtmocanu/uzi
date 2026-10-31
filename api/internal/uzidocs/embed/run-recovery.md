@@ -1821,7 +1821,7 @@ These worker events identify the failed guard or completed disposition:
 | `quiescence` | `quiescence_blocked` or `quiescence_error`: the scoped capture check blocked or failed. |
 | `attempt_ledger` / `attempt_journal` | `attempt_release_failure`: recording retained attempt state or clearing its journal failed. |
 | `retirement` | `canonical_retirement_failure`, or `attempt_release_failure` when attempt validation falls through to this generic stage. |
-| `completion_handoff` | The owner's journal carried a completion-source fence. `completion_retirement_pending`: the certified retirement is not ready, so the successor stops without failing (see the retained stop above). `completion_retirement_refused`: the outward refusal for an invalid or unsupported fenced source in retire mode (a retire-mode `not_completion` carries subreason `fenced_source`), or a journal that changed under the call (`pair_changed`, the successor re-admits). |
+| `completion_handoff` | The owner's journal carried a completion-source fence. `completion_retirement_pending`: the certified retirement is not ready, so the successor stops without failing (see the retained stop above); when its subreason is `pair_changed`, the successor stopped after exhausting its two allowed re-admissions. `completion_retirement_refused`: the outward refusal for an invalid or unsupported fenced source in retire mode (a retire-mode `not_completion` carries subreason `fenced_source`), or a journal that changed under the call (`pair_changed`, the successor re-admits). |
 
 Inner retirement stages are `journal_read`, `journal_validation`, `containment`,
 `holding_parent`, `rename`, `retained_copy`, `intra_device_rename`, and

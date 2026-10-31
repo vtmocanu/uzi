@@ -5,6 +5,7 @@ package config
 
 import (
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // workerMaxConcurrentRunsCeiling is the sanity ceiling for UZI_WORKER_MAX_CONCURRENT_RUNS.
@@ -123,6 +125,12 @@ type Config struct {
 	// workers.priorityClass.enabled, naming the cluster-scoped PriorityClass the chart
 	// creates (issue #1341).
 	WorkerPriorityClassName string
+	// WorkerNodeSelector is the nodeSelector rendered onto every worker pod, all three
+	// tiers (UZI_WORKER_NODE_SELECTOR, a JSON object of label key -> value). Unset,
+	// empty, "null" or "{}" means no nodeSelector. The chart defaults it to
+	// kubernetes.io/arch=amd64, because the published agent images are amd64 only and
+	// would crash-loop on an arm64 node of a mixed-arch cluster.
+	WorkerNodeSelector map[string]string
 	// WorkerEphemeralRequest overrides the WORKER container's
 	// requests.ephemeral-storage for a PLAIN worker (issue #224 M-b;
 	// UZI_WORKER_EPHEMERAL_REQUEST). Empty ⇒ the render side's built-in 512Mi.
@@ -476,6 +484,11 @@ func loadWorkerSettings(cfg *Config) error {
 	}
 	cfg.WorkerStorageClass = strings.TrimSpace(os.Getenv("UZI_WORKER_STORAGE_CLASS"))
 	cfg.WorkerPriorityClassName = strings.TrimSpace(os.Getenv("UZI_WORKER_PRIORITY_CLASS_NAME"))
+	sel, err := parseNodeSelector(os.Getenv("UZI_WORKER_NODE_SELECTOR"))
+	if err != nil {
+		return err
+	}
+	cfg.WorkerNodeSelector = sel
 
 	// The per-worker slot cap (UZI_WORKER_MAX_CONCURRENT_RUNS). Default 1 (empty/unset),
 	// operator-configurable in [1, workerMaxConcurrentRunsCeiling]. A non-integer or an
@@ -759,6 +772,40 @@ func validateDockerTier(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// parseNodeSelector reads UZI_WORKER_NODE_SELECTOR. Every key must be a valid label
+// key and every value a valid label value, checked here at boot: the API server would
+// accept neither on a Deployment, so a bad selector would otherwise surface only as
+// workers that never appear. A top-level null means no selector, but a null MEMBER is
+// refused: decoded into a plain string it would become "", a valid label value, and
+// every worker would then require an empty label and stay Pending.
+func parseNodeSelector(raw string) (map[string]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" {
+		return nil, nil
+	}
+	var members map[string]*string
+	if err := json.Unmarshal([]byte(raw), &members); err != nil {
+		return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR=%q is not a JSON object of label key to string value: %w", raw, err)
+	}
+	sel := make(map[string]string, len(members))
+	for k, v := range members {
+		if v == nil {
+			return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR: key %q has a null value; give it a string value or remove the key", k)
+		}
+		if errs := validation.IsQualifiedName(k); len(errs) > 0 {
+			return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR: key %q is not a valid label key: %s", k, strings.Join(errs, "; "))
+		}
+		if errs := validation.IsValidLabelValue(*v); len(errs) > 0 {
+			return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR: value %q for key %q is not a valid label value: %s", *v, k, strings.Join(errs, "; "))
+		}
+		sel[k] = *v
+	}
+	if len(sel) == 0 {
+		return nil, nil
+	}
+	return sel, nil
 }
 
 // parseQuantityEnv reads an optional k8s-quantity env var into dst, leaving dst

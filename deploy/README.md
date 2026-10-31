@@ -730,6 +730,7 @@ which takes uzi down. It fails closed, but the blast radius is the whole product
 | `workers.drainDeadline` | `"24h"` | Compatible Go duration (`"1h"`, `"30m"`), with unchanged positive-only parsing; exposed as `UZI_WORKER_DRAIN_DEADLINE`. Now bounds only independent **nondrifted** pressure/nix-size maintenance, which can interrupt busy runs and delete /data unless custody-held. No elapsed timer permits busy spec-hash/generation replacement or associated recycle, even with no pacing entry/plain drain; shortening this value no longer forces image upgrades. No new knob. |
 | `workers.forceRoll` | `false` | **Global** emergency bypass of pacing, holds, incarnation proof and busy deferral for drifted workers, plus busy deferral for independent maintenance. May interrupt runs and lose all capacity; neither targeted nor a recovery guarantee. Custody-held data and independent DinD readiness/identity/pod-absence guards remain authoritative; DinD has no deadline or ForceRoll bypass. No automatic rollback. Restore `false` after the emergency. |
 | `workers.storageClass` | `""` (cluster default) | `standard` on dev-cluster. |
+| `workers.nodeSelector` | `kubernetes.io/arch: amd64` | Rendered onto every hosted worker pod (plain, docker, isolated), next to the docker tier's soft anti-affinity. The default exists because the published agent images are amd64 only. With your own arm64-capable `workers.image.repository`, override it or clear it with `nodeSelector: null` (`{}` does not clear it: Helm merges it into the default). Changing it re-hashes every worker's pod template: persistent workers roll through the normal paced drain, while run-bound workers are outside pacing but keep the busy-drift deferral. |
 
 ### Deploying paced hosted rolls (#1470)
 
@@ -979,9 +980,16 @@ and [design and implementation evidence](../prds/3430-pod-epoch-lock-shadow.md).
 
 **Runtime declaration is an operator attestation, not autodetection.**
 `workers.docker.podEpochReclaim.runtime` defaults to `""` (unset). The chart
-accepts exactly `containerd-runc` or `crio-crun` when set. The declaration
-attests that the nodes eligible for these workers meet the audited stack and
-storage prerequisites below; it does not verify versions or storage itself.
+accepts exactly `containerd-runc` or `crio-crun` when set. The pass runs by
+default, and keeping trees needs no declaration: with the value unset it keeps
+every tree, logs `deferred` / `runtime_not_declared` without waiting for evidence
+and reports no candidates, while still taking part in lifetime epoch locking.
+Candidate inventory needs a declared value. Setting a value attests the
+**full audited runtime/storage contract** below for the nodes eligible for these
+workers (a future hosted-Docker deletion under PRD #3431 will require it). The
+declaration does not verify versions or storage itself; the controller and worker
+only cross-check it against observations (see *Reading verdicts*). This release
+deletes nothing either way.
 
 | Declaration | Audited stack |
 |---|---|
@@ -1052,6 +1060,70 @@ SH startup.
 A would-delete entry requires terminal ownership, fresh empty holds and an
 eligible retained-source disposition; a verdict grants no deletion authority.
 
+**Authority and counts (PRD #3431 M1a).** The log line also carries
+`authority: {result, reason}`, `evidence_version` and, once version-2 binding
+and prefix checks pass, `observations.kernel`. `authority.result` is one of `undeclared`,
+`legacy_evidence`, `contradicted`, `unproven` or `attested`, with a fixed reason
+token; controller free text is never logged. Only `attested` runs the inventory,
+and authority falls back to `unproven` when the pass is invalidated
+(`entry_changed`, `daemon_veto` or `path_set_changed`).
+
+- Unset runtime keeps the zero-wait path: `deferred` / `runtime_not_declared`,
+  authority `undeclared`.
+- Version-1 evidence (an older controller) defers as `legacy_evidence` with no
+  inventory.
+- Version-2 evidence adds the successor's container IDs and a controller
+  `attestation`. The worker checks the binding first, refuses a `contradicted`
+  attestation (`attestation_contradicted`), then recomputes the container-ID
+  runtime prefixes itself (`containerd://` for `containerd-runc`, `cri-o://` for
+  `crio-crun`) and defers on a mismatch (`predecessor_runtime_prefix`,
+  `successor_runtime_prefix`). For `crio-crun` the successor node's kernel release
+  must be exactly `6.12.0-243.el10.x86_64` or `6.12.0-243.el10.aarch64`; anything
+  else defers as `kernel_unaudited`. For `containerd-runc` the kernel is only
+  recorded.
+- On an attested pass, candidates need a positive terminal lifecycle (read before
+  holds), known zero holds, a complete inspection and no local records, with basis
+  `discard` (the existing retained-source disposition) or `strict_plain` (a
+  ledger-`live` attempt whose active journal is exactly `runId`, `clonePath` and
+  `attemptId`, and which is the clone's sole namer; any extra journal field,
+  another namer, another non-retired ledger attempt on the clone key, pins, holds
+  or any other blocker keeps the source).
+- `would_delete` counts present candidate paths and `would_delete_bytes` their
+  bytes. `would_settle` counts candidate paths that are missing (metadata-only;
+  bytes are never counted). `by_basis` splits the two by `discard` and
+  `strict_plain`. Each `list` entry (up to **32**, present first) adds `presence`
+  and `basis`. `kept = examined - would_delete - would_settle`. A path seen with
+  conflicting presence, run, basis or bytes, or also named by a refused group, is
+  kept. `journal_extra_fields` counts candidates that are marker-less canonical
+  sources whose plain journal carries fields beyond `runId` and `clonePath`; they
+  keep their existing `discard` basis. Only the count is reported (list entries
+  carry no marker), so identify them by reading each candidate's journal before M1b.
+
+The cross-checks have limits. Matching observations never prove the
+unobservable OCI-handler, crun/conmon, NRI, attachment or ownership-walk facts,
+and the kernel observation covers the successor's node only. Nothing is deleted
+or settled; deletion and settlement are PRD #3431 M1b, later and separately
+gated.
+
+**Kernel allowlist (operator note).** Any kernel release outside the exact
+`crio-crun` allowlist above yields `kernel_unaudited` and defers, including after
+a node OS upgrade. The allowlist is refreshed only through a reviewed addendum to
+the [PRD #3430 CRI-O audit](../prds/3430-pod-epoch-crio-audit.md); check the
+successor node's kernel release before and after each node roll.
+
+**Evidence latency and worker pin.** The controller still sends negative handoff
+documents when the successor pod is first seen. A positive proof is frozen at that
+point but sent once, as a version-2 document, at the first later pod update that
+carries the successor's own container IDs, so positive evidence waits for those
+IDs. If they never appear (or the pod is deleted, tainted, terminal or superseded
+first) nothing is sent and the worker reports `partial` / `evidence_timeout`
+(authority `unproven`) without an inventory. The single
+PATCH is unchanged: no retry, and a 409 conflict consumes it. No new RBAC is
+needed. `workers.image.tag` is decoupled from the controller: a new controller
+with old workers is normal until the pin moves, and an old worker refuses
+version 2 (`evidence_invalid`), so it reports no shadow data. A new worker with
+an old controller reports `legacy_evidence`.
+
 **The daemon check is a veto, not an event-subscription proof.** Read-only GET
 inventory requires stopped/created containers, no running/restarting/paused
 containers, restart policy `no`, inactive Swarm, live-restore off, no enabled
@@ -1089,6 +1161,12 @@ a formal owner partial decision must name the actual milestone IDs and the
 outstanding M1/M2c image/full-gate criteria and M3 live acceptance. Continuation
 guidance does not waive these checks. These pending proofs are not production
 verification; deletion remains later work under #3431.
+
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1a's widened live acceptance is
+also pending: on real rolls, check strict-plain eligibility, protected and shared
+refusals, present versus missing classification, the declaration, contradiction
+and legacy-evidence behavior, and the measured caps. PRD #3430's items above stay
+pending.
 
 ### M4/M5 runbook: known items before go-live
 

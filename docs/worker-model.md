@@ -115,18 +115,76 @@ stay on your normal model.
 
 Set it in the schedule's create/edit form, in the **Model (optional)**
 control, or with `uzi schedule create --model <alias|id>`. Leaving it on
-Inherit uses your worker model for the schedule's harness. The model a
-scheduled run actually used is shown on that run's detail page and by `uzi
-run get`. The schedule field accepts a single token of at most 100
+Inherit uses your worker model for the schedule's harness. The schedule field accepts a single token of at most 100
 characters; blank means inherit. The Codex schedule picker remains curated;
 the custom Codex worker-root escape hatch does not extend to schedule pins.
+The frozen model is readable with `uzi run get <id> --field model` (or in
+`uzi run get <id> --json`); to see the model a run actually used, see [See
+which model a run used](#see-which-model-a-run-used).
 
 Tick **"Apply model also to agents"** (or pass `uzi schedule create
 --apply-model-to-agents`) to make the schedule's model apply to every
 subagent too, not just the lead. This is useful for a cheap recurring bot
 whose subagents would otherwise run on their own pinned (and pricier) models.
-Whether a given run applied the model fleet-wide is shown on that run's
-detail page and by `uzi run get`.
+Whether a given run applied the model fleet-wide is readable with `uzi run
+get <id> --field override_subagent_model` (or `uzi run get <id> --json`).
+The run page shows a "model on all agents" badge when it is set; the human
+`uzi run get` view has no row for it.
+
+## See which model a run used
+
+A run with a lead agent records the model and reasoning effort the lead was
+asked to use, where each came from, and what the runtime reported back. This
+covers issue, CI-fix, prompt, self-improve and MR-rework runs and task runs
+that are not reviews. Review, cross-check, chat and job runs, and runs bound
+to an egress profile (the isolated lane), have no lead agent here and show
+nothing.
+
+Each record is kept per claim attempt (every time a worker claims the run) and
+per phase: `plan` while the lead plans, `implement` after approval. A run that
+resumes after its plan was approved records only `implement` for the new
+attempt; the earlier attempt's `plan` row stays in the history.
+
+For each phase the record holds:
+
+- **Requested** model and effort, with their **source**: *fixed by schedule*,
+  *your Claude default* or *your Codex default*, *lead template*, or
+  *built-in*. A Claude row that sent no model reads *Claude SDK default*. When
+  you chose [Runtime default](./worker-effort.md#runtime-default) effort, uzi
+  sends no level and the requested effort reads *runtime default*.
+- **Runtime-reported** model and effort, with the evidence behind them
+  (*Claude SDK init*, *Claude SDK settings*, *Codex thread config* or *sent to
+  Codex*).
+
+Where the runtime reports a different effort than requested, the display shows
+both, for example `high (requested xhigh)`. A value not yet observed
+reads *not reported yet*, whatever the attempt or run status, including on a
+finished run. *Not reported by the runtime* means the runtime was asked and did
+not say. An effort Claude reports as not sent reads *not sent*. See [Reasoning effort](./worker-effort.md#read-requested-and-effective-effort)
+for how to read the effort side.
+
+These rows are attested by the worker and are for display only. They never
+feed billing, authorization or scheduling, and they describe the lead agent:
+a subagent with its own `model` pin may differ.
+
+Before a worker claims the run, nothing is resolved yet, so the chip reads
+`lead: model and effort resolve at claim`, or, for a schedule-pinned model,
+`lead: <model> · effort resolves at claim` with the model marked *fixed by
+schedule*. A claimed run whose worker recorded nothing (an older worker, or a
+run that ended before its first lead turn) reads `lead: not recorded`.
+
+Where to see it:
+
+- **Run page.** A `lead: <model> · <effort>` chip beside the harness badge.
+  Hover it for the sources and runtime lines (a native tooltip); screen
+  readers read them on focus. If the plan and
+  implement phases differ, it reads `lead: plan <model> · <effort> →
+  implement <model> · <effort>`.
+- **`uzi run get <id>`.** `LEAD` and `LEAD_SOURCE` rows, shown only for runs
+  with a lead agent. `uzi run get <id> --json` carries the full `lead_config`
+  object.
+- **`uzi run lead-config <id>`.** The history across every attempt; see
+  [the CLI reference](./cli.md#lead-model-and-effort-history-uzi-run-lead-config).
 
 ## Good to know
 
@@ -150,7 +208,7 @@ detail page and by `uzi run get`.
   settings here have no effect on them.
 - **Separate from reasoning effort.** Your [reasoning
   effort](./worker-effort.md), which controls how hard the model thinks,
-  is shared across both harnesses; see that page.
+  is set separately for Claude and Codex; see that page.
 
 ## Current Codex worker baseline
 

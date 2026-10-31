@@ -114,6 +114,8 @@
     "question_max": 5,
     "question_timeout_seconds": 86400,
     "default_model": "sonnet",
+    "default_model_source": "schedule_pin",
+    "default_effort_source": "user_default",
     "attribution_enabled": true,
     "skill_max_bytes": 65536,
     "skills_max_per_run": 32,

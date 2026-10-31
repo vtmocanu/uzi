@@ -421,7 +421,9 @@ export const LEAD_FAST_CHECK_APPEND = [
  * Issue #2593: integration-gate sequencing and failed-gate triage for the LEAD only.
  * An append (not a template edit) so customized lead templates get it without
  * rewriting stored bodies. Deliberately NOT added to subagent prompts (agents.ts,
- * codex/render.ts): subagents do not run the integration gate. Prompt-level guidance
+ * codex/render.ts): when the gate runs is the lead's decision. A guarded Claude lead may
+ * delegate gate execution to one gate-owning subagent (CLAUDE_GUARDED_LEAD_GATE_APPEND,
+ * #3722); that subagent follows the lead's brief, not this policy. Prompt-level guidance
  * only; nothing enforces it. Refines PRD #215's overlap rule (gate overlapped with the
  * read-only review wave) with one exception and a triage procedure. Generic by design:
  * it names no repo, language, gate command or harness-specific tool.

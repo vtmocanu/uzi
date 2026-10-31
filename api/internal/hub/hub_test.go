@@ -122,6 +122,31 @@ func TestPublishHealthEmitsHealthFrameWithoutReason(t *testing.T) {
 	}
 }
 
+func TestPublishRefreshEmitsDatalessRefreshFrame(t *testing.T) {
+	h := New()
+	run := uuid.New()
+	sub := h.Subscribe(run)
+	defer sub.Close()
+
+	h.PublishRefresh(run)
+	raw := <-sub.Events()
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if string(wire["type"]) != `"refresh"` {
+		t.Fatalf("type = %s, want refresh", wire["type"])
+	}
+	if _, present := wire["status"]; present {
+		t.Fatalf("a refresh frame must carry no status, got %s", raw)
+	}
+}
+
+func TestPublishRefreshOnNilHubIsNoOp(t *testing.T) {
+	var h *Hub
+	h.PublishRefresh(uuid.New()) // must not panic
+}
+
 func TestUnsubscribeStopsDelivery(t *testing.T) {
 	h := New()
 	run := uuid.New()

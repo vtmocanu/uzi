@@ -96,7 +96,7 @@ func TestTUIRejectedBoardInk(t *testing.T) {
 				for label, span := range map[string]string{
 					"spine": paintSeg(m.pal.faintC, bg, false, "▌"),
 					"glyph": paintSeg(m.pal.faintC, bg, false, "·"),
-					"state": paintSeg(m.pal.faintC, bg, false, padCell("rejected", boardStatusWordWidth)),
+					"state": paintSeg(m.pal.faintC, bg, false, padCell("rejected", boardTestStatusW(m))),
 					"issue": paintSeg(issueInk, bg, selected, "#51"),
 				} {
 					if !strings.Contains(row, span) {
@@ -113,7 +113,7 @@ func TestTUIRejectedBoardEyebrowAndFilter(t *testing.T) {
 		m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 		m.dark, m.pal = dark, newPalette(dark)
 		m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: rejectedRows()})
-		if header := strings.TrimSpace(lineWith(t, stripANSI(m.View().Content), "DONE ·")); header != "DONE · 3 · 1 failed" {
+		if header := boardHeadingText(lineWith(t, stripANSI(m.View().Content), "DONE ·")); header != "DONE · 3 · 1 failed" {
 			t.Errorf("DONE eyebrow = %q", header)
 		}
 		m = key(m, "/")
@@ -124,7 +124,7 @@ func TestTUIRejectedBoardEyebrowAndFilter(t *testing.T) {
 		if len(rows) != 1 || rows[0].ID != "reject01" {
 			t.Fatalf("rejected filter did not isolate base divergence: %v", rows)
 		}
-		if header := strings.TrimSpace(lineWith(t, stripANSI(m.View().Content), "DONE ·")); header != "DONE · 1" {
+		if header := boardHeadingText(lineWith(t, stripANSI(m.View().Content), "DONE ·")); header != "DONE · 1" {
 			t.Errorf("filtered DONE eyebrow = %q", header)
 		}
 	}

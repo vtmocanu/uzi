@@ -2320,7 +2320,7 @@ func scheduleModelStore(t *testing.T, runModel, userDefault pgtype.Text) *fakeSt
 // beats the owner's per-user Worker default for THIS run's Config.DefaultModel. The
 // frozen model also must NOT disturb a subagent template's own model: pin — that pin
 // rides each agent independently (Config.DefaultModel is the LEAD default only, which
-// the worker's resolveLeadModel reads; pinned subagents bypass it), so claim assembly
+// the worker's resolveLeadRequest reads; pinned subagents bypass it), so claim assembly
 // only copies the pin through and the "pin wins over the schedule model" guarantee is
 // entirely worker-side and unchanged here.
 func TestClaimScheduleModelOverridesUserDefault(t *testing.T) {

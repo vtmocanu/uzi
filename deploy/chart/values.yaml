@@ -623,7 +623,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.86.0-rc.30"
+    tag: "0.86.0-rc.31"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -645,6 +645,22 @@ workers:
   # own CNPG already runs on standard here, so this is a default worth thinking about,
   # not a blocker.
   storageClass: ""
+  # nodeSelector for every hosted worker pod, all three tiers (plain, docker, isolated).
+  # The default keeps workers on amd64 nodes because the published agent images
+  # (workers.image.repository) are amd64 only; on an arm64 node of a mixed-arch cluster
+  # they would crash-loop. The api, web and controller images are multi-arch and are
+  # not affected by this value.
+  #
+  # Running your own arm64-capable worker image? Override the value
+  # (`kubernetes.io/arch: arm64`) or clear the selector with `nodeSelector: null`.
+  # `{}` does NOT clear it: Helm deep-merges maps into the default, so `{}` keeps
+  # `kubernetes.io/arch: amd64`. Removing one key takes `<key>: null`.
+  #
+  # Changing it re-hashes the worker pod template: persistent workers go through the
+  # normal paced drain-and-roll; run-bound (ephemeral) workers are outside the pacing
+  # pools but keep the busy-drift deferral, so a busy one is not replaced mid-run.
+  nodeSelector:
+    kubernetes.io/arch: amd64
   # A cluster-scoped PriorityClass for hosted worker pods (issue #1341). When enabled,
   # the chart creates the PriorityClass AND the controller stamps its name onto every
   # worker pod's priorityClassName, so a busy worker outranks lower-priority pods for
@@ -942,9 +958,12 @@ workers:
   # non-privileged tier once a cluster can run it; it is NOT installed and NOT required.
   docker:
     podEpochReclaim:
-      # Shadow reporting only; unset still participates in lifetime epoch locking.
-      # Set containerd-runc or crio-crun only after operator attestation of the
-      # audited runtime/storage prerequisites; see deploy/README.md, Pod-epoch shadow reclaim.
+      # The pass runs by default and keeping trees needs no declaration: unset keeps every
+      # tree (deferred / runtime_not_declared, no candidate inventory) and still participates
+      # in lifetime epoch locking. Setting containerd-runc or crio-crun is
+      # the operator's attestation of the FULL audited runtime/storage contract (a future
+      # hosted-Docker deletion will require it) and is cross-checked against observations.
+      # This release still deletes nothing; see deploy/README.md, Pod-epoch shadow reclaim.
       runtime: ""
     # Turning this on creates the privileged namespace, its quota/limits, the worker
     # SA + pull secret in it, and the controller's Role there. It also makes the

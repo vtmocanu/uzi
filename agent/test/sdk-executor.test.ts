@@ -13,13 +13,15 @@ import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWal
 
 const HAS_PROCFS = process.platform === "linux";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError, ProviderTransientError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
+import { SdkExecutor, embedSeededPlan, TransientRecoveryError, ProviderTransientError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
 import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { LimitReachedError } from "../src/limit.js";
 import { EnvProbeCleanupError } from "../src/env-probe.js";
 import { PlanRejectedError, PlanRevisionReplacedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import { PauseNowSignal, CredentialSwitchSignal, type PlanVerdict } from "../src/steering.js";
+import { LeadConfigReporter, leadConfigActive, type LeadConfigClient } from "../src/lead-config-report.js";
+import type { ClaimConfig, LeadConfigReportBody } from "../src/protocol.js";
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { mrCompletionBlock } from "../src/runner.js";
@@ -2731,29 +2733,6 @@ describe("SdkExecutor failure + watchdog paths", () => {
   });
 });
 
-describe("resolveLeadModel (PRD #17 precedence)", () => {
-  it("prefers the run owner's per-user default over the lead template model", () => {
-    assert.strictEqual(resolveLeadModel("sonnet", "fable"), "sonnet");
-  });
-  it("falls back to the lead template model when there is no per-user default", () => {
-    assert.strictEqual(resolveLeadModel(undefined, "fable"), "fable");
-  });
-  it("uses the per-user default when the lead template has no model", () => {
-    assert.strictEqual(resolveLeadModel("sonnet", undefined), "sonnet");
-  });
-  it("falls back to the template when the config model is a blank string (|| not ??)", () => {
-    // The server sends NULL (omitted) for an unset default, never "", but the
-    // resolver must be correct in isolation: an empty config must not blank out
-    // the template model.
-    assert.strictEqual(resolveLeadModel("", "fable"), "fable");
-  });
-  it("returns undefined (omit the key) when neither is set", () => {
-    assert.strictEqual(resolveLeadModel(undefined, undefined), undefined);
-    assert.strictEqual(resolveLeadModel("", ""), undefined);
-    assert.strictEqual(resolveLeadModel("", undefined), undefined);
-  });
-});
-
 describe("SdkExecutor model precedence on baseOptions", () => {
   // The resolved model must land on options.model exactly per precedence, and an
   // unset model must OMIT the key (never `model: undefined`) so the SDK/account
@@ -2924,6 +2903,332 @@ describe("SdkExecutor reasoning effort on baseOptions (PRD #617)", () => {
     );
     assert.strictEqual(turns[0]!.options.effort, "max", "plan turn: value passes through");
     assert.strictEqual(turns[1]!.options.effort, "max", "implement turn: value passes through");
+  });
+});
+
+describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
+  const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+  const revise: PlanVerdict = { kind: "revise", feedback: "tighten it" };
+  const ACTIVE_CONFIG = {
+    default_model: "sonnet", default_model_source: "user_default" as const,
+    default_effort: "high" as const, default_effort_source: "user_default" as const,
+  };
+
+  async function waitForPosts(posts: unknown[], n: number): Promise<void> {
+    for (let i = 0; i < 100 && posts.length < n; i++) await new Promise((r) => setTimeout(r, 10));
+  }
+
+  /** A real reporter over a recording client: the rows the executor makes it post. */
+  function reporterRig() {
+    const posts: LeadConfigReportBody[] = [];
+    const client: LeadConfigClient = {
+      async recordLeadConfig(_runId, body) {
+        posts.push(body);
+        return { kind: "ok" };
+      },
+    };
+    const make = (config: ClaimConfig | null) => new LeadConfigReporter({
+      client, runId: "r1", claimGeneration: 4, active: leadConfigActive(config), logger: nullLogger(),
+    });
+    const rows = () => posts.map((p) => `${p.phase}#${p.phase_entry}/${p.seq}`);
+    return { posts, make, rows };
+  }
+
+  it("plan then approve then implement: one requested-side row per phase, matching what the SDK is sent", async () => {
+    const { posts, make, rows } = reporterRig();
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({ agents: [lead, coder], config: ACTIVE_CONFIG, leadConfig: make(ACTIVE_CONFIG) }, approveWith("own"));
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.deepEqual(rows(), ["plan#1/1", "implement#1/1"]);
+    for (const p of posts) {
+      assert.equal(p.claim_generation, 4);
+      assert.equal(p.requested_model, "sonnet");
+      assert.equal(p.requested_model_source, "user_default");
+      assert.equal(p.requested_effort, "high");
+      assert.equal(p.requested_effort_mode, "explicit");
+      assert.equal(p.requested_effort_source, "user_default");
+      assert.equal(p.observed_model, null);
+    }
+    // What was reported is what was sent.
+    for (const t of turns) {
+      assert.equal(t.options.model, "sonnet");
+      assert.equal(t.options.effort, "high");
+    }
+  });
+
+  it("a revise round re-drives the plan turn without a new entry", async () => {
+    const { make, rows } = reporterRig();
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("v1"), resultSuccess()],
+      [submitPlan("v2"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({ agents: [lead, coder], config: ACTIVE_CONFIG, leadConfig: make(ACTIVE_CONFIG) }, [revise, approve]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(turns.length, 3);
+    assert.deepEqual(rows(), ["plan#1/1", "implement#1/1"]);
+  });
+
+  it("a pre-approved resume records only the implement phase", async () => {
+    const { make, rows } = reporterRig();
+    const { queryFn } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config: ACTIVE_CONFIG, leadConfig: make(ACTIVE_CONFIG),
+      planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.deepEqual(rows(), ["implement#1/1"]);
+  });
+
+  it("reports the lead template model as `template` and an absent effort as runtime default", async () => {
+    const config = { default_effort_source: "builtin" as const };
+    const { posts, make } = reporterRig();
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config, leadConfig: make(config),
+      planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0]!.requested_model, "fable");
+    assert.equal(posts[0]!.requested_model_source, "template");
+    assert.equal(posts[0]!.requested_effort, null);
+    assert.equal(posts[0]!.requested_effort_mode, "runtime_default");
+    assert.equal(turns[0]!.options.model, "fable");
+    assert.ok(!("effort" in turns[0]!.options));
+  });
+
+  it("every claude request_case of the shared matrix is what the executor actually sends to the SDK", async () => {
+    const contract = JSON.parse(
+      fs.readFileSync(path.join(import.meta.dirname, "..", "..", "fixtures", "lead-config", "contract.json"), "utf8"),
+    ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; expect: { model?: string; effort?: string } }> };
+    const cases = contract.request_cases.filter((c) => c.harness === "claude");
+    assert.ok(cases.length >= 5, "the claude matrix is loaded, not empty");
+    const visited: string[] = [];
+    for (const c of cases) {
+      const { model: _drop, ...leadNoModel } = lead;
+      const leadT: AgentTemplate = c.templateModel !== undefined ? { ...leadNoModel, model: c.templateModel } : leadNoModel;
+      const planPhase = c.phase === "plan";
+      const { queryFn, turns } = fakeTurns(
+        planPhase
+          ? [[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]
+          : [[signalDone(), resultSuccess()]],
+      );
+      const { ctx } = makeCtx(
+        planPhase
+          ? { agents: [leadT, coder], config: c.config }
+          : { agents: [leadT, coder], config: c.config, planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved" },
+        approveWith("own"),
+      );
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+      assert.ok(turns.length >= 1, `${c.id}: a turn ran`);
+      // Only the turns of the case's own phase: the first turn is the plan turn, the rest implement.
+      const phaseTurns = planPhase ? turns.slice(0, 1) : turns;
+      assert.ok(phaseTurns.length >= 1, `${c.id}: a ${c.phase}-phase turn ran`);
+      for (const t of phaseTurns) {
+        if (c.expect.model === undefined) assert.ok(!("model" in t.options), `${c.id}: no model key`);
+        else assert.equal(t.options.model, c.expect.model, `${c.id}: sent model`);
+        if (c.expect.effort === undefined) assert.ok(!("effort" in t.options), `${c.id}: no effort key`);
+        else assert.equal(t.options.effort, c.expect.effort, `${c.id}: sent effort`);
+      }
+      visited.push(c.id);
+    }
+    assert.deepEqual(visited, cases.map((c) => c.id));
+  });
+
+  /** fakeTurns plus init frames carrying `effort`, and an optional getSettings on each instance. */
+  function observedTurns(
+    scripts: SDKMessage[][],
+    getSettings?: () => Promise<unknown>,
+  ): { queryFn: SdkQueryFn; settingsCalls: () => number } {
+    let i = 0;
+    let settingsCalls = 0;
+    const queryFn: SdkQueryFn = (params) => {
+      const script = scripts[Math.min(i, scripts.length - 1)]!;
+      i++;
+      const gen = (async function* () {
+        for await (const _ of params.prompt) { /* consume the prompt */ }
+        for (const m of script) yield m;
+      })();
+      if (getSettings) {
+        (gen as unknown as Record<string, unknown>)["getSettings"] = () => { settingsCalls++; return getSettings(); };
+      }
+      return gen;
+    };
+    return { queryFn, settingsCalls: () => settingsCalls };
+  }
+  const initFrame = (extra: Record<string, unknown> = {}): SDKMessage =>
+    ({ type: "system", subtype: "init", session_id: "sess-1", model: "claude-opus-4-8", ...extra }) as unknown as SDKMessage;
+  const observed = (p: LeadConfigReportBody) =>
+    [p.observed_model, p.observed_model_evidence, p.observed_effort, p.observed_effort_evidence];
+  const DEFAULT_CASE = {
+    default_model: "opus", default_model_source: "user_default" as const,
+    default_effort: "medium" as const, default_effort_source: "builtin" as const,
+  };
+
+  it("acceptance example 1 (Claude default case): requested opus/medium, runtime model from init, effort from the settings probe", async () => {
+    const { posts, make, rows } = reporterRig();
+    const { queryFn, settingsCalls } = observedTurns(
+      [[initFrame(), submitPlan("plan"), resultSuccess()], [initFrame({ effort: "medium" }), signalDone(), resultSuccess()]],
+      async () => ({ applied: { effort: "high" } }),
+    );
+    const { ctx } = makeCtx({ agents: [lead, coder], config: DEFAULT_CASE, leadConfig: make(DEFAULT_CASE) }, approveWith("own"));
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 4);
+    assert.deepEqual(rows(), ["plan#1/1", "plan#1/2", "implement#1/1", "implement#1/2"]);
+    for (const p of posts) {
+      assert.equal(p.requested_model, "opus");
+      assert.equal(p.requested_model_source, "user_default");
+      assert.equal(p.requested_effort, "medium");
+      assert.equal(p.requested_effort_source, "builtin");
+    }
+    assert.deepEqual(observed(posts[0]!), [null, null, null, null]);
+    assert.deepEqual(observed(posts[1]!), ["claude-opus-4-8", "claude_init", "high", "claude_get_settings"]);
+    assert.deepEqual(observed(posts[2]!), [null, null, null, null]);
+    assert.deepEqual(observed(posts[3]!), ["claude-opus-4-8", "claude_init", "medium", "claude_init"]);
+    assert.equal(settingsCalls(), 1, "only the plan init lacked an effort key, so the probe ran once");
+  });
+
+  it("an init without effort and no getSettings reports the model and an unknown effort", async () => {
+    const { posts, make } = reporterRig();
+    const { queryFn } = observedTurns([[initFrame(), signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config: DEFAULT_CASE, leadConfig: make(DEFAULT_CASE),
+      planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 2);
+    assert.deepEqual(posts.map((p) => `${p.phase}#${p.phase_entry}/${p.seq}`), ["implement#1/1", "implement#1/2"]);
+    assert.deepEqual(observed(posts[1]!), ["claude-opus-4-8", "claude_init", null, "unknown"]);
+  });
+
+  it("an inactive reporter gets no phase entry and never probes getSettings", async () => {
+    const config = { default_model: "opus", default_effort: "medium" as const };
+    const { posts, make } = reporterRig();
+    const reporter = make(config);
+    assert.equal(reporter.enabled, false, "no default_effort_source: the reporter is inactive");
+    let entered = 0;
+    const enterPhase = reporter.enterPhase.bind(reporter);
+    reporter.enterPhase = (...args) => { entered++; return enterPhase(...args); };
+    const { queryFn, settingsCalls } = observedTurns(
+      [[initFrame(), submitPlan("plan"), resultSuccess()], [initFrame(), signalDone(), resultSuccess()]],
+      async () => ({ applied: { effort: "high" } }),
+    );
+    const { ctx } = makeCtx({ agents: [lead, coder], config, leadConfig: reporter }, approveWith("own"));
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(entered, 0);
+    assert.equal(settingsCalls(), 0, "a non-lead-config claim must not send the settings probe");
+    assert.equal(posts.length, 0);
+  });
+
+  it("an init effort null is recorded as not sent, with claude_init evidence", async () => {
+    const { posts, make } = reporterRig();
+    const { queryFn } = observedTurns([[initFrame({ effort: null }), signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config: DEFAULT_CASE, leadConfig: make(DEFAULT_CASE),
+      planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 2);
+    assert.deepEqual(observed(posts[1]!), ["claude-opus-4-8", "claude_init", null, "claude_init"]);
+  });
+
+  it("an init reporting high while xhigh was requested records both sides", async () => {
+    const config = { ...DEFAULT_CASE, default_effort: "xhigh" as const };
+    const { posts, make } = reporterRig();
+    const { queryFn } = observedTurns([[initFrame({ effort: "high" }), signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config, leadConfig: make(config),
+      planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 2);
+    assert.equal(posts[1]!.requested_effort, "xhigh");
+    assert.equal(posts[1]!.observed_effort, "high");
+  });
+
+  it("only the first turn of an entry carries the callback: a revise round neither re-reports nor re-probes", async () => {
+    const { posts, make, rows } = reporterRig();
+    const { queryFn, settingsCalls } = observedTurns(
+      [
+        [initFrame(), submitPlan("v1"), resultSuccess()],
+        [initFrame(), submitPlan("v2"), resultSuccess()],
+        [initFrame({ effort: "low" }), signalDone(), resultSuccess()],
+      ],
+      async () => ({ applied: { effort: "high" } }),
+    );
+    const { ctx } = makeCtx({ agents: [lead, coder], config: DEFAULT_CASE, leadConfig: make(DEFAULT_CASE) }, [revise, approve]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 4);
+    assert.deepEqual(rows(), ["plan#1/1", "plan#1/2", "implement#1/1", "implement#1/2"]);
+    assert.equal(settingsCalls(), 1, "the revise turn's init did not probe");
+    assert.equal(posts[1]!.observed_effort, "high");
+  });
+
+  it("a slow settings probe does not let a later turn of the same entry probe again", async () => {
+    const { posts, make, rows } = reporterRig();
+    const { queryFn, settingsCalls } = observedTurns(
+      [
+        [initFrame(), submitPlan("v1"), resultSuccess()],
+        [initFrame(), submitPlan("v2"), resultSuccess()],
+        [initFrame({ effort: "low" }), signalDone(), resultSuccess()],
+      ],
+      () => new Promise((r) => setTimeout(() => r({ applied: { effort: "high" } }), 300)),
+    );
+    const { ctx } = makeCtx({ agents: [lead, coder], config: DEFAULT_CASE, leadConfig: make(DEFAULT_CASE) }, [revise, approve]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 4);
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(settingsCalls(), 1, "probe ran once per phase entry");
+    // The slow plan observation may land after implement began; it still attaches to plan entry 1.
+    assert.deepEqual([...rows()].sort(), ["implement#1/1", "implement#1/2", "plan#1/1", "plan#1/2"]);
+    assert.equal(posts.find((p) => p.phase === "plan" && p.seq === 2)!.observed_effort, "high");
+  });
+
+  it("a re-driven implement turn keeps one reporter: the first turn's observation is row 2 and the re-drive adds none", async () => {
+    const { posts, make, rows } = reporterRig();
+    const { queryFn } = observedTurns([
+      [initFrame({ effort: "high" }), resultSuccess()],
+      [initFrame({ effort: "low" }), signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config: ACTIVE_CONFIG, leadConfig: make(ACTIVE_CONFIG),
+      planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 2);
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"], "seq continues on one entry; the re-drive's init posted nothing");
+    assert.equal(posts[0]!.claim_generation, 4);
+    assert.equal(posts[1]!.observed_effort, "high", "the row came from the first turn, not the re-drive");
+  });
+
+  it("a turn that yields no init does not spend the entry's observation: the retry's init posts one row", async () => {
+    const { posts, make, rows } = reporterRig();
+    const { queryFn } = observedTurns([
+      [resultSuccess()],
+      [initFrame({ effort: "high" }), signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({
+      agents: [lead, coder], config: ACTIVE_CONFIG, leadConfig: make(ACTIVE_CONFIG),
+      planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    await waitForPosts(posts, 2);
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"]);
+    assert.equal(posts[1]!.observed_effort, "high");
+  });
+
+  it("posts nothing when the claim carries no default_effort_source", async () => {
+    const { posts, make } = reporterRig();
+    const config = { default_model: "sonnet", default_effort: "low" as const };
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({ agents: [lead, coder], config, leadConfig: make(config) }, approveWith("own"));
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(posts.length, 0);
   });
 });
 

@@ -24,6 +24,9 @@ const (
 	RunEventTypeState   = "state"
 	RunEventTypeHealth  = "health"
 	RunEventTypeInput   = "input"
+	// RunEventTypeRefresh (PRD #3244) says a GetRun-derived field changed; it carries no
+	// status or payload, so a consumer re-reads over REST and never treats it as state.
+	RunEventTypeRefresh = "refresh"
 
 	// RunEventTypeUnknown replaces a Type this binary does not recognise. It is a
 	// value no consumer branches on, so an unknown frame renders neutrally and can
@@ -40,7 +43,7 @@ const (
 // same binary as the API (internal/hub).
 var knownRunEventTypes = map[string]struct{}{
 	RunEventTypeMessage: {}, RunEventTypeState: {},
-	RunEventTypeHealth: {}, RunEventTypeInput: {},
+	RunEventTypeHealth: {}, RunEventTypeInput: {}, RunEventTypeRefresh: {},
 }
 
 // knownRunStatuses is closed because the database enforces it: runs.status carries a

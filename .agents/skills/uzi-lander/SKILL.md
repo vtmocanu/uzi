@@ -361,6 +361,10 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
      'GUIDANCE'` (single-quoted), `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` captured first,
      `S/wait-mrrework.sh OWNER/REPO PR 45 60 "$SINCE"`, review its commit, trail `fix rework`.
      Exit 3 means the rework is still running: re-run the waiter with the same `$SINCE`.
+     GUIDANCE asks only for steps the agent can do in-run. It has no network git, so never
+     require fetching or merging live `main` (or any worker-, forge- or lander-only step):
+     an impossible precondition spins the run into its iteration budget. Integrate `main`
+     locally after the rework completes, then validate the integrated PR head before merging.
      On-demand rework ignores the per-run and per-user auto-rework settings, so a run
      created with `--mr-rework=false` can still be reworked and needs no toggle. A 409
      "disabled" is the admin kill-switch: report it, never downgrade a big fix to a local

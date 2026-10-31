@@ -35,8 +35,8 @@ const subBuffer = 256
 
 // Event is one WS frame. "message" carries a persisted run message (the client
 // renders it directly, deduped by seq); "state" signals a run state change,
-// "health" a run-health flag change (PRD #47), and "input" a steer-queue change
-// (PRD #95) — for all three the client re-reads over REST, since WS never carries
+// "health" a run-health flag change (PRD #47), "input" a steer-queue change
+// (PRD #95) and "refresh" a changed GetRun-derived field (PRD #3244) — for all four the client re-reads over REST, since WS never carries
 // authoritative run state.
 //
 // It is an ALIAS, not a copy: the shape lives in apitypes because PRD #112 M1 put
@@ -143,22 +143,37 @@ func (h *Hub) PublishInput(runID uuid.UUID) {
 	h.broadcast(runID, Event{Type: "input"})
 }
 
+// PublishRefresh signals that a GetRun-derived field of the run changed (PRD #3244: a lead-config
+// row was committed) and the consumer should re-read the run. Like "state" and "health" it is
+// data-less and carries NO status, so it cannot overwrite a newer status in a consumer that
+// treats a state frame as authoritative. It is hub-only: callers must not route it through a
+// multi-broadcaster, so Slack sees nothing. A nil *Hub is a no-op (handler unit tests build a
+// Handler without a hub).
+func (h *Hub) PublishRefresh(runID uuid.UUID) {
+	if h == nil {
+		return
+	}
+	h.broadcast(runID, Event{Type: "refresh"})
+}
+
 // broadcast marshals ev once and sends it to every subscriber of runID,
 // non-blocking: a subscriber whose buffer is full has this frame dropped. Marshal
 // failures are logged and skipped rather than propagated — a broadcast must never
 // break the write path that persisted the underlying event.
 //
-// WHAT A DROP COSTS DEPENDS ON THE FRAME TYPE, and only one of the four self-heals.
+// WHAT A DROP COSTS DEPENDS ON THE FRAME TYPE, and only one of the five self-heals.
 // This comment used to say a dropped frame "is not lost — only its WS fast-path",
-// which is true for "message" and FALSE for the other three:
+// which is true for "message" and FALSE for the other four:
 //
 //   - "message" frames carry a per-run gapless Seq, so a drop leaves a hole the
 //     client sees and repairs with a REST replay from its last-seen seq.
-//   - "state", "health" and "input" carry NO Seq. A drop produces no gap, so there
-//     is nothing to detect and nothing triggers a re-read: the signal is simply
+//   - "state", "health", "input" and "refresh" carry NO Seq. A drop produces no gap, so
+//     there is nothing to detect and nothing triggers a re-read: the signal is simply
 //     gone until the next frame of that type, which for a TERMINAL state frame
 //     never comes. A completed run then reads as still running for as long as the
-//     consumer trusts the socket.
+//     consumer trusts the socket. A dropped "refresh" does not self-heal either: the
+//     change it announced (a lead-config row) is picked up by the next run re-read
+//     (a state frame, a reconnect, or any later refresh).
 //
 // The recovery for the second bullet cannot live here — it is the consumer's, and
 // it must be time-based rather than event-based, because no event will arrive to
@@ -178,7 +193,7 @@ func (h *Hub) broadcast(runID uuid.UUID, ev Event) {
 		case s.ch <- frame:
 		default:
 			// Buffer full: drop. Recoverable for a "message" (its seq gap triggers a
-			// REST catch-up); NOT self-healing for state/health/input, which carry no
+			// REST catch-up); NOT self-healing for state/health/input/refresh, which carry no
 			// seq — see the note above this function before assuming otherwise.
 		}
 	}

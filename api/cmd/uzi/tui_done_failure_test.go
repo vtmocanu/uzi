@@ -64,7 +64,7 @@ func TestBoardDoneFailureInk(t *testing.T) {
 					for label, span := range map[string]string{
 						"spine":  paintSeg(stateInk, bg, false, "▌"),
 						"glyph":  paintSeg(stateInk, bg, false, glyph),
-						"status": paintSeg(stateInk, bg, false, padCell(word, boardStatusWordWidth)),
+						"status": paintSeg(stateInk, bg, false, padCell(word, boardTestStatusW(m))),
 						"run id": paintSeg(idInk, bg, selected, padCell(r.ID, boardIDWidth)),
 						"issue":  paintSeg(issueInk, bg, selected, "#"+itoa(int(*r.IssueIID))),
 						"title":  paintSeg(m.pal.faintC, bg, false, r.IssueTitle),
@@ -150,7 +150,7 @@ func TestBoardDoneFailureEyebrow(t *testing.T) {
 						break
 					}
 				}
-				if strings.TrimSpace(stripANSI(header)) != tc.want {
+				if boardHeadingText(stripANSI(header)) != tc.want {
 					t.Errorf("header = %q, want %q", stripANSI(header), tc.want)
 				}
 				if strings.Contains(tc.want, "failed") {

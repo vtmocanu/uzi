@@ -28,7 +28,7 @@ func (m tuiModel) boardWorkerWidth() int {
 
 // boardProgRoom is title room after the merged cell and actual worker column.
 func (m tuiModel) boardProgRoom() int {
-	prefix := boardRowPrefixWidth(m.board.admin, m.boardShowCred(), m.boardShowCost())
+	prefix := boardRowPrefixWidth(m.board.admin, m.boardShowDur(), m.boardShowCred(), m.boardShowCost())
 	return m.width - m.boardWorkerWidth() - (prefix + boardMileWidth + 1 + boardProgPctWidth + 2)
 }
 

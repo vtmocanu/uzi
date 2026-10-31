@@ -1649,6 +1649,13 @@ tasks:
       # script header.
       - ./scripts/assert-drain-knobs-render.sh
 
+  render:node-selector-check:
+    desc: assert the controller Deployment renders workers.nodeSelector (default, override, null, {}) and refuses a non-map value
+    cmds:
+      # Not in gate:repo (the lint job lacks helm); CI's helm-chart job runs it. Offline +
+      # non-vacuous, see the script header.
+      - ./scripts/assert-worker-node-selector-render.sh
+
   render:ephemeral-docker-check:
     desc: assert effective Docker tier availability reaches the api Deployment
     cmds:

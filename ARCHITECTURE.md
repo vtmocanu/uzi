@@ -534,6 +534,9 @@ especially its Decision Log); this section is the map. See
 [docs/run-cost.md](docs/run-cost.md) for why a run on this runtime costs less
 than the same task worked by a local Claude Code agent-team session, and
 whether the cheaper run is as good.
+The lead agent's requested and runtime-reported model and effort are recorded
+per claim attempt and phase, worker-attested and display-only; see
+[PRD #3244](prds/3244-lead-config-per-claim.md).
 
 ```
 browser ──WS+REST──▶ web (nginx) ──▶ api (Go)  ◀──HTTP (compose) / HTTPS (k8s), poll/claim/report── agent (worker, per user)

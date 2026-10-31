@@ -256,18 +256,42 @@ Hosted Docker workers participate in a lifetime shared epoch lock on supported
 ext4/xfs data volumes, including when shadow evaluation is off. On replacement,
 a fresh pod can evaluate retained attempt trees before accepting runs and log
 `pod_epoch_reclaim`: `eligible`, `deferred` or `partial`, with a stable reason,
-examined/would-delete/kept counts and up to 32 would-delete entries with sizes.
-Partial or unknown bytes and incomplete inventories are marked explicitly.
+examined/would-delete/would-settle/kept counts and up to 32 candidate entries
+with sizes, presence (`present` or `missing`) and basis (`discard` or
+`strict_plain`). `would_delete` counts present candidate paths; `would_settle`
+counts missing ones (metadata only, never counted in bytes); `by_basis` splits
+them; `journal_extra_fields` counts candidates whose marker-less plain journal
+carries extra fields (a count only; list entries carry no marker). Partial or unknown bytes and incomplete inventories are marked explicitly.
+The line also carries `authority` (`undeclared`, `legacy_evidence`,
+`contradicted`, `unproven` or `attested`, with a fixed reason),
+`evidence_version` and, once version-2 binding and prefix checks pass, the node's kernel release.
 
-**This is shadow reporting:** the pass deletes no attempt trees, releases no
-recovery holds and removes no stopped containers. Existing startup reapers and
-DinD maintenance retain their separate behavior. Compose and non-Docker workers
-are unchanged.
+**This is shadow reporting:** the pass deletes no attempt trees, settles no
+records, releases no recovery holds and removes no stopped containers. Existing
+startup reapers and DinD maintenance retain their separate behavior. Compose and
+non-Docker workers are unchanged. Deletion and settlement are later work under
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md) (M1b).
 
 The administrator's `workers.docker.podEpochReclaim.runtime` defaults to unset.
 A fresh default-off pod logs `deferred` / `runtime_not_declared` immediately
-after startup reaping, without waiting for predecessor evidence. The lifetime
-lock still applies. A consumed pod does not evaluate again on process restart.
+after startup reaping, without waiting for predecessor evidence; keeping trees
+needs no declaration. Setting a value attests the full audited runtime/storage
+contract, and the worker cross-checks it against the controller's version-2
+evidence (container-ID runtime prefixes of both pods). Matching observations do
+not prove the facts they cannot see. The lifetime lock still applies. A consumed
+pod does not evaluate again on process restart.
+
+For `crio-crun`, the node's kernel release must be exactly `6.12.0-243.el10.x86_64`
+or `6.12.0-243.el10.aarch64`. Any other release, including after a node OS
+upgrade, reports `kernel_unaudited` and defers; the list is refreshed only through
+a reviewed addendum to the
+[PRD #3430 CRI-O audit](../prds/3430-pod-epoch-crio-audit.md).
+
+The worker image pin (`workers.image.tag`) moves separately from the controller.
+An old worker refuses version-2 evidence and reports no shadow data; a new worker
+with an old controller reports `legacy_evidence`. Positive evidence is sent only
+once the successor reports its first container IDs, so it can arrive later than
+the negative case.
 
 Rolls can take longer while startup waits for epoch ownership or evidence.
 A lock timeout refuses startup and retries through a nonzero exit; deleting

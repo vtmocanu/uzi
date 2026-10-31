@@ -91,7 +91,7 @@ func TestPodEpochMaintenanceOwnReceipt(t *testing.T) {
 			var decision *PodEpochDecision
 			client.PrependReactor("create", "deployments", func(ktesting.Action) (bool, runtime.Object, error) {
 				// The successor may arrive before the next maintenance poll.
-				decision = h.event(watch.Added, epochPod(epochB))
+				decision = h.successor(epochPod(epochB))
 				return false, nil, nil
 			})
 			tick()

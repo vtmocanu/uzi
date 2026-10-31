@@ -122,6 +122,7 @@ func main() {
 		APIURL:                      cfg.WorkerAPIURL,
 		StorageClass:                cfg.WorkerStorageClass,
 		PriorityClassName:           cfg.WorkerPriorityClassName,
+		NodeSelector:                cfg.WorkerNodeSelector,
 		MaxConcurrentRuns:           cfg.WorkerMaxConcurrentRuns,
 		MemoryGuardEnabled:          cfg.WorkerMemoryGuardEnabled,
 		MemoryGuardReserveBytes:     cfg.WorkerMemoryGuardReserveBytes,

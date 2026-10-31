@@ -41,6 +41,37 @@ runtime, claim identities and predecessor with its volume entry record, and
 apply its lock and durable consumption rules. A document alone grants no
 cleanup authority.
 
+## Version 2
+
+`v2/positive.json`, `v2/valid/*.json` and `v2/invalid/*.json` are the version-2
+corpus; the same strict rules apply (8 KiB, duplicate keys at any depth, nulls,
+unknown fields, int32 integers, trailing JSON, maintenance rules, negative
+document grammar). Every version-1 field is unchanged except `version`, which is
+exactly integer 2. Two fields are added, both required at version 2:
+
+| Field | Meaning / validation |
+| --- | --- |
+| successorContainers | Nonempty array of exactly `{name, containerID}` objects; both nonempty strings; names unique |
+| attestation | Exactly `{result, reason}`; `result` is exactly `consistent` or `contradicted`; `reason` is nonempty after trimming |
+
+Presence rule by `version`: a version-1 document must NOT carry either field, a
+version-2 document must carry both. Version 1 remains the legacy corpus above
+(unchanged fixtures). A version-2 consumer must treat version-1 evidence as
+legacy evidence that grants no authority (the worker defers it as `legacy_evidence`). A released version-1-only worker refuses every
+version-2 document (the `version` check fails), so version 2 is safe to publish
+before the fleet drains.
+
+`attestation` is the controller's namespaced-API cross-check of the runtime
+prefixes of the predecessor (X) and successor (S) container IDs against the
+declared `runtime`: `containerd://` for `containerd-runc`, `cri-o://` for
+`crio-crun`. `consistent` means every observed ID carries the declared prefix;
+`contradicted` means at least one does not, with `reason` naming why (for example
+`predecessor_runtime_prefix`). The reason is a diagnostic string. A consumer
+must refuse a `contradicted` document and must recompute the prefixes itself
+rather than trusting a `consistent` attestation; the worker does both. A version-2
+document alone still grants no cleanup authority: the worker's own pod UID,
+runtime, claim identity, lock and durable consumption rules all still apply.
+
 ## Integration API
 
 All new Go code lives in `controller/internal/kube/pod_epoch*.go`.

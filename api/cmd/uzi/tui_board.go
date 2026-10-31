@@ -82,6 +82,12 @@ type boardState struct {
 	// scroll is the index of the first visible run row: the board windows the run list to
 	// the terminal height so the header and footer stay on screen even with hundreds of runs.
 	scroll int
+
+	// heldVerdictW / heldCountW are markerSlotWidths over every held run, refreshed where runs
+	// are accepted, so boardShowDur can reserve the judge marker's width without re-scanning
+	// the list on every row it renders. Over all held runs (a superset of the filtered view),
+	// so the reservation is conservative and does not move while filtering.
+	heldVerdictW, heldCountW int
 }
 
 func newBoardState() boardState { return boardState{} }
@@ -116,6 +122,7 @@ func (b *boardState) apply(msg boardRunsMsg) {
 		keep = b.selectedID()
 	}
 	b.runs = msg.runs
+	b.heldVerdictW, b.heldCountW = markerSlotWidths(b.runs)
 	// Record the accepted set's provenance. This is the single site runs are accepted (the
 	// error path above leaves runs — and so runsAdmin — untouched), and msg.admin == b.admin
 	// is guaranteed by the early return, so this is exactly the admin-ness of the held runs.
@@ -696,10 +703,37 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 			}
 		}
 		accountCols := m.boardAccountCols(rendered)
+		// The status cell never shrinks so far that the band headings in view push their first
+		// label (age / ended) off: it keeps the first label two blanks clear of the widest
+		// heading, within the fixed maximum (tui-ux review of #3732). A labelled heading is one
+		// with at least one of its rows rendered below it.
+		for i := start; i < end; i++ {
+			if items[i].kind == biEyebrow && i+1 < end && items[i+1].kind == biRow {
+				floor := visualWidth(m.boardEyebrow(items[i])) + 2 - boardAgeLabelOffset(m.board.admin)
+				accountCols.statusW = min(boardStatusWordWidth, max(accountCols.statusW, floor))
+			}
+		}
+		// A band's heading names the judge column only when one of its runs carries a verdict:
+		// the judge runs after a run finishes, so active bands would label an empty column.
+		var bandVerdict [numBands]bool
+		for _, r := range rows {
+			if r.JudgeVerdict != nil {
+				bandVerdict[runBandOf(r)] = true
+			}
+		}
 		for i := start; i < end; i++ {
 			switch it := items[i]; it.kind {
 			case biEyebrow:
-				sb.WriteString(m.boardEyebrow(it) + "\n")
+				bmc := mc
+				if !bandVerdict[it.band] {
+					bmc.fullW = 0 // the column stays reserved on rows; only the label is omitted
+				}
+				if i+1 < end && items[i+1].kind == biRow {
+					sb.WriteString(m.boardEyebrowLabelled(it, bmc, accountCols) + "\n")
+				} else {
+					// A heading at the window's bottom edge with no rows under it: no labels.
+					sb.WriteString(m.boardEyebrow(it) + "\n")
+				}
 			case biRow:
 				r := rows[it.runIdx]
 				sel := it.runIdx == m.board.cursor
@@ -825,6 +859,17 @@ func (m tuiModel) boardEyebrow(it boardItem) string {
 		label += m.pal.faint.Render(" · ") + paintSeg(m.pal.alarm, nil, false, itoa(it.failed)+" failed")
 	}
 	return label
+}
+
+// boardEyebrowLabelled is the band heading plus its faint column names (#3732), positioned
+// over the rendered window's cells and dropped where they would collide.
+func (m tuiModel) boardEyebrowLabelled(it boardItem, mc boardMarkerCols, cols boardAccountCols) string {
+	head := m.boardEyebrow(it)
+	labels := placeBoardLabels(visualWidth(head), m.width, m.boardColumnLabels(it.band, mc, cols))
+	if labels == "" {
+		return head
+	}
+	return head + m.pal.faint.Render(labels)
 }
 
 // boardFooter preserves the unabridged legend for version-readout selection.
@@ -975,13 +1020,14 @@ func (m tuiModel) versionClientOnly() string {
 
 const (
 	boardIDWidth         = 8  // short run id (first 8 of the UUID)
-	boardStatusWordWidth = 14 // status word cell; fits the 13-rune longest words ("recovery wait" / "needs landing", issue #1418) with a column of breathing room
+	boardStatusWordWidth = 14 // status word cell MAXIMUM (thresholds reserve it); fits the 13-rune longest words ("recovery wait" / "needs landing", issue #1418) with a column of breathing room. Rows draw the rendered window's measured width (boardAccountCols.statusW, #3732)
 	boardAgeWidth        = 4  // AGE cell (relAge, single-unit)
 	boardMileWidth       = 9  // milestone micro-bar cell (up to boardMileCap ▰/▱ cells, or done/total | –/N text above that)
 	boardMileCap         = 9  // above this many milestones the micro-bar falls back to N/M text
 	boardOwnerWidth      = 20 // admin owner-email cell
 	boardCredWidth       = 10 // maximum credential label width; no tone dot
 	boardCostWidth       = 6  // COST cell width (right-aligned; fits "$9999", "<$1", "n/a"; blank when usage is absent)
+	boardDurWidth        = 6  // DONE run-length cell (right-aligned; fits "23h59m"/"99d23h"; boardDurText bounds longer spans to days/years)
 	// boardMileMinWidth is the narrowest own board that shows the milestone micro-bar. Below it
 	// the column is dropped (milestone progress is still on the run-detail view) so the fixed
 	// prefix does not squeeze the title into an overflowing marker row (issue #379).
@@ -1001,7 +1047,7 @@ func (m tuiModel) boardShowMile() bool {
 	// shown) push the mile threshold up by exactly their width, so a narrow board drops the
 	// micro-bar instead of squeezing the title (issue #379). The milestone-free
 	// prefix leaves only the owner + credential + cost deltas.
-	min += boardRowPrefixWidth(m.board.admin, m.boardShowCred(), m.boardShowCost()) - boardRowPrefixWidth(false, false, false)
+	min += boardRowPrefixWidth(m.board.admin, m.boardShowDur(), m.boardShowCred(), m.boardShowCost()) - boardRowPrefixWidth(false, false, false, false)
 	return m.width >= min
 }
 
@@ -1017,8 +1063,36 @@ func (m tuiModel) boardShowCost() bool {
 	min := boardCostMinWidth
 	// The extra columns before TITLE (the credential cell when shown) push the threshold up by
 	// exactly their width; cost is false in both terms so it cancels, only the cred delta survives.
-	min += boardRowPrefixWidth(false, m.boardShowCred(), false) - boardRowPrefixWidth(false, false, false)
+	min += boardRowPrefixWidth(false, false, m.boardShowCred(), false) - boardRowPrefixWidth(false, false, false, false)
 	return m.width >= min
+}
+
+// boardShowDur gates the own-board DONE run-length column. The admin board lists non-terminal
+// runs only (AdminListRuns), so it never has a DONE row and never shows the column. On the own
+// board the cell is reserved on every row (blank outside DONE) so later columns stay aligned
+// across bands.
+//
+// Run length is the lowest-priority column: it is a retrospective signal, while the milestone
+// micro-bar, percentage and COST describe live work. So it is shown only when the whole row
+// still fits with it: the prefix with run length and COST, the micro-bar plus percentage, the
+// title floor, the judge marker when any held run has one, and the worker column counted
+// unconditionally. Counting the worker column even
+// below its 120 breakpoint makes the threshold conservative but monotonic, so neither this
+// column nor the percentage flaps on/off across that breakpoint, and the #379 thresholds of
+// the milestone and COST columns are unchanged. Not derived from boardShowMile/boardShowProg
+// (both read this gate), so there is no visibility cycle.
+func (m tuiModel) boardShowDur() bool {
+	if m.board.admin {
+		return false
+	}
+	need := boardRowPrefixWidth(false, true, m.boardShowCred(), true) +
+		boardMileWidth + 1 + boardProgPctWidth + 2 + boardProgTitleFloor + boardWorkerColumnWidth
+	// The judge marker is flushed right and its width (plus gap) comes off the title, so it is
+	// reserved too: otherwise the column would appear at the threshold and squeeze the title.
+	if mc := m.markerColsFor(m.board.heldVerdictW, m.board.heldCountW); mc.fullW > 0 {
+		need += mc.fullW + 2
+	}
+	return m.width >= need
 }
 
 // boardShowCred reserves an account column when the viewer holds multiple

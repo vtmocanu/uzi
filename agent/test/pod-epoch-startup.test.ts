@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { test } from "node:test";
 import { compileFunction } from "node:vm";
 import { inspectPodEpochBootstrap } from "../src/pod-epoch-bootstrap.js";
-import { PodEpochSettlementError } from "../src/pod-epoch-reclaim.js";
+import { PodEpochSettlementError, runPodEpochShadow } from "../src/pod-epoch-reclaim.js";
 import type { createPodEpoch, PodEpochOwnership } from "../src/pod-epoch-lock.js";
 
 const source = fs.readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
@@ -123,6 +123,45 @@ test("main uses one runtime, consumes the bootstrap UID and restores TMP before 
   environment.UZI_EPOCH_LOCK = "0";
   await executeBoundary(body, ports);
   assert.deepEqual(events, [], "nonparticipants do not touch epoch runtime or TMP");
+});
+
+test("an undeclared runtime acquires SH, consumes the UID and yields values the shadow reports as undeclared", async () => {
+  const events: string[] = [];
+  const podUid = "12345678-1234-1234-1234-123456789abc";
+  const environment = { UZI_EPOCH_LOCK: "1", UZI_DATA_DIR: "/data", UZI_POD_UID: podUid } as Record<string, string>;
+  const controller = new AbortController();
+  const ownership: PodEpochOwnership = {
+    mode: "shared",
+    consume: async uid => { assert.equal(uid, podUid); events.push("consume"); return { result: "fresh", mayEvaluate: false }; },
+    close: () => assert.fail("lifetime ownership must remain open"),
+    reacquireShared: async () => assert.fail("a shared first mode has no handover"),
+    matchesEntry: () => assert.fail("no evidence is evaluated"),
+  };
+  const runtime: ReturnType<typeof createPodEpoch> = {
+    inspectConsumption: () => { events.push("peek"); return "fresh"; },
+    acquire: async options => { events.push("acquire:" + options?.firstMode); return ownership; },
+    seed: async () => assert.fail("startup must not seed"),
+    prepare: () => assert.fail("startup must not prepare"),
+    hold: async () => assert.fail("startup must not hold"),
+  };
+  const body = section('const epochEnabled =', "if (epochOwnership) restoreEpochRuntimeTmpdir(epochOwnership);") +
+    "\nreturn { epochBootstrap, epochOwnership, epochConsumption };";
+  const boundary = await compileFunction("return (async () => { " + body + "\n})();", ["process", "controller",
+    "inspectPodEpochBootstrap", "createPodEpoch", "restoreEpochRuntimeTmpdir"])(
+    { env: environment }, controller, inspectPodEpochBootstrap, () => runtime, () => events.push("restore")) as
+    { epochBootstrap: Parameters<typeof runPodEpochShadow>[0]["bootstrap"]; epochOwnership: PodEpochOwnership;
+      epochConsumption: Parameters<typeof runPodEpochShadow>[0]["consumption"] };
+  assert.deepEqual(events, ["acquire:shared", "consume", "restore"]);
+  let reads = 0;
+  const verdict = await runPodEpochShadow({
+    bootstrap: boundary.epochBootstrap, ownership: boundary.epochOwnership, consumption: boundary.epochConsumption,
+    signal: controller.signal, readEvidence: async () => { reads++; return ""; },
+    git: { discoverEpochRetainedSources: async () => assert.fail("no census"), inspectRetainedSources: async () => assert.fail("no inspection") },
+    client: { listRecoveryHolds: async () => assert.fail("no holds"), getRunOwnership: async () => assert.fail("no ownership") },
+  });
+  assert.equal(reads, 0);
+  assert.equal(verdict?.reason, "runtime_not_declared");
+  assert.deepEqual(verdict?.authority, { result: "undeclared", reason: "runtime_not_declared" });
 });
 
 const admissionBody = section("const verdict = startupReapVerdict(", "await worker.run(controller.signal);");

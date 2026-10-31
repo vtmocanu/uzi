@@ -19,7 +19,7 @@ import (
 func TestPodEpochDeliveryResponseBound(t *testing.T) {
 	h := newEpochHarness(t, epochPod(epochA))
 	h.event(watch.Modified, epochTerminal(epochPod(epochA)))
-	d := h.event(watch.Added, epochPod(epochB))
+	d := h.successor(epochPod(epochB))
 	if d == nil {
 		t.Fatal("missing successor decision")
 	}

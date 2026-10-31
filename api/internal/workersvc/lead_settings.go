@@ -1,0 +1,86 @@
+package workersvc
+
+import (
+	"strings"
+
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/leadcfg"
+)
+
+// LeadSettingsInput is what the lead resolver reads: the run's harness, the model frozen onto the
+// run at create (runs.model), the owner's model lane for that harness and the owner's per-harness
+// effort column. The caller reads them; the resolver is pure.
+type LeadSettingsInput struct {
+	Harness    Harness
+	RunModel   pgtype.Text // runs.model, frozen at create
+	LaneModel  pgtype.Text // the user's lane for Harness
+	UserEffort pgtype.Text // the user's per-harness effort column
+}
+
+// LeadSettings is the resolved lead model and effort with the provenance the claim ships.
+type LeadSettings struct {
+	// Model is invalid when no default_model is shipped (the worker decides).
+	Model pgtype.Text
+	// ModelSource is empty exactly when Model is invalid.
+	ModelSource leadcfg.ModelSource
+	// Effort is the claim's default_effort; nil means the owner chose the runtime default (no
+	// default_effort is shipped).
+	Effort       *string
+	EffortSource leadcfg.EffortSource
+	// DroppedLaneModel is the trimmed Claude-lane Codex-role token the #3245 guard discarded, for
+	// its existing fallback note.
+	DroppedLaneModel pgtype.Text
+	// DroppedRunModel is the (untrimmed) incompatible runs.model that was ignored, for its
+	// existing fallback note.
+	DroppedRunModel pgtype.Text
+}
+
+// resolveLeadSettings is the one server-side home of lead precedence (PRD #3244 section 3). It is
+// the behavior-preserving extraction of assembleClaim's inline lane/schedule block: the
+// per-harness lane is read, a Claude lane holding a Codex role token is cleared (#3245), then a
+// compatible runs.model wins over the lane and an incompatible one is dropped. The caller owns
+// the gate (never for a checker or Codex review claim) and the fallback notes.
+func resolveLeadSettings(in LeadSettingsInput) LeadSettings {
+	var out LeadSettings
+	model := in.LaneModel
+	if in.Harness != HarnessCodex {
+		if model.Valid && agenttmpl.CodexRoleModels[strings.TrimSpace(model.String)] {
+			out.DroppedLaneModel = pgtype.Text{String: strings.TrimSpace(model.String), Valid: true}
+			model = pgtype.Text{}
+		}
+	}
+	if model.Valid {
+		out.ModelSource = leadcfg.ModelSourceUserDefault
+	}
+	if in.RunModel.Valid {
+		if harnessModelCompatible(in.Harness, in.RunModel.String) {
+			model = in.RunModel
+			out.ModelSource = leadcfg.ModelSourceSchedulePin
+		} else {
+			out.DroppedRunModel = in.RunModel
+		}
+	}
+	out.Model = model
+	if !model.Valid {
+		out.ModelSource = ""
+	}
+	out.Effort, out.EffortSource = resolveLeadEffort(in.Harness, in.UserEffort)
+	return out
+}
+
+// resolveLeadEffort is the single home of the lead effort value and its source. assembleClaim
+// reads the effort column after the model block (statement order is deliberate), so it calls this
+// again with the late read instead of repeating the two expressions; resolveLeadSettings calls it
+// for LeadSettingsInput.UserEffort.
+//
+// It makes one agenttmpl.ResolveHarnessEffort call (#3247) and maps the EffortResolution: the
+// level is the claim's default_effort (nil for the owner's `runtime` choice, so the worker
+// records requested_effort_mode runtime_default), and the resolution's source is the
+// default_effort_source (NULL, blank or a corrupt stored value is builtin; a level or `runtime`
+// is user_default). The value mapping is shared with resolveHarnessEffortPtr.
+func resolveLeadEffort(harness Harness, userEffort pgtype.Text) (effort *string, source leadcfg.EffortSource) {
+	r := agenttmpl.ResolveHarnessEffort(string(harness), textPtr(userEffort))
+	return effortResolutionPtr(r), leadcfg.EffortSource(r.Source)
+}

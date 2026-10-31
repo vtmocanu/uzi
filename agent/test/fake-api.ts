@@ -454,6 +454,15 @@ export class FakeApi {
   readonly decisionsMemoGets: Array<{ runId: string; claimGeneration: string | null }> = [];
   readonly decisionsMemoPosts: Array<{ runId: string; body: { claim_generation?: number; body?: string } }> = [];
 
+  /** PRD #3244: the lead-config route. Every POST body is recorded in `leadConfigPosts`; the
+   *  answer is the next entry of `leadConfig.queue` (consumed in order), else `leadConfig.fallback`
+   *  (default 204 = stored). A non-204 status answers `{error, reason}` like httpx.ErrorReason when `reason` is set. */
+  leadConfig: {
+    queue: Array<{ status: number; reason?: string }>;
+    fallback: { status: number; reason?: string };
+  } = { queue: [], fallback: { status: 204 } };
+  readonly leadConfigPosts: Array<{ runId: string; body: Record<string, unknown> }> = [];
+
   constructor(private readonly token: string) {
     this.server = http.createServer((req, res) => {
       this.handle(req, res).catch((err) => {
@@ -1664,6 +1673,15 @@ export class FakeApi {
         if (this.decisionsMemo.postStatus === 204) return sendEmpty(res, 204);
         return send(res, this.decisionsMemo.postStatus, { error: "decisions_memo_rejected" });
       }
+    }
+
+    // PRD #3244: the lead-config route.
+    const leadConfigMatch = /^\/api\/worker\/runs\/([^/]+)\/lead-config$/.exec(p);
+    if (leadConfigMatch && req.method === "POST") {
+      this.leadConfigPosts.push({ runId: leadConfigMatch[1] as string, body: json as Record<string, unknown> });
+      const answer = this.leadConfig.queue.shift() ?? this.leadConfig.fallback;
+      if (answer.status === 204) return sendEmpty(res, 204);
+      return send(res, answer.status, answer.reason ? { error: "fake lead-config refusal", reason: answer.reason } : {});
     }
 
     // PRD #1798 M6: the pr-description routes, answered by an in-memory model when a test installs

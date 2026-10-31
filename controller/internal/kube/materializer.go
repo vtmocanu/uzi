@@ -322,6 +322,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		// them, and where they have to be for a change to roll the pod at all.
 		ann := d.Spec.Template.Annotations
 		o.SpecHash = ann[AnnotationSpecHash]
+		o.DeploymentNodeSelector = d.Spec.Template.Spec.NodeSelector
 		if raw := ann[AnnotationGeneration]; raw != "" {
 			gen, err := strconv.ParseInt(raw, 10, 64)
 			if err != nil {
@@ -1111,7 +1112,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	}
 	dep.UID = types.UID(obs.DeploymentUID)
 	dep.ResourceVersion = obs.DeploymentResourceVersion
-	patch, err := patchFor(dep)
+	patch, err := patchFor(dep, obs.DeploymentNodeSelector)
 	if err != nil {
 		return err
 	}
@@ -1137,12 +1138,20 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 // admin can edit objects in the worker namespace (the workers' own SA has zero RBAC
 // and no mounted token). A strategic-merge or apply-based patch would close it if
 // this ever needs to be true in general.
-func patchFor(dep *appsv1.Deployment) ([]byte, error) {
+//
+// The nodeSelector is the one map this patch does make convergent, because operators
+// are expected to change it (workers.nodeSelector): liveSelector is the observed
+// template's, and every key of it the desired template dropped is sent as null.
+func patchFor(dep *appsv1.Deployment, liveSelector map[string]string) ([]byte, error) {
+	tmpl, err := templateWithSelectorDeletes(dep.Spec.Template, liveSelector)
+	if err != nil {
+		return nil, err
+	}
 	patch := map[string]any{
 		"metadata": map[string]any{"uid": dep.UID, "resourceVersion": dep.ResourceVersion},
 		"spec": map[string]any{
 			"replicas": 1,
-			"template": dep.Spec.Template,
+			"template": tmpl,
 			// revisionHistoryLimit is a spec-level SIBLING of template, not inside it
 			// (a merge patch treats an absent key as "leave alone", so it would never
 			// reach an already-provisioned worker if omitted). Carry it here so existing
@@ -1156,6 +1165,38 @@ func patchFor(dep *appsv1.Deployment) ([]byte, error) {
 		return nil, fmt.Errorf("marshal deployment patch: %w", err)
 	}
 	return raw, nil
+}
+
+// templateWithSelectorDeletes returns tmpl as the generic JSON a merge patch sends,
+// with spec.nodeSelector set to tmpl's selector plus a null for each live key it
+// lacks. With nothing to delete it is tmpl unchanged.
+func templateWithSelectorDeletes(tmpl corev1.PodTemplateSpec, live map[string]string) (any, error) {
+	sel := map[string]any{}
+	for k := range live {
+		if _, keep := tmpl.Spec.NodeSelector[k]; !keep {
+			sel[k] = nil
+		}
+	}
+	if len(sel) == 0 {
+		return tmpl, nil
+	}
+	for k, v := range tmpl.Spec.NodeSelector {
+		sel[k] = v
+	}
+	raw, err := json.Marshal(tmpl)
+	if err != nil {
+		return nil, fmt.Errorf("marshal pod template: %w", err)
+	}
+	var generic map[string]any
+	if err := json.Unmarshal(raw, &generic); err != nil {
+		return nil, fmt.Errorf("unmarshal pod template: %w", err)
+	}
+	spec, ok := generic["spec"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("pod template has no spec object")
+	}
+	spec["nodeSelector"] = sel
+	return generic, nil
 }
 
 // teardown removes a worker we provisioned that the api no longer wants
