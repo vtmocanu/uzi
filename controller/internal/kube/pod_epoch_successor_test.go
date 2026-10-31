@@ -200,7 +200,7 @@ func TestPodEpochSuccessorNeverEmits(t *testing.T) {
 			// The terminal status already carries container IDs, so this event alone
 			// would complete the pending proof if the terminal guard were missing.
 			if d := h.event(watch.Modified, epochTerminal(epochPod(epochB))); d != nil {
-				t.Fatalf("emitted on terminal successor: %s", d.Document())
+				h.t.Fatalf("emitted on terminal successor: %s", d.Document())
 			}
 		}, func(h *epochHarness) *PodEpochDecision { return h.event(watch.Modified, ids()) }},
 		{"tainted-before-ids", func(h *epochHarness) {
