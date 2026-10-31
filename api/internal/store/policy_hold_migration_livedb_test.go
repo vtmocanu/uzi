@@ -73,12 +73,15 @@ func TestCompactPolicyHoldMigrationLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range []uuid.UUID{held, queued, live} {
-		var status, session string
-		if err := pool.QueryRow(ctx, "SELECT status,session_id FROM runs WHERE id=$1", id).Scan(&status, &session); err != nil {
+		var status, session, reason string
+		if err := pool.QueryRow(ctx, "SELECT status,session_id,failure_reason FROM runs WHERE id=$1", id).Scan(&status, &session, &reason); err != nil {
 			t.Fatal(err)
 		}
 		if status != "failed" || session != "saved-session" {
 			t.Fatal("Down failed to terminalize safely or lost session")
+		}
+		if reason != "Policy hold ended by schema rollback" {
+			t.Fatalf("Down recorded a stale rollback diagnostic: %q", reason)
 		}
 	}
 	for _, id := range []uuid.UUID{ordinary, resolved} {
