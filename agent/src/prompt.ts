@@ -179,7 +179,7 @@ const COMPLETION_DELIVERY_GUIDANCE = [
   "Coding, docs, tests, mandatory gates, security and review remain worker obligations and never move to either section,",
   "even if the lander repeats a check or the worker lacks time, permissions or tooling. Mixed or ambiguous milestones block completion.",
   "Environment limits, permissions and automatic approval do not waive those obligations.",
-  "When the plan has Owner acceptance items, declare `non_closing` with a reason naming them as pending and not verified,",
+  "On issue runs, when the plan has Owner acceptance items, declare `non_closing` with a reason naming them as pending and not verified,",
   "and list each as a `deferred` `pr_summary` scope note.",
   "Resolve classification from the issue, the repository and prior owner instructions; if consequential doubt remains",
   "and ask_user reaches a human (the plan prompt carries no autopilot note), use ask_user before the final submit_plan,",

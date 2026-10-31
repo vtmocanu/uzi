@@ -232,8 +232,8 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    Parks: `awaiting_input` → read the question (`uzi run logs RUN --json`, kind `question`),
    surface it, answer with `uzi run answer` if you can (never a wait-only answer: see `uzi-watcher`,
    *Watching*; a completion question about a frozen
-   milestone on an older plan that made it maintainer-owned: `uzi run decide RUN --partial <kept ids>
-   --reason '...'`, since a plain answer cannot exempt it, then open the PR; new plans should list
+   milestone on an older plan that made it maintainer-owned:
+   `uzi run decide RUN --partial KEPT_IDS --reason '...'`, since a plain answer cannot exempt it, then open the PR; new plans should list
    owner acceptance outside the milestones and not ask); `awaiting_approval` past `SEQ` → the run re-planned
    (usually a lost worker resumed from the default branch): before steering the new gate with
    `uzi-watcher`, check `uzi run recovery RUN` for committed work worth landing instead; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,

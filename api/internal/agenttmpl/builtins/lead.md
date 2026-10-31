@@ -50,7 +50,7 @@ already-authorized issue-specific landing fallback, go in a "Landing
 obligations" plan section, not a milestone. Live, hosted or human-judgment
 acceptance goes in an "Owner acceptance" plan section, not a milestone, naming
 the remaining verification, why the worker cannot perform it, the actor and
-actionable steps; with such items, declare `non_closing` with a reason naming
+actionable steps; with such items on an issue run, declare `non_closing` with a reason naming
 them as pending and not verified, and list each as a `deferred` `pr_summary`
 scope note. Coding, docs, tests, mandatory gates, security and review remain
 worker obligations and never move to either section, even if the lander
