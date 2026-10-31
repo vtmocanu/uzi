@@ -861,11 +861,12 @@ test("a run's lifecycle is read before its holds", async () => {
   } finally { await d.close(); }
 });
 test("a path also named by a group refused for its run ID is never a candidate", async () => {
+  for (const order of [["bad id!", "run0"], ["run0", "bad id!"]]) {
   const d = await daemon();
   try {
     const { options } = setup(); options.dockerHost = d.host;
     options.git.discoverEpochRetainedSources = async () => ({
-      groups: ["bad id!", "run0"].map(runId => ({ barePath: "/bare", selector: { runId, generation: 1, attempt: "attempt" }, paths: ["/tree/shared"] })),
+      groups: order.map(runId => ({ barePath: "/bare", selector: { runId, generation: 1, attempt: "attempt" }, paths: ["/tree/shared"] })),
       inventoryComplete: true, physicalPaths: 1, overflow: 0, overflowExact: true, unreadable: 0,
     });
     options.git.inspectRetainedSources = async opts => {
@@ -874,8 +875,36 @@ test("a path also named by a group refused for its run ID is never a candidate",
     };
     const result = (await runPodEpochShadow(options))!;
     assert.equal(result.verdict, "partial"); assert.equal(result.would_delete, 0); assert.equal(result.would_settle, 0);
-    assert.equal(result.kept, 1); assert.deepEqual(result.list, []);
+    assert.equal(result.kept, 1, order.join()); assert.deepEqual(result.list, [], order.join());
   } finally { await d.close(); }
+  }
+});
+test("one run observing one path with different bytes or basis demotes it", async () => {
+  for (const tweak of [
+    (x: RetainedSourceEvidence) => { x.sources[0]!.allocatedBytes = 999; x.allocatedBytes = 999; },
+    (x: RetainedSourceEvidence) => {
+      x.disposition = { kind: "refused", consumers: [] };
+      x.epochSettlement = { basis: "strict_plain", disposition: { kind: "local_discard" } };
+    },
+  ]) {
+    const d = await daemon();
+    try {
+      const { options } = setup(); options.dockerHost = d.host;
+      options.git.discoverEpochRetainedSources = async () => ({
+        groups: ["/bare-a", "/bare-b"].map(barePath => ({ barePath, selector: { runId: "run0", generation: 1, attempt: "attempt" }, paths: ["/tree/shared"] })),
+        inventoryComplete: true, physicalPaths: 1, overflow: 0, overflowExact: true, unreadable: 0,
+      });
+      options.git.inspectRetainedSources = async opts => {
+        opts.beforeTree!("/tree/shared");
+        const s = candidateSource("/tree/shared", "run0", opts.barePath === "/bare-b" ? tweak : () => {});
+        s.barePath = opts.barePath!;
+        return { sources: [s], partial: false, unreadable: 0, sampledAt: "" };
+      };
+      const result = (await runPodEpochShadow(options))!;
+      assert.equal(result.examined, 1); assert.equal(result.would_delete, 0);
+      assert.equal(result.kept, 1); assert.deepEqual(result.list, []);
+    } finally { await d.close(); }
+  }
 });
 test("one path observed twice is never double counted", async () => {
   const cases: Array<[string, Array<(s: RetainedSourceEvidence) => void>]> = [

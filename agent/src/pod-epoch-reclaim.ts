@@ -132,7 +132,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
   const decide = (outcome: Verdict["authority"]["result"], reason: string) => {
     result.authority = { result: outcome, reason }; decided = true;
   };
-  // One candidate per clone path. A path observed again with a different presence or run, by any
+  // One candidate per clone path. A path observed again with a different presence, run, basis or bytes, by any
   // inspected source in which it is not a candidate, or by a group refused for its run ID, is
   // demoted to kept and cannot be re-added.
   const candidates = new Map<string, Candidate>();
@@ -341,7 +341,8 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
               candidate = { ...entry, bytes: 0, presence: "missing", basis };
           }
           const previous = candidates.get(part.clonePath);
-          if (!candidate || refused.has(part.clonePath) || (previous && (previous.presence !== candidate.presence || previous.run_id !== candidate.run_id))) {
+          if (!candidate || refused.has(part.clonePath) || (previous && (previous.presence !== candidate.presence || previous.run_id !== candidate.run_id ||
+              previous.basis !== candidate.basis || previous.bytes !== candidate.bytes))) {
             candidates.delete(part.clonePath); refused.add(part.clonePath);
           } else candidates.set(part.clonePath, candidate);
         }
