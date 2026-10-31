@@ -121,6 +121,37 @@ func TestSettingsGetShowsCodexMode(t *testing.T) {
 	}
 }
 
+// TestRailCodexReasonLineCountsAgainstSiblingBudget pins that the Codex label AND its reason
+// line both count toward the row budget the sibling Claude entries are fitted into. Two
+// readable accounts make the shown one a 3-row entry (label, 5h, 7d); a budget of header + 2
+// (Codex label, reason) + 2 is one row short of it, so the sibling must be dropped whole.
+func TestRailCodexReasonLineCountsAgainstSiblingBudget(t *testing.T) {
+	label := "old-login"
+	id := "alias-id"
+	ok := apitypes.RateLimitDTO{Status: "ok"}
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "codex-run")
+	m.width, m.height = 100, 40
+	m.rateLimits = []apitypes.TokenRateLimitDTO{
+		{SecretID: "claude-shown", Label: "claude-shown", IsDefault: true, Limits: ok},
+		{SecretID: "claude-hidden", Label: "claude-hidden", Limits: ok},
+	}
+	m = applyDetail(m, apitypes.RunDTO{ID: "codex-run", Harness: "codex", Status: "completed",
+		CodexSecretID: &id, CodexSecretLabel: &label, CodexSelectReason: sptr("best_of_pool")}, nil)
+
+	const budget = 1 + 2 + 2 // header + Codex label and reason + one row short of the 3-row sibling
+	usedRows := m.transcriptViewport() - 1 - budget
+	got := stripANSI(m.railRateMeters(time.Now(), usedRows))
+	if got != "ACCOUNTS\nold-login\nbest of pool" {
+		t.Errorf("one row short of the sibling: rail = %q, want the Codex label and reason with no half-drawn sibling", got)
+	}
+
+	// One more row and the whole sibling fits, so the budget above is the boundary, not a floor.
+	full := stripANSI(m.railRateMeters(time.Now(), usedRows-1))
+	if lines := strings.Split(full, "\n"); len(lines) != 6 || !strings.Contains(full, "claude-shown") || !strings.Contains(full, "7d") {
+		t.Errorf("exact fit: rail = %q, want the Codex rows then the complete sibling entry", full)
+	}
+}
+
 func TestRailCodexSnapshotShowsReasonTag(t *testing.T) {
 	id := "alias-id"
 	label := "old-login"

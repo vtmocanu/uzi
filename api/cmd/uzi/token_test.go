@@ -708,8 +708,11 @@ func TestTokenPoolDisabledCodexRefusedBeforeWrite(t *testing.T) {
 	fc := &uzicli.FakeClient{Secrets: []apitypes.SecretDTO{
 		{ID: "c1", Kind: "codex_auth", Label: "old", Enabled: false, DisabledAt: &disabled},
 	}}
-	_, _, code := runCLI(t, fakeEnv(fc), "token", "pool", "old", "--on")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "token", "pool", "old", "--on")
 	if code != uzicli.ExitConflict || fc.CodexPoolCalls != 0 {
 		t.Fatalf("exit = %d calls = %d, want conflict and no write", code, fc.CodexPoolCalls)
+	}
+	if want := `login "old" is disabled; enable it in Settings before adding it to the pool`; !strings.Contains(errOut, want) {
+		t.Fatalf("stderr = %q, want it to contain %q", errOut, want)
 	}
 }
