@@ -69,14 +69,17 @@ RETURNING *;
 -- name: MarkPublicationParked :one
 -- The side-row half of a publication park: the wait clock starts at the first park and is never
 -- reset by a later one, the lifetime counters grow, and the hold reason is set only on an owner
--- hold (NULL for a timed retry). A handoff, when supplied, replaces the stored one. @now comes
--- from Go so the clock is deterministic.
+-- hold (NULL for a timed retry). Each park sets the handoff to the newly verified value or NULL
+-- (never keeps an older one, which could let a peer claim from a stale tip), and the custodian to
+-- the reporting worker, which holds the captured source. @now comes from Go so the clock is
+-- deterministic.
 UPDATE run_publication_resume SET
     wait_started_at = COALESCE(wait_started_at, @now::timestamptz),
     first_wait_at   = COALESCE(first_wait_at, @now::timestamptz),
     park_total      = park_total + 1,
     hold_reason     = sqlc.narg('hold_reason')::text,
-    handoff         = COALESCE(sqlc.narg('handoff')::json, handoff)
+    handoff         = sqlc.narg('handoff')::json,
+    worker_id       = @worker_id::uuid
 WHERE run_id = @run_id AND state = 'active'
 RETURNING *;
 
@@ -131,15 +134,26 @@ WITH candidates AS MATERIALIZED (
     SELECT r.id FROM runs r
     JOIN run_publication_resume p ON p.run_id = r.id AND p.state = 'active' AND p.handoff IS NULL
     WHERE r.status = 'queued'
-      AND NOT EXISTS (
-          SELECT 1 FROM workers w
-          WHERE w.id = r.worker_id AND w.user_id = r.user_id
-            AND 'publication_resume_v1' = ANY(w.protocol_capabilities)
-            AND ((w.last_heartbeat_at IS NOT NULL AND w.last_heartbeat_at >= @heartbeat_cutoff::timestamptz)
-                 OR (r.stale_requeue_generation = r.claim_generation
-                     AND COALESCE(r.status_since > sqlc.narg('stale_requeue_cutoff')::timestamptz, false))
-                 OR ((w.draining_since IS NOT NULL OR w.maintenance_phase IN ('requested','ready','stopping','recycling') OR w.maintenance_fenced)
-                     AND r.updated_at >= @affinity_cutoff::timestamptz)))
+      AND (
+          -- The custodian is the side row's worker_id (runs.worker_id is cleared by the resume
+          -- writers); a NULL one is held.
+          p.worker_id IS NULL
+          OR NOT EXISTS (
+              SELECT 1 FROM workers w
+              WHERE w.id = p.worker_id AND w.user_id = r.user_id
+                AND 'publication_resume_v1' = ANY(w.protocol_capabilities)
+                AND ((w.last_heartbeat_at IS NOT NULL AND w.last_heartbeat_at >= @heartbeat_cutoff::timestamptz)
+                     OR (r.stale_requeue_generation = r.claim_generation
+                         AND COALESCE(r.status_since > sqlc.narg('stale_requeue_cutoff')::timestamptz, false))
+                     OR ((w.draining_since IS NOT NULL OR w.maintenance_phase IN ('requested','ready','stopping','recycling') OR w.maintenance_fenced)
+                         AND r.updated_at >= @affinity_cutoff::timestamptz)))
+          -- The affinity ceiling is its own conjunct: a draining or fenced custodian past it is
+          -- held whatever its heartbeat says, because ClaimRun refuses a fenced claimant.
+          OR EXISTS (
+              SELECT 1 FROM workers w
+              WHERE w.id = p.worker_id AND w.user_id = r.user_id
+                AND (w.draining_since IS NOT NULL OR w.maintenance_phase IN ('requested','ready','stopping','recycling') OR w.maintenance_fenced)
+                AND r.updated_at < @affinity_cutoff::timestamptz))
     ORDER BY r.id
     FOR UPDATE OF r SKIP LOCKED
 ), held AS (

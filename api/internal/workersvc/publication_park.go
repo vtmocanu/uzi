@@ -133,7 +133,7 @@ func (s *Service) parkPublicationForgeUnreachable(ctx context.Context, tx pgx.Tx
 		return store.Run{}, 0, err
 	}
 	if _, err := qtx.MarkPublicationParked(ctx, store.MarkPublicationParkedParams{
-		Now: pgconv.Time(now), HoldReason: holdReason, Handoff: publicationHandoff(run, req), RunID: run.ID,
+		Now: pgconv.Time(now), HoldReason: holdReason, Handoff: publicationHandoff(run, req), RunID: run.ID, WorkerID: wkr.ID,
 	}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return run, 0, ErrForgeParkCustodyUnsettled
