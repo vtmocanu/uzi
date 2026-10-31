@@ -187,6 +187,7 @@ uzi whoami
 uzi settings
 uzi settings get
 uzi settings reserve
+uzi settings codex-mode default|auto
 uzi context list
 uzi context current
 uzi context use <name>
@@ -265,7 +266,7 @@ uzi worker set-token <worker-id> <label>
 uzi worker set-token <worker-id> --default
 uzi worker set-token <worker-id> --auto
 uzi token list
-uzi token pool <label> --on|--off
+uzi token pool <label> [--kind anthropic|codex] --on|--off
 uzi token test <label> [--kind anthropic|codex|openai-key]
 uzi rate-limits [--provider claude|codex]
 uzi memory list
@@ -357,6 +358,13 @@ uzi version
   The table output ends with a `Weekly usage reserve:` line (`off`, or the threshold
   and whether running runs are paused); `--json` carries `weekly_reserve_pct` (null =
   off) and `weekly_reserve_pause_running`.
+- `uzi settings codex-mode default|auto` — choose how a NEW Codex run picks its login:
+  `default` binds your default Codex login (today's behaviour), `auto` picks, at run
+  creation, the pooled login with the most limit headroom (pool logins with `uzi token
+  pool <label> --kind codex --on`; with nothing pooled, auto falls back to the default).
+  `uzi settings get` shows it as `Codex account mode:`; `uzi run get` explains the pick on
+  the `CODEX_ALIAS` row. When `auto` cannot bind any pooled login the run start is refused
+  with a 422 whose reason is `codex_pool_unavailable`.
 - `uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]` — set
   your weekly usage reserve, the 7-day utilization percent at which uzi stops starting
   runs on your subscription (and, with pausing on, pauses running runs at their next
@@ -1751,6 +1759,10 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   deleting a token are web-only, because they mint or replace a credential and must
   not be reachable from a CLI token (PRD #104 D8, the same reason `uzi worker` has no
   `create`). Use the labels this lists as the argument to `uzi worker set-token`.
+- `uzi token pool <label> [--kind anthropic|codex] --on|--off` — also pools a Codex
+  login (`codex_auth`) for `uzi settings codex-mode auto`. A label held by both an
+  Anthropic token and a Codex login needs `--kind`; `openai_api_key` cannot be pooled.
+  The rest of this entry describes the Anthropic pool.
 - `uzi token pool <label> --on|--off` — opt one of your tokens into or out of the
   pool an `auto` worker may spend from (PRD #111). It is the ONE token write the CLI
   can reach, and it has its own narrow route for exactly that reason: it mints

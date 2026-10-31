@@ -110,6 +110,16 @@ type Client interface {
 	// caller's OWN tokens the pool may spend. An unknown label is a usage error
 	// resolved client-side (exit 3); an unknown id is a 404 (exit 4).
 	SetTokenAutoEligible(ctx context.Context, id string, eligible bool) (apitypes.SecretDTO, error)
+	// SetCodexAutoEligible is SetTokenAutoEligible's Codex sibling (issue #3719): PATCH
+	// /api/me/secrets/codex_auth/{id}/auto-eligible {auto_eligible}, RequireUser. It opts
+	// one of the caller's codex_auth aliases into or out of the Codex auto-selection pool.
+	// A foreign id or an id of another kind is a 404 (exit 4); pooling a disabled alias is
+	// a 409 (exit 5).
+	SetCodexAutoEligible(ctx context.Context, id string, eligible bool) (apitypes.SecretDTO, error)
+	// SetCodexAccountMode sets the caller's Codex account mode (issue #3719): PUT
+	// /api/me/codex-account-mode {codex_account_mode: "default"|"auto"}, RequireUser.
+	// Returns the stored mode.
+	SetCodexAccountMode(ctx context.Context, mode string) (string, error)
 	// SetRunPriority expedites (expedite=true → priority bumped to the front) or clears
 	// (expedite=false → manual override removed, back to the kind default) ONE queued run:
 	// PATCH /api/runs/{id}/priority (PRD #320 D6/D7), RequireUser so a CLI token can reach
@@ -1120,6 +1130,12 @@ const ReasonOutcomePendingConfirmationRequired = "outcome_pending_confirmation_r
 // carried on *ExitError.CurrentGateRevision.
 const ReasonGateRevisionMismatch = "gate_revision_mismatch"
 
+// ReasonCodexPoolUnavailable is the typed 422 reason (issue #3719) beside the stable
+// no_credential_for_harness code when a run start or MR rework is refused because the user's
+// Codex account mode is auto and no pooled account can be bound. The CLI names it in the
+// message so the cause is visible without --json.
+const ReasonCodexPoolUnavailable = "codex_pool_unavailable"
+
 // Typed owner-reset refusals never authorize rebinding or retrying consent.
 const (
 	ReasonMilestoneReconciliationRequired = "milestone_reconciliation_required"
@@ -1182,6 +1198,9 @@ func buildStatusError(status int, msg, reason, retryAfter string) *ExitError {
 		// so it exits 2 and the message names the offending value.
 		if msg == "" {
 			msg = "unprocessable request"
+		}
+		if reason == ReasonCodexPoolUnavailable {
+			msg += " (reason: " + reason + ")"
 		}
 		return Exitf(ExitUsage, "%s", msg)
 	case status == http.StatusUnauthorized:

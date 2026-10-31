@@ -22,5 +22,6 @@
   "judge_models": null,
   "effort_settings": null,
   "weekly_reserve_pct": null,
-  "weekly_reserve_pause_running": false
+  "weekly_reserve_pause_running": false,
+  "codex_account_mode": ""
 }

@@ -82,4 +82,8 @@ type UserSettingsDTO struct {
 	// written through PUT /api/me/settings; PUT /api/me/usage-reserve owns the write.
 	WeeklyReservePct          *int `json:"weekly_reserve_pct"`
 	WeeklyReservePauseRunning bool `json:"weekly_reserve_pause_running"`
+	// CodexAccountMode is the user's Codex account mode (issue #3719): "default" binds the
+	// default alias, "auto" picks among the aliases the user pooled. Read-only here:
+	// PUT /api/me/codex-account-mode owns the write.
+	CodexAccountMode string `json:"codex_account_mode"`
 }

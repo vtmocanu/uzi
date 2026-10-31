@@ -913,6 +913,13 @@ type RunDTO struct {
 	// The label is USER-SUPPLIED text, so terminal consumers must sanitize it as they
 	// do AnthropicSecretLabel.
 	CodexSecretLabel *string `json:"codex_secret_label"`
+	// CodexSelectReason is why the run's Codex alias was chosen (issue #3719): one of the
+	// server-generated codexselect.Reason values (default, pool_empty, auto, best_of_pool,
+	// pool_stale, pool_exhausted). A CLOSED SERVER ENUM describing the owner's own
+	// configuration, so it rides under the same owner-or-admin scoping as CodexSecretLabel.
+	// Null for a run created before auto-selection and for a non-Codex run. Clients must
+	// render an UNRECOGNISED value honestly: the API deploys separately from its clients.
+	CodexSelectReason *string `json:"codex_select_reason"`
 	// RecoveryRetryNotBefore is the earliest scheduled recovery promotion time, not
 	// a promise of immediate execution. It is separate from the usage-limit RetryNotBefore.
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
@@ -1769,6 +1776,13 @@ type RunSummaryItemDTO struct {
 	// The label is USER-SUPPLIED text, so terminal consumers must sanitize it as they
 	// do AnthropicSecretLabel.
 	CodexSecretLabel *string `json:"codex_secret_label"`
+	// CodexSelectReason is why the run's Codex alias was chosen (issue #3719): one of the
+	// server-generated codexselect.Reason values (default, pool_empty, auto, best_of_pool,
+	// pool_stale, pool_exhausted). A CLOSED SERVER ENUM describing the owner's own
+	// configuration, so it rides under the same owner-or-admin scoping as CodexSecretLabel.
+	// Null for a run created before auto-selection and for a non-Codex run. Clients must
+	// render an UNRECOGNISED value honestly: the API deploys separately from its clients.
+	CodexSelectReason *string `json:"codex_select_reason"`
 	// RecoveryRetryNotBefore is the earliest scheduled recovery promotion time, not
 	// a promise of immediate execution. It is separate from the usage-limit RetryNotBefore.
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
@@ -2050,6 +2064,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		CodexAccountAction:            item.CodexAccountAction,
 		CodexSecretID:                 item.CodexSecretID,
 		CodexSecretLabel:              item.CodexSecretLabel,
+		CodexSelectReason:             item.CodexSelectReason,
 		RecoveryRetryNotBefore:        item.RecoveryRetryNotBefore,
 		RecoveryRetryNotBeforePresent: item.RecoveryRetryNotBeforePresent,
 		ForgeParkCount:                item.ForgeParkCount,
@@ -2226,6 +2241,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			CodexAccountAction:            s.CodexAccountAction,
 			CodexSecretID:                 s.CodexSecretID,
 			CodexSecretLabel:              s.CodexSecretLabel,
+			CodexSelectReason:             s.CodexSelectReason,
 			RecoveryRetryNotBefore:        s.RecoveryRetryNotBefore,
 			RecoveryRetryNotBeforePresent: s.RecoveryRetryNotBeforePresent,
 			ForgeParkCount:                s.ForgeParkCount,

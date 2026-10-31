@@ -251,7 +251,7 @@ var runDTOKeys = []string{
 	// PRD #1590 D6: the derived owner action for a codex_account_unavailable hold (null otherwise).
 	"codex_account_action",
 	// Issue #1730: the run's bound alias id and its independent snapshotted label.
-	"codex_secret_id", "codex_secret_label",
+	"codex_secret_id", "codex_secret_label", "codex_select_reason",
 	// PRD #841 M1: the per-run MR-rework override, tri-state *bool (null = inherit the
 	// owner default, resolved live). NOT omitempty — always on the wire, so the web can
 	// tell "no per-run opinion" (null) from an explicit true/false and render the
@@ -1187,7 +1187,9 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		// PRD #3247: the read-only resolved ordinary effort cells.
 		"effort_settings",
 		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).
-		"weekly_reserve_pct", "weekly_reserve_pause_running")
+		"weekly_reserve_pct", "weekly_reserve_pause_running",
+		// Issue #3719: the user's Codex account mode (default|auto).
+		"codex_account_mode")
 }
 
 func TestModelSettingCellDTOTags(t *testing.T) {

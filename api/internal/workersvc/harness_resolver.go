@@ -678,8 +678,9 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 			// quarantine or reauth writes, so a failure here is an expected path for those; the
 			// alias is dropped and the pool re-selected. The fence reads coord_state and reauth
 			// unlocked, so a quarantine or reauth committed between the fence and this commit can
-			// still bind; claim-time admission (codex_operation_admission.go refuses a quarantined
-			// account) is the backstop.
+			// still bind. Claim-time admission (codex_operation_admission.go refuses a quarantined
+			// account) backs up quarantine ONLY; a reauth flagged between the fence and the commit
+			// surfaces at the run's first token use.
 			pick, err = s.fenceCodexPoolAlias(ctx, qtx, userID, pick)
 			if err != nil {
 				return store.Run{}, resolvedHarness{}, err

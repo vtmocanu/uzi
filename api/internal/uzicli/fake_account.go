@@ -47,6 +47,25 @@ func (f *FakeClient) SetTokenAutoEligible(_ context.Context, id string, eligible
 	return f.PoolSecret, nil
 }
 
+func (f *FakeClient) SetCodexAutoEligible(_ context.Context, id string, eligible bool) (apitypes.SecretDTO, error) {
+	f.LastCodexPoolSecretID = id
+	f.LastCodexPoolValue = eligible
+	f.CodexPoolCalls++
+	if f.Err != nil {
+		return apitypes.SecretDTO{}, f.Err
+	}
+	return f.CodexPoolSecret, nil
+}
+
+func (f *FakeClient) SetCodexAccountMode(_ context.Context, mode string) (string, error) {
+	f.LastCodexMode = mode
+	f.CodexModeCalls++
+	if f.Err != nil {
+		return "", f.Err
+	}
+	return mode, nil
+}
+
 func (f *FakeClient) SelfUsage(context.Context) (apitypes.SelfUsageDTO, error) {
 	if f.Err != nil {
 		return apitypes.SelfUsageDTO{}, f.Err

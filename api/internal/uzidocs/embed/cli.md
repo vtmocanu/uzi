@@ -233,6 +233,7 @@ uzi admin egress-profile list | show <name>
 uzi admin maintenance status [--json]
 uzi settings get
 uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]
+uzi settings codex-mode default|auto
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -2630,6 +2631,7 @@ uzi token list                                 # labels, default flag, pool opt-
 uzi token test <label> [--kind anthropic|codex|openai-key]
 uzi token pool console-key --on                # add it to the auto-selection pool
 uzi token pool console-key --off               # take it back out
+uzi token pool work-codex --kind codex --on    # pool a Codex login (see settings codex-mode)
 uzi worker set-token <worker-id> console-key   # bind a worker to a named token
 uzi worker set-token <worker-id> --default     # clear the binding
 uzi worker set-token <worker-id> --auto        # pick per claim, from the pool
@@ -3038,6 +3040,30 @@ on)` or `Weekly usage reserve: off`; `--json` returns
 
 `uzi settings get` ends with the same `Weekly usage reserve:` line (after the
 `Now summary:` line), and its `--json` carries both fields.
+
+### Codex account mode
+
+```sh
+uzi settings codex-mode auto
+uzi settings codex-mode default
+uzi token pool work-codex --kind codex --on
+```
+
+`uzi settings codex-mode default|auto` sets how a new Codex run chooses its
+login (`PUT /api/me/codex-account-mode`, which accepts a `uzc_` Bearer token).
+`default` binds your default Codex login. `auto` picks, at run creation, the
+pooled Codex login with the most limit headroom; you opt logins into the pool
+per login with `uzi token pool <label> --kind codex --on` (the pool is empty
+until you do, and `auto` then falls back to your default). A label held by both
+an Anthropic token and a Codex login needs `--kind anthropic|codex`; an
+`openai_api_key` cannot be pooled. `uzi token list` shows the Codex pool state in
+the `POOL` column. `uzi run get` explains the pick on the `CODEX_ALIAS` row, for
+example `work-codex - auto (most limit headroom)`, or `not recorded` for a run
+created before auto-selection. When `auto` has pooled logins but none can be
+bound, starting a run or an MR rework is refused with a 422 carrying
+`reason: codex_pool_unavailable`; link, re-authenticate or pool a Codex login in
+Settings. `uzi settings get` shows `Codex account mode:` after the reserve line,
+and `--json` carries `codex_account_mode`.
 
 On a run the reserve touches, `uzi run get` shows:
 

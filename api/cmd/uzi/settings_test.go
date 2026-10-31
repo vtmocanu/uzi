@@ -27,8 +27,8 @@ func TestSettingsGetTableAndJSON(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 5 || lines[3] != "Now summary: on (default)" || lines[4] != "Weekly usage reserve: off" {
-		t.Fatalf("expected header, two cells, the Now summary line and the reserve line: %s", out)
+	if len(lines) != 6 || lines[3] != "Now summary: on (default)" || lines[4] != "Weekly usage reserve: off" || lines[5] != "Codex account mode: default" {
+		t.Fatalf("expected header, two cells, the Now summary, reserve and Codex mode lines: %s", out)
 	}
 	want := []string{
 		"plan claude active Default SDK/account default SDK/account default worker default Pin · high high pin",
@@ -74,7 +74,7 @@ func TestSettingsGetFourIndependentCells(t *testing.T) {
 		"code claude inactive Default SDK/account default SDK/account default worker default Pin · low low pin",
 		"code codex active Pin · code-only code-worker code-only pin Default medium worker default",
 	}
-	if len(lines) != 7 || lines[5] != "Now summary: on (default)" {
+	if len(lines) != 8 || lines[5] != "Now summary: on (default)" {
 		t.Fatalf("four cells: %s", out)
 	}
 	for i, row := range want {
@@ -99,7 +99,7 @@ func TestSettingsGetFourIndependentCells(t *testing.T) {
 	}
 	fc.Settings.CrossCheckPins = append(fc.Settings.CrossCheckPins, settings.CrossCheckPins[2:]...)
 	out, _, code = runCLI(t, fakeEnv(fc), "settings", "get")
-	if code != 0 || strings.Count(out, "\n") != 5 {
+	if code != 0 || strings.Count(out, "\n") != 6 {
 		t.Fatalf("input bound: %s", out)
 	}
 }
@@ -117,7 +117,7 @@ func TestSettingsGetClaudePinAndDefaultModel(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 5 {
+	if len(lines) != 6 {
 		t.Fatalf("expected two cells: %s", out)
 	}
 	for i, want := range []string{
@@ -145,7 +145,7 @@ func TestSettingsGetHostileTextAndBounds(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
-	if strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Count(out, "\n") != 4 ||
+	if strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Count(out, "\n") != 5 ||
 		len(out) > 3000 || !strings.Contains(out, "unknown") || strings.Contains(out, strings.Repeat("x", 201)) {
 		t.Fatalf("unsafe or unbounded output: %q", out)
 	}
@@ -190,8 +190,8 @@ func TestSettingsGetTokenGET(t *testing.T) {
 func TestSettingsReadOnlyAndErrors(t *testing.T) {
 	root := newRootCmd(fakeEnv(&uzicli.FakeClient{}))
 	cmd := findCmd(root, "settings")
-	if cmd == nil || len(cmd.Commands()) != 2 || findCmd(cmd, "get") == nil || findCmd(cmd, "reserve") == nil {
-		t.Fatal("settings must expose only get and reserve")
+	if cmd == nil || len(cmd.Commands()) != 3 || findCmd(cmd, "get") == nil || findCmd(cmd, "reserve") == nil || findCmd(cmd, "codex-mode") == nil {
+		t.Fatal("settings must expose only get, reserve and codex-mode")
 	}
 	for _, args := range [][]string{{"settings", "set"}, {"settings", "reset"}, {"settings", "get", "extra"}} {
 		if _, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), args...); code == 0 {

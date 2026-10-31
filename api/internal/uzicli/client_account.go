@@ -80,6 +80,32 @@ func (c *HTTPClient) SetTokenAutoEligible(ctx context.Context, id string, eligib
 	return env.Secret, nil
 }
 
+func (c *HTTPClient) SetCodexAutoEligible(ctx context.Context, id string, eligible bool) (apitypes.SecretDTO, error) {
+	body := struct {
+		AutoEligible bool `json:"auto_eligible"`
+	}{AutoEligible: eligible}
+	var resp struct {
+		Secret apitypes.SecretDTO `json:"secret"`
+	}
+	if err := c.patch(ctx, "/api/me/secrets/codex_auth/"+url.PathEscape(id)+"/auto-eligible", body, &resp); err != nil {
+		return apitypes.SecretDTO{}, err
+	}
+	return resp.Secret, nil
+}
+
+func (c *HTTPClient) SetCodexAccountMode(ctx context.Context, mode string) (string, error) {
+	body := struct {
+		Mode string `json:"codex_account_mode"`
+	}{Mode: mode}
+	var resp struct {
+		Mode string `json:"codex_account_mode"`
+	}
+	if err := c.put(ctx, "/api/me/codex-account-mode", body, &resp); err != nil {
+		return "", err
+	}
+	return resp.Mode, nil
+}
+
 func (c *HTTPClient) SelfUsage(ctx context.Context) (apitypes.SelfUsageDTO, error) {
 	var out apitypes.SelfUsageDTO
 	if err := c.get(ctx, "/api/usage", &out); err != nil {

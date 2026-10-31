@@ -400,11 +400,7 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 		rows = append(rows, []string{"ANTHROPIC_TOKEN", credentialCell(r)})
 	}
 	if r.Harness == "codex" && r.CodexSecretLabel != nil && *r.CodexSecretLabel != "" {
-		label := cellText(*r.CodexSecretLabel)
-		if r.CodexSecretID == nil {
-			label += " (deleted)"
-		}
-		rows = append(rows, []string{"CODEX_ALIAS", label})
+		rows = append(rows, []string{"CODEX_ALIAS", codexAliasCell(r)})
 	}
 	// The per-run token CHOICE and any in-flight switch (PRD #1247 M8), DISTINCT from the
 	// ANTHROPIC_TOKEN row above: that names the token the run SPENT, this names what the
