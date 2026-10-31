@@ -155,6 +155,83 @@ for (const mode of ["BOOT", "RUNTIME"] as const) {
     }
   });
 
+  it(`R1 ${mode} withholds the last slot until the real descriptor close joins`, async t => {
+    const { subject, file } = await fixture(t);
+    const tokens = occupy(subject, 1023);
+    const entered = deferred();
+    const release = deferred();
+    const open = fs.open.bind(fs);
+    t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+      const handle = await open(...args);
+      if (String(args[0]) === file) {
+        const close = handle.close.bind(handle);
+        handle.close = async () => {
+          entered.resolve();
+          await release.promise;
+          await close();
+        };
+      }
+      return handle;
+    });
+    const clock = t.mock.method(Date, "now", () => 1000);
+    const joined = scan(subject, mode).then(value => ({ value, error: undefined }),
+      error => ({ value: undefined, error }));
+    let competitor: symbol | undefined;
+    try {
+      await ready(entered.promise);
+      competitor = subject.reservePolicyFlight(runC, 1);
+      assert.equal(competitor, undefined, "enrollment owns slot 1024 until physical close joins");
+      assert.ok(subject.listPendingTerminals().some(p =>
+        p.run_id === runB && p.outcome_kind === "unknown"));
+      release.resolve();
+      const result = await joined;
+      assert.equal(result.error, undefined);
+      assert.equal(result.value, 1);
+      competitor = subject.reservePolicyFlight(runC, 1);
+      assert.ok(competitor, "joined ordinary authentication makes the last slot reusable");
+      assert.equal(subject.reservePolicyFlight(runC, 2), undefined);
+    } finally {
+      release.resolve();
+      await joined; // Join real I/O even if the pre-close capacity assertion fails.
+      clock.mock.restore();
+      if (competitor) subject.releasePolicyFlight(competitor);
+      for (const token of tokens) subject.releasePolicyFlight(token);
+      await subject.closeTerminalObservationScan();
+    }
+  });
+
+  it(`R1 ${mode} keeps enrollment conservative when descriptor close rejects`, async t => {
+    const { subject, file } = await fixture(t);
+    const tokens = occupy(subject, 1023);
+    const open = fs.open.bind(fs);
+    let closes = 0;
+    t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+      const handle = await open(...args);
+      if (String(args[0]) === file) {
+        const close = handle.close.bind(handle);
+        handle.close = async () => {
+          closes++;
+          await close(); // Join the real descriptor even on the injected failure.
+          throw new Error("injected close failure");
+        };
+      }
+      return handle;
+    });
+    let competitor: symbol | undefined;
+    try {
+      assert.equal(await scan(subject, mode), 0);
+      assert.equal(closes, 1, "failed close is not retried by finally");
+      assert.ok(subject.listPendingTerminals().some(p =>
+        p.run_id === runB && p.outcome_kind === "unknown"));
+      competitor = subject.reservePolicyFlight(runC, 1);
+      assert.equal(competitor, undefined, "close rejection cannot release enrollment capacity");
+    } finally {
+      if (competitor) subject.releasePolicyFlight(competitor);
+      for (const token of tokens) subject.releasePolicyFlight(token);
+      await subject.closeTerminalObservationScan();
+    }
+  });
+
   it(`R1 ${mode} retains actually enrolled unknown B across disappearance and cursor resets`, async t => {
     const { subject, file } = await fixture(t);
     await fs.writeFile(file, "unknown");

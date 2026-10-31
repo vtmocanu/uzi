@@ -3187,7 +3187,15 @@ export class Outbox {
         return result;
       }
       if (!coerceTerminalRecord(obj, runId, generation)) return result;
+      // Join the descriptor before publishing authentication or releasing the
+      // budgetDeferred identity. Selection can change while close is pending;
+      // the metadata and selected identity checks below must use the live slot.
+      const closing = fh;
+      fh = undefined;
+      await closing.close();
+      checkProofBudget(budget);
       const candidate = this.runs.get(runId)?.terminals.get(generation);
+      if (candidate !== initial) { observation.kind = "unreadable"; return result; }
       if (candidate?.fileName === fileName && candidate.capturePending) {
         // The identity is selected, but its owned payload has not been captured yet.
         observation.kind = "unreadable";
