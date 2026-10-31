@@ -1,6 +1,6 @@
 # PRD #3721: Plan owner-only acceptance outside the milestones, so runs stop asking at completion
 
-**Status**: Draft
+**Status**: Done (2026-10-31). Delivered: shared lead guidance on both harnesses, non-closing delivery tests, docs, issue-author guidance, watcher/lander skills, spec and ADR-1225 addendum. Landing obligation (not a milestone): full agent suite: exact-head PR CI, verified by the lander before merge.
 **Priority**: Normal
 **Revisits**:
 - #3090's planning guidance, which puts human or live acceptance in "a separate, final informative milestone". That milestone is what makes runs park at completion (below). #3090's other rules stay: ordinary answers never supply a deferral (#3089), worker obligations are never reclassified as acceptance, and unperformed checks are never described as done.

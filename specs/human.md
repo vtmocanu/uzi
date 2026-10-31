@@ -949,9 +949,20 @@ Mock at `prds/mockups/1167-lights-on-themes-mock.html`.
 Approved M5 prose. (AI-synced 2026-10-18). Mechanism and residual boundaries are recorded
 in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#addendum--non-closing-publication-and-pending-acceptance-2026-10-18-3090).
 
-- Plans isolate external acceptance in a final milestone; implementation,
-  docs, tests, mandatory gates, security and review remain worker obligations.
-  Formal owner partial records exact kept/deferred IDs and reason, including
+- Implementation, docs, tests, mandatory gates, security and review remain
+  worker obligations. (AI-synced 2026-10-31, #3721; [PRD](../prds/done/3721-owner-acceptance-outside-milestones.md)):
+  - New, unfrozen plans put PR/merge-environment checks (e.g. exact-head PR CI)
+    in a "Landing obligations" section and live, hosted or human-judgment
+    acceptance in an "Owner acceptance" section; neither is a milestone.
+  - With owner-acceptance items the lead declares `non_closing` (reason names
+    the pending items) and lists them as `deferred` scope notes.
+  - Worker obligations never move to either section.
+  - Consequential classification doubt goes to `ask_user` only where it reaches
+    a human; on auto-approved runs the item stays a required milestone (owner
+    decision 2026-10-31).
+  - A frozen unmet milestone still needs the formal owner partial decision;
+    unfinished worker work still parks at completion. No server change.
+- Formal owner partial records exact kept/deferred IDs and reason, including
   ordinary coding scope. Answers, non-closing intent and auto-approval waive
   nothing. Pending entries remain unchecked with ID, frozen title, reason
   and not-delivered/not-verified status before owner closure; checkbox edits
