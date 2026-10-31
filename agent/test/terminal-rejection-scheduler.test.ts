@@ -57,22 +57,18 @@ async function rig(generations = [3], physical = run, generationWidth = 0) {
 
 test("long aliases exceeding page metadata budget report all 310 generations despite failed POST/custody", async (t) => {
   const r = await rig(Array.from({ length: 310 }, (_, i) => i + 1), run, 241);
-  // The production scanner retries a failed bounded pass. Keep its one-second
-  // proof deadline and allow at most three independent probe passes under load.
-  let probed = false;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const page = await r.outbox.scanTerminalObservationsPage();
-      assert.ok(page.observations.length <= 256);
-      assert.ok(Buffer.byteLength(JSON.stringify(page.observations)) > 128 * 1024);
-      probed = true;
-      break;
-    } catch (error) {
-      if (!(error instanceof Error) || error.message !== "outbox proof deadline") throw error;
-    }
+  // This probe exercises metadata batching with real I/O, independently of the
+  // cooperative elapsed-time budget in Outbox.scanTerminalObservationsPage.
+  const probeNow = Date.now();
+  const clock = t.mock.method(Date, "now", () => probeNow);
+  try {
+    const page = await r.outbox.scanTerminalObservationsPage();
+    assert.ok(page.observations.length <= 256);
+    assert.ok(Buffer.byteLength(JSON.stringify(page.observations)) > 128 * 1024);
+  } finally {
+    clock.mock.restore();
+    await r.outbox.closeTerminalObservationScan();
   }
-  assert.equal(probed, true, "a bounded scan demonstrates the metadata budget");
-  await r.outbox.closeTerminalObservationScan();
   const posted = new Set<number>();
   const reads = new Set<number>();
   let settle = false;
