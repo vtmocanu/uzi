@@ -510,9 +510,8 @@ func codexFake() *uzicli.FakeClient {
 }
 
 // TestTokenListShowsKindAndStatus pins the M3 human-table shape: a KIND column, a
-// STATUS column, and — critically — that POOL and ELIGIBLE read "-" (not applicable)
-// on a codex row rather than a misleading "false". There is no Codex auto-selection
-// pool server-side, so "false" would imply an opt-in a user could flip.
+// STATUS column, and that ELIGIBLE reads "-" (not applicable) on a codex row. POOL shows
+// a codex_auth row's real opt-in (issue #3719) and "-" for openai_api_key, which has no pool.
 func TestTokenListShowsKindAndStatus(t *testing.T) {
 	out, _, code := runCLI(t, fakeEnv(codexFake()), "token", "list")
 	if code != uzicli.ExitOK {
@@ -540,8 +539,9 @@ func TestTokenListShowsKindAndStatus(t *testing.T) {
 	}{
 		// The anthropic row keeps its POOL/ELIGIBLE facts and carries no status ("-").
 		{"default", "anthropic", "true", "?", "-"},
-		// The codex row shows its kind and link status; POOL and ELIGIBLE are N/A ("-").
-		{"my-codex", "codex", "-", "-", "linked"},
+		// The codex row shows its kind and link status; POOL is its (unpooled) opt-in and
+		// ELIGIBLE stays N/A ("-"): the Codex pool has no autoselect headroom answer.
+		{"my-codex", "codex", "false", "-", "linked"},
 		// The openai_api_key row is a codex-family credential too: kind alias + status.
 		{"my-openai", "openai-key", "-", "-", "static"},
 	} {
@@ -599,46 +599,117 @@ func TestTokenListJSONCarriesKindAndStatus(t *testing.T) {
 	}
 }
 
-// TestTokenPoolRejectsCodexLabel is the M3 kind guard: `uzi token pool <label>` must
-// refuse a codex-kind label and send NO write, because there is no Codex auto-selection
-// pool server-side. The error names the kind so the refusal is legible.
-func TestTokenPoolRejectsCodexLabel(t *testing.T) {
-	for _, tc := range []struct{ label, wantKind string }{
-		{"my-codex", "codex"},
-		{"my-openai", "openai-key"},
-	} {
-		t.Run(tc.label, func(t *testing.T) {
-			fc := codexFake()
-			_, errOut, code := runCLI(t, fakeEnv(fc), "token", "pool", tc.label, "--on")
-			if code != uzicli.ExitUsage {
-				t.Fatalf("exit = %d, want %d (usage) — pool is Anthropic-only", code, uzicli.ExitUsage)
-			}
-			if !strings.Contains(errOut, "Anthropic") || !strings.Contains(errOut, tc.wantKind) {
-				t.Errorf("error should say pool is Anthropic-only and name the %s kind, got: %q", tc.wantKind, errOut)
-			}
-			if fc.LastPoolSecretID != "" {
-				t.Errorf("a codex label still sent a write for %q", fc.LastPoolSecretID)
-			}
-		})
+// TestTokenPoolRefusesOpenAIKeyLabel: an openai_api_key has no pool, so `uzi token pool` refuses
+// it with a usage error naming the kind and sends NO write (issue #3719 keeps the M3 guard for
+// this kind), with and without --kind.
+func TestTokenPoolRefusesOpenAIKeyLabel(t *testing.T) {
+	fc := codexFake()
+	_, errOut, code := runCLI(t, fakeEnv(fc), "token", "pool", "my-openai", "--on")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	if !strings.Contains(errOut, "openai-key") || !strings.Contains(errOut, "only") {
+		t.Errorf("error should say pool excludes the openai-key kind, got: %q", errOut)
+	}
+	_, _, code = runCLI(t, fakeEnv(fc), "token", "pool", "my-openai", "--on", "--kind", "codex")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("--kind codex on an openai key: exit = %d, want %d", code, uzicli.ExitUsage)
+	}
+	if fc.LastPoolSecretID != "" || fc.CodexPoolCalls != 0 {
+		t.Errorf("an openai key still sent a write (anthropic %q, codex calls %d)", fc.LastPoolSecretID, fc.CodexPoolCalls)
 	}
 }
 
-// TestTokenPoolPrefersAnthropicOnLabelCollision pins that when a codex and an anthropic
-// secret share a label, pool resolves the ANTHROPIC one (the kind filter), rather than
-// cross-matching the codex row that happens to appear first.
-func TestTokenPoolPrefersAnthropicOnLabelCollision(t *testing.T) {
-	fc := &uzicli.FakeClient{
-		Secrets: []apitypes.SecretDTO{
-			// The codex row is listed FIRST, so an unfiltered match would pick it.
-			{ID: "c1", Kind: "codex_auth", Label: "shared", CodexStatus: "linked", CreatedAt: time.Unix(1784000000, 0)},
-			{ID: "s1", Kind: "anthropic_token", Label: "shared", AutoEligible: false, CreatedAt: time.Unix(1784000000, 0)},
-		},
-		PoolSecret: apitypes.SecretDTO{ID: "s1", Kind: "anthropic_token", Label: "shared", AutoEligible: true},
-	}
-	if _, _, code := runCLI(t, fakeEnv(fc), "token", "pool", "shared", "--on"); code != uzicli.ExitOK {
+// TestTokenPoolCodexLabel: a label held only by a codex_auth alias resolves to it WITHOUT
+// --kind and toggles the Codex route, never the Anthropic one.
+func TestTokenPoolCodexLabel(t *testing.T) {
+	fc := codexFake()
+	fc.CodexPoolSecret = apitypes.SecretDTO{ID: "c1", Kind: "codex_auth", Label: "my-codex", AutoEligible: true}
+	out, _, code := runCLI(t, fakeEnv(fc), "token", "pool", "my-codex", "--on")
+	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	if fc.LastPoolSecretID != "s1" {
-		t.Errorf("sent secret id %q, want s1 — the kind filter must resolve the anthropic row, not the codex one sharing the label", fc.LastPoolSecretID)
+	if fc.LastCodexPoolSecretID != "c1" || !fc.LastCodexPoolValue || fc.CodexPoolCalls != 1 {
+		t.Errorf("codex route got id %q value %v calls %d, want c1 true 1", fc.LastCodexPoolSecretID, fc.LastCodexPoolValue, fc.CodexPoolCalls)
+	}
+	if fc.LastPoolSecretID != "" {
+		t.Errorf("the Anthropic route was called for %q", fc.LastPoolSecretID)
+	}
+	if !strings.Contains(out, "my-codex") {
+		t.Errorf("output should name the alias: %q", out)
+	}
+}
+
+// sharedLabelFake holds a codex_auth and an anthropic_token with ONE label, the codex row
+// listed first so an unfiltered match would pick it.
+func sharedLabelFake() *uzicli.FakeClient {
+	return &uzicli.FakeClient{
+		Secrets: []apitypes.SecretDTO{
+			{ID: "c1", Kind: "codex_auth", Label: "shared", CodexStatus: "linked", CreatedAt: time.Unix(1784000000, 0)},
+			{ID: "s1", Kind: "anthropic_token", Label: "shared", CreatedAt: time.Unix(1784000000, 0)},
+		},
+		PoolSecret:      apitypes.SecretDTO{ID: "s1", Kind: "anthropic_token", Label: "shared", AutoEligible: true},
+		CodexPoolSecret: apitypes.SecretDTO{ID: "c1", Kind: "codex_auth", Label: "shared", AutoEligible: true},
+	}
+}
+
+// TestTokenPoolAmbiguousLabelNeedsKind: a label in BOTH poolable kinds is a usage error naming
+// --kind, and nothing is written.
+func TestTokenPoolAmbiguousLabelNeedsKind(t *testing.T) {
+	fc := sharedLabelFake()
+	_, errOut, code := runCLI(t, fakeEnv(fc), "token", "pool", "shared", "--on")
+	if code != uzicli.ExitUsage || !strings.Contains(errOut, "--kind") {
+		t.Fatalf("exit = %d err = %q, want usage naming --kind", code, errOut)
+	}
+	if fc.LastPoolSecretID != "" || fc.CodexPoolCalls != 0 {
+		t.Errorf("an ambiguous label still wrote (anthropic %q, codex calls %d)", fc.LastPoolSecretID, fc.CodexPoolCalls)
+	}
+}
+
+// TestTokenPoolKindResolvesWithinKind: --kind scopes the label to that kind alone, so the
+// same-label credential of the other kind is never toggled.
+func TestTokenPoolKindResolvesWithinKind(t *testing.T) {
+	fc := sharedLabelFake()
+	if _, _, code := runCLI(t, fakeEnv(fc), "token", "pool", "shared", "--on", "--kind", "codex"); code != uzicli.ExitOK {
+		t.Fatalf("--kind codex: exit = %d, want 0", code)
+	}
+	if fc.LastCodexPoolSecretID != "c1" || fc.LastPoolSecretID != "" {
+		t.Errorf("--kind codex sent codex %q anthropic %q; want c1 and no Anthropic write", fc.LastCodexPoolSecretID, fc.LastPoolSecretID)
+	}
+	fc = sharedLabelFake()
+	if _, _, code := runCLI(t, fakeEnv(fc), "token", "pool", "shared", "--off", "--kind", "anthropic"); code != uzicli.ExitOK {
+		t.Fatalf("--kind anthropic: exit = %d, want 0", code)
+	}
+	if fc.LastPoolSecretID != "s1" || fc.CodexPoolCalls != 0 {
+		t.Errorf("--kind anthropic sent anthropic %q codex calls %d; want s1 and no Codex write", fc.LastPoolSecretID, fc.CodexPoolCalls)
+	}
+}
+
+// TestTokenPoolKindMissAndInvalid: --kind with a label that exists only in the other kind is a
+// usage error that names what the label is; an unknown --kind value is a usage error.
+func TestTokenPoolKindMissAndInvalid(t *testing.T) {
+	fc := codexFake()
+	_, errOut, code := runCLI(t, fakeEnv(fc), "token", "pool", "default", "--on", "--kind", "codex")
+	if code != uzicli.ExitUsage || !strings.Contains(errOut, "Codex login") {
+		t.Fatalf("exit = %d err = %q, want usage mentioning Codex login", code, errOut)
+	}
+	_, _, code = runCLI(t, fakeEnv(fc), "token", "pool", "default", "--on", "--kind", "bogus")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("invalid --kind: exit = %d, want usage", code)
+	}
+	if fc.LastPoolSecretID != "" || fc.CodexPoolCalls != 0 {
+		t.Error("a refused resolution still wrote")
+	}
+}
+
+// TestTokenPoolDisabledCodexRefusedBeforeWrite mirrors the Anthropic disabled guard.
+func TestTokenPoolDisabledCodexRefusedBeforeWrite(t *testing.T) {
+	disabled := time.Unix(1784000000, 0)
+	fc := &uzicli.FakeClient{Secrets: []apitypes.SecretDTO{
+		{ID: "c1", Kind: "codex_auth", Label: "old", Enabled: false, DisabledAt: &disabled},
+	}}
+	_, _, code := runCLI(t, fakeEnv(fc), "token", "pool", "old", "--on")
+	if code != uzicli.ExitConflict || fc.CodexPoolCalls != 0 {
+		t.Fatalf("exit = %d calls = %d, want conflict and no write", code, fc.CodexPoolCalls)
 	}
 }

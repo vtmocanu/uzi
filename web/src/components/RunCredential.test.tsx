@@ -29,6 +29,7 @@ function cred(over: {
     harness: over.harness ?? "claude",
     codex_secret_id: over.codexId === undefined ? null : over.codexId,
     codex_secret_label: over.codexLabel === undefined ? null : over.codexLabel,
+    codex_select_reason: null,
     anthropic_secret_id: over.id === undefined ? "sec-1" : over.id,
     anthropic_secret_label: over.label === undefined ? "console-key" : over.label,
     anthropic_select_reason: over.reason ?? null,
