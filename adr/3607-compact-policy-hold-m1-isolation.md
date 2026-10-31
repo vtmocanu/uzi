@@ -2,7 +2,7 @@
 
 **Status:** Accepted narrow M1 repair contract; partial checkpoint through
 d7b03dae276ebc2c54681a47a5205c2903654140. Initial R1/R2 reviewed; R3 INCOMPLETE.
-Final merged validation, remaining validator returns and exact-head CI are pending.
+Final merged validation, integration review and exact-head CI are pending.
 **Date:** 2026-10-31
 **Issue:** [#3607](https://github.com/vtmocanu/uzi/issues/3607)
 **PRD:** [Compact policy-refusal hold](../prds/3607-compact-policy-refusal-hold.md#decision-log)
@@ -202,8 +202,10 @@ arbitrary historic database values.
 Initial R1/R2 delivery and later enrollment/descriptor-close repairs retain their
 candidate-bound reviews and focused evidence. The required 114-file agent selection
 at 2df3641f failed two fixture assertions. Test-only repairs through d7b03dae pass
-the lead's focused 16-case selection; remaining independent review and the final
-merged rerun are pending. The PRD inventories failures, repairs, review limits and
+the lead's and independent reviewer/tester 16-case selections. A bounded auditor
+review found no specific security defect in the supplied complete two-file diff;
+it did not execute tests, scanners or independent repository verification. Final
+integration review and the merged rerun are pending. The PRD inventories failures, repairs, review limits and
 historical successes without treating them as final validation.
 
 Current-main integration remains required. Public REST observation on 2026-10-31
