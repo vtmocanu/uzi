@@ -1314,11 +1314,13 @@ export class Outbox {
           }
           const gen = parseTerminalFileName(name);
           if (gen === undefined) continue;
+          let bootPlaceholder: TerminalMeta | undefined;
           // Transfer without yielding or counting the source twice.
           if (token && !ownedScope && !this.runs.get(runId)?.terminals.has(gen)) {
             this.policyInspections.delete(token);
-            if (!this.retainUnknownTerminal(runId, gen, name, true) && scope)
-              this.policyInspections.set(token, scope);
+            if (!this.retainUnknownTerminal(runId, gen, name, true)) {
+              if (scope) this.policyInspections.set(token, scope);
+            } else bootPlaceholder = this.runs.get(runId)?.terminals.get(gen);
           }
           const enrolled = this.runs.get(runId)?.terminals.get(gen);
           if (token && enrolled?.fileName === name && enrolled.outcomeKind !== "terminal")
@@ -1354,7 +1356,7 @@ export class Outbox {
             result.rejected++;
             const held = this.runs.get(runId)?.terminals.get(gen);
             const rejection = inspected && this.copyMACBinding(inspected.observation);
-            if (token && scope && rejection && held?.fileName === name && held.outcomeKind === "unknown" &&
+            if (token && scope && rejection && held === bootPlaceholder && held?.fileName === name && held.outcomeKind === "unknown" &&
                 !held.selectionToken && !held.policyOutcomeId && !held.capturePending) {
               if (bootRejections.size >= this.policyCatalogLimit) {
                 for (const prior of bootRejections) if (!this.policyInspections.has(prior)) bootRejections.delete(prior);
