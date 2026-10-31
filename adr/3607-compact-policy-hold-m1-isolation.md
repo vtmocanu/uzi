@@ -148,6 +148,13 @@ heap bound. Opaque/provisional evidence prevents a claim of complete
 inventory; safe known source bindings supply identity coverage, not authentication
 or settlement authority.
 
+Deferral fields belong to the enrolled filename: an alias observation cannot
+stamp its version/eligibility onto another file or clear that file's eligibility.
+The existing version and selected-identity checks still control authentication.
+Runtime displacement of a rejected UNKNOWN entry by an authenticated alias is
+deferred, retaining the baseline fail-closed boundary. No new rejection cache,
+ranking policy or lifetime/version-cache subsystem is introduced by this repair.
+
 The targeted scanner and persistent recovery pager cooperate after at most 256
 visited entries per slice or a one-second elapsed-time checkpoint. Ignored entries
 consume visits. The deadline is cooperative, not preemptive I/O cancellation: an

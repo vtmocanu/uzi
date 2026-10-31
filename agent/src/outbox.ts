@@ -1337,7 +1337,7 @@ export class Outbox {
               break; // A changed ordinary lifetime needs new capacity.
             }
             const held = this.runs.get(runId)?.terminals.get(gen);
-            if (held) held.deferredVersion = fileVersion(stat);
+            if (held?.fileName === name) held.deferredVersion = fileVersion(stat);
           } catch { /* unknown stays pending */ }
           const affordable = bytes <= this.terminalReadMaxBytes && bytes <= this.runMaxBytes - readBytes &&
             bytes <= this.maxBytes - this.terminalLoadBytes;
@@ -1373,7 +1373,7 @@ export class Outbox {
               bootRejections.add(token);
               continue;
             }
-            if (held) held.budgetDeferred = !affordable && bytes <= this.terminalReadMaxBytes && bytes <= this.runMaxBytes && bytes <= this.maxBytes;
+            if (held?.fileName === name) held.budgetDeferred = !affordable && bytes <= this.terminalReadMaxBytes && bytes <= this.runMaxBytes && bytes <= this.maxBytes;
             continue; // physical evidence cannot establish absence
           }
           const meta = coerceTerminal(parsed, runId, gen, name);
@@ -3493,7 +3493,7 @@ export class Outbox {
               remaining -= cap;
               runRemaining -= cap;
               const meta = generation === undefined ? undefined : this.runs.get(this.terminalScanRun.id)?.terminals.get(generation);
-              if (meta?.outcomeKind === "unknown" && result.observation.kind !== "unreadable" && result.observation.kind !== "key_unavailable") meta.budgetDeferred = false;
+              if (meta?.fileName === entry.name && meta.outcomeKind === "unknown" && result.observation.kind !== "unreadable" && result.observation.kind !== "key_unavailable") meta.budgetDeferred = false;
               if (token && result.record && result.record.outcome_kind !== "policy_hold")
                 this.policyInspections.delete(token);
               page.observations.push(result.observation);
