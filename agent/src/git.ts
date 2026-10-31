@@ -1919,6 +1919,17 @@ function namesWholePath(text: string, p: string): boolean {
   return false;
 }
 
+/** Does the raw journal parse to an object with an own key other than `runId` and `clonePath`? */
+function journalHasExtraFields(raw: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) &&
+      Object.keys(parsed).some((k) => k !== "runId" && k !== "clonePath");
+  } catch {
+    return false;
+  }
+}
+
 function stoppedMarkerKey(runId: string): string {
   return `uzi-stopped.${runId}.entry`;
 }
@@ -2010,6 +2021,12 @@ export interface RetainedSourceEvidence {
   disposition: RetainedDisposition | undefined;
   /** Epoch inspections only: the disposition under the strict-plain basis. Defined only when the caller's lifecycle verdict is `terminal`, zero open holds are required for `local_discard` (an open or unknown hold yields another disposition), and a `live` ledger attempt is named solely by an active journal whose raw text equals `JSON.stringify` of its parse (any key order; duplicates and whitespace variants are rejected), with no other non-retired ledger entry on the same clone key. Never set for operator inspection. */
   epochSettlement?: { basis: "strict_plain"; disposition: RetainedDisposition };
+  /** Epoch inspections only, report-only: a marker-less canonical source under a plain active journal
+   *  (`journalState: "plain"`, `markerState: "none"`) whose journal, read in the same lock-held snapshot as
+   *  the rest of the evidence, carries any own key other than `runId` and `clonePath` (for example
+   *  `restoreTip`). It never changes the disposition, the descriptor digest or operator output, which
+   *  never sets it. The pod-epoch shadow counts such candidates as `journal_extra_fields`. */
+  epochJournalExtraFields?: true;
 }
 
 /** The server's lifecycle verdict for a run, read by the caller (never by GitCache) before it
@@ -2563,6 +2580,8 @@ interface GatheredRecord {
   descriptorSnapshot: string | undefined;
   journalState: RetainedSourceEvidence["journalState"];
   markerState: RetainedSourceEvidence["markerState"];
+  /** Epoch gathers only: see {@link RetainedSourceEvidence.epochJournalExtraFields}. */
+  epochJournalExtraFields?: true;
   markerRaw: string | undefined;
   ledgerRaw: string | undefined;
   digest: string;
@@ -9386,6 +9405,7 @@ export class GitCache {
       records.push({
         kind: "canonical", runId: j.runId, branch, key, parts: [p], journal: j, activeRaw: a.raw,
         descriptorRaw: undefined, descriptorSnapshot: undefined, journalState: "plain", markerState: "none",
+        ...(this.epochRetained.getStore() && journalHasExtraFields(a.raw) ? { epochJournalExtraFields: true as const } : {}),
         markerRaw: undefined, ledgerRaw: undefined, problems: runProblems(j.runId), namers,
         digest: sha256Hex(["retained-source-v1", "canonical-plain", a.raw, p.devIno].join("\n")),
       });
@@ -9882,6 +9902,7 @@ export class GitCache {
         sources: parts, consumers: [...ev.consumers, ...ev.blockers.map((b) => `blocker:${b}`)], localRecords: ev.localRecords,
         holds: ev.holdsView, disposition: ev.disposition,
         ...(ev.epochSettlement ? { epochSettlement: ev.epochSettlement } : {}),
+        ...(rec.epochJournalExtraFields ? { epochJournalExtraFields: true as const } : {}),
       });
     }
     if (bindingFailed) {

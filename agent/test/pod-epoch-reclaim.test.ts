@@ -670,6 +670,34 @@ for (const endpoint of ["holds", "ownership"] as const) {
   }
 }
 
+for (const failing of ["ownership", "holds"] as const) {
+  test("a real WorkerClient HTTP 404 on " + failing +
+    (failing === "holds" ? " after terminal ownership succeeded" : "") + " keeps every source", async () => {
+    const d = await daemon();
+    try {
+      const { options, calls } = setup(); options.dockerHost = d.host; inventory(options, 2);
+      const requests: string[] = [];
+      options.client = new WorkerClient("http://example.invalid", "inert", "test", nullLogger(), {
+        fetch: async (url, init) => {
+          assert.equal(init?.method, "GET");
+          const path = new URL(String(url)).pathname;
+          requests.push(path);
+          if (failing === "holds" && path.endsWith("/ownership")) return new Response(JSON.stringify({ status: "completed" }));
+          return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+        },
+      });
+      const result = (await runPodEpochShadow(options))!;
+      assert.equal(result.would_delete, 0); assert.equal(result.would_settle, 0);
+      assert.deepEqual(result.list, []); assert.equal(result.list_overflow, 0);
+      assert.equal(result.kept, 2); assert.equal(result.verdict, "partial");
+      assert.equal(result.reason, "inventory_partial");
+      assert.equal(requests.length, failing === "holds" ? 4 : 2, "one bounded attempt per request, no retry");
+      assert.equal(requests.filter(p => p.endsWith("/recovery-holds")).length, failing === "holds" ? 2 : 0);
+      assert.equal(calls.handovers, 1);
+    } finally { await d.close(); }
+  });
+}
+
 // ---- M1a widened shadow: authority, worker-recomputed attestation, widened candidates ----
 const mutate = async (name: string, change: (doc: any) => void) => {
   const doc = JSON.parse((await fixture(name)).toString()); change(doc); return JSON.stringify(doc);
@@ -832,6 +860,31 @@ test("present and missing candidates, strict-plain basis, and the examined invar
     assert.ok(!result.list.some(e => e.run_id === "run3" || e.run_id === "run4" || e.run_id === "run6" || e.run_id === "run7"));
     assert.ok(d.requests.every(r => r.startsWith("GET ")));
   } finally { await d.close(); }
+});
+test("journal_extra_fields counts only final candidates whose source carried the report-only flag", async () => {
+  const d = await daemon();
+  try {
+    const { options } = setup(); options.dockerHost = d.host; inventory(options, 4);
+    const flagged = new Set([0, 1, 2]);
+    options.git.inspectRetainedSources = async opts => {
+      const i = Number(opts.selector!.runId.slice(3)); const path = "/tree/" + i;
+      opts.beforeTree!(path);
+      const s = candidateSource(path, opts.selector!.runId, x => {
+        if (i === 1) { x.presence = "missing"; x.sources[0]!.presence = "missing"; x.sources[0]!.allocatedBytes = null; }
+        if (i === 2) x.disposition = { kind: "refused", consumers: [] };
+      });
+      if (flagged.has(i)) s.epochJournalExtraFields = true;
+      return { sources: [s], partial: false, unreadable: 0, sampledAt: "" };
+    };
+    const result = (await runPodEpochShadow(options))!;
+    // run0 (present) and run1 (missing) are flagged candidates; run2 is flagged but kept; run3 is an
+    // unflagged present candidate.
+    assert.equal(result.would_delete, 2); assert.equal(result.would_settle, 1);
+    assert.equal(result.journal_extra_fields, 2);
+    assert.equal(result.kept, 1);
+  } finally { await d.close(); }
+  const { result } = await run(bytes);
+  assert.equal(result.journal_extra_fields, 0, "defaults to zero");
 });
 test("an invalid pass clears present and missing candidates alike", async () => {
   const d = await daemon();

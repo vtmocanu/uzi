@@ -44,6 +44,9 @@ interface Verdict {
   would_settle: number;
   by_basis: { discard: number; strict_plain: number };
   kept: number;
+  /** Final discard candidates whose marker-less canonical plain journal carried fields beyond
+   *  runId and clonePath (for example restoreTip). Report-only, so m6 can review them before M1b. */
+  journal_extra_fields: number;
   list: Candidate[];
   list_overflow: number;
   inventory_overflow: number;
@@ -122,7 +125,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
   let detachVeto = () => {};
   const result: Verdict = {
     verdict: "deferred", reason: "not_evaluated", examined: 0, would_delete: 0, would_delete_bytes: 0,
-    would_settle: 0, by_basis: { discard: 0, strict_plain: 0 }, kept: 0,
+    would_settle: 0, by_basis: { discard: 0, strict_plain: 0 }, kept: 0, journal_extra_fields: 0,
     authority: { result: "unproven", reason: "not_evaluated" }, evidence_version: null,
     list: [], list_overflow: 0, inventory_overflow: 0, inventory_overflow_exact: false,
     inventory_complete: false, bytes_state: "unknown", evidence_wait_ms: 0, pass_ms: 0,
@@ -137,6 +140,8 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
   // demoted to kept and cannot be re-added.
   const candidates = new Map<string, Candidate>();
   const refused = new Set<string>();
+  // Paths whose source was a marker-less canonical plain journal carrying extra fields (report-only).
+  const extraFieldPaths = new Set<string>();
   let invalidReason = "";
   const invalidate = (reason: string) => { invalid = true; invalidReason ||= reason; };
   const examined = new Set<string>();
@@ -340,6 +345,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
             else if (part.presence === "missing")
               candidate = { ...entry, bytes: 0, presence: "missing", basis };
           }
+          if (candidate && source.epochJournalExtraFields) extraFieldPaths.add(part.clonePath);
           const previous = candidates.get(part.clonePath);
           if (!candidate || refused.has(part.clonePath) || (previous && (previous.presence !== candidate.presence || previous.run_id !== candidate.run_id ||
               previous.basis !== candidate.basis || previous.bytes !== candidate.bytes))) {
@@ -409,6 +415,8 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     discard: all.filter(c => c.basis === "discard").length,
     strict_plain: all.filter(c => c.basis === "strict_plain").length,
   };
+  // Final candidates only: a demoted or cleared path is never counted.
+  result.journal_extra_fields = [...candidates.keys()].filter(p => extraFieldPaths.has(p)).length;
   // Candidates are a subset of examined paths, so the invariant examined = delete + settle + kept
   // holds without help; the clamp is only a defensive floor.
   result.kept = Math.max(0, examined.size - all.length);

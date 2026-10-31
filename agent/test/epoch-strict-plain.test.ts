@@ -93,10 +93,23 @@ describe("strict-plain epoch settlement", () => {
     ["retainedSources", () => [], true],
     ["peeledMarkers", () => [sha()], true],
     ["unknownKey", () => 1, false],
-    // These records have strict inner grammars; an invalid one makes the whole bare unreadable.
+    // `recovery` is excluded from the plain journal classification and has a strict inner grammar:
+    // this invalid payload makes the whole bare unreadable, so it proves only that no source (hence no
+    // settlement) is reported, not the exact-key-set guard.
     ["recovery", () => ({ stage: "captured" }), false],
-    ["memoryPark", () => ({ version: 1 }), false],
-    ["completionSourceFence", () => ({ version: 1 }), false],
+    // These two are admitted by the broad plain classification, so they need VALID payloads (the same
+    // shapes git-memory-park.test.ts and completion-retirement.test.ts persist): the source is gathered
+    // and only the exact-key-set guard refuses the waiver.
+    ["memoryPark", () => ({
+      version: 1,
+      binding: { runId: RUN, claimGeneration: 7, workerId: "worker-1", registerNonce: "nonce-1", memoryEpisode: 3 },
+      ack: "sent_unconfirmed",
+      origin: { flightId: "11111111-1111-4111-8111-111111111111", attemptId: null, executorIncarnation: null,
+        authorityIncarnation: "22222222-2222-4222-8222-222222222222", sourceEpoch: "33333333-3333-4333-8333-333333333333" },
+    }), true],
+    ["completionSourceFence", () => ({
+      version: 1, sourceUseEpoch: "99999999-9999-4999-8999-999999999999", sourceCoreDigest: "a".repeat(64),
+    }), true],
   ];
   for (const [field, value, mustSurvive] of extras) {
     it(`refuses a journal carrying an extra ${field} field`, async () => {
@@ -222,6 +235,35 @@ describe("strict-plain epoch settlement", () => {
     assert.deepEqual(epoch.disposition, operator.disposition);
     assert.equal(epoch.descriptor, operator.descriptor);
     assert.deepEqual(epoch.consumers, operator.consumers);
+  });
+
+  it("flags a marker-less canonical plain journal that carries extra fields, for epoch inspection only", async () => {
+    const canonical = await git.createOrAttachRunnerClone(bare, 3431, noProofReseed, RUN);
+    await git.markRecoveryCapture(bare, canonical.path, BRANCH, RUN);
+    const selector = { runId: RUN, generation: "none" as const, attempt: "canonical" };
+    const read = async (epoch: boolean) => {
+      const r = await git.inspectRetainedSources({ selector, holds: NO_HOLDS, lifecycle: TERMINAL, isLivePath: () => false,
+        barePath: bare, ...(epoch ? { epoch: true } : {}) });
+      assert.equal(r.sources.length, 1);
+      return r.sources[0]!;
+    };
+    const plain = await read(true);
+    assert.equal(plain.kind, "canonical");
+    assert.equal(plain.journalState, "plain");
+    assert.equal(plain.markerState, "none");
+    assert.equal("epochJournalExtraFields" in plain, false, "{runId, clonePath} alone is not flagged");
+
+    setJournal(JSON.stringify({ runId: RUN, clonePath: canonical.path, restoreTip: gitIn(bare, ["rev-parse", "HEAD"]) }));
+    const epoch = await read(true);
+    const operator = await read(false);
+    assert.equal(epoch.journalState, "plain");
+    assert.equal(epoch.markerState, "none");
+    assert.equal(epoch.epochJournalExtraFields, true);
+    assert.equal("epochJournalExtraFields" in operator, false);
+    // Report-only: the disposition and the descriptor are identical to an operator read.
+    assert.deepEqual(epoch.disposition, operator.disposition);
+    assert.equal(epoch.disposition?.kind, "local_discard");
+    assert.equal(epoch.descriptor, operator.descriptor);
   });
 
   it("writes nothing", async () => {
