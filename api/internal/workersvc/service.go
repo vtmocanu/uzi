@@ -4681,9 +4681,12 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return store.Run{}, false, werr
 			}
 		}
-		// The worker lock above is conditional; the opt-ins are not (a publication-enrolled run needs them).
-		if err := optInRunFences(ctx, qtx, wkr.ID, true); err != nil {
-			return store.Run{}, false, err
+		// The opt-ins are set only after the worker lock: without it the 00352 checkpoint fence and
+		// the publication fence stay closed and refuse a wrong-lock-order authority write.
+		if workerLocked {
+			if err := optInRunFences(ctx, qtx, wkr.ID, true); err != nil {
+				return store.Run{}, false, err
+			}
 		}
 		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 		if lerr != nil {
@@ -4789,8 +4792,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return store.Run{}, false, err
 			}
 		}
-		if err := optInRunFences(ctx, qtx, wkr.ID, true); err != nil {
-			return store.Run{}, false, err
+		if workerLocked {
+			if err := optInRunFences(ctx, qtx, wkr.ID, true); err != nil {
+				return store.Run{}, false, err
+			}
 		}
 		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 		if lerr != nil {

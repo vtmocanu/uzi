@@ -3,10 +3,18 @@
 -- lives in a side table so runs gains a single column (recovery_wait_phase).
 
 -- +goose Up
--- The first statement: CREATE TABLE ... REFERENCES runs and the ALTER TABLE on runs below both
+-- The first statement: the ALTER TABLE on runs and CREATE TABLE ... REFERENCES runs below both
 -- wait on runs locks, so the bound must cover them. A lock wait past it fails the migration,
 -- which can be rerun.
 SET LOCAL lock_timeout = '5s';
+-- runs is hot. Its ALTER runs FIRST and as ONE statement so ACCESS EXCLUSIVE on runs is taken
+-- before anything else: CREATE TABLE ... REFERENCES runs would first take SHARE ROW EXCLUSIVE and
+-- the later ALTER would upgrade it, deadlocking with a concurrent read-then-update of runs. The
+-- CHECK is added NOT VALID and left that way: validating would scan runs, and the column is NULL
+-- on every existing row.
+ALTER TABLE runs ADD COLUMN recovery_wait_phase text,
+    ADD CONSTRAINT runs_recovery_wait_phase_check
+    CHECK (recovery_wait_phase IS NULL OR recovery_wait_phase = 'publication') NOT VALID;
 CREATE TABLE run_publication_resume (
     run_id           uuid        NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     enrollment_seq   int         NOT NULL CHECK (enrollment_seq > 0),
@@ -34,12 +42,6 @@ CREATE TABLE run_publication_resume (
     PRIMARY KEY (run_id, enrollment_seq)
 );
 CREATE UNIQUE INDEX run_publication_resume_active_idx ON run_publication_resume (run_id) WHERE state = 'active';
-
--- runs is hot (see the lock_timeout above). The CHECK is added NOT VALID and left that way:
--- validating would scan runs, and the column is NULL on every existing row.
-ALTER TABLE runs ADD COLUMN recovery_wait_phase text;
-ALTER TABLE runs ADD CONSTRAINT runs_recovery_wait_phase_check
-    CHECK (recovery_wait_phase IS NULL OR recovery_wait_phase = 'publication') NOT VALID;
 
 -- Authority mirrors guard_checkpoint_coordinates (minus its enrollment leg): a run with an
 -- active intent may change owner, generation or claim state only with BOTH the persisted worker
@@ -98,6 +100,26 @@ FOR EACH ROW
 WHEN (OLD.status = 'recovery_wait' AND OLD.recovery_wait_cause = 'forge_unreachable'
       AND (NEW.status <> 'recovery_wait' OR NEW.recovery_wait_cause IS DISTINCT FROM 'forge_unreachable'))
 EXECUTE FUNCTION clear_publication_hold_reason();
+
+-- Intent lifecycle: a run reaching a terminal status closes its active intent in the same
+-- transaction as whichever writer made it terminal (completed on completion, retired with the
+-- run's outcome on failed or cancelled). It lives in the database so every terminal writer is
+-- covered. The marker setting lets the row guard accept exactly this active -> closed transition.
+CREATE FUNCTION close_publication_resume() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM set_config('uzi.publication_resume_closing', 'on', true);
+    UPDATE run_publication_resume p
+    SET state = CASE WHEN NEW.status = 'completed' THEN 'completed' ELSE 'retired' END,
+        retired_reason = CASE NEW.status WHEN 'failed' THEN 'run_failed' WHEN 'cancelled' THEN 'run_cancelled' END
+    WHERE p.run_id = NEW.id AND p.state = 'active';
+    PERFORM set_config('uzi.publication_resume_closing', '', true);
+    RETURN NULL;
+END;
+$$;
+CREATE TRIGGER close_publication_resume_trg AFTER UPDATE OF status ON runs
+FOR EACH ROW
+WHEN (OLD.status NOT IN ('completed', 'failed', 'cancelled') AND NEW.status IN ('completed', 'failed', 'cancelled'))
+EXECUTE FUNCTION close_publication_resume();
 -- +goose StatementEnd
 
 -- Identity, state and candidate writes need the API opt-in. The hold reason, wait clock, counters
@@ -106,6 +128,8 @@ EXECUTE FUNCTION clear_publication_hold_reason();
 CREATE FUNCTION guard_publication_resume_row() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
     opted boolean := current_setting('uzi.publication_resume_api', true) IS NOT DISTINCT FROM 'v1';
+    -- Set only by close_publication_resume (below) around its own update.
+    closing boolean := current_setting('uzi.publication_resume_closing', true) IS NOT DISTINCT FROM 'on';
     field text;
 BEGIN
     IF TG_OP = 'INSERT' THEN
@@ -126,7 +150,7 @@ BEGIN
         END IF;
     END IF;
     IF NEW.state IS DISTINCT FROM OLD.state THEN
-        IF NOT opted OR OLD.state <> 'active' OR NEW.state NOT IN ('retired', 'completed') THEN
+        IF NOT (opted OR closing) OR OLD.state <> 'active' OR NEW.state NOT IN ('retired', 'completed') THEN
             RAISE EXCEPTION 'publication resume state change refused' USING ERRCODE = '23514';
         END IF;
     ELSIF OLD.state <> 'active'
@@ -193,9 +217,11 @@ DO $$ BEGIN
     END IF;
 END $$;
 -- +goose StatementEnd
+DROP TRIGGER close_publication_resume_trg ON runs;
 DROP TRIGGER clear_publication_hold_reason_trg ON runs;
 DROP TRIGGER normalize_recovery_wait_phase_trg ON runs;
 DROP TRIGGER guard_publication_resume_trg ON runs;
+DROP FUNCTION close_publication_resume();
 DROP FUNCTION clear_publication_hold_reason();
 DROP FUNCTION normalize_recovery_wait_phase();
 DROP FUNCTION guard_publication_resume();
