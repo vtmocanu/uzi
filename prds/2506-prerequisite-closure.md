@@ -1,7 +1,7 @@
 # PRD #2506 (option A): a pinned prerequisite closure lets a thin guarded capture release custody
 
 **Issue:** #2506 (option A only). Delivery under this PRD is **non-closing**: every PR uses `Refs #2506` and closes only its own child issue. #2506 stays open until the whole acceptance below is met. Option D shipped separately (ADR-2506) and does not complete this.
-**Current execution:** C1b child #3591 is implemented locally through M4 at `db652da5ffb7139ce421dae88eb6c6f3a2d3437f`; M5 documentation and focused local checks are recorded below through `60a94c89`; hosted exact-head gates and comparative timing are not collected, so M5 remains in progress. No thin FINAL release, feature advertisement or agent change. C2/C3, release, E6 and parent acceptance remain open. See [current execution and checkbox disposition](#c1b-current-execution-2026-10-29-child-3591). The design status below is historical, not a claim that implementation has not started.
+**Current execution (2026-10-31):** C1a and C1b source are merged. C1b landed in [PR #3655](https://github.com/vtmocanu/uzi/pull/3655) as `b6fab6b7`, with migration 00387; exact-head hosted checks and timing were collected before merge. The local handoff records below remain historical evidence, not the current hosted-gate status. C1b adds no thin FINAL release, feature advertisement or agent change. C2/C3, E5 and parent acceptance remain open; E6 is post-roll reporting only. M6 operator observation is not claimed performed. See [current execution and checkbox disposition](#c1b-current-execution-2026-10-29-child-3591).
 
 **Historical design status:** DRAFT, revision 18 (2026-10-28), approved C1a/C1b split and review folds, pending exact-text final review. C1a and C1b are API-only; no filing or dispatch follows from this draft. Based on the exact revision-11 artifact (SHA256 `2205e1146950263b2aa90f35863cadec3f3debfbd350590b9e65bd560a9640ec`, whose header still said revision 10). The earlier paired architecture reviews and owner decisions remain the design history; this new evidence fold requires recov6 review and is not filing, dispatch or implementation approval. **E2 ran on GitHub on 2026-10-27 and returned FINDING (one measured workflow-scope refusal, zero probe malfunctions), conclusive for the tested production credential class.** The anchor strategy is feasible in that tested case; other forges and protected/ruleset configurations remain unverified. Existing source line anchors are historical at `91647464c02bd12ae30d4fce6aa656f2245e88e1`, not refreshed line numbers for current main. The new E2 section states the exact observed scope and remaining gates.
 **Priority:** High (inherits #2506). The independent architecture review CLAUDE.md requires for priority::high applies to this PRD and to each child before dispatch; no waiver. M0 is evidence-only and is never auto-dispatched.
@@ -577,25 +577,37 @@ Reader surfaces inspected as starting points were summary/list/download/reconcil
 
 #### C1b current execution (2026-10-29, child #3591)
 
-C1b's local M1–M4 implementation is present at
-`db652da5ffb7139ce421dae88eb6c6f3a2d3437f`. This section supersedes
-pre-dispatch status as a description of current execution, without asserting
-that uncollected prerequisite/hosted acceptance passed. C1a's execution,
-writer audit, amendment and exact-head checkbox above are preserved. The
-historical design, including prospective S6/FINAL/worker behavior, is not a
-claim of C1b shipment. Parent #2506 remains active and non-closing.
+C1b landed in [PR #3655](https://github.com/vtmocanu/uzi/pull/3655) on
+2026-10-31 as `b6fab6b7`, migration 00387. Before merge, the final head
+`edb29486` passed the required hosted checks. The full seven-package store-it
+sweep recorded 3,696 named PASS and zero SKIP, including all 62 required
+prerequisite names and both witness rollback tests. The combined lost-reply
+proof completed in 48m33s under the separately reviewed 60-minute cap.
+These results complete the hosted portion of M5, not M6 operator observation,
+C2 release, C3 owner acceptance or the parent goals. C1a's evidence is preserved.
+The detailed local records below describe the worker's earlier handoff state;
+they do not assert that hosted checks were available at that earlier time.
 
 - [x] C1b M1: immutable closure persistence, restrictive live pointer, state/reservation/absence fences, guarded Down and inherited C1a regressions implemented and checked locally.
 - [x] C1b M2: bounded broker prepare/send/list/expected-tip CAS, shared one-send authority and native positive/negative restore fixtures checked locally.
 - [x] C1b M3: bounded lane, shutdown, removal guards, frozen-binding/unknown/cleanup/audit lifecycle and real-driver/LiveDB/native integration checked locally.
 - [x] C1b M4: atomic S0, original authenticated registration snapshot, no-backfill receipts, postcommit kick, knob normalization/admission and optional status mapping checked locally.
 - [x] C1b M5 local evidence: documentation/mirrors, tracked E2E audit, E2E library/fake tests, focused build/vet/race checks, SQLC/migration/static/security checks and committed repair reviews recorded below.
-- [ ] C1b M5 overall acceptance: exact-head hosted gates and comparative timing are not yet collected. Local results do not complete this milestone.
-- [ ] C1b final exact-head hosted acceptance: every API constituent, repo gate and named store-it tests PASS with zero SKIP; affected-job/critical-path timing with queue/cache/reruns separated.
+- [x] C1b M5 overall acceptance: local deliverables and final exact-head hosted checks/timing collected at the #3655 landing boundary.
+- [x] C1b final exact-head hosted acceptance: required API/repo checks and the full store-it sweep passed, all 62 required names PASS with zero SKIP; advisory timing recorded below. This is not a post-deployment runtime result.
 - [ ] C2 thin FINAL release, feature/worker advertisement, permission/replay/reconciliation and real freeze-path authority acceptance.
 - [ ] C3 owner/web/CLI pin visibility and E5 restore-time acceptance.
-- [ ] E6 two weeks of hosted post-roll counts and growth, including unresolved/exhausted pins and removal blockers.
+- [ ] E6 two weeks of hosted post-roll counts and growth, including unresolved/exhausted pins and removal blockers (reporting only, not a closure gate).
 - [ ] Parent release/acceptance: all child acceptance and remaining end-to-end/rollout criteria below.
+
+**Hosted timing at landing.** The advisory report for CI run 41182433894
+compared execution steps with a five-sample main median: store-it 2,794s
+(+1,051s), combined lost-reply 2,913s (+593s). Whole-run wall time was 7,463s
+against 3,134s; runner activation was 2,444s. Queue/activation, compilation
+and cache effects prevent treating those differences as isolated test-cost
+measurements. No causal performance improvement or production pin latency
+is claimed. The agent-gap rebalance advisory was false. Post-merge CI,
+deployment and M6 observation are not established by this pre-merge record.
 
 **Direct evidence, not hosted CI.** Lead-owned run-local records were read in
 `.uzi/scratch/m1/evidence.md`, `m2-*evidence.md`, `m3-*evidence.md` and
@@ -691,7 +703,7 @@ active. The E4 row and C1a execution block are unchanged.
   `60a94c89` change removes only an unused comment. All these commits received
   their scoped read-only reviews; no final implementation commit is unreviewed.
 
-These are local observations, not exact-head hosted acceptance. The last
+At that worker handoff these were local observations, not hosted acceptance. The last
 pipeline read returned an upstream forge error; no CI verdict is inferred.
 Every API constituent, repo gate, and named store-it PASS/zero-SKIP result at
 the published head remains required. `govulncheck` was unavailable on PATH;
@@ -699,7 +711,9 @@ no dependency-scan PASS is claimed. Added per-fixture migrations have an
 unmeasured CI cost. Affected-job and critical-path before/after timing,
 separating queue/cache/reruns, remains outstanding; local fixture/compile
 seconds are not a substitute. M6 maintainer/operator acceptance, E6, C2/C3
-and parent completion remain separate and unperformed.
+and parent completion remained separate and unperformed at that handoff.
+The landing record above supplies the subsequently collected hosted results;
+it does not claim M6, E5 or parent completion. E6 remains reporting only.
 
 #### C1b cross-check repair (2026-10-30)
 
@@ -736,10 +750,11 @@ G702 on the existing native fixture Git launcher (gate-log.34zKTd, EXIT 1).
 Its literal executable/subcommands and runtime-owned test arguments use no
 shell; the launcher now documents that narrow false-positive suppression.
 
-Exact-head hosted API/repo/store-it acceptance, named LiveDB PASS/zero SKIP,
-paired CI timing and M6 operator/maintainer actions remain outstanding.
-The latest forge-reader attempt still returned an upstream error. These local
-repairs and checks do not tick the overall M5 or parent acceptance boxes.
+At this pre-publication repair handoff, hosted acceptance and timing were still
+outstanding and the latest forge-reader attempt returned an upstream error.
+The landing record above now supplies M5's collected hosted results and timing.
+M6 operator observation is not performed here, and parent acceptance remains
+unchecked; the earlier local repairs alone did not establish hosted success.
 
 ### C2: "Release a guarded hold on a pinned prerequisite closure"
 
@@ -801,10 +816,11 @@ repairs and checks do not tick the overall M5 or parent acceptance boxes.
 | 2026-10-27 (E2 observation; fold drafted 2026-10-28, pending review) | GitHub, classic repo-only PAT, exactly Write: current-default anchor and same-workflow older tips accepted; tested differing-workflow old tip refused; native Git agrees. | FINDING, one provider refusal, zero probe malfunctions; no blanket direct-pin feasibility. |
 | 2026-10-28 (draft consequence, pending review) | Keep the compatible default-tip anchor and all ancestry/binding/lifetime rules; no token expansion or retry at a new D after invocation. #2969 consumes implementation-proven pin status within its existing window only. | E2 closes the tested transport question, not implementation, integration, other-forge feasibility or #3031 producer FINAL authority. |
 | 2026-10-28 (user; matching draft review pending) | Split C1 into API-only C1a ready-query/guard/fixture prefactor and dependent C1b complete pin lifecycle; C2 owns agent changes and release. Publish E4 distribution, clarify registration/status/retry contracts, use next free migrations at landing. | One reviewable invariant first; no partial pin lifecycle, capability advertisement or release. Agent changes in later children use full-suite exact-head PR CI; C1a/C1b stop on agent scope drift. |
+| 2026-10-31 (lead/buddy scope agreement after paired architecture review) | Keep C2 as one release-proof child and one PR, implemented in reviewed serial commits; C3 remains the independently useful owner/restore child and is dispatched serially by default because files overlap. | No independently valuable further C2 split was identified under the supported-worker acceptance. A dark, nonadvertised API-first stage is a safe fallback if run size requires it, but does not by itself deliver the supported-worker release outcome. Advertisement before API acceptance is implemented remains forbidden; API-first acceptance without advertisement does not create that rollout hole. C1b already isolated pin creation/lifetime. The API, worker, schema and reader compatibility must agree on the same proof; size alone does not justify dropping tests or authority checks. This records the reviewed scope choice; dispatch still requires its gated plan review. |
 
 
 ## Open questions (owner calls)
 
 - O9 to O12 decided by the owners on 2026-10-25 (Decision Log).
 - P3 to P5 above.
-- E2 ran on the tested GitHub configuration. This evidence fold and final architecture disposition still gate filing; E4 is reported; its exact record review and implementation-specific plans still gate C1b dispatch. Other forges/configurations remain unverified and unlisted.
+- E2 ran on the tested GitHub configuration and E4 was reported for C1a/C1b's reviewed delivery. Later child filing/dispatch still requires its own final text, architecture and plan reviews. Other forges/configurations remain unverified and unlisted.
