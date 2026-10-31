@@ -273,14 +273,16 @@ func (w usageWindow) window(label string) (Window, error) {
 // epoch seconds. A missing 7d utilization header fails the reading (an account with
 // no unified headers — e.g. a Console API key — is out of scope and surfaces as no
 // reading, i.e. `unavailable`). The 5h headers are optional: plans without a 5-hour
-// window send only the 7d set, which yields FiveHour nil. A 5h utilization header
-// that is present but not a finite number still fails the reading.
+// window send only the 7d set, which yields FiveHour nil. Any 5h header at all
+// (utilization, reset, status, even with an empty value) claims the window exists,
+// so it then needs a finite 5h utilization or the reading fails: a partial 5h set
+// must never read as "no 5-hour window" and overwrite a binding 5h reading.
 func parseHeaders(h http.Header) (Reading, error) {
 	var fh *Window
-	if strings.TrimSpace(h.Get("anthropic-ratelimit-unified-5h-utilization")) != "" {
+	if hasFiveHourHeader(h) {
 		fp, ok := headerPct(h, "anthropic-ratelimit-unified-5h-utilization")
 		if !ok {
-			return Reading{}, &Error{Kind: KindMalformed, msg: "anthropic probe: 5h utilization header is not a finite number"}
+			return Reading{}, &Error{Kind: KindMalformed, msg: "anthropic probe: 5h headers present without a finite 5h utilization"}
 		}
 		fh = &Window{Pct: fp, ResetsAt: headerEpoch(h, "anthropic-ratelimit-unified-5h-reset")}
 	}
@@ -293,6 +295,21 @@ func parseHeaders(h http.Header) (Reading, error) {
 		SevenDay: Window{Pct: sp, ResetsAt: headerEpoch(h, "anthropic-ratelimit-unified-7d-reset")},
 		Source:   SourceHeaderProbe,
 	}, nil
+}
+
+// fiveHourHeaderPrefix is the canonical (http.CanonicalHeaderKey) form of the
+// "anthropic-ratelimit-unified-5h-" family that http.Header keys are stored under.
+var fiveHourHeaderPrefix = http.CanonicalHeaderKey("anthropic-ratelimit-unified-5h-utilization")[:len("anthropic-ratelimit-unified-5h-")]
+
+// hasFiveHourHeader reports whether ANY 5h header key is present, whatever its
+// value: presence, not content, is what claims the 5-hour window exists.
+func hasFiveHourHeader(h http.Header) bool {
+	for k := range h {
+		if strings.HasPrefix(http.CanonicalHeaderKey(k), fiveHourHeaderPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // fractionToPct floors a 0..1 utilization fraction to an integer percent and

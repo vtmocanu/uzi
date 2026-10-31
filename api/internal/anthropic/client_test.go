@@ -301,6 +301,34 @@ func TestParseHeadersSevenDayOnly(t *testing.T) {
 	}
 }
 
+// TestParseHeadersPartialFiveHourFailsClosed: any 5h header claims the window
+// exists, so a partial 5h set (empty utilization, or reset/status without
+// utilization) must fail the reading rather than read as "no 5-hour window" and
+// overwrite a binding 5h reading with weekly-only headroom.
+func TestParseHeadersPartialFiveHourFailsClosed(t *testing.T) {
+	cases := map[string]map[string]string{
+		"empty 5h utilization":      {"anthropic-ratelimit-unified-5h-utilization": ""},
+		"whitespace 5h utilization": {"anthropic-ratelimit-unified-5h-utilization": "   "},
+		"lone 5h reset":             {"anthropic-ratelimit-unified-5h-reset": "1794081600"},
+		"lone 5h status":            {"anthropic-ratelimit-unified-5h-status": "allowed"},
+	}
+	for name, extra := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := http.Header{}
+			h.Set("anthropic-ratelimit-unified-7d-utilization", "0.2")
+			h.Set("anthropic-ratelimit-unified-7d-reset", "1794081600")
+			for k, v := range extra {
+				h.Set(k, v)
+			}
+			_, err := parseHeaders(h)
+			var ae *Error
+			if !errors.As(err, &ae) || ae.Kind != KindMalformed {
+				t.Fatalf("partial 5h headers must be KindMalformed, got %v", err)
+			}
+		})
+	}
+}
+
 func TestParseHeadersSevenDayStillRequired(t *testing.T) {
 	h := http.Header{}
 	h.Set("anthropic-ratelimit-unified-5h-utilization", "0.5")
