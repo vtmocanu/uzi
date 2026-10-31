@@ -1404,8 +1404,9 @@ export class Outbox {
           if (meta.outcomeKind === "policy_hold") meta.selectedLifetime = this.authenticatedLifetimes.get(parsed);
           const rank = name === terminalFileName(gen) ? 3 : 2;
           if (!here()) {
-            if (token && scope && this.displaceBootTerminal(runId, gen, rank, meta, evidence, token, scope, arbitration))
-              result.authenticated++;
+            // Every authenticated file counts, whether or not it wins the generation.
+            result.authenticated++;
+            if (token && scope) this.displaceBootTerminal(runId, gen, rank, meta, evidence, token, scope, arbitration);
             continue;
           }
           if (meta.outcomeKind === "policy_hold" && !this.admitPolicyMetadata(runId, meta)) break;
@@ -1419,8 +1420,8 @@ export class Outbox {
         }
       }
     } finally {
-      await directory.close();
       this.orderTerminalsByGeneration(runId);
+      await directory.close();
     }
     return result;
   }
@@ -1438,9 +1439,9 @@ export class Outbox {
   /** Boot arbitration for a file read after another file of the same generation was enrolled.
    *  Ranks: 3 authenticated canonical, 2 authenticated alias, 1 read and rejected, 0 uninspected
    *  or uncertain. Higher rank wins, then the greater filename in code-unit order. A rank 0
-   *  entry is never displaced. The displaced file receives the held counted scope that
-   *  reading it after the winner would have left, admitted before the entry switches; if that
-   *  admission fails nothing changes and the inventory is marked incomplete. */
+   *  entry is never displaced. The displaced file inherits the current file's own held
+   *  inspection scope (re-keyed, original `since`), which is what reading it after the winner
+   *  would have left; a refused policy_hold admission changes nothing and marks the inventory incomplete. */
   private displaceBootTerminal(
     runId: string, generation: number, rank: number, replacement: TerminalMeta,
     evidence: { ownMac?: Readonly<TerminalMACBinding>; ownSource?: Readonly<TerminalSourceBinding> },
@@ -1458,21 +1459,17 @@ export class Outbox {
       this.terminalInventoryComplete = false;
       return false;
     }
-    const kept = this.reserveInspection(runId);
-    if (!kept) {
-      this.terminalInventoryComplete = false;
-      return false;
-    }
-    const protection = this.policyInspections.get(kept)!;
-    protection.held = true;
-    protection.sourceKey = createHash("sha256").update(displaced.fileName).digest("hex");
-    protection.since = displaced.since;
-    if (current.macBinding) protection.macBinding = current.macBinding;
-    else if (current.sourceBinding && Buffer.byteLength(JSON.stringify({ ...protection, sourceBinding: current.sourceBinding })) <= 1024)
-      protection.sourceBinding = current.sourceBinding;
+    // Re-key the winner's own already-admitted held scope to the displaced file: net-zero
+    // capacity, and the scope keeps its original `since`, as the loser's scope would in forward order.
+    scope.held = true;
+    scope.sourceKey = createHash("sha256").update(displaced.fileName).digest("hex");
+    delete scope.macBinding;
+    delete scope.sourceBinding;
+    if (current.macBinding) scope.macBinding = current.macBinding;
+    else if (current.sourceBinding && Buffer.byteLength(JSON.stringify({ ...scope, sourceBinding: current.sourceBinding })) <= 1024)
+      scope.sourceBinding = current.sourceBinding;
     // No await from here: the displaced entry, its scope and the winner switch together.
     this.terminalRetirementIdentities.delete(displaced);
-    this.policyInspections.delete(token);
     rs.terminals.set(generation, replacement);
     arbitration.set(generation, { fileName: name, rank, macBinding: evidence.ownMac, sourceBinding: evidence.ownSource });
     return true;

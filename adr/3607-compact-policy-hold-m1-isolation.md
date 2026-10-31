@@ -240,16 +240,23 @@ authenticated alias, 1 read and rejected (MAC failure, parse error, malformed),
 Within ranks 1 to 3 the higher rank wins, then the greater filename in code-unit
 order, so the enrolled winner is identical in every enumeration order. A later
 file replaces the enrolled one only if it wins, the enrolled entry is not rank 0
-and has no selection token or pending capture, and the protection transfer
-succeeds. Ranks are load-local state; nothing is persisted.
+and has no selection token or pending capture, and a replacement policy_hold
+passes metadata admission. Ranks are load-local state; nothing is persisted.
 
-The displaced file receives, before the entry switches, the held counted scope
-that reading it after the winner would have produced: source key, `since` and
-its MAC or source binding. It is admitted through the same catalog capacity
-check as an inspection reservation. If admission fails nothing changes: the
-displaced entry stays enrolled and the inventory is marked incomplete (fail
-closed). The winner's own inspection scope is released as for a first-read
-winner, so the catalog stays balanced.
+The displaced file inherits the current (winner's) file's already-admitted held
+inspection scope, re-keyed to the displaced filename: the source key and the
+displaced entry's MAC or source binding replace the winner's, the original
+`since` is kept, and the token is not deleted. This needs no extra catalog
+capacity and leaves exactly the held counted scope that reading the displaced
+file after the winner would have produced, `since` included, so forward and
+reverse enumeration are equal even at exact capacity. If a replacement
+policy_hold fails metadata admission nothing changes: the enrolled entry stays
+and the inventory is marked incomplete (fail closed).
+
+Deferral identity (`deferredVersion`, `budgetDeferred`) is only written to the
+entry whose own filename was read, so a loser never alters the enrolled entry.
+`authenticated_files` in the boot log counts every authenticated file, winner or
+not, so the counts are order independent.
 
 Rank 0 is the uncertainty exception: an uninspected file is never displaced, so
 with rank 0 present which file is enrolled may depend on order. Every file stays

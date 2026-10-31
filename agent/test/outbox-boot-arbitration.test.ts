@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { realpathSync, type Dirent } from "node:fs";
 import { Outbox } from "../src/outbox.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 
 // Boot terminal arbitration (ADR-3607): the enrolled file per generation and the
 // pending order must not depend on the order the directory stream yields entries.
@@ -53,10 +53,10 @@ function options(root: string, extra: Record<string, unknown> = {}) {
   return { root, log: nullLogger(), runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1, ...extra };
 }
 
-async function writerFixture(generations: number[] = [3]) {
+async function writerFixture(generations: number[] = [3], writeNow?: () => number) {
   const root = await fs.mkdtemp(path.join(scratch, "boot-arbitration-"));
   roots.push(root);
-  const writer = new Outbox(options(root));
+  const writer = new Outbox(options(root, writeNow ? { now: writeNow } : {}));
   await writer.init();
   for (const generation of generations) {
     await writer.journalTerminal(run, generation, "implement", 0, { status: "failed", error: "private body" });
@@ -90,9 +90,42 @@ async function exists(file: string): Promise<boolean> {
 
 for (const order of orders) {
   test(`R1 (${order}): pending terminals list in ascending claim_generation`, async () => {
-    const { root } = await writerFixture([1, 2]);
+    // 2 and 10 differ between numeric and lexicographic ("terminal-10" sorts before "terminal-2").
+    const { root } = await writerFixture([2, 10]);
     const box = await restart(order, root);
-    assert.deepEqual(box.listPendingTerminals().map(p => p.claim_generation), [1, 2]);
+    assert.deepEqual(box.listPendingTerminals().map(p => p.claim_generation), [2, 10]);
+  });
+
+  test(`R6 (${order}): generation 0 canonical outranks a valid alias`, async () => {
+    const { root, dir } = await writerFixture([0]);
+    const canonical = path.join(dir, "terminal-0.json");
+    const alias = path.join(dir, "terminal-00.json");
+    await fs.copyFile(canonical, alias);
+    const box = await restart(order, root);
+    assert.equal(await box.retireTerminal(run, 0), true);
+    assert.equal(await exists(canonical), false, "the canonical is the enrolled winner ('.' sorts before '0')");
+    assert.ok(await exists(alias));
+  });
+
+  test(`R7 (${order}): a loser read after an enrolled file leaves its deferral fields untouched`, async () => {
+    const { root, dir, file } = await writerFixture();
+    const alias = path.join(dir, "terminal-0003.json");
+    await fs.copyFile(file, alias);
+    const size = (await fs.stat(file)).size;
+    // Room for exactly one full read per run: the second file is budget-deferred.
+    const box = await restart(order, root, { runMaxBytes: Math.floor(size * 1.5) });
+    const runs = (box as unknown as { runs: Map<string, { terminals: Map<number, { budgetDeferred?: boolean; deferredVersion?: string }> }> }).runs;
+    const enrolled = runs.get(run)?.terminals.get(3);
+    assert.ok(enrolled);
+    assert.notEqual(enrolled.budgetDeferred, true, "the deferred loser must not mark the enrolled entry");
+    assert.equal((await box.readTerminalJournal(run, 3))?.body.error, "private body");
+  });
+
+  test(`R8 (${order}): without a usable key the catalog is still ascending`, async () => {
+    const { root } = await writerFixture([2, 10]);
+    await fs.unlink(path.join(root, ".key"));
+    const box = await restart(order, root);
+    assert.deepEqual(box.listPendingOutcomeSources().map(p => p.claim_generation), [2, 10]);
   });
 
   test(`R2 (${order}): valid alias beats a rejected canonical, which stays protected`, async () => {
@@ -158,7 +191,7 @@ for (const order of orders) {
 }
 
 async function rejectedCanonicalWithAlias() {
-  const fixture = await writerFixture();
+  const fixture = await writerFixture([3], () => 1e6);
   await fs.copyFile(fixture.file, path.join(fixture.dir, "terminal-0003.json"));
   await reject(fixture.file);
   return fixture;
@@ -172,22 +205,71 @@ const seedInventory = (limit?: number) => (box: Outbox) => {
 };
 const catalogOutcome = (box: Outbox) => box.listPendingTerminals().find(p => p.claim_generation === 3)?.outcome_kind;
 
-// Control (green before and after): a transfer that cannot be admitted does not replace.
-test("C2 control: transfer capacity exhaustion keeps the displaced entry enrolled", async () => {
-  const { root, dir, file } = await rejectedCanonicalWithAlias();
-  const box = await restart("reversed", root, {}, seedInventory(2));
-  assert.equal(catalogOutcome(box), "unknown", "the rejected canonical stays enrolled");
-  assert.ok(await exists(file));
-  assert.ok(await exists(path.join(dir, "terminal-0003.json")));
+// The displaced file inherits the winner's own admitted scope, so a tight catalog
+// limit gives the same enrolled entry and protection in both orders.
+test("R5: at a tight policy catalog limit both orders enroll the same entry and protection", async () => {
+  const snapshots = [];
+  for (const order of orders) {
+    const { root, dir, file } = await rejectedCanonicalWithAlias();
+    const box = await restart(order, root, { now: () => 9e6 }, seedInventory(2));
+    assert.equal((await box.readTerminalJournal(run, 3))?.body.error, "private body");
+    assert.ok(await exists(file));
+    assert.ok(await exists(path.join(dir, "terminal-0003.json")));
+    snapshots.push({
+      outcome: catalogOutcome(box),
+      coverage: box.policyInventoryCoverageAvailable(),
+      sources: box.listPendingOutcomeSources(),
+      protection: await box.hasPhysicalTerminalProtection(run),
+    });
+  }
+  assert.equal(snapshots[0]!.outcome, undefined, "the valid alias replaces the rejected canonical");
+  assert.deepEqual(snapshots[1], snapshots[0]);
 });
 
-test("R5 (reversed): a replacement keeps coverage; a refused transfer marks inventory incomplete", async () => {
-  const open = await rejectedCanonicalWithAlias();
-  const unconstrained = await restart("reversed", open.root, {}, seedInventory());
-  assert.equal(catalogOutcome(unconstrained), undefined, "without the limit the valid alias replaces the rejected canonical");
-  assert.equal(unconstrained.policyInventoryCoverageAvailable(), true);
+// B1: the displaced file's protection must be identical to the forward-order one, including `since`.
+async function sourcesAfterBoot(order: Order, build: (f: Awaited<ReturnType<typeof writerFixture>>) => Promise<void>) {
+  const root = await fs.mkdtemp(path.join(scratch, "boot-arbitration-"));
+  roots.push(root);
+  const writer = new Outbox(options(root, { now: () => 1e6 }));
+  await writer.init();
+  await writer.journalTerminal(run, 3, "implement", 0, { status: "failed", error: "private body" });
+  const dir = path.join(root, run);
+  await build({ root, writer, dir, file: path.join(dir, "terminal-3.json") });
+  const box = await restart(order, root, { now: () => 9e6 });
+  return box.listPendingOutcomeSources();
+}
 
-  const tight = await rejectedCanonicalWithAlias();
-  const box = await restart("reversed", tight.root, {}, seedInventory(2));
-  assert.equal(box.policyInventoryCoverageAvailable(), false);
+test("B1a: canonical plus valid alias report identical sources in both orders", async () => {
+  const build = async (f: { dir: string; file: string }) => { await fs.copyFile(f.file, path.join(f.dir, "terminal-0003.json")); };
+  const forward = await sourcesAfterBoot("forward", build);
+  const reversed = await sourcesAfterBoot("reversed", build);
+  assert.ok(forward.length > 0);
+  assert.deepEqual(reversed, forward);
+});
+
+test("B1b: rejected canonical plus valid alias report identical sources in both orders", async () => {
+  const build = async (f: { dir: string; file: string }) => {
+    await fs.copyFile(f.file, path.join(f.dir, "terminal-0003.json"));
+    await reject(f.file);
+  };
+  const forward = await sourcesAfterBoot("forward", build);
+  const reversed = await sourcesAfterBoot("reversed", build);
+  assert.ok(forward.some(p => p.outcome_kind === "unknown"));
+  assert.deepEqual(reversed, forward);
+});
+
+// N1: the logged file counts do not depend on which file wins.
+test("N1: authenticated_files and rejected_files are order independent", async () => {
+  for (const [rejectCanonical, authenticated, rejected] of [[false, 2, 0], [true, 1, 1]] as const) {
+    for (const order of orders) {
+      const { root, dir, file } = await writerFixture();
+      await fs.copyFile(file, path.join(dir, "terminal-0003.json"));
+      if (rejectCanonical) await reject(file);
+      const rec = recordingLogger();
+      await restart(order, root, { log: rec.logger });
+      const line = rec.lines.find((l: any) => l.msg === "outbox terminal journal load" && l.outcome === "complete") as any;
+      assert.equal(line.authenticated_files, authenticated, `${order} rejectCanonical=${rejectCanonical}`);
+      assert.equal(line.rejected_files, rejected, `${order} rejectCanonical=${rejectCanonical}`);
+    }
+  }
 });
