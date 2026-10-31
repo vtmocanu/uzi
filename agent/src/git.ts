@@ -475,6 +475,15 @@ export function annotateRetainedSuccessorError<T>(error: T, reason: string): T {
   return error;
 }
 
+/** Classify a runGit failure from git's own stderr only. runGit's message embeds the argument list
+ *  (`refs/heads/<branch>`), so classifying the message would let a branch name such as `agent/issue-502`
+ *  or `agent/issue-404` decide the verdict. A failure without retained stderr is permanent. */
+export function classifyGitStderr(error: unknown): "transient" | "permanent" {
+  const retained = error instanceof Error ? retainedGitDiagnostics.get(error) : undefined;
+  const stderr = retained?.stderr.trim();
+  return stderr ? classifyForgeError(new Error(stderr)) : "permanent";
+}
+
 const RETAINED_DIAGNOSTIC_INPUT_MAX = 64 * 1024;
 
 /** Redact unsplit inputs before sanitizing or cutting. Both ends survive a cut so
@@ -3511,7 +3520,7 @@ export class GitCache {
         return await this.runGit(barePath, args, pat, scope, username);
       } catch (cause) {
         if (cause instanceof RunResidueBlockedError || isAbortLike(cause) || this.boundaryAbortError(cause)) throw cause;
-        if (classifyForgeError(cause) !== "transient") throw cause;
+        if (classifyGitStderr(cause) !== "transient") throw cause;
         throw new ScratchPublicationError("cannot reach remote to verify floor", cause, {
           kind: "floor_unreachable", step: "floor_refresh", detail: "remote unreachable during floor refresh",
           rawDetail: execDetail(classifyExecFailure(cause)).rawDetail,

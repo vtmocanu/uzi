@@ -12,14 +12,14 @@ import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 // Real-Git proof that a transient ls-remote/fetch failure during the publication floor refresh is typed
 // `floor_unreachable`, while every other failure keeps its existing `floor_unverified`/movement meaning.
 
-const branch = "agent/issue-1324";
+const defaultBranch = "agent/issue-1324";
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, "-c", "maintenance.auto=false", "-c", "gc.auto=0",
     "-c", "user.name=Test", "-c", "user.email=test@example.org", "-c", "commit.gpgsign=false", ...args],
   { encoding: "utf8", stdio: "pipe", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } }).trim();
 }
 
-async function fixture() {
+async function fixture(branch = defaultBranch) {
   const fx = makeFixture();
   const remote = path.join(fx.dataDir, "remote.git");
   git(fx.dataDir, "clone", "--bare", fx.originPath, remote);
@@ -31,7 +31,7 @@ async function fixture() {
   git(writer, "push", "origin", branch);
   const cache = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
   const bare = await cache.ensureClone(remote);
-  const clone = await cache.createOrAttachRunnerClone(bare, 1324, noProofReseed);
+  const clone = await cache.createOrAttachRunnerClone(bare, Number(branch.split("-").pop()), noProofReseed);
   git(clone.path, "commit", "--allow-empty", "-m", "H");
   const H = git(clone.path, "rev-parse", "HEAD");
   const fetched = await cache.fetchAgentBranch(bare, clone.path, branch, "floor", { context: {
@@ -104,11 +104,16 @@ it("tags an HTTP 503 as floor_unreachable and keeps remote text out of message a
 it("tags a fetch-stage transient failure (ls-remote succeeded) as floor_unreachable", async () => {
   const f = await fixture();
   try {
-    const seam = f.cache as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
-    const original = seam.runGit.bind(f.cache);
-    seam.runGit = async (cwd, args, ...rest) => {
-      if (args[0] === "fetch") throw new Error("git fetch failed: fatal: unable to access: The requested URL returned error: 503");
-      return original(cwd, args, ...rest);
+    // Fail the real fetch process boundary with git-shaped stderr, so runGit retains it as it would live.
+    const seam = f.cache as unknown as { execScoped: (cmd: string, args: string[], ...rest: unknown[]) => Promise<unknown> };
+    const original = seam.execScoped.bind(f.cache);
+    seam.execScoped = async (cmd, args, ...rest) => {
+      if (args.includes("fetch")) {
+        throw Object.assign(new Error("Command failed: git fetch"), {
+          code: 128, stderr: "fatal: unable to access: The requested URL returned error: 503",
+        });
+      }
+      return original(cmd, args, ...rest);
     };
     await assert.rejects(f.publish(), (e: unknown) => e instanceof ScratchPublicationError && e.kind === "floor_unreachable");
   } finally { f.fx.cleanup(); }
@@ -165,6 +170,22 @@ it("keeps an unrecognised remote failure as floor_unverified", async () => {
   } finally { f.fx.cleanup(); }
 });
 
+it("does not classify the branch name: a permanent remote failure on agent/issue-502 stays floor_unverified", async () => {
+  const f = await fixture("agent/issue-502");
+  try {
+    f.setRemoteUrl(path.join(f.fx.dataDir, "does-not-exist.git"));
+    await assert.rejects(f.publish(), (e: unknown) => e instanceof ScratchPublicationError && e.kind === "floor_unverified");
+  } finally { f.fx.cleanup(); }
+});
+
+it("does not classify the branch name: a real outage on agent/issue-404 is still floor_unreachable", async () => {
+  const f = await fixture("agent/issue-404");
+  try {
+    f.setRemoteUrl(await closedPortUrl());
+    await assert.rejects(f.publish(), (e: unknown) => e instanceof ScratchPublicationError && e.kind === "floor_unreachable");
+  } finally { f.fx.cleanup(); }
+});
+
 it("keeps a local git failure as floor_unverified even when its text looks transient", async () => {
   const f = await fixture();
   try {
@@ -193,6 +214,6 @@ it("leaves remote_branch_advanced unchanged", async () => {
   try {
     const R = f.advance();
     await assert.rejects(f.publish(), (e: unknown) => e instanceof ScratchPublicationError && e.kind === "remote_branch_advanced");
-    assert.equal(git(f.remote, "rev-parse", branch), R);
+    assert.equal(git(f.remote, "rev-parse", defaultBranch), R);
   } finally { f.fx.cleanup(); }
 });

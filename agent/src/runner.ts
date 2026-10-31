@@ -215,6 +215,7 @@ import {
   RemoteBranchAdvancedError,
   type PublicationFloor,
   classifyPlanningCaptureError,
+  classifyGitStderr,
 } from "./git.js";
 import {
   buildCheckEnv,
@@ -9268,7 +9269,7 @@ export class RunRunner {
           throw publicationForgeUnreachable(flight.redactText, "git", "floor_refresh", error);
         }
         if (atPush && !(error instanceof ScratchPublicationError) && !(error instanceof PublicationRefusedSignal)
-          && classifyForgeError(error) === "transient") {
+          && classifyGitStderr(error) === "transient") {
           throw publicationForgeUnreachable(flight.redactText, "git", "push", error);
         }
         throw error;

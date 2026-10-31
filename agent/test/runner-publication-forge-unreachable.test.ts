@@ -39,6 +39,20 @@ const failedReason = (runId: string) =>
   api.states.find(s => s.runId === runId && s.body.status === "failed")?.body.failure_reason ?? "";
 
 type Seam = { runGit(cwd: string, args: string[], ...rest: unknown[]): Promise<string> };
+type ExecSeam = { execScoped(cmd: string, args: string[], ...rest: unknown[]): Promise<unknown> };
+
+/** Fail one git subcommand at the process boundary with the given stderr, so runGit retains it as it does live. */
+function failGit(sub: string, stderr: string, onHit: () => void): void {
+  const seam = git as unknown as ExecSeam;
+  const real = seam.execScoped.bind(git);
+  seam.execScoped = async (cmd, args, ...rest) => {
+    if (cmd === "git" && args.includes(sub)) {
+      onHit();
+      throw Object.assign(new Error(`Command failed: git ${args.join(" ")}`), { code: 128, stderr });
+    }
+    return real(cmd, args, ...rest);
+  };
+}
 
 const ATTEMPTS = FORGE_RETRY_SCHEDULE.length + 1;
 
@@ -51,16 +65,8 @@ function countPreflights(): () => number {
 
 it("floor_unreachable retries with a full proof per attempt, then exhausts as a typed git/floor_refresh error", async t => {
   const claim = gitlabClaim(4101);
-  const seam = git as unknown as Seam;
-  const real = seam.runGit.bind(git);
   let listings = 0;
-  seam.runGit = async (cwd, args, ...rest) => {
-    if (args[0] === "ls-remote") {
-      listings++;
-      throw new Error("git ls-remote -- origin failed: fatal: unable to access: Failed to connect to forge.test port 443: Connection refused");
-    }
-    return real(cwd, args, ...rest);
-  };
+  failGit("ls-remote", "fatal: unable to access: Failed to connect to forge.test port 443: Connection refused", () => { listings++; });
   const preflights = countPreflights();
   const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
   instantRetries(r);
@@ -78,13 +84,8 @@ it("floor_unreachable retries with a full proof per attempt, then exhausts as a 
 
 it("a transient raw push failure reruns the proof per attempt and exhausts as a typed git/push error", async t => {
   const claim = gitlabClaim(4102);
-  const seam = git as unknown as Seam;
-  const real = seam.runGit.bind(git);
   let pushes = 0;
-  seam.runGit = async (cwd, args, ...rest) => {
-    if (args[0] === "push") { pushes++; throw new Error("git push failed: fatal: unable to access: connection reset by peer"); }
-    return real(cwd, args, ...rest);
-  };
+  failGit("push", "fatal: unable to access: connection reset by peer", () => { pushes++; });
   const preflights = countPreflights();
   const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
   instantRetries(r);
@@ -110,6 +111,20 @@ it("a permanent push rejection keeps today's behaviour and is not typed", async 
   const seen = hookRecorder(t, r);
   await r.execute(claim);
   assert.equal(pushes, 1);
+  assert.equal(seen.length, 0);
+  assert.doesNotMatch(failedReason(claim.run_id), /publication_forge_unreachable/);
+});
+
+it("a permanent push stderr is not typed even when the branch name looks like a transient status", async t => {
+  // The branch is agent/issue-502 and git's argument list carries it; only git's own stderr may decide.
+  const claim = gitlabClaim(502);
+  let pushes = 0;
+  failGit("push", "fatal: the remote end hung up on policy grounds", () => { pushes++; });
+  const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
+  instantRetries(r);
+  const seen = hookRecorder(t, r);
+  await r.execute(claim);
+  assert.ok(pushes >= 1);
   assert.equal(seen.length, 0);
   assert.doesNotMatch(failedReason(claim.run_id), /publication_forge_unreachable/);
 });
@@ -195,12 +210,7 @@ it("a deadline abort during the last push attempt stays permanent and is not typ
 it("the hook logs one warn carrying run id, surface, step and a redacted raw detail", async () => {
   const claim = gitlabClaim(4109);
   const secret = claim.secrets.forge_pat;
-  const seam = git as unknown as Seam;
-  const real = seam.runGit.bind(git);
-  seam.runGit = async (cwd, args, ...rest) => {
-    if (args[0] === "push") throw new Error(`git push failed: fatal: unable to access https://oauth2:${secret}@forge.test/x.git: connection reset by peer`);
-    return real(cwd, args, ...rest);
-  };
+  failGit("push", `fatal: unable to access https://oauth2:${secret}@forge.test/x.git: connection reset by peer`, () => {});
   const warns: Array<{ msg: string; fields: Record<string, unknown> | undefined }> = [];
   const base = nullLogger();
   const log: Logger = {
@@ -273,7 +283,7 @@ it("a GitHub align-path push outage invokes the hook once and surfaces the typed
     },
   };
   let pushes = 0;
-  git.pushBranch = (async () => { pushes++; throw new Error("git push failed: fatal: unable to access: connection reset by peer"); }) as typeof git.pushBranch;
+  failGit("push", "fatal: unable to access: connection reset by peer", () => { pushes++; });
   const r = new RunRunner(client, git, () => ({ executor }), nullLogger(), 20, undefined,
     { pollMs: 5, planApprovalTimeoutMs: 0, github: fakeGitHub().github });
   instantRetries(r);
