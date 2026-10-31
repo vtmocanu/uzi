@@ -414,10 +414,11 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		{"worker_memory_pressure_v1"},
 		{"worker_memory_authority_claim_v1"}, // issue #3142: this api accepts the run-lane claim body's memory_authority member
 		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1"}, // PRD #1392 M1; issue #2625 adds the redundancy route
-		{"heartbeat_outbox"},          // PRD #1391 M5, Run A
-		{"worker_residue_quarantine"}, // issue #2213: this api accepts the heartbeat's residue_quarantine member
-		{"claim_generation_fence"},    // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
-		{"terminal_fence"},            // PRD #1391 Run B M3c: this api fences a terminal transition on messages_through_seq contiguity
+		{"heartbeat_outbox"},               // PRD #1391 M5, Run A
+		{"heartbeat_outbox_root_unusable"}, // optional worker-global diagnostic
+		{"worker_residue_quarantine"},      // issue #2213: this api accepts the heartbeat's residue_quarantine member
+		{"claim_generation_fence"},         // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
+		{"terminal_fence"},                 // PRD #1391 Run B M3c: this api fences a terminal transition on messages_through_seq contiguity
 		// Issue #1766 M2: this api accepts {status:"recovery_wait", recovery_cause:"vault_locked"}
 		// and stores the cause. Advertised UNCONDITIONALLY (no config gates the park): a worker
 		// must see it before sending the cause, because an older api 400s an unknown recovery_cause.
@@ -524,6 +525,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// `heartbeat_outbox` AND a run has depth, so an older api never sees it and a
 		// current worker on a rolled-back api strips it on the generic-400 retry (D8).
 		Outbox                  json.RawMessage                    `json:"outbox"`
+		OutboxRootUnusable      json.RawMessage                    `json:"outbox_root_unusable"`
 		DindMeter               json.RawMessage                    `json:"dind_meter"`
 		DindMaintenanceReadyACK *workersvc.DindMaintenanceReadyACK `json:"dind_maintenance_ready_ack"`
 		// ActiveSnapshot is the worker's active-run snapshot (PRD #1390 M2a), its OWN isolated
@@ -582,6 +584,12 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	var rootUnusable string
+	// Isolated enum parsing drops invalid telemetry without failing liveness.
+	if len(req.OutboxRootUnusable) <= 32 {
+		_ = json.Unmarshal(req.OutboxRootUnusable, &rootUnusable)
+	}
+	h.wsvc.RecordOutboxRootUnusable(wkr.ID, rootUnusable)
 	dto := workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
 	h.overlayEphemeralLease(&dto, updated.LeaseSince, updated.DrainingSince)
 	h.overlayWorkerReports(&dto, updated.ID)

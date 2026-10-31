@@ -2723,6 +2723,8 @@ export interface Worker {
   // outbox_blocked describes), shown to the worker's owner. Untrusted worker text: never
   // joined to a run's title or status.
   outbox_blocked_run_id?: string | null;
+  /** Worker-global root diagnostic, distinct from per-run arbitration. */
+  outbox_root_unusable?: string | null;
   // The worker's residue-quarantine latch (issue #2213): it found an unreadable,
   // unattributed process running as its own uid, so it claims nothing and starts no
   // forge-credentialed git and no new Claude/Codex turn until its container restarts.

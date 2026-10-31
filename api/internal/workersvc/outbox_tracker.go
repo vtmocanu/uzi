@@ -86,8 +86,42 @@ const outboxCapWarnEvery = time.Minute
 // wholesale on every report (record), so a run the worker no longer lists drops out
 // — that is how "clears on the next empty report" works at the per-run grain.
 type outboxWorkerState struct {
-	updatedAt time.Time
-	runs      map[uuid.UUID]OutboxEntry
+	updatedAt    time.Time
+	runs         map[uuid.UUID]OutboxEntry
+	rootUnusable string
+}
+
+// recordRootUnusable shares the existing worker cap, TTL and deletion lifecycle.
+// It is advisory telemetry, independent of per-run arbitration and blocked reasons.
+func (t *outboxTracker) recordRootUnusable(workerID uuid.UUID, reason string, now time.Time) {
+	if reason != "symlink" && reason != "unreadable" {
+		reason = ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st := t.workers[workerID]
+	if st == nil {
+		if reason == "" || len(t.workers) >= outboxTrackerMaxWorkers {
+			return
+		}
+		st = &outboxWorkerState{}
+		t.workers[workerID] = st
+	}
+	st.rootUnusable = reason
+	st.updatedAt = now
+	if reason == "" && len(st.runs) == 0 {
+		delete(t.workers, workerID)
+	}
+}
+
+func (t *outboxTracker) rootUnusable(workerID uuid.UUID) *string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if st := t.workers[workerID]; st != nil && st.rootUnusable != "" {
+		reason := st.rootUnusable
+		return &reason
+	}
+	return nil
 }
 
 // outboxTracker is the whole of M5's server-side visibility state. Modelled exactly

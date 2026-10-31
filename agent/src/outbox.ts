@@ -547,6 +547,40 @@ export class Outbox {
    *  present, or the root is a symlink): every write is a no-op and drain
    *  replays nothing. */
   private disabled = false;
+  private rootUnusable: "symlink" | "unreadable" | undefined;
+
+  /** Root visibility failure, distinct from key failures or incomplete inventory. */
+  unusableRootReason(): "symlink" | "unreadable" | undefined { return this.rootUnusable; }
+
+  private async classifyUnusableRoot(): Promise<void> {
+    try {
+      const stat = await fs.lstat(this.root);
+      if (stat.isSymbolicLink()) this.rootUnusable = "symlink";
+      else if (stat.isDirectory()) this.rootUnusable = "unreadable";
+      return;
+    } catch (err) {
+      if (!["ENOENT", "ENOTDIR"].includes((err as NodeJS.ErrnoException).code ?? "")) {
+        this.rootUnusable = "unreadable";
+        return;
+      }
+    }
+    // Inspect components without following aliases, like the exact-target missing-root
+    // proof. Only a proven missing/non-directory path retains the ordinary fallback.
+    let component = path.parse(this.root).root;
+    for (const name of this.root.slice(component.length).split(path.sep)) {
+      component = path.join(component, name);
+      try {
+        const stat = await fs.lstat(component);
+        if (stat.isSymbolicLink()) { this.rootUnusable = "symlink"; return; }
+        if (!stat.isDirectory()) return;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") this.rootUnusable = "unreadable";
+        return;
+      }
+    }
+    this.rootUnusable = "unreadable"; // the path reappeared after the failed read
+  }
 
   constructor(opts: OutboxOptions) {
     this.root = path.resolve(opts.root);
@@ -584,11 +618,13 @@ export class Outbox {
           path: this.root,
         });
         this.disabled = true;
+        this.rootUnusable = "symlink";
         return;
       }
     } catch (err) {
       this.log.error("outbox: cannot create root; disabling", { error: errText(err) });
       this.disabled = true;
+      await this.classifyUnusableRoot();
       return;
     }
 
@@ -605,6 +641,7 @@ export class Outbox {
     } catch (err) {
       this.log.error("outbox: cannot read root; disabling", { error: errText(err) });
       this.disabled = true;
+      await this.classifyUnusableRoot();
       return;
     }
     for (const e of entries) {

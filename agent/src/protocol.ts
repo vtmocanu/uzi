@@ -819,6 +819,8 @@ export interface HeartbeatRequest {
    * field and the heartbeat wire stays byte-identical to today when it is unset.
    */
   outbox?: OutboxHeartbeatEntry[];
+  /** Optional worker-global root diagnostic; never per-run arbitration evidence. */
+  outbox_root_unusable?: "symlink" | "unreadable" | null;
   /**
    * The worker's active-run snapshot (PRD #1390 M2a). Sent ONLY when the server
    * advertised `active_run_snapshot` in the current API feature cache and an original

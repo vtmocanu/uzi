@@ -2476,6 +2476,7 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	s.quarantine.evictIfSet(wkr.ID)
 	// A fresh incarnation reports its own memory authority (issue #3142).
 	s.memAuthority.evictIfSet(wkr.ID)
+	s.RecordOutboxRootUnusable(wkr.ID, "")
 	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 	// template is the worker's self-reported image template (PRD #18); empty →
 	// NULL (older image sends none). Soft signal only; never rejected here.
@@ -3161,6 +3162,21 @@ func (s *Service) RecordResidueQuarantine(workerID uuid.UUID, q *ResidueQuaranti
 		return
 	}
 	s.quarantine.record(workerID, q, s.now())
+}
+
+// RecordOutboxRootUnusable records bounded, restart-losing worker health telemetry.
+// Missing, invalid and healthy reports clear it; it is never transition authority.
+func (s *Service) RecordOutboxRootUnusable(workerID uuid.UUID, reason string) {
+	if s.outbox != nil {
+		s.outbox.recordRootUnusable(workerID, reason, s.now())
+	}
+}
+
+func (s *Service) OutboxRootUnusable(workerID uuid.UUID) *string {
+	if s.outbox == nil {
+		return nil
+	}
+	return s.outbox.rootUnusable(workerID)
 }
 
 // ResidueQuarantineFor returns the worker's last reported residue-quarantine latch, for

@@ -115,6 +115,78 @@ it(`D1: real Worker claims ordinary work with incomplete ${scenario} coverage (s
   } finally { clearTimeout(timer); controller.abort(); await running; }
 });
 
+for (const scenario of ["key", "impossible"] as const)
+it(`D2: ${scenario} disablement does not invent a root visibility fault`, async t => {
+  const dir = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "worker-disabled-"));
+  tmpRoots.push(dir);
+  let root = dir;
+  if (scenario === "key") await fs.writeFile(path.join(root, ".key"), "invalid");
+  else { await fs.writeFile(path.join(dir, "file"), "file"); root = path.join(dir, "file", "outbox"); }
+  const outbox = new Outbox({ root, log: nullLogger(), runMaxBytes: 1e6, maxBytes: 4e6, retentionMs: 86400000 });
+  await outbox.init();
+  t.after(() => outbox.closeTerminalObservationScan());
+  assert.equal(outbox.isDisabled(), true);
+  assert.equal(outbox.unusableRootReason(), undefined);
+  const controller = new AbortController();
+  let observed!: () => void;
+  const claimed = new Promise<void>(resolve => { observed = resolve; });
+  const client = idleClient();
+  Object.assign(client, { hasFeature: () => false,
+    claimRun: async () => { observed(); controller.abort(); return null; } });
+  const worker = new Worker(fakeConfig(), client, idleRunner, idleChat, noJudge, noReview,
+    nullLogger(), okPreflight, outbox);
+  const running = worker.run(controller.signal);
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try { await Promise.race([claimed, running.then(() => { throw new Error("non-root disablement blocked intake"); })]); }
+  finally { clearTimeout(timer); controller.abort(); await running; }
+});
+
+for (const scoped of [false, true]) for (const reason of ["symlink", "unreadable"] as const)
+it(`D2: an unusable ${reason} root stops new claims and reports health (scoped=${scoped})`, async t => {
+  const dir = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "worker-unusable-"));
+  tmpRoots.push(dir);
+  const root = path.join(dir, "outbox");
+  await fs.mkdir(root);
+  if (reason === "symlink") {
+    await fs.rename(root, path.join(dir, "saved"));
+    await fs.symlink(path.join(dir, "saved"), root, "dir");
+  } else {
+    const readdir = fs.readdir.bind(fs);
+    t.mock.method(fs, "readdir", async (...args: Parameters<typeof fs.readdir>) => {
+      if (args[0] === root) throw Object.assign(new Error("denied"), { code: "EACCES" });
+      return readdir(...args);
+    });
+  }
+  const outbox = new Outbox({ root, log: nullLogger(), runMaxBytes: 1e6, maxBytes: 4e6, retentionMs: 86400000 });
+  await outbox.init();
+  t.after(() => outbox.closeTerminalObservationScan());
+  assert.equal(outbox.isDisabled(), true);
+  const controller = new AbortController();
+  let claims = 0;
+  let health: unknown;
+  let ticks = 0;
+  let observed!: () => void;
+  const heartbeat = new Promise<void>(resolve => { observed = resolve; });
+  const client = idleClient();
+  Object.assign(client, {
+    hasFeature: () => false, supportsScopedPendingClaim: scoped,
+    claimRun: async () => { claims++; return null; },
+    claimCrossCheck: async () => { claims++; return null; },
+    claimChat: async () => { claims++; return null; },
+    heartbeat: async (...args: unknown[]) => { health = args[5]; if (++ticks === 2) observed(); },
+  });
+  const worker = new Worker(fakeConfig({ crossCheckSlots: 1 }), client, idleRunner, idleChat, noJudge, noReview,
+    nullLogger(), okPreflight, outbox);
+  const running = worker.run(controller.signal);
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    await Promise.race([heartbeat, running.then(() => { throw new Error("heartbeat not reached"); })]);
+    // The heartbeat has run alongside every enabled intake lane.
+    assert.equal(claims, 0, "a broken root must not manufacture new claimed runs");
+    assert.equal(health, reason);
+  } finally { clearTimeout(timer); controller.abort(); await running; }
+});
+
 describe("Worker outbox drainer (PRD #1391 M2)", () => {
   it("drain is SINGLE-FLIGHT: overlapping boot + heartbeat triggers never run the drain body concurrently", async () => {
     let release!: () => void;

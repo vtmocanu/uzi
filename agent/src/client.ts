@@ -1818,9 +1818,11 @@ export class WorkerClient {
     activeSnapshot?: ActiveSnapshot,
     maintenance?: { sample?: DindMeterSample | null; ack?: DindMaintenanceReadyACK },
     quarantine?: ResidueQuarantineState,
+    outboxRootUnusable?: "symlink" | "unreadable",
   ): Promise<boolean | undefined> {
     this.latestDindMaintenanceValue = undefined;
     const body: HeartbeatRequest = { version: this.version };
+    if (this.hasFeature("heartbeat_outbox_root_unusable")) body.outbox_root_unusable = outboxRootUnusable ?? null;
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
     // bytes and a collector-less tick is indistinguishable from an old worker.
@@ -1873,11 +1875,17 @@ export class WorkerClient {
       };
     }
     const includeExtension = body.protocol_refresh !== undefined || includeOutbox || includeSnapshot || body.dind_meter !== undefined ||
-      body.dind_maintenance_ready_ack !== undefined || includeQuarantine;
+      body.dind_maintenance_ready_ack !== undefined || includeQuarantine || body.outbox_root_unusable !== undefined;
     try {
       try {
         return await this.postHeartbeat(body);
       } catch (err) {
+        // A diagnostic rejected after API rollback must not strip protection fields.
+        if (body.outbox_root_unusable !== undefined && isStrictDecodeError(err)) {
+          delete body.outbox_root_unusable;
+          this.dropFeature("heartbeat_outbox_root_unusable");
+          return await this.postHeartbeat(body);
+        }
         // A stale ACK gets one ACK-free resync; sibling extensions remain intact.
         // Any failure of that request reaches the usual strict-decode fallback below.
         if (!body.dind_maintenance_ready_ack || !(err instanceof RequestError) || err.status !== 409) throw err;

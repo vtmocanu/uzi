@@ -647,15 +647,24 @@ func outboxCell(w apitypes.WorkerDTO) string {
 	if w.OutboxPendingMessages != nil {
 		pending = *w.OutboxPendingMessages
 	}
+	s := "-"
 	if pending == 0 {
 		if blocked {
-			return "blocked"
+			s = "blocked"
 		}
-		return "-"
+	} else {
+		s = strconv.Itoa(pending)
+		if blocked {
+			s += " (blocked)"
+		}
 	}
-	s := strconv.Itoa(pending)
-	if blocked {
-		s += " (blocked)"
+	if w.OutboxRootUnusable != nil {
+		diagnostic := "disabled:" + cellText(*w.OutboxRootUnusable)
+		if s == "-" {
+			s = diagnostic
+		} else {
+			s += " (" + diagnostic + ")"
+		}
 	}
 	return s
 }

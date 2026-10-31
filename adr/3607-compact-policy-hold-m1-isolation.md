@@ -101,9 +101,20 @@ The existing pre-factory admission refusal can leave the server row `claimed`.
 Snapshot-absence requeue targets running/awaiting states; claimed-never-started
 requeue is separately suppressed while heartbeat overflow protection remains
 live. A continuously inaccessible root can therefore retain the claimed row
-until storage repair. This is an open review disposition, not an automatic
-requeue guarantee. An actionable worker diagnostic and the final admission/
-already-claimed behavior must be decided before publication.
+until storage repair. There is no automatic release or requeue guarantee for
+already-claimed or running targets; these remain operator-held.
+
+When initialization positively finds a symlinked or unreadable outbox root, the
+worker stops all new run, cross-check and chat claims in both negotiation modes.
+This intake stop is distinct from healthy but incomplete inventory coverage and
+from key failures on an otherwise readable root. Heartbeats and drains continue.
+The optional `heartbeat_outbox_root_unusable` API feature negotiates the
+`outbox_root_unusable` heartbeat/worker DTO diagnostic. It
+reports only `symlink` or `unreadable`, independently of per-run `outbox_blocked`.
+It uses the existing bounded, ten-minute in-memory outbox tracker, clears on a
+healthy/absent report or registration, and is visible in `uzi worker list`.
+Browser rendering remains deferred. Repair preserves the original `.key` and
+all journals, then restarts the worker; an empty replacement is never recovery.
 
 ### Bounded demand and recovery, without a startup rewrite
 

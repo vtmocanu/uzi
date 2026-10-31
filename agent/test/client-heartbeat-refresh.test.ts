@@ -33,6 +33,32 @@ function fixture(register: Record<string, unknown> = {}) {
 const heartbeatBodies = (f: ReturnType<typeof fixture>) =>
   f.requests.filter((r) => r.path.endsWith("/heartbeat")).map((r) => r.body);
 
+it("D2: root diagnostics are negotiated, clear when healthy, and rollback preserves sibling protection", async () => {
+  const f = fixture({ protocol_features: [REFRESH, "active_run_snapshot", "heartbeat_outbox_root_unusable"] });
+  await f.client.register("w", undefined, 4, undefined, [], undefined, 0);
+  let attempts = 0;
+  f.setReply(() => ++attempts === 1 ? json({ error: "invalid request body" }, 400) : json({}));
+  await f.client.heartbeat(undefined, undefined, snapshot, undefined, undefined, "symlink");
+  const [first, retry] = heartbeatBodies(f);
+  assert.equal(first?.outbox_root_unusable, "symlink");
+  assert.equal(retry?.outbox_root_unusable, undefined);
+  assert.deepEqual(retry?.active_snapshot, first?.active_snapshot);
+  assert.deepEqual(retry?.protocol_refresh, first?.protocol_refresh);
+  assert.ok(retry?.active_snapshot);
+  assert.ok(retry?.protocol_refresh);
+  assert.equal(f.client.hasFeature("active_run_snapshot"), true);
+  assert.equal(f.client.hasFeature("heartbeat_outbox_root_unusable"), false);
+
+  const old = fixture();
+  await old.client.register("w");
+  await old.client.heartbeat(undefined, undefined, undefined, undefined, undefined, "unreadable");
+  assert.deepEqual(heartbeatBodies(old), [{ version: "test" }]);
+  const healthy = fixture({ protocol_features: ["heartbeat_outbox_root_unusable"] });
+  await healthy.client.register("w");
+  await healthy.client.heartbeat();
+  assert.equal(heartbeatBodies(healthy)[0]?.outbox_root_unusable, null);
+});
+
 it("discovers on one ordinary tick and reports original unfiltered capabilities on the next, with one register", async () => {
   const f = fixture({ protocol_capabilities: ["server-accepted-only"] });
   const caps = ["credential_switch_v1", "unknown-new-cap"];

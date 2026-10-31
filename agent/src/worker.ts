@@ -1142,6 +1142,7 @@ export class Worker {
           { sample: stats.latestDindSample, ack: this.dindMaintenance?.acknowledgement() },
           // issue #2213: the quarantine latch (the client sends it only when negotiated).
           residueQuarantine(),
+          this.outbox?.unusableRootReason?.(),
         );
         ok = true;
         // Heartbeat negotiation can grow or shrink support without a new incarnation.
@@ -1363,6 +1364,10 @@ export class Worker {
     let loggedAtCapacity = false;
     let loggedQuarantined = false;
     while (!signal.aborted) {
+      if (this.outbox?.unusableRootReason?.() !== undefined) {
+        await sleep(this.config.pollIntervalMs, signal);
+        continue;
+      }
       // PRD #1390 M4 (e2e ONLY): the env-gated drop-execution seam pauses claiming (via the
       // shared registry latch) so a silently-dropped run can be observed sitting `queued`
       // before any reclaim. isClaimPausedForE2E() is a constant `false` in production (nothing
@@ -1581,6 +1586,10 @@ export class Worker {
     const gate = this.claimGate ?? this.dindMaintenance?.gate ?? this.dindPrune?.gate;
     let loggedQuarantined = false;
     while (!signal.aborted) {
+      if (this.outbox?.unusableRootReason?.() !== undefined) {
+        await sleep(this.config.chatPollMs, signal);
+        continue;
+      }
       // issue #2213: the same quarantine gate as the run lane (see claimLoop).
       if (residueQuarantine() !== undefined) {
         if (!loggedQuarantined) {
