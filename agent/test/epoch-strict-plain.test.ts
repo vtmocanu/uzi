@@ -1,0 +1,187 @@
+import { afterEach, beforeEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { formatAttemptId } from "../src/attempt-path.js";
+import { GitCache, type RetainedHoldsSnapshot, type RetainedLifecycleSnapshot, type RetainedSourceEvidence } from "../src/git.js";
+import { resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
+import { makeFixture, type Fixture } from "./fixture-repo.js";
+import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
+
+// Read-only strict-plain epoch evaluation: a stale `live` attempt named solely by its exact plain
+// journal gets an `epochSettlement`; nothing is written, and operator inspection never sets it.
+
+const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+const NO_HOLDS: RetainedHoldsSnapshot = { state: "read", holds: [] };
+const TERMINAL: RetainedLifecycleSnapshot = { state: "terminal", status: "completed" };
+const RUN = "run-strict";
+const BRANCH = "agent/issue-3431";
+
+let fx: Fixture;
+let git: GitCache;
+let bare: string;
+
+function gitIn(dir: string, args: string[]): string {
+  return execFileSync("git", ["-C", dir, ...args], { env: GIT_ENV, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+}
+function idAt(n: number): string {
+  return formatAttemptId(new Date(Date.UTC(2026, 0, 1, 0, 0, n)), 1, n.toString(16).padStart(16, "0"));
+}
+function journalRaw(branch = BRANCH): string {
+  return gitIn(bare, ["config", "--local", `uzi-recovery.${branch}.clone`]);
+}
+function setJournal(raw: string, branch = BRANCH): void {
+  gitIn(bare, ["config", "--local", `uzi-recovery.${branch}.clone`, raw]);
+}
+
+beforeEach(async () => {
+  fx = makeFixture();
+  git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  bare = await git.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700);
+  fs.chmodSync(bare, 0o700);
+});
+afterEach(() => {
+  resetResidueQuarantineForTests();
+  fx.cleanup();
+});
+
+/** A REAL live attempt clone seeded through production, with its production plain journal. */
+async function seed(n = 1) {
+  const key = "issue-3431";
+  const attemptId = idAt(n);
+  const clone = await git.runnerCloneForBranch(bare, BRANCH, key, noProofReseed, RUN, false, undefined,
+    { attemptId, isLive: () => false, beforeSeed: async () => {} });
+  await git.markRecoveryCapture(bare, clone.path, BRANCH, RUN, attemptId);
+  return { attemptId, clonePath: clone.path, key };
+}
+function strictJournal(a: { attemptId: string; clonePath: string }): string {
+  return JSON.stringify({ runId: RUN, clonePath: a.clonePath, attemptId: a.attemptId });
+}
+async function inspect(a: { attemptId: string }, over: { epoch?: boolean; holds?: RetainedHoldsSnapshot } = {}): Promise<RetainedSourceEvidence | undefined> {
+  const r = await git.inspectRetainedSources({
+    selector: { runId: RUN, generation: 1, attempt: a.attemptId }, holds: over.holds ?? NO_HOLDS, lifecycle: TERMINAL,
+    isLivePath: () => false, barePath: bare, ...(over.epoch === false ? {} : { epoch: true }),
+  });
+  assert.ok(r.sources.length <= 1);
+  return r.sources[0];
+}
+async function settlementOf(a: { attemptId: string }, over: Parameters<typeof inspect>[1] = {}) {
+  return (await inspect(a, over))?.epochSettlement;
+}
+
+describe("strict-plain epoch settlement", () => {
+  it("settles an exact plain journal on a stale live attempt while the ordinary disposition stays refused", async () => {
+    const a = await seed();
+    assert.equal(journalRaw(), strictJournal(a), "production writes the exact canonical spelling");
+    const ev = await inspect(a);
+    assert.equal(ev!.ledgerState, "live");
+    assert.deepEqual(ev!.epochSettlement, { basis: "strict_plain", disposition: { kind: "local_discard" } });
+    assert.equal(ev!.disposition?.kind, "refused");
+    const consumers = (ev!.disposition as { consumers: string[] }).consumers;
+    assert.ok(consumers.includes("ledger_live"));
+    assert.ok(consumers.some(c => c.startsWith("named_by_journal:")));
+  });
+
+  const sha = () => gitIn(bare, ["rev-parse", "HEAD"]);
+  const extras: Array<[string, () => unknown, boolean]> = [
+    ["restoreTip", sha, true],
+    ["retainedSources", () => [], true],
+    ["peeledMarkers", () => [sha()], true],
+    ["unknownKey", () => 1, false],
+    // These records have strict inner grammars; an invalid one makes the whole bare unreadable.
+    ["recovery", () => ({ stage: "captured" }), false],
+    ["memoryPark", () => ({ version: 1 }), false],
+    ["completionSourceFence", () => ({ version: 1 }), false],
+  ];
+  for (const [field, value, mustSurvive] of extras) {
+    it(`refuses a journal carrying an extra ${field} field`, async () => {
+      const a = await seed();
+      setJournal(JSON.stringify({ ...JSON.parse(strictJournal(a)), [field]: value() }));
+      const ev = await inspect(a);
+      if (mustSurvive) assert.ok(ev, "the journal still parses, so the refusal is the strict guard's");
+      assert.equal(ev?.epochSettlement, undefined);
+    });
+  }
+
+  it("refuses a runId, clonePath or attemptId mismatch", async () => {
+    const a = await seed();
+    const base = JSON.parse(strictJournal(a));
+    for (const over of [{ runId: "other-run" }, { clonePath: a.clonePath + "-x" }, { attemptId: idAt(9) }]) {
+      setJournal(JSON.stringify({ ...base, ...over }));
+      assert.equal(await settlementOf(a), undefined, JSON.stringify(over));
+    }
+  });
+
+  it("refuses a duplicate-key or reformatted raw journal", async () => {
+    const a = await seed();
+    const dup = `{"runId":"stale","runId":${JSON.stringify(RUN)},"clonePath":${JSON.stringify(a.clonePath)},"attemptId":"${a.attemptId}"}`;
+    for (const raw of [dup, JSON.stringify(JSON.parse(strictJournal(a)), null, 1), strictJournal(a) + " "]) {
+      setJournal(raw);
+      assert.equal(await settlementOf(a), undefined, raw);
+    }
+  });
+
+  it("refuses when another journal also names the path", async () => {
+    const a = await seed();
+    setJournal(strictJournal(a), "agent/issue-other");
+    assert.equal(await settlementOf(a), undefined);
+  });
+
+  it("refuses when a second non-retired attempt shares the clone key, and ignores a retired one", async () => {
+    const a = await seed();
+    const canonical = git.runnerClonePath(bare, a.key);
+    const entry = (n: number, state: string) => JSON.stringify({ attemptId: idAt(n), runId: "other-run",
+      clonePath: `${canonical}.attempt-${idAt(n)}`, state });
+    gitIn(bare, ["config", "--local", "--add", `uzi-attempts.${BRANCH}.entry`, entry(5, "retired")]);
+    assert.equal((await settlementOf(a))?.disposition.kind, "local_discard", "retired entries do not count");
+    for (const state of ["abandoned", "reclaimed", "live"]) {
+      gitIn(bare, ["config", "--local", "--add", `uzi-attempts.${BRANCH}.entry`, entry(6, state)]);
+      assert.equal(await settlementOf(a), undefined, state);
+    }
+  });
+
+  it("keeps an owed pin or an episode pin as a consumer that refuses the basis", async () => {
+    const a = await seed();
+    const tip = gitIn(bare, ["rev-parse", "HEAD"]);
+    gitIn(bare, ["update-ref", `refs/uzi-owed/${RUN}/${tip}`, tip]);
+    assert.equal(await settlementOf(a), undefined, "owed pin");
+    gitIn(bare, ["update-ref", "-d", `refs/uzi-owed/${RUN}/${tip}`]);
+    assert.equal((await settlementOf(a))?.disposition.kind, "local_discard");
+    gitIn(bare, ["update-ref", `refs/uzi-recovery-episode/${RUN}/e1`, tip]);
+    assert.equal(await settlementOf(a), undefined, "episode pin");
+  });
+
+  it("does not settle when holds are unknown or a hold is open", async () => {
+    const a = await seed();
+    const unknown = await settlementOf(a, { holds: { state: "unknown" } });
+    assert.notEqual(unknown?.disposition.kind, "local_discard");
+    const open = await settlementOf(a, { holds: { state: "read", holds: [{ id: "h1", generation: 1 }] } });
+    assert.notEqual(open?.disposition.kind, "local_discard");
+  });
+
+  it("operator inspection never sets it and reports exactly what an epoch read reports", async () => {
+    const a = await seed();
+    const operator = (await inspect(a, { epoch: false }))!;
+    const epoch = (await inspect(a))!;
+    assert.equal("epochSettlement" in operator, false);
+    assert.equal(operator.disposition?.kind, "refused");
+    assert.deepEqual(epoch.disposition, operator.disposition);
+    assert.equal(epoch.descriptor, operator.descriptor);
+    assert.deepEqual(epoch.consumers, operator.consumers);
+  });
+
+  it("writes nothing", async () => {
+    const a = await seed();
+    const snapshot = () => ({
+      config: gitIn(bare, ["config", "--local", "--list"]),
+      refs: gitIn(bare, ["for-each-ref"]),
+      parent: fs.readdirSync(path.dirname(a.clonePath)).sort(),
+      clone: fs.readdirSync(a.clonePath).sort(),
+    });
+    const before = snapshot();
+    assert.equal((await settlementOf(a))?.disposition.kind, "local_discard");
+    assert.deepEqual(snapshot(), before);
+  });
+});
