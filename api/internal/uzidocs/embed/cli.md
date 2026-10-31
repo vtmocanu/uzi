@@ -3285,8 +3285,9 @@ Lists every recorded lead configuration of a run, one row per recorded
 snapshot (`SEQ`) across all claim attempts, so one phase entry usually has
 several rows, newest attempt first and `plan` before `implement`
 within an attempt. Columns: `GEN` (the claim attempt), `PHASE`, `ENTRY` (the
-phase entry within the attempt), `SEQ` (the row number within the attempt and phase; it keeps counting across that phase's entries), `REQUESTED`
-and `SOURCE` (the model and effort uzi asked for, and where each came from),
+phase entry within the attempt), `SEQ` (the row number within the attempt
+and phase; it keeps counting across that phase's entries), `REQUESTED` and
+`SOURCE` (the model and effort uzi asked for, and where each came from),
 `OBSERVED` and `EVIDENCE` (what the runtime reported, and how), and
 `REPORTED` (an RFC 3339 UTC time, with ` (later changes not recorded)` when the
 worker hit its per-phase row limit). A run with no lead agent, or whose worker

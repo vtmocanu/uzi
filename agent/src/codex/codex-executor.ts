@@ -5692,8 +5692,9 @@ export class CodexExecutor implements Executor {
       // PRD #3244: record the lead's requested config for this phase before the turn starts. A new
       // entry only on a phase change (a re-driven turn, replacement turn or recreated epoch of the
       // same phase is a no-op); bounded to 3 s inside the reporter, which never throws.
-      // PRD #3244 M2: every root thread/start and thread/resume reports the thread's resolved config
-      // against the entry bound here; the reporter dedupes an unchanged reading per entry.
+      // PRD #3244 M2: every root thread/start and thread/resume reports the thread's resolved config,
+      // once its first turn/start is accepted (D30), against the entry bound here; the reporter
+      // dedupes an unchanged reading per entry.
       let onRuntimeConfig: RunTurnRequest["onRuntimeConfig"];
       if (ctx.leadConfig) {
         const reporter = ctx.leadConfig;

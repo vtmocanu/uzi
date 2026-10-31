@@ -6321,6 +6321,32 @@ describe("CodexHarness runtime config observation (PRD #3244 M2)", () => {
     assert.deepEqual(obs, []);
   });
 
+  it("a later accepted turn reports once after a refused one, and a further turn does not report again", async () => {
+    const transport = new FakeTransport((method) => {
+      if (method === "thread/start") return { thread: { id: "th-1" }, model: "gpt-6-astra", reasoningEffort: "low" };
+      return defaultResponder(method);
+    });
+    const { harness } = makeHarness({ transport });
+    const obs: unknown[] = [];
+    const onRuntimeConfig = (o: unknown) => { obs.push(o); };
+    try {
+      await assert.rejects(collect(harness.startTurn(makeRequest({
+        effort: "xhigh", onRuntimeConfig,
+        rootDispatch: { prepare: async () => { throw new Error("dispatch refused"); }, check: () => true },
+      })).events), /dispatch refused/);
+      assert.deepEqual(obs, []);
+      transport.push(turnCompleted("completed")).push(turnCompleted("completed"));
+      await collect(harness.startTurn(makeRequest({ effort: "xhigh", onRuntimeConfig })).events);
+      await collect(harness.startTurn(makeRequest({ effort: "xhigh", onRuntimeConfig })).events);
+      transport.end();
+    } finally { await harness.close(); }
+    assert.equal(transport.requests.filter((r) => r.method === "turn/start").length, 2);
+    assert.deepEqual(obs, [{
+      model: "gpt-6-astra", modelEvidence: "codex_thread_response",
+      effort: "xhigh", effortEvidence: "codex_sent",
+    }]);
+  });
+
   it("without a callback nothing is read or required", async () => {
     const transport = new FakeTransport();
     const { harness } = makeHarness({ transport });
