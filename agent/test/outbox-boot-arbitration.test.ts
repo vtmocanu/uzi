@@ -118,6 +118,8 @@ for (const order of orders) {
     const enrolled = runs.get(run)?.terminals.get(3);
     assert.ok(enrolled);
     assert.notEqual(enrolled.budgetDeferred, true, "the deferred loser must not mark the enrolled entry");
+    // The authenticated winner carries no deferral identity; the loser's file version must not land on it.
+    assert.equal(enrolled.deferredVersion, undefined, "the deferred loser must not stamp the enrolled entry's deferredVersion");
     assert.equal((await box.readTerminalJournal(run, 3))?.body.error, "private body");
   });
 
@@ -181,6 +183,14 @@ for (const order of orders) {
     // The read cap is terminalMaxBytes + 64 KiB, so the large canonical is never inspected.
     const box = await restart(order, root, { terminalMaxBytes: 1024 });
     assert.ok(box.listPendingTerminals().some(p => p.claim_generation === 3));
+    if (order === "reversed") {
+      // The canonical is read first (rank 0); the later valid alias must not displace it.
+      const runs = (box as unknown as { runs: Map<string, { terminals: Map<number, { fileName: string; outcomeKind?: string }> }> }).runs;
+      const enrolled = runs.get(run)?.terminals.get(3);
+      assert.equal(enrolled?.fileName, "terminal-3.json");
+      assert.equal(enrolled?.outcomeKind, "unknown");
+      assert.equal(box.listPendingTerminals().find(p => p.claim_generation === 3)?.outcome_kind, "unknown");
+    }
     await box.retireTerminal(run, 3);
     assert.deepEqual(await fs.readFile(file), before, "the uninspected canonical is untouched");
     // Whichever file was enrolled, the other is covered by a held scope: protection survives deletion of both.

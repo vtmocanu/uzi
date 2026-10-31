@@ -247,11 +247,17 @@ The displaced file inherits the current (winner's) file's already-admitted held
 inspection scope, re-keyed to the displaced filename: the source key and the
 displaced entry's MAC or source binding replace the winner's, the original
 `since` is kept, and the token is not deleted. This needs no extra catalog
-capacity and leaves exactly the held counted scope that reading the displaced
-file after the winner would have produced, `since` included, so forward and
-reverse enumeration are equal even at exact capacity. If a replacement
+capacity and leaves the held counted scope that reading the displaced file
+after the winner would have produced: the same source key, binding and catalog
+count in either enumeration order, even at exact capacity. Its `since` is the
+boot read's reservation time, so it is equal across orders only up to the
+clock reads between them, and retained scopes are listed in reservation order,
+not by generation. If a replacement
 policy_hold fails metadata admission nothing changes: the enrolled entry stays
-and the inventory is marked incomplete (fail closed).
+and the inventory is marked incomplete (fail closed). The same oversized
+policy_hold read first takes the existing admission `break`, which stops that
+directory without marking the inventory incomplete; this pre-existing
+asymmetry is recorded here, not changed.
 
 Deferral identity (`deferredVersion`, `budgetDeferred`) is only written to the
 entry whose own filename was read, so a loser never alters the enrolled entry.
