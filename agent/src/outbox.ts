@@ -2954,7 +2954,7 @@ export class Outbox {
     if (represented && initial?.outcomeKind === "terminal") {
       try {
         const stat = await fs.lstat(path.join(this.runDir(runId), fileName), { bigint: true });
-        represented = !stat.isFile() || initial.ordinaryVersion === fileVersion(stat);
+        represented = !stat.isSymbolicLink() && (stat.isDirectory() || initial.ordinaryVersion === fileVersion(stat));
       } catch (err) {
         // A missing represented ordinary source remains a transient read.
         represented = (err as NodeJS.ErrnoException).code === "ENOENT";
@@ -3390,8 +3390,7 @@ export class Outbox {
         // memory evidence, and keep a surviving alias visible to snapshot admission.
         const terminals = this.runs.get(physicalRunId)?.terminals;
         const meta = terminals?.get(generation);
-        if (meta === capturedMeta && meta?.outcomeKind === "unknown" && !meta.selectionToken && meta.fileName === observed.fileName &&
-            capturedScopes.some(captured => captured.binding.fileName === observed.fileName)) {
+        if (meta === capturedMeta && meta?.outcomeKind === "unknown" && !meta.selectionToken && meta.fileName === observed.fileName) {
           if (meta.unpersistedPolicy) meta.outcomeKind = "policy_hold";
           else {
             const directory = await fs.opendir(this.runDir(physicalRunId));
