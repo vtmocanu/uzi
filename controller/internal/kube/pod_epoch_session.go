@@ -516,6 +516,10 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 		if event == watch.Added || baseline {
 			return nil, nil
 		}
+		// The Deleted and r.deleted clauses are defence in depth: a Deleted event
+		// always leaves the record tainted or terminal, so they are not separately
+		// testable. The terminal, tainted and current clauses are pinned by
+		// TestPodEpochSuccessorNeverEmits.
 		if event == watch.Deleted || r.deleted || r.tainted || r.terminal != 0 || s.current[w.ID] != uid {
 			s.dropPending(r)
 			return nil, nil

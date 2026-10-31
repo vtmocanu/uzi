@@ -142,6 +142,33 @@ func TestPodEpochSuccessorAttestation(t *testing.T) {
 	}
 }
 
+func TestPodEpochSuccessorPredecessorInitPrefixContradicts(t *testing.T) {
+	x := epochTerminal(epochPod(epochA))
+	x.Status.InitContainerStatuses[0].ContainerID = "cri-o://seed"
+	h := epochReadyHarness(t, x)
+	h.event(watch.Added, epochPod(epochB))
+	e := h.assertDecision(h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://")), true)
+	if e.Attestation.Result != "contradicted" || e.Attestation.Reason != "predecessor_runtime_prefix" {
+		t.Fatalf("%+v", e.Attestation)
+	}
+}
+
+func TestPodEpochSuccessorProofIsFrozenAtAdded(t *testing.T) {
+	h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
+	h.event(watch.Added, epochPod(epochB))
+	// A later predecessor change that would make a recomputed proof negative.
+	a := withRV(epochTerminal(epochPod(epochA)), "/tainted")
+	a.Spec.Volumes = a.Spec.Volumes[:1]
+	h.event(watch.Modified, a)
+	if !h.session.records[epochA].tainted {
+		t.Fatal("predecessor not tainted; test does not discriminate")
+	}
+	e := h.assertDecision(h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://")), true)
+	if e.Attestation == nil || e.Attestation.Result != "consistent" {
+		t.Fatalf("%+v", e.Attestation)
+	}
+}
+
 func TestPodEpochSuccessorMainContainerOnlyIDs(t *testing.T) {
 	h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
 	h.event(watch.Added, epochPod(epochB))
@@ -169,7 +196,13 @@ func TestPodEpochSuccessorNeverEmits(t *testing.T) {
 	}{
 		{"deleted-event-with-ids", nil, func(h *epochHarness) *PodEpochDecision { return h.event(watch.Deleted, ids()) }},
 		{"deleted-before-ids", func(h *epochHarness) { h.event(watch.Deleted, epochPod(epochB)) }, func(h *epochHarness) *PodEpochDecision { return h.event(watch.Modified, ids()) }},
-		{"terminal-before-ids", func(h *epochHarness) { h.event(watch.Modified, epochTerminal(epochPod(epochB))) }, func(h *epochHarness) *PodEpochDecision { return h.event(watch.Modified, ids()) }},
+		{"terminal-before-ids", func(h *epochHarness) {
+			// The terminal status already carries container IDs, so this event alone
+			// would complete the pending proof if the terminal guard were missing.
+			if d := h.event(watch.Modified, epochTerminal(epochPod(epochB))); d != nil {
+				t.Fatalf("emitted on terminal successor: %s", d.Document())
+			}
+		}, func(h *epochHarness) *PodEpochDecision { return h.event(watch.Modified, ids()) }},
 		{"tainted-before-ids", func(h *epochHarness) {
 			p := withRV(epochPod(epochB), "/mounts")
 			p.Spec.Volumes = p.Spec.Volumes[:1]
@@ -261,8 +294,20 @@ func TestPodEpochSuccessorPendingBudget(t *testing.T) {
 	before := h.session.bytes
 	h.event(watch.Added, epochPod(epochB))
 	r := h.session.records[epochB]
-	if r.pending == nil || r.pendingCost <= 0 {
-		t.Fatal("pending not charged")
+	if r.pending == nil || r.pendingCost < 500 {
+		t.Fatalf("pending not charged or too small to discriminate: %d", r.pendingCost)
+	}
+	// Control: the same successor Added against an unproven predecessor yields a
+	// negative with no pending proof. Everything else charged is identical, so the
+	// difference between the two session totals is exactly the pending charge.
+	neg := newEpochHarness(t, epochPod(epochA))
+	negBefore := neg.session.bytes
+	neg.event(watch.Added, epochPod(epochB))
+	if neg.session.records[epochB].pending != nil {
+		t.Fatal("control kept a pending proof")
+	}
+	if got, want := (h.session.bytes-before)-(neg.session.bytes-negBefore), r.pendingCost; got != want {
+		t.Fatalf("session total grew %d more than the control, want pending cost %d", got, want)
 	}
 	charged := h.session.bytes
 	h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
