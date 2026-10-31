@@ -153,7 +153,7 @@ func helpLines(v tuiView) []string {
 			"a          toggle the factory-wide admin board (needs a uza_ token)",
 			"h          hide finished runs; keep active and needs-you",
 			"p          floor: highest progress first; again restores the default order",
-			"done rows  age = finished ago, then run length (start to finish; wide boards)",
+			"done rows  ended = how long ago it finished · took = first start to finish",
 			"cost       API-equivalent estimate",
 			"+ after 7d cost means the estimate is incomplete",
 			"           runs without estimates: tokens only",

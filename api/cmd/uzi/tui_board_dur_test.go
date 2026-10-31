@@ -213,7 +213,7 @@ func TestBoardRunLengthKeepsTitleWithJudgeMarkers(t *testing.T) {
 // The bare run-length cell is explained in the board's ? legend (user call: keep the cell
 // unlabelled).
 func TestBoardHelpExplainsRunLength(t *testing.T) {
-	if got := strings.Join(helpLines(viewBoard), "\n"); !strings.Contains(got, "then run length (") {
+	if got := strings.Join(helpLines(viewBoard), "\n"); !strings.Contains(got, "took = first start to finish") {
 		t.Errorf("board help lacks the run-length legend:\n%s", got)
 	}
 }

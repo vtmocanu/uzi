@@ -304,7 +304,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	if terminal {
 		ageAt = doneAnchor(r)
 	}
-	row += paintSeg(stateC, bg, false, padCell(tok.word, boardStatusWordWidth)) + gap +
+	row += paintSeg(stateC, bg, false, padCell(tok.word, cols.statusW)) + gap +
 		paintSeg(m.pal.faintC, bg, false, padCell(relAge(ageAt), boardAgeWidth)) + gap
 	if m.boardShowDur() {
 		dur := ""
@@ -375,13 +375,17 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	return clampVisual(row, m.width)
 }
 
-// boardAccountCols holds capped display widths for one rendered board window.
-// Visibility still reserves the fixed maxima, independently of the window.
-type boardAccountCols struct{ credW, costW int }
+// boardAccountCols holds capped display widths for one rendered board window: the status
+// word, account and cost cells. Visibility still reserves the fixed maxima, independently of
+// the window, so a short-word window gives its spare columns to the title (#3732).
+type boardAccountCols struct{ statusW, credW, costW int }
 
 func (m tuiModel) boardAccountCols(rows []apitypes.RunListItemDTO) boardAccountCols {
 	var cols boardAccountCols
 	for _, r := range rows {
+		// The word boardRow actually draws (health and recovery overrides included), capped.
+		word := m.pal.runStateToken(r.RunDTO, r.IsRevising).word
+		cols.statusW = max(cols.statusW, visualWidth(capCell(word, boardStatusWordWidth)))
 		if m.boardShowRunCred(r) {
 			cols.credW = max(cols.credW, visualWidth(m.boardCredLabel(r)))
 		}
@@ -711,4 +715,82 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	}
 	b.WriteString(paintSeg(m.pal.faintC, bg, false, " · "+relAge(act.At)))
 	return padSeg(clampVisual(b.String(), m.width), m.width, bg)
+}
+
+// boardColLabel is one faint column name drawn on a band heading: text placed at start.
+type boardColLabel struct {
+	text  string
+	start int
+}
+
+// boardColumnLabels is the column-name set for one band heading (#3732), positioned over the
+// cells boardRow draws with the same widths: any change to boardRow's column order or cell
+// widths must move here too (TestBoardEyebrowLabelsAlignWithCells pins the two together).
+// Labels follow their columns' visibility; run id, the admin owner and status carry none,
+// since the heading text sits over them.
+func (m tuiModel) boardColumnLabels(band int, mc boardMarkerCols, cols boardAccountCols) []boardColLabel {
+	var out []boardColLabel
+	add := func(text string, start int) { out = append(out, boardColLabel{text, start}) }
+	pos := 4 + boardIDWidth + 2 // cursor, strip, glyph, space, id, gap
+	if m.board.admin {
+		// No label: the owner cell starts right after the run id, under the heading text
+		// (every heading is wider than the id), like the id and status columns.
+		pos += boardOwnerWidth + 2
+	}
+	pos += cols.statusW + 2
+	if band == bandDone {
+		add("ended", pos)
+	} else {
+		add("age", pos)
+	}
+	pos += boardAgeWidth + 2
+	if m.boardShowDur() {
+		if band == bandDone {
+			add("took", pos+boardDurWidth-len("took")) // right-aligned like the cell
+		}
+		pos += boardDurWidth + 2
+	}
+	if m.boardShowMile() {
+		add("miles", pos)
+		w := boardMileWidth
+		if m.boardShowProg() {
+			w += 1 + boardProgPctWidth
+		}
+		pos += w + 2
+	}
+	if m.boardShowCred() {
+		add("acct", pos)
+		pos += cols.credW + 2
+	}
+	if m.boardShowCost() {
+		add("cost", pos+cols.costW-len("cost")) // right-aligned like the cell
+		pos += cols.costW + 2
+	}
+	add("title", pos)
+	workerW := m.boardWorkerWidth()
+	contentW := m.width - workerW
+	if mc.fullW > 0 && !m.board.admin {
+		add("judge", contentW-mc.fullW)
+	}
+	if workerW > 0 {
+		add("worker", contentW+2)
+	}
+	return out
+}
+
+// placeBoardLabels lays labels after a heading of visual width headW: each one starts exactly
+// at its column, or is dropped when it would overlap the heading (two blank columns kept),
+// the previous label (one blank column kept) or the right edge. Labels never move a column.
+func placeBoardLabels(headW, width int, labels []boardColLabel) string {
+	var b strings.Builder
+	pos, minStart := headW, headW+2
+	for _, l := range labels {
+		end := l.start + visualWidth(l.text)
+		if l.start < minStart || end > width {
+			continue
+		}
+		b.WriteString(strings.Repeat(" ", l.start-pos) + l.text)
+		pos, minStart = end, end+1
+	}
+	return b.String()
 }

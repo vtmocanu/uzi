@@ -1930,7 +1930,8 @@ A newer release is available.
   finish stamp, and blank on active rows (the cell is reserved so columns line
   up). It is the lowest-priority column: it appears only from 111 columns (123
   with the account column, wider still when judge badges are shown) and is the
-  first to go on a narrowing terminal. The `?` legend names both numbers.
+  first to go on a narrowing terminal. The DONE heading labels the two
+  numbers `ended` and `took`, and the `?` legend explains them.
   `[h]` hides finished runs (completed/failed/cancelled),
   leaving the active and needs-you runs. The rows are grouped into three
   triage bands (NEEDS YOU, then ON THE FLOOR, then DONE) rather than one
@@ -1943,8 +1944,14 @@ A newer release is available.
   status glyph, the run id, the status WORD in its own colour (a stalled run
   reads `▲ stalled`, because health folds into the status token rather than
   a separate column), the AGE, the DONE run length, the milestone micro-bar, the COST cell, and
-  the TITLE; there are no STATUS/HEALTH/MILE column headers or full-width
-  rules. The list windows to the terminal height so the wordmark and key
+  the TITLE. There is no separate header row or full-width rule: each band
+  heading carries faint lowercase column names over its columns (`age`, or
+  `ended` and `took` on DONE, then `miles`, `acct`, `cost`, `title`, `judge`,
+  `worker`), shown only for visible columns and dropped where one would
+  collide with the heading text; the run id, status and admin owner sit under
+  the heading itself. The status cell is as wide as the longest status word
+  on screen (at most 14 columns), so a board of short statuses gives the title
+  the spare room. The list windows to the terminal height so the wordmark and key
   legend stay on screen however many runs there are, with the visible run
   span (`lo–hi`) and a seven-day cost shown in the top-right summary
   cluster (`⚑ N · ✎ N · ➤ N · ⚿ N · ▲ N · $N 7d · T runs`). On your own
