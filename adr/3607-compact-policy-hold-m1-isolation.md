@@ -223,10 +223,29 @@ LiveDB gates at 5b8a14f8, including the shared claim-route fixture. The API comp
 inputs remain unchanged from its recorded successful gate. The expanded 125-file
 affected-agent selection also passed at f6240187. A small matched common-check
 timing pair is recorded separately from new conformance-case costs, without a CI
-performance inference. Repository-gate execution follows the evidence commit;
-default integration and final F7 thread actions remain open, and changed merge
-inputs require renewed validation. Final
-published-head agent CI and comparable CI timing are separately pending. This is a
+performance inference. The canonical task gate:repo at
+855378d5bd1febe0ba0dad411405ed92a6fa83f1 failed with EXIT=201 after 1,332 seconds
+(log .uzi/scratch/gate-log.qJcAkA). Its first 41 top-level targets passed, then
+test:ci-safe-paths failed at scripts/ci-safe-paths.test.rb:225, “failed Brew proof
+remains a gate failure”: expected 1, got 3. The subsequent 35 top-level targets
+have not executed (inventory .uzi/scratch/r3-repo-top-level-targets.txt, lines 43–77).
+The root will run them as separate sequential diagnostics and list exact unfinished
+targets in its receipt; these cannot establish a full canonical gate pass. The final
+gate remains FAILED, not waived.
+
+The narrow watcher probe in .uzi/scratch/r3-ci-safe-brew-reproducer.json records
+exit 3 and stderr “release-watch: not in a git checkout”. The direct diagnostic
+using git -c core.fsmonitor=false was denied by the worker Git guardrail because
+modifying remote/core/http/credential Git config is not permitted. Do not retry
+or bypass that denial. Baseline reproduction has not executed; no passing baseline
+or unrelated/pre-existing classification is established.
+
+F7 thread reply 4426391039 and resolution of PRRT_kwDOUGFljs6yEQQM both returned
+success; those thread actions are complete. Default integration remains open:
+the missing live-main object prevents the approved merge, migration 00386 collision
+repair and merged-input revalidation. Changed merge inputs require renewed validation.
+VCI remains externally pending; final published-head agent CI and comparable CI
+timing are separately pending. This is a
 partial checkpoint, not a completion claim or waiver of R3. Historical successful
 checks remain successful for their tested candidates. The final MR description
 must preserve F5/m3 and M2/M3/I1 deferrals and report only observed results.
