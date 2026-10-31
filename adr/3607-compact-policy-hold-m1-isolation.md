@@ -1,7 +1,8 @@
 # ADR-3607: Compact policy-hold M1 isolation
 
-**Status:** Accepted narrow M1 repair contract; R1/R2 implementation reviewed through
-5f4378da. R3 final validation and exact-head CI remain pending.
+**Status:** Accepted narrow M1 repair contract; partial checkpoint through
+d7b03dae276ebc2c54681a47a5205c2903654140. Initial R1/R2 reviewed; R3 INCOMPLETE.
+Final merged validation, remaining validator returns and exact-head CI are pending.
 **Date:** 2026-10-31
 **Issue:** [#3607](https://github.com/vtmocanu/uzi/issues/3607)
 **PRD:** [Compact policy-refusal hold](../prds/3607-compact-policy-refusal-hold.md#decision-log)
@@ -71,7 +72,12 @@ Boot content budgets and per-record authentication remain. A record marked inter
 on-demand read rather than being permanently classified oversized because the
 aggregate boot budget ran out. The selected identity still wins over competing
 files, mutation or disappearance. Inspection capacity is reserved before interpreting
-an additional candidate. Opaque/provisional evidence prevents a claim of complete
+an additional candidate, including before boot/runtime raw directory reads.
+Authentication joins descriptor close before ordinary promotion or slot release,
+then rechecks the selected identity and current metadata object. Failed close or
+unknown evidence retains protection. The 76bc3680 and 2df3641f repair reviews and
+regressions are inventoried in the PRD; these changes do not establish a whole-startup
+heap bound. Opaque/provisional evidence prevents a claim of complete
 inventory; safe known source bindings supply identity coverage, not authentication
 or settlement authority.
 
@@ -193,8 +199,26 @@ successful policy-admission retention while preserving independent vetoes, inclu
 deferred: current report-path 40/64-hex validation and React escaping do not validate
 arbitrary historic database values.
 
-R1/R2 focused red/green results and immutable reviews do not prove full-feature or
-merge readiness. Final R3 gates, combined fixture evidence, live-default freshness
-and final exact-head CI are **pending** in the PRD's final validation section. The
-lead updates that section after the serial gate run; old successful CI remains
-historical, not evidence of future passes.
+Initial R1/R2 delivery and later enrollment/descriptor-close repairs retain their
+candidate-bound reviews and focused evidence. The required 114-file agent selection
+at 2df3641f failed two fixture assertions. Test-only repairs through d7b03dae pass
+the lead's focused 16-case selection; remaining independent review and the final
+merged rerun are pending. The PRD inventories failures, repairs, review limits and
+historical successes without treating them as final validation.
+
+Current-main integration remains required. Public REST observation on 2026-10-31
+at 08:32:14 UTC found main at 01d624859f34c0fff969081fbc9eb50100776416; that commit
+object is absent locally. Its migration prefix 00386 collides with the feature's
+compact-policy migration. The worker must supply the fetched current tip and object;
+the agent cannot fetch over network Git. Integrate with git merge, inspect conflicts,
+then use task migration:renumber above the fetched live head and fix reported
+references. Changed runtime, API, SQL and package inputs require renewed validation;
+no history rewrite, manual dependency installation or object reconstruction is allowed.
+
+The [PRD validation record](../prds/3607-compact-policy-refusal-hold.md#deferred-scope-and-final-validation)
+keeps local component, repository and unnarrowed LiveDB gates open. The new shared
+claim-route LiveDB test remains unrun, as do final F7 thread actions. Final
+published-head agent CI and comparable CI timing are separately pending. This is a
+partial checkpoint, not a completion claim or waiver of R3. Historical successful
+checks remain successful for their tested candidates. The final MR description
+must preserve F5/m3 and M2/M3/I1 deferrals and report only observed results.
